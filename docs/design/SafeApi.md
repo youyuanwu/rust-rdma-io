@@ -36,12 +36,12 @@ rust-rdma-io/
 │   │   ├── mr.rs        # Memory Region
 │   │   ├── srq.rs       # Shared Receive Queue
 │   │   ├── ah.rs        # Address Handle
-│   │   ├── comp.rs      # Completion Channel + async polling
+│   │   ├── comp.rs      # Completion Channel
 │   │   ├── cm.rs        # rdma_cm connection management
 │   │   ├── wr.rs        # Work requests (send/recv builders)
 │   │   ├── wc.rs        # Work completions
 │   │   ├── error.rs     # Error types
-│   │   └── stream.rs    # AsyncRead/AsyncWrite over RDMA
+│   │   └── stream.rs    # Read/Write over RDMA
 │   └── Cargo.toml
 └── rdma-io-tests/       # Integration tests (exists today, will grow)
 ```
@@ -73,6 +73,8 @@ Device
 ### Approach: `Arc`-based parent references
 
 Each resource holds an `Arc` to its parent, ensuring the parent outlives all children. This is the same approach used by Nugine/rdma and is the simplest correct solution.
+
+Every resource type implements `Drop`, calling the corresponding `ibv_destroy_*` / `ibv_dealloc_*` / `ibv_dereg_*` function. Drop order is guaranteed correct by the `Arc` references — children are dropped before parents because the parent's refcount only reaches zero after all children are gone.
 
 ```rust
 pub struct Context {
@@ -149,6 +151,8 @@ impl Device {
 impl Context {
     pub fn query_device(&self) -> Result<DeviceAttr>
     pub fn query_port(&self, port: u8) -> Result<PortAttr>
+    pub fn query_gid(&self, port: u8, index: i32) -> Result<Gid>
+    pub fn query_gid_table(&self) -> Result<Vec<GidEntry>>
     pub fn create_pd(self: &Arc<Self>) -> Result<Arc<ProtectionDomain>>
     pub fn create_cq(self: &Arc<Self>, cqe: i32) -> Result<Arc<CompletionQueue>>
     pub fn create_comp_channel(self: &Arc<Self>) -> Result<CompletionChannel>
@@ -525,6 +529,7 @@ Most ibverbs/rdmacm functions return 0 on success or set `errno`. The wrapper co
 | `CmId` | ✅ | ❌ | CM operations are not thread-safe |
 | `EventChannel` | ✅ | ❌ | Single reader at a time |
 | `WrSession` | ❌ | ❌ | Scoped to one thread, one QP |
+| `PollGuard` | ❌ | ❌ | Scoped to one thread, one CQ |
 
 ---
 
@@ -665,3 +670,5 @@ Items identified from the [ExistingLibs.md](ExistingLibs.md) gap analysis that a
 6. **io_uring integration** — Use io_uring for CQ notification instead of epoll/completion channel. Potential for lower latency event loop integration.
 7. **Connection pooling / reconnection** — Higher-level abstractions for managing multiple connections with automatic reconnect on failure.
 8. **Async runtime backends (tokio, smol)** — `AsyncFd` (tokio) or `Async` (async-io/smol) wrappers around the comp_channel fd, enabling `AsyncCq`, `AsyncRead`/`AsyncWrite` on `RdmaStream`, and runtime-agnostic async CQ polling.
+9. **Async device events** — `ibv_get_async_event` handling for port state changes, QP errors, and device removal notifications. Likely a `Context::async_events()` stream.
+10. **QP state transition helpers** — Convenience methods like `qp.transition_to_rts(port, gid, remote_qpn, remote_psn)` to reduce boilerplate for manual (non-CM) QP setup.
