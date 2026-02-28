@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["bnd-rdma-gen", "rdma-io-sys", "rdma-io-tests"]
+
+package.edition = "2024"
+package.license = "MIT"
+
+[workspace.dependencies]
+bnd-winmd = { path = "../bnd/bnd-winmd" }
+bnd-posix = { path = "../bnd/bnd-posix" }
+bnd-linux = { path = "../bnd/bnd-linux" }
+tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+windows-bindgen = "0.66"
+windows-link = "0.2"

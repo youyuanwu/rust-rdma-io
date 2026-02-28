@@ -1,0 +1,10 @@
+[package]
+name = "rdma-io-tests"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Integration tests for rdma-io-sys against SoftIWarp (siw)"
+publish = false
+
+[dependencies]
+rdma-io-sys = { path = "../rdma-io-sys" }

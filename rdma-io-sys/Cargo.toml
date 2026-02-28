@@ -1,0 +1,21 @@
+[package]
+name = "rdma-io-sys"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Low-level RDMA sys crate — FFI bindings for libibverbs + librdmacm"
+
+[dependencies]
+bnd-posix = { workspace = true, features = ["pthread", "socket", "inet", "types"] }
+bnd-linux = { workspace = true, features = ["types"] }
+windows-link.workspace = true
+
+[build-dependencies]
+cc = "1"
+
+[features]
+default = ["ibverbs", "rdmacm", "wrapper"]
+Foundation = []
+ibverbs = ["Foundation"]
+rdmacm = ["Foundation"]
+wrapper = ["Foundation"]

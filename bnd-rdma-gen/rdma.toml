@@ -1,0 +1,48 @@
+include_paths = ["/usr/include/x86_64-linux-gnu", "/usr/include"]
+
+[output]
+name = "rdma"
+file = "bnd-rdma.winmd"
+
+# Import POSIX types (pthread_mutex_t, pthread_cond_t, sockaddr, sockaddr_in, etc.)
+[[type_import]]
+winmd = "../../bnd/bnd-posix/winmd/bnd-posix.winmd"
+namespace = "posix"
+
+# Import Linux types (__be16, __be32, __be64, etc.)
+[[type_import]]
+winmd = "../../bnd/bnd-linux/winmd/bnd-linux.winmd"
+namespace = "linux"
+
+# Partition 1: ibverbs — core RDMA verb API (structs, enums, extern functions)
+# bnd skips static inline functions; those are handled by wrapper.c in rdma-io-sys.
+[[partition]]
+namespace = "rdma.ibverbs"
+library = "ibverbs"
+headers = ["infiniband/verbs.h"]
+traverse = [
+    "infiniband/verbs.h",
+    "infiniband/verbs_api.h",
+    "infiniband/ib_user_ioctl_verbs.h",
+    "rdma/ib_user_verbs.h",
+]
+
+# Partition 2: rdmacm — RDMA Connection Manager API
+[[partition]]
+namespace = "rdma.rdmacm"
+library = "rdmacm"
+headers = ["rdma/rdma_cma.h"]
+traverse = [
+    "rdma/rdma_cma.h",
+    "infiniband/sa.h",
+]
+
+# Partition 3: wrapper — Rust FFI for inline function wrappers from wrapper.c
+# These are non-inline C functions that call the real static inline verbs functions.
+# The wrapper.h includes verbs.h but we only traverse wrapper.h itself,
+# so only the rdma_wrap_* symbols are extracted (types come from partition 1).
+[[partition]]
+namespace = "rdma.wrapper"
+library = "rdma_wrapper"
+headers = ["../rdma-io-sys/wrapper/wrapper.h"]
+traverse = ["../rdma-io-sys/wrapper/wrapper.h"]
