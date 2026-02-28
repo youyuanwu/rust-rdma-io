@@ -8,3 +8,4 @@ publish = false
 
 [dependencies]
 rdma-io-sys = { path = "../rdma-io-sys" }
+rdma-io = { path = "../rdma-io" }

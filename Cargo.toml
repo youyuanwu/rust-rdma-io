@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["bnd-rdma-gen", "rdma-io-sys", "rdma-io-tests"]
+members = ["bnd-rdma-gen", "rdma-io", "rdma-io-sys", "rdma-io-tests"]
 
 package.edition = "2024"
 package.license = "MIT"

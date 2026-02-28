@@ -405,6 +405,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
 
 [[package]]
+name = "rdma-io"
+version = "0.1.0"
+dependencies = [
+ "bitflags",
+ "rdma-io-sys",
+ "thiserror",
+]
+
+[[package]]
 name = "rdma-io-sys"
 version = "0.1.0"
 dependencies = [
@@ -418,6 +427,7 @@ dependencies = [
 name = "rdma-io-tests"
 version = "0.1.0"
 dependencies = [
+ "rdma-io",
  "rdma-io-sys",
 ]
 
@@ -558,6 +568,26 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys",
+]
+
+[[package]]
+name = "thiserror"
+version = "2.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4288b5bcbc7920c07a1149a35cf9590a2aa808e0bc1eafaade0b80947865fbc4"
+dependencies = [
+ "thiserror-impl",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "2.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ebc4ee7f67670e9b64d05fa4253e753e016c6c95ff35b89b7941d6b856dec1d5"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
