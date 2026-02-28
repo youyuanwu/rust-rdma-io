@@ -43,6 +43,18 @@ pub(crate) fn from_ret(ret: i32) -> Result<()> {
     }
 }
 
+/// Convert a C return code (-1 = failure, errno set) to a `Result`.
+///
+/// Used for rdma_cm functions which return -1 on error and set `errno`,
+/// unlike ibverbs functions which return negative errno values directly.
+pub(crate) fn from_ret_errno(ret: i32) -> Result<()> {
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(Error::Verbs(io::Error::last_os_error()))
+    }
+}
+
 /// Convert a nullable pointer return to `Result`, using `errno` on failure.
 pub(crate) fn from_ptr<T>(ptr: *mut T) -> Result<*mut T> {
     if ptr.is_null() {

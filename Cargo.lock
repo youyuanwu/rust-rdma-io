@@ -409,6 +409,7 @@ name = "rdma-io"
 version = "0.1.0"
 dependencies = [
  "bitflags",
+ "bnd-posix",
  "rdma-io-sys",
  "thiserror",
 ]

@@ -7,5 +7,6 @@ description = "Safe Rust API for RDMA (libibverbs + librdmacm)"
 
 [dependencies]
 rdma-io-sys = { path = "../rdma-io-sys" }
+bnd-posix = { path = "../../bnd/bnd-posix" }
 bitflags = "2"
 thiserror = "2"

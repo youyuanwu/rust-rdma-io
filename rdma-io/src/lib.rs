@@ -3,6 +3,7 @@
 //! Provides RAII wrappers for RDMA resources with `Arc`-based ownership
 //! to enforce correct destruction order.
 
+pub mod cm;
 pub mod cq;
 pub mod device;
 pub mod error;

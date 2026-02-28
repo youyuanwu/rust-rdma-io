@@ -7,6 +7,8 @@
 //! ```
 
 #[cfg(test)]
+mod cm_tests;
+#[cfg(test)]
 mod safe_api_tests;
 #[cfg(test)]
 mod sys_tests;

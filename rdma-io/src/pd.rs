@@ -38,6 +38,15 @@ impl ProtectionDomain {
         Ok(Arc::new(Self { inner: pd, ctx }))
     }
 
+    /// Wrap a raw `ibv_pd` pointer.
+    ///
+    /// # Safety
+    /// The pointer must be valid and the caller must ensure `ctx` is the
+    /// correct parent context.
+    pub unsafe fn from_raw(pd: *mut ibv_pd, ctx: Arc<Context>) -> Arc<Self> {
+        Arc::new(Self { inner: pd, ctx })
+    }
+
     /// Register a borrowed memory region.
     ///
     /// The returned `MemoryRegion` borrows `buf` and keeps `self` alive via `Arc`.

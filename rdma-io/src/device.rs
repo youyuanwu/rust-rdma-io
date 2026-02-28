@@ -80,7 +80,10 @@ impl Device {
     /// Open this device and return a [`Context`].
     pub fn open(&self) -> Result<Context> {
         let ctx = from_ptr(unsafe { ibv_open_device(self.as_ptr()) })?;
-        Ok(Context { inner: ctx })
+        Ok(Context {
+            inner: ctx,
+            owned: true,
+        })
     }
 
     fn as_ptr(&self) -> *mut ibv_device {
@@ -95,6 +98,8 @@ impl Device {
 /// the context alive.
 pub struct Context {
     pub(crate) inner: *mut ibv_context,
+    /// If false, we don't call ibv_close_device on drop (e.g. rdma_cm-owned).
+    owned: bool,
 }
 
 // Safety: ibv_context is thread-safe (protected by internal locking).
@@ -103,13 +108,24 @@ unsafe impl Sync for Context {}
 
 impl Drop for Context {
     fn drop(&mut self) {
-        unsafe {
-            ibv_close_device(self.inner);
+        if self.owned {
+            unsafe {
+                ibv_close_device(self.inner);
+            }
         }
     }
 }
 
 impl Context {
+    /// Wrap a raw `ibv_context` pointer.
+    ///
+    /// # Safety
+    /// The pointer must be valid. If `owned` is true, `ibv_close_device` will
+    /// be called on drop. Set `owned` to false for rdma_cm-managed contexts.
+    pub unsafe fn from_raw(ctx: *mut ibv_context, owned: bool) -> Self {
+        Self { inner: ctx, owned }
+    }
+
     /// Query device attributes.
     pub fn query_device(&self) -> Result<ibv_device_attr> {
         let mut attr = ibv_device_attr::default();
