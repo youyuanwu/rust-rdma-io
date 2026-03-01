@@ -5,13 +5,14 @@ name = "rdma"
 file = "bnd-rdma.winmd"
 
 # Import POSIX types (pthread_mutex_t, pthread_cond_t, sockaddr, sockaddr_in, etc.)
+# The winmd is downloaded to build/winmd/ by CMake configure step.
 [[type_import]]
-winmd = "../../bnd/bnd-linux/winmd/bnd-linux.winmd"
+winmd = "../build/winmd/bnd-linux.winmd"
 namespace = "libc.posix"
 
 # Import Linux types (__be16, __be32, __be64, etc.)
 [[type_import]]
-winmd = "../../bnd/bnd-linux/winmd/bnd-linux.winmd"
+winmd = "../build/winmd/bnd-linux.winmd"
 namespace = "libc.linux"
 
 # Partition 1: ibverbs — core RDMA verb API (structs, enums, extern functions)
