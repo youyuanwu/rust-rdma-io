@@ -34,19 +34,29 @@
 
 - **10 integration tests**: atomics, cancel safety, device detection, immediate data, MR slicing, remote MR access/timeout, event loops, timing
 - **Shared test utilities** (`test_utilities.rs`): Server/client helpers using `RdmaBuilder`, port picker for localhost testing, tokio runtime
-- **CI setup**: Installs `rdma-core` packages, creates **both** SoftRoCE (rxe) and SoftIWarp (siw) devices, runs full test suite with `ulimit -l unlimited`
 - **Example-as-test**: Examples (rpc, server/client) are also executed in CI
 - **Verification**: Uses `ibv_rc_pingpong`, `ibv_uc_pingpong`, `ibv_ud_pingpong`, `ibv_srq_pingpong` standard tools as validation
 
-**CI commands** (from `scripts/run.sh`):
+**CI strategy**: Single GitHub Actions workflow on `ubuntu-latest`. The key insight: they **build `rdma_rxe` and `siw` kernel modules from source** when they aren't pre-installed. A git submodule (`rdma-env-setup`) handles this:
+
+1. Checks `modprobe -c | grep rxe` — if module not found in running kernel
+2. Downloads matching kernel source tarball from `cdn.kernel.org`
+3. Extracts `drivers/infiniband/sw/rxe/` and `drivers/infiniband/sw/siw/`
+4. Builds both out-of-tree with modified Makefiles (`$(CONFIG_RDMA_RXE)` → `m`)
+5. Loads via `sudo insmod ./rdma_rxe.ko` / `sudo insmod ./siw.ko`
+
+Then `scripts/run.sh` creates both devices, runs full test suite with unlimited locked memory, and also runs `ibv_*_pingpong` verifications:
+
 ```bash
-# Setup rxe device
-sudo rdma link add rxe_eth0 type rxe netdev eth0
-# Run tests with unlimited locked memory
+# Setup both devices
+sudo rdma link add siw_eth0 type siw netdev $ETH_DEV
+sudo rdma link add rxe_eth0 type rxe netdev $ETH_DEV
+# Run tests (on rxe device) with unlimited locked memory
 sudo bash -c 'ulimit -l unlimited && cargo test --features="cm raw"'
+# Also runs ibv_rc_pingpong, ibv_uc_pingpong, ibv_ud_pingpong, ibv_srq_pingpong
 ```
 
-**Lesson**: The server/client loopback pattern over rxe works well for async RDMA testing. The dual rxe+siw setup tests across transport implementations.
+**Lesson**: The server/client loopback pattern over rxe works well for async RDMA testing. Building kernel modules from source is a viable (if complex) workaround for CI runners that lack pre-installed RDMA modules.
 
 ### 1.3 rdma (Nugine)
 
@@ -65,11 +75,37 @@ sudo bash -c 'ulimit -l unlimited && cargo test --features="cm raw"'
   - `one_guard_has_only_one_handle.rs` — prevents multiple handles per guard
   - `one_guard_has_only_one_wr.rs` — prevents multiple WRs per guard
   - `one_qp_has_only_one_guard.rs` — ensures single concurrent guard per QP
-- **Dual CI**: GitHub Actions (smoke/compile) + Cirrus CI (full functional with rxe)
-- **Cirrus CI**: Builds rdma-core from source on Rocky Linux, creates rxe device, runs integration tests + examples as coverage targets
 - **Coverage**: `cargo-llvm-cov` with Codecov integration
 
-**Lesson**: Compile-fail tests (`trybuild`) are excellent for RDMA safety verification — they prove the type system prevents common RDMA misuse patterns. The dual-CI strategy (lightweight + heavy) is pragmatic.
+**CI strategy — dual platform**:
+
+1. **GitHub Actions** (`ubuntu-latest`): Compile, clippy, and `cargo test` only. Does `sudo rmmod mlx5_ib` to unload the Mellanox driver (GitHub runners expose Mellanox VFs). Does **NOT** load rxe/siw — tests that run here are unit/compile tests that don't need a real RDMA device.
+
+2. **Cirrus CI** (Google Compute Engine, Rocky Linux 9): Full RDMA integration tests. Has full kernel access:
+   - `rdma link add rxe_eth0 type rxe netdev eth0` — creates rxe device (Rocky Linux includes `rdma_rxe` by default)
+   - Builds `rdma-core` from source for latest userspace libs
+   - Runs integration tests via `just`: basic tests, `rc_pingpong` example, `cmtime` example
+   - Uses `cargo-llvm-cov` for coverage uploaded to Codecov
+
+```yaml
+# Cirrus CI (.cirrus.yml) — Rocky Linux 9 GCE VM
+compute_engine_instance:
+  image_project: rocky-linux-cloud
+  image: family/rocky-linux-9
+# ...
+prepare_script:
+  - dnf install -y cmake librdmacm libibverbs gcc clang
+  - rdma link add rxe_eth0 type rxe netdev eth0
+rdma_core_script:
+  - git clone https://github.com/linux-rdma/rdma-core.git
+  - ./rdma-core/build.sh
+test_script:
+  - export LD_LIBRARY_PATH=./rdma-core/build/lib
+  - just test-basic-with-cov
+  - just test-rc-pingpong-with-cov
+```
+
+**Lesson**: Compile-fail tests (`trybuild`) are excellent for RDMA safety verification — they prove the type system prevents common RDMA misuse patterns. The dual-CI strategy (GitHub Actions for lint/compile, Cirrus CI for functional RDMA tests) is pragmatic — it avoids fighting GitHub Actions' kernel module restrictions.
 
 ### 1.5 rrddmma
 
@@ -216,7 +252,37 @@ If we provide async APIs:
 
 ## 4. Recommended CI Setup
 
-### GitHub Actions Workflow
+### GitHub Actions Kernel Module Limitations
+
+**Key finding** (Mar 2026): Standard GitHub-hosted `ubuntu-latest` runners do **not** have `rdma_rxe` or `siw` pre-installed as loadable kernel modules. The `linux-modules-extra` package for the runner's kernel may or may not include them, and `modprobe` often fails due to security restrictions or missing modules.
+
+**How other projects work around this**:
+
+| Project | Strategy | Details |
+|---|---|---|
+| **async-rdma** | Build kernel modules from source on GitHub Actions | Downloads matching kernel source tarball, compiles `rdma_rxe.ko` + `siw.ko` out-of-tree, loads via `insmod` |
+| **sideway** | Dual CI: GitHub Actions (compile only) + Cirrus CI (RDMA tests) | Cirrus CI uses Rocky Linux 9 GCE VM where `rdma_rxe` is available; GitHub Actions only runs clippy/compile/unit tests |
+| **rdma (Nugine)** | No RDMA tests in CI | Only format/clippy checks |
+
+### Recommended Approach
+
+**Option A — siw via `linux-modules-extra` (simplest, our current approach)**:
+GitHub Actions Ubuntu runners use a standard (non-Azure) kernel. The `siw` module is often available in `linux-modules-extra-$(uname -r)`. This is what our current CI does. If the runner kernel changes and siw becomes unavailable, fall back to Option B.
+
+**Option B — Build rxe/siw from kernel source (async-rdma approach)**:
+Download the matching kernel source, extract and build `rdma_rxe` and `siw` modules out-of-tree. Complex but self-contained on GitHub Actions. See async-rdma's `rdma-env-setup` submodule for reference.
+
+**Option C — Dual CI (sideway approach)**:
+Use GitHub Actions for compile/lint/unit tests only. Use a second CI platform (Cirrus CI with GCE, or self-hosted runners) for functional RDMA tests with full kernel access.
+
+### Current CI Implementation
+
+Our `.github/workflows/ci.yml` uses **Option A** with two jobs:
+
+1. **`build-and-test`**: Installs `linux-modules-extra`, loads `siw`, creates siw device, runs cmake configure → build → clippy → test
+2. **`check-rxe`**: Exploratory job to verify if `rdma_rxe` is available on the runner. May fail — used to track GitHub Actions kernel support.
+
+### GitHub Actions Workflow Template
 
 ```yaml
 name: CI
@@ -233,7 +299,7 @@ jobs:
       - run: cargo test --lib        # Layer 1 only (pure unit tests)
       - run: cargo doc --no-deps
 
-  # Full RDMA tests (rxe device)
+  # Full RDMA tests (siw device — works on GitHub Actions)
   rdma-test:
     runs-on: ubuntu-latest
     steps:
@@ -241,23 +307,21 @@ jobs:
       - name: Install RDMA dependencies
         run: |
           sudo apt-get update
+          KVER=$(uname -r)
           sudo apt-get install -y \
             libibverbs-dev librdmacm-dev \
             ibverbs-utils rdmacm-utils \
-            ibverbs-providers rdma-core
-      - name: Setup SoftRoCE
+            ibverbs-providers rdma-core \
+            "linux-modules-extra-${KVER}"
+      - name: Setup SoftIWarp
         run: |
-          sudo modprobe rdma_rxe
-          # Use eth0 or the first available interface
+          sudo modprobe siw
           NETDEV=$(ip -o link show | awk -F': ' '{print $2}' | grep -v lo | head -1)
-          sudo rdma link add rxe0 type rxe netdev $NETDEV
+          sudo rdma link add siw0 type siw netdev $NETDEV
           rdma link  # verify ACTIVE
       - name: Run all tests
         run: |
           sudo bash -c 'ulimit -l unlimited && cargo test --all-features'
-      - name: Run examples
-        run: |
-          sudo bash -c 'ulimit -l unlimited && cargo run --example loopback'
 ```
 
 ### Conditional Test Execution
@@ -321,13 +385,14 @@ sudo bash -c 'ulimit -l unlimited && cargo test'
 
 ### Adopt from sideway
 - **`trybuild` compile-fail tests** — prove type-safety invariants (prevents MR misuse, QP misuse)
-- **Dual CI** — lightweight (compile/lint) + heavyweight (full RDMA)
+- **Dual CI** — lightweight GitHub Actions (compile/lint) + heavyweight Cirrus CI (full RDMA with rxe on Rocky Linux GCE VM)
 - **Coverage** via `cargo-llvm-cov` + Codecov
 
 ### Adopt from async-rdma
 - **Server/client test helpers** — reusable `server_wrapper`/`client_wrapper` for loopback tests
 - **Port picker** — avoid port conflicts in parallel tests
-- **Test both rxe and siw** — catches transport-specific bugs
+- **Out-of-tree kernel module build** — viable fallback when CI runners lack pre-installed RDMA modules
+- **Test both rxe and siw** — catches transport-specific bugs (when both are available)
 
 ### Adopt from Nugine/rdma
 - **FFI layout assertions** — `size_of`, `align_of`, `offset_of` checks
@@ -399,17 +464,23 @@ tests/
 - **iWARP RDMA WRITE with IMM**: iWARP (RFC 5040) does not define RDMA Write with Immediate Data — that's an InfiniBand-specific operation. siw correctly rejects it. API method exists for InfiniBand/RoCE but is untestable on siw.
 - **siw atomic support**: siw reports `ATOMIC_NONE` — no atomic CAS or FAA support. The `compare_and_swap()` and `fetch_and_add()` API methods require InfiniBand/RoCE hardware with `ATOMIC_HCA` or `ATOMIC_GLOB` capability.
 
-### Current Test Suite (34 tests)
+### Current Test Suite (35 tests)
 
 | Category | Count | Description |
 |----------|-------|-------------|
-| sys_tests | 8 | Raw FFI lifecycle: device, PD, CQ, MR, QP (against siw) |
+| sys_tests | 8 | Raw FFI lifecycle: device, PD, CQ, MR, QP (against siw or rxe) |
 | safe_api_tests | 10 | Safe API: device enumeration, PD, CQ, QP, MR, query port/GID |
 | cm_tests | 2 | rdma_cm: connect/disconnect, send/recv (threaded, loopback) |
 | stream_tests | 3 | Stream: echo, multi-message (5 round-trips), large transfer (32 KiB) |
 | async_cq_tests | 2 | Async CQ: send/recv via comp_channel notification, poll_wr_id |
-| async_qp_tests | 3 | AsyncQp: send/recv, ping-pong, RDMA WRITE+READ roundtrip |
+| async_qp_tests | 4 | AsyncQp: send/recv, ping-pong, RDMA WRITE+READ roundtrip, disconnect |
 | async_stream_tests | 6 | AsyncRdmaStream: echo, multi-message, large transfer, futures-io echo, tokio compat, tokio::io::copy |
+
+**Device compatibility**: All tests are device-agnostic — they discover available software RDMA devices (siw or rxe) automatically. `sys_tests` and `safe_api_tests` prefer `siw*`/`rxe*` devices over hardware VFs. Connection-based tests use `rdma_cm` which auto-routes to the correct device.
+
+**CI strategy**: Two jobs run the same 35 tests against different transports:
+- **`build-and-test`**: Uses SIW (loaded from `linux-modules-extra`)
+- **`build-rxe`**: Builds `rdma_rxe.ko` from kernel source (via CMake `BUILD_RXE` option), loads with `insmod`
 
 ---
 
@@ -510,22 +581,55 @@ rping -c -a 10.0.0.4 -v -C 5'
 
 ### Building rxe/siw from Source
 
-Neither module needs a full kernel source tree — only **kernel headers** (already installed as `linux-headers-$(uname -r)`).
-
 **SIW**: Already available via `linux-modules-extra` — no need to build from source.
 
-**RXE** (`rdma_rxe`): Disabled in the Azure kernel config (`# CONFIG_RDMA_RXE is not set`). Building it out-of-tree is **not straightforward**:
+**RXE** (`rdma_rxe`): Disabled in the Azure kernel config (`# CONFIG_RDMA_RXE is not set`) and not pre-installed on GitHub Actions `ubuntu-latest` runners. However, building it out-of-tree **is practical** — async-rdma's `rdma-env-setup` proves this works in CI.
 
-1. **Out-of-tree build is impractical** — `rdma_rxe` depends on internal kernel RDMA subsystem symbols (`ib_core`, `ib_uverbs`). It's not a standalone module; it's tightly coupled to the in-tree RDMA stack. You cannot simply compile `drivers/infiniband/sw/rxe/*.c` against headers alone.
-2. **Recompiling the kernel** would work — clone the Ubuntu kernel source, enable `CONFIG_RDMA_RXE=m`, and build. This is a ~30-60 min process and requires ~10GB disk for the build tree.
-3. **DKMS is not an option** — no upstream DKMS package for rxe exists.
+**What you need**:
+- **Kernel headers** (`linux-headers-$(uname -r)`) — provides the build infrastructure at `/lib/modules/$(uname -r)/build`
+- **Module source files** — just the `drivers/infiniband/sw/rxe/` directory from the matching kernel source tarball (not the full tree)
+- **Runtime**: `ib_core` and `rdma_ucm` modules must be loaded (they provide the symbols `rdma_rxe` depends on)
 
-**Recommendation**: Use SIW (already available) for local loopback testing. Use RXE in CI (GitHub Actions Ubuntu runners include it). If RXE is needed locally, the simplest path is installing the `linux-generic` kernel package (non-Azure kernel) which includes both rxe and siw, but this is not recommended on production Azure VMs.
+**Build steps** (from async-rdma's `rdma-env-setup`):
+
+```bash
+# 1. Install kernel headers (if not present)
+sudo apt-get install -y linux-headers-$(uname -r)
+
+# 2. Download matching kernel source, extract only rxe driver
+KVER=$(uname -r | sed 's/-.*//')   # e.g. "6.8.0"
+KMAJOR=$(echo $KVER | cut -d. -f1)  # e.g. "6"
+wget -q https://cdn.kernel.org/pub/linux/kernel/v${KMAJOR}.x/linux-${KVER}.tar.xz
+tar xf linux-${KVER}.tar.xz linux-${KVER}/drivers/infiniband/sw/rxe/
+
+# 3. Prepare Kbuild — enable as module
+cd linux-${KVER}/drivers/infiniband/sw/rxe/
+mv Makefile Kbuild
+sed -i 's/$(CONFIG_RDMA_RXE)/m/g' Kbuild
+
+# 4. Create out-of-tree Makefile
+cat > Makefile << 'EOF'
+LINUX_SRC_PATH = /lib/modules/$(shell uname -r)/build
+modules:
+	@$(MAKE) -C $(LINUX_SRC_PATH) M=$(pwd) modules
+EOF
+
+# 5. Build and load
+make
+sudo modprobe ib_core rdma_ucm  # load dependencies first
+sudo insmod ./rdma_rxe.ko
+sudo rdma link add rxe0 type rxe netdev eth0
+```
+
+**Note**: The out-of-tree build works because `rdma_rxe` resolves its `ib_core`/`ib_uverbs` symbol dependencies at module load time (not compile time). The kernel headers provide the build system and header files; the runtime kernel provides the symbols.
+
+**Recommendation**: Use SIW (already available) for local loopback testing on Azure VMs. For CI, use SIW on GitHub Actions via `linux-modules-extra` (our current approach). If rxe-specific tests are needed later, build the module from kernel source (as async-rdma does — adds ~1 min to CI) or use a second CI platform with full kernel access (as sideway does with Cirrus CI on Rocky Linux). If RXE is needed locally on Azure, the simplest path is installing the `linux-generic` kernel package (non-Azure kernel) which includes both rxe and siw, but this is not recommended on production Azure VMs.
 
 ### Implications for CI/Testing
 
 1. **Standard Azure VMs can run RDMA data-path tests via SIW** — but only with `rdma_cm`-based connection setup, not manual QP wiring.
 2. **Layer 2 tests** (device, PD, CQ, MR, QP creation) work with both SIW and the hardware ConnectX-5 VFs.
-3. **Layer 3 data-path tests** on Azure require SIW + `rdma_cm`. On CI (GitHub Actions), use RXE which supports both manual QP transitions and `rdma_cm`.
+3. **Layer 3 data-path tests** on Azure require SIW + `rdma_cm`. On GitHub Actions, also use SIW (via `linux-modules-extra`). RXE is **not** pre-installed on GitHub Actions runners.
 4. **Azure HPC VMs** (HB, HC, ND series) with InfiniBand support would have populated GID tables and full RDMA capability including manual QP transitions.
 5. **Test strategy**: Write data-path tests using `rdma_cm` for connection setup (works everywhere: SIW, RXE, real hardware). Optionally add manual-QP-transition tests gated behind a feature flag or runtime check for RXE/hardware availability.
+6. **CI strategy**: Use siw on GitHub Actions for now. If rxe-specific testing is needed later, adopt the async-rdma approach (build from kernel source) or the sideway approach (Cirrus CI with full kernel access).

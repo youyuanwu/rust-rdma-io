@@ -1,4 +1,4 @@
-//! Raw FFI (rdma-io-sys) integration tests against SoftIWarp.
+//! Raw FFI (rdma-io-sys) integration tests against software RDMA devices (siw/rxe).
 //!
 //! All tests exercise the control-path only (device, PD, CQ, MR).
 //! Data-path tests (QP, send/recv) require rdma_cm for siw and
@@ -7,8 +7,8 @@
 use rdma_io_sys::ibverbs::*;
 use std::ffi::CStr;
 
-/// Find a siw device from the device list, returning its name.
-fn find_siw_device() -> Option<String> {
+/// Find a software RDMA device (siw or rxe) from the device list, returning its name.
+fn find_rdma_device() -> Option<String> {
     unsafe {
         let mut num_devices: i32 = 0;
         let device_list = ibv_get_device_list(&mut num_devices);
@@ -25,7 +25,7 @@ fn find_siw_device() -> Option<String> {
             let name_ptr = ibv_get_device_name(device);
             if !name_ptr.is_null() {
                 let name = CStr::from_ptr(name_ptr).to_string_lossy().into_owned();
-                if name.starts_with("siw") {
+                if name.starts_with("siw") || name.starts_with("rxe") {
                     result = Some(name);
                     break;
                 }
@@ -37,9 +37,9 @@ fn find_siw_device() -> Option<String> {
     }
 }
 
-/// Open a siw device, returning (context, device_name).
-/// Panics if no siw device is available.
-fn open_siw_device() -> (*mut ibv_context, String) {
+/// Open a software RDMA device (siw or rxe), returning (context, device_name).
+/// Panics if no software RDMA device is available.
+fn open_rdma_device() -> (*mut ibv_context, String) {
     unsafe {
         let mut num_devices: i32 = 0;
         let device_list = ibv_get_device_list(&mut num_devices);
@@ -57,7 +57,7 @@ fn open_siw_device() -> (*mut ibv_context, String) {
             let name_ptr = ibv_get_device_name(device);
             if !name_ptr.is_null() {
                 let n = CStr::from_ptr(name_ptr).to_string_lossy().into_owned();
-                if n.starts_with("siw") {
+                if n.starts_with("siw") || n.starts_with("rxe") {
                     ctx = ibv_open_device(device);
                     name = n;
                     break;
@@ -68,25 +68,25 @@ fn open_siw_device() -> (*mut ibv_context, String) {
         ibv_free_device_list(device_list);
         assert!(
             !ctx.is_null(),
-            "no siw device found or ibv_open_device failed"
+            "no software RDMA device (siw/rxe) found or ibv_open_device failed"
         );
         (ctx, name)
     }
 }
 
 #[test]
-fn test_siw_device_available() {
-    let name = find_siw_device();
+fn test_rdma_device_available() {
+    let name = find_rdma_device();
     assert!(
         name.is_some(),
-        "No siw device found. Run: sudo modprobe siw && sudo rdma link add siw0 type siw netdev eth0"
+        "No software RDMA device found. Run: sudo modprobe siw && sudo rdma link add siw0 type siw netdev eth0"
     );
-    println!("Found siw device: {}", name.unwrap());
+    println!("Found RDMA device: {}", name.unwrap());
 }
 
 #[test]
 fn test_open_close_device() {
-    let (ctx, name) = open_siw_device();
+    let (ctx, name) = open_rdma_device();
     println!("Opened device: {}", name);
     let ret = unsafe { ibv_close_device(ctx) };
     assert_eq!(ret, 0, "ibv_close_device failed");
@@ -94,7 +94,7 @@ fn test_open_close_device() {
 
 #[test]
 fn test_query_device() {
-    let (ctx, name) = open_siw_device();
+    let (ctx, name) = open_rdma_device();
     unsafe {
         let mut attr: ibv_device_attr = std::mem::zeroed();
         let ret = ibv_query_device(ctx, &mut attr);
@@ -118,7 +118,7 @@ fn test_query_device() {
 
 #[test]
 fn test_alloc_dealloc_pd() {
-    let (ctx, _) = open_siw_device();
+    let (ctx, _) = open_rdma_device();
     unsafe {
         let pd = ibv_alloc_pd(ctx);
         assert!(!pd.is_null(), "ibv_alloc_pd failed");
@@ -132,7 +132,7 @@ fn test_alloc_dealloc_pd() {
 
 #[test]
 fn test_create_destroy_cq() {
-    let (ctx, _) = open_siw_device();
+    let (ctx, _) = open_rdma_device();
     unsafe {
         let cq = ibv_create_cq(ctx, 16, std::ptr::null_mut(), std::ptr::null_mut(), 0);
         assert!(!cq.is_null(), "ibv_create_cq failed");
@@ -146,7 +146,7 @@ fn test_create_destroy_cq() {
 
 #[test]
 fn test_register_deregister_mr() {
-    let (ctx, _) = open_siw_device();
+    let (ctx, _) = open_rdma_device();
     unsafe {
         let pd = ibv_alloc_pd(ctx);
         assert!(!pd.is_null(), "ibv_alloc_pd failed");
@@ -173,10 +173,10 @@ fn test_register_deregister_mr() {
 }
 
 #[test]
-fn test_create_qp_with_siw() {
-    // QP creation works on siw, but manual state transitions
-    // (INIT→RTR→RTS) fail because iWARP needs rdma_cm.
-    let (ctx, _) = open_siw_device();
+fn test_create_qp() {
+    // QP creation works on siw and rxe. Manual state transitions
+    // (INIT→RTR→RTS) fail on siw because iWARP needs rdma_cm.
+    let (ctx, _) = open_rdma_device();
     unsafe {
         let pd = ibv_alloc_pd(ctx);
         assert!(!pd.is_null());
@@ -196,7 +196,7 @@ fn test_create_qp_with_siw() {
         qp_init_attr.qp_type = IBV_QPT_RC;
 
         let qp = ibv_create_qp(pd, &mut qp_init_attr);
-        assert!(!qp.is_null(), "ibv_create_qp failed on siw");
+        assert!(!qp.is_null(), "ibv_create_qp failed");
         println!("QP created: qp_num={}", (*qp).qp_num);
 
         let ret = ibv_destroy_qp(qp);
@@ -211,7 +211,7 @@ fn test_create_qp_with_siw() {
 
 #[test]
 fn test_multiple_resources() {
-    let (ctx, _) = open_siw_device();
+    let (ctx, _) = open_rdma_device();
     unsafe {
         let pd1 = ibv_alloc_pd(ctx);
         let pd2 = ibv_alloc_pd(ctx);

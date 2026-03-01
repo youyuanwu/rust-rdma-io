@@ -67,3 +67,11 @@ add_custom_target(generate
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     COMMENT "Regenerating RDMA bindings"
 )
+
+# ---------------------------------------------------------------------------
+# Optional: build rdma_rxe kernel module from source
+# ---------------------------------------------------------------------------
+option(BUILD_RXE "Download kernel source and build rdma_rxe.ko out-of-tree" OFF)
+if(BUILD_RXE)
+    include(cmake/BuildRxe.cmake)
+endif()

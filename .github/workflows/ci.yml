@@ -55,7 +55,7 @@ jobs:
           toolchain: "1.93.0"
           components: clippy
 
-      - uses: Swatinem/rust-cache@v2
+      # - uses: Swatinem/rust-cache@v2
 
       - name: Configure (download bnd-linux.winmd)
         run: cmake -B build
@@ -71,3 +71,53 @@ jobs:
 
       - name: Doc tests
         run: cargo test --doc --workspace --features tokio
+
+  build-rxe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libibverbs-dev \
+            librdmacm-dev \
+            rdma-core \
+            ibverbs-utils \
+            iproute2 \
+            cmake \
+            libclang-dev \
+            linux-headers-$(uname -r)
+
+      - name: Configure and build rdma_rxe.ko
+        run: |
+          cmake -B build -DBUILD_RXE=ON
+          cmake --build build --target rxe
+
+      - name: Load rdma_rxe and create device
+        run: |
+          # Remove Mellanox VFs if present (avoids test device confusion)
+          sudo rmmod mlx5_ib 2>/dev/null || true
+          sudo modprobe ib_core rdma_ucm
+          sudo insmod build/_deps/linux_kernel-build/rxe/rdma_rxe.ko
+          IFACE=$(ip -o link show up | awk -F': ' '{print $2}' | grep -v lo | head -1)
+          echo "Creating rxe0 on interface: $IFACE"
+          sudo rdma link add rxe0 type rxe netdev "$IFACE"
+
+          # Verify
+          ibv_devices
+          rdma link show
+          lsmod | grep -E "rdma_rxe|ib_core"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.93.0"
+          components: clippy
+
+      - name: Build
+        run: cargo build --workspace --features tokio
+
+      - name: Test
+        run: cargo test -p rdma-io-tests

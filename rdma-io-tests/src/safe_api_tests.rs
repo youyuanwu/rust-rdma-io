@@ -1,4 +1,4 @@
-//! Safe API (rdma-io) integration tests against SoftIWarp.
+//! Safe API (rdma-io) integration tests against software RDMA devices (siw/rxe).
 
 use rdma_io::device;
 use rdma_io::mr::AccessFlags;
@@ -7,8 +7,10 @@ use rdma_io::wc::WorkCompletion;
 use rdma_io::wr::QpType;
 use std::sync::Arc;
 
-fn require_siw() -> Arc<rdma_io::device::Context> {
+/// Open a software RDMA device (siw or rxe), preferring siw0/rxe0.
+fn require_rdma_device() -> Arc<rdma_io::device::Context> {
     let ctx = device::open_device_by_name("siw0")
+        .or_else(|_| device::open_device_by_name("rxe0"))
         .or_else(|_| device::open_first_device())
         .expect("No RDMA device available");
     Arc::new(ctx)
@@ -25,7 +27,7 @@ fn safe_device_enumeration() {
 
 #[test]
 fn safe_open_device() {
-    let ctx = require_siw();
+    let ctx = require_rdma_device();
     let attr = ctx.query_device().expect("query_device failed");
     println!(
         "max_qp={}, max_cq={}, max_mr={}",
@@ -36,14 +38,14 @@ fn safe_open_device() {
 
 #[test]
 fn safe_query_port() {
-    let ctx = require_siw();
+    let ctx = require_rdma_device();
     let port_attr = ctx.query_port(1).expect("query_port failed");
     println!("port state={}, lid={}", port_attr.state, port_attr.lid);
 }
 
 #[test]
 fn safe_query_gid() {
-    let ctx = require_siw();
+    let ctx = require_rdma_device();
     let gid = ctx.query_gid(1, 0).expect("query_gid failed");
     let raw = unsafe { gid.raw };
     println!("GID[0] = {:02x?}", raw);
@@ -51,7 +53,7 @@ fn safe_query_gid() {
 
 #[test]
 fn safe_pd_lifecycle() {
-    let ctx = require_siw();
+    let ctx = require_rdma_device();
     let pd = ctx.alloc_pd().expect("alloc_pd failed");
     assert!(!pd.as_raw().is_null());
     // PD is dropped here — RAII dealloc
@@ -59,7 +61,7 @@ fn safe_pd_lifecycle() {
 
 #[test]
 fn safe_cq_lifecycle() {
-    let ctx = require_siw();
+    let ctx = require_rdma_device();
     let cq = ctx.create_cq(32).expect("create_cq failed");
     assert!(!cq.as_raw().is_null());
 
@@ -71,7 +73,7 @@ fn safe_cq_lifecycle() {
 
 #[test]
 fn safe_mr_borrowed() {
-    let ctx = require_siw();
+    let ctx = require_rdma_device();
     let pd = ctx.alloc_pd().unwrap();
     let mut buf = vec![0u8; 4096];
     let mr = pd
@@ -88,7 +90,7 @@ fn safe_mr_borrowed() {
 
 #[test]
 fn safe_mr_owned() {
-    let ctx = require_siw();
+    let ctx = require_rdma_device();
     let pd = ctx.alloc_pd().unwrap();
     let buf = vec![42u8; 2048];
     let mr = pd
@@ -101,7 +103,7 @@ fn safe_mr_owned() {
 
 #[test]
 fn safe_qp_create_destroy() {
-    let ctx = require_siw();
+    let ctx = require_rdma_device();
     let pd = ctx.alloc_pd().unwrap();
     let send_cq = ctx.create_cq(16).unwrap();
     let recv_cq = ctx.create_cq(16).unwrap();
@@ -125,7 +127,7 @@ fn safe_qp_create_destroy() {
 
 #[test]
 fn safe_multiple_resources() {
-    let ctx = require_siw();
+    let ctx = require_rdma_device();
     let pd1 = ctx.alloc_pd().unwrap();
     let pd2 = ctx.alloc_pd().unwrap();
     let cq1 = ctx.create_cq(32).unwrap();
