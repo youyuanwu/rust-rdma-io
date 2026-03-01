@@ -12,7 +12,7 @@ windows_link::link!("ibverbs" "C" fn ___ibv_query_port(context : *mut ibv_contex
 windows_link::link!("ibverbs" "C" fn __ibv_reg_mr(pd : *mut ibv_pd, addr : *mut core::ffi::c_void, length : u64, access : u32, is_access_const : i32) -> *mut ibv_mr);
 windows_link::link!("ibverbs" "C" fn __ibv_reg_mr_iova(pd : *mut ibv_pd, addr : *mut core::ffi::c_void, length : u64, iova : u64, access : u32, is_access_const : i32) -> *mut ibv_mr);
 windows_link::link!("ibverbs" "C" fn _ibv_query_gid_ex(context : *mut ibv_context, port_num : u32, gid_index : u32, entry : *mut ibv_gid_entry, flags : u32, entry_size : u64) -> i32);
-windows_link::link!("ibverbs" "C" fn _ibv_query_gid_table(context : *mut ibv_context, entries : *mut ibv_gid_entry, max_entries : u64, flags : u32, entry_size : u64) -> bnd_posix::posix::types:: ssize_t);
+windows_link::link!("ibverbs" "C" fn _ibv_query_gid_table(context : *mut ibv_context, entries : *mut ibv_gid_entry, max_entries : u64, flags : u32, entry_size : u64) -> bnd_linux::libc::posix::types:: ssize_t);
 windows_link::link!("ibverbs" "C" fn ibv_ack_async_event(event : *mut ibv_async_event));
 windows_link::link!("ibverbs" "C" fn ibv_ack_cq_events(cq : *mut ibv_cq, nevents : u32));
 windows_link::link!("ibverbs" "C" fn ibv_advise_mr(pd : *mut ibv_pd, advice : ib_uverbs_advise_mr_advice, flags : u32, sg_list : *mut ibv_sge, num_sge : u32) -> i32);
@@ -65,11 +65,11 @@ windows_link::link!("ibverbs" "C" fn ibv_free_device_list(list : *mut *mut ibv_d
 windows_link::link!("ibverbs" "C" fn ibv_free_dm(dm : *mut ibv_dm) -> i32);
 windows_link::link!("ibverbs" "C" fn ibv_get_async_event(context : *mut ibv_context, event : *mut ibv_async_event) -> i32);
 windows_link::link!("ibverbs" "C" fn ibv_get_cq_event(channel : *mut ibv_comp_channel, cq : *mut *mut ibv_cq, cq_context : *mut *mut core::ffi::c_void) -> i32);
-windows_link::link!("ibverbs" "C" fn ibv_get_device_guid(device : *mut ibv_device) -> bnd_linux::linux::types:: __be64);
+windows_link::link!("ibverbs" "C" fn ibv_get_device_guid(device : *mut ibv_device) -> bnd_linux::libc::linux::types:: __be64);
 windows_link::link!("ibverbs" "C" fn ibv_get_device_index(device : *mut ibv_device) -> i32);
 windows_link::link!("ibverbs" "C" fn ibv_get_device_list(num_devices : *mut i32) -> *mut *mut ibv_device);
 windows_link::link!("ibverbs" "C" fn ibv_get_device_name(device : *mut ibv_device) -> *mut i8);
-windows_link::link!("ibverbs" "C" fn ibv_get_pkey_index(context : *mut ibv_context, port_num : u8, pkey : bnd_linux::linux::types:: __be16) -> i32);
+windows_link::link!("ibverbs" "C" fn ibv_get_pkey_index(context : *mut ibv_context, port_num : u8, pkey : bnd_linux::libc::linux::types:: __be16) -> i32);
 windows_link::link!("ibverbs" "C" fn ibv_get_srq_num(srq : *mut ibv_srq, srq_num : *mut u32) -> i32);
 windows_link::link!("ibverbs" "C" fn ibv_import_device(cmd_fd : i32) -> *mut ibv_context);
 windows_link::link!("ibverbs" "C" fn ibv_import_dm(context : *mut ibv_context, dm_handle : u32) -> *mut ibv_dm);
@@ -105,8 +105,8 @@ windows_link::link!("ibverbs" "C" fn ibv_query_device_ex(context : *mut ibv_cont
 windows_link::link!("ibverbs" "C" fn ibv_query_ece(qp : *mut ibv_qp, ece : *mut ibv_ece) -> i32);
 windows_link::link!("ibverbs" "C" fn ibv_query_gid(context : *mut ibv_context, port_num : u8, index : i32, gid : *mut ibv_gid) -> i32);
 windows_link::link!("ibverbs" "C" fn ibv_query_gid_ex(context : *mut ibv_context, port_num : u32, gid_index : u32, entry : *mut ibv_gid_entry, flags : u32) -> i32);
-windows_link::link!("ibverbs" "C" fn ibv_query_gid_table(context : *mut ibv_context, entries : *mut ibv_gid_entry, max_entries : u64, flags : u32) -> bnd_posix::posix::types:: ssize_t);
-windows_link::link!("ibverbs" "C" fn ibv_query_pkey(context : *mut ibv_context, port_num : u8, index : i32, pkey : *mut bnd_linux::linux::types:: __be16) -> i32);
+windows_link::link!("ibverbs" "C" fn ibv_query_gid_table(context : *mut ibv_context, entries : *mut ibv_gid_entry, max_entries : u64, flags : u32) -> bnd_linux::libc::posix::types:: ssize_t);
+windows_link::link!("ibverbs" "C" fn ibv_query_pkey(context : *mut ibv_context, port_num : u8, index : i32, pkey : *mut bnd_linux::libc::linux::types:: __be16) -> i32);
 windows_link::link!("ibverbs" "C" fn ibv_query_port(context : *mut ibv_context, port_num : u8, port_attr : *mut core::ffi::c_void) -> i32);
 windows_link::link!("ibverbs" "C" fn ibv_query_qp(qp : *mut ibv_qp, attr : *mut ibv_qp_attr, attr_mask : i32, init_attr : *mut ibv_qp_init_attr) -> i32);
 windows_link::link!("ibverbs" "C" fn ibv_query_qp_data_in_order(qp : *mut ibv_qp, op : ibv_wr_opcode, flags : u32) -> i32);
@@ -135,7 +135,7 @@ windows_link::link!("ibverbs" "C" fn ibv_wc_read_completion_wallclock_ns(cq : *m
 windows_link::link!("ibverbs" "C" fn ibv_wc_read_cvlan(cq : *mut ibv_cq_ex) -> u16);
 windows_link::link!("ibverbs" "C" fn ibv_wc_read_dlid_path_bits(cq : *mut ibv_cq_ex) -> u8);
 windows_link::link!("ibverbs" "C" fn ibv_wc_read_flow_tag(cq : *mut ibv_cq_ex) -> u32);
-windows_link::link!("ibverbs" "C" fn ibv_wc_read_imm_data(cq : *mut ibv_cq_ex) -> bnd_linux::linux::types:: __be32);
+windows_link::link!("ibverbs" "C" fn ibv_wc_read_imm_data(cq : *mut ibv_cq_ex) -> bnd_linux::libc::linux::types:: __be32);
 windows_link::link!("ibverbs" "C" fn ibv_wc_read_invalidated_rkey(cq : *mut ibv_cq_ex) -> u32);
 windows_link::link!("ibverbs" "C" fn ibv_wc_read_opcode(cq : *mut ibv_cq_ex) -> ibv_wc_opcode);
 windows_link::link!("ibverbs" "C" fn ibv_wc_read_qp_num(cq : *mut ibv_cq_ex) -> u32);
@@ -157,9 +157,9 @@ windows_link::link!("ibverbs" "C" fn ibv_wr_local_inv(qp : *mut ibv_qp_ex, inval
 windows_link::link!("ibverbs" "C" fn ibv_wr_opcode_str(opcode : ibv_wr_opcode) -> *mut i8);
 windows_link::link!("ibverbs" "C" fn ibv_wr_rdma_read(qp : *mut ibv_qp_ex, rkey : u32, remote_addr : u64));
 windows_link::link!("ibverbs" "C" fn ibv_wr_rdma_write(qp : *mut ibv_qp_ex, rkey : u32, remote_addr : u64));
-windows_link::link!("ibverbs" "C" fn ibv_wr_rdma_write_imm(qp : *mut ibv_qp_ex, rkey : u32, remote_addr : u64, imm_data : bnd_linux::linux::types:: __be32));
+windows_link::link!("ibverbs" "C" fn ibv_wr_rdma_write_imm(qp : *mut ibv_qp_ex, rkey : u32, remote_addr : u64, imm_data : bnd_linux::libc::linux::types:: __be32));
 windows_link::link!("ibverbs" "C" fn ibv_wr_send(qp : *mut ibv_qp_ex));
-windows_link::link!("ibverbs" "C" fn ibv_wr_send_imm(qp : *mut ibv_qp_ex, imm_data : bnd_linux::linux::types:: __be32));
+windows_link::link!("ibverbs" "C" fn ibv_wr_send_imm(qp : *mut ibv_qp_ex, imm_data : bnd_linux::libc::linux::types:: __be32));
 windows_link::link!("ibverbs" "C" fn ibv_wr_send_inv(qp : *mut ibv_qp_ex, invalidate_rkey : u32));
 windows_link::link!("ibverbs" "C" fn ibv_wr_send_tso(qp : *mut ibv_qp_ex, hdr : *mut core::ffi::c_void, hdr_sz : u16, mss : u16));
 windows_link::link!("ibverbs" "C" fn ibv_wr_set_inline_data(qp : *mut ibv_qp_ex, addr : *mut core::ffi::c_void, length : u64));
@@ -1467,8 +1467,8 @@ impl Default for ib_uverbs_flow_attr {
 pub struct ib_uverbs_flow_eth_filter {
     pub dst_mac: [u8; 6],
     pub src_mac: [u8; 6],
-    pub ether_type: bnd_linux::linux::types::__be16,
-    pub vlan_tag: bnd_linux::linux::types::__be16,
+    pub ether_type: bnd_linux::libc::linux::types::__be16,
+    pub vlan_tag: bnd_linux::libc::linux::types::__be16,
 }
 impl Default for ib_uverbs_flow_eth_filter {
     fn default() -> Self {
@@ -1478,15 +1478,15 @@ impl Default for ib_uverbs_flow_eth_filter {
 #[repr(C, packed(4))]
 #[derive(Clone, Copy, Default)]
 pub struct ib_uverbs_flow_gre_filter {
-    pub c_ks_res0_ver: bnd_linux::linux::types::__be16,
-    pub protocol: bnd_linux::linux::types::__be16,
-    pub key: bnd_linux::linux::types::__be32,
+    pub c_ks_res0_ver: bnd_linux::libc::linux::types::__be16,
+    pub protocol: bnd_linux::libc::linux::types::__be16,
+    pub key: bnd_linux::libc::linux::types::__be32,
 }
 #[repr(C, packed(4))]
 #[derive(Clone, Copy, Default)]
 pub struct ib_uverbs_flow_ipv4_filter {
-    pub src_ip: bnd_linux::linux::types::__be32,
-    pub dst_ip: bnd_linux::linux::types::__be32,
+    pub src_ip: bnd_linux::libc::linux::types::__be32,
+    pub dst_ip: bnd_linux::libc::linux::types::__be32,
     pub proto: u8,
     pub tos: u8,
     pub ttl: u8,
@@ -1497,7 +1497,7 @@ pub struct ib_uverbs_flow_ipv4_filter {
 pub struct ib_uverbs_flow_ipv6_filter {
     pub src_ip: [u8; 16],
     pub dst_ip: [u8; 16],
-    pub flow_label: bnd_linux::linux::types::__be32,
+    pub flow_label: bnd_linux::libc::linux::types::__be32,
     pub next_hdr: u8,
     pub traffic_class: u8,
     pub hop_limit: u8,
@@ -1511,7 +1511,7 @@ impl Default for ib_uverbs_flow_ipv6_filter {
 #[repr(C, packed(4))]
 #[derive(Clone, Copy, Default)]
 pub struct ib_uverbs_flow_mpls_filter {
-    pub label: bnd_linux::linux::types::__be32,
+    pub label: bnd_linux::libc::linux::types::__be32,
 }
 #[repr(C, packed(8))]
 #[derive(Clone, Copy)]
@@ -1897,13 +1897,13 @@ pub struct ib_uverbs_flow_spec_tunnel__anon_0__anon_0 {
 #[repr(C, packed(2))]
 #[derive(Clone, Copy, Default)]
 pub struct ib_uverbs_flow_tcp_udp_filter {
-    pub dst_port: bnd_linux::linux::types::__be16,
-    pub src_port: bnd_linux::linux::types::__be16,
+    pub dst_port: bnd_linux::libc::linux::types::__be16,
+    pub src_port: bnd_linux::libc::linux::types::__be16,
 }
 #[repr(C, packed(4))]
 #[derive(Clone, Copy, Default)]
 pub struct ib_uverbs_flow_tunnel_filter {
-    pub tunnel_id: bnd_linux::linux::types::__be32,
+    pub tunnel_id: bnd_linux::libc::linux::types::__be32,
 }
 #[repr(C, packed(8))]
 #[derive(Clone, Copy)]
@@ -2228,8 +2228,8 @@ impl Default for ib_uverbs_query_device {
 #[derive(Clone, Copy)]
 pub struct ib_uverbs_query_device_resp {
     pub fw_ver: u64,
-    pub node_guid: bnd_linux::linux::types::__be64,
-    pub sys_image_guid: bnd_linux::linux::types::__be64,
+    pub node_guid: bnd_linux::libc::linux::types::__be64,
+    pub sys_image_guid: bnd_linux::libc::linux::types::__be64,
     pub max_mr_size: u64,
     pub page_size_cap: u64,
     pub vendor_id: u32,
@@ -2527,7 +2527,7 @@ impl Default for ib_uverbs_send_wr {
 #[repr(C, packed(4))]
 #[derive(Clone, Copy)]
 pub union ib_uverbs_send_wr_ex {
-    pub imm_data: bnd_linux::linux::types::__be32,
+    pub imm_data: bnd_linux::libc::linux::types::__be32,
     pub invalidate_rkey: u32,
 }
 impl Default for ib_uverbs_send_wr_ex {
@@ -2616,7 +2616,7 @@ impl Default for ib_uverbs_wc {
 #[repr(C, packed(4))]
 #[derive(Clone, Copy)]
 pub union ib_uverbs_wc_ex {
-    pub imm_data: bnd_linux::linux::types::__be32,
+    pub imm_data: bnd_linux::libc::linux::types::__be32,
     pub invalidate_rkey: u32,
 }
 impl Default for ib_uverbs_wc_ex {
@@ -2711,7 +2711,7 @@ pub struct ibv_context {
     pub cmd_fd: i32,
     pub async_fd: i32,
     pub num_comp_vectors: i32,
-    pub mutex: bnd_posix::posix::pthread::pthread_mutex_t,
+    pub mutex: bnd_linux::libc::posix::pthread::pthread_mutex_t,
     pub abi_compat: *mut core::ffi::c_void,
 }
 impl Default for ibv_context {
@@ -2791,8 +2791,8 @@ pub struct ibv_cq {
     pub cq_context: *mut core::ffi::c_void,
     pub handle: u32,
     pub cqe: i32,
-    pub mutex: bnd_posix::posix::pthread::pthread_mutex_t,
-    pub cond: bnd_posix::posix::pthread::pthread_cond_t,
+    pub mutex: bnd_linux::libc::posix::pthread::pthread_mutex_t,
+    pub cond: bnd_linux::libc::posix::pthread::pthread_cond_t,
     pub comp_events_completed: u32,
     pub async_events_completed: u32,
 }
@@ -2810,8 +2810,8 @@ pub struct ibv_cq_ex {
     pub cq_context: *mut core::ffi::c_void,
     pub handle: u32,
     pub cqe: i32,
-    pub mutex: bnd_posix::posix::pthread::pthread_mutex_t,
-    pub cond: bnd_posix::posix::pthread::pthread_cond_t,
+    pub mutex: bnd_linux::libc::posix::pthread::pthread_mutex_t,
+    pub cond: bnd_linux::libc::posix::pthread::pthread_cond_t,
     pub comp_events_completed: u32,
     pub async_events_completed: u32,
     pub comp_mask: u32,
@@ -2898,8 +2898,8 @@ impl Default for ibv_device {
 #[derive(Clone, Copy)]
 pub struct ibv_device_attr {
     pub fw_ver: [i8; 64],
-    pub node_guid: bnd_linux::linux::types::__be64,
-    pub sys_image_guid: bnd_linux::linux::types::__be64,
+    pub node_guid: bnd_linux::libc::linux::types::__be64,
+    pub sys_image_guid: bnd_linux::libc::linux::types::__be64,
     pub max_mr_size: u64,
     pub page_size_cap: u64,
     pub vendor_id: u32,
@@ -3294,8 +3294,8 @@ impl Default for ibv_gid_entry {
 #[repr(C, packed(8))]
 #[derive(Clone, Copy, Default)]
 pub struct ibv_gid_global {
-    pub subnet_prefix: bnd_linux::linux::types::__be64,
-    pub interface_id: bnd_linux::linux::types::__be64,
+    pub subnet_prefix: bnd_linux::libc::linux::types::__be64,
+    pub interface_id: bnd_linux::libc::linux::types::__be64,
 }
 pub type ibv_gid_type = u32;
 #[repr(C, packed(8))]
@@ -3315,8 +3315,8 @@ impl Default for ibv_global_route {
 #[repr(C, packed(8))]
 #[derive(Clone, Copy)]
 pub struct ibv_grh {
-    pub version_tclass_flow: bnd_linux::linux::types::__be32,
-    pub paylen: bnd_linux::linux::types::__be16,
+    pub version_tclass_flow: bnd_linux::libc::linux::types::__be32,
+    pub paylen: bnd_linux::libc::linux::types::__be16,
     pub next_hdr: u8,
     pub hop_limit: u8,
     pub sgid: ibv_gid,
@@ -3537,8 +3537,8 @@ pub struct ibv_qp {
     pub qp_num: u32,
     pub state: ibv_qp_state,
     pub qp_type: ibv_qp_type,
-    pub mutex: bnd_posix::posix::pthread::pthread_mutex_t,
-    pub cond: bnd_posix::posix::pthread::pthread_cond_t,
+    pub mutex: bnd_linux::libc::posix::pthread::pthread_mutex_t,
+    pub cond: bnd_linux::libc::posix::pthread::pthread_cond_t,
     pub events_completed: u32,
 }
 impl Default for ibv_qp {
@@ -3794,7 +3794,7 @@ impl Default for ibv_send_wr {
 #[repr(C, packed(4))]
 #[derive(Clone, Copy)]
 pub union ibv_send_wr__anon_0 {
-    pub imm_data: bnd_linux::linux::types::__be32,
+    pub imm_data: bnd_linux::libc::linux::types::__be32,
     pub invalidate_rkey: u32,
 }
 impl Default for ibv_send_wr__anon_0 {
@@ -3904,8 +3904,8 @@ pub struct ibv_srq {
     pub srq_context: *mut core::ffi::c_void,
     pub pd: *mut ibv_pd,
     pub handle: u32,
-    pub mutex: bnd_posix::posix::pthread::pthread_mutex_t,
-    pub cond: bnd_posix::posix::pthread::pthread_cond_t,
+    pub mutex: bnd_linux::libc::posix::pthread::pthread_mutex_t,
+    pub cond: bnd_linux::libc::posix::pthread::pthread_cond_t,
     pub events_completed: u32,
 }
 impl Default for ibv_srq {
@@ -3993,7 +3993,7 @@ pub struct ibv_tso_caps {
 #[derive(Clone, Copy, Default)]
 pub struct ibv_values_ex {
     pub comp_mask: u32,
-    pub raw_clock: bnd_posix::posix::stat::timespec,
+    pub raw_clock: bnd_linux::libc::posix::stat::timespec,
 }
 pub type ibv_values_mask = u32;
 #[repr(C, packed(8))]
@@ -4021,7 +4021,7 @@ impl Default for ibv_wc {
 #[repr(C, packed(4))]
 #[derive(Clone, Copy)]
 pub union ibv_wc__anon_0 {
-    pub imm_data: bnd_linux::linux::types::__be32,
+    pub imm_data: bnd_linux::libc::linux::types::__be32,
     pub invalidated_rkey: u32,
 }
 impl Default for ibv_wc__anon_0 {
@@ -4050,8 +4050,8 @@ pub struct ibv_wq {
     pub state: ibv_wq_state,
     pub wq_type: ibv_wq_type,
     pub post_recv: *mut isize,
-    pub mutex: bnd_posix::posix::pthread::pthread_mutex_t,
-    pub cond: bnd_posix::posix::pthread::pthread_cond_t,
+    pub mutex: bnd_linux::libc::posix::pthread::pthread_mutex_t,
+    pub cond: bnd_linux::libc::posix::pthread::pthread_cond_t,
     pub events_completed: u32,
     pub comp_mask: u32,
 }

@@ -101,14 +101,6 @@ checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
 name = "bnd-linux"
 version = "0.0.1"
 dependencies = [
- "bnd-posix",
- "windows-link",
-]
-
-[[package]]
-name = "bnd-posix"
-version = "0.0.1"
-dependencies = [
  "windows-link",
 ]
 
@@ -552,7 +544,7 @@ version = "0.1.0"
 dependencies = [
  "async-io",
  "bitflags",
- "bnd-posix",
+ "bnd-linux",
  "futures-io",
  "libc",
  "rdma-io-sys",
@@ -566,7 +558,6 @@ name = "rdma-io-sys"
 version = "0.1.0"
 dependencies = [
  "bnd-linux",
- "bnd-posix",
  "cc",
  "windows-link",
 ]

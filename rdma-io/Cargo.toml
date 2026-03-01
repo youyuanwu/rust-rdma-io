@@ -11,12 +11,12 @@ tokio = ["dep:tokio", "dep:futures-io"]
 smol = ["dep:async-io", "dep:futures-io"]
 
 [dependencies]
-rdma-io-sys = { path = "../rdma-io-sys" }
-bnd-posix = { path = "../../bnd/bnd-posix" }
-bitflags = "2"
-thiserror = "2"
-tracing = "0.1"
-libc = "0.2"
-futures-io = { version = "0.3", optional = true }
-tokio = { version = "1", features = ["net"], optional = true }
-async-io = { version = "2", optional = true }
+rdma-io-sys.workspace = true
+bnd-linux = { workspace = true, features = ["posix_socket", "posix_inet"] }
+bitflags.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+libc.workspace = true
+futures-io = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+async-io = { workspace = true, optional = true }

@@ -4,9 +4,9 @@ use std::path::Path;
 ///
 /// 1. Runs bnd-winmd on `rdma.toml` to produce a `.winmd`.
 /// 2. Runs `windows-bindgen --package` to emit `src/rdma/*/mod.rs`.
-///    Passes posix and linux winmds so cross-winmd type references
+///    Passes the linux winmd so cross-winmd type references
 ///    resolve correctly.  `--reference` suppresses codegen for those
-///    types; the generated code uses `bnd_posix::posix::…` and
+///    types; the generated code uses `bnd_linux::posix::…` and
 ///    `bnd_linux::linux::…` paths.
 /// 3. Saves the `.winmd` under `output_dir/winmd/`.
 pub fn generate(output_dir: &Path) {
@@ -19,14 +19,7 @@ pub fn generate(output_dir: &Path) {
     bnd_winmd::run(&gen_dir.join("rdma.toml"), Some(&rdma_winmd))
         .expect("bnd-winmd failed to generate winmd");
 
-    // Step 2: Locate posix and linux winmds
-    let posix_winmd = gen_dir.join("../../bnd/bnd-posix/winmd/bnd-posix.winmd");
-    assert!(
-        posix_winmd.exists(),
-        "posix winmd not found at {}\n\
-         Hint: run `cargo run -p bnd-posix-gen` in ../bnd first",
-        posix_winmd.display()
-    );
+    // Step 2: Locate linux winmd (contains both posix and linux namespaces)
     let linux_winmd = gen_dir.join("../../bnd/bnd-linux/winmd/bnd-linux.winmd");
     assert!(
         linux_winmd.exists(),
@@ -40,17 +33,15 @@ pub fn generate(output_dir: &Path) {
         "--in",
         rdma_winmd.to_str().unwrap(),
         "--in",
-        posix_winmd.to_str().unwrap(),
-        "--in",
         linux_winmd.to_str().unwrap(),
         "--out",
         output_dir.to_str().unwrap(),
         "--filter",
         "rdma",
         "--reference",
-        "bnd_posix,full,posix",
+        "bnd_linux,full,libc.posix",
         "--reference",
-        "bnd_linux,full,linux",
+        "bnd_linux,full,libc.linux",
         "--sys",
         "--package",
         "--no-toml",

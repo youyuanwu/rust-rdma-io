@@ -430,13 +430,13 @@ const AF_INET6: u16 = 10;
 
 /// Convert a `SocketAddr` to a `sockaddr_storage`-sized buffer.
 fn to_sockaddr_storage(addr: &SocketAddr) -> SockAddrBuf {
-    let mut buf = [0u8; std::mem::size_of::<bnd_posix::posix::socket::sockaddr_storage>()];
+    let mut buf = [0u8; std::mem::size_of::<bnd_linux::libc::posix::socket::sockaddr_storage>()];
     match addr {
         SocketAddr::V4(v4) => {
-            let sa = bnd_posix::posix::inet::sockaddr_in {
+            let sa = bnd_linux::libc::posix::inet::sockaddr_in {
                 sin_family: AF_INET,
                 sin_port: v4.port().to_be(),
-                sin_addr: bnd_posix::posix::inet::in_addr {
+                sin_addr: bnd_linux::libc::posix::inet::in_addr {
                     s_addr: u32::from_ne_bytes(v4.ip().octets()),
                 },
                 ..Default::default()
@@ -450,12 +450,12 @@ fn to_sockaddr_storage(addr: &SocketAddr) -> SockAddrBuf {
             }
         }
         SocketAddr::V6(v6) => {
-            let sa = bnd_posix::posix::inet::sockaddr_in6 {
+            let sa = bnd_linux::libc::posix::inet::sockaddr_in6 {
                 sin6_family: AF_INET6,
                 sin6_port: v6.port().to_be(),
                 sin6_flowinfo: v6.flowinfo(),
-                sin6_addr: bnd_posix::posix::inet::in6_addr {
-                    __in6_u: bnd_posix::posix::inet::in6_addr___in6_u {
+                sin6_addr: bnd_linux::libc::posix::inet::in6_addr {
+                    __in6_u: bnd_linux::libc::posix::inet::in6_addr___in6_u {
                         __u6_addr8: v6.ip().octets(),
                     },
                 },
@@ -474,10 +474,10 @@ fn to_sockaddr_storage(addr: &SocketAddr) -> SockAddrBuf {
 }
 
 /// Stack-allocated sockaddr buffer.
-struct SockAddrBuf([u8; std::mem::size_of::<bnd_posix::posix::socket::sockaddr_storage>()]);
+struct SockAddrBuf([u8; std::mem::size_of::<bnd_linux::libc::posix::socket::sockaddr_storage>()]);
 
 impl SockAddrBuf {
-    fn as_ptr(&self) -> *const bnd_posix::posix::socket::sockaddr {
+    fn as_ptr(&self) -> *const bnd_linux::libc::posix::socket::sockaddr {
         self.0.as_ptr().cast()
     }
 }
@@ -485,7 +485,7 @@ impl SockAddrBuf {
 fn sockaddr_args(
     src: Option<&SocketAddr>,
     dst: &SocketAddr,
-) -> (*mut bnd_posix::posix::socket::sockaddr, SockAddrBuf) {
+) -> (*mut bnd_linux::libc::posix::socket::sockaddr, SockAddrBuf) {
     let dst_sa = to_sockaddr_storage(dst);
     let src_ptr = match src {
         // For simplicity, pass null for src (let the kernel choose).

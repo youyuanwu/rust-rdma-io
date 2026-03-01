@@ -109,7 +109,7 @@ windows_link::link!("rdma_wrapper" "C" fn rdma_wrap_ibv_query_device_ex(context 
 #[cfg(feature = "ibverbs")]
 windows_link::link!("rdma_wrapper" "C" fn rdma_wrap_ibv_query_gid_ex(context : *mut super::ibverbs:: ibv_context, port_num : u32, gid_index : u32, entry : *mut super::ibverbs:: ibv_gid_entry, flags : u32) -> i32);
 #[cfg(feature = "ibverbs")]
-windows_link::link!("rdma_wrapper" "C" fn rdma_wrap_ibv_query_gid_table(context : *mut super::ibverbs:: ibv_context, entries : *mut super::ibverbs:: ibv_gid_entry, max_entries : u64, flags : u32) -> bnd_posix::posix::types:: ssize_t);
+windows_link::link!("rdma_wrapper" "C" fn rdma_wrap_ibv_query_gid_table(context : *mut super::ibverbs:: ibv_context, entries : *mut super::ibverbs:: ibv_gid_entry, max_entries : u64, flags : u32) -> bnd_linux::libc::posix::types:: ssize_t);
 #[cfg(feature = "ibverbs")]
 windows_link::link!("rdma_wrapper" "C" fn rdma_wrap_ibv_query_rt_values_ex(context : *mut super::ibverbs:: ibv_context, values : *mut super::ibverbs:: ibv_values_ex) -> i32);
 #[cfg(feature = "ibverbs")]
@@ -133,7 +133,7 @@ windows_link::link!("rdma_wrapper" "C" fn rdma_wrap_ibv_wc_read_dlid_path_bits(c
 #[cfg(feature = "ibverbs")]
 windows_link::link!("rdma_wrapper" "C" fn rdma_wrap_ibv_wc_read_flow_tag(cq : *mut super::ibverbs:: ibv_cq_ex) -> u32);
 #[cfg(feature = "ibverbs")]
-windows_link::link!("rdma_wrapper" "C" fn rdma_wrap_ibv_wc_read_imm_data(cq : *mut super::ibverbs:: ibv_cq_ex) -> bnd_linux::linux::types:: __be32);
+windows_link::link!("rdma_wrapper" "C" fn rdma_wrap_ibv_wc_read_imm_data(cq : *mut super::ibverbs:: ibv_cq_ex) -> bnd_linux::libc::linux::types:: __be32);
 #[cfg(feature = "ibverbs")]
 windows_link::link!("rdma_wrapper" "C" fn rdma_wrap_ibv_wc_read_invalidated_rkey(cq : *mut super::ibverbs:: ibv_cq_ex) -> u32);
 #[cfg(feature = "ibverbs")]
@@ -173,11 +173,11 @@ windows_link::link!("rdma_wrapper" "C" fn rdma_wrap_ibv_wr_rdma_read(qp : *mut s
 #[cfg(feature = "ibverbs")]
 windows_link::link!("rdma_wrapper" "C" fn rdma_wrap_ibv_wr_rdma_write(qp : *mut super::ibverbs:: ibv_qp_ex, rkey : u32, remote_addr : u64));
 #[cfg(feature = "ibverbs")]
-windows_link::link!("rdma_wrapper" "C" fn rdma_wrap_ibv_wr_rdma_write_imm(qp : *mut super::ibverbs:: ibv_qp_ex, rkey : u32, remote_addr : u64, imm_data : bnd_linux::linux::types:: __be32));
+windows_link::link!("rdma_wrapper" "C" fn rdma_wrap_ibv_wr_rdma_write_imm(qp : *mut super::ibverbs:: ibv_qp_ex, rkey : u32, remote_addr : u64, imm_data : bnd_linux::libc::linux::types:: __be32));
 #[cfg(feature = "ibverbs")]
 windows_link::link!("rdma_wrapper" "C" fn rdma_wrap_ibv_wr_send(qp : *mut super::ibverbs:: ibv_qp_ex));
 #[cfg(feature = "ibverbs")]
-windows_link::link!("rdma_wrapper" "C" fn rdma_wrap_ibv_wr_send_imm(qp : *mut super::ibverbs:: ibv_qp_ex, imm_data : bnd_linux::linux::types:: __be32));
+windows_link::link!("rdma_wrapper" "C" fn rdma_wrap_ibv_wr_send_imm(qp : *mut super::ibverbs:: ibv_qp_ex, imm_data : bnd_linux::libc::linux::types:: __be32));
 #[cfg(feature = "ibverbs")]
 windows_link::link!("rdma_wrapper" "C" fn rdma_wrap_ibv_wr_send_inv(qp : *mut super::ibverbs:: ibv_qp_ex, invalidate_rkey : u32));
 #[cfg(feature = "ibverbs")]

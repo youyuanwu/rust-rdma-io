@@ -13,7 +13,7 @@ windows_link::link!("rdmacm" "C" fn rdma_accept(id : *mut rdma_cm_id, conn_param
 #[cfg(feature = "ibverbs")]
 windows_link::link!("rdmacm" "C" fn rdma_ack_cm_event(event : *mut rdma_cm_event) -> i32);
 #[cfg(feature = "ibverbs")]
-windows_link::link!("rdmacm" "C" fn rdma_bind_addr(id : *mut rdma_cm_id, addr : *mut bnd_posix::posix::socket:: sockaddr) -> i32);
+windows_link::link!("rdmacm" "C" fn rdma_bind_addr(id : *mut rdma_cm_id, addr : *mut bnd_linux::libc::posix::socket:: sockaddr) -> i32);
 #[cfg(feature = "ibverbs")]
 windows_link::link!("rdmacm" "C" fn rdma_connect(id : *mut rdma_cm_id, conn_param : *mut rdma_conn_param) -> i32);
 #[cfg(feature = "ibverbs")]
@@ -45,26 +45,26 @@ windows_link::link!("rdmacm" "C" fn rdma_get_cm_event(channel : *mut rdma_event_
 #[cfg(feature = "ibverbs")]
 windows_link::link!("rdmacm" "C" fn rdma_get_devices(num_devices : *mut i32) -> *mut *mut super::ibverbs:: ibv_context);
 #[cfg(feature = "ibverbs")]
-windows_link::link!("rdmacm" "C" fn rdma_get_dst_port(id : *mut rdma_cm_id) -> bnd_linux::linux::types:: __be16);
+windows_link::link!("rdmacm" "C" fn rdma_get_dst_port(id : *mut rdma_cm_id) -> bnd_linux::libc::linux::types:: __be16);
 #[cfg(feature = "ibverbs")]
-windows_link::link!("rdmacm" "C" fn rdma_get_local_addr(id : *mut rdma_cm_id) -> *mut bnd_posix::posix::socket:: sockaddr);
+windows_link::link!("rdmacm" "C" fn rdma_get_local_addr(id : *mut rdma_cm_id) -> *mut bnd_linux::libc::posix::socket:: sockaddr);
 #[cfg(feature = "ibverbs")]
-windows_link::link!("rdmacm" "C" fn rdma_get_peer_addr(id : *mut rdma_cm_id) -> *mut bnd_posix::posix::socket:: sockaddr);
+windows_link::link!("rdmacm" "C" fn rdma_get_peer_addr(id : *mut rdma_cm_id) -> *mut bnd_linux::libc::posix::socket:: sockaddr);
 #[cfg(feature = "ibverbs")]
 windows_link::link!("rdmacm" "C" fn rdma_get_remote_ece(id : *mut rdma_cm_id, ece : *mut super::ibverbs:: ibv_ece) -> i32);
 #[cfg(feature = "ibverbs")]
 windows_link::link!("rdmacm" "C" fn rdma_get_request(listen : *mut rdma_cm_id, id : *mut *mut rdma_cm_id) -> i32);
 #[cfg(feature = "ibverbs")]
-windows_link::link!("rdmacm" "C" fn rdma_get_src_port(id : *mut rdma_cm_id) -> bnd_linux::linux::types:: __be16);
+windows_link::link!("rdmacm" "C" fn rdma_get_src_port(id : *mut rdma_cm_id) -> bnd_linux::libc::linux::types:: __be16);
 windows_link::link!("rdmacm" "C" fn rdma_getaddrinfo(node : *const i8, service : *const i8, hints : *const rdma_addrinfo, res : *mut *mut rdma_addrinfo) -> i32);
 #[cfg(feature = "ibverbs")]
 windows_link::link!("rdmacm" "C" fn rdma_init_qp_attr(id : *mut rdma_cm_id, qp_attr : *mut super::ibverbs:: ibv_qp_attr, qp_attr_mask : *mut i32) -> i32);
 #[cfg(feature = "ibverbs")]
-windows_link::link!("rdmacm" "C" fn rdma_join_multicast(id : *mut rdma_cm_id, addr : *mut bnd_posix::posix::socket:: sockaddr, context : *mut core::ffi::c_void) -> i32);
+windows_link::link!("rdmacm" "C" fn rdma_join_multicast(id : *mut rdma_cm_id, addr : *mut bnd_linux::libc::posix::socket:: sockaddr, context : *mut core::ffi::c_void) -> i32);
 #[cfg(feature = "ibverbs")]
 windows_link::link!("rdmacm" "C" fn rdma_join_multicast_ex(id : *mut rdma_cm_id, mc_join_attr : *mut rdma_cm_join_mc_attr_ex, context : *mut core::ffi::c_void) -> i32);
 #[cfg(feature = "ibverbs")]
-windows_link::link!("rdmacm" "C" fn rdma_leave_multicast(id : *mut rdma_cm_id, addr : *mut bnd_posix::posix::socket:: sockaddr) -> i32);
+windows_link::link!("rdmacm" "C" fn rdma_leave_multicast(id : *mut rdma_cm_id, addr : *mut bnd_linux::libc::posix::socket:: sockaddr) -> i32);
 #[cfg(feature = "ibverbs")]
 windows_link::link!("rdmacm" "C" fn rdma_listen(id : *mut rdma_cm_id, backlog : i32) -> i32);
 #[cfg(feature = "ibverbs")]
@@ -76,7 +76,7 @@ windows_link::link!("rdmacm" "C" fn rdma_reject(id : *mut rdma_cm_id, private_da
 #[cfg(feature = "ibverbs")]
 windows_link::link!("rdmacm" "C" fn rdma_reject_ece(id : *mut rdma_cm_id, private_data : *const core::ffi::c_void, private_data_len : u8) -> i32);
 #[cfg(feature = "ibverbs")]
-windows_link::link!("rdmacm" "C" fn rdma_resolve_addr(id : *mut rdma_cm_id, src_addr : *mut bnd_posix::posix::socket:: sockaddr, dst_addr : *mut bnd_posix::posix::socket:: sockaddr, timeout_ms : i32) -> i32);
+windows_link::link!("rdmacm" "C" fn rdma_resolve_addr(id : *mut rdma_cm_id, src_addr : *mut bnd_linux::libc::posix::socket:: sockaddr, dst_addr : *mut bnd_linux::libc::posix::socket:: sockaddr, timeout_ms : i32) -> i32);
 #[cfg(feature = "ibverbs")]
 windows_link::link!("rdmacm" "C" fn rdma_resolve_route(id : *mut rdma_cm_id, timeout_ms : i32) -> i32);
 #[cfg(feature = "ibverbs")]
@@ -147,16 +147,16 @@ impl Default for ibv_path_data {
 #[cfg(feature = "ibverbs")]
 #[derive(Clone, Copy)]
 pub struct ibv_path_record {
-    pub service_id: bnd_linux::linux::types::__be64,
+    pub service_id: bnd_linux::libc::linux::types::__be64,
     pub dgid: super::ibverbs::ibv_gid,
     pub sgid: super::ibverbs::ibv_gid,
-    pub dlid: bnd_linux::linux::types::__be16,
-    pub slid: bnd_linux::linux::types::__be16,
-    pub flowlabel_hoplimit: bnd_linux::linux::types::__be32,
+    pub dlid: bnd_linux::libc::linux::types::__be16,
+    pub slid: bnd_linux::libc::linux::types::__be16,
+    pub flowlabel_hoplimit: bnd_linux::libc::linux::types::__be32,
     pub tclass: u8,
     pub reversible_numpath: u8,
-    pub pkey: bnd_linux::linux::types::__be16,
-    pub qosclass_sl: bnd_linux::linux::types::__be16,
+    pub pkey: bnd_linux::libc::linux::types::__be16,
+    pub qosclass_sl: bnd_linux::libc::linux::types::__be16,
     pub mtu: u8,
     pub rate: u8,
     pub packetlifetime: u8,
@@ -204,15 +204,15 @@ impl Default for ibv_sa_mcmember_rec {
 pub struct ibv_sa_path_rec {
     pub dgid: super::ibverbs::ibv_gid,
     pub sgid: super::ibverbs::ibv_gid,
-    pub dlid: bnd_linux::linux::types::__be16,
-    pub slid: bnd_linux::linux::types::__be16,
+    pub dlid: bnd_linux::libc::linux::types::__be16,
+    pub slid: bnd_linux::libc::linux::types::__be16,
     pub raw_traffic: i32,
-    pub flow_label: bnd_linux::linux::types::__be32,
+    pub flow_label: bnd_linux::libc::linux::types::__be32,
     pub hop_limit: u8,
     pub traffic_class: u8,
     pub reversible: i32,
     pub numb_path: u8,
-    pub pkey: bnd_linux::linux::types::__be16,
+    pub pkey: bnd_linux::libc::linux::types::__be16,
     pub sl: u8,
     pub mtu_selector: u8,
     pub mtu: u8,
@@ -266,10 +266,10 @@ impl Default for rdma_addr {
 #[repr(C, packed(8))]
 #[derive(Clone, Copy)]
 pub union rdma_addr__anon_0 {
-    pub src_addr: bnd_posix::posix::socket::sockaddr,
-    pub src_sin: bnd_posix::posix::inet::sockaddr_in,
-    pub src_sin6: bnd_posix::posix::inet::sockaddr_in6,
-    pub src_storage: bnd_posix::posix::socket::sockaddr_storage,
+    pub src_addr: bnd_linux::libc::posix::socket::sockaddr,
+    pub src_sin: bnd_linux::libc::posix::inet::sockaddr_in,
+    pub src_sin6: bnd_linux::libc::posix::inet::sockaddr_in6,
+    pub src_storage: bnd_linux::libc::posix::socket::sockaddr_storage,
 }
 impl Default for rdma_addr__anon_0 {
     fn default() -> Self {
@@ -279,10 +279,10 @@ impl Default for rdma_addr__anon_0 {
 #[repr(C, packed(8))]
 #[derive(Clone, Copy)]
 pub union rdma_addr__anon_1 {
-    pub dst_addr: bnd_posix::posix::socket::sockaddr,
-    pub dst_sin: bnd_posix::posix::inet::sockaddr_in,
-    pub dst_sin6: bnd_posix::posix::inet::sockaddr_in6,
-    pub dst_storage: bnd_posix::posix::socket::sockaddr_storage,
+    pub dst_addr: bnd_linux::libc::posix::socket::sockaddr,
+    pub dst_sin: bnd_linux::libc::posix::inet::sockaddr_in,
+    pub dst_sin6: bnd_linux::libc::posix::inet::sockaddr_in6,
+    pub dst_storage: bnd_linux::libc::posix::socket::sockaddr_storage,
 }
 impl Default for rdma_addr__anon_1 {
     fn default() -> Self {
@@ -308,10 +308,10 @@ pub struct rdma_addrinfo {
     pub ai_family: i32,
     pub ai_qp_type: i32,
     pub ai_port_space: i32,
-    pub ai_src_len: bnd_posix::posix::unistd::socklen_t,
-    pub ai_dst_len: bnd_posix::posix::unistd::socklen_t,
-    pub ai_src_addr: *mut bnd_posix::posix::socket::sockaddr,
-    pub ai_dst_addr: *mut bnd_posix::posix::socket::sockaddr,
+    pub ai_src_len: bnd_linux::libc::posix::unistd::socklen_t,
+    pub ai_dst_len: bnd_linux::libc::posix::unistd::socklen_t,
+    pub ai_src_addr: *mut bnd_linux::libc::posix::socket::sockaddr,
+    pub ai_dst_addr: *mut bnd_linux::libc::posix::socket::sockaddr,
     pub ai_src_canonname: *mut i8,
     pub ai_dst_canonname: *mut i8,
     pub ai_route_len: u64,
@@ -386,7 +386,7 @@ impl Default for rdma_cm_id {
 pub struct rdma_cm_join_mc_attr_ex {
     pub comp_mask: u32,
     pub join_flags: u32,
-    pub addr: *mut bnd_posix::posix::socket::sockaddr,
+    pub addr: *mut bnd_linux::libc::posix::socket::sockaddr,
 }
 impl Default for rdma_cm_join_mc_attr_ex {
     fn default() -> Self {
@@ -424,7 +424,7 @@ pub struct rdma_event_channel {
 pub struct rdma_ib_addr {
     pub sgid: super::ibverbs::ibv_gid,
     pub dgid: super::ibverbs::ibv_gid,
-    pub pkey: bnd_linux::linux::types::__be16,
+    pub pkey: bnd_linux::libc::linux::types::__be16,
 }
 #[cfg(feature = "ibverbs")]
 impl Default for rdma_ib_addr {
