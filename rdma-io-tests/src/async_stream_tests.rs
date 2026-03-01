@@ -1,4 +1,4 @@
-//! AsyncRdmaStream integration tests — Phases C + D.
+//! AsyncRdmaStream integration tests — Phases C + D + F.
 //!
 //! Tests verify that `AsyncRdmaStream` provides TCP-like async read/write
 //! over RDMA SEND/RECV, using completion-channel-driven async CQ polling.
@@ -6,10 +6,8 @@
 //! Phase D tests verify the `futures::io::AsyncRead`/`AsyncWrite` trait
 //! implementations and tokio compat layer.
 //!
-//! Note: `AsyncRdmaListener::accept()` and `AsyncRdmaStream::connect()` create
-//! `TokioCqNotifier` internally, which requires a tokio reactor context.
-//! We use `tokio::task::spawn_blocking` (not `std::thread::spawn`) so the
-//! tokio Handle is available on the blocking thread.
+//! Phase F tests verify async connect/accept using CM event channel
+//! (no `spawn_blocking` needed — both connect and accept are native async).
 
 use rdma_io::async_stream::{AsyncRdmaListener, AsyncRdmaStream};
 
@@ -34,15 +32,14 @@ fn local_ip() -> String {
 async fn async_stream_echo() {
     let (bind_addr, connect_addr) = test_addrs();
 
-    let server_handle = tokio::task::spawn_blocking(move || {
-        let listener = AsyncRdmaListener::bind(&bind_addr).unwrap();
-        listener.accept().unwrap()
-    });
+    let listener = AsyncRdmaListener::bind(&bind_addr).unwrap();
+
+    let server_handle = tokio::spawn(async move { listener.accept().await.unwrap() });
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let client_handle =
-        tokio::task::spawn_blocking(move || AsyncRdmaStream::connect(&connect_addr).unwrap());
+        tokio::spawn(async move { AsyncRdmaStream::connect(&connect_addr).await.unwrap() });
 
     let (server_res, client_res) = tokio::join!(server_handle, client_handle);
     let mut server = server_res.unwrap();
@@ -72,15 +69,13 @@ async fn async_stream_echo() {
 async fn async_stream_multi_message() {
     let (bind_addr, connect_addr) = test_addrs();
 
-    let server_handle = tokio::task::spawn_blocking(move || {
-        let listener = AsyncRdmaListener::bind(&bind_addr).unwrap();
-        listener.accept().unwrap()
-    });
+    let listener = AsyncRdmaListener::bind(&bind_addr).unwrap();
+    let server_handle = tokio::spawn(async move { listener.accept().await.unwrap() });
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let mut client =
-        tokio::task::spawn_blocking(move || AsyncRdmaStream::connect(&connect_addr).unwrap())
+        tokio::spawn(async move { AsyncRdmaStream::connect(&connect_addr).await.unwrap() })
             .await
             .unwrap();
 
@@ -113,15 +108,13 @@ async fn async_stream_multi_message() {
 async fn async_stream_large_transfer() {
     let (bind_addr, connect_addr) = test_addrs();
 
-    let server_handle = tokio::task::spawn_blocking(move || {
-        let listener = AsyncRdmaListener::bind(&bind_addr).unwrap();
-        listener.accept().unwrap()
-    });
+    let listener = AsyncRdmaListener::bind(&bind_addr).unwrap();
+    let server_handle = tokio::spawn(async move { listener.accept().await.unwrap() });
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let mut client =
-        tokio::task::spawn_blocking(move || AsyncRdmaStream::connect(&connect_addr).unwrap())
+        tokio::spawn(async move { AsyncRdmaStream::connect(&connect_addr).await.unwrap() })
             .await
             .unwrap();
 
@@ -149,19 +142,17 @@ async fn async_stream_large_transfer() {
 
 // --- Phase D: futures::io AsyncRead/AsyncWrite trait tests ---
 
-/// Helper: create a connected (server, client) pair using spawn_blocking.
+/// Helper: create a connected (server, client) pair using async connect/accept.
 async fn connected_pair() -> (AsyncRdmaStream, AsyncRdmaStream) {
     let (bind_addr, connect_addr) = test_addrs();
 
-    let server_handle = tokio::task::spawn_blocking(move || {
-        let listener = AsyncRdmaListener::bind(&bind_addr).unwrap();
-        listener.accept().unwrap()
-    });
+    let listener = AsyncRdmaListener::bind(&bind_addr).unwrap();
+    let server_handle = tokio::spawn(async move { listener.accept().await.unwrap() });
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let client_handle =
-        tokio::task::spawn_blocking(move || AsyncRdmaStream::connect(&connect_addr).unwrap());
+        tokio::spawn(async move { AsyncRdmaStream::connect(&connect_addr).await.unwrap() });
 
     let (server_res, client_res) = tokio::join!(server_handle, client_handle);
     (server_res.unwrap(), client_res.unwrap())

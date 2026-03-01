@@ -32,6 +32,10 @@ pub enum Error {
         /// Vendor-specific error code.
         vendor_err: u32,
     },
+
+    /// Non-blocking operation would block (EAGAIN/EWOULDBLOCK).
+    #[error("operation would block")]
+    WouldBlock,
 }
 
 /// Convert a C return code (0 = success, negative = -errno) to a `Result`.

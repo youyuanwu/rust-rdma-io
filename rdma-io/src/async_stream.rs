@@ -14,15 +14,19 @@
 //! Pure RDMA SEND/RECV with no application-level framing. Each `write()`
 //! becomes one RDMA SEND; each `read()` consumes one RDMA RECV completion.
 
+use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use futures_io::{AsyncRead, AsyncWrite};
+
+use crate::async_cm::{AsyncCmId, AsyncCmListener};
 use crate::async_cq::{AsyncCq, CqPollState};
 use crate::async_qp::AsyncQp;
-use crate::cm::{CmEventType, CmId, ConnParam, EventChannel, PortSpace};
+use crate::cm::{CmId, ConnParam, EventChannel, PortSpace};
 use crate::comp_channel::CompletionChannel;
 use crate::cq::CompletionQueue;
 use crate::mr::{AccessFlags, OwnedMemoryRegion};
@@ -54,12 +58,12 @@ const SEND_WR_ID: u64 = 100;
 /// # async fn example() -> rdma_io::Result<()> {
 /// // Server
 /// let listener = AsyncRdmaListener::bind(&"0.0.0.0:9999".parse().unwrap())?;
-/// let mut stream = listener.accept()?;
+/// let mut stream = listener.accept().await?;
 /// let mut buf = [0u8; 1024];
 /// let n = stream.read(&mut buf).await?;
 ///
 /// // Client
-/// let mut stream = AsyncRdmaStream::connect(&"10.0.0.1:9999".parse().unwrap())?;
+/// let mut stream = AsyncRdmaStream::connect(&"10.0.0.1:9999".parse().unwrap()).await?;
 /// stream.write(b"hello").await?;
 /// # Ok(())
 /// # }
@@ -78,8 +82,10 @@ pub struct AsyncRdmaStream {
     send_wr_seq: u64,
     /// CQ poll state for poll-based AsyncRead/AsyncWrite.
     cq_state: CqPollState,
-    /// Recv completion encountered during poll_write (stashed for poll_read).
-    stashed_recv: Option<WorkCompletion>,
+    /// Recv completions encountered during poll_write (drained by poll_read).
+    stashed_recv: VecDeque<WorkCompletion>,
+    /// Send completions encountered during poll_read (drained by poll_write).
+    stashed_send: VecDeque<WorkCompletion>,
     /// In-progress write: (wr_id, byte_len). Set when send is posted, cleared on completion.
     write_pending: Option<(u64, usize)>,
 }
@@ -91,31 +97,26 @@ unsafe impl Send for AsyncRdmaStream {}
 impl AsyncRdmaStream {
     /// Connect to a remote RDMA endpoint (client side).
     ///
-    /// Connection setup is synchronous (uses rdma_cm). Once connected,
-    /// all data transfer is async via `AsyncQp`.
-    pub fn connect(addr: &SocketAddr) -> crate::Result<Self> {
-        Self::connect_with_buf_size(addr, DEFAULT_BUF_SIZE)
+    /// Uses async CM event notification — does not block the executor.
+    pub async fn connect(addr: &SocketAddr) -> crate::Result<Self> {
+        Self::connect_with_buf_size(addr, DEFAULT_BUF_SIZE).await
     }
 
     /// Connect with a custom buffer size.
-    pub fn connect_with_buf_size(addr: &SocketAddr, buf_size: usize) -> crate::Result<Self> {
-        let ch = EventChannel::new()?;
-        let cm_id = CmId::new(&ch, PortSpace::Tcp)?;
+    pub async fn connect_with_buf_size(addr: &SocketAddr, buf_size: usize) -> crate::Result<Self> {
+        // Step-by-step connect: we need to create QP between resolve_route and connect
+        let async_cm = AsyncCmId::new(PortSpace::Tcp)?;
+        async_cm.resolve_addr(None, addr, 2000).await?;
+        async_cm.resolve_route(2000).await?;
 
-        cm_id.resolve_addr(None, addr, 2000)?;
-        expect_event(&ch, CmEventType::AddrResolved)?.ack();
-
-        cm_id.resolve_route(2000)?;
-        expect_event(&ch, CmEventType::RouteResolved)?.ack();
-
-        let ctx = cm_id
+        let ctx = async_cm
             .verbs_context()
             .ok_or(crate::Error::InvalidArg("no verbs context".into()))?;
-        let pd = cm_id.alloc_pd()?;
+        let pd = async_cm.alloc_pd()?;
         let comp_ch = CompletionChannel::new(&ctx)?;
         let cq = CompletionQueue::with_comp_channel(ctx, 32, &comp_ch)?;
 
-        cm_id.create_qp_with_cq(&pd, &stream_qp_attr(), Some(&cq), Some(&cq))?;
+        async_cm.create_qp_with_cq(&pd, &stream_qp_attr(), Some(&cq), Some(&cq))?;
 
         let send_mr = pd.reg_mr_owned(vec![0u8; buf_size], AccessFlags::LOCAL_WRITE)?;
         let recv_mrs = [
@@ -123,22 +124,25 @@ impl AsyncRdmaStream {
             pd.reg_mr_owned(vec![0u8; buf_size], AccessFlags::LOCAL_WRITE)?,
         ];
 
-        // Pre-post recv buffers
+        // Pre-post recv buffers before connect
         for (i, mr) in recv_mrs.iter().enumerate() {
-            post_recv_raw(cm_id.qp_raw(), mr, i as u64)?;
+            post_recv_raw(async_cm.qp_raw(), mr, i as u64)?;
         }
 
-        cm_id.connect(&ConnParam::default())?;
-        expect_event(&ch, CmEventType::Established)?.ack();
+        async_cm.connect(&ConnParam::default()).await?;
 
-        // Create async CQ AFTER connection is established (AsyncFd registration
-        // must happen inside a tokio runtime context).
+        // Extract QP pointer AFTER the last await
+        let qp = async_cm.qp_raw();
+
+        // Create async CQ AFTER connection is established
         let notifier = TokioCqNotifier::new(comp_ch.fd()).map_err(crate::Error::Verbs)?;
         let async_cq = AsyncCq::new(cq, comp_ch, Box::new(notifier));
-        let aqp = unsafe { AsyncQp::new(cm_id.qp_raw(), async_cq) };
+        let aqp = unsafe { AsyncQp::new(qp, async_cq) };
+
+        let (event_channel, cm_id) = async_cm.into_parts();
 
         Ok(Self {
-            _event_channel: ch,
+            _event_channel: event_channel,
             cm_id,
             _pd: pd,
             aqp,
@@ -147,7 +151,8 @@ impl AsyncRdmaStream {
             recv_pending: None,
             send_wr_seq: SEND_WR_ID,
             cq_state: CqPollState::default(),
-            stashed_recv: None,
+            stashed_recv: VecDeque::new(),
+            stashed_send: VecDeque::new(),
             write_pending: None,
         })
     }
@@ -155,91 +160,19 @@ impl AsyncRdmaStream {
     /// Read data from the stream asynchronously.
     ///
     /// Returns the number of bytes read. Returns `Ok(0)` on disconnect (EOF).
+    ///
+    /// Delegates to the [`futures_io::AsyncRead`] implementation.
     pub async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-
-        // Return buffered recv data first
-        if let Some((buf_idx, offset, total_len)) = self.recv_pending {
-            let remaining = total_len - offset;
-            let copy_len = remaining.min(buf.len());
-            buf[..copy_len]
-                .copy_from_slice(&self.recv_mrs[buf_idx].as_slice()[offset..offset + copy_len]);
-
-            if copy_len < remaining {
-                self.recv_pending = Some((buf_idx, offset + copy_len, total_len));
-            } else {
-                self.recv_pending = None;
-                post_recv_raw(self.cm_id.qp_raw(), &self.recv_mrs[buf_idx], buf_idx as u64)
-                    .map_err(io::Error::other)?;
-            }
-            return Ok(copy_len);
-        }
-
-        // Poll CQ for a recv completion
-        let mut wc = [WorkCompletion::default(); 4];
-        loop {
-            let n = self.aqp.poll(&mut wc).await.map_err(io::Error::other)?;
-            for wc_item in &wc[..n] {
-                if !wc_item.is_success() {
-                    if wc_item.status_raw() == rdma_io_sys::ibverbs::IBV_WC_WR_FLUSH_ERR {
-                        return Ok(0); // EOF on disconnect
-                    }
-                    return Err(io::Error::other(format!(
-                        "WC error: status={:?}",
-                        wc_item.status()
-                    )));
-                }
-                let wr_id = wc_item.wr_id();
-                if wr_id < NUM_RECV_BUFS as u64 {
-                    let byte_len = wc_item.byte_len() as usize;
-                    if byte_len == 0 {
-                        return Ok(0);
-                    }
-                    let bidx = wr_id as usize;
-                    let copy_len = byte_len.min(buf.len());
-                    buf[..copy_len].copy_from_slice(&self.recv_mrs[bidx].as_slice()[..copy_len]);
-                    if copy_len < byte_len {
-                        self.recv_pending = Some((bidx, copy_len, byte_len));
-                    } else {
-                        post_recv_raw(self.cm_id.qp_raw(), &self.recv_mrs[bidx], wr_id)
-                            .map_err(io::Error::other)?;
-                    }
-                    return Ok(copy_len);
-                }
-                // Ignore send completions during read
-            }
-        }
+        std::future::poll_fn(|cx| Pin::new(&mut *self).poll_read(cx, buf)).await
     }
 
     /// Write data to the stream asynchronously.
     ///
     /// Returns the number of bytes written (bounded by buffer size).
+    ///
+    /// Delegates to the [`futures_io::AsyncWrite`] implementation.
     pub async fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        if data.is_empty() {
-            return Ok(0);
-        }
-
-        let send_len = data.len().min(self.send_mr.as_slice().len());
-        self.send_mr.as_mut_slice()[..send_len].copy_from_slice(&data[..send_len]);
-
-        let wr_id = self.send_wr_seq;
-        self.send_wr_seq += 1;
-
-        let wc = self
-            .aqp
-            .send(&self.send_mr, 0, send_len, wr_id)
-            .await
-            .map_err(io::Error::other)?;
-        if !wc.is_success() {
-            return Err(io::Error::other(format!(
-                "send WC error: status={:?}",
-                wc.status()
-            )));
-        }
-
-        Ok(send_len)
+        std::future::poll_fn(|cx| Pin::new(&mut *self).poll_write(cx, data)).await
     }
 
     /// Write all data to the stream, looping if necessary.
@@ -318,7 +251,7 @@ impl futures_io::AsyncRead for AsyncRdmaStream {
         }
 
         // 2. Check stashed recv completion (from a poll_write that encountered recv)
-        if let Some(wc) = this.stashed_recv.take() {
+        if let Some(wc) = this.stashed_recv.pop_front() {
             return Poll::Ready(this.process_recv_wc(&wc, buf));
         }
 
@@ -347,7 +280,8 @@ impl futures_io::AsyncRead for AsyncRdmaStream {
                 if wc_item.wr_id() < NUM_RECV_BUFS as u64 {
                     return Poll::Ready(this.process_recv_wc(wc_item, buf));
                 }
-                // Send completions — discard during read
+                // Stash send completions for later poll_write
+                this.stashed_send.push_back(*wc_item);
             }
         }
     }
@@ -381,6 +315,21 @@ impl futures_io::AsyncWrite for AsyncRdmaStream {
 
         let (wr_id, len) = this.write_pending.unwrap();
 
+        // Check stashed send completions (from a poll_read that encountered send)
+        while let Some(wc) = this.stashed_send.pop_front() {
+            if !wc.is_success() {
+                this.write_pending = None;
+                return Poll::Ready(Err(io::Error::other(format!(
+                    "send WC error: status={:?}",
+                    wc.status()
+                ))));
+            }
+            if wc.wr_id() == wr_id {
+                this.write_pending = None;
+                return Poll::Ready(Ok(len));
+            }
+        }
+
         // Poll CQ for send completion
         let mut wc_buf = [WorkCompletion::default(); 4];
         loop {
@@ -410,7 +359,7 @@ impl futures_io::AsyncWrite for AsyncRdmaStream {
                 }
                 // Stash recv completions for later poll_read
                 if wc_item.wr_id() < NUM_RECV_BUFS as u64 {
-                    this.stashed_recv = Some(*wc_item);
+                    this.stashed_recv.push_back(*wc_item);
                 }
             }
         }
@@ -433,10 +382,9 @@ impl futures_io::AsyncWrite for AsyncRdmaStream {
 /// An async RDMA listener, analogous to `TcpListener`.
 ///
 /// Binds to a local address and accepts incoming RDMA connections,
-/// returning an [`AsyncRdmaStream`] for each.
+/// returning an [`AsyncRdmaStream`] for each. Built on [`AsyncCmListener`].
 pub struct AsyncRdmaListener {
-    event_channel: EventChannel,
-    _cm_id: CmId,
+    inner: AsyncCmListener,
     buf_size: usize,
 }
 
@@ -448,44 +396,27 @@ impl AsyncRdmaListener {
 
     /// Bind with a custom buffer size for accepted streams.
     pub fn bind_with_buf_size(addr: &SocketAddr, buf_size: usize) -> crate::Result<Self> {
-        let ch = EventChannel::new()?;
-        let cm_id = CmId::new(&ch, PortSpace::Tcp)?;
-        cm_id.listen(addr, 128)?;
-        Ok(Self {
-            event_channel: ch,
-            _cm_id: cm_id,
-            buf_size,
-        })
+        let inner = AsyncCmListener::bind(addr)?;
+        Ok(Self { inner, buf_size })
     }
 
     /// Accept an incoming connection, returning an [`AsyncRdmaStream`].
     ///
-    /// Connection setup (CM handshake) is synchronous. Use
-    /// `tokio::task::spawn_blocking` if you need to accept from an async context
-    /// without blocking the executor.
-    pub fn accept(&self) -> crate::Result<AsyncRdmaStream> {
-        let ev = self.event_channel.get_event()?;
-        let etype = ev.event_type();
-        if etype != CmEventType::ConnectRequest {
-            ev.ack();
-            return Err(crate::Error::InvalidArg(format!(
-                "expected ConnectRequest, got {etype:?}"
-            )));
-        }
-        let conn_id = unsafe { CmId::from_raw(ev.cm_id_raw(), true) };
-        ev.ack();
+    /// Uses async CM event notification — does not block the executor.
+    pub async fn accept(&self) -> crate::Result<AsyncRdmaStream> {
+        // Phase 1: await CONNECT_REQUEST
+        let conn_id = self.inner.get_request().await?;
 
+        // Set up QP resources on the new CM ID
         let ctx = conn_id
             .verbs_context()
             .ok_or(crate::Error::InvalidArg("no verbs context".into()))?;
         let pd = conn_id.alloc_pd()?;
         let comp_ch = CompletionChannel::new(&ctx)?;
         let cq = CompletionQueue::with_comp_channel(ctx, 32, &comp_ch)?;
-        let conn_ch = EventChannel::new()?;
 
         conn_id.create_qp_with_cq(&pd, &stream_qp_attr(), Some(&cq), Some(&cq))?;
 
-        // Post recv buffers and complete handshake BEFORE creating async resources
         let send_mr = pd.reg_mr_owned(vec![0u8; self.buf_size], AccessFlags::LOCAL_WRITE)?;
         let recv_mrs = [
             pd.reg_mr_owned(vec![0u8; self.buf_size], AccessFlags::LOCAL_WRITE)?,
@@ -495,21 +426,25 @@ impl AsyncRdmaListener {
             post_recv_raw(conn_id.qp_raw(), mr, i as u64)?;
         }
 
-        conn_id.accept(&ConnParam::default())?;
-        expect_event(&self.event_channel, CmEventType::Established)?.ack();
+        // Phase 2: accept handshake + await ESTABLISHED + migrate
+        let async_cm = self
+            .inner
+            .complete_accept(conn_id, &ConnParam::default())
+            .await?;
 
-        // Migrate the accepted connection to its own event channel so the
-        // listener can be safely dropped without affecting this connection.
-        conn_id.migrate(&conn_ch)?;
+        // Extract QP pointer AFTER the await (conn_id moved into async_cm)
+        let qp = async_cm.qp_raw();
 
         // Create async CQ AFTER connection is established
         let notifier = TokioCqNotifier::new(comp_ch.fd()).map_err(crate::Error::Verbs)?;
         let async_cq = AsyncCq::new(cq, comp_ch, Box::new(notifier));
-        let aqp = unsafe { AsyncQp::new(conn_id.qp_raw(), async_cq) };
+        let aqp = unsafe { AsyncQp::new(qp, async_cq) };
+
+        let (event_channel, cm_id) = async_cm.into_parts();
 
         Ok(AsyncRdmaStream {
-            _event_channel: conn_ch,
-            cm_id: conn_id,
+            _event_channel: event_channel,
+            cm_id,
             _pd: pd,
             aqp,
             send_mr,
@@ -517,25 +452,14 @@ impl AsyncRdmaListener {
             recv_pending: None,
             send_wr_seq: SEND_WR_ID,
             cq_state: CqPollState::default(),
-            stashed_recv: None,
+            stashed_recv: VecDeque::new(),
+            stashed_send: VecDeque::new(),
             write_pending: None,
         })
     }
 }
 
 // --- Helpers ---
-
-fn expect_event(ch: &EventChannel, expected: CmEventType) -> crate::Result<crate::cm::CmEvent> {
-    let ev = ch.get_event()?;
-    let actual = ev.event_type();
-    if actual != expected {
-        ev.ack();
-        return Err(crate::Error::InvalidArg(format!(
-            "expected {expected:?}, got {actual:?}"
-        )));
-    }
-    Ok(ev)
-}
 
 fn stream_qp_attr() -> QpInitAttr {
     QpInitAttr {

@@ -4,6 +4,7 @@
 //! way to use iWARP (siw) and the recommended approach for RoCE.
 
 use std::net::SocketAddr;
+use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
 use rdma_io_sys::ibverbs::*;
@@ -147,6 +148,39 @@ impl EventChannel {
         let mut event: *mut rdma_cm_event = std::ptr::null_mut();
         from_ret_errno(unsafe { rdma_get_cm_event(self.inner, &mut event) })?;
         Ok(CmEvent { inner: event })
+    }
+
+    /// Non-blocking get_event. Returns `Error::WouldBlock` if no event is pending.
+    pub fn try_get_event(&self) -> Result<CmEvent> {
+        let mut event: *mut rdma_cm_event = std::ptr::null_mut();
+        let ret = unsafe { rdma_get_cm_event(self.inner, &mut event) };
+        if ret != 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::WouldBlock {
+                return Err(crate::Error::WouldBlock);
+            }
+            return Err(crate::Error::Verbs(e));
+        }
+        Ok(CmEvent { inner: event })
+    }
+
+    /// Raw file descriptor for async reactor registration.
+    pub fn fd(&self) -> RawFd {
+        unsafe { (*self.inner).fd }
+    }
+
+    /// Set the event channel fd to non-blocking mode.
+    pub fn set_nonblocking(&self) -> Result<()> {
+        let fd = self.fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(crate::Error::Verbs(std::io::Error::last_os_error()));
+        }
+        let ret = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        if ret < 0 {
+            return Err(crate::Error::Verbs(std::io::Error::last_os_error()));
+        }
+        Ok(())
     }
 
     /// Raw pointer.

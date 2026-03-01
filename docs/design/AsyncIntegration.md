@@ -68,7 +68,7 @@ In async mode, step 4 becomes `async_fd.readable().await` — non-blocking, comp
 - Custom event loop / reactor implementation
 - io_uring integration (separate future work)
 - Async device events (`ibv_get_async_event`) — separate concern
-- Connection-level async (`rdma_cm` event channel) — separate from CQ async
+- ~~Connection-level async (`rdma_cm` event channel)~~ — now in scope (Phase F, §8)
 - Direct `tokio::io::AsyncRead` impl — users use `tokio_util::compat::FuturesAsyncReadCompatExt` instead
 
 ---
@@ -109,12 +109,10 @@ In async mode, step 4 becomes `async_fd.readable().await` — non-blocking, comp
 rdma-io/
 ├── src/
 │   ├── comp_channel.rs       # CompletionChannel (safe ibv_comp_channel wrapper)
-│   ├── async_cq.rs           # AsyncCq + CqNotifier trait
+│   ├── async_cq.rs           # AsyncCq + CqNotifier trait + CqPollState
+│   ├── async_qp.rs           # AsyncQp — async verb wrappers
 │   ├── async_stream.rs       # AsyncRdmaStream / AsyncRdmaListener
-│   ├── notifier/
-│   │   ├── mod.rs
-│   │   ├── tokio.rs          # TokioCqNotifier (behind "tokio" feature)
-│   │   └── smol.rs           # SmolCqNotifier (behind "smol" feature)
+│   ├── tokio_notifier.rs     # TokioCqNotifier (behind "tokio" feature)
 │   └── ... (existing modules)
 └── Cargo.toml
 ```
@@ -125,13 +123,14 @@ rdma-io/
 [features]
 default = []
 
-# Async runtime support
-tokio = ["dep:tokio"]
-smol = ["dep:async-io"]
+# Async runtime support — each pulls in futures-io for trait impls
+tokio = ["dep:tokio", "dep:futures-io"]
+smol = ["dep:async-io", "dep:futures-io"]
 
 [dependencies]
-tokio = { version = "1", features = ["net"], optional = true }
+tokio = { version = "1", features = ["io-util"], optional = true }
 async-io = { version = "2", optional = true }
+futures-io = { version = "0.3", optional = true }
 ```
 
 ---
@@ -140,251 +139,40 @@ async-io = { version = "2", optional = true }
 
 ### 4.1 CompletionChannel
 
-Safe wrapper around `ibv_comp_channel`. Prerequisite for all async CQ operations.
+Safe wrapper around `ibv_comp_channel`. Provides the file descriptor used for async CQ notification. The fd is set non-blocking at creation and registered with the async reactor.
 
-```rust
-use std::os::unix::io::{AsRawFd, RawFd};
-
-/// Safe wrapper around `ibv_comp_channel`.
-///
-/// Provides the file descriptor used for async CQ notification.
-/// The fd becomes readable when a CQ associated with this channel
-/// has a completion event.
-pub struct CompletionChannel {
-    inner: *mut ibv_comp_channel,
-    _ctx: Arc<Context>,
-}
-
-impl CompletionChannel {
-    /// Create a new completion channel.
-    pub fn new(ctx: &Arc<Context>) -> Result<Self> {
-        let ch = from_ptr(unsafe { ibv_create_comp_channel(ctx.inner) })?;
-        // Set non-blocking for async use
-        set_nonblocking(unsafe { (*ch).fd })?;
-        Ok(Self { inner: ch, _ctx: Arc::clone(ctx) })
-    }
-
-    /// Raw file descriptor (for async reactor registration).
-    pub fn fd(&self) -> RawFd {
-        unsafe { (*self.inner).fd }
-    }
-
-    /// Raw pointer (for CQ creation).
-    pub(crate) fn as_raw(&self) -> *mut ibv_comp_channel {
-        self.inner
-    }
-
-    /// Consume one CQ event notification (non-blocking).
-    ///
-    /// Returns the CQ that fired. Caller must call `ack_cq_events` later.
-    pub fn get_cq_event(&self) -> Result<(*mut ibv_cq, usize)> {
-        let mut cq: *mut ibv_cq = std::ptr::null_mut();
-        let mut ctx: *mut c_void = std::ptr::null_mut();
-        let ret = unsafe {
-            ibv_get_cq_event(self.inner, &mut cq, &mut ctx)
-        };
-        if ret != 0 {
-            Err(Error::Verbs(io::Error::last_os_error()))
-        } else {
-            Ok((cq, 1))
-        }
-    }
-}
-
-impl AsRawFd for CompletionChannel {
-    fn as_raw_fd(&self) -> RawFd { self.fd() }
-}
-
-impl Drop for CompletionChannel {
-    fn drop(&mut self) {
-        let ret = unsafe { ibv_destroy_comp_channel(self.inner) };
-        if ret != 0 {
-            tracing::error!("ibv_destroy_comp_channel failed: {}",
-                io::Error::from_raw_os_error(-ret));
-        }
-    }
-}
-```
+> **Implementation**: See `comp_channel.rs`. RAII drop calls `ibv_destroy_comp_channel()`. Implements `AsRawFd`.
 
 ### 4.2 CqNotifier trait (runtime abstraction)
 
-```rust
-use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll};
+Trait abstracting over async runtimes for CQ fd readiness. Each runtime provides a `CqNotifier` that registers the comp_channel fd with its reactor. Two methods:
 
-/// Trait abstracting over async runtimes for CQ fd readiness.
-///
-/// Each runtime provides an implementation that registers the
-/// comp_channel fd with its reactor and awaits readiness.
-pub trait CqNotifier: Send + Sync {
-    /// Wait until the comp_channel fd is readable.
-    ///
-    /// Returns when the fd has data (a CQ event notification).
-    /// The caller must consume the event and re-arm.
-    fn readable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>>;
-}
-```
+- `readable()` — async future-based readiness (for `AsyncCq::poll()`)
+- `poll_readable()` — poll-based readiness (for `AsyncRead`/`AsyncWrite` impls)
+
+> **Implementation**: See `async_cq.rs` (trait definition), `tokio_notifier.rs` (tokio backend).
 
 ### 4.3 Tokio adapter
 
-```rust
-#[cfg(feature = "tokio")]
-pub mod tokio_notifier {
-    use tokio::io::unix::AsyncFd;
-    use std::os::unix::io::RawFd;
+`TokioCqNotifier` wraps the comp_channel fd in `tokio::io::unix::AsyncFd` for reactor integration. Must be created within a tokio runtime context.
 
-    pub struct TokioCqNotifier {
-        async_fd: AsyncFd<RawFd>,
-    }
-
-    impl TokioCqNotifier {
-        pub fn new(fd: RawFd) -> io::Result<Self> {
-            Ok(Self {
-                async_fd: AsyncFd::new(fd)?,
-            })
-        }
-    }
-
-    impl CqNotifier for TokioCqNotifier {
-        fn readable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
-            Box::pin(async {
-                let mut guard = self.async_fd.readable().await?;
-                guard.clear_ready();
-                Ok(())
-            })
-        }
-    }
-}
-```
+> **Implementation**: See `tokio_notifier.rs`.
 
 ### 4.4 Smol adapter
 
-```rust
-#[cfg(feature = "smol")]
-pub mod smol_notifier {
-    use async_io::Async;
-    use std::os::unix::io::{AsFd, BorrowedFd, OwnedFd, RawFd};
-
-    /// Wrapper to implement AsFd for a raw fd.
-    struct FdWrapper(OwnedFd);
-
-    pub struct SmolCqNotifier {
-        async_fd: Async<FdWrapper>,
-    }
-
-    impl SmolCqNotifier {
-        pub fn new(fd: RawFd) -> io::Result<Self> {
-            // Duplicate the fd so Async owns it independently
-            let owned = unsafe { OwnedFd::from_raw_fd(libc::dup(fd)) };
-            Ok(Self {
-                async_fd: Async::new(FdWrapper(owned))?,
-            })
-        }
-    }
-
-    impl CqNotifier for SmolCqNotifier {
-        fn readable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
-            Box::pin(async {
-                self.async_fd.readable().await?;
-                Ok(())
-            })
-        }
-    }
-}
-```
+> 📋 **Future work**: `SmolCqNotifier` using `async_io::Async<FdWrapper>`. Same pattern as tokio adapter but using smol's reactor. See Phase F.
 
 ### 4.5 AsyncCq — the core async CQ poller
 
-```rust
-/// Async completion queue poller.
-///
-/// Wraps a `CompletionQueue` + `CompletionChannel` + runtime `CqNotifier`
-/// to provide async-await CQ polling without spin loops.
-///
-/// # Completion notification protocol
-///
-/// Uses the standard drain-after-arm pattern:
-/// 1. `req_notify_cq()` — arm CQ notification
-/// 2. `poll_cq()` — drain any completions that arrived before arming
-/// 3. If completions found → return them (skip waiting)
-/// 4. If no completions → `notifier.readable().await` (sleep until fd fires)
-/// 5. `get_cq_event()` + `ack_cq_events()` — consume notification
-/// 6. Go to 1
-pub struct AsyncCq {
-    cq: Arc<CompletionQueue>,
-    channel: CompletionChannel,
-    notifier: Box<dyn CqNotifier>,
-    /// Accumulated unacked CQ events (must ack before destroy).
-    unacked_events: AtomicU32,
-}
+Async completion queue poller wrapping `CompletionQueue` + `CompletionChannel` + `CqNotifier`. Uses the drain-after-arm pattern (see §9 Performance). Provides:
 
-impl AsyncCq {
-    pub fn new(
-        cq: Arc<CompletionQueue>,
-        channel: CompletionChannel,
-        notifier: Box<dyn CqNotifier>,
-    ) -> Self {
-        Self { cq, channel, notifier, unacked_events: AtomicU32::new(0) }
-    }
+- `poll()` — async: wait for completions, return when at least one available
+- `poll_wr_id()` — async: wait for a specific WR ID completion
+- `poll_completions()` — poll-based: for `AsyncRead`/`AsyncWrite` state machine via `CqPollState`
+- Drop impl acks all remaining CQ events before destruction
+- Batched acks every 16 events to reduce `ibv_ack_cq_events` mutex contention
 
-    /// Poll for up to `wc_buf.len()` completions asynchronously.
-    ///
-    /// Returns when at least one completion is available.
-    pub async fn poll(&self, wc_buf: &mut [WorkCompletion]) -> Result<usize> {
-        loop {
-            // 1. Arm notification
-            self.cq.req_notify(false)?;
-
-            // 2. Drain any completions (catches race between arm and await)
-            let n = self.cq.poll(wc_buf)?;
-            if n > 0 {
-                return Ok(n);
-            }
-
-            // 3. No completions — wait for fd readiness
-            self.notifier.readable().await
-                .map_err(Error::Verbs)?;
-
-            // 4. Consume the CQ event
-            let _ = self.channel.get_cq_event()?;
-            self.unacked_events.fetch_add(1, Ordering::Relaxed);
-
-            // 5. Ack periodically to avoid overflow
-            let unacked = self.unacked_events.load(Ordering::Relaxed);
-            if unacked >= 16 {
-                unsafe { ibv_ack_cq_events(self.cq.as_raw(), unacked) };
-                self.unacked_events.store(0, Ordering::Relaxed);
-            }
-
-            // 6. Loop back — poll will find completions now
-        }
-    }
-
-    /// Wait for a specific WR ID completion.
-    pub async fn poll_wr_id(&self, expected: u64) -> Result<WorkCompletion> {
-        let mut wc = [WorkCompletion::default(); 4];
-        loop {
-            let n = self.poll(&mut wc).await?;
-            for item in &wc[..n] {
-                if item.wr_id() == expected {
-                    return Ok(*item);
-                }
-            }
-        }
-    }
-}
-
-impl Drop for AsyncCq {
-    fn drop(&mut self) {
-        // Ack all remaining events before CQ destruction
-        let unacked = self.unacked_events.load(Ordering::Relaxed);
-        if unacked > 0 {
-            unsafe { ibv_ack_cq_events(self.cq.as_raw(), unacked) };
-        }
-    }
-}
-```
+> **Implementation**: See `async_cq.rs`.
 
 ---
 
@@ -394,249 +182,79 @@ impl Drop for AsyncCq {
 
 `AsyncRdmaStream` mirrors `RdmaStream` but uses `AsyncCq` instead of spin-polling.
 
-```rust
-/// Async RDMA stream implementing `AsyncRead` + `AsyncWrite`.
-///
-/// # Example (tokio)
-///
-/// ```no_run
-/// use rdma_io::async_stream::{AsyncRdmaStream, AsyncRdmaListener};
-/// use futures::io::{AsyncReadExt, AsyncWriteExt};
-/// // For tokio compat: use tokio_util::compat::FuturesAsyncReadCompatExt;
-///
-/// #[tokio::main]
-/// async fn main() -> rdma_io::Result<()> {
-///     let mut stream = AsyncRdmaStream::connect_tokio(
-///         &"10.0.0.1:9999".parse().unwrap()
-///     ).await?;
-///     stream.write_all(b"hello async rdma").await?;
-///     let mut buf = [0u8; 1024];
-///     let n = stream.read(&mut buf).await?;
-///     Ok(())
-/// }
-/// ```
-pub struct AsyncRdmaStream {
-    _event_channel: EventChannel,
-    cm_id: CmId,
-    _pd: Arc<ProtectionDomain>,
-    async_cq: AsyncCq,
-    send_mr: OwnedMemoryRegion,
-    recv_mrs: [OwnedMemoryRegion; NUM_RECV_BUFS],
-    recv_pending: Option<(usize, usize, usize)>,
-}
-```
+> **Implementation**: See `async_stream.rs`. Implements `futures::io::AsyncRead` + `AsyncWrite`.
+
+Key design points:
+- Manages CM ID, PD, CQ, QP, send MR, and recv MRs internally
+- Double-buffered recv with partial-read support
+- Shared CQ for send and recv — `poll_write` may encounter recv completions (stashed for `poll_read`)
+- `write_pending` tracks in-flight send WRs across poll calls
 
 ### Connection setup
 
-Connection setup (`resolve_addr`, `resolve_route`, `connect`) is inherently sequential and fast. We keep it synchronous and wrap in `spawn_blocking` if needed:
+Connection setup uses the CM event channel fd for true async I/O — no `spawn_blocking` needed.
 
-```rust
-impl AsyncRdmaStream {
-    /// Connect using tokio runtime.
-    #[cfg(feature = "tokio")]
-    pub async fn connect_tokio(addr: &SocketAddr) -> Result<Self> {
-        let addr = *addr;
-        // CM setup is fast (<100ms) but does block on kernel calls
-        tokio::task::spawn_blocking(move || {
-            Self::connect_sync(&addr, |fd| {
-                Box::new(TokioCqNotifier::new(fd)?) as Box<dyn CqNotifier>
-            })
-        }).await.map_err(|e| Error::InvalidArg(e.to_string()))?
-    }
+**How it works**: The rdma_cm calls (`resolve_addr`, `resolve_route`, `connect`, `accept`) are non-blocking kernel submissions that return immediately. Results arrive as events on the `rdma_event_channel` fd, which is a regular Linux fd pollable with epoll/`AsyncFd`.
 
-    /// Connect using smol runtime.
-    #[cfg(feature = "smol")]
-    pub async fn connect_smol(addr: &SocketAddr) -> Result<Self> {
-        let addr = *addr;
-        smol::unblock(move || {
-            Self::connect_sync(&addr, |fd| {
-                Box::new(SmolCqNotifier::new(fd)?) as Box<dyn CqNotifier>
-            })
-        }).await
-    }
+**Async connect flow**:
+1. `EventChannel::new()` — set fd non-blocking via `fcntl(O_NONBLOCK)`
+2. `cm_id.resolve_addr(addr)` — returns immediately (kernel async)
+3. `await` fd readable → `get_event()` returns `ADDR_RESOLVED`
+4. `cm_id.resolve_route()` — returns immediately
+5. `await` fd readable → `get_event()` returns `ROUTE_RESOLVED`
+6. Setup PD, CQ, QP, MRs, post recv buffers
+7. `cm_id.connect()` — returns immediately
+8. `await` fd readable → `get_event()` returns `ESTABLISHED`
+9. Create `TokioCqNotifier` + `AsyncCq` (tokio reactor context available here)
 
-    /// Internal sync connect that accepts a notifier factory.
-    fn connect_sync(
-        addr: &SocketAddr,
-        make_notifier: impl FnOnce(RawFd) -> io::Result<Box<dyn CqNotifier>>,
-    ) -> Result<Self> {
-        let ch = EventChannel::new()?;
-        let cm_id = CmId::new(&ch, PortSpace::Tcp)?;
+**Async accept flow**:
+1. Listener's `EventChannel` fd set non-blocking
+2. `await` fd readable → `get_event()` returns `CONNECT_REQUEST`
+3. Setup PD, CQ, QP, MRs on the new CM ID
+4. `cm_id.accept()` — returns immediately
+5. `await` fd readable → `get_event()` returns `ESTABLISHED`
+6. `migrate()` to per-connection `EventChannel`
 
-        cm_id.resolve_addr(None, addr, 2000)?;
-        expect_event(&ch, CmEventType::AddrResolved)?.ack();
-        cm_id.resolve_route(2000)?;
-        expect_event(&ch, CmEventType::RouteResolved)?.ack();
+**Key constraint**: `TokioCqNotifier::new()` calls `AsyncFd::new()`, which requires tokio reactor context. This is fine — the notifier is created *after* connection setup completes, inside the `async fn` body.
 
-        let ctx = cm_id.verbs_context().ok_or(Error::InvalidArg("no ctx".into()))?;
-        let pd = cm_id.alloc_pd()?;
+**API surface**:
+- `AsyncRdmaStream::connect(addr)` → `async fn` (was sync)
+- `AsyncRdmaStream::connect_with_buf_size(addr, size)` → `async fn` (was sync)
+- `AsyncRdmaListener::bind(addr)` → stays sync (no CM events needed for bind/listen)
+- `AsyncRdmaListener::accept()` → `async fn` (was sync)
 
-        // Create CQ with completion channel for async notification
-        let comp_channel = CompletionChannel::new(&ctx)?;
-        let cq = CompletionQueue::with_comp_channel(
-            Arc::clone(&ctx), 32, comp_channel.as_raw()
-        )?;
-        let notifier = make_notifier(comp_channel.fd())?;
-        let async_cq = AsyncCq::new(Arc::clone(&cq), comp_channel, notifier);
-
-        cm_id.create_qp_with_cq(&pd, &stream_qp_attr(), Some(&cq), Some(&cq))?;
-
-        // ... register MRs, post recv, connect (same as sync) ...
-    }
-}
-```
+> See §8 for the `AsyncEventChannel` design that enables this.
 
 ### AsyncRead / AsyncWrite (futures::io — runtime-agnostic)
 
-We implement `futures::io::AsyncRead` + `AsyncWrite` as the **primary** trait implementation.
-This works natively with smol/async-std, and tokio users wrap with `.compat()`:
+`futures::io::AsyncRead` + `AsyncWrite` are the **primary** trait implementations. Tokio users wrap with `.compat()`:
 
 ```rust
 use tokio_util::compat::FuturesAsyncReadCompatExt;
-let stream = AsyncRdmaStream::connect(...).await?;
-let compat = stream.compat(); // now implements tokio::io::AsyncRead
+let stream = AsyncRdmaStream::connect(&addr).await?;
+let compat = stream.compat(); // now implements tokio::io::AsyncRead + AsyncWrite
 tokio::io::copy(&mut compat, &mut sink).await?;
 ```
 
-```rust
-impl futures::io::AsyncRead for AsyncRdmaStream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
-        // If recv_pending has buffered data, return it immediately
-        // Otherwise, poll the AsyncCq for a recv completion
-        // Pin the async_cq.poll() future and drive it with cx
-    }
-}
+### poll_read / poll_write state machine
 
-impl futures::io::AsyncWrite for AsyncRdmaStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        // Copy to send_mr, post SEND WR
-        // Poll AsyncCq for send completion
-    }
+The challenge: `poll_read` must return `Poll::Pending` and register with the waker, but `AsyncCq::poll()` is async. Solution: `CqPollState` enum (Idle vs WaitingFd) in `AsyncCq::poll_completions()` drives the drain-after-arm loop in poll form, using `CqNotifier::poll_readable()` for fd readiness.
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // rdma_disconnect
-        Poll::Ready(Ok(()))
-    }
-}
-```
-
-### Implementing `poll_read` / `poll_write` correctly
-
-The challenge: `AsyncRead::poll_read` must return `Poll::Pending` and register with the waker, but our `AsyncCq::poll()` is an async fn. We need to store the future across poll calls:
-
-```rust
-/// Internal state machine for pending async operations.
-enum ReadState {
-    /// No read in progress — need to start one.
-    Idle,
-    /// Waiting for CQ completion.
-    Polling(Pin<Box<dyn Future<Output = Result<usize>> + Send>>),
-}
-
-impl AsyncRdmaStream {
-    fn poll_read_inner(
-        &mut self,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
-        // Check buffered recv data first
-        if let Some((buf_idx, offset, total_len)) = self.recv_pending {
-            // ... copy from recv buffer, same as sync ...
-            return Poll::Ready(Ok(copy_len));
-        }
-
-        // Start or resume CQ polling
-        match &mut self.read_state {
-            ReadState::Idle => {
-                // Start polling
-                let mut wc = [WorkCompletion::default(); 4];
-                let future = self.async_cq.poll(&mut wc);
-                self.read_state = ReadState::Polling(Box::pin(future));
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-            ReadState::Polling(ref mut fut) => {
-                match fut.as_mut().poll(cx) {
-                    Poll::Ready(Ok(n)) => {
-                        // Process completions, copy to user buffer
-                        self.read_state = ReadState::Idle;
-                        Poll::Ready(Ok(copy_len))
-                    }
-                    Poll::Ready(Err(e)) => {
-                        self.read_state = ReadState::Idle;
-                        Poll::Ready(Err(io::Error::other(e)))
-                    }
-                    Poll::Pending => Poll::Pending,
-                }
-            }
-        }
-    }
-}
-```
+> **Implementation**: `CqPollState` enum and `poll_completions()` in `async_cq.rs`; `AsyncRead`/`AsyncWrite` impls in `async_stream.rs`.
 
 ---
 
 ## 6. Alternative: Simpler Approach via `poll_fn`
 
-Instead of implementing `AsyncRead`/`AsyncWrite` directly (complex state machines), we can provide simpler async methods that users call:
-
-```rust
-impl AsyncRdmaStream {
-    /// Read data asynchronously.
-    pub async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        // Check buffered recv data
-        if let Some((buf_idx, offset, total_len)) = self.recv_pending.take() {
-            // ... return buffered data ...
-        }
-
-        // Wait for recv completion
-        let mut wc = [WorkCompletion::default(); 4];
-        loop {
-            let n = self.async_cq.poll(&mut wc).await
-                .map_err(io::Error::other)?;
-            for item in &wc[..n] {
-                let wr_id = item.wr_id();
-                if wr_id < NUM_RECV_BUFS as u64 {
-                    // Process recv completion, copy to buf
-                    return Ok(copy_len);
-                }
-                // Ignore send completions
-            }
-        }
-    }
-
-    /// Write data asynchronously.
-    pub async fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        // Copy to send_mr, post SEND
-        // Wait for send completion
-        self.async_cq.poll_wr_id(SEND_WR_ID).await
-            .map_err(io::Error::other)?;
-        Ok(send_len)
-    }
-}
-```
-
-This is simpler and can be wrapped into `AsyncRead`/`AsyncWrite` via `futures_util::io::AsyncReadExt` adapters or tokio's `StreamReader` (via compat layer).
-
-**Recommendation**: Start with the simpler async methods (§6), add trait impls (§5) as a follow-up.
+> **Historical note**: This was an alternative design considered before implementing Phase D. The actual implementation uses `CqPollState` + `poll_completions()` on `AsyncCq` instead of storing boxed futures. The `AsyncRdmaStream` also provides inherent async `read()`/`write()` methods (Phase C) alongside the trait impls.
 
 ---
 
 ## 7. Async RDMA Verbs (Individual Operations)
 
 Beyond the stream abstraction (SEND/RECV), RDMA supports one-sided operations (READ/WRITE) and atomics that don't involve the remote CPU. These are the core value proposition of RDMA and should have first-class async support.
+
+> **Implementation**: See `async_qp.rs` for `AsyncQp`, `mr.rs` for `RemoteMr`, `wr.rs` for `SendWr` builders.
 
 ### 7.1 Supported Verbs
 
@@ -651,192 +269,39 @@ Beyond the stream abstraction (SEND/RECV), RDMA supports one-sided operations (R
 
 ### 7.2 AsyncQp — Async Queue Pair
 
-The central type for async verb operations. Wraps a `QueuePair` + `AsyncCq` and provides an async method per verb:
+Central type for async verb operations. Wraps a raw `*mut ibv_qp` (borrowed from CM ID) + `AsyncCq`. Provides async methods for each verb:
+
+- **Two-sided**: `send()`, `recv()`, `send_with_imm()`
+- **One-sided**: `read_remote()`, `write_remote()`, `write_remote_with_imm()`
+- **Atomic**: `compare_and_swap()`, `fetch_and_add()`
+- **Utility**: `post_send_signaled()` (post without awaiting, for poll-based callers)
+
+Each method posts the WR via the underlying QP, then awaits completion via `AsyncCq::poll_wr_id()`.
+
+### 7.3 RemoteMr
+
+Lightweight descriptor exchanged between peers for one-sided operations:
 
 ```rust
-/// Async wrapper around a QueuePair for individual RDMA verb operations.
-///
-/// Unlike `AsyncRdmaStream` (which provides a stream abstraction over SEND/RECV),
-/// `AsyncQp` exposes each RDMA verb individually, giving full control over
-/// one-sided and two-sided operations.
-pub struct AsyncQp {
-    qp: QueuePair,
-    async_cq: AsyncCq,       // shared send + recv CQ (or separate)
-    // Optional: separate send/recv CQs
-    // async_send_cq: AsyncCq,
-    // async_recv_cq: AsyncCq,
-}
-```
-
-### 7.3 Two-sided verbs (SEND / RECV)
-
-```rust
-impl AsyncQp {
-    /// Post a SEND and await its completion.
-    pub async fn send(&self, mr: &MemoryRegion, range: Range<usize>, wr_id: u64) -> Result<()> {
-        let mut wr = SendWr::new(mr, range, wr_id, ibv_wr_opcode::IBV_WR_SEND);
-        self.qp.post_send(&mut wr)?;
-        self.async_cq.poll_wr_id(wr_id).await
-    }
-
-    /// Post a RECV buffer and await its completion. Returns bytes received.
-    pub async fn recv(&self, mr: &mut MemoryRegion, range: Range<usize>, wr_id: u64) -> Result<u32> {
-        let mut wr = RecvWr::new(mr, range, wr_id);
-        self.qp.post_recv(&mut wr)?;
-        let wc = self.async_cq.poll_wr_id(wr_id).await?;
-        Ok(wc.byte_len())
-    }
-
-    /// Post a SEND with immediate data.
-    pub async fn send_with_imm(
-        &self, mr: &MemoryRegion, range: Range<usize>, wr_id: u64, imm: u32,
-    ) -> Result<()> {
-        let mut wr = SendWr::new(mr, range, wr_id, ibv_wr_opcode::IBV_WR_SEND_WITH_IMM);
-        wr.set_imm_data(imm);
-        self.qp.post_send(&mut wr)?;
-        self.async_cq.poll_wr_id(wr_id).await
-    }
-}
-```
-
-### 7.4 One-sided verbs (RDMA READ / WRITE)
-
-One-sided operations access remote memory directly without involving the remote CPU. They require a `RemoteMemoryRegion` token (rkey + remote address) exchanged out-of-band.
-
-```rust
-/// Token representing a remote memory region.
-/// Exchanged between peers during setup (e.g., via SEND/RECV or a side channel).
-#[derive(Debug, Clone, Copy)]
 pub struct RemoteMr {
     pub addr: u64,
     pub len: u32,
     pub rkey: u32,
 }
-
-impl AsyncQp {
-    /// RDMA READ: read from remote memory into a local MR.
-    /// The remote side is not notified.
-    pub async fn read_remote(
-        &self,
-        local_mr: &mut MemoryRegion,
-        local_range: Range<usize>,
-        remote: &RemoteMr,
-        remote_offset: usize,
-        wr_id: u64,
-    ) -> Result<()> {
-        let mut wr = SendWr::new(local_mr, local_range, wr_id, ibv_wr_opcode::IBV_WR_RDMA_READ);
-        wr.set_remote(remote.addr + remote_offset as u64, remote.rkey);
-        self.qp.post_send(&mut wr)?;
-        self.async_cq.poll_wr_id(wr_id).await
-    }
-
-    /// RDMA WRITE: write from local MR to remote memory.
-    /// The remote side is not notified.
-    pub async fn write_remote(
-        &self,
-        local_mr: &MemoryRegion,
-        local_range: Range<usize>,
-        remote: &RemoteMr,
-        remote_offset: usize,
-        wr_id: u64,
-    ) -> Result<()> {
-        let mut wr = SendWr::new(local_mr, local_range, wr_id, ibv_wr_opcode::IBV_WR_RDMA_WRITE);
-        wr.set_remote(remote.addr + remote_offset as u64, remote.rkey);
-        self.qp.post_send(&mut wr)?;
-        self.async_cq.poll_wr_id(wr_id).await
-    }
-
-    /// RDMA WRITE with immediate data.
-    /// Remote side receives a RECV completion with the imm_data.
-    pub async fn write_remote_with_imm(
-        &self,
-        local_mr: &MemoryRegion,
-        local_range: Range<usize>,
-        remote: &RemoteMr,
-        remote_offset: usize,
-        imm: u32,
-        wr_id: u64,
-    ) -> Result<()> {
-        let mut wr = SendWr::new(local_mr, local_range, wr_id, ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM);
-        wr.set_remote(remote.addr + remote_offset as u64, remote.rkey);
-        wr.set_imm_data(imm);
-        self.qp.post_send(&mut wr)?;
-        self.async_cq.poll_wr_id(wr_id).await
-    }
-}
 ```
 
-### 7.5 Atomic verbs
+Created via `OwnedMemoryRegion::to_remote()`. Exchanged out-of-band (e.g., via SEND/RECV during setup).
 
-Atomic operations require the QP to be `RC` (reliable connected) and the remote MR to have `IBV_ACCESS_REMOTE_ATOMIC`. The target address must be 8-byte aligned.
+### 7.4 iWARP Limitations
 
-```rust
-impl AsyncQp {
-    /// Compare-and-swap: if remote value == `expected`, set to `desired`.
-    /// Returns the original remote value (before the swap attempt).
-    pub async fn compare_and_swap(
-        &self,
-        local_mr: &mut MemoryRegion,  // 8 bytes to receive old value
-        local_offset: usize,
-        remote: &RemoteMr,
-        remote_offset: usize,
-        expected: u64,
-        desired: u64,
-        wr_id: u64,
-    ) -> Result<u64> {
-        let mut wr = SendWr::new_atomic(
-            local_mr, local_offset, wr_id,
-            ibv_wr_opcode::IBV_WR_ATOMIC_CMP_AND_SWP,
-        );
-        wr.set_remote(remote.addr + remote_offset as u64, remote.rkey);
-        wr.set_atomic(expected, desired);
-        self.qp.post_send(&mut wr)?;
-        self.async_cq.poll_wr_id(wr_id).await?;
-        // Old value is written into local_mr at local_offset
-        Ok(u64::from_ne_bytes(local_mr.as_slice()[local_offset..local_offset+8].try_into().unwrap()))
-    }
-
-    /// Fetch-and-add: atomically adds `add_val` to the remote 8-byte value.
-    /// Returns the original remote value (before the add).
-    pub async fn fetch_and_add(
-        &self,
-        local_mr: &mut MemoryRegion,  // 8 bytes to receive old value
-        local_offset: usize,
-        remote: &RemoteMr,
-        remote_offset: usize,
-        add_val: u64,
-        wr_id: u64,
-    ) -> Result<u64> {
-        let mut wr = SendWr::new_atomic(
-            local_mr, local_offset, wr_id,
-            ibv_wr_opcode::IBV_WR_ATOMIC_FETCH_AND_ADD,
-        );
-        wr.set_remote(remote.addr + remote_offset as u64, remote.rkey);
-        wr.set_atomic(add_val, 0);  // compare_add = add_val, swap = unused
-        self.qp.post_send(&mut wr)?;
-        self.async_cq.poll_wr_id(wr_id).await?;
-        Ok(u64::from_ne_bytes(local_mr.as_slice()[local_offset..local_offset+8].try_into().unwrap()))
-    }
-}
-```
+- **RDMA WRITE with IMM**: Not defined in iWARP (RFC 5040) — InfiniBand/RoCE only. siw correctly rejects it.
+- **Atomics**: siw reports `ATOMIC_NONE` — no CAS/FAA support. These are optional RDMA capabilities.
+- **RDMA READ/WRITE**: Work fine on siw (iWARP requires them).
+- API methods for all verbs exist and are correct for InfiniBand/RoCE; siw limitations are documented in tests.
 
 ### 7.6 Batch operations
 
-For high-throughput use cases, posting many WRs one at a time is inefficient. We support posting a batch and awaiting all completions:
-
-```rust
-impl AsyncQp {
-    /// Post multiple send WRs as a linked list and await all completions.
-    pub async fn post_send_batch(&self, wrs: &mut [SendWr]) -> Result<Vec<WorkCompletion>> {
-        // Link WRs into a chain (each wr.next points to the next)
-        for i in 0..wrs.len() - 1 {
-            wrs[i].set_next(&mut wrs[i + 1]);
-        }
-        self.qp.post_send(&mut wrs[0])?;
-        self.async_cq.poll_n(wrs.len()).await
-    }
-}
-```
+> 📋 **Future work**: `post_send_batch()` — post multiple linked WRs and await all completions. Not yet implemented.
 
 ### 7.7 Relationship to AsyncRdmaStream
 
@@ -850,125 +315,106 @@ impl AsyncQp {
 │  compare_and_swap() fetch_and_add()               │
 ├──────────────────────────────────────────────────┤
 │  AsyncCq                                          │  Low-level CQ polling (§4)
-│  poll() poll_wr_id()                              │  Runtime-agnostic
+│  poll() poll_wr_id() poll_completions()           │  Runtime-agnostic
 ├──────────────────────────────────────────────────┤
 │  QueuePair / CompletionQueue / MemoryRegion       │  Sync core (existing)
 └──────────────────────────────────────────────────┘
 ```
 
-- **`AsyncRdmaStream`** uses `AsyncQp` internally (or shares the same `AsyncCq`) for SEND/RECV with buffering, flow control, and `AsyncRead`/`AsyncWrite` traits.
-- **`AsyncQp`** gives direct access to all verbs — users manage MRs, WR IDs, and flow control themselves. This is the right choice for RDMA READ/WRITE workloads, key-value stores, distributed locks, etc.
+- **`AsyncRdmaStream`** uses `AsyncCq` directly for SEND/RECV with buffering, flow control, and trait impls.
+- **`AsyncQp`** gives direct access to all verbs — users manage MRs, WR IDs, and flow control themselves.
 - Both share the **`AsyncCq`** layer for async completion handling.
 
 ### 7.8 Sync verb equivalents
 
-The same API pattern works synchronously (already partially exists via `QueuePair::post_send`). We'll add ergonomic sync wrappers that post + poll in one call:
+> 📋 **Future work**: Ergonomic sync wrappers that post + spin-poll in one call (e.g., `QueuePair::read_remote_sync()`).
 
-```rust
-impl QueuePair {
-    /// Synchronous RDMA READ: post + spin-poll until completion.
-    pub fn read_remote_sync(
-        &self, cq: &CompletionQueue,
-        local_mr: &mut MemoryRegion, local_range: Range<usize>,
-        remote: &RemoteMr, remote_offset: usize,
-    ) -> Result<()> {
-        let wr_id = /* unique id */;
-        let mut wr = SendWr::new(local_mr, local_range, wr_id, ibv_wr_opcode::IBV_WR_RDMA_READ);
-        wr.set_remote(remote.addr + remote_offset as u64, remote.rkey);
-        self.post_send(&mut wr)?;
-        cq.poll_blocking_wr_id(wr_id)
-    }
-}
-```
+### 7.9 Prerequisites (all complete ✅)
 
-### 7.9 Prerequisites
-
-Before `AsyncQp` can be implemented, the sync layer needs:
-
-1. **`SendWr` builder methods**: `set_remote(addr, rkey)`, `set_imm_data(imm)`, `set_atomic(compare_add, swap)`, `set_next(wr)`
-2. **`RemoteMr` type**: simple struct with `addr`, `len`, `rkey` — exchanged out-of-band
-3. **`WorkCompletion` accessors**: `byte_len()`, `imm_data()`, `opcode()`
-4. **`MemoryRegion::rkey()`** and **`MemoryRegion::addr()`** — expose remote access tokens
-5. **MR access flags**: `IBV_ACCESS_REMOTE_READ`, `REMOTE_WRITE`, `REMOTE_ATOMIC` on registration
+All prerequisites for `AsyncQp` are implemented in the sync layer:
+- `SendWr` builder methods: `set_remote()`, `set_imm_data()`, `atomic()`, `build_raw()` atomic branch
+- `RemoteMr` type with `OwnedMemoryRegion::to_remote()`
+- `WorkCompletion` accessors: `byte_len()`, `imm_data()`, `opcode()`
+- `MemoryRegion::rkey()`, `MemoryRegion::addr()`, `AccessFlags` with remote access bits
 
 ---
 
 ## 8. Async CM Event Channel (Connection Setup)
 
-The `rdma_event_channel` struct has an `.fd` field — a regular Linux file descriptor, just like `ibv_comp_channel`. This means **the entire connection flow can be fully async**, not just the data path.
+> 🔧 **Planned** (Phase F): True async connection setup using the CM event channel fd.
 
-### How it works
+The `rdma_event_channel` struct has an `.fd` field — a regular Linux fd, pollable with epoll/AsyncFd. By setting it non-blocking and registering with the async reactor, all CM operations become truly async without `spawn_blocking`.
 
-```
-rdma_event_channel {
-    pub fd: i32,   // ← pollable with epoll/kqueue, wrappable with AsyncFd
-}
-```
+### Design
 
-The fd becomes readable whenever `rdma_get_cm_event()` has an event to return. By setting the fd to non-blocking and registering it with the async reactor, all connection management operations become non-blocking:
+**`EventChannel` additions** (in `cm.rs`):
+- `fd() -> RawFd` — expose the channel fd (like `CompletionChannel::fd()`)
+- `set_nonblocking() -> Result<()>` — `fcntl(fd, F_SETFL, O_NONBLOCK)`
+- `try_get_event() -> Result<CmEvent>` — non-blocking; returns `WouldBlock` if no event
 
-```rust
-/// Async wrapper around rdma_event_channel.fd.
-pub struct AsyncEventChannel {
-    channel: EventChannel,
-    notifier: Box<dyn CqNotifier>,  // reuse the same CqNotifier trait
-}
+**`AsyncEventChannel`** (new type in `async_stream.rs` or dedicated `async_cm.rs`):
+- Wraps `EventChannel` + `AsyncFd<RawFd>` (tokio) or `Async<FdWrapper>` (smol)
+- `async fn get_event() -> Result<CmEvent>` — loop: await fd readable → `try_get_event()` → handle `WouldBlock` (spurious wakeup, retry)
+- `async fn expect_event(expected: CmEventType) -> Result<()>` — get_event + type check + ack
 
-impl AsyncEventChannel {
-    /// Wait for the next CM event asynchronously.
-    pub async fn get_event(&self) -> Result<CmEvent> {
-        loop {
-            self.notifier.readable().await.map_err(Error::Verbs)?;
-            match self.channel.try_get_event() {
-                Ok(ev) => return Ok(ev),
-                Err(e) if e.would_block() => continue,  // spurious wakeup
-                Err(e) => return Err(e),
-            }
-        }
-    }
-}
-```
+**Error handling**:
+- `try_get_event()` calls `rdma_get_cm_event()` on non-blocking fd
+- Returns `Error::WouldBlock` on `EAGAIN`/`EWOULDBLOCK` (already in our error model)
+- `AsyncEventChannel::get_event()` retries on `WouldBlock` after re-registering for readiness
 
-### Fully async connection flow
+**Notifier reuse**: The `CqNotifier` trait (`readable()` + `poll_readable()`) can be reused for the CM event channel fd — same pattern, different fd. Alternatively, use `AsyncFd` directly since CM events are less frequent.
+
+### Async connect implementation sketch
 
 ```rust
-// Client — fully async, no blocking calls
 impl AsyncRdmaStream {
     pub async fn connect(addr: &SocketAddr) -> Result<Self> {
-        let async_ch = AsyncEventChannel::new_tokio()?;
-        let cm_id = CmId::new(async_ch.inner(), PortSpace::Tcp)?;
+        let ch = EventChannel::new()?;
+        ch.set_nonblocking()?;
+        let async_ch = AsyncEventChannel::new(&ch)?;  // registers fd with reactor
+        let cm_id = CmId::new(&ch, PortSpace::Tcp)?;
 
-        cm_id.resolve_addr(None, addr, 2000)?;
-        let ev = async_ch.get_event().await?;         // async wait for ADDR_RESOLVED
-        assert_eq!(ev.event_type(), CmEventType::AddrResolved);
-        ev.ack();
+        cm_id.resolve_addr(None, addr, 2000)?;         // non-blocking kernel call
+        async_ch.expect_event(AddrResolved).await?;     // await event on fd
 
-        cm_id.resolve_route(2000)?;
-        let ev = async_ch.get_event().await?;         // async wait for ROUTE_RESOLVED
-        ev.ack();
+        cm_id.resolve_route(2000)?;                     // non-blocking kernel call
+        async_ch.expect_event(RouteResolved).await?;    // await event on fd
 
-        // ... create QP, MRs ...
-        cm_id.connect(&param)?;
-        let ev = async_ch.get_event().await?;         // async wait for ESTABLISHED
-        ev.ack();
+        // Setup resources (sync, fast)
+        let ctx = cm_id.verbs_context().ok_or(...)?;
+        let pd = cm_id.alloc_pd()?;
+        let comp_ch = CompletionChannel::new(&ctx)?;
+        let cq = CompletionQueue::with_comp_channel(ctx, 32, &comp_ch)?;
+        cm_id.create_qp_with_cq(&pd, &stream_qp_attr(), Some(&cq), Some(&cq))?;
+        // ... MR setup, post recv buffers ...
 
-        Ok(stream)
+        cm_id.connect(&ConnParam::default())?;          // non-blocking kernel call
+        async_ch.expect_event(Established).await?;      // await event on fd
+
+        // Now in tokio async context — safe to create AsyncFd
+        let notifier = TokioCqNotifier::new(comp_ch.fd())?;
+        let async_cq = AsyncCq::new(cq, comp_ch, Box::new(notifier));
+        // ...
     }
 }
+```
 
-// Server — async accept loop
+### Async accept implementation sketch
+
+```rust
 impl AsyncRdmaListener {
     pub async fn accept(&self) -> Result<AsyncRdmaStream> {
-        let ev = self.async_ch.get_event().await?;    // async wait for CONNECT_REQUEST
-        let conn_id = unsafe { CmId::from_raw(ev.cm_id_raw(), true) };
-        ev.ack();
+        let ev = self.async_ch.get_event().await?;      // await CONNECT_REQUEST
+        // ... validate event type, extract conn_id ...
 
-        // ... create QP, accept ...
-        conn_id.accept(&param)?;
-        let ev = self.async_ch.get_event().await?;    // async wait for ESTABLISHED
-        ev.ack();
+        // Setup resources on conn_id (sync, fast)
+        // ... PD, CQ, QP, MRs, post recv buffers ...
 
-        Ok(stream)
+        conn_id.accept(&ConnParam::default())?;         // non-blocking kernel call
+        self.async_ch.expect_event(Established).await?;  // await event on fd
+
+        conn_id.migrate(&conn_ch)?;                     // move to per-connection channel
+        // Create async CQ + return stream
     }
 }
 ```
@@ -977,10 +423,10 @@ impl AsyncRdmaListener {
 
 | Approach | Pros | Cons |
 |----------|------|------|
-| `spawn_blocking` (§5 current design) | Simple, works today | Ties up a thread pool thread for ~10ms |
+| `spawn_blocking` (current) | Simple, works today | Ties up a thread pool thread for ~10ms |
 | Async CM events (this section) | True async, no thread pool | More code, need non-blocking EventChannel |
 
-**Recommendation**: Phase C (§11) uses `spawn_blocking` for connection setup initially. Phase F adds fully async CM events. For servers accepting many connections concurrently, async CM is important to avoid thread pool exhaustion.
+For servers accepting many concurrent connections, async CM avoids thread pool exhaustion. For single-connection clients, the difference is negligible but the API is cleaner (`async fn` vs `spawn_blocking` wrapper).
 
 ---
 
@@ -1021,11 +467,7 @@ impl AsyncCq {
 
 ### Batching CQ events
 
-`ibv_ack_cq_events` is expensive (takes a mutex internally). Batch acknowledgements:
-
-- Ack every 16 events (configurable)
-- Ack all remaining in `Drop`
-- This is already handled in our `AsyncCq` design (§4.5)
+`ibv_ack_cq_events` takes a mutex internally — batch acknowledgements every 16 events (implemented in `AsyncCq`).
 
 ---
 
@@ -1039,36 +481,19 @@ impl AsyncCq {
 
 ### Integration tests (siw)
 
-```rust
-#[tokio::test]
-async fn async_stream_echo() {
-    let listener = AsyncRdmaListener::bind_tokio(&bind_addr).await.unwrap();
-    let server = tokio::spawn(async move {
-        let mut stream = listener.accept().await.unwrap();
-        let mut buf = [0u8; 1024];
-        let n = stream.read(&mut buf).await.unwrap();
-        stream.write(&buf[..n]).await.unwrap();
-    });
+> **Implementation**: See `rdma-io-tests/src/async_stream_tests.rs` and `async_qp_tests.rs`. 34 tests total (all passing).
 
-    let mut client = AsyncRdmaStream::connect_tokio(&connect_addr).await.unwrap();
-    client.write(b"hello async").await.unwrap();
-    let mut buf = [0u8; 1024];
-    let n = client.read(&mut buf).await.unwrap();
-    assert_eq!(&buf[..n], b"hello async");
-
-    server.await.unwrap();
-}
-```
+Tests cover: async CQ send/recv, AsyncQp ping-pong, AsyncRdmaStream echo/multi-message/large-transfer, futures-io traits, tokio compat, tokio::io::copy, RDMA WRITE+READ roundtrip.
 
 ### Compatibility test matrix
 
 | Test | tokio | smol | Notes |
 |------|-------|------|-------|
-| async_echo | ✅ | ✅ | Basic round-trip |
-| async_multi_message | ✅ | ✅ | 5 round-trips |
-| async_concurrent_streams | ✅ | ✅ | Multiple connections on one runtime |
-| async_interleave_with_tcp | ✅ | ✅ | RDMA + TCP on same event loop |
-| async_cancellation | ✅ | ✅ | Drop future mid-read |
+| async_echo | ✅ | 📋 | Basic round-trip |
+| async_multi_message | ✅ | 📋 | 5 round-trips |
+| futures_io_echo | ✅ | 📋 | AsyncRead/AsyncWrite traits |
+| tokio_compat_echo | ✅ | N/A | tokio_util compat layer |
+| rdma_write_read | ✅ | 📋 | One-sided verbs |
 
 ---
 
@@ -1093,12 +518,13 @@ Build the mid-level verb abstraction first so the stream can compose on top of i
 
 ### Phase C: AsyncRdmaStream (wraps AsyncQp) ✅
 
-Stream is a thin buffering + flow-control layer on top of `AsyncQp`.
+Stream is a thin buffering + flow-control layer on top of `AsyncCq`.
 
 1. `AsyncRdmaStream::connect()` / `AsyncRdmaListener::bind()` / `accept()`
-2. `AsyncRdmaStream::read()` / `write()` using `AsyncQp::send()` / `recv()`
+2. `AsyncRdmaStream::read()` / `write()` delegate to `poll_read` / `poll_write` via `std::future::poll_fn` (single code path)
 3. `accept()` uses `rdma_migrate_id()` to decouple accepted connection from listener event channel — allows listener to be safely dropped after accept
-4. Tests: async echo, multi-message, large transfer (32 KiB)
+4. Shared CQ: `poll_write` stashes recv completions (`VecDeque`); `poll_read` stashes send completions — no completions dropped
+5. Tests: async echo, multi-message, large transfer (32 KiB)
 
 ### Phase D: AsyncRead / AsyncWrite trait impls ✅
 
@@ -1118,11 +544,16 @@ Extend `AsyncQp` with the remaining RDMA verbs.
 4. Tests: RDMA WRITE + READ roundtrip verified on siw — 1 test
 5. Note: RDMA WRITE with IMM not supported on iWARP/siw; atomics require `ATOMIC_HCA` capability (siw has `ATOMIC_NONE`). These are tested on InfiniBand/RoCE hardware.
 
-### Phase F: SmolCqNotifier + CM event async 📋 (future work)
+### Phase F: Async CM Event Channel 🔧 (planned)
 
-1. `SmolCqNotifier` (smol feature) — `Async<T>` fd wrapper for async-io runtime
-2. Async CM event channel (for `AsyncRdmaListener::accept` without `spawn_blocking`)
-3. Full test matrix across both runtimes
+True async connection setup — eliminate `spawn_blocking` from connect/accept paths.
+
+1. **`EventChannel` extensions**: `fd()` accessor, `set_nonblocking()`, `try_get_event()` (non-blocking)
+2. **`AsyncEventChannel`**: wraps `EventChannel` + `AsyncFd<RawFd>`, provides `async fn get_event()` + `expect_event()`
+3. **`AsyncRdmaStream::connect()`** → `async fn`: resolve_addr → await → resolve_route → await → connect → await (see §8)
+4. **`AsyncRdmaListener::accept()`** → `async fn`: await CONNECT_REQUEST → setup → accept → await ESTABLISHED
+5. **`AsyncRdmaListener`** stores `AsyncEventChannel` (bind stays sync — no CM events for bind/listen)
+6. Tests: async connect/accept without `spawn_blocking`, concurrent accept stress test
 
 ---
 
@@ -1130,10 +561,10 @@ Extend `AsyncQp` with the remaining RDMA verbs.
 
 | Crate | Version | Feature | Purpose |
 |-------|---------|---------|---------|
-| `futures-io` | 0.3 | (always, when async) | `AsyncRead`/`AsyncWrite` traits (primary, runtime-agnostic) |
-| `tokio` | 1.x | `tokio` | `AsyncFd`, `spawn_blocking` |
-| `tokio-util` | 0.7 | `tokio` | `FuturesAsyncReadCompatExt` for tokio compat |
+| `futures-io` | 0.3 | `tokio` or `smol` | `AsyncRead`/`AsyncWrite` traits (primary, runtime-agnostic) |
+| `tokio` | 1.x | `tokio` | `AsyncFd` for CQ + CM event channels |
 | `async-io` | 2.x | `smol` | `Async<T>` fd wrapper |
+| `tokio-util` | 0.7 | (test crate only) | `FuturesAsyncReadCompatExt` for tokio compat in tests |
 
 All optional behind feature flags. Core `rdma-io` remains dependency-free (beyond existing deps).
 
@@ -1153,11 +584,11 @@ Tokio is the dominant runtime, but `futures::io` traits are the *de facto* stand
 
 ## 13. Open Questions
 
-1. **Should `AsyncCq` own the `CompletionChannel`?** If yes, simpler lifetime. If no, channel can be shared across multiple CQs (uncommon but valid).
-2. **Thread-safety of `AsyncCq`**: Should it be `Sync`? CQ polling is thread-safe, but the notifier state may not be. Likely `Send` but not `Sync` — one task owns it.
-3. **`ibv_get_cq_event` blocking behavior**: When the fd is non-blocking, does `ibv_get_cq_event` return `EAGAIN` or block? Must verify on siw. If it blocks, we need to call it only after `epoll` confirms readability.
-4. **Multiple CQs on one channel**: Should we support it? The RDMA spec allows it but it complicates event routing (each `ibv_get_cq_event` returns which CQ fired).
-5. **Cancellation safety**: If a future is dropped mid-`poll`, are RDMA resources in a consistent state? The drain-after-arm pattern is inherently cancellation-safe since we re-arm on every loop iteration.
+1. ~~**Should `AsyncCq` own the `CompletionChannel`?**~~ **Resolved** — Yes, `AsyncCq` owns the channel. Simpler lifetimes; 1:1 CQ-to-channel mapping.
+2. ~~**Thread-safety of `AsyncCq`**~~ **Resolved** — `AsyncCq` is `Send` but not `Sync` (single-owner). `AsyncQp` is `Send + Sync` (QP operations are thread-safe per libibverbs).
+3. ~~**`ibv_get_cq_event` blocking behavior**~~ **Resolved** — Returns `WouldBlock` on non-blocking fd. `poll_completions()` loops on spurious wakeups.
+4. **Multiple CQs on one channel**: Not supported. Code assumes 1:1 CQ-to-channel mapping. Supporting multiple CQs would require event routing (`ibv_get_cq_event` returns which CQ fired).
+5. ~~**Cancellation safety**~~ **Resolved** — Drain-after-arm is inherently cancellation-safe. Re-arm on every loop iteration, so dropping mid-poll is safe.
 
 ---
 
@@ -1167,6 +598,82 @@ Tokio is the dominant runtime, but `futures::io` traits are the *de facto* stand
 2. **Graceful async shutdown** — Design `poll_close` / `shutdown()` on `AsyncRdmaStream` that drains pending send/recv WRs before `rdma_disconnect`, instead of abrupt disconnect in Drop.
 3. **Stream split** — `AsyncRdmaStream::into_split()` → `AsyncReadHalf` / `AsyncWriteHalf` for concurrent read+write from separate tasks. Requires shared `AsyncCq` (via `Arc`) and separate send/recv state.
 4. **Error recovery & QP state transitions** — Document what happens when a verb fails mid-flight (QP transitions to error state). Distinguish fatal vs. recoverable errors. Design `reset_qp()` or reconnect flow.
+
+### 14.1 Async ibverbs — why no new API is needed
+
+The ibverbs posting functions (`ibv_post_send`, `ibv_post_recv`) are inherently non-blocking — they write a WR to the QP's send/recv queue and return immediately. The "async" part is waiting for the **completion**, which `AsyncQp` already handles:
+
+```
+AsyncQp::send()  =  ibv_post_send()  +  async_cq.poll_wr_id().await
+AsyncQp::recv()  =  ibv_post_recv()  +  async_cq.poll_wr_id().await
+```
+
+There's no kernel or network wait in the posting step itself — the NIC processes WRs asynchronously by design. Making `ibv_post_send` "more async" would add overhead for no benefit. The completion-driven model (`AsyncCq`) is already the correct async abstraction.
+
+**Raw ibv access**: Users who need `ibv_post_send`/`ibv_post_recv` without the completion await can use `AsyncQp::post_send_signaled()` (post-only) and `AsyncCq::poll()`/`poll_wr_id()` separately for manual control.
+
+### 14.2 Async disconnect
+
+`rdma_disconnect()` is a non-blocking kernel call that returns immediately. The `DISCONNECTED` event arrives asynchronously on the CM event channel. With `AsyncCmId`, true async disconnect is straightforward:
+
+**Proposed API**:
+```rust
+impl AsyncCmId {
+    /// Disconnect and await the DISCONNECTED event.
+    pub async fn disconnect_async(&self) -> Result<()> {
+        let async_ch = AsyncEventChannel::new(&self.event_channel)?;
+        self.cm_id.disconnect()?;
+        async_ch.expect_event(&self.event_channel, CmEventType::Disconnected).await
+    }
+}
+```
+
+**Use cases**:
+- **Graceful stream shutdown** — `AsyncRdmaStream::shutdown()` could drain pending WRs, then `disconnect_async()` to confirm the peer acknowledged the disconnect
+- **Connection lifecycle management** — servers that need to know when a client has fully disconnected before cleaning up resources
+- **Orderly close** — analogous to TCP's `shutdown()` + await FIN-ACK, vs. the current abrupt `disconnect()` in `Drop`
+
+**Current state**: `CmId::disconnect()` is sync (fire-and-forget). The `Drop` impl calls it without waiting for confirmation. This is safe but abrupt — the peer may not have finished processing in-flight data.
+
+### 14.3 Async CM event stream
+
+For advanced use cases (connection managers, multi-connection servers), an event stream on `AsyncCmListener` would be useful:
+
+**Proposed API**:
+```rust
+impl AsyncCmListener {
+    /// Returns an async Stream of CM events (connect requests, disconnects, errors).
+    pub fn events(&self) -> impl Stream<Item = Result<CmEvent>> + '_ { ... }
+}
+
+impl AsyncCmId {
+    /// Returns an async Stream of CM events on this connection (disconnect, errors).
+    pub fn events(&self) -> impl Stream<Item = Result<CmEvent>> + '_ { ... }
+}
+```
+
+This would enable patterns like:
+```rust
+// Accept loop
+while let Some(event) = listener.events().next().await {
+    match event?.event_type() {
+        ConnectRequest => { /* spawn handler */ }
+        _ => { /* log unexpected */ }
+    }
+}
+
+// Connection lifecycle
+tokio::select! {
+    result = stream.read(&mut buf) => { /* data */ }
+    event = cm_id.events().next() => { /* disconnect/error */ }
+}
+```
+
+**Dependencies**: Requires `futures::Stream` trait (already available via `futures-io` feature). Implementation wraps `AsyncEventChannel::get_event()` in a `poll_fn`-based stream adapter.
+
+### 14.4 SmolCqNotifier (smol runtime support)
+
+`SmolCqNotifier` using `async_io::Async<FdWrapper>` — same pattern as tokio adapter but using smol's reactor. Enables the entire async stack (CQ, QP, stream, CM) to work with smol/async-std runtimes. Behind `smol` feature flag.
 5. **Completion routing / dispatch** — Current `poll_wr_id()` silently drops non-matching completions. Need a proper dispatch mechanism (e.g., `HashMap<u64, Waker>`) for multiplexing multiple in-flight operations on one CQ.
 6. **Cancellation safety documentation** — Document precisely which async operations are safe to cancel (drop the future) and which may leak posted WRs. Posted RECV WRs that are never completed are leaked until QP destroy.
 7. **Backpressure / flow control (async)** — Adapt the sync stream's credit-based flow control for async context. Sender must track remote RECV buffer availability; `write()` should return `Pending` when no credits available rather than posting to a full QP.

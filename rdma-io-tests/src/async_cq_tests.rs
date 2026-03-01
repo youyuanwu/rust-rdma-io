@@ -1,14 +1,13 @@
 //! Async CQ integration tests — Phase A: CompletionChannel + AsyncCq.
 //!
 //! Tests verify that async CQ notification works with siw over the
-//! tokio runtime. Connection setup is done synchronously on std::threads,
-//! then the CompletionChannel + CQ are handed to the async test for
-//! AsyncCq polling.
+//! tokio runtime. Connection setup uses async CM (AsyncCmId/AsyncCmListener),
+//! but raw ibv_post_recv/ibv_post_send + spin-poll for the data path to
+//! isolate AsyncCq testing from AsyncQp.
 
-use std::thread;
-
+use rdma_io::async_cm::{AsyncCmId, AsyncCmListener};
 use rdma_io::async_cq::AsyncCq;
-use rdma_io::cm::{CmEventType, CmId, ConnParam, EventChannel, PortSpace};
+use rdma_io::cm::{CmEventType, ConnParam, PortSpace};
 use rdma_io::comp_channel::CompletionChannel;
 use rdma_io::cq::CompletionQueue;
 use rdma_io::mr::{AccessFlags, OwnedMemoryRegion};
@@ -44,10 +43,9 @@ fn default_qp_attr() -> QpInitAttr {
     }
 }
 
-/// Server-side resources returned after synchronous setup.
+/// Server-side resources returned after setup.
 struct ServerSetup {
-    _server_id: CmId,
-    _server_ch: EventChannel,
+    _server_cm: AsyncCmId,
     comp_ch: CompletionChannel,
     cq: std::sync::Arc<CompletionQueue>,
     recv_mr: OwnedMemoryRegion,
@@ -56,9 +54,12 @@ struct ServerSetup {
 // Safety: RDMA resources are usable across threads.
 unsafe impl Send for ServerSetup {}
 
-/// Do all RDMA setup synchronously: server listens, client connects, client sends.
-/// Returns the server's CompletionChannel + CQ for async polling.
-fn setup_and_send(
+/// Set up connection via async CM, send data via raw verbs, return server CQ.
+///
+/// Uses AsyncCmId/AsyncCmListener for connection setup and disconnect,
+/// but raw ibv_post_recv/ibv_post_send + spin-poll for the data path
+/// to isolate AsyncCq testing.
+async fn setup_and_send(
     bind_addr: std::net::SocketAddr,
     connect_addr: std::net::SocketAddr,
     send_data: &[u8],
@@ -67,22 +68,18 @@ fn setup_and_send(
     let data_len = send_data.len();
     let send_buf = send_data.to_vec();
 
-    let server_handle = thread::spawn(move || {
-        let ch = EventChannel::new().unwrap();
-        let listener = CmId::new(&ch, PortSpace::Tcp).unwrap();
-        listener.listen(&bind_addr, 1).unwrap();
+    let listener = AsyncCmListener::bind(&bind_addr).unwrap();
 
-        let ev = ch.get_event().unwrap();
-        assert_eq!(ev.event_type(), CmEventType::ConnectRequest);
-        let server_id = unsafe { CmId::from_raw(ev.cm_id_raw(), true) };
-        ev.ack();
+    let server_handle = tokio::spawn(async move {
+        // Two-phase accept: get request, set up QP + recv, then complete
+        let conn_id = listener.get_request().await.unwrap();
 
-        let pd = server_id.alloc_pd().unwrap();
-        let ctx = server_id.verbs_context().unwrap();
+        let pd = conn_id.alloc_pd().unwrap();
+        let ctx = conn_id.verbs_context().unwrap();
         let comp_ch = CompletionChannel::new(&ctx).unwrap();
         let cq = CompletionQueue::with_comp_channel(ctx, 16, &comp_ch).unwrap();
 
-        server_id
+        conn_id
             .create_qp_with_cq(&pd, &default_qp_attr(), Some(&cq), Some(&cq))
             .unwrap();
 
@@ -90,7 +87,8 @@ fn setup_and_send(
             .reg_mr_owned(vec![0u8; 64], AccessFlags::LOCAL_WRITE)
             .unwrap();
 
-        let server_qp = server_id.qp_raw();
+        // Post raw recv before accept (tests raw verb path)
+        let server_qp = conn_id.qp_raw();
         {
             let mut sge = rdma_io_sys::ibverbs::ibv_sge {
                 addr: unsafe { (*recv_mr.as_raw()).addr as u64 },
@@ -110,48 +108,48 @@ fn setup_and_send(
             assert_eq!(ret, 0, "server post_recv failed");
         }
 
-        server_id.accept(&ConnParam::default()).unwrap();
-        let ev = ch.get_event().unwrap();
-        assert_eq!(ev.event_type(), CmEventType::Established);
-        ev.ack();
+        let server_cm = listener
+            .complete_accept(conn_id, &ConnParam::default())
+            .await
+            .unwrap();
 
-        // Wait for disconnect from client
-        let ev = ch.get_event().unwrap();
+        // Await disconnect from client
+        let ev = server_cm.next_event().await.unwrap();
         assert_eq!(ev.event_type(), CmEventType::Disconnected);
         ev.ack();
 
         ServerSetup {
-            _server_id: server_id,
-            _server_ch: ch,
+            _server_cm: server_cm,
             comp_ch,
             cq,
             recv_mr,
         }
     });
 
-    // Client: connect, send, disconnect
-    thread::sleep(std::time::Duration::from_millis(50));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let ch = EventChannel::new().unwrap();
-    let client_id = CmId::new(&ch, PortSpace::Tcp).unwrap();
+    // Client: async connect, raw send, async disconnect
+    let client_cm = AsyncCmId::new(PortSpace::Tcp).unwrap();
+    client_cm
+        .resolve_addr(None, &connect_addr, 2000)
+        .await
+        .unwrap();
+    client_cm.resolve_route(2000).await.unwrap();
 
-    client_id.resolve_addr(None, &connect_addr, 2000).unwrap();
-    ch.get_event().unwrap().ack();
-    client_id.resolve_route(2000).unwrap();
-    ch.get_event().unwrap().ack();
+    let pd = client_cm.alloc_pd().unwrap();
+    // No CompletionChannel — client uses spin-poll (testing CQ layer, not QP layer)
+    client_cm
+        .cm_id()
+        .create_qp(&pd, &default_qp_attr())
+        .unwrap();
+    client_cm.connect(&ConnParam::default()).await.unwrap();
 
-    let pd = client_id.alloc_pd().unwrap();
-    client_id.create_qp(&pd, &default_qp_attr()).unwrap();
-    client_id.connect(&ConnParam::default()).unwrap();
-    let ev = ch.get_event().unwrap();
-    assert_eq!(ev.event_type(), CmEventType::Established);
-    ev.ack();
-
+    // Raw post_send + spin-poll
     let mut padded = vec![0u8; 64];
     padded[..data_len].copy_from_slice(&send_buf);
     let send_mr = pd.reg_mr_owned(padded, AccessFlags::LOCAL_WRITE).unwrap();
 
-    let client_qp = client_id.qp_raw();
+    let client_qp = client_cm.qp_raw();
     let client_send_cq = unsafe { (*client_qp).send_cq };
     {
         let mut sge = rdma_io_sys::ibverbs::ibv_sge {
@@ -188,18 +186,17 @@ fn setup_and_send(
         std::hint::spin_loop();
     }
 
-    // Disconnect client
-    client_id.disconnect().unwrap();
-    let _ev = ch.get_event().unwrap();
+    // Async disconnect — await DISCONNECTED event
+    client_cm.disconnect_async().await.unwrap();
 
-    server_handle.join().expect("server thread panicked")
+    server_handle.await.expect("server task panicked")
 }
 
 /// Test: AsyncCq::poll() receives a completion via comp_channel notification.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn async_cq_send_recv() {
     let (bind_addr, connect_addr) = test_addrs();
-    let setup = setup_and_send(bind_addr, connect_addr, b"async hello!", 100);
+    let setup = setup_and_send(bind_addr, connect_addr, b"async hello!", 100).await;
 
     let notifier = TokioCqNotifier::new(setup.comp_ch.fd()).unwrap();
     let async_cq = AsyncCq::new(setup.cq, setup.comp_ch, Box::new(notifier));
@@ -223,10 +220,10 @@ async fn async_cq_send_recv() {
 }
 
 /// Test: AsyncCq::poll_wr_id() waits for a specific WR ID.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn async_cq_poll_wr_id() {
     let (bind_addr, connect_addr) = test_addrs();
-    let setup = setup_and_send(bind_addr, connect_addr, b"wr_id", 42);
+    let setup = setup_and_send(bind_addr, connect_addr, b"wr_id", 42).await;
 
     let notifier = TokioCqNotifier::new(setup.comp_ch.fd()).unwrap();
     let async_cq = AsyncCq::new(setup.cq, setup.comp_ch, Box::new(notifier));

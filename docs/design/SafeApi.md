@@ -76,36 +76,7 @@ Each resource holds an `Arc` to its parent, ensuring the parent outlives all chi
 
 Every resource type implements `Drop`, calling the corresponding `ibv_destroy_*` / `ibv_dealloc_*` / `ibv_dereg_*` function. Drop order is guaranteed correct by the `Arc` references — children are dropped before parents because the parent's refcount only reaches zero after all children are gone.
 
-```rust
-pub struct Context {
-    inner: *mut ibv_context,
-    // No parent Arc — Context is the root (device list freed at open time)
-}
-
-pub struct ProtectionDomain {
-    inner: *mut ibv_pd,
-    _ctx: Arc<Context>,     // Prevents context from being closed
-}
-
-pub struct CompletionQueue {
-    inner: *mut ibv_cq,
-    _ctx: Arc<Context>,
-}
-
-pub struct QueuePair {
-    inner: *mut ibv_qp,
-    _pd: Arc<ProtectionDomain>,
-    _send_cq: Arc<CompletionQueue>,
-    _recv_cq: Arc<CompletionQueue>,
-    _srq: Option<Arc<SharedReceiveQueue>>,
-}
-
-pub struct MemoryRegion<'a> {
-    inner: *mut ibv_mr,
-    _pd: Arc<ProtectionDomain>,
-    _buf: PhantomData<&'a mut [u8]>,  // Ties MR lifetime to buffer
-}
-```
+> **Implementation**: See `device.rs`, `pd.rs`, `cq.rs`, `qp.rs`, `mr.rs` for the actual struct definitions.
 
 ### Why `Arc` and not lifetimes?
 
@@ -120,183 +91,51 @@ An MR pins a memory buffer for DMA access. The buffer **must not be freed or mov
 
 We provide both:
 
-```rust
-/// MR borrowing an external buffer.
-pub struct MemoryRegion<'a> { ... }
+- **Borrowed MR** (`MemoryRegion<'a>`) — ties MR lifetime to buffer via `PhantomData<&'a mut [u8]>`
+- **Owned MR** (`OwnedMemoryRegion`) — owns its buffer (`Box<[u8]>`), freed on deregistration
 
-/// MR owning its buffer.
-pub struct OwnedMemoryRegion {
-    inner: *mut ibv_mr,
-    _pd: Arc<ProtectionDomain>,
-    buf: Vec<u8>,
-}
-```
+> **Implementation**: See `mr.rs`. Also includes `RemoteMr` descriptor for one-sided operations and `OwnedMemoryRegion::to_remote()` for remote MR exchange.
 
 ---
 
 ## 4. Core API Surface
 
-### 4.1 Device & Context
+> **Implementation**: All types below are implemented. See source files for full API signatures.
 
-```rust
-/// List available RDMA devices.
-pub fn devices() -> Result<Vec<Device>>
+### 4.1 Device & Context (`device.rs`)
 
-impl Device {
-    pub fn name(&self) -> &str
-    pub fn guid(&self) -> u64
-    pub fn open(&self) -> Result<Arc<Context>>
-}
+- `devices()` — list RDMA devices
+- `Device::open()` → `Arc<Context>`
+- `Context`: `query_device()`, `query_port()`, `query_gid()`, `create_pd()`, `create_cq()`
 
-impl Context {
-    pub fn query_device(&self) -> Result<DeviceAttr>
-    pub fn query_port(&self, port: u8) -> Result<PortAttr>
-    pub fn query_gid(&self, port: u8, index: i32) -> Result<Gid>
-    pub fn query_gid_table(&self) -> Result<Vec<GidEntry>>
-    pub fn create_pd(self: &Arc<Self>) -> Result<Arc<ProtectionDomain>>
-    pub fn create_cq(self: &Arc<Self>, cqe: i32) -> Result<Arc<CompletionQueue>>
-    pub fn create_comp_channel(self: &Arc<Self>) -> Result<CompletionChannel>
-}
-```
+### 4.2 Protection Domain (`pd.rs`)
 
-### 4.2 Protection Domain
+- `reg_mr()` — borrowed MR with lifetime tied to buffer
+- `reg_mr_owned()` — owned MR with internal buffer
+- `create_qp()` — QP creation with explicit CQ references
 
-```rust
-impl ProtectionDomain {
-    pub fn reg_mr<'a>(
-        self: &Arc<Self>,
-        buf: &'a mut [u8],
-        access: AccessFlags,
-    ) -> Result<MemoryRegion<'a>>
+### 4.3 Completion Queue (`cq.rs`)
 
-    pub fn reg_mr_owned(
-        self: &Arc<Self>,
-        buf: Vec<u8>,
-        access: AccessFlags,
-    ) -> Result<OwnedMemoryRegion>
+- `poll()` — poll for completions (legacy API)
+- `req_notify()` — arm notification for async use
+- `CompletionQueueEx` / `PollGuard` — new CQ API (designed, not yet implemented — siw lacks support)
 
-    pub fn create_qp(
-        self: &Arc<Self>,
-        init_attr: &QpInitAttr,
-    ) -> Result<QueuePair>
+### 4.4 Queue Pair (`qp.rs`)
 
-    pub fn create_ah(
-        self: &Arc<Self>,
-        attr: &AhAttr,
-    ) -> Result<AddressHandle>
-}
-```
+- `post_send()` / `post_recv()` — legacy verb posting
+- `modify()` — QP state transitions (INIT → RTR → RTS)
+- `QueuePairEx` / `WrSession` — new WR builder API (designed, not yet implemented)
 
-### 4.3 Completion Queue
+### 4.5 Memory Region (`mr.rs`)
 
-```rust
-impl CompletionQueue {
-    /// Poll for completions (legacy API). Returns number of completions.
-    pub fn poll(&self, wc: &mut [WorkCompletion]) -> Result<usize>
+- `MemoryRegion<'a>` — borrowed, `OwnedMemoryRegion` — owned
+- Both expose `lkey()`, `rkey()`, `as_slice()`, `as_mut_slice()`
+- `RemoteMr` — lightweight descriptor (addr, rkey, len) for one-sided ops
 
-    /// Request notification on next completion.
-    pub fn req_notify(&self, solicited_only: bool) -> Result<()>
-}
+### 4.6 Work Completion (`wc.rs`)
 
-/// Extended CQ with the new polling API.
-impl CompletionQueueEx {
-    pub fn start_poll(&self) -> Result<PollGuard<'_>>
-}
-
-impl PollGuard<'_> {
-    pub fn opcode(&self) -> WcOpcode
-    pub fn byte_len(&self) -> u32
-    pub fn qp_num(&self) -> u32
-    pub fn status(&self) -> WcStatus
-    pub fn next(&mut self) -> Result<bool>
-    // ... other wc_read_* accessors
-}
-// PollGuard::drop calls ibv_end_poll
-```
-
-### 4.4 Queue Pair
-
-```rust
-pub struct QpInitAttr {
-    pub send_cq: Arc<CompletionQueue>,
-    pub recv_cq: Arc<CompletionQueue>,
-    pub srq: Option<Arc<SharedReceiveQueue>>,
-    pub cap: QpCap,
-    pub qp_type: QpType,
-    pub sq_sig_all: bool,
-}
-
-impl QueuePair {
-    pub fn qp_num(&self) -> u32
-    pub fn qp_type(&self) -> QpType
-
-    /// Modify QP state (e.g., INIT → RTR → RTS).
-    pub fn modify(&self, attr: &QpAttr, mask: QpAttrMask) -> Result<()>
-
-    /// Post a send work request (legacy API).
-    pub fn post_send(&self, wr: &SendWr) -> Result<()>
-
-    /// Post a receive work request (legacy API).
-    pub fn post_recv(&self, wr: &RecvWr) -> Result<()>
-}
-
-/// Extended QP with the new WR API (builder pattern).
-impl QueuePairEx {
-    pub fn start(&self) -> WrSession<'_>
-}
-
-impl WrSession<'_> {
-    pub fn send(&mut self) -> &mut Self
-    pub fn send_with_imm(&mut self, imm: u32) -> &mut Self
-    pub fn rdma_write(&mut self, raddr: u64, rkey: u32) -> &mut Self
-    pub fn rdma_read(&mut self, raddr: u64, rkey: u32) -> &mut Self
-    pub fn atomic_fetch_add(&mut self, raddr: u64, rkey: u32, add: u64) -> &mut Self
-    pub fn atomic_cmp_swap(&mut self, raddr: u64, rkey: u32, cmp: u64, swap: u64) -> &mut Self
-    pub fn set_sge(&mut self, lkey: u32, addr: u64, len: u32) -> &mut Self
-    pub fn set_inline_data(&mut self, data: &[u8]) -> &mut Self
-    pub fn complete(self) -> Result<()>
-    pub fn abort(self)
-}
-// WrSession::drop calls abort if not completed
-```
-
-### 4.5 Memory Region
-
-```rust
-impl<'a> MemoryRegion<'a> {
-    pub fn lkey(&self) -> u32
-    pub fn rkey(&self) -> u32
-    pub fn addr(&self) -> *mut u8
-    pub fn len(&self) -> usize
-    pub fn as_slice(&self) -> &[u8]
-    pub fn as_mut_slice(&mut self) -> &mut [u8]
-}
-
-impl OwnedMemoryRegion {
-    pub fn lkey(&self) -> u32
-    pub fn rkey(&self) -> u32
-    pub fn as_slice(&self) -> &[u8]
-    pub fn as_mut_slice(&mut self) -> &mut [u8]
-}
-```
-
-### 4.6 Work Completion
-
-```rust
-/// Wrapper around ibv_wc with typed accessors.
-#[repr(transparent)]
-pub struct WorkCompletion(ibv_wc);
-
-impl WorkCompletion {
-    pub fn status(&self) -> WcStatus
-    pub fn opcode(&self) -> WcOpcode
-    pub fn byte_len(&self) -> u32
-    pub fn qp_num(&self) -> u32
-    pub fn wr_id(&self) -> u64
-    pub fn imm_data(&self) -> Option<u32>
-    pub fn is_success(&self) -> bool
-}
-```
+- `#[repr(transparent)]` wrapper around `ibv_wc`
+- Typed accessors: `status()`, `opcode()`, `byte_len()`, `wr_id()`, `imm_data()`
 
 ---
 
@@ -304,146 +143,36 @@ impl WorkCompletion {
 
 rdma_cm provides TCP-like connection semantics over RDMA. This is the primary way to use iWARP (siw) and the recommended approach for RoCE.
 
-```rust
-/// Event channel for receiving CM events.
-pub struct EventChannel { ... }
+> **Implementation**: See `cm.rs` for `EventChannel`, `CmId`, `CmEvent`, `ConnParam`, `PortSpace`.
 
-/// Connection management ID — the core CM handle.
-pub struct CmId { ... }
+### Key types
 
-/// CM event received from an event channel.
-pub struct CmEvent { ... }
+- **`EventChannel`** — receives CM events (`get_event()`)
+- **`CmId`** — the core CM handle: `resolve_addr()`, `resolve_route()`, `connect()`, `listen()`, `accept()`, `disconnect()`, `create_qp()`, `create_qp_with_cq()`, `migrate()`
+- **`CmEvent`** — typed event with `event_type()`, `cm_id_raw()`, `ack()`
 
-impl EventChannel {
-    pub fn new() -> Result<Self>
-    pub fn get_event(&self) -> Result<CmEvent>
-}
+### Connection flows
 
-impl CmId {
-    /// Create a new CM ID for active (client) or passive (server) use.
-    pub fn new(channel: &EventChannel, port_space: PortSpace) -> Result<Self>
+**Client**: `CmId::new()` → `resolve_addr()` → `resolve_route()` → `create_qp()` → `connect()` → `ESTABLISHED`
 
-    /// Resolve destination address.
-    pub fn resolve_addr(&self, src: Option<&SocketAddr>, dst: &SocketAddr, timeout_ms: i32) -> Result<()>
+**Server**: `CmId::new()` → `listen()` → `CONNECT_REQUEST` → `from_raw()` → `create_qp()` → `accept()` → `ESTABLISHED`
 
-    /// Resolve route to destination.
-    pub fn resolve_route(&self, timeout_ms: i32) -> Result<()>
-
-    /// Connect to a remote peer (client side).
-    pub fn connect(&self, param: &ConnParam) -> Result<()>
-
-    /// Bind to local address and listen (server side).
-    pub fn listen(&self, addr: &SocketAddr, backlog: i32) -> Result<()>
-
-    /// Accept an incoming connection.
-    pub fn accept(&self, param: &ConnParam) -> Result<()>
-
-    /// Disconnect.
-    pub fn disconnect(&self) -> Result<()>
-
-    /// Access the underlying QP (created by rdma_cm).
-    pub fn qp(&self) -> Option<&QueuePair>
-
-    /// Access the PD (created automatically or user-supplied).
-    pub fn pd(&self) -> Option<&ProtectionDomain>
-
-    /// Create a QP associated with this CM ID.
-    pub fn create_qp(&self, pd: &ProtectionDomain, init_attr: &QpInitAttr) -> Result<()>
-}
-
-impl CmEvent {
-    pub fn event_type(&self) -> CmEventType
-    pub fn status(&self) -> i32
-    /// For CONNECT_REQUEST events, get the new CM ID for the incoming connection.
-    pub fn new_id(&self) -> Option<CmId>
-    pub fn ack(self)  // consumes event
-}
-```
-
-### Connection flow (client)
-
-```rust
-let channel = EventChannel::new()?;
-let id = CmId::new(&channel, PortSpace::Tcp)?;
-id.resolve_addr(None, &"192.168.1.1:9999".parse()?, 2000)?;
-let event = channel.get_event()?;  // ADDR_RESOLVED
-event.ack();
-id.resolve_route(2000)?;
-let event = channel.get_event()?;  // ROUTE_RESOLVED
-event.ack();
-id.create_qp(&pd, &qp_attr)?;
-id.connect(&conn_param)?;
-let event = channel.get_event()?;  // ESTABLISHED
-event.ack();
-// ... data path ...
-id.disconnect()?;
-```
-
-### Connection flow (server)
-
-```rust
-let channel = EventChannel::new()?;
-let listener = CmId::new(&channel, PortSpace::Tcp)?;
-listener.listen(&"0.0.0.0:9999".parse()?, 10)?;
-loop {
-    let event = channel.get_event()?;  // CONNECT_REQUEST
-    let new_id = event.new_id().unwrap();
-    event.ack();
-    new_id.create_qp(&pd, &qp_attr)?;
-    new_id.accept(&conn_param)?;
-    let event = channel.get_event()?;  // ESTABLISHED
-    event.ack();
-    // ... handle connection ...
-}
-```
+> **Note**: `accept()` in the async path uses `rdma_migrate_id()` to give accepted connections their own event channel, decoupling from listener lifetime.
 
 ---
 
 ## 6. Async Completion Polling
 
-> **Implemented**: See [AsyncIntegration.md](AsyncIntegration.md) for the full async design. Phase A (CompletionChannel + AsyncCq) and Phase B (AsyncQp) are complete. Runtime backends use feature flags (`tokio`, `smol`).
+> **Implementation**: See `async_cq.rs`, `tokio_notifier.rs`, `async_qp.rs`. Full async design in [AsyncIntegration.md](AsyncIntegration.md).
 
 ### Design
 
-RDMA completion notifications use file descriptors (via `ibv_comp_channel`). We register the fd with an event loop for edge-triggered readiness, then poll the CQ when notified. The `CqNotifier` trait abstracts over runtime-specific fd polling.
+RDMA completion notifications use file descriptors (via `ibv_comp_channel`). We register the fd with an event loop for edge-triggered readiness, then poll the CQ when notified.
 
-```rust
-/// Trait abstracting async fd readiness notification.
-pub trait CqNotifier: Send {
-    /// Wait until the comp_channel fd is readable.
-    fn wait_readable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>>;
-}
-
-/// Async-ready completion queue poller.
-pub struct AsyncCq {
-    cq: Arc<CompletionQueue>,
-    channel: CompletionChannel,
-    notifier: Box<dyn CqNotifier>,
-    acked: AtomicU32,
-}
-
-impl AsyncCq {
-    pub fn new(cq: Arc<CompletionQueue>, channel: CompletionChannel, notifier: Box<dyn CqNotifier>) -> Self
-
-    /// Wait for completions asynchronously (drain-after-arm loop).
-    pub async fn poll(&self, wc: &mut [WorkCompletion]) -> Result<usize>
-
-    /// Wait for a specific WR ID completion.
-    pub async fn poll_wr_id(&self, wr_id: u64) -> Result<WorkCompletion>
-}
-
-/// Async QP wrapper for individual RDMA verb operations.
-pub struct AsyncQp {
-    qp: *mut ibv_qp,    // borrowed from CmId
-    async_cq: AsyncCq,
-}
-
-impl AsyncQp {
-    pub async fn send(&self, mr: &OwnedMemoryRegion, offset: usize, length: usize, wr_id: u64) -> Result<WorkCompletion>
-    pub async fn recv(&self, mr: &OwnedMemoryRegion, offset: usize, length: usize, wr_id: u64) -> Result<WorkCompletion>
-    pub async fn send_with_imm(&self, mr: &OwnedMemoryRegion, offset: usize, length: usize, imm_data: u32, wr_id: u64) -> Result<WorkCompletion>
-}
-```
+- **`CqNotifier` trait** — abstracts runtime-specific fd polling (`wait_readable()` + `poll_readable()`)
+- **`AsyncCq`** — drain-after-arm loop with batched acks (every 16 events), plus `poll_completions()` for poll-based `AsyncRead`/`AsyncWrite`
+- **`AsyncQp`** — async verb wrappers: `send()`, `recv()`, `send_with_imm()`, plus one-sided: `read_remote()`, `write_remote()`, `compare_and_swap()`, `fetch_and_add()`
+- **`TokioCqNotifier`** — tokio backend using `AsyncFd`
 
 ### Completion notification flow (drain-after-arm)
 
@@ -460,36 +189,13 @@ This drain-after-arm pattern avoids the race condition where a completion arrive
 
 ## 7. Stream Abstraction (Read / Write)
 
-> **Note**: Phase 4 provides the synchronous stream abstraction using `std::io::Read`/`std::io::Write`. Async `AsyncRdmaStream` implements `futures::io::AsyncRead`/`AsyncWrite` (Phase D complete). Tokio users use `tokio_util::compat::FuturesAsyncReadCompatExt`. See [AsyncIntegration.md](AsyncIntegration.md).
+> **Implementation**: `stream.rs` (sync), `async_stream.rs` (async). Async traits in [AsyncIntegration.md](AsyncIntegration.md).
 
-```rust
-/// RDMA stream with Read + Write.
-///
-/// Uses rdma_cm for connection setup and RDMA SEND/RECV for data transfer.
-/// Internally manages MR registration and work request posting.
-pub struct RdmaStream {
-    id: CmId,
-    send_mr: OwnedMemoryRegion,
-    recv_mr: OwnedMemoryRegion,
-    // internal state: recv buffers, pending sends, etc.
-}
-
-impl RdmaStream {
-    /// Connect to a remote RDMA endpoint.
-    pub fn connect(addr: &SocketAddr) -> Result<Self>
-}
-
-impl std::io::Read for RdmaStream { ... }
-impl std::io::Write for RdmaStream { ... }
-
-/// RDMA listener (like TcpListener).
-pub struct RdmaListener { ... }
-
-impl RdmaListener {
-    pub fn bind(addr: &SocketAddr) -> Result<Self>
-    pub fn accept(&self) -> Result<RdmaStream>
-}
-```
+- **`RdmaStream`** — sync stream with `std::io::Read`/`Write` over RDMA SEND/RECV via rdma_cm
+- **`RdmaListener`** — `bind()` + `accept()`, like `TcpListener`
+- **`AsyncRdmaStream`** — async equivalent, implements `futures::io::AsyncRead`/`AsyncWrite`
+- **`AsyncRdmaListener`** — async listener; `accept()` uses `rdma_migrate_id()` for listener lifetime independence
+- Tokio users use `tokio_util::compat::FuturesAsyncReadCompatExt` for `tokio::io` traits
 
 ### How it works
 
@@ -504,36 +210,11 @@ This is an opinionated, high-level abstraction. Users who need fine-grained cont
 
 ## 8. Error Handling
 
-```rust
-/// RDMA error types.
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("ibverbs call failed: {0}")]
-    Verbs(#[source] std::io::Error),
+> **Implementation**: See `error.rs`.
 
-    #[error("rdma_cm call failed: {0}")]
-    Cm(#[source] std::io::Error),
-
-    #[error("work completion error: status={status:?}, vendor_err={vendor_err}")]
-    WorkCompletion {
-        status: WcStatus,
-        vendor_err: u32,
-    },
-
-    #[error("no RDMA devices found")]
-    NoDevices,
-
-    #[error("device not found: {0}")]
-    DeviceNotFound(String),
-
-    #[error("invalid argument: {0}")]
-    InvalidArg(String),
-}
-
-pub type Result<T> = std::result::Result<T, Error>;
-```
-
-Most ibverbs/rdmacm functions return 0 on success or set `errno`. The wrapper converts these to `std::io::Error` using `std::io::Error::last_os_error()`.
+- `Error` enum with variants: `Verbs`, `Cm`, `WorkCompletion`, `NoDevices`, `DeviceNotFound`, `InvalidArg`
+- `from_ret()` for ibverbs (negative errno), `from_ret_errno()` for rdma_cm (-1 + errno)
+- Uses `thiserror` for `Display`/`Error` derives, `std::io::Error` as inner source
 
 ---
 
@@ -585,41 +266,12 @@ smol = ["dep:async-io"]
 
 ## 11. Enum / Flag Types
 
+> **Implementation**: See `enums.rs`, `flags.rs`, and individual module files.
+
 The FFI layer generates enums as `u32` type aliases with module-level constants. The safe API wraps these in proper Rust types:
 
-```rust
-/// QP transport type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QpType {
-    Rc,
-    Uc,
-    Ud,
-    RawPacket,
-    XrcSend,
-    XrcRecv,
-}
-
-/// Memory region access flags.
-bitflags::bitflags! {
-    pub struct AccessFlags: u32 {
-        const LOCAL_WRITE = IBV_ACCESS_LOCAL_WRITE;
-        const REMOTE_WRITE = IBV_ACCESS_REMOTE_WRITE;
-        const REMOTE_READ = IBV_ACCESS_REMOTE_READ;
-        const REMOTE_ATOMIC = IBV_ACCESS_REMOTE_ATOMIC;
-    }
-}
-
-/// QP attribute mask for ibv_modify_qp.
-bitflags::bitflags! {
-    pub struct QpAttrMask: i32 {
-        const STATE = IBV_QP_STATE;
-        const PORT = IBV_QP_PORT;
-        const PKEY_INDEX = IBV_QP_PKEY_INDEX;
-        const ACCESS_FLAGS = IBV_QP_ACCESS_FLAGS;
-        // ...
-    }
-}
-```
+- **Rust enums** for transport types (`QpType`), states (`QpState`, `WcStatus`, `WcOpcode`), event types (`CmEventType`)
+- **`bitflags!`** for flag fields (`AccessFlags`, `QpAttrMask`, `SendFlags`)
 
 ---
 
@@ -676,8 +328,10 @@ bitflags::bitflags! {
 ### Async Phase C: AsyncRdmaStream ✅
 
 - `async_stream.rs` — `AsyncRdmaStream` + `AsyncRdmaListener`
-- TCP-like async read/write over RDMA SEND/RECV using `AsyncQp`
+- TCP-like async read/write over RDMA SEND/RECV via shared `AsyncCq`
+- `read()`/`write()` delegate to `poll_read`/`poll_write` via `std::future::poll_fn` (single code path)
 - `accept()` uses `rdma_migrate_id()` to give accepted connections their own event channel, decoupling from listener lifetime
+- Shared CQ completion stashing via `VecDeque` — recv and send completions never dropped across read/write interleaving
 - Connection setup is synchronous (use `spawn_blocking`); data path is fully async
 - Tests: echo, multi-message (5 round-trips), large transfer (32 KiB) — 3 tests
 

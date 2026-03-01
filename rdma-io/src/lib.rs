@@ -15,6 +15,8 @@ pub mod stream;
 pub mod wc;
 pub mod wr;
 
+#[cfg(feature = "tokio")]
+pub mod async_cm;
 #[cfg(any(feature = "tokio", feature = "smol"))]
 pub mod async_cq;
 #[cfg(any(feature = "tokio", feature = "smol"))]

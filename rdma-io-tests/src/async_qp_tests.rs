@@ -4,15 +4,15 @@
 //! Phase E: one-sided RDMA READ/WRITE + atomic verbs.
 //!
 //! Tests verify that `AsyncQp` correctly posts verbs and awaits completions.
-//! Connection setup uses rdma_cm synchronously on std::threads, then
-//! AsyncQp is constructed for async verb operations.
+//! Connection setup uses async CM (AsyncCmId/AsyncCmListener) for
+//! non-blocking connect/accept, then AsyncQp is constructed for verb operations.
 
 use std::sync::Arc;
-use std::thread;
 
+use rdma_io::async_cm::{AsyncCmId, AsyncCmListener};
 use rdma_io::async_cq::AsyncCq;
 use rdma_io::async_qp::AsyncQp;
-use rdma_io::cm::{CmEventType, CmId, ConnParam, EventChannel, PortSpace};
+use rdma_io::cm::{ConnParam, PortSpace};
 use rdma_io::comp_channel::CompletionChannel;
 use rdma_io::cq::CompletionQueue;
 use rdma_io::mr::{AccessFlags, RemoteMr};
@@ -48,130 +48,94 @@ fn default_qp_attr() -> QpInitAttr {
     }
 }
 
-/// RDMA endpoint resources for one side of a connection.
-struct Endpoint {
-    _cm_id: CmId,
-    _event_ch: EventChannel,
-    pd: Arc<ProtectionDomain>,
-    comp_ch: CompletionChannel,
-    cq: Arc<CompletionQueue>,
-    qp_raw: *mut rdma_io_sys::ibverbs::ibv_qp,
-}
-
-// Safety: RDMA resources are usable across threads.
-unsafe impl Send for Endpoint {}
-
-/// Set up a connected server+client pair synchronously.
-/// Returns (server_endpoint, client_endpoint) ready for async verb posting.
-fn setup_connection(
-    bind_addr: std::net::SocketAddr,
-    connect_addr: std::net::SocketAddr,
-) -> (Endpoint, Endpoint) {
-    let server_handle = thread::spawn(move || {
-        let ch = EventChannel::new().unwrap();
-        let listener = CmId::new(&ch, PortSpace::Tcp).unwrap();
-        listener.listen(&bind_addr, 1).unwrap();
-
-        let ev = ch.get_event().unwrap();
-        assert_eq!(ev.event_type(), CmEventType::ConnectRequest);
-        let server_id = unsafe { CmId::from_raw(ev.cm_id_raw(), true) };
-        ev.ack();
-
-        let pd = server_id.alloc_pd().unwrap();
-        let ctx = server_id.verbs_context().unwrap();
-        let comp_ch = CompletionChannel::new(&ctx).unwrap();
-        let cq = CompletionQueue::with_comp_channel(ctx, 16, &comp_ch).unwrap();
-
-        server_id
-            .create_qp_with_cq(&pd, &default_qp_attr(), Some(&cq), Some(&cq))
-            .unwrap();
-
-        let qp_raw = server_id.qp_raw();
-
-        server_id.accept(&ConnParam::default()).unwrap();
-        let ev = ch.get_event().unwrap();
-        assert_eq!(ev.event_type(), CmEventType::Established);
-        ev.ack();
-
-        Endpoint {
-            _cm_id: server_id,
-            _event_ch: ch,
-            pd,
-            comp_ch,
-            cq,
-            qp_raw,
-        }
-    });
-
-    // Small delay so server is listening
-    thread::sleep(std::time::Duration::from_millis(50));
-
-    let ch = EventChannel::new().unwrap();
-    let client_id = CmId::new(&ch, PortSpace::Tcp).unwrap();
-
-    client_id.resolve_addr(None, &connect_addr, 2000).unwrap();
-    ch.get_event().unwrap().ack();
-    client_id.resolve_route(2000).unwrap();
-    ch.get_event().unwrap().ack();
-
-    let pd = client_id.alloc_pd().unwrap();
-    let ctx = client_id.verbs_context().unwrap();
-    let comp_ch = CompletionChannel::new(&ctx).unwrap();
-    let cq = CompletionQueue::with_comp_channel(ctx, 16, &comp_ch).unwrap();
-
-    client_id
-        .create_qp_with_cq(&pd, &default_qp_attr(), Some(&cq), Some(&cq))
-        .unwrap();
-
-    let qp_raw = client_id.qp_raw();
-
-    client_id.connect(&ConnParam::default()).unwrap();
-    let ev = ch.get_event().unwrap();
-    assert_eq!(ev.event_type(), CmEventType::Established);
-    ev.ack();
-
-    let server = server_handle.join().expect("server thread panicked");
-
-    let client = Endpoint {
-        _cm_id: client_id,
-        _event_ch: ch,
-        pd,
-        comp_ch,
-        cq,
-        qp_raw,
-    };
-
-    (server, client)
-}
-
 /// Holds resources that must stay alive while AsyncQp is in use.
 struct AsyncEndpoint {
     aqp: AsyncQp,
     pd: Arc<ProtectionDomain>,
-    _cm_id: CmId,
-    _event_ch: EventChannel,
+    _cm: AsyncCmId,
 }
 
-fn make_async_endpoint(ep: Endpoint) -> AsyncEndpoint {
-    let notifier = TokioCqNotifier::new(ep.comp_ch.fd()).unwrap();
-    let async_cq = AsyncCq::new(ep.cq, ep.comp_ch, Box::new(notifier));
-    let aqp = unsafe { AsyncQp::new(ep.qp_raw, async_cq) };
-    AsyncEndpoint {
-        aqp,
-        pd: ep.pd,
-        _cm_id: ep._cm_id,
-        _event_ch: ep._event_ch,
-    }
+/// Set up a connected server+client pair using async CM.
+/// Returns (server_endpoint, client_endpoint) ready for async verb posting.
+async fn setup_connection(
+    bind_addr: std::net::SocketAddr,
+    connect_addr: std::net::SocketAddr,
+) -> (AsyncEndpoint, AsyncEndpoint) {
+    let listener = AsyncCmListener::bind(&bind_addr).unwrap();
+
+    let server_handle = tokio::spawn(async move {
+        // Two-phase accept: get request, set up QP, then complete
+        let conn_id = listener.get_request().await.unwrap();
+
+        let pd = conn_id.alloc_pd().unwrap();
+        let ctx = conn_id.verbs_context().unwrap();
+        let comp_ch = CompletionChannel::new(&ctx).unwrap();
+        let cq = CompletionQueue::with_comp_channel(ctx, 16, &comp_ch).unwrap();
+
+        conn_id
+            .create_qp_with_cq(&pd, &default_qp_attr(), Some(&cq), Some(&cq))
+            .unwrap();
+
+        let async_cm = listener
+            .complete_accept(conn_id, &ConnParam::default())
+            .await
+            .unwrap();
+
+        let qp_raw = async_cm.qp_raw();
+        let notifier = TokioCqNotifier::new(comp_ch.fd()).unwrap();
+        let async_cq = AsyncCq::new(cq, comp_ch, Box::new(notifier));
+        let aqp = unsafe { AsyncQp::new(qp_raw, async_cq) };
+
+        AsyncEndpoint {
+            aqp,
+            pd,
+            _cm: async_cm,
+        }
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let client_handle = tokio::spawn(async move {
+        // Step-by-step connect: resolve → QP setup → connect
+        let async_cm = AsyncCmId::new(PortSpace::Tcp).unwrap();
+        async_cm
+            .resolve_addr(None, &connect_addr, 2000)
+            .await
+            .unwrap();
+        async_cm.resolve_route(2000).await.unwrap();
+
+        let pd = async_cm.alloc_pd().unwrap();
+        let ctx = async_cm.verbs_context().unwrap();
+        let comp_ch = CompletionChannel::new(&ctx).unwrap();
+        let cq = CompletionQueue::with_comp_channel(ctx, 16, &comp_ch).unwrap();
+
+        async_cm
+            .create_qp_with_cq(&pd, &default_qp_attr(), Some(&cq), Some(&cq))
+            .unwrap();
+
+        async_cm.connect(&ConnParam::default()).await.unwrap();
+
+        let qp_raw = async_cm.qp_raw();
+        let notifier = TokioCqNotifier::new(comp_ch.fd()).unwrap();
+        let async_cq = AsyncCq::new(cq, comp_ch, Box::new(notifier));
+        let aqp = unsafe { AsyncQp::new(qp_raw, async_cq) };
+
+        AsyncEndpoint {
+            aqp,
+            pd,
+            _cm: async_cm,
+        }
+    });
+
+    let (server_res, client_res) = tokio::join!(server_handle, client_handle);
+    (server_res.unwrap(), client_res.unwrap())
 }
 
 /// Test: AsyncQp send/recv roundtrip.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn async_qp_send_recv() {
     let (bind_addr, connect_addr) = test_addrs();
-    let (server_ep, client_ep) = setup_connection(bind_addr, connect_addr);
-
-    let server = make_async_endpoint(server_ep);
-    let client = make_async_endpoint(client_ep);
+    let (server, client) = setup_connection(bind_addr, connect_addr).await;
 
     let server_mr = server
         .pd
@@ -212,10 +176,7 @@ async fn async_qp_send_recv() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn async_qp_ping_pong() {
     let (bind_addr, connect_addr) = test_addrs();
-    let (server_ep, client_ep) = setup_connection(bind_addr, connect_addr);
-
-    let server = make_async_endpoint(server_ep);
-    let client = make_async_endpoint(client_ep);
+    let (server, client) = setup_connection(bind_addr, connect_addr).await;
 
     let server_mr = server
         .pd
@@ -307,10 +268,7 @@ async fn exchange_remote_mr(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn async_qp_rdma_write_read() {
     let (bind_addr, connect_addr) = test_addrs();
-    let (server_ep, client_ep) = setup_connection(bind_addr, connect_addr);
-
-    let server = make_async_endpoint(server_ep);
-    let client = make_async_endpoint(client_ep);
+    let (server, client) = setup_connection(bind_addr, connect_addr).await;
 
     // Server MR with remote access
     let server_data_mr = server
@@ -377,3 +335,75 @@ async fn async_qp_rdma_write_read() {
 // NOT supported by iWARP/siw. The API methods exist and are correct for
 // InfiniBand/RoCE hardware. Tests for these will be added when hardware
 // testing is available. See AsyncIntegration.md Phase E.
+
+// --- Async CM lifecycle tests ---
+
+/// Test: async disconnect — client disconnects, server detects via next_event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_cm_disconnect() {
+    let (bind_addr, connect_addr) = test_addrs();
+
+    let listener = AsyncCmListener::bind(&bind_addr).unwrap();
+
+    // Server: two-phase accept, keep AsyncCmId alive for event monitoring
+    let server_handle = tokio::spawn(async move {
+        let conn_id = listener.get_request().await.unwrap();
+
+        let pd = conn_id.alloc_pd().unwrap();
+        let ctx = conn_id.verbs_context().unwrap();
+        let comp_ch = CompletionChannel::new(&ctx).unwrap();
+        let cq = CompletionQueue::with_comp_channel(ctx, 16, &comp_ch).unwrap();
+        conn_id
+            .create_qp_with_cq(&pd, &default_qp_attr(), Some(&cq), Some(&cq))
+            .unwrap();
+
+        let server_cm = listener
+            .complete_accept(conn_id, &ConnParam::default())
+            .await
+            .unwrap();
+
+        // Wait for disconnect event
+        let event = server_cm.next_event().await.unwrap();
+        let etype = event.event_type();
+        event.ack();
+        assert_eq!(
+            etype,
+            rdma_io::cm::CmEventType::Disconnected,
+            "expected Disconnected, got {etype:?}"
+        );
+        println!("  server: received Disconnected event");
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Client: connect then async disconnect
+    let client_handle = tokio::spawn(async move {
+        let client_cm = AsyncCmId::new(PortSpace::Tcp).unwrap();
+        client_cm
+            .resolve_addr(None, &connect_addr, 2000)
+            .await
+            .unwrap();
+        client_cm.resolve_route(2000).await.unwrap();
+
+        let pd = client_cm.alloc_pd().unwrap();
+        let ctx = client_cm.verbs_context().unwrap();
+        let comp_ch = CompletionChannel::new(&ctx).unwrap();
+        let cq = CompletionQueue::with_comp_channel(ctx, 16, &comp_ch).unwrap();
+        client_cm
+            .create_qp_with_cq(&pd, &default_qp_attr(), Some(&cq), Some(&cq))
+            .unwrap();
+
+        client_cm.connect(&ConnParam::default()).await.unwrap();
+        println!("  client: connected, disconnecting...");
+
+        // Graceful async disconnect — await DISCONNECTED event
+        client_cm.disconnect_async().await.unwrap();
+        println!("  client: async disconnect complete");
+    });
+
+    let (server_res, client_res) = tokio::join!(server_handle, client_handle);
+    server_res.unwrap();
+    client_res.unwrap();
+
+    println!("async_cm_disconnect passed!");
+}
