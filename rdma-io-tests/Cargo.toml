@@ -11,3 +11,5 @@ rdma-io-sys = { path = "../rdma-io-sys" }
 rdma-io = { path = "../rdma-io", features = ["tokio"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }
 futures-io = "0.3"
+futures-util = { version = "0.3", features = ["io"] }
+tokio-util = { version = "0.7", features = ["compat"] }

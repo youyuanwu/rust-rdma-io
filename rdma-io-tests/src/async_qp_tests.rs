@@ -1,4 +1,7 @@
-//! AsyncQp integration tests — Phase B: send/recv via AsyncQp.
+//! AsyncQp integration tests — Phases B + E.
+//!
+//! Phase B: send/recv via AsyncQp.
+//! Phase E: one-sided RDMA READ/WRITE + atomic verbs.
 //!
 //! Tests verify that `AsyncQp` correctly posts verbs and awaits completions.
 //! Connection setup uses rdma_cm synchronously on std::threads, then
@@ -12,7 +15,7 @@ use rdma_io::async_qp::AsyncQp;
 use rdma_io::cm::{CmEventType, CmId, ConnParam, EventChannel, PortSpace};
 use rdma_io::comp_channel::CompletionChannel;
 use rdma_io::cq::CompletionQueue;
-use rdma_io::mr::AccessFlags;
+use rdma_io::mr::{AccessFlags, RemoteMr};
 use rdma_io::pd::ProtectionDomain;
 use rdma_io::qp::QpInitAttr;
 use rdma_io::tokio_notifier::TokioCqNotifier;
@@ -249,3 +252,128 @@ async fn async_qp_ping_pong() {
 
     println!("async_qp_ping_pong passed!");
 }
+
+// --- Phase E: One-sided RDMA READ/WRITE tests ---
+
+/// Access flags for remote-accessible MRs.
+const REMOTE_ACCESS: AccessFlags = AccessFlags::LOCAL_WRITE
+    .union(AccessFlags::REMOTE_READ)
+    .union(AccessFlags::REMOTE_WRITE);
+
+/// Exchange remote MR info via SEND/RECV.
+async fn exchange_remote_mr(
+    sender: &AsyncQp,
+    sender_mr: &rdma_io::mr::OwnedMemoryRegion,
+    receiver: &AsyncQp,
+    receiver_mr: &rdma_io::mr::OwnedMemoryRegion,
+    remote: &RemoteMr,
+) -> RemoteMr {
+    // Serialize RemoteMr into sender_mr
+    let bytes = remote.addr.to_le_bytes();
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), (*sender_mr.as_raw()).addr as *mut u8, 8);
+        let rkey_bytes = remote.rkey.to_le_bytes();
+        std::ptr::copy_nonoverlapping(
+            rkey_bytes.as_ptr(),
+            ((*sender_mr.as_raw()).addr as *mut u8).add(8),
+            4,
+        );
+        let len_bytes = remote.len.to_le_bytes();
+        std::ptr::copy_nonoverlapping(
+            len_bytes.as_ptr(),
+            ((*sender_mr.as_raw()).addr as *mut u8).add(12),
+            4,
+        );
+    }
+
+    let recv_fut = receiver.recv(receiver_mr, 0, 64, 50);
+    let send_fut = sender.send(sender_mr, 0, 16, 51);
+    let (recv_wc, send_wc) = tokio::join!(recv_fut, send_fut);
+    assert!(recv_wc.unwrap().is_success());
+    assert!(send_wc.unwrap().is_success());
+
+    // Deserialize from receiver_mr
+    let buf = receiver_mr.as_slice();
+    let addr = u64::from_le_bytes(buf[..8].try_into().unwrap());
+    let rkey = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+    let len = u32::from_le_bytes(buf[12..16].try_into().unwrap());
+    RemoteMr { addr, rkey, len }
+}
+
+/// Test: RDMA WRITE then RDMA READ roundtrip.
+///
+/// Client writes data to server's MR via RDMA WRITE (one-sided),
+/// then reads it back via RDMA READ to verify.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_qp_rdma_write_read() {
+    let (bind_addr, connect_addr) = test_addrs();
+    let (server_ep, client_ep) = setup_connection(bind_addr, connect_addr);
+
+    let server = make_async_endpoint(server_ep);
+    let client = make_async_endpoint(client_ep);
+
+    // Server MR with remote access
+    let server_data_mr = server
+        .pd
+        .reg_mr_owned(vec![0u8; 256], REMOTE_ACCESS)
+        .unwrap();
+    let server_remote = server_data_mr.to_remote();
+
+    // Messaging MRs for exchanging remote MR info
+    let server_msg_mr = server
+        .pd
+        .reg_mr_owned(vec![0u8; 64], AccessFlags::LOCAL_WRITE)
+        .unwrap();
+    let client_msg_mr = client
+        .pd
+        .reg_mr_owned(vec![0u8; 64], AccessFlags::LOCAL_WRITE)
+        .unwrap();
+
+    // Client's local buffer for RDMA ops
+    let mut client_buf_mr = client
+        .pd
+        .reg_mr_owned(vec![0u8; 256], AccessFlags::LOCAL_WRITE)
+        .unwrap();
+
+    // Exchange server's remote MR info → client
+    let remote_info = exchange_remote_mr(
+        &server.aqp,
+        &server_msg_mr,
+        &client.aqp,
+        &client_msg_mr,
+        &server_remote,
+    )
+    .await;
+
+    // Client RDMA WRITE "hello rdma write" to server
+    let write_data = b"hello rdma write";
+    client_buf_mr.as_mut_slice()[..write_data.len()].copy_from_slice(write_data);
+
+    let wc = client
+        .aqp
+        .write_remote(&client_buf_mr, 0, write_data.len(), &remote_info, 0, 100)
+        .await
+        .unwrap();
+    assert!(wc.is_success(), "RDMA WRITE failed: {:?}", wc.status());
+
+    // Verify server MR has the data
+    assert_eq!(&server_data_mr.as_slice()[..write_data.len()], write_data);
+
+    // Client RDMA READ back from server
+    client_buf_mr.as_mut_slice()[..write_data.len()].fill(0); // clear local
+
+    let wc = client
+        .aqp
+        .read_remote(&client_buf_mr, 0, write_data.len(), &remote_info, 0, 101)
+        .await
+        .unwrap();
+    assert!(wc.is_success(), "RDMA READ failed: {:?}", wc.status());
+    assert_eq!(&client_buf_mr.as_slice()[..write_data.len()], write_data);
+
+    println!("async_qp_rdma_write_read passed!");
+}
+
+// Note: RDMA WRITE with Immediate and Atomic operations (CAS, FAA) are
+// NOT supported by iWARP/siw. The API methods exist and are correct for
+// InfiniBand/RoCE hardware. Tests for these will be added when hardware
+// testing is available. See AsyncIntegration.md Phase E.

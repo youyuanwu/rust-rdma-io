@@ -194,6 +194,8 @@ pub struct SendWr {
     pub(crate) sges: Vec<Sge>,
     pub(crate) rdma_remote_addr: u64,
     pub(crate) rdma_rkey: u32,
+    pub(crate) atomic_compare_add: u64,
+    pub(crate) atomic_swap: u64,
 }
 
 impl SendWr {
@@ -206,6 +208,8 @@ impl SendWr {
             sges: Vec::new(),
             rdma_remote_addr: 0,
             rdma_rkey: 0,
+            atomic_compare_add: 0,
+            atomic_swap: 0,
         }
     }
 
@@ -225,6 +229,15 @@ impl SendWr {
     pub fn rdma(mut self, remote_addr: u64, rkey: u32) -> Self {
         self.rdma_remote_addr = remote_addr;
         self.rdma_rkey = rkey;
+        self
+    }
+
+    /// Set atomic operation parameters (for CAS and FAA).
+    pub fn atomic(mut self, remote_addr: u64, rkey: u32, compare_add: u64, swap: u64) -> Self {
+        self.rdma_remote_addr = remote_addr;
+        self.rdma_rkey = rkey;
+        self.atomic_compare_add = compare_add;
+        self.atomic_swap = swap;
         self
     }
 
@@ -258,6 +271,14 @@ impl SendWr {
             WrOpcode::RdmaWrite | WrOpcode::RdmaWriteWithImm(_) | WrOpcode::RdmaRead => {
                 wr.wr.rdma = ibv_send_wr_wr_rdma {
                     remote_addr: self.rdma_remote_addr,
+                    rkey: self.rdma_rkey,
+                };
+            }
+            WrOpcode::AtomicCmpAndSwp | WrOpcode::AtomicFetchAndAdd => {
+                wr.wr.atomic = ibv_send_wr_wr_atomic {
+                    remote_addr: self.rdma_remote_addr,
+                    compare_add: self.atomic_compare_add,
+                    swap: self.atomic_swap,
                     rkey: self.rdma_rkey,
                 };
             }

@@ -16,9 +16,11 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
-use crate::async_cq::AsyncCq;
+use crate::async_cq::{AsyncCq, CqPollState};
 use crate::async_qp::AsyncQp;
 use crate::cm::{CmEventType, CmId, ConnParam, EventChannel, PortSpace};
 use crate::comp_channel::CompletionChannel;
@@ -74,6 +76,12 @@ pub struct AsyncRdmaStream {
     recv_pending: Option<(usize, usize, usize)>,
     /// Next send WR ID (incremented per send for uniqueness).
     send_wr_seq: u64,
+    /// CQ poll state for poll-based AsyncRead/AsyncWrite.
+    cq_state: CqPollState,
+    /// Recv completion encountered during poll_write (stashed for poll_read).
+    stashed_recv: Option<WorkCompletion>,
+    /// In-progress write: (wr_id, byte_len). Set when send is posted, cleared on completion.
+    write_pending: Option<(u64, usize)>,
 }
 
 // Safety: All interior types are Send-safe. The CmId/AsyncQp raw pointers
@@ -138,6 +146,9 @@ impl AsyncRdmaStream {
             recv_mrs,
             recv_pending: None,
             send_wr_seq: SEND_WR_ID,
+            cq_state: CqPollState::default(),
+            stashed_recv: None,
+            write_pending: None,
         })
     }
 
@@ -254,6 +265,171 @@ impl Drop for AsyncRdmaStream {
     }
 }
 
+// --- Private helpers for poll-based trait impls ---
+
+impl AsyncRdmaStream {
+    /// Process a recv work completion, copying data into `buf`.
+    fn process_recv_wc(&mut self, wc: &WorkCompletion, buf: &mut [u8]) -> io::Result<usize> {
+        let byte_len = wc.byte_len() as usize;
+        if byte_len == 0 {
+            return Ok(0);
+        }
+        let bidx = wc.wr_id() as usize;
+        let copy_len = byte_len.min(buf.len());
+        buf[..copy_len].copy_from_slice(&self.recv_mrs[bidx].as_slice()[..copy_len]);
+        if copy_len < byte_len {
+            self.recv_pending = Some((bidx, copy_len, byte_len));
+        } else {
+            post_recv_raw(self.cm_id.qp_raw(), &self.recv_mrs[bidx], wc.wr_id())
+                .map_err(io::Error::other)?;
+        }
+        Ok(copy_len)
+    }
+}
+
+// --- futures::io trait implementations ---
+
+impl futures_io::AsyncRead for AsyncRdmaStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        // 1. Return buffered recv data
+        if let Some((buf_idx, offset, total_len)) = this.recv_pending {
+            let remaining = total_len - offset;
+            let copy_len = remaining.min(buf.len());
+            buf[..copy_len]
+                .copy_from_slice(&this.recv_mrs[buf_idx].as_slice()[offset..offset + copy_len]);
+            if copy_len < remaining {
+                this.recv_pending = Some((buf_idx, offset + copy_len, total_len));
+            } else {
+                this.recv_pending = None;
+                post_recv_raw(this.cm_id.qp_raw(), &this.recv_mrs[buf_idx], buf_idx as u64)
+                    .map_err(io::Error::other)?;
+            }
+            return Poll::Ready(Ok(copy_len));
+        }
+
+        // 2. Check stashed recv completion (from a poll_write that encountered recv)
+        if let Some(wc) = this.stashed_recv.take() {
+            return Poll::Ready(this.process_recv_wc(&wc, buf));
+        }
+
+        // 3. Poll CQ for recv completions
+        let mut wc_buf = [WorkCompletion::default(); 4];
+        loop {
+            let n = match this
+                .aqp
+                .async_cq()
+                .poll_completions(cx, &mut this.cq_state, &mut wc_buf)
+            {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(io::Error::other(e))),
+                Poll::Ready(Ok(n)) => n,
+            };
+            for wc_item in &wc_buf[..n] {
+                if !wc_item.is_success() {
+                    if wc_item.status_raw() == rdma_io_sys::ibverbs::IBV_WC_WR_FLUSH_ERR {
+                        return Poll::Ready(Ok(0)); // EOF
+                    }
+                    return Poll::Ready(Err(io::Error::other(format!(
+                        "WC error: status={:?}",
+                        wc_item.status()
+                    ))));
+                }
+                if wc_item.wr_id() < NUM_RECV_BUFS as u64 {
+                    return Poll::Ready(this.process_recv_wc(wc_item, buf));
+                }
+                // Send completions — discard during read
+            }
+        }
+    }
+}
+
+impl futures_io::AsyncWrite for AsyncRdmaStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        // Post send if not already in progress
+        if this.write_pending.is_none() {
+            let send_len = buf.len().min(this.send_mr.as_slice().len());
+            this.send_mr.as_mut_slice()[..send_len].copy_from_slice(&buf[..send_len]);
+
+            let wr_id = this.send_wr_seq;
+            this.send_wr_seq += 1;
+
+            this.aqp
+                .post_send_signaled(&this.send_mr, 0, send_len, wr_id)
+                .map_err(io::Error::other)?;
+            this.write_pending = Some((wr_id, send_len));
+        }
+
+        let (wr_id, len) = this.write_pending.unwrap();
+
+        // Poll CQ for send completion
+        let mut wc_buf = [WorkCompletion::default(); 4];
+        loop {
+            let n = match this
+                .aqp
+                .async_cq()
+                .poll_completions(cx, &mut this.cq_state, &mut wc_buf)
+            {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => {
+                    this.write_pending = None;
+                    return Poll::Ready(Err(io::Error::other(e)));
+                }
+                Poll::Ready(Ok(n)) => n,
+            };
+            for wc_item in &wc_buf[..n] {
+                if !wc_item.is_success() {
+                    this.write_pending = None;
+                    return Poll::Ready(Err(io::Error::other(format!(
+                        "send WC error: status={:?}",
+                        wc_item.status()
+                    ))));
+                }
+                if wc_item.wr_id() == wr_id {
+                    this.write_pending = None;
+                    return Poll::Ready(Ok(len));
+                }
+                // Stash recv completions for later poll_read
+                if wc_item.wr_id() < NUM_RECV_BUFS as u64 {
+                    this.stashed_recv = Some(*wc_item);
+                }
+            }
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // RDMA sends are flushed by the HCA — no application-level buffering.
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.get_mut()
+            .cm_id
+            .disconnect()
+            .map_err(io::Error::other)?;
+        Poll::Ready(Ok(()))
+    }
+}
+
 /// An async RDMA listener, analogous to `TcpListener`.
 ///
 /// Binds to a local address and accepts incoming RDMA connections,
@@ -340,6 +516,9 @@ impl AsyncRdmaListener {
             recv_mrs,
             recv_pending: None,
             send_wr_seq: SEND_WR_ID,
+            cq_state: CqPollState::default(),
+            stashed_recv: None,
+            write_pending: None,
         })
     }
 }

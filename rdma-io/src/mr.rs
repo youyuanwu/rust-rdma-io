@@ -112,6 +112,11 @@ impl OwnedMemoryRegion {
         unsafe { (*self.inner).rkey }
     }
 
+    /// The registered address as a u64 (for WR construction).
+    pub fn addr(&self) -> u64 {
+        unsafe { (*self.inner).addr as u64 }
+    }
+
     /// Access the registered buffer.
     pub fn as_slice(&self) -> &[u8] {
         &self._buf
@@ -126,4 +131,30 @@ impl OwnedMemoryRegion {
     pub fn as_raw(&self) -> *mut ibv_mr {
         self.inner
     }
+
+    /// Create a `RemoteMr` descriptor from this MR's remote key and address.
+    ///
+    /// The returned descriptor can be sent to a remote peer for one-sided operations.
+    pub fn to_remote(&self) -> RemoteMr {
+        RemoteMr {
+            addr: self.addr(),
+            rkey: self.rkey(),
+            len: self._buf.len() as u32,
+        }
+    }
+}
+
+/// Descriptor for a remote memory region.
+///
+/// Contains the information needed for one-sided RDMA READ/WRITE or atomic
+/// operations. Obtained from a remote peer (via SEND/RECV or out-of-band)
+/// or from a local MR's [`OwnedMemoryRegion::to_remote`].
+#[derive(Debug, Clone, Copy)]
+pub struct RemoteMr {
+    /// Remote virtual address.
+    pub addr: u64,
+    /// Remote key.
+    pub rkey: u32,
+    /// Length of the remote buffer in bytes.
+    pub len: u32,
 }

@@ -1100,29 +1100,28 @@ Stream is a thin buffering + flow-control layer on top of `AsyncQp`.
 3. `accept()` uses `rdma_migrate_id()` to decouple accepted connection from listener event channel — allows listener to be safely dropped after accept
 4. Tests: async echo, multi-message, large transfer (32 KiB)
 
-### Phase D: AsyncRead / AsyncWrite trait impls
+### Phase D: AsyncRead / AsyncWrite trait impls ✅
 
-1. Internal state machine for `poll_read` / `poll_write`
-2. Implement `futures::io::AsyncRead` + `AsyncWrite` (primary, runtime-agnostic)
-3. Tokio users use `tokio_util::compat::FuturesAsyncReadCompatExt` — no separate impl needed
-4. Tests: verify compat layer works with `tokio::io::copy`, `BufReader`, etc.
+1. Added `poll_readable()` to `CqNotifier` trait + `TokioCqNotifier` implementation
+2. Added `CqPollState` enum and `poll_completions()` poll-based method to `AsyncCq`
+3. Implemented `futures::io::AsyncRead` + `AsyncWrite` on `AsyncRdmaStream`
+4. Tokio users use `tokio_util::compat::FuturesAsyncReadCompatExt` — no separate impl needed
+5. Tests: futures-io echo, tokio compat echo, tokio::io::copy — 3 tests
 
-### Phase E: AsyncQp — One-sided + Atomics
+### Phase E: AsyncQp — One-sided + Atomics ✅
 
 Extend `AsyncQp` with the remaining RDMA verbs.
 
-1. Sync prerequisites: `SendWr` builder methods (`set_remote`, `set_atomic`), `RemoteMr` type
-2. `send_with_imm()`
-3. One-sided: `read_remote()`, `write_remote()`, `write_remote_with_imm()`
-4. Atomics: `compare_and_swap()`, `fetch_and_add()`
-5. Batch: `post_send_batch()`
-6. Sync convenience wrappers: `QueuePair::read_remote_sync()`, etc.
-7. Tests: RDMA READ/WRITE roundtrip, atomic CAS, batch operations
+1. Sync prerequisites: `SendWr::atomic()` builder, `RemoteMr` type, `OwnedMemoryRegion::to_remote()` + `addr()`
+2. One-sided: `read_remote()`, `write_remote()`, `write_remote_with_imm()`
+3. Atomics: `compare_and_swap()`, `fetch_and_add()`
+4. Tests: RDMA WRITE + READ roundtrip verified on siw — 1 test
+5. Note: RDMA WRITE with IMM not supported on iWARP/siw; atomics require `ATOMIC_HCA` capability (siw has `ATOMIC_NONE`). These are tested on InfiniBand/RoCE hardware.
 
-### Phase F: SmolCqNotifier + CM event async
+### Phase F: SmolCqNotifier + CM event async 📋 (future work)
 
-1. `SmolCqNotifier` (smol feature)
-2. Async CM event channel (for `AsyncRdmaListener::accept`)
+1. `SmolCqNotifier` (smol feature) — `Async<T>` fd wrapper for async-io runtime
+2. Async CM event channel (for `AsyncRdmaListener::accept` without `spawn_blocking`)
 3. Full test matrix across both runtimes
 
 ---

@@ -396,8 +396,10 @@ tests/
 - **siw does not support extended ibverbs API**: `ibv_create_cq_ex` and `ibv_qp_to_qp_ex` both return `EOPNOTSUPP`. Phase 3 (new ibverbs API) was skipped.
 - **CompChannel race condition**: The `ibv_req_notify_cq` → `ibv_poll_cq` → `ibv_get_cq_event` sequence has a race when multiple completions interleave — the notification can be consumed before `ibv_get_cq_event`, causing a hang. The sync stream resolves this with spin-polling + `thread::yield_now()`. The async path (`AsyncCq`) resolves this with a drain-after-arm pattern: arm → poll → if empty, await fd → consume event → loop.
 - **Listener event channel lifetime**: Accepted rdma_cm connections inherit the listener's event channel. Destroying the listener (and its event channel) causes accepted QPs to enter ERROR state with `WR_FLUSH_ERR` on all pending recv WRs. Fix: `rdma_migrate_id()` migrates accepted connections to their own event channel, decoupling them from the listener's lifetime. Applied in `AsyncRdmaListener::accept()`.
+- **iWARP RDMA WRITE with IMM**: iWARP (RFC 5040) does not define RDMA Write with Immediate Data — that's an InfiniBand-specific operation. siw correctly rejects it. API method exists for InfiniBand/RoCE but is untestable on siw.
+- **siw atomic support**: siw reports `ATOMIC_NONE` — no atomic CAS or FAA support. The `compare_and_swap()` and `fetch_and_add()` API methods require InfiniBand/RoCE hardware with `ATOMIC_HCA` or `ATOMIC_GLOB` capability.
 
-### Current Test Suite (30 tests)
+### Current Test Suite (34 tests)
 
 | Category | Count | Description |
 |----------|-------|-------------|
@@ -406,8 +408,8 @@ tests/
 | cm_tests | 2 | rdma_cm: connect/disconnect, send/recv (threaded, loopback) |
 | stream_tests | 3 | Stream: echo, multi-message (5 round-trips), large transfer (32 KiB) |
 | async_cq_tests | 2 | Async CQ: send/recv via comp_channel notification, poll_wr_id |
-| async_qp_tests | 2 | AsyncQp: send/recv roundtrip, multi-message ping-pong |
-| async_stream_tests | 3 | AsyncRdmaStream: echo, multi-message (5 round-trips), large transfer (32 KiB) |
+| async_qp_tests | 3 | AsyncQp: send/recv, ping-pong, RDMA WRITE+READ roundtrip |
+| async_stream_tests | 6 | AsyncRdmaStream: echo, multi-message, large transfer, futures-io echo, tokio compat, tokio::io::copy |
 
 ---
 

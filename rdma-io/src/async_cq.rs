@@ -9,6 +9,7 @@ use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::task::{Context, Poll};
 
 use rdma_io_sys::ibverbs::*;
 
@@ -30,6 +31,24 @@ pub trait CqNotifier: Send + Sync {
     /// Returns when the fd has data (a CQ event notification).
     /// The caller must then consume the event and re-arm.
     fn readable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>>;
+
+    /// Poll-based readiness check for the comp_channel fd.
+    ///
+    /// Used by `futures::io::AsyncRead`/`AsyncWrite` trait implementations
+    /// which require poll-based (non-async) interfaces.
+    fn poll_readable(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
+}
+
+/// State for poll-based CQ completion drain.
+///
+/// Tracks position in the drain-after-arm loop for `poll_completions()`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum CqPollState {
+    /// Start a fresh drain-after-arm cycle.
+    #[default]
+    Idle,
+    /// CQ was armed and polled empty; waiting for fd readiness.
+    WaitingFd,
 }
 
 /// Async completion queue poller.
@@ -92,19 +111,9 @@ impl AsyncCq {
 
             // 4. Consume the CQ event
             let _ = self.channel.get_cq_event()?;
-            let prev = self.unacked_events.fetch_add(1, Ordering::Relaxed);
+            self.ack_event();
 
-            // 5. Ack periodically to avoid overflow
-            if prev + 1 >= ACK_BATCH_SIZE {
-                let unacked = self.unacked_events.swap(0, Ordering::Relaxed);
-                if unacked > 0 {
-                    unsafe {
-                        ibv_ack_cq_events(self.cq.as_raw(), unacked);
-                    }
-                }
-            }
-
-            // 6. Loop back — poll will find completions now
+            // 5. Loop back — poll will find completions now
         }
     }
 
@@ -128,6 +137,74 @@ impl AsyncCq {
     /// Access the underlying CQ.
     pub fn cq(&self) -> &Arc<CompletionQueue> {
         &self.cq
+    }
+
+    /// Poll-based completion drain using the drain-after-arm pattern.
+    ///
+    /// External `state` tracks where we are in the arm → drain → wait loop.
+    /// Used by `AsyncRead`/`AsyncWrite` trait impls that need `Poll`-based APIs.
+    pub fn poll_completions(
+        &self,
+        cx: &mut Context<'_>,
+        state: &mut CqPollState,
+        wc_buf: &mut [WorkCompletion],
+    ) -> Poll<Result<usize>> {
+        loop {
+            if *state == CqPollState::WaitingFd {
+                match self.notifier.poll_readable(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(crate::Error::Verbs(e))),
+                    Poll::Ready(Ok(())) => {
+                        // Consume the CQ event (WouldBlock = spurious wakeup, loop back)
+                        match self.channel.get_cq_event() {
+                            Ok(_) => self.ack_event(),
+                            Err(crate::Error::Verbs(ref e))
+                                if e.kind() == io::ErrorKind::WouldBlock => {}
+                            Err(e) => return Poll::Ready(Err(e)),
+                        }
+                        *state = CqPollState::Idle;
+                    }
+                }
+            }
+
+            // Arm + drain
+            self.cq.req_notify(false)?;
+            let n = self.cq.poll(wc_buf)?;
+            if n > 0 {
+                return Poll::Ready(Ok(n));
+            }
+
+            // No completions — wait for fd
+            match self.notifier.poll_readable(cx) {
+                Poll::Pending => {
+                    *state = CqPollState::WaitingFd;
+                    return Poll::Pending;
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(crate::Error::Verbs(e))),
+                Poll::Ready(Ok(())) => {
+                    match self.channel.get_cq_event() {
+                        Ok(_) => self.ack_event(),
+                        Err(crate::Error::Verbs(ref e))
+                            if e.kind() == io::ErrorKind::WouldBlock => {}
+                        Err(e) => return Poll::Ready(Err(e)),
+                    }
+                    // Loop back to arm+drain
+                }
+            }
+        }
+    }
+
+    /// Ack one event, batching to amortize mutex cost.
+    fn ack_event(&self) {
+        let prev = self.unacked_events.fetch_add(1, Ordering::Relaxed);
+        if prev + 1 >= ACK_BATCH_SIZE {
+            let unacked = self.unacked_events.swap(0, Ordering::Relaxed);
+            if unacked > 0 {
+                unsafe {
+                    ibv_ack_cq_events(self.cq.as_raw(), unacked);
+                }
+            }
+        }
     }
 }
 

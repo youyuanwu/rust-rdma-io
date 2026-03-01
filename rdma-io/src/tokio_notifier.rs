@@ -4,6 +4,7 @@ use std::future::Future;
 use std::io;
 use std::os::unix::io::RawFd;
 use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use tokio::io::unix::AsyncFd;
 
@@ -35,5 +36,16 @@ impl CqNotifier for TokioCqNotifier {
             guard.clear_ready();
             Ok(())
         })
+    }
+
+    fn poll_readable(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.async_fd.poll_read_ready(cx) {
+            Poll::Ready(Ok(mut guard)) => {
+                guard.clear_ready();
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }

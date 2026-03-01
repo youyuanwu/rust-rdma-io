@@ -17,7 +17,7 @@ use crate::Result;
 use crate::async_cq::AsyncCq;
 use crate::cq::CompletionQueue;
 use crate::error::from_ret;
-use crate::mr::OwnedMemoryRegion;
+use crate::mr::{OwnedMemoryRegion, RemoteMr};
 use crate::wc::WorkCompletion;
 use crate::wr::{RecvWr, SendFlags, SendWr, Sge, WrOpcode};
 
@@ -69,6 +69,27 @@ impl AsyncQp {
         let mut raw = wr.build_raw();
         let mut bad_wr: *mut ibv_recv_wr = std::ptr::null_mut();
         from_ret(unsafe { rdma_wrap_ibv_post_recv(self.qp, &mut raw, &mut bad_wr) })
+    }
+
+    /// Post a SEND without waiting for completion.
+    ///
+    /// Used by poll-based `AsyncWrite` which separates post from completion polling.
+    pub fn post_send_signaled(
+        &self,
+        mr: &OwnedMemoryRegion,
+        offset: usize,
+        length: usize,
+        wr_id: u64,
+    ) -> Result<()> {
+        let sge = Sge::new(
+            unsafe { (*mr.as_raw()).addr as u64 } + offset as u64,
+            length as u32,
+            mr.lkey(),
+        );
+        let mut wr = SendWr::new(wr_id, WrOpcode::Send)
+            .flags(SendFlags::SIGNALED)
+            .sg(sge);
+        self.post_send_raw(&mut wr)
     }
 
     /// Post a SEND and await its completion.
@@ -132,6 +153,124 @@ impl AsyncQp {
         let mut wr = SendWr::new(wr_id, WrOpcode::SendWithImm(imm_data))
             .flags(SendFlags::SIGNALED)
             .sg(sge);
+        self.post_send_raw(&mut wr)?;
+        self.async_cq.poll_wr_id(wr_id).await
+    }
+
+    // --- One-sided RDMA verbs ---
+
+    /// RDMA READ: read data from a remote memory region into a local buffer.
+    ///
+    /// The remote side is not notified. The local `mr` receives the data.
+    pub async fn read_remote(
+        &self,
+        mr: &OwnedMemoryRegion,
+        local_offset: usize,
+        length: usize,
+        remote: &RemoteMr,
+        remote_offset: u64,
+        wr_id: u64,
+    ) -> Result<WorkCompletion> {
+        let sge = Sge::new(mr.addr() + local_offset as u64, length as u32, mr.lkey());
+        let mut wr = SendWr::new(wr_id, WrOpcode::RdmaRead)
+            .flags(SendFlags::SIGNALED)
+            .sg(sge)
+            .rdma(remote.addr + remote_offset, remote.rkey);
+        self.post_send_raw(&mut wr)?;
+        self.async_cq.poll_wr_id(wr_id).await
+    }
+
+    /// RDMA WRITE: write data from a local buffer to a remote memory region.
+    ///
+    /// The remote side is not notified (no completion on remote CQ).
+    pub async fn write_remote(
+        &self,
+        mr: &OwnedMemoryRegion,
+        local_offset: usize,
+        length: usize,
+        remote: &RemoteMr,
+        remote_offset: u64,
+        wr_id: u64,
+    ) -> Result<WorkCompletion> {
+        let sge = Sge::new(mr.addr() + local_offset as u64, length as u32, mr.lkey());
+        let mut wr = SendWr::new(wr_id, WrOpcode::RdmaWrite)
+            .flags(SendFlags::SIGNALED)
+            .sg(sge)
+            .rdma(remote.addr + remote_offset, remote.rkey);
+        self.post_send_raw(&mut wr)?;
+        self.async_cq.poll_wr_id(wr_id).await
+    }
+
+    /// RDMA WRITE with immediate data.
+    ///
+    /// Like `write_remote`, but the immediate data generates a recv completion
+    /// on the remote side (the remote must have a posted recv WR).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn write_remote_with_imm(
+        &self,
+        mr: &OwnedMemoryRegion,
+        local_offset: usize,
+        length: usize,
+        remote: &RemoteMr,
+        remote_offset: u64,
+        imm_data: u32,
+        wr_id: u64,
+    ) -> Result<WorkCompletion> {
+        let sge = Sge::new(mr.addr() + local_offset as u64, length as u32, mr.lkey());
+        let mut wr = SendWr::new(wr_id, WrOpcode::RdmaWriteWithImm(imm_data))
+            .flags(SendFlags::SIGNALED)
+            .sg(sge)
+            .rdma(remote.addr + remote_offset, remote.rkey);
+        self.post_send_raw(&mut wr)?;
+        self.async_cq.poll_wr_id(wr_id).await
+    }
+
+    // --- Atomic verbs ---
+
+    /// Atomic Compare-and-Swap on a remote 8-byte value.
+    ///
+    /// Atomically: if `*remote == compare`, set `*remote = swap`.
+    /// The original remote value is written to `result_mr` at `result_offset`.
+    /// The result buffer must be at least 8 bytes at the given offset.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn compare_and_swap(
+        &self,
+        result_mr: &OwnedMemoryRegion,
+        result_offset: usize,
+        remote: &RemoteMr,
+        remote_offset: u64,
+        compare: u64,
+        swap: u64,
+        wr_id: u64,
+    ) -> Result<WorkCompletion> {
+        let sge = Sge::new(result_mr.addr() + result_offset as u64, 8, result_mr.lkey());
+        let mut wr = SendWr::new(wr_id, WrOpcode::AtomicCmpAndSwp)
+            .flags(SendFlags::SIGNALED)
+            .sg(sge)
+            .atomic(remote.addr + remote_offset, remote.rkey, compare, swap);
+        self.post_send_raw(&mut wr)?;
+        self.async_cq.poll_wr_id(wr_id).await
+    }
+
+    /// Atomic Fetch-and-Add on a remote 8-byte value.
+    ///
+    /// Atomically: `old = *remote; *remote += add_value; return old`.
+    /// The original remote value is written to `result_mr` at `result_offset`.
+    /// The result buffer must be at least 8 bytes at the given offset.
+    pub async fn fetch_and_add(
+        &self,
+        result_mr: &OwnedMemoryRegion,
+        result_offset: usize,
+        remote: &RemoteMr,
+        remote_offset: u64,
+        add_value: u64,
+        wr_id: u64,
+    ) -> Result<WorkCompletion> {
+        let sge = Sge::new(result_mr.addr() + result_offset as u64, 8, result_mr.lkey());
+        let mut wr = SendWr::new(wr_id, WrOpcode::AtomicFetchAndAdd)
+            .flags(SendFlags::SIGNALED)
+            .sg(sge)
+            .atomic(remote.addr + remote_offset, remote.rkey, add_value, 0);
         self.post_send_raw(&mut wr)?;
         self.async_cq.poll_wr_id(wr_id).await
     }

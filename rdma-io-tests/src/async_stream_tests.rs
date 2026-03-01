@@ -1,7 +1,10 @@
-//! AsyncRdmaStream integration tests — Phase C.
+//! AsyncRdmaStream integration tests — Phases C + D.
 //!
 //! Tests verify that `AsyncRdmaStream` provides TCP-like async read/write
 //! over RDMA SEND/RECV, using completion-channel-driven async CQ polling.
+//!
+//! Phase D tests verify the `futures::io::AsyncRead`/`AsyncWrite` trait
+//! implementations and tokio compat layer.
 //!
 //! Note: `AsyncRdmaListener::accept()` and `AsyncRdmaStream::connect()` create
 //! `TokioCqNotifier` internally, which requires a tokio reactor context.
@@ -142,4 +145,107 @@ async fn async_stream_large_transfer() {
     assert_eq!(received, data);
 
     println!("async_stream_large_transfer passed!");
+}
+
+// --- Phase D: futures::io AsyncRead/AsyncWrite trait tests ---
+
+/// Helper: create a connected (server, client) pair using spawn_blocking.
+async fn connected_pair() -> (AsyncRdmaStream, AsyncRdmaStream) {
+    let (bind_addr, connect_addr) = test_addrs();
+
+    let server_handle = tokio::task::spawn_blocking(move || {
+        let listener = AsyncRdmaListener::bind(&bind_addr).unwrap();
+        listener.accept().unwrap()
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let client_handle =
+        tokio::task::spawn_blocking(move || AsyncRdmaStream::connect(&connect_addr).unwrap());
+
+    let (server_res, client_res) = tokio::join!(server_handle, client_handle);
+    (server_res.unwrap(), client_res.unwrap())
+}
+
+/// Test: futures::io::AsyncReadExt / AsyncWriteExt echo via trait methods.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn async_stream_futures_io_echo() {
+    let (mut server, mut client) = connected_pair().await;
+
+    // Client writes using AsyncWriteExt
+    let msg = b"futures-io trait echo!";
+    let n = futures_util::io::AsyncWriteExt::write(&mut client, msg)
+        .await
+        .unwrap();
+    assert_eq!(n, msg.len());
+
+    // Server reads using AsyncReadExt
+    let mut buf = [0u8; 256];
+    let n = futures_util::io::AsyncReadExt::read(&mut server, &mut buf)
+        .await
+        .unwrap();
+    assert_eq!(&buf[..n], msg);
+
+    // Server echoes back
+    futures_util::io::AsyncWriteExt::write(&mut server, &buf[..n])
+        .await
+        .unwrap();
+
+    let n = futures_util::io::AsyncReadExt::read(&mut client, &mut buf)
+        .await
+        .unwrap();
+    assert_eq!(&buf[..n], msg);
+
+    println!("async_stream_futures_io_echo passed!");
+}
+
+/// Test: tokio compat layer — use tokio::io::AsyncReadExt/AsyncWriteExt
+/// via FuturesAsyncReadCompatExt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn async_stream_tokio_compat() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::compat::FuturesAsyncReadCompatExt;
+
+    let (server, client) = connected_pair().await;
+
+    // Wrap with compat layer to get tokio::io traits
+    let mut server = server.compat();
+    let mut client = client.compat();
+
+    let msg = b"tokio compat layer!";
+    client.write_all(msg).await.unwrap();
+
+    let mut buf = [0u8; 256];
+    let n = server.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], msg);
+
+    // Echo back
+    server.write_all(&buf[..n]).await.unwrap();
+
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], msg);
+
+    println!("async_stream_tokio_compat passed!");
+}
+
+/// Test: tokio::io::copy through the compat layer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn async_stream_tokio_io_copy() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::compat::FuturesAsyncReadCompatExt;
+
+    let (server, client) = connected_pair().await;
+    let mut server = server.compat();
+    let mut client = client.compat();
+
+    // Send data from client
+    let data = b"copy test payload 12345";
+    client.write_all(data).await.unwrap();
+
+    // Read on server side into a Vec using read_buf
+    let mut buf = vec![0u8; 256];
+    let n = server.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], data);
+
+    println!("async_stream_tokio_io_copy passed!");
 }

@@ -460,7 +460,7 @@ This drain-after-arm pattern avoids the race condition where a completion arrive
 
 ## 7. Stream Abstraction (Read / Write)
 
-> **Note**: Phase 4 provides the synchronous stream abstraction using `std::io::Read`/`std::io::Write`. Async `AsyncRdmaStream` with `read()`/`write()` is implemented (Phase C). `futures::io::AsyncRead`/`AsyncWrite` trait impls are next (Phase D). See [AsyncIntegration.md](AsyncIntegration.md).
+> **Note**: Phase 4 provides the synchronous stream abstraction using `std::io::Read`/`std::io::Write`. Async `AsyncRdmaStream` implements `futures::io::AsyncRead`/`AsyncWrite` (Phase D complete). Tokio users use `tokio_util::compat::FuturesAsyncReadCompatExt`. See [AsyncIntegration.md](AsyncIntegration.md).
 
 ```rust
 /// RDMA stream with Read + Write.
@@ -680,7 +680,23 @@ bitflags::bitflags! {
 - `accept()` uses `rdma_migrate_id()` to give accepted connections their own event channel, decoupling from listener lifetime
 - Connection setup is synchronous (use `spawn_blocking`); data path is fully async
 - Tests: echo, multi-message (5 round-trips), large transfer (32 KiB) — 3 tests
-- See [AsyncIntegration.md](AsyncIntegration.md) for remaining phases (D–F)
+
+### Async Phase D: AsyncRead / AsyncWrite traits ✅
+
+- `poll_readable()` added to `CqNotifier` trait for poll-based fd readiness
+- `CqPollState` enum + `poll_completions()` on `AsyncCq` for poll-based drain-after-arm
+- `futures::io::AsyncRead` + `AsyncWrite` implemented on `AsyncRdmaStream`
+- Tokio users use `tokio_util::compat::FuturesAsyncReadCompatExt` for `tokio::io` traits
+- Tests: futures-io echo, tokio compat echo, tokio::io::copy — 3 tests
+
+### Async Phase E: One-sided + Atomics ✅
+
+- `RemoteMr` type + `OwnedMemoryRegion::to_remote()` for remote MR descriptors
+- `SendWr::atomic()` builder for CAS/FAA work requests
+- `AsyncQp`: `read_remote()`, `write_remote()`, `write_remote_with_imm()`, `compare_and_swap()`, `fetch_and_add()`
+- Tests: RDMA WRITE + READ roundtrip on siw — 1 test
+- Note: RDMA WRITE with IMM (iWARP limitation) and atomics (`ATOMIC_NONE` on siw) require InfiniBand/RoCE hardware
+- See [AsyncIntegration.md](AsyncIntegration.md) for remaining phase (F)
 
 ### Phase 5: Advanced resources 📋 (future)
 
@@ -708,7 +724,7 @@ bitflags::bitflags! {
 | Enum wrapping | `bitflags` for flags, Rust enums for types | Type safety without runtime cost |
 | API surface | Both legacy and new ibverbs | Legacy for compatibility, new for performance |
 | Connection mgmt | rdma_cm as primary | Required for iWARP, recommended for RoCE |
-| Stream abstraction | `std::io::Read`/`Write` (sync), `AsyncRdmaStream::read()`/`write()` (async) | Sync: `std::io`; Async: `AsyncQp`-based. `AsyncRead`/`AsyncWrite` traits in Phase D |
+| Stream abstraction | `std::io::Read`/`Write` (sync), `futures::io::AsyncRead`/`AsyncWrite` (async) | Sync: `std::io`; Async: poll-based via `CqPollState`. Tokio: `tokio_util::compat` |
 | Stream CQ polling | Spin-poll + `thread::yield_now()` | comp_channel had race condition (notification consumed before `ibv_get_cq_event`) |
 | rdma_cm error model | `from_ret_errno()` (reads `last_os_error`) | rdma_cm returns -1 + sets errno, unlike ibverbs which returns negative errno |
 | Test serialization | `RUST_TEST_THREADS=1` in `.cargo/config.toml` | siw has kernel resource contention with concurrent RDMA connections |
@@ -763,6 +779,6 @@ Items identified from the [ExistingLibs.md](ExistingLibs.md) gap analysis and im
 5. **Tracing instrumentation** — `tracing` dependency added for Drop error reporting. Future: optional spans on resource creation/destruction and data-path operations (behind a feature flag).
 6. **io_uring integration** — Use io_uring for CQ notification instead of epoll/completion channel. Potential for lower latency event loop integration.
 7. **Connection pooling / reconnection** — Higher-level abstractions for managing multiple connections with automatic reconnect on failure.
-8. ~~**Async runtime backends (tokio, smol)**~~ — **Mostly done**: `TokioCqNotifier`, `AsyncCq`, `AsyncQp`, `AsyncRdmaStream` + `AsyncRdmaListener` implemented. Remaining: `SmolCqNotifier`, `futures::io::AsyncRead`/`AsyncWrite` trait impls, one-sided + atomic verbs, async CM events. See [AsyncIntegration.md](AsyncIntegration.md) Phases D–F.
+8. ~~**Async runtime backends (tokio, smol)**~~ — **Tokio complete** (Phases A–E). Remaining for future: `SmolCqNotifier` (smol feature), async CM events. See [AsyncIntegration.md](AsyncIntegration.md) Phase F.
 9. **Async device events** — `ibv_get_async_event` handling for port state changes, QP errors, and device removal notifications. Likely a `Context::async_events()` stream.
 10. ~~**QP state transition helpers**~~ — **Partially done**: `to_init()`, `to_rtr()`, `to_rts()` exist. Future: higher-level `transition_to_rts(port, gid, remote_qpn, remote_psn)` that sets all attributes in one call.
