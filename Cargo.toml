@@ -11,8 +11,9 @@ rdma-io-sys = { path = "rdma-io-sys" }
 rdma-io = { path = "rdma-io" }
 
 # bnd ecosystem (path deps to sibling repo)
-bnd-winmd = { path = "../bnd/bnd-winmd" }
-bnd-linux = { path = "../bnd/bnd-linux" }
+bnd-winmd = { version = "0.0.6" }
+bnd-linux = { version = "0.0.6" }
+bnd-macros = { version = "0.0.6" }
 
 # Core
 bitflags = "2"
@@ -30,7 +31,6 @@ async-io = "2"
 # Build / codegen
 cc = "1"
 windows-bindgen = "0.66"
-windows-link = "0.2"
 
 # Dev / test
 tempfile = "3"

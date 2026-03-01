@@ -4,3 +4,5 @@
 
 pub mod rdma;
 pub use rdma::*;
+
+extern crate bnd_macros as windows_link;

@@ -7,7 +7,7 @@ description = "Low-level RDMA sys crate — FFI bindings for libibverbs + librdm
 
 [dependencies]
 bnd-linux = { workspace = true, features = ["posix_pthread", "posix_socket", "posix_inet", "posix_types", "posix_unistd", "posix_stat", "linux_types"] }
-windows-link.workspace = true
+bnd-macros = { workspace = true }
 
 [build-dependencies]
 cc.workspace = true

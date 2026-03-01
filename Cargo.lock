@@ -99,10 +99,18 @@ checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
 
 [[package]]
 name = "bnd-linux"
-version = "0.0.1"
+version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fa84e683db7a14fa4ca5f4f5d15091398b30766e28b57d3492822c697b2ab9cd"
 dependencies = [
- "windows-link",
+ "bnd-macros",
 ]
+
+[[package]]
+name = "bnd-macros"
+version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d09806ffcb84bd77cd298529b4cd972eb3d824c2d00364349fd0a81f74a45d5a"
 
 [[package]]
 name = "bnd-rdma-gen"
@@ -116,7 +124,9 @@ dependencies = [
 
 [[package]]
 name = "bnd-winmd"
-version = "0.0.5"
+version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "165fbc87a6ec404a79c5d0ff7f72f9764402d6d6edfc39606e64b4367cce12b7"
 dependencies = [
  "anyhow",
  "clang",
@@ -558,8 +568,8 @@ name = "rdma-io-sys"
 version = "0.1.0"
 dependencies = [
  "bnd-linux",
+ "bnd-macros",
  "cc",
- "windows-link",
 ]
 
 [[package]]
