@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TEST_THREADS: "1"
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libibverbs-dev \
+            librdmacm-dev \
+            rdma-core \
+            ibverbs-utils \
+            iproute2 \
+            cmake \
+            libclang-dev
+
+      - name: Install kernel extra modules and load siw
+        run: |
+          KVER=$(uname -r)
+          echo "Kernel: $KVER"
+
+          # Install extra modules (contains siw)
+          sudo apt-get install -y "linux-modules-extra-${KVER}" || true
+
+          # Load RDMA stack
+          sudo modprobe rdma_cm
+          sudo modprobe rdma_ucm
+          sudo modprobe siw
+
+          # Create siw device on first non-lo interface
+          IFACE=$(ip -o link show up | awk -F': ' '{print $2}' | grep -v lo | head -1)
+          echo "Creating siw0 on interface: $IFACE"
+          sudo rdma link add siw0 type siw netdev "$IFACE"
+
+          # Verify
+          ibv_devices
+          rdma link show
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.93.0"
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Configure (download bnd-linux.winmd)
+        run: cmake -B build
+
+      - name: Build
+        run: cargo build --workspace --features tokio
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --features tokio -- -D warnings
+
+      - name: Test
+        run: cargo test -p rdma-io-tests
+
+      - name: Doc tests
+        run: cargo test --doc --workspace --features tokio
