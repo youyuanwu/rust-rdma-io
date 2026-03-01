@@ -980,7 +980,7 @@ impl AsyncRdmaListener {
 | `spawn_blocking` (§5 current design) | Simple, works today | Ties up a thread pool thread for ~10ms |
 | Async CM events (this section) | True async, no thread pool | More code, need non-blocking EventChannel |
 
-**Recommendation**: Phase B (§11) uses `spawn_blocking` for simplicity. Phase E adds fully async CM events. For servers accepting many connections concurrently, async CM is important to avoid thread pool exhaustion.
+**Recommendation**: Phase C (§11) uses `spawn_blocking` for connection setup initially. Phase F adds fully async CM events. For servers accepting many connections concurrently, async CM is important to avoid thread pool exhaustion.
 
 ---
 
@@ -1074,7 +1074,7 @@ async fn async_stream_echo() {
 
 ## 11. Implementation Phases
 
-### Phase A: CompletionChannel + AsyncCq
+### Phase A: CompletionChannel + AsyncCq ✅
 
 1. Implement `CompletionChannel` (safe `ibv_comp_channel` wrapper)
 2. Re-add `CompletionQueue::with_comp_channel` constructor
@@ -1083,32 +1083,43 @@ async fn async_stream_echo() {
 5. Implement `AsyncCq` with drain-after-arm loop
 6. Test: create async CQ, post WR, await completion
 
-### Phase B: AsyncRdmaStream (simple async methods)
+### Phase B: AsyncQp — Async RDMA Verbs (SEND/RECV) ✅
 
-1. `AsyncRdmaStream::connect_tokio()` / `connect_smol()`
-2. `AsyncRdmaStream::read()` / `write()` (async methods, not trait impls)
-3. `AsyncRdmaListener::bind_tokio()` / `accept()`
-4. Tests: echo, multi-message
+Build the mid-level verb abstraction first so the stream can compose on top of it.
 
-### Phase C: AsyncRead / AsyncWrite trait impls
+1. `AsyncQp` struct wrapping raw `*mut ibv_qp` + `AsyncCq`
+2. Two-sided: `send()`, `recv()`, `send_with_imm()` (core verbs needed by stream)
+3. Tests: async send/recv roundtrip, multi-message ping-pong
+
+### Phase C: AsyncRdmaStream (wraps AsyncQp) ✅
+
+Stream is a thin buffering + flow-control layer on top of `AsyncQp`.
+
+1. `AsyncRdmaStream::connect()` / `AsyncRdmaListener::bind()` / `accept()`
+2. `AsyncRdmaStream::read()` / `write()` using `AsyncQp::send()` / `recv()`
+3. `accept()` uses `rdma_migrate_id()` to decouple accepted connection from listener event channel — allows listener to be safely dropped after accept
+4. Tests: async echo, multi-message, large transfer (32 KiB)
+
+### Phase D: AsyncRead / AsyncWrite trait impls
 
 1. Internal state machine for `poll_read` / `poll_write`
 2. Implement `futures::io::AsyncRead` + `AsyncWrite` (primary, runtime-agnostic)
 3. Tokio users use `tokio_util::compat::FuturesAsyncReadCompatExt` — no separate impl needed
 4. Tests: verify compat layer works with `tokio::io::copy`, `BufReader`, etc.
 
-### Phase D: AsyncQp — Async RDMA Verbs
+### Phase E: AsyncQp — One-sided + Atomics
 
-1. Sync prerequisites: `SendWr` builder methods, `RemoteMr` type, MR access flag support
-2. `AsyncQp` struct wrapping `QueuePair` + `AsyncCq`
-3. Two-sided: `send()`, `recv()`, `send_with_imm()`
-4. One-sided: `read_remote()`, `write_remote()`, `write_remote_with_imm()`
-5. Atomics: `compare_and_swap()`, `fetch_and_add()`
-6. Batch: `post_send_batch()`
-7. Sync convenience wrappers: `QueuePair::read_remote_sync()`, etc.
-8. Tests: RDMA READ/WRITE roundtrip, atomic CAS, batch operations (requires siw or rxe)
+Extend `AsyncQp` with the remaining RDMA verbs.
 
-### Phase E: SmolCqNotifier + CM event async
+1. Sync prerequisites: `SendWr` builder methods (`set_remote`, `set_atomic`), `RemoteMr` type
+2. `send_with_imm()`
+3. One-sided: `read_remote()`, `write_remote()`, `write_remote_with_imm()`
+4. Atomics: `compare_and_swap()`, `fetch_and_add()`
+5. Batch: `post_send_batch()`
+6. Sync convenience wrappers: `QueuePair::read_remote_sync()`, etc.
+7. Tests: RDMA READ/WRITE roundtrip, atomic CAS, batch operations
+
+### Phase F: SmolCqNotifier + CM event async
 
 1. `SmolCqNotifier` (smol feature)
 2. Async CM event channel (for `AsyncRdmaListener::accept`)

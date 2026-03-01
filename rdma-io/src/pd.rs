@@ -27,7 +27,10 @@ impl Drop for ProtectionDomain {
     fn drop(&mut self) {
         let ret = unsafe { ibv_dealloc_pd(self.inner) };
         if ret != 0 {
-            tracing::error!("ibv_dealloc_pd failed: {}", std::io::Error::from_raw_os_error(-ret));
+            tracing::error!(
+                "ibv_dealloc_pd failed: {}",
+                std::io::Error::from_raw_os_error(-ret)
+            );
         }
     }
 }

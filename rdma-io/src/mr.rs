@@ -40,7 +40,10 @@ impl Drop for MemoryRegion<'_> {
     fn drop(&mut self) {
         let ret = unsafe { ibv_dereg_mr(self.inner) };
         if ret != 0 {
-            tracing::error!("ibv_dereg_mr failed: {}", std::io::Error::from_raw_os_error(-ret));
+            tracing::error!(
+                "ibv_dereg_mr failed: {}",
+                std::io::Error::from_raw_os_error(-ret)
+            );
         }
     }
 }
@@ -90,7 +93,10 @@ impl Drop for OwnedMemoryRegion {
         // Deregister MR first, then buffer is freed when _buf drops.
         let ret = unsafe { ibv_dereg_mr(self.inner) };
         if ret != 0 {
-            tracing::error!("ibv_dereg_mr failed: {}", std::io::Error::from_raw_os_error(-ret));
+            tracing::error!(
+                "ibv_dereg_mr failed: {}",
+                std::io::Error::from_raw_os_error(-ret)
+            );
         }
     }
 }

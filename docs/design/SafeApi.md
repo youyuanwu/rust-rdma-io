@@ -401,45 +401,66 @@ loop {
 
 ## 6. Async Completion Polling
 
-> **Note**: Async runtime integration (tokio, smol) is deferred to future work. This section describes the design for when it is implemented. Phase 4 focuses on the core `AsyncCq` abstraction using raw fd polling (`rustix` / `mio`); runtime-specific backends will be added later.
+> **Implemented**: See [AsyncIntegration.md](AsyncIntegration.md) for the full async design. Phase A (CompletionChannel + AsyncCq) and Phase B (AsyncQp) are complete. Runtime backends use feature flags (`tokio`, `smol`).
 
 ### Design
 
-RDMA completion notifications use file descriptors (via `ibv_comp_channel`). We register the fd with an event loop for edge-triggered readiness, then poll the CQ when notified.
+RDMA completion notifications use file descriptors (via `ibv_comp_channel`). We register the fd with an event loop for edge-triggered readiness, then poll the CQ when notified. The `CqNotifier` trait abstracts over runtime-specific fd polling.
 
 ```rust
+/// Trait abstracting async fd readiness notification.
+pub trait CqNotifier: Send {
+    /// Wait until the comp_channel fd is readable.
+    fn wait_readable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>>;
+}
+
 /// Async-ready completion queue poller.
 pub struct AsyncCq {
     cq: Arc<CompletionQueue>,
     channel: CompletionChannel,
-    // fd-based async readiness
+    notifier: Box<dyn CqNotifier>,
+    acked: AtomicU32,
 }
 
 impl AsyncCq {
-    pub fn new(cq: Arc<CompletionQueue>, channel: CompletionChannel) -> Result<Self>
+    pub fn new(cq: Arc<CompletionQueue>, channel: CompletionChannel, notifier: Box<dyn CqNotifier>) -> Self
 
-    /// Wait for completions asynchronously.
+    /// Wait for completions asynchronously (drain-after-arm loop).
     pub async fn poll(&self, wc: &mut [WorkCompletion]) -> Result<usize>
 
-    /// Stream of completions.
-    pub fn completions(&self) -> impl Stream<Item = Result<WorkCompletion>> + '_
+    /// Wait for a specific WR ID completion.
+    pub async fn poll_wr_id(&self, wr_id: u64) -> Result<WorkCompletion>
+}
+
+/// Async QP wrapper for individual RDMA verb operations.
+pub struct AsyncQp {
+    qp: *mut ibv_qp,    // borrowed from CmId
+    async_cq: AsyncCq,
+}
+
+impl AsyncQp {
+    pub async fn send(&self, mr: &OwnedMemoryRegion, offset: usize, length: usize, wr_id: u64) -> Result<WorkCompletion>
+    pub async fn recv(&self, mr: &OwnedMemoryRegion, offset: usize, length: usize, wr_id: u64) -> Result<WorkCompletion>
+    pub async fn send_with_imm(&self, mr: &OwnedMemoryRegion, offset: usize, length: usize, imm_data: u32, wr_id: u64) -> Result<WorkCompletion>
 }
 ```
 
-### Completion notification flow
+### Completion notification flow (drain-after-arm)
 
-Each backend registers `comp_channel.fd` for read-readiness. When readable:
-1. `ibv_get_cq_event()` to consume the notification
-2. `ibv_req_notify_cq()` to re-arm
-3. `ibv_poll_cq()` to drain completions
+1. `ibv_req_notify_cq()` to arm
+2. `ibv_poll_cq()` to drain (catches completions between arm and await)
+3. If nothing found: await fd readiness via `CqNotifier`
+4. `ibv_get_cq_event()` to consume the notification
+5. Batch ack every 16 events (`ibv_ack_cq_events`)
+6. Loop back to step 1
 
-This is the standard CQ notification pattern — we just wire it into Rust async.
+This drain-after-arm pattern avoids the race condition where a completion arrives between arming and blocking.
 
 ---
 
 ## 7. Stream Abstraction (Read / Write)
 
-> **Note**: The async `RdmaStream` with `AsyncRead`/`AsyncWrite` depends on runtime integration (deferred). Phase 4 provides the synchronous stream abstraction using `std::io::Read`/`std::io::Write`. Async variants will be added when runtime backends land.
+> **Note**: Phase 4 provides the synchronous stream abstraction using `std::io::Read`/`std::io::Write`. Async `AsyncRdmaStream` with `read()`/`write()` is implemented (Phase C). `futures::io::AsyncRead`/`AsyncWrite` trait impls are next (Phase D). See [AsyncIntegration.md](AsyncIntegration.md).
 
 ```rust
 /// RDMA stream with Read + Write.
@@ -550,7 +571,15 @@ cm = []
 
 # Read/Write stream abstraction over rdma_cm
 stream = ["cm"]
+
+# Async runtime: tokio backend (AsyncFd-based CqNotifier)
+tokio = ["dep:tokio"]
+
+# Async runtime: smol backend (async-io-based CqNotifier)
+smol = ["dep:async-io"]
 ```
+
+> **Note**: `tokio` and `smol` feature flags are implemented. The `legacy-api`, `new-api`, `cm`, and `stream` flags are designed but not yet enforced — everything compiles unconditionally.
 
 ---
 
@@ -628,6 +657,31 @@ bitflags::bitflags! {
 - Double-buffered recv with partial-read support
 - Tests: echo, multi-message (5 round-trips), large transfer (32 KiB) — 3 tests
 
+### Async Phase A: CompletionChannel + AsyncCq ✅
+
+- `comp_channel.rs` — Safe `ibv_comp_channel` wrapper with non-blocking fd
+- `async_cq.rs` — `CqNotifier` trait + `AsyncCq` with drain-after-arm loop, batched acks
+- `tokio_notifier.rs` — `TokioCqNotifier` using `tokio::io::unix::AsyncFd`
+- Feature flags: `tokio`, `smol` (conditional compilation via `#[cfg(feature = "...")]`)
+- Dependencies: `futures-io`, `tokio` (optional), `async-io` (optional), `libc`
+- Tests: async CQ send/recv, poll_wr_id — 2 tests
+
+### Async Phase B: AsyncQp ✅
+
+- `async_qp.rs` — `AsyncQp` wrapping raw `*mut ibv_qp` + `AsyncCq`
+- Async verbs: `send()`, `recv()`, `send_with_imm()`, `poll()`
+- Borrows raw QP pointer (CM ID owns the QP, avoids double-free)
+- Tests: send/recv roundtrip, multi-message ping-pong — 2 tests
+
+### Async Phase C: AsyncRdmaStream ✅
+
+- `async_stream.rs` — `AsyncRdmaStream` + `AsyncRdmaListener`
+- TCP-like async read/write over RDMA SEND/RECV using `AsyncQp`
+- `accept()` uses `rdma_migrate_id()` to give accepted connections their own event channel, decoupling from listener lifetime
+- Connection setup is synchronous (use `spawn_blocking`); data path is fully async
+- Tests: echo, multi-message (5 round-trips), large transfer (32 KiB) — 3 tests
+- See [AsyncIntegration.md](AsyncIntegration.md) for remaining phases (D–F)
+
 ### Phase 5: Advanced resources 📋 (future)
 
 - `srq.rs` — Shared Receive Queue
@@ -643,13 +697,18 @@ bitflags::bitflags! {
 |----------|--------|-----------|
 | Ownership model | `Arc`-based | Enables `Send + Sync`, natural for multi-threaded RDMA |
 | MR lifetime | Borrowed + Owned variants | Flexibility — short-lived vs long-lived buffers |
-| Async approach | Deferred — core uses sync spin-polling | Runtime integration (tokio/smol) is future work |
+| Async approach | `futures::io` traits as primary, runtime-agnostic | Tokio users use `tokio_util::compat`; smol works natively. See [AsyncIntegration.md](AsyncIntegration.md) |
+| Async CQ pattern | Drain-after-arm loop | Avoids race between `ibv_req_notify_cq` and `ibv_get_cq_event` that caused hangs with standard arm-then-block |
+| Async CQ ack batching | Batch every 16 events | `ibv_ack_cq_events` takes a mutex; batching reduces contention |
+| AsyncQp ownership | Borrows raw `*mut ibv_qp` | CM ID owns the QP; `QueuePair::Drop` would double-free. `AsyncQp` uses unsafe raw pointer with documented lifetime requirement |
+| Accepted CM ID migration | `rdma_migrate_id()` after accept | Accepted connections inherit listener's event channel; dropping listener kills accepted QPs. Migration decouples lifetimes |
+| Feature flags (async) | `tokio`, `smol` | Core async types (`CqNotifier`, `AsyncCq`, `AsyncQp`) compile with either; notifier backends are feature-gated |
 | Error handling | `thiserror` + `std::io::Error` | Composable with Rust I/O ecosystem |
 | Drop error handling | `tracing::error!` on all resource destruction failures | Silent drops hide kernel resource leaks |
 | Enum wrapping | `bitflags` for flags, Rust enums for types | Type safety without runtime cost |
 | API surface | Both legacy and new ibverbs | Legacy for compatibility, new for performance |
 | Connection mgmt | rdma_cm as primary | Required for iWARP, recommended for RoCE |
-| Stream abstraction | `std::io::Read`/`Write` first | Sync first, async (`AsyncRead`/`AsyncWrite`) when runtime backends land |
+| Stream abstraction | `std::io::Read`/`Write` (sync), `AsyncRdmaStream::read()`/`write()` (async) | Sync: `std::io`; Async: `AsyncQp`-based. `AsyncRead`/`AsyncWrite` traits in Phase D |
 | Stream CQ polling | Spin-poll + `thread::yield_now()` | comp_channel had race condition (notification consumed before `ibv_get_cq_event`) |
 | rdma_cm error model | `from_ret_errno()` (reads `last_os_error`) | rdma_cm returns -1 + sets errno, unlike ibverbs which returns negative errno |
 | Test serialization | `RUST_TEST_THREADS=1` in `.cargo/config.toml` | siw has kernel resource contention with concurrent RDMA connections |
@@ -673,11 +732,11 @@ Items identified from the [ExistingLibs.md](ExistingLibs.md) gap analysis and im
 ### API Gaps (design specified but not yet implemented)
 
 11. **`MemoryRegion<'a>` slice accessors** — Add `as_slice()` / `as_mut_slice()` on borrowed MRs (already on `OwnedMemoryRegion`).
-12. **`CompletionChannel`** — Wrap `ibv_comp_channel` for event-driven CQ notification. Prerequisite for async backends.
+12. ~~**`CompletionChannel`**~~ — **Done**: `comp_channel.rs` wraps `ibv_comp_channel` with non-blocking fd, `AsRawFd`, RAII drop.
 13. **`qp_type()` accessor** — Return the transport type of a `QueuePair`.
 14. **`CmId.qp()` / `CmId.pd()` safe accessors** — Return `&QueuePair` / `&ProtectionDomain` instead of raw pointers.
 15. **`query_gid_table()`** — Bulk GID table query for device discovery.
-16. **Feature flags** — §10 design specifies `legacy-api`, `new-api`, `cm`, `stream` features but none are implemented; everything compiles unconditionally.
+16. **Feature flags** — §10 design specifies `legacy-api`, `new-api`, `cm`, `stream` features but none are enforced; everything compiles unconditionally. `tokio` and `smol` flags are implemented and working.
 
 ### Stream Enhancements
 
@@ -704,6 +763,6 @@ Items identified from the [ExistingLibs.md](ExistingLibs.md) gap analysis and im
 5. **Tracing instrumentation** — `tracing` dependency added for Drop error reporting. Future: optional spans on resource creation/destruction and data-path operations (behind a feature flag).
 6. **io_uring integration** — Use io_uring for CQ notification instead of epoll/completion channel. Potential for lower latency event loop integration.
 7. **Connection pooling / reconnection** — Higher-level abstractions for managing multiple connections with automatic reconnect on failure.
-8. **Async runtime backends (tokio, smol)** — `AsyncFd` (tokio) or `Async` (async-io/smol) wrappers around the comp_channel fd, enabling `AsyncCq`, `AsyncRead`/`AsyncWrite` on `RdmaStream`, and runtime-agnostic async CQ polling.
+8. ~~**Async runtime backends (tokio, smol)**~~ — **Mostly done**: `TokioCqNotifier`, `AsyncCq`, `AsyncQp`, `AsyncRdmaStream` + `AsyncRdmaListener` implemented. Remaining: `SmolCqNotifier`, `futures::io::AsyncRead`/`AsyncWrite` trait impls, one-sided + atomic verbs, async CM events. See [AsyncIntegration.md](AsyncIntegration.md) Phases D–F.
 9. **Async device events** — `ibv_get_async_event` handling for port state changes, QP errors, and device removal notifications. Likely a `Context::async_events()` stream.
 10. ~~**QP state transition helpers**~~ — **Partially done**: `to_init()`, `to_rtr()`, `to_rts()` exist. Future: higher-level `transition_to_rts(port, gid, remote_qpn, remote_psn)` that sets all attributes in one call.

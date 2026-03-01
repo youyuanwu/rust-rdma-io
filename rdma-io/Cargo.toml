@@ -5,9 +5,18 @@ edition.workspace = true
 license.workspace = true
 description = "Safe Rust API for RDMA (libibverbs + librdmacm)"
 
+[features]
+default = []
+tokio = ["dep:tokio", "dep:futures-io"]
+smol = ["dep:async-io", "dep:futures-io"]
+
 [dependencies]
 rdma-io-sys = { path = "../rdma-io-sys" }
 bnd-posix = { path = "../../bnd/bnd-posix" }
 bitflags = "2"
 thiserror = "2"
 tracing = "0.1"
+libc = "0.2"
+futures-io = { version = "0.3", optional = true }
+tokio = { version = "1", features = ["net"], optional = true }
+async-io = { version = "2", optional = true }

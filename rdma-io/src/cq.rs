@@ -6,6 +6,7 @@ use rdma_io_sys::ibverbs::*;
 use rdma_io_sys::wrapper::*;
 
 use crate::Result;
+use crate::comp_channel::CompletionChannel;
 use crate::device::Context;
 use crate::error::{from_ptr, from_ret};
 use crate::wc::WorkCompletion;
@@ -24,7 +25,10 @@ impl Drop for CompletionQueue {
     fn drop(&mut self) {
         let ret = unsafe { ibv_destroy_cq(self.inner) };
         if ret != 0 {
-            tracing::error!("ibv_destroy_cq failed: {}", std::io::Error::from_raw_os_error(-ret));
+            tracing::error!(
+                "ibv_destroy_cq failed: {}",
+                std::io::Error::from_raw_os_error(-ret)
+            );
         }
     }
 }
@@ -69,6 +73,30 @@ impl CompletionQueue {
     /// Raw pointer (for advanced/FFI use).
     pub fn as_raw(&self) -> *mut ibv_cq {
         self.inner
+    }
+
+    /// Create a CQ associated with a completion channel.
+    ///
+    /// When completions arrive, the channel's fd becomes readable,
+    /// enabling async notification via `epoll`/`kqueue`.
+    pub fn with_comp_channel(
+        ctx: Arc<Context>,
+        cqe: i32,
+        channel: &CompletionChannel,
+    ) -> Result<Arc<Self>> {
+        let cq = from_ptr(unsafe {
+            ibv_create_cq(
+                ctx.inner,
+                cqe,
+                std::ptr::null_mut(), // cq_context
+                channel.as_raw(),     // comp_channel
+                0,                    // comp_vector
+            )
+        })?;
+        Ok(Arc::new(Self {
+            inner: cq,
+            _ctx: ctx,
+        }))
     }
 }
 

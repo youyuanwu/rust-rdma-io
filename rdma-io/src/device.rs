@@ -111,7 +111,10 @@ impl Drop for Context {
         if self.owned {
             let ret = unsafe { ibv_close_device(self.inner) };
             if ret != 0 {
-                tracing::error!("ibv_close_device failed: {}", std::io::Error::from_raw_os_error(-ret));
+                tracing::error!(
+                    "ibv_close_device failed: {}",
+                    std::io::Error::from_raw_os_error(-ret)
+                );
             }
         }
     }

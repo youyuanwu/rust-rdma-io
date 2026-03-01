@@ -7,6 +7,12 @@
 //! ```
 
 #[cfg(test)]
+mod async_cq_tests;
+#[cfg(test)]
+mod async_qp_tests;
+#[cfg(test)]
+mod async_stream_tests;
+#[cfg(test)]
 mod cm_tests;
 #[cfg(test)]
 mod safe_api_tests;

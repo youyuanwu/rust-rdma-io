@@ -250,8 +250,7 @@ impl io::Read for RdmaStream {
                     }
                     let buf_idx = wr_id as usize;
                     let copy_len = byte_len.min(buf.len());
-                    buf[..copy_len]
-                        .copy_from_slice(&self.recv_mrs[buf_idx].as_slice()[..copy_len]);
+                    buf[..copy_len].copy_from_slice(&self.recv_mrs[buf_idx].as_slice()[..copy_len]);
                     if copy_len < byte_len {
                         self.recv_pending = Some((buf_idx, copy_len, byte_len));
                     } else {
@@ -371,8 +370,7 @@ impl RdmaListener {
 
         conn_id.create_qp_with_cq(&pd, &stream_qp_attr(), Some(&cq), Some(&cq))?;
 
-        let stream =
-            RdmaStream::from_accepted(conn_ch, conn_id, pd, cq, self.buf_size)?;
+        let stream = RdmaStream::from_accepted(conn_ch, conn_id, pd, cq, self.buf_size)?;
 
         stream.cm_id.accept(&ConnParam::default())?;
         expect_event(&self.event_channel, CmEventType::Established)?.ack();

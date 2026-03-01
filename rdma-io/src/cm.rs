@@ -196,7 +196,10 @@ impl Drop for CmEvent {
         // If not ack'd, ack now to avoid leaking the event.
         let ret = unsafe { rdma_ack_cm_event(self.inner) };
         if ret != 0 {
-            tracing::error!("rdma_ack_cm_event failed: {}", std::io::Error::last_os_error());
+            tracing::error!(
+                "rdma_ack_cm_event failed: {}",
+                std::io::Error::last_os_error()
+            );
         }
     }
 }
@@ -219,7 +222,10 @@ impl Drop for CmId {
         if self.owned {
             let ret = unsafe { rdma_destroy_id(self.inner) };
             if ret != 0 {
-                tracing::error!("rdma_destroy_id failed: {}", std::io::Error::last_os_error());
+                tracing::error!(
+                    "rdma_destroy_id failed: {}",
+                    std::io::Error::last_os_error()
+                );
             }
         }
     }
@@ -371,6 +377,15 @@ impl CmId {
     /// Raw pointer.
     pub fn as_raw(&self) -> *mut rdma_cm_id {
         self.inner
+    }
+
+    /// Migrate this CM ID to a different event channel.
+    ///
+    /// After migration, events for this CM ID will be reported on the new channel.
+    /// This is typically used after `accept()` to give the accepted connection
+    /// its own event channel, independent of the listener.
+    pub fn migrate(&self, new_channel: &EventChannel) -> Result<()> {
+        from_ret_errno(unsafe { rdma_migrate_id(self.inner, new_channel.as_raw()) })
     }
 }
 

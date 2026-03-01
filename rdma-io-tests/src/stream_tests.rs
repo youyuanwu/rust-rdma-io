@@ -53,7 +53,10 @@ fn stream_echo() {
     let mut buf = [0u8; 1024];
     let n = client.read(&mut buf).expect("read");
     assert_eq!(&buf[..n], msg);
-    println!("Client: received echo: {}", std::str::from_utf8(&buf[..n]).unwrap());
+    println!(
+        "Client: received echo: {}",
+        std::str::from_utf8(&buf[..n]).unwrap()
+    );
 
     server.join().expect("server panicked");
     println!("Stream echo test passed!");
