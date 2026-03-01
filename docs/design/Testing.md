@@ -383,10 +383,27 @@ tests/
 ## 7. Open Questions
 
 1. **Docker vs. bare metal CI**: Should we run rxe inside a Docker container (may need `--privileged`) or bare on the CI runner?
-2. **Test parallelism**: RDMA device is shared state — do tests need serialization (e.g., `cargo test -- --test-threads=1`) or can they use separate PDs/QPs?
+2. ~~**Test parallelism**: RDMA device is shared state — do tests need serialization (e.g., `cargo test -- --test-threads=1`) or can they use separate PDs/QPs?~~ **Resolved** — Tests must run single-threaded (`RUST_TEST_THREADS=1` in `.cargo/config.toml`). siw has kernel resource contention when multiple RDMA connections run concurrently.
 3. **Cleanup**: If a test crashes, RDMA resources (QPs, MRs) may leak in the kernel. Need cleanup strategy.
 4. **Minimum kernel version**: rxe behavior varies across kernel versions. Pin or document minimum?
 5. **Performance regression tests**: Worth running micro-benchmarks in CI (latency/throughput with rxe)?
+
+### Findings from Implementation
+
+- **siw loopback quirk**: siw on loopback (127.0.0.1/siw_lo) fails `rdma_listen` with `EADDRINUSE`. Tests must bind to `0.0.0.0` and connect via the eth0 IP (e.g. `10.0.0.4`).
+- **Error model difference**: rdma_cm functions return -1 + set errno (use `last_os_error()`), while ibverbs functions return negative errno directly. This caused a subtle EPERM misinterpretation bug during development.
+- **CmEvent ownership**: `rdma_ack_cm_event` invalidates the event — save `event_type()` before calling `ack()`. Drop impl also acks to prevent leaks.
+- **siw does not support extended ibverbs API**: `ibv_create_cq_ex` and `ibv_qp_to_qp_ex` both return `EOPNOTSUPP`. Phase 3 (new ibverbs API) was skipped.
+- **CompChannel race condition**: The `ibv_req_notify_cq` → `ibv_poll_cq` → `ibv_get_cq_event` sequence has a race when multiple completions interleave — the notification can be consumed before `ibv_get_cq_event`, causing a hang. Resolved by using spin-polling with `thread::yield_now()` instead.
+
+### Current Test Suite (23 tests)
+
+| Category | Count | Description |
+|----------|-------|-------------|
+| sys_tests | 8 | Raw FFI lifecycle: device, PD, CQ, MR, QP (against siw) |
+| safe_api_tests | 10 | Safe API: device enumeration, PD, CQ, QP, MR, query port/GID |
+| cm_tests | 2 | rdma_cm: connect/disconnect, send/recv (threaded, loopback) |
+| stream_tests | 3 | Stream: echo, multi-message (5 round-trips), large transfer (32 KiB) |
 
 ---
 

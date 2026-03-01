@@ -412,6 +412,7 @@ dependencies = [
  "bnd-posix",
  "rdma-io-sys",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]

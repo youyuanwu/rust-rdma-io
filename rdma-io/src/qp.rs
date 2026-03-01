@@ -58,8 +58,9 @@ unsafe impl Sync for QueuePair {}
 
 impl Drop for QueuePair {
     fn drop(&mut self) {
-        unsafe {
-            ibv_destroy_qp(self.inner);
+        let ret = unsafe { ibv_destroy_qp(self.inner) };
+        if ret != 0 {
+            tracing::error!("ibv_destroy_qp failed: {}", std::io::Error::from_raw_os_error(-ret));
         }
     }
 }

@@ -38,8 +38,9 @@ unsafe impl Sync for MemoryRegion<'_> {}
 
 impl Drop for MemoryRegion<'_> {
     fn drop(&mut self) {
-        unsafe {
-            ibv_dereg_mr(self.inner);
+        let ret = unsafe { ibv_dereg_mr(self.inner) };
+        if ret != 0 {
+            tracing::error!("ibv_dereg_mr failed: {}", std::io::Error::from_raw_os_error(-ret));
         }
     }
 }
@@ -87,8 +88,9 @@ unsafe impl Sync for OwnedMemoryRegion {}
 impl Drop for OwnedMemoryRegion {
     fn drop(&mut self) {
         // Deregister MR first, then buffer is freed when _buf drops.
-        unsafe {
-            ibv_dereg_mr(self.inner);
+        let ret = unsafe { ibv_dereg_mr(self.inner) };
+        if ret != 0 {
+            tracing::error!("ibv_dereg_mr failed: {}", std::io::Error::from_raw_os_error(-ret));
         }
     }
 }

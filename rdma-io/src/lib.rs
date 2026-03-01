@@ -10,6 +10,7 @@ pub mod error;
 pub mod mr;
 pub mod pd;
 pub mod qp;
+pub mod stream;
 pub mod wc;
 pub mod wr;
 

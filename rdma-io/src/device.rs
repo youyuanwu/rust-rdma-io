@@ -109,8 +109,9 @@ unsafe impl Sync for Context {}
 impl Drop for Context {
     fn drop(&mut self) {
         if self.owned {
-            unsafe {
-                ibv_close_device(self.inner);
+            let ret = unsafe { ibv_close_device(self.inner) };
+            if ret != 0 {
+                tracing::error!("ibv_close_device failed: {}", std::io::Error::from_raw_os_error(-ret));
             }
         }
     }

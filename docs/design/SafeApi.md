@@ -596,7 +596,7 @@ bitflags::bitflags! {
 
 ## 12. Implementation Phases
 
-### Phase 1: Core resources + legacy API
+### Phase 1: Core resources + legacy API ✅
 
 - `device.rs`, `pd.rs`, `cq.rs`, `qp.rs`, `mr.rs`, `error.rs`, `wc.rs`, `wr.rs`
 - RAII wrappers with `Arc`-based ownership
@@ -604,27 +604,31 @@ bitflags::bitflags! {
 - QP state transitions (INIT → RTR → RTS)
 - Enum and flag types via `bitflags`
 - Tests against siw (extend existing test suite)
+- 10 safe API tests passing
 
-### Phase 2: rdma_cm
+### Phase 2: rdma_cm ✅
 
-- `cm.rs` — `EventChannel`, `CmId`, `CmEvent`
+- `cm.rs` — `EventChannel`, `CmId`, `CmEvent`, `ConnParam`, `PortSpace`
 - Connection setup (client + server flows)
-- Tests: siw loopback connect/disconnect, data transfer via CM
+- `from_ret_errno()` for rdma_cm error handling (returns -1 + errno, unlike ibverbs)
+- `CmId::create_qp_with_cq()` for explicit CQ passing
+- Tests: siw loopback connect/disconnect, data transfer via CM (2 tests)
 
-### Phase 3: New ibverbs API
+### Phase 3: New ibverbs API ⏭️ (skipped)
 
 - `QueuePairEx`, `WrSession` (builder pattern for new WR API)
 - `CompletionQueueEx`, `PollGuard` (new CQ polling API)
-- Tests: new API against siw (if supported) or rxe
+- **Skipped**: siw does not support `ibv_create_cq_ex` or `ibv_qp_to_qp_ex` (returns `EOPNOTSUPP`). Will implement when hardware or rxe testing is available.
 
-### Phase 4: Stream
+### Phase 4: Stream ✅
 
 - `stream.rs` — `RdmaStream`, `RdmaListener`
 - `std::io::Read`/`std::io::Write` implementations
-- Synchronous CQ polling with comp_channel fd
-- Tests: loopback echo, bidirectional transfer via siw
+- Spin-polling CQ design (comp_channel approach had race conditions with siw)
+- Double-buffered recv with partial-read support
+- Tests: echo, multi-message (5 round-trips), large transfer (32 KiB) — 3 tests
 
-### Phase 5: Advanced resources
+### Phase 5: Advanced resources 📋 (future)
 
 - `srq.rs` — Shared Receive Queue
 - `ah.rs` — Address Handle (for UD)
@@ -639,12 +643,16 @@ bitflags::bitflags! {
 |----------|--------|-----------|
 | Ownership model | `Arc`-based | Enables `Send + Sync`, natural for multi-threaded RDMA |
 | MR lifetime | Borrowed + Owned variants | Flexibility — short-lived vs long-lived buffers |
-| Async approach | Deferred — core uses sync CQ polling with comp_channel fd | Runtime integration (tokio/smol) is future work |
+| Async approach | Deferred — core uses sync spin-polling | Runtime integration (tokio/smol) is future work |
 | Error handling | `thiserror` + `std::io::Error` | Composable with Rust I/O ecosystem |
+| Drop error handling | `tracing::error!` on all resource destruction failures | Silent drops hide kernel resource leaks |
 | Enum wrapping | `bitflags` for flags, Rust enums for types | Type safety without runtime cost |
 | API surface | Both legacy and new ibverbs | Legacy for compatibility, new for performance |
 | Connection mgmt | rdma_cm as primary | Required for iWARP, recommended for RoCE |
 | Stream abstraction | `std::io::Read`/`Write` first | Sync first, async (`AsyncRead`/`AsyncWrite`) when runtime backends land |
+| Stream CQ polling | Spin-poll + `thread::yield_now()` | comp_channel had race condition (notification consumed before `ibv_get_cq_event`) |
+| rdma_cm error model | `from_ret_errno()` (reads `last_os_error`) | rdma_cm returns -1 + sets errno, unlike ibverbs which returns negative errno |
+| Test serialization | `RUST_TEST_THREADS=1` in `.cargo/config.toml` | siw has kernel resource contention with concurrent RDMA connections |
 
 ---
 
@@ -654,21 +662,48 @@ bitflags::bitflags! {
 2. **Inline data threshold**: Should `post_send` auto-detect inline capability and use it when data is small?
 3. **SRQ integration**: How tightly should SRQ be coupled with QP creation?
 4. **Multi-device**: Should `RdmaStream` support failover between devices?
-5. **Metrics/tracing**: Should we instrument with `tracing` crate from the start?
+5. ~~**Metrics/tracing**: Should we instrument with `tracing` crate from the start?~~ **Resolved** — `tracing` added for Drop error reporting; data-path tracing deferred to future work (§15.5).
 
 ---
 
 ## 15. Future Work
 
-Items identified from the [ExistingLibs.md](ExistingLibs.md) gap analysis that are not covered in the phased plan above:
+Items identified from the [ExistingLibs.md](ExistingLibs.md) gap analysis and implementation review:
+
+### API Gaps (design specified but not yet implemented)
+
+11. **`MemoryRegion<'a>` slice accessors** — Add `as_slice()` / `as_mut_slice()` on borrowed MRs (already on `OwnedMemoryRegion`).
+12. **`CompletionChannel`** — Wrap `ibv_comp_channel` for event-driven CQ notification. Prerequisite for async backends.
+13. **`qp_type()` accessor** — Return the transport type of a `QueuePair`.
+14. **`CmId.qp()` / `CmId.pd()` safe accessors** — Return `&QueuePair` / `&ProtectionDomain` instead of raw pointers.
+15. **`query_gid_table()`** — Bulk GID table query for device discovery.
+16. **Feature flags** — §10 design specifies `legacy-api`, `new-api`, `cm`, `stream` features but none are implemented; everything compiles unconditionally.
+
+### Stream Enhancements
+
+17. **Read/write timeouts** — `set_read_timeout()` / `set_write_timeout()` like `TcpStream`. Current spin-poll blocks forever.
+18. **`RdmaListener::local_addr()`** — Analogous to `TcpListener::local_addr()`, useful for ephemeral port tests.
+19. **`RdmaStream::peer_addr()`** — Connection introspection.
+20. **Stream split** — `into_split()` returning `OwnedReadHalf` / `OwnedWriteHalf` (like tokio's `TcpStream`), or `Clone` via internal `Arc`.
+21. **Builder pattern** — `RdmaStreamBuilder::new(addr).buf_size(128*1024).max_recv_wr(32).connect()?` for ergonomic configuration.
+22. **Graceful shutdown protocol** — `shutdown(Write)` → drain reads → disconnect, instead of abrupt disconnect in Drop.
+23. **Backpressure / flow control** — Credit-based flow control (§7 design mentions it but not implemented). Sender must track remote recv buffer availability to avoid deadlock when sender outpaces receiver.
+
+### Ergonomics & Ecosystem
+
+24. **`Into<std::io::Error>` for `Error`** — Seamless `?` in io-returning functions.
+25. **`Display` / `Debug` enrichment** — Richer debug output for `CmId`, `QueuePair`, `RdmaStream` (show QP num, state, addresses).
+26. **New ibverbs API (Phase 3)** — `QueuePairEx`, `WrSession`, `CompletionQueueEx`, `PollGuard`. Skipped because siw doesn't support `ibv_create_cq_ex` / `ibv_qp_to_qp_ex`. Implement when rxe or hardware testing is available.
+
+### From Gap Analysis
 
 1. **XRC (Extended Reliable Connected)** — Reduces QP count in large-scale deployments by sharing receive-side resources across connections. No existing Rust library supports this.
 2. **serde support** — Derive `Serialize`/`Deserialize` on `DeviceAttr`, `PortAttr`, GID, and QP endpoint info. Essential for out-of-band QP info exchange when not using rdma_cm.
-3. **Multi-device / multi-port helpers** — Device lookup by name, GID, or subnet. Port selection and binding. No existing library handles multi-device well.
+3. **Multi-device / multi-port helpers** — Device lookup by name, GID, or subnet. Port selection and binding. `open_device_by_name()` exists but more is needed.
 4. **UD-specific APIs** — Multicast group join/leave (`rdma_join_multicast`), send-with-AH pattern, UD QP address resolution.
-5. **Tracing instrumentation** — Optional `tracing` spans on resource creation/destruction and data-path operations (behind a feature flag).
+5. **Tracing instrumentation** — `tracing` dependency added for Drop error reporting. Future: optional spans on resource creation/destruction and data-path operations (behind a feature flag).
 6. **io_uring integration** — Use io_uring for CQ notification instead of epoll/completion channel. Potential for lower latency event loop integration.
 7. **Connection pooling / reconnection** — Higher-level abstractions for managing multiple connections with automatic reconnect on failure.
 8. **Async runtime backends (tokio, smol)** — `AsyncFd` (tokio) or `Async` (async-io/smol) wrappers around the comp_channel fd, enabling `AsyncCq`, `AsyncRead`/`AsyncWrite` on `RdmaStream`, and runtime-agnostic async CQ polling.
 9. **Async device events** — `ibv_get_async_event` handling for port state changes, QP errors, and device removal notifications. Likely a `Context::async_events()` stream.
-10. **QP state transition helpers** — Convenience methods like `qp.transition_to_rts(port, gid, remote_qpn, remote_psn)` to reduce boilerplate for manual (non-CM) QP setup.
+10. ~~**QP state transition helpers**~~ — **Partially done**: `to_init()`, `to_rtr()`, `to_rts()` exist. Future: higher-level `transition_to_rts(port, gid, remote_qpn, remote_psn)` that sets all attributes in one call.

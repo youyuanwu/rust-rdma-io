@@ -22,8 +22,9 @@ unsafe impl Sync for CompletionQueue {}
 
 impl Drop for CompletionQueue {
     fn drop(&mut self) {
-        unsafe {
-            ibv_destroy_cq(self.inner);
+        let ret = unsafe { ibv_destroy_cq(self.inner) };
+        if ret != 0 {
+            tracing::error!("ibv_destroy_cq failed: {}", std::io::Error::from_raw_os_error(-ret));
         }
     }
 }

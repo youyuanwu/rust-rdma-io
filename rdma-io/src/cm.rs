@@ -10,6 +10,7 @@ use rdma_io_sys::ibverbs::*;
 use rdma_io_sys::rdmacm::*;
 
 use crate::Result;
+use crate::cq::CompletionQueue;
 use crate::device::Context;
 use crate::error::{from_ptr, from_ret_errno};
 use crate::pd::ProtectionDomain;
@@ -193,7 +194,10 @@ impl CmEvent {
 impl Drop for CmEvent {
     fn drop(&mut self) {
         // If not ack'd, ack now to avoid leaking the event.
-        unsafe { rdma_ack_cm_event(self.inner) };
+        let ret = unsafe { rdma_ack_cm_event(self.inner) };
+        if ret != 0 {
+            tracing::error!("rdma_ack_cm_event failed: {}", std::io::Error::last_os_error());
+        }
     }
 }
 
@@ -213,7 +217,10 @@ unsafe impl Sync for CmId {}
 impl Drop for CmId {
     fn drop(&mut self) {
         if self.owned {
-            unsafe { rdma_destroy_id(self.inner) };
+            let ret = unsafe { rdma_destroy_id(self.inner) };
+            if ret != 0 {
+                tracing::error!("rdma_destroy_id failed: {}", std::io::Error::last_os_error());
+            }
         }
     }
 }
@@ -273,8 +280,25 @@ impl CmId {
     /// Create a QP on this CM ID.
     ///
     /// The QP is managed by rdma_cm and destroyed when the CM ID is destroyed.
+    /// When send_cq/recv_cq are None, rdma_cm creates internal CQs.
     pub fn create_qp(&self, pd: &Arc<ProtectionDomain>, init_attr: &QpInitAttr) -> Result<()> {
+        self.create_qp_with_cq(pd, init_attr, None, None)
+    }
+
+    /// Create a QP on this CM ID with explicit CQs.
+    ///
+    /// Use this when you need to control CQ creation (e.g., for completion
+    /// channel notification). Pass `None` to let rdma_cm create internal CQs.
+    pub fn create_qp_with_cq(
+        &self,
+        pd: &Arc<ProtectionDomain>,
+        init_attr: &QpInitAttr,
+        send_cq: Option<&Arc<CompletionQueue>>,
+        recv_cq: Option<&Arc<CompletionQueue>>,
+    ) -> Result<()> {
         let mut raw_attr = ibv_qp_init_attr {
+            send_cq: send_cq.map_or(std::ptr::null_mut(), |cq| cq.inner),
+            recv_cq: recv_cq.map_or(std::ptr::null_mut(), |cq| cq.inner),
             cap: ibv_qp_cap {
                 max_send_wr: init_attr.max_send_wr,
                 max_recv_wr: init_attr.max_recv_wr,
