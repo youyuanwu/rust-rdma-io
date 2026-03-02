@@ -148,7 +148,8 @@ rdma_cm provides TCP-like connection semantics over RDMA. This is the primary wa
 ### Key types
 
 - **`EventChannel`** — receives CM events (`get_event()`)
-- **`CmId`** — the core CM handle: `resolve_addr()`, `resolve_route()`, `connect()`, `listen()`, `accept()`, `disconnect()`, `create_qp()`, `create_qp_with_cq()`, `migrate()`
+- **`CmId`** — the core CM handle: `resolve_addr()`, `resolve_route()`, `connect()`, `listen()`, `accept()`, `disconnect()`, `create_qp()` → `CmQueuePair`, `create_qp_with_cq()` → `CmQueuePair`, `migrate()`
+- **`CmQueuePair`** — owned QP lifecycle for CM-managed QPs. Drop calls `rdma_destroy_qp`. Captures `Arc<PD>` + `Arc<CQ>` to prevent premature destruction.
 - **`CmEvent`** — typed event with `event_type()`, `cm_id_raw()`, `ack()`
 
 ### Connection flows

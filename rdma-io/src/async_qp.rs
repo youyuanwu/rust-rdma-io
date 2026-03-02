@@ -1,12 +1,13 @@
 //! Async Queue Pair — mid-level async wrapper for RDMA verbs.
 //!
-//! `AsyncQp` wraps a raw `ibv_qp` pointer + `AsyncCq` and provides async
+//! `AsyncQp` wraps a [`CmQueuePair`] + [`AsyncCq`] and provides async
 //! methods for individual RDMA verbs. Unlike `AsyncRdmaStream` (which
 //! provides a buffered stream abstraction), `AsyncQp` exposes each verb
 //! individually for full control.
 //!
-//! When using rdma_cm, the CM ID owns the QP — so `AsyncQp` borrows
-//! the raw pointer rather than taking ownership of a `QueuePair`.
+//! Field order matters: `qp` (a [`CmQueuePair`]) is declared before
+//! `async_cq`, so Rust drops the QP before the CQ — matching the
+//! kernel-enforced teardown order.
 
 use rdma_io_sys::ibverbs::*;
 use rdma_io_sys::wrapper::*;
@@ -15,38 +16,31 @@ use std::sync::Arc;
 
 use crate::Result;
 use crate::async_cq::AsyncCq;
+use crate::cm::CmQueuePair;
 use crate::cq::CompletionQueue;
 use crate::error::from_ret;
 use crate::mr::{OwnedMemoryRegion, RemoteMr};
 use crate::wc::WorkCompletion;
 use crate::wr::{RecvWr, SendFlags, SendWr, Sge, WrOpcode};
 
-/// Async wrapper around a raw QP pointer for individual RDMA verb operations.
+/// Async wrapper owning a CM-managed QP and its async completion queue.
 ///
-/// # Safety
-/// The caller must ensure the `ibv_qp` pointer remains valid for the
-/// lifetime of this struct (typically by keeping the owning `CmId` alive).
+/// Drop order: `qp` first (destroys QP), `async_cq` second (destroys CQ).
 pub struct AsyncQp {
-    qp: *mut ibv_qp,
+    // IMPORTANT: field order = drop order. QP must die before CQ.
+    qp: CmQueuePair,
     async_cq: AsyncCq,
 }
 
-// Safety: ibv_qp is thread-safe (protected by internal locking in libibverbs).
-unsafe impl Send for AsyncQp {}
-unsafe impl Sync for AsyncQp {}
-
 impl AsyncQp {
-    /// Create a new `AsyncQp` from a raw QP pointer and AsyncCq.
-    ///
-    /// # Safety
-    /// The `ibv_qp` pointer must remain valid for the lifetime of this struct.
-    pub unsafe fn new(qp: *mut ibv_qp, async_cq: AsyncCq) -> Self {
+    /// Create a new `AsyncQp` from a [`CmQueuePair`] and [`AsyncCq`].
+    pub fn new(qp: CmQueuePair, async_cq: AsyncCq) -> Self {
         Self { qp, async_cq }
     }
 
     /// Access the raw QP pointer.
     pub fn as_raw(&self) -> *mut ibv_qp {
-        self.qp
+        self.qp.as_raw()
     }
 
     /// Access the underlying AsyncCq.
@@ -62,13 +56,13 @@ impl AsyncQp {
     fn post_send_raw(&self, wr: &mut SendWr) -> Result<()> {
         let mut raw = wr.build_raw();
         let mut bad_wr: *mut ibv_send_wr = std::ptr::null_mut();
-        from_ret(unsafe { rdma_wrap_ibv_post_send(self.qp, &mut raw, &mut bad_wr) })
+        from_ret(unsafe { rdma_wrap_ibv_post_send(self.qp.as_raw(), &mut raw, &mut bad_wr) })
     }
 
     fn post_recv_raw(&self, wr: &mut RecvWr) -> Result<()> {
         let mut raw = wr.build_raw();
         let mut bad_wr: *mut ibv_recv_wr = std::ptr::null_mut();
-        from_ret(unsafe { rdma_wrap_ibv_post_recv(self.qp, &mut raw, &mut bad_wr) })
+        from_ret(unsafe { rdma_wrap_ibv_post_recv(self.qp.as_raw(), &mut raw, &mut bad_wr) })
     }
 
     /// Post a SEND without waiting for completion.

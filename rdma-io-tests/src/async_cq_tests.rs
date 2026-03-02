@@ -46,6 +46,7 @@ fn default_qp_attr() -> QpInitAttr {
 /// Server-side resources returned after setup.
 struct ServerSetup {
     _server_cm: AsyncCmId,
+    _cmqp: rdma_io::cm::CmQueuePair,
     comp_ch: CompletionChannel,
     cq: std::sync::Arc<CompletionQueue>,
     recv_mr: OwnedMemoryRegion,
@@ -79,7 +80,7 @@ async fn setup_and_send(
         let comp_ch = CompletionChannel::new(&ctx).unwrap();
         let cq = CompletionQueue::with_comp_channel(ctx, 16, &comp_ch).unwrap();
 
-        conn_id
+        let cmqp = conn_id
             .create_qp_with_cq(&pd, &default_qp_attr(), Some(&cq), Some(&cq))
             .unwrap();
 
@@ -88,7 +89,7 @@ async fn setup_and_send(
             .unwrap();
 
         // Post raw recv before accept (tests raw verb path)
-        let server_qp = conn_id.qp_raw();
+        let server_qp = cmqp.as_raw();
         {
             let mut sge = rdma_io_sys::ibverbs::ibv_sge {
                 addr: unsafe { (*recv_mr.as_raw()).addr as u64 },
@@ -120,6 +121,7 @@ async fn setup_and_send(
 
         ServerSetup {
             _server_cm: server_cm,
+            _cmqp: cmqp,
             comp_ch,
             cq,
             recv_mr,
@@ -138,7 +140,7 @@ async fn setup_and_send(
 
     let pd = client_cm.alloc_pd().unwrap();
     // No CompletionChannel — client uses spin-poll (testing CQ layer, not QP layer)
-    client_cm
+    let cmqp = client_cm
         .cm_id()
         .create_qp(&pd, &default_qp_attr())
         .unwrap();
@@ -149,7 +151,7 @@ async fn setup_and_send(
     padded[..data_len].copy_from_slice(&send_buf);
     let send_mr = pd.reg_mr_owned(padded, AccessFlags::LOCAL_WRITE).unwrap();
 
-    let client_qp = client_cm.qp_raw();
+    let client_qp = cmqp.as_raw();
     let client_send_cq = unsafe { (*client_qp).send_cq };
     {
         let mut sge = rdma_io_sys::ibverbs::ibv_sge {
@@ -189,11 +191,14 @@ async fn setup_and_send(
     // Async disconnect — await DISCONNECTED event
     client_cm.disconnect_async().await.unwrap();
 
+    // cmqp drops → rdma_destroy_qp before PD/CmId
+    drop(cmqp);
+
     server_handle.await.expect("server task panicked")
 }
 
 /// Test: AsyncCq::poll() receives a completion via comp_channel notification.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn async_cq_send_recv() {
     let (bind_addr, connect_addr) = test_addrs();
     let setup = setup_and_send(bind_addr, connect_addr, b"async hello!", 100).await;
@@ -217,10 +222,14 @@ async fn async_cq_send_recv() {
 
     assert_eq!(&setup.recv_mr.as_slice()[..12], b"async hello!");
     println!("async_cq_send_recv test passed!");
+
+    // Drop CmQueuePair first to release Arc<CQ> refs before AsyncCq destroys comp_channel.
+    drop(setup._cmqp);
+    drop(async_cq);
 }
 
 /// Test: AsyncCq::poll_wr_id() waits for a specific WR ID.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn async_cq_poll_wr_id() {
     let (bind_addr, connect_addr) = test_addrs();
     let setup = setup_and_send(bind_addr, connect_addr, b"wr_id", 42).await;
@@ -233,4 +242,8 @@ async fn async_cq_poll_wr_id() {
     assert_eq!(wc.byte_len(), 5);
     assert_eq!(&setup.recv_mr.as_slice()[..5], b"wr_id");
     println!("async_cq_poll_wr_id test passed!");
+
+    // Drop CmQueuePair first to release Arc<CQ> refs before AsyncCq destroys comp_channel.
+    drop(setup._cmqp);
+    drop(async_cq);
 }

@@ -16,7 +16,7 @@ fn require_rdma_device() -> Arc<rdma_io::device::Context> {
     Arc::new(ctx)
 }
 
-#[test]
+#[test_log::test]
 fn safe_device_enumeration() {
     let devs = device::devices().expect("devices() failed");
     assert!(!devs.is_empty(), "No RDMA devices found");
@@ -25,7 +25,7 @@ fn safe_device_enumeration() {
     }
 }
 
-#[test]
+#[test_log::test]
 fn safe_open_device() {
     let ctx = require_rdma_device();
     let attr = ctx.query_device().expect("query_device failed");
@@ -36,14 +36,14 @@ fn safe_open_device() {
     assert!(attr.max_qp > 0);
 }
 
-#[test]
+#[test_log::test]
 fn safe_query_port() {
     let ctx = require_rdma_device();
     let port_attr = ctx.query_port(1).expect("query_port failed");
     println!("port state={}, lid={}", port_attr.state, port_attr.lid);
 }
 
-#[test]
+#[test_log::test]
 fn safe_query_gid() {
     let ctx = require_rdma_device();
     let gid = ctx.query_gid(1, 0).expect("query_gid failed");
@@ -51,7 +51,7 @@ fn safe_query_gid() {
     println!("GID[0] = {:02x?}", raw);
 }
 
-#[test]
+#[test_log::test]
 fn safe_pd_lifecycle() {
     let ctx = require_rdma_device();
     let pd = ctx.alloc_pd().expect("alloc_pd failed");
@@ -59,7 +59,7 @@ fn safe_pd_lifecycle() {
     // PD is dropped here — RAII dealloc
 }
 
-#[test]
+#[test_log::test]
 fn safe_cq_lifecycle() {
     let ctx = require_rdma_device();
     let cq = ctx.create_cq(32).expect("create_cq failed");
@@ -71,7 +71,7 @@ fn safe_cq_lifecycle() {
     assert_eq!(n, 0, "Expected 0 completions on empty CQ");
 }
 
-#[test]
+#[test_log::test]
 fn safe_mr_borrowed() {
     let ctx = require_rdma_device();
     let pd = ctx.alloc_pd().unwrap();
@@ -88,7 +88,7 @@ fn safe_mr_borrowed() {
     println!("Borrowed MR: lkey={}, rkey={}", mr.lkey(), mr.rkey());
 }
 
-#[test]
+#[test_log::test]
 fn safe_mr_owned() {
     let ctx = require_rdma_device();
     let pd = ctx.alloc_pd().unwrap();
@@ -101,7 +101,7 @@ fn safe_mr_owned() {
     assert_eq!(mr.as_slice()[0], 42);
 }
 
-#[test]
+#[test_log::test]
 fn safe_qp_create_destroy() {
     let ctx = require_rdma_device();
     let pd = ctx.alloc_pd().unwrap();
@@ -125,7 +125,7 @@ fn safe_qp_create_destroy() {
     // QP is dropped — RAII destroy
 }
 
-#[test]
+#[test_log::test]
 fn safe_multiple_resources() {
     let ctx = require_rdma_device();
     let pd1 = ctx.alloc_pd().unwrap();

@@ -269,7 +269,7 @@ Beyond the stream abstraction (SEND/RECV), RDMA supports one-sided operations (R
 
 ### 7.2 AsyncQp — Async Queue Pair
 
-Central type for async verb operations. Wraps a raw `*mut ibv_qp` (borrowed from CM ID) + `AsyncCq`. Provides async methods for each verb:
+Central type for async verb operations. Owns a `CmQueuePair` (QP lifecycle) + `AsyncCq` (async completion). Field declaration order ensures correct teardown: QP drops before CQ. Provides async methods for each verb:
 
 - **Two-sided**: `send()`, `recv()`, `send_with_imm()`
 - **One-sided**: `read_remote()`, `write_remote()`, `write_remote_with_imm()`
@@ -317,7 +317,7 @@ Created via `OwnedMemoryRegion::to_remote()`. Exchanged out-of-band (e.g., via S
 │  AsyncCq                                          │  Low-level CQ polling (§4)
 │  poll() poll_wr_id() poll_completions()           │  Runtime-agnostic
 ├──────────────────────────────────────────────────┤
-│  QueuePair / CompletionQueue / MemoryRegion       │  Sync core (existing)
+│  CmQueuePair / CompletionQueue / MemoryRegion      │  Sync core (existing)
 └──────────────────────────────────────────────────┘
 ```
 
@@ -385,7 +385,7 @@ impl AsyncRdmaStream {
         let pd = cm_id.alloc_pd()?;
         let comp_ch = CompletionChannel::new(&ctx)?;
         let cq = CompletionQueue::with_comp_channel(ctx, 32, &comp_ch)?;
-        cm_id.create_qp_with_cq(&pd, &stream_qp_attr(), Some(&cq), Some(&cq))?;
+        let cmqp = cm_id.create_qp_with_cq(&pd, &stream_qp_attr(), Some(&cq), Some(&cq))?;
         // ... MR setup, post recv buffers ...
 
         cm_id.connect(&ConnParam::default())?;          // non-blocking kernel call
@@ -512,7 +512,7 @@ Tests cover: async CQ send/recv, AsyncQp ping-pong, AsyncRdmaStream echo/multi-m
 
 Build the mid-level verb abstraction first so the stream can compose on top of it.
 
-1. `AsyncQp` struct wrapping raw `*mut ibv_qp` + `AsyncCq`
+1. `AsyncQp` struct owning `CmQueuePair` + `AsyncCq` (safe constructor, field order = drop order)
 2. Two-sided: `send()`, `recv()`, `send_with_imm()` (core verbs needed by stream)
 3. Tests: async send/recv roundtrip, multi-message ping-pong
 

@@ -7,6 +7,7 @@
 //! These are the building blocks for higher-level types like `AsyncRdmaStream`,
 //! but can also be used directly with `AsyncQp` for custom RDMA patterns.
 
+use std::mem::ManuallyDrop;
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
@@ -101,12 +102,24 @@ impl AsyncEventChannel {
 /// # }
 /// ```
 pub struct AsyncCmId {
-    event_channel: EventChannel,
-    cm_id: CmId,
+    // ManuallyDrop: cm_id must be destroyed before event_channel.
+    // rdma_destroy_id needs the event channel fd to still be open.
+    cm_id: ManuallyDrop<CmId>,
+    event_channel: ManuallyDrop<EventChannel>,
 }
 
 // Safety: EventChannel + CmId are Send-safe (raw pointers guarded by kernel).
 unsafe impl Send for AsyncCmId {}
+
+impl Drop for AsyncCmId {
+    fn drop(&mut self) {
+        // RDMA teardown order: CM ID first, then event channel.
+        unsafe {
+            ManuallyDrop::drop(&mut self.cm_id);
+            ManuallyDrop::drop(&mut self.event_channel);
+        }
+    }
+}
 
 impl AsyncCmId {
     /// Create a new async CM ID on its own event channel.
@@ -115,8 +128,8 @@ impl AsyncCmId {
         ch.set_nonblocking()?;
         let cm_id = CmId::new(&ch, port_space)?;
         Ok(Self {
-            event_channel: ch,
-            cm_id,
+            cm_id: ManuallyDrop::new(cm_id),
+            event_channel: ManuallyDrop::new(ch),
         })
     }
 
@@ -186,18 +199,20 @@ impl AsyncCmId {
     }
 
     /// Create a QP with separate send/recv CQs on this CM ID.
+    ///
+    /// Returns an owned [`CmQueuePair`] that the caller must keep alive.
     pub fn create_qp_with_cq(
         &self,
         pd: &Arc<ProtectionDomain>,
         init_attr: &QpInitAttr,
         send_cq: Option<&Arc<CompletionQueue>>,
         recv_cq: Option<&Arc<CompletionQueue>>,
-    ) -> Result<()> {
+    ) -> Result<crate::cm::CmQueuePair> {
         self.cm_id
             .create_qp_with_cq(pd, init_attr, send_cq, recv_cq)
     }
 
-    /// Raw QP pointer for use with `AsyncQp`.
+    /// Raw QP pointer (from the cm_id, for low-level use before QP is transferred).
     pub fn qp_raw(&self) -> *mut rdma_io_sys::ibverbs::ibv_qp {
         self.cm_id.qp_raw()
     }
@@ -234,11 +249,12 @@ impl AsyncCmId {
     ///
     /// Used when transferring ownership to a higher-level type (e.g., `AsyncRdmaStream`).
     pub fn into_parts(self) -> (EventChannel, CmId) {
-        // Prevent Drop from running (it would disconnect)
-        let event_channel = unsafe { std::ptr::read(&self.event_channel) };
-        let cm_id = unsafe { std::ptr::read(&self.cm_id) };
-        std::mem::forget(self);
-        (event_channel, cm_id)
+        let mut this = ManuallyDrop::new(self);
+        unsafe {
+            let cm_id = ManuallyDrop::take(&mut this.cm_id);
+            let event_channel = ManuallyDrop::take(&mut this.event_channel);
+            (event_channel, cm_id)
+        }
     }
 }
 
@@ -267,13 +283,25 @@ impl AsyncCmId {
 /// # }
 /// ```
 pub struct AsyncCmListener {
-    event_channel: EventChannel,
+    // ManuallyDrop: _cm_id must be destroyed before event_channel.
+    _cm_id: ManuallyDrop<CmId>,
+    event_channel: ManuallyDrop<EventChannel>,
     async_ch: AsyncEventChannel,
-    _cm_id: CmId,
 }
 
 // Safety: EventChannel + CmId are Send-safe (raw pointers guarded by kernel).
 unsafe impl Send for AsyncCmListener {}
+
+impl Drop for AsyncCmListener {
+    fn drop(&mut self) {
+        // RDMA teardown order: CM ID first, then event channel.
+        // async_ch has no Drop (just wraps an AsyncFd).
+        unsafe {
+            ManuallyDrop::drop(&mut self._cm_id);
+            ManuallyDrop::drop(&mut self.event_channel);
+        }
+    }
+}
 
 impl AsyncCmListener {
     /// Bind to a local address and start listening.
@@ -289,9 +317,9 @@ impl AsyncCmListener {
         let cm_id = CmId::new(&ch, PortSpace::Tcp)?;
         cm_id.listen(addr, backlog)?;
         Ok(Self {
-            event_channel: ch,
+            _cm_id: ManuallyDrop::new(cm_id),
+            event_channel: ManuallyDrop::new(ch),
             async_ch,
-            _cm_id: cm_id,
         })
     }
 
@@ -332,8 +360,8 @@ impl AsyncCmListener {
         conn_id.migrate(&conn_ch)?;
 
         Ok(AsyncCmId {
-            event_channel: conn_ch,
-            cm_id: conn_id,
+            cm_id: ManuallyDrop::new(conn_id),
+            event_channel: ManuallyDrop::new(conn_ch),
         })
     }
 
@@ -372,8 +400,8 @@ impl AsyncCmListener {
         conn_id.migrate(&conn_ch)?;
 
         Ok(AsyncCmId {
-            event_channel: conn_ch,
-            cm_id: conn_id,
+            cm_id: ManuallyDrop::new(conn_id),
+            event_channel: ManuallyDrop::new(conn_ch),
         })
     }
 

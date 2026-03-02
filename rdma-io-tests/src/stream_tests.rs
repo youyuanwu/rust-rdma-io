@@ -1,6 +1,7 @@
 //! Stream integration tests — RdmaListener/RdmaStream with std::io traits.
 
 use std::io::{Read, Write};
+use std::sync::{Arc, Barrier};
 use std::thread;
 
 use rdma_io::stream::{RdmaListener, RdmaStream};
@@ -23,9 +24,11 @@ fn test_addrs() -> (std::net::SocketAddr, std::net::SocketAddr) {
     (bind, connect)
 }
 
-#[test]
+#[test_log::test]
 fn stream_echo() {
     let (bind_addr, connect_addr) = test_addrs();
+    let done = Arc::new(Barrier::new(2));
+    let done2 = done.clone();
 
     let server = thread::spawn(move || {
         let listener = RdmaListener::bind(&bind_addr).expect("bind");
@@ -39,6 +42,9 @@ fn stream_echo() {
         // Echo back
         stream.write_all(&buf[..n]).expect("write");
         println!("Server: echoed {} bytes", n);
+
+        // Keep stream alive until client has read the echo.
+        done2.wait();
     });
 
     thread::sleep(std::time::Duration::from_millis(100));
@@ -58,14 +64,19 @@ fn stream_echo() {
         std::str::from_utf8(&buf[..n]).unwrap()
     );
 
+    // Signal server that we've read the echo; both sides can now drop.
+    done.wait();
+
     server.join().expect("server panicked");
     println!("Stream echo test passed!");
 }
 
-#[test]
+#[test_log::test]
 fn stream_multi_message() {
     let (bind_addr, connect_addr) = test_addrs();
     let num_messages = 5;
+    let done = Arc::new(Barrier::new(2));
+    let done2 = done.clone();
 
     let server = thread::spawn(move || {
         let listener = RdmaListener::bind(&bind_addr).expect("bind");
@@ -82,6 +93,9 @@ fn stream_multi_message() {
             let reply = format!("reply {i}");
             stream.write_all(reply.as_bytes()).expect("write");
         }
+
+        // Keep stream alive until client has read all replies.
+        done2.wait();
     });
 
     thread::sleep(std::time::Duration::from_millis(100));
@@ -99,11 +113,14 @@ fn stream_multi_message() {
         println!("Client: received '{reply}'");
     }
 
+    // Signal server that we've read all replies; both sides can now drop.
+    done.wait();
+
     server.join().expect("server panicked");
     println!("Multi-message test passed!");
 }
 
-#[test]
+#[test_log::test]
 fn stream_large_transfer() {
     let (bind_addr, connect_addr) = test_addrs();
     let data_size = 32 * 1024; // 32 KiB (fits in one message)

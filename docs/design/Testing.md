@@ -464,7 +464,7 @@ tests/
 - **iWARP RDMA WRITE with IMM**: iWARP (RFC 5040) does not define RDMA Write with Immediate Data — that's an InfiniBand-specific operation. siw correctly rejects it. API method exists for InfiniBand/RoCE but is untestable on siw.
 - **siw atomic support**: siw reports `ATOMIC_NONE` — no atomic CAS or FAA support. The `compare_and_swap()` and `fetch_and_add()` API methods require InfiniBand/RoCE hardware with `ATOMIC_HCA` or `ATOMIC_GLOB` capability.
 
-### Current Test Suite (35 tests)
+### Current Test Suite (37 tests)
 
 | Category | Count | Description |
 |----------|-------|-------------|
@@ -473,14 +473,16 @@ tests/
 | cm_tests | 2 | rdma_cm: connect/disconnect, send/recv (threaded, loopback) |
 | stream_tests | 3 | Stream: echo, multi-message (5 round-trips), large transfer (32 KiB) |
 | async_cq_tests | 2 | Async CQ: send/recv via comp_channel notification, poll_wr_id |
-| async_qp_tests | 4 | AsyncQp: send/recv, ping-pong, RDMA WRITE+READ roundtrip, disconnect |
+| async_qp_tests | 6 | AsyncQp: send/recv, ping-pong, RDMA WRITE+READ, disconnect, CAS, FAA |
 | async_stream_tests | 6 | AsyncRdmaStream: echo, multi-message, large transfer, futures-io echo, tokio compat, tokio::io::copy |
 
 **Device compatibility**: All tests are device-agnostic — they discover available software RDMA devices (siw or rxe) automatically. `sys_tests` and `safe_api_tests` prefer `siw*`/`rxe*` devices over hardware VFs. Connection-based tests use `rdma_cm` which auto-routes to the correct device.
 
-**CI strategy**: Two jobs run the same 35 tests against different transports:
-- **`build-and-test`**: Uses SIW (loaded from `linux-modules-extra`)
-- **`build-rxe`**: Builds `rdma_rxe.ko` from kernel source (via CMake `BUILD_RXE` option), loads with `insmod`
+**Capability-gated tests**: Atomic tests (CAS, FAA) check `atomic_cap` at runtime — they auto-skip on siw (`ATOMIC_NONE`) and run on rxe (`ATOMIC_HCA`) or real hardware.
+
+**CI strategy**: Two jobs run the same 37 tests against different transports:
+- **`build-and-test`**: Uses SIW (loaded from `linux-modules-extra`) — atomics skipped
+- **`build-rxe`**: Builds `rdma_rxe.ko` from kernel source (via CMake `BUILD_RXE` option) — atomics run
 
 ---
 

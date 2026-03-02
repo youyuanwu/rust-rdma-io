@@ -74,7 +74,7 @@ fn open_rdma_device() -> (*mut ibv_context, String) {
     }
 }
 
-#[test]
+#[test_log::test]
 fn test_rdma_device_available() {
     let name = find_rdma_device();
     assert!(
@@ -84,7 +84,7 @@ fn test_rdma_device_available() {
     println!("Found RDMA device: {}", name.unwrap());
 }
 
-#[test]
+#[test_log::test]
 fn test_open_close_device() {
     let (ctx, name) = open_rdma_device();
     println!("Opened device: {}", name);
@@ -92,7 +92,7 @@ fn test_open_close_device() {
     assert_eq!(ret, 0, "ibv_close_device failed");
 }
 
-#[test]
+#[test_log::test]
 fn test_query_device() {
     let (ctx, name) = open_rdma_device();
     unsafe {
@@ -116,7 +116,7 @@ fn test_query_device() {
     }
 }
 
-#[test]
+#[test_log::test]
 fn test_alloc_dealloc_pd() {
     let (ctx, _) = open_rdma_device();
     unsafe {
@@ -130,7 +130,7 @@ fn test_alloc_dealloc_pd() {
     }
 }
 
-#[test]
+#[test_log::test]
 fn test_create_destroy_cq() {
     let (ctx, _) = open_rdma_device();
     unsafe {
@@ -144,7 +144,7 @@ fn test_create_destroy_cq() {
     }
 }
 
-#[test]
+#[test_log::test]
 fn test_register_deregister_mr() {
     let (ctx, _) = open_rdma_device();
     unsafe {
@@ -172,7 +172,7 @@ fn test_register_deregister_mr() {
     }
 }
 
-#[test]
+#[test_log::test]
 fn test_create_qp() {
     // QP creation works on siw and rxe. Manual state transitions
     // (INIT→RTR→RTS) fail on siw because iWARP needs rdma_cm.
@@ -209,7 +209,7 @@ fn test_create_qp() {
     }
 }
 
-#[test]
+#[test_log::test]
 fn test_multiple_resources() {
     let (ctx, _) = open_rdma_device();
     unsafe {

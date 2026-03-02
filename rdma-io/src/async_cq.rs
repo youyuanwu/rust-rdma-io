@@ -210,6 +210,12 @@ impl AsyncCq {
 
 impl Drop for AsyncCq {
     fn drop(&mut self) {
+        // Drain any pending comp_channel events (from arm-before-poll races)
+        // before acking and destroying the CQ.
+        while self.channel.get_cq_event().is_ok() {
+            self.unacked_events
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         // Ack all remaining events before CQ destruction
         let unacked = self.unacked_events.load(Ordering::Relaxed);
         if unacked > 0 {

@@ -317,15 +317,18 @@ impl CmId {
         from_ret_errno(unsafe { rdma_listen(self.inner, backlog) })
     }
 
-    /// Create a QP on this CM ID.
+    /// Create a QP on this CM ID, returning an owned [`CmQueuePair`].
     ///
-    /// The QP is managed by rdma_cm and destroyed when the CM ID is destroyed.
     /// When send_cq/recv_cq are None, rdma_cm creates internal CQs.
-    pub fn create_qp(&self, pd: &Arc<ProtectionDomain>, init_attr: &QpInitAttr) -> Result<()> {
+    pub fn create_qp(
+        &self,
+        pd: &Arc<ProtectionDomain>,
+        init_attr: &QpInitAttr,
+    ) -> Result<CmQueuePair> {
         self.create_qp_with_cq(pd, init_attr, None, None)
     }
 
-    /// Create a QP on this CM ID with explicit CQs.
+    /// Create a QP on this CM ID with explicit CQs, returning an owned [`CmQueuePair`].
     ///
     /// Use this when you need to control CQ creation (e.g., for completion
     /// channel notification). Pass `None` to let rdma_cm create internal CQs.
@@ -335,7 +338,7 @@ impl CmId {
         init_attr: &QpInitAttr,
         send_cq: Option<&Arc<CompletionQueue>>,
         recv_cq: Option<&Arc<CompletionQueue>>,
-    ) -> Result<()> {
+    ) -> Result<CmQueuePair> {
         let mut raw_attr = ibv_qp_init_attr {
             send_cq: send_cq.map_or(std::ptr::null_mut(), |cq| cq.inner),
             recv_cq: recv_cq.map_or(std::ptr::null_mut(), |cq| cq.inner),
@@ -350,7 +353,14 @@ impl CmId {
             sq_sig_all: i32::from(init_attr.sq_sig_all),
             ..Default::default()
         };
-        from_ret_errno(unsafe { rdma_create_qp(self.inner, pd.inner, &mut raw_attr) })
+        from_ret_errno(unsafe { rdma_create_qp(self.inner, pd.inner, &mut raw_attr) })?;
+        Ok(CmQueuePair {
+            qp: self.qp_raw(),
+            cm_id_raw: self.inner,
+            _pd: Arc::clone(pd),
+            _send_cq: send_cq.map(Arc::clone),
+            _recv_cq: recv_cq.map(Arc::clone),
+        })
     }
 
     /// Connect to a remote peer (client side).
@@ -420,6 +430,53 @@ impl CmId {
     /// its own event channel, independent of the listener.
     pub fn migrate(&self, new_channel: &EventChannel) -> Result<()> {
         from_ret_errno(unsafe { rdma_migrate_id(self.inner, new_channel.as_raw()) })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CmQueuePair — safe wrapper for CM-managed QPs
+// ---------------------------------------------------------------------------
+
+/// A Queue Pair created via `rdma_create_qp` on a [`CmId`].
+///
+/// Owns the QP lifecycle. [`Drop`] calls `rdma_destroy_qp`.
+/// Captures `Arc` references to PD and CQs to prevent premature destruction
+/// of resources the QP depends on.
+///
+/// # Teardown
+///
+/// Must be dropped **before** the [`CmId`] that created it (since
+/// `rdma_destroy_id` requires the QP to be destroyed first). When used
+/// inside [`AsyncQp`], field declaration order guarantees this.
+pub struct CmQueuePair {
+    qp: *mut ibv_qp,
+    cm_id_raw: *mut rdma_cm_id,
+    _pd: Arc<ProtectionDomain>,
+    _send_cq: Option<Arc<CompletionQueue>>,
+    _recv_cq: Option<Arc<CompletionQueue>>,
+}
+
+// Safety: ibv_qp is thread-safe (protected by internal locking in libibverbs).
+unsafe impl Send for CmQueuePair {}
+unsafe impl Sync for CmQueuePair {}
+
+impl Drop for CmQueuePair {
+    fn drop(&mut self) {
+        // Safety: QP was created by rdma_create_qp on this cm_id.
+        // Arc refs to PD/CQs keep them alive until after this returns.
+        unsafe { rdma_destroy_qp(self.cm_id_raw) };
+    }
+}
+
+impl CmQueuePair {
+    /// Raw QP pointer for posting work requests.
+    pub fn as_raw(&self) -> *mut ibv_qp {
+        self.qp
+    }
+
+    /// QP number assigned by the HCA.
+    pub fn qp_num(&self) -> u32 {
+        unsafe { (*self.qp).qp_num }
     }
 }
 

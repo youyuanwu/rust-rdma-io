@@ -43,7 +43,7 @@ fn default_qp_attr() -> QpInitAttr {
     }
 }
 
-#[test]
+#[test_log::test]
 fn cm_loopback_connect_disconnect() {
     let (bind_addr, connect_addr) = test_addrs();
 
@@ -60,7 +60,7 @@ fn cm_loopback_connect_disconnect() {
         ev.ack();
 
         let pd = server_id.alloc_pd().expect("server alloc_pd");
-        server_id
+        let _cmqp = server_id
             .create_qp(&pd, &default_qp_attr())
             .expect("server create_qp");
 
@@ -77,6 +77,7 @@ fn cm_loopback_connect_disconnect() {
         assert_eq!(ev.event_type(), CmEventType::Disconnected);
         ev.ack();
         println!("Server: disconnected");
+        // _cmqp drops → rdma_destroy_qp before PD/CmId/EventChannel
     });
 
     // --- Client (main thread) ---
@@ -99,7 +100,7 @@ fn cm_loopback_connect_disconnect() {
     ev.ack();
 
     let pd = client_id.alloc_pd().expect("client alloc_pd");
-    client_id
+    let _cmqp = client_id
         .create_qp(&pd, &default_qp_attr())
         .expect("client create_qp");
 
@@ -117,11 +118,13 @@ fn cm_loopback_connect_disconnect() {
     assert_eq!(ev.event_type(), CmEventType::Disconnected);
     ev.ack();
 
+    // _cmqp drops → rdma_destroy_qp before PD/CmId/EventChannel
+
     server.join().expect("server thread panicked");
     println!("Connect/disconnect test passed!");
 }
 
-#[test]
+#[test_log::test]
 fn cm_loopback_send_recv() {
     let (bind_addr, connect_addr) = test_addrs();
 
@@ -137,14 +140,14 @@ fn cm_loopback_send_recv() {
         ev.ack();
 
         let pd = server_id.alloc_pd().unwrap();
-        server_id.create_qp(&pd, &default_qp_attr()).unwrap();
+        let cmqp = server_id.create_qp(&pd, &default_qp_attr()).unwrap();
 
         // Register recv buffer and post recv BEFORE accept
         let recv_mr = pd
             .reg_mr_owned(vec![0u8; 64], AccessFlags::LOCAL_WRITE)
             .unwrap();
 
-        let server_qp = server_id.qp_raw();
+        let server_qp = cmqp.as_raw();
         let server_recv_cq = unsafe { (*server_qp).recv_cq };
         {
             let mut sge = rdma_io_sys::ibverbs::ibv_sge {
@@ -200,6 +203,7 @@ fn cm_loopback_send_recv() {
         let ev = ch.get_event().unwrap();
         assert_eq!(ev.event_type(), CmEventType::Disconnected);
         ev.ack();
+        // cmqp drops → rdma_destroy_qp before PD/CmId/EventChannel
     });
 
     // --- Client (main thread) ---
@@ -214,7 +218,7 @@ fn cm_loopback_send_recv() {
     ch.get_event().unwrap().ack();
 
     let pd = client_id.alloc_pd().unwrap();
-    client_id.create_qp(&pd, &default_qp_attr()).unwrap();
+    let cmqp = client_id.create_qp(&pd, &default_qp_attr()).unwrap();
 
     client_id.connect(&ConnParam::default()).unwrap();
     let ev = ch.get_event().unwrap();
@@ -228,7 +232,7 @@ fn cm_loopback_send_recv() {
         .reg_mr_owned(send_data, AccessFlags::LOCAL_WRITE)
         .unwrap();
 
-    let client_qp = client_id.qp_raw();
+    let client_qp = cmqp.as_raw();
     let client_send_cq = unsafe { (*client_qp).send_cq };
     {
         let mut sge = rdma_io_sys::ibverbs::ibv_sge {
@@ -272,6 +276,9 @@ fn cm_loopback_send_recv() {
     let ev = ch.get_event().unwrap();
     assert_eq!(ev.event_type(), CmEventType::Disconnected);
     ev.ack();
+
+    // cmqp drops → rdma_destroy_qp before PD/CmId/EventChannel
+    drop(cmqp);
 
     server.join().expect("server thread panicked");
     println!("Send/recv test passed!");

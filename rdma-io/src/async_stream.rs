@@ -69,25 +69,21 @@ const SEND_WR_ID: u64 = 100;
 /// # }
 /// ```
 pub struct AsyncRdmaStream {
-    // Keep CM resources alive — the QP pointer in AsyncQp borrows from cm_id.
-    _event_channel: EventChannel,
-    cm_id: CmId,
-    _pd: Arc<ProtectionDomain>,
-    aqp: AsyncQp,
+    // Drop order matters! Fields drop in declaration order.
+    // MRs, buffers, and poll state must be freed before RDMA teardown.
+    recv_pending: Option<(usize, usize, usize)>,
+    send_wr_seq: u64,
+    cq_state: CqPollState,
+    stashed_recv: VecDeque<WorkCompletion>,
+    stashed_send: VecDeque<WorkCompletion>,
+    write_pending: Option<(u64, usize)>,
     send_mr: OwnedMemoryRegion,
     recv_mrs: [OwnedMemoryRegion; NUM_RECV_BUFS],
-    /// Buffered recv data: (buffer_index, offset, length).
-    recv_pending: Option<(usize, usize, usize)>,
-    /// Next send WR ID (incremented per send for uniqueness).
-    send_wr_seq: u64,
-    /// CQ poll state for poll-based AsyncRead/AsyncWrite.
-    cq_state: CqPollState,
-    /// Recv completions encountered during poll_write (drained by poll_read).
-    stashed_recv: VecDeque<WorkCompletion>,
-    /// Send completions encountered during poll_read (drained by poll_write).
-    stashed_send: VecDeque<WorkCompletion>,
-    /// In-progress write: (wr_id, byte_len). Set when send is posted, cleared on completion.
-    write_pending: Option<(u64, usize)>,
+    _pd: Arc<ProtectionDomain>,
+    // RDMA teardown: QP+CQ (inside aqp) → CM ID → EventChannel
+    aqp: AsyncQp,
+    cm_id: CmId,
+    _event_channel: EventChannel,
 }
 
 // Safety: All interior types are Send-safe. The CmId/AsyncQp raw pointers
@@ -116,7 +112,7 @@ impl AsyncRdmaStream {
         let comp_ch = CompletionChannel::new(&ctx)?;
         let cq = CompletionQueue::with_comp_channel(ctx, 32, &comp_ch)?;
 
-        async_cm.create_qp_with_cq(&pd, &stream_qp_attr(), Some(&cq), Some(&cq))?;
+        let cmqp = async_cm.create_qp_with_cq(&pd, &stream_qp_attr(), Some(&cq), Some(&cq))?;
 
         let send_mr = pd.reg_mr_owned(vec![0u8; buf_size], AccessFlags::LOCAL_WRITE)?;
         let recv_mrs = [
@@ -126,26 +122,23 @@ impl AsyncRdmaStream {
 
         // Pre-post recv buffers before connect
         for (i, mr) in recv_mrs.iter().enumerate() {
-            post_recv_raw(async_cm.qp_raw(), mr, i as u64)?;
+            post_recv_raw(cmqp.as_raw(), mr, i as u64)?;
         }
 
         async_cm.connect(&ConnParam::default()).await?;
 
-        // Extract QP pointer AFTER the last await
-        let qp = async_cm.qp_raw();
-
         // Create async CQ AFTER connection is established
         let notifier = TokioCqNotifier::new(comp_ch.fd()).map_err(crate::Error::Verbs)?;
         let async_cq = AsyncCq::new(cq, comp_ch, Box::new(notifier));
-        let aqp = unsafe { AsyncQp::new(qp, async_cq) };
+        let aqp = AsyncQp::new(cmqp, async_cq);
 
         let (event_channel, cm_id) = async_cm.into_parts();
 
         Ok(Self {
-            _event_channel: event_channel,
-            cm_id,
-            _pd: pd,
             aqp,
+            cm_id,
+            _event_channel: event_channel,
+            _pd: pd,
             send_mr,
             recv_mrs,
             recv_pending: None,
@@ -192,6 +185,8 @@ impl AsyncRdmaStream {
 
 impl Drop for AsyncRdmaStream {
     fn drop(&mut self) {
+        // Disconnect before field drops handle teardown.
+        // Field drop order (aqp → cm_id → _event_channel) is correct.
         if let Err(e) = self.cm_id.disconnect() {
             tracing::error!("AsyncRdmaStream disconnect failed: {e}");
         }
@@ -213,7 +208,7 @@ impl AsyncRdmaStream {
         if copy_len < byte_len {
             self.recv_pending = Some((bidx, copy_len, byte_len));
         } else {
-            post_recv_raw(self.cm_id.qp_raw(), &self.recv_mrs[bidx], wc.wr_id())
+            post_recv_raw(self.aqp.as_raw(), &self.recv_mrs[bidx], wc.wr_id())
                 .map_err(io::Error::other)?;
         }
         Ok(copy_len)
@@ -244,7 +239,7 @@ impl futures_io::AsyncRead for AsyncRdmaStream {
                 this.recv_pending = Some((buf_idx, offset + copy_len, total_len));
             } else {
                 this.recv_pending = None;
-                post_recv_raw(this.cm_id.qp_raw(), &this.recv_mrs[buf_idx], buf_idx as u64)
+                post_recv_raw(this.aqp.as_raw(), &this.recv_mrs[buf_idx], buf_idx as u64)
                     .map_err(io::Error::other)?;
             }
             return Poll::Ready(Ok(copy_len));
@@ -415,7 +410,7 @@ impl AsyncRdmaListener {
         let comp_ch = CompletionChannel::new(&ctx)?;
         let cq = CompletionQueue::with_comp_channel(ctx, 32, &comp_ch)?;
 
-        conn_id.create_qp_with_cq(&pd, &stream_qp_attr(), Some(&cq), Some(&cq))?;
+        let cmqp = conn_id.create_qp_with_cq(&pd, &stream_qp_attr(), Some(&cq), Some(&cq))?;
 
         let send_mr = pd.reg_mr_owned(vec![0u8; self.buf_size], AccessFlags::LOCAL_WRITE)?;
         let recv_mrs = [
@@ -423,7 +418,7 @@ impl AsyncRdmaListener {
             pd.reg_mr_owned(vec![0u8; self.buf_size], AccessFlags::LOCAL_WRITE)?,
         ];
         for (i, mr) in recv_mrs.iter().enumerate() {
-            post_recv_raw(conn_id.qp_raw(), mr, i as u64)?;
+            post_recv_raw(cmqp.as_raw(), mr, i as u64)?;
         }
 
         // Phase 2: accept handshake + await ESTABLISHED + migrate
@@ -432,21 +427,18 @@ impl AsyncRdmaListener {
             .complete_accept(conn_id, &ConnParam::default())
             .await?;
 
-        // Extract QP pointer AFTER the await (conn_id moved into async_cm)
-        let qp = async_cm.qp_raw();
-
         // Create async CQ AFTER connection is established
         let notifier = TokioCqNotifier::new(comp_ch.fd()).map_err(crate::Error::Verbs)?;
         let async_cq = AsyncCq::new(cq, comp_ch, Box::new(notifier));
-        let aqp = unsafe { AsyncQp::new(qp, async_cq) };
+        let aqp = AsyncQp::new(cmqp, async_cq);
 
         let (event_channel, cm_id) = async_cm.into_parts();
 
         Ok(AsyncRdmaStream {
-            _event_channel: event_channel,
-            cm_id,
-            _pd: pd,
             aqp,
+            cm_id,
+            _event_channel: event_channel,
+            _pd: pd,
             send_mr,
             recv_mrs,
             recv_pending: None,

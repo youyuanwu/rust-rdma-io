@@ -16,6 +16,7 @@
 //! becomes one RDMA SEND; each `read()` consumes one RDMA RECV completion.
 //! Messages are bounded by the buffer size (default 64 KiB).
 
+use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -23,7 +24,7 @@ use std::sync::Arc;
 use rdma_io_sys::ibverbs::*;
 use rdma_io_sys::wrapper::*;
 
-use crate::cm::{CmEventType, CmId, ConnParam, EventChannel, PortSpace};
+use crate::cm::{CmEventType, CmId, CmQueuePair, ConnParam, EventChannel, PortSpace};
 use crate::cq::CompletionQueue;
 use crate::mr::{AccessFlags, OwnedMemoryRegion};
 use crate::pd::ProtectionDomain;
@@ -62,14 +63,17 @@ const SEND_WR_ID: u64 = 100;
 /// stream.write_all(b"hello").unwrap();
 /// ```
 pub struct RdmaStream {
-    _event_channel: EventChannel,
-    cm_id: CmId,
-    _pd: Arc<ProtectionDomain>,
-    cq: Arc<CompletionQueue>,
+    // Drop order matters! Fields drop in declaration order.
+    // MRs and buffers must be freed before QP/CQ/CM teardown.
+    recv_pending: VecDeque<(usize, usize, usize)>,
     send_mr: OwnedMemoryRegion,
     recv_mrs: [OwnedMemoryRegion; NUM_RECV_BUFS],
-    /// Buffered recv data: (buffer_index, offset, length).
-    recv_pending: Option<(usize, usize, usize)>,
+    _pd: Arc<ProtectionDomain>,
+    // RDMA teardown: QP → CQ → CM ID → EventChannel
+    cmqp: CmQueuePair,
+    cq: Arc<CompletionQueue>,
+    cm_id: CmId,
+    _event_channel: EventChannel,
 }
 
 impl RdmaStream {
@@ -95,7 +99,7 @@ impl RdmaStream {
         let pd = cm_id.alloc_pd()?;
         let cq = CompletionQueue::new(Arc::clone(&ctx), 32)?;
 
-        cm_id.create_qp_with_cq(&pd, &stream_qp_attr(), Some(&cq), Some(&cq))?;
+        let cmqp = cm_id.create_qp_with_cq(&pd, &stream_qp_attr(), Some(&cq), Some(&cq))?;
 
         let send_mr = pd.reg_mr_owned(vec![0u8; buf_size], AccessFlags::LOCAL_WRITE)?;
         let recv_mrs = [
@@ -104,13 +108,14 @@ impl RdmaStream {
         ];
 
         let mut stream = RdmaStream {
-            _event_channel: ch,
-            cm_id,
-            _pd: pd,
+            cmqp,
             cq,
+            cm_id,
+            _event_channel: ch,
+            _pd: pd,
             send_mr,
             recv_mrs,
-            recv_pending: None,
+            recv_pending: VecDeque::new(),
         };
 
         stream.post_recv(0)?;
@@ -128,6 +133,7 @@ impl RdmaStream {
         cm_id: CmId,
         pd: Arc<ProtectionDomain>,
         cq: Arc<CompletionQueue>,
+        cmqp: CmQueuePair,
         buf_size: usize,
     ) -> crate::Result<Self> {
         let send_mr = pd.reg_mr_owned(vec![0u8; buf_size], AccessFlags::LOCAL_WRITE)?;
@@ -137,13 +143,14 @@ impl RdmaStream {
         ];
 
         let mut stream = RdmaStream {
-            _event_channel: event_channel,
-            cm_id,
-            _pd: pd,
+            cmqp,
             cq,
+            cm_id,
+            _event_channel: event_channel,
+            _pd: pd,
             send_mr,
             recv_mrs,
-            recv_pending: None,
+            recv_pending: VecDeque::new(),
         };
 
         stream.post_recv(0)?;
@@ -166,7 +173,7 @@ impl RdmaStream {
             ..Default::default()
         };
         let mut bad_wr: *mut ibv_recv_wr = std::ptr::null_mut();
-        let qp = self.cm_id.qp_raw();
+        let qp = self.cmqp.as_raw();
         let ret = unsafe { rdma_wrap_ibv_post_recv(qp, &mut wr, &mut bad_wr) };
         if ret != 0 {
             return Err(crate::Error::Verbs(io::Error::from_raw_os_error(-ret)));
@@ -180,6 +187,7 @@ impl RdmaStream {
         let mut wc = [WorkCompletion::default(); 4];
         loop {
             let n = self.cq.poll(&mut wc)?;
+            let mut found: Option<WorkCompletion> = None;
             for wc_item in &wc[..n] {
                 if !wc_item.is_success() {
                     return Err(crate::Error::WorkCompletion {
@@ -188,15 +196,23 @@ impl RdmaStream {
                     });
                 }
                 if wc_item.wr_id() == expected_wr_id {
-                    return Ok(*wc_item);
-                }
-                // Buffer unexpected recv completions
-                let wr_id = wc_item.wr_id();
-                if wr_id < NUM_RECV_BUFS as u64 {
-                    self.recv_pending = Some((wr_id as usize, 0, wc_item.byte_len() as usize));
+                    found = Some(*wc_item);
+                } else {
+                    // Buffer unexpected recv completions
+                    let wr_id = wc_item.wr_id();
+                    if wr_id < NUM_RECV_BUFS as u64 {
+                        self.recv_pending.push_back((
+                            wr_id as usize,
+                            0,
+                            wc_item.byte_len() as usize,
+                        ));
+                    }
                 }
             }
-            std::thread::yield_now();
+            if let Some(wc_match) = found {
+                return Ok(wc_match);
+            }
+            std::thread::sleep(std::time::Duration::from_micros(10));
         }
     }
 
@@ -213,22 +229,22 @@ impl io::Read for RdmaStream {
         }
 
         // Return buffered recv data first
-        if let Some((buf_idx, offset, total_len)) = self.recv_pending {
+        if let Some((buf_idx, offset, total_len)) = self.recv_pending.front().copied() {
             let remaining = total_len - offset;
             let copy_len = remaining.min(buf.len());
             buf[..copy_len]
                 .copy_from_slice(&self.recv_mrs[buf_idx].as_slice()[offset..offset + copy_len]);
 
             if copy_len < remaining {
-                self.recv_pending = Some((buf_idx, offset + copy_len, total_len));
+                *self.recv_pending.front_mut().unwrap() = (buf_idx, offset + copy_len, total_len);
             } else {
-                self.recv_pending = None;
+                self.recv_pending.pop_front();
                 self.post_recv(buf_idx).map_err(io::Error::other)?;
             }
             return Ok(copy_len);
         }
 
-        // Poll CQ for a recv completion
+        // Poll CQ for a recv completion, buffer all completions from each batch
         let mut wc = [WorkCompletion::default(); 4];
         loop {
             let n = self.cq.poll(&mut wc).map_err(io::Error::other)?;
@@ -244,23 +260,28 @@ impl io::Read for RdmaStream {
                 }
                 let wr_id = wc_item.wr_id();
                 if wr_id < NUM_RECV_BUFS as u64 {
-                    let byte_len = wc_item.byte_len() as usize;
-                    if byte_len == 0 {
-                        return Ok(0);
-                    }
-                    let buf_idx = wr_id as usize;
-                    let copy_len = byte_len.min(buf.len());
-                    buf[..copy_len].copy_from_slice(&self.recv_mrs[buf_idx].as_slice()[..copy_len]);
-                    if copy_len < byte_len {
-                        self.recv_pending = Some((buf_idx, copy_len, byte_len));
-                    } else {
-                        self.post_recv(buf_idx).map_err(io::Error::other)?;
-                    }
-                    return Ok(copy_len);
+                    self.recv_pending
+                        .push_back((wr_id as usize, 0, wc_item.byte_len() as usize));
                 }
                 // Ignore send completions during read
             }
-            std::thread::yield_now();
+            // If we buffered any recv completions, return the first one
+            if let Some((buf_idx, _, total_len)) = self.recv_pending.front().copied() {
+                if total_len == 0 {
+                    self.recv_pending.pop_front();
+                    return Ok(0);
+                }
+                let copy_len = total_len.min(buf.len());
+                buf[..copy_len].copy_from_slice(&self.recv_mrs[buf_idx].as_slice()[..copy_len]);
+                if copy_len < total_len {
+                    *self.recv_pending.front_mut().unwrap() = (buf_idx, copy_len, total_len);
+                } else {
+                    self.recv_pending.pop_front();
+                    self.post_recv(buf_idx).map_err(io::Error::other)?;
+                }
+                return Ok(copy_len);
+            }
+            std::thread::sleep(std::time::Duration::from_micros(10));
         }
     }
 }
@@ -288,7 +309,7 @@ impl io::Write for RdmaStream {
             ..Default::default()
         };
         let mut bad_wr: *mut ibv_send_wr = std::ptr::null_mut();
-        let qp = self.cm_id.qp_raw();
+        let qp = self.cmqp.as_raw();
         let ret = unsafe { rdma_wrap_ibv_post_send(qp, &mut wr, &mut bad_wr) };
         if ret != 0 {
             return Err(io::Error::from_raw_os_error(-ret));
@@ -312,6 +333,8 @@ impl io::Write for RdmaStream {
 
 impl Drop for RdmaStream {
     fn drop(&mut self) {
+        // Disconnect before field drops handle teardown.
+        // Field drop order (cmqp → cq → cm_id → _event_channel) is correct.
         if let Err(e) = self.cm_id.disconnect() {
             tracing::error!("RdmaStream disconnect failed: {e}");
         }
@@ -323,8 +346,9 @@ impl Drop for RdmaStream {
 /// Binds to a local address and accepts incoming RDMA connections,
 /// returning an [`RdmaStream`] for each.
 pub struct RdmaListener {
-    event_channel: EventChannel,
+    // Field order = drop order. cm_id before event_channel.
     _cm_id: CmId,
+    event_channel: EventChannel,
     buf_size: usize,
 }
 
@@ -340,8 +364,8 @@ impl RdmaListener {
         let cm_id = CmId::new(&ch, PortSpace::Tcp)?;
         cm_id.listen(addr, 128)?;
         Ok(Self {
-            event_channel: ch,
             _cm_id: cm_id,
+            event_channel: ch,
             buf_size,
         })
     }
@@ -368,9 +392,9 @@ impl RdmaListener {
         let cq = CompletionQueue::new(Arc::clone(&ctx), 32)?;
         let conn_ch = EventChannel::new()?;
 
-        conn_id.create_qp_with_cq(&pd, &stream_qp_attr(), Some(&cq), Some(&cq))?;
+        let cmqp = conn_id.create_qp_with_cq(&pd, &stream_qp_attr(), Some(&cq), Some(&cq))?;
 
-        let stream = RdmaStream::from_accepted(conn_ch, conn_id, pd, cq, self.buf_size)?;
+        let stream = RdmaStream::from_accepted(conn_ch, conn_id, pd, cq, cmqp, self.buf_size)?;
 
         stream.cm_id.accept(&ConnParam::default())?;
         expect_event(&self.event_channel, CmEventType::Established)?.ack();

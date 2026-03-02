@@ -67,7 +67,8 @@ jobs:
         run: cargo clippy --workspace --all-targets --features tokio -- -D warnings
 
       - name: Test
-        run: cargo test -p rdma-io-tests
+        run: cargo test -p rdma-io-tests -- --nocapture
+        timeout-minutes: 5
 
       - name: Doc tests
         run: cargo test --doc --workspace --features tokio
@@ -93,7 +94,7 @@ jobs:
       - name: Configure and build rdma_rxe.ko
         run: |
           cmake -B build -DBUILD_RXE=ON
-          cmake --build build --target rxe
+          cmake --build build --target rxe --parallel
 
       - name: Load rdma_rxe and create device
         run: |
@@ -120,4 +121,5 @@ jobs:
         run: cargo build --workspace --features tokio
 
       - name: Test
-        run: cargo test -p rdma-io-tests
+        run: cargo test -p rdma-io-tests -- --nocapture
+        timeout-minutes: 5

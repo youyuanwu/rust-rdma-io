@@ -28,7 +28,7 @@ fn local_ip() -> String {
 }
 
 /// Test: async echo — client sends, server reads and echoes back.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn async_stream_echo() {
     let (bind_addr, connect_addr) = test_addrs();
 
@@ -65,7 +65,7 @@ async fn async_stream_echo() {
 }
 
 /// Test: multi-message — 5 round-trips of ping/pong.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn async_stream_multi_message() {
     let (bind_addr, connect_addr) = test_addrs();
 
@@ -104,7 +104,7 @@ async fn async_stream_multi_message() {
 }
 
 /// Test: large transfer — send 32 KiB in one write.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn async_stream_large_transfer() {
     let (bind_addr, connect_addr) = test_addrs();
 
@@ -159,7 +159,7 @@ async fn connected_pair() -> (AsyncRdmaStream, AsyncRdmaStream) {
 }
 
 /// Test: futures::io::AsyncReadExt / AsyncWriteExt echo via trait methods.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn async_stream_futures_io_echo() {
     let (mut server, mut client) = connected_pair().await;
 
@@ -192,7 +192,7 @@ async fn async_stream_futures_io_echo() {
 
 /// Test: tokio compat layer — use tokio::io::AsyncReadExt/AsyncWriteExt
 /// via FuturesAsyncReadCompatExt.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn async_stream_tokio_compat() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_util::compat::FuturesAsyncReadCompatExt;
@@ -220,7 +220,7 @@ async fn async_stream_tokio_compat() {
 }
 
 /// Test: tokio::io::copy through the compat layer.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn async_stream_tokio_io_copy() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_util::compat::FuturesAsyncReadCompatExt;

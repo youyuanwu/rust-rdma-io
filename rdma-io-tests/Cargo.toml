@@ -13,3 +13,6 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", 
 futures-io.workspace = true
 futures-util.workspace = true
 tokio-util.workspace = true
+tracing.workspace = true
+test-log.workspace = true
+tracing-subscriber.workspace = true
