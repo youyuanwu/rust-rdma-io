@@ -17,11 +17,11 @@ pub mod wr;
 
 #[cfg(feature = "tokio")]
 pub mod async_cm;
-#[cfg(any(feature = "tokio", feature = "smol"))]
+#[cfg(feature = "async")]
 pub mod async_cq;
-#[cfg(any(feature = "tokio", feature = "smol"))]
+#[cfg(feature = "async")]
 pub mod async_qp;
-#[cfg(feature = "tokio")]
+#[cfg(feature = "async")]
 pub mod async_stream;
 #[cfg(feature = "tokio")]
 pub mod tokio_notifier;

@@ -74,6 +74,43 @@ impl AsyncEventChannel {
         ev.ack();
         Ok(())
     }
+
+    /// Poll for a specific CM event type. Returns `Poll::Ready(Ok(()))` when
+    /// the expected event arrives and is acked, or `Poll::Pending` if not yet
+    /// ready. Suitable for use inside `poll_close` / `poll_*` trait methods.
+    pub(crate) fn poll_expect_event(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        ch: &EventChannel,
+        expected: CmEventType,
+    ) -> std::task::Poll<Result<()>> {
+        loop {
+            let mut guard = match self.async_fd.poll_read_ready(cx) {
+                std::task::Poll::Ready(Ok(g)) => g,
+                std::task::Poll::Ready(Err(e)) => {
+                    return std::task::Poll::Ready(Err(crate::Error::Verbs(e)));
+                }
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+            };
+            match ch.try_get_event() {
+                Ok(ev) => {
+                    let actual = ev.event_type();
+                    ev.ack();
+                    if actual != expected {
+                        return std::task::Poll::Ready(Err(crate::Error::InvalidArg(format!(
+                            "expected {expected:?}, got {actual:?}"
+                        ))));
+                    }
+                    return std::task::Poll::Ready(Ok(()));
+                }
+                Err(crate::Error::WouldBlock) => {
+                    guard.clear_ready();
+                    continue;
+                }
+                Err(e) => return std::task::Poll::Ready(Err(e)),
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -1,14 +1,15 @@
 [package]
 name = "rdma-io"
-version = "0.1.0"
+version = "0.0.1"
 edition.workspace = true
 license.workspace = true
 description = "Safe Rust API for RDMA (libibverbs + librdmacm)"
+readme = "../README.md"
 
 [features]
-default = []
-tokio = ["dep:tokio", "dep:futures-io"]
-smol = ["dep:async-io", "dep:futures-io"]
+default = ["tokio"]
+async = ["dep:futures-io"]
+tokio = ["async", "dep:tokio"]
 
 [dependencies]
 rdma-io-sys.workspace = true
@@ -19,4 +20,3 @@ tracing.workspace = true
 libc.workspace = true
 futures-io = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
-async-io = { workspace = true, optional = true }

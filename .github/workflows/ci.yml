@@ -68,7 +68,7 @@ jobs:
 
       - name: Test
         run: cargo test -p rdma-io-tests -- --nocapture
-        timeout-minutes: 5
+        timeout-minutes: 10
 
       - name: Doc tests
         run: cargo test --doc --workspace --features tokio
@@ -122,4 +122,4 @@ jobs:
 
       - name: Test
         run: cargo test -p rdma-io-tests -- --nocapture
-        timeout-minutes: 5
+        timeout-minutes: 10

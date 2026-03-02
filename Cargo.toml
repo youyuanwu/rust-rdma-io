@@ -7,7 +7,7 @@ package.license = "MIT"
 
 [workspace.dependencies]
 # Internal crates
-rdma-io-sys = { path = "rdma-io-sys" }
+rdma-io-sys = { path = "rdma-io-sys" , version = "0.0.1"}
 rdma-io = { path = "rdma-io" }
 
 # bnd ecosystem (path deps to sibling repo)
@@ -26,7 +26,6 @@ futures-io = "0.3"
 futures-util = { version = "0.3", features = ["io"] }
 tokio = { version = "1", features = ["net"] }
 tokio-util = { version = "0.7", features = ["compat"] }
-async-io = "2"
 
 # Build / codegen
 cc = "1"

@@ -333,11 +333,10 @@ impl io::Write for RdmaStream {
 
 impl Drop for RdmaStream {
     fn drop(&mut self) {
-        // Disconnect before field drops handle teardown.
-        // Field drop order (cmqp → cq → cm_id → _event_channel) is correct.
-        if let Err(e) = self.cm_id.disconnect() {
-            tracing::error!("RdmaStream disconnect failed: {e}");
-        }
+        // Do NOT call rdma_disconnect() here — it generates a DISCONNECTED
+        // CM event that nobody acks, causing rdma_destroy_id to block.
+        // rdma_destroy_id handles disconnect internally without user events.
+        // Use shutdown() for graceful disconnect before dropping.
     }
 }
 

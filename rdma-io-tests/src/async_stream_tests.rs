@@ -240,3 +240,63 @@ async fn async_stream_tokio_io_copy() {
 
     println!("async_stream_tokio_io_copy passed!");
 }
+
+/// Test: explicit shutdown() performs graceful disconnect (DREQ → DISCONNECTED).
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn async_stream_shutdown() {
+    let (bind_addr, connect_addr) = test_addrs();
+
+    let listener = AsyncRdmaListener::bind(&bind_addr).unwrap();
+    let server_handle = tokio::spawn(async move { listener.accept().await.unwrap() });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let mut client = AsyncRdmaStream::connect(&connect_addr).await.unwrap();
+    let mut server = server_handle.await.unwrap();
+
+    // Round-trip: client sends, server echoes, client reads.
+    let msg = b"shutdown test";
+    client.write(msg).await.unwrap();
+    let mut buf = [0u8; 256];
+    let n = server.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], msg);
+    server.write(&buf[..n]).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], msg);
+
+    // Client shutdown: drains send, sends DREQ, awaits DISCONNECTED.
+    client.shutdown().await.unwrap();
+
+    println!("async_stream_shutdown passed!");
+}
+
+/// Test: poll_close via futures AsyncWriteExt::close() performs graceful disconnect.
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn async_stream_poll_close() {
+    let (bind_addr, connect_addr) = test_addrs();
+
+    let listener = AsyncRdmaListener::bind(&bind_addr).unwrap();
+    let server_handle = tokio::spawn(async move { listener.accept().await.unwrap() });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let mut client = AsyncRdmaStream::connect(&connect_addr).await.unwrap();
+    let mut server = server_handle.await.unwrap();
+
+    // Round-trip: client sends, server echoes, client reads.
+    let msg = b"close test";
+    client.write(msg).await.unwrap();
+    let mut buf = [0u8; 256];
+    let n = server.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], msg);
+    server.write(&buf[..n]).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], msg);
+
+    // Close via futures_io::AsyncWrite::poll_close (through AsyncWriteExt).
+    futures_util::io::AsyncWriteExt::close(&mut client)
+        .await
+        .unwrap();
+
+    println!("async_stream_poll_close passed!");
+}

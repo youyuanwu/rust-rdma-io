@@ -77,6 +77,9 @@ pub struct AsyncRdmaStream {
     stashed_recv: VecDeque<WorkCompletion>,
     stashed_send: VecDeque<WorkCompletion>,
     write_pending: Option<(u64, usize)>,
+    /// Lazily created when poll_close begins; awaits DISCONNECTED event.
+    close_ch: Option<crate::async_cm::AsyncEventChannel>,
+    disconnected: bool,
     send_mr: OwnedMemoryRegion,
     recv_mrs: [OwnedMemoryRegion; NUM_RECV_BUFS],
     _pd: Arc<ProtectionDomain>,
@@ -147,6 +150,8 @@ impl AsyncRdmaStream {
             stashed_recv: VecDeque::new(),
             stashed_send: VecDeque::new(),
             write_pending: None,
+            close_ch: None,
+            disconnected: false,
         })
     }
 
@@ -178,18 +183,20 @@ impl AsyncRdmaStream {
     }
 
     /// Disconnect the stream gracefully.
-    pub fn shutdown(&self) -> crate::Result<()> {
-        self.cm_id.disconnect()
+    ///
+    /// Drains any pending send completion, disconnects, and awaits the
+    /// `DISCONNECTED` event from the peer (analogous to TCP FIN/FIN-ACK).
+    pub async fn shutdown(&mut self) -> io::Result<()> {
+        std::future::poll_fn(|cx| Pin::new(&mut *self).poll_close(cx)).await
     }
 }
 
 impl Drop for AsyncRdmaStream {
     fn drop(&mut self) {
-        // Disconnect before field drops handle teardown.
-        // Field drop order (aqp → cm_id → _event_channel) is correct.
-        if let Err(e) = self.cm_id.disconnect() {
-            tracing::error!("AsyncRdmaStream disconnect failed: {e}");
-        }
+        // Do NOT call rdma_disconnect() here — it generates a DISCONNECTED
+        // CM event that nobody acks, causing rdma_destroy_id to block.
+        // rdma_destroy_id handles disconnect internally without user events.
+        // Use shutdown()/poll_close() for graceful disconnect before dropping.
     }
 }
 
@@ -365,12 +372,77 @@ impl futures_io::AsyncWrite for AsyncRdmaStream {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.get_mut()
-            .cm_id
-            .disconnect()
-            .map_err(io::Error::other)?;
-        Poll::Ready(Ok(()))
+    /// Drains pending send completion, disconnects, and awaits the peer's
+    /// DISCONNECTED event for a fully graceful close.
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+
+        // Phase 1: Drain pending send completion before disconnecting.
+        if let Some((wr_id, _)) = this.write_pending {
+            // Check stashed send completions first.
+            while let Some(wc) = this.stashed_send.pop_front() {
+                if wc.wr_id() == wr_id {
+                    this.write_pending = None;
+                    break;
+                }
+            }
+            // Poll CQ if still pending.
+            if this.write_pending.is_some() {
+                let mut wc_buf = [WorkCompletion::default(); 4];
+                loop {
+                    let n = match this.aqp.async_cq().poll_completions(
+                        cx,
+                        &mut this.cq_state,
+                        &mut wc_buf,
+                    ) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(Err(e)) => {
+                            this.write_pending = None;
+                            return Poll::Ready(Err(io::Error::other(e)));
+                        }
+                        Poll::Ready(Ok(n)) => n,
+                    };
+                    let mut found = false;
+                    for wc_item in &wc_buf[..n] {
+                        if wc_item.wr_id() == wr_id {
+                            found = true;
+                        }
+                    }
+                    if found {
+                        this.write_pending = None;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Phase 2: Send DREQ and create async channel for event polling.
+        if this.close_ch.is_none() {
+            let async_ch = crate::async_cm::AsyncEventChannel::new(&this._event_channel)
+                .map_err(io::Error::other)?;
+            this.cm_id.disconnect().map_err(io::Error::other)?;
+            this.close_ch = Some(async_ch);
+        }
+
+        // Phase 3: Await DISCONNECTED event from peer.
+        let ch = this.close_ch.as_ref().unwrap();
+        match ch.poll_expect_event(
+            cx,
+            &this._event_channel,
+            crate::cm::CmEventType::Disconnected,
+        ) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(())) => {
+                this.close_ch = None;
+                this.disconnected = true;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => {
+                this.close_ch = None;
+                this.disconnected = true;
+                Poll::Ready(Err(io::Error::other(e)))
+            }
+        }
     }
 }
 
@@ -447,6 +519,8 @@ impl AsyncRdmaListener {
             stashed_recv: VecDeque::new(),
             stashed_send: VecDeque::new(),
             write_pending: None,
+            close_ch: None,
+            disconnected: false,
         })
     }
 }
