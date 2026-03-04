@@ -1,0 +1,17 @@
+[package]
+name = "rdma-io-tonic"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+description = "Tonic gRPC transport over RDMA"
+readme = "../README.md"
+
+[dependencies]
+rdma-io = { workspace = true, features = ["tokio"] }
+tonic = { version = "0.14", default-features = false, features = ["server", "channel"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower-service = "0.3"
+http = "1"
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures-util = { workspace = true }

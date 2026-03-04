@@ -431,6 +431,24 @@ impl CmId {
     pub fn migrate(&self, new_channel: &EventChannel) -> Result<()> {
         from_ret_errno(unsafe { rdma_migrate_id(self.inner, new_channel.as_raw()) })
     }
+
+    /// Get the peer's socket address (remote end of the connection).
+    ///
+    /// Returns `None` if the address is not available (e.g., not yet connected).
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        // rdma_get_peer_addr is an inline function: &id->route.addr.dst_addr
+        let sa = unsafe { &(*self.inner).route.addr.rdma_addr__anon_1.dst_addr };
+        unsafe { sockaddr_to_std(sa as *const _ as *const _) }
+    }
+
+    /// Get the local socket address.
+    ///
+    /// Returns `None` if the address is not available.
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        // rdma_get_local_addr is an inline function: &id->route.addr.src_addr
+        let sa = unsafe { &(*self.inner).route.addr.rdma_addr__anon_0.src_addr };
+        unsafe { sockaddr_to_std(sa as *const _ as *const _) }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -550,4 +568,34 @@ fn sockaddr_args(
         None => std::ptr::null_mut(),
     };
     (src_ptr, dst_sa)
+}
+
+/// Convert a raw `sockaddr*` to a `std::net::SocketAddr`.
+///
+/// # Safety
+/// The pointer must be valid and point to a `sockaddr_in` or `sockaddr_in6`.
+unsafe fn sockaddr_to_std(
+    sa: *const bnd_linux::libc::posix::socket::sockaddr,
+) -> Option<SocketAddr> {
+    unsafe {
+        let family = (*sa).sa_family;
+        if family == AF_INET {
+            let sin = &*(sa as *const bnd_linux::libc::posix::inet::sockaddr_in);
+            let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+            let port = u16::from_be(sin.sin_port);
+            Some(SocketAddr::V4(std::net::SocketAddrV4::new(ip, port)))
+        } else if family == AF_INET6 {
+            let sin6 = &*(sa as *const bnd_linux::libc::posix::inet::sockaddr_in6);
+            let ip = std::net::Ipv6Addr::from(sin6.sin6_addr.__in6_u.__u6_addr8);
+            let port = u16::from_be(sin6.sin6_port);
+            Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+                ip,
+                port,
+                sin6.sin6_flowinfo,
+                sin6.sin6_scope_id,
+            )))
+        } else {
+            None
+        }
+    }
 }

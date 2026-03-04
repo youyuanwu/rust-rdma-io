@@ -20,3 +20,5 @@ mod safe_api_tests;
 mod stream_tests;
 #[cfg(test)]
 mod sys_tests;
+#[cfg(test)]
+mod tonic_tests;

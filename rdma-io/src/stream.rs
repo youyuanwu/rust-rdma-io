@@ -333,10 +333,10 @@ impl io::Write for RdmaStream {
 
 impl Drop for RdmaStream {
     fn drop(&mut self) {
-        // Do NOT call rdma_disconnect() here — it generates a DISCONNECTED
-        // CM event that nobody acks, causing rdma_destroy_id to block.
-        // rdma_destroy_id handles disconnect internally without user events.
-        // Use shutdown() for graceful disconnect before dropping.
+        // Best-effort disconnect so the peer sees DREQ promptly.
+        if let Err(e) = self.cm_id.disconnect() {
+            tracing::trace!("RdmaStream::drop disconnect failed: {e}");
+        }
     }
 }
 

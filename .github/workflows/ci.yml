@@ -27,6 +27,8 @@ jobs:
             cmake \
             libclang-dev
 
+      - uses: taiki-e/install-action@protoc
+
       - name: Install kernel extra modules and load siw
         run: |
           KVER=$(uname -r)
@@ -90,6 +92,8 @@ jobs:
             cmake \
             libclang-dev \
             linux-headers-$(uname -r)
+
+      - uses: taiki-e/install-action@protoc
 
       - name: Configure and build rdma_rxe.ko
         run: |

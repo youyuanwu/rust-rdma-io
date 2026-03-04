@@ -189,14 +189,27 @@ impl AsyncRdmaStream {
     pub async fn shutdown(&mut self) -> io::Result<()> {
         std::future::poll_fn(|cx| Pin::new(&mut *self).poll_close(cx)).await
     }
+
+    /// Get the peer's socket address (remote end of the connection).
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        self.cm_id.peer_addr()
+    }
+
+    /// Get the local socket address.
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        self.cm_id.local_addr()
+    }
 }
 
 impl Drop for AsyncRdmaStream {
     fn drop(&mut self) {
-        // Do NOT call rdma_disconnect() here — it generates a DISCONNECTED
-        // CM event that nobody acks, causing rdma_destroy_id to block.
-        // rdma_destroy_id handles disconnect internally without user events.
-        // Use shutdown()/poll_close() for graceful disconnect before dropping.
+        // Best-effort disconnect so the peer sees DREQ promptly.
+        // Skip if poll_close/shutdown already disconnected gracefully.
+        if !self.disconnected
+            && let Err(e) = self.cm_id.disconnect()
+        {
+            tracing::trace!("AsyncRdmaStream::drop disconnect failed: {e}");
+        }
     }
 }
 
@@ -269,7 +282,7 @@ impl futures_io::AsyncRead for AsyncRdmaStream {
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(io::Error::other(e))),
                 Poll::Ready(Ok(n)) => n,
             };
-            for wc_item in &wc_buf[..n] {
+            for (i, wc_item) in wc_buf[..n].iter().enumerate() {
                 if !wc_item.is_success() {
                     if wc_item.status_raw() == rdma_io_sys::ibverbs::IBV_WC_WR_FLUSH_ERR {
                         return Poll::Ready(Ok(0)); // EOF
@@ -280,6 +293,16 @@ impl futures_io::AsyncRead for AsyncRdmaStream {
                     ))));
                 }
                 if wc_item.wr_id() < NUM_RECV_BUFS as u64 {
+                    // Stash remaining completions before returning
+                    for remaining in &wc_buf[i + 1..n] {
+                        if remaining.is_success() {
+                            if remaining.wr_id() < NUM_RECV_BUFS as u64 {
+                                this.stashed_recv.push_back(*remaining);
+                            } else {
+                                this.stashed_send.push_back(*remaining);
+                            }
+                        }
+                    }
                     return Poll::Ready(this.process_recv_wc(wc_item, buf));
                 }
                 // Stash send completions for later poll_write
@@ -347,7 +370,7 @@ impl futures_io::AsyncWrite for AsyncRdmaStream {
                 }
                 Poll::Ready(Ok(n)) => n,
             };
-            for wc_item in &wc_buf[..n] {
+            for (i, wc_item) in wc_buf[..n].iter().enumerate() {
                 if !wc_item.is_success() {
                     this.write_pending = None;
                     return Poll::Ready(Err(io::Error::other(format!(
@@ -356,6 +379,16 @@ impl futures_io::AsyncWrite for AsyncRdmaStream {
                     ))));
                 }
                 if wc_item.wr_id() == wr_id {
+                    // Stash remaining completions before returning
+                    for remaining in &wc_buf[i + 1..n] {
+                        if remaining.is_success() {
+                            if remaining.wr_id() < NUM_RECV_BUFS as u64 {
+                                this.stashed_recv.push_back(*remaining);
+                            } else {
+                                this.stashed_send.push_back(*remaining);
+                            }
+                        }
+                    }
                     this.write_pending = None;
                     return Poll::Ready(Ok(len));
                 }

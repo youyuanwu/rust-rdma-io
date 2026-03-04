@@ -25,17 +25,24 @@ const ACK_BATCH_SIZE: u32 = 16;
 ///
 /// Each runtime provides an implementation that registers the
 /// comp_channel fd with its reactor and awaits readiness.
+///
+/// # Edge-triggered semantics
+///
+/// Implementations use edge-triggered epoll (EPOLLET). Callers must
+/// drain ALL events from the fd after readiness is signaled to avoid
+/// lost notifications.
 pub trait CqNotifier: Send + Sync {
     /// Wait until the comp_channel fd is readable.
     ///
     /// Returns when the fd has data (a CQ event notification).
-    /// The caller must then consume the event and re-arm.
+    /// The caller must then drain all events and re-arm.
     fn readable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>>;
 
     /// Poll-based readiness check for the comp_channel fd.
     ///
-    /// Used by `futures::io::AsyncRead`/`AsyncWrite` trait implementations
-    /// which require poll-based (non-async) interfaces.
+    /// Returns `Ready(Ok(()))` when the fd is (or was recently) readable.
+    /// The caller must drain all events from the comp_channel to avoid
+    /// lost wakeups with edge-triggered epoll.
     fn poll_readable(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
 }
 
@@ -109,9 +116,8 @@ impl AsyncCq {
                 .await
                 .map_err(crate::Error::Verbs)?;
 
-            // 4. Consume the CQ event
-            let _ = self.channel.get_cq_event()?;
-            self.ack_event();
+            // 4. Drain all CQ events (EPOLLET safety)
+            self.drain_channel_events()?;
 
             // 5. Loop back — poll will find completions now
         }
@@ -143,6 +149,12 @@ impl AsyncCq {
     ///
     /// External `state` tracks where we are in the arm → drain → wait loop.
     /// Used by `AsyncRead`/`AsyncWrite` trait impls that need `Poll`-based APIs.
+    ///
+    /// # Edge-triggered safety
+    ///
+    /// After `poll_readable` returns Ready (which clears tokio's readiness
+    /// flag), we drain ALL events from the comp_channel. This ensures
+    /// EPOLLET correctly fires for the next new event.
     pub fn poll_completions(
         &self,
         cx: &mut Context<'_>,
@@ -155,13 +167,11 @@ impl AsyncCq {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(crate::Error::Verbs(e))),
                     Poll::Ready(Ok(())) => {
-                        // Consume the CQ event (WouldBlock = spurious wakeup, loop back)
-                        match self.channel.get_cq_event() {
-                            Ok(_) => self.ack_event(),
-                            Err(crate::Error::Verbs(ref e))
-                                if e.kind() == io::ErrorKind::WouldBlock => {}
-                            Err(e) => return Poll::Ready(Err(e)),
-                        }
+                        // Drain ALL comp_channel events to stay safe with EPOLLET.
+                        // poll_readable cleared tokio's readiness flag, so we must
+                        // empty the fd completely — any leftover event won't trigger
+                        // a new edge and would be lost.
+                        self.drain_channel_events()?;
                         *state = CqPollState::Idle;
                     }
                 }
@@ -182,14 +192,26 @@ impl AsyncCq {
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(crate::Error::Verbs(e))),
                 Poll::Ready(Ok(())) => {
-                    match self.channel.get_cq_event() {
-                        Ok(_) => self.ack_event(),
-                        Err(crate::Error::Verbs(ref e))
-                            if e.kind() == io::ErrorKind::WouldBlock => {}
-                        Err(e) => return Poll::Ready(Err(e)),
-                    }
+                    self.drain_channel_events()?;
                     // Loop back to arm+drain
                 }
+            }
+        }
+    }
+
+    /// Drain all pending events from the comp_channel.
+    ///
+    /// Required after `poll_readable` (which clears tokio's edge-triggered
+    /// readiness flag) to ensure the fd is truly empty. Any leftover event
+    /// would not trigger a new EPOLLET notification.
+    fn drain_channel_events(&self) -> Result<()> {
+        loop {
+            match self.channel.get_cq_event() {
+                Ok(_) => self.ack_event(),
+                Err(crate::Error::Verbs(ref e)) if e.kind() == io::ErrorKind::WouldBlock => {
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
             }
         }
     }

@@ -9,6 +9,10 @@ publish = false
 [dependencies]
 rdma-io-sys.workspace = true
 rdma-io = { workspace = true, features = ["tokio"] }
+rdma-io-tonic = { path = "../rdma-io-tonic" }
+tonic = { version = "0.14" }
+tonic-prost = "0.14"
+prost = "0.14"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "time"] }
 futures-io.workspace = true
 futures-util.workspace = true
@@ -16,3 +20,6 @@ tokio-util.workspace = true
 tracing.workspace = true
 test-log.workspace = true
 tracing-subscriber.workspace = true
+
+[build-dependencies]
+tonic-prost-build = "0.14"
