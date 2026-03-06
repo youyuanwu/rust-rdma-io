@@ -4,6 +4,7 @@ on:
   push:
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -69,7 +70,11 @@ jobs:
         run: cargo clippy --workspace --all-targets --features tokio -- -D warnings
 
       - name: Test
-        run: cargo test -p rdma-io-tests -- --nocapture
+        run: |
+          for i in $(seq 1 5); do
+            echo "=== Test run $i/5 ==="
+            cargo test -p rdma-io-tests -- --nocapture
+          done
         timeout-minutes: 30
 
       - name: Doc tests
@@ -133,5 +138,9 @@ jobs:
       #   timeout-minutes: 10
 
       - name: Test
-        run: cargo test -p rdma-io-tests -- --nocapture
+        run: |
+          for i in $(seq 1 5); do
+            echo "=== Test run $i/5 ==="
+            cargo test -p rdma-io-tests -- --nocapture
+          done
         timeout-minutes: 30
