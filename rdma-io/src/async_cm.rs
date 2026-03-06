@@ -78,6 +78,7 @@ impl AsyncEventChannel {
     /// Poll for a specific CM event type. Returns `Poll::Ready(Ok(()))` when
     /// the expected event arrives and is acked, or `Poll::Pending` if not yet
     /// ready. Suitable for use inside `poll_close` / `poll_*` trait methods.
+    #[allow(dead_code)]
     pub(crate) fn poll_expect_event(
         &self,
         cx: &mut std::task::Context<'_>,

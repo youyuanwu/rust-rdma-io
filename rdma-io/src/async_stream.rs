@@ -17,11 +17,13 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::os::unix::io::RawFd;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures_io::{AsyncRead, AsyncWrite};
+use tokio::io::unix::AsyncFd;
 
 use crate::async_cm::{AsyncCmId, AsyncCmListener};
 use crate::async_cq::{AsyncCq, CqPollState};
@@ -80,8 +82,6 @@ pub struct AsyncRdmaStream {
     recv_cq_state: CqPollState,
     /// In-flight send: (len,). None if send slot is free.
     write_pending: Option<usize>,
-    /// Lazily created when poll_close begins; awaits DISCONNECTED event.
-    close_ch: Option<crate::async_cm::AsyncEventChannel>,
     disconnected: bool,
     /// Set when poll_read sees a flush error (QP entered ERROR state).
     /// Once set, poll_read always returns Ok(0) — the QP will never
@@ -94,8 +94,12 @@ pub struct AsyncRdmaStream {
     cmqp: crate::cm::CmQueuePair,
     send_cq: AsyncCq,
     recv_cq: AsyncCq,
+    /// Async fd for CM event channel — registered alongside CQ fds so
+    /// disconnect events wake poll_read/poll_write even when no CQ
+    /// completions arrive (critical for rxe where CQ flush is unreliable).
+    cm_async_fd: AsyncFd<RawFd>,
     cm_id: CmId,
-    _event_channel: EventChannel,
+    event_channel: EventChannel,
 }
 
 // Safety: All interior types are Send-safe. The CmId raw pointers
@@ -157,12 +161,15 @@ impl AsyncRdmaStream {
 
         let (event_channel, cm_id) = async_cm.into_parts();
 
+        let cm_async_fd = AsyncFd::new(event_channel.fd()).map_err(crate::Error::Verbs)?;
+
         Ok(Self {
             cmqp,
             send_cq,
             recv_cq,
+            cm_async_fd,
             cm_id,
-            _event_channel: event_channel,
+            event_channel,
             _pd: pd,
             send_mr,
             recv_mrs,
@@ -170,7 +177,6 @@ impl AsyncRdmaStream {
             send_cq_state: CqPollState::default(),
             recv_cq_state: CqPollState::default(),
             write_pending: None,
-            close_ch: None,
             disconnected: false,
             read_eof: false,
         })
@@ -266,7 +272,7 @@ impl AsyncRdmaStream {
             return true;
         }
         // Check CM event channel for DISCONNECTED (non-blocking).
-        match self._event_channel.try_get_event() {
+        match self.event_channel.try_get_event() {
             Ok(ev) => {
                 let etype = ev.event_type();
                 ev.ack();
@@ -290,6 +296,34 @@ impl AsyncRdmaStream {
                 // Event channel error — connection is dead.
                 self.read_eof = true;
                 true
+            }
+        }
+    }
+
+    /// Register the task waker on the CM event channel fd.
+    ///
+    /// This ensures that disconnect events (DREQ → DISCONNECTED) wake up
+    /// poll_read/poll_write even when the CQ fd never becomes readable.
+    /// Critical for rxe where CQ flush completions are unreliable.
+    ///
+    /// If the CM fd is already readable, drains readiness and calls
+    /// `check_disconnect()`. May set `read_eof` as a side effect.
+    fn register_cm_waker(&mut self, cx: &mut Context<'_>) {
+        loop {
+            match self.cm_async_fd.poll_read_ready(cx) {
+                Poll::Ready(Ok(mut guard)) => {
+                    guard.clear_ready();
+                    if self.check_disconnect() {
+                        return;
+                    }
+                    // Spurious readiness or non-disconnect event consumed;
+                    // loop to re-register the waker.
+                }
+                Poll::Pending => return, // waker registered
+                Poll::Ready(Err(_)) => {
+                    self.read_eof = true;
+                    return;
+                }
             }
         }
     }
@@ -333,10 +367,10 @@ impl futures_io::AsyncRead for AsyncRdmaStream {
                 .poll_completions(cx, &mut this.recv_cq_state, &mut wc)
             {
                 Poll::Pending => {
-                    // CQ notification may be lost (EPOLLET race) or flush
-                    // completions may not arrive (rxe). Check CM events and
-                    // QP state as fallback.
-                    if this.check_disconnect() {
+                    // Register waker on CM event channel fd so disconnect
+                    // events wake this task even if CQ fd never triggers.
+                    this.register_cm_waker(cx);
+                    if this.read_eof {
                         return Poll::Ready(Ok(0)); // EOF
                     }
                     return Poll::Pending;
@@ -404,10 +438,10 @@ impl futures_io::AsyncWrite for AsyncRdmaStream {
                 .poll_completions(cx, &mut this.send_cq_state, &mut wc)
             {
                 Poll::Pending => {
-                    // CQ notification may be lost (EPOLLET race) or QP may
-                    // not have transitioned yet (rxe). Check CM events and
-                    // QP state as fallback.
-                    if this.check_disconnect() {
+                    // Register waker on CM event channel fd so disconnect
+                    // events wake this task even if CQ fd never triggers.
+                    this.register_cm_waker(cx);
+                    if this.read_eof {
                         this.write_pending = None;
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::BrokenPipe,
@@ -464,7 +498,8 @@ impl futures_io::AsyncWrite for AsyncRdmaStream {
                         .poll_completions(cx, &mut this.send_cq_state, &mut wc_buf)
                     {
                         Poll::Pending => {
-                            if this.check_disconnect() {
+                            this.register_cm_waker(cx);
+                            if this.read_eof {
                                 this.write_pending = None;
                                 this.disconnected = true;
                                 return Poll::Ready(Ok(()));
@@ -484,17 +519,16 @@ impl futures_io::AsyncWrite for AsyncRdmaStream {
             }
         }
 
-        // Phase 2: Send DREQ and create async channel for event polling.
-        // Note: check_disconnect() in Phase 1 or poll_read/poll_write may
-        // have already consumed the DISCONNECTED event and set read_eof.
+        // Phase 2: Send DREQ.
+        // Note: register_cm_waker/check_disconnect in Phase 1 or
+        // poll_read/poll_write may have already consumed the DISCONNECTED
+        // event and set read_eof.
         if this.read_eof {
             this.write_pending = None;
             this.disconnected = true;
             return Poll::Ready(Ok(()));
         }
-        if this.close_ch.is_none() {
-            let async_ch = crate::async_cm::AsyncEventChannel::new(&this._event_channel)
-                .map_err(io::Error::other)?;
+        if !this.disconnected {
             // disconnect() may fail if the connection is already being torn
             // down. Check CM events / QP state to distinguish real errors.
             if let Err(e) = this.cm_id.disconnect() {
@@ -504,37 +538,43 @@ impl futures_io::AsyncWrite for AsyncRdmaStream {
                 }
                 return Poll::Ready(Err(io::Error::other(e)));
             }
-            this.close_ch = Some(async_ch);
+            this.disconnected = true;
         }
 
         // Phase 3: Await DISCONNECTED event from peer.
-        let ch = this.close_ch.as_ref().unwrap();
-        match ch.poll_expect_event(
-            cx,
-            &this._event_channel,
-            crate::cm::CmEventType::Disconnected,
-        ) {
-            Poll::Pending => {
-                // The DISCONNECTED event may never arrive (peer crashed,
-                // no DREP for our DREQ). Check QP state as fallback.
-                // Don't use check_disconnect() here — it would consume
-                // the event that poll_expect_event is waiting for.
-                if is_qp_dead(this.cmqp.as_raw()) {
-                    this.close_ch = None;
-                    this.disconnected = true;
+        // Uses the persistent cm_async_fd — same fd as register_cm_waker.
+        loop {
+            let mut guard = match this.cm_async_fd.poll_read_ready(cx) {
+                Poll::Ready(Ok(g)) => g,
+                Poll::Ready(Err(e)) => {
+                    return Poll::Ready(Err(io::Error::other(e)));
+                }
+                Poll::Pending => {
+                    // DISCONNECTED may never arrive (peer crashed, no DREP).
+                    // Check QP state as fallback.
+                    if is_qp_dead(this.cmqp.as_raw()) {
+                        return Poll::Ready(Ok(()));
+                    }
+                    return Poll::Pending;
+                }
+            };
+            match this.event_channel.try_get_event() {
+                Ok(ev) => {
+                    let etype = ev.event_type();
+                    ev.ack();
+                    if etype == crate::cm::CmEventType::Disconnected {
+                        return Poll::Ready(Ok(()));
+                    }
+                    // Unexpected event — treat as disconnect.
                     return Poll::Ready(Ok(()));
                 }
-                Poll::Pending
-            }
-            Poll::Ready(Ok(())) => {
-                this.close_ch = None;
-                this.disconnected = true;
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Err(e)) => {
-                this.close_ch = None;
-                this.disconnected = true;
-                Poll::Ready(Err(io::Error::other(e)))
+                Err(crate::Error::WouldBlock) => {
+                    guard.clear_ready();
+                    continue;
+                }
+                Err(e) => {
+                    return Poll::Ready(Err(io::Error::other(e)));
+                }
             }
         }
     }
@@ -613,12 +653,15 @@ impl AsyncRdmaListener {
 
         let (event_channel, cm_id) = async_cm.into_parts();
 
+        let cm_async_fd = AsyncFd::new(event_channel.fd()).map_err(crate::Error::Verbs)?;
+
         Ok(AsyncRdmaStream {
             cmqp,
             send_cq,
             recv_cq,
+            cm_async_fd,
             cm_id,
-            _event_channel: event_channel,
+            event_channel,
             _pd: pd,
             send_mr,
             recv_mrs,
@@ -626,7 +669,6 @@ impl AsyncRdmaListener {
             send_cq_state: CqPollState::default(),
             recv_cq_state: CqPollState::default(),
             write_pending: None,
-            close_ch: None,
             disconnected: false,
             read_eof: false,
         })

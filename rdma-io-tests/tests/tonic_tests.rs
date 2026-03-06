@@ -7,6 +7,7 @@
 //! reload or when stale kernel resources remain from forcefully killed
 //! processes. The test includes retry logic to tolerate transient failures.
 
+use std::pin::Pin;
 use std::time::Duration;
 
 use rdma_io::async_stream::AsyncRdmaListener;
@@ -15,15 +16,15 @@ use rdma_io_tonic::{RdmaConnector, RdmaIncoming};
 use greeter::greeter_client::GreeterClient;
 use greeter::greeter_server::{Greeter, GreeterServer};
 use greeter::{HelloReply, HelloRequest};
-use tonic::transport::{Endpoint, Server};
-use tonic::{Request, Response, Status};
+use tokio_stream::{Stream, StreamExt};
+use tonic::transport::{Channel, Endpoint, Server};
+use tonic::{Request, Response, Status, Streaming};
 
 pub mod greeter {
     tonic::include_proto!("greeter");
 }
 
 fn test_addrs() -> (std::net::SocketAddr, std::net::SocketAddr) {
-    // Bind to port 0 to let the OS pick a free port, then extract it.
     let sock = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
     let port = sock.local_addr().unwrap().port();
     drop(sock);
@@ -49,26 +50,77 @@ impl Greeter for MyGreeter {
         request: Request<HelloRequest>,
     ) -> Result<Response<HelloReply>, Status> {
         let name = request.into_inner().name;
-        let reply = HelloReply {
+        Ok(Response::new(HelloReply {
             message: format!("Hello {}!", name),
-        };
-        Ok(Response::new(reply))
+        }))
+    }
+
+    type ServerStreamStream =
+        Pin<Box<dyn Stream<Item = Result<HelloReply, Status>> + Send + 'static>>;
+
+    async fn server_stream(
+        &self,
+        request: Request<HelloRequest>,
+    ) -> Result<Response<Self::ServerStreamStream>, Status> {
+        let name = request.into_inner().name;
+        let stream = tokio_stream::iter(0..5).map(move |i| {
+            Ok(HelloReply {
+                message: format!("{name}-{i}"),
+            })
+        });
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn client_stream(
+        &self,
+        request: Request<Streaming<HelloRequest>>,
+    ) -> Result<Response<HelloReply>, Status> {
+        let mut stream = request.into_inner();
+        let mut names = Vec::new();
+        while let Some(req) = stream.next().await {
+            names.push(req?.name);
+        }
+        Ok(Response::new(HelloReply {
+            message: format!("Hello {}!", names.join(", ")),
+        }))
+    }
+
+    type BidiStreamStream =
+        Pin<Box<dyn Stream<Item = Result<HelloReply, Status>> + Send + 'static>>;
+
+    async fn bidi_stream(
+        &self,
+        request: Request<Streaming<HelloRequest>>,
+    ) -> Result<Response<Self::BidiStreamStream>, Status> {
+        let mut stream = request.into_inner();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        tokio::spawn(async move {
+            while let Some(Ok(req)) = stream.next().await {
+                let reply = HelloReply {
+                    message: format!("echo: {}", req.name),
+                };
+                if tx.send(Ok(reply)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        )))
     }
 }
 
-/// Test: tonic Greeter service over RDMA — server uses RdmaIncoming, client uses RdmaConnector.
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
-async fn tonic_greeter_over_rdma() {
+/// Start a tonic server over RDMA and return (client, shutdown_tx, server_handle).
+async fn start_server_and_connect() -> (
+    GreeterClient<Channel>,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
     let (bind_addr, connect_addr) = test_addrs();
-
-    // Start RDMA listener and wrap as tonic incoming stream
     let listener = AsyncRdmaListener::bind(&bind_addr).unwrap();
     let incoming = RdmaIncoming::new(listener);
 
-    // Shutdown signal
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-
-    // Spawn tonic server with graceful shutdown
     let server_handle = tokio::spawn(async move {
         Server::builder()
             .add_service(GreeterServer::new(MyGreeter))
@@ -79,12 +131,11 @@ async fn tonic_greeter_over_rdma() {
             .unwrap();
     });
 
-    // Give server time to start listening
+    tracing::info!("Server listening on {bind_addr}");
+
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Connect with retry — siw can reject connections transiently after
-    // module reload or when stale resources linger in the kernel.
-    tracing::info!("Client connecting to server at {connect_addr}...");
+    tracing::info!("Client connecting to {connect_addr}...");
     let connector = RdmaConnector::default();
     let uri = format!("http://{}:{}", connect_addr.ip(), connect_addr.port());
     let mut channel = None;
@@ -105,11 +156,17 @@ async fn tonic_greeter_over_rdma() {
             Err(e) => panic!("RDMA connect failed after {attempt} attempts: {e}"),
         }
     }
-    let channel = channel.unwrap();
-    let mut client = GreeterClient::new(channel);
+    let client = GreeterClient::new(channel.unwrap());
+    tracing::info!("Client connected");
+    (client, shutdown_tx, server_handle)
+}
 
-    tracing::info!("Client connected, making gRPC call...");
-    // Make the gRPC call with a timeout to avoid indefinite hangs
+/// Test: unary RPC over RDMA.
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn tonic_greeter_over_rdma() {
+    let (mut client, shutdown_tx, server_handle) = start_server_and_connect().await;
+
+    tracing::info!("Calling SayHello (unary)...");
     let response = tokio::time::timeout(
         Duration::from_secs(5),
         client.say_hello(Request::new(HelloRequest {
@@ -121,12 +178,109 @@ async fn tonic_greeter_over_rdma() {
     .expect("gRPC call failed");
 
     assert_eq!(response.into_inner().message, "Hello RDMA!");
+    tracing::info!("Unary call succeeded");
 
-    tracing::info!("gRPC call succeeded, shutting down server...");
-    // Graceful shutdown: drop client, signal server to stop, wait for drain.
     drop(client);
     shutdown_tx.send(()).unwrap();
-    tracing::info!("Waiting for server to shut down...");
     server_handle.await.unwrap();
-    tracing::info!("Server shut down, test complete.");
+    tracing::info!("Server shut down");
+}
+
+/// Test: server streaming RPC over RDMA — server sends 5 replies.
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn tonic_server_stream_over_rdma() {
+    let (mut client, shutdown_tx, server_handle) = start_server_and_connect().await;
+
+    tracing::info!("Calling ServerStream...");
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.server_stream(Request::new(HelloRequest {
+            name: "stream".into(),
+        })),
+    )
+    .await
+    .expect("gRPC call timed out")
+    .expect("gRPC call failed");
+
+    let mut stream = response.into_inner();
+    let mut messages = Vec::new();
+    while let Some(reply) = stream.next().await {
+        messages.push(reply.expect("stream error").message);
+    }
+    tracing::info!("Received {} server-stream replies", messages.len());
+    assert_eq!(
+        messages,
+        vec!["stream-0", "stream-1", "stream-2", "stream-3", "stream-4"]
+    );
+
+    drop(client);
+    shutdown_tx.send(()).unwrap();
+    server_handle.await.unwrap();
+    tracing::info!("Server shut down");
+}
+
+/// Test: client streaming RPC over RDMA — client sends 3 names, server aggregates.
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn tonic_client_stream_over_rdma() {
+    let (mut client, shutdown_tx, server_handle) = start_server_and_connect().await;
+
+    tracing::info!("Calling ClientStream with 3 requests...");
+    let request_stream =
+        tokio_stream::iter(
+            ["Alice", "Bob", "Charlie"]
+                .into_iter()
+                .map(|n| HelloRequest {
+                    name: n.to_string(),
+                }),
+        );
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.client_stream(Request::new(request_stream)),
+    )
+    .await
+    .expect("gRPC call timed out")
+    .expect("gRPC call failed");
+
+    let msg = response.into_inner().message;
+    tracing::info!("ClientStream response: {msg}");
+    assert_eq!(msg, "Hello Alice, Bob, Charlie!");
+
+    drop(client);
+    shutdown_tx.send(()).unwrap();
+    server_handle.await.unwrap();
+    tracing::info!("Server shut down");
+}
+
+/// Test: bidirectional streaming RPC over RDMA — client sends, server echoes each.
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn tonic_bidi_stream_over_rdma() {
+    let (mut client, shutdown_tx, server_handle) = start_server_and_connect().await;
+
+    tracing::info!("Calling BidiStream with 3 requests...");
+    let request_stream =
+        tokio_stream::iter(["one", "two", "three"].into_iter().map(|n| HelloRequest {
+            name: n.to_string(),
+        }));
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.bidi_stream(Request::new(request_stream)),
+    )
+    .await
+    .expect("gRPC call timed out")
+    .expect("gRPC call failed");
+
+    let mut stream = response.into_inner();
+    let mut messages = Vec::new();
+    while let Some(reply) = stream.next().await {
+        messages.push(reply.expect("stream error").message);
+    }
+    tracing::info!("Received {} bidi-stream replies", messages.len());
+    assert_eq!(messages, vec!["echo: one", "echo: two", "echo: three"]);
+
+    drop(client);
+    shutdown_tx.send(()).unwrap();
+    server_handle.await.unwrap();
+    tracing::info!("Server shut down");
 }

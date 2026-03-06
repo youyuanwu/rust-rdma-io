@@ -219,9 +219,20 @@ check `read_eof` at entry. If the QP is already known to be dead
 they return `BrokenPipe` / `Ok(())` immediately instead of waiting
 for a completion that may never arrive.
 
-**Layer 3: `check_disconnect()` + `is_qp_dead()` safety net.** When any
-poll method would return `Pending`, it probes for disconnect via two
-mechanisms:
+**Layer 3: `register_cm_waker()` + `check_disconnect()` + `is_qp_dead()` safety net.**
+When any poll method would return `Pending`, it registers the task waker on
+**both** the CQ fd (via `poll_completions`) **and** the CM event channel fd
+(via `register_cm_waker`). This ensures that disconnect events (DREQ →
+DISCONNECTED) wake the task even when no CQ completions arrive — critical for
+rxe where CQ flush is unreliable.
+
+`register_cm_waker()` uses a persistent `AsyncFd<RawFd>` wrapping the CM event
+channel fd. On each call it:
+1. Calls `poll_read_ready(cx)` to register the waker
+2. If the fd is already readable, drains readiness and calls `check_disconnect()`
+3. Loops until the waker is registered (fd not readable)
+
+`check_disconnect()` probes for disconnect via two mechanisms:
 
 1. **CM event channel probe** (`try_get_event`): Checks the connection's
    rdma_cm event channel for a DISCONNECTED event. This is the most
@@ -236,43 +247,53 @@ mechanisms:
    transitioned.
 
 Applied to:
-- `poll_read`: returns `Ok(0)` (EOF) when recv CQ returns `Pending`
-- `poll_write`: returns `BrokenPipe` when send CQ returns `Pending`
-- `poll_close` Phase 1: returns `Ok(())` when draining a pending send
+- `poll_read`: registers CM waker, returns `Ok(0)` (EOF) if disconnect detected
+- `poll_write`: registers CM waker, returns `BrokenPipe` if disconnect detected
+- `poll_close` Phase 1: registers CM waker when draining a pending send
 - `poll_close` Phase 2: returns `Ok(())` when `disconnect()` fails on dead QP
-- `poll_close` Phase 3: returns `Ok(())` when DISCONNECTED event never arrives
-  (uses `is_qp_dead()` only — cannot use `check_disconnect()` here because
-  `poll_expect_event` is already monitoring the same event channel)
+- `poll_close` Phase 3: polls CM async fd directly for DISCONNECTED event,
+  with `is_qp_dead()` fallback when Pending
 
 ```
+register_cm_waker(cx):
+  loop:
+    cm_async_fd.poll_read_ready(cx):
+      Ready → clear_ready, check_disconnect() → if read_eof: return
+              else: loop (re-register waker)
+      Pending → return (waker registered on CM fd)
+
 check_disconnect():
   try_get_event → DISCONNECTED? → set read_eof, return true
   else → is_qp_dead()? → set read_eof, return true
 
 poll_write(cx, buf):
-  if read_eof → BrokenPipe                     # Layer 2
+  if read_eof → BrokenPipe                        # Layer 2
   post send (if not pending)
   poll send_cq:
-    Pending → if check_disconnect() → BrokenPipe  # Layer 3
+    Pending → register_cm_waker(cx)                # Layer 3
+              if read_eof → BrokenPipe
               else → Pending
     Ready(flush) → BrokenPipe
     Ready(ok) → Ok(len)
 
 poll_close(cx):
-  if read_eof → Ok(())                         # Layer 2
+  if read_eof → Ok(())                            # Layer 2
   Phase 1 (drain pending send):
-    Pending → if check_disconnect() → Ok(())   # Layer 3
+    Pending → register_cm_waker(cx)                # Layer 3
+              if read_eof → Ok(())
               else → Pending
   Phase 2 (disconnect):
-    if read_eof → Ok(())                       # (set by Phase 1)
+    if read_eof → Ok(())                          # (set by Phase 1)
     disconnect() err → if check_disconnect() → Ok(())
-  Phase 3 (await DISCONNECTED):
-    Pending → if is_qp_dead() → Ok(())         # Layer 3 (QP-only)
+  Phase 3 (await DISCONNECTED via cm_async_fd):
+    Pending → if is_qp_dead() → Ok(())            # Layer 3 (QP-only)
               else → Pending
 
 poll_read(cx, buf):
-  if read_eof → Ok(0)                          # Layer 1
+  if read_eof → Ok(0)                             # Layer 1
   poll recv_cq:
-    Pending → if check_disconnect() → Ok(0)    # Layer 3
-    Ready(flush) → set read_eof, Ok(0)         # Layer 1
+    Pending → register_cm_waker(cx)                # Layer 3
+              if read_eof → Ok(0)
+              else → Pending
+    Ready(flush) → set read_eof, Ok(0)            # Layer 1
 ```
