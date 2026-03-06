@@ -9,8 +9,7 @@
 1. **Memory-safe RAII wrappers** for all RDMA resources (context, PD, CQ, QP, MR, SRQ, AH, etc.)
 2. **Both ibverbs APIs**: legacy (`ibv_post_send`/`ibv_poll_cq`) and new (`ibv_wr_*`/`ibv_start_poll`)
 3. **rdma_cm** connection management with a listen/connect model
-4. **`std::io::Read`/`Write`** trait implementations for RDMA streams
-5. **Zero-cost where possible** — thin wrappers that compile down to the same code as C
+4. **Zero-cost where possible** — thin wrappers that compile down to the same code as C
 
 ### Non-goals (for now)
 
@@ -40,8 +39,7 @@ rust-rdma-io/
 │   │   ├── cm.rs        # rdma_cm connection management
 │   │   ├── wr.rs        # Work requests (send/recv builders)
 │   │   ├── wc.rs        # Work completions
-│   │   ├── error.rs     # Error types
-│   │   └── stream.rs    # Read/Write over RDMA
+│   │   └── error.rs     # Error types
 │   └── Cargo.toml
 └── rdma-io-tests/       # Integration tests (exists today, will grow)
 ```
@@ -188,13 +186,11 @@ This drain-after-arm pattern avoids the race condition where a completion arrive
 
 ---
 
-## 7. Stream Abstraction (Read / Write)
+## 7. Stream Abstraction (AsyncRead / AsyncWrite)
 
-> **Implementation**: `stream.rs` (sync), `async_stream.rs` (async). Async traits in [AsyncIntegration.md](AsyncIntegration.md).
+> **Implementation**: `async_stream.rs`. Async traits in [AsyncIntegration.md](AsyncIntegration.md).
 
-- **`RdmaStream`** — sync stream with `std::io::Read`/`Write` over RDMA SEND/RECV via rdma_cm
-- **`RdmaListener`** — `bind()` + `accept()`, like `TcpListener`
-- **`AsyncRdmaStream`** — async equivalent, implements `futures::io::AsyncRead`/`AsyncWrite`
+- **`AsyncRdmaStream`** — async stream implementing `futures::io::AsyncRead`/`AsyncWrite` over RDMA SEND/RECV via rdma_cm
 - **`AsyncRdmaListener`** — async listener; `accept()` uses `rdma_migrate_id()` for listener lifetime independence
 - Tokio users use `tokio_util::compat::FuturesAsyncReadCompatExt` for `tokio::io` traits
 
@@ -251,9 +247,6 @@ new-api = []
 # rdma_cm connection management
 cm = []
 
-# Read/Write stream abstraction over rdma_cm
-stream = ["cm"]
-
 # Async runtime: tokio backend (AsyncFd-based CqNotifier)
 tokio = ["dep:tokio"]
 
@@ -301,14 +294,6 @@ The FFI layer generates enums as `u32` type aliases with module-level constants.
 - `QueuePairEx`, `WrSession` (builder pattern for new WR API)
 - `CompletionQueueEx`, `PollGuard` (new CQ polling API)
 - **Skipped**: siw does not support `ibv_create_cq_ex` or `ibv_qp_to_qp_ex` (returns `EOPNOTSUPP`). Will implement when hardware or rxe testing is available.
-
-### Phase 4: Stream ✅
-
-- `stream.rs` — `RdmaStream`, `RdmaListener`
-- `std::io::Read`/`std::io::Write` implementations
-- Spin-polling CQ design (comp_channel approach had race conditions with siw)
-- Double-buffered recv with partial-read support
-- Tests: echo, multi-message (5 round-trips), large transfer (32 KiB) — 3 tests
 
 ### Async Phase A: CompletionChannel + AsyncCq ✅
 
@@ -379,8 +364,7 @@ The FFI layer generates enums as `u32` type aliases with module-level constants.
 | Enum wrapping | `bitflags` for flags, Rust enums for types | Type safety without runtime cost |
 | API surface | Both legacy and new ibverbs | Legacy for compatibility, new for performance |
 | Connection mgmt | rdma_cm as primary | Required for iWARP, recommended for RoCE |
-| Stream abstraction | `std::io::Read`/`Write` (sync), `futures::io::AsyncRead`/`AsyncWrite` (async) | Sync: `std::io`; Async: poll-based via `CqPollState`. Tokio: `tokio_util::compat` |
-| Stream CQ polling | Spin-poll + `thread::yield_now()` | comp_channel had race condition (notification consumed before `ibv_get_cq_event`) |
+| Stream abstraction | `futures::io::AsyncRead`/`AsyncWrite` (async only) | Poll-based via `CqPollState`. Tokio: `tokio_util::compat` |
 | rdma_cm error model | `from_ret_errno()` (reads `last_os_error`) | rdma_cm returns -1 + sets errno, unlike ibverbs which returns negative errno |
 | Test serialization | `RUST_TEST_THREADS=1` in `.cargo/config.toml` | siw has kernel resource contention with concurrent RDMA connections |
 
@@ -411,18 +395,18 @@ Items identified from the [ExistingLibs.md](ExistingLibs.md) gap analysis and im
 
 ### Stream Enhancements
 
-17. **Read/write timeouts** — `set_read_timeout()` / `set_write_timeout()` like `TcpStream`. Current spin-poll blocks forever.
-18. **`RdmaListener::local_addr()`** — Analogous to `TcpListener::local_addr()`, useful for ephemeral port tests.
-19. **`RdmaStream::peer_addr()`** — Connection introspection.
+17. **Read/write timeouts** — Timeout support for async stream operations.
+18. **`AsyncRdmaListener::local_addr()`** — Analogous to `TcpListener::local_addr()`, useful for ephemeral port tests.
+19. **`AsyncRdmaStream::peer_addr()`** — Connection introspection.
 20. **Stream split** — `into_split()` returning `OwnedReadHalf` / `OwnedWriteHalf` (like tokio's `TcpStream`), or `Clone` via internal `Arc`.
-21. **Builder pattern** — `RdmaStreamBuilder::new(addr).buf_size(128*1024).max_recv_wr(32).connect()?` for ergonomic configuration.
+21. **Builder pattern** — `AsyncRdmaStreamBuilder::new(addr).buf_size(128*1024).max_recv_wr(32).connect()?` for ergonomic configuration.
 22. **Graceful shutdown protocol** — `shutdown(Write)` → drain reads → disconnect, instead of abrupt disconnect in Drop.
 23. **Backpressure / flow control** — Credit-based flow control (§7 design mentions it but not implemented). Sender must track remote recv buffer availability to avoid deadlock when sender outpaces receiver.
 
 ### Ergonomics & Ecosystem
 
 24. **`Into<std::io::Error>` for `Error`** — Seamless `?` in io-returning functions.
-25. **`Display` / `Debug` enrichment** — Richer debug output for `CmId`, `QueuePair`, `RdmaStream` (show QP num, state, addresses).
+25. **`Display` / `Debug` enrichment** — Richer debug output for `CmId`, `QueuePair`, `AsyncRdmaStream` (show QP num, state, addresses).
 26. **New ibverbs API (Phase 3)** — `QueuePairEx`, `WrSession`, `CompletionQueueEx`, `PollGuard`. Skipped because siw doesn't support `ibv_create_cq_ex` / `ibv_qp_to_qp_ex`. Implement when rxe or hardware testing is available.
 
 ### From Gap Analysis

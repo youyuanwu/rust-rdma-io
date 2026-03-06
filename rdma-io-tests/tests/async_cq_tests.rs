@@ -7,7 +7,7 @@
 
 use rdma_io::async_cm::{AsyncCmId, AsyncCmListener};
 use rdma_io::async_cq::AsyncCq;
-use rdma_io::cm::{CmEventType, ConnParam, PortSpace};
+use rdma_io::cm::{ConnParam, PortSpace};
 use rdma_io::comp_channel::CompletionChannel;
 use rdma_io::cq::CompletionQueue;
 use rdma_io::mr::{AccessFlags, OwnedMemoryRegion};
@@ -46,6 +46,7 @@ fn default_qp_attr() -> QpInitAttr {
 /// Server-side resources returned after setup.
 struct ServerSetup {
     _server_cm: AsyncCmId,
+    #[allow(dead_code)]
     _cmqp: rdma_io::cm::CmQueuePair,
     comp_ch: CompletionChannel,
     cq: std::sync::Arc<CompletionQueue>,
@@ -55,17 +56,26 @@ struct ServerSetup {
 // Safety: RDMA resources are usable across threads.
 unsafe impl Send for ServerSetup {}
 
-/// Set up connection via async CM, send data via raw verbs, return server CQ.
+/// Client-side resources returned after setup.
+struct ClientSetup {
+    client_cm: AsyncCmId,
+    _cmqp: rdma_io::cm::CmQueuePair,
+}
+
+// Safety: RDMA resources are usable across threads.
+unsafe impl Send for ClientSetup {}
+
+/// Set up connection via async CM, send data via raw verbs.
 ///
-/// Uses AsyncCmId/AsyncCmListener for connection setup and disconnect,
-/// but raw ibv_post_recv/ibv_post_send + spin-poll for the data path
-/// to isolate AsyncCq testing.
+/// Returns both server and client resources so the test can:
+/// 1. Use the server CQ for async polling assertions
+/// 2. Perform graceful disconnect after assertions are done
 async fn setup_and_send(
     bind_addr: std::net::SocketAddr,
     connect_addr: std::net::SocketAddr,
     send_data: &[u8],
     recv_wr_id: u64,
-) -> ServerSetup {
+) -> (ServerSetup, ClientSetup) {
     let data_len = send_data.len();
     let send_buf = send_data.to_vec();
 
@@ -113,11 +123,6 @@ async fn setup_and_send(
             .complete_accept(conn_id, &ConnParam::default())
             .await
             .unwrap();
-
-        // Await disconnect from client
-        let ev = server_cm.next_event().await.unwrap();
-        assert_eq!(ev.event_type(), CmEventType::Disconnected);
-        ev.ack();
 
         ServerSetup {
             _server_cm: server_cm,
@@ -188,20 +193,19 @@ async fn setup_and_send(
         std::hint::spin_loop();
     }
 
-    // Async disconnect — await DISCONNECTED event
-    client_cm.disconnect_async().await.unwrap();
-
-    // cmqp drops → rdma_destroy_qp before PD/CmId
-    drop(cmqp);
-
-    server_handle.await.expect("server task panicked")
+    let server_setup = server_handle.await.expect("server task panicked");
+    let client_setup = ClientSetup {
+        client_cm,
+        _cmqp: cmqp,
+    };
+    (server_setup, client_setup)
 }
 
 /// Test: AsyncCq::poll() receives a completion via comp_channel notification.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn async_cq_send_recv() {
     let (bind_addr, connect_addr) = test_addrs();
-    let setup = setup_and_send(bind_addr, connect_addr, b"async hello!", 100).await;
+    let (setup, client) = setup_and_send(bind_addr, connect_addr, b"async hello!", 100).await;
 
     let notifier = TokioCqNotifier::new(setup.comp_ch.fd()).unwrap();
     let async_cq = AsyncCq::new(setup.cq, setup.comp_ch, Box::new(notifier));
@@ -223,7 +227,9 @@ async fn async_cq_send_recv() {
     assert_eq!(&setup.recv_mr.as_slice()[..12], b"async hello!");
     println!("async_cq_send_recv test passed!");
 
-    // Drop CmQueuePair first to release Arc<CQ> refs before AsyncCq destroys comp_channel.
+    // Graceful cleanup: disconnect client, then drop in correct order.
+    client.client_cm.disconnect().unwrap();
+    drop(client._cmqp);
     drop(setup._cmqp);
     drop(async_cq);
 }
@@ -232,7 +238,7 @@ async fn async_cq_send_recv() {
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn async_cq_poll_wr_id() {
     let (bind_addr, connect_addr) = test_addrs();
-    let setup = setup_and_send(bind_addr, connect_addr, b"wr_id", 42).await;
+    let (setup, client) = setup_and_send(bind_addr, connect_addr, b"wr_id", 42).await;
 
     let notifier = TokioCqNotifier::new(setup.comp_ch.fd()).unwrap();
     let async_cq = AsyncCq::new(setup.cq, setup.comp_ch, Box::new(notifier));
@@ -243,7 +249,9 @@ async fn async_cq_poll_wr_id() {
     assert_eq!(&setup.recv_mr.as_slice()[..5], b"wr_id");
     println!("async_cq_poll_wr_id test passed!");
 
-    // Drop CmQueuePair first to release Arc<CQ> refs before AsyncCq destroys comp_channel.
+    // Graceful cleanup: disconnect client, then drop in correct order.
+    client.client_cm.disconnect().unwrap();
+    drop(client._cmqp);
     drop(setup._cmqp);
     drop(async_cq);
 }

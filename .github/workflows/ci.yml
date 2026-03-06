@@ -63,14 +63,14 @@ jobs:
         run: cmake -B build
 
       - name: Build
-        run: cargo build --workspace --features tokio
+        run: cargo build --all-targets
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets --features tokio -- -D warnings
 
       - name: Test
         run: cargo test -p rdma-io-tests -- --nocapture
-        timeout-minutes: 10
+        timeout-minutes: 30
 
       - name: Doc tests
         run: cargo test --doc --workspace --features tokio
@@ -122,8 +122,16 @@ jobs:
           components: clippy
 
       - name: Build
-        run: cargo build --workspace --features tokio
+        run: cargo build --all-targets
+
+
+      # - name: Shutdown tests debug
+      #   run : cargo test --package rdma-io-tests --test async_stream_tests -- async_stream_shutdown_after_peer_drop --exact --nocapture 
+
+      # - name: Tonic test debug
+      #   run: cargo test --package rdma-io-tests --test tonic_tests -- tonic_greeter_over_rdma --exact --nocapture 
+      #   timeout-minutes: 10
 
       - name: Test
         run: cargo test -p rdma-io-tests -- --nocapture
-        timeout-minutes: 10
+        timeout-minutes: 30

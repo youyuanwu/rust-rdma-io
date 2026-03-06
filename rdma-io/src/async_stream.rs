@@ -1,20 +1,20 @@
 //! Async RDMA Stream — async `read` + `write` over RDMA SEND/RECV.
 //!
 //! Provides TCP-like async semantics over rdma_cm connections, built on
-//! top of [`AsyncQp`] for completion-driven (non-spinning) I/O.
+//! top of [`AsyncCq`] for completion-driven (non-spinning) I/O.
 //!
 //! # Buffer Architecture
 //!
-//! Same as the sync `RdmaStream`:
-//! - **Send buffer**: Pre-registered MR for outgoing data.
-//! - **Recv buffers**: Two pre-registered MRs (double-buffered).
+//! Each stream has one send buffer and one recv buffer (pre-registered MRs).
+//! Send and recv use **separate CQs** so `poll_write` never blocks on recv
+//! state and vice versa — this avoids deadlocks when both peers send
+//! simultaneously (e.g., HTTP/2 connection setup).
 //!
 //! # Protocol
 //!
 //! Pure RDMA SEND/RECV with no application-level framing. Each `write()`
 //! becomes one RDMA SEND; each `read()` consumes one RDMA RECV completion.
 
-use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -25,7 +25,6 @@ use futures_io::{AsyncRead, AsyncWrite};
 
 use crate::async_cm::{AsyncCmId, AsyncCmListener};
 use crate::async_cq::{AsyncCq, CqPollState};
-use crate::async_qp::AsyncQp;
 use crate::cm::{CmId, ConnParam, EventChannel, PortSpace};
 use crate::comp_channel::CompletionChannel;
 use crate::cq::CompletionQueue;
@@ -39,11 +38,15 @@ use crate::wr::QpType;
 /// Default buffer size for stream send/recv (64 KiB).
 const DEFAULT_BUF_SIZE: usize = 64 * 1024;
 
-/// Number of recv buffers (double-buffered).
-const NUM_RECV_BUFS: usize = 2;
+/// Number of pre-posted recv buffers.
+///
+/// iWARP (siw) has no RNR retry — missing recv buffers cause an immediate
+/// DDP TERMINATE error. Multiple buffers absorb back-to-back sends from
+/// the peer (e.g. HTTP/2 rapid frame bursts).
+const NUM_RECV_BUFS: usize = 4;
 
-/// Base WR ID for send operations (recv uses buf_idx 0..NUM_RECV_BUFS).
-const SEND_WR_ID: u64 = 100;
+/// WR IDs: 0..NUM_RECV_BUFS-1 for recv buffers, NUM_RECV_BUFS for send.
+const SEND_WR_ID: u64 = NUM_RECV_BUFS as u64;
 
 /// An async RDMA stream with `read` and `write` methods.
 ///
@@ -70,26 +73,32 @@ const SEND_WR_ID: u64 = 100;
 /// ```
 pub struct AsyncRdmaStream {
     // Drop order matters! Fields drop in declaration order.
-    // MRs, buffers, and poll state must be freed before RDMA teardown.
+    // MRs and poll state must be freed before RDMA teardown.
+    /// Partially consumed recv: (buf_index, offset, total_len).
     recv_pending: Option<(usize, usize, usize)>,
-    send_wr_seq: u64,
-    cq_state: CqPollState,
-    stashed_recv: VecDeque<WorkCompletion>,
-    stashed_send: VecDeque<WorkCompletion>,
-    write_pending: Option<(u64, usize)>,
+    send_cq_state: CqPollState,
+    recv_cq_state: CqPollState,
+    /// In-flight send: (len,). None if send slot is free.
+    write_pending: Option<usize>,
     /// Lazily created when poll_close begins; awaits DISCONNECTED event.
     close_ch: Option<crate::async_cm::AsyncEventChannel>,
     disconnected: bool,
+    /// Set when poll_read sees a flush error (QP entered ERROR state).
+    /// Once set, poll_read always returns Ok(0) — the QP will never
+    /// produce another recv completion.
+    read_eof: bool,
     send_mr: OwnedMemoryRegion,
     recv_mrs: [OwnedMemoryRegion; NUM_RECV_BUFS],
     _pd: Arc<ProtectionDomain>,
-    // RDMA teardown: QP+CQ (inside aqp) → CM ID → EventChannel
-    aqp: AsyncQp,
+    // RDMA teardown: QP first (needs CQs alive), then CQs, then CM.
+    cmqp: crate::cm::CmQueuePair,
+    send_cq: AsyncCq,
+    recv_cq: AsyncCq,
     cm_id: CmId,
     _event_channel: EventChannel,
 }
 
-// Safety: All interior types are Send-safe. The CmId/AsyncQp raw pointers
+// Safety: All interior types are Send-safe. The CmId raw pointers
 // are guarded by libibverbs internal locking.
 unsafe impl Send for AsyncRdmaStream {}
 
@@ -103,7 +112,6 @@ impl AsyncRdmaStream {
 
     /// Connect with a custom buffer size.
     pub async fn connect_with_buf_size(addr: &SocketAddr, buf_size: usize) -> crate::Result<Self> {
-        // Step-by-step connect: we need to create QP between resolve_route and connect
         let async_cm = AsyncCmId::new(PortSpace::Tcp)?;
         async_cm.resolve_addr(None, addr, 2000).await?;
         async_cm.resolve_route(2000).await?;
@@ -112,46 +120,59 @@ impl AsyncRdmaStream {
             .verbs_context()
             .ok_or(crate::Error::InvalidArg("no verbs context".into()))?;
         let pd = async_cm.alloc_pd()?;
-        let comp_ch = CompletionChannel::new(&ctx)?;
-        let cq = CompletionQueue::with_comp_channel(ctx, 32, &comp_ch)?;
 
-        let cmqp = async_cm.create_qp_with_cq(&pd, &stream_qp_attr(), Some(&cq), Some(&cq))?;
+        // Separate CQs for send and recv — avoids deadlock when both
+        // sides send simultaneously (e.g. HTTP/2 connection setup).
+        let send_ch = CompletionChannel::new(&ctx)?;
+        let send_cq_raw = CompletionQueue::with_comp_channel(ctx.clone(), 2, &send_ch)?;
+        let recv_ch = CompletionChannel::new(&ctx)?;
+        let recv_cq_raw =
+            CompletionQueue::with_comp_channel(ctx, NUM_RECV_BUFS as i32 + 1, &recv_ch)?;
+
+        let cmqp = async_cm.create_qp_with_cq(
+            &pd,
+            &stream_qp_attr(),
+            Some(&send_cq_raw),
+            Some(&recv_cq_raw),
+        )?;
 
         let send_mr = pd.reg_mr_owned(vec![0u8; buf_size], AccessFlags::LOCAL_WRITE)?;
-        let recv_mrs = [
-            pd.reg_mr_owned(vec![0u8; buf_size], AccessFlags::LOCAL_WRITE)?,
-            pd.reg_mr_owned(vec![0u8; buf_size], AccessFlags::LOCAL_WRITE)?,
-        ];
+        let recv_mrs: [OwnedMemoryRegion; NUM_RECV_BUFS] = std::array::from_fn(|_| {
+            pd.reg_mr_owned(vec![0u8; buf_size], AccessFlags::LOCAL_WRITE)
+                .expect("failed to allocate recv MR")
+        });
 
-        // Pre-post recv buffers before connect
+        // Pre-post all recv buffers before connect
         for (i, mr) in recv_mrs.iter().enumerate() {
             post_recv_raw(cmqp.as_raw(), mr, i as u64)?;
         }
 
         async_cm.connect(&ConnParam::default()).await?;
 
-        // Create async CQ AFTER connection is established
-        let notifier = TokioCqNotifier::new(comp_ch.fd()).map_err(crate::Error::Verbs)?;
-        let async_cq = AsyncCq::new(cq, comp_ch, Box::new(notifier));
-        let aqp = AsyncQp::new(cmqp, async_cq);
+        // Create async CQs AFTER connection is established
+        let send_notifier = TokioCqNotifier::new(send_ch.fd()).map_err(crate::Error::Verbs)?;
+        let send_cq = AsyncCq::new(send_cq_raw, send_ch, Box::new(send_notifier));
+        let recv_notifier = TokioCqNotifier::new(recv_ch.fd()).map_err(crate::Error::Verbs)?;
+        let recv_cq = AsyncCq::new(recv_cq_raw, recv_ch, Box::new(recv_notifier));
 
         let (event_channel, cm_id) = async_cm.into_parts();
 
         Ok(Self {
-            aqp,
+            cmqp,
+            send_cq,
+            recv_cq,
             cm_id,
             _event_channel: event_channel,
             _pd: pd,
             send_mr,
             recv_mrs,
             recv_pending: None,
-            send_wr_seq: SEND_WR_ID,
-            cq_state: CqPollState::default(),
-            stashed_recv: VecDeque::new(),
-            stashed_send: VecDeque::new(),
+            send_cq_state: CqPollState::default(),
+            recv_cq_state: CqPollState::default(),
             write_pending: None,
             close_ch: None,
             disconnected: false,
+            read_eof: false,
         })
     }
 
@@ -205,10 +226,8 @@ impl Drop for AsyncRdmaStream {
     fn drop(&mut self) {
         // Best-effort disconnect so the peer sees DREQ promptly.
         // Skip if poll_close/shutdown already disconnected gracefully.
-        if !self.disconnected
-            && let Err(e) = self.cm_id.disconnect()
-        {
-            tracing::trace!("AsyncRdmaStream::drop disconnect failed: {e}");
+        if !self.disconnected {
+            let _ = self.cm_id.disconnect();
         }
     }
 }
@@ -218,20 +237,61 @@ impl Drop for AsyncRdmaStream {
 impl AsyncRdmaStream {
     /// Process a recv work completion, copying data into `buf`.
     fn process_recv_wc(&mut self, wc: &WorkCompletion, buf: &mut [u8]) -> io::Result<usize> {
+        let buf_idx = wc.wr_id() as usize;
         let byte_len = wc.byte_len() as usize;
         if byte_len == 0 {
             return Ok(0);
         }
-        let bidx = wc.wr_id() as usize;
         let copy_len = byte_len.min(buf.len());
-        buf[..copy_len].copy_from_slice(&self.recv_mrs[bidx].as_slice()[..copy_len]);
+        buf[..copy_len].copy_from_slice(&self.recv_mrs[buf_idx].as_slice()[..copy_len]);
         if copy_len < byte_len {
-            self.recv_pending = Some((bidx, copy_len, byte_len));
+            self.recv_pending = Some((buf_idx, copy_len, byte_len));
         } else {
-            post_recv_raw(self.aqp.as_raw(), &self.recv_mrs[bidx], wc.wr_id())
+            post_recv_raw(self.cmqp.as_raw(), &self.recv_mrs[buf_idx], buf_idx as u64)
                 .map_err(io::Error::other)?;
         }
         Ok(copy_len)
+    }
+
+    /// Check if the peer has disconnected by probing the CM event channel
+    /// and QP state. Sets `read_eof` if disconnection is detected.
+    ///
+    /// This is the primary disconnect detection mechanism. On rxe (RoCE),
+    /// CQ flush completions may not arrive (or their EPOLLET notifications
+    /// may be lost), and the QP may linger in RTS until the CM event is
+    /// consumed. Checking the CM event channel directly is reliable across
+    /// all providers.
+    fn check_disconnect(&mut self) -> bool {
+        if self.read_eof {
+            return true;
+        }
+        // Check CM event channel for DISCONNECTED (non-blocking).
+        match self._event_channel.try_get_event() {
+            Ok(ev) => {
+                let etype = ev.event_type();
+                ev.ack();
+                if etype == crate::cm::CmEventType::Disconnected {
+                    self.read_eof = true;
+                    return true;
+                }
+                // Other unexpected events — treat as disconnect.
+                self.read_eof = true;
+                true
+            }
+            Err(crate::Error::WouldBlock) => {
+                // No CM event — fall back to QP state check.
+                if is_qp_dead(self.cmqp.as_raw()) {
+                    self.read_eof = true;
+                    return true;
+                }
+                false
+            }
+            Err(_) => {
+                // Event channel error — connection is dead.
+                self.read_eof = true;
+                true
+            }
+        }
     }
 }
 
@@ -245,11 +305,11 @@ impl futures_io::AsyncRead for AsyncRdmaStream {
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
 
-        if buf.is_empty() {
+        if buf.is_empty() || this.read_eof {
             return Poll::Ready(Ok(0));
         }
 
-        // 1. Return buffered recv data
+        // 1. Return buffered recv data (partial read from previous completion)
         if let Some((buf_idx, offset, total_len)) = this.recv_pending {
             let remaining = total_len - offset;
             let copy_len = remaining.min(buf.len());
@@ -259,54 +319,45 @@ impl futures_io::AsyncRead for AsyncRdmaStream {
                 this.recv_pending = Some((buf_idx, offset + copy_len, total_len));
             } else {
                 this.recv_pending = None;
-                post_recv_raw(this.aqp.as_raw(), &this.recv_mrs[buf_idx], buf_idx as u64)
+                post_recv_raw(this.cmqp.as_raw(), &this.recv_mrs[buf_idx], buf_idx as u64)
                     .map_err(io::Error::other)?;
             }
             return Poll::Ready(Ok(copy_len));
         }
 
-        // 2. Check stashed recv completion (from a poll_write that encountered recv)
-        if let Some(wc) = this.stashed_recv.pop_front() {
-            return Poll::Ready(this.process_recv_wc(&wc, buf));
-        }
-
-        // 3. Poll CQ for recv completions
-        let mut wc_buf = [WorkCompletion::default(); 4];
+        // 2. Poll recv CQ for completion (only recv completions appear here)
+        let mut wc = [WorkCompletion::default(); 1];
         loop {
             let n = match this
-                .aqp
-                .async_cq()
-                .poll_completions(cx, &mut this.cq_state, &mut wc_buf)
+                .recv_cq
+                .poll_completions(cx, &mut this.recv_cq_state, &mut wc)
             {
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    // CQ notification may be lost (EPOLLET race) or flush
+                    // completions may not arrive (rxe). Check CM events and
+                    // QP state as fallback.
+                    if this.check_disconnect() {
+                        return Poll::Ready(Ok(0)); // EOF
+                    }
+                    return Poll::Pending;
+                }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(io::Error::other(e))),
                 Poll::Ready(Ok(n)) => n,
             };
-            for (i, wc_item) in wc_buf[..n].iter().enumerate() {
-                if !wc_item.is_success() {
-                    if wc_item.status_raw() == rdma_io_sys::ibverbs::IBV_WC_WR_FLUSH_ERR {
+            if n > 0 {
+                let wc = &wc[0];
+                if !wc.is_success() {
+                    if wc.status_raw() == rdma_io_sys::ibverbs::IBV_WC_WR_FLUSH_ERR {
+                        this.read_eof = true;
                         return Poll::Ready(Ok(0)); // EOF
                     }
                     return Poll::Ready(Err(io::Error::other(format!(
-                        "WC error: status={:?}",
-                        wc_item.status()
+                        "recv WC error: status={:?} wr_id={}",
+                        wc.status(),
+                        wc.wr_id()
                     ))));
                 }
-                if wc_item.wr_id() < NUM_RECV_BUFS as u64 {
-                    // Stash remaining completions before returning
-                    for remaining in &wc_buf[i + 1..n] {
-                        if remaining.is_success() {
-                            if remaining.wr_id() < NUM_RECV_BUFS as u64 {
-                                this.stashed_recv.push_back(*remaining);
-                            } else {
-                                this.stashed_send.push_back(*remaining);
-                            }
-                        }
-                    }
-                    return Poll::Ready(this.process_recv_wc(wc_item, buf));
-                }
-                // Stash send completions for later poll_write
-                this.stashed_send.push_back(*wc_item);
+                return Poll::Ready(this.process_recv_wc(wc, buf));
             }
         }
     }
@@ -324,78 +375,63 @@ impl futures_io::AsyncWrite for AsyncRdmaStream {
             return Poll::Ready(Ok(0));
         }
 
+        // QP is in ERROR state — writes will never complete.
+        if this.read_eof {
+            this.write_pending = None;
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "connection closed",
+            )));
+        }
+
         // Post send if not already in progress
         if this.write_pending.is_none() {
             let send_len = buf.len().min(this.send_mr.as_slice().len());
             this.send_mr.as_mut_slice()[..send_len].copy_from_slice(&buf[..send_len]);
 
-            let wr_id = this.send_wr_seq;
-            this.send_wr_seq += 1;
-
-            this.aqp
-                .post_send_signaled(&this.send_mr, 0, send_len, wr_id)
+            post_send_raw(this.cmqp.as_raw(), &this.send_mr, 0, send_len, SEND_WR_ID)
                 .map_err(io::Error::other)?;
-            this.write_pending = Some((wr_id, send_len));
+            this.write_pending = Some(send_len);
         }
 
-        let (wr_id, len) = this.write_pending.unwrap();
+        let len = this.write_pending.unwrap();
 
-        // Check stashed send completions (from a poll_read that encountered send)
-        while let Some(wc) = this.stashed_send.pop_front() {
-            if !wc.is_success() {
-                this.write_pending = None;
-                return Poll::Ready(Err(io::Error::other(format!(
-                    "send WC error: status={:?}",
-                    wc.status()
-                ))));
-            }
-            if wc.wr_id() == wr_id {
-                this.write_pending = None;
-                return Poll::Ready(Ok(len));
-            }
-        }
-
-        // Poll CQ for send completion
-        let mut wc_buf = [WorkCompletion::default(); 4];
+        // Poll send CQ for completion (only send completions appear here)
+        let mut wc = [WorkCompletion::default(); 1];
         loop {
             let n = match this
-                .aqp
-                .async_cq()
-                .poll_completions(cx, &mut this.cq_state, &mut wc_buf)
+                .send_cq
+                .poll_completions(cx, &mut this.send_cq_state, &mut wc)
             {
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    // CQ notification may be lost (EPOLLET race) or QP may
+                    // not have transitioned yet (rxe). Check CM events and
+                    // QP state as fallback.
+                    if this.check_disconnect() {
+                        this.write_pending = None;
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "connection closed",
+                        )));
+                    }
+                    return Poll::Pending;
+                }
                 Poll::Ready(Err(e)) => {
                     this.write_pending = None;
                     return Poll::Ready(Err(io::Error::other(e)));
                 }
                 Poll::Ready(Ok(n)) => n,
             };
-            for (i, wc_item) in wc_buf[..n].iter().enumerate() {
-                if !wc_item.is_success() {
+            if n > 0 {
+                if !wc[0].is_success() {
                     this.write_pending = None;
                     return Poll::Ready(Err(io::Error::other(format!(
                         "send WC error: status={:?}",
-                        wc_item.status()
+                        wc[0].status()
                     ))));
                 }
-                if wc_item.wr_id() == wr_id {
-                    // Stash remaining completions before returning
-                    for remaining in &wc_buf[i + 1..n] {
-                        if remaining.is_success() {
-                            if remaining.wr_id() < NUM_RECV_BUFS as u64 {
-                                this.stashed_recv.push_back(*remaining);
-                            } else {
-                                this.stashed_send.push_back(*remaining);
-                            }
-                        }
-                    }
-                    this.write_pending = None;
-                    return Poll::Ready(Ok(len));
-                }
-                // Stash recv completions for later poll_read
-                if wc_item.wr_id() < NUM_RECV_BUFS as u64 {
-                    this.stashed_recv.push_back(*wc_item);
-                }
+                this.write_pending = None;
+                return Poll::Ready(Ok(len));
             }
         }
     }
@@ -410,50 +446,64 @@ impl futures_io::AsyncWrite for AsyncRdmaStream {
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
 
+        // QP is in ERROR state — peer already disconnected. Skip graceful
+        // close; the Drop impl will handle cleanup.
+        if this.read_eof {
+            this.write_pending = None;
+            this.disconnected = true;
+            return Poll::Ready(Ok(()));
+        }
+
         // Phase 1: Drain pending send completion before disconnecting.
-        if let Some((wr_id, _)) = this.write_pending {
-            // Check stashed send completions first.
-            while let Some(wc) = this.stashed_send.pop_front() {
-                if wc.wr_id() == wr_id {
-                    this.write_pending = None;
-                    break;
-                }
-            }
-            // Poll CQ if still pending.
-            if this.write_pending.is_some() {
-                let mut wc_buf = [WorkCompletion::default(); 4];
-                loop {
-                    let n = match this.aqp.async_cq().poll_completions(
-                        cx,
-                        &mut this.cq_state,
-                        &mut wc_buf,
-                    ) {
-                        Poll::Pending => return Poll::Pending,
+        if this.write_pending.is_some() {
+            let mut wc_buf = [WorkCompletion::default(); 1];
+            loop {
+                let n =
+                    match this
+                        .send_cq
+                        .poll_completions(cx, &mut this.send_cq_state, &mut wc_buf)
+                    {
+                        Poll::Pending => {
+                            if this.check_disconnect() {
+                                this.write_pending = None;
+                                this.disconnected = true;
+                                return Poll::Ready(Ok(()));
+                            }
+                            return Poll::Pending;
+                        }
                         Poll::Ready(Err(e)) => {
                             this.write_pending = None;
                             return Poll::Ready(Err(io::Error::other(e)));
                         }
                         Poll::Ready(Ok(n)) => n,
                     };
-                    let mut found = false;
-                    for wc_item in &wc_buf[..n] {
-                        if wc_item.wr_id() == wr_id {
-                            found = true;
-                        }
-                    }
-                    if found {
-                        this.write_pending = None;
-                        break;
-                    }
+                if n > 0 {
+                    this.write_pending = None;
+                    break;
                 }
             }
         }
 
         // Phase 2: Send DREQ and create async channel for event polling.
+        // Note: check_disconnect() in Phase 1 or poll_read/poll_write may
+        // have already consumed the DISCONNECTED event and set read_eof.
+        if this.read_eof {
+            this.write_pending = None;
+            this.disconnected = true;
+            return Poll::Ready(Ok(()));
+        }
         if this.close_ch.is_none() {
             let async_ch = crate::async_cm::AsyncEventChannel::new(&this._event_channel)
                 .map_err(io::Error::other)?;
-            this.cm_id.disconnect().map_err(io::Error::other)?;
+            // disconnect() may fail if the connection is already being torn
+            // down. Check CM events / QP state to distinguish real errors.
+            if let Err(e) = this.cm_id.disconnect() {
+                if this.check_disconnect() {
+                    this.disconnected = true;
+                    return Poll::Ready(Ok(()));
+                }
+                return Poll::Ready(Err(io::Error::other(e)));
+            }
             this.close_ch = Some(async_ch);
         }
 
@@ -464,7 +514,18 @@ impl futures_io::AsyncWrite for AsyncRdmaStream {
             &this._event_channel,
             crate::cm::CmEventType::Disconnected,
         ) {
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => {
+                // The DISCONNECTED event may never arrive (peer crashed,
+                // no DREP for our DREQ). Check QP state as fallback.
+                // Don't use check_disconnect() here — it would consume
+                // the event that poll_expect_event is waiting for.
+                if is_qp_dead(this.cmqp.as_raw()) {
+                    this.close_ch = None;
+                    this.disconnected = true;
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Pending
+            }
             Poll::Ready(Ok(())) => {
                 this.close_ch = None;
                 this.disconnected = true;
@@ -512,16 +573,28 @@ impl AsyncRdmaListener {
             .verbs_context()
             .ok_or(crate::Error::InvalidArg("no verbs context".into()))?;
         let pd = conn_id.alloc_pd()?;
-        let comp_ch = CompletionChannel::new(&ctx)?;
-        let cq = CompletionQueue::with_comp_channel(ctx, 32, &comp_ch)?;
 
-        let cmqp = conn_id.create_qp_with_cq(&pd, &stream_qp_attr(), Some(&cq), Some(&cq))?;
+        // Separate CQs for send and recv
+        let send_ch = CompletionChannel::new(&ctx)?;
+        let send_cq_raw = CompletionQueue::with_comp_channel(ctx.clone(), 2, &send_ch)?;
+        let recv_ch = CompletionChannel::new(&ctx)?;
+        let recv_cq_raw =
+            CompletionQueue::with_comp_channel(ctx, NUM_RECV_BUFS as i32 + 1, &recv_ch)?;
+
+        let cmqp = conn_id.create_qp_with_cq(
+            &pd,
+            &stream_qp_attr(),
+            Some(&send_cq_raw),
+            Some(&recv_cq_raw),
+        )?;
 
         let send_mr = pd.reg_mr_owned(vec![0u8; self.buf_size], AccessFlags::LOCAL_WRITE)?;
-        let recv_mrs = [
-            pd.reg_mr_owned(vec![0u8; self.buf_size], AccessFlags::LOCAL_WRITE)?,
-            pd.reg_mr_owned(vec![0u8; self.buf_size], AccessFlags::LOCAL_WRITE)?,
-        ];
+        let recv_mrs: [OwnedMemoryRegion; NUM_RECV_BUFS] = std::array::from_fn(|_| {
+            pd.reg_mr_owned(vec![0u8; self.buf_size], AccessFlags::LOCAL_WRITE)
+                .expect("failed to allocate recv MR")
+        });
+
+        // Pre-post all recv buffers before accept handshake
         for (i, mr) in recv_mrs.iter().enumerate() {
             post_recv_raw(cmqp.as_raw(), mr, i as u64)?;
         }
@@ -532,28 +605,30 @@ impl AsyncRdmaListener {
             .complete_accept(conn_id, &ConnParam::default())
             .await?;
 
-        // Create async CQ AFTER connection is established
-        let notifier = TokioCqNotifier::new(comp_ch.fd()).map_err(crate::Error::Verbs)?;
-        let async_cq = AsyncCq::new(cq, comp_ch, Box::new(notifier));
-        let aqp = AsyncQp::new(cmqp, async_cq);
+        // Create async CQs AFTER connection is established
+        let send_notifier = TokioCqNotifier::new(send_ch.fd()).map_err(crate::Error::Verbs)?;
+        let send_cq = AsyncCq::new(send_cq_raw, send_ch, Box::new(send_notifier));
+        let recv_notifier = TokioCqNotifier::new(recv_ch.fd()).map_err(crate::Error::Verbs)?;
+        let recv_cq = AsyncCq::new(recv_cq_raw, recv_ch, Box::new(recv_notifier));
 
         let (event_channel, cm_id) = async_cm.into_parts();
 
         Ok(AsyncRdmaStream {
-            aqp,
+            cmqp,
+            send_cq,
+            recv_cq,
             cm_id,
             _event_channel: event_channel,
             _pd: pd,
             send_mr,
             recv_mrs,
             recv_pending: None,
-            send_wr_seq: SEND_WR_ID,
-            cq_state: CqPollState::default(),
-            stashed_recv: VecDeque::new(),
-            stashed_send: VecDeque::new(),
+            send_cq_state: CqPollState::default(),
+            recv_cq_state: CqPollState::default(),
             write_pending: None,
             close_ch: None,
             disconnected: false,
+            read_eof: false,
         })
     }
 }
@@ -563,8 +638,8 @@ impl AsyncRdmaListener {
 fn stream_qp_attr() -> QpInitAttr {
     QpInitAttr {
         qp_type: QpType::Rc,
-        max_send_wr: 16,
-        max_recv_wr: 16,
+        max_send_wr: 2,
+        max_recv_wr: NUM_RECV_BUFS as u32 + 1,
         max_send_sge: 1,
         max_recv_sge: 1,
         max_inline_data: 0,
@@ -572,8 +647,7 @@ fn stream_qp_attr() -> QpInitAttr {
     }
 }
 
-/// Post a recv WR using raw ibverbs (doesn't go through AsyncQp since
-/// we need to pre-post before the CQ is fully set up).
+/// Post a recv WR using raw ibverbs.
 fn post_recv_raw(
     qp: *mut rdma_io_sys::ibverbs::ibv_qp,
     mr: &OwnedMemoryRegion,
@@ -596,4 +670,55 @@ fn post_recv_raw(
         return Err(crate::Error::Verbs(io::Error::from_raw_os_error(-ret)));
     }
     Ok(())
+}
+
+/// Post a signaled send WR using raw ibverbs.
+fn post_send_raw(
+    qp: *mut rdma_io_sys::ibverbs::ibv_qp,
+    mr: &OwnedMemoryRegion,
+    offset: usize,
+    len: usize,
+    wr_id: u64,
+) -> crate::Result<()> {
+    let mut sge = rdma_io_sys::ibverbs::ibv_sge {
+        addr: unsafe { (*mr.as_raw()).addr as u64 } + offset as u64,
+        length: len as u32,
+        lkey: mr.lkey(),
+    };
+    let mut wr = rdma_io_sys::ibverbs::ibv_send_wr {
+        wr_id,
+        sg_list: &mut sge,
+        num_sge: 1,
+        opcode: rdma_io_sys::ibverbs::IBV_WR_SEND,
+        send_flags: rdma_io_sys::ibverbs::IBV_SEND_SIGNALED,
+        ..Default::default()
+    };
+    let mut bad_wr: *mut rdma_io_sys::ibverbs::ibv_send_wr = std::ptr::null_mut();
+    let ret = unsafe { rdma_io_sys::wrapper::rdma_wrap_ibv_post_send(qp, &mut wr, &mut bad_wr) };
+    if ret != 0 {
+        return Err(crate::Error::Verbs(io::Error::from_raw_os_error(-ret)));
+    }
+    Ok(())
+}
+
+/// Check if a QP is no longer operational (any state other than RTS).
+///
+/// Used as a safety net to detect dead connections when CQ notifications
+/// may have been lost (e.g. due to EPOLLET edge-triggered races).
+///
+/// After rdma_disconnect, the QP may transition through SQD or SQE before
+/// reaching ERROR. On rxe (RoCE), this transition can take significant time.
+/// Any non-RTS state means data-path operations will never complete normally.
+fn is_qp_dead(qp: *mut rdma_io_sys::ibverbs::ibv_qp) -> bool {
+    unsafe {
+        let mut attr: rdma_io_sys::ibverbs::ibv_qp_attr = std::mem::zeroed();
+        let mut init_attr: rdma_io_sys::ibverbs::ibv_qp_init_attr = std::mem::zeroed();
+        let ret = rdma_io_sys::ibverbs::ibv_query_qp(
+            qp,
+            &mut attr,
+            rdma_io_sys::ibverbs::IBV_QP_STATE as i32,
+            &mut init_attr,
+        );
+        ret == 0 && attr.qp_state != rdma_io_sys::ibverbs::IBV_QPS_RTS
+    }
 }

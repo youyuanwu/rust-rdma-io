@@ -57,7 +57,7 @@ impl Greeter for MyGreeter {
 }
 
 /// Test: tonic Greeter service over RDMA — server uses RdmaIncoming, client uses RdmaConnector.
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn tonic_greeter_over_rdma() {
     let (bind_addr, connect_addr) = test_addrs();
 
@@ -84,6 +84,7 @@ async fn tonic_greeter_over_rdma() {
 
     // Connect with retry — siw can reject connections transiently after
     // module reload or when stale resources linger in the kernel.
+    tracing::info!("Client connecting to server at {connect_addr}...");
     let connector = RdmaConnector::default();
     let uri = format!("http://{}:{}", connect_addr.ip(), connect_addr.port());
     let mut channel = None;
@@ -107,6 +108,7 @@ async fn tonic_greeter_over_rdma() {
     let channel = channel.unwrap();
     let mut client = GreeterClient::new(channel);
 
+    tracing::info!("Client connected, making gRPC call...");
     // Make the gRPC call with a timeout to avoid indefinite hangs
     let response = tokio::time::timeout(
         Duration::from_secs(5),
@@ -120,18 +122,11 @@ async fn tonic_greeter_over_rdma() {
 
     assert_eq!(response.into_inner().message, "Hello RDMA!");
 
+    tracing::info!("gRPC call succeeded, shutting down server...");
     // Graceful shutdown: drop client, signal server to stop, wait for drain.
     drop(client);
     shutdown_tx.send(()).unwrap();
-    let abort_handle = server_handle.abort_handle();
-    tokio::select! {
-        res = server_handle => res.unwrap(),
-        _ = tokio::time::sleep(Duration::from_secs(2)) => {
-            tracing::warn!("server shutdown timed out, aborting");
-            abort_handle.abort();
-        }
-    }
-
-    // Brief pause to let siw kernel resources settle
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tracing::info!("Waiting for server to shut down...");
+    server_handle.await.unwrap();
+    tracing::info!("Server shut down, test complete.");
 }

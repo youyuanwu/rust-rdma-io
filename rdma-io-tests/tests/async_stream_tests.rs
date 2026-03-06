@@ -241,6 +241,88 @@ async fn async_stream_tokio_io_copy() {
     println!("async_stream_tokio_io_copy passed!");
 }
 
+/// Test: server shutdown after client drops connection.
+///
+/// Reproduces the CI hang: client disconnects → server QP enters ERROR →
+/// server calls shutdown(). poll_close must detect the dead QP and return
+/// promptly instead of waiting indefinitely for CQ notifications or CM
+/// events that may never arrive.
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn async_stream_shutdown_after_peer_drop() {
+    let (mut server, client) = connected_pair().await;
+
+    // Drop client — its Drop impl calls disconnect(), sending DREQ.
+    // Server QP transitions to ERROR state.
+    drop(client);
+
+    // Give QP state change time to propagate.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Server shutdown must complete, not hang forever.
+    // This exercises poll_close Phase 2 (disconnect on dead QP) and
+    // Phase 3 (await DISCONNECTED event that may already have arrived).
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), server.shutdown()).await;
+
+    // Ok(Ok(..)) or Ok(Err(..)) are both acceptable — the important
+    // thing is that shutdown didn't hang (Err(Elapsed) = hang).
+    assert!(result.is_ok(), "server shutdown hung — timed out after 5s");
+    println!("async_stream_shutdown_after_peer_drop passed!");
+}
+
+/// Test: server read detects EOF, then shutdown completes immediately.
+///
+/// When poll_read sees flush completions it sets read_eof, which lets
+/// poll_close take the fast path (Layer 2). This is the well-tested path.
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn async_stream_read_eof_then_shutdown() {
+    let (mut server, client) = connected_pair().await;
+
+    drop(client);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Server reads — should get EOF (Ok(0)) from flush completions.
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(5), server.read(&mut buf))
+        .await
+        .expect("read hung")
+        .expect("read failed");
+    assert_eq!(n, 0, "expected EOF after peer disconnect");
+
+    // Now shutdown takes the read_eof fast path — should be instant.
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), server.shutdown()).await;
+    assert!(result.is_ok(), "server shutdown hung after read EOF");
+    println!("async_stream_read_eof_then_shutdown passed!");
+}
+
+/// Test: server writes to dead QP (BrokenPipe), then shutdown completes.
+///
+/// poll_write's Layer 3 (is_qp_error) sets read_eof on BrokenPipe.
+/// Subsequent poll_close takes the fast path via Layer 2.
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn async_stream_write_then_shutdown_after_peer_drop() {
+    let (mut server, client) = connected_pair().await;
+
+    drop(client);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Server write should fail — BrokenPipe via Layer 3 (is_qp_error).
+    let write_result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        server.write(b"data after disconnect"),
+    )
+    .await
+    .expect("write hung");
+    assert!(write_result.is_err(), "write to dead QP should fail");
+
+    // Now shutdown — read_eof set by Layer 3, poll_close returns immediately.
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), server.shutdown()).await;
+    assert!(
+        result.is_ok(),
+        "server shutdown hung after write BrokenPipe"
+    );
+    println!("async_stream_write_then_shutdown_after_peer_drop passed!");
+}
+
 /// Test: explicit shutdown() performs graceful disconnect (DREQ → DISCONNECTED).
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn async_stream_shutdown() {
