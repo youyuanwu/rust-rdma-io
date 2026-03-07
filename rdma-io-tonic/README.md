@@ -1,5 +1,7 @@
 # rdma-io-tonic
 
+Part of [rdma-io](../README.md) — safe Rust bindings for RDMA programming.
+
 [tonic](https://github.com/hyperium/tonic) gRPC transport over RDMA.
 
 Drop-in RDMA transport for tonic servers and clients — use `RdmaIncoming` for the server side and `RdmaConnector` for the client side. Supports all gRPC patterns (unary, server/client/bidi streaming) and optional mTLS via OpenSSL.
