@@ -27,13 +27,11 @@ use tokio::io::unix::AsyncFd;
 
 use crate::async_cm::{AsyncCmId, AsyncCmListener};
 use crate::async_cq::{AsyncCq, CqPollState};
+use crate::async_qp::AsyncQp;
 use crate::cm::{CmId, ConnParam, EventChannel, PortSpace};
-use crate::comp_channel::CompletionChannel;
-use crate::cq::CompletionQueue;
 use crate::mr::{AccessFlags, OwnedMemoryRegion};
 use crate::pd::ProtectionDomain;
 use crate::qp::QpInitAttr;
-use crate::tokio_notifier::TokioCqNotifier;
 use crate::wc::WorkCompletion;
 use crate::wr::QpType;
 
@@ -91,9 +89,7 @@ pub struct AsyncRdmaStream {
     recv_mrs: [OwnedMemoryRegion; NUM_RECV_BUFS],
     _pd: Arc<ProtectionDomain>,
     // RDMA teardown: QP first (needs CQs alive), then CQs, then CM.
-    cmqp: crate::cm::CmQueuePair,
-    send_cq: AsyncCq,
-    recv_cq: AsyncCq,
+    qp: AsyncQp,
     /// Async fd for CM event channel — registered alongside CQ fds so
     /// disconnect events wake poll_read/poll_write even when no CQ
     /// completions arrive (critical for rxe where CQ flush is unreliable).
@@ -127,17 +123,14 @@ impl AsyncRdmaStream {
 
         // Separate CQs for send and recv — avoids deadlock when both
         // sides send simultaneously (e.g. HTTP/2 connection setup).
-        let send_ch = CompletionChannel::new(&ctx)?;
-        let send_cq_raw = CompletionQueue::with_comp_channel(ctx.clone(), 2, &send_ch)?;
-        let recv_ch = CompletionChannel::new(&ctx)?;
-        let recv_cq_raw =
-            CompletionQueue::with_comp_channel(ctx, NUM_RECV_BUFS as i32 + 1, &recv_ch)?;
+        let send_cq = AsyncCq::create_tokio(ctx.clone(), 2)?;
+        let recv_cq = AsyncCq::create_tokio(ctx, NUM_RECV_BUFS as i32 + 1)?;
 
         let cmqp = async_cm.create_qp_with_cq(
             &pd,
             &stream_qp_attr(),
-            Some(&send_cq_raw),
-            Some(&recv_cq_raw),
+            Some(send_cq.cq()),
+            Some(recv_cq.cq()),
         )?;
 
         let send_mr = pd.reg_mr_owned(vec![0u8; buf_size], AccessFlags::LOCAL_WRITE)?;
@@ -146,27 +139,21 @@ impl AsyncRdmaStream {
                 .expect("failed to allocate recv MR")
         });
 
+        let qp = AsyncQp::new(cmqp, send_cq, recv_cq);
+
         // Pre-post all recv buffers before connect
         for (i, mr) in recv_mrs.iter().enumerate() {
-            post_recv_raw(cmqp.as_raw(), mr, i as u64)?;
+            qp.post_recv_buffer(mr, i as u64)?;
         }
 
         async_cm.connect(&ConnParam::default()).await?;
-
-        // Create async CQs AFTER connection is established
-        let send_notifier = TokioCqNotifier::new(send_ch.fd()).map_err(crate::Error::Verbs)?;
-        let send_cq = AsyncCq::new(send_cq_raw, send_ch, Box::new(send_notifier));
-        let recv_notifier = TokioCqNotifier::new(recv_ch.fd()).map_err(crate::Error::Verbs)?;
-        let recv_cq = AsyncCq::new(recv_cq_raw, recv_ch, Box::new(recv_notifier));
 
         let (event_channel, cm_id) = async_cm.into_parts();
 
         let cm_async_fd = AsyncFd::new(event_channel.fd()).map_err(crate::Error::Verbs)?;
 
         Ok(Self {
-            cmqp,
-            send_cq,
-            recv_cq,
+            qp,
             cm_async_fd,
             cm_id,
             event_channel,
@@ -253,7 +240,8 @@ impl AsyncRdmaStream {
         if copy_len < byte_len {
             self.recv_pending = Some((buf_idx, copy_len, byte_len));
         } else {
-            post_recv_raw(self.cmqp.as_raw(), &self.recv_mrs[buf_idx], buf_idx as u64)
+            self.qp
+                .post_recv_buffer(&self.recv_mrs[buf_idx], buf_idx as u64)
                 .map_err(io::Error::other)?;
         }
         Ok(copy_len)
@@ -286,7 +274,7 @@ impl AsyncRdmaStream {
             }
             Err(crate::Error::WouldBlock) => {
                 // No CM event — fall back to QP state check.
-                if is_qp_dead(self.cmqp.as_raw()) {
+                if is_qp_dead(self.qp.as_raw()) {
                     self.read_eof = true;
                     return true;
                 }
@@ -353,7 +341,8 @@ impl futures_io::AsyncRead for AsyncRdmaStream {
                 this.recv_pending = Some((buf_idx, offset + copy_len, total_len));
             } else {
                 this.recv_pending = None;
-                post_recv_raw(this.cmqp.as_raw(), &this.recv_mrs[buf_idx], buf_idx as u64)
+                this.qp
+                    .post_recv_buffer(&this.recv_mrs[buf_idx], buf_idx as u64)
                     .map_err(io::Error::other)?;
             }
             return Poll::Ready(Ok(copy_len));
@@ -362,10 +351,7 @@ impl futures_io::AsyncRead for AsyncRdmaStream {
         // 2. Poll recv CQ for completion (only recv completions appear here)
         let mut wc = [WorkCompletion::default(); 1];
         loop {
-            let n = match this
-                .recv_cq
-                .poll_completions(cx, &mut this.recv_cq_state, &mut wc)
-            {
+            let n = match this.qp.poll_recv_cq(cx, &mut this.recv_cq_state, &mut wc) {
                 Poll::Pending => {
                     // Register waker on CM event channel fd so disconnect
                     // events wake this task even if CQ fd never triggers.
@@ -423,7 +409,8 @@ impl futures_io::AsyncWrite for AsyncRdmaStream {
             let send_len = buf.len().min(this.send_mr.as_slice().len());
             this.send_mr.as_mut_slice()[..send_len].copy_from_slice(&buf[..send_len]);
 
-            post_send_raw(this.cmqp.as_raw(), &this.send_mr, 0, send_len, SEND_WR_ID)
+            this.qp
+                .post_send_signaled(&this.send_mr, 0, send_len, SEND_WR_ID)
                 .map_err(io::Error::other)?;
             this.write_pending = Some(send_len);
         }
@@ -433,10 +420,7 @@ impl futures_io::AsyncWrite for AsyncRdmaStream {
         // Poll send CQ for completion (only send completions appear here)
         let mut wc = [WorkCompletion::default(); 1];
         loop {
-            let n = match this
-                .send_cq
-                .poll_completions(cx, &mut this.send_cq_state, &mut wc)
-            {
+            let n = match this.qp.poll_send_cq(cx, &mut this.send_cq_state, &mut wc) {
                 Poll::Pending => {
                     // Register waker on CM event channel fd so disconnect
                     // events wake this task even if CQ fd never triggers.
@@ -492,26 +476,25 @@ impl futures_io::AsyncWrite for AsyncRdmaStream {
         if this.write_pending.is_some() {
             let mut wc_buf = [WorkCompletion::default(); 1];
             loop {
-                let n =
-                    match this
-                        .send_cq
-                        .poll_completions(cx, &mut this.send_cq_state, &mut wc_buf)
-                    {
-                        Poll::Pending => {
-                            this.register_cm_waker(cx);
-                            if this.read_eof {
-                                this.write_pending = None;
-                                this.disconnected = true;
-                                return Poll::Ready(Ok(()));
-                            }
-                            return Poll::Pending;
-                        }
-                        Poll::Ready(Err(e)) => {
+                let n = match this
+                    .qp
+                    .poll_send_cq(cx, &mut this.send_cq_state, &mut wc_buf)
+                {
+                    Poll::Pending => {
+                        this.register_cm_waker(cx);
+                        if this.read_eof {
                             this.write_pending = None;
-                            return Poll::Ready(Err(io::Error::other(e)));
+                            this.disconnected = true;
+                            return Poll::Ready(Ok(()));
                         }
-                        Poll::Ready(Ok(n)) => n,
-                    };
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(Err(e)) => {
+                        this.write_pending = None;
+                        return Poll::Ready(Err(io::Error::other(e)));
+                    }
+                    Poll::Ready(Ok(n)) => n,
+                };
                 if n > 0 {
                     this.write_pending = None;
                     break;
@@ -552,7 +535,7 @@ impl futures_io::AsyncWrite for AsyncRdmaStream {
                 Poll::Pending => {
                     // DISCONNECTED may never arrive (peer crashed, no DREP).
                     // Check QP state as fallback.
-                    if is_qp_dead(this.cmqp.as_raw()) {
+                    if is_qp_dead(this.qp.as_raw()) {
                         return Poll::Ready(Ok(()));
                     }
                     return Poll::Pending;
@@ -615,17 +598,14 @@ impl AsyncRdmaListener {
         let pd = conn_id.alloc_pd()?;
 
         // Separate CQs for send and recv
-        let send_ch = CompletionChannel::new(&ctx)?;
-        let send_cq_raw = CompletionQueue::with_comp_channel(ctx.clone(), 2, &send_ch)?;
-        let recv_ch = CompletionChannel::new(&ctx)?;
-        let recv_cq_raw =
-            CompletionQueue::with_comp_channel(ctx, NUM_RECV_BUFS as i32 + 1, &recv_ch)?;
+        let send_cq = AsyncCq::create_tokio(ctx.clone(), 2)?;
+        let recv_cq = AsyncCq::create_tokio(ctx, NUM_RECV_BUFS as i32 + 1)?;
 
         let cmqp = conn_id.create_qp_with_cq(
             &pd,
             &stream_qp_attr(),
-            Some(&send_cq_raw),
-            Some(&recv_cq_raw),
+            Some(send_cq.cq()),
+            Some(recv_cq.cq()),
         )?;
 
         let send_mr = pd.reg_mr_owned(vec![0u8; self.buf_size], AccessFlags::LOCAL_WRITE)?;
@@ -634,9 +614,11 @@ impl AsyncRdmaListener {
                 .expect("failed to allocate recv MR")
         });
 
+        let qp = AsyncQp::new(cmqp, send_cq, recv_cq);
+
         // Pre-post all recv buffers before accept handshake
         for (i, mr) in recv_mrs.iter().enumerate() {
-            post_recv_raw(cmqp.as_raw(), mr, i as u64)?;
+            qp.post_recv_buffer(mr, i as u64)?;
         }
 
         // Phase 2: accept handshake + await ESTABLISHED + migrate
@@ -645,20 +627,12 @@ impl AsyncRdmaListener {
             .complete_accept(conn_id, &ConnParam::default())
             .await?;
 
-        // Create async CQs AFTER connection is established
-        let send_notifier = TokioCqNotifier::new(send_ch.fd()).map_err(crate::Error::Verbs)?;
-        let send_cq = AsyncCq::new(send_cq_raw, send_ch, Box::new(send_notifier));
-        let recv_notifier = TokioCqNotifier::new(recv_ch.fd()).map_err(crate::Error::Verbs)?;
-        let recv_cq = AsyncCq::new(recv_cq_raw, recv_ch, Box::new(recv_notifier));
-
         let (event_channel, cm_id) = async_cm.into_parts();
 
         let cm_async_fd = AsyncFd::new(event_channel.fd()).map_err(crate::Error::Verbs)?;
 
         Ok(AsyncRdmaStream {
-            cmqp,
-            send_cq,
-            recv_cq,
+            qp,
             cm_async_fd,
             cm_id,
             event_channel,
@@ -687,60 +661,6 @@ fn stream_qp_attr() -> QpInitAttr {
         max_inline_data: 0,
         sq_sig_all: true,
     }
-}
-
-/// Post a recv WR using raw ibverbs.
-fn post_recv_raw(
-    qp: *mut rdma_io_sys::ibverbs::ibv_qp,
-    mr: &OwnedMemoryRegion,
-    wr_id: u64,
-) -> crate::Result<()> {
-    let mut sge = rdma_io_sys::ibverbs::ibv_sge {
-        addr: unsafe { (*mr.as_raw()).addr as u64 },
-        length: mr.as_slice().len() as u32,
-        lkey: mr.lkey(),
-    };
-    let mut wr = rdma_io_sys::ibverbs::ibv_recv_wr {
-        wr_id,
-        sg_list: &mut sge,
-        num_sge: 1,
-        ..Default::default()
-    };
-    let mut bad_wr: *mut rdma_io_sys::ibverbs::ibv_recv_wr = std::ptr::null_mut();
-    let ret = unsafe { rdma_io_sys::wrapper::rdma_wrap_ibv_post_recv(qp, &mut wr, &mut bad_wr) };
-    if ret != 0 {
-        return Err(crate::Error::Verbs(io::Error::from_raw_os_error(-ret)));
-    }
-    Ok(())
-}
-
-/// Post a signaled send WR using raw ibverbs.
-fn post_send_raw(
-    qp: *mut rdma_io_sys::ibverbs::ibv_qp,
-    mr: &OwnedMemoryRegion,
-    offset: usize,
-    len: usize,
-    wr_id: u64,
-) -> crate::Result<()> {
-    let mut sge = rdma_io_sys::ibverbs::ibv_sge {
-        addr: unsafe { (*mr.as_raw()).addr as u64 } + offset as u64,
-        length: len as u32,
-        lkey: mr.lkey(),
-    };
-    let mut wr = rdma_io_sys::ibverbs::ibv_send_wr {
-        wr_id,
-        sg_list: &mut sge,
-        num_sge: 1,
-        opcode: rdma_io_sys::ibverbs::IBV_WR_SEND,
-        send_flags: rdma_io_sys::ibverbs::IBV_SEND_SIGNALED,
-        ..Default::default()
-    };
-    let mut bad_wr: *mut rdma_io_sys::ibverbs::ibv_send_wr = std::ptr::null_mut();
-    let ret = unsafe { rdma_io_sys::wrapper::rdma_wrap_ibv_post_send(qp, &mut wr, &mut bad_wr) };
-    if ret != 0 {
-        return Err(crate::Error::Verbs(io::Error::from_raw_os_error(-ret)));
-    }
-    Ok(())
 }
 
 /// Check if a QP is no longer operational (any state other than RTS).

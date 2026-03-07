@@ -96,6 +96,19 @@ impl AsyncCq {
         }
     }
 
+    /// Create an `AsyncCq` with a tokio-backed notifier.
+    ///
+    /// Convenience factory that creates a `CompletionChannel`,
+    /// `CompletionQueue`, and `TokioCqNotifier` in one call.
+    #[cfg(feature = "tokio")]
+    pub fn create_tokio(ctx: Arc<crate::device::Context>, depth: i32) -> crate::Result<Self> {
+        let ch = CompletionChannel::new(&ctx)?;
+        let cq = CompletionQueue::with_comp_channel(ctx, depth, &ch)?;
+        let notifier =
+            crate::tokio_notifier::TokioCqNotifier::new(ch.fd()).map_err(crate::Error::Verbs)?;
+        Ok(Self::new(cq, ch, Box::new(notifier)))
+    }
+
     /// Poll for up to `wc_buf.len()` completions asynchronously.
     ///
     /// Returns when at least one completion is available.

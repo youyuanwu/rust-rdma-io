@@ -1,41 +1,54 @@
 //! Async Queue Pair — mid-level async wrapper for RDMA verbs.
 //!
-//! `AsyncQp` wraps a [`CmQueuePair`] + [`AsyncCq`] and provides async
-//! methods for individual RDMA verbs. Unlike `AsyncRdmaStream` (which
-//! provides a buffered stream abstraction), `AsyncQp` exposes each verb
-//! individually for full control.
+//! `AsyncQp` wraps a [`CmQueuePair`] + separate send/recv [`AsyncCq`]s and
+//! provides both async and poll-based methods for RDMA verbs.
 //!
-//! Field order matters: `qp` (a [`CmQueuePair`]) is declared before
-//! `async_cq`, so Rust drops the QP before the CQ — matching the
-//! kernel-enforced teardown order.
+//! Unlike `AsyncRdmaStream` (which provides a buffered stream abstraction),
+//! `AsyncQp` exposes each verb individually for full control.
+//!
+//! # Dual CQ Architecture
+//!
+//! Send and recv completions are routed to **separate CQs** to avoid
+//! silent completion loss when both operations are in-flight concurrently.
+//! See `docs/design/AsyncQpPolling.md` for the rationale.
+//!
+//! # Drop Order
+//!
+//! Field order matters: `qp` is declared before `send_cq`/`recv_cq`,
+//! so Rust drops the QP before the CQs — matching the kernel-enforced
+//! teardown order.
 
 use rdma_io_sys::ibverbs::*;
 use rdma_io_sys::wrapper::*;
 
-use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use crate::Result;
-use crate::async_cq::AsyncCq;
+use crate::async_cq::{AsyncCq, CqPollState};
 use crate::cm::CmQueuePair;
-use crate::cq::CompletionQueue;
 use crate::error::from_ret;
 use crate::mr::{OwnedMemoryRegion, RemoteMr};
 use crate::wc::WorkCompletion;
 use crate::wr::{RecvWr, SendFlags, SendWr, Sge, WrOpcode};
 
-/// Async wrapper owning a CM-managed QP and its async completion queue.
+/// Async wrapper owning a CM-managed QP and its async completion queues.
 ///
-/// Drop order: `qp` first (destroys QP), `async_cq` second (destroys CQ).
+/// Drop order: `qp` first (destroys QP), then `send_cq`, then `recv_cq`.
 pub struct AsyncQp {
-    // IMPORTANT: field order = drop order. QP must die before CQ.
+    // IMPORTANT: field order = drop order. QP must die before CQs.
     qp: CmQueuePair,
-    async_cq: AsyncCq,
+    send_cq: AsyncCq,
+    recv_cq: AsyncCq,
 }
 
 impl AsyncQp {
-    /// Create a new `AsyncQp` from a [`CmQueuePair`] and [`AsyncCq`].
-    pub fn new(qp: CmQueuePair, async_cq: AsyncCq) -> Self {
-        Self { qp, async_cq }
+    /// Create a new `AsyncQp` with separate send and recv CQs.
+    pub fn new(qp: CmQueuePair, send_cq: AsyncCq, recv_cq: AsyncCq) -> Self {
+        Self {
+            qp,
+            send_cq,
+            recv_cq,
+        }
     }
 
     /// Access the raw QP pointer.
@@ -43,15 +56,7 @@ impl AsyncQp {
         self.qp.as_raw()
     }
 
-    /// Access the underlying AsyncCq.
-    pub fn async_cq(&self) -> &AsyncCq {
-        &self.async_cq
-    }
-
-    /// Access the underlying CQ.
-    pub fn cq(&self) -> &Arc<CompletionQueue> {
-        self.async_cq.cq()
-    }
+    // --- Post helpers (private) ---
 
     fn post_send_raw(&self, wr: &mut SendWr) -> Result<()> {
         let mut raw = wr.build_raw();
@@ -64,6 +69,8 @@ impl AsyncQp {
         let mut bad_wr: *mut ibv_recv_wr = std::ptr::null_mut();
         from_ret(unsafe { rdma_wrap_ibv_post_recv(self.qp.as_raw(), &mut raw, &mut bad_wr) })
     }
+
+    // --- Fire-and-forget post methods ---
 
     /// Post a SEND without waiting for completion.
     ///
@@ -86,6 +93,46 @@ impl AsyncQp {
         self.post_send_raw(&mut wr)
     }
 
+    /// Post a RECV buffer without waiting for completion.
+    ///
+    /// Used by `AsyncRdmaStream` to pre-post recv buffers and re-post
+    /// after consuming a recv completion.
+    pub fn post_recv_buffer(&self, mr: &OwnedMemoryRegion, wr_id: u64) -> Result<()> {
+        let sge = Sge::new(
+            unsafe { (*mr.as_raw()).addr as u64 },
+            mr.as_slice().len() as u32,
+            mr.lkey(),
+        );
+        let mut wr = RecvWr::new(wr_id).sg(sge);
+        self.post_recv_raw(&mut wr)
+    }
+
+    // --- Poll-based CQ accessors (for AsyncRead/AsyncWrite impls) ---
+
+    /// Poll the send CQ for completions.
+    #[inline]
+    pub fn poll_send_cq(
+        &self,
+        cx: &mut Context<'_>,
+        state: &mut CqPollState,
+        wc_buf: &mut [WorkCompletion],
+    ) -> Poll<Result<usize>> {
+        self.send_cq.poll_completions(cx, state, wc_buf)
+    }
+
+    /// Poll the recv CQ for completions.
+    #[inline]
+    pub fn poll_recv_cq(
+        &self,
+        cx: &mut Context<'_>,
+        state: &mut CqPollState,
+        wc_buf: &mut [WorkCompletion],
+    ) -> Poll<Result<usize>> {
+        self.recv_cq.poll_completions(cx, state, wc_buf)
+    }
+
+    // --- Async convenience methods ---
+
     /// Post a SEND and await its completion.
     ///
     /// Posts `length` bytes from `mr` starting at `offset`, then awaits
@@ -106,7 +153,7 @@ impl AsyncQp {
             .flags(SendFlags::SIGNALED)
             .sg(sge);
         self.post_send_raw(&mut wr)?;
-        self.async_cq.poll_wr_id(wr_id).await
+        self.send_cq.poll_wr_id(wr_id).await
     }
 
     /// Post a RECV buffer and await its completion.
@@ -127,7 +174,7 @@ impl AsyncQp {
         );
         let mut wr = RecvWr::new(wr_id).sg(sge);
         self.post_recv_raw(&mut wr)?;
-        self.async_cq.poll_wr_id(wr_id).await
+        self.recv_cq.poll_wr_id(wr_id).await
     }
 
     /// Post a SEND with immediate data and await completion.
@@ -148,7 +195,7 @@ impl AsyncQp {
             .flags(SendFlags::SIGNALED)
             .sg(sge);
         self.post_send_raw(&mut wr)?;
-        self.async_cq.poll_wr_id(wr_id).await
+        self.send_cq.poll_wr_id(wr_id).await
     }
 
     // --- One-sided RDMA verbs ---
@@ -171,7 +218,7 @@ impl AsyncQp {
             .sg(sge)
             .rdma(remote.addr + remote_offset, remote.rkey);
         self.post_send_raw(&mut wr)?;
-        self.async_cq.poll_wr_id(wr_id).await
+        self.send_cq.poll_wr_id(wr_id).await
     }
 
     /// RDMA WRITE: write data from a local buffer to a remote memory region.
@@ -192,7 +239,7 @@ impl AsyncQp {
             .sg(sge)
             .rdma(remote.addr + remote_offset, remote.rkey);
         self.post_send_raw(&mut wr)?;
-        self.async_cq.poll_wr_id(wr_id).await
+        self.send_cq.poll_wr_id(wr_id).await
     }
 
     /// RDMA WRITE with immediate data.
@@ -216,7 +263,7 @@ impl AsyncQp {
             .sg(sge)
             .rdma(remote.addr + remote_offset, remote.rkey);
         self.post_send_raw(&mut wr)?;
-        self.async_cq.poll_wr_id(wr_id).await
+        self.send_cq.poll_wr_id(wr_id).await
     }
 
     // --- Atomic verbs ---
@@ -243,7 +290,7 @@ impl AsyncQp {
             .sg(sge)
             .atomic(remote.addr + remote_offset, remote.rkey, compare, swap);
         self.post_send_raw(&mut wr)?;
-        self.async_cq.poll_wr_id(wr_id).await
+        self.send_cq.poll_wr_id(wr_id).await
     }
 
     /// Atomic Fetch-and-Add on a remote 8-byte value.
@@ -266,11 +313,6 @@ impl AsyncQp {
             .sg(sge)
             .atomic(remote.addr + remote_offset, remote.rkey, add_value, 0);
         self.post_send_raw(&mut wr)?;
-        self.async_cq.poll_wr_id(wr_id).await
-    }
-
-    /// Poll for completions directly (low-level access).
-    pub async fn poll(&self, wc_buf: &mut [WorkCompletion]) -> Result<usize> {
-        self.async_cq.poll(wc_buf).await
+        self.send_cq.poll_wr_id(wr_id).await
     }
 }

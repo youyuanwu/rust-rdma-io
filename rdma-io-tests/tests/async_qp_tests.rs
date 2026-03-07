@@ -18,7 +18,6 @@ use rdma_io::cq::CompletionQueue;
 use rdma_io::mr::{AccessFlags, RemoteMr};
 use rdma_io::pd::ProtectionDomain;
 use rdma_io::qp::QpInitAttr;
-use rdma_io::tokio_notifier::TokioCqNotifier;
 use rdma_io::wr::QpType;
 
 use rdma_io_tests::test_helpers::test_addrs;
@@ -57,11 +56,16 @@ async fn setup_connection(
 
         let pd = conn_id.alloc_pd().unwrap();
         let ctx = conn_id.verbs_context().unwrap();
-        let comp_ch = CompletionChannel::new(&ctx).unwrap();
-        let cq = CompletionQueue::with_comp_channel(ctx, 16, &comp_ch).unwrap();
+        let send_cq = AsyncCq::create_tokio(ctx.clone(), 16).unwrap();
+        let recv_cq = AsyncCq::create_tokio(ctx, 16).unwrap();
 
         let cmqp = conn_id
-            .create_qp_with_cq(&pd, &default_qp_attr(), Some(&cq), Some(&cq))
+            .create_qp_with_cq(
+                &pd,
+                &default_qp_attr(),
+                Some(send_cq.cq()),
+                Some(recv_cq.cq()),
+            )
             .unwrap();
 
         let async_cm = listener
@@ -69,9 +73,7 @@ async fn setup_connection(
             .await
             .unwrap();
 
-        let notifier = TokioCqNotifier::new(comp_ch.fd()).unwrap();
-        let async_cq = AsyncCq::new(cq, comp_ch, Box::new(notifier));
-        let aqp = AsyncQp::new(cmqp, async_cq);
+        let aqp = AsyncQp::new(cmqp, send_cq, recv_cq);
 
         AsyncEndpoint {
             aqp,
@@ -93,18 +95,21 @@ async fn setup_connection(
 
         let pd = async_cm.alloc_pd().unwrap();
         let ctx = async_cm.verbs_context().unwrap();
-        let comp_ch = CompletionChannel::new(&ctx).unwrap();
-        let cq = CompletionQueue::with_comp_channel(ctx, 16, &comp_ch).unwrap();
+        let send_cq = AsyncCq::create_tokio(ctx.clone(), 16).unwrap();
+        let recv_cq = AsyncCq::create_tokio(ctx, 16).unwrap();
 
         let cmqp = async_cm
-            .create_qp_with_cq(&pd, &default_qp_attr(), Some(&cq), Some(&cq))
+            .create_qp_with_cq(
+                &pd,
+                &default_qp_attr(),
+                Some(send_cq.cq()),
+                Some(recv_cq.cq()),
+            )
             .unwrap();
 
         async_cm.connect(&ConnParam::default()).await.unwrap();
 
-        let notifier = TokioCqNotifier::new(comp_ch.fd()).unwrap();
-        let async_cq = AsyncCq::new(cq, comp_ch, Box::new(notifier));
-        let aqp = AsyncQp::new(cmqp, async_cq);
+        let aqp = AsyncQp::new(cmqp, send_cq, recv_cq);
 
         AsyncEndpoint {
             aqp,

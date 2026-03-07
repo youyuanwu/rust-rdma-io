@@ -9,6 +9,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_TEST_THREADS: "1"
+  RUST_VERSION: "1.94.0"
 
 jobs:
   build-and-test:
@@ -55,7 +56,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.93.0"
+          toolchain: "${{ env.RUST_VERSION }}"
           components: clippy
 
       # - uses: Swatinem/rust-cache@v2
@@ -74,6 +75,7 @@ jobs:
           for i in $(seq 1 5); do
             echo "=== Test run $i/5 ==="
             cargo test -p rdma-io-tests -- --nocapture
+            sleep 3
           done
         timeout-minutes: 30
 
@@ -123,7 +125,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.94.0"
+          toolchain: "${{ env.RUST_VERSION }}"
           components: clippy
 
       - name: Build
@@ -142,5 +144,6 @@ jobs:
           for i in $(seq 1 5); do
             echo "=== Test run $i/5 ==="
             cargo test -p rdma-io-tests -- --nocapture
+            sleep 3
           done
         timeout-minutes: 30
