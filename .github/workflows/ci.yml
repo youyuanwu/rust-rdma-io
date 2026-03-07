@@ -31,27 +31,12 @@ jobs:
 
       - uses: taiki-e/install-action@protoc
 
-      - name: Install kernel extra modules and load siw
+      - name: Install kernel extra modules and setup siw
         run: |
           KVER=$(uname -r)
           echo "Kernel: $KVER"
-
-          # Install extra modules (contains siw)
           sudo apt-get install -y "linux-modules-extra-${KVER}" || true
-
-          # Load RDMA stack
-          sudo modprobe rdma_cm
-          sudo modprobe rdma_ucm
-          sudo modprobe siw
-
-          # Create siw device on first non-lo interface
-          IFACE=$(ip -o link show up | awk -F': ' '{print $2}' | grep -v lo | head -1)
-          echo "Creating siw0 on interface: $IFACE"
-          sudo rdma link add siw0 type siw netdev "$IFACE"
-
-          # Verify
-          ibv_devices
-          rdma link show
+          sudo ./scripts/setup-siw.sh
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -111,16 +96,7 @@ jobs:
         run: |
           # Remove Mellanox VFs if present (avoids test device confusion)
           sudo rmmod mlx5_ib 2>/dev/null || true
-          sudo modprobe ib_core rdma_ucm
-          sudo insmod build/_deps/linux_kernel-build/rxe/rdma_rxe.ko
-          IFACE=$(ip -o link show up | awk -F': ' '{print $2}' | grep -v lo | head -1)
-          echo "Creating rxe0 on interface: $IFACE"
-          sudo rdma link add rxe0 type rxe netdev "$IFACE"
-
-          # Verify
-          ibv_devices
-          rdma link show
-          lsmod | grep -E "rdma_rxe|ib_core"
+          sudo ./scripts/setup-rxe.sh
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master

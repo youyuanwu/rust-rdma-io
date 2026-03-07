@@ -46,51 +46,9 @@ Client write(buf)                    Server read(buf)
 - **Both CPUs involved**: Receiver must actively post and process completions
 - **Memory scales linearly**: 576KB × N connections
 
-## Alternative: RDMA Write-Based Stream
+## Alternative: RDMA Write-Based Stream (rsocket)
 
-The **rsocket** library (part of librdmacm/rdma-core) implements a POSIX-compatible byte stream using RDMA Write internally. This is the most production-proven alternative.
-
-### rsocket Architecture
-
-```
-Sender rsend(buf)                    Receiver rrecv(buf)
-  ├─ RDMA Write → remote ring buf     ├─ poll for new data
-  ├─ Send immediate (doorbell)         ├─ read from ring position
-  └─ advance local tail pointer        └─ advance head, send credit
-```
-
-Key design elements:
-- **Ring buffers**: Both sides maintain registered ring buffers. Sender writes directly into receiver's buffer via RDMA Write
-- **Credit-based flow control**: Receiver advertises available credits. Sender blocks when credits exhausted
-- **Immediate data as doorbell**: RDMA Write with Immediate notifies receiver of new data arrival
-- **Zero-copy on receive**: Data lands directly in pre-registered buffer — one less copy than Send/Recv
-
-### Trade-offs vs Send/Recv
-
-| Aspect | Send/Recv | Write-Based (rsocket) |
-|--------|-----------|----------------------|
-| **Copies** | 2 per message | 1 (sender only) |
-| **Recv CPU** | Active (post + process) | Passive (data arrives in-place) |
-| **Setup complexity** | Low | High (exchange MR keys, manage ring) |
-| **Flow control** | Implicit (buffer count) | Explicit credits (more protocol code) |
-| **iWARP support** | ✅ Full | ⚠️ Write+Imm not supported on iWARP |
-| **Memory** | 576KB/conn | Similar (ring buffers) |
-| **Latency** | ~same | Slightly lower (fewer completions) |
-
-### Availability
-
-rsocket is part of `librdmacm` (rdma-core). On this machine it's already installed:
-- Header: `/usr/include/rdma/rsocket.h` (via `librdmacm-dev`)
-- Library: `librdmacm1t64` 50.0
-- Tools: `rdmacm-utils` includes `rstream` and `rping` for benchmarking
-
-It could be called from Rust via FFI or by linking against `-lrdmacm`. However, rsocket is a C library that manages its own event loop and buffers — integrating it with tokio's async model would require significant bridging work.
-
-### Why rsocket Isn't Strictly Better
-
-1. **iWARP incompatibility**: RDMA Write with Immediate Data is an InfiniBand/RoCE feature. iWARP does not support it. Our crate targets all transports including siw
-2. **Protocol complexity**: Credit management, ring pointer synchronization, and key exchange add significant implementation and debugging surface
-3. **Marginal gain for small messages**: The saved recv-side copy matters for large transfers but is negligible for gRPC/RPC payloads (typically <1KB)
+The **rsocket** library (part of librdmacm) implements a byte stream using RDMA Write internally. It saves one memory copy on the receive side but introduces protocol complexity and has limited transport support. See **[Rsocket.md](Rsocket.md)** for full architecture, benchmarks, and compatibility testing.
 
 ## Other Approaches in the Wild
 
@@ -137,8 +95,7 @@ If profiling shows Send/Recv is the bottleneck:
 
 ## References
 
-- [rsocket(7) man page](https://manpages.debian.org/testing/librdmacm-dev/rsocket.7.en.html) — librdmacm byte stream over RDMA Write
 - [FaSST: Fast, Scalable Distributed Transactions](https://www.usenix.org/conference/osdi16/technical-sessions/presentation/kalia) — Two-sided RDMA at scale
 - [Design Guidelines for High Performance RDMA Systems](https://www.usenix.org/conference/atc16/technical-sessions/presentation/kalia) — USENIX ATC'16
 - [Demikernel SOSP'21](https://irenezhang.net/papers/demikernel-sosp21.pdf) — Datapath OS with RDMA LibOS
-- [RB²: Distributed Ring Buffer](https://jokerwyt.github.io/rb2.pdf) — Write-based ring buffer design
+- [rsocket analysis](Rsocket.md) — Detailed rsocket architecture, benchmarks, and compatibility

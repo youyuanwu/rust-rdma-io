@@ -72,12 +72,5 @@ add_custom_target(rxe
     COMMENT "Building rdma_rxe.ko (out-of-tree)"
 )
 
-# Convenience target: load the module
-add_custom_target(rxe-load
-    COMMAND sudo modprobe ib_core rdma_ucm
-    COMMAND sudo insmod "${RXE_BUILD_DIR}/rdma_rxe.ko"
-    COMMAND sudo rdma link add rxe0 type rxe netdev eth0
-    COMMAND rdma link show
-    DEPENDS rxe
-    COMMENT "Loading rdma_rxe and creating rxe0 device"
-)
+# After building, load with: sudo ./scripts/setup-rxe.sh
+# The script auto-detects the out-of-tree .ko in the build directory.
