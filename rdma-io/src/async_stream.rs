@@ -41,9 +41,12 @@ const DEFAULT_BUF_SIZE: usize = 64 * 1024;
 /// Number of pre-posted recv buffers.
 ///
 /// iWARP (siw) has no RNR retry — missing recv buffers cause an immediate
-/// DDP TERMINATE error. Multiple buffers absorb back-to-back sends from
-/// the peer (e.g. HTTP/2 rapid frame bursts).
-const NUM_RECV_BUFS: usize = 4;
+/// DDP TERMINATE error. Must absorb back-to-back sends from the peer
+/// without the application consuming any completions in between. The worst
+/// case is TLS mTLS handshake + HTTP/2 connection setup where the peer
+/// sends ~6-7 messages in a burst (Certificate, CertificateVerify,
+/// Finished, SETTINGS, WindowUpdate, HEADERS, DATA).
+const NUM_RECV_BUFS: usize = 8;
 
 /// WR IDs: 0..NUM_RECV_BUFS-1 for recv buffers, NUM_RECV_BUFS for send.
 const SEND_WR_ID: u64 = NUM_RECV_BUFS as u64;
