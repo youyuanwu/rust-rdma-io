@@ -9,10 +9,13 @@ publish = false
 [dependencies]
 rdma-io-sys.workspace = true
 rdma-io = { workspace = true, features = ["tokio"] }
-rdma-io-tonic = { path = "../rdma-io-tonic" }
+rdma-io-tonic = { path = "../rdma-io-tonic", features = ["tls"] }
 tonic = { version = "0.14" }
+tonic-tls = { version = "0.7", features = ["openssl"] }
 tonic-prost = "0.14"
 prost = "0.14"
+openssl = "0.10"
+rcgen = "0.13"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "time"] }
 tokio-stream = "0.1"
 futures-io.workspace = true

@@ -11,26 +11,7 @@ use rdma_io::qp::QpInitAttr;
 use rdma_io::wc::WorkCompletion;
 use rdma_io::wr::QpType;
 
-/// Pick a unique port per test, with the server binding to 0.0.0.0
-/// and the client connecting to the first non-loopback IPv4 address.
-fn test_addrs() -> (std::net::SocketAddr, std::net::SocketAddr) {
-    use std::sync::atomic::{AtomicU16, Ordering};
-    static PORT: AtomicU16 = AtomicU16::new(39876);
-    let port = PORT.fetch_add(1, Ordering::Relaxed);
-
-    let bind_addr: std::net::SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
-    let connect_addr: std::net::SocketAddr = format!("{}:{port}", local_ip()).parse().unwrap();
-    (bind_addr, connect_addr)
-}
-
-/// Discover the first non-loopback IPv4 address (for siw0 over eth0).
-fn local_ip() -> String {
-    use std::net::UdpSocket;
-    // Trick: connect a UDP socket to an external address to find the local IP.
-    let sock = UdpSocket::bind("0.0.0.0:0").unwrap();
-    sock.connect("8.8.8.8:80").unwrap();
-    sock.local_addr().unwrap().ip().to_string()
-}
+use rdma_io_tests::test_helpers::test_addrs;
 
 fn default_qp_attr() -> QpInitAttr {
     QpInitAttr {

@@ -11,21 +11,7 @@
 
 use rdma_io::async_stream::{AsyncRdmaListener, AsyncRdmaStream};
 
-fn test_addrs() -> (std::net::SocketAddr, std::net::SocketAddr) {
-    use std::sync::atomic::{AtomicU16, Ordering};
-    static PORT: AtomicU16 = AtomicU16::new(40300);
-    let port = PORT.fetch_add(1, Ordering::Relaxed);
-    let bind_addr: std::net::SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
-    let connect_addr: std::net::SocketAddr = format!("{}:{port}", local_ip()).parse().unwrap();
-    (bind_addr, connect_addr)
-}
-
-fn local_ip() -> String {
-    use std::net::UdpSocket;
-    let sock = UdpSocket::bind("0.0.0.0:0").unwrap();
-    sock.connect("8.8.8.8:80").unwrap();
-    sock.local_addr().unwrap().ip().to_string()
-}
+use rdma_io_tests::test_helpers::test_addrs;
 
 /// Test: async echo — client sends, server reads and echoes back.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]

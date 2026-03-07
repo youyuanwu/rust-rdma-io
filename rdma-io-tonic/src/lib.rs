@@ -39,6 +39,12 @@ mod connector;
 mod incoming;
 mod stream;
 
+#[cfg(feature = "tls")]
+mod tls;
+
 pub use connector::RdmaConnector;
 pub use incoming::RdmaIncoming;
 pub use stream::{RdmaConnectInfo, TokioRdmaStream};
+
+#[cfg(feature = "tls")]
+pub use tls::RdmaTransport;

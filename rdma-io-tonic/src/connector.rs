@@ -78,7 +78,7 @@ impl Service<Uri> for RdmaConnector {
 }
 
 /// Extract a `SocketAddr` from a URI's authority (host:port).
-fn uri_to_socket_addr(uri: &Uri) -> Result<SocketAddr, rdma_io::Error> {
+pub(crate) fn uri_to_socket_addr(uri: &Uri) -> Result<SocketAddr, rdma_io::Error> {
     let host = uri
         .host()
         .ok_or_else(|| rdma_io::Error::InvalidArg("URI has no host".into()))?;

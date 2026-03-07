@@ -15,3 +15,11 @@ http = "1"
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures-util = { workspace = true }
+
+# TLS (optional)
+tonic-tls = { version = "0.7", features = ["openssl"], optional = true }
+openssl = { version = "0.10", optional = true }
+
+[features]
+default = []
+tls = ["dep:tonic-tls", "dep:openssl"]

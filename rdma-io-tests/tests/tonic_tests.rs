@@ -2,113 +2,18 @@
 //!
 //! Tests verify that tonic server + client can communicate over RDMA
 //! using `RdmaIncoming` (server) and `RdmaConnector` (client).
-//!
-//! Note: siw (soft-iWARP) can be flaky, particularly right after module
-//! reload or when stale kernel resources remain from forcefully killed
-//! processes. The test includes retry logic to tolerate transient failures.
 
-use std::pin::Pin;
 use std::time::Duration;
 
 use rdma_io::async_stream::AsyncRdmaListener;
 use rdma_io_tonic::{RdmaConnector, RdmaIncoming};
 
-use greeter::greeter_client::GreeterClient;
-use greeter::greeter_server::{Greeter, GreeterServer};
-use greeter::{HelloReply, HelloRequest};
-use tokio_stream::{Stream, StreamExt};
+use rdma_io_tests::greeter_service::*;
+use rdma_io_tests::test_helpers::test_addrs;
+
+use tokio_stream::StreamExt;
+use tonic::Request;
 use tonic::transport::{Channel, Endpoint, Server};
-use tonic::{Request, Response, Status, Streaming};
-
-pub mod greeter {
-    tonic::include_proto!("greeter");
-}
-
-fn test_addrs() -> (std::net::SocketAddr, std::net::SocketAddr) {
-    let sock = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
-    let port = sock.local_addr().unwrap().port();
-    drop(sock);
-    let bind_addr: std::net::SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
-    let connect_addr: std::net::SocketAddr = format!("{}:{port}", local_ip()).parse().unwrap();
-    (bind_addr, connect_addr)
-}
-
-fn local_ip() -> String {
-    use std::net::UdpSocket;
-    let sock = UdpSocket::bind("0.0.0.0:0").unwrap();
-    sock.connect("8.8.8.8:80").unwrap();
-    sock.local_addr().unwrap().ip().to_string()
-}
-
-#[derive(Debug, Default)]
-pub struct MyGreeter;
-
-#[tonic::async_trait]
-impl Greeter for MyGreeter {
-    async fn say_hello(
-        &self,
-        request: Request<HelloRequest>,
-    ) -> Result<Response<HelloReply>, Status> {
-        let name = request.into_inner().name;
-        Ok(Response::new(HelloReply {
-            message: format!("Hello {}!", name),
-        }))
-    }
-
-    type ServerStreamStream =
-        Pin<Box<dyn Stream<Item = Result<HelloReply, Status>> + Send + 'static>>;
-
-    async fn server_stream(
-        &self,
-        request: Request<HelloRequest>,
-    ) -> Result<Response<Self::ServerStreamStream>, Status> {
-        let name = request.into_inner().name;
-        let stream = tokio_stream::iter(0..5).map(move |i| {
-            Ok(HelloReply {
-                message: format!("{name}-{i}"),
-            })
-        });
-        Ok(Response::new(Box::pin(stream)))
-    }
-
-    async fn client_stream(
-        &self,
-        request: Request<Streaming<HelloRequest>>,
-    ) -> Result<Response<HelloReply>, Status> {
-        let mut stream = request.into_inner();
-        let mut names = Vec::new();
-        while let Some(req) = stream.next().await {
-            names.push(req?.name);
-        }
-        Ok(Response::new(HelloReply {
-            message: format!("Hello {}!", names.join(", ")),
-        }))
-    }
-
-    type BidiStreamStream =
-        Pin<Box<dyn Stream<Item = Result<HelloReply, Status>> + Send + 'static>>;
-
-    async fn bidi_stream(
-        &self,
-        request: Request<Streaming<HelloRequest>>,
-    ) -> Result<Response<Self::BidiStreamStream>, Status> {
-        let mut stream = request.into_inner();
-        let (tx, rx) = tokio::sync::mpsc::channel(16);
-        tokio::spawn(async move {
-            while let Some(Ok(req)) = stream.next().await {
-                let reply = HelloReply {
-                    message: format!("echo: {}", req.name),
-                };
-                if tx.send(Ok(reply)).await.is_err() {
-                    break;
-                }
-            }
-        });
-        Ok(Response::new(Box::pin(
-            tokio_stream::wrappers::ReceiverStream::new(rx),
-        )))
-    }
-}
 
 /// Start a tonic server over RDMA and return (client, shutdown_tx, server_handle).
 async fn start_server_and_connect() -> (
