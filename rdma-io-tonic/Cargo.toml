@@ -3,8 +3,10 @@ name = "rdma-io-tonic"
 version = "0.0.1"
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+documentation.workspace = true
 description = "Tonic gRPC transport over RDMA"
-readme = "../README.md"
+readme = "README.md"
 
 [dependencies]
 rdma-io = { workspace = true, features = ["tokio"] }

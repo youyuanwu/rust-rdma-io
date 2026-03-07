@@ -4,6 +4,8 @@ members = ["bnd-rdma-gen", "rdma-io", "rdma-io-sys", "rdma-io-tests", "rdma-io-t
 
 package.edition = "2024"
 package.license = "MIT"
+package.repository = "https://github.com/youyuanwu/rust-rdma-io"
+package.documentation = "https://github.com/youyuanwu/rust-rdma-io"
 
 [workspace.dependencies]
 # Internal crates

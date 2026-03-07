@@ -3,6 +3,8 @@ name = "rdma-io-sys"
 version = "0.0.1"
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+documentation.workspace = true
 description = "Low-level RDMA sys crate — FFI bindings for libibverbs + librdmacm"
 readme = "README.md"
 
