@@ -20,7 +20,7 @@ use rdma_io::pd::ProtectionDomain;
 use rdma_io::qp::QpInitAttr;
 use rdma_io::wr::QpType;
 
-use rdma_io_tests::test_helpers::test_addrs;
+use rdma_io_tests::test_helpers::{bind_addr, connect_addr_for};
 
 fn default_qp_attr() -> QpInitAttr {
     QpInitAttr {
@@ -44,11 +44,9 @@ struct AsyncEndpoint {
 
 /// Set up a connected server+client pair using async CM.
 /// Returns (server_endpoint, client_endpoint) ready for async verb posting.
-async fn setup_connection(
-    bind_addr: std::net::SocketAddr,
-    connect_addr: std::net::SocketAddr,
-) -> (AsyncEndpoint, AsyncEndpoint) {
-    let listener = AsyncCmListener::bind(&bind_addr).unwrap();
+async fn setup_connection() -> (AsyncEndpoint, AsyncEndpoint) {
+    let listener = AsyncCmListener::bind(&bind_addr()).unwrap();
+    let connect_addr = connect_addr_for(listener.local_addr());
 
     let server_handle = tokio::spawn(async move {
         // Two-phase accept: get request, set up QP, then complete
@@ -125,8 +123,7 @@ async fn setup_connection(
 /// Test: AsyncQp send/recv roundtrip.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn async_qp_send_recv() {
-    let (bind_addr, connect_addr) = test_addrs();
-    let (server, client) = setup_connection(bind_addr, connect_addr).await;
+    let (server, client) = setup_connection().await;
 
     let server_mr = server
         .pd
@@ -166,8 +163,7 @@ async fn async_qp_send_recv() {
 /// Test: AsyncQp multi-message ping-pong.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn async_qp_ping_pong() {
-    let (bind_addr, connect_addr) = test_addrs();
-    let (server, client) = setup_connection(bind_addr, connect_addr).await;
+    let (server, client) = setup_connection().await;
 
     let server_mr = server
         .pd
@@ -258,8 +254,7 @@ async fn exchange_remote_mr(
 /// then reads it back via RDMA READ to verify.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn async_qp_rdma_write_read() {
-    let (bind_addr, connect_addr) = test_addrs();
-    let (server, client) = setup_connection(bind_addr, connect_addr).await;
+    let (server, client) = setup_connection().await;
 
     // Server MR with remote access
     let server_data_mr = server
@@ -348,8 +343,7 @@ fn device_supports_atomics(pd: &ProtectionDomain) -> bool {
 /// returning the current value 42.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn async_qp_atomic_compare_and_swap() {
-    let (bind_addr, connect_addr) = test_addrs();
-    let (server, client) = setup_connection(bind_addr, connect_addr).await;
+    let (server, client) = setup_connection().await;
 
     if !device_supports_atomics(&server.pd) {
         tracing::warn!(
@@ -433,8 +427,7 @@ async fn async_qp_atomic_compare_and_swap() {
 /// FAA(add=100) should return 15 and set remote to 115.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn async_qp_atomic_fetch_and_add() {
-    let (bind_addr, connect_addr) = test_addrs();
-    let (server, client) = setup_connection(bind_addr, connect_addr).await;
+    let (server, client) = setup_connection().await;
 
     if !device_supports_atomics(&server.pd) {
         tracing::warn!(
@@ -517,9 +510,8 @@ async fn async_qp_atomic_fetch_and_add() {
 /// Test: async disconnect — client disconnects, server detects via next_event.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn async_cm_disconnect() {
-    let (bind_addr, connect_addr) = test_addrs();
-
-    let listener = AsyncCmListener::bind(&bind_addr).unwrap();
+    let listener = AsyncCmListener::bind(&bind_addr()).unwrap();
+    let connect_addr = connect_addr_for(listener.local_addr());
 
     // Server: two-phase accept, keep AsyncCmId alive for event monitoring
     let server_handle = tokio::spawn(async move {

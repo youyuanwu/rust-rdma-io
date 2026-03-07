@@ -587,6 +587,13 @@ impl AsyncRdmaListener {
         Ok(Self { inner, buf_size })
     }
 
+    /// Get the local socket address the listener is bound to.
+    ///
+    /// Useful when binding to port 0 to discover the assigned port.
+    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.inner.local_addr()
+    }
+
     /// Accept an incoming connection, returning an [`AsyncRdmaStream`].
     ///
     /// Uses async CM event notification — does not block the executor.

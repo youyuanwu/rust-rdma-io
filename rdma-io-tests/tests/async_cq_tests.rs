@@ -16,7 +16,7 @@ use rdma_io::tokio_notifier::TokioCqNotifier;
 use rdma_io::wc::WorkCompletion;
 use rdma_io::wr::QpType;
 
-use rdma_io_tests::test_helpers::test_addrs;
+use rdma_io_tests::test_helpers::{bind_addr, connect_addr_for};
 
 fn default_qp_attr() -> QpInitAttr {
     QpInitAttr {
@@ -56,16 +56,12 @@ unsafe impl Send for ClientSetup {}
 /// Returns both server and client resources so the test can:
 /// 1. Use the server CQ for async polling assertions
 /// 2. Perform graceful disconnect after assertions are done
-async fn setup_and_send(
-    bind_addr: std::net::SocketAddr,
-    connect_addr: std::net::SocketAddr,
-    send_data: &[u8],
-    recv_wr_id: u64,
-) -> (ServerSetup, ClientSetup) {
+async fn setup_and_send(send_data: &[u8], recv_wr_id: u64) -> (ServerSetup, ClientSetup) {
     let data_len = send_data.len();
     let send_buf = send_data.to_vec();
 
-    let listener = AsyncCmListener::bind(&bind_addr).unwrap();
+    let listener = AsyncCmListener::bind(&bind_addr()).unwrap();
+    let connect_addr = connect_addr_for(listener.local_addr());
 
     let server_handle = tokio::spawn(async move {
         // Two-phase accept: get request, set up QP + recv, then complete
@@ -190,8 +186,7 @@ async fn setup_and_send(
 /// Test: AsyncCq::poll() receives a completion via comp_channel notification.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn async_cq_send_recv() {
-    let (bind_addr, connect_addr) = test_addrs();
-    let (setup, client) = setup_and_send(bind_addr, connect_addr, b"async hello!", 100).await;
+    let (setup, client) = setup_and_send(b"async hello!", 100).await;
 
     let notifier = TokioCqNotifier::new(setup.comp_ch.fd()).unwrap();
     let async_cq = AsyncCq::new(setup.cq, setup.comp_ch, Box::new(notifier));
@@ -223,8 +218,7 @@ async fn async_cq_send_recv() {
 /// Test: AsyncCq::poll_wr_id() waits for a specific WR ID.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn async_cq_poll_wr_id() {
-    let (bind_addr, connect_addr) = test_addrs();
-    let (setup, client) = setup_and_send(bind_addr, connect_addr, b"wr_id", 42).await;
+    let (setup, client) = setup_and_send(b"wr_id", 42).await;
 
     let notifier = TokioCqNotifier::new(setup.comp_ch.fd()).unwrap();
     let async_cq = AsyncCq::new(setup.cq, setup.comp_ch, Box::new(notifier));

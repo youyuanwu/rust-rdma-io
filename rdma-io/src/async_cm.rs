@@ -361,6 +361,13 @@ impl AsyncCmListener {
         })
     }
 
+    /// Get the local socket address the listener is bound to.
+    ///
+    /// Useful when binding to port 0 to discover the assigned port.
+    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self._cm_id.local_addr()
+    }
+
     /// Accept an incoming connection asynchronously.
     ///
     /// Returns an [`AsyncCmId`] that is fully connected and migrated to its

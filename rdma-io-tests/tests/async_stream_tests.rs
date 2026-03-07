@@ -11,14 +11,13 @@
 
 use rdma_io::async_stream::{AsyncRdmaListener, AsyncRdmaStream};
 
-use rdma_io_tests::test_helpers::test_addrs;
+use rdma_io_tests::test_helpers::{bind_addr, connect_addr_for};
 
 /// Test: async echo — client sends, server reads and echoes back.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn async_stream_echo() {
-    let (bind_addr, connect_addr) = test_addrs();
-
-    let listener = AsyncRdmaListener::bind(&bind_addr).unwrap();
+    let listener = AsyncRdmaListener::bind(&bind_addr()).unwrap();
+    let connect_addr = connect_addr_for(listener.local_addr());
 
     let server_handle = tokio::spawn(async move { listener.accept().await.unwrap() });
 
@@ -53,9 +52,9 @@ async fn async_stream_echo() {
 /// Test: multi-message — 5 round-trips of ping/pong.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn async_stream_multi_message() {
-    let (bind_addr, connect_addr) = test_addrs();
+    let listener = AsyncRdmaListener::bind(&bind_addr()).unwrap();
+    let connect_addr = connect_addr_for(listener.local_addr());
 
-    let listener = AsyncRdmaListener::bind(&bind_addr).unwrap();
     let server_handle = tokio::spawn(async move { listener.accept().await.unwrap() });
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -92,9 +91,9 @@ async fn async_stream_multi_message() {
 /// Test: large transfer — send 32 KiB in one write.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn async_stream_large_transfer() {
-    let (bind_addr, connect_addr) = test_addrs();
+    let listener = AsyncRdmaListener::bind(&bind_addr()).unwrap();
+    let connect_addr = connect_addr_for(listener.local_addr());
 
-    let listener = AsyncRdmaListener::bind(&bind_addr).unwrap();
     let server_handle = tokio::spawn(async move { listener.accept().await.unwrap() });
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -130,9 +129,9 @@ async fn async_stream_large_transfer() {
 
 /// Helper: create a connected (server, client) pair using async connect/accept.
 async fn connected_pair() -> (AsyncRdmaStream, AsyncRdmaStream) {
-    let (bind_addr, connect_addr) = test_addrs();
+    let listener = AsyncRdmaListener::bind(&bind_addr()).unwrap();
+    let connect_addr = connect_addr_for(listener.local_addr());
 
-    let listener = AsyncRdmaListener::bind(&bind_addr).unwrap();
     let server_handle = tokio::spawn(async move { listener.accept().await.unwrap() });
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -312,9 +311,9 @@ async fn async_stream_write_then_shutdown_after_peer_drop() {
 /// Test: explicit shutdown() performs graceful disconnect (DREQ → DISCONNECTED).
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn async_stream_shutdown() {
-    let (bind_addr, connect_addr) = test_addrs();
+    let listener = AsyncRdmaListener::bind(&bind_addr()).unwrap();
+    let connect_addr = connect_addr_for(listener.local_addr());
 
-    let listener = AsyncRdmaListener::bind(&bind_addr).unwrap();
     let server_handle = tokio::spawn(async move { listener.accept().await.unwrap() });
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -341,9 +340,9 @@ async fn async_stream_shutdown() {
 /// Test: poll_close via futures AsyncWriteExt::close() performs graceful disconnect.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn async_stream_poll_close() {
-    let (bind_addr, connect_addr) = test_addrs();
+    let listener = AsyncRdmaListener::bind(&bind_addr()).unwrap();
+    let connect_addr = connect_addr_for(listener.local_addr());
 
-    let listener = AsyncRdmaListener::bind(&bind_addr).unwrap();
     let server_handle = tokio::spawn(async move { listener.accept().await.unwrap() });
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;

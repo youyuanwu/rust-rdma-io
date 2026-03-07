@@ -11,7 +11,7 @@ use rdma_io::qp::QpInitAttr;
 use rdma_io::wc::WorkCompletion;
 use rdma_io::wr::QpType;
 
-use rdma_io_tests::test_helpers::test_addrs;
+use rdma_io_tests::test_helpers::{bind_addr, connect_addr_for};
 
 fn default_qp_attr() -> QpInitAttr {
     QpInitAttr {
@@ -26,13 +26,15 @@ fn default_qp_attr() -> QpInitAttr {
 
 #[test_log::test]
 fn cm_loopback_connect_disconnect() {
-    let (bind_addr, connect_addr) = test_addrs();
+    let (port_tx, port_rx) = std::sync::mpsc::channel::<u16>();
 
     // --- Server thread ---
     let server = thread::spawn(move || {
         let ch = EventChannel::new().expect("server EventChannel");
         let listener = CmId::new(&ch, PortSpace::Tcp).expect("server CmId");
-        listener.listen(&bind_addr, 1).expect("listen");
+        listener.listen(&bind_addr(), 1).expect("listen");
+        let port = listener.local_addr().expect("local_addr").port();
+        port_tx.send(port).expect("send port");
 
         // Wait for connect request
         let ev = ch.get_event().expect("server CONNECT_REQUEST");
@@ -62,8 +64,12 @@ fn cm_loopback_connect_disconnect() {
     });
 
     // --- Client (main thread) ---
-    // Small delay to let server bind+listen
-    thread::sleep(std::time::Duration::from_millis(50));
+    // Wait for server to bind and send port
+    let port = port_rx.recv().expect("recv port");
+    let connect_addr = connect_addr_for(Some(std::net::SocketAddr::new(
+        std::net::Ipv4Addr::UNSPECIFIED.into(),
+        port,
+    )));
 
     let ch = EventChannel::new().expect("client EventChannel");
     let client_id = CmId::new(&ch, PortSpace::Tcp).expect("client CmId");
@@ -107,13 +113,15 @@ fn cm_loopback_connect_disconnect() {
 
 #[test_log::test]
 fn cm_loopback_send_recv() {
-    let (bind_addr, connect_addr) = test_addrs();
+    let (port_tx, port_rx) = std::sync::mpsc::channel::<u16>();
 
     // --- Server thread ---
     let server = thread::spawn(move || {
         let ch = EventChannel::new().unwrap();
         let listener = CmId::new(&ch, PortSpace::Tcp).unwrap();
-        listener.listen(&bind_addr, 1).unwrap();
+        listener.listen(&bind_addr(), 1).unwrap();
+        let port = listener.local_addr().expect("local_addr").port();
+        port_tx.send(port).expect("send port");
 
         let ev = ch.get_event().unwrap();
         assert_eq!(ev.event_type(), CmEventType::ConnectRequest);
@@ -188,7 +196,11 @@ fn cm_loopback_send_recv() {
     });
 
     // --- Client (main thread) ---
-    thread::sleep(std::time::Duration::from_millis(50));
+    let port = port_rx.recv().expect("recv port");
+    let connect_addr = connect_addr_for(Some(std::net::SocketAddr::new(
+        std::net::Ipv4Addr::UNSPECIFIED.into(),
+        port,
+    )));
 
     let ch = EventChannel::new().unwrap();
     let client_id = CmId::new(&ch, PortSpace::Tcp).unwrap();

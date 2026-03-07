@@ -9,7 +9,7 @@ use rdma_io::async_stream::AsyncRdmaListener;
 use rdma_io_tonic::{RdmaConnector, RdmaIncoming};
 
 use rdma_io_tests::greeter_service::*;
-use rdma_io_tests::test_helpers::test_addrs;
+use rdma_io_tests::test_helpers::{bind_addr, connect_addr_for};
 
 use tokio_stream::StreamExt;
 use tonic::Request;
@@ -21,8 +21,8 @@ async fn start_server_and_connect() -> (
     tokio::sync::oneshot::Sender<()>,
     tokio::task::JoinHandle<()>,
 ) {
-    let (bind_addr, connect_addr) = test_addrs();
-    let listener = AsyncRdmaListener::bind(&bind_addr).unwrap();
+    let listener = AsyncRdmaListener::bind(&bind_addr()).unwrap();
+    let connect_addr = connect_addr_for(listener.local_addr());
     let incoming = RdmaIncoming::new(listener);
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -36,7 +36,7 @@ async fn start_server_and_connect() -> (
             .unwrap();
     });
 
-    tracing::info!("Server listening on {bind_addr}");
+    tracing::info!("Server listening on {connect_addr}");
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 

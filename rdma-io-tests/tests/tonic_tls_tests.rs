@@ -14,7 +14,7 @@ use tonic::Request;
 use tonic::transport::{Channel, Endpoint, Server};
 
 use rdma_io_tests::greeter_service::*;
-use rdma_io_tests::test_helpers::{local_ip, test_addrs};
+use rdma_io_tests::test_helpers::{bind_addr, connect_addr_for, local_ip};
 
 // ---------------------------------------------------------------------------
 // Test certificate generation (rcgen)
@@ -89,7 +89,9 @@ async fn start_tls_server_and_connect(
     tokio::sync::oneshot::Sender<()>,
     tokio::task::JoinHandle<()>,
 ) {
-    let (bind_addr, connect_addr) = test_addrs();
+    let listener = AsyncRdmaListener::bind(&bind_addr()).expect("bind RDMA listener");
+    let connect_addr = connect_addr_for(listener.local_addr());
+    let incoming = RdmaIncoming::new(listener);
 
     // --- Server TLS ---
     let mut acceptor_builder =
@@ -116,8 +118,6 @@ async fn start_tls_server_and_connect(
         .expect("set ALPN");
     let acceptor = acceptor_builder.build();
 
-    let listener = AsyncRdmaListener::bind(&bind_addr).expect("bind RDMA listener");
-    let incoming = RdmaIncoming::new(listener);
     let tls_incoming = tonic_tls::openssl::TlsIncoming::new(incoming, acceptor);
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -131,7 +131,7 @@ async fn start_tls_server_and_connect(
             .unwrap();
     });
 
-    tracing::info!("TLS server listening on {bind_addr}");
+    tracing::info!("TLS server listening on {connect_addr}");
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // --- Client TLS ---

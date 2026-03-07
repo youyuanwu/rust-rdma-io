@@ -16,18 +16,22 @@ pub mod test_helpers {
         sock.local_addr().unwrap().ip().to_string()
     }
 
-    /// Allocate a unique `(bind_addr, connect_addr)` pair using an ephemeral port.
+    /// Return a `0.0.0.0:0` bind address for RDMA listeners.
     ///
-    /// The bind address is `0.0.0.0:<port>` and the connect address is
-    /// `<local_ip>:<port>`, which is necessary because siw on loopback
-    /// (127.0.0.1) doesn't support `rdma_listen`.
-    pub fn test_addrs() -> (SocketAddr, SocketAddr) {
-        let sock = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
-        let port = sock.local_addr().unwrap().port();
-        drop(sock);
-        let bind_addr: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
-        let connect_addr: SocketAddr = format!("{}:{port}", local_ip()).parse().unwrap();
-        (bind_addr, connect_addr)
+    /// Callers should bind an RDMA listener to this address, then call
+    /// `connect_addr_for()` with the listener to get the connect address
+    /// with the actual assigned port.
+    pub fn bind_addr() -> SocketAddr {
+        "0.0.0.0:0".parse().unwrap()
+    }
+
+    /// Build a connect address from a bound listener's actual port.
+    ///
+    /// Combines `local_ip()` with the port assigned by RDMA CM, avoiding
+    /// the TCP→RDMA port reuse race that caused EADDRINUSE flakiness.
+    pub fn connect_addr_for(listener_addr: Option<SocketAddr>) -> SocketAddr {
+        let port = listener_addr.expect("listener has no local address").port();
+        format!("{}:{port}", local_ip()).parse().unwrap()
     }
 }
 
