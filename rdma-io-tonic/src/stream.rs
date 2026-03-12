@@ -20,12 +20,6 @@ pub struct TokioRdmaStream {
     peer_addr: Option<SocketAddr>,
 }
 
-// Safety: AsyncRdmaStream is Send (unsafe impl), Compat preserves it.
-unsafe impl Send for TokioRdmaStream {}
-// Safety: TokioRdmaStream is only mutated through &mut self (Pin<&mut Self>)
-// in AsyncRead/AsyncWrite impls. No interior mutability or shared mutable state.
-unsafe impl Sync for TokioRdmaStream {}
-
 impl std::fmt::Debug for TokioRdmaStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TokioRdmaStream")

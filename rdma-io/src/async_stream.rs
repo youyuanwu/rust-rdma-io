@@ -101,10 +101,6 @@ pub struct AsyncRdmaStream {
     event_channel: EventChannel,
 }
 
-// Safety: All interior types are Send-safe. The CmId raw pointers
-// are guarded by libibverbs internal locking.
-unsafe impl Send for AsyncRdmaStream {}
-
 impl AsyncRdmaStream {
     /// Connect to a remote RDMA endpoint (client side).
     ///

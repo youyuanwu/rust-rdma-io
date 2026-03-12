@@ -74,10 +74,6 @@ pub struct AsyncCq {
     unacked_events: AtomicU32,
 }
 
-// Safety: All interior state is Send. The AtomicU32 is inherently Sync,
-// and we only access CQ/channel from &self (no mutable aliasing).
-unsafe impl Send for AsyncCq {}
-
 impl AsyncCq {
     /// Create a new async CQ poller.
     ///

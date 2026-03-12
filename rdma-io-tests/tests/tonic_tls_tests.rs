@@ -1,7 +1,8 @@
 //! Tonic gRPC over RDMA with TLS (OpenSSL via tonic-tls) integration tests.
 //!
-//! Uses [`rcgen`] to generate a self-signed CA, server cert, and client cert
-//! at test time. Verifies mTLS gRPC over RDMA end-to-end.
+//! Uses [`rcgen`] to generate self-signed server and client certs at test time.
+//! Each side directly trusts the other's self-signed cert (no CA needed).
+//! Verifies mTLS gRPC over RDMA end-to-end.
 
 use std::time::Duration;
 
@@ -21,7 +22,6 @@ use rdma_io_tests::test_helpers::{bind_addr, connect_addr_for, local_ip};
 // ---------------------------------------------------------------------------
 
 struct TestPki {
-    ca_cert_pem: Vec<u8>,
     server_cert_pem: Vec<u8>,
     server_key_pem: Vec<u8>,
     client_cert_pem: Vec<u8>,
@@ -29,48 +29,32 @@ struct TestPki {
 }
 
 fn generate_test_pki() -> TestPki {
-    // CA
-    let ca_key = rcgen::KeyPair::generate().unwrap();
-    let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    ca_params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "Test CA");
-    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
-    let ca_cert_pem = ca_cert.pem().into_bytes();
-
-    // Server cert signed by CA
+    // Self-signed server cert
     let server_key = rcgen::KeyPair::generate().unwrap();
     let mut server_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
     server_params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "localhost");
-    // Add the local IP as a SAN so the server cert is valid for the connect addr
     if let Ok(ip) = local_ip().parse::<std::net::IpAddr>() {
         server_params
             .subject_alt_names
             .push(rcgen::SanType::IpAddress(ip));
     }
-    let server_cert = server_params
-        .signed_by(&server_key, &ca_cert, &ca_key)
-        .unwrap();
+    let server_cert = server_params.self_signed(&server_key).unwrap();
     let server_cert_pem = server_cert.pem().into_bytes();
     let server_key_pem = server_key.serialize_pem().into_bytes();
 
-    // Client cert signed by CA
+    // Self-signed client cert
     let client_key = rcgen::KeyPair::generate().unwrap();
     let mut client_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
     client_params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "test-client");
-    let client_cert = client_params
-        .signed_by(&client_key, &ca_cert, &ca_key)
-        .unwrap();
+    let client_cert = client_params.self_signed(&client_key).unwrap();
     let client_cert_pem = client_cert.pem().into_bytes();
     let client_key_pem = client_key.serialize_pem().into_bytes();
 
     TestPki {
-        ca_cert_pem,
         server_cert_pem,
         server_key_pem,
         client_cert_pem,
@@ -107,10 +91,11 @@ async fn start_tls_server_and_connect(
         .expect("set server key");
     // Require client certificates (mTLS)
     acceptor_builder.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+    // Trust the client's self-signed cert directly
     acceptor_builder
         .cert_store_mut()
-        .add_cert(X509::from_pem(&pki.ca_cert_pem).expect("parse CA cert"))
-        .expect("add CA to trust store");
+        .add_cert(X509::from_pem(&pki.client_cert_pem).expect("parse client cert"))
+        .expect("add client cert to trust store");
     // h2 ALPN for gRPC (wire format: length-prefixed protocol name)
     const ALPN_H2_WIRE: &[u8] = b"\x02h2";
     acceptor_builder
@@ -137,11 +122,11 @@ async fn start_tls_server_and_connect(
     // --- Client TLS ---
     let mut connector_builder =
         SslConnector::builder(SslMethod::tls_client()).expect("SslConnector builder");
-    // Trust our test CA
+    // Trust the server's self-signed cert directly
     connector_builder
         .cert_store_mut()
-        .add_cert(X509::from_pem(&pki.ca_cert_pem).expect("parse CA cert"))
-        .expect("add CA to client trust store");
+        .add_cert(X509::from_pem(&pki.server_cert_pem).expect("parse server cert"))
+        .expect("add server cert to client trust store");
     // Client certificate (mTLS)
     connector_builder
         .set_certificate(&X509::from_pem(&pki.client_cert_pem).expect("parse client cert"))

@@ -10,17 +10,17 @@ readme = "README.md"
 
 [dependencies]
 rdma-io = { workspace = true, features = ["tokio"] }
-tonic = { version = "0.14", default-features = false, features = ["server", "channel"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
-tower-service = "0.3"
-http = "1"
-tokio = { workspace = true }
-tokio-util = { workspace = true }
-futures-util = { workspace = true }
+tonic = { workspace = true, features = ["server", "channel"] }
+hyper-util.workspace = true
+tower-service.workspace = true
+http.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = true
 
 # TLS (optional)
-tonic-tls = { version = "0.7", features = ["openssl"], optional = true }
-openssl = { version = "0.10", optional = true }
+tonic-tls = { workspace = true, optional = true }
+openssl = { workspace = true, optional = true }
 
 [features]
 default = []
