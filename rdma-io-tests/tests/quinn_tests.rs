@@ -89,7 +89,7 @@ async fn quinn_echo_over_rdma() {
     client_socket
         .connect_to(
             &connect_addr,
-            rdma_io::rdma_transport::TransportConfig::datagram(),
+            rdma_io_quinn::RdmaTransportConfig::datagram(),
         )
         .await
         .expect("RDMA pre-connect");

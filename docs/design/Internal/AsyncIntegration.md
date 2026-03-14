@@ -1,6 +1,9 @@
 # RDMA Async Integration — Design
 
-> Design for integrating `rdma-io` with Rust async runtimes (tokio, smol).
+> Internal design document for integrating `rdma-io` with Rust async runtimes.
+>
+> **Status:** Implemented (Phases A–F complete)  
+> **Crate:** `rdma-io` (feature-gated: `async`, `tokio`)
 
 ---
 
@@ -68,7 +71,6 @@ In async mode, step 4 becomes `async_fd.readable().await` — non-blocking, comp
 - Custom event loop / reactor implementation
 - io_uring integration (separate future work)
 - Async device events (`ibv_get_async_event`) — separate concern
-- ~~Connection-level async (`rdma_cm` event channel)~~ — now in scope (Phase F, §8)
 - Direct `tokio::io::AsyncRead` impl — users use `tokio_util::compat::FuturesAsyncReadCompatExt` instead
 
 ---
@@ -79,8 +81,14 @@ In async mode, step 4 becomes `async_fd.readable().await` — non-blocking, comp
 
 ```
 ┌─────────────────────────────────────────────────┐
-│  AsyncRdmaStream / AsyncRdmaListener            │  ← High-level stream (§5)
-│  (futures::io::AsyncRead + AsyncWrite)           │    SEND/RECV with buffering
+│  Quinn / tonic-h3 (external)                    │  ← QUIC/gRPC over RDMA
+│  rdma-io-quinn (AsyncUdpSocket)                 │    (separate crate)
+├─────────────────────────────────────────────────┤
+│  AsyncRdmaStream / AsyncCmListener              │  ← High-level stream (§5)
+│  (futures::io::AsyncRead + AsyncWrite)          │    SEND/RECV with buffering
+├─────────────────────────────────────────────────┤
+│  Transport trait / RdmaTransport                │  ← Datagram transport (§7.10)
+│  send_copy() poll_recv() poll_disconnect()      │    Used by Quinn socket
 ├────────────────────────┬────────────────────────┤
 │  AsyncQp               │                        │  ← Mid-level verb access (§7)
 │  send() recv()         │  (AsyncRdmaStream uses │    All verbs: READ/WRITE/
@@ -88,12 +96,15 @@ In async mode, step 4 becomes `async_fd.readable().await` — non-blocking, comp
 │  write_remote()        │                        │
 │  compare_and_swap()    │                        │
 ├────────────────────────┴────────────────────────┤
-│  AsyncCq                                        │  ← Async CQ poller (core)
+│  AsyncCq (dual CQ: send_cq + recv_cq)          │  ← Async CQ poller (core)
 │  (runtime-agnostic via CqNotifier trait)        │
 ├──────────────────┬──────────────────────────────┤
-│  TokioCqNotifier │  SmolCqNotifier              │  ← Runtime adapters (feature-gated)
-│  (AsyncFd)       │  (async_io::Async)           │
+│  TokioCqNotifier │  (SmolCqNotifier — future)   │  ← Runtime adapters (feature-gated)
+│  (AsyncFd)       │                              │
 ├──────────────────┴──────────────────────────────┤
+│  AsyncCmId / AsyncCmListener / AsyncEventChannel│  ← Async CM (§8)
+│  (async connect/accept/disconnect)              │
+├─────────────────────────────────────────────────┤
 │  CompletionChannel                              │  ← Safe wrapper around ibv_comp_channel
 │  (owns fd, Drop calls ibv_destroy_comp_ch)      │
 ├─────────────────────────────────────────────────┤
@@ -109,11 +120,14 @@ In async mode, step 4 becomes `async_fd.readable().await` — non-blocking, comp
 rdma-io/
 ├── src/
 │   ├── comp_channel.rs       # CompletionChannel (safe ibv_comp_channel wrapper)
-│   ├── async_cq.rs           # AsyncCq + CqNotifier trait + CqPollState
-│   ├── async_qp.rs           # AsyncQp — async verb wrappers
-│   ├── async_stream.rs       # AsyncRdmaStream / AsyncRdmaListener
+│   ├── async_cq.rs           # AsyncCq + CqNotifier trait
+│   ├── async_qp.rs           # AsyncQp — async verb wrappers (dual CQ)
+│   ├── async_stream.rs       # AsyncRdmaStream (futures-io traits)
+│   ├── async_cm.rs           # AsyncCmId / AsyncCmListener / AsyncEventChannel
+│   ├── transport.rs          # Transport trait (generic datagram abstraction)
+│   ├── rdma_transport.rs     # RdmaTransport (Send/Recv transport impl)
 │   ├── tokio_notifier.rs     # TokioCqNotifier (behind "tokio" feature)
-│   └── ... (existing modules)
+│   └── ... (sync modules: cm.rs, cq.rs, qp.rs, mr.rs, etc.)
 └── Cargo.toml
 ```
 
@@ -121,15 +135,15 @@ rdma-io/
 
 ```toml
 [features]
-default = []
+default = ["tokio"]
 
-# Async runtime support — each pulls in futures-io for trait impls
-tokio = ["dep:tokio", "dep:futures-io"]
-smol = ["dep:async-io", "dep:futures-io"]
+# Async runtime support
+async = ["dep:futures-io"]           # Core async types (CqNotifier, AsyncCq, etc.)
+tokio = ["async", "dep:tokio"]       # Tokio runtime adapter (AsyncFd)
+# smol = ["async", "dep:async-io"]   # Future: smol runtime adapter
 
 [dependencies]
-tokio = { version = "1", features = ["io-util"], optional = true }
-async-io = { version = "2", optional = true }
+tokio = { version = "1", features = ["net"], optional = true }
 futures-io = { version = "0.3", optional = true }
 ```
 
@@ -160,7 +174,7 @@ Trait abstracting over async runtimes for CQ fd readiness. Each runtime provides
 
 ### 4.4 Smol adapter
 
-> 📋 **Future work**: `SmolCqNotifier` using `async_io::Async<FdWrapper>`. Same pattern as tokio adapter but using smol's reactor. See Phase F.
+> 📋 **Future work**: `SmolCqNotifier` using `async_io::Async<FdWrapper>`. Same pattern as tokio adapter but using smol's reactor.
 
 ### 4.5 AsyncCq — the core async CQ poller
 
@@ -180,15 +194,16 @@ Async completion queue poller wrapping `CompletionQueue` + `CompletionChannel` +
 
 ### Design
 
-`AsyncRdmaStream` mirrors `RdmaStream` but uses `AsyncCq` instead of spin-polling.
+`AsyncRdmaStream` provides byte-stream I/O over RDMA using the `Transport` trait abstraction.
 
-> **Implementation**: See `async_stream.rs`. Implements `futures::io::AsyncRead` + `AsyncWrite`.
+> **Implementation**: See `async_stream.rs`. Generic over `T: Transport` (defaults to `RdmaTransport`). Implements `futures::io::AsyncRead` + `AsyncWrite`.
 
 Key design points:
-- Manages CM ID, PD, CQ, QP, send MR, and recv MRs internally
-- Double-buffered recv with partial-read support
-- Shared CQ for send and recv — `poll_write` may encounter recv completions (stashed for `poll_read`)
+- Generic over `Transport` trait — `RdmaTransport` default, mockable for testing
+- **Dual CQ**: Separate `send_cq` and `recv_cq` avoid silent completion loss when both send and recv are in-flight concurrently. `poll_write` only waits on `send_cq`; `poll_read` only on `recv_cq`. No stashing needed.
+- `recv_pending` tracks partial-read state (buf_idx, offset, total_len)
 - `write_pending` tracks in-flight send WRs across poll calls
+- `poll_close` / `shutdown()` — three-phase graceful disconnect (drain send → DREQ → await DISCONNECTED)
 
 ### Connection setup
 
@@ -339,94 +354,27 @@ All prerequisites for `AsyncQp` are implemented in the sync layer:
 
 ---
 
-## 8. Async CM Event Channel (Connection Setup)
+## 8. Async CM Event Channel (Connection Setup) ✅
 
-> 🔧 **Planned** (Phase F): True async connection setup using the CM event channel fd.
+Fully implemented in `async_cm.rs`. True async connection setup using the CM event channel fd — no `spawn_blocking` needed.
 
-The `rdma_event_channel` struct has an `.fd` field — a regular Linux fd, pollable with epoll/AsyncFd. By setting it non-blocking and registering with the async reactor, all CM operations become truly async without `spawn_blocking`.
+### Components
 
-### Design
+- **`AsyncEventChannel`** — wraps `EventChannel` + tokio `AsyncFd<RawFd>`. Provides `get_event()` (async, loops until event) and `try_get_event()` (non-blocking). Edge-triggered safe: drains all events inside `readable()` guard.
 
-**`EventChannel` additions** (in `cm.rs`):
-- `fd() -> RawFd` — expose the channel fd (like `CompletionChannel::fd()`)
-- `set_nonblocking() -> Result<()>` — `fcntl(fd, F_SETFL, O_NONBLOCK)`
-- `try_get_event() -> Result<CmEvent>` — non-blocking; returns `WouldBlock` if no event
+- **`AsyncCmId`** — async client-side CM ID. Full connect pipeline: `resolve_addr()` → `resolve_route()` → `connect()`, each awaiting the corresponding CM event. Factory: `connect_to(addr)` for simple use.
 
-**`AsyncEventChannel`** (new type in `async_stream.rs` or dedicated `async_cm.rs`):
-- Wraps `EventChannel` + `AsyncFd<RawFd>` (tokio) or `Async<FdWrapper>` (smol)
-- `async fn get_event() -> Result<CmEvent>` — loop: await fd readable → `try_get_event()` → handle `WouldBlock` (spurious wakeup, retry)
-- `async fn expect_event(expected: CmEventType) -> Result<()>` — get_event + type check + ack
+- **`AsyncCmListener`** — async server-side listener. `bind()` / `bind_with_backlog()` (sync — no CM events for bind). `accept()` returns fully connected `AsyncCmId`. Two-phase variant: `get_request()` → `complete_accept()` for custom QP setup (used by Quinn socket).
 
-**Error handling**:
-- `try_get_event()` calls `rdma_get_cm_event()` on non-blocking fd
-- Returns `Error::WouldBlock` on `EAGAIN`/`EWOULDBLOCK` (already in our error model)
-- `AsyncEventChannel::get_event()` retries on `WouldBlock` after re-registering for readiness
+- **`poll_get_request(cx)`** — poll-based accept for integration with Quinn's `poll_recv`. Used by `rdma-io-quinn::RdmaUdpSocket` to drive accept within the Quinn endpoint driver.
 
-**Notifier reuse**: The `CqNotifier` trait (`readable()` + `poll_readable()`) can be reused for the CM event channel fd — same pattern, different fd. Alternatively, use `AsyncFd` directly since CM events are less frequent.
+### Key design decisions
 
-### Async connect implementation sketch
+- **Per-connection EventChannel**: Every accepted connection is migrated via `rdma_migrate_id()` to its own `EventChannel`. This decouples connection fds so they can be independently polled, and prevents listener destruction from killing accepted connections.
 
-```rust
-impl AsyncRdmaStream {
-    pub async fn connect(addr: &SocketAddr) -> Result<Self> {
-        let ch = EventChannel::new()?;
-        ch.set_nonblocking()?;
-        let async_ch = AsyncEventChannel::new(&ch)?;  // registers fd with reactor
-        let cm_id = CmId::new(&ch, PortSpace::Tcp)?;
+- **Edge-triggered safety**: `AsyncEventChannel::get_event()` loops inside the `readable()` guard, consuming all available events before returning. This handles EPOLLET correctly (one edge per burst of events).
 
-        cm_id.resolve_addr(None, addr, 2000)?;         // non-blocking kernel call
-        async_ch.expect_event(AddrResolved).await?;     // await event on fd
-
-        cm_id.resolve_route(2000)?;                     // non-blocking kernel call
-        async_ch.expect_event(RouteResolved).await?;    // await event on fd
-
-        // Setup resources (sync, fast)
-        let ctx = cm_id.verbs_context().ok_or(...)?;
-        let pd = cm_id.alloc_pd()?;
-        let comp_ch = CompletionChannel::new(&ctx)?;
-        let cq = CompletionQueue::with_comp_channel(ctx, 32, &comp_ch)?;
-        let cmqp = cm_id.create_qp_with_cq(&pd, &stream_qp_attr(), Some(&cq), Some(&cq))?;
-        // ... MR setup, post recv buffers ...
-
-        cm_id.connect(&ConnParam::default())?;          // non-blocking kernel call
-        async_ch.expect_event(Established).await?;      // await event on fd
-
-        // Now in tokio async context — safe to create AsyncFd
-        let notifier = TokioCqNotifier::new(comp_ch.fd())?;
-        let async_cq = AsyncCq::new(cq, comp_ch, Box::new(notifier));
-        // ...
-    }
-}
-```
-
-### Async accept implementation sketch
-
-```rust
-impl AsyncRdmaListener {
-    pub async fn accept(&self) -> Result<AsyncRdmaStream> {
-        let ev = self.async_ch.get_event().await?;      // await CONNECT_REQUEST
-        // ... validate event type, extract conn_id ...
-
-        // Setup resources on conn_id (sync, fast)
-        // ... PD, CQ, QP, MRs, post recv buffers ...
-
-        conn_id.accept(&ConnParam::default())?;         // non-blocking kernel call
-        self.async_ch.expect_event(Established).await?;  // await event on fd
-
-        conn_id.migrate(&conn_ch)?;                     // move to per-connection channel
-        // Create async CQ + return stream
-    }
-}
-```
-
-### Advantages over `spawn_blocking`
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| `spawn_blocking` (current) | Simple, works today | Ties up a thread pool thread for ~10ms |
-| Async CM events (this section) | True async, no thread pool | More code, need non-blocking EventChannel |
-
-For servers accepting many concurrent connections, async CM avoids thread pool exhaustion. For single-connection clients, the difference is negligible but the API is cleaner (`async fn` vs `spawn_blocking` wrapper).
+> **Implementation**: See `async_cm.rs` (~500 lines).
 
 ---
 
@@ -481,9 +429,9 @@ impl AsyncCq {
 
 ### Integration tests (siw)
 
-> **Implementation**: See `rdma-io-tests/src/async_stream_tests.rs` and `async_qp_tests.rs`. 34 tests total (all passing).
+> **Implementation**: See `rdma-io-tests/tests/` — `async_cq_tests.rs` (3 tests), `async_qp_tests.rs` (8 tests), `async_stream_tests.rs` (12 tests), `quinn_tests.rs` (1 test), `tonic_h3_tests.rs` (3 tests), and more. Run with `RUST_TEST_THREADS=1`.
 
-Tests cover: async CQ send/recv, AsyncQp ping-pong, AsyncRdmaStream echo/multi-message/large-transfer, futures-io traits, tokio compat, tokio::io::copy, RDMA WRITE+READ roundtrip.
+Tests cover: async CQ send/recv, AsyncQp ping-pong, AsyncRdmaStream echo/multi-message/large-transfer, futures-io traits, tokio compat, tokio::io::copy, RDMA WRITE+READ roundtrip, graceful shutdown (poll_close), Quinn echo over RDMA, tonic gRPC over HTTP/3 over QUIC over RDMA.
 
 ### Compatibility test matrix
 
@@ -516,15 +464,17 @@ Build the mid-level verb abstraction first so the stream can compose on top of i
 2. Two-sided: `send()`, `recv()`, `send_with_imm()` (core verbs needed by stream)
 3. Tests: async send/recv roundtrip, multi-message ping-pong
 
-### Phase C: AsyncRdmaStream (wraps AsyncQp) ✅
+### Phase C: AsyncRdmaStream (wraps Transport) ✅
 
-Stream is a thin buffering + flow-control layer on top of `AsyncCq`.
+Stream is a thin buffering + flow-control layer on top of the `Transport` trait.
 
 1. `AsyncRdmaStream::connect()` / `AsyncRdmaListener::bind()` / `accept()`
-2. `AsyncRdmaStream::read()` / `write()` delegate to `poll_read` / `poll_write` via `std::future::poll_fn` (single code path)
-3. `accept()` uses `rdma_migrate_id()` to decouple accepted connection from listener event channel — allows listener to be safely dropped after accept
-4. Shared CQ: `poll_write` stashes recv completions (`VecDeque`); `poll_read` stashes send completions — no completions dropped
-5. Tests: async echo, multi-message, large transfer (32 KiB)
+2. Generic over `T: Transport` — `RdmaTransport` default, enables mockable testing
+3. `AsyncRdmaStream::read()` / `write()` delegate to `poll_read` / `poll_write` via `std::future::poll_fn` (single code path)
+4. `accept()` uses `rdma_migrate_id()` to decouple accepted connection from listener event channel — allows listener to be safely dropped after accept
+5. **Dual CQ**: Separate `send_cq` and `recv_cq` in `AsyncQp` — `poll_write` only waits on `send_cq`; `poll_read` only on `recv_cq`. No stashing or completion routing needed.
+6. `poll_close` / `shutdown()` — three-phase graceful disconnect (drain send → DREQ → await DISCONNECTED)
+7. Tests: async echo, multi-message, large transfer (32 KiB), graceful shutdown
 
 ### Phase D: AsyncRead / AsyncWrite trait impls ✅
 
@@ -544,16 +494,26 @@ Extend `AsyncQp` with the remaining RDMA verbs.
 4. Tests: RDMA WRITE + READ roundtrip verified on siw — 1 test
 5. Note: RDMA WRITE with IMM not supported on iWARP/siw; atomics require `ATOMIC_HCA` capability (siw has `ATOMIC_NONE`). These are tested on InfiniBand/RoCE hardware.
 
-### Phase F: Async CM Event Channel 🔧 (planned)
+### Phase F: Async CM Event Channel ✅
 
-True async connection setup — eliminate `spawn_blocking` from connect/accept paths.
+True async connection setup — eliminated `spawn_blocking` from connect/accept paths.
 
 1. **`EventChannel` extensions**: `fd()` accessor, `set_nonblocking()`, `try_get_event()` (non-blocking)
 2. **`AsyncEventChannel`**: wraps `EventChannel` + `AsyncFd<RawFd>`, provides `async fn get_event()` + `expect_event()`
-3. **`AsyncRdmaStream::connect()`** → `async fn`: resolve_addr → await → resolve_route → await → connect → await (see §8)
-4. **`AsyncRdmaListener::accept()`** → `async fn`: await CONNECT_REQUEST → setup → accept → await ESTABLISHED
-5. **`AsyncRdmaListener`** stores `AsyncEventChannel` (bind stays sync — no CM events for bind/listen)
-6. Tests: async connect/accept without `spawn_blocking`, concurrent accept stress test
+3. **`AsyncCmId`**: full async connect pipeline — `resolve_addr()` → `resolve_route()` → `connect()`, each awaiting CM events
+4. **`AsyncCmListener`**: `accept()` (one-phase) + `get_request()` / `complete_accept()` (two-phase for custom QP setup) + `poll_get_request()` (poll-based for Quinn)
+5. **`rdma_migrate_id`**: accepted connections migrated to per-connection `EventChannel`
+6. Tests: all async stream + Quinn + tonic-h3 tests exercise this path
+
+### Phase G: Transport Trait + RdmaTransport ✅
+
+Generic datagram transport abstraction for Quinn QUIC integration.
+
+1. **`Transport` trait** (`transport.rs`): `send_copy()`, `poll_recv()`, `poll_send_completion()`, `poll_disconnect()`, `is_qp_dead()`, `disconnect()`, `repost_recv()`
+2. **`RdmaTransport`** (`rdma_transport.rs`): concrete impl using RDMA Send/Recv verbs with dual CQ, pre-posted recv buffers, and configurable buffer sizes
+3. **`TransportConfig`**: presets `stream()` (NUM_RECV_BUFS=8, 32KB) and `datagram()` (64 recv × 1.5KB, 4 send)
+4. Used by `rdma-io-quinn::RdmaUdpSocket` as the underlying transport for each peer connection
+5. Used by `AsyncRdmaStream<T: Transport>` as default generic parameter
 
 ---
 
@@ -561,12 +521,11 @@ True async connection setup — eliminate `spawn_blocking` from connect/accept p
 
 | Crate | Version | Feature | Purpose |
 |-------|---------|---------|---------|
-| `futures-io` | 0.3 | `tokio` or `smol` | `AsyncRead`/`AsyncWrite` traits (primary, runtime-agnostic) |
+| `futures-io` | 0.3 | `async` | `AsyncRead`/`AsyncWrite` traits (primary, runtime-agnostic) |
 | `tokio` | 1.x | `tokio` | `AsyncFd` for CQ + CM event channels |
-| `async-io` | 2.x | `smol` | `Async<T>` fd wrapper |
-| `tokio-util` | 0.7 | (test crate only) | `FuturesAsyncReadCompatExt` for tokio compat in tests |
+| `tokio-util` | 0.7 | (test crate) | `FuturesAsyncReadCompatExt` for tokio compat |
 
-All optional behind feature flags. Core `rdma-io` remains dependency-free (beyond existing deps).
+All optional behind feature flags. Core `rdma-io` (sync) remains dependency-free (beyond FFI deps).
 
 ### Why `futures::io` over `tokio::io` as primary trait?
 
@@ -587,16 +546,17 @@ Tokio is the dominant runtime, but `futures::io` traits are the *de facto* stand
 1. ~~**Should `AsyncCq` own the `CompletionChannel`?**~~ **Resolved** — Yes, `AsyncCq` owns the channel. Simpler lifetimes; 1:1 CQ-to-channel mapping.
 2. ~~**Thread-safety of `AsyncCq`**~~ **Resolved** — `AsyncCq` is `Send` but not `Sync` (single-owner). `AsyncQp` is `Send + Sync` (QP operations are thread-safe per libibverbs).
 3. ~~**`ibv_get_cq_event` blocking behavior**~~ **Resolved** — Returns `WouldBlock` on non-blocking fd. `poll_completions()` loops on spurious wakeups.
-4. **Multiple CQs on one channel**: Not supported. Code assumes 1:1 CQ-to-channel mapping. Supporting multiple CQs would require event routing (`ibv_get_cq_event` returns which CQ fired).
+4. ~~**Multiple CQs on one channel**~~ **Resolved** — Not supported. 1:1 CQ-to-channel mapping. Dual CQ uses two separate channels.
 5. ~~**Cancellation safety**~~ **Resolved** — Drain-after-arm is inherently cancellation-safe. Re-arm on every loop iteration, so dropping mid-poll is safe.
+6. ~~**Shared CQ completion routing**~~ **Resolved** — Eliminated by dual CQ architecture. Send completions go to `send_cq`, recv to `recv_cq`. No routing needed.
 
 ---
 
 ## 14. Future Work
 
 1. **Async timeouts** — Wrap verb/stream ops with `tokio::time::timeout()` or provide built-in `with_timeout(Duration)` combinators. Current design blocks forever on missing completions.
-2. **Graceful async shutdown** — Design `poll_close` / `shutdown()` on `AsyncRdmaStream` that drains pending send/recv WRs before `rdma_disconnect`, instead of abrupt disconnect in Drop.
-3. **Stream split** — `AsyncRdmaStream::into_split()` → `AsyncReadHalf` / `AsyncWriteHalf` for concurrent read+write from separate tasks. Requires shared `AsyncCq` (via `Arc`) and separate send/recv state.
+2. ~~**Graceful async shutdown**~~ **Done** — `poll_close` / `shutdown()` implemented with three-phase disconnect: drain pending sends → DREQ → await DISCONNECTED.
+3. **Stream split** — `AsyncRdmaStream::into_split()` → `AsyncReadHalf` / `AsyncWriteHalf` for concurrent read+write from separate tasks. Requires shared transport (via `Arc`) and separate send/recv state.
 4. **Error recovery & QP state transitions** — Document what happens when a verb fails mid-flight (QP transitions to error state). Distinguish fatal vs. recoverable errors. Design `reset_qp()` or reconnect flow.
 
 ### 14.1 Async ibverbs — why no new API is needed
@@ -612,72 +572,29 @@ There's no kernel or network wait in the posting step itself — the NIC process
 
 **Raw ibv access**: Users who need `ibv_post_send`/`ibv_post_recv` without the completion await can use `AsyncQp::post_send_signaled()` (post-only) and `AsyncCq::poll()`/`poll_wr_id()` separately for manual control.
 
-### 14.2 Async disconnect
+### 14.2 ~~Async disconnect~~ ✅ Implemented
 
-`rdma_disconnect()` is a non-blocking kernel call that returns immediately. The `DISCONNECTED` event arrives asynchronously on the CM event channel. With `AsyncCmId`, true async disconnect is straightforward:
-
-**Proposed API**:
-```rust
-impl AsyncCmId {
-    /// Disconnect and await the DISCONNECTED event.
-    pub async fn disconnect_async(&self) -> Result<()> {
-        let async_ch = AsyncEventChannel::new(&self.event_channel)?;
-        self.cm_id.disconnect()?;
-        async_ch.expect_event(&self.event_channel, CmEventType::Disconnected).await
-    }
-}
-```
-
-**Use cases**:
-- **Graceful stream shutdown** — `AsyncRdmaStream::shutdown()` could drain pending WRs, then `disconnect_async()` to confirm the peer acknowledged the disconnect
-- **Connection lifecycle management** — servers that need to know when a client has fully disconnected before cleaning up resources
-- **Orderly close** — analogous to TCP's `shutdown()` + await FIN-ACK, vs. the current abrupt `disconnect()` in `Drop`
-
-**Current state**: `CmId::disconnect()` is sync (fire-and-forget). The `Drop` impl calls it without waiting for confirmation. This is safe but abrupt — the peer may not have finished processing in-flight data.
+Graceful async disconnect is implemented via `poll_close` / `shutdown()` on `AsyncRdmaStream`. Three-phase: drain pending sends → DREQ → await DISCONNECTED event. The `Transport` trait's `poll_disconnect(cx)` registers wakers on the CM fd for disconnect event detection.
 
 ### 14.3 Async CM event stream
 
-For advanced use cases (connection managers, multi-connection servers), an event stream on `AsyncCmListener` would be useful:
+For advanced use cases (connection managers, multi-connection servers), a `Stream`-based API could be useful:
 
-**Proposed API**:
 ```rust
 impl AsyncCmListener {
-    /// Returns an async Stream of CM events (connect requests, disconnects, errors).
-    pub fn events(&self) -> impl Stream<Item = Result<CmEvent>> + '_ { ... }
-}
-
-impl AsyncCmId {
-    /// Returns an async Stream of CM events on this connection (disconnect, errors).
     pub fn events(&self) -> impl Stream<Item = Result<CmEvent>> + '_ { ... }
 }
 ```
 
-This would enable patterns like:
-```rust
-// Accept loop
-while let Some(event) = listener.events().next().await {
-    match event?.event_type() {
-        ConnectRequest => { /* spawn handler */ }
-        _ => { /* log unexpected */ }
-    }
-}
-
-// Connection lifecycle
-tokio::select! {
-    result = stream.read(&mut buf) => { /* data */ }
-    event = cm_id.events().next() => { /* disconnect/error */ }
-}
-```
-
-**Dependencies**: Requires `futures::Stream` trait (already available via `futures-io` feature). Implementation wraps `AsyncEventChannel::get_event()` in a `poll_fn`-based stream adapter.
+**Dependencies**: Requires `futures::Stream`. Implementation wraps `AsyncEventChannel::get_event()` in a `poll_fn`-based stream adapter.
 
 ### 14.4 SmolCqNotifier (smol runtime support)
 
-`SmolCqNotifier` using `async_io::Async<FdWrapper>` — same pattern as tokio adapter but using smol's reactor. Enables the entire async stack (CQ, QP, stream, CM) to work with smol/async-std runtimes. Behind `smol` feature flag.
-5. **Completion routing / dispatch** — Current `poll_wr_id()` silently drops non-matching completions. Need a proper dispatch mechanism (e.g., `HashMap<u64, Waker>`) for multiplexing multiple in-flight operations on one CQ.
-6. **Cancellation safety documentation** — Document precisely which async operations are safe to cancel (drop the future) and which may leak posted WRs. Posted RECV WRs that are never completed are leaked until QP destroy.
-7. **Backpressure / flow control (async)** — Adapt the sync stream's credit-based flow control for async context. Sender must track remote RECV buffer availability; `write()` should return `Pending` when no credits available rather than posting to a full QP.
-8. **`Send`/`Sync` bounds audit** — Explicitly verify and document `Send`/`Sync` bounds for `AsyncQp`, `AsyncRdmaStream`, `AsyncCq`. All must be `Send` to work with `tokio::spawn`. Add compile-time assertions: `fn assert_send<T: Send>() {}`.
-9. **Shared Receive Queue (SRQ) async support** — `AsyncSrq` for connection-dense servers where thousands of QPs share a receive pool, reducing memory usage.
-10. **Memory window (MW) support** — Fine-grained remote access control without re-registering MRs. Useful for zero-copy RPC frameworks.
-11. **io_uring integration** — Use `io_uring` to submit `epoll_wait` or direct RDMA operations (if supported by future drivers), eliminating syscall overhead for the notification path.
+`SmolCqNotifier` using `async_io::Async<FdWrapper>` — same pattern as tokio adapter but using smol's reactor. Behind `smol` feature flag.
+
+### 14.5 Additional future items
+
+- **Cancellation safety documentation** — Document precisely which async operations are safe to cancel (drop the future) and which may leak posted WRs.
+- **Backpressure / flow control (async)** — Track remote RECV buffer availability; `write()` should return `Pending` when no credits available.
+- **SRQ async support** — `AsyncSrq` for connection-dense servers where thousands of QPs share a receive pool.
+- **io_uring integration** — Use `io_uring` for CQ notification, eliminating syscall overhead.

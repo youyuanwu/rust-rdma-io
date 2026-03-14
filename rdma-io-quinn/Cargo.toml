@@ -1,11 +1,14 @@
 [package]
 name = "rdma-io-quinn"
 version = "0.0.1"
-edition = "2021"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
 description = "Quinn QUIC over RDMA — AsyncUdpSocket implementation using rdma-io Transport trait"
-license = "MIT"
 
 [dependencies]
-rdma-io = { path = "../rdma-io" }
-quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
-tokio = { version = "1", features = ["rt", "net", "sync"] }
+rdma-io.workspace = true
+quinn.workspace = true
+tokio = { workspace = true, features = ["rt", "net", "sync"] }
+tracing.workspace = true

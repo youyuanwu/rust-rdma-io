@@ -56,6 +56,16 @@ impl AsyncQp {
         self.qp.as_raw()
     }
 
+    /// Access the send completion queue (for CQ drain in teardown).
+    pub fn send_cq(&self) -> &AsyncCq {
+        &self.send_cq
+    }
+
+    /// Access the recv completion queue (for CQ drain in teardown).
+    pub fn recv_cq(&self) -> &AsyncCq {
+        &self.recv_cq
+    }
+
     // --- Post helpers (private) ---
 
     fn post_send_raw(&self, wr: &mut SendWr) -> Result<()> {

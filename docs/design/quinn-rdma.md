@@ -185,25 +185,23 @@ gRPC over HTTP/3 over QUIC over RDMA — the full stack works via `tonic-h3` (v0
 
 ## Known Issues & Improvements
 
-### Should Fix (functional gaps)
+### Should Fix
 
 | # | Issue | Impact | Effort |
 |---|-------|--------|--------|
-| 1 | ~~Verify `Send + Sync` on `RdmaUdpSocket`~~ | ✅ Verified — auto-derived correctly. `Mutex<Option<Pin<Box<dyn Future + Send>>>>` is `Sync` because `Mutex<T>: Sync` when `T: Send`. | N/A |
-| 2 | **Multi-peer test missing** — only single-client echo tested. No coverage for concurrent peers, disconnect-while-other-continues. | Test gap | Medium |
-| 3 | **`poll_recv` returns Pending with no waker when connections empty** — client-only socket before `connect_to` hangs forever. | Requires documented `connect_to` before endpoint creation | Low — document or add waker on a timer |
-| 4 | **No graceful shutdown** — `RdmaUdpSocket` has no `close()` or way to disconnect all peers. Quinn endpoint drop may leak connections. | Resource leak on shutdown | Medium |
-| 5 | **Re-export `TransportConfig`** from `rdma-io-quinn` — users must import from `rdma_io::rdma_transport::TransportConfig` which is awkward. | Ergonomics | Trivial |
+| 1 | ~~**`poll_disconnect` never called in `poll_recv`**~~ | ✅ Fixed — replaced `is_qp_dead()` with `poll_disconnect(cx)` which registers CM fd waker for DREQ events and checks actual QP state. | N/A |
+| 2 | ~~**`UdpPoller` always returns Ready → busy-spin**~~ | ✅ Fixed — `RdmaUdpPoller` now holds `Arc<RdmaUdpSocket>`; `try_send` stashes blocked transport on WouldBlock; `poll_writable` waits on its send CQ via `poll_send_completion(cx)`, returning `Pending` until a buffer frees. | N/A |
+| 3 | ~~**Accept errors silently swallowed**~~ | ✅ Fixed — replaced `eprintln!` with `tracing::warn!`; added consecutive error counter (`AtomicU32`); propagates `io::Error` to Quinn after 10 consecutive failures. Counter resets on successful accept. | N/A |
 
 ### Nice-to-Have (future optimization)
 
 | # | Feature | Benefit |
 |---|---------|---------|
-| 6 | **Lazy connect-on-first-send** — buffer first packet, spawn background CM connect | Removes `connect_to` requirement; true UDP-like behavior |
-| 7 | **SRQ (Shared Receive Queue)** — pool recv buffers across QPs | 20 peers: 1280 → ~128 buffers (10× memory saving) |
-| 8 | **Inline data for small packets** — `max_inline_data = 64` | QUIC packets ≤64B skip PCIe DMA; lower latency |
-| 9 | **UD QP mode** — single QP for all peers | Eliminates per-peer QP overhead; true UDP semantics |
-| 10 | **Ring buffer transport** — `RdmaRingTransport` via `Transport` trait | One fewer copy on receiver; higher throughput |
+| 4 | **Lazy connect-on-first-send** — buffer first packet, spawn background CM connect | Removes `connect_to` requirement; true UDP-like behavior |
+| 5 | **SRQ (Shared Receive Queue)** — pool recv buffers across QPs | 20 peers: 1280 → ~128 buffers (10× memory saving) |
+| 6 | **Inline data for small packets** — `max_inline_data = 64` | QUIC packets ≤64B skip PCIe DMA; lower latency |
+| 7 | **UD QP mode** — single QP for all peers | Eliminates per-peer QP overhead; true UDP semantics |
+| 8 | **Ring buffer transport** — `RdmaRingTransport` via `Transport` trait | One fewer copy on receiver; higher throughput |
 
 ## References
 

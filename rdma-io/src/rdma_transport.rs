@@ -71,9 +71,9 @@ impl TransportConfig {
 ///
 /// **Drop order is critical.** Fields drop in declaration order:
 /// 1. State fields (no RDMA teardown)
-/// 2. MRs (deregister before QP destroy)
-/// 3. PD (ref-counted, safe anytime)
-/// 4. QP (destroys QP, needs CQs alive — CQs are inside AsyncQp)
+/// 2. QP (destroys QP, flushes all outstanding WRs — CQs are inside AsyncQp)
+/// 3. MRs (safe to deregister after QP destroy flushed all WRs)
+/// 4. PD (ref-counted, safe anytime)
 /// 5. cm_async_fd (deregister from epoll BEFORE closing the fd)
 /// 6. cm_id (disconnect/destroy)
 /// 7. event_channel (closes the fd — must be LAST)
@@ -87,12 +87,13 @@ pub struct RdmaTransport {
     next_send_idx: usize,
     send_in_flight: Vec<bool>,
     config: TransportConfig,
+    qp_check_counter: u32,
 
-    // -- RDMA data-path resources (drop: MRs → PD → QP) --
+    // -- RDMA data-path resources (drop: QP → MRs → PD) --
+    qp: AsyncQp,
     send_bufs: Vec<OwnedMemoryRegion>,
     recv_bufs: Vec<OwnedMemoryRegion>,
     _pd: Arc<ProtectionDomain>,
-    qp: AsyncQp,
 
     // -- CM resources (drop: AsyncFd → CmId → EventChannel) --
     cm_async_fd: AsyncFd<RawFd>,
@@ -224,10 +225,11 @@ impl RdmaTransport {
             next_send_idx: 0,
             send_in_flight: vec![false; num_send],
             config,
+            qp_check_counter: 0,
+            qp,
             send_bufs,
             recv_bufs,
             _pd: pd,
-            qp,
             cm_async_fd,
             cm_id,
             event_channel,
@@ -322,11 +324,11 @@ impl Transport for RdmaTransport {
         cx: &mut Context<'_>,
         out: &mut [RecvCompletion],
     ) -> Poll<crate::Result<usize>> {
-        let max = out.len();
-        let mut wc_buf = vec![WorkCompletion::default(); max];
+        let max = out.len().min(8);
+        let mut wc_buf = [WorkCompletion::default(); 8];
         let n = match self
             .qp
-            .poll_recv_cq(cx, &mut self.recv_cq_state, &mut wc_buf)
+            .poll_recv_cq(cx, &mut self.recv_cq_state, &mut wc_buf[..max])
         {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -342,7 +344,7 @@ impl Transport for RdmaTransport {
             }
             out[i] = RecvCompletion {
                 buf_idx: wc_buf[i].wr_id() as usize,
-                byte_len: wc_buf[i].byte_len() as usize,
+                byte_len: (wc_buf[i].byte_len() as usize).min(self.config.buf_size),
             };
         }
         Poll::Ready(Ok(n))
@@ -373,9 +375,14 @@ impl Transport for RdmaTransport {
                     // CM fd has nothing — check QP state as fallback.
                     // On rxe, the QP may transition to ERROR without a CM
                     // event (or after the event was already consumed).
-                    if is_qp_dead(self.qp.as_raw()) {
-                        self.qp_dead = true;
-                        return true;
+                    // Rate-limit the verbs call to avoid hot-path overhead.
+                    self.qp_check_counter += 1;
+                    if self.qp_check_counter >= 64 {
+                        self.qp_check_counter = 0;
+                        if is_qp_dead(self.qp.as_raw()) {
+                            self.qp_dead = true;
+                            return true;
+                        }
                     }
                     return false;
                 }
@@ -413,6 +420,21 @@ impl Drop for RdmaTransport {
         if !self.disconnected {
             let _ = self.cm_id.disconnect();
         }
+        // Drain CQ flush completions so the QP releases MR references
+        // before MRs are deregistered (field drop order: qp → MRs).
+        let mut wc = [crate::wc::WorkCompletion::default(); 16];
+        loop {
+            match self.qp.send_cq().cq().poll(&mut wc) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => continue,
+            }
+        }
+        loop {
+            match self.qp.recv_cq().cq().poll(&mut wc) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => continue,
+            }
+        }
     }
 }
 
@@ -446,14 +468,16 @@ fn alloc_buffers(
 
 fn is_qp_dead(qp: *mut rdma_io_sys::ibverbs::ibv_qp) -> bool {
     unsafe {
-        let mut attr: rdma_io_sys::ibverbs::ibv_qp_attr = std::mem::zeroed();
-        let mut init_attr: rdma_io_sys::ibverbs::ibv_qp_init_attr = std::mem::zeroed();
+        let mut attr = std::mem::MaybeUninit::<rdma_io_sys::ibverbs::ibv_qp_attr>::uninit();
+        let mut init_attr =
+            std::mem::MaybeUninit::<rdma_io_sys::ibverbs::ibv_qp_init_attr>::uninit();
         let ret = rdma_io_sys::ibverbs::ibv_query_qp(
             qp,
-            &mut attr,
+            attr.as_mut_ptr(),
             rdma_io_sys::ibverbs::IBV_QP_STATE as i32,
-            &mut init_attr,
+            init_attr.as_mut_ptr(),
         );
-        ret == 0 && attr.qp_state != rdma_io_sys::ibverbs::IBV_QPS_RTS
+        // If query fails, assume dead (defensive). If QP not in RTS, dead.
+        ret != 0 || (*attr.as_ptr()).qp_state != rdma_io_sys::ibverbs::IBV_QPS_RTS
     }
 }

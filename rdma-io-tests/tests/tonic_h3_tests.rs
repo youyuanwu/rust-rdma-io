@@ -113,10 +113,7 @@ async fn make_h3_client_endpoint(
 
     let client_socket = RdmaUdpSocket::bind(&test_helpers::bind_addr()).expect("client bind");
     client_socket
-        .connect_to(
-            connect_addr,
-            rdma_io::rdma_transport::TransportConfig::datagram(),
-        )
+        .connect_to(connect_addr, rdma_io_quinn::RdmaTransportConfig::datagram())
         .await
         .expect("RDMA pre-connect");
 
@@ -211,4 +208,73 @@ async fn tonic_h3_server_stream_over_rdma() {
     client_endpoint.close(0u16.into(), b"done");
     server_task.await.expect("server task");
     println!("tonic_h3_server_stream_over_rdma passed!");
+}
+
+#[tokio::test]
+async fn tonic_h3_multi_peer_over_rdma() {
+    let (certs, key) = generate_self_signed_cert();
+
+    let (connect_addr, shutdown_tx, server_task) = start_h3_server(&certs, key).await;
+
+    // Create two independent clients, each with their own RDMA connection.
+    let client_config_1 = make_h3_client_config(&certs);
+    let client_config_2 = make_h3_client_config(&certs);
+    let ep1 = make_h3_client_endpoint(&connect_addr, client_config_1).await;
+    let ep2 = make_h3_client_endpoint(&connect_addr, client_config_2).await;
+    let mut client1 = make_h3_grpc_client(&ep1, &connect_addr);
+    let mut client2 = make_h3_grpc_client(&ep2, &connect_addr);
+
+    // Both clients call concurrently.
+    let (r1, r2) = tokio::join!(
+        client1.say_hello(tonic::Request::new(HelloRequest {
+            name: "peer-1".into(),
+        })),
+        client2.say_hello(tonic::Request::new(HelloRequest {
+            name: "peer-2".into(),
+        })),
+    );
+    assert_eq!(
+        r1.expect("peer-1 RPC").into_inner().message,
+        "Hello peer-1!"
+    );
+    assert_eq!(
+        r2.expect("peer-2 RPC").into_inner().message,
+        "Hello peer-2!"
+    );
+    println!("multi_peer: both concurrent calls succeeded");
+
+    // Disconnect client 1 — client 2 should still work.
+    drop(client1);
+    ep1.close(0u16.into(), b"peer1 done");
+
+    let r3 = client2
+        .say_hello(tonic::Request::new(HelloRequest {
+            name: "peer-2-again".into(),
+        }))
+        .await
+        .expect("peer-2 post-disconnect RPC");
+    assert_eq!(r3.into_inner().message, "Hello peer-2-again!");
+    println!("multi_peer: peer-2 works after peer-1 disconnect");
+
+    // Server-stream on the surviving client to exercise streaming multiplexing.
+    let stream_resp = client2
+        .server_stream(tonic::Request::new(HelloRequest {
+            name: "multi".into(),
+        }))
+        .await
+        .expect("server_stream RPC");
+    let mut stream = stream_resp.into_inner();
+    let mut count = 0;
+    while let Some(reply) = stream.message().await.expect("stream msg") {
+        println!("  stream[{count}]: {}", reply.message);
+        count += 1;
+    }
+    assert_eq!(count, 5);
+    println!("multi_peer: server-stream on surviving client passed");
+
+    // Cleanup
+    let _ = shutdown_tx.send(());
+    ep2.close(0u16.into(), b"peer2 done");
+    server_task.await.expect("server task");
+    println!("tonic_h3_multi_peer_over_rdma passed!");
 }

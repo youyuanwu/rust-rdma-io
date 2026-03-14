@@ -69,10 +69,6 @@ pub struct AsyncRdmaStream<T: Transport = RdmaTransport> {
 // T: Transport is Send + Sync, and our own fields are trivially Unpin/Send/Sync.
 impl<T: Transport> Unpin for AsyncRdmaStream<T> {}
 
-// Safety: T: Send + Sync (required by Transport), remaining fields are trivially Send + Sync.
-unsafe impl<T: Transport> Send for AsyncRdmaStream<T> {}
-unsafe impl<T: Transport> Sync for AsyncRdmaStream<T> {}
-
 impl<T: Transport> fmt::Debug for AsyncRdmaStream<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AsyncRdmaStream")
@@ -183,9 +179,9 @@ impl<T: Transport> AsyncRead for AsyncRdmaStream<T> {
                 this.recv_pending = Some((buf_idx, offset + copy_len, total_len));
             } else {
                 this.recv_pending = None;
-                this.transport
-                    .repost_recv(buf_idx)
-                    .map_err(io::Error::other)?;
+                // Repost failure is non-fatal — data is already delivered.
+                // The buffer is lost, but the QP ERROR will be detected on next poll.
+                let _ = this.transport.repost_recv(buf_idx);
             }
             return Poll::Ready(Ok(copy_len));
         }
@@ -215,9 +211,7 @@ impl<T: Transport> AsyncRead for AsyncRdmaStream<T> {
                 if copy_len < c.byte_len {
                     this.recv_pending = Some((c.buf_idx, copy_len, c.byte_len));
                 } else {
-                    this.transport
-                        .repost_recv(c.buf_idx)
-                        .map_err(io::Error::other)?;
+                    let _ = this.transport.repost_recv(c.buf_idx);
                 }
                 Poll::Ready(Ok(copy_len))
             }
@@ -277,6 +271,10 @@ impl<T: Transport> AsyncWrite for AsyncRdmaStream<T> {
                     return Poll::Ready(Err(io::Error::other(e)));
                 }
                 Poll::Ready(Ok(())) => match this.transport.send_copy(buf) {
+                    Ok(0) => {
+                        // Still no free buffer after draining — retry on next wake.
+                        return Poll::Pending;
+                    }
                     Ok(n) => this.write_pending = Some(n),
                     Err(e) => return Poll::Ready(Err(io::Error::other(e))),
                 },
@@ -338,31 +336,16 @@ impl<T: Transport> AsyncWrite for AsyncRdmaStream<T> {
             }
         }
 
-        // Phase 2: Send DREQ (idempotent).
-        if this.eof || this.transport.is_qp_dead() {
-            return Poll::Ready(Ok(()));
-        }
+        // Phase 2: Send DREQ and complete.
+        //
+        // We don't wait for the peer's DREP or DISCONNECTED event.
+        // On rxe, the peer may not process DREQ promptly (e.g. idle
+        // server), causing an 80+ second CM timeout. The kernel handles
+        // the DREP exchange asynchronously, and Drop performs final
+        // QP/CQ cleanup.
         let _ = this.transport.disconnect();
-
-        // Phase 3: Await DISCONNECTED event from peer.
-        //
-        // On rxe (RoCE), the QP may linger in RTS for a significant time
-        // after disconnect, and CQ flush completions are unreliable. The CM
-        // DISCONNECTED event may have been consumed by a prior poll_disconnect
-        // call, leaving nothing to wake the task.
-        //
-        // We use poll_disconnect in a loop (not a single check) to handle
-        // spurious wakeups and to keep retrying the QP state fallback.
-        // If poll_disconnect returns Pending, we return Pending — but the
-        // CM fd waker is registered, and the QP dead check provides a
-        // safety net on the next wake.
-        if this.transport.poll_disconnect(cx) {
-            this.eof = true;
-            Poll::Ready(Ok(()))
-        } else {
-            // Waker registered on CM fd + QP dead fallback checked.
-            Poll::Pending
-        }
+        this.eof = true;
+        Poll::Ready(Ok(()))
     }
 }
 
