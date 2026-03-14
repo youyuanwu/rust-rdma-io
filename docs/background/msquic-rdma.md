@@ -211,6 +211,331 @@ Both msquic-RDMA and rsocket use RDMA Write into remote ring buffers for data tr
 
 6. **Ring buffer complexity** — the `datapath_rdma_ringbuffer.c` handles wrap-around, out-of-order completions, and head/tail synchronization — significant protocol surface absent from two-sided designs
 
+## Internal Implementation Details
+
+*Source: ~6000 lines in `datapath_winrdma.c` + ~500 lines in `datapath_rdma_ringbuffer.c`*
+
+### How QUIC Maps onto RDMA
+
+MsQuic treats the RDMA transport as a **datapath** — the same abstraction layer used for UDP sockets.
+The QUIC protocol stack (connection management, TLS, stream multiplexing, congestion control, loss recovery)
+runs unchanged on top. Only the packet delivery mechanism changes:
+
+```
+  QUIC Core (connections, streams, TLS, CC, loss recovery)
+       │
+       │ CxPlatSocketSend(packet)        CxPlatRecvData callback(packet)
+       ▼                                        ▲
+  ┌─────────────────────────────────────────────────────┐
+  │              datapath_winrdma.c                      │
+  │  RdmaSocketSend()                                   │
+  │    1. Reserve slot in remote recv ring buffer        │
+  │    2. memcpy QUIC packet → local send ring buffer    │
+  │    3. RDMA Write With Immediate → remote ring buffer │
+  │    4. SendCQ completion → release send ring slot     │
+  │                                                      │
+  │  RecvCQ completion fires (Write-With-Imm received):  │
+  │    1. Parse immediate data → offset + length         │
+  │    2. Point CXPLAT_RECV_DATA at recv ring[offset]    │
+  │    3. Upcall → QUIC Core processes QUIC packet       │
+  │    4. Release recv ring slot, re-post receive         │
+  └─────────────────────────────────────────────────────┘
+```
+
+**Key insight:** Each QUIC packet (including headers, crypto frames, stream frames) is delivered
+as a single RDMA Write With Immediate. The QUIC core sees it identically to a UDP datagram arrival.
+There is no byte-stream abstraction — RDMA delivers discrete packets, which is a natural fit for QUIC's
+packet-oriented design.
+
+### Core Data Structures
+
+```c
+// Per-connection state (~6000 lines of lifecycle management)
+typedef struct _RDMA_NDSPI_CONNECTION {
+    RDMA_NDSPI_ADAPTER*         Adapter;
+    HANDLE                      ConnOverlappedFile;   // IOCP handle
+    IND2MemoryRegion*           MemoryRegion;         // Single MR for all buffers
+    IND2MemoryWindow*           RecvMemoryWindow;     // MW scoping recv ring
+    IND2MemoryWindow*           OffsetMemoryWindow;   // MW scoping offset buffer
+    IND2ManaCompletionQueue*    RecvCompletionQueue;   // Dual CQ
+    IND2ManaCompletionQueue*    SendCompletionQueue;
+    IND2ManaQueuePair*          QueuePair;
+    IND2Connector*              Connector;
+    RDMA_SEND_RING_BUFFER*      SendRingBuffer;       // Local staging area
+    RDMA_RECV_RING_BUFFER*      RecvRingBuffer;       // Landing zone for remote writes
+    RDMA_REMOTE_RING_BUFFER*    RemoteRingBuffer;     // Tracks remote peer's recv ring
+    RDMA_CONNECTION_STATE       State;                 // 13-state machine
+    CXPLAT_LIST_ENTRY           SendQueue;             // Pending sends (backpressure)
+    ULONG                       Flags;                 // MW_USED, OFFSET_USED, etc.
+} RDMA_CONNECTION;
+
+// Token exchanged during connection handshake (packed, 24 bytes)
+typedef struct _RDMA_DATAPATH_PRIVATE_DATA {
+    uint64_t RemoteAddress;           // Base VA of recv ring buffer
+    uint32_t Capacity;                // Ring buffer size
+    uint32_t RemoteToken;             // MW rkey for RDMA Write
+    uint64_t RemoteOffsetBufferAddress;  // Offset sync buffer VA
+    uint32_t RemoteOffsetBufferToken;    // Offset sync rkey
+} RDMA_DATAPATH_PRIVATE_DATA;
+```
+
+### Connection State Machine
+
+```
+  Uninitialized
+      │ (alloc MR, register memory)
+      ▼
+  RingBufferRegistered
+      │ (Connector.Connect / Listener.GetConnectionRequest)
+      ▼
+  Connecting ◄─────────────── WaitingForGetConnRequest (server)
+      │ (Connect completes)        │ (GetConnectionRequest completes)
+      ▼                            ▼
+  CompleteConnect              WaitingForAccept
+      │ (CompleteConnect           │ (Accept completes)
+      │  IOCP completes)           │
+      ▼                            ▼
+  Connected ◄──────────────── Connected
+      │ (Bind MW, post recv, exchange tokens via Send/Recv)
+      ▼
+  TokenExchangeInitiated
+      │ (Recv CQ fires: got peer's ring buffer info)
+      │ (Send own ring buffer info to peer)
+      ▼
+  TokenExchangeComplete
+      │ (Verify both sides have remote ring info)
+      ▼
+  Ready ─────────────────────── Data transfer begins
+      │
+  ReceivedDisconnect / Closing / Closed
+```
+
+**13 states total.** The critical path is `Ready` — only in this state can data transfer occur.
+States before `Ready` handle resource allocation, RDMA connection, and ring buffer token exchange.
+
+### Memory Layout (Per Connection)
+
+A single contiguous allocation is registered as one Memory Region:
+
+```
+ ┌──────────────────────┬──────────────────────┬──────┬──────┐
+ │   Send Ring Buffer   │   Recv Ring Buffer   │ Ofs  │ ROfs │
+ │   (configurable)     │   (configurable)     │ (4B) │ (4B) │
+ └──────────────────────┴──────────────────────┴──────┴──────┘
+ ◄─── SendRingBufferSize ──►◄─ RecvRingBufferSize ─►
+
+ Defaults: 64 KB each (MIN=4KB, MAX=4GB)
+ Offset buffers only allocated when ring > 64KB
+```
+
+- **Send Ring Buffer**: Local staging area. Sender copies QUIC packet here, then RDMA Writes from it.
+- **Recv Ring Buffer**: Landing zone. Remote peer writes QUIC packets directly into it via RDMA Write.
+- **Offset Buffer** (optional): 4-byte head pointer exposed to remote peer via RDMA Read for flow control when ring > 64KB.
+
+### Ring Buffer Protocol
+
+Both send and recv rings are circular buffers with `Head` (consumer) and `Tail` (producer) pointers:
+
+```
+  Reserve(length):
+    1. Check available = Capacity - CurSize
+    2. If insufficient contiguous space at tail:
+       - If Head < Tail: wrap Tail to 0 (insert padding entry in CompletionTable)
+       - Recalculate available space after wrap
+    3. Return Buffer[Tail], advance Tail += length
+
+  Release(offset, length):
+    1. If offset == Head (in-order): advance Head += length
+       - Chase CompletionTable entries at new Head (handle wrap-arounds)
+    2. If offset != Head (out-of-order): insert into CompletionTable hash
+       - Will be chased when earlier completions arrive
+```
+
+**Out-of-order completion handling**: Since multiple RDMA Writes can be in-flight simultaneously,
+completions may arrive out of order. A hash table (`SendCompletionTable` / `RecvCompletionTable`)
+tracks pending releases. When an in-order completion arrives at `Head`, it chases forward through
+the hash table releasing any contiguous completed entries.
+
+### Send Data Path (CxPlatRdmaSend → RDMA Write)
+
+```
+RdmaSocketSend(Socket, Route, SendData):
+  1. If SendQueue not empty → enqueue SendData → return BUFFER_TOO_SMALL
+     (backpressure: wait for prior sends to complete)
+
+  2. RdmaSocketSendInline(SocketProc, SendData):
+     a. RdmaRemoteRecvRingBufferReserve(length)
+        → get remote VA + offset where we can write
+        → if no space: enqueue to SendQueue
+
+     b. Encode ImmediateData:
+        - If ring ≤ 64KB: imm = (offset << 16) | length  (16-bit each)
+        - If ring > 64KB:  imm = length only (offset via RDMA Read)
+
+     c. Build ND2_SGE pointing to SendRingBuffer[offset]
+        - Buffer = SendData->Buffer.Buffer (already in send ring)
+        - MemoryRegionToken = local MR token
+
+     d. QueuePair->WriteWithImmediate(
+           SGE, remote_addr, remote_rkey, flags, ImmediateData)
+
+     e. SendCompletionQueue->Notify(ND_CQ_NOTIFY_ANY, overlapped)
+        → IOCP completion fires → CxPlatIoRdmaSendEventComplete
+
+  3. On SendCQ completion:
+     a. GetManaResults() to drain CQ
+     b. RdmaSendRingBufferRelease(offset, length) → free send ring slot
+     c. RdmaRemoteReceiveRingBufferRelease(length) → update remote tracking
+     d. Process pending SendQueue entries (RdmaSocketPendingSend)
+```
+
+### Receive Data Path (RDMA Write Arrival → QUIC Upcall)
+
+```
+CxPlatDataPathRdmaStartReceiveAsync(SocketProc):
+  1. Pre-post receives (NdspiPostReceive) for doorbell notifications
+  2. RecvCompletionQueue->Notify(ND_CQ_NOTIFY_ANY, overlapped)
+
+On RecvCQ completion (CxPlatIoRdmaRecvEventComplete):
+  1. GetManaResults() → array of ND2_MANA_RESULT
+  2. For each result with RequestType == RecvRdmaWithImmediate:
+     a. Decode ImmediateData:
+        - Small ring: offset = (imm >> 16), length = (imm & 0xFFFF)
+        - Large ring: length = imm, offset from RDMA Read of peer's offset buffer
+     b. Build CXPLAT_RECV_DATA:
+        - Buffer = RecvRingBuffer->Buffer[offset]
+        - Length = decoded length
+        - RingBufferOffset = offset  (for later release)
+     c. Upcall: Datapath->RdmaHandlers.Receive(Socket, Context, RecvData)
+        → QUIC core processes the packet (decrypt, parse frames, etc.)
+     d. After QUIC is done with buffer:
+        - RdmaLocalReceiveRingBufferRelease(offset, length)
+        - Re-post receive for next doorbell
+```
+
+### Token Exchange (Post-Connect Handshake)
+
+After RDMA connection is established but before data transfer, both peers must
+exchange ring buffer metadata so each side knows the remote VA + rkey to write to:
+
+```
+Client (initiator):                       Server (acceptor):
+  Connect completes                         Accept completes
+  → State = Connected                       → State = Connected
+  │                                         │
+  BindMemoryWindow(RecvRing)                BindMemoryWindow(RecvRing)
+  BindMemoryWindow(OffsetBuf)               BindMemoryWindow(OffsetBuf)
+  │                                         │
+  Post Recv (to receive server tokens)      Post Recv (to receive client tokens)
+  │                                         │
+  Build RDMA_DATAPATH_PRIVATE_DATA:         Wait for RecvCQ completion...
+    { VA, capacity, rkey, offset_VA, rkey }  │
+  Send(private_data) → ──────────────────── → RecvCQ fires
+  │                                           Parse private_data
+  │                                           Now knows client's recv ring
+  │                                           │
+  │                      ◄──────────────────── Send(private_data)
+  RecvCQ fires                                │
+  Parse private_data                          │
+  Now knows server's recv ring                │
+  │                                           │
+  State = Ready                               State = Ready
+```
+
+When Memory Windows are NOT used (simpler path), the token exchange is embedded
+in the connection's private data during Connect/Accept itself, eliminating the
+post-connect Send/Recv phase.
+
+### Immediate Data Encoding
+
+Two modes depending on ring buffer size:
+
+**Small rings (≤ 64KB)** — offset + length packed into 32-bit immediate:
+```
+  Bits [31:16] = offset in recv ring buffer (max 64KB)
+  Bits [15:0]  = payload length (max 64KB)
+```
+
+**Large rings (> 64KB)** — only length in immediate, offset via RDMA Read:
+```
+  Bits [31:0] = payload length (max 16MB, capped by MAX_PAYLOAD_SIZE)
+  Receiver reads sender's offset buffer via RDMA Read to determine position
+```
+
+### Completion Queue Processing
+
+Uses **Windows IOCP (I/O Completion Ports)** for async completion notification:
+
+```
+  1. Post RDMA operation (Write, Send, Recv, etc.)
+  2. CQ->Notify(ND_CQ_NOTIFY_ANY, &overlapped) → arms the CQ
+  3. On completion: IOCP fires → event handler callback
+  4. GetManaResults() → drain all completions (batch)
+  5. Process each ND2_MANA_RESULT:
+     - Check RequestType (Send, Recv, RecvRdmaWithImmediate, etc.)
+     - Extract ImmediateData for RecvRdmaWithImmediate
+     - Route to appropriate handler
+```
+
+Each connection has **12 distinct IOCP event handlers** for different async operations:
+- `CxPlatIoRdmaRecvEventComplete` — data arrival
+- `CxPlatIoRdmaSendEventComplete` — send completion
+- `CxPlatIoRdmaConnectEventComplete` — connect completed
+- `CxPlatIoRdmaConnectCompletionEventComplete` — CompleteConnect done
+- `CxPlatIoRdmaGetConnectionRequestEventComplete` — accept new connection
+- `CxPlatIoRdmaAcceptEventComplete` — accept completed
+- `CxPlatIoRdmaDisconnectEventComplete` — peer disconnected
+- `CxPlatIoRdmaTokenExchangeInitEventComplete` — token recv done
+- `CxPlatIoRdmaTokenExchangeFinalEventComplete` — token send done
+- `CxPlatIoRdmaSendRingBufferOffsetsEventComplete` — offset sync send
+- `CxPlatIoRdmaRecvRingBufferOffsetsEventComplete` — offset sync recv
+- `CxPlatIoRdmaReadRingBufferOffsetsEventComplete` — RDMA Read of offset
+
+### Key Constants
+
+| Constant | Value | Purpose |
+|----------|-------|---------|
+| `DEFAULT_RING_BUFFER_SIZE` | 64 KB | Default per-ring buffer size |
+| `MAX_IMMEDIATE_RING_BUFFER_SIZE` | 64 KB | Threshold for offset buffer mode |
+| `MIN_RING_BUFFER_SIZE` | 4 KB | Minimum allowed ring size |
+| `MAX_RING_BUFFER_SIZE` | 4 GB | Maximum allowed ring size |
+| `MIN_FREE_BUFFER_THRESHOLD` | 128 B | Minimum free space before backpressure |
+| `MAX_PAYLOAD_SIZE` | 16 MB | Maximum single write payload |
+| `DEFAULT_OFFSET_BUFFER_SIZE` | 4 B | Size of offset sync buffer |
+| `MAX_SGE_POOL_SIZE` | 8192 | SGE pool capacity per connection |
+| `MAX_MANA_RESULT_POOL_SIZE` | 8192 | CQ result pool capacity |
+| `MAX_RDMA_CONNECTION_POOL_SIZE` | 1024 | Connection pool per adapter |
+| `DEFAULT_RDMA_REQ_PRIVATE_DATA_SIZE` | 56 B | Client connect private data |
+| `DEFAULT_RDMA_REP_PRIVATE_DATA_SIZE` | 196 B | Server accept private data |
+
+### Backpressure / Flow Control
+
+Flow control is **implicit** through ring buffer availability:
+
+1. **Sender checks remote ring space**: Before each send, `RdmaRemoteRecvRingBufferReserve()`
+   checks if the remote peer's recv ring has room. If not, the send is **queued** in `SendQueue`.
+
+2. **Send queue drain**: When a send CQ completion fires, `RdmaSocketPendingSend()` drains
+   the queue, attempting each pending send. If the remote ring is still full, the entry
+   is re-inserted at the head (maintaining order).
+
+3. **No explicit credits**: Unlike rsocket (which sends credit update messages), msquic relies
+   on the ring buffer head/tail tracking + optional RDMA Read of the offset buffer for
+   large rings.
+
+### Comparison: Send/Recv (Our Design) vs Write-Into-Ring-Buffer (msquic)
+
+| Aspect | Our Send/Recv | msquic RDMA Write + Ring |
+|--------|--------------|-------------------------|
+| **Copies** | 2 (sender copies to send MR, receiver reads from recv MR) | 1 on sender (to send ring), 0 on receiver (data lands in place) |
+| **CPU on receiver** | Must post recv buffers; HCA writes to posted buffer | No recv posting for data; doorbell recv is tiny |
+| **Protocol state** | None (implicit via RNR retry) | Ring head/tail, completion hash tables, offset sync |
+| **Max in-flight** | Limited by recv buffer count (8) | Limited by ring buffer capacity (64KB default) |
+| **Ordering** | Guaranteed by SQ FIFO | Guaranteed by SQ FIFO; ring wrap adds complexity |
+| **Memory exposure** | None (two-sided) | Remote peer can write to recv ring via MW/MR |
+| **Setup complexity** | 0 extra states | 7+ states for token exchange |
+| **Code** | ~600 lines | ~6000 lines |
+
 ## References
 
 - [microsoft/msquic#5113](https://github.com/microsoft/msquic/pull/5113) — RDMA NDSPI datapath PR

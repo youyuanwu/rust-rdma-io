@@ -22,7 +22,11 @@ pub mod async_cq;
 pub mod async_qp;
 #[cfg(feature = "async")]
 pub mod async_stream;
+#[cfg(feature = "async")]
+pub mod rdma_transport;
 #[cfg(feature = "tokio")]
 pub mod tokio_notifier;
+#[cfg(feature = "async")]
+pub mod transport;
 
 pub use error::{Error, Result};
