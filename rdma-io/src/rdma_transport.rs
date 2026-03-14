@@ -151,7 +151,18 @@ impl RdmaTransport {
         config: TransportConfig,
     ) -> crate::Result<Self> {
         let conn_id = listener.get_request().await?;
+        Self::complete_accept(conn_id, listener, config).await
+    }
 
+    /// Complete accept using a pre-obtained `CmId` from `poll_get_request`.
+    ///
+    /// Sets up QP, buffers, runs the accept handshake, and migrates the
+    /// connection to its own event channel.
+    pub async fn complete_accept(
+        conn_id: crate::cm::CmId,
+        listener: &AsyncCmListener,
+        config: TransportConfig,
+    ) -> crate::Result<Self> {
         let ctx = conn_id
             .verbs_context()
             .ok_or(crate::Error::InvalidArg("no verbs context".into()))?;

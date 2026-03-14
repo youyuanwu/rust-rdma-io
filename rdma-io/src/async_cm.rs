@@ -429,6 +429,46 @@ impl AsyncCmListener {
         Ok(conn_id)
     }
 
+    /// Poll for a CONNECT_REQUEST. Non-blocking poll variant of [`get_request`](Self::get_request).
+    ///
+    /// Returns `Poll::Ready(Ok(CmId))` when a new connection request arrives,
+    /// or `Poll::Pending` if none is ready (waker registered on CM fd).
+    ///
+    /// Used by `RdmaUdpSocket::poll_accept` to drive accept from within `poll_recv`.
+    pub fn poll_get_request(
+        &self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<CmId>> {
+        loop {
+            let mut guard = match self.async_ch.async_fd.poll_read_ready(cx) {
+                std::task::Poll::Ready(Ok(g)) => g,
+                std::task::Poll::Ready(Err(e)) => {
+                    return std::task::Poll::Ready(Err(crate::Error::Verbs(e)));
+                }
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+            };
+            match self.event_channel.try_get_event() {
+                Ok(ev) => {
+                    let etype = ev.event_type();
+                    if etype != CmEventType::ConnectRequest {
+                        ev.ack();
+                        return std::task::Poll::Ready(Err(crate::Error::InvalidArg(format!(
+                            "expected ConnectRequest, got {etype:?}"
+                        ))));
+                    }
+                    let conn_id = unsafe { CmId::from_raw(ev.cm_id_raw(), true) };
+                    ev.ack();
+                    return std::task::Poll::Ready(Ok(conn_id));
+                }
+                Err(crate::Error::WouldBlock) => {
+                    guard.clear_ready();
+                    continue;
+                }
+                Err(e) => return std::task::Poll::Ready(Err(e)),
+            }
+        }
+    }
+
     /// Complete the accept handshake after QP setup.
     ///
     /// Second phase of a two-phase accept: sends the accept reply, awaits

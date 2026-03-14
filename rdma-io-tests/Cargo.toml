@@ -12,6 +12,8 @@ publish = false
 rdma-io-sys.workspace = true
 rdma-io = { workspace = true, features = ["tokio"] }
 rdma-io-tonic = { workspace = true, features = ["tls"] }
+rdma-io-quinn = { path = "../rdma-io-quinn" }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 tonic = { workspace = true, features = ["server", "channel", "router", "transport"] }
 tonic-tls.workspace = true
 tonic-prost.workspace = true

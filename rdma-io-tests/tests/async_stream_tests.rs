@@ -11,7 +11,7 @@
 
 use rdma_io::async_stream::{AsyncRdmaListener, AsyncRdmaStream};
 
-use rdma_io_tests::test_helpers::{bind_addr, connect_addr_for};
+use rdma_io_tests::test_helpers::{bind_addr, connect_addr_for, connect_with_retry};
 
 /// Test: async echo — client sends, server reads and echoes back.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
@@ -318,7 +318,7 @@ async fn async_stream_shutdown() {
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let mut client = AsyncRdmaStream::connect(&connect_addr).await.unwrap();
+    let mut client = connect_with_retry(&connect_addr).await.unwrap();
     let mut server = server_handle.await.unwrap();
 
     // Round-trip: client sends, server echoes, client reads.
@@ -347,7 +347,7 @@ async fn async_stream_poll_close() {
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let mut client = AsyncRdmaStream::connect(&connect_addr).await.unwrap();
+    let mut client = connect_with_retry(&connect_addr).await.unwrap();
     let mut server = server_handle.await.unwrap();
 
     // Round-trip: client sends, server echoes, client reads.

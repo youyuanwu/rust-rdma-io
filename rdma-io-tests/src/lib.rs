@@ -33,6 +33,29 @@ pub mod test_helpers {
         let port = listener_addr.expect("listener has no local address").port();
         format!("{}:{port}", local_ip()).parse().unwrap()
     }
+
+    /// Connect with retry on EADDRINUSE.
+    ///
+    /// siw releases RDMA CM ports asynchronously — a previous test's
+    /// connection may still hold an ephemeral port. Retry with backoff.
+    pub async fn connect_with_retry(
+        addr: &SocketAddr,
+    ) -> rdma_io::Result<rdma_io::async_stream::AsyncRdmaStream> {
+        use rdma_io::async_stream::AsyncRdmaStream;
+        for attempt in 0..5 {
+            match AsyncRdmaStream::connect(addr).await {
+                Ok(stream) => return Ok(stream),
+                Err(rdma_io::Error::Verbs(ref e))
+                    if e.raw_os_error() == Some(98) && attempt < 4 =>
+                {
+                    // EADDRINUSE — wait for port release
+                    tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt + 1))).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        unreachable!()
+    }
 }
 
 /// Greeter gRPC service implementation for tonic integration tests.
