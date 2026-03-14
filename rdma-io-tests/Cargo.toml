@@ -16,8 +16,10 @@ rdma-io-quinn = { path = "../rdma-io-quinn" }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 tonic = { workspace = true, features = ["server", "channel", "router", "transport"] }
 tonic-tls.workspace = true
+tonic-h3.workspace = true
 tonic-prost.workspace = true
 prost.workspace = true
+http.workspace = true
 openssl.workspace = true
 rcgen.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "time"] }

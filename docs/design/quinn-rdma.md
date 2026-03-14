@@ -4,8 +4,8 @@
 **Date:** 2026-03-14  
 **Crate:** `rdma-io-quinn`  
 **Source:** `rdma-io-quinn/src/lib.rs`  
-**Test:** `rdma-io-tests/tests/quinn_tests.rs`  
-**Dependencies:** `quinn 0.11`, `rdma-io`
+**Tests:** `rdma-io-tests/tests/quinn_tests.rs`, `rdma-io-tests/tests/tonic_h3_tests.rs`  
+**Dependencies:** `quinn 0.11`, `rdma-io`, `tonic-h3 0.0.5` (for gRPC/HTTP3 tests)
 
 ## Motivation
 
@@ -150,7 +150,8 @@ All phases complete:
 1. ✅ `rdma-io-quinn` crate — `RdmaUdpSocket`, `RdmaUdpPoller`, `AsyncUdpSocket` impl (~240 lines)
 2. ✅ `poll_accept` state machine — `Arc<AsyncCmListener>` + pinned accept future
 3. ✅ `complete_accept` on `RdmaTransport` — accepts pre-obtained `CmId` from `poll_get_request`
-4. ✅ Quinn echo test — `rdma-io-tests/tests/quinn_tests.rs` (45 total tests pass)
+4. ✅ Quinn echo test — `rdma-io-tests/tests/quinn_tests.rs`
+5. ✅ tonic-h3 gRPC tests — `rdma-io-tests/tests/tonic_h3_tests.rs` (unary + server-streaming)
 
 **Implementation findings:**
 - Quinn 0.11.9 API differs from `main` branch (`try_send`/`UdpPoller` vs `UdpSender`)
@@ -158,13 +159,51 @@ All phases complete:
 - RDMA requires `connect_to()` pre-connection — unlike UDP's implicit "send to anyone"
 - Server endpoint must be created before client connects (poll_accept drives RDMA accept)
 
-## Open Questions
+## tonic-h3 Integration
 
-1. **Lazy connect timing:** CM connect takes ms; Quinn expects fast `poll_send`.
-   Options: buffer first packet, or require pre-connection via custom API.
+gRPC over HTTP/3 over QUIC over RDMA — the full stack works via `tonic-h3` (v0.0.5):
 
-2. **SRQ optimization:** 20 peers × 64 recv bufs = 1280 buffers.
-   Shared Receive Queue pools across QPs — future optimization.
+```
+  tonic GreeterClient/Server
+         │
+  tonic-h3 H3Channel / H3Router  (gRPC ↔ HTTP/3)
+         │
+  h3 / h3-quinn                   (HTTP/3 ↔ QUIC)
+         │
+  quinn::Endpoint                  (QUIC state machine)
+         │
+  RdmaUdpSocket                    (AsyncUdpSocket → RDMA transport)
+```
+
+**Server:** `RdmaUdpSocket::bind()` → `Endpoint::new_with_abstract_socket(socket, server_config)` → `H3QuinnAcceptor` → `H3Router.serve()`
+
+**Client:** `RdmaUdpSocket::bind()` → `connect_to(addr)` → `Endpoint::new_with_abstract_socket(socket, None)` → `H3QuinnConnector` → `H3Channel` → `GreeterClient`
+
+**TLS config:** ALPN must be `"h3"` (not `"h2"`). Rustls `ServerConfig`/`ClientConfig` wrapped in `QuicServerConfig`/`QuicClientConfig`.
+
+**Tested RPCs:** Unary `SayHello`, server-streaming `ServerStream` — both pass over RDMA.
+
+## Known Issues & Improvements
+
+### Should Fix (functional gaps)
+
+| # | Issue | Impact | Effort |
+|---|-------|--------|--------|
+| 1 | ~~Verify `Send + Sync` on `RdmaUdpSocket`~~ | ✅ Verified — auto-derived correctly. `Mutex<Option<Pin<Box<dyn Future + Send>>>>` is `Sync` because `Mutex<T>: Sync` when `T: Send`. | N/A |
+| 2 | **Multi-peer test missing** — only single-client echo tested. No coverage for concurrent peers, disconnect-while-other-continues. | Test gap | Medium |
+| 3 | **`poll_recv` returns Pending with no waker when connections empty** — client-only socket before `connect_to` hangs forever. | Requires documented `connect_to` before endpoint creation | Low — document or add waker on a timer |
+| 4 | **No graceful shutdown** — `RdmaUdpSocket` has no `close()` or way to disconnect all peers. Quinn endpoint drop may leak connections. | Resource leak on shutdown | Medium |
+| 5 | **Re-export `TransportConfig`** from `rdma-io-quinn` — users must import from `rdma_io::rdma_transport::TransportConfig` which is awkward. | Ergonomics | Trivial |
+
+### Nice-to-Have (future optimization)
+
+| # | Feature | Benefit |
+|---|---------|---------|
+| 6 | **Lazy connect-on-first-send** — buffer first packet, spawn background CM connect | Removes `connect_to` requirement; true UDP-like behavior |
+| 7 | **SRQ (Shared Receive Queue)** — pool recv buffers across QPs | 20 peers: 1280 → ~128 buffers (10× memory saving) |
+| 8 | **Inline data for small packets** — `max_inline_data = 64` | QUIC packets ≤64B skip PCIe DMA; lower latency |
+| 9 | **UD QP mode** — single QP for all peers | Eliminates per-peer QP overhead; true UDP semantics |
+| 10 | **Ring buffer transport** — `RdmaRingTransport` via `Transport` trait | One fewer copy on receiver; higher throughput |
 
 ## References
 

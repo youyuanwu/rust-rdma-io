@@ -16,69 +16,35 @@ fn generate_self_signed_cert() -> (
     (vec![cert], key.into())
 }
 
-fn make_server_config() -> ServerConfig {
-    let (certs, key) = generate_self_signed_cert();
-    ServerConfig::with_single_cert(certs, key).unwrap()
+fn make_server_config(
+    certs: &[quinn::rustls::pki_types::CertificateDer<'static>],
+    key: quinn::rustls::pki_types::PrivateKeyDer<'static>,
+) -> ServerConfig {
+    ServerConfig::with_single_cert(certs.to_vec(), key).unwrap()
 }
 
-fn make_client_config() -> ClientConfig {
-    let _roots = quinn::rustls::RootCertStore::empty();
-    // For testing: accept any cert
+fn make_client_config(
+    server_certs: &[quinn::rustls::pki_types::CertificateDer<'static>],
+) -> ClientConfig {
+    let mut roots = quinn::rustls::RootCertStore::empty();
+    for cert in server_certs {
+        roots.add(cert.clone()).unwrap();
+    }
     let crypto = quinn::rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SkipVerify))
+        .with_root_certificates(roots)
         .with_no_client_auth();
     ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto).unwrap(),
     ))
 }
 
-#[derive(Debug)]
-struct SkipVerify;
-
-impl quinn::rustls::client::danger::ServerCertVerifier for SkipVerify {
-    fn verify_server_cert(
-        &self,
-        _: &quinn::rustls::pki_types::CertificateDer<'_>,
-        _: &[quinn::rustls::pki_types::CertificateDer<'_>],
-        _: &quinn::rustls::pki_types::ServerName<'_>,
-        _: &[u8],
-        _: quinn::rustls::pki_types::UnixTime,
-    ) -> Result<quinn::rustls::client::danger::ServerCertVerified, quinn::rustls::Error> {
-        Ok(quinn::rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _: &[u8],
-        _: &quinn::rustls::pki_types::CertificateDer<'_>,
-        _: &quinn::rustls::DigitallySignedStruct,
-    ) -> Result<quinn::rustls::client::danger::HandshakeSignatureValid, quinn::rustls::Error> {
-        Ok(quinn::rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _: &[u8],
-        _: &quinn::rustls::pki_types::CertificateDer<'_>,
-        _: &quinn::rustls::DigitallySignedStruct,
-    ) -> Result<quinn::rustls::client::danger::HandshakeSignatureValid, quinn::rustls::Error> {
-        Ok(quinn::rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<quinn::rustls::SignatureScheme> {
-        quinn::rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
-
 use rdma_io_tests::test_helpers;
 
 #[tokio::test]
 async fn quinn_echo_over_rdma() {
-    let server_config = make_server_config();
-    let client_config = make_client_config();
+    let (certs, key) = generate_self_signed_cert();
+    let server_config = make_server_config(&certs, key);
+    let client_config = make_client_config(&certs);
     let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
 
     // 1. Bind server socket + create server Quinn endpoint FIRST

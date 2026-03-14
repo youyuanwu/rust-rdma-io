@@ -34,6 +34,7 @@ tokio-stream = "0.1"
 # gRPC / HTTP
 tonic = { version = "0.14", default-features = false }
 tonic-tls = { version = "0.7", features = ["openssl"] }
+tonic-h3 = { version = "0.0.5", default-features = false, features = ["quinn"] }
 tonic-prost = "0.14"
 prost = "0.14"
 hyper-util = { version = "0.1", features = ["tokio"] }
