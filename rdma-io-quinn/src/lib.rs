@@ -271,11 +271,18 @@ impl<B: TransportBuilder> AsyncUdpSocket for RdmaUdpSocket<B> {
                                 count += 1;
                             }
                         }
+                        Poll::Ready(Ok(_)) => {
+                            // Credit-only batch (ring transport) — no data but
+                            // internal credit state updated. Re-poll so the CQ
+                            // registers a waker via poll_completions, otherwise
+                            // future data on this CQ goes unnoticed.
+                            continue;
+                        }
                         Poll::Ready(Err(_)) => {
                             dead_addrs.push(*addr);
                             break;
                         }
-                        _ => break,
+                        Poll::Pending => break,
                     }
                 }
             }

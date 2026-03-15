@@ -313,7 +313,6 @@ async fn h3_multi_peer_default() {
 }
 
 #[tokio::test]
-#[ignore = "ring transport credit flow + Quinn multi-peer polling causes timeout"]
 async fn h3_multi_peer_ring() {
     require_no_iwarp!();
     h3_multi_peer(RingConfig::datagram()).await;

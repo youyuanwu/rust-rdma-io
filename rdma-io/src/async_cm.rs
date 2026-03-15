@@ -325,6 +325,9 @@ pub struct AsyncCmListener {
     _cm_id: ManuallyDrop<CmId>,
     event_channel: ManuallyDrop<EventChannel>,
     async_ch: AsyncEventChannel,
+    /// ConnectRequest events consumed while waiting for Established.
+    /// Drained by `get_request` / `poll_get_request` before polling the fd.
+    pending_requests: std::sync::Mutex<std::collections::VecDeque<CmId>>,
 }
 
 // Safety: EventChannel + CmId are Send-safe (raw pointers guarded by kernel).
@@ -334,6 +337,7 @@ unsafe impl Send for AsyncCmListener {}
 // - CmId: `unsafe impl Sync` (kernel operations are atomic)
 // - EventChannel: `unsafe impl Sync` (kernel fd queue is serialized)
 // - AsyncEventChannel: contains `AsyncFd<RawFd>` which is Sync
+// - pending_requests: `Mutex<VecDeque<CmId>>` is Sync
 // Concurrent &self callers are safe; the kernel serializes event delivery.
 unsafe impl Sync for AsyncCmListener {}
 
@@ -365,6 +369,7 @@ impl AsyncCmListener {
             _cm_id: ManuallyDrop::new(cm_id),
             event_channel: ManuallyDrop::new(ch),
             async_ch,
+            pending_requests: std::sync::Mutex::new(std::collections::VecDeque::new()),
         })
     }
 
@@ -401,10 +406,28 @@ impl AsyncCmListener {
         // Accept the connection (non-blocking kernel call)
         conn_id.accept(param)?;
 
-        // Await ESTABLISHED on the listener's event channel
-        self.async_ch
-            .expect_event(&self.event_channel, CmEventType::Established)
-            .await?;
+        // Await ESTABLISHED, stashing interleaved ConnectRequest events.
+        loop {
+            let ev = self.async_ch.get_event(&self.event_channel).await?;
+            let etype = ev.event_type();
+            match etype {
+                CmEventType::Established => {
+                    ev.ack();
+                    break;
+                }
+                CmEventType::ConnectRequest => {
+                    let stashed_id = unsafe { CmId::from_raw(ev.cm_id_raw(), true) };
+                    ev.ack();
+                    self.pending_requests.lock().unwrap().push_back(stashed_id);
+                }
+                _ => {
+                    ev.ack();
+                    return Err(crate::Error::InvalidArg(format!(
+                        "expected Established, got {etype:?}"
+                    )));
+                }
+            }
+        }
 
         // Migrate to its own event channel
         let conn_ch = EventChannel::new()?;
@@ -423,6 +446,10 @@ impl AsyncCmListener {
     /// QP resources on the returned `CmId`, then call
     /// [`complete_accept`](Self::complete_accept) to finish the handshake.
     pub async fn get_request(&self) -> Result<CmId> {
+        // Drain stashed requests from interleaved events during complete_accept.
+        if let Some(conn_id) = self.pending_requests.lock().unwrap().pop_front() {
+            return Ok(conn_id);
+        }
         let ev = self.async_ch.get_event(&self.event_channel).await?;
         let etype = ev.event_type();
         if etype != CmEventType::ConnectRequest {
@@ -446,6 +473,10 @@ impl AsyncCmListener {
         &self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<CmId>> {
+        // Drain stashed requests from interleaved events during complete_accept.
+        if let Some(conn_id) = self.pending_requests.lock().unwrap().pop_front() {
+            return std::task::Poll::Ready(Ok(conn_id));
+        }
         loop {
             let mut guard = match self.async_ch.async_fd.poll_read_ready(cx) {
                 std::task::Poll::Ready(Ok(g)) => g,
@@ -480,12 +511,35 @@ impl AsyncCmListener {
     ///
     /// Second phase of a two-phase accept: sends the accept reply, awaits
     /// ESTABLISHED, and migrates the connection to its own event channel.
+    ///
+    /// If a `ConnectRequest` event arrives while waiting for `Established`
+    /// (concurrent client connecting), it is stashed for later retrieval
+    /// by [`get_request`](Self::get_request) / [`poll_get_request`](Self::poll_get_request).
     pub async fn complete_accept(&self, conn_id: CmId, param: &ConnParam) -> Result<AsyncCmId> {
         conn_id.accept(param)?;
 
-        self.async_ch
-            .expect_event(&self.event_channel, CmEventType::Established)
-            .await?;
+        // Wait for Established, stashing any interleaved ConnectRequest events.
+        loop {
+            let ev = self.async_ch.get_event(&self.event_channel).await?;
+            let etype = ev.event_type();
+            match etype {
+                CmEventType::Established => {
+                    ev.ack();
+                    break;
+                }
+                CmEventType::ConnectRequest => {
+                    let stashed_id = unsafe { CmId::from_raw(ev.cm_id_raw(), true) };
+                    ev.ack();
+                    self.pending_requests.lock().unwrap().push_back(stashed_id);
+                }
+                _ => {
+                    ev.ack();
+                    return Err(crate::Error::InvalidArg(format!(
+                        "expected Established, got {etype:?}"
+                    )));
+                }
+            }
+        }
 
         let conn_ch = EventChannel::new()?;
         conn_ch.set_nonblocking()?;

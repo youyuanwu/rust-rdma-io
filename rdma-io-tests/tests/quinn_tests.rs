@@ -133,3 +133,123 @@ async fn quinn_echo_ring() {
     require_no_iwarp!();
     quinn_echo(RingConfig::datagram()).await;
 }
+
+// ===========================================================================
+// quinn_multi_peer — two clients echo concurrently via the same server.
+// ===========================================================================
+
+async fn quinn_multi_peer<B: TransportBuilder>(builder: B) {
+    let (certs, key) = generate_self_signed_cert();
+    let server_config = make_server_config(&certs, key);
+    let client_config = make_client_config(&certs);
+    let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
+
+    // Server
+    let server_socket =
+        RdmaUdpSocket::bind(&test_helpers::bind_addr(), builder.clone()).expect("server bind");
+    let connect_addr = test_helpers::connect_addr_for(Some(server_socket.bound_addr()));
+
+    let server_endpoint = Endpoint::new_with_abstract_socket(
+        quinn::EndpointConfig::default(),
+        Some(server_config),
+        Arc::new(server_socket),
+        runtime.clone(),
+    )
+    .expect("server endpoint");
+
+    // Server task: accept 2 connections, echo on each.
+    let server = tokio::spawn(async move {
+        for i in 0..2 {
+            let incoming = server_endpoint.accept().await.expect("no incoming");
+            let connection = incoming.await.expect("accept failed");
+            println!(
+                "Server: accepted peer-{i} from {}",
+                connection.remote_address()
+            );
+            tokio::spawn(async move {
+                let (mut send, mut recv) = connection.accept_bi().await.expect("accept_bi");
+                let data = recv.read_to_end(1024).await.expect("read");
+                send.write_all(&data).await.expect("write");
+                send.finish().expect("finish");
+                send.stopped().await.ok();
+            });
+        }
+    });
+
+    // Client 1
+    let client_socket_1 =
+        RdmaUdpSocket::bind(&test_helpers::bind_addr(), builder.clone()).expect("client1 bind");
+    client_socket_1
+        .connect_to(&connect_addr)
+        .await
+        .expect("client1 pre-connect");
+
+    let mut ep1 = Endpoint::new_with_abstract_socket(
+        quinn::EndpointConfig::default(),
+        None,
+        Arc::new(client_socket_1),
+        runtime.clone(),
+    )
+    .expect("client1 endpoint");
+    ep1.set_default_client_config(client_config.clone());
+
+    // Client 2
+    let client_socket_2 =
+        RdmaUdpSocket::bind(&test_helpers::bind_addr(), builder).expect("client2 bind");
+    client_socket_2
+        .connect_to(&connect_addr)
+        .await
+        .expect("client2 pre-connect");
+
+    let mut ep2 = Endpoint::new_with_abstract_socket(
+        quinn::EndpointConfig::default(),
+        None,
+        Arc::new(client_socket_2),
+        runtime,
+    )
+    .expect("client2 endpoint");
+    ep2.set_default_client_config(client_config);
+
+    // Both clients connect and echo concurrently.
+    let (r1, r2) = tokio::join!(
+        async {
+            let conn = ep1
+                .connect(connect_addr, "localhost")
+                .unwrap()
+                .await
+                .expect("connect1");
+            let (mut send, mut recv) = conn.open_bi().await.expect("open_bi");
+            send.write_all(b"peer-1").await.expect("write");
+            send.finish().expect("finish");
+            recv.read_to_end(1024).await.expect("read")
+        },
+        async {
+            let conn = ep2
+                .connect(connect_addr, "localhost")
+                .unwrap()
+                .await
+                .expect("connect2");
+            let (mut send, mut recv) = conn.open_bi().await.expect("open_bi");
+            send.write_all(b"peer-2").await.expect("write");
+            send.finish().expect("finish");
+            recv.read_to_end(1024).await.expect("read")
+        },
+    );
+
+    assert_eq!(r1, b"peer-1");
+    assert_eq!(r2, b"peer-2");
+    println!("Multi-peer echo verified!");
+
+    server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn quinn_multi_peer_default() {
+    quinn_multi_peer(TransportConfig::datagram()).await;
+}
+
+#[tokio::test]
+async fn quinn_multi_peer_ring() {
+    require_no_iwarp!();
+    quinn_multi_peer(RingConfig::datagram()).await;
+}

@@ -53,13 +53,18 @@ async fn drain_send_completions(transport: &mut RdmaRingTransport) {
 }
 
 /// Helper: receive one completion and return (buf_idx, byte_len).
+/// Loops past credit-only batches (Ok(0)) from ring transport.
 async fn recv_one(transport: &mut RdmaRingTransport) -> RecvCompletion {
     let mut completions = [RecvCompletion::default(); 1];
-    let n = poll_fn(|cx| transport.poll_recv(cx, &mut completions))
-        .await
-        .unwrap();
-    assert!(n > 0, "poll_recv returned 0 completions");
-    completions[0]
+    for _ in 0..100 {
+        let n = poll_fn(|cx| transport.poll_recv(cx, &mut completions))
+            .await
+            .unwrap();
+        if n > 0 {
+            return completions[0];
+        }
+    }
+    panic!("recv_one: no data after 100 poll_recv attempts (all credit-only)");
 }
 
 // ===========================================================================
@@ -690,4 +695,99 @@ async fn ring_stream_echo() {
     assert_eq!(received, data, "stream echo data integrity");
 
     println!("ring_stream_echo passed!");
+}
+
+// ===========================================================================
+// P2 — Multi-connection: two clients share the same server listener
+// ===========================================================================
+
+/// P2: Two clients connect to the same listener concurrently.
+/// Each pair does an independent send/recv echo. Verifies that
+/// interleaved ConnectRequest + Established events on the shared
+/// listener event channel are handled correctly.
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn ring_multi_connection() {
+    require_no_iwarp!();
+    let config = RingConfig::default();
+
+    let listener = AsyncCmListener::bind(&bind_addr()).unwrap();
+    let connect_addr = connect_addr_for(listener.local_addr());
+    let listener = std::sync::Arc::new(listener);
+
+    // Server: accept two connections sequentially on the same listener.
+    let listener_s = listener.clone();
+    let config_s = config.clone();
+    let server_handle = tokio::spawn(async move {
+        println!("Server: waiting for connection 1...");
+        let t1 = RdmaRingTransport::accept(&listener_s, config_s.clone())
+            .await
+            .unwrap();
+        println!("Server: accepted connection 1 from {:?}", t1.peer_addr());
+        println!("Server: waiting for connection 2...");
+        let t2 = RdmaRingTransport::accept(&listener_s, config_s)
+            .await
+            .unwrap();
+        println!("Server: accepted connection 2 from {:?}", t2.peer_addr());
+        (t1, t2)
+    });
+
+    // Small delay so the server is listening before clients connect.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Client 1 connects first, waits, then client 2 connects (sequential).
+    let config_c1 = config.clone();
+    let addr1 = connect_addr;
+    let client1_handle = tokio::spawn(async move {
+        println!("Client1: connecting...");
+        let t = RdmaRingTransport::connect(&addr1, config_c1).await.unwrap();
+        println!("Client1: connected");
+        t
+    });
+
+    // Wait for client 1 to fully connect before starting client 2.
+    let client1 = client1_handle.await.unwrap();
+    println!("Client1 done, starting client2...");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let config_c2 = config;
+    let addr2 = connect_addr;
+    let client2_handle = tokio::spawn(async move {
+        println!("Client2: connecting...");
+        let t = RdmaRingTransport::connect(&addr2, config_c2).await.unwrap();
+        println!("Client2: connected");
+        t
+    });
+
+    let (server_res, c2_res) = tokio::join!(server_handle, client2_handle);
+    let (mut server1, mut server2) = server_res.unwrap();
+    let mut client1 = client1;
+    let mut client2 = c2_res.unwrap();
+
+    println!("All 4 transports connected");
+
+    // Echo on connection 1: client1 → server1 → client1
+    let msg1 = b"hello from client 1";
+    send_and_complete(&mut client1, msg1).await;
+    let rc = recv_one(&mut server1).await;
+    assert_eq!(&server1.recv_buf(rc.buf_idx)[..rc.byte_len], msg1);
+    server1.repost_recv(rc.buf_idx).unwrap();
+
+    send_and_complete(&mut server1, msg1).await;
+    let rc = recv_one(&mut client1).await;
+    assert_eq!(&client1.recv_buf(rc.buf_idx)[..rc.byte_len], msg1);
+    client1.repost_recv(rc.buf_idx).unwrap();
+
+    // Echo on connection 2: client2 → server2 → client2
+    let msg2 = b"hello from client 2";
+    send_and_complete(&mut client2, msg2).await;
+    let rc = recv_one(&mut server2).await;
+    assert_eq!(&server2.recv_buf(rc.buf_idx)[..rc.byte_len], msg2);
+    server2.repost_recv(rc.buf_idx).unwrap();
+
+    send_and_complete(&mut server2, msg2).await;
+    let rc = recv_one(&mut client2).await;
+    assert_eq!(&client2.recv_buf(rc.buf_idx)[..rc.byte_len], msg2);
+    client2.repost_recv(rc.buf_idx).unwrap();
+
+    println!("ring_multi_connection passed!");
 }
