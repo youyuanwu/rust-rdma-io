@@ -330,6 +330,13 @@ pub struct AsyncCmListener {
 // Safety: EventChannel + CmId are Send-safe (raw pointers guarded by kernel).
 unsafe impl Send for AsyncCmListener {}
 
+// Safety: All fields are Sync:
+// - CmId: `unsafe impl Sync` (kernel operations are atomic)
+// - EventChannel: `unsafe impl Sync` (kernel fd queue is serialized)
+// - AsyncEventChannel: contains `AsyncFd<RawFd>` which is Sync
+// Concurrent &self callers are safe; the kernel serializes event delivery.
+unsafe impl Sync for AsyncCmListener {}
+
 impl Drop for AsyncCmListener {
     fn drop(&mut self) {
         // RDMA teardown order: CM ID first, then event channel.

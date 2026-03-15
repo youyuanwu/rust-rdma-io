@@ -3,6 +3,7 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures_util::Stream;
@@ -18,26 +19,16 @@ const DEFAULT_BUF_SIZE: usize = 64 * 1024;
 type AcceptFut =
     Pin<Box<dyn Future<Output = rdma_io::Result<AsyncRdmaStream<RdmaIoTransport>>> + Send>>;
 
-/// Send-safe wrapper for a pointer to AsyncCmListener.
-///
-/// Safety: The listener is owned by RdmaIncoming and outlives the future.
-/// AsyncCmListener is Send, so accessing it from another thread is safe.
-struct ListenerPtr(*const AsyncCmListener);
-unsafe impl Send for ListenerPtr {}
-
 /// A [`Stream`] of incoming RDMA connections for use with
 /// [`tonic::transport::Server::serve_with_incoming`].
 ///
 /// Each accepted connection is wrapped as a [`TokioRdmaStream`] with the
 /// required `tokio::io` and `Connected` trait implementations.
 pub struct RdmaIncoming {
-    listener: AsyncCmListener,
+    listener: Arc<AsyncCmListener>,
     buf_size: usize,
     accept_fut: Option<AcceptFut>,
 }
-
-// Safety: AsyncCmListener is Send, the boxed future is Send.
-unsafe impl Send for RdmaIncoming {}
 
 impl RdmaIncoming {
     /// Wrap an existing [`AsyncCmListener`] as an incoming stream.
@@ -48,7 +39,7 @@ impl RdmaIncoming {
     /// Wrap an existing [`AsyncCmListener`] with a custom buffer size.
     pub fn with_buf_size(listener: AsyncCmListener, buf_size: usize) -> Self {
         Self {
-            listener,
+            listener: Arc::new(listener),
             buf_size,
             accept_fut: None,
         }
@@ -62,7 +53,11 @@ impl RdmaIncoming {
     /// Bind with a custom buffer size for accepted streams.
     pub fn bind_with_buf_size(addr: &SocketAddr, buf_size: usize) -> rdma_io::Result<Self> {
         let listener = AsyncCmListener::bind(addr)?;
-        Ok(Self::with_buf_size(listener, buf_size))
+        Ok(Self {
+            listener: Arc::new(listener),
+            buf_size,
+            accept_fut: None,
+        })
     }
 
     /// Get the local socket address the listener is bound to.
@@ -92,26 +87,22 @@ impl Stream for RdmaIncoming {
                 }
             }
 
-            // Safety: the listener is owned by RdmaIncoming. We only hold
-            // one accept future at a time, and it is polled/dropped before
-            // the listener. ListenerPtr makes the raw pointer Send-safe.
-            let ptr = ListenerPtr(&this.listener as *const AsyncCmListener);
+            let listener = Arc::clone(&this.listener);
             let buf_size = this.buf_size;
-            this.accept_fut = Some(Box::pin(accept_one(ptr, buf_size)));
+            this.accept_fut = Some(Box::pin(accept_one(listener, buf_size)));
         }
     }
 }
 
-/// Accept one connection from the listener behind a Send-safe pointer.
+/// Accept one connection from the listener.
 async fn accept_one(
-    ptr: ListenerPtr,
+    listener: Arc<AsyncCmListener>,
     buf_size: usize,
 ) -> rdma_io::Result<AsyncRdmaStream<RdmaIoTransport>> {
-    let listener = unsafe { &*ptr.0 };
     let config = TransportConfig {
         buf_size,
         ..TransportConfig::stream()
     };
-    let transport = RdmaIoTransport::accept(listener, config).await?;
+    let transport = RdmaIoTransport::accept(&listener, config).await?;
     Ok(AsyncRdmaStream::new(transport))
 }

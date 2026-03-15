@@ -166,36 +166,45 @@ impl<T: Transport> AsyncRead for AsyncRdmaStream<T> {
             return Poll::Ready(Ok(copy_len));
         }
 
-        // Phase 2: Poll transport for new recv completion
+        // Phase 2: Poll transport for new recv completion.
+        // Loop handles credit-only batches (Ok(0)) from ring transport —
+        // credits update internal state but produce no data. Re-polling
+        // ensures the CQ waker is properly registered when no data remains.
         let mut completions = [RecvCompletion::default(); 1];
-        match this.transport.poll_recv(cx, &mut completions) {
-            Poll::Pending => {
-                if this.transport.poll_disconnect(cx) {
+        loop {
+            match this.transport.poll_recv(cx, &mut completions) {
+                Poll::Pending => {
+                    if this.transport.poll_disconnect(cx) {
+                        this.eof = true;
+                        return Poll::Ready(Ok(0));
+                    }
+                    return Poll::Pending;
+                }
+                Poll::Ready(Err(_)) => {
+                    // FLUSH_ERR etc. — transport marked itself dead
                     this.eof = true;
                     return Poll::Ready(Ok(0));
                 }
-                Poll::Pending
-            }
-            Poll::Ready(Err(_)) => {
-                // FLUSH_ERR etc. — transport marked itself dead
-                this.eof = true;
-                Poll::Ready(Ok(0))
-            }
-            Poll::Ready(Ok(n)) if n > 0 => {
-                let c = &completions[0];
-                if c.byte_len == 0 {
-                    return Poll::Ready(Ok(0));
+                Poll::Ready(Ok(0)) => {
+                    // Credit-only or internal-state-only batch — re-poll.
+                    continue;
                 }
-                let copy_len = c.byte_len.min(buf.len());
-                buf[..copy_len].copy_from_slice(&this.transport.recv_buf(c.buf_idx)[..copy_len]);
-                if copy_len < c.byte_len {
-                    this.recv_pending = Some((c.buf_idx, copy_len, c.byte_len));
-                } else {
-                    let _ = this.transport.repost_recv(c.buf_idx);
+                Poll::Ready(Ok(_)) => {
+                    let c = &completions[0];
+                    if c.byte_len == 0 {
+                        return Poll::Ready(Ok(0));
+                    }
+                    let copy_len = c.byte_len.min(buf.len());
+                    buf[..copy_len]
+                        .copy_from_slice(&this.transport.recv_buf(c.buf_idx)[..copy_len]);
+                    if copy_len < c.byte_len {
+                        this.recv_pending = Some((c.buf_idx, copy_len, c.byte_len));
+                    } else {
+                        let _ = this.transport.repost_recv(c.buf_idx);
+                    }
+                    return Poll::Ready(Ok(copy_len));
                 }
-                Poll::Ready(Ok(copy_len))
             }
-            _ => Poll::Pending,
         }
     }
 }
