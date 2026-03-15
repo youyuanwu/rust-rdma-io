@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use rdma_io::async_stream::AsyncRdmaListener;
+use rdma_io::async_cm::AsyncCmListener;
 use rdma_io_tonic::{RdmaConnector, RdmaIncoming};
 
 use rdma_io_tests::greeter_service::*;
@@ -21,7 +21,7 @@ async fn start_server_and_connect() -> (
     tokio::sync::oneshot::Sender<()>,
     tokio::task::JoinHandle<()>,
 ) {
-    let listener = AsyncRdmaListener::bind(&bind_addr()).unwrap();
+    let listener = AsyncCmListener::bind(&bind_addr()).unwrap();
     let connect_addr = connect_addr_for(listener.local_addr());
     let incoming = RdmaIncoming::new(listener);
 

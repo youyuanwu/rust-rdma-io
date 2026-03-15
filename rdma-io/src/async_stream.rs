@@ -5,15 +5,38 @@
 //!
 //! # Architecture
 //!
-//! `AsyncRdmaStream<T>` is generic over `T: Transport`. The default
-//! concrete type is [`RdmaTransport`](crate::rdma_transport::RdmaTransport)
-//! which uses RDMA Send/Recv verbs. Convenience constructors
-//! (`connect`, `connect_with_buf_size`) hide the generic parameter.
+//! `AsyncRdmaStream<T>` is generic over `T: Transport`. Callers construct
+//! the transport directly (e.g. [`RdmaTransport::connect`] or
+//! [`RdmaRingTransport::connect`]) and wrap it with [`AsyncRdmaStream::new`].
+//!
+//! [`RdmaTransport::connect`]: crate::rdma_transport::RdmaTransport::connect
+//! [`RdmaRingTransport::connect`]: crate::rdma_ring_transport::RdmaRingTransport::connect
 //!
 //! # Protocol
 //!
-//! Pure RDMA SEND/RECV with no application-level framing. Each `write()`
-//! becomes one transport send; each `read()` consumes one recv completion.
+//! No application-level framing. Each `write()` becomes one transport send;
+//! each `read()` consumes one recv completion.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use rdma_io::async_cm::AsyncCmListener;
+//! use rdma_io::async_stream::AsyncRdmaStream;
+//! use rdma_io::rdma_transport::{RdmaTransport, TransportConfig};
+//!
+//! # async fn example() -> rdma_io::Result<()> {
+//! // Server
+//! let listener = AsyncCmListener::bind(&"0.0.0.0:9999".parse().unwrap())?;
+//! let transport = RdmaTransport::accept(&listener, TransportConfig::default()).await?;
+//! let mut server = AsyncRdmaStream::new(transport);
+//!
+//! // Client
+//! let addr = "10.0.0.1:9999".parse().unwrap();
+//! let transport = RdmaTransport::connect(&addr, TransportConfig::default()).await?;
+//! let mut client = AsyncRdmaStream::new(transport);
+//! # Ok(())
+//! # }
+//! ```
 
 use std::fmt;
 use std::io;
@@ -23,38 +46,13 @@ use std::task::{Context, Poll};
 
 use futures_io::{AsyncRead, AsyncWrite};
 
-use crate::async_cm::AsyncCmListener;
-use crate::rdma_transport::{RdmaTransport, TransportConfig};
 use crate::transport::{RecvCompletion, Transport};
-
-/// Default buffer size for stream send/recv (64 KiB).
-const DEFAULT_BUF_SIZE: usize = 64 * 1024;
 
 /// An async RDMA stream with `read` and `write` methods.
 ///
-/// Generic over `T: Transport` for testability and future transport variants.
-/// Created via [`AsyncRdmaStream::connect`] (client) or
-/// [`AsyncRdmaListener::accept`] (server).
-///
-/// # Example
-///
-/// ```no_run
-/// use rdma_io::async_stream::{AsyncRdmaListener, AsyncRdmaStream};
-///
-/// # async fn example() -> rdma_io::Result<()> {
-/// // Server
-/// let listener = AsyncRdmaListener::bind(&"0.0.0.0:9999".parse().unwrap())?;
-/// let mut stream = listener.accept().await?;
-/// let mut buf = [0u8; 1024];
-/// let n = stream.read(&mut buf).await?;
-///
-/// // Client
-/// let mut stream = AsyncRdmaStream::connect(&"10.0.0.1:9999".parse().unwrap()).await?;
-/// stream.write(b"hello").await?;
-/// # Ok(())
-/// # }
-/// ```
-pub struct AsyncRdmaStream<T: Transport = RdmaTransport> {
+/// Generic over `T: Transport`. Construct via [`AsyncRdmaStream::new`] with
+/// a pre-built transport.
+pub struct AsyncRdmaStream<T: Transport> {
     transport: T,
     /// Partially consumed recv: (buf_index, offset, total_len).
     recv_pending: Option<(usize, usize, usize)>,
@@ -128,24 +126,6 @@ impl<T: Transport> AsyncRdmaStream<T> {
     /// Get the local socket address.
     pub fn local_addr(&self) -> Option<SocketAddr> {
         self.transport.local_addr()
-    }
-}
-
-/// Convenience constructors for the default Send/Recv transport.
-impl AsyncRdmaStream<RdmaTransport> {
-    /// Connect to a remote RDMA endpoint (client side).
-    pub async fn connect(addr: &SocketAddr) -> crate::Result<Self> {
-        Self::connect_with_buf_size(addr, DEFAULT_BUF_SIZE).await
-    }
-
-    /// Connect with a custom buffer size.
-    pub async fn connect_with_buf_size(addr: &SocketAddr, buf_size: usize) -> crate::Result<Self> {
-        let config = TransportConfig {
-            buf_size,
-            ..TransportConfig::stream()
-        };
-        let transport = RdmaTransport::connect(addr, config).await?;
-        Ok(Self::new(transport))
     }
 }
 
@@ -346,42 +326,5 @@ impl<T: Transport> AsyncWrite for AsyncRdmaStream<T> {
         let _ = this.transport.disconnect();
         this.eof = true;
         Poll::Ready(Ok(()))
-    }
-}
-
-/// An async RDMA listener, analogous to `TcpListener`.
-///
-/// Binds to a local address and accepts incoming RDMA connections,
-/// returning an [`AsyncRdmaStream`] for each.
-pub struct AsyncRdmaListener {
-    inner: AsyncCmListener,
-    buf_size: usize,
-}
-
-impl AsyncRdmaListener {
-    /// Bind to a local address and start listening.
-    pub fn bind(addr: &SocketAddr) -> crate::Result<Self> {
-        Self::bind_with_buf_size(addr, DEFAULT_BUF_SIZE)
-    }
-
-    /// Bind with a custom buffer size for accepted streams.
-    pub fn bind_with_buf_size(addr: &SocketAddr, buf_size: usize) -> crate::Result<Self> {
-        let inner = AsyncCmListener::bind(addr)?;
-        Ok(Self { inner, buf_size })
-    }
-
-    /// Get the local socket address the listener is bound to.
-    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
-        self.inner.local_addr()
-    }
-
-    /// Accept an incoming connection, returning an [`AsyncRdmaStream`].
-    pub async fn accept(&self) -> crate::Result<AsyncRdmaStream<RdmaTransport>> {
-        let config = TransportConfig {
-            buf_size: self.buf_size,
-            ..TransportConfig::stream()
-        };
-        let transport = RdmaTransport::accept(&self.inner, config).await?;
-        Ok(AsyncRdmaStream::new(transport))
     }
 }

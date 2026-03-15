@@ -46,13 +46,14 @@
 //! ```
 
 use rdma_io::async_stream::AsyncRdmaStream;
+use rdma_io::rdma_transport::{RdmaTransport as RdmaIoTransport, TransportConfig};
 use tonic::transport::Uri;
 
 use crate::RdmaIncoming;
 use crate::connector::uri_to_socket_addr;
 use crate::stream::TokioRdmaStream;
 
-/// Default buffer size (matches AsyncRdmaStream default).
+/// Default buffer size (64 KiB).
 const DEFAULT_BUF_SIZE: usize = 64 * 1024;
 
 /// RDMA transport for [`tonic_tls`].
@@ -91,7 +92,12 @@ impl tonic_tls::Transport for RdmaTransport {
 
     async fn connect(&self, uri: &Uri) -> Result<Self::Io, Self::Error> {
         let addr = uri_to_socket_addr(uri)?;
-        let stream = AsyncRdmaStream::connect_with_buf_size(&addr, self.buf_size).await?;
+        let config = TransportConfig {
+            buf_size: self.buf_size,
+            ..TransportConfig::stream()
+        };
+        let transport = RdmaIoTransport::connect(&addr, config).await?;
+        let stream = AsyncRdmaStream::new(transport);
         Ok(TokioRdmaStream::new(stream))
     }
 }

@@ -6,18 +6,23 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use futures_util::Stream;
-use rdma_io::async_stream::{AsyncRdmaListener, AsyncRdmaStream};
+use rdma_io::async_cm::AsyncCmListener;
+use rdma_io::async_stream::AsyncRdmaStream;
+use rdma_io::rdma_transport::{RdmaTransport as RdmaIoTransport, TransportConfig};
 
 use crate::stream::TokioRdmaStream;
 
-/// Default buffer size (matches AsyncRdmaStream default).
+/// Default buffer size (64 KiB).
 const DEFAULT_BUF_SIZE: usize = 64 * 1024;
 
-/// Send-safe wrapper for a pointer to AsyncRdmaListener.
+type AcceptFut =
+    Pin<Box<dyn Future<Output = rdma_io::Result<AsyncRdmaStream<RdmaIoTransport>>> + Send>>;
+
+/// Send-safe wrapper for a pointer to AsyncCmListener.
 ///
 /// Safety: The listener is owned by RdmaIncoming and outlives the future.
-/// AsyncRdmaListener is Send, so accessing it from another thread is safe.
-struct ListenerPtr(*const AsyncRdmaListener);
+/// AsyncCmListener is Send, so accessing it from another thread is safe.
+struct ListenerPtr(*const AsyncCmListener);
 unsafe impl Send for ListenerPtr {}
 
 /// A [`Stream`] of incoming RDMA connections for use with
@@ -26,18 +31,25 @@ unsafe impl Send for ListenerPtr {}
 /// Each accepted connection is wrapped as a [`TokioRdmaStream`] with the
 /// required `tokio::io` and `Connected` trait implementations.
 pub struct RdmaIncoming {
-    listener: AsyncRdmaListener,
-    accept_fut: Option<Pin<Box<dyn Future<Output = rdma_io::Result<AsyncRdmaStream>> + Send>>>,
+    listener: AsyncCmListener,
+    buf_size: usize,
+    accept_fut: Option<AcceptFut>,
 }
 
-// Safety: AsyncRdmaListener is Send, the boxed future is Send.
+// Safety: AsyncCmListener is Send, the boxed future is Send.
 unsafe impl Send for RdmaIncoming {}
 
 impl RdmaIncoming {
-    /// Wrap an existing [`AsyncRdmaListener`] as an incoming stream.
-    pub fn new(listener: AsyncRdmaListener) -> Self {
+    /// Wrap an existing [`AsyncCmListener`] as an incoming stream.
+    pub fn new(listener: AsyncCmListener) -> Self {
+        Self::with_buf_size(listener, DEFAULT_BUF_SIZE)
+    }
+
+    /// Wrap an existing [`AsyncCmListener`] with a custom buffer size.
+    pub fn with_buf_size(listener: AsyncCmListener, buf_size: usize) -> Self {
         Self {
             listener,
+            buf_size,
             accept_fut: None,
         }
     }
@@ -49,8 +61,13 @@ impl RdmaIncoming {
 
     /// Bind with a custom buffer size for accepted streams.
     pub fn bind_with_buf_size(addr: &SocketAddr, buf_size: usize) -> rdma_io::Result<Self> {
-        let listener = AsyncRdmaListener::bind_with_buf_size(addr, buf_size)?;
-        Ok(Self::new(listener))
+        let listener = AsyncCmListener::bind(addr)?;
+        Ok(Self::with_buf_size(listener, buf_size))
+    }
+
+    /// Get the local socket address the listener is bound to.
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        self.listener.local_addr()
     }
 }
 
@@ -78,14 +95,23 @@ impl Stream for RdmaIncoming {
             // Safety: the listener is owned by RdmaIncoming. We only hold
             // one accept future at a time, and it is polled/dropped before
             // the listener. ListenerPtr makes the raw pointer Send-safe.
-            let ptr = ListenerPtr(&this.listener as *const AsyncRdmaListener);
-            this.accept_fut = Some(Box::pin(accept_one(ptr)));
+            let ptr = ListenerPtr(&this.listener as *const AsyncCmListener);
+            let buf_size = this.buf_size;
+            this.accept_fut = Some(Box::pin(accept_one(ptr, buf_size)));
         }
     }
 }
 
 /// Accept one connection from the listener behind a Send-safe pointer.
-async fn accept_one(ptr: ListenerPtr) -> rdma_io::Result<AsyncRdmaStream> {
+async fn accept_one(
+    ptr: ListenerPtr,
+    buf_size: usize,
+) -> rdma_io::Result<AsyncRdmaStream<RdmaIoTransport>> {
     let listener = unsafe { &*ptr.0 };
-    listener.accept().await
+    let config = TransportConfig {
+        buf_size,
+        ..TransportConfig::stream()
+    };
+    let transport = RdmaIoTransport::accept(listener, config).await?;
+    Ok(AsyncRdmaStream::new(transport))
 }

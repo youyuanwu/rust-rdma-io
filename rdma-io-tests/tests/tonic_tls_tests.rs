@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use openssl::ssl::{SslAcceptor, SslConnector, SslMethod, SslVerifyMode};
 use openssl::x509::X509;
-use rdma_io::async_stream::AsyncRdmaListener;
+use rdma_io::async_cm::AsyncCmListener;
 use rdma_io_tonic::{RdmaIncoming, RdmaTransport};
 use tokio_stream::StreamExt;
 use tonic::Request;
@@ -73,7 +73,7 @@ async fn start_tls_server_and_connect(
     tokio::sync::oneshot::Sender<()>,
     tokio::task::JoinHandle<()>,
 ) {
-    let listener = AsyncRdmaListener::bind(&bind_addr()).expect("bind RDMA listener");
+    let listener = AsyncCmListener::bind(&bind_addr()).expect("bind RDMA listener");
     let connect_addr = connect_addr_for(listener.local_addr());
     let incoming = RdmaIncoming::new(listener);
 

@@ -16,7 +16,7 @@ use tonic::transport::server::Connected;
 /// from `futures_io` traits to `tokio::io` traits. Implements [`Connected`]
 /// for tonic server integration.
 pub struct TokioRdmaStream {
-    inner: Compat<AsyncRdmaStream>,
+    inner: Compat<AsyncRdmaStream<rdma_io::rdma_transport::RdmaTransport>>,
     peer_addr: Option<SocketAddr>,
 }
 
@@ -30,7 +30,7 @@ impl std::fmt::Debug for TokioRdmaStream {
 
 impl TokioRdmaStream {
     /// Wrap an [`AsyncRdmaStream`] with tokio::io compatibility.
-    pub fn new(stream: AsyncRdmaStream) -> Self {
+    pub fn new(stream: AsyncRdmaStream<rdma_io::rdma_transport::RdmaTransport>) -> Self {
         let peer_addr = stream.peer_addr();
         Self {
             inner: stream.compat(),

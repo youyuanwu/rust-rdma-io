@@ -8,11 +8,12 @@ use std::task::{Context, Poll};
 use http::Uri;
 use hyper_util::rt::TokioIo;
 use rdma_io::async_stream::AsyncRdmaStream;
+use rdma_io::rdma_transport::{RdmaTransport, TransportConfig};
 use tower_service::Service;
 
 use crate::stream::TokioRdmaStream;
 
-/// Default buffer size (matches AsyncRdmaStream default).
+/// Default buffer size (64 KiB).
 const DEFAULT_BUF_SIZE: usize = 64 * 1024;
 
 /// A [`tower::Service<Uri>`] connector that establishes RDMA connections
@@ -70,7 +71,12 @@ impl Service<Uri> for RdmaConnector {
         let buf_size = self.buf_size;
         Box::pin(async move {
             let addr = uri_to_socket_addr(&uri)?;
-            let stream = AsyncRdmaStream::connect_with_buf_size(&addr, buf_size).await?;
+            let config = TransportConfig {
+                buf_size,
+                ..TransportConfig::stream()
+            };
+            let transport = RdmaTransport::connect(&addr, config).await?;
+            let stream = AsyncRdmaStream::new(transport);
             let tokio_stream = TokioRdmaStream::new(stream);
             Ok(TokioIo::new(tokio_stream))
         })

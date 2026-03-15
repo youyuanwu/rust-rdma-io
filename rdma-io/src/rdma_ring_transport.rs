@@ -50,7 +50,7 @@ use crate::mr::{AccessFlags, OwnedMemoryRegion};
 use crate::mw::MemoryWindow;
 use crate::pd::ProtectionDomain;
 use crate::qp::QpInitAttr;
-use crate::transport::{RecvCompletion, Transport};
+use crate::transport::{RecvCompletion, Transport, TransportBuilder};
 use crate::wc::{WcOpcode, WorkCompletion};
 use crate::wr::{QpType, RecvWr, SendFlags, SendWr, Sge, WrOpcode};
 
@@ -1266,5 +1266,17 @@ fn is_qp_dead(qp: *mut rdma_io_sys::ibverbs::ibv_qp) -> bool {
             init_attr.as_mut_ptr(),
         );
         ret != 0 || (*attr.as_ptr()).qp_state != rdma_io_sys::ibverbs::IBV_QPS_RTS
+    }
+}
+
+impl TransportBuilder for RingConfig {
+    type Transport = RdmaRingTransport;
+
+    async fn connect(&self, addr: &SocketAddr) -> crate::Result<RdmaRingTransport> {
+        RdmaRingTransport::connect(addr, self.clone()).await
+    }
+
+    async fn accept(&self, listener: &AsyncCmListener) -> crate::Result<RdmaRingTransport> {
+        RdmaRingTransport::accept(listener, self.clone()).await
     }
 }

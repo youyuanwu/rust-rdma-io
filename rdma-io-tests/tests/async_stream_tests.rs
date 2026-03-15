@@ -1,36 +1,67 @@
-//! AsyncRdmaStream integration tests — Phases C + D + F.
+//! AsyncRdmaStream integration tests.
 //!
-//! Tests verify that `AsyncRdmaStream` provides TCP-like async read/write
-//! over RDMA SEND/RECV, using completion-channel-driven async CQ polling.
-//!
-//! Phase D tests verify the `futures::io::AsyncRead`/`AsyncWrite` trait
-//! implementations and tokio compat layer.
-//!
-//! Phase F tests verify async connect/accept using CM event channel
-//! (no `spawn_blocking` needed — both connect and accept are native async).
+//! Each test has a generic body (`test_name<B: TransportBuilder>`) and two
+//! concrete entry points: `test_name_default` (Send/Recv) and `test_name_ring`
+//! (Ring buffer). The ring variant is skipped on iWARP.
 
-use rdma_io::async_stream::{AsyncRdmaListener, AsyncRdmaStream};
+use rdma_io::async_stream::AsyncRdmaStream;
+use rdma_io::rdma_ring_transport::RingConfig;
+use rdma_io::rdma_transport::TransportConfig;
+use rdma_io::transport::TransportBuilder;
 
-use rdma_io_tests::test_helpers::{bind_addr, connect_addr_for, connect_with_retry};
+use rdma_io_tests::require_no_iwarp;
+use rdma_io_tests::test_helpers::{bind_addr, connect_addr_for};
 
-/// Test: async echo — client sends, server reads and echoes back.
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
-async fn async_stream_echo() {
-    let listener = AsyncRdmaListener::bind(&bind_addr()).unwrap();
+// ---------------------------------------------------------------------------
+// Generic helpers
+// ---------------------------------------------------------------------------
+
+/// Create a connected (server, client) stream pair using any transport builder.
+/// Retries client connect on EADDRINUSE (siw async port release).
+async fn connected_pair<B: TransportBuilder>(
+    builder: B,
+) -> (AsyncRdmaStream<B::Transport>, AsyncRdmaStream<B::Transport>) {
+    use rdma_io::async_cm::AsyncCmListener;
+
+    let listener = AsyncCmListener::bind(&bind_addr()).unwrap();
     let connect_addr = connect_addr_for(listener.local_addr());
+    let builder2 = builder.clone();
 
-    let server_handle = tokio::spawn(async move { listener.accept().await.unwrap() });
-
+    let server_handle =
+        tokio::spawn(
+            async move { AsyncRdmaStream::new(builder2.accept(&listener).await.unwrap()) },
+        );
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let client_handle = tokio::spawn(async move {
+        for attempt in 0u64..5 {
+            match builder.connect(&connect_addr).await {
+                Ok(transport) => return AsyncRdmaStream::new(transport),
+                Err(e) => {
+                    let is_addr_in_use = matches!(&e, rdma_io::Error::Verbs(io)
+                        if io.raw_os_error() == Some(98));
+                    if is_addr_in_use && attempt < 4 {
+                        tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt + 1)))
+                            .await;
+                        continue;
+                    }
+                    panic!("connect failed: {e}");
+                }
+            }
+        }
+        unreachable!()
+    });
 
-    let client_handle =
-        tokio::spawn(async move { AsyncRdmaStream::connect(&connect_addr).await.unwrap() });
+    let (s, c) = tokio::join!(server_handle, client_handle);
+    (s.unwrap(), c.unwrap())
+}
 
-    let (server_res, client_res) = tokio::join!(server_handle, client_handle);
-    let mut server = server_res.unwrap();
-    let mut client = client_res.unwrap();
+// ===========================================================================
+// echo — client sends a message, server reads and echoes it back.
+// ===========================================================================
 
-    // Client sends, server reads
+async fn echo<B: TransportBuilder>(builder: B) {
+    let (mut server, mut client) = connected_pair(builder).await;
+
     let send_data = b"async stream hello!";
     let n = client.write(send_data).await.unwrap();
     assert_eq!(n, send_data.len());
@@ -39,32 +70,30 @@ async fn async_stream_echo() {
     let n = server.read(&mut buf).await.unwrap();
     assert_eq!(&buf[..n], send_data);
 
-    // Server echoes back
     let n = server.write(&buf[..n]).await.unwrap();
     assert_eq!(n, send_data.len());
 
     let n = client.read(&mut buf).await.unwrap();
     assert_eq!(&buf[..n], send_data);
-
-    println!("async_stream_echo passed!");
 }
 
-/// Test: multi-message — 5 round-trips of ping/pong.
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
-async fn async_stream_multi_message() {
-    let listener = AsyncRdmaListener::bind(&bind_addr()).unwrap();
-    let connect_addr = connect_addr_for(listener.local_addr());
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn echo_default() {
+    echo(TransportConfig::default()).await;
+}
 
-    let server_handle = tokio::spawn(async move { listener.accept().await.unwrap() });
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn echo_ring() {
+    require_no_iwarp!();
+    echo(RingConfig::default()).await;
+}
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+// ===========================================================================
+// multi_message — 5 round-trips of ping/pong.
+// ===========================================================================
 
-    let mut client =
-        tokio::spawn(async move { AsyncRdmaStream::connect(&connect_addr).await.unwrap() })
-            .await
-            .unwrap();
-
-    let mut server = server_handle.await.unwrap();
+async fn multi_message<B: TransportBuilder>(builder: B) {
+    let (mut server, mut client) = connected_pair(builder).await;
 
     for i in 0..5u32 {
         let msg = format!("message-{i}");
@@ -84,85 +113,91 @@ async fn async_stream_multi_message() {
             "round {i} client read mismatch"
         );
     }
-
-    println!("async_stream_multi_message passed!");
 }
 
-/// Test: large transfer — send 32 KiB in one write.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
-async fn async_stream_large_transfer() {
-    let listener = AsyncRdmaListener::bind(&bind_addr()).unwrap();
-    let connect_addr = connect_addr_for(listener.local_addr());
+async fn multi_message_default() {
+    multi_message(TransportConfig::default()).await;
+}
 
-    let server_handle = tokio::spawn(async move { listener.accept().await.unwrap() });
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn multi_message_ring() {
+    require_no_iwarp!();
+    multi_message(RingConfig::default()).await;
+}
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+// ===========================================================================
+// large_transfer — send 32 KiB, verify integrity.
+// Uses write_all + concurrent reader for transport-independence
+// (ring transport caps each send to max_message_size).
+// ===========================================================================
 
-    let mut client =
-        tokio::spawn(async move { AsyncRdmaStream::connect(&connect_addr).await.unwrap() })
-            .await
-            .unwrap();
+async fn large_transfer<B: TransportBuilder>(builder: B) {
+    let (server, client) = connected_pair(builder).await;
 
-    let mut server = server_handle.await.unwrap();
+    let total = 32768usize;
+    let data: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+    let send_data = data.clone();
 
-    // 32 KiB of patterned data
-    let data: Vec<u8> = (0..32768).map(|i| (i % 251) as u8).collect();
-    let n = client.write(&data).await.unwrap();
-    assert_eq!(n, data.len());
+    let writer = tokio::spawn(async move {
+        let mut client = client;
+        client.write_all(&send_data).await.unwrap();
+        client
+    });
 
-    // Server reads — may need multiple reads for partial delivery
-    let mut received = Vec::new();
-    let mut buf = [0u8; 65536];
-    while received.len() < data.len() {
-        let n = server.read(&mut buf).await.unwrap();
-        assert!(n > 0, "unexpected EOF");
-        received.extend_from_slice(&buf[..n]);
-    }
+    let reader = tokio::spawn(async move {
+        let mut server = server;
+        let mut received = Vec::with_capacity(total);
+        let mut buf = [0u8; 65536];
+        while received.len() < total {
+            let n = tokio::time::timeout(std::time::Duration::from_secs(10), server.read(&mut buf))
+                .await
+                .expect("read timed out")
+                .expect("read failed");
+            assert!(n > 0, "unexpected EOF at {} bytes", received.len());
+            received.extend_from_slice(&buf[..n]);
+        }
+        (server, received)
+    });
 
-    assert_eq!(received.len(), data.len());
+    let (writer_res, reader_res) = tokio::join!(writer, reader);
+    let _client = writer_res.unwrap();
+    let (_server, received) = reader_res.unwrap();
+
+    assert_eq!(received.len(), total);
     assert_eq!(received, data);
-
-    println!("async_stream_large_transfer passed!");
 }
 
-// --- Phase D: futures::io AsyncRead/AsyncWrite trait tests ---
-
-/// Helper: create a connected (server, client) pair using async connect/accept.
-async fn connected_pair() -> (AsyncRdmaStream, AsyncRdmaStream) {
-    let listener = AsyncRdmaListener::bind(&bind_addr()).unwrap();
-    let connect_addr = connect_addr_for(listener.local_addr());
-
-    let server_handle = tokio::spawn(async move { listener.accept().await.unwrap() });
-
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let client_handle =
-        tokio::spawn(async move { AsyncRdmaStream::connect(&connect_addr).await.unwrap() });
-
-    let (server_res, client_res) = tokio::join!(server_handle, client_handle);
-    (server_res.unwrap(), client_res.unwrap())
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn large_transfer_default() {
+    large_transfer(TransportConfig::default()).await;
 }
 
-/// Test: futures::io::AsyncReadExt / AsyncWriteExt echo via trait methods.
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
-async fn async_stream_futures_io_echo() {
-    let (mut server, mut client) = connected_pair().await;
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn large_transfer_ring() {
+    require_no_iwarp!();
+    large_transfer(RingConfig::default()).await;
+}
 
-    // Client writes using AsyncWriteExt
+// ===========================================================================
+// futures_io_echo — echo via futures::io::AsyncReadExt / AsyncWriteExt traits.
+// ===========================================================================
+
+async fn futures_io_echo<B: TransportBuilder>(builder: B) {
+    let (mut server, mut client) = connected_pair(builder).await;
+
     let msg = b"futures-io trait echo!";
     let n = futures_util::io::AsyncWriteExt::write(&mut client, msg)
         .await
         .unwrap();
     assert_eq!(n, msg.len());
 
-    // Server reads using AsyncReadExt
     let mut buf = [0u8; 256];
     let n = futures_util::io::AsyncReadExt::read(&mut server, &mut buf)
         .await
         .unwrap();
     assert_eq!(&buf[..n], msg);
 
-    // Server echoes back
     futures_util::io::AsyncWriteExt::write(&mut server, &buf[..n])
         .await
         .unwrap();
@@ -171,20 +206,28 @@ async fn async_stream_futures_io_echo() {
         .await
         .unwrap();
     assert_eq!(&buf[..n], msg);
-
-    println!("async_stream_futures_io_echo passed!");
 }
 
-/// Test: tokio compat layer — use tokio::io::AsyncReadExt/AsyncWriteExt
-/// via FuturesAsyncReadCompatExt.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
-async fn async_stream_tokio_compat() {
+async fn futures_io_echo_default() {
+    futures_io_echo(TransportConfig::default()).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn futures_io_echo_ring() {
+    require_no_iwarp!();
+    futures_io_echo(RingConfig::default()).await;
+}
+
+// ===========================================================================
+// tokio_compat — tokio::io traits via FuturesAsyncReadCompatExt.
+// ===========================================================================
+
+async fn tokio_compat<B: TransportBuilder>(builder: B) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_util::compat::FuturesAsyncReadCompatExt;
 
-    let (server, client) = connected_pair().await;
-
-    // Wrap with compat layer to get tokio::io traits
+    let (server, client) = connected_pair(builder).await;
     let mut server = server.compat();
     let mut client = client.compat();
 
@@ -195,77 +238,89 @@ async fn async_stream_tokio_compat() {
     let n = server.read(&mut buf).await.unwrap();
     assert_eq!(&buf[..n], msg);
 
-    // Echo back
     server.write_all(&buf[..n]).await.unwrap();
 
     let n = client.read(&mut buf).await.unwrap();
     assert_eq!(&buf[..n], msg);
-
-    println!("async_stream_tokio_compat passed!");
 }
 
-/// Test: tokio::io::copy through the compat layer.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
-async fn async_stream_tokio_io_copy() {
+async fn tokio_compat_default() {
+    tokio_compat(TransportConfig::default()).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn tokio_compat_ring() {
+    require_no_iwarp!();
+    tokio_compat(RingConfig::default()).await;
+}
+
+// ===========================================================================
+// tokio_io_copy — tokio::io::copy through the compat layer.
+// ===========================================================================
+
+async fn tokio_io_copy<B: TransportBuilder>(builder: B) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_util::compat::FuturesAsyncReadCompatExt;
 
-    let (server, client) = connected_pair().await;
+    let (server, client) = connected_pair(builder).await;
     let mut server = server.compat();
     let mut client = client.compat();
 
-    // Send data from client
     let data = b"copy test payload 12345";
     client.write_all(data).await.unwrap();
 
-    // Read on server side into a Vec using read_buf
     let mut buf = vec![0u8; 256];
     let n = server.read(&mut buf).await.unwrap();
     assert_eq!(&buf[..n], data);
-
-    println!("async_stream_tokio_io_copy passed!");
 }
 
-/// Test: server shutdown after client drops connection.
-///
-/// Reproduces the CI hang: client disconnects → server QP enters ERROR →
-/// server calls shutdown(). poll_close must detect the dead QP and return
-/// promptly instead of waiting indefinitely for CQ notifications or CM
-/// events that may never arrive.
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
-async fn async_stream_shutdown_after_peer_drop() {
-    let (mut server, client) = connected_pair().await;
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn tokio_io_copy_default() {
+    tokio_io_copy(TransportConfig::default()).await;
+}
 
-    // Drop client — its Drop impl calls disconnect(), sending DREQ.
-    // Server QP transitions to ERROR state.
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn tokio_io_copy_ring() {
+    require_no_iwarp!();
+    tokio_io_copy(RingConfig::default()).await;
+}
+
+// ===========================================================================
+// shutdown_after_peer_drop — server shutdown must not hang after client drops.
+// ===========================================================================
+
+async fn shutdown_after_peer_drop<B: TransportBuilder>(builder: B) {
+    let (mut server, client) = connected_pair(builder).await;
+
     drop(client);
-
-    // Give QP state change time to propagate.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    // Server shutdown must complete, not hang forever.
-    // This exercises poll_close Phase 2 (disconnect on dead QP) and
-    // Phase 3 (await DISCONNECTED event that may already have arrived).
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), server.shutdown()).await;
-
-    // Ok(Ok(..)) or Ok(Err(..)) are both acceptable — the important
-    // thing is that shutdown didn't hang (Err(Elapsed) = hang).
     assert!(result.is_ok(), "server shutdown hung — timed out after 5s");
-    println!("async_stream_shutdown_after_peer_drop passed!");
 }
 
-/// Test: server read detects EOF, then shutdown completes immediately.
-///
-/// When poll_read sees flush completions it sets read_eof, which lets
-/// poll_close take the fast path (Layer 2). This is the well-tested path.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
-async fn async_stream_read_eof_then_shutdown() {
-    let (mut server, client) = connected_pair().await;
+async fn shutdown_after_peer_drop_default() {
+    shutdown_after_peer_drop(TransportConfig::default()).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn shutdown_after_peer_drop_ring() {
+    require_no_iwarp!();
+    shutdown_after_peer_drop(RingConfig::default()).await;
+}
+
+// ===========================================================================
+// read_eof_then_shutdown — server reads EOF after peer drop, then shutdown.
+// ===========================================================================
+
+async fn read_eof_then_shutdown<B: TransportBuilder>(builder: B) {
+    let (mut server, client) = connected_pair(builder).await;
 
     drop(client);
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    // Server reads — should get EOF (Ok(0)) from flush completions.
     let mut buf = [0u8; 64];
     let n = tokio::time::timeout(std::time::Duration::from_secs(5), server.read(&mut buf))
         .await
@@ -273,24 +328,31 @@ async fn async_stream_read_eof_then_shutdown() {
         .expect("read failed");
     assert_eq!(n, 0, "expected EOF after peer disconnect");
 
-    // Now shutdown takes the read_eof fast path — should be instant.
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), server.shutdown()).await;
     assert!(result.is_ok(), "server shutdown hung after read EOF");
-    println!("async_stream_read_eof_then_shutdown passed!");
 }
 
-/// Test: server writes to dead QP (BrokenPipe), then shutdown completes.
-///
-/// poll_write's Layer 3 (is_qp_error) sets read_eof on BrokenPipe.
-/// Subsequent poll_close takes the fast path via Layer 2.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
-async fn async_stream_write_then_shutdown_after_peer_drop() {
-    let (mut server, client) = connected_pair().await;
+async fn read_eof_then_shutdown_default() {
+    read_eof_then_shutdown(TransportConfig::default()).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn read_eof_then_shutdown_ring() {
+    require_no_iwarp!();
+    read_eof_then_shutdown(RingConfig::default()).await;
+}
+
+// ===========================================================================
+// write_then_shutdown_after_peer_drop — write to dead QP fails, then shutdown.
+// ===========================================================================
+
+async fn write_then_shutdown_after_peer_drop<B: TransportBuilder>(builder: B) {
+    let (mut server, client) = connected_pair(builder).await;
 
     drop(client);
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    // Server write should fail — BrokenPipe via Layer 3 (is_qp_error).
     let write_result = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         server.write(b"data after disconnect"),
@@ -299,29 +361,31 @@ async fn async_stream_write_then_shutdown_after_peer_drop() {
     .expect("write hung");
     assert!(write_result.is_err(), "write to dead QP should fail");
 
-    // Now shutdown — read_eof set by Layer 3, poll_close returns immediately.
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), server.shutdown()).await;
     assert!(
         result.is_ok(),
         "server shutdown hung after write BrokenPipe"
     );
-    println!("async_stream_write_then_shutdown_after_peer_drop passed!");
 }
 
-/// Test: explicit shutdown() performs graceful disconnect (DREQ → DISCONNECTED).
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
-async fn async_stream_shutdown() {
-    let listener = AsyncRdmaListener::bind(&bind_addr()).unwrap();
-    let connect_addr = connect_addr_for(listener.local_addr());
+async fn write_then_shutdown_after_peer_drop_default() {
+    write_then_shutdown_after_peer_drop(TransportConfig::default()).await;
+}
 
-    let server_handle = tokio::spawn(async move { listener.accept().await.unwrap() });
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn write_then_shutdown_after_peer_drop_ring() {
+    require_no_iwarp!();
+    write_then_shutdown_after_peer_drop(RingConfig::default()).await;
+}
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+// ===========================================================================
+// graceful_shutdown — round-trip then explicit shutdown (DREQ → DISCONNECTED).
+// ===========================================================================
 
-    let mut client = connect_with_retry(&connect_addr).await.unwrap();
-    let mut server = server_handle.await.unwrap();
+async fn graceful_shutdown<B: TransportBuilder>(builder: B) {
+    let (mut server, mut client) = connected_pair(builder).await;
 
-    // Round-trip: client sends, server echoes, client reads.
     let msg = b"shutdown test";
     client.write(msg).await.unwrap();
     let mut buf = [0u8; 256];
@@ -331,26 +395,27 @@ async fn async_stream_shutdown() {
     let n = client.read(&mut buf).await.unwrap();
     assert_eq!(&buf[..n], msg);
 
-    // Client shutdown: drains send, sends DREQ, awaits DISCONNECTED.
     client.shutdown().await.unwrap();
-
-    println!("async_stream_shutdown passed!");
 }
 
-/// Test: poll_close via futures AsyncWriteExt::close() performs graceful disconnect.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
-async fn async_stream_poll_close() {
-    let listener = AsyncRdmaListener::bind(&bind_addr()).unwrap();
-    let connect_addr = connect_addr_for(listener.local_addr());
+async fn graceful_shutdown_default() {
+    graceful_shutdown(TransportConfig::default()).await;
+}
 
-    let server_handle = tokio::spawn(async move { listener.accept().await.unwrap() });
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn graceful_shutdown_ring() {
+    require_no_iwarp!();
+    graceful_shutdown(RingConfig::default()).await;
+}
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+// ===========================================================================
+// poll_close — graceful disconnect via futures AsyncWriteExt::close().
+// ===========================================================================
 
-    let mut client = connect_with_retry(&connect_addr).await.unwrap();
-    let mut server = server_handle.await.unwrap();
+async fn poll_close<B: TransportBuilder>(builder: B) {
+    let (mut server, mut client) = connected_pair(builder).await;
 
-    // Round-trip: client sends, server echoes, client reads.
     let msg = b"close test";
     client.write(msg).await.unwrap();
     let mut buf = [0u8; 256];
@@ -360,10 +425,18 @@ async fn async_stream_poll_close() {
     let n = client.read(&mut buf).await.unwrap();
     assert_eq!(&buf[..n], msg);
 
-    // Close via futures_io::AsyncWrite::poll_close (through AsyncWriteExt).
     futures_util::io::AsyncWriteExt::close(&mut client)
         .await
         .unwrap();
+}
 
-    println!("async_stream_poll_close passed!");
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn poll_close_default() {
+    poll_close(TransportConfig::default()).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn poll_close_ring() {
+    require_no_iwarp!();
+    poll_close(RingConfig::default()).await;
 }

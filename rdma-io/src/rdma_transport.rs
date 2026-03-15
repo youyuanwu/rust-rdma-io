@@ -18,7 +18,7 @@ use crate::cm::{CmId, ConnParam, EventChannel, PortSpace};
 use crate::mr::{AccessFlags, OwnedMemoryRegion};
 use crate::pd::ProtectionDomain;
 use crate::qp::QpInitAttr;
-use crate::transport::{RecvCompletion, Transport};
+use crate::transport::{RecvCompletion, Transport, TransportBuilder};
 use crate::wc::WorkCompletion;
 use crate::wr::QpType;
 
@@ -479,5 +479,17 @@ fn is_qp_dead(qp: *mut rdma_io_sys::ibverbs::ibv_qp) -> bool {
         );
         // If query fails, assume dead (defensive). If QP not in RTS, dead.
         ret != 0 || (*attr.as_ptr()).qp_state != rdma_io_sys::ibverbs::IBV_QPS_RTS
+    }
+}
+
+impl TransportBuilder for TransportConfig {
+    type Transport = RdmaTransport;
+
+    async fn connect(&self, addr: &SocketAddr) -> crate::Result<RdmaTransport> {
+        RdmaTransport::connect(addr, self.clone()).await
+    }
+
+    async fn accept(&self, listener: &AsyncCmListener) -> crate::Result<RdmaTransport> {
+        RdmaTransport::accept(listener, self.clone()).await
     }
 }

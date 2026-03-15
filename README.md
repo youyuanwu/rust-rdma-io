@@ -29,16 +29,19 @@ Safe Rust bindings for RDMA programming over [libibverbs](https://github.com/lin
 ### Async Stream (tokio)
 
 ```rust
-use rdma_io::async_stream::{AsyncRdmaListener, AsyncRdmaStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use rdma_io::async_cm::AsyncCmListener;
+use rdma_io::async_stream::AsyncRdmaStream;
+use rdma_io::rdma_transport::{RdmaTransport, TransportConfig};
 
 // Server
-let listener = AsyncRdmaListener::bind("0.0.0.0:0").await.unwrap();
-let addr = listener.local_addr().unwrap();
-let (mut server, _) = listener.accept().await.unwrap();
+let listener = AsyncCmListener::bind(&"0.0.0.0:0".parse().unwrap()).unwrap();
+let transport = RdmaTransport::accept(&listener, TransportConfig::default()).await.unwrap();
+let mut server = AsyncRdmaStream::new(transport);
 
 // Client
-let mut client = AsyncRdmaStream::connect(&addr).await.unwrap();
+let addr = "10.0.0.1:9999".parse().unwrap();
+let transport = RdmaTransport::connect(&addr, TransportConfig::default()).await.unwrap();
+let mut client = AsyncRdmaStream::new(transport);
 client.write_all(b"hello async rdma").await.unwrap();
 ```
 

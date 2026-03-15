@@ -15,6 +15,42 @@ use std::net::SocketAddr;
 use std::task::{Context, Poll};
 
 use crate::Result;
+use crate::async_cm::AsyncCmListener;
+
+/// Factory for establishing RDMA connections.
+///
+/// Abstracts the connect/accept pattern so that code can be generic over
+/// transport type. Each implementation holds its own configuration
+/// (e.g. buffer sizes, ring capacity).
+///
+/// # Example
+///
+/// ```ignore
+/// async fn connected_pair<B: TransportBuilder>(builder: B) -> (T, T)
+/// where B::Transport: Transport
+/// {
+///     let listener = AsyncCmListener::bind(&addr)?;
+///     let server = builder.accept(&listener).await?;
+///     let client = builder.connect(&addr).await?;
+///     (server, client)
+/// }
+/// ```
+pub trait TransportBuilder: Clone + Send + 'static {
+    /// The transport type produced by this builder.
+    type Transport: Transport + 'static;
+
+    /// Connect to a remote endpoint (client side).
+    fn connect(
+        &self,
+        addr: &SocketAddr,
+    ) -> impl std::future::Future<Output = Result<Self::Transport>> + Send;
+
+    /// Accept an incoming connection (server side).
+    fn accept(
+        &self,
+        listener: &AsyncCmListener,
+    ) -> impl std::future::Future<Output = Result<Self::Transport>> + Send;
+}
 
 /// A completed receive operation — transport-neutral.
 #[derive(Debug, Default, Clone, Copy)]
