@@ -8,25 +8,29 @@ use std::task::{Context, Poll};
 use http::Uri;
 use hyper_util::rt::TokioIo;
 use rdma_io::async_stream::AsyncRdmaStream;
-use rdma_io::rdma_transport::{RdmaTransport, TransportConfig};
+use rdma_io::transport::TransportBuilder;
 use tower_service::Service;
 
 use crate::stream::TokioRdmaStream;
 
-/// Default buffer size (64 KiB).
-const DEFAULT_BUF_SIZE: usize = 64 * 1024;
-
 /// A [`tower::Service<Uri>`] connector that establishes RDMA connections
 /// for use with [`tonic::transport::Endpoint::connect_with_connector`].
+///
+/// Generic over the transport builder — use [`TransportConfig`] for Send/Recv
+/// or [`RingConfig`] for ring buffer transport.
+///
+/// [`TransportConfig`]: rdma_io::rdma_transport::TransportConfig
+/// [`RingConfig`]: rdma_io::rdma_ring_transport::RingConfig
 ///
 /// # Example
 ///
 /// ```no_run
+/// use rdma_io::rdma_transport::TransportConfig;
 /// use rdma_io_tonic::RdmaConnector;
 /// use tonic::transport::Endpoint;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let connector = RdmaConnector::new();
+/// let connector = RdmaConnector::new(TransportConfig::stream());
 /// let channel = Endpoint::from_static("http://10.0.0.1:50051")
 ///     .connect_with_connector(connector)
 ///     .await?;
@@ -34,32 +38,19 @@ const DEFAULT_BUF_SIZE: usize = 64 * 1024;
 /// # }
 /// ```
 #[derive(Clone, Debug)]
-pub struct RdmaConnector {
-    buf_size: usize,
+pub struct RdmaConnector<B: TransportBuilder> {
+    builder: B,
 }
 
-impl RdmaConnector {
-    /// Create a connector with the default buffer size (64 KiB).
-    pub fn new() -> Self {
-        Self {
-            buf_size: DEFAULT_BUF_SIZE,
-        }
-    }
-
-    /// Create a connector with a custom buffer size.
-    pub fn with_buf_size(buf_size: usize) -> Self {
-        Self { buf_size }
+impl<B: TransportBuilder> RdmaConnector<B> {
+    /// Create a connector with the given transport builder.
+    pub fn new(builder: B) -> Self {
+        Self { builder }
     }
 }
 
-impl Default for RdmaConnector {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Service<Uri> for RdmaConnector {
-    type Response = TokioIo<TokioRdmaStream>;
+impl<B: TransportBuilder> Service<Uri> for RdmaConnector<B> {
+    type Response = TokioIo<TokioRdmaStream<B::Transport>>;
     type Error = rdma_io::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
@@ -68,14 +59,10 @@ impl Service<Uri> for RdmaConnector {
     }
 
     fn call(&mut self, uri: Uri) -> Self::Future {
-        let buf_size = self.buf_size;
+        let builder = self.builder.clone();
         Box::pin(async move {
             let addr = uri_to_socket_addr(&uri)?;
-            let config = TransportConfig {
-                buf_size,
-                ..TransportConfig::stream()
-            };
-            let transport = RdmaTransport::connect(&addr, config).await?;
+            let transport = builder.connect(&addr).await?;
             let stream = AsyncRdmaStream::new(transport);
             let tokio_stream = TokioRdmaStream::new(stream);
             Ok(TokioIo::new(tokio_stream))

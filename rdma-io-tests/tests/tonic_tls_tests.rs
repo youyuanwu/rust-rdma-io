@@ -9,7 +9,9 @@ use std::time::Duration;
 use openssl::ssl::{SslAcceptor, SslConnector, SslMethod, SslVerifyMode};
 use openssl::x509::X509;
 use rdma_io::async_cm::AsyncCmListener;
-use rdma_io_tonic::{RdmaIncoming, RdmaTransport};
+use rdma_io::rdma_transport::TransportConfig;
+use rdma_io_tonic::RdmaIncoming;
+use rdma_io_tonic::tls::RdmaTransport;
 use tokio_stream::StreamExt;
 use tonic::Request;
 use tonic::transport::{Channel, Endpoint, Server};
@@ -75,7 +77,7 @@ async fn start_tls_server_and_connect(
 ) {
     let listener = AsyncCmListener::bind(&bind_addr()).expect("bind RDMA listener");
     let connect_addr = connect_addr_for(listener.local_addr());
-    let incoming = RdmaIncoming::new(listener);
+    let incoming = RdmaIncoming::new(listener, TransportConfig::stream());
 
     // --- Server TLS ---
     let mut acceptor_builder =
@@ -143,7 +145,7 @@ async fn start_tls_server_and_connect(
         .expect("set ALPN");
     let ssl_conn = connector_builder.build();
 
-    let transport = RdmaTransport::new();
+    let transport = RdmaTransport::new(TransportConfig::stream());
     let ip = connect_addr.ip();
     let port = connect_addr.port();
     // Use IP string as domain for SNI — the server cert has the IP as a SAN.

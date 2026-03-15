@@ -6,21 +6,22 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use rdma_io::async_stream::AsyncRdmaStream;
+use rdma_io::transport::Transport;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt};
 use tonic::transport::server::Connected;
 
 /// RDMA stream with `tokio::io` trait implementations.
 ///
-/// Wraps [`AsyncRdmaStream`] via [`tokio_util::compat::Compat`] to bridge
+/// Wraps [`AsyncRdmaStream<T>`] via [`tokio_util::compat::Compat`] to bridge
 /// from `futures_io` traits to `tokio::io` traits. Implements [`Connected`]
 /// for tonic server integration.
-pub struct TokioRdmaStream {
-    inner: Compat<AsyncRdmaStream<rdma_io::rdma_transport::RdmaTransport>>,
+pub struct TokioRdmaStream<T: Transport> {
+    inner: Compat<AsyncRdmaStream<T>>,
     peer_addr: Option<SocketAddr>,
 }
 
-impl std::fmt::Debug for TokioRdmaStream {
+impl<T: Transport> std::fmt::Debug for TokioRdmaStream<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TokioRdmaStream")
             .field("peer_addr", &self.peer_addr)
@@ -28,9 +29,9 @@ impl std::fmt::Debug for TokioRdmaStream {
     }
 }
 
-impl TokioRdmaStream {
+impl<T: Transport> TokioRdmaStream<T> {
     /// Wrap an [`AsyncRdmaStream`] with tokio::io compatibility.
-    pub fn new(stream: AsyncRdmaStream<rdma_io::rdma_transport::RdmaTransport>) -> Self {
+    pub fn new(stream: AsyncRdmaStream<T>) -> Self {
         let peer_addr = stream.peer_addr();
         Self {
             inner: stream.compat(),
@@ -44,7 +45,7 @@ impl TokioRdmaStream {
     }
 }
 
-impl AsyncRead for TokioRdmaStream {
+impl<T: Transport> AsyncRead for TokioRdmaStream<T> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -54,7 +55,7 @@ impl AsyncRead for TokioRdmaStream {
     }
 }
 
-impl AsyncWrite for TokioRdmaStream {
+impl<T: Transport> AsyncWrite for TokioRdmaStream<T> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -82,7 +83,7 @@ pub struct RdmaConnectInfo {
     pub remote_addr: Option<SocketAddr>,
 }
 
-impl Connected for TokioRdmaStream {
+impl<T: Transport> Connected for TokioRdmaStream<T> {
     type ConnectInfo = RdmaConnectInfo;
 
     fn connect_info(&self) -> Self::ConnectInfo {

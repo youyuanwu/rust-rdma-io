@@ -35,7 +35,7 @@ use crate::async_cm::AsyncCmListener;
 ///     (server, client)
 /// }
 /// ```
-pub trait TransportBuilder: Clone + Send + 'static {
+pub trait TransportBuilder: Clone + Send + Sync + Unpin + 'static {
     /// The transport type produced by this builder.
     type Transport: Transport + 'static;
 
