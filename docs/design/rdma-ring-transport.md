@@ -1,161 +1,147 @@
-# RDMA Ring Buffer Transport — Future Design
+# RDMA Ring Buffer Transport
 
-**Status:** Design (not implemented)  
-**Date:** 2026-03-14  
-**Prerequisite:** Transport trait (implemented in `rdma-io/src/transport.rs`)  
+**Status:** Implemented  
+**Updated:** 2026-03-15  
+**Implementation:** `rdma-io/src/rdma_ring_transport.rs`  
 **Reference:** [rdma-transport-layer.md](rdma-transport-layer.md) — Transport architecture  
-**Reference:** [rdma-transport-comparison.md](rdma-transport-comparison.md) — Three-way comparison
+**Reference:** [rdma-transport-comparison.md](rdma-transport-comparison.md) — Three-way comparison  
+**Reference:** [msquic-rdma.md](../background/msquic-rdma.md) — msquic Write+Ring analysis  
+**Reference:** [Rsocket.md](../background/Rsocket.md) — rsocket Write+Ring analysis
 
 ## Overview
 
-`RdmaRingTransport` would implement the `Transport` trait using RDMA Write + Immediate Data
-instead of Send/Recv — the same approach as msquic and rsocket. Since consumers are already
-generic over `T: Transport`, this is a **drop-in replacement**:
+`RdmaRingTransport` implements the `Transport` trait using RDMA Write + Immediate Data
+instead of Send/Recv — the same approach as msquic and rsocket. Since `AsyncRdmaStream<T>` is
+generic over `T: Transport`, it is a **drop-in replacement**:
 
 ```rust
 let transport = RdmaRingTransport::connect(addr, RingConfig::default()).await?;
-let stream = AsyncRdmaStream::new(transport);  // same AsyncRdmaStream<T>
+let stream = AsyncRdmaStream::new(transport);  // same interface, different engine
 ```
 
-## How It Differs from Send/Recv
+**Best for:** QUIC datagrams, bulk transfer on InfiniBand/RoCE.  
+**Not for:** iWARP/siw (no Write+Imm support), byte streams (ring HOL blocking).
+
+## Architecture
 
 | Operation | `RdmaTransport` (Send/Recv) | `RdmaRingTransport` (Write+Ring) |
 |-----------|---------------------------|----------------------------------|
-| `send_copy()` | Copy → MR[round_robin], `ibv_post_send(SEND)` | Check credit → copy → send_ring[tail], `ibv_post_send(WRITE_WITH_IMM)` |
-| `poll_recv()` | Poll RecvCQ → `RecvCompletion` | Poll RecvCQ for doorbells + drain stash, decode immediate → virtual `RecvCompletion` |
-| `recv_buf(idx)` | `recv_mrs[idx]` slice | `recv_ring[offset..offset+len]` via virtual_idx_map |
-| `repost_recv(idx)` | `ibv_post_recv` on buffer | Advance ring Head, repost doorbell, send credit update |
-| `send_copy` backpressure | Hardware RNR (always accepts) | Credit-based (`Ok(0)` when full) |
-| Setup | Create QP, alloc MRs | Create QP, alloc rings, exchange tokens (VA + rkey + capacity) |
+| `send_copy()` | Copy → send buf, `post_send(SEND)` | Check credit → copy → send_ring, `post_send(WRITE_WITH_IMM)` |
+| `poll_recv()` | Poll RecvCQ → `RecvCompletion` | Poll RecvCQ for doorbells, decode imm → virtual `RecvCompletion` |
+| `recv_buf(idx)` | `recv_bufs[idx].as_slice()` | `recv_ring[offset..offset+len]` via `virtual_idx_map` |
+| `repost_recv(idx)` | `ibv_post_recv` on buffer idx | Advance ring head, repost doorbell, send credit update |
+| Backpressure | `Ok(0)` when all send bufs in-flight | `Ok(0)` when remote credits exhausted |
+| Setup | Create QP, alloc N×MR per direction | Create QP, alloc rings, exchange tokens (VA + rkey + capacity) |
 
-## Struct Design
+The **virtual buffer index** mapping is the key abstraction: `poll_recv` decodes each
+doorbell's immediate data → `(offset, length)`, assigns a `virt_idx` from a bounded slab
+(`Vec<Option<(usize, usize)>>`), and returns `RecvCompletion { buf_idx: virt_idx }`.
+Consumers use `virt_idx` identically to discrete buffer indices.
 
-```rust
-pub struct RdmaRingTransport {
-    // CQ poll state and connection flags
-    send_cq_state: CqPollState,
-    recv_cq_state: CqPollState,
-    disconnected: bool,
-    qp_dead: bool,
-    peer_disconnected: bool,
+## Credit Protocol
 
-    // Virtual buffer index mapping: ring offsets → discrete indices
-    virtual_idx_map: HashMap<usize, (usize, usize)>,  // virt_idx → (offset, len)
-    next_virt_idx: usize,
+Credit-based flow control prevents the sender from overwriting unread data in the
+receiver's ring buffer.
 
-    // Stashed completions: doorbells polled from CQ but not yet returned.
-    // CRITICAL: losing doorbell immediate data = losing data location in ring.
-    recv_stash: VecDeque<RecvCompletion>,
+**Absolute encoding.** Each `repost_recv()` sends a `SendWithImm` carrying the **total
+freed credits** as a `u32` immediate value. The sender computes `delta =
+freed_count.wrapping_sub(last_received)` to update `remote_credits`. If a credit WR
+is lost (QP error), the next successful one recovers all lost credits — no permanent stall.
 
-    qp: AsyncQp,
+**Send+Imm (not Write+Imm).** Credits use `WrOpcode::SendWithImm`, not RDMA Write. The
+receiver distinguishes the two by completion opcode:
+- `WcOpcode::RecvRdmaWithImm` → data or padding (RDMA Write landed)
+- `WcOpcode::Recv` with `IBV_WC_WITH_IMM` flag → credit update (Send landed)
 
-    // Ring buffers
-    send_ring: RingBuffer,       // Local staging → RDMA Write source
-    recv_ring: RingBuffer,       // Landing zone for remote writes
-    remote_ring: RemoteRingInfo, // Peer's recv ring VA + rkey + capacity
+**Inline credit drain in `send_copy`.** When `remote_credits == 0`, `send_copy` calls
+`drain_recv_credits()` — a non-blocking poll of the recv CQ that processes any pending
+credit completions (and stashes data completions for the next `poll_recv`). This allows
+the transport to recover credits without requiring the caller to explicitly poll the recv
+side, making it compatible with `AsyncRdmaStream` without stream-layer changes.
 
-    // Doorbell recv buffers (small — just for immediate data notification)
-    doorbell_bufs: Vec<OwnedMemoryRegion>,
+**Credit exhaustion sequence:**
+1. `send_copy(data)` checks `remote_credits == 0`
+2. Calls `drain_recv_credits()` — arms recv CQ, polls once, processes any completions
+3. If credits recovered → proceeds with the send normally
+4. If still 0 → returns `Ok(0)` (caller should `poll_send_completion` and retry)
+5. `AsyncRdmaStream::poll_write` handles `Ok(0)` by waiting on `poll_send_completion`,
+   then retrying `send_copy` — which calls `drain_recv_credits` again
+6. This retry loop converges once the peer's `repost_recv` credit updates arrive
 
-    // Credit tracking: sender's estimate of remote ring free space.
-    // Without this, sender can overwrite unconsumed data (silent corruption).
-    remote_credits: usize,
+**WR identification.** WR IDs use bit 63 as a flag: `0` = data/padding WR, `1` = credit
+WR. The padding sentinel is `u64::MAX - 20`. Data WR IDs encode the total bytes to release
+(padding + data length) in the lower bits for direct `send_ring.release()` on completion.
 
-    // Completion tracking for out-of-order release
-    send_completions: CompletionTracker,
-    recv_completions: CompletionTracker,
+## Immediate Data Encoding
 
-    // CM resources — drop order: AsyncFd → CmId → EventChannel
-    cm_async_fd: AsyncFd<RawFd>,
-    cm_id: CmId,
-    event_channel: EventChannel,
-}
+Small-ring mode (≤64 KB): `imm = (offset << 16) | length` — 16 bits each.
 
-struct RingBuffer {
-    mr: OwnedMemoryRegion,
-    capacity: usize,
-    head: usize,  // Consumer position
-    tail: usize,  // Producer position
-}
+- **Data:** `offset` is the byte position in the remote ring; `length` is the payload size.
+- **Padding:** `length = 0` signals a wrap-around padding marker. The receiver advances
+  `recv_ring.head` by `capacity - offset` to skip the gap.
 
-struct RemoteRingInfo {
-    addr: u64,       // Remote virtual address
-    rkey: u32,       // Remote memory key
-    capacity: usize,
-    head: usize,     // Tracked via credits
-    tail: usize,
-}
-```
+Max message length is 65535 bytes (16-bit). `send_copy` clamps via `.min(0xFFFF)`.
 
-## The buf_idx Mapping Trick
+## Connection Setup
 
-The `Transport` trait uses `buf_idx` for `recv_buf()` and `repost_recv()`. The ring has no
-discrete buffers — it has a contiguous byte range. Solution: **virtual buffer indices**.
+Token exchange uses Send/Recv to share ring metadata. The 20-byte `RingToken`
+(`version`, `ring_va`, `mw_rkey`, `capacity`) is sent inline.
 
-`poll_recv` decodes each doorbell's immediate data → `(ring_offset, length)`, assigns a
-monotonically increasing `virt_idx`, stores the mapping in `virtual_idx_map`, and returns
-`RecvCompletion { buf_idx: virt_idx, byte_len: length }`. Consumers use `virt_idx`
-identically to discrete buffer indices.
+**WR ordering is critical:** the token Recv WR is posted BEFORE `connect()`/`accept()`
+(before doorbell WRs) so the 20-byte token Send from the peer is consumed by the token
+Recv, not by a 4-byte doorbell buffer. Doorbell Recv WRs are posted AFTER token exchange.
 
-## Send Path
+**Async wait:** `complete_token_exchange` uses `AsyncCq::poll().await` on the recv CQ
+for the token arrival, with a configurable timeout (default 5s via `RingConfig::token_timeout`).
 
 ```
-send_copy(data):
-  1. Check remote_credits > 0 → if 0, return Ok(0)
-  2. Alloc local send_ring slot at tail
-  3. Copy data → send_ring[tail]
-  4. Alloc remote ring slot, decrement remote_credits
-  5. Encode immediate: (remote_offset << 16) | length
-  6. ibv_post_send(WRITE_WITH_IMM, local → remote, imm)
-  7. Return Ok(len)
+  Client                              Server
+    │ Resolve addr                       │ get_request()
+    │ Alloc rings, register MRs          │ Alloc rings, register MRs
+    │ Post token Recv WR                 │ Post token Recv WR
+    │ rdma_connect()                     │ complete_accept()
+    │                                    │
+    │ Send(RingToken) ──────────────────►│ Parse → store remote info
+    │◄────────────────────────────────── │ Send(RingToken)
+    │ Parse → store remote info          │
+    │                                    │
+    │ Post doorbell Recv WRs             │ Post doorbell Recv WRs
+    │ Ready ◄────────────────────────────► Ready
 ```
 
-## Recv Path
+## Drop Safety
 
-```
-poll_recv:
-  1. Drain recv_stash first (overflow from previous poll)
-  2. Poll RecvCQ for Write-With-Immediate doorbells
-  3. Decode immediate → offset + length
-  4. Data already in recv_ring[offset] — zero-copy on receiver!
-  5. Allocate virtual buf_idx, store in virtual_idx_map
-  6. If output buffer full, STASH remainder (can't lose doorbells!)
-  7. Return completions
+Resource cleanup relies on Rust's field declaration order. The `Drop` impl drains both
+CQs before fields are dropped, ensuring all in-flight WRs release MR references:
 
-repost_recv(idx):
-  1. Remove virtual_idx_map entry → (offset, length)
-  2. Advance recv_ring head (with out-of-order tracking)
-  3. Repost doorbell recv buffer
-  4. Send credit update to peer
-```
+1. **`Drop` impl** — disconnect (if not already), drain send + recv CQs to completion
+2. `_recv_mw` (MW) — dropped before QP (invalidation would need a live QP; currently `None`)
+3. `qp` (QP + CQs) — kernel flushes outstanding WRs
+4. `send_ring`, `recv_ring` (MRs) — safe, all WR references cleared
+5. `_pd`, `cm_async_fd`, `cm_id`, `event_channel` — CM resources drop last
 
-## Token Exchange (Connection Setup)
+## Design Decisions
 
-```
-  Client                                Server
-    │ Connect(QP)                         │ Accept(QP)
-    │ Bind MW to recv_ring                │ Bind MW to recv_ring
-    │ Post doorbell recv                  │ Post doorbell recv
-    │                                     │
-    │ Send(my_ring_VA + rkey + capacity)  │
-    │ ─────────────────────────────────►  │
-    │                                     │ Parse → store as remote_ring
-    │  ◄─────────────────────────────────  │
-    │ Parse → store as remote_ring        │ Send(my_ring_VA + rkey + capacity)
-    │                                     │
-    │ Ready ◄─────────────────────────────► Ready
-```
+### Adopted
 
-## Behavioral Differences for Consumers
+| Feature | Source | Implementation |
+|---------|--------|----------------|
+| **Dual CQ** | msquic | Reused `AsyncQp` with separate send/recv CQs |
+| **Small-ring immediate encoding** | msquic | `(offset<<16)\|length`, 64KB ring, no RDMA Read fallback |
+| **Token exchange** | msquic | 20-byte `RingToken` via inline Send/Recv after connect |
+| **Absolute credit encoding** | rsocket (adapted) | Total freed count in `SendWithImm` imm value — self-healing |
+| **iWARP detection + reject** | rsocket | `first_device_is_iwarp()` check in `connect()`/`accept()` |
+| **CompletionTracker (head-chasing)** | msquic | Struct exists; unused on RC QPs (see Implementation Notes) |
 
-| Behavior | Send/Recv | Ring |
-|----------|-----------|------|
-| `send_copy` backpressure | Always accepts (hardware RNR) | May return `Ok(0)` when ring full |
-| `recv_pending` (partial read) | Blocks 1 of N independent buffers | Pins ring Head → **app-level HOL blocking** |
-| Credit management | None needed (hardware) | Must send credit updates on `repost_recv` |
+### Rejected
 
-**Datagram** (copy-and-repost immediately): unaffected by ring HOL.  
-**Stream** (partial reads hold buffer): degrades — prefer Send/Recv for streams.
+| Feature | Source | Reason |
+|---------|--------|--------|
+| **Single shared CQ** | rsocket | Mixed send/recv confusion; dual CQ validated by msquic |
+| **MR-only protection** | rsocket | Exposes entire region; MW planned for future scoping |
+| **13-state connection machine** | msquic | 3 implicit states suffice: setup → token exchange → ready |
+| **IOCP/callback model** | msquic | Tokio `AsyncFd` + `poll_*` is fundamentally different |
+| **Write+Imm for credits** | (original plan) | `SendWithImm` allows opcode-based disambiguation on recv CQ |
 
 ## Trade-offs
 
@@ -164,20 +150,81 @@ repost_recv(idx):
                      (Send/Recv)                (Write+Ring)
                 ┌────────────────────┐    ┌────────────────────────┐
   Simplicity    │ ████████████████   │    │ ███                    │
-  Portability   │ ████████████████   │    │ ██████████             │
+  Portability   │ ████████████████   │    │ ████████               │
   Recv copies   │ ████ (2 copies)    │    │ ████████████████ (1)   │
   Throughput    │ ████████████       │    │ ████████████████       │
   Latency       │ ██████████████     │    │ ████████████████       │
   Code size     │ ████████████████   │    │ ██████                 │
   Safety        │ ████████████████   │    │ ████████ (MW needed)   │
   Stream HOL    │ ████████████████   │    │ ████ (ring Head blocks)│
+  iWARP         │ ████████████████   │    │ ██ (see below)         │
                 └────────────────────┘    └────────────────────────┘
 
-  Use RdmaTransport:     QUIC, RPC, byte streams, many peers
-  Use RdmaRingTransport: Datagram bulk transfer, max throughput, few peers
+  Use RdmaTransport:     byte streams (gRPC), iWARP/siw, many peers
+  Use RdmaRingTransport: QUIC datagrams, bulk transfer, InfiniBand/RoCE, few peers
 ```
 
-## Open Issues (deferred)
+## Known Limitations
 
-- **Credit protocol:** Piggyback on next data send vs dedicated 0-byte message. Batching strategy.
-- **64KB limit:** Immediate data `(offset<<16|length)` limits ring to 64KB. Need large-ring mode (length-only encoding + RDMA Read for offset) for stream workloads.
+- **MW not supported on rxe.** `IBV_WR_BIND_MW` Type 2 send WRs fail on rxe. The
+  implementation uses MR rkey directly. `_recv_mw` is `Option<MemoryWindow>` (always `None`)
+  as a placeholder for future MW support when targeting real hardware.
+
+- **Stream HOL blocking.** `AsyncRdmaStream` partial reads pin the ring head, blocking
+  all subsequent messages. Prefer `RdmaTransport` (Send/Recv) for byte streams.
+
+- **No credit keepalive.** If the receiver stops consuming, the sender stalls at
+  `remote_credits == 0` indefinitely. Relies on application-level timeouts (e.g. Quinn's
+  idle timeout).
+
+- **No credit batching.** Each `repost_recv` sends a credit update WR (~100% WR overhead
+  for small messages). Batching (send every N reposts) is future optimization.
+
+- **Max message 65535 bytes.** 16-bit length field in immediate data. Stream config's
+  64 KiB (65536) overflows by 1 byte. Large-ring mode is deferred.
+
+- **No iWARP support.** `connect()`/`accept()` return `Err` on iWARP devices. Callers
+  should fall back to `RdmaTransport`.
+
+- **`repost_recv` ordering.** Out-of-order repost delays ring head advancement (unlike
+  `RdmaTransport` where buffers are independent). Consumers holding recv buffers longer
+  have different costs per transport.
+
+## Implementation Notes
+
+- **`send_tracker` unused.** RC QPs guarantee in-order completions. `poll_send_completion`
+  uses direct head advance: the data WR's `wr_id` encodes total bytes to release, and
+  `send_ring.release(data_len)` advances the head. `CompletionTracker` is kept (with
+  `#[allow(dead_code)]`) for potential future use with UD QPs.
+
+- **`unsafe impl Send for SendWr`** (in `wr.rs`). `SendWr` contains `*mut ibv_mw` and
+  `*mut ibv_mr` pointers (for MW bind fields). These are kernel-managed handles that
+  don't alias mutable state, making `Send` safe.
+
+- **Fail-fast for protocol violations.** Any invalid immediate data (offset/length out of
+  bounds) sets `qp_dead = true` immediately. RC guarantees reliable delivery, so corruption
+  means a bug, not a transient issue.
+
+- **`remote_freed_received` wrapping.** Credit deltas use `wrapping_sub` on `u32` to
+  handle counter overflow gracefully. Deltas > `max_outstanding` are ignored as stale.
+
+## Files
+
+| File | Description |
+|------|-------------|
+| `rdma-io/src/rdma_ring_transport.rs` | Full implementation (~1200 lines) |
+| `rdma-io/src/transport.rs` | `Transport` trait definition |
+| `rdma-io/src/mw.rs` | `MemoryWindow` RAII wrapper |
+| `rdma-io/src/wr.rs` | `SendWr`, `RecvWr`, `WrOpcode` (includes `SendWithImm`) |
+| `rdma-io/src/wc.rs` | `WorkCompletion`, `WcOpcode` (recv opcode discrimination) |
+| `rdma-io/src/device.rs` | `first_device_is_iwarp()` detection |
+| `rdma-io-tests/` | Integration tests (gated by `require_rxe!()`) |
+
+## Future Work
+
+- **MW scoping**: Enable `IBV_WR_BIND_MW` on real IB/RoCE hardware to scope recv ring
+  access per-connection instead of using MR-level rkey.
+- **Credit keepalive**: Periodic 0-byte probe to detect hung peers.
+- **Credit batching**: Send credit updates every N reposts to reduce WR overhead.
+- **Large ring mode**: Length-only immediate encoding + RDMA Read for >64KB rings.
+- **Generic `RdmaUdpSocket<T: Transport>`**: Make Quinn integration generic over transport.

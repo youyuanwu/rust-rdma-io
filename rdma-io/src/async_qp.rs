@@ -66,15 +66,17 @@ impl AsyncQp {
         &self.recv_cq
     }
 
-    // --- Post helpers (private) ---
+    // --- Post helpers (pub(crate) for use by ring transport) ---
 
-    fn post_send_raw(&self, wr: &mut SendWr) -> Result<()> {
+    /// Post an arbitrary send WR to the QP.
+    pub(crate) fn post_send_wr(&self, wr: &mut SendWr) -> Result<()> {
         let mut raw = wr.build_raw();
         let mut bad_wr: *mut ibv_send_wr = std::ptr::null_mut();
         from_ret(unsafe { rdma_wrap_ibv_post_send(self.qp.as_raw(), &mut raw, &mut bad_wr) })
     }
 
-    fn post_recv_raw(&self, wr: &mut RecvWr) -> Result<()> {
+    /// Post an arbitrary recv WR to the QP.
+    pub(crate) fn post_recv_wr(&self, wr: &mut RecvWr) -> Result<()> {
         let mut raw = wr.build_raw();
         let mut bad_wr: *mut ibv_recv_wr = std::ptr::null_mut();
         from_ret(unsafe { rdma_wrap_ibv_post_recv(self.qp.as_raw(), &mut raw, &mut bad_wr) })
@@ -100,7 +102,7 @@ impl AsyncQp {
         let mut wr = SendWr::new(wr_id, WrOpcode::Send)
             .flags(SendFlags::SIGNALED)
             .sg(sge);
-        self.post_send_raw(&mut wr)
+        self.post_send_wr(&mut wr)
     }
 
     /// Post a RECV buffer without waiting for completion.
@@ -114,7 +116,7 @@ impl AsyncQp {
             mr.lkey(),
         );
         let mut wr = RecvWr::new(wr_id).sg(sge);
-        self.post_recv_raw(&mut wr)
+        self.post_recv_wr(&mut wr)
     }
 
     // --- Poll-based CQ accessors (for AsyncRead/AsyncWrite impls) ---
@@ -162,7 +164,7 @@ impl AsyncQp {
         let mut wr = SendWr::new(wr_id, WrOpcode::Send)
             .flags(SendFlags::SIGNALED)
             .sg(sge);
-        self.post_send_raw(&mut wr)?;
+        self.post_send_wr(&mut wr)?;
         self.send_cq.poll_wr_id(wr_id).await
     }
 
@@ -183,7 +185,7 @@ impl AsyncQp {
             mr.lkey(),
         );
         let mut wr = RecvWr::new(wr_id).sg(sge);
-        self.post_recv_raw(&mut wr)?;
+        self.post_recv_wr(&mut wr)?;
         self.recv_cq.poll_wr_id(wr_id).await
     }
 
@@ -204,7 +206,7 @@ impl AsyncQp {
         let mut wr = SendWr::new(wr_id, WrOpcode::SendWithImm(imm_data))
             .flags(SendFlags::SIGNALED)
             .sg(sge);
-        self.post_send_raw(&mut wr)?;
+        self.post_send_wr(&mut wr)?;
         self.send_cq.poll_wr_id(wr_id).await
     }
 
@@ -227,7 +229,7 @@ impl AsyncQp {
             .flags(SendFlags::SIGNALED)
             .sg(sge)
             .rdma(remote.addr + remote_offset, remote.rkey);
-        self.post_send_raw(&mut wr)?;
+        self.post_send_wr(&mut wr)?;
         self.send_cq.poll_wr_id(wr_id).await
     }
 
@@ -248,7 +250,7 @@ impl AsyncQp {
             .flags(SendFlags::SIGNALED)
             .sg(sge)
             .rdma(remote.addr + remote_offset, remote.rkey);
-        self.post_send_raw(&mut wr)?;
+        self.post_send_wr(&mut wr)?;
         self.send_cq.poll_wr_id(wr_id).await
     }
 
@@ -272,7 +274,7 @@ impl AsyncQp {
             .flags(SendFlags::SIGNALED)
             .sg(sge)
             .rdma(remote.addr + remote_offset, remote.rkey);
-        self.post_send_raw(&mut wr)?;
+        self.post_send_wr(&mut wr)?;
         self.send_cq.poll_wr_id(wr_id).await
     }
 
@@ -299,7 +301,7 @@ impl AsyncQp {
             .flags(SendFlags::SIGNALED)
             .sg(sge)
             .atomic(remote.addr + remote_offset, remote.rkey, compare, swap);
-        self.post_send_raw(&mut wr)?;
+        self.post_send_wr(&mut wr)?;
         self.send_cq.poll_wr_id(wr_id).await
     }
 
@@ -322,7 +324,7 @@ impl AsyncQp {
             .flags(SendFlags::SIGNALED)
             .sg(sge)
             .atomic(remote.addr + remote_offset, remote.rkey, add_value, 0);
-        self.post_send_raw(&mut wr)?;
+        self.post_send_wr(&mut wr)?;
         self.send_cq.poll_wr_id(wr_id).await
     }
 }

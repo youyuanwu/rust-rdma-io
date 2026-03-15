@@ -5,6 +5,25 @@
 pub mod test_helpers {
     use std::net::SocketAddr;
 
+    /// Returns `true` if **any** device is iWARP (e.g. siw present alongside rxe).
+    pub fn any_iwarp() -> bool {
+        rdma_io::device::any_device_is_iwarp()
+    }
+
+    /// Skip test if ANY device is iWARP. Used for tests that need
+    /// InfiniBand/RoCE features unsupported on iWARP (atomics, RDMA Write
+    /// with Immediate Data, etc.). Tests binding to 0.0.0.0 may have the
+    /// CM pick an iWARP device even if rxe is also present.
+    #[macro_export]
+    macro_rules! require_no_iwarp {
+        () => {
+            if rdma_io_tests::test_helpers::any_iwarp() {
+                tracing::warn!("SKIPPED: test requires no iWARP devices (siw detected)");
+                return;
+            }
+        };
+    }
+
     /// Discover the first non-loopback IPv4 address (for siw0 over eth0).
     ///
     /// Uses the UDP connect trick: binding to 0.0.0.0 then "connecting" to an

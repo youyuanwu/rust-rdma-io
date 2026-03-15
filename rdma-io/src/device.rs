@@ -77,6 +77,19 @@ impl Device {
         unsafe { ibv_get_device_guid(self.as_ptr()) }
     }
 
+    /// The transport type of this device.
+    ///
+    /// Returns `IBV_TRANSPORT_IB` for InfiniBand/RoCE (rxe, mlx5, etc.)
+    /// or `IBV_TRANSPORT_IWARP` for iWARP (siw, cxgb4, etc.).
+    pub fn transport_type(&self) -> ibv_transport_type {
+        unsafe { (*self.as_ptr()).transport_type }
+    }
+
+    /// Returns `true` if this device uses the iWARP transport (e.g. siw).
+    pub fn is_iwarp(&self) -> bool {
+        self.transport_type() == IBV_TRANSPORT_IWARP
+    }
+
     /// Open this device and return a [`Context`].
     pub fn open(&self) -> Result<Context> {
         let ctx = from_ptr(unsafe { ibv_open_device(self.as_ptr()) })?;
@@ -166,6 +179,21 @@ pub fn open_first_device() -> Result<Context> {
         return Err(Error::NoDevices);
     }
     devs[0].open()
+}
+
+/// Returns `true` if the first available RDMA device is iWARP (e.g. siw).
+///
+/// Useful for tests that need to skip features unsupported on iWARP
+/// (atomics, RDMA Write with Immediate Data, etc.).
+/// Returns `true` if **any** RDMA device is iWARP (e.g. siw).
+///
+/// Useful when binding to `0.0.0.0` where the CM may pick any device —
+/// a single iWARP device in the list means the connection could land on it.
+pub fn any_device_is_iwarp() -> bool {
+    devices()
+        .ok()
+        .map(|d| d.iter().any(|dev| dev.is_iwarp()))
+        .unwrap_or(false)
 }
 
 /// Open an RDMA device by name.

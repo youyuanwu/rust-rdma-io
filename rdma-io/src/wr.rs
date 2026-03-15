@@ -170,6 +170,10 @@ pub enum WrOpcode {
     RdmaRead,
     AtomicCmpAndSwp,
     AtomicFetchAndAdd,
+    /// Bind a Memory Window to an MR sub-region (Type 2).
+    BindMw,
+    /// Invalidate a Memory Window's rkey (makes it unusable for remote access).
+    LocalInv,
 }
 
 impl WrOpcode {
@@ -182,6 +186,8 @@ impl WrOpcode {
             Self::RdmaRead => IBV_WR_RDMA_READ,
             Self::AtomicCmpAndSwp => IBV_WR_ATOMIC_CMP_AND_SWP,
             Self::AtomicFetchAndAdd => IBV_WR_ATOMIC_FETCH_AND_ADD,
+            Self::BindMw => IBV_WR_BIND_MW,
+            Self::LocalInv => IBV_WR_LOCAL_INV,
         }
     }
 }
@@ -196,7 +202,18 @@ pub struct SendWr {
     pub(crate) rdma_rkey: u32,
     pub(crate) atomic_compare_add: u64,
     pub(crate) atomic_swap: u64,
+    // MW bind fields (for BindMw opcode)
+    pub(crate) bind_mw_mw: *mut ibv_mw,
+    pub(crate) bind_mw_rkey: u32,
+    pub(crate) bind_mw_bind_info: ibv_mw_bind_info,
+    // Local invalidation (for LocalInv opcode)
+    pub(crate) invalidate_rkey: u32,
 }
+
+// Safety: The raw pointers (*mut ibv_mw, *mut ibv_mr in bind_info) are RDMA
+// kernel-managed handles, safe to send between threads — same justification
+// as OwnedMemoryRegion which also holds *mut ibv_mr.
+unsafe impl Send for SendWr {}
 
 impl SendWr {
     /// Create a new send WR.
@@ -210,6 +227,10 @@ impl SendWr {
             rdma_rkey: 0,
             atomic_compare_add: 0,
             atomic_swap: 0,
+            bind_mw_mw: std::ptr::null_mut(),
+            bind_mw_rkey: 0,
+            bind_mw_bind_info: ibv_mw_bind_info::default(),
+            invalidate_rkey: 0,
         }
     }
 
@@ -241,6 +262,41 @@ impl SendWr {
         self
     }
 
+    /// Set Memory Window bind parameters (for BindMw opcode).
+    ///
+    /// # Arguments
+    /// * `mw` - Raw MW pointer to bind
+    /// * `rkey` - New rkey to assign to the MW after binding
+    /// * `mr` - Raw MR pointer that the MW will be bound to
+    /// * `addr` - Start address within the MR
+    /// * `length` - Length of the bound region
+    /// * `access` - Access flags for the MW binding
+    pub fn bind_mw(
+        mut self,
+        mw: *mut ibv_mw,
+        rkey: u32,
+        mr: *mut ibv_mr,
+        addr: u64,
+        length: u64,
+        access: u32,
+    ) -> Self {
+        self.bind_mw_mw = mw;
+        self.bind_mw_rkey = rkey;
+        self.bind_mw_bind_info = ibv_mw_bind_info {
+            mr,
+            addr,
+            length,
+            mw_access_flags: access,
+        };
+        self
+    }
+
+    /// Set the rkey to invalidate (for LocalInv opcode).
+    pub fn inv_rkey(mut self, rkey: u32) -> Self {
+        self.invalidate_rkey = rkey;
+        self
+    }
+
     /// Build the raw `ibv_send_wr`. The caller must ensure `sges` outlives usage.
     pub(crate) fn build_raw(&mut self) -> ibv_send_wr {
         let sg_list = if self.sges.is_empty() {
@@ -263,6 +319,9 @@ impl SendWr {
             WrOpcode::SendWithImm(imm) | WrOpcode::RdmaWriteWithImm(imm) => {
                 wr.ibv_send_wr__anon_0.imm_data = imm;
             }
+            WrOpcode::LocalInv => {
+                wr.ibv_send_wr__anon_0.invalidate_rkey = self.invalidate_rkey;
+            }
             _ => {}
         }
 
@@ -280,6 +339,13 @@ impl SendWr {
                     compare_add: self.atomic_compare_add,
                     swap: self.atomic_swap,
                     rkey: self.rdma_rkey,
+                };
+            }
+            WrOpcode::BindMw => {
+                wr.ibv_send_wr__anon_1.bind_mw = ibv_send_wr__anon_1_bind_mw {
+                    mw: self.bind_mw_mw,
+                    rkey: self.bind_mw_rkey,
+                    bind_info: self.bind_mw_bind_info,
                 };
             }
             _ => {}

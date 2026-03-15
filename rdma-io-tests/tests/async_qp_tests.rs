@@ -19,6 +19,7 @@ use rdma_io::mr::{AccessFlags, RemoteMr};
 use rdma_io::pd::ProtectionDomain;
 use rdma_io::qp::QpInitAttr;
 use rdma_io::wr::QpType;
+use rdma_io_tests::require_no_iwarp;
 
 use rdma_io_tests::test_helpers::{bind_addr, connect_addr_for};
 
@@ -323,18 +324,6 @@ const REMOTE_ATOMIC_ACCESS: AccessFlags = AccessFlags::LOCAL_WRITE
     .union(AccessFlags::REMOTE_WRITE)
     .union(AccessFlags::REMOTE_ATOMIC);
 
-/// Check if the device supports atomic operations.
-fn device_supports_atomics(pd: &ProtectionDomain) -> bool {
-    let attr = unsafe {
-        let ctx = (*pd.as_raw()).context;
-        let mut attr: rdma_io_sys::ibverbs::ibv_device_attr = std::mem::zeroed();
-        rdma_io_sys::ibverbs::ibv_query_device(ctx, &mut attr);
-        attr
-    };
-    // IBV_ATOMIC_HCA = 1, IBV_ATOMIC_GLOB = 2; 0 = NONE
-    attr.atomic_cap != 0
-}
-
 /// Test: Compare-and-Swap atomic operation.
 ///
 /// Client performs CAS on server's MR. The remote 8-byte value starts at 0.
@@ -345,12 +334,7 @@ fn device_supports_atomics(pd: &ProtectionDomain) -> bool {
 async fn async_qp_atomic_compare_and_swap() {
     let (server, client) = setup_connection().await;
 
-    if !device_supports_atomics(&server.pd) {
-        tracing::warn!(
-            "SKIPPED: device does not support atomics (siw). Test requires rxe or hardware."
-        );
-        return;
-    }
+    require_no_iwarp!();
 
     // Server MR with remote atomic access — 8 bytes for one u64, initialized to 0
     let server_data_mr = server
@@ -429,12 +413,7 @@ async fn async_qp_atomic_compare_and_swap() {
 async fn async_qp_atomic_fetch_and_add() {
     let (server, client) = setup_connection().await;
 
-    if !device_supports_atomics(&server.pd) {
-        tracing::warn!(
-            "SKIPPED: device does not support atomics (siw). Test requires rxe or hardware."
-        );
-        return;
-    }
+    require_no_iwarp!();
 
     // Server MR initialized to 10 (little-endian u64)
     let mut init_data = vec![0u8; 8];
