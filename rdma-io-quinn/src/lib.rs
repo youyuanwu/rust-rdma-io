@@ -17,37 +17,38 @@ use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, UdpPoller};
 
 use rdma_io::async_cm::AsyncCmListener;
-use rdma_io::rdma_transport::{RdmaTransport, TransportConfig};
-use rdma_io::transport::{RecvCompletion, Transport};
+use rdma_io::transport::{RecvCompletion, Transport, TransportBuilder};
 
-// Re-export for ergonomics — users don't need to depend on rdma-io directly.
-pub use rdma_io::rdma_transport::TransportConfig as RdmaTransportConfig;
+type ConnectionMap<T> = Arc<RwLock<HashMap<SocketAddr, Arc<Mutex<T>>>>>;
 
-type ConnectionMap = Arc<RwLock<HashMap<SocketAddr, Arc<Mutex<RdmaTransport>>>>>;
-
-type AcceptFuture =
-    Pin<Box<dyn Future<Output = rdma_io::Result<(SocketAddr, RdmaTransport)>> + Send>>;
+type AcceptFuture<T> = Pin<Box<dyn Future<Output = rdma_io::Result<(SocketAddr, T)>> + Send>>;
 
 /// RDMA-backed UDP socket for Quinn endpoints.
 ///
 /// Implements [`AsyncUdpSocket`] by multiplexing across per-peer transports.
 /// Server-side accept is driven within [`poll_recv`](AsyncUdpSocket::poll_recv).
 ///
+/// Generic over the transport builder — use [`TransportConfig`] for Send/Recv
+/// or [`RingConfig`] for ring buffer transport.
+///
+/// [`TransportConfig`]: rdma_io::rdma_transport::TransportConfig
+/// [`RingConfig`]: rdma_io::rdma_ring_transport::RingConfig
+///
 /// Quinn 0.11 API: `poll_recv(&self)` + `try_send(&self)` + `create_io_poller(self: Arc<Self>)`.
 /// All methods take `&self`, so internal state uses `Mutex` for interior mutability.
-pub struct RdmaUdpSocket {
+pub struct RdmaUdpSocket<B: TransportBuilder> {
     listener: Arc<AsyncCmListener>,
-    connections: ConnectionMap,
+    connections: ConnectionMap<B::Transport>,
     local_addr: SocketAddr,
-    config: TransportConfig,
-    accept_state: Mutex<Option<AcceptFuture>>,
+    builder: B,
+    accept_state: Mutex<Option<AcceptFuture<B::Transport>>>,
     /// Waker from the last `poll_recv` that returned `Pending`.
     /// `connect_to` wakes this so Quinn's driver discovers the new connection.
     recv_waker: Mutex<Option<Waker>>,
     /// Transport whose send buffers were full on the last `try_send`.
     /// `poll_writable` waits for a send CQ completion on this transport
     /// instead of busy-spinning.
-    send_blocked: Mutex<Option<Arc<Mutex<RdmaTransport>>>>,
+    send_blocked: Mutex<Option<Arc<Mutex<B::Transport>>>>,
     /// Consecutive accept errors. Reset on success; propagated after threshold.
     accept_errors: AtomicU32,
 }
@@ -57,11 +58,11 @@ pub struct RdmaUdpSocket {
 /// Quinn calls `poll_writable` after `try_send` returns `WouldBlock`.
 /// When a transport's send buffers are full, this waits for a send CQ
 /// completion before returning `Ready`, avoiding a busy-spin.
-pub struct RdmaUdpPoller {
-    socket: Arc<RdmaUdpSocket>,
+pub struct RdmaUdpPoller<B: TransportBuilder> {
+    socket: Arc<RdmaUdpSocket<B>>,
 }
 
-impl fmt::Debug for RdmaUdpSocket {
+impl<B: TransportBuilder> fmt::Debug for RdmaUdpSocket<B> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RdmaUdpSocket")
             .field("local_addr", &self.local_addr)
@@ -70,7 +71,7 @@ impl fmt::Debug for RdmaUdpSocket {
     }
 }
 
-impl fmt::Debug for RdmaUdpPoller {
+impl<B: TransportBuilder> fmt::Debug for RdmaUdpPoller<B> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RdmaUdpPoller")
             .field("local_addr", &self.socket.local_addr)
@@ -78,14 +79,9 @@ impl fmt::Debug for RdmaUdpPoller {
     }
 }
 
-impl RdmaUdpSocket {
+impl<B: TransportBuilder> RdmaUdpSocket<B> {
     /// Bind to a local address and start listening for RDMA connections.
-    pub fn bind(addr: &SocketAddr) -> rdma_io::Result<Self> {
-        Self::bind_with_config(addr, TransportConfig::datagram())
-    }
-
-    /// Bind with a custom transport configuration.
-    pub fn bind_with_config(addr: &SocketAddr, config: TransportConfig) -> rdma_io::Result<Self> {
+    pub fn bind(addr: &SocketAddr, builder: B) -> rdma_io::Result<Self> {
         let listener = AsyncCmListener::bind(addr)?;
         let local_addr = listener
             .local_addr()
@@ -94,7 +90,7 @@ impl RdmaUdpSocket {
             listener: Arc::new(listener),
             connections: Arc::new(RwLock::new(HashMap::new())),
             local_addr,
-            config,
+            builder,
             accept_state: Mutex::new(None),
             recv_waker: Mutex::new(None),
             send_blocked: Mutex::new(None),
@@ -116,12 +112,8 @@ impl RdmaUdpSocket {
     /// Can be called before or after the Quinn endpoint is created. If the
     /// endpoint already exists, `poll_recv` will be woken to discover the
     /// new connection.
-    pub async fn connect_to(
-        &self,
-        addr: &SocketAddr,
-        config: TransportConfig,
-    ) -> rdma_io::Result<()> {
-        let transport = RdmaTransport::connect(addr, config).await?;
+    pub async fn connect_to(&self, addr: &SocketAddr) -> rdma_io::Result<()> {
+        let transport = self.builder.connect(addr).await?;
         let peer = transport
             .peer_addr()
             .ok_or(rdma_io::Error::InvalidArg("no peer addr".into()))?;
@@ -182,41 +174,25 @@ impl RdmaUdpSocket {
                                 "RDMA accept failed {n} consecutive times, last: {e}"
                             )));
                         }
-                        return Ok(());
                     }
                 }
             } else {
-                match self.listener.poll_get_request(cx) {
-                    Poll::Pending => return Ok(()),
-                    Poll::Ready(Ok(conn_id)) => {
-                        let config = self.config.clone();
-                        let listener = Arc::clone(&self.listener);
-                        *accept = Some(Box::pin(async move {
-                            let transport =
-                                RdmaTransport::complete_accept(conn_id, &listener, config).await?;
-                            let addr = transport
-                                .peer_addr()
-                                .ok_or(rdma_io::Error::InvalidArg("no peer addr".into()))?;
-                            Ok((addr, transport))
-                        }));
-                    }
-                    Poll::Ready(Err(e)) => {
-                        let n = self.accept_errors.fetch_add(1, Ordering::Relaxed) + 1;
-                        tracing::warn!(error = %e, consecutive = n, "RDMA listen error");
-                        if n >= Self::MAX_ACCEPT_ERRORS {
-                            return Err(io::Error::other(format!(
-                                "RDMA listen failed {n} consecutive times, last: {e}"
-                            )));
-                        }
-                        return Ok(());
-                    }
-                }
+                // Spawn a new accept future using the transport builder.
+                let builder = self.builder.clone();
+                let listener = Arc::clone(&self.listener);
+                *accept = Some(Box::pin(async move {
+                    let transport = builder.accept(&listener).await?;
+                    let addr = transport
+                        .peer_addr()
+                        .ok_or(rdma_io::Error::InvalidArg("no peer addr".into()))?;
+                    Ok((addr, transport))
+                }));
             }
         }
     }
 }
 
-impl AsyncUdpSocket for RdmaUdpSocket {
+impl<B: TransportBuilder> AsyncUdpSocket for RdmaUdpSocket<B> {
     fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
         Box::pin(RdmaUdpPoller { socket: self })
     }
@@ -327,7 +303,7 @@ impl AsyncUdpSocket for RdmaUdpSocket {
     }
 }
 
-impl UdpPoller for RdmaUdpPoller {
+impl<B: TransportBuilder> UdpPoller for RdmaUdpPoller<B> {
     fn poll_writable(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let blocked = self.socket.send_blocked.lock().unwrap().clone();
         match blocked {
@@ -349,7 +325,7 @@ impl UdpPoller for RdmaUdpPoller {
     }
 }
 
-impl Drop for RdmaUdpSocket {
+impl<B: TransportBuilder> Drop for RdmaUdpSocket<B> {
     fn drop(&mut self) {
         self.close();
     }

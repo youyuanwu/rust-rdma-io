@@ -1,9 +1,18 @@
 //! Quinn QUIC echo test over RDMA.
+//!
+//! Each test has a generic body and two concrete entry points:
+//! `_default` (Send/Recv) and `_ring` (Ring buffer, skipped on iWARP).
 
 use std::sync::Arc;
 
 use quinn::{ClientConfig, Endpoint, ServerConfig};
+use rdma_io::rdma_ring_transport::RingConfig;
+use rdma_io::rdma_transport::TransportConfig;
+use rdma_io::transport::TransportBuilder;
 use rdma_io_quinn::RdmaUdpSocket;
+
+use rdma_io_tests::require_no_iwarp;
+use rdma_io_tests::test_helpers;
 
 fn generate_self_signed_cert() -> (
     Vec<quinn::rustls::pki_types::CertificateDer<'static>>,
@@ -38,18 +47,18 @@ fn make_client_config(
     ))
 }
 
-use rdma_io_tests::test_helpers;
+// ===========================================================================
+// quinn_echo — QUIC bidirectional stream echo over RDMA.
+// ===========================================================================
 
-#[tokio::test]
-async fn quinn_echo_over_rdma() {
+async fn quinn_echo<B: TransportBuilder>(builder: B) {
     let (certs, key) = generate_self_signed_cert();
     let server_config = make_server_config(&certs, key);
     let client_config = make_client_config(&certs);
     let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
 
-    // 1. Bind server socket + create server Quinn endpoint FIRST
-    //    (so poll_accept can handle the incoming RDMA connection)
-    let server_socket = RdmaUdpSocket::bind(&test_helpers::bind_addr()).expect("server bind");
+    let server_socket =
+        RdmaUdpSocket::bind(&test_helpers::bind_addr(), builder.clone()).expect("server bind");
     let connect_addr = test_helpers::connect_addr_for(Some(server_socket.bound_addr()));
 
     let server_endpoint = Endpoint::new_with_abstract_socket(
@@ -60,8 +69,6 @@ async fn quinn_echo_over_rdma() {
     )
     .expect("server endpoint");
 
-    // 2. Server accept task — spawned before RDMA connect so the
-    //    server's poll_recv → poll_accept can handle the RDMA CM handshake.
     let server = tokio::spawn(async move {
         let incoming = server_endpoint.accept().await.expect("no incoming");
         let connection = incoming.await.expect("accept failed");
@@ -76,26 +83,18 @@ async fn quinn_echo_over_rdma() {
         );
         send.write_all(&data).await.expect("write");
         send.finish().expect("finish");
-        // Keep connection alive until client reads the echo response.
-        // Dropping connection immediately causes ApplicationClosed.
         send.stopped().await.ok();
     });
 
-    // 3. Bind client socket and pre-establish RDMA connection.
-    //    The server's poll_accept (driven by Quinn's EndpointDriver) will
-    //    handle the accept side concurrently.
-    let client_socket = RdmaUdpSocket::bind(&test_helpers::bind_addr()).expect("client bind");
+    let client_socket =
+        RdmaUdpSocket::bind(&test_helpers::bind_addr(), builder).expect("client bind");
     println!("Client: pre-connecting RDMA to {connect_addr}");
     client_socket
-        .connect_to(
-            &connect_addr,
-            rdma_io_quinn::RdmaTransportConfig::datagram(),
-        )
+        .connect_to(&connect_addr)
         .await
         .expect("RDMA pre-connect");
     println!("Client: RDMA connection established");
 
-    // 4. Create client Quinn endpoint and do QUIC handshake
     let mut client_endpoint = Endpoint::new_with_abstract_socket(
         quinn::EndpointConfig::default(),
         None,
@@ -122,4 +121,15 @@ async fn quinn_echo_over_rdma() {
     println!("Client: echo verified!");
 
     server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn quinn_echo_default() {
+    quinn_echo(TransportConfig::datagram()).await;
+}
+
+#[tokio::test]
+async fn quinn_echo_ring() {
+    require_no_iwarp!();
+    quinn_echo(RingConfig::datagram()).await;
 }

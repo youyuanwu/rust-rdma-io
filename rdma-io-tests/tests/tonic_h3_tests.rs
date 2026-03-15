@@ -1,15 +1,19 @@
 //! tonic gRPC over HTTP/3 (QUIC) over RDMA tests.
 //!
 //! Full stack: tonic gRPC → HTTP/3 (h3) → QUIC (Quinn) → RDMA (rdma-io).
-//! Uses tonic-h3 for the HTTP/3 gRPC layer and rdma-io-quinn's RdmaUdpSocket
-//! as Quinn's transport.
+//! Each test has a generic body and two concrete entry points:
+//! `_default` (Send/Recv) and `_ring` (Ring buffer, skipped on iWARP).
 
 use std::sync::Arc;
 
 use quinn::{Endpoint, EndpointConfig};
+use rdma_io::rdma_ring_transport::RingConfig;
+use rdma_io::rdma_transport::TransportConfig;
+use rdma_io::transport::TransportBuilder;
 use rdma_io_quinn::RdmaUdpSocket;
 
 use rdma_io_tests::greeter_service::*;
+use rdma_io_tests::require_no_iwarp;
 use rdma_io_tests::test_helpers;
 
 fn generate_self_signed_cert() -> (
@@ -58,11 +62,15 @@ fn make_h3_client_config(
     ))
 }
 
+// ---------------------------------------------------------------------------
+// Generic helpers
+// ---------------------------------------------------------------------------
+
 /// Start a tonic-h3 gRPC server on an RDMA-backed Quinn endpoint.
-/// Returns (server_endpoint, connect_addr, shutdown_tx, server_task).
-async fn start_h3_server(
+async fn start_h3_server<B: TransportBuilder>(
     certs: &[quinn::rustls::pki_types::CertificateDer<'static>],
     key: quinn::rustls::pki_types::PrivateKeyDer<'static>,
+    builder: B,
 ) -> (
     std::net::SocketAddr,
     tokio::sync::oneshot::Sender<()>,
@@ -72,7 +80,7 @@ async fn start_h3_server(
     let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
 
     let server_socket =
-        Arc::new(RdmaUdpSocket::bind(&test_helpers::bind_addr()).expect("server bind"));
+        Arc::new(RdmaUdpSocket::bind(&test_helpers::bind_addr(), builder).expect("server bind"));
     let connect_addr = test_helpers::connect_addr_for(Some(server_socket.bound_addr()));
 
     let server_endpoint = Endpoint::new_with_abstract_socket(
@@ -105,15 +113,17 @@ async fn start_h3_server(
 }
 
 /// Create an RDMA-backed Quinn client endpoint pre-connected to the server.
-async fn make_h3_client_endpoint(
+async fn make_h3_client_endpoint<B: TransportBuilder>(
     connect_addr: &std::net::SocketAddr,
     client_config: quinn::ClientConfig,
+    builder: B,
 ) -> Endpoint {
     let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
 
-    let client_socket = RdmaUdpSocket::bind(&test_helpers::bind_addr()).expect("client bind");
+    let client_socket =
+        RdmaUdpSocket::bind(&test_helpers::bind_addr(), builder).expect("client bind");
     client_socket
-        .connect_to(connect_addr, rdma_io_quinn::RdmaTransportConfig::datagram())
+        .connect_to(connect_addr)
         .await
         .expect("RDMA pre-connect");
 
@@ -143,20 +153,19 @@ fn make_h3_grpc_client(
     GreeterClient::new(channel)
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// h3_unary — unary gRPC over HTTP/3 + RDMA.
+// ===========================================================================
 
-#[tokio::test]
-async fn tonic_h3_unary_over_rdma() {
+async fn h3_unary<B: TransportBuilder>(builder: B) {
     let (certs, key) = generate_self_signed_cert();
     let client_config = make_h3_client_config(&certs);
 
-    let (connect_addr, shutdown_tx, server_task) = start_h3_server(&certs, key).await;
-    let client_endpoint = make_h3_client_endpoint(&connect_addr, client_config).await;
+    let (connect_addr, shutdown_tx, server_task) =
+        start_h3_server(&certs, key, builder.clone()).await;
+    let client_endpoint = make_h3_client_endpoint(&connect_addr, client_config, builder).await;
     let mut client = make_h3_grpc_client(&client_endpoint, &connect_addr);
 
-    // Unary gRPC call
     let response = client
         .say_hello(tonic::Request::new(HelloRequest {
             name: "RDMA-H3".into(),
@@ -165,26 +174,38 @@ async fn tonic_h3_unary_over_rdma() {
         .expect("unary RPC failed");
 
     let message = response.into_inner().message;
-    println!("tonic_h3_unary: {message}");
+    println!("h3_unary: {message}");
     assert_eq!(message, "Hello RDMA-H3!");
 
-    // Cleanup
     let _ = shutdown_tx.send(());
     client_endpoint.close(0u16.into(), b"done");
     server_task.await.expect("server task");
-    println!("tonic_h3_unary_over_rdma passed!");
 }
 
 #[tokio::test]
-async fn tonic_h3_server_stream_over_rdma() {
+async fn h3_unary_default() {
+    h3_unary(TransportConfig::datagram()).await;
+}
+
+#[tokio::test]
+async fn h3_unary_ring() {
+    require_no_iwarp!();
+    h3_unary(RingConfig::datagram()).await;
+}
+
+// ===========================================================================
+// h3_server_stream — server streaming gRPC over HTTP/3 + RDMA.
+// ===========================================================================
+
+async fn h3_server_stream<B: TransportBuilder>(builder: B) {
     let (certs, key) = generate_self_signed_cert();
     let client_config = make_h3_client_config(&certs);
 
-    let (connect_addr, shutdown_tx, server_task) = start_h3_server(&certs, key).await;
-    let client_endpoint = make_h3_client_endpoint(&connect_addr, client_config).await;
+    let (connect_addr, shutdown_tx, server_task) =
+        start_h3_server(&certs, key, builder.clone()).await;
+    let client_endpoint = make_h3_client_endpoint(&connect_addr, client_config, builder).await;
     let mut client = make_h3_grpc_client(&client_endpoint, &connect_addr);
 
-    // Server-streaming gRPC call
     let response = client
         .server_stream(tonic::Request::new(HelloRequest {
             name: "stream".into(),
@@ -198,33 +219,44 @@ async fn tonic_h3_server_stream_over_rdma() {
         messages.push(reply.message);
     }
 
-    println!("tonic_h3_server_stream: {messages:?}");
+    println!("h3_server_stream: {messages:?}");
     assert_eq!(messages.len(), 5);
     assert_eq!(messages[0], "stream-0");
     assert_eq!(messages[4], "stream-4");
 
-    // Cleanup
     let _ = shutdown_tx.send(());
     client_endpoint.close(0u16.into(), b"done");
     server_task.await.expect("server task");
-    println!("tonic_h3_server_stream_over_rdma passed!");
 }
 
 #[tokio::test]
-async fn tonic_h3_multi_peer_over_rdma() {
+async fn h3_server_stream_default() {
+    h3_server_stream(TransportConfig::datagram()).await;
+}
+
+#[tokio::test]
+async fn h3_server_stream_ring() {
+    require_no_iwarp!();
+    h3_server_stream(RingConfig::datagram()).await;
+}
+
+// ===========================================================================
+// h3_multi_peer — concurrent clients over HTTP/3 + RDMA.
+// ===========================================================================
+
+async fn h3_multi_peer<B: TransportBuilder>(builder: B) {
     let (certs, key) = generate_self_signed_cert();
 
-    let (connect_addr, shutdown_tx, server_task) = start_h3_server(&certs, key).await;
+    let (connect_addr, shutdown_tx, server_task) =
+        start_h3_server(&certs, key, builder.clone()).await;
 
-    // Create two independent clients, each with their own RDMA connection.
     let client_config_1 = make_h3_client_config(&certs);
     let client_config_2 = make_h3_client_config(&certs);
-    let ep1 = make_h3_client_endpoint(&connect_addr, client_config_1).await;
-    let ep2 = make_h3_client_endpoint(&connect_addr, client_config_2).await;
+    let ep1 = make_h3_client_endpoint(&connect_addr, client_config_1, builder.clone()).await;
+    let ep2 = make_h3_client_endpoint(&connect_addr, client_config_2, builder).await;
     let mut client1 = make_h3_grpc_client(&ep1, &connect_addr);
     let mut client2 = make_h3_grpc_client(&ep2, &connect_addr);
 
-    // Both clients call concurrently.
     let (r1, r2) = tokio::join!(
         client1.say_hello(tonic::Request::new(HelloRequest {
             name: "peer-1".into(),
@@ -243,7 +275,6 @@ async fn tonic_h3_multi_peer_over_rdma() {
     );
     println!("multi_peer: both concurrent calls succeeded");
 
-    // Disconnect client 1 — client 2 should still work.
     drop(client1);
     ep1.close(0u16.into(), b"peer1 done");
 
@@ -256,7 +287,6 @@ async fn tonic_h3_multi_peer_over_rdma() {
     assert_eq!(r3.into_inner().message, "Hello peer-2-again!");
     println!("multi_peer: peer-2 works after peer-1 disconnect");
 
-    // Server-stream on the surviving client to exercise streaming multiplexing.
     let stream_resp = client2
         .server_stream(tonic::Request::new(HelloRequest {
             name: "multi".into(),
@@ -272,9 +302,19 @@ async fn tonic_h3_multi_peer_over_rdma() {
     assert_eq!(count, 5);
     println!("multi_peer: server-stream on surviving client passed");
 
-    // Cleanup
     let _ = shutdown_tx.send(());
     ep2.close(0u16.into(), b"peer2 done");
     server_task.await.expect("server task");
-    println!("tonic_h3_multi_peer_over_rdma passed!");
+}
+
+#[tokio::test]
+async fn h3_multi_peer_default() {
+    h3_multi_peer(TransportConfig::datagram()).await;
+}
+
+#[tokio::test]
+#[ignore = "ring transport credit flow + Quinn multi-peer polling causes timeout"]
+async fn h3_multi_peer_ring() {
+    require_no_iwarp!();
+    h3_multi_peer(RingConfig::datagram()).await;
 }

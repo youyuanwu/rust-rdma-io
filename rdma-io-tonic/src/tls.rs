@@ -9,6 +9,7 @@
 //! ```no_run
 //! use rdma_io::rdma_transport::TransportConfig;
 //! use rdma_io_tonic::tls::RdmaTransport;
+//! use tonic::transport::Endpoint;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let transport = RdmaTransport::new(TransportConfig::stream());
