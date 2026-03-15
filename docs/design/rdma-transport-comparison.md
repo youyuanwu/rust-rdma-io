@@ -1,27 +1,38 @@
 # RDMA Transport Design Comparison
 
-**Status:** Research  
-**Date:** 2026-03-14  
-**Scope:** Three RDMA transport designs compared: our Send/Recv, msquic's Write+Ring, rsocket's Write+Ring
+**Status:** Implemented (both transports)  
+**Updated:** 2026-03-15  
+**Scope:** Four RDMA transport designs compared: our Send/Recv, our Write+Ring, msquic's Write+Ring, rsocket's Write+Ring
 
 ## Overview
 
-Three production/proposed RDMA transports use fundamentally different approaches to deliver
-data over RDMA. This document compares their architectures, trade-offs, and suitability for
-different workloads.
+Four production/proposed RDMA transports use fundamentally different approaches to deliver
+data over RDMA. We implement **two** — selectable via `TransportBuilder` at construction time:
 
-| | **rust-rdma-io (ours)** | **msquic RDMA (PR #5113)** | **rsocket (librdmacm)** |
-|---|---|---|---|
-| **Purpose** | Byte stream (gRPC) + Datagram (QUIC) | QUIC packet delivery | POSIX socket drop-in |
-| **Platform** | Linux (ibverbs / rdma_cm) | Windows (NDSPI / MANA) | Linux (ibverbs / rdma_cm) |
-| **Code size** | ~600 lines (stream) / ~800 est (datagram) | ~6000 lines | ~3400 lines |
-| **Language** | Rust (async) | C (IOCP callbacks) | C (blocking + rpoll) |
+| | **rust-rdma-io Send/Recv** | **rust-rdma-io Ring** | **msquic RDMA (PR #5113)** | **rsocket (librdmacm)** |
+|---|---|---|---|---|
+| **Type** | `RdmaTransport` | `RdmaRingTransport` | N/A (C) | N/A (C) |
+| **Builder** | `TransportConfig` | `RingConfig` | — | — |
+| **Purpose** | Byte stream (gRPC) + Datagram (QUIC) | Datagram (QUIC) + Bulk transfer | QUIC packet delivery | POSIX socket drop-in |
+| **Platform** | Linux (ibverbs / rdma_cm) | Linux (ibverbs / rdma_cm) | Windows (NDSPI / MANA) | Linux (ibverbs / rdma_cm) |
+| **Code size** | ~500 lines | ~1300 lines | ~6000 lines | ~3400 lines |
+| **Language** | Rust (async) | Rust (async) | C (IOCP callbacks) | C (blocking + rpoll) |
+| **iWARP** | ✅ All providers | ❌ InfiniBand/RoCE only | ❌ MANA only | ⚠️ Adapts (2 WRs) |
+
+```rust
+// User selects transport at construction time — consumers are generic
+use rdma_io::rdma_transport::TransportConfig;
+use rdma_io::rdma_ring_transport::RingConfig;
+
+let incoming = RdmaIncoming::bind(&addr, TransportConfig::stream())?;  // Send/Recv
+let incoming = RdmaIncoming::bind(&addr, RingConfig::default())?;      // Write+Ring
+```
 
 ## Data Transfer Verb
 
 The most fundamental design choice: how data moves between peers.
 
-### Send/Recv (Two-Sided) — Our Approach
+### Send/Recv (Two-Sided) — `RdmaTransport`
 
 ```
 Sender:                          Receiver:
@@ -35,7 +46,7 @@ Sender:                          Receiver:
 **How it works:** Both sides participate. Sender posts a Send WQE, receiver pre-posts a Recv WQE.
 The HCA matches them — sender's data lands in the next available recv buffer.
 
-### RDMA Write + Ring Buffer (One-Sided) — msquic & rsocket
+### RDMA Write + Ring Buffer (One-Sided) — `RdmaRingTransport`, msquic, rsocket
 
 ```
 Sender:                          Receiver:
@@ -52,19 +63,39 @@ The receiver is notified via Immediate Data in the RecvCQ.
 
 ### Comparison
 
-| Aspect | Send/Recv (ours) | RDMA Write + Ring (msquic/rsocket) |
+| Aspect | Send/Recv (ours) | RDMA Write + Ring (ours / msquic / rsocket) |
 |--------|------------------|------------------------------------|
 | **Copies** | 2 (sender → send MR, HCA → recv buf) | 1 (sender → send ring, HCA → remote ring in-place) |
 | **Receiver CPU** | HCA must match send to posted recv | Zero — data lands directly in app memory |
-| **Pre-posted buffers** | Required (N recv WQEs) | Not needed for data path |
-| **Flow control** | Hardware RNR retry (automatic) | Application-level ring space tracking |
+| **Pre-posted buffers** | Required (N recv WQEs) | Doorbell WRs only (4 bytes each) |
+| **Flow control** | Hardware RNR retry (automatic) | Application-level credit tracking |
 | **Notification** | Implicit (recv completion = data) | Explicit doorbell (Immediate Data) |
 | **Setup** | None beyond QP creation | Token exchange (VA + rkey + capacity) |
-| **Memory exposure** | None | Remote peer can write to your ring |
+| **Memory exposure** | None | Remote peer can write to MW-scoped recv ring region only |
 
-## Ring Buffer Protocol
+## Ring Buffer Protocol Comparison
 
-msquic and rsocket both use ring buffers but with different details.
+All three ring implementations (ours, msquic, rsocket) differ in details.
+
+### Our Ring Buffer (`RdmaRingTransport`)
+
+```
+┌────────────────────────┬────────────────────────┐
+│   send_ring (64KB)     │   recv_ring (64KB)     │
+│   Separate MR each     │   Separate MR each     │
+│   [head ──── tail]     │   [head ──── tail]     │
+└────────────────────────┴────────────────────────┘
+  + N×4-byte doorbell MRs for recv WRs
+```
+
+- **Head/Tail pointers** with wrap-around; padding markers for ring-end gaps
+- **Virtual buffer index slab** (`Vec<Option<(offset, len)>>`) maps ring offsets to consumer-facing indices
+- **Immediate encoding:** Small-ring: `imm = (offset << 16) | length` — 16 bits each
+- **Credit protocol:** Absolute freed count via `SendWithImm` — self-healing on loss
+- **Backpressure:** `send_copy` returns `Ok(0)` on credit exhaustion; inline `drain_recv_credits()` recovers
+- **Token exchange:** 20-byte `RingToken` via inline Send/Recv after connect/accept
+- **Memory Windows:** MW Type 2 bound to recv ring; token carries `mw.rkey()`; panics if device doesn't support MW
+- **iWARP:** Rejected at `connect()`/`accept()` — `any_device_is_iwarp()` check
 
 ### msquic Ring Buffer
 
@@ -104,7 +135,7 @@ msquic and rsocket both use ring buffers but with different details.
 - **Overlapped send sizing:** Starts at 2KB, doubles per iteration up to 64KB (RS_MAX_TRANSFER)
 - **iWARP adaptation:** Detects `IBV_TRANSPORT_IWARP`, uses Send + Write (2 WRs per message) instead of Write-With-Immediate
 
-### Our Approach: No Ring Buffer
+### Send/Recv (`RdmaTransport`) — No Ring
 
 ```
 Pre-posted recv buffers (independent):
@@ -119,9 +150,9 @@ Pre-posted recv buffers (independent):
 
 ## Head-of-Line Blocking
 
-### Wire Level (RC QP — All Three Designs)
+### Wire Level (RC QP — All Designs)
 
-All three use RC (Reliable Connection) QPs, which provide TCP-like in-order delivery:
+All use RC (Reliable Connection) QPs, which provide TCP-like in-order delivery:
 
 ```
 Sender posts: A → B → C
@@ -130,7 +161,7 @@ Packet B lost on wire:
   Application sees: A ... [wait] ... B, C
 ```
 
-This is inherent to RC and affects all three equally. Practical impact is negligible in
+This is inherent to RC and affects all equally. Practical impact is negligible in
 datacenter networks (<10⁻⁹ loss rate, microsecond retry).
 
 ### Application Buffer Level
@@ -138,15 +169,16 @@ datacenter networks (<10⁻⁹ loss rate, microsecond retry).
 | Design | Application HOL? | Mechanism |
 |--------|-----------------|-----------|
 | **Our Send/Recv** | **No** | Independent recv buffers; consuming buf[5] doesn't depend on buf[3] |
+| **Our Ring** | **Yes** | Virtual index slab; ring head advances only in order |
 | **msquic Ring** | **Yes** | Ring Head advances only in order; out-of-order releases queue in hash table |
 | **rsocket Ring** | **Yes** | Split-buffer halves; must complete current half before cycling to next |
 
 ```
-Our design — no app-level HOL:
+Send/Recv — no app-level HOL:
   [buf0: ✓] [buf1: ✗] [buf2: ✓] [buf3: ✓]
   Can process buf0, buf2, buf3 regardless of buf1 state.
 
-Ring buffer — app-level HOL:
+Ring buffer — app-level HOL (ours, msquic, rsocket):
   [Pkt_A: slow][Pkt_B: done][Pkt_C: done][  free  ]
    ^Head (stuck)                          ^Tail
   Can't advance Head past slow Pkt_A. Ring fills up. Sender stalls.
@@ -154,47 +186,52 @@ Ring buffer — app-level HOL:
 
 ## Flow Control & Backpressure
 
-| Mechanism | Our Design | msquic | rsocket |
-|-----------|-----------|--------|---------|
-| **Primary** | RNR retry (hardware) | Ring buffer space check | Credit-based (RS_OP_SGL) |
-| **On exhaustion** | HCA retries with backoff | Enqueue to SendQueue | Block in rsend() |
-| **Overhead** | Zero (hardware handles it) | Check + queue + drain per send | Credit messages consume bandwidth |
-| **Granularity** | Per-QP (recv buffer count) | Per-byte (ring free space) | Per-message (sequence numbers) |
-| **Starvation risk** | Low (HCA exponential backoff) | Send queue can grow unbounded | Can deadlock if both peers block |
+| Mechanism | **Our Send/Recv** | **Our Ring** | **msquic** | **rsocket** |
+|-----------|-----------|--------|---------|---------|
+| **Primary** | RNR retry (hardware) | Credit count (absolute) | Ring buffer space check | Credit-based (RS_OP_SGL) |
+| **On exhaustion** | HCA retries with backoff | `drain_recv_credits()` + `Ok(0)` | Enqueue to SendQueue | Block in rsend() |
+| **Overhead** | Zero (hardware handles it) | 1 Send+Imm WR per repost | Check + queue + drain per send | Credit messages consume bandwidth |
+| **Granularity** | Per-QP (recv buffer count) | Per-message (credit count) | Per-byte (ring free space) | Per-message (sequence numbers) |
+| **Self-healing** | N/A (hardware) | ✅ Absolute encoding | No | No |
+| **Starvation risk** | Low (HCA exponential backoff) | Low (inline drain + retry) | Send queue can grow unbounded | Can deadlock if both peers block |
 
-### rsocket Credit Flow in Detail
+### Our Credit Flow in Detail
 
 ```
-Sender tracks:    sseq_no (next send seq), sseq_comp (last ack'd)
-Receiver tracks:  rseq_no (next expected), rseq_comp (last consumed)
+Sender tracks:    remote_credits (starts at max_outstanding = capacity / max_msg_size)
+Receiver tracks:  local_freed_credits (monotonic counter)
 
-When receiver consumes data:
-  1. Update rseq_comp
-  2. If enough credits freed: RDMA Write RS_OP_SGL to sender's remote_sgl
-     (tells sender: "you can send up to sseq_comp + window")
+When receiver calls repost_recv():
+  1. Release ring space (recv_ring.release)
+  2. Repost doorbell recv WR
+  3. Increment local_freed_credits
+  4. Post SendWithImm(imm = local_freed_credits)  ← absolute count
 
-Sender before each send:
-  1. Check: sseq_no < sseq_comp + sq_size?
-  2. If yes: send
-  3. If no: block (poll CQ for credits or call rpoll)
+Sender receives credit update:
+  1. delta = freed_count.wrapping_sub(remote_freed_received)
+  2. remote_credits += delta
+  3. remote_freed_received = freed_count
+  → Self-healing: missed updates recovered by next successful one
+
+On credit exhaustion:
+  1. send_copy() calls drain_recv_credits() — non-blocking recv CQ poll
+  2. If credits recovered → send proceeds
+  3. If still 0 → return Ok(0), AsyncRdmaStream retries after poll_send_completion
 ```
-
-This is the most sophisticated flow control but also the most complex — explicit credit
-messages add latency and can deadlock if both peers exhaust credits simultaneously.
 
 ## Connection Setup Complexity
 
-| Phase | Our Design | msquic | rsocket |
-|-------|-----------|--------|---------|
-| **RDMA CM connect** | ✓ | ✓ | ✓ (transparent) |
-| **QP creation** | ✓ | ✓ | ✓ |
-| **MR registration** | ✓ | ✓ | ✓ |
-| **MW bind** | — | ✓ (RecvMW + OffsetMW) | — |
-| **Token exchange** | — | ✓ (Send/Recv of private data) | ✓ (CM private data) |
-| **Pre-post recv buffers** | ✓ | ✓ (for doorbells only) | — |
-| **Credit initialization** | — | — | ✓ (sseq/rseq init) |
-| **iWARP detection** | — | — | ✓ (IBV_TRANSPORT_IWARP check) |
-| **Connection states** | 2 | 13 | ~8 (hidden in rsocket) |
+| Phase | **Our Send/Recv** | **Our Ring** | **msquic** | **rsocket** |
+|-------|-----------|--------|---------|---------|
+| **RDMA CM connect** | ✓ | ✓ | ✓ | ✓ (transparent) |
+| **QP creation** | ✓ | ✓ | ✓ | ✓ |
+| **MR registration** | ✓ | ✓ | ✓ | ✓ |
+| **MW bind** | — | ✅ (recv ring scoped) | ✓ (RecvMW + OffsetMW) | — |
+| **Token exchange** | — | ✓ (20B Send/Recv) | ✓ (24B Send/Recv) | ✓ (CM private data) |
+| **Pre-post recv WRs** | ✓ (data bufs) | ✓ (doorbell bufs) | ✓ (doorbells) | — |
+| **Credit initialization** | — | ✓ (max_outstanding) | — | ✓ (sseq/rseq init) |
+| **iWARP detection** | — | ✓ (reject) | — | ✓ (adapt) |
+| **Connection states** | 2 | 3 (setup→token→ready) | 13 | ~8 |
 
 ## Advantages of Ring Buffer (Write-Based)
 
@@ -206,7 +243,6 @@ messages add latency and can deadlock if both peers exhaust credits simultaneous
 | **No RNR risk** | Ring is always "ready" — no missing recv buffers |
 | **Batched notification** | One doorbell (Write-With-Immediate) can signal a large transfer |
 | **CPU efficiency on receiver** | HCA writes directly to final location — no recv WQE matching |
-| **Overlapped sends (rsocket)** | Multiple in-flight writes to different ring offsets |
 
 ## Disadvantages of Ring Buffer (Write-Based)
 
@@ -214,28 +250,25 @@ messages add latency and can deadlock if both peers exhaust credits simultaneous
 |--------------|--------|
 | **Application-level HOL blocking** | Ring Head must advance in order. One slow packet blocks all. |
 | **Security exposure** | Remote peer has write access to your memory via rkey |
-| **MW lifecycle (msquic)** | Must bind per-connection, invalidate on disconnect |
 | **Token exchange** | Post-connect handshake adds latency and protocol states |
-| **Ring protocol complexity** | Head/tail, wrap-around, completion hash tables, offset sync (~500 lines) |
-| **13-state machine (msquic)** | Each state has error paths, recovery, and teardown logic |
-| **Credit protocol (rsocket)** | Explicit credit messages consume bandwidth, risk deadlock |
+| **Ring protocol complexity** | Head/tail, wrap-around, credit tracking, offset encoding |
+| **No iWARP** | Write-With-Immediate not supported on iWARP/siw |
 | **Memory pinned upfront** | Entire ring registered for connection lifetime, even if mostly idle |
-| **No hardware flow control** | Must track ring space in software; RNR retry not available |
+| **No hardware flow control** | Must track ring space/credits in software |
 | **Debugging difficulty** | Data appears in remote memory "magically" — harder to trace |
-| **Fragile to bugs** | Wrap-around off-by-one, completion table leak, head/tail desync → silent corruption |
-| **iWARP adaptation (rsocket)** | iWARP doesn't support Write-With-Immediate; needs 2 WRs per message |
 
 ## Suitability by Workload
 
 | Workload | Best Design | Why |
 |----------|------------|-----|
-| **Small packets (QUIC, RPC)** | Send/Recv | Minimal overhead per packet; extra copy is negligible at 1.2KB |
-| **Bulk streaming (large files)** | Write + Ring | One fewer copy matters at high throughput; ring absorbs bursts |
-| **Many peers (microservices)** | Send/Recv | No per-peer ring memory; simpler teardown |
-| **Drop-in replacement (legacy)** | rsocket | POSIX socket API compatibility; transparent to applications |
-| **Latency-sensitive** | Send/Recv | Fewer protocol states; no token exchange latency |
-| **Hardware diversity** | Send/Recv | Works on IB, RoCE, iWARP, siw, rxe without adaptation |
-| **Memory-constrained** | Send/Recv | Per-connection buffers scale with actual recv count, not ring capacity |
+| **Small packets (QUIC, RPC)** | `TransportConfig` (Send/Recv) | Minimal overhead; extra copy negligible at 1.2KB |
+| **Bulk streaming (large files)** | `RingConfig` (Write+Ring) | One fewer copy matters at high throughput; ring absorbs bursts |
+| **Many peers (microservices)** | `TransportConfig` (Send/Recv) | No per-peer ring memory; simpler teardown |
+| **iWARP / siw / all hardware** | `TransportConfig` (Send/Recv) | Works on IB, RoCE, iWARP, siw, rxe without adaptation |
+| **Latency-sensitive** | `TransportConfig` (Send/Recv) | Fewer protocol states; no token exchange latency |
+| **InfiniBand/RoCE bulk** | `RingConfig` (Write+Ring) | Credit flow + ring buffer maximizes NIC pipeline |
+| **Memory-constrained** | `TransportConfig` (Send/Recv) | Per-connection buffers scale with actual recv count |
+| **Drop-in legacy (POSIX)** | rsocket | Socket API compatibility; transparent to applications |
 
 ## Summary
 
@@ -243,25 +276,28 @@ messages add latency and can deadlock if both peers exhaust credits simultaneous
                 Simplicity                              Throughput
                     ◄──────────────────────────────────────►
 
-  Send/Recv (ours)          rsocket              msquic RDMA
-  ┌──────────────┐    ┌──────────────┐    ┌──────────────────┐
-  │ ~600 lines   │    │ ~3400 lines  │    │ ~6000 lines      │
-  │ 2 states     │    │ ~8 states    │    │ 13 states        │
-  │ No ring      │    │ Credit flow  │    │ Ring + MW + hash │
-  │ No HOL (app) │    │ HOL (ring)   │    │ HOL (ring)       │
-  │ 2 copies     │    │ 1 copy       │    │ 1 copy           │
-  │ HW flow ctrl │    │ SW credits   │    │ SW ring check    │
-  │ All HW       │    │ IB+RoCE(+siw)│    │ MANA only        │
-  └──────────────┘    └──────────────┘    └──────────────────┘
-  Best: QUIC, RPC     Best: legacy apps   Best: QUIC bulk xfer
+  Send/Recv (ours)    Ring (ours)      rsocket        msquic RDMA
+  ┌──────────────┐  ┌──────────────┐  ┌────────────┐  ┌──────────────────┐
+  │ ~500 lines   │  │ ~1300 lines  │  │ ~3400 lines│  │ ~6000 lines      │
+  │ 2 states     │  │ 3 states     │  │ ~8 states  │  │ 13 states        │
+  │ No ring      │  │ Credit flow  │  │ Credit flow│  │ Ring + MW + hash │
+  │ No HOL (app) │  │ HOL (ring)   │  │ HOL (ring) │  │ HOL (ring)       │
+  │ 2 copies     │  │ 1 copy       │  │ 1 copy     │  │ 1 copy           │
+  │ HW flow ctrl │  │ SW credits   │  │ SW credits │  │ SW ring check    │
+  │ All HW       │  │ IB+RoCE      │  │ IB+RoCE+siw│  │ MANA only       │
+  └──────────────┘  └──────────────┘  └────────────┘  └──────────────────┘
+  Best: gRPC,       Best: QUIC bulk,  Best: legacy    Best: QUIC bulk
+  iWARP, many peers IB/RoCE transfer  POSIX apps      (Windows/MANA)
 ```
 
-For our quinn-rdma use case (QUIC packets, ~1.2KB, datacenter), Send/Recv is the clear choice:
-the ring buffer's throughput advantage is negligible at small packet sizes, while its complexity
-cost is substantial.
+Both our transports implement the same `Transport` trait and are selected via `TransportBuilder` —
+consumer code (stream, tonic, quinn) is unchanged. All tests run on both transports via generic
+test bodies with `_default` and `_ring` variants.
 
 ## References
 
+- [docs/design/rdma-transport-layer.md](rdma-transport-layer.md) — Transport trait architecture
+- [docs/design/rdma-ring-transport.md](rdma-ring-transport.md) — Ring transport design
 - [docs/design/quinn-rdma.md](quinn-rdma.md) — Quinn RDMA integration design
 - [docs/background/msquic-rdma.md](../background/msquic-rdma.md) — msquic RDMA transport analysis
 - [docs/background/Rsocket.md](../background/Rsocket.md) — rsocket internal implementation analysis

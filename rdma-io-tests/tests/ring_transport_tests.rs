@@ -321,6 +321,76 @@ async fn ring_mw_type2b_bind() {
     println!("ring_mw_type2b_bind passed!");
 }
 
+/// P0: Probe device capabilities for Memory Window Type 2 support.
+/// Reports capability flags and performs trial allocation on the connection's
+/// actual device context (not the first device — which might be wrong).
+/// Also explicitly tests rxe if present — rxe advertises MW cap flags but
+/// alloc fails (EINVAL).
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn ring_mw_capability_probe() {
+    require_no_iwarp!();
+
+    // Bind a listener to get a valid address, then resolve route to get
+    // the correct device context via rdma_cm routing.
+    let listener = AsyncCmListener::bind(&bind_addr()).unwrap();
+    let connect_addr = connect_addr_for(listener.local_addr());
+
+    use rdma_io::async_cm::AsyncCmId;
+    use rdma_io::cm::PortSpace;
+    use rdma_io::mw::{MemoryWindow, MwType};
+
+    let cm = AsyncCmId::new(PortSpace::Tcp).unwrap();
+    cm.resolve_addr(None, &connect_addr, 2000).await.unwrap();
+    cm.resolve_route(2000).await.unwrap();
+
+    // PD is allocated on the routed device — this is the device that
+    // would actually be used for the ring transport connection.
+    let pd = cm.alloc_pd().unwrap();
+    let supports = rdma_io::device::supports_mw_type2(&pd);
+    println!("Routed device: supports_mw_type2() = {supports}");
+
+    let result = MemoryWindow::alloc(&pd, MwType::Type2);
+    assert_eq!(
+        result.is_ok(),
+        supports,
+        "trial alloc result must match supports_mw_type2()"
+    );
+
+    // Explicitly test rxe if present — some versions advertise MW flags
+    // but alloc fails (EINVAL). Report findings without hard assertions
+    // since behavior depends on kernel/driver version.
+    match rdma_io::device::open_device_by_name("rxe0") {
+        Ok(rxe_ctx) => {
+            let rxe_attr = rxe_ctx.query_device().unwrap();
+            let rxe_flags = rxe_attr.device_cap_flags;
+            let rxe_mw2b = rxe_flags & rdma_io_sys::ibverbs::IBV_DEVICE_MEM_WINDOW_TYPE_2B != 0;
+
+            let rxe_ctx = std::sync::Arc::new(rxe_ctx);
+            let rxe_pd = rdma_io::pd::ProtectionDomain::new(rxe_ctx).unwrap();
+            let rxe_supports = rdma_io::device::supports_mw_type2(&rxe_pd);
+            let rxe_alloc = MemoryWindow::alloc(&rxe_pd, MwType::Type2);
+
+            println!(
+                "rxe0: cap_flag MW_TYPE_2B={rxe_mw2b}, \
+                 supports_mw_type2()={rxe_supports}, alloc={}",
+                if rxe_alloc.is_ok() { "ok" } else { "FAILED" }
+            );
+
+            // Consistency check: probe must match actual alloc.
+            assert_eq!(
+                rxe_alloc.is_ok(),
+                rxe_supports,
+                "rxe0: supports_mw_type2() must match actual alloc result"
+            );
+        }
+        Err(_) => {
+            println!("rxe0 not present — skipping rxe-specific MW check");
+        }
+    }
+
+    println!("ring_mw_capability_probe passed!");
+}
+
 // ===========================================================================
 // P1 — Edge Cases
 // ===========================================================================
@@ -632,7 +702,7 @@ async fn ring_drop_safety() {
 }
 
 /// P2: Wrap RdmaRingTransport in AsyncRdmaStream, send 64KB, read back,
-/// verify integrity.
+/// verify integrity. Uses connected_pair for robust connection setup.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn ring_stream_echo() {
     require_no_iwarp!();
@@ -650,10 +720,22 @@ async fn ring_stream_echo() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let client_handle = tokio::spawn(async move {
-        let transport = RdmaRingTransport::connect(&connect_addr, config)
-            .await
-            .unwrap();
-        AsyncRdmaStream::new(transport)
+        for attempt in 0u64..5 {
+            match RdmaRingTransport::connect(&connect_addr, config.clone()).await {
+                Ok(t) => return AsyncRdmaStream::new(t),
+                Err(e) => {
+                    let is_addr_in_use =
+                        matches!(&e, rdma_io::Error::Verbs(io) if io.raw_os_error() == Some(98));
+                    if is_addr_in_use && attempt < 4 {
+                        tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt + 1)))
+                            .await;
+                        continue;
+                    }
+                    panic!("connect failed: {e}");
+                }
+            }
+        }
+        unreachable!()
     });
 
     let (server_res, client_res) = tokio::join!(server_handle, client_handle);

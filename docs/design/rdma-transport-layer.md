@@ -71,7 +71,7 @@ Construction: `RdmaTransport::connect(addr, config)` / `RdmaTransport::accept(li
 
 ## AsyncRdmaStream\<T: Transport\>
 
-Generic byte stream consuming the trait. Default type parameter `= RdmaTransport`.
+Generic byte stream consuming the trait.
 
 | Field | Purpose |
 |-------|---------|
@@ -82,7 +82,24 @@ Generic byte stream consuming the trait. Default type parameter `= RdmaTransport
 
 Implements: `AsyncRead`, `AsyncWrite`, `Unpin`, `Send`, `Sync`, `Debug`, `Drop`
 
-Convenience: `AsyncRdmaStream::connect(addr)` hides the generic parameter.
+Construction: `AsyncRdmaStream::new(transport)` — always takes an explicit transport instance.
+
+## TransportBuilder Trait
+
+`TransportBuilder: Clone + Send + Sync + Unpin + 'static` — config-as-builder for connection
+establishment. Associated type `Transport: Transport + 'static`.
+
+| Method | Purpose |
+|--------|---------|
+| `connect(&self, addr) → impl Future<Output = Result<Self::Transport>> + Send` | Client-side connect |
+| `accept(&self, listener) → impl Future<Output = Result<Self::Transport>> + Send` | Server-side accept |
+
+Implementations:
+- `TransportConfig` → `RdmaTransport` (Send/Recv, presets: `stream()`, `datagram()`)
+- `RingConfig` → `RdmaRingTransport` (Write+Imm ring buffers, presets: `datagram()`, `default()`)
+
+Generic consumers (e.g., `RdmaIncoming<B>`, `RdmaConnector<B>`, `RdmaUdpSocket<B>`) accept
+any builder — users choose the transport at construction time.
 
 ## Responsibility Split
 
@@ -99,14 +116,16 @@ Convenience: `AsyncRdmaStream::connect(addr)` hides the generic parameter.
 
 ## Migration Status
 
-- ✅ **Phase 1: Transport Trait + RdmaTransport** — `transport.rs` (114 lines), `rdma_transport.rs` (448 lines), refactored `async_stream.rs` (404 lines). 44 tests pass, zero warnings.
+- ✅ **Phase 1: Transport Trait + RdmaTransport** — `transport.rs`, `rdma_transport.rs`, refactored `async_stream.rs`.
 - ✅ **Phase 1.5: poll_get_request** — Added to `AsyncCmListener` for non-blocking accept in `poll_recv`.
-- ✅ **Phase 2: RdmaUdpSocket** — `rdma-io-quinn` crate (~240 lines). Quinn echo test passes. 45 total tests.
-- ⬜ **Phase 3: Optimize** — SRQ, inline data, UD QP, Ring transport
+- ✅ **Phase 2: RdmaUdpSocket** — `rdma-io-quinn` crate. Generic over `TransportBuilder`. Quinn echo + multi-peer tests pass.
+- ✅ **Phase 3: RdmaRingTransport** — Ring buffer transport via RDMA Write + Immediate Data with credit-based flow control.
+- ✅ **Phase 4: TransportBuilder** — Generic builder trait. All consumers (`RdmaIncoming`, `RdmaConnector`, `RdmaUdpSocket`, `TokioRdmaStream`) are generic over the builder.
+- ✅ **Phase 5: Generic tests** — All stream, tonic, quinn, and h3 tests run on both Send/Recv and Ring transports.
 
-## Future: Ring Buffer Transport
+## Ring Buffer Transport
 
-`RdmaRingTransport` would implement `Transport` using RDMA Write + Immediate Data.
+`RdmaRingTransport` implements `Transport` using RDMA Write + Immediate Data.
 Drop-in replacement via generics — consumer code unchanged.
 See [rdma-ring-transport.md](rdma-ring-transport.md) for the full design.
 

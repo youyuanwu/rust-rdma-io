@@ -48,16 +48,20 @@ client.write_all(b"hello async rdma").await.unwrap();
 ### tonic gRPC over RDMA
 
 ```rust
+use rdma_io::rdma_transport::TransportConfig;
 use rdma_io_tonic::{RdmaConnector, RdmaIncoming};
 
 // Server
-let incoming = RdmaIncoming::bind("0.0.0.0:50051").await.unwrap();
+let incoming = RdmaIncoming::bind(
+    &"0.0.0.0:50051".parse().unwrap(),
+    TransportConfig::stream(),
+)?;
 Server::builder()
     .add_service(my_service)
     .serve_with_incoming(incoming).await?;
 
 // Client
-let connector = RdmaConnector;
+let connector = RdmaConnector::new(TransportConfig::stream());
 let channel = Endpoint::from_static("http://10.0.0.1:50051")
     .connect_with_connector(connector).await?;
 ```
@@ -65,11 +69,14 @@ let channel = Endpoint::from_static("http://10.0.0.1:50051")
 ### Quinn QUIC over RDMA
 
 ```rust
+use rdma_io::rdma_transport::TransportConfig;
 use rdma_io_quinn::RdmaUdpSocket;
 use quinn::{Endpoint, EndpointConfig};
 
-// Server: bind RDMA socket, create Quinn endpoint
-let server_socket = Arc::new(RdmaUdpSocket::bind(&"0.0.0.0:0".parse().unwrap())?);
+// Server: bind RDMA socket with transport builder, create Quinn endpoint
+let server_socket = Arc::new(
+    RdmaUdpSocket::bind(&"0.0.0.0:0".parse().unwrap(), TransportConfig::datagram())?
+);
 let server_endpoint = Endpoint::new_with_abstract_socket(
     EndpointConfig::default(), Some(server_config),
     server_socket, runtime,
@@ -77,8 +84,8 @@ let server_endpoint = Endpoint::new_with_abstract_socket(
 let incoming = server_endpoint.accept().await.unwrap();
 
 // Client: pre-connect RDMA, then create Quinn endpoint
-let client_socket = RdmaUdpSocket::bind(&"0.0.0.0:0".parse().unwrap())?;
-client_socket.connect_to(&server_addr, TransportConfig::datagram()).await?;
+let client_socket = RdmaUdpSocket::bind(&"0.0.0.0:0".parse().unwrap(), TransportConfig::datagram())?;
+client_socket.connect_to(&server_addr).await?;
 let client_endpoint = Endpoint::new_with_abstract_socket(
     EndpointConfig::default(), None,
     Arc::new(client_socket), runtime,
@@ -89,18 +96,19 @@ let connection = client_endpoint.connect(server_addr, "localhost")?.await?;
 ### tonic gRPC over HTTP/3 over RDMA
 
 ```rust
+use rdma_io::rdma_transport::TransportConfig;
 use rdma_io_quinn::RdmaUdpSocket;
 use tonic_h3::quinn::{H3QuinnAcceptor, H3QuinnConnector};
 
 // Server: RDMA socket → Quinn endpoint → tonic-h3 acceptor
-let socket = Arc::new(RdmaUdpSocket::bind(&addr)?);
+let socket = Arc::new(RdmaUdpSocket::bind(&addr, TransportConfig::datagram())?);
 let endpoint = Endpoint::new_with_abstract_socket(config, Some(h3_server_config), socket, rt)?;
 let acceptor = H3QuinnAcceptor::new(endpoint);
 tonic_h3::server::H3Router::new(routes).serve(acceptor).await?;
 
 // Client: pre-connect RDMA → Quinn endpoint → H3 channel → gRPC client
-let socket = RdmaUdpSocket::bind(&addr)?;
-socket.connect_to(&server_addr, TransportConfig::datagram()).await?;
+let socket = RdmaUdpSocket::bind(&addr, TransportConfig::datagram())?;
+socket.connect_to(&server_addr).await?;
 let endpoint = Endpoint::new_with_abstract_socket(config, None, Arc::new(socket), rt)?;
 let connector = H3QuinnConnector::new(uri.clone(), "localhost".into(), endpoint);
 let channel = tonic_h3::H3Channel::new(connector, uri);

@@ -34,16 +34,16 @@ different traits on each side:
            ▼                          ▼
 ┌────────────────────┐   ┌───────────────────────┐
 │ serve_with_incoming│   │connect_with_connector  │
-│  RdmaIncoming      │   │  RdmaConnector         │
+│  RdmaIncoming<B>   │   │  RdmaConnector<B>      │
 │  (Stream<Item=     │   │  (Service<Uri> →       │
 │   Result<IO,E>>)   │   │   TokioIo<TokioRdma>)  │
 └────────┬───────────┘   └──────────┬────────────┘
          │                          │
          ▼                          ▼
 ┌─────────────────────────────────────────────────┐
-│          TokioRdmaStream (newtype)              │
+│          TokioRdmaStream<T> (newtype)             │
 │   tokio::io::AsyncRead/Write + Connected        │
-│   wraps: Compat<AsyncRdmaStream>                │
+│   wraps: Compat<AsyncRdmaStream<T>>             │
 └─────────────────────────────────────────────────┘
          │
          ▼
@@ -57,9 +57,9 @@ different traits on each side:
 The IO adapter chain (client side) bridges three trait families:
 
 ```
-AsyncRdmaStream            → futures_io::AsyncRead/Write
-  → Compat<AsyncRdmaStream>  → tokio::io::AsyncRead/Write
-    → TokioRdmaStream          + Connected (newtype)
+AsyncRdmaStream<T>         → futures_io::AsyncRead/Write
+  → Compat<AsyncRdmaStream<T>> → tokio::io::AsyncRead/Write
+    → TokioRdmaStream<T>         + Connected (newtype)
       → TokioIo<TokioRdmaStream> → hyper::rt::Read/Write  ← tonic needs this
 ```
 
@@ -71,9 +71,10 @@ dependencies out of the core `rdma-io` crate.
 ```
 rdma-io-tonic/src/
 ├── lib.rs          # Re-exports: RdmaConnector, RdmaIncoming, TokioRdmaStream, RdmaConnectInfo
-├── stream.rs       # TokioRdmaStream + RdmaConnectInfo + Connected impl
-├── incoming.rs     # RdmaIncoming (Stream impl over AsyncRdmaListener)
-└── connector.rs    # RdmaConnector (Service<Uri> impl)
+├── stream.rs       # TokioRdmaStream<T> + RdmaConnectInfo + Connected impl
+├── incoming.rs     # RdmaIncoming<B> (Stream impl, Arc<AsyncCmListener> + builder)
+├── connector.rs    # RdmaConnector<B> (Service<Uri> impl)
+└── tls.rs          # RdmaTransport<B> (tonic_tls::Transport, requires `tls` feature)
 ```
 
 ---
@@ -97,10 +98,8 @@ registered memory; one `Box<Future>` (~64 bytes) is noise in comparison.
 
 ### Send safety
 
-- `TokioRdmaStream`: explicit `unsafe impl Send` (AsyncRdmaStream is Send).
-- `RdmaIncoming`: explicit `unsafe impl Send`. Uses a `ListenerPtr` newtype
-  to make the raw pointer to the listener Send-safe within the boxed accept
-  future. Only one accept future is alive at a time.
+- `TokioRdmaStream<T>`: Send+Sync derived from `Transport: Send + Sync`.
+- `RdmaIncoming<B>`: Send+Sync — uses `Arc<AsyncCmListener>` (Sync) to share the listener with accept futures. No raw pointers or unsafe needed.
 
 ### URI parsing
 
@@ -108,11 +107,24 @@ The connector extracts `host:port` from any URI scheme (`http://`, `rdma://`,
 etc.) and strips IPv6 brackets. The `rdma_cm` layer handles RDMA address
 resolution transparently from the IP.
 
-### Buffer sizes
+### Transport selection
 
-Default 64 KiB aligns well with HTTP/2 (16 KiB default max frame size).
-Configurable via `RdmaConnector::with_buf_size()` and
-`RdmaIncoming::bind_with_buf_size()`.
+All types are generic over `TransportBuilder`. Users choose the transport
+at construction time:
+
+```rust
+use rdma_io::rdma_transport::TransportConfig;
+use rdma_io::rdma_ring_transport::RingConfig;
+use rdma_io_tonic::{RdmaConnector, RdmaIncoming};
+
+// Send/Recv transport (default, works on all RDMA providers)
+let incoming = RdmaIncoming::bind(&addr, TransportConfig::stream())?;
+let connector = RdmaConnector::new(TransportConfig::stream());
+
+// Ring buffer transport (requires InfiniBand/RoCE, not iWARP)
+let incoming = RdmaIncoming::bind(&addr, RingConfig::default())?;
+let connector = RdmaConnector::new(RingConfig::default());
+```
 
 ### Connection pooling
 
@@ -133,10 +145,14 @@ Tonic 0.14 only requires `Send`, not `Sync`. Our streams are `Send` but not
 ### Server
 
 ```rust
+use rdma_io::rdma_transport::TransportConfig;
 use rdma_io_tonic::{RdmaIncoming, RdmaConnectInfo};
 use tonic::transport::Server;
 
-let incoming = RdmaIncoming::bind(&"0.0.0.0:50051".parse().unwrap())?;
+let incoming = RdmaIncoming::bind(
+    &"0.0.0.0:50051".parse().unwrap(),
+    TransportConfig::stream(),
+)?;
 
 Server::builder()
     .add_service(GreeterServer::new(my_greeter))
@@ -152,10 +168,11 @@ if let Some(info) = request.extensions().get::<RdmaConnectInfo>() {
 ### Client
 
 ```rust
+use rdma_io::rdma_transport::TransportConfig;
 use rdma_io_tonic::RdmaConnector;
 use tonic::transport::Endpoint;
 
-let connector = RdmaConnector::new();  // default 64 KiB buffers
+let connector = RdmaConnector::new(TransportConfig::stream());
 let channel = Endpoint::from_static("http://10.0.0.1:50051")
     .connect_with_connector(connector)
     .await?;
@@ -166,7 +183,7 @@ let mut client = GreeterClient::new(channel);
 ### Lazy connection (recommended for production)
 
 ```rust
-let connector = RdmaConnector::with_buf_size(256 * 1024);
+let connector = RdmaConnector::new(TransportConfig::stream());
 let channel = Endpoint::from_static("http://10.0.0.1:50051")
     .connect_with_connector_lazy(connector);
 // Connection established on first RPC

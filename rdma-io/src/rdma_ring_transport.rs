@@ -385,11 +385,8 @@ impl RdmaRingTransport {
         let send_mr = pd.reg_mr_owned(vec![0u8; config.ring_capacity], AccessFlags::LOCAL_WRITE)?;
         let recv_mr = pd.reg_mr_owned(
             vec![0u8; config.ring_capacity],
-            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE,
+            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::MW_BIND,
         )?;
-
-        // MW Type 2 bind via send WR is not supported on rxe — skip for now.
-        // Use the recv MR's rkey directly. MW scoping is future work.
 
         let doorbell_bufs = (0..max_outstanding)
             .map(|_| pd.reg_mr_owned(vec![0u8; 4], AccessFlags::LOCAL_WRITE))
@@ -407,11 +404,14 @@ impl RdmaRingTransport {
         let (event_channel, cm_id) = async_cm.into_parts();
         let cm_async_fd = AsyncFd::new(event_channel.fd()).map_err(crate::Error::Verbs)?;
 
+        // QP is now RTS — bind Memory Window to scope remote write access.
+        let (recv_mw, mw_rkey) = bind_recv_mw(&qp, &pd, &recv_mr, &config)?;
+
         // Complete token exchange (async — waits for CQ notification).
         let (remote_addr, remote_rkey, remote_capacity) =
-            complete_token_exchange(&qp, &pd, &recv_mr, &token_recv_mr, &config).await?;
+            complete_token_exchange(&qp, &pd, &recv_mr, mw_rkey, &token_recv_mr, &config).await?;
 
-        // Drain setup completions from send CQ.
+        // Drain setup completions from send CQ (token send + MW bind).
         drain_send_cq(&qp);
 
         // NOW post doorbell recv WRs (after token exchange is done).
@@ -429,6 +429,7 @@ impl RdmaRingTransport {
             pd,
             send_mr,
             recv_mr,
+            recv_mw,
             doorbell_bufs,
             remote_addr,
             remote_rkey,
@@ -437,8 +438,6 @@ impl RdmaRingTransport {
             config,
         ))
     }
-
-    /// Accept a connection from a listener (server side).
     ///
     /// Waits for an incoming connection request, allocates ring buffers and MW,
     /// exchanges ring tokens with the peer, and returns a ready transport.
@@ -480,7 +479,7 @@ impl RdmaRingTransport {
         let send_mr = pd.reg_mr_owned(vec![0u8; config.ring_capacity], AccessFlags::LOCAL_WRITE)?;
         let recv_mr = pd.reg_mr_owned(
             vec![0u8; config.ring_capacity],
-            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE,
+            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::MW_BIND,
         )?;
 
         let doorbell_bufs = (0..max_outstanding)
@@ -499,10 +498,14 @@ impl RdmaRingTransport {
         let (event_channel, cm_id) = async_cm.into_parts();
         let cm_async_fd = AsyncFd::new(event_channel.fd()).map_err(crate::Error::Verbs)?;
 
+        // QP is now RTS — bind Memory Window to scope remote write access.
+        let (recv_mw, mw_rkey) = bind_recv_mw(&qp, &pd, &recv_mr, &config)?;
+
         // Complete token exchange (async).
         let (remote_addr, remote_rkey, remote_capacity) =
-            complete_token_exchange(&qp, &pd, &recv_mr, &token_recv_mr, &config).await?;
+            complete_token_exchange(&qp, &pd, &recv_mr, mw_rkey, &token_recv_mr, &config).await?;
 
+        // Drain setup completions from send CQ (token send + MW bind).
         drain_send_cq(&qp);
 
         // Post doorbell recv WRs.
@@ -520,6 +523,7 @@ impl RdmaRingTransport {
             pd,
             send_mr,
             recv_mr,
+            recv_mw,
             doorbell_bufs,
             remote_addr,
             remote_rkey,
@@ -538,6 +542,7 @@ impl RdmaRingTransport {
         pd: Arc<ProtectionDomain>,
         send_mr: OwnedMemoryRegion,
         recv_mr: OwnedMemoryRegion,
+        recv_mw: MemoryWindow,
         doorbell_bufs: Vec<OwnedMemoryRegion>,
         remote_addr: u64,
         remote_rkey: u32,
@@ -566,7 +571,7 @@ impl RdmaRingTransport {
             local_freed_credits: 0,
             send_in_flight: 0,
 
-            _recv_mw: None,
+            _recv_mw: Some(recv_mw),
 
             qp,
 
@@ -1148,6 +1153,42 @@ impl Drop for RdmaRingTransport {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Allocate and bind a Memory Window Type 2 to the recv ring MR.
+/// Must be called AFTER QP reaches RTS (post-connect/accept).
+/// Panics if the device does not support MW Type 2.
+fn bind_recv_mw(
+    qp: &AsyncQp,
+    pd: &Arc<ProtectionDomain>,
+    recv_mr: &OwnedMemoryRegion,
+    config: &RingConfig,
+) -> crate::Result<(MemoryWindow, u32)> {
+    assert!(
+        crate::device::supports_mw_type2(pd),
+        "ring transport requires Memory Window Type 2 support \
+         (device does not support ibv_alloc_mw Type 2)"
+    );
+
+    let mw = MemoryWindow::alloc(pd, crate::mw::MwType::Type2)?;
+    let mw_rkey = mw.rkey();
+
+    // Bind MW to the recv ring MR region via IBV_WR_BIND_MW send WR.
+    let mut bind_wr = SendWr::new(u64::MAX - 10, WrOpcode::BindMw)
+        .flags(SendFlags::SIGNALED)
+        .bind_mw(
+            mw.as_raw(),
+            mw_rkey,
+            recv_mr.as_raw(),
+            recv_mr.addr(),
+            config.ring_capacity as u64,
+            rdma_io_sys::ibverbs::IBV_ACCESS_REMOTE_WRITE,
+        );
+    qp.post_send_wr(&mut bind_wr)?;
+
+    // The bind completion will be drained by drain_send_cq after token exchange.
+    // After bind, the MW rkey grants scoped REMOTE_WRITE to exactly the recv ring.
+    Ok((mw, mw_rkey))
+}
+
 /// Allocate token recv MR and post the recv WR. Must be called BEFORE connect/accept
 /// so it's the first recv WR on the QP (consumed by the peer's token Send).
 fn post_token_recv(qp: &AsyncQp, pd: &Arc<ProtectionDomain>) -> crate::Result<OwnedMemoryRegion> {
@@ -1168,6 +1209,7 @@ async fn complete_token_exchange(
     qp: &AsyncQp,
     pd: &Arc<ProtectionDomain>,
     recv_mr: &OwnedMemoryRegion,
+    mw_rkey: u32,
     token_recv_mr: &OwnedMemoryRegion,
     config: &RingConfig,
 ) -> crate::Result<(u64, u32, usize)> {
@@ -1176,7 +1218,7 @@ async fn complete_token_exchange(
         version: RING_TOKEN_VERSION,
         _reserved: [0; 3],
         ring_va: recv_mr.addr(),
-        mw_rkey: recv_mr.rkey(),
+        mw_rkey,
         capacity: config.ring_capacity as u32,
     };
     let token_bytes = our_token.to_bytes();

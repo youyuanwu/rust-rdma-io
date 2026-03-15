@@ -42,11 +42,12 @@ interior mutability (`Mutex`) for mutable transport state.
 ```
   quinn EndpointDriver
        │
-  RdmaUdpSocket (impl AsyncUdpSocket)
+  RdmaUdpSocket<B: TransportBuilder> (impl AsyncUdpSocket)
     ├── try_send: drain send CQ (noop waker) + send_copy
     ├── poll_recv: poll_accept + iterate transports → fill bufs + meta
-    ├── create_io_poller → RdmaUdpPoller (always writable)
-    ├── connections: Arc<RwLock<HashMap<SocketAddr, Arc<Mutex<RdmaTransport>>>>>
+    │   └── Ok(0) credit-only batches: re-poll to register CQ waker
+    ├── create_io_poller → RdmaUdpPoller (waits on blocked send CQ)
+    ├── connections: Arc<RwLock<HashMap<SocketAddr, Arc<Mutex<B::Transport>>>>>
     ├── accept_state: Mutex<Option<AcceptFuture>>
     └── listener: Arc<AsyncCmListener>
 ```
@@ -54,17 +55,20 @@ interior mutability (`Mutex`) for mutable transport state.
 ## Core Types
 
 ```rust
-pub struct RdmaUdpSocket {
+pub struct RdmaUdpSocket<B: TransportBuilder> {
     listener: Arc<AsyncCmListener>,
-    connections: Arc<RwLock<HashMap<SocketAddr, Arc<Mutex<RdmaTransport>>>>>,
+    connections: Arc<RwLock<HashMap<SocketAddr, Arc<Mutex<B::Transport>>>>>,
     local_addr: SocketAddr,
-    config: TransportConfig,
-    accept_state: Mutex<Option<AcceptFuture>>,  // interior mutability for &self
+    builder: B,
+    accept_state: Mutex<Option<AcceptFuture<B::Transport>>>,
+    send_blocked: Mutex<Option<Arc<Mutex<B::Transport>>>>,
+    recv_waker: Mutex<Option<Waker>>,
+    accept_errors: AtomicU32,
 }
 
-pub struct RdmaUdpPoller;  // always reports writable
-
-// No separate sender type — Quinn 0.11 uses try_send(&self) on the socket directly
+pub struct RdmaUdpPoller<B: TransportBuilder> {
+    socket: Arc<RdmaUdpSocket<B>>,
+}
 ```
 
 ## Key Design Decisions
@@ -72,15 +76,15 @@ pub struct RdmaUdpPoller;  // always reports writable
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
 | Crate | `rdma-io-quinn` (separate) | Quinn dependency isolated from core `rdma-io` |
-| Concrete type | `RdmaTransport` (not generic `T`) | Quinn uses `Arc<dyn AsyncUdpSocket>` — concrete type simpler |
+| Generic | `RdmaUdpSocket<B: TransportBuilder>` | User chooses Send/Recv (`TransportConfig`) or Ring (`RingConfig`) at construction |
 | Connection map | `Arc<RwLock<HashMap>>` | `&self` API requires interior mutability; RwLock for read-heavy access |
-| Accept | `Mutex<Option<AcceptFuture>>` | Interior mutability; pinned future drives get_request + complete_accept |
+| Accept | Builder's `accept()` in boxed future | TransportBuilder provides the accept logic; listener stashes interleaved ConnectRequests |
 | try_send | Drain send CQ first (noop waker) | Prevents send buffer exhaustion; `send_copy` returns 0 → WouldBlock |
-| UdpPoller | Always returns Ready | RDMA send rarely blocks; hardware RNR handles backpressure |
+| UdpPoller | Waits on blocked transport's send CQ | Returns Pending until send buffer frees; avoids busy-spin |
 | Pre-connect | `connect_to()` before Quinn endpoint | RDMA is point-to-point; must establish connection before data flow |
+| Credit-only re-poll | `Ok(0)` → continue inner loop | Ensures CQ waker is registered (tokio edge-triggered); prevents missed notifications |
 | ECN | Not supported | RDMA doesn't carry ECN; Quinn degrades gracefully |
 | GSO/GRO | Not supported | `max_receive_segments() = 1`, `max_transmit_segments() = 1` |
-| Config | `TransportConfig::datagram()` | 64 recv × 1.5KB, 4 send buffers per peer |
 
 ## poll_recv Flow
 
@@ -120,10 +124,10 @@ pub struct RdmaUdpPoller;  // always reports writable
 ## Connection Management
 
 ```
-  RdmaUdpSocket<RdmaTransport>
-    ├── Peer[10.0.0.2:4433] → Arc<Mutex<RdmaTransport>> (64 recv × 1.5KB)
-    ├── Peer[10.0.0.3:4433] → Arc<Mutex<RdmaTransport>> (64 recv × 1.5KB)
-    └── Listener → AsyncCmListener (poll_get_request)
+  RdmaUdpSocket<B: TransportBuilder>
+    ├── Peer[10.0.0.2:4433] → Arc<Mutex<B::Transport>> (per-builder config)
+    ├── Peer[10.0.0.3:4433] → Arc<Mutex<B::Transport>> (per-builder config)
+    └── Listener → AsyncCmListener (stashes interleaved ConnectRequests)
 ```
 
 **Server:** `poll_recv` → `poll_get_request` → accept future → insert  
@@ -147,11 +151,11 @@ pub struct RdmaUdpPoller;  // always reports writable
 
 All phases complete:
 
-1. ✅ `rdma-io-quinn` crate — `RdmaUdpSocket`, `RdmaUdpPoller`, `AsyncUdpSocket` impl (~240 lines)
-2. ✅ `poll_accept` state machine — `Arc<AsyncCmListener>` + pinned accept future
-3. ✅ `complete_accept` on `RdmaTransport` — accepts pre-obtained `CmId` from `poll_get_request`
-4. ✅ Quinn echo test — `rdma-io-tests/tests/quinn_tests.rs`
-5. ✅ tonic-h3 gRPC tests — `rdma-io-tests/tests/tonic_h3_tests.rs` (unary + server-streaming)
+1. ✅ `rdma-io-quinn` crate — `RdmaUdpSocket<B>`, `RdmaUdpPoller<B>`, `AsyncUdpSocket` impl, generic over `TransportBuilder`
+2. ✅ `poll_accept` state machine — Uses builder's `accept()` in boxed future; `AsyncCmListener` stashes interleaved ConnectRequest events
+3. ✅ Credit-only re-poll fix — `poll_recv` re-polls on `Ok(0)` to ensure CQ waker registration (edge-triggered safety)
+4. ✅ Quinn echo + multi-peer tests — both Send/Recv and Ring transport variants
+5. ✅ tonic-h3 gRPC tests — unary, server-streaming, multi-peer (both transports)
 
 **Implementation findings:**
 - Quinn 0.11.9 API differs from `main` branch (`try_send`/`UdpPoller` vs `UdpSender`)
@@ -175,9 +179,9 @@ gRPC over HTTP/3 over QUIC over RDMA — the full stack works via `tonic-h3` (v0
   RdmaUdpSocket                    (AsyncUdpSocket → RDMA transport)
 ```
 
-**Server:** `RdmaUdpSocket::bind()` → `Endpoint::new_with_abstract_socket(socket, server_config)` → `H3QuinnAcceptor` → `H3Router.serve()`
+**Server:** `RdmaUdpSocket::bind(addr, builder)` → `Endpoint::new_with_abstract_socket(socket, server_config)` → `H3QuinnAcceptor` → `H3Router.serve()`
 
-**Client:** `RdmaUdpSocket::bind()` → `connect_to(addr)` → `Endpoint::new_with_abstract_socket(socket, None)` → `H3QuinnConnector` → `H3Channel` → `GreeterClient`
+**Client:** `RdmaUdpSocket::bind(addr, builder)` → `connect_to(addr)` → `Endpoint::new_with_abstract_socket(socket, None)` → `H3QuinnConnector` → `H3Channel` → `GreeterClient`
 
 **TLS config:** ALPN must be `"h3"` (not `"h2"`). Rustls `ServerConfig`/`ClientConfig` wrapped in `QuicServerConfig`/`QuicClientConfig`.
 

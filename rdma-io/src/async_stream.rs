@@ -233,7 +233,13 @@ impl<T: Transport> AsyncWrite for AsyncRdmaStream<T> {
         if this.write_pending.is_none() {
             match this.transport.send_copy(buf) {
                 Ok(0) => {
-                    // All send buffers occupied — fall through to wait
+                    // All send buffers occupied or credits exhausted.
+                    // Poll recv CQ to register a waker for incoming credit
+                    // updates (ring transport sends credits via Send+Imm on
+                    // the recv CQ). Without this, credit-blocked writes deadlock
+                    // because poll_send_completion only watches the send CQ.
+                    let mut completions = [RecvCompletion::default(); 1];
+                    let _ = this.transport.poll_recv(cx, &mut completions);
                 }
                 Ok(n) => {
                     this.write_pending = Some(n);
@@ -261,7 +267,11 @@ impl<T: Transport> AsyncWrite for AsyncRdmaStream<T> {
                 }
                 Poll::Ready(Ok(())) => match this.transport.send_copy(buf) {
                     Ok(0) => {
-                        // Still no free buffer after draining — retry on next wake.
+                        // Still blocked (credit exhaustion for ring transport).
+                        // Poll recv CQ to register a waker — credit updates
+                        // arrive as Send+Imm on the recv CQ, not the send CQ.
+                        let mut completions = [RecvCompletion::default(); 1];
+                        let _ = this.transport.poll_recv(cx, &mut completions);
                         return Poll::Pending;
                     }
                     Ok(n) => this.write_pending = Some(n),

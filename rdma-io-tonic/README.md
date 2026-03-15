@@ -11,10 +11,14 @@ Drop-in RDMA transport for tonic servers and clients — use `RdmaIncoming` for 
 ### Server
 
 ```rust
+use rdma_io::rdma_transport::TransportConfig;
 use rdma_io_tonic::RdmaIncoming;
 use tonic::transport::Server;
 
-let incoming = RdmaIncoming::bind(&"0.0.0.0:50051".parse().unwrap()).await?;
+let incoming = RdmaIncoming::bind(
+    &"0.0.0.0:50051".parse().unwrap(),
+    TransportConfig::stream(),
+)?;
 Server::builder()
     .add_service(my_service)
     .serve_with_incoming(incoming)
@@ -24,26 +28,27 @@ Server::builder()
 ### Client
 
 ```rust
+use rdma_io::rdma_transport::TransportConfig;
 use rdma_io_tonic::RdmaConnector;
 use tonic::transport::Endpoint;
 
-let connector = RdmaConnector::default();
+let connector = RdmaConnector::new(TransportConfig::stream());
 let channel = Endpoint::from_static("http://10.0.0.1:50051")
     .connect_with_connector(connector)
     .await?;
 let client = MyServiceClient::new(channel);
 ```
 
-### Custom Buffer Size
+### Ring Buffer Transport
 
-Both connector and incoming default to 64 KiB RDMA buffers. Override with:
+Use `RingConfig` instead of `TransportConfig` for RDMA Write + Immediate Data
+with ring buffers and credit-based flow control:
 
 ```rust
-let connector = RdmaConnector::with_buf_size(128 * 1024);
-let incoming = RdmaIncoming::bind_with_buf_size(
-    &"0.0.0.0:50051".parse().unwrap(),
-    128 * 1024,
-).await?;
+use rdma_io::rdma_ring_transport::RingConfig;
+
+let incoming = RdmaIncoming::bind(&addr, RingConfig::default())?;
+let connector = RdmaConnector::new(RingConfig::default());
 ```
 
 ### TLS (mTLS with OpenSSL)
@@ -67,7 +72,7 @@ builder.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
 builder.set_alpn_protos(b"\x02h2")?;
 let acceptor = builder.build();
 
-let incoming = RdmaIncoming::bind(&addr).await?;
+let incoming = RdmaIncoming::bind(&addr, TransportConfig::stream())?;
 let tls_incoming = tonic_tls::openssl::TlsIncoming::new(incoming, acceptor);
 Server::builder()
     .add_service(my_service)
@@ -78,7 +83,7 @@ Server::builder()
 **Client:**
 
 ```rust
-use rdma_io_tonic::RdmaTransport;
+use rdma_io_tonic::tls::RdmaTransport;
 use openssl::ssl::{SslConnector, SslMethod};
 
 let mut builder = SslConnector::builder(SslMethod::tls_client())?;
@@ -88,7 +93,7 @@ builder.set_private_key(&client_key)?;
 builder.set_alpn_protos(b"\x02h2")?;
 let ssl_connector = builder.build();
 
-let transport = RdmaTransport::new();
+let transport = RdmaTransport::new(TransportConfig::stream());
 let connector = tonic_tls::openssl::TlsConnector::new(
     transport,
     ssl_connector,
@@ -105,11 +110,11 @@ let channel = Endpoint::from_shared(uri)?
 
 | Type | Role |
 |---|---|
-| `RdmaConnector` | Client connector — implements `tower::Service<Uri>` |
-| `RdmaIncoming` | Server incoming stream — implements `futures::Stream` + `tonic_tls::Incoming` |
-| `TokioRdmaStream` | Tokio-compatible RDMA stream wrapper |
+| `RdmaConnector<B>` | Client connector — implements `tower::Service<Uri>`, generic over `TransportBuilder` |
+| `RdmaIncoming<B>` | Server incoming stream — implements `futures::Stream` + `tonic_tls::Incoming`, generic over `TransportBuilder` |
+| `TokioRdmaStream<T>` | Tokio-compatible RDMA stream wrapper, generic over `Transport` |
 | `RdmaConnectInfo` | Connection metadata (remote address), accessible via `Request::extensions()` |
-| `RdmaTransport` | TLS transport — implements `tonic_tls::Transport` *(requires `tls` feature)* |
+| `tls::RdmaTransport<B>` | TLS transport — implements `tonic_tls::Transport` *(requires `tls` feature)* |
 
 ## Features
 

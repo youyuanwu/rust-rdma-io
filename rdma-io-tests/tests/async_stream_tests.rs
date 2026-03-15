@@ -353,13 +353,24 @@ async fn write_then_shutdown_after_peer_drop<B: TransportBuilder>(builder: B) {
     drop(client);
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let write_result = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        server.write(b"data after disconnect"),
-    )
-    .await
-    .expect("write hung");
-    assert!(write_result.is_err(), "write to dead QP should fail");
+    // Write until the dead QP is detected. The first write may succeed
+    // (ring transport can post a WR before the disconnect propagates),
+    // but subsequent writes must eventually fail.
+    let mut write_failed = false;
+    for _ in 0..10 {
+        let write_result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server.write(b"data after disconnect"),
+        )
+        .await
+        .expect("write hung");
+        if write_result.is_err() {
+            write_failed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(write_failed, "write to dead QP should eventually fail");
 
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), server.shutdown()).await;
     assert!(

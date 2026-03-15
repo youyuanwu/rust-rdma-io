@@ -196,6 +196,30 @@ pub fn any_device_is_iwarp() -> bool {
         .unwrap_or(false)
 }
 
+/// Returns `true` if the given protection domain's device supports Memory Window Type 2.
+///
+/// MW Type 2 allows per-connection scoped remote write access via
+/// `IBV_WR_BIND_MW` send WRs. Checks the device capability flags
+/// (`IBV_DEVICE_MEM_WINDOW_TYPE_2A` or `IBV_DEVICE_MEM_WINDOW_TYPE_2B`).
+///
+/// Takes a `&Arc<ProtectionDomain>` to query the correct device — the PD
+/// is bound to the connection's device context via `rdma_cm` routing.
+///
+/// **Note:** Some providers (older rxe kernels) may report the flag but fail
+/// on `ibv_alloc_mw`. The ring transport surfaces a clear error at connect
+/// time if alloc fails despite the flag.
+pub fn supports_mw_type2(pd: &Arc<crate::pd::ProtectionDomain>) -> bool {
+    let attr = match pd.context().query_device() {
+        Ok(attr) => attr,
+        Err(_) => return false,
+    };
+    let flags = attr.device_cap_flags;
+    flags
+        & (rdma_io_sys::ibverbs::IBV_DEVICE_MEM_WINDOW_TYPE_2A
+            | rdma_io_sys::ibverbs::IBV_DEVICE_MEM_WINDOW_TYPE_2B)
+        != 0
+}
+
 /// Open an RDMA device by name.
 pub fn open_device_by_name(name: &str) -> Result<Context> {
     let devs = devices()?;
