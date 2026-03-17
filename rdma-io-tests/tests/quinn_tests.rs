@@ -14,6 +14,29 @@ use rdma_io_quinn::RdmaUdpSocket;
 use rdma_io_tests::require_no_iwarp;
 use rdma_io_tests::test_helpers;
 
+/// Retry `connect_to` on EADDRINUSE (siw async port release).
+async fn connect_with_retry<B: TransportBuilder>(
+    socket: &RdmaUdpSocket<B>,
+    addr: &std::net::SocketAddr,
+    label: &str,
+) {
+    for attempt in 0u64..5 {
+        match socket.connect_to(addr).await {
+            Ok(()) => return,
+            Err(e) => {
+                let is_addr_in_use =
+                    matches!(&e, rdma_io::Error::Verbs(io) if io.raw_os_error() == Some(98));
+                if is_addr_in_use && attempt < 4 {
+                    eprintln!("{label} connect attempt {attempt} EADDRINUSE, retrying...");
+                    tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt + 1))).await;
+                    continue;
+                }
+                panic!("{label} pre-connect failed: {e}");
+            }
+        }
+    }
+}
+
 fn generate_self_signed_cert() -> (
     Vec<quinn::rustls::pki_types::CertificateDer<'static>>,
     quinn::rustls::pki_types::PrivateKeyDer<'static>,
@@ -89,10 +112,7 @@ async fn quinn_echo<B: TransportBuilder>(builder: B) {
     let client_socket =
         RdmaUdpSocket::bind(&test_helpers::bind_addr(), builder).expect("client bind");
     println!("Client: pre-connecting RDMA to {connect_addr}");
-    client_socket
-        .connect_to(&connect_addr)
-        .await
-        .expect("RDMA pre-connect");
+    connect_with_retry(&client_socket, &connect_addr, "client").await;
     println!("Client: RDMA connection established");
 
     let mut client_endpoint = Endpoint::new_with_abstract_socket(
@@ -179,10 +199,7 @@ async fn quinn_multi_peer<B: TransportBuilder>(builder: B) {
     // Client 1
     let client_socket_1 =
         RdmaUdpSocket::bind(&test_helpers::bind_addr(), builder.clone()).expect("client1 bind");
-    client_socket_1
-        .connect_to(&connect_addr)
-        .await
-        .expect("client1 pre-connect");
+    connect_with_retry(&client_socket_1, &connect_addr, "client1").await;
 
     let mut ep1 = Endpoint::new_with_abstract_socket(
         quinn::EndpointConfig::default(),
@@ -196,10 +213,7 @@ async fn quinn_multi_peer<B: TransportBuilder>(builder: B) {
     // Client 2
     let client_socket_2 =
         RdmaUdpSocket::bind(&test_helpers::bind_addr(), builder).expect("client2 bind");
-    client_socket_2
-        .connect_to(&connect_addr)
-        .await
-        .expect("client2 pre-connect");
+    connect_with_retry(&client_socket_2, &connect_addr, "client2").await;
 
     let mut ep2 = Endpoint::new_with_abstract_socket(
         quinn::EndpointConfig::default(),
