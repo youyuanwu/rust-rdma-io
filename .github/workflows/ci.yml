@@ -125,3 +125,37 @@ jobs:
             sleep 3
           done
         timeout-minutes: 30
+
+  qemu-rdma-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install QEMU, libvirt, and Ansible
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-kvm libvirt-daemon-system \
+              libvirt-clients libvirt-dev virtinst qemu-utils ansible
+          sudo systemctl start libvirtd
+          sudo usermod -aG libvirt $USER
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Generate SSH key
+        run: ssh-keygen -t rsa -f ~/.ssh/id_rsa -N "" -q
+
+      - name: Deploy RDMA VMs
+        run: sg libvirt -c "./tests/infra-local/scripts/start-vm.sh --no-kvm -y"
+
+      - name: Wait for VMs to be ready
+        run: |
+          sg libvirt -c "./tests/infra-local/scripts/ssh-vm.sh 1 --wait=1200"
+          sg libvirt -c "./tests/infra-local/scripts/ssh-vm.sh 2 --wait=1200"
+
+      - name: Run E2E tests
+        run: sg libvirt -c "./tests/e2e/run_tests.sh"
+
+      - name: Destroy VMs
+        if: always()
+        run: sg libvirt -c "./tests/infra-local/scripts/destroy-vm.sh -y"

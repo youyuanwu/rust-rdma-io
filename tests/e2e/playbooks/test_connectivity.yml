@@ -1,0 +1,18 @@
+---
+- name: VM Connectivity Test
+  hosts: vms
+  gather_facts: false
+  tasks:
+    - name: Ping other VM
+      ansible.builtin.shell: |
+        ping -c 3 {{ hostvars[item].ansible_host }}
+      loop: "{{ groups['vms'] }}"
+      when: item != inventory_hostname
+      register: ping_results
+      changed_when: false
+
+    - name: Display ping results
+      ansible.builtin.debug:
+        msg: "{{ item.stdout_lines }}"
+      loop: "{{ ping_results.results }}"
+      when: item.stdout_lines is defined

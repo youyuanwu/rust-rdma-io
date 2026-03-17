@@ -1,0 +1,9 @@
+---
+- name: Import RDMA Setup Check
+  ansible.builtin.import_playbook: setup_rdma.yml
+
+- name: Import Connectivity Test
+  ansible.builtin.import_playbook: test_connectivity.yml
+
+- name: Import Cross-Node RDMA Test
+  ansible.builtin.import_playbook: rdma_ping_test.yml

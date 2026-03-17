@@ -1,0 +1,107 @@
+---
+- name: Setup RDMA (rxe)
+  hosts: vms
+  become: true
+  tasks:
+    - name: Install kernel modules extra (for RDMA modules)
+      ansible.builtin.apt:
+        name: "linux-modules-extra-{{ ansible_facts['kernel'] }}"
+        state: present
+
+    - name: Load base RDMA modules (skip if already loaded)
+      ansible.builtin.shell: lsmod | grep -q "^{{ item }} " || modprobe {{ item }}
+      loop:
+        - ib_uverbs
+        - rdma_cm
+        - rdma_ucm
+      register: base_modules
+      changed_when: "'modprobe' in base_modules.cmd and base_modules.rc == 0"
+      ignore_errors: true
+
+    - name: Check if rdma_rxe already loaded
+      ansible.builtin.shell: lsmod | grep -q "^rdma_rxe "
+      register: rxe_loaded
+      ignore_errors: true
+      changed_when: false
+
+    - name: Try loading rdma_rxe via modprobe
+      ansible.builtin.shell: modprobe rdma_rxe
+      register: modprobe_rxe
+      ignore_errors: true
+      when: rxe_loaded.rc != 0
+
+    - name: Find host-built rdma_rxe.ko on controller
+      ansible.builtin.find:
+        paths: "{{ lookup('env', 'PROJECT_DIR') | default(playbook_dir + '/../..', true) }}/build"
+        patterns: "rdma_rxe.ko"
+        recurse: true
+      delegate_to: localhost
+      register: rxe_ko_files
+      when: rxe_loaded.rc != 0 and (modprobe_rxe.rc | default(1)) != 0
+
+    - name: Copy host-built rdma_rxe.ko
+      ansible.builtin.copy:
+        src: "{{ rxe_ko_files.files[0].path }}"
+        dest: /tmp/rdma_rxe.ko
+        mode: '0644'
+      when: rxe_loaded.rc != 0 and (modprobe_rxe.rc | default(1)) != 0 and (rxe_ko_files.files | default([]) | length > 0)
+
+    - name: Verify kernel version matches
+      ansible.builtin.shell: |
+        VM_KVER=$(uname -r)
+        KO_KVER=$(modinfo -F vermagic /tmp/rdma_rxe.ko | awk '{print $1}')
+        if [ "$VM_KVER" != "$KO_KVER" ]; then
+          echo "MISMATCH: VM=$VM_KVER, KO=$KO_KVER"
+          echo "Host must run the same kernel as VM, or build rxe inside VM"
+          exit 1
+        fi
+        echo "OK: kernel $VM_KVER matches"
+      changed_when: false
+      when: rxe_loaded.rc != 0 and (modprobe_rxe.rc | default(1)) != 0 and (rxe_ko_files.files | default([]) | length > 0)
+
+    - name: Load rdma_rxe via insmod
+      ansible.builtin.shell: insmod /tmp/rdma_rxe.ko
+      when: rxe_loaded.rc != 0 and (modprobe_rxe.rc | default(1)) != 0 and (rxe_ko_files.files | default([]) | length > 0)
+
+    - name: Fail if no rxe available
+      ansible.builtin.fail:
+        msg: "rdma_rxe not available — modprobe failed and no host-built .ko found in build/"
+      when: rxe_loaded.rc != 0 and (modprobe_rxe.rc | default(1)) != 0 and (rxe_ko_files.files | default([]) | length == 0)
+
+    - name: Detect primary NIC
+      ansible.builtin.shell: "ip -o link show up | awk -F': ' '{print $2}' | grep -v lo | head -1"
+      register: detected_iface
+      changed_when: false
+
+    - name: Check if rxe0 device already exists
+      ansible.builtin.shell: rdma link show | grep -q rxe0
+      register: rxe0_exists
+      ignore_errors: true
+      changed_when: false
+
+    - name: Create rxe0 device
+      ansible.builtin.shell: rdma link add rxe0 type rxe netdev {{ detected_iface.stdout }}
+      when: rxe0_exists.rc != 0
+
+    - name: Verify RDMA setup
+      ansible.builtin.shell: ibv_devices && rdma link show
+      register: rdma_status
+      changed_when: false
+
+    - name: Display RDMA status
+      ansible.builtin.debug:
+        msg: "{{ rdma_status.stdout_lines }}"
+
+    - name: Test RDMA loopback with rping
+      ansible.builtin.shell: |
+        timeout 10 rping -s -a {{ ansible_host }} &
+        sleep 2
+        timeout 10 rping -c -a {{ ansible_host }} -C 3
+      register: rping_result
+      changed_when: false
+      ignore_errors: true
+
+    - name: Display rping result
+      ansible.builtin.debug:
+        msg: "{{ rping_result.stdout_lines }}"
+      when: rping_result.stdout_lines is defined

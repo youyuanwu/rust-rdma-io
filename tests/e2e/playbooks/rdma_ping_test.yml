@@ -1,0 +1,49 @@
+---
+# rping server on VM1, rping client on VM2
+- name: Start rping Server
+  hosts: vm1
+  tasks:
+    - name: Start rping server in background
+      ansible.builtin.shell: |
+        nohup rping -s -a {{ ansible_host }} -v \
+          > /tmp/rping_server.log 2>&1 &
+        echo $!
+      register: server_pid
+
+    - name: Record server PID
+      ansible.builtin.copy:
+        content: "{{ server_pid.stdout }}"
+        dest: /tmp/rping_server.pid
+        mode: '0644'
+
+    - name: Wait for rping server to be ready
+      ansible.builtin.pause:
+        seconds: 2
+
+- name: Run rping Client
+  hosts: vm2
+  tasks:
+    - name: Run rping client against VM1
+      ansible.builtin.shell: |
+        rping -c -a {{ hostvars['vm1'].ansible_host }} -C 10 -v
+      register: client_result
+      timeout: 30
+      changed_when: false
+
+    - name: Display client results
+      ansible.builtin.debug:
+        msg: "{{ client_result.stdout_lines }}"
+
+    - name: Assert success
+      ansible.builtin.assert:
+        that: client_result.rc == 0
+        fail_msg: "Cross-node rping failed"
+
+- name: Cleanup rping Server
+  hosts: vm1
+  tasks:
+    - name: Stop rping server
+      ansible.builtin.shell: |
+        kill $(cat /tmp/rping_server.pid) 2>/dev/null || true
+        rm -f /tmp/rping_server.pid /tmp/rping_server.log
+      ignore_errors: true

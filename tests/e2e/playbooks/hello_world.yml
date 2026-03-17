@@ -1,0 +1,30 @@
+---
+- name: Hello World Test
+  hosts: vms
+  gather_facts: true
+  tasks:
+    - name: Echo hello world
+      ansible.builtin.shell: echo "Hello from $(hostname) at $(date)"
+      register: hello
+      changed_when: false
+
+    - name: Display hello result
+      ansible.builtin.debug:
+        msg: "{{ hello.stdout }}"
+
+    - name: Show VM info
+      ansible.builtin.debug:
+        msg: |
+          VM: {{ vm_name }}
+          IP: {{ ansible_host }}
+          OS: {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}
+          Kernel: {{ ansible_facts['kernel'] }}
+
+    - name: Show network info
+      ansible.builtin.shell: ip addr show | grep -E "inet [0-9]"
+      register: network_info
+      changed_when: false
+
+    - name: Display network info
+      ansible.builtin.debug:
+        msg: "{{ network_info.stdout_lines }}"
