@@ -49,7 +49,7 @@ variable "vm_vcpus" {
 variable "disk_size" {
   description = "OS disk size in bytes (default 6GB)"
   type        = number
-  default     = 6442450944 # 6 GB
+  default     = 4294967296 # 4 GB
 }
 
 variable "use_kvm" {

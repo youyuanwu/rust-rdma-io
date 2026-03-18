@@ -75,10 +75,16 @@ virsh net-dhcp-leases default
 Edit `tests/infra-local/terraform.tfvars` to customize:
 
 ```hcl
-vm_memory_mb = 2048   # RAM per VM
-vm_vcpus     = 2      # CPUs per VM
+vm_memory_mb = 2048   # RAM per VM (default)
+vm_vcpus     = 2      # CPUs per VM (default)
 ```
 
-## Design Document
+For benchmarking, use more resources:
+```bash
+TF_VAR_vm_memory_mb=4096 TF_VAR_vm_vcpus=4 ./tests/infra-local/scripts/start-vm.sh -y
+```
 
-See [docs/future/QemuTestInfra.md](../../docs/future/QemuTestInfra.md) for the full design.
+## Design Documents
+
+- [QEMU Test Infrastructure](../../docs/future/QemuTestInfra.md)
+- [RDMA Benchmark Server & Client](../../docs/future/RdmaBenchmark.md)

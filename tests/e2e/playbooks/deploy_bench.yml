@@ -1,0 +1,52 @@
+---
+- name: Generate TLS Certificates
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Create build/certs directory
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/../../../build/certs"
+        state: directory
+        mode: '0755'
+
+    - name: Check if cert exists
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/../../../build/certs/cert.pem"
+      register: cert_stat
+
+    - name: Generate self-signed certificate
+      ansible.builtin.shell: |
+        openssl req -x509 -newkey rsa:2048 \
+          -keyout "{{ playbook_dir }}/../../../build/certs/key.pem" \
+          -out "{{ playbook_dir }}/../../../build/certs/cert.pem" \
+          -days 3650 -nodes \
+          -subj "/CN=rdma-bench" \
+          -addext "subjectAltName=DNS:rdma-bench,DNS:localhost,IP:127.0.0.1,IP:0.0.0.0"
+      when: not cert_stat.stat.exists
+
+- name: Deploy Benchmark Binaries
+  hosts: vms
+  tasks:
+    - name: Create directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - ~/bin
+        - ~/certs
+
+    - name: Copy benchmark binaries
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "~/bin/{{ item | basename }}"
+        mode: '0755'
+      loop:
+        - "{{ playbook_dir }}/../../../target/release/rdma-bench-server"
+        - "{{ playbook_dir }}/../../../target/release/rdma-bench-client"
+
+    - name: Copy TLS certificates
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../../../build/certs/"
+        dest: "~/certs/"

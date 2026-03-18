@@ -42,6 +42,31 @@ sudo apt install -y ansible
 | `setup_rdma.yml` | Load rxe module, create rxe0 device, verify with loopback rping |
 | `rdma_ping_test.yml` | Cross-node rping (server on VM1, client on VM2) |
 | `run_tests.yml` | Full suite: setup + connectivity + rping |
+| `deploy_bench.yml` | Generate certs, copy benchmark binaries to VMs |
+| `bench_run.yml` | Parameterized benchmark: server on VM1, client on VM2 |
+
+## Benchmarking
+
+```bash
+# Build release binaries
+cargo build -p rdma-io-bench --release
+
+# Setup RDMA on VMs (load rxe module, create rxe0 device)
+./tests/e2e/run_tests.sh playbooks/setup_rdma.yml
+
+# Deploy binaries + certs to VMs (generates certs in build/certs/ if missing)
+./tests/e2e/run_tests.sh playbooks/deploy_bench.yml
+
+# Run a single benchmark
+./tests/e2e/run_bench.sh --mode tls --connections 4 --threads 2
+
+# Run full benchmark matrix
+./tests/e2e/run_bench.sh --matrix
+
+# Results saved to /tmp/bench-*.json
+```
+
+See [docs/future/RdmaBenchmark.md](../../docs/future/RdmaBenchmark.md) for full design.
 
 ## Dynamic Inventory
 

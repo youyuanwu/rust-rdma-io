@@ -126,6 +126,44 @@ jobs:
           done
         timeout-minutes: 30
 
+  build-bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libibverbs-dev \
+            librdmacm-dev \
+            rdma-core \
+            cmake \
+            libclang-dev
+
+      - uses: taiki-e/install-action@protoc
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "${{ env.RUST_VERSION }}"
+
+      - name: Configure
+        run: cmake -B build
+
+      - name: Build bench release
+        run: cargo build -p rdma-io-bench --release
+
+      - name: Upload bench artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: bench-binaries
+          path: |
+            target/release/rdma-bench-server
+            target/release/rdma-bench-client
+          retention-days: 1
+
   qemu-rdma-test:
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -150,11 +188,51 @@ jobs:
 
       - name: Wait for VMs to be ready
         run: |
-          sg libvirt -c "./tests/infra-local/scripts/ssh-vm.sh 1 --wait=1200"
-          sg libvirt -c "./tests/infra-local/scripts/ssh-vm.sh 2 --wait=1200"
+          sg libvirt -c "./tests/infra-local/scripts/ssh-vm.sh 1 --wait=600"
+          sg libvirt -c "./tests/infra-local/scripts/ssh-vm.sh 2 --wait=600"
 
       - name: Run E2E tests
         run: sg libvirt -c "./tests/e2e/run_tests.sh"
+
+      - name: Wait for bench artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Waiting for bench-binaries artifact..."
+          for i in $(seq 1 120); do
+            ARTIFACTS=$(gh api repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts --jq '.artifacts[].name' 2>/dev/null || echo "")
+            if echo "$ARTIFACTS" | grep -q "bench-binaries"; then
+              echo "Artifact ready!"
+              exit 0
+            fi
+            BUILD_STATUS=$(gh api repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs --jq '.jobs[] | select(.name == "build-bench") | .conclusion' 2>/dev/null | head -1)
+            if [ "$BUILD_STATUS" = "failure" ] || [ "$BUILD_STATUS" = "cancelled" ]; then
+              echo "build-bench job failed!"
+              exit 1
+            fi
+            echo "  Attempt $i/120: waiting... (build-bench: ${BUILD_STATUS:-running})"
+            sleep 10
+          done
+          echo "Timeout waiting for artifact"
+          exit 1
+
+      - name: Download bench artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: bench-binaries
+          path: target/release/
+        timeout-minutes: 30
+
+      - name: Deploy bench to VMs
+        run: |
+          chmod +x target/release/rdma-bench-server target/release/rdma-bench-client
+          sg libvirt -c "./tests/e2e/run_tests.sh playbooks/deploy_bench.yml"
+
+      - name: Run benchmark (TLS)
+        run: sg libvirt -c "./tests/e2e/run_bench.sh --mode tls --connections 1"
+
+      - name: Run benchmark (H3)
+        run: sg libvirt -c "./tests/e2e/run_bench.sh --mode h3 --connections 1"
 
       - name: Destroy VMs
         if: always()
