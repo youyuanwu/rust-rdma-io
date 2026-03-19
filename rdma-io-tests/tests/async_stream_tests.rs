@@ -5,8 +5,8 @@
 //! (Ring buffer). The ring variant is skipped on iWARP.
 
 use rdma_io::async_stream::AsyncRdmaStream;
-use rdma_io::rdma_ring_transport::RingConfig;
-use rdma_io::rdma_transport::TransportConfig;
+use rdma_io::credit_ring_transport::CreditRingConfig;
+use rdma_io::send_recv_transport::SendRecvConfig;
 use rdma_io::transport::TransportBuilder;
 
 use rdma_io_tests::require_no_iwarp;
@@ -79,13 +79,13 @@ async fn echo<B: TransportBuilder>(builder: B) {
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn echo_default() {
-    echo(TransportConfig::default()).await;
+    echo(SendRecvConfig::default()).await;
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn echo_ring() {
     require_no_iwarp!();
-    echo(RingConfig::default()).await;
+    echo(CreditRingConfig::default()).await;
 }
 
 // ===========================================================================
@@ -117,13 +117,13 @@ async fn multi_message<B: TransportBuilder>(builder: B) {
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn multi_message_default() {
-    multi_message(TransportConfig::default()).await;
+    multi_message(SendRecvConfig::default()).await;
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn multi_message_ring() {
     require_no_iwarp!();
-    multi_message(RingConfig::default()).await;
+    multi_message(CreditRingConfig::default()).await;
 }
 
 // ===========================================================================
@@ -170,13 +170,13 @@ async fn large_transfer<B: TransportBuilder>(builder: B) {
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn large_transfer_default() {
-    large_transfer(TransportConfig::default()).await;
+    large_transfer(SendRecvConfig::default()).await;
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn large_transfer_ring() {
     require_no_iwarp!();
-    large_transfer(RingConfig::default()).await;
+    large_transfer(CreditRingConfig::default()).await;
 }
 
 // ===========================================================================
@@ -210,13 +210,13 @@ async fn futures_io_echo<B: TransportBuilder>(builder: B) {
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn futures_io_echo_default() {
-    futures_io_echo(TransportConfig::default()).await;
+    futures_io_echo(SendRecvConfig::default()).await;
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn futures_io_echo_ring() {
     require_no_iwarp!();
-    futures_io_echo(RingConfig::default()).await;
+    futures_io_echo(CreditRingConfig::default()).await;
 }
 
 // ===========================================================================
@@ -246,13 +246,13 @@ async fn tokio_compat<B: TransportBuilder>(builder: B) {
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn tokio_compat_default() {
-    tokio_compat(TransportConfig::default()).await;
+    tokio_compat(SendRecvConfig::default()).await;
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn tokio_compat_ring() {
     require_no_iwarp!();
-    tokio_compat(RingConfig::default()).await;
+    tokio_compat(CreditRingConfig::default()).await;
 }
 
 // ===========================================================================
@@ -277,13 +277,13 @@ async fn tokio_io_copy<B: TransportBuilder>(builder: B) {
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn tokio_io_copy_default() {
-    tokio_io_copy(TransportConfig::default()).await;
+    tokio_io_copy(SendRecvConfig::default()).await;
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn tokio_io_copy_ring() {
     require_no_iwarp!();
-    tokio_io_copy(RingConfig::default()).await;
+    tokio_io_copy(CreditRingConfig::default()).await;
 }
 
 // ===========================================================================
@@ -302,13 +302,13 @@ async fn shutdown_after_peer_drop<B: TransportBuilder>(builder: B) {
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn shutdown_after_peer_drop_default() {
-    shutdown_after_peer_drop(TransportConfig::default()).await;
+    shutdown_after_peer_drop(SendRecvConfig::default()).await;
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn shutdown_after_peer_drop_ring() {
     require_no_iwarp!();
-    shutdown_after_peer_drop(RingConfig::default()).await;
+    shutdown_after_peer_drop(CreditRingConfig::default()).await;
 }
 
 // ===========================================================================
@@ -334,13 +334,13 @@ async fn read_eof_then_shutdown<B: TransportBuilder>(builder: B) {
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn read_eof_then_shutdown_default() {
-    read_eof_then_shutdown(TransportConfig::default()).await;
+    read_eof_then_shutdown(SendRecvConfig::default()).await;
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn read_eof_then_shutdown_ring() {
     require_no_iwarp!();
-    read_eof_then_shutdown(RingConfig::default()).await;
+    read_eof_then_shutdown(CreditRingConfig::default()).await;
 }
 
 // ===========================================================================
@@ -381,13 +381,13 @@ async fn write_then_shutdown_after_peer_drop<B: TransportBuilder>(builder: B) {
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn write_then_shutdown_after_peer_drop_default() {
-    write_then_shutdown_after_peer_drop(TransportConfig::default()).await;
+    write_then_shutdown_after_peer_drop(SendRecvConfig::default()).await;
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn write_then_shutdown_after_peer_drop_ring() {
     require_no_iwarp!();
-    write_then_shutdown_after_peer_drop(RingConfig::default()).await;
+    write_then_shutdown_after_peer_drop(CreditRingConfig::default()).await;
 }
 
 // ===========================================================================
@@ -411,13 +411,13 @@ async fn graceful_shutdown<B: TransportBuilder>(builder: B) {
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn graceful_shutdown_default() {
-    graceful_shutdown(TransportConfig::default()).await;
+    graceful_shutdown(SendRecvConfig::default()).await;
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn graceful_shutdown_ring() {
     require_no_iwarp!();
-    graceful_shutdown(RingConfig::default()).await;
+    graceful_shutdown(CreditRingConfig::default()).await;
 }
 
 // ===========================================================================
@@ -443,11 +443,11 @@ async fn poll_close<B: TransportBuilder>(builder: B) {
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn poll_close_default() {
-    poll_close(TransportConfig::default()).await;
+    poll_close(SendRecvConfig::default()).await;
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn poll_close_ring() {
     require_no_iwarp!();
-    poll_close(RingConfig::default()).await;
+    poll_close(CreditRingConfig::default()).await;
 }

@@ -1,4 +1,4 @@
-//! RdmaRingTransport — ring-buffer transport using RDMA Write + Immediate Data.
+//! CreditRingTransport — ring-buffer transport using RDMA Write + Immediate Data.
 //!
 //! Implements the [`Transport`](crate::transport::Transport) trait using one-sided
 //! RDMA Write with Immediate Data and ring buffers, providing zero-copy receive
@@ -21,8 +21,8 @@
 //!
 //! # Connection Setup
 //!
-//! Created via [`connect`](RdmaRingTransport::connect) (client) or
-//! [`accept`](RdmaRingTransport::accept) (server). Both perform:
+//! Created via [`connect`](CreditRingTransport::connect) (client) or
+//! [`accept`](CreditRingTransport::accept) (server). Both perform:
 //! 1. RDMA CM connection with dual CQs
 //! 2. Ring buffer + doorbell allocation
 //! 3. Symmetric token exchange (20-byte `RingToken` with ring VA, rkey, capacity)
@@ -60,12 +60,12 @@ const WR_ID_CREDIT_FLAG: u64 = 1 << 63;
 const WR_ID_PADDING_SENTINEL: u64 = u64::MAX - 20;
 
 // ---------------------------------------------------------------------------
-// RingConfig
+// CreditRingConfig
 // ---------------------------------------------------------------------------
 
-/// Configuration for creating an [`RdmaRingTransport`].
+/// Configuration for creating an [`CreditRingTransport`].
 #[derive(Debug, Clone)]
-pub struct RingConfig {
+pub struct CreditRingConfig {
     /// Ring buffer capacity in bytes (each direction).
     pub ring_capacity: usize,
     /// Maximum message size in bytes.
@@ -76,7 +76,7 @@ pub struct RingConfig {
     pub max_inline_data: u32,
 }
 
-impl RingConfig {
+impl CreditRingConfig {
     /// Configuration tuned for datagram-style workloads.
     pub fn datagram() -> Self {
         Self {
@@ -88,7 +88,7 @@ impl RingConfig {
     }
 }
 
-impl Default for RingConfig {
+impl Default for CreditRingConfig {
     fn default() -> Self {
         Self::datagram()
     }
@@ -269,7 +269,7 @@ impl CompletionTracker {
 }
 
 // ---------------------------------------------------------------------------
-// RdmaRingTransport
+// CreditRingTransport
 // ---------------------------------------------------------------------------
 
 /// Ring-buffer RDMA transport using RDMA Write + Memory Windows.
@@ -277,7 +277,7 @@ impl CompletionTracker {
 /// Field ordering is critical: Rust drops fields in declaration order.
 /// MW must be dropped before QP (invalidation needs a live QP).
 /// QP must be dropped before ring MRs. CM resources drop last.
-pub struct RdmaRingTransport {
+pub struct CreditRingTransport {
     // -- CQ poll state --
     send_cq_state: CqPollState,
     recv_cq_state: CqPollState,
@@ -331,7 +331,7 @@ pub struct RdmaRingTransport {
     send_tracker: CompletionTracker,
 
     // -- Config --
-    config: RingConfig,
+    config: CreditRingConfig,
 
     // -- CM resources (drop last) --
     _pd: Arc<ProtectionDomain>,
@@ -340,12 +340,12 @@ pub struct RdmaRingTransport {
     event_channel: EventChannel,
 }
 
-impl RdmaRingTransport {
+impl CreditRingTransport {
     /// Connect to a remote RDMA endpoint (client side).
     ///
     /// Performs CM address/route resolution, allocates ring buffers and MW,
     /// exchanges ring tokens with the peer, and returns a ready transport.
-    pub async fn connect(addr: &SocketAddr, config: RingConfig) -> crate::Result<Self> {
+    pub async fn connect(addr: &SocketAddr, config: CreditRingConfig) -> crate::Result<Self> {
         // Ring transport requires InfiniBand/RoCE — iWARP doesn't support MW Type 2.
         if crate::device::any_device_is_iwarp() {
             return Err(crate::Error::InvalidArg(
@@ -441,7 +441,7 @@ impl RdmaRingTransport {
     ///
     /// Waits for an incoming connection request, allocates ring buffers and MW,
     /// exchanges ring tokens with the peer, and returns a ready transport.
-    pub async fn accept(listener: &AsyncCmListener, config: RingConfig) -> crate::Result<Self> {
+    pub async fn accept(listener: &AsyncCmListener, config: CreditRingConfig) -> crate::Result<Self> {
         // Ring transport requires InfiniBand/RoCE — iWARP doesn't support MW Type 2.
         if crate::device::any_device_is_iwarp() {
             return Err(crate::Error::InvalidArg(
@@ -548,7 +548,7 @@ impl RdmaRingTransport {
         remote_rkey: u32,
         remote_capacity: usize,
         max_outstanding: usize,
-        config: RingConfig,
+        config: CreditRingConfig,
     ) -> Self {
         let ring_capacity = config.ring_capacity;
         Self {
@@ -719,7 +719,7 @@ impl RdmaRingTransport {
     }
 }
 
-impl Transport for RdmaRingTransport {
+impl Transport for CreditRingTransport {
     /// Copy data into the send ring and post an RDMA Write + Immediate Data.
     ///
     /// Returns the number of bytes accepted (up to `max_message_size`), or
@@ -1126,7 +1126,7 @@ impl Transport for RdmaRingTransport {
     }
 }
 
-impl Drop for RdmaRingTransport {
+impl Drop for CreditRingTransport {
     fn drop(&mut self) {
         if !self.disconnected {
             let _ = self.cm_id.disconnect();
@@ -1160,7 +1160,7 @@ fn bind_recv_mw(
     qp: &AsyncQp,
     pd: &Arc<ProtectionDomain>,
     recv_mr: &OwnedMemoryRegion,
-    config: &RingConfig,
+    config: &CreditRingConfig,
 ) -> crate::Result<(MemoryWindow, u32)> {
     assert!(
         crate::device::supports_mw_type2(pd),
@@ -1211,7 +1211,7 @@ async fn complete_token_exchange(
     recv_mr: &OwnedMemoryRegion,
     mw_rkey: u32,
     token_recv_mr: &OwnedMemoryRegion,
-    config: &RingConfig,
+    config: &CreditRingConfig,
 ) -> crate::Result<(u64, u32, usize)> {
     // Send our token.
     let our_token = RingToken {
@@ -1311,14 +1311,14 @@ fn is_qp_dead(qp: *mut rdma_io_sys::ibverbs::ibv_qp) -> bool {
     }
 }
 
-impl TransportBuilder for RingConfig {
-    type Transport = RdmaRingTransport;
+impl TransportBuilder for CreditRingConfig {
+    type Transport = CreditRingTransport;
 
-    async fn connect(&self, addr: &SocketAddr) -> crate::Result<RdmaRingTransport> {
-        RdmaRingTransport::connect(addr, self.clone()).await
+    async fn connect(&self, addr: &SocketAddr) -> crate::Result<CreditRingTransport> {
+        CreditRingTransport::connect(addr, self.clone()).await
     }
 
-    async fn accept(&self, listener: &AsyncCmListener) -> crate::Result<RdmaRingTransport> {
-        RdmaRingTransport::accept(listener, self.clone()).await
+    async fn accept(&self, listener: &AsyncCmListener) -> crate::Result<CreditRingTransport> {
+        CreditRingTransport::accept(listener, self.clone()).await
     }
 }

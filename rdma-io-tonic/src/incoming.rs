@@ -16,22 +16,22 @@ use crate::stream::TokioRdmaStream;
 /// A [`Stream`] of incoming RDMA connections for use with
 /// [`tonic::transport::Server::serve_with_incoming`].
 ///
-/// Generic over the transport builder — use [`TransportConfig`] for Send/Recv
-/// or [`RingConfig`] for ring buffer transport.
+/// Generic over the transport builder — use [`SendRecvConfig`] for Send/Recv
+/// or [`CreditRingConfig`] for ring buffer transport.
 ///
-/// [`TransportConfig`]: rdma_io::rdma_transport::TransportConfig
-/// [`RingConfig`]: rdma_io::rdma_ring_transport::RingConfig
+/// [`SendRecvConfig`]: rdma_io::send_recv_transport::SendRecvConfig
+/// [`CreditRingConfig`]: rdma_io::credit_ring_transport::CreditRingConfig
 ///
 /// # Example
 ///
 /// ```no_run
-/// use rdma_io::rdma_transport::TransportConfig;
+/// use rdma_io::send_recv_transport::SendRecvConfig;
 /// use rdma_io_tonic::RdmaIncoming;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let incoming = RdmaIncoming::bind(
 ///     &"0.0.0.0:50051".parse().unwrap(),
-///     TransportConfig::stream(),
+///     SendRecvConfig::stream(),
 /// )?;
 /// // Server::builder().add_service(svc).serve_with_incoming(incoming).await?;
 /// # Ok(())

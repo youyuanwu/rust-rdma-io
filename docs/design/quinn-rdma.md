@@ -76,7 +76,7 @@ pub struct RdmaUdpPoller<B: TransportBuilder> {
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
 | Crate | `rdma-io-quinn` (separate) | Quinn dependency isolated from core `rdma-io` |
-| Generic | `RdmaUdpSocket<B: TransportBuilder>` | User chooses Send/Recv (`TransportConfig`) or Ring (`RingConfig`) at construction |
+| Generic | `RdmaUdpSocket<B: TransportBuilder>` | User chooses Send/Recv (`SendRecvConfig`) or Ring (`CreditRingConfig`) at construction |
 | Connection map | `Arc<RwLock<HashMap>>` | `&self` API requires interior mutability; RwLock for read-heavy access |
 | Accept | Builder's `accept()` in boxed future | TransportBuilder provides the accept logic; listener stashes interleaved ConnectRequests |
 | try_send | Drain send CQ first (noop waker) | Prevents send buffer exhaustion; `send_copy` returns 0 → WouldBlock |
@@ -131,7 +131,7 @@ pub struct RdmaUdpPoller<B: TransportBuilder> {
 ```
 
 **Server:** `poll_recv` → `poll_get_request` → accept future → insert  
-**Client:** `poll_send` to unknown addr → `RdmaTransport::connect()` → lazy connect
+**Client:** `poll_send` to unknown addr → `SendRecvTransport::connect()` → lazy connect
 
 ## Comparison with msquic
 
@@ -205,7 +205,7 @@ gRPC over HTTP/3 over QUIC over RDMA — the full stack works via `tonic-h3` (v0
 | 5 | **SRQ (Shared Receive Queue)** — pool recv buffers across QPs | 20 peers: 1280 → ~128 buffers (10× memory saving) |
 | 6 | **Inline data for small packets** — `max_inline_data = 64` | QUIC packets ≤64B skip PCIe DMA; lower latency |
 | 7 | **UD QP mode** — single QP for all peers | Eliminates per-peer QP overhead; true UDP semantics |
-| 8 | **Ring buffer transport** — `RdmaRingTransport` via `Transport` trait | One fewer copy on receiver; higher throughput |
+| 8 | **Ring buffer transport** — `CreditRingTransport` via `Transport` trait | One fewer copy on receiver; higher throughput |
 
 ## References
 

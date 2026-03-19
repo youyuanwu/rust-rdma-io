@@ -2,7 +2,7 @@
 
 **Status:** Implemented  
 **Updated:** 2026-03-15  
-**Implementation:** `rdma-io/src/rdma_ring_transport.rs`  
+**Implementation:** `rdma-io/src/credit_ring_transport.rs`  
 **Reference:** [rdma-transport-layer.md](rdma-transport-layer.md) — Transport architecture  
 **Reference:** [rdma-transport-comparison.md](rdma-transport-comparison.md) — Three-way comparison  
 **Reference:** [msquic-rdma.md](../background/msquic-rdma.md) — msquic Write+Ring analysis  
@@ -10,20 +10,20 @@
 
 ## Overview
 
-`RdmaRingTransport` implements the `Transport` trait using RDMA Write + Immediate Data
+`CreditRingTransport` implements the `Transport` trait using RDMA Write + Immediate Data
 instead of Send/Recv — the same approach as msquic and rsocket. Since `AsyncRdmaStream<T>` is
 generic over `T: Transport`, it is a **drop-in replacement**:
 
 ```rust
-use rdma_io::rdma_ring_transport::RingConfig;
+use rdma_io::credit_ring_transport::CreditRingConfig;
 use rdma_io::transport::TransportBuilder;
 
 // Via TransportBuilder (recommended)
-let transport = RingConfig::default().connect(&addr).await?;
+let transport = CreditRingConfig::default().connect(&addr).await?;
 let stream = AsyncRdmaStream::new(transport);  // same interface, different engine
 
 // Or directly
-let transport = RdmaRingTransport::connect(&addr, RingConfig::default()).await?;
+let transport = CreditRingTransport::connect(&addr, CreditRingConfig::default()).await?;
 let stream = AsyncRdmaStream::new(transport);
 ```
 
@@ -32,7 +32,7 @@ let stream = AsyncRdmaStream::new(transport);
 
 ## Architecture
 
-| Operation | `RdmaTransport` (Send/Recv) | `RdmaRingTransport` (Write+Ring) |
+| Operation | `SendRecvTransport` (Send/Recv) | `CreditRingTransport` (Write+Ring) |
 |-----------|---------------------------|----------------------------------|
 | `send_copy()` | Copy → send buf, `post_send(SEND)` | Check credit → copy → send_ring, `post_send(WRITE_WITH_IMM)` |
 | `poll_recv()` | Poll RecvCQ → `RecvCompletion` | Poll RecvCQ for doorbells, decode imm → virtual `RecvCompletion` |
@@ -186,7 +186,7 @@ Token exchange uses Send/Recv to share ring metadata. The 20-byte `RingToken`
 Recv, not by a 4-byte doorbell buffer. Doorbell Recv WRs are posted AFTER token exchange.
 
 **Async wait:** `complete_token_exchange` uses `AsyncCq::poll().await` on the recv CQ
-for the token arrival, with a configurable timeout (default 5s via `RingConfig::token_timeout`).
+for the token arrival, with a configurable timeout (default 5s via `CreditRingConfig::token_timeout`).
 
 **Multi-connection support:** When multiple clients connect to the same listener
 concurrently, `ConnectRequest` events can interleave with `Established` events on the
@@ -215,21 +215,21 @@ drain the stash before polling the event channel.
 
 ## TransportBuilder Integration
 
-`RingConfig` implements `TransportBuilder`, enabling generic usage across the stack:
+`CreditRingConfig` implements `TransportBuilder`, enabling generic usage across the stack:
 
 ```rust
-use rdma_io::rdma_ring_transport::RingConfig;
+use rdma_io::credit_ring_transport::CreditRingConfig;
 
 // tonic gRPC server + client
-let incoming = RdmaIncoming::bind(&addr, RingConfig::default())?;
-let connector = RdmaConnector::new(RingConfig::default());
+let incoming = RdmaIncoming::bind(&addr, CreditRingConfig::default())?;
+let connector = RdmaConnector::new(CreditRingConfig::default());
 
 // Quinn QUIC socket
-let socket = RdmaUdpSocket::bind(&addr, RingConfig::datagram())?;
+let socket = RdmaUdpSocket::bind(&addr, CreditRingConfig::datagram())?;
 
 // Generic test helper
 async fn echo_test<B: TransportBuilder>(builder: B) { ... }
-echo_test(RingConfig::default()).await;
+echo_test(CreditRingConfig::default()).await;
 ```
 
 ## Drop Safety
@@ -270,7 +270,7 @@ CQs before fields are dropped, ensuring all in-flight WRs release MR references:
 ## Trade-offs
 
 ```
-                     RdmaTransport              RdmaRingTransport
+                     SendRecvTransport              CreditRingTransport
                      (Send/Recv)                (Write+Ring)
                 ┌────────────────────┐    ┌────────────────────────┐
   Simplicity    │ ████████████████   │    │ ███                    │
@@ -284,8 +284,8 @@ CQs before fields are dropped, ensuring all in-flight WRs release MR references:
   iWARP         │ ████████████████   │    │ ██ (see below)         │
                 └────────────────────┘    └────────────────────────┘
 
-  Use RdmaTransport:     byte streams (gRPC), iWARP/siw, many peers
-  Use RdmaRingTransport: QUIC datagrams, bulk transfer, InfiniBand/RoCE, few peers
+  Use SendRecvTransport:     byte streams (gRPC), iWARP/siw, many peers
+  Use CreditRingTransport: QUIC datagrams, bulk transfer, InfiniBand/RoCE, few peers
 ```
 
 ## Known Limitations
@@ -296,7 +296,7 @@ CQs before fields are dropped, ensuring all in-flight WRs release MR references:
   clear `ibv_alloc_mw` failure message.
 
 - **Stream HOL blocking.** `AsyncRdmaStream` partial reads pin the ring head, blocking
-  all subsequent messages. Prefer `RdmaTransport` (Send/Recv) for byte streams.
+  all subsequent messages. Prefer `SendRecvTransport` (Send/Recv) for byte streams.
 
 - **No credit keepalive.** If the receiver stops consuming, the sender stalls at
   `remote_credits == 0` indefinitely. Relies on application-level timeouts (e.g. Quinn's
@@ -309,10 +309,10 @@ CQs before fields are dropped, ensuring all in-flight WRs release MR references:
   64 KiB (65536) overflows by 1 byte. Large-ring mode is deferred.
 
 - **No iWARP support.** `connect()`/`accept()` return `Err` on iWARP devices. Callers
-  should fall back to `RdmaTransport`. Tests use `require_no_iwarp!()` macro.
+  should fall back to `SendRecvTransport`. Tests use `require_no_iwarp!()` macro.
 
 - **`repost_recv` ordering.** Out-of-order repost delays ring head advancement (unlike
-  `RdmaTransport` where buffers are independent). Consumers holding recv buffers longer
+  `SendRecvTransport` where buffers are independent). Consumers holding recv buffers longer
   have different costs per transport.
 
 ## Implementation Notes
@@ -352,7 +352,7 @@ CQs before fields are dropped, ensuring all in-flight WRs release MR references:
 
 | File | Description |
 |------|-------------|
-| `rdma-io/src/rdma_ring_transport.rs` | Full implementation (~1300 lines) |
+| `rdma-io/src/credit_ring_transport.rs` | Full implementation (~1300 lines) |
 | `rdma-io/src/transport.rs` | `Transport` + `TransportBuilder` traits |
 | `rdma-io/src/mw.rs` | `MemoryWindow` RAII wrapper |
 | `rdma-io/src/wr.rs` | `SendWr`, `RecvWr`, `WrOpcode` (includes `SendWithImm`, `BindMw`) |
@@ -364,6 +364,9 @@ CQs before fields are dropped, ensuring all in-flight WRs release MR references:
 
 ## Future Work
 
+- **`ReadRingTransport` sibling.** A sibling transport using RDMA Read for flow control
+  (msquic-style) will share ~80% of the ring infrastructure. See
+  [RingPerformance.md](../future/RingPerformance.md) for the transport family design.
 - **Credit keepalive**: Periodic 0-byte probe to detect hung peers.
 - **Credit batching**: Send credit updates every N reposts to reduce WR overhead.
 - **Large ring mode**: Length-only immediate encoding + RDMA Read for >64KB rings.

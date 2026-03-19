@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use rdma_io::async_cm::AsyncCmListener;
-use rdma_io::rdma_transport::TransportConfig;
+use rdma_io::send_recv_transport::SendRecvConfig;
 use rdma_io_quinn::RdmaUdpSocket;
 use rdma_io_tonic::RdmaIncoming;
 use tonic::transport::Server;
@@ -69,7 +69,7 @@ async fn run_tls_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = AsyncCmListener::bind(&args.bind)?;
     let local_addr = listener.local_addr();
-    let incoming = RdmaIncoming::new(listener, TransportConfig::stream());
+    let incoming = RdmaIncoming::new(listener, SendRecvConfig::stream());
     let tls_incoming = tonic_tls::openssl::TlsIncoming::new(incoming, acceptor);
 
     eprintln!("Benchmark server listening on {:?} (mode=tls)", local_addr);
@@ -88,7 +88,7 @@ async fn run_h3_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
 
     let socket = Arc::new(
-        RdmaUdpSocket::bind(&args.bind, TransportConfig::datagram()).expect("bind RDMA UDP socket"),
+        RdmaUdpSocket::bind(&args.bind, SendRecvConfig::datagram()).expect("bind RDMA UDP socket"),
     );
     let bound_addr = socket.bound_addr();
 

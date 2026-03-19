@@ -11,8 +11,8 @@ data over RDMA. We implement **two** — selectable via `TransportBuilder` at co
 
 | | **rust-rdma-io Send/Recv** | **rust-rdma-io Ring** | **msquic RDMA (PR #5113)** | **rsocket (librdmacm)** |
 |---|---|---|---|---|
-| **Type** | `RdmaTransport` | `RdmaRingTransport` | N/A (C) | N/A (C) |
-| **Builder** | `TransportConfig` | `RingConfig` | — | — |
+| **Type** | `SendRecvTransport` | `CreditRingTransport` | N/A (C) | N/A (C) |
+| **Builder** | `SendRecvConfig` | `CreditRingConfig` | — | — |
 | **Purpose** | Byte stream (gRPC) + Datagram (QUIC) | Datagram (QUIC) + Bulk transfer | QUIC packet delivery | POSIX socket drop-in |
 | **Platform** | Linux (ibverbs / rdma_cm) | Linux (ibverbs / rdma_cm) | Windows (NDSPI / MANA) | Linux (ibverbs / rdma_cm) |
 | **Code size** | ~500 lines | ~1300 lines | ~6000 lines | ~3400 lines |
@@ -21,18 +21,18 @@ data over RDMA. We implement **two** — selectable via `TransportBuilder` at co
 
 ```rust
 // User selects transport at construction time — consumers are generic
-use rdma_io::rdma_transport::TransportConfig;
-use rdma_io::rdma_ring_transport::RingConfig;
+use rdma_io::send_recv_transport::SendRecvConfig;
+use rdma_io::credit_ring_transport::CreditRingConfig;
 
-let incoming = RdmaIncoming::bind(&addr, TransportConfig::stream())?;  // Send/Recv
-let incoming = RdmaIncoming::bind(&addr, RingConfig::default())?;      // Write+Ring
+let incoming = RdmaIncoming::bind(&addr, SendRecvConfig::stream())?;  // Send/Recv
+let incoming = RdmaIncoming::bind(&addr, CreditRingConfig::default())?;      // Write+Ring
 ```
 
 ## Data Transfer Verb
 
 The most fundamental design choice: how data moves between peers.
 
-### Send/Recv (Two-Sided) — `RdmaTransport`
+### Send/Recv (Two-Sided) — `SendRecvTransport`
 
 ```
 Sender:                          Receiver:
@@ -46,7 +46,7 @@ Sender:                          Receiver:
 **How it works:** Both sides participate. Sender posts a Send WQE, receiver pre-posts a Recv WQE.
 The HCA matches them — sender's data lands in the next available recv buffer.
 
-### RDMA Write + Ring Buffer (One-Sided) — `RdmaRingTransport`, msquic, rsocket
+### RDMA Write + Ring Buffer (One-Sided) — `CreditRingTransport`, msquic, rsocket
 
 ```
 Sender:                          Receiver:
@@ -77,7 +77,7 @@ The receiver is notified via Immediate Data in the RecvCQ.
 
 All three ring implementations (ours, msquic, rsocket) differ in details.
 
-### Our Ring Buffer (`RdmaRingTransport`)
+### Our Ring Buffer (`CreditRingTransport`)
 
 ```
 ┌────────────────────────┬────────────────────────┐
@@ -135,7 +135,7 @@ All three ring implementations (ours, msquic, rsocket) differ in details.
 - **Overlapped send sizing:** Starts at 2KB, doubles per iteration up to 64KB (RS_MAX_TRANSFER)
 - **iWARP adaptation:** Detects `IBV_TRANSPORT_IWARP`, uses Send + Write (2 WRs per message) instead of Write-With-Immediate
 
-### Send/Recv (`RdmaTransport`) — No Ring
+### Send/Recv (`SendRecvTransport`) — No Ring
 
 ```
 Pre-posted recv buffers (independent):
@@ -261,13 +261,13 @@ On credit exhaustion:
 
 | Workload | Best Design | Why |
 |----------|------------|-----|
-| **Small packets (QUIC, RPC)** | `TransportConfig` (Send/Recv) | Minimal overhead; extra copy negligible at 1.2KB |
-| **Bulk streaming (large files)** | `RingConfig` (Write+Ring) | One fewer copy matters at high throughput; ring absorbs bursts |
-| **Many peers (microservices)** | `TransportConfig` (Send/Recv) | No per-peer ring memory; simpler teardown |
-| **iWARP / siw / all hardware** | `TransportConfig` (Send/Recv) | Works on IB, RoCE, iWARP, siw, rxe without adaptation |
-| **Latency-sensitive** | `TransportConfig` (Send/Recv) | Fewer protocol states; no token exchange latency |
-| **InfiniBand/RoCE bulk** | `RingConfig` (Write+Ring) | Credit flow + ring buffer maximizes NIC pipeline |
-| **Memory-constrained** | `TransportConfig` (Send/Recv) | Per-connection buffers scale with actual recv count |
+| **Small packets (QUIC, RPC)** | `SendRecvConfig` (Send/Recv) | Minimal overhead; extra copy negligible at 1.2KB |
+| **Bulk streaming (large files)** | `CreditRingConfig` (Write+Ring) | One fewer copy matters at high throughput; ring absorbs bursts |
+| **Many peers (microservices)** | `SendRecvConfig` (Send/Recv) | No per-peer ring memory; simpler teardown |
+| **iWARP / siw / all hardware** | `SendRecvConfig` (Send/Recv) | Works on IB, RoCE, iWARP, siw, rxe without adaptation |
+| **Latency-sensitive** | `SendRecvConfig` (Send/Recv) | Fewer protocol states; no token exchange latency |
+| **InfiniBand/RoCE bulk** | `CreditRingConfig` (Write+Ring) | Credit flow + ring buffer maximizes NIC pipeline |
+| **Memory-constrained** | `SendRecvConfig` (Send/Recv) | Per-connection buffers scale with actual recv count |
 | **Drop-in legacy (POSIX)** | rsocket | Socket API compatibility; transparent to applications |
 
 ## Summary

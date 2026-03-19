@@ -1,21 +1,52 @@
-# Ring Transport Performance Improvements
+# Ring Transport Family — Performance & Architecture
 
 **Status:** Future work  
-**Date:** 2026-03-15  
-**Implementation:** `rdma-io/src/rdma_ring_transport.rs`  
+**Date:** 2026-03-19  
+**Implementation:** `rdma-io/src/credit_ring_transport.rs` (current: credit-based)  
 **Prerequisite:** [rdma-ring-transport.md](../design/rdma-ring-transport.md) — current design
+
+## Transport Family Overview
+
+All Write+Ring transports share the same data path (`memcpy` → `ibv_post_send(WRITE_WITH_IMM)`)
+but differ in **flow control**. Rather than optimizing one transport for all workloads, we
+provide two sibling implementations behind the same `Transport` trait:
+
+| Transport | Flow Control | Rename |
+|-----------|-------------|--------|
+| `CreditRingTransport` | Receiver pushes credits (SendWithImm) | Current `CreditRingTransport` |
+| `ReadRingTransport` | Sender polls remote head (RDMA Read) | New — msquic approach |
+
+Both share ~80% of the code: ring buffers, token exchange, doorbell recv, imm encoding,
+MW binding, virtual buffer index mapping. They differ only in `repost_recv` (receiver side)
+and the sender's space-check path.
+
+```rust
+// User selects transport by config — same AsyncRdmaStream<T> interface
+let stream = AsyncRdmaStream::new(CreditRingConfig::default().connect(&addr).await?);
+let stream = AsyncRdmaStream::new(ReadRingConfig::default().connect(&addr).await?);
+```
+
+See [rdma-transport-layer.md](../design/rdma-transport-layer.md#transport-naming-convention-planned)
+for the full naming convention (including `SendRecvTransport` rename).
+
+### When to Use Each
+
+| Scenario | Best Transport | Why |
+|----------|---------------|-----|
+| Congested ring (>70% utilization) | **Credit Ring** | Proactive push — sender learns of space immediately |
+| Backpressure-heavy workloads | **Credit Ring** | Zero-latency recovery — credit arrives, no polling needed |
+| Fan-in (many senders → one receiver) | **Credit Ring** | O(1) push per sender vs. O(N) RDMA Reads on receiver NIC |
+| Low-moderate load, CPU-sensitive | **Read Ring** | Zero receiver WRs — offset buffer write is ~1ns |
+| HFT / >5M msg/sec | **Read Ring** | Minimal NIC doorbells — 1M doorbells for 1M messages |
+| Bulk transfer (large ring, few stalls) | **Read Ring** | Reads are rare when ring rarely fills |
 
 ## Hot-Path Comparison
 
-All three Write+Ring transports (ours, msquic, rsocket) execute the same
-fundamental operation per message: `memcpy` → `ibv_post_send(WRITE_WITH_IMM)`.
-The differences are in flow control overhead and completion tracking.
-
 ### Per-Message Send (Hot Path)
 
-| Step | Our Ring | msquic | rsocket |
-|------|---------|--------|---------|
-| Credit/space check | 1 compare (`remote_credits`) | 1 compare (ring free space) | 1 compare (`sseq_no < limit`) |
+| Step | Credit Ring | Read Ring (msquic) | rsocket |
+|------|------------|-------------------|---------|
+| Space check | 1 compare (`remote_credits`) | 1 compare (`cached_remote_head` vs tail) | 1 compare (`sseq_no < limit`) |
 | Copy to ring | `memcpy` → send_ring | `memcpy` → send ring | `memcpy` → sbuf |
 | Post WR | 1 `ibv_post_send(WRITE_WITH_IMM)` | 1 `ibv_post_send(WRITE_WITH_IMM)` | 1–2 WRs (iWARP needs 2) |
 | **Total copies** | **1** | **1** | **1** |
@@ -23,20 +54,24 @@ The differences are in flow control overhead and completion tracking.
 
 ### Per-Message Recv (Overhead Comparison)
 
-| Step | Our Ring | msquic | rsocket |
-|------|---------|--------|---------|
-| CQ poll | `ibv_poll_cq` | IOCP callback | `rpoll` |
+| Step | Credit Ring | Read Ring (msquic) | rsocket |
+|------|------------|-------------------|---------|
+| CQ poll | `ibv_poll_cq` | `ibv_poll_cq` | `rpoll` |
 | Decode imm | Shift + mask | Shift + mask | Shift + mask |
 | Repost doorbell | 1 `ibv_post_recv` (4 bytes) | 1 `ibv_post_recv` (4 bytes) | — |
-| **Credit update** | **1 `ibv_post_send(SendWithImm)`** | **None (local write)** | **1 `ibv_post_send(Write)` per batch** |
-| Completion tracking | Direct head advance | Hash table lookup | Sequence compare |
-| Lock contention | None (`&mut self`) | Per-connection mutex | Global lock |
+| **Flow control** | **1 `ibv_post_send(SendWithImm)`** | **1 `u32` store (~1ns)** | **1 `ibv_post_send(Write)` per batch** |
+| Completion tracking | Direct head advance | Direct head advance | Sequence compare |
+| Lock contention | None (`&mut self`) | None (`&mut self`) | Global lock |
 
-**Key gap:** Our receiver posts a Send+Imm WR for every `repost_recv()`. msquic
-posts zero WRs — it just writes to a local offset buffer that the sender reads
-on demand.
+**Key difference:** Credit Ring receiver posts a Send+Imm WR per `repost_recv()`.
+Read Ring receiver writes a `u32` to a local offset buffer — the sender reads it
+on demand via RDMA Read.
 
-## Improvement 1: Credit Batching
+## `CreditRingTransport` Improvements
+
+The following improvements apply to `CreditRingTransport` specifically.
+
+### Credit Batching
 
 **Impact:** High — reduces credit WR count by N×  
 **Complexity:** Low  
@@ -86,7 +121,7 @@ buffers returned).
 ### Config
 
 ```rust
-pub struct RingConfig {
+pub struct CreditRingConfig {
     pub ring_capacity: usize,
     pub max_message_size: usize,
     pub token_timeout: Duration,
@@ -95,13 +130,16 @@ pub struct RingConfig {
 }
 ```
 
-## Improvement 2: RDMA Read Direct Space Check (msquic approach)
+## `ReadRingTransport` — RDMA Read Flow Control
 
-**Impact:** Eliminates all credit WRs  
-**Complexity:** High  
-**Priority:** P2 (only if credit batching is insufficient)
+**Status:** Separate transport (sibling to Credit Ring)  
+**Complexity:** Medium — ~300 new lines + shared ring infrastructure  
+**Priority:** P2 (implement after Credit Ring is production-validated)
 
-msquic avoids credit messages entirely. Instead:
+The Read Ring transport eliminates all credit WRs by using RDMA Read for flow
+control, following the msquic approach.
+
+### Design
 
 1. Each side allocates a 4-byte "offset buffer" MR containing the current ring head
 2. Token exchange includes the offset buffer's VA + rkey (token grows 20 → 28 bytes)
@@ -128,29 +166,52 @@ msquic avoids credit messages entirely. Instead:
     │                                   │    (no WR posted)
 ```
 
-### Advantages Over Credit Batching
+### Credit Ring vs. Read Ring
 
-| Aspect | Credit Batching | RDMA Read Check |
-|--------|----------------|----------------|
+| Aspect | Credit Ring (batched, N=8) | Read Ring |
+|--------|--------------------------|-----------|
 | Receiver WRs per msg | 1/N | **0** |
 | Sender WRs per msg | 1 | 1 (+ occasional Read) |
-| Total WRs at 1M msg/s (N=8) | 1.125M | ~1.001M |
-| Backpressure latency | Wait for credit Send RTT | Wait for Read RTT |
+| Total WRs at 1M msg/s | 1.125M | ~1.001M |
+| Backpressure recovery | **Immediate** (credit pushed) | RTT delay (must Read) |
+| Fan-in (N senders) | **O(1) push** per sender | O(N) Reads on receiver NIC |
+| Near-full ring (>70%) | **Proactive** — no stalls | Frequent Reads + RTT stalls |
+| Low-load ring (<30%) | Credit WRs wasted | **Reads near-zero** |
 | Self-healing on loss | ✅ (absolute encoding) | ✅ (Read always gets latest) |
-| Complexity | Low | High |
+| Complexity | Low | Medium |
 
-### Implementation Cost
+**Key insight:** Credit Ring wins under congestion (proactive push, no polling).
+Read Ring wins under low load (zero receiver WRs when Reads are rare).
+
+### Crossover Model
+
+```
+Credit batch WRs = send_rate / N   (e.g., 125K/s at 1M msg/s, N=8)
+RDMA Read WRs   ≈ send_rate × f(ring_utilization)
+
+Crossover: at ~70% ring utilization with small rings, Read frequency
+exceeds credit batch frequency. Above this, Credit Ring has fewer total
+WRs AND avoids RTT stalls on the sender hot path.
+```
+
+### Implementation
+
+New files/changes needed beyond shared ring infrastructure:
 
 | Component | Effort |
 |-----------|--------|
+| `ReadRingTransport` struct | Small — mirrors Credit Ring, minus credit fields |
 | Offset buffer MR (per side) | Small — 4-byte MR, register + share in token |
-| Token expansion (20 → 28 bytes) | Small — add 2 fields (offset_va, offset_rkey) |
+| Token expansion (20 → 28 bytes) | Small — add `offset_va` + `offset_rkey` fields |
+| `ReadRingConfig` + `TransportBuilder` impl | Small — mirrors `CreditRingConfig` |
 | RDMA Read WR posting | Medium — new `WrOpcode::RdmaRead` path, async completion wait |
-| Read/Write race handling | Medium — sender may read stale head; must handle gracefully |
-| Remove credit Send+Imm path | Medium — remove from `repost_recv`, `drain_recv_credits`, `poll_recv` |
-| MW for offset buffer | Small — bind separate MW for the 4-byte offset MR |
+| `repost_recv` (no credit WR) | Small — advance head + write offset buffer + repost doorbell |
+| `send_copy` space check (Read path) | Medium — cache remote head, RDMA Read on backpressure |
 
-**Total: ~200-300 lines changed, moderate risk (race conditions).**
+**Shared code** (extracted from current `CreditRingTransport`): ring buffers, imm encoding,
+token exchange, MW binding, virtual buffer mapping, doorbell recv, send path (Write+Imm).
+
+**Total: ~300 new lines for Read Ring + ~200 lines refactored into shared module.**
 
 ### Race Condition
 
@@ -168,7 +229,11 @@ means it does another Read sooner than necessary. No correctness issue.
 The dangerous race (sender sees head AHEAD of actual) can't happen because the
 receiver only advances the head, never moves it backward.
 
-## Improvement 3: Inline Small Messages
+## Shared Improvements (Both Transports)
+
+The following improvements apply to both Credit Ring and Read Ring transports.
+
+### Inline Small Messages
 
 **Impact:** Medium — saves PCIe DMA for small payloads  
 **Complexity:** Low  
@@ -193,10 +258,10 @@ let wr = if data_len <= config.max_inline_data as usize {
 **Threshold:** Typical `max_inline_data` is 64–256 bytes depending on HCA.
 QUIC short headers are ~20-40 bytes. ACKs and small control packets benefit most.
 
-**Config:** Already exists — `RingConfig::max_inline_data` (default 0). Just
+**Config:** Already exists — `CreditRingConfig::max_inline_data` (default 0). Just
 needs to be wired into the send path.
 
-## Improvement 4: Selective Signaling
+### Selective Signaling
 
 **Impact:** Medium — reduces send CQ polling overhead  
 **Complexity:** Medium  
@@ -215,10 +280,10 @@ CQ polls:                           ^                                   ^
 Currently wr_id encodes bytes-to-release — with selective signaling, the
 signaled WR must release ALL preceding unsignaled WRs' space.
 
-**Prerequisite:** Selective signaling is orthogonal to credit mechanism. Can be
-combined with either credit batching or RDMA Read approach.
+**Prerequisite:** Selective signaling is orthogonal to flow control. Can be
+applied to both Credit Ring and Read Ring transports.
 
-## Improvement 5: SRQ (Shared Receive Queue) for Doorbells
+### SRQ (Shared Receive Queue) for Doorbells
 
 **Impact:** High for many-peer scenarios  
 **Complexity:** Medium  
@@ -242,8 +307,8 @@ SRQ:      Shared: [d0][d1]...[d63]                              = 64 recv WRs
                   Impact
                     ▲
                     │
-   Credit Batch ●   │           ● RDMA Read Check
-   (P0, Low)        │           (P2, High)
+   Credit Batch ●   │           ● Read Ring Transport
+   (P0, Low)        │           (P2, Medium)
                     │
    Inline Small ●   │   ● Selective Signaling
    (P1, Low)        │   (P2, Medium)
@@ -255,20 +320,20 @@ SRQ:      Shared: [d0][d1]...[d63]                              = 64 recv WRs
 ```
 
 **Recommended order:**
-1. **Credit batching** — biggest bang for the buck, simple change
-2. **Inline small messages** — wire existing config field into send path
-3. **Selective signaling** — reduces CQ overhead, moderate complexity
-4. **RDMA Read check** — only if profiling shows credits are still a bottleneck
-5. **SRQ doorbells** — only for many-peer scenarios
+1. **Credit batching** — biggest bang for the buck, simple change to Credit Ring
+2. **Inline small messages** — wire existing config field into send path (both transports)
+3. **Selective signaling** — reduces CQ overhead (both transports)
+4. **Read Ring transport** — extract shared ring code, implement RDMA Read flow control
+5. **SRQ doorbells** — only for many-peer scenarios (both transports)
 
-## Lowest-CPU Design: Combined Optimizations
+## Read Ring: Lowest-CPU Design
 
-Combining RDMA Read + Selective Signaling + Inline yields a design where the
-NIC does almost all the work and CPU touches are minimized:
+The Read Ring transport combined with Selective Signaling + Inline yields a design
+where the NIC does almost all the work and CPU touches are minimized:
 
 ### Per-Message CPU Cost Comparison
 
-| Work item | Current | Credit batch (N=8) | **Lowest-CPU** |
+| Work item | Credit Ring (current) | Credit Ring (batched N=8) | **Read Ring + Sel. Signal** |
 |-----------|---------|-------------------|---------------|
 | **Sender: build WR** | 1 WR | 1 WR | 1 WR |
 | **Sender: post send** | 1 `ibv_post_send` | 1 `ibv_post_send` | 1 `ibv_post_send` (INLINE for small) |
@@ -280,7 +345,7 @@ NIC does almost all the work and CPU touches are minimized:
 | **Receiver: update offset buf** | N/A | N/A | **1 `u32` store (~1ns)** |
 | **Receiver: poll credit send CQ** | 1 entry | 1/8 entry | **0** |
 
-### Architecture
+### Read Ring Architecture
 
 ```
   Sender (hot path)                       Receiver (hot path)
@@ -305,18 +370,19 @@ NIC does almost all the work and CPU touches are minimized:
 
 | Design | Sender `ibv_post_send` | Sender CQ entries | Receiver `ibv_post_send` | Receiver CQ entries | Total NIC doorbells |
 |--------|----------------------|-------------------|------------------------|--------------------|-------------------|
-| **Current** | 1M | 1M | 1M (credits) | 1M (credits) | 3M |
-| **Credit batch (N=8)** | 1M | 1M | 125K | 125K | 2.125M |
-| **Lowest-CPU** | 1M | 125K (N=8) | **0** | **0** | **1M** |
+| **Credit Ring (current)** | 1M | 1M | 1M (credits) | 1M (credits) | 3M |
+| **Credit Ring (batched N=8)** | 1M | 1M | 125K | 125K | 2.125M |
+| **Read Ring + Sel. Signal** | 1M | 125K (N=8) | **0** | **0** | **1M** |
 
-The lowest-CPU design achieves **1M NIC doorbells for 1M messages** — the
+The Read Ring design achieves **1M NIC doorbells for 1M messages** — the
 theoretical minimum (one post_send per message, everything else is either
 local memory or NIC-served).
 
 ### Receiver CPU Breakdown
 
 ```
-                    Current         Credit Batch      Lowest-CPU
+                    Credit Ring     Credit Ring        Read Ring
+                    (current)       (batched N=8)      + Sel. Signal
                     ┌─────────┐     ┌─────────┐      ┌─────────┐
   ibv_post_send     │ ████████│     │ █       │      │         │  ← eliminated
   (credit WR)       │ ~300ns  │     │ ~38ns   │      │   0ns   │
@@ -340,27 +406,28 @@ local memory or NIC-served).
 
 ### When to Use Each Tier
 
-| Tier | Design | Recv CPU/msg | Use case |
-|------|--------|-------------|----------|
-| **Simple** | Current (credit per repost) | ~550ns | Development, correctness testing |
-| **Balanced** | Credit batch (N=8) | ~200ns | Production gRPC, moderate throughput |
-| **Lowest-CPU** | RDMA Read + Sel. Signal + Inline | ~151ns | HFT, >5M msg/sec, CPU-bound workloads |
+| Tier | Transport | Recv CPU/msg | Use case |
+|------|----------|-------------|----------|
+| **Simple** | Credit Ring (unbatched) | ~550ns | Development, correctness testing |
+| **Balanced** | Credit Ring (batched N=8) | ~200ns | Production gRPC, congested rings, fan-in |
+| **Lowest-CPU** | Read Ring + Sel. Signal + Inline | ~151ns | HFT, >5M msg/sec, low-utilization rings |
 
 ### Implementation Phases
 
 ```
-  Phase 1 (P0): Credit Batching
+  Phase 1 (P0): Credit Batching [Credit Ring]
     └── Simple, ~200 lines, 63% recv CPU reduction
   
-  Phase 2 (P1): Inline Small Messages
+  Phase 2 (P1): Inline Small Messages [Both transports]
     └── Wire existing config field, ~20 lines, latency reduction for small msgs
   
-  Phase 3 (P2): Selective Signaling
+  Phase 3 (P2): Selective Signaling [Both transports]
     └── Reduce sender CQ overhead by N×, ~100 lines
   
-  Phase 4 (P2): RDMA Read Check
-    └── Eliminate all credit WRs, ~300 lines, 73% recv CPU reduction total
-    └── Requires: offset buffer MR, RDMA Read WR path, token expansion
+  Phase 4 (P2): Read Ring Transport [New transport]
+    └── Extract shared ring code (~500 lines) + Read Ring impl (~300 lines)
+    └── Requires: offset buffer MR, RDMA Read WR path, ReadRingConfig
+    └── Total recv overhead: ~151ns (73% reduction vs unbatched Credit Ring)
 ```
 
 ## Benchmarking Plan

@@ -1,8 +1,8 @@
-//! RdmaTransport — concrete [`Transport`](crate::transport::Transport) using RDMA Send/Recv.
+//! SendRecvTransport — concrete [`Transport`](crate::transport::Transport) using RDMA Send/Recv.
 //!
 //! Owns the QP, buffers, CQ state, and CM connection lifecycle. Created via
-//! [`connect`](RdmaTransport::connect) (client) or
-//! [`accept`](RdmaTransport::accept) (server).
+//! [`connect`](SendRecvTransport::connect) (client) or
+//! [`accept`](SendRecvTransport::accept) (server).
 
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
@@ -22,9 +22,9 @@ use crate::transport::{RecvCompletion, Transport, TransportBuilder};
 use crate::wc::WorkCompletion;
 use crate::wr::QpType;
 
-/// Configuration for creating an [`RdmaTransport`].
+/// Configuration for creating an [`SendRecvTransport`].
 #[derive(Debug, Clone)]
-pub struct TransportConfig {
+pub struct SendRecvConfig {
     /// Size of each buffer (send and recv).
     pub buf_size: usize,
     /// Number of pre-posted recv buffers.
@@ -37,13 +37,13 @@ pub struct TransportConfig {
     pub qp_type: QpType,
 }
 
-impl Default for TransportConfig {
+impl Default for SendRecvConfig {
     fn default() -> Self {
         Self::stream()
     }
 }
 
-impl TransportConfig {
+impl SendRecvConfig {
     /// Configuration tuned for byte stream workloads (gRPC/tonic).
     pub fn stream() -> Self {
         Self {
@@ -77,7 +77,7 @@ impl TransportConfig {
 /// 5. cm_async_fd (deregister from epoll BEFORE closing the fd)
 /// 6. cm_id (disconnect/destroy)
 /// 7. event_channel (closes the fd — must be LAST)
-pub struct RdmaTransport {
+pub struct SendRecvTransport {
     // -- State (no RDMA teardown) --
     send_cq_state: CqPollState,
     recv_cq_state: CqPollState,
@@ -86,7 +86,7 @@ pub struct RdmaTransport {
     peer_disconnected: bool,
     next_send_idx: usize,
     send_in_flight: Vec<bool>,
-    config: TransportConfig,
+    config: SendRecvConfig,
     qp_check_counter: u32,
 
     // -- RDMA data-path resources (drop: QP → MRs → PD) --
@@ -101,9 +101,9 @@ pub struct RdmaTransport {
     event_channel: EventChannel,
 }
 
-impl RdmaTransport {
+impl SendRecvTransport {
     /// Connect to a remote RDMA endpoint (client side).
-    pub async fn connect(addr: &SocketAddr, config: TransportConfig) -> crate::Result<Self> {
+    pub async fn connect(addr: &SocketAddr, config: SendRecvConfig) -> crate::Result<Self> {
         let async_cm = AsyncCmId::new(PortSpace::Tcp)?;
         async_cm.resolve_addr(None, addr, 2000).await?;
         async_cm.resolve_route(2000).await?;
@@ -149,7 +149,7 @@ impl RdmaTransport {
     /// Accept a connection from a listener (server side).
     pub async fn accept(
         listener: &AsyncCmListener,
-        config: TransportConfig,
+        config: SendRecvConfig,
     ) -> crate::Result<Self> {
         let conn_id = listener.get_request().await?;
         Self::complete_accept(conn_id, listener, config).await
@@ -162,7 +162,7 @@ impl RdmaTransport {
     pub async fn complete_accept(
         conn_id: crate::cm::CmId,
         listener: &AsyncCmListener,
-        config: TransportConfig,
+        config: SendRecvConfig,
     ) -> crate::Result<Self> {
         let ctx = conn_id
             .verbs_context()
@@ -213,7 +213,7 @@ impl RdmaTransport {
         pd: Arc<ProtectionDomain>,
         send_bufs: Vec<OwnedMemoryRegion>,
         recv_bufs: Vec<OwnedMemoryRegion>,
-        config: TransportConfig,
+        config: SendRecvConfig,
     ) -> Self {
         let num_send = config.num_send_bufs;
         Self {
@@ -264,7 +264,7 @@ impl RdmaTransport {
     }
 }
 
-impl Transport for RdmaTransport {
+impl Transport for SendRecvTransport {
     fn send_copy(&mut self, data: &[u8]) -> crate::Result<usize> {
         // Find a free send buffer (round-robin with in-flight check)
         let n = self.send_bufs.len();
@@ -415,7 +415,7 @@ impl Transport for RdmaTransport {
     }
 }
 
-impl Drop for RdmaTransport {
+impl Drop for SendRecvTransport {
     fn drop(&mut self) {
         if !self.disconnected {
             let _ = self.cm_id.disconnect();
@@ -440,7 +440,7 @@ impl Drop for RdmaTransport {
 
 // --- Helpers ---
 
-fn make_qp_attr(config: &TransportConfig) -> QpInitAttr {
+fn make_qp_attr(config: &SendRecvConfig) -> QpInitAttr {
     QpInitAttr {
         qp_type: config.qp_type,
         max_send_wr: config.num_send_bufs as u32 + 1,
@@ -454,7 +454,7 @@ fn make_qp_attr(config: &TransportConfig) -> QpInitAttr {
 
 fn alloc_buffers(
     pd: &Arc<ProtectionDomain>,
-    config: &TransportConfig,
+    config: &SendRecvConfig,
 ) -> crate::Result<(Vec<OwnedMemoryRegion>, Vec<OwnedMemoryRegion>)> {
     let access = AccessFlags::LOCAL_WRITE;
     let send_bufs = (0..config.num_send_bufs)
@@ -482,14 +482,14 @@ fn is_qp_dead(qp: *mut rdma_io_sys::ibverbs::ibv_qp) -> bool {
     }
 }
 
-impl TransportBuilder for TransportConfig {
-    type Transport = RdmaTransport;
+impl TransportBuilder for SendRecvConfig {
+    type Transport = SendRecvTransport;
 
-    async fn connect(&self, addr: &SocketAddr) -> crate::Result<RdmaTransport> {
-        RdmaTransport::connect(addr, self.clone()).await
+    async fn connect(&self, addr: &SocketAddr) -> crate::Result<SendRecvTransport> {
+        SendRecvTransport::connect(addr, self.clone()).await
     }
 
-    async fn accept(&self, listener: &AsyncCmListener) -> crate::Result<RdmaTransport> {
-        RdmaTransport::accept(listener, self.clone()).await
+    async fn accept(&self, listener: &AsyncCmListener) -> crate::Result<SendRecvTransport> {
+        SendRecvTransport::accept(listener, self.clone()).await
     }
 }

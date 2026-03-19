@@ -8,8 +8,8 @@ use std::fmt::Debug;
 use std::time::Duration;
 
 use rdma_io::async_cm::AsyncCmListener;
-use rdma_io::rdma_ring_transport::RingConfig;
-use rdma_io::rdma_transport::TransportConfig;
+use rdma_io::credit_ring_transport::CreditRingConfig;
+use rdma_io::send_recv_transport::SendRecvConfig;
 use rdma_io::transport::TransportBuilder;
 use rdma_io_tonic::{RdmaConnector, RdmaIncoming};
 
@@ -106,13 +106,13 @@ async fn greeter<B: TransportBuilder + Debug>(builder: B) {
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn greeter_default() {
-    greeter(TransportConfig::stream()).await;
+    greeter(SendRecvConfig::stream()).await;
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn greeter_ring() {
     require_no_iwarp!();
-    greeter(RingConfig::default()).await;
+    greeter(CreditRingConfig::default()).await;
 }
 
 // ===========================================================================
@@ -151,13 +151,13 @@ async fn server_stream<B: TransportBuilder + Debug>(builder: B) {
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn server_stream_default() {
-    server_stream(TransportConfig::stream()).await;
+    server_stream(SendRecvConfig::stream()).await;
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn server_stream_ring() {
     require_no_iwarp!();
-    server_stream(RingConfig::default()).await;
+    server_stream(CreditRingConfig::default()).await;
 }
 
 // ===========================================================================
@@ -196,13 +196,13 @@ async fn client_stream<B: TransportBuilder + Debug>(builder: B) {
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn client_stream_default() {
-    client_stream(TransportConfig::stream()).await;
+    client_stream(SendRecvConfig::stream()).await;
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn client_stream_ring() {
     require_no_iwarp!();
-    client_stream(RingConfig::default()).await;
+    client_stream(CreditRingConfig::default()).await;
 }
 
 // ===========================================================================
@@ -241,11 +241,11 @@ async fn bidi_stream<B: TransportBuilder + Debug>(builder: B) {
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn bidi_stream_default() {
-    bidi_stream(TransportConfig::stream()).await;
+    bidi_stream(SendRecvConfig::stream()).await;
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn bidi_stream_ring() {
     require_no_iwarp!();
-    bidi_stream(RingConfig::default()).await;
+    bidi_stream(CreditRingConfig::default()).await;
 }

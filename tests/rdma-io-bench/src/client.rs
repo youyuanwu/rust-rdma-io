@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use rdma_io::rdma_transport::TransportConfig;
+use rdma_io::send_recv_transport::SendRecvConfig;
 use rdma_io_quinn::RdmaUdpSocket;
 use rdma_io_tonic::tls::RdmaTransport;
 use tonic::transport::Endpoint;
@@ -86,7 +86,7 @@ async fn run_tls_bench(
     payload: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let ssl_connector = tls_common::build_connector(&args.cert);
-    let transport = RdmaTransport::new(TransportConfig::stream());
+    let transport = RdmaTransport::new(SendRecvConfig::stream());
 
     // Create connections
     let mut clients = Vec::with_capacity(args.connections);
@@ -198,7 +198,7 @@ async fn run_h3_bench(
     let mut clients: Vec<H3Client> = Vec::with_capacity(args.connections);
 
     for _ in 0..args.connections {
-        let client_socket = RdmaUdpSocket::bind(&bind_addr, TransportConfig::datagram())
+        let client_socket = RdmaUdpSocket::bind(&bind_addr, SendRecvConfig::datagram())
             .expect("bind client socket");
         client_socket
             .connect_to(&args.connect)

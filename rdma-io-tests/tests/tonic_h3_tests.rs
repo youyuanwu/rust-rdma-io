@@ -7,8 +7,8 @@
 use std::sync::Arc;
 
 use quinn::{Endpoint, EndpointConfig};
-use rdma_io::rdma_ring_transport::RingConfig;
-use rdma_io::rdma_transport::TransportConfig;
+use rdma_io::credit_ring_transport::CreditRingConfig;
+use rdma_io::send_recv_transport::SendRecvConfig;
 use rdma_io::transport::TransportBuilder;
 use rdma_io_quinn::RdmaUdpSocket;
 
@@ -184,13 +184,13 @@ async fn h3_unary<B: TransportBuilder>(builder: B) {
 
 #[tokio::test]
 async fn h3_unary_default() {
-    h3_unary(TransportConfig::datagram()).await;
+    h3_unary(SendRecvConfig::datagram()).await;
 }
 
 #[tokio::test]
 async fn h3_unary_ring() {
     require_no_iwarp!();
-    h3_unary(RingConfig::datagram()).await;
+    h3_unary(CreditRingConfig::datagram()).await;
 }
 
 // ===========================================================================
@@ -231,13 +231,13 @@ async fn h3_server_stream<B: TransportBuilder>(builder: B) {
 
 #[tokio::test]
 async fn h3_server_stream_default() {
-    h3_server_stream(TransportConfig::datagram()).await;
+    h3_server_stream(SendRecvConfig::datagram()).await;
 }
 
 #[tokio::test]
 async fn h3_server_stream_ring() {
     require_no_iwarp!();
-    h3_server_stream(RingConfig::datagram()).await;
+    h3_server_stream(CreditRingConfig::datagram()).await;
 }
 
 // ===========================================================================
@@ -309,13 +309,13 @@ async fn h3_multi_peer<B: TransportBuilder>(builder: B) {
 
 #[tokio::test]
 async fn h3_multi_peer_default() {
-    h3_multi_peer(TransportConfig::datagram()).await;
+    h3_multi_peer(SendRecvConfig::datagram()).await;
 }
 
 #[tokio::test]
 async fn h3_multi_peer_ring() {
     require_no_iwarp!();
-    h3_multi_peer(RingConfig::datagram()).await;
+    h3_multi_peer(CreditRingConfig::datagram()).await;
 }
 
 // ===========================================================================
@@ -352,11 +352,11 @@ async fn h3_channel_reuse<B: TransportBuilder>(builder: B) {
 
 #[tokio::test]
 async fn h3_channel_reuse_default() {
-    h3_channel_reuse(TransportConfig::datagram()).await;
+    h3_channel_reuse(SendRecvConfig::datagram()).await;
 }
 
 #[tokio::test]
 async fn h3_channel_reuse_ring() {
     require_no_iwarp!();
-    h3_channel_reuse(RingConfig::datagram()).await;
+    h3_channel_reuse(CreditRingConfig::datagram()).await;
 }

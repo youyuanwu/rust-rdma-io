@@ -16,21 +16,21 @@ use crate::stream::TokioRdmaStream;
 /// A [`tower::Service<Uri>`] connector that establishes RDMA connections
 /// for use with [`tonic::transport::Endpoint::connect_with_connector`].
 ///
-/// Generic over the transport builder — use [`TransportConfig`] for Send/Recv
-/// or [`RingConfig`] for ring buffer transport.
+/// Generic over the transport builder — use [`SendRecvConfig`] for Send/Recv
+/// or [`CreditRingConfig`] for ring buffer transport.
 ///
-/// [`TransportConfig`]: rdma_io::rdma_transport::TransportConfig
-/// [`RingConfig`]: rdma_io::rdma_ring_transport::RingConfig
+/// [`SendRecvConfig`]: rdma_io::send_recv_transport::SendRecvConfig
+/// [`CreditRingConfig`]: rdma_io::credit_ring_transport::CreditRingConfig
 ///
 /// # Example
 ///
 /// ```no_run
-/// use rdma_io::rdma_transport::TransportConfig;
+/// use rdma_io::send_recv_transport::SendRecvConfig;
 /// use rdma_io_tonic::RdmaConnector;
 /// use tonic::transport::Endpoint;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let connector = RdmaConnector::new(TransportConfig::stream());
+/// let connector = RdmaConnector::new(SendRecvConfig::stream());
 /// let channel = Endpoint::from_static("http://10.0.0.1:50051")
 ///     .connect_with_connector(connector)
 ///     .await?;

@@ -2,7 +2,7 @@
 
 **Status:** Implemented  
 **Date:** 2026-03-14  
-**Source code:** `rdma-io/src/transport.rs`, `rdma-io/src/rdma_transport.rs`, `rdma-io/src/async_stream.rs`
+**Source code:** `rdma-io/src/transport.rs`, `rdma-io/src/send_recv_transport.rs`, `rdma-io/src/async_stream.rs`
 
 ## Overview
 
@@ -20,7 +20,7 @@ AsyncRdmaStream<T> (byte stream)      RdmaUdpSocket<T> (datagram, future)
                        │
               Transport trait (10 methods)
                        │
-              RdmaTransport (Send/Recv)
+              SendRecvTransport (Send/Recv)
                 ├── QP + dual CQ
                 ├── Configurable buffer pool
                 ├── In-flight send tracking
@@ -52,7 +52,7 @@ AsyncRdmaStream<T> (byte stream)      RdmaUdpSocket<T> (datagram, future)
 - `poll_disconnect` includes `is_qp_dead()` fallback for rxe (QP transitions without CM event)
 - `repost_recv(&mut self)` — compatible with future Ring transport that mutates internal state
 
-## RdmaTransport
+## SendRecvTransport
 
 Concrete `impl Transport` using RDMA Send/Recv. Owns all resources:
 
@@ -62,12 +62,12 @@ Concrete `impl Transport` using RDMA Send/Recv. Owns all resources:
 | Send buffers | `Vec<OwnedMemoryRegion>`, round-robin with `send_in_flight: Vec<bool>` |
 | Recv buffers | `Vec<OwnedMemoryRegion>`, pre-posted on creation |
 | CM | `CmId` + `EventChannel` + `AsyncFd<RawFd>` for waker registration |
-| Config | `TransportConfig` with `stream()` and `datagram()` presets |
+| Config | `SendRecvConfig` with `stream()` and `datagram()` presets |
 
 **Drop order is critical** (Rust drops fields in declaration order):
 state → MRs → PD → QP → cm_async_fd → cm_id → event_channel
 
-Construction: `RdmaTransport::connect(addr, config)` / `RdmaTransport::accept(listener, config)`
+Construction: `SendRecvTransport::connect(addr, config)` / `SendRecvTransport::accept(listener, config)`
 
 ## AsyncRdmaStream\<T: Transport\>
 
@@ -95,8 +95,8 @@ establishment. Associated type `Transport: Transport + 'static`.
 | `accept(&self, listener) → impl Future<Output = Result<Self::Transport>> + Send` | Server-side accept |
 
 Implementations:
-- `TransportConfig` → `RdmaTransport` (Send/Recv, presets: `stream()`, `datagram()`)
-- `RingConfig` → `RdmaRingTransport` (Write+Imm ring buffers, presets: `datagram()`, `default()`)
+- `SendRecvConfig` → `SendRecvTransport` (Send/Recv, presets: `stream()`, `datagram()`)
+- `CreditRingConfig` → `CreditRingTransport` (Write+Imm ring buffers, presets: `datagram()`, `default()`)
 
 Generic consumers (e.g., `RdmaIncoming<B>`, `RdmaConnector<B>`, `RdmaUdpSocket<B>`) accept
 any builder — users choose the transport at construction time.
@@ -116,25 +116,47 @@ any builder — users choose the transport at construction time.
 
 ## Migration Status
 
-- ✅ **Phase 1: Transport Trait + RdmaTransport** — `transport.rs`, `rdma_transport.rs`, refactored `async_stream.rs`.
+- ✅ **Phase 1: Transport Trait + SendRecvTransport** — `transport.rs`, `send_recv_transport.rs`, refactored `async_stream.rs`.
 - ✅ **Phase 1.5: poll_get_request** — Added to `AsyncCmListener` for non-blocking accept in `poll_recv`.
 - ✅ **Phase 2: RdmaUdpSocket** — `rdma-io-quinn` crate. Generic over `TransportBuilder`. Quinn echo + multi-peer tests pass.
-- ✅ **Phase 3: RdmaRingTransport** — Ring buffer transport via RDMA Write + Immediate Data with credit-based flow control.
+- ✅ **Phase 3: CreditRingTransport** — Ring buffer transport via RDMA Write + Immediate Data with credit-based flow control.
 - ✅ **Phase 4: TransportBuilder** — Generic builder trait. All consumers (`RdmaIncoming`, `RdmaConnector`, `RdmaUdpSocket`, `TokioRdmaStream`) are generic over the builder.
 - ✅ **Phase 5: Generic tests** — All stream, tonic, quinn, and h3 tests run on both Send/Recv and Ring transports.
 
 ## Ring Buffer Transport
 
-`RdmaRingTransport` implements `Transport` using RDMA Write + Immediate Data.
+`CreditRingTransport` implements `Transport` using RDMA Write + Immediate Data.
 Drop-in replacement via generics — consumer code unchanged.
 See [rdma-ring-transport.md](rdma-ring-transport.md) for the full design.
 
-| Aspect | RdmaTransport | RdmaRingTransport |
+| Aspect | SendRecvTransport | CreditRingTransport |
 |--------|--------------|-------------------|
 | Verb | `ibv_post_send(SEND)` | `ibv_post_send(WRITE_WITH_IMM)` |
 | Recv mechanism | Pre-posted recv buffers | Doorbell + ring landing zone |
 | `send_copy` backpressure | Hardware RNR (always accepts) | Credit-based (`Ok(0)` when full) |
 | Stream HOL | None (independent buffers) | Yes (ring Head blocks) |
+
+## Transport Naming Convention
+
+The `Rdma` prefix is dropped since everything is in the `rdma_io` crate namespace.
+Names describe the transport mechanism:
+
+| Name | Mechanism |
+|------|-----------|
+| `SendRecvTransport` | RDMA Send/Recv, discrete buffers |
+| `CreditRingTransport` | Write+Imm ring, credit-based flow control |
+| `ReadRingTransport` *(future)* | Write+Imm ring, RDMA Read flow control |
+| `SendRecvConfig` | Builder for SendRecvTransport |
+| `CreditRingConfig` | Builder for CreditRingTransport |
+| `ReadRingConfig` *(future)* | Builder for ReadRingTransport |
+
+The naming pattern is **mechanism** + `Transport` / `Config`:
+- `SendRecv` — the RDMA verbs used for data transfer
+- `CreditRing` — ring buffer with credit-based flow control
+- `ReadRing` — ring buffer with RDMA Read flow control
+
+See [RingPerformance.md](../future/RingPerformance.md) for the transport family
+design and trade-off analysis.
 
 ## References
 
@@ -142,6 +164,6 @@ See [rdma-ring-transport.md](rdma-ring-transport.md) for the full design.
 - [rdma-ring-transport.md](rdma-ring-transport.md) — Ring buffer transport design (future)
 - [rdma-transport-comparison.md](rdma-transport-comparison.md) — Three-way comparison
 - [rdma-io/src/transport.rs](../../rdma-io/src/transport.rs) — Transport trait
-- [rdma-io/src/rdma_transport.rs](../../rdma-io/src/rdma_transport.rs) — RdmaTransport
+- [rdma-io/src/send_recv_transport.rs](../../rdma-io/src/send_recv_transport.rs) — SendRecvTransport
 - [rdma-io/src/async_stream.rs](../../rdma-io/src/async_stream.rs) — AsyncRdmaStream\<T\>
 - [rdma-io-quinn/src/lib.rs](../../rdma-io-quinn/src/lib.rs) — RdmaUdpSocket (Quinn integration)

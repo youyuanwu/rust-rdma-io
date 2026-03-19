@@ -6,11 +6,11 @@
 //! # Architecture
 //!
 //! `AsyncRdmaStream<T>` is generic over `T: Transport`. Callers construct
-//! the transport directly (e.g. [`RdmaTransport::connect`] or
-//! [`RdmaRingTransport::connect`]) and wrap it with [`AsyncRdmaStream::new`].
+//! the transport directly (e.g. [`SendRecvTransport::connect`] or
+//! [`CreditRingTransport::connect`]) and wrap it with [`AsyncRdmaStream::new`].
 //!
-//! [`RdmaTransport::connect`]: crate::rdma_transport::RdmaTransport::connect
-//! [`RdmaRingTransport::connect`]: crate::rdma_ring_transport::RdmaRingTransport::connect
+//! [`SendRecvTransport::connect`]: crate::send_recv_transport::SendRecvTransport::connect
+//! [`CreditRingTransport::connect`]: crate::credit_ring_transport::CreditRingTransport::connect
 //!
 //! # Protocol
 //!
@@ -22,17 +22,17 @@
 //! ```no_run
 //! use rdma_io::async_cm::AsyncCmListener;
 //! use rdma_io::async_stream::AsyncRdmaStream;
-//! use rdma_io::rdma_transport::{RdmaTransport, TransportConfig};
+//! use rdma_io::send_recv_transport::{SendRecvTransport, SendRecvConfig};
 //!
 //! # async fn example() -> rdma_io::Result<()> {
 //! // Server
 //! let listener = AsyncCmListener::bind(&"0.0.0.0:9999".parse().unwrap())?;
-//! let transport = RdmaTransport::accept(&listener, TransportConfig::default()).await?;
+//! let transport = SendRecvTransport::accept(&listener, SendRecvConfig::default()).await?;
 //! let mut server = AsyncRdmaStream::new(transport);
 //!
 //! // Client
 //! let addr = "10.0.0.1:9999".parse().unwrap();
-//! let transport = RdmaTransport::connect(&addr, TransportConfig::default()).await?;
+//! let transport = SendRecvTransport::connect(&addr, SendRecvConfig::default()).await?;
 //! let mut client = AsyncRdmaStream::new(transport);
 //! # Ok(())
 //! # }

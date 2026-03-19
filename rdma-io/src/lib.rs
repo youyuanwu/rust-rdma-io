@@ -24,9 +24,9 @@ pub mod async_qp;
 #[cfg(feature = "async")]
 pub mod async_stream;
 #[cfg(feature = "async")]
-pub mod rdma_ring_transport;
+pub mod credit_ring_transport;
 #[cfg(feature = "async")]
-pub mod rdma_transport;
+pub mod send_recv_transport;
 #[cfg(feature = "tokio")]
 pub mod tokio_notifier;
 #[cfg(feature = "async")]

@@ -7,12 +7,12 @@
 //! # Client
 //!
 //! ```no_run
-//! use rdma_io::rdma_transport::TransportConfig;
+//! use rdma_io::send_recv_transport::SendRecvConfig;
 //! use rdma_io_tonic::tls::RdmaTransport;
 //! use tonic::transport::Endpoint;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let transport = RdmaTransport::new(TransportConfig::stream());
+//! let transport = RdmaTransport::new(SendRecvConfig::stream());
 //! let ssl = openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls_client())?
 //!     .build();
 //! let connector = tonic_tls::openssl::TlsConnector::new(
@@ -28,7 +28,7 @@
 //! # Server
 //!
 //! ```no_run
-//! use rdma_io::rdma_transport::TransportConfig;
+//! use rdma_io::send_recv_transport::SendRecvConfig;
 //! use rdma_io_tonic::RdmaIncoming;
 //! use tonic::transport::Server;
 //!
@@ -42,7 +42,7 @@
 //! # ) -> Result<(), Box<dyn std::error::Error>> {
 //! let incoming = RdmaIncoming::bind(
 //!     &"0.0.0.0:50051".parse().unwrap(),
-//!     TransportConfig::stream(),
+//!     SendRecvConfig::stream(),
 //! )?;
 //! let tls_incoming = tonic_tls::openssl::TlsIncoming::new(incoming, acceptor);
 //! // Server::builder().add_service(svc).serve_with_incoming(tls_incoming).await?;

@@ -28,11 +28,11 @@ type AcceptFuture<T> = Pin<Box<dyn Future<Output = rdma_io::Result<(SocketAddr, 
 /// Implements [`AsyncUdpSocket`] by multiplexing across per-peer transports.
 /// Server-side accept is driven within [`poll_recv`](AsyncUdpSocket::poll_recv).
 ///
-/// Generic over the transport builder — use [`TransportConfig`] for Send/Recv
-/// or [`RingConfig`] for ring buffer transport.
+/// Generic over the transport builder — use [`SendRecvConfig`] for Send/Recv
+/// or [`CreditRingConfig`] for ring buffer transport.
 ///
-/// [`TransportConfig`]: rdma_io::rdma_transport::TransportConfig
-/// [`RingConfig`]: rdma_io::rdma_ring_transport::RingConfig
+/// [`SendRecvConfig`]: rdma_io::send_recv_transport::SendRecvConfig
+/// [`CreditRingConfig`]: rdma_io::credit_ring_transport::CreditRingConfig
 ///
 /// Quinn 0.11 API: `poll_recv(&self)` + `try_send(&self)` + `create_io_poller(self: Arc<Self>)`.
 /// All methods take `&self`, so internal state uses `Mutex` for interior mutability.

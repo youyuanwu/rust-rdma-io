@@ -8,14 +8,14 @@
 //! Use [`RdmaIncoming`] with `Server::serve_with_incoming`:
 //!
 //! ```no_run
-//! use rdma_io::rdma_transport::TransportConfig;
+//! use rdma_io::send_recv_transport::SendRecvConfig;
 //! use rdma_io_tonic::{RdmaIncoming, RdmaConnectInfo};
 //! use tonic::transport::Server;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let incoming = RdmaIncoming::bind(
 //!     &"0.0.0.0:50051".parse().unwrap(),
-//!     TransportConfig::stream(),
+//!     SendRecvConfig::stream(),
 //! )?;
 //! // Server::builder().add_service(svc).serve_with_incoming(incoming).await?;
 //! # Ok(())
@@ -27,12 +27,12 @@
 //! Use [`RdmaConnector`] with `Endpoint::connect_with_connector`:
 //!
 //! ```no_run
-//! use rdma_io::rdma_transport::TransportConfig;
+//! use rdma_io::send_recv_transport::SendRecvConfig;
 //! use rdma_io_tonic::RdmaConnector;
 //! use tonic::transport::Endpoint;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let connector = RdmaConnector::new(TransportConfig::stream());
+//! let connector = RdmaConnector::new(SendRecvConfig::stream());
 //! let channel = Endpoint::from_static("http://10.0.0.1:50051")
 //!     .connect_with_connector(connector)
 //!     .await?;

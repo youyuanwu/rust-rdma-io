@@ -1,6 +1,6 @@
 //! Ring transport integration tests.
 //!
-//! Tests verify that `RdmaRingTransport` provides datagram-style RDMA Write
+//! Tests verify that `CreditRingTransport` provides datagram-style RDMA Write
 //! over ring buffers with Memory Window scoping, credit-based flow control,
 //! and wrap-around handling.
 
@@ -9,22 +9,22 @@ use std::task::Poll;
 
 use rdma_io::async_cm::AsyncCmListener;
 use rdma_io::async_stream::AsyncRdmaStream;
-use rdma_io::rdma_ring_transport::{RdmaRingTransport, RingConfig};
+use rdma_io::credit_ring_transport::{CreditRingTransport, CreditRingConfig};
 use rdma_io::transport::{RecvCompletion, Transport};
 use rdma_io_tests::require_no_iwarp;
 use rdma_io_tests::test_helpers::{bind_addr, connect_addr_for};
 
 /// Helper: create a connected (server, client) ring transport pair.
-async fn ring_connected_pair(config: RingConfig) -> (RdmaRingTransport, RdmaRingTransport) {
+async fn ring_connected_pair(config: CreditRingConfig) -> (CreditRingTransport, CreditRingTransport) {
     let listener = AsyncCmListener::bind(&bind_addr()).unwrap();
     let connect_addr = connect_addr_for(listener.local_addr());
     let config2 = config.clone();
 
     let server =
-        tokio::spawn(async move { RdmaRingTransport::accept(&listener, config2).await.unwrap() });
+        tokio::spawn(async move { CreditRingTransport::accept(&listener, config2).await.unwrap() });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let client = tokio::spawn(async move {
-        RdmaRingTransport::connect(&connect_addr, config)
+        CreditRingTransport::connect(&connect_addr, config)
             .await
             .unwrap()
     });
@@ -33,7 +33,7 @@ async fn ring_connected_pair(config: RingConfig) -> (RdmaRingTransport, RdmaRing
 }
 
 /// Helper: send data and wait for send completion.
-async fn send_and_complete(transport: &mut RdmaRingTransport, data: &[u8]) -> usize {
+async fn send_and_complete(transport: &mut CreditRingTransport, data: &[u8]) -> usize {
     let n = transport.send_copy(data).unwrap();
     assert!(n > 0, "send_copy returned 0 — no credits or ring space");
     poll_fn(|cx| transport.poll_send_completion(cx))
@@ -43,7 +43,7 @@ async fn send_and_complete(transport: &mut RdmaRingTransport, data: &[u8]) -> us
 }
 
 /// Helper: drain all pending send completions (non-blocking).
-async fn drain_send_completions(transport: &mut RdmaRingTransport) {
+async fn drain_send_completions(transport: &mut CreditRingTransport) {
     while let Some(Ok(())) = poll_fn(|cx| match transport.poll_send_completion(cx) {
         Poll::Ready(r) => Poll::Ready(Some(r)),
         Poll::Pending => Poll::Ready(None),
@@ -54,7 +54,7 @@ async fn drain_send_completions(transport: &mut RdmaRingTransport) {
 
 /// Helper: receive one completion and return (buf_idx, byte_len).
 /// Loops past credit-only batches (Ok(0)) from ring transport.
-async fn recv_one(transport: &mut RdmaRingTransport) -> RecvCompletion {
+async fn recv_one(transport: &mut CreditRingTransport) -> RecvCompletion {
     let mut completions = [RecvCompletion::default(); 1];
     for _ in 0..100 {
         let n = poll_fn(|cx| transport.poll_recv(cx, &mut completions))
@@ -76,7 +76,7 @@ async fn recv_one(transport: &mut RdmaRingTransport) -> RecvCompletion {
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn ring_connect_accept() {
     require_no_iwarp!();
-    let (server, client) = ring_connected_pair(RingConfig::default()).await;
+    let (server, client) = ring_connected_pair(CreditRingConfig::default()).await;
 
     assert!(
         server.local_addr().is_some(),
@@ -104,7 +104,7 @@ async fn ring_connect_accept() {
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn ring_send_recv_single() {
     require_no_iwarp!();
-    let (mut server, mut client) = ring_connected_pair(RingConfig::default()).await;
+    let (mut server, mut client) = ring_connected_pair(CreditRingConfig::default()).await;
 
     // 1500 bytes of patterned data
     let data: Vec<u8> = (0..1500).map(|i| (i % 251) as u8).collect();
@@ -131,7 +131,7 @@ async fn ring_send_recv_single() {
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn ring_send_recv_multi() {
     require_no_iwarp!();
-    let config = RingConfig::default();
+    let config = CreditRingConfig::default();
     let max_outstanding = config.ring_capacity / config.max_message_size;
     let (mut _server, mut client) = ring_connected_pair(config).await;
 
@@ -167,7 +167,7 @@ async fn ring_send_recv_multi() {
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn ring_credit_recovery() {
     require_no_iwarp!();
-    let config = RingConfig::default();
+    let config = CreditRingConfig::default();
     let (mut server, mut client) = ring_connected_pair(config).await;
 
     // Send until credits exhausted
@@ -215,7 +215,7 @@ async fn ring_credit_recovery() {
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn ring_wrap_around() {
     require_no_iwarp!();
-    let config = RingConfig::default();
+    let config = CreditRingConfig::default();
     let (mut server, mut client) = ring_connected_pair(config).await;
 
     let msg_size = 1500;
@@ -275,7 +275,7 @@ async fn ring_wrap_around() {
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn ring_disconnect() {
     require_no_iwarp!();
-    let (mut server, mut client) = ring_connected_pair(RingConfig::default()).await;
+    let (mut server, mut client) = ring_connected_pair(CreditRingConfig::default()).await;
 
     // Client disconnects
     client.disconnect().unwrap();
@@ -303,7 +303,7 @@ async fn ring_disconnect() {
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn ring_mw_type2b_bind() {
     require_no_iwarp!();
-    let (mut server, mut client) = ring_connected_pair(RingConfig::default()).await;
+    let (mut server, mut client) = ring_connected_pair(CreditRingConfig::default()).await;
 
     // MW bind is implicitly tested by a successful connection.
     // Verify data path works (proves MW-scoped remote writes succeed).
@@ -400,7 +400,7 @@ async fn ring_mw_capability_probe() {
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn ring_out_of_order_repost() {
     require_no_iwarp!();
-    let (mut server, mut client) = ring_connected_pair(RingConfig::default()).await;
+    let (mut server, mut client) = ring_connected_pair(CreditRingConfig::default()).await;
 
     // Send 2 messages
     let data_a = b"message-A";
@@ -439,7 +439,7 @@ async fn ring_out_of_order_repost() {
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn ring_credit_wr_disambiguation() {
     require_no_iwarp!();
-    let config = RingConfig::default();
+    let config = CreditRingConfig::default();
     let (mut server, mut client) = ring_connected_pair(config).await;
 
     // Send a batch
@@ -477,7 +477,7 @@ async fn ring_credit_wr_disambiguation() {
 }
 
 /// P1: Test iWARP detection. NOT gated by require_no_iwarp!.
-/// If iWARP (siw): verify RdmaRingTransport::connect returns an error
+/// If iWARP (siw): verify CreditRingTransport::connect returns an error
 /// containing "iWARP". If rxe: just do a normal connect/accept.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn ring_iwarp_detection() {
@@ -485,9 +485,9 @@ async fn ring_iwarp_detection() {
         // iWARP device present — connect should fail with iWARP error
         let listener = AsyncCmListener::bind(&bind_addr()).unwrap();
         let connect_addr = connect_addr_for(listener.local_addr());
-        let config = RingConfig::default();
+        let config = CreditRingConfig::default();
 
-        let result = RdmaRingTransport::connect(&connect_addr, config).await;
+        let result = CreditRingTransport::connect(&connect_addr, config).await;
         assert!(
             result.is_err(),
             "connect should fail when iWARP device present"
@@ -501,7 +501,7 @@ async fn ring_iwarp_detection() {
         println!("ring_iwarp_detection passed! (iWARP path)");
     } else {
         // No iWARP — just verify connect/accept works
-        let (_server, _client) = ring_connected_pair(RingConfig::default()).await;
+        let (_server, _client) = ring_connected_pair(CreditRingConfig::default()).await;
         println!("ring_iwarp_detection passed! (rxe path)");
     }
 }
@@ -515,9 +515,9 @@ async fn ring_token_timeout() {
     let listener = AsyncCmListener::bind(&bind_addr()).unwrap();
     let connect_addr = connect_addr_for(listener.local_addr());
 
-    let config = RingConfig {
+    let config = CreditRingConfig {
         token_timeout: std::time::Duration::from_secs(1),
-        ..RingConfig::default()
+        ..CreditRingConfig::default()
     };
 
     // Accept the CM connection but never do token exchange.
@@ -532,7 +532,7 @@ async fn ring_token_timeout() {
         //
         // Instead: just accept normally but with a timeout on the client.
         // The server will also timeout, but we only care about the client error.
-        let _ = RdmaRingTransport::accept(&listener, server_config).await;
+        let _ = CreditRingTransport::accept(&listener, server_config).await;
     });
 
     // Client with 1-second token timeout — the overall connect includes CM
@@ -540,7 +540,7 @@ async fn ring_token_timeout() {
     // timeout for the wrong reason, but that's acceptable for this test.
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        RdmaRingTransport::connect(&connect_addr, config),
+        CreditRingTransport::connect(&connect_addr, config),
     )
     .await;
 
@@ -612,7 +612,7 @@ async fn ring_mw_rkey_scope() {
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn ring_virtual_idx_wrap() {
     require_no_iwarp!();
-    let config = RingConfig::default();
+    let config = CreditRingConfig::default();
     let max_outstanding = config.ring_capacity / config.max_message_size;
     let (mut server, mut client) = ring_connected_pair(config).await;
 
@@ -687,7 +687,7 @@ async fn ring_virtual_idx_wrap() {
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn ring_drop_safety() {
     require_no_iwarp!();
-    let (server, mut client) = ring_connected_pair(RingConfig::default()).await;
+    let (server, mut client) = ring_connected_pair(CreditRingConfig::default()).await;
 
     // Send a few messages without draining everything
     let data = b"drop-safety-test";
@@ -701,19 +701,19 @@ async fn ring_drop_safety() {
     println!("ring_drop_safety passed!");
 }
 
-/// P2: Wrap RdmaRingTransport in AsyncRdmaStream, send 64KB, read back,
+/// P2: Wrap CreditRingTransport in AsyncRdmaStream, send 64KB, read back,
 /// verify integrity. Uses connected_pair for robust connection setup.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn ring_stream_echo() {
     require_no_iwarp!();
-    let config = RingConfig::default();
+    let config = CreditRingConfig::default();
 
     let listener = AsyncCmListener::bind(&bind_addr()).unwrap();
     let connect_addr = connect_addr_for(listener.local_addr());
     let config2 = config.clone();
 
     let server_handle = tokio::spawn(async move {
-        let transport = RdmaRingTransport::accept(&listener, config2).await.unwrap();
+        let transport = CreditRingTransport::accept(&listener, config2).await.unwrap();
         AsyncRdmaStream::new(transport)
     });
 
@@ -721,7 +721,7 @@ async fn ring_stream_echo() {
 
     let client_handle = tokio::spawn(async move {
         for attempt in 0u64..5 {
-            match RdmaRingTransport::connect(&connect_addr, config.clone()).await {
+            match CreditRingTransport::connect(&connect_addr, config.clone()).await {
                 Ok(t) => return AsyncRdmaStream::new(t),
                 Err(e) => {
                     let is_addr_in_use =
@@ -790,7 +790,7 @@ async fn ring_stream_echo() {
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn ring_multi_connection() {
     require_no_iwarp!();
-    let config = RingConfig::default();
+    let config = CreditRingConfig::default();
 
     let listener = AsyncCmListener::bind(&bind_addr()).unwrap();
     let connect_addr = connect_addr_for(listener.local_addr());
@@ -801,12 +801,12 @@ async fn ring_multi_connection() {
     let config_s = config.clone();
     let server_handle = tokio::spawn(async move {
         println!("Server: waiting for connection 1...");
-        let t1 = RdmaRingTransport::accept(&listener_s, config_s.clone())
+        let t1 = CreditRingTransport::accept(&listener_s, config_s.clone())
             .await
             .unwrap();
         println!("Server: accepted connection 1 from {:?}", t1.peer_addr());
         println!("Server: waiting for connection 2...");
-        let t2 = RdmaRingTransport::accept(&listener_s, config_s)
+        let t2 = CreditRingTransport::accept(&listener_s, config_s)
             .await
             .unwrap();
         println!("Server: accepted connection 2 from {:?}", t2.peer_addr());
@@ -821,7 +821,7 @@ async fn ring_multi_connection() {
     let addr1 = connect_addr;
     let client1_handle = tokio::spawn(async move {
         println!("Client1: connecting...");
-        let t = RdmaRingTransport::connect(&addr1, config_c1).await.unwrap();
+        let t = CreditRingTransport::connect(&addr1, config_c1).await.unwrap();
         println!("Client1: connected");
         t
     });
@@ -835,7 +835,7 @@ async fn ring_multi_connection() {
     let addr2 = connect_addr;
     let client2_handle = tokio::spawn(async move {
         println!("Client2: connecting...");
-        let t = RdmaRingTransport::connect(&addr2, config_c2).await.unwrap();
+        let t = CreditRingTransport::connect(&addr2, config_c2).await.unwrap();
         println!("Client2: connected");
         t
     });

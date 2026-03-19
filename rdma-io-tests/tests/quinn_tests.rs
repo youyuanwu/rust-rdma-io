@@ -6,8 +6,8 @@
 use std::sync::Arc;
 
 use quinn::{ClientConfig, Endpoint, ServerConfig};
-use rdma_io::rdma_ring_transport::RingConfig;
-use rdma_io::rdma_transport::TransportConfig;
+use rdma_io::credit_ring_transport::CreditRingConfig;
+use rdma_io::send_recv_transport::SendRecvConfig;
 use rdma_io::transport::TransportBuilder;
 use rdma_io_quinn::RdmaUdpSocket;
 
@@ -145,13 +145,13 @@ async fn quinn_echo<B: TransportBuilder>(builder: B) {
 
 #[tokio::test]
 async fn quinn_echo_default() {
-    quinn_echo(TransportConfig::datagram()).await;
+    quinn_echo(SendRecvConfig::datagram()).await;
 }
 
 #[tokio::test]
 async fn quinn_echo_ring() {
     require_no_iwarp!();
-    quinn_echo(RingConfig::datagram()).await;
+    quinn_echo(CreditRingConfig::datagram()).await;
 }
 
 // ===========================================================================
@@ -259,11 +259,11 @@ async fn quinn_multi_peer<B: TransportBuilder>(builder: B) {
 
 #[tokio::test]
 async fn quinn_multi_peer_default() {
-    quinn_multi_peer(TransportConfig::datagram()).await;
+    quinn_multi_peer(SendRecvConfig::datagram()).await;
 }
 
 #[tokio::test]
 async fn quinn_multi_peer_ring() {
     require_no_iwarp!();
-    quinn_multi_peer(RingConfig::datagram()).await;
+    quinn_multi_peer(CreditRingConfig::datagram()).await;
 }

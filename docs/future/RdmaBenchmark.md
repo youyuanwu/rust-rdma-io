@@ -16,8 +16,8 @@ Two binaries in the `rdma-io-bench` crate (`tests/rdma-io-bench/`):
 
 | Mode | Flag | Transport Stack | RDMA Transport |
 |------|------|-----------------|----------------|
-| `tls` | `--mode tls` (default) | RDMA → TLS (OpenSSL) → HTTP/2 → gRPC | `TransportConfig::stream()` |
-| `h3` | `--mode h3` (future) | RDMA → QUIC (Quinn) → HTTP/3 → gRPC | `TransportConfig::datagram()` |
+| `tls` | `--mode tls` (default) | RDMA → TLS (OpenSSL) → HTTP/2 → gRPC | `SendRecvConfig::stream()` |
+| `h3` | `--mode h3` (future) | RDMA → QUIC (Quinn) → HTTP/3 → gRPC | `SendRecvConfig::datagram()` |
 
 ## Usage
 

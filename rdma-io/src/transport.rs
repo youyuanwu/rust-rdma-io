@@ -3,8 +3,8 @@
 //! Consumers ([`crate::async_stream::AsyncRdmaStream`]) are generic over
 //! `T: Transport`, enabling different transport implementations:
 //!
-//! - [`crate::rdma_transport::RdmaTransport`] — Send/Recv (two-sided)
-//! - (Future) Ring buffer transport — RDMA Write + Immediate Data
+//! - [`crate::send_recv_transport::SendRecvTransport`] — Send/Recv (two-sided)
+//! - [`crate::credit_ring_transport::CreditRingTransport`] — RDMA Write + Immediate Data (ring buffer)
 //! - Mock transports for unit testing without RDMA hardware
 //!
 //! The trait is designed around the **consumer's view** (send bytes,

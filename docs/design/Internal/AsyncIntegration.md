@@ -87,7 +87,7 @@ In async mode, step 4 becomes `async_fd.readable().await` — non-blocking, comp
 │  AsyncRdmaStream / AsyncCmListener              │  ← High-level stream (§5)
 │  (futures::io::AsyncRead + AsyncWrite)          │    SEND/RECV with buffering
 ├─────────────────────────────────────────────────┤
-│  Transport trait / RdmaTransport                │  ← Datagram transport (§7.10)
+│  Transport trait / SendRecvTransport                │  ← Datagram transport (§7.10)
 │  send_copy() poll_recv() poll_disconnect()      │    Used by Quinn socket
 ├────────────────────────┬────────────────────────┤
 │  AsyncQp               │                        │  ← Mid-level verb access (§7)
@@ -125,7 +125,7 @@ rdma-io/
 │   ├── async_stream.rs       # AsyncRdmaStream (futures-io traits)
 │   ├── async_cm.rs           # AsyncCmId / AsyncCmListener / AsyncEventChannel
 │   ├── transport.rs          # Transport trait (generic datagram abstraction)
-│   ├── rdma_transport.rs     # RdmaTransport (Send/Recv transport impl)
+│   ├── send_recv_transport.rs     # SendRecvTransport (Send/Recv transport impl)
 │   ├── tokio_notifier.rs     # TokioCqNotifier (behind "tokio" feature)
 │   └── ... (sync modules: cm.rs, cq.rs, qp.rs, mr.rs, etc.)
 └── Cargo.toml
@@ -196,10 +196,10 @@ Async completion queue poller wrapping `CompletionQueue` + `CompletionChannel` +
 
 `AsyncRdmaStream` provides byte-stream I/O over RDMA using the `Transport` trait abstraction.
 
-> **Implementation**: See `async_stream.rs`. Generic over `T: Transport` (defaults to `RdmaTransport`). Implements `futures::io::AsyncRead` + `AsyncWrite`.
+> **Implementation**: See `async_stream.rs`. Generic over `T: Transport` (defaults to `SendRecvTransport`). Implements `futures::io::AsyncRead` + `AsyncWrite`.
 
 Key design points:
-- Generic over `Transport` trait — `RdmaTransport` default, mockable for testing
+- Generic over `Transport` trait — `SendRecvTransport` default, mockable for testing
 - **Dual CQ**: Separate `send_cq` and `recv_cq` avoid silent completion loss when both send and recv are in-flight concurrently. `poll_write` only waits on `send_cq`; `poll_read` only on `recv_cq`. No stashing needed.
 - `recv_pending` tracks partial-read state (buf_idx, offset, total_len)
 - `write_pending` tracks in-flight send WRs across poll calls
@@ -469,7 +469,7 @@ Build the mid-level verb abstraction first so the stream can compose on top of i
 Stream is a thin buffering + flow-control layer on top of the `Transport` trait.
 
 1. `AsyncRdmaStream::connect()` / `AsyncRdmaListener::bind()` / `accept()`
-2. Generic over `T: Transport` — `RdmaTransport` default, enables mockable testing
+2. Generic over `T: Transport` — `SendRecvTransport` default, enables mockable testing
 3. `AsyncRdmaStream::read()` / `write()` delegate to `poll_read` / `poll_write` via `std::future::poll_fn` (single code path)
 4. `accept()` uses `rdma_migrate_id()` to decouple accepted connection from listener event channel — allows listener to be safely dropped after accept
 5. **Dual CQ**: Separate `send_cq` and `recv_cq` in `AsyncQp` — `poll_write` only waits on `send_cq`; `poll_read` only on `recv_cq`. No stashing or completion routing needed.
@@ -505,13 +505,13 @@ True async connection setup — eliminated `spawn_blocking` from connect/accept 
 5. **`rdma_migrate_id`**: accepted connections migrated to per-connection `EventChannel`
 6. Tests: all async stream + Quinn + tonic-h3 tests exercise this path
 
-### Phase G: Transport Trait + RdmaTransport ✅
+### Phase G: Transport Trait + SendRecvTransport ✅
 
 Generic datagram transport abstraction for Quinn QUIC integration.
 
 1. **`Transport` trait** (`transport.rs`): `send_copy()`, `poll_recv()`, `poll_send_completion()`, `poll_disconnect()`, `is_qp_dead()`, `disconnect()`, `repost_recv()`
-2. **`RdmaTransport`** (`rdma_transport.rs`): concrete impl using RDMA Send/Recv verbs with dual CQ, pre-posted recv buffers, and configurable buffer sizes
-3. **`TransportConfig`**: presets `stream()` (NUM_RECV_BUFS=8, 32KB) and `datagram()` (64 recv × 1.5KB, 4 send)
+2. **`SendRecvTransport`** (`send_recv_transport.rs`): concrete impl using RDMA Send/Recv verbs with dual CQ, pre-posted recv buffers, and configurable buffer sizes
+3. **`SendRecvConfig`**: presets `stream()` (NUM_RECV_BUFS=8, 32KB) and `datagram()` (64 recv × 1.5KB, 4 send)
 4. Used by `rdma-io-quinn::RdmaUdpSocket` as the underlying transport for each peer connection
 5. Used by `AsyncRdmaStream<T: Transport>` as default generic parameter
 

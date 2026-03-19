@@ -113,17 +113,17 @@ All types are generic over `TransportBuilder`. Users choose the transport
 at construction time:
 
 ```rust
-use rdma_io::rdma_transport::TransportConfig;
-use rdma_io::rdma_ring_transport::RingConfig;
+use rdma_io::send_recv_transport::SendRecvConfig;
+use rdma_io::credit_ring_transport::CreditRingConfig;
 use rdma_io_tonic::{RdmaConnector, RdmaIncoming};
 
 // Send/Recv transport (default, works on all RDMA providers)
-let incoming = RdmaIncoming::bind(&addr, TransportConfig::stream())?;
-let connector = RdmaConnector::new(TransportConfig::stream());
+let incoming = RdmaIncoming::bind(&addr, SendRecvConfig::stream())?;
+let connector = RdmaConnector::new(SendRecvConfig::stream());
 
 // Ring buffer transport (requires InfiniBand/RoCE, not iWARP)
-let incoming = RdmaIncoming::bind(&addr, RingConfig::default())?;
-let connector = RdmaConnector::new(RingConfig::default());
+let incoming = RdmaIncoming::bind(&addr, CreditRingConfig::default())?;
+let connector = RdmaConnector::new(CreditRingConfig::default());
 ```
 
 ### Connection pooling
@@ -145,13 +145,13 @@ Tonic 0.14 only requires `Send`, not `Sync`. Our streams are `Send` but not
 ### Server
 
 ```rust
-use rdma_io::rdma_transport::TransportConfig;
+use rdma_io::send_recv_transport::SendRecvConfig;
 use rdma_io_tonic::{RdmaIncoming, RdmaConnectInfo};
 use tonic::transport::Server;
 
 let incoming = RdmaIncoming::bind(
     &"0.0.0.0:50051".parse().unwrap(),
-    TransportConfig::stream(),
+    SendRecvConfig::stream(),
 )?;
 
 Server::builder()
@@ -168,11 +168,11 @@ if let Some(info) = request.extensions().get::<RdmaConnectInfo>() {
 ### Client
 
 ```rust
-use rdma_io::rdma_transport::TransportConfig;
+use rdma_io::send_recv_transport::SendRecvConfig;
 use rdma_io_tonic::RdmaConnector;
 use tonic::transport::Endpoint;
 
-let connector = RdmaConnector::new(TransportConfig::stream());
+let connector = RdmaConnector::new(SendRecvConfig::stream());
 let channel = Endpoint::from_static("http://10.0.0.1:50051")
     .connect_with_connector(connector)
     .await?;
@@ -183,7 +183,7 @@ let mut client = GreeterClient::new(channel);
 ### Lazy connection (recommended for production)
 
 ```rust
-let connector = RdmaConnector::new(TransportConfig::stream());
+let connector = RdmaConnector::new(SendRecvConfig::stream());
 let channel = Endpoint::from_static("http://10.0.0.1:50051")
     .connect_with_connector_lazy(connector);
 // Connection established on first RPC
