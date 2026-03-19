@@ -17,9 +17,12 @@ rdma-io-tonic = { path = "../../rdma-io-tonic", features = ["tls"] }
 rdma-io-quinn = { path = "../../rdma-io-quinn" }
 tonic.workspace = true
 tonic-tls.workspace = true
+tonic-h3.workspace = true
 tonic-prost.workspace = true
 prost.workspace = true
+quinn.workspace = true
 openssl.workspace = true
+http = "1"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

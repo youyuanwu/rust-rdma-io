@@ -13,6 +13,8 @@
 
     - name: Start server
       ansible.builtin.shell: |
+        RUST_LOG="{{ bench_rust_log | default('info') }}" \
+        RUST_BACKTRACE=1 \
         nohup ~/bin/rdma-bench-server \
           --bind "{{ ansible_host }}:50051" \
           --mode "{{ bench_mode | default('tls') }}" \
@@ -30,6 +32,8 @@
   tasks:
     - name: Run benchmark
       ansible.builtin.shell: |
+        RUST_LOG="{{ bench_rust_log | default('info') }}" \
+        RUST_BACKTRACE=1 \
         ~/bin/rdma-bench-client \
           --connect "{{ hostvars['vm1'].ansible_host }}:50051" \
           --mode "{{ bench_mode | default('tls') }}" \

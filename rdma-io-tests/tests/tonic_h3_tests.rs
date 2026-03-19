@@ -317,3 +317,46 @@ async fn h3_multi_peer_ring() {
     require_no_iwarp!();
     h3_multi_peer(RingConfig::datagram()).await;
 }
+
+// ===========================================================================
+// h3_channel_reuse — send multiple sequential requests on the same channel.
+// ===========================================================================
+
+async fn h3_channel_reuse<B: TransportBuilder>(builder: B) {
+    let (certs, key) = generate_self_signed_cert();
+    let client_config = make_h3_client_config(&certs);
+
+    let (connect_addr, shutdown_tx, server_task) =
+        start_h3_server(&certs, key, builder.clone()).await;
+    let client_endpoint = make_h3_client_endpoint(&connect_addr, client_config, builder).await;
+    let mut client = make_h3_grpc_client(&client_endpoint, &connect_addr);
+
+    // Send multiple requests on the same channel
+    for i in 0..5 {
+        let response = client
+            .say_hello(tonic::Request::new(HelloRequest {
+                name: format!("request-{i}"),
+            }))
+            .await
+            .unwrap_or_else(|_| panic!("RPC {i} failed"));
+
+        let message = response.into_inner().message;
+        println!("h3_channel_reuse[{i}]: {message}");
+        assert_eq!(message, format!("Hello request-{i}!"));
+    }
+
+    let _ = shutdown_tx.send(());
+    client_endpoint.close(0u16.into(), b"done");
+    server_task.await.expect("server task");
+}
+
+#[tokio::test]
+async fn h3_channel_reuse_default() {
+    h3_channel_reuse(TransportConfig::datagram()).await;
+}
+
+#[tokio::test]
+async fn h3_channel_reuse_ring() {
+    require_no_iwarp!();
+    h3_channel_reuse(RingConfig::datagram()).await;
+}

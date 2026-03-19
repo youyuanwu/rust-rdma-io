@@ -87,6 +87,16 @@ Entry point: `tests/e2e/run_bench.sh`
 - **Workspace deps:** Uses `foo.workspace = true` for shared dependencies
 - **H3 client needs `connect_to()`:** RDMA pre-connection step before QUIC
   handshake (see `tonic_h3_tests.rs` for pattern)
+- **Tracing:** Uses `RUST_LOG` env var. Per-request errors are at `trace`
+  level (won't flood), task failures at `warn`. Examples:
+  ```bash
+  # Local: set RUST_LOG directly
+  RUST_LOG=info rdma-bench-client --connect ...
+  RUST_LOG=rdma_io_bench=trace rdma-bench-client --connect ...
+
+  # Ansible: pass bench_rust_log variable
+  ./tests/e2e/run_bench.sh --mode tls -e "bench_rust_log=debug"
+  ```
 
 ## VM Resources for Benchmarking
 
@@ -100,11 +110,12 @@ KVM required for meaningful results — software emulation is too slow.
 
 ## Future Work
 
-### Phase 2: H3 + Ring Transport
+### Phase 2: H3 Benchmark Improvements + Ring Transport
 
-- Add `--mode h3` (QUIC over RDMA, uses `datagram()` transport)
+- H3 bench works with 1 connection. Multiple H3 connections panic in
+  `h3-util` v0.0.5 ("async fn resumed after completion"). Investigate
+  whether multiple Quinn endpoints per process is supported.
 - Add `--transport ring` for ring buffer transport testing
-- H3 server uses `tonic::service::Routes::builder()` (not `Server::builder().into_router()`)
 
 ### Phase 3: CI Integration
 

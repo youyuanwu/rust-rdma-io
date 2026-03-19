@@ -1,16 +1,18 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
 use rdma_io::async_cm::AsyncCmListener;
 use rdma_io::rdma_transport::TransportConfig;
+use rdma_io_quinn::RdmaUdpSocket;
 use rdma_io_tonic::RdmaIncoming;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
 use rdma_io_bench::greeter::greeter_server::{Greeter, GreeterServer};
 use rdma_io_bench::greeter::{HelloReply, HelloRequest};
-use rdma_io_bench::tls_common;
+use rdma_io_bench::{h3_common, tls_common};
 
 #[derive(Parser)]
 #[command(name = "rdma-bench-server", about = "RDMA gRPC benchmark server")]
@@ -46,6 +48,7 @@ impl Greeter for BenchGreeter {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
+        .with_ansi(false)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
@@ -53,8 +56,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match args.mode.as_str() {
         "tls" => run_tls_server(args).await,
+        "h3" => run_h3_server(args).await,
         other => {
-            eprintln!("Unknown mode: {other}. Supported: tls");
+            eprintln!("Unknown mode: {other}. Supported: tls, h3");
             std::process::exit(1);
         }
     }
@@ -74,6 +78,38 @@ async fn run_tls_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .add_service(GreeterServer::new(BenchGreeter))
         .serve_with_incoming(tls_incoming)
         .await?;
+
+    Ok(())
+}
+
+async fn run_h3_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    let (certs, key) = h3_common::load_certs_from_pem(&args.cert, &args.key);
+    let server_config = h3_common::make_server_config(&certs, key);
+    let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
+
+    let socket = Arc::new(
+        RdmaUdpSocket::bind(&args.bind, TransportConfig::datagram()).expect("bind RDMA UDP socket"),
+    );
+    let bound_addr = socket.bound_addr();
+
+    let endpoint = quinn::Endpoint::new_with_abstract_socket(
+        quinn::EndpointConfig::default(),
+        Some(server_config),
+        socket,
+        runtime,
+    )?;
+
+    eprintln!("Benchmark server listening on {} (mode=h3)", bound_addr);
+
+    let acceptor = tonic_h3::quinn::H3QuinnAcceptor::new(endpoint.clone());
+    let routes = tonic::service::Routes::builder()
+        .add_service(GreeterServer::new(BenchGreeter))
+        .clone()
+        .routes();
+    tonic_h3::server::H3Router::new(routes)
+        .serve(acceptor)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error> { e })?;
 
     Ok(())
 }
