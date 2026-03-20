@@ -211,6 +211,6 @@ gRPC over HTTP/3 over QUIC over RDMA — the full stack works via `tonic-h3` (v0
 
 - [rdma-transport-layer.md](rdma-transport-layer.md) — Transport trait architecture
 - [rdma-transport-comparison.md](rdma-transport-comparison.md) — Three-way comparison
-- [rdma-ring-transport.md](rdma-ring-transport.md) — Future Ring transport
+- [rdma-credit-ring-transport.md](rdma-credit-ring-transport.md) — Future Ring transport
 - [quinn-rs/quinn](https://github.com/quinn-rs/quinn) — Quinn source
 - [msquic RDMA analysis](../background/msquic-rdma.md) — msquic research

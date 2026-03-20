@@ -5,6 +5,7 @@
 **Implementation:** `rdma-io/src/credit_ring_transport.rs`  
 **Reference:** [rdma-transport-layer.md](rdma-transport-layer.md) — Transport architecture  
 **Reference:** [rdma-transport-comparison.md](rdma-transport-comparison.md) — Three-way comparison  
+**Reference:** [rdma-read-ring-transport.md](rdma-read-ring-transport.md) — ReadRingTransport (future sibling)  
 **Reference:** [msquic-rdma.md](../background/msquic-rdma.md) — msquic Write+Ring analysis  
 **Reference:** [Rsocket.md](../background/Rsocket.md) — rsocket Write+Ring analysis
 
@@ -366,7 +367,7 @@ CQs before fields are dropped, ensuring all in-flight WRs release MR references:
 
 - **`ReadRingTransport` sibling.** A sibling transport using RDMA Read for flow control
   (msquic-style) will share ~80% of the ring infrastructure. See
-  [RingPerformance.md](../future/RingPerformance.md) for the transport family design.
+  [rdma-read-ring-transport.md](rdma-read-ring-transport.md) for the full design.
 - **Credit keepalive**: Periodic 0-byte probe to detect hung peers.
 - **Credit batching**: Send credit updates every N reposts to reduce WR overhead.
 - **Large ring mode**: Length-only immediate encoding + RDMA Read for >64KB rings.

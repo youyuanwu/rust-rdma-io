@@ -127,7 +127,7 @@ any builder — users choose the transport at construction time.
 
 `CreditRingTransport` implements `Transport` using RDMA Write + Immediate Data.
 Drop-in replacement via generics — consumer code unchanged.
-See [rdma-ring-transport.md](rdma-ring-transport.md) for the full design.
+See [rdma-credit-ring-transport.md](rdma-credit-ring-transport.md) for the full design.
 
 | Aspect | SendRecvTransport | CreditRingTransport |
 |--------|--------------|-------------------|
@@ -161,7 +161,8 @@ design and trade-off analysis.
 ## References
 
 - [quinn-rdma.md](quinn-rdma.md) — Quinn RDMA integration (implemented)
-- [rdma-ring-transport.md](rdma-ring-transport.md) — Ring buffer transport design (future)
+- [rdma-credit-ring-transport.md](rdma-credit-ring-transport.md) — CreditRingTransport design (implemented)
+- [rdma-read-ring-transport.md](rdma-read-ring-transport.md) — ReadRingTransport design (future)
 - [rdma-transport-comparison.md](rdma-transport-comparison.md) — Three-way comparison
 - [rdma-io/src/transport.rs](../../rdma-io/src/transport.rs) — Transport trait
 - [rdma-io/src/send_recv_transport.rs](../../rdma-io/src/send_recv_transport.rs) — SendRecvTransport

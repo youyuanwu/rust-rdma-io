@@ -899,3 +899,107 @@ async fn ring_multi_connection() {
 
     println!("ring_multi_connection passed!");
 }
+
+/// Regression test: Out-of-order repost_recv must NOT cause the sender to
+/// wrap around and overwrite unreleased data in the recv ring.
+///
+/// The fix uses CompletionTracker to defer credits until the contiguous
+/// head advances, preventing the sender from wrapping into gaps.
+///
+/// See docs/bugs/credit-ring-ooo-overwrite.md for full analysis.
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn ring_ooo_repost_overwrites_unreleased_data() {
+    require_no_iwarp!();
+    let config = CreditRingConfig::default(); // 64KB ring, 1500B msgs, max_outstanding=43
+    let (mut server, mut client) = ring_connected_pair(config).await;
+
+    let msg_size = 1500;
+
+    // Step 1: Fill ring completely — send until credits exhausted.
+    let mut sent_count = 0;
+    let mut sent_data: Vec<Vec<u8>> = Vec::new();
+    loop {
+        // Each message has a unique pattern so we can detect corruption.
+        let data: Vec<u8> = (0..msg_size)
+            .map(|i| ((sent_count * 13 + i * 7 + 42) % 251) as u8)
+            .collect();
+        match client.send_copy(&data) {
+            Ok(0) => break,
+            Ok(_) => {
+                sent_data.push(data);
+                sent_count += 1;
+            }
+            Err(e) => panic!("send_copy error: {e}"),
+        }
+    }
+    assert!(sent_count >= 3, "need at least 3 messages to test OOO");
+    println!("sent {sent_count} messages, ring full");
+
+    // Drain all send completions.
+    drain_send_completions(&mut client).await;
+
+    // Step 2: Receive ALL messages on server.
+    let mut recv_completions = Vec::new();
+    for _ in 0..sent_count {
+        let rc = recv_one(&mut server).await;
+        recv_completions.push(rc);
+    }
+
+    // Verify message 0 data is correct before any repost.
+    let msg0_rc = recv_completions[0];
+    let msg0_original = server.recv_buf(msg0_rc.buf_idx)[..msg0_rc.byte_len].to_vec();
+    assert_eq!(
+        msg0_original, sent_data[0],
+        "message 0 should match before any repost"
+    );
+
+    // Step 3: Repost all messages EXCEPT message 0 (out-of-order release).
+    for rc in &recv_completions[1..] {
+        server.repost_recv(rc.buf_idx).unwrap();
+    }
+    println!("reposted messages 1..{sent_count}, holding message 0");
+
+    // Step 4: Try to send — sender should get NO credits because slot 0
+    // blocks contiguous advance in the CompletionTracker.
+    // Give enough time for any credit updates to arrive.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    drain_recv_credits(&mut client).await;
+    drain_send_completions(&mut client).await;
+
+    let new_pattern: Vec<u8> = (0..msg_size)
+        .map(|i| (0xBB_u8).wrapping_add(i as u8))
+        .collect();
+    let n = client.send_copy(&new_pattern).unwrap();
+    assert_eq!(
+        n, 0,
+        "sender should have 0 credits — slot 0 blocks contiguous advance"
+    );
+    println!("confirmed: sender blocked (0 credits) while msg 0 unreleased");
+
+    // Step 5: Verify message 0 data is intact (not overwritten).
+    let msg0_after = server.recv_buf(msg0_rc.buf_idx)[..msg0_rc.byte_len].to_vec();
+    assert_eq!(
+        msg0_after, msg0_original,
+        "message 0 data should be intact — OOO repost must not allow overwrite"
+    );
+
+    // Step 6: Release message 0 — credits should now flush (contiguous 0..42).
+    server.repost_recv(msg0_rc.buf_idx).unwrap();
+    println!("released message 0 — credits should flush");
+
+    // Step 7: Sender should now be able to send (all credits recovered at once).
+    let n = send_after_credits(&mut client, &new_pattern, "post-flush send").await;
+    assert!(n > 0, "sender should have credits after slot 0 released");
+    drain_send_completions(&mut client).await;
+
+    // Verify the new message arrived intact on the server.
+    let rc = recv_one(&mut server).await;
+    assert_eq!(
+        &server.recv_buf(rc.buf_idx)[..rc.byte_len],
+        &new_pattern[..n],
+        "new message data integrity after OOO recovery"
+    );
+    server.repost_recv(rc.buf_idx).unwrap();
+
+    println!("ring_ooo_repost_overwrites_unreleased_data passed (bug fixed)!");
+}

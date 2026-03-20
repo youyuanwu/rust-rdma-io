@@ -297,7 +297,7 @@ test bodies with `_default` and `_ring` variants.
 ## References
 
 - [docs/design/rdma-transport-layer.md](rdma-transport-layer.md) — Transport trait architecture
-- [docs/design/rdma-ring-transport.md](rdma-ring-transport.md) — Ring transport design
+- [docs/design/rdma-credit-ring-transport.md](rdma-credit-ring-transport.md) — Ring transport design
 - [docs/design/quinn-rdma.md](quinn-rdma.md) — Quinn RDMA integration design
 - [docs/background/msquic-rdma.md](../background/msquic-rdma.md) — msquic RDMA transport analysis
 - [docs/background/Rsocket.md](../background/Rsocket.md) — rsocket internal implementation analysis

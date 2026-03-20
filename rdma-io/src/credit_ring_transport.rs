@@ -234,9 +234,8 @@ impl RingBuffer {
 // CompletionTracker — chase-forward slot release
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)] // Will be used for out-of-order completion tracking if needed.
 struct CompletionTracker {
-    released: Vec<bool>,
+    released: Box<[bool]>,
     head_slot: usize,
     capacity: usize,
 }
@@ -244,7 +243,7 @@ struct CompletionTracker {
 impl CompletionTracker {
     fn new(capacity: usize) -> Self {
         Self {
-            released: vec![false; capacity],
+            released: vec![false; capacity].into_boxed_slice(),
             head_slot: 0,
             capacity,
         }
@@ -252,8 +251,7 @@ impl CompletionTracker {
 
     /// Mark `slot` as released and chase forward from head_slot.
     ///
-    /// Returns the number of contiguous bytes/slots that can be advanced.
-    #[allow(dead_code)] // Reserved for out-of-order completion tracking.
+    /// Returns the number of contiguous slots that can be advanced.
     fn release(&mut self, slot: usize) -> usize {
         if slot < self.capacity {
             self.released[slot] = true;
@@ -289,9 +287,12 @@ pub struct CreditRingTransport {
     qp_check_counter: u32,
 
     // -- Virtual buffer index mapping --
-    virtual_idx_map: Vec<Option<(usize, usize)>>,
+    // -- Virtual buffer index mapping (fixed at max_outstanding) --
+    virtual_idx_map: Box<[Option<(usize, usize, usize)>]>, // (offset, length, arrival_seq)
     next_virt_idx: usize,
     max_outstanding: usize,
+    /// Monotonic counter: sequence number assigned to each received data message.
+    recv_arrival_seq: usize,
 
     // -- Recv stash --
     recv_stash: VecDeque<RecvCompletion>,
@@ -319,16 +320,13 @@ pub struct CreditRingTransport {
     /// Position in the remote ring where the next write goes.
     remote_write_tail: usize,
 
-    // -- Doorbell recv buffers --
-    doorbell_bufs: Vec<OwnedMemoryRegion>,
+    // -- Doorbell recv buffers (fixed at max_outstanding) --
+    doorbell_bufs: Box<[OwnedMemoryRegion]>,
     /// Round-robin index for reposting doorbell recv buffers.
     doorbell_repost_idx: usize,
 
-    // -- Completion trackers --
-    #[allow(dead_code)] // Reserved for out-of-order recv completion tracking.
+    // -- Completion tracker (recv side, for OOO repost_recv) --
     recv_tracker: CompletionTracker,
-    #[allow(dead_code)] // RC QPs have in-order completions; send_ring uses direct head advance.
-    send_tracker: CompletionTracker,
 
     // -- Config --
     config: CreditRingConfig,
@@ -388,9 +386,10 @@ impl CreditRingTransport {
             AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::MW_BIND,
         )?;
 
-        let doorbell_bufs = (0..max_outstanding)
+        let doorbell_bufs: Box<[OwnedMemoryRegion]> = (0..max_outstanding)
             .map(|_| pd.reg_mr_owned(vec![0u8; 4], AccessFlags::LOCAL_WRITE))
-            .collect::<crate::Result<Vec<_>>>()?;
+            .collect::<crate::Result<Vec<_>>>()?
+            .into_boxed_slice();
 
         let qp = AsyncQp::new(cmqp, send_cq, recv_cq);
 
@@ -485,9 +484,10 @@ impl CreditRingTransport {
             AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::MW_BIND,
         )?;
 
-        let doorbell_bufs = (0..max_outstanding)
+        let doorbell_bufs: Box<[OwnedMemoryRegion]> = (0..max_outstanding)
             .map(|_| pd.reg_mr_owned(vec![0u8; 4], AccessFlags::LOCAL_WRITE))
-            .collect::<crate::Result<Vec<_>>>()?;
+            .collect::<crate::Result<Vec<_>>>()?
+            .into_boxed_slice();
 
         let qp = AsyncQp::new(cmqp, send_cq, recv_cq);
 
@@ -546,7 +546,7 @@ impl CreditRingTransport {
         send_mr: OwnedMemoryRegion,
         recv_mr: OwnedMemoryRegion,
         recv_mw: MemoryWindow,
-        doorbell_bufs: Vec<OwnedMemoryRegion>,
+        doorbell_bufs: Box<[OwnedMemoryRegion]>,
         remote_addr: u64,
         remote_rkey: u32,
         remote_capacity: usize,
@@ -563,9 +563,10 @@ impl CreditRingTransport {
             qp_dead: false,
             qp_check_counter: 0,
 
-            virtual_idx_map: vec![None; max_outstanding],
+            virtual_idx_map: vec![None; max_outstanding].into_boxed_slice(),
             next_virt_idx: 0,
             max_outstanding,
+            recv_arrival_seq: 0,
 
             recv_stash: VecDeque::new(),
 
@@ -590,7 +591,6 @@ impl CreditRingTransport {
             doorbell_repost_idx: 0,
 
             recv_tracker: CompletionTracker::new(max_outstanding),
-            send_tracker: CompletionTracker::new(max_outstanding),
 
             config,
 
@@ -662,20 +662,26 @@ impl CreditRingTransport {
                     let offset = (imm >> 16) as usize;
                     let length = (imm & 0xFFFF) as usize;
                     if length == 0 {
-                        // Padding — advance recv_ring head, repost doorbell,
-                        // send credit update.
-                        let pad_len = self.recv_ring.capacity - offset;
-                        self.recv_ring.release(pad_len);
+                        // Padding — advance recv_ring head, repost doorbell.
+                        // Padding consumes a sender credit, so assign a tracker
+                        // slot and immediately release it.
+                        let _pad_len = self.recv_ring.capacity - offset;
                         let _ = self.repost_doorbell();
-                        self.local_freed_credits += 1;
-                        let credit_imm = self.local_freed_credits as u32;
-                        let mut credit_wr = SendWr::new(
-                            WR_ID_CREDIT_FLAG | (self.local_freed_credits as u64),
-                            WrOpcode::SendWithImm(credit_imm),
-                        )
-                        .flags(SendFlags::SIGNALED);
-                        let _ = self.qp.post_send_wr(&mut credit_wr);
-                        self.send_in_flight += 1;
+                        let seq = self.recv_arrival_seq;
+                        self.recv_arrival_seq += 1;
+                        let slot = seq % self.max_outstanding;
+                        let contiguous = self.recv_tracker.release(slot);
+                        if contiguous > 0 {
+                            self.local_freed_credits += contiguous;
+                            let credit_imm = self.local_freed_credits as u32;
+                            let mut credit_wr = SendWr::new(
+                                WR_ID_CREDIT_FLAG | (self.local_freed_credits as u64),
+                                WrOpcode::SendWithImm(credit_imm),
+                            )
+                            .flags(SendFlags::SIGNALED);
+                            let _ = self.qp.post_send_wr(&mut credit_wr);
+                            self.send_in_flight += 1;
+                        }
                     } else {
                         // Data — find a virtual idx slot and stash.
                         let mut virt_idx = self.next_virt_idx;
@@ -688,7 +694,9 @@ impl CreditRingTransport {
                             virt_idx = (virt_idx + 1) % self.max_outstanding;
                         }
                         if found {
-                            self.virtual_idx_map[virt_idx] = Some((offset, length));
+                            let seq = self.recv_arrival_seq;
+                            self.recv_arrival_seq += 1;
+                            self.virtual_idx_map[virt_idx] = Some((offset, length, seq));
                             self.next_virt_idx = (virt_idx + 1) % self.max_outstanding;
                             self.recv_stash.push_back(RecvCompletion {
                                 buf_idx: virt_idx,
@@ -943,21 +951,24 @@ impl Transport for CreditRingTransport {
                         }
 
                         if length == 0 {
-                            // Padding — advance recv_ring head, repost doorbell,
-                            // and send credit update (padding consumed 1 sender credit).
-                            let pad_len = self.recv_ring.capacity - offset;
-                            self.recv_ring.release(pad_len);
+                            // Padding — repost doorbell. Assign a tracker slot
+                            // and immediately release (padding is auto-consumed).
                             let _ = self.repost_doorbell();
-                            // Credit update for the padding message.
-                            self.local_freed_credits += 1;
-                            let credit_imm = self.local_freed_credits as u32;
-                            let mut credit_wr = SendWr::new(
-                                WR_ID_CREDIT_FLAG | (self.local_freed_credits as u64),
-                                WrOpcode::SendWithImm(credit_imm),
-                            )
-                            .flags(SendFlags::SIGNALED);
-                            let _ = self.qp.post_send_wr(&mut credit_wr);
-                            self.send_in_flight += 1;
+                            let seq = self.recv_arrival_seq;
+                            self.recv_arrival_seq += 1;
+                            let slot = seq % self.max_outstanding;
+                            let contiguous = self.recv_tracker.release(slot);
+                            if contiguous > 0 {
+                                self.local_freed_credits += contiguous;
+                                let credit_imm = self.local_freed_credits as u32;
+                                let mut credit_wr = SendWr::new(
+                                    WR_ID_CREDIT_FLAG | (self.local_freed_credits as u64),
+                                    WrOpcode::SendWithImm(credit_imm),
+                                )
+                                .flags(SendFlags::SIGNALED);
+                                let _ = self.qp.post_send_wr(&mut credit_wr);
+                                self.send_in_flight += 1;
+                            }
                             continue;
                         }
 
@@ -983,7 +994,9 @@ impl Transport for CreditRingTransport {
                             )));
                         }
 
-                        self.virtual_idx_map[virt_idx] = Some((offset, length));
+                        let seq = self.recv_arrival_seq;
+                        self.recv_arrival_seq += 1;
+                        self.virtual_idx_map[virt_idx] = Some((offset, length, seq));
                         self.next_virt_idx = (virt_idx + 1) % self.max_outstanding;
 
                         let rc = RecvCompletion {
@@ -1041,37 +1054,49 @@ impl Transport for CreditRingTransport {
     }
 
     fn recv_buf(&self, buf_idx: usize) -> &[u8] {
-        let (offset, length) =
+        let (offset, length, _seq) =
             self.virtual_idx_map[buf_idx].expect("recv_buf called with invalid buf_idx");
         &self.recv_ring.mr.as_slice()[offset..offset + length]
     }
 
     fn repost_recv(&mut self, buf_idx: usize) -> crate::Result<()> {
-        let (_offset, length) = self.virtual_idx_map[buf_idx]
+        let (_offset, _length, arrival_seq) = self.virtual_idx_map[buf_idx]
             .take()
             .expect("repost_recv called with invalid buf_idx");
-
-        // Release recv_ring slot.
-        self.recv_ring.release(length);
 
         // Repost a doorbell recv buffer.
         self.repost_doorbell()?;
 
-        // Increment local freed credits.
-        self.local_freed_credits += 1;
+        // Mark this arrival sequence slot as released and chase forward.
+        // Credits are only sent for contiguous head advances — this prevents
+        // the sender from wrapping remote_write_tail into unreleased ring positions
+        // when repost_recv is called out of order.
+        // See docs/bugs/credit-ring-ooo-overwrite.md.
+        let slot = arrival_seq % self.max_outstanding;
+        let contiguous = self.recv_tracker.release(slot);
 
-        // Send credit update: Send with Immediate Data (absolute freed count).
-        let imm = self.local_freed_credits as u32;
-        let wr_id = WR_ID_CREDIT_FLAG | (self.local_freed_credits as u64);
-        let mut wr = SendWr::new(wr_id, WrOpcode::SendWithImm(imm)).flags(SendFlags::SIGNALED);
-        self.qp.post_send_wr(&mut wr)?;
-        self.send_in_flight += 1;
+        if contiguous > 0 {
+            self.local_freed_credits += contiguous;
 
-        tracing::debug!(
-            local_freed_credits = self.local_freed_credits,
-            send_in_flight = self.send_in_flight,
-            "repost_recv: sent credit update"
-        );
+            // Send credit update: absolute freed count.
+            let imm = self.local_freed_credits as u32;
+            let wr_id = WR_ID_CREDIT_FLAG | (self.local_freed_credits as u64);
+            let mut wr = SendWr::new(wr_id, WrOpcode::SendWithImm(imm)).flags(SendFlags::SIGNALED);
+            self.qp.post_send_wr(&mut wr)?;
+            self.send_in_flight += 1;
+
+            tracing::debug!(
+                contiguous,
+                local_freed_credits = self.local_freed_credits,
+                send_in_flight = self.send_in_flight,
+                "repost_recv: sent credit update (contiguous advance)"
+            );
+        } else {
+            tracing::debug!(
+                arrival_seq,
+                "repost_recv: non-contiguous release, credit deferred"
+            );
+        }
 
         Ok(())
     }
