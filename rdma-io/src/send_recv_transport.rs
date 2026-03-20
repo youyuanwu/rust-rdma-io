@@ -147,10 +147,7 @@ impl SendRecvTransport {
     }
 
     /// Accept a connection from a listener (server side).
-    pub async fn accept(
-        listener: &AsyncCmListener,
-        config: SendRecvConfig,
-    ) -> crate::Result<Self> {
+    pub async fn accept(listener: &AsyncCmListener, config: SendRecvConfig) -> crate::Result<Self> {
         let conn_id = listener.get_request().await?;
         Self::complete_accept(conn_id, listener, config).await
     }

@@ -441,7 +441,10 @@ impl CreditRingTransport {
     ///
     /// Waits for an incoming connection request, allocates ring buffers and MW,
     /// exchanges ring tokens with the peer, and returns a ready transport.
-    pub async fn accept(listener: &AsyncCmListener, config: CreditRingConfig) -> crate::Result<Self> {
+    pub async fn accept(
+        listener: &AsyncCmListener,
+        config: CreditRingConfig,
+    ) -> crate::Result<Self> {
         // Ring transport requires InfiniBand/RoCE — iWARP doesn't support MW Type 2.
         if crate::device::any_device_is_iwarp() {
             return Err(crate::Error::InvalidArg(

@@ -9,19 +9,24 @@ use std::task::Poll;
 
 use rdma_io::async_cm::AsyncCmListener;
 use rdma_io::async_stream::AsyncRdmaStream;
-use rdma_io::credit_ring_transport::{CreditRingTransport, CreditRingConfig};
+use rdma_io::credit_ring_transport::{CreditRingConfig, CreditRingTransport};
 use rdma_io::transport::{RecvCompletion, Transport};
 use rdma_io_tests::require_no_iwarp;
 use rdma_io_tests::test_helpers::{bind_addr, connect_addr_for};
 
 /// Helper: create a connected (server, client) ring transport pair.
-async fn ring_connected_pair(config: CreditRingConfig) -> (CreditRingTransport, CreditRingTransport) {
+async fn ring_connected_pair(
+    config: CreditRingConfig,
+) -> (CreditRingTransport, CreditRingTransport) {
     let listener = AsyncCmListener::bind(&bind_addr()).unwrap();
     let connect_addr = connect_addr_for(listener.local_addr());
     let config2 = config.clone();
 
-    let server =
-        tokio::spawn(async move { CreditRingTransport::accept(&listener, config2).await.unwrap() });
+    let server = tokio::spawn(async move {
+        CreditRingTransport::accept(&listener, config2)
+            .await
+            .unwrap()
+    });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let client = tokio::spawn(async move {
         CreditRingTransport::connect(&connect_addr, config)
@@ -50,6 +55,40 @@ async fn drain_send_completions(transport: &mut CreditRingTransport) {
     })
     .await
     {}
+}
+
+/// Helper: non-blocking drain of recv CQ (picks up credit updates without blocking).
+async fn drain_recv_credits(transport: &mut CreditRingTransport) {
+    let mut completions = [RecvCompletion::default(); 8];
+    let _ = poll_fn(|cx| match transport.poll_recv(cx, &mut completions) {
+        Poll::Ready(r) => Poll::Ready(Some(r)),
+        Poll::Pending => Poll::Ready(None),
+    })
+    .await;
+}
+
+/// Helper: send data, retrying until credit updates arrive from the peer.
+///
+/// Credit updates (Send+Imm) are delivered asynchronously — a single
+/// `poll_recv` may not catch them if the RDMA Send is still in-flight.
+/// This helper drains recv credits + send completions in a loop, retrying
+/// `send_copy` with a 5 s timeout.
+async fn send_after_credits(transport: &mut CreditRingTransport, data: &[u8], ctx: &str) -> usize {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        drain_recv_credits(transport).await;
+        drain_send_completions(transport).await;
+
+        let n = transport.send_copy(data).unwrap();
+        if n > 0 {
+            return n;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{ctx} — timed out waiting for credits (5 s)"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
 
 /// Helper: receive one completion and return (buf_idx, byte_len).
@@ -192,18 +231,8 @@ async fn ring_credit_recovery() {
         server.repost_recv(rc.buf_idx).unwrap();
     }
 
-    // Sender: process credit updates — credits arrive as Recv completions
-    // on the sender's recv CQ (peer's Send+Imm)
-    let mut completions = [RecvCompletion::default(); 8];
-    let _n = poll_fn(|cx| client.poll_recv(cx, &mut completions))
-        .await
-        .unwrap();
-
-    // Drain any remaining send completions
-    drain_send_completions(&mut client).await;
-
-    // Now send_copy should succeed again
-    let n = client.send_copy(&data).unwrap();
+    // Credit updates are async — retry send_copy until credits arrive.
+    let n = send_after_credits(&mut client, &data, "credit recovery").await;
     assert!(n > 0, "send_copy should succeed after credit recovery");
 
     println!("ring_credit_recovery passed!");
@@ -241,18 +270,9 @@ async fn ring_wrap_around() {
         server.repost_recv(rc.buf_idx).unwrap();
     }
 
-    // Process credit updates on sender side
-    let mut completions = [RecvCompletion::default(); 8];
-    let _n = poll_fn(|cx| client.poll_recv(cx, &mut completions))
-        .await
-        .unwrap();
-
-    // Drain all pending send completions
-    drain_send_completions(&mut client).await;
-
-    // Second batch: this should cause ring wrap-around
+    // Credit updates are async — retry send_copy until credits arrive.
     let wrap_data: Vec<u8> = (0..msg_size).map(|i| ((i + 42) % 253) as u8).collect();
-    let n = client.send_copy(&wrap_data).unwrap();
+    let n = send_after_credits(&mut client, &wrap_data, "wrap-around").await;
     assert!(n > 0, "send should succeed after credits recovered (wrap)");
     // Drain all pending send completions
     drain_send_completions(&mut client).await;
@@ -419,15 +439,9 @@ async fn ring_out_of_order_repost() {
     server.repost_recv(rc_b.buf_idx).unwrap();
     server.repost_recv(rc_a.buf_idx).unwrap();
 
-    // Verify credits recovered — sender should be able to process credit updates
-    // and send again
-    let mut completions = [RecvCompletion::default(); 8];
-    let _n = poll_fn(|cx| client.poll_recv(cx, &mut completions))
-        .await
-        .unwrap();
-
+    // Verify credits recovered — retry since credit updates are async.
     let data_c = b"after-reorder";
-    let n = client.send_copy(data_c).unwrap();
+    let n = send_after_credits(&mut client, data_c, "out-of-order repost").await;
     assert!(n > 0, "send should work after out-of-order repost");
 
     println!("ring_out_of_order_repost passed!");
@@ -459,17 +473,10 @@ async fn ring_credit_wr_disambiguation() {
     // Drain all pending send completions
     drain_send_completions(&mut server).await;
 
-    // Sender processes credit updates via poll_recv
-    let mut completions = [RecvCompletion::default(); 8];
-    let _n = poll_fn(|cx| client.poll_recv(cx, &mut completions))
-        .await
-        .unwrap();
-
+    // Sender processes credit updates — retry since async.
     // Now send more — credits should be available
     for _ in 0..3 {
-        let n = client.send_copy(&data).unwrap();
-        assert!(n > 0, "send should succeed after credit recovery");
-        // Drain all pending send completions
+        send_after_credits(&mut client, &data, "credit wr disambiguation").await;
         drain_send_completions(&mut client).await;
     }
 
@@ -642,24 +649,37 @@ async fn ring_virtual_idx_wrap() {
     // Drain all pending send completions
     drain_send_completions(&mut server).await;
 
-    // Process credit updates on sender
-    let mut completions = [RecvCompletion::default(); 8];
-    let _n = poll_fn(|cx| client.poll_recv(cx, &mut completions))
-        .await
-        .unwrap();
-
-    // Drain all pending send completions
+    // Process credit updates on sender — retry since async delivery.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     drain_send_completions(&mut client).await;
 
-    // Batch 2: virtual idx slots should be recycled
+    // Batch 2: virtual idx slots should be recycled.
+    // First send retries until credits arrive; subsequent Ok(0) means real exhaustion.
     let mut batch2_count = 0;
     for i in 0..max_outstanding {
         let msg: Vec<u8> = (0..1500).map(|j| ((i * 3 + j) % 251) as u8).collect();
-        match client.send_copy(&msg) {
-            Ok(0) => break,
-            Ok(_) => batch2_count += 1,
-            Err(e) => panic!("batch 2 send_copy error: {e}"),
+        let mut n = 0;
+        while n == 0 {
+            drain_recv_credits(&mut client).await;
+            drain_send_completions(&mut client).await;
+
+            match client.send_copy(&msg) {
+                Ok(0) if batch2_count > 0 => break,
+                Ok(0) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "batch 2 should send messages (idx recycled) — timed out after 5s"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Ok(sent) => n = sent,
+                Err(e) => panic!("batch 2 send_copy error: {e}"),
+            }
         }
+        if n == 0 {
+            break;
+        }
+        batch2_count += 1;
     }
     assert!(
         batch2_count > 0,
@@ -713,7 +733,9 @@ async fn ring_stream_echo() {
     let config2 = config.clone();
 
     let server_handle = tokio::spawn(async move {
-        let transport = CreditRingTransport::accept(&listener, config2).await.unwrap();
+        let transport = CreditRingTransport::accept(&listener, config2)
+            .await
+            .unwrap();
         AsyncRdmaStream::new(transport)
     });
 
@@ -821,7 +843,9 @@ async fn ring_multi_connection() {
     let addr1 = connect_addr;
     let client1_handle = tokio::spawn(async move {
         println!("Client1: connecting...");
-        let t = CreditRingTransport::connect(&addr1, config_c1).await.unwrap();
+        let t = CreditRingTransport::connect(&addr1, config_c1)
+            .await
+            .unwrap();
         println!("Client1: connected");
         t
     });
@@ -835,7 +859,9 @@ async fn ring_multi_connection() {
     let addr2 = connect_addr;
     let client2_handle = tokio::spawn(async move {
         println!("Client2: connecting...");
-        let t = CreditRingTransport::connect(&addr2, config_c2).await.unwrap();
+        let t = CreditRingTransport::connect(&addr2, config_c2)
+            .await
+            .unwrap();
         println!("Client2: connected");
         t
     });
