@@ -6,6 +6,7 @@
 
 use rdma_io::async_stream::AsyncRdmaStream;
 use rdma_io::credit_ring_transport::CreditRingConfig;
+use rdma_io::read_ring_transport::ReadRingConfig;
 use rdma_io::send_recv_transport::SendRecvConfig;
 use rdma_io::transport::TransportBuilder;
 
@@ -88,6 +89,12 @@ async fn echo_ring() {
     echo(CreditRingConfig::default()).await;
 }
 
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn echo_read_ring() {
+    require_no_iwarp!();
+    echo(ReadRingConfig::default()).await;
+}
+
 // ===========================================================================
 // multi_message — 5 round-trips of ping/pong.
 // ===========================================================================
@@ -124,6 +131,12 @@ async fn multi_message_default() {
 async fn multi_message_ring() {
     require_no_iwarp!();
     multi_message(CreditRingConfig::default()).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn multi_message_read_ring() {
+    require_no_iwarp!();
+    multi_message(ReadRingConfig::default()).await;
 }
 
 // ===========================================================================
@@ -179,6 +192,12 @@ async fn large_transfer_ring() {
     large_transfer(CreditRingConfig::default()).await;
 }
 
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn large_transfer_read_ring() {
+    require_no_iwarp!();
+    large_transfer(ReadRingConfig::default()).await;
+}
+
 // ===========================================================================
 // futures_io_echo — echo via futures::io::AsyncReadExt / AsyncWriteExt traits.
 // ===========================================================================
@@ -219,6 +238,12 @@ async fn futures_io_echo_ring() {
     futures_io_echo(CreditRingConfig::default()).await;
 }
 
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn futures_io_echo_read_ring() {
+    require_no_iwarp!();
+    futures_io_echo(ReadRingConfig::default()).await;
+}
+
 // ===========================================================================
 // tokio_compat — tokio::io traits via FuturesAsyncReadCompatExt.
 // ===========================================================================
@@ -255,6 +280,12 @@ async fn tokio_compat_ring() {
     tokio_compat(CreditRingConfig::default()).await;
 }
 
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn tokio_compat_read_ring() {
+    require_no_iwarp!();
+    tokio_compat(ReadRingConfig::default()).await;
+}
+
 // ===========================================================================
 // tokio_io_copy — tokio::io::copy through the compat layer.
 // ===========================================================================
@@ -286,6 +317,12 @@ async fn tokio_io_copy_ring() {
     tokio_io_copy(CreditRingConfig::default()).await;
 }
 
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn tokio_io_copy_read_ring() {
+    require_no_iwarp!();
+    tokio_io_copy(ReadRingConfig::default()).await;
+}
+
 // ===========================================================================
 // shutdown_after_peer_drop — server shutdown must not hang after client drops.
 // ===========================================================================
@@ -309,6 +346,12 @@ async fn shutdown_after_peer_drop_default() {
 async fn shutdown_after_peer_drop_ring() {
     require_no_iwarp!();
     shutdown_after_peer_drop(CreditRingConfig::default()).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn shutdown_after_peer_drop_read_ring() {
+    require_no_iwarp!();
+    shutdown_after_peer_drop(ReadRingConfig::default()).await;
 }
 
 // ===========================================================================
@@ -341,6 +384,12 @@ async fn read_eof_then_shutdown_default() {
 async fn read_eof_then_shutdown_ring() {
     require_no_iwarp!();
     read_eof_then_shutdown(CreditRingConfig::default()).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn read_eof_then_shutdown_read_ring() {
+    require_no_iwarp!();
+    read_eof_then_shutdown(ReadRingConfig::default()).await;
 }
 
 // ===========================================================================
@@ -390,6 +439,12 @@ async fn write_then_shutdown_after_peer_drop_ring() {
     write_then_shutdown_after_peer_drop(CreditRingConfig::default()).await;
 }
 
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn write_then_shutdown_after_peer_drop_read_ring() {
+    require_no_iwarp!();
+    write_then_shutdown_after_peer_drop(ReadRingConfig::default()).await;
+}
+
 // ===========================================================================
 // graceful_shutdown — round-trip then explicit shutdown (DREQ → DISCONNECTED).
 // ===========================================================================
@@ -418,6 +473,12 @@ async fn graceful_shutdown_default() {
 async fn graceful_shutdown_ring() {
     require_no_iwarp!();
     graceful_shutdown(CreditRingConfig::default()).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn graceful_shutdown_read_ring() {
+    require_no_iwarp!();
+    graceful_shutdown(ReadRingConfig::default()).await;
 }
 
 // ===========================================================================
@@ -450,4 +511,10 @@ async fn poll_close_default() {
 async fn poll_close_ring() {
     require_no_iwarp!();
     poll_close(CreditRingConfig::default()).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn poll_close_read_ring() {
+    require_no_iwarp!();
+    poll_close(ReadRingConfig::default()).await;
 }

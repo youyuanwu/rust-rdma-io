@@ -114,7 +114,7 @@ contiguous free space from the wrap-around perspective.
 
 - `rdma-io/src/credit_ring_transport.rs` — `repost_recv()`, `recv_ring.release()`
 - `rdma-io/src/credit_ring_transport.rs:238` — `CompletionTracker` (exists, unused)
-- `ReadRingTransport` (future) — already designed with chase-forward release
+- `ReadRingTransport` — implemented with chase-forward release
 
 ## Workaround
 

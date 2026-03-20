@@ -211,6 +211,113 @@ Both msquic-RDMA and rsocket use RDMA Write into remote ring buffers for data tr
 
 6. **Ring buffer complexity** — the `datapath_rdma_ringbuffer.c` handles wrap-around, out-of-order completions, and head/tail synchronization — significant protocol surface absent from two-sided designs
 
+## QUIC-to-RDMA Connection Mapping
+
+### msquic Approach: 1 QUIC connection = 1 RDMA connection
+
+MsQuic replaces the UDP socket with an RDMA connection at the **datapath** layer.
+The mapping is **1:1** — each QUIC connection (identified by a remote address) gets
+its own dedicated RDMA connection with its own QP, CQs, and ring buffers:
+
+```
+  QUIC Connection A (peer 10.0.0.1:4433)
+    └── RDMA_CONNECTION A  (QP, send/recv CQ, ring buffers)
+
+  QUIC Connection B (peer 10.0.0.2:4433)
+    └── RDMA_CONNECTION B  (QP, send/recv CQ, ring buffers)
+```
+
+The `CXPLAT_SOCKET` struct has a `RdmaContext` pointer to an `RDMA_CONNECTION`:
+
+```c
+Socket->RdmaContext = RdmaConnection;   // 1:1 binding
+RdmaConnection->Socket = Socket;        // back-pointer
+```
+
+**QUIC streams are invisible to the RDMA layer.** The QUIC core multiplexes streams
+into QUIC packets (datagrams), and each datagram is delivered as a single
+`WriteWithImmediate` into the remote ring buffer. The RDMA layer sees opaque packets,
+not streams.
+
+**Connection lifecycle:** msquic creates a new `RDMA_CONNECTION` (with its own QP +
+CQs + ring buffers) per QUIC connection via `SocketCreateRdmaInternal()`. The RDMA
+connection goes through the 13-state machine (connect → token exchange → ready).
+On the server side, `SocketCreateRdmaListener()` creates a listener, and
+`GetConnectionRequest` + `Accept` create per-client RDMA connections.
+
+**CIBIR (Connection ID Based Internal Routing):** For shared endpoints (multiple
+QUIC connections on the same IP:port), msquic uses CIBIR IDs in the RDMA connection's
+private data to demux incoming connections to the correct QUIC connection.
+
+### Our Approach (rdma-io-quinn): Same Architecture
+
+Our `RdmaUdpSocket<B>` (in `rdma-io-quinn`) takes the **same 1:1 approach**:
+
+```
+  Quinn Endpoint
+    └── RdmaUdpSocket<B: TransportBuilder>
+          ├── AsyncCmListener (accepts new peers)
+          └── HashMap<SocketAddr, Arc<Mutex<B::Transport>>>
+                ├── 10.0.0.1:4433 → CreditRingTransport A  (QP, CQs, ring)
+                └── 10.0.0.2:4433 → CreditRingTransport B  (QP, CQs, ring)
+```
+
+`RdmaUdpSocket` implements Quinn's `AsyncUdpSocket` trait — the same abstraction
+boundary as msquic's `CXPLAT_SOCKET`. Both replace the UDP datagram path while the
+QUIC protocol stack above runs unchanged.
+
+### Side-by-Side Comparison
+
+| Aspect | msquic | rdma-io-quinn |
+|--------|--------|---------------|
+| **Abstraction boundary** | `CXPLAT_SOCKET` (datapath layer) | `AsyncUdpSocket` (Quinn trait) |
+| **Mapping** | 1 QUIC connection = 1 `RDMA_CONNECTION` | 1 SocketAddr = 1 `B::Transport` |
+| **Connection registry** | `Socket->RdmaContext` (1:1 pointer) | `HashMap<SocketAddr, Arc<Mutex<T>>>` (N peers) |
+| **QUIC streams** | Invisible — RDMA sees opaque packets | Invisible — same |
+| **Server accept** | `Listener → GetConnectionRequest → Accept` | `AsyncCmListener → poll_accept → insert into map` |
+| **Client connect** | `Connector.Connect(RemoteAddr)` | `connect_to(addr)` pre-establishes RDMA |
+| **Multiplexing** | 1 QP per connection (dedicated) | 1 QP per connection (dedicated) |
+| **Send dispatch** | `RdmaSocketSend(Socket, Route, SendData)` | `try_send(transmit)` → lookup by `transmit.destination` |
+| **Recv dispatch** | `RecvCQ fires → upcall(Socket, RecvData)` | `poll_recv → iterate all transports → copy to Quinn bufs` |
+| **Data unit** | QUIC packet as single `WriteWithImmediate` | QUIC packet as single `send_copy` |
+| **Backpressure** | `SendQueue` — queues pending sends | `WouldBlock` — Quinn retries via `poll_writable` |
+| **Multi-connection polling** | 1 IOCP per connection (event-driven) | Round-robin all transports in `poll_recv` |
+
+### Key Similarities
+
+1. **Same 1:1 model**: Both give each QUIC peer its own RDMA connection (QP + CQs + buffers).
+   There is no RDMA-level multiplexing of multiple peers onto one QP.
+
+2. **Datapath replacement**: Both replace the UDP socket layer. The QUIC protocol
+   (TLS, congestion control, loss recovery, stream multiplexing) runs unmodified above.
+
+3. **Opaque packets**: RDMA carries QUIC packets as discrete datagrams. No stream
+   awareness at the RDMA layer.
+
+4. **Point-to-point connection**: Both require an RDMA connection (CM handshake +
+   token exchange) before data transfer. msquic does this in `NdspiConnect` / `NdspiAccept`;
+   we do it in `connect_to()` / `poll_accept()`.
+
+### Key Differences
+
+1. **Accept model**: msquic's server creates each client's full RDMA connection
+   inside the accept handler (`SocketCreateRdmaInternal` with `RDMA_SERVER` type).
+   Our server spawns an async `accept` future from the `TransportBuilder`, which
+   runs in the background and inserts the transport into the connection map when done.
+
+2. **Recv polling**: msquic uses IOCP — each connection's RecvCQ independently
+   fires a completion event. Our `poll_recv` iterates all connections in round-robin,
+   which is simpler but O(N) in connection count. For large connection counts, an
+   epoll-based approach (one `AsyncFd` per recv CQ) would be more efficient.
+
+3. **Backpressure**: msquic queues sends internally (`SendQueue`) and drains them
+   on send CQ completion. We return `WouldBlock` and rely on Quinn's `poll_writable` →
+   `RdmaUdpPoller` which waits on the blocked transport's send CQ.
+
+4. **Shared endpoints / CIBIR**: msquic supports multiplexing multiple QUIC
+   connections onto a shared RDMA endpoint via CIBIR ID routing. We don't support
+   this — each connection has its own listener port (point-to-point).
+
 ## Internal Implementation Details
 
 *Source: ~6000 lines in `datapath_winrdma.c` + ~500 lines in `datapath_rdma_ringbuffer.c`*

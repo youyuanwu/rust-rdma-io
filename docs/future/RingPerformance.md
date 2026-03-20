@@ -15,7 +15,7 @@ provide two sibling implementations behind the same `Transport` trait:
 | Transport | Flow Control | Rename |
 |-----------|-------------|--------|
 | `CreditRingTransport` | Receiver pushes credits (SendWithImm) | Current `CreditRingTransport` |
-| `ReadRingTransport` | Sender polls remote head (RDMA Read) | New — msquic approach |
+| `ReadRingTransport` | Sender polls remote head (RDMA Read) | Implemented |
 
 Both share ~80% of the code: ring buffers, token exchange, doorbell recv, imm encoding,
 MW binding, virtual buffer index mapping. They differ only in `repost_recv` (receiver side)

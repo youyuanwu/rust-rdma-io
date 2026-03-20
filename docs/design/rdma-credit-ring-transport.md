@@ -5,7 +5,7 @@
 **Implementation:** `rdma-io/src/credit_ring_transport.rs`  
 **Reference:** [rdma-transport-layer.md](rdma-transport-layer.md) — Transport architecture  
 **Reference:** [rdma-transport-comparison.md](rdma-transport-comparison.md) — Three-way comparison  
-**Reference:** [rdma-read-ring-transport.md](rdma-read-ring-transport.md) — ReadRingTransport (future sibling)  
+**Reference:** [rdma-read-ring-transport.md](rdma-read-ring-transport.md) — ReadRingTransport (sibling)  
 **Reference:** [msquic-rdma.md](../background/msquic-rdma.md) — msquic Write+Ring analysis  
 **Reference:** [Rsocket.md](../background/Rsocket.md) — rsocket Write+Ring analysis
 

@@ -1,31 +1,34 @@
 # RDMA Transport Design Comparison
 
-**Status:** Implemented (both transports)  
-**Updated:** 2026-03-15  
-**Scope:** Four RDMA transport designs compared: our Send/Recv, our Write+Ring, msquic's Write+Ring, rsocket's Write+Ring
+**Status:** Implemented (all three transports)  
+**Updated:** 2026-03-20  
+**Scope:** Five RDMA transport designs compared: our Send/Recv, our Credit Ring, our Read Ring, msquic's Write+Ring, rsocket's Write+Ring
 
 ## Overview
 
-Four production/proposed RDMA transports use fundamentally different approaches to deliver
-data over RDMA. We implement **two** — selectable via `TransportBuilder` at construction time:
+Five production/proposed RDMA transports use fundamentally different approaches to deliver
+data over RDMA. We implement **three** — selectable via `TransportBuilder` at construction time:
 
-| | **rust-rdma-io Send/Recv** | **rust-rdma-io Ring** | **msquic RDMA (PR #5113)** | **rsocket (librdmacm)** |
-|---|---|---|---|---|
-| **Type** | `SendRecvTransport` | `CreditRingTransport` | N/A (C) | N/A (C) |
-| **Builder** | `SendRecvConfig` | `CreditRingConfig` | — | — |
-| **Purpose** | Byte stream (gRPC) + Datagram (QUIC) | Datagram (QUIC) + Bulk transfer | QUIC packet delivery | POSIX socket drop-in |
-| **Platform** | Linux (ibverbs / rdma_cm) | Linux (ibverbs / rdma_cm) | Windows (NDSPI / MANA) | Linux (ibverbs / rdma_cm) |
-| **Code size** | ~500 lines | ~1300 lines | ~6000 lines | ~3400 lines |
-| **Language** | Rust (async) | Rust (async) | C (IOCP callbacks) | C (blocking + rpoll) |
-| **iWARP** | ✅ All providers | ❌ InfiniBand/RoCE only | ❌ MANA only | ⚠️ Adapts (2 WRs) |
+| | **rust-rdma-io Send/Recv** | **rust-rdma-io Credit Ring** | **rust-rdma-io Read Ring** | **msquic RDMA (PR #5113)** | **rsocket (librdmacm)** |
+|---|---|---|---|---|---|
+| **Type** | `SendRecvTransport` | `CreditRingTransport` | `ReadRingTransport` | N/A (C) | N/A (C) |
+| **Builder** | `SendRecvConfig` | `CreditRingConfig` | `ReadRingConfig` | — | — |
+| **Purpose** | Byte stream (gRPC) + Datagram (QUIC) | Datagram (QUIC) + Bulk transfer | Datagram (QUIC) + Low-CPU | QUIC packet delivery | POSIX socket drop-in |
+| **Flow control** | Implicit (RNR retry) | Credit-based (Send+Imm) | RDMA Read (offset buffer) | Ring head/tail + Read | Credit-based (Write) |
+| **Platform** | Linux (ibverbs / rdma_cm) | Linux (ibverbs / rdma_cm) | Linux (ibverbs / rdma_cm) | Windows (NDSPI / MANA) | Linux (ibverbs / rdma_cm) |
+| **Code size** | ~500 lines | ~1000 lines | ~1200 lines | ~6000 lines | ~3400 lines |
+| **Language** | Rust (async) | Rust (async) | Rust (async) | C (IOCP callbacks) | C (blocking + rpoll) |
+| **iWARP** | ✅ All providers | ❌ InfiniBand/RoCE only | ❌ InfiniBand/RoCE only | ❌ MANA only | ⚠️ Adapts (2 WRs) |
 
 ```rust
 // User selects transport at construction time — consumers are generic
 use rdma_io::send_recv_transport::SendRecvConfig;
 use rdma_io::credit_ring_transport::CreditRingConfig;
+use rdma_io::read_ring_transport::ReadRingConfig;
 
-let incoming = RdmaIncoming::bind(&addr, SendRecvConfig::stream())?;  // Send/Recv
-let incoming = RdmaIncoming::bind(&addr, CreditRingConfig::default())?;      // Write+Ring
+let incoming = RdmaIncoming::bind(&addr, SendRecvConfig::stream())?;    // Send/Recv
+let incoming = RdmaIncoming::bind(&addr, CreditRingConfig::default())?; // Credit Ring
+let incoming = RdmaIncoming::bind(&addr, ReadRingConfig::default())?;   // Read Ring
 ```
 
 ## Data Transfer Verb

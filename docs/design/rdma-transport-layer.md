@@ -20,12 +20,14 @@ AsyncRdmaStream<T> (byte stream)      RdmaUdpSocket<T> (datagram, future)
                        │
               Transport trait (10 methods)
                        │
-              SendRecvTransport (Send/Recv)
-                ├── QP + dual CQ
-                ├── Configurable buffer pool
-                ├── In-flight send tracking
-                ├── CM disconnect detection + QP state fallback
-                └── Connection lifecycle (connect / accept)
+          ┌────────────┼──────────────────────┐
+          │            │                      │
+  SendRecvTransport  CreditRingTransport    ReadRingTransport
+  (Send/Recv)        (Write+Ring+Credits)   (Write+Ring+Read)
+          │            │                      │
+          └────────────┴──────────────────────┘
+                       │
+              ring_common (shared ring infrastructure)
                        │
               AsyncQp / AsyncCq / AsyncCmId (primitives)
 ```
@@ -129,12 +131,15 @@ any builder — users choose the transport at construction time.
 Drop-in replacement via generics — consumer code unchanged.
 See [rdma-credit-ring-transport.md](rdma-credit-ring-transport.md) for the full design.
 
-| Aspect | SendRecvTransport | CreditRingTransport |
-|--------|--------------|-------------------|
-| Verb | `ibv_post_send(SEND)` | `ibv_post_send(WRITE_WITH_IMM)` |
-| Recv mechanism | Pre-posted recv buffers | Doorbell + ring landing zone |
-| `send_copy` backpressure | Hardware RNR (always accepts) | Credit-based (`Ok(0)` when full) |
-| Stream HOL | None (independent buffers) | Yes (ring Head blocks) |
+| Aspect | SendRecvTransport | CreditRingTransport | ReadRingTransport |
+|--------|--------------|-------------------|------------------|
+| Verb | `ibv_post_send(SEND)` | `ibv_post_send(WRITE_WITH_IMM)` | `ibv_post_send(WRITE_WITH_IMM)` |
+| Recv mechanism | Pre-posted recv buffers | Doorbell + ring landing zone | Doorbell + ring landing zone |
+| Flow control | Hardware RNR (always accepts) | Credit-based (Send+Imm) | RDMA Read (offset buffer) |
+| `send_copy` backpressure | `Ok(n)` always | `Ok(0)` when credits exhausted | `Ok(0)` when cached head full |
+| Receiver WRs/msg | 1 post_recv | 1 Send+Imm + 1 post_recv | 0 Send + 1 post_recv |
+| Stream HOL | None (independent buffers) | Yes (ring Head blocks) | Yes (ring Head blocks) |
+| Memory Windows | None (two-sided) | 1 MW (recv ring) | 2 MWs (recv ring + offset buf) |
 
 ## Transport Naming Convention
 
@@ -145,10 +150,10 @@ Names describe the transport mechanism:
 |------|-----------|
 | `SendRecvTransport` | RDMA Send/Recv, discrete buffers |
 | `CreditRingTransport` | Write+Imm ring, credit-based flow control |
-| `ReadRingTransport` *(future)* | Write+Imm ring, RDMA Read flow control |
+| `ReadRingTransport` | Write+Imm ring, RDMA Read flow control |
 | `SendRecvConfig` | Builder for SendRecvTransport |
 | `CreditRingConfig` | Builder for CreditRingTransport |
-| `ReadRingConfig` *(future)* | Builder for ReadRingTransport |
+| `ReadRingConfig` | Builder for ReadRingTransport |
 
 The naming pattern is **mechanism** + `Transport` / `Config`:
 - `SendRecv` — the RDMA verbs used for data transfer
@@ -162,9 +167,12 @@ design and trade-off analysis.
 
 - [quinn-rdma.md](quinn-rdma.md) — Quinn RDMA integration (implemented)
 - [rdma-credit-ring-transport.md](rdma-credit-ring-transport.md) — CreditRingTransport design (implemented)
-- [rdma-read-ring-transport.md](rdma-read-ring-transport.md) — ReadRingTransport design (future)
+- [rdma-read-ring-transport.md](rdma-read-ring-transport.md) — ReadRingTransport design (implemented)
 - [rdma-transport-comparison.md](rdma-transport-comparison.md) — Three-way comparison
 - [rdma-io/src/transport.rs](../../rdma-io/src/transport.rs) — Transport trait
 - [rdma-io/src/send_recv_transport.rs](../../rdma-io/src/send_recv_transport.rs) — SendRecvTransport
+- [rdma-io/src/credit_ring_transport.rs](../../rdma-io/src/credit_ring_transport.rs) — CreditRingTransport
+- [rdma-io/src/read_ring_transport.rs](../../rdma-io/src/read_ring_transport.rs) — ReadRingTransport
+- [rdma-io/src/ring_common.rs](../../rdma-io/src/ring_common.rs) — Shared ring infrastructure
 - [rdma-io/src/async_stream.rs](../../rdma-io/src/async_stream.rs) — AsyncRdmaStream\<T\>
 - [rdma-io-quinn/src/lib.rs](../../rdma-io-quinn/src/lib.rs) — RdmaUdpSocket (Quinn integration)

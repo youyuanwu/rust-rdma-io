@@ -1,7 +1,8 @@
 # RDMA Read Ring Transport
 
-**Status:** Future — Design complete, not yet implemented  
+**Status:** Implemented  
 **Date:** 2026-03-20  
+**Implementation:** `rdma-io/src/read_ring_transport.rs`  
 **Prerequisite:** [rdma-credit-ring-transport.md](rdma-credit-ring-transport.md) — CreditRingTransport (implemented)  
 **Reference:** [rdma-transport-layer.md](rdma-transport-layer.md) — Transport architecture  
 **Reference:** [rdma-transport-comparison.md](rdma-transport-comparison.md) — Three-way comparison  
@@ -64,13 +65,19 @@ full naming convention.
 ## Design
 
 1. Each side allocates a 4-byte "offset buffer" MR containing the current ring head
-2. Each side binds **two Memory Windows**: one for the recv ring, one for the offset buffer
-   (separate rkeys — minimum attack surface, follows msquic's dual-MW pattern)
+2. Each side binds **two Memory Windows**: one for the recv ring (`IBV_ACCESS_REMOTE_WRITE`),
+   one for the offset buffer (`IBV_ACCESS_REMOTE_READ` **only** — NOT REMOTE_WRITE).
+   Separate rkeys, minimum attack surface, follows msquic's dual-MW pattern.
+   **CRITICAL**: Use a dedicated `bind_offset_mw` helper, not the existing `bind_recv_mw`
+   (which hardcodes REMOTE_WRITE). A forged head value from a malicious peer would
+   cause the sender to overwrite in-use recv ring data.
 3. Token exchange includes both MW rkeys + VAs (see Token Format below)
 4. Sender tracks `cached_remote_head` locally
-5. Before sending: `free_space = cached_remote_head - write_tail` (with wrap)
+5. Before sending: compute free space with wrap-aware arithmetic (NOT `wrapping_sub` —
+   see Free Space Calculation below)
 6. If free space < payload + `min_free_threshold`: post `RDMA Read` of remote offset buffer → update cache
-7. Receiver: after consuming data, writes new head to local offset buffer (no WR)
+7. Receiver: after consuming data, writes new head to local offset buffer via
+   `AtomicU32::store(head, Ordering::Release)` for portability across architectures
 
 ### Token Format
 
@@ -79,16 +86,19 @@ offset buffer metadata:
 
 ```
 ReadRingToken (32 bytes):
+  version:       u8    // = 2 (CreditRingToken is version 1)
+  _reserved:     [u8; 3] // Alignment padding
   ring_va:       u64   // Base VA of recv ring buffer
   ring_capacity: u32   // Ring buffer size in bytes
-  ring_rkey:     u32   // MW rkey scoped to recv ring
+  ring_rkey:     u32   // MW rkey scoped to recv ring (REMOTE_WRITE)
   offset_va:     u64   // VA of 4-byte offset buffer (contains recv head)
-  offset_rkey:   u32   // MW rkey scoped to offset buffer
-  _reserved:     u32   // Alignment / future use
+  offset_rkey:   u32   // MW rkey scoped to offset buffer (REMOTE_READ)
 ```
 
-msquic's `RDMA_DATAPATH_PRIVATE_DATA` is 28 bytes with the same five fields
-(no reserved). We add 4 bytes for alignment.
+The version byte allows future protocol detection (e.g., a generic `RingListener`
+that accepts either transport type). CreditRingToken uses `version: 1` (20 bytes);
+ReadRingToken uses `version: 2` (32 bytes). The shared `ring_common` module
+should define a common token header.
 
 ### Memory Window Layout
 
@@ -101,13 +111,17 @@ msquic's `RDMA_DATAPATH_PRIVATE_DATA` is 28 bytes with the same five fields
                        ▲                    ▲
                        MW1 (recv ring)      MW2 (offset buffer)
 
-  MW1 rkey → scoped to recv ring only (peer writes data here)
-  MW2 rkey → scoped to offset buffer only (peer reads head position here)
+  MW1 rkey → scoped to recv ring only (REMOTE_WRITE — peer writes data here)
+  MW2 rkey → scoped to offset buffer only (REMOTE_READ — peer reads head here)
 ```
 
 Two separate Memory Windows ensure the sender can only write to the recv ring
 and can only read the offset buffer. Neither MW exposes the send ring or other
 memory. This matches msquic's `RecvMemoryWindow` + `OffsetMemoryWindow` pattern.
+
+**CQ depth**: The send CQ must accommodate RDMA Read completions alongside Write+Imm
+completions. Formula: `send_cq_depth = max_outstanding + 3` (data WRs + 1 Read + 2 setup).
+The `read_in_flight` flag ensures at most 1 concurrent Read WR.
 
 ### Minimum Free Space Threshold
 
@@ -211,25 +225,38 @@ Each ring slot is marked as released independently; the head only advances
 through contiguous released slots:
 
 ```rust
-// Existing CompletionTracker in credit_ring_transport.rs (currently dead_code)
 fn repost_recv(&mut self, buf_idx: usize) -> Result<()> {
-    let (offset, length) = self.virtual_idx_map[buf_idx].take().unwrap();
+    let (offset, length, arrival_seq) = self.virtual_idx_map[buf_idx].take().unwrap();
 
-    // Mark this slot as released in the tracker.
-    self.completion_tracker.mark_released(offset, length);
+    // Mark this arrival-seq slot as released in the tracker.
+    let slot = arrival_seq % self.max_outstanding;
+    let contiguous = self.completion_tracker.release(slot);
 
-    // Chase forward: advance head through all contiguous released slots.
-    let new_head = self.completion_tracker.chase_head();
-    self.recv_ring.head = new_head;
+    // Chase forward: advance head by the byte lengths of contiguous released slots.
+    // The tracker returns a slot COUNT; we need byte LENGTHS. Use an auxiliary
+    // per-slot length array (Box<[usize]>) to map slot releases to byte offsets.
+    for _ in 0..contiguous {
+        let slot_len = self.slot_lengths[self.head_slot_idx];
+        self.recv_ring.head = (self.recv_ring.head + slot_len) % self.recv_ring.capacity;
+        self.head_slot_idx = (self.head_slot_idx + 1) % self.max_outstanding;
+    }
 
     // Update offset buffer — sender sees contiguous head only.
-    *self.offset_buffer = new_head as u32;
+    if contiguous > 0 {
+        self.offset_buffer.store(self.recv_ring.head as u32, Ordering::Release);
+    }
 
     // Repost doorbell recv WR.
     self.repost_doorbell()?;
     Ok(())
 }
 ```
+
+**Slot-to-position mapping**: The `CompletionTracker` returns a contiguous slot
+**count**, not a byte position. For variable-length messages, an auxiliary
+`slot_lengths: Box<[usize]>` stores the byte length of each arrival-seq slot.
+When the tracker chases forward by N slots, the head advances by the sum of
+those N slot lengths. This is set when messages arrive: `slot_lengths[seq % max_outstanding] = length`.
 
 ```
   Example: recv_ring with 3 messages (A at 0, B at 1500, C at 3000):
@@ -262,21 +289,22 @@ if (Offset == RecvRingBuffer->Head) {
 }
 ```
 
-Our `CompletionTracker` (already in `credit_ring_transport.rs:238`, currently
-`#[allow(dead_code)]`) uses a `Vec<bool>` bitmap instead of a hash table —
+Our `CompletionTracker` (already activated in `credit_ring_transport.rs`)
+uses a `Box<[bool]>` bitmap instead of a hash table —
 simpler and faster for bounded slot counts. The chase-forward logic is identical.
 
 ### Impact on CreditRingTransport
 
-CreditRingTransport does NOT need chase-forward because:
-- Credits are an absolute count (position-independent)
-- `recv_ring.release(length)` advances head, but the head position is never
-  read by the sender — only the credit count matters
-- Out-of-order `repost_recv` sends credit updates in any order; the absolute
-  encoding self-corrects
+CreditRingTransport **also uses chase-forward** since the out-of-order overwrite
+bug fix (see [credit-ring-ooo-overwrite.md](../bugs/credit-ring-ooo-overwrite.md)).
+Both ring transports use `CompletionTracker` for the same structural reason but
+for different effects:
 
-If CreditRingTransport is later extended to expose head position (e.g., for
-diagnostics or large ring mode), chase-forward would need to be added.
+- **CreditRingTransport**: Chase-forward gates **credit updates** — credits are
+  only sent when contiguous slots advance, preventing the sender from wrapping
+  `remote_write_tail` into unreleased ring positions.
+- **ReadRingTransport**: Chase-forward gates **offset buffer writes** — the head
+  position only advances through contiguous released slots.
 
 ## Padding and Offset Buffer Interaction
 
@@ -287,21 +315,29 @@ The receiver must handle padding correctly with offset buffer updates:
 ```
   Receiver sees padding (imm length == 0):
     1. Compute pad_len = ring_capacity - offset
-    2. Advance recv_ring.head past padding (head += pad_len, or head = 0)
-    3. Repost doorbell recv WR
-    4. Write updated head to offset_buffer  ← CRITICAL for sender visibility
-       (without this, sender's RDMA Read sees stale head behind the wrap point)
+    2. Assign a CompletionTracker arrival_seq slot (padding consumes a sender credit)
+    3. Immediately release the slot in the tracker (padding is auto-consumed)
+    4. If contiguous advance > 0: write updated head to offset_buffer
+    5. Repost doorbell recv WR
 ```
+
+**CRITICAL**: Padding MUST go through the CompletionTracker, not bypass it.
+If the ring head advances without the tracker knowing, subsequent `repost_recv`
+calls compute wrong offset buffer values (tracker's `head_slot` desyncs from
+the ring's actual head). The CreditRingTransport implementation handles this
+correctly — padding gets a tracker slot and is immediately released (see
+`credit_ring_transport.rs` padding handling in `poll_recv` and `drain_recv_credits`).
 
 In CreditRingTransport, padding triggers a credit update (Send+Imm) which
 explicitly notifies the sender. In ReadRingTransport, the offset buffer update
 is the ONLY mechanism — if the receiver forgets to update the offset buffer
 after padding, the sender will repeatedly Read a stale head and stall.
 
-**Implementation note:** Both data release and padding release must write to
-the offset buffer. The `repost_recv` path handles data; a separate
-`release_padding` path (called from `poll_recv` or `drain_recv_credits`)
-handles padding. Both paths must end with `*offset_buffer = recv_ring.head`.
+**Implementation note:** Both data release and padding release must go through
+the CompletionTracker. The `repost_recv` path handles data (mark slot, chase,
+write offset buffer); the `release_padding` path (called from `poll_recv` or
+`drain_recv_credits`) assigns a seq, immediately releases, and writes offset
+buffer if contiguous advance > 0.
 
 ## Large Ring Mode (>64KB)
 
@@ -355,12 +391,20 @@ deterministic from the completion sequence.
 
 ```
 Credit batch WRs = send_rate / N   (e.g., 125K/s at 1M msg/s, N=8)
-RDMA Read WRs   ≈ send_rate × f(ring_utilization)
+RDMA Read WRs   ≈ send_rate × msg_size / (ring_capacity × (1 - utilization))
 
-Crossover: at ~70% ring utilization with small rings, Read frequency
-exceeds credit batch frequency. Above this, Credit Ring has fewer total
-WRs AND avoids RTT stalls on the sender hot path.
+Example (64KB ring, 1200B msgs, N=8):
+  At 70% utilization: reads ≈ 1M × 1200 / (65536 × 0.3) ≈ 61K  (< 125K credits → Read wins)
+  At 84% utilization: reads ≈ 1M × 1200 / (65536 × 0.16) ≈ 114K  (≈ 125K → crossover)
+  At 90% utilization: reads ≈ 1M × 1200 / (65536 × 0.1) ≈ 183K  (> 125K → Credit wins)
+
+Crossover shifts with ring size: 256KB ring → crossover at ~95%+ utilization.
 ```
+
+**Note**: The crossover is workload-dependent. The guidance in the "When to Use" table
+uses **70% as a conservative bound** — Read Ring is reliably better below this.
+The exact crossover for a given deployment depends on ring capacity, message size,
+and credit batch size N.
 
 ## Performance Comparison
 
@@ -379,15 +423,17 @@ WRs AND avoids RTT stalls on the sender hot path.
 
 ### Cost Per 1M Messages/sec
 
-| Design | Sender `ibv_post_send` | Sender CQ entries | Receiver `ibv_post_send` | Receiver CQ entries | Total NIC doorbells |
-|--------|----------------------|-------------------|------------------------|--------------------|-------------------|
-| **Credit Ring (current)** | 1M | 1M | 1M (credits) | 1M (credits) | 3M |
-| **Credit Ring (batched N=8)** | 1M | 1M | 125K | 125K | 2.125M |
-| **Read Ring + Sel. Signal** | 1M | 125K (N=8) | **0** | **0** | **1M** |
+| Design | Sender `post_send` | Sender CQ entries | Receiver `post_send` | Receiver `post_recv` | Total NIC doorbells |
+|--------|-------------------|-------------------|---------------------|---------------------|-------------------|
+| **Credit Ring (current)** | 1M | 1M | 1M (credits) | 1M (doorbells) | 4M |
+| **Credit Ring (batched N=8)** | 1M | 1M | 125K | 1M | 3.125M |
+| **Read Ring + Sel. Signal** | 1M | 125K (N=8) | **0** | 1M | **2.125M** |
 
-The Read Ring design achieves **1M NIC doorbells for 1M messages** — the
-theoretical minimum (one post_send per message, everything else is either
-local memory or NIC-served).
+**Note**: Every received message requires an `ibv_post_recv` to repost the 4-byte
+doorbell WR — this is a NIC doorbell that cannot be eliminated without switching
+to a polling-based recv model (see §"No-Doorbell Polling Mode"). The Read Ring
+advantage over batched Credit Ring is **32%** (2.125M vs 3.125M), primarily from
+eliminating the receiver's credit Send+Imm WRs.
 
 ### Receiver CPU Breakdown
 
@@ -404,24 +450,44 @@ local memory or NIC-served).
   ibv_poll_cq       │ ████    │     │ ████    │      │ ████    │  ← same
   (doorbell CQ)     │ ~100ns  │     │ ~100ns  │      │ ~100ns  │
                     ├─────────┤     ├─────────┤      ├─────────┤
-  repost doorbell   │ ██      │     │ ██      │      │ ██      │  ← same
-  (ibv_post_recv)   │ ~50ns   │     │ ~50ns   │      │ ~50ns   │
+  repost doorbell   │ ████    │     │ ████    │      │ ████    │  ← same
+  (ibv_post_recv)   │ ~120ns  │     │ ~120ns  │      │ ~120ns  │
                     ├─────────┤     ├─────────┤      ├─────────┤
   offset buf write  │         │     │         │      │ ▏       │  ← ~1ns
                     │         │     │         │      │         │
                     └─────────┘     └─────────┘      └─────────┘
-  Total recv CPU:    ~550ns          ~200ns            ~151ns
+  Total recv CPU:    ~620ns          ~271ns            ~221ns
 
-  Savings vs current:  —             63%               73%
+  Savings vs current:  —             56%               64%
 ```
+
+**Note**: `ibv_post_recv` for a 1-SGE 4-byte WR is estimated at ~120ns (WQE setup +
+MMIO doorbell write). Published benchmarks on ConnectX-5/6 show 100–200ns. The exact
+cost should be benchmarked on the target NIC; the relative ranking is stable across
+the plausible range.
 
 ### Transport Tier Summary
 
 | Tier | Transport | Recv CPU/msg | Use case |
 |------|----------|-------------|----------|
-| **Simple** | Credit Ring (unbatched) | ~550ns | Development, correctness testing |
-| **Balanced** | Credit Ring (batched N=8) | ~200ns | Production gRPC, congested rings, fan-in |
-| **Lowest-CPU** | Read Ring + Sel. Signal + Inline | ~151ns | HFT, >5M msg/sec, low-utilization rings |
+| **Simple** | Credit Ring (unbatched) | ~620ns | Development, correctness testing |
+| **Balanced** | Credit Ring (batched N=8) | ~271ns | Production gRPC, congested rings, fan-in |
+| **Lowest-CPU** | Read Ring + Sel. Signal + Inline | ~221ns | HFT, low-utilization rings |
+
+### Ring Sizing for High Message Rates
+
+The default 64KB ring with 1200B messages holds ~54 messages = **10.8µs buffer at
+5M msg/sec**. Any receiver scheduling jitter >11µs triggers backpressure Reads.
+
+| Target rate | Required buffer | Ring capacity | Mode |
+|-------------|----------------|---------------|------|
+| 1M msg/sec | ~54µs (OK for shared core) | 64 KB (default) | Small ring |
+| 5M msg/sec | ~100µs jitter absorption | ~600 KB | Large ring |
+| 10M msg/sec | ~100µs jitter absorption | ~1.2 MB | Large ring |
+
+For >5M msg/sec, use `ReadRingConfig { ring_capacity: 1 << 20, .. }` (1MB) with
+large ring mode auto-enabled. Dedicated-core deployments with busy-poll (`tokio`
+current-thread) can tolerate smaller rings.
 
 ## Implementation Plan
 
@@ -431,12 +497,12 @@ local memory or NIC-served).
 |-----------|--------|
 | `ReadRingTransport` struct | Small — mirrors Credit Ring, minus credit fields, plus offset buffer |
 | Offset buffer MR (per side) | Small — 4-byte MR, register in single contiguous allocation |
-| **Second Memory Window** (offset buffer) | Small — bind MW2 scoped to 4-byte offset buffer |
-| Token expansion (20 → 32 bytes) | Small — add `offset_va` + `offset_rkey` + reserved fields |
+| **Second Memory Window** (offset buffer) | Small — `bind_offset_mw` with `IBV_ACCESS_REMOTE_READ` (NOT reuse `bind_recv_mw`) |
+| Token expansion (20 → 32 bytes) | Small — version byte + `offset_va` + `offset_rkey` fields |
 | `ReadRingConfig` + `TransportBuilder` impl | Small — mirrors `CreditRingConfig`, adds `min_free_threshold` |
 | RDMA Read WR posting | Medium — new `WrOpcode::RdmaRead` path, async completion wait |
-| `repost_recv` (no credit WR) | Small — chase-forward release + **write offset buffer** + repost doorbell |
-| **CompletionTracker** (chase-forward) | Small — activate existing `CompletionTracker` for out-of-order release |
+| `repost_recv` (no credit WR) | Small — chase-forward release + **write offset buffer** (AtomicU32) + repost doorbell |
+| **CompletionTracker + slot_lengths** | Small — tracker + `Box<[usize]>` per-slot byte lengths for variable-size messages |
 | **Padding release** (offset buffer update) | Small — advance head past padding + write offset buffer |
 | `send_copy` space check (Read path) | Medium — cache remote head, RDMA Read on backpressure |
 | **Min free threshold** logic | Small — proactive Read when free space is low |
@@ -499,15 +565,16 @@ pub struct ReadRingConfig {
     └── Quinn integration test (ReadRingConfig as TransportBuilder)
 ```
 
-## Files (Planned)
+## Files
 
 | File | Description |
 |------|-------------|
-| `rdma-io/src/read_ring_transport.rs` | ReadRingTransport implementation (~300 lines) |
-| `rdma-io/src/ring_common.rs` | Shared ring infrastructure (~500 lines, extracted) |
-| `rdma-io/src/credit_ring_transport.rs` | Refactored to use `ring_common` |
+| `rdma-io/src/read_ring_transport.rs` | ReadRingTransport implementation (~1200 lines) |
+| `rdma-io/src/ring_common.rs` | Shared ring infrastructure (~360 lines) |
+| `rdma-io/src/credit_ring_transport.rs` | Refactored to use `ring_common` (~1000 lines) |
 | `rdma-io/src/transport.rs` | `Transport` + `TransportBuilder` traits (unchanged) |
-| `rdma-io-tests/tests/read_ring_transport_tests.rs` | Read Ring integration tests |
+| `rdma-io-tests/tests/read_ring_transport_tests.rs` | 8 Read Ring integration tests |
+| `rdma-io-tests/tests/async_stream_tests.rs` | 11 Read Ring stream tests (33 total) |
 
 ## Design Notes — msquic Comparison
 
@@ -531,9 +598,9 @@ alignments and intentional divergences:
 | Aspect | msquic | ReadRingTransport | Rationale |
 |--------|--------|-------------------|-----------|
 | Out-of-order **send** completion | Hash tables (`SendCompletionTable`) | Sequential ring advance via wr_id | RC QPs on ibverbs guarantee in-order send CQ completions; NDSPI may reorder |
-| Recv release data structure | Hash table (unbounded) | `Vec<bool>` bitmap (bounded by `max_outstanding`) | Bounded slot count makes bitmap simpler and faster |
+| Recv release data structure | Hash table (unbounded) | `Box<[bool]>` bitmap (bounded by `max_outstanding`) | Bounded slot count makes bitmap simpler and faster |
 | Backpressure handling | `SendQueue` queues pending sends | Returns `Ok(0)` — caller retries | Matches our `Transport` trait contract; avoids internal queue complexity |
-| MR allocation | Single contiguous MR for all buffers | Same approach planned | Single MR simplifies registration |
+| MR allocation | Single contiguous MR for all buffers | Single contiguous MR | Single MR simplifies registration |
 | Offset buffer conditional | Only for rings > 64KB | Always present | We always need it for flow control (not just position tracking) |
 | Large ring mode | imm = length-only, receiver tracks tail | Same approach (Phase 3) | RC QP ordering makes receiver tail deterministic |
 | Platform | Windows NDSPI / MANA extensions | Linux ibverbs / rdma_cm | Portable across IB, RoCE, (not iWARP) |
@@ -548,8 +615,187 @@ alignments and intentional divergences:
 - **12 IOCP event handlers**: Our async model uses `poll_fn` + tokio `AsyncFd` — one code path
   per CQ, not per event type.
 
+## Open Design Questions
+
+### 1. RDMA Read in Synchronous `send_copy`
+
+`send_copy(&mut self, data) -> Result<usize>` is synchronous. On backpressure, the sender
+must post an RDMA Read and wait for the CQ completion — but that's an async operation.
+
+**Options:**
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| **Busy-poll send CQ inline** | Simple, no state machine | Burns CPU during stall |
+| **Return `Ok(0)`, pick up Read result later** | Non-blocking, matches trait | Needs `read_in_flight` state flag + wr_id tag |
+| **Post Read speculatively on every send** | Always up-to-date cache | Wasteful when ring isn't full |
+
+**Recommended:** Return `Ok(0)` and post a non-blocking Read. On next `send_copy`,
+check `read_in_flight` — if the Read has completed (poll send CQ), update
+`cached_remote_head` and retry. This matches the existing `drain_recv_credits`
+pattern in CreditRingTransport.
+
+```rust
+fn send_copy(&mut self, data: &[u8]) -> Result<usize> {
+    // Try inline send CQ poll to pick up completed Read.
+    if self.read_in_flight {
+        self.drain_send_cq_for_read();
+    }
+
+    // Wrap-aware free space calculation (NOT wrapping_sub — that gives
+    // wrong results when head < tail with positions in [0, capacity)).
+    let free = if self.cached_remote_head >= self.write_tail {
+        // No wrap: head is ahead of or at tail (could also mean empty ring)
+        self.cached_remote_head - self.write_tail
+    } else {
+        // Wrapped: free space spans end + beginning
+        self.remote_capacity - self.write_tail + self.cached_remote_head
+    };
+
+    if free < data.len() + self.min_free_threshold {
+        if !self.read_in_flight {
+            self.post_offset_read()?;  // non-blocking
+            self.read_in_flight = true;
+        }
+        return Ok(0);  // caller retries via poll_writable
+    }
+
+    // Proactive Read when space is getting low.
+    if free < data.len() * 2 + self.min_free_threshold && !self.read_in_flight {
+        self.post_offset_read()?;
+        self.read_in_flight = true;
+    }
+
+    // ... proceed with Write+Imm
+}
+```
+
+### 2. RDMA Read CQ Routing
+
+RDMA Read is an "initiator" operation — its completion arrives on the **send CQ**
+(not recv CQ). The send CQ will contain mixed completion types:
+
+| WR type | wr_id | Opcode in WC |
+|---------|-------|-------------|
+| Write+Imm (data) | `release_bytes` | `WcOpcode::RdmaWrite` |
+| Write+Imm (padding) | `PADDING_SENTINEL` | `WcOpcode::RdmaWrite` |
+| **RDMA Read** | **`READ_SENTINEL`** | **`WcOpcode::RdmaRead`** |
+
+The `poll_send_completion` / `drain_send_cq` paths must handle `WcOpcode::RdmaRead`:
+- Update `cached_remote_head` from the Read result (4 bytes in local read buffer)
+- Set `read_in_flight = false`
+- Do NOT release send ring space (Read doesn't consume ring bytes)
+- Do NOT count as "≥1 send completed" for the `poll_send_completion` return —
+  a Read completion is a cache refresh, not a data send. If `poll_send_completion`
+  returns `Ready` solely due to a Read, `AsyncRdmaStream::poll_write` would retry
+  `send_copy` on a still-full ring, causing a busy-spin. Read completions should
+  be processed silently; only Write+Imm completions trigger the `Ready` return.
+
+**RDMA Read does NOT increment `send_in_flight`** — it's not a data send and doesn't
+occupy send ring space. The `read_in_flight: bool` flag tracks it separately.
+
+### 3. Offset Buffer Atomicity
+
+The receiver writes a `u32` to the offset buffer; the sender reads it via RDMA Read
+(NIC-level DMA, not CPU load). Correctness requires:
+
+- **Atomic store**: Use `AtomicU32::store(head, Ordering::Release)` on the receiver
+  side. This ensures correctness on all architectures (x86, ARM64, POWER) without
+  relying on platform-specific memory ordering guarantees.
+- **RDMA NIC**: PCIe TLP minimum payload is 4 bytes — a 4-byte aligned RDMA Read
+  returns a consistent value from the coherence point.
+- **Cache coherence**: On x86, PCIe devices participate in the cache coherence domain.
+  On ARM64 (Graviton, BlueField), `ibv_reg_mr` typically provides DMA-coherent
+  mappings. The `Ordering::Release` fence ensures the store is visible at the
+  coherence point before any subsequent operation.
+- **Alignment**: Offset buffer must be 4-byte aligned (guaranteed by allocation
+  layout; recommend 64-byte alignment for cache-line isolation — see §4).
+
+### 4. Offset Buffer Cache Line Alignment
+
+The 4-byte offset buffer should be **64-byte aligned** to avoid false sharing:
+
+```
+  BAD:  [... recv_ring last 60 bytes ...][OBuf 4B]  ← same cache line
+  GOOD: [... recv_ring ...][ 60B pad ][OBuf 4B]     ← own cache line
+```
+
+The receiver writes `offset_buffer` on every `repost_recv`. If it shares a cache
+line with the recv ring tail, every data Write+Imm from the sender invalidates the
+cache line containing the offset buffer, causing unnecessary cache thrashing.
+
+**Fix:** Pad the allocation so the offset buffer starts at a 64-byte boundary.
+The overhead is at most 60 bytes per connection — negligible.
+
+### 5. Disconnect Detection via Failed Read
+
+If the remote QP enters ERROR state (peer disconnected), an RDMA Read will fail
+with `IBV_WC_REM_ACCESS_ERR` or `IBV_WC_WR_FLUSH_ERR`. The Read completion handler
+must set `qp_dead = true` on failure, same as the existing Write+Imm error path.
+
+### 6. MW Invalidation on Disconnect
+
+On disconnect, post `IBV_WR_LOCAL_INV` for both MWs before QP teardown to
+explicitly revoke the peer's access. Order: MW2 (offset buffer — stops Reads)
+first, then MW1 (recv ring — stops Writes). Wait for send CQ completions of
+both invalidation WRs. This is a security hardening that CreditRingTransport
+also needs (documented as future work in `rdma-credit-ring-transport.md`).
+
+## Possible Improvements
+
+### Adaptive Flow Control
+
+A hybrid `AdaptiveRingTransport` could switch between Credit and Read behavior
+based on observed ring utilization:
+
+```
+  utilization > 70% sustained → credit mode (proactive pushes, no stalls)
+  utilization < 30% sustained → read mode (zero receiver WRs)
+  30-70% → read mode with proactive Reads
+```
+
+This gets the best of both worlds without requiring the user to choose. The
+implementation would track a moving average of `free_space / capacity` and flip
+a `flow_mode: enum { Credit, Read }` flag. The receiver would either post
+Send+Imm credits or just write to the offset buffer depending on the mode.
+
+**Complexity:** Medium — both code paths needed, plus hysteresis to avoid flapping.
+**Priority:** P3 (after both transports are validated independently).
+
+### Read Coalescing
+
+Instead of reading just 4 bytes (offset buffer), read a 64-byte region that
+includes diagnostic counters alongside the head position:
+
+```
+  Offset region (64 bytes, cache-line aligned):
+  ┌───────┬──────────┬──────────┬──────────────────────────────┐
+  │ head  │ recv_cnt │ drop_cnt │ reserved                     │
+  │ (4B)  │ (4B)     │ (4B)     │ (52B)                        │
+  └───────┴──────────┴──────────┴──────────────────────────────┘
+```
+
+An RDMA Read of 4 bytes vs 64 bytes costs the same on the NIC (minimum PCIe TLP
+is 64 bytes). The extra counters provide free telemetry for monitoring/debugging.
+
+### No-Doorbell Polling Mode
+
+For ultra-low-latency scenarios, eliminate the doorbell recv entirely. The sender
+writes data AND increments a "sequence counter" in a separate sender-to-receiver
+region. The receiver **polls** this counter instead of waiting for CQ notifications:
+
+```
+  Sender: Write+Imm(data) + atomic Write(seq_counter++)
+  Receiver: spin-poll seq_counter → new data → read from ring
+```
+
+This saves 1 `ibv_post_recv` + 1 CQ notification per message on the receiver.
+Trade-off: burns a CPU core on the receiver (DPDK-style). Only for dedicated
+HFT-class deployments.
+
+**Priority:** P4 — only if benchmarks show doorbell CQ overhead is the bottleneck.
+
 ## Priority
 
-**P2** — implement after `CreditRingTransport` is production-validated and credit batching
-(P0) + inline small messages (P1) are done. See [RingPerformance.md](../future/RingPerformance.md)
-for the full priority roadmap.
+**P2** — implemented. Large ring mode (Phase 3) is deferred. See
+[RingPerformance.md](../future/RingPerformance.md) for the full priority roadmap.
