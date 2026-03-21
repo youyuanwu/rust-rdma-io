@@ -10,8 +10,8 @@ package.documentation = "https://github.com/youyuanwu/rust-rdma-io"
 [workspace.dependencies]
 # Internal crates
 rdma-io-sys = { path = "rdma-io-sys", version = "0.0.1" }
-rdma-io = { path = "rdma-io", version = "0.0.1" }
-rdma-io-tonic = { path = "rdma-io-tonic", version = "0.0.1" }
+rdma-io = { path = "rdma-io", version = "0.0.2" }
+rdma-io-tonic = { path = "rdma-io-tonic", version = "0.0.2" }
 rdma-io-quinn = { path = "rdma-io-quinn", version = "0.0.1" }
 
 # bnd ecosystem

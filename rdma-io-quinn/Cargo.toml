@@ -6,6 +6,8 @@ license.workspace = true
 repository.workspace = true
 documentation.workspace = true
 description = "Quinn QUIC over RDMA — AsyncUdpSocket implementation using rdma-io Transport trait"
+# Not yet ready for release.
+publish = false
 
 [dependencies]
 rdma-io.workspace = true

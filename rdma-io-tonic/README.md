@@ -11,13 +11,13 @@ Drop-in RDMA transport for tonic servers and clients — use `RdmaIncoming` for 
 ### Server
 
 ```rust
-use rdma_io::rdma_transport::TransportConfig;
+use rdma_io::send_recv_transport::SendRecvConfig;
 use rdma_io_tonic::RdmaIncoming;
 use tonic::transport::Server;
 
 let incoming = RdmaIncoming::bind(
     &"0.0.0.0:50051".parse().unwrap(),
-    TransportConfig::stream(),
+    SendRecvConfig::stream(),
 )?;
 Server::builder()
     .add_service(my_service)
@@ -28,27 +28,33 @@ Server::builder()
 ### Client
 
 ```rust
-use rdma_io::rdma_transport::TransportConfig;
+use rdma_io::send_recv_transport::SendRecvConfig;
 use rdma_io_tonic::RdmaConnector;
 use tonic::transport::Endpoint;
 
-let connector = RdmaConnector::new(TransportConfig::stream());
+let connector = RdmaConnector::new(SendRecvConfig::stream());
 let channel = Endpoint::from_static("http://10.0.0.1:50051")
     .connect_with_connector(connector)
     .await?;
 let client = MyServiceClient::new(channel);
 ```
 
-### Ring Buffer Transport
+### Ring Buffer Transports
 
-Use `RingConfig` instead of `TransportConfig` for RDMA Write + Immediate Data
-with ring buffers and credit-based flow control:
+Use `CreditRingConfig` or `ReadRingConfig` instead of `SendRecvConfig` for RDMA Write + Immediate Data
+with ring buffers and flow control:
 
 ```rust
-use rdma_io::rdma_ring_transport::RingConfig;
+use rdma_io::credit_ring_transport::CreditRingConfig;
+use rdma_io::read_ring_transport::ReadRingConfig;
 
-let incoming = RdmaIncoming::bind(&addr, RingConfig::default())?;
-let connector = RdmaConnector::new(RingConfig::default());
+// Credit-based flow control
+let incoming = RdmaIncoming::bind(&addr, CreditRingConfig::default())?;
+let connector = RdmaConnector::new(CreditRingConfig::default());
+
+// RDMA Read flow control
+let incoming = RdmaIncoming::bind(&addr, ReadRingConfig::default())?;
+let connector = RdmaConnector::new(ReadRingConfig::default());
 ```
 
 ### TLS (mTLS with OpenSSL)
@@ -63,6 +69,8 @@ rdma-io-tonic = { version = "0.0.1", features = ["tls"] }
 **Server:**
 
 ```rust
+use rdma_io::send_recv_transport::SendRecvConfig;
+use rdma_io_tonic::RdmaIncoming;
 use openssl::ssl::{SslAcceptor, SslMethod, SslVerifyMode};
 
 let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server())?;
@@ -72,7 +80,7 @@ builder.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
 builder.set_alpn_protos(b"\x02h2")?;
 let acceptor = builder.build();
 
-let incoming = RdmaIncoming::bind(&addr, TransportConfig::stream())?;
+let incoming = RdmaIncoming::bind(&addr, SendRecvConfig::stream())?;
 let tls_incoming = tonic_tls::openssl::TlsIncoming::new(incoming, acceptor);
 Server::builder()
     .add_service(my_service)
@@ -83,6 +91,7 @@ Server::builder()
 **Client:**
 
 ```rust
+use rdma_io::send_recv_transport::SendRecvConfig;
 use rdma_io_tonic::tls::RdmaTransport;
 use openssl::ssl::{SslConnector, SslMethod};
 
@@ -93,7 +102,7 @@ builder.set_private_key(&client_key)?;
 builder.set_alpn_protos(b"\x02h2")?;
 let ssl_connector = builder.build();
 
-let transport = RdmaTransport::new(TransportConfig::stream());
+let transport = RdmaTransport::new(SendRecvConfig::stream());
 let connector = tonic_tls::openssl::TlsConnector::new(
     transport,
     ssl_connector,

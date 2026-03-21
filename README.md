@@ -6,7 +6,7 @@ Safe Rust bindings for RDMA programming over [libibverbs](https://github.com/lin
 
 - **Safe RAII wrappers** — `ProtectionDomain`, `CompletionQueue`, `MemoryRegion`, `QueuePair`, `CmId`, etc. with `Arc`-based ownership enforcing correct destruction order
 - **Async stream** — `AsyncRdmaStream` implements `tokio::io::AsyncRead` + `AsyncWrite` and `futures::AsyncRead` + `AsyncWrite` with dual completion queues for full-duplex I/O
-- **Transport trait** — Generic `Transport` abstraction decoupling RDMA mechanics from consumers; `RdmaTransport` provides the concrete implementation
+- **Transport trait** — Generic `Transport` / `TransportBuilder` abstraction decoupling RDMA mechanics from consumers; three concrete implementations: `SendRecvTransport` (Send/Recv verbs), `CreditRingTransport` (RDMA Write ring + credits), `ReadRingTransport` (RDMA Write ring + Read flow control)
 - **Low-level async** — `AsyncCq` (completion queue polling via epoll) and `AsyncQp` for custom RDMA verb patterns (Send/Recv, RDMA Read/Write, atomics)
 - **tonic gRPC transport** — `RdmaConnector` and `RdmaIncoming` for drop-in RDMA transport with tonic, including optional TLS via `tonic-tls` + OpenSSL
 - **Quinn QUIC transport** — `RdmaUdpSocket` implements Quinn's `AsyncUdpSocket` trait, enabling QUIC over RDMA without modifying Quinn
@@ -31,16 +31,18 @@ Safe Rust bindings for RDMA programming over [libibverbs](https://github.com/lin
 ```rust
 use rdma_io::async_cm::AsyncCmListener;
 use rdma_io::async_stream::AsyncRdmaStream;
-use rdma_io::rdma_transport::{RdmaTransport, TransportConfig};
+use rdma_io::send_recv_transport::SendRecvConfig;
+
+let config = SendRecvConfig::stream();
 
 // Server
 let listener = AsyncCmListener::bind(&"0.0.0.0:0".parse().unwrap()).unwrap();
-let transport = RdmaTransport::accept(&listener, TransportConfig::default()).await.unwrap();
+let transport = config.accept(&listener).await.unwrap();
 let mut server = AsyncRdmaStream::new(transport);
 
 // Client
 let addr = "10.0.0.1:9999".parse().unwrap();
-let transport = RdmaTransport::connect(&addr, TransportConfig::default()).await.unwrap();
+let transport = config.connect(&addr).await.unwrap();
 let mut client = AsyncRdmaStream::new(transport);
 client.write_all(b"hello async rdma").await.unwrap();
 ```
@@ -48,20 +50,20 @@ client.write_all(b"hello async rdma").await.unwrap();
 ### tonic gRPC over RDMA
 
 ```rust
-use rdma_io::rdma_transport::TransportConfig;
+use rdma_io::send_recv_transport::SendRecvConfig;
 use rdma_io_tonic::{RdmaConnector, RdmaIncoming};
 
 // Server
 let incoming = RdmaIncoming::bind(
     &"0.0.0.0:50051".parse().unwrap(),
-    TransportConfig::stream(),
+    SendRecvConfig::stream(),
 )?;
 Server::builder()
     .add_service(my_service)
     .serve_with_incoming(incoming).await?;
 
 // Client
-let connector = RdmaConnector::new(TransportConfig::stream());
+let connector = RdmaConnector::new(SendRecvConfig::stream());
 let channel = Endpoint::from_static("http://10.0.0.1:50051")
     .connect_with_connector(connector).await?;
 ```
@@ -69,13 +71,13 @@ let channel = Endpoint::from_static("http://10.0.0.1:50051")
 ### Quinn QUIC over RDMA
 
 ```rust
-use rdma_io::rdma_transport::TransportConfig;
+use rdma_io::send_recv_transport::SendRecvConfig;
 use rdma_io_quinn::RdmaUdpSocket;
 use quinn::{Endpoint, EndpointConfig};
 
 // Server: bind RDMA socket with transport builder, create Quinn endpoint
 let server_socket = Arc::new(
-    RdmaUdpSocket::bind(&"0.0.0.0:0".parse().unwrap(), TransportConfig::datagram())?
+    RdmaUdpSocket::bind(&"0.0.0.0:0".parse().unwrap(), SendRecvConfig::datagram())?
 );
 let server_endpoint = Endpoint::new_with_abstract_socket(
     EndpointConfig::default(), Some(server_config),
@@ -84,7 +86,7 @@ let server_endpoint = Endpoint::new_with_abstract_socket(
 let incoming = server_endpoint.accept().await.unwrap();
 
 // Client: pre-connect RDMA, then create Quinn endpoint
-let client_socket = RdmaUdpSocket::bind(&"0.0.0.0:0".parse().unwrap(), TransportConfig::datagram())?;
+let client_socket = RdmaUdpSocket::bind(&"0.0.0.0:0".parse().unwrap(), SendRecvConfig::datagram())?;
 client_socket.connect_to(&server_addr).await?;
 let client_endpoint = Endpoint::new_with_abstract_socket(
     EndpointConfig::default(), None,
@@ -96,18 +98,18 @@ let connection = client_endpoint.connect(server_addr, "localhost")?.await?;
 ### tonic gRPC over HTTP/3 over RDMA
 
 ```rust
-use rdma_io::rdma_transport::TransportConfig;
+use rdma_io::send_recv_transport::SendRecvConfig;
 use rdma_io_quinn::RdmaUdpSocket;
 use tonic_h3::quinn::{H3QuinnAcceptor, H3QuinnConnector};
 
 // Server: RDMA socket → Quinn endpoint → tonic-h3 acceptor
-let socket = Arc::new(RdmaUdpSocket::bind(&addr, TransportConfig::datagram())?);
+let socket = Arc::new(RdmaUdpSocket::bind(&addr, SendRecvConfig::datagram())?);
 let endpoint = Endpoint::new_with_abstract_socket(config, Some(h3_server_config), socket, rt)?;
 let acceptor = H3QuinnAcceptor::new(endpoint);
 tonic_h3::server::H3Router::new(routes).serve(acceptor).await?;
 
 // Client: pre-connect RDMA → Quinn endpoint → H3 channel → gRPC client
-let socket = RdmaUdpSocket::bind(&addr, TransportConfig::datagram())?;
+let socket = RdmaUdpSocket::bind(&addr, SendRecvConfig::datagram())?;
 socket.connect_to(&server_addr).await?;
 let endpoint = Endpoint::new_with_abstract_socket(config, None, Arc::new(socket), rt)?;
 let connector = H3QuinnConnector::new(uri.clone(), "localhost".into(), endpoint);
@@ -170,7 +172,7 @@ Design documents and background research are in [`docs/`](docs/):
 |---|---|
 | [SafeApi.md](docs/design/SafeApi.md) | Safe API design and RAII ownership model |
 | [RdmaOperations.md](docs/design/RdmaOperations.md) | RDMA verb operations and data path patterns |
-| [rdma-transport-layer.md](docs/design/rdma-transport-layer.md) | Transport trait architecture and RdmaTransport |
+| [rdma-transport-layer.md](docs/design/rdma-transport-layer.md) | Transport trait architecture and transport implementations |
 | [quinn-rdma.md](docs/design/quinn-rdma.md) | Quinn QUIC over RDMA design (includes tonic-h3 integration) |
 | [rdma-transport-comparison.md](docs/design/rdma-transport-comparison.md) | Three-way transport comparison (rdma-io vs msquic vs ring) |
 | [Testing.md](docs/design/Testing.md) | Test strategy and provider compatibility matrix |

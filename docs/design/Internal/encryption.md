@@ -55,10 +55,11 @@ tonic gRPC
 ### Client
 
 ```rust
-use rdma_io_tonic::RdmaTransport;
+use rdma_io::send_recv_transport::SendRecvConfig;
+use rdma_io_tonic::tls::RdmaTransport;
 use tonic_tls::openssl::TlsConnector;
 
-let transport = RdmaTransport::new();
+let transport = RdmaTransport::new(SendRecvConfig::stream());
 let ssl = SslConnector::builder(SslMethod::tls_client())?.build();
 let connector = TlsConnector::new(transport, ssl, "server.example.com".into());
 
@@ -70,12 +71,13 @@ let client = MyServiceClient::new(channel);
 ### Server
 
 ```rust
+use rdma_io::send_recv_transport::SendRecvConfig;
 use rdma_io_tonic::RdmaIncoming;
 use tonic_tls::openssl::TlsIncoming;
 
 let acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server())?;
 // ... set cert, key, CA ...
-let incoming = RdmaIncoming::bind(&"0.0.0.0:50051".parse()?)?;
+let incoming = RdmaIncoming::bind(&"0.0.0.0:50051".parse()?, SendRecvConfig::stream())?;
 let tls_incoming = TlsIncoming::new(incoming, acceptor.build());
 
 Server::builder()
