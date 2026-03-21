@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use quinn::{Endpoint, EndpointConfig};
 use rdma_io::credit_ring_transport::CreditRingConfig;
+use rdma_io::read_ring_transport::ReadRingConfig;
 use rdma_io::send_recv_transport::SendRecvConfig;
 use rdma_io::transport::TransportBuilder;
 use rdma_io_quinn::RdmaUdpSocket;
@@ -193,6 +194,12 @@ async fn h3_unary_ring() {
     h3_unary(CreditRingConfig::datagram()).await;
 }
 
+#[tokio::test]
+async fn h3_unary_read_ring() {
+    require_no_iwarp!();
+    h3_unary(ReadRingConfig::datagram()).await;
+}
+
 // ===========================================================================
 // h3_server_stream — server streaming gRPC over HTTP/3 + RDMA.
 // ===========================================================================
@@ -238,6 +245,12 @@ async fn h3_server_stream_default() {
 async fn h3_server_stream_ring() {
     require_no_iwarp!();
     h3_server_stream(CreditRingConfig::datagram()).await;
+}
+
+#[tokio::test]
+async fn h3_server_stream_read_ring() {
+    require_no_iwarp!();
+    h3_server_stream(ReadRingConfig::datagram()).await;
 }
 
 // ===========================================================================
@@ -318,6 +331,12 @@ async fn h3_multi_peer_ring() {
     h3_multi_peer(CreditRingConfig::datagram()).await;
 }
 
+#[tokio::test]
+async fn h3_multi_peer_read_ring() {
+    require_no_iwarp!();
+    h3_multi_peer(ReadRingConfig::datagram()).await;
+}
+
 // ===========================================================================
 // h3_channel_reuse — send multiple sequential requests on the same channel.
 // ===========================================================================
@@ -359,4 +378,10 @@ async fn h3_channel_reuse_default() {
 async fn h3_channel_reuse_ring() {
     require_no_iwarp!();
     h3_channel_reuse(CreditRingConfig::datagram()).await;
+}
+
+#[tokio::test]
+async fn h3_channel_reuse_read_ring() {
+    require_no_iwarp!();
+    h3_channel_reuse(ReadRingConfig::datagram()).await;
 }

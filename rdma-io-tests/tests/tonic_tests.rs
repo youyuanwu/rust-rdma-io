@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use rdma_io::async_cm::AsyncCmListener;
 use rdma_io::credit_ring_transport::CreditRingConfig;
+use rdma_io::read_ring_transport::ReadRingConfig;
 use rdma_io::send_recv_transport::SendRecvConfig;
 use rdma_io::transport::TransportBuilder;
 use rdma_io_tonic::{RdmaConnector, RdmaIncoming};
@@ -115,6 +116,12 @@ async fn greeter_ring() {
     greeter(CreditRingConfig::default()).await;
 }
 
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn greeter_read_ring() {
+    require_no_iwarp!();
+    greeter(ReadRingConfig::default()).await;
+}
+
 // ===========================================================================
 // server_stream — server sends 5 replies.
 // ===========================================================================
@@ -158,6 +165,12 @@ async fn server_stream_default() {
 async fn server_stream_ring() {
     require_no_iwarp!();
     server_stream(CreditRingConfig::default()).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn server_stream_read_ring() {
+    require_no_iwarp!();
+    server_stream(ReadRingConfig::default()).await;
 }
 
 // ===========================================================================
@@ -205,6 +218,12 @@ async fn client_stream_ring() {
     client_stream(CreditRingConfig::default()).await;
 }
 
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn client_stream_read_ring() {
+    require_no_iwarp!();
+    client_stream(ReadRingConfig::default()).await;
+}
+
 // ===========================================================================
 // bidi_stream — client sends, server echoes each.
 // ===========================================================================
@@ -248,4 +267,10 @@ async fn bidi_stream_default() {
 async fn bidi_stream_ring() {
     require_no_iwarp!();
     bidi_stream(CreditRingConfig::default()).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn bidi_stream_read_ring() {
+    require_no_iwarp!();
+    bidi_stream(ReadRingConfig::default()).await;
 }

@@ -3,13 +3,20 @@
 //! Uses [`rcgen`] to generate self-signed server and client certs at test time.
 //! Each side directly trusts the other's self-signed cert (no CA needed).
 //! Verifies mTLS gRPC over RDMA end-to-end.
+//!
+//! Each test exercises unary, server-streaming, and bidi-streaming gRPC
+//! against a single TLS server to avoid siw resource cleanup races.
 
 use std::time::Duration;
 
 use openssl::ssl::{SslAcceptor, SslConnector, SslMethod, SslVerifyMode};
 use openssl::x509::X509;
 use rdma_io::async_cm::AsyncCmListener;
+use rdma_io::credit_ring_transport::CreditRingConfig;
+use rdma_io::read_ring_transport::ReadRingConfig;
 use rdma_io::send_recv_transport::SendRecvConfig;
+use rdma_io::transport::TransportBuilder;
+use rdma_io_tests::require_no_iwarp;
 use rdma_io_tonic::RdmaIncoming;
 use rdma_io_tonic::tls::RdmaTransport;
 use tokio_stream::StreamExt;
@@ -68,8 +75,9 @@ fn generate_test_pki() -> TestPki {
 // Server + client setup with TLS
 // ---------------------------------------------------------------------------
 
-async fn start_tls_server_and_connect(
+async fn start_tls_server_and_connect<B: TransportBuilder>(
     pki: &TestPki,
+    builder: B,
 ) -> (
     GreeterClient<Channel>,
     tokio::sync::oneshot::Sender<()>,
@@ -77,7 +85,7 @@ async fn start_tls_server_and_connect(
 ) {
     let listener = AsyncCmListener::bind(&bind_addr()).expect("bind RDMA listener");
     let connect_addr = connect_addr_for(listener.local_addr());
-    let incoming = RdmaIncoming::new(listener, SendRecvConfig::stream());
+    let incoming = RdmaIncoming::new(listener, builder.clone());
 
     // --- Server TLS ---
     let mut acceptor_builder =
@@ -145,7 +153,7 @@ async fn start_tls_server_and_connect(
         .expect("set ALPN");
     let ssl_conn = connector_builder.build();
 
-    let transport = RdmaTransport::new(SendRecvConfig::stream());
+    let transport = RdmaTransport::new(builder);
     let ip = connect_addr.ip();
     let port = connect_addr.port();
     // Use IP string as domain for SNI — the server cert has the IP as a SAN.
@@ -200,15 +208,13 @@ async fn start_tls_server_and_connect(
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Test: unary, server-streaming, and bidi-streaming gRPC over RDMA with mTLS.
-///
-/// All RPC patterns are exercised against a single TLS server to avoid the siw
-/// resource cleanup race that occurs when repeatedly creating and destroying
-/// RDMA connections between separate tests.
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
-async fn tonic_tls_over_rdma() {
+/// Generic TLS test body: unary, server-streaming, and bidi-streaming gRPC
+/// over RDMA with mTLS. All RPC patterns are exercised against a single TLS
+/// server to avoid siw resource cleanup races.
+async fn tonic_tls_over_rdma_generic<B: TransportBuilder>(builder: B) {
     let pki = generate_test_pki();
-    let (mut client, shutdown_tx, server_handle) = start_tls_server_and_connect(&pki).await;
+    let (mut client, shutdown_tx, server_handle) =
+        start_tls_server_and_connect(&pki, builder).await;
 
     // -- Unary --
     let response = tokio::time::timeout(
@@ -261,4 +267,21 @@ async fn tonic_tls_over_rdma() {
     drop(client);
     let _ = shutdown_tx.send(());
     server_handle.await.unwrap();
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn tonic_tls_over_rdma() {
+    tonic_tls_over_rdma_generic(SendRecvConfig::stream()).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn tonic_tls_over_rdma_ring() {
+    require_no_iwarp!();
+    tonic_tls_over_rdma_generic(CreditRingConfig::default()).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn tonic_tls_over_rdma_read_ring() {
+    require_no_iwarp!();
+    tonic_tls_over_rdma_generic(ReadRingConfig::default()).await;
 }
