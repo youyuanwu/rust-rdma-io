@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use quinn::{ClientConfig, Endpoint, ServerConfig};
 use rdma_io::credit_ring_transport::CreditRingConfig;
+use rdma_io::read_ring_transport::ReadRingConfig;
 use rdma_io::send_recv_transport::SendRecvConfig;
 use rdma_io::transport::TransportBuilder;
 use rdma_io_quinn::RdmaUdpSocket;
@@ -154,6 +155,12 @@ async fn quinn_echo_ring() {
     quinn_echo(CreditRingConfig::datagram()).await;
 }
 
+#[tokio::test]
+async fn quinn_echo_read_ring() {
+    require_no_iwarp!();
+    quinn_echo(ReadRingConfig::datagram()).await;
+}
+
 // ===========================================================================
 // quinn_multi_peer — two clients echo concurrently via the same server.
 // ===========================================================================
@@ -266,4 +273,10 @@ async fn quinn_multi_peer_default() {
 async fn quinn_multi_peer_ring() {
     require_no_iwarp!();
     quinn_multi_peer(CreditRingConfig::datagram()).await;
+}
+
+#[tokio::test]
+async fn quinn_multi_peer_read_ring() {
+    require_no_iwarp!();
+    quinn_multi_peer(ReadRingConfig::datagram()).await;
 }
