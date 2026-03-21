@@ -243,7 +243,7 @@ impl CreditRingTransport {
         .await?;
 
         // Drain setup completions from send CQ (token send + MW bind).
-        drain_send_cq(&qp);
+        drain_send_cq(&qp)?;
 
         // NOW post doorbell recv WRs (after token exchange is done).
         for (i, mr) in doorbell_bufs.iter().enumerate() {
@@ -349,7 +349,7 @@ impl CreditRingTransport {
         .await?;
 
         // Drain setup completions from send CQ (token send + MW bind).
-        drain_send_cq(&qp);
+        drain_send_cq(&qp)?;
 
         // Post doorbell recv WRs.
         for (i, mr) in doorbell_bufs.iter().enumerate() {
@@ -485,10 +485,16 @@ impl CreditRingTransport {
     fn drain_recv_credits(&mut self) {
         let mut wc_buf = [WorkCompletion::default(); 8];
         // Arm + drain (one pass, non-blocking).
-        let _ = self.qp.recv_cq().cq().req_notify(false);
+        if self.qp.recv_cq().cq().req_notify(false).is_err() {
+            self.qp_dead = true;
+            return;
+        }
         let n = match self.qp.recv_cq().cq().poll(&mut wc_buf) {
             Ok(n) => n,
-            Err(_) => return,
+            Err(_) => {
+                self.qp_dead = true;
+                return;
+            }
         };
         for wc in &wc_buf[..n] {
             if !wc.is_success() {
@@ -506,7 +512,10 @@ impl CreditRingTransport {
                         // Padding consumes a sender credit, so assign a tracker
                         // slot and immediately release it.
                         let _pad_len = self.recv_ring.capacity - offset;
-                        let _ = self.repost_doorbell();
+                        if self.repost_doorbell().is_err() {
+                            self.qp_dead = true;
+                            return;
+                        }
                         let seq = self.recv_arrival_seq;
                         self.recv_arrival_seq += 1;
                         let slot = seq % self.max_outstanding;
@@ -519,7 +528,10 @@ impl CreditRingTransport {
                                 WrOpcode::SendWithImm(credit_imm),
                             )
                             .flags(SendFlags::SIGNALED);
-                            let _ = self.qp.post_send_wr(&mut credit_wr);
+                            if self.qp.post_send_wr(&mut credit_wr).is_err() {
+                                self.qp_dead = true;
+                                return;
+                            }
                             self.send_in_flight += 1;
                         }
                     } else {
@@ -562,7 +574,10 @@ impl CreditRingTransport {
                             );
                         }
                     }
-                    let _ = self.repost_doorbell();
+                    if self.repost_doorbell().is_err() {
+                        self.qp_dead = true;
+                        return;
+                    }
                 }
                 _ => {}
             }
@@ -793,7 +808,12 @@ impl Transport for CreditRingTransport {
                         if length == 0 {
                             // Padding — repost doorbell. Assign a tracker slot
                             // and immediately release (padding is auto-consumed).
-                            let _ = self.repost_doorbell();
+                            if self.repost_doorbell().is_err() {
+                                self.qp_dead = true;
+                                return Poll::Ready(Err(crate::Error::InvalidArg(
+                                    "repost_doorbell failed".into(),
+                                )));
+                            }
                             let seq = self.recv_arrival_seq;
                             self.recv_arrival_seq += 1;
                             let slot = seq % self.max_outstanding;
@@ -806,7 +826,12 @@ impl Transport for CreditRingTransport {
                                     WrOpcode::SendWithImm(credit_imm),
                                 )
                                 .flags(SendFlags::SIGNALED);
-                                let _ = self.qp.post_send_wr(&mut credit_wr);
+                                if self.qp.post_send_wr(&mut credit_wr).is_err() {
+                                    self.qp_dead = true;
+                                    return Poll::Ready(Err(crate::Error::InvalidArg(
+                                        "credit post_send failed".into(),
+                                    )));
+                                }
                                 self.send_in_flight += 1;
                             }
                             continue;
@@ -870,7 +895,12 @@ impl Transport for CreditRingTransport {
                             }
                             got_credits = true;
                         }
-                        let _ = self.repost_doorbell();
+                        if self.repost_doorbell().is_err() {
+                            self.qp_dead = true;
+                            return Poll::Ready(Err(crate::Error::InvalidArg(
+                                "repost_doorbell failed".into(),
+                            )));
+                        }
                     }
                     _ => {
                         // Unexpected opcode — skip.

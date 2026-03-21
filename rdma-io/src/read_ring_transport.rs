@@ -440,7 +440,7 @@ impl ReadRingTransport {
             complete_read_ring_token_exchange(&qp, &pd, &our_token, &token_recv_mr).await?;
 
         // Drain setup completions from send CQ (token send + 2 MW binds).
-        drain_send_cq(&qp);
+        drain_send_cq(&qp)?;
 
         // Post doorbell recv WRs.
         for (i, mr) in doorbell_bufs.iter().enumerate() {
@@ -554,7 +554,7 @@ impl ReadRingTransport {
         let peer_token =
             complete_read_ring_token_exchange(&qp, &pd, &our_token, &token_recv_mr).await?;
 
-        drain_send_cq(&qp);
+        drain_send_cq(&qp)?;
 
         for (i, mr) in doorbell_bufs.iter().enumerate() {
             let sge = Sge::new(mr.addr(), 4, mr.lkey());
@@ -732,10 +732,16 @@ impl ReadRingTransport {
     /// Also handles Write and padding completions encountered along the way.
     fn drain_send_cq_for_read(&mut self) {
         let mut wc_buf = [WorkCompletion::default(); 8];
-        let _ = self.qp.send_cq().cq().req_notify(false);
+        if self.qp.send_cq().cq().req_notify(false).is_err() {
+            self.qp_dead = true;
+            return;
+        }
         let n = match self.qp.send_cq().cq().poll(&mut wc_buf) {
             Ok(n) => n,
-            Err(_) => return,
+            Err(_) => {
+                self.qp_dead = true;
+                return;
+            }
         };
         for wc in &wc_buf[..n] {
             if !wc.is_success() {
@@ -868,8 +874,10 @@ impl Transport for ReadRingTransport {
         // Proactive Read when remaining space is getting low.
         if !self.read_in_flight {
             let remaining = self.remote_free_space();
-            if remaining < data_len * 2 + self.config.min_free_threshold {
-                let _ = self.post_offset_read();
+            if remaining < data_len * 2 + self.config.min_free_threshold
+                && self.post_offset_read().is_err()
+            {
+                self.qp_dead = true;
             }
         }
 
@@ -993,7 +1001,12 @@ impl Transport for ReadRingTransport {
                             // Padding — repost doorbell, assign tracker slot,
                             // immediately release.
                             let pad_len = self.recv_ring.capacity - offset;
-                            let _ = self.repost_doorbell();
+                            if self.repost_doorbell().is_err() {
+                                self.qp_dead = true;
+                                return Poll::Ready(Err(crate::Error::InvalidArg(
+                                    "repost_doorbell failed".into(),
+                                )));
+                            }
                             let seq = self.recv_arrival_seq;
                             self.recv_arrival_seq += 1;
                             let slot = seq % self.max_outstanding;

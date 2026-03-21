@@ -322,12 +322,12 @@ pub(crate) async fn complete_token_exchange(
 /// Drain all pending completions from the send CQ.
 /// Waits briefly for in-flight completions (e.g., token Send) to arrive.
 /// Returns the number of completions drained.
-pub(crate) fn drain_send_cq(qp: &AsyncQp) -> usize {
+pub(crate) fn drain_send_cq(qp: &AsyncQp) -> crate::Result<usize> {
     let mut wc = [WorkCompletion::default(); 16];
     let mut total = 0;
     // Brief spin to catch in-flight completions from setup WRs.
     for _ in 0..100 {
-        let _ = qp.send_cq().cq().req_notify(false);
+        qp.send_cq().cq().req_notify(false)?;
         match qp.send_cq().cq().poll(&mut wc) {
             Ok(0) => {
                 if total > 0 {
@@ -338,10 +338,10 @@ pub(crate) fn drain_send_cq(qp: &AsyncQp) -> usize {
             Ok(n) => {
                 total += n;
             }
-            Err(_) => break,
+            Err(e) => return Err(e),
         }
     }
-    total
+    Ok(total)
 }
 
 /// Check whether the QP has left RTS state (e.g. entered ERROR).
