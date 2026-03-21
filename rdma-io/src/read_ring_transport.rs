@@ -178,8 +178,6 @@ pub struct ReadRingTransport {
     cached_remote_head: usize,
     /// Is an RDMA Read of the offset buffer pending?
     read_in_flight: bool,
-    /// Pointer to local 4-byte offset buffer (written by receiver on repost_recv).
-    offset_buffer: *mut AtomicU32,
     /// VA of the remote peer's offset buffer.
     remote_offset_va: u64,
     /// MW2 rkey for RDMA Read of remote offset buffer.
@@ -235,12 +233,18 @@ pub struct ReadRingTransport {
     event_channel: EventChannel,
 }
 
-// Safety: Raw pointer `offset_buffer` points into `offset_mr` memory which is
-// pinned by ibverbs registration and valid for the struct's lifetime. All RDMA
-// kernel-managed handles (*mut ibv_mr, *mut ibv_mw etc.) are safe to send
-// between threads — same justification as OwnedMemoryRegion.
-unsafe impl Send for ReadRingTransport {}
-unsafe impl Sync for ReadRingTransport {}
+impl ReadRingTransport {
+    /// Returns a reference to the local offset buffer (AtomicU32).
+    ///
+    /// The offset buffer lives inside `_offset_mr`, which is pinned by ibverbs
+    /// registration and valid for the struct's lifetime. The 4-byte region is
+    /// aligned to 64 bytes (cache-line) within the MR allocation.
+    fn offset_buffer(&self) -> &AtomicU32 {
+        // Safety: `_offset_mr` is registered, pinned, and outlives all uses.
+        // The address is 4-byte aligned (guaranteed by 64-byte cache-line alignment).
+        unsafe { &*(self._offset_mr.addr() as *const AtomicU32) }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Token exchange helpers (32-byte ReadRingToken, different from ring_common)
@@ -445,14 +449,6 @@ impl ReadRingTransport {
             qp.post_recv_wr(&mut wr)?;
         }
 
-        // Derive offset_buffer pointer from MR.
-        let offset_ptr = offset_mr.addr() as *mut AtomicU32;
-
-        // Initialize offset buffer to 0 (already zeroed, but explicit).
-        unsafe {
-            (*offset_ptr).store(0, Ordering::Release);
-        }
-
         Ok(Self::from_parts(
             qp,
             cm_async_fd,
@@ -464,7 +460,6 @@ impl ReadRingTransport {
             recv_mw,
             offset_mw,
             offset_mr,
-            offset_ptr,
             read_buf,
             doorbell_bufs,
             peer_token.ring_va,
@@ -567,11 +562,6 @@ impl ReadRingTransport {
             qp.post_recv_wr(&mut wr)?;
         }
 
-        let offset_ptr = offset_mr.addr() as *mut AtomicU32;
-        unsafe {
-            (*offset_ptr).store(0, Ordering::Release);
-        }
-
         Ok(Self::from_parts(
             qp,
             cm_async_fd,
@@ -583,7 +573,6 @@ impl ReadRingTransport {
             recv_mw,
             offset_mw,
             offset_mr,
-            offset_ptr,
             read_buf,
             doorbell_bufs,
             peer_token.ring_va,
@@ -608,7 +597,6 @@ impl ReadRingTransport {
         recv_mw: MemoryWindow,
         offset_mw: MemoryWindow,
         offset_mr: OwnedMemoryRegion,
-        offset_ptr: *mut AtomicU32,
         read_buf: OwnedMemoryRegion,
         doorbell_bufs: Box<[OwnedMemoryRegion]>,
         remote_addr: u64,
@@ -638,7 +626,6 @@ impl ReadRingTransport {
 
             cached_remote_head: 0,
             read_in_flight: false,
-            offset_buffer: offset_ptr,
             remote_offset_va,
             remote_offset_rkey,
             slot_lengths: vec![0usize; max_outstanding].into_boxed_slice(),
@@ -779,9 +766,8 @@ impl ReadRingTransport {
             self.head_slot_idx = (self.head_slot_idx + 1) % self.max_outstanding;
         }
         // Update offset buffer (AtomicU32 for portability).
-        unsafe {
-            (*self.offset_buffer).store(self.recv_ring.head as u32, Ordering::Release);
-        }
+        self.offset_buffer()
+            .store(self.recv_ring.head as u32, Ordering::Release);
     }
 }
 
