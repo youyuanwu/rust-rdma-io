@@ -509,7 +509,7 @@ True async connection setup — eliminated `spawn_blocking` from connect/accept 
 
 Generic datagram transport abstraction for Quinn QUIC integration.
 
-1. **`Transport` trait** (`transport.rs`): `send_copy()`, `poll_recv()`, `poll_send_completion()`, `poll_disconnect()`, `is_qp_dead()`, `disconnect()`, `repost_recv()`
+1. **`Transport` trait** (`transport.rs`): `send_copy()`, `poll_recv()`, `poll_send_completion()`, `poll_disconnect()`, `disconnect()`, `repost_recv()`
 2. **`SendRecvTransport`** (`send_recv_transport.rs`): concrete impl using RDMA Send/Recv verbs with dual CQ, pre-posted recv buffers, and configurable buffer sizes
 3. **`SendRecvConfig`**: presets `stream()` (NUM_RECV_BUFS=8, 32KB) and `datagram()` (64 recv × 1.5KB, 4 send)
 4. Used by `rdma-io-quinn::RdmaUdpSocket` as the underlying transport for each peer connection

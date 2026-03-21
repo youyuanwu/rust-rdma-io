@@ -44,14 +44,13 @@ AsyncRdmaStream<T> (byte stream)      RdmaUdpSocket<T> (datagram, future)
 | `recv_buf(buf_idx) → &[u8]` | Access received data (valid until repost) |
 | `repost_recv(buf_idx) → Result<()>` | Release recv buffer for reuse |
 | `poll_disconnect(cx) → bool` | Register CM waker + check state. True = dead. |
-| `is_qp_dead() → bool` | Non-blocking dead check |
 | `disconnect() → Result<()>` | Initiate graceful disconnect (idempotent) |
 | `local_addr() / peer_addr()` | Connection metadata |
 
 **Key design decisions:**
 - `send_copy` manages buffers internally (round-robin with in-flight tracking)
 - `poll_recv`/`poll_send_completion` convert WC errors to `Err()` — consumers never see `WorkCompletion`
-- `poll_disconnect` includes `is_qp_dead()` fallback for rxe (QP transitions without CM event)
+- `poll_disconnect` detects peer disconnect via CM events; CQ flush errors provide a secondary signal
 - `repost_recv(&mut self)` — compatible with future Ring transport that mutates internal state
 
 ## SendRecvTransport

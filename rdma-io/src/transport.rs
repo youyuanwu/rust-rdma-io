@@ -133,10 +133,6 @@ pub trait Transport: Send + Sync {
     /// the CQ fd has no completions to trigger epoll.
     fn poll_disconnect(&mut self, cx: &mut Context<'_>) -> bool;
 
-    /// Returns `true` when the connection is dead — no more data will
-    /// ever arrive or be sendable.
-    fn is_qp_dead(&self) -> bool;
-
     /// Initiate graceful disconnect. Idempotent — safe to call multiple times.
     fn disconnect(&mut self) -> Result<()>;
 

@@ -221,7 +221,7 @@ impl<T: Transport> AsyncWrite for AsyncRdmaStream<T> {
             return Poll::Ready(Ok(0));
         }
 
-        if this.eof || this.transport.is_qp_dead() {
+        if this.eof {
             this.write_pending = None;
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -313,7 +313,7 @@ impl<T: Transport> AsyncWrite for AsyncRdmaStream<T> {
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
 
-        if this.eof || this.transport.is_qp_dead() {
+        if this.eof {
             this.write_pending = None;
             return Poll::Ready(Ok(()));
         }

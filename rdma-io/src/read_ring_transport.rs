@@ -160,8 +160,6 @@ pub struct ReadRingTransport {
     // -- Connection state --
     disconnected: bool,
     peer_disconnected: bool,
-    qp_dead: bool,
-    qp_check_counter: u32,
 
     // -- Virtual buffer index mapping (fixed at max_outstanding) --
     virtual_idx_map: Box<[Option<(usize, usize, usize)>]>, // (offset, length, arrival_seq)
@@ -614,8 +612,6 @@ impl ReadRingTransport {
 
             disconnected: false,
             peer_disconnected: false,
-            qp_dead: false,
-            qp_check_counter: 0,
 
             virtual_idx_map: vec![None; max_outstanding].into_boxed_slice(),
             next_virt_idx: 0,
@@ -681,20 +677,11 @@ impl ReadRingTransport {
                 if etype == crate::cm::CmEventType::Disconnected {
                     self.peer_disconnected = true;
                 }
-                if is_qp_dead(self.qp.as_raw()) {
-                    self.qp_dead = true;
-                }
-                self.peer_disconnected || self.qp_dead
+                self.peer_disconnected
             }
-            Err(crate::Error::WouldBlock) => {
-                if is_qp_dead(self.qp.as_raw()) {
-                    self.qp_dead = true;
-                    return true;
-                }
-                false
-            }
+            Err(crate::Error::WouldBlock) => false,
             Err(_) => {
-                self.qp_dead = true;
+                self.peer_disconnected = true;
                 true
             }
         }
@@ -733,19 +720,19 @@ impl ReadRingTransport {
     fn drain_send_cq_for_read(&mut self) {
         let mut wc_buf = [WorkCompletion::default(); 8];
         if self.qp.send_cq().cq().req_notify(false).is_err() {
-            self.qp_dead = true;
+            self.peer_disconnected = true;
             return;
         }
         let n = match self.qp.send_cq().cq().poll(&mut wc_buf) {
             Ok(n) => n,
             Err(_) => {
-                self.qp_dead = true;
+                self.peer_disconnected = true;
                 return;
             }
         };
         for wc in &wc_buf[..n] {
             if !wc.is_success() {
-                self.qp_dead = true;
+                self.peer_disconnected = true;
                 return;
             }
             let wr_id = wc.wr_id();
@@ -786,7 +773,7 @@ impl Transport for ReadRingTransport {
     /// When the remote ring's free space drops below `min_free_threshold`,
     /// posts an RDMA Read to refresh the cached head position.
     fn send_copy(&mut self, data: &[u8]) -> crate::Result<usize> {
-        if self.qp_dead {
+        if self.peer_disconnected {
             return Err(crate::Error::WorkCompletion {
                 status: rdma_io_sys::ibverbs::IBV_WC_WR_FLUSH_ERR,
                 vendor_err: 0,
@@ -877,7 +864,7 @@ impl Transport for ReadRingTransport {
             if remaining < data_len * 2 + self.config.min_free_threshold
                 && self.post_offset_read().is_err()
             {
-                self.qp_dead = true;
+                self.peer_disconnected = true;
             }
         }
 
@@ -899,7 +886,7 @@ impl Transport for ReadRingTransport {
             let mut got_write = false;
             for wc in &wc_buf[..n] {
                 if !wc.is_success() {
-                    self.qp_dead = true;
+                    self.peer_disconnected = true;
                     return Poll::Ready(Err(crate::Error::WorkCompletion {
                         status: wc.status_raw(),
                         vendor_err: wc.vendor_err(),
@@ -975,7 +962,7 @@ impl Transport for ReadRingTransport {
             let mut got_data = false;
             for wc in &wc_buf[..n] {
                 if !wc.is_success() {
-                    self.qp_dead = true;
+                    self.peer_disconnected = true;
                     return Poll::Ready(Err(crate::Error::WorkCompletion {
                         status: wc.status_raw(),
                         vendor_err: wc.vendor_err(),
@@ -991,7 +978,7 @@ impl Transport for ReadRingTransport {
                         if offset >= self.recv_ring.capacity
                             || (length > 0 && offset + length > self.recv_ring.capacity)
                         {
-                            self.qp_dead = true;
+                            self.peer_disconnected = true;
                             return Poll::Ready(Err(crate::Error::InvalidArg(
                                 "recv ring offset/length out of bounds".into(),
                             )));
@@ -1002,7 +989,7 @@ impl Transport for ReadRingTransport {
                             // immediately release.
                             let pad_len = self.recv_ring.capacity - offset;
                             if self.repost_doorbell().is_err() {
-                                self.qp_dead = true;
+                                self.peer_disconnected = true;
                                 return Poll::Ready(Err(crate::Error::InvalidArg(
                                     "repost_doorbell failed".into(),
                                 )));
@@ -1029,7 +1016,7 @@ impl Transport for ReadRingTransport {
                             virt_idx = (virt_idx + 1) % self.max_outstanding;
                         }
                         if !found {
-                            self.qp_dead = true;
+                            self.peer_disconnected = true;
                             return Poll::Ready(Err(crate::Error::InvalidArg(
                                 "recv virtual index map exhausted".into(),
                             )));
@@ -1093,7 +1080,7 @@ impl Transport for ReadRingTransport {
     }
 
     fn poll_disconnect(&mut self, cx: &mut Context<'_>) -> bool {
-        if self.qp_dead {
+        if self.peer_disconnected {
             return true;
         }
         loop {
@@ -1105,27 +1092,14 @@ impl Transport for ReadRingTransport {
                     }
                 }
                 Poll::Pending => {
-                    // CM fd has nothing — check QP state as fallback.
-                    self.qp_check_counter += 1;
-                    if self.qp_check_counter >= 64 {
-                        self.qp_check_counter = 0;
-                        if is_qp_dead(self.qp.as_raw()) {
-                            self.qp_dead = true;
-                            return true;
-                        }
-                    }
                     return false;
                 }
                 Poll::Ready(Err(_)) => {
-                    self.qp_dead = true;
+                    self.peer_disconnected = true;
                     return true;
                 }
             }
         }
-    }
-
-    fn is_qp_dead(&self) -> bool {
-        self.qp_dead
     }
 
     fn disconnect(&mut self) -> crate::Result<()> {

@@ -21,7 +21,28 @@ use rdma_io_tests::test_helpers::{bind_addr, connect_addr_for};
 
 /// Create a connected (server, client) transport pair using any builder.
 async fn ring_connected_pair<B: TransportBuilder>(config: B) -> (B::Transport, B::Transport) {
-    let listener = AsyncCmListener::bind(&bind_addr()).unwrap();
+    // siw port release is async — bind can transiently fail with EADDRINUSE
+    // right after disconnect-heavy tests, even on port 0. Retry with backoff.
+    let listener = {
+        let mut last_err = None;
+        let mut listener_opt = None;
+        for attempt in 0..5u32 {
+            match AsyncCmListener::bind(&bind_addr()) {
+                Ok(l) => {
+                    listener_opt = Some(l);
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        100 * (attempt as u64 + 1),
+                    ))
+                    .await;
+                }
+            }
+        }
+        listener_opt.unwrap_or_else(|| panic!("bind failed after 5 attempts: {:?}", last_err))
+    };
     let connect_addr = connect_addr_for(listener.local_addr());
     let config2 = config.clone();
 

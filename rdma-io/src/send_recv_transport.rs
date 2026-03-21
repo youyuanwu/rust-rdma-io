@@ -19,7 +19,6 @@ use crate::mr::{AccessFlags, OwnedMemoryRegion};
 use crate::pd::ProtectionDomain;
 use crate::qp::QpInitAttr;
 use crate::transport::{RecvCompletion, Transport, TransportBuilder};
-use crate::transport_common::is_qp_dead;
 use crate::wc::WorkCompletion;
 use crate::wr::QpType;
 
@@ -83,12 +82,10 @@ pub struct SendRecvTransport {
     send_cq_state: CqPollState,
     recv_cq_state: CqPollState,
     disconnected: bool,
-    qp_dead: bool,
     peer_disconnected: bool,
     next_send_idx: usize,
     send_in_flight: Vec<bool>,
     config: SendRecvConfig,
-    qp_check_counter: u32,
 
     // -- RDMA data-path resources (drop: QP → MRs → PD) --
     qp: AsyncQp,
@@ -218,12 +215,10 @@ impl SendRecvTransport {
             send_cq_state: CqPollState::default(),
             recv_cq_state: CqPollState::default(),
             disconnected: false,
-            qp_dead: false,
             peer_disconnected: false,
             next_send_idx: 0,
             send_in_flight: vec![false; num_send],
             config,
-            qp_check_counter: 0,
             qp,
             send_bufs,
             recv_bufs,
@@ -242,20 +237,11 @@ impl SendRecvTransport {
                 if etype == crate::cm::CmEventType::Disconnected {
                     self.peer_disconnected = true;
                 }
-                if is_qp_dead(self.qp.as_raw()) {
-                    self.qp_dead = true;
-                }
-                self.peer_disconnected || self.qp_dead
+                self.peer_disconnected
             }
-            Err(crate::Error::WouldBlock) => {
-                if is_qp_dead(self.qp.as_raw()) {
-                    self.qp_dead = true;
-                    return true;
-                }
-                false
-            }
+            Err(crate::Error::WouldBlock) => false,
             Err(_) => {
-                self.qp_dead = true;
+                self.peer_disconnected = true;
                 true
             }
         }
@@ -300,7 +286,7 @@ impl Transport for SendRecvTransport {
         };
         for wc in &wc_buf[..n] {
             if !wc.is_success() {
-                self.qp_dead = true;
+                self.peer_disconnected = true;
                 return Poll::Ready(Err(crate::Error::WorkCompletion {
                     status: wc.status_raw(),
                     vendor_err: wc.vendor_err(),
@@ -334,7 +320,7 @@ impl Transport for SendRecvTransport {
         };
         for i in 0..n {
             if !wc_buf[i].is_success() {
-                self.qp_dead = true;
+                self.peer_disconnected = true;
                 return Poll::Ready(Err(crate::Error::WorkCompletion {
                     status: wc_buf[i].status_raw(),
                     vendor_err: wc_buf[i].vendor_err(),
@@ -358,7 +344,7 @@ impl Transport for SendRecvTransport {
     }
 
     fn poll_disconnect(&mut self, cx: &mut Context<'_>) -> bool {
-        if self.qp_dead {
+        if self.peer_disconnected {
             return true;
         }
         loop {
@@ -370,30 +356,14 @@ impl Transport for SendRecvTransport {
                     }
                 }
                 Poll::Pending => {
-                    // CM fd has nothing — check QP state as fallback.
-                    // On rxe, the QP may transition to ERROR without a CM
-                    // event (or after the event was already consumed).
-                    // Rate-limit the verbs call to avoid hot-path overhead.
-                    self.qp_check_counter += 1;
-                    if self.qp_check_counter >= 64 {
-                        self.qp_check_counter = 0;
-                        if is_qp_dead(self.qp.as_raw()) {
-                            self.qp_dead = true;
-                            return true;
-                        }
-                    }
                     return false;
                 }
                 Poll::Ready(Err(_)) => {
-                    self.qp_dead = true;
+                    self.peer_disconnected = true;
                     return true;
                 }
             }
         }
-    }
-
-    fn is_qp_dead(&self) -> bool {
-        self.qp_dead
     }
 
     fn disconnect(&mut self) -> crate::Result<()> {

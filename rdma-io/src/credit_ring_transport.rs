@@ -107,8 +107,6 @@ pub struct CreditRingTransport {
     // -- Connection state --
     disconnected: bool,
     peer_disconnected: bool,
-    qp_dead: bool,
-    qp_check_counter: u32,
 
     // -- Virtual buffer index mapping --
     // -- Virtual buffer index mapping (fixed at max_outstanding) --
@@ -400,8 +398,6 @@ impl CreditRingTransport {
 
             disconnected: false,
             peer_disconnected: false,
-            qp_dead: false,
-            qp_check_counter: 0,
 
             virtual_idx_map: vec![None; max_outstanding].into_boxed_slice(),
             next_virt_idx: 0,
@@ -449,20 +445,11 @@ impl CreditRingTransport {
                 if etype == crate::cm::CmEventType::Disconnected {
                     self.peer_disconnected = true;
                 }
-                if is_qp_dead(self.qp.as_raw()) {
-                    self.qp_dead = true;
-                }
-                self.peer_disconnected || self.qp_dead
+                self.peer_disconnected
             }
-            Err(crate::Error::WouldBlock) => {
-                if is_qp_dead(self.qp.as_raw()) {
-                    self.qp_dead = true;
-                    return true;
-                }
-                false
-            }
+            Err(crate::Error::WouldBlock) => false,
             Err(_) => {
-                self.qp_dead = true;
+                self.peer_disconnected = true;
                 true
             }
         }
@@ -486,19 +473,19 @@ impl CreditRingTransport {
         let mut wc_buf = [WorkCompletion::default(); 8];
         // Arm + drain (one pass, non-blocking).
         if self.qp.recv_cq().cq().req_notify(false).is_err() {
-            self.qp_dead = true;
+            self.peer_disconnected = true;
             return;
         }
         let n = match self.qp.recv_cq().cq().poll(&mut wc_buf) {
             Ok(n) => n,
             Err(_) => {
-                self.qp_dead = true;
+                self.peer_disconnected = true;
                 return;
             }
         };
         for wc in &wc_buf[..n] {
             if !wc.is_success() {
-                self.qp_dead = true;
+                self.peer_disconnected = true;
                 return;
             }
             match wc.opcode() {
@@ -513,7 +500,7 @@ impl CreditRingTransport {
                         // slot and immediately release it.
                         let _pad_len = self.recv_ring.capacity - offset;
                         if self.repost_doorbell().is_err() {
-                            self.qp_dead = true;
+                            self.peer_disconnected = true;
                             return;
                         }
                         let seq = self.recv_arrival_seq;
@@ -529,7 +516,7 @@ impl CreditRingTransport {
                             )
                             .flags(SendFlags::SIGNALED);
                             if self.qp.post_send_wr(&mut credit_wr).is_err() {
-                                self.qp_dead = true;
+                                self.peer_disconnected = true;
                                 return;
                             }
                             self.send_in_flight += 1;
@@ -575,7 +562,7 @@ impl CreditRingTransport {
                         }
                     }
                     if self.repost_doorbell().is_err() {
-                        self.qp_dead = true;
+                        self.peer_disconnected = true;
                         return;
                     }
                 }
@@ -610,7 +597,7 @@ impl Transport for CreditRingTransport {
     /// Any data completions encountered during the inline drain are stashed
     /// and returned by the next `poll_recv` call.
     fn send_copy(&mut self, data: &[u8]) -> crate::Result<usize> {
-        if self.qp_dead {
+        if self.peer_disconnected {
             return Err(crate::Error::WorkCompletion {
                 status: rdma_io_sys::ibverbs::IBV_WC_WR_FLUSH_ERR,
                 vendor_err: 0,
@@ -715,7 +702,7 @@ impl Transport for CreditRingTransport {
         };
         for wc in &wc_buf[..n] {
             if !wc.is_success() {
-                self.qp_dead = true;
+                self.peer_disconnected = true;
                 return Poll::Ready(Err(crate::Error::WorkCompletion {
                     status: wc.status_raw(),
                     vendor_err: wc.vendor_err(),
@@ -783,7 +770,7 @@ impl Transport for CreditRingTransport {
             let mut got_credits = false;
             for wc in &wc_buf[..n] {
                 if !wc.is_success() {
-                    self.qp_dead = true;
+                    self.peer_disconnected = true;
                     return Poll::Ready(Err(crate::Error::WorkCompletion {
                         status: wc.status_raw(),
                         vendor_err: wc.vendor_err(),
@@ -799,7 +786,7 @@ impl Transport for CreditRingTransport {
                         if offset >= self.recv_ring.capacity
                             || (length > 0 && offset + length > self.recv_ring.capacity)
                         {
-                            self.qp_dead = true;
+                            self.peer_disconnected = true;
                             return Poll::Ready(Err(crate::Error::InvalidArg(
                                 "recv ring offset/length out of bounds".into(),
                             )));
@@ -809,7 +796,7 @@ impl Transport for CreditRingTransport {
                             // Padding — repost doorbell. Assign a tracker slot
                             // and immediately release (padding is auto-consumed).
                             if self.repost_doorbell().is_err() {
-                                self.qp_dead = true;
+                                self.peer_disconnected = true;
                                 return Poll::Ready(Err(crate::Error::InvalidArg(
                                     "repost_doorbell failed".into(),
                                 )));
@@ -827,7 +814,7 @@ impl Transport for CreditRingTransport {
                                 )
                                 .flags(SendFlags::SIGNALED);
                                 if self.qp.post_send_wr(&mut credit_wr).is_err() {
-                                    self.qp_dead = true;
+                                    self.peer_disconnected = true;
                                     return Poll::Ready(Err(crate::Error::InvalidArg(
                                         "credit post_send failed".into(),
                                     )));
@@ -853,7 +840,7 @@ impl Transport for CreditRingTransport {
                             // For now we can't map this completion — stash as a special
                             // entry. Actually, we need a mapped slot. Log and mark dead
                             // as a safety measure (shouldn't happen under credit control).
-                            self.qp_dead = true;
+                            self.peer_disconnected = true;
                             return Poll::Ready(Err(crate::Error::InvalidArg(
                                 "recv virtual index map exhausted".into(),
                             )));
@@ -896,7 +883,7 @@ impl Transport for CreditRingTransport {
                             got_credits = true;
                         }
                         if self.repost_doorbell().is_err() {
-                            self.qp_dead = true;
+                            self.peer_disconnected = true;
                             return Poll::Ready(Err(crate::Error::InvalidArg(
                                 "repost_doorbell failed".into(),
                             )));
@@ -972,7 +959,7 @@ impl Transport for CreditRingTransport {
     }
 
     fn poll_disconnect(&mut self, cx: &mut Context<'_>) -> bool {
-        if self.qp_dead {
+        if self.peer_disconnected {
             return true;
         }
         loop {
@@ -984,27 +971,14 @@ impl Transport for CreditRingTransport {
                     }
                 }
                 Poll::Pending => {
-                    // CM fd has nothing — check QP state as fallback.
-                    self.qp_check_counter += 1;
-                    if self.qp_check_counter >= 64 {
-                        self.qp_check_counter = 0;
-                        if is_qp_dead(self.qp.as_raw()) {
-                            self.qp_dead = true;
-                            return true;
-                        }
-                    }
                     return false;
                 }
                 Poll::Ready(Err(_)) => {
-                    self.qp_dead = true;
+                    self.peer_disconnected = true;
                     return true;
                 }
             }
         }
-    }
-
-    fn is_qp_dead(&self) -> bool {
-        self.qp_dead
     }
 
     fn disconnect(&mut self) -> crate::Result<()> {

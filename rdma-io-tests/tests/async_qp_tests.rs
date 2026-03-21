@@ -332,9 +332,8 @@ const REMOTE_ATOMIC_ACCESS: AccessFlags = AccessFlags::LOCAL_WRITE
 /// returning the current value 42.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn async_qp_atomic_compare_and_swap() {
-    let (server, client) = setup_connection().await;
-
     require_no_iwarp!();
+    let (server, client) = setup_connection().await;
 
     // Server MR with remote atomic access — 8 bytes for one u64, initialized to 0
     let server_data_mr = server
