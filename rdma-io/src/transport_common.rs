@@ -345,6 +345,17 @@ pub(crate) fn drain_send_cq(qp: &AsyncQp) -> crate::Result<usize> {
 }
 
 /// Check whether the QP has left RTS state (e.g. entered ERROR).
+///
+/// Some soft-RDMA providers (notably rxe / Soft-RoCE) can transition the QP
+/// to ERROR without delivering an rdma_cm DISCONNECTED event, or after the
+/// event has already been consumed. Without this fallback, `poll_disconnect`
+/// would wait on a CM event that never arrives, causing the task to hang.
+///
+/// Used in two contexts:
+/// - Inside `poll_disconnect` (throttled to every 64 polls) as a fallback
+///   when the CM fd has no events.
+/// - As a fast non-blocking guard in `poll_write` / `poll_close` to avoid
+///   posting work requests on a dead QP.
 pub(crate) fn is_qp_dead(qp: *mut rdma_io_sys::ibverbs::ibv_qp) -> bool {
     unsafe {
         let mut attr = std::mem::MaybeUninit::<rdma_io_sys::ibverbs::ibv_qp_attr>::uninit();

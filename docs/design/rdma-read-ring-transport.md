@@ -3,7 +3,7 @@
 **Status:** Implemented  
 **Date:** 2026-03-20  
 **Implementation:** `rdma-io/src/read_ring_transport.rs` (~1200 lines)  
-**Shared infrastructure:** `rdma-io/src/ring_common.rs` (~360 lines)  
+**Shared infrastructure:** `rdma-io/src/transport_common.rs` (~360 lines)  
 **Reference:** [rdma-credit-ring-transport.md](rdma-credit-ring-transport.md) — CreditRingTransport (sibling)  
 **Reference:** [rdma-transport-layer.md](rdma-transport-layer.md) — Transport architecture  
 **Reference:** [RingPerformance.md](../future/RingPerformance.md) — Performance roadmap
@@ -38,7 +38,7 @@ let stream = AsyncRdmaStream::new(transport);
 | Token version | v1 (20 bytes) | v2 (32 bytes) — includes offset buffer VA + rkey |
 | Send CQ depth | `max_outstanding + 2` | `max_outstanding + 3` (extra for RDMA Read) |
 
-Both transports share ~80% of their code via `ring_common.rs`: ring buffers, token exchange,
+Both transports share ~80% of their code via `transport_common.rs`: ring buffers, token exchange,
 MW binding, imm encoding, virtual buffer index mapping, CompletionTracker, doorbell recv.
 
 ### Memory Layout
@@ -192,7 +192,7 @@ side (zero Send WRs).
 | File | Description |
 |------|-------------|
 | `rdma-io/src/read_ring_transport.rs` | ReadRingTransport (~1200 lines) |
-| `rdma-io/src/ring_common.rs` | Shared ring infrastructure (~360 lines) |
+| `rdma-io/src/transport_common.rs` | Shared transport infrastructure (~360 lines) |
 | `rdma-io/src/credit_ring_transport.rs` | CreditRingTransport, refactored (~1000 lines) |
 | `rdma-io-tests/tests/read_ring_transport_tests.rs` | 8 transport-level tests |
 | `rdma-io-tests/tests/async_stream_tests.rs` | 11 stream tests (33 total) |

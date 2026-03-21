@@ -48,8 +48,8 @@ use crate::mr::{AccessFlags, OwnedMemoryRegion};
 use crate::mw::MemoryWindow;
 use crate::pd::ProtectionDomain;
 use crate::qp::QpInitAttr;
-use crate::ring_common::*;
 use crate::transport::{RecvCompletion, Transport, TransportBuilder};
+use crate::transport_common::*;
 use crate::wc::{WcOpcode, WorkCompletion};
 use crate::wr::{QpType, RecvWr, SendFlags, SendWr, Sge, WrOpcode};
 
@@ -247,7 +247,7 @@ impl ReadRingTransport {
 }
 
 // ---------------------------------------------------------------------------
-// Token exchange helpers (32-byte ReadRingToken, different from ring_common)
+// Token exchange helpers (32-byte ReadRingToken, different from transport_common)
 // ---------------------------------------------------------------------------
 
 /// Post a 32-byte recv WR for the peer's ReadRingToken.

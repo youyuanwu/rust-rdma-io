@@ -28,12 +28,12 @@ pub mod credit_ring_transport;
 #[cfg(feature = "async")]
 pub mod read_ring_transport;
 #[cfg(feature = "async")]
-pub mod ring_common;
-#[cfg(feature = "async")]
 pub mod send_recv_transport;
 #[cfg(feature = "tokio")]
 pub mod tokio_notifier;
 #[cfg(feature = "async")]
 pub mod transport;
+#[cfg(feature = "async")]
+pub mod transport_common;
 
 pub use error::{Error, Result};

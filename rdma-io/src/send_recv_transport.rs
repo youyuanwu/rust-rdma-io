@@ -19,6 +19,7 @@ use crate::mr::{AccessFlags, OwnedMemoryRegion};
 use crate::pd::ProtectionDomain;
 use crate::qp::QpInitAttr;
 use crate::transport::{RecvCompletion, Transport, TransportBuilder};
+use crate::transport_common::is_qp_dead;
 use crate::wc::WorkCompletion;
 use crate::wr::QpType;
 
@@ -461,22 +462,6 @@ fn alloc_buffers(
         .map(|_| pd.reg_mr_owned(vec![0u8; config.buf_size], access))
         .collect::<crate::Result<Vec<_>>>()?;
     Ok((send_bufs, recv_bufs))
-}
-
-fn is_qp_dead(qp: *mut rdma_io_sys::ibverbs::ibv_qp) -> bool {
-    unsafe {
-        let mut attr = std::mem::MaybeUninit::<rdma_io_sys::ibverbs::ibv_qp_attr>::uninit();
-        let mut init_attr =
-            std::mem::MaybeUninit::<rdma_io_sys::ibverbs::ibv_qp_init_attr>::uninit();
-        let ret = rdma_io_sys::ibverbs::ibv_query_qp(
-            qp,
-            attr.as_mut_ptr(),
-            rdma_io_sys::ibverbs::IBV_QP_STATE as i32,
-            init_attr.as_mut_ptr(),
-        );
-        // If query fails, assume dead (defensive). If QP not in RTS, dead.
-        ret != 0 || (*attr.as_ptr()).qp_state != rdma_io_sys::ibverbs::IBV_QPS_RTS
-    }
 }
 
 impl TransportBuilder for SendRecvConfig {

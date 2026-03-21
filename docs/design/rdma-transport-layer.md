@@ -27,7 +27,7 @@ AsyncRdmaStream<T> (byte stream)      RdmaUdpSocket<T> (datagram, future)
           │            │                      │
           └────────────┴──────────────────────┘
                        │
-              ring_common (shared ring infrastructure)
+              transport_common (shared transport infrastructure)
                        │
               AsyncQp / AsyncCq / AsyncCmId (primitives)
 ```
@@ -173,6 +173,6 @@ design and trade-off analysis.
 - [rdma-io/src/send_recv_transport.rs](../../rdma-io/src/send_recv_transport.rs) — SendRecvTransport
 - [rdma-io/src/credit_ring_transport.rs](../../rdma-io/src/credit_ring_transport.rs) — CreditRingTransport
 - [rdma-io/src/read_ring_transport.rs](../../rdma-io/src/read_ring_transport.rs) — ReadRingTransport
-- [rdma-io/src/ring_common.rs](../../rdma-io/src/ring_common.rs) — Shared ring infrastructure
+- [rdma-io/src/transport_common.rs](../../rdma-io/src/transport_common.rs) — Shared transport infrastructure
 - [rdma-io/src/async_stream.rs](../../rdma-io/src/async_stream.rs) — AsyncRdmaStream\<T\>
 - [rdma-io-quinn/src/lib.rs](../../rdma-io-quinn/src/lib.rs) — RdmaUdpSocket (Quinn integration)
