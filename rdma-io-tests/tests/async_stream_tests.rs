@@ -18,13 +18,37 @@ use rdma_io_tests::test_helpers::{bind_addr, connect_addr_for};
 // ---------------------------------------------------------------------------
 
 /// Create a connected (server, client) stream pair using any transport builder.
-/// Retries client connect on EADDRINUSE (siw async port release).
+/// Retries bind + client connect on EADDRINUSE (siw async port release).
 async fn connected_pair<B: TransportBuilder>(
     builder: B,
 ) -> (AsyncRdmaStream<B::Transport>, AsyncRdmaStream<B::Transport>) {
     use rdma_io::async_cm::AsyncCmListener;
 
-    let listener = AsyncCmListener::bind(&bind_addr()).unwrap();
+    // Retry bind — siw can return EADDRINUSE if previous test's CM port isn't released yet.
+    let listener = {
+        let mut last_err = None;
+        let mut listener = None;
+        for attempt in 0u64..5 {
+            match AsyncCmListener::bind(&bind_addr()) {
+                Ok(l) => {
+                    listener = Some(l);
+                    break;
+                }
+                Err(e) => {
+                    let is_addr_in_use = matches!(&e, rdma_io::Error::Verbs(io)
+                        if io.raw_os_error() == Some(98));
+                    if is_addr_in_use && attempt < 4 {
+                        tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt + 1)))
+                            .await;
+                        last_err = Some(e);
+                        continue;
+                    }
+                    panic!("bind failed: {e}");
+                }
+            }
+        }
+        listener.unwrap_or_else(|| panic!("bind failed after retries: {}", last_err.unwrap()))
+    };
     let connect_addr = connect_addr_for(listener.local_addr());
     let builder2 = builder.clone();
 
