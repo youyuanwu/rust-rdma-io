@@ -146,3 +146,37 @@ fn safe_multiple_resources() {
 
     // Everything dropped in reverse order — RAII handles it.
 }
+
+/// Verify iWARP device detection matches the `require_no_iwarp!` macro behavior.
+/// If any iWARP device is present (siw), `any_device_is_iwarp()` returns true.
+/// Ring transports (CreditRing, ReadRing) require non-iWARP devices (InfiniBand/RoCE).
+#[test_log::test]
+fn iwarp_detection() {
+    let is_iwarp = device::any_device_is_iwarp();
+    println!("any_device_is_iwarp() = {is_iwarp}");
+
+    // Cross-check: enumerate devices and look for transport type
+    let devs = device::devices().expect("devices() failed");
+    let mut found_iwarp = false;
+    for d in &devs {
+        let ctx = device::open_device_by_name(d.name()).unwrap();
+        let port = ctx.query_port(1).unwrap();
+        let transport = port.link_layer;
+        println!("  {} link_layer={}", d.name(), transport);
+        // link_layer 1 = InfiniBand, 2 = Ethernet (RoCE), iWARP uses transport_type
+        // any_device_is_iwarp() checks node_type / transport_type internally
+        if d.name().starts_with("siw") {
+            found_iwarp = true;
+        }
+    }
+
+    if found_iwarp {
+        assert!(
+            is_iwarp,
+            "siw device present but any_device_is_iwarp() returned false"
+        );
+    }
+    // Note: is_iwarp can be true without siw if other iWARP devices exist
+
+    println!("iwarp_detection passed! (iwarp={is_iwarp})");
+}
