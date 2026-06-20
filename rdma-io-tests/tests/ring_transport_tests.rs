@@ -9,17 +9,16 @@
 use std::future::poll_fn;
 use std::task::Poll;
 
-use rdma_io::async_cm::AsyncCmListener;
 use rdma_io::credit_ring_transport::{CreditRingConfig, CreditRingTransport};
 use rdma_io::transport::{RecvCompletion, Transport};
 use rdma_io_tests::require_no_iwarp;
-use rdma_io_tests::test_helpers::{bind_addr, connect_addr_for};
+use rdma_io_tests::test_helpers::connect_addr_for;
 
 /// Helper: create a connected (server, client) ring transport pair.
 async fn ring_connected_pair(
     config: CreditRingConfig,
 ) -> (CreditRingTransport, CreditRingTransport) {
-    let listener = AsyncCmListener::bind(&bind_addr()).unwrap();
+    let listener = rdma_io_tests::test_helpers::bind_listener_with_retry().await;
     let connect_addr = connect_addr_for(listener.local_addr());
     let config2 = config.clone();
 
@@ -30,9 +29,7 @@ async fn ring_connected_pair(
     });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let client = tokio::spawn(async move {
-        CreditRingTransport::connect(&connect_addr, config)
-            .await
-            .unwrap()
+        rdma_io_tests::test_helpers::connect_with_retry(&config, &connect_addr).await
     });
     let (s, c) = tokio::join!(server, client);
     (s.unwrap(), c.unwrap())
@@ -135,7 +132,7 @@ async fn ring_mw_capability_probe() {
 
     // Bind a listener to get a valid address, then resolve route to get
     // the correct device context via rdma_cm routing.
-    let listener = AsyncCmListener::bind(&bind_addr()).unwrap();
+    let listener = rdma_io_tests::test_helpers::bind_listener_with_retry().await;
     let connect_addr = connect_addr_for(listener.local_addr());
 
     use rdma_io::async_cm::AsyncCmId;
@@ -240,7 +237,7 @@ async fn ring_credit_wr_disambiguation() {
 async fn ring_token_timeout() {
     require_no_iwarp!();
 
-    let listener = AsyncCmListener::bind(&bind_addr()).unwrap();
+    let listener = rdma_io_tests::test_helpers::bind_listener_with_retry().await;
     let connect_addr = connect_addr_for(listener.local_addr());
 
     let config = CreditRingConfig {

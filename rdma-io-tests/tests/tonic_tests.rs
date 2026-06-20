@@ -7,7 +7,6 @@
 use std::fmt::Debug;
 use std::time::Duration;
 
-use rdma_io::async_cm::AsyncCmListener;
 use rdma_io::credit_ring_transport::CreditRingConfig;
 use rdma_io::read_ring_transport::ReadRingConfig;
 use rdma_io::send_recv_transport::SendRecvConfig;
@@ -16,7 +15,7 @@ use rdma_io_tonic::{RdmaConnector, RdmaIncoming};
 
 use rdma_io_tests::greeter_service::*;
 use rdma_io_tests::require_no_iwarp;
-use rdma_io_tests::test_helpers::{bind_addr, connect_addr_for};
+use rdma_io_tests::test_helpers::connect_addr_for;
 
 use tokio_stream::StreamExt;
 use tonic::Request;
@@ -34,7 +33,7 @@ async fn start_server_and_connect<B: TransportBuilder + Debug>(
     tokio::sync::oneshot::Sender<()>,
     tokio::task::JoinHandle<()>,
 ) {
-    let listener = AsyncCmListener::bind(&bind_addr()).unwrap();
+    let listener = rdma_io_tests::test_helpers::bind_listener_with_retry().await;
     let connect_addr = connect_addr_for(listener.local_addr());
     let incoming = RdmaIncoming::new(listener, builder.clone());
 

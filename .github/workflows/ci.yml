@@ -14,7 +14,7 @@ env:
   RUST_VERSION: "1.96.0"
 
 jobs:
-  build-and-test:
+  build-siw:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

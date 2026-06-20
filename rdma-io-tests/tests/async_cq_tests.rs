@@ -5,9 +5,9 @@
 //! but raw ibv_post_recv/ibv_post_send + spin-poll for the data path to
 //! isolate AsyncCq testing from AsyncQp.
 
-use rdma_io::async_cm::{AsyncCmId, AsyncCmListener};
+use rdma_io::async_cm::AsyncCmId;
 use rdma_io::async_cq::AsyncCq;
-use rdma_io::cm::{ConnParam, PortSpace};
+use rdma_io::cm::ConnParam;
 use rdma_io::comp_channel::CompletionChannel;
 use rdma_io::cq::CompletionQueue;
 use rdma_io::mr::{AccessFlags, OwnedMemoryRegion};
@@ -16,7 +16,7 @@ use rdma_io::tokio_notifier::TokioCqNotifier;
 use rdma_io::wc::WorkCompletion;
 use rdma_io::wr::QpType;
 
-use rdma_io_tests::test_helpers::{bind_addr, connect_addr_for};
+use rdma_io_tests::test_helpers::connect_addr_for;
 
 fn default_qp_attr() -> QpInitAttr {
     QpInitAttr {
@@ -60,7 +60,7 @@ async fn setup_and_send(send_data: &[u8], recv_wr_id: u64) -> (ServerSetup, Clie
     let data_len = send_data.len();
     let send_buf = send_data.to_vec();
 
-    let listener = AsyncCmListener::bind(&bind_addr()).unwrap();
+    let listener = rdma_io_tests::test_helpers::bind_listener_with_retry().await;
     let connect_addr = connect_addr_for(listener.local_addr());
 
     let server_handle = tokio::spawn(async move {
@@ -118,12 +118,7 @@ async fn setup_and_send(send_data: &[u8], recv_wr_id: u64) -> (ServerSetup, Clie
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // Client: async connect, raw send, async disconnect
-    let client_cm = AsyncCmId::new(PortSpace::Tcp).unwrap();
-    client_cm
-        .resolve_addr(None, &connect_addr, 2000)
-        .await
-        .unwrap();
-    client_cm.resolve_route(2000).await.unwrap();
+    let client_cm = rdma_io_tests::test_helpers::connect_client_cm_with_retry(&connect_addr).await;
 
     let pd = client_cm.alloc_pd().unwrap();
     // No CompletionChannel — client uses spin-poll (testing CQ layer, not QP layer)

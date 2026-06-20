@@ -11,7 +11,7 @@ use rdma_io::send_recv_transport::SendRecvConfig;
 use rdma_io::transport::TransportBuilder;
 
 use rdma_io_tests::require_no_iwarp;
-use rdma_io_tests::test_helpers::{bind_addr, connect_addr_for};
+use rdma_io_tests::test_helpers::connect_addr_for;
 
 // ---------------------------------------------------------------------------
 // Generic helpers
@@ -22,33 +22,7 @@ use rdma_io_tests::test_helpers::{bind_addr, connect_addr_for};
 async fn connected_pair<B: TransportBuilder>(
     builder: B,
 ) -> (AsyncRdmaStream<B::Transport>, AsyncRdmaStream<B::Transport>) {
-    use rdma_io::async_cm::AsyncCmListener;
-
-    // Retry bind — siw can return EADDRINUSE if previous test's CM port isn't released yet.
-    let listener = {
-        let mut last_err = None;
-        let mut listener = None;
-        for attempt in 0u64..5 {
-            match AsyncCmListener::bind(&bind_addr()) {
-                Ok(l) => {
-                    listener = Some(l);
-                    break;
-                }
-                Err(e) => {
-                    let is_addr_in_use = matches!(&e, rdma_io::Error::Verbs(io)
-                        if io.raw_os_error() == Some(98));
-                    if is_addr_in_use && attempt < 4 {
-                        tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt + 1)))
-                            .await;
-                        last_err = Some(e);
-                        continue;
-                    }
-                    panic!("bind failed: {e}");
-                }
-            }
-        }
-        listener.unwrap_or_else(|| panic!("bind failed after retries: {}", last_err.unwrap()))
-    };
+    let listener = rdma_io_tests::test_helpers::bind_listener_with_retry().await;
     let connect_addr = connect_addr_for(listener.local_addr());
     let builder2 = builder.clone();
 
@@ -58,22 +32,9 @@ async fn connected_pair<B: TransportBuilder>(
         );
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let client_handle = tokio::spawn(async move {
-        for attempt in 0u64..5 {
-            match builder.connect(&connect_addr).await {
-                Ok(transport) => return AsyncRdmaStream::new(transport),
-                Err(e) => {
-                    let is_addr_in_use = matches!(&e, rdma_io::Error::Verbs(io)
-                        if io.raw_os_error() == Some(98));
-                    if is_addr_in_use && attempt < 4 {
-                        tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt + 1)))
-                            .await;
-                        continue;
-                    }
-                    panic!("connect failed: {e}");
-                }
-            }
-        }
-        unreachable!()
+        let transport =
+            rdma_io_tests::test_helpers::connect_with_retry(&builder, &connect_addr).await;
+        AsyncRdmaStream::new(transport)
     });
 
     let (s, c) = tokio::join!(server_handle, client_handle);

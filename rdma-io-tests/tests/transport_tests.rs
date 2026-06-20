@@ -7,13 +7,12 @@
 use std::future::poll_fn;
 use std::task::Poll;
 
-use rdma_io::async_cm::AsyncCmListener;
 use rdma_io::credit_ring_transport::CreditRingConfig;
 use rdma_io::read_ring_transport::ReadRingConfig;
 use rdma_io::send_recv_transport::SendRecvConfig;
 use rdma_io::transport::{RecvCompletion, Transport, TransportBuilder};
 use rdma_io_tests::require_no_iwarp;
-use rdma_io_tests::test_helpers::{bind_addr, connect_addr_for};
+use rdma_io_tests::test_helpers::connect_addr_for;
 
 // ---------------------------------------------------------------------------
 // Generic helpers
@@ -21,34 +20,15 @@ use rdma_io_tests::test_helpers::{bind_addr, connect_addr_for};
 
 /// Create a connected (server, client) transport pair using any builder.
 async fn ring_connected_pair<B: TransportBuilder>(config: B) -> (B::Transport, B::Transport) {
-    // siw port release is async — bind can transiently fail with EADDRINUSE
-    // right after disconnect-heavy tests, even on port 0. Retry with backoff.
-    let listener = {
-        let mut last_err = None;
-        let mut listener_opt = None;
-        for attempt in 0..5u32 {
-            match AsyncCmListener::bind(&bind_addr()) {
-                Ok(l) => {
-                    listener_opt = Some(l);
-                    break;
-                }
-                Err(e) => {
-                    last_err = Some(e);
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        100 * (attempt as u64 + 1),
-                    ))
-                    .await;
-                }
-            }
-        }
-        listener_opt.unwrap_or_else(|| panic!("bind failed after 5 attempts: {:?}", last_err))
-    };
+    let listener = rdma_io_tests::test_helpers::bind_listener_with_retry().await;
     let connect_addr = connect_addr_for(listener.local_addr());
     let config2 = config.clone();
 
     let server = tokio::spawn(async move { config2.accept(&listener).await.unwrap() });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    let client = tokio::spawn(async move { config.connect(&connect_addr).await.unwrap() });
+    let client = tokio::spawn(async move {
+        rdma_io_tests::test_helpers::connect_with_retry(&config, &connect_addr).await
+    });
     let (s, c) = tokio::join!(server, client);
     (s.unwrap(), c.unwrap())
 }
@@ -543,7 +523,7 @@ async fn drop_safety_read_ring() {
 // ===========================================================================
 
 async fn multi_connection<B: TransportBuilder>(config: B) {
-    let listener = AsyncCmListener::bind(&bind_addr()).unwrap();
+    let listener = rdma_io_tests::test_helpers::bind_listener_with_retry().await;
     let connect_addr = connect_addr_for(listener.local_addr());
     let listener = std::sync::Arc::new(listener);
 
@@ -560,15 +540,19 @@ async fn multi_connection<B: TransportBuilder>(config: B) {
 
     let config_c1 = config.clone();
     let addr1 = connect_addr;
-    let client1 = tokio::spawn(async move { config_c1.connect(&addr1).await.unwrap() })
-        .await
-        .unwrap();
+    let client1 = tokio::spawn(async move {
+        rdma_io_tests::test_helpers::connect_with_retry(&config_c1, &addr1).await
+    })
+    .await
+    .unwrap();
 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     let config_c2 = config;
     let addr2 = connect_addr;
-    let client2_handle = tokio::spawn(async move { config_c2.connect(&addr2).await.unwrap() });
+    let client2_handle = tokio::spawn(async move {
+        rdma_io_tests::test_helpers::connect_with_retry(&config_c2, &addr2).await
+    });
 
     let (server_res, c2_res) = tokio::join!(server_handle, client2_handle);
     let (mut server1, mut server2) = server_res.unwrap();

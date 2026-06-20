@@ -72,11 +72,8 @@ fn cm_loopback_connect_disconnect() {
     )));
 
     let ch = EventChannel::new().expect("client EventChannel");
-    let client_id = CmId::new(&ch, PortSpace::Tcp).expect("client CmId");
-
-    client_id
-        .resolve_addr(None, &connect_addr, 2000)
-        .expect("resolve_addr");
+    let client_id =
+        rdma_io_tests::test_helpers::connect_client_cm_id_with_retry(&ch, &connect_addr);
     let ev = ch.get_event().expect("client ADDR_RESOLVED");
     assert_eq!(ev.event_type(), CmEventType::AddrResolved);
     ev.ack();
@@ -203,9 +200,8 @@ fn cm_loopback_send_recv() {
     )));
 
     let ch = EventChannel::new().unwrap();
-    let client_id = CmId::new(&ch, PortSpace::Tcp).unwrap();
-
-    client_id.resolve_addr(None, &connect_addr, 2000).unwrap();
+    let client_id =
+        rdma_io_tests::test_helpers::connect_client_cm_id_with_retry(&ch, &connect_addr);
     ch.get_event().unwrap().ack();
     client_id.resolve_route(2000).unwrap();
     ch.get_event().unwrap().ack();

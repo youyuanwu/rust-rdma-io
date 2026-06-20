@@ -52,6 +52,199 @@ pub mod test_helpers {
         let port = listener_addr.expect("listener has no local address").port();
         format!("{}:{port}", local_ip()).parse().unwrap()
     }
+
+    /// Returns `true` if the error is an `EADDRINUSE` (errno 98) from verbs.
+    fn is_addr_in_use(err: &rdma_io::Error) -> bool {
+        matches!(err, rdma_io::Error::Verbs(io) if io.raw_os_error() == Some(98))
+    }
+
+    /// Bind an [`AsyncCmListener`] to `0.0.0.0:0`, retrying on `EADDRINUSE`.
+    ///
+    /// siw releases RDMA CM ports asynchronously, so a fresh bind — even to
+    /// port 0 — can transiently fail with `EADDRINUSE` right after a previous
+    /// test tore down its connections. Retries up to 5 times with backoff.
+    pub async fn bind_listener_with_retry() -> rdma_io::async_cm::AsyncCmListener {
+        use rdma_io::async_cm::AsyncCmListener;
+        let addr = bind_addr();
+        let mut last_err = None;
+        for attempt in 0u64..5 {
+            match AsyncCmListener::bind(&addr) {
+                Ok(l) => return l,
+                Err(e) => {
+                    if is_addr_in_use(&e) && attempt < 4 {
+                        tracing::warn!("bind attempt {attempt} EADDRINUSE, retrying...");
+                        tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt + 1)))
+                            .await;
+                        last_err = Some(e);
+                        continue;
+                    }
+                    panic!("listener bind failed: {e}");
+                }
+            }
+        }
+        panic!("listener bind failed after 5 attempts: {last_err:?}");
+    }
+
+    /// Connect a [`TransportBuilder`] client to `addr`, retrying on `EADDRINUSE`.
+    ///
+    /// The client side also allocates a local RDMA CM port, so it is subject
+    /// to the same siw async port-release race as the listener bind. Retries
+    /// up to 5 times with backoff.
+    pub async fn connect_with_retry<B>(builder: &B, addr: &SocketAddr) -> B::Transport
+    where
+        B: rdma_io::transport::TransportBuilder,
+    {
+        let mut last_err = None;
+        for attempt in 0u64..5 {
+            match builder.connect(addr).await {
+                Ok(t) => return t,
+                Err(e) => {
+                    if is_addr_in_use(&e) && attempt < 4 {
+                        tracing::warn!("connect attempt {attempt} EADDRINUSE, retrying...");
+                        tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt + 1)))
+                            .await;
+                        last_err = Some(e);
+                        continue;
+                    }
+                    panic!("connect failed: {e}");
+                }
+            }
+        }
+        panic!("connect failed after 5 attempts: {last_err:?}");
+    }
+
+    /// Create an [`AsyncCmId`] client, resolve address+route, retrying on
+    /// `EADDRINUSE`.
+    ///
+    /// `resolve_addr(None, ..)` is where librdmacm binds the client's local
+    /// ephemeral CM port, so it is subject to the same siw async port-release
+    /// race as the listener bind. A fresh CM ID is created per attempt.
+    pub async fn connect_client_cm_with_retry(
+        connect_addr: &SocketAddr,
+    ) -> rdma_io::async_cm::AsyncCmId {
+        use rdma_io::async_cm::AsyncCmId;
+        use rdma_io::cm::PortSpace;
+        let mut last_err = None;
+        for attempt in 0u64..5 {
+            let cm = AsyncCmId::new(PortSpace::Tcp).unwrap();
+            let resolved = async {
+                cm.resolve_addr(None, connect_addr, 2000).await?;
+                cm.resolve_route(2000).await?;
+                Ok::<(), rdma_io::Error>(())
+            }
+            .await;
+            match resolved {
+                Ok(()) => return cm,
+                Err(e) => {
+                    if is_addr_in_use(&e) && attempt < 4 {
+                        tracing::warn!("client resolve attempt {attempt} EADDRINUSE, retrying...");
+                        tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt + 1)))
+                            .await;
+                        last_err = Some(e);
+                        continue;
+                    }
+                    panic!("client resolve failed: {e}");
+                }
+            }
+        }
+        panic!("client resolve failed after 5 attempts: {last_err:?}");
+    }
+
+    /// Create a synchronous [`CmId`] client on `ch` and call `resolve_addr`,
+    /// retrying on `EADDRINUSE`.
+    ///
+    /// `rdma_resolve_addr` binds the client's local ephemeral CM port and can
+    /// return `EADDRINUSE` synchronously under siw. A fresh CM ID is created
+    /// per attempt; the caller then drives the resulting events on `ch`.
+    pub fn connect_client_cm_id_with_retry(
+        ch: &rdma_io::cm::EventChannel,
+        connect_addr: &SocketAddr,
+    ) -> rdma_io::cm::CmId {
+        use rdma_io::cm::{CmId, PortSpace};
+        let mut last_err = None;
+        for attempt in 0u64..5 {
+            let id = CmId::new(ch, PortSpace::Tcp).unwrap();
+            match id.resolve_addr(None, connect_addr, 2000) {
+                Ok(()) => return id,
+                Err(e) => {
+                    if is_addr_in_use(&e) && attempt < 4 {
+                        tracing::warn!(
+                            "client resolve_addr attempt {attempt} EADDRINUSE, retrying..."
+                        );
+                        drop(id);
+                        std::thread::sleep(std::time::Duration::from_millis(100 * (attempt + 1)));
+                        last_err = Some(e);
+                        continue;
+                    }
+                    panic!("client resolve_addr failed: {e}");
+                }
+            }
+        }
+        panic!("client resolve_addr failed after 5 attempts: {last_err:?}");
+    }
+
+    /// Bind an [`RdmaUdpSocket`](rdma_io_quinn::RdmaUdpSocket) to `0.0.0.0:0`,
+    /// retrying on `EADDRINUSE`.
+    ///
+    /// Same siw async port-release race as [`bind_listener_with_retry`], but
+    /// for the Quinn abstract-socket layer.
+    pub async fn bind_socket_with_retry<B>(
+        builder: B,
+        label: &str,
+    ) -> rdma_io_quinn::RdmaUdpSocket<B>
+    where
+        B: rdma_io::transport::TransportBuilder,
+    {
+        let addr = bind_addr();
+        let mut last_err = None;
+        for attempt in 0u64..5 {
+            match rdma_io_quinn::RdmaUdpSocket::bind(&addr, builder.clone()) {
+                Ok(s) => return s,
+                Err(e) => {
+                    if is_addr_in_use(&e) && attempt < 4 {
+                        tracing::warn!("{label} bind attempt {attempt} EADDRINUSE, retrying...");
+                        tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt + 1)))
+                            .await;
+                        last_err = Some(e);
+                        continue;
+                    }
+                    panic!("{label} bind failed: {e}");
+                }
+            }
+        }
+        panic!("{label} bind failed after 5 attempts: {last_err:?}");
+    }
+
+    /// Pre-connect an [`RdmaUdpSocket`](rdma_io_quinn::RdmaUdpSocket) to a peer,
+    /// retrying on `EADDRINUSE`.
+    ///
+    /// `connect_to` allocates the client's local CM port, so it is subject to
+    /// the same siw async port-release race as the listener bind.
+    pub async fn connect_socket_with_retry<B>(
+        socket: &rdma_io_quinn::RdmaUdpSocket<B>,
+        addr: &SocketAddr,
+        label: &str,
+    ) where
+        B: rdma_io::transport::TransportBuilder,
+    {
+        let mut last_err = None;
+        for attempt in 0u64..5 {
+            match socket.connect_to(addr).await {
+                Ok(()) => return,
+                Err(e) => {
+                    if is_addr_in_use(&e) && attempt < 4 {
+                        tracing::warn!("{label} connect attempt {attempt} EADDRINUSE, retrying...");
+                        tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt + 1)))
+                            .await;
+                        last_err = Some(e);
+                        continue;
+                    }
+                    panic!("{label} pre-connect failed: {e}");
+                }
+            }
+        }
+        panic!("{label} connect failed after 5 attempts: {last_err:?}");
+    }
 }
 
 /// Greeter gRPC service implementation for tonic integration tests.

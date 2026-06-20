@@ -9,10 +9,10 @@
 
 use std::sync::Arc;
 
-use rdma_io::async_cm::{AsyncCmId, AsyncCmListener};
+use rdma_io::async_cm::AsyncCmId;
 use rdma_io::async_cq::AsyncCq;
 use rdma_io::async_qp::AsyncQp;
-use rdma_io::cm::{ConnParam, PortSpace};
+use rdma_io::cm::ConnParam;
 use rdma_io::comp_channel::CompletionChannel;
 use rdma_io::cq::CompletionQueue;
 use rdma_io::mr::{AccessFlags, RemoteMr};
@@ -21,7 +21,7 @@ use rdma_io::qp::QpInitAttr;
 use rdma_io::wr::QpType;
 use rdma_io_tests::require_no_iwarp;
 
-use rdma_io_tests::test_helpers::{bind_addr, connect_addr_for};
+use rdma_io_tests::test_helpers::connect_addr_for;
 
 fn default_qp_attr() -> QpInitAttr {
     QpInitAttr {
@@ -46,7 +46,7 @@ struct AsyncEndpoint {
 /// Set up a connected server+client pair using async CM.
 /// Returns (server_endpoint, client_endpoint) ready for async verb posting.
 async fn setup_connection() -> (AsyncEndpoint, AsyncEndpoint) {
-    let listener = AsyncCmListener::bind(&bind_addr()).unwrap();
+    let listener = rdma_io_tests::test_helpers::bind_listener_with_retry().await;
     let connect_addr = connect_addr_for(listener.local_addr());
 
     let server_handle = tokio::spawn(async move {
@@ -85,12 +85,8 @@ async fn setup_connection() -> (AsyncEndpoint, AsyncEndpoint) {
 
     let client_handle = tokio::spawn(async move {
         // Step-by-step connect: resolve → QP setup → connect
-        let async_cm = AsyncCmId::new(PortSpace::Tcp).unwrap();
-        async_cm
-            .resolve_addr(None, &connect_addr, 2000)
-            .await
-            .unwrap();
-        async_cm.resolve_route(2000).await.unwrap();
+        let async_cm =
+            rdma_io_tests::test_helpers::connect_client_cm_with_retry(&connect_addr).await;
 
         let pd = async_cm.alloc_pd().unwrap();
         let ctx = async_cm.verbs_context().unwrap();
@@ -488,7 +484,7 @@ async fn async_qp_atomic_fetch_and_add() {
 /// Test: async disconnect — client disconnects, server detects via next_event.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn async_cm_disconnect() {
-    let listener = AsyncCmListener::bind(&bind_addr()).unwrap();
+    let listener = rdma_io_tests::test_helpers::bind_listener_with_retry().await;
     let connect_addr = connect_addr_for(listener.local_addr());
 
     // Server: two-phase accept, keep AsyncCmId alive for event monitoring
@@ -525,12 +521,8 @@ async fn async_cm_disconnect() {
 
     // Client: connect then async disconnect
     let client_handle = tokio::spawn(async move {
-        let client_cm = AsyncCmId::new(PortSpace::Tcp).unwrap();
-        client_cm
-            .resolve_addr(None, &connect_addr, 2000)
-            .await
-            .unwrap();
-        client_cm.resolve_route(2000).await.unwrap();
+        let client_cm =
+            rdma_io_tests::test_helpers::connect_client_cm_with_retry(&connect_addr).await;
 
         let pd = client_cm.alloc_pd().unwrap();
         let ctx = client_cm.verbs_context().unwrap();
