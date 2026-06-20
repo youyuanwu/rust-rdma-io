@@ -24,7 +24,9 @@ fn find_rdma_device() -> Option<String> {
             }
             let name_ptr = ibv_get_device_name(device);
             if !name_ptr.is_null() {
-                let name = CStr::from_ptr(name_ptr).to_string_lossy().into_owned();
+                let name = CStr::from_ptr(name_ptr.cast())
+                    .to_string_lossy()
+                    .into_owned();
                 if name.starts_with("siw") || name.starts_with("rxe") {
                     result = Some(name);
                     break;
@@ -56,7 +58,9 @@ fn open_rdma_device() -> (*mut ibv_context, String) {
             }
             let name_ptr = ibv_get_device_name(device);
             if !name_ptr.is_null() {
-                let n = CStr::from_ptr(name_ptr).to_string_lossy().into_owned();
+                let n = CStr::from_ptr(name_ptr.cast())
+                    .to_string_lossy()
+                    .into_owned();
                 if n.starts_with("siw") || n.starts_with("rxe") {
                     ctx = ibv_open_device(device);
                     name = n;

@@ -66,7 +66,7 @@ impl Device {
         if name.is_null() {
             "<unknown>"
         } else {
-            unsafe { CStr::from_ptr(name) }
+            unsafe { CStr::from_ptr(name.cast()) }
                 .to_str()
                 .unwrap_or("<invalid utf8>")
         }
