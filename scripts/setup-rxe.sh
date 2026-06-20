@@ -80,7 +80,7 @@ elif [[ -n "$RXE_KO" ]]; then
     fi
 elif [[ -n "$RXE_OOT" ]]; then
     echo -n "  Loading rdma_rxe (insmod $RXE_OOT)... "
-    if insmod "$RXE_OOT" 2>/dev/null; then
+    if insmod "$RXE_OOT"; then
         ok "loaded"
     else
         fail "failed to insmod rdma_rxe"

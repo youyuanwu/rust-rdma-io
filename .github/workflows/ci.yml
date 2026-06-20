@@ -15,7 +15,11 @@ env:
 
 jobs:
   build-siw:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
     steps:
       - uses: actions/checkout@v6
 
@@ -73,7 +77,11 @@ jobs:
         run: cargo test --doc --workspace --features tokio
 
   build-rxe:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
     steps:
       - uses: actions/checkout@v6
 
@@ -88,7 +96,8 @@ jobs:
             iproute2 \
             cmake \
             libclang-dev \
-            linux-headers-$(uname -r)
+            linux-headers-$(uname -r) \
+            linux-modules-extra-$(uname -r)
 
       - uses: taiki-e/install-action@protoc
 
