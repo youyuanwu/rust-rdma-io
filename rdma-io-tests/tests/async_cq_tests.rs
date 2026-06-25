@@ -117,16 +117,16 @@ async fn setup_and_send(send_data: &[u8], recv_wr_id: u64) -> (ServerSetup, Clie
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    // Client: async connect, raw send, async disconnect
-    let client_cm = rdma_io_tests::test_helpers::connect_client_cm_with_retry(&connect_addr).await;
-
-    let pd = client_cm.alloc_pd().unwrap();
-    // No CompletionChannel — client uses spin-poll (testing CQ layer, not QP layer)
-    let cmqp = client_cm
-        .cm_id()
-        .create_qp(&pd, &default_qp_attr())
-        .unwrap();
-    client_cm.connect(&ConnParam::default()).await.unwrap();
+    // Client: async connect, raw send, async disconnect.
+    // Retry the full handshake — siw/rxe can transiently reject connect.
+    let (client_cm, (pd, cmqp)) =
+        rdma_io_tests::test_helpers::connect_client_with_retry(&connect_addr, |cm| {
+            let pd = cm.alloc_pd().unwrap();
+            // No CompletionChannel — client spin-polls (testing CQ layer, not QP layer)
+            let cmqp = cm.cm_id().create_qp(&pd, &default_qp_attr()).unwrap();
+            (pd, cmqp)
+        })
+        .await;
 
     // Raw post_send + spin-poll
     let mut padded = vec![0u8; 64];

@@ -84,27 +84,25 @@ async fn setup_connection() -> (AsyncEndpoint, AsyncEndpoint) {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let client_handle = tokio::spawn(async move {
-        // Step-by-step connect: resolve → QP setup → connect
-        let async_cm =
-            rdma_io_tests::test_helpers::connect_client_cm_with_retry(&connect_addr).await;
-
-        let pd = async_cm.alloc_pd().unwrap();
-        let ctx = async_cm.verbs_context().unwrap();
-        let send_cq = AsyncCq::create_tokio(ctx.clone(), 16).unwrap();
-        let recv_cq = AsyncCq::create_tokio(ctx, 16).unwrap();
-
-        let cmqp = async_cm
-            .create_qp_with_cq(
-                &pd,
-                &default_qp_attr(),
-                Some(send_cq.cq()),
-                Some(recv_cq.cq()),
-            )
-            .unwrap();
-
-        async_cm.connect(&ConnParam::default()).await.unwrap();
-
-        let aqp = AsyncQp::new(cmqp, send_cq, recv_cq);
+        // Retry the full handshake — siw/rxe can transiently reject connect.
+        let (async_cm, (pd, aqp)) =
+            rdma_io_tests::test_helpers::connect_client_with_retry(&connect_addr, |cm| {
+                let pd = cm.alloc_pd().unwrap();
+                let ctx = cm.verbs_context().unwrap();
+                let send_cq = AsyncCq::create_tokio(ctx.clone(), 16).unwrap();
+                let recv_cq = AsyncCq::create_tokio(ctx, 16).unwrap();
+                let cmqp = cm
+                    .create_qp_with_cq(
+                        &pd,
+                        &default_qp_attr(),
+                        Some(send_cq.cq()),
+                        Some(recv_cq.cq()),
+                    )
+                    .unwrap();
+                let aqp = AsyncQp::new(cmqp, send_cq, recv_cq);
+                (pd, aqp)
+            })
+            .await;
 
         AsyncEndpoint {
             aqp,
@@ -521,24 +519,26 @@ async fn async_cm_disconnect() {
 
     // Client: connect then async disconnect
     let client_handle = tokio::spawn(async move {
-        let client_cm =
-            rdma_io_tests::test_helpers::connect_client_cm_with_retry(&connect_addr).await;
-
-        let pd = client_cm.alloc_pd().unwrap();
-        let ctx = client_cm.verbs_context().unwrap();
-        let comp_ch = CompletionChannel::new(&ctx).unwrap();
-        let cq = CompletionQueue::with_comp_channel(ctx, 16, &comp_ch).unwrap();
-        let _cmqp = client_cm
-            .create_qp_with_cq(&pd, &default_qp_attr(), Some(&cq), Some(&cq))
-            .unwrap();
-
-        client_cm.connect(&ConnParam::default()).await.unwrap();
+        // Retry the full handshake — siw/rxe can transiently reject connect.
+        // Tuple order keeps the QP dropped before its CQ/PD/CmId.
+        let (client_cm, _resources) =
+            rdma_io_tests::test_helpers::connect_client_with_retry(&connect_addr, |cm| {
+                let pd = cm.alloc_pd().unwrap();
+                let ctx = cm.verbs_context().unwrap();
+                let comp_ch = CompletionChannel::new(&ctx).unwrap();
+                let cq = CompletionQueue::with_comp_channel(ctx, 16, &comp_ch).unwrap();
+                let cmqp = cm
+                    .create_qp_with_cq(&pd, &default_qp_attr(), Some(&cq), Some(&cq))
+                    .unwrap();
+                (cmqp, cq, comp_ch, pd)
+            })
+            .await;
         println!("  client: connected, disconnecting...");
 
         // Graceful async disconnect — await DISCONNECTED event
         client_cm.disconnect_async().await.unwrap();
         println!("  client: async disconnect complete");
-        // _cmqp drops here → rdma_destroy_qp before CQ/PD/CmId
+        // _resources drops here → rdma_destroy_qp before CQ/PD/CmId
     });
 
     let (server_res, client_res) = tokio::join!(server_handle, client_handle);

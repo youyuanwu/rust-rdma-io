@@ -58,6 +58,14 @@ pub mod test_helpers {
         matches!(err, rdma_io::Error::Verbs(io) if io.raw_os_error() == Some(98))
     }
 
+    /// Returns `true` for transient CM errors that siw/rxe can raise during the
+    /// connect handshake: `EADDRINUSE` (98, async port release) or `EINVAL`
+    /// (22, stale/half-resolved CM route). Both clear on a fresh CM ID.
+    fn is_transient_cm_error(err: &rdma_io::Error) -> bool {
+        matches!(err, rdma_io::Error::Verbs(io)
+            if matches!(io.raw_os_error(), Some(22) | Some(98)))
+    }
+
     /// Bind an [`AsyncCmListener`] to `0.0.0.0:0`, retrying on `EADDRINUSE`.
     ///
     /// siw releases RDMA CM ports asynchronously, so a fresh bind — even to
@@ -148,6 +156,46 @@ pub mod test_helpers {
             }
         }
         panic!("client resolve failed after 5 attempts: {last_err:?}");
+    }
+
+    /// Establish a client [`AsyncCmId`] connection, retrying the entire
+    /// handshake on transient errors.
+    ///
+    /// `rdma_connect` cannot be retried on a rejected CM ID, so each attempt
+    /// builds a fresh CM ID (via [`connect_client_cm_with_retry`]), runs
+    /// `setup_qp` to create the QP (and any per-attempt resources) on it, then
+    /// connects. On a transient failure (`EADDRINUSE`, or `EINVAL` from a stale
+    /// route) the CM ID and QP state are dropped and the handshake is retried.
+    /// Returns the connected CM ID and the value produced by `setup_qp`.
+    pub async fn connect_client_with_retry<F, T>(
+        connect_addr: &SocketAddr,
+        mut setup_qp: F,
+    ) -> (rdma_io::async_cm::AsyncCmId, T)
+    where
+        F: FnMut(&rdma_io::async_cm::AsyncCmId) -> T,
+    {
+        use rdma_io::cm::ConnParam;
+        let mut last_err = None;
+        for attempt in 0u64..5 {
+            let cm = connect_client_cm_with_retry(connect_addr).await;
+            let qp_state = setup_qp(&cm);
+            match cm.connect(&ConnParam::default()).await {
+                Ok(()) => return (cm, qp_state),
+                Err(e) => {
+                    if is_transient_cm_error(&e) && attempt < 4 {
+                        tracing::warn!("client connect attempt {attempt} {e}, retrying...");
+                        drop(qp_state);
+                        drop(cm);
+                        tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt + 1)))
+                            .await;
+                        last_err = Some(e);
+                        continue;
+                    }
+                    panic!("client connect failed: {e}");
+                }
+            }
+        }
+        panic!("client connect failed after 5 attempts: {last_err:?}");
     }
 
     /// Create a synchronous [`CmId`] client on `ch` and call `resolve_addr`,
