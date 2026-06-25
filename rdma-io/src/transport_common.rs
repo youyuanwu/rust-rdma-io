@@ -199,6 +199,36 @@ impl CompletionTracker {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Validate that the routed device can satisfy the configured remote-access
+/// mode before any QP setup work is done.
+///
+/// When `use_mr_rkey` is `false` (the default, Memory-Window mode), the device
+/// must support Type-2 Memory Windows. Some RoCE NICs (e.g. Azure MANA) report
+/// `max_mw == 0` and reject `ibv_alloc_mw`; on those NICs `bind_recv_mw` would
+/// otherwise fail later with an opaque verbs error. This surfaces an actionable
+/// error pointing at the MR-rkey fallback instead.
+///
+/// In MR-rkey mode (`use_mr_rkey == true`) no MW is ever allocated, so this is
+/// a no-op.
+pub(crate) fn check_remote_access_caps(
+    pd: &Arc<ProtectionDomain>,
+    use_mr_rkey: bool,
+) -> crate::Result<()> {
+    if use_mr_rkey {
+        return Ok(());
+    }
+    let max_mw = pd.context().query_device().map(|a| a.max_mw).unwrap_or(0);
+    if max_mw == 0 || !crate::device::supports_mw_type2(pd) {
+        return Err(crate::Error::InvalidArg(
+            "device does not support Type-2 Memory Windows (max_mw == 0); \
+             enable the MR-rkey fallback with \
+             `.with_mr_rkey_fallback(true)` on the ring config"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Allocate and bind a Memory Window Type 2 to the recv ring MR.
 /// Must be called AFTER QP reaches RTS (post-connect/accept).
 /// Panics if the device does not support MW Type 2.

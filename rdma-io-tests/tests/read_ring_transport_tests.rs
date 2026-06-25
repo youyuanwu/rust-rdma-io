@@ -178,3 +178,39 @@ async fn read_ring_ooo_repost_no_overwrite() {
 
     println!("read_ring_ooo_repost_no_overwrite passed!");
 }
+
+/// MR-rkey fallback: when `use_mr_rkey` is enabled the transport skips both
+/// Memory Window binds (recv ring + offset buffer) and exchanges the MRs' own
+/// rkeys. This path is required on NICs that report `max_mw = 0` (e.g. Azure
+/// MANA); it also works on MW-capable test NICs, so verify both the RDMA Write
+/// data path and the RDMA Read flow-control path round-trip correctly.
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn read_ring_mr_rkey_fallback_roundtrip() {
+    require_no_iwarp!();
+    let config = ReadRingConfig::default().with_mr_rkey_fallback(true);
+    assert!(config.use_mr_rkey, "fallback flag should be set");
+    let (mut server, mut client) = ring_connected_pair(config).await;
+
+    // Send several messages, each with a distinct pattern, and verify they
+    // arrive intact. send_after_credits drives the RDMA Read flow-control
+    // path, which also relies on the offset-buffer MR rkey in this mode.
+    for i in 0..8u8 {
+        let data: Vec<u8> = (0..1500).map(|j| i.wrapping_add(j as u8)).collect();
+        let n = send_after_credits(&mut client, &data, "mr-rkey fallback send").await;
+        assert_eq!(n, data.len(), "full message accepted");
+        drain_send_completions(&mut client).await;
+
+        let rc = recv_one(&mut server).await;
+        assert_eq!(
+            &server.recv_buf(rc.buf_idx)[..rc.byte_len],
+            &data[..],
+            "message {i} data integrity over MR-rkey path"
+        );
+        server.repost_recv(rc.buf_idx).unwrap();
+    }
+
+    drop(client);
+    drop(server);
+
+    println!("read_ring_mr_rkey_fallback_roundtrip passed!");
+}

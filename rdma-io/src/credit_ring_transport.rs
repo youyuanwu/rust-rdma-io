@@ -70,6 +70,22 @@ pub struct CreditRingConfig {
     pub token_timeout: Duration,
     /// Max inline data size (0 = disabled).
     pub max_inline_data: u32,
+    /// Use the MR's own rkey for remote access instead of binding a Type-2
+    /// Memory Window.
+    ///
+    /// Some RoCE NICs (e.g. Azure MANA) report `max_mw = 0` and reject
+    /// `ibv_alloc_mw`, even though one-sided RDMA Write works. When this is
+    /// `true`, the transport skips MW allocation/bind and exchanges the recv
+    /// ring MR rkey directly. The recv MR is registered without the `MW_BIND`
+    /// access flag in this mode.
+    ///
+    /// Note: the recv MR already covers exactly the ring region, so the
+    /// exposed memory is the same as the MW-bound case. What is given up is
+    /// Type-2 MW protection: per-bind rkey randomization, QP association, and
+    /// revocability. The static MR rkey is scoped to this connection's PD
+    /// (each connection allocates its own), so a leaked rkey cannot reach
+    /// other connections' memory.
+    pub use_mr_rkey: bool,
 }
 
 impl CreditRingConfig {
@@ -80,7 +96,16 @@ impl CreditRingConfig {
             max_message_size: 1500,
             token_timeout: Duration::from_secs(5),
             max_inline_data: 0,
+            use_mr_rkey: false,
         }
+    }
+
+    /// Enable or disable the MR-rkey fallback (skip Type-2 Memory Windows).
+    ///
+    /// Use this on NICs that report `max_mw = 0` (e.g. Azure MANA).
+    pub fn with_mr_rkey_fallback(mut self, enabled: bool) -> Self {
+        self.use_mr_rkey = enabled;
+        self
     }
 }
 
@@ -182,6 +207,10 @@ impl CreditRingTransport {
             .ok_or(crate::Error::InvalidArg("no verbs context".into()))?;
         let pd = async_cm.alloc_pd()?;
 
+        // Fail fast with an actionable error if MW mode is requested on a NIC
+        // that cannot allocate Type-2 Memory Windows (e.g. Azure MANA).
+        check_remote_access_caps(&pd, config.use_mr_rkey)?;
+
         let max_outstanding = config.ring_capacity / config.max_message_size;
         let send_cq_depth = (max_outstanding + 2) as i32;
         let recv_cq_depth = (max_outstanding + 2) as i32;
@@ -202,10 +231,18 @@ impl CreditRingTransport {
         let cmqp =
             async_cm.create_qp_with_cq(&pd, &qp_attr, Some(send_cq.cq()), Some(recv_cq.cq()))?;
 
+        // In MR-rkey fallback mode we never bind a Memory Window, so omit the
+        // MW_BIND access flag (some NICs reject it when max_mw == 0).
+        let mw_bind = if config.use_mr_rkey {
+            AccessFlags::empty()
+        } else {
+            AccessFlags::MW_BIND
+        };
+
         let send_mr = pd.reg_mr_owned(vec![0u8; config.ring_capacity], AccessFlags::LOCAL_WRITE)?;
         let recv_mr = pd.reg_mr_owned(
             vec![0u8; config.ring_capacity],
-            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::MW_BIND,
+            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | mw_bind,
         )?;
 
         let doorbell_bufs: Box<[OwnedMemoryRegion]> = (0..max_outstanding)
@@ -225,8 +262,14 @@ impl CreditRingTransport {
         let (event_channel, cm_id) = async_cm.into_parts();
         let cm_async_fd = AsyncFd::new(event_channel.fd()).map_err(crate::Error::Verbs)?;
 
-        // QP is now RTS — bind Memory Window to scope remote write access.
-        let (recv_mw, mw_rkey) = bind_recv_mw(&qp, &pd, &recv_mr, config.ring_capacity)?;
+        // QP is now RTS — bind Memory Window to scope remote write access
+        // (unless using MR-rkey fallback).
+        let (recv_mw, mw_rkey) = if config.use_mr_rkey {
+            (None, recv_mr.rkey())
+        } else {
+            let (mw, rkey) = bind_recv_mw(&qp, &pd, &recv_mr, config.ring_capacity)?;
+            (Some(mw), rkey)
+        };
 
         // Complete token exchange (async — waits for CQ notification).
         let (remote_addr, remote_rkey, remote_capacity) = complete_token_exchange(
@@ -288,6 +331,10 @@ impl CreditRingTransport {
             .ok_or(crate::Error::InvalidArg("no verbs context".into()))?;
         let pd = conn_id.alloc_pd()?;
 
+        // Fail fast with an actionable error if MW mode is requested on a NIC
+        // that cannot allocate Type-2 Memory Windows (e.g. Azure MANA).
+        check_remote_access_caps(&pd, config.use_mr_rkey)?;
+
         let max_outstanding = config.ring_capacity / config.max_message_size;
         let send_cq_depth = (max_outstanding + 2) as i32;
         let recv_cq_depth = (max_outstanding + 2) as i32;
@@ -308,10 +355,18 @@ impl CreditRingTransport {
         let cmqp =
             conn_id.create_qp_with_cq(&pd, &qp_attr, Some(send_cq.cq()), Some(recv_cq.cq()))?;
 
+        // In MR-rkey fallback mode we never bind a Memory Window, so omit the
+        // MW_BIND access flag (some NICs reject it when max_mw == 0).
+        let mw_bind = if config.use_mr_rkey {
+            AccessFlags::empty()
+        } else {
+            AccessFlags::MW_BIND
+        };
+
         let send_mr = pd.reg_mr_owned(vec![0u8; config.ring_capacity], AccessFlags::LOCAL_WRITE)?;
         let recv_mr = pd.reg_mr_owned(
             vec![0u8; config.ring_capacity],
-            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::MW_BIND,
+            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | mw_bind,
         )?;
 
         let doorbell_bufs: Box<[OwnedMemoryRegion]> = (0..max_outstanding)
@@ -331,8 +386,14 @@ impl CreditRingTransport {
         let (event_channel, cm_id) = async_cm.into_parts();
         let cm_async_fd = AsyncFd::new(event_channel.fd()).map_err(crate::Error::Verbs)?;
 
-        // QP is now RTS — bind Memory Window to scope remote write access.
-        let (recv_mw, mw_rkey) = bind_recv_mw(&qp, &pd, &recv_mr, config.ring_capacity)?;
+        // QP is now RTS — bind Memory Window to scope remote write access
+        // (unless using MR-rkey fallback).
+        let (recv_mw, mw_rkey) = if config.use_mr_rkey {
+            (None, recv_mr.rkey())
+        } else {
+            let (mw, rkey) = bind_recv_mw(&qp, &pd, &recv_mr, config.ring_capacity)?;
+            (Some(mw), rkey)
+        };
 
         // Complete token exchange (async).
         let (remote_addr, remote_rkey, remote_capacity) = complete_token_exchange(
@@ -383,7 +444,7 @@ impl CreditRingTransport {
         pd: Arc<ProtectionDomain>,
         send_mr: OwnedMemoryRegion,
         recv_mr: OwnedMemoryRegion,
-        recv_mw: MemoryWindow,
+        recv_mw: Option<MemoryWindow>,
         doorbell_bufs: Box<[OwnedMemoryRegion]>,
         remote_addr: u64,
         remote_rkey: u32,
@@ -411,7 +472,7 @@ impl CreditRingTransport {
             local_freed_credits: 0,
             send_in_flight: 0,
 
-            _recv_mw: Some(recv_mw),
+            _recv_mw: recv_mw,
 
             qp,
 

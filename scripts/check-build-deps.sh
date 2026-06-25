@@ -57,14 +57,16 @@ check_tool() {
     fi
 }
 
-echo "=== Headers (libibverbs-dev, librdmacm-dev) ==="
+echo "=== Headers (libibverbs-dev, librdmacm-dev, libssl-dev) ==="
 check_header "infiniband/verbs.h"  "libibverbs-dev"
 check_header "rdma/rdma_cma.h"     "librdmacm-dev"
+check_header "openssl/ssl.h"       "libssl-dev"
 
 echo
 echo "=== Libraries ==="
 check_lib "libibverbs" "libibverbs.so" "libibverbs-dev"
 check_lib "librdmacm"  "librdmacm.so"  "librdmacm-dev"
+check_lib "openssl"    "libssl.so"     "libssl-dev"
 
 echo
 echo "=== Build tools ==="
@@ -77,6 +79,9 @@ else
 fi
 check_tool "cargo" "rustup or rust toolchain"
 check_tool "protoc" "protobuf-compiler"
+# pkg-config is used by -sys crates (e.g. openssl-sys) to locate system
+# libraries at build time; the build fails without it.
+check_tool "pkg-config" "pkg-config"
 
 echo
 echo "=== Optional (binding regeneration / full workspace build) ==="
@@ -110,6 +115,6 @@ else
     fail "$errors dependency check(s) failed"
     echo
     echo "On Ubuntu/Debian, install everything with:"
-    echo "  sudo apt install build-essential libibverbs-dev librdmacm-dev rdma-core protobuf-compiler"
+    echo "  sudo apt install build-essential pkg-config libibverbs-dev librdmacm-dev rdma-core protobuf-compiler libssl-dev"
     exit 1
 fi

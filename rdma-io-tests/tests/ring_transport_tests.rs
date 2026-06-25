@@ -439,3 +439,35 @@ async fn ring_ooo_repost_overwrites_unreleased_data() {
 
     println!("ring_ooo_repost_overwrites_unreleased_data passed (bug fixed)!");
 }
+
+/// MR-rkey fallback: when `use_mr_rkey` is enabled the transport skips Memory
+/// Window binding and exchanges the recv MR's own rkey. This path is required
+/// on NICs that report `max_mw = 0` (e.g. Azure MANA); it also works on
+/// MW-capable test NICs, so verify the data path round-trips correctly.
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn ring_mr_rkey_fallback_roundtrip() {
+    require_no_iwarp!();
+    let config = CreditRingConfig::default().with_mr_rkey_fallback(true);
+    assert!(config.use_mr_rkey, "fallback flag should be set");
+    let (mut server, mut client) = ring_connected_pair(config).await;
+
+    // Send several messages, each with a distinct pattern, and verify they
+    // arrive intact over the MR-rkey (no Memory Window) data path.
+    for i in 0..8u8 {
+        let data: Vec<u8> = (0..1500).map(|j| i.wrapping_add(j as u8)).collect();
+        send_and_complete(&mut client, &data).await;
+
+        let rc = recv_one(&mut server).await;
+        assert_eq!(
+            &server.recv_buf(rc.buf_idx)[..rc.byte_len],
+            &data[..],
+            "message {i} data integrity over MR-rkey path"
+        );
+        server.repost_recv(rc.buf_idx).unwrap();
+    }
+
+    drop(client);
+    drop(server);
+
+    println!("ring_mr_rkey_fallback_roundtrip passed!");
+}

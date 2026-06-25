@@ -123,6 +123,22 @@ pub struct ReadRingConfig {
     pub max_inline_data: u32,
     /// Minimum free bytes in remote ring before triggering backpressure.
     pub min_free_threshold: usize,
+    /// Use the MR's own rkey for remote access instead of binding a Type-2
+    /// Memory Window.
+    ///
+    /// Some RoCE NICs (e.g. Azure MANA) report `max_mw = 0` and reject
+    /// `ibv_alloc_mw`, even though one-sided RDMA Write/Read work. When this is
+    /// `true`, the transport skips MW allocation/bind and exchanges the recv
+    /// ring / offset MR rkeys directly. The MRs are registered without the
+    /// `MW_BIND` access flag in this mode.
+    ///
+    /// Note: the recv ring and offset MRs already cover exactly the exposed
+    /// regions, so the exposed memory is the same as the MW-bound case. What
+    /// is given up is Type-2 MW protection: per-bind rkey randomization, QP
+    /// association, and revocability. The static MR rkeys are scoped to this
+    /// connection's PD (each connection allocates its own), so a leaked rkey
+    /// cannot reach other connections' memory.
+    pub use_mr_rkey: bool,
 }
 
 impl ReadRingConfig {
@@ -134,7 +150,16 @@ impl ReadRingConfig {
             token_timeout: Duration::from_secs(5),
             max_inline_data: 0,
             min_free_threshold: 128,
+            use_mr_rkey: false,
         }
+    }
+
+    /// Enable or disable the MR-rkey fallback (skip Type-2 Memory Windows).
+    ///
+    /// Use this on NICs that report `max_mw = 0` (e.g. Azure MANA).
+    pub fn with_mr_rkey_fallback(mut self, enabled: bool) -> Self {
+        self.use_mr_rkey = enabled;
+        self
     }
 }
 
@@ -366,6 +391,10 @@ impl ReadRingTransport {
             .ok_or(crate::Error::InvalidArg("no verbs context".into()))?;
         let pd = async_cm.alloc_pd()?;
 
+        // Fail fast with an actionable error if MW mode is requested on a NIC
+        // that cannot allocate Type-2 Memory Windows (e.g. Azure MANA).
+        check_remote_access_caps(&pd, config.use_mr_rkey)?;
+
         let max_outstanding = config.ring_capacity / config.max_message_size;
         // +3: headroom for RDMA Read WR on send CQ
         let send_cq_depth = (max_outstanding + 3) as i32;
@@ -387,17 +416,25 @@ impl ReadRingTransport {
         let cmqp =
             async_cm.create_qp_with_cq(&pd, &qp_attr, Some(send_cq.cq()), Some(recv_cq.cq()))?;
 
+        // In MR-rkey fallback mode we never bind a Memory Window, so omit the
+        // MW_BIND access flag (some NICs reject it when max_mw == 0).
+        let mw_bind = if config.use_mr_rkey {
+            AccessFlags::empty()
+        } else {
+            AccessFlags::MW_BIND
+        };
+
         // Allocate ring MRs (separate, like CreditRing).
         let send_mr = pd.reg_mr_owned(vec![0u8; config.ring_capacity], AccessFlags::LOCAL_WRITE)?;
         let recv_mr = pd.reg_mr_owned(
             vec![0u8; config.ring_capacity],
-            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::MW_BIND,
+            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | mw_bind,
         )?;
 
         // Offset buffer: 64 bytes (cache-line aligned allocation).
         let offset_mr = pd.reg_mr_owned(
             vec![0u8; 64],
-            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_READ | AccessFlags::MW_BIND,
+            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_READ | mw_bind,
         )?;
 
         // RDMA Read landing buffer: 4 bytes.
@@ -418,9 +455,19 @@ impl ReadRingTransport {
         let (event_channel, cm_id) = async_cm.into_parts();
         let cm_async_fd = AsyncFd::new(event_channel.fd()).map_err(crate::Error::Verbs)?;
 
-        // QP is now RTS — bind Memory Windows.
-        let (recv_mw, mw1_rkey) = bind_recv_mw(&qp, &pd, &recv_mr, config.ring_capacity)?;
-        let (offset_mw, mw2_rkey) = bind_offset_mw(&qp, &pd, &offset_mr, 64)?;
+        // QP is now RTS — bind Memory Windows (unless using MR-rkey fallback).
+        let (recv_mw, mw1_rkey) = if config.use_mr_rkey {
+            (None, recv_mr.rkey())
+        } else {
+            let (mw, rkey) = bind_recv_mw(&qp, &pd, &recv_mr, config.ring_capacity)?;
+            (Some(mw), rkey)
+        };
+        let (offset_mw, mw2_rkey) = if config.use_mr_rkey {
+            (None, offset_mr.rkey())
+        } else {
+            let (mw, rkey) = bind_offset_mw(&qp, &pd, &offset_mr, 64)?;
+            (Some(mw), rkey)
+        };
 
         // Build our token.
         let our_token = ReadRingToken {
@@ -437,7 +484,7 @@ impl ReadRingTransport {
         let peer_token =
             complete_read_ring_token_exchange(&qp, &pd, &our_token, &token_recv_mr).await?;
 
-        // Drain setup completions from send CQ (token send + 2 MW binds).
+        // Drain setup completions from send CQ (token send + MW binds if any).
         drain_send_cq(&qp)?;
 
         // Post doorbell recv WRs.
@@ -485,6 +532,10 @@ impl ReadRingTransport {
             .ok_or(crate::Error::InvalidArg("no verbs context".into()))?;
         let pd = conn_id.alloc_pd()?;
 
+        // Fail fast with an actionable error if MW mode is requested on a NIC
+        // that cannot allocate Type-2 Memory Windows (e.g. Azure MANA).
+        check_remote_access_caps(&pd, config.use_mr_rkey)?;
+
         let max_outstanding = config.ring_capacity / config.max_message_size;
         let send_cq_depth = (max_outstanding + 3) as i32;
         let recv_cq_depth = (max_outstanding + 2) as i32;
@@ -505,15 +556,23 @@ impl ReadRingTransport {
         let cmqp =
             conn_id.create_qp_with_cq(&pd, &qp_attr, Some(send_cq.cq()), Some(recv_cq.cq()))?;
 
+        // In MR-rkey fallback mode we never bind a Memory Window, so omit the
+        // MW_BIND access flag (some NICs reject it when max_mw == 0).
+        let mw_bind = if config.use_mr_rkey {
+            AccessFlags::empty()
+        } else {
+            AccessFlags::MW_BIND
+        };
+
         let send_mr = pd.reg_mr_owned(vec![0u8; config.ring_capacity], AccessFlags::LOCAL_WRITE)?;
         let recv_mr = pd.reg_mr_owned(
             vec![0u8; config.ring_capacity],
-            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::MW_BIND,
+            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | mw_bind,
         )?;
 
         let offset_mr = pd.reg_mr_owned(
             vec![0u8; 64],
-            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_READ | AccessFlags::MW_BIND,
+            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_READ | mw_bind,
         )?;
 
         let read_buf = pd.reg_mr_owned(vec![0u8; 4], AccessFlags::LOCAL_WRITE)?;
@@ -535,9 +594,19 @@ impl ReadRingTransport {
         let (event_channel, cm_id) = async_cm.into_parts();
         let cm_async_fd = AsyncFd::new(event_channel.fd()).map_err(crate::Error::Verbs)?;
 
-        // QP is now RTS — bind Memory Windows.
-        let (recv_mw, mw1_rkey) = bind_recv_mw(&qp, &pd, &recv_mr, config.ring_capacity)?;
-        let (offset_mw, mw2_rkey) = bind_offset_mw(&qp, &pd, &offset_mr, 64)?;
+        // QP is now RTS — bind Memory Windows (unless using MR-rkey fallback).
+        let (recv_mw, mw1_rkey) = if config.use_mr_rkey {
+            (None, recv_mr.rkey())
+        } else {
+            let (mw, rkey) = bind_recv_mw(&qp, &pd, &recv_mr, config.ring_capacity)?;
+            (Some(mw), rkey)
+        };
+        let (offset_mw, mw2_rkey) = if config.use_mr_rkey {
+            (None, offset_mr.rkey())
+        } else {
+            let (mw, rkey) = bind_offset_mw(&qp, &pd, &offset_mr, 64)?;
+            (Some(mw), rkey)
+        };
 
         let our_token = ReadRingToken {
             version: READ_RING_TOKEN_VERSION,
@@ -592,8 +661,8 @@ impl ReadRingTransport {
         pd: Arc<ProtectionDomain>,
         send_mr: OwnedMemoryRegion,
         recv_mr: OwnedMemoryRegion,
-        recv_mw: MemoryWindow,
-        offset_mw: MemoryWindow,
+        recv_mw: Option<MemoryWindow>,
+        offset_mw: Option<MemoryWindow>,
         offset_mr: OwnedMemoryRegion,
         read_buf: OwnedMemoryRegion,
         doorbell_bufs: Box<[OwnedMemoryRegion]>,
@@ -629,8 +698,8 @@ impl ReadRingTransport {
 
             send_in_flight: 0,
 
-            _offset_mw: Some(offset_mw),
-            _recv_mw: Some(recv_mw),
+            _offset_mw: offset_mw,
+            _recv_mw: recv_mw,
 
             qp,
 
