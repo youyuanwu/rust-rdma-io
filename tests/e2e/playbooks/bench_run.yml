@@ -53,10 +53,17 @@
       timeout: "{{ (bench_duration | default(10) | int) + (bench_warmup | default(5) | int) + 30 }}"
       changed_when: false
 
+    - name: Ensure result directory exists
+      ansible.builtin.file:
+        path: "{{ bench_out_dir | default('/tmp') }}"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+
     - name: Save results to controller
       ansible.builtin.copy:
         content: "{{ bench_result.stdout }}"
-        dest: "/tmp/bench-{{ bench_mode | default('rh2') }}-{{ bench_transport | default('send-recv') }}-{{ bench_connections | default(1) }}conn.json"
+        dest: "{{ bench_out_dir | default('/tmp') }}/bench-{{ bench_mode | default('rh2') }}-{{ bench_transport | default('send-recv') }}-{{ bench_connections | default(1) }}conn-{{ bench_threads | default(1) }}thr.json"
         mode: '0644'
       delegate_to: localhost
 

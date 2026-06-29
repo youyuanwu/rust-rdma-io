@@ -1,0 +1,44 @@
+---
+# Hardware RDMA setup: install the RDMA/RoCEv2 userspace stack on hosts with a
+# real RDMA NIC (e.g. Azure MANA RoCEv2). Unlike setup_rdma.yml, this does NOT
+# load the software rxe provider — the kernel driver is already present.
+#
+# Use this playbook for hardware RoCEv2 hosts; use setup_rdma.yml for local
+# QEMU/KVM VMs that need the software rxe provider.
+#
+# Usage:
+#   ansible-playbook -i <inventory> playbooks/setup_rdma_hw.yml
+
+- name: Install RDMA userspace stack on hardware RDMA hosts
+  hosts: vms
+  become: true
+  gather_facts: false
+  vars:
+    rdma_packages:
+      - rdma-core
+      - rdmacm-utils
+      - ibverbs-utils
+      - libibverbs-dev
+      - librdmacm-dev
+      # Bandwidth / latency micro-benchmark tools (perf_bench.yml).
+      - perftest
+      - qperf
+      # Runtime dependency of the rdma-io-bench binaries (tonic-tls / openssl).
+      - libssl3
+  tasks:
+    - name: Install RDMA packages (skips any already present)
+      ansible.builtin.apt:
+        name: "{{ rdma_packages }}"
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Verify RDMA devices are visible
+      ansible.builtin.command:
+        cmd: ibv_devices
+      register: ibv_devices_out
+      changed_when: false
+
+    - name: Show detected RDMA devices
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}:\n{{ ibv_devices_out.stdout }}"
