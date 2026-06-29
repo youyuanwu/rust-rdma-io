@@ -45,6 +45,22 @@ struct Args {
 
 struct BenchGreeter;
 
+/// Resolve when the process receives SIGTERM (default `kill`) or SIGINT
+/// (Ctrl-C). Used to drive graceful server shutdown so RDMA queue pairs are
+/// torn down cleanly (via `rdma_disconnect`) instead of being abandoned on an
+/// abrupt process kill — abrupt teardown wedges the Azure MANA connection
+/// manager and makes back-to-back benchmark runs fail.
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = int.recv() => {}
+    }
+    eprintln!("shutdown signal received; draining connections");
+}
+
 #[tonic::async_trait]
 impl Greeter for BenchGreeter {
     async fn say_hello(
@@ -93,7 +109,7 @@ async fn run_tcp_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     Server::builder()
         .add_service(GreeterServer::new(BenchGreeter))
-        .serve_with_incoming(tls_incoming)
+        .serve_with_incoming_shutdown(tls_incoming, shutdown_signal())
         .await?;
 
     Ok(())
@@ -142,7 +158,7 @@ where
 
     Server::builder()
         .add_service(GreeterServer::new(BenchGreeter))
-        .serve_with_incoming(tls_incoming)
+        .serve_with_incoming_shutdown(tls_incoming, shutdown_signal())
         .await?;
 
     Ok(())
@@ -202,9 +218,14 @@ where
         .clone()
         .routes();
     tonic_h3::server::H3Router::new(routes)
-        .serve(acceptor)
+        .serve_with_shutdown(acceptor, shutdown_signal())
         .await
         .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+
+    // Close the QUIC endpoint and wait for connections to drain so the RDMA
+    // queue pairs are released cleanly before the process exits.
+    endpoint.close(0u16.into(), b"shutdown");
+    endpoint.wait_idle().await;
 
     Ok(())
 }

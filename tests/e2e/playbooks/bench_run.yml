@@ -5,7 +5,13 @@
     - name: Stop any existing server
       ansible.builtin.shell: |
         if [ -f /tmp/bench-server.pid ]; then
-          kill $(cat /tmp/bench-server.pid) 2>/dev/null || true
+          pid=$(cat /tmp/bench-server.pid)
+          kill "$pid" 2>/dev/null || true
+          for _ in $(seq 1 50); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.2
+          done
+          kill -9 "$pid" 2>/dev/null || true
           rm -f /tmp/bench-server.pid
         fi
       changed_when: false
@@ -76,7 +82,17 @@
     - name: Stop server
       ansible.builtin.shell: |
         if [ -f /tmp/bench-server.pid ]; then
-          kill $(cat /tmp/bench-server.pid) 2>/dev/null || true
+          pid=$(cat /tmp/bench-server.pid)
+          # Send SIGTERM so the server drains connections and tears down its
+          # RDMA queue pairs cleanly (rdma_disconnect) instead of being killed
+          # abruptly, which wedges the MANA connection manager.
+          kill "$pid" 2>/dev/null || true
+          # Wait up to ~10s for graceful exit before escalating to SIGKILL.
+          for _ in $(seq 1 50); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.2
+          done
+          kill -9 "$pid" 2>/dev/null || true
           rm -f /tmp/bench-server.pid /tmp/bench-server.log
         fi
       changed_when: false
