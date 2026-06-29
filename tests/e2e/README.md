@@ -38,12 +38,14 @@ sudo apt install -y ansible
 | Playbook | Description |
 |----------|-------------|
 | `hello_world.yml` | Basic connectivity, OS info |
-| `test_connectivity.yml` | Ping between VMs |
-| `setup_rdma.yml` | Load rxe module, create rxe0 device, verify with loopback rping |
+| `test_connectivity.yml` | Ping between VMs over both the SSH network and the RDMA subnet (`rdma_ip`) |
+| `setup_rdma.yml` | **Local/software RDMA:** load rxe module, create rxe0 device, verify with loopback rping |
+| `setup_rdma_hw.yml` | **Hardware RDMA (e.g. Azure RoCEv2):** install the RDMA userspace stack (no rxe) |
 | `rdma_ping_test.yml` | Cross-node rping (server on VM1, client on VM2) |
 | `run_tests.yml` | Full suite: setup + connectivity + rping |
 | `deploy_bench.yml` | Generate certs, copy benchmark binaries to VMs |
-| `bench_run.yml` | Parameterized benchmark: server on VM1, client on VM2 |
+| `bench_run.yml` | Parameterized gRPC benchmark: server on VM1, client on VM2 |
+| `perf_bench.yml` | Bandwidth/latency micro-benchmark: perftest (`ib_write_bw`/`ib_write_lat`) + qperf (`tcp_bw`/`tcp_lat`) |
 
 ## Benchmarking
 
@@ -58,10 +60,13 @@ cargo build -p rdma-io-bench --release
 ./tests/e2e/run_tests.sh playbooks/deploy_bench.yml
 
 # Run a single benchmark
-./tests/e2e/run_bench.sh --mode tls --connections 4 --threads 2
+./tests/e2e/run_bench.sh --mode rh2 --transport send-recv --connections 4 --threads 2
 
 # Run full benchmark matrix
 ./tests/e2e/run_bench.sh --matrix
+
+# Raw transport bandwidth/latency (perftest + qperf)
+./tests/e2e/run_tests.sh playbooks/perf_bench.yml
 
 # Results saved to /tmp/bench-*.json
 ```
@@ -71,6 +76,20 @@ See [docs/future/RdmaBenchmark.md](../../docs/future/RdmaBenchmark.md) for full 
 ## Dynamic Inventory
 
 The `inventory_local.py` script reads VM IPs from libvirt DHCP leases.
+
+## Remote / hardware hosts
+
+The playbooks also work against non-libvirt hosts (e.g. cloud VMs with a real
+RoCEv2 NIC). Supply your own inventory with a `vms` group containing `vm1`
+(server) and `vm2` (client). Two optional per-host vars:
+
+- `rdma_ip` — the address used for RDMA traffic, if different from the SSH
+  address (defaults to `ansible_host`).
+- `bench_out_dir` — directory on the controller where `bench_run.yml` writes
+  result JSON (defaults to `/tmp`).
+
+For hardware hosts, run `playbooks/setup_rdma_hw.yml` instead of
+`playbooks/setup_rdma.yml` (the latter loads the software rxe provider).
 
 ## Adding New Tests
 

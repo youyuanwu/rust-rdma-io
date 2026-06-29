@@ -1,0 +1,172 @@
+---
+# Bandwidth and latency micro-benchmarks between VM1 (server) and VM2 (client):
+#   - RDMA via perftest (ib_write_bw / ib_write_lat)
+#   - TCP  via qperf    (tcp_bw / tcp_lat)
+#
+# perftest tools run a single test and exit on their own; qperf runs a daemon
+# that is started and torn down explicitly. Bandwidth is reported in Gb/sec and
+# latency in microseconds so the RDMA and TCP numbers are directly comparable.
+#
+# Tunables (override with -e):
+#   bench_dev   RDMA device passed to perftest -d   (default rxe0; use mana_0
+#               etc. on hardware RoCEv2 NICs)
+#   rdma_ip     per-host RDMA address               (default ansible_host)
+#   bw_opts     ib_write_bw options (server + client)
+#   lat_opts    ib_write_lat options (server + client)
+#
+# Usage:
+#   ./tests/e2e/run_tests.sh playbooks/perf_bench.yml
+#   ansible-playbook -i inventory_local.py playbooks/perf_bench.yml -e bench_dev=mana_0
+
+- name: Ensure benchmark tools are installed
+  hosts: vms
+  become: true
+  tasks:
+    - name: Install perftest and qperf (skips any already present)
+      ansible.builtin.apt:
+        name:
+          - perftest
+          - qperf
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+# ---------------------------------------------------------------------------
+# RDMA bandwidth: ib_write_bw
+# ---------------------------------------------------------------------------
+- name: RDMA bandwidth server (ib_write_bw)
+  hosts: vm1
+  vars:
+    bench_dev: rxe0
+    bw_opts: "-s 838860 -q 8 -m 7000 -b -R -F --report_gbits"
+  tasks:
+    - name: Kill any leftover ib_write_bw server
+      ansible.builtin.command:
+        cmd: pkill -f ib_write_bw
+      register: kill_bw
+      changed_when: kill_bw.rc == 0
+      failed_when: kill_bw.rc not in [0, 1]
+
+    - name: Launch ib_write_bw server in the background
+      ansible.builtin.shell:
+        cmd: "nohup ib_write_bw {{ bw_opts }} -d {{ bench_dev }} > /tmp/ib_write_bw.log 2>&1 &"
+      changed_when: true
+
+    - name: Give the server a moment to start listening
+      ansible.builtin.pause:
+        seconds: 2
+
+- name: RDMA bandwidth client (ib_write_bw)
+  hosts: vm2
+  vars:
+    bench_dev: rxe0
+    bw_opts: "-s 838860 -q 8 -m 7000 -b -R -F --report_gbits"
+    server_ip: "{{ hostvars['vm1'].rdma_ip | default(hostvars['vm1'].ansible_host) }}"
+  tasks:
+    - name: Run ib_write_bw client (retry until the server is ready)
+      ansible.builtin.command:
+        cmd: "timeout 120 ib_write_bw {{ bw_opts }} -d {{ bench_dev }} {{ server_ip }}"
+      register: bw_client
+      changed_when: false
+      retries: 5
+      delay: 3
+      until: bw_client.rc == 0
+
+    - name: Show ib_write_bw result
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} -> {{ server_ip }} (RDMA bandwidth):\n{{ bw_client.stdout }}"
+
+# ---------------------------------------------------------------------------
+# RDMA latency: ib_write_lat
+# ---------------------------------------------------------------------------
+- name: RDMA latency server (ib_write_lat)
+  hosts: vm1
+  vars:
+    bench_dev: rxe0
+    lat_opts: "--perform_warm_up -n 10000 -R -F"
+  tasks:
+    - name: Kill any leftover ib_write_lat server
+      ansible.builtin.command:
+        cmd: pkill -f ib_write_lat
+      register: kill_lat
+      changed_when: kill_lat.rc == 0
+      failed_when: kill_lat.rc not in [0, 1]
+
+    - name: Launch ib_write_lat server in the background
+      ansible.builtin.shell:
+        cmd: "nohup ib_write_lat {{ lat_opts }} -d {{ bench_dev }} > /tmp/ib_write_lat.log 2>&1 &"
+      changed_when: true
+
+    - name: Give the server a moment to start listening
+      ansible.builtin.pause:
+        seconds: 2
+
+- name: RDMA latency client (ib_write_lat)
+  hosts: vm2
+  vars:
+    bench_dev: rxe0
+    lat_opts: "--perform_warm_up -n 10000 -R -F"
+    server_ip: "{{ hostvars['vm1'].rdma_ip | default(hostvars['vm1'].ansible_host) }}"
+  tasks:
+    - name: Run ib_write_lat client (retry until the server is ready)
+      ansible.builtin.command:
+        cmd: "timeout 120 ib_write_lat {{ lat_opts }} -d {{ bench_dev }} {{ server_ip }}"
+      register: lat_client
+      changed_when: false
+      retries: 5
+      delay: 3
+      until: lat_client.rc == 0
+
+    - name: Show ib_write_lat result
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} -> {{ server_ip }} (RDMA latency):\n{{ lat_client.stdout }}"
+
+# ---------------------------------------------------------------------------
+# TCP bandwidth + latency: qperf
+# ---------------------------------------------------------------------------
+- name: TCP qperf server
+  hosts: vm1
+  tasks:
+    - name: Kill any leftover qperf server
+      ansible.builtin.command:
+        cmd: pkill -f qperf
+      register: kill_qperf
+      changed_when: kill_qperf.rc == 0
+      failed_when: kill_qperf.rc not in [0, 1]
+
+    - name: Launch qperf server daemon in the background
+      ansible.builtin.shell:
+        cmd: "nohup qperf > /tmp/qperf-server.log 2>&1 &"
+      changed_when: true
+
+    - name: Give the server a moment to start listening
+      ansible.builtin.pause:
+        seconds: 2
+
+- name: TCP qperf client
+  hosts: vm2
+  vars:
+    server_ip: "{{ hostvars['vm1'].rdma_ip | default(hostvars['vm1'].ansible_host) }}"
+  tasks:
+    - name: Run qperf tcp_bw and tcp_lat (retry until the server is ready)
+      ansible.builtin.command:
+        cmd: "timeout 120 qperf -ub {{ server_ip }} tcp_bw tcp_lat"
+      register: qperf_client
+      changed_when: false
+      retries: 5
+      delay: 3
+      until: qperf_client.rc == 0
+
+    - name: Show qperf result
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} -> {{ server_ip }} (TCP bandwidth + latency):\n{{ qperf_client.stdout }}"
+
+- name: Stop the qperf server
+  hosts: vm1
+  tasks:
+    - name: Kill the background qperf server
+      ansible.builtin.command:
+        cmd: pkill -f qperf
+      register: qperf_stop
+      changed_when: qperf_stop.rc == 0
+      failed_when: qperf_stop.rc not in [0, 1]

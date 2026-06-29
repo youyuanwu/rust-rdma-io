@@ -3,16 +3,21 @@
   hosts: vms
   gather_facts: false
   tasks:
-    - name: Ping other VM
-      ansible.builtin.shell: |
-        ping -c 3 {{ hostvars[item].ansible_host }}
+    - name: Verify SSH reachability (controller -> host)
+      ansible.builtin.ping:
+
+    - name: Ping peers over the RDMA subnet (rdma_ip)
+      ansible.builtin.command:
+        cmd: "ping -c 3 -W 2 {{ hostvars[item].rdma_ip | default(hostvars[item].ansible_host) }}"
       loop: "{{ groups['vms'] }}"
       when: item != inventory_hostname
-      register: ping_results
+      register: rdma_ping
       changed_when: false
 
-    - name: Display ping results
+    - name: Display RDMA-subnet ping results
       ansible.builtin.debug:
         msg: "{{ item.stdout_lines }}"
-      loop: "{{ ping_results.results }}"
+      loop: "{{ rdma_ping.results }}"
       when: item.stdout_lines is defined
+      loop_control:
+        label: "{{ item.item }}"

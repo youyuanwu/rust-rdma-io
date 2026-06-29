@@ -231,11 +231,11 @@ jobs:
           chmod +x target/release/rdma-bench-server target/release/rdma-bench-client
           sg libvirt -c "./tests/e2e/run_tests.sh playbooks/deploy_bench.yml"
 
-      - name: Run benchmark (TLS)
-        run: sg libvirt -c "./tests/e2e/run_bench.sh --mode tls"
+      - name: Run benchmark (rh2)
+        run: sg libvirt -c "./tests/e2e/run_bench.sh --mode rh2"
 
       - name: Run H3 smoke test
-        run: sg libvirt -c "./tests/e2e/run_bench.sh --mode h3"
+        run: sg libvirt -c "./tests/e2e/run_bench.sh --mode rh3"
 
       - name: Destroy VMs
         if: always()
