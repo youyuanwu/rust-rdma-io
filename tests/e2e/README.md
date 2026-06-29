@@ -43,7 +43,8 @@ sudo apt install -y ansible
 | `rdma_ping_test.yml` | Cross-node rping (server on VM1, client on VM2) |
 | `run_tests.yml` | Full suite: setup + connectivity + rping |
 | `deploy_bench.yml` | Generate certs, copy benchmark binaries to VMs |
-| `bench_run.yml` | Parameterized benchmark: server on VM1, client on VM2 |
+| `bench_run.yml` | Parameterized gRPC benchmark: server on VM1, client on VM2 |
+| `perf_bench.yml` | Bandwidth/latency micro-benchmark: perftest (`ib_write_bw`/`ib_write_lat`) + qperf (`tcp_bw`/`tcp_lat`) |
 
 ## Benchmarking
 
@@ -58,10 +59,13 @@ cargo build -p rdma-io-bench --release
 ./tests/e2e/run_tests.sh playbooks/deploy_bench.yml
 
 # Run a single benchmark
-./tests/e2e/run_bench.sh --mode tls --connections 4 --threads 2
+./tests/e2e/run_bench.sh --mode rh2 --transport send-recv --connections 4 --threads 2
 
 # Run full benchmark matrix
 ./tests/e2e/run_bench.sh --matrix
+
+# Raw transport bandwidth/latency (perftest + qperf)
+./tests/e2e/run_tests.sh playbooks/perf_bench.yml
 
 # Results saved to /tmp/bench-*.json
 ```

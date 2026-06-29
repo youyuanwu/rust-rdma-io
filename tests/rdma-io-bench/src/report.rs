@@ -18,6 +18,7 @@ pub struct BenchResult {
 #[derive(Serialize)]
 pub struct LatencyStats {
     pub p50: f64,
+    pub p95: f64,
     pub p99: f64,
     pub p999: f64,
     pub min: f64,
@@ -54,6 +55,7 @@ impl BenchResult {
             throughput_rps: throughput,
             latency_us: LatencyStats {
                 p50: hist.value_at_quantile(0.50) as f64,
+                p95: hist.value_at_quantile(0.95) as f64,
                 p99: hist.value_at_quantile(0.99) as f64,
                 p999: hist.value_at_quantile(0.999) as f64,
                 min: hist.min() as f64,
@@ -76,6 +78,7 @@ impl BenchResult {
         println!("Throughput:   {:.0} req/s", self.throughput_rps);
         println!("Latency:");
         println!("  p50:        {:.1} µs", self.latency_us.p50);
+        println!("  p95:        {:.1} µs", self.latency_us.p95);
         println!("  p99:        {:.1} µs", self.latency_us.p99);
         println!("  p999:       {:.1} µs", self.latency_us.p999);
         println!("  min:        {:.1} µs", self.latency_us.min);

@@ -5,7 +5,7 @@
   tasks:
     - name: Start rping server in background
       ansible.builtin.shell: |
-        nohup rping -s -a {{ ansible_host }} -v \
+        nohup rping -s -a {{ rdma_ip | default(ansible_host) }} -v \
           > /tmp/rping_server.log 2>&1 &
         echo $!
       register: server_pid
@@ -25,7 +25,7 @@
   tasks:
     - name: Run rping client against VM1
       ansible.builtin.shell: |
-        rping -c -a {{ hostvars['vm1'].ansible_host }} -C 10 -v
+        rping -c -a {{ hostvars['vm1'].rdma_ip | default(hostvars['vm1'].ansible_host) }} -C 10 -v
       register: client_result
       timeout: 30
       changed_when: false

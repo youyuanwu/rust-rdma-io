@@ -16,8 +16,10 @@
         RUST_LOG="{{ bench_rust_log | default('info') }}" \
         RUST_BACKTRACE=1 \
         nohup ~/bin/rdma-bench-server \
-          --bind "{{ ansible_host }}:50051" \
-          --mode "{{ bench_mode | default('tls') }}" \
+          --bind "{{ rdma_ip | default(ansible_host) }}:50051" \
+          --mode "{{ bench_mode | default('rh2') }}" \
+          --transport "{{ bench_transport | default('send-recv') }}" \
+          {{ '--mw-fallback' if (bench_mw_fallback | default(false) | bool) else '' }} \
           --cert ~/certs/cert.pem \
           --key ~/certs/key.pem \
           > /tmp/bench-server.log 2>&1 &
@@ -35,8 +37,10 @@
         RUST_LOG="{{ bench_rust_log | default('info') }}" \
         RUST_BACKTRACE=1 \
         ~/bin/rdma-bench-client \
-          --connect "{{ hostvars['vm1'].ansible_host }}:50051" \
-          --mode "{{ bench_mode | default('tls') }}" \
+          --connect "{{ hostvars['vm1'].rdma_ip | default(hostvars['vm1'].ansible_host) }}:50051" \
+          --mode "{{ bench_mode | default('rh2') }}" \
+          --transport "{{ bench_transport | default('send-recv') }}" \
+          {{ '--mw-fallback' if (bench_mw_fallback | default(false) | bool) else '' }} \
           --connections "{{ bench_connections | default(1) }}" \
           --threads "{{ bench_threads | default(1) }}" \
           --duration "{{ bench_duration | default(10) }}" \
@@ -52,7 +56,7 @@
     - name: Save results to controller
       ansible.builtin.copy:
         content: "{{ bench_result.stdout }}"
-        dest: "/tmp/bench-{{ bench_mode | default('tls') }}-{{ bench_connections | default(1) }}conn.json"
+        dest: "/tmp/bench-{{ bench_mode | default('rh2') }}-{{ bench_transport | default('send-recv') }}-{{ bench_connections | default(1) }}conn.json"
         mode: '0644'
       delegate_to: localhost
 

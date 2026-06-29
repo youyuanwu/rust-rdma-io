@@ -4,7 +4,10 @@ use std::sync::Arc;
 
 use clap::Parser;
 use rdma_io::async_cm::AsyncCmListener;
+use rdma_io::credit_ring_transport::CreditRingConfig;
+use rdma_io::read_ring_transport::ReadRingConfig;
 use rdma_io::send_recv_transport::SendRecvConfig;
+use rdma_io::transport::TransportBuilder;
 use rdma_io_quinn::RdmaUdpSocket;
 use rdma_io_tonic::RdmaIncoming;
 use tonic::transport::Server;
@@ -20,8 +23,18 @@ struct Args {
     #[arg(long, default_value = "0.0.0.0:50051")]
     bind: SocketAddr,
 
-    #[arg(long, default_value = "tls")]
+    #[arg(long, default_value = "rh2")]
     mode: String,
+
+    /// RDMA transport: send-recv, read-ring, or credit-ring.
+    /// Works with both rh2 and rh3 modes.
+    #[arg(long, default_value = "send-recv")]
+    transport: String,
+
+    /// Use the MR rkey instead of a Type-2 Memory Window for the ring
+    /// transports. Required on NICs that report max_mw=0 (e.g. Azure MANA).
+    #[arg(long, default_value_t = false)]
+    mw_fallback: bool,
 
     #[arg(long, default_value = "build/certs/cert.pem")]
     cert: PathBuf,
@@ -49,30 +62,83 @@ impl Greeter for BenchGreeter {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_ansi(false)
+        .with_writer(std::io::stderr)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
     let args = Args::parse();
 
     match args.mode.as_str() {
-        "tls" => run_tls_server(args).await,
-        "h3" => run_h3_server(args).await,
+        "rh2" => run_tls_server(args).await,
+        "rh3" => run_h3_server(args).await,
+        "tcp" => run_tcp_server(args).await,
         other => {
-            eprintln!("Unknown mode: {other}. Supported: tls, h3");
+            eprintln!("Unknown mode: {other}. Supported: rh2, rh3, tcp");
             std::process::exit(1);
         }
     }
 }
 
+/// TCP baseline: tonic-tls + OpenSSL over a standard TCP socket (no RDMA).
+///
+/// Same TLS/gRPC stack as `tls` mode, served over a kernel TCP listener so the
+/// only variable is the underlying byte transport.
+async fn run_tcp_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    let acceptor = tls_common::build_acceptor(&args.cert, &args.key);
+
+    let tcp_incoming = tonic::transport::server::TcpIncoming::bind(args.bind)?;
+    let tls_incoming = tonic_tls::openssl::TlsIncoming::new(tcp_incoming, acceptor);
+
+    eprintln!("Benchmark server listening on {} (mode=tcp)", args.bind);
+
+    Server::builder()
+        .add_service(GreeterServer::new(BenchGreeter))
+        .serve_with_incoming(tls_incoming)
+        .await?;
+
+    Ok(())
+}
+
 async fn run_tls_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    let mw_fallback = args.mw_fallback;
+    match args.transport.as_str() {
+        "send-recv" => run_tls_server_with(args, SendRecvConfig::stream()).await,
+        "read-ring" => {
+            run_tls_server_with(
+                args,
+                ReadRingConfig::datagram().with_mr_rkey_fallback(mw_fallback),
+            )
+            .await
+        }
+        "credit-ring" => {
+            run_tls_server_with(
+                args,
+                CreditRingConfig::datagram().with_mr_rkey_fallback(mw_fallback),
+            )
+            .await
+        }
+        other => {
+            eprintln!("Unknown transport: {other}. Supported: send-recv, read-ring, credit-ring");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn run_tls_server_with<B>(args: Args, builder: B) -> Result<(), Box<dyn std::error::Error>>
+where
+    B: TransportBuilder,
+{
     let acceptor = tls_common::build_acceptor(&args.cert, &args.key);
 
     let listener = AsyncCmListener::bind(&args.bind)?;
     let local_addr = listener.local_addr();
-    let incoming = RdmaIncoming::new(listener, SendRecvConfig::stream());
+    let incoming = RdmaIncoming::new(listener, builder);
     let tls_incoming = tonic_tls::openssl::TlsIncoming::new(incoming, acceptor);
 
-    eprintln!("Benchmark server listening on {:?} (mode=tls)", local_addr);
+    eprintln!(
+        "Benchmark server listening on {:?} (mode=rh2, transport={})",
+        local_addr, args.transport
+    );
 
     Server::builder()
         .add_service(GreeterServer::new(BenchGreeter))
@@ -83,13 +149,39 @@ async fn run_tls_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_h3_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    let mw_fallback = args.mw_fallback;
+    match args.transport.as_str() {
+        "send-recv" => run_h3_server_with(args, SendRecvConfig::datagram()).await,
+        "read-ring" => {
+            run_h3_server_with(
+                args,
+                ReadRingConfig::datagram().with_mr_rkey_fallback(mw_fallback),
+            )
+            .await
+        }
+        "credit-ring" => {
+            run_h3_server_with(
+                args,
+                CreditRingConfig::datagram().with_mr_rkey_fallback(mw_fallback),
+            )
+            .await
+        }
+        other => {
+            eprintln!("Unknown transport: {other}. Supported: send-recv, read-ring, credit-ring");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn run_h3_server_with<B>(args: Args, builder: B) -> Result<(), Box<dyn std::error::Error>>
+where
+    B: TransportBuilder,
+{
     let (certs, key) = h3_common::load_certs_from_pem(&args.cert, &args.key);
     let server_config = h3_common::make_server_config(&certs, key);
     let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
 
-    let socket = Arc::new(
-        RdmaUdpSocket::bind(&args.bind, SendRecvConfig::datagram()).expect("bind RDMA UDP socket"),
-    );
+    let socket = Arc::new(RdmaUdpSocket::bind(&args.bind, builder).expect("bind RDMA UDP socket"));
     let bound_addr = socket.bound_addr();
 
     let endpoint = quinn::Endpoint::new_with_abstract_socket(
@@ -99,7 +191,10 @@ async fn run_h3_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         runtime,
     )?;
 
-    eprintln!("Benchmark server listening on {} (mode=h3)", bound_addr);
+    eprintln!(
+        "Benchmark server listening on {} (mode=rh3, transport={})",
+        bound_addr, args.transport
+    );
 
     let acceptor = tonic_h3::quinn::H3QuinnAcceptor::new(endpoint.clone());
     let routes = tonic::service::Routes::builder()
