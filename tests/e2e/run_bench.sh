@@ -1,7 +1,7 @@
 #!/bin/bash
 # Run RDMA benchmarks
 # Usage:
-#   ./run_bench.sh --mode tls --connections 4   # Specific config
+#   ./run_bench.sh --mode rh2 --connections 4   # Specific config
 #   ./run_bench.sh --matrix                     # Full matrix
 
 set -e
