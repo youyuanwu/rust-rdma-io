@@ -180,11 +180,14 @@ impl<B: TransportBuilder> RdmaUdpSocket<B> {
     /// token exchange — is driven to completion at full speed, independent of
     /// how often Quinn happens to call [`poll_recv`](AsyncUdpSocket::poll_recv).
     ///
-    /// Driving `accept` lazily inside `poll_recv` (the previous approach)
-    /// starved the handshake during the pure-RDMA phase before any QUIC traffic
-    /// exists to trigger polling, stalling ring-transport accepts for seconds
-    /// and tripping the peer's connection-manager timeout (observed on Azure
-    /// MANA RoCEv2).
+    /// The previous approach drove `accept` lazily inside `poll_recv`, which
+    /// couples handshake progress to Quinn's poll cadence. That version also
+    /// works (A/B tested on Azure MANA RoCEv2, rh3 ring at up to 64×64), so it
+    /// is not strictly required for correctness; the dedicated task is kept
+    /// because it advances the handshake at full speed and measured modestly
+    /// fewer connection errors at high concurrency. (An earlier "100% failure /
+    /// CM `Rejected`" attributed to the lazy path turned out to be a
+    /// NIC-degradation + too-short-benchmark-timeout confound, not a stall here.)
     async fn accept_loop(
         builder: B,
         listener: Arc<AsyncCmListener>,

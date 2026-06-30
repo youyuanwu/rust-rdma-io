@@ -56,7 +56,13 @@
           --key ~/certs/key.pem \
           --report json
       register: bench_result
-      timeout: "{{ (bench_duration | default(10) | int) + (bench_warmup | default(5) | int) + 30 }}"
+      # Timeout must cover connection SETUP + warmup + benchmark. Setup time
+      # grows with connection count — the rh3 (HTTP/3 over QUIC) ring transports
+      # take ~1s/connection to establish on the Azure MANA RoCEv2 preview
+      # (~60s for 64 connections), so a fixed buffer false-timed-out high-conn
+      # runs even though the client completes. Scale the buffer with the
+      # connection count: base 30s + 1s per connection.
+      timeout: "{{ (bench_duration | default(10) | int) + (bench_warmup | default(5) | int) + 30 + (bench_connections | default(1) | int) }}"
       changed_when: false
 
     - name: Ensure result directory exists

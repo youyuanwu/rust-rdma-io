@@ -342,6 +342,14 @@ where
     type H3Client = GreeterClient<tonic_h3::H3Channel<tonic_h3::quinn::H3QuinnConnector>>;
     let mut clients: Vec<H3Client> = Vec::with_capacity(args.connections);
 
+    // Each connection is established sequentially: bind an RdmaUdpSocket, then
+    // `connect_to` (the full RDMA-CM handshake + ring token exchange) before
+    // building the Quinn endpoint. On the Azure MANA RoCEv2 preview the rh3 RING
+    // transports are slow to establish at high connection counts (~1s/conn,
+    // ~60s for 64) — every combo still completes and works, but the benchmark
+    // harness must allow setup time that scales with `connections` (see the
+    // run-bench timeout in tests/e2e/playbooks/bench_run.yml). send-recv and the
+    // rh2 transports are much faster.
     for _ in 0..args.connections {
         let client_socket = RdmaUdpSocket::bind(&bind_addr, builder.clone())
             .map_err(|e| transport_setup_error(&args.transport, e))?;
