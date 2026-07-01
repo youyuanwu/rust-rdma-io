@@ -5,41 +5,28 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::future::Future;
 use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll, Waker};
 
 use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, UdpPoller};
-use tokio::sync::mpsc;
 
 use rdma_io::async_cm::AsyncCmListener;
 use rdma_io::transport::{RecvCompletion, Transport, TransportBuilder};
 
 type ConnectionMap<T> = Arc<RwLock<HashMap<SocketAddr, Arc<Mutex<T>>>>>;
 
-/// Result delivered by the background accept task for each inbound connection.
-type AcceptResult<T> = io::Result<(SocketAddr, T)>;
-
-/// State for the background accept loop: the receiver end of the channel the
-/// accept task feeds, plus the task handle so it can be aborted on close.
-struct AcceptState<B: TransportBuilder> {
-    /// `true` once the accept task has been spawned (or the socket closed).
-    started: bool,
-    /// Receiver for transports accepted by the background task.
-    rx: Option<mpsc::UnboundedReceiver<AcceptResult<B::Transport>>>,
-    /// Handle to the spawned accept task (aborted on close).
-    task: Option<tokio::task::JoinHandle<()>>,
-}
+type AcceptFuture<T> = Pin<Box<dyn Future<Output = rdma_io::Result<(SocketAddr, T)>> + Send>>;
 
 /// RDMA-backed UDP socket for Quinn endpoints.
 ///
 /// Implements [`AsyncUdpSocket`] by multiplexing across per-peer transports.
-/// Server-side connections are accepted by a dedicated background task (see
-/// [`accept_loop`](RdmaUdpSocket::accept_loop)) and surfaced through
-/// [`poll_recv`](AsyncUdpSocket::poll_recv).
+/// Server-side accept is driven within [`poll_recv`](AsyncUdpSocket::poll_recv).
 ///
 /// Generic over the transport builder — use [`SendRecvConfig`] for Send/Recv
 /// or [`CreditRingConfig`] for ring buffer transport.
@@ -54,8 +41,7 @@ pub struct RdmaUdpSocket<B: TransportBuilder> {
     connections: ConnectionMap<B::Transport>,
     local_addr: SocketAddr,
     builder: B,
-    /// Background accept loop state (task spawned lazily on first `poll_recv`).
-    accept: Mutex<AcceptState<B>>,
+    accept_state: Mutex<Option<AcceptFuture<B::Transport>>>,
     /// Waker from the last `poll_recv` that returned `Pending`.
     /// `connect_to` wakes this so Quinn's driver discovers the new connection.
     recv_waker: Mutex<Option<Waker>>,
@@ -63,6 +49,8 @@ pub struct RdmaUdpSocket<B: TransportBuilder> {
     /// `poll_writable` waits for a send CQ completion on this transport
     /// instead of busy-spinning.
     send_blocked: Mutex<Option<Arc<Mutex<B::Transport>>>>,
+    /// Consecutive accept errors. Reset on success; propagated after threshold.
+    accept_errors: AtomicU32,
 }
 
 /// Poller for write-readiness on the RDMA socket.
@@ -103,13 +91,10 @@ impl<B: TransportBuilder> RdmaUdpSocket<B> {
             connections: Arc::new(RwLock::new(HashMap::new())),
             local_addr,
             builder,
-            accept: Mutex::new(AcceptState {
-                started: false,
-                rx: None,
-                task: None,
-            }),
+            accept_state: Mutex::new(None),
             recv_waker: Mutex::new(None),
             send_blocked: Mutex::new(None),
+            accept_errors: AtomicU32::new(0),
         })
     }
 
@@ -150,122 +135,93 @@ impl<B: TransportBuilder> RdmaUdpSocket<B> {
     /// Quinn endpoint to ensure RDMA resources are released promptly instead of
     /// waiting for `Arc` reference counting.
     pub fn close(&self) {
-        {
-            let mut connections = self.connections.write().unwrap();
-            for (_addr, transport_arc) in connections.drain() {
-                if let Ok(mut transport) = transport_arc.lock() {
-                    let _ = transport.disconnect();
-                }
+        let mut connections = self.connections.write().unwrap();
+        for (_addr, transport_arc) in connections.drain() {
+            if let Ok(mut transport) = transport_arc.lock() {
+                let _ = transport.disconnect();
             }
         }
-        // Stop the background accept task and drop its channel.
-        {
-            let mut acc = self.accept.lock().unwrap();
-            acc.started = true; // prevent re-spawn after close
-            if let Some(task) = acc.task.take() {
-                task.abort();
-            }
-            acc.rx = None;
-        }
+        // Cancel any pending accept future.
+        *self.accept_state.lock().unwrap() = None;
         *self.send_blocked.lock().unwrap() = None;
     }
 
     /// Maximum consecutive accept errors before propagating to caller.
     const MAX_ACCEPT_ERRORS: u32 = 10;
 
-    /// Background accept loop.
+    /// Drive the accept state machine. Non-blocking, called from `poll_recv`.
     ///
-    /// Runs on a dedicated tokio task so the (potentially multi-round-trip)
-    /// RDMA connection handshake — e.g. the ring transports' memory-region
-    /// token exchange — is driven to completion at full speed, independent of
-    /// how often Quinn happens to call [`poll_recv`](AsyncUdpSocket::poll_recv).
+    /// # Why driving accept inside `poll_recv` is sufficient
     ///
-    /// The previous approach drove `accept` lazily inside `poll_recv`, which
-    /// couples handshake progress to Quinn's poll cadence. That version also
-    /// works (A/B tested on Azure MANA RoCEv2, rh3 ring at up to 64×64), so it
-    /// is not strictly required for correctness; the dedicated task is kept
-    /// because it advances the handshake at full speed and measured modestly
-    /// fewer connection errors at high concurrency. (An earlier "100% failure /
-    /// CM `Rejected`" attributed to the lazy path turned out to be a
-    /// NIC-degradation + too-short-benchmark-timeout confound, not a stall here.)
-    async fn accept_loop(
-        builder: B,
-        listener: Arc<AsyncCmListener>,
-        tx: mpsc::UnboundedSender<AcceptResult<B::Transport>>,
-    ) {
-        let mut consecutive_errors = 0u32;
-        loop {
-            match builder.accept(&listener).await {
-                Ok(transport) => {
-                    consecutive_errors = 0;
-                    let msg = match transport.peer_addr() {
-                        Some(addr) => Ok((addr, transport)),
-                        None => Err(io::Error::other("accepted transport has no peer address")),
-                    };
-                    if tx.send(msg).is_err() {
-                        return; // receiver dropped — socket closed
-                    }
-                }
-                Err(e) => {
-                    consecutive_errors += 1;
-                    tracing::warn!(error = %e, consecutive = consecutive_errors, "RDMA accept failed");
-                    if consecutive_errors >= Self::MAX_ACCEPT_ERRORS {
-                        let _ = tx.send(Err(io::Error::other(format!(
-                            "RDMA accept failed {consecutive_errors} consecutive times, last: {e}"
-                        ))));
-                        return;
-                    }
-                }
-            }
-        }
-    }
-
-    /// Drain transports accepted by the background task. Non-blocking; called
-    /// from `poll_recv`. Spawns the accept task on first call.
+    /// The RDMA `accept()` is a multi-round-trip async handshake (CM
+    /// establish, plus the ring transports' memory-region token exchange).
+    /// Rather than run it on a dedicated task, we keep a single in-flight
+    /// accept **future** in `accept_state` and poll it one step per call.
+    /// Continued progress does not depend on Quinn's polling *cadence* — it
+    /// depends only on the future's own wakers being wired back to Quinn, and
+    /// they are:
+    ///
+    /// - Each `fut.poll(cx)` here registers **Quinn's** `poll_recv` waker
+    ///   (`cx`) with whatever the handshake is currently blocked on — the CM
+    ///   event-channel fd or a send/recv CQ. When that RDMA resource becomes
+    ///   ready, its waker fires, Quinn re-polls `poll_recv`, and we advance the
+    ///   handshake by another step. So the future self-drives to completion via
+    ///   the reactor; Quinn does not need any unrelated traffic to "tick" it.
+    /// - The `loop` matters: on `Poll::Ready` we immediately start (and poll)
+    ///   the *next* accept in the same call, so a burst of pending inbound
+    ///   connections drains as fast as the NIC completes them rather than one
+    ///   per `poll_recv`.
+    /// - On `Poll::Pending` we return, having left `cx` registered, so the very
+    ///   next readiness edge wakes us.
+    ///
+    /// A dedicated accept task was tried (`c37e2ce`) and **reverted**: A/B
+    /// testing on Azure MANA RoCEv2 (rh3 QUIC ring transports up to 64×64)
+    /// showed this lazy path connects and runs identically, so the extra task,
+    /// channel, and abort-on-close machinery were unnecessary complexity. (An
+    /// earlier "100% `Rejected`" blamed on the lazy path was really a
+    /// NIC-degradation + too-short-benchmark-timeout confound, not a stall
+    /// here.)
+    ///
+    /// Non-blocking: never `.await`s; each call advances the handshake as far
+    /// as the reactor currently allows, then yields.
     fn poll_accept(&self, cx: &mut Context<'_>) -> io::Result<()> {
-        let mut accepted = Vec::new();
-        let mut fatal = None;
-        {
-            let mut acc = self.accept.lock().unwrap();
-            if !acc.started {
-                acc.started = true;
-                let (tx, rx) = mpsc::unbounded_channel();
-                acc.rx = Some(rx);
-                acc.task = Some(tokio::spawn(Self::accept_loop(
-                    self.builder.clone(),
-                    Arc::clone(&self.listener),
-                    tx,
-                )));
-            }
-            if let Some(rx) = acc.rx.as_mut() {
-                loop {
-                    match rx.poll_recv(cx) {
-                        Poll::Ready(Some(Ok(pair))) => accepted.push(pair),
-                        Poll::Ready(Some(Err(e))) => {
-                            fatal = Some(e);
-                            break;
+        let mut accept = self.accept_state.lock().unwrap();
+        loop {
+            if let Some(fut) = accept.as_mut() {
+                match fut.as_mut().poll(cx) {
+                    Poll::Pending => return Ok(()),
+                    Poll::Ready(Ok((addr, transport))) => {
+                        self.accept_errors.store(0, Ordering::Relaxed);
+                        tracing::debug!(%addr, "RDMA connection accepted");
+                        self.connections
+                            .write()
+                            .unwrap()
+                            .insert(addr, Arc::new(Mutex::new(transport)));
+                        *accept = None;
+                    }
+                    Poll::Ready(Err(e)) => {
+                        let n = self.accept_errors.fetch_add(1, Ordering::Relaxed) + 1;
+                        tracing::warn!(error = %e, consecutive = n, "RDMA accept failed");
+                        *accept = None;
+                        if n >= Self::MAX_ACCEPT_ERRORS {
+                            return Err(io::Error::other(format!(
+                                "RDMA accept failed {n} consecutive times, last: {e}"
+                            )));
                         }
-                        Poll::Ready(None) => {
-                            acc.rx = None;
-                            break;
-                        }
-                        Poll::Pending => break,
                     }
                 }
+            } else {
+                // Spawn a new accept future using the transport builder.
+                let builder = self.builder.clone();
+                let listener = Arc::clone(&self.listener);
+                *accept = Some(Box::pin(async move {
+                    let transport = builder.accept(&listener).await?;
+                    let addr = transport
+                        .peer_addr()
+                        .ok_or(rdma_io::Error::InvalidArg("no peer addr".into()))?;
+                    Ok((addr, transport))
+                }));
             }
-        }
-
-        if !accepted.is_empty() {
-            let mut connections = self.connections.write().unwrap();
-            for (addr, transport) in accepted {
-                tracing::debug!(%addr, "RDMA connection accepted");
-                connections.insert(addr, Arc::new(Mutex::new(transport)));
-            }
-        }
-
-        match fatal {
-            Some(e) => Err(e),
-            None => Ok(()),
         }
     }
 }
