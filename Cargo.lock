@@ -1538,7 +1538,6 @@ dependencies = [
  "openssl",
  "rdma-io",
  "tokio",
- "tokio-util",
  "tonic",
  "tonic-tls",
  "tower-service",

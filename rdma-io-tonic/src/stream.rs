@@ -8,16 +8,15 @@ use std::task::{Context, Poll};
 use rdma_io::async_stream::AsyncRdmaStream;
 use rdma_io::transport::Transport;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt};
 use tonic::transport::server::Connected;
 
 /// RDMA stream with `tokio::io` trait implementations.
 ///
-/// Wraps [`AsyncRdmaStream<T>`] via [`tokio_util::compat::Compat`] to bridge
-/// from `futures_io` traits to `tokio::io` traits. Implements [`Connected`]
-/// for tonic server integration.
+/// Wraps [`AsyncRdmaStream<T>`], which implements the `tokio::io` traits
+/// natively (via `rdma-io`'s `tokio` feature). Implements [`Connected`] for
+/// tonic server integration.
 pub struct TokioRdmaStream<T: Transport> {
-    inner: Compat<AsyncRdmaStream<T>>,
+    inner: AsyncRdmaStream<T>,
     peer_addr: Option<SocketAddr>,
 }
 
@@ -34,7 +33,7 @@ impl<T: Transport> TokioRdmaStream<T> {
     pub fn new(stream: AsyncRdmaStream<T>) -> Self {
         let peer_addr = stream.peer_addr();
         Self {
-            inner: stream.compat(),
+            inner: stream,
             peer_addr,
         }
     }
@@ -62,6 +61,21 @@ impl<T: Transport> AsyncWrite for TokioRdmaStream<T> {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        // Advertise vectored writes so hyper/h2 hand us gathered frame slices
+        // (header + payload) in one call; the inner stream coalesces them into
+        // a single RDMA send.
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write_vectored(cx, bufs)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {

@@ -43,25 +43,32 @@ different traits on each side:
 ┌─────────────────────────────────────────────────┐
 │          TokioRdmaStream<T> (newtype)             │
 │   tokio::io::AsyncRead/Write + Connected        │
-│   wraps: Compat<AsyncRdmaStream<T>>             │
+│   wraps: AsyncRdmaStream<T> directly            │
 └─────────────────────────────────────────────────┘
          │
          ▼
 ┌─────────────────────────────────────────────────┐
 │             AsyncRdmaStream                     │
-│   futures_io::AsyncRead/Write                   │
+│   futures_io::AsyncRead/Write  (runtime-agnostic)│
+│   tokio::io::AsyncRead/Write   (`tokio` feature) │
 │   RDMA SEND/RECV via AsyncQp + AsyncCq          │
 └─────────────────────────────────────────────────┘
 ```
 
-The IO adapter chain (client side) bridges three trait families:
+The IO adapter chain (client side) — no `Compat` shim; `AsyncRdmaStream`
+implements the tokio traits natively under the `tokio` feature:
 
 ```
-AsyncRdmaStream<T>         → futures_io::AsyncRead/Write
-  → Compat<AsyncRdmaStream<T>> → tokio::io::AsyncRead/Write
-    → TokioRdmaStream<T>         + Connected (newtype)
-      → TokioIo<TokioRdmaStream> → hyper::rt::Read/Write  ← tonic needs this
+AsyncRdmaStream<T>         → tokio::io::AsyncRead/Write (native)
+  → TokioRdmaStream<T>         + Connected (newtype)
+    → TokioIo<TokioRdmaStream> → hyper::rt::Read/Write  ← tonic needs this
 ```
+
+Dropping `Compat` avoids its defensive `ReadBuf::initialize_unfilled`
+zero-fill on every read and its lack of vectored-write forwarding; the native
+read copies recv bytes straight into the `ReadBuf` via `put_slice`, and
+`is_write_vectored`/`poll_write_vectored` let hyper/h2 coalesce a frame's
+header + payload into a single RDMA send.
 
 ### Crate structure
 
@@ -81,12 +88,19 @@ rdma-io-tonic/src/
 
 ## 3. Design Decisions
 
-### Why a newtype (`TokioRdmaStream`) instead of direct tokio trait impls?
+### Why a newtype (`TokioRdmaStream`) if `AsyncRdmaStream` already impls tokio traits?
 
-1. `AsyncRdmaStream` uses `futures_io` for runtime independence — adding
-   tokio traits couples it to tokio.
-2. `Connected` is tonic-specific and doesn't belong on the core stream.
-3. Zero-cost: `Compat` is a transparent wrapper.
+`AsyncRdmaStream` implements the `tokio::io` traits natively behind the
+`tokio` feature (in addition to the runtime-agnostic `futures_io` traits), so
+no `Compat` shim is needed. The `TokioRdmaStream` newtype remains because:
+
+1. `Connected` (peer address for tonic handlers) is tonic-specific and
+   doesn't belong on the core stream.
+2. It caches `peer_addr` for the `Connected` impl.
+
+The native tokio read avoids `Compat`'s per-read `initialize_unfilled`
+zero-fill; the write side advertises `is_write_vectored` so h2 hands over
+gathered frame slices (header + payload) for a single coalesced send.
 
 ### Accept loop: boxed future vs poll-based
 

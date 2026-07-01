@@ -48,7 +48,7 @@ The transport stack:
 tonic gRPC
   → tonic_tls::openssl::TlsConnector / TlsIncoming
     → tokio_openssl::SslStream<TokioRdmaStream>    (TLS)
-      → TokioRdmaStream (Compat<AsyncRdmaStream>)  (byte stream)
+      → TokioRdmaStream (AsyncRdmaStream, native tokio::io)  (byte stream)
         → RDMA SEND/RECV verbs                      (kernel bypass)
 ```
 

@@ -15,7 +15,6 @@ hyper-util.workspace = true
 tower-service.workspace = true
 http.workspace = true
 tokio.workspace = true
-tokio-util.workspace = true
 futures-util.workspace = true
 
 # TLS (optional)
