@@ -149,7 +149,41 @@ impl<B: TransportBuilder> RdmaUdpSocket<B> {
     /// Maximum consecutive accept errors before propagating to caller.
     const MAX_ACCEPT_ERRORS: u32 = 10;
 
-    /// Drive the accept state machine. Non-blocking, called from poll_recv.
+    /// Drive the accept state machine. Non-blocking, called from `poll_recv`.
+    ///
+    /// # Why driving accept inside `poll_recv` is sufficient
+    ///
+    /// The RDMA `accept()` is a multi-round-trip async handshake (CM
+    /// establish, plus the ring transports' memory-region token exchange).
+    /// Rather than run it on a dedicated task, we keep a single in-flight
+    /// accept **future** in `accept_state` and poll it one step per call.
+    /// Continued progress does not depend on Quinn's polling *cadence* — it
+    /// depends only on the future's own wakers being wired back to Quinn, and
+    /// they are:
+    ///
+    /// - Each `fut.poll(cx)` here registers **Quinn's** `poll_recv` waker
+    ///   (`cx`) with whatever the handshake is currently blocked on — the CM
+    ///   event-channel fd or a send/recv CQ. When that RDMA resource becomes
+    ///   ready, its waker fires, Quinn re-polls `poll_recv`, and we advance the
+    ///   handshake by another step. So the future self-drives to completion via
+    ///   the reactor; Quinn does not need any unrelated traffic to "tick" it.
+    /// - The `loop` matters: on `Poll::Ready` we immediately start (and poll)
+    ///   the *next* accept in the same call, so a burst of pending inbound
+    ///   connections drains as fast as the NIC completes them rather than one
+    ///   per `poll_recv`.
+    /// - On `Poll::Pending` we return, having left `cx` registered, so the very
+    ///   next readiness edge wakes us.
+    ///
+    /// A dedicated accept task was tried (`c37e2ce`) and **reverted**: A/B
+    /// testing on Azure MANA RoCEv2 (rh3 QUIC ring transports up to 64×64)
+    /// showed this lazy path connects and runs identically, so the extra task,
+    /// channel, and abort-on-close machinery were unnecessary complexity. (An
+    /// earlier "100% `Rejected`" blamed on the lazy path was really a
+    /// NIC-degradation + too-short-benchmark-timeout confound, not a stall
+    /// here.)
+    ///
+    /// Non-blocking: never `.await`s; each call advances the handshake as far
+    /// as the reactor currently allows, then yields.
     fn poll_accept(&self, cx: &mut Context<'_>) -> io::Result<()> {
         let mut accept = self.accept_state.lock().unwrap();
         loop {

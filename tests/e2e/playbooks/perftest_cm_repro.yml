@@ -1,0 +1,169 @@
+---
+# Reproduce the Azure MANA RoCEv2 preview rdma_cm connection hang using STOCK
+# perftest — no rdma-bench / rdma-io involved. This isolates the cumulative
+# degradation to the NIC/driver CM path (see
+# docs/RDMA-MANA-Bench-Matrix-Investigation.md → "Reproduced with stock
+# rdma-core tools").
+#
+# Method: vm1 runs a self-restarting perftest server; vm2 runs `repro_iters`
+# back-to-back clients over rdma_cm (`-R`) with many QPs (`-q`), measuring each
+# client's wall-time + exit code. A run that HANGS the full timeout (rc=124,
+# ~30 s) is the reproduction — the client's rdma_cm connect never completes even
+# though the server is healthy and listening. Fast failures (<25 s) are just the
+# server being mid-restart and are reported separately (not the bug).
+#
+# Tunables (override with -e):
+#   repro_tool   perftest binary       (default ib_write_bw; try ib_send_bw)
+#   repro_qps    QPs per run (-q)       (default 64)
+#   repro_iters  client iterations      (default 20)
+#   repro_dev    RDMA device (-d)       (default: auto-detected roce* device)
+#   rdma_ip      per-host RDMA address  (default ansible_host)
+#
+# Usage:
+#   ansible-playbook -i build/inventory.json \
+#     rust-rdma-io/tests/e2e/playbooks/perftest_cm_repro.yml
+#   ansible-playbook ... -e repro_tool=ib_send_bw -e repro_iters=30
+#   (or, from the outer repo:  just cm-repro  /  just cm-repro repro_tool=ib_send_bw)
+
+- name: Ensure perftest is installed
+  hosts: vms
+  become: true
+  tasks:
+    - name: Install perftest (skips if already present)
+      ansible.builtin.apt:
+        name: perftest
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+- name: Discover the RoCE device on each host
+  hosts: vms
+  gather_facts: false
+  tasks:
+    - name: Pick the first roce* RDMA device (fallback to first device)
+      ansible.builtin.shell: |
+        set -o pipefail
+        dev=$(ibv_devices | awk 'NR>2 {print $1}' | grep -E '^roce' | head -1)
+        [ -n "$dev" ] || dev=$(ibv_devices | awk 'NR>2 {print $1}' | head -1)
+        echo "$dev"
+      args:
+        executable: /bin/bash
+      register: dev_probe
+      changed_when: false
+
+    - name: Set the RDMA device fact
+      ansible.builtin.set_fact:
+        repro_dev_resolved: "{{ repro_dev | default(dev_probe.stdout | trim) }}"
+
+- name: Start the self-restarting perftest server (vm1)
+  hosts: vm1
+  gather_facts: false
+  tasks:
+    - name: Stop any previous repro server loop
+      ansible.builtin.shell: |
+        rm -f /tmp/perftest_repro.run
+        pkill -9 -f '[p]erftest_repro_server.sh' 2>/dev/null || true
+        pkill -9 "{{ repro_tool | default('ib_write_bw') }}" 2>/dev/null || true
+        exit 0
+      changed_when: false
+
+    - name: Install the server restart-loop script
+      ansible.builtin.copy:
+        dest: /tmp/perftest_repro_server.sh
+        mode: "0755"
+        content: |
+          #!/usr/bin/env bash
+          # Keep a fresh perftest server listening: each server exits after one
+          # client (or its own 40s timeout), then the loop relaunches it.
+          TOOL="{{ repro_tool | default('ib_write_bw') }}"
+          Q="{{ repro_qps | default(64) }}"
+          DEV="{{ repro_dev_resolved }}"
+          touch /tmp/perftest_repro.run
+          while [ -f /tmp/perftest_repro.run ]; do
+            timeout 40 "$TOOL" -R -q "$Q" -s 1024 -n 600 -F -d "$DEV" \
+              > /tmp/perftest_repro_server.log 2>&1
+            sleep 0.3
+          done
+
+    - name: Launch the server loop in the background
+      ansible.builtin.shell: |
+        nohup /tmp/perftest_repro_server.sh > /tmp/perftest_repro_server_loop.out 2>&1 &
+        sleep 3
+        echo "server-loop-pid=$(pgrep -f '[p]erftest_repro_server.sh' | head -1)"
+      changed_when: true
+      register: server_launch
+
+    - name: Show server launch
+      ansible.builtin.debug:
+        msg: "{{ server_launch.stdout }} (tool={{ repro_tool | default('ib_write_bw') }} qps={{ repro_qps | default(64) }} dev={{ repro_dev_resolved }})"
+
+- name: Run the back-to-back client loop and classify each run (vm2)
+  hosts: vm2
+  gather_facts: false
+  vars:
+    server_ip: "{{ hostvars['vm1'].rdma_ip | default(hostvars['vm1'].ansible_host) }}"
+  tasks:
+    - name: Loop clients, measuring wall-time + exit code
+      ansible.builtin.shell: |
+        TOOL="{{ repro_tool | default('ib_write_bw') }}"
+        Q="{{ repro_qps | default(64) }}"
+        DEV="{{ repro_dev_resolved }}"
+        SRV="{{ server_ip }}"
+        N="{{ repro_iters | default(20) }}"
+        ok=0; hangs=0; skipped=0
+        run_client() {
+          local s e dur rc
+          s=$(date +%s)
+          timeout 35 "$TOOL" -R -q "$Q" -s 1024 -n 600 -F -d "$DEV" "$SRV" \
+            > /tmp/perftest_repro_client.log 2>&1
+          rc=$?; e=$(date +%s); dur=$((e - s)); echo "$rc $dur"
+        }
+        for i in $(seq 1 "$N"); do
+          # The server self-restarts between tests; a fast failure just means we
+          # hit the restart gap, so retry (up to ~6x) until we either connect or
+          # HANG. A genuine rdma_cm hang burns the full timeout and is NOT retried.
+          result="skip"; last_dur=0
+          for attempt in 1 2 3 4 5 6; do
+            read rc dur < <(run_client); last_dur=$dur
+            if grep -q 'BW average' /tmp/perftest_repro_client.log; then result="ok"; break; fi
+            if [ "$dur" -ge 25 ]; then result="hang"; break; fi
+            sleep 1.5   # server mid-restart — wait and retry
+          done
+          case "$result" in
+            ok)   ok=$((ok + 1));    printf 'iter %2d: OK %ss\n' "$i" "$last_dur" ;;
+            hang) hangs=$((hangs + 1)); printf 'iter %2d: HANG %ss (rc=%s) <-- rdma_cm connect hung\n' "$i" "$last_dur" "$rc" ;;
+            *)    skipped=$((skipped + 1)); printf 'iter %2d: SKIP (server never came back after 6 tries)\n' "$i" ;;
+          esac
+          sleep 1
+        done
+        echo "SUMMARY tool=$TOOL qps=$Q dev=$DEV: ok=$ok hangs=$hangs skipped=$skipped"
+      args:
+        executable: /bin/bash
+      register: repro
+      changed_when: false
+      failed_when: false
+
+    - name: Reproduction results
+      ansible.builtin.debug:
+        msg: "{{ repro.stdout_lines }}"
+
+    - name: Verdict
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'REPRODUCED: rdma_cm connect hung on the MANA NIC ('
+             + (repro.stdout_lines | select('search', 'HANG') | list | length | string)
+             + ' hang(s)) — this is a NIC/driver issue, not our bench.'
+             if (repro.stdout is search('HANG'))
+             else 'No hang this run — try more iterations (-e repro_iters=40) or a higher -q.' }}"
+
+- name: Stop the server loop and clean up (vm1)
+  hosts: vm1
+  gather_facts: false
+  tasks:
+    - name: Tear down the repro server
+      ansible.builtin.shell: |
+        rm -f /tmp/perftest_repro.run
+        pkill -9 -f '[p]erftest_repro_server.sh' 2>/dev/null || true
+        pkill -9 "{{ repro_tool | default('ib_write_bw') }}" 2>/dev/null || true
+        exit 0
+      changed_when: true
