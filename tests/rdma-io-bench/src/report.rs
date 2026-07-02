@@ -7,6 +7,9 @@ pub struct BenchResult {
     pub transport: String,
     pub connections: usize,
     pub threads: usize,
+    /// Requests kept outstanding per connection (1 for the request/response
+    /// tonic modes; the sweep axis for `--mode echo`).
+    pub in_flight: usize,
     pub duration_secs: u64,
     pub payload_bytes: usize,
     pub total_requests: u64,
@@ -34,6 +37,7 @@ impl BenchResult {
         transport: &str,
         connections: usize,
         threads: usize,
+        in_flight: usize,
         duration_secs: u64,
         payload_bytes: usize,
         errors: u64,
@@ -49,6 +53,7 @@ impl BenchResult {
             transport: transport.to_string(),
             connections,
             threads,
+            in_flight,
             duration_secs,
             payload_bytes,
             total_requests: total,
@@ -72,6 +77,7 @@ impl BenchResult {
         println!("Transport:    {}", self.transport);
         println!("Connections:  {}", self.connections);
         println!("Threads:      {}", self.threads);
+        println!("In-flight:    {}", self.in_flight);
         println!("Duration:     {}s", self.duration_secs);
         println!("Payload:      {} bytes", self.payload_bytes);
         println!();

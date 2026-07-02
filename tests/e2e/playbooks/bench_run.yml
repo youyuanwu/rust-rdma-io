@@ -26,6 +26,8 @@
           --mode "{{ bench_mode | default('rh2') }}" \
           --transport "{{ bench_transport | default('send-recv') }}" \
           {{ '--mw-fallback' if (bench_mw_fallback | default(false) | bool) else '' }} \
+          --ring-max-msg "{{ bench_ring_max_msg | default(1500) }}" \
+          --ring-max-inflight "{{ bench_ring_max_inflight | default(0) }}" \
           --cert ~/certs/cert.pem \
           --key ~/certs/key.pem \
           > /tmp/bench-server.log 2>&1 &
@@ -49,9 +51,12 @@
           {{ '--mw-fallback' if (bench_mw_fallback | default(false) | bool) else '' }} \
           --connections "{{ bench_connections | default(1) }}" \
           --threads "{{ bench_threads | default(1) }}" \
+          --in-flight "{{ bench_in_flight | default(1) }}" \
           --duration "{{ bench_duration | default(10) }}" \
           --warmup "{{ bench_warmup | default(5) }}" \
           --payload "{{ bench_payload | default(64) }}" \
+          --ring-max-msg "{{ bench_ring_max_msg | default(1500) }}" \
+          --ring-max-inflight "{{ bench_ring_max_inflight | default(0) }}" \
           --cert ~/certs/cert.pem \
           --key ~/certs/key.pem \
           --report json
@@ -74,7 +79,7 @@
     - name: Save results to controller
       ansible.builtin.copy:
         content: "{{ bench_result.stdout }}"
-        dest: "{{ bench_out_dir | default('/tmp') }}/bench-{{ bench_mode | default('rh2') }}-{{ bench_transport | default('send-recv') }}-{{ bench_connections | default(1) }}conn-{{ bench_threads | default(1) }}thr.json"
+        dest: "{{ bench_out_dir | default('/tmp') }}/bench-{{ bench_mode | default('rh2') }}-{{ bench_transport | default('send-recv') }}-{{ bench_connections | default(1) }}conn-{{ bench_threads | default(1) }}thr-{{ bench_in_flight | default(1) }}if.json"
         mode: '0644'
       delegate_to: localhost
 
@@ -82,9 +87,30 @@
       ansible.builtin.debug:
         msg: "{{ bench_result.stdout }}"
 
+    # Opt-in (save_logs=true): keep the client's stderr (RUST_LOG output) for
+    # debugging. Combine with e.g. rust_log="rdma_io_bench=trace,rdma_io=debug"
+    # to capture data-path errors such as the ring send-queue ENOMEM.
+    - name: Save client log to controller
+      ansible.builtin.copy:
+        content: "{{ bench_result.stderr }}"
+        dest: "{{ bench_out_dir | default('/tmp') }}/client-{{ bench_mode | default('rh2') }}-{{ bench_transport | default('send-recv') }}-{{ bench_in_flight | default(1) }}if.log"
+        mode: '0644'
+      delegate_to: localhost
+      when: bench_save_logs | default(false) | bool
+
 - name: Stop Server
   hosts: vm1
   tasks:
+    # Opt-in (save_logs=true): pull the server's RUST_LOG output before it is
+    # deleted by the stop task below.
+    - name: Fetch server log to controller
+      ansible.builtin.fetch:
+        src: /tmp/bench-server.log
+        dest: "{{ bench_out_dir | default('/tmp') }}/server-{{ bench_transport | default('send-recv') }}-{{ bench_in_flight | default(1) }}if.log"
+        flat: true
+      when: bench_save_logs | default(false) | bool
+      ignore_errors: true
+
     - name: Stop server
       ansible.builtin.shell: |
         if [ -f /tmp/bench-server.pid ]; then

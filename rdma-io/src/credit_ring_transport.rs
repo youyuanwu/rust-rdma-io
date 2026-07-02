@@ -55,6 +55,10 @@ use crate::transport_common::*;
 use crate::wc::{WcOpcode, WorkCompletion};
 use crate::wr::{QpType, RecvWr, SendFlags, SendWr, Sge, WrOpcode};
 
+/// Extra send-queue slots beyond `max_outstanding` (headroom for in-flight
+/// credit `Send` WRs). Must match the value used to size `max_send_wr`.
+const CREDIT_RING_SQ_HEADROOM: usize = 2;
+
 // ---------------------------------------------------------------------------
 // CreditRingConfig
 // ---------------------------------------------------------------------------
@@ -66,6 +70,14 @@ pub struct CreditRingConfig {
     pub ring_capacity: usize,
     /// Maximum message size in bytes.
     pub max_message_size: usize,
+    /// Optional explicit in-flight message budget (send/doorbell/CQ slot count).
+    ///
+    /// `None` (default) derives it as `ring_capacity / max_message_size`, which
+    /// undercounts small messages. Set `Some(n)` to size the queues for `n`
+    /// in-flight messages independently of `max_message_size` — useful for deep
+    /// pipelines of small messages. Clamped to the device's queue limits.
+    /// See docs/bugs/ring-send-queue-exhaustion.md.
+    pub max_in_flight: Option<usize>,
     /// Timeout for token exchange during setup.
     pub token_timeout: Duration,
     /// Max inline data size (0 = disabled).
@@ -94,6 +106,7 @@ impl CreditRingConfig {
         Self {
             ring_capacity: 65536,
             max_message_size: 1500,
+            max_in_flight: None,
             token_timeout: Duration::from_secs(5),
             max_inline_data: 0,
             use_mr_rkey: false,
@@ -105,6 +118,14 @@ impl CreditRingConfig {
     /// Use this on NICs that report `max_mw = 0` (e.g. Azure MANA).
     pub fn with_mr_rkey_fallback(mut self, enabled: bool) -> Self {
         self.use_mr_rkey = enabled;
+        self
+    }
+
+    /// Set an explicit in-flight message budget, sizing the send/doorbell/CQ
+    /// queues for `n` messages independently of `max_message_size`. Clamped to
+    /// the device's queue limits. See [`CreditRingConfig::max_in_flight`].
+    pub fn with_max_in_flight(mut self, n: usize) -> Self {
+        self.max_in_flight = Some(n);
         self
     }
 }
@@ -148,7 +169,15 @@ pub struct CreditRingTransport {
     remote_credits: usize,
     remote_freed_received: u32, // Last absolute freed count received from peer (u32 wire format)
     local_freed_credits: usize,
+    /// Cumulative credit count last actually sent to the peer. When the send
+    /// queue is full, credit updates are deferred; because they carry an
+    /// absolute count, the next send subsumes any skipped ones.
+    credits_sent: usize,
     send_in_flight: usize,
+    /// Send-queue depth (`max_send_wr`). Un-completed send WRs (data/padding
+    /// Writes + credit Sends) must not exceed this, or `ibv_post_send` returns
+    /// ENOMEM. See docs/bugs/ring-send-queue-exhaustion.md.
+    sq_capacity: usize,
 
     // -- MW (dropped BEFORE QP — invalidation needs live QP) --
     _recv_mw: Option<MemoryWindow>,
@@ -211,8 +240,14 @@ impl CreditRingTransport {
         // that cannot allocate Type-2 Memory Windows (e.g. Azure MANA).
         check_remote_access_caps(&pd, config.use_mr_rkey)?;
 
-        let max_outstanding = config.ring_capacity / config.max_message_size;
-        let send_cq_depth = (max_outstanding + 2) as i32;
+        let max_outstanding = effective_max_outstanding(
+            &pd,
+            config.ring_capacity,
+            config.max_message_size,
+            config.max_in_flight,
+            CREDIT_RING_SQ_HEADROOM,
+        );
+        let send_cq_depth = (max_outstanding + CREDIT_RING_SQ_HEADROOM) as i32;
         let recv_cq_depth = (max_outstanding + 2) as i32;
 
         let send_cq = AsyncCq::create_tokio(ctx.clone(), send_cq_depth)?;
@@ -335,8 +370,14 @@ impl CreditRingTransport {
         // that cannot allocate Type-2 Memory Windows (e.g. Azure MANA).
         check_remote_access_caps(&pd, config.use_mr_rkey)?;
 
-        let max_outstanding = config.ring_capacity / config.max_message_size;
-        let send_cq_depth = (max_outstanding + 2) as i32;
+        let max_outstanding = effective_max_outstanding(
+            &pd,
+            config.ring_capacity,
+            config.max_message_size,
+            config.max_in_flight,
+            CREDIT_RING_SQ_HEADROOM,
+        );
+        let send_cq_depth = (max_outstanding + CREDIT_RING_SQ_HEADROOM) as i32;
         let recv_cq_depth = (max_outstanding + 2) as i32;
 
         let send_cq = AsyncCq::create_tokio(ctx.clone(), send_cq_depth)?;
@@ -470,7 +511,9 @@ impl CreditRingTransport {
             remote_credits: max_outstanding,
             remote_freed_received: 0,
             local_freed_credits: 0,
+            credits_sent: 0,
             send_in_flight: 0,
+            sq_capacity: max_outstanding + CREDIT_RING_SQ_HEADROOM,
 
             _recv_mw: recv_mw,
 
@@ -570,17 +613,10 @@ impl CreditRingTransport {
                         let contiguous = self.recv_tracker.release(slot);
                         if contiguous > 0 {
                             self.local_freed_credits += contiguous;
-                            let credit_imm = self.local_freed_credits as u32;
-                            let mut credit_wr = SendWr::new(
-                                WR_ID_CREDIT_FLAG | (self.local_freed_credits as u64),
-                                WrOpcode::SendWithImm(credit_imm),
-                            )
-                            .flags(SendFlags::SIGNALED);
-                            if self.qp.post_send_wr(&mut credit_wr).is_err() {
+                            if self.flush_credits().is_err() {
                                 self.peer_disconnected = true;
                                 return;
                             }
-                            self.send_in_flight += 1;
                         }
                     } else {
                         // Data — find a virtual idx slot and stash.
@@ -631,6 +667,24 @@ impl CreditRingTransport {
             }
         }
     }
+
+    /// Post a cumulative credit update to the peer if credits are pending and
+    /// the send queue has room. Credit `Send`s carry the absolute freed count,
+    /// so a single update subsumes any deferred ones; when the queue is full we
+    /// skip and retry after a send completes (see `poll_send_completion`). This
+    /// keeps `send_in_flight` within the send-queue depth so `ibv_post_send`
+    /// never returns ENOMEM. See docs/bugs/ring-send-queue-exhaustion.md.
+    fn flush_credits(&mut self) -> crate::Result<()> {
+        if self.local_freed_credits > self.credits_sent && self.send_in_flight < self.sq_capacity {
+            let imm = self.local_freed_credits as u32;
+            let wr_id = WR_ID_CREDIT_FLAG | (self.local_freed_credits as u64);
+            let mut wr = SendWr::new(wr_id, WrOpcode::SendWithImm(imm)).flags(SendFlags::SIGNALED);
+            self.qp.post_send_wr(&mut wr)?;
+            self.credits_sent = self.local_freed_credits;
+            self.send_in_flight += 1;
+        }
+        Ok(())
+    }
 }
 
 impl Transport for CreditRingTransport {
@@ -675,6 +729,19 @@ impl Transport for CreditRingTransport {
             if self.remote_credits == 0 {
                 return Ok(0);
             }
+        }
+
+        // Send-queue backpressure. A single send_copy posts up to 2 WRs
+        // (padding + data), and credit Sends also consume the queue. If the
+        // send queue can't hold them, ibv_post_send would return ENOMEM.
+        // Return Ok(0) (transient "cannot accept now", not a fatal error) so the
+        // caller reaps via poll_send_completion and retries — matching the
+        // Transport::send_copy contract. (Reaping is left to
+        // poll_send_completion's CqPollState path; polling the CQ here would
+        // desync the edge-triggered notification and lose wakeups.)
+        // See docs/bugs/ring-send-queue-exhaustion.md.
+        if self.send_in_flight + 2 > self.sq_capacity {
+            return Ok(0);
         }
 
         // Clamp data length (16-bit immediate encoding limit).
@@ -784,6 +851,12 @@ impl Transport for CreditRingTransport {
             }
             self.send_in_flight = self.send_in_flight.saturating_sub(1);
         }
+        // Reaping freed send-queue slots; flush any credit update that was
+        // deferred while the queue was full.
+        if let Err(e) = self.flush_credits() {
+            self.peer_disconnected = true;
+            return Poll::Ready(Err(e));
+        }
         Poll::Ready(Ok(()))
     }
 
@@ -868,19 +941,12 @@ impl Transport for CreditRingTransport {
                             let contiguous = self.recv_tracker.release(slot);
                             if contiguous > 0 {
                                 self.local_freed_credits += contiguous;
-                                let credit_imm = self.local_freed_credits as u32;
-                                let mut credit_wr = SendWr::new(
-                                    WR_ID_CREDIT_FLAG | (self.local_freed_credits as u64),
-                                    WrOpcode::SendWithImm(credit_imm),
-                                )
-                                .flags(SendFlags::SIGNALED);
-                                if self.qp.post_send_wr(&mut credit_wr).is_err() {
+                                if self.flush_credits().is_err() {
                                     self.peer_disconnected = true;
                                     return Poll::Ready(Err(crate::Error::InvalidArg(
                                         "credit post_send failed".into(),
                                     )));
                                 }
-                                self.send_in_flight += 1;
                             }
                             continue;
                         }
@@ -996,12 +1062,9 @@ impl Transport for CreditRingTransport {
         if contiguous > 0 {
             self.local_freed_credits += contiguous;
 
-            // Send credit update: absolute freed count.
-            let imm = self.local_freed_credits as u32;
-            let wr_id = WR_ID_CREDIT_FLAG | (self.local_freed_credits as u64);
-            let mut wr = SendWr::new(wr_id, WrOpcode::SendWithImm(imm)).flags(SendFlags::SIGNALED);
-            self.qp.post_send_wr(&mut wr)?;
-            self.send_in_flight += 1;
+            // Send credit update (absolute freed count). Deferred if the send
+            // queue is full; flushed later from poll_send_completion.
+            self.flush_credits()?;
 
             tracing::debug!(
                 contiguous,

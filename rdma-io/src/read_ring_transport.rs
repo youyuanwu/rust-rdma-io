@@ -60,6 +60,14 @@ use crate::wr::{QpType, RecvWr, SendFlags, SendWr, Sge, WrOpcode};
 const READ_RING_TOKEN_VERSION: u8 = 2;
 const READ_RING_TOKEN_SIZE: usize = 32;
 
+/// Extra send-queue slots beyond `max_outstanding`: headroom for the RDMA-Read
+/// flow-control WR. Must match the `+ 3` used when sizing `max_send_wr`.
+const READ_RING_SQ_HEADROOM: usize = 3;
+
+/// Worst-case number of send WRs a single `send_copy` can post: a padding
+/// Write (on ring wrap) + the data Write + a proactive RDMA-Read.
+const SEND_COPY_MAX_WRS: usize = 3;
+
 /// Sentinel wr_id for RDMA Read of offset buffer — not a data WR.
 const WR_ID_READ_SENTINEL: u64 = u64::MAX - 30;
 
@@ -117,6 +125,14 @@ pub struct ReadRingConfig {
     pub ring_capacity: usize,
     /// Maximum message size in bytes.
     pub max_message_size: usize,
+    /// Optional explicit in-flight message budget (send/doorbell/CQ slot count).
+    ///
+    /// `None` (default) derives it as `ring_capacity / max_message_size`, which
+    /// undercounts small messages. Set `Some(n)` to size the queues for `n`
+    /// in-flight messages independently of `max_message_size` — useful for deep
+    /// pipelines of small messages. Clamped to the device's queue limits.
+    /// See docs/bugs/ring-send-queue-exhaustion.md.
+    pub max_in_flight: Option<usize>,
     /// Timeout for token exchange during setup.
     pub token_timeout: Duration,
     /// Max inline data size (0 = disabled).
@@ -147,6 +163,7 @@ impl ReadRingConfig {
         Self {
             ring_capacity: 65536,
             max_message_size: 1500,
+            max_in_flight: None,
             token_timeout: Duration::from_secs(5),
             max_inline_data: 0,
             min_free_threshold: 128,
@@ -159,6 +176,14 @@ impl ReadRingConfig {
     /// Use this on NICs that report `max_mw = 0` (e.g. Azure MANA).
     pub fn with_mr_rkey_fallback(mut self, enabled: bool) -> Self {
         self.use_mr_rkey = enabled;
+        self
+    }
+
+    /// Set an explicit in-flight message budget, sizing the send/doorbell/CQ
+    /// queues for `n` messages independently of `max_message_size`. Clamped to
+    /// the device's queue limits. See [`ReadRingConfig::max_in_flight`].
+    pub fn with_max_in_flight(mut self, n: usize) -> Self {
+        self.max_in_flight = Some(n);
         self
     }
 }
@@ -212,6 +237,10 @@ pub struct ReadRingTransport {
 
     // -- Send tracking --
     send_in_flight: usize,
+    /// Send-queue depth (`max_send_wr`). Un-completed send WRs
+    /// (`send_in_flight` data/padding Writes + a pending RDMA-Read) must not
+    /// exceed this, or `ibv_post_send` returns ENOMEM.
+    sq_capacity: usize,
 
     // -- MW2 (offset buffer, REMOTE_READ) — dropped BEFORE MW1 --
     _offset_mw: Option<MemoryWindow>,
@@ -395,9 +424,15 @@ impl ReadRingTransport {
         // that cannot allocate Type-2 Memory Windows (e.g. Azure MANA).
         check_remote_access_caps(&pd, config.use_mr_rkey)?;
 
-        let max_outstanding = config.ring_capacity / config.max_message_size;
+        let max_outstanding = effective_max_outstanding(
+            &pd,
+            config.ring_capacity,
+            config.max_message_size,
+            config.max_in_flight,
+            READ_RING_SQ_HEADROOM,
+        );
         // +3: headroom for RDMA Read WR on send CQ
-        let send_cq_depth = (max_outstanding + 3) as i32;
+        let send_cq_depth = (max_outstanding + READ_RING_SQ_HEADROOM) as i32;
         let recv_cq_depth = (max_outstanding + 2) as i32;
 
         let send_cq = AsyncCq::create_tokio(ctx.clone(), send_cq_depth)?;
@@ -536,8 +571,14 @@ impl ReadRingTransport {
         // that cannot allocate Type-2 Memory Windows (e.g. Azure MANA).
         check_remote_access_caps(&pd, config.use_mr_rkey)?;
 
-        let max_outstanding = config.ring_capacity / config.max_message_size;
-        let send_cq_depth = (max_outstanding + 3) as i32;
+        let max_outstanding = effective_max_outstanding(
+            &pd,
+            config.ring_capacity,
+            config.max_message_size,
+            config.max_in_flight,
+            READ_RING_SQ_HEADROOM,
+        );
+        let send_cq_depth = (max_outstanding + READ_RING_SQ_HEADROOM) as i32;
         let recv_cq_depth = (max_outstanding + 2) as i32;
 
         let send_cq = AsyncCq::create_tokio(ctx.clone(), send_cq_depth)?;
@@ -697,6 +738,7 @@ impl ReadRingTransport {
             head_slot_idx: 0,
 
             send_in_flight: 0,
+            sq_capacity: max_outstanding + READ_RING_SQ_HEADROOM,
 
             _offset_mw: offset_mw,
             _recv_mw: recv_mw,
@@ -855,6 +897,22 @@ impl Transport for ReadRingTransport {
         // Pick up completed RDMA Read if pending.
         if self.read_in_flight {
             self.drain_send_cq_for_read();
+        }
+
+        // Send-queue backpressure. A single send_copy can post up to
+        // SEND_COPY_MAX_WRS work requests (padding + data + a proactive
+        // RDMA-Read); if the send queue can't hold them, ibv_post_send would
+        // return ENOMEM. The remote-ring free-space check below is byte-based
+        // and, for small messages, would let far more messages in flight than
+        // the send queue has slots. Return Ok(0) (transient "cannot accept
+        // now", not a fatal error) so the caller reaps via poll_send_completion
+        // and retries — matching SendRecvTransport and the send_copy contract.
+        // (Reaping is left to poll_send_completion's CqPollState path; polling
+        // the CQ here would desync the edge-triggered notification and lose
+        // wakeups.) See docs/bugs/ring-send-queue-exhaustion.md.
+        let sq_used = self.send_in_flight + usize::from(self.read_in_flight);
+        if sq_used + SEND_COPY_MAX_WRS > self.sq_capacity {
+            return Ok(0);
         }
 
         let free = self.remote_free_space();

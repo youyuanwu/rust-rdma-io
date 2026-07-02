@@ -9,6 +9,7 @@ use rdma_io::credit_ring_transport::CreditRingConfig;
 use rdma_io::read_ring_transport::ReadRingConfig;
 use rdma_io::send_recv_transport::SendRecvConfig;
 use rdma_io::transport::TransportBuilder;
+use rdma_io::wr::QpType;
 use rdma_io_quinn::RdmaUdpSocket;
 use rdma_io_tonic::tls::RdmaTransport;
 use tonic::transport::Endpoint;
@@ -17,7 +18,7 @@ use rdma_io_bench::greeter::HelloRequest;
 use rdma_io_bench::greeter::greeter_client::GreeterClient;
 use rdma_io_bench::metrics::BenchMetrics;
 use rdma_io_bench::report::BenchResult;
-use rdma_io_bench::{h3_common, tls_common};
+use rdma_io_bench::{echo, h3_common, tls_common};
 
 #[derive(Parser)]
 #[command(name = "rdma-bench-client", about = "RDMA gRPC benchmark client")]
@@ -43,6 +44,23 @@ struct Args {
 
     #[arg(long, default_value_t = 2)]
     connections: usize,
+
+    /// Requests kept outstanding per connection (echo mode only).
+    #[arg(long, default_value_t = 1)]
+    in_flight: usize,
+
+    /// Ring transport `max_message_size` in bytes (echo mode only). The number
+    /// of outstanding messages a ring allows is `ring_capacity / this`
+    /// (ring_capacity is fixed at 65536), so a smaller value permits deeper
+    /// `--in-flight` for small payloads. Payloads larger than this are truncated.
+    #[arg(long, default_value_t = 1500)]
+    ring_max_msg: usize,
+
+    /// Ring transport in-flight message budget (echo mode only). 0 = derive from
+    /// `ring_capacity / ring_max_msg`. Set >0 to size the send/doorbell/CQ queues
+    /// for that many in-flight messages independently of the message size.
+    #[arg(long, default_value_t = 0)]
+    ring_max_inflight: usize,
 
     #[arg(long, default_value_t = 10)]
     duration: u64,
@@ -104,11 +122,100 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         "rh2" => run_tls_bench(&args, &uri, &payload).await,
         "rh3" => run_h3_bench(&args, &uri, &payload).await,
         "tcp" => run_tcp_bench(&args, &uri, &payload).await,
+        "echo" => run_echo_bench(&args).await,
         other => {
-            eprintln!("Unknown mode: {other}. Supported: rh2, rh3, tcp");
+            eprintln!("Unknown mode: {other}. Supported: rh2, rh3, tcp, echo");
             std::process::exit(1);
         }
     }
+}
+
+/// Direct transport-level echo benchmark (no tonic/TLS/gRPC). `--transport tcp`
+/// selects the raw-TCP baseline; the others drive the raw RDMA transport.
+async fn run_echo_bench(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    match args.transport.as_str() {
+        "tcp" => {
+            echo::run_tcp_echo_client(
+                args.connect,
+                args.connections,
+                args.in_flight,
+                args.payload,
+                args.warmup,
+                args.duration,
+                args.threads,
+                &args.report,
+            )
+            .await
+        }
+        "send-recv" => {
+            let config = SendRecvConfig {
+                buf_size: args.payload.max(64),
+                num_recv_bufs: args.in_flight + 2,
+                num_send_bufs: args.in_flight + 2,
+                max_inline_data: 0,
+                qp_type: QpType::Rc,
+            };
+            run_echo_bench_with(args, config, "send-recv").await
+        }
+        "read-ring" => {
+            warn_ring_payload(args.payload, args.ring_max_msg);
+            let mut config = ReadRingConfig::datagram().with_mr_rkey_fallback(args.mw_fallback);
+            config.max_message_size = args.ring_max_msg;
+            if args.ring_max_inflight > 0 {
+                config.max_in_flight = Some(args.ring_max_inflight);
+            }
+            run_echo_bench_with(args, config, "read-ring").await
+        }
+        "credit-ring" => {
+            warn_ring_payload(args.payload, args.ring_max_msg);
+            let mut config = CreditRingConfig::datagram().with_mr_rkey_fallback(args.mw_fallback);
+            config.max_message_size = args.ring_max_msg;
+            if args.ring_max_inflight > 0 {
+                config.max_in_flight = Some(args.ring_max_inflight);
+            }
+            run_echo_bench_with(args, config, "credit-ring").await
+        }
+        other => {
+            eprintln!(
+                "Unknown transport: {other}. Supported: send-recv, read-ring, credit-ring, tcp"
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+/// The ring transports carry one message per RDMA-Write, capped at
+/// `ring_max_msg` bytes, so larger echo payloads are truncated to one message.
+fn warn_ring_payload(payload: usize, ring_max_msg: usize) {
+    if payload > ring_max_msg {
+        eprintln!(
+            "warning: echo payload {payload} > ring max_message_size {ring_max_msg}; \
+             the ring transports will truncate each message to {ring_max_msg} bytes"
+        );
+    }
+}
+
+async fn run_echo_bench_with<B>(
+    args: &Args,
+    builder: B,
+    transport_label: &str,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    B: TransportBuilder,
+{
+    echo::run_transport_echo_client(
+        builder,
+        args.connect,
+        args.connections,
+        args.in_flight,
+        args.payload,
+        args.warmup,
+        args.duration,
+        args.threads,
+        transport_label,
+        &args.report,
+    )
+    .await
 }
 
 async fn run_tls_bench(
@@ -280,6 +387,7 @@ async fn run_channel_clients(
         transport,
         args.connections,
         args.threads,
+        1, // request/response: one request outstanding per connection
         args.duration,
         args.payload,
         metrics.total_errors.load(Ordering::Relaxed),
@@ -431,6 +539,7 @@ where
         &args.transport,
         args.connections,
         args.threads,
+        1, // request/response: one request outstanding per connection
         args.duration,
         args.payload,
         metrics.total_errors.load(Ordering::Relaxed),

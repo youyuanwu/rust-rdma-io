@@ -8,6 +8,7 @@ use rdma_io::credit_ring_transport::CreditRingConfig;
 use rdma_io::read_ring_transport::ReadRingConfig;
 use rdma_io::send_recv_transport::SendRecvConfig;
 use rdma_io::transport::TransportBuilder;
+use rdma_io::wr::QpType;
 use rdma_io_quinn::RdmaUdpSocket;
 use rdma_io_tonic::RdmaIncoming;
 use tonic::transport::Server;
@@ -15,7 +16,7 @@ use tonic::{Request, Response, Status};
 
 use rdma_io_bench::greeter::greeter_server::{Greeter, GreeterServer};
 use rdma_io_bench::greeter::{HelloReply, HelloRequest};
-use rdma_io_bench::{h3_common, tls_common};
+use rdma_io_bench::{echo, h3_common, tls_common};
 
 #[derive(Parser)]
 #[command(name = "rdma-bench-server", about = "RDMA gRPC benchmark server")]
@@ -35,6 +36,18 @@ struct Args {
     /// transports. Required on NICs that report max_mw=0 (e.g. Azure MANA).
     #[arg(long, default_value_t = false)]
     mw_fallback: bool,
+
+    /// Ring transport `max_message_size` in bytes (echo mode only). Must match
+    /// the client so both sides size their credits/buffers identically. Smaller
+    /// values raise the number of outstanding messages a ring allows.
+    #[arg(long, default_value_t = 1500)]
+    ring_max_msg: usize,
+
+    /// Ring transport in-flight message budget (echo mode only). 0 = derive from
+    /// `ring_capacity / ring_max_msg`. Must match the client. Set >0 to size the
+    /// send/doorbell/CQ queues for that many in-flight messages.
+    #[arg(long, default_value_t = 0)]
+    ring_max_inflight: usize,
 
     #[arg(long, default_value = "build/certs/cert.pem")]
     cert: PathBuf,
@@ -88,8 +101,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "rh2" => run_tls_server(args).await,
         "rh3" => run_h3_server(args).await,
         "tcp" => run_tcp_server(args).await,
+        "echo" => run_echo_server(args).await,
         other => {
-            eprintln!("Unknown mode: {other}. Supported: rh2, rh3, tcp");
+            eprintln!("Unknown mode: {other}. Supported: rh2, rh3, tcp, echo");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Direct transport-level echo server (no tonic/TLS/gRPC). `--transport tcp`
+/// serves a raw-TCP byte echo; the others serve the raw RDMA transport.
+async fn run_echo_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    match args.transport.as_str() {
+        "tcp" => echo::run_tcp_echo_server(args.bind, shutdown_signal()).await,
+        "send-recv" => {
+            let config = SendRecvConfig {
+                buf_size: 64 * 1024,
+                num_recv_bufs: 64,
+                num_send_bufs: 64,
+                max_inline_data: 0,
+                qp_type: QpType::Rc,
+            };
+            echo::run_transport_echo_server(config, args.bind, "send-recv", shutdown_signal()).await
+        }
+        "read-ring" => {
+            let mut config = ReadRingConfig::datagram().with_mr_rkey_fallback(args.mw_fallback);
+            config.max_message_size = args.ring_max_msg;
+            if args.ring_max_inflight > 0 {
+                config.max_in_flight = Some(args.ring_max_inflight);
+            }
+            echo::run_transport_echo_server(config, args.bind, "read-ring", shutdown_signal()).await
+        }
+        "credit-ring" => {
+            let mut config = CreditRingConfig::datagram().with_mr_rkey_fallback(args.mw_fallback);
+            config.max_message_size = args.ring_max_msg;
+            if args.ring_max_inflight > 0 {
+                config.max_in_flight = Some(args.ring_max_inflight);
+            }
+            echo::run_transport_echo_server(config, args.bind, "credit-ring", shutdown_signal())
+                .await
+        }
+        other => {
+            eprintln!(
+                "Unknown transport: {other}. Supported: send-recv, read-ring, credit-ring, tcp"
+            );
             std::process::exit(1);
         }
     }

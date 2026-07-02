@@ -229,6 +229,46 @@ pub(crate) fn check_remote_access_caps(
     Ok(())
 }
 
+/// Compute the effective in-flight message budget (`max_outstanding`) for a ring
+/// transport, decoupled from `max_message_size` when an explicit override is
+/// given.
+///
+/// `max_outstanding` is the number of message *slots* the transport sizes its
+/// send queue, recv (doorbell) queue, CQs, and slot-tracking tables to. By
+/// default it is `ring_capacity / max_message_size` (each slot budgeted at the
+/// max message size). That undercounts small messages: a 64 KiB ring with a
+/// 1500 B max message sizes for 43 slots even though ~1024 messages of 64 B
+/// could be in flight, so the send/doorbell queues become the bottleneck (see
+/// `docs/bugs/ring-send-queue-exhaustion.md`).
+///
+/// When `max_in_flight` is `Some(n)`, the slot count is `n` instead, letting
+/// deep pipelines of small messages use the ring's true byte capacity. The
+/// result is clamped to the device's queue limits (`max_qp_wr`, `max_cqe`),
+/// leaving `headroom` slots for the extra send WRs each transport posts
+/// (padding / RDMA-Read / credit updates), and is always at least 1.
+pub(crate) fn effective_max_outstanding(
+    pd: &Arc<ProtectionDomain>,
+    ring_capacity: usize,
+    max_message_size: usize,
+    max_in_flight: Option<usize>,
+    headroom: usize,
+) -> usize {
+    let derived = (ring_capacity / max_message_size.max(1)).max(1);
+    let requested = max_in_flight.unwrap_or(derived).max(1);
+    // send_cq_depth = max_outstanding + headroom, recv_cq_depth = max_outstanding
+    // + 2; both must fit max_qp_wr and max_cqe.
+    let reserve = headroom.max(2);
+    let device_cap = pd
+        .context()
+        .query_device()
+        .ok()
+        .map(|a| (a.max_qp_wr as usize).min(a.max_cqe as usize))
+        .unwrap_or(usize::MAX)
+        .saturating_sub(reserve)
+        .max(1);
+    requested.min(device_cap).max(1)
+}
+
 /// Allocate and bind a Memory Window Type 2 to the recv ring MR.
 /// Must be called AFTER QP reaches RTS (post-connect/accept).
 /// Panics if the device does not support MW Type 2.

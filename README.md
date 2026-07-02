@@ -175,6 +175,8 @@ Design documents and background research are in [`docs/`](docs/):
 | [rdma-transport-layer.md](docs/design/rdma-transport-layer.md) | Transport trait architecture and transport implementations |
 | [quinn-rdma.md](docs/design/quinn-rdma.md) | Quinn QUIC over RDMA design (includes tonic-h3 integration) |
 | [rdma-transport-comparison.md](docs/design/rdma-transport-comparison.md) | Three-way transport comparison (rdma-io vs msquic vs ring) |
+| [TonicRdmaVsTcpPerformance.md](docs/design/TonicRdmaVsTcpPerformance.md) | Why tonic-over-RDMA trails TCP at low concurrency (root-cause analysis) |
+| [EchoBenchmark.md](docs/design/EchoBenchmark.md) | Direct transport-level echo benchmark (`--mode echo`) design and diagrams |
 | [Testing.md](docs/design/Testing.md) | Test strategy and provider compatibility matrix |
 | [RingBufferStream.md](docs/design/RingBufferStream.md) | Ring buffer stream design (RDMA Write alternative) |
 | [BndBindings.md](docs/design/BndBindings.md) | FFI binding generation with bnd |
