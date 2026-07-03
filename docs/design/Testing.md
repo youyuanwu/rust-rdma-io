@@ -625,6 +625,8 @@ sudo rdma link add rxe0 type rxe netdev eth0
 
 **Note**: The out-of-tree build works because `rdma_rxe` resolves its `ib_core`/`ib_uverbs` symbol dependencies at module load time (not compile time). The kernel headers provide the build system and header files; the runtime kernel provides the symbols.
 
+**Note (fetching the source)**: `cmake/BuildRxe.cmake` no longer downloads the full kernel tarball from `cdn.kernel.org` (that CDN has intermittently returned 404s for `/pub` tarballs). Instead it lists `drivers/infiniband/sw/rxe/` via the GitHub Contents API on the `torvalds/linux` mirror at the matching release tag (`v$(uname -r base)`) and downloads only those ~35 files from `raw.githubusercontent.com`. Override the tag/repo with `-DRXE_GIT_REF=<vX.Y>` / `-DRXE_GH_REPO=<owner/repo>` if needed.
+
 **Recommendation**: Use SIW (already available) for local loopback testing on Azure VMs. For CI, use SIW on GitHub Actions via `linux-modules-extra` (our current approach). If rxe-specific tests are needed later, build the module from kernel source (as async-rdma does — adds ~1 min to CI) or use a second CI platform with full kernel access (as sideway does with Cirrus CI on Rocky Linux). If RXE is needed locally on Azure, the simplest path is installing the `linux-generic` kernel package (non-Azure kernel) which includes both rxe and siw, but this is not recommended on production Azure VMs.
 
 ### Implications for CI/Testing
