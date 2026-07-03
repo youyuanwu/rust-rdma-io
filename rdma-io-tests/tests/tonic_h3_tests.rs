@@ -11,7 +11,6 @@ use rdma_io::credit_ring_transport::CreditRingConfig;
 use rdma_io::read_ring_transport::ReadRingConfig;
 use rdma_io::send_recv_transport::SendRecvConfig;
 use rdma_io::transport::TransportBuilder;
-use rdma_io_quinn::RdmaUdpSocket;
 
 use rdma_io_tests::greeter_service::*;
 use rdma_io_tests::require_no_iwarp;
@@ -80,8 +79,7 @@ async fn start_h3_server<B: TransportBuilder>(
     let server_config = make_h3_server_config(certs, key);
     let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
 
-    let server_socket =
-        Arc::new(RdmaUdpSocket::bind(&test_helpers::bind_addr(), builder).expect("server bind"));
+    let server_socket = Arc::new(test_helpers::bind_socket_with_retry(builder, "server").await);
     let connect_addr = test_helpers::connect_addr_for(Some(server_socket.bound_addr()));
 
     let server_endpoint = Endpoint::new_with_abstract_socket(
@@ -121,12 +119,8 @@ async fn make_h3_client_endpoint<B: TransportBuilder>(
 ) -> Endpoint {
     let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
 
-    let client_socket =
-        RdmaUdpSocket::bind(&test_helpers::bind_addr(), builder).expect("client bind");
-    client_socket
-        .connect_to(connect_addr)
-        .await
-        .expect("RDMA pre-connect");
+    let client_socket = test_helpers::bind_socket_with_retry(builder, "client").await;
+    test_helpers::connect_socket_with_retry(&client_socket, connect_addr, "client").await;
 
     let mut endpoint = Endpoint::new_with_abstract_socket(
         EndpointConfig::default(),
