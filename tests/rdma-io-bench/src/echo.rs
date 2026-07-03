@@ -47,6 +47,60 @@ fn new_histogram() -> Histogram<u64> {
     Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).expect("create histogram")
 }
 
+/// Cumulative user+system CPU time of this process (summed over all threads),
+/// in seconds, read from `/proc/self/stat`. Fields 14 (`utime`) and 15
+/// (`stime`) are in clock ticks; Linux `USER_HZ` is 100 on these VMs.
+fn process_cpu_seconds() -> f64 {
+    const USER_HZ: f64 = 100.0;
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    // The comm field (2nd) is wrapped in parens and may itself contain spaces
+    // or parens, so split on the final ')': everything after it is space-
+    // separated starting at field 3 (state).
+    if let Some((_, rest)) = stat.rsplit_once(')') {
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        // utime = field 14 -> index 11, stime = field 15 -> index 12.
+        if fields.len() > 12 {
+            let utime: u64 = fields[11].parse().unwrap_or(0);
+            let stime: u64 = fields[12].parse().unwrap_or(0);
+            return (utime + stime) as f64 / USER_HZ;
+        }
+    }
+    0.0
+}
+
+/// Peak resident set size of this process in kilobytes (`VmHWM` high-water
+/// mark), read from `/proc/self/status`.
+fn peak_rss_kb() -> u64 {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    for line in status.lines() {
+        if let Some(v) = line.strip_prefix("VmHWM:") {
+            return v
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+        }
+    }
+    0
+}
+
+/// Spawn a task that measures this process's CPU consumption strictly over the
+/// `[warmup_deadline, bench_deadline]` window plus the peak RSS, so the reported
+/// CPU-per-op excludes connection setup and warmup. Returns `(cpu_seconds,
+/// peak_rss_kb)`.
+fn spawn_resource_sampler(
+    warmup_deadline: Instant,
+    bench_deadline: Instant,
+) -> tokio::task::JoinHandle<(f64, u64)> {
+    tokio::spawn(async move {
+        tokio::time::sleep_until(tokio::time::Instant::from_std(warmup_deadline)).await;
+        let cpu_start = process_cpu_seconds();
+        tokio::time::sleep_until(tokio::time::Instant::from_std(bench_deadline)).await;
+        let cpu_end = process_cpu_seconds();
+        ((cpu_end - cpu_start).max(0.0), peak_rss_kb())
+    })
+}
+
 /// Print an assembled [`BenchResult`] in the requested format.
 #[allow(clippy::too_many_arguments)]
 fn report_result(
@@ -58,6 +112,8 @@ fn report_result(
     duration: u64,
     payload: usize,
     errors: u64,
+    cpu_seconds: f64,
+    peak_rss_kb: u64,
     report: &str,
 ) {
     let result = BenchResult::from_histogram(
@@ -70,7 +126,8 @@ fn report_result(
         duration,
         payload,
         errors,
-    );
+    )
+    .with_resource_usage(cpu_seconds, peak_rss_kb);
     match report {
         "json" => result.print_json(),
         _ => result.print_text(),
@@ -226,6 +283,8 @@ where
     let bench_deadline = warmup_deadline + Duration::from_secs(duration);
     eprintln!("Warming up {warmup}s, then benchmarking {duration}s...");
 
+    let sampler = spawn_resource_sampler(warmup_deadline, bench_deadline);
+
     let mut handles = Vec::with_capacity(connections);
     for t in transports {
         let p = payload_buf.clone();
@@ -250,6 +309,8 @@ where
         }
     }
 
+    let (cpu_seconds, peak_rss) = sampler.await.unwrap_or((0.0, 0));
+
     report_result(
         &merged,
         transport_label,
@@ -259,6 +320,8 @@ where
         duration,
         payload,
         errors,
+        cpu_seconds,
+        peak_rss,
         report,
     );
     Ok(())
@@ -478,6 +541,8 @@ pub async fn run_tcp_echo_client(
     let bench_deadline = warmup_deadline + Duration::from_secs(duration);
     eprintln!("Warming up {warmup}s, then benchmarking {duration}s...");
 
+    let sampler = spawn_resource_sampler(warmup_deadline, bench_deadline);
+
     let mut handles = Vec::with_capacity(connections);
     for stream in streams {
         let p = payload_buf.clone();
@@ -502,6 +567,8 @@ pub async fn run_tcp_echo_client(
         }
     }
 
+    let (cpu_seconds, peak_rss) = sampler.await.unwrap_or((0.0, 0));
+
     report_result(
         &merged,
         "tcp",
@@ -511,6 +578,8 @@ pub async fn run_tcp_echo_client(
         duration,
         payload,
         errors,
+        cpu_seconds,
+        peak_rss,
         report,
     );
     Ok(())

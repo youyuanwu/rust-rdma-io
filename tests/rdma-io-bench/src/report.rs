@@ -16,6 +16,16 @@ pub struct BenchResult {
     pub throughput_rps: f64,
     pub latency_us: LatencyStats,
     pub errors: u64,
+    /// Client-side user+system CPU seconds consumed during the measured window
+    /// (all threads). Only populated by `--mode echo`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_seconds: Option<f64>,
+    /// CPU microseconds spent per request (`cpu_seconds / total_requests`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_us_per_op: Option<f64>,
+    /// Peak resident set size in kilobytes (process lifetime high-water mark).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_rss_kb: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -68,7 +78,22 @@ impl BenchResult {
                 avg: hist.mean(),
             },
             errors,
+            cpu_seconds: None,
+            cpu_us_per_op: None,
+            peak_rss_kb: None,
         }
+    }
+
+    /// Attach client-side resource usage measured over the benchmark window.
+    pub fn with_resource_usage(mut self, cpu_seconds: f64, peak_rss_kb: u64) -> Self {
+        self.cpu_us_per_op = if self.total_requests > 0 {
+            Some(cpu_seconds / self.total_requests as f64 * 1e6)
+        } else {
+            None
+        };
+        self.cpu_seconds = Some(cpu_seconds);
+        self.peak_rss_kb = Some(peak_rss_kb);
+        self
     }
 
     pub fn print_text(&self) {
@@ -91,6 +116,15 @@ impl BenchResult {
         println!("  max:        {:.1} µs", self.latency_us.max);
         println!("  avg:        {:.1} µs", self.latency_us.avg);
         println!("Errors:       {}", self.errors);
+        if let Some(cpu) = self.cpu_seconds {
+            println!("CPU time:     {cpu:.2} s");
+        }
+        if let Some(cpu_op) = self.cpu_us_per_op {
+            println!("CPU/op:       {cpu_op:.3} µs");
+        }
+        if let Some(rss) = self.peak_rss_kb {
+            println!("Peak RSS:     {rss} KB");
+        }
     }
 
     pub fn print_json(&self) {
