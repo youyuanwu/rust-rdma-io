@@ -251,8 +251,9 @@ async fn pipelined_transfer_default() {
     // a Send arriving with no posted recv buffer is a fatal LOC_QP_OP_ERR rather
     // than a retry. Under CPU contention the post-and-return writer can outrun a
     // starved reader and overrun the recv-buffer pool, which is safe on RoCE but
-    // fatal on iWARP. (Flow-controlled paths — gRPC/h2 and the ring transports —
-    // are unaffected; see concurrent_unary_load.)
+    // fatal on iWARP. (The ring transports are credit/read flow-controlled and
+    // unaffected; the send-recv gRPC/h2 path has the same iWARP limitation — see
+    // concurrent_unary_load_default.)
     require_no_iwarp!();
     pipelined_transfer(SendRecvConfig::stream_with_depth(16)).await;
 }

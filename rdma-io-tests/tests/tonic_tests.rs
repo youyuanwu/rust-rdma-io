@@ -319,6 +319,15 @@ async fn concurrent_unary_load<B: TransportBuilder + Debug>(builder: B) {
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn concurrent_unary_load_default() {
+    // Non-iWARP only. h2 flow control bounds application bytes per stream, not
+    // the number of transport-level Sends posted below the send-recv recv-pool
+    // depth: with several concurrent streams (HEADERS + DATA + trailers each way)
+    // the writer can transiently outrun the reader's recv reposts and overrun
+    // the pool. On RoCE/IB that is RNR NAK (retried); iWARP has no RNR, so the
+    // overrun is a fatal LOC_QP_OP_ERR that tears down the QP and surfaces as a
+    // BrokenPipe transport error. The ring transports (below) are credit/read
+    // flow-controlled and unaffected. See pipelined_transfer_default.
+    require_no_iwarp!();
     concurrent_unary_load(SendRecvConfig::stream_with_depth(8)).await;
 }
 

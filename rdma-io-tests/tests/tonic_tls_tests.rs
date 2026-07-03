@@ -331,6 +331,11 @@ async fn concurrent_unary_load_tls<B: TransportBuilder>(builder: B) {
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn concurrent_unary_load_tls_default() {
+    // Non-iWARP only: same reason as concurrent_unary_load_default — h2 flow
+    // control does not bound transport-level Sends below the send-recv recv-pool
+    // depth, so concurrent streams can overrun it, which is a fatal
+    // LOC_QP_OP_ERR (BrokenPipe) on iWARP (no RNR) but RNR-retried on RoCE/IB.
+    require_no_iwarp!();
     concurrent_unary_load_tls(SendRecvConfig::stream_with_depth(8)).await;
 }
 
