@@ -224,6 +224,22 @@ impl<T: Transport> AsyncRdmaStream<T> {
             )));
         }
 
+        // Writes post-and-return (they do not wait for completion), so without an
+        // explicit check a peer that has gone away stays undetected until the send
+        // ring fills and a write finally blocks. On a fresh write, surface a peer
+        // disconnect up front so a write to a dead peer fails promptly — the
+        // behavior callers relied on before the send pipeline landed. This is
+        // cheap (a cached flag or a single CM-fd poll; no CQ re-arm, unlike
+        // `poll_send_completion`). Skipped while re-polling a blocked write, where
+        // the loop below already checks `poll_disconnect`.
+        if !this.write_blocked && this.transport.poll_disconnect(cx) {
+            this.eof = true;
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "connection closed",
+            )));
+        }
+
         // Post-and-return: try to accept the write; on success return
         // immediately so the send pipelines behind any already-posted sends.
         // On `Ok(0)` (all send buffers in flight / credits exhausted) reap a

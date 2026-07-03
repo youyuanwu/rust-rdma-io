@@ -341,7 +341,17 @@ async fn sends_in_flight_tracking<B: TransportBuilder>(config: B) {
         client.sends_in_flight()
     );
 
-    drain_send_completions(&mut client).await;
+    // Wait for the posted sends to complete. poll_send_completion awaits CQ
+    // readiness (a single non-blocking drain can race the completions on
+    // soft-RoCE, where they are not ready the instant we post).
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while client.sends_in_flight() > 0 {
+        poll_fn(|cx| client.poll_send_completion(cx)).await.unwrap();
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "sends_in_flight did not drain to zero within 5s"
+        );
+    }
     assert_eq!(
         client.sends_in_flight(),
         0,

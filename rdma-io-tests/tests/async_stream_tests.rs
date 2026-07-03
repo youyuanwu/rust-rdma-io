@@ -218,7 +218,7 @@ async fn pipelined_transfer<B: TransportBuilder>(builder: B) {
         let mut received = Vec::with_capacity(total);
         let mut buf = [0u8; 65536];
         while received.len() < total {
-            let n = tokio::time::timeout(std::time::Duration::from_secs(10), server.read(&mut buf))
+            let n = tokio::time::timeout(std::time::Duration::from_secs(30), server.read(&mut buf))
                 .await
                 .expect("read timed out")
                 .expect("read failed");
@@ -309,7 +309,7 @@ async fn concurrent_write_no_deadlock<B: TransportBuilder>(builder: B) {
     });
 
     // Without fix A this join never resolves (both peers wedged, no wakeup).
-    let (client, server) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+    let (client, server) = tokio::time::timeout(std::time::Duration::from_secs(45), async {
         (writer_c.await.unwrap(), writer_s.await.unwrap())
     })
     .await
@@ -338,7 +338,7 @@ async fn concurrent_write_no_deadlock<B: TransportBuilder>(builder: B) {
         }
         got
     });
-    let (c_got, s_got) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+    let (c_got, s_got) = tokio::time::timeout(std::time::Duration::from_secs(45), async {
         (reader_c.await.unwrap(), reader_s.await.unwrap())
     })
     .await

@@ -698,6 +698,60 @@ impl CreditRingTransport {
         }
         Ok(())
     }
+
+    /// Process a batch of send-CQ work completions: release `send_ring` for data
+    /// WRs and decrement `send_in_flight`. Credit/padding WRs occupy no local
+    /// ring space. Returns `Err` (and marks the peer disconnected) on a failed
+    /// completion. Shared by [`poll_send_completion`](Transport::poll_send_completion)
+    /// and [`drain_send_cq`](Self::drain_send_cq).
+    fn process_send_completions(&mut self, wcs: &[WorkCompletion]) -> crate::Result<()> {
+        for wc in wcs {
+            if !wc.is_success() {
+                self.peer_disconnected = true;
+                return Err(crate::Error::WorkCompletion {
+                    status: wc.status_raw(),
+                    vendor_err: wc.vendor_err(),
+                });
+            }
+            let wr_id = wc.wr_id();
+            if wr_id & WR_ID_CREDIT_FLAG != 0 {
+                // Credit WR — no ring space to free.
+            } else if wr_id == WR_ID_PADDING_SENTINEL {
+                // Padding WR — no local ring space to free (padding was at ring end).
+            } else {
+                // Data WR — wr_id lower bits encode data_len. Release send_ring.
+                // For RC QPs, completions arrive in-order, so simple head advance works.
+                let data_len = wr_id as usize;
+                if data_len > 0 && data_len <= self.send_ring.capacity {
+                    self.send_ring.release(data_len);
+                }
+            }
+            self.send_in_flight = self.send_in_flight.saturating_sub(1);
+        }
+        Ok(())
+    }
+
+    /// Non-blocking reap of the local send CQ (direct `ibv_poll_cq`, no
+    /// notification arm). A pure-reader stream drives only `poll_recv` /
+    /// `repost_recv` and never calls `poll_send_completion`, so its credit
+    /// `Send` completions would otherwise accumulate until the send queue
+    /// saturates (`send_in_flight == sq_capacity`) and it can no longer post
+    /// credit updates — stalling the writer, which never regains credits.
+    /// `poll_recv` calls this so a reader keeps its own send queue drained.
+    /// Safe alongside the async send path: the stream is driven by a single
+    /// task, and this uses a plain poll (no `req_notify`), so it does not
+    /// disturb `send_cq_state`.
+    fn drain_send_cq(&mut self) -> crate::Result<()> {
+        let mut wc_buf = [WorkCompletion::default(); 8];
+        loop {
+            let n = self.qp.send_cq().cq().poll(&mut wc_buf)?;
+            if n == 0 {
+                break;
+            }
+            self.process_send_completions(&wc_buf[..n])?;
+        }
+        Ok(())
+    }
 }
 
 impl Transport for CreditRingTransport {
@@ -848,28 +902,8 @@ impl Transport for CreditRingTransport {
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             Poll::Ready(Ok(n)) => n,
         };
-        for wc in &wc_buf[..n] {
-            if !wc.is_success() {
-                self.peer_disconnected = true;
-                return Poll::Ready(Err(crate::Error::WorkCompletion {
-                    status: wc.status_raw(),
-                    vendor_err: wc.vendor_err(),
-                }));
-            }
-            let wr_id = wc.wr_id();
-            if wr_id & WR_ID_CREDIT_FLAG != 0 {
-                // Credit WR — no ring space to free.
-            } else if wr_id == WR_ID_PADDING_SENTINEL {
-                // Padding WR — no local ring space to free (padding was at ring end).
-            } else {
-                // Data WR — wr_id lower bits encode data_len. Release send_ring.
-                // For RC QPs, completions arrive in-order, so simple head advance works.
-                let data_len = wr_id as usize;
-                if data_len > 0 && data_len <= self.send_ring.capacity {
-                    self.send_ring.release(data_len);
-                }
-            }
-            self.send_in_flight = self.send_in_flight.saturating_sub(1);
+        if let Err(e) = self.process_send_completions(&wc_buf[..n]) {
+            return Poll::Ready(Err(e));
         }
         // Reaping freed send-queue slots; flush any credit update that was
         // deferred while the queue was full.
@@ -903,6 +937,19 @@ impl Transport for CreditRingTransport {
 
         if filled >= out.len() {
             return Poll::Ready(Ok(filled));
+        }
+
+        // Reap our own send CQ (non-blocking) so a pure-reader stream drains its
+        // credit `Send` completions and can keep posting credit updates. Without
+        // this, `send_in_flight` saturates and the writer stalls waiting for
+        // credits it never regains. Also flush any credit deferred while full.
+        if let Err(e) = self.drain_send_cq() {
+            self.peer_disconnected = true;
+            return Poll::Ready(Err(e));
+        }
+        if let Err(e) = self.flush_credits() {
+            self.peer_disconnected = true;
+            return Poll::Ready(Err(e));
         }
 
         // Poll recv CQ. Loop to handle batches that contain only credit/padding
