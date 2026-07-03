@@ -273,3 +273,63 @@ async fn bidi_stream_read_ring() {
     require_no_iwarp!();
     bidi_stream(ReadRingConfig::default()).await;
 }
+
+// ===========================================================================
+// concurrent_unary_load — N concurrent in-flight unary RPCs multiplexed over a
+// single h2 connection, sustained over several rounds. Mirrors the bench tool's
+// `--in-flight` knob (concurrent RPCs per connection) at unit-test scale, and
+// is the regression guard for the concurrent-RPC gRPC-over-RDMA path the
+// read-ring deadlock lived in (docs/bugs/read-ring-concurrent-stream-deadlock.md).
+// ===========================================================================
+
+async fn concurrent_unary_load<B: TransportBuilder + Debug>(builder: B) {
+    let (client, shutdown_tx, server_handle) = start_server_and_connect(builder).await;
+
+    const IN_FLIGHT: usize = 8;
+    const ROUNDS: usize = 8;
+    // Small payload mirrors the deadlock repro (64 B); embedded in the name so
+    // the echoed response is checkable.
+    let payload = "x".repeat(64);
+
+    for round in 0..ROUNDS {
+        let mut handles = Vec::with_capacity(IN_FLIGHT);
+        for i in 0..IN_FLIGHT {
+            let mut c = client.clone(); // clones share the one h2 connection
+            let name = format!("{payload}-{round}-{i}");
+            handles.push(tokio::spawn(async move {
+                let resp = tokio::time::timeout(
+                    Duration::from_secs(20),
+                    c.say_hello(Request::new(HelloRequest { name: name.clone() })),
+                )
+                .await
+                .expect("concurrent gRPC call timed out")
+                .expect("concurrent gRPC call failed");
+                assert_eq!(resp.into_inner().message, format!("Hello {name}!"));
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+    }
+
+    drop(client);
+    shutdown_tx.send(()).unwrap();
+    server_handle.await.unwrap();
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn concurrent_unary_load_default() {
+    concurrent_unary_load(SendRecvConfig::stream_with_depth(8)).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn concurrent_unary_load_ring() {
+    require_no_iwarp!();
+    concurrent_unary_load(CreditRingConfig::default()).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn concurrent_unary_load_read_ring() {
+    require_no_iwarp!();
+    concurrent_unary_load(ReadRingConfig::default()).await;
+}
