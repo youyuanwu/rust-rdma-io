@@ -68,7 +68,7 @@ jobs:
         run: |
           for i in $(seq 1 5); do
             echo "=== Test run $i/5 ==="
-            cargo test -p rdma-io-tests -- --nocapture
+            cargo test --workspace
             sleep 3
           done
         timeout-minutes: 30
@@ -124,7 +124,7 @@ jobs:
         run: |
           for i in $(seq 1 5); do
             echo "=== Test run $i/5 ==="
-            cargo test -p rdma-io-tests -- --nocapture
+            cargo test --workspace
             sleep 3
           done
         timeout-minutes: 30
