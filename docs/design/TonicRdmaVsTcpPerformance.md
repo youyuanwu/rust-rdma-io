@@ -1,7 +1,7 @@
 # Why tonic-over-RDMA trails TCP at low concurrency
 
-**Status:** Analysis
-**Date:** 2026-07-01
+**Status:** Analysis + fix (multiple-in-flight implemented 2026-07-03)
+**Date:** 2026-07-01 (updated 2026-07-03)
 **Context:** MANA RoCEv2 preview, `rdma-io-bench` gRPC matrix (rh2 = tonic/HTTP-2
 over RDMA, tcp = tonic-tls over kernel TCP). Both paths run TLS.
 
@@ -24,6 +24,11 @@ queue depth) and the current stream mechanics.
 **Key evidence it is *not* a fundamental deficit:** the same stack scales ~4× to
 **~161k req/s at 64×64**. The 8×8 result is **latency-/concurrency-bound**, not a
 transport ceiling.
+
+> **Resolved (2026-07-03).** The one-signaled-send-in-flight write gate was the
+> limiter. With an N-deep send pipeline + concurrent RPCs, rh2 reaches **TCP
+> parity** (send-recv within ~4 %, credit-ring within ~0.3 % at 32×32/if16). See
+> the [Update](#update-2026-07-03-multiple-in-flight-implemented) section.
 
 ---
 
@@ -98,6 +103,9 @@ Ordered by expected impact on the low-concurrency small-message case:
    [StreamImprovements.md](../future/StreamImprovements.md#2-double-buffered-sends)
    (generalize the 2-slot design to N slots). **These are two separable changes
    with very different portability — see [below](#transport-applicability-of-fix-1).**
+   **✅ Multiple-in-flight is implemented (2026-07-03) — measured 2.7–3.4×; see
+   the [Update](#update-2026-07-03-multiple-in-flight-implemented) section below.
+   Selective signaling is still open.**
 2. **Inline data for small messages** (`max_inline_data = 64`) — eliminates a
    PCIe DMA-read per small send. See
    [StreamImprovements.md](../future/StreamImprovements.md#1-enable-inline-data-for-small-messages).
@@ -148,6 +156,125 @@ must drain the final unsignaled batch before returning / sending DREQ.
 change); selective signaling is achievable on all three but is trivial for
 send-recv, a release-accounting rework for credit-ring, and additionally a
 mixed-CQ concern for read-ring.
+
+---
+
+## Update (2026-07-03): multiple-in-flight implemented
+
+Fix #1 (multiple sends in flight) — and the client-side concurrency needed to
+exercise it — are now implemented and measured. Two changes.
+
+### 1. Stream layer: post-and-return, N-deep pipeline
+
+[`AsyncRdmaStream::poll_write_slice`](../../rdma-io/src/async_stream.rs) no longer
+posts one signaled send and blocks on its completion. It now **posts and returns
+immediately**, letting consecutive writes keep up to the transport's send-buffer
+count outstanding at once. The single-slot `write_pending: Option<usize>` gate is
+replaced by a `write_blocked: bool` (scratch-preservation only).
+
+Pattern / invariants:
+
+- **Backpressure comes from the transport, not a stream-level counter.**
+  `send_copy` returns `Ok(0)` when every send buffer is in flight (send-recv) or
+  credits are exhausted (rings); only then does the stream reap a completion and
+  retry. On a successful post it returns `Ok(n)` *without* waiting — matching
+  TCP's "accepted into the buffer, not yet ACKed" semantics (the payload is
+  already copied into the registered MR, so the caller's buffer is free to reuse).
+- **`poll_flush` stays a no-op** — a posted send is already on the wire. Only
+  `poll_close` must drain: it waits for the new `Transport::sends_in_flight()` to
+  reach 0 before `disconnect()`, so pipelined sends are delivered rather than
+  flushed by the QP's transition to ERROR.
+- **Sizing:** `SendRecvConfig::stream_with_depth(depth)` sizes `num_send_bufs`
+  (and matching recv buffers) so the QP can actually hold `depth` sends; both
+  peers must be sized for the depth they intend to pipeline. `stream()` (depth 1)
+  is unchanged. The ring transports already allow many in-flight via credits.
+- **Gotcha (bit us during bring-up).** The blocked-write path drains the recv CQ
+  to catch ring credit updates, and that poll is *destructive*. For send-recv
+  those completions are real **responses**, so they must be stashed
+  (`recv_stash`) and served by `poll_read` before it polls the transport —
+  otherwise responses are dropped and the client hangs (every run timed out until
+  the stash was added).
+
+### 2. Benchmark: `--in-flight` drives concurrent RPCs per connection
+
+A deep transport pipeline only fills if the application keeps multiple requests
+outstanding. The gRPC client's `--in-flight N`
+([client.rs](../../tests/rdma-io-bench/src/client.rs)) now spawns `N` concurrent
+request loops per connection (each an independent `say_hello` loop sharing the
+connection's `Channel`); h2 multiplexes them as concurrent streams over the one
+RDMA connection. The server takes a matching `--in-flight` to size its stream
+depth. (Previously `--in-flight` was echo-mode only and the gRPC path was
+hard-wired to one outstanding RPC per connection.)
+
+### Measured (rh2/send-recv, 64 B, MANA RoCEv2, 0 errors everywhere)
+
+**32×32 depth sweep:**
+
+| in_flight | rps | p50 µs | p99 µs | vs if=1 |
+|----:|----:|----:|----:|----:|
+| 1 | 159,786 | 190 | 350 | 1.00× |
+| 2 | 249,978 | 249 | 413 | 1.56× |
+| 4 | 331,149 | 378 | 658 | 2.07× |
+| 8 | 327,919 | 533 | 1,032 | 2.05× |
+| 16 | 415,286 | 1,118 | 2,177 | 2.60× |
+| 32 | 452,955 | 2,151 | 4,183 | 2.83× |
+
+**64×64:**
+
+| in_flight | rps | p50 µs | p99 µs | vs if=1 |
+|----:|----:|----:|----:|----:|
+| 1 | 193,795 | 312 | 642 | 1.00× |
+| 8 | 531,684 | 619 | 1,175 | 2.74× |
+
+At 64×64 the stream layer went from the original one-in-flight **~156k** (top of
+this doc) to **531.7k** — **3.4×** — with zero errors.
+
+### The pattern: depth trades latency for throughput (Little's Law)
+
+Throughput rises monotonically with depth while p50 grows roughly linearly,
+exactly as `rps ≈ concurrency / latency` predicts. Depth is a **tuning knob**,
+not a free win:
+
+- **if=2** — cheapest win: +56 % rps for +30 % p50.
+- **if=4** — the knee: ~2× rps at ~2× p50 (378 µs). Good default for a
+  latency-sensitive service.
+- **if=16–32** — throughput mode: up to ~2.8×, but p50 balloons 6–11×.
+
+This is the same pipelining lesson the raw-transport echo benchmark showed
+([EchoBenchmark.md](EchoBenchmark.md) §8), now applied one layer up through
+gRPC/HTTP-2. Reproduce with e.g.
+`just run-bench mode=rh2 transport=send-recv connections=32 threads=32 in_flight=8`.
+
+### At tuned depth, gRPC-over-RDMA reaches TCP parity
+
+The gap this doc opens with — rh2 *trailing* the TCP baseline — closes once both
+run at the same application concurrency. Matrix at **32×32, in_flight=16, 64 B,
+0 errors** (`just bench-matrix "rh2 tcp" "send-recv read-ring credit-ring" 32 10 64 true 0 true 16`):
+
+| transport | rps | p50 µs | p99 µs |
+|---|---:|---:|---:|
+| rh2 / send-recv | 411,552 | 1,131 | 2,195 |
+| rh2 / credit-ring | 425,905 | 1,168 | 2,303 |
+| rh2 / read-ring | — (CM wedge, unmeasured) | | |
+| tcp baseline | 427,034 | 1,148 | 2,355 |
+
+send-recv lands within ~4 % of TCP and credit-ring within ~0.3 %, with p50/p99
+essentially identical (RDMA's p50 is marginally lower). Contrast the depth-1
+numbers at the top of this doc (8×8: ~40k vs ~50k; 64×64: 156k vs 227k, ~30 %
+behind).
+
+Two honest caveats:
+
+- **TCP scales with the same knob.** `--in-flight` is concurrent RPCs per
+  connection, which helps *both* stacks; TCP rose from ~227k (depth 1) to 427k
+  here. So this is RDMA **catching up to** TCP on raw gRPC throughput, not beating
+  it. RDMA's standing win is **CPU efficiency per op** (see the raw-transport echo
+  results in [EchoBenchmark.md](EchoBenchmark.md) §8), not req/s.
+- **read-ring is capped at `in_flight = 1`** over gRPC — it has a known
+  concurrent-stream deadlock (bidirectional send-queue-full / doorbell RNR stall;
+  see [read-ring-concurrent-stream-deadlock.md](../bugs/read-ring-concurrent-stream-deadlock.md)),
+  so the benchmark client forces its depth to 1 until that transport fix lands.
+  send-recv and credit-ring are the pipelined RDMA gRPC transports on this NIC.
 
 ---
 
@@ -236,7 +363,7 @@ a config tweak.
 
 ## References
 
-- [async_stream.rs](../../rdma-io/src/async_stream.rs) — send state machine (`poll_write_slice`, one-in-flight `write_pending`)
+- [async_stream.rs](../../rdma-io/src/async_stream.rs) — send state machine (`poll_write_slice`, N-deep post-and-return pipeline; drains `sends_in_flight()` on close)
 - [send_recv_transport.rs](../../rdma-io/src/send_recv_transport.rs) — `send_copy` (signaled send, MR copy)
 - [credit_ring_transport.rs](../../rdma-io/src/credit_ring_transport.rs) — push-credit flow control, `max_outstanding = ring_capacity / max_message_size`
 - [read_ring_transport.rs](../../rdma-io/src/read_ring_transport.rs) — pull flow control (RDMA-Read offset refresh)

@@ -55,6 +55,26 @@ impl SendRecvConfig {
         }
     }
 
+    /// Stream configuration sized to keep `depth` sends outstanding.
+    ///
+    /// [`stream`](Self::stream) posts one signaled send at a time; that caps a
+    /// byte stream (and therefore gRPC/HTTP-2 over it) to a single in-flight
+    /// RDMA message per connection. Sizing `num_send_bufs` (and matching recv
+    /// buffers) to `depth` lets [`AsyncRdmaStream`](crate::async_stream::AsyncRdmaStream)
+    /// pipeline up to `depth` posted sends before it must reap a completion —
+    /// the mechanism the echo benchmark uses to raise throughput. Both peers
+    /// must be sized for the depth they intend to pipeline.
+    pub fn stream_with_depth(depth: usize) -> Self {
+        let depth = depth.max(1);
+        Self {
+            buf_size: 64 * 1024,
+            num_recv_bufs: (depth + 2).max(8),
+            num_send_bufs: (depth + 1).max(2),
+            max_inline_data: 0,
+            qp_type: QpType::Rc,
+        }
+    }
+
     /// Configuration tuned for datagram workloads (Quinn/QUIC).
     pub fn datagram() -> Self {
         Self {
@@ -301,6 +321,10 @@ impl Transport for SendRecvTransport {
             }
         }
         Poll::Ready(Ok(()))
+    }
+
+    fn sends_in_flight(&self) -> usize {
+        self.send_in_flight.iter().filter(|&&busy| busy).count()
     }
 
     fn poll_recv(

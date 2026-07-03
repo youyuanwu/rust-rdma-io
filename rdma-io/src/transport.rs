@@ -90,6 +90,14 @@ pub trait Transport: Send + Sync {
     /// send completion was successfully reaped.
     fn poll_send_completion(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>>;
 
+    /// Number of sends posted but not yet reaped by
+    /// [`poll_send_completion`](Self::poll_send_completion).
+    ///
+    /// Stream adapters use this to drain the send pipeline on close before
+    /// tearing the connection down, so already-posted data is delivered rather
+    /// than flushed when the QP transitions to ERROR.
+    fn sends_in_flight(&self) -> usize;
+
     // --- Recv path ---
 
     /// Poll for recv completions.

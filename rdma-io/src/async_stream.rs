@@ -68,8 +68,17 @@ pub struct AsyncRdmaStream<T: Transport> {
     transport: T,
     /// Partially consumed recv: (buf_index, offset, total_len).
     recv_pending: Option<(usize, usize, usize)>,
-    /// In-flight send length. None if send slot is free.
-    write_pending: Option<usize>,
+    /// Recv completions reaped by the *write* path (while draining the recv CQ
+    /// for ring credit updates) that carried real data. Stashed here — as
+    /// `(buf_idx, byte_len)` — so [`poll_read`](AsyncRead::poll_read) serves
+    /// them before polling the transport, instead of the write path dropping
+    /// the bytes on the floor.
+    recv_stash: std::collections::VecDeque<(usize, usize)>,
+    /// Set when the last write could not be posted (all transport send buffers
+    /// in flight / ring credits exhausted) and returned `Pending`. While set,
+    /// the coalescing scratch must be preserved so a re-poll re-presents the
+    /// exact bytes that still need posting.
+    write_blocked: bool,
     /// Reusable buffer for coalescing vectored writes into one send.
     /// Grows to a high-water mark (capped at [`MAX_GATHER`]); reused across
     /// calls to avoid per-write allocation.
@@ -90,7 +99,8 @@ impl<T: Transport> fmt::Debug for AsyncRdmaStream<T> {
             .field("peer_addr", &self.transport.peer_addr())
             .field("eof", &self.eof)
             .field("recv_pending", &self.recv_pending.is_some())
-            .field("write_pending", &self.write_pending.is_some())
+            .field("write_blocked", &self.write_blocked)
+            .field("sends_in_flight", &self.transport.sends_in_flight())
             .finish()
     }
 }
@@ -101,7 +111,8 @@ impl<T: Transport> AsyncRdmaStream<T> {
         Self {
             transport,
             recv_pending: None,
-            write_pending: None,
+            recv_stash: std::collections::VecDeque::new(),
+            write_blocked: false,
             write_scratch: Vec::new(),
             eof: false,
         }
@@ -149,11 +160,20 @@ impl<T: Transport> AsyncRdmaStream<T> {
 impl<T: Transport> AsyncRdmaStream<T> {
     /// Core send state machine for a single contiguous slice.
     ///
-    /// Posts `buf` as one transport send (if none is in flight) and drives it
-    /// to completion. Only one send is outstanding at a time (`write_pending`),
-    /// so a re-poll after `Pending` skips re-posting and just waits for the
-    /// in-flight send. Shared by [`poll_write`](AsyncWrite::poll_write) and the
-    /// coalescing [`poll_write_vectored`](AsyncWrite::poll_write_vectored).
+    /// Posts `buf` as one transport send and returns as soon as it is *accepted*
+    /// (copied into a registered send buffer and posted), **without** waiting for
+    /// its completion. This lets consecutive writes keep up to the transport's
+    /// send-buffer count outstanding at once — the pipelining the echo benchmark
+    /// relies on — instead of paying a full post→completion round trip per write.
+    ///
+    /// Backpressure comes from the transport: `send_copy` returns `Ok(0)` once
+    /// every send buffer is in flight (or ring credits are exhausted). When that
+    /// happens this reaps a completion to free a buffer and retries; if none is
+    /// ready it registers the CQ waker(s) and returns `Pending` (leaving
+    /// `write_blocked` set so the coalescing scratch is preserved).
+    ///
+    /// Shared by [`poll_write`](AsyncWrite::poll_write) and the coalescing
+    /// [`poll_write_vectored`](AsyncWrite::poll_write_vectored).
     fn poll_write_slice(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         let this = self;
 
@@ -162,38 +182,62 @@ impl<T: Transport> AsyncRdmaStream<T> {
         }
 
         if this.eof {
-            this.write_pending = None;
+            this.write_blocked = false;
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "connection closed",
             )));
         }
 
-        // Post send if not already in progress
-        if this.write_pending.is_none() {
+        // Post-and-return: try to accept the write; on success return
+        // immediately so the send pipelines behind any already-posted sends.
+        // On `Ok(0)` (all send buffers in flight / credits exhausted) reap a
+        // completion and retry; the loop terminates because the send queue is
+        // finite, so `poll_send_completion` eventually returns `Pending` with a
+        // waker armed.
+        loop {
             match this.transport.send_copy(buf) {
-                Ok(0) => {
-                    // All send buffers occupied or credits exhausted.
-                    // Poll recv CQ to register a waker for incoming credit
-                    // updates (ring transport sends credits via Send+Imm on
-                    // the recv CQ). Without this, credit-blocked writes deadlock
-                    // because poll_send_completion only watches the send CQ.
-                    let mut completions = [RecvCompletion::default(); 1];
-                    let _ = this.transport.poll_recv(cx, &mut completions);
-                }
+                Ok(0) => {}
                 Ok(n) => {
-                    this.write_pending = Some(n);
+                    this.write_blocked = false;
+                    return Poll::Ready(Ok(n));
                 }
-                Err(e) => return Poll::Ready(Err(io::Error::other(e))),
+                Err(e) => {
+                    this.write_blocked = false;
+                    return Poll::Ready(Err(io::Error::other(e)));
+                }
             }
-        }
 
-        // If we haven't posted yet (buffers full), wait then retry
-        if this.write_pending.is_none() {
+            // Blocked. Keep the scratch (vectored path) pinned until we post.
+            this.write_blocked = true;
+
+            // Ring transports deliver credit updates on the recv CQ; poll it so
+            // replenished credits re-arm this task's waker. Without this, a
+            // credit-blocked write would only watch the send CQ and could stall.
+            // The poll is destructive, so any *data* completion it reaps (e.g. a
+            // response that arrived while we were send-blocked) must be stashed
+            // for `poll_read` rather than dropped.
+            let mut completions = [RecvCompletion::default(); 1];
+            if let Poll::Ready(Ok(got)) = this.transport.poll_recv(cx, &mut completions) {
+                for c in &completions[..got] {
+                    if c.byte_len > 0 {
+                        this.recv_stash.push_back((c.buf_idx, c.byte_len));
+                    }
+                }
+            }
+
+            // Reap a send completion to free a buffer, then retry the post.
             match this.transport.poll_send_completion(cx) {
+                Poll::Ready(Ok(())) => continue,
+                Poll::Ready(Err(e)) => {
+                    this.eof = true;
+                    this.write_blocked = false;
+                    return Poll::Ready(Err(io::Error::other(e)));
+                }
                 Poll::Pending => {
                     if this.transport.poll_disconnect(cx) {
                         this.eof = true;
+                        this.write_blocked = false;
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::BrokenPipe,
                             "connection closed",
@@ -201,47 +245,6 @@ impl<T: Transport> AsyncRdmaStream<T> {
                     }
                     return Poll::Pending;
                 }
-                Poll::Ready(Err(e)) => {
-                    this.eof = true;
-                    return Poll::Ready(Err(io::Error::other(e)));
-                }
-                Poll::Ready(Ok(())) => match this.transport.send_copy(buf) {
-                    Ok(0) => {
-                        // Still blocked (credit exhaustion for ring transport).
-                        // Poll recv CQ to register a waker — credit updates
-                        // arrive as Send+Imm on the recv CQ, not the send CQ.
-                        let mut completions = [RecvCompletion::default(); 1];
-                        let _ = this.transport.poll_recv(cx, &mut completions);
-                        return Poll::Pending;
-                    }
-                    Ok(n) => this.write_pending = Some(n),
-                    Err(e) => return Poll::Ready(Err(io::Error::other(e))),
-                },
-            }
-        }
-        let len = this.write_pending.unwrap();
-
-        // Wait for THIS send's completion
-        match this.transport.poll_send_completion(cx) {
-            Poll::Pending => {
-                if this.transport.poll_disconnect(cx) {
-                    this.eof = true;
-                    this.write_pending = None;
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "connection closed",
-                    )));
-                }
-                Poll::Pending
-            }
-            Poll::Ready(Err(e)) => {
-                this.eof = true;
-                this.write_pending = None;
-                Poll::Ready(Err(io::Error::other(e)))
-            }
-            Poll::Ready(Ok(())) => {
-                this.write_pending = None;
-                Poll::Ready(Ok(len))
             }
         }
     }
@@ -276,10 +279,10 @@ impl<T: Transport> AsyncRdmaStream<T> {
         }
 
         // Coalesce the slices into the reusable scratch buffer. Only rebuild
-        // when no send is in flight; while a send is pending the scratch must
-        // keep the exact bytes/length already posted so the state machine can
-        // complete it (a re-poll after `Pending` presents the same slices).
-        if self.write_pending.is_none() {
+        // when the previous poll actually posted; while a post is blocked
+        // (`write_blocked`) the scratch must keep the exact bytes/length still
+        // pending so the state machine re-presents them on the next poll.
+        if !self.write_blocked {
             self.write_scratch.clear();
             for b in bufs {
                 if b.is_empty() {
@@ -304,31 +307,38 @@ impl<T: Transport> AsyncRdmaStream<T> {
         res
     }
 
-    /// Graceful close: drain any in-flight send, then send DREQ.
+    /// Graceful close: drain all in-flight sends, then send DREQ.
     ///
     /// Shared by the `futures_io` `poll_close` and the `tokio` `poll_shutdown`.
+    /// Writes return once a send is *posted* (not completed), so on close the
+    /// pipeline may hold several outstanding sends. Drain them before
+    /// disconnecting so the posted data is delivered rather than flushed by the
+    /// QP's transition to ERROR.
     fn poll_close_impl(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if self.eof {
-            self.write_pending = None;
+            self.write_blocked = false;
             return Poll::Ready(Ok(()));
         }
 
-        // Phase 1: Drain pending send completion before disconnecting.
-        if self.write_pending.is_some() {
+        // Phase 1: Drain every in-flight send before disconnecting.
+        while self.transport.sends_in_flight() > 0 {
             match self.transport.poll_send_completion(cx) {
+                Poll::Ready(Ok(())) => continue,
+                Poll::Ready(Err(_)) => {
+                    self.eof = true;
+                    break;
+                }
                 Poll::Pending => {
                     if self.transport.poll_disconnect(cx) {
                         self.eof = true;
-                        self.write_pending = None;
+                        self.write_blocked = false;
                         return Poll::Ready(Ok(()));
                     }
                     return Poll::Pending;
                 }
-                Poll::Ready(_) => {
-                    self.write_pending = None;
-                }
             }
         }
+        self.write_blocked = false;
 
         // Phase 2: Send DREQ and complete.
         //
@@ -367,6 +377,19 @@ impl<T: Transport> AsyncRdmaStream<T> {
                 self.recv_pending = Some((buf_idx, offset + copy_len, total_len));
             } else {
                 self.recv_pending = None;
+                let _ = self.transport.repost_recv(buf_idx);
+            }
+            return Poll::Ready(Ok(()));
+        }
+
+        // Phase 1.5: Serve a completion the write path stashed while draining
+        // the recv CQ for credit updates (so those bytes are not lost).
+        if let Some((buf_idx, byte_len)) = self.recv_stash.pop_front() {
+            let copy_len = byte_len.min(buf.remaining());
+            buf.put_slice(&self.transport.recv_buf(buf_idx)[..copy_len]);
+            if copy_len < byte_len {
+                self.recv_pending = Some((buf_idx, copy_len, byte_len));
+            } else {
                 let _ = self.transport.repost_recv(buf_idx);
             }
             return Poll::Ready(Ok(()));
@@ -440,6 +463,19 @@ impl<T: Transport> AsyncRead for AsyncRdmaStream<T> {
                 this.recv_pending = None;
                 // Repost failure is non-fatal — data is already delivered.
                 // The buffer is lost, but the QP ERROR will be detected on next poll.
+                let _ = this.transport.repost_recv(buf_idx);
+            }
+            return Poll::Ready(Ok(copy_len));
+        }
+
+        // Phase 1.5: Serve a completion the write path stashed while draining
+        // the recv CQ for credit updates (so those bytes are not lost).
+        if let Some((buf_idx, byte_len)) = this.recv_stash.pop_front() {
+            let copy_len = byte_len.min(buf.len());
+            buf[..copy_len].copy_from_slice(&this.transport.recv_buf(buf_idx)[..copy_len]);
+            if copy_len < byte_len {
+                this.recv_pending = Some((buf_idx, copy_len, byte_len));
+            } else {
                 let _ = this.transport.repost_recv(buf_idx);
             }
             return Poll::Ready(Ok(copy_len));

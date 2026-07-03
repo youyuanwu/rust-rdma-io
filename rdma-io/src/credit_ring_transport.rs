@@ -860,6 +860,10 @@ impl Transport for CreditRingTransport {
         Poll::Ready(Ok(()))
     }
 
+    fn sends_in_flight(&self) -> usize {
+        self.send_in_flight
+    }
+
     fn poll_recv(
         &mut self,
         cx: &mut Context<'_>,

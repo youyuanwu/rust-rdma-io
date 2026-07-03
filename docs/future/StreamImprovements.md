@@ -73,6 +73,15 @@ let flags = if length <= self.sq_inline_threshold {
 
 ### 2. Double-Buffered Sends
 
+> **✅ Implemented (2026-07-03), generalized to an N-deep pipeline.**
+> [`AsyncRdmaStream::poll_write_slice`](../../rdma-io/src/async_stream.rs) now
+> posts-and-returns instead of blocking on each send's completion, keeping up to
+> the transport's send-buffer count outstanding; `SendRecvConfig::stream_with_depth(depth)`
+> sizes the buffers. Measured **2.7–3.4×** gRPC throughput on MANA RoCEv2 (see
+> [TonicRdmaVsTcpPerformance.md](../design/TonicRdmaVsTcpPerformance.md#update-2026-07-03-multiple-in-flight-implemented)).
+> The design sketch below (fixed 2 slots) is superseded by the N-slot
+> implementation, but the ordering/`poll_flush`/`poll_close` reasoning still holds.
+
 **Effort:** Medium | **Impact:** Throughput for bulk/streaming data only
 
 **Problem:** `write_pending` gates poll_write to exactly 1 send in-flight. The send path is:

@@ -45,7 +45,10 @@ struct Args {
     #[arg(long, default_value_t = 2)]
     connections: usize,
 
-    /// Requests kept outstanding per connection (echo mode only).
+    /// Requests kept outstanding per connection. In `echo` mode this is the
+    /// transport-level pipeline depth; in the gRPC modes (`rh2`/`rh3`/`tcp`) it
+    /// is the number of concurrent in-flight RPCs issued per connection (h2/h3
+    /// multiplex them over the one connection).
     #[arg(long, default_value_t = 1)]
     in_flight: usize,
 
@@ -56,11 +59,13 @@ struct Args {
     #[arg(long, default_value_t = 1500)]
     ring_max_msg: usize,
 
-    /// Ring transport in-flight message budget (echo mode only). 0 = derive from
-    /// `ring_capacity / ring_max_msg`. Set >0 to size the send/doorbell/CQ queues
-    /// for that many in-flight messages independently of the message size.
+    /// Ring transport send-queue depth (advanced; echo mode only). Sizes the
+    /// send/doorbell/CQ queues for this many in-flight messages, independent of
+    /// `--ring-max-msg`. 0 = derive from `ring_capacity / ring_max_msg` (which
+    /// undercounts small messages). This is the transport-level queue budget,
+    /// distinct from the application-level `--in-flight`.
     #[arg(long, default_value_t = 0)]
-    ring_max_inflight: usize,
+    ring_queue_depth: usize,
 
     #[arg(long, default_value_t = 10)]
     duration: u64,
@@ -161,8 +166,8 @@ async fn run_echo_bench(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             warn_ring_payload(args.payload, args.ring_max_msg);
             let mut config = ReadRingConfig::datagram().with_mr_rkey_fallback(args.mw_fallback);
             config.max_message_size = args.ring_max_msg;
-            if args.ring_max_inflight > 0 {
-                config.max_in_flight = Some(args.ring_max_inflight);
+            if args.ring_queue_depth > 0 {
+                config.max_in_flight = Some(args.ring_queue_depth);
             }
             run_echo_bench_with(args, config, "read-ring").await
         }
@@ -170,8 +175,8 @@ async fn run_echo_bench(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             warn_ring_payload(args.payload, args.ring_max_msg);
             let mut config = CreditRingConfig::datagram().with_mr_rkey_fallback(args.mw_fallback);
             config.max_message_size = args.ring_max_msg;
-            if args.ring_max_inflight > 0 {
-                config.max_in_flight = Some(args.ring_max_inflight);
+            if args.ring_queue_depth > 0 {
+                config.max_in_flight = Some(args.ring_queue_depth);
             }
             run_echo_bench_with(args, config, "credit-ring").await
         }
@@ -224,7 +229,15 @@ async fn run_tls_bench(
     payload: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match args.transport.as_str() {
-        "send-recv" => run_tls_bench_with(args, uri, payload, SendRecvConfig::stream()).await,
+        "send-recv" => {
+            run_tls_bench_with(
+                args,
+                uri,
+                payload,
+                SendRecvConfig::stream_with_depth(args.in_flight),
+            )
+            .await
+        }
         "read-ring" => {
             run_tls_bench_with(
                 args,
@@ -326,19 +339,43 @@ async fn run_channel_clients(
     mode: &str,
     transport: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Concurrent in-flight RPCs per connection. Each is an independent request
+    // loop sharing the connection's `Channel` (cheaply cloneable); h2 multiplexes
+    // them as concurrent streams over the one RDMA connection, so a depth > 1
+    // keeps several requests — and therefore several transport sends — pipelined
+    // instead of the strict one-at-a-time ping-pong.
+    //
+    // read-ring is excepted: it has a known concurrent-stream deadlock (a
+    // bidirectional send-queue-full / doorbell RNR stall — see
+    // docs/bugs/read-ring-concurrent-stream-deadlock.md). Until the transport
+    // fix lands, cap it to one in-flight RPC per connection so the benchmark
+    // doesn't hang. send-recv and credit-ring pipeline safely.
+    let mut depth = args.in_flight.max(1);
+    if transport == "read-ring" && depth > 1 {
+        eprintln!(
+            "warning: read-ring has a known concurrent-stream deadlock; capping \
+             --in-flight from {} to 1 (see docs/bugs/read-ring-concurrent-stream-deadlock.md)",
+            args.in_flight
+        );
+        depth = 1;
+    }
+
     // Warmup
     if args.warmup > 0 {
         eprintln!("Warming up for {}s...", args.warmup);
         let warmup_deadline = Instant::now() + Duration::from_secs(args.warmup);
         let mut warmup_handles = Vec::new();
-        for mut client in clients.clone() {
-            let p = payload.to_string();
-            let deadline = warmup_deadline;
-            warmup_handles.push(tokio::spawn(async move {
-                while Instant::now() < deadline {
-                    let _ = client.say_hello(HelloRequest { name: p.clone() }).await;
-                }
-            }));
+        for client in clients.clone() {
+            for _ in 0..depth {
+                let mut client = client.clone();
+                let p = payload.to_string();
+                let deadline = warmup_deadline;
+                warmup_handles.push(tokio::spawn(async move {
+                    while Instant::now() < deadline {
+                        let _ = client.say_hello(HelloRequest { name: p.clone() }).await;
+                    }
+                }));
+            }
         }
         for h in warmup_handles {
             let _ = h.await;
@@ -346,36 +383,44 @@ async fn run_channel_clients(
         eprintln!("Warmup complete");
     }
 
-    // Benchmark
-    let metrics = BenchMetrics::new(args.connections);
+    // Benchmark. One histogram slot per concurrent request loop so the loops
+    // never contend on the same lock.
+    let metrics = BenchMetrics::new(args.connections * depth);
     let bench_deadline = Instant::now() + Duration::from_secs(args.duration);
 
-    eprintln!("Benchmarking for {}s...", args.duration);
+    eprintln!(
+        "Benchmarking for {}s ({depth} concurrent RPC(s) per connection)...",
+        args.duration
+    );
 
     let mut handles = Vec::new();
-    for (conn_id, mut client) in clients.into_iter().enumerate() {
-        let m = metrics.clone();
-        let p = payload.to_string();
-        let deadline = bench_deadline;
-        handles.push(tokio::spawn(async move {
-            while Instant::now() < deadline {
-                let start = Instant::now();
-                match client.say_hello(HelloRequest { name: p.clone() }).await {
-                    Ok(_) => {
-                        m.record(conn_id, start.elapsed()).await;
-                    }
-                    Err(e) => {
-                        tracing::trace!(conn_id, error = %e, "RPC failed");
-                        m.record_error();
+    for (conn_id, client) in clients.into_iter().enumerate() {
+        for sub in 0..depth {
+            let slot = conn_id * depth + sub;
+            let mut client = client.clone();
+            let m = metrics.clone();
+            let p = payload.to_string();
+            let deadline = bench_deadline;
+            handles.push(tokio::spawn(async move {
+                while Instant::now() < deadline {
+                    let start = Instant::now();
+                    match client.say_hello(HelloRequest { name: p.clone() }).await {
+                        Ok(_) => {
+                            m.record(slot, start.elapsed()).await;
+                        }
+                        Err(e) => {
+                            tracing::trace!(conn_id, error = %e, "RPC failed");
+                            m.record_error();
+                        }
                     }
                 }
-            }
-        }));
+            }));
+        }
     }
 
     for (i, h) in handles.into_iter().enumerate() {
         if let Err(e) = h.await {
-            tracing::warn!(conn_id = i, error = %e, "bench task failed");
+            tracing::warn!(task = i, error = %e, "bench task failed");
         }
     }
 
@@ -387,7 +432,7 @@ async fn run_channel_clients(
         transport,
         args.connections,
         args.threads,
-        1, // request/response: one request outstanding per connection
+        depth,
         args.duration,
         args.payload,
         metrics.total_errors.load(Ordering::Relaxed),

@@ -37,17 +37,25 @@ struct Args {
     #[arg(long, default_value_t = false)]
     mw_fallback: bool,
 
+    /// Per-connection send/recv pipeline depth for the send-recv stream (gRPC
+    /// modes). Sizes the QP's send/recv buffers so up to this many sends can be
+    /// outstanding at once; match the client's `--in-flight` so both peers can
+    /// pipeline to the same depth. Ignored by the ring transports and echo mode.
+    #[arg(long, default_value_t = 1)]
+    in_flight: usize,
+
     /// Ring transport `max_message_size` in bytes (echo mode only). Must match
     /// the client so both sides size their credits/buffers identically. Smaller
     /// values raise the number of outstanding messages a ring allows.
     #[arg(long, default_value_t = 1500)]
     ring_max_msg: usize,
 
-    /// Ring transport in-flight message budget (echo mode only). 0 = derive from
-    /// `ring_capacity / ring_max_msg`. Must match the client. Set >0 to size the
-    /// send/doorbell/CQ queues for that many in-flight messages.
+    /// Ring transport send-queue depth (advanced; echo mode only). Sizes the
+    /// send/doorbell/CQ queues for this many in-flight messages, independent of
+    /// `--ring-max-msg`. 0 = derive from `ring_capacity / ring_max_msg`. Must
+    /// match the client. Distinct from the application-level `--in-flight`.
     #[arg(long, default_value_t = 0)]
-    ring_max_inflight: usize,
+    ring_queue_depth: usize,
 
     #[arg(long, default_value = "build/certs/cert.pem")]
     cert: PathBuf,
@@ -127,16 +135,16 @@ async fn run_echo_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         "read-ring" => {
             let mut config = ReadRingConfig::datagram().with_mr_rkey_fallback(args.mw_fallback);
             config.max_message_size = args.ring_max_msg;
-            if args.ring_max_inflight > 0 {
-                config.max_in_flight = Some(args.ring_max_inflight);
+            if args.ring_queue_depth > 0 {
+                config.max_in_flight = Some(args.ring_queue_depth);
             }
             echo::run_transport_echo_server(config, args.bind, "read-ring", shutdown_signal()).await
         }
         "credit-ring" => {
             let mut config = CreditRingConfig::datagram().with_mr_rkey_fallback(args.mw_fallback);
             config.max_message_size = args.ring_max_msg;
-            if args.ring_max_inflight > 0 {
-                config.max_in_flight = Some(args.ring_max_inflight);
+            if args.ring_queue_depth > 0 {
+                config.max_in_flight = Some(args.ring_queue_depth);
             }
             echo::run_transport_echo_server(config, args.bind, "credit-ring", shutdown_signal())
                 .await
@@ -173,7 +181,10 @@ async fn run_tcp_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 async fn run_tls_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let mw_fallback = args.mw_fallback;
     match args.transport.as_str() {
-        "send-recv" => run_tls_server_with(args, SendRecvConfig::stream()).await,
+        "send-recv" => {
+            let depth = args.in_flight;
+            run_tls_server_with(args, SendRecvConfig::stream_with_depth(depth)).await
+        }
         "read-ring" => {
             run_tls_server_with(
                 args,

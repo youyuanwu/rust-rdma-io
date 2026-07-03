@@ -26,8 +26,9 @@
           --mode "{{ bench_mode | default('rh2') }}" \
           --transport "{{ bench_transport | default('send-recv') }}" \
           {{ '--mw-fallback' if (bench_mw_fallback | default(false) | bool) else '' }} \
+          --in-flight "{{ bench_in_flight | default(1) }}" \
           --ring-max-msg "{{ bench_ring_max_msg | default(1500) }}" \
-          --ring-max-inflight "{{ bench_ring_max_inflight | default(0) }}" \
+          --ring-queue-depth "{{ bench_ring_queue_depth | default(0) }}" \
           --cert ~/certs/cert.pem \
           --key ~/certs/key.pem \
           > /tmp/bench-server.log 2>&1 &
@@ -56,7 +57,7 @@
           --warmup "{{ bench_warmup | default(5) }}" \
           --payload "{{ bench_payload | default(64) }}" \
           --ring-max-msg "{{ bench_ring_max_msg | default(1500) }}" \
-          --ring-max-inflight "{{ bench_ring_max_inflight | default(0) }}" \
+          --ring-queue-depth "{{ bench_ring_queue_depth | default(0) }}" \
           --cert ~/certs/cert.pem \
           --key ~/certs/key.pem \
           --report json

@@ -229,15 +229,15 @@ Transports: `send-recv`, `read-ring`, `credit-ring` (raw RDMA) and `tcp`
 `ring_capacity / max_message_size` in-flight messages (~43 at the 1500 B
 default), which caps deep pipelines of small messages. Two knobs raise it:
 
-- `--ring-max-inflight N` — size the queues for `N` in-flight messages directly
+- `--ring-queue-depth N` — size the queues for `N` in-flight messages directly
   (preferred; keeps the message size). Must match on client and server.
 - `--ring-max-msg B` — lower the max message size (also raises the slot count),
   at the cost of truncating payloads larger than `B`.
 
 ```bash
 # read-ring, 64 in flight per connection, queues sized for 128
-rdma-bench-server --mode echo --transport read-ring --mw-fallback --ring-max-inflight 128 --bind 0.0.0.0:50051
-rdma-bench-client --mode echo --transport read-ring --mw-fallback --ring-max-inflight 128 \
+rdma-bench-server --mode echo --transport read-ring --mw-fallback --ring-queue-depth 128 --bind 0.0.0.0:50051
+rdma-bench-client --mode echo --transport read-ring --mw-fallback --ring-queue-depth 128 \
     --connect <server-ip>:50051 --connections 8 --in-flight 64 --payload 64
 ```
 
@@ -250,14 +250,14 @@ just deploy-bench                                   # build + push binaries/cert
 just echo-matrix                                    # transports x in-flight, 8x8
 just echo-matrix "send-recv tcp" "1 8 32" 8 10 1024 # subset + 1 KiB payload
 # full sweep with ring queues sized for deep pipelines (positional args:
-# transports in_flights cpus duration payload mw_fallback settle reboot_between ring_max_inflight)
+# transports in_flights cpus duration payload mw_fallback settle reboot_between ring_queue_depth)
 just echo-matrix "send-recv read-ring credit-ring tcp" "1 4 16 64" 8 8 64 true 10 false 128
 just bench-report                                   # merge JSON → Markdown + charts
 ```
 
 `echo-matrix` iterates `transports x in_flights`, invoking the shared
 `bench_run.yml` playbook with `bench_mode=echo` and `bench_in_flight=N`. The
-trailing `ring_max_inflight` arg (default `0` = derive from `ring_capacity /
+trailing `ring_queue_depth` arg (default `0` = derive from `ring_capacity /
 max_message_size`) sizes the ring queues so the ring transports sustain the
 deeper in-flight values without back-pressuring early (see §7). Results land in
 `build/bench/bench-echo-<transport>-<conns>conn-<threads>thr-<N>if.json`;
@@ -284,12 +284,12 @@ in-flight ceiling the rings failed with an `ENOMEM` (`os error -12`) from
 to the ring slot count** (`ring_capacity / max_message_size`), so a deep request
 pipeline overran the queues. This is now fixed two ways: `send_copy` treats a
 full send queue as back-pressure (`Ok(0)`) instead of a fatal error, and a
-`max_in_flight` config option (`--ring-max-inflight`) sizes the send/doorbell/CQ
+`max_in_flight` config option (`--ring-queue-depth`) sizes the send/doorbell/CQ
 queues for the intended pipeline depth independently of `max_message_size`. See
 [../bugs/ring-send-queue-exhaustion.md](../bugs/ring-send-queue-exhaustion.md)
 for the full analysis, reproduction, and fix.
 
-With the queues sized (`ring_max_inflight=128`), every transport scales cleanly
+With the queues sized (`ring_queue_depth=128`), every transport scales cleanly
 to in-flight 64 with **zero errors** (8×8, 64 B payload, req/s):
 
 | in-flight | send-recv | read-ring | credit-ring | tcp |
@@ -359,7 +359,7 @@ RSS (registered buffers + MRs); `send-recv` is lighter than the rings.
 The 4.75M figure is not a hardware ceiling — 64×64 uses shallow 64-deep
 pipelines. Because the limiter is per-message overhead (doorbells + completion
 notifications), *deeper per-connection pipelines* amortize it. Sweeping
-`--in-flight` (with `--ring-max-inflight` sized to match) on read-ring:
+`--in-flight` (with `--ring-queue-depth` sized to match) on read-ring:
 
 | conns × depth | offered | throughput | CPU/op | cores | p50 | p99 |
 |---|---:|---:|---:|---:|---:|---:|
