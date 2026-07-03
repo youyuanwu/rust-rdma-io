@@ -245,6 +245,15 @@ async fn pipelined_transfer<B: TransportBuilder>(builder: B) {
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn pipelined_transfer_default() {
+    // Non-iWARP only. This test blasts a deep pipeline of small sends with no
+    // application-level flow control, relying on the transport to backpressure a
+    // reader that falls behind. On RoCE/IB that is RNR NAK; iWARP has no RNR, so
+    // a Send arriving with no posted recv buffer is a fatal LOC_QP_OP_ERR rather
+    // than a retry. Under CPU contention the post-and-return writer can outrun a
+    // starved reader and overrun the recv-buffer pool, which is safe on RoCE but
+    // fatal on iWARP. (Flow-controlled paths — gRPC/h2 and the ring transports —
+    // are unaffected; see concurrent_unary_load.)
+    require_no_iwarp!();
     pipelined_transfer(SendRecvConfig::stream_with_depth(16)).await;
 }
 
