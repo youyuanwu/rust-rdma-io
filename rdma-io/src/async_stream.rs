@@ -60,6 +60,13 @@ use crate::transport::{RecvCompletion, Transport};
 /// limit, so it never under-fills a single send.
 const MAX_GATHER: usize = 64 * 1024;
 
+/// Max recv completions the write-blocked path will drain into the owned stash
+/// (and the cap on recycled stash buffers) before it stops draining and lets the
+/// transport's own backpressure apply. Bounds stash memory while leaving ample
+/// room to release the peer's flow control. See
+/// [`AsyncRdmaStream::recv_stash`](AsyncRdmaStream#structfield.recv_stash).
+const MAX_STASH_BUFS: usize = 64;
+
 /// An async RDMA stream with `read` and `write` methods.
 ///
 /// Generic over `T: Transport`. Construct via [`AsyncRdmaStream::new`] with
@@ -68,12 +75,19 @@ pub struct AsyncRdmaStream<T: Transport> {
     transport: T,
     /// Partially consumed recv: (buf_index, offset, total_len).
     recv_pending: Option<(usize, usize, usize)>,
-    /// Recv completions reaped by the *write* path (while draining the recv CQ
-    /// for ring credit updates) that carried real data. Stashed here — as
-    /// `(buf_idx, byte_len)` — so [`poll_read`](AsyncRead::poll_read) serves
-    /// them before polling the transport, instead of the write path dropping
-    /// the bytes on the floor.
-    recv_stash: std::collections::VecDeque<(usize, usize)>,
+    /// Bytes the *write* path drained from the recv CQ while send-blocked, copied
+    /// into pooled owned buffers so the transport recv slot can be released
+    /// (`repost_recv`) immediately rather than held until `poll_read` runs.
+    /// Releasing eagerly lets a write-blocked endpoint keep freeing its peer's
+    /// flow control, which breaks the read-ring concurrent-stream deadlock (see
+    /// docs/bugs/read-ring-concurrent-stream-deadlock.md). `poll_read` serves
+    /// these FIFO before polling the transport, preserving byte order.
+    recv_stash: std::collections::VecDeque<Vec<u8>>,
+    /// Bytes already consumed from the front `recv_stash` buffer on a partial read.
+    stash_offset: usize,
+    /// Recycled `recv_stash` buffers, reused to avoid reallocating on the
+    /// (backpressure-path) drain copy.
+    stash_pool: Vec<Vec<u8>>,
     /// Set when the last write could not be posted (all transport send buffers
     /// in flight / ring credits exhausted) and returned `Pending`. While set,
     /// the coalescing scratch must be preserved so a re-poll re-presents the
@@ -112,6 +126,8 @@ impl<T: Transport> AsyncRdmaStream<T> {
             transport,
             recv_pending: None,
             recv_stash: std::collections::VecDeque::new(),
+            stash_offset: 0,
+            stash_pool: Vec::new(),
             write_blocked: false,
             write_scratch: Vec::new(),
             eof: false,
@@ -158,6 +174,25 @@ impl<T: Transport> AsyncRdmaStream<T> {
 }
 
 impl<T: Transport> AsyncRdmaStream<T> {
+    /// Copy a freshly-reaped recv completion out of the transport recv ring into
+    /// a pooled owned buffer, so the caller can `repost_recv` the slot right away
+    /// (see [`recv_stash`](Self::recv_stash)). Reuses a buffer from `stash_pool`
+    /// to avoid allocating on this backpressure path.
+    fn stash_recv(&mut self, buf_idx: usize, byte_len: usize) {
+        let mut owned = self.stash_pool.pop().unwrap_or_default();
+        owned.clear();
+        owned.extend_from_slice(&self.transport.recv_buf(buf_idx)[..byte_len]);
+        self.recv_stash.push_back(owned);
+    }
+
+    /// Return a fully-consumed stash buffer to the pool for reuse (capped).
+    fn recycle_stash_buf(&mut self, mut buf: Vec<u8>) {
+        if self.stash_pool.len() < MAX_STASH_BUFS {
+            buf.clear();
+            self.stash_pool.push(buf);
+        }
+    }
+
     /// Core send state machine for a single contiguous slice.
     ///
     /// Posts `buf` as one transport send and returns as soon as it is *accepted*
@@ -211,17 +246,28 @@ impl<T: Transport> AsyncRdmaStream<T> {
             // Blocked. Keep the scratch (vectored path) pinned until we post.
             this.write_blocked = true;
 
-            // Ring transports deliver credit updates on the recv CQ; poll it so
-            // replenished credits re-arm this task's waker. Without this, a
-            // credit-blocked write would only watch the send CQ and could stall.
-            // The poll is destructive, so any *data* completion it reaps (e.g. a
-            // response that arrived while we were send-blocked) must be stashed
-            // for `poll_read` rather than dropped.
-            let mut completions = [RecvCompletion::default(); 1];
-            if let Poll::Ready(Ok(got)) = this.transport.poll_recv(cx, &mut completions) {
-                for c in &completions[..got] {
-                    if c.byte_len > 0 {
-                        this.recv_stash.push_back((c.buf_idx, c.byte_len));
+            // Drain the recv CQ and RELEASE the slots immediately: copy the
+            // bytes into a pooled owned buffer and `repost_recv` now, instead of
+            // holding the transport slot until `poll_read` runs. This serves two
+            // purposes: (1) ring transports deliver credit updates on the recv
+            // CQ, so polling it re-arms this task's waker; (2) — the important
+            // one — it lets a write-blocked endpoint keep freeing its peer's
+            // flow control (doorbells/ring slots), which breaks the read-ring
+            // concurrent-stream deadlock where both peers wedge with full send
+            // queues and neither reads. Bounded by `MAX_STASH_BUFS`; once the
+            // stash is full we stop draining and let the transport's own
+            // backpressure apply. See docs/bugs/read-ring-concurrent-stream-deadlock.md.
+            if this.recv_stash.len() < MAX_STASH_BUFS {
+                let mut completions = [RecvCompletion::default(); 1];
+                if let Poll::Ready(Ok(got)) = this.transport.poll_recv(cx, &mut completions) {
+                    for c in completions.iter().take(got) {
+                        let buf_idx = c.buf_idx;
+                        let byte_len = c.byte_len;
+                        if byte_len > 0 {
+                            this.stash_recv(buf_idx, byte_len);
+                        }
+                        // Release the transport slot + doorbell now.
+                        let _ = this.transport.repost_recv(buf_idx);
                     }
                 }
             }
@@ -382,15 +428,19 @@ impl<T: Transport> AsyncRdmaStream<T> {
             return Poll::Ready(Ok(()));
         }
 
-        // Phase 1.5: Serve a completion the write path stashed while draining
-        // the recv CQ for credit updates (so those bytes are not lost).
-        if let Some((buf_idx, byte_len)) = self.recv_stash.pop_front() {
-            let copy_len = byte_len.min(buf.remaining());
-            buf.put_slice(&self.transport.recv_buf(buf_idx)[..copy_len]);
-            if copy_len < byte_len {
-                self.recv_pending = Some((buf_idx, copy_len, byte_len));
+        // Phase 1.5: Serve bytes the write-blocked path drained into the owned
+        // stash (already released from the transport recv ring).
+        if !self.recv_stash.is_empty() {
+            let front = &self.recv_stash[0];
+            let avail = front.len() - self.stash_offset;
+            let copy_len = avail.min(buf.remaining());
+            buf.put_slice(&front[self.stash_offset..self.stash_offset + copy_len]);
+            if copy_len < avail {
+                self.stash_offset += copy_len;
             } else {
-                let _ = self.transport.repost_recv(buf_idx);
+                let done = self.recv_stash.pop_front().unwrap();
+                self.recycle_stash_buf(done);
+                self.stash_offset = 0;
             }
             return Poll::Ready(Ok(()));
         }
@@ -468,15 +518,20 @@ impl<T: Transport> AsyncRead for AsyncRdmaStream<T> {
             return Poll::Ready(Ok(copy_len));
         }
 
-        // Phase 1.5: Serve a completion the write path stashed while draining
-        // the recv CQ for credit updates (so those bytes are not lost).
-        if let Some((buf_idx, byte_len)) = this.recv_stash.pop_front() {
-            let copy_len = byte_len.min(buf.len());
-            buf[..copy_len].copy_from_slice(&this.transport.recv_buf(buf_idx)[..copy_len]);
-            if copy_len < byte_len {
-                this.recv_pending = Some((buf_idx, copy_len, byte_len));
+        // Phase 1.5: Serve bytes the write-blocked path drained into the owned
+        // stash (already released from the transport recv ring).
+        if !this.recv_stash.is_empty() {
+            let front = &this.recv_stash[0];
+            let avail = front.len() - this.stash_offset;
+            let copy_len = avail.min(buf.len());
+            buf[..copy_len]
+                .copy_from_slice(&front[this.stash_offset..this.stash_offset + copy_len]);
+            if copy_len < avail {
+                this.stash_offset += copy_len;
             } else {
-                let _ = this.transport.repost_recv(buf_idx);
+                let done = this.recv_stash.pop_front().unwrap();
+                this.recycle_stash_buf(done);
+                this.stash_offset = 0;
             }
             return Poll::Ready(Ok(copy_len));
         }

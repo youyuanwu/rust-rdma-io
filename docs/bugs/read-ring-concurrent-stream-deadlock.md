@@ -2,20 +2,31 @@
 
 ## Summary
 
-`ReadRingTransport` deadlocks when used as an `AsyncRdmaStream` under **sustained
-bidirectional concurrent streaming** — specifically the gRPC/HTTP-2 path
-(`--mode rh2 --transport read-ring`) with more than one concurrent RPC per
-connection (`--in-flight > 1`). Both peers wedge with their send queues full and
-never recover. `send-recv` and `credit-ring` do **not** have this problem and
+`ReadRingTransport` deadlocked when used as an `AsyncRdmaStream` under
+**sustained bidirectional concurrent streaming** — specifically the gRPC/HTTP-2
+path (`--mode rh2 --transport read-ring`) with more than one concurrent RPC per
+connection (`--in-flight > 1`). Both peers wedged with their send queues full and
+never recovered. `send-recv` and `credit-ring` do **not** have this problem and
 pipeline cleanly to the same depths.
+
+Resolved at the stream layer by fix A (see Status / "Fix applied"); the
+transport-level coupling that made it possible is documented below and left for a
+future transport rework.
 
 ## Status
 
-**Open — worked around, not fixed.** The benchmark client caps read-ring gRPC to
-`in_flight = 1` (with a warning) so runs don't hang; see
-[`run_channel_clients`](../../tests/rdma-io-bench/src/client.rs). The transport
-fix is deferred. read-ring at `in_flight = 1` is unaffected, and the direct echo
-path (`--mode echo`) is unaffected (see "Why only the gRPC path" below).
+**Stream-layer fix applied (fix A); transport-level rework still deferred.**
+`AsyncRdmaStream`'s write-blocked path now drains its recv CQ and *releases the
+slot immediately* — copying the bytes into an owned stash and calling
+`repost_recv` — so a write-blocked endpoint keeps replenishing its peer's
+doorbells instead of holding them. This breaks the symmetric-write-block cycle at
+the stream layer without changing the transport. See "Fix applied (fix A)" below.
+
+The benchmark client still caps read-ring gRPC to `in_flight = 1` (with a
+warning); see [`run_channel_clients`](../../tests/rdma-io-bench/src/client.rs).
+That cap is retained pending validation of fix A on MANA RoCEv2 hardware — once
+confirmed there it can be lifted. read-ring at `in_flight = 1` and the direct
+echo path (`--mode echo`) were never affected.
 
 This is **not a regression**: before concurrent RPCs were wired into the gRPC
 client, that path only ever issued one outstanding RPC per connection, so
@@ -101,18 +112,71 @@ symmetric write-block breaks the cycle.
   Removing that arm did **not** fix it either (same reason — wrong path). It may
   still be a latent hazard worth cleaning up alongside the real fix.
 
-## Fix direction (deferred)
+## Fix applied (fix A — stream-layer eager slot release)
 
-The real fix is read-ring flow-control rework so that write completion does not
-depend on the peer's instantaneous read progress. Candidate approaches:
+The root cause reduces to one fact: a read-ring recv slot (and its doorbell) is
+released only by `repost_recv`, which `AsyncRdmaStream` called *only* from
+`poll_read`. A write-blocked endpoint stopped calling `poll_read`, so it held its
+slots and starved its peer's doorbells.
+
+Fix A makes the **write-blocked path itself** release the recv side, in
+[`async_stream.rs`](../../rdma-io/src/async_stream.rs):
+
+- `recv_stash` changed from a *reference* to the transport recv slot
+  (`(buf_idx, byte_len)`) to **owned** pooled buffers — `VecDeque<Vec<u8>>` plus a
+  `stash_offset` for partial reads and a `stash_pool` free-list to avoid
+  allocating on this path.
+- When `poll_write_slice` is send-blocked it drains the recv CQ, copies each
+  completion's bytes into a pooled owned buffer, and calls `repost_recv`
+  **immediately** — releasing the transport slot + doorbell — bounded by
+  `MAX_STASH_BUFS` (once the stash is full it stops draining and lets the
+  transport's own byte-backpressure apply). `poll_read` serves the owned stash
+  FIFO before polling the transport, preserving byte order.
+
+Because the release happens *synchronously inside the blocked poll, before the
+task parks*, a write-blocked A frees B's flow control → B's stalled sends
+complete → B's send-CQ waker (already armed) fires → B drains and releases → A's
+sends complete. The circular wait becomes a self-unwinding cascade. The change is
+transport-agnostic and harmless for send-recv/credit-ring.
+
+**Cost.** One extra copy per message, of order the message size (64 B in the
+repro), **only on the backpressure path** — `AsyncRdmaStream` is already a
+copying adapter (send and read both copy), and steady-state reads are unchanged.
+A copy-free alternative was rejected: enlarging the doorbell pool only converts
+the doorbell deadlock into a byte-space stall under sustained load, and bounding
+stream depth caps throughput without guaranteeing deadlock-freedom.
+
+**Tests.**
+- `read_ring_write_completion_coupled_to_peer_read`
+  ([read_ring_transport_tests.rs](../../rdma-io-tests/tests/read_ring_transport_tests.rs))
+  — transport-level characterization of the coupling fix A works around. It still
+  reproduces the exact freeze signature (44 sends pinned until the peer reads) and
+  documents *why* the stream-layer release is needed; the transport itself is
+  unchanged.
+- `concurrent_write_no_deadlock_read_ring`
+  ([async_stream_tests.rs](../../rdma-io-tests/tests/async_stream_tests.rs)) —
+  stream-level regression: both peers write 50 small messages before either reads
+  (the h2 write-priority pattern). Pre-fix this deadlocks; with fix A both writers
+  complete and the buffered streams verify in order. Validated deterministically
+  on rxe.
+
+## Remaining transport-level work (deferred)
+
+Fix A resolves the deadlock at the stream layer but leaves the transport's
+write-completion-coupled-to-peer-read property in place (hence the transport-level
+repro still wedges). A deeper transport rework could remove the coupling — and the
+backpressure-path copy — entirely. Candidate approaches:
 
 1. **Guarantee doorbell headroom ≥ SQ depth** and repost doorbells eagerly
    (independent of stream read progress), so Write+Imm never RNR-stalls on a
-   drained doorbell pool.
+   drained doorbell pool. Requires growing the `max_outstanding`-sized recv
+   tracking (`virtual_idx_map`, `recv_tracker`) so doorbell reposting can be
+   decoupled from slot release.
 2. **Bound the stream's outstanding sends** below the point where a symmetric
    write-block can starve the peer's reposting, giving the read side room to run.
 3. Revisit the `poll_send_completion` "Read-only ⇒ Pending" hiding and the
    `drain_send_cq_for_read` dual-arm as part of the same change.
 
-Any fix must be validated at `in_flight` 4/8/16 on the MANA RoCEv2 preview (the
-CM is flaky there, so use `reboot_between`/retries).
+Before lifting the bench `in_flight = 1` cap, validate fix A at `in_flight`
+4/8/16 on the MANA RoCEv2 preview (the CM is flaky there, so use
+`reboot_between`/retries).

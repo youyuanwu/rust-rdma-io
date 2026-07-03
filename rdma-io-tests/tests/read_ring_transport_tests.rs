@@ -214,3 +214,107 @@ async fn read_ring_mr_rkey_fallback_roundtrip() {
 
     println!("read_ring_mr_rkey_fallback_roundtrip passed!");
 }
+
+/// Deterministic reproduction of the *root cause* behind the read-ring
+/// concurrent-stream deadlock: a sender's **write completion is coupled to the
+/// peer's read progress**.
+///
+/// Each `send_copy` posts an RDMA Write+Immediate that must be consumed by a
+/// doorbell recv WR on the peer. The peer only reposts doorbells while draining
+/// its recv ring (`poll_recv` / `repost_recv`) — i.e. on its *read* side. The
+/// send queue (`max_outstanding + 3`) is deliberately deeper than the peer's
+/// doorbell pool (`max_outstanding`), so a sender can post more Write+Imm than
+/// the peer has doorbells. With small messages the 64 KiB byte ring never fills,
+/// so the doorbell pool — not ring space — is the binding constraint; this is
+/// exactly the SQ-backpressure path (`rif=false`) observed at the freeze.
+///
+/// Once the peer's doorbells are spent and it is not reading, the excess
+/// Write+Imm RNR-stall and `send_in_flight` pins with no send-CQ wakeup. Over
+/// gRPC both peers hit this symmetrically and neither ever reads again, so the
+/// pin becomes a permanent deadlock. `send-recv` and `credit-ring` do not couple
+/// write completion to peer read progress and pipeline cleanly.
+///
+/// This drives one direction to the wedge (peer never reads) and asserts:
+///   1. `send_in_flight` pins > 0 and cannot drain despite a full send queue
+///      (the deadlock condition), and
+///   2. the peer reading + reposting doorbells is what unblocks the sender,
+/// confirming the coupling.
+///
+/// NOTE: this documents *current* (buggy) behavior. A flow-control fix that
+/// guarantees doorbell headroom ≥ send-queue depth would stop the wedge from
+/// occurring; this test must then be revisited.
+///
+/// See docs/bugs/read-ring-concurrent-stream-deadlock.md.
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn read_ring_write_completion_coupled_to_peer_read() {
+    require_no_iwarp!();
+    // Default: max_outstanding = 43, doorbell pool = 43, send queue = 46.
+    let (mut server, mut client) = ring_connected_pair(ReadRingConfig::default()).await;
+
+    // Small messages so the byte ring never fills — the doorbell pool is the
+    // binding constraint (matches the bug's SQ-backpressure path).
+    let data = vec![0xABu8; 64];
+
+    // Drive the client's send pipeline to the wedge WITHOUT the server ever
+    // reading. Each round posts until backpressure (Ok(0)) then drains the send
+    // CQ. A decoupled transport would let the peer HCA autonomously consume every
+    // Write+Imm and complete these sends; here, once the 43 doorbells are spent,
+    // further Write+Imm RNR-stall and cannot complete.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        while client.send_copy(&data).unwrap() > 0 {}
+        drain_send_completions(&mut client).await;
+
+        // Wedged when the send queue is full (Ok(0)) yet posted sends can't drain.
+        if client.send_copy(&data).unwrap() == 0 && client.sends_in_flight() > 0 {
+            let pinned = client.sends_in_flight();
+            drain_send_completions(&mut client).await;
+            if client.sends_in_flight() == pinned {
+                break; // no send-CQ progress despite a full queue: the deadlock
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "did not reach the send-queue wedge within 10s"
+        );
+    }
+
+    let pinned = client.sends_in_flight();
+    assert!(
+        pinned > 0,
+        "expected posted sends pinned by the peer's exhausted doorbells"
+    );
+    println!("wedge reproduced: {pinned} sends pinned with the peer not reading");
+
+    // The pin is NOT benign backpressure: it only clears once the *peer reads*.
+    // Drain the server's recv ring and repost doorbells; each repost lets one
+    // RNR-stalled Write+Imm complete on the client, cascading until all drain.
+    let recover_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while client.sends_in_flight() > 0 {
+        let mut completions = [RecvCompletion::default(); 8];
+        let got = poll_fn(|cx| match server.poll_recv(cx, &mut completions) {
+            Poll::Ready(r) => Poll::Ready(Some(r)),
+            Poll::Pending => Poll::Ready(None),
+        })
+        .await;
+        if let Some(Ok(n)) = got {
+            for c in &completions[..n] {
+                server.repost_recv(c.buf_idx).unwrap();
+            }
+        }
+        drain_send_completions(&mut client).await;
+        assert!(
+            tokio::time::Instant::now() < recover_deadline,
+            "client sends never drained even after the peer read ({} still pinned)",
+            client.sends_in_flight()
+        );
+    }
+
+    assert_eq!(
+        client.sends_in_flight(),
+        0,
+        "peer read progress must unblock the sender's writes"
+    );
+
+    println!("read_ring_write_completion_coupled_to_peer_read passed!");
+}

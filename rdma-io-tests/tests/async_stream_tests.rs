@@ -261,6 +261,111 @@ async fn pipelined_transfer_read_ring() {
 }
 
 // ===========================================================================
+// concurrent_write_no_deadlock — both peers write many small messages before
+// either reads (the HTTP/2 write-priority pattern that wedged read-ring at
+// in_flight > 1). Fix A's write-blocked drain copies the received bytes out and
+// reposts the recv slot immediately, so a write-blocked endpoint keeps freeing
+// its peer's flow control; without it, read-ring deadlocks and this times out.
+//
+// Read-ring only: the pattern (both sides write `count` messages before either
+// reads) is what the bug requires. `count` must exceed the read-ring doorbell
+// pool (43) to force the blocked-write path, yet stay within the stream stash
+// cap (64) so each peer can buffer the other's whole stream without reading.
+// (credit-ring's credit window and send-recv's recv-buffer pool make this exact
+// no-read pattern a different question; those transports don't have this bug and
+// are already exercised by the pipelined/large-transfer tests.)
+// See docs/bugs/read-ring-concurrent-stream-deadlock.md.
+// ===========================================================================
+
+async fn concurrent_write_no_deadlock<B: TransportBuilder>(builder: B) {
+    let (server, client) = connected_pair(builder).await;
+
+    // count > the read-ring doorbell pool (43) forces the blocked-write path;
+    // count <= the stream stash cap (64) lets each peer buffer the other's whole
+    // stream without reading, so both writers complete via fix A's eager release.
+    let count = 50usize;
+    let msg = 64usize;
+
+    // Distinct per-message marker byte per direction so ordering is checkable.
+    let cdata: Vec<u8> = (0..count).map(|i| (i % 251) as u8).collect();
+    let sdata: Vec<u8> = (0..count).map(|i| ((i * 3 + 7) % 251) as u8).collect();
+    let cw = cdata.clone();
+    let sw = sdata.clone();
+
+    // Both sides write their full payload before reading anything.
+    let writer_c = tokio::spawn(async move {
+        let mut client = client;
+        for &b in &cw {
+            client.write_all(&vec![b; msg]).await.unwrap();
+        }
+        client
+    });
+    let writer_s = tokio::spawn(async move {
+        let mut server = server;
+        for &b in &sw {
+            server.write_all(&vec![b; msg]).await.unwrap();
+        }
+        server
+    });
+
+    // Without fix A this join never resolves (both peers wedged, no wakeup).
+    let (client, server) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        (writer_c.await.unwrap(), writer_s.await.unwrap())
+    })
+    .await
+    .expect("concurrent writes deadlocked (see read-ring-concurrent-stream-deadlock.md)");
+
+    // Drain each direction and verify per-message markers survived in order.
+    let reader_c = tokio::spawn(async move {
+        let mut client = client;
+        let mut got = Vec::with_capacity(count * msg);
+        let mut buf = [0u8; 4096];
+        while got.len() < count * msg {
+            let n = client.read(&mut buf).await.unwrap();
+            assert!(n > 0, "unexpected EOF draining client");
+            got.extend_from_slice(&buf[..n]);
+        }
+        got
+    });
+    let reader_s = tokio::spawn(async move {
+        let mut server = server;
+        let mut got = Vec::with_capacity(count * msg);
+        let mut buf = [0u8; 4096];
+        while got.len() < count * msg {
+            let n = server.read(&mut buf).await.unwrap();
+            assert!(n > 0, "unexpected EOF draining server");
+            got.extend_from_slice(&buf[..n]);
+        }
+        got
+    });
+    let (c_got, s_got) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        (reader_c.await.unwrap(), reader_s.await.unwrap())
+    })
+    .await
+    .expect("reads timed out draining the buffered streams");
+
+    // Client received what the server wrote (sdata), and vice versa.
+    for i in 0..count {
+        assert_eq!(
+            c_got[i * msg],
+            sdata[i],
+            "client recv chunk {i} out of order"
+        );
+        assert_eq!(
+            s_got[i * msg],
+            cdata[i],
+            "server recv chunk {i} out of order"
+        );
+    }
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn concurrent_write_no_deadlock_read_ring() {
+    require_no_iwarp!();
+    concurrent_write_no_deadlock(ReadRingConfig::default()).await;
+}
+
+// ===========================================================================
 // futures_io_echo — echo via futures::io::AsyncReadExt / AsyncWriteExt traits.
 // ===========================================================================
 
