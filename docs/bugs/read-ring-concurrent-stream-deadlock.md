@@ -105,8 +105,21 @@ symmetric write-block breaks the cycle.
 
 - **"Hidden progress on the RDMA-Read completion."** `poll_send_completion`
   returns `Pending` for a Read-only completion batch even though it refreshed the
-  head. A stream-side "retry `send_copy` after `Pending`" did **not** fix it —
-  the deadlock is on the SQ-backpressure path (`rif=false`), not the Read path.
+  head. A stream-side "retry `send_copy` after `Pending`" did **not** fix *this*
+  (bidirectional) deadlock — it is on the SQ-backpressure path (`rif=false`), not
+  the Read path.
+
+  **Update:** the Read-only ⇒ `Pending` behavior *was* a real bug in a different
+  scenario — a **unidirectional** pipelined stream. A write-blocked sender posts
+  a proactive Read as its only outstanding WR; when it completed,
+  `poll_send_completion` refreshed the head (freeing remote space) but returned
+  `Pending`, so the sender parked with space available and — read-ring has no
+  push wakeup for a head advance — never woke. Fixed by counting a
+  head-refreshing Read as progress (`Ready(Ok)`), so the blocked writer re-polls
+  `send_copy`. See the commit for `read_ring_transport::poll_send_completion`.
+  (The analogous credit-ring writer stall — the recv path reaping the send CQ out
+  from under `poll_send_completion` — was fixed by retrying `send_copy` after the
+  recv drain in `poll_write_slice`.)
 - **Dual-poller `req_notify` desync.** `send_copy`'s `drain_send_cq_for_read`
   arms the send CQ (`req_notify`) independently of the async `CqPollState`.
   Removing that arm did **not** fix it either (same reason — wrong path). It may
@@ -174,8 +187,9 @@ backpressure-path copy — entirely. Candidate approaches:
    decoupled from slot release.
 2. **Bound the stream's outstanding sends** below the point where a symmetric
    write-block can starve the peer's reposting, giving the read side room to run.
-3. Revisit the `poll_send_completion` "Read-only ⇒ Pending" hiding and the
-   `drain_send_cq_for_read` dual-arm as part of the same change.
+3. The `poll_send_completion` "Read-only ⇒ Pending" hiding is **fixed** (a
+   head-refreshing Read now returns `Ready(Ok)` so the blocked writer re-polls);
+   the `drain_send_cq_for_read` dual-arm remains a latent hazard to clean up.
 
 Before lifting the bench `in_flight = 1` cap, validate fix A at `in_flight`
 4/8/16 on the MANA RoCEv2 preview (the CM is flaky there, so use

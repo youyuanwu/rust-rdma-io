@@ -1029,9 +1029,16 @@ impl Transport for ReadRingTransport {
                 }
                 let wr_id = wc.wr_id();
                 if wr_id == WR_ID_READ_SENTINEL {
-                    // RDMA Read completed — update cached head, don't count as send.
+                    // RDMA Read completed — refresh cached head. This frees remote
+                    // ring space, so count it as progress: a write-blocked sender
+                    // parks after posting this Read (its only outstanding WR), and
+                    // there is no push wakeup for a read-ring receiver's head
+                    // advance. Returning `Ready(Ok)` lets the stream re-poll
+                    // `send_copy` (which posts the next Read if still full), turning
+                    // a would-be permanent park into head polling at Read-RTT rate.
                     self.update_cached_remote_head();
                     self.read_in_flight = false;
+                    got_write = true;
                 } else if wr_id == WR_ID_PADDING_SENTINEL {
                     // Padding WR — no local ring space to free.
                     self.send_in_flight = self.send_in_flight.saturating_sub(1);
@@ -1050,7 +1057,7 @@ impl Transport for ReadRingTransport {
             if got_write {
                 return Poll::Ready(Ok(()));
             }
-            // Only Read completions in this batch — loop to re-poll CQ.
+            // Batch was empty of actionable completions — loop to re-poll CQ.
         }
     }
 
