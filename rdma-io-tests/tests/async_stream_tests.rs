@@ -325,6 +325,10 @@ async fn concurrent_write_no_deadlock<B: TransportBuilder>(builder: B) {
     .expect("concurrent writes deadlocked (see read-ring-concurrent-stream-deadlock.md)");
 
     // Drain each direction and verify per-message markers survived in order.
+    // Return the stream from each reader so neither peer is dropped until BOTH
+    // directions have fully drained: dropping a stream tears down the
+    // connection, and if the other reader hasn't finished it would see a
+    // premature EOF on the still-in-flight bytes.
     let reader_c = tokio::spawn(async move {
         let mut client = client;
         let mut got = Vec::with_capacity(count * msg);
@@ -334,7 +338,7 @@ async fn concurrent_write_no_deadlock<B: TransportBuilder>(builder: B) {
             assert!(n > 0, "unexpected EOF draining client");
             got.extend_from_slice(&buf[..n]);
         }
-        got
+        (got, client)
     });
     let reader_s = tokio::spawn(async move {
         let mut server = server;
@@ -345,13 +349,14 @@ async fn concurrent_write_no_deadlock<B: TransportBuilder>(builder: B) {
             assert!(n > 0, "unexpected EOF draining server");
             got.extend_from_slice(&buf[..n]);
         }
-        got
+        (got, server)
     });
-    let (c_got, s_got) = tokio::time::timeout(std::time::Duration::from_secs(45), async {
-        (reader_c.await.unwrap(), reader_s.await.unwrap())
-    })
-    .await
-    .expect("reads timed out draining the buffered streams");
+    let ((c_got, _client), (s_got, _server)) =
+        tokio::time::timeout(std::time::Duration::from_secs(45), async {
+            (reader_c.await.unwrap(), reader_s.await.unwrap())
+        })
+        .await
+        .expect("reads timed out draining the buffered streams");
 
     // Client received what the server wrote (sdata), and vice versa.
     for i in 0..count {
