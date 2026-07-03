@@ -288,6 +288,24 @@ impl<T: Transport> AsyncRdmaStream<T> {
                 }
             }
 
+            // The recv drain above may have freed send capacity: `poll_recv`
+            // replenishes ring credits and, for credit-ring, reaps this endpoint's
+            // own send CQ. Retry the post before parking so capacity a completion
+            // freed via the recv path is used immediately, rather than being lost
+            // to `poll_send_completion` returning `Pending` (it would find nothing
+            // left to reap, park on a notification that never comes, and stall).
+            match this.transport.send_copy(buf) {
+                Ok(0) => {}
+                Ok(n) => {
+                    this.write_blocked = false;
+                    return Poll::Ready(Ok(n));
+                }
+                Err(e) => {
+                    this.write_blocked = false;
+                    return Poll::Ready(Err(io::Error::other(e)));
+                }
+            }
+
             // Reap a send completion to free a buffer, then retry the post.
             match this.transport.poll_send_completion(cx) {
                 Poll::Ready(Ok(())) => continue,
