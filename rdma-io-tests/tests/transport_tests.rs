@@ -250,6 +250,123 @@ async fn backpressure_recovery_read_ring() {
 }
 
 // ===========================================================================
+// send_never_errors_under_backpressure — flooding small messages without
+// reaping must backpressure via Ok(0), never surface a fatal Err. Regression
+// for ring send-queue exhaustion (ENOMEM leaked as Err); see
+// docs/bugs/ring-send-queue-exhaustion.md.
+// ===========================================================================
+
+async fn send_never_errors_under_backpressure<B: TransportBuilder>(config: B) {
+    let (mut _server, mut client) = ring_connected_pair(config).await;
+
+    // Small messages: the ring's byte capacity would admit far more than the
+    // send queue has slots, so this exercises the send-queue backpressure path
+    // rather than byte/credit exhaustion alone.
+    let data = vec![0x5Au8; 64];
+    let mut hit_backpressure = false;
+    for _ in 0..4000 {
+        match client.send_copy(&data) {
+            Ok(0) => {
+                hit_backpressure = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => panic!("send_copy must backpressure with Ok(0), not error: {e}"),
+        }
+    }
+    assert!(
+        hit_backpressure,
+        "expected Ok(0) backpressure within 4000 small sends"
+    );
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn send_never_errors_under_backpressure_default() {
+    send_never_errors_under_backpressure(SendRecvConfig::datagram()).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn send_never_errors_under_backpressure_ring() {
+    require_no_iwarp!();
+    send_never_errors_under_backpressure(CreditRingConfig::default()).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn send_never_errors_under_backpressure_read_ring() {
+    require_no_iwarp!();
+    send_never_errors_under_backpressure(ReadRingConfig::default()).await;
+}
+
+// A large explicit in-flight budget with tiny messages is the exact case the
+// send-queue exhaustion bug hit: the byte free-space check admitted far more
+// concurrent messages than the send queue could hold. The queues are now sized
+// to the budget (clamped to device limits) and send_copy backpressures instead
+// of returning ENOMEM.
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn high_in_flight_small_messages_backpressure_ring() {
+    require_no_iwarp!();
+    send_never_errors_under_backpressure(CreditRingConfig::default().with_max_in_flight(512)).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn high_in_flight_small_messages_backpressure_read_ring() {
+    require_no_iwarp!();
+    send_never_errors_under_backpressure(ReadRingConfig::default().with_max_in_flight(512)).await;
+}
+
+// ===========================================================================
+// sends_in_flight_tracking — sends_in_flight() reflects posted-not-reaped
+// sends and returns to 0 once completions are drained. Drives the stream
+// pipeline's close-drain (Transport::sends_in_flight).
+// ===========================================================================
+
+async fn sends_in_flight_tracking<B: TransportBuilder>(config: B) {
+    let (mut _server, mut client) = ring_connected_pair(config).await;
+
+    assert_eq!(client.sends_in_flight(), 0, "idle transport has no sends");
+
+    let data = vec![0x11u8; 64];
+    let mut posted = 0;
+    while posted < 3 {
+        match client.send_copy(&data) {
+            Ok(0) => break, // backpressured before reaching 3
+            Ok(_) => posted += 1,
+            Err(e) => panic!("send_copy error: {e}"),
+        }
+    }
+    assert!(posted > 0, "expected to post at least one small message");
+    assert!(
+        client.sends_in_flight() >= posted,
+        "sends_in_flight {} should cover {posted} posted messages",
+        client.sends_in_flight()
+    );
+
+    drain_send_completions(&mut client).await;
+    assert_eq!(
+        client.sends_in_flight(),
+        0,
+        "sends_in_flight drains to zero after completions"
+    );
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn sends_in_flight_tracking_default() {
+    sends_in_flight_tracking(SendRecvConfig::datagram()).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn sends_in_flight_tracking_ring() {
+    require_no_iwarp!();
+    sends_in_flight_tracking(CreditRingConfig::default()).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn sends_in_flight_tracking_read_ring() {
+    require_no_iwarp!();
+    sends_in_flight_tracking(ReadRingConfig::default()).await;
+}
+
+// ===========================================================================
 // wrap_around — fill, drain, resend to trigger ring wrap, verify integrity.
 // ===========================================================================
 

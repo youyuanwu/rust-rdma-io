@@ -469,3 +469,31 @@ impl TransportBuilder for SendRecvConfig {
         SendRecvTransport::accept(listener, self.clone()).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::SendRecvConfig;
+
+    // stream() posts one send at a time -> a single in-flight message.
+    #[test]
+    fn stream_has_single_send_buffer() {
+        assert_eq!(SendRecvConfig::stream().num_send_bufs, 1);
+    }
+
+    // stream_with_depth sizes send/recv buffers to pipeline `depth` sends.
+    #[test]
+    fn stream_with_depth_sizes_buffers_for_pipeline() {
+        let c = SendRecvConfig::stream_with_depth(16);
+        assert_eq!(c.num_send_bufs, 17); // depth + 1
+        assert_eq!(c.num_recv_bufs, 18); // depth + 2
+        assert_eq!(c.buf_size, 64 * 1024);
+    }
+
+    // Buffer counts respect their floors and depth 0 clamps to 1.
+    #[test]
+    fn stream_with_depth_enforces_minimums() {
+        let c = SendRecvConfig::stream_with_depth(0);
+        assert_eq!(c.num_send_bufs, 2); // (1 + 1).max(2)
+        assert_eq!(c.num_recv_bufs, 8); // (1 + 2).max(8)
+    }
+}

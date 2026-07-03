@@ -184,6 +184,83 @@ async fn large_transfer_read_ring() {
 }
 
 // ===========================================================================
+// pipelined_transfer — many small writes over a depth-sized stream, exercising
+// the N-deep send pipeline: writes post-and-return (multiple sends outstanding),
+// backpressure once the pipeline is full, ordering preserved via recv_stash,
+// and poll_close drains all in-flight sends. Verifies stream integrity.
+// ===========================================================================
+
+async fn pipelined_transfer<B: TransportBuilder>(builder: B) {
+    let (server, client) = connected_pair(builder).await;
+
+    // Many small messages so several sends are in flight at once (deeper than
+    // any single write). 512 * 1000 B = 500 KB total.
+    let chunk = vec![0u8; 1000];
+    let chunk_len = chunk.len();
+    let chunks = 512usize;
+    let total = chunk_len * chunks;
+
+    let writer = tokio::spawn(async move {
+        let mut client = client;
+        for i in 0..chunks {
+            // Vary the first byte per chunk so ordering errors are detectable.
+            let mut c = chunk.clone();
+            c[0] = (i % 251) as u8;
+            client.write_all(&c).await.unwrap();
+        }
+        // Graceful close drains the in-flight send pipeline.
+        client.shutdown().await.unwrap();
+        client
+    });
+
+    let reader = tokio::spawn(async move {
+        let mut server = server;
+        let mut received = Vec::with_capacity(total);
+        let mut buf = [0u8; 65536];
+        while received.len() < total {
+            let n = tokio::time::timeout(std::time::Duration::from_secs(10), server.read(&mut buf))
+                .await
+                .expect("read timed out")
+                .expect("read failed");
+            assert!(n > 0, "unexpected EOF at {} bytes", received.len());
+            received.extend_from_slice(&buf[..n]);
+        }
+        received
+    });
+
+    let (writer_res, reader_res) = tokio::join!(writer, reader);
+    let _client = writer_res.unwrap();
+    let received = reader_res.unwrap();
+
+    assert_eq!(received.len(), total, "byte count mismatch");
+    // Verify per-chunk ordering marker survived the pipeline.
+    for i in 0..chunks {
+        assert_eq!(
+            received[i * chunk_len],
+            (i % 251) as u8,
+            "chunk {i} out of order or corrupted"
+        );
+    }
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn pipelined_transfer_default() {
+    pipelined_transfer(SendRecvConfig::stream_with_depth(16)).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn pipelined_transfer_ring() {
+    require_no_iwarp!();
+    pipelined_transfer(CreditRingConfig::default()).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn pipelined_transfer_read_ring() {
+    require_no_iwarp!();
+    pipelined_transfer(ReadRingConfig::default()).await;
+}
+
+// ===========================================================================
 // futures_io_echo — echo via futures::io::AsyncReadExt / AsyncWriteExt traits.
 // ===========================================================================
 

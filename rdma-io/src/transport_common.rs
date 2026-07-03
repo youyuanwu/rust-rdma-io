@@ -253,19 +253,41 @@ pub(crate) fn effective_max_outstanding(
     max_in_flight: Option<usize>,
     headroom: usize,
 ) -> usize {
+    let device_limit = pd
+        .context()
+        .query_device()
+        .ok()
+        .map(|a| (a.max_qp_wr as usize).min(a.max_cqe as usize))
+        .unwrap_or(usize::MAX);
+    clamp_max_outstanding(
+        ring_capacity,
+        max_message_size,
+        max_in_flight,
+        headroom,
+        device_limit,
+    )
+}
+
+/// Pure slot-count math behind [`effective_max_outstanding`], split out so the
+/// clamping/undercount logic can be unit-tested without a device.
+///
+/// `device_limit` is `min(max_qp_wr, max_cqe)` for the target device (pass
+/// [`usize::MAX`] to model an unbounded device). The `send_cq_depth` is
+/// `max_outstanding + headroom` and `recv_cq_depth` is `max_outstanding + 2`,
+/// so `reserve = headroom.max(2)` slots are held back from `device_limit`.
+fn clamp_max_outstanding(
+    ring_capacity: usize,
+    max_message_size: usize,
+    max_in_flight: Option<usize>,
+    headroom: usize,
+    device_limit: usize,
+) -> usize {
     let derived = (ring_capacity / max_message_size.max(1)).max(1);
     let requested = max_in_flight.unwrap_or(derived).max(1);
     // send_cq_depth = max_outstanding + headroom, recv_cq_depth = max_outstanding
     // + 2; both must fit max_qp_wr and max_cqe.
     let reserve = headroom.max(2);
-    let device_cap = pd
-        .context()
-        .query_device()
-        .ok()
-        .map(|a| (a.max_qp_wr as usize).min(a.max_cqe as usize))
-        .unwrap_or(usize::MAX)
-        .saturating_sub(reserve)
-        .max(1);
+    let device_cap = device_limit.saturating_sub(reserve).max(1);
     requested.min(device_cap).max(1)
 }
 
@@ -412,4 +434,56 @@ pub(crate) fn drain_send_cq(qp: &AsyncQp) -> crate::Result<usize> {
         }
     }
     Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clamp_max_outstanding;
+
+    // Default derivation: ring_capacity / max_message_size, device unbounded.
+    #[test]
+    fn derives_slot_count_from_ring_and_message_size() {
+        // 64 KiB ring, 1500 B messages -> 43 slots.
+        assert_eq!(clamp_max_outstanding(65536, 1500, None, 3, usize::MAX), 43);
+    }
+
+    // The undercount the fix targets: small messages get far fewer slots than
+    // the ring could actually hold, until max_in_flight overrides it.
+    #[test]
+    fn explicit_in_flight_overrides_message_size_derivation() {
+        // Without override, 64 B messages derive 1024 slots...
+        assert_eq!(clamp_max_outstanding(65536, 64, None, 3, usize::MAX), 1024);
+        // ...but an explicit budget takes precedence over the derived value.
+        assert_eq!(
+            clamp_max_outstanding(65536, 1500, Some(256), 3, usize::MAX),
+            256
+        );
+    }
+
+    // Result is clamped to the device queue limit minus reserve headroom.
+    #[test]
+    fn clamps_to_device_limit_minus_reserve() {
+        // reserve = headroom.max(2) = 3; device_limit 100 -> cap 97.
+        assert_eq!(clamp_max_outstanding(65536, 1, Some(10_000), 3, 100), 97);
+    }
+
+    // reserve floors at 2 even when headroom is smaller.
+    #[test]
+    fn reserve_floors_at_two() {
+        // headroom 0 -> reserve 2; device_limit 50 -> cap 48.
+        assert_eq!(clamp_max_outstanding(65536, 1, Some(10_000), 0, 50), 48);
+    }
+
+    // Always at least 1, even with degenerate inputs.
+    #[test]
+    fn never_below_one() {
+        // Zero max_message_size must not divide-by-zero; tiny device limit still
+        // yields at least 1 slot.
+        assert_eq!(clamp_max_outstanding(65536, 0, None, 3, 1), 1);
+        assert_eq!(clamp_max_outstanding(0, 1500, None, 3, usize::MAX), 1);
+        assert_eq!(
+            clamp_max_outstanding(65536, 1500, Some(0), 3, usize::MAX),
+            1
+        );
+    }
 }

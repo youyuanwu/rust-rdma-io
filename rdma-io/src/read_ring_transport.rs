@@ -995,6 +995,14 @@ impl Transport for ReadRingTransport {
             }
         }
 
+        debug_assert!(
+            self.send_in_flight + usize::from(self.read_in_flight) <= self.sq_capacity,
+            "send queue overflow after send_copy: {} + {} > {}",
+            self.send_in_flight,
+            usize::from(self.read_in_flight),
+            self.sq_capacity
+        );
+
         Ok(data_len)
     }
 
@@ -1282,5 +1290,23 @@ impl TransportBuilder for ReadRingConfig {
 
     async fn accept(&self, listener: &AsyncCmListener) -> crate::Result<ReadRingTransport> {
         ReadRingTransport::accept(listener, self.clone()).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ReadRingConfig;
+
+    // Default derives the slot count from message size (max_in_flight unset).
+    #[test]
+    fn default_has_no_explicit_in_flight() {
+        assert_eq!(ReadRingConfig::default().max_in_flight, None);
+    }
+
+    // with_max_in_flight sets an explicit pipeline budget.
+    #[test]
+    fn with_max_in_flight_sets_budget() {
+        let c = ReadRingConfig::default().with_max_in_flight(256);
+        assert_eq!(c.max_in_flight, Some(256));
     }
 }

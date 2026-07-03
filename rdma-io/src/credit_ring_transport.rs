@@ -674,6 +674,13 @@ impl CreditRingTransport {
     /// skip and retry after a send completes (see `poll_send_completion`). This
     /// keeps `send_in_flight` within the send-queue depth so `ibv_post_send`
     /// never returns ENOMEM. See docs/bugs/ring-send-queue-exhaustion.md.
+    ///
+    /// The tight `send_copy` `+ 2` backpressure accounting relies on this only
+    /// ever being called from the completion/release paths
+    /// (`poll_send_completion` and the recv-side slot release), never mid
+    /// `send_copy`. If that assumption changes, a concurrently posted credit
+    /// could consume a slot `send_copy` had reserved for its padding+data pair
+    /// and overflow the send queue.
     fn flush_credits(&mut self) -> crate::Result<()> {
         if self.local_freed_credits > self.credits_sent && self.send_in_flight < self.sq_capacity {
             let imm = self.local_freed_credits as u32;
@@ -682,6 +689,12 @@ impl CreditRingTransport {
             self.qp.post_send_wr(&mut wr)?;
             self.credits_sent = self.local_freed_credits;
             self.send_in_flight += 1;
+            debug_assert!(
+                self.send_in_flight <= self.sq_capacity,
+                "send queue overflow after credit post: {} > {}",
+                self.send_in_flight,
+                self.sq_capacity
+            );
         }
         Ok(())
     }
@@ -806,6 +819,13 @@ impl Transport for CreditRingTransport {
         self.remote_write_tail = (remote_offset + data_len) % self.remote_capacity;
         self.remote_credits -= 1;
         self.send_in_flight += 1;
+
+        debug_assert!(
+            self.send_in_flight <= self.sq_capacity,
+            "send queue overflow after data post: {} > {}",
+            self.send_in_flight,
+            self.sq_capacity
+        );
 
         tracing::debug!(
             data_len,
@@ -1158,5 +1178,23 @@ impl TransportBuilder for CreditRingConfig {
 
     async fn accept(&self, listener: &AsyncCmListener) -> crate::Result<CreditRingTransport> {
         CreditRingTransport::accept(listener, self.clone()).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CreditRingConfig;
+
+    // Default derives the slot count from message size (max_in_flight unset).
+    #[test]
+    fn default_has_no_explicit_in_flight() {
+        assert_eq!(CreditRingConfig::default().max_in_flight, None);
+    }
+
+    // with_max_in_flight sets an explicit pipeline budget.
+    #[test]
+    fn with_max_in_flight_sets_budget() {
+        let c = CreditRingConfig::default().with_max_in_flight(256);
+        assert_eq!(c.max_in_flight, Some(256));
     }
 }
