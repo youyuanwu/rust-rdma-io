@@ -61,6 +61,11 @@ pub struct RecvCompletion {
     pub byte_len: usize,
 }
 
+/// Default [`Transport::recv_window`] for transports that don't expose a
+/// distinct recv-side window. Sized so the derived write-blocked drain stash
+/// keeps its historical floor.
+pub const DEFAULT_RECV_WINDOW: usize = 48;
+
 /// Shared abstraction for RDMA data-path operations.
 ///
 /// Implementations own the QP, buffers, CQ state, and connection lifecycle.
@@ -145,6 +150,16 @@ pub trait Transport: Send + Sync {
     fn disconnect(&mut self) -> Result<()>;
 
     // --- Metadata ---
+
+    /// The transport's recv-side window: how many in-flight recv messages it can
+    /// track before the peer must be throttled (doorbell pool / credit count /
+    /// recv-buffer count). Stream adapters size the write-blocked drain stash
+    /// strictly above this, so raising a transport's in-flight budget can't
+    /// silently make the stash the binding backpressure limit. Defaults to a
+    /// conservative constant for transports that don't expose a distinct window.
+    fn recv_window(&self) -> usize {
+        DEFAULT_RECV_WINDOW
+    }
 
     /// Local socket address of this connection.
     fn local_addr(&self) -> Option<SocketAddr>;

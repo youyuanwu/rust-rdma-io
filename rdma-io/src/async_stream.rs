@@ -62,11 +62,27 @@ const MAX_GATHER: usize = 64 * 1024;
 
 /// Cap on the number of recycled `recv_stash` buffers kept in `stash_pool` for
 /// reuse, so the write-blocked drain path avoids reallocating on the common
-/// case without letting the pool grow without bound. This does *not* bound how
-/// much the drain reaps (it drains the recv CQ to completion); it only bounds
-/// the idle free-list. See
+/// case without letting the free-list grow without bound. This is a
+/// memory-reuse cap only (correctness-neutral); the write-blocked drain's
+/// absorption limit is [`stash_drain_cap`], derived from the transport's recv
+/// window. See
 /// [`AsyncRdmaStream::stash_pool`](AsyncRdmaStream#structfield.stash_pool).
-const MAX_STASH_BUFS: usize = 64;
+const STASH_POOL_CAP: usize = 64;
+
+/// Extra stash headroom above the transport's recv window, so the write-blocked
+/// drain can absorb a full peer window and still reach `poll_recv == Pending`
+/// (registering the recv waker) before it stops on a full stash.
+const STASH_HEADROOM: usize = 16;
+
+/// Write-blocked drain absorption cap: how many owned buffers the drain stashes
+/// before it stops and lets the transport's own byte-backpressure apply. Kept
+/// strictly above the transport's recv window (`recv_window`) so raising a
+/// transport's in-flight budget can't silently make the stash the binding
+/// backpressure limit; floored at [`STASH_POOL_CAP`] to preserve the historical
+/// 64-buffer stash for small-window transports.
+fn stash_drain_cap(recv_window: usize) -> usize {
+    (recv_window + STASH_HEADROOM).max(STASH_POOL_CAP)
+}
 
 /// An async RDMA stream with `read` and `write` methods.
 ///
@@ -188,7 +204,7 @@ impl<T: Transport> AsyncRdmaStream<T> {
 
     /// Return a fully-consumed stash buffer to the pool for reuse (capped).
     fn recycle_stash_buf(&mut self, mut buf: Vec<u8>) {
-        if self.stash_pool.len() < MAX_STASH_BUFS {
+        if self.stash_pool.len() < STASH_POOL_CAP {
             buf.clear();
             self.stash_pool.push(buf);
         }
@@ -286,7 +302,7 @@ impl<T: Transport> AsyncRdmaStream<T> {
             // full we stop and rely on the send-CQ / byte-backpressure wakeup.
             // See docs/bugs/read-ring-concurrent-stream-deadlock.md.
             loop {
-                if this.recv_stash.len() >= MAX_STASH_BUFS {
+                if this.recv_stash.len() >= stash_drain_cap(this.transport.recv_window()) {
                     break;
                 }
                 let mut completions = [RecvCompletion::default(); 16];

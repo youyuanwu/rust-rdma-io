@@ -327,6 +327,10 @@ impl Transport for SendRecvTransport {
         self.send_in_flight.iter().filter(|&&busy| busy).count()
     }
 
+    fn recv_window(&self) -> usize {
+        self.recv_bufs.len()
+    }
+
     fn poll_recv(
         &mut self,
         cx: &mut Context<'_>,

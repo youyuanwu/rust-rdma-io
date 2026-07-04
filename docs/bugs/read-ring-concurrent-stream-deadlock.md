@@ -299,6 +299,127 @@ Before lifting the bench `in_flight = 1` cap, validate fix A at `in_flight`
 4/8/16 on the MANA RoCEv2 preview (the CM is flaky there, so use
 `reboot_between`/retries).
 
+## Design analysis: why it deadlocks, and the fix options
+
+This section records the mechanism and the fix trade-offs worked out while
+root-causing the bidirectional stall, so the reasoning isn't lost. Nothing here
+is implemented beyond the two lost-wakeup fixes above; it's the map for a future
+rework.
+
+### 1. Two backpressure paths — only one has a wakeup
+
+`send_copy` returns `Ok(0)` (backpressure) on two distinct conditions, and they
+behave very differently:
+
+- **Doorbell-blocked** — `send_in_flight + read_in_flight + SEND_COPY_MAX_WRS >
+  max_outstanding`. The sender already has as many Write+Imm in flight as the
+  peer has pre-posted doorbell recv WRs to catch them. This path returns `Ok(0)`
+  **without posting an RDMA Read**, so it leaves **no send-side heartbeat**. Its
+  only unblock is a send completion — a Write+Imm being caught by a peer doorbell
+  — which requires the peer to be *reaping and reposting doorbells* (draining).
+  This is the deadlock seed: a doorbell-blocked writer whose peer has stopped
+  draining parks with no wakeup (the capture signature: `rif = 0`, high stale
+  `send_in_flight`).
+- **Byte-blocked** — `remote_free_space() < data_len + min_free_threshold`. The
+  peer's recv **ring** is full. This path **posts an RDMA Read** of the peer's
+  head; the Read is one-sided and always completes, so the send CQ keeps firing
+  and the task keeps being re-polled. Benign.
+
+Which one you hit first depends on message size vs `ring_capacity /
+max_outstanding` (≈ 1.5 KB default): small messages exhaust the ~43 doorbell
+slots first (doorbell-blocked); large messages fill the byte ring first
+(byte-blocked). **Candidate mitigation:** post a Read on the doorbell-blocked
+path too, so a doorbell-blocked sender keeps a heartbeat instead of parking blind.
+
+### 2. Why credit-ring doesn't silent-park: push relief *with a wakeup*
+
+Both ring transports relieve backpressure only when the receiver consumes
+(`repost_recv`). The difference is **how the sender learns of the relief**:
+
+- **credit-ring** — `repost_recv` sends a credit update as a `Send+Imm` to the
+  sender; it lands on the **sender's recv CQ**, fires a completion event, and
+  **wakes the sender's task** (`drain_recv_credits` → `remote_credits += delta`).
+  The relief *is* a notification, so a doubly-write-blocked pair keeps waking each
+  other and stays live.
+- **read-ring** — `repost_recv` advances the head into a local atomic offset
+  buffer. That is **silent**: no message, no CQ event on the sender. The sender
+  must **pull** it via an RDMA Read (a send-side op), and when doorbell-blocked it
+  posts no Read → no wakeup → both peers go quiet. Silent park.
+
+So read-ring's flow control is **pull-based and silent**; credit-ring's is
+**push-based and self-notifying**. This is the crux of "make read-ring behave
+like credit-ring." (Caveat: credit-ring also grants credits only at consume and
+stashes bounded, so it is not *obviously* immune to the same stash-full ceiling —
+it has **not** been tested at the config that broke read-ring, `conn=4
+in_flight=8 payload=256`. Open item.)
+
+### 3. Why hyper stops servicing reads while write-blocked
+
+An HTTP/2 connection is driven by one `h2` task whose poll loop flushes pending
+writes *before* processing reads, propagating `Poll::Pending` from the flush via
+`ready!`. When the transport's write half returns `Pending` (our `send_copy`
+fully backpressured), the connection future short-circuits at the flush and never
+reaches the read/dispatch step; it parks on the **write** waker. Reads resume only
+when writes become writable again. This is correct and efficient on **TCP**, where
+write-readiness self-heals (the kernel drains the socket buffer regardless of
+reads). read-ring **violates that assumption**: its write-readiness is coupled to
+the peer *reading* (reposting doorbells), so "park until writable" can be
+permanent. send-recv/credit-ring don't couple write-completion to peer reads, so
+they satisfy hyper's assumption.
+
+### 4. Fix options and their limits
+
+- **A — Rate limiting / windowing.** Bound each connection's outstanding writes
+  (bytes *and* messages) strictly below the peer's guaranteed recv absorption
+  (ring + `virtual_idx_map` + stash). **Which layer matters:**
+  - **A1 (application-level) — the one that works.** Bound the total *unacked
+    requests* — a small h2 `INITIAL_WINDOW_SIZE` or an in-flight-RPC cap. This
+    caps how much data hyper buffers before it must read a response, so a
+    symmetric write-block can't form. `in_flight = 1` is the degenerate case.
+  - **A3 (transport-level send window) — TRIED, MEASURED INSUFFICIENT, REMOVED.**
+    A `send_copy` semaphore capping outstanding `Write+Imm`
+    (`ReadRingConfig::with_send_window`) was implemented and tested cross-VM at
+    the failing config `conn=4 in_flight=8 payload=256`: **both `window=8` and
+    `window=2` still wedge in warmup** (Connected → Warming up → hang), right
+    after a clean `in_flight=1` baseline (28.7k rps, 0 err). A transport send
+    window does **not** break this deadlock at *any* size — because the deadlock
+    is a *wakeup* problem (hyper won't poll reads while write-blocked; the recv
+    waker isn't registered at the backpressure boundary), **not** a send-*depth*
+    problem. Shrinking the window only makes both peers block sooner. The knob
+    was **removed** (it added a config surface without fixing anything); the
+    `in_flight = 1` cap stays.
+  Windowing is **guaranteed deadlock-free only at A1** (bound the smallest
+  message; the ~43-slot `virtual_idx_map`, not bytes, is binding for tiny
+  payloads), and caps pipeline depth (Little's law).
+- **B — Untangle doorbell reposting from consume (deferred item 1).** Keep
+  reaping + reposting doorbells past the stash cap (holding messages in
+  `virtual_idx_map`, data in the recv ring), so backpressure becomes byte-based
+  (ring-full, which has the Read heartbeat) instead of doorbell-RNR. Raises the
+  ceiling to `stash + virtual_idx_map + ring`, but `virtual_idx_map`
+  (`max_outstanding` ≈ 43) still bottoms out for small messages. **Necessary but
+  not sufficient alone.**
+- **C — Dedicated reader task (decouple reads from h2's write state).** Split the
+  transport into a **send half** and a **recv half** — read-ring's **dual CQs**
+  make this feasible (share the QP; `ibv_post_send` and `ibv_post_recv` are
+  different verbs) — and run the recv half as a driver task that always drains the
+  recv CQ (reap, repost doorbells, advance head, deliver into a bounded channel),
+  independent of the write path. `poll_read` pulls from the channel. A
+  write-blocked endpoint then frees its peer autonomously, up to the channel size.
+  This is the "behave like credit-ring" fix and lives primarily at the
+  **transport layer** (the recv half must be independently drainable), with a thin
+  stream/connection-driver wrapper. **Still bounded** by the channel size — a
+  large enough load reopens it — so C ≈ A with better ergonomics; a provable
+  guarantee is **C (removes write-gating) + A (bounds load)** together.
+
+**Recommendation.** For "safe soon" → **A1** (application-level window: h2
+`INITIAL_WINDOW_SIZE` or an in-flight-RPC cap) — **A3 (a transport send window)
+was implemented and measured *not* to break the deadlock, see §4**. For
+"pipeline properly like credit-ring" → C. B only as a companion. Given
+read-ring already trails send-recv/credit-ring at depth and those pipeline
+cleanly, keeping read-ring capped and steering pipelined gRPC to
+send-recv/credit-ring is the cheapest option unless read-ring's one-sided-write
+CPU profile is the specific target.
+
 ## Bidirectional gRPC stall: recv-CQ lost wakeup (fixed) + residual flow-control deadlock
 
 **The residual `in_flight > 1` gRPC stall was a lost *recv*-CQ wakeup on the

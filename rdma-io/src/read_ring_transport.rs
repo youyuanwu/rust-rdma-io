@@ -1046,6 +1046,10 @@ impl Transport for ReadRingTransport {
         self.send_in_flight
     }
 
+    fn recv_window(&self) -> usize {
+        self.max_outstanding
+    }
+
     fn poll_recv(
         &mut self,
         cx: &mut Context<'_>,
