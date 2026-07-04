@@ -187,6 +187,22 @@ symmetric write-block breaks the cycle.
   arms the send CQ (`req_notify`) independently of the async `CqPollState`.
   Removing that arm did **not** fix it either (same reason — wrong path). It may
   still be a latent hazard worth cleaning up alongside the real fix.
+- **In-process unit-test repro of the *bidirectional* stall (2026-07-04).**
+  Tried a single-process tonic test mirroring the bench topology: 8 h2 channels
+  (each its own RDMA connection) × 4 in-flight `say_hello` loops, 96k RPCs
+  sustained, no per-round barrier (the barrier'd `concurrent_unary_load` drains
+  each round and never wedges; a single channel at in_flight=8 doesn't either).
+  On MANA it does **not** reproduce the load stall (0 load-stalls in 15 runs);
+  every intermittent failure is a read-ring **CM connect wedge** at setup
+  (`ConnectError("expected Established, got Unreachable")` or a connect hang),
+  orthogonal to the data path. Adding connect retries made the load phase 15/15.
+  Meanwhile the **cross-VM bench** wedges *in the benchmark phase* — the client
+  log shows `Connected 8 clients` → `Warmup complete` → `Benchmarking for 8s…`
+  then hangs — so the stall is a genuine data-path event, but it needs real
+  cross-VM RTT: same-VM loopback latency never opens the timing window. The
+  bidirectional stall is therefore **not reproducible in a single-process unit
+  test**; the repro is the cross-VM bench
+  (`just run-bench mode=rh2 transport=read-ring connections=8 in_flight=4`).
 
 ## Fix applied (fix A — stream-layer eager slot release)
 
