@@ -345,16 +345,22 @@ async fn run_channel_clients(
     // keeps several requests — and therefore several transport sends — pipelined
     // instead of the strict one-at-a-time ping-pong.
     //
-    // read-ring is excepted: it has a known concurrent-stream deadlock (a
-    // bidirectional send-queue-full / doorbell RNR stall — see
-    // docs/bugs/read-ring-concurrent-stream-deadlock.md). Until the transport
-    // fix lands, cap it to one in-flight RPC per connection so the benchmark
-    // doesn't hang. send-recv and credit-ring pipeline safely.
+    // send-recv and credit-ring pipeline safely at depth > 1.
+    //
+    // read-ring is still capped to one in-flight RPC per connection. The
+    // transport-level RNR root cause (posting more Write+Imm than the peer has
+    // doorbells to catch) is now fixed — send_copy bounds outstanding Write+Imm
+    // to the peer's `max_outstanding` recv capacity, and doorbells are reposted
+    // eagerly at recv-CQ reap rather than at application read — which turns the
+    // former *deterministic* if=4 deadlock into a high pass rate (conn=8 if=4
+    // ~2/3, conn=1 if=8 ~3/4 on MANA RoCEv2). A residual *sustained-load* stall
+    // remains at in_flight > 1, so the benchmark still caps read-ring to 1 to
+    // avoid intermittent hangs. See docs/bugs/read-ring-concurrent-stream-deadlock.md.
     let mut depth = args.in_flight.max(1);
     if transport == "read-ring" && depth > 1 {
         eprintln!(
-            "warning: read-ring has a known concurrent-stream deadlock; capping \
-             --in-flight from {} to 1 (see docs/bugs/read-ring-concurrent-stream-deadlock.md)",
+            "warning: read-ring gRPC still has a residual concurrent-stream stall; \
+             capping --in-flight from {} to 1 (see docs/bugs/read-ring-concurrent-stream-deadlock.md)",
             args.in_flight
         );
         depth = 1;

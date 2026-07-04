@@ -60,11 +60,12 @@ use crate::transport::{RecvCompletion, Transport};
 /// limit, so it never under-fills a single send.
 const MAX_GATHER: usize = 64 * 1024;
 
-/// Max recv completions the write-blocked path will drain into the owned stash
-/// (and the cap on recycled stash buffers) before it stops draining and lets the
-/// transport's own backpressure apply. Bounds stash memory while leaving ample
-/// room to release the peer's flow control. See
-/// [`AsyncRdmaStream::recv_stash`](AsyncRdmaStream#structfield.recv_stash).
+/// Cap on the number of recycled `recv_stash` buffers kept in `stash_pool` for
+/// reuse, so the write-blocked drain path avoids reallocating on the common
+/// case without letting the pool grow without bound. This does *not* bound how
+/// much the drain reaps (it drains the recv CQ to completion); it only bounds
+/// the idle free-list. See
+/// [`AsyncRdmaStream::stash_pool`](AsyncRdmaStream#structfield.stash_pool).
 const MAX_STASH_BUFS: usize = 64;
 
 /// An async RDMA stream with `read` and `write` methods.
@@ -262,29 +263,31 @@ impl<T: Transport> AsyncRdmaStream<T> {
             // Blocked. Keep the scratch (vectored path) pinned until we post.
             this.write_blocked = true;
 
-            // Drain the recv CQ and RELEASE the slots immediately: copy the
-            // bytes into a pooled owned buffer and `repost_recv` now, instead of
-            // holding the transport slot until `poll_read` runs. This serves two
-            // purposes: (1) ring transports deliver credit updates on the recv
-            // CQ, so polling it re-arms this task's waker; (2) — the important
-            // one — it lets a write-blocked endpoint keep freeing its peer's
-            // flow control (doorbells/ring slots), which breaks the read-ring
-            // concurrent-stream deadlock where both peers wedge with full send
-            // queues and neither reads. Bounded by `MAX_STASH_BUFS`; once the
-            // stash is full we stop draining and let the transport's own
-            // backpressure apply. See docs/bugs/read-ring-concurrent-stream-deadlock.md.
-            if this.recv_stash.len() < MAX_STASH_BUFS {
-                let mut completions = [RecvCompletion::default(); 1];
-                if let Poll::Ready(Ok(got)) = this.transport.poll_recv(cx, &mut completions) {
-                    for c in completions.iter().take(got) {
-                        let buf_idx = c.buf_idx;
-                        let byte_len = c.byte_len;
-                        if byte_len > 0 {
-                            this.stash_recv(buf_idx, byte_len);
-                        }
-                        // Release the transport slot + doorbell now.
-                        let _ = this.transport.repost_recv(buf_idx);
+            // Drain a batch of recv completions and RELEASE each slot immediately:
+            // copy the bytes into a pooled owned buffer and `repost_recv` now,
+            // instead of holding the transport slot until `poll_read` runs. This
+            // serves two purposes: (1) ring transports deliver credit updates on
+            // the recv CQ, so polling it re-arms this task's waker; (2) — the
+            // important one — it lets a write-blocked endpoint keep freeing its
+            // peer's flow control: reposting doorbells (read-ring reposts at reap,
+            // in poll_recv) and advancing the recv-ring head. Without this, two
+            // peers both write-blocked over concurrent gRPC streams can wedge with
+            // full send queues, neither reading, so neither reposts the doorbells
+            // the other's Write+Imm needs. Reaping a batch here (rather than a
+            // full drain) keeps `poll_read` from starving on the same task while
+            // still releasing the peer. See
+            // docs/bugs/read-ring-concurrent-stream-deadlock.md.
+            let mut completions = [RecvCompletion::default(); 16];
+            if let Poll::Ready(Ok(got)) = this.transport.poll_recv(cx, &mut completions) {
+                for c in completions.iter().take(got) {
+                    let buf_idx = c.buf_idx;
+                    let byte_len = c.byte_len;
+                    if byte_len > 0 {
+                        this.stash_recv(buf_idx, byte_len);
                     }
+                    // Release the transport slot + head now (read-ring
+                    // already reposted the doorbell at reap in poll_recv).
+                    let _ = this.transport.repost_recv(buf_idx);
                 }
             }
 

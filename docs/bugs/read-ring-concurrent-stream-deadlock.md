@@ -15,18 +15,49 @@ future transport rework.
 
 ## Status
 
-**Stream-layer fix applied (fix A); transport-level rework still deferred.**
-`AsyncRdmaStream`'s write-blocked path now drains its recv CQ and *releases the
-slot immediately* — copying the bytes into an owned stash and calling
-`repost_recv` — so a write-blocked endpoint keeps replenishing its peer's
-doorbells instead of holding them. This breaks the symmetric-write-block cycle at
-the stream layer without changing the transport. See "Fix applied (fix A)" below.
+**RNR root cause fixed; a residual sustained-load stall remains, so the
+benchmark keeps read-ring gRPC capped at `in_flight = 1`.**
 
-The benchmark client still caps read-ring gRPC to `in_flight = 1` (with a
-warning); see [`run_channel_clients`](../../tests/rdma-io-bench/src/client.rs).
-That cap is retained pending validation of fix A on MANA RoCEv2 hardware — once
-confirmed there it can be lifted. read-ring at `in_flight = 1` and the direct
-echo path (`--mode echo`) were never affected.
+Three transport/stream changes landed on top of the original fix A:
+
+1. **Doorbell reposting decoupled from application reads.** `poll_recv` now
+   reposts the doorbell recv WR at the moment it *reaps* a data completion
+   (mirroring the padding branch), instead of only in `repost_recv` when the
+   app consumes the message. Recv-ring overwrite protection stays with the
+   independent RDMA-Read `head` flow control, so this is safe.
+2. **Outstanding Write+Imm bounded to the peer's recv capacity.** `send_copy`'s
+   backpressure guard now caps in-flight Write+Imm against `max_outstanding`
+   (the peer's doorbell / virtual-index count) rather than the deeper physical
+   `sq_capacity`. Previously the send queue could hold *more* Write+Imm than the
+   peer had doorbells to catch (measured `sif = 44` vs 43 doorbells), so 1-2
+   always RNR-stalled — the deadlock seed. This is the "doorbell headroom ≥ SQ
+   depth" fix from the deferred-work list below.
+3. **Single send-CQ poller.** `drain_send_cq_for_read` no longer arms the CQ
+   (`req_notify`); arming is owned solely by `poll_send_completion`'s
+   `CqPollState`, removing a dual-poller lost-wakeup hazard.
+
+**Measured effect on MANA RoCEv2** (rh2, 64 B, `--mw-fallback`): the former
+*deterministic* deadlock is gone — `conn=8 in_flight=4` now passes ~2/3
+(≈106-110k rps, 0 errors) and `conn=1 in_flight=8` ~3/4 (≈40k rps), where both
+were previously a hard hang. `in_flight = 1..4` are reliable. send-recv and
+credit-ring are unaffected (≈112k rps at `in_flight = 8`, 0 errors).
+
+**A residual stall remains at `in_flight > 1` under *sustained* load** (the
+benchmark phase, after warmup): occasionally both peers wedge with the client
+write-saturated (`sif ≈ 41`) and the server idle (`sif = 0`), *not* on doorbell
+exhaustion (`sif ≤ 42 ≤ 43` doorbells) — a deeper flow-control / h2-scheduling
+interaction not yet root-caused. Because of it the benchmark client still caps
+read-ring gRPC to `in_flight = 1` (with a warning); see
+[`run_channel_clients`](../../tests/rdma-io-bench/src/client.rs). read-ring at
+`in_flight = 1` and the direct echo path (`--mode echo`) were never affected.
+
+### Original fix A (superseded in part by the above)
+
+`AsyncRdmaStream`'s write-blocked path drains a batch of its recv CQ and
+*releases each slot immediately* — copying the bytes into an owned stash and
+calling `repost_recv` — so a write-blocked endpoint keeps replenishing its peer's
+doorbells (and advancing head) instead of holding them. This breaks the
+symmetric-write-block cycle at the stream layer. See "Fix applied (fix A)" below.
 
 This is **not a regression**: before concurrent RPCs were wired into the gRPC
 client, that path only ever issued one outstanding RPC per connection, so

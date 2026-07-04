@@ -828,12 +828,16 @@ impl ReadRingTransport {
 
     /// Non-blocking drain of send CQ to pick up RDMA Read completions.
     /// Also handles Write and padding completions encountered along the way.
+    ///
+    /// Does NOT arm the CQ for notification (`req_notify`): arming is owned
+    /// solely by `poll_send_completion`'s `CqPollState`. A second, independent
+    /// arm here races that state machine and can swallow the completion
+    /// notification `poll_send_completion` is waiting on, so a write whose
+    /// completion is drained here (or arrives right after) never wakes the
+    /// blocked writer — a lost-wakeup stall. Draining without arming is safe:
+    /// `poll_send_completion` re-polls and re-arms on its next call.
     fn drain_send_cq_for_read(&mut self) {
         let mut wc_buf = [WorkCompletion::default(); 8];
-        if self.qp.send_cq().cq().req_notify(false).is_err() {
-            self.peer_disconnected = true;
-            return;
-        }
         let n = match self.qp.send_cq().cq().poll(&mut wc_buf) {
             Ok(n) => n,
             Err(_) => {
@@ -899,19 +903,26 @@ impl Transport for ReadRingTransport {
             self.drain_send_cq_for_read();
         }
 
-        // Send-queue backpressure. A single send_copy can post up to
-        // SEND_COPY_MAX_WRS work requests (padding + data + a proactive
-        // RDMA-Read); if the send queue can't hold them, ibv_post_send would
-        // return ENOMEM. The remote-ring free-space check below is byte-based
-        // and, for small messages, would let far more messages in flight than
-        // the send queue has slots. Return Ok(0) (transient "cannot accept
-        // now", not a fatal error) so the caller reaps via poll_send_completion
-        // and retries — matching SendRecvTransport and the send_copy contract.
-        // (Reaping is left to poll_send_completion's CqPollState path; polling
-        // the CQ here would desync the edge-triggered notification and lose
-        // wakeups.) See docs/bugs/ring-send-queue-exhaustion.md.
+        // Doorbell / recv-capacity backpressure. Every data or padding
+        // Write+Imm we post must be caught by one of the peer's doorbell recv
+        // WRs, of which it pre-posts exactly `max_outstanding` (it also tracks
+        // at most `max_outstanding` unread messages in its virtual-index map).
+        // The physical send queue is deeper (`sq_capacity = max_outstanding +
+        // headroom`, sized for the extra RDMA-Read WR), so bounding purely on it
+        // would let MORE Write+Imm go in flight than the peer has doorbells to
+        // catch. The excess RNR-stalls on the peer's drained doorbell pool — and
+        // because a doorbell is only replenished when the peer reaps its recv CQ,
+        // two peers that both overshoot under concurrent bidirectional streaming
+        // wedge (the read-ring concurrent-stream deadlock). Cap outstanding
+        // Write+Imm against the peer's `max_outstanding` capacity instead, with
+        // SEND_COPY_MAX_WRS headroom for the padding + data pair a single
+        // send_copy can post; this keeps us within the physical send queue too
+        // (max_outstanding + used-headroom <= sq_capacity). Return Ok(0)
+        // (transient "cannot accept now") so the caller reaps and retries.
+        // See docs/bugs/read-ring-concurrent-stream-deadlock.md and
+        // docs/bugs/ring-send-queue-exhaustion.md.
         let sq_used = self.send_in_flight + usize::from(self.read_in_flight);
-        if sq_used + SEND_COPY_MAX_WRS > self.sq_capacity {
+        if sq_used + SEND_COPY_MAX_WRS > self.max_outstanding {
             return Ok(0);
         }
 
@@ -1174,6 +1185,29 @@ impl Transport for ReadRingTransport {
                         self.slot_lengths[seq % self.max_outstanding] = length;
                         self.next_virt_idx = (virt_idx + 1) % self.max_outstanding;
 
+                        // Repost the doorbell recv WR now that its completion is
+                        // reaped — do NOT wait for the application to consume the
+                        // message (repost_recv). The doorbell only catches the
+                        // Write+Imm's immediate; it carries no ring data, so
+                        // replenishing it here is independent of when the bytes are
+                        // read out. Recv-ring overwrite protection is provided
+                        // separately by the RDMA-Read `head` flow control
+                        // (advance_recv_head, still driven at app-read time from
+                        // repost_recv), so early reposting cannot clobber unread
+                        // data. Decoupling doorbell availability from stream read
+                        // progress is what makes sustained bidirectional streaming
+                        // (gRPC in_flight > 1) deadlock-free: a write-blocked peer
+                        // that merely reaps its recv CQ keeps its partner's
+                        // Write+Imm from RNR-stalling. Mirror the padding branch,
+                        // which already reposts inline.
+                        // See docs/bugs/read-ring-concurrent-stream-deadlock.md.
+                        if self.repost_doorbell().is_err() {
+                            self.peer_disconnected = true;
+                            return Poll::Ready(Err(crate::Error::InvalidArg(
+                                "repost_doorbell failed".into(),
+                            )));
+                        }
+
                         let rc = RecvCompletion {
                             buf_idx: virt_idx,
                             byte_len: length,
@@ -1211,8 +1245,11 @@ impl Transport for ReadRingTransport {
             .take()
             .expect("repost_recv called with invalid buf_idx");
 
-        // Repost a doorbell recv buffer.
-        self.repost_doorbell()?;
+        // NOTE: the doorbell recv WR was already reposted when this message's
+        // completion was reaped in poll_recv (see the data branch there); do not
+        // repost it again here or the recv queue would grow past max_recv_wr.
+        // This function now only advances the recv-ring `head` (freeing remote
+        // ring bytes for the sender) once the application has consumed the bytes.
 
         // Mark this arrival sequence slot as released and chase forward.
         let slot = arrival_seq % self.max_outstanding;
