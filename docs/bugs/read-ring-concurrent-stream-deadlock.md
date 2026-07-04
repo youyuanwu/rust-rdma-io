@@ -9,24 +9,28 @@ connection (`--in-flight > 1`). Both peers wedged with their send queues full an
 never recovered. `send-recv` and `credit-ring` do **not** have this problem and
 pipeline cleanly to the same depths.
 
-Resolved at the stream layer by fix A; the *unidirectional* sustained-load
-lost-wakeup stall was root-caused to `send_copy` reaping the send CQ out-of-band
-and fixed by making `poll_send_completion` the sole send-CQ owner (Status change
-4); and the *bidirectional* gRPC deadlock at `in_flight > 1` was root-caused to a
-lost *recv*-CQ wakeup and fixed by draining the write-blocked recv path to
-`Pending` so the recv waker is registered before parking (Status change 5). All
-three are validated on MANA; the benchmark's read-ring `in_flight = 1` cap is
-removed.
+Resolved at the stream layer by fix A; two transport **lost-wakeup** bugs were
+then found and fixed — the *unidirectional* send-CQ reap (`send_copy` reaping the
+send CQ out-of-band; Status change 4) and the write-blocked path not registering
+its *recv* waker (now drains `poll_recv` to `Pending`; Status change 5). These
+make read-ring gRPC reliable at modest aggregate load. **But the *bidirectional*
+flow-control deadlock that fix A only mitigates is still reachable at higher
+aggregate load** — both peers write-block with full stashes and neither reads —
+so the benchmark keeps read-ring gRPC capped at `in_flight = 1`.
 
 ## Status
 
-**Resolved.** The RNR root cause, the *unidirectional* sustained-load lost-wakeup
-(send CQ), and the *bidirectional* gRPC stall (recv CQ) are all fixed and
-validated on MANA RoCEv2. The last integration flake
-(`pipelined_transfer_read_ring`) is green (20/20), and the cross-VM gRPC bench
-runs `in_flight > 1` with **0 benchmark-phase stalls** (previously ~1/3) at
-≈113k rps for `conn=8 in_flight=4` — double the former capped `in_flight=1` rate.
-The benchmark's read-ring `in_flight = 1` cap is removed.
+**Two lost-wakeup bugs fixed; the fundamental bidirectional flow-control deadlock
+remains, so read-ring gRPC stays capped at `in_flight = 1`.** The RNR root cause,
+the *unidirectional* send-CQ lost wakeup, and the write-blocked recv-waker gap are
+all fixed — `pipelined_transfer_read_ring` is green (20/20) and the cross-VM gRPC
+bench is stall-free at modest load (validated `conn≤8 in_flight≤8`, 64 B, 0 stalls,
+≈113k rps at `conn=8 in_flight=4`). **However, the bidirectional deadlock still
+reproduces at higher aggregate load:** `conn=4 in_flight=8 payload=256`
+deterministically wedges in warmup on MANA RoCEv2 (both peers write-block with
+full recv stashes, neither reads). The safe boundary depends on
+connections × depth × payload, so the benchmark keeps the conservative
+`in_flight = 1` cap; use send-recv or credit-ring for pipelined gRPC.
 
 Five transport/stream changes landed on top of the original fix A:
 
@@ -60,17 +64,19 @@ Five transport/stream changes landed on top of the original fix A:
    [`read_ring_send_copy_must_not_reap_send_cq`](../../rdma-io-tests/tests/read_ring_transport_tests.rs),
    a deterministic invariant test (asserts `send_copy` never decreases
    `sends_in_flight()`) that failed on the old code and passes after the fix.
-5. **Write-blocked recv drain registers the recv waker (the *bidirectional*
-   stall fix).** Fix A's write-blocked drain in `poll_write_slice` polled the
-   recv CQ a single batch; when that returned `Ready` (data found) it left the
-   recv CQ drained-but-unwatched (`poll_recv` registers the recv waker only on
+5. **Write-blocked recv drain registers the recv waker (closes a lost-wakeup
+   gap).** Fix A's write-blocked drain in `poll_write_slice` polled the recv CQ a
+   single batch; when that returned `Ready` (data found) it left the recv CQ
+   drained-but-unwatched (`poll_recv` registers the recv waker only on
    `Pending`), then parked on the send CQ. Under HTTP/2 hyper stops polling reads
-   while the write is blocked, so the reader parked with no recv waker and a
+   while the write is blocked, so the reader could park with no recv waker and a
    response completion woke nobody. Now the drain **loops until `poll_recv`
-   returns `Pending`** (or the stash fills), so the recv waker is always
-   registered before parking. Transport-agnostic; see
-   [`poll_write_slice`](../../rdma-io/src/async_stream.rs). Details under
-   "Bidirectional gRPC stall" below.
+   returns `Pending`** (or the stash fills), so the recv waker is registered
+   before parking. Transport-agnostic; see
+   [`poll_write_slice`](../../rdma-io/src/async_stream.rs). This removes the lost
+   wakeup and makes read-ring gRPC reliable at modest load, but it does **not**
+   eliminate the underlying *bidirectional* flow-control deadlock once the recv
+   stash is full on both peers — see "Bidirectional gRPC stall" below.
 
 **Measured effect on MANA RoCEv2** (rh2, 64 B, `--mw-fallback`): the former
 *deterministic* deadlock is gone — `conn=8 in_flight=4` now passes ~2/3
@@ -82,14 +88,13 @@ credit-ring are unaffected (≈112k rps at `in_flight = 8`, 0 errors).
 wedged with the client write-saturated (`sif ≈ 41`) and the server idle
 (`sif = 0`), *not* on doorbell exhaustion (`sif ≤ 42 ≤ 43` doorbells) — a lost
 send-CQ wakeup caused by `send_copy`'s out-of-band reap. The *bidirectional*
-gRPC path at `in_flight > 1` was a distinct, deeper coupling that change 4 did
-**not** resolve; a cross-VM capture root-caused it to a lost *recv*-CQ wakeup on
-the reader (the recv-side analog of change 4), now **fixed** by having the
-write-blocked stream drain `poll_recv` to `Pending` so the recv waker is
-registered before parking — see
-[Bidirectional gRPC stall](#bidirectional-grpc-stall-lost-recv-cq-wakeup-cross-vm--fixed-2026-07-04)
-below. Validated on MANA (0 stalls, ≈113k rps at `in_flight=4`), so the
-benchmark's read-ring `in_flight = 1` cap is **removed**.
+gRPC path at `in_flight > 1` is a distinct, deeper coupling: a cross-VM capture
+root-caused a lost *recv*-CQ wakeup (the recv-side analog of change 4), fixed by
+change 5 (draining `poll_recv` to `Pending`). That removes the lost wakeup at
+modest load, but the underlying flow-control deadlock still reproduces once both
+recv stashes fill (`conn=4 in_flight=8 payload=256` wedges on MANA) — see
+[Bidirectional gRPC stall](#bidirectional-grpc-stall-recv-cq-lost-wakeup-fixed--residual-flow-control-deadlock)
+below. So the benchmark's read-ring `in_flight = 1` cap is **retained**.
 
 The stall reproduced on MANA in a **unidirectional** integration test
 (`pipelined_transfer_read_ring`) — a lost wakeup on the send-completion path,
@@ -285,15 +290,16 @@ backpressure-path copy — entirely. Candidate approaches:
    the `drain_send_cq_for_read` dual-poller hazard is now **removed** as well —
    `send_copy` no longer polls the send CQ, so `poll_send_completion` is the sole
    owner (Status change 4). This closed the residual *unidirectional* lost-wakeup
-   stall. The recv-side analog (the *bidirectional* gRPC stall) is now **also
-   fixed** — the write-blocked drain registers the recv waker before parking; see
-   "Bidirectional gRPC stall" below.
+stall. The recv-side analog (the *bidirectional* gRPC stall) is a lost recv-CQ
+   wakeup, fixed at modest load by the write-blocked drain registering the recv
+   waker before parking; the fundamental flow-control deadlock at high load
+   remains. See "Bidirectional gRPC stall" below.
 
 Before lifting the bench `in_flight = 1` cap, validate fix A at `in_flight`
 4/8/16 on the MANA RoCEv2 preview (the CM is flaky there, so use
 `reboot_between`/retries).
 
-## Bidirectional gRPC stall: lost recv-CQ wakeup (cross-VM) — FIXED 2026-07-04
+## Bidirectional gRPC stall: recv-CQ lost wakeup (fixed) + residual flow-control deadlock
 
 **The residual `in_flight > 1` gRPC stall was a lost *recv*-CQ wakeup on the
 reader — the recv-side analog of the send-CQ lost wakeup fixed in Status change
@@ -356,15 +362,29 @@ tell — the task parked on the read side while its own sends had already
 completed, so `poll_send_completion` was never even reached to re-arm.)
 
 The fix makes the write-blocked drain **loop until `poll_recv` returns `Pending`**
-(or the stash fills), so the recv waker is always registered before the task
-parks. It is transport-agnostic and bounded by `MAX_STASH_BUFS`.
+(or the stash fills), so the recv waker is registered before the task parks. It
+is transport-agnostic and bounded by `MAX_STASH_BUFS`.
 
-**Validated on MANA RoCEv2** (cross-VM, cap lifted): **0 benchmark-phase stalls**
-across all runs (previously ~1/3) — `conn=8 in_flight=4` at **≈113k rps** (double
-the `in_flight=1` ≈51k) and 7 clean `conn=1 in_flight=8` runs; every remaining
-failure was an orthogonal CM connect wedge, never the stall. In-process suites
-unaffected: `async_stream_tests` 37/37, `read_ring_transport_tests` 4/4. The
-benchmark's read-ring `in_flight = 1` cap is therefore **removed**.
+**Partially validated on MANA RoCEv2** (cross-VM, cap lifted): at modest load the
+lost wakeup is gone — **0 benchmark-phase stalls** at 64 B (`conn=8 in_flight=4`
+≈113k rps, double the `in_flight=1` ≈51k; `conn=1 in_flight=8` 7/7). In-process
+suites unaffected: `async_stream_tests` 37/37, `read_ring_transport_tests` 4/4.
+
+**But the fix is *not* complete.** When the recv stash fills to `MAX_STASH_BUFS`,
+the drain stops (to keep backpressuring the peer) *without* reaching `Pending`,
+so the recv waker is again unregistered — and at that point the peer's sends are
+RNR-stalled on our un-reposted doorbells, so no recv completion will arrive to
+fire even a registered waker. This is the **fundamental bidirectional
+flow-control deadlock** (both peers write-block with full stashes, neither reads),
+which fix A only mitigates — not a lost wakeup. It reproduces deterministically at
+higher aggregate load: **`conn=4 in_flight=8 payload=256` wedges in warmup** on
+MANA. A self-wake at the stash-full park was tried and rejected — it livelocks
+(the connection task busy-polls, starving the RPC tasks that would drain the
+stash). Because the safe boundary depends on connections × depth × payload, the
+benchmark's read-ring `in_flight = 1` cap is **retained**; send-recv and
+credit-ring remain the transports for pipelined gRPC. Genuinely lifting the cap
+needs the flow-control coupling itself removed (see deferred work) or the h2
+layer servicing reads while write-blocked.
 
 ## MANA unit-test reproduction: `pipelined_transfer` (unidirectional stall)
 
