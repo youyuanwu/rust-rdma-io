@@ -9,25 +9,26 @@ connection (`--in-flight > 1`). Both peers wedged with their send queues full an
 never recovered. `send-recv` and `credit-ring` do **not** have this problem and
 pipeline cleanly to the same depths.
 
-Resolved at the stream layer by fix A, and the *unidirectional* sustained-load
-lost-wakeup stall was then root-caused to `send_copy` reaping the send CQ
-out-of-band and fixed by making `poll_send_completion` the sole send-CQ owner
-(see Status, change 4). The *bidirectional* gRPC deadlock at `in_flight > 1`
-still stalls ~1/3 of runs on MANA and keeps the bench cap in place; the
-transport-level coupling that makes it possible is documented below.
+Resolved at the stream layer by fix A; the *unidirectional* sustained-load
+lost-wakeup stall was root-caused to `send_copy` reaping the send CQ out-of-band
+and fixed by making `poll_send_completion` the sole send-CQ owner (Status change
+4); and the *bidirectional* gRPC deadlock at `in_flight > 1` was root-caused to a
+lost *recv*-CQ wakeup and fixed by draining the write-blocked recv path to
+`Pending` so the recv waker is registered before parking (Status change 5). All
+three are validated on MANA; the benchmark's read-ring `in_flight = 1` cap is
+removed.
 
 ## Status
 
-**Resolved for the unidirectional stall; the bidirectional gRPC path at
-`in_flight > 1` still stalls intermittently, so the benchmark keeps read-ring
-gRPC capped at `in_flight = 1`.** The RNR root cause and the *unidirectional*
-sustained-load lost-wakeup stall are both fixed — the last-standing MANA
-integration flake (`pipelined_transfer_read_ring`) is green (20/20 after the fix,
-previously ~1/3 failures). The *bidirectional* gRPC benchmark deadlock is
-unchanged by the lost-wakeup fix: `conn=8 in_flight=4` still measures ~2/3 on
-MANA RoCEv2 (two runs ≈105k rps, 0 errors; one hang), the same rate as before.
+**Resolved.** The RNR root cause, the *unidirectional* sustained-load lost-wakeup
+(send CQ), and the *bidirectional* gRPC stall (recv CQ) are all fixed and
+validated on MANA RoCEv2. The last integration flake
+(`pipelined_transfer_read_ring`) is green (20/20), and the cross-VM gRPC bench
+runs `in_flight > 1` with **0 benchmark-phase stalls** (previously ~1/3) at
+≈113k rps for `conn=8 in_flight=4` — double the former capped `in_flight=1` rate.
+The benchmark's read-ring `in_flight = 1` cap is removed.
 
-Four transport/stream changes landed on top of the original fix A:
+Five transport/stream changes landed on top of the original fix A:
 
 1. **Doorbell reposting decoupled from application reads.** `poll_recv` now
    reposts the doorbell recv WR at the moment it *reaps* a data completion
@@ -59,6 +60,17 @@ Four transport/stream changes landed on top of the original fix A:
    [`read_ring_send_copy_must_not_reap_send_cq`](../../rdma-io-tests/tests/read_ring_transport_tests.rs),
    a deterministic invariant test (asserts `send_copy` never decreases
    `sends_in_flight()`) that failed on the old code and passes after the fix.
+5. **Write-blocked recv drain registers the recv waker (the *bidirectional*
+   stall fix).** Fix A's write-blocked drain in `poll_write_slice` polled the
+   recv CQ a single batch; when that returned `Ready` (data found) it left the
+   recv CQ drained-but-unwatched (`poll_recv` registers the recv waker only on
+   `Pending`), then parked on the send CQ. Under HTTP/2 hyper stops polling reads
+   while the write is blocked, so the reader parked with no recv waker and a
+   response completion woke nobody. Now the drain **loops until `poll_recv`
+   returns `Pending`** (or the stash fills), so the recv waker is always
+   registered before parking. Transport-agnostic; see
+   [`poll_write_slice`](../../rdma-io/src/async_stream.rs). Details under
+   "Bidirectional gRPC stall" below.
 
 **Measured effect on MANA RoCEv2** (rh2, 64 B, `--mw-fallback`): the former
 *deterministic* deadlock is gone — `conn=8 in_flight=4` now passes ~2/3
@@ -70,12 +82,14 @@ credit-ring are unaffected (≈112k rps at `in_flight = 8`, 0 errors).
 wedged with the client write-saturated (`sif ≈ 41`) and the server idle
 (`sif = 0`), *not* on doorbell exhaustion (`sif ≤ 42 ≤ 43` doorbells) — a lost
 send-CQ wakeup caused by `send_copy`'s out-of-band reap. The *bidirectional*
-gRPC path at `in_flight > 1` is a distinct, deeper coupling (both peers
-write-block, the h2 scheduler stops servicing reads) that change 4 does **not**
-resolve: `conn=8 in_flight=4` still stalls ~1/3 of runs on MANA. So the
-benchmark client still caps read-ring gRPC to `in_flight = 1` (with a warning);
-see [`run_channel_clients`](../../tests/rdma-io-bench/src/client.rs). Lifting
-that cap needs the bidirectional deadlock itself resolved (see deferred work).
+gRPC path at `in_flight > 1` was a distinct, deeper coupling that change 4 did
+**not** resolve; a cross-VM capture root-caused it to a lost *recv*-CQ wakeup on
+the reader (the recv-side analog of change 4), now **fixed** by having the
+write-blocked stream drain `poll_recv` to `Pending` so the recv waker is
+registered before parking — see
+[Bidirectional gRPC stall](#bidirectional-grpc-stall-lost-recv-cq-wakeup-cross-vm--fixed-2026-07-04)
+below. Validated on MANA (0 stalls, ≈113k rps at `in_flight=4`), so the
+benchmark's read-ring `in_flight = 1` cap is **removed**.
 
 The stall reproduced on MANA in a **unidirectional** integration test
 (`pipelined_transfer_read_ring`) — a lost wakeup on the send-completion path,
@@ -270,11 +284,87 @@ backpressure-path copy — entirely. Candidate approaches:
    head-refreshing Read now returns `Ready(Ok)` so the blocked writer re-polls);
    the `drain_send_cq_for_read` dual-poller hazard is now **removed** as well —
    `send_copy` no longer polls the send CQ, so `poll_send_completion` is the sole
-   owner (Status change 4). This closed the residual lost-wakeup stall.
+   owner (Status change 4). This closed the residual *unidirectional* lost-wakeup
+   stall. The recv-side analog (the *bidirectional* gRPC stall) is now **also
+   fixed** — the write-blocked drain registers the recv waker before parking; see
+   "Bidirectional gRPC stall" below.
 
 Before lifting the bench `in_flight = 1` cap, validate fix A at `in_flight`
 4/8/16 on the MANA RoCEv2 preview (the CM is flaky there, so use
 `reboot_between`/retries).
+
+## Bidirectional gRPC stall: lost recv-CQ wakeup (cross-VM) — FIXED 2026-07-04
+
+**The residual `in_flight > 1` gRPC stall was a lost *recv*-CQ wakeup on the
+reader — the recv-side analog of the send-CQ lost wakeup fixed in Status change
+4 — now fixed (see "Root cause and fix" below).** Captured on MANA with the client on vm2 and the server on vm1 (rh2,
+read-ring, `connections=8 in_flight=4`), both sides instrumented to dump
+transport state at every backpressure/park point (temporary `RRDIAG` logging).
+
+**Capture (both sides, 8 connections each):**
+
+| Signal | Client | Server |
+|---|---|---|
+| Last log timestamp | **t ≈ 4.97 s, then silent** | t ≈ 59.7 s (polled until the kill) |
+| Park point | **149× `poll_recv` Pending, 0× `poll_send_completion` Pending** | 159× `poll_recv` Pending |
+| `send_in_flight` at park | 34–41 (high) | 34–41 (high) |
+| `read_in_flight` | 0 | 0 |
+| remote free space | 10k–64k of 65536 (**not full**) | large |
+
+The connections wedge one-by-one (first at t ≈ 3.4 s, the rest by t ≈ 5 s), then
+the **client goes fully silent** — every task parked in `poll_recv` and never woke
+— while the server keeps getting polled to the 60 s timeout.
+
+**Mechanics:**
+
+1. The client sends its requests; `send_in_flight` climbs to ~38. Those Write+Imm
+   actually *complete* at the HW (the server catches the immediates), but the
+   count stays high because the client is parked in `poll_recv`, **not**
+   `poll_send_completion`, so it never reaps them. The high `send_in_flight` is
+   stale accounting, not a real send backlog.
+2. The client then parks in `poll_recv` with the recv CQ armed, waiting for the
+   responses.
+3. The server posts responses (its own `send_in_flight` is high). They arrive at
+   the client, its doorbell catches the immediate, and a completion lands on the
+   client's recv CQ — **but that completion never wakes the parked client.**
+4. The client's h2 tasks sleep forever → no new requests → the server starves
+   waiting for the next request → the whole connection set wedges.
+
+The alternatives are ruled out by the capture: `read_in_flight = 0` (not the
+RDMA-Read head-refresh path), remote free space large (not ring-full — only 3
+`ring-full`/`doorbell-bp` events total across the whole client run), and the park
+is on the **read** side, never `poll_send_completion`.
+
+**Why cross-VM only.** Real RTT opens the arm/park-vs-completion window: the
+server's response lands *just after* the client arms the recv CQ and parks.
+Same-VM loopback delivers completions synchronously enough that the drain-after-
+arm always catches them before the park, which is why the in-process tonic repro
+(8 conns × 4 in-flight, 96k RPCs) never reproduced it — every in-process failure
+was a CM connect wedge, not this stall (see the dead-ends note).
+
+**Root cause (confirmed) and fix.** Fix A's write-blocked drain in
+[`poll_write_slice`](../../rdma-io/src/async_stream.rs) polled the recv CQ a
+**single batch**. `poll_recv` registers this task's recv waker only on its
+`Pending` return; when the batch came back `Ready` (data found) it left the recv
+CQ drained-but-unwatched, and the path then parked on the **send** CQ
+(`poll_send_completion` Pending) — registering only the send waker. Under
+HTTP/2, hyper stops polling reads once the connection's write is blocked, so this
+drain was the *only* thing that would have registered the recv waker. With it
+returning `Ready`, the reader parked with no recv waker: the server's response
+completion arrived and woke nobody. (The high stale `send_in_flight` is the
+tell — the task parked on the read side while its own sends had already
+completed, so `poll_send_completion` was never even reached to re-arm.)
+
+The fix makes the write-blocked drain **loop until `poll_recv` returns `Pending`**
+(or the stash fills), so the recv waker is always registered before the task
+parks. It is transport-agnostic and bounded by `MAX_STASH_BUFS`.
+
+**Validated on MANA RoCEv2** (cross-VM, cap lifted): **0 benchmark-phase stalls**
+across all runs (previously ~1/3) — `conn=8 in_flight=4` at **≈113k rps** (double
+the `in_flight=1` ≈51k) and 7 clean `conn=1 in_flight=8` runs; every remaining
+failure was an orthogonal CM connect wedge, never the stall. In-process suites
+unaffected: `async_stream_tests` 37/37, `read_ring_transport_tests` 4/4. The
+benchmark's read-ring `in_flight = 1` cap is therefore **removed**.
 
 ## MANA unit-test reproduction: `pipelined_transfer` (unidirectional stall)
 

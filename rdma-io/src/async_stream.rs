@@ -263,31 +263,54 @@ impl<T: Transport> AsyncRdmaStream<T> {
             // Blocked. Keep the scratch (vectored path) pinned until we post.
             this.write_blocked = true;
 
-            // Drain a batch of recv completions and RELEASE each slot immediately:
-            // copy the bytes into a pooled owned buffer and `repost_recv` now,
-            // instead of holding the transport slot until `poll_read` runs. This
-            // serves two purposes: (1) ring transports deliver credit updates on
-            // the recv CQ, so polling it re-arms this task's waker; (2) — the
-            // important one — it lets a write-blocked endpoint keep freeing its
-            // peer's flow control: reposting doorbells (read-ring reposts at reap,
-            // in poll_recv) and advancing the recv-ring head. Without this, two
-            // peers both write-blocked over concurrent gRPC streams can wedge with
-            // full send queues, neither reading, so neither reposts the doorbells
-            // the other's Write+Imm needs. Reaping a batch here (rather than a
-            // full drain) keeps `poll_read` from starving on the same task while
-            // still releasing the peer. See
-            // docs/bugs/read-ring-concurrent-stream-deadlock.md.
-            let mut completions = [RecvCompletion::default(); 16];
-            if let Poll::Ready(Ok(got)) = this.transport.poll_recv(cx, &mut completions) {
-                for c in completions.iter().take(got) {
-                    let buf_idx = c.buf_idx;
-                    let byte_len = c.byte_len;
-                    if byte_len > 0 {
-                        this.stash_recv(buf_idx, byte_len);
+            // Drain recv completions and RELEASE each slot immediately: copy the
+            // bytes into a pooled owned buffer and `repost_recv` now, instead of
+            // holding the transport slot until `poll_read` runs. This lets a
+            // write-blocked endpoint keep freeing its peer's flow control:
+            // reposting doorbells (read-ring reposts at reap, in poll_recv) and
+            // advancing the recv-ring head. Without it, two peers both
+            // write-blocked over concurrent gRPC streams wedge with full send
+            // queues, neither reading, so neither reposts the doorbells the
+            // other's Write+Imm needs.
+            //
+            // Loop until `poll_recv` returns `Pending` (or the stash fills), NOT
+            // just one batch. The `Pending` return is what registers this task's
+            // recv waker; a single `Ready` batch leaves the recv CQ
+            // drained-but-unwatched, so if we then park on the send CQ (below) a
+            // recv completion arriving while write-blocked would never wake us.
+            // Under HTTP/2 the connection often stops polling reads once the write
+            // is blocked, so this drain is the only thing keeping the recv waker
+            // armed — without the loop the reader wedges (the residual
+            // *bidirectional* read-ring stall: a lost recv-CQ wakeup, the
+            // recv-side analog of the send-CQ fix). Bounded by the stash cap: once
+            // full we stop and rely on the send-CQ / byte-backpressure wakeup.
+            // See docs/bugs/read-ring-concurrent-stream-deadlock.md.
+            loop {
+                if this.recv_stash.len() >= MAX_STASH_BUFS {
+                    break;
+                }
+                let mut completions = [RecvCompletion::default(); 16];
+                match this.transport.poll_recv(cx, &mut completions) {
+                    Poll::Ready(Ok(got)) => {
+                        if got == 0 {
+                            break;
+                        }
+                        for c in completions.iter().take(got) {
+                            let buf_idx = c.buf_idx;
+                            let byte_len = c.byte_len;
+                            if byte_len > 0 {
+                                this.stash_recv(buf_idx, byte_len);
+                            }
+                            // Release the transport slot + head now (read-ring
+                            // already reposted the doorbell at reap in poll_recv).
+                            let _ = this.transport.repost_recv(buf_idx);
+                        }
                     }
-                    // Release the transport slot + head now (read-ring
-                    // already reposted the doorbell at reap in poll_recv).
-                    let _ = this.transport.repost_recv(buf_idx);
+                    // An error surfaces below via `poll_disconnect` / the next
+                    // `send_copy`; stop draining either way.
+                    Poll::Ready(Err(_)) => break,
+                    // Recv CQ empty and its waker is now registered — safe to park.
+                    Poll::Pending => break,
                 }
             }
 

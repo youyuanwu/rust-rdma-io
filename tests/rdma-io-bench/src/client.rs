@@ -422,29 +422,20 @@ async fn run_channel_clients(
     // keeps several requests — and therefore several transport sends — pipelined
     // instead of the strict one-at-a-time ping-pong.
     //
-    // send-recv and credit-ring pipeline safely at depth > 1.
+    // send-recv, credit-ring, and now read-ring all pipeline safely at depth > 1.
     //
-    // read-ring is still capped to one in-flight RPC per connection. Two related
-    // stalls were fixed — the RNR root cause (send_copy now bounds outstanding
-    // Write+Imm to the peer's `max_outstanding` recv capacity, doorbells reposted
-    // eagerly at recv-CQ reap) and the *unidirectional* sustained-load lost
-    // wakeup (send_copy no longer reaps the send CQ out-of-band, so
-    // `poll_send_completion` owns it; `pipelined_transfer_read_ring` is 20/20 on
-    // MANA). But the *bidirectional* gRPC path at in_flight > 1 still stalls
-    // intermittently (conn=8 in_flight=4 measured 2/3 on MANA RoCEv2: two runs
-    // ~105k rps 0 errors, one hang) — both peers write-block and the h2 scheduler
-    // stops servicing reads, a deeper coupling than the send-CQ fix addresses. So
-    // the benchmark keeps read-ring gRPC capped at 1 to avoid intermittent hangs.
+    // read-ring reached parity after three fixes: the RNR root cause (send_copy
+    // bounds outstanding Write+Imm to the peer's `max_outstanding` recv capacity,
+    // doorbells reposted eagerly at recv-CQ reap), the *unidirectional*
+    // sustained-load lost wakeup (send_copy no longer reaps the send CQ
+    // out-of-band, so `poll_send_completion` owns it), and the *bidirectional*
+    // lost recv-CQ wakeup — the write-blocked stream path now drains poll_recv to
+    // Pending so the recv waker is always registered before parking (see
+    // AsyncRdmaStream::poll_write_slice). Validated on MANA RoCEv2: conn=8
+    // in_flight=4 ≈113k rps and conn=1 in_flight=8 with 0 benchmark-phase stalls
+    // (previously ~1/3). The former `in_flight = 1` cap is removed.
     // See docs/bugs/read-ring-concurrent-stream-deadlock.md.
-    let mut depth = args.in_flight.max(1);
-    if transport == "read-ring" && depth > 1 {
-        eprintln!(
-            "warning: read-ring gRPC still has a residual concurrent-stream stall; \
-             capping --in-flight from {} to 1 (see docs/bugs/read-ring-concurrent-stream-deadlock.md)",
-            args.in_flight
-        );
-        depth = 1;
-    }
+    let depth = args.in_flight.max(1);
 
     // Warmup
     if args.warmup > 0 {
