@@ -24,6 +24,69 @@ pub mod test_helpers {
         };
     }
 
+    /// Returns `true` if a software RDMA device (siw or rxe) is present.
+    ///
+    /// The low-level verbs smoke tests (`sys_tests`, `safe_api_tests`) open the
+    /// first/software device directly (no `rdma_cm` routing). That works on the
+    /// siw/rxe devices used in CI, but on real multi-device NICs (e.g. Azure
+    /// MANA exposes both an `rdmaP*` and a `roceP*` device) `open_first_device`
+    /// can pick a device that rejects raw PD/QP/GID operations (ENODEV/EPERM).
+    /// Those tests gate on this so they run in CI and skip on such hardware.
+    pub fn has_software_rdma() -> bool {
+        rdma_io::device::devices()
+            .map(|ds| {
+                ds.iter()
+                    .any(|d| d.name().starts_with("siw") || d.name().starts_with("rxe"))
+            })
+            .unwrap_or(false)
+    }
+
+    /// Returns `true` if any local device advertises RDMA atomic support
+    /// (`atomic_cap != IBV_ATOMIC_NONE`).
+    ///
+    /// Some RoCE NICs (e.g. the Azure MANA RoCEv2 preview) do not support RDMA
+    /// atomics (CompareAndSwap / FetchAndAdd); tests exercising them gate on
+    /// this so they run on atomic-capable devices (rxe) and skip elsewhere.
+    pub fn supports_atomics() -> bool {
+        let devices = match rdma_io::device::devices() {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
+        devices.iter().any(|d| {
+            d.open()
+                .and_then(|ctx| ctx.query_device())
+                .map(|attr| attr.atomic_cap != rdma_io_sys::ibverbs::IBV_ATOMIC_NONE)
+                .unwrap_or(false)
+        })
+    }
+
+    /// Skip test if no software RDMA device (siw/rxe) is present. See
+    /// [`has_software_rdma`]. Used by the low-level verbs smoke tests that open
+    /// the first/software device without `rdma_cm` routing.
+    #[macro_export]
+    macro_rules! require_software_rdma {
+        () => {
+            if !rdma_io_tests::test_helpers::has_software_rdma() {
+                tracing::warn!("SKIPPED: test requires a software RDMA device (siw/rxe)");
+                return;
+            }
+        };
+    }
+
+    /// Skip test if no local device supports RDMA atomics. See
+    /// [`supports_atomics`].
+    #[macro_export]
+    macro_rules! require_atomics {
+        () => {
+            if !rdma_io_tests::test_helpers::supports_atomics() {
+                tracing::warn!(
+                    "SKIPPED: test requires RDMA atomic support (device atomic_cap == NONE)"
+                );
+                return;
+            }
+        };
+    }
+
     /// Discover the first non-loopback IPv4 address (for siw0 over eth0).
     ///
     /// Uses the UDP connect trick: binding to 0.0.0.0 then "connecting" to an

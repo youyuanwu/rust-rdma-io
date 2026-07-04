@@ -19,6 +19,7 @@ use rdma_io::mr::{AccessFlags, RemoteMr};
 use rdma_io::pd::ProtectionDomain;
 use rdma_io::qp::QpInitAttr;
 use rdma_io::wr::QpType;
+use rdma_io_tests::require_atomics;
 use rdma_io_tests::require_no_iwarp;
 
 use rdma_io_tests::test_helpers::connect_addr_for;
@@ -327,6 +328,7 @@ const REMOTE_ATOMIC_ACCESS: AccessFlags = AccessFlags::LOCAL_WRITE
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn async_qp_atomic_compare_and_swap() {
     require_no_iwarp!();
+    require_atomics!();
     let (server, client) = setup_connection().await;
 
     // Server MR with remote atomic access — 8 bytes for one u64, initialized to 0
@@ -407,6 +409,7 @@ async fn async_qp_atomic_fetch_and_add() {
     let (server, client) = setup_connection().await;
 
     require_no_iwarp!();
+    require_atomics!();
 
     // Server MR initialized to 10 (little-endian u64)
     let mut init_data = vec![0u8; 8];

@@ -8,6 +8,7 @@ use rdma_io::credit_ring_transport::CreditRingConfig;
 use rdma_io::read_ring_transport::ReadRingConfig;
 use rdma_io::send_recv_transport::SendRecvConfig;
 use rdma_io::transport::TransportBuilder;
+use rdma_io::transport_common::MemoryWindowMode;
 use rdma_io::wr::QpType;
 use rdma_io_quinn::RdmaUdpSocket;
 use rdma_io_tonic::RdmaIncoming;
@@ -32,10 +33,13 @@ struct Args {
     #[arg(long, default_value = "send-recv")]
     transport: String,
 
-    /// Use the MR rkey instead of a Type-2 Memory Window for the ring
-    /// transports. Required on NICs that report max_mw=0 (e.g. Azure MANA).
+    /// Force Type-2 Memory Windows for the ring transports instead of the
+    /// default auto-detect. By default the transport binds a Memory Window
+    /// when the NIC supports one and falls back to the MR rkey automatically on
+    /// NICs that report max_mw=0 (e.g. Azure MANA). Pass this to fail fast
+    /// instead (useful on MW-capable NICs / in CI).
     #[arg(long, default_value_t = false)]
-    mw_fallback: bool,
+    require_mw: bool,
 
     /// Per-connection send/recv pipeline depth for the send-recv stream (gRPC
     /// modes). Sizes the QP's send/recv buffers so up to this many sends can be
@@ -133,7 +137,8 @@ async fn run_echo_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             echo::run_transport_echo_server(config, args.bind, "send-recv", shutdown_signal()).await
         }
         "read-ring" => {
-            let mut config = ReadRingConfig::datagram().with_mr_rkey_fallback(args.mw_fallback);
+            let mut config =
+                ReadRingConfig::datagram().with_memory_window_mode(mw_mode(args.require_mw));
             config.max_message_size = args.ring_max_msg;
             if args.ring_queue_depth > 0 {
                 config.max_in_flight = Some(args.ring_queue_depth);
@@ -141,7 +146,8 @@ async fn run_echo_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             echo::run_transport_echo_server(config, args.bind, "read-ring", shutdown_signal()).await
         }
         "credit-ring" => {
-            let mut config = CreditRingConfig::datagram().with_mr_rkey_fallback(args.mw_fallback);
+            let mut config =
+                CreditRingConfig::datagram().with_memory_window_mode(mw_mode(args.require_mw));
             config.max_message_size = args.ring_max_msg;
             if args.ring_queue_depth > 0 {
                 config.max_in_flight = Some(args.ring_queue_depth);
@@ -178,8 +184,18 @@ async fn run_tcp_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Map the `--require-mw` flag to a [`MemoryWindowMode`]. Default is `Auto`
+/// (detect + fall back to the MR rkey); `--require-mw` forces Memory Windows.
+fn mw_mode(require_mw: bool) -> MemoryWindowMode {
+    if require_mw {
+        MemoryWindowMode::Require
+    } else {
+        MemoryWindowMode::Auto
+    }
+}
+
 async fn run_tls_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    let mw_fallback = args.mw_fallback;
+    let require_mw = args.require_mw;
     match args.transport.as_str() {
         "send-recv" => {
             let depth = args.in_flight;
@@ -188,14 +204,14 @@ async fn run_tls_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         "read-ring" => {
             run_tls_server_with(
                 args,
-                ReadRingConfig::datagram().with_mr_rkey_fallback(mw_fallback),
+                ReadRingConfig::datagram().with_memory_window_mode(mw_mode(require_mw)),
             )
             .await
         }
         "credit-ring" => {
             run_tls_server_with(
                 args,
-                CreditRingConfig::datagram().with_mr_rkey_fallback(mw_fallback),
+                CreditRingConfig::datagram().with_memory_window_mode(mw_mode(require_mw)),
             )
             .await
         }
@@ -231,20 +247,20 @@ where
 }
 
 async fn run_h3_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    let mw_fallback = args.mw_fallback;
+    let require_mw = args.require_mw;
     match args.transport.as_str() {
         "send-recv" => run_h3_server_with(args, SendRecvConfig::datagram()).await,
         "read-ring" => {
             run_h3_server_with(
                 args,
-                ReadRingConfig::datagram().with_mr_rkey_fallback(mw_fallback),
+                ReadRingConfig::datagram().with_memory_window_mode(mw_mode(require_mw)),
             )
             .await
         }
         "credit-ring" => {
             run_h3_server_with(
                 args,
-                CreditRingConfig::datagram().with_mr_rkey_fallback(mw_fallback),
+                CreditRingConfig::datagram().with_memory_window_mode(mw_mode(require_mw)),
             )
             .await
         }

@@ -1,0 +1,119 @@
+---
+# Build the rdma-io integration test binaries on the controller and run them on
+# a remote RDMA host (e.g. the Azure MANA VMs). The unit/integration tests are
+# single-process — they set up a connected pair over the host's own RDMA device
+# via loopback — so they run on ONE host, not across the pair like the benchmark.
+#
+# Prerequisites: the target host must have a working RDMA device (run
+# `just prepare-rdma` first). Ring/Memory-Window tests auto-detect max_mw=0 and
+# fall back to the MR rkey; MW-, atomics-, and siw/rxe-only tests self-skip on
+# hardware that lacks the capability (see the require_* macros in the tests).
+#
+# Usage:
+#   just test-remote                          # run on vm1 (default)
+#   just test-remote host=vm2                 # run on vm2
+#   just test-remote filter=read_ring         # only binaries whose name matches
+#   just test-remote rust_log=info            # verbose test logging
+#
+# Overridable vars: test_host, test_filter, test_rust_log, test_timeout.
+
+- name: Build rdma-io test binaries (controller)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    # playbook_dir is rust-rdma-io/tests/e2e/playbooks; three levels up is the
+    # rust-rdma-io submodule root, where the Cargo workspace lives.
+    crate_root: "{{ playbook_dir }}/../../.."
+  tasks:
+    - name: Compile integration tests and enumerate executables
+      # `--no-run` builds the test binaries without running them; the JSON
+      # message stream reports each test executable's path (names are hashed,
+      # so we cannot glob them reliably). Emitted even when the build is cached.
+      ansible.builtin.shell: |
+        set -euo pipefail
+        [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+        cd "{{ crate_root }}"
+        cargo test --release -p rdma-io-tests --no-run --message-format=json 2>/dev/null \
+          | python3 -c "import sys,json;[print(o['executable']) for l in sys.stdin if l.strip() for o in [json.loads(l)] if o.get('executable')]"
+      args:
+        executable: /bin/bash
+      register: cargo_build
+      changed_when: false
+
+    - name: Select test binaries (optionally filtered by name)
+      ansible.builtin.set_fact:
+        test_binaries: >-
+          {{ cargo_build.stdout_lines
+             | select('search', test_filter | default(''))
+             | list }}
+
+    - name: Fail if no test binaries were found
+      ansible.builtin.assert:
+        that: test_binaries | length > 0
+        fail_msg: "No test binaries matched (filter='{{ test_filter | default('') }}'). Did the build succeed?"
+
+    - name: Report what will run
+      ansible.builtin.debug:
+        msg: "{{ test_binaries | length }} test binaries -> host '{{ test_host | default('vm1') }}'"
+
+- name: Run rdma-io tests on the RDMA host
+  hosts: "{{ test_host | default('vm1') }}"
+  gather_facts: false
+  vars:
+    binaries: "{{ hostvars['localhost'].test_binaries }}"
+    remote_dir: "~/rdma-tests"
+  tasks:
+    - name: Verify an RDMA device is present
+      ansible.builtin.command: ibv_devices
+      register: ibv
+      changed_when: false
+      failed_when: ibv.rc != 0 or ibv.stdout_lines | length <= 2
+
+    - name: Create test directory
+      ansible.builtin.file:
+        path: "{{ remote_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Copy test binaries
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "{{ remote_dir }}/{{ item | basename | regex_replace('-[0-9a-f]{8,}$', '') }}"
+        mode: '0755'
+      loop: "{{ binaries }}"
+
+    - name: Run each test binary (serialized, per Cargo convention)
+      ansible.builtin.shell: |
+        cd {{ remote_dir }}
+        RUST_TEST_THREADS=1 RUST_LOG="{{ test_rust_log | default('warn') }}" \
+          timeout {{ test_timeout | default(300) }} \
+          ./{{ item | basename | regex_replace('-[0-9a-f]{8,}$', '') }} --test-threads=1
+      loop: "{{ binaries }}"
+      loop_control:
+        label: "{{ item | basename | regex_replace('-[0-9a-f]{8,}$', '') }}"
+      register: test_runs
+      changed_when: false
+      failed_when: false
+
+    - name: Per-binary result summary
+      ansible.builtin.debug:
+        msg: >-
+          {{ '%-30s'
+             | format(item.item | basename | regex_replace('-[0-9a-f]{8,}$', '')) }}
+          {{ 'TIMEOUT' if item.rc == 124
+             else (item.stdout_lines | select('match', '^test result:') | list | last
+                   | default('(no result line, rc=' ~ item.rc ~ ')')) }}
+      loop: "{{ test_runs.results }}"
+      loop_control:
+        label: "{{ item.item | basename | regex_replace('-[0-9a-f]{8,}$', '') }}"
+
+    - name: Fail if any test binary failed
+      ansible.builtin.assert:
+        that: test_runs.results | selectattr('rc', 'ne', 0) | list | length == 0
+        fail_msg: >-
+          FAILED:
+          {{ test_runs.results | selectattr('rc', 'ne', 0)
+             | map(attribute='item') | map('basename')
+             | map('regex_replace', '-[0-9a-f]{8,}$', '') | list | join(', ') }}
+        success_msg: "All {{ test_runs.results | length }} test binaries passed."

@@ -5,6 +5,7 @@
 //! are not included here.
 
 use rdma_io_sys::ibverbs::*;
+use rdma_io_tests::require_software_rdma;
 use std::ffi::CStr;
 
 /// Find a software RDMA device (siw or rxe) from the device list, returning its name.
@@ -80,6 +81,7 @@ fn open_rdma_device() -> (*mut ibv_context, String) {
 
 #[test_log::test]
 fn test_rdma_device_available() {
+    require_software_rdma!();
     let name = find_rdma_device();
     assert!(
         name.is_some(),
@@ -90,6 +92,7 @@ fn test_rdma_device_available() {
 
 #[test_log::test]
 fn test_open_close_device() {
+    require_software_rdma!();
     let (ctx, name) = open_rdma_device();
     println!("Opened device: {}", name);
     let ret = unsafe { ibv_close_device(ctx) };
@@ -98,6 +101,7 @@ fn test_open_close_device() {
 
 #[test_log::test]
 fn test_query_device() {
+    require_software_rdma!();
     let (ctx, name) = open_rdma_device();
     unsafe {
         let mut attr: ibv_device_attr = std::mem::zeroed();
@@ -122,6 +126,7 @@ fn test_query_device() {
 
 #[test_log::test]
 fn test_alloc_dealloc_pd() {
+    require_software_rdma!();
     let (ctx, _) = open_rdma_device();
     unsafe {
         let pd = ibv_alloc_pd(ctx);
@@ -136,6 +141,7 @@ fn test_alloc_dealloc_pd() {
 
 #[test_log::test]
 fn test_create_destroy_cq() {
+    require_software_rdma!();
     let (ctx, _) = open_rdma_device();
     unsafe {
         let cq = ibv_create_cq(ctx, 16, std::ptr::null_mut(), std::ptr::null_mut(), 0);
@@ -150,6 +156,7 @@ fn test_create_destroy_cq() {
 
 #[test_log::test]
 fn test_register_deregister_mr() {
+    require_software_rdma!();
     let (ctx, _) = open_rdma_device();
     unsafe {
         let pd = ibv_alloc_pd(ctx);
@@ -178,6 +185,7 @@ fn test_register_deregister_mr() {
 
 #[test_log::test]
 fn test_create_qp() {
+    require_software_rdma!();
     // QP creation works on siw and rxe. Manual state transitions
     // (INIT→RTR→RTS) fail on siw because iWARP needs rdma_cm.
     let (ctx, _) = open_rdma_device();
@@ -215,6 +223,7 @@ fn test_create_qp() {
 
 #[test_log::test]
 fn test_multiple_resources() {
+    require_software_rdma!();
     let (ctx, _) = open_rdma_device();
     unsafe {
         let pd1 = ibv_alloc_pd(ctx);

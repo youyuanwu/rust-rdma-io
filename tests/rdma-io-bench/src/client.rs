@@ -9,6 +9,7 @@ use rdma_io::credit_ring_transport::CreditRingConfig;
 use rdma_io::read_ring_transport::ReadRingConfig;
 use rdma_io::send_recv_transport::SendRecvConfig;
 use rdma_io::transport::TransportBuilder;
+use rdma_io::transport_common::MemoryWindowMode;
 use rdma_io::wr::QpType;
 use rdma_io_quinn::RdmaUdpSocket;
 use rdma_io_tonic::tls::RdmaTransport;
@@ -34,10 +35,13 @@ struct Args {
     #[arg(long, default_value = "send-recv")]
     transport: String,
 
-    /// Use the MR rkey instead of a Type-2 Memory Window for the ring
-    /// transports. Required on NICs that report max_mw=0 (e.g. Azure MANA).
+    /// Force Type-2 Memory Windows for the ring transports instead of the
+    /// default auto-detect. By default the transport binds a Memory Window
+    /// when the NIC supports one and falls back to the MR rkey automatically on
+    /// NICs that report max_mw=0 (e.g. Azure MANA). Pass this to fail fast
+    /// instead (useful on MW-capable NICs / in CI).
     #[arg(long, default_value_t = false)]
-    mw_fallback: bool,
+    require_mw: bool,
 
     #[arg(long, default_value_t = 2)]
     threads: usize,
@@ -86,15 +90,25 @@ struct Args {
     report: String,
 }
 
+/// Map the `--require-mw` flag to a [`MemoryWindowMode`]. Default is `Auto`
+/// (detect + fall back to the MR rkey); `--require-mw` forces Memory Windows.
+fn mw_mode(require_mw: bool) -> MemoryWindowMode {
+    if require_mw {
+        MemoryWindowMode::Require
+    } else {
+        MemoryWindowMode::Auto
+    }
+}
+
 /// Wrap an RDMA setup error with a hint when a ring transport hits EINVAL,
 /// which on Azure NICs means Memory Windows are unsupported (`max_mw=0`).
 fn transport_setup_error(transport: &str, err: rdma_io::Error) -> Box<dyn std::error::Error> {
     if transport != "send-recv" {
         format!(
             "transport '{transport}' failed during RDMA setup: {err}\n\
-             hint: read-ring and credit-ring bind a Type-2 Memory Window by default. \
-             NICs that report max_mw=0 (e.g. Azure MANA, check `ibv_devinfo -v`) reject this. \
-             Pass --mw-fallback to use the MR rkey instead of a Memory Window."
+             hint: read-ring and credit-ring auto-detect Memory Window support and \
+             fall back to the MR rkey on NICs that report max_mw=0 (e.g. Azure MANA). \
+             If you passed --require-mw on such a NIC, drop it to allow the fallback."
         )
         .into()
     } else {
@@ -164,7 +178,8 @@ async fn run_echo_bench(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         }
         "read-ring" => {
             warn_ring_payload(args.payload, args.ring_max_msg);
-            let mut config = ReadRingConfig::datagram().with_mr_rkey_fallback(args.mw_fallback);
+            let mut config =
+                ReadRingConfig::datagram().with_memory_window_mode(mw_mode(args.require_mw));
             config.max_message_size = args.ring_max_msg;
             if args.ring_queue_depth > 0 {
                 config.max_in_flight = Some(args.ring_queue_depth);
@@ -173,7 +188,8 @@ async fn run_echo_bench(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         }
         "credit-ring" => {
             warn_ring_payload(args.payload, args.ring_max_msg);
-            let mut config = CreditRingConfig::datagram().with_mr_rkey_fallback(args.mw_fallback);
+            let mut config =
+                CreditRingConfig::datagram().with_memory_window_mode(mw_mode(args.require_mw));
             config.max_message_size = args.ring_max_msg;
             if args.ring_queue_depth > 0 {
                 config.max_in_flight = Some(args.ring_queue_depth);
@@ -243,7 +259,7 @@ async fn run_tls_bench(
                 args,
                 uri,
                 payload,
-                ReadRingConfig::datagram().with_mr_rkey_fallback(args.mw_fallback),
+                ReadRingConfig::datagram().with_memory_window_mode(mw_mode(args.require_mw)),
             )
             .await
         }
@@ -252,7 +268,7 @@ async fn run_tls_bench(
                 args,
                 uri,
                 payload,
-                CreditRingConfig::datagram().with_mr_rkey_fallback(args.mw_fallback),
+                CreditRingConfig::datagram().with_memory_window_mode(mw_mode(args.require_mw)),
             )
             .await
         }
@@ -463,7 +479,7 @@ async fn run_h3_bench(
             run_h3_bench_with(
                 args,
                 payload,
-                ReadRingConfig::datagram().with_mr_rkey_fallback(args.mw_fallback),
+                ReadRingConfig::datagram().with_memory_window_mode(mw_mode(args.require_mw)),
             )
             .await
         }
@@ -471,7 +487,7 @@ async fn run_h3_bench(
             run_h3_bench_with(
                 args,
                 payload,
-                CreditRingConfig::datagram().with_mr_rkey_fallback(args.mw_fallback),
+                CreditRingConfig::datagram().with_memory_window_mode(mw_mode(args.require_mw)),
             )
             .await
         }

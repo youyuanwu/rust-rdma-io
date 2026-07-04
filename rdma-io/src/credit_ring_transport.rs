@@ -82,22 +82,21 @@ pub struct CreditRingConfig {
     pub token_timeout: Duration,
     /// Max inline data size (0 = disabled).
     pub max_inline_data: u32,
-    /// Use the MR's own rkey for remote access instead of binding a Type-2
-    /// Memory Window.
+    /// How remote-accessible memory is exposed: a Type-2 Memory Window or the
+    /// MR's own rkey.
     ///
-    /// Some RoCE NICs (e.g. Azure MANA) report `max_mw = 0` and reject
-    /// `ibv_alloc_mw`, even though one-sided RDMA Write works. When this is
-    /// `true`, the transport skips MW allocation/bind and exchanges the recv
-    /// ring MR rkey directly. The recv MR is registered without the `MW_BIND`
-    /// access flag in this mode.
+    /// Defaults to [`MemoryWindowMode::Auto`], which binds a Memory Window when
+    /// the routed device supports one and automatically falls back to the MR
+    /// rkey on NICs that report `max_mw = 0` (e.g. Azure MANA). The effective
+    /// mode is resolved once at connect/accept time via `resolve_mr_rkey`.
     ///
-    /// Note: the recv MR already covers exactly the ring region, so the
-    /// exposed memory is the same as the MW-bound case. What is given up is
-    /// Type-2 MW protection: per-bind rkey randomization, QP association, and
-    /// revocability. The static MR rkey is scoped to this connection's PD
-    /// (each connection allocates its own), so a leaked rkey cannot reach
-    /// other connections' memory.
-    pub use_mr_rkey: bool,
+    /// In the MR-rkey path the recv MR already covers exactly the ring region,
+    /// so the exposed memory is the same as the MW-bound case. What is given up
+    /// is Type-2 MW protection: per-bind rkey randomization, QP association, and
+    /// revocability. The static MR rkey is scoped to this connection's PD (each
+    /// connection allocates its own), so a leaked rkey cannot reach other
+    /// connections' memory.
+    pub mw_mode: MemoryWindowMode,
 }
 
 impl CreditRingConfig {
@@ -109,15 +108,16 @@ impl CreditRingConfig {
             max_in_flight: None,
             token_timeout: Duration::from_secs(5),
             max_inline_data: 0,
-            use_mr_rkey: false,
+            mw_mode: MemoryWindowMode::Auto,
         }
     }
 
-    /// Enable or disable the MR-rkey fallback (skip Type-2 Memory Windows).
+    /// Set the [`MemoryWindowMode`] (Type-2 Memory Window vs. MR-rkey).
     ///
-    /// Use this on NICs that report `max_mw = 0` (e.g. Azure MANA).
-    pub fn with_mr_rkey_fallback(mut self, enabled: bool) -> Self {
-        self.use_mr_rkey = enabled;
+    /// Defaults to [`MemoryWindowMode::Auto`], which falls back to the MR rkey
+    /// automatically on NICs that report `max_mw = 0` (e.g. Azure MANA).
+    pub fn with_memory_window_mode(mut self, mode: MemoryWindowMode) -> Self {
+        self.mw_mode = mode;
         self
     }
 
@@ -236,9 +236,10 @@ impl CreditRingTransport {
             .ok_or(crate::Error::InvalidArg("no verbs context".into()))?;
         let pd = async_cm.alloc_pd()?;
 
-        // Fail fast with an actionable error if MW mode is requested on a NIC
-        // that cannot allocate Type-2 Memory Windows (e.g. Azure MANA).
-        check_remote_access_caps(&pd, config.use_mr_rkey)?;
+        // Resolve the effective remote-access mode against the routed device:
+        // bind a Memory Window when supported, else fall back to the MR rkey
+        // (Auto), unless the mode forces one or the other.
+        let use_mr_rkey = resolve_mr_rkey(&pd, config.mw_mode)?;
 
         let max_outstanding = effective_max_outstanding(
             &pd,
@@ -268,7 +269,7 @@ impl CreditRingTransport {
 
         // In MR-rkey fallback mode we never bind a Memory Window, so omit the
         // MW_BIND access flag (some NICs reject it when max_mw == 0).
-        let mw_bind = if config.use_mr_rkey {
+        let mw_bind = if use_mr_rkey {
             AccessFlags::empty()
         } else {
             AccessFlags::MW_BIND
@@ -299,7 +300,7 @@ impl CreditRingTransport {
 
         // QP is now RTS — bind Memory Window to scope remote write access
         // (unless using MR-rkey fallback).
-        let (recv_mw, mw_rkey) = if config.use_mr_rkey {
+        let (recv_mw, mw_rkey) = if use_mr_rkey {
             (None, recv_mr.rkey())
         } else {
             let (mw, rkey) = bind_recv_mw(&qp, &pd, &recv_mr, config.ring_capacity)?;
@@ -366,9 +367,9 @@ impl CreditRingTransport {
             .ok_or(crate::Error::InvalidArg("no verbs context".into()))?;
         let pd = conn_id.alloc_pd()?;
 
-        // Fail fast with an actionable error if MW mode is requested on a NIC
-        // that cannot allocate Type-2 Memory Windows (e.g. Azure MANA).
-        check_remote_access_caps(&pd, config.use_mr_rkey)?;
+        // Resolve the effective remote-access mode against the routed device
+        // (see connect()).
+        let use_mr_rkey = resolve_mr_rkey(&pd, config.mw_mode)?;
 
         let max_outstanding = effective_max_outstanding(
             &pd,
@@ -398,7 +399,7 @@ impl CreditRingTransport {
 
         // In MR-rkey fallback mode we never bind a Memory Window, so omit the
         // MW_BIND access flag (some NICs reject it when max_mw == 0).
-        let mw_bind = if config.use_mr_rkey {
+        let mw_bind = if use_mr_rkey {
             AccessFlags::empty()
         } else {
             AccessFlags::MW_BIND
@@ -429,7 +430,7 @@ impl CreditRingTransport {
 
         // QP is now RTS — bind Memory Window to scope remote write access
         // (unless using MR-rkey fallback).
-        let (recv_mw, mw_rkey) = if config.use_mr_rkey {
+        let (recv_mw, mw_rkey) = if use_mr_rkey {
             (None, recv_mr.rkey())
         } else {
             let (mw, rkey) = bind_recv_mw(&qp, &pd, &recv_mr, config.ring_capacity)?;

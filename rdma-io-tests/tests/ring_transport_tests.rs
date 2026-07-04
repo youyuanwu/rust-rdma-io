@@ -11,6 +11,7 @@ use std::task::Poll;
 
 use rdma_io::credit_ring_transport::{CreditRingConfig, CreditRingTransport};
 use rdma_io::transport::{RecvCompletion, Transport};
+use rdma_io::transport_common::MemoryWindowMode;
 use rdma_io_tests::require_no_iwarp;
 use rdma_io_tests::test_helpers::connect_addr_for;
 
@@ -440,15 +441,20 @@ async fn ring_ooo_repost_overwrites_unreleased_data() {
     println!("ring_ooo_repost_overwrites_unreleased_data passed (bug fixed)!");
 }
 
-/// MR-rkey fallback: when `use_mr_rkey` is enabled the transport skips Memory
-/// Window binding and exchanges the recv MR's own rkey. This path is required
-/// on NICs that report `max_mw = 0` (e.g. Azure MANA); it also works on
-/// MW-capable test NICs, so verify the data path round-trips correctly.
+/// MR-rkey mode: with [`MemoryWindowMode::Disable`] the transport skips Memory
+/// Window binding and exchanges the recv MR's own rkey. This path is used
+/// automatically on NICs that report `max_mw = 0` (e.g. Azure MANA) and forced
+/// here via `Disable`; it also works on MW-capable test NICs, so verify the
+/// data path round-trips correctly.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn ring_mr_rkey_fallback_roundtrip() {
     require_no_iwarp!();
-    let config = CreditRingConfig::default().with_mr_rkey_fallback(true);
-    assert!(config.use_mr_rkey, "fallback flag should be set");
+    let config = CreditRingConfig::default().with_memory_window_mode(MemoryWindowMode::Disable);
+    assert_eq!(
+        config.mw_mode,
+        MemoryWindowMode::Disable,
+        "MR-rkey mode should be set"
+    );
     let (mut server, mut client) = ring_connected_pair(config).await;
 
     // Send several messages, each with a distinct pattern, and verify they

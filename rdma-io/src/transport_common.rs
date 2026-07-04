@@ -199,34 +199,64 @@ impl CompletionTracker {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Validate that the routed device can satisfy the configured remote-access
-/// mode before any QP setup work is done.
+/// Policy for Type-2 Memory Window usage vs. the MR-rkey fallback.
 ///
-/// When `use_mr_rkey` is `false` (the default, Memory-Window mode), the device
-/// must support Type-2 Memory Windows. Some RoCE NICs (e.g. Azure MANA) report
-/// `max_mw == 0` and reject `ibv_alloc_mw`; on those NICs `bind_recv_mw` would
-/// otherwise fail later with an opaque verbs error. This surfaces an actionable
-/// error pointing at the MR-rkey fallback instead.
+/// The ring transports expose remote-accessible memory either through a Type-2
+/// Memory Window (per-connection rkey, QP-associated, revocable) or, on NICs
+/// that cannot allocate one, directly through the MR's own rkey. This enum
+/// selects which — resolved once at connect/accept time via [`resolve_mr_rkey`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MemoryWindowMode {
+    /// Use Type-2 Memory Windows when the routed device supports them, and
+    /// automatically fall back to the MR rkey when it does not (e.g. Azure MANA
+    /// reports `max_mw == 0`). This is the default and works everywhere.
+    #[default]
+    Auto,
+    /// Always use Type-2 Memory Windows; fail connect/accept with an error if
+    /// the routed device does not support them. Useful in tests/CI to assert
+    /// the Memory-Window path is actually exercised (e.g. on rxe).
+    Require,
+    /// Never allocate a Memory Window; always expose the MR's own rkey.
+    Disable,
+}
+
+/// Resolve the effective remote-access mode against the routed device.
 ///
-/// In MR-rkey mode (`use_mr_rkey == true`) no MW is ever allocated, so this is
-/// a no-op.
-pub(crate) fn check_remote_access_caps(
+/// Returns `true` when the transport should use the MR rkey (skip Memory
+/// Windows), or `false` when it should bind a Type-2 Memory Window. Called once
+/// per connection, after the PD is allocated, before any QP setup:
+///
+/// * [`MemoryWindowMode::Disable`] → always `true` (MR rkey).
+/// * [`MemoryWindowMode::Require`] → always `false`, but errors first if the
+///   device reports `max_mw == 0` or lacks Type-2 MW support (otherwise
+///   `bind_recv_mw` would later fail with an opaque verbs error).
+/// * [`MemoryWindowMode::Auto`] → detects support and falls back to `true`
+///   when Memory Windows are unavailable.
+pub(crate) fn resolve_mr_rkey(
     pd: &Arc<ProtectionDomain>,
-    use_mr_rkey: bool,
-) -> crate::Result<()> {
-    if use_mr_rkey {
-        return Ok(());
+    mode: MemoryWindowMode,
+) -> crate::Result<bool> {
+    match mode {
+        MemoryWindowMode::Disable => Ok(true),
+        MemoryWindowMode::Require => {
+            if !device_supports_mw(pd) {
+                return Err(crate::Error::InvalidArg(
+                    "MemoryWindowMode::Require: device does not support Type-2 \
+                     Memory Windows (max_mw == 0); use MemoryWindowMode::Auto \
+                     (the default) to fall back to the MR rkey automatically"
+                        .into(),
+                ));
+            }
+            Ok(false)
+        }
+        MemoryWindowMode::Auto => Ok(!device_supports_mw(pd)),
     }
+}
+
+/// Returns `true` if the routed device can allocate Type-2 Memory Windows.
+fn device_supports_mw(pd: &Arc<ProtectionDomain>) -> bool {
     let max_mw = pd.context().query_device().map(|a| a.max_mw).unwrap_or(0);
-    if max_mw == 0 || !crate::device::supports_mw_type2(pd) {
-        return Err(crate::Error::InvalidArg(
-            "device does not support Type-2 Memory Windows (max_mw == 0); \
-             enable the MR-rkey fallback with \
-             `.with_mr_rkey_fallback(true)` on the ring config"
-                .into(),
-        ));
-    }
-    Ok(())
+    max_mw != 0 && crate::device::supports_mw_type2(pd)
 }
 
 /// Compute the effective in-flight message budget (`max_outstanding`) for a ring

@@ -51,6 +51,12 @@ read-ring gRPC to `in_flight = 1` (with a warning); see
 [`run_channel_clients`](../../tests/rdma-io-bench/src/client.rs). read-ring at
 `in_flight = 1` and the direct echo path (`--mode echo`) were never affected.
 
+The same residual stall reproduces on MANA in a **unidirectional** integration
+test (`pipelined_transfer_read_ring`) — a lost wakeup on the read side, not a
+gRPC-only phenomenon. See
+[MANA unit-test reproduction](#mana-unit-test-reproduction-pipelined_transfer-unidirectional-stall)
+below.
+
 ### Original fix A (superseded in part by the above)
 
 `AsyncRdmaStream`'s write-blocked path drains a batch of its recv CQ and
@@ -225,3 +231,59 @@ backpressure-path copy — entirely. Candidate approaches:
 Before lifting the bench `in_flight = 1` cap, validate fix A at `in_flight`
 4/8/16 on the MANA RoCEv2 preview (the CM is flaky there, so use
 `reboot_between`/retries).
+
+## MANA unit-test reproduction: `pipelined_transfer` (unidirectional stall)
+
+The residual sustained-load stall also reproduces in the **integration tests on
+MANA hardware** — it is *not* purely a gRPC/bidirectional phenomenon. Running the
+suite on a MANA VM (via
+[`run_unit_tests.yml`](../../tests/e2e/playbooks/run_unit_tests.yml) /
+`just test-remote`), `pipelined_transfer_read_ring`
+([async_stream_tests.rs](../../rdma-io-tests/tests/async_stream_tests.rs)) fails
+intermittently — ~1/3 of runs. `pipelined_transfer_default` (send-recv) shows a
+rarer analogous stall. **rxe/CI does not reproduce it**; it is timing-dependent
+and only surfaces on the MANA preview's latencies.
+
+The test is a **unidirectional** 500 KB blast: one task `write_all`s 512×1000 B
+with no application flow control, the other reads. This is a simpler shape than
+the bidirectional gRPC deadlock but the same underlying coupling.
+
+**Observed failure sequence** (captured with disconnect-source instrumentation at
+each `peer_disconnected = true` site, the CM event handler, and
+`AsyncRdmaStream`'s `poll_close`/`Drop`):
+
+1. The **reader** blocks in `read()` and hits its 30 s timeout — no data is
+   arriving even though the writer is still going.
+2. The reader task panics on the timeout ⇒ its stream is **dropped** ⇒
+   `Drop → disconnect()` ⇒ the writer's CM channel gets a `Disconnected` event.
+3. The writer's next `write_all` sees `poll_disconnect() == true` and fails with
+   `BrokenPipe: "connection closed"`; the `tokio::join!` then surfaces the
+   `JoinError::Panic`.
+
+So the **primary event is the reader starving**, not a hardware WC error (no
+`IBV_WC_*` error status is ever logged) and not a genuine peer close — the
+"connection closed" is a *secondary cascade* from the reader-drop. The writer is
+write-blocked on flow control while the server sits idle with no wakeup: the same
+"client write-saturated, server idle, `sif` **not** doorbell-bound" signature as
+the bench residual stall, i.e. a **lost wakeup on the read side** (the recv-CQ
+notification arming vs. a completion that already arrived).
+
+**Test-level fixes do not work** (and were reverted):
+- Keeping the reader's `server` alive past the `read()` loop (return it from the
+  task instead of dropping) removes only a *secondary* end-of-transfer drop race.
+- Reading to EOF instead of a fixed byte count (so the reader keeps *polling* the
+  transport until the writer's graceful shutdown) improved the pass rate
+  (~6/15 → ~10/15) by eliminating that drop race, but ~1/3 still stalled on the
+  underlying lost wakeup.
+
+A test cannot paper over a transport lost-wakeup, and shrinking the blast would
+just hide a real bug that CI is meant to catch, so the test is left unchanged and
+this is tracked here. The fix belongs in the transport/`AsyncCq` notification
+path (see deferred work above); fixing it would also let the benchmark lift its
+read-ring `in_flight = 1` cap.
+
+**Note on the full MANA suite.** Every other integration test passes on MANA.
+Memory-Window, atomics, and siw/rxe-only tests self-skip via the `require_*`
+macros ([lib.rs](../../rdma-io-tests/src/lib.rs)); the ring transports auto-detect
+`max_mw = 0` and fall back to the MR rkey (`MemoryWindowMode::Auto`).
+`pipelined_transfer_read_ring` is the sole remaining flake, and it is this stall.

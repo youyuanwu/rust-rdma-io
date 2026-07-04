@@ -10,6 +10,7 @@ use std::task::Poll;
 
 use rdma_io::read_ring_transport::{ReadRingConfig, ReadRingTransport};
 use rdma_io::transport::{RecvCompletion, Transport};
+use rdma_io::transport_common::MemoryWindowMode;
 use rdma_io_tests::require_no_iwarp;
 use rdma_io_tests::test_helpers::connect_addr_for;
 
@@ -90,21 +91,34 @@ async fn read_ring_ooo_repost_no_overwrite() {
 
     let msg_size = 1500;
 
-    // Step 1: Fill ring completely — send until backpressure.
+    // Step 1: Fill the ring to byte-capacity. `send_copy` returns Ok(0) both
+    // for a genuinely byte-full ring AND for transient send-queue backpressure
+    // (outstanding Write+Imm is capped at max_outstanding so it never exceeds
+    // the peer's doorbell pool). Draining send completions clears the transient
+    // case and refreshes the RDMA-Read head; only a 0 that persists *after* a
+    // full drain means the ring is actually byte-full.
     let mut sent_count = 0;
     let mut sent_data: Vec<Vec<u8>> = Vec::new();
     loop {
         let data: Vec<u8> = (0..msg_size)
             .map(|i| ((sent_count * 13 + i * 7 + 42) % 251) as u8)
             .collect();
-        match client.send_copy(&data) {
-            Ok(0) => break,
-            Ok(_) => {
-                sent_data.push(data);
-                sent_count += 1;
-            }
+        let mut n = match client.send_copy(&data) {
+            Ok(n) => n,
             Err(e) => panic!("send_copy error: {e}"),
+        };
+        if n == 0 {
+            drain_send_completions(&mut client).await;
+            n = match client.send_copy(&data) {
+                Ok(n) => n,
+                Err(e) => panic!("send_copy error: {e}"),
+            };
         }
+        if n == 0 {
+            break;
+        }
+        sent_data.push(data);
+        sent_count += 1;
     }
     assert!(sent_count >= 3, "need at least 3 messages to test OOO");
     println!("sent {sent_count} messages, ring full");
@@ -179,16 +193,21 @@ async fn read_ring_ooo_repost_no_overwrite() {
     println!("read_ring_ooo_repost_no_overwrite passed!");
 }
 
-/// MR-rkey fallback: when `use_mr_rkey` is enabled the transport skips both
+/// MR-rkey mode: with [`MemoryWindowMode::Disable`] the transport skips both
 /// Memory Window binds (recv ring + offset buffer) and exchanges the MRs' own
-/// rkeys. This path is required on NICs that report `max_mw = 0` (e.g. Azure
-/// MANA); it also works on MW-capable test NICs, so verify both the RDMA Write
-/// data path and the RDMA Read flow-control path round-trip correctly.
+/// rkeys. This path is used automatically on NICs that report `max_mw = 0`
+/// (e.g. Azure MANA) and forced here via `Disable`; it also works on MW-capable
+/// test NICs, so verify both the RDMA Write data path and the RDMA Read
+/// flow-control path round-trip correctly.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn read_ring_mr_rkey_fallback_roundtrip() {
     require_no_iwarp!();
-    let config = ReadRingConfig::default().with_mr_rkey_fallback(true);
-    assert!(config.use_mr_rkey, "fallback flag should be set");
+    let config = ReadRingConfig::default().with_memory_window_mode(MemoryWindowMode::Disable);
+    assert_eq!(
+        config.mw_mode,
+        MemoryWindowMode::Disable,
+        "MR-rkey mode should be set"
+    );
     let (mut server, mut client) = ring_connected_pair(config).await;
 
     // Send several messages, each with a distinct pattern, and verify they
