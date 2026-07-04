@@ -279,6 +279,47 @@ async fn run_tls_bench(
     }
 }
 
+/// Establish one connection with bounded retries and backoff.
+///
+/// read-ring's RDMA-CM is flaky under connect churn on the Azure MANA RoCEv2
+/// preview: a connection can transiently fail the handshake ("expected
+/// Established, got Unreachable") or hang mid-handshake. A single-attempt connect
+/// would abort the entire benchmark whenever any one of the N connections trips,
+/// masking data-path results as setup flakiness. Retry each connection up to
+/// `MAX_ATTEMPTS` times with linear backoff; bound every attempt with
+/// `per_attempt` so a hung handshake is retried rather than blocking forever.
+async fn connect_with_retry<T, F, Fut>(
+    what: &str,
+    per_attempt: Duration,
+    mut make: F,
+) -> Result<T, Box<dyn std::error::Error>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, Box<dyn std::error::Error>>>,
+{
+    const MAX_ATTEMPTS: u32 = 5;
+    let mut last_err: Option<Box<dyn std::error::Error>> = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match tokio::time::timeout(per_attempt, make()).await {
+            Ok(Ok(v)) => return Ok(v),
+            Ok(Err(e)) => {
+                eprintln!("{what}: connect attempt {attempt}/{MAX_ATTEMPTS} failed: {e}");
+                last_err = Some(e);
+            }
+            Err(_) => {
+                eprintln!(
+                    "{what}: connect attempt {attempt}/{MAX_ATTEMPTS} timed out after {per_attempt:?}"
+                );
+                last_err = Some(format!("connect timed out after {per_attempt:?}").into());
+            }
+        }
+        if attempt < MAX_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(200 * u64::from(attempt))).await;
+        }
+    }
+    Err(last_err.unwrap_or_else(|| "connect failed".into()))
+}
+
 async fn run_tls_bench_with<B>(
     args: &Args,
     uri: &str,
@@ -291,17 +332,27 @@ where
     let ssl_connector = tls_common::build_connector(&args.cert);
     let transport = RdmaTransport::new(builder);
 
-    // Create connections
+    // Create connections (retry: read-ring's RDMA-CM is flaky under connect
+    // churn on MANA — see connect_with_retry).
     let mut clients = Vec::with_capacity(args.connections);
-    for _ in 0..args.connections {
-        let connector = tonic_tls::openssl::TlsConnector::new(
-            transport.clone(),
-            ssl_connector.clone(),
-            "rdma-bench".to_string(),
-        );
-        let channel = Endpoint::from_shared(uri.to_string())?
-            .connect_with_connector(connector)
-            .await?;
+    for i in 0..args.connections {
+        let channel = connect_with_retry(&format!("rh2 conn {i}"), Duration::from_secs(15), || {
+            let transport = transport.clone();
+            let ssl_connector = ssl_connector.clone();
+            let uri = uri.to_string();
+            async move {
+                let connector = tonic_tls::openssl::TlsConnector::new(
+                    transport,
+                    ssl_connector,
+                    "rdma-bench".to_string(),
+                );
+                Endpoint::from_shared(uri)?
+                    .connect_with_connector(connector)
+                    .await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+            }
+        })
+        .await?;
         clients.push(GreeterClient::new(channel));
     }
 
@@ -324,17 +375,27 @@ async fn run_tcp_bench(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let ssl_connector = tls_common::build_connector(&args.cert);
 
-    // Create connections over plain TCP.
+    // Create connections over plain TCP (retry for parity; TCP rarely needs it).
     let mut clients = Vec::with_capacity(args.connections);
-    for _ in 0..args.connections {
-        let endpoint = Endpoint::from_shared(uri.to_string())?;
-        let transport = tonic_tls::TcpTransport::from_endpoint(&endpoint);
-        let connector = tonic_tls::openssl::TlsConnector::new(
-            transport,
-            ssl_connector.clone(),
-            "rdma-bench".to_string(),
-        );
-        let channel = endpoint.connect_with_connector(connector).await?;
+    for i in 0..args.connections {
+        let channel = connect_with_retry(&format!("tcp conn {i}"), Duration::from_secs(15), || {
+            let ssl_connector = ssl_connector.clone();
+            let uri = uri.to_string();
+            async move {
+                let endpoint = Endpoint::from_shared(uri)?;
+                let transport = tonic_tls::TcpTransport::from_endpoint(&endpoint);
+                let connector = tonic_tls::openssl::TlsConnector::new(
+                    transport,
+                    ssl_connector,
+                    "rdma-bench".to_string(),
+                );
+                endpoint
+                    .connect_with_connector(connector)
+                    .await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+            }
+        })
+        .await?;
         clients.push(GreeterClient::new(channel));
     }
 
@@ -528,27 +589,41 @@ where
     // harness must allow setup time that scales with `connections` (see the
     // run-bench timeout in tests/e2e/playbooks/bench_run.yml). send-recv and the
     // rh2 transports are much faster.
-    for _ in 0..args.connections {
-        let client_socket = RdmaUdpSocket::bind(&bind_addr, builder.clone())
-            .map_err(|e| transport_setup_error(&args.transport, e))?;
-        client_socket
-            .connect_to(&args.connect)
-            .await
-            .map_err(|e| transport_setup_error(&args.transport, e))?;
+    for i in 0..args.connections {
+        let client = connect_with_retry(&format!("rh3 conn {i}"), Duration::from_secs(30), || {
+            let builder = builder.clone();
+            let runtime = runtime.clone();
+            let client_config = client_config.clone();
+            let connect = args.connect;
+            let transport_name = args.transport.clone();
+            async move {
+                let client_socket = RdmaUdpSocket::bind(&bind_addr, builder)
+                    .map_err(|e| transport_setup_error(&transport_name, e))?;
+                client_socket
+                    .connect_to(&connect)
+                    .await
+                    .map_err(|e| transport_setup_error(&transport_name, e))?;
 
-        let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
-            quinn::EndpointConfig::default(),
-            None,
-            Arc::new(client_socket),
-            runtime.clone(),
-        )?;
-        endpoint.set_default_client_config(client_config.clone());
+                let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
+                    quinn::EndpointConfig::default(),
+                    None,
+                    Arc::new(client_socket),
+                    runtime,
+                )?;
+                endpoint.set_default_client_config(client_config);
 
-        let uri: http::Uri = format!("https://{}", args.connect).parse()?;
-        let connector =
-            tonic_h3::quinn::H3QuinnConnector::new(uri.clone(), "localhost".to_string(), endpoint);
-        let channel = tonic_h3::H3Channel::new(connector, uri);
-        clients.push(GreeterClient::new(channel));
+                let uri: http::Uri = format!("https://{}", connect).parse()?;
+                let connector = tonic_h3::quinn::H3QuinnConnector::new(
+                    uri.clone(),
+                    "localhost".to_string(),
+                    endpoint,
+                );
+                let channel = tonic_h3::H3Channel::new(connector, uri);
+                Ok(GreeterClient::new(channel))
+            }
+        })
+        .await?;
+        clients.push(client);
     }
 
     eprintln!(
