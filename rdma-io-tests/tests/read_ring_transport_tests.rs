@@ -337,3 +337,100 @@ async fn read_ring_write_completion_coupled_to_peer_read() {
 
     println!("read_ring_write_completion_coupled_to_peer_read passed!");
 }
+
+/// Regression test for the send-CQ ownership invariant.
+///
+/// `poll_send_completion` (driven by the `CqPollState` drain-after-arm state
+/// machine) must be the **sole** consumer of the send CQ. `send_copy` must
+/// never reap send completions itself: a second, out-of-band poll of the send
+/// CQ (the old `drain_send_cq_for_read`) races the arming state machine and can
+/// swallow the completion notification `poll_send_completion` is parked on, so a
+/// write-blocked writer whose sends have already completed never wakes. That is
+/// the residual sustained-load stall — a lost send-CQ wakeup — behind the MANA
+/// `pipelined_transfer_read_ring` flake.
+///
+/// The invariant is testable deterministically without depending on the race:
+/// `send_copy` only ever *posts* work (incrementing `sends_in_flight()`); it
+/// must **never decrease** `sends_in_flight()`. Any decrease across a bare
+/// `send_copy` call (with no intervening `poll_send_completion`) means
+/// `send_copy` reaped the send CQ behind the state machine's back.
+///
+/// See docs/bugs/read-ring-concurrent-stream-deadlock.md.
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn read_ring_send_copy_must_not_reap_send_cq() {
+    require_no_iwarp!();
+
+    // Large doorbell pool + tiny byte ring. Two effects make this the exact
+    // state that exposes an out-of-band send-CQ reap:
+    //   * the byte ring (not the doorbell pool) is the binding constraint, so
+    //     `send_copy` posts a proactive RDMA-Read once free space drops below
+    //     threshold — `read_in_flight` becomes true, arming the buggy
+    //     `drain_send_cq_for_read` path at the top of `send_copy`; and
+    //   * with ~40 doorbells pre-posted, every Write+Imm is caught immediately
+    //     and completes at HW, so completed-but-unreaped completions accumulate
+    //     in the client's send CQ — exactly what a stray reap would consume.
+    let config = ReadRingConfig {
+        ring_capacity: 8192,
+        max_message_size: 1024,
+        max_in_flight: Some(40),
+        min_free_threshold: 512,
+        ..ReadRingConfig::default()
+    };
+    let (mut server, mut client) = ring_connected_pair(config).await;
+
+    let data = vec![0xABu8; 1024];
+
+    // Cycle the ring for a few seconds: fill it, let the HW complete the posted
+    // Write+Imm, drain them *only* through the legitimate owner
+    // (`poll_send_completion`), let the server read to free byte space, repeat.
+    // Around EVERY bare `send_copy` call, assert it never reduced
+    // `sends_in_flight()`.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut posted_total = 0usize;
+    loop {
+        let before = client.sends_in_flight();
+        let n = client.send_copy(&data).unwrap();
+        let after = client.sends_in_flight();
+        assert!(
+            after >= before,
+            "send_copy reduced sends_in_flight {before} -> {after}: it reaped the \
+             send CQ behind poll_send_completion's back (the lost-wakeup bug). \
+             poll_send_completion must be the sole consumer of the send CQ. \
+             See docs/bugs/read-ring-concurrent-stream-deadlock.md"
+        );
+
+        if n > 0 {
+            posted_total += 1;
+            continue;
+        }
+
+        // Ring full (`Ok(0)`): let the HW finish the in-flight Write+Imm, then
+        // reap them through the legitimate owner only, and let the server read
+        // to free byte space so the next iteration keeps posting.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        drain_send_completions(&mut client).await;
+
+        let mut completions = [RecvCompletion::default(); 16];
+        if let Poll::Ready(Ok(got)) = poll_fn(|cx| match server.poll_recv(cx, &mut completions) {
+            Poll::Ready(r) => Poll::Ready(Poll::Ready(r)),
+            Poll::Pending => Poll::Ready(Poll::Pending),
+        })
+        .await
+        {
+            for c in &completions[..got] {
+                server.repost_recv(c.buf_idx).unwrap();
+            }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+    }
+
+    assert!(
+        posted_total > 0,
+        "test did not post any sends — configuration did not exercise the ring"
+    );
+
+    println!("read_ring_send_copy_must_not_reap_send_cq passed! (posted {posted_total})");
+}

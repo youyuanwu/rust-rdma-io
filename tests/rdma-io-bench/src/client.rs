@@ -363,15 +363,18 @@ async fn run_channel_clients(
     //
     // send-recv and credit-ring pipeline safely at depth > 1.
     //
-    // read-ring is still capped to one in-flight RPC per connection. The
-    // transport-level RNR root cause (posting more Write+Imm than the peer has
-    // doorbells to catch) is now fixed — send_copy bounds outstanding Write+Imm
-    // to the peer's `max_outstanding` recv capacity, and doorbells are reposted
-    // eagerly at recv-CQ reap rather than at application read — which turns the
-    // former *deterministic* if=4 deadlock into a high pass rate (conn=8 if=4
-    // ~2/3, conn=1 if=8 ~3/4 on MANA RoCEv2). A residual *sustained-load* stall
-    // remains at in_flight > 1, so the benchmark still caps read-ring to 1 to
-    // avoid intermittent hangs. See docs/bugs/read-ring-concurrent-stream-deadlock.md.
+    // read-ring is still capped to one in-flight RPC per connection. Two related
+    // stalls were fixed — the RNR root cause (send_copy now bounds outstanding
+    // Write+Imm to the peer's `max_outstanding` recv capacity, doorbells reposted
+    // eagerly at recv-CQ reap) and the *unidirectional* sustained-load lost
+    // wakeup (send_copy no longer reaps the send CQ out-of-band, so
+    // `poll_send_completion` owns it; `pipelined_transfer_read_ring` is 20/20 on
+    // MANA). But the *bidirectional* gRPC path at in_flight > 1 still stalls
+    // intermittently (conn=8 in_flight=4 measured 2/3 on MANA RoCEv2: two runs
+    // ~105k rps 0 errors, one hang) — both peers write-block and the h2 scheduler
+    // stops servicing reads, a deeper coupling than the send-CQ fix addresses. So
+    // the benchmark keeps read-ring gRPC capped at 1 to avoid intermittent hangs.
+    // See docs/bugs/read-ring-concurrent-stream-deadlock.md.
     let mut depth = args.in_flight.max(1);
     if transport == "read-ring" && depth > 1 {
         eprintln!(

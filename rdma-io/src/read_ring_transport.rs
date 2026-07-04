@@ -827,46 +827,6 @@ impl ReadRingTransport {
         self.cached_remote_head = head_val as usize;
     }
 
-    /// Non-blocking drain of send CQ to pick up RDMA Read completions.
-    /// Also handles Write and padding completions encountered along the way.
-    ///
-    /// Does NOT arm the CQ for notification (`req_notify`): arming is owned
-    /// solely by `poll_send_completion`'s `CqPollState`. A second, independent
-    /// arm here races that state machine and can swallow the completion
-    /// notification `poll_send_completion` is waiting on, so a write whose
-    /// completion is drained here (or arrives right after) never wakes the
-    /// blocked writer — a lost-wakeup stall. Draining without arming is safe:
-    /// `poll_send_completion` re-polls and re-arms on its next call.
-    fn drain_send_cq_for_read(&mut self) {
-        let mut wc_buf = [WorkCompletion::default(); 8];
-        let n = match self.qp.send_cq().cq().poll(&mut wc_buf) {
-            Ok(n) => n,
-            Err(_) => {
-                self.peer_disconnected = true;
-                return;
-            }
-        };
-        for wc in &wc_buf[..n] {
-            if !wc.is_success() {
-                self.peer_disconnected = true;
-                return;
-            }
-            let wr_id = wc.wr_id();
-            if wr_id == WR_ID_READ_SENTINEL {
-                self.update_cached_remote_head();
-                self.read_in_flight = false;
-            } else if wr_id == WR_ID_PADDING_SENTINEL {
-                self.send_in_flight = self.send_in_flight.saturating_sub(1);
-            } else {
-                let data_len = wr_id as usize;
-                if data_len > 0 && data_len <= self.send_ring.capacity {
-                    self.send_ring.release(data_len);
-                }
-                self.send_in_flight = self.send_in_flight.saturating_sub(1);
-            }
-        }
-    }
-
     /// Advance recv_ring head by contiguous released slot lengths and update offset buffer.
     fn advance_recv_head(&mut self, contiguous: usize) {
         for _ in 0..contiguous {
@@ -899,10 +859,19 @@ impl Transport for ReadRingTransport {
             return Ok(0);
         }
 
-        // Pick up completed RDMA Read if pending.
-        if self.read_in_flight {
-            self.drain_send_cq_for_read();
-        }
+        // NOTE: `send_copy` does NOT poll the send CQ. `poll_send_completion`
+        // (driven by the `CqPollState` drain-after-arm state machine) is the
+        // SOLE consumer of the send CQ, including the RDMA-Read head-refresh
+        // completion: it reaps `WR_ID_READ_SENTINEL`, calls
+        // `update_cached_remote_head`, clears `read_in_flight`, and returns
+        // `Ready(Ok)` so a write-blocked caller re-polls `send_copy` with the
+        // refreshed head. A second, out-of-band poll here (the former
+        // `drain_send_cq_for_read`) raced that state machine and swallowed the
+        // completion notification `poll_send_completion` was parked on, so a
+        // writer whose sends had already completed never woke — the residual
+        // sustained-load lost-wakeup stall. Keeping a single owner makes
+        // `send_copy` monotonic: it only ever posts work (never reaps).
+        // See docs/bugs/read-ring-concurrent-stream-deadlock.md.
 
         // Doorbell / recv-capacity backpressure. Every data or padding
         // Write+Imm we post must be caught by one of the peer's doorbell recv
