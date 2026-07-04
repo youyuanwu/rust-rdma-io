@@ -1,0 +1,24 @@
+---
+# Reboot the RDMA benchmark VMs to clear an accumulated RDMA-CM wedge.
+#
+# read-ring's RDMA-CM hard-wedges under sustained connect churn on the Azure
+# MANA RoCEv2 preview: connects start failing ("expected Established, got
+# Rejected/Unreachable" or a hung handshake) and within-run connect retries
+# cannot clear it. A reboot is the documented recovery. If the userspace RDMA
+# stack needs reinstalling afterwards, follow with `just prepare-rdma`.
+#
+# Usage:
+#   just reboot                 # reboot both VMs (the `vms` group)
+#   just reboot target=vm1      # reboot only vm1
+#   just reboot target=vm2      # reboot only vm2
+
+- name: Reboot RDMA VMs
+  hosts: "{{ target | default('vms') }}"
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Reboot and wait for the host to come back online
+      ansible.builtin.reboot:
+        reboot_timeout: 300
+        post_reboot_delay: 15
+        test_command: ibv_devices
