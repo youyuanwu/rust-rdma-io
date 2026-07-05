@@ -381,6 +381,104 @@ async fn concurrent_write_no_deadlock_read_ring() {
 }
 
 // ===========================================================================
+// concurrent_write_stash_overflow_no_deadlock — same write-before-read pattern
+// as concurrent_write_no_deadlock, but `count` is pushed PAST the stream stash
+// cap (64) so each peer's write-blocked drain hits the cap and stops (instead of
+// buffering the whole stream). This exercises the stash-OVERFLOW branch of the
+// write-blocked drain in poll_write_slice.
+//
+// It also documents a NEGATIVE result: the fundamental bidirectional
+// flow-control deadlock (the one that wedges rh2 read-ring at
+// conn=4 in_flight=8 payload=256 on MANA) does NOT reproduce in-process over
+// loopback with this pattern. Verified empirically: at count=100 both writers
+// still complete (this test passes ~1.4s); pushing to count=256 msg=256 only
+// trips an unrelated MANA status-21 general error under the high-volume drain,
+// not the clean flow-control hang. Loopback delivers completions fast enough
+// that each side's eager write-blocked drain keeps unblocking the other, so the
+// two peers never park with full stashes simultaneously — the real deadlock
+// needs cross-VM RTT to open that window (see the "cross-VM only" analysis in
+// docs/bugs/read-ring-concurrent-stream-deadlock.md). So this stays a
+// no-deadlock guard: a wedge here in loopback would be a genuine regression.
+// ===========================================================================
+
+async fn concurrent_write_stash_overflow_no_deadlock<B: TransportBuilder>(builder: B) {
+    let (server, client) = connected_pair(builder).await;
+
+    // count > stash cap (64) so BOTH peers' recv stashes overflow while neither
+    // reads; msg kept small (64 B) so the ring itself isn't overloaded — this
+    // isolates the flow-control question (does the write phase deadlock?) from
+    // any high-volume HW artifact.
+    let count = 100usize;
+    let msg = 64usize;
+
+    let cw: Vec<u8> = (0..count).map(|i| (i % 251) as u8).collect();
+    let sw: Vec<u8> = (0..count).map(|i| ((i * 3 + 7) % 251) as u8).collect();
+
+    // Both sides write their full payload before reading anything.
+    let writer_c = tokio::spawn(async move {
+        let mut client = client;
+        for &b in &cw {
+            client.write_all(&vec![b; msg]).await.unwrap();
+        }
+        client
+    });
+    let writer_s = tokio::spawn(async move {
+        let mut server = server;
+        for &b in &sw {
+            server.write_all(&vec![b; msg]).await.unwrap();
+        }
+        server
+    });
+
+    let writers = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        (writer_c.await.unwrap(), writer_s.await.unwrap())
+    })
+    .await;
+    assert!(
+        writers.is_ok(),
+        "write-blocked drain wedged with overflowing recv stashes at \
+         count={count} msg={msg} (stash cap 64) — this pattern must NOT deadlock \
+         over loopback (see read-ring-concurrent-stream-deadlock.md)"
+    );
+
+    // Both writers completed; drain both directions so nothing is left dangling.
+    let (client, server) = writers.unwrap();
+    let reader_c = tokio::spawn(async move {
+        let mut client = client;
+        let mut got = 0usize;
+        let mut buf = [0u8; 4096];
+        while got < count * msg {
+            let n = client.read(&mut buf).await.unwrap();
+            assert!(n > 0, "unexpected EOF draining client");
+            got += n;
+        }
+        client
+    });
+    let reader_s = tokio::spawn(async move {
+        let mut server = server;
+        let mut got = 0usize;
+        let mut buf = [0u8; 4096];
+        while got < count * msg {
+            let n = server.read(&mut buf).await.unwrap();
+            assert!(n > 0, "unexpected EOF draining server");
+            got += n;
+        }
+        server
+    });
+    let (_c, _s) = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        (reader_c.await.unwrap(), reader_s.await.unwrap())
+    })
+    .await
+    .expect("reads timed out draining the buffered streams");
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn concurrent_write_stash_overflow_no_deadlock_read_ring() {
+    require_no_iwarp!();
+    concurrent_write_stash_overflow_no_deadlock(ReadRingConfig::default()).await;
+}
+
+// ===========================================================================
 // futures_io_echo — echo via futures::io::AsyncReadExt / AsyncWriteExt traits.
 // ===========================================================================
 
