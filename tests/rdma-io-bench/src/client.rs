@@ -43,6 +43,11 @@ struct Args {
     #[arg(long, default_value_t = false)]
     require_mw: bool,
 
+    /// Number of tokio runtime worker threads (executor pool size). This is
+    /// NOT a load dimension: the offered load is driven by --connections
+    /// (each connection is one task) times --in-flight, so raising --threads
+    /// only changes how many OS threads service the async tasks, not the
+    /// request concurrency.
     #[arg(long, default_value_t = 2)]
     threads: usize,
 
@@ -56,20 +61,32 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     in_flight: usize,
 
-    /// Ring transport `max_message_size` in bytes (echo mode only). The number
-    /// of outstanding messages a ring allows is `ring_capacity / this`
-    /// (ring_capacity is fixed at 65536), so a smaller value permits deeper
-    /// `--in-flight` for small payloads. Payloads larger than this are truncated.
+    /// Ring transport `max_message_size` in bytes (echo mode only): the largest
+    /// payload carried in a single RDMA message; larger echo payloads are
+    /// truncated to this. This no longer bounds the in-flight budget — that is
+    /// auto-derived from --in-flight (see --ring-queue-depth). Must match the
+    /// server.
     #[arg(long, default_value_t = 1500)]
     ring_max_msg: usize,
 
-    /// Ring transport send-queue depth (advanced; echo mode only). Sizes the
-    /// send/doorbell/CQ queues for this many in-flight messages, independent of
-    /// `--ring-max-msg`. 0 = derive from `ring_capacity / ring_max_msg` (which
-    /// undercounts small messages). This is the transport-level queue budget,
-    /// distinct from the application-level `--in-flight`.
-    #[arg(long, default_value_t = 0)]
+    /// Advanced override for the ring transport's in-flight budget (echo mode
+    /// only): sizes the send/doorbell/CQ queues for this many outstanding
+    /// messages. 0 (default) auto-derives the budget from --in-flight with
+    /// headroom, so the ring always has at least as many slots as the client
+    /// keeps in flight — this prevents the silent RNR over-subscription
+    /// collapse that happens when a deep --in-flight falls back to the small
+    /// ring_capacity/ring_max_msg default. Set >0 only to force a specific
+    /// depth (e.g. to reproduce that collapse). Must match the server. Also
+    /// accepted as --ring-max-inflight.
+    #[arg(long, visible_alias = "ring-max-inflight", default_value_t = 0)]
     ring_queue_depth: usize,
+
+    /// Number of times to retry a failed connection setup (echo mode only)
+    /// before giving up, with a short linear backoff. Absorbs the MANA RoCEv2
+    /// preview's intermittent CM "Unreachable"/"Rejected" failures at high
+    /// connection counts so one flaky connect doesn't abort the whole run.
+    #[arg(long, default_value_t = 5)]
+    connect_retries: u32,
 
     #[arg(long, default_value_t = 10)]
     duration: u64,
@@ -97,6 +114,23 @@ fn mw_mode(require_mw: bool) -> MemoryWindowMode {
         MemoryWindowMode::Require
     } else {
         MemoryWindowMode::Auto
+    }
+}
+
+/// Resolve the ring transport's `max_in_flight` (send/doorbell/CQ depth) for
+/// echo mode. An explicit `--ring-queue-depth` (>0) wins; otherwise size the
+/// ring from the application's `--in-flight` with headroom so the ring always
+/// has at least as many outstanding-message slots as the client pipelines.
+/// This prevents the silent RNR over-subscription collapse that occurs when a
+/// deep `--in-flight` would otherwise fall back to the small
+/// `ring_capacity / ring_max_msg` default (~43 slots). The transport clamps the
+/// result to the device's queue limits. Both peers derive the same value from
+/// the same `--in-flight`, preserving the required client/server symmetry.
+fn ring_max_in_flight(ring_queue_depth: usize, in_flight: usize) -> Option<usize> {
+    if ring_queue_depth > 0 {
+        Some(ring_queue_depth)
+    } else {
+        Some((in_flight.max(1) * 2).max(16))
     }
 }
 
@@ -157,6 +191,7 @@ async fn run_echo_bench(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             echo::run_tcp_echo_client(
                 args.connect,
                 args.connections,
+                args.connect_retries,
                 args.in_flight,
                 args.payload,
                 args.warmup,
@@ -181,9 +216,7 @@ async fn run_echo_bench(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             let mut config =
                 ReadRingConfig::datagram().with_memory_window_mode(mw_mode(args.require_mw));
             config.max_message_size = args.ring_max_msg;
-            if args.ring_queue_depth > 0 {
-                config.max_in_flight = Some(args.ring_queue_depth);
-            }
+            config.max_in_flight = ring_max_in_flight(args.ring_queue_depth, args.in_flight);
             run_echo_bench_with(args, config, "read-ring").await
         }
         "credit-ring" => {
@@ -191,9 +224,7 @@ async fn run_echo_bench(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             let mut config =
                 CreditRingConfig::datagram().with_memory_window_mode(mw_mode(args.require_mw));
             config.max_message_size = args.ring_max_msg;
-            if args.ring_queue_depth > 0 {
-                config.max_in_flight = Some(args.ring_queue_depth);
-            }
+            config.max_in_flight = ring_max_in_flight(args.ring_queue_depth, args.in_flight);
             run_echo_bench_with(args, config, "credit-ring").await
         }
         other => {
@@ -228,6 +259,7 @@ where
         builder,
         args.connect,
         args.connections,
+        args.connect_retries,
         args.in_flight,
         args.payload,
         args.warmup,

@@ -43,8 +43,39 @@ use crate::report::BenchResult;
 /// Recv completions to drain per poll (the send/recv transports cap at 8).
 const RECV_BATCH: usize = 8;
 
+/// Per-attempt connect timeout. On the MANA RoCEv2 preview a CM handshake can
+/// hang (not just fast-fail) under connect churn, so each attempt is bounded and
+/// a hung handshake is retried rather than blocking the whole run.
+const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn new_histogram() -> Histogram<u64> {
     Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).expect("create histogram")
+}
+
+/// Log a failed connect attempt and back off, returning `true` if the caller
+/// should retry. Transient CM setup failures (e.g. the MANA RoCEv2 preview's
+/// intermittent "Unreachable"/"Rejected" or a hung handshake at high connection
+/// counts) usually succeed on a later attempt, so a small bounded retry avoids
+/// aborting the whole run on one flaky connection. Returns `false` once
+/// `retries` is exhausted, signalling the caller to propagate the error. The
+/// backoff grows linearly (200ms × attempt).
+async fn backoff_or_giveup(
+    what: &str,
+    tries: u32,
+    retries: u32,
+    err: &dyn std::fmt::Display,
+) -> bool {
+    if tries >= retries {
+        return false;
+    }
+    let backoff = Duration::from_millis(200 * (tries as u64 + 1));
+    eprintln!(
+        "{what} connect attempt {} failed ({err}); retrying in {}ms...",
+        tries + 1,
+        backoff.as_millis()
+    );
+    tokio::time::sleep(backoff).await;
+    true
 }
 
 /// Cumulative user+system CPU time of this process (summed over all threads),
@@ -256,6 +287,7 @@ pub async fn run_transport_echo_client<B>(
     builder: B,
     addr: SocketAddr,
     connections: usize,
+    connect_retries: u32,
     in_flight: usize,
     payload: usize,
     warmup: u64,
@@ -271,7 +303,25 @@ where
 
     let mut transports = Vec::with_capacity(connections);
     for _ in 0..connections {
-        transports.push(builder.connect(&addr).await?);
+        let mut tries = 0u32;
+        let t = loop {
+            match tokio::time::timeout(CONNECT_ATTEMPT_TIMEOUT, builder.connect(&addr)).await {
+                Ok(Ok(t)) => break t,
+                Ok(Err(e)) => {
+                    if !backoff_or_giveup(transport_label, tries, connect_retries, &e).await {
+                        return Err(e.into());
+                    }
+                }
+                Err(_) => {
+                    let e = format!("connect timed out after {CONNECT_ATTEMPT_TIMEOUT:?}");
+                    if !backoff_or_giveup(transport_label, tries, connect_retries, &e).await {
+                        return Err(e.into());
+                    }
+                }
+            }
+            tries += 1;
+        };
+        transports.push(t);
     }
     eprintln!(
         "Connected {connections} echo clients to {addr} \
@@ -516,6 +566,7 @@ async fn tcp_client_conn(
 pub async fn run_tcp_echo_client(
     addr: SocketAddr,
     connections: usize,
+    connect_retries: u32,
     in_flight: usize,
     payload: usize,
     warmup: u64,
@@ -527,7 +578,24 @@ pub async fn run_tcp_echo_client(
 
     let mut streams = Vec::with_capacity(connections);
     for _ in 0..connections {
-        let stream = TcpStream::connect(addr).await?;
+        let mut tries = 0u32;
+        let stream = loop {
+            match tokio::time::timeout(CONNECT_ATTEMPT_TIMEOUT, TcpStream::connect(addr)).await {
+                Ok(Ok(s)) => break s,
+                Ok(Err(e)) => {
+                    if !backoff_or_giveup("tcp", tries, connect_retries, &e).await {
+                        return Err(e.into());
+                    }
+                }
+                Err(_) => {
+                    let e = format!("connect timed out after {CONNECT_ATTEMPT_TIMEOUT:?}");
+                    if !backoff_or_giveup("tcp", tries, connect_retries, &e).await {
+                        return Err(e.into());
+                    }
+                }
+            }
+            tries += 1;
+        };
         stream.set_nodelay(true)?;
         streams.push(stream);
     }

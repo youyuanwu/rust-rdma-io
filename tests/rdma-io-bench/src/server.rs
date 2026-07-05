@@ -41,24 +41,30 @@ struct Args {
     #[arg(long, default_value_t = false)]
     require_mw: bool,
 
-    /// Per-connection send/recv pipeline depth for the send-recv stream (gRPC
-    /// modes). Sizes the QP's send/recv buffers so up to this many sends can be
-    /// outstanding at once; match the client's `--in-flight` so both peers can
-    /// pipeline to the same depth. Ignored by the ring transports and echo mode.
+    /// Per-connection send/recv pipeline depth. In the gRPC modes this sizes
+    /// the send-recv stream's QP buffers so up to this many sends can be
+    /// outstanding. In echo mode with a ring transport it drives the
+    /// auto-derived ring in-flight budget (see --ring-queue-depth). Either way
+    /// it must match the client's `--in-flight` so both peers size symmetrically.
     #[arg(long, default_value_t = 1)]
     in_flight: usize,
 
-    /// Ring transport `max_message_size` in bytes (echo mode only). Must match
-    /// the client so both sides size their credits/buffers identically. Smaller
-    /// values raise the number of outstanding messages a ring allows.
+    /// Ring transport `max_message_size` in bytes (echo mode only): the largest
+    /// payload carried in a single RDMA message; larger echo payloads are
+    /// truncated to this. This no longer bounds the in-flight budget — that is
+    /// auto-derived from --in-flight (see --ring-queue-depth). Must match the
+    /// client.
     #[arg(long, default_value_t = 1500)]
     ring_max_msg: usize,
 
-    /// Ring transport send-queue depth (advanced; echo mode only). Sizes the
-    /// send/doorbell/CQ queues for this many in-flight messages, independent of
-    /// `--ring-max-msg`. 0 = derive from `ring_capacity / ring_max_msg`. Must
-    /// match the client. Distinct from the application-level `--in-flight`.
-    #[arg(long, default_value_t = 0)]
+    /// Advanced override for the ring transport's in-flight budget (echo mode
+    /// only): sizes the send/doorbell/CQ queues for this many outstanding
+    /// messages. 0 (default) auto-derives the budget from --in-flight with
+    /// headroom so the ring always has at least as many slots as the peer keeps
+    /// in flight, preventing the RNR over-subscription collapse. Set >0 only to
+    /// force a specific depth. Must match the client. Also accepted as
+    /// --ring-max-inflight.
+    #[arg(long, visible_alias = "ring-max-inflight", default_value_t = 0)]
     ring_queue_depth: usize,
 
     #[arg(long, default_value = "build/certs/cert.pem")]
@@ -140,18 +146,14 @@ async fn run_echo_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             let mut config =
                 ReadRingConfig::datagram().with_memory_window_mode(mw_mode(args.require_mw));
             config.max_message_size = args.ring_max_msg;
-            if args.ring_queue_depth > 0 {
-                config.max_in_flight = Some(args.ring_queue_depth);
-            }
+            config.max_in_flight = ring_max_in_flight(args.ring_queue_depth, args.in_flight);
             echo::run_transport_echo_server(config, args.bind, "read-ring", shutdown_signal()).await
         }
         "credit-ring" => {
             let mut config =
                 CreditRingConfig::datagram().with_memory_window_mode(mw_mode(args.require_mw));
             config.max_message_size = args.ring_max_msg;
-            if args.ring_queue_depth > 0 {
-                config.max_in_flight = Some(args.ring_queue_depth);
-            }
+            config.max_in_flight = ring_max_in_flight(args.ring_queue_depth, args.in_flight);
             echo::run_transport_echo_server(config, args.bind, "credit-ring", shutdown_signal())
                 .await
         }
@@ -191,6 +193,20 @@ fn mw_mode(require_mw: bool) -> MemoryWindowMode {
         MemoryWindowMode::Require
     } else {
         MemoryWindowMode::Auto
+    }
+}
+
+/// Resolve the ring transport's `max_in_flight` (send/doorbell/CQ depth) for
+/// echo mode. An explicit `--ring-queue-depth` (>0) wins; otherwise size the
+/// ring from `--in-flight` with headroom so the ring always has at least as
+/// many outstanding-message slots as the peer pipelines, preventing the RNR
+/// over-subscription collapse. The transport clamps to device queue limits.
+/// Must derive identically to the client (same `--in-flight`).
+fn ring_max_in_flight(ring_queue_depth: usize, in_flight: usize) -> Option<usize> {
+    if ring_queue_depth > 0 {
+        Some(ring_queue_depth)
+    } else {
+        Some((in_flight.max(1) * 2).max(16))
     }
 }
 
