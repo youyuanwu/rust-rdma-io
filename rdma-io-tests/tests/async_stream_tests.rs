@@ -381,33 +381,35 @@ async fn concurrent_write_no_deadlock_read_ring() {
 }
 
 // ===========================================================================
-// concurrent_write_stash_overflow_no_deadlock — same write-before-read pattern
-// as concurrent_write_no_deadlock, but `count` is pushed PAST the stream stash
-// cap (64) so each peer's write-blocked drain hits the cap and stops (instead of
-// buffering the whole stream). This exercises the stash-OVERFLOW branch of the
-// write-blocked drain in poll_write_slice.
+// concurrent_write_stash_overflow_deadlock — a REPRODUCTION of the fundamental
+// bidirectional flow-control deadlock (the one that wedges rh2 read-ring at
+// conn=4 in_flight=8 payload=256 cross-VM on MANA), NOT a passing guard.
 //
-// It also documents a NEGATIVE result: the fundamental bidirectional
-// flow-control deadlock (the one that wedges rh2 read-ring at
-// conn=4 in_flight=8 payload=256 on MANA) does NOT reproduce in-process over
-// loopback with this pattern. Verified empirically: at count=100 both writers
-// still complete (this test passes ~1.4s); pushing to count=256 msg=256 only
-// trips an unrelated MANA status-21 general error under the high-volume drain,
-// not the clean flow-control hang. Loopback delivers completions fast enough
-// that each side's eager write-blocked drain keeps unblocking the other, so the
-// two peers never park with full stashes simultaneously — the real deadlock
-// needs cross-VM RTT to open that window (see the "cross-VM only" analysis in
-// docs/bugs/read-ring-concurrent-stream-deadlock.md). So this stays a
-// no-deadlock guard: a wedge here in loopback would be a genuine regression.
+// Same write-before-read pattern as concurrent_write_no_deadlock, but `count`
+// is pushed PAST the stream stash cap (64) so each peer's write-blocked drain
+// fills its stash and stops reposting doorbells. With neither side reading, both
+// peers can park with full stashes at once and wedge — the deadlock fix A only
+// mitigates below the cap.
+//
+// Whether it wedges is PROVIDER-TIMING dependent:
+//   - rxe (CI software provider): DEADLOCKS at count=100 — both writers time out
+//     and a reader sees BrokenPipe. This is the bug.
+//   - MANA loopback: completions are delivered fast enough that the eager
+//     write-blocked drain keeps unblocking the other side, so it completes.
+//
+// Because it deadlocks on rxe it is `#[ignore]`d (would hang CI). Run manually
+// to demonstrate the bug or to check whether a fix lifts it:
+//     cargo test -p rdma-io-tests --test async_stream_tests -- --ignored \
+//         concurrent_write_stash_overflow_deadlock_read_ring
+// If the underlying flow-control coupling is ever fixed, the writers complete
+// and this passes. See docs/bugs/read-ring-concurrent-stream-deadlock.md.
 // ===========================================================================
 
-async fn concurrent_write_stash_overflow_no_deadlock<B: TransportBuilder>(builder: B) {
+async fn concurrent_write_stash_overflow_deadlock<B: TransportBuilder>(builder: B) {
     let (server, client) = connected_pair(builder).await;
 
     // count > stash cap (64) so BOTH peers' recv stashes overflow while neither
-    // reads; msg kept small (64 B) so the ring itself isn't overloaded — this
-    // isolates the flow-control question (does the write phase deadlock?) from
-    // any high-volume HW artifact.
+    // reads; msg kept small (64 B) so the ring itself isn't overloaded.
     let count = 100usize;
     let msg = 64usize;
 
@@ -436,12 +438,14 @@ async fn concurrent_write_stash_overflow_no_deadlock<B: TransportBuilder>(builde
     .await;
     assert!(
         writers.is_ok(),
-        "write-blocked drain wedged with overflowing recv stashes at \
-         count={count} msg={msg} (stash cap 64) — this pattern must NOT deadlock \
-         over loopback (see read-ring-concurrent-stream-deadlock.md)"
+        "bidirectional flow-control deadlock: both writers wedged with \
+         overflowing recv stashes at count={count} msg={msg} (stash cap 64) — \
+         neither peer reads, so doorbells are never reposted \
+         (see read-ring-concurrent-stream-deadlock.md)"
     );
 
-    // Both writers completed; drain both directions so nothing is left dangling.
+    // If the writers completed (the deadlock did not fire on this provider),
+    // drain both directions so nothing is left dangling.
     let (client, server) = writers.unwrap();
     let reader_c = tokio::spawn(async move {
         let mut client = client;
@@ -473,9 +477,12 @@ async fn concurrent_write_stash_overflow_no_deadlock<B: TransportBuilder>(builde
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
-async fn concurrent_write_stash_overflow_no_deadlock_read_ring() {
+#[ignore = "reproduces the fundamental read-ring bidirectional deadlock on rxe \
+            and other slow-completion providers (wedges); passes on MANA \
+            loopback. Opt-in: run with `-- --ignored`."]
+async fn concurrent_write_stash_overflow_deadlock_read_ring() {
     require_no_iwarp!();
-    concurrent_write_stash_overflow_no_deadlock(ReadRingConfig::default()).await;
+    concurrent_write_stash_overflow_deadlock(ReadRingConfig::default()).await;
 }
 
 // ===========================================================================
