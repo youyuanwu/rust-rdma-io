@@ -338,6 +338,74 @@ async fn read_ring_write_completion_coupled_to_peer_read() {
     println!("read_ring_write_completion_coupled_to_peer_read passed!");
 }
 
+/// The doorbell-blocked backpressure path must post a one-sided RDMA-Read
+/// *heartbeat* so a wedged sender still has a send-CQ wakeup source.
+///
+/// Unlike the byte-blocked path, the doorbell-blocked branch of `send_copy`
+/// posts no data WR: the pinned Write+Imm are RNR-stalled on the peer's spent
+/// doorbells (only the peer reading + reposting completes them), and nothing
+/// else is outstanding. Without a proactive Read the caller would park on the
+/// send CQ with NO completion ever arriving — the silent-park seed of the
+/// concurrent-stream deadlock.
+///
+/// This asserts the *mechanism* deterministically (provider-independent): drive
+/// `send_copy` into the doorbell-blocked branch (small messages, peer never
+/// reads, so the 43-slot doorbell pool — not the 64 KiB byte ring — is the
+/// binding constraint) and verify a Read is left in flight. The heartbeat is a
+/// **liveness** guarantee, not a deadlock cure: it does not relieve the doorbell
+/// block (only the peer reading does), it just keeps a send-CQ wakeup source
+/// alive so the stream's recv-drain / doorbell-repost cascade cannot go silent.
+///
+/// (The *effect* — no silent park — is only observable cross-VM under real RTT;
+/// on same-VM loopback data completions still trickle in, so it can't be
+/// isolated in-process. Hence this checks the mechanism, not the effect.)
+///
+/// See docs/bugs/read-ring-concurrent-stream-deadlock.md.
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn read_ring_doorbell_blocked_posts_read_heartbeat() {
+    require_no_iwarp!();
+    // Default: max_outstanding = 43, doorbell pool = 43, 64 KiB ring. Keep the
+    // server bound (idle, never reading) so the connection stays up.
+    let (mut _server, mut client) = ring_connected_pair(ReadRingConfig::default()).await;
+
+    // Small messages so the doorbell pool (not byte space) is the binding
+    // constraint — the SQ-backpressure path the heartbeat protects. Post WITHOUT
+    // draining and without the server reading, so the send queue fills to the
+    // doorbell cap and the next send_copy takes the doorbell-blocked branch.
+    let data = vec![0xABu8; 64];
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if client.send_copy(&data).unwrap() == 0 && client.sends_in_flight() > 0 {
+            break; // doorbell-blocked: Ok(0) with sends pinned
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "did not reach doorbell backpressure within 10s"
+        );
+    }
+
+    // Tiny messages (64 B) can only fill ~43 * 64 B = 2.7 KiB of the 64 KiB ring,
+    // so this is unambiguously the doorbell-pool constraint, not byte-fill.
+    let pinned = client.sends_in_flight();
+    assert!(
+        pinned >= 40,
+        "expected the doorbell pool (~43) to be the binding constraint, not byte \
+         space; got only {pinned} sends pinned"
+    );
+
+    // The heartbeat: a doorbell-blocked send_copy must leave a one-sided RDMA
+    // Read outstanding so the wedged sender retains a send-CQ wakeup source.
+    assert!(
+        client.read_in_flight(),
+        "doorbell-blocked send_copy must post an RDMA-Read heartbeat; without it a \
+         wedged sender parks with no send-CQ wakeup source (the concurrent-stream \
+         deadlock's silent-park seed). \
+         See docs/bugs/read-ring-concurrent-stream-deadlock.md"
+    );
+
+    println!("read_ring_doorbell_blocked_posts_read_heartbeat passed!");
+}
+
 /// Regression test for the send-CQ ownership invariant.
 ///
 /// `poll_send_completion` (driven by the `CqPollState` drain-after-arm state

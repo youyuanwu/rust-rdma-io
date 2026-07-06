@@ -296,6 +296,17 @@ impl ReadRingTransport {
         // The address is 4-byte aligned (guaranteed by 64-byte cache-line alignment).
         unsafe { &*(self._offset_mr.addr() as *const AtomicU32) }
     }
+
+    /// Whether an RDMA-Read (head refresh / doorbell-blocked heartbeat) is
+    /// currently outstanding on the send CQ.
+    ///
+    /// Test/observability hook: the concurrent-stream deadlock tests assert that
+    /// a doorbell-blocked `send_copy` leaves a Read in flight (the send-CQ
+    /// heartbeat). See docs/bugs/read-ring-concurrent-stream-deadlock.md.
+    #[doc(hidden)]
+    pub fn read_in_flight(&self) -> bool {
+        self.read_in_flight
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -898,6 +909,26 @@ impl Transport for ReadRingTransport {
         // docs/bugs/ring-send-queue-exhaustion.md.
         let sq_used = self.send_in_flight + usize::from(self.read_in_flight);
         if sq_used + SEND_COPY_MAX_WRS > self.max_outstanding {
+            // Doorbell-blocked heartbeat. Unlike the byte-blocked branch below,
+            // this path posts no data WR, so without a proactive Read it leaves
+            // NO outstanding work on the send CQ: the pinned Write+Imm are
+            // RNR-stalled on the peer's spent doorbells (they only complete once
+            // the peer reads + reposts), and nothing else will fire a
+            // completion. A caller that parks here therefore parks with no
+            // wakeup source — the silent-park seed of the concurrent-stream
+            // deadlock. Post a single one-sided RDMA-Read (if none is already in
+            // flight): it always completes at Read-RTT regardless of the peer's
+            // doorbell/read state, guaranteeing a send-CQ completion that
+            // re-polls this send_copy and keeps the stream's recv-drain /
+            // doorbell-repost cascade alive (it also refreshes the cached head,
+            // relieving byte-block). It does NOT by itself relieve the doorbell
+            // block — only the peer reposting does — so this is a liveness
+            // guarantee, not a deadlock cure. One Read fits the physical SQ
+            // headroom (sq_capacity = max_outstanding + READ_RING_SQ_HEADROOM).
+            // See docs/bugs/read-ring-concurrent-stream-deadlock.md.
+            if !self.read_in_flight {
+                self.post_offset_read()?;
+            }
             return Ok(0);
         }
 

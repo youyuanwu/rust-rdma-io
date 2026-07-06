@@ -13,26 +13,31 @@ Resolved at the stream layer by fix A; two transport **lost-wakeup** bugs were
 then found and fixed — the *unidirectional* send-CQ reap (`send_copy` reaping the
 send CQ out-of-band; Status change 4) and the write-blocked path not registering
 its *recv* waker (now drains `poll_recv` to `Pending`; Status change 5). These
-make read-ring gRPC reliable at modest aggregate load. **But the *bidirectional*
-flow-control deadlock that fix A only mitigates is still reachable at higher
-aggregate load** — both peers write-block with full stashes and neither reads —
-so the benchmark keeps read-ring gRPC capped at `in_flight = 1`.
+make read-ring gRPC reliable at modest aggregate load. **The *bidirectional*
+flow-control deadlock is now FIXED** by a sixth change — a doorbell-blocked
+RDMA-Read *heartbeat* (Status change 6) — validated cross-VM on MANA with a
+reboot-clean A/B; the benchmark's read-ring gRPC `in_flight = 1` cap has been
+**lifted**.
 
 ## Status
 
-**Two lost-wakeup bugs fixed; the fundamental bidirectional flow-control deadlock
-remains, so read-ring gRPC stays capped at `in_flight = 1`.** The RNR root cause,
-the *unidirectional* send-CQ lost wakeup, and the write-blocked recv-waker gap are
-all fixed — `pipelined_transfer_read_ring` is green (20/20) and the cross-VM gRPC
-bench is stall-free at modest load (validated `conn≤8 in_flight≤8`, 64 B, 0 stalls,
-≈113k rps at `conn=8 in_flight=4`). **However, the bidirectional deadlock still
-reproduces at higher aggregate load:** `conn=4 in_flight=8 payload=256`
-deterministically wedges in warmup on MANA RoCEv2 (both peers write-block with
-full recv stashes, neither reads). The safe boundary depends on
-connections × depth × payload, so the benchmark keeps the conservative
-`in_flight = 1` cap; use send-recv or credit-ring for pipelined gRPC.
+**RESOLVED (2026-07-06): the bidirectional flow-control deadlock is fixed by a
+doorbell-blocked RDMA-Read heartbeat (Status change 6); the read-ring gRPC
+`in_flight = 1` cap has been LIFTED.** Changes 1–5 (RNR root cause, the
+*unidirectional* send-CQ lost wakeup, and the write-blocked recv-waker gap) made
+read-ring gRPC reliable only at modest load and merely *mitigated* the residual
+bidirectional deadlock; change 6 *closes* it. The config the benchmark used as
+its canonical deterministic wedge — `conn=4 in_flight=8 payload=256` — now
+passes. A **reboot-clean cross-VM A/B on MANA RoCEv2** measured **5/5 pass with
+the heartbeat vs 3/3 warmup-wedge without** (same binary except the one
+`send_gather` branch; A/B/A confirmed causation), and a boundary sweep up to
+`conn=16 in_flight=64 payload=1024` found **0 deadlocks**. One caveat is *perf,
+not correctness*: read-ring at deep pipelines with larger payloads (e.g.
+`conn=8 in_flight=32 payload=1024`) collapses to a low-throughput
+byte-ring-saturation regime (Read head-refresh RTT bubbles) — prefer
+send-recv/credit-ring there. `pipelined_transfer_read_ring` remains green (20/20).
 
-Five transport/stream changes landed on top of the original fix A:
+Six transport/stream changes landed on top of the original fix A:
 
 1. **Doorbell reposting decoupled from application reads.** `poll_recv` now
    reposts the doorbell recv WR at the moment it *reaps* a data completion
@@ -76,31 +81,34 @@ Five transport/stream changes landed on top of the original fix A:
    [`poll_write_slice`](../../rdma-io/src/async_stream.rs). This removes the lost
    wakeup and makes read-ring gRPC reliable at modest load, but it does **not**
    eliminate the underlying *bidirectional* flow-control deadlock once the recv
-   stash is full on both peers — see "Bidirectional gRPC stall" below.
+   stash is full on both peers — see "Bidirectional gRPC stall" below. (Change 6
+   is what finally eliminates it.)
+6. **Doorbell-blocked RDMA-Read heartbeat — the actual deadlock fix.** The
+   doorbell-blocked backpressure branch of `send_gather` (`sq_used +
+   SEND_COPY_MAX_WRS > max_outstanding`) used to return `Ok(0)` with **no
+   outstanding send-CQ work**: the pinned Write+Imm RNR-stall on the peer's spent
+   doorbells, so a write-blocked sender parked with **no wakeup source** (the
+   silent-park seed). It now posts a single one-sided RDMA Read (guarded by
+   `!read_in_flight`; fits the SQ headroom). The Read always completes at
+   Read-RTT regardless of the peer, so its send-CQ completion **re-polls the
+   stream's `poll_write`**, which **re-runs fix A's write-blocked recv-drain**
+   (repost doorbells → free the peer): the silent park becomes a self-sustaining
+   relief pump, so a symmetric write-block self-unwinds instead of wedging. This
+   is what actually breaks the bidirectional deadlock (changes 1–5 only mitigated
+   it). The earlier belief that this was "liveness only, not a cure" was
+   disproved by the reboot-clean A/B (5/5 pass vs 3/3 wedge). Guarded by the
+   deterministic mechanism test
+   [`read_ring_doorbell_blocked_posts_read_heartbeat`](../../rdma-io-tests/tests/read_ring_transport_tests.rs)
+   (a doorbell-blocked `send_copy` must leave a Read in flight).
 
-**Measured effect on MANA RoCEv2** (rh2, 64 B, `--mw-fallback`): the former
-*deterministic* deadlock is gone — `conn=8 in_flight=4` now passes ~2/3
-(≈106-110k rps, 0 errors) and `conn=1 in_flight=8` ~3/4 (≈40k rps), where both
-were previously a hard hang. `in_flight = 1..4` are reliable. send-recv and
-credit-ring are unaffected (≈112k rps at `in_flight = 8`, 0 errors).
-
-**The unidirectional residual stall is fixed** by change 4 above. It previously
-wedged with the client write-saturated (`sif ≈ 41`) and the server idle
-(`sif = 0`), *not* on doorbell exhaustion (`sif ≤ 42 ≤ 43` doorbells) — a lost
-send-CQ wakeup caused by `send_copy`'s out-of-band reap. The *bidirectional*
-gRPC path at `in_flight > 1` is a distinct, deeper coupling: a cross-VM capture
-root-caused a lost *recv*-CQ wakeup (the recv-side analog of change 4), fixed by
-change 5 (draining `poll_recv` to `Pending`). That removes the lost wakeup at
-modest load, but the underlying flow-control deadlock still reproduces once both
-recv stashes fill (`conn=4 in_flight=8 payload=256` wedges on MANA) — see
+The fixes landed incrementally: changes 4–5 removed *lost-wakeup* stalls (a
+unidirectional send-CQ reap and a bidirectional recv-CQ gap) and made read-ring
+gRPC reliable at modest load; change 6 (the heartbeat) then closed the residual
+*bidirectional* flow-control deadlock at higher load. Two detailed forensic
+captures are kept below: the cross-VM
 [Bidirectional gRPC stall](#bidirectional-grpc-stall-recv-cq-lost-wakeup-fixed--residual-flow-control-deadlock)
-below. So the benchmark's read-ring `in_flight = 1` cap is **retained**.
-
-The stall reproduced on MANA in a **unidirectional** integration test
-(`pipelined_transfer_read_ring`) — a lost wakeup on the send-completion path,
-not a gRPC-only phenomenon; it is now green. See
-[MANA unit-test reproduction](#mana-unit-test-reproduction-pipelined_transfer-unidirectional-stall)
-below.
+and the
+[MANA unidirectional `pipelined_transfer` reproduction](#mana-unit-test-reproduction-pipelined_transfer-unidirectional-stall).
 
 ### Original fix A (superseded in part by the above)
 
@@ -273,10 +281,12 @@ stream depth caps throughput without guaranteeing deadlock-freedom.
 
 ## Remaining transport-level work (deferred)
 
-Fix A resolves the deadlock at the stream layer but leaves the transport's
-write-completion-coupled-to-peer-read property in place (hence the transport-level
-repro still wedges). A deeper transport rework could remove the coupling — and the
-backpressure-path copy — entirely. Candidate approaches:
+The deadlock is fixed (changes 1–6). The transport still has the underlying
+write-completion-coupled-to-peer-read property — the doorbell-blocked heartbeat
+pumps *around* it rather than removing it (so the transport-level coupling test
+still shows the property by design). The items below are optional
+*architecture/perf* reworks that would remove the coupling and the
+backpressure-path copy — no longer needed for correctness:
 
 1. **Guarantee doorbell headroom ≥ SQ depth** and repost doorbells eagerly
    (independent of stream read progress), so Write+Imm never RNR-stalls on a
@@ -285,26 +295,17 @@ backpressure-path copy — entirely. Candidate approaches:
    decoupled from slot release.
 2. **Bound the stream's outstanding sends** below the point where a symmetric
    write-block can starve the peer's reposting, giving the read side room to run.
-3. The `poll_send_completion` "Read-only ⇒ Pending" hiding is **fixed** (a
-   head-refreshing Read now returns `Ready(Ok)` so the blocked writer re-polls);
-   the `drain_send_cq_for_read` dual-poller hazard is now **removed** as well —
-   `send_copy` no longer polls the send CQ, so `poll_send_completion` is the sole
-   owner (Status change 4). This closed the residual *unidirectional* lost-wakeup
-stall. The recv-side analog (the *bidirectional* gRPC stall) is a lost recv-CQ
-   wakeup, fixed at modest load by the write-blocked drain registering the recv
-   waker before parking; the fundamental flow-control deadlock at high load
-   remains. See "Bidirectional gRPC stall" below.
-
-Before lifting the bench `in_flight = 1` cap, validate fix A at `in_flight`
-4/8/16 on the MANA RoCEv2 preview (the CM is flaky there, so use
-`reboot_between`/retries).
+3. The lost-wakeup fixes themselves (changes 3–6) are already landed and
+   validated — this section is only the optional coupling-removal rework, which
+   overlaps with options B and C in the design analysis below.
 
 ## Design analysis: why it deadlocks, and the fix options
 
 This section records the mechanism and the fix trade-offs worked out while
-root-causing the bidirectional stall, so the reasoning isn't lost. Nothing here
-is implemented beyond the two lost-wakeup fixes above; it's the map for a future
-rework.
+root-causing the bidirectional stall. The fix that actually landed — the
+doorbell-blocked Read heartbeat (change 6) — is a lightweight send-side variant
+of the §1 mitigation; the A/B/C options below were the pre-fix map and are kept
+for context and possible future perf work.
 
 ### 1. Two backpressure paths — only one has a wakeup
 
@@ -328,8 +329,10 @@ behave very differently:
 Which one you hit first depends on message size vs `ring_capacity /
 max_outstanding` (≈ 1.5 KB default): small messages exhaust the ~43 doorbell
 slots first (doorbell-blocked); large messages fill the byte ring first
-(byte-blocked). **Candidate mitigation:** post a Read on the doorbell-blocked
-path too, so a doorbell-blocked sender keeps a heartbeat instead of parking blind.
+(byte-blocked). **Fix (IMPLEMENTED — Status change 6):** post a Read on the
+doorbell-blocked path too. The doorbell-blocked sender keeps a heartbeat; its
+send-CQ completion re-polls the write path and pumps fix A's recv-drain, which is
+what breaks the deadlock (measured 5/5 pass vs 3/3 wedge, reboot-clean A/B).
 
 ### 2. Why credit-ring doesn't silent-park: push relief *with a wakeup*
 
@@ -349,9 +352,10 @@ Both ring transports relieve backpressure only when the receiver consumes
 So read-ring's flow control is **pull-based and silent**; credit-ring's is
 **push-based and self-notifying**. This is the crux of "make read-ring behave
 like credit-ring." (Caveat: credit-ring also grants credits only at consume and
-stashes bounded, so it is not *obviously* immune to the same stash-full ceiling —
-it has **not** been tested at the config that broke read-ring, `conn=4
-in_flight=8 payload=256`. Open item.)
+stashes bounded, so it is not *obviously* immune to the same stash-full ceiling.
+**Resolved 2026-07-06:** credit-ring was measured at that config and up through
+`conn=8 in_flight=16 payload=1024` — all 0 errors, no wedge; it is empirically
+deadlock-free there.)
 
 ### 3. Why hyper stops servicing reads while write-blocked
 
@@ -367,58 +371,33 @@ the peer *reading* (reposting doorbells), so "park until writable" can be
 permanent. send-recv/credit-ring don't couple write-completion to peer reads, so
 they satisfy hyper's assumption.
 
-### 4. Fix options and their limits
+### 4. Fix options considered (pre-fix map)
 
-- **A — Rate limiting / windowing.** Bound each connection's outstanding writes
-  (bytes *and* messages) strictly below the peer's guaranteed recv absorption
-  (ring + `virtual_idx_map` + stash). **Which layer matters:**
-  - **A1 (application-level) — the one that works.** Bound the total *unacked
-    requests* — a small h2 `INITIAL_WINDOW_SIZE` or an in-flight-RPC cap. This
-    caps how much data hyper buffers before it must read a response, so a
-    symmetric write-block can't form. `in_flight = 1` is the degenerate case.
-  - **A3 (transport-level send window) — TRIED, MEASURED INSUFFICIENT, REMOVED.**
-    A `send_copy` semaphore capping outstanding `Write+Imm`
-    (`ReadRingConfig::with_send_window`) was implemented and tested cross-VM at
-    the failing config `conn=4 in_flight=8 payload=256`: **both `window=8` and
-    `window=2` still wedge in warmup** (Connected → Warming up → hang), right
-    after a clean `in_flight=1` baseline (28.7k rps, 0 err). A transport send
-    window does **not** break this deadlock at *any* size — because the deadlock
-    is a *wakeup* problem (hyper won't poll reads while write-blocked; the recv
-    waker isn't registered at the backpressure boundary), **not** a send-*depth*
-    problem. Shrinking the window only makes both peers block sooner. The knob
-    was **removed** (it added a config surface without fixing anything); the
-    `in_flight = 1` cap stays.
-  Windowing is **guaranteed deadlock-free only at A1** (bound the smallest
-  message; the ~43-slot `virtual_idx_map`, not bytes, is binding for tiny
-  payloads), and caps pipeline depth (Little's law).
-- **B — Untangle doorbell reposting from consume (deferred item 1).** Keep
-  reaping + reposting doorbells past the stash cap (holding messages in
-  `virtual_idx_map`, data in the recv ring), so backpressure becomes byte-based
-  (ring-full, which has the Read heartbeat) instead of doorbell-RNR. Raises the
-  ceiling to `stash + virtual_idx_map + ring`, but `virtual_idx_map`
-  (`max_outstanding` ≈ 43) still bottoms out for small messages. **Necessary but
-  not sufficient alone.**
-- **C — Dedicated reader task (decouple reads from h2's write state).** Split the
-  transport into a **send half** and a **recv half** — read-ring's **dual CQs**
-  make this feasible (share the QP; `ibv_post_send` and `ibv_post_recv` are
-  different verbs) — and run the recv half as a driver task that always drains the
-  recv CQ (reap, repost doorbells, advance head, deliver into a bounded channel),
-  independent of the write path. `poll_read` pulls from the channel. A
-  write-blocked endpoint then frees its peer autonomously, up to the channel size.
-  This is the "behave like credit-ring" fix and lives primarily at the
-  **transport layer** (the recv half must be independently drainable), with a thin
-  stream/connection-driver wrapper. **Still bounded** by the channel size — a
-  large enough load reopens it — so C ≈ A with better ergonomics; a provable
-  guarantee is **C (removes write-gating) + A (bounds load)** together.
+Four families were mapped before change 6 landed; kept for context:
 
-**Recommendation.** For "safe soon" → **A1** (application-level window: h2
-`INITIAL_WINDOW_SIZE` or an in-flight-RPC cap) — **A3 (a transport send window)
-was implemented and measured *not* to break the deadlock, see §4**. For
-"pipeline properly like credit-ring" → C. B only as a companion. Given
-read-ring already trails send-recv/credit-ring at depth and those pipeline
-cleanly, keeping read-ring capped and steering pipelined gRPC to
-send-recv/credit-ring is the cheapest option unless read-ring's one-sided-write
-CPU profile is the specific target.
+- **A1 — application window** (bound unacked RPCs via h2 `INITIAL_WINDOW_SIZE` or
+  an in-flight cap; `in_flight = 1` is the degenerate case). Deadlock-free but
+  caps pipeline depth (Little's law).
+- **A3 — transport send window** (a `send_copy` semaphore on outstanding
+  Write+Imm). **Tried, measured *not* to help** — `window=2` and `window=8` both
+  wedged at `conn=4 in_flight=8 payload=256` — and removed: the deadlock is a
+  *wakeup* problem, not a send-*depth* one, so shrinking the window only makes
+  both peers block sooner.
+- **B — untangle doorbell reposting from consume** (repost past the stash cap so
+  backpressure becomes byte-based, which has the Read heartbeat). Raises the
+  ceiling but `virtual_idx_map` (~43 slots) still bottoms out for small messages.
+- **C — dedicated reader task** that always drains recv independent of the write
+  path (the "behave like credit-ring" rework, feasible via read-ring's dual CQs).
+  Removes write-gating but is bounded by its channel size.
+
+**Outcome.** None of A1/A3/B/C was needed: the deadlock was broken by the §1
+mitigation — the doorbell-blocked Read heartbeat (change 6) — which is cheap (one
+one-sided Read on the backpressure path) and required neither an application
+depth cap (A1) nor a transport rework (C). A3 (a transport send window) was
+implemented and measured *not* to help (see §4) and was removed. B/C remain as
+optional perf/architecture ideas. Caveat (perf, not correctness): read-ring still
+trails send-recv/credit-ring at large payloads × deep pipelines, so steer those
+there.
 
 ## Bidirectional gRPC stall: recv-CQ lost wakeup (fixed) + residual flow-control deadlock
 
@@ -491,21 +470,23 @@ lost wakeup is gone — **0 benchmark-phase stalls** at 64 B (`conn=8 in_flight=
 ≈113k rps, double the `in_flight=1` ≈51k; `conn=1 in_flight=8` 7/7). In-process
 suites unaffected: `async_stream_tests` 37/37, `read_ring_transport_tests` 4/4.
 
-**But the fix is *not* complete.** When the recv stash fills to `MAX_STASH_BUFS`,
-the drain stops (to keep backpressuring the peer) *without* reaching `Pending`,
-so the recv waker is again unregistered — and at that point the peer's sends are
-RNR-stalled on our un-reposted doorbells, so no recv completion will arrive to
-fire even a registered waker. This is the **fundamental bidirectional
+**The stash-full ceiling change 5 left — and how change 6 closed it.** Change 5
+still stopped draining when the recv stash filled (`MAX_STASH_BUFS`) *without*
+reaching `Pending`, so the recv waker went unregistered again while the peer's
+sends RNR-stalled on un-reposted doorbells — the **fundamental bidirectional
 flow-control deadlock** (both peers write-block with full stashes, neither reads),
-which fix A only mitigates — not a lost wakeup. It reproduces deterministically at
-higher aggregate load: **`conn=4 in_flight=8 payload=256` wedges in warmup** on
-MANA. A self-wake at the stash-full park was tried and rejected — it livelocks
-(the connection task busy-polls, starving the RPC tasks that would drain the
-stash). Because the safe boundary depends on connections × depth × payload, the
-benchmark's read-ring `in_flight = 1` cap is **retained**; send-recv and
-credit-ring remain the transports for pipelined gRPC. Genuinely lifting the cap
-needs the flow-control coupling itself removed (see deferred work) or the h2
-layer servicing reads while write-blocked.
+reproducing deterministically at `conn=4 in_flight=8 payload=256`. A stash-full
+*self-wake* was tried and rejected (it livelocks — the connection task busy-polls
+and starves the RPC tasks that would drain the stash).
+
+**Change 6 (the doorbell-blocked Read heartbeat) fixes it.** It is *not* the
+rejected self-wake: the wakeup is a real hardware Read completion (Read-RTT paced,
+not a busy spin), and on each wake the stream's `poll_write` re-runs fix A's
+recv-drain — reposting doorbells and freeing the peer (a relief pump, not an empty
+wake). Reboot-clean cross-VM A/B: `conn=4 in_flight=8 payload=256` **5/5 pass
+with the heartbeat vs 3/3 warmup-wedge without**; boundary sweep to
+`conn=16 in_flight=64 payload=1024` — 0 deadlocks. The `in_flight = 1` cap is
+**lifted**.
 
 ## MANA unit-test reproduction: `pipelined_transfer` (unidirectional stall)
 
@@ -566,10 +547,10 @@ send CQ (see Status change 4), making `poll_send_completion` the sole owner. The
 deterministic guard
 [`read_ring_send_copy_must_not_reap_send_cq`](../../rdma-io-tests/tests/read_ring_transport_tests.rs)
 locks in the invariant (`send_copy` must never decrease `sends_in_flight()`), and
-`pipelined_transfer_read_ring` is now green (20/20 on MANA). This fixes the
-unidirectional stall only; the bidirectional gRPC benchmark deadlock at
-`in_flight > 1` (~1/3 on MANA) is unchanged, so the read-ring `in_flight = 1`
-bench cap stays until that separate coupling is resolved.
+`pipelined_transfer_read_ring` is now green (20/20 on MANA). This fixed the
+unidirectional stall; the *bidirectional* gRPC deadlock at `in_flight > 1` was a
+separate coupling, later closed by change 6 (the doorbell-blocked heartbeat), so
+the read-ring `in_flight = 1` bench cap is now lifted.
 
 **Note on the full MANA suite.** Every other integration test passes on MANA.
 Memory-Window, atomics, and siw/rxe-only tests self-skip via the `require_*`
