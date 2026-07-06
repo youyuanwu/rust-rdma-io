@@ -456,29 +456,24 @@ async fn run_channel_clients(
     //
     // send-recv and credit-ring pipeline safely at depth > 1.
     //
-    // read-ring is capped to one in-flight RPC per connection. Two transport
-    // lost-wakeup bugs were fixed along the way — the *unidirectional* send-CQ
-    // reap (`send_copy` no longer polls the send CQ; `pipelined_transfer_read_ring`
-    // is 20/20) and the write-blocked path not registering its recv waker (it now
-    // drains `poll_recv` to `Pending`). Those make read-ring gRPC reliable at
-    // modest aggregate load (validated: conn≤8 in_flight≤8, 64 B, 0 stalls,
-    // ≈113k rps at conn=8 in_flight=4). But the *bidirectional* flow-control
-    // deadlock that fix A only mitigates is still reachable at higher aggregate
-    // load: `conn=4 in_flight=8 payload=256` deterministically wedges in warmup
-    // on MANA RoCEv2 (both peers write-block with full stashes, neither reads).
-    // Because the safe boundary depends on connections × depth × payload, the
-    // benchmark keeps the conservative cap; use send-recv or credit-ring for
-    // pipelined gRPC. See docs/bugs/read-ring-concurrent-stream-deadlock.md.
-    let mut depth = args.in_flight.max(1);
-    if transport == "read-ring" && depth > 1 {
-        eprintln!(
-            "warning: read-ring gRPC has a residual bidirectional stall at high \
-             aggregate load; capping --in-flight from {} to 1 \
-             (see docs/bugs/read-ring-concurrent-stream-deadlock.md)",
-            args.in_flight
-        );
-        depth = 1;
-    }
+    // read-ring also pipelines at depth > 1 now. Its former `in_flight = 1` cap
+    // guarded a *bidirectional* flow-control deadlock (both peers write-block
+    // with spent doorbells, neither reads, so their Write+Imm RNR-stall with no
+    // wakeup source). That is fixed by the doorbell-blocked RDMA-Read *heartbeat*
+    // in `read_ring_transport::send_gather`: a doorbell-blocked sender posts a
+    // one-sided Read whose completion re-polls the write path and pumps the
+    // stream's recv-drain / doorbell-repost cascade, so a symmetric write-block
+    // self-unwinds instead of wedging. Validated cross-VM on MANA RoCEv2 with a
+    // reboot-clean A/B (`conn=4 in_flight=8 payload=256`: 5/5 pass with the
+    // heartbeat vs 3/3 warmup-wedge without) and a boundary sweep up to
+    // `conn=16 in_flight=64 payload=1024` — 0 deadlocks.
+    //
+    // NOTE (perf, not correctness): read-ring at deep pipelines with larger
+    // payloads (e.g. `conn=8 in_flight=32 payload=1024`) collapses to a
+    // low-throughput byte-ring-saturation regime (RDMA-Read head-refresh RTT
+    // bubbles); prefer send-recv/credit-ring for large-payload pipelines.
+    // See docs/bugs/read-ring-concurrent-stream-deadlock.md.
+    let depth = args.in_flight.max(1);
 
     // Warmup
     if args.warmup > 0 {
