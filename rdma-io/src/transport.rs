@@ -88,6 +88,35 @@ pub trait Transport: Send + Sync {
     /// For Ring (future): returns `Ok(0)` when remote ring is full.
     fn send_copy(&mut self, data: &[u8]) -> Result<usize>;
 
+    /// Coalesce a vectored list of slices into a **single** transport send,
+    /// copying the bytes directly into the registered send buffer.
+    ///
+    /// Semantically equivalent to [`send_copy`](Self::send_copy) on the
+    /// concatenation of `bufs`, but lets the stream adapter hand down an HTTP/2
+    /// frame's discontiguous slices (header + payload) without first gathering
+    /// them into an intermediate scratch buffer — saving one copy per fragmented
+    /// write. Returns bytes accepted across the slices (capped by the transport's
+    /// per-send capacity), or `Ok(0)` if no send buffer is available right now
+    /// (same backpressure contract as `send_copy`).
+    ///
+    /// The default implementation coalesces into a temporary and calls
+    /// `send_copy` (two copies); real transports override it to gather straight
+    /// into the send region (one copy).
+    fn send_gather(&mut self, bufs: &[std::io::IoSlice<'_>]) -> Result<usize> {
+        let total: usize = bufs.iter().map(|b| b.len()).sum();
+        if total == 0 {
+            return Ok(0);
+        }
+        if bufs.len() == 1 {
+            return self.send_copy(&bufs[0]);
+        }
+        let mut tmp = Vec::with_capacity(total);
+        for b in bufs {
+            tmp.extend_from_slice(b);
+        }
+        self.send_copy(&tmp)
+    }
+
     /// Wait for at least one in-flight send to complete.
     ///
     /// Returns `Err` on fatal CQ error (e.g., `WR_FLUSH_ERR` — marks the

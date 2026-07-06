@@ -479,6 +479,69 @@ async fn concurrent_write_stash_overflow_no_deadlock_read_ring() {
 }
 
 // ===========================================================================
+// vectored_write — a multi-slice `poll_write_vectored` (the HTTP/2 header +
+// payload shape) must be coalesced into ONE transport send and arrive as the
+// in-order concatenation of the slices. Guards `Transport::send_gather`, which
+// gathers the slices directly into the registered send buffer (one copy).
+// ===========================================================================
+
+async fn vectored_write<B: TransportBuilder>(builder: B) {
+    use std::pin::Pin;
+
+    let (mut server, mut client) = connected_pair(builder).await;
+
+    let parts: [&[u8]; 3] = [b"frame-header:", b"hpack", b"the-DATA-payload"];
+    let expected: Vec<u8> = parts.concat();
+    let slices = [
+        std::io::IoSlice::new(parts[0]),
+        std::io::IoSlice::new(parts[1]),
+        std::io::IoSlice::new(parts[2]),
+    ];
+
+    // One vectored write; the slices coalesce into a single send well under
+    // every transport's per-message capacity, so all bytes are accepted at once.
+    let n = std::future::poll_fn(|cx| {
+        futures_io::AsyncWrite::poll_write_vectored(Pin::new(&mut client), cx, &slices)
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        n,
+        expected.len(),
+        "gathered vectored write not fully accepted"
+    );
+
+    let mut got = vec![0u8; expected.len()];
+    let mut off = 0;
+    while off < expected.len() {
+        let k = server.read(&mut got[off..]).await.unwrap();
+        assert!(k > 0, "unexpected EOF reading gathered write");
+        off += k;
+    }
+    assert_eq!(
+        got, expected,
+        "gathered slices arrived out of order/corrupted"
+    );
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn vectored_write_default() {
+    vectored_write(SendRecvConfig::default()).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn vectored_write_read_ring() {
+    require_no_iwarp!();
+    vectored_write(ReadRingConfig::default()).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn vectored_write_credit_ring() {
+    require_no_iwarp!();
+    vectored_write(CreditRingConfig::default()).await;
+}
+
+// ===========================================================================
 // futures_io_echo — echo via futures::io::AsyncReadExt / AsyncWriteExt traits.
 // ===========================================================================
 

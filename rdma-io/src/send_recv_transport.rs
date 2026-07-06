@@ -294,6 +294,37 @@ impl Transport for SendRecvTransport {
         Ok(len)
     }
 
+    fn send_gather(&mut self, bufs: &[std::io::IoSlice<'_>]) -> crate::Result<usize> {
+        // Gather the caller's slices straight into a registered send buffer
+        // (one copy) instead of coalescing into a scratch first (two copies).
+        let total: usize = bufs.iter().map(|b| b.len()).sum();
+        if total == 0 {
+            return Ok(0);
+        }
+        // Find a free send buffer (round-robin with in-flight check).
+        let n = self.send_bufs.len();
+        let start = self.next_send_idx % n;
+        let mut idx = start;
+        loop {
+            if !self.send_in_flight[idx] {
+                break;
+            }
+            idx = (idx + 1) % n;
+            if idx == start {
+                return Ok(0); // All send buffers occupied
+            }
+        }
+
+        let wr_id = self.config.num_recv_bufs as u64 + idx as u64;
+        let mr = &mut self.send_bufs[idx];
+        let len = total.min(mr.as_slice().len());
+        crate::transport_common::gather_into(&mut mr.as_mut_slice()[..len], bufs);
+        self.qp.post_send_signaled(mr, 0, len, wr_id)?;
+        self.send_in_flight[idx] = true;
+        self.next_send_idx = (idx + 1) % n;
+        Ok(len)
+    }
+
     fn poll_send_completion(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
         let mut wc_buf = [WorkCompletion::default(); 4];
         let n = match self

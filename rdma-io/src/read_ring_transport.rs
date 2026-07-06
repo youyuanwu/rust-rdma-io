@@ -849,13 +849,18 @@ impl Transport for ReadRingTransport {
     /// When the remote ring's free space drops below `min_free_threshold`,
     /// posts an RDMA Read to refresh the cached head position.
     fn send_copy(&mut self, data: &[u8]) -> crate::Result<usize> {
+        self.send_gather(&[std::io::IoSlice::new(data)])
+    }
+
+    fn send_gather(&mut self, bufs: &[std::io::IoSlice<'_>]) -> crate::Result<usize> {
         if self.peer_disconnected {
             return Err(crate::Error::WorkCompletion {
                 status: rdma_io_sys::ibverbs::IBV_WC_WR_FLUSH_ERR,
                 vendor_err: 0,
             });
         }
-        if data.is_empty() {
+        let total_len: usize = bufs.iter().map(|b| b.len()).sum();
+        if total_len == 0 {
             return Ok(0);
         }
 
@@ -899,8 +904,7 @@ impl Transport for ReadRingTransport {
         let free = self.remote_free_space();
 
         // Clamp data length (16-bit immediate encoding limit).
-        let data_len = data
-            .len()
+        let data_len = total_len
             .min(self.config.max_message_size)
             .min(self.remote_capacity)
             .min(0xFFFF);
@@ -943,9 +947,12 @@ impl Transport for ReadRingTransport {
             self.remote_write_tail = 0;
         }
 
-        // Copy data into send_ring at reserved offset.
-        self.send_ring.mr.as_mut_slice()[local_offset..local_offset + data_len]
-            .copy_from_slice(&data[..data_len]);
+        // Gather the caller's slices into send_ring at the reserved offset
+        // (one copy straight into the registered ring, no scratch).
+        crate::transport_common::gather_into(
+            &mut self.send_ring.mr.as_mut_slice()[local_offset..local_offset + data_len],
+            bufs,
+        );
 
         // Build RDMA Write+Imm WR for data.
         let remote_offset = self.remote_write_tail;

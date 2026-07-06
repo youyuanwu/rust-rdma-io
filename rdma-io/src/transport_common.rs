@@ -321,6 +321,26 @@ fn clamp_max_outstanding(
     requested.min(device_cap).max(1)
 }
 
+/// Coalesce a vectored slice list into `dst`, copying up to `dst.len()` bytes
+/// total, and return the number of bytes written.
+///
+/// Transports use this in [`Transport::send_gather`](crate::transport::Transport::send_gather)
+/// to gather the caller's slices (e.g. an HTTP/2 frame header plus its payload)
+/// straight into the registered send buffer — avoiding the intermediate scratch
+/// copy the stream adapter would otherwise need to make the slices contiguous.
+pub(crate) fn gather_into(dst: &mut [u8], bufs: &[std::io::IoSlice<'_>]) -> usize {
+    let mut written = 0;
+    for b in bufs {
+        if written >= dst.len() {
+            break;
+        }
+        let take = b.len().min(dst.len() - written);
+        dst[written..written + take].copy_from_slice(&b[..take]);
+        written += take;
+    }
+    written
+}
+
 /// Allocate and bind a Memory Window Type 2 to the recv ring MR.
 /// Must be called AFTER QP reaches RTS (post-connect/accept).
 /// Panics if the device does not support MW Type 2.

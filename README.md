@@ -173,6 +173,7 @@ Design documents and background research are in [`docs/`](docs/):
 | [SafeApi.md](docs/design/SafeApi.md) | Safe API design and RAII ownership model |
 | [RdmaOperations.md](docs/design/RdmaOperations.md) | RDMA verb operations and data path patterns |
 | [rdma-transport-layer.md](docs/design/rdma-transport-layer.md) | Transport trait architecture and transport implementations |
+| [DataPathCopies.md](docs/design/DataPathCopies.md) | Send/recv copy audit of the transport & stream interfaces, and where `Buf`/`Bytes` would help |
 | [quinn-rdma.md](docs/design/quinn-rdma.md) | Quinn QUIC over RDMA design (includes tonic-h3 integration) |
 | [rdma-transport-comparison.md](docs/design/rdma-transport-comparison.md) | Three-way transport comparison (rdma-io vs msquic vs ring) |
 | [TonicRdmaVsTcpPerformance.md](docs/design/TonicRdmaVsTcpPerformance.md) | Why tonic-over-RDMA trails TCP at low concurrency (root-cause analysis) |

@@ -48,18 +48,6 @@ use futures_io::{AsyncRead, AsyncWrite};
 
 use crate::transport::{RecvCompletion, Transport};
 
-/// Upper bound on bytes coalesced into a single send by
-/// [`poll_write_vectored`](AsyncRdmaStream::poll_write_vectored).
-///
-/// Vectored writes gather the caller's slices (e.g. an HTTP/2 frame header
-/// plus its payload) into one contiguous buffer so they travel as a single
-/// RDMA message instead of one send per slice. The gather is capped so the
-/// reusable scratch buffer stays bounded; anything beyond the cap (or beyond a
-/// transport's per-send capacity) is left for the next write. 64 KiB matches
-/// the Send/Recv stream buffer and exceeds the ring transports' per-message
-/// limit, so it never under-fills a single send.
-const MAX_GATHER: usize = 64 * 1024;
-
 /// Cap on the number of recycled `recv_stash` buffers kept in `stash_pool` for
 /// reuse, so the write-blocked drain path avoids reallocating on the common
 /// case without letting the free-list grow without bound. This is a
@@ -106,14 +94,11 @@ pub struct AsyncRdmaStream<T: Transport> {
     /// (backpressure-path) drain copy.
     stash_pool: Vec<Vec<u8>>,
     /// Set when the last write could not be posted (all transport send buffers
-    /// in flight / ring credits exhausted) and returned `Pending`. While set,
-    /// the coalescing scratch must be preserved so a re-poll re-presents the
-    /// exact bytes that still need posting.
+    /// in flight / ring credits exhausted) and returned `Pending`. Used to skip
+    /// the up-front peer-disconnect check while re-polling a blocked write (the
+    /// drain loop already checks it). The bytes still to post are re-presented by
+    /// the caller each poll (the `AsyncWrite` contract), so no scratch is kept.
     write_blocked: bool,
-    /// Reusable buffer for coalescing vectored writes into one send.
-    /// Grows to a high-water mark (capped at [`MAX_GATHER`]); reused across
-    /// calls to avoid per-write allocation.
-    write_scratch: Vec<u8>,
     /// Set when transport returns Err from poll_recv (QP entered ERROR state).
     /// Once set, poll_read always returns Ok(0) — the QP will never
     /// produce another recv completion.
@@ -146,7 +131,6 @@ impl<T: Transport> AsyncRdmaStream<T> {
             stash_offset: 0,
             stash_pool: Vec::new(),
             write_blocked: false,
-            write_scratch: Vec::new(),
             eof: false,
         }
     }
@@ -210,26 +194,33 @@ impl<T: Transport> AsyncRdmaStream<T> {
         }
     }
 
-    /// Core send state machine for a single contiguous slice.
+    /// Core send state machine for one write, coalescing a slice list into a
+    /// single transport send.
     ///
-    /// Posts `buf` as one transport send and returns as soon as it is *accepted*
-    /// (copied into a registered send buffer and posted), **without** waiting for
-    /// its completion. This lets consecutive writes keep up to the transport's
+    /// Posts `bufs` as one transport send (via [`Transport::send_gather`], which
+    /// gathers the slices straight into the registered send buffer) and returns
+    /// as soon as it is *accepted* (posted), **without** waiting for its
+    /// completion. This lets consecutive writes keep up to the transport's
     /// send-buffer count outstanding at once — the pipelining the echo benchmark
     /// relies on — instead of paying a full post→completion round trip per write.
     ///
-    /// Backpressure comes from the transport: `send_copy` returns `Ok(0)` once
+    /// Backpressure comes from the transport: `send_gather` returns `Ok(0)` once
     /// every send buffer is in flight (or ring credits are exhausted). When that
     /// happens this reaps a completion to free a buffer and retries; if none is
-    /// ready it registers the CQ waker(s) and returns `Pending` (leaving
-    /// `write_blocked` set so the coalescing scratch is preserved).
+    /// ready it registers the CQ waker(s) and returns `Pending`. The bytes still
+    /// to post are re-presented by the caller on the next poll (the `AsyncWrite`
+    /// contract), so nothing is buffered here.
     ///
-    /// Shared by [`poll_write`](AsyncWrite::poll_write) and the coalescing
+    /// Shared by [`poll_write`](AsyncWrite::poll_write) (a one-element list) and
     /// [`poll_write_vectored`](AsyncWrite::poll_write_vectored).
-    fn poll_write_slice(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write_bufs(
+        &mut self,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
         let this = self;
 
-        if buf.is_empty() {
+        if bufs.iter().all(|b| b.is_empty()) {
             return Poll::Ready(Ok(0));
         }
 
@@ -264,7 +255,7 @@ impl<T: Transport> AsyncRdmaStream<T> {
         // finite, so `poll_send_completion` eventually returns `Pending` with a
         // waker armed.
         loop {
-            match this.transport.send_copy(buf) {
+            match this.transport.send_gather(bufs) {
                 Ok(0) => {}
                 Ok(n) => {
                     this.write_blocked = false;
@@ -276,7 +267,7 @@ impl<T: Transport> AsyncRdmaStream<T> {
                 }
             }
 
-            // Blocked. Keep the scratch (vectored path) pinned until we post.
+            // Blocked. Keep re-presenting the same bytes until we post.
             this.write_blocked = true;
 
             // Drain recv completions and RELEASE each slot immediately: copy the
@@ -336,7 +327,7 @@ impl<T: Transport> AsyncRdmaStream<T> {
             // freed via the recv path is used immediately, rather than being lost
             // to `poll_send_completion` returning `Pending` (it would find nothing
             // left to reap, park on a notification that never comes, and stall).
-            match this.transport.send_copy(buf) {
+            match this.transport.send_gather(bufs) {
                 Ok(0) => {}
                 Ok(n) => {
                     this.write_blocked = false;
@@ -374,59 +365,15 @@ impl<T: Transport> AsyncRdmaStream<T> {
     /// Coalesce vectored slices into a single send.
     ///
     /// Shared by the `futures_io` and `tokio` [`AsyncWrite`] impls; see
-    /// [`AsyncWrite::poll_write_vectored`] for the rationale.
+    /// [`AsyncWrite::poll_write_vectored`] for the rationale. The slices are
+    /// gathered straight into the transport's registered send buffer by
+    /// [`Transport::send_gather`], so no intermediate scratch copy is made.
     fn poll_write_vectored_impl(
         &mut self,
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        // Locate non-empty slices to pick the cheapest path.
-        let mut first_nonempty = None;
-        let mut nonempty_count = 0usize;
-        for (i, b) in bufs.iter().enumerate() {
-            if !b.is_empty() {
-                nonempty_count += 1;
-                if first_nonempty.is_none() {
-                    first_nonempty = Some(i);
-                }
-            }
-        }
-
-        match (nonempty_count, first_nonempty) {
-            // Nothing to write.
-            (0, _) => return Poll::Ready(Ok(0)),
-            // Exactly one slice carries data — send it directly, no gather copy.
-            (1, Some(i)) => return self.poll_write_slice(cx, &bufs[i]),
-            _ => {}
-        }
-
-        // Coalesce the slices into the reusable scratch buffer. Only rebuild
-        // when the previous poll actually posted; while a post is blocked
-        // (`write_blocked`) the scratch must keep the exact bytes/length still
-        // pending so the state machine re-presents them on the next poll.
-        if !self.write_blocked {
-            self.write_scratch.clear();
-            for b in bufs {
-                if b.is_empty() {
-                    continue;
-                }
-                let remaining = MAX_GATHER - self.write_scratch.len();
-                if remaining == 0 {
-                    break;
-                }
-                let take = b.len().min(remaining);
-                self.write_scratch.extend_from_slice(&b[..take]);
-                if take < b.len() {
-                    break;
-                }
-            }
-        }
-
-        // Swap the scratch out so `poll_write_slice` can take `&mut self`.
-        let scratch = std::mem::take(&mut self.write_scratch);
-        let res = self.poll_write_slice(cx, &scratch);
-        self.write_scratch = scratch;
-        res
+        self.poll_write_bufs(cx, bufs)
     }
 
     /// Graceful close: drain all in-flight sends, then send DREQ.
@@ -661,7 +608,7 @@ impl<T: Transport> AsyncWrite for AsyncRdmaStream<T> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.get_mut().poll_write_slice(cx, buf)
+        self.get_mut().poll_write_bufs(cx, &[io::IoSlice::new(buf)])
     }
 
     /// Gather multiple slices into a single RDMA send.
@@ -673,9 +620,10 @@ impl<T: Transport> AsyncWrite for AsyncRdmaStream<T> {
     /// them into one contiguous buffer collapses a request into a single
     /// message with one completion.
     ///
-    /// Only the first [`MAX_GATHER`] bytes are coalesced; the returned count
-    /// (and `send_copy`'s own per-send cap) leaves any remainder for the next
-    /// call, which the caller re-presents.
+    /// The slices are gathered directly into the transport's registered send
+    /// buffer ([`Transport::send_gather`]); the returned count (bounded by the
+    /// transport's per-send capacity) leaves any remainder for the next call,
+    /// which the caller re-presents.
     fn poll_write_vectored(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -718,7 +666,7 @@ impl<T: Transport> tokio::io::AsyncWrite for AsyncRdmaStream<T> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.get_mut().poll_write_slice(cx, buf)
+        self.get_mut().poll_write_bufs(cx, &[io::IoSlice::new(buf)])
     }
 
     fn is_write_vectored(&self) -> bool {
