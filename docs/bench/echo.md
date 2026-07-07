@@ -139,51 +139,47 @@ changes (unsignaled/batched sends, doorbell/completion batching), not knobs.**
 Best deployable configs: **48 × 512** for peak throughput, or **32 × 512** for a
 better latency/throughput balance (p50 462 vs 651 µs).
 
-### Connection-count ceiling: a client fd limit, not a transport limit
+### Connection-count ceiling: no data-path deadlock
 
 Scaling *connection count* (fixed in-flight 16, 64 B) shows read-ring's data path
-has **no high-fan-out deadlock** — the only ceiling is a client OS resource limit:
+has **no high-fan-out deadlock** — the only ceiling is connection *setup*, never
+the data path. (The earlier `EMFILE` / `ulimit -n` fd wall is fixed: the bench
+playbooks now raise the soft `nofile` limit to the hard cap — `setup_rdma_hw.yml`
+`limits.d` drop-in + `bench_run.yml` `ulimit -n` at launch; see
+[h1.md § The fd wall](h1.md#the-fd-wall-fixed).)
+
+**read-ring** scales cleanly to ~384 connections, then fails to *establish* at
+~448 on a fresh NIC — MANA RDMA-CM setup flakiness at high fan-out, not a
+data-path wedge:
 
 | conns × in-flight | throughput | cores | p99 | errors | result |
 |---|---:|---:|---:|---:|---|
-| 64 × 16  | 2.43M | 4.3 | 900 µs | 0 | clean |
-| 128 × 16 | 2.70M | 7.3 | 1729 µs | 0 | clean |
-| **192 × 16** | 2.57M | 4.8 | 1973 µs | 0 | **clean (max clean)** |
-| 256 × 16 | 2.48M | 4.2 | 2229 µs | 1 | 1 transient error |
-| 320 × 16 | 2.77M | 9.9 | 3109 µs | 3 | 3 transient errors |
-| 384 × 16 | — | — | — | — | **fail: `Too many open files` (EMFILE)** |
+| 192 × 16 | 2.66M | 6.1 | 1785 µs | 0 | clean |
+| **384 × 16** | 2.56M | 5.3 | 2537 µs | 0 | **clean (max clean)** |
+| 448 × 16 | — | — | — | — | fail: CM setup (won't establish) |
 
-read-ring scales **cleanly to ~192 connections** (0 errors), degrades gracefully
-to ~320 (a few transient CM errors), then **hard-fails at 384 with
-`ibverbs: Too many open files (os error 24)`**. That is the client's
-`RLIMIT_NOFILE` (default `ulimit -n` = **1024**), not the transport: each
-read-ring connection consumes ~3 ibverbs fds (QP / CQ / event channel), so
-~384 × 3 exceeds 1024. **Raising `ulimit -n` lifts the ceiling** — this is a
-resource cap, not a deadlock. (Throughput is flat ~2.5M here only because
-in-flight 16 is far below the depth knee; connection count is not read-ring's
-throughput lever — depth is, per the sweep above.)
+(Throughput is flat ~2.6M here only because in-flight 16 is far below the depth
+knee; connection count is not read-ring's throughput lever — depth is, per the
+sweep above.)
 
-**TCP hits the same fd cap ~5× later**, because a kernel socket is ~1 fd per
-connection (vs read-ring's ~3):
+**TCP** has no connection wall in the tested range — kernel sockets scale to
+4096+ with 0 errors, bounded only by latency:
 
-| tcp conns × in-flight | throughput | cores | p99 | errors | result |
-|---|---:|---:|---:|---:|---|
-| 256 × 16 | 3.41M | 16.7 | 2173 µs | 0 | clean |
-| 512 × 16 | 3.19M | 15.9 | 5095 µs | 0 | clean |
-| 768 × 16 | 3.24M | 16.2 | 8239 µs | 0 | clean |
-| **960 × 16** | 3.23M | 16.3 | 10919 µs | 0 | **clean (max clean)** |
-| 1024 × 16 | — | — | — | — | **fail: `Too many open files` (EMFILE)** |
+| tcp conns × in-flight | throughput | cores | p50 | p99 | errors |
+|---|---:|---:|---:|---:|---:|
+| 1024 × 16 | 3.12M | 15.7 | 4847 µs | 12207 µs | 0 |
+| 2048 × 16 | 3.16M | 15.8 | 9615 µs | 27711 µs | 0 |
+| 4096 × 16 | 3.08M | 15.6 | 19599 µs | 63391 µs | 0 |
 
-TCP scales cleanly to **~960 connections** and fails at 1024 — the same
-`ulimit -n = 1024` limit (`960 × 1 ≈ 1024`). So the connection ceiling for **both**
-transports is the client's fd limit, not the byte transport; they differ only in
-fds-per-connection (read-ring ~3 → ~192 clean; TCP ~1 → ~960 clean). Bump
-`ulimit -n` to go higher with either.
+TCP throughput is flat ~3.1M across the range (in-flight 16 is below its
+connection-scaling regime); more connections only inflate latency (p50
+4.8 → 19.6 ms). So read-ring's connection ceiling is RDMA-CM setup (~384) and
+TCP's is practical latency, not a hard limit.
 
 This is the direct-transport control for the gRPC high-fan-out deadlock: the same
 read-ring transport that wedges under `rh2` at ~208 connections (64 B) runs
-`echo` cleanly to 192+ and only stops on an OS fd limit — **confirming the
-deadlock lives in the `AsyncRdmaStream` / HTTP-2 layer, not the transport**
+`echo` cleanly to ~384 and only ever stops on connection *setup* — **confirming
+the deadlock lives in the `AsyncRdmaStream` / HTTP-2 layer, not the transport**
 ([read-ring-concurrent-stream-deadlock.md](../bugs/read-ring-concurrent-stream-deadlock.md)).
 
 ### TCP scales the other way — with connections (cores)
