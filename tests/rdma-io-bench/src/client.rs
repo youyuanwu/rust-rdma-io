@@ -17,7 +17,7 @@ use tonic::transport::Endpoint;
 
 use rdma_io_bench::greeter::HelloRequest;
 use rdma_io_bench::greeter::greeter_client::GreeterClient;
-use rdma_io_bench::metrics::BenchMetrics;
+use rdma_io_bench::metrics::{BenchMetrics, spawn_resource_sampler};
 use rdma_io_bench::report::BenchResult;
 use rdma_io_bench::{echo, h3_common, tls_common};
 
@@ -475,10 +475,17 @@ async fn run_channel_clients(
     // See docs/bugs/read-ring-concurrent-stream-deadlock.md.
     let depth = args.in_flight.max(1);
 
+    // Client CPU + peak-RSS sampling window is [warmup_deadline, bench_deadline],
+    // so the reported CPU-per-op excludes connection setup and warmup (mirrors
+    // `--mode echo`). Both deadlines are computed up front and shared with the
+    // warmup/benchmark loops below.
+    let warmup_deadline = Instant::now() + Duration::from_secs(args.warmup);
+    let bench_deadline = warmup_deadline + Duration::from_secs(args.duration);
+    let sampler = spawn_resource_sampler(warmup_deadline, bench_deadline);
+
     // Warmup
     if args.warmup > 0 {
         eprintln!("Warming up for {}s...", args.warmup);
-        let warmup_deadline = Instant::now() + Duration::from_secs(args.warmup);
         let mut warmup_handles = Vec::new();
         for client in clients.clone() {
             for _ in 0..depth {
@@ -501,7 +508,6 @@ async fn run_channel_clients(
     // Benchmark. One histogram slot per concurrent request loop so the loops
     // never contend on the same lock.
     let metrics = BenchMetrics::new(args.connections * depth);
-    let bench_deadline = Instant::now() + Duration::from_secs(args.duration);
 
     eprintln!(
         "Benchmarking for {}s ({depth} concurrent RPC(s) per connection)...",
@@ -540,6 +546,7 @@ async fn run_channel_clients(
     }
 
     // Report
+    let (cpu_seconds, peak_rss_kb) = sampler.await.unwrap_or((0.0, 0));
     let hist = metrics.merged_histogram().await;
     let result = BenchResult::from_histogram(
         &hist,
@@ -551,7 +558,8 @@ async fn run_channel_clients(
         args.duration,
         args.payload,
         metrics.total_errors.load(Ordering::Relaxed),
-    );
+    )
+    .with_resource_usage(cpu_seconds, peak_rss_kb);
 
     match args.report.as_str() {
         "json" => result.print_json(),

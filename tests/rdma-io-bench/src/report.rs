@@ -17,7 +17,8 @@ pub struct BenchResult {
     pub latency_us: LatencyStats,
     pub errors: u64,
     /// Client-side user+system CPU seconds consumed during the measured window
-    /// (all threads). Only populated by `--mode echo`.
+    /// (all threads). Populated by `--mode echo` and the tonic `rh2` / `tcp`
+    /// paths; omitted (via `skip_serializing_if`) by the `rh3` path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_seconds: Option<f64>,
     /// CPU microseconds spent per request (`cpu_seconds / total_requests`).
