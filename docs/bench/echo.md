@@ -139,6 +139,53 @@ changes (unsignaled/batched sends, doorbell/completion batching), not knobs.**
 Best deployable configs: **48 × 512** for peak throughput, or **32 × 512** for a
 better latency/throughput balance (p50 462 vs 651 µs).
 
+### Connection-count ceiling: a client fd limit, not a transport limit
+
+Scaling *connection count* (fixed in-flight 16, 64 B) shows read-ring's data path
+has **no high-fan-out deadlock** — the only ceiling is a client OS resource limit:
+
+| conns × in-flight | throughput | cores | p99 | errors | result |
+|---|---:|---:|---:|---:|---|
+| 64 × 16  | 2.43M | 4.3 | 900 µs | 0 | clean |
+| 128 × 16 | 2.70M | 7.3 | 1729 µs | 0 | clean |
+| **192 × 16** | 2.57M | 4.8 | 1973 µs | 0 | **clean (max clean)** |
+| 256 × 16 | 2.48M | 4.2 | 2229 µs | 1 | 1 transient error |
+| 320 × 16 | 2.77M | 9.9 | 3109 µs | 3 | 3 transient errors |
+| 384 × 16 | — | — | — | — | **fail: `Too many open files` (EMFILE)** |
+
+read-ring scales **cleanly to ~192 connections** (0 errors), degrades gracefully
+to ~320 (a few transient CM errors), then **hard-fails at 384 with
+`ibverbs: Too many open files (os error 24)`**. That is the client's
+`RLIMIT_NOFILE` (default `ulimit -n` = **1024**), not the transport: each
+read-ring connection consumes ~3 ibverbs fds (QP / CQ / event channel), so
+~384 × 3 exceeds 1024. **Raising `ulimit -n` lifts the ceiling** — this is a
+resource cap, not a deadlock. (Throughput is flat ~2.5M here only because
+in-flight 16 is far below the depth knee; connection count is not read-ring's
+throughput lever — depth is, per the sweep above.)
+
+**TCP hits the same fd cap ~5× later**, because a kernel socket is ~1 fd per
+connection (vs read-ring's ~3):
+
+| tcp conns × in-flight | throughput | cores | p99 | errors | result |
+|---|---:|---:|---:|---:|---|
+| 256 × 16 | 3.41M | 16.7 | 2173 µs | 0 | clean |
+| 512 × 16 | 3.19M | 15.9 | 5095 µs | 0 | clean |
+| 768 × 16 | 3.24M | 16.2 | 8239 µs | 0 | clean |
+| **960 × 16** | 3.23M | 16.3 | 10919 µs | 0 | **clean (max clean)** |
+| 1024 × 16 | — | — | — | — | **fail: `Too many open files` (EMFILE)** |
+
+TCP scales cleanly to **~960 connections** and fails at 1024 — the same
+`ulimit -n = 1024` limit (`960 × 1 ≈ 1024`). So the connection ceiling for **both**
+transports is the client's fd limit, not the byte transport; they differ only in
+fds-per-connection (read-ring ~3 → ~192 clean; TCP ~1 → ~960 clean). Bump
+`ulimit -n` to go higher with either.
+
+This is the direct-transport control for the gRPC high-fan-out deadlock: the same
+read-ring transport that wedges under `rh2` at ~208 connections (64 B) runs
+`echo` cleanly to 192+ and only stops on an OS fd limit — **confirming the
+deadlock lives in the `AsyncRdmaStream` / HTTP-2 layer, not the transport**
+([read-ring-concurrent-stream-deadlock.md](../bugs/read-ring-concurrent-stream-deadlock.md)).
+
 ### TCP scales the other way — with connections (cores)
 
 TCP is **CPU-bound in the kernel stack**, so it scales with *connection count*
@@ -159,13 +206,14 @@ connection is a serial byte stream, so parallelism comes from *more connections*
 
 ### Which is faster?
 
-| | peak throughput | CPU/op | cores at peak |
-|---|---:|---:|---:|
-| **read-ring** (RDMA) | 6.75M | **1.05 µs** | **~7** |
-| tcp (kernel) | **8.42M** | 6.38 µs | ~54 |
+| | peak throughput | CPU/op | cores at peak | p50 | p99 |
+|---|---:|---:|---:|---:|---:|
+| **read-ring** (RDMA) | 6.75M | **1.05 µs** | **~7** | **462 µs** | **1942 µs** |
+| tcp (kernel) | **8.42M** | 6.38 µs | ~54 | 575 µs | 4079 µs |
 
 TCP wins **absolute** throughput (~+25%) — but only by burning **~7.5× the cores
-and ~6× the CPU per op**. read-ring delivers ~80% of TCP's peak while leaving
+and ~6× the CPU per op**, and at **~2× the tail latency** (p99 4079 µs vs
+1942 µs). read-ring delivers ~80% of TCP's peak while leaving
 ~57 cores free for the actual application. On a box dedicated to moving bytes,
 TCP's brute force wins the headline number; whenever the CPU is needed for real
 work, RDMA's efficiency wins decisively. The earlier notion of a shared "~6.7M
