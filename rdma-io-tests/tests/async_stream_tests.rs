@@ -393,9 +393,14 @@ async fn concurrent_write_no_deadlock_read_ring() {
 // pumps fix A's recv-drain, which should keep both sides unblocking each other
 // past the stash cap; this guard asserts that on whatever provider runs it.
 //
-// NOTE: newly un-ignored to be verified on rxe (CI). If rxe still wedges, that
-// would mean a genuine bounded-buffer deadlock (write > absorption both ways
-// before reading) that the heartbeat cannot fix — re-`#[ignore]` it in that case.
+// NOTE: rxe (CI) WEDGES here (verified 2026-07-07), so this stays `#[ignore]`d.
+// The heartbeat re-polls the write path and pumps fix A's recv-drain, but once
+// BOTH recv stashes are full (count=100 > cap 64) the drain stops reposting
+// doorbells and only an application read can make progress — and this shape reads
+// nothing until both writers finish. That is a genuine bounded-buffer deadlock
+// (write > absorption both ways before reading) that no transport-layer fix can
+// close. It completes on MANA loopback (ring absorbs enough) but deadlocks on
+// rxe, hence provider-timing dependent and ignored by default.
 // See docs/bugs/read-ring-concurrent-stream-deadlock.md.
 // ===========================================================================
 
@@ -470,6 +475,16 @@ async fn concurrent_write_stash_overflow_no_deadlock<B: TransportBuilder>(builde
     .expect("reads timed out draining the buffered streams");
 }
 
+// rxe (CI) wedges here: with count=100 > stash cap (64), BOTH peers overflow
+// their recv stashes before either reads, so the write-blocked drain stops
+// reposting doorbells and neither writer can complete. This is a genuine
+// application-level bounded-buffer deadlock (write > absorption both ways before
+// reading) that the doorbell heartbeat cannot fix — only an application read can
+// drain a full stash, and this shape reads nothing until both writers finish. It
+// completes on MANA loopback (ring absorbs enough) but deadlocks on rxe, so it is
+// provider-timing dependent and ignored by default. See
+// docs/bugs/read-ring-concurrent-stream-deadlock.md.
+#[ignore = "provider-timing dependent bounded-buffer deadlock: wedges on rxe (CI), passes on MANA loopback"]
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn concurrent_write_stash_overflow_no_deadlock_read_ring() {
     require_no_iwarp!();
