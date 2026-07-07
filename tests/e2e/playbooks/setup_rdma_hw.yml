@@ -33,6 +33,26 @@
         update_cache: true
         cache_valid_time: 3600
 
+    - name: Raise open-file (nofile) limits for high connection-count benchmarks
+      # Each RDMA connection consumes ~3 fds (CM id + QP + event channel), so the
+      # distro default soft nofile=1024 caps the bench client/server near
+      # ~320 (rings) / ~960 (TCP) connections — a client-side fd wall, not a
+      # transport limit. The hard limit is already high (1048576 on these VMs);
+      # lift the soft limit to match so high-conn sweeps aren't fd-bound. The
+      # bench playbook also raises the soft limit at launch (belt-and-suspenders,
+      # in case pam_limits isn't applied to the non-interactive Ansible session).
+      ansible.builtin.copy:
+        dest: /etc/security/limits.d/99-rdma-bench.conf
+        content: |
+          # Managed by tests/e2e/playbooks/setup_rdma_hw.yml (rdma-io-bench).
+          *     soft    nofile    1048576
+          *     hard    nofile    1048576
+          root  soft    nofile    1048576
+          root  hard    nofile    1048576
+        owner: root
+        group: root
+        mode: '0644'
+
     - name: Verify RDMA devices are visible
       ansible.builtin.command:
         cmd: ibv_devices

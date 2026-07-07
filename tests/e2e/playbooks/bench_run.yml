@@ -19,6 +19,9 @@
 
     - name: Start server
       ansible.builtin.shell: |
+        # Raise the fd soft limit to the hard cap so high connection-count runs
+        # are not capped by the default nofile=1024 (each RDMA conn uses ~3 fds).
+        ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
         RUST_LOG="{{ bench_rust_log | default('info') }}" \
         RUST_BACKTRACE=1 \
         nohup ~/bin/rdma-bench-server \
@@ -43,6 +46,9 @@
   tasks:
     - name: Run benchmark
       ansible.builtin.shell: |
+        # Raise the fd soft limit to the hard cap so high connection-count runs
+        # are not capped by the default nofile=1024 (each RDMA conn uses ~3 fds).
+        ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
         RUST_LOG="{{ bench_rust_log | default('info') }}" \
         RUST_BACKTRACE=1 \
         ~/bin/rdma-bench-client \
