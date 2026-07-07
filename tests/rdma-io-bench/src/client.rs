@@ -61,16 +61,20 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     in_flight: usize,
 
-    /// Ring transport `max_message_size` in bytes (echo mode only): the largest
-    /// payload carried in a single RDMA message; larger echo payloads are
-    /// truncated to this. This no longer bounds the in-flight budget — that is
-    /// auto-derived from --in-flight (see --ring-queue-depth). Must match the
-    /// server.
+    /// Ring transport `max_message_size` in bytes (ring transports; `echo` and
+    /// `rh2`): the largest payload carried in a single RDMA message. In `echo`
+    /// mode a larger payload is truncated to this; in `rh2` (gRPC byte stream) a
+    /// larger write is fragmented into `ceil(len / max_message_size)` messages,
+    /// so raising it avoids fragmenting large gRPC payloads (e.g. set 8192 for an
+    /// 8 KiB payload to send one message instead of ~6). This no longer bounds
+    /// the in-flight budget — that is auto-derived from --in-flight (see
+    /// --ring-queue-depth). Must match the server.
     #[arg(long, default_value_t = 1500)]
     ring_max_msg: usize,
 
-    /// Advanced override for the ring transport's in-flight budget (echo mode
-    /// only): sizes the send/doorbell/CQ queues for this many outstanding
+    /// Advanced override for the ring transport's in-flight budget (ring
+    /// transports; `echo` and `rh2`): sizes the send/doorbell/CQ queues for this
+    /// many outstanding
     /// messages. 0 (default) auto-derives the budget from --in-flight with
     /// headroom, so the ring always has at least as many slots as the client
     /// keeps in flight — this prevents the silent RNR over-subscription
@@ -287,22 +291,18 @@ async fn run_tls_bench(
             .await
         }
         "read-ring" => {
-            run_tls_bench_with(
-                args,
-                uri,
-                payload,
-                ReadRingConfig::datagram().with_memory_window_mode(mw_mode(args.require_mw)),
-            )
-            .await
+            let mut config =
+                ReadRingConfig::datagram().with_memory_window_mode(mw_mode(args.require_mw));
+            config.max_message_size = args.ring_max_msg;
+            config.max_in_flight = ring_max_in_flight(args.ring_queue_depth, args.in_flight);
+            run_tls_bench_with(args, uri, payload, config).await
         }
         "credit-ring" => {
-            run_tls_bench_with(
-                args,
-                uri,
-                payload,
-                CreditRingConfig::datagram().with_memory_window_mode(mw_mode(args.require_mw)),
-            )
-            .await
+            let mut config =
+                CreditRingConfig::datagram().with_memory_window_mode(mw_mode(args.require_mw));
+            config.max_message_size = args.ring_max_msg;
+            config.max_in_flight = ring_max_in_flight(args.ring_queue_depth, args.in_flight);
+            run_tls_bench_with(args, uri, payload, config).await
         }
         other => {
             eprintln!("Unknown transport: {other}. Supported: send-recv, read-ring, credit-ring");
