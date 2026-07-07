@@ -1,23 +1,15 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use clap::Parser;
-use rdma_io::async_cm::AsyncCmListener;
 use rdma_io::credit_ring_transport::CreditRingConfig;
 use rdma_io::read_ring_transport::ReadRingConfig;
 use rdma_io::send_recv_transport::SendRecvConfig;
-use rdma_io::transport::TransportBuilder;
 use rdma_io::transport_common::MemoryWindowMode;
 use rdma_io::wr::QpType;
-use rdma_io_quinn::RdmaUdpSocket;
-use rdma_io_tonic::RdmaIncoming;
-use tonic::transport::Server;
-use tonic::{Request, Response, Status};
 
-use rdma_io_bench::greeter::greeter_server::{Greeter, GreeterServer};
-use rdma_io_bench::greeter::{HelloReply, HelloRequest};
-use rdma_io_bench::{echo, h3_common, tls_common};
+use rdma_io_bench::common::ServerOpts;
+use rdma_io_bench::{echo, grpc, h1};
 
 #[derive(Parser)]
 #[command(name = "rdma-bench-server", about = "RDMA gRPC benchmark server")]
@@ -76,7 +68,17 @@ struct Args {
     key: PathBuf,
 }
 
-struct BenchGreeter;
+impl Args {
+    /// Build the shared server run parameters passed to the per-protocol
+    /// runners (`grpc`, `h1`).
+    fn server_opts(&self) -> ServerOpts {
+        ServerOpts {
+            bind: self.bind,
+            cert: self.cert.clone(),
+            key: self.key.clone(),
+        }
+    }
+}
 
 /// Resolve when the process receives SIGTERM (default `kill`) or SIGINT
 /// (Ctrl-C). Used to drive graceful server shutdown so RDMA queue pairs are
@@ -94,17 +96,44 @@ async fn shutdown_signal() {
     eprintln!("shutdown signal received; draining connections");
 }
 
-#[tonic::async_trait]
-impl Greeter for BenchGreeter {
-    async fn say_hello(
-        &self,
-        request: Request<HelloRequest>,
-    ) -> Result<Response<HelloReply>, Status> {
-        let name = request.into_inner().name;
-        Ok(Response::new(HelloReply {
-            message: format!("Hello {name}"),
-        }))
+/// Map the `--require-mw` flag to a [`MemoryWindowMode`]. Default is `Auto`
+/// (detect + fall back to the MR rkey); `--require-mw` forces Memory Windows.
+fn mw_mode(require_mw: bool) -> MemoryWindowMode {
+    if require_mw {
+        MemoryWindowMode::Require
+    } else {
+        MemoryWindowMode::Auto
     }
+}
+
+/// Resolve the ring transport's `max_in_flight` (send/doorbell/CQ depth). An
+/// explicit `--ring-queue-depth` (>0) wins; otherwise size the ring from
+/// `--in-flight` with headroom so the ring always has at least as many
+/// outstanding-message slots as the peer pipelines, preventing the RNR
+/// over-subscription collapse. The transport clamps to device queue limits.
+/// Must derive identically to the client (same `--in-flight`).
+fn ring_max_in_flight(ring_queue_depth: usize, in_flight: usize) -> Option<usize> {
+    if ring_queue_depth > 0 {
+        Some(ring_queue_depth)
+    } else {
+        Some((in_flight.max(1) * 2).max(16))
+    }
+}
+
+/// Read-ring stream config for the gRPC/HTTP server modes.
+fn ring_config_read(args: &Args) -> ReadRingConfig {
+    let mut config = ReadRingConfig::datagram().with_memory_window_mode(mw_mode(args.require_mw));
+    config.max_message_size = args.ring_max_msg;
+    config.max_in_flight = ring_max_in_flight(args.ring_queue_depth, args.in_flight);
+    config
+}
+
+/// Credit-ring stream config for the gRPC/HTTP server modes.
+fn ring_config_credit(args: &Args) -> CreditRingConfig {
+    let mut config = CreditRingConfig::datagram().with_memory_window_mode(mw_mode(args.require_mw));
+    config.max_message_size = args.ring_max_msg;
+    config.max_in_flight = ring_max_in_flight(args.ring_queue_depth, args.in_flight);
+    config
 }
 
 #[tokio::main]
@@ -116,14 +145,138 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
+    let opts = args.server_opts();
 
     match args.mode.as_str() {
-        "rh2" => run_tls_server(args).await,
-        "rh3" => run_h3_server(args).await,
-        "tcp" => run_tcp_server(args).await,
+        "rh2" => dispatch_rh2_server(&args, &opts).await,
+        "rh3" => dispatch_rh3_server(&args, &opts).await,
+        "tcp" => grpc::run_tcp_server(&opts, shutdown_signal()).await,
+        "rh1" => dispatch_rh1_server(&args, &opts).await,
+        "tcp1" => h1::run_tcp1_server(&opts, shutdown_signal()).await,
         "echo" => run_echo_server(args).await,
         other => {
-            eprintln!("Unknown mode: {other}. Supported: rh2, rh3, tcp, echo");
+            eprintln!("Unknown mode: {other}. Supported: rh2, rh3, tcp, rh1, tcp1, echo");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Build the selected RDMA transport for `rh2` and serve gRPC.
+async fn dispatch_rh2_server(
+    args: &Args,
+    opts: &ServerOpts,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match args.transport.as_str() {
+        "send-recv" => {
+            grpc::run_rh2_server(
+                SendRecvConfig::stream_with_depth(args.in_flight),
+                opts,
+                &args.transport,
+                shutdown_signal(),
+            )
+            .await
+        }
+        "read-ring" => {
+            grpc::run_rh2_server(
+                ring_config_read(args),
+                opts,
+                &args.transport,
+                shutdown_signal(),
+            )
+            .await
+        }
+        "credit-ring" => {
+            grpc::run_rh2_server(
+                ring_config_credit(args),
+                opts,
+                &args.transport,
+                shutdown_signal(),
+            )
+            .await
+        }
+        other => {
+            eprintln!("Unknown transport: {other}. Supported: send-recv, read-ring, credit-ring");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Build the selected RDMA transport for `rh1` and serve HTTP/1.1.
+async fn dispatch_rh1_server(
+    args: &Args,
+    opts: &ServerOpts,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match args.transport.as_str() {
+        "send-recv" => {
+            let depth = args.in_flight.max(1);
+            h1::run_h1_server(
+                SendRecvConfig::stream_with_depth(depth),
+                opts,
+                &args.transport,
+                shutdown_signal(),
+            )
+            .await
+        }
+        "read-ring" => {
+            h1::run_h1_server(
+                ring_config_read(args),
+                opts,
+                &args.transport,
+                shutdown_signal(),
+            )
+            .await
+        }
+        "credit-ring" => {
+            h1::run_h1_server(
+                ring_config_credit(args),
+                opts,
+                &args.transport,
+                shutdown_signal(),
+            )
+            .await
+        }
+        other => {
+            eprintln!("Unknown transport: {other}. Supported: send-recv, read-ring, credit-ring");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Build the selected RDMA transport for `rh3` and serve HTTP/3.
+async fn dispatch_rh3_server(
+    args: &Args,
+    opts: &ServerOpts,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match args.transport.as_str() {
+        "send-recv" => {
+            grpc::run_h3_server(
+                SendRecvConfig::datagram(),
+                opts,
+                &args.transport,
+                shutdown_signal(),
+            )
+            .await
+        }
+        "read-ring" => {
+            grpc::run_h3_server(
+                ReadRingConfig::datagram().with_memory_window_mode(mw_mode(args.require_mw)),
+                opts,
+                &args.transport,
+                shutdown_signal(),
+            )
+            .await
+        }
+        "credit-ring" => {
+            grpc::run_h3_server(
+                CreditRingConfig::datagram().with_memory_window_mode(mw_mode(args.require_mw)),
+                opts,
+                &args.transport,
+                shutdown_signal(),
+            )
+            .await
+        }
+        other => {
+            eprintln!("Unknown transport: {other}. Supported: send-recv, read-ring, credit-ring");
             std::process::exit(1);
         }
     }
@@ -145,17 +298,11 @@ async fn run_echo_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             echo::run_transport_echo_server(config, args.bind, "send-recv", shutdown_signal()).await
         }
         "read-ring" => {
-            let mut config =
-                ReadRingConfig::datagram().with_memory_window_mode(mw_mode(args.require_mw));
-            config.max_message_size = args.ring_max_msg;
-            config.max_in_flight = ring_max_in_flight(args.ring_queue_depth, args.in_flight);
+            let config = ring_config_read(&args);
             echo::run_transport_echo_server(config, args.bind, "read-ring", shutdown_signal()).await
         }
         "credit-ring" => {
-            let mut config =
-                CreditRingConfig::datagram().with_memory_window_mode(mw_mode(args.require_mw));
-            config.max_message_size = args.ring_max_msg;
-            config.max_in_flight = ring_max_in_flight(args.ring_queue_depth, args.in_flight);
+            let config = ring_config_credit(&args);
             echo::run_transport_echo_server(config, args.bind, "credit-ring", shutdown_signal())
                 .await
         }
@@ -166,166 +313,4 @@ async fn run_echo_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     }
-}
-
-/// TCP baseline: tonic-tls + OpenSSL over a standard TCP socket (no RDMA).
-///
-/// Same TLS/gRPC stack as `tls` mode, served over a kernel TCP listener so the
-/// only variable is the underlying byte transport.
-async fn run_tcp_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    let acceptor = tls_common::build_acceptor(&args.cert, &args.key);
-
-    let tcp_incoming = tonic::transport::server::TcpIncoming::bind(args.bind)?;
-    let tls_incoming = tonic_tls::openssl::TlsIncoming::new(tcp_incoming, acceptor);
-
-    eprintln!("Benchmark server listening on {} (mode=tcp)", args.bind);
-
-    Server::builder()
-        .add_service(GreeterServer::new(BenchGreeter))
-        .serve_with_incoming_shutdown(tls_incoming, shutdown_signal())
-        .await?;
-
-    Ok(())
-}
-
-/// Map the `--require-mw` flag to a [`MemoryWindowMode`]. Default is `Auto`
-/// (detect + fall back to the MR rkey); `--require-mw` forces Memory Windows.
-fn mw_mode(require_mw: bool) -> MemoryWindowMode {
-    if require_mw {
-        MemoryWindowMode::Require
-    } else {
-        MemoryWindowMode::Auto
-    }
-}
-
-/// Resolve the ring transport's `max_in_flight` (send/doorbell/CQ depth) for
-/// echo mode. An explicit `--ring-queue-depth` (>0) wins; otherwise size the
-/// ring from `--in-flight` with headroom so the ring always has at least as
-/// many outstanding-message slots as the peer pipelines, preventing the RNR
-/// over-subscription collapse. The transport clamps to device queue limits.
-/// Must derive identically to the client (same `--in-flight`).
-fn ring_max_in_flight(ring_queue_depth: usize, in_flight: usize) -> Option<usize> {
-    if ring_queue_depth > 0 {
-        Some(ring_queue_depth)
-    } else {
-        Some((in_flight.max(1) * 2).max(16))
-    }
-}
-
-async fn run_tls_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    let require_mw = args.require_mw;
-    match args.transport.as_str() {
-        "send-recv" => {
-            let depth = args.in_flight;
-            run_tls_server_with(args, SendRecvConfig::stream_with_depth(depth)).await
-        }
-        "read-ring" => {
-            let mut config =
-                ReadRingConfig::datagram().with_memory_window_mode(mw_mode(require_mw));
-            config.max_message_size = args.ring_max_msg;
-            config.max_in_flight = ring_max_in_flight(args.ring_queue_depth, args.in_flight);
-            run_tls_server_with(args, config).await
-        }
-        "credit-ring" => {
-            let mut config =
-                CreditRingConfig::datagram().with_memory_window_mode(mw_mode(require_mw));
-            config.max_message_size = args.ring_max_msg;
-            config.max_in_flight = ring_max_in_flight(args.ring_queue_depth, args.in_flight);
-            run_tls_server_with(args, config).await
-        }
-        other => {
-            eprintln!("Unknown transport: {other}. Supported: send-recv, read-ring, credit-ring");
-            std::process::exit(1);
-        }
-    }
-}
-
-async fn run_tls_server_with<B>(args: Args, builder: B) -> Result<(), Box<dyn std::error::Error>>
-where
-    B: TransportBuilder,
-{
-    let acceptor = tls_common::build_acceptor(&args.cert, &args.key);
-
-    let listener = AsyncCmListener::bind(&args.bind)?;
-    let local_addr = listener.local_addr();
-    let incoming = RdmaIncoming::new(listener, builder);
-    let tls_incoming = tonic_tls::openssl::TlsIncoming::new(incoming, acceptor);
-
-    eprintln!(
-        "Benchmark server listening on {:?} (mode=rh2, transport={})",
-        local_addr, args.transport
-    );
-
-    Server::builder()
-        .add_service(GreeterServer::new(BenchGreeter))
-        .serve_with_incoming_shutdown(tls_incoming, shutdown_signal())
-        .await?;
-
-    Ok(())
-}
-
-async fn run_h3_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    let require_mw = args.require_mw;
-    match args.transport.as_str() {
-        "send-recv" => run_h3_server_with(args, SendRecvConfig::datagram()).await,
-        "read-ring" => {
-            run_h3_server_with(
-                args,
-                ReadRingConfig::datagram().with_memory_window_mode(mw_mode(require_mw)),
-            )
-            .await
-        }
-        "credit-ring" => {
-            run_h3_server_with(
-                args,
-                CreditRingConfig::datagram().with_memory_window_mode(mw_mode(require_mw)),
-            )
-            .await
-        }
-        other => {
-            eprintln!("Unknown transport: {other}. Supported: send-recv, read-ring, credit-ring");
-            std::process::exit(1);
-        }
-    }
-}
-
-async fn run_h3_server_with<B>(args: Args, builder: B) -> Result<(), Box<dyn std::error::Error>>
-where
-    B: TransportBuilder,
-{
-    let (certs, key) = h3_common::load_certs_from_pem(&args.cert, &args.key);
-    let server_config = h3_common::make_server_config(&certs, key);
-    let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
-
-    let socket = Arc::new(RdmaUdpSocket::bind(&args.bind, builder).expect("bind RDMA UDP socket"));
-    let bound_addr = socket.bound_addr();
-
-    let endpoint = quinn::Endpoint::new_with_abstract_socket(
-        quinn::EndpointConfig::default(),
-        Some(server_config),
-        socket,
-        runtime,
-    )?;
-
-    eprintln!(
-        "Benchmark server listening on {} (mode=rh3, transport={})",
-        bound_addr, args.transport
-    );
-
-    let acceptor = tonic_h3::quinn::H3QuinnAcceptor::new(endpoint.clone());
-    let routes = tonic::service::Routes::builder()
-        .add_service(GreeterServer::new(BenchGreeter))
-        .clone()
-        .routes();
-    tonic_h3::server::H3Router::new(routes)
-        .serve_with_shutdown(acceptor, shutdown_signal())
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error> { e })?;
-
-    // Close the QUIC endpoint and wait for connections to drain so the RDMA
-    // queue pairs are released cleanly before the process exits.
-    endpoint.close(0u16.into(), b"shutdown");
-    endpoint.wait_idle().await;
-
-    Ok(())
 }

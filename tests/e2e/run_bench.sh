@@ -40,7 +40,7 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Single run:"
-            echo "  --mode <rh2|rh3|tcp>      Protocol mode [default: rh2]"
+            echo "  --mode <rh2|rh3|tcp|rh1|tcp1|echo>  Protocol mode [default: rh2]"
             echo "  --transport <send-recv|read-ring|credit-ring>  RDMA transport [default: send-recv]"
             echo "  --connections <N>          Concurrent connections [default: 1]"
             echo "  --threads <N>             Worker threads [default: 1]"
