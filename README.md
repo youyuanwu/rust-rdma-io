@@ -183,6 +183,8 @@ Design documents and background research are in [`docs/`](docs/):
 | [BndBindings.md](docs/design/BndBindings.md) | FFI binding generation with bnd |
 | [siw-vs-rxe.md](docs/background/siw-vs-rxe.md) | Software provider comparison |
 | [msquic-rdma.md](docs/background/msquic-rdma.md) | msquic RDMA transport architecture analysis |
+| [bench/grpc.md](docs/bench/grpc.md) | gRPC-over-RDMA (`rh2`) vs TCP measured benchmark results |
+| [bench/echo.md](docs/bench/echo.md) | Direct-transport (`--mode echo`) measured benchmark results |
 
 ## CI
 
