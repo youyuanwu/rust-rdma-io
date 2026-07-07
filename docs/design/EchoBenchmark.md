@@ -451,4 +451,28 @@ scale *connection/thread count* toward the core budget. Keep depth/conns modest
 when latency matters.** Pushing read-ring past its ~6.75M ceiling needs transport
 changes (unsignaled/batched sends, doorbell batching), not a config knob.
 
+### Re-validation (2026-07-07)
+
+Re-measured on the current binary (64 B, `duration=10 warmup=3`), both ceilings
+hold:
+
+| transport | peak throughput | CPU/op | ~cores | p99 | best config |
+|---|---:|---:|---:|---:|---|
+| tcp (kernel) | **~8.84M** | 6.23 µs | ~55 | 5903 µs | 384 × 64 |
+| read-ring (RDMA) | ~6.4M | **~1.0 µs** | ~6.4 | **2869 µs** | 24 × 768 |
+
+The TCP connection sweep pushed slightly past the earlier 256 × 64 point:
+64 × 64 → 6.68M, 128 × 64 → 7.90M, 256 × 64 → 8.39M, **384 × 64 → 8.84M**,
+512 × 64 → 8.58M (regresses; ~55-core CPU wall). read-ring stayed run-to-run
+noisy (5.0–6.4M) at ~1 µs/op and ~6–7 cores, reconfirming the architectural
+~6.8M / ~7-core cap. The qualitative picture is unchanged: **TCP wins the
+absolute number (~8.8M) by burning ~55 cores; read-ring delivers ~72 % of that at
+~1/8 the cores — ~6× more CPU-efficient per op** — and at *half* the tail (p99
+2.9 ms vs TCP 5.9 ms), since read-ring hits its peak at far lower concurrency.
+
+(Note: this raw-transport efficiency gap is *erased* once the same transports run
+under gRPC — the TLS/HTTP-2/protobuf stack collapses both to ~0.7–0.83M req/s at
+~55 cores, so the gRPC-layer throughput is bounded by the stack, not the byte
+transport.)
+
 
