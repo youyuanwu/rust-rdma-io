@@ -40,8 +40,7 @@ Terraform configuration for provisioning QEMU/KVM virtual machines for RDMA test
 
 ```bash
 # Build rxe kernel module (if not shipped with VM kernel)
-cmake -B build -DBUILD_RXE=ON
-cmake --build build --target rxe
+just build-rxe
 
 # Start VMs
 ./tests/infra-local/scripts/start-vm.sh -y

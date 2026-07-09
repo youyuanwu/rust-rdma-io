@@ -232,5 +232,5 @@ Or ensure your user is in the `libvirt` group and the inventory script handles t
 
 Ubuntu cloud images ship minimal kernels. `setup_rdma.yml` installs
 `linux-modules-extra` automatically. If that doesn't include `rdma_rxe`,
-build it on the host (`cmake --build build --target rxe`) and the playbook
+build it on the host (`just build-rxe`) and the playbook
 will copy and `insmod` it.

@@ -134,7 +134,7 @@ For development and testing without RDMA hardware, use one of the software provi
 | Provider | Type | Script | Notes |
 |---|---|---|---|
 | **siw** (Soft-iWARP) | iWARP | `sudo ./scripts/setup-siw.sh` | Recommended for testing; works on any Linux |
-| **rxe** (Soft-RoCE) | InfiniBand/RoCE | `sudo ./scripts/setup-rxe.sh` | Supports atomics and Write+Imm; can build from source via CMake |
+| **rxe** (Soft-RoCE) | InfiniBand/RoCE | `sudo ./scripts/setup-rxe.sh` | Supports atomics and Write+Imm; can build from source via `just build-rxe` |
 
 Both scripts check for kernel modules, load them, create a device, and verify with `ibv_devices`.
 
@@ -148,8 +148,7 @@ cargo build --no-default-features --features async  # futures-only async, no tok
 To build the rxe kernel module from source (optional):
 
 ```sh
-cmake -B build -DBUILD_RXE=ON
-cmake --build build --target rxe
+just build-rxe
 ```
 
 ## Test

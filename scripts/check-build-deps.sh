@@ -89,22 +89,42 @@ echo "=== Optional (binding regeneration / full workspace build) ==="
 # crate. It is NOT needed to build the rdma-io library crates, but a
 # workspace-wide `cargo build`/`cargo check` compiles bnd-rdma-gen too and
 # will fail without it. The generated bindings are checked in, so this only
-# warns. Note: clang-sys needs the libclang.so symlink + llvm-config from the
-# -dev package, not just the versioned runtime library.
+# warns. Note: clang-sys loads the libclang.so / libclang-*.so file directly —
+# it does NOT consult llvm-config — so a versioned runtime library alone
+# (e.g. libclang-18.so.1) is not enough; the -dev package's symlink is required.
+libclang_so=""
+libclang_dirs=()
+[[ -n "${LIBCLANG_PATH:-}" ]] && libclang_dirs+=("$LIBCLANG_PATH")
 if command -v llvm-config >/dev/null 2>&1; then
-    ok "libclang ($(llvm-config --version), $(command -v llvm-config))"
-elif command -v pkg-config >/dev/null 2>&1 && pkg-config --exists "clang" 2>/dev/null; then
-    ok "libclang ($(pkg-config --modversion clang))"
-else
-    # clang-sys resolves the libclang.so symlink shipped by libclang-dev,
-    # typically under /usr/lib/llvm-*/lib or the multiarch lib dir.
-    libclang_so=$(ls /usr/lib/llvm-*/lib/libclang.so /usr/lib/*/libclang.so 2>/dev/null | head -1)
-    if [[ -n "$libclang_so" ]]; then
-        ok "libclang ($libclang_so)"
-    else
-        warn "libclang not found — needed for 'just gen-bindings' and"
-        warn "  workspace-wide builds of bnd-rdma-gen (install libclang-dev)"
+    libclang_dirs+=("$(llvm-config --libdir 2>/dev/null)")
+fi
+libclang_dirs+=(/usr/lib/llvm-*/lib /usr/lib/*/. /usr/lib /usr/lib64 /usr/local/lib)
+for d in "${libclang_dirs[@]}"; do
+    [[ -d "$d" ]] || continue
+    # Match only the filenames clang-sys accepts (libclang.so, libclang-*.so);
+    # a versioned-only libclang.so.N does NOT satisfy clang-sys.
+    found=$(ls "$d"/libclang.so "$d"/libclang-*.so 2>/dev/null | head -1)
+    if [[ -n "$found" ]]; then
+        libclang_so="$found"
+        break
     fi
+done
+if [[ -n "$libclang_so" ]]; then
+    ok "libclang ($libclang_so)"
+else
+    warn "libclang.so not found — needed for 'just gen-bindings' and"
+    warn "  workspace-wide builds of bnd-rdma-gen (install libclang-dev)"
+fi
+
+# Kernel headers are needed only to build the rdma_rxe module from source
+# ('just build-rxe'). They must match the running kernel exactly, so report the
+# specific linux-headers-<uname -r> package when the build symlink is missing.
+kver=$(uname -r)
+if [[ -d "/lib/modules/${kver}/build" ]]; then
+    ok "kernel headers (/lib/modules/${kver}/build)"
+else
+    warn "kernel headers not found at /lib/modules/${kver}/build — needed for"
+    warn "  'just build-rxe' (install linux-headers-${kver})"
 fi
 
 echo

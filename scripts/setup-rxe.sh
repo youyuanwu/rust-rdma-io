@@ -2,7 +2,7 @@
 # Setup and verify Soft-RoCE (rxe) kernel module for RDMA testing.
 #
 # If rdma_rxe.ko is not shipped with the running kernel, the script
-# looks for an out-of-tree build produced by cmake (BuildRxe.cmake).
+# looks for an out-of-tree build produced by 'just build-rxe'.
 #
 # Usage: sudo ./scripts/setup-rxe.sh
 #        ./scripts/setup-rxe.sh --check   # check-only, no changes
@@ -29,13 +29,13 @@ KVER=$(uname -r)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# Look for rdma_rxe in the standard module tree first, then in the cmake
-# out-of-tree build directory.
+# Look for rdma_rxe in the standard module tree first, then in the
+# out-of-tree build directory produced by 'just build-rxe'.
 RXE_KO=$(find "/lib/modules/$KVER" -name 'rdma_rxe.ko*' 2>/dev/null | head -1)
 RXE_OOT=""
 
 if [[ -z "$RXE_KO" ]]; then
-    # Search cmake build dirs for an out-of-tree build
+    # Search the build dir for an out-of-tree build
     RXE_OOT=$(find "$PROJECT_DIR/build" -name 'rdma_rxe.ko' 2>/dev/null | head -1)
 fi
 
@@ -45,7 +45,7 @@ elif [[ -n "$RXE_OOT" ]]; then
     ok "rdma_rxe module available (out-of-tree build: $RXE_OOT)"
 else
     fail "rdma_rxe module not found for kernel $KVER"
-    warn "Build out-of-tree with: cmake -B build -DBUILD_RXE=ON && cmake --build build --target rxe"
+    warn "Build out-of-tree with: just build-rxe"
     ((errors++))
 fi
 

@@ -32,7 +32,6 @@ jobs:
             rdma-core \
             ibverbs-utils \
             iproute2 \
-            cmake \
             libclang-dev
 
       - uses: taiki-e/install-action@protoc
@@ -51,9 +50,6 @@ jobs:
           components: clippy, rustfmt
 
       # - uses: Swatinem/rust-cache@v2
-
-      - name: Configure (download bnd-linux.winmd)
-        run: cmake -B build
 
       - name: Format check
         run: cargo fmt --all -- --check
@@ -94,17 +90,15 @@ jobs:
             rdma-core \
             ibverbs-utils \
             iproute2 \
-            cmake \
             libclang-dev \
             linux-headers-$(uname -r) \
             linux-modules-extra-$(uname -r)
 
       - uses: taiki-e/install-action@protoc
+      - uses: taiki-e/install-action@just
 
-      - name: Configure and build rdma_rxe.ko
-        run: |
-          cmake -B build -DBUILD_RXE=ON
-          cmake --build build --target rxe --parallel
+      - name: Build rdma_rxe.ko
+        run: just build-rxe
 
       - name: Load rdma_rxe and create device
         run: |
@@ -142,7 +136,6 @@ jobs:
             libibverbs-dev \
             librdmacm-dev \
             rdma-core \
-            cmake \
             libclang-dev
 
       - uses: taiki-e/install-action@protoc
@@ -151,9 +144,6 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "${{ env.RUST_VERSION }}"
-
-      - name: Configure
-        run: cmake -B build
 
       - name: Build bench release
         run: cargo build -p rdma-io-bench --release
