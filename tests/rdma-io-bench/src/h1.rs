@@ -91,6 +91,10 @@ pub async fn run_tcp1_client(opts: &ClientOpts) -> Result<(), Box<dyn std::error
             let connector = connector.clone();
             async move {
                 let tcp = tokio::net::TcpStream::connect(addr).await?;
+                // Disable Nagle: this is a small-message request/response
+                // workload, so coalescing delays would inflate latency (and
+                // RDMA has no Nagle equivalent) — keep the baseline fair.
+                tcp.set_nodelay(true)?;
                 h1_connect(tcp, &connector).await
             }
         })
@@ -305,6 +309,7 @@ pub async fn run_tcp1_server(
             _ = &mut shutdown => break,
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
+                    let _ = stream.set_nodelay(true);
                     let acceptor = acceptor.clone();
                     tokio::spawn(serve_h1_conn(stream, acceptor));
                 }

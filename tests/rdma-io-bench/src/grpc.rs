@@ -445,7 +445,9 @@ pub async fn run_tcp_server(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let acceptor = tls_common::build_acceptor(&opts.cert, &opts.key);
 
-    let tcp_incoming = tonic::transport::server::TcpIncoming::bind(opts.bind)?;
+    // Disable Nagle to match the echo/rh1 TCP paths (fair low-latency baseline).
+    let tcp_incoming =
+        tonic::transport::server::TcpIncoming::bind(opts.bind)?.with_nodelay(Some(true));
     let tls_incoming = tonic_tls::openssl::TlsIncoming::new(tcp_incoming, acceptor);
 
     eprintln!("Benchmark server listening on {} (mode=tcp)", opts.bind);
