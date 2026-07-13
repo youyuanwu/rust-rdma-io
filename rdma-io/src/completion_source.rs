@@ -98,6 +98,21 @@ impl CompletionSource {
         }
     }
 
+    /// Arm the CQ notification, then poll once (non-blocking drain-after-arm).
+    ///
+    /// Used by opportunistic synchronous drains on the live data path (e.g.
+    /// credit harvesting) that must keep the async notification armed so a
+    /// later completion still wakes the parked reactor.
+    #[inline]
+    pub fn drain_once(&mut self, wc_buf: &mut [WorkCompletion]) -> Result<usize> {
+        match self {
+            Self::ArmPark(s) => {
+                s.cq.cq().req_notify(false)?;
+                s.cq.cq().poll(wc_buf)
+            }
+        }
+    }
+
     /// Drain the completions of already-posted setup work requests (token Send,
     /// MW binds) with a short bounded arm-then-poll spin. Replaces the legacy
     /// `transport_common::drain_send_cq` for sources. Returns the count drained.

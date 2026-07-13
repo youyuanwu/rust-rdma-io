@@ -396,8 +396,10 @@ pub(crate) fn post_token_recv(
 
 /// Send our token and asynchronously wait for the peer's token to arrive.
 /// Called AFTER connect/accept (QP is RTS, peer's token Send is in flight).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn complete_token_exchange(
     qp: &AsyncQp,
+    recv_src: &mut crate::completion_source::CompletionSource,
     pd: &Arc<ProtectionDomain>,
     recv_mr: &OwnedMemoryRegion,
     mw_rkey: u32,
@@ -426,9 +428,9 @@ pub(crate) async fn complete_token_exchange(
         .sg(send_sge);
     qp.post_send_wr(&mut send_wr)?;
 
-    // Async wait for recv completion via CQ notification.
+    // Async wait for recv completion via CQ notification (through the seam).
     let mut wc_buf = [WorkCompletion::default(); 4];
-    let n = qp.recv_cq().poll(&mut wc_buf).await?;
+    let n = recv_src.acquire(&mut wc_buf).await?;
     if n > 0 && !wc_buf[0].is_success() {
         return Err(crate::Error::WorkCompletion {
             status: wc_buf[0].status_raw(),
@@ -459,31 +461,6 @@ pub(crate) async fn complete_token_exchange(
         )));
     }
     Ok((peer_token.ring_va, peer_token.mw_rkey, peer_cap as usize))
-}
-
-/// Drain all pending completions from the send CQ.
-/// Waits briefly for in-flight completions (e.g., token Send) to arrive.
-/// Returns the number of completions drained.
-pub(crate) fn drain_send_cq(qp: &AsyncQp) -> crate::Result<usize> {
-    let mut wc = [WorkCompletion::default(); 16];
-    let mut total = 0;
-    // Brief spin to catch in-flight completions from setup WRs.
-    for _ in 0..100 {
-        qp.send_cq().cq().req_notify(false)?;
-        match qp.send_cq().cq().poll(&mut wc) {
-            Ok(0) => {
-                if total > 0 {
-                    break; // Already drained some, CQ is empty now.
-                }
-                std::hint::spin_loop();
-            }
-            Ok(n) => {
-                total += n;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(total)
 }
 
 #[cfg(test)]

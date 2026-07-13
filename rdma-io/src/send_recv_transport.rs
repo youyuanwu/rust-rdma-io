@@ -12,15 +12,21 @@ use std::task::{Context, Poll};
 use tokio::io::unix::AsyncFd;
 
 use crate::async_cm::{AsyncCmId, AsyncCmListener};
-use crate::async_cq::{AsyncCq, CqPollState};
+use crate::async_cq::AsyncCq;
 use crate::async_qp::AsyncQp;
 use crate::cm::{CmId, ConnParam, EventChannel, PortSpace};
+use crate::completion_source::CompletionSource;
 use crate::mr::{AccessFlags, OwnedMemoryRegion};
 use crate::pd::ProtectionDomain;
 use crate::qp::QpInitAttr;
 use crate::transport::{RecvCompletion, Transport, TransportBuilder};
 use crate::wc::WorkCompletion;
 use crate::wr::QpType;
+
+/// Bounded number of teardown drain sweeps in `Drop`. After forcing the QP to
+/// ERROR the outstanding WRs flush locally (microseconds), so this is a short
+/// spin, not a wall-clock wait; `ibv_destroy_qp` is the backstop if exhausted.
+const SEND_RECV_TEARDOWN_DRAIN_POLLS: usize = 4096;
 
 /// Configuration for creating an [`SendRecvTransport`].
 #[derive(Debug, Clone)]
@@ -91,24 +97,27 @@ impl SendRecvConfig {
 ///
 /// **Drop order is critical.** Fields drop in declaration order:
 /// 1. State fields (no RDMA teardown)
-/// 2. QP (destroys QP, flushes all outstanding WRs — CQs are inside AsyncQp)
-/// 3. MRs (safe to deregister after QP destroy flushed all WRs)
-/// 4. PD (ref-counted, safe anytime)
-/// 5. cm_async_fd (deregister from epoll BEFORE closing the fd)
-/// 6. cm_id (disconnect/destroy)
-/// 7. event_channel (closes the fd — must be LAST)
+/// 2. QP (destroys QP, flushes all outstanding WRs)
+/// 3. Completion sources (destroy the send/recv CQs — after the QP)
+/// 4. MRs (safe to deregister after QP destroy flushed all WRs)
+/// 5. PD (ref-counted, safe anytime)
+/// 6. cm_async_fd (deregister from epoll BEFORE closing the fd)
+/// 7. cm_id (disconnect/destroy)
+/// 8. event_channel (closes the fd — must be LAST)
 pub struct SendRecvTransport {
     // -- State (no RDMA teardown) --
-    send_cq_state: CqPollState,
-    recv_cq_state: CqPollState,
     disconnected: bool,
     peer_disconnected: bool,
     next_send_idx: usize,
     send_in_flight: Vec<bool>,
     config: SendRecvConfig,
 
-    // -- RDMA data-path resources (drop: QP → MRs → PD) --
+    // -- RDMA data-path resources (drop: QP → CQs → MRs → PD) --
     qp: AsyncQp,
+    // Sources own the send/recv CQs; declared AFTER `qp` so RAII destroys the
+    // QP before its CQs (the verbs "destroy QP before its CQ" rule).
+    send_src: CompletionSource,
+    recv_src: CompletionSource,
     send_bufs: Vec<OwnedMemoryRegion>,
     recv_bufs: Vec<OwnedMemoryRegion>,
     _pd: Arc<ProtectionDomain>,
@@ -141,7 +150,9 @@ impl SendRecvTransport {
             async_cm.create_qp_with_cq(&pd, &qp_attr, Some(send_cq.cq()), Some(recv_cq.cq()))?;
 
         let (send_bufs, recv_bufs) = alloc_buffers(&pd, &config)?;
-        let qp = AsyncQp::new(cmqp, send_cq, recv_cq);
+        let qp = AsyncQp::new_poster(cmqp);
+        let send_src = CompletionSource::arm_park(send_cq);
+        let recv_src = CompletionSource::arm_park(recv_cq);
 
         for (i, mr) in recv_bufs.iter().enumerate() {
             qp.post_recv_buffer(mr, i as u64)?;
@@ -154,6 +165,8 @@ impl SendRecvTransport {
 
         Ok(Self::from_parts(
             qp,
+            send_src,
+            recv_src,
             cm_async_fd,
             cm_id,
             event_channel,
@@ -194,7 +207,9 @@ impl SendRecvTransport {
             conn_id.create_qp_with_cq(&pd, &qp_attr, Some(send_cq.cq()), Some(recv_cq.cq()))?;
 
         let (send_bufs, recv_bufs) = alloc_buffers(&pd, &config)?;
-        let qp = AsyncQp::new(cmqp, send_cq, recv_cq);
+        let qp = AsyncQp::new_poster(cmqp);
+        let send_src = CompletionSource::arm_park(send_cq);
+        let recv_src = CompletionSource::arm_park(recv_cq);
 
         for (i, mr) in recv_bufs.iter().enumerate() {
             qp.post_recv_buffer(mr, i as u64)?;
@@ -209,6 +224,8 @@ impl SendRecvTransport {
 
         Ok(Self::from_parts(
             qp,
+            send_src,
+            recv_src,
             cm_async_fd,
             cm_id,
             event_channel,
@@ -222,6 +239,8 @@ impl SendRecvTransport {
     #[allow(clippy::too_many_arguments)]
     fn from_parts(
         qp: AsyncQp,
+        send_src: CompletionSource,
+        recv_src: CompletionSource,
         cm_async_fd: AsyncFd<RawFd>,
         cm_id: CmId,
         event_channel: EventChannel,
@@ -232,14 +251,14 @@ impl SendRecvTransport {
     ) -> Self {
         let num_send = config.num_send_bufs;
         Self {
-            send_cq_state: CqPollState::default(),
-            recv_cq_state: CqPollState::default(),
             disconnected: false,
             peer_disconnected: false,
             next_send_idx: 0,
             send_in_flight: vec![false; num_send],
             config,
             qp,
+            send_src,
+            recv_src,
             send_bufs,
             recv_bufs,
             _pd: pd,
@@ -327,10 +346,7 @@ impl Transport for SendRecvTransport {
 
     fn poll_send_completion(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
         let mut wc_buf = [WorkCompletion::default(); 4];
-        let n = match self
-            .qp
-            .poll_send_cq(cx, &mut self.send_cq_state, &mut wc_buf)
-        {
+        let n = match self.send_src.poll_completions(cx, &mut wc_buf) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             Poll::Ready(Ok(n)) => n,
@@ -369,10 +385,7 @@ impl Transport for SendRecvTransport {
     ) -> Poll<crate::Result<usize>> {
         let max = out.len().min(8);
         let mut wc_buf = [WorkCompletion::default(); 8];
-        let n = match self
-            .qp
-            .poll_recv_cq(cx, &mut self.recv_cq_state, &mut wc_buf[..max])
-        {
+        let n = match self.recv_src.poll_completions(cx, &mut wc_buf[..max]) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             Poll::Ready(Ok(n)) => n,
@@ -447,19 +460,22 @@ impl Drop for SendRecvTransport {
         if !self.disconnected {
             let _ = self.cm_id.disconnect();
         }
-        // Drain CQ flush completions so the QP releases MR references
-        // before MRs are deregistered (field drop order: qp → MRs).
+        // Force the QP to ERROR so every outstanding WR flushes *locally* and
+        // synchronously, then reap the resulting CQEs through the sources so the
+        // QP releases its MR references before the MRs are deregistered (field
+        // drop order: qp → sources → MRs). Forcing ERROR first avoids the race
+        // where the async `cm_id.disconnect()` has not yet flushed the WRs, so
+        // the old "poll once until empty" could under-drain. Bounded so `Drop`
+        // never blocks the calling (possibly tokio worker) thread; the flush is
+        // local (microseconds), and `ibv_destroy_qp` in the `qp` field drop is
+        // the backstop.
+        let _ = self.qp.to_error();
         let mut wc = [crate::wc::WorkCompletion::default(); 16];
-        loop {
-            match self.qp.send_cq().cq().poll(&mut wc) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => continue,
-            }
-        }
-        loop {
-            match self.qp.recv_cq().cq().poll(&mut wc) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => continue,
+        for _ in 0..SEND_RECV_TEARDOWN_DRAIN_POLLS {
+            let s = self.send_src.try_drain(&mut wc).unwrap_or(0);
+            let r = self.recv_src.try_drain(&mut wc).unwrap_or(0);
+            if s == 0 && r == 0 {
+                break;
             }
         }
     }

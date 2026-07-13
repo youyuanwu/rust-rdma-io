@@ -43,9 +43,10 @@ use std::time::Duration;
 use tokio::io::unix::AsyncFd;
 
 use crate::async_cm::{AsyncCmId, AsyncCmListener};
-use crate::async_cq::{AsyncCq, CqPollState};
+use crate::async_cq::AsyncCq;
 use crate::async_qp::AsyncQp;
 use crate::cm::{CmId, ConnParam, EventChannel, PortSpace};
+use crate::completion_source::CompletionSource;
 use crate::mr::{AccessFlags, OwnedMemoryRegion};
 use crate::mw::MemoryWindow;
 use crate::pd::ProtectionDomain;
@@ -58,6 +59,11 @@ use crate::wr::{QpType, RecvWr, SendFlags, SendWr, Sge, WrOpcode};
 /// Extra send-queue slots beyond `max_outstanding` (headroom for in-flight
 /// credit `Send` WRs). Must match the value used to size `max_send_wr`.
 const CREDIT_RING_SQ_HEADROOM: usize = 2;
+
+/// Bounded number of teardown drain sweeps in `Drop`. After forcing the QP to
+/// ERROR the outstanding WRs flush locally (microseconds), so this is a short
+/// spin, not a wall-clock wait; `ibv_destroy_qp` is the backstop if exhausted.
+const CREDIT_RING_TEARDOWN_DRAIN_POLLS: usize = 4096;
 
 // ---------------------------------------------------------------------------
 // CreditRingConfig
@@ -146,10 +152,6 @@ impl Default for CreditRingConfig {
 /// MW must be dropped before QP (invalidation needs a live QP).
 /// QP must be dropped before ring MRs. CM resources drop last.
 pub struct CreditRingTransport {
-    // -- CQ poll state --
-    send_cq_state: CqPollState,
-    recv_cq_state: CqPollState,
-
     // -- Connection state --
     disconnected: bool,
     peer_disconnected: bool,
@@ -182,8 +184,13 @@ pub struct CreditRingTransport {
     // -- MW (dropped BEFORE QP — invalidation needs live QP) --
     _recv_mw: Option<MemoryWindow>,
 
-    // -- QP (owns dual CQs) --
+    // -- QP (poster: owns only the QP; its CQs live in the sources below) --
     qp: AsyncQp,
+
+    // -- Completion sources (own the send/recv CQs). Declared AFTER `qp` so
+    //    RAII destroys the QP before its CQs (destroy-QP-before-CQ). --
+    send_src: CompletionSource,
+    recv_src: CompletionSource,
 
     // -- Ring buffers --
     send_ring: RingBuffer,
@@ -286,7 +293,9 @@ impl CreditRingTransport {
             .collect::<crate::Result<Vec<_>>>()?
             .into_boxed_slice();
 
-        let qp = AsyncQp::new(cmqp, send_cq, recv_cq);
+        let qp = AsyncQp::new_poster(cmqp);
+        let mut send_src = CompletionSource::arm_park(send_cq);
+        let mut recv_src = CompletionSource::arm_park(recv_cq);
 
         // Post token recv FIRST (before doorbells, before connect).
         // This ensures the 20-byte token recv WR is consumed by the peer's
@@ -310,6 +319,7 @@ impl CreditRingTransport {
         // Complete token exchange (async — waits for CQ notification).
         let (remote_addr, remote_rkey, remote_capacity) = complete_token_exchange(
             &qp,
+            &mut recv_src,
             &pd,
             &recv_mr,
             mw_rkey,
@@ -320,7 +330,7 @@ impl CreditRingTransport {
         .await?;
 
         // Drain setup completions from send CQ (token send + MW bind).
-        drain_send_cq(&qp)?;
+        send_src.drain_setup()?;
 
         // NOW post doorbell recv WRs (after token exchange is done).
         for (i, mr) in doorbell_bufs.iter().enumerate() {
@@ -331,6 +341,8 @@ impl CreditRingTransport {
 
         Ok(Self::from_parts(
             qp,
+            send_src,
+            recv_src,
             cm_async_fd,
             cm_id,
             event_channel,
@@ -416,7 +428,9 @@ impl CreditRingTransport {
             .collect::<crate::Result<Vec<_>>>()?
             .into_boxed_slice();
 
-        let qp = AsyncQp::new(cmqp, send_cq, recv_cq);
+        let qp = AsyncQp::new_poster(cmqp);
+        let mut send_src = CompletionSource::arm_park(send_cq);
+        let mut recv_src = CompletionSource::arm_park(recv_cq);
 
         // Post token recv FIRST — see connect() comment.
         let token_recv_mr = post_token_recv(&qp, &pd)?;
@@ -440,6 +454,7 @@ impl CreditRingTransport {
         // Complete token exchange (async).
         let (remote_addr, remote_rkey, remote_capacity) = complete_token_exchange(
             &qp,
+            &mut recv_src,
             &pd,
             &recv_mr,
             mw_rkey,
@@ -450,7 +465,7 @@ impl CreditRingTransport {
         .await?;
 
         // Drain setup completions from send CQ (token send + MW bind).
-        drain_send_cq(&qp)?;
+        send_src.drain_setup()?;
 
         // Post doorbell recv WRs.
         for (i, mr) in doorbell_bufs.iter().enumerate() {
@@ -461,6 +476,8 @@ impl CreditRingTransport {
 
         Ok(Self::from_parts(
             qp,
+            send_src,
+            recv_src,
             cm_async_fd,
             cm_id,
             event_channel,
@@ -480,6 +497,8 @@ impl CreditRingTransport {
     #[allow(clippy::too_many_arguments)]
     fn from_parts(
         qp: AsyncQp,
+        send_src: CompletionSource,
+        recv_src: CompletionSource,
         cm_async_fd: AsyncFd<RawFd>,
         cm_id: CmId,
         event_channel: EventChannel,
@@ -496,9 +515,6 @@ impl CreditRingTransport {
     ) -> Self {
         let ring_capacity = config.ring_capacity;
         Self {
-            send_cq_state: CqPollState::default(),
-            recv_cq_state: CqPollState::default(),
-
             disconnected: false,
             peer_disconnected: false,
 
@@ -519,6 +535,9 @@ impl CreditRingTransport {
             _recv_mw: recv_mw,
 
             qp,
+
+            send_src,
+            recv_src,
 
             send_ring: RingBuffer::new(send_mr, ring_capacity),
             recv_ring: RingBuffer::new(recv_mr, ring_capacity),
@@ -577,11 +596,7 @@ impl CreditRingTransport {
     fn drain_recv_credits(&mut self) {
         let mut wc_buf = [WorkCompletion::default(); 8];
         // Arm + drain (one pass, non-blocking).
-        if self.qp.recv_cq().cq().req_notify(false).is_err() {
-            self.peer_disconnected = true;
-            return;
-        }
-        let n = match self.qp.recv_cq().cq().poll(&mut wc_buf) {
+        let n = match self.recv_src.drain_once(&mut wc_buf) {
             Ok(n) => n,
             Err(_) => {
                 self.peer_disconnected = true;
@@ -745,7 +760,7 @@ impl CreditRingTransport {
     fn drain_send_cq(&mut self) -> crate::Result<()> {
         let mut wc_buf = [WorkCompletion::default(); 8];
         loop {
-            let n = self.qp.send_cq().cq().poll(&mut wc_buf)?;
+            let n = self.send_src.try_drain(&mut wc_buf)?;
             if n == 0 {
                 break;
             }
@@ -902,10 +917,7 @@ impl Transport for CreditRingTransport {
 
     fn poll_send_completion(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
         let mut wc_buf = [WorkCompletion::default(); 8];
-        let n = match self
-            .qp
-            .poll_send_cq(cx, &mut self.send_cq_state, &mut wc_buf)
-        {
+        let n = match self.send_src.poll_completions(cx, &mut wc_buf) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             Poll::Ready(Ok(n)) => n,
@@ -969,10 +981,7 @@ impl Transport for CreditRingTransport {
         // without a waker registration.
         loop {
             let mut wc_buf = [WorkCompletion::default(); 8];
-            let n = match self
-                .qp
-                .poll_recv_cq(cx, &mut self.recv_cq_state, &mut wc_buf)
-            {
+            let n = match self.recv_src.poll_completions(cx, &mut wc_buf) {
                 Poll::Pending => {
                     if filled > 0 {
                         return Poll::Ready(Ok(filled));
@@ -1210,19 +1219,20 @@ impl Drop for CreditRingTransport {
         if !self.disconnected {
             let _ = self.cm_id.disconnect();
         }
-        // Drain CQ flush completions so the QP releases MR references
-        // before MRs are deregistered (field drop order: MW → QP → MRs).
+        // Force the QP to ERROR so every outstanding WR flushes locally, then
+        // reap the CQEs through the sources so the QP releases its MR references
+        // before the MRs are deregistered (field drop order: MW → QP → sources
+        // → MRs). Forcing ERROR first avoids the race where the async
+        // `cm_id.disconnect()` has not yet flushed the WRs. Bounded so `Drop`
+        // never blocks the calling (possibly tokio worker) thread; the flush is
+        // local (microseconds) and `ibv_destroy_qp` is the backstop.
+        let _ = self.qp.to_error();
         let mut wc = [WorkCompletion::default(); 16];
-        loop {
-            match self.qp.send_cq().cq().poll(&mut wc) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => continue,
-            }
-        }
-        loop {
-            match self.qp.recv_cq().cq().poll(&mut wc) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => continue,
+        for _ in 0..CREDIT_RING_TEARDOWN_DRAIN_POLLS {
+            let s = self.send_src.try_drain(&mut wc).unwrap_or(0);
+            let r = self.recv_src.try_drain(&mut wc).unwrap_or(0);
+            if s == 0 && r == 0 {
+                break;
             }
         }
     }
