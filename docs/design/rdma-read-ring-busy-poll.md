@@ -528,11 +528,15 @@ access. Grounded in the current code:
 
 ### Phases
 
-0. **Phase 0 — the seam.** Introduce `CompletionSource` (enum: `ArmParkSource` | `DriverSource`)
-   and route **all** `ReadRingTransport` completion access through it — the data path, the setup
-   `drain_send_cq`, and the teardown drain — so nothing calls `ibv_poll_cq` directly. Stop exposing
-   `AsyncQp::send_cq()`/`recv_cq()` and decouple CQ ownership from `AsyncQp` (P3). `ArmParkSource`
-   wraps today's `AsyncCq` with **no behavior change**. Regression-test all existing transports.
+0. **Phase 0 — the seam (`ArmPark`-only).** Introduce `CompletionSource` with **only the
+   `ArmParkSource` variant** — the `DriverSource` variant references `ConnSlot`/`poll_inbox`, which
+   are Phase-1 types, so it is *not* added until Phase 1 (Appendix A shows the target two-variant
+   shape for reference). Route **all** `ReadRingTransport` completion access through the seam — the
+   data path, the setup `drain_send_cq`, and the teardown drain — so nothing calls `ibv_poll_cq`
+   directly. Stop exposing `AsyncQp::send_cq()`/`recv_cq()` and decouple CQ ownership from `AsyncQp`
+   (P3). `ArmParkSource` wraps today's `AsyncCq` with **no behavior change**. **Stage read-ring
+   first**, leaving `AsyncQp`'s CQ accessors in place for `send_recv`/`credit_ring`; migrate those
+   two in a follow-up. Regression-test all existing transports.
 1. **Phase 1 — busy-poll end-to-end (read-ring), correctness-complete.** Add `CoreDriver`, the
    shared per-core poll-only CQ pair, `ConnSlot` + inboxes + `AtomicWaker`, and `qp_num` demux.
    **The lifecycle-correctness items are Phase 1, not deferred:** overflow-free inbox sizing +
@@ -597,11 +601,16 @@ externally: `poll_send_cq(cx, state: &mut CqPollState, wc)` — see
 
 ### A.1 Types
 
+> **Phase-0 scope:** only the `ArmPark` variant is implemented now. The `Driver` variant below is
+> the **target shape** — it depends on the Phase-1 `ConnSlot`/`poll_inbox` types and is added in
+> Phase 1, not Phase 0. Phase 0 lands the enum with a single `ArmPark` variant (and the `Dir` /
+> `try_drain` scaffolding), so adding `Driver` later is purely additive.
+
 ```rust
 /// One direction's completion stream. The transport still interprets the WCs.
 enum CompletionSource {
     ArmPark(ArmParkSource),   // owns a per-connection CQ + its drain-after-arm state
-    Driver(DriverSource),     // reads a per-direction inbox filled by the CoreDriver
+    Driver(DriverSource),     // [Phase 1] reads a per-direction inbox filled by the CoreDriver
 }
 
 struct ArmParkSource {
@@ -701,10 +710,12 @@ their completions, then `send_src/recv_src = Driver(DriverSource { slot, dir })`
 
 ### A.5 Migration scope + tests
 
-- **Scope.** The seam is introduced for **read-ring** first. `send_recv_transport` and
-  `credit_ring_transport` use the same `poll_send_cq/poll_recv_cq(state)` shape, so they migrate to
-  `ArmParkSource` mechanically; do them in the same PR (all three are `ArmPark`-only until Phase 1)
-  or stage read-ring first behind the unchanged `AsyncQp` path for the other two.
+- **Scope (decided: read-ring first).** The seam is introduced for **read-ring** only in Phase 0,
+  leaving `AsyncQp`'s `send_cq()`/`recv_cq()`/`poll_send_cq`/`poll_recv_cq` in place for
+  `send_recv_transport` and `credit_ring_transport`. Those two use the same
+  `poll_send_cq/poll_recv_cq(state)` shape and migrate to `ArmParkSource` mechanically in a
+  **follow-up** PR (all three are `ArmPark`-only until Phase 1). Staging read-ring first keeps the
+  first cut small and revertible.
 - **Tests (arm-park only — no busy-poll yet).** (a) a unit test that `ArmParkSource::poll_completions`
   reproduces `AsyncQp::poll_send_cq` output for a scripted CQ; (b) full integration regression of all
   three transports (`just test-remote`); (c) a teardown test asserting the counter reaches zero and
