@@ -587,3 +587,125 @@ placement; per-core connection count.
 - [read-ring-concurrent-stream-deadlock.md](../bugs/read-ring-concurrent-stream-deadlock.md) —
   the single-owner / liveness invariants both modes preserve.
 - [../future/RingPerformance.md](../future/RingPerformance.md) — broader ring perf roadmap.
+
+## Appendix A — Phase-0 `CompletionSource` API (P3)
+
+The conceptual seam is §3; this pins down the **Rust shape** so P3 is code-ready. It resolves the
+four decisions the current code forces (`AsyncQp` owns the CQs and holds the drain-after-arm state
+externally: `poll_send_cq(cx, state: &mut CqPollState, wc)` — see
+[async_qp.rs](../../rdma-io/src/async_qp.rs)).
+
+### A.1 Types
+
+```rust
+/// One direction's completion stream. The transport still interprets the WCs.
+enum CompletionSource {
+    ArmPark(ArmParkSource),   // owns a per-connection CQ + its drain-after-arm state
+    Driver(DriverSource),     // reads a per-direction inbox filled by the CoreDriver
+}
+
+struct ArmParkSource {
+    cq: AsyncCq,              // moved OUT of AsyncQp; owned here, by value
+    state: CqPollState,      // moved off the transport into the source
+}
+
+#[derive(Clone, Copy)]
+enum Dir { Send, Recv }
+
+struct DriverSource {
+    slot: Arc<ConnSlot>,     // registered with the core's CoreDriver
+    dir:  Dir,               // which inbox/waker to use
+}
+
+impl CompletionSource {
+    /// Async acquire: ≥1 completion, or register waker + `Pending`.
+    fn poll_completions(
+        &mut self, cx: &mut Context<'_>, out: &mut [WorkCompletion],
+    ) -> Poll<Result<usize>> {
+        match self {
+            // Verbatim today's arm-then-drain path — no behavior change.
+            Self::ArmPark(s) => s.cq.poll_completions(cx, &mut s.state, out),
+            // Drain inbox with §7.3 register–check–recheck via the slot's AtomicWaker.
+            Self::Driver(s)  => s.slot.poll_inbox(s.dir, cx, out),
+        }
+    }
+
+    /// Sync, **non-arming** drain for arm-park teardown (P2). Busy-poll returns
+    /// `Ok(0)`: its teardown is driver-mediated (§6.2), never a local CQ poll.
+    fn try_drain(&mut self, out: &mut [WorkCompletion]) -> Result<usize> {
+        match self {
+            Self::ArmPark(s) => s.cq.cq().poll(out),   // ibv_poll_cq, no req_notify
+            Self::Driver(_)  => Ok(0),
+        }
+    }
+}
+```
+
+`AsyncQp` is slimmed to a **poster** — it owns only the `CmQueuePair` and keeps `post_send_wr` /
+`post_recv_wr` / `as_raw` / `qp_num` / the new `to_error()` (P1). Its `send_cq()`/`recv_cq()` and
+`poll_send_cq`/`poll_recv_cq` are **removed**; completion acquisition lives entirely in
+`CompletionSource`.
+
+### A.2 The four decisions, resolved
+
+1. **Where `CqPollState` lives → inside `ArmParkSource`.** The state moves off the transport
+   (`self.send_cq_state`/`recv_cq_state` disappear) into the source that owns the CQ, so the
+   `poll_completions(cx, out)` signature carries no external state. `AsyncCq::poll_completions` is
+   already `&self` taking `&mut CqPollState`, so this is a move, not a rewrite.
+2. **CQ ownership + drop order → source-owned (arm-park) / driver-owned (busy-poll), with the
+   QP-before-CQ invariant relocated to field order.** The QP is built against the CQ's raw pointer
+   and does **not** own it (`CmQueuePair` holds a non-owning pointer). The transport's fields are
+   ordered `qp` **before** `send_src`/`recv_src`, so RAII drops the QP first and the arm-park CQs
+   after — preserving the verbs "destroy QP before its CQ" rule that `AsyncQp` used to enforce
+   internally. In busy-poll the shared CQ is owned by the `CoreDriver` and destroyed only at
+   runtime shutdown, after the teardown barrier (§6.2) has reclaimed every bundle — same invariant,
+   enforced by the barrier instead of field order.
+3. **Setup before the transport exists → build the source first, drain setup through it, then move
+   it in.** Sequencing below.
+4. **Enum, not `dyn` → static dispatch**, exactly two variants; the read-ring interpretation
+   (Read-sentinel, imm decode, `CompletionTracker`) stays in the transport for both.
+
+### A.3 Setup sequence
+
+**Arm-park (unchanged behavior, restructured):**
+
+```text
+let send_cq = AsyncCq::create_tokio(ctx.clone(), send_depth)?;
+let recv_cq = AsyncCq::create_tokio(ctx.clone(), recv_depth)?;
+let qp = build_qp(&cm_id, send_cq.cq().as_raw(), recv_cq.cq().as_raw(), ...)?;   // QP refs raw CQs
+let mut send_src = CompletionSource::ArmPark(ArmParkSource { cq: send_cq, state: default });
+let mut recv_src = CompletionSource::ArmPark(ArmParkSource { cq: recv_cq, state: default });
+post_setup_wrs(&qp)?;                         // token send/recv, MW binds
+drain_setup(&mut send_src, &mut recv_src)?;   // try_drain loop until setup WRs accounted (P2 counters)
+ReadRingTransport { qp, send_src, recv_src, /* rings, tracker, counters */ }   // move sources in
+```
+
+`drain_setup` replaces `transport_common::drain_send_cq` — same effect (spin `try_drain` until the
+posted setup WRs are reaped), now through the source so nothing else pokes the CQ.
+
+**Busy-poll:** register a `Connecting` `ConnSlot` with the driver **before** posting setup WRs
+(§6.1), build the QP against the driver's **shared** CQs, post setup WRs, `await` the slot inbox for
+their completions, then `send_src/recv_src = Driver(DriverSource { slot, dir })`, transition the slot
+`Established`, and construct the transport.
+
+### A.4 Steady state and teardown
+
+- **Steady state.** `poll_send_completion` → `self.send_src.poll_completions(cx, wc)`; `poll_recv`
+  → `self.recv_src.poll_completions(cx, wc)`; the transport then runs its unchanged interpretation.
+- **Teardown (arm-park, P2).** `Drop` transitions the QP to `ERR` (`to_error()`, P1), then loops
+  `send_src.try_drain` / `recv_src.try_drain` against the send/recv outstanding counters until zero
+  (bounded by a spin deadline, since `Drop` is sync). Field order guarantees the QP is already
+  destroyable before the sources (CQs) drop.
+- **Teardown (busy-poll).** `Drop` moves the QP/MRs/PD/`ConnSlot` into a `ResourceBundle` on the
+  driver's reclaim queue; `try_drain` is a no-op; the driver runs the barrier (§6.2).
+
+### A.5 Migration scope + tests
+
+- **Scope.** The seam is introduced for **read-ring** first. `send_recv_transport` and
+  `credit_ring_transport` use the same `poll_send_cq/poll_recv_cq(state)` shape, so they migrate to
+  `ArmParkSource` mechanically; do them in the same PR (all three are `ArmPark`-only until Phase 1)
+  or stage read-ring first behind the unchanged `AsyncQp` path for the other two.
+- **Tests (arm-park only — no busy-poll yet).** (a) a unit test that `ArmParkSource::poll_completions`
+  reproduces `AsyncQp::poll_send_cq` output for a scripted CQ; (b) full integration regression of all
+  three transports (`just test-remote`); (c) a teardown test asserting the counter reaches zero and
+  MRs deregister cleanly (the P2 latent-race fix — no more best-effort single drain).
