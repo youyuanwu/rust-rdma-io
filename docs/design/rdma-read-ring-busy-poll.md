@@ -502,33 +502,48 @@ strict driver→app round-robin, and app futures are cooperative. So:
 
 ### Prerequisites — fix the current impl first
 
+> **Implementation status (2026-07-13).** P1, P2, and **P3/Phase 0 (all three transports)** are
+> implemented and validated on MANA. read-ring: 5/5 + rh2 bench ~687k rps/0 err. Credit-ring and
+> send-recv migrated to the seam: functional tests pass isolated on a fresh NIC (the full
+> `transport_tests` binary wedges late on accept — confirmed MANA churn, green per-test), echo bench
+> ~1.33M rps/0 err each. Commits on `dev`: `d09aa55` (P1+P2 read-ring), `e8858e7`/`c20f771` (P3
+> read-ring), plus the send-recv/credit-ring seam migration. **Not yet started:** Phase 1 (busy-poll)
+> onward.
+
 Do these before any busy-poll code; each is a small refactor or primitive **testable against
 arm-park alone**, so the new subsystem lands on clean seams rather than on today's scattered CQ
 access. Grounded in the current code:
 
-- **P1 — safe `to_error()` QP-state primitive.** `qp.rs` has `modify(attr, mask)` and `wr.rs`
-  already maps `Err ↔ IBV_QPS_ERR`, but there is no `to_error()`, and `disconnect()` is *only* an
-  RDMA-CM disconnect ([read_ring_transport.rs](../../rdma-io/src/read_ring_transport.rs)). Add a
-  `CmQueuePair::to_error()` on top of `modify()`. Self-contained; the teardown barrier (§6.2)
-  needs it, and arm-park teardown becomes deterministic with it.
-- **P2 — deterministic, accounted teardown drain (also a latent-bug fix today).** The current
-  `Drop` calls `cm_id.disconnect()` (async, fire-and-forget) then drains the CQ **once, breaking
-  on the first empty poll** — so it can run *before* flush CQEs land and deregister MRs while WRs
-  still reference them (the likely source of the non-fatal `ibv_dealloc_pd` teardown messages seen
-  in benchmarking). Replace it with: transition the QP to `ERR` (P1), then drain against **real
-  send + recv outstanding counters** (including setup and doorbell WRs, not just `send_in_flight`)
-  until zero, with a timeout. This is exactly the accounting §6.2 formalizes.
-- **P3 — fold the seam + CQ-ownership decoupling into Phase 0 (below).** Today `AsyncQp` owns its
-  per-QP `send_cq`/`recv_cq`, **publicly exposes `send_cq()`/`recv_cq()`**, and relies on the field
-  drop order "QP before CQs" ([async_qp.rs](../../rdma-io/src/async_qp.rs)); setup polls via
-  `drain_send_cq` and `Drop` polls the CQ directly. Phase 0 must remove that raw exposure, route
-  setup/data/teardown completions through the one `CompletionSource`, and make CQ ownership
-  **external-capable** so a driver-owned shared CQ can outlive the QP without breaking the
-  destroy-QP-before-CQ order.
+- **P1 — safe `to_error()` QP-state primitive. [Done — `d09aa55`].** Added idempotent `to_error()`
+  (transition QP to `IBV_QPS_ERR`, flushing outstanding WRs) on `QueuePair`, `CmQueuePair`, and
+  `AsyncQp`, on top of `modify()`. The teardown barrier (§6.2) needs it, and arm-park teardown is
+  deterministic with it.
+- **P2 — deterministic, accounted teardown drain (also a latent-bug fix today). [Done — `d09aa55`
+  read-ring; send-recv/credit-ring migrated too].** Read-ring `Drop` forces `to_error()` (P1) then
+  drains against exact expected counts — `send_in_flight + read_in_flight` on the send CQ,
+  `max_outstanding` on the recv CQ (invariant: each reaped recv reposts a doorbell inline) — with a
+  bounded poll budget and no wall-clock deadline / thread yield, so `Drop` never blocks the tokio
+  worker. Replaces the old "disconnect then poll once until empty" that could under-drain and
+  deregister MRs the QP still referenced (the non-fatal `ibv_dealloc_pd` teardown messages).
+  **Send-recv and credit-ring** also now force `to_error()` first, then drain both sources until a
+  full sweep is empty (bounded budget) — their recv WR counts are not tracked exactly, so they use
+  drain-until-quiescent rather than exact counters, which is correct because `to_error()` makes the
+  flush CQEs present up front. Full deferral to a spawned reclaim task is the Phase-1
+  `ResourceBundle` work.
+- **P3 — fold the seam + CQ-ownership decoupling into Phase 0 (below). [Done — all three
+  transports].** Introduced [`completion_source.rs`](../../rdma-io/src/completion_source.rs)
+  (`CompletionSource::ArmPark`, owning the `AsyncCq` + `CqPollState`); `AsyncQp` CQ fields are now
+  `Option<AsyncCq>` with a `new_poster(cmqp)` constructor; each transport holds a poster QP +
+  `send_src`/`recv_src` (declared after `qp` so RAII destroys the QP before its CQs) and routes the
+  data path, setup token/MW-bind drain, and the teardown drain through the sources — nothing calls
+  `ibv_poll_cq` directly. `transport_common::complete_token_exchange` takes the recv source and
+  `drain_send_cq` was removed. `AsyncQp` keeps its `Option`-CQ Some-path only for its own low-level
+  unit tests (`async_qp_tests`), which use its `send`/`recv` convenience verbs directly.
 
 ### Phases
 
-0. **Phase 0 — the seam (`ArmPark`-only).** Introduce `CompletionSource` with **only the
+0. **Phase 0 — the seam (`ArmPark`-only). [Done — all three transports (read-ring `e8858e7`;
+   send-recv + credit-ring migrated).]** Introduce `CompletionSource` with **only the
    `ArmParkSource` variant** — the `DriverSource` variant references `ConnSlot`/`poll_inbox`, which
    are Phase-1 types, so it is *not* added until Phase 1 (Appendix A shows the target two-variant
    shape for reference). Route **all** `ReadRingTransport` completion access through the seam — the
