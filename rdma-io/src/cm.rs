@@ -496,6 +496,25 @@ impl CmQueuePair {
     pub fn qp_num(&self) -> u32 {
         unsafe { (*self.qp).qp_num }
     }
+
+    /// Transition the QP to the ERROR state (`IBV_QPS_ERR`).
+    ///
+    /// Legal from any state. Forces every outstanding send/recv work request to
+    /// complete (as success or `IBV_WC_WR_FLUSH_ERR`), so a completion-draining
+    /// teardown barrier is guaranteed to terminate rather than waiting on WRs
+    /// that would otherwise never complete. Idempotent: a best-effort no-op if
+    /// the QP is already in ERROR (e.g. an RDMA-CM disconnect already moved it
+    /// there).
+    pub fn to_error(&self) -> Result<()> {
+        if unsafe { (*self.qp).state } == IBV_QPS_ERR {
+            return Ok(());
+        }
+        let mut attr = ibv_qp_attr {
+            qp_state: IBV_QPS_ERR,
+            ..Default::default()
+        };
+        crate::error::from_ret(unsafe { ibv_modify_qp(self.qp, &mut attr, IBV_QP_STATE as i32) })
+    }
 }
 
 // --- Socket address helpers ---

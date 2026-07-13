@@ -71,6 +71,14 @@ const SEND_COPY_MAX_WRS: usize = 3;
 /// Sentinel wr_id for RDMA Read of offset buffer — not a data WR.
 const WR_ID_READ_SENTINEL: u64 = u64::MAX - 30;
 
+/// Bounded poll budget for the teardown completion drain. Moving the QP to
+/// ERROR flushes outstanding WRs *locally* (no network round-trip), so their
+/// flush completions land within a few `ibv_poll_cq` calls; this cap only
+/// guards against a misbehaving provider — with `ibv_destroy_qp` (in the QP
+/// field drop) as the ultimate backstop — so `Drop` never occupies the calling
+/// (possibly tokio worker) thread for more than microseconds.
+const READ_RING_TEARDOWN_DRAIN_POLLS: usize = 4096;
+
 // ---------------------------------------------------------------------------
 // ReadRingToken — 32-byte connection setup token (v2)
 // ---------------------------------------------------------------------------
@@ -1316,22 +1324,52 @@ impl Transport for ReadRingTransport {
 
 impl Drop for ReadRingTransport {
     fn drop(&mut self) {
+        // Optionally notify the peer, then force a *deterministic* local flush.
+        // `cm_id.disconnect()` is asynchronous: draining right after it races the
+        // QP's transition to ERROR and can reap zero completions while WRs are
+        // still outstanding — under-draining, then deregistering MRs the QP still
+        // references (the source of benign but noisy teardown warnings).
+        // Explicitly moving the QP to ERROR generates every outstanding WR's
+        // flush completion up front, so the bounded drain below reaps exactly the
+        // expected number. Best-effort: errors only mean the QP is already gone.
         if !self.disconnected {
             let _ = self.cm_id.disconnect();
         }
-        // Drain CQ flush completions so the QP releases MR references
-        // before MRs are deregistered (field drop order: MW2 → MW1 → QP → MRs).
+        let _ = self.qp.to_error();
+
+        // Reap the now-flushed completions so the QP releases its MR references
+        // before the MRs are deregistered (field drop order: MW2 → MW1 → QP →
+        // MRs). Moving the QP to ERROR flushes every outstanding WR *locally*, so
+        // the completions materialize within microseconds — a short bounded spin
+        // drains them without meaningfully occupying the calling thread (which
+        // may be a tokio worker: this is a synchronous `Drop`, so it must not
+        // block). Expected counts are known exactly:
+        //   send CQ: in-flight data/padding Writes + a pending RDMA-Read.
+        //   recv CQ: doorbell recv WRs — `posted + unreaped` is invariant at
+        //            `max_outstanding` (each reaped recv reposts inline).
+        // `ibv_destroy_qp` (in the subsequent `qp` field drop) is the backstop if
+        // the poll budget is exhausted, so the loop is strictly bounded and never
+        // waits on a wall clock. Fully deferring teardown to a spawned reclaim
+        // task is the ResourceBundle work (see the busy-poll design): that
+        // requires moving these resources out of `Drop`, so it is done there.
+        let mut send_expected = self.send_in_flight + usize::from(self.read_in_flight);
+        let mut recv_expected = self.max_outstanding;
         let mut wc = [WorkCompletion::default(); 16];
-        loop {
-            match self.qp.send_cq().cq().poll(&mut wc) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => continue,
+        for _ in 0..READ_RING_TEARDOWN_DRAIN_POLLS {
+            if send_expected == 0 && recv_expected == 0 {
+                break;
             }
-        }
-        loop {
-            match self.qp.recv_cq().cq().poll(&mut wc) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => continue,
+            if send_expected > 0 {
+                match self.qp.send_cq().cq().poll(&mut wc) {
+                    Ok(n) => send_expected = send_expected.saturating_sub(n),
+                    Err(_) => send_expected = 0,
+                }
+            }
+            if recv_expected > 0 {
+                match self.qp.recv_cq().cq().poll(&mut wc) {
+                    Ok(n) => recv_expected = recv_expected.saturating_sub(n),
+                    Err(_) => recv_expected = 0,
+                }
             }
         }
     }

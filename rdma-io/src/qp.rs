@@ -166,6 +166,23 @@ impl QueuePair {
         self.modify(&mut attr, mask)
     }
 
+    /// Transition the QP to the ERROR state (`IBV_QPS_ERR`).
+    ///
+    /// Legal from any state. Forces every outstanding send/recv work request to
+    /// complete (as success or `IBV_WC_WR_FLUSH_ERR`), so a completion-draining
+    /// teardown barrier is guaranteed to terminate. Idempotent: a no-op if the
+    /// QP is already in ERROR.
+    pub fn to_error(&self) -> Result<()> {
+        if self.state() == QpState::Err {
+            return Ok(());
+        }
+        let mut attr = ibv_qp_attr {
+            qp_state: IBV_QPS_ERR,
+            ..Default::default()
+        };
+        self.modify(&mut attr, IBV_QP_STATE)
+    }
+
     /// Post a send work request (legacy API).
     pub fn post_send(&self, wr: &mut SendWr) -> Result<()> {
         let mut raw = wr.build_raw();

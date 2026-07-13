@@ -56,6 +56,15 @@ impl AsyncQp {
         self.qp.as_raw()
     }
 
+    /// Transition the underlying QP to the ERROR state, flushing outstanding WRs.
+    ///
+    /// Used by teardown to guarantee the completion-drain barrier terminates:
+    /// once in ERROR the NIC completes every posted WR as success or
+    /// `IBV_WC_WR_FLUSH_ERR`. Idempotent.
+    pub fn to_error(&self) -> Result<()> {
+        self.qp.to_error()
+    }
+
     /// Access the send completion queue (for CQ drain in teardown).
     pub fn send_cq(&self) -> &AsyncCq {
         &self.send_cq
