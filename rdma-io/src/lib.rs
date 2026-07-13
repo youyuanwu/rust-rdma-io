@@ -24,6 +24,8 @@ pub mod async_qp;
 #[cfg(feature = "async")]
 pub mod async_stream;
 #[cfg(feature = "async")]
+pub mod completion_source;
+#[cfg(feature = "async")]
 pub mod credit_ring_transport;
 #[cfg(feature = "async")]
 pub mod read_ring_transport;

@@ -31,14 +31,22 @@ use crate::mr::{OwnedMemoryRegion, RemoteMr};
 use crate::wc::WorkCompletion;
 use crate::wr::{RecvWr, SendFlags, SendWr, Sge, WrOpcode};
 
-/// Async wrapper owning a CM-managed QP and its async completion queues.
+/// Async wrapper owning a CM-managed QP and (optionally) its async completion
+/// queues.
 ///
-/// Drop order: `qp` first (destroys QP), then `send_cq`, then `recv_cq`.
+/// The completion queues are held in `Option`s so an `AsyncQp` can also serve
+/// as a pure **poster** (via [`AsyncQp::new_poster`]) whose completions are
+/// owned and drained elsewhere — the read-ring transport moves its CQs into a
+/// [`crate::completion_source::CompletionSource`] and keeps only the QP here.
+///
+/// Drop order: `qp` first (destroys QP), then `send_cq`, then `recv_cq`. When
+/// the CQs live here (`Some`), that preserves the verbs "destroy QP before its
+/// CQ" rule; a poster (`None`) leaves that ordering to the owner's field order.
 pub struct AsyncQp {
     // IMPORTANT: field order = drop order. QP must die before CQs.
     qp: CmQueuePair,
-    send_cq: AsyncCq,
-    recv_cq: AsyncCq,
+    send_cq: Option<AsyncCq>,
+    recv_cq: Option<AsyncCq>,
 }
 
 impl AsyncQp {
@@ -46,8 +54,22 @@ impl AsyncQp {
     pub fn new(qp: CmQueuePair, send_cq: AsyncCq, recv_cq: AsyncCq) -> Self {
         Self {
             qp,
-            send_cq,
-            recv_cq,
+            send_cq: Some(send_cq),
+            recv_cq: Some(recv_cq),
+        }
+    }
+
+    /// Create a **poster-only** `AsyncQp` that owns just the QP.
+    ///
+    /// Completions are owned and drained by the caller (e.g. through a
+    /// [`crate::completion_source::CompletionSource`]). The CQ accessors
+    /// (`send_cq`/`recv_cq`/`poll_send_cq`/`poll_recv_cq`) and the async
+    /// `send`/`recv` convenience methods **must not** be called on a poster.
+    pub fn new_poster(qp: CmQueuePair) -> Self {
+        Self {
+            qp,
+            send_cq: None,
+            recv_cq: None,
         }
     }
 
@@ -66,13 +88,21 @@ impl AsyncQp {
     }
 
     /// Access the send completion queue (for CQ drain in teardown).
+    ///
+    /// Panics on a poster-only `AsyncQp` ([`AsyncQp::new_poster`]).
     pub fn send_cq(&self) -> &AsyncCq {
-        &self.send_cq
+        self.send_cq
+            .as_ref()
+            .expect("send_cq() called on a poster-only AsyncQp")
     }
 
     /// Access the recv completion queue (for CQ drain in teardown).
+    ///
+    /// Panics on a poster-only `AsyncQp` ([`AsyncQp::new_poster`]).
     pub fn recv_cq(&self) -> &AsyncCq {
-        &self.recv_cq
+        self.recv_cq
+            .as_ref()
+            .expect("recv_cq() called on a poster-only AsyncQp")
     }
 
     // --- Post helpers (pub(crate) for use by ring transport) ---
@@ -131,6 +161,8 @@ impl AsyncQp {
     // --- Poll-based CQ accessors (for AsyncRead/AsyncWrite impls) ---
 
     /// Poll the send CQ for completions.
+    ///
+    /// Panics on a poster-only `AsyncQp` ([`AsyncQp::new_poster`]).
     #[inline]
     pub fn poll_send_cq(
         &self,
@@ -138,10 +170,12 @@ impl AsyncQp {
         state: &mut CqPollState,
         wc_buf: &mut [WorkCompletion],
     ) -> Poll<Result<usize>> {
-        self.send_cq.poll_completions(cx, state, wc_buf)
+        self.send_cq().poll_completions(cx, state, wc_buf)
     }
 
     /// Poll the recv CQ for completions.
+    ///
+    /// Panics on a poster-only `AsyncQp` ([`AsyncQp::new_poster`]).
     #[inline]
     pub fn poll_recv_cq(
         &self,
@@ -149,7 +183,7 @@ impl AsyncQp {
         state: &mut CqPollState,
         wc_buf: &mut [WorkCompletion],
     ) -> Poll<Result<usize>> {
-        self.recv_cq.poll_completions(cx, state, wc_buf)
+        self.recv_cq().poll_completions(cx, state, wc_buf)
     }
 
     // --- Async convenience methods ---
@@ -174,7 +208,7 @@ impl AsyncQp {
             .flags(SendFlags::SIGNALED)
             .sg(sge);
         self.post_send_wr(&mut wr)?;
-        self.send_cq.poll_wr_id(wr_id).await
+        self.send_cq().poll_wr_id(wr_id).await
     }
 
     /// Post a RECV buffer and await its completion.
@@ -195,7 +229,7 @@ impl AsyncQp {
         );
         let mut wr = RecvWr::new(wr_id).sg(sge);
         self.post_recv_wr(&mut wr)?;
-        self.recv_cq.poll_wr_id(wr_id).await
+        self.recv_cq().poll_wr_id(wr_id).await
     }
 
     /// Post a SEND with immediate data and await completion.
@@ -216,7 +250,7 @@ impl AsyncQp {
             .flags(SendFlags::SIGNALED)
             .sg(sge);
         self.post_send_wr(&mut wr)?;
-        self.send_cq.poll_wr_id(wr_id).await
+        self.send_cq().poll_wr_id(wr_id).await
     }
 
     // --- One-sided RDMA verbs ---
@@ -239,7 +273,7 @@ impl AsyncQp {
             .sg(sge)
             .rdma(remote.addr + remote_offset, remote.rkey);
         self.post_send_wr(&mut wr)?;
-        self.send_cq.poll_wr_id(wr_id).await
+        self.send_cq().poll_wr_id(wr_id).await
     }
 
     /// RDMA WRITE: write data from a local buffer to a remote memory region.
@@ -260,7 +294,7 @@ impl AsyncQp {
             .sg(sge)
             .rdma(remote.addr + remote_offset, remote.rkey);
         self.post_send_wr(&mut wr)?;
-        self.send_cq.poll_wr_id(wr_id).await
+        self.send_cq().poll_wr_id(wr_id).await
     }
 
     /// RDMA WRITE with immediate data.
@@ -284,7 +318,7 @@ impl AsyncQp {
             .sg(sge)
             .rdma(remote.addr + remote_offset, remote.rkey);
         self.post_send_wr(&mut wr)?;
-        self.send_cq.poll_wr_id(wr_id).await
+        self.send_cq().poll_wr_id(wr_id).await
     }
 
     // --- Atomic verbs ---
@@ -311,7 +345,7 @@ impl AsyncQp {
             .sg(sge)
             .atomic(remote.addr + remote_offset, remote.rkey, compare, swap);
         self.post_send_wr(&mut wr)?;
-        self.send_cq.poll_wr_id(wr_id).await
+        self.send_cq().poll_wr_id(wr_id).await
     }
 
     /// Atomic Fetch-and-Add on a remote 8-byte value.
@@ -334,6 +368,6 @@ impl AsyncQp {
             .sg(sge)
             .atomic(remote.addr + remote_offset, remote.rkey, add_value, 0);
         self.post_send_wr(&mut wr)?;
-        self.send_cq.poll_wr_id(wr_id).await
+        self.send_cq().poll_wr_id(wr_id).await
     }
 }

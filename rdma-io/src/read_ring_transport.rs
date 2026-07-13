@@ -41,9 +41,10 @@ use std::time::Duration;
 use tokio::io::unix::AsyncFd;
 
 use crate::async_cm::{AsyncCmId, AsyncCmListener};
-use crate::async_cq::{AsyncCq, CqPollState};
+use crate::async_cq::AsyncCq;
 use crate::async_qp::AsyncQp;
 use crate::cm::{CmId, ConnParam, EventChannel, PortSpace};
+use crate::completion_source::CompletionSource;
 use crate::mr::{AccessFlags, OwnedMemoryRegion};
 use crate::mw::MemoryWindow;
 use crate::pd::ProtectionDomain;
@@ -211,10 +212,6 @@ impl Default for ReadRingConfig {
 /// Field ordering is critical: Rust drops fields in declaration order.
 /// MW2 → MW1 → QP → MRs → PD.
 pub struct ReadRingTransport {
-    // -- CQ poll state --
-    send_cq_state: CqPollState,
-    recv_cq_state: CqPollState,
-
     // -- Connection state --
     disconnected: bool,
     peer_disconnected: bool,
@@ -255,8 +252,14 @@ pub struct ReadRingTransport {
     // -- MW1 (recv ring, REMOTE_WRITE) — dropped BEFORE QP --
     _recv_mw: Option<MemoryWindow>,
 
-    // -- QP (owns dual CQs) --
+    // -- QP (poster: owns only the QP; its CQs live in the sources below) --
     qp: AsyncQp,
+
+    // -- Completion sources (own the send/recv CQs). Declared AFTER `qp` so
+    //    RAII drops the QP first, then its CQs — the verbs "destroy QP before
+    //    its CQ" rule (formerly enforced inside AsyncQp). --
+    send_src: CompletionSource,
+    recv_src: CompletionSource,
 
     // -- Ring buffers --
     send_ring: RingBuffer,
@@ -341,6 +344,7 @@ fn post_read_ring_token_recv(
 /// Send our 32-byte token and wait for the peer's token.
 async fn complete_read_ring_token_exchange(
     qp: &AsyncQp,
+    recv_src: &mut CompletionSource,
     pd: &Arc<ProtectionDomain>,
     our_token: &ReadRingToken,
     token_recv_mr: &OwnedMemoryRegion,
@@ -357,9 +361,9 @@ async fn complete_read_ring_token_exchange(
         .sg(send_sge);
     qp.post_send_wr(&mut send_wr)?;
 
-    // Async wait for recv completion via CQ notification.
+    // Async wait for recv completion via CQ notification (through the seam).
     let mut wc_buf = [WorkCompletion::default(); 4];
-    let n = qp.recv_cq().poll(&mut wc_buf).await?;
+    let n = recv_src.acquire(&mut wc_buf).await?;
     if n > 0 && !wc_buf[0].is_success() {
         return Err(crate::Error::WorkCompletion {
             status: wc_buf[0].status_raw(),
@@ -500,7 +504,9 @@ impl ReadRingTransport {
             .collect::<crate::Result<Vec<_>>>()?
             .into_boxed_slice();
 
-        let qp = AsyncQp::new(cmqp, send_cq, recv_cq);
+        let qp = AsyncQp::new_poster(cmqp);
+        let mut send_src = CompletionSource::arm_park(send_cq);
+        let mut recv_src = CompletionSource::arm_park(recv_cq);
 
         // Post 32-byte token recv FIRST (before doorbells, before connect).
         let token_recv_mr = post_read_ring_token_recv(&qp, &pd)?;
@@ -537,10 +543,11 @@ impl ReadRingTransport {
 
         // Complete token exchange (async — waits for CQ notification).
         let peer_token =
-            complete_read_ring_token_exchange(&qp, &pd, &our_token, &token_recv_mr).await?;
+            complete_read_ring_token_exchange(&qp, &mut recv_src, &pd, &our_token, &token_recv_mr)
+                .await?;
 
         // Drain setup completions from send CQ (token send + MW binds if any).
-        drain_send_cq(&qp)?;
+        send_src.drain_setup()?;
 
         // Post doorbell recv WRs.
         for (i, mr) in doorbell_bufs.iter().enumerate() {
@@ -551,6 +558,8 @@ impl ReadRingTransport {
 
         Ok(Self::from_parts(
             qp,
+            send_src,
+            recv_src,
             cm_async_fd,
             cm_id,
             event_channel,
@@ -643,7 +652,9 @@ impl ReadRingTransport {
             .collect::<crate::Result<Vec<_>>>()?
             .into_boxed_slice();
 
-        let qp = AsyncQp::new(cmqp, send_cq, recv_cq);
+        let qp = AsyncQp::new_poster(cmqp);
+        let mut send_src = CompletionSource::arm_park(send_cq);
+        let mut recv_src = CompletionSource::arm_park(recv_cq);
 
         // Post 32-byte token recv FIRST.
         let token_recv_mr = post_read_ring_token_recv(&qp, &pd)?;
@@ -680,9 +691,10 @@ impl ReadRingTransport {
         };
 
         let peer_token =
-            complete_read_ring_token_exchange(&qp, &pd, &our_token, &token_recv_mr).await?;
+            complete_read_ring_token_exchange(&qp, &mut recv_src, &pd, &our_token, &token_recv_mr)
+                .await?;
 
-        drain_send_cq(&qp)?;
+        send_src.drain_setup()?;
 
         for (i, mr) in doorbell_bufs.iter().enumerate() {
             let sge = Sge::new(mr.addr(), 4, mr.lkey());
@@ -692,6 +704,8 @@ impl ReadRingTransport {
 
         Ok(Self::from_parts(
             qp,
+            send_src,
+            recv_src,
             cm_async_fd,
             cm_id,
             event_channel,
@@ -716,6 +730,8 @@ impl ReadRingTransport {
     #[allow(clippy::too_many_arguments)]
     fn from_parts(
         qp: AsyncQp,
+        send_src: CompletionSource,
+        recv_src: CompletionSource,
         cm_async_fd: AsyncFd<RawFd>,
         cm_id: CmId,
         event_channel: EventChannel,
@@ -737,9 +753,6 @@ impl ReadRingTransport {
     ) -> Self {
         let ring_capacity = config.ring_capacity;
         Self {
-            send_cq_state: CqPollState::default(),
-            recv_cq_state: CqPollState::default(),
-
             disconnected: false,
             peer_disconnected: false,
 
@@ -764,6 +777,9 @@ impl ReadRingTransport {
             _recv_mw: recv_mw,
 
             qp,
+
+            send_src,
+            recv_src,
 
             send_ring: RingBuffer::new(send_mr, ring_capacity),
             recv_ring: RingBuffer::new(recv_mr, ring_capacity),
@@ -1036,10 +1052,7 @@ impl Transport for ReadRingTransport {
     fn poll_send_completion(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
         loop {
             let mut wc_buf = [WorkCompletion::default(); 8];
-            let n = match self
-                .qp
-                .poll_send_cq(cx, &mut self.send_cq_state, &mut wc_buf)
-            {
+            let n = match self.send_src.poll_completions(cx, &mut wc_buf) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Ready(Ok(n)) => n,
@@ -1122,10 +1135,7 @@ impl Transport for ReadRingTransport {
         // without a waker registration.
         loop {
             let mut wc_buf = [WorkCompletion::default(); 8];
-            let n = match self
-                .qp
-                .poll_recv_cq(cx, &mut self.recv_cq_state, &mut wc_buf)
-            {
+            let n = match self.recv_src.poll_completions(cx, &mut wc_buf) {
                 Poll::Pending => {
                     if filled > 0 {
                         return Poll::Ready(Ok(filled));
@@ -1360,13 +1370,13 @@ impl Drop for ReadRingTransport {
                 break;
             }
             if send_expected > 0 {
-                match self.qp.send_cq().cq().poll(&mut wc) {
+                match self.send_src.try_drain(&mut wc) {
                     Ok(n) => send_expected = send_expected.saturating_sub(n),
                     Err(_) => send_expected = 0,
                 }
             }
             if recv_expected > 0 {
-                match self.qp.recv_cq().cq().poll(&mut wc) {
+                match self.recv_src.try_drain(&mut wc) {
                     Ok(n) => recv_expected = recv_expected.saturating_sub(n),
                     Err(_) => recv_expected = 0,
                 }
