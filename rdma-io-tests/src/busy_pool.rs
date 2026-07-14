@@ -44,8 +44,27 @@ struct CoreWorker {
     rt: RtHandle,
     /// The core's shared-CQ reaper handle (register/reclaim/shutdown).
     driver: CoreDriverHandle,
+    /// Max live connections admitted to this core (`usize::MAX` = uncapped, for
+    /// [`BusyPool::new`]; a finite cap for [`BusyPool::with_config`]).
+    cap: usize,
+    /// Current live-connection count (admission load). Incremented at placement,
+    /// decremented by [`AdmissionGuard`] when the connection's task ends.
+    admitted: Arc<AtomicUsize>,
     /// The OS thread running the runtime; joined at shutdown.
     thread: Option<thread::JoinHandle<()>>,
+}
+
+/// Releases a core's admission slot when dropped. Held by the connection's task,
+/// so the slot frees on the owning core when the app returns and the transport
+/// is reclaimed.
+struct AdmissionGuard {
+    admitted: Arc<AtomicUsize>,
+}
+
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        self.admitted.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// A pool of pinned per-core busy-poll workers, over which connections are
@@ -74,9 +93,52 @@ impl BusyPool {
         send_depth: i32,
         recv_depth: i32,
     ) -> rdma_io::Result<Self> {
+        // Uncapped: placement is pure round-robin (admission always succeeds).
+        Self::build(ctx, core_ids, send_depth, recv_depth, usize::MAX)
+    }
+
+    /// Build a pool that sizes each core's shared CQs for `conns_per_core`
+    /// connections of `config` and **caps admission** at `conns_per_core` per
+    /// core (Slice D3).
+    ///
+    /// The per-connection WR budget ([`ReadRingConfig::wr_budget`]) sets the
+    /// shared-CQ depth: `(conns_per_core + 1) * per_conn_wrs` — the `+1` reserves
+    /// **flush headroom** so a disconnecting connection's in-flight flush CQEs
+    /// cannot overrun the CQ while a replacement is admitted (§7.2). Fails if
+    /// that depth would exceed the device `max_cqe` (reduce `conns_per_core`,
+    /// `ring_capacity`, or `max_in_flight`).
+    pub fn with_config(
+        ctx: Arc<Context>,
+        core_ids: &[usize],
+        config: &ReadRingConfig,
+        conns_per_core: usize,
+    ) -> rdma_io::Result<Self> {
+        let budget = config.wr_budget(&ctx);
+        // +1 connection's worth of headroom for flush CQEs during reclaim.
+        let slots = (conns_per_core + 1) as i32;
+        let send_depth = slots * budget.send_wrs;
+        let recv_depth = slots * budget.recv_wrs;
+        let max_cqe = ctx.query_device().map(|a| a.max_cqe).unwrap_or(i32::MAX);
+        if send_depth > max_cqe || recv_depth > max_cqe {
+            return Err(rdma_io::Error::InvalidArg(format!(
+                "busy pool: conns_per_core={conns_per_core} needs shared CQ depth \
+                 send={send_depth}/recv={recv_depth} > device max_cqe={max_cqe}; \
+                 reduce conns_per_core / ring_capacity / max_in_flight"
+            )));
+        }
+        Self::build(ctx, core_ids, send_depth, recv_depth, conns_per_core)
+    }
+
+    fn build(
+        ctx: Arc<Context>,
+        core_ids: &[usize],
+        send_depth: i32,
+        recv_depth: i32,
+        cap: usize,
+    ) -> rdma_io::Result<Self> {
         let mut workers: Vec<CoreWorker> = Vec::with_capacity(core_ids.len());
         for &core_id in core_ids {
-            match spawn_worker(ctx.clone(), core_id, send_depth, recv_depth) {
+            match spawn_worker(ctx.clone(), core_id, send_depth, recv_depth, cap) {
                 Ok(w) => workers.push(w),
                 Err(e) => {
                     // Clean up the workers already started before failing.
@@ -101,10 +163,60 @@ impl BusyPool {
         self.workers.iter().map(|w| w.core_id).collect()
     }
 
-    /// Round-robin the next worker.
-    fn next_worker(&self) -> &CoreWorker {
-        let i = self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len();
-        &self.workers[i]
+    /// Current live-connection count per core (in placement order). For tests /
+    /// observability.
+    pub fn admitted_counts(&self) -> Vec<usize> {
+        self.workers
+            .iter()
+            .map(|w| w.admitted.load(Ordering::Acquire))
+            .collect()
+    }
+
+    /// Reserve an admission slot on the next core with headroom (round-robin
+    /// scan). Returns the worker index and a guard that releases the slot when
+    /// dropped, or `None` if every core is at its cap (`with_config` pools only;
+    /// an uncapped `new` pool always admits).
+    fn try_admit(&self) -> Option<(usize, AdmissionGuard)> {
+        let n = self.workers.len();
+        for _ in 0..n {
+            let i = self.next.fetch_add(1, Ordering::Relaxed) % n;
+            let w = &self.workers[i];
+            if w.admitted.fetch_add(1, Ordering::AcqRel) < w.cap {
+                return Some((
+                    i,
+                    AdmissionGuard {
+                        admitted: w.admitted.clone(),
+                    },
+                ));
+            }
+            // Over cap — undo and try the next core.
+            w.admitted.fetch_sub(1, Ordering::AcqRel);
+        }
+        None
+    }
+
+    /// Like [`try_admit`](Self::try_admit), but when no core has headroom it
+    /// over-admits on the round-robin core (relying on the reserved flush
+    /// headroom) rather than rejecting an already-pending accept. Used by
+    /// [`serve`](Self::serve); server-side reject/redirect is a follow-up.
+    fn admit_or_roundrobin(&self) -> (usize, AdmissionGuard) {
+        if let Some(slot) = self.try_admit() {
+            return slot;
+        }
+        let n = self.workers.len();
+        let i = self.next.fetch_add(1, Ordering::Relaxed) % n;
+        let w = &self.workers[i];
+        w.admitted.fetch_add(1, Ordering::AcqRel);
+        tracing::warn!(
+            core = w.core_id,
+            "busy pool over-admit: no core has admission headroom"
+        );
+        (
+            i,
+            AdmissionGuard {
+                admitted: w.admitted.clone(),
+            },
+        )
     }
 
     /// Open a busy-poll read-ring connection on the next core (round-robin) and
@@ -115,23 +227,30 @@ impl BusyPool {
     /// so the transport never crosses a thread boundary (the owner-worker guard,
     /// §7.5). The transport is dropped when `app` returns, handing its resources
     /// to that core's driver reclaim queue (§6.2).
+    ///
+    /// Returns `None` if every core is at its admission cap (`with_config`
+    /// pools); an uncapped [`new`](Self::new) pool always returns `Some`.
     pub fn spawn_connect<F, Fut, R>(
         &self,
         addr: SocketAddr,
         config: ReadRingConfig,
         app: F,
-    ) -> JoinHandle<rdma_io::Result<R>>
+    ) -> Option<JoinHandle<rdma_io::Result<R>>>
     where
         F: FnOnce(ReadRingTransport) -> Fut + Send + 'static,
         Fut: Future<Output = R> + Send + 'static,
         R: Send + 'static,
     {
-        let worker = self.next_worker();
+        let (i, guard) = self.try_admit()?;
+        let worker = &self.workers[i];
         let driver = worker.driver.clone();
-        worker.rt.spawn(async move {
+        Some(worker.rt.spawn(async move {
+            // Held for the connection's lifetime; releases the core's admission
+            // slot when the app returns (transport dropped -> reclaim).
+            let _guard = guard;
             let transport = ReadRingTransport::connect_busy(&addr, config, &driver).await?;
             Ok(app(transport).await)
-        })
+        }))
     }
 
     /// Serve `count` busy-poll read-ring connections: accept each on the pool
@@ -163,7 +282,8 @@ impl BusyPool {
     {
         let mut handles = Vec::with_capacity(count);
         for _ in 0..count {
-            let worker = self.next_worker();
+            let (i, guard) = self.admit_or_roundrobin();
+            let worker = &self.workers[i];
             let driver = worker.driver.clone();
             let listener = listener.clone();
             let config = config.clone();
@@ -172,6 +292,7 @@ impl BusyPool {
             // listener, so the pool can accept the next connection.
             let (setup_tx, setup_rx) = tokio::sync::oneshot::channel::<()>();
             let handle = worker.rt.spawn(async move {
+                let _guard = guard;
                 let result = ReadRingTransport::accept_busy(&listener, config, &driver).await;
                 let _ = setup_tx.send(());
                 match result {
@@ -222,6 +343,7 @@ fn spawn_worker(
     core_id: usize,
     send_depth: i32,
     recv_depth: i32,
+    cap: usize,
 ) -> rdma_io::Result<CoreWorker> {
     // Handshake: the worker sends back its runtime + driver handle (or the error
     // it hit) once the driver task is running.
@@ -273,6 +395,8 @@ fn spawn_worker(
             core_id,
             rt,
             driver,
+            cap,
+            admitted: Arc::new(AtomicUsize::new(0)),
             thread: Some(thread),
         }),
         Ok(Err(msg)) => {

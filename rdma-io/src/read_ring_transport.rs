@@ -198,6 +198,51 @@ impl ReadRingConfig {
         self.max_in_flight = Some(n);
         self
     }
+
+    /// Per-connection shared-CQ WR budget on `ctx`'s device (Slice D3 admission
+    /// arithmetic).
+    ///
+    /// Mirrors the send/recv CQ depths [`connect`](ReadRingTransport::connect) /
+    /// [`accept`](ReadRingTransport::accept) size internally, so a busy-poll pool
+    /// sharing one CQ pair per core can size those CQs and cap admission without
+    /// overrunning them: a per-core shared CQ must hold the **sum** of
+    /// [`send_wrs`](ReadRingWrBudget::send_wrs) (resp.
+    /// [`recv_wrs`](ReadRingWrBudget::recv_wrs)) over the connections it admits,
+    /// plus reserved flush headroom, and no more than the device `max_cqe`.
+    pub fn wr_budget(&self, ctx: &Arc<crate::device::Context>) -> ReadRingWrBudget {
+        let device_limit = ctx
+            .query_device()
+            .ok()
+            .map(|a| (a.max_qp_wr as usize).min(a.max_cqe as usize))
+            .unwrap_or(usize::MAX);
+        let max_outstanding = clamp_max_outstanding(
+            self.ring_capacity,
+            self.max_message_size,
+            self.max_in_flight,
+            READ_RING_SQ_HEADROOM,
+            device_limit,
+        );
+        ReadRingWrBudget {
+            max_outstanding,
+            send_wrs: (max_outstanding + READ_RING_SQ_HEADROOM) as i32,
+            recv_wrs: (max_outstanding + 2) as i32,
+        }
+    }
+}
+
+/// Per-connection shared-CQ WR budget for a busy-poll read-ring connection
+/// (returned by [`ReadRingConfig::wr_budget`]). See that method for how a pool
+/// uses it to size shared CQs and cap admission (Slice D3).
+#[derive(Debug, Clone, Copy)]
+pub struct ReadRingWrBudget {
+    /// Effective in-flight message budget after clamping to device limits.
+    pub max_outstanding: usize,
+    /// Send-CQ WRs this connection can have outstanding (data Write+Imm +
+    /// padding + one RDMA Read): `max_outstanding + READ_RING_SQ_HEADROOM`.
+    pub send_wrs: i32,
+    /// Recv-CQ WRs this connection keeps posted (doorbell recvs):
+    /// `max_outstanding + 2`.
+    pub recv_wrs: i32,
 }
 
 impl Default for ReadRingConfig {

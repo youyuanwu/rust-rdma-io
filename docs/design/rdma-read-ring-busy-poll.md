@@ -516,8 +516,10 @@ strict driver→app round-robin, and app futures are cooperative. So:
 > `ReadRingInner` (MW→QP→MR→PD) and retires the `qp_num`, joined at shutdown — MANA (fresh NIC):
 > busy echo + 24-cycle reconnect churn 2/2, arm-park 5/5 regression-free. **Slice D in progress:**
 > D1 (`BusyPool` per-core worker pool + client sharding) and D2 (server accept via serialized
-> handshake) are done — MANA: 6-client/2-core busy↔arm-park echo both directions. **Not yet
-> started:** D3 (aggregate CQ sizing + admission) and D4 (thread-per-core bench runner).
+> handshake) are done — MANA: 6-client/2-core busy↔arm-park echo both directions. D3 (aggregate CQ
+> sizing via `ReadRingConfig::wr_budget` + per-core admission cap + flush headroom) is done too —
+> MANA: cap-2 pool admits 2 / refuses the 3rd. **Not yet started:** D4 (thread-per-core bench
+> runner).
 
 Do these before any busy-poll code; each is a small refactor or primitive **testable against
 arm-park alone**, so the new subsystem lands on clean seams rather than on today's scattered CQ
@@ -617,13 +619,13 @@ crate deps needed: an `AtomicWaker` (`atomic-waker` or `futures-util`'s `task`) 
   to a reused `qp_num` is a **fatal** invariant breach, validated by the rapid close/reconnect +
   `qp_num`-reuse stress test. **The background-reclaim model and shutdown-join protocol are
   specified in [Slice C part 2 design](#slice-c-part-2-design--background-reclaim-teardown-as-a-kernel-like-cleanup-task) below.**
-- **Slice D — setup handoff, server CM-ID routing, sharding + admission control. [D1 + D2 done — see
+- **Slice D — setup handoff, server CM-ID routing, sharding + admission control. [D1–D3 done — see
   [Slice D design](#slice-d-design--multi-connection-sharded-and-measurable) below; MANA-validated
-  busy↔arm-park echo, client- and server-pool.]** Add the per-core **`BusyPool`** + connection
-  sharding (D1 — done), the server-side control task (D2 — done, serialized-handshake realization),
-  aggregate shared-CQ sizing + per-core admission control + reserved flush headroom (D3, §7.2), and
-  the **distinct pinned-`current_thread` thread-per-core bench runner** (D4, §11). Then run echo /
-  rh1 thread-per-core and measure p50/p99 + `cpu_us_per_op` vs arm-park.
+  busy↔arm-park echo (client- and server-pool) + admission cap.]** Add the per-core **`BusyPool`** +
+  connection sharding (D1 — done), the server-side control task (D2 — done, serialized-handshake
+  realization), aggregate shared-CQ sizing + per-core admission control + reserved flush headroom
+  (D3 — done, §7.2), and the **distinct pinned-`current_thread` thread-per-core bench runner** (D4,
+  §11). Then run echo / rh1 thread-per-core and measure p50/p99 + `cpu_us_per_op` vs arm-park.
 
 Slices A and B are low-risk and unlock everything downstream; C is the correctness crux under MANA
 churn; D makes it multi-connection and measurable. Per §12, correctness scenarios run on **both rxe
@@ -946,6 +948,17 @@ The fixed 1024-entry CQs of Slices B/C do not scale. Size and gate:
   budget (or cap admission below `max_cqe` by the largest single-QP budget).
 - Wire the cap into placement (D1): round-robin **among cores with headroom**; fail the connect (or
   redirect) when all are full. Cap enforcement is a correctness test, not just a tuning knob.
+
+> **Implemented (Slice D3).** The per-connection arithmetic lives in the core crate:
+> `ReadRingConfig::wr_budget(ctx) -> ReadRingWrBudget { max_outstanding, send_wrs, recv_wrs }`
+> mirrors the CQ depths `connect`/`accept` size internally. `BusyPool::with_config(ctx, core_ids,
+> config, conns_per_core)` uses it to size each core's shared CQs at `(conns_per_core + 1) *
+> per_conn_wrs` — the `+1` is the flush headroom (one reclaiming connection's worth) — and fails if
+> that exceeds the device `max_cqe`. Admission is capped at `conns_per_core`: `spawn_connect` returns
+> `None` when every core is at cap (round-robin scan for headroom), and an `AdmissionGuard` moved
+> into the connection's task frees the slot on the owning core when it ends. `serve` over-admits on
+> the round-robin core if full (rather than reject a pending accept; server-side reject/redirect is
+> the follow-up). Validated on MANA: cap-2 pool admits 2, refuses the 3rd, frees on close.
 
 #### D4 — Thread-per-core bench runner + measurement
 

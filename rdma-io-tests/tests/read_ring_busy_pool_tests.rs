@@ -127,7 +127,8 @@ async fn read_ring_busy_pool_multi_core_echo() {
                     let got = recv_msg(&mut t, "pool client recv").await;
                     assert_eq!(got, data, "conn {i} msg {m} payload mismatch");
                 }
-            }),
+            })
+            .expect("uncapped pool always admits"),
         );
     }
 
@@ -200,6 +201,89 @@ async fn read_ring_busy_pool_server_echo() {
     for h in servers {
         h.await.expect("server conn task panicked");
     }
+
+    pool.shutdown();
+    drop(probe);
+}
+
+// Slice D3: a `with_config` pool sizes its shared CQs from the config and caps
+// admission per core; a connect past the cap is refused, and a freed slot
+// re-opens headroom.
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn read_ring_busy_pool_admission_cap() {
+    require_no_iwarp!();
+
+    const CAP: usize = 2;
+    const MSG_LEN: usize = 256;
+
+    let config = ReadRingConfig::default();
+    let listener = Arc::new(bind_listener_with_retry().await);
+    let connect_addr = connect_addr_for(listener.local_addr());
+
+    let probe = AsyncCmId::new(PortSpace::Tcp).unwrap();
+    probe.resolve_addr(None, &connect_addr, 2000).await.unwrap();
+    let ctx = probe.verbs_context().expect("probe has no verbs context");
+
+    // One core, cap CAP: shared CQs sized from the config (D3), admission capped.
+    let pool = BusyPool::with_config(ctx, &[0], &config, CAP).expect("build capped pool");
+
+    // Arm-park server accepts exactly the CAP admitted connections, echoing one.
+    let server_cfg = config.clone();
+    let server = tokio::spawn(async move {
+        let mut conns = Vec::with_capacity(CAP);
+        for _ in 0..CAP {
+            let t = ReadRingTransport::accept(&listener, server_cfg.clone())
+                .await
+                .expect("server accept");
+            conns.push(tokio::spawn(server_echo_loop(t, 1)));
+        }
+        for h in conns {
+            h.await.expect("server echo task panicked");
+        }
+    });
+
+    // A gate that keeps the admitted connections alive (holding their slots)
+    // until we have asserted the cap is enforced.
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+
+    let mut held = Vec::with_capacity(CAP);
+    for i in 0..CAP {
+        let cfg = config.clone();
+        let gate = gate.clone();
+        held.push(
+            pool.spawn_connect(connect_addr, cfg, move |mut t| async move {
+                let data = payload(i, MSG_LEN);
+                send_msg(&mut t, &data, "held client send").await;
+                let got = recv_msg(&mut t, "held client recv").await;
+                assert_eq!(got, data, "held conn {i} payload mismatch");
+                // Hold the admission slot until released.
+                let _ = gate.acquire().await;
+            })
+            .expect("within cap admits"),
+        );
+    }
+
+    // `spawn_connect` reserves the slot synchronously, so the cap is already
+    // reached: the next connect is refused (no await between, so no held task
+    // could have freed a slot yet).
+    assert_eq!(pool.admitted_counts(), vec![CAP], "both slots admitted");
+    assert!(
+        pool.spawn_connect(connect_addr, config.clone(), |_t| async {})
+            .is_none(),
+        "connect past the per-core cap must be refused"
+    );
+
+    // Release the held connections; their guards free the admission slots.
+    gate.add_permits(CAP);
+    for (i, h) in held.into_iter().enumerate() {
+        h.await
+            .unwrap_or_else(|e| panic!("held {i} panicked: {e}"))
+            .unwrap_or_else(|e| panic!("held {i} connect failed: {e}"));
+    }
+    server.await.expect("server task panicked");
+
+    // Every slot is freed again once the connections have been reclaimed.
+    assert_eq!(pool.admitted_counts(), vec![0], "slots freed after close");
 
     pool.shutdown();
     drop(probe);

@@ -305,7 +305,7 @@ pub(crate) fn effective_max_outstanding(
 /// [`usize::MAX`] to model an unbounded device). The `send_cq_depth` is
 /// `max_outstanding + headroom` and `recv_cq_depth` is `max_outstanding + 2`,
 /// so `reserve = headroom.max(2)` slots are held back from `device_limit`.
-fn clamp_max_outstanding(
+pub(crate) fn clamp_max_outstanding(
     ring_capacity: usize,
     max_message_size: usize,
     max_in_flight: Option<usize>,
