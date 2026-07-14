@@ -1,0 +1,15 @@
+[package]
+name = "rdma-io-busy"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+description = "Harness-layer per-core busy-poll worker pool for rdma-io read-ring transports"
+publish = false
+
+[dependencies]
+rdma-io = { workspace = true, features = ["tokio"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+core_affinity = "0.8"
+tracing.workspace = true

@@ -29,6 +29,8 @@
           --mode "{{ bench_mode | default('rh2') }}" \
           --transport "{{ bench_transport | default('send-recv') }}" \
           {{ '--require-mw' if (bench_require_mw | default(false) | bool) else '' }} \
+          --connections "{{ bench_connections | default(1) }}" \
+          --threads "{{ bench_threads | default(0) }}" \
           --in-flight "{{ bench_in_flight | default(1) }}" \
           --ring-max-msg "{{ bench_ring_max_msg | default(1500) }}" \
           --ring-queue-depth "{{ bench_ring_queue_depth | default(0) }}" \

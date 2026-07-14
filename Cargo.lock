@@ -1500,6 +1500,7 @@ dependencies = [
  "prost",
  "quinn",
  "rdma-io",
+ "rdma-io-busy",
  "rdma-io-quinn",
  "rdma-io-tonic",
  "serde",
@@ -1513,6 +1514,16 @@ dependencies = [
  "tonic-tls",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "rdma-io-busy"
+version = "0.0.1"
+dependencies = [
+ "core_affinity",
+ "rdma-io",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1538,7 +1549,6 @@ dependencies = [
 name = "rdma-io-tests"
 version = "0.1.0"
 dependencies = [
- "core_affinity",
  "futures-io",
  "futures-util",
  "http",
@@ -1547,6 +1557,7 @@ dependencies = [
  "quinn",
  "rcgen",
  "rdma-io",
+ "rdma-io-busy",
  "rdma-io-quinn",
  "rdma-io-sys",
  "rdma-io-tonic",

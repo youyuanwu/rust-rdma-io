@@ -518,8 +518,13 @@ strict driver→app round-robin, and app futures are cooperative. So:
 > D1 (`BusyPool` per-core worker pool + client sharding) and D2 (server accept via serialized
 > handshake) are done — MANA: 6-client/2-core busy↔arm-park echo both directions. D3 (aggregate CQ
 > sizing via `ReadRingConfig::wr_budget` + per-core admission cap + flush headroom) is done too —
-> MANA: cap-2 pool admits 2 / refuses the 3rd. **Not yet started:** D4 (thread-per-core bench
-> runner).
+> MANA: cap-2 pool admits 2 / refuses the 3rd. **D4 (bench integration) done:** the `BusyPool`
+> moved to a shared `rdma-io-busy` crate, and the **same** `rdma-bench-{client,server}` executables
+> gained an `echo-busy` mode whose `main` selects the busy runtime topology (N pinned `current_thread`
+> cores) instead of the arm-park multi-thread runtime. 2-VM MANA (8 conns, payload 64, in_flight 4):
+> `echo-busy` on 2 pinned cores = 938K rps, p50 32µs / p99 42µs, 2.13 cpu-µs/op vs arm-park `echo` on
+> 8 threads = 386K rps, p50 78µs / p99 131µs, 5.37 cpu-µs/op (0 errors both; the busy cores run at
+> ~100% under load, the honest cost).
 
 Do these before any busy-poll code; each is a small refactor or primitive **testable against
 arm-park alone**, so the new subsystem lands on clean seams rather than on today's scattered CQ
@@ -619,13 +624,14 @@ crate deps needed: an `AtomicWaker` (`atomic-waker` or `futures-util`'s `task`) 
   to a reused `qp_num` is a **fatal** invariant breach, validated by the rapid close/reconnect +
   `qp_num`-reuse stress test. **The background-reclaim model and shutdown-join protocol are
   specified in [Slice C part 2 design](#slice-c-part-2-design--background-reclaim-teardown-as-a-kernel-like-cleanup-task) below.**
-- **Slice D — setup handoff, server CM-ID routing, sharding + admission control. [D1–D3 done — see
+- **Slice D — setup handoff, server CM-ID routing, sharding + admission control. [D1–D4 done — see
   [Slice D design](#slice-d-design--multi-connection-sharded-and-measurable) below; MANA-validated
   busy↔arm-park echo (client- and server-pool) + admission cap.]** Add the per-core **`BusyPool`** +
   connection sharding (D1 — done), the server-side control task (D2 — done, serialized-handshake
   realization), aggregate shared-CQ sizing + per-core admission control + reserved flush headroom
-  (D3 — done, §7.2), and the **distinct pinned-`current_thread` thread-per-core bench runner** (D4,
-  §11). Then run echo / rh1 thread-per-core and measure p50/p99 + `cpu_us_per_op` vs arm-park.
+  (D3 — done, §7.2), and the **`echo-busy` bench mode** wired into the existing
+  `rdma-bench-{client,server}` executables (D4 — implemented, §11). Then run echo thread-per-core and
+  measure p50/p99 + `cpu_us_per_op` vs arm-park.
 
 Slices A and B are low-risk and unlock everything downstream; C is the correctness crux under MANA
 churn; D makes it multi-connection and measurable. Per §12, correctness scenarios run on **both rxe
@@ -891,7 +897,8 @@ cannot co-locate and falls back to the cross-core channel above.
   build against them — but creation still runs on the owner thread.
 - Testable by generalizing the loopback echo test to K connections on a 2-core pool.
 
-> **Implemented (Slice D1).** `BusyPool` (harness-layer, in `rdma-io-tests`): `new(ctx, core_ids,
+> **Implemented (Slice D1).** `BusyPool` (harness-layer, in the shared `rdma-io-busy` crate — see
+> D4): `new(ctx, core_ids,
 > send_depth, recv_depth)` spawns one pinned OS thread per core, each running a `current_thread`
 > runtime whose `block_on` future *is* its `CoreDriver::run()` loop (a `std::mpsc` handshake returns
 > the runtime + driver handle once the driver is up). `spawn_connect(addr, cfg, app)` round-robins,
@@ -960,18 +967,45 @@ The fixed 1024-entry CQs of Slices B/C do not scale. Size and gate:
 > the round-robin core if full (rather than reject a pending accept; server-side reject/redirect is
 > the follow-up). Validated on MANA: cap-2 pool admits 2, refuses the 3rd, frees on close.
 
-#### D4 — Thread-per-core bench runner + measurement
+#### D4 — Bench integration + measurement
 
-- A **distinct runner** (a separate code path, *not* a `--busy` flag on the multi-thread harness —
-  §11): `run_echo_busy` builds a `BusyPool`, shards connections, and runs the existing
-  `client_conn_loop` / `server_conn_loop` per connection on its core's runtime. It reuses
-  `BenchMetrics` / `BenchResult` so the numbers line up with the arm-park modes.
-- Expose it as new bench **modes** (e.g. `echo-busy`, `rh1-busy`) in the bench CLI and `echo-matrix`,
-  with `cpus=` selecting the pool size.
-- **Measure** echo and rh1 thread-per-core vs arm-park: `throughput_rps`, latency **p50/p99**, and
+- **Same executables, redesigned `main`.** Rather than a separate binary, the existing
+  `rdma-bench-client` / `rdma-bench-server` gain a new **`--mode echo-busy`**. The redesign moves the
+  runtime-topology choice *up into `main`*: `main` parses args first, and for `echo-busy` builds a
+  small single-threaded **orchestration** runtime (probe + awaiting the pool's per-connection handles
+  + the resource sampler) and delegates the data path to a `BusyPool`; every other mode keeps the
+  arm-park multi-thread runtime unchanged. A **single `--threads N` knob** is the process's CPU
+  budget, interpreted per mode: worker threads for the arm-park runtime (`0` = tokio default, one per
+  core), or the number of pinned busy-poll cores for `echo-busy`. The server also takes
+  `--connections` (how many to accept).
+- **Shared crate.** `BusyPool` moved out of `rdma-io-tests` into a new **`rdma-io-busy`** crate that
+  both the integration tests and the bench binaries depend on, keeping it out of the runtime-agnostic
+  `rdma-io` core.
+- **Reuse.** The `echo-busy` client shards `connections` read-ring connections across the pool with
+  `BusyPool::with_config` (right-sized shared CQs + per-core admission) and runs the **existing**
+  `client_conn_loop` per connection on-core; the server accepts exactly `connections` via
+  `BusyPool::serve` and runs the existing `server_conn_loop` on-core. Both reuse `BenchMetrics` /
+  `BenchResult`, so busy-poll and arm-park numbers are directly comparable. The device context is a
+  probe `cm_id` resolving the connect/bind address (librdmacm's per-device context); the server's
+  `--bind` must be a concrete RoCE IP, which the bench playbook already supplies.
+- **Measure** echo thread-per-core vs arm-park: `throughput_rps`, latency **p50/p99**, and
   **`cpu_us_per_op`**. Busy-poll trades CPU for latency, so `cpu_us_per_op` is the honest cost axis —
   a throughput win that costs a pinned core at 100% must be read against it. Record under
-  `docs/bench/` with the reboot-between methodology.
+  `docs/bench/` with the reboot-between methodology. (`rh1-busy` is the documented follow-up: it needs
+  the `AsyncRdmaStream` adapter driven on-core.)
+
+> **Implemented (Slice D4).** `BusyPool` moved to the shared **`rdma-io-busy`** crate (workspace
+> member; `rdma-io-tests` and `tests/rdma-io-bench` both depend on it). Both bench mains were
+> redesigned to branch on `--mode echo-busy` *before* building a runtime — busy uses a
+> `current_thread` orchestration runtime + `BusyPool`, arm-park keeps the multi-thread runtime. New
+> `echo::run_read_ring_busy_{client,server}` reuse `client_conn_loop` / `server_conn_loop` and the
+> `BenchResult` reporting. A single **`--threads`** knob is the per-process CPU budget in both modes
+> (arm-park worker threads / busy pinned cores; `0` = tokio default all-cores, preserving the arm-park
+> server), plus `--connections` (server); the bench playbook forwards both. Local: workspace clippy
+> `-D warnings` + fmt + 27 unit tests clean; all test
+> binaries (incl. the relocated busy-pool tests importing `rdma_io_busy`) compile. 2-VM MANA (fresh
+> NIC): `echo-busy` 8 conns / 2 pinned cores = 938K rps, p50 32µs / p99 42µs, 0 err, clean
+> SIGTERM drain; arm-park `echo` regression green (386K rps, unchanged path).
 
 #### Ordering and risk
 
@@ -990,8 +1024,10 @@ stream, cap enforcement) run on **both rxe and MANA**.
   long-lived heavy connection cannot be migrated cheaply (its QP/CQ/slot are core-affine).
 - **Admission vs utilization.** Conservative CQ sizing caps connections per core; too tight wastes
   the core, too loose risks overrun. Needs empirical tuning per NIC (`max_cqe`, doorbell counts).
-- **Benchmark harness shape.** Busy-poll is N pinned `current_thread` runtimes with sharding — a
-  distinct runner from the current multi-thread `Send` harness, not a drop-in flag.
+- **Benchmark harness shape.** Busy-poll is N pinned `current_thread` runtimes with sharding, a
+  different runtime topology from the multi-thread `Send` harness. Rather than a separate binary it
+  is selected by `--mode echo-busy` in the **same** `rdma-bench-{client,server}` executables, whose
+  `main` branches on the mode to build the busy runtime topology before any arm-park runtime (D4).
 - **Platform.** Read-ring only, RoCE/IB only (Write+Imm; no iWARP/siw). Extending to other
   transports is Phase 4.
 

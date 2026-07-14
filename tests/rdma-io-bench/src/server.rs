@@ -41,6 +41,25 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     in_flight: usize,
 
+    /// Number of connections to accept in `--mode echo-busy` (must match the
+    /// client's --connections). The busy-poll server accepts exactly this many
+    /// read-ring connections, sharded across the pinned cores, then echoes each
+    /// on its owning core until the peers disconnect or a shutdown signal
+    /// arrives. Ignored by the arm-park modes (which accept unbounded
+    /// connections until shutdown).
+    #[arg(long, default_value_t = 2)]
+    connections: usize,
+
+    /// Executor budget — how many CPUs the server uses. In the arm-park modes
+    /// it is the number of tokio multi-thread worker threads (`0` = tokio
+    /// default, one per core — the historical behaviour). In `--mode echo-busy`
+    /// it is the number of **pinned busy-poll cores** in the pool (each spins
+    /// one `CoreDriver` over its shared CQs; connections are sharded round-robin
+    /// and are core-affine for life). Match the client's `--threads` for a fair
+    /// CPU comparison.
+    #[arg(long, default_value_t = 0)]
+    threads: usize,
+
     /// Ring transport `max_message_size` in bytes (ring transports; `echo` and
     /// `rh2`): the largest payload carried in a single RDMA message. In `echo`
     /// mode a larger payload is truncated to this; in `rh2` (gRPC byte stream) a
@@ -136,8 +155,7 @@ fn ring_config_credit(args: &Args) -> CreditRingConfig {
     config
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_ansi(false)
         .with_writer(std::io::stderr)
@@ -145,6 +163,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
+
+    // Busy-poll (`--mode echo-busy`) runs its data path on the BusyPool's pinned
+    // `current_thread` runtimes, so `main` uses only a small single-threaded
+    // orchestration runtime; the arm-park modes use the multi-thread runtime.
+    if args.mode == "echo-busy" {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        return rt.block_on(run_echo_busy_server(&args));
+    }
+
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    // `--threads 0` = tokio's default (one worker per core, the historical
+    // server behaviour); otherwise cap the worker pool.
+    if args.threads > 0 {
+        builder.worker_threads(args.threads);
+    }
+    let rt = builder.build()?;
+    rt.block_on(run_arm_park(args))
+}
+
+/// Dispatch the arm-park (interrupt-driven) server modes on the multi-thread
+/// runtime.
+async fn run_arm_park(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let opts = args.server_opts();
 
     match args.mode.as_str() {
@@ -155,10 +198,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "tcp1" => h1::run_tcp1_server(&opts, shutdown_signal()).await,
         "echo" => run_echo_server(args).await,
         other => {
-            eprintln!("Unknown mode: {other}. Supported: rh2, rh3, tcp, rh1, tcp1, echo");
+            eprintln!(
+                "Unknown mode: {other}. Supported: rh2, rh3, tcp, rh1, tcp1, echo, echo-busy"
+            );
             std::process::exit(1);
         }
     }
+}
+
+/// Busy-poll read-ring echo server (`--mode echo-busy`). The counterpart to the
+/// client's `run_echo_busy_client`: accepts exactly `--connections` read-ring
+/// connections across `--threads` pinned cores and echoes each on its owning
+/// core. Only the read-ring transport is supported.
+async fn run_echo_busy_server(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    if args.transport != "read-ring" && args.transport != "send-recv" {
+        eprintln!(
+            "note: --mode echo-busy uses the read-ring transport; ignoring --transport {}",
+            args.transport
+        );
+    }
+    let mut config = ReadRingConfig::datagram().with_memory_window_mode(mw_mode(args.require_mw));
+    config.max_message_size = args.ring_max_msg;
+    config.max_in_flight = ring_max_in_flight(args.ring_queue_depth, args.in_flight);
+    echo::run_read_ring_busy_server(
+        args.bind,
+        config,
+        args.threads,
+        args.connections,
+        shutdown_signal(),
+    )
+    .await
 }
 
 /// Build the selected RDMA transport for `rh2` and serve gRPC.

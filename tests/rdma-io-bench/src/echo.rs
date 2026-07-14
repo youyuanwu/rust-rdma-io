@@ -32,8 +32,12 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
-use rdma_io::async_cm::AsyncCmListener;
+use rdma_io::async_cm::{AsyncCmId, AsyncCmListener};
+use rdma_io::cm::PortSpace;
+use rdma_io::device::Context;
+use rdma_io::read_ring_transport::ReadRingConfig;
 use rdma_io::transport::{RecvCompletion, Transport, TransportBuilder};
+use rdma_io_busy::BusyPool;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Semaphore};
@@ -427,6 +431,193 @@ where
     }
 
     eprintln!("Echo server draining");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Busy-poll read-ring echo (thread-per-core BusyPool)
+// ---------------------------------------------------------------------------
+
+/// Probe for the shared per-device verbs context that backs the pool's per-core
+/// driver CQs.
+///
+/// librdmacm caches **one** `ibv_context` per device across cm_ids, so a
+/// throwaway cm_id that merely *resolves* `addr` yields the context every QP
+/// built on that device will share — which is exactly the context the pool's
+/// shared CQs must live on. The returned cm_id must be kept alive for the pool's
+/// lifetime (it owns that cached context).
+async fn probe_device_context(
+    addr: SocketAddr,
+) -> Result<(AsyncCmId, Arc<Context>), Box<dyn std::error::Error>> {
+    let probe = AsyncCmId::new(PortSpace::Tcp)?;
+    probe.resolve_addr(None, &addr, 2000).await?;
+    let ctx = probe
+        .verbs_context()
+        .ok_or("probe cm_id has no verbs context (device address did not resolve)")?;
+    Ok((probe, ctx))
+}
+
+/// Run the busy-poll read-ring echo **client**: build a [`BusyPool`] over
+/// `busy_cores` pinned cores, shard `connections` read-ring connections
+/// round-robin across them, and drive each connection's pipelined echo loop
+/// **on its owning core**.
+///
+/// Reuses [`client_conn_loop`] and the same [`BenchResult`] reporting as the
+/// arm-park echo client (`run_transport_echo_client`), so busy-poll and arm-park
+/// numbers are directly comparable — the only difference is the completion
+/// driver and the runtime topology. `busy_cores` is the executor pool size (the
+/// `threads` analogue), so `cpu_us_per_op` reads against a known number of
+/// pinned cores.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_read_ring_busy_client(
+    addr: SocketAddr,
+    config: ReadRingConfig,
+    busy_cores: usize,
+    connections: usize,
+    in_flight: usize,
+    payload: usize,
+    warmup: u64,
+    duration: u64,
+    report: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cores = busy_cores.max(1);
+    let (probe, ctx) = probe_device_context(addr).await?;
+
+    let conns_per_core = connections.max(1).div_ceil(cores);
+    let core_ids: Vec<usize> = (0..cores).collect();
+    let pool = BusyPool::with_config(ctx, &core_ids, &config, conns_per_core)?;
+    eprintln!(
+        "Busy-poll echo client: {cores} pinned core(s), {connections} read-ring connection(s) \
+         ({conns_per_core}/core), in_flight={in_flight}"
+    );
+
+    let payload_buf: Arc<[u8]> = vec![b'x'; payload].into();
+    let target = in_flight.max(1);
+    let warmup_deadline = Instant::now() + Duration::from_secs(warmup);
+    let bench_deadline = warmup_deadline + Duration::from_secs(duration);
+    eprintln!("Warming up {warmup}s, then benchmarking {duration}s...");
+
+    let sampler = spawn_resource_sampler(warmup_deadline, bench_deadline);
+
+    // Shard the connections onto the pool. Each `connect_busy` setup *and* its
+    // echo loop run on the owning core (co-location, §7.5); the JoinHandle
+    // yields the per-connection latency histogram + error count.
+    let mut handles = Vec::with_capacity(connections);
+    for _ in 0..connections {
+        let p = payload_buf.clone();
+        let cfg = config.clone();
+        let handle = pool
+            .spawn_connect(addr, cfg, move |t| {
+                client_conn_loop(t, p, target, warmup_deadline, bench_deadline)
+            })
+            .ok_or("busy pool refused a connection (per-core admission cap reached)")?;
+        handles.push(handle);
+    }
+
+    let mut merged = new_histogram();
+    let mut errors = 0u64;
+    for (i, h) in handles.into_iter().enumerate() {
+        match h.await {
+            Ok(Ok((hist, errs))) => {
+                errors += errs;
+                merged.add(&hist).expect("merge histograms");
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(conn_id = i, error = %e, "busy echo connect_busy failed");
+                errors += 1;
+            }
+            Err(e) => tracing::warn!(conn_id = i, error = %e, "busy echo client task panicked"),
+        }
+    }
+
+    let (cpu_seconds, peak_rss) = sampler.await.unwrap_or((0.0, 0));
+
+    report_result(
+        &merged,
+        "read-ring",
+        connections,
+        cores,
+        target,
+        duration,
+        payload,
+        errors,
+        cpu_seconds,
+        peak_rss,
+        report,
+    );
+
+    // Every connection's JoinHandle has been awaited (each transport `Drop`
+    // handed its resources to its core's reclaim queue); now stop the drivers
+    // (draining reclaim) and join the pinned threads before releasing the probe.
+    pool.shutdown();
+    drop(probe);
+    Ok(())
+}
+
+/// Run the busy-poll read-ring echo **server**: build a [`BusyPool`] over
+/// `busy_cores` pinned cores, accept exactly `connections` read-ring
+/// connections (round-robin across cores, handshake serialized), and echo on
+/// each connection's owning core until the peers disconnect or `shutdown`
+/// resolves.
+///
+/// The device context is probed by resolving the server's own `bind` address
+/// (it routes over the local RoCE device), so `bind` must be a concrete RDMA IP,
+/// not the unspecified address.
+pub async fn run_read_ring_busy_server<S>(
+    bind: SocketAddr,
+    config: ReadRingConfig,
+    busy_cores: usize,
+    connections: usize,
+    shutdown: S,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    S: Future<Output = ()>,
+{
+    if bind.ip().is_unspecified() {
+        return Err(format!(
+            "busy-poll echo server needs a concrete --bind RDMA address to probe the device \
+             context, but got the unspecified address {bind}; bind to the NIC's RoCE IP \
+             (e.g. 10.0.1.5:50051)"
+        )
+        .into());
+    }
+    let cores = busy_cores.max(1);
+    // Resolve our own bind address to obtain the shared device context (keep the
+    // probe cm_id alive for the pool's lifetime).
+    let (probe, ctx) = probe_device_context(bind).await?;
+
+    let conns_per_core = connections.max(1).div_ceil(cores);
+    let core_ids: Vec<usize> = (0..cores).collect();
+    let pool = BusyPool::with_config(ctx, &core_ids, &config, conns_per_core)?;
+
+    let listener = Arc::new(AsyncCmListener::bind(&bind)?);
+    let local = listener.local_addr();
+    eprintln!(
+        "Busy-poll echo server listening on {local:?}: {cores} pinned core(s), accepting \
+         {connections} read-ring connection(s) ({conns_per_core}/core)"
+    );
+
+    // Accept exactly `connections` (serialized handshake), each echoing on its
+    // owning core until its peer disconnects.
+    let handles = pool
+        .serve(listener, config, connections, server_conn_loop)
+        .await;
+
+    // Hold until every connection closes (clients finished) or a shutdown signal
+    // arrives, then stop the drivers (draining reclaim) and join the threads.
+    let all_closed = async {
+        for h in handles {
+            let _ = h.await;
+        }
+    };
+    tokio::pin!(shutdown);
+    tokio::select! {
+        _ = all_closed => eprintln!("Busy-poll echo server: all connections closed"),
+        _ = &mut shutdown => eprintln!("Busy-poll echo server: shutdown signal received, draining"),
+    }
+
+    pool.shutdown();
+    drop(probe);
     Ok(())
 }
 

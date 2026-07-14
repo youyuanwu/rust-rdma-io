@@ -1,8 +1,6 @@
 // This crate's tests live in the `tests/` directory as integration tests.
 // The build.rs generates protobuf code used by tonic_tests.rs.
 
-pub mod busy_pool;
-
 /// Shared test helpers for RDMA integration tests.
 pub mod test_helpers {
     use std::net::SocketAddr;

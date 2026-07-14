@@ -13,6 +13,7 @@ path = "src/client.rs"
 
 [dependencies]
 rdma-io = { path = "../../rdma-io", features = ["tokio"] }
+rdma-io-busy = { path = "../../rdma-io-busy" }
 rdma-io-tonic = { path = "../../rdma-io-tonic", features = ["tls"] }
 rdma-io-quinn = { path = "../../rdma-io-quinn" }
 tonic.workspace = true

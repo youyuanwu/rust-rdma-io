@@ -20,7 +20,7 @@ use rdma_io::async_cm::AsyncCmId;
 use rdma_io::cm::PortSpace;
 use rdma_io::read_ring_transport::{ReadRingConfig, ReadRingTransport};
 use rdma_io::transport::{RecvCompletion, Transport};
-use rdma_io_tests::busy_pool::BusyPool;
+use rdma_io_busy::BusyPool;
 use rdma_io_tests::require_no_iwarp;
 use rdma_io_tests::test_helpers::{bind_listener_with_retry, connect_addr_for};
 

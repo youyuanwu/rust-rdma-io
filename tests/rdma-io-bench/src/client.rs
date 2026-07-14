@@ -34,11 +34,14 @@ struct Args {
     #[arg(long, default_value_t = false)]
     require_mw: bool,
 
-    /// Number of tokio runtime worker threads (executor pool size). This is
-    /// NOT a load dimension: the offered load is driven by --connections
-    /// (each connection is one task) times --in-flight, so raising --threads
-    /// only changes how many OS threads service the async tasks, not the
-    /// request concurrency.
+    /// Executor budget — how many CPUs this process uses. In the arm-park modes
+    /// (`rh2`/`rh3`/`rh1`/`tcp`/`tcp1`/`echo`) it is the number of tokio
+    /// multi-thread worker threads (`0` = tokio default, one per core); it is
+    /// NOT a load dimension (offered load is `--connections` × `--in-flight`).
+    /// In `--mode echo-busy` it is the number of **pinned busy-poll cores** in
+    /// the pool (each runs one `CoreDriver` spinning `ibv_poll_cq`; connections
+    /// are sharded round-robin and are core-affine for life). Both peers should
+    /// use the same value for a fair CPU comparison.
     #[arg(long, default_value_t = 2)]
     threads: usize,
 
@@ -157,10 +160,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(args.threads)
-        .enable_all()
-        .build()?;
+    // Busy-poll (`--mode echo-busy`) has its own runtime topology: the data path
+    // runs on the BusyPool's N pinned `current_thread` runtimes, so `main` uses
+    // only a small single-threaded orchestration runtime (probe + awaiting the
+    // pool's per-connection handles + the resource sampler) rather than the
+    // multi-thread worker pool the arm-park modes drive.
+    if args.mode == "echo-busy" {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        return rt.block_on(run_echo_busy_client(&args));
+    }
+
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    // `--threads 0` = tokio's default (one worker per core); otherwise cap.
+    if args.threads > 0 {
+        builder.worker_threads(args.threads);
+    }
+    let rt = builder.build()?;
 
     rt.block_on(run(args))
 }
@@ -176,10 +194,41 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         "tcp1" => h1::run_tcp1_client(&opts).await,
         "echo" => run_echo_bench(&args).await,
         other => {
-            eprintln!("Unknown mode: {other}. Supported: rh2, rh3, tcp, rh1, tcp1, echo");
+            eprintln!(
+                "Unknown mode: {other}. Supported: rh2, rh3, tcp, rh1, tcp1, echo, echo-busy"
+            );
             std::process::exit(1);
         }
     }
+}
+
+/// Busy-poll read-ring echo client (`--mode echo-busy`). Builds the read-ring
+/// config from the same ring knobs as `echo`, then drives it through the
+/// thread-per-core [`BusyPool`](rdma_io_busy::BusyPool). Only the read-ring
+/// transport is supported (busy-poll is a read-ring completion mode).
+async fn run_echo_busy_client(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    if args.transport != "read-ring" && args.transport != "send-recv" {
+        eprintln!(
+            "note: --mode echo-busy uses the read-ring transport; ignoring --transport {}",
+            args.transport
+        );
+    }
+    warn_ring_payload(args.payload, args.ring_max_msg);
+    let mut config = ReadRingConfig::datagram().with_memory_window_mode(mw_mode(args.require_mw));
+    config.max_message_size = args.ring_max_msg;
+    config.max_in_flight = ring_max_in_flight(args.ring_queue_depth, args.in_flight);
+    echo::run_read_ring_busy_client(
+        args.connect,
+        config,
+        args.threads,
+        args.connections,
+        args.in_flight,
+        args.payload,
+        args.warmup,
+        args.duration,
+        &args.report,
+    )
+    .await
 }
 
 /// Build the selected RDMA transport for `rh2` and drive the gRPC client.
