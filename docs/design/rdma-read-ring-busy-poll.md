@@ -566,6 +566,56 @@ access. Grounded in the current code:
 4. **Phase 4 — scale-out.** Least-loaded sharding, SMT-aware placement, NUMA-aware Context/PD, and
    extending the same driver to send-recv / credit-ring.
 
+### Phase 1 implementation slices
+
+Phase 1 is the largest single chunk in this design, so it is **sliced into four independently
+landable commits** rather than one drop. Each slice is testable on its own, and the ordering front-
+loads the low-risk library work so the churn-sensitive teardown lands on proven primitives.
+
+**What already exists (Phase 1 builds on, does not create):** the poll-only shared CQ
+([`CompletionQueue::new`](../../rdma-io/src/cq.rs) — null comp_channel, no fd/interrupt); QP-against-
+arbitrary-CQ ([`create_qp_with_cq`](../../rdma-io/src/async_cm.rs)); the poster QP
+([`AsyncQp::new_poster`](../../rdma-io/src/async_qp.rs)); the single-variant, additive seam
+([`CompletionSource`](../../rdma-io/src/completion_source.rs)); the forced-flush primitive
+(`to_error()`, P1); and the routing key ([`WorkCompletion::qp_num()`](../../rdma-io/src/wc.rs)). New
+crate deps needed: an `AtomicWaker` (`atomic-waker` or `futures-util`'s `task`) and `core_affinity`.
+
+- **Slice A — `ConnSlot` + `DriverSource` primitives (no driver, no hardware).** Add `ConnSlot`
+  (per-direction bounded inbox sized overflow-free per §7.2, an `AtomicWaker` per direction with the
+  §7.3 register–check–recheck ordering, the separate send/recv WR counters of §6.2, and the
+  `Connecting/Established/Closing/Drained` lifecycle state), the `Driver(DriverSource)` variant +
+  `poll_inbox`, and the §7.5 owner-worker token guard. Pure library code; unit-test with a fake
+  producer feeding the inbox — covers the completion-arrived-before-registration race, both-
+  directions wake, coalesced wakes, and counter underflow = fatal. Builds and tests **locally, no
+  RDMA device**. Keeps `CompletionSource` compiling in both variants.
+- **Slice B — `CoreDriver` + single connection, read-ring, one pinned core.** Add the `CoreDriver`
+  task (sole reaper of one shared send/recv CQ pair, `qp_num → Arc<ConnSlot>` map, the bounded
+  cooperative loop of §5.2 with `MAX_CQE_PER_CQ`/`MAX_CQE_PER_TURN` + `yield_now`, unknown-`qp_num`
+  = fatal per §4.2), build the read-ring QP against the shared CQs, route setup drain and the data
+  path through `DriverSource`. Scope: **one connection, one core, pinned `current_thread` runtime**
+  (§4.1). Proves the data path end-to-end on hardware without any of the multi-connection or reuse
+  hazards. Preserves the single-owner send-CQ invariant (§8) — the driver is that owner.
+- **Slice C — teardown barrier + `ResourceBundle` (the churn-critical slice).** Add the transferable
+  `ResourceBundle` and the §6.2 protocol: `Drop`/cancel/setup-failure `take()`s the bundle onto the
+  driver's **reclaim queue** (RAII destroys nothing), the driver forces the QP to `ERR`
+  (`to_error()`), keeps routing that QP's flush CQEs and decrementing accounting until **both
+  counters zero and both inboxes empty**, then destroys MWs → QP → MRs in order and **retires** the
+  `qp_num` (bump generation; reuse legal only after retirement). This is where MANA churn
+  correctness concentrates — a stale CQE mis-routed to a reused `qp_num` is a **fatal** invariant
+  breach, not a droppable event. Validate with rapid close/reconnect + `qp_num`-reuse stress on a
+  fresh NIC, and driver-task-panic / runtime-shutdown reclaim.
+- **Slice D — setup handoff, server CM-ID routing, sharding + admission control.** Add the
+  `Connecting`-slot setup handoff (§6.1), the server-side **CM-ID-keyed** control-task routing state
+  machine (per-`CmId` `pending` map, dispatch resource creation to the owning worker, migrate the
+  `CmId` to a per-connection channel for `poll_disconnect`), aggregate shared-CQ sizing + per-core
+  admission control + reserved flush headroom (§7.2), and the **new pinned-`current_thread`
+  thread-per-core bench runner** with connection sharding (a distinct runner, not a flag — §11).
+  Then run echo / rh1 thread-per-core and measure p50/p99 + `cpu_us_per_op` vs arm-park.
+
+Slices A and B are low-risk and unlock everything downstream; C is the correctness crux under MANA
+churn; D makes it multi-connection and measurable. Per §12, correctness scenarios run on **both rxe
+and MANA**, and every slice keeps the **arm-park regression suite green**.
+
 ## 11. Risks and open questions
 
 - **CPU cost.** Pure spin burns a core per poller; viable only when latency justifies dedicating
