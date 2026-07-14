@@ -210,11 +210,14 @@ impl Default for ReadRingConfig {
 // ReadRingTransport
 // ---------------------------------------------------------------------------
 
-/// Ring-buffer RDMA transport using RDMA Read–based flow control.
+/// The RDMA-owning half of [`ReadRingTransport`]: every verbs/CM object plus the
+/// transport's live protocol state. Held behind an `Option` in the wrapper so
+/// teardown can `take()` it out (arm-park drains it inline; busy-poll hands it
+/// to the driver's reclaim queue — §6.2 / §10).
 ///
 /// Field ordering is critical: Rust drops fields in declaration order.
 /// MW2 → MW1 → QP → MRs → PD.
-pub struct ReadRingTransport {
+struct ReadRingInner {
     // -- Connection state --
     disconnected: bool,
     peer_disconnected: bool,
@@ -299,7 +302,39 @@ pub struct ReadRingTransport {
     event_channel: EventChannel,
 }
 
+/// Ring-buffer RDMA transport using RDMA Read–based flow control.
+///
+/// A thin wrapper over [`ReadRingInner`]: the RDMA/CM resources and live
+/// protocol state live in `inner`, held behind an `Option` so teardown can move
+/// them out (`Drop` `take()`s it). See §6.2 / §10 for the reclaim protocol.
+pub struct ReadRingTransport {
+    inner: Option<ReadRingInner>,
+}
+
 impl ReadRingTransport {
+    /// Whether an RDMA-Read is currently outstanding on the send stream.
+    /// Test/observability hook; delegates to [`ReadRingInner`].
+    #[doc(hidden)]
+    pub fn read_in_flight(&self) -> bool {
+        self.inner.as_ref().is_some_and(|i| i.read_in_flight())
+    }
+
+    #[inline]
+    fn inner(&self) -> &ReadRingInner {
+        self.inner
+            .as_ref()
+            .expect("ReadRingInner used after teardown take()")
+    }
+
+    #[inline]
+    fn inner_mut(&mut self) -> &mut ReadRingInner {
+        self.inner
+            .as_mut()
+            .expect("ReadRingInner used after teardown take()")
+    }
+}
+
+impl ReadRingInner {
     /// Returns a reference to the local offset buffer (AtomicU32).
     ///
     /// The offset buffer lives inside `_offset_mr`, which is pinned by ibverbs
@@ -710,7 +745,7 @@ impl ReadRingTransport {
             qp.post_recv_wr(&mut wr)?;
         }
 
-        Ok(Self::from_parts(
+        let inner = ReadRingInner::from_parts(
             qp,
             send_src,
             recv_src,
@@ -732,7 +767,8 @@ impl ReadRingTransport {
             peer_token.offset_rkey,
             max_outstanding,
             config,
-        ))
+        );
+        Ok(ReadRingTransport { inner: Some(inner) })
     }
 
     /// Accept an incoming connection (server side), arm-park mode.
@@ -881,7 +917,7 @@ impl ReadRingTransport {
             qp.post_recv_wr(&mut wr)?;
         }
 
-        Ok(Self::from_parts(
+        let inner = ReadRingInner::from_parts(
             qp,
             send_src,
             recv_src,
@@ -903,9 +939,12 @@ impl ReadRingTransport {
             peer_token.offset_rkey,
             max_outstanding,
             config,
-        ))
+        );
+        Ok(ReadRingTransport { inner: Some(inner) })
     }
+}
 
+impl ReadRingInner {
     #[allow(clippy::too_many_arguments)]
     fn from_parts(
         qp: AsyncQp,
@@ -1054,7 +1093,7 @@ impl ReadRingTransport {
     }
 }
 
-impl Transport for ReadRingTransport {
+impl Transport for ReadRingInner {
     /// Copy data into the send ring and post an RDMA Write + Immediate Data.
     ///
     /// Returns the number of bytes accepted, or `Ok(0)` if the transport
@@ -1511,8 +1550,66 @@ impl Transport for ReadRingTransport {
     }
 }
 
-impl Drop for ReadRingTransport {
-    fn drop(&mut self) {
+impl Transport for ReadRingTransport {
+    fn send_copy(&mut self, data: &[u8]) -> crate::Result<usize> {
+        self.inner_mut().send_copy(data)
+    }
+
+    fn send_gather(&mut self, bufs: &[std::io::IoSlice<'_>]) -> crate::Result<usize> {
+        self.inner_mut().send_gather(bufs)
+    }
+
+    fn poll_send_completion(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
+        self.inner_mut().poll_send_completion(cx)
+    }
+
+    fn sends_in_flight(&self) -> usize {
+        self.inner().sends_in_flight()
+    }
+
+    fn recv_window(&self) -> usize {
+        self.inner().recv_window()
+    }
+
+    fn poll_recv(
+        &mut self,
+        cx: &mut Context<'_>,
+        out: &mut [RecvCompletion],
+    ) -> Poll<crate::Result<usize>> {
+        self.inner_mut().poll_recv(cx, out)
+    }
+
+    fn recv_buf(&self, buf_idx: usize) -> &[u8] {
+        self.inner().recv_buf(buf_idx)
+    }
+
+    fn repost_recv(&mut self, buf_idx: usize) -> crate::Result<()> {
+        self.inner_mut().repost_recv(buf_idx)
+    }
+
+    fn poll_disconnect(&mut self, cx: &mut Context<'_>) -> bool {
+        self.inner_mut().poll_disconnect(cx)
+    }
+
+    fn disconnect(&mut self) -> crate::Result<()> {
+        self.inner_mut().disconnect()
+    }
+
+    fn local_addr(&self) -> Option<SocketAddr> {
+        self.inner().local_addr()
+    }
+
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        self.inner().peer_addr()
+    }
+}
+
+impl ReadRingInner {
+    /// Bounded, synchronous teardown drain (arm-park path). Forces the QP to
+    /// `ERR` so every outstanding WR flushes a CQE, then reaps those flushes so
+    /// the QP releases its MR references before `self` is dropped (whose field
+    /// order frees MW2 → MW1 → QP → MRs → PD).
+    fn drain_teardown(&mut self) {
         // Optionally notify the peer, then force a *deterministic* local flush.
         // `cm_id.disconnect()` is asynchronous: draining right after it races the
         // QP's transition to ERROR and can reap zero completions while WRs are
@@ -1560,6 +1657,19 @@ impl Drop for ReadRingTransport {
                     Err(_) => recv_expected = 0,
                 }
             }
+        }
+    }
+}
+
+impl Drop for ReadRingTransport {
+    fn drop(&mut self) {
+        // Move the RDMA/CM resources out and drain them synchronously (arm-park
+        // path). The busy-poll reclaim handoff (§6.2 / §10) replaces this branch
+        // in Slice C part 2; today both modes take this path (a driver source's
+        // `try_drain` is a no-op, so busy simply relies on `ibv_destroy_qp`).
+        if let Some(mut inner) = self.inner.take() {
+            inner.drain_teardown();
+            // `inner` drops here: MW2 → MW1 → QP → MRs → PD (field order).
         }
     }
 }
