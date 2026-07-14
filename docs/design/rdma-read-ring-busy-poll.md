@@ -615,13 +615,13 @@ crate deps needed: an `AtomicWaker` (`atomic-waker` or `futures-util`'s `task`) 
   to a reused `qp_num` is a **fatal** invariant breach, validated by the rapid close/reconnect +
   `qp_num`-reuse stress test. **The background-reclaim model and shutdown-join protocol are
   specified in [Slice C part 2 design](#slice-c-part-2-design--background-reclaim-teardown-as-a-kernel-like-cleanup-task) below.**
-- **Slice D — setup handoff, server CM-ID routing, sharding + admission control.** Add the
-  `Connecting`-slot setup handoff (§6.1), the server-side **CM-ID-keyed** control-task routing state
-  machine (per-`CmId` `pending` map, dispatch resource creation to the owning worker, migrate the
-  `CmId` to a per-connection channel for `poll_disconnect`), aggregate shared-CQ sizing + per-core
-  admission control + reserved flush headroom (§7.2), and the **new pinned-`current_thread`
-  thread-per-core bench runner** with connection sharding (a distinct runner, not a flag — §11).
-  Then run echo / rh1 thread-per-core and measure p50/p99 + `cpu_us_per_op` vs arm-park.
+- **Slice D — setup handoff, server CM-ID routing, sharding + admission control. [Designed — see
+  [Slice D design](#slice-d-design--multi-connection-sharded-and-measurable) below.]** Add the
+  per-core **`BusyPool`** + connection sharding (D1), the server-side **CM-ID-keyed** control-task
+  routing state machine (D2), aggregate shared-CQ sizing + per-core admission control + reserved
+  flush headroom (D3, §7.2), and the **distinct pinned-`current_thread` thread-per-core bench
+  runner** (D4, §11). Then run echo / rh1 thread-per-core and measure p50/p99 + `cpu_us_per_op` vs
+  arm-park.
 
 Slices A and B are low-risk and unlock everything downstream; C is the correctness crux under MANA
 churn; D makes it multi-connection and measurable. Per §12, correctness scenarios run on **both rxe
@@ -793,15 +793,104 @@ impl CoreDriver {
 }
 ```
 
-The transport-side change this forces is the **`Option<ReadRingInner>` split**: the RDMA-owning
-fields (listed above) move behind one option so `Drop` can `take()` them into a `ResourceBundle` in
-a single move — *no* per-field `Option`, since the inner is always freed whole on `Drained`. The
-scalar flow-control state (`disconnected`, `send_in_flight`, `cached_remote_head`, the virtual-idx
-map, etc.) stays inline on the transport, and the busy transport additionally holds the
-`Arc<ConnSlot>` and its `reclaim: CoreDriverHandle`. Arm-park keeps destroying its inner inline
-(today's P2 synchronous drain, restructured only to `take()` the inner and drain-then-drop it —
-behavior unchanged); busy hands it to the driver. That refactor — not the barrier logic — is the
-bulk of the Slice C part 2 diff, and the arm-park regression suite is the guard rail.
+The transport-side change this forces is the **`Option<ReadRingInner>` split** (shipped in
+`da8054a`): the RDMA/CM resources **and** the transport's live protocol state move into one plain
+`ReadRingInner`, and `ReadRingTransport` becomes a thin `{ inner: Option<ReadRingInner>, slot, reclaim }`
+wrapper that delegates the `Transport` trait to the inner — so `Drop` is a single `Option::take`. The
+busy wrapper additionally holds the `Arc<ConnSlot>` and its `reclaim: CoreDriverHandle`. Arm-park
+keeps destroying its inner inline (the P2 synchronous `drain_teardown`); busy hands it to the driver.
+That refactor — not the barrier logic — is the bulk of the Slice C part 2 diff, and the arm-park
+regression suite is the guard rail.
+
+### Slice D design — multi-connection, sharded, and measurable
+
+Slices A–C proved **one** busy connection per core end to end, including churn-safe teardown. Slice D
+makes busy-poll **multi-connection, multi-core, and benchmarkable** — the first slice that yields a
+head-to-head number vs arm-park. It splits into four independently-testable parts, each keeping the
+arm-park regression green (§12).
+
+**What A–C already give us.** `connect_busy`/`accept_busy` already create the QP against the driver's
+shared CQs, register a `Connecting` slot before the first post, route setup completions through the
+inbox, flip to `Established`, and reclaim on `Drop`. So the single-connection setup handoff (§6.1
+steps 1–3, client + inline accept) is **done**. What remains is everything that only appears with N
+connections across M cores: a server that fans accepts out to cores, per-core CQ budgeting,
+connection placement, and a runner that spins M pinned cores.
+
+#### D1 — Sharding + per-core worker pool (client first)
+
+- A **`BusyPool`**: M `current_thread` runtimes, one per pinned core
+  (`core_affinity::set_for_current`), each owning exactly one `CoreDriver` task plus its
+  `CoreDriverHandle`. The shared building block for client and server.
+- **Placement.** A connection is assigned to a core at creation and is core-affine for life (§4.1,
+  §7.5). Start **round-robin**; leave a `least-loaded` hook (per-core connection count) for later.
+  No migration — a live QP/CQ/slot cannot move cheaply.
+- **Client path.** To open N connections, round-robin them across the pool: `spawn` each
+  `connect_busy` future **onto its target core's runtime** so the QP is built against that core's
+  driver CQs *on that core's thread* (the owner-token requirement, §7.5). The device `ibv_context`
+  is shared per-device (librdmacm), so every core's CQs live on one context and any `cm_id` can
+  build against them — but creation still runs on the owner thread.
+- Testable by generalizing the loopback echo test to K connections on a 2-core pool (no server
+  control task yet — use inline `accept_busy` per core, or loopback).
+
+#### D2 — Server CM-ID-keyed control task
+
+The server cannot call `accept_busy` per connection on one task: the **listener has a single CM
+event channel**, and each accepted QP must be built on its target core against that core's CQs. So
+(per §6.1, server side):
+
+- One **control task** is the sole consumer of the listener's CM channel, holding
+  `pending: HashMap<raw CmId, PendingConn>`.
+- On `ConnectRequest`: pick a core (round-robin among cores with headroom — D3), **dispatch resource
+  creation to that core's runtime** (send the `conn_id` over a channel; the worker builds PD/QP/MRs
+  against its shared CQs, registers the `Connecting` slot, and **acks**). Only after the ack does the
+  control task drive `complete_accept` for that CM ID.
+- On `Established`/`Disconnected`: match by **CM ID** (not event type) against `pending`, migrate
+  that exact `CmId` to a per-connection event channel, and hand it to the owning worker for
+  `poll_disconnect`.
+- Matching by CM ID is load-bearing: concurrent accepts would otherwise bind an `Established` to the
+  wrong setup future.
+
+This reshapes the accept primitive: from `listener → get_request → complete_accept` inline to "build
+a busy transport from an already-accepted `conn_id` on this worker," with the control task owning the
+CM state machine. Keep today's inline `accept_busy` as the single-core / test convenience. `CmId`
+must be `Send` to migrate to the worker (verify; it is moved, never shared).
+
+#### D3 — Aggregate CQ sizing + admission control + flush headroom (§7.2)
+
+The fixed 1024-entry CQs of Slices B/C do not scale. Size and gate:
+
+- **Aggregate sizing.** `recv_cq ≥ Σ per-conn doorbell WRs`, `send_cq ≥ Σ (outstanding Write+Imm + 1
+  Read)`, summed over the core's admitted connections, validated against the device `max_cqe`.
+- **Per-core connection cap** derived from those sums and `max_cqe`; a connection that would overrun
+  the shared CQ is **refused or redirected** to another core, even though its own QP is within its
+  WR limits.
+- **Reserved flush headroom.** A disconnect burst flushes all of a QP's WRs at once; the shared CQ
+  must have room or a reclaim overruns it (fatal, §4.2). Reserve headroom equal to the admitted WR
+  budget (or cap admission below `max_cqe` by the largest single-QP budget).
+- Wire the cap into placement (D1): round-robin **among cores with headroom**; fail the connect (or
+  redirect) when all are full. Cap enforcement is a correctness test, not just a tuning knob.
+
+#### D4 — Thread-per-core bench runner + measurement
+
+- A **distinct runner** (a separate code path, *not* a `--busy` flag on the multi-thread harness —
+  §11): `run_echo_busy` builds a `BusyPool`, shards connections, and runs the existing
+  `client_conn_loop` / `server_conn_loop` per connection on its core's runtime. It reuses
+  `BenchMetrics` / `BenchResult` so the numbers line up with the arm-park modes.
+- Expose it as new bench **modes** (e.g. `echo-busy`, `rh1-busy`) in the bench CLI and `echo-matrix`,
+  with `cpus=` selecting the pool size.
+- **Measure** echo and rh1 thread-per-core vs arm-park: `throughput_rps`, latency **p50/p99**, and
+  **`cpu_us_per_op`**. Busy-poll trades CPU for latency, so `cpu_us_per_op` is the honest cost axis —
+  a throughput win that costs a pinned core at 100% must be read against it. Record under
+  `docs/bench/` with the reboot-between methodology.
+
+#### Ordering and risk
+
+D1 → D2 → D3 → D4. D1 is a pure harness primitive (no protocol change). D2 is the trickiest (the CM
+state machine) and the highest-risk under MANA connect churn — exercise it with the same fresh-NIC,
+reboot-between discipline as the churn test. D3 is arithmetic plus a gate. D4 is the payoff. Every
+part keeps the arm-park regression green (§12); the busy correctness scenarios (multiple connections
+on one CQ, hot/idle mix, one connection flooding — fairness, per-connection disconnect while others
+stream, cap enforcement) run on **both rxe and MANA**.
 
 ## 11. Risks and open questions
 
