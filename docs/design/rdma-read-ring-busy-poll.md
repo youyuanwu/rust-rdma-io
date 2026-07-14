@@ -337,9 +337,10 @@ reply that lets the peer start sending.
 completions for them may still be in that CQ. So the resources are **handed to the driver** and
 close becomes an async protocol, not a synchronous drain.
 
-**Ownership transfer.** Busy-mode RDMA resources live in a transferable **`ResourceBundle`**
-(`Option`-held fields): QP, MWs, MRs, PD, CM ID + event channel, the `ConnSlot`, and the
-outstanding-WR accounting. `Drop` (and cancel / setup-failure / panic) `take()`s the bundle and
+**Ownership transfer.** Busy-mode RDMA resources live in a transferable **`ResourceBundle`** — an
+`Option`-held `ReadRingInner` (one plain struct owning the QP, MWs, MRs, PD, CM ID + event channel,
+and the completion sources; see §10) beside the `Arc<ConnSlot>` (routing key + outstanding-WR
+accounting) that outlives it. `Drop` (and cancel / setup-failure / panic) `take()`s the bundle and
 enqueues it on the driver's **reclaim queue** — RAII destroys *nothing* itself. (Spawning an async
 cleanup task from `Drop` is insufficient: the runtime may already be shutting down; it must be a
 plain queue the driver owns.) At **runtime shutdown** the driver reclaims *every* bundle before the
@@ -653,39 +654,61 @@ part is only the **process-level shutdown join** (below), which fans out to ever
 **2. Does `main` wait for it?** *Yes, at process/runtime shutdown* — exactly like a graceful daemon
 that drains connections before exit. The ownership handoff makes this safe:
 
-- **Handoff (never blocks).** Busy-mode RDMA resources live in a transferable `ResourceBundle`
-  (`Option`-held: QP, MWs, MRs, rings, doorbell buffers, PD, `CmId` + event channel, the
-  `Arc<ConnSlot>`, and the WR accounting). `Drop` (and cancel / setup-failure / panic) does three
-  cheap, non-blocking things: mark the slot `Closing`, force the QP to `ERR` (`to_error()`, P1 — so
-  every outstanding WR flushes a CQE *up front*, guaranteeing the drain terminates), and `take()`
-  the bundle onto the driver's **reclaim queue** (`Arc<Mutex<Vec<ResourceBundle>>>` — a plain
-  driver-owned queue, *not* a spawned task, because the runtime may already be shutting down). RAII
-  destroys **nothing** in `Drop` itself.
-- **Drain (the barrier).** Each driver turn, after the data sweep, it walks the reclaim queue with a
-  bounded budget. It keeps routing each reclaiming QP's flush CQEs — but routing becomes
-  **`Closing`-aware**: for a `Closing` slot the driver *discards* the CQE (the app is gone; the
-  ring framing no longer matters) while still **`dec_posted`-ing** it, instead of delivering to the
-  inbox. When a bundle's send and recv counters both reach zero, it transitions `Closing → Drained`.
-- **Free + retire (the `TIME_WAIT`).** Only on `Drained` does the driver destroy the bundle's
-  resources in verbs order (**MWs → QP → MRs → PD**, encoded in `ResourceBundle`'s field order, not
-  prose), then **retire** the slot: bump its generation and **remove `qp_num` from the routing
-  map**. Reuse of that `qp_num` is legal only after retirement, so a straggler flush CQE for the old
-  QP can never be mis-routed to a new connection that happens to be assigned the same number (§4.2)
-  — the direct analogue of `TIME_WAIT`.
+- **Handoff (never blocks).** Busy-mode RDMA resources live in one transferable `ReadRingInner`
+  (the §7.1 struct split — a *plain* struct, not per-field `Option`s), which owns **every**
+  RDMA/CM-holding field of the transport: `offset_mw`/`recv_mw`, the `qp`, both
+  `CompletionSource`s (`send_src`/`recv_src` — in busy mode these are cheap driver-sources holding
+  only an `Arc<ConnSlot>`), the rings, `read_buf`, `offset_mr`, `doorbell_bufs`, the arm-park
+  `cm_async_fd`, the `cm_id` + `event_channel`, and the `pd`. To make the handoff concrete the
+  *busy* transport gains two extra fields beside its `Option<ReadRingInner>`: the `Arc<ConnSlot>`
+  and a `reclaim: CoreDriverHandle` exposing the driver's reclaim queue. `Drop` (and cancel /
+  setup-failure / panic) does only cheap, **owner-agnostic** things, in this order: (1) mark the
+  slot `Closing` (`set_state`, which takes no `assert_owner`); (2) force the QP to `ERR` via
+  `to_error()` on the *still-borrowed* inner (P1 — every outstanding WR flushes a CQE *up front*, so
+  the drain terminates) — this must run **before** the inner is moved; (3) `take()` the
+  `Option<ReadRingInner>` into a `ResourceBundle` and push it onto the reclaim queue. **`Drop` must
+  not call any `assert_owner` method** (`dec_posted`, `drain_inbox`, `poll_inbox`) — those run only
+  on the driver/owner core — so teardown stays sound even if the transport is dropped from a foreign
+  thread. RAII destroys **nothing** in `Drop` itself. The reclaim queue is
+  `reclaim: Arc<Mutex<Vec<ResourceBundle>>>`, a field on **both** `CoreDriver` and
+  `CoreDriverHandle` (a plain driver-owned queue, *not* a spawned task, because the runtime may
+  already be shutting down); `CoreDriverHandle::reclaim(bundle)` pushes.
+- **Drain (the barrier).** Each driver turn, after the data sweep, `process_reclaim` walks the
+  queue with a bounded per-bundle budget. Two things must happen for a `Closing` bundle:
+  - **Clear the inbox backlog.** CQEs the driver delivered *before* the app stopped polling still
+    sit in the slot's two inboxes, and `drain_complete()` requires both inboxes empty — so reclaim
+    `drain_inbox(Send)`/`drain_inbox(Recv)` to discard that backlog (the app is gone; ring framing
+    no longer matters). Without this the barrier can never complete — it is the single most likely
+    wedge.
+  - **Discard future flush CQEs.** Routing becomes **`Closing`-aware**: `route_into` still
+    `dec_posted`s each reaped CQE for a `Closing` slot but *discards* it instead of `deliver`-ing to
+    the inbox (which would re-fill what reclaim just drained).
+  When a bundle's send and recv counters both reach zero *and* both inboxes are empty
+  (`drain_complete()`), it transitions `Closing → Drained`.
+- **Free + retire (the `TIME_WAIT`).** Only on `Drained` does the driver destroy the inner in
+  field/verbs order (**MWs → QP → MRs → PD**, encoded in `ReadRingInner`'s field order, not prose)
+  by setting `bundle.inner = None`. The `Arc<ConnSlot>` is held *beside* the inner (not inside it),
+  so it survives the free; the driver then **retires** it — bump its generation and **remove
+  `qp_num` from the routing map** — *after* the inner is dropped. Reuse of that `qp_num` is legal
+  only after retirement, so a straggler flush CQE for the old QP can never be mis-routed to a new
+  connection that happens to be assigned the same number (§4.2) — the direct analogue of
+  `TIME_WAIT`.
 - **Shutdown join (`main` waits).** `CoreDriverHandle::shutdown()` flips a flag; the driver's run
-  loop then **keeps going until the reclaim queue is empty** (every bundle `Drained` + freed) and
-  only then returns. The owner `await`s the driver task's `JoinHandle` **before** the shared CQs and
-  per-core `ibv_context` are dropped — guaranteeing no QP/MR outlives, and no flush CQE is stranded
-  in, a CQ that is about to be destroyed. This is the "wait for the background thread to finish
-  freeing TCBs" step, made explicit.
+  loop calls `process_reclaim` every turn and, once the flag is set, **keeps sweeping + reclaiming
+  until the reclaim queue is empty** (every bundle `Drained` + freed) before returning. The owner
+  `await`s the driver task's `JoinHandle` **before** the shared CQs and per-core `ibv_context` are
+  dropped — guaranteeing no QP/MR outlives, and no flush CQE is stranded in, a CQ that is about to
+  be destroyed. This is the "wait for the background thread to finish freeing TCBs" step, made
+  explicit.
 
 **Termination guarantee + the wedge escape hatch.** `to_error()` forcing flush up front means the
 expected CQE count is fixed at `Drop` time, so the barrier is not an open-ended wait. But a wedged
-NIC can still fail to deliver a flush CQE (the MANA churn failure mode). So reclaim carries a
-**bounded budget / deadline** (a max number of driver turns, or a coarse timer): on expiry the
-driver logs a fatal-teardown warning, force-destroys the bundle anyway, and retires the `qp_num`.
-That trades a small, logged correctness risk for a shutdown that cannot hang — the same pragmatic
-choice the kernel makes with `TIME_WAIT` / `FIN_WAIT` timeouts. Tuning this budget is Phase 2.
+NIC can still fail to deliver a flush CQE (the MANA churn failure mode). So each bundle carries a
+**turn counter** and reclaim a **budget**: once `turns >= budget` (wired in `process_reclaim`
+below; a coarse timer is an equivalent alternative), the driver logs a fatal-teardown warning,
+force-destroys the bundle anyway (`inner = None`), and retires the `qp_num`. That trades a small,
+logged correctness risk for a shutdown that cannot hang — the same pragmatic choice the kernel makes
+with `TIME_WAIT` / `FIN_WAIT` timeouts. Tuning the budget is Phase 2.
 
 **Failure modes.** If the driver task **panics**, its reclaim queue (an `Arc<Mutex<…>>`) is dropped
 and RAII destroys the pending bundles best-effort (possibly with benign teardown warnings) — no
@@ -702,47 +725,79 @@ refinement that keeps the same ownership rules and doesn't change the barrier.
 **Rust shape (sketch).**
 
 ```rust
-// Resources that must outlive the flush drain — freed by the driver, in field
-// (drop) order: MWs → QP → MRs → PD. `Option` so Drop can move them out.
+// The RDMA-owning half of the transport (the §7.1 split). ONE move-out, no
+// per-field Option: `Drop` takes the whole inner. Field order IS the verbs
+// drop order: MWs → QP → (sources) → MRs/rings/buffers → CM → PD.
+struct ReadRingInner {
+    offset_mw:     MemoryWindow,        // MW2, dropped first
+    recv_mw:       MemoryWindow,        // MW1
+    qp:            AsyncQp,             // then the QP (ERR'd before the move)
+    send_src:      CompletionSource,    // busy: driver-source (Arc<ConnSlot>), no CQ
+    recv_src:      CompletionSource,
+    send_ring:     RingBuffer,          // then the MRs / rings / buffers
+    recv_ring:     RingBuffer,
+    read_buf:      OwnedMemoryRegion,
+    offset_mr:     OwnedMemoryRegion,
+    doorbell_bufs: Box<[OwnedMemoryRegion]>,
+    cm_async_fd:   AsyncFd<RawFd>,      // arm-park CM readiness (inert in busy)
+    cm_id:         CmId,                // CM state (its own event channel)
+    event_channel: EventChannel,
+    pd:            Arc<ProtectionDomain>, // dropped last
+}
+
+// What the driver reclaims: the inner (freed on Drained) plus the slot it must
+// retire *after* the inner is gone, plus the wedge budget counter.
 struct ResourceBundle {
-    offset_mw: Option<MemoryWindow>,   // MW2, dropped first
-    recv_mw:   Option<MemoryWindow>,   // MW1
-    qp:        Option<AsyncQp>,        // then the QP
-    send_ring: Option<RingBuffer>,     // then the MRs / rings / buffers
-    recv_ring: Option<RingBuffer>,
-    read_buf:  Option<OwnedMemoryRegion>,
-    offset_mr: Option<OwnedMemoryRegion>,
-    doorbell_bufs: Option<Box<[OwnedMemoryRegion]>>,
-    slot:      Arc<ConnSlot>,          // routing key + counters (retired last)
-    cm_id:     Option<CmId>,           // CM state (its own event channel)
-    pd:        Option<Arc<ProtectionDomain>>, // dropped last
+    inner: Option<ReadRingInner>, // Some until Drained; None frees in field order
+    slot:  Arc<ConnSlot>,         // routing key + counters; retired after inner drop
+    turns: usize,                 // reclaim turns spent (wedge budget)
 }
 
 impl CoreDriver {
-    // Called each turn after the data sweep; bounded work.
+    // Called each turn after the data sweep; bounded work. `budget` caps turns
+    // per bundle so a wedged NIC cannot hang shutdown.
     fn process_reclaim(&mut self, budget: usize) {
-        self.reclaim.retain_mut(|b| {
-            if b.slot.drain_complete() /* both counters 0 */ {
-                b.slot.set_state(Drained);
-                // drop order frees MW→QP→MR→PD; then retire the routing key.
-                let qp_num = b.slot.qp_num();
-                *b = ResourceBundle::empty(&b.slot); // take()/drop the resources
-                b.slot.retire();                     // bump gen
-                self.slots.remove(&qp_num);          // reuse now legal
-                false                                // done — drop from queue
-            } else {
-                true                                 // still draining
+        // Split-borrow: reclaim and slots are disjoint fields.
+        let CoreDriver { reclaim, slots, .. } = self;
+        let mut scratch = [WorkCompletion::default(); 16];
+        reclaim.retain_mut(|b| {
+            // Clear any pre-Closing inbox backlog so drain_complete() can hold
+            // (idempotent — empty after the first turn; route_into discards new).
+            b.slot.drain_inbox(Dir::Send, &mut scratch);
+            b.slot.drain_inbox(Dir::Recv, &mut scratch);
+            b.turns += 1;
+
+            let done = b.slot.drain_complete();   // counters 0 && inboxes empty
+            let wedged = b.turns >= budget;       // escape hatch
+            if !done && !wedged {
+                return true;                      // still draining
             }
+            if wedged && !done {
+                tracing::error!(
+                    qp_num = b.slot.qp_num(),
+                    "reclaim budget exhausted; force-freeing (NIC wedge, §12)"
+                );
+            }
+            b.slot.set_state(SlotState::Drained);
+            let qp_num = b.slot.qp_num();
+            b.inner = None;                       // free MW→QP→MR→PD (field order)
+            b.slot.retire();                      // bump generation (reuse barrier)
+            slots.lock().unwrap().remove(&qp_num); // reuse now legal
+            false                                 // done — drop the bundle
         });
     }
 }
 ```
 
 The transport-side change this forces is the **`Option<ReadRingInner>` split**: the RDMA-owning
-fields move behind one option so `Drop` can `take()` them into a `ResourceBundle`, while the
-scalar flow-control state stays inline. Arm-park keeps destroying its bundle inline (today's P2
-drain); busy hands it to the driver. That refactor — not the barrier logic — is the bulk of the
-Slice C part 2 diff, and the arm-park regression suite is the guard rail.
+fields (listed above) move behind one option so `Drop` can `take()` them into a `ResourceBundle` in
+a single move — *no* per-field `Option`, since the inner is always freed whole on `Drained`. The
+scalar flow-control state (`disconnected`, `send_in_flight`, `cached_remote_head`, the virtual-idx
+map, etc.) stays inline on the transport, and the busy transport additionally holds the
+`Arc<ConnSlot>` and its `reclaim: CoreDriverHandle`. Arm-park keeps destroying its inner inline
+(today's P2 synchronous drain, restructured only to `take()` the inner and drain-then-drop it —
+behavior unchanged); busy hands it to the driver. That refactor — not the barrier logic — is the
+bulk of the Slice C part 2 diff, and the arm-park regression suite is the guard rail.
 
 ## 11. Risks and open questions
 
