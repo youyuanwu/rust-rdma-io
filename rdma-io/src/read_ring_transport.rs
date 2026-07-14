@@ -45,6 +45,9 @@ use crate::async_cq::AsyncCq;
 use crate::async_qp::AsyncQp;
 use crate::cm::{CmId, ConnParam, EventChannel, PortSpace};
 use crate::completion_source::CompletionSource;
+use crate::conn_slot::{ConnSlot, Dir, SlotState, WorkerToken};
+use crate::core_driver::CoreDriverHandle;
+use crate::cq::CompletionQueue;
 use crate::mr::{AccessFlags, OwnedMemoryRegion};
 use crate::mw::MemoryWindow;
 use crate::pd::ProtectionDomain;
@@ -422,12 +425,158 @@ fn bind_offset_mw(
 }
 
 // ---------------------------------------------------------------------------
+// Completion backend (arm-park vs busy-poll) — the only setup-time difference
+// between the two completion modes (§3, Appendix A of the busy-poll design).
+// ---------------------------------------------------------------------------
+
+/// How a connection's completions are produced during setup. Selected by the
+/// public `connect`/`accept` (arm-park) vs `connect_busy`/`accept_busy` (busy).
+enum SetupBackend<'a> {
+    /// Per-connection CQs owned by the transport (today's default).
+    ArmPark { send_cq: AsyncCq, recv_cq: AsyncCq },
+    /// Shared per-core CQs owned by a [`CoreDriver`](crate::core_driver); the
+    /// transport reads its inbox on a registered [`ConnSlot`].
+    Busy {
+        handle: &'a CoreDriverHandle,
+        send_cap: usize,
+        recv_cap: usize,
+    },
+}
+
+impl<'a> SetupBackend<'a> {
+    /// Build the backend. For arm-park this allocates the per-connection CQs
+    /// exactly as before; for busy it just records the shared handle + inbox
+    /// sizes (the [`ConnSlot`] is created and registered in [`into_sources`]).
+    ///
+    /// [`into_sources`]: SetupBackend::into_sources
+    fn new(
+        driver: Option<&'a CoreDriverHandle>,
+        ctx: &Arc<crate::device::Context>,
+        send_depth: i32,
+        recv_depth: i32,
+    ) -> crate::Result<Self> {
+        match driver {
+            None => Ok(SetupBackend::ArmPark {
+                send_cq: AsyncCq::create_tokio(ctx.clone(), send_depth)?,
+                recv_cq: AsyncCq::create_tokio(ctx.clone(), recv_depth)?,
+            }),
+            Some(handle) => Ok(SetupBackend::Busy {
+                handle,
+                send_cap: send_depth as usize,
+                recv_cap: recv_depth as usize,
+            }),
+        }
+    }
+
+    /// The send/recv CQs to build the QP against.
+    fn cqs(&self) -> (&Arc<CompletionQueue>, &Arc<CompletionQueue>) {
+        match self {
+            SetupBackend::ArmPark { send_cq, recv_cq } => (send_cq.cq(), recv_cq.cq()),
+            SetupBackend::Busy { handle, .. } => (handle.send_cq(), handle.recv_cq()),
+        }
+    }
+
+    /// Finalize into the transport's `send_src`/`recv_src`. For busy this creates
+    /// the [`ConnSlot`] for `qp_num` and **registers it with the driver before
+    /// any WR is posted** (§6.1), returning it so setup can mark it `Established`.
+    fn into_sources(
+        self,
+        qp_num: u32,
+    ) -> (CompletionSource, CompletionSource, Option<Arc<ConnSlot>>) {
+        match self {
+            SetupBackend::ArmPark { send_cq, recv_cq } => (
+                CompletionSource::arm_park(send_cq),
+                CompletionSource::arm_park(recv_cq),
+                None,
+            ),
+            SetupBackend::Busy {
+                handle,
+                send_cap,
+                recv_cap,
+            } => {
+                let slot = Arc::new(ConnSlot::new(
+                    qp_num,
+                    send_cap,
+                    recv_cap,
+                    WorkerToken::current(),
+                ));
+                handle.register(slot.clone());
+                (
+                    CompletionSource::driver(slot.clone(), Dir::Send),
+                    CompletionSource::driver(slot.clone(), Dir::Recv),
+                    Some(slot),
+                )
+            }
+        }
+    }
+}
+
+/// Reap the setup **send** completions (token Send + MW binds if any) so the
+/// data path starts on a clean send stream.
+///
+/// - **Arm-park:** the bounded spin drain over the per-connection CQ (unchanged).
+/// - **Busy:** await exactly the expected number of setup send completions from
+///   the driver-fed inbox (the driver routes them), then mark the slot
+///   `Established`. The count is deterministic: 1 token Send + 2 MW binds
+///   (unless MR-rkey fallback, where no MW is bound).
+async fn finish_setup_sends(
+    send_src: &mut CompletionSource,
+    conn_slot: &Option<Arc<ConnSlot>>,
+    use_mr_rkey: bool,
+) -> crate::Result<()> {
+    match conn_slot {
+        None => {
+            send_src.drain_setup()?;
+            Ok(())
+        }
+        Some(slot) => {
+            let expected = 1 + if use_mr_rkey { 0 } else { 2 };
+            let mut got = 0;
+            let mut wc = [WorkCompletion::default(); 8];
+            while got < expected {
+                let n = send_src.acquire(&mut wc).await?;
+                for w in &wc[..n] {
+                    if !w.is_success() {
+                        return Err(crate::Error::WorkCompletion {
+                            status: w.status_raw(),
+                            vendor_err: w.vendor_err(),
+                        });
+                    }
+                }
+                got += n;
+            }
+            slot.set_state(SlotState::Established);
+            Ok(())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
 
 impl ReadRingTransport {
-    /// Connect to a remote RDMA endpoint (client side).
+    /// Connect to a remote RDMA endpoint (client side), arm-park mode.
     pub async fn connect(addr: &SocketAddr, config: ReadRingConfig) -> crate::Result<Self> {
+        Self::connect_inner(addr, config, None).await
+    }
+
+    /// Connect in **busy-poll** mode: the connection's QP is created against the
+    /// driver's shared CQs and its completions are delivered through `driver`
+    /// (Phase 1). The `driver`'s reaper task must be running on this worker.
+    pub async fn connect_busy(
+        addr: &SocketAddr,
+        config: ReadRingConfig,
+        driver: &CoreDriverHandle,
+    ) -> crate::Result<Self> {
+        Self::connect_inner(addr, config, Some(driver)).await
+    }
+
+    async fn connect_inner(
+        addr: &SocketAddr,
+        config: ReadRingConfig,
+        driver: Option<&CoreDriverHandle>,
+    ) -> crate::Result<Self> {
         if crate::device::any_device_is_iwarp() {
             return Err(crate::Error::InvalidArg(
                 "ring transport requires InfiniBand/RoCE (iWARP detected)".into(),
@@ -459,8 +608,7 @@ impl ReadRingTransport {
         let send_cq_depth = (max_outstanding + READ_RING_SQ_HEADROOM) as i32;
         let recv_cq_depth = (max_outstanding + 2) as i32;
 
-        let send_cq = AsyncCq::create_tokio(ctx.clone(), send_cq_depth)?;
-        let recv_cq = AsyncCq::create_tokio(ctx, recv_cq_depth)?;
+        let backend = SetupBackend::new(driver, &ctx, send_cq_depth, recv_cq_depth)?;
 
         let qp_attr = QpInitAttr {
             qp_type: QpType::Rc,
@@ -472,8 +620,10 @@ impl ReadRingTransport {
             sq_sig_all: true,
         };
 
+        let (setup_send_cq, setup_recv_cq) = backend.cqs();
         let cmqp =
-            async_cm.create_qp_with_cq(&pd, &qp_attr, Some(send_cq.cq()), Some(recv_cq.cq()))?;
+            async_cm.create_qp_with_cq(&pd, &qp_attr, Some(setup_send_cq), Some(setup_recv_cq))?;
+        let qp_num = cmqp.qp_num();
 
         // In MR-rkey fallback mode we never bind a Memory Window, so omit the
         // MW_BIND access flag (some NICs reject it when max_mw == 0).
@@ -505,8 +655,7 @@ impl ReadRingTransport {
             .into_boxed_slice();
 
         let qp = AsyncQp::new_poster(cmqp);
-        let mut send_src = CompletionSource::arm_park(send_cq);
-        let mut recv_src = CompletionSource::arm_park(recv_cq);
+        let (mut send_src, mut recv_src, conn_slot) = backend.into_sources(qp_num);
 
         // Post 32-byte token recv FIRST (before doorbells, before connect).
         let token_recv_mr = post_read_ring_token_recv(&qp, &pd)?;
@@ -546,8 +695,8 @@ impl ReadRingTransport {
             complete_read_ring_token_exchange(&qp, &mut recv_src, &pd, &our_token, &token_recv_mr)
                 .await?;
 
-        // Drain setup completions from send CQ (token send + MW binds if any).
-        send_src.drain_setup()?;
+        // Drain setup completions from the send stream (token send + MW binds).
+        finish_setup_sends(&mut send_src, &conn_slot, use_mr_rkey).await?;
 
         // Post doorbell recv WRs.
         for (i, mr) in doorbell_bufs.iter().enumerate() {
@@ -581,8 +730,27 @@ impl ReadRingTransport {
         ))
     }
 
-    /// Accept an incoming connection (server side).
+    /// Accept an incoming connection (server side), arm-park mode.
     pub async fn accept(listener: &AsyncCmListener, config: ReadRingConfig) -> crate::Result<Self> {
+        Self::accept_inner(listener, config, None).await
+    }
+
+    /// Accept in **busy-poll** mode (Phase 1): the QP is created against the
+    /// driver's shared CQs and completions are delivered through `driver`, whose
+    /// reaper task must be running on this worker.
+    pub async fn accept_busy(
+        listener: &AsyncCmListener,
+        config: ReadRingConfig,
+        driver: &CoreDriverHandle,
+    ) -> crate::Result<Self> {
+        Self::accept_inner(listener, config, Some(driver)).await
+    }
+
+    async fn accept_inner(
+        listener: &AsyncCmListener,
+        config: ReadRingConfig,
+        driver: Option<&CoreDriverHandle>,
+    ) -> crate::Result<Self> {
         if crate::device::any_device_is_iwarp() {
             return Err(crate::Error::InvalidArg(
                 "ring transport requires InfiniBand/RoCE (iWARP detected)".into(),
@@ -610,8 +778,7 @@ impl ReadRingTransport {
         let send_cq_depth = (max_outstanding + READ_RING_SQ_HEADROOM) as i32;
         let recv_cq_depth = (max_outstanding + 2) as i32;
 
-        let send_cq = AsyncCq::create_tokio(ctx.clone(), send_cq_depth)?;
-        let recv_cq = AsyncCq::create_tokio(ctx, recv_cq_depth)?;
+        let backend = SetupBackend::new(driver, &ctx, send_cq_depth, recv_cq_depth)?;
 
         let qp_attr = QpInitAttr {
             qp_type: QpType::Rc,
@@ -623,8 +790,10 @@ impl ReadRingTransport {
             sq_sig_all: true,
         };
 
+        let (setup_send_cq, setup_recv_cq) = backend.cqs();
         let cmqp =
-            conn_id.create_qp_with_cq(&pd, &qp_attr, Some(send_cq.cq()), Some(recv_cq.cq()))?;
+            conn_id.create_qp_with_cq(&pd, &qp_attr, Some(setup_send_cq), Some(setup_recv_cq))?;
+        let qp_num = cmqp.qp_num();
 
         // In MR-rkey fallback mode we never bind a Memory Window, so omit the
         // MW_BIND access flag (some NICs reject it when max_mw == 0).
@@ -653,8 +822,7 @@ impl ReadRingTransport {
             .into_boxed_slice();
 
         let qp = AsyncQp::new_poster(cmqp);
-        let mut send_src = CompletionSource::arm_park(send_cq);
-        let mut recv_src = CompletionSource::arm_park(recv_cq);
+        let (mut send_src, mut recv_src, conn_slot) = backend.into_sources(qp_num);
 
         // Post 32-byte token recv FIRST.
         let token_recv_mr = post_read_ring_token_recv(&qp, &pd)?;
@@ -694,7 +862,8 @@ impl ReadRingTransport {
             complete_read_ring_token_exchange(&qp, &mut recv_src, &pd, &our_token, &token_recv_mr)
                 .await?;
 
-        send_src.drain_setup()?;
+        // Drain setup completions from the send stream (token send + MW binds).
+        finish_setup_sends(&mut send_src, &conn_slot, use_mr_rkey).await?;
 
         for (i, mr) in doorbell_bufs.iter().enumerate() {
             let sge = Sge::new(mr.addr(), 4, mr.lkey());

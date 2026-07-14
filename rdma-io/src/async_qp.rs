@@ -78,6 +78,14 @@ impl AsyncQp {
         self.qp.as_raw()
     }
 
+    /// The QP number assigned by the HCA.
+    ///
+    /// Used by the busy-poll [`CoreDriver`](crate::core_driver) to register the
+    /// connection's routing key before any WR is posted.
+    pub fn qp_num(&self) -> u32 {
+        self.qp.qp_num()
+    }
+
     /// Transition the underlying QP to the ERROR state, flushing outstanding WRs.
     ///
     /// Used by teardown to guarantee the completion-drain barrier terminates:
