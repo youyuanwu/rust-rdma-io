@@ -654,8 +654,13 @@ impl ReadRingTransport {
             .collect::<crate::Result<Vec<_>>>()?
             .into_boxed_slice();
 
-        let qp = AsyncQp::new_poster(cmqp);
+        let mut qp = AsyncQp::new_poster(cmqp);
         let (mut send_src, mut recv_src, conn_slot) = backend.into_sources(qp_num);
+        // Busy mode: count every WR the driver will later reap (§6.2). Must be
+        // set before the first post below.
+        if let Some(slot) = &conn_slot {
+            qp.set_accounting(slot.clone());
+        }
 
         // Post 32-byte token recv FIRST (before doorbells, before connect).
         let token_recv_mr = post_read_ring_token_recv(&qp, &pd)?;
@@ -821,8 +826,13 @@ impl ReadRingTransport {
             .collect::<crate::Result<Vec<_>>>()?
             .into_boxed_slice();
 
-        let qp = AsyncQp::new_poster(cmqp);
+        let mut qp = AsyncQp::new_poster(cmqp);
         let (mut send_src, mut recv_src, conn_slot) = backend.into_sources(qp_num);
+        // Busy mode: count every WR the driver will later reap (§6.2). Must be
+        // set before the first post below.
+        if let Some(slot) = &conn_slot {
+            qp.set_accounting(slot.clone());
+        }
 
         // Post 32-byte token recv FIRST.
         let token_recv_mr = post_read_ring_token_recv(&qp, &pd)?;

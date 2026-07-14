@@ -209,20 +209,26 @@ fn route_into(
     for wc in wcs {
         let qp_num = wc.qp_num();
         match map.get(&qp_num) {
-            Some(slot) => match slot.deliver(dir, *wc) {
-                Ok(()) => {
-                    if !woken.contains(&qp_num) {
-                        woken.push(qp_num);
+            Some(slot) => {
+                // Every reaped CQE decrements the outstanding-WR count (§6.2);
+                // this drives the teardown barrier to zero. Underflow is a fatal
+                // accounting bug (dec without a matching post).
+                slot.dec_posted(dir);
+                match slot.deliver(dir, *wc) {
+                    Ok(()) => {
+                        if !woken.contains(&qp_num) {
+                            woken.push(qp_num);
+                        }
+                    }
+                    Err(_rejected) => {
+                        // Inbox overflow: a per-connection fatal fault (§7.2).
+                        // Inboxes are sized overflow-free, so this should be
+                        // unreachable; if seen, isolate this connection.
+                        tracing::error!(qp_num, ?dir, "CoreDriver: inbox overflow (fatal)");
+                        slot.mark_fatal();
                     }
                 }
-                Err(_rejected) => {
-                    // Inbox overflow: a per-connection fatal fault (§7.2).
-                    // Inboxes are sized overflow-free, so this should be
-                    // unreachable; if seen, isolate this connection.
-                    tracing::error!(qp_num, ?dir, "CoreDriver: inbox overflow (fatal)");
-                    slot.mark_fatal();
-                }
-            },
+            }
             None => {
                 unknown_qp.fetch_add(1, Ordering::Relaxed);
                 tracing::error!(
@@ -323,6 +329,10 @@ mod tests {
 
         // Interleaved recv completions for two connections.
         let batch = [wc_for(10, 1), wc_for(20, 2), wc_for(10, 3)];
+        // Balance the driver's dec_posted: pre-count the posts these CQEs reap.
+        a.inc_posted(Dir::Recv);
+        a.inc_posted(Dir::Recv);
+        b.inc_posted(Dir::Recv);
         route_into(&map, &unknown, Dir::Recv, &batch);
         assert_eq!(unknown.load(Ordering::Relaxed), 0);
 
@@ -363,6 +373,9 @@ mod tests {
 
         // Three completions for the same slot in one sweep → exactly one wake.
         let batch = [wc_for(10, 1), wc_for(10, 2), wc_for(10, 3)];
+        a.inc_posted(Dir::Recv);
+        a.inc_posted(Dir::Recv);
+        a.inc_posted(Dir::Recv);
         route_into(&map, &unknown, Dir::Recv, &batch);
         assert_eq!(cw.count(), 1);
     }
@@ -375,6 +388,8 @@ mod tests {
         let unknown = AtomicU64::new(0);
 
         let batch = [wc_for(999, 1), wc_for(10, 2)];
+        // Only the known slot's CQE is accounted (the unknown one is dropped).
+        a.inc_posted(Dir::Send);
         route_into(&map, &unknown, Dir::Send, &batch);
         assert_eq!(unknown.load(Ordering::Relaxed), 1);
 
@@ -396,6 +411,8 @@ mod tests {
         map.insert(10u32, a.clone());
         let unknown = AtomicU64::new(0);
 
+        a.inc_posted(Dir::Send);
+        a.inc_posted(Dir::Recv);
         route_into(&map, &unknown, Dir::Send, &[wc_for(10, 100)]);
         route_into(&map, &unknown, Dir::Recv, &[wc_for(10, 200)]);
 

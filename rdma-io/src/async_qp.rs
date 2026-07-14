@@ -21,11 +21,13 @@
 use rdma_io_sys::ibverbs::*;
 use rdma_io_sys::wrapper::*;
 
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use crate::Result;
 use crate::async_cq::{AsyncCq, CqPollState};
 use crate::cm::CmQueuePair;
+use crate::conn_slot::{ConnSlot, Dir};
 use crate::error::from_ret;
 use crate::mr::{OwnedMemoryRegion, RemoteMr};
 use crate::wc::WorkCompletion;
@@ -47,6 +49,12 @@ pub struct AsyncQp {
     qp: CmQueuePair,
     send_cq: Option<AsyncCq>,
     recv_cq: Option<AsyncCq>,
+    /// Busy-poll WR accounting (§6.2). When set, every successful post
+    /// increments the slot's outstanding-WR counter for that direction; the
+    /// [`CoreDriver`](crate::core_driver) decrements it on each reaped CQE. The
+    /// teardown barrier drains to zero before destroying the QP. `None` for the
+    /// arm-park path (its teardown drains its own CQ against exact counts).
+    accounting: Option<Arc<ConnSlot>>,
 }
 
 impl AsyncQp {
@@ -56,6 +64,7 @@ impl AsyncQp {
             qp,
             send_cq: Some(send_cq),
             recv_cq: Some(recv_cq),
+            accounting: None,
         }
     }
 
@@ -70,7 +79,15 @@ impl AsyncQp {
             qp,
             send_cq: None,
             recv_cq: None,
+            accounting: None,
         }
+    }
+
+    /// Attach a busy-poll [`ConnSlot`] so every subsequent successful post is
+    /// counted for the teardown barrier (§6.2). Must be called before the first
+    /// post; no-op accounting (arm-park) simply never calls this.
+    pub fn set_accounting(&mut self, slot: Arc<ConnSlot>) {
+        self.accounting = Some(slot);
     }
 
     /// Access the raw QP pointer.
@@ -119,14 +136,22 @@ impl AsyncQp {
     pub(crate) fn post_send_wr(&self, wr: &mut SendWr) -> Result<()> {
         let mut raw = wr.build_raw();
         let mut bad_wr: *mut ibv_send_wr = std::ptr::null_mut();
-        from_ret(unsafe { rdma_wrap_ibv_post_send(self.qp.as_raw(), &mut raw, &mut bad_wr) })
+        from_ret(unsafe { rdma_wrap_ibv_post_send(self.qp.as_raw(), &mut raw, &mut bad_wr) })?;
+        if let Some(slot) = &self.accounting {
+            slot.inc_posted(Dir::Send);
+        }
+        Ok(())
     }
 
     /// Post an arbitrary recv WR to the QP.
     pub(crate) fn post_recv_wr(&self, wr: &mut RecvWr) -> Result<()> {
         let mut raw = wr.build_raw();
         let mut bad_wr: *mut ibv_recv_wr = std::ptr::null_mut();
-        from_ret(unsafe { rdma_wrap_ibv_post_recv(self.qp.as_raw(), &mut raw, &mut bad_wr) })
+        from_ret(unsafe { rdma_wrap_ibv_post_recv(self.qp.as_raw(), &mut raw, &mut bad_wr) })?;
+        if let Some(slot) = &self.accounting {
+            slot.inc_posted(Dir::Recv);
+        }
+        Ok(())
     }
 
     // --- Fire-and-forget post methods ---
