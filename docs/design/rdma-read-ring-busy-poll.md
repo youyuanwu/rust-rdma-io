@@ -844,6 +844,33 @@ cross-core channel (a copy, a queue, and a cross-core wake). That is a caller to
 avoiding it (co-locating per-connection work on the connection's core) is the whole point of
 thread-per-core — another reason placement is the caller's to own.
 
+**Co-location: the pool runs your per-connection task, on-core.** The corollary of the copy analysis
+is that `BusyPool` is not a set of drivers you *call into* from outside — it is a set of **per-core
+executors, and each connection's app loop runs *inside* one of them**, next to that core's
+`CoreDriver` and transport. Co-location is mandatory: the `ConnSlot` inbox is same-core SPSC (the
+driver produces, the app task calling `poll_recv`/`send_copy` consumes — §7.1), the owner-token
+guard panics if the transport is touched off its core (§7.5), and the transport is core-affine for
+life. So the pool's connect/accept primitives are **combinators that run the app closure on-core**,
+never handing the transport back to the caller:
+
+```rust
+// Client: pick a core, connect on it, run the app loop on it — the transport never leaves the core.
+pool.spawn_connect(addr, cfg, |t| async move { client_conn_loop(t).await });
+// Server: the D2 control task dispatches to the owning worker, which builds the transport
+// on-core and spawns the app loop (server_conn_loop) there.
+```
+
+Returning the (`Send`) transport to the caller would compile but let it be moved to another runtime,
+tripping the owner-token guard at runtime; keeping it inside an on-core closure makes the safe path
+the only path. The app future must still be `Send` — `tokio::spawn` requires it **even on a
+`current_thread` runtime** (only `spawn_local` / `LocalSet` accept `!Send`, which §7.1 avoids on
+purpose). Since the transport is `Send + Sync` the app loop is `Send` and spawns fine; the pinning
+comes from the **`current_thread` topology** (one thread, no work-stealing), not the bound, and the
+owner-token guard catches an accidental spawn onto a multi-thread runtime. Per-connection logic must
+therefore be a `'static` future that owns its transport and loops (the bench `client_conn_loop` /
+`server_conn_loop` already are); an app that must drive the connection from a *different* thread
+cannot co-locate and falls back to the cross-core channel above.
+
 #### D1 — Sharding + per-core worker pool (client first)
 
 - A **`BusyPool`** (harness-layer, per *Runtime ownership* above): M `current_thread` runtimes, one
@@ -853,7 +880,8 @@ thread-per-core — another reason placement is the caller's to own.
   §7.5). Start **round-robin**; leave a `least-loaded` hook (per-core connection count) for later.
   No migration — a live QP/CQ/slot cannot move cheaply.
 - **Client path.** To open N connections, round-robin them across the pool: `spawn` each
-  `connect_busy` future **onto its target core's runtime** so the QP is built against that core's
+  `connect_busy` future **onto its target core's runtime** (via the on-core `spawn_connect`
+  combinator above, which also runs the app loop there) so the QP is built against that core's
   driver CQs *on that core's thread* (the owner-token requirement, §7.5). The device `ibv_context`
   is shared per-device (librdmacm), so every core's CQs live on one context and any `cm_id` can
   build against them — but creation still runs on the owner thread.
