@@ -10,7 +10,7 @@ readme = "../README.md"
 
 [features]
 default = ["tokio"]
-async = ["dep:futures-io"]
+async = ["dep:futures-io", "dep:futures-util"]
 tokio = ["async", "dep:tokio"]
 
 [dependencies]
@@ -21,4 +21,5 @@ thiserror.workspace = true
 tracing.workspace = true
 libc.workspace = true
 futures-io = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }

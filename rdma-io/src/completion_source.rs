@@ -26,8 +26,12 @@
 
 use std::task::{Context, Poll};
 
+use std::future::poll_fn;
+use std::sync::Arc;
+
 use crate::Result;
 use crate::async_cq::{AsyncCq, CqPollState};
+use crate::conn_slot::{ConnSlot, Dir};
 use crate::wc::WorkCompletion;
 
 /// Number of arm-then-poll iterations `drain_setup` spins to reap the
@@ -43,8 +47,10 @@ pub enum CompletionSource {
     /// Owns a per-connection [`AsyncCq`] and its drain-after-arm state, and
     /// uses the arm-and-park pattern to sleep when the CQ is empty.
     ArmPark(ArmParkSource),
-    // Phase 1: `Driver(DriverSource)` — reads a per-direction inbox filled by
-    // the per-core busy-poll driver. Added when `ConnSlot` lands.
+    /// Reads a per-direction inbox on an [`Arc<ConnSlot>`] filled by the
+    /// per-core busy-poll [`CoreDriver`](crate::conn_slot); never touches a CQ
+    /// (the driver is the sole reaper of the shared CQ, §5.1).
+    Driver(DriverSource),
 }
 
 /// The arm-and-park completion source: a per-connection [`AsyncCq`] plus the
@@ -54,6 +60,16 @@ pub struct ArmParkSource {
     state: CqPollState,
 }
 
+/// The busy-poll completion source: one direction of a shared [`ConnSlot`].
+///
+/// It never polls a CQ — the [`CoreDriver`](crate::conn_slot) reaps the shared
+/// CQ and pushes completions into the slot's inbox; this source only drains
+/// that inbox (register–check–recheck via the slot's `AtomicWaker`, §7.3).
+pub struct DriverSource {
+    slot: Arc<ConnSlot>,
+    dir: Dir,
+}
+
 impl CompletionSource {
     /// Build an arm-and-park source that owns `cq`.
     pub fn arm_park(cq: AsyncCq) -> Self {
@@ -61,6 +77,11 @@ impl CompletionSource {
             cq,
             state: CqPollState::default(),
         })
+    }
+
+    /// Build a busy-poll source that reads `dir`'s inbox on `slot`.
+    pub fn driver(slot: Arc<ConnSlot>, dir: Dir) -> Self {
+        Self::Driver(DriverSource { slot, dir })
     }
 
     /// `Poll`-based acquire for the data path: returns `Ready(Ok(n))` with at
@@ -76,6 +97,7 @@ impl CompletionSource {
     ) -> Poll<Result<usize>> {
         match self {
             Self::ArmPark(s) => s.cq.poll_completions(cx, &mut s.state, wc_buf),
+            Self::Driver(s) => s.slot.poll_inbox(s.dir, cx, wc_buf),
         }
     }
 
@@ -85,6 +107,12 @@ impl CompletionSource {
     pub async fn acquire(&mut self, wc_buf: &mut [WorkCompletion]) -> Result<usize> {
         match self {
             Self::ArmPark(s) => s.cq.poll(wc_buf).await,
+            // Busy-poll setup awaits the slot inbox the driver fills (§6.1).
+            Self::Driver(s) => {
+                let slot = &s.slot;
+                let dir = s.dir;
+                poll_fn(|cx| slot.poll_inbox(dir, cx, wc_buf)).await
+            }
         }
     }
 
@@ -95,6 +123,10 @@ impl CompletionSource {
     pub fn try_drain(&mut self, wc_buf: &mut [WorkCompletion]) -> Result<usize> {
         match self {
             Self::ArmPark(s) => s.cq.cq().poll(wc_buf),
+            // Busy-poll teardown is driver-mediated (§6.2); the transport must
+            // never poll the shared CQ, so an arm-park-style teardown drain is a
+            // no-op here.
+            Self::Driver(_) => Ok(0),
         }
     }
 
@@ -110,6 +142,9 @@ impl CompletionSource {
                 s.cq.cq().req_notify(false)?;
                 s.cq.cq().poll(wc_buf)
             }
+            // No arming for a driver-fed inbox; opportunistically take whatever
+            // the driver has already delivered.
+            Self::Driver(s) => Ok(s.slot.drain_inbox(s.dir, wc_buf)),
         }
     }
 
@@ -136,6 +171,8 @@ impl CompletionSource {
                 }
                 Ok(total)
             }
+            // Busy-poll setup awaits the inbox via `acquire`, not a spin here.
+            Self::Driver(_) => Ok(0),
         }
     }
 }

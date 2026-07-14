@@ -1449,6 +1449,7 @@ dependencies = [
  "bitflags",
  "bnd-linux",
  "futures-io",
+ "futures-util",
  "libc",
  "rdma-io-sys",
  "thiserror",
