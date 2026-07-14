@@ -27,6 +27,7 @@ tokio-stream.workspace = true
 futures-io.workspace = true
 futures-util.workspace = true
 tokio-util.workspace = true
+core_affinity = "0.8"
 tracing.workspace = true
 test-log.workspace = true
 tracing-subscriber.workspace = true
