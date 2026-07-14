@@ -87,6 +87,7 @@ async fn backoff_or_giveup(
 #[allow(clippy::too_many_arguments)]
 fn report_result(
     hist: &Histogram<u64>,
+    mode: &str,
     transport: &str,
     connections: usize,
     threads: usize,
@@ -100,7 +101,7 @@ fn report_result(
 ) {
     let result = BenchResult::from_histogram(
         hist,
-        "echo",
+        mode,
         transport,
         connections,
         threads,
@@ -314,6 +315,7 @@ where
 
     report_result(
         &merged,
+        "echo",
         transport_label,
         connections,
         threads,
@@ -534,6 +536,7 @@ pub async fn run_read_ring_busy_client(
 
     report_result(
         &merged,
+        "echo-busy",
         "read-ring",
         connections,
         cores,
@@ -777,6 +780,7 @@ pub async fn run_tcp_echo_client(
 
     report_result(
         &merged,
+        "echo",
         "tcp",
         connections,
         threads,
