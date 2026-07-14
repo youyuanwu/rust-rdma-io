@@ -502,13 +502,16 @@ strict driver→app round-robin, and app futures are cooperative. So:
 
 ### Prerequisites — fix the current impl first
 
-> **Implementation status (2026-07-13).** P1, P2, and **P3/Phase 0 (all three transports)** are
+> **Implementation status (2026-07-14).** P1, P2, and **P3/Phase 0 (all three transports)** are
 > implemented and validated on MANA. read-ring: 5/5 + rh2 bench ~687k rps/0 err. Credit-ring and
 > send-recv migrated to the seam: functional tests pass isolated on a fresh NIC (the full
 > `transport_tests` binary wedges late on accept — confirmed MANA churn, green per-test), echo bench
-> ~1.33M rps/0 err each. Commits on `dev`: `d09aa55` (P1+P2 read-ring), `e8858e7`/`c20f771` (P3
-> read-ring), plus the send-recv/credit-ring seam migration. **Not yet started:** Phase 1 (busy-poll)
-> onward.
+> ~1.33M rps/0 err each. **Phase 1 in progress:** Slice A (`ConnSlot` + `DriverSource` primitives,
+> unit-tested), Slice B (`CoreDriver` shared-CQ reaper + busy-poll read-ring connect/accept — MANA:
+> bidirectional busy echo 1/1, arm-park 5/5 regression-free), and **Slice C part 1** (WR accounting
+> via the `AsyncQp` post choke point — MANA: busy echo runs with no underflow) are done. **In
+> progress:** Slice C part 2 (the `ResourceBundle` reclaim barrier + `qp_num` retirement, designed
+> below). **Not yet started:** Slice D (setup handoff / sharding / bench runner) onward.
 
 Do these before any busy-poll code; each is a small refactor or primitive **testable against
 arm-park alone**, so the new subsystem lands on clean seams rather than on today's scattered CQ
@@ -596,15 +599,17 @@ crate deps needed: an `AtomicWaker` (`atomic-waker` or `futures-util`'s `task`) 
   path through `DriverSource`. Scope: **one connection, one core, pinned `current_thread` runtime**
   (§4.1). Proves the data path end-to-end on hardware without any of the multi-connection or reuse
   hazards. Preserves the single-owner send-CQ invariant (§8) — the driver is that owner.
-- **Slice C — teardown barrier + `ResourceBundle` (the churn-critical slice).** Add the transferable
-  `ResourceBundle` and the §6.2 protocol: `Drop`/cancel/setup-failure `take()`s the bundle onto the
-  driver's **reclaim queue** (RAII destroys nothing), the driver forces the QP to `ERR`
-  (`to_error()`), keeps routing that QP's flush CQEs and decrementing accounting until **both
+- **Slice C — teardown barrier + `ResourceBundle` (the churn-critical slice). [Part 1 done — WR
+  accounting, MANA-validated (busy echo, no underflow); part 2 designed below, in progress.]** Add
+  the transferable `ResourceBundle` and the §6.2 protocol: `Drop`/cancel/setup-failure `take()`s the
+  bundle onto the driver's **reclaim queue** (RAII destroys nothing), the driver forces the QP to
+  `ERR` (`to_error()`), keeps routing that QP's flush CQEs and decrementing accounting until **both
   counters zero and both inboxes empty**, then destroys MWs → QP → MRs in order and **retires** the
   `qp_num` (bump generation; reuse legal only after retirement). This is where MANA churn
   correctness concentrates — a stale CQE mis-routed to a reused `qp_num` is a **fatal** invariant
   breach, not a droppable event. Validate with rapid close/reconnect + `qp_num`-reuse stress on a
-  fresh NIC, and driver-task-panic / runtime-shutdown reclaim.
+  fresh NIC, and driver-task-panic / runtime-shutdown reclaim. **The background-reclaim model and
+  shutdown-join protocol are specified in [Slice C part 2 design](#slice-c-part-2-design--background-reclaim-teardown-as-a-kernel-like-cleanup-task) below.**
 - **Slice D — setup handoff, server CM-ID routing, sharding + admission control.** Add the
   `Connecting`-slot setup handoff (§6.1), the server-side **CM-ID-keyed** control-task routing state
   machine (per-`CmId` `pending` map, dispatch resource creation to the owning worker, migrate the
@@ -616,6 +621,128 @@ crate deps needed: an `AtomicWaker` (`atomic-waker` or `futures-util`'s `task`) 
 Slices A and B are low-risk and unlock everything downstream; C is the correctness crux under MANA
 churn; D makes it multi-connection and measurable. Per §12, correctness scenarios run on **both rxe
 and MANA**, and every slice keeps the **arm-park regression suite green**.
+
+### Slice C part 2 design — background reclaim (teardown as a kernel-like cleanup task)
+
+**The right mental model is TCP `close()`.** When an app closes a TCP socket the `close()` syscall
+returns *immediately*; the kernel keeps the connection's protocol state alive in the background —
+sending its FIN, acking the peer's FIN, retransmitting, and holding the 4-tuple in **`TIME_WAIT`**
+so a delayed segment from the old connection can't be mis-delivered to a new one — and only frees
+the TCB (transmission control block) once that is all quiescent. Busy-poll RDMA teardown wants the
+same shape, and the pieces map almost one-to-one:
+
+| TCP | Busy-poll read-ring |
+|---|---|
+| `close()` returns immediately | transport `Drop` returns immediately (never blocks a worker) |
+| kernel background finishes FIN/ACK, drains in-flight segments | the **`CoreDriver`** reaps the QP's flush CQEs off the shared CQ |
+| free the TCB when quiescent | destroy MW→QP→MR→PD once **both WR counters hit zero** |
+| `TIME_WAIT` blocks 4-tuple reuse | **`qp_num` retirement** blocks routing-key reuse until drained |
+| kernel worker/soft-IRQ context (not the app) | the per-core driver task (not the app task) owns cleanup |
+
+So **yes — there is a background task we hand closing work to, and shutdown joins it.** Two design
+questions the analogy raises, answered:
+
+**1. Global cleanup task, or per-core?** *Per-core* — the `CoreDriver` already running on the
+connection's owning core *is* the background reaper; we do **not** add a separate global task. A
+global reclaimer would have to touch QPs/CQs/MRs that live on *other* cores' `ibv_context`s
+(ibverbs objects are not thread-safe without external sync — §7.5) and would reintroduce the
+cross-core contention the per-core shared CQ exists to avoid. A connection's QP, MRs, ring, and
+`ConnSlot` are core-affine for life (§4.1), so its teardown must run where they live. The "global"
+part is only the **process-level shutdown join** (below), which fans out to every core's driver.
+
+**2. Does `main` wait for it?** *Yes, at process/runtime shutdown* — exactly like a graceful daemon
+that drains connections before exit. The ownership handoff makes this safe:
+
+- **Handoff (never blocks).** Busy-mode RDMA resources live in a transferable `ResourceBundle`
+  (`Option`-held: QP, MWs, MRs, rings, doorbell buffers, PD, `CmId` + event channel, the
+  `Arc<ConnSlot>`, and the WR accounting). `Drop` (and cancel / setup-failure / panic) does three
+  cheap, non-blocking things: mark the slot `Closing`, force the QP to `ERR` (`to_error()`, P1 — so
+  every outstanding WR flushes a CQE *up front*, guaranteeing the drain terminates), and `take()`
+  the bundle onto the driver's **reclaim queue** (`Arc<Mutex<Vec<ResourceBundle>>>` — a plain
+  driver-owned queue, *not* a spawned task, because the runtime may already be shutting down). RAII
+  destroys **nothing** in `Drop` itself.
+- **Drain (the barrier).** Each driver turn, after the data sweep, it walks the reclaim queue with a
+  bounded budget. It keeps routing each reclaiming QP's flush CQEs — but routing becomes
+  **`Closing`-aware**: for a `Closing` slot the driver *discards* the CQE (the app is gone; the
+  ring framing no longer matters) while still **`dec_posted`-ing** it, instead of delivering to the
+  inbox. When a bundle's send and recv counters both reach zero, it transitions `Closing → Drained`.
+- **Free + retire (the `TIME_WAIT`).** Only on `Drained` does the driver destroy the bundle's
+  resources in verbs order (**MWs → QP → MRs → PD**, encoded in `ResourceBundle`'s field order, not
+  prose), then **retire** the slot: bump its generation and **remove `qp_num` from the routing
+  map**. Reuse of that `qp_num` is legal only after retirement, so a straggler flush CQE for the old
+  QP can never be mis-routed to a new connection that happens to be assigned the same number (§4.2)
+  — the direct analogue of `TIME_WAIT`.
+- **Shutdown join (`main` waits).** `CoreDriverHandle::shutdown()` flips a flag; the driver's run
+  loop then **keeps going until the reclaim queue is empty** (every bundle `Drained` + freed) and
+  only then returns. The owner `await`s the driver task's `JoinHandle` **before** the shared CQs and
+  per-core `ibv_context` are dropped — guaranteeing no QP/MR outlives, and no flush CQE is stranded
+  in, a CQ that is about to be destroyed. This is the "wait for the background thread to finish
+  freeing TCBs" step, made explicit.
+
+**Termination guarantee + the wedge escape hatch.** `to_error()` forcing flush up front means the
+expected CQE count is fixed at `Drop` time, so the barrier is not an open-ended wait. But a wedged
+NIC can still fail to deliver a flush CQE (the MANA churn failure mode). So reclaim carries a
+**bounded budget / deadline** (a max number of driver turns, or a coarse timer): on expiry the
+driver logs a fatal-teardown warning, force-destroys the bundle anyway, and retires the `qp_num`.
+That trades a small, logged correctness risk for a shutdown that cannot hang — the same pragmatic
+choice the kernel makes with `TIME_WAIT` / `FIN_WAIT` timeouts. Tuning this budget is Phase 2.
+
+**Failure modes.** If the driver task **panics**, its reclaim queue (an `Arc<Mutex<…>>`) is dropped
+and RAII destroys the pending bundles best-effort (possibly with benign teardown warnings) — no
+use-after-free, because nothing else references those resources. At **runtime shutdown** the driver
+reclaims *every* bundle before the shared CQs/context go (the join above). A bundle whose app
+`Drop` ran while the driver was already gone is likewise freed by the queue's own drop.
+
+**Why not offload destruction to a dedicated task?** `ibv_destroy_qp` / `ibv_dereg_mr` are syscalls,
+and doing them on the hot polling core adds jitter. For Phase 1 we accept that (reclaim is
+infrequent and bounded per turn); a **dedicated per-core reclaim task** — the driver hands `Drained`
+bundles to a lower-priority sibling that only runs the destroy syscalls — is a clean Phase 2
+refinement that keeps the same ownership rules and doesn't change the barrier.
+
+**Rust shape (sketch).**
+
+```rust
+// Resources that must outlive the flush drain — freed by the driver, in field
+// (drop) order: MWs → QP → MRs → PD. `Option` so Drop can move them out.
+struct ResourceBundle {
+    offset_mw: Option<MemoryWindow>,   // MW2, dropped first
+    recv_mw:   Option<MemoryWindow>,   // MW1
+    qp:        Option<AsyncQp>,        // then the QP
+    send_ring: Option<RingBuffer>,     // then the MRs / rings / buffers
+    recv_ring: Option<RingBuffer>,
+    read_buf:  Option<OwnedMemoryRegion>,
+    offset_mr: Option<OwnedMemoryRegion>,
+    doorbell_bufs: Option<Box<[OwnedMemoryRegion]>>,
+    slot:      Arc<ConnSlot>,          // routing key + counters (retired last)
+    cm_id:     Option<CmId>,           // CM state (its own event channel)
+    pd:        Option<Arc<ProtectionDomain>>, // dropped last
+}
+
+impl CoreDriver {
+    // Called each turn after the data sweep; bounded work.
+    fn process_reclaim(&mut self, budget: usize) {
+        self.reclaim.retain_mut(|b| {
+            if b.slot.drain_complete() /* both counters 0 */ {
+                b.slot.set_state(Drained);
+                // drop order frees MW→QP→MR→PD; then retire the routing key.
+                let qp_num = b.slot.qp_num();
+                *b = ResourceBundle::empty(&b.slot); // take()/drop the resources
+                b.slot.retire();                     // bump gen
+                self.slots.remove(&qp_num);          // reuse now legal
+                false                                // done — drop from queue
+            } else {
+                true                                 // still draining
+            }
+        });
+    }
+}
+```
+
+The transport-side change this forces is the **`Option<ReadRingInner>` split**: the RDMA-owning
+fields move behind one option so `Drop` can `take()` them into a `ResourceBundle`, while the
+scalar flow-control state stays inline. Arm-park keeps destroying its bundle inline (today's P2
+drain); busy hands it to the driver. That refactor — not the barrier logic — is the bulk of the
+Slice C part 2 diff, and the arm-park regression suite is the guard rail.
 
 ## 11. Risks and open questions
 
