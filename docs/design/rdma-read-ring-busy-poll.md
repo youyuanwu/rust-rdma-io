@@ -816,11 +816,39 @@ steps 1–3, client + inline accept) is **done**. What remains is everything tha
 connections across M cores: a server that fans accepts out to cores, per-core CQ budgeting,
 connection placement, and a runner that spins M pinned cores.
 
+**Runtime ownership stays with the caller.** The core `rdma-io` crate must **not** build or own a
+runtime: it depends on tokio with only the `net` feature (no `rt`), and `CoreDriver::run()` is an
+ordinary `async fn` the caller spawns on whatever `current_thread` runtime it constructs. Runtime
+topology is deployment **policy**, not a transport concern — which cores to pin, NUMA / HT-sibling
+layout, thread names / panic handlers, and integration with an app's *existing* executor all vary and
+would fight a library-hardcoded pool. So **`BusyPool` is an optional harness-layer helper** (it lives
+in the bench crate / an opt-in module, not in `rdma-io`) wrapping the runtime-agnostic seam already
+shipped: per core it builds a `current_thread` runtime, pins it, spawns one `CoreDriver`, and holds
+its `CoreDriverHandle`. What *does* belong in the core crate is the **placement / admission
+arithmetic** (D3 — per-core CQ budget and cap) plus `CoreDriverHandle` load counters, because those
+are correctness, not thread policy; the pool consumes them. Net: the library gives you the driver +
+`connect_busy`/`accept_busy` + sizing math; you (or the thin pool) own the threads.
+
+**Copies and buffering.** Sharding into a pool adds **no** data-path copy *as long as each
+connection's app loop runs on its own core* (shared-nothing thread-per-core: `client_conn_loop` /
+`server_conn_loop` spawned on the connection's runtime). The only handoff the busy model adds over
+arm-park is the same-core **SPSC `ConnSlot` inbox**: the driver copies each reaped `WorkCompletion`
+(one cache-line struct) into the inbox and the transport drains it. That copy is the intrinsic
+**sole-reaper tax** of a shared CQ — once the driver reaps a CQE it cannot hand the hardware slot
+back (§7.2) — **not** a pool artifact; it is present with one connection too. The data *bytes* are
+untouched: `send_copy` still does its single copy into the registered send ring (unavoidable for the
+one-sided Write), and `recv_buf` still hands out the ring slice in place. Extra copy / buffering
+appears in exactly one case: routing application data **across** cores — e.g. a work-stealing
+front-end that accepts on any thread but must send on a connection pinned elsewhere — which needs a
+cross-core channel (a copy, a queue, and a cross-core wake). That is a caller topology choice, and
+avoiding it (co-locating per-connection work on the connection's core) is the whole point of
+thread-per-core — another reason placement is the caller's to own.
+
 #### D1 — Sharding + per-core worker pool (client first)
 
-- A **`BusyPool`**: M `current_thread` runtimes, one per pinned core
-  (`core_affinity::set_for_current`), each owning exactly one `CoreDriver` task plus its
-  `CoreDriverHandle`. The shared building block for client and server.
+- A **`BusyPool`** (harness-layer, per *Runtime ownership* above): M `current_thread` runtimes, one
+  per pinned core (`core_affinity::set_for_current`), each owning exactly one `CoreDriver` task plus
+  its `CoreDriverHandle`. The shared building block for client and server.
 - **Placement.** A connection is assigned to a core at creation and is core-affine for life (§4.1,
   §7.5). Start **round-robin**; leave a `least-loaded` hook (per-core connection count) for later.
   No migration — a live QP/CQ/slot cannot move cheaply.
