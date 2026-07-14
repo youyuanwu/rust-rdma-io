@@ -75,6 +75,43 @@ async fn server_echo_loop(mut t: ReadRingTransport, count: usize) {
     let _ = t.disconnect();
 }
 
+/// Arm-park server side: echo every received message back until the peer
+/// disconnects (used by the mixed-load / disconnect-isolation tests, where each
+/// client sends a different, unknown number of messages before closing).
+async fn server_echo_until_close(mut t: ReadRingTransport) {
+    loop {
+        let mut c = [RecvCompletion::default(); 1];
+        // `Some(Some(data))` = a message to echo; `Some(None)` = progress with no
+        // message; `None` = the peer closed (disconnect or fatal completion).
+        let step = poll_fn(|cx| match t.poll_recv(cx, &mut c) {
+            Poll::Ready(Ok(n)) => {
+                if n > 0 {
+                    let data = t.recv_buf(c[0].buf_idx)[..c[0].byte_len].to_vec();
+                    t.repost_recv(c[0].buf_idx).unwrap();
+                    Poll::Ready(Some(Some(data)))
+                } else {
+                    Poll::Ready(Some(None))
+                }
+            }
+            Poll::Ready(Err(_)) => Poll::Ready(None),
+            Poll::Pending => {
+                if t.poll_disconnect(cx) {
+                    Poll::Ready(None)
+                } else {
+                    Poll::Pending
+                }
+            }
+        })
+        .await;
+        match step {
+            Some(Some(data)) => send_msg(&mut t, &data, "server echo send").await,
+            Some(None) => {}
+            None => break,
+        }
+    }
+    let _ = t.disconnect();
+}
+
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn read_ring_busy_pool_multi_core_echo() {
     require_no_iwarp!();
@@ -284,6 +321,148 @@ async fn read_ring_busy_pool_admission_cap() {
 
     // Every slot is freed again once the connections have been reclaimed.
     assert_eq!(pool.admitted_counts(), vec![0], "slots freed after close");
+
+    pool.shutdown();
+    drop(probe);
+}
+
+// Slice D correctness: many connections on ONE core share a single busy-polled
+// CQ, under a hot/idle load mix (some connections stream heavily, others barely).
+// The per-core driver must reap the shared CQ and route each completion to the
+// right connection's inbox with no starvation and no cross-talk — every
+// connection completes its own sequence and every echo matches its own payload.
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn read_ring_busy_pool_shared_cq_fairness() {
+    require_no_iwarp!();
+
+    const CONNS: usize = 6; // all on ONE core => one shared CQ
+    const HOT_MSGS: usize = 300; // heavy streamers (even ids)
+    const COOL_MSGS: usize = 5; // light streamers (odd ids)
+    const MSG_LEN: usize = 256;
+
+    let config = ReadRingConfig::default();
+    let listener = bind_listener_with_retry().await;
+    let connect_addr = connect_addr_for(listener.local_addr());
+
+    let probe = AsyncCmId::new(PortSpace::Tcp).unwrap();
+    probe.resolve_addr(None, &connect_addr, 2000).await.unwrap();
+    let ctx = probe.verbs_context().expect("probe has no verbs context");
+
+    // Arm-park server: accept CONNS, echo each until its client disconnects
+    // (clients send different, unknown message counts).
+    let server_cfg = config.clone();
+    let server = tokio::spawn(async move {
+        let mut conns = Vec::with_capacity(CONNS);
+        for _ in 0..CONNS {
+            let t = ReadRingTransport::accept(&listener, server_cfg.clone())
+                .await
+                .expect("server accept");
+            conns.push(tokio::spawn(server_echo_until_close(t)));
+        }
+        for h in conns {
+            h.await.expect("server echo task panicked");
+        }
+    });
+
+    // Single-core pool: all CONNS share ONE busy-polled CQ.
+    let pool = BusyPool::new(ctx, &[0], 1024, 1024).expect("build busy pool");
+
+    let mut clients = Vec::with_capacity(CONNS);
+    for i in 0..CONNS {
+        let cfg = config.clone();
+        let msgs = if i % 2 == 0 { HOT_MSGS } else { COOL_MSGS };
+        clients.push(
+            pool.spawn_connect(connect_addr, cfg, move |mut t| async move {
+                for m in 0..msgs {
+                    // Seed the payload by connection id so a mis-routed echo
+                    // (another connection's data) is caught.
+                    let data = payload(i * 1_000_000 + m, MSG_LEN);
+                    send_msg(&mut t, &data, "client send").await;
+                    let got = recv_msg(&mut t, "client recv").await;
+                    assert_eq!(got, data, "conn {i} msg {m} echo mismatch (cross-talk?)");
+                }
+            })
+            .expect("uncapped pool always admits"),
+        );
+    }
+
+    for (i, h) in clients.into_iter().enumerate() {
+        h.await
+            .unwrap_or_else(|e| panic!("client {i} task panicked: {e}"))
+            .unwrap_or_else(|e| panic!("client {i} connect_busy failed: {e}"));
+    }
+    server.await.expect("server task panicked");
+
+    pool.shutdown();
+    drop(probe);
+}
+
+// Slice D correctness: one connection on a shared core disconnects mid-stream
+// (its transport `Drop` triggers the busy reclaim barrier on that core) while
+// its siblings on the SAME core keep streaming. The reclaim of the departing
+// connection must not disrupt the survivors — they complete their full sequence
+// with correct echoes, and the pool shuts down cleanly (reclaim drained).
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn read_ring_busy_pool_disconnect_isolation() {
+    require_no_iwarp!();
+
+    const CONNS: usize = 4; // all on one core
+    const EARLY_MSGS: usize = 3; // conn 0 drops early
+    const SURVIVOR_MSGS: usize = 150; // the rest keep streaming
+    const MSG_LEN: usize = 256;
+
+    let config = ReadRingConfig::default();
+    let listener = bind_listener_with_retry().await;
+    let connect_addr = connect_addr_for(listener.local_addr());
+
+    let probe = AsyncCmId::new(PortSpace::Tcp).unwrap();
+    probe.resolve_addr(None, &connect_addr, 2000).await.unwrap();
+    let ctx = probe.verbs_context().expect("probe has no verbs context");
+
+    let server_cfg = config.clone();
+    let server = tokio::spawn(async move {
+        let mut conns = Vec::with_capacity(CONNS);
+        for _ in 0..CONNS {
+            let t = ReadRingTransport::accept(&listener, server_cfg.clone())
+                .await
+                .expect("server accept");
+            conns.push(tokio::spawn(server_echo_until_close(t)));
+        }
+        for h in conns {
+            h.await.expect("server echo task panicked");
+        }
+    });
+
+    let pool = BusyPool::new(ctx, &[0], 1024, 1024).expect("build busy pool");
+
+    let mut clients = Vec::with_capacity(CONNS);
+    for i in 0..CONNS {
+        let cfg = config.clone();
+        // conn 0 drops after a few messages (early disconnect + reclaim);
+        // conns 1..CONNS keep streaming a long sequence on the same core.
+        let msgs = if i == 0 { EARLY_MSGS } else { SURVIVOR_MSGS };
+        clients.push(
+            pool.spawn_connect(connect_addr, cfg, move |mut t| async move {
+                for m in 0..msgs {
+                    let data = payload(i * 1_000_000 + m, MSG_LEN);
+                    send_msg(&mut t, &data, "client send").await;
+                    let got = recv_msg(&mut t, "client recv").await;
+                    assert_eq!(got, data, "conn {i} msg {m} echo mismatch");
+                }
+                // Returning here drops the transport: conn 0 tears down (busy
+                // reclaim on the shared core) while the survivors are still
+                // streaming through the same driver.
+            })
+            .expect("uncapped pool always admits"),
+        );
+    }
+
+    for (i, h) in clients.into_iter().enumerate() {
+        h.await
+            .unwrap_or_else(|e| panic!("client {i} task panicked: {e}"))
+            .unwrap_or_else(|e| panic!("client {i} connect_busy failed: {e}"));
+    }
+    server.await.expect("server task panicked");
 
     pool.shutdown();
     drop(probe);
