@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
-use crate::conn_slot::{ConnSlot, Dir};
+use crate::conn_slot::{ConnSlot, Dir, SlotState};
 use crate::cq::CompletionQueue;
 use crate::device::Context;
 use crate::wc::WorkCompletion;
@@ -41,7 +41,32 @@ use crate::wc::WorkCompletion;
 /// completions (§5.2, §9).
 const MAX_CQE_PER_CQ: usize = 64;
 
+/// Max reclaim turns a bundle may take before the driver force-frees it (the
+/// wedge escape hatch, §10). Generous: `to_error()` normally flushes every
+/// outstanding WR within a handful of turns, so this only trips on a wedged
+/// NIC that never delivers a flush CQE.
+const RECLAIM_MAX_TURNS: usize = 4096;
+
 type SlotMap = Arc<Mutex<HashMap<u32, Arc<ConnSlot>>>>;
+type ReclaimQueue = Arc<Mutex<Vec<ReclaimEntry>>>;
+
+/// A connection's resources awaiting teardown reclaim (§6.2 / §10).
+///
+/// `Drop` hands one of these to the driver instead of destroying the QP/MRs
+/// synchronously (which is illegal while flush CQEs for them may still be in the
+/// shared CQ). The driver drains the flush CQEs to zero, then frees `resources`
+/// (dropping the concrete transport-inner in verbs order) and retires `slot`.
+struct ReclaimEntry {
+    slot: Arc<ConnSlot>,
+    /// Type-erased owner of the RDMA/CM resources (e.g. a read-ring
+    /// `ReadRingInner`). `None` once freed on `Drained`. Dropped on the driver's
+    /// core, which is the resources' owner core (§7.5), so the verbs destroys
+    /// run where the objects live.
+    resources: Option<Box<dyn Send>>,
+    /// Reclaim turns spent; bounds the wait so a wedged NIC cannot hang
+    /// shutdown (§10 wedge escape hatch).
+    turns: usize,
+}
 
 /// The per-core reaper. Built with [`CoreDriver::new`], which also returns a
 /// [`CoreDriverHandle`] for registering connections and building QPs against the
@@ -50,6 +75,8 @@ pub struct CoreDriver {
     send_cq: Arc<CompletionQueue>,
     recv_cq: Arc<CompletionQueue>,
     slots: SlotMap,
+    /// Connections handed off for background teardown (§6.2 / §10).
+    reclaim: ReclaimQueue,
     shutdown: Arc<AtomicBool>,
     /// Count of completions whose `qp_num` was not in the routing map. Post-
     /// retirement-barrier (Slice C) this is impossible (§4.2); a nonzero value
@@ -64,6 +91,7 @@ pub struct CoreDriverHandle {
     send_cq: Arc<CompletionQueue>,
     recv_cq: Arc<CompletionQueue>,
     slots: SlotMap,
+    reclaim: ReclaimQueue,
     shutdown: Arc<AtomicBool>,
     unknown_qp: Arc<AtomicU64>,
 }
@@ -83,12 +111,14 @@ impl CoreDriver {
         let send_cq = CompletionQueue::new(ctx.clone(), send_depth)?;
         let recv_cq = CompletionQueue::new(ctx, recv_depth)?;
         let slots: SlotMap = Arc::new(Mutex::new(HashMap::new()));
+        let reclaim: ReclaimQueue = Arc::new(Mutex::new(Vec::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
         let unknown_qp = Arc::new(AtomicU64::new(0));
         let handle = CoreDriverHandle {
             send_cq: send_cq.clone(),
             recv_cq: recv_cq.clone(),
             slots: slots.clone(),
+            reclaim: reclaim.clone(),
             shutdown: shutdown.clone(),
             unknown_qp: unknown_qp.clone(),
         };
@@ -96,6 +126,7 @@ impl CoreDriver {
             send_cq,
             recv_cq,
             slots,
+            reclaim,
             shutdown,
             unknown_qp,
         };
@@ -144,14 +175,83 @@ impl CoreDriver {
     pub async fn run(self) {
         let mut recv_batch = [WorkCompletion::default(); MAX_CQE_PER_CQ];
         let mut send_batch = [WorkCompletion::default(); MAX_CQE_PER_CQ];
-        while !self.shutdown.load(Ordering::Acquire) {
+        loop {
             self.sweep(Dir::Recv, &mut recv_batch);
             self.sweep(Dir::Send, &mut send_batch);
+            // Advance teardown reclaim: drain handed-off connections' flush CQEs,
+            // then free + retire the ones that reached the drain barrier (§6.2 /
+            // §10).
+            self.process_reclaim(RECLAIM_MAX_TURNS);
+            // Shutdown drains: once asked to stop, keep sweeping + reclaiming
+            // until every handed-off bundle is freed, so no QP/MR outlives — and
+            // no flush CQE is stranded in — the shared CQs about to be dropped
+            // (§10 shutdown join).
+            if self.shutdown.load(Ordering::Acquire)
+                && self
+                    .reclaim
+                    .lock()
+                    .expect("CoreDriver reclaim queue poisoned")
+                    .is_empty()
+            {
+                break;
+            }
             // Cooperative, runtime-agnostic yield: hand the core to app tasks
             // for one turn, then resume. Avoids depending on tokio's "rt"
             // feature (this crate enables only "net").
             yield_now().await;
         }
+    }
+
+    /// Advance the teardown reclaim queue by one bounded pass (§6.2 / §10).
+    ///
+    /// For each handed-off (`Closing`) bundle: discard any inbox backlog (CQEs
+    /// delivered before the app dropped), then test the drain barrier
+    /// ([`ConnSlot::drain_complete`]). When both WR counters are zero and both
+    /// inboxes empty — or the per-bundle `budget` of turns is exhausted (the
+    /// wedge escape hatch) — mark it `Drained`, free its resources (dropping the
+    /// transport-inner in verbs order MW→QP→MR→PD), retire the slot, and remove
+    /// its `qp_num` from the routing map so the number may be reused (§4.2, the
+    /// `TIME_WAIT` analogue).
+    fn process_reclaim(&self, budget: usize) {
+        let mut scratch = [WorkCompletion::default(); MAX_CQE_PER_CQ];
+        let mut queue = self
+            .reclaim
+            .lock()
+            .expect("CoreDriver reclaim queue poisoned");
+        queue.retain_mut(|entry| {
+            // Discard any inbox backlog delivered before the app dropped, so the
+            // barrier (which requires both inboxes empty) can complete. Fully
+            // drain this turn; `route_into` discards further CQEs for a `Closing`
+            // slot, so the inboxes stay empty afterwards.
+            while entry.slot.drain_inbox(Dir::Send, &mut scratch) > 0 {}
+            while entry.slot.drain_inbox(Dir::Recv, &mut scratch) > 0 {}
+            entry.turns += 1;
+
+            let done = entry.slot.drain_complete();
+            let wedged = entry.turns >= budget;
+            if !done && !wedged {
+                return true; // still draining — keep in the queue
+            }
+            if wedged && !done {
+                tracing::error!(
+                    qp_num = entry.slot.qp_num(),
+                    posted_send = entry.slot.posted(Dir::Send),
+                    posted_recv = entry.slot.posted(Dir::Recv),
+                    "CoreDriver: reclaim budget exhausted; force-freeing (NIC wedge, §12)"
+                );
+            }
+            entry.slot.set_state(SlotState::Drained);
+            let qp_num = entry.slot.qp_num();
+            // Free MW→QP→MR→PD via the inner's field drop order, *then* retire
+            // the routing key (reuse barrier) once the resources are gone.
+            entry.resources = None;
+            entry.slot.retire();
+            self.slots
+                .lock()
+                .expect("CoreDriver slot map poisoned")
+                .remove(&qp_num);
+            false // done — drop the entry
+        });
     }
 }
 
@@ -189,6 +289,25 @@ impl CoreDriverHandle {
         self.shutdown.store(true, Ordering::Release);
     }
 
+    /// Hand a connection's resources to the driver for background teardown
+    /// (§6.2 / §10). **Non-blocking**: pushes the bundle onto the reclaim queue;
+    /// the driver drains the QP's flush CQEs, frees the resources (dropping
+    /// `resources` in verbs order), and retires the `qp_num`.
+    ///
+    /// The caller (transport `Drop`) must already have marked `slot` `Closing`
+    /// and forced its QP to `ERR` (`to_error()`), so the flush terminates. Only
+    /// owner-agnostic ops may run before this call (§10).
+    pub fn reclaim(&self, slot: Arc<ConnSlot>, resources: Box<dyn Send>) {
+        self.reclaim
+            .lock()
+            .expect("CoreDriver reclaim queue poisoned")
+            .push(ReclaimEntry {
+                slot,
+                resources: Some(resources),
+                turns: 0,
+            });
+    }
+
     /// Count of completions routed to an unknown `qp_num` (§4.2). Zero in a
     /// correct run; nonzero signals a retirement-barrier breach.
     pub fn unknown_qp_count(&self) -> u64 {
@@ -214,6 +333,13 @@ fn route_into(
                 // this drives the teardown barrier to zero. Underflow is a fatal
                 // accounting bug (dec without a matching post).
                 slot.dec_posted(dir);
+                // Teardown: once the app has dropped and the slot is `Closing`,
+                // discard the CQE (the ring framing no longer matters) but still
+                // count it down so the drain barrier can reach zero. Delivering
+                // would refill the inbox that reclaim just drained (§10).
+                if matches!(slot.state(), SlotState::Closing | SlotState::Drained) {
+                    continue;
+                }
                 match slot.deliver(dir, *wc) {
                     Ok(()) => {
                         if !woken.contains(&qp_num) {
@@ -428,5 +554,48 @@ mod tests {
             Poll::Ready(Ok(1)) => assert_eq!(out[0].wr_id(), 200),
             other => panic!("recv: expected Ready(Ok(1)), got {other:?}"),
         }
+    }
+
+    // A `Closing` slot's flush CQEs are counted down (so the drain barrier can
+    // reach zero) but NOT delivered to the inbox — otherwise reclaim's inbox
+    // drain would be refilled and the barrier would never complete (§10).
+    #[test]
+    fn closing_slot_discards_but_decrements() {
+        let a = slot(10);
+        let mut map = HashMap::new();
+        map.insert(10u32, a.clone());
+        let unknown = AtomicU64::new(0);
+
+        // Two posts outstanding on each direction, then teardown begins.
+        a.inc_posted(Dir::Send);
+        a.inc_posted(Dir::Send);
+        a.inc_posted(Dir::Recv);
+        a.inc_posted(Dir::Recv);
+        a.set_state(SlotState::Closing);
+        assert!(!a.drain_complete());
+
+        // The forced-ERR flush CQEs arrive on the shared CQ.
+        route_into(&map, &unknown, Dir::Send, &[wc_for(10, 1), wc_for(10, 2)]);
+        route_into(&map, &unknown, Dir::Recv, &[wc_for(10, 3), wc_for(10, 4)]);
+
+        // Every CQE was accounted (nothing mis-routed) ...
+        assert_eq!(unknown.load(Ordering::Relaxed), 0);
+        assert_eq!(a.posted(Dir::Send), 0);
+        assert_eq!(a.posted(Dir::Recv), 0);
+        // ... but none were delivered: both inboxes stay empty, so the barrier
+        // is now satisfied.
+        let cw = CountingWaker::new();
+        let waker = cw.waker();
+        let mut cx = TaskContext::from_waker(&waker);
+        let mut out = [WorkCompletion::default(); 8];
+        assert!(matches!(
+            a.poll_inbox(Dir::Send, &mut cx, &mut out),
+            Poll::Pending
+        ));
+        assert!(matches!(
+            a.poll_inbox(Dir::Recv, &mut cx, &mut out),
+            Poll::Pending
+        ));
+        assert!(a.drain_complete());
     }
 }

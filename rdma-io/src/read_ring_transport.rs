@@ -309,6 +309,12 @@ struct ReadRingInner {
 /// them out (`Drop` `take()`s it). See §6.2 / §10 for the reclaim protocol.
 pub struct ReadRingTransport {
     inner: Option<ReadRingInner>,
+    /// Busy-poll only: the connection's routing slot, retired by the driver on
+    /// reclaim. `None` in arm-park mode.
+    slot: Option<Arc<ConnSlot>>,
+    /// Busy-poll only: handle used to hand `inner` to the driver's reclaim queue
+    /// on `Drop`. `None` in arm-park mode (which drains inline).
+    reclaim: Option<CoreDriverHandle>,
 }
 
 impl ReadRingTransport {
@@ -768,7 +774,11 @@ impl ReadRingTransport {
             max_outstanding,
             config,
         );
-        Ok(ReadRingTransport { inner: Some(inner) })
+        Ok(ReadRingTransport {
+            inner: Some(inner),
+            slot: conn_slot,
+            reclaim: driver.cloned(),
+        })
     }
 
     /// Accept an incoming connection (server side), arm-park mode.
@@ -940,7 +950,11 @@ impl ReadRingTransport {
             max_outstanding,
             config,
         );
-        Ok(ReadRingTransport { inner: Some(inner) })
+        Ok(ReadRingTransport {
+            inner: Some(inner),
+            slot: conn_slot,
+            reclaim: driver.cloned(),
+        })
     }
 }
 
@@ -1663,13 +1677,31 @@ impl ReadRingInner {
 
 impl Drop for ReadRingTransport {
     fn drop(&mut self) {
-        // Move the RDMA/CM resources out and drain them synchronously (arm-park
-        // path). The busy-poll reclaim handoff (§6.2 / §10) replaces this branch
-        // in Slice C part 2; today both modes take this path (a driver source's
-        // `try_drain` is a no-op, so busy simply relies on `ibv_destroy_qp`).
-        if let Some(mut inner) = self.inner.take() {
-            inner.drain_teardown();
-            // `inner` drops here: MW2 → MW1 → QP → MRs → PD (field order).
+        let Some(mut inner) = self.inner.take() else {
+            return;
+        };
+        match (self.reclaim.take(), self.slot.take()) {
+            // Busy-poll: non-blocking handoff to the driver's reclaim queue
+            // (§6.2 / §10). Only owner-agnostic ops run here — mark the slot
+            // `Closing`, optionally notify the peer, and force the QP to `ERR`
+            // so every outstanding WR flushes a CQE the driver will reap. The
+            // driver drains those to zero, frees `inner` (MW2 → MW1 → QP → MRs →
+            // PD via field order), and retires the `qp_num`. We must NOT drain
+            // here: the CQ is shared (only the driver may poll it) and this
+            // `Drop` may run on a worker whose runtime is already shutting down.
+            (Some(handle), Some(slot)) => {
+                slot.set_state(SlotState::Closing);
+                if !inner.disconnected {
+                    let _ = inner.cm_id.disconnect();
+                }
+                let _ = inner.qp.to_error();
+                handle.reclaim(slot, Box::new(inner));
+            }
+            // Arm-park: private CQs, synchronous bounded drain, then drop `inner`
+            // (MW2 → MW1 → QP → MRs → PD via field order).
+            _ => {
+                inner.drain_teardown();
+            }
         }
     }
 }

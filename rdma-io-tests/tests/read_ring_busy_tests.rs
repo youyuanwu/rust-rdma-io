@@ -1,13 +1,15 @@
-//! Busy-poll (`CoreDriver`) read-ring integration test — Phase 1 Slice B.
+//! Busy-poll (`CoreDriver`) read-ring integration test.
 //!
 //! Proves the read-ring **data path** end-to-end when completions are produced
 //! by the per-core shared-CQ [`CoreDriver`] instead of per-connection arm-park
 //! CQs: one driver on one (pinned) `current_thread` runtime serves both ends of
 //! a loopback connection, demuxing by `qp_num` into each connection's inbox.
 //!
-//! Scope (Slice B): single core, one connection pair, data path only. WR
-//! accounting and the teardown barrier are Slice C — teardown here just stops
-//! the driver and drops the transports.
+//! Also exercises the Slice C teardown barrier: dropping a busy transport hands
+//! its resources to the driver's reclaim queue, and the driver drains the flush
+//! CQEs to zero, frees the resources, and retires the `qp_num` before the
+//! shutdown join returns. The churn test additionally stresses the
+//! `qp_num`-retirement (TIME_WAIT) reuse guard across rapid reconnects.
 
 use std::future::poll_fn;
 use std::task::Poll;
@@ -134,11 +136,84 @@ async fn read_ring_busy_echo_bidirectional() {
         "driver routed a completion to an unknown qp_num"
     );
 
-    // Teardown (Slice B): stop the driver, then drop the transports. The full
-    // ResourceBundle teardown barrier is Slice C.
-    handle.shutdown();
-    let _ = driver_task.await;
+    // Teardown (Slice C reclaim barrier): drop the transports FIRST so each busy
+    // `Drop` hands its resources to the driver's reclaim queue (forcing the QP to
+    // ERR up front). Then ask the driver to stop: its run loop keeps sweeping +
+    // reclaiming until every handed-off bundle has drained to zero, been freed,
+    // and had its `qp_num` retired — only then does the task return. A clean
+    // `Ok(())` join is the assertion that the barrier completed without wedging
+    // or a WR-accounting underflow panic.
     drop(client);
     drop(server);
+    handle.shutdown();
+    driver_task
+        .await
+        .expect("driver task panicked (barrier underflow or wedge)");
+
+    assert_eq!(
+        handle.unknown_qp_count(),
+        0,
+        "driver routed a completion to an unknown qp_num during teardown"
+    );
+    drop(probe);
+}
+
+/// Rapid connect → echo → drop churn on a single driver: exercises the Slice C
+/// reclaim barrier and the `qp_num`-retirement (TIME_WAIT) reuse guard. Each
+/// dropped transport hands its resources to the driver's reclaim queue; the
+/// driver must drain, free, and retire each before its `qp_num` can be reused,
+/// with no completion ever mis-routed to a stale/reused slot.
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+async fn read_ring_busy_reconnect_churn() {
+    require_no_iwarp!();
+
+    let config = ReadRingConfig::default();
+    let listener = bind_listener_with_retry().await;
+    let connect_addr = connect_addr_for(listener.local_addr());
+
+    let probe = AsyncCmId::new(PortSpace::Tcp).unwrap();
+    probe.resolve_addr(None, &connect_addr, 2000).await.unwrap();
+    let ctx = probe.verbs_context().expect("probe has no verbs context");
+
+    let (driver, handle) = CoreDriver::new(ctx, 1024, 1024).unwrap();
+    let driver_task = tokio::spawn(driver.run());
+
+    // Each cycle establishes a fresh pair over the SAME driver/shared CQs, echoes
+    // one message, then drops both ends. The two dropped bundles must be fully
+    // reclaimed (drained + freed + retired) before their QPs/`qp_num`s are reused
+    // by a later cycle — the churn-critical path.
+    for cycle in 0..24usize {
+        // Concurrently accept + connect on this task (no spawn — the listener is
+        // reused across cycles, so it cannot be moved into a task).
+        let accept_fut = ReadRingTransport::accept_busy(&listener, config.clone(), &handle);
+        let connect_fut = ReadRingTransport::connect_busy(&connect_addr, config.clone(), &handle);
+        let (server, client) = tokio::join!(accept_fut, connect_fut);
+        let mut server = server.unwrap();
+        let mut client = client.unwrap();
+
+        let data = payload(cycle, 128);
+        send_msg(&mut client, &data, "churn client->server send").await;
+        let got = recv_msg(&mut server, "churn client->server recv").await;
+        assert_eq!(got, data, "payload mismatch at cycle {cycle}");
+
+        // Drop both ends → two reclaim handoffs. Yield repeatedly so the driver
+        // reaps the flush CQEs and retires both `qp_num`s before the next cycle.
+        drop(client);
+        drop(server);
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            handle.unknown_qp_count(),
+            0,
+            "driver mis-routed a completion (stale/reused qp_num) at cycle {cycle}"
+        );
+    }
+
+    handle.shutdown();
+    driver_task
+        .await
+        .expect("driver task panicked during churn reclaim");
+    assert_eq!(handle.unknown_qp_count(), 0);
     drop(probe);
 }
