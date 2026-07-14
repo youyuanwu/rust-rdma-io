@@ -580,7 +580,7 @@ arbitrary-CQ ([`create_qp_with_cq`](../../rdma-io/src/async_cm.rs)); the poster 
 (`to_error()`, P1); and the routing key ([`WorkCompletion::qp_num()`](../../rdma-io/src/wc.rs)). New
 crate deps needed: an `AtomicWaker` (`atomic-waker` or `futures-util`'s `task`) and `core_affinity`.
 
-- **Slice A — `ConnSlot` + `DriverSource` primitives (no driver, no hardware).** Add `ConnSlot`
+- **Slice A — `ConnSlot` + `DriverSource` primitives (no driver, no hardware). [Done.]** Add `ConnSlot`
   (per-direction bounded inbox sized overflow-free per §7.2, an `AtomicWaker` per direction with the
   §7.3 register–check–recheck ordering, the separate send/recv WR counters of §6.2, and the
   `Connecting/Established/Closing/Drained` lifecycle state), the `Driver(DriverSource)` variant +
@@ -588,7 +588,8 @@ crate deps needed: an `AtomicWaker` (`atomic-waker` or `futures-util`'s `task`) 
   producer feeding the inbox — covers the completion-arrived-before-registration race, both-
   directions wake, coalesced wakes, and counter underflow = fatal. Builds and tests **locally, no
   RDMA device**. Keeps `CompletionSource` compiling in both variants.
-- **Slice B — `CoreDriver` + single connection, read-ring, one pinned core.** Add the `CoreDriver`
+- **Slice B — `CoreDriver` + single connection, read-ring, one pinned core. [Done — validated on
+  MANA: bidirectional busy echo 1/1, arm-park read-ring 5/5 regression-free.]** Add the `CoreDriver`
   task (sole reaper of one shared send/recv CQ pair, `qp_num → Arc<ConnSlot>` map, the bounded
   cooperative loop of §5.2 with `MAX_CQE_PER_CQ`/`MAX_CQE_PER_TURN` + `yield_now`, unknown-`qp_num`
   = fatal per §4.2), build the read-ring QP against the shared CQs, route setup drain and the data
