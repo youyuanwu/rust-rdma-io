@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
+use rdma_io::async_cm::AsyncCmListener;
 use rdma_io::core_driver::{CoreDriver, CoreDriverHandle};
 use rdma_io::device::Context;
 use rdma_io::read_ring_transport::{ReadRingConfig, ReadRingTransport};
@@ -131,6 +132,58 @@ impl BusyPool {
             let transport = ReadRingTransport::connect_busy(&addr, config, &driver).await?;
             Ok(app(transport).await)
         })
+    }
+
+    /// Serve `count` busy-poll read-ring connections: accept each on the pool
+    /// (round-robin across cores) and run `app` with it **on its owning core**.
+    ///
+    /// The accept *handshake* is **serialized** — the pool waits for each
+    /// connection's setup to finish touching the listener before accepting the
+    /// next — so the listener has a single consumer at a time and an
+    /// `Established` can never be matched to the wrong connection (§6.1). This is
+    /// the pragmatic realization of the "CM-ID-keyed control task": rather than a
+    /// single task that routes concurrent handshakes' events by CM ID, one
+    /// handshake is in flight at a time, so no routing is needed. The
+    /// per-connection `app` loops run **concurrently** across cores once their
+    /// own setup completes; only setup is serialized (it is not the hot path).
+    ///
+    /// Returns a [`JoinHandle`] per served connection; await them (each transport
+    /// `Drop` then hands off to its core's reclaim queue) before
+    /// [`shutdown`](Self::shutdown).
+    pub async fn serve<F, Fut>(
+        &self,
+        listener: Arc<AsyncCmListener>,
+        config: ReadRingConfig,
+        count: usize,
+        app: F,
+    ) -> Vec<JoinHandle<()>>
+    where
+        F: Fn(ReadRingTransport) -> Fut + Clone + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let mut handles = Vec::with_capacity(count);
+        for _ in 0..count {
+            let worker = self.next_worker();
+            let driver = worker.driver.clone();
+            let listener = listener.clone();
+            let config = config.clone();
+            let app = app.clone();
+            // The worker signals when its handshake is done touching the
+            // listener, so the pool can accept the next connection.
+            let (setup_tx, setup_rx) = tokio::sync::oneshot::channel::<()>();
+            let handle = worker.rt.spawn(async move {
+                let result = ReadRingTransport::accept_busy(&listener, config, &driver).await;
+                let _ = setup_tx.send(());
+                match result {
+                    Ok(transport) => app(transport).await,
+                    Err(e) => tracing::warn!(error = %e, "busy pool accept failed"),
+                }
+            });
+            handles.push(handle);
+            // Serialize the handshake: a single listener consumer at a time.
+            let _ = setup_rx.await;
+        }
+        handles
     }
 
     /// Stop every driver (draining its reclaim queue) and join the worker

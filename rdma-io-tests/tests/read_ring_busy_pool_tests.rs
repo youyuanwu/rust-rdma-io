@@ -13,6 +13,7 @@
 //! the read-ring wire protocol is identical, so the modes interoperate.
 
 use std::future::poll_fn;
+use std::sync::Arc;
 use std::task::Poll;
 
 use rdma_io::async_cm::AsyncCmId;
@@ -141,6 +142,65 @@ async fn read_ring_busy_pool_multi_core_echo() {
 
     // Clean shutdown-join: stop each driver, drain its reclaim queue, join the
     // pinned threads. A hang here would mean a wedged reclaim barrier.
+    pool.shutdown();
+    drop(probe);
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn read_ring_busy_pool_server_echo() {
+    require_no_iwarp!();
+
+    const CORES: usize = 2;
+    const CONNS: usize = 6;
+    const MSGS: usize = 8;
+    const MSG_LEN: usize = 256;
+
+    let config = ReadRingConfig::default();
+    let listener = Arc::new(bind_listener_with_retry().await);
+    let connect_addr = connect_addr_for(listener.local_addr());
+
+    let probe = AsyncCmId::new(PortSpace::Tcp).unwrap();
+    probe.resolve_addr(None, &connect_addr, 2000).await.unwrap();
+    let ctx = probe.verbs_context().expect("probe has no verbs context");
+
+    let core_ids: Vec<usize> = (0..CORES).collect();
+    let pool = BusyPool::new(ctx, &core_ids, 1024, 1024).expect("build busy pool");
+
+    // Arm-park clients connect + echo. Spawned first so they are connecting while
+    // the busy pool server accepts (the handshake is serialized server-side).
+    let mut clients = Vec::with_capacity(CONNS);
+    for i in 0..CONNS {
+        let addr = connect_addr;
+        let cfg = config.clone();
+        clients.push(tokio::spawn(async move {
+            let mut t = ReadRingTransport::connect(&addr, cfg)
+                .await
+                .expect("client connect");
+            for m in 0..MSGS {
+                let data = payload(i * 100 + m, MSG_LEN);
+                send_msg(&mut t, &data, "client send").await;
+                let got = recv_msg(&mut t, "client recv").await;
+                assert_eq!(got, data, "conn {i} msg {m} payload mismatch");
+            }
+        }));
+    }
+
+    // Busy-poll server: accept CONNS on the pool (round-robin across cores) and
+    // echo MSGS on each connection's owning core.
+    let servers = pool
+        .serve(listener.clone(), config.clone(), CONNS, move |t| {
+            server_echo_loop(t, MSGS)
+        })
+        .await;
+
+    for (i, h) in clients.into_iter().enumerate() {
+        h.await
+            .unwrap_or_else(|e| panic!("client {i} panicked: {e}"));
+    }
+    for h in servers {
+        h.await.expect("server conn task panicked");
+    }
+
     pool.shutdown();
     drop(probe);
 }

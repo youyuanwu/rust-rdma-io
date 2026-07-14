@@ -514,8 +514,10 @@ strict driver→app round-robin, and app futures are cooperative. So:
 > part 2** (the reclaim barrier + `qp_num` retirement) is done too: `Drop` hands a busy transport's
 > resources to the per-core driver's reclaim queue, which drains the flush CQEs to zero, frees
 > `ReadRingInner` (MW→QP→MR→PD) and retires the `qp_num`, joined at shutdown — MANA (fresh NIC):
-> busy echo + 24-cycle reconnect churn 2/2, arm-park 5/5 regression-free. **Not yet started:** Slice
-> D (setup handoff / sharding / bench runner) onward.
+> busy echo + 24-cycle reconnect churn 2/2, arm-park 5/5 regression-free. **Slice D in progress:**
+> D1 (`BusyPool` per-core worker pool + client sharding) and D2 (server accept via serialized
+> handshake) are done — MANA: 6-client/2-core busy↔arm-park echo both directions. **Not yet
+> started:** D3 (aggregate CQ sizing + admission) and D4 (thread-per-core bench runner).
 
 Do these before any busy-poll code; each is a small refactor or primitive **testable against
 arm-park alone**, so the new subsystem lands on clean seams rather than on today's scattered CQ
@@ -615,13 +617,13 @@ crate deps needed: an `AtomicWaker` (`atomic-waker` or `futures-util`'s `task`) 
   to a reused `qp_num` is a **fatal** invariant breach, validated by the rapid close/reconnect +
   `qp_num`-reuse stress test. **The background-reclaim model and shutdown-join protocol are
   specified in [Slice C part 2 design](#slice-c-part-2-design--background-reclaim-teardown-as-a-kernel-like-cleanup-task) below.**
-- **Slice D — setup handoff, server CM-ID routing, sharding + admission control. [Designed — see
-  [Slice D design](#slice-d-design--multi-connection-sharded-and-measurable) below.]** Add the
-  per-core **`BusyPool`** + connection sharding (D1), the server-side **CM-ID-keyed** control-task
-  routing state machine (D2), aggregate shared-CQ sizing + per-core admission control + reserved
-  flush headroom (D3, §7.2), and the **distinct pinned-`current_thread` thread-per-core bench
-  runner** (D4, §11). Then run echo / rh1 thread-per-core and measure p50/p99 + `cpu_us_per_op` vs
-  arm-park.
+- **Slice D — setup handoff, server CM-ID routing, sharding + admission control. [D1 + D2 done — see
+  [Slice D design](#slice-d-design--multi-connection-sharded-and-measurable) below; MANA-validated
+  busy↔arm-park echo, client- and server-pool.]** Add the per-core **`BusyPool`** + connection
+  sharding (D1 — done), the server-side control task (D2 — done, serialized-handshake realization),
+  aggregate shared-CQ sizing + per-core admission control + reserved flush headroom (D3, §7.2), and
+  the **distinct pinned-`current_thread` thread-per-core bench runner** (D4, §11). Then run echo /
+  rh1 thread-per-core and measure p50/p99 + `cpu_us_per_op` vs arm-park.
 
 Slices A and B are low-risk and unlock everything downstream; C is the correctness crux under MANA
 churn; D makes it multi-connection and measurable. Per §12, correctness scenarios run on **both rxe
@@ -885,8 +887,15 @@ cannot co-locate and falls back to the cross-core channel above.
   driver CQs *on that core's thread* (the owner-token requirement, §7.5). The device `ibv_context`
   is shared per-device (librdmacm), so every core's CQs live on one context and any `cm_id` can
   build against them — but creation still runs on the owner thread.
-- Testable by generalizing the loopback echo test to K connections on a 2-core pool (no server
-  control task yet — use inline `accept_busy` per core, or loopback).
+- Testable by generalizing the loopback echo test to K connections on a 2-core pool.
+
+> **Implemented (Slice D1).** `BusyPool` (harness-layer, in `rdma-io-tests`): `new(ctx, core_ids,
+> send_depth, recv_depth)` spawns one pinned OS thread per core, each running a `current_thread`
+> runtime whose `block_on` future *is* its `CoreDriver::run()` loop (a `std::mpsc` handshake returns
+> the runtime + driver handle once the driver is up). `spawn_connect(addr, cfg, app)` round-robins,
+> runs `connect_busy` + the app closure on-core, and returns a `JoinHandle`. Validated on MANA: 6
+> busy clients over 2 cores echo against an arm-park server (busy ↔ arm-park interop), clean
+> shutdown-join reclaim.
 
 #### D2 — Server CM-ID-keyed control task
 
@@ -910,6 +919,18 @@ This reshapes the accept primitive: from `listener → get_request → complete_
 a busy transport from an already-accepted `conn_id` on this worker," with the control task owning the
 CM state machine. Keep today's inline `accept_busy` as the single-core / test convenience. `CmId`
 must be `Send` to migrate to the worker (verify; it is moved, never shared).
+
+> **Implemented (Slice D2) — serialized handshake.** The current `complete_accept` waits for
+> `Established` **on the listener's channel** (then migrates the conn to its own channel), so two
+> concurrent `complete_accept`s would race and one could consume the *other*'s `Established` — the
+> mis-binding above. The shipped `BusyPool::serve(listener, cfg, count, app)` sidesteps the full
+> CM-ID-routing state machine by **serializing the handshake**: it dispatches `accept_busy` to the
+> next core, then waits (a per-connection `oneshot`) until that handshake has *finished touching the
+> listener* before dispatching the next. So the listener has **a single consumer at a time** — one
+> handshake in flight — and no `Established` can be mis-bound; the per-connection `app` loops still
+> run concurrently across cores (only setup is serialized, and setup is not the hot path). The
+> concurrent-handshake CM-ID-routing model above stays a future optimization for accept-heavy
+> churn. Validated on MANA: 6 arm-park clients echo against a 2-core busy pool server.
 
 #### D3 — Aggregate CQ sizing + admission control + flush headroom (§7.2)
 
