@@ -510,9 +510,12 @@ strict driver→app round-robin, and app futures are cooperative. So:
 > ~1.33M rps/0 err each. **Phase 1 in progress:** Slice A (`ConnSlot` + `DriverSource` primitives,
 > unit-tested), Slice B (`CoreDriver` shared-CQ reaper + busy-poll read-ring connect/accept — MANA:
 > bidirectional busy echo 1/1, arm-park 5/5 regression-free), and **Slice C part 1** (WR accounting
-> via the `AsyncQp` post choke point — MANA: busy echo runs with no underflow) are done. **In
-> progress:** Slice C part 2 (the `ResourceBundle` reclaim barrier + `qp_num` retirement, designed
-> below). **Not yet started:** Slice D (setup handoff / sharding / bench runner) onward.
+> via the `AsyncQp` post choke point — MANA: busy echo runs with no underflow) are done. **Slice C
+> part 2** (the reclaim barrier + `qp_num` retirement) is done too: `Drop` hands a busy transport's
+> resources to the per-core driver's reclaim queue, which drains the flush CQEs to zero, frees
+> `ReadRingInner` (MW→QP→MR→PD) and retires the `qp_num`, joined at shutdown — MANA (fresh NIC):
+> busy echo + 24-cycle reconnect churn 2/2, arm-park 5/5 regression-free. **Not yet started:** Slice
+> D (setup handoff / sharding / bench runner) onward.
 
 Do these before any busy-poll code; each is a small refactor or primitive **testable against
 arm-park alone**, so the new subsystem lands on clean seams rather than on today's scattered CQ
@@ -600,17 +603,18 @@ crate deps needed: an `AtomicWaker` (`atomic-waker` or `futures-util`'s `task`) 
   path through `DriverSource`. Scope: **one connection, one core, pinned `current_thread` runtime**
   (§4.1). Proves the data path end-to-end on hardware without any of the multi-connection or reuse
   hazards. Preserves the single-owner send-CQ invariant (§8) — the driver is that owner.
-- **Slice C — teardown barrier + `ResourceBundle` (the churn-critical slice). [Part 1 done — WR
-  accounting, MANA-validated (busy echo, no underflow); part 2 designed below, in progress.]** Add
-  the transferable `ResourceBundle` and the §6.2 protocol: `Drop`/cancel/setup-failure `take()`s the
-  bundle onto the driver's **reclaim queue** (RAII destroys nothing), the driver forces the QP to
-  `ERR` (`to_error()`), keeps routing that QP's flush CQEs and decrementing accounting until **both
-  counters zero and both inboxes empty**, then destroys MWs → QP → MRs in order and **retires** the
-  `qp_num` (bump generation; reuse legal only after retirement). This is where MANA churn
-  correctness concentrates — a stale CQE mis-routed to a reused `qp_num` is a **fatal** invariant
-  breach, not a droppable event. Validate with rapid close/reconnect + `qp_num`-reuse stress on a
-  fresh NIC, and driver-task-panic / runtime-shutdown reclaim. **The background-reclaim model and
-  shutdown-join protocol are specified in [Slice C part 2 design](#slice-c-part-2-design--background-reclaim-teardown-as-a-kernel-like-cleanup-task) below.**
+- **Slice C — teardown barrier + `ResourceBundle` (the churn-critical slice). [Done — part 1 (WR
+  accounting) + part 2 (reclaim barrier), MANA-validated: busy echo + 24-cycle reconnect churn 2/2,
+  arm-park 5/5 regression-free.]** Implemented as a `ReadRingInner` split (`da8054a`) + the
+  background reclaim (`3a690a1`): busy `Drop` marks the slot `Closing`, forces the QP to `ERR`
+  (`to_error()`), and `take()`s `Option<ReadRingInner>` onto the driver's **reclaim queue** (RAII
+  destroys nothing). The driver keeps routing that QP's flush CQEs — `Closing`-aware: `dec_posted`
+  but discard — and, once **both counters zero and both inboxes empty** (or the wedge budget trips),
+  frees MWs → QP → MRs → PD in field order and **retires** the `qp_num` (bump generation; reuse legal
+  only after retirement). This is where MANA churn correctness concentrates — a stale CQE mis-routed
+  to a reused `qp_num` is a **fatal** invariant breach, validated by the rapid close/reconnect +
+  `qp_num`-reuse stress test. **The background-reclaim model and shutdown-join protocol are
+  specified in [Slice C part 2 design](#slice-c-part-2-design--background-reclaim-teardown-as-a-kernel-like-cleanup-task) below.**
 - **Slice D — setup handoff, server CM-ID routing, sharding + admission control.** Add the
   `Connecting`-slot setup handoff (§6.1), the server-side **CM-ID-keyed** control-task routing state
   machine (per-`CmId` `pending` map, dispatch resource creation to the owning worker, migrate the
