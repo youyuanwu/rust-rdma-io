@@ -9,7 +9,7 @@ use rdma_io::transport::TransportBuilder;
 use rdma_io::transport_common::MemoryWindowMode;
 use rdma_io::wr::QpType;
 
-use rdma_io_bench::common::ClientOpts;
+use rdma_io_bench::common::{ClientOpts, require_read_ring};
 use rdma_io_bench::{echo, grpc, h1};
 
 #[derive(Parser)]
@@ -224,12 +224,7 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 /// thread-per-core [`BusyPool`](rdma_io_busy::BusyPool). Only the read-ring
 /// transport is supported (busy-poll is a read-ring completion mode).
 async fn run_echo_busy_client(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    if args.transport != "read-ring" && args.transport != "send-recv" {
-        eprintln!(
-            "note: --mode echo-busy uses the read-ring transport; ignoring --transport {}",
-            args.transport
-        );
-    }
+    require_read_ring("echo-busy", &args.transport)?;
     warn_ring_payload(args.payload, args.ring_max_msg);
     let mut config = ReadRingConfig::datagram().with_memory_window_mode(mw_mode(args.require_mw));
     config.max_message_size = args.ring_max_msg;
@@ -254,12 +249,7 @@ async fn run_echo_busy_client(args: &Args) -> Result<(), Box<dyn std::error::Err
 /// park when idle) instead of the busy-poll [`BusyPool`]. Only the read-ring
 /// transport is supported.
 async fn run_echo_park_client(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    if args.transport != "read-ring" && args.transport != "send-recv" {
-        eprintln!(
-            "note: --mode echo-park uses the read-ring transport; ignoring --transport {}",
-            args.transport
-        );
-    }
+    require_read_ring("echo-park", &args.transport)?;
     warn_ring_payload(args.payload, args.ring_max_msg);
     let mut config = ReadRingConfig::datagram().with_memory_window_mode(mw_mode(args.require_mw));
     config.max_message_size = args.ring_max_msg;
@@ -283,12 +273,7 @@ async fn run_echo_park_client(args: &Args) -> Result<(), Box<dyn std::error::Err
 /// handling run on a pinned busy-poll core ([`BusyPool`](rdma_io_busy::BusyPool)).
 /// Only the read-ring transport is supported.
 async fn run_rh1_busy_client(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    if args.transport != "read-ring" {
-        eprintln!(
-            "note: --mode rh1-busy uses the read-ring transport; ignoring --transport {}",
-            args.transport
-        );
-    }
+    require_read_ring("rh1-busy", &args.transport)?;
     warn_ring_payload(args.payload, args.ring_max_msg);
     h1::run_h1_busy_client(
         args.connect,
@@ -309,12 +294,7 @@ async fn run_rh1_busy_client(args: &Args) -> Result<(), Box<dyn std::error::Erro
 /// [`ArmParkPool`](rdma_io_busy::ArmParkPool) (cores park when idle). Only the
 /// read-ring transport is supported.
 async fn run_rh1_park_client(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    if args.transport != "read-ring" {
-        eprintln!(
-            "note: --mode rh1-park uses the read-ring transport; ignoring --transport {}",
-            args.transport
-        );
-    }
+    require_read_ring("rh1-park", &args.transport)?;
     warn_ring_payload(args.payload, args.ring_max_msg);
     h1::run_h1_park_client(
         args.connect,

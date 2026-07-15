@@ -8,7 +8,7 @@ use rdma_io::send_recv_transport::SendRecvConfig;
 use rdma_io::transport_common::MemoryWindowMode;
 use rdma_io::wr::QpType;
 
-use rdma_io_bench::common::ServerOpts;
+use rdma_io_bench::common::{ServerOpts, require_read_ring};
 use rdma_io_bench::{echo, grpc, h1};
 
 #[derive(Parser)]
@@ -227,12 +227,7 @@ async fn run_arm_park(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 /// connections across `--threads` pinned cores and echoes each on its owning
 /// core. Only the read-ring transport is supported.
 async fn run_echo_busy_server(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    if args.transport != "read-ring" && args.transport != "send-recv" {
-        eprintln!(
-            "note: --mode echo-busy uses the read-ring transport; ignoring --transport {}",
-            args.transport
-        );
-    }
+    require_read_ring("echo-busy", &args.transport)?;
     let mut config = ReadRingConfig::datagram().with_memory_window_mode(mw_mode(args.require_mw));
     config.max_message_size = args.ring_max_msg;
     config.max_in_flight = ring_max_in_flight(args.ring_queue_depth, args.in_flight);
@@ -252,12 +247,7 @@ async fn run_echo_busy_server(args: &Args) -> Result<(), Box<dyn std::error::Err
 /// with its own armed CQ, parking when idle) and echoes each on its owning core.
 /// Only the read-ring transport is supported.
 async fn run_echo_park_server(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    if args.transport != "read-ring" && args.transport != "send-recv" {
-        eprintln!(
-            "note: --mode echo-park uses the read-ring transport; ignoring --transport {}",
-            args.transport
-        );
-    }
+    require_read_ring("echo-park", &args.transport)?;
     let mut config = ReadRingConfig::datagram().with_memory_window_mode(mw_mode(args.require_mw));
     config.max_message_size = args.ring_max_msg;
     config.max_in_flight = ring_max_in_flight(args.ring_queue_depth, args.in_flight);
@@ -277,12 +267,7 @@ async fn run_echo_park_server(args: &Args) -> Result<(), Box<dyn std::error::Err
 /// HTTP/1.1 + TLS echo on its owning core. Only the read-ring transport is
 /// supported.
 async fn run_rh1_busy_server(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    if args.transport != "read-ring" {
-        eprintln!(
-            "note: --mode rh1-busy uses the read-ring transport; ignoring --transport {}",
-            args.transport
-        );
-    }
+    require_read_ring("rh1-busy", &args.transport)?;
     h1::run_h1_busy_server(
         args.bind,
         ring_config_read(args),
@@ -300,12 +285,7 @@ async fn run_rh1_busy_server(args: &Args) -> Result<(), Box<dyn std::error::Erro
 /// interrupt-armed [`ArmParkPool`](rdma_io_busy::ArmParkPool) (cores park when
 /// idle). Only the read-ring transport is supported.
 async fn run_rh1_park_server(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    if args.transport != "read-ring" {
-        eprintln!(
-            "note: --mode rh1-park uses the read-ring transport; ignoring --transport {}",
-            args.transport
-        );
-    }
+    require_read_ring("rh1-park", &args.transport)?;
     h1::run_h1_park_server(
         args.bind,
         ring_config_read(args),

@@ -207,11 +207,14 @@ impl CoreDriver {
     /// For each handed-off (`Closing`) bundle: discard any inbox backlog (CQEs
     /// delivered before the app dropped), then test the drain barrier
     /// ([`ConnSlot::drain_complete`]). When both WR counters are zero and both
-    /// inboxes empty — or the per-bundle `budget` of turns is exhausted (the
-    /// wedge escape hatch) — mark it `Drained`, free its resources (dropping the
+    /// inboxes empty — mark it `Drained`, free its resources (dropping the
     /// transport-inner in verbs order MW→QP→MR→PD), retire the slot, and remove
     /// its `qp_num` from the routing map so the number may be reused (§4.2, the
-    /// `TIME_WAIT` analogue).
+    /// `TIME_WAIT` analogue). If instead the per-bundle `budget` of turns is
+    /// exhausted (the wedge escape hatch, a NIC that never delivered the flush
+    /// CQEs), force-free the resources but **quarantine** the `qp_num` — leave the
+    /// `Drained` slot registered so the number is never reused and any straggler
+    /// CQE is counted down + discarded rather than mis-routed.
     fn process_reclaim(&self, budget: usize) {
         let mut scratch = [WorkCompletion::default(); MAX_CQE_PER_CQ];
         let mut queue = self
@@ -232,25 +235,37 @@ impl CoreDriver {
             if !done && !wedged {
                 return true; // still draining — keep in the queue
             }
-            if wedged && !done {
-                tracing::error!(
-                    qp_num = entry.slot.qp_num(),
-                    posted_send = entry.slot.posted(Dir::Send),
-                    posted_recv = entry.slot.posted(Dir::Recv),
-                    "CoreDriver: reclaim budget exhausted; force-freeing (NIC wedge, §12)"
-                );
-            }
             entry.slot.set_state(SlotState::Drained);
             let qp_num = entry.slot.qp_num();
-            // Free MW→QP→MR→PD via the inner's field drop order, *then* retire
-            // the routing key (reuse barrier) once the resources are gone.
+            // Free MW→QP→MR→PD via the inner's field drop order.
             entry.resources = None;
-            entry.slot.retire();
-            self.slots
-                .lock()
-                .expect("CoreDriver slot map poisoned")
-                .remove(&qp_num);
-            false // done — drop the entry
+            if done {
+                // Normal drain: the barrier held, so the `qp_num` is safe to
+                // reuse. Retire (asserting the barrier) and remove the routing
+                // key so a future QP may take the number.
+                entry.slot.retire();
+                self.slots
+                    .lock()
+                    .expect("CoreDriver slot map poisoned")
+                    .remove(&qp_num);
+            } else {
+                // Wedge escape hatch (§10): the NIC never delivered the
+                // outstanding flush CQEs. Force-free without asserting the drain
+                // barrier (which would panic), and **quarantine** the `qp_num` —
+                // keep the `Drained` slot registered so the number can never be
+                // reused and a straggler CQE for the old QP is counted down +
+                // discarded here (`route_into`, §4.2) instead of mis-routed to a
+                // new connection that reused the number.
+                tracing::error!(
+                    qp_num,
+                    posted_send = entry.slot.posted(Dir::Send),
+                    posted_recv = entry.slot.posted(Dir::Recv),
+                    "CoreDriver: reclaim budget exhausted; force-freeing and \
+                     quarantining qp_num (NIC wedge, §10/§12)"
+                );
+                entry.slot.abandon();
+            }
+            false // done — drop the reclaim entry
         });
     }
 }

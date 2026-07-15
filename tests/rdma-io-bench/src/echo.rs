@@ -42,7 +42,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Semaphore};
 
-use crate::metrics::spawn_resource_sampler;
+use crate::metrics::{run_readiness_barrier, spawn_resource_sampler};
 use crate::report::BenchResult;
 
 /// Recv completions to drain per poll (the send/recv transports cap at 8).
@@ -495,47 +495,26 @@ pub async fn run_read_ring_busy_client(
 
     let payload_buf: Arc<[u8]> = vec![b'x'; payload].into();
     let target = in_flight.max(1);
-    let warmup_deadline = Instant::now() + Duration::from_secs(warmup);
-    let bench_deadline = warmup_deadline + Duration::from_secs(duration);
-    eprintln!("Warming up {warmup}s, then benchmarking {duration}s...");
+    eprintln!("Setting up {connections} connection(s) before the timed window...");
 
-    let sampler = spawn_resource_sampler(warmup_deadline, bench_deadline);
-
-    // Shard the connections onto the pool. Each `connect_busy` setup *and* its
-    // echo loop run on the owning core (co-location, §7.5); the JoinHandle
-    // yields the per-connection latency histogram + error count.
-    let mut handles = Vec::with_capacity(connections);
-    for _ in 0..connections {
+    // Readiness barrier: every connection finishes `connect_busy` setup, reports
+    // ready, and blocks until *all* are ready before the shared warmup/bench
+    // clock and the CPU/RSS sampler start — so setup time (and CM retries) never
+    // land in the measurement window (design §12 / §13). Each connection's echo
+    // loop runs on its owning core (co-location, §7.5).
+    let outcome = run_readiness_barrier(connections, warmup, duration, |ready, gate| {
         let p = payload_buf.clone();
         let cfg = config.clone();
-        let handle = pool
-            .spawn_connect(addr, cfg, move |t| {
-                client_conn_loop(t, p, target, warmup_deadline, bench_deadline)
-            })
-            .ok_or("busy pool refused a connection (per-core admission cap reached)")?;
-        handles.push(handle);
-    }
-
-    let mut merged = new_histogram();
-    let mut errors = 0u64;
-    for (i, h) in handles.into_iter().enumerate() {
-        match h.await {
-            Ok(Ok((hist, errs))) => {
-                errors += errs;
-                merged.add(&hist).expect("merge histograms");
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(conn_id = i, error = %e, "busy echo connect_busy failed");
-                errors += 1;
-            }
-            Err(e) => tracing::warn!(conn_id = i, error = %e, "busy echo client task panicked"),
-        }
-    }
-
-    let (cpu_seconds, peak_rss) = sampler.await.unwrap_or((0.0, 0));
+        pool.spawn_connect(addr, cfg, move |t| async move {
+            ready.report().await;
+            let (warmup_deadline, bench_deadline) = gate.wait().await;
+            client_conn_loop(t, p, target, warmup_deadline, bench_deadline).await
+        })
+    })
+    .await;
 
     report_result(
-        &merged,
+        &outcome.merged,
         "echo-busy",
         "read-ring",
         connections,
@@ -543,9 +522,9 @@ pub async fn run_read_ring_busy_client(
         target,
         duration,
         payload,
-        errors,
-        cpu_seconds,
-        peak_rss,
+        outcome.errors,
+        outcome.cpu_seconds,
+        outcome.peak_rss_kb,
         report,
     );
 
@@ -663,44 +642,24 @@ pub async fn run_read_ring_park_client(
 
     let payload_buf: Arc<[u8]> = vec![b'x'; payload].into();
     let target = in_flight.max(1);
-    let warmup_deadline = Instant::now() + Duration::from_secs(warmup);
-    let bench_deadline = warmup_deadline + Duration::from_secs(duration);
-    eprintln!("Warming up {warmup}s, then benchmarking {duration}s...");
+    eprintln!("Setting up {connections} connection(s) before the timed window...");
 
-    let sampler = spawn_resource_sampler(warmup_deadline, bench_deadline);
-
-    // Shard the connections onto the pool. Each `connect` setup *and* its echo
-    // loop run on the owning core, so the transport's fds bind to that core's
-    // reactor; the JoinHandle yields the per-connection histogram + error count.
-    let mut handles = Vec::with_capacity(connections);
-    for _ in 0..connections {
+    // Readiness barrier (see `run_read_ring_busy_client`): start the shared clock
+    // + sampler only after every connection has finished setup, so setup time is
+    // excluded from the window and busy-vs-park stays comparable (design §12 / §13).
+    let outcome = run_readiness_barrier(connections, warmup, duration, |ready, gate| {
         let p = payload_buf.clone();
         let cfg = config.clone();
-        handles.push(pool.spawn_connect(addr, cfg, move |t| {
-            client_conn_loop(t, p, target, warmup_deadline, bench_deadline)
-        }));
-    }
-
-    let mut merged = new_histogram();
-    let mut errors = 0u64;
-    for (i, h) in handles.into_iter().enumerate() {
-        match h.await {
-            Ok(Ok((hist, errs))) => {
-                errors += errs;
-                merged.add(&hist).expect("merge histograms");
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(conn_id = i, error = %e, "arm-park pool connect failed");
-                errors += 1;
-            }
-            Err(e) => tracing::warn!(conn_id = i, error = %e, "arm-park echo client task panicked"),
-        }
-    }
-
-    let (cpu_seconds, peak_rss) = sampler.await.unwrap_or((0.0, 0));
+        Some(pool.spawn_connect(addr, cfg, move |t| async move {
+            ready.report().await;
+            let (warmup_deadline, bench_deadline) = gate.wait().await;
+            client_conn_loop(t, p, target, warmup_deadline, bench_deadline).await
+        }))
+    })
+    .await;
 
     report_result(
-        &merged,
+        &outcome.merged,
         "echo-park",
         "read-ring",
         connections,
@@ -708,9 +667,9 @@ pub async fn run_read_ring_park_client(
         target,
         duration,
         payload,
-        errors,
-        cpu_seconds,
-        peak_rss,
+        outcome.errors,
+        outcome.cpu_seconds,
+        outcome.peak_rss_kb,
         report,
     );
 

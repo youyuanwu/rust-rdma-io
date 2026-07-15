@@ -33,16 +33,12 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_openssl::SslStream;
 
 use crate::common::{ClientOpts, ServerOpts, connect_with_retry, transport_setup_error};
-use crate::metrics::{BenchMetrics, spawn_resource_sampler};
+use crate::metrics::{BenchMetrics, run_readiness_barrier, spawn_resource_sampler};
 use crate::report::BenchResult;
 use crate::tls_common;
 
 /// HTTP/1.1 client `SendRequest` handle over the shared body type.
 type H1Sender = hyper::client::conn::http1::SendRequest<Full<Bytes>>;
-
-/// A thread-per-core connection's join result: its latency histogram and error
-/// count, or an `rdma_io` setup error if the connection never established.
-type H1ConnJoin = tokio::task::JoinHandle<rdma_io::Result<(Histogram<u64>, u64)>>;
 
 /// Histogram matching the echo modes' bounds (1µs..60s, 3 sig figs), so the
 /// thread-per-core HTTP/1.1 latencies line up with the other benchmark outputs.
@@ -465,29 +461,6 @@ where
     (hist, errors)
 }
 
-/// Await every connection's join handle, merge their latency histograms, and sum
-/// their error counts (including per-connection setup failures).
-async fn collect_h1_conn_results(handles: Vec<H1ConnJoin>, mode: &str) -> (Histogram<u64>, u64) {
-    let mut merged = new_histogram();
-    let mut errors = 0u64;
-    for (i, h) in handles.into_iter().enumerate() {
-        match h.await {
-            Ok(Ok((hist, errs))) => {
-                errors += errs;
-                merged.add(&hist).expect("merge histograms");
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(conn_id = i, %mode, error = %e, "thread-per-core h1 connect failed");
-                errors += 1;
-            }
-            Err(e) => {
-                tracing::warn!(conn_id = i, %mode, error = %e, "thread-per-core h1 task panicked")
-            }
-        }
-    }
-    (merged, errors)
-}
-
 /// Emit the merged thread-per-core HTTP/1.1 result in the same shape as `rh1`
 /// (`in_flight` is always 1; `threads` reports the pinned-core count).
 #[allow(clippy::too_many_arguments)]
@@ -551,45 +524,44 @@ pub async fn run_h1_busy_client(
     let connector = tls_common::build_connector_h1(cert);
     let authority = format!("{}:{}", addr.ip(), addr.port());
     let body = "x".repeat(payload).into_bytes();
-    let warmup_deadline = Instant::now() + Duration::from_secs(warmup);
-    let bench_deadline = warmup_deadline + Duration::from_secs(duration);
-    eprintln!("Warming up {warmup}s, then benchmarking {duration}s...");
-    let sampler = spawn_resource_sampler(warmup_deadline, bench_deadline);
+    eprintln!("Setting up {connections} connection(s) before the timed window...");
 
-    let mut handles = Vec::with_capacity(connections);
-    for _ in 0..connections {
+    // Readiness barrier: every connection finishes RDMA setup + TLS/hyper
+    // handshake, reports ready, and blocks until all are ready before the shared
+    // warmup/bench clock and the CPU/RSS sampler start — so setup time never
+    // biases busy-vs-park (design §12 / §13). Each request loop runs on its core.
+    let outcome = run_readiness_barrier(connections, warmup, duration, |ready, gate| {
         let connector = connector.clone();
         let authority = authority.clone();
         let body = body.clone();
         let cfg = config.clone();
-        let handle = pool
-            .spawn_connect(addr, cfg, move |t| {
-                let rdma = TokioRdmaStream::new(AsyncRdmaStream::new(t));
-                h1_conn_loop(
-                    rdma,
-                    connector,
-                    authority,
-                    body,
-                    warmup_deadline,
-                    bench_deadline,
-                )
-            })
-            .ok_or("busy pool refused a connection (per-core admission cap reached)")?;
-        handles.push(handle);
-    }
+        pool.spawn_connect(addr, cfg, move |t| async move {
+            ready.report().await;
+            let (warmup_deadline, bench_deadline) = gate.wait().await;
+            let rdma = TokioRdmaStream::new(AsyncRdmaStream::new(t));
+            h1_conn_loop(
+                rdma,
+                connector,
+                authority,
+                body,
+                warmup_deadline,
+                bench_deadline,
+            )
+            .await
+        })
+    })
+    .await;
 
-    let (merged, errors) = collect_h1_conn_results(handles, "rh1-busy").await;
-    let (cpu_seconds, peak_rss) = sampler.await.unwrap_or((0.0, 0));
     report_h1_thread_per_core(
-        &merged,
+        &outcome.merged,
         "rh1-busy",
         connections,
         cores,
         duration,
         payload,
-        errors,
-        cpu_seconds,
-        peak_rss,
+        outcome.errors,
+        outcome.cpu_seconds,
+        outcome.peak_rss_kb,
         report,
     );
 
@@ -625,18 +597,18 @@ pub async fn run_h1_park_client(
     let connector = tls_common::build_connector_h1(cert);
     let authority = format!("{}:{}", addr.ip(), addr.port());
     let body = "x".repeat(payload).into_bytes();
-    let warmup_deadline = Instant::now() + Duration::from_secs(warmup);
-    let bench_deadline = warmup_deadline + Duration::from_secs(duration);
-    eprintln!("Warming up {warmup}s, then benchmarking {duration}s...");
-    let sampler = spawn_resource_sampler(warmup_deadline, bench_deadline);
+    eprintln!("Setting up {connections} connection(s) before the timed window...");
 
-    let mut handles = Vec::with_capacity(connections);
-    for _ in 0..connections {
+    // Readiness barrier (see `run_h1_busy_client`): start the shared clock +
+    // sampler only after every connection's setup completes (design §12 / §13).
+    let outcome = run_readiness_barrier(connections, warmup, duration, |ready, gate| {
         let connector = connector.clone();
         let authority = authority.clone();
         let body = body.clone();
         let cfg = config.clone();
-        handles.push(pool.spawn_connect(addr, cfg, move |t| {
+        Some(pool.spawn_connect(addr, cfg, move |t| async move {
+            ready.report().await;
+            let (warmup_deadline, bench_deadline) = gate.wait().await;
             let rdma = TokioRdmaStream::new(AsyncRdmaStream::new(t));
             h1_conn_loop(
                 rdma,
@@ -646,21 +618,21 @@ pub async fn run_h1_park_client(
                 warmup_deadline,
                 bench_deadline,
             )
-        }));
-    }
+            .await
+        }))
+    })
+    .await;
 
-    let (merged, errors) = collect_h1_conn_results(handles, "rh1-park").await;
-    let (cpu_seconds, peak_rss) = sampler.await.unwrap_or((0.0, 0));
     report_h1_thread_per_core(
-        &merged,
+        &outcome.merged,
         "rh1-park",
         connections,
         cores,
         duration,
         payload,
-        errors,
-        cpu_seconds,
-        peak_rss,
+        outcome.errors,
+        outcome.cpu_seconds,
+        outcome.peak_rss_kb,
         report,
     );
 

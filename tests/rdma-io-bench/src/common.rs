@@ -55,6 +55,24 @@ pub fn transport_setup_error(transport: &str, err: rdma_io::Error) -> Box<dyn st
     }
 }
 
+/// Guard for the thread-per-core busy-poll / arm-park benchmark modes
+/// (`echo-busy`, `echo-park`, `rh1-busy`, `rh1-park`), which are a **read-ring**
+/// completion mode only. Reject an incompatible `--transport` instead of
+/// silently coercing it to read-ring: the old coercion mislabeled the result
+/// JSON (and its filename) with the requested transport and hid that the
+/// argument was ignored.
+pub fn require_read_ring(mode: &str, transport: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if transport == "read-ring" {
+        Ok(())
+    } else {
+        Err(format!(
+            "--mode {mode} requires --transport read-ring (thread-per-core busy-poll/arm-park is \
+             a read-ring completion mode); got --transport {transport}"
+        )
+        .into())
+    }
+}
+
 /// Establish one connection with bounded retries and backoff.
 ///
 /// read-ring's RDMA-CM is flaky under connect churn on the Azure MANA RoCEv2

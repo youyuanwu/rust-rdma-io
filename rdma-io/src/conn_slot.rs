@@ -413,6 +413,18 @@ impl ConnSlot {
         self.generation.fetch_add(1, Ordering::AcqRel);
     }
 
+    /// Abandon the slot when the drain barrier could **not** be satisfied — the
+    /// wedge escape hatch (§10). Unlike [`retire`](Self::retire) it makes **no**
+    /// drain-complete assertion, because it is called precisely when a wedged NIC
+    /// never delivered the outstanding flush CQEs (so asserting would panic). The
+    /// caller must **quarantine** the `qp_num` (keep the slot registered, never
+    /// reuse the number) rather than free it for reuse, since a straggler CQE for
+    /// the old QP may still arrive.
+    #[inline]
+    pub fn abandon(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+    }
+
     // --- Consumer (transport) side ----------------------------------------
 
     /// `Poll`-based drain of `dir`'s inbox for the data path.
@@ -648,6 +660,20 @@ mod tests {
         s.set_state(SlotState::Drained);
         assert_eq!(s.generation(), 0);
         s.retire();
+        assert_eq!(s.generation(), 1);
+    }
+
+    #[test]
+    fn abandon_bumps_generation_without_drain_barrier() {
+        // The wedge escape hatch (§10): a bundle whose flush CQEs never arrived
+        // is force-freed via `abandon()`, which must NOT assert the drain barrier
+        // (unlike `retire()`, whose debug_assert would panic here). Leaving WRs
+        // outstanding is exactly the wedged case.
+        let s = slot(2, 2);
+        s.inc_posted(Dir::Send);
+        assert!(!s.drain_complete());
+        assert_eq!(s.generation(), 0);
+        s.abandon(); // must not panic despite the unsatisfied barrier
         assert_eq!(s.generation(), 1);
     }
 
