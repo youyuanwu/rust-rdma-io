@@ -149,7 +149,7 @@ jobs:
         run: cargo build -p rdma-io-bench --release
 
       - name: Upload bench artifacts
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: bench-binaries
           path: |
