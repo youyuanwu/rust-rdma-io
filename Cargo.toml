@@ -16,7 +16,7 @@ rdma-io-tonic = { path = "rdma-io-tonic", version = "0.0.2" }
 rdma-io-quinn = { path = "rdma-io-quinn", version = "0.0.1" }
 
 # bnd ecosystem
-bnd-winmd = "0.0.6"
+bnd-winmd = "0.0.7"
 bnd-linux = "0.0.6"
 bnd-macros = "0.0.6"
 

@@ -271,9 +271,9 @@ dependencies = [
 
 [[package]]
 name = "bnd-winmd"
-version = "0.0.6"
+version = "0.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "165fbc87a6ec404a79c5d0ff7f72f9764402d6d6edfc39606e64b4367cce12b7"
+checksum = "2a9e7b0ed61d67ff32c33a347823b79497573bdfd1fa7b1d1a95b171de8a7796"
 dependencies = [
  "anyhow",
  "clang",
