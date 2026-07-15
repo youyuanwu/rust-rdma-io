@@ -38,12 +38,13 @@ struct Args {
     /// (`rh2`/`rh3`/`rh1`/`tcp`/`tcp1`/`echo`) it is the number of tokio
     /// multi-thread worker threads (`0` = tokio default, one per core); it is
     /// NOT a load dimension (offered load is `--connections` × `--in-flight`).
-    /// In `--mode echo-busy` it is the number of **pinned busy-poll cores** in
-    /// the pool (each runs one `CoreDriver` spinning `ibv_poll_cq`; connections
-    /// are sharded round-robin and are core-affine for life). `--mode echo-park`
-    /// uses it the same way — pinned thread-per-core cores — but the cores park
-    /// in `epoll_wait` when idle (per-connection armed CQ) instead of spinning.
-    /// Both peers should use the same value for a fair CPU comparison.
+    /// In `--mode echo-busy` / `--mode rh1-busy` it is the number of **pinned
+    /// busy-poll cores** in the pool (each runs one `CoreDriver` spinning
+    /// `ibv_poll_cq`; connections are sharded round-robin and are core-affine for
+    /// life). `--mode echo-park` / `--mode rh1-park` use it the same way — pinned
+    /// thread-per-core cores — but the cores park in `epoll_wait` when idle
+    /// (per-connection armed CQ) instead of spinning. Both peers should use the
+    /// same value for a fair CPU comparison.
     #[arg(long, default_value_t = 2)]
     threads: usize,
 
@@ -168,16 +169,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // pool's per-connection handles + the resource sampler) rather than the
     // multi-thread worker pool the arm-park modes drive. `--mode echo-park` uses
     // the same thread-per-core topology (an ArmParkPool of N pinned runtimes),
-    // so it shares the small orchestration runtime.
-    if args.mode == "echo-busy" || args.mode == "echo-park" {
+    // so it shares the small orchestration runtime. The `rh1-busy` / `rh1-park`
+    // HTTP/1.1 modes use the same pinned pools, so they share it too.
+    if matches!(
+        args.mode.as_str(),
+        "echo-busy" | "echo-park" | "rh1-busy" | "rh1-park"
+    ) {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
         return rt.block_on(async move {
-            if args.mode == "echo-busy" {
-                run_echo_busy_client(&args).await
-            } else {
-                run_echo_park_client(&args).await
+            match args.mode.as_str() {
+                "echo-busy" => run_echo_busy_client(&args).await,
+                "echo-park" => run_echo_park_client(&args).await,
+                "rh1-busy" => run_rh1_busy_client(&args).await,
+                _ => run_rh1_park_client(&args).await,
             }
         });
     }
@@ -205,8 +211,8 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         "echo" => run_echo_bench(&args).await,
         other => {
             eprintln!(
-                "Unknown mode: {other}. Supported: rh2, rh3, tcp, rh1, tcp1, echo, echo-busy, \
-                 echo-park"
+                "Unknown mode: {other}. Supported: rh2, rh3, tcp, rh1, rh1-busy, rh1-park, tcp1, \
+                 echo, echo-busy, echo-park"
             );
             std::process::exit(1);
         }
@@ -267,6 +273,58 @@ async fn run_echo_park_client(args: &Args) -> Result<(), Box<dyn std::error::Err
         args.payload,
         args.warmup,
         args.duration,
+        &args.report,
+    )
+    .await
+}
+
+/// Busy-poll HTTP/1.1 client (`--mode rh1-busy`). Same read-ring config as `rh1`
+/// but each connection's hyper HTTP/1.1 + TLS stack and its RDMA completion
+/// handling run on a pinned busy-poll core ([`BusyPool`](rdma_io_busy::BusyPool)).
+/// Only the read-ring transport is supported.
+async fn run_rh1_busy_client(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    if args.transport != "read-ring" {
+        eprintln!(
+            "note: --mode rh1-busy uses the read-ring transport; ignoring --transport {}",
+            args.transport
+        );
+    }
+    warn_ring_payload(args.payload, args.ring_max_msg);
+    h1::run_h1_busy_client(
+        args.connect,
+        ring_config_read(args),
+        args.threads,
+        args.connections,
+        args.payload,
+        args.warmup,
+        args.duration,
+        &args.cert,
+        &args.report,
+    )
+    .await
+}
+
+/// Thread-per-core arm-park HTTP/1.1 client (`--mode rh1-park`). Same pinned
+/// per-core topology as `rh1-busy`, but driven through the interrupt-armed
+/// [`ArmParkPool`](rdma_io_busy::ArmParkPool) (cores park when idle). Only the
+/// read-ring transport is supported.
+async fn run_rh1_park_client(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    if args.transport != "read-ring" {
+        eprintln!(
+            "note: --mode rh1-park uses the read-ring transport; ignoring --transport {}",
+            args.transport
+        );
+    }
+    warn_ring_payload(args.payload, args.ring_max_msg);
+    h1::run_h1_park_client(
+        args.connect,
+        ring_config_read(args),
+        args.threads,
+        args.connections,
+        args.payload,
+        args.warmup,
+        args.duration,
+        &args.cert,
         &args.report,
     )
     .await

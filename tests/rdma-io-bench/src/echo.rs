@@ -448,7 +448,7 @@ where
 /// built on that device will share — which is exactly the context the pool's
 /// shared CQs must live on. The returned cm_id must be kept alive for the pool's
 /// lifetime (it owns that cached context).
-async fn probe_device_context(
+pub(crate) async fn probe_device_context(
     addr: SocketAddr,
 ) -> Result<(AsyncCmId, Arc<Context>), Box<dyn std::error::Error>> {
     let probe = AsyncCmId::new(PortSpace::Tcp)?;

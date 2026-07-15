@@ -7,6 +7,9 @@
 //! connection issues one request at a time; scale offered load with
 //! `--connections`.
 
+use std::future::Future;
+use std::net::SocketAddr;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -14,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::StreamExt;
+use hdrhistogram::Histogram;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -21,7 +25,9 @@ use hyper_util::rt::TokioIo;
 use openssl::ssl::{Ssl, SslAcceptor, SslConnector};
 use rdma_io::async_cm::AsyncCmListener;
 use rdma_io::async_stream::AsyncRdmaStream;
+use rdma_io::read_ring_transport::{ReadRingConfig, ReadRingTransport};
 use rdma_io::transport::TransportBuilder;
+use rdma_io_busy::{ArmParkPool, BusyPool};
 use rdma_io_tonic::{RdmaIncoming, TokioRdmaStream};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_openssl::SslStream;
@@ -33,6 +39,16 @@ use crate::tls_common;
 
 /// HTTP/1.1 client `SendRequest` handle over the shared body type.
 type H1Sender = hyper::client::conn::http1::SendRequest<Full<Bytes>>;
+
+/// A thread-per-core connection's join result: its latency histogram and error
+/// count, or an `rdma_io` setup error if the connection never established.
+type H1ConnJoin = tokio::task::JoinHandle<rdma_io::Result<(Histogram<u64>, u64)>>;
+
+/// Histogram matching the echo modes' bounds (1µs..60s, 3 sig figs), so the
+/// thread-per-core HTTP/1.1 latencies line up with the other benchmark outputs.
+fn new_histogram() -> Histogram<u64> {
+    Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).expect("create histogram")
+}
 
 // ---------------------------------------------------------------------------
 // Client
@@ -367,4 +383,406 @@ async fn h1_echo(
         .map(|c| c.to_bytes())
         .unwrap_or_default();
     Ok(hyper::Response::new(Full::new(body)))
+}
+
+// ---------------------------------------------------------------------------
+// Thread-per-core HTTP/1.1 (`rh1-busy` / `rh1-park`)
+// ---------------------------------------------------------------------------
+//
+// The `rh1` client/server above run the whole hyper HTTP/1.1 + TLS stack on a
+// shared multi-thread tokio runtime, so a connection's request loop, its TLS
+// state, and its RDMA completion handling can migrate across cores (tokio
+// work-stealing). These two variants instead pin each connection to a core for
+// life — the read-ring transport, the `AsyncRdmaStream`, the OpenSSL session,
+// and the hyper `http1` driver all run on one core's `current_thread` runtime —
+// mirroring the `echo-busy` / `echo-park` topologies:
+//
+// - `rh1-busy` drives completions with a shared-CQ [`BusyPool`] (busy-poll, one
+//   reaper per core, 100 % core even when idle, lowest latency).
+// - `rh1-park` drives completions with an [`ArmParkPool`] (per-connection armed
+//   CQ, the core parks in `epoll_wait` when idle, 0 % idle CPU).
+//
+// HTTP/1.1 keeps exactly one request in flight per connection, so offered load
+// scales with `--connections`; `--threads` is the number of pinned cores across
+// which the connections are sharded round-robin.
+
+/// Per-connection HTTP/1.1 request loop for the thread-per-core modes: complete
+/// the TLS + hyper handshake over the already-wrapped `stream`, then issue
+/// sequential requests until `bench_deadline`, recording post-warmup latencies.
+/// Runs entirely on the owning core (the caller invokes it inside a pool
+/// closure), so the hyper connection driver it spawns stays core-local. Returns
+/// the connection's latency histogram and error count.
+async fn h1_conn_loop<S>(
+    stream: S,
+    connector: SslConnector,
+    authority: String,
+    body: Vec<u8>,
+    warmup_deadline: Instant,
+    bench_deadline: Instant,
+) -> (Histogram<u64>, u64)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut hist = new_histogram();
+    let mut sender = match h1_connect(stream, &connector).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "thread-per-core h1 handshake failed");
+            return (hist, 1);
+        }
+    };
+
+    let mut errors = 0u64;
+    while Instant::now() < bench_deadline {
+        let start = Instant::now();
+        let req = match hyper::Request::builder()
+            .method(hyper::Method::POST)
+            .uri("/")
+            .header(hyper::header::HOST, authority.as_str())
+            .body(Full::new(Bytes::from(body.clone())))
+        {
+            Ok(req) => req,
+            Err(_) => {
+                errors += 1;
+                continue;
+            }
+        };
+        match send_h1(&mut sender, req).await {
+            Ok(()) => {
+                if start >= warmup_deadline {
+                    let us = start.elapsed().as_micros().min(u64::MAX as u128) as u64;
+                    let _ = hist.record(us.max(1));
+                }
+            }
+            Err(e) => {
+                tracing::trace!(error = %e, "h1 request failed");
+                if start >= warmup_deadline {
+                    errors += 1;
+                }
+            }
+        }
+    }
+    (hist, errors)
+}
+
+/// Await every connection's join handle, merge their latency histograms, and sum
+/// their error counts (including per-connection setup failures).
+async fn collect_h1_conn_results(handles: Vec<H1ConnJoin>, mode: &str) -> (Histogram<u64>, u64) {
+    let mut merged = new_histogram();
+    let mut errors = 0u64;
+    for (i, h) in handles.into_iter().enumerate() {
+        match h.await {
+            Ok(Ok((hist, errs))) => {
+                errors += errs;
+                merged.add(&hist).expect("merge histograms");
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(conn_id = i, %mode, error = %e, "thread-per-core h1 connect failed");
+                errors += 1;
+            }
+            Err(e) => {
+                tracing::warn!(conn_id = i, %mode, error = %e, "thread-per-core h1 task panicked")
+            }
+        }
+    }
+    (merged, errors)
+}
+
+/// Emit the merged thread-per-core HTTP/1.1 result in the same shape as `rh1`
+/// (`in_flight` is always 1; `threads` reports the pinned-core count).
+#[allow(clippy::too_many_arguments)]
+fn report_h1_thread_per_core(
+    merged: &Histogram<u64>,
+    mode: &str,
+    connections: usize,
+    cores: usize,
+    duration: u64,
+    payload: usize,
+    errors: u64,
+    cpu_seconds: f64,
+    peak_rss_kb: u64,
+    report: &str,
+) {
+    let result = BenchResult::from_histogram(
+        merged,
+        mode,
+        "read-ring",
+        connections,
+        cores,
+        1,
+        duration,
+        payload,
+        errors,
+    )
+    .with_resource_usage(cpu_seconds, peak_rss_kb);
+    match report {
+        "json" => result.print_json(),
+        _ => result.print_text(),
+    }
+}
+
+/// Run the busy-poll HTTP/1.1 **client** (`--mode rh1-busy`): build a
+/// [`BusyPool`] over `busy_cores` pinned cores, shard `connections` read-ring
+/// connections round-robin across them, and drive each connection's HTTP/1.1
+/// request loop **on its owning core**. Reports as `rh1-busy` / `read-ring`.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_h1_busy_client(
+    addr: SocketAddr,
+    config: ReadRingConfig,
+    busy_cores: usize,
+    connections: usize,
+    payload: usize,
+    warmup: u64,
+    duration: u64,
+    cert: &Path,
+    report: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cores = busy_cores.max(1);
+    let (probe, ctx) = crate::echo::probe_device_context(addr).await?;
+
+    let conns_per_core = connections.max(1).div_ceil(cores);
+    let core_ids: Vec<usize> = (0..cores).collect();
+    let pool = BusyPool::with_config(ctx, &core_ids, &config, conns_per_core)?;
+    eprintln!(
+        "Busy-poll h1 client: {cores} pinned core(s), {connections} read-ring connection(s) \
+         ({conns_per_core}/core), 1 request/connection"
+    );
+
+    let connector = tls_common::build_connector_h1(cert);
+    let authority = format!("{}:{}", addr.ip(), addr.port());
+    let body = "x".repeat(payload).into_bytes();
+    let warmup_deadline = Instant::now() + Duration::from_secs(warmup);
+    let bench_deadline = warmup_deadline + Duration::from_secs(duration);
+    eprintln!("Warming up {warmup}s, then benchmarking {duration}s...");
+    let sampler = spawn_resource_sampler(warmup_deadline, bench_deadline);
+
+    let mut handles = Vec::with_capacity(connections);
+    for _ in 0..connections {
+        let connector = connector.clone();
+        let authority = authority.clone();
+        let body = body.clone();
+        let cfg = config.clone();
+        let handle = pool
+            .spawn_connect(addr, cfg, move |t| {
+                let rdma = TokioRdmaStream::new(AsyncRdmaStream::new(t));
+                h1_conn_loop(
+                    rdma,
+                    connector,
+                    authority,
+                    body,
+                    warmup_deadline,
+                    bench_deadline,
+                )
+            })
+            .ok_or("busy pool refused a connection (per-core admission cap reached)")?;
+        handles.push(handle);
+    }
+
+    let (merged, errors) = collect_h1_conn_results(handles, "rh1-busy").await;
+    let (cpu_seconds, peak_rss) = sampler.await.unwrap_or((0.0, 0));
+    report_h1_thread_per_core(
+        &merged,
+        "rh1-busy",
+        connections,
+        cores,
+        duration,
+        payload,
+        errors,
+        cpu_seconds,
+        peak_rss,
+        report,
+    );
+
+    pool.shutdown();
+    drop(probe);
+    Ok(())
+}
+
+/// Run the thread-per-core arm-park HTTP/1.1 **client** (`--mode rh1-park`):
+/// same pinned-per-core topology as [`run_h1_busy_client`], but driven through
+/// an interrupt-armed [`ArmParkPool`] (per-connection armed CQ, cores park when
+/// idle). Reports as `rh1-park` / `read-ring`.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_h1_park_client(
+    addr: SocketAddr,
+    config: ReadRingConfig,
+    park_cores: usize,
+    connections: usize,
+    payload: usize,
+    warmup: u64,
+    duration: u64,
+    cert: &Path,
+    report: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cores = park_cores.max(1);
+    let core_ids: Vec<usize> = (0..cores).collect();
+    let pool = ArmParkPool::new(&core_ids)?;
+    eprintln!(
+        "Thread-per-core arm-park h1 client: {cores} pinned core(s), {connections} read-ring \
+         connection(s), 1 request/connection"
+    );
+
+    let connector = tls_common::build_connector_h1(cert);
+    let authority = format!("{}:{}", addr.ip(), addr.port());
+    let body = "x".repeat(payload).into_bytes();
+    let warmup_deadline = Instant::now() + Duration::from_secs(warmup);
+    let bench_deadline = warmup_deadline + Duration::from_secs(duration);
+    eprintln!("Warming up {warmup}s, then benchmarking {duration}s...");
+    let sampler = spawn_resource_sampler(warmup_deadline, bench_deadline);
+
+    let mut handles = Vec::with_capacity(connections);
+    for _ in 0..connections {
+        let connector = connector.clone();
+        let authority = authority.clone();
+        let body = body.clone();
+        let cfg = config.clone();
+        handles.push(pool.spawn_connect(addr, cfg, move |t| {
+            let rdma = TokioRdmaStream::new(AsyncRdmaStream::new(t));
+            h1_conn_loop(
+                rdma,
+                connector,
+                authority,
+                body,
+                warmup_deadline,
+                bench_deadline,
+            )
+        }));
+    }
+
+    let (merged, errors) = collect_h1_conn_results(handles, "rh1-park").await;
+    let (cpu_seconds, peak_rss) = sampler.await.unwrap_or((0.0, 0));
+    report_h1_thread_per_core(
+        &merged,
+        "rh1-park",
+        connections,
+        cores,
+        duration,
+        payload,
+        errors,
+        cpu_seconds,
+        peak_rss,
+        report,
+    );
+
+    pool.shutdown();
+    Ok(())
+}
+
+/// Serve one accepted read-ring transport as a thread-per-core HTTP/1.1
+/// connection: wrap it in an [`AsyncRdmaStream`], then run the same TLS-accept +
+/// hyper `http1` echo path as [`serve_h1_conn`], on the owning core.
+async fn serve_h1_transport(transport: ReadRingTransport, acceptor: Arc<SslAcceptor>) {
+    let rdma = TokioRdmaStream::new(AsyncRdmaStream::new(transport));
+    serve_h1_conn(rdma, acceptor).await;
+}
+
+/// Run the busy-poll HTTP/1.1 **server** (`--mode rh1-busy`): build a
+/// [`BusyPool`] over `busy_cores` pinned cores, accept exactly `connections`
+/// read-ring connections (round-robin, handshake serialized), and serve each on
+/// its owning core until the peers disconnect or `shutdown` resolves. `bind`
+/// must be a concrete RDMA IP (the pool probes the device context from it).
+pub async fn run_h1_busy_server<Sh>(
+    bind: SocketAddr,
+    config: ReadRingConfig,
+    busy_cores: usize,
+    connections: usize,
+    cert: &Path,
+    key: &Path,
+    shutdown: Sh,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    Sh: Future<Output = ()>,
+{
+    if bind.ip().is_unspecified() {
+        return Err(format!(
+            "busy-poll h1 server needs a concrete --bind RDMA address to probe the device \
+             context, but got the unspecified address {bind}; bind to the NIC's RoCE IP \
+             (e.g. 10.0.1.5:50051)"
+        )
+        .into());
+    }
+    let cores = busy_cores.max(1);
+    let (probe, ctx) = crate::echo::probe_device_context(bind).await?;
+
+    let conns_per_core = connections.max(1).div_ceil(cores);
+    let core_ids: Vec<usize> = (0..cores).collect();
+    let pool = BusyPool::with_config(ctx, &core_ids, &config, conns_per_core)?;
+
+    let acceptor = Arc::new(tls_common::build_acceptor_h1(cert, key));
+    let listener = Arc::new(AsyncCmListener::bind(&bind)?);
+    let local = listener.local_addr();
+    eprintln!(
+        "Busy-poll h1 server listening on {local:?}: {cores} pinned core(s), accepting \
+         {connections} read-ring connection(s) ({conns_per_core}/core)"
+    );
+
+    let handles = pool
+        .serve(listener, config, connections, move |t| {
+            serve_h1_transport(t, acceptor.clone())
+        })
+        .await;
+
+    let all_closed = async {
+        for h in handles {
+            let _ = h.await;
+        }
+    };
+    tokio::pin!(shutdown);
+    tokio::select! {
+        _ = all_closed => eprintln!("Busy-poll h1 server: all connections closed"),
+        _ = &mut shutdown => eprintln!("Busy-poll h1 server: shutdown signal received, draining"),
+    }
+
+    pool.shutdown();
+    drop(probe);
+    Ok(())
+}
+
+/// Run the thread-per-core arm-park HTTP/1.1 **server** (`--mode rh1-park`):
+/// same pinned-per-core accept/serve topology as [`run_h1_busy_server`], but
+/// driven through an interrupt-armed [`ArmParkPool`]. No device-context probe is
+/// needed, so `bind` may be any address the CM can bind.
+pub async fn run_h1_park_server<Sh>(
+    bind: SocketAddr,
+    config: ReadRingConfig,
+    park_cores: usize,
+    connections: usize,
+    cert: &Path,
+    key: &Path,
+    shutdown: Sh,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    Sh: Future<Output = ()>,
+{
+    let cores = park_cores.max(1);
+    let core_ids: Vec<usize> = (0..cores).collect();
+    let pool = ArmParkPool::new(&core_ids)?;
+
+    let acceptor = Arc::new(tls_common::build_acceptor_h1(cert, key));
+    let listener = Arc::new(AsyncCmListener::bind(&bind)?);
+    let local = listener.local_addr();
+    eprintln!(
+        "Thread-per-core arm-park h1 server listening on {local:?}: {cores} pinned core(s), \
+         accepting {connections} read-ring connection(s)"
+    );
+
+    let handles = pool
+        .serve(listener, config, connections, move |t| {
+            serve_h1_transport(t, acceptor.clone())
+        })
+        .await;
+
+    let all_closed = async {
+        for h in handles {
+            let _ = h.await;
+        }
+    };
+    tokio::pin!(shutdown);
+    tokio::select! {
+        _ = all_closed => eprintln!("arm-park h1 server: all connections closed"),
+        _ = &mut shutdown => eprintln!("arm-park h1 server: shutdown signal received, draining"),
+    }
+
+    pool.shutdown();
+    Ok(())
 }
