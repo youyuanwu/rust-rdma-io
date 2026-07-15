@@ -1,7 +1,7 @@
 # RDMA Read Ring — Arm-Park and Busy-Poll Completion Modes
 
-**Status:** Proposed  
-**Date:** 2026-07-10  
+**Status:** Implemented (experimental) — Phase 0 seam + Phase 1 busy-poll (read-ring) landed and MANA-validated; current behavior lives in code, remaining hardening is in §13 (review must-fix items 6/8/13 addressed 2026-07-15).  
+**Date:** 2026-07-10 (design)  
 **Builds on:** [rdma-read-ring-transport.md](rdma-read-ring-transport.md) — `ReadRingTransport` (wire/data path reused wholesale)  
 **Background:** [../background/RdmaMechanisms.md](../background/RdmaMechanisms.md) — *§Kernel bypass: which to poll, and busy-poll vs arm-and-park*  
 **Contrast:** [rdma-transport-layer.md](rdma-transport-layer.md), [`async_cq.rs`](../../rdma-io/src/async_cq.rs) — current arm-and-park model
@@ -501,156 +501,42 @@ strict driver→app round-robin, and app futures are cooperative. So:
 
 ## 10. Phasing
 
-### Prerequisites — fix the current impl first
+### What is implemented (and where the code lives)
 
-> **Implementation status (2026-07-14).** P1, P2, and **P3/Phase 0 (all three transports)** are
-> implemented and validated on MANA. read-ring: 5/5 + rh2 bench ~687k rps/0 err. Credit-ring and
-> send-recv migrated to the seam: functional tests pass isolated on a fresh NIC (the full
-> `transport_tests` binary wedges late on accept — confirmed MANA churn, green per-test), echo bench
-> ~1.33M rps/0 err each. **Phase 1 in progress:** Slice A (`ConnSlot` + `DriverSource` primitives,
-> unit-tested), Slice B (`CoreDriver` shared-CQ reaper + busy-poll read-ring connect/accept — MANA:
-> bidirectional busy echo 1/1, arm-park 5/5 regression-free), and **Slice C part 1** (WR accounting
-> via the `AsyncQp` post choke point — MANA: busy echo runs with no underflow) are done. **Slice C
-> part 2** (the reclaim barrier + `qp_num` retirement) is done too: `Drop` hands a busy transport's
-> resources to the per-core driver's reclaim queue, which drains the flush CQEs to zero, frees
-> `ReadRingInner` (MW→QP→MR→PD) and retires the `qp_num`, joined at shutdown — MANA (fresh NIC):
-> busy echo + 24-cycle reconnect churn 2/2, arm-park 5/5 regression-free. **Slice D done:**
-> D1 (`BusyPool` per-core worker pool + client sharding) and D2 (server accept via serialized
-> handshake) are done — MANA: 6-client/2-core busy↔arm-park echo both directions. D3 (aggregate CQ
-> sizing via `ReadRingConfig::wr_budget` + per-core admission cap + flush headroom) is done too —
-> MANA: cap-2 pool admits 2 / refuses the 3rd. **D4 (bench integration) done:** the `BusyPool`
-> moved to a shared `rdma-io-busy` crate, and the **same** `rdma-bench-{client,server}` executables
-> gained an `echo-busy` mode whose `main` selects the busy runtime topology (N pinned `current_thread`
-> cores) instead of the arm-park multi-thread runtime. 2-VM MANA (8 conns, payload 64, in_flight 4):
-> `echo-busy` on 2 pinned cores = 938K rps, p50 32µs / p99 42µs, 2.13 cpu-µs/op vs arm-park `echo` on
-> 8 threads = 386K rps, p50 78µs / p99 131µs, 5.37 cpu-µs/op (0 errors both; the busy cores run at
-> ~100% under load, the honest cost). A unified `--threads` knob is the per-process CPU budget in both
-> modes; the bench result labels busy runs `echo-busy` so they separate from the arm-park baseline.
-> **Busy correctness (§12) on a single-core shared CQ:** shared-CQ fairness (6 conns, hot/idle mix,
-> id-seeded payloads — no cross-talk, no starvation) and per-connection disconnect isolation (one conn
-> reclaims mid-stream while siblings keep streaming) — MANA fresh NIC: 5/5 busy-pool tests, arm-park
-> regression green. **Remaining:** the `echo-busy` measurement sweep + `docs/bench/` write-up, and the
-> design-deferred `rh1-busy`, server-side admission reject/redirect, and idle hybrid (§5.4).
+Phase 0 (the completion-source seam) and Phase 1 (busy-poll end-to-end for read-ring,
+correctness-complete) are **landed and MANA-validated**. The phasing/slice narrative that guided the
+build has been removed in favor of the code, which is now the source of truth:
 
-Do these before any busy-poll code; each is a small refactor or primitive **testable against
-arm-park alone**, so the new subsystem lands on clean seams rather than on today's scattered CQ
-access. Grounded in the current code:
+| Piece | Code |
+|---|---|
+| Completion-source seam (`ArmPark` + `Driver`) | [`completion_source.rs`](../../rdma-io/src/completion_source.rs) |
+| Poster QP (`new_poster`, `to_error()`, no raw CQ accessors) | [`async_qp.rs`](../../rdma-io/src/async_qp.rs) |
+| Per-core shared-CQ reaper, `qp_num` demux, reclaim barrier | [`core_driver.rs`](../../rdma-io/src/core_driver.rs) |
+| `ConnSlot` (inboxes, wakers, WR counters, lifecycle state) | [`conn_slot.rs`](../../rdma-io/src/conn_slot.rs) |
+| Busy connect/accept, `ReadRingInner` split, reclaim handoff | [`read_ring_transport.rs`](../../rdma-io/src/read_ring_transport.rs) |
+| `BusyPool` / `ArmParkPool` (pinned pool, sharding, admission, CQ sizing) | `rdma-io-busy/src/lib.rs` |
+| Bench modes (`echo-busy`, `rh1-busy`, `rh1-park`) | `tests/rdma-io-bench/src/` |
 
-- **P1 — safe `to_error()` QP-state primitive. [Done — `d09aa55`].** Added idempotent `to_error()`
-  (transition QP to `IBV_QPS_ERR`, flushing outstanding WRs) on `QueuePair`, `CmQueuePair`, and
-  `AsyncQp`, on top of `modify()`. The teardown barrier (§6.2) needs it, and arm-park teardown is
-  deterministic with it.
-- **P2 — deterministic, accounted teardown drain (also a latent-bug fix today). [Done — `d09aa55`
-  read-ring; send-recv/credit-ring migrated too].** Read-ring `Drop` forces `to_error()` (P1) then
-  drains against exact expected counts — `send_in_flight + read_in_flight` on the send CQ,
-  `max_outstanding` on the recv CQ (invariant: each reaped recv reposts a doorbell inline) — with a
-  bounded poll budget and no wall-clock deadline / thread yield, so `Drop` never blocks the tokio
-  worker. Replaces the old "disconnect then poll once until empty" that could under-drain and
-  deregister MRs the QP still referenced (the non-fatal `ibv_dealloc_pd` teardown messages).
-  **Send-recv and credit-ring** also now force `to_error()` first, then drain both sources until a
-  full sweep is empty (bounded budget) — their recv WR counts are not tracked exactly, so they use
-  drain-until-quiescent rather than exact counters, which is correct because `to_error()` makes the
-  flush CQEs present up front. Full deferral to a spawned reclaim task is the Phase-1
-  `ResourceBundle` work.
-- **P3 — fold the seam + CQ-ownership decoupling into Phase 0 (below). [Done — all three
-  transports].** Introduced [`completion_source.rs`](../../rdma-io/src/completion_source.rs)
-  (`CompletionSource::ArmPark`, owning the `AsyncCq` + `CqPollState`); `AsyncQp` CQ fields are now
-  `Option<AsyncCq>` with a `new_poster(cmqp)` constructor; each transport holds a poster QP +
-  `send_src`/`recv_src` (declared after `qp` so RAII destroys the QP before its CQs) and routes the
-  data path, setup token/MW-bind drain, and the teardown drain through the sources — nothing calls
-  `ibv_poll_cq` directly. `transport_common::complete_token_exchange` takes the recv source and
-  `drain_send_cq` was removed. `AsyncQp` keeps its `Option`-CQ Some-path only for its own low-level
-  unit tests (`async_qp_tests`), which use its `send`/`recv` convenience verbs directly.
+The **arm-park default is unchanged and remains the regression baseline.** The three prerequisites
+also shipped: **P1** the idempotent `to_error()` QP-to-`ERR` primitive; **P2** the deterministic,
+accounted teardown drain (a latent-bug fix that replaced the best-effort single drain); **P3** the
+CQ-ownership decoupling that slimmed `AsyncQp` to a poster and moved completion acquisition entirely
+into `CompletionSource`. Read the code and its tests for exact behavior.
 
-### Phases
+### Remaining phases (not yet done)
 
-0. **Phase 0 — the seam (`ArmPark`-only). [Done — all three transports (read-ring `e8858e7`;
-   send-recv + credit-ring migrated).]** Introduce `CompletionSource` with **only the
-   `ArmParkSource` variant** — the `DriverSource` variant references `ConnSlot`/`poll_inbox`, which
-   are Phase-1 types, so it is *not* added until Phase 1 (Appendix A shows the target two-variant
-   shape for reference). Route **all** `ReadRingTransport` completion access through the seam — the
-   data path, the setup `drain_send_cq`, and the teardown drain — so nothing calls `ibv_poll_cq`
-   directly. Stop exposing `AsyncQp::send_cq()`/`recv_cq()` and decouple CQ ownership from `AsyncQp`
-   (P3). `ArmParkSource` wraps today's `AsyncCq` with **no behavior change**. **Stage read-ring
-   first**, leaving `AsyncQp`'s CQ accessors in place for `send_recv`/`credit_ring`; migrate those
-   two in a follow-up. Regression-test all existing transports.
-1. **Phase 1 — busy-poll end-to-end (read-ring), correctness-complete.** Add `CoreDriver`, the
-   shared per-core poll-only CQ pair, `ConnSlot` + inboxes + `AtomicWaker`, and `qp_num` demux.
-   **The lifecycle-correctness items are Phase 1, not deferred:** overflow-free inbox sizing +
-   shared-CQ sizing (§7.2), separate send/recv WR accounting (§6.2), the `ResourceBundle`
-   ownership-transfer + forced-`ERR` teardown barrier (§6.2), the setup handoff incl. CM-ID routing
-   (§6.1), per-connection PD (§7.4), and the worker-affinity guard (§7.5). Pin workers in this
-   phase (§4.1). Run echo / rh1 thread-per-core and measure p50/p99 and `cpu_us_per_op` vs arm-park.
-2. **Phase 2 — tuning + hardening.** Admission-control *policy* tuning (caps, redirect vs refuse),
+1. **Phase 2 — tuning + hardening.** Admission-policy tuning (caps, redirect vs refuse),
    cleanup-timeout / forced-failure tuning, `qp_num`-reuse stress, and the full observability set
-   (§12).
-3. **Phase 3 (DEFERRED) — bounded-spin hybrid.** Idle-CPU fallback (§5.4).
-4. **Phase 4 — scale-out.** Least-loaded sharding, SMT-aware placement, NUMA-aware Context/PD, and
+   (§12). The review-driven correctness gaps are enumerated in the §13 TODO.
+2. **Phase 3 (deferred) — bounded-spin idle hybrid.** Idle-CPU fallback (§5.4).
+3. **Phase 4 — scale-out.** Least-loaded sharding, SMT-aware placement, NUMA-aware Context/PD, and
    extending the same driver to send-recv / credit-ring.
 
-### Phase 1 implementation slices
+### Teardown as a kernel-like background reclaim
 
-Phase 1 is the largest single chunk in this design, so it is **sliced into four independently
-landable commits** rather than one drop. Each slice is testable on its own, and the ordering front-
-loads the low-risk library work so the churn-sensitive teardown lands on proven primitives.
-
-**What already exists (Phase 1 builds on, does not create):** the poll-only shared CQ
-([`CompletionQueue::new`](../../rdma-io/src/cq.rs) — null comp_channel, no fd/interrupt); QP-against-
-arbitrary-CQ ([`create_qp_with_cq`](../../rdma-io/src/async_cm.rs)); the poster QP
-([`AsyncQp::new_poster`](../../rdma-io/src/async_qp.rs)); the single-variant, additive seam
-([`CompletionSource`](../../rdma-io/src/completion_source.rs)); the forced-flush primitive
-(`to_error()`, P1); and the routing key ([`WorkCompletion::qp_num()`](../../rdma-io/src/wc.rs)). New
-crate deps needed: an `AtomicWaker` (`atomic-waker` or `futures-util`'s `task`) and `core_affinity`.
-
-- **Slice A — `ConnSlot` + `DriverSource` primitives (no driver, no hardware). [Done.]** Add `ConnSlot`
-  (per-direction bounded inbox sized overflow-free per §7.2, an `AtomicWaker` per direction with the
-  §7.3 register–check–recheck ordering, the separate send/recv WR counters of §6.2, and the
-  `Connecting/Established/Closing/Drained` lifecycle state), the `Driver(DriverSource)` variant +
-  `poll_inbox`, and the §7.5 owner-worker token guard. Pure library code; unit-test with a fake
-  producer feeding the inbox — covers the completion-arrived-before-registration race, both-
-  directions wake, coalesced wakes, and counter underflow = fatal. Builds and tests **locally, no
-  RDMA device**. Keeps `CompletionSource` compiling in both variants.
-- **Slice B — `CoreDriver` + single connection, read-ring, one pinned core. [Done — validated on
-  MANA: bidirectional busy echo 1/1, arm-park read-ring 5/5 regression-free.]** Add the `CoreDriver`
-  task (sole reaper of one shared send/recv CQ pair, `qp_num → Arc<ConnSlot>` map, the bounded
-  cooperative loop of §5.2 with `MAX_CQE_PER_CQ`/`MAX_CQE_PER_TURN` + `yield_now`, unknown-`qp_num`
-  = fatal per §4.2), build the read-ring QP against the shared CQs, route setup drain and the data
-  path through `DriverSource`. Scope: **one connection, one core, pinned `current_thread` runtime**
-  (§4.1). Proves the data path end-to-end on hardware without any of the multi-connection or reuse
-  hazards. Preserves the single-owner send-CQ invariant (§8) — the driver is that owner.
-- **Slice C — teardown barrier + `ResourceBundle` (the churn-critical slice). [Done — part 1 (WR
-  accounting) + part 2 (reclaim barrier), MANA-validated: busy echo + 24-cycle reconnect churn 2/2,
-  arm-park 5/5 regression-free.]** Implemented as a `ReadRingInner` split (`da8054a`) + the
-  background reclaim (`3a690a1`): busy `Drop` marks the slot `Closing`, forces the QP to `ERR`
-  (`to_error()`), and `take()`s `Option<ReadRingInner>` onto the driver's **reclaim queue** (RAII
-  destroys nothing). The driver keeps routing that QP's flush CQEs — `Closing`-aware: `dec_posted`
-  but discard — and, once **both counters zero and both inboxes empty** (or the wedge budget trips),
-  frees MWs → QP → MRs → PD in field order and **retires** the `qp_num` (bump generation; reuse legal
-  only after retirement). This is where MANA churn correctness concentrates — a stale CQE mis-routed
-  to a reused `qp_num` is a **fatal** invariant breach, validated by the rapid close/reconnect +
-  `qp_num`-reuse stress test. **The background-reclaim model and shutdown-join protocol are
-  specified in [Slice C part 2 design](#slice-c-part-2-design--background-reclaim-teardown-as-a-kernel-like-cleanup-task) below.**
-- **Slice D — setup handoff, server CM-ID routing, sharding + admission control. [D1–D4 done — see
-  [Slice D design](#slice-d-design--multi-connection-sharded-and-measurable) below; MANA-validated
-  busy↔arm-park echo (client- and server-pool) + admission cap.]** Add the per-core **`BusyPool`** +
-  connection sharding (D1 — done), the server-side control task (D2 — done, serialized-handshake
-  realization), aggregate shared-CQ sizing + per-core admission control + reserved flush headroom
-  (D3 — done, §7.2), and the **`echo-busy` bench mode** wired into the existing
-  `rdma-bench-{client,server}` executables (D4 — implemented, §11). Then run echo thread-per-core and
-  measure p50/p99 + `cpu_us_per_op` vs arm-park.
-
-Slices A and B are low-risk and unlock everything downstream; C is the correctness crux under MANA
-churn; D makes it multi-connection and measurable. Per §12, correctness scenarios run on **both rxe
-and MANA**, and every slice keeps the **arm-park regression suite green**.
-
-### Slice C part 2 design — background reclaim (teardown as a kernel-like cleanup task)
-
-**The right mental model is TCP `close()`.** When an app closes a TCP socket the `close()` syscall
-returns *immediately*; the kernel keeps the connection's protocol state alive in the background —
-sending its FIN, acking the peer's FIN, retransmitting, and holding the 4-tuple in **`TIME_WAIT`**
-so a delayed segment from the old connection can't be mis-delivered to a new one — and only frees
-the TCB (transmission control block) once that is all quiescent. Busy-poll RDMA teardown wants the
-same shape, and the pieces map almost one-to-one:
+**The mental model is TCP `close()`.** Closing returns immediately; the kernel keeps protocol state
+alive in the background (FIN/ACK, retransmit, `TIME_WAIT`) and frees the TCB only once quiescent.
+Busy-poll RDMA teardown has the same shape:
 
 | TCP | Busy-poll read-ring |
 |---|---|
@@ -660,367 +546,70 @@ same shape, and the pieces map almost one-to-one:
 | `TIME_WAIT` blocks 4-tuple reuse | **`qp_num` retirement** blocks routing-key reuse until drained |
 | kernel worker/soft-IRQ context (not the app) | the per-core driver task (not the app task) owns cleanup |
 
-So **yes — there is a background task we hand closing work to, and shutdown joins it.** Two design
-questions the analogy raises, answered:
+Reclaim runs **per-core** — the `CoreDriver` already on the connection's owning core *is* the
+background reaper (a global reclaimer would touch other cores' non-thread-safe ibverbs objects and
+reintroduce cross-core contention), and a connection's QP/MRs/ring/`ConnSlot` are core-affine for
+life. The **process-level shutdown join** fans out to every core's driver. The protocol:
 
-**1. Global cleanup task, or per-core?** *Per-core* — the `CoreDriver` already running on the
-connection's owning core *is* the background reaper; we do **not** add a separate global task. A
-global reclaimer would have to touch QPs/CQs/MRs that live on *other* cores' `ibv_context`s
-(ibverbs objects are not thread-safe without external sync — §7.5) and would reintroduce the
-cross-core contention the per-core shared CQ exists to avoid. A connection's QP, MRs, ring, and
-`ConnSlot` are core-affine for life (§4.1), so its teardown must run where they live. The "global"
-part is only the **process-level shutdown join** (below), which fans out to every core's driver.
+- **Handoff (never blocks).** `Drop` marks the slot `Closing`, forces the QP to `ERR` (`to_error()`,
+  so every outstanding WR flushes a CQE up front and the drain terminates), and `take()`s the
+  RDMA/CM resources onto the driver's reclaim queue — RAII destroys nothing, and `Drop` calls no
+  owner-checked method, so it is sound even if dropped from a foreign thread.
+- **Drain (the barrier).** Each turn the driver clears the slot's inbox backlog and `dec_posted`s
+  (but discards) further flush CQEs for a `Closing` slot; when both WR counters are zero and both
+  inboxes empty the bundle is `Drained`.
+- **Free + retire (the `TIME_WAIT`).** On `Drained` the driver frees MW→QP→MR→PD in field order,
+  then retires the slot — bump generation, remove `qp_num` from the routing map — so a straggler
+  flush CQE can never be mis-routed to a reused `qp_num` (§4.2).
+- **Shutdown join (`main` waits).** `shutdown()` flips a flag; the driver keeps sweeping +
+  reclaiming until the queue is empty, and the owner awaits the driver task **before** the shared
+  CQs and per-core context drop — so no QP/MR outlives, and no flush CQE is stranded in, a CQ about
+  to be destroyed.
 
-**2. Does `main` wait for it?** *Yes, at process/runtime shutdown* — exactly like a graceful daemon
-that drains connections before exit. The ownership handoff makes this safe:
+**Wedge escape hatch.** A wedged NIC can fail to deliver a flush CQE, so reclaim force-frees a
+bundle after a bounded budget and logs it — trading a small logged risk for a shutdown that cannot
+hang (the same choice the kernel makes with `TIME_WAIT`/`FIN_WAIT` timeouts). The current
+turn-counter budget and its interaction with the retirement `debug_assert` are called out in the
+§13 TODO. The concrete `process_reclaim` loop and the `ReadRingInner` split live in
+[`core_driver.rs`](../../rdma-io/src/core_driver.rs) and
+[`read_ring_transport.rs`](../../rdma-io/src/read_ring_transport.rs).
 
-- **Handoff (never blocks).** Busy-mode RDMA resources live in one transferable `ReadRingInner`
-  (the §7.1 struct split — a *plain* struct, not per-field `Option`s), which owns **every**
-  RDMA/CM-holding field of the transport: `offset_mw`/`recv_mw`, the `qp`, both
-  `CompletionSource`s (`send_src`/`recv_src` — in busy mode these are cheap driver-sources holding
-  only an `Arc<ConnSlot>`), the rings, `read_buf`, `offset_mr`, `doorbell_bufs`, the arm-park
-  `cm_async_fd`, the `cm_id` + `event_channel`, and the `pd`. To make the handoff concrete the
-  *busy* transport gains two extra fields beside its `Option<ReadRingInner>`: the `Arc<ConnSlot>`
-  and a `reclaim: CoreDriverHandle` exposing the driver's reclaim queue. `Drop` (and cancel /
-  setup-failure / panic) does only cheap, **owner-agnostic** things, in this order: (1) mark the
-  slot `Closing` (`set_state`, which takes no `assert_owner`); (2) force the QP to `ERR` via
-  `to_error()` on the *still-borrowed* inner (P1 — every outstanding WR flushes a CQE *up front*, so
-  the drain terminates) — this must run **before** the inner is moved; (3) `take()` the
-  `Option<ReadRingInner>` into a `ResourceBundle` and push it onto the reclaim queue. **`Drop` must
-  not call any `assert_owner` method** (`dec_posted`, `drain_inbox`, `poll_inbox`) — those run only
-  on the driver/owner core — so teardown stays sound even if the transport is dropped from a foreign
-  thread. RAII destroys **nothing** in `Drop` itself. The reclaim queue is
-  `reclaim: Arc<Mutex<Vec<ResourceBundle>>>`, a field on **both** `CoreDriver` and
-  `CoreDriverHandle` (a plain driver-owned queue, *not* a spawned task, because the runtime may
-  already be shutting down); `CoreDriverHandle::reclaim(bundle)` pushes.
-- **Drain (the barrier).** Each driver turn, after the data sweep, `process_reclaim` walks the
-  queue with a bounded per-bundle budget. Two things must happen for a `Closing` bundle:
-  - **Clear the inbox backlog.** CQEs the driver delivered *before* the app stopped polling still
-    sit in the slot's two inboxes, and `drain_complete()` requires both inboxes empty — so reclaim
-    `drain_inbox(Send)`/`drain_inbox(Recv)` to discard that backlog (the app is gone; ring framing
-    no longer matters). Without this the barrier can never complete — it is the single most likely
-    wedge.
-  - **Discard future flush CQEs.** Routing becomes **`Closing`-aware**: `route_into` still
-    `dec_posted`s each reaped CQE for a `Closing` slot but *discards* it instead of `deliver`-ing to
-    the inbox (which would re-fill what reclaim just drained).
-  When a bundle's send and recv counters both reach zero *and* both inboxes are empty
-  (`drain_complete()`), it transitions `Closing → Drained`.
-- **Free + retire (the `TIME_WAIT`).** Only on `Drained` does the driver destroy the inner in
-  field/verbs order (**MWs → QP → MRs → PD**, encoded in `ReadRingInner`'s field order, not prose)
-  by setting `bundle.inner = None`. The `Arc<ConnSlot>` is held *beside* the inner (not inside it),
-  so it survives the free; the driver then **retires** it — bump its generation and **remove
-  `qp_num` from the routing map** — *after* the inner is dropped. Reuse of that `qp_num` is legal
-  only after retirement, so a straggler flush CQE for the old QP can never be mis-routed to a new
-  connection that happens to be assigned the same number (§4.2) — the direct analogue of
-  `TIME_WAIT`.
-- **Shutdown join (`main` waits).** `CoreDriverHandle::shutdown()` flips a flag; the driver's run
-  loop calls `process_reclaim` every turn and, once the flag is set, **keeps sweeping + reclaiming
-  until the reclaim queue is empty** (every bundle `Drained` + freed) before returning. The owner
-  `await`s the driver task's `JoinHandle` **before** the shared CQs and per-core `ibv_context` are
-  dropped — guaranteeing no QP/MR outlives, and no flush CQE is stranded in, a CQ that is about to
-  be destroyed. This is the "wait for the background thread to finish freeing TCBs" step, made
-  explicit.
+### Multi-connection: sharding, server accept, and CQ budgeting
 
-**Termination guarantee + the wedge escape hatch.** `to_error()` forcing flush up front means the
-expected CQE count is fixed at `Drop` time, so the barrier is not an open-ended wait. But a wedged
-NIC can still fail to deliver a flush CQE (the MANA churn failure mode). So each bundle carries a
-**turn counter** and reclaim a **budget**: once `turns >= budget` (wired in `process_reclaim`
-below; a coarse timer is an equivalent alternative), the driver logs a fatal-teardown warning,
-force-destroys the bundle anyway (`inner = None`), and retires the `qp_num`. That trades a small,
-logged correctness risk for a shutdown that cannot hang — the same pragmatic choice the kernel makes
-with `TIME_WAIT` / `FIN_WAIT` timeouts. Tuning the budget is Phase 2.
+Busy-poll is multi-connection and benchmarkable via a per-core pool. The design decisions that
+shaped the code (`rdma-io-busy`):
 
-**Failure modes.** If the driver task **panics**, its reclaim queue (an `Arc<Mutex<…>>`) is dropped
-and RAII destroys the pending bundles best-effort (possibly with benign teardown warnings) — no
-use-after-free, because nothing else references those resources. At **runtime shutdown** the driver
-reclaims *every* bundle before the shared CQs/context go (the join above). A bundle whose app
-`Drop` ran while the driver was already gone is likewise freed by the queue's own drop.
-
-**Why not offload destruction to a dedicated task?** `ibv_destroy_qp` / `ibv_dereg_mr` are syscalls,
-and doing them on the hot polling core adds jitter. For Phase 1 we accept that (reclaim is
-infrequent and bounded per turn); a **dedicated per-core reclaim task** — the driver hands `Drained`
-bundles to a lower-priority sibling that only runs the destroy syscalls — is a clean Phase 2
-refinement that keeps the same ownership rules and doesn't change the barrier.
-
-**Rust shape (sketch).**
-
-```rust
-// The RDMA-owning half of the transport (the §7.1 split). ONE move-out, no
-// per-field Option: `Drop` takes the whole inner. Field order IS the verbs
-// drop order: MWs → QP → (sources) → MRs/rings/buffers → CM → PD.
-struct ReadRingInner {
-    offset_mw:     MemoryWindow,        // MW2, dropped first
-    recv_mw:       MemoryWindow,        // MW1
-    qp:            AsyncQp,             // then the QP (ERR'd before the move)
-    send_src:      CompletionSource,    // busy: driver-source (Arc<ConnSlot>), no CQ
-    recv_src:      CompletionSource,
-    send_ring:     RingBuffer,          // then the MRs / rings / buffers
-    recv_ring:     RingBuffer,
-    read_buf:      OwnedMemoryRegion,
-    offset_mr:     OwnedMemoryRegion,
-    doorbell_bufs: Box<[OwnedMemoryRegion]>,
-    cm_async_fd:   AsyncFd<RawFd>,      // arm-park CM readiness (inert in busy)
-    cm_id:         CmId,                // CM state (its own event channel)
-    event_channel: EventChannel,
-    pd:            Arc<ProtectionDomain>, // dropped last
-}
-
-// What the driver reclaims: the inner (freed on Drained) plus the slot it must
-// retire *after* the inner is gone, plus the wedge budget counter.
-struct ResourceBundle {
-    inner: Option<ReadRingInner>, // Some until Drained; None frees in field order
-    slot:  Arc<ConnSlot>,         // routing key + counters; retired after inner drop
-    turns: usize,                 // reclaim turns spent (wedge budget)
-}
-
-impl CoreDriver {
-    // Called each turn after the data sweep; bounded work. `budget` caps turns
-    // per bundle so a wedged NIC cannot hang shutdown.
-    fn process_reclaim(&mut self, budget: usize) {
-        // Split-borrow: reclaim and slots are disjoint fields.
-        let CoreDriver { reclaim, slots, .. } = self;
-        let mut scratch = [WorkCompletion::default(); 16];
-        reclaim.retain_mut(|b| {
-            // Clear any pre-Closing inbox backlog so drain_complete() can hold
-            // (idempotent — empty after the first turn; route_into discards new).
-            b.slot.drain_inbox(Dir::Send, &mut scratch);
-            b.slot.drain_inbox(Dir::Recv, &mut scratch);
-            b.turns += 1;
-
-            let done = b.slot.drain_complete();   // counters 0 && inboxes empty
-            let wedged = b.turns >= budget;       // escape hatch
-            if !done && !wedged {
-                return true;                      // still draining
-            }
-            if wedged && !done {
-                tracing::error!(
-                    qp_num = b.slot.qp_num(),
-                    "reclaim budget exhausted; force-freeing (NIC wedge, §12)"
-                );
-            }
-            b.slot.set_state(SlotState::Drained);
-            let qp_num = b.slot.qp_num();
-            b.inner = None;                       // free MW→QP→MR→PD (field order)
-            b.slot.retire();                      // bump generation (reuse barrier)
-            slots.lock().unwrap().remove(&qp_num); // reuse now legal
-            false                                 // done — drop the bundle
-        });
-    }
-}
-```
-
-The transport-side change this forces is the **`Option<ReadRingInner>` split** (shipped in
-`da8054a`): the RDMA/CM resources **and** the transport's live protocol state move into one plain
-`ReadRingInner`, and `ReadRingTransport` becomes a thin `{ inner: Option<ReadRingInner>, slot, reclaim }`
-wrapper that delegates the `Transport` trait to the inner — so `Drop` is a single `Option::take`. The
-busy wrapper additionally holds the `Arc<ConnSlot>` and its `reclaim: CoreDriverHandle`. Arm-park
-keeps destroying its inner inline (the P2 synchronous `drain_teardown`); busy hands it to the driver.
-That refactor — not the barrier logic — is the bulk of the Slice C part 2 diff, and the arm-park
-regression suite is the guard rail.
-
-### Slice D design — multi-connection, sharded, and measurable
-
-Slices A–C proved **one** busy connection per core end to end, including churn-safe teardown. Slice D
-makes busy-poll **multi-connection, multi-core, and benchmarkable** — the first slice that yields a
-head-to-head number vs arm-park. It splits into four independently-testable parts, each keeping the
-arm-park regression green (§12).
-
-**What A–C already give us.** `connect_busy`/`accept_busy` already create the QP against the driver's
-shared CQs, register a `Connecting` slot before the first post, route setup completions through the
-inbox, flip to `Established`, and reclaim on `Drop`. So the single-connection setup handoff (§6.1
-steps 1–3, client + inline accept) is **done**. What remains is everything that only appears with N
-connections across M cores: a server that fans accepts out to cores, per-core CQ budgeting,
-connection placement, and a runner that spins M pinned cores.
-
-**Runtime ownership stays with the caller.** The core `rdma-io` crate must **not** build or own a
-runtime: it depends on tokio with only the `net` feature (no `rt`), and `CoreDriver::run()` is an
-ordinary `async fn` the caller spawns on whatever `current_thread` runtime it constructs. Runtime
-topology is deployment **policy**, not a transport concern — which cores to pin, NUMA / HT-sibling
-layout, thread names / panic handlers, and integration with an app's *existing* executor all vary and
-would fight a library-hardcoded pool. So **`BusyPool` is an optional harness-layer helper** (it lives
-in the bench crate / an opt-in module, not in `rdma-io`) wrapping the runtime-agnostic seam already
-shipped: per core it builds a `current_thread` runtime, pins it, spawns one `CoreDriver`, and holds
-its `CoreDriverHandle`. What *does* belong in the core crate is the **placement / admission
-arithmetic** (D3 — per-core CQ budget and cap) plus `CoreDriverHandle` load counters, because those
-are correctness, not thread policy; the pool consumes them. Net: the library gives you the driver +
-`connect_busy`/`accept_busy` + sizing math; you (or the thin pool) own the threads.
-
-**Copies and buffering.** Sharding into a pool adds **no** data-path copy *as long as each
-connection's app loop runs on its own core* (shared-nothing thread-per-core: `client_conn_loop` /
-`server_conn_loop` spawned on the connection's runtime). The only handoff the busy model adds over
-arm-park is the same-core **SPSC `ConnSlot` inbox**: the driver copies each reaped `WorkCompletion`
-(one cache-line struct) into the inbox and the transport drains it. That copy is the intrinsic
-**sole-reaper tax** of a shared CQ — once the driver reaps a CQE it cannot hand the hardware slot
-back (§7.2) — **not** a pool artifact; it is present with one connection too. The data *bytes* are
-untouched: `send_copy` still does its single copy into the registered send ring (unavoidable for the
-one-sided Write), and `recv_buf` still hands out the ring slice in place. Extra copy / buffering
-appears in exactly one case: routing application data **across** cores — e.g. a work-stealing
-front-end that accepts on any thread but must send on a connection pinned elsewhere — which needs a
-cross-core channel (a copy, a queue, and a cross-core wake). That is a caller topology choice, and
-avoiding it (co-locating per-connection work on the connection's core) is the whole point of
-thread-per-core — another reason placement is the caller's to own.
-
-**Co-location: the pool runs your per-connection task, on-core.** The corollary of the copy analysis
-is that `BusyPool` is not a set of drivers you *call into* from outside — it is a set of **per-core
-executors, and each connection's app loop runs *inside* one of them**, next to that core's
-`CoreDriver` and transport. Co-location is mandatory: the `ConnSlot` inbox is same-core SPSC (the
-driver produces, the app task calling `poll_recv`/`send_copy` consumes — §7.1), the owner-token
-guard panics if the transport is touched off its core (§7.5), and the transport is core-affine for
-life. So the pool's connect/accept primitives are **combinators that run the app closure on-core**,
-never handing the transport back to the caller:
-
-```rust
-// Client: pick a core, connect on it, run the app loop on it — the transport never leaves the core.
-pool.spawn_connect(addr, cfg, |t| async move { client_conn_loop(t).await });
-// Server: the D2 control task dispatches to the owning worker, which builds the transport
-// on-core and spawns the app loop (server_conn_loop) there.
-```
-
-Returning the (`Send`) transport to the caller would compile but let it be moved to another runtime,
-tripping the owner-token guard at runtime; keeping it inside an on-core closure makes the safe path
-the only path. The app future must still be `Send` — `tokio::spawn` requires it **even on a
-`current_thread` runtime** (only `spawn_local` / `LocalSet` accept `!Send`, which §7.1 avoids on
-purpose). Since the transport is `Send + Sync` the app loop is `Send` and spawns fine; the pinning
-comes from the **`current_thread` topology** (one thread, no work-stealing), not the bound, and the
-owner-token guard catches an accidental spawn onto a multi-thread runtime. Per-connection logic must
-therefore be a `'static` future that owns its transport and loops (the bench `client_conn_loop` /
-`server_conn_loop` already are); an app that must drive the connection from a *different* thread
-cannot co-locate and falls back to the cross-core channel above.
-
-#### D1 — Sharding + per-core worker pool (client first)
-
-- A **`BusyPool`** (harness-layer, per *Runtime ownership* above): M `current_thread` runtimes, one
-  per pinned core (`core_affinity::set_for_current`), each owning exactly one `CoreDriver` task plus
-  its `CoreDriverHandle`. The shared building block for client and server.
-- **Placement.** A connection is assigned to a core at creation and is core-affine for life (§4.1,
-  §7.5). Start **round-robin**; leave a `least-loaded` hook (per-core connection count) for later.
-  No migration — a live QP/CQ/slot cannot move cheaply.
-- **Client path.** To open N connections, round-robin them across the pool: `spawn` each
-  `connect_busy` future **onto its target core's runtime** (via the on-core `spawn_connect`
-  combinator above, which also runs the app loop there) so the QP is built against that core's
-  driver CQs *on that core's thread* (the owner-token requirement, §7.5). The device `ibv_context`
-  is shared per-device (librdmacm), so every core's CQs live on one context and any `cm_id` can
-  build against them — but creation still runs on the owner thread.
-- Testable by generalizing the loopback echo test to K connections on a 2-core pool.
-
-> **Implemented (Slice D1).** `BusyPool` (harness-layer, in the shared `rdma-io-busy` crate — see
-> D4): `new(ctx, core_ids,
-> send_depth, recv_depth)` spawns one pinned OS thread per core, each running a `current_thread`
-> runtime whose `block_on` future *is* its `CoreDriver::run()` loop (a `std::mpsc` handshake returns
-> the runtime + driver handle once the driver is up). `spawn_connect(addr, cfg, app)` round-robins,
-> runs `connect_busy` + the app closure on-core, and returns a `JoinHandle`. Validated on MANA: 6
-> busy clients over 2 cores echo against an arm-park server (busy ↔ arm-park interop), clean
-> shutdown-join reclaim.
-
-#### D2 — Server CM-ID-keyed control task
-
-The server cannot call `accept_busy` per connection on one task: the **listener has a single CM
-event channel**, and each accepted QP must be built on its target core against that core's CQs. So
-(per §6.1, server side):
-
-- One **control task** is the sole consumer of the listener's CM channel, holding
-  `pending: HashMap<raw CmId, PendingConn>`.
-- On `ConnectRequest`: pick a core (round-robin among cores with headroom — D3), **dispatch resource
-  creation to that core's runtime** (send the `conn_id` over a channel; the worker builds PD/QP/MRs
-  against its shared CQs, registers the `Connecting` slot, and **acks**). Only after the ack does the
-  control task drive `complete_accept` for that CM ID.
-- On `Established`/`Disconnected`: match by **CM ID** (not event type) against `pending`, migrate
-  that exact `CmId` to a per-connection event channel, and hand it to the owning worker for
-  `poll_disconnect`.
-- Matching by CM ID is load-bearing: concurrent accepts would otherwise bind an `Established` to the
-  wrong setup future.
-
-This reshapes the accept primitive: from `listener → get_request → complete_accept` inline to "build
-a busy transport from an already-accepted `conn_id` on this worker," with the control task owning the
-CM state machine. Keep today's inline `accept_busy` as the single-core / test convenience. `CmId`
-must be `Send` to migrate to the worker (verify; it is moved, never shared).
-
-> **Implemented (Slice D2) — serialized handshake.** The current `complete_accept` waits for
-> `Established` **on the listener's channel** (then migrates the conn to its own channel), so two
-> concurrent `complete_accept`s would race and one could consume the *other*'s `Established` — the
-> mis-binding above. The shipped `BusyPool::serve(listener, cfg, count, app)` sidesteps the full
-> CM-ID-routing state machine by **serializing the handshake**: it dispatches `accept_busy` to the
-> next core, then waits (a per-connection `oneshot`) until that handshake has *finished touching the
-> listener* before dispatching the next. So the listener has **a single consumer at a time** — one
-> handshake in flight — and no `Established` can be mis-bound; the per-connection `app` loops still
-> run concurrently across cores (only setup is serialized, and setup is not the hot path). The
-> concurrent-handshake CM-ID-routing model above stays a future optimization for accept-heavy
-> churn. Validated on MANA: 6 arm-park clients echo against a 2-core busy pool server.
-
-#### D3 — Aggregate CQ sizing + admission control + flush headroom (§7.2)
-
-The fixed 1024-entry CQs of Slices B/C do not scale. Size and gate:
-
-- **Aggregate sizing.** `recv_cq ≥ Σ per-conn doorbell WRs`, `send_cq ≥ Σ (outstanding Write+Imm + 1
-  Read)`, summed over the core's admitted connections, validated against the device `max_cqe`.
-- **Per-core connection cap** derived from those sums and `max_cqe`; a connection that would overrun
-  the shared CQ is **refused or redirected** to another core, even though its own QP is within its
-  WR limits.
-- **Reserved flush headroom.** A disconnect burst flushes all of a QP's WRs at once; the shared CQ
-  must have room or a reclaim overruns it (fatal, §4.2). Reserve headroom equal to the admitted WR
-  budget (or cap admission below `max_cqe` by the largest single-QP budget).
-- Wire the cap into placement (D1): round-robin **among cores with headroom**; fail the connect (or
-  redirect) when all are full. Cap enforcement is a correctness test, not just a tuning knob.
-
-> **Implemented (Slice D3).** The per-connection arithmetic lives in the core crate:
-> `ReadRingConfig::wr_budget(ctx) -> ReadRingWrBudget { max_outstanding, send_wrs, recv_wrs }`
-> mirrors the CQ depths `connect`/`accept` size internally. `BusyPool::with_config(ctx, core_ids,
-> config, conns_per_core)` uses it to size each core's shared CQs at `(conns_per_core + 1) *
-> per_conn_wrs` — the `+1` is the flush headroom (one reclaiming connection's worth) — and fails if
-> that exceeds the device `max_cqe`. Admission is capped at `conns_per_core`: `spawn_connect` returns
-> `None` when every core is at cap (round-robin scan for headroom), and an `AdmissionGuard` moved
-> into the connection's task frees the slot on the owning core when it ends. `serve` over-admits on
-> the round-robin core if full (rather than reject a pending accept; server-side reject/redirect is
-> the follow-up). Validated on MANA: cap-2 pool admits 2, refuses the 3rd, frees on close.
-
-#### D4 — Bench integration + measurement
-
-- **Same executables, redesigned `main`.** Rather than a separate binary, the existing
-  `rdma-bench-client` / `rdma-bench-server` gain a new **`--mode echo-busy`**. The redesign moves the
-  runtime-topology choice *up into `main`*: `main` parses args first, and for `echo-busy` builds a
-  small single-threaded **orchestration** runtime (probe + awaiting the pool's per-connection handles
-  + the resource sampler) and delegates the data path to a `BusyPool`; every other mode keeps the
-  arm-park multi-thread runtime unchanged. A **single `--threads N` knob** is the process's CPU
-  budget, interpreted per mode: worker threads for the arm-park runtime (`0` = tokio default, one per
-  core), or the number of pinned busy-poll cores for `echo-busy`. The server also takes
-  `--connections` (how many to accept).
-- **Shared crate.** `BusyPool` moved out of `rdma-io-tests` into a new **`rdma-io-busy`** crate that
-  both the integration tests and the bench binaries depend on, keeping it out of the runtime-agnostic
-  `rdma-io` core.
-- **Reuse.** The `echo-busy` client shards `connections` read-ring connections across the pool with
-  `BusyPool::with_config` (right-sized shared CQs + per-core admission) and runs the **existing**
-  `client_conn_loop` per connection on-core; the server accepts exactly `connections` via
-  `BusyPool::serve` and runs the existing `server_conn_loop` on-core. Both reuse `BenchMetrics` /
-  `BenchResult`, so busy-poll and arm-park numbers are directly comparable. The device context is a
-  probe `cm_id` resolving the connect/bind address (librdmacm's per-device context); the server's
-  `--bind` must be a concrete RoCE IP, which the bench playbook already supplies.
-- **Measure** echo thread-per-core vs arm-park: `throughput_rps`, latency **p50/p99**, and
-  **`cpu_us_per_op`**. Busy-poll trades CPU for latency, so `cpu_us_per_op` is the honest cost axis —
-  a throughput win that costs a pinned core at 100% must be read against it. Record under
-  `docs/bench/` with the reboot-between methodology. (`rh1-busy` is the documented follow-up: it needs
-  the `AsyncRdmaStream` adapter driven on-core.)
-
-> **Implemented (Slice D4).** `BusyPool` moved to the shared **`rdma-io-busy`** crate (workspace
-> member; `rdma-io-tests` and `tests/rdma-io-bench` both depend on it). Both bench mains were
-> redesigned to branch on `--mode echo-busy` *before* building a runtime — busy uses a
-> `current_thread` orchestration runtime + `BusyPool`, arm-park keeps the multi-thread runtime. New
-> `echo::run_read_ring_busy_{client,server}` reuse `client_conn_loop` / `server_conn_loop` and the
-> `BenchResult` reporting. A single **`--threads`** knob is the per-process CPU budget in both modes
-> (arm-park worker threads / busy pinned cores; `0` = tokio default all-cores, preserving the arm-park
-> server), plus `--connections` (server); the bench playbook forwards both. Local: workspace clippy
-> `-D warnings` + fmt + 27 unit tests clean; all test
-> binaries (incl. the relocated busy-pool tests importing `rdma_io_busy`) compile. 2-VM MANA (fresh
-> NIC): `echo-busy` 8 conns / 2 pinned cores = 938K rps, p50 32µs / p99 42µs, 0 err, clean
-> SIGTERM drain; arm-park `echo` regression green (386K rps, unchanged path).
-
-#### Ordering and risk
-
-D1 → D2 → D3 → D4. D1 is a pure harness primitive (no protocol change). D2 is the trickiest (the CM
-state machine) and the highest-risk under MANA connect churn — exercise it with the same fresh-NIC,
-reboot-between discipline as the churn test. D3 is arithmetic plus a gate. D4 is the payoff. Every
-part keeps the arm-park regression green (§12); the busy correctness scenarios (multiple connections
-on one CQ, hot/idle mix, one connection flooding — fairness, per-connection disconnect while others
-stream, cap enforcement) run on **both rxe and MANA**.
+- **Runtime ownership stays with the caller.** The `rdma-io` core depends on tokio with only `net`
+  (no `rt`); `CoreDriver::run()` is a plain `async fn` the caller spawns. Runtime topology (which
+  cores to pin, NUMA/SMT layout, panic handlers) is deployment policy, so the pool lives in the
+  harness-layer `rdma-io-busy` crate, not the core. What *does* belong in the core is the
+  placement/admission arithmetic (`ReadRingConfig::wr_budget`).
+- **Co-location is mandatory.** The `ConnSlot` inbox is same-core SPSC and the owner-token guard
+  (§7.5) panics off-core, so the transport is core-affine for life. The pool's connect/accept are
+  therefore **combinators that run the app closure on-core** (`spawn_connect`, `serve`), never
+  handing the (`Send`) transport back to the caller — keeping the safe path the only path. Routing
+  application data *across* cores is the one case that needs an extra cross-core channel; avoiding
+  it is the whole point of thread-per-core, so placement is the caller's to own. The data *bytes*
+  are untouched (`send_copy`'s single copy into the send ring, `recv_buf`'s in-place slice); the
+  only added handoff is the same-core copy of each one-cache-line `WorkCompletion` into the inbox —
+  the intrinsic sole-reaper tax of a shared CQ, present with one connection too.
+- **Placement.** Round-robin among cores with headroom, core-affine for life (no migration). A
+  least-loaded hook is future work.
+- **Server accept (serialized handshake).** The listener has a single CM event channel, so the
+  shipped `BusyPool::serve` serializes setup (one handshake touching the listener at a time) to
+  avoid mis-binding an `Established` to the wrong accept. The full concurrent CM-ID-keyed routing
+  state machine (§6.1, server side) stays a future optimization for accept-heavy churn.
+- **Aggregate CQ sizing + admission + flush headroom (§7.2).** Each core's shared CQs are sized
+  `(conns_per_core + 1) * per_conn_wrs` (the `+1` is one reclaiming connection's flush headroom),
+  validated against `max_cqe`; admission is capped per core. Client connect refuses when all cores
+  are full; the server currently over-admits on the round-robin core (server-side reject/redirect is
+  in the §13 TODO).
+- **Bench integration.** `--mode echo-busy` / `rh1-busy` / `rh1-park` select the busy topology (N
+  pinned `current_thread` cores) in the same `rdma-bench-{client,server}` executables; a single
+  `--threads` knob is the per-process CPU budget in both modes. Results (`throughput_rps`, p50/p99,
+  `cpu_us_per_op`) are recorded under `docs/bench/` with the reboot-between methodology. Busy-poll
+  trades CPU for latency, so `cpu_us_per_op` is the honest cost axis (a pinned core runs ~100% under
+  load).
 
 ## 11. Risks and open questions
 
@@ -1033,7 +622,7 @@ stream, cap enforcement) run on **both rxe and MANA**.
 - **Benchmark harness shape.** Busy-poll is N pinned `current_thread` runtimes with sharding, a
   different runtime topology from the multi-thread `Send` harness. Rather than a separate binary it
   is selected by `--mode echo-busy` in the **same** `rdma-bench-{client,server}` executables, whose
-  `main` branches on the mode to build the busy runtime topology before any arm-park runtime (D4).
+  `main` branches on the mode to build the busy runtime topology before any arm-park runtime (§10).
 - **Platform.** Read-ring only, RoCE/IB only (Write+Imm; no iWARP/siw). Extending to other
   transports is Phase 4.
 
@@ -1048,11 +637,10 @@ active; rapid close/reconnect with `qp_num` reuse; shared-CQ and inbox saturatio
 each construction stage; driver shutdown and driver-task panic; timer/`AsyncFd` progress under a
 continuously-ready driver; and **regression of all arm-park transports and constructors**.
 
-> **Implemented so far (`read_ring_busy_pool_tests`, MANA fresh NIC):** multi-connection routing on a
-> shared CQ, mixed hot/idle connections on one CQ + one connection flooding (fairness — no cross-talk,
-> no starvation), per-connection disconnect while siblings keep streaming, admission-cap enforcement,
-> and clean shutdown-join reclaim (5/5). Still to add: rxe runs, the immediate-before/after-waker and
-> simultaneous read+write waiter races, and `qp_num`-reuse churn folded into the pool tests.
+> Implemented so far in `read_ring_busy_pool_tests` (MANA): multi-connection routing, hot/idle
+> fairness, per-connection disconnect isolation, admission-cap enforcement, and shutdown-join
+> reclaim. The remaining fault-injection cases (rxe runs, waker races, `qp_num`-reuse churn, and the
+> review-driven scenarios) are tracked in §13.
 
 **Metrics:** total vs empty CQ polls; CQEs per batch and per turn; **poll-gap histogram + max**;
 per-connection inbox depth + high-water; useful/coalesced/redundant wakes; unknown/stale-QP
@@ -1060,7 +648,94 @@ completions; CQ errors + overrun; outstanding WRs at close + close duration; CM 
 disconnect-detection latency; reactor-turn cadence + syscall rate; per-core CPU/affinity/NUMA/SMT
 placement; per-core connection count.
 
-## 13. Where to go next
+## 13. Remaining work and review-driven hardening TODO
+
+The feature is implemented and experimentally validated, but not yet lifecycle-complete for
+arbitrary failure, cancellation, and shutdown. The items below are from the 2026-07-15
+implementation review, in fix order.
+
+> **Progress (2026-07-15).** The three "must-fix-now" items are done: **8** (readiness barrier),
+> **6** (forced-reclaim panic — the panic; the monotonic-deadline refinement is still open), and
+> **13** (argument/result hygiene). See the per-item **[Done]** notes below.
+
+**Blockers (before production):**
+
+1. **Setup-failure cleanup.** A busy connect/accept that fails after slot registration drops the
+   half-built QP/MRs locally and leaves a registered slot. Add a setup RAII guard that marks the
+   slot `Closing`, forces the QP to `ERR`, hands the partial bundle to the driver reclaim queue, and
+   keeps the slot registered until retirement. Make `CoreDriverHandle::register()` reject an existing
+   `qp_num` instead of replacing it.
+2. **Admission vs retirement accounting.** `AdmissionGuard` releases a slot when the app task ends,
+   but the old QP may still have a full budget of flush CQEs pending, so `~2×cap` connections can
+   share a CQ sized for `cap+1`. Move the admission lease into the reclaim entry and release it only
+   after retirement; give server over-admission a strict bound reflected in CQ sizing (reject or
+   redirect when full).
+3. **Shutdown ordering.** Pool shutdown can stop a driver before active connection tasks drop,
+   stranding late reclaim entries. Signal app loops, await (or abort-then-await) every task so each
+   transport `Drop` enqueues reclaim, then stop the driver — and refuse driver exit while any
+   non-retired slot is still registered.
+
+**High priority:**
+
+4. **Terminal-error propagation.** Inbox overflow / CQ-poll failure / unknown-`qp_num` are logged
+   but not surfaced: `poll_inbox()` never checks `is_fatal()`, so a connection can hang instead of
+   erroring. Store a concrete terminal error in `ConnSlot`, return it from `poll_inbox()`, wake both
+   directions, and drive QP→`ERR`. A CQ-poll failure should fail every slot on that core.
+5. **Mandatory affinity + release-mode owner check.** Worker pinning ignores
+   `core_affinity::set_for_current()` and runners pick `0..N` rather than the allowed CPU set; the
+   owner guard is only `debug_assert` and runs *after* the verbs post. Enumerate allowed cores, fail
+   worker creation if pinning fails, and check the owner token (release builds too) *before* every
+   busy QP/CM op.
+6. **Forced-reclaim deadline (fixes a debug panic).** `process_reclaim`'s wedge path calls
+   `ConnSlot::retire()`, whose `debug_assert!(drain_complete())` fires exactly when the escape hatch
+   is exercised. Separate forced abandonment from normal `retire()`, use a monotonic deadline +
+   progress tracking instead of a turn count, and quarantine the `qp_num` (or fail the driver) rather
+   than claim the reuse barrier held.
+   **[Done 2026-07-15 — panic + quarantine]** Added `ConnSlot::abandon()` (no drain assertion) and
+   split `process_reclaim`: the normal drain retires + frees the `qp_num` for reuse; the wedge path
+   `abandon()`s and **quarantines** the number (leaves the `Drained` slot registered so it is never
+   reused and stragglers are counted-down + discarded). Unit test
+   `abandon_bumps_generation_without_drain_barrier`. **Still open:** replacing the turn-count budget
+   with a monotonic deadline + progress tracking.
+7. **Setup cancellation + timeouts.** `BusyPool::serve` waits unconditionally for each setup ack, so
+   the server can't observe SIGTERM until it has accepted the configured count; token acquisition
+   ignores `token_timeout`. Select shutdown against waiting for a request and each ack, and apply
+   `token_timeout` to token/setup waits (timeouts enter the setup reclaim guard, item 1).
+8. **Benchmark readiness barrier.** Busy clients arm warmup/bench deadlines before connect + protocol
+   setup, biasing busy-vs-park comparisons. Add a barrier: every on-core task finishes setup, reports
+   ready, and waits for a shared start signal; start sampling/deadlines only when all requested
+   connections are ready; mark the run invalid otherwise.
+   **[Done 2026-07-15]** `run_readiness_barrier` (+ `ConnReady` / `StartGate` / `BarrierOutcome`) in
+   the bench `metrics` module: each connection reports ready after setup and blocks on a shared start
+   gate; the orchestrator starts the deadlines and the CPU/RSS sampler only once every connection is
+   accounted for, then releases the gate. All four thread-per-core clients (`echo-busy`/`echo-park`/
+   `rh1-busy`/`rh1-park`) use it; incomplete readiness prints `RUN INVALID`.
+
+**Medium priority:**
+
+9. **Remove/guard public `deregister()`.** `CoreDriverHandle::deregister()` removes a slot with no
+   counter/lifetime check, contradicting the retirement invariant. Remove it or gate it behind a
+   completed-retirement proof.
+10. **Defensive sizing/construction validation.** Reject empty core sets and zero caps, use checked
+    arithmetic/casts for CQ depths, and require a successful device capability query (don't treat a
+    failed `wr_budget` device query as unbounded).
+11. **Lifecycle fault-injection tests.** Setup failure/cancellation at each stage; simultaneous
+    close + re-admit at cap; shutdown with active tasks; token/setup timeout; inbox-overflow and
+    CQ-poll propagation; unknown-`qp_num` terminal behavior; forced-reclaim timeout; off-core misuse
+    in release; empty/invalid core sets; explicit proof of `qp_num` reuse/quarantine; rxe runs and
+    the waker races (§12).
+12. **Observability.** Add per-driver poll/batch/gap metrics, per-slot inbox high-water + terminal
+    state, reclaim duration/outcome counters, and verified CPU/NUMA identity; emit a compact per-core
+    summary in the benchmark JSON.
+13. **Argument/result hygiene.** Reject an incompatible `--transport` for busy modes instead of
+    silently coercing to read-ring; count busy task panics / setup failures as errors; mark a run
+    invalid if fewer than the requested connections reach the readiness barrier.
+    **[Done 2026-07-15]** `common::require_read_ring` hard-errors the four thread-per-core modes on
+    any non-`read-ring` transport (was a silent note that mislabeled the JSON + filename); the
+    readiness barrier (item 8) counts panics / setup failures / admission-refusals as errors and
+    prints `RUN INVALID` when fewer than requested connections reach the barrier.
+
+## 14. Where to go next
 
 - [rdma-read-ring-transport.md](rdma-read-ring-transport.md) — the data path both modes reuse.
 - [../background/RdmaMechanisms.md](../background/RdmaMechanisms.md) — busy-poll vs arm-and-park,
@@ -1071,131 +746,24 @@ placement; per-core connection count.
   the single-owner / liveness invariants both modes preserve.
 - [../future/RingPerformance.md](../future/RingPerformance.md) — broader ring perf roadmap.
 
-## Appendix A — Phase-0 `CompletionSource` API (P3)
+## Appendix A — the `CompletionSource` seam (design decisions)
 
-The conceptual seam is §3; this pins down the **Rust shape** so P3 is code-ready. It resolves the
-four decisions the current code forces (`AsyncQp` owns the CQs and holds the drain-after-arm state
-externally: `poll_send_cq(cx, state: &mut CqPollState, wc)` — see
-[async_qp.rs](../../rdma-io/src/async_qp.rs)).
+The seam is implemented in [`completion_source.rs`](../../rdma-io/src/completion_source.rs) (an enum
+with `ArmPark` and `Driver` variants) and the poster QP in
+[`async_qp.rs`](../../rdma-io/src/async_qp.rs); the code is the reference for exact signatures. The
+design decisions it encodes, for future readers:
 
-### A.1 Types
-
-> **Phase-0 scope:** only the `ArmPark` variant is implemented now. The `Driver` variant below is
-> the **target shape** — it depends on the Phase-1 `ConnSlot`/`poll_inbox` types and is added in
-> Phase 1, not Phase 0. Phase 0 lands the enum with a single `ArmPark` variant (and the `Dir` /
-> `try_drain` scaffolding), so adding `Driver` later is purely additive.
-
-```rust
-/// One direction's completion stream. The transport still interprets the WCs.
-enum CompletionSource {
-    ArmPark(ArmParkSource),   // owns a per-connection CQ + its drain-after-arm state
-    Driver(DriverSource),     // [Phase 1] reads a per-direction inbox filled by the CoreDriver
-}
-
-struct ArmParkSource {
-    cq: AsyncCq,              // moved OUT of AsyncQp; owned here, by value
-    state: CqPollState,      // moved off the transport into the source
-}
-
-#[derive(Clone, Copy)]
-enum Dir { Send, Recv }
-
-struct DriverSource {
-    slot: Arc<ConnSlot>,     // registered with the core's CoreDriver
-    dir:  Dir,               // which inbox/waker to use
-}
-
-impl CompletionSource {
-    /// Async acquire: ≥1 completion, or register waker + `Pending`.
-    fn poll_completions(
-        &mut self, cx: &mut Context<'_>, out: &mut [WorkCompletion],
-    ) -> Poll<Result<usize>> {
-        match self {
-            // Verbatim today's arm-then-drain path — no behavior change.
-            Self::ArmPark(s) => s.cq.poll_completions(cx, &mut s.state, out),
-            // Drain inbox with §7.3 register–check–recheck via the slot's AtomicWaker.
-            Self::Driver(s)  => s.slot.poll_inbox(s.dir, cx, out),
-        }
-    }
-
-    /// Sync, **non-arming** drain for arm-park teardown (P2). Busy-poll returns
-    /// `Ok(0)`: its teardown is driver-mediated (§6.2), never a local CQ poll.
-    fn try_drain(&mut self, out: &mut [WorkCompletion]) -> Result<usize> {
-        match self {
-            Self::ArmPark(s) => s.cq.cq().poll(out),   // ibv_poll_cq, no req_notify
-            Self::Driver(_)  => Ok(0),
-        }
-    }
-}
-```
-
-`AsyncQp` is slimmed to a **poster** — it owns only the `CmQueuePair` and keeps `post_send_wr` /
-`post_recv_wr` / `as_raw` / `qp_num` / the new `to_error()` (P1). Its `send_cq()`/`recv_cq()` and
-`poll_send_cq`/`poll_recv_cq` are **removed**; completion acquisition lives entirely in
-`CompletionSource`.
-
-### A.2 The four decisions, resolved
-
-1. **Where `CqPollState` lives → inside `ArmParkSource`.** The state moves off the transport
-   (`self.send_cq_state`/`recv_cq_state` disappear) into the source that owns the CQ, so the
-   `poll_completions(cx, out)` signature carries no external state. `AsyncCq::poll_completions` is
-   already `&self` taking `&mut CqPollState`, so this is a move, not a rewrite.
-2. **CQ ownership + drop order → source-owned (arm-park) / driver-owned (busy-poll), with the
-   QP-before-CQ invariant relocated to field order.** The QP is built against the CQ's raw pointer
-   and does **not** own it (`CmQueuePair` holds a non-owning pointer). The transport's fields are
-   ordered `qp` **before** `send_src`/`recv_src`, so RAII drops the QP first and the arm-park CQs
-   after — preserving the verbs "destroy QP before its CQ" rule that `AsyncQp` used to enforce
-   internally. In busy-poll the shared CQ is owned by the `CoreDriver` and destroyed only at
-   runtime shutdown, after the teardown barrier (§6.2) has reclaimed every bundle — same invariant,
-   enforced by the barrier instead of field order.
-3. **Setup before the transport exists → build the source first, drain setup through it, then move
-   it in.** Sequencing below.
-4. **Enum, not `dyn` → static dispatch**, exactly two variants; the read-ring interpretation
-   (Read-sentinel, imm decode, `CompletionTracker`) stays in the transport for both.
-
-### A.3 Setup sequence
-
-**Arm-park (unchanged behavior, restructured):**
-
-```text
-let send_cq = AsyncCq::create_tokio(ctx.clone(), send_depth)?;
-let recv_cq = AsyncCq::create_tokio(ctx.clone(), recv_depth)?;
-let qp = build_qp(&cm_id, send_cq.cq().as_raw(), recv_cq.cq().as_raw(), ...)?;   // QP refs raw CQs
-let mut send_src = CompletionSource::ArmPark(ArmParkSource { cq: send_cq, state: default });
-let mut recv_src = CompletionSource::ArmPark(ArmParkSource { cq: recv_cq, state: default });
-post_setup_wrs(&qp)?;                         // token send/recv, MW binds
-drain_setup(&mut send_src, &mut recv_src)?;   // try_drain loop until setup WRs accounted (P2 counters)
-ReadRingTransport { qp, send_src, recv_src, /* rings, tracker, counters */ }   // move sources in
-```
-
-`drain_setup` replaces `transport_common::drain_send_cq` — same effect (spin `try_drain` until the
-posted setup WRs are reaped), now through the source so nothing else pokes the CQ.
-
-**Busy-poll:** register a `Connecting` `ConnSlot` with the driver **before** posting setup WRs
-(§6.1), build the QP against the driver's **shared** CQs, post setup WRs, `await` the slot inbox for
-their completions, then `send_src/recv_src = Driver(DriverSource { slot, dir })`, transition the slot
-`Established`, and construct the transport.
-
-### A.4 Steady state and teardown
-
-- **Steady state.** `poll_send_completion` → `self.send_src.poll_completions(cx, wc)`; `poll_recv`
-  → `self.recv_src.poll_completions(cx, wc)`; the transport then runs its unchanged interpretation.
-- **Teardown (arm-park, P2).** `Drop` transitions the QP to `ERR` (`to_error()`, P1), then loops
-  `send_src.try_drain` / `recv_src.try_drain` against the send/recv outstanding counters until zero
-  (bounded by a spin deadline, since `Drop` is sync). Field order guarantees the QP is already
-  destroyable before the sources (CQs) drop.
-- **Teardown (busy-poll).** `Drop` moves the QP/MRs/PD/`ConnSlot` into a `ResourceBundle` on the
-  driver's reclaim queue; `try_drain` is a no-op; the driver runs the barrier (§6.2).
-
-### A.5 Migration scope + tests
-
-- **Scope (decided: read-ring first).** The seam is introduced for **read-ring** only in Phase 0,
-  leaving `AsyncQp`'s `send_cq()`/`recv_cq()`/`poll_send_cq`/`poll_recv_cq` in place for
-  `send_recv_transport` and `credit_ring_transport`. Those two use the same
-  `poll_send_cq/poll_recv_cq(state)` shape and migrate to `ArmParkSource` mechanically in a
-  **follow-up** PR (all three are `ArmPark`-only until Phase 1). Staging read-ring first keeps the
-  first cut small and revertible.
-- **Tests (arm-park only — no busy-poll yet).** (a) a unit test that `ArmParkSource::poll_completions`
-  reproduces `AsyncQp::poll_send_cq` output for a scripted CQ; (b) full integration regression of all
-  three transports (`just test-remote`); (c) a teardown test asserting the counter reaches zero and
-  MRs deregister cleanly (the P2 latent-race fix — no more best-effort single drain).
+1. **`CqPollState` lives inside `ArmParkSource`.** The drain-after-arm state moves off the transport
+   into the source that owns the CQ, so `poll_completions(cx, out)` carries no external state.
+2. **CQ ownership + drop order.** The QP holds a non-owning pointer to its CQ, so the transport
+   orders `qp` **before** `send_src`/`recv_src` in its fields; RAII drops the QP first and the
+   arm-park CQs after, preserving the verbs "destroy QP before its CQ" rule. In busy-poll the shared
+   CQ is driver-owned and destroyed only at shutdown, after the teardown barrier (§6.2) reclaims
+   every bundle — same invariant, enforced by the barrier instead of field order.
+3. **Setup before the transport exists.** Build the source(s) first, drain setup WRs through them
+   (`try_drain` / the slot inbox), then move them into the constructed transport — nothing else pokes
+   a CQ. `drain_setup` replaced `transport_common::drain_send_cq`.
+4. **Static dispatch, exactly two variants.** An enum (not `dyn`) keeps dispatch static; the
+   read-ring interpretation (Read-sentinel, imm decode, `CompletionTracker`) stays in the transport
+   for both modes. `AsyncQp` is slimmed to a poster (`post_*`, `qp_num`, `to_error()`) with its raw
+   CQ accessors removed.
