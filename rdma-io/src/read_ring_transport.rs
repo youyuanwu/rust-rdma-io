@@ -360,6 +360,13 @@ pub struct ReadRingTransport {
     /// Busy-poll only: handle used to hand `inner` to the driver's reclaim queue
     /// on `Drop`. `None` in arm-park mode (which drains inline).
     reclaim: Option<CoreDriverHandle>,
+    /// Busy-poll only: an opaque **admission lease** the pool attaches after
+    /// setup. It travels into the reclaim bundle on `Drop` and is dropped by the
+    /// driver only after the QP is drained + retired — so the pool's admission
+    /// count (and thus the shared-CQ budget) is released at retirement, not when
+    /// the app task ends (review #2). `None` in arm-park mode / before the pool
+    /// attaches it.
+    admission: Option<Box<dyn Send + Sync>>,
 }
 
 impl ReadRingTransport {
@@ -368,6 +375,14 @@ impl ReadRingTransport {
     #[doc(hidden)]
     pub fn read_in_flight(&self) -> bool {
         self.inner.as_ref().is_some_and(|i| i.read_in_flight())
+    }
+
+    /// Attach an opaque **admission lease** (busy-poll pools only): a droppable
+    /// the transport carries into its reclaim bundle so it is dropped only after
+    /// the driver retires the connection (review #2). Called on the owning core
+    /// after setup, before the app loop.
+    pub fn set_reclaim_lease(&mut self, lease: Box<dyn Send + Sync>) {
+        self.admission = Some(lease);
     }
 
     #[inline]
@@ -825,6 +840,7 @@ impl ReadRingTransport {
             inner: Some(inner),
             slot: conn_slot,
             reclaim: driver.cloned(),
+            admission: None,
         })
     }
 
@@ -1001,6 +1017,7 @@ impl ReadRingTransport {
             inner: Some(inner),
             slot: conn_slot,
             reclaim: driver.cloned(),
+            admission: None,
         })
     }
 }
@@ -1742,7 +1759,7 @@ impl Drop for ReadRingTransport {
                     let _ = inner.cm_id.disconnect();
                 }
                 let _ = inner.qp.to_error();
-                handle.reclaim(slot, Box::new(inner));
+                handle.reclaim(slot, Box::new(inner), self.admission.take());
             }
             // Arm-park: private CQs, synchronous bounded drain, then drop `inner`
             // (MW2 → MW1 → QP → MRs → PD via field order).

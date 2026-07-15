@@ -369,7 +369,8 @@ async fn read_ring_busy_pool_admission_cap() {
         "connect past the per-core cap must be refused"
     );
 
-    // Release the held connections; their guards free the admission slots.
+    // Release the held connections; their reclaim frees the admission slots
+    // (at driver retirement, not app end — review #2).
     gate.add_permits(CAP);
     for (i, h) in held.into_iter().enumerate() {
         h.await
@@ -378,8 +379,22 @@ async fn read_ring_busy_pool_admission_cap() {
     }
     server.await.expect("server task panicked");
 
-    // Every slot is freed again once the connections have been reclaimed.
-    assert_eq!(pool.admitted_counts(), vec![0], "slots freed after close");
+    // Slots free only after the driver *retires* each connection (drains its
+    // flush CQEs), not merely when the app task ends — the admission lease now
+    // travels with the reclaim bundle (review #2). Poll until reclaim completes.
+    let mut freed = false;
+    for _ in 0..500 {
+        if pool.admitted_counts() == vec![0] {
+            freed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        freed,
+        "admission slots must free after reclaim retirement; got {:?}",
+        pool.admitted_counts()
+    );
 
     pool.shutdown();
     drop(probe);

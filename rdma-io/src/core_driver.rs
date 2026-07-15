@@ -63,6 +63,12 @@ struct ReclaimEntry {
     /// core, which is the resources' owner core (§7.5), so the verbs destroys
     /// run where the objects live.
     resources: Option<Box<dyn Send>>,
+    /// An opaque **admission lease** (e.g. the pool's `AdmissionGuard`) held for
+    /// the connection's whole lifetime. Dropped when this entry is freed — i.e.
+    /// only after the QP is drained + retired/quarantined — so a pool releases its
+    /// admission slot (and thus the shared-CQ budget) at **retirement**, not when
+    /// the app task ends (review #2). `None` when the caller holds no lease.
+    lease: Option<Box<dyn Send + Sync>>,
     /// Reclaim turns spent; bounds the wait so a wedged NIC cannot hang
     /// shutdown (§10 wedge escape hatch).
     turns: usize,
@@ -281,6 +287,11 @@ impl CoreDriver {
                 );
                 entry.slot.abandon();
             }
+            // Release the admission lease now that the connection is fully
+            // reclaimed (retired or quarantined + resources freed) — this ties a
+            // pool's admission release to retirement, not app completion, so the
+            // shared CQ can never be over-subscribed (review #2).
+            drop(entry.lease.take());
             false // done — drop the reclaim entry
         });
     }
@@ -336,14 +347,22 @@ impl CoreDriverHandle {
     ///
     /// The caller (transport `Drop`) must already have marked `slot` `Closing`
     /// and forced its QP to `ERR` (`to_error()`), so the flush terminates. Only
-    /// owner-agnostic ops may run before this call (§10).
-    pub fn reclaim(&self, slot: Arc<ConnSlot>, resources: Box<dyn Send>) {
+    /// owner-agnostic ops may run before this call (§10). `lease` is an opaque
+    /// admission lease dropped only when this bundle is fully reclaimed — tying a
+    /// pool's admission release to retirement, not app completion (review #2).
+    pub fn reclaim(
+        &self,
+        slot: Arc<ConnSlot>,
+        resources: Box<dyn Send>,
+        lease: Option<Box<dyn Send + Sync>>,
+    ) {
         self.reclaim
             .lock()
             .expect("CoreDriver reclaim queue poisoned")
             .push(ReclaimEntry {
                 slot,
                 resources: Some(resources),
+                lease,
                 turns: 0,
             });
     }

@@ -601,9 +601,10 @@ shaped the code (`rdma-io-busy`):
   state machine (§6.1, server side) stays a future optimization for accept-heavy churn.
 - **Aggregate CQ sizing + admission + flush headroom (§7.2).** Each core's shared CQs are sized
   `(conns_per_core + 1) * per_conn_wrs` (the `+1` is one reclaiming connection's flush headroom),
-  validated against `max_cqe`; admission is capped per core. Client connect refuses when all cores
-  are full; the server currently over-admits on the round-robin core (server-side reject/redirect is
-  in the §13 TODO).
+  validated against `max_cqe`; admission is capped per core. A connection holds its admission slot
+  until the driver **retires** it (drains its flush CQEs), not merely until its app task ends, so the
+  live + draining count never exceeds the cap and the `(cap+1)` sizing holds (review #2). Both the
+  client (`spawn_connect`) and the server (`serve`) refuse strictly when all cores are full.
 - **Bench integration.** `--mode echo-busy` / `rh1-busy` / `rh1-park` select the busy topology (N
   pinned `current_thread` cores) in the same `rdma-bench-{client,server}` executables; a single
   `--threads` knob is the per-process CPU budget in both modes. Results (`throughput_rps`, p50/p99,
@@ -656,8 +657,9 @@ implementation review, in fix order.
 
 > **Progress (2026-07-15).** Done: **8** (readiness barrier), **6** (forced-reclaim panic — the
 > panic + quarantine; the monotonic-deadline refinement is still open), **13** (argument/result
-> hygiene), **4** (terminal-error propagation), **9** (removed `deregister`), and the `register()`
-> duplicate-`qp_num` rejection half of blocker **1**. See the per-item **[Done]** notes below.
+> hygiene), **4** (terminal-error propagation), **9** (removed `deregister`), **2** (admission tied to
+> retirement + bounded server admission), and the `register()` duplicate-`qp_num` rejection half of
+> blocker **1**. See the per-item **[Done]** notes below.
 
 **Blockers (before production):**
 
@@ -675,6 +677,13 @@ implementation review, in fix order.
    share a CQ sized for `cap+1`. Move the admission lease into the reclaim entry and release it only
    after retirement; give server over-admission a strict bound reflected in CQ sizing (reject or
    redirect when full).
+   **[Done 2026-07-15]** The admission lease is now an opaque droppable carried on the transport
+   (`set_reclaim_lease`) into the driver's `ReclaimEntry`; `process_reclaim` drops it only after the
+   QP is drained + retired/quarantined and resources freed — so a connection holds its admission slot
+   (and CQ budget) until **retirement**, keeping live + draining ≤ cap. `serve` uses strict
+   `try_admit` and **rejects** a pending accept when all cores are full (the unbounded
+   `admit_or_roundrobin` was removed). Validated on MANA: `read_ring_busy_pool_admission_cap` (now
+   polls for the retirement-tied release) + 5/5 busy-pool tests.
 3. **Shutdown ordering.** Pool shutdown can stop a driver before active connection tasks drop,
    stranding late reclaim entries. Signal app loops, await (or abort-then-await) every task so each
    transport `Drop` enqueues reclaim, then stop the driver — and refuse driver exit while any

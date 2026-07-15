@@ -213,30 +213,6 @@ impl BusyPool {
         None
     }
 
-    /// Like [`try_admit`](Self::try_admit), but when no core has headroom it
-    /// over-admits on the round-robin core (relying on the reserved flush
-    /// headroom) rather than rejecting an already-pending accept. Used by
-    /// [`serve`](Self::serve); server-side reject/redirect is a follow-up.
-    fn admit_or_roundrobin(&self) -> (usize, AdmissionGuard) {
-        if let Some(slot) = self.try_admit() {
-            return slot;
-        }
-        let n = self.workers.len();
-        let i = self.next.fetch_add(1, Ordering::Relaxed) % n;
-        let w = &self.workers[i];
-        w.admitted.fetch_add(1, Ordering::AcqRel);
-        tracing::warn!(
-            core = w.core_id,
-            "busy pool over-admit: no core has admission headroom"
-        );
-        (
-            i,
-            AdmissionGuard {
-                admitted: w.admitted.clone(),
-            },
-        )
-    }
-
     /// Open a busy-poll read-ring connection on the next core (round-robin) and
     /// run `app` with it **on that core**, returning a [`JoinHandle`] for the
     /// app's result.
@@ -263,10 +239,13 @@ impl BusyPool {
         let worker = &self.workers[i];
         let driver = worker.driver.clone();
         Some(worker.rt.spawn(async move {
-            // Held for the connection's lifetime; releases the core's admission
-            // slot when the app returns (transport dropped -> reclaim).
-            let _guard = guard;
-            let transport = ReadRingTransport::connect_busy(&addr, config, &driver).await?;
+            let mut transport = ReadRingTransport::connect_busy(&addr, config, &driver).await?;
+            // Tie the admission lease to driver **retirement**, not app
+            // completion: it travels into the reclaim bundle and frees the core's
+            // admission slot only after the QP is drained + retired, so the shared
+            // CQ can never be over-subscribed (review #2). A failed connect above
+            // returns early and drops `guard`, releasing admission immediately.
+            transport.set_reclaim_lease(Box::new(guard));
             Ok(app(transport).await)
         }))
     }
@@ -300,7 +279,16 @@ impl BusyPool {
     {
         let mut handles = Vec::with_capacity(count);
         for _ in 0..count {
-            let (i, guard) = self.admit_or_roundrobin();
+            let Some((i, guard)) = self.try_admit() else {
+                // Strict bound (review #2): never over-admit past a core's cap —
+                // that would overrun the shared CQ sized for `cap + 1`. Reject the
+                // pending accept instead of over-subscribing.
+                tracing::error!(
+                    "busy pool: no admission headroom for a pending accept; rejecting \
+                     (server over-admission is bounded, review #2)"
+                );
+                break;
+            };
             let worker = &self.workers[i];
             let driver = worker.driver.clone();
             let listener = listener.clone();
@@ -310,11 +298,15 @@ impl BusyPool {
             // listener, so the pool can accept the next connection.
             let (setup_tx, setup_rx) = tokio::sync::oneshot::channel::<()>();
             let handle = worker.rt.spawn(async move {
-                let _guard = guard;
                 let result = ReadRingTransport::accept_busy(&listener, config, &driver).await;
                 let _ = setup_tx.send(());
                 match result {
-                    Ok(transport) => app(transport).await,
+                    Ok(mut transport) => {
+                        // Admission frees at retirement, not app end (review #2).
+                        transport.set_reclaim_lease(Box::new(guard));
+                        app(transport).await
+                    }
+                    // Accept failed: `guard` drops here, releasing admission.
                     Err(e) => tracing::warn!(error = %e, "busy pool accept failed"),
                 }
             });
