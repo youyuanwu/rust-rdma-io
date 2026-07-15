@@ -514,7 +514,7 @@ strict driver→app round-robin, and app futures are cooperative. So:
 > part 2** (the reclaim barrier + `qp_num` retirement) is done too: `Drop` hands a busy transport's
 > resources to the per-core driver's reclaim queue, which drains the flush CQEs to zero, frees
 > `ReadRingInner` (MW→QP→MR→PD) and retires the `qp_num`, joined at shutdown — MANA (fresh NIC):
-> busy echo + 24-cycle reconnect churn 2/2, arm-park 5/5 regression-free. **Slice D in progress:**
+> busy echo + 24-cycle reconnect churn 2/2, arm-park 5/5 regression-free. **Slice D done:**
 > D1 (`BusyPool` per-core worker pool + client sharding) and D2 (server accept via serialized
 > handshake) are done — MANA: 6-client/2-core busy↔arm-park echo both directions. D3 (aggregate CQ
 > sizing via `ReadRingConfig::wr_budget` + per-core admission cap + flush headroom) is done too —
@@ -524,7 +524,13 @@ strict driver→app round-robin, and app futures are cooperative. So:
 > cores) instead of the arm-park multi-thread runtime. 2-VM MANA (8 conns, payload 64, in_flight 4):
 > `echo-busy` on 2 pinned cores = 938K rps, p50 32µs / p99 42µs, 2.13 cpu-µs/op vs arm-park `echo` on
 > 8 threads = 386K rps, p50 78µs / p99 131µs, 5.37 cpu-µs/op (0 errors both; the busy cores run at
-> ~100% under load, the honest cost).
+> ~100% under load, the honest cost). A unified `--threads` knob is the per-process CPU budget in both
+> modes; the bench result labels busy runs `echo-busy` so they separate from the arm-park baseline.
+> **Busy correctness (§12) on a single-core shared CQ:** shared-CQ fairness (6 conns, hot/idle mix,
+> id-seeded payloads — no cross-talk, no starvation) and per-connection disconnect isolation (one conn
+> reclaims mid-stream while siblings keep streaming) — MANA fresh NIC: 5/5 busy-pool tests, arm-park
+> regression green. **Remaining:** the `echo-busy` measurement sweep + `docs/bench/` write-up, and the
+> design-deferred `rh1-busy`, server-side admission reject/redirect, and idle hybrid (§5.4).
 
 Do these before any busy-poll code; each is a small refactor or primitive **testable against
 arm-park alone**, so the new subsystem lands on clean seams rather than on today's scattered CQ
@@ -1041,6 +1047,12 @@ completions (fairness); cancel with outstanding WRs; disconnect/flush while unre
 active; rapid close/reconnect with `qp_num` reuse; shared-CQ and inbox saturation; setup failure at
 each construction stage; driver shutdown and driver-task panic; timer/`AsyncFd` progress under a
 continuously-ready driver; and **regression of all arm-park transports and constructors**.
+
+> **Implemented so far (`read_ring_busy_pool_tests`, MANA fresh NIC):** multi-connection routing on a
+> shared CQ, mixed hot/idle connections on one CQ + one connection flooding (fairness — no cross-talk,
+> no starvation), per-connection disconnect while siblings keep streaming, admission-cap enforcement,
+> and clean shutdown-join reclaim (5/5). Still to add: rxe runs, the immediate-before/after-waker and
+> simultaneous read+write waiter races, and `qp_num`-reuse churn folded into the pool tests.
 
 **Metrics:** total vs empty CQ polls; CQEs per batch and per turn; **poll-gap histogram + max**;
 per-connection inbox depth + high-water; useful/coalesced/redundant wakes; unknown/stale-QP
