@@ -316,4 +316,176 @@ holds `ring_capacity / max_message_size ≈ 65536/8192 = 8` message slots at thi
 size, so very deep pipelines back-pressure on the byte ring — do not push
 `max_message_size` toward the ring capacity.)
 
+## Busy-poll echo ceiling (`mode=echo-busy`, read-ring)
+
+Everything above is the **arm-park** path — completions delivered by
+per-connection interrupt-armed CQs on the tokio worker pool, which spreads work
+opportunistically across all 64 vCPUs. The **busy-poll** path
+(`--mode echo-busy`) is the opposite topology: `--threads N` pins **N cores**,
+each running one `CoreDriver` that spins a single shared CQ pair at 100 % and
+demuxes completions to its connections by `qp_num` (§4.1 of the busy-poll
+design). `connections` shard round-robin across the N cores (`conns_per_core =
+⌈connections / N⌉`); `in_flight` is the per-connection pipeline depth. So here
+`threads` is a **hard core budget** (N fully-consumed cores), not a scheduler
+hint — the interesting question is throughput *per pinned core* and where the
+shared NIC saturates.
+
+Measured 64 B, `duration=10 warmup=3`, reboot-clean NIC:
+
+| cores | conns | /core | in-flight | throughput | CPU/op | p50 | p99 |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2 | 8 | 4 | 16 | 1.91M | 1.05 µs | 64 µs | 94 µs |
+| 2 | 8 | 4 | 64 | 2.26M | **0.89 µs** | 192 µs | 838 µs |
+| 4 | 16 | 4 | 64 | 3.87M | 1.03 µs | 210 µs | 1338 µs |
+| 8 | 32 | 4 | 64 | 5.02M | 1.59 µs | 254 µs | 841 µs |
+| 8 | 16 | 2 | 128 | 5.02M | 1.59 µs | 299 µs | 958 µs |
+| **8** | **8** | **1** | **256** | **5.08M** | 1.57 µs | 359 µs | **630 µs** |
+| 16 | 64 | 4 | 64 | **5.39M** | 2.97 µs | 427 µs | 2403 µs |
+
+**Per-core scaling is near-linear at low core counts, then the shared NIC
+message rate saturates.** Two cores sustain 2.26M (≈1.13M/core); four hold 3.87M
+(≈0.97M/core); by eight the per-core share has fallen to ~0.63M as the NIC's
+per-message completion rate — not the CPUs — becomes the limiter. Beyond eight
+cores throughput barely moves (5.0M → 5.4M from 8 → 16 cores) while CPU/op nearly
+doubles (1.57 → 2.97 µs) and p99 quadruples (630 µs → 2403 µs): those extra eight
+pinned cores spin for a ~7 % throughput gain. **The busy-poll 64 B ceiling is
+~5.4M rps; the *efficient* ceiling is ~5.0M on 8 cores.**
+
+**At the ceiling, per-core pipeline *shape* is irrelevant — only the aggregate
+offered load matters.** At 8 cores, 4 conns/core × 64, 2 conns/core × 128, and
+1 conn/core × 256 all land at ~5.0M. The 1-conn/core deep pipeline gives the
+**cleanest tail** (p99 630 µs vs 841–958 µs) at equal throughput, because a
+single connection per shared CQ removes cross-connection demux jitter — the
+preferred busy config when latency matters.
+
+**Shared-CQ sizing caps per-core depth (§7.2).** Each core's shared CQ is sized
+`(conns_per_core + 1) × per_conn_wrs` and must fit the device `max_cqe` (2048 on
+MANA). At `in_flight=256`, 4 conns/core needs `send=2575 > 2048` and the pool
+**refuses to start** (`InvalidArg: reduce conns_per_core / ring_capacity /
+max_in_flight`) — a deliberate admission guard, not a crash. Deeper pipelines
+therefore require **fewer connections per core** (drop to 1–2 conns/core for
+`in_flight ≥ 128`).
+
+**Busy-poll vs arm-park.** Arm-park read-ring peaks higher (~6.75–6.8M, §above)
+because its completions fan out across up to ~9 of the 64 vCPUs on demand; busy
+caps at ~5.4M on its pinned cores because each shared CQ is reaped by exactly one
+spinning core and that per-CQ completion path will not parallelize further.
+Busy-poll trades a slice of peak throughput for **pinned-core determinism and
+low-concurrency latency/efficiency**: two dedicated cores already deliver 2.26M
+at **0.89 µs/op** with a 192 µs p50 — the regime it is built for (cf. the Slice D4
+headline, `echo-busy` 938K vs arm-park `echo` 386K at 8 conns / in-flight 4,
+where busy wins 2.4× at low concurrency). Pick busy-poll when you want a fixed,
+isolated core budget and predictable tail latency; pick arm-park when you want
+the last ~25 % of headline throughput and elastic core use.
+
+## Thread-per-core arm-park (`echo-park`) — the third topology
+
+`echo-park` (`--mode echo-park`) is the **interrupt-driven** sibling of
+`echo-busy`: the same `--threads N` pinned `current_thread` cores and the same
+round-robin connection sharding, but each connection keeps its own
+**interrupt-armed** CQ (like the default `echo` path) instead of a shared
+busy-polled CQ. Each connection's completion-channel and CM fds bind to their
+owning core's reactor at construction, so the event-driven data path is serviced
+on that core — reactor-per-core locality — but the core **parks in `epoll_wait`
+when idle** (0 % idle CPU) rather than spinning. It is the middle point between
+the two existing modes:
+
+| mode | reaping | idle CPU | core placement | fan-out |
+|---|---|---|---|---|
+| `echo` (arm-park) | per-conn armed CQ | 0 % (parks) | tokio work-stealing over all vCPUs | elastic (~7–9 cores) |
+| `echo-busy` | shared CQ, 100 % spin | **100 %** | pinned 1 core/CQ, sole reaper | none |
+| `echo-park` | per-conn armed CQ | **0 % (parks)** | **pinned** 1 core/runtime | none (no stealing) |
+
+Measured 64 B, `duration=10 warmup=3`, reboot-clean NIC, same configs as the
+busy sweep:
+
+| cores | conns | /core | in-flight | throughput | CPU/op | p50 | p99 |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2 | 8 | 4 | 16 | 1.59M | 1.26 µs | 79 µs | 122 µs |
+| 2 | 8 | 4 | 64 | 2.15M | 0.93 µs | 229 µs | **495 µs** |
+| 4 | 16 | 4 | 64 | 3.36M | 1.17 µs | 237 µs | 1227 µs |
+| 8 | 32 | 4 | 64 | **4.93M** | 1.52 µs | 362 µs | 1634 µs |
+| 8 | 8 | 1 | 256 | 4.79M | 1.45 µs | 343 µs | 1110 µs |
+
+`echo-park` **tracks `echo-busy` ~5–15 % behind at every point and converges to
+the same ~5M ceiling by 8 cores** (4.93M vs 5.02M) — the shared NIC message rate
+caps both. It pays busy-poll's avoided hot-path cost (`ibv_get_cq_event` + re-arm
++ epoll wakeup), so its per-op latency runs a bit higher — except it actually
+**wins the tail at low core counts** (2-core p99 495 µs vs busy's 838 µs), the
+armed CQ absorbing bursts more evenly than the spin loop's fixed sweep cadence.
+The 16-core / 64-connection point could not be measured: `echo-park` repeatedly
+failed to *establish* all 64 connections (`expected Established, got Unreachable`)
+— the MANA RoCEv2 **CM-setup** flakiness at high fan-out (§ connection ceiling
+above), not a throughput limit. Neither pool retries a hung/failed connect, so at
+64 connections this surfaces as a run-ending timeout; the ceiling is already
+reached at 8 cores regardless.
+
+### Matched-core comparison: same core budget, three topologies
+
+The tables above compare `echo-busy`/`echo-park` head-to-head, but the fair
+question is how the pinned modes compare to the **default `echo`** at the *same
+core budget*. Running base `echo` (multi-thread arm-park, work-stealing) with
+`--threads N` = the same `N` and the same conns/in-flight (64 B, deep
+`in_flight=64`, reboot-clean NIC):
+
+| cores | conns | `echo` | `echo-busy` | `echo-park` |
+|---:|---:|---:|---:|---:|
+| 2 | 8 | **2.59M** (0.75 µs/op, p99 359 µs) | 2.26M (0.89, 838) | 2.15M (0.93, 495) |
+| 4 | 16 | **4.42M** (0.87 µs/op, p99 455 µs) | 3.87M (1.03, 1338) | 3.36M (1.17, 1227) |
+| 8 | 32 | **5.61M** (1.12 µs/op, p99 1228 µs) | 5.02M (1.59, 841) | 4.93M (1.52, 1634) |
+
+**At a deep pipeline, plain `echo` is the fastest and most CPU-efficient of the
+three even at a matched core budget** (5.61M vs 5.02M vs 4.93M on 8 cores, at
+0.75–1.12 µs/op vs ~1.5 µs). That is the *opposite* of the shallow-pipeline
+result below, and the reason is pipeline depth: at `in_flight=64` the per-message
+interrupt cost is already amortized across ~64 completions per wakeup, so
+busy-poll's spin buys almost nothing — and it *costs* the shared-CQ demux plus
+pinning away work-stealing's ability to smooth bursts across cores (note `echo`
+holds ~6.3 busy cores at 8 threads, not a hard 8, and still wins). Busy-poll and
+park pin every core at ~100 %/parked-hot for *less* throughput here.
+
+### Idle / shallow pipeline — where busy-poll wins
+
+The pinned modes' advantage is the **shallow-pipeline / low-latency** regime,
+where each message pays a full interrupt round-trip that busy-poll's spin
+eliminates. At 2 connections / in-flight 1 on 2 cores:
+
+| mode | throughput | cores busy | CPU/op | p50 | p99 |
+|---|---:|---:|---:|---:|---:|
+| `echo-busy` | **68.6k** | ~2.0 | 29.1 µs | **28 µs** | 34 µs |
+| `echo-park` | 28.8k | ~0.5 | 16.7 µs | 67 µs | 80 µs |
+| `echo` | 23.7k | ~0.4 | 18.6 µs | 89 µs | 104 µs |
+
+Here busy-poll **wins throughput and latency ~2.4–2.9×** (68.6k / p50 28 µs) —
+no per-message `ibv_get_cq_event`/re-arm, it just spins and reaps — at the cost
+of pinning 2 whole cores. `echo-park` and `echo` are both interrupt-bound and
+much slower per message (p50 67–89 µs), but use only ~0.4–0.5 cores; `echo-park`
+edges `echo` on latency (pinned locality, no cross-core task migration) at
+slightly higher CPU. This is the crossover: **busy-poll's spin pays off only when
+the pipeline is too shallow to amortize the interrupt** — exactly the
+request/response regime (`in_flight` 1) the busy-poll design targets (cf. the
+Slice D4 headline, `echo-busy` 938K vs arm-park `echo` 386K at 8 conns /
+in-flight 4).
+
+### Picking a mode
+
+The three modes hit the same **architectural ~5–6.8M read-ring echo ceiling**
+(the per-message doorbell/completion path, not CPU or NIC); which one is best
+depends on **pipeline depth and what you value**:
+
+- **`echo`** (default, work-stealing) — **best deep-pipeline throughput and
+  CPU/op**, even at a matched core budget; parks when idle. Downside: connections
+  migrate across cores (no locality/determinism), and it is interrupt-bound at
+  shallow depth. The default choice for raw throughput.
+- **`echo-busy`** (pinned, 100 % spin) — **wins the shallow / low-latency
+  regime** decisively (p50 28 µs, 2.4× the throughput at `in_flight=1`) and gives
+  a hard isolated core budget, at the cost of burning every pinned core
+  continuously (even idle) and *losing* on deep-pipeline throughput. Best for
+  latency-critical, dedicated-core, request/response workloads.
+- **`echo-park`** (pinned, reactor-per-core) — the **middle**: pinned locality
+  and determinism with **0 % idle CPU** and the best tail at low core counts, but
+  ~5–15 % less throughput than `echo` and higher p50 than `echo-busy`. Best when
+  you want core affinity **without** paying for spin on an idle/bursty workload.
+
+
 
