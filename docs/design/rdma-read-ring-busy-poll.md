@@ -654,9 +654,10 @@ The feature is implemented and experimentally validated, but not yet lifecycle-c
 arbitrary failure, cancellation, and shutdown. The items below are from the 2026-07-15
 implementation review, in fix order.
 
-> **Progress (2026-07-15).** The three "must-fix-now" items are done: **8** (readiness barrier),
-> **6** (forced-reclaim panic — the panic; the monotonic-deadline refinement is still open), and
-> **13** (argument/result hygiene). See the per-item **[Done]** notes below.
+> **Progress (2026-07-15).** Done: **8** (readiness barrier), **6** (forced-reclaim panic — the
+> panic + quarantine; the monotonic-deadline refinement is still open), **13** (argument/result
+> hygiene), **4** (terminal-error propagation), **9** (removed `deregister`), and the `register()`
+> duplicate-`qp_num` rejection half of blocker **1**. See the per-item **[Done]** notes below.
 
 **Blockers (before production):**
 
@@ -665,6 +666,10 @@ implementation review, in fix order.
    slot `Closing`, forces the QP to `ERR`, hands the partial bundle to the driver reclaim queue, and
    keeps the slot registered until retirement. Make `CoreDriverHandle::register()` reject an existing
    `qp_num` instead of replacing it.
+   **[Partial 2026-07-15]** `register()` now returns `Result` and **rejects a duplicate `qp_num`**
+   (an entry still draining or quarantined, §10) instead of clobbering it — closing the reuse hole
+   the wedge-quarantine (item 6) depends on. **Still open:** the setup-failure RAII guard that routes
+   a failed/cancelled connect/accept through the reclaim barrier.
 2. **Admission vs retirement accounting.** `AdmissionGuard` releases a slot when the app task ends,
    but the old QP may still have a full budget of flush CQEs pending, so `~2×cap` connections can
    share a CQ sized for `cap+1`. Move the admission lease into the reclaim entry and release it only
@@ -681,6 +686,12 @@ implementation review, in fix order.
    but not surfaced: `poll_inbox()` never checks `is_fatal()`, so a connection can hang instead of
    erroring. Store a concrete terminal error in `ConnSlot`, return it from `poll_inbox()`, wake both
    directions, and drive QP→`ERR`. A CQ-poll failure should fail every slot on that core.
+   **[Done 2026-07-15]** `ConnSlot` stores a `TerminalFault` code; `poll_inbox()` returns it as
+   `Error::ConnectionFault` before parking (so the transport tears down and busy `Drop` forces
+   QP→`ERR`); `mark_fatal(fault)` wakes both directions. Inbox overflow sets `InboxOverflow`; a
+   shared-CQ poll failure fails **every** slot on the core (`fail_all_slots`). Unit test
+   `poll_inbox_returns_terminal_error_when_fatal`. **Still open:** the unknown-`qp_num` terminal
+   policy (currently counted; post-barrier it is unreachable).
 5. **Mandatory affinity + release-mode owner check.** Worker pinning ignores
    `core_affinity::set_for_current()` and runners pick `0..N` rather than the allowed CPU set; the
    owner guard is only `debug_assert` and runs *after* the verbs post. Enumerate allowed cores, fail
@@ -716,6 +727,8 @@ implementation review, in fix order.
 9. **Remove/guard public `deregister()`.** `CoreDriverHandle::deregister()` removes a slot with no
    counter/lifetime check, contradicting the retirement invariant. Remove it or gate it behind a
    completed-retirement proof.
+   **[Done 2026-07-15]** Removed the unused `deregister()`; the verified retirement barrier (normal
+   reclaim) and the wedge quarantine are now the only routes that touch the routing map.
 10. **Defensive sizing/construction validation.** Reject empty core sets and zero caps, use checked
     arithmetic/casts for CQ depths, and require a successful device capability query (don't treat a
     failed `wr_budget` device query as unbounded).

@@ -568,13 +568,13 @@ impl<'a> SetupBackend<'a> {
     fn into_sources(
         self,
         qp_num: u32,
-    ) -> (CompletionSource, CompletionSource, Option<Arc<ConnSlot>>) {
+    ) -> crate::Result<(CompletionSource, CompletionSource, Option<Arc<ConnSlot>>)> {
         match self {
-            SetupBackend::ArmPark { send_cq, recv_cq } => (
+            SetupBackend::ArmPark { send_cq, recv_cq } => Ok((
                 CompletionSource::arm_park(send_cq),
                 CompletionSource::arm_park(recv_cq),
                 None,
-            ),
+            )),
             SetupBackend::Busy {
                 handle,
                 send_cap,
@@ -586,12 +586,14 @@ impl<'a> SetupBackend<'a> {
                     recv_cap,
                     WorkerToken::current(),
                 ));
-                handle.register(slot.clone());
-                (
+                // Rejects a stale/quarantined qp_num still in the routing map
+                // (§4.2) instead of clobbering it.
+                handle.register(slot.clone())?;
+                Ok((
                     CompletionSource::driver(slot.clone(), Dir::Send),
                     CompletionSource::driver(slot.clone(), Dir::Recv),
                     Some(slot),
-                )
+                ))
             }
         }
     }
@@ -741,7 +743,7 @@ impl ReadRingTransport {
             .into_boxed_slice();
 
         let mut qp = AsyncQp::new_poster(cmqp);
-        let (mut send_src, mut recv_src, conn_slot) = backend.into_sources(qp_num);
+        let (mut send_src, mut recv_src, conn_slot) = backend.into_sources(qp_num)?;
         // Busy mode: count every WR the driver will later reap (§6.2). Must be
         // set before the first post below.
         if let Some(slot) = &conn_slot {
@@ -918,7 +920,7 @@ impl ReadRingTransport {
             .into_boxed_slice();
 
         let mut qp = AsyncQp::new_poster(cmqp);
-        let (mut send_src, mut recv_src, conn_slot) = backend.into_sources(qp_num);
+        let (mut send_src, mut recv_src, conn_slot) = backend.into_sources(qp_num)?;
         // Busy mode: count every WR the driver will later reap (§6.2). Must be
         // set before the first post below.
         if let Some(slot) = &conn_slot {

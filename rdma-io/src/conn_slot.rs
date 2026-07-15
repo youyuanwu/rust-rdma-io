@@ -35,7 +35,7 @@
 //!   built the slot (§7.5); moving a busy-mode connection off its core is a bug.
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::thread::ThreadId;
 
@@ -84,6 +84,41 @@ impl SlotState {
             2 => Self::Closing,
             3 => Self::Drained,
             other => unreachable!("invalid SlotState byte {other}"),
+        }
+    }
+}
+
+/// A terminal, per-connection fault the busy-poll driver escalates to the
+/// transport (§7.2, review #4). Stored as a small code in [`ConnSlot`] and
+/// surfaced by [`ConnSlot::poll_inbox`] as [`crate::Error::ConnectionFault`], so
+/// a faulted connection observes an error instead of parking forever. The `0`
+/// code is reserved for "no fault".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum TerminalFault {
+    /// A per-direction inbox overflowed: a reaped completion could not be
+    /// delivered, so the ring framing is unrecoverable (§7.2).
+    InboxOverflow = 1,
+    /// The shared CQ poll failed on this core; the driver fails every slot so no
+    /// connection hangs waiting on completions that will never come.
+    SharedCqPollFailed = 2,
+}
+
+impl TerminalFault {
+    #[inline]
+    fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            1 => Some(Self::InboxOverflow),
+            2 => Some(Self::SharedCqPollFailed),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::InboxOverflow => "busy-poll inbox overflow (completion undeliverable)",
+            Self::SharedCqPollFailed => "busy-poll shared CQ poll failed",
         }
     }
 }
@@ -233,11 +268,13 @@ pub struct ConnSlot {
     send: DirState,
     recv: DirState,
     state: AtomicU8,
-    /// Set when this connection hits a per-connection fatal fault (inbox
-    /// overflow, unknown/stale routing, WC error the driver escalates). Orthogonal
-    /// to [`SlotState`]: a fatal slot still progresses `Closing → Drained` as its
-    /// flush CQEs are reaped.
-    fatal: AtomicBool,
+    /// Non-zero when this connection hits a per-connection terminal fault (a
+    /// [`TerminalFault`] code: inbox overflow, shared-CQ poll failure, …).
+    /// Orthogonal to [`SlotState`]: a faulted slot still progresses
+    /// `Closing → Drained` as its flush CQEs are reaped. `poll_inbox` surfaces it
+    /// as [`crate::Error::ConnectionFault`] so the transport tears down instead of
+    /// hanging (§7.2, review #4).
+    terminal: AtomicU8,
     /// The QP number this slot is registered under in the driver's routing map.
     /// Stable for the slot's life; reused only after retirement (§4.2).
     qp_num: u32,
@@ -261,7 +298,7 @@ impl ConnSlot {
             send: DirState::new(send_capacity),
             recv: DirState::new(recv_capacity),
             state: AtomicU8::new(SlotState::Connecting as u8),
-            fatal: AtomicBool::new(false),
+            terminal: AtomicU8::new(0),
             qp_num,
             generation: AtomicU32::new(0),
             owner,
@@ -369,18 +406,30 @@ impl ConnSlot {
         self.state.store(state as u8, Ordering::Release);
     }
 
-    /// Mark this connection as having hit a fatal, per-connection fault (§7.2).
-    /// Also wakes both directions so blocked tasks observe the fault.
+    /// Mark this connection as having hit a terminal, per-connection `fault`
+    /// (§7.2). Also wakes both directions so blocked tasks observe it. Records the
+    /// **first** fault only: a later fault does not overwrite it.
     #[inline]
-    pub fn mark_fatal(&self) {
-        self.fatal.store(true, Ordering::Release);
+    pub fn mark_fatal(&self, fault: TerminalFault) {
+        let _ = self
+            .terminal
+            .compare_exchange(0, fault as u8, Ordering::AcqRel, Ordering::Relaxed);
         self.wake_both();
     }
 
-    /// Whether a fatal per-connection fault has been signalled.
+    /// Whether a terminal per-connection fault has been signalled.
     #[inline]
     pub fn is_fatal(&self) -> bool {
-        self.fatal.load(Ordering::Acquire)
+        self.terminal.load(Ordering::Acquire) != 0
+    }
+
+    /// The terminal fault as a [`crate::Error`], if one has been signalled.
+    /// `poll_inbox` returns this so the transport observes the fault instead of
+    /// parking forever (review #4).
+    #[inline]
+    pub fn terminal_error(&self) -> Option<crate::Error> {
+        TerminalFault::from_u8(self.terminal.load(Ordering::Acquire))
+            .map(|f| crate::Error::ConnectionFault(f.as_str()))
     }
 
     /// Whether the teardown drain barrier is satisfied: both WR counters zero
@@ -440,6 +489,14 @@ impl ConnSlot {
         out: &mut [WorkCompletion],
     ) -> Poll<Result<usize>> {
         self.assert_owner();
+
+        // Terminal fault: surface it so the transport tears down instead of
+        // parking forever (§7.2, review #4). Checked before draining because a
+        // fault (e.g. inbox overflow) means the completion-stream framing is no
+        // longer trustworthy.
+        if let Some(e) = self.terminal_error() {
+            return Poll::Ready(Err(e));
+        }
         let ds = self.dir(dir);
 
         // 1. Fast path: drain before touching the waker.
@@ -688,9 +745,32 @@ mod tests {
         let _ = s.poll_inbox(Dir::Send, &mut Context::from_waker(&s_waker), &mut out);
         let _ = s.poll_inbox(Dir::Recv, &mut Context::from_waker(&r_waker), &mut out);
         assert!(!s.is_fatal());
-        s.mark_fatal();
+        s.mark_fatal(TerminalFault::InboxOverflow);
         assert!(s.is_fatal());
         assert_eq!(sw.count(), 1);
         assert_eq!(rw.count(), 1);
+    }
+
+    #[test]
+    fn poll_inbox_returns_terminal_error_when_fatal() {
+        let s = slot(2, 2);
+        let cw = CountingWaker::new();
+        let waker = cw.waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut out = [WorkCompletion::default(); 2];
+
+        // Healthy + empty: parks (Pending).
+        assert!(matches!(
+            s.poll_inbox(Dir::Recv, &mut cx, &mut out),
+            Poll::Pending
+        ));
+
+        // After a terminal fault, poll_inbox surfaces it as an error instead of
+        // parking forever (review #4).
+        s.mark_fatal(TerminalFault::InboxOverflow);
+        match s.poll_inbox(Dir::Recv, &mut cx, &mut out) {
+            Poll::Ready(Err(crate::Error::ConnectionFault(_))) => {}
+            other => panic!("expected Ready(Err(ConnectionFault)), got {other:?}"),
+        }
     }
 }

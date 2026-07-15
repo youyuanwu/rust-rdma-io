@@ -36,6 +36,11 @@ pub enum Error {
     /// Non-blocking operation would block (EAGAIN/EWOULDBLOCK).
     #[error("operation would block")]
     WouldBlock,
+
+    /// A busy-poll connection hit a terminal, per-connection fault (inbox
+    /// overflow, shared-CQ poll failure, …) and must be torn down.
+    #[error("connection fault: {0}")]
+    ConnectionFault(&'static str),
 }
 
 /// Convert a C return code (0 = success, negative = -errno) to a `Result`.

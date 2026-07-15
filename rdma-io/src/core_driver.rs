@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
-use crate::conn_slot::{ConnSlot, Dir, SlotState};
+use crate::conn_slot::{ConnSlot, Dir, SlotState, TerminalFault};
 use crate::cq::CompletionQueue;
 use crate::device::Context;
 use crate::wc::WorkCompletion;
@@ -151,7 +151,12 @@ impl CoreDriver {
                 n
             }
             Err(e) => {
-                tracing::error!(?dir, error = %e, "CoreDriver: ibv_poll_cq failed");
+                tracing::error!(
+                    ?dir,
+                    error = %e,
+                    "CoreDriver: ibv_poll_cq failed; failing every slot on this core (review #4)"
+                );
+                self.fail_all_slots(TerminalFault::SharedCqPollFailed);
                 0
             }
         }
@@ -164,6 +169,17 @@ impl CoreDriver {
     fn route(&self, dir: Dir, wcs: &[WorkCompletion]) {
         let map = self.slots.lock().expect("CoreDriver slot map poisoned");
         route_into(&map, &self.unknown_qp, dir, wcs);
+    }
+
+    /// Fail every registered connection with `fault` — used when a whole-core
+    /// error (a shared-CQ poll failure) leaves no connection recoverable. Each
+    /// faulted slot's `poll_inbox` then returns the terminal error instead of
+    /// hanging on completions that will never arrive (review #4).
+    fn fail_all_slots(&self, fault: TerminalFault) {
+        let map = self.slots.lock().expect("CoreDriver slot map poisoned");
+        for slot in map.values() {
+            slot.mark_fatal(fault);
+        }
     }
 
     /// Run the cooperative reaper loop until [`CoreDriverHandle::shutdown`].
@@ -285,18 +301,27 @@ impl CoreDriverHandle {
 
     /// Register a connection so the driver routes its `qp_num` to `slot`.
     /// Must be called **before** the connection posts any WR (§6.1).
-    pub fn register(&self, slot: Arc<ConnSlot>) {
-        let mut map = self.slots.lock().expect("CoreDriver slot map poisoned");
-        map.insert(slot.qp_num(), slot);
-    }
-
-    /// Deregister a connection's `qp_num` from the routing map.
     ///
-    /// Slice B calls this at connection drop; the verified-retirement ordering
-    /// (drain to zero *before* removal) is Slice C (§6.2).
-    pub fn deregister(&self, qp_num: u32) {
+    /// **Rejects a `qp_num` already in the routing map** rather than replacing it:
+    /// a live entry for the same number means a previous connection has not yet
+    /// retired (still draining, or quarantined after a wedge, §10), and clobbering
+    /// it would strand that connection's accounting and mis-route its flush CQEs
+    /// to the new one. The verified retirement barrier is the only route to reuse
+    /// (§4.2).
+    pub fn register(&self, slot: Arc<ConnSlot>) -> crate::Result<()> {
+        use std::collections::hash_map::Entry;
         let mut map = self.slots.lock().expect("CoreDriver slot map poisoned");
-        map.remove(&qp_num);
+        match map.entry(slot.qp_num()) {
+            Entry::Occupied(_) => Err(crate::Error::InvalidArg(format!(
+                "qp_num {} is already registered (previous connection not yet retired / \
+                 quarantined); refusing reuse before the retirement barrier (§4.2)",
+                slot.qp_num()
+            ))),
+            Entry::Vacant(e) => {
+                e.insert(slot);
+                Ok(())
+            }
+        }
     }
 
     /// Ask the driver loop to exit after its current turn.
@@ -366,7 +391,7 @@ fn route_into(
                         // Inboxes are sized overflow-free, so this should be
                         // unreachable; if seen, isolate this connection.
                         tracing::error!(qp_num, ?dir, "CoreDriver: inbox overflow (fatal)");
-                        slot.mark_fatal();
+                        slot.mark_fatal(TerminalFault::InboxOverflow);
                     }
                 }
             }
