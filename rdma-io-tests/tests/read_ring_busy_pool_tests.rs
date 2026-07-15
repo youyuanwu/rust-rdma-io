@@ -13,8 +13,10 @@
 //! the read-ring wire protocol is identical, so the modes interoperate.
 
 use std::future::poll_fn;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::task::Poll;
+use std::time::{Duration, Instant};
 
 use rdma_io::async_cm::AsyncCmId;
 use rdma_io::cm::PortSpace;
@@ -35,13 +37,27 @@ static BUSY_POOL_SERIAL: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 /// Acquire the busy-pool serialization lock and pick the core ids for `cores`
-/// pinned pollers — but only if the host has enough CPUs to dedicate them while
-/// leaving headroom for the co-located peer and (on rxe) the software data path.
-/// Returns `None` to skip on an under-provisioned host (e.g. a small rxe VM),
-/// where pinned 100%-spin pollers would starve the loopback peer into a hang.
+/// pinned pollers — skipping the test on hosts where busy-poll can't work.
+///
+/// Busy-poll dedicates a core and spins `ibv_poll_cq` at 100%; it assumes a
+/// **hardware** data path (the NIC moves data with no CPU). On a software
+/// transport (siw/rxe) the "NIC" *is* the CPU, so a pinned 100%-spin poller
+/// starves the very kernel workers that would produce its completions — the
+/// loopback peer never makes progress and the test hangs. So skip on any
+/// software RDMA device (this is what makes the CI siw/rxe jobs green; the tests
+/// run on the hardware MANA VMs). Also skip when the host lacks enough CPUs to
+/// dedicate the pollers with headroom for the peer/runtime. Returns `None` to
+/// skip, else the serialization guard + core ids.
 async fn busy_pool_guard(
     cores: usize,
 ) -> Option<(tokio::sync::MutexGuard<'static, ()>, Vec<usize>)> {
+    if rdma_io_tests::test_helpers::has_software_rdma() {
+        eprintln!(
+            "skipping busy-pool test: needs a hardware RDMA device — a 100%-spin busy poller \
+             starves the software data path (siw/rxe) that runs on the same CPUs"
+        );
+        return None;
+    }
     let guard = BUSY_POOL_SERIAL.lock().await;
     let available = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -486,23 +502,48 @@ async fn read_ring_busy_pool_disconnect_isolation() {
 
     let pool = BusyPool::new(ctx, &core_ids, 1024, 1024).expect("build busy pool");
 
+    // Gate conn 0's teardown on *every* connection being established, so its
+    // early disconnect happens strictly while the siblings STREAM — never while
+    // one is still connecting (a concurrent connect+disconnect churns the CM and
+    // flushes the connecting peer's WQE: a connect-time WR_FLUSH_ERR). Only conn
+    // 0 waits (survivors never block on it) and the wait is bounded, so a flaky
+    // sibling connect surfaces as *that* connection's error instead of
+    // deadlocking the whole test (as a hard Barrier would).
+    let established = Arc::new(AtomicUsize::new(0));
+
     let mut clients = Vec::with_capacity(CONNS);
     for i in 0..CONNS {
         let cfg = config.clone();
-        // conn 0 drops after a few messages (early disconnect + reclaim);
-        // conns 1..CONNS keep streaming a long sequence on the same core.
+        let established = established.clone();
+        // conn 0 drops after a few messages (early disconnect + reclaim); conns
+        // 1..CONNS keep streaming a long sequence on the same core.
         let msgs = if i == 0 { EARLY_MSGS } else { SURVIVOR_MSGS };
         clients.push(
             pool.spawn_connect(connect_addr, cfg, move |mut t| async move {
-                for m in 0..msgs {
+                // A warmup round-trip proves this connection is established.
+                let warm = payload(i * 1_000_000, MSG_LEN);
+                send_msg(&mut t, &warm, "warmup send").await;
+                let got = recv_msg(&mut t, "warmup recv").await;
+                assert_eq!(got, warm, "conn {i} warmup echo mismatch");
+                established.fetch_add(1, Ordering::AcqRel);
+
+                // conn 0 holds off its teardown until every sibling is up
+                // (bounded, so a failed sibling connect can't hang this task).
+                if i == 0 {
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while established.load(Ordering::Acquire) < CONNS && Instant::now() < deadline {
+                        tokio::task::yield_now().await;
+                    }
+                }
+
+                for m in 1..msgs {
                     let data = payload(i * 1_000_000 + m, MSG_LEN);
                     send_msg(&mut t, &data, "client send").await;
                     let got = recv_msg(&mut t, "client recv").await;
                     assert_eq!(got, data, "conn {i} msg {m} echo mismatch");
                 }
-                // Returning here drops the transport: conn 0 tears down (busy
-                // reclaim on the shared core) while the survivors are still
-                // streaming through the same driver.
+                // Returning drops the transport: conn 0 tears down (busy reclaim
+                // on the shared core) while the survivors keep streaming.
             })
             .expect("uncapped pool always admits"),
         );
