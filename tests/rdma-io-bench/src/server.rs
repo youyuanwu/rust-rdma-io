@@ -41,12 +41,12 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     in_flight: usize,
 
-    /// Number of connections to accept in `--mode echo-busy` (must match the
-    /// client's --connections). The busy-poll server accepts exactly this many
-    /// read-ring connections, sharded across the pinned cores, then echoes each
-    /// on its owning core until the peers disconnect or a shutdown signal
-    /// arrives. Ignored by the arm-park modes (which accept unbounded
-    /// connections until shutdown).
+    /// Number of connections to accept in `--mode echo-busy` / `--mode
+    /// echo-park` (must match the client's --connections). The pool accepts
+    /// exactly this many read-ring connections, sharded across the pinned cores,
+    /// then echoes each on its owning core until the peers disconnect or a
+    /// shutdown signal arrives. Ignored by the arm-park modes (which accept
+    /// unbounded connections until shutdown).
     #[arg(long, default_value_t = 2)]
     connections: usize,
 
@@ -55,7 +55,8 @@ struct Args {
     /// default, one per core — the historical behaviour). In `--mode echo-busy`
     /// it is the number of **pinned busy-poll cores** in the pool (each spins
     /// one `CoreDriver` over its shared CQs; connections are sharded round-robin
-    /// and are core-affine for life). Match the client's `--threads` for a fair
+    /// and are core-affine for life); `--mode echo-park` uses it the same way
+    /// but the cores park when idle. Match the client's `--threads` for a fair
     /// CPU comparison.
     #[arg(long, default_value_t = 0)]
     threads: usize,
@@ -167,11 +168,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Busy-poll (`--mode echo-busy`) runs its data path on the BusyPool's pinned
     // `current_thread` runtimes, so `main` uses only a small single-threaded
     // orchestration runtime; the arm-park modes use the multi-thread runtime.
-    if args.mode == "echo-busy" {
+    // `--mode echo-park` uses the same thread-per-core topology (an ArmParkPool),
+    // so it shares the small orchestration runtime.
+    if args.mode == "echo-busy" || args.mode == "echo-park" {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        return rt.block_on(run_echo_busy_server(&args));
+        return rt.block_on(async move {
+            if args.mode == "echo-busy" {
+                run_echo_busy_server(&args).await
+            } else {
+                run_echo_park_server(&args).await
+            }
+        });
     }
 
     let mut builder = tokio::runtime::Builder::new_multi_thread();
@@ -199,7 +208,8 @@ async fn run_arm_park(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         "echo" => run_echo_server(args).await,
         other => {
             eprintln!(
-                "Unknown mode: {other}. Supported: rh2, rh3, tcp, rh1, tcp1, echo, echo-busy"
+                "Unknown mode: {other}. Supported: rh2, rh3, tcp, rh1, tcp1, echo, echo-busy, \
+                 echo-park"
             );
             std::process::exit(1);
         }
@@ -221,6 +231,31 @@ async fn run_echo_busy_server(args: &Args) -> Result<(), Box<dyn std::error::Err
     config.max_message_size = args.ring_max_msg;
     config.max_in_flight = ring_max_in_flight(args.ring_queue_depth, args.in_flight);
     echo::run_read_ring_busy_server(
+        args.bind,
+        config,
+        args.threads,
+        args.connections,
+        shutdown_signal(),
+    )
+    .await
+}
+
+/// Thread-per-core arm-park read-ring echo server (`--mode echo-park`). The
+/// counterpart to the client's `run_echo_park_client`: accepts exactly
+/// `--connections` read-ring connections across `--threads` pinned cores (each
+/// with its own armed CQ, parking when idle) and echoes each on its owning core.
+/// Only the read-ring transport is supported.
+async fn run_echo_park_server(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    if args.transport != "read-ring" && args.transport != "send-recv" {
+        eprintln!(
+            "note: --mode echo-park uses the read-ring transport; ignoring --transport {}",
+            args.transport
+        );
+    }
+    let mut config = ReadRingConfig::datagram().with_memory_window_mode(mw_mode(args.require_mw));
+    config.max_message_size = args.ring_max_msg;
+    config.max_in_flight = ring_max_in_flight(args.ring_queue_depth, args.in_flight);
+    echo::run_read_ring_park_server(
         args.bind,
         config,
         args.threads,

@@ -40,8 +40,10 @@ struct Args {
     /// NOT a load dimension (offered load is `--connections` × `--in-flight`).
     /// In `--mode echo-busy` it is the number of **pinned busy-poll cores** in
     /// the pool (each runs one `CoreDriver` spinning `ibv_poll_cq`; connections
-    /// are sharded round-robin and are core-affine for life). Both peers should
-    /// use the same value for a fair CPU comparison.
+    /// are sharded round-robin and are core-affine for life). `--mode echo-park`
+    /// uses it the same way — pinned thread-per-core cores — but the cores park
+    /// in `epoll_wait` when idle (per-connection armed CQ) instead of spinning.
+    /// Both peers should use the same value for a fair CPU comparison.
     #[arg(long, default_value_t = 2)]
     threads: usize,
 
@@ -164,12 +166,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // runs on the BusyPool's N pinned `current_thread` runtimes, so `main` uses
     // only a small single-threaded orchestration runtime (probe + awaiting the
     // pool's per-connection handles + the resource sampler) rather than the
-    // multi-thread worker pool the arm-park modes drive.
-    if args.mode == "echo-busy" {
+    // multi-thread worker pool the arm-park modes drive. `--mode echo-park` uses
+    // the same thread-per-core topology (an ArmParkPool of N pinned runtimes),
+    // so it shares the small orchestration runtime.
+    if args.mode == "echo-busy" || args.mode == "echo-park" {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        return rt.block_on(run_echo_busy_client(&args));
+        return rt.block_on(async move {
+            if args.mode == "echo-busy" {
+                run_echo_busy_client(&args).await
+            } else {
+                run_echo_park_client(&args).await
+            }
+        });
     }
 
     let mut builder = tokio::runtime::Builder::new_multi_thread();
@@ -195,7 +205,8 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         "echo" => run_echo_bench(&args).await,
         other => {
             eprintln!(
-                "Unknown mode: {other}. Supported: rh2, rh3, tcp, rh1, tcp1, echo, echo-busy"
+                "Unknown mode: {other}. Supported: rh2, rh3, tcp, rh1, tcp1, echo, echo-busy, \
+                 echo-park"
             );
             std::process::exit(1);
         }
@@ -218,6 +229,36 @@ async fn run_echo_busy_client(args: &Args) -> Result<(), Box<dyn std::error::Err
     config.max_message_size = args.ring_max_msg;
     config.max_in_flight = ring_max_in_flight(args.ring_queue_depth, args.in_flight);
     echo::run_read_ring_busy_client(
+        args.connect,
+        config,
+        args.threads,
+        args.connections,
+        args.in_flight,
+        args.payload,
+        args.warmup,
+        args.duration,
+        &args.report,
+    )
+    .await
+}
+
+/// Thread-per-core arm-park read-ring echo client (`--mode echo-park`). Same
+/// read-ring config as `echo-busy`, but driven through the interrupt-driven
+/// [`ArmParkPool`](rdma_io_busy::ArmParkPool) (per-connection armed CQ, cores
+/// park when idle) instead of the busy-poll [`BusyPool`]. Only the read-ring
+/// transport is supported.
+async fn run_echo_park_client(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    if args.transport != "read-ring" && args.transport != "send-recv" {
+        eprintln!(
+            "note: --mode echo-park uses the read-ring transport; ignoring --transport {}",
+            args.transport
+        );
+    }
+    warn_ring_payload(args.payload, args.ring_max_msg);
+    let mut config = ReadRingConfig::datagram().with_memory_window_mode(mw_mode(args.require_mw));
+    config.max_message_size = args.ring_max_msg;
+    config.max_in_flight = ring_max_in_flight(args.ring_queue_depth, args.in_flight);
+    echo::run_read_ring_park_client(
         args.connect,
         config,
         args.threads,

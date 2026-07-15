@@ -21,6 +21,24 @@
 //! `JoinHandle` (so each transport `Drop` hands its resources to the owning
 //! driver's reclaim queue), then [`BusyPool::shutdown`] stops each driver, which
 //! drains its reclaim queue before its thread joins.
+//!
+//! # Two thread-per-core executors
+//!
+//! This crate ships two pinned per-core pools that differ only in **how
+//! completions are delivered**:
+//!
+//! - [`BusyPool`] — **busy-poll**: one shared-CQ [`CoreDriver`] per core spins
+//!   `ibv_poll_cq` at 100 %, the sole reaper for every connection on that core.
+//!   Lowest latency, zero hot-path syscalls, but the core is pinned at 100 %
+//!   even when idle. Connections use `connect_busy`/`accept_busy`.
+//! - [`ArmParkPool`] — **thread-per-core arm-park**: the same pinned
+//!   `current_thread` runtimes, but each connection keeps its own
+//!   interrupt-armed CQ and the core **parks** in `epoll_wait` when idle
+//!   (0 % idle CPU). Because each connection's completion-channel and CM fds
+//!   bind to their owning core's reactor at construction time, the event-driven
+//!   data path is serviced on that core with no cross-core work-stealing — the
+//!   reactor-per-core model. Connections use the ordinary `connect`/`accept`.
+//!   No shared CQ, so no `CoreDriver`, reclaim queue, or admission cap.
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -407,6 +425,245 @@ fn spawn_worker(
             let _ = thread.join();
             Err(rdma_io::Error::InvalidArg(format!(
                 "busy-core-{core_id} thread exited before ready"
+            )))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ArmParkPool — thread-per-core *arm-park* executor (no shared CoreDriver).
+// ---------------------------------------------------------------------------
+
+/// One pinned per-core worker running an *arm-park* `current_thread` runtime.
+///
+/// Unlike [`CoreWorker`] there is no `CoreDriver` — the runtime's engine future
+/// is just a shutdown signal, and it drives the connection tasks spawned onto
+/// `rt` (each with its own interrupt-armed CQ) between which the core parks in
+/// `epoll_wait`.
+struct ParkWorker {
+    /// The core this worker is pinned to (for observability).
+    core_id: usize,
+    /// Spawn point for on-core tasks (connections + their app loops).
+    rt: RtHandle,
+    /// Ends the runtime's engine future at shutdown (drop or send). `Option` so
+    /// [`shutdown_park_workers`] can take it before joining.
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    /// The OS thread running the runtime; joined at shutdown.
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+/// A thread-per-core **arm-park** pool: `N` pinned `current_thread` runtimes
+/// (IO driver enabled) over which connections are sharded round-robin.
+///
+/// This is the interrupt-driven sibling of [`BusyPool`]. Instead of a shared
+/// busy-polled CQ per core, each connection keeps its own arm-park CQ, and the
+/// core **parks** in `epoll_wait` when idle (0 % idle CPU). The essential
+/// mechanism is fd affinity: a connection built on core *c*'s runtime registers
+/// its completion-channel and CM `AsyncFd`s with core *c*'s reactor, so all its
+/// readiness events are serviced on core *c* — pinned locality without the 100 %
+/// spin, and without tokio's cross-core work-stealing. There is no shared CQ, so
+/// no `CoreDriver`, reclaim queue, or admission cap; a connection is a plain
+/// `connect`/`accept` run on-core, dropped when its app returns.
+pub struct ArmParkPool {
+    workers: Vec<ParkWorker>,
+    /// Round-robin placement cursor.
+    next: AtomicUsize,
+}
+
+impl ArmParkPool {
+    /// Build a pool with one pinned arm-park worker per entry in `core_ids`.
+    pub fn new(core_ids: &[usize]) -> rdma_io::Result<Self> {
+        let mut workers: Vec<ParkWorker> = Vec::with_capacity(core_ids.len());
+        for &core_id in core_ids {
+            match spawn_park_worker(core_id) {
+                Ok(w) => workers.push(w),
+                Err(e) => {
+                    shutdown_park_workers(&mut workers);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(Self {
+            workers,
+            next: AtomicUsize::new(0),
+        })
+    }
+
+    /// Number of pinned cores in the pool.
+    pub fn core_count(&self) -> usize {
+        self.workers.len()
+    }
+
+    /// The core ids the pool is pinned to, in placement order.
+    pub fn core_ids(&self) -> Vec<usize> {
+        self.workers.iter().map(|w| w.core_id).collect()
+    }
+
+    /// Pick the next core (round-robin).
+    fn next_worker(&self) -> &ParkWorker {
+        let n = self.workers.len();
+        let i = self.next.fetch_add(1, Ordering::Relaxed) % n;
+        &self.workers[i]
+    }
+
+    /// Open an arm-park read-ring connection on the next core (round-robin) and
+    /// run `app` with it **on that core**, returning a [`JoinHandle`] for the
+    /// app's result.
+    ///
+    /// The `connect` runs on the owning core's runtime, so the transport's
+    /// completion-channel and CM fds bind to that core's reactor and its
+    /// event-driven data path is serviced there. The transport is dropped when
+    /// `app` returns (ordinary arm-park teardown drain, no reclaim queue).
+    pub fn spawn_connect<F, Fut, R>(
+        &self,
+        addr: SocketAddr,
+        config: ReadRingConfig,
+        app: F,
+    ) -> JoinHandle<rdma_io::Result<R>>
+    where
+        F: FnOnce(ReadRingTransport) -> Fut + Send + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Send + 'static,
+    {
+        self.next_worker().rt.spawn(async move {
+            let transport = ReadRingTransport::connect(&addr, config).await?;
+            Ok(app(transport).await)
+        })
+    }
+
+    /// Serve `count` arm-park connections: accept each on the pool (round-robin
+    /// across cores) and run `app` with it **on its owning core**.
+    ///
+    /// Like [`BusyPool::serve`], the accept *handshake* is **serialized** (the
+    /// pool waits for each connection's setup to finish touching the listener
+    /// before accepting the next), so the shared listener has a single consumer
+    /// at a time and an `Established` cannot be matched to the wrong connection.
+    /// The per-connection `app` loops run concurrently across cores once their
+    /// own setup completes. The listener may live on a different (orchestration)
+    /// runtime — its fd readiness is serviced there and wakes the on-core accept
+    /// task via a cross-runtime waker; only the *accepted* transport's fds bind
+    /// to the owning core.
+    pub async fn serve<F, Fut>(
+        &self,
+        listener: Arc<AsyncCmListener>,
+        config: ReadRingConfig,
+        count: usize,
+        app: F,
+    ) -> Vec<JoinHandle<()>>
+    where
+        F: Fn(ReadRingTransport) -> Fut + Clone + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let mut handles = Vec::with_capacity(count);
+        for _ in 0..count {
+            let worker = self.next_worker();
+            let rt = worker.rt.clone();
+            let listener = listener.clone();
+            let config = config.clone();
+            let app = app.clone();
+            // The worker signals when its handshake is done touching the
+            // listener, so the pool can accept the next connection.
+            let (setup_tx, setup_rx) = tokio::sync::oneshot::channel::<()>();
+            let handle = rt.spawn(async move {
+                let result = ReadRingTransport::accept(&listener, config).await;
+                let _ = setup_tx.send(());
+                match result {
+                    Ok(transport) => app(transport).await,
+                    Err(e) => tracing::warn!(error = %e, "arm-park pool accept failed"),
+                }
+            });
+            handles.push(handle);
+            // Serialize the handshake: a single listener consumer at a time.
+            let _ = setup_rx.await;
+        }
+        handles
+    }
+
+    /// Signal every worker's runtime to stop and join the threads. Call **after**
+    /// every connection's `JoinHandle` has been awaited (a still-running task is
+    /// cancelled when its runtime drops).
+    pub fn shutdown(mut self) {
+        shutdown_park_workers(&mut self.workers);
+    }
+}
+
+impl Drop for ArmParkPool {
+    fn drop(&mut self) {
+        shutdown_park_workers(&mut self.workers);
+    }
+}
+
+/// Signal each worker's engine future to end, then join its thread. Idempotent:
+/// a `None` stop/thread (already taken) is skipped.
+fn shutdown_park_workers(workers: &mut [ParkWorker]) {
+    // Signal all first (drop/send the stop sender), then join — so the runtimes
+    // wind down concurrently.
+    for w in workers.iter_mut() {
+        if let Some(tx) = w.stop.take() {
+            let _ = tx.send(());
+        }
+    }
+    for w in workers.iter_mut() {
+        if let Some(t) = w.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// Spawn one pinned arm-park worker thread: pin the core, build a
+/// `current_thread` runtime with the IO driver enabled, and block on a shutdown
+/// signal while the runtime drives the connection tasks spawned onto it.
+fn spawn_park_worker(core_id: usize) -> rdma_io::Result<ParkWorker> {
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<RtHandle, String>>();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let thread = thread::Builder::new()
+        .name(format!("park-core-{core_id}"))
+        .spawn(move || {
+            // Pin BEFORE building the runtime so its buffers/reactor are
+            // node-local (§4.1).
+            let _ = core_affinity::set_for_current(core_affinity::CoreId { id: core_id });
+
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = ready_tx.send(Err(format!("build runtime: {e}")));
+                    return;
+                }
+            };
+            let rt_handle = rt.handle().clone();
+            if ready_tx.send(Ok(rt_handle)).is_err() {
+                // The pool gave up waiting; wind down cleanly (runtime drops).
+                return;
+            }
+
+            // Engine: keep the runtime turning (driving the spawned connection
+            // tasks) until shutdown. Arm-park tasks park in `epoll_wait` when
+            // idle, so this thread sleeps at 0 % CPU between events.
+            rt.block_on(async move {
+                let _ = stop_rx.await;
+            });
+        })
+        .map_err(|e| rdma_io::Error::InvalidArg(format!("spawn park-core-{core_id}: {e}")))?;
+
+    match ready_rx.recv() {
+        Ok(Ok(rt)) => Ok(ParkWorker {
+            core_id,
+            rt,
+            stop: Some(stop_tx),
+            thread: Some(thread),
+        }),
+        Ok(Err(msg)) => {
+            let _ = thread.join();
+            Err(rdma_io::Error::InvalidArg(msg))
+        }
+        Err(_) => {
+            let _ = thread.join();
+            Err(rdma_io::Error::InvalidArg(format!(
+                "park-core-{core_id} thread exited before ready"
             )))
         }
     }
