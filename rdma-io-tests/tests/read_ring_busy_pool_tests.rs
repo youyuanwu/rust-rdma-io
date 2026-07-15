@@ -13,7 +13,7 @@
 //! the read-ring wire protocol is identical, so the modes interoperate.
 
 use std::future::poll_fn;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::task::Poll;
 
 use rdma_io::async_cm::AsyncCmId;
@@ -23,6 +23,39 @@ use rdma_io::transport::{RecvCompletion, Transport};
 use rdma_io_busy::BusyPool;
 use rdma_io_tests::require_no_iwarp;
 use rdma_io_tests::test_helpers::{bind_listener_with_retry, connect_addr_for};
+
+/// Busy-poll pools pin OS threads to specific cores and spin them at 100%. These
+/// loopback tests also run the *peer* — and, on a software transport like rxe,
+/// the data path itself — in the same process, so two busy-pool tests running at
+/// once would pin overlapping cores and starve each other (and the co-located
+/// work) into a livelock. libtest runs tests in parallel by default, so
+/// serialize the busy-pool tests through this lock. (The ansible runner also
+/// passes `--test-threads=1`, but a direct `cargo test` does not.)
+static BUSY_POOL_SERIAL: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// Acquire the busy-pool serialization lock and pick the core ids for `cores`
+/// pinned pollers — but only if the host has enough CPUs to dedicate them while
+/// leaving headroom for the co-located peer and (on rxe) the software data path.
+/// Returns `None` to skip on an under-provisioned host (e.g. a small rxe VM),
+/// where pinned 100%-spin pollers would starve the loopback peer into a hang.
+async fn busy_pool_guard(
+    cores: usize,
+) -> Option<(tokio::sync::MutexGuard<'static, ()>, Vec<usize>)> {
+    let guard = BUSY_POOL_SERIAL.lock().await;
+    let available = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let needed = cores + 2; // pinned pollers + headroom for peer/runtime/kernel
+    if available < needed {
+        eprintln!(
+            "skipping busy-pool test: needs >= {needed} CPUs ({cores} pinned pollers + headroom), \
+             host has {available}"
+        );
+        return None;
+    }
+    Some((guard, (0..cores).collect()))
+}
 
 /// Drain all currently-available send completions (non-blocking).
 async fn drain_sends(t: &mut ReadRingTransport) {
@@ -121,6 +154,10 @@ async fn read_ring_busy_pool_multi_core_echo() {
     const MSGS: usize = 8;
     const MSG_LEN: usize = 256;
 
+    let Some((_serial, core_ids)) = busy_pool_guard(CORES).await else {
+        return;
+    };
+
     let config = ReadRingConfig::default();
     let listener = bind_listener_with_retry().await;
     let connect_addr = connect_addr_for(listener.local_addr());
@@ -147,8 +184,7 @@ async fn read_ring_busy_pool_multi_core_echo() {
         }
     });
 
-    // Busy-poll client pool across CORES pinned cores.
-    let core_ids: Vec<usize> = (0..CORES).collect();
+    // Busy-poll client pool across CORES pinned cores (ids from the guard).
     let pool = BusyPool::new(ctx, &core_ids, 1024, 1024).expect("build busy pool");
     assert_eq!(pool.core_count(), CORES);
 
@@ -193,6 +229,10 @@ async fn read_ring_busy_pool_server_echo() {
     const MSGS: usize = 8;
     const MSG_LEN: usize = 256;
 
+    let Some((_serial, core_ids)) = busy_pool_guard(CORES).await else {
+        return;
+    };
+
     let config = ReadRingConfig::default();
     let listener = Arc::new(bind_listener_with_retry().await);
     let connect_addr = connect_addr_for(listener.local_addr());
@@ -201,7 +241,6 @@ async fn read_ring_busy_pool_server_echo() {
     probe.resolve_addr(None, &connect_addr, 2000).await.unwrap();
     let ctx = probe.verbs_context().expect("probe has no verbs context");
 
-    let core_ids: Vec<usize> = (0..CORES).collect();
     let pool = BusyPool::new(ctx, &core_ids, 1024, 1024).expect("build busy pool");
 
     // Arm-park clients connect + echo. Spawned first so they are connecting while
@@ -253,6 +292,10 @@ async fn read_ring_busy_pool_admission_cap() {
     const CAP: usize = 2;
     const MSG_LEN: usize = 256;
 
+    let Some((_serial, core_ids)) = busy_pool_guard(1).await else {
+        return;
+    };
+
     let config = ReadRingConfig::default();
     let listener = Arc::new(bind_listener_with_retry().await);
     let connect_addr = connect_addr_for(listener.local_addr());
@@ -262,7 +305,7 @@ async fn read_ring_busy_pool_admission_cap() {
     let ctx = probe.verbs_context().expect("probe has no verbs context");
 
     // One core, cap CAP: shared CQs sized from the config (D3), admission capped.
-    let pool = BusyPool::with_config(ctx, &[0], &config, CAP).expect("build capped pool");
+    let pool = BusyPool::with_config(ctx, &core_ids, &config, CAP).expect("build capped pool");
 
     // Arm-park server accepts exactly the CAP admitted connections, echoing one.
     let server_cfg = config.clone();
@@ -340,6 +383,10 @@ async fn read_ring_busy_pool_shared_cq_fairness() {
     const COOL_MSGS: usize = 5; // light streamers (odd ids)
     const MSG_LEN: usize = 256;
 
+    let Some((_serial, core_ids)) = busy_pool_guard(1).await else {
+        return;
+    };
+
     let config = ReadRingConfig::default();
     let listener = bind_listener_with_retry().await;
     let connect_addr = connect_addr_for(listener.local_addr());
@@ -365,7 +412,7 @@ async fn read_ring_busy_pool_shared_cq_fairness() {
     });
 
     // Single-core pool: all CONNS share ONE busy-polled CQ.
-    let pool = BusyPool::new(ctx, &[0], 1024, 1024).expect("build busy pool");
+    let pool = BusyPool::new(ctx, &core_ids, 1024, 1024).expect("build busy pool");
 
     let mut clients = Vec::with_capacity(CONNS);
     for i in 0..CONNS {
@@ -411,6 +458,10 @@ async fn read_ring_busy_pool_disconnect_isolation() {
     const SURVIVOR_MSGS: usize = 150; // the rest keep streaming
     const MSG_LEN: usize = 256;
 
+    let Some((_serial, core_ids)) = busy_pool_guard(1).await else {
+        return;
+    };
+
     let config = ReadRingConfig::default();
     let listener = bind_listener_with_retry().await;
     let connect_addr = connect_addr_for(listener.local_addr());
@@ -433,7 +484,7 @@ async fn read_ring_busy_pool_disconnect_isolation() {
         }
     });
 
-    let pool = BusyPool::new(ctx, &[0], 1024, 1024).expect("build busy pool");
+    let pool = BusyPool::new(ctx, &core_ids, 1024, 1024).expect("build busy pool");
 
     let mut clients = Vec::with_capacity(CONNS);
     for i in 0..CONNS {
