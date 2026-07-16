@@ -228,20 +228,25 @@ impl SendRecvTransport {
             qp.post_recv_buffer(mr, i as u64)?;
         }
 
-        let async_cm = listener
-            .complete_accept(conn_id, &ConnParam::default())
-            .await?;
-
-        let (event_channel, cm_id) = async_cm.into_parts();
-        let cm_async_fd = AsyncFd::new(event_channel.fd()).map_err(crate::Error::Verbs)?;
+        // Phased accept so `conn_id` is never moved into a consuming future:
+        // reply (sync) → await ESTABLISHED (borrows the listener, not conn_id) →
+        // migrate (sync). `conn_id` stays a local declared before `qp`, so a
+        // cancellation during the only await drops the QP before conn_id's CM id
+        // (which is still on the listener's channel, so its destroy is safe).
+        conn_id.accept(&ConnParam::default())?;
+        listener.await_established().await?;
+        let conn_ch = EventChannel::new()?;
+        conn_ch.set_nonblocking()?;
+        conn_id.migrate(&conn_ch)?;
+        let cm_async_fd = AsyncFd::new(conn_ch.fd()).map_err(crate::Error::Verbs)?;
 
         Ok(Self::from_parts(
             qp,
             send_src,
             recv_src,
             cm_async_fd,
-            cm_id,
-            event_channel,
+            conn_id,
+            conn_ch,
             pd,
             send_bufs,
             recv_bufs,

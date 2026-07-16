@@ -448,12 +448,14 @@ impl CreditRingTransport {
         // Post token recv FIRST — see connect() comment.
         let token_recv_mr = post_token_recv(&qp, &pd)?;
 
-        let async_cm = listener
-            .complete_accept(conn_id, &ConnParam::default())
-            .await?;
-
-        let (event_channel, cm_id) = async_cm.into_parts();
-        let cm_async_fd = AsyncFd::new(event_channel.fd()).map_err(crate::Error::Verbs)?;
+        // Phased accept so `conn_id` is never moved into a consuming future:
+        // reply (sync) → await ESTABLISHED (borrows the listener, not conn_id).
+        // `conn_id` stays a local (declared before `qp`) on the listener's
+        // channel; migrating it to a private channel is deferred to *after* the
+        // setup awaits below, so a cancellation during any of them drops the QP
+        // before conn_id's CM id — and the CM id keeps a live channel.
+        conn_id.accept(&ConnParam::default())?;
+        listener.await_established().await?;
 
         // QP is now RTS — bind Memory Window to scope remote write access
         // (unless using MR-rkey fallback).
@@ -488,13 +490,21 @@ impl CreditRingTransport {
             qp.post_recv_wr(&mut wr)?;
         }
 
+        // Setup awaits done — migrate `conn_id` onto its own event channel (sync)
+        // and build the transport. Deferred to here so `conn_id` stayed
+        // cancellation-safe on the listener's channel throughout the awaits.
+        let conn_ch = EventChannel::new()?;
+        conn_ch.set_nonblocking()?;
+        conn_id.migrate(&conn_ch)?;
+        let cm_async_fd = AsyncFd::new(conn_ch.fd()).map_err(crate::Error::Verbs)?;
+
         Ok(Self::from_parts(
             qp,
             send_src,
             recv_src,
             cm_async_fd,
-            cm_id,
-            event_channel,
+            conn_id,
+            conn_ch,
             pd,
             send_mr,
             recv_mr,
