@@ -60,11 +60,6 @@ use crate::wr::{QpType, RecvWr, SendFlags, SendWr, Sge, WrOpcode};
 /// credit `Send` WRs). Must match the value used to size `max_send_wr`.
 const CREDIT_RING_SQ_HEADROOM: usize = 2;
 
-/// Bounded number of teardown drain sweeps in `Drop`. After forcing the QP to
-/// ERROR the outstanding WRs flush locally (microseconds), so this is a short
-/// spin, not a wall-clock wait; `ibv_destroy_qp` is the backstop if exhausted.
-const CREDIT_RING_TEARDOWN_DRAIN_POLLS: usize = 4096;
-
 // ---------------------------------------------------------------------------
 // CreditRingConfig
 // ---------------------------------------------------------------------------
@@ -156,7 +151,6 @@ pub struct CreditRingTransport {
     disconnected: bool,
     peer_disconnected: bool,
 
-    // -- Virtual buffer index mapping --
     // -- Virtual buffer index mapping (fixed at max_outstanding) --
     virtual_idx_map: Box<[Option<(usize, usize, usize)>]>, // (offset, length, arrival_seq)
     next_virt_idx: usize,
@@ -585,32 +579,13 @@ impl CreditRingTransport {
         }
     }
 
-    fn check_cm_event(&mut self) -> bool {
-        match self.event_channel.try_get_event() {
-            Ok(ev) => {
-                let etype = ev.event_type();
-                ev.ack();
-                if etype == crate::cm::CmEventType::Disconnected {
-                    self.peer_disconnected = true;
-                }
-                self.peer_disconnected
-            }
-            Err(crate::Error::WouldBlock) => false,
-            Err(_) => {
-                self.peer_disconnected = true;
-                true
-            }
-        }
-    }
-
     /// Repost a doorbell recv buffer (round-robin).
     fn repost_doorbell(&mut self) -> crate::Result<()> {
-        let idx = self.doorbell_repost_idx;
-        self.doorbell_repost_idx = (idx + 1) % self.doorbell_bufs.len();
-        let mr = &self.doorbell_bufs[idx];
-        let sge = Sge::new(mr.addr(), 4, mr.lkey());
-        let mut wr = RecvWr::new(idx as u64).sg(sge);
-        self.qp.post_recv_wr(&mut wr)
+        crate::transport_common::repost_doorbell(
+            &self.qp,
+            &self.doorbell_bufs,
+            &mut self.doorbell_repost_idx,
+        )
     }
 
     /// Non-blocking drain of recv CQ for credit updates only.
@@ -636,13 +611,11 @@ impl CreditRingTransport {
                 WcOpcode::RecvRdmaWithImm => {
                     // Data or padding — stash for poll_recv to handle.
                     let imm = wc.imm_data();
-                    let offset = (imm >> 16) as usize;
-                    let length = (imm & 0xFFFF) as usize;
+                    let (offset, length) = crate::transport_common::decode_ring_imm(imm);
                     if length == 0 {
                         // Padding — advance recv_ring head, repost doorbell.
                         // Padding consumes a sender credit, so assign a tracker
                         // slot and immediately release it.
-                        let _pad_len = self.recv_ring.capacity - offset;
                         if self.repost_doorbell().is_err() {
                             self.peer_disconnected = true;
                             return;
@@ -880,7 +853,7 @@ impl Transport for CreditRingTransport {
                 return Ok(0);
             }
             let pad_remote_offset = self.remote_write_tail;
-            let imm = (pad_remote_offset as u32) << 16; // length=0 signals padding
+            let imm = crate::transport_common::encode_ring_imm(pad_remote_offset, 0);
             let mut pad_wr = SendWr::new(WR_ID_PADDING_SENTINEL, WrOpcode::RdmaWriteWithImm(imm))
                 .flags(SendFlags::SIGNALED)
                 .rdma(
@@ -902,7 +875,7 @@ impl Transport for CreditRingTransport {
 
         // Build RDMA Write+Imm WR for data.
         let remote_offset = self.remote_write_tail;
-        let imm = ((remote_offset as u32) << 16) | (data_len as u32);
+        let imm = crate::transport_common::encode_ring_imm(remote_offset, data_len);
         let sge = Sge::new(
             self.send_ring.mr.addr() + local_offset as u64,
             data_len as u32,
@@ -1030,8 +1003,7 @@ impl Transport for CreditRingTransport {
                 match wc.opcode() {
                     WcOpcode::RecvRdmaWithImm => {
                         let imm = wc.imm_data();
-                        let offset = (imm >> 16) as usize;
-                        let length = (imm & 0xFFFF) as usize;
+                        let (offset, length) = crate::transport_common::decode_ring_imm(imm);
 
                         if offset >= self.recv_ring.capacity
                             || (length > 0 && offset + length > self.recv_ring.capacity)
@@ -1199,26 +1171,12 @@ impl Transport for CreditRingTransport {
     }
 
     fn poll_disconnect(&mut self, cx: &mut Context<'_>) -> bool {
-        if self.peer_disconnected {
-            return true;
-        }
-        loop {
-            match self.cm_async_fd.poll_read_ready(cx) {
-                Poll::Ready(Ok(mut guard)) => {
-                    guard.clear_ready();
-                    if self.check_cm_event() {
-                        return true;
-                    }
-                }
-                Poll::Pending => {
-                    return false;
-                }
-                Poll::Ready(Err(_)) => {
-                    self.peer_disconnected = true;
-                    return true;
-                }
-            }
-        }
+        crate::transport_common::poll_cm_disconnect(
+            &self.cm_async_fd,
+            &self.event_channel,
+            &mut self.peer_disconnected,
+            cx,
+        )
     }
 
     fn disconnect(&mut self) -> crate::Result<()> {
@@ -1251,14 +1209,7 @@ impl Drop for CreditRingTransport {
         // never blocks the calling (possibly tokio worker) thread; the flush is
         // local (microseconds) and `ibv_destroy_qp` is the backstop.
         let _ = self.qp.to_error();
-        let mut wc = [WorkCompletion::default(); 16];
-        for _ in 0..CREDIT_RING_TEARDOWN_DRAIN_POLLS {
-            let s = self.send_src.try_drain(&mut wc).unwrap_or(0);
-            let r = self.recv_src.try_drain(&mut wc).unwrap_or(0);
-            if s == 0 && r == 0 {
-                break;
-            }
-        }
+        crate::transport_common::drain_flushed(&mut self.send_src, &mut self.recv_src);
     }
 }
 

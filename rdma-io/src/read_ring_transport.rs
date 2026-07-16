@@ -75,20 +75,11 @@ const SEND_COPY_MAX_WRS: usize = 3;
 /// Sentinel wr_id for RDMA Read of offset buffer — not a data WR.
 const WR_ID_READ_SENTINEL: u64 = u64::MAX - 30;
 
-/// Setup wr_id for our token Send; matched exactly by the setup-completion drain.
-const WR_ID_TOKEN_SEND: u64 = u64::MAX - 2;
 /// Setup wr_id for the offset-buffer Memory-Window bind (MW2); matched exactly by
 /// the setup-completion drain. (The recv-ring MW bind uses
-/// [`crate::transport_common::WR_ID_RECV_MW_BIND`].)
+/// [`crate::transport_common::WR_ID_RECV_MW_BIND`], the token Send uses
+/// [`crate::transport_common::WR_ID_TOKEN_SEND`].)
 const WR_ID_OFFSET_MW_BIND: u64 = u64::MAX - 11;
-
-/// Bounded poll budget for the teardown completion drain. Moving the QP to
-/// ERROR flushes outstanding WRs *locally* (no network round-trip), so their
-/// flush completions land within a few `ibv_poll_cq` calls; this cap only
-/// guards against a misbehaving provider — with `ibv_destroy_qp` (in the QP
-/// field drop) as the ultimate backstop — so `Drop` never occupies the calling
-/// (possibly tokio worker) thread for more than microseconds.
-const READ_RING_TEARDOWN_DRAIN_POLLS: usize = 4096;
 
 // ---------------------------------------------------------------------------
 // ReadRingToken — 32-byte connection setup token (v2)
@@ -1042,14 +1033,7 @@ impl Drop for PendingReadRing {
             // flush terminates), then drop in field order (QP before its CQs).
             ConnectionLifecycle::ArmPark => {
                 let _ = res.qp.to_error();
-                let mut wc = [WorkCompletion::default(); 16];
-                for _ in 0..READ_RING_TEARDOWN_DRAIN_POLLS {
-                    let s = res.send_src.try_drain(&mut wc).unwrap_or(0);
-                    let r = res.recv_src.try_drain(&mut wc).unwrap_or(0);
-                    if s == 0 && r == 0 {
-                        break;
-                    }
-                }
+                crate::transport_common::drain_flushed(&mut res.send_src, &mut res.recv_src);
                 drop(res);
             }
         }
@@ -1425,32 +1409,13 @@ impl ReadRingInner {
         self.remote_capacity.saturating_sub(used + 1)
     }
 
-    fn check_cm_event(&mut self) -> bool {
-        match self.event_channel.try_get_event() {
-            Ok(ev) => {
-                let etype = ev.event_type();
-                ev.ack();
-                if etype == crate::cm::CmEventType::Disconnected {
-                    self.peer_disconnected = true;
-                }
-                self.peer_disconnected
-            }
-            Err(crate::Error::WouldBlock) => false,
-            Err(_) => {
-                self.peer_disconnected = true;
-                true
-            }
-        }
-    }
-
     /// Repost a doorbell recv buffer (round-robin).
     fn repost_doorbell(&mut self) -> crate::Result<()> {
-        let idx = self.doorbell_repost_idx;
-        self.doorbell_repost_idx = (idx + 1) % self.doorbell_bufs.len();
-        let mr = &self.doorbell_bufs[idx];
-        let sge = Sge::new(mr.addr(), 4, mr.lkey());
-        let mut wr = RecvWr::new(idx as u64).sg(sge);
-        self.qp.post_recv_wr(&mut wr)
+        crate::transport_common::repost_doorbell(
+            &self.qp,
+            &self.doorbell_bufs,
+            &mut self.doorbell_repost_idx,
+        )
     }
 
     /// Post an RDMA Read of the remote offset buffer.
@@ -1599,7 +1564,7 @@ impl Transport for ReadRingInner {
                 return Ok(0);
             }
             let pad_remote_offset = self.remote_write_tail;
-            let imm = (pad_remote_offset as u32) << 16; // length=0 signals padding
+            let imm = crate::transport_common::encode_ring_imm(pad_remote_offset, 0);
             let mut pad_wr = SendWr::new(WR_ID_PADDING_SENTINEL, WrOpcode::RdmaWriteWithImm(imm))
                 .flags(SendFlags::SIGNALED)
                 .rdma(
@@ -1620,7 +1585,7 @@ impl Transport for ReadRingInner {
 
         // Build RDMA Write+Imm WR for data.
         let remote_offset = self.remote_write_tail;
-        let imm = ((remote_offset as u32) << 16) | (data_len as u32);
+        let imm = crate::transport_common::encode_ring_imm(remote_offset, data_len);
         let sge = Sge::new(
             self.send_ring.mr.addr() + local_offset as u64,
             data_len as u32,
@@ -1768,8 +1733,7 @@ impl Transport for ReadRingInner {
                 match wc.opcode() {
                     WcOpcode::RecvRdmaWithImm => {
                         let imm = wc.imm_data();
-                        let offset = (imm >> 16) as usize;
-                        let length = (imm & 0xFFFF) as usize;
+                        let (offset, length) = crate::transport_common::decode_ring_imm(imm);
 
                         if offset >= self.recv_ring.capacity
                             || (length > 0 && offset + length > self.recv_ring.capacity)
@@ -1902,26 +1866,12 @@ impl Transport for ReadRingInner {
     }
 
     fn poll_disconnect(&mut self, cx: &mut Context<'_>) -> bool {
-        if self.peer_disconnected {
-            return true;
-        }
-        loop {
-            match self.cm_async_fd.poll_read_ready(cx) {
-                Poll::Ready(Ok(mut guard)) => {
-                    guard.clear_ready();
-                    if self.check_cm_event() {
-                        return true;
-                    }
-                }
-                Poll::Pending => {
-                    return false;
-                }
-                Poll::Ready(Err(_)) => {
-                    self.peer_disconnected = true;
-                    return true;
-                }
-            }
-        }
+        crate::transport_common::poll_cm_disconnect(
+            &self.cm_async_fd,
+            &self.event_channel,
+            &mut self.peer_disconnected,
+            cx,
+        )
     }
 
     fn disconnect(&mut self) -> crate::Result<()> {
@@ -2032,7 +1982,7 @@ impl ReadRingInner {
         let mut send_expected = self.send_in_flight + usize::from(self.read_in_flight);
         let mut recv_expected = self.max_outstanding;
         let mut wc = [WorkCompletion::default(); 16];
-        for _ in 0..READ_RING_TEARDOWN_DRAIN_POLLS {
+        for _ in 0..crate::transport_common::TEARDOWN_DRAIN_POLLS {
             if send_expected == 0 && recv_expected == 0 {
                 break;
             }
@@ -2064,7 +2014,7 @@ impl ReadRingInner {
             tracing::warn!(
                 send_unreaped = send_expected,
                 recv_unreaped = recv_expected,
-                budget = READ_RING_TEARDOWN_DRAIN_POLLS,
+                budget = crate::transport_common::TEARDOWN_DRAIN_POLLS,
                 "read-ring teardown drain exhausted its poll budget with completions \
                  still outstanding; QP destroy will backstop cleanup"
             );

@@ -5,14 +5,26 @@
 //! and future ring transports: ring tokens, ring buffers, completion tracking,
 //! memory window binding, token exchange, and QP state checks.
 
+use std::os::unix::io::RawFd;
 use std::sync::Arc;
+use std::task::{Context, Poll};
+
+use tokio::io::unix::AsyncFd;
 
 use crate::async_qp::AsyncQp;
+use crate::cm::{CmEventType, EventChannel};
+use crate::completion_source::CompletionSource;
 use crate::mr::{AccessFlags, OwnedMemoryRegion};
 use crate::mw::MemoryWindow;
 use crate::pd::ProtectionDomain;
 use crate::wc::WorkCompletion;
 use crate::wr::{RecvWr, SendFlags, SendWr, Sge, WrOpcode};
+
+/// Bounded number of teardown drain sweeps a transport `Drop` spins after
+/// forcing the QP to `ERROR`. The outstanding WRs flush locally (microseconds),
+/// so this is a short spin, not a wall-clock wait; `ibv_destroy_qp` is the
+/// backstop if exhausted. Shared by all three transports.
+pub(crate) const TEARDOWN_DRAIN_POLLS: usize = 4096;
 
 /// wr_id bit 63: 0 = data WR, 1 = credit WR.
 pub(crate) const WR_ID_CREDIT_FLAG: u64 = 1 << 63;
@@ -525,6 +537,107 @@ pub(crate) async fn drain_ring_setup_sends(
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Shared CM-disconnect / teardown / doorbell / immediate-data helpers
+// (identical across read-ring, credit-ring, send-recv)
+// ---------------------------------------------------------------------------
+
+/// Drain one CM event non-blocking, setting `*peer_disconnected` on a
+/// `Disconnected` event or any error. Returns whether the peer is now
+/// disconnected. Shared by every transport's `check_cm_event`.
+pub(crate) fn check_cm_event(event_channel: &EventChannel, peer_disconnected: &mut bool) -> bool {
+    match event_channel.try_get_event() {
+        Ok(ev) => {
+            let etype = ev.event_type();
+            ev.ack();
+            if etype == CmEventType::Disconnected {
+                *peer_disconnected = true;
+            }
+            *peer_disconnected
+        }
+        Err(crate::Error::WouldBlock) => false,
+        Err(_) => {
+            *peer_disconnected = true;
+            true
+        }
+    }
+}
+
+/// The `Transport::poll_disconnect` loop shared by every transport: poll the CM
+/// fd for readiness and drain events via [`check_cm_event`], returning `true`
+/// once the peer has disconnected.
+pub(crate) fn poll_cm_disconnect(
+    cm_async_fd: &AsyncFd<RawFd>,
+    event_channel: &EventChannel,
+    peer_disconnected: &mut bool,
+    cx: &mut Context<'_>,
+) -> bool {
+    if *peer_disconnected {
+        return true;
+    }
+    loop {
+        match cm_async_fd.poll_read_ready(cx) {
+            Poll::Ready(Ok(mut guard)) => {
+                guard.clear_ready();
+                if check_cm_event(event_channel, peer_disconnected) {
+                    return true;
+                }
+            }
+            Poll::Pending => return false,
+            Poll::Ready(Err(_)) => {
+                *peer_disconnected = true;
+                return true;
+            }
+        }
+    }
+}
+
+/// The bounded teardown drain shared by the transport `Drop`s (and the read-ring
+/// arm-park setup rollback): after the QP is forced to `ERROR`, reap the flushed
+/// CQEs through both sources until they are empty (or the [`TEARDOWN_DRAIN_POLLS`]
+/// budget is exhausted), so the QP releases its MR references before the MRs are
+/// deregistered. (`read_ring::drain_teardown` uses an exact-count variant.)
+pub(crate) fn drain_flushed(send_src: &mut CompletionSource, recv_src: &mut CompletionSource) {
+    let mut wc = [WorkCompletion::default(); 16];
+    for _ in 0..TEARDOWN_DRAIN_POLLS {
+        let s = send_src.try_drain(&mut wc).unwrap_or(0);
+        let r = recv_src.try_drain(&mut wc).unwrap_or(0);
+        if s == 0 && r == 0 {
+            break;
+        }
+    }
+}
+
+/// Repost a 4-byte doorbell recv WR round-robin over `bufs`, advancing
+/// `*repost_idx`. Shared by both ring transports.
+pub(crate) fn repost_doorbell(
+    qp: &AsyncQp,
+    bufs: &[OwnedMemoryRegion],
+    repost_idx: &mut usize,
+) -> crate::Result<()> {
+    let idx = *repost_idx;
+    *repost_idx = (idx + 1) % bufs.len();
+    let mr = &bufs[idx];
+    let sge = Sge::new(mr.addr(), 4, mr.lkey());
+    let mut wr = RecvWr::new(idx as u64).sg(sge);
+    qp.post_recv_wr(&mut wr)
+}
+
+/// Pack a message's `(offset, len)` into the 32-bit RDMA-Write immediate:
+/// `offset` in the high 16 bits, `len` in the low 16 bits. `len == 0` signals a
+/// padding (ring-wrap) message. This encoding is what hard-caps the ring at
+/// 65536 bytes (16-bit fields). Shared by both ring transports' `send_gather`.
+#[inline]
+pub(crate) fn encode_ring_imm(offset: usize, len: usize) -> u32 {
+    ((offset as u32) << 16) | (len as u32)
+}
+
+/// Inverse of [`encode_ring_imm`]: `(offset, len)` from a Write immediate.
+#[inline]
+pub(crate) fn decode_ring_imm(imm: u32) -> (usize, usize) {
+    ((imm >> 16) as usize, (imm & 0xFFFF) as usize)
 }
 
 #[cfg(test)]

@@ -23,11 +23,6 @@ use crate::transport::{RecvCompletion, Transport, TransportBuilder};
 use crate::wc::WorkCompletion;
 use crate::wr::QpType;
 
-/// Bounded number of teardown drain sweeps in `Drop`. After forcing the QP to
-/// ERROR the outstanding WRs flush locally (microseconds), so this is a short
-/// spin, not a wall-clock wait; `ibv_destroy_qp` is the backstop if exhausted.
-const SEND_RECV_TEARDOWN_DRAIN_POLLS: usize = 4096;
-
 /// Configuration for creating an [`SendRecvTransport`].
 #[derive(Debug, Clone)]
 pub struct SendRecvConfig {
@@ -285,24 +280,6 @@ impl SendRecvTransport {
             event_channel,
         }
     }
-
-    fn check_cm_event(&mut self) -> bool {
-        match self.event_channel.try_get_event() {
-            Ok(ev) => {
-                let etype = ev.event_type();
-                ev.ack();
-                if etype == crate::cm::CmEventType::Disconnected {
-                    self.peer_disconnected = true;
-                }
-                self.peer_disconnected
-            }
-            Err(crate::Error::WouldBlock) => false,
-            Err(_) => {
-                self.peer_disconnected = true;
-                true
-            }
-        }
-    }
 }
 
 impl Transport for SendRecvTransport {
@@ -434,26 +411,12 @@ impl Transport for SendRecvTransport {
     }
 
     fn poll_disconnect(&mut self, cx: &mut Context<'_>) -> bool {
-        if self.peer_disconnected {
-            return true;
-        }
-        loop {
-            match self.cm_async_fd.poll_read_ready(cx) {
-                Poll::Ready(Ok(mut guard)) => {
-                    guard.clear_ready();
-                    if self.check_cm_event() {
-                        return true;
-                    }
-                }
-                Poll::Pending => {
-                    return false;
-                }
-                Poll::Ready(Err(_)) => {
-                    self.peer_disconnected = true;
-                    return true;
-                }
-            }
-        }
+        crate::transport_common::poll_cm_disconnect(
+            &self.cm_async_fd,
+            &self.event_channel,
+            &mut self.peer_disconnected,
+            cx,
+        )
     }
 
     fn disconnect(&mut self) -> crate::Result<()> {
@@ -488,14 +451,7 @@ impl Drop for SendRecvTransport {
         // local (microseconds), and `ibv_destroy_qp` in the `qp` field drop is
         // the backstop.
         let _ = self.qp.to_error();
-        let mut wc = [crate::wc::WorkCompletion::default(); 16];
-        for _ in 0..SEND_RECV_TEARDOWN_DRAIN_POLLS {
-            let s = self.send_src.try_drain(&mut wc).unwrap_or(0);
-            let r = self.recv_src.try_drain(&mut wc).unwrap_or(0);
-            if s == 0 && r == 0 {
-                break;
-            }
-        }
+        crate::transport_common::drain_flushed(&mut self.send_src, &mut self.recv_src);
     }
 }
 
