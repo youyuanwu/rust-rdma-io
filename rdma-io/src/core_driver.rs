@@ -204,10 +204,17 @@ impl CoreDriver {
             // then free + retire the ones that reached the drain barrier (§6.2 /
             // §10).
             self.process_reclaim(RECLAIM_MAX_TURNS);
-            // Shutdown drains: once asked to stop, keep sweeping + reclaiming
+            // Shutdown join (§10): once asked to stop, keep sweeping + reclaiming
             // until every handed-off bundle is freed, so no QP/MR outlives — and
-            // no flush CQE is stranded in — the shared CQs about to be dropped
-            // (§10 shutdown join).
+            // no flush CQE is stranded in — the shared CQs about to be dropped.
+            //
+            // Contract (review #3): the owner must **close every connection
+            // before shutdown** — await each `JoinHandle` (aborting first if the
+            // app loop must be interrupted), so each transport `Drop` has already
+            // enqueued its reclaim. The reclaim push and this drain both run on
+            // this one core, so a closed connection's bundle is always visible
+            // here; we only need the queue to drain. The `debug_assert` catches a
+            // caller that shut down while a connection was still live.
             if self.shutdown.load(Ordering::Acquire)
                 && self
                     .reclaim
@@ -215,6 +222,15 @@ impl CoreDriver {
                     .expect("CoreDriver reclaim queue poisoned")
                     .is_empty()
             {
+                debug_assert!(
+                    self.slots
+                        .lock()
+                        .expect("CoreDriver slot map poisoned")
+                        .values()
+                        .all(|s| s.state() == SlotState::Drained),
+                    "CoreDriver shut down with a non-Drained slot still registered: close every \
+                     connection (await its JoinHandle) before shutdown (§10, review #3)"
+                );
                 break;
             }
             // Cooperative, runtime-agnostic yield: hand the core to app tasks

@@ -318,8 +318,15 @@ impl BusyPool {
     }
 
     /// Stop every driver (draining its reclaim queue) and join the worker
-    /// threads. Call **after** every connection's `JoinHandle` has been awaited,
-    /// so each transport `Drop` has already enqueued its reclaim (§6.2).
+    /// threads.
+    ///
+    /// **Close every connection first** (review #3): await each `JoinHandle`
+    /// returned by [`spawn_connect`](Self::spawn_connect) / [`serve`](Self::serve)
+    /// — aborting first if an app loop must be interrupted — so each transport
+    /// `Drop` has already handed its resources to the owning driver's reclaim
+    /// queue. Each driver then drains that queue before its thread joins. A
+    /// `debug_assert` in the driver fires if a connection is still live at
+    /// shutdown.
     pub fn shutdown(mut self) {
         shutdown_workers(&mut self.workers);
     }

@@ -574,3 +574,82 @@ async fn read_ring_busy_pool_disconnect_isolation() {
     pool.shutdown();
     drop(probe);
 }
+
+// Review #3 contract: a caller must CLOSE every connection before `shutdown` —
+// abort each active app loop and await its `JoinHandle` so its transport drops
+// (enqueuing reclaim) first; `shutdown` then drains cleanly. Exercises the
+// SIGTERM path (force-closing still-active connections) reclaiming without
+// hanging or stranding; the driver's debug-assert verifies no slot is live at
+// exit.
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn read_ring_busy_pool_shutdown_with_active_tasks() {
+    require_no_iwarp!();
+
+    const N: usize = 3;
+
+    let Some((_serial, core_ids)) = busy_pool_guard(1).await else {
+        return;
+    };
+
+    let config = ReadRingConfig::default();
+    let listener = bind_listener_with_retry().await;
+    let connect_addr = connect_addr_for(listener.local_addr());
+
+    let probe = AsyncCmId::new(PortSpace::Tcp).unwrap();
+    probe.resolve_addr(None, &connect_addr, 2000).await.unwrap();
+    let ctx = probe.verbs_context().expect("probe has no verbs context");
+
+    // Server accepts N connections and holds them alive (never closes).
+    let server_cfg = config.clone();
+    let server = tokio::spawn(async move {
+        let mut conns = Vec::with_capacity(N);
+        for _ in 0..N {
+            conns.push(
+                ReadRingTransport::accept(&listener, server_cfg.clone())
+                    .await
+                    .expect("server accept"),
+            );
+        }
+        std::future::pending::<()>().await;
+    });
+
+    let pool = BusyPool::new(ctx, &core_ids, 1024, 1024).expect("build busy pool");
+
+    // N active client connections whose app loops block forever. Each signals
+    // once its transport is established; we keep their `JoinHandle`s so we can
+    // close them before shutdown (the contract).
+    let up = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut handles = Vec::with_capacity(N);
+    for _ in 0..N {
+        let cfg = config.clone();
+        let up = up.clone();
+        let placed = pool.spawn_connect(connect_addr, cfg, move |t| async move {
+            let _held = t; // hold the transport: the connection stays active
+            up.add_permits(1);
+            std::future::pending::<()>().await;
+        });
+        handles.push(placed.expect("uncapped pool always admits"));
+    }
+
+    // Wait until all N are fully established (not mid-setup).
+    let _permit = tokio::time::timeout(Duration::from_secs(20), up.acquire_many(N as u32))
+        .await
+        .expect("all clients established")
+        .expect("semaphore acquire");
+
+    // Close every connection BEFORE `pool.shutdown()` (review #3 contract): abort
+    // each still-blocked app loop, then await its `JoinHandle` so its transport
+    // `Drop` enqueues reclaim first. `shutdown` then drains cleanly — the driver's
+    // debug-assert fires if any slot were still live at exit.
+    for h in &handles {
+        h.abort();
+    }
+    for h in handles {
+        let _ = h.await;
+    }
+    pool.shutdown();
+
+    server.abort();
+    let _ = server.await;
+    drop(probe);
+}

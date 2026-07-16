@@ -31,6 +31,7 @@ use rdma_io_busy::{ArmParkPool, BusyPool};
 use rdma_io_tonic::{RdmaIncoming, TokioRdmaStream};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_openssl::SslStream;
+use tokio_util::sync::CancellationToken;
 
 use crate::common::{ClientOpts, ServerOpts, connect_with_retry, transport_setup_error};
 use crate::metrics::{BenchMetrics, run_readiness_barrier, spawn_resource_sampler};
@@ -688,21 +689,39 @@ where
          {connections} read-ring connection(s) ({conns_per_core}/core)"
     );
 
+    // Serve each connection cooperatively cancellable: its hyper HTTP/1.1 driver
+    // races a shared cancellation token, so a shutdown signal makes every
+    // connection return (dropping its transport → reclaim) — the
+    // close-before-shutdown contract (review #3), via a token rather than a blunt
+    // task abort.
+    let cancel = CancellationToken::new();
+    let serve_cancel = cancel.clone();
     let handles = pool
         .serve(listener, config, connections, move |t| {
-            serve_h1_transport(t, acceptor.clone())
+            let cancel = serve_cancel.clone();
+            let acceptor = acceptor.clone();
+            async move {
+                tokio::select! {
+                    _ = cancel.cancelled() => {}
+                    _ = serve_h1_transport(t, acceptor) => {}
+                }
+            }
         })
         .await;
 
-    let all_closed = async {
+    let mut all_closed = Box::pin(async move {
         for h in handles {
             let _ = h.await;
         }
-    };
+    });
     tokio::pin!(shutdown);
     tokio::select! {
-        _ = all_closed => eprintln!("Busy-poll h1 server: all connections closed"),
-        _ = &mut shutdown => eprintln!("Busy-poll h1 server: shutdown signal received, draining"),
+        _ = &mut all_closed => eprintln!("Busy-poll h1 server: all connections closed"),
+        _ = &mut shutdown => {
+            eprintln!("Busy-poll h1 server: shutdown signal received, draining");
+            cancel.cancel();
+            all_closed.await;
+        }
     }
 
     pool.shutdown();

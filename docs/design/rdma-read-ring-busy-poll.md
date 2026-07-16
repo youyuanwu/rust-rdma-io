@@ -658,8 +658,9 @@ implementation review, in fix order.
 > **Progress (2026-07-15).** Done: **8** (readiness barrier), **6** (forced-reclaim panic — the
 > panic + quarantine; the monotonic-deadline refinement is still open), **13** (argument/result
 > hygiene), **4** (terminal-error propagation), **9** (removed `deregister`), **2** (admission tied to
-> retirement + bounded server admission), and the `register()` duplicate-`qp_num` rejection half of
-> blocker **1**. See the per-item **[Done]** notes below.
+> retirement + bounded server admission), **3** (shutdown ordering — close-before-shutdown contract),
+> and the `register()` duplicate-`qp_num` rejection half of blocker **1**. See the per-item **[Done]**
+> notes below.
 
 **Blockers (before production):**
 
@@ -688,6 +689,17 @@ implementation review, in fix order.
    stranding late reclaim entries. Signal app loops, await (or abort-then-await) every task so each
    transport `Drop` enqueues reclaim, then stop the driver — and refuse driver exit while any
    non-retired slot is still registered.
+   **[Done 2026-07-15 — contract]** Adopted the **close-before-shutdown contract** (simpler than a
+   defensive pool): the caller must close every connection — await each `JoinHandle` — before
+   `BusyPool::shutdown()`. Because a connection's reclaim push and the driver's drain run on the
+   **same** core, an awaited handle guarantees its bundle is enqueued and visible, so the driver's
+   simple `shutdown && reclaim.is_empty()` exit is race-free; a `debug_assert` fires if a non-`Drained`
+   slot is still registered at exit. The busy bench servers realize the contract with a
+   `tokio_util::sync::CancellationToken`: each connection's app loop races `token.cancelled()`, and a
+   shutdown signal cancels the token (every connection returns → transport drops → reclaim) then
+   awaits them all — cooperative cancellation, not a task abort. Validated on MANA:
+   `read_ring_busy_pool_shutdown_with_active_tasks` + 6/6 busy-pool tests; echo-busy / rh1-busy
+   servers shut down clean.
 
 **High priority:**
 

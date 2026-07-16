@@ -41,6 +41,7 @@ use rdma_io_busy::{ArmParkPool, BusyPool};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Semaphore};
+use tokio_util::sync::CancellationToken;
 
 use crate::metrics::{run_readiness_barrier, spawn_resource_sampler};
 use crate::report::BenchResult;
@@ -579,23 +580,41 @@ where
          {connections} read-ring connection(s) ({conns_per_core}/core)"
     );
 
-    // Accept exactly `connections` (serialized handshake), each echoing on its
-    // owning core until its peer disconnects.
+    // Serve each connection cooperatively cancellable: its echo loop races a
+    // shared cancellation token, so a shutdown signal makes every connection
+    // return (dropping its transport → reclaim) — the close-before-shutdown
+    // contract (review #3), via a token rather than a blunt task abort.
+    let cancel = CancellationToken::new();
+    let serve_cancel = cancel.clone();
     let handles = pool
-        .serve(listener, config, connections, server_conn_loop)
+        .serve(listener, config, connections, move |t| {
+            let cancel = serve_cancel.clone();
+            async move {
+                tokio::select! {
+                    _ = cancel.cancelled() => {}
+                    _ = server_conn_loop(t) => {}
+                }
+            }
+        })
         .await;
 
-    // Hold until every connection closes (clients finished) or a shutdown signal
-    // arrives, then stop the drivers (draining reclaim) and join the threads.
-    let all_closed = async {
+    // Drive to completion: either every connection closes naturally, or the
+    // shutdown signal cancels the token (making every connection return). Then
+    // await them all so each transport's reclaim is enqueued before the drivers
+    // stop.
+    let mut all_closed = Box::pin(async move {
         for h in handles {
             let _ = h.await;
         }
-    };
+    });
     tokio::pin!(shutdown);
     tokio::select! {
-        _ = all_closed => eprintln!("Busy-poll echo server: all connections closed"),
-        _ = &mut shutdown => eprintln!("Busy-poll echo server: shutdown signal received, draining"),
+        _ = &mut all_closed => eprintln!("Busy-poll echo server: all connections closed"),
+        _ = &mut shutdown => {
+            eprintln!("Busy-poll echo server: shutdown signal received, draining");
+            cancel.cancel();
+            all_closed.await;
+        }
     }
 
     pool.shutdown();
