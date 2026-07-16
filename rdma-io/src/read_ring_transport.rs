@@ -975,59 +975,6 @@ impl Drop for PendingReadRing {
 // Implementation
 // ---------------------------------------------------------------------------
 
-/// A CM endpoint that can host a QP during read-ring setup — either a client
-/// [`AsyncCmId`] (post address/route resolution) or a server-side [`CmId`] (from
-/// `AsyncCmListener::get_request`). Lets [`prepare_pending`] build the QP and
-/// resource bundle once for both roles; the two `connect`/`accept` paths then
-/// differ only in the role-specific CM handshake.
-trait CmSetupEndpoint {
-    fn verbs_context(&self) -> Option<Arc<crate::device::Context>>;
-    fn alloc_pd(&self) -> crate::Result<Arc<ProtectionDomain>>;
-    fn create_qp_with_cq(
-        &self,
-        pd: &Arc<ProtectionDomain>,
-        init_attr: &QpInitAttr,
-        send_cq: Option<&Arc<crate::cq::CompletionQueue>>,
-        recv_cq: Option<&Arc<crate::cq::CompletionQueue>>,
-    ) -> crate::Result<crate::cm::CmQueuePair>;
-}
-
-impl CmSetupEndpoint for AsyncCmId {
-    fn verbs_context(&self) -> Option<Arc<crate::device::Context>> {
-        AsyncCmId::verbs_context(self)
-    }
-    fn alloc_pd(&self) -> crate::Result<Arc<ProtectionDomain>> {
-        AsyncCmId::alloc_pd(self)
-    }
-    fn create_qp_with_cq(
-        &self,
-        pd: &Arc<ProtectionDomain>,
-        init_attr: &QpInitAttr,
-        send_cq: Option<&Arc<crate::cq::CompletionQueue>>,
-        recv_cq: Option<&Arc<crate::cq::CompletionQueue>>,
-    ) -> crate::Result<crate::cm::CmQueuePair> {
-        AsyncCmId::create_qp_with_cq(self, pd, init_attr, send_cq, recv_cq)
-    }
-}
-
-impl CmSetupEndpoint for CmId {
-    fn verbs_context(&self) -> Option<Arc<crate::device::Context>> {
-        CmId::verbs_context(self)
-    }
-    fn alloc_pd(&self) -> crate::Result<Arc<ProtectionDomain>> {
-        CmId::alloc_pd(self)
-    }
-    fn create_qp_with_cq(
-        &self,
-        pd: &Arc<ProtectionDomain>,
-        init_attr: &QpInitAttr,
-        send_cq: Option<&Arc<crate::cq::CompletionQueue>>,
-        recv_cq: Option<&Arc<crate::cq::CompletionQueue>>,
-    ) -> crate::Result<crate::cm::CmQueuePair> {
-        CmId::create_qp_with_cq(self, pd, init_attr, send_cq, recv_cq)
-    }
-}
-
 /// Build the QP + resource bundle and open the setup transaction, shared by
 /// `connect` and `accept`. On return the busy slot (if any) is registered and
 /// the 32-byte peer-token recv WR is posted; the caller performs its

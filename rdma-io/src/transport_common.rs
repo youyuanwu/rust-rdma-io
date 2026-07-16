@@ -11,12 +11,15 @@ use std::task::{Context, Poll};
 
 use tokio::io::unix::AsyncFd;
 
+use crate::async_cm::AsyncCmId;
 use crate::async_qp::AsyncQp;
-use crate::cm::{CmEventType, EventChannel};
+use crate::cm::{CmEventType, CmId, CmQueuePair, EventChannel};
 use crate::completion_source::CompletionSource;
+use crate::cq::CompletionQueue;
 use crate::mr::{AccessFlags, OwnedMemoryRegion};
 use crate::mw::MemoryWindow;
 use crate::pd::ProtectionDomain;
+use crate::qp::QpInitAttr;
 use crate::wc::WorkCompletion;
 use crate::wr::{RecvWr, SendFlags, SendWr, Sge, WrOpcode};
 
@@ -648,6 +651,64 @@ pub(crate) fn encode_ring_imm(offset: usize, len: usize) -> u32 {
 #[inline]
 pub(crate) fn decode_ring_imm(imm: u32) -> (usize, usize) {
     ((imm >> 16) as usize, (imm & 0xFFFF) as usize)
+}
+
+// ---------------------------------------------------------------------------
+// CmSetupEndpoint — client/server CM endpoint abstraction for ring setup
+// ---------------------------------------------------------------------------
+
+/// A CM endpoint that can host a QP during ring-transport setup — either a
+/// client [`AsyncCmId`] (post address/route resolution) or a server-side
+/// [`CmId`] (from `AsyncCmListener::get_request`). Lets each transport's
+/// `prepare_pending` build the QP and resource bundle once for both roles; the
+/// two `connect`/`accept` paths then differ only in the role-specific CM
+/// handshake. Shared by the read-ring and credit-ring setup transactions.
+pub(crate) trait CmSetupEndpoint {
+    fn verbs_context(&self) -> Option<Arc<crate::device::Context>>;
+    fn alloc_pd(&self) -> crate::Result<Arc<ProtectionDomain>>;
+    fn create_qp_with_cq(
+        &self,
+        pd: &Arc<ProtectionDomain>,
+        init_attr: &QpInitAttr,
+        send_cq: Option<&Arc<CompletionQueue>>,
+        recv_cq: Option<&Arc<CompletionQueue>>,
+    ) -> crate::Result<CmQueuePair>;
+}
+
+impl CmSetupEndpoint for AsyncCmId {
+    fn verbs_context(&self) -> Option<Arc<crate::device::Context>> {
+        AsyncCmId::verbs_context(self)
+    }
+    fn alloc_pd(&self) -> crate::Result<Arc<ProtectionDomain>> {
+        AsyncCmId::alloc_pd(self)
+    }
+    fn create_qp_with_cq(
+        &self,
+        pd: &Arc<ProtectionDomain>,
+        init_attr: &QpInitAttr,
+        send_cq: Option<&Arc<CompletionQueue>>,
+        recv_cq: Option<&Arc<CompletionQueue>>,
+    ) -> crate::Result<CmQueuePair> {
+        AsyncCmId::create_qp_with_cq(self, pd, init_attr, send_cq, recv_cq)
+    }
+}
+
+impl CmSetupEndpoint for CmId {
+    fn verbs_context(&self) -> Option<Arc<crate::device::Context>> {
+        CmId::verbs_context(self)
+    }
+    fn alloc_pd(&self) -> crate::Result<Arc<ProtectionDomain>> {
+        CmId::alloc_pd(self)
+    }
+    fn create_qp_with_cq(
+        &self,
+        pd: &Arc<ProtectionDomain>,
+        init_attr: &QpInitAttr,
+        send_cq: Option<&Arc<CompletionQueue>>,
+        recv_cq: Option<&Arc<CompletionQueue>>,
+    ) -> crate::Result<CmQueuePair> {
+        CmId::create_qp_with_cq(self, pd, init_attr, send_cq, recv_cq)
+    }
 }
 
 #[cfg(test)]

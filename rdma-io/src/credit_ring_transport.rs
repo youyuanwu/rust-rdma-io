@@ -215,6 +215,307 @@ pub struct CreditRingTransport {
     event_channel: EventChannel,
 }
 
+// ---------------------------------------------------------------------------
+// PendingCreditRing — cancellation-safe setup transaction
+// ---------------------------------------------------------------------------
+
+/// The CM connection once the handshake has completed and it has been decomposed
+/// into the pieces the steady-state transport holds. Field order = drop order:
+/// `cm_id` before `event_channel` (`rdma_destroy_id` needs the channel fd open),
+/// matching [`CreditRingTransport`].
+struct PendingCm {
+    cm_async_fd: AsyncFd<RawFd>,
+    cm_id: CmId,
+    event_channel: EventChannel,
+}
+
+/// The RDMA resource bundle a connection owns *during setup*, in verbs drop
+/// order (MW → QP → CQs → MRs → CM). Holds only *resources* (no protocol
+/// state), because the protocol state (remote ring addr/rkey/capacity) is not
+/// known until the peer token arrives — [`PendingCreditRing::commit`] assembles
+/// the full [`CreditRingTransport`] at that point.
+struct PendingCreditResources {
+    // MW (recv) — invalidated before the QP.
+    recv_mw: Option<MemoryWindow>,
+    // QP poster — destroyed before its CQs (held in the sources) and CM id.
+    qp: AsyncQp,
+    send_src: CompletionSource,
+    recv_src: CompletionSource,
+    // MRs.
+    send_mr: OwnedMemoryRegion,
+    recv_mr: OwnedMemoryRegion,
+    /// Setup-only: the 20-byte peer-token landing buffer. Dropped at `commit`
+    /// (the exchange is done); kept in the bundle during setup so a rollback
+    /// after `to_error()` can drain its flush CQE against a live MR.
+    token_recv_mr: OwnedMemoryRegion,
+    doorbell_bufs: Box<[OwnedMemoryRegion]>,
+    // CM (drop last) — populated once the handshake completes (`attach_cm`).
+    pd: Arc<ProtectionDomain>,
+    cm: Option<PendingCm>,
+}
+
+/// A credit-ring connection under construction (arm-park only). Owns every
+/// resource created after the QP so that **any** `?`/cancellation between QP
+/// creation and `commit()` rolls back through the same ownership protocol as
+/// steady-state `Drop` — closing the window where a half-built connection would
+/// drop its CQs before its QP, or destroy its QP while a still-borrowed CM id is
+/// alive.
+///
+/// Declared **after** the caller's `async_cm`/`conn_id` local so that on an early
+/// return before the CM is attached, this guard drops *first* — destroying the
+/// QP while the CM id (still owned by the caller) is alive, satisfying the verbs
+/// "destroy QP before its CM id" rule.
+struct PendingCreditRing {
+    /// The resource bundle; `take`n by `commit` (disarms rollback) or by `Drop`.
+    res: Option<PendingCreditResources>,
+    max_outstanding: usize,
+    use_mr_rkey: bool,
+    config: CreditRingConfig,
+}
+
+impl PendingCreditRing {
+    #[inline]
+    fn res_mut(&mut self) -> &mut PendingCreditResources {
+        self.res
+            .as_mut()
+            .expect("PendingCreditRing used after commit")
+    }
+
+    /// Take ownership of the established CM connection's decomposed parts (fd +
+    /// CM id + event channel). Infallible: the fallible `AsyncFd::new` is done by
+    /// the caller on a borrow *before* this call (so the CM handle stays intact —
+    /// and thus the QP's CM id stays alive — if it fails).
+    fn attach_cm(&mut self, cm_async_fd: AsyncFd<RawFd>, cm_id: CmId, event_channel: EventChannel) {
+        self.res_mut().cm = Some(PendingCm {
+            cm_async_fd,
+            cm_id,
+            event_channel,
+        });
+    }
+
+    /// Finish setup on the now-RTS QP: bind the recv Memory Window, exchange
+    /// tokens, drain the setup send completions, and post the doorbell recvs.
+    /// Returns the validated peer ring info for `commit`. Any error here rolls
+    /// back through `Drop`.
+    async fn finish(&mut self) -> crate::Result<(u64, u32, usize)> {
+        let use_mr_rkey = self.use_mr_rkey;
+        let ring_capacity = self.config.ring_capacity;
+        // One monotonic deadline for the whole post-RTS token phase (token
+        // exchange + setup-send drain), so a stalled peer/driver cannot hang
+        // setup past `token_timeout`.
+        let deadline = tokio::time::Instant::now() + self.config.token_timeout;
+        let res = self.res_mut();
+
+        // QP is RTS — bind Memory Window to scope remote write access (unless
+        // using MR-rkey fallback).
+        let (recv_mw, mw_rkey) = if use_mr_rkey {
+            (None, res.recv_mr.rkey())
+        } else {
+            let (mw, rkey) = bind_recv_mw(&res.qp, &res.pd, &res.recv_mr, ring_capacity)?;
+            (Some(mw), rkey)
+        };
+        res.recv_mw = recv_mw;
+
+        // Complete token exchange (async — waits for CQ notification).
+        let (remote_addr, remote_rkey, remote_capacity) = complete_token_exchange(
+            &res.qp,
+            &mut res.recv_src,
+            &res.pd,
+            &res.recv_mr,
+            mw_rkey,
+            &res.token_recv_mr,
+            deadline,
+            ring_capacity,
+        )
+        .await?;
+
+        // Drain the exact setup send completions (token send + MW bind).
+        let setup_wrs: &[u64] = if use_mr_rkey {
+            &[WR_ID_TOKEN_SEND]
+        } else {
+            &[WR_ID_TOKEN_SEND, WR_ID_RECV_MW_BIND]
+        };
+        drain_ring_setup_sends(&mut res.send_src, setup_wrs, deadline).await?;
+
+        // Post doorbell recv WRs (after token exchange is done).
+        for (i, mr) in res.doorbell_bufs.iter().enumerate() {
+            let sge = Sge::new(mr.addr(), 4, mr.lkey());
+            let mut wr = RecvWr::new(i as u64).sg(sge);
+            res.qp.post_recv_wr(&mut wr)?;
+        }
+
+        Ok((remote_addr, remote_rkey, remote_capacity))
+    }
+
+    /// Commit: assemble the full [`CreditRingTransport`] from the resource bundle
+    /// plus the peer ring info, and hand ownership to a steady-state transport.
+    /// Disarms the rollback `Drop`.
+    fn commit(
+        mut self,
+        remote_addr: u64,
+        remote_rkey: u32,
+        remote_capacity: usize,
+    ) -> CreditRingTransport {
+        let res = self.res.take().expect("commit called twice");
+        let PendingCreditResources {
+            recv_mw,
+            qp,
+            send_src,
+            recv_src,
+            send_mr,
+            recv_mr,
+            token_recv_mr,
+            doorbell_bufs,
+            pd,
+            cm,
+        } = res;
+        // Setup-only landing buffer: the exchange is complete.
+        drop(token_recv_mr);
+        let PendingCm {
+            cm_async_fd,
+            cm_id,
+            event_channel,
+        } = cm.expect("commit before attach_cm");
+
+        CreditRingTransport::from_parts(
+            qp,
+            send_src,
+            recv_src,
+            cm_async_fd,
+            cm_id,
+            event_channel,
+            pd,
+            send_mr,
+            recv_mr,
+            recv_mw,
+            doorbell_bufs,
+            remote_addr,
+            remote_rkey,
+            remote_capacity,
+            self.max_outstanding,
+            self.config.clone(),
+        )
+    }
+}
+
+impl Drop for PendingCreditRing {
+    fn drop(&mut self) {
+        // Committed → nothing to roll back.
+        let Some(mut res) = self.res.take() else {
+            return;
+        };
+        // Arm-park: private CQs, synchronous bounded drain (force `ERR` so the
+        // flush terminates), then drop in field order (MW → QP → CQs → MRs → CM).
+        let _ = res.qp.to_error();
+        crate::transport_common::drain_flushed(&mut res.send_src, &mut res.recv_src);
+        drop(res);
+    }
+}
+
+/// Build the QP + resource bundle and open the setup transaction, shared by
+/// `connect` and `accept`. On return the 20-byte peer-token recv WR is posted;
+/// the caller performs its role-specific CM handshake, then
+/// [`PendingCreditRing::attach_cm`] + [`finish`](PendingCreditRing::finish) +
+/// [`commit`](PendingCreditRing::commit).
+///
+/// The caller must declare its CM endpoint (`async_cm` / `conn_id`) as a local
+/// **before** the returned guard so that, on a cancellation before `attach_cm`,
+/// the guard drops first — destroying the QP while the endpoint's CM id is still
+/// alive (the QP was created against it here).
+fn prepare_pending_credit(
+    endpoint: &impl CmSetupEndpoint,
+    config: &CreditRingConfig,
+) -> crate::Result<PendingCreditRing> {
+    let ctx = endpoint
+        .verbs_context()
+        .ok_or(crate::Error::InvalidArg("no verbs context".into()))?;
+    let pd = endpoint.alloc_pd()?;
+
+    // Resolve the effective remote-access mode against the routed device: bind a
+    // Memory Window when supported, else fall back to the MR rkey (Auto), unless
+    // the mode forces one or the other.
+    let use_mr_rkey = resolve_mr_rkey(&pd, config.mw_mode)?;
+
+    let max_outstanding = effective_max_outstanding(
+        &pd,
+        config.ring_capacity,
+        config.max_message_size,
+        config.max_in_flight,
+        CREDIT_RING_SQ_HEADROOM,
+    );
+    let send_cq_depth = (max_outstanding + CREDIT_RING_SQ_HEADROOM) as i32;
+    let recv_cq_depth = (max_outstanding + 2) as i32;
+
+    let qp_attr = QpInitAttr {
+        qp_type: QpType::Rc,
+        max_send_wr: send_cq_depth as u32,
+        max_recv_wr: recv_cq_depth as u32,
+        max_send_sge: 1,
+        max_recv_sge: 1,
+        max_inline_data: config.max_inline_data.max(RING_TOKEN_SIZE as u32),
+        sq_sig_all: true,
+    };
+
+    // Build the completion sources first so they *own* the CQs, then create the
+    // QP against those CQs. Declaring the sources before the QP makes the QP drop
+    // before its CQs on a setup failure/cancellation — the verbs "destroy QP
+    // before its CQ" order.
+    let send_src = CompletionSource::arm_park(AsyncCq::create_tokio(ctx.clone(), send_cq_depth)?);
+    let recv_src = CompletionSource::arm_park(AsyncCq::create_tokio(ctx, recv_cq_depth)?);
+    let cmqp = endpoint.create_qp_with_cq(
+        &pd,
+        &qp_attr,
+        Some(send_src.arm_park_cq()),
+        Some(recv_src.arm_park_cq()),
+    )?;
+
+    // In MR-rkey fallback mode we never bind a Memory Window, so omit the
+    // MW_BIND access flag (some NICs reject it when max_mw == 0).
+    let mw_bind = if use_mr_rkey {
+        AccessFlags::empty()
+    } else {
+        AccessFlags::MW_BIND
+    };
+
+    let send_mr = pd.reg_mr_owned(vec![0u8; config.ring_capacity], AccessFlags::LOCAL_WRITE)?;
+    let recv_mr = pd.reg_mr_owned(
+        vec![0u8; config.ring_capacity],
+        AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | mw_bind,
+    )?;
+
+    let doorbell_bufs: Box<[OwnedMemoryRegion]> = (0..max_outstanding)
+        .map(|_| pd.reg_mr_owned(vec![0u8; 4], AccessFlags::LOCAL_WRITE))
+        .collect::<crate::Result<Vec<_>>>()?
+        .into_boxed_slice();
+
+    // QP poster declared *after* the sources (see above).
+    let qp = AsyncQp::new_poster(cmqp);
+
+    // Post token recv FIRST (before doorbells, before the CM handshake). This
+    // ensures the 20-byte token recv WR is consumed by the peer's token Send,
+    // not by a 4-byte doorbell WR. Arm-park has no slot registration, so posting
+    // before the guard takes ownership of the QP is fine.
+    let token_recv_mr = post_token_recv(&qp, &pd)?;
+
+    Ok(PendingCreditRing {
+        res: Some(PendingCreditResources {
+            recv_mw: None,
+            qp,
+            send_src,
+            recv_src,
+            send_mr,
+            recv_mr,
+            token_recv_mr,
+            doorbell_bufs,
+            pd,
+            cm: None,
+        }),
+        max_outstanding,
+        use_mr_rkey,
+        config: config.clone(),
+    })
+}
+
 impl CreditRingTransport {
     /// Connect to a remote RDMA endpoint (client side).
     ///
@@ -232,138 +533,28 @@ impl CreditRingTransport {
         async_cm.resolve_addr(None, addr, 2000).await?;
         async_cm.resolve_route(2000).await?;
 
-        let ctx = async_cm
-            .verbs_context()
-            .ok_or(crate::Error::InvalidArg("no verbs context".into()))?;
-        let pd = async_cm.alloc_pd()?;
+        // Build the QP + resource bundle and open the transaction. `pending` is
+        // declared *after* `async_cm` so an early return before `attach_cm` drops
+        // the QP while `async_cm`'s CM id is still live (the QP was created
+        // against it).
+        let mut pending = prepare_pending_credit(&async_cm, &config)?;
 
-        // Resolve the effective remote-access mode against the routed device:
-        // bind a Memory Window when supported, else fall back to the MR rkey
-        // (Auto), unless the mode forces one or the other.
-        let use_mr_rkey = resolve_mr_rkey(&pd, config.mw_mode)?;
-
-        let max_outstanding = effective_max_outstanding(
-            &pd,
-            config.ring_capacity,
-            config.max_message_size,
-            config.max_in_flight,
-            CREDIT_RING_SQ_HEADROOM,
-        );
-        let send_cq_depth = (max_outstanding + CREDIT_RING_SQ_HEADROOM) as i32;
-        let recv_cq_depth = (max_outstanding + 2) as i32;
-
-        let qp_attr = QpInitAttr {
-            qp_type: QpType::Rc,
-            max_send_wr: send_cq_depth as u32,
-            max_recv_wr: recv_cq_depth as u32,
-            max_send_sge: 1,
-            max_recv_sge: 1,
-            max_inline_data: config.max_inline_data.max(RING_TOKEN_SIZE as u32),
-            sq_sig_all: true,
-        };
-
-        // Build the completion sources first so they *own* the CQs, then create
-        // the QP against those CQs. Declaring the sources before the QP makes the
-        // QP drop before its CQs on a setup failure/cancellation — the verbs
-        // "destroy QP before its CQ" order.
-        let mut send_src =
-            CompletionSource::arm_park(AsyncCq::create_tokio(ctx.clone(), send_cq_depth)?);
-        let mut recv_src = CompletionSource::arm_park(AsyncCq::create_tokio(ctx, recv_cq_depth)?);
-        let cmqp = async_cm.create_qp_with_cq(
-            &pd,
-            &qp_attr,
-            Some(send_src.arm_park_cq()),
-            Some(recv_src.arm_park_cq()),
-        )?;
-
-        // In MR-rkey fallback mode we never bind a Memory Window, so omit the
-        // MW_BIND access flag (some NICs reject it when max_mw == 0).
-        let mw_bind = if use_mr_rkey {
-            AccessFlags::empty()
-        } else {
-            AccessFlags::MW_BIND
-        };
-
-        let send_mr = pd.reg_mr_owned(vec![0u8; config.ring_capacity], AccessFlags::LOCAL_WRITE)?;
-        let recv_mr = pd.reg_mr_owned(
-            vec![0u8; config.ring_capacity],
-            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | mw_bind,
-        )?;
-
-        let doorbell_bufs: Box<[OwnedMemoryRegion]> = (0..max_outstanding)
-            .map(|_| pd.reg_mr_owned(vec![0u8; 4], AccessFlags::LOCAL_WRITE))
-            .collect::<crate::Result<Vec<_>>>()?
-            .into_boxed_slice();
-
-        // QP poster declared *after* the sources (see above).
-        let qp = AsyncQp::new_poster(cmqp);
-
-        // Post token recv FIRST (before doorbells, before connect).
-        // This ensures the 20-byte token recv WR is consumed by the peer's
-        // token Send, not by a 4-byte doorbell WR.
-        let token_recv_mr = post_token_recv(&qp, &pd)?;
-
+        // Handshake: `connect` borrows `async_cm` (does not consume it), so a
+        // cancellation here drops `pending` first (QP destroyed) then `async_cm`.
         async_cm.connect(&ConnParam::default()).await?;
 
+        // Attach the established CM. The fallible `AsyncFd::new` runs on a borrow
+        // *before* `into_parts`, so `async_cm` stays intact (CM id alive) if it
+        // fails.
+        let cm_async_fd =
+            AsyncFd::new(async_cm.event_channel().fd()).map_err(crate::Error::Verbs)?;
         let (event_channel, cm_id) = async_cm.into_parts();
-        let cm_async_fd = AsyncFd::new(event_channel.fd()).map_err(crate::Error::Verbs)?;
+        pending.attach_cm(cm_async_fd, cm_id, event_channel);
 
-        // QP is now RTS — bind Memory Window to scope remote write access
-        // (unless using MR-rkey fallback).
-        let (recv_mw, mw_rkey) = if use_mr_rkey {
-            (None, recv_mr.rkey())
-        } else {
-            let (mw, rkey) = bind_recv_mw(&qp, &pd, &recv_mr, config.ring_capacity)?;
-            (Some(mw), rkey)
-        };
+        // Bind MW, exchange tokens, drain setup sends, post doorbells.
+        let (remote_addr, remote_rkey, remote_capacity) = pending.finish().await?;
 
-        // Complete token exchange (async — waits for CQ notification).
-        let deadline = tokio::time::Instant::now() + config.token_timeout;
-        let (remote_addr, remote_rkey, remote_capacity) = complete_token_exchange(
-            &qp,
-            &mut recv_src,
-            &pd,
-            &recv_mr,
-            mw_rkey,
-            &token_recv_mr,
-            deadline,
-            config.ring_capacity,
-        )
-        .await?;
-
-        // Drain the exact setup send completions (token send + MW bind).
-        let setup_wrs: &[u64] = if use_mr_rkey {
-            &[WR_ID_TOKEN_SEND]
-        } else {
-            &[WR_ID_TOKEN_SEND, WR_ID_RECV_MW_BIND]
-        };
-        drain_ring_setup_sends(&mut send_src, setup_wrs, deadline).await?;
-
-        // NOW post doorbell recv WRs (after token exchange is done).
-        for (i, mr) in doorbell_bufs.iter().enumerate() {
-            let sge = Sge::new(mr.addr(), 4, mr.lkey());
-            let mut wr = RecvWr::new(i as u64).sg(sge);
-            qp.post_recv_wr(&mut wr)?;
-        }
-
-        Ok(Self::from_parts(
-            qp,
-            send_src,
-            recv_src,
-            cm_async_fd,
-            cm_id,
-            event_channel,
-            pd,
-            send_mr,
-            recv_mr,
-            recv_mw,
-            doorbell_bufs,
-            remote_addr,
-            remote_rkey,
-            remote_capacity,
-            max_outstanding,
-            config,
-        ))
+        Ok(pending.commit(remote_addr, remote_rkey, remote_capacity))
     }
     ///
     /// Waits for an incoming connection request, allocates ring buffers and MW,
@@ -381,145 +572,33 @@ impl CreditRingTransport {
 
         let conn_id = listener.get_request().await?;
 
-        let ctx = conn_id
-            .verbs_context()
-            .ok_or(crate::Error::InvalidArg("no verbs context".into()))?;
-        let pd = conn_id.alloc_pd()?;
+        // Build the QP + resource bundle and open the transaction. `pending` is
+        // declared *after* `conn_id` so an early return before `attach_cm` drops
+        // the QP while `conn_id`'s CM id is still live (the QP was created
+        // against it).
+        let mut pending = prepare_pending_credit(&conn_id, &config)?;
 
-        // Resolve the effective remote-access mode against the routed device
-        // (see connect()).
-        let use_mr_rkey = resolve_mr_rkey(&pd, config.mw_mode)?;
-
-        let max_outstanding = effective_max_outstanding(
-            &pd,
-            config.ring_capacity,
-            config.max_message_size,
-            config.max_in_flight,
-            CREDIT_RING_SQ_HEADROOM,
-        );
-        let send_cq_depth = (max_outstanding + CREDIT_RING_SQ_HEADROOM) as i32;
-        let recv_cq_depth = (max_outstanding + 2) as i32;
-
-        let qp_attr = QpInitAttr {
-            qp_type: QpType::Rc,
-            max_send_wr: send_cq_depth as u32,
-            max_recv_wr: recv_cq_depth as u32,
-            max_send_sge: 1,
-            max_recv_sge: 1,
-            max_inline_data: config.max_inline_data.max(RING_TOKEN_SIZE as u32),
-            sq_sig_all: true,
-        };
-
-        // Sources own the CQs; the QP is created from them and declared after
-        // them (see connect()) so it drops before its CQs on a setup failure.
-        let mut send_src =
-            CompletionSource::arm_park(AsyncCq::create_tokio(ctx.clone(), send_cq_depth)?);
-        let mut recv_src = CompletionSource::arm_park(AsyncCq::create_tokio(ctx, recv_cq_depth)?);
-        let cmqp = conn_id.create_qp_with_cq(
-            &pd,
-            &qp_attr,
-            Some(send_src.arm_park_cq()),
-            Some(recv_src.arm_park_cq()),
-        )?;
-
-        // In MR-rkey fallback mode we never bind a Memory Window, so omit the
-        // MW_BIND access flag (some NICs reject it when max_mw == 0).
-        let mw_bind = if use_mr_rkey {
-            AccessFlags::empty()
-        } else {
-            AccessFlags::MW_BIND
-        };
-
-        let send_mr = pd.reg_mr_owned(vec![0u8; config.ring_capacity], AccessFlags::LOCAL_WRITE)?;
-        let recv_mr = pd.reg_mr_owned(
-            vec![0u8; config.ring_capacity],
-            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | mw_bind,
-        )?;
-
-        let doorbell_bufs: Box<[OwnedMemoryRegion]> = (0..max_outstanding)
-            .map(|_| pd.reg_mr_owned(vec![0u8; 4], AccessFlags::LOCAL_WRITE))
-            .collect::<crate::Result<Vec<_>>>()?
-            .into_boxed_slice();
-
-        // QP poster declared *after* the sources (see above).
-        let qp = AsyncQp::new_poster(cmqp);
-
-        // Post token recv FIRST — see connect() comment.
-        let token_recv_mr = post_token_recv(&qp, &pd)?;
-
-        // Phased accept so `conn_id` is never moved into a consuming future:
-        // reply (sync) → await ESTABLISHED (borrows the listener, not conn_id).
-        // `conn_id` stays a local (declared before `qp`) on the listener's
-        // channel; migrating it to a private channel is deferred to *after* the
-        // setup awaits below, so a cancellation during any of them drops the QP
-        // before conn_id's CM id — and the CM id keeps a live channel.
+        // Phased accept handshake so `conn_id` is never moved into a consuming
+        // future: send the reply (sync), await ESTABLISHED (this borrows only the
+        // `listener`, NOT `conn_id`), then migrate `conn_id` (sync). Because
+        // `conn_id` stays a local declared before `pending`, a cancellation
+        // during the await drops `pending` first — destroying the QP before
+        // `conn_id`'s CM id — closing the accept teardown-order gap.
         conn_id.accept(&ConnParam::default())?;
         listener.await_established().await?;
 
-        // QP is now RTS — bind Memory Window to scope remote write access
-        // (unless using MR-rkey fallback).
-        let (recv_mw, mw_rkey) = if use_mr_rkey {
-            (None, recv_mr.rkey())
-        } else {
-            let (mw, rkey) = bind_recv_mw(&qp, &pd, &recv_mr, config.ring_capacity)?;
-            (Some(mw), rkey)
-        };
-
-        // Complete token exchange (async).
-        let deadline = tokio::time::Instant::now() + config.token_timeout;
-        let (remote_addr, remote_rkey, remote_capacity) = complete_token_exchange(
-            &qp,
-            &mut recv_src,
-            &pd,
-            &recv_mr,
-            mw_rkey,
-            &token_recv_mr,
-            deadline,
-            config.ring_capacity,
-        )
-        .await?;
-
-        // Drain the exact setup send completions (token send + MW bind).
-        let setup_wrs: &[u64] = if use_mr_rkey {
-            &[WR_ID_TOKEN_SEND]
-        } else {
-            &[WR_ID_TOKEN_SEND, WR_ID_RECV_MW_BIND]
-        };
-        drain_ring_setup_sends(&mut send_src, setup_wrs, deadline).await?;
-
-        // Post doorbell recv WRs.
-        for (i, mr) in doorbell_bufs.iter().enumerate() {
-            let sge = Sge::new(mr.addr(), 4, mr.lkey());
-            let mut wr = RecvWr::new(i as u64).sg(sge);
-            qp.post_recv_wr(&mut wr)?;
-        }
-
-        // Setup awaits done — migrate `conn_id` onto its own event channel (sync)
-        // and build the transport. Deferred to here so `conn_id` stayed
-        // cancellation-safe on the listener's channel throughout the awaits.
         let conn_ch = EventChannel::new()?;
         conn_ch.set_nonblocking()?;
         conn_id.migrate(&conn_ch)?;
+        // Fallible `AsyncFd::new` on a borrow before consuming `conn_id`/`conn_ch`
+        // into the bundle, so both stay live (QP's CM id alive) if it fails.
         let cm_async_fd = AsyncFd::new(conn_ch.fd()).map_err(crate::Error::Verbs)?;
+        pending.attach_cm(cm_async_fd, conn_id, conn_ch);
 
-        Ok(Self::from_parts(
-            qp,
-            send_src,
-            recv_src,
-            cm_async_fd,
-            conn_id,
-            conn_ch,
-            pd,
-            send_mr,
-            recv_mr,
-            recv_mw,
-            doorbell_bufs,
-            remote_addr,
-            remote_rkey,
-            remote_capacity,
-            max_outstanding,
-            config,
-        ))
+        // Bind MW, exchange tokens, drain setup sends, post doorbells.
+        let (remote_addr, remote_rkey, remote_capacity) = pending.finish().await?;
+
+        Ok(pending.commit(remote_addr, remote_rkey, remote_capacity))
     }
 
     #[allow(clippy::too_many_arguments)]

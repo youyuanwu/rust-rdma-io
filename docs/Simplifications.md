@@ -259,7 +259,7 @@ so `read_ring::finish_setup_sends` is deleted; factor
 the exact-count/status checks. Setup-correctness sensitive → MANA reboot-clean
 `read_ring_transport_tests` (5/5) + `async_stream_tests` (credit `*_ring`).
 
-### Batch C — #11 (port credit-ring onto read-ring's setup design)
+### Batch C — #11 (port credit-ring onto read-ring's setup design) — ✅ DONE
 Move `CmSetupEndpoint` to `transport_common`; add `prepare_pending_credit` (reuse
 the transaction-guard design — setup drop-order is subtle); reduce credit
 `connect`/`accept` to thin handshake wrappers. This is effectively "the A5 dedup
