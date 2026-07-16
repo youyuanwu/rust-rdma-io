@@ -317,6 +317,7 @@ impl CreditRingTransport {
         };
 
         // Complete token exchange (async — waits for CQ notification).
+        let deadline = tokio::time::Instant::now() + config.token_timeout;
         let (remote_addr, remote_rkey, remote_capacity) = complete_token_exchange(
             &qp,
             &mut recv_src,
@@ -324,13 +325,13 @@ impl CreditRingTransport {
             &recv_mr,
             mw_rkey,
             &token_recv_mr,
-            config.token_timeout,
+            deadline,
             config.ring_capacity,
         )
         .await?;
 
-        // Drain setup completions from send CQ (token send + MW bind).
-        send_src.drain_setup()?;
+        // Drain the exact setup send completions (token send + MW bind).
+        drain_ring_setup_sends(&mut send_src, use_mr_rkey, deadline).await?;
 
         // NOW post doorbell recv WRs (after token exchange is done).
         for (i, mr) in doorbell_bufs.iter().enumerate() {
@@ -452,6 +453,7 @@ impl CreditRingTransport {
         };
 
         // Complete token exchange (async).
+        let deadline = tokio::time::Instant::now() + config.token_timeout;
         let (remote_addr, remote_rkey, remote_capacity) = complete_token_exchange(
             &qp,
             &mut recv_src,
@@ -459,13 +461,13 @@ impl CreditRingTransport {
             &recv_mr,
             mw_rkey,
             &token_recv_mr,
-            config.token_timeout,
+            deadline,
             config.ring_capacity,
         )
         .await?;
 
-        // Drain setup completions from send CQ (token send + MW bind).
-        send_src.drain_setup()?;
+        // Drain the exact setup send completions (token send + MW bind).
+        drain_ring_setup_sends(&mut send_src, use_mr_rkey, deadline).await?;
 
         // Post doorbell recv WRs.
         for (i, mr) in doorbell_bufs.iter().enumerate() {

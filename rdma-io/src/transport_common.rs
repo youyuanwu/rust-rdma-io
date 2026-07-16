@@ -6,7 +6,6 @@
 //! memory window binding, token exchange, and QP state checks.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::async_qp::AsyncQp;
 use crate::mr::{AccessFlags, OwnedMemoryRegion};
@@ -22,6 +21,9 @@ pub(crate) const WR_ID_PADDING_SENTINEL: u64 = u64::MAX - 20;
 /// Setup wr_id for the recv-ring Memory-Window bind (shared by both ring
 /// transports); matched exactly by the read-ring setup-completion drain.
 pub(crate) const WR_ID_RECV_MW_BIND: u64 = u64::MAX - 10;
+/// Setup wr_id for our token Send (shared token exchange); matched exactly by
+/// the setup-completion drain.
+pub(crate) const WR_ID_TOKEN_SEND: u64 = u64::MAX - 2;
 
 pub(crate) const RING_TOKEN_VERSION: u8 = 1;
 pub(crate) const RING_TOKEN_SIZE: usize = 20;
@@ -407,7 +409,7 @@ pub(crate) async fn complete_token_exchange(
     recv_mr: &OwnedMemoryRegion,
     mw_rkey: u32,
     token_recv_mr: &OwnedMemoryRegion,
-    _token_timeout: Duration,
+    deadline: tokio::time::Instant,
     ring_capacity: usize,
 ) -> crate::Result<(u64, u32, usize)> {
     // Send our token.
@@ -426,14 +428,19 @@ pub(crate) async fn complete_token_exchange(
         RING_TOKEN_SIZE as u32,
         token_send_mr.lkey(),
     );
-    let mut send_wr = SendWr::new(u64::MAX - 2, WrOpcode::Send)
+    let mut send_wr = SendWr::new(WR_ID_TOKEN_SEND, WrOpcode::Send)
         .flags(SendFlags::SIGNALED | SendFlags::INLINE)
         .sg(send_sge);
     qp.post_send_wr(&mut send_wr)?;
 
-    // Async wait for recv completion via CQ notification (through the seam).
+    // Async wait for recv completion via CQ notification (through the seam),
+    // bounded by the setup deadline (a peer that establishes CM but never sends
+    // its token must not hang setup forever).
     let mut wc_buf = [WorkCompletion::default(); 4];
-    let n = recv_src.acquire(&mut wc_buf).await?;
+    let n = match tokio::time::timeout_at(deadline, recv_src.acquire(&mut wc_buf)).await {
+        Ok(r) => r?,
+        Err(_) => return Err(crate::Error::Timeout("ring peer token")),
+    };
     if n > 0 && !wc_buf[0].is_success() {
         return Err(crate::Error::WorkCompletion {
             status: wc_buf[0].status_raw(),
@@ -464,6 +471,60 @@ pub(crate) async fn complete_token_exchange(
         )));
     }
     Ok((peer_token.ring_va, peer_token.mw_rkey, peer_cap as usize))
+}
+
+/// Reap the setup **send** completions of a credit/send-recv ring so the data
+/// path starts on a clean send stream: await **exactly** the known setup WR ids
+/// (the token Send, plus the recv-ring MW bind unless MR-rkey fallback) via
+/// [`CompletionSource::acquire`], under the setup `deadline`, validating each
+/// completion's status and rejecting any duplicate or unknown wr_id.
+///
+/// Replaces the previous [`CompletionSource::drain_setup`] spin, which stopped
+/// after the first empty poll once *any* completion had arrived and checked
+/// neither the expected count nor WC status/identity — so a late token/MW
+/// completion could leak into the data path and be misread as a data completion.
+pub(crate) async fn drain_ring_setup_sends(
+    send_src: &mut crate::completion_source::CompletionSource,
+    use_mr_rkey: bool,
+    deadline: tokio::time::Instant,
+) -> crate::Result<()> {
+    let expected: &[u64] = if use_mr_rkey {
+        &[WR_ID_TOKEN_SEND]
+    } else {
+        &[WR_ID_TOKEN_SEND, WR_ID_RECV_MW_BIND]
+    };
+    let mut seen = [false; 2];
+    let mut remaining = expected.len();
+    let mut wc = [WorkCompletion::default(); 8];
+
+    while remaining > 0 {
+        let n = match tokio::time::timeout_at(deadline, send_src.acquire(&mut wc)).await {
+            Ok(r) => r?,
+            Err(_) => return Err(crate::Error::Timeout("ring setup send completions")),
+        };
+        for w in &wc[..n] {
+            let wr_id = w.wr_id();
+            let Some(idx) = expected.iter().position(|&e| e == wr_id) else {
+                return Err(crate::Error::ConnectionFault(
+                    "ring setup: unexpected send completion wr_id",
+                ));
+            };
+            if seen[idx] {
+                return Err(crate::Error::ConnectionFault(
+                    "ring setup: duplicate send completion wr_id",
+                ));
+            }
+            if !w.is_success() {
+                return Err(crate::Error::WorkCompletion {
+                    status: w.status_raw(),
+                    vendor_err: w.vendor_err(),
+                });
+            }
+            seen[idx] = true;
+            remaining -= 1;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
