@@ -361,19 +361,32 @@ struct ReadRingInner {
 /// them out (`Drop` `take()`s it). See §6.2 / §10 for the reclaim protocol.
 pub struct ReadRingTransport {
     inner: Option<ReadRingInner>,
-    /// Busy-poll only: the connection's routing slot, retired by the driver on
-    /// reclaim. `None` in arm-park mode.
-    slot: Option<Arc<ConnSlot>>,
-    /// Busy-poll only: handle used to hand `inner` to the driver's reclaim queue
-    /// on `Drop`. `None` in arm-park mode (which drains inline).
-    reclaim: Option<CoreDriverHandle>,
-    /// Busy-poll only: an opaque **admission lease** the pool attaches after
-    /// setup. It travels into the reclaim bundle on `Drop` and is dropped by the
-    /// driver only after the QP is drained + retired — so the pool's admission
-    /// count (and thus the shared-CQ budget) is released at retirement, not when
-    /// the app task ends (review #2). `None` in arm-park mode / before the pool
-    /// attaches it.
-    admission: Option<Box<dyn Send + Sync>>,
+    /// Which completion mode this connection runs in, and (for busy-poll) the
+    /// driver-facing teardown handles. One explicit owner replaces the former
+    /// three independent `Option`s (`slot`/`reclaim`/`admission`), which admitted
+    /// invalid combinations and forced a wildcard `Drop` arm.
+    lifecycle: ConnectionLifecycle,
+}
+
+/// The completion mode of a [`ReadRingTransport`] (and [`PendingReadRing`]) plus,
+/// for busy-poll, everything `Drop` needs to hand the connection to its core
+/// driver. Exactly two valid states — no representable invalid combination.
+enum ConnectionLifecycle {
+    /// Per-connection CQs owned by the transport; teardown drains them inline.
+    ArmPark,
+    /// Shared-CQ busy-poll: teardown hands the resources to the core driver.
+    Busy {
+        /// Routing slot, retired by the driver on reclaim.
+        slot: Arc<ConnSlot>,
+        /// Handle used to hand `inner` to the driver's reclaim queue on `Drop`.
+        driver: CoreDriverHandle,
+        /// Opaque **admission lease** the pool attaches after setup. It travels
+        /// into the reclaim bundle on `Drop` and is dropped by the driver only
+        /// after the QP is drained + retired — so the pool's admission count
+        /// (and thus the shared-CQ budget) is released at retirement, not when
+        /// the app task ends (review #2). `None` until the pool attaches it.
+        lease: Option<Box<dyn Send + Sync>>,
+    },
 }
 
 impl ReadRingTransport {
@@ -387,9 +400,23 @@ impl ReadRingTransport {
     /// Attach an opaque **admission lease** (busy-poll pools only): a droppable
     /// the transport carries into its reclaim bundle so it is dropped only after
     /// the driver retires the connection (review #2). Called on the owning core
-    /// after setup, before the app loop.
+    /// after setup, before the app loop. Rejects a double-set and panics on a
+    /// non-busy transport (the pools only call it on busy connections).
     pub fn set_reclaim_lease(&mut self, lease: Box<dyn Send + Sync>) {
-        self.admission = Some(lease);
+        match &mut self.lifecycle {
+            ConnectionLifecycle::Busy {
+                lease: slot_lease, ..
+            } => {
+                assert!(
+                    slot_lease.is_none(),
+                    "reclaim lease already set on this ReadRingTransport"
+                );
+                *slot_lease = Some(lease);
+            }
+            ConnectionLifecycle::ArmPark => {
+                panic!("set_reclaim_lease called on an arm-park ReadRingTransport")
+            }
+        }
     }
 
     #[inline]
@@ -733,10 +760,9 @@ struct PendingResources {
 struct PendingReadRing {
     /// The resource bundle; `take`n by `commit` (disarms rollback) or by `Drop`.
     res: Option<PendingResources>,
-    /// Busy-poll routing slot (registered with the driver). `None` = arm-park.
-    slot: Option<Arc<ConnSlot>>,
-    /// Busy-poll driver handle (reclaim / unregister). `None` = arm-park.
-    reclaim: Option<CoreDriverHandle>,
+    /// Completion mode + (busy) driver teardown handles. `lease` is always `None`
+    /// during setup (the pool attaches it after `commit`).
+    lifecycle: ConnectionLifecycle,
     max_outstanding: usize,
     use_mr_rkey: bool,
     config: ReadRingConfig,
@@ -766,11 +792,23 @@ impl PendingReadRing {
         config: ReadRingConfig,
     ) -> crate::Result<Self> {
         let (send_src, recv_src, slot) = backend.into_sources(qp_num)?;
-        // Busy mode: count every WR the driver will later reap (§6.2). Must be
-        // set before the first post below.
-        if let Some(s) = &slot {
-            qp.set_accounting(s.clone());
-        }
+        // Busy mode iff `into_sources` registered a slot (which happens iff the
+        // backend was built with a driver handle). Set accounting before the
+        // first post so the driver's teardown drain counts every WR (§6.2).
+        let lifecycle = match slot {
+            Some(slot) => {
+                qp.set_accounting(slot.clone());
+                let driver = driver
+                    .expect("busy backend registered a slot but has no driver handle")
+                    .clone();
+                ConnectionLifecycle::Busy {
+                    slot,
+                    driver,
+                    lease: None,
+                }
+            }
+            None => ConnectionLifecycle::ArmPark,
+        };
         Ok(Self {
             res: Some(PendingResources {
                 offset_mw: None,
@@ -787,8 +825,7 @@ impl PendingReadRing {
                 pd,
                 cm: None,
             }),
-            slot,
-            reclaim: driver.cloned(),
+            lifecycle,
             max_outstanding,
             use_mr_rkey,
             config,
@@ -907,11 +944,10 @@ impl PendingReadRing {
     /// Disarms the rollback `Drop`.
     fn commit(mut self, peer_token: ReadRingToken) -> ReadRingTransport {
         let res = self.res.take().expect("commit called twice");
-        let slot = self.slot.take();
-        let reclaim = self.reclaim.take();
+        let lifecycle = std::mem::replace(&mut self.lifecycle, ConnectionLifecycle::ArmPark);
         // Established only after doorbells are posted (finding 3).
-        if let Some(s) = &slot {
-            s.set_state(SlotState::Established);
+        if let ConnectionLifecycle::Busy { slot, .. } = &lifecycle {
+            slot.set_state(SlotState::Established);
         }
         let PendingResources {
             offset_mw,
@@ -961,9 +997,7 @@ impl PendingReadRing {
         );
         ReadRingTransport {
             inner: Some(inner),
-            slot,
-            reclaim,
-            admission: None,
+            lifecycle,
         }
     }
 }
@@ -974,18 +1008,23 @@ impl Drop for PendingReadRing {
         let Some(mut res) = self.res.take() else {
             return;
         };
-        match (self.slot.take(), self.reclaim.take()) {
+        let lifecycle = std::mem::replace(&mut self.lifecycle, ConnectionLifecycle::ArmPark);
+        match lifecycle {
             // Busy-poll with the CM attached: hand the whole bundle (CM id
             // included) to the driver's reclaim queue, exactly like steady-state
             // `Drop`. Owner-agnostic ops only: mark `Closing`, notify the peer,
             // force the QP to `ERR` so the driver's drain terminates.
-            (Some(slot), Some(driver)) if res.cm.is_some() => {
+            ConnectionLifecycle::Busy {
+                slot,
+                driver,
+                lease,
+            } if res.cm.is_some() => {
                 slot.set_state(SlotState::Closing);
                 if let Some(cm) = &res.cm {
                     let _ = cm.cm_id.disconnect();
                 }
                 let _ = res.qp.to_error();
-                driver.reclaim(slot, Box::new(res), None);
+                driver.reclaim(slot, Box::new(res), lease);
             }
             // Busy-poll *before* the CM is attached (setup cancelled during the
             // connect handshake): the CM id is still owned by the caller's
@@ -994,14 +1033,14 @@ impl Drop for PendingReadRing {
             // unregister the slot (no reclaim barrier — nothing was exchanged) and
             // drop the bundle here, which destroys the QP while `async_cm` (this
             // guard drops before it) still holds a live CM id.
-            (Some(slot), Some(driver)) => {
+            ConnectionLifecycle::Busy { slot, driver, .. } => {
                 let _ = res.qp.to_error();
                 driver.unregister(slot.qp_num());
                 drop(res);
             }
             // Arm-park: private CQs, synchronous bounded drain (force `ERR` so the
             // flush terminates), then drop in field order (QP before its CQs).
-            _ => {
+            ConnectionLifecycle::ArmPark => {
                 let _ = res.qp.to_error();
                 let mut wc = [WorkCompletion::default(); 16];
                 for _ in 0..READ_RING_TEARDOWN_DRAIN_POLLS {
@@ -2049,7 +2088,8 @@ impl Drop for ReadRingTransport {
         let Some(mut inner) = self.inner.take() else {
             return;
         };
-        match (self.reclaim.take(), self.slot.take()) {
+        let lifecycle = std::mem::replace(&mut self.lifecycle, ConnectionLifecycle::ArmPark);
+        match lifecycle {
             // Busy-poll: non-blocking handoff to the driver's reclaim queue
             // (§6.2 / §10). Only owner-agnostic ops run here — mark the slot
             // `Closing`, optionally notify the peer, and force the QP to `ERR`
@@ -2058,17 +2098,21 @@ impl Drop for ReadRingTransport {
             // PD via field order), and retires the `qp_num`. We must NOT drain
             // here: the CQ is shared (only the driver may poll it) and this
             // `Drop` may run on a worker whose runtime is already shutting down.
-            (Some(handle), Some(slot)) => {
+            ConnectionLifecycle::Busy {
+                slot,
+                driver,
+                lease,
+            } => {
                 slot.set_state(SlotState::Closing);
                 if !inner.disconnected {
                     let _ = inner.cm_id.disconnect();
                 }
                 let _ = inner.qp.to_error();
-                handle.reclaim(slot, Box::new(inner), self.admission.take());
+                driver.reclaim(slot, Box::new(inner), lease);
             }
             // Arm-park: private CQs, synchronous bounded drain, then drop `inner`
             // (MW2 → MW1 → QP → MRs → PD via field order).
-            _ => {
+            ConnectionLifecycle::ArmPark => {
                 inner.drain_teardown();
             }
         }
