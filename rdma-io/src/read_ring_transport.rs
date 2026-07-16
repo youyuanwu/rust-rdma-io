@@ -428,23 +428,6 @@ impl ReadRingInner {
 // Token exchange helpers (32-byte ReadRingToken, different from transport_common)
 // ---------------------------------------------------------------------------
 
-/// Post a 32-byte recv WR for the peer's ReadRingToken.
-fn post_read_ring_token_recv(
-    qp: &AsyncQp,
-    pd: &Arc<ProtectionDomain>,
-) -> crate::Result<OwnedMemoryRegion> {
-    let token_recv_mr =
-        pd.reg_mr_owned(vec![0u8; READ_RING_TOKEN_SIZE], AccessFlags::LOCAL_WRITE)?;
-    let recv_sge = Sge::new(
-        token_recv_mr.addr(),
-        READ_RING_TOKEN_SIZE as u32,
-        token_recv_mr.lkey(),
-    );
-    let mut recv_wr = RecvWr::new(u64::MAX).sg(recv_sge);
-    qp.post_recv_wr(&mut recv_wr)?;
-    Ok(token_recv_mr)
-}
-
 /// Send our 32-byte token and wait for the peer's token.
 async fn complete_read_ring_token_exchange(
     qp: &AsyncQp,
@@ -648,8 +631,350 @@ async fn finish_setup_sends(
                 }
                 got += n;
             }
-            slot.set_state(SlotState::Established);
+            // NOTE: the slot is *not* marked `Established` here. The setup
+            // transaction ([`PendingReadRing`]) marks it in `commit()` only after
+            // the doorbell recvs are posted, so a doorbell-post failure can never
+            // leave an established-but-incomplete slot (review P0 #1, finding 3).
+            let _ = slot;
             Ok(())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PendingReadRing — cancellation-safe setup transaction (review P0 #1)
+// ---------------------------------------------------------------------------
+
+/// The CM connection once the handshake has completed and it has been decomposed
+/// into the pieces the steady-state transport holds. Field order = drop order:
+/// `cm_id` before `event_channel` (`rdma_destroy_id` needs the channel fd open),
+/// matching [`ReadRingInner`].
+struct PendingCm {
+    cm_async_fd: AsyncFd<RawFd>,
+    cm_id: CmId,
+    event_channel: EventChannel,
+}
+
+/// The transferable RDMA resource bundle a connection owns *during setup*, in
+/// verbs drop order (MWs → QP → CQs → MRs → CM). On busy rollback it is boxed
+/// whole and handed to the driver's reclaim queue, so it must be `Send` and its
+/// field order must destroy the QP before its CQs and its CM id.
+///
+/// It intentionally mirrors the ordering constraints of [`ReadRingInner`] but
+/// holds only *resources* (no protocol state), because the protocol state
+/// (remote ring addrs, trackers) is not known until the peer token arrives —
+/// [`PendingReadRing::commit`] assembles the full `ReadRingInner` at that point.
+struct PendingResources {
+    // MW2 (offset), MW1 (recv) — unbound before the QP.
+    offset_mw: Option<MemoryWindow>,
+    recv_mw: Option<MemoryWindow>,
+    // QP poster — destroyed before its CQs (held in the sources) and CM id.
+    qp: AsyncQp,
+    send_src: CompletionSource,
+    recv_src: CompletionSource,
+    // MRs.
+    send_mr: OwnedMemoryRegion,
+    recv_mr: OwnedMemoryRegion,
+    offset_mr: OwnedMemoryRegion,
+    read_buf: OwnedMemoryRegion,
+    /// Setup-only: the 32-byte peer-token landing buffer. Dropped at `commit`
+    /// (the exchange is done); kept in the bundle during setup so a rollback
+    /// after `to_error()` can drain its flush CQE against a live MR.
+    token_recv_mr: OwnedMemoryRegion,
+    doorbell_bufs: Box<[OwnedMemoryRegion]>,
+    // CM (drop last) — populated once the handshake completes (`attach_cm`).
+    pd: Arc<ProtectionDomain>,
+    cm: Option<PendingCm>,
+}
+
+/// A connection under construction. Owns every resource created after the QP so
+/// that **any** `?`/cancellation between slot registration and `commit()` rolls
+/// back through the same ownership protocol as steady-state `Drop` — closing the
+/// window where a half-built busy connection would leak its `ConnSlot` (and
+/// quarantine its `qp_num` forever) or an arm-park connection would drop its CQs
+/// before its QP (review P0 #1).
+///
+/// Declared **after** the caller's `async_cm` local so that on an early return
+/// before the CM is attached, this guard drops *first* — destroying the QP while
+/// the CM id (still owned by `async_cm`) is alive, satisfying the verbs
+/// "destroy QP before its CM id" rule.
+struct PendingReadRing {
+    /// The resource bundle; `take`n by `commit` (disarms rollback) or by `Drop`.
+    res: Option<PendingResources>,
+    /// Busy-poll routing slot (registered with the driver). `None` = arm-park.
+    slot: Option<Arc<ConnSlot>>,
+    /// Busy-poll driver handle (reclaim / unregister). `None` = arm-park.
+    reclaim: Option<CoreDriverHandle>,
+    max_outstanding: usize,
+    use_mr_rkey: bool,
+    config: ReadRingConfig,
+}
+
+impl PendingReadRing {
+    /// Begin the transaction: build the completion sources (registering the busy
+    /// `ConnSlot` with the driver **before any WR is posted**, §6.1) and take
+    /// ownership of the freshly-created QP and MRs. Infallible after
+    /// `into_sources` succeeds, so the register→guard handoff is atomic (no
+    /// `.await`/`?` in between): once the slot is registered, rollback is owned.
+    #[allow(clippy::too_many_arguments)]
+    fn begin(
+        backend: SetupBackend<'_>,
+        qp_num: u32,
+        mut qp: AsyncQp,
+        pd: Arc<ProtectionDomain>,
+        send_mr: OwnedMemoryRegion,
+        recv_mr: OwnedMemoryRegion,
+        offset_mr: OwnedMemoryRegion,
+        read_buf: OwnedMemoryRegion,
+        token_recv_mr: OwnedMemoryRegion,
+        doorbell_bufs: Box<[OwnedMemoryRegion]>,
+        driver: Option<&CoreDriverHandle>,
+        max_outstanding: usize,
+        use_mr_rkey: bool,
+        config: ReadRingConfig,
+    ) -> crate::Result<Self> {
+        let (send_src, recv_src, slot) = backend.into_sources(qp_num)?;
+        // Busy mode: count every WR the driver will later reap (§6.2). Must be
+        // set before the first post below.
+        if let Some(s) = &slot {
+            qp.set_accounting(s.clone());
+        }
+        Ok(Self {
+            res: Some(PendingResources {
+                offset_mw: None,
+                recv_mw: None,
+                qp,
+                send_src,
+                recv_src,
+                send_mr,
+                recv_mr,
+                offset_mr,
+                read_buf,
+                token_recv_mr,
+                doorbell_bufs,
+                pd,
+                cm: None,
+            }),
+            slot,
+            reclaim: driver.cloned(),
+            max_outstanding,
+            use_mr_rkey,
+            config,
+        })
+    }
+
+    #[inline]
+    fn res(&self) -> &PendingResources {
+        self.res
+            .as_ref()
+            .expect("PendingReadRing used after commit")
+    }
+
+    #[inline]
+    fn res_mut(&mut self) -> &mut PendingResources {
+        self.res
+            .as_mut()
+            .expect("PendingReadRing used after commit")
+    }
+
+    /// Post the 32-byte peer-token recv WR (before the CM connect, so the buffer
+    /// is ready the instant the peer sends its token). Counted for busy mode.
+    fn post_token_recv(&mut self) -> crate::Result<()> {
+        let res = self.res();
+        let sge = Sge::new(
+            res.token_recv_mr.addr(),
+            READ_RING_TOKEN_SIZE as u32,
+            res.token_recv_mr.lkey(),
+        );
+        let mut recv_wr = RecvWr::new(u64::MAX).sg(sge);
+        res.qp.post_recv_wr(&mut recv_wr)
+    }
+
+    /// Take ownership of the established CM connection. Infallible: the fallible
+    /// `AsyncFd::new` is done by the caller on a borrow *before* this call (so
+    /// `async_cm` stays intact — and thus the QP's CM id stays alive — if it
+    /// fails). After this returns, busy rollback can defer to the driver reclaim
+    /// queue because the CM id now travels inside the bundle.
+    fn attach_cm(&mut self, cm_async_fd: AsyncFd<RawFd>, async_cm: AsyncCmId) {
+        let (event_channel, cm_id) = async_cm.into_parts();
+        self.res_mut().cm = Some(PendingCm {
+            cm_async_fd,
+            cm_id,
+            event_channel,
+        });
+    }
+
+    /// Finish setup on the now-RTS QP: bind Memory Windows, exchange tokens,
+    /// drain the setup send completions, and post the doorbell recvs. Returns the
+    /// validated peer token for `commit`. Any error here rolls back through
+    /// `Drop` (the CM is attached, so busy defers to the reclaim queue).
+    async fn finish(&mut self) -> crate::Result<ReadRingToken> {
+        let use_mr_rkey = self.use_mr_rkey;
+        let ring_capacity = self.config.ring_capacity;
+        let slot = self.slot.clone();
+        let res = self.res_mut();
+
+        // QP is RTS — bind Memory Windows (unless using MR-rkey fallback).
+        let (recv_mw, mw1_rkey) = if use_mr_rkey {
+            (None, res.recv_mr.rkey())
+        } else {
+            let (mw, rkey) = bind_recv_mw(&res.qp, &res.pd, &res.recv_mr, ring_capacity)?;
+            (Some(mw), rkey)
+        };
+        let (offset_mw, mw2_rkey) = if use_mr_rkey {
+            (None, res.offset_mr.rkey())
+        } else {
+            let (mw, rkey) = bind_offset_mw(&res.qp, &res.pd, &res.offset_mr, 64)?;
+            (Some(mw), rkey)
+        };
+        res.recv_mw = recv_mw;
+        res.offset_mw = offset_mw;
+
+        let our_token = ReadRingToken {
+            version: READ_RING_TOKEN_VERSION,
+            _reserved: [0; 3],
+            ring_va: res.recv_mr.addr(),
+            ring_capacity: ring_capacity as u32,
+            ring_rkey: mw1_rkey,
+            offset_va: res.offset_mr.addr(),
+            offset_rkey: mw2_rkey,
+        };
+
+        // Token exchange (async — waits for CQ/inbox notification).
+        let peer_token = complete_read_ring_token_exchange(
+            &res.qp,
+            &mut res.recv_src,
+            &res.pd,
+            &our_token,
+            &res.token_recv_mr,
+        )
+        .await?;
+
+        // Drain setup send completions (token Send + MW binds).
+        finish_setup_sends(&mut res.send_src, &slot, use_mr_rkey).await?;
+
+        // Post doorbell recv WRs (before marking the slot `Established`).
+        for (i, mr) in res.doorbell_bufs.iter().enumerate() {
+            let sge = Sge::new(mr.addr(), 4, mr.lkey());
+            let mut wr = RecvWr::new(i as u64).sg(sge);
+            res.qp.post_recv_wr(&mut wr)?;
+        }
+
+        Ok(peer_token)
+    }
+
+    /// Commit: transition the busy slot to `Established` (now that doorbells are
+    /// posted), assemble the full [`ReadRingInner`] from the resource bundle plus
+    /// the peer token, and hand ownership to a steady-state [`ReadRingTransport`].
+    /// Disarms the rollback `Drop`.
+    fn commit(mut self, peer_token: ReadRingToken) -> ReadRingTransport {
+        let res = self.res.take().expect("commit called twice");
+        let slot = self.slot.take();
+        let reclaim = self.reclaim.take();
+        // Established only after doorbells are posted (finding 3).
+        if let Some(s) = &slot {
+            s.set_state(SlotState::Established);
+        }
+        let PendingResources {
+            offset_mw,
+            recv_mw,
+            qp,
+            send_src,
+            recv_src,
+            send_mr,
+            recv_mr,
+            offset_mr,
+            read_buf,
+            token_recv_mr,
+            doorbell_bufs,
+            pd,
+            cm,
+        } = res;
+        // Setup-only landing buffer: the exchange is complete.
+        drop(token_recv_mr);
+        let PendingCm {
+            cm_async_fd,
+            cm_id,
+            event_channel,
+        } = cm.expect("commit before attach_cm");
+
+        let inner = ReadRingInner::from_parts(
+            qp,
+            send_src,
+            recv_src,
+            cm_async_fd,
+            cm_id,
+            event_channel,
+            pd,
+            send_mr,
+            recv_mr,
+            recv_mw,
+            offset_mw,
+            offset_mr,
+            read_buf,
+            doorbell_bufs,
+            peer_token.ring_va,
+            peer_token.ring_rkey,
+            peer_token.ring_capacity as usize,
+            peer_token.offset_va,
+            peer_token.offset_rkey,
+            self.max_outstanding,
+            self.config.clone(),
+        );
+        ReadRingTransport {
+            inner: Some(inner),
+            slot,
+            reclaim,
+            admission: None,
+        }
+    }
+}
+
+impl Drop for PendingReadRing {
+    fn drop(&mut self) {
+        // Committed → nothing to roll back.
+        let Some(mut res) = self.res.take() else {
+            return;
+        };
+        match (self.slot.take(), self.reclaim.take()) {
+            // Busy-poll with the CM attached: hand the whole bundle (CM id
+            // included) to the driver's reclaim queue, exactly like steady-state
+            // `Drop`. Owner-agnostic ops only: mark `Closing`, notify the peer,
+            // force the QP to `ERR` so the driver's drain terminates.
+            (Some(slot), Some(driver)) if res.cm.is_some() => {
+                slot.set_state(SlotState::Closing);
+                if let Some(cm) = &res.cm {
+                    let _ = cm.cm_id.disconnect();
+                }
+                let _ = res.qp.to_error();
+                driver.reclaim(slot, Box::new(res), None);
+            }
+            // Busy-poll *before* the CM is attached (setup cancelled during the
+            // connect handshake): the CM id is still owned by the caller's
+            // `async_cm`, so the QP cannot be deferred to the driver (it would be
+            // destroyed later with a dangling cm_id). Retire synchronously:
+            // unregister the slot (no reclaim barrier — nothing was exchanged) and
+            // drop the bundle here, which destroys the QP while `async_cm` (this
+            // guard drops before it) still holds a live CM id.
+            (Some(slot), Some(driver)) => {
+                let _ = res.qp.to_error();
+                driver.unregister(slot.qp_num());
+                drop(res);
+            }
+            // Arm-park: private CQs, synchronous bounded drain (force `ERR` so the
+            // flush terminates), then drop in field order (QP before its CQs).
+            _ => {
+                let _ = res.qp.to_error();
+                let mut wc = [WorkCompletion::default(); 16];
+                for _ in 0..READ_RING_TEARDOWN_DRAIN_POLLS {
+                    let s = res.send_src.try_drain(&mut wc).unwrap_or(0);
+                    let r = res.recv_src.try_drain(&mut wc).unwrap_or(0);
+                    if s == 0 && r == 0 {
+                        break;
+                    }
+                }
+                drop(res);
+            }
         }
     }
 }
@@ -757,91 +1082,48 @@ impl ReadRingTransport {
             .collect::<crate::Result<Vec<_>>>()?
             .into_boxed_slice();
 
-        let mut qp = AsyncQp::new_poster(cmqp);
-        let (mut send_src, mut recv_src, conn_slot) = backend.into_sources(qp_num)?;
-        // Busy mode: count every WR the driver will later reap (§6.2). Must be
-        // set before the first post below.
-        if let Some(slot) = &conn_slot {
-            qp.set_accounting(slot.clone());
-        }
+        // 32-byte peer-token landing buffer (registered before the slot so all
+        // fallible allocation precedes slot registration).
+        let token_recv_mr =
+            pd.reg_mr_owned(vec![0u8; READ_RING_TOKEN_SIZE], AccessFlags::LOCAL_WRITE)?;
 
-        // Post 32-byte token recv FIRST (before doorbells, before connect).
-        let token_recv_mr = post_read_ring_token_recv(&qp, &pd)?;
+        let qp = AsyncQp::new_poster(cmqp);
 
-        async_cm.connect(&ConnParam::default()).await?;
-
-        let (event_channel, cm_id) = async_cm.into_parts();
-        let cm_async_fd = AsyncFd::new(event_channel.fd()).map_err(crate::Error::Verbs)?;
-
-        // QP is now RTS — bind Memory Windows (unless using MR-rkey fallback).
-        let (recv_mw, mw1_rkey) = if use_mr_rkey {
-            (None, recv_mr.rkey())
-        } else {
-            let (mw, rkey) = bind_recv_mw(&qp, &pd, &recv_mr, config.ring_capacity)?;
-            (Some(mw), rkey)
-        };
-        let (offset_mw, mw2_rkey) = if use_mr_rkey {
-            (None, offset_mr.rkey())
-        } else {
-            let (mw, rkey) = bind_offset_mw(&qp, &pd, &offset_mr, 64)?;
-            (Some(mw), rkey)
-        };
-
-        // Build our token.
-        let our_token = ReadRingToken {
-            version: READ_RING_TOKEN_VERSION,
-            _reserved: [0; 3],
-            ring_va: recv_mr.addr(),
-            ring_capacity: config.ring_capacity as u32,
-            ring_rkey: mw1_rkey,
-            offset_va: offset_mr.addr(),
-            offset_rkey: mw2_rkey,
-        };
-
-        // Complete token exchange (async — waits for CQ notification).
-        let peer_token =
-            complete_read_ring_token_exchange(&qp, &mut recv_src, &pd, &our_token, &token_recv_mr)
-                .await?;
-
-        // Drain setup completions from the send stream (token send + MW binds).
-        finish_setup_sends(&mut send_src, &conn_slot, use_mr_rkey).await?;
-
-        // Post doorbell recv WRs.
-        for (i, mr) in doorbell_bufs.iter().enumerate() {
-            let sge = Sge::new(mr.addr(), 4, mr.lkey());
-            let mut wr = RecvWr::new(i as u64).sg(sge);
-            qp.post_recv_wr(&mut wr)?;
-        }
-
-        let inner = ReadRingInner::from_parts(
+        // Open the setup transaction: registers the busy slot and takes ownership
+        // of the QP + MRs. From here, any `?`/cancellation rolls back through
+        // `PendingReadRing::drop`. Declared *after* `async_cm` so an early return
+        // before `attach_cm` drops the QP while `async_cm`'s CM id is still live.
+        let mut pending = PendingReadRing::begin(
+            backend,
+            qp_num,
             qp,
-            send_src,
-            recv_src,
-            cm_async_fd,
-            cm_id,
-            event_channel,
             pd,
             send_mr,
             recv_mr,
-            recv_mw,
-            offset_mw,
             offset_mr,
             read_buf,
+            token_recv_mr,
             doorbell_bufs,
-            peer_token.ring_va,
-            peer_token.ring_rkey,
-            peer_token.ring_capacity as usize,
-            peer_token.offset_va,
-            peer_token.offset_rkey,
+            driver,
             max_outstanding,
+            use_mr_rkey,
             config,
-        );
-        Ok(ReadRingTransport {
-            inner: Some(inner),
-            slot: conn_slot,
-            reclaim: driver.cloned(),
-            admission: None,
-        })
+        )?;
+
+        // Post the token recv before the connect handshake, then connect.
+        pending.post_token_recv()?;
+        async_cm.connect(&ConnParam::default()).await?;
+
+        // Attach the established CM (fallible `AsyncFd::new` on a borrow first, so
+        // `async_cm` stays intact — and the QP's CM id alive — if it fails).
+        let cm_async_fd =
+            AsyncFd::new(async_cm.event_channel().fd()).map_err(crate::Error::Verbs)?;
+        pending.attach_cm(cm_async_fd, async_cm);
+
+        // Bind MWs, exchange tokens, drain setup sends, post doorbells.
+        let peer_token = pending.finish().await?;
+
+        Ok(pending.commit(peer_token))
     }
 
     /// Accept an incoming connection (server side), arm-park mode.
@@ -935,90 +1217,55 @@ impl ReadRingTransport {
             .collect::<crate::Result<Vec<_>>>()?
             .into_boxed_slice();
 
-        let mut qp = AsyncQp::new_poster(cmqp);
-        let (mut send_src, mut recv_src, conn_slot) = backend.into_sources(qp_num)?;
-        // Busy mode: count every WR the driver will later reap (§6.2). Must be
-        // set before the first post below.
-        if let Some(slot) = &conn_slot {
-            qp.set_accounting(slot.clone());
-        }
+        // 32-byte peer-token landing buffer (registered before the slot so all
+        // fallible allocation precedes slot registration).
+        let token_recv_mr =
+            pd.reg_mr_owned(vec![0u8; READ_RING_TOKEN_SIZE], AccessFlags::LOCAL_WRITE)?;
 
-        // Post 32-byte token recv FIRST.
-        let token_recv_mr = post_read_ring_token_recv(&qp, &pd)?;
+        let qp = AsyncQp::new_poster(cmqp);
 
+        // Open the setup transaction: registers the busy slot and takes ownership
+        // of the QP + MRs. Any `?`/cancellation past this point rolls back through
+        // `PendingReadRing::drop`.
+        //
+        // NOTE (review P0 #1 residual, accept path): `complete_accept` below
+        // *consumes* `conn_id`, so a cancellation during that await can drop the
+        // CM id before this guard destroys the QP. The busy slot leak / arm-park
+        // CQ-order / Established-ordering are all fixed here; the pre-attach CM
+        // destroy-order for accept is no worse than before and is addressed when
+        // the CM handshake ownership is restructured (A5).
+        let mut pending = PendingReadRing::begin(
+            backend,
+            qp_num,
+            qp,
+            pd,
+            send_mr,
+            recv_mr,
+            offset_mr,
+            read_buf,
+            token_recv_mr,
+            doorbell_bufs,
+            driver,
+            max_outstanding,
+            use_mr_rkey,
+            config,
+        )?;
+
+        // Post the token recv, then complete the accept handshake.
+        pending.post_token_recv()?;
         let async_cm = listener
             .complete_accept(conn_id, &ConnParam::default())
             .await?;
 
-        let (event_channel, cm_id) = async_cm.into_parts();
-        let cm_async_fd = AsyncFd::new(event_channel.fd()).map_err(crate::Error::Verbs)?;
+        // Attach the established CM (fallible `AsyncFd::new` on a borrow first).
+        let cm_async_fd =
+            AsyncFd::new(async_cm.event_channel().fd()).map_err(crate::Error::Verbs)?;
+        pending.attach_cm(cm_async_fd, async_cm);
 
-        // QP is now RTS — bind Memory Windows (unless using MR-rkey fallback).
-        let (recv_mw, mw1_rkey) = if use_mr_rkey {
-            (None, recv_mr.rkey())
-        } else {
-            let (mw, rkey) = bind_recv_mw(&qp, &pd, &recv_mr, config.ring_capacity)?;
-            (Some(mw), rkey)
-        };
-        let (offset_mw, mw2_rkey) = if use_mr_rkey {
-            (None, offset_mr.rkey())
-        } else {
-            let (mw, rkey) = bind_offset_mw(&qp, &pd, &offset_mr, 64)?;
-            (Some(mw), rkey)
-        };
+        // Bind MWs, exchange tokens, drain setup sends, post doorbells.
+        let peer_token = pending.finish().await?;
 
-        let our_token = ReadRingToken {
-            version: READ_RING_TOKEN_VERSION,
-            _reserved: [0; 3],
-            ring_va: recv_mr.addr(),
-            ring_capacity: config.ring_capacity as u32,
-            ring_rkey: mw1_rkey,
-            offset_va: offset_mr.addr(),
-            offset_rkey: mw2_rkey,
-        };
-
-        let peer_token =
-            complete_read_ring_token_exchange(&qp, &mut recv_src, &pd, &our_token, &token_recv_mr)
-                .await?;
-
-        // Drain setup completions from the send stream (token send + MW binds).
-        finish_setup_sends(&mut send_src, &conn_slot, use_mr_rkey).await?;
-
-        for (i, mr) in doorbell_bufs.iter().enumerate() {
-            let sge = Sge::new(mr.addr(), 4, mr.lkey());
-            let mut wr = RecvWr::new(i as u64).sg(sge);
-            qp.post_recv_wr(&mut wr)?;
-        }
-
-        let inner = ReadRingInner::from_parts(
-            qp,
-            send_src,
-            recv_src,
-            cm_async_fd,
-            cm_id,
-            event_channel,
-            pd,
-            send_mr,
-            recv_mr,
-            recv_mw,
-            offset_mw,
-            offset_mr,
-            read_buf,
-            doorbell_bufs,
-            peer_token.ring_va,
-            peer_token.ring_rkey,
-            peer_token.ring_capacity as usize,
-            peer_token.offset_va,
-            peer_token.offset_rkey,
-            max_outstanding,
-            config,
-        );
-        Ok(ReadRingTransport {
-            inner: Some(inner),
-            slot: conn_slot,
-            reclaim: driver.cloned(),
-            admission: None,
-        })
+        Ok(pending.commit(peer_token))
     }
 }
 
@@ -1735,6 +1982,26 @@ impl ReadRingInner {
                     Err(_) => recv_expected = 0,
                 }
             }
+        }
+
+        // If the budget is exhausted with completions still expected, the drain
+        // under-reaped: `to_error()` should have flushed every WR locally within
+        // a handful of polls, so a nonzero remainder means the flush never
+        // materialized (e.g. `to_error()` silently failed). Correctness still
+        // holds — the `ibv_destroy_qp` in the subsequent field drop is the
+        // backstop — but the deregistering MRs may still be referenced by a
+        // not-yet-destroyed QP, producing noisy verbs warnings. Surface it so a
+        // real occurrence is diagnosable rather than silent. (A clean CQ-gone
+        // exit zeroes the counters via the `Err(_)` arms, so this only fires on a
+        // genuine budget exhaustion.)
+        if send_expected > 0 || recv_expected > 0 {
+            tracing::warn!(
+                send_unreaped = send_expected,
+                recv_unreaped = recv_expected,
+                budget = READ_RING_TEARDOWN_DRAIN_POLLS,
+                "read-ring teardown drain exhausted its poll budget with completions \
+                 still outstanding; QP destroy will backstop cleanup"
+            );
         }
     }
 }

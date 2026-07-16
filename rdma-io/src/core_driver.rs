@@ -383,6 +383,25 @@ impl CoreDriverHandle {
             });
     }
 
+    /// Synchronously drop a slot from the routing map **without** the reclaim
+    /// drain barrier. Used only by setup rollback before a connection has
+    /// exchanged any data, when the resources are torn down synchronously by the
+    /// caller rather than handed to the reclaim queue (e.g. a `connect().await`
+    /// cancelled before the CM id is owned by the transferable bundle, so the QP
+    /// cannot be deferred to the driver — see the read-ring setup transaction).
+    ///
+    /// The caller owns the QP/MRs and destroys them itself; any late flush CQE
+    /// for this now-unregistered `qp_num` is routed to the unknown-qp counter
+    /// (benign). Unlike [`reclaim`](Self::reclaim), the `qp_num` becomes reusable
+    /// immediately — there is no quarantine, because setup rollback happens
+    /// before the connection could have wedged the QP.
+    pub fn unregister(&self, qp_num: u32) {
+        self.slots
+            .lock()
+            .expect("CoreDriver slot map poisoned")
+            .remove(&qp_num);
+    }
+
     /// Count of completions routed to an unknown `qp_num` (§4.2). Zero in a
     /// correct run; nonzero signals a retirement-barrier breach.
     pub fn unknown_qp_count(&self) -> u64 {
