@@ -258,9 +258,6 @@ impl CreditRingTransport {
         let send_cq_depth = (max_outstanding + CREDIT_RING_SQ_HEADROOM) as i32;
         let recv_cq_depth = (max_outstanding + 2) as i32;
 
-        let send_cq = AsyncCq::create_tokio(ctx.clone(), send_cq_depth)?;
-        let recv_cq = AsyncCq::create_tokio(ctx, recv_cq_depth)?;
-
         let qp_attr = QpInitAttr {
             qp_type: QpType::Rc,
             max_send_wr: send_cq_depth as u32,
@@ -271,8 +268,19 @@ impl CreditRingTransport {
             sq_sig_all: true,
         };
 
-        let cmqp =
-            async_cm.create_qp_with_cq(&pd, &qp_attr, Some(send_cq.cq()), Some(recv_cq.cq()))?;
+        // Build the completion sources first so they *own* the CQs, then create
+        // the QP against those CQs. Declaring the sources before the QP makes the
+        // QP drop before its CQs on a setup failure/cancellation — the verbs
+        // "destroy QP before its CQ" order.
+        let mut send_src =
+            CompletionSource::arm_park(AsyncCq::create_tokio(ctx.clone(), send_cq_depth)?);
+        let mut recv_src = CompletionSource::arm_park(AsyncCq::create_tokio(ctx, recv_cq_depth)?);
+        let cmqp = async_cm.create_qp_with_cq(
+            &pd,
+            &qp_attr,
+            Some(send_src.arm_park_cq()),
+            Some(recv_src.arm_park_cq()),
+        )?;
 
         // In MR-rkey fallback mode we never bind a Memory Window, so omit the
         // MW_BIND access flag (some NICs reject it when max_mw == 0).
@@ -293,9 +301,8 @@ impl CreditRingTransport {
             .collect::<crate::Result<Vec<_>>>()?
             .into_boxed_slice();
 
+        // QP poster declared *after* the sources (see above).
         let qp = AsyncQp::new_poster(cmqp);
-        let mut send_src = CompletionSource::arm_park(send_cq);
-        let mut recv_src = CompletionSource::arm_park(recv_cq);
 
         // Post token recv FIRST (before doorbells, before connect).
         // This ensures the 20-byte token recv WR is consumed by the peer's
@@ -394,9 +401,6 @@ impl CreditRingTransport {
         let send_cq_depth = (max_outstanding + CREDIT_RING_SQ_HEADROOM) as i32;
         let recv_cq_depth = (max_outstanding + 2) as i32;
 
-        let send_cq = AsyncCq::create_tokio(ctx.clone(), send_cq_depth)?;
-        let recv_cq = AsyncCq::create_tokio(ctx, recv_cq_depth)?;
-
         let qp_attr = QpInitAttr {
             qp_type: QpType::Rc,
             max_send_wr: send_cq_depth as u32,
@@ -407,8 +411,17 @@ impl CreditRingTransport {
             sq_sig_all: true,
         };
 
-        let cmqp =
-            conn_id.create_qp_with_cq(&pd, &qp_attr, Some(send_cq.cq()), Some(recv_cq.cq()))?;
+        // Sources own the CQs; the QP is created from them and declared after
+        // them (see connect()) so it drops before its CQs on a setup failure.
+        let mut send_src =
+            CompletionSource::arm_park(AsyncCq::create_tokio(ctx.clone(), send_cq_depth)?);
+        let mut recv_src = CompletionSource::arm_park(AsyncCq::create_tokio(ctx, recv_cq_depth)?);
+        let cmqp = conn_id.create_qp_with_cq(
+            &pd,
+            &qp_attr,
+            Some(send_src.arm_park_cq()),
+            Some(recv_src.arm_park_cq()),
+        )?;
 
         // In MR-rkey fallback mode we never bind a Memory Window, so omit the
         // MW_BIND access flag (some NICs reject it when max_mw == 0).
@@ -429,9 +442,8 @@ impl CreditRingTransport {
             .collect::<crate::Result<Vec<_>>>()?
             .into_boxed_slice();
 
+        // QP poster declared *after* the sources (see above).
         let qp = AsyncQp::new_poster(cmqp);
-        let mut send_src = CompletionSource::arm_park(send_cq);
-        let mut recv_src = CompletionSource::arm_park(recv_cq);
 
         // Post token recv FIRST — see connect() comment.
         let token_recv_mr = post_token_recv(&qp, &pd)?;

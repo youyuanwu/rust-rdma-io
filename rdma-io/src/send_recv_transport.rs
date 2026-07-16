@@ -142,17 +142,24 @@ impl SendRecvTransport {
 
         let send_cq_depth = config.num_send_bufs as i32 + 1;
         let recv_cq_depth = config.num_recv_bufs as i32 + 1;
-        let send_cq = AsyncCq::create_tokio(ctx.clone(), send_cq_depth)?;
-        let recv_cq = AsyncCq::create_tokio(ctx, recv_cq_depth)?;
 
         let qp_attr = make_qp_attr(&config);
-        let cmqp =
-            async_cm.create_qp_with_cq(&pd, &qp_attr, Some(send_cq.cq()), Some(recv_cq.cq()))?;
+        // Sources own the CQs; the QP is created from them and declared after
+        // them so it drops before its CQs on a setup failure (the verbs "destroy
+        // QP before its CQ" rule).
+        let send_src =
+            CompletionSource::arm_park(AsyncCq::create_tokio(ctx.clone(), send_cq_depth)?);
+        let recv_src = CompletionSource::arm_park(AsyncCq::create_tokio(ctx, recv_cq_depth)?);
+        let cmqp = async_cm.create_qp_with_cq(
+            &pd,
+            &qp_attr,
+            Some(send_src.arm_park_cq()),
+            Some(recv_src.arm_park_cq()),
+        )?;
 
         let (send_bufs, recv_bufs) = alloc_buffers(&pd, &config)?;
+        // QP poster declared *after* the sources (see above).
         let qp = AsyncQp::new_poster(cmqp);
-        let send_src = CompletionSource::arm_park(send_cq);
-        let recv_src = CompletionSource::arm_park(recv_cq);
 
         for (i, mr) in recv_bufs.iter().enumerate() {
             qp.post_recv_buffer(mr, i as u64)?;
@@ -199,17 +206,23 @@ impl SendRecvTransport {
 
         let send_cq_depth = config.num_send_bufs as i32 + 1;
         let recv_cq_depth = config.num_recv_bufs as i32 + 1;
-        let send_cq = AsyncCq::create_tokio(ctx.clone(), send_cq_depth)?;
-        let recv_cq = AsyncCq::create_tokio(ctx, recv_cq_depth)?;
 
         let qp_attr = make_qp_attr(&config);
-        let cmqp =
-            conn_id.create_qp_with_cq(&pd, &qp_attr, Some(send_cq.cq()), Some(recv_cq.cq()))?;
+        // Sources own the CQs; the QP is created from them and declared after
+        // them so it drops before its CQs on a setup failure (verbs order).
+        let send_src =
+            CompletionSource::arm_park(AsyncCq::create_tokio(ctx.clone(), send_cq_depth)?);
+        let recv_src = CompletionSource::arm_park(AsyncCq::create_tokio(ctx, recv_cq_depth)?);
+        let cmqp = conn_id.create_qp_with_cq(
+            &pd,
+            &qp_attr,
+            Some(send_src.arm_park_cq()),
+            Some(recv_src.arm_park_cq()),
+        )?;
 
         let (send_bufs, recv_bufs) = alloc_buffers(&pd, &config)?;
+        // QP poster declared *after* the sources (see above).
         let qp = AsyncQp::new_poster(cmqp);
-        let send_src = CompletionSource::arm_park(send_cq);
-        let recv_src = CompletionSource::arm_park(recv_cq);
 
         for (i, mr) in recv_bufs.iter().enumerate() {
             qp.post_recv_buffer(mr, i as u64)?;

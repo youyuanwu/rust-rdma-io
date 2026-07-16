@@ -84,6 +84,18 @@ impl CompletionSource {
         Self::Driver(DriverSource { slot, dir })
     }
 
+    /// The underlying [`CompletionQueue`] of an arm-park source, for creating the
+    /// QP against it *after* the source owns the CQ — so setup can declare the
+    /// sources before the QP and thus drop the QP before its CQs on a setup
+    /// failure (the verbs "destroy QP before its CQ" order). Panics on a
+    /// driver-fed source (its CQ is the driver's shared CQ, not owned here).
+    pub(crate) fn arm_park_cq(&self) -> &Arc<crate::cq::CompletionQueue> {
+        match self {
+            Self::ArmPark(s) => s.cq.cq(),
+            Self::Driver(_) => panic!("arm_park_cq() called on a driver-fed CompletionSource"),
+        }
+    }
+
     /// `Poll`-based acquire for the data path: returns `Ready(Ok(n))` with at
     /// least one completion, or registers the task waker and returns `Pending`.
     ///
