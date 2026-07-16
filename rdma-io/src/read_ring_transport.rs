@@ -75,6 +75,13 @@ const SEND_COPY_MAX_WRS: usize = 3;
 /// Sentinel wr_id for RDMA Read of offset buffer — not a data WR.
 const WR_ID_READ_SENTINEL: u64 = u64::MAX - 30;
 
+/// Setup wr_id for our token Send; matched exactly by the setup-completion drain.
+const WR_ID_TOKEN_SEND: u64 = u64::MAX - 2;
+/// Setup wr_id for the offset-buffer Memory-Window bind (MW2); matched exactly by
+/// the setup-completion drain. (The recv-ring MW bind uses
+/// [`crate::transport_common::WR_ID_RECV_MW_BIND`].)
+const WR_ID_OFFSET_MW_BIND: u64 = u64::MAX - 11;
+
 /// Bounded poll budget for the teardown completion drain. Moving the QP to
 /// ERROR flushes outstanding WRs *locally* (no network round-trip), so their
 /// flush completions land within a few `ibv_poll_cq` calls; this cap only
@@ -446,7 +453,7 @@ async fn complete_read_ring_token_exchange(
         READ_RING_TOKEN_SIZE as u32,
         token_send_mr.lkey(),
     );
-    let mut send_wr = SendWr::new(u64::MAX - 2, WrOpcode::Send)
+    let mut send_wr = SendWr::new(WR_ID_TOKEN_SEND, WrOpcode::Send)
         .flags(SendFlags::SIGNALED | SendFlags::INLINE)
         .sg(send_sge);
     qp.post_send_wr(&mut send_wr)?;
@@ -500,7 +507,7 @@ fn bind_offset_mw(
     let mw = MemoryWindow::alloc(pd, crate::mw::MwType::Type2)?;
     let mw_rkey = mw.rkey();
 
-    let mut bind_wr = SendWr::new(u64::MAX - 11, WrOpcode::BindMw)
+    let mut bind_wr = SendWr::new(WR_ID_OFFSET_MW_BIND, WrOpcode::BindMw)
         .flags(SendFlags::SIGNALED)
         .bind_mw(
             mw.as_raw(),
@@ -604,54 +611,66 @@ impl<'a> SetupBackend<'a> {
     }
 }
 
-/// Reap the setup **send** completions (token Send + MW binds if any) so the
-/// data path starts on a clean send stream.
+/// Reap the setup **send** completions so the data path starts on a clean send
+/// stream: await **exactly** the known setup WR ids (token Send, plus the two MW
+/// binds unless MR-rkey fallback), validating each completion's status and
+/// rejecting any duplicate or unknown wr_id.
 ///
-/// - **Arm-park:** the bounded spin drain over the per-connection CQ (unchanged).
-/// - **Busy:** await exactly the expected number of setup send completions from
-///   the driver-fed inbox (the driver routes them), then mark the slot
-///   `Established`. The count is deterministic: 1 token Send + 2 MW binds
-///   (unless MR-rkey fallback, where no MW is bound).
+/// Both modes use the same [`CompletionSource::acquire`] seam under the shared
+/// setup `deadline` — arm-park polls its private CQ, busy reads the driver-fed
+/// inbox — so setup correctness (exact count + status + identity) is identical
+/// regardless of how completions are discovered. This replaces the previous
+/// arm-park `drain_setup` spin, which stopped after the first empty poll and
+/// checked neither the expected count nor WC status/identity, letting a late
+/// token/MW completion leak into the data path (review P1).
 async fn finish_setup_sends(
     send_src: &mut CompletionSource,
-    conn_slot: &Option<Arc<ConnSlot>>,
     use_mr_rkey: bool,
     deadline: tokio::time::Instant,
 ) -> crate::Result<()> {
-    match conn_slot {
-        None => {
-            send_src.drain_setup()?;
-            Ok(())
-        }
-        Some(slot) => {
-            let expected = 1 + if use_mr_rkey { 0 } else { 2 };
-            let mut got = 0;
-            let mut wc = [WorkCompletion::default(); 8];
-            while got < expected {
-                let n = match tokio::time::timeout_at(deadline, send_src.acquire(&mut wc)).await {
-                    Ok(r) => r?,
-                    Err(_) => {
-                        return Err(crate::Error::Timeout("read-ring setup send completions"));
-                    }
-                };
-                for w in &wc[..n] {
-                    if !w.is_success() {
-                        return Err(crate::Error::WorkCompletion {
-                            status: w.status_raw(),
-                            vendor_err: w.vendor_err(),
-                        });
-                    }
-                }
-                got += n;
+    // The exact setup send WRs, in the order posted. MR-rkey fallback binds no
+    // Memory Window, so only the token Send is expected.
+    let expected: &[u64] = if use_mr_rkey {
+        &[WR_ID_TOKEN_SEND]
+    } else {
+        &[
+            WR_ID_TOKEN_SEND,
+            crate::transport_common::WR_ID_RECV_MW_BIND,
+            WR_ID_OFFSET_MW_BIND,
+        ]
+    };
+    let mut seen = [false; 3];
+    let mut remaining = expected.len();
+    let mut wc = [WorkCompletion::default(); 8];
+
+    while remaining > 0 {
+        let n = match tokio::time::timeout_at(deadline, send_src.acquire(&mut wc)).await {
+            Ok(r) => r?,
+            Err(_) => return Err(crate::Error::Timeout("read-ring setup send completions")),
+        };
+        for w in &wc[..n] {
+            let wr_id = w.wr_id();
+            let Some(idx) = expected.iter().position(|&e| e == wr_id) else {
+                return Err(crate::Error::ConnectionFault(
+                    "read-ring setup: unexpected send completion wr_id",
+                ));
+            };
+            if seen[idx] {
+                return Err(crate::Error::ConnectionFault(
+                    "read-ring setup: duplicate send completion wr_id",
+                ));
             }
-            // NOTE: the slot is *not* marked `Established` here. The setup
-            // transaction ([`PendingReadRing`]) marks it in `commit()` only after
-            // the doorbell recvs are posted, so a doorbell-post failure can never
-            // leave an established-but-incomplete slot (review P0 #1, finding 3).
-            let _ = slot;
-            Ok(())
+            if !w.is_success() {
+                return Err(crate::Error::WorkCompletion {
+                    status: w.status_raw(),
+                    vendor_err: w.vendor_err(),
+                });
+            }
+            seen[idx] = true;
+            remaining -= 1;
         }
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -830,7 +849,6 @@ impl PendingReadRing {
         // flows into the same `PendingReadRing::drop` rollback as any other
         // setup error.
         let deadline = tokio::time::Instant::now() + self.config.token_timeout;
-        let slot = self.slot.clone();
         let res = self.res_mut();
 
         // QP is RTS — bind Memory Windows (unless using MR-rkey fallback).
@@ -871,7 +889,7 @@ impl PendingReadRing {
         .await?;
 
         // Drain setup send completions (token Send + MW binds).
-        finish_setup_sends(&mut res.send_src, &slot, use_mr_rkey, deadline).await?;
+        finish_setup_sends(&mut res.send_src, use_mr_rkey, deadline).await?;
 
         // Post doorbell recv WRs (before marking the slot `Established`).
         for (i, mr) in res.doorbell_bufs.iter().enumerate() {

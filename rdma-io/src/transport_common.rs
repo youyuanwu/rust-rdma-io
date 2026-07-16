@@ -19,6 +19,9 @@ use crate::wr::{RecvWr, SendFlags, SendWr, Sge, WrOpcode};
 pub(crate) const WR_ID_CREDIT_FLAG: u64 = 1 << 63;
 /// Sentinel wr_id for padding WRs — no send_ring data to free on completion.
 pub(crate) const WR_ID_PADDING_SENTINEL: u64 = u64::MAX - 20;
+/// Setup wr_id for the recv-ring Memory-Window bind (shared by both ring
+/// transports); matched exactly by the read-ring setup-completion drain.
+pub(crate) const WR_ID_RECV_MW_BIND: u64 = u64::MAX - 10;
 
 pub(crate) const RING_TOKEN_VERSION: u8 = 1;
 pub(crate) const RING_TOKEN_SIZE: usize = 20;
@@ -360,7 +363,7 @@ pub(crate) fn bind_recv_mw(
     let mw_rkey = mw.rkey();
 
     // Bind MW to the recv ring MR region via IBV_WR_BIND_MW send WR.
-    let mut bind_wr = SendWr::new(u64::MAX - 10, WrOpcode::BindMw)
+    let mut bind_wr = SendWr::new(WR_ID_RECV_MW_BIND, WrOpcode::BindMw)
         .flags(SendFlags::SIGNALED)
         .bind_mw(
             mw.as_raw(),
