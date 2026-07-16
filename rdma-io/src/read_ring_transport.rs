@@ -464,31 +464,14 @@ async fn complete_read_ring_token_exchange(
     token_recv_mr: &OwnedMemoryRegion,
     deadline: tokio::time::Instant,
 ) -> crate::Result<ReadRingToken> {
-    let token_bytes = our_token.to_bytes();
-    let token_send_mr = pd.reg_mr_owned(token_bytes.to_vec(), AccessFlags::LOCAL_WRITE)?;
-    let send_sge = Sge::new(
-        token_send_mr.addr(),
-        READ_RING_TOKEN_SIZE as u32,
-        token_send_mr.lkey(),
-    );
-    let mut send_wr = SendWr::new(WR_ID_TOKEN_SEND, WrOpcode::Send)
-        .flags(SendFlags::SIGNALED | SendFlags::INLINE)
-        .sg(send_sge);
-    qp.post_send_wr(&mut send_wr)?;
-
-    // Async wait for recv completion via CQ notification (through the seam),
-    // bounded by the setup deadline.
-    let mut wc_buf = [WorkCompletion::default(); 4];
-    let n = match tokio::time::timeout_at(deadline, recv_src.acquire(&mut wc_buf)).await {
-        Ok(r) => r?,
-        Err(_) => return Err(crate::Error::Timeout("read-ring peer token")),
-    };
-    if n > 0 && !wc_buf[0].is_success() {
-        return Err(crate::Error::WorkCompletion {
-            status: wc_buf[0].status_raw(),
-            vendor_err: wc_buf[0].vendor_err(),
-        });
-    }
+    crate::transport_common::exchange_setup_token(
+        qp,
+        recv_src,
+        pd,
+        &our_token.to_bytes(),
+        deadline,
+    )
+    .await?;
 
     let recv_buf: &[u8; READ_RING_TOKEN_SIZE] = token_recv_mr
         .as_slice()
@@ -627,68 +610,6 @@ impl<'a> SetupBackend<'a> {
             }
         }
     }
-}
-
-/// Reap the setup **send** completions so the data path starts on a clean send
-/// stream: await **exactly** the known setup WR ids (token Send, plus the two MW
-/// binds unless MR-rkey fallback), validating each completion's status and
-/// rejecting any duplicate or unknown wr_id.
-///
-/// Both modes use the same [`CompletionSource::acquire`] seam under the shared
-/// setup `deadline` — arm-park polls its private CQ, busy reads the driver-fed
-/// inbox — so setup correctness (exact count + status + identity) is identical
-/// regardless of how completions are discovered. This replaces the previous
-/// arm-park `drain_setup` spin, which stopped after the first empty poll and
-/// checked neither the expected count nor WC status/identity, letting a late
-/// token/MW completion leak into the data path (review P1).
-async fn finish_setup_sends(
-    send_src: &mut CompletionSource,
-    use_mr_rkey: bool,
-    deadline: tokio::time::Instant,
-) -> crate::Result<()> {
-    // The exact setup send WRs, in the order posted. MR-rkey fallback binds no
-    // Memory Window, so only the token Send is expected.
-    let expected: &[u64] = if use_mr_rkey {
-        &[WR_ID_TOKEN_SEND]
-    } else {
-        &[
-            WR_ID_TOKEN_SEND,
-            crate::transport_common::WR_ID_RECV_MW_BIND,
-            WR_ID_OFFSET_MW_BIND,
-        ]
-    };
-    let mut seen = [false; 3];
-    let mut remaining = expected.len();
-    let mut wc = [WorkCompletion::default(); 8];
-
-    while remaining > 0 {
-        let n = match tokio::time::timeout_at(deadline, send_src.acquire(&mut wc)).await {
-            Ok(r) => r?,
-            Err(_) => return Err(crate::Error::Timeout("read-ring setup send completions")),
-        };
-        for w in &wc[..n] {
-            let wr_id = w.wr_id();
-            let Some(idx) = expected.iter().position(|&e| e == wr_id) else {
-                return Err(crate::Error::ConnectionFault(
-                    "read-ring setup: unexpected send completion wr_id",
-                ));
-            };
-            if seen[idx] {
-                return Err(crate::Error::ConnectionFault(
-                    "read-ring setup: duplicate send completion wr_id",
-                ));
-            }
-            if !w.is_success() {
-                return Err(crate::Error::WorkCompletion {
-                    status: w.status_raw(),
-                    vendor_err: w.vendor_err(),
-                });
-            }
-            seen[idx] = true;
-            remaining -= 1;
-        }
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -916,8 +837,18 @@ impl PendingReadRing {
         )
         .await?;
 
-        // Drain setup send completions (token Send + MW binds).
-        finish_setup_sends(&mut res.send_src, use_mr_rkey, deadline).await?;
+        // Drain the exact setup send completions (token Send + MW binds).
+        let setup_wrs: &[u64] = if use_mr_rkey {
+            &[crate::transport_common::WR_ID_TOKEN_SEND]
+        } else {
+            &[
+                crate::transport_common::WR_ID_TOKEN_SEND,
+                crate::transport_common::WR_ID_RECV_MW_BIND,
+                WR_ID_OFFSET_MW_BIND,
+            ]
+        };
+        crate::transport_common::drain_ring_setup_sends(&mut res.send_src, setup_wrs, deadline)
+            .await?;
 
         // Post doorbell recv WRs (before marking the slot `Established`).
         for (i, mr) in res.doorbell_bufs.iter().enumerate() {

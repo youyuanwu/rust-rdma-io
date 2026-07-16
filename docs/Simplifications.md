@@ -251,7 +251,7 @@ suffice. #1/#6 also remove duplication from the recent work.
 - Validation: local gates only. One MANA `async_stream_tests` smoke at the end
   (it exercises the extracted CM-disconnect + teardown paths).
 
-### Batch B — #10 (setup drain + token exchange unification)
+### Batch B — #10 (setup drain + token exchange unification) — ✅ DONE
 Give `drain_ring_setup_sends(send_src, expected: &[u64], deadline)` a wr-id slice
 so `read_ring::finish_setup_sends` is deleted; factor
 `recv_setup_token(qp, recv_src, deadline, buf)` so read-ring's

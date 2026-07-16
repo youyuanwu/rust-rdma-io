@@ -332,7 +332,12 @@ impl CreditRingTransport {
         .await?;
 
         // Drain the exact setup send completions (token send + MW bind).
-        drain_ring_setup_sends(&mut send_src, use_mr_rkey, deadline).await?;
+        let setup_wrs: &[u64] = if use_mr_rkey {
+            &[WR_ID_TOKEN_SEND]
+        } else {
+            &[WR_ID_TOKEN_SEND, WR_ID_RECV_MW_BIND]
+        };
+        drain_ring_setup_sends(&mut send_src, setup_wrs, deadline).await?;
 
         // NOW post doorbell recv WRs (after token exchange is done).
         for (i, mr) in doorbell_bufs.iter().enumerate() {
@@ -475,7 +480,12 @@ impl CreditRingTransport {
         .await?;
 
         // Drain the exact setup send completions (token send + MW bind).
-        drain_ring_setup_sends(&mut send_src, use_mr_rkey, deadline).await?;
+        let setup_wrs: &[u64] = if use_mr_rkey {
+            &[WR_ID_TOKEN_SEND]
+        } else {
+            &[WR_ID_TOKEN_SEND, WR_ID_RECV_MW_BIND]
+        };
+        drain_ring_setup_sends(&mut send_src, setup_wrs, deadline).await?;
 
         // Post doorbell recv WRs.
         for (i, mr) in doorbell_bufs.iter().enumerate() {

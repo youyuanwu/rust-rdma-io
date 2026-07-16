@@ -411,33 +411,22 @@ pub(crate) fn post_token_recv(
     Ok(token_recv_mr)
 }
 
-/// Send our token and asynchronously wait for the peer's token to arrive.
-/// Called AFTER connect/accept (QP is RTS, peer's token Send is in flight).
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn complete_token_exchange(
+/// Post our setup token (`token_bytes`, SIGNALED+INLINE) and await the peer's
+/// token recv completion, bounded by `deadline`. The recv WR was posted earlier
+/// (`post_token_recv`); each ring transport parses/validates the landed bytes in
+/// its own token-recv MR after this returns. Shared post+await for both rings'
+/// token exchange (they differ only in token layout + validation).
+pub(crate) async fn exchange_setup_token(
     qp: &AsyncQp,
-    recv_src: &mut crate::completion_source::CompletionSource,
+    recv_src: &mut CompletionSource,
     pd: &Arc<ProtectionDomain>,
-    recv_mr: &OwnedMemoryRegion,
-    mw_rkey: u32,
-    token_recv_mr: &OwnedMemoryRegion,
+    token_bytes: &[u8],
     deadline: tokio::time::Instant,
-    ring_capacity: usize,
-) -> crate::Result<(u64, u32, usize)> {
-    // Send our token.
-    let our_token = RingToken {
-        version: RING_TOKEN_VERSION,
-        _reserved: [0; 3],
-        ring_va: recv_mr.addr(),
-        mw_rkey,
-        capacity: ring_capacity as u32,
-    };
-    let token_bytes = our_token.to_bytes();
-
+) -> crate::Result<()> {
     let token_send_mr = pd.reg_mr_owned(token_bytes.to_vec(), AccessFlags::LOCAL_WRITE)?;
     let send_sge = Sge::new(
         token_send_mr.addr(),
-        RING_TOKEN_SIZE as u32,
+        token_bytes.len() as u32,
         token_send_mr.lkey(),
     );
     let mut send_wr = SendWr::new(WR_ID_TOKEN_SEND, WrOpcode::Send)
@@ -459,6 +448,31 @@ pub(crate) async fn complete_token_exchange(
             vendor_err: wc_buf[0].vendor_err(),
         });
     }
+    Ok(())
+}
+
+/// Send our token and asynchronously wait for the peer's token to arrive.
+/// Called AFTER connect/accept (QP is RTS, peer's token Send is in flight).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn complete_token_exchange(
+    qp: &AsyncQp,
+    recv_src: &mut crate::completion_source::CompletionSource,
+    pd: &Arc<ProtectionDomain>,
+    recv_mr: &OwnedMemoryRegion,
+    mw_rkey: u32,
+    token_recv_mr: &OwnedMemoryRegion,
+    deadline: tokio::time::Instant,
+    ring_capacity: usize,
+) -> crate::Result<(u64, u32, usize)> {
+    // Send our token, then await + status-check the peer's (shared post+await).
+    let our_token = RingToken {
+        version: RING_TOKEN_VERSION,
+        _reserved: [0; 3],
+        ring_va: recv_mr.addr(),
+        mw_rkey,
+        capacity: ring_capacity as u32,
+    };
+    exchange_setup_token(qp, recv_src, pd, &our_token.to_bytes(), deadline).await?;
 
     // Parse received token.
     let recv_buf: &[u8; RING_TOKEN_SIZE] = token_recv_mr
@@ -485,11 +499,12 @@ pub(crate) async fn complete_token_exchange(
     Ok((peer_token.ring_va, peer_token.mw_rkey, peer_cap as usize))
 }
 
-/// Reap the setup **send** completions of a credit/send-recv ring so the data
-/// path starts on a clean send stream: await **exactly** the known setup WR ids
-/// (the token Send, plus the recv-ring MW bind unless MR-rkey fallback) via
-/// [`CompletionSource::acquire`], under the setup `deadline`, validating each
-/// completion's status and rejecting any duplicate or unknown wr_id.
+/// Reap the setup **send** completions of a ring transport so the data path
+/// starts on a clean send stream: await **exactly** the `expected` setup WR ids
+/// (the caller supplies them — the token Send, plus the MW binds unless MR-rkey
+/// fallback) via [`CompletionSource::acquire`], under the setup `deadline`,
+/// validating each completion's status and rejecting any duplicate or unknown
+/// wr_id.
 ///
 /// Replaces the previous [`CompletionSource::drain_setup`] spin, which stopped
 /// after the first empty poll once *any* completion had arrived and checked
@@ -497,15 +512,10 @@ pub(crate) async fn complete_token_exchange(
 /// completion could leak into the data path and be misread as a data completion.
 pub(crate) async fn drain_ring_setup_sends(
     send_src: &mut crate::completion_source::CompletionSource,
-    use_mr_rkey: bool,
+    expected: &[u64],
     deadline: tokio::time::Instant,
 ) -> crate::Result<()> {
-    let expected: &[u64] = if use_mr_rkey {
-        &[WR_ID_TOKEN_SEND]
-    } else {
-        &[WR_ID_TOKEN_SEND, WR_ID_RECV_MW_BIND]
-    };
-    let mut seen = [false; 2];
+    let mut seen: u32 = 0;
     let mut remaining = expected.len();
     let mut wc = [WorkCompletion::default(); 8];
 
@@ -521,7 +531,7 @@ pub(crate) async fn drain_ring_setup_sends(
                     "ring setup: unexpected send completion wr_id",
                 ));
             };
-            if seen[idx] {
+            if seen & (1u32 << idx) != 0 {
                 return Err(crate::Error::ConnectionFault(
                     "ring setup: duplicate send completion wr_id",
                 ));
@@ -532,7 +542,7 @@ pub(crate) async fn drain_ring_setup_sends(
                     vendor_err: w.vendor_err(),
                 });
             }
-            seen[idx] = true;
+            seen |= 1u32 << idx;
             remaining -= 1;
         }
     }
