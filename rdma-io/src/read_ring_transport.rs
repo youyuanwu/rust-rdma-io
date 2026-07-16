@@ -859,13 +859,13 @@ impl PendingReadRing {
         res.qp.post_recv_wr(&mut recv_wr)
     }
 
-    /// Take ownership of the established CM connection. Infallible: the fallible
-    /// `AsyncFd::new` is done by the caller on a borrow *before* this call (so
-    /// `async_cm` stays intact — and thus the QP's CM id stays alive — if it
-    /// fails). After this returns, busy rollback can defer to the driver reclaim
-    /// queue because the CM id now travels inside the bundle.
-    fn attach_cm(&mut self, cm_async_fd: AsyncFd<RawFd>, async_cm: AsyncCmId) {
-        let (event_channel, cm_id) = async_cm.into_parts();
+    /// Take ownership of the established CM connection's decomposed parts (fd +
+    /// CM id + event channel). Infallible: the fallible `AsyncFd::new` is done by
+    /// the caller on a borrow *before* this call (so the CM handle stays intact —
+    /// and thus the QP's CM id stays alive — if it fails). After this returns,
+    /// busy rollback can defer to the driver reclaim queue because the CM id now
+    /// travels inside the bundle.
+    fn attach_cm(&mut self, cm_async_fd: AsyncFd<RawFd>, cm_id: CmId, event_channel: EventChannel) {
         self.res_mut().cm = Some(PendingCm {
             cm_async_fd,
             cm_id,
@@ -1060,6 +1060,166 @@ impl Drop for PendingReadRing {
 // Implementation
 // ---------------------------------------------------------------------------
 
+/// A CM endpoint that can host a QP during read-ring setup — either a client
+/// [`AsyncCmId`] (post address/route resolution) or a server-side [`CmId`] (from
+/// `AsyncCmListener::get_request`). Lets [`prepare_pending`] build the QP and
+/// resource bundle once for both roles; the two `connect`/`accept` paths then
+/// differ only in the role-specific CM handshake.
+trait CmSetupEndpoint {
+    fn verbs_context(&self) -> Option<Arc<crate::device::Context>>;
+    fn alloc_pd(&self) -> crate::Result<Arc<ProtectionDomain>>;
+    fn create_qp_with_cq(
+        &self,
+        pd: &Arc<ProtectionDomain>,
+        init_attr: &QpInitAttr,
+        send_cq: Option<&Arc<crate::cq::CompletionQueue>>,
+        recv_cq: Option<&Arc<crate::cq::CompletionQueue>>,
+    ) -> crate::Result<crate::cm::CmQueuePair>;
+}
+
+impl CmSetupEndpoint for AsyncCmId {
+    fn verbs_context(&self) -> Option<Arc<crate::device::Context>> {
+        AsyncCmId::verbs_context(self)
+    }
+    fn alloc_pd(&self) -> crate::Result<Arc<ProtectionDomain>> {
+        AsyncCmId::alloc_pd(self)
+    }
+    fn create_qp_with_cq(
+        &self,
+        pd: &Arc<ProtectionDomain>,
+        init_attr: &QpInitAttr,
+        send_cq: Option<&Arc<crate::cq::CompletionQueue>>,
+        recv_cq: Option<&Arc<crate::cq::CompletionQueue>>,
+    ) -> crate::Result<crate::cm::CmQueuePair> {
+        AsyncCmId::create_qp_with_cq(self, pd, init_attr, send_cq, recv_cq)
+    }
+}
+
+impl CmSetupEndpoint for CmId {
+    fn verbs_context(&self) -> Option<Arc<crate::device::Context>> {
+        CmId::verbs_context(self)
+    }
+    fn alloc_pd(&self) -> crate::Result<Arc<ProtectionDomain>> {
+        CmId::alloc_pd(self)
+    }
+    fn create_qp_with_cq(
+        &self,
+        pd: &Arc<ProtectionDomain>,
+        init_attr: &QpInitAttr,
+        send_cq: Option<&Arc<crate::cq::CompletionQueue>>,
+        recv_cq: Option<&Arc<crate::cq::CompletionQueue>>,
+    ) -> crate::Result<crate::cm::CmQueuePair> {
+        CmId::create_qp_with_cq(self, pd, init_attr, send_cq, recv_cq)
+    }
+}
+
+/// Build the QP + resource bundle and open the setup transaction, shared by
+/// `connect` and `accept`. On return the busy slot (if any) is registered and
+/// the 32-byte peer-token recv WR is posted; the caller performs its
+/// role-specific CM handshake, then [`PendingReadRing::attach_cm`] +
+/// [`finish`](PendingReadRing::finish) + [`commit`](PendingReadRing::commit).
+///
+/// The caller must declare its CM endpoint (`async_cm` / `conn_id`) as a local
+/// **before** the returned guard so that, on a cancellation before `attach_cm`,
+/// the guard drops first — destroying the QP while the endpoint's CM id is still
+/// alive (the QP was created against it here).
+fn prepare_pending(
+    endpoint: &impl CmSetupEndpoint,
+    config: &ReadRingConfig,
+    driver: Option<&CoreDriverHandle>,
+) -> crate::Result<PendingReadRing> {
+    let ctx = endpoint
+        .verbs_context()
+        .ok_or(crate::Error::InvalidArg("no verbs context".into()))?;
+    let pd = endpoint.alloc_pd()?;
+
+    // Resolve the effective remote-access mode against the routed device: bind a
+    // Memory Window when supported, else fall back to the MR rkey (Auto), unless
+    // the mode forces one or the other.
+    let use_mr_rkey = resolve_mr_rkey(&pd, config.mw_mode)?;
+
+    let max_outstanding = effective_max_outstanding(
+        &pd,
+        config.ring_capacity,
+        config.max_message_size,
+        config.max_in_flight,
+        READ_RING_SQ_HEADROOM,
+    );
+    // +3: headroom for the RDMA-Read WR on the send CQ.
+    let send_cq_depth = (max_outstanding + READ_RING_SQ_HEADROOM) as i32;
+    let recv_cq_depth = (max_outstanding + 2) as i32;
+
+    let backend = SetupBackend::new(driver, &ctx, send_cq_depth, recv_cq_depth)?;
+
+    let qp_attr = QpInitAttr {
+        qp_type: QpType::Rc,
+        max_send_wr: send_cq_depth as u32,
+        max_recv_wr: recv_cq_depth as u32,
+        max_send_sge: 1,
+        max_recv_sge: 1,
+        max_inline_data: config.max_inline_data.max(READ_RING_TOKEN_SIZE as u32),
+        sq_sig_all: true,
+    };
+
+    let (setup_send_cq, setup_recv_cq) = backend.cqs();
+    let cmqp =
+        endpoint.create_qp_with_cq(&pd, &qp_attr, Some(setup_send_cq), Some(setup_recv_cq))?;
+    let qp_num = cmqp.qp_num();
+
+    // In MR-rkey fallback mode we never bind a Memory Window, so omit the
+    // MW_BIND access flag (some NICs reject it when max_mw == 0).
+    let mw_bind = if use_mr_rkey {
+        AccessFlags::empty()
+    } else {
+        AccessFlags::MW_BIND
+    };
+
+    // Allocate ring MRs. All fallible allocation happens here, before the setup
+    // transaction registers the busy slot.
+    let send_mr = pd.reg_mr_owned(vec![0u8; config.ring_capacity], AccessFlags::LOCAL_WRITE)?;
+    let recv_mr = pd.reg_mr_owned(
+        vec![0u8; config.ring_capacity],
+        AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | mw_bind,
+    )?;
+    // Offset buffer: 64 bytes (cache-line aligned allocation).
+    let offset_mr = pd.reg_mr_owned(
+        vec![0u8; 64],
+        AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_READ | mw_bind,
+    )?;
+    // RDMA Read landing buffer: 4 bytes.
+    let read_buf = pd.reg_mr_owned(vec![0u8; 4], AccessFlags::LOCAL_WRITE)?;
+    let doorbell_bufs: Box<[OwnedMemoryRegion]> = (0..max_outstanding)
+        .map(|_| pd.reg_mr_owned(vec![0u8; 4], AccessFlags::LOCAL_WRITE))
+        .collect::<crate::Result<Vec<_>>>()?
+        .into_boxed_slice();
+    // 32-byte peer-token landing buffer.
+    let token_recv_mr =
+        pd.reg_mr_owned(vec![0u8; READ_RING_TOKEN_SIZE], AccessFlags::LOCAL_WRITE)?;
+
+    let qp = AsyncQp::new_poster(cmqp);
+
+    // Open the setup transaction (registers the busy slot, takes ownership of the
+    // QP + MRs), then post the token recv before the handshake.
+    let mut pending = PendingReadRing::begin(
+        backend,
+        qp_num,
+        qp,
+        pd,
+        send_mr,
+        recv_mr,
+        offset_mr,
+        read_buf,
+        token_recv_mr,
+        doorbell_bufs,
+        driver,
+        max_outstanding,
+        use_mr_rkey,
+        config.clone(),
+    )?;
+    pending.post_token_recv()?;
+    Ok(pending)
+}
+
 impl ReadRingTransport {
     /// Connect to a remote RDMA endpoint (client side), arm-park mode.
     pub async fn connect(addr: &SocketAddr, config: ReadRingConfig) -> crate::Result<Self> {
@@ -1092,110 +1252,23 @@ impl ReadRingTransport {
         async_cm.resolve_addr(None, addr, 2000).await?;
         async_cm.resolve_route(2000).await?;
 
-        let ctx = async_cm
-            .verbs_context()
-            .ok_or(crate::Error::InvalidArg("no verbs context".into()))?;
-        let pd = async_cm.alloc_pd()?;
+        // Build the QP + resource bundle and open the transaction. `pending` is
+        // declared *after* `async_cm` so an early return before `attach_cm` drops
+        // the QP while `async_cm`'s CM id is still live (the QP was created
+        // against it).
+        let mut pending = prepare_pending(&async_cm, &config, driver)?;
 
-        // Resolve the effective remote-access mode against the routed device:
-        // bind a Memory Window when supported, else fall back to the MR rkey
-        // (Auto), unless the mode forces one or the other.
-        let use_mr_rkey = resolve_mr_rkey(&pd, config.mw_mode)?;
-
-        let max_outstanding = effective_max_outstanding(
-            &pd,
-            config.ring_capacity,
-            config.max_message_size,
-            config.max_in_flight,
-            READ_RING_SQ_HEADROOM,
-        );
-        // +3: headroom for RDMA Read WR on send CQ
-        let send_cq_depth = (max_outstanding + READ_RING_SQ_HEADROOM) as i32;
-        let recv_cq_depth = (max_outstanding + 2) as i32;
-
-        let backend = SetupBackend::new(driver, &ctx, send_cq_depth, recv_cq_depth)?;
-
-        let qp_attr = QpInitAttr {
-            qp_type: QpType::Rc,
-            max_send_wr: send_cq_depth as u32,
-            max_recv_wr: recv_cq_depth as u32,
-            max_send_sge: 1,
-            max_recv_sge: 1,
-            max_inline_data: config.max_inline_data.max(READ_RING_TOKEN_SIZE as u32),
-            sq_sig_all: true,
-        };
-
-        let (setup_send_cq, setup_recv_cq) = backend.cqs();
-        let cmqp =
-            async_cm.create_qp_with_cq(&pd, &qp_attr, Some(setup_send_cq), Some(setup_recv_cq))?;
-        let qp_num = cmqp.qp_num();
-
-        // In MR-rkey fallback mode we never bind a Memory Window, so omit the
-        // MW_BIND access flag (some NICs reject it when max_mw == 0).
-        let mw_bind = if use_mr_rkey {
-            AccessFlags::empty()
-        } else {
-            AccessFlags::MW_BIND
-        };
-
-        // Allocate ring MRs (separate, like CreditRing).
-        let send_mr = pd.reg_mr_owned(vec![0u8; config.ring_capacity], AccessFlags::LOCAL_WRITE)?;
-        let recv_mr = pd.reg_mr_owned(
-            vec![0u8; config.ring_capacity],
-            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | mw_bind,
-        )?;
-
-        // Offset buffer: 64 bytes (cache-line aligned allocation).
-        let offset_mr = pd.reg_mr_owned(
-            vec![0u8; 64],
-            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_READ | mw_bind,
-        )?;
-
-        // RDMA Read landing buffer: 4 bytes.
-        let read_buf = pd.reg_mr_owned(vec![0u8; 4], AccessFlags::LOCAL_WRITE)?;
-
-        let doorbell_bufs: Box<[OwnedMemoryRegion]> = (0..max_outstanding)
-            .map(|_| pd.reg_mr_owned(vec![0u8; 4], AccessFlags::LOCAL_WRITE))
-            .collect::<crate::Result<Vec<_>>>()?
-            .into_boxed_slice();
-
-        // 32-byte peer-token landing buffer (registered before the slot so all
-        // fallible allocation precedes slot registration).
-        let token_recv_mr =
-            pd.reg_mr_owned(vec![0u8; READ_RING_TOKEN_SIZE], AccessFlags::LOCAL_WRITE)?;
-
-        let qp = AsyncQp::new_poster(cmqp);
-
-        // Open the setup transaction: registers the busy slot and takes ownership
-        // of the QP + MRs. From here, any `?`/cancellation rolls back through
-        // `PendingReadRing::drop`. Declared *after* `async_cm` so an early return
-        // before `attach_cm` drops the QP while `async_cm`'s CM id is still live.
-        let mut pending = PendingReadRing::begin(
-            backend,
-            qp_num,
-            qp,
-            pd,
-            send_mr,
-            recv_mr,
-            offset_mr,
-            read_buf,
-            token_recv_mr,
-            doorbell_bufs,
-            driver,
-            max_outstanding,
-            use_mr_rkey,
-            config,
-        )?;
-
-        // Post the token recv before the connect handshake, then connect.
-        pending.post_token_recv()?;
+        // Handshake: `connect` borrows `async_cm` (does not consume it), so a
+        // cancellation here drops `pending` first (QP destroyed) then `async_cm`.
         async_cm.connect(&ConnParam::default()).await?;
 
-        // Attach the established CM (fallible `AsyncFd::new` on a borrow first, so
-        // `async_cm` stays intact — and the QP's CM id alive — if it fails).
+        // Attach the established CM. The fallible `AsyncFd::new` runs on a borrow
+        // *before* `into_parts`, so `async_cm` stays intact (CM id alive) if it
+        // fails.
         let cm_async_fd =
             AsyncFd::new(async_cm.event_channel().fd()).map_err(crate::Error::Verbs)?;
-        pending.attach_cm(cm_async_fd, async_cm);
+        let (event_channel, cm_id) = async_cm.into_parts();
+        pending.attach_cm(cm_async_fd, cm_id, event_channel);
 
         // Bind MWs, exchange tokens, drain setup sends, post doorbells.
         let peer_token = pending.finish().await?;
@@ -1232,112 +1305,28 @@ impl ReadRingTransport {
 
         let conn_id = listener.get_request().await?;
 
-        let ctx = conn_id
-            .verbs_context()
-            .ok_or(crate::Error::InvalidArg("no verbs context".into()))?;
-        let pd = conn_id.alloc_pd()?;
+        // Build the QP + resource bundle and open the transaction. `pending` is
+        // declared *after* `conn_id` so an early return before `attach_cm` drops
+        // the QP while `conn_id`'s CM id is still live (the QP was created
+        // against it).
+        let mut pending = prepare_pending(&conn_id, &config, driver)?;
 
-        // Resolve the effective remote-access mode against the routed device
-        // (see connect()).
-        let use_mr_rkey = resolve_mr_rkey(&pd, config.mw_mode)?;
+        // Phased accept handshake so `conn_id` is never moved into a consuming
+        // future: send the reply (sync), await ESTABLISHED (this borrows only the
+        // `listener`, NOT `conn_id`), then migrate `conn_id` (sync). Because
+        // `conn_id` stays a local declared before `pending`, a cancellation
+        // during the await drops `pending` first — destroying the QP before
+        // `conn_id`'s CM id — closing the accept teardown-order gap.
+        conn_id.accept(&ConnParam::default())?;
+        listener.await_established().await?;
 
-        let max_outstanding = effective_max_outstanding(
-            &pd,
-            config.ring_capacity,
-            config.max_message_size,
-            config.max_in_flight,
-            READ_RING_SQ_HEADROOM,
-        );
-        let send_cq_depth = (max_outstanding + READ_RING_SQ_HEADROOM) as i32;
-        let recv_cq_depth = (max_outstanding + 2) as i32;
-
-        let backend = SetupBackend::new(driver, &ctx, send_cq_depth, recv_cq_depth)?;
-
-        let qp_attr = QpInitAttr {
-            qp_type: QpType::Rc,
-            max_send_wr: send_cq_depth as u32,
-            max_recv_wr: recv_cq_depth as u32,
-            max_send_sge: 1,
-            max_recv_sge: 1,
-            max_inline_data: config.max_inline_data.max(READ_RING_TOKEN_SIZE as u32),
-            sq_sig_all: true,
-        };
-
-        let (setup_send_cq, setup_recv_cq) = backend.cqs();
-        let cmqp =
-            conn_id.create_qp_with_cq(&pd, &qp_attr, Some(setup_send_cq), Some(setup_recv_cq))?;
-        let qp_num = cmqp.qp_num();
-
-        // In MR-rkey fallback mode we never bind a Memory Window, so omit the
-        // MW_BIND access flag (some NICs reject it when max_mw == 0).
-        let mw_bind = if use_mr_rkey {
-            AccessFlags::empty()
-        } else {
-            AccessFlags::MW_BIND
-        };
-
-        let send_mr = pd.reg_mr_owned(vec![0u8; config.ring_capacity], AccessFlags::LOCAL_WRITE)?;
-        let recv_mr = pd.reg_mr_owned(
-            vec![0u8; config.ring_capacity],
-            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | mw_bind,
-        )?;
-
-        let offset_mr = pd.reg_mr_owned(
-            vec![0u8; 64],
-            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_READ | mw_bind,
-        )?;
-
-        let read_buf = pd.reg_mr_owned(vec![0u8; 4], AccessFlags::LOCAL_WRITE)?;
-
-        let doorbell_bufs: Box<[OwnedMemoryRegion]> = (0..max_outstanding)
-            .map(|_| pd.reg_mr_owned(vec![0u8; 4], AccessFlags::LOCAL_WRITE))
-            .collect::<crate::Result<Vec<_>>>()?
-            .into_boxed_slice();
-
-        // 32-byte peer-token landing buffer (registered before the slot so all
-        // fallible allocation precedes slot registration).
-        let token_recv_mr =
-            pd.reg_mr_owned(vec![0u8; READ_RING_TOKEN_SIZE], AccessFlags::LOCAL_WRITE)?;
-
-        let qp = AsyncQp::new_poster(cmqp);
-
-        // Open the setup transaction: registers the busy slot and takes ownership
-        // of the QP + MRs. Any `?`/cancellation past this point rolls back through
-        // `PendingReadRing::drop`.
-        //
-        // NOTE (review P0 #1 residual, accept path): `complete_accept` below
-        // *consumes* `conn_id`, so a cancellation during that await can drop the
-        // CM id before this guard destroys the QP. The busy slot leak / arm-park
-        // CQ-order / Established-ordering are all fixed here; the pre-attach CM
-        // destroy-order for accept is no worse than before and is addressed when
-        // the CM handshake ownership is restructured (A5).
-        let mut pending = PendingReadRing::begin(
-            backend,
-            qp_num,
-            qp,
-            pd,
-            send_mr,
-            recv_mr,
-            offset_mr,
-            read_buf,
-            token_recv_mr,
-            doorbell_bufs,
-            driver,
-            max_outstanding,
-            use_mr_rkey,
-            config,
-        )?;
-
-        // Post the token recv, then complete the accept handshake.
-        pending.post_token_recv()?;
-        let async_cm = listener
-            .complete_accept(conn_id, &ConnParam::default())
-            .await?;
-
-        // Attach the established CM (fallible `AsyncFd::new` on a borrow first).
-        let cm_async_fd =
-            AsyncFd::new(async_cm.event_channel().fd()).map_err(crate::Error::Verbs)?;
-        pending.attach_cm(cm_async_fd, async_cm);
+        let conn_ch = EventChannel::new()?;
+        conn_ch.set_nonblocking()?;
+        conn_id.migrate(&conn_ch)?;
+        // Fallible `AsyncFd::new` on a borrow before consuming `conn_id`/`conn_ch`
+        // into the bundle, so both stay live (QP's CM id alive) if it fails.
+        let cm_async_fd = AsyncFd::new(conn_ch.fd()).map_err(crate::Error::Verbs)?;
+        pending.attach_cm(cm_async_fd, conn_id, conn_ch);
 
         // Bind MWs, exchange tokens, drain setup sends, post doorbells.
         let peer_token = pending.finish().await?;

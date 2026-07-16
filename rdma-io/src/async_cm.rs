@@ -517,15 +517,29 @@ impl AsyncCmListener {
     /// by [`get_request`](Self::get_request) / [`poll_get_request`](Self::poll_get_request).
     pub async fn complete_accept(&self, conn_id: CmId, param: &ConnParam) -> Result<AsyncCmId> {
         conn_id.accept(param)?;
+        self.await_established().await?;
+        Self::migrate_accepted(conn_id)
+    }
 
-        // Wait for Established, stashing any interleaved ConnectRequest events.
+    /// Await the `ESTABLISHED` event on the listener's channel after an accept
+    /// reply has been sent (`conn_id.accept(param)`), stashing any interleaved
+    /// `ConnectRequest` events for later [`get_request`](Self::get_request).
+    ///
+    /// This borrows only the listener — **not** the `conn_id` — so a caller that
+    /// owns `conn_id` in a cancellation-safe slot (e.g. the read-ring setup
+    /// transaction) can keep it there across this await: the QP created against
+    /// `conn_id` is then guaranteed to be destroyed before `conn_id`'s CM id even
+    /// if setup is cancelled here. Pair with [`migrate_accepted`] to finish.
+    ///
+    /// [`migrate_accepted`]: Self::migrate_accepted
+    pub async fn await_established(&self) -> Result<()> {
         loop {
             let ev = self.async_ch.get_event(&self.event_channel).await?;
             let etype = ev.event_type();
             match etype {
                 CmEventType::Established => {
                     ev.ack();
-                    break;
+                    return Ok(());
                 }
                 CmEventType::ConnectRequest => {
                     let stashed_id = unsafe { CmId::from_raw(ev.cm_id_raw(), true) };
@@ -540,11 +554,16 @@ impl AsyncCmListener {
                 }
             }
         }
+    }
 
+    /// Migrate an accepted `conn_id` (already `ESTABLISHED`) onto its own new
+    /// event channel and wrap it as an [`AsyncCmId`]. Synchronous — consuming
+    /// `conn_id` only *after* the [`await_established`](Self::await_established)
+    /// await has completed.
+    fn migrate_accepted(conn_id: CmId) -> Result<AsyncCmId> {
         let conn_ch = EventChannel::new()?;
         conn_ch.set_nonblocking()?;
         conn_id.migrate(&conn_ch)?;
-
         Ok(AsyncCmId {
             cm_id: ManuallyDrop::new(conn_id),
             event_channel: ManuallyDrop::new(conn_ch),
