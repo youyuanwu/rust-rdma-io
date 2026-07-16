@@ -53,13 +53,37 @@ use rdma_io::read_ring_transport::{ReadRingConfig, ReadRingTransport};
 use tokio::runtime::Handle as RtHandle;
 use tokio::task::JoinHandle;
 
-/// One pinned per-core worker: a `current_thread` runtime handle plus the
-/// handle to the [`CoreDriver`] running on it.
-struct CoreWorker {
-    /// The core this worker is pinned to (for observability).
+/// A pinned per-core `current_thread` runtime: pins a core, builds the runtime,
+/// runs a caller-supplied `engine` future as the runtime's main task, and joins
+/// the OS thread at shutdown. Both pools ([`BusyPool`], [`ArmParkPool`]) are
+/// built on it; they differ only in the engine future (a [`CoreDriver`] run loop
+/// vs a shutdown-signal await) and how they stop it.
+struct PinnedRuntime {
+    /// The core this runtime is pinned to (for observability).
     core_id: usize,
     /// Spawn point for on-core tasks (connections + their app loops).
     rt: RtHandle,
+    /// The OS thread running the runtime; joined at shutdown.
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl PinnedRuntime {
+    /// Join the worker thread if it hasn't been joined yet. Idempotent.
+    ///
+    /// The caller must first make the engine future return (stop the driver /
+    /// send the stop signal) so the runtime's `block_on` completes.
+    fn join(&mut self) {
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// One pinned per-core busy-poll worker: a [`PinnedRuntime`] plus the handle to
+/// the [`CoreDriver`] running on it and its admission accounting.
+struct CoreWorker {
+    /// The pinned `current_thread` runtime + its OS thread (spawn point, join).
+    inner: PinnedRuntime,
     /// The core's shared-CQ reaper handle (register/reclaim/shutdown).
     driver: CoreDriverHandle,
     /// Max live connections admitted to this core (`usize::MAX` = uncapped, for
@@ -68,8 +92,6 @@ struct CoreWorker {
     /// Current live-connection count (admission load). Incremented at placement,
     /// decremented by [`AdmissionGuard`] when the connection's task ends.
     admitted: Arc<AtomicUsize>,
-    /// The OS thread running the runtime; joined at shutdown.
-    thread: Option<thread::JoinHandle<()>>,
 }
 
 /// Releases a core's admission slot when dropped. Held by the connection's task,
@@ -178,7 +200,7 @@ impl BusyPool {
 
     /// The core ids the pool is pinned to, in placement order.
     pub fn core_ids(&self) -> Vec<usize> {
-        self.workers.iter().map(|w| w.core_id).collect()
+        self.workers.iter().map(|w| w.inner.core_id).collect()
     }
 
     /// Current live-connection count per core (in placement order). For tests /
@@ -238,7 +260,7 @@ impl BusyPool {
         let (i, guard) = self.try_admit()?;
         let worker = &self.workers[i];
         let driver = worker.driver.clone();
-        Some(worker.rt.spawn(async move {
+        Some(worker.inner.rt.spawn(async move {
             let mut transport = ReadRingTransport::connect_busy(&addr, config, &driver).await?;
             // Tie the admission lease to driver **retirement**, not app
             // completion: it travels into the reclaim bundle and frees the core's
@@ -297,7 +319,7 @@ impl BusyPool {
             // The worker signals when its handshake is done touching the
             // listener, so the pool can accept the next connection.
             let (setup_tx, setup_rx) = tokio::sync::oneshot::channel::<()>();
-            let handle = worker.rt.spawn(async move {
+            let handle = worker.inner.rt.spawn(async move {
                 let result = ReadRingTransport::accept_busy(&listener, config, &driver).await;
                 let _ = setup_tx.send(());
                 match result {
@@ -346,31 +368,33 @@ fn shutdown_workers(workers: &mut [CoreWorker]) {
         w.driver.shutdown();
     }
     for w in workers.iter_mut() {
-        if let Some(t) = w.thread.take() {
-            let _ = t.join();
-        }
+        w.inner.join();
     }
 }
 
-/// Spawn one pinned worker thread: pin the core, build a `current_thread`
-/// runtime, create + run the [`CoreDriver`] on it, and hand back the runtime
-/// handle + driver handle once the driver is up.
-fn spawn_worker(
-    ctx: Arc<Context>,
+/// Spawn one pinned per-core `current_thread` runtime. Pins `core_id`, builds
+/// the runtime, then runs `setup` **on-core** (so any CQs/MRs it allocates are
+/// node-local, §4.1) to produce a ready payload `R` — sent back to the caller —
+/// plus the `engine` future that keeps the runtime alive. The thread then
+/// `block_on`s that engine; the runtime winds down when the engine returns.
+fn spawn_pinned<S, R, Fut>(
     core_id: usize,
-    send_depth: i32,
-    recv_depth: i32,
-    cap: usize,
-) -> rdma_io::Result<CoreWorker> {
-    // Handshake: the worker sends back its runtime + driver handle (or the error
-    // it hit) once the driver task is running.
-    let (ready_tx, ready_rx) =
-        std::sync::mpsc::channel::<Result<(RtHandle, CoreDriverHandle), String>>();
+    thread_name: String,
+    setup: S,
+) -> rdma_io::Result<(PinnedRuntime, R)>
+where
+    S: FnOnce() -> Result<(R, Fut), String> + Send + 'static,
+    R: Send + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
+    // Handshake: the worker sends back its runtime handle + ready payload (or
+    // the error it hit) once `setup` has run on-core.
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(RtHandle, R), String>>();
 
     let thread = thread::Builder::new()
-        .name(format!("busy-core-{core_id}"))
+        .name(thread_name.clone())
         .spawn(move || {
-            // Pin BEFORE allocating CQs/MRs so they are node-local (§4.1).
+            // Pin BEFORE building the runtime / allocating CQs/MRs (§4.1).
             let _ = core_affinity::set_for_current(core_affinity::CoreId { id: core_id });
 
             let rt = match tokio::runtime::Builder::new_current_thread()
@@ -385,37 +409,33 @@ fn spawn_worker(
             };
             let rt_handle = rt.handle().clone();
 
-            // The driver's run loop IS this runtime's main future: it services
-            // its own task plus the app connections spawned onto `rt_handle`,
-            // and returns only after `shutdown()` + a fully drained reclaim
-            // queue (the shutdown join, §10).
             rt.block_on(async move {
-                let (driver, handle) = match CoreDriver::new(ctx, send_depth, recv_depth) {
+                let (payload, engine) = match setup() {
                     Ok(v) => v,
                     Err(e) => {
-                        let _ = ready_tx.send(Err(format!("core driver: {e}")));
+                        let _ = ready_tx.send(Err(e));
                         return;
                     }
                 };
-                if ready_tx.send(Ok((rt_handle, handle))).is_err() {
-                    // The pool gave up waiting; still wind down cleanly by
-                    // returning (the runtime drops on thread exit).
+                if ready_tx.send(Ok((rt_handle, payload))).is_err() {
+                    // The pool gave up waiting; wind down cleanly (runtime drops
+                    // on thread exit).
                     return;
                 }
-                driver.run().await;
+                engine.await;
             });
         })
-        .map_err(|e| rdma_io::Error::InvalidArg(format!("spawn busy-core-{core_id}: {e}")))?;
+        .map_err(|e| rdma_io::Error::InvalidArg(format!("spawn {thread_name}: {e}")))?;
 
     match ready_rx.recv() {
-        Ok(Ok((rt, driver))) => Ok(CoreWorker {
-            core_id,
-            rt,
-            driver,
-            cap,
-            admitted: Arc::new(AtomicUsize::new(0)),
-            thread: Some(thread),
-        }),
+        Ok(Ok((rt, payload))) => Ok((
+            PinnedRuntime {
+                core_id,
+                rt,
+                thread: Some(thread),
+            },
+            payload,
+        )),
         Ok(Err(msg)) => {
             let _ = thread.join();
             Err(rdma_io::Error::InvalidArg(msg))
@@ -423,10 +443,37 @@ fn spawn_worker(
         Err(_) => {
             let _ = thread.join();
             Err(rdma_io::Error::InvalidArg(format!(
-                "busy-core-{core_id} thread exited before ready"
+                "{thread_name} thread exited before ready"
             )))
         }
     }
+}
+
+/// Spawn one pinned per-core busy-poll worker: a [`PinnedRuntime`] whose engine
+/// future is the [`CoreDriver`] run loop, plus the driver handle + admission
+/// accounting.
+fn spawn_worker(
+    ctx: Arc<Context>,
+    core_id: usize,
+    send_depth: i32,
+    recv_depth: i32,
+    cap: usize,
+) -> rdma_io::Result<CoreWorker> {
+    // The driver's run loop IS the runtime's main future: it services its own
+    // task plus the app connections spawned onto the runtime, and returns only
+    // after `shutdown()` + a fully drained reclaim queue (the shutdown join,
+    // §10).
+    let (inner, driver) = spawn_pinned(core_id, format!("busy-core-{core_id}"), move || {
+        let (driver, handle) = CoreDriver::new(ctx, send_depth, recv_depth)
+            .map_err(|e| format!("core driver: {e}"))?;
+        Ok((handle, async move { driver.run().await }))
+    })?;
+    Ok(CoreWorker {
+        inner,
+        driver,
+        cap,
+        admitted: Arc::new(AtomicUsize::new(0)),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -436,19 +483,15 @@ fn spawn_worker(
 /// One pinned per-core worker running an *arm-park* `current_thread` runtime.
 ///
 /// Unlike [`CoreWorker`] there is no `CoreDriver` — the runtime's engine future
-/// is just a shutdown signal, and it drives the connection tasks spawned onto
-/// `rt` (each with its own interrupt-armed CQ) between which the core parks in
-/// `epoll_wait`.
+/// is just a shutdown-signal await, and it drives the connection tasks spawned
+/// onto its [`PinnedRuntime`] (each with its own interrupt-armed CQ) between
+/// which the core parks in `epoll_wait`.
 struct ParkWorker {
-    /// The core this worker is pinned to (for observability).
-    core_id: usize,
-    /// Spawn point for on-core tasks (connections + their app loops).
-    rt: RtHandle,
+    /// The pinned `current_thread` runtime + its OS thread (spawn point, join).
+    inner: PinnedRuntime,
     /// Ends the runtime's engine future at shutdown (drop or send). `Option` so
     /// [`shutdown_park_workers`] can take it before joining.
     stop: Option<tokio::sync::oneshot::Sender<()>>,
-    /// The OS thread running the runtime; joined at shutdown.
-    thread: Option<thread::JoinHandle<()>>,
 }
 
 /// A thread-per-core **arm-park** pool: `N` pinned `current_thread` runtimes
@@ -495,7 +538,7 @@ impl ArmParkPool {
 
     /// The core ids the pool is pinned to, in placement order.
     pub fn core_ids(&self) -> Vec<usize> {
-        self.workers.iter().map(|w| w.core_id).collect()
+        self.workers.iter().map(|w| w.inner.core_id).collect()
     }
 
     /// Pick the next core (round-robin).
@@ -524,7 +567,7 @@ impl ArmParkPool {
         Fut: Future<Output = R> + Send + 'static,
         R: Send + 'static,
     {
-        self.next_worker().rt.spawn(async move {
+        self.next_worker().inner.rt.spawn(async move {
             let transport = ReadRingTransport::connect(&addr, config).await?;
             Ok(app(transport).await)
         })
@@ -556,7 +599,7 @@ impl ArmParkPool {
         let mut handles = Vec::with_capacity(count);
         for _ in 0..count {
             let worker = self.next_worker();
-            let rt = worker.rt.clone();
+            let rt = worker.inner.rt.clone();
             let listener = listener.clone();
             let config = config.clone();
             let app = app.clone();
@@ -603,67 +646,23 @@ fn shutdown_park_workers(workers: &mut [ParkWorker]) {
         }
     }
     for w in workers.iter_mut() {
-        if let Some(t) = w.thread.take() {
-            let _ = t.join();
-        }
+        w.inner.join();
     }
 }
 
-/// Spawn one pinned arm-park worker thread: pin the core, build a
-/// `current_thread` runtime with the IO driver enabled, and block on a shutdown
-/// signal while the runtime drives the connection tasks spawned onto it.
+/// Spawn one pinned per-core arm-park worker: a [`PinnedRuntime`] whose engine
+/// future is a shutdown-signal await. The runtime drives the connection tasks
+/// spawned onto it (each with its own interrupt-armed CQ); the core parks in
+/// `epoll_wait` when idle (0 % CPU) between events.
 fn spawn_park_worker(core_id: usize) -> rdma_io::Result<ParkWorker> {
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<RtHandle, String>>();
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-
-    let thread = thread::Builder::new()
-        .name(format!("park-core-{core_id}"))
-        .spawn(move || {
-            // Pin BEFORE building the runtime so its buffers/reactor are
-            // node-local (§4.1).
-            let _ = core_affinity::set_for_current(core_affinity::CoreId { id: core_id });
-
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    let _ = ready_tx.send(Err(format!("build runtime: {e}")));
-                    return;
-                }
-            };
-            let rt_handle = rt.handle().clone();
-            if ready_tx.send(Ok(rt_handle)).is_err() {
-                // The pool gave up waiting; wind down cleanly (runtime drops).
-                return;
-            }
-
-            // Engine: keep the runtime turning (driving the spawned connection
-            // tasks) until shutdown. Arm-park tasks park in `epoll_wait` when
-            // idle, so this thread sleeps at 0 % CPU between events.
-            rt.block_on(async move {
-                let _ = stop_rx.await;
-            });
-        })
-        .map_err(|e| rdma_io::Error::InvalidArg(format!("spawn park-core-{core_id}: {e}")))?;
-
-    match ready_rx.recv() {
-        Ok(Ok(rt)) => Ok(ParkWorker {
-            core_id,
-            rt,
-            stop: Some(stop_tx),
-            thread: Some(thread),
-        }),
-        Ok(Err(msg)) => {
-            let _ = thread.join();
-            Err(rdma_io::Error::InvalidArg(msg))
-        }
-        Err(_) => {
-            let _ = thread.join();
-            Err(rdma_io::Error::InvalidArg(format!(
-                "park-core-{core_id} thread exited before ready"
-            )))
-        }
-    }
+    let (inner, ()) = spawn_pinned(core_id, format!("park-core-{core_id}"), move || {
+        Ok(((), async move {
+            let _ = stop_rx.await;
+        }))
+    })?;
+    Ok(ParkWorker {
+        inner,
+        stop: Some(stop_tx),
+    })
 }
