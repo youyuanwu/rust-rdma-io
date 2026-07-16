@@ -428,13 +428,16 @@ impl ReadRingInner {
 // Token exchange helpers (32-byte ReadRingToken, different from transport_common)
 // ---------------------------------------------------------------------------
 
-/// Send our 32-byte token and wait for the peer's token.
+/// Send our 32-byte token and wait for the peer's token, bounded by `deadline`
+/// (the shared setup deadline — a peer that establishes CM but never sends its
+/// token must not hang setup forever).
 async fn complete_read_ring_token_exchange(
     qp: &AsyncQp,
     recv_src: &mut CompletionSource,
     pd: &Arc<ProtectionDomain>,
     our_token: &ReadRingToken,
     token_recv_mr: &OwnedMemoryRegion,
+    deadline: tokio::time::Instant,
 ) -> crate::Result<ReadRingToken> {
     let token_bytes = our_token.to_bytes();
     let token_send_mr = pd.reg_mr_owned(token_bytes.to_vec(), AccessFlags::LOCAL_WRITE)?;
@@ -448,9 +451,13 @@ async fn complete_read_ring_token_exchange(
         .sg(send_sge);
     qp.post_send_wr(&mut send_wr)?;
 
-    // Async wait for recv completion via CQ notification (through the seam).
+    // Async wait for recv completion via CQ notification (through the seam),
+    // bounded by the setup deadline.
     let mut wc_buf = [WorkCompletion::default(); 4];
-    let n = recv_src.acquire(&mut wc_buf).await?;
+    let n = match tokio::time::timeout_at(deadline, recv_src.acquire(&mut wc_buf)).await {
+        Ok(r) => r?,
+        Err(_) => return Err(crate::Error::Timeout("read-ring peer token")),
+    };
     if n > 0 && !wc_buf[0].is_success() {
         return Err(crate::Error::WorkCompletion {
             status: wc_buf[0].status_raw(),
@@ -609,6 +616,7 @@ async fn finish_setup_sends(
     send_src: &mut CompletionSource,
     conn_slot: &Option<Arc<ConnSlot>>,
     use_mr_rkey: bool,
+    deadline: tokio::time::Instant,
 ) -> crate::Result<()> {
     match conn_slot {
         None => {
@@ -620,7 +628,12 @@ async fn finish_setup_sends(
             let mut got = 0;
             let mut wc = [WorkCompletion::default(); 8];
             while got < expected {
-                let n = send_src.acquire(&mut wc).await?;
+                let n = match tokio::time::timeout_at(deadline, send_src.acquire(&mut wc)).await {
+                    Ok(r) => r?,
+                    Err(_) => {
+                        return Err(crate::Error::Timeout("read-ring setup send completions"));
+                    }
+                };
                 for w in &wc[..n] {
                     if !w.is_success() {
                         return Err(crate::Error::WorkCompletion {
@@ -811,6 +824,12 @@ impl PendingReadRing {
     async fn finish(&mut self) -> crate::Result<ReadRingToken> {
         let use_mr_rkey = self.use_mr_rkey;
         let ring_capacity = self.config.ring_capacity;
+        // One monotonic deadline for the whole post-RTS token phase (token
+        // exchange + setup-send drain), so a stalled peer/driver cannot hang
+        // setup past `token_timeout`. A timeout returns `Error::Timeout`, which
+        // flows into the same `PendingReadRing::drop` rollback as any other
+        // setup error.
+        let deadline = tokio::time::Instant::now() + self.config.token_timeout;
         let slot = self.slot.clone();
         let res = self.res_mut();
 
@@ -847,11 +866,12 @@ impl PendingReadRing {
             &res.pd,
             &our_token,
             &res.token_recv_mr,
+            deadline,
         )
         .await?;
 
         // Drain setup send completions (token Send + MW binds).
-        finish_setup_sends(&mut res.send_src, &slot, use_mr_rkey).await?;
+        finish_setup_sends(&mut res.send_src, &slot, use_mr_rkey, deadline).await?;
 
         // Post doorbell recv WRs (before marking the slot `Established`).
         for (i, mr) in res.doorbell_bufs.iter().enumerate() {

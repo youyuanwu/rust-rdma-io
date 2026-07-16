@@ -29,7 +29,7 @@ tracing = "0.1"
 # Async / IO
 futures-io = "0.3"
 futures-util = { version = "0.3", features = ["io"] }
-tokio = { version = "1", features = ["net"] }
+tokio = { version = "1", features = ["net", "time"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 tokio-stream = "0.1"
 

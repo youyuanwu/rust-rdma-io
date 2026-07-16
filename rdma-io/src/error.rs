@@ -41,6 +41,11 @@ pub enum Error {
     /// overflow, shared-CQ poll failure, …) and must be torn down.
     #[error("connection fault: {0}")]
     ConnectionFault(&'static str),
+
+    /// A setup/handshake phase exceeded its deadline (e.g. a peer that
+    /// established CM but never sent its token).
+    #[error("timed out: {0}")]
+    Timeout(&'static str),
 }
 
 /// Convert a C return code (0 = success, negative = -errno) to a `Result`.
