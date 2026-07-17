@@ -24,7 +24,7 @@ path. Two properties drive everything below:
   be **registered** first (see below).
 
 That is why RDMA wins CPU-efficiency and tail latency in the benchmarks
-([grpc.md](../bench/grpc.md), [echo.md](../bench/echo.md)): the per-message cost
+([grpc](../bench/grpc/README.md), [echo](../bench/echo/README.md)): the per-message cost
 is a few doorbells and completions, not syscalls + a kernel stack traversal.
 
 ## The building blocks

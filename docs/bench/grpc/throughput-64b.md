@@ -1,10 +1,9 @@
-# gRPC-over-RDMA benchmark results
+# gRPC throughput & pipelining (64 B)
 
-Measured results for the tonic gRPC transports (`--mode rh2`) versus the `tcp`
-baseline (same tonic + TLS stack over a kernel socket), produced by the
-`rdma-io-bench` tool. For the benchmark design, infrastructure, and how to run
-it, see `docs/Benchmark.md` in the `rdma-io-bench` repo; for the direct-transport
-(`--mode echo`) numbers see [echo.md](echo.md).
+Connection scaling, in-flight pipelining, and peak-throughput sweeps at 64 B for
+the tonic `rh2` transports vs the `tcp` baseline. See [README.md](README.md) for
+the scenario and how to run it. Other gRPC datasets: [payload size](payload.md) ·
+[client CPU & memory](cpu-memory.md).
 
 Measured **2026-07-06** on the two E-series MANA RoCEv2 VMs, comparing `rh2`
 (gRPC / HTTP-2 over RDMA) against the `tcp` baseline (same tonic + TLS stack over
@@ -35,7 +34,7 @@ completions that never arrive), and the RNR-NAK counters (`requester_rnr_nak`,
 `responder_rnr_nak`, `requester_timeout`) accumulate then freeze — receivers run
 out of posted recv buffers, senders get RNR-NAKed, and the whole fan-out wedges.
 It is the same flow-control coupling as the low-connection bidirectional deadlock
-([read-ring-concurrent-stream-deadlock.md](../bugs/read-ring-concurrent-stream-deadlock.md)),
+([read-ring-concurrent-stream-deadlock.md](../../bugs/read-ring-concurrent-stream-deadlock.md)),
 re-emerging at scale where the per-connection relief can't keep up with aggregate
 recv-buffer exhaustion.
 
@@ -59,7 +58,7 @@ and scales past 256.
 
 **The deadlock is in the gRPC / `AsyncRdmaStream` layer, not the transport.** The
 direct-transport `echo` mode (same RDMA transports, but no tonic / h2 / TLS /
-`AsyncRdmaStream` — see [EchoBenchmark.md](../design/EchoBenchmark.md))
+`AsyncRdmaStream` — see [EchoBenchmark.md](../../design/EchoBenchmark.md))
 was run at the same load as a control, on **all three transports**:
 
 | echo transport | data phase | peak throughput |
@@ -81,7 +80,7 @@ the low-connection bidirectional deadlock) re-emerges at high fan-out and wedges
 were run-to-run MANA RDMA-CM variance, not a real ceiling — the A/B reconnected
 224 fine.) So the fix is in the gRPC recv path (drain reads independent of the
 write state / bound aggregate outstanding), not the transport — see the
-[deadlock bug doc](../bugs/read-ring-concurrent-stream-deadlock.md).
+[deadlock bug doc](../../bugs/read-ring-concurrent-stream-deadlock.md).
 
 The RDMA rings **beat TCP at 64–128 connections** on both throughput and latency
 — at 128 connections `credit-ring` leads at **315K req/s (+28 % over TCP)** with
@@ -113,7 +112,7 @@ is a serial byte stream, so extra outstanding requests barely help) while the
 RDMA transports pipeline to ~100–106K. At `in_flight=64` the rings regress
 (read-ring 114K, credit-ring 100K) because the gRPC path does not yet auto-size
 the ring queue depth from `in_flight` (the `echo` mode does — see
-[EchoBenchmark.md](../design/EchoBenchmark.md)); `send-recv`
+[EchoBenchmark.md](../../design/EchoBenchmark.md)); `send-recv`
 and TCP scale cleanly to ~150K.
 
 The bolded p999 outliers are tail artifacts, not median regressions: TCP's
@@ -179,114 +178,3 @@ corrected picture: the TLS/HTTP-2/protobuf stack still bounds both transports at
 ~55–56 of 64 cores, but `read-ring`'s lower per-op CPU converts that budget into
 **more** throughput than TCP (833K vs 740K), at fewer connections. Lifting the
 high-fan-out deadlock would let it scale further still.
-
-## Payload size (8 conns / 8 threads)
-
-Throughput (p99 latency µs):
-
-| Payload | in-flight | send-recv | read-ring | credit-ring | tcp |
-|---:|---:|---:|---:|---:|---:|
-| 64 B  | 1 | 53.5K (228) | 54.9K (226) | **58.5K** (216) | 48.2K (249) |
-| 256 B | 8 | 105.0K (969) | **115.6K** (991) | 115.2K (995) | 101.5K (1169) |
-| 8 KB  | 1 | 29.8K (389) | 44.9K (278) | **47.1K** (259) | 31.8K (348) |
-
-At an 8 KB payload the one-sided ring transports (44.9K / 47.1K) outrun both
-`send-recv` (29.8K) and TCP (31.8K), at roughly half the p99 latency
-(259–278 µs vs 348–389 µs).
-
-## Large-payload (8 KiB) ceiling — max throughput per transport
-
-The payload-size table above is `in_flight=1` at a fixed 8 conns. Pushing each
-transport for **peak** 8 KiB throughput (tuning connections *and* in-flight,
-`threads=64`, reboot-clean NIC) tells the opposite story to the raw-transport
-[echo 8 KiB result](echo.md#large-payload-8-kib-ceiling-read-ring-vs-tcp), where
-read-ring *wins*. Best config = `connections × in-flight`:
-
-| transport | best config | **max throughput** | bandwidth | p50 | p99 | CPU/op | ~cores | limited by |
-|---|---|---:|---:|---:|---:|---:|---:|---|
-| **tcp** (kernel) | 256 × 8 | **427K** | 28.0 Gbps | 4411 µs | 10167 µs | 118 µs | ~50 | bandwidth + CPU wall |
-| **read-ring** | 128 × 1 | **247K** | 16.2 Gbps | 486 µs | 1090 µs | 95 µs | ~24 | deadlock @ ~160 conns |
-| **credit-ring** | 48 × 1 | **202K** | 13.2 Gbps | 227 µs | 422 µs | 94 µs | ~19 | deadlock @ ~64 conns |
-| **send-recv** | 192 × 1 | **110K** | 7.2 Gbps | 1745 µs | 2623 µs | 117 µs | ~13 | 2-sided recv round-trip |
-
-Scaling behind each peak (RDMA held at `in_flight=1` — connections drive
-throughput; deeper pipelines make the RDMA transports *worse*, e.g. `send-recv`
-at `in_flight=16` collapsed to a **1.3 s p99**):
-
-- **tcp**: 32→64→128→256 conns × 16 = 273K→343K→412K→426K; 256 × 8 = **427K**
-  (384 conns regresses). ~50 cores near the ~28 Gbps wall.
-- **read-ring**: 32→64→96→128 × 1 = 153K→202K→229K→**247K**; **160 × 1
-  deadlocks** (warmup hang — onset lower than 64 B's ~208 because 8 KiB fills the
-  byte ring faster).
-- **credit-ring**: 16→32→48 × 1 = 91K→156K→**202K**; **64 × 1 deadlocks**.
-- **send-recv**: 64→128→192 × 1 = 99K→107K→**110K** (plateaus, no deadlock).
-
-**At the gRPC layer TCP wins the 8 KiB headline (427K) — the inverse of `echo`,
-where read-ring leads at 36 Gbps.** Two things flip it: (1) gRPC 8 KiB is
-stack-bound (~95–118 µs/op, TLS + h2 + protobuf), and (2) **every RDMA transport
-hits the high-fan-out flow-control deadlock** — read-ring at ~160 connections,
-credit-ring at ~64 — capping them at **13–24 of 64 cores**, far below TCP's
-~50-core / 28 Gbps wall. TCP has no RDMA recv-pool/ring to exhaust, so it scales
-to 256 connections. `in_flight>1` only makes the RDMA transports worse.
-
-But **RDMA still wins latency by ~10×** at its own peak (read-ring p50 486 µs /
-p99 1090 µs vs TCP p50 4411 / p99 10167), because it peaks at far lower
-concurrency — and it leaves ~30–40 cores idle. read-ring was **still climbing at
-128 × 1** (16.2 Gbps, ~24 cores): if the high-fan-out deadlock
-([read-ring-concurrent-stream-deadlock.md](../bugs/read-ring-concurrent-stream-deadlock.md))
-were lifted it could chase the same ~28 Gbps bandwidth wall TCP hits. The
-one-sided rings (read-ring, credit-ring) beat `send-recv` here, which is throttled
-by its per-message two-sided recv round-trip.
-
-> Carrying a whole 8 KiB gRPC message in one RDMA message needs
-> `--ring-max-msg ≥ 8215` (payload + protobuf/gRPC/HTTP-2 DATA framing ≈ +17–23 B;
-> HEADERS frames are separate writes). These runs used `--ring-max-msg 9216`
-> (9 KiB) — above the DATA frame, and still `65536/9216 ≈ 7` ring slots.
-> Fragmentation is *not* what triggers the deadlock (the same 8 KiB payload runs
-> cleanly at `in_flight=1`, low fan-out); connection count is.
-
-## Client CPU & memory
-
-Client-side CPU per request and peak RSS, measured over the benchmark window
-(connection setup and warmup excluded), 8 conns / 8 threads, 64 B:
-
-| in-flight | metric | send-recv | read-ring | credit-ring | tcp |
-|---:|---|---:|---:|---:|---:|
-| 1  | CPU µs/op | 67.1 | 66.4 | 74.7 | 64.4 |
-| 16 | CPU µs/op | 45.9 | 45.7 | 48.1 | 47.1 |
-| 64 | CPU µs/op | 40.7 | 50.6 | 55.1 | 42.0 |
-| 64 | peak RSS MB | 165 | 101 | 100 | 98 |
-
-Two things stand out. First, **at the gRPC layer CPU-per-op is comparable between
-RDMA and TCP** — the TLS + HTTP/2 + protobuf stack dominates client CPU and costs
-the same regardless of the byte transport, so RDMA's raw efficiency advantage (the
-direct-transport `echo` mode measures RDMA ~4× cheaper per op) is masked here.
-Second, **CPU-per-op falls as pipelining depth rises** (67 → 41 µs for `send-recv`)
-because batching amortizes the per-request stack overhead over more work per
-wakeup. RDMA carries a higher peak RSS than TCP (registered buffer pools / MRs),
-and `send-recv` the most — a full recv-buffer pool per connection.
-
-At full scale (64 conns / 64 threads, `in_flight=1`, ~17–19 client cores) the
-picture is unchanged — CPU/op stays transport-agnostic:
-
-| metric | send-recv | read-ring | credit-ring | tcp |
-|---|---:|---:|---:|---:|
-| throughput req/s | 191.9K | 255.6K | 237.9K | 220.6K |
-| CPU µs/op | 70.8 | 75.5 | 75.2 | 75.4 |
-| peak RSS MB | 84 | 52 | 52 | 38 |
-
-This is the sharpest contrast with raw `echo`, which at 64×64 measures `read-ring`
-at **1.2 µs/op vs TCP 5.4 µs/op** (RDMA ~4× cheaper): at the gRPC layer that entire
-efficiency gap is consumed by the TLS/HTTP-2/protobuf stack, not the transport.
-
-**Takeaways.** With the current data path (native-tokio + vectored `send_gather`)
-`rh2` gRPC-over-RDMA now **meets or beats the TCP baseline at every tested
-config** (the old ~40K rh2 ceiling is gone). The `read-ring` transport pipelines
-cleanly at depth after the bidirectional-deadlock fix
-([read-ring-concurrent-stream-deadlock.md](../bugs/read-ring-concurrent-stream-deadlock.md)).
-RDMA wins on throughput *and* latency up to ~200 connections (peak ~365–376K
-req/s, transport-dependent); beyond that a high-concurrency flow-control deadlock
-appears (all connections still establish — it is not a connection-setup ceiling),
-so TCP, which keeps scaling, is the choice for very high connection fan-out until
-that deadlock is root-caused.
-
