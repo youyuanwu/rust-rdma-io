@@ -123,3 +123,41 @@ steadily-loaded deployments that can dedicate the cores.
 
 Server `--bind` must be a concrete RDMA IP for `rh1-busy` (it probes the device
 context from it); `rh1-park` and `rh1` accept any bindable address.
+
+## Re-validation (2026-07-17)
+
+Re-run on the current binary (64 B, `duration=10 warmup=3`, reboot-clean NIC) as
+a regression check. **No regression** — the pinned modes reproduce baseline; the
+only gaps are the 32-core / 256-conn points, which failed to *establish* (CM
+setup) on this flaky host.
+
+**Matched-core (4 cores, 32 conns):**
+
+| mode | throughput | p50 | p99 | µs/op |
+|---|---:|---:|---:|---:|
+| `rh1` (shared) | 216K (194K) | 144 µs | 244 µs | 15.8 |
+| `rh1-park` | 286K (303K) | 90 µs | 197 µs | 13.2 |
+| **`rh1-busy`** | **431K** (437K) | **73 µs** | **100 µs** | **9.3** |
+
+Busy-poll still wins matched-core outright (~2× the shared runtime, ~9.3 µs/op).
+
+**Peak / ceiling (8 conns/core):**
+
+| cores | conns | `rh1-busy` | `rh1-park` |
+|---:|---:|---|---|
+| 4  | 32  | 431K · 9.3 µs/op | 286K · 13.2 µs/op |
+| 8  | 64  | 852K · 9.4 µs/op | 579K · 12.8 µs/op |
+| 16 | 128 | **1461K · 10.9 µs/op** | 385K · 16.1 µs/op ↓ |
+| 32 | 256 | ✗ CM setup | ✗ CM setup |
+
+`rh1-busy` **peaks at ~1.46M req/s at 16 pinned cores** (baseline 1.37M),
+scaling near-linear at ~108K/core; `rh1-park` holds its ~579K / 8-core ceiling
+then regresses at 16 cores — both unchanged from baseline. The 32-core / 256-conn
+points would not *establish* this session (CM-setup flakiness at high fan-out),
+so the past-16-core regression could not be re-measured; it is a setup ceiling,
+not a data-path result.
+
+**Idle / low-load (2 cores, 2 conns):** `rh1` 24.3K (p50 80 µs), `rh1-park`
+24.5K (p50 81 µs), `rh1-busy` 48.0K (p50 41 µs) — matches baseline (22.9 / 24.4 /
+48.0K); busy-poll still doubles throughput and halves latency at the cost of two
+pinned cores.

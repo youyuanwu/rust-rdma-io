@@ -249,3 +249,43 @@ absolute number (~8.8M) by burning ~55 cores; read-ring delivers ~72 % of that a
 under gRPC — the TLS/HTTP-2/protobuf stack collapses both to ~0.7–0.83M req/s at
 ~55 cores, so the gRPC-layer throughput is bounded by the stack, not the byte
 transport.)
+
+## Re-validation (2026-07-17)
+
+Full re-run on the current binary (64 B, `duration=10 warmup=3 threads=64`,
+reboot-clean NIC between ring batches) as a regression check. **No regression** —
+every ceiling and CPU/op figure holds within the documented run-to-run noise.
+
+**In-flight sweep (8×8, `ring_queue_depth=128`)** — req/s, vs baseline in
+parens:
+
+| in-flight | send-recv | read-ring | credit-ring | tcp |
+|---:|---:|---:|---:|---:|
+| 1  | 95.2k (99.7k) | 94.2k (100.4k) | 93.4k (100.2k) | 94.8k (92.7k) |
+| 4  | 377k (419k) | 378k (362k) | 355k (375k) | 333k (334k) |
+| 16 | 1.29M (1.30M) | 1.30M (1.34M) | 1.36M (1.26M) | 1.11M (1.08M) |
+| 64 | 3.98M (3.71M) | 3.98M (4.32M) | 0.996M (1.05M) | 1.89M (1.80M) |
+
+**CPU/op (64×64, in-flight 64)** — unchanged:
+
+| transport | throughput | CPU/op | ~cores | p50 | p99 |
+|---|---:|---:|---:|---:|---:|
+| read-ring | 4.77M (4.75M) | 1.24 µs (1.21) | 5.9 | 153 µs | 1760 µs |
+| send-recv | 4.14M (4.40M) | 1.25 µs (1.30) | 5.2 | 345 µs | 1502 µs |
+| tcp | 6.84M (6.75M) | 5.20 µs (5.37) | 35.5 | 272 µs | 1339 µs |
+| credit-ring | 0.98M (1.01M) | 3.18 µs (3.93) | 3.1 | 4183 µs | 4731 µs |
+
+**read-ring depth & hard-cap sweeps** — the knee shifted run-to-run (as the
+baseline already flagged, read-ring is noisy in the 5.0–6.4M band) but the
+architectural ceiling (~6.3M this session) and CPU/op (~0.9–1.0 µs) are intact,
+0 errors: 16×256 5.13M/0.98µs, 32×512 6.32M/0.97µs (session peak), 64×512
+5.21M/0.95µs, 16×2048 6.26M/0.95µs. Connection ceiling reproduced clean —
+192×16 2.48M, 384×16 2.75M, and **448×16 established this reboot-clean NIC**
+(2.78M, 4 negligible errors), i.e. it went past the documented ~384 clean-max
+(the ~384 limit is probabilistic MANA CM-*setup* flakiness, not a data-path wall).
+
+**TCP scaling** — reconfirmed, ~55-core wall: 64×64 6.84M, 128×64 7.97M,
+256×64 8.62M, **512×64 8.94M (session peak)**; in-flight-16 connection sweep flat
+at ~3.2–3.35M (1024/2048/4096 conns) with latency inflating as before. TCP still
+wins the absolute number (~8.9M) by burning ~55 cores; read-ring delivers its
+~6.3M at ~6 cores — the ~6× CPU-efficiency and tail-latency story is unchanged.

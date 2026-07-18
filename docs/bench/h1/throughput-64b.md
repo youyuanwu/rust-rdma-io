@@ -87,3 +87,33 @@ multiplexed concurrent streams. HTTP/1.1 keeps only one request in flight per
 connection — a strict request/response ping-pong — so the two peers never both
 saturate their send queues at once and the cycle cannot form. See
 [../bugs/read-ring-concurrent-stream-deadlock.md](../../bugs/read-ring-concurrent-stream-deadlock.md).
+
+## Re-validation (2026-07-17)
+
+Re-run on the current binary (64 B, `duration=10 warmup=3 threads=64`,
+reboot-clean NIC between ring batches) as a regression check. **No regression** —
+every point that established matches baseline; the only gaps are high-connection
+ring points that failed to *establish* (CM setup), which was flakier than usual
+on this host — never a data-path failure (consistent with h1's no-deadlock
+property; TCP scaled clean to 5120).
+
+**Connection scaling** — req/s, vs baseline:
+
+| conns | tcp1 | read-ring | send-recv | credit-ring |
+|---:|---:|---:|---:|---:|
+| 64   | 286k (309k) | 283k (306k) | 252k (244k) | — |
+| 128  | 340k (355k) | 356k (361k) | 315k (310k) | 360k (353k) |
+| 256  | 432k (414k) | 469k (469k) | ✗ CM setup (295k) | — |
+| 384  | — | 541k (567k) | — | — |
+| 512  | 489k (496k) | ✗ CM setup (582k) | — | — |
+| 1024 | 603k (605k) | — | — | — |
+| 2048 | 727k (724k) | — | — | — |
+| 4096 | 766k (783k) | — | — | — |
+| 5120 | **790k** (784k) | — | — | — |
+
+`tcp1` reproduces its full curve, peaking **~790K at 5120 conns / ~26 cores**.
+The rings match baseline where they establish (read-ring peak **541K at 384
+conns** this session; credit-ring 360K at 128). read-ring 512 and send-recv 256
+failed to *establish* (`Terminated` on CM setup) — a lower CM-setup ceiling than
+baseline on this flaky host, **not** a data-path regression: every ring run that
+started completed with 0 errors, and there is no HTTP/1.1 deadlock.

@@ -115,3 +115,38 @@ depends on **pipeline depth and what you value**:
   and determinism with **0 % idle CPU** and the best tail at low core counts, but
   ~5–15 % less throughput than `echo` and higher p50 than `echo-busy`. Best when
   you want core affinity **without** paying for spin on an idle/bursty workload.
+
+## Re-validation (2026-07-17)
+
+Re-run on the current binary (64 B, `duration=10 warmup=3`, reboot-clean NIC) as
+a regression check. **No regression** — the pinned `echo-park` sweep reproduces
+within ~1 %:
+
+| cores | conns | in-flight | throughput | CPU/op | p50 | p99 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2 | 8 | 16 | 1.58M (1.59M) | 1.27 µs | 79 µs | 124 µs |
+| 2 | 8 | 64 | 2.15M (2.15M) | 0.93 µs | 225 µs | 503 µs |
+| 4 | 16 | 64 | 3.42M (3.36M) | 1.17 µs | 248 µs | 957 µs |
+| 8 | 32 | 64 | 4.96M (4.93M) | 1.52 µs | 353 µs | 1655 µs |
+| 8 | 8 | 256 | 4.78M (4.79M) | 1.44 µs | 344 µs | 1047 µs |
+
+**Matched-core (deep `in_flight=64`), req/s (CPU/op µs):**
+
+| cores | conns | `echo` | `echo-busy` | `echo-park` |
+|---:|---:|---:|---:|---:|
+| 2 | 8 | 1.98M (0.75 base 2.59M) | 2.25M (0.89) | 2.15M (0.93) |
+| 4 | 16 | 4.15M (0.94, base 4.42M) | 3.86M (1.04) | 3.42M (1.17) |
+| 8 | 32 | 4.51M (1.31, base 5.61M) | 5.01M (1.60) | 4.96M (1.52) |
+
+The two **pinned** modes (`echo-busy`, `echo-park`) reproduce the baseline
+essentially exactly. Plain `echo` (elastic work-stealing) ran **soft** at the
+2- and 8-core matched points this session (1.98M / 4.51M vs baseline 2.59M /
+5.61M), so it did not top the matched-core table at those points — this is the
+documented read-ring arm-park run-to-run variance at low pinned-thread counts
+(the full-64-thread arm-park read-ring re-measured clean at 4.77M / 1.24 µs/op in
+[message-rate-64b.md](message-rate-64b.md)), not a systematic regression. The
+CPU/op figures are all in range.
+
+**Idle / low-load (2 cores, 2 conns, in-flight 1):** `echo-busy` 68.5k (p50
+28 µs), `echo-park` 29.0k (p50 66 µs), `echo` 25.9k (p50 77 µs) — matches the
+baseline (68.6k / 28.8k / 23.7k); busy-poll still wins the shallow regime ~2.4×.

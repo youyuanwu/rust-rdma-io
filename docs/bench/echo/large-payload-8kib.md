@@ -71,3 +71,22 @@ in-flight ≤ 16 for 8 KiB; deeper or wider over-queues and hurts. (Note the rin
 holds `ring_capacity / max_message_size ≈ 65536/8192 = 8` message slots at this
 size, so very deep pipelines back-pressure on the byte ring — do not push
 `max_message_size` toward the ring capacity.)
+
+## Re-validation (2026-07-17)
+
+Re-run on the current binary (`payload=8192`, `ring_max_msg=8192` for read-ring,
+`duration=10 warmup=3 threads=64`, reboot-clean NIC) as a regression check. **No
+regression** — both bandwidth ceilings hold and read-ring still wins 8 KiB.
+
+| transport | config | throughput | bandwidth | p50 | p99 | CPU/op | ~cores |
+|---|---|---:|---:|---:|---:|---:|---:|
+| **read-ring** | 24 × 8 (peak) | 533k (539k) | **35.0 Gbps** (35.3) | 268 µs | 619 µs | 4.95 µs | ~2.6 |
+| **tcp** | 32 × 4 (peak) | 452k (454k) | 29.6 Gbps (29.8) | 262 µs | 443 µs | 8.91 µs | ~4.0 |
+
+read-ring sweep (req/s | Gbps): 8×8 350k/22.9, 16×16 501k/32.9, **24×8
+533k/35.0**, 24×16 424k/27.8, 32×16 415k/27.2 — same inverted-U, peak at 24×8
+(the 24×16 point landed on the over-queue side this run, run-to-run knee noise).
+TCP flat at the ~29.2 Gbps bandwidth wall across 32×8 / 64×8 / 32×16 / 64×16 /
+128×16 (all ~446k), latency inflating with concurrency (p50 539 µs → 4.3 ms).
+read-ring still leads by ~+18 % bandwidth on fewer cores — unchanged from
+baseline.

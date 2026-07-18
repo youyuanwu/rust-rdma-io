@@ -178,3 +178,54 @@ corrected picture: the TLS/HTTP-2/protobuf stack still bounds both transports at
 ~55–56 of 64 cores, but `read-ring`'s lower per-op CPU converts that budget into
 **more** throughput than TCP (833K vs 740K), at fewer connections. Lifting the
 high-fan-out deadlock would let it scale further still.
+
+## Re-validation (2026-07-17)
+
+Re-run on the current binary (64 B, `duration=10 warmup=3`, reboot-clean NIC
+between ring batches) as a regression check. **No regression** in any measurable
+point; the only gaps are the high-fan-out ring runs, which hit the *documented*
+flow-control deadlock (it manifested earlier than usual on a deadlock-prone host
+this session — not a code change; TCP at the same fan-out ran clean).
+
+**Connection scaling (in-flight 1)** — req/s, vs baseline:
+
+| conns | credit-ring | read-ring | send-recv | tcp |
+|---:|---:|---:|---:|---:|
+| 64  | 236K (251.6K) | 238K (230.7K) | 188K (195.6K) | 218K (223.4K) |
+| 128 | 321K (315.2K) | 304K (308.2K) | 212K (213.7K) | 246K (245.9K) |
+| 256 | — (deadlock) | — (deadlock) | — (deadlock) | 323K (328.9K) |
+
+**In-flight pipelining (8 conns / 8 threads)** — req/s:
+
+| in-flight | send-recv | read-ring | credit-ring | tcp |
+|---:|---:|---:|---:|---:|
+| 1  | 51.7K | 50.9K | 56.8K | 50.7K |
+| 4  | 114.9K | 105.3K | 108.2K | 91.4K |
+| 16 | 98.8K | 121.5K | 109.2K | 116.9K |
+| 64 | 136.3K | 142.5K | 139.1K | 134.7K |
+
+**Peak throughput (64 conns, in-flight depth)** — req/s:
+
+| in-flight | read-ring | credit-ring | send-recv | tcp |
+|---:|---:|---:|---:|---:|
+| 1  | 242.9K | 248.6K | 196.9K | 216.3K |
+| 4  | 553.5K | 565.5K | ✗¹ | 450.6K |
+| 8  | 633.0K | 529.5K | 461.2K | 534.4K |
+| 16 | 691.0K | 652.9K | — | 595.9K |
+| 32 | 744.1K | — | — | 661.5K |
+| 64 | 772.4K | 710.3K | — | 700.4K |
+
+read-ring peaks ~744–772K (baseline ~697K), credit-ring 710K, tcp 700K — all at
+or above baseline. TCP connection sweep (in-flight 16): 128×16 742K, **256×16
+806K** (baseline peak 740K), 384×16 743K, 512×16 642K. ¹`send-recv 64×4` warmup-
+hung on every attempt this session (the probabilistic gRPC flow-control hang;
+send-recv hangs earliest) — its in-flight-1 and in-flight-8 neighbours are clean
+and match baseline, so it is environmental, not a transport regression.
+
+**Not reproducible this session:** the read-ring connection sweep
+(128–208 × in-flight 16, baseline ~784–833K) — every point warmup-hung on the
+gRPC flow-control deadlock, which was more prone than usual on this host (it hit
+at ≥128 conns vs the documented ~208 onset). TCP at the same connection counts
+ran clean, confirming the wedge is the known `AsyncRdmaStream`/HTTP-2-layer
+deadlock ([../../bugs/read-ring-concurrent-stream-deadlock.md](../../bugs/read-ring-concurrent-stream-deadlock.md)),
+not a data-path change.

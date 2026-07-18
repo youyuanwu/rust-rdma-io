@@ -51,3 +51,30 @@ Takeaways:
   read-ring's ~36 Gbps at 8 KiB: the TLS + hyper + HTTP/1.1 stack (~34 µs/op) plus
   one-in-flight-per-connection request/response cap it below the raw transport's
   zero-copy bandwidth.
+
+## Re-validation (2026-07-17)
+
+Re-run on the current binary (`payload=8192`, rings at `ring_max_msg=9216`,
+`duration=10 warmup=3 threads=64`, reboot-clean NIC) as a regression check. **No
+regression** — every point that established matches baseline; the read-ring
+320/384-conn points failed to *establish* (CM setup) on this flaky host, so the
+read-ring peak could not be pushed past 256 conns this session.
+
+| conns | tcp1 | read-ring | send-recv | credit-ring |
+|---:|---:|---:|---:|---:|
+| 64   | 234k / 15.3 (240k) | 223k / 14.6 (231k) | — | — |
+| 128  | 250k / 16.4 (260k) | 283k / 18.5 (283k) | 259k / 16.9 (255k) | 321k / 21.0 (314k) |
+| 256  | 300k / 19.6 (307k) | 349k / 22.8 (363k) | 322k / 21.1 (307k) | ✗ CM setup |
+| 320  | — | ✗ CM setup (388k) | — | — |
+| 384  | — | ✗ CM setup (410k) | — | — |
+| 512  | 398k / 26.1 (402k) | — | — | — |
+| 1024 | **437k / 28.7** (437k) | — | — | — |
+| 2048 | 435k / 28.5 (434k) | — | — | — |
+
+(req/s | Gbps; baseline in parens.) `tcp1` reproduces its full ~28.7 Gbps
+bandwidth wall (peak **437K at 1024 conns**). The rings match baseline where they
+establish (read-ring 349K / 22.8 Gbps at 256, its measured peak this session;
+send-recv 322K at 256; credit-ring 321K at 128). read-ring 320/384 — its baseline
+peak region (~410K) — would not *establish* on this host's flakier CM setup, so
+the peak reads lower this run purely from the setup ceiling, not a data-path
+change (every ring run that started had 0 errors, no deadlock).

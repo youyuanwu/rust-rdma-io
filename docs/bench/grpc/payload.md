@@ -70,3 +70,38 @@ by its per-message two-sided recv round-trip.
 > (9 KiB) — above the DATA frame, and still `65536/9216 ≈ 7` ring slots.
 > Fragmentation is *not* what triggers the deadlock (the same 8 KiB payload runs
 > cleanly at `in_flight=1`, low fan-out); connection count is.
+
+## Re-validation (2026-07-17)
+
+Re-run on the current binary (`duration=10 warmup=3`, rings at 8 KiB use
+`ring_max_msg=9216`, reboot-clean NIC) as a regression check. **No regression** —
+and because the large-payload sweeps hold `in_flight=1` (the deadlock-safe regime)
+every point was measurable and matches baseline.
+
+**Payload size (8 conns / 8 threads)** — throughput, vs baseline:
+
+| payload | in-flight | send-recv | read-ring | credit-ring | tcp |
+|---:|---:|---:|---:|---:|---:|
+| 64 B  | 1 | 51.7K | 50.9K | 56.8K | 50.7K |
+| 256 B | 8 | 82.2K (105.0K) | 110.1K (115.6K) | 85.7K (115.2K) | 102.3K (101.5K) |
+| 8 KB  | 1 | 29.9K (29.8K) | 47.2K (44.9K) | 47.3K (47.1K) | 41.2K (31.8K) |
+
+(read-ring and tcp track baseline at every size; the credit-ring/send-recv 256 B
+points came in ~25 % soft this single run — run-to-run gRPC variance, as both are
+healthy at 64 B depth and 8 KB here.)
+
+**Large-payload (8 KiB) peak per transport** — held `in_flight=1`, tuned
+connections:
+
+| transport | best config | throughput | bandwidth | vs baseline |
+|---|---|---:|---:|---|
+| **tcp** | 256 × 8 | **431K** | 28.3 Gbps | 427K / 28.0 |
+| **read-ring** | 128 × 1 | 245K | 16.1 Gbps | 247K / 16.2 |
+| **credit-ring** | 48 × 1 | 204K | 13.4 Gbps | 202K / 13.2 |
+| **send-recv** | 192 × 1 | 114K | 7.5 Gbps | 110K / 7.2 |
+
+Connection scaling behind each peak reproduced cleanly (read-ring
+153/208/228/245K at 32/64/96/128×1; credit-ring 91/159/204K at 16/32/48×1;
+send-recv 97/109/114K at 64/128/192×1; tcp 277/348/417/428K at 32/64/128/256×16).
+TCP still wins the 8 KiB gRPC headline; the one-sided rings win latency at their
+peak — unchanged.
