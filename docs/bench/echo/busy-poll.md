@@ -75,16 +75,26 @@ Re-run on the current binary (64 B, `duration=10 warmup=3`, reboot-clean NIC) as
 a regression check. **No regression** — being pinned-core deterministic, every
 point reproduces within ~1 %:
 
-| cores | conns | in-flight | throughput | CPU/op | p50 | p99 |
-|---:|---:|---:|---:|---:|---:|---:|
-| 2 | 8 | 16 | 1.90M (1.91M) | 1.05 µs | 64 µs | 95 µs |
-| 2 | 8 | 64 | 2.25M (2.26M) | 0.89 µs | 169 µs | 1368 µs |
-| 4 | 16 | 64 | 3.86M (3.87M) | 1.04 µs | 202 µs | 1820 µs |
-| 8 | 32 | 64 | 5.01M (5.02M) | 1.60 µs | 246 µs | 884 µs |
-| 8 | 16 | 128 | 5.01M (5.02M) | 1.60 µs | 295 µs | 970 µs |
-| 8 | 8 | 256 | 5.07M (5.08M) | 1.58 µs | 359 µs | 633 µs |
-| 16 | 64 | 64 | 5.39M (5.39M) | 2.97 µs | 423 µs | 2381 µs |
+| cores | conns | in-flight | echo-busy | tcp echo¹ | CPU/op | p50 | p99 |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2 | 8 | 16 | 1.90M (1.91M) | 0.89M | 1.05 µs | 64 µs | 95 µs |
+| 2 | 8 | 64 | 2.25M (2.26M) | 1.05M | 0.89 µs | 169 µs | 1368 µs |
+| 4 | 16 | 64 | 3.86M (3.87M) | 1.59M | 1.04 µs | 202 µs | 1820 µs |
+| 8 | 32 | 64 | 5.01M (5.02M) | 2.59M | 1.60 µs | 246 µs | 884 µs |
+| 8 | 16 | 128 | 5.01M (5.02M) | 2.13M | 1.60 µs | 295 µs | 970 µs |
+| 8 | 8 | 256 | 5.07M (5.08M) | 1.56M | 1.58 µs | 359 µs | 633 µs |
+| 16 | 64 | 64 | 5.39M (5.39M) | 4.59M | 2.97 µs | 423 µs | 2381 µs |
+
+¹ `tcp echo` = kernel-socket `--transport tcp` at the same cores (threads) /
+connections / in-flight (a shared-runtime kernel baseline; TCP has no busy-poll
+mode). It runs at **2.2–3.9 µs/op** vs busy-poll's ~1–1.6 µs, so read-ring
+busy-poll delivers ~1.2–2.5× the throughput at a fraction of the CPU/op across
+the sweep — the pinned single-CQ reaper is both faster and cheaper than kernel
+TCP at matched cores (they converge only at 16 cores, where the shared NIC
+message rate caps read-ring at ~5.4M vs TCP's 4.6M).
 
 The ~5.0M efficient / ~5.4M peak ceiling, the per-core scaling knee, and the
 idle-load point (2 cores / 2 conns / in-flight 1 → 68.5k, 0.89 µs/op after
-warmup, p50 28 µs — baseline 68.6k) all hold.
+warmup, p50 28 µs — baseline 68.6k) all hold. The matched-core `tcp echo` idle
+point is 25.0k at p50 77 µs, so busy-poll wins the shallow regime ~2.7× on both
+throughput and latency.

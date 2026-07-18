@@ -135,29 +135,37 @@ setup) on this flaky host.
 
 | mode | throughput | p50 | p99 | µs/op |
 |---|---:|---:|---:|---:|
+| `tcp1` (kernel)¹ | 169K | 187 µs | 298 µs | 20.6 |
 | `rh1` (shared) | 216K (194K) | 144 µs | 244 µs | 15.8 |
 | `rh1-park` | 286K (303K) | 90 µs | 197 µs | 13.2 |
 | **`rh1-busy`** | **431K** (437K) | **73 µs** | **100 µs** | **9.3** |
 
-Busy-poll still wins matched-core outright (~2× the shared runtime, ~9.3 µs/op).
+¹ `tcp1` = kernel HTTP/1.1 baseline at the same core budget (threads=4) and
+connections; it has no thread-per-core mode. `rh1-busy` delivers ~2.5× its
+throughput at ~half the p50 and CPU/op.
+
+Busy-poll still wins matched-core outright (~2× the shared runtime, ~2.5× kernel
+`tcp1`, ~9.3 µs/op).
 
 **Peak / ceiling (8 conns/core):**
 
-| cores | conns | `rh1-busy` | `rh1-park` |
-|---:|---:|---|---|
-| 4  | 32  | 431K · 9.3 µs/op | 286K · 13.2 µs/op |
-| 8  | 64  | 852K · 9.4 µs/op | 579K · 12.8 µs/op |
-| 16 | 128 | **1461K · 10.9 µs/op** | 385K · 16.1 µs/op ↓ |
-| 32 | 256 | ✗ CM setup | ✗ CM setup |
+| cores | conns | `rh1-busy` | `rh1-park` | `tcp1` (kernel) |
+|---:|---:|---|---|---|
+| 4  | 32  | 431K · 9.3 µs/op | 286K · 13.2 µs/op | 169K · 20.6 µs/op |
+| 8  | 64  | 852K · 9.4 µs/op | 579K · 12.8 µs/op | 250K · 22.6 µs/op |
+| 16 | 128 | **1461K · 10.9 µs/op** | 385K · 16.1 µs/op ↓ | 345K · 22.8 µs/op |
+| 32 | 256 | ✗ CM setup | ✗ CM setup | 407K · 26.4 µs/op |
 
 `rh1-busy` **peaks at ~1.46M req/s at 16 pinned cores** (baseline 1.37M),
-scaling near-linear at ~108K/core; `rh1-park` holds its ~579K / 8-core ceiling
-then regresses at 16 cores — both unchanged from baseline. The 32-core / 256-conn
-points would not *establish* this session (CM-setup flakiness at high fan-out),
-so the past-16-core regression could not be re-measured; it is a setup ceiling,
-not a data-path result.
+scaling near-linear at ~108K/core — ~4× kernel `tcp1` at the same 16 cores (345K)
+and at ~half the CPU/op; `rh1-park` holds its ~579K / 8-core ceiling then
+regresses at 16 cores — both unchanged from baseline. The 32-core / 256-conn
+ring points would not *establish* this session (CM-setup flakiness at high
+fan-out), so the past-16-core regression could not be re-measured — a setup
+ceiling, not a data-path result; kernel `tcp1` scaled clean to 407K there (no CM
+setup to fail).
 
 **Idle / low-load (2 cores, 2 conns):** `rh1` 24.3K (p50 80 µs), `rh1-park`
-24.5K (p50 81 µs), `rh1-busy` 48.0K (p50 41 µs) — matches baseline (22.9 / 24.4 /
-48.0K); busy-poll still doubles throughput and halves latency at the cost of two
-pinned cores.
+24.5K (p50 81 µs), `rh1-busy` 48.0K (p50 41 µs), `tcp1` 22.7K (p50 85 µs) —
+matches baseline (22.9 / 24.4 / 48.0K); busy-poll still doubles throughput and
+halves latency over both `rh1` and kernel `tcp1` at the cost of two pinned cores.
