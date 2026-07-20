@@ -29,7 +29,11 @@ here. Shared strategy / methodology / metrics live one level up
 Results for each scenario (regime files grouped by scenario). The regime files are
 added as each scenario is migrated.
 
-- **[Echo](../scenarios/echo.md)** — _populated during migration_
+- **[Echo](../scenarios/echo.md)** —
+  [message-rate (64 B)](echo/message-rate-64b.md) ·
+  [large-payload (8 KiB)](echo/large-payload-8kib.md) ·
+  [busy-poll](echo/busy-poll.md) ·
+  [thread-per-core (echo-park)](echo/thread-per-core-park.md)
 - **[gRPC](../scenarios/grpc.md)** — _populated during migration_
 - **[HTTP/1.1](../scenarios/h1.md)** — _populated during migration_
 

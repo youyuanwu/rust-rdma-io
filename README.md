@@ -184,7 +184,7 @@ Design documents and background research are in [`docs/`](docs/):
 | [msquic-rdma.md](docs/background/msquic-rdma.md) | msquic RDMA transport architecture analysis |
 | [bench/grpc/README.md](docs/bench/grpc/README.md) | gRPC-over-RDMA (`rh2`) vs TCP benchmark scenario + results |
 | [bench/h1/README.md](docs/bench/h1/README.md) | HTTP/1.1 (`rh1`/`tcp1`) benchmark scenario + results |
-| [bench/echo/README.md](docs/bench/echo/README.md) | Direct-transport (`--mode echo`) benchmark scenario + results |
+| [bench/scenarios/echo.md](docs/bench/scenarios/echo.md) | Direct-transport (`--mode echo`) benchmark scenario + results |
 
 ## CI
 

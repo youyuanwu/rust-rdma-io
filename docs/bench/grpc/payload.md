@@ -25,7 +25,7 @@ At an 8 KB payload the one-sided ring transports (44.9K / 47.1K) outrun both
 The payload-size table above is `in_flight=1` at a fixed 8 conns. Pushing each
 transport for **peak** 8 KiB throughput (tuning connections *and* in-flight,
 `threads=64`, reboot-clean NIC) tells the opposite story to the raw-transport
-[echo 8 KiB result](../echo/large-payload-8kib.md#large-payload-8-kib-ceiling-read-ring-vs-tcp), where
+[echo 8 KiB result](../azure-mana-rocev2/echo/large-payload-8kib.md#large-payload-8-kib-ceiling-read-ring-vs-tcp), where
 read-ring *wins*. Best config = `connections × in-flight`:
 
 | transport | best config | **max throughput** | bandwidth | p50 | p99 | CPU/op | ~cores | limited by |
