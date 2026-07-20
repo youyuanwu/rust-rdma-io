@@ -43,41 +43,8 @@ added as each scenario is migrated.
   [thread-per-core](h1/thread-per-core.md) ·
   [large-payload (8 KiB)](h1/large-payload-8kib.md)
 
-## Recording convention (read before adding results)
+## Recording convention
 
-Results are **append-only, newest on top**. Each regime file
-(`<scenario>/<regime>.md`) is:
-
-```
-# <Regime title>
-<one-line intro linking the shared scenario doc>
-
-## Results
-### <YYYY-MM-DD> — <label>          (newest first)
-- **Date:** 2026-07-17
-- **Environment:** [azure-mana-rocev2](../README.md)
-- **Commit:** `192daa7`             (or `unknown` — never guessed)
-- **Command:** `just bench-echo --transport read-ring …`   (or `TODO — not recorded`)
-- *(optional)* duration/warmup/threads · reboot-clean NIC · raw JSON `build/…/archive/`
-
-<this run's tables AND its analysis stay together, in this block>
-
-### Undated — historical baseline    (last block, only if the baseline date is unrecoverable)
-- **Date:** unknown
-- **Environment:** … **Commit:** … **Command:** …
-```
-
-Rules:
-
-- **Mandatory provenance (per block):** `**Date:**`, `**Environment:**`,
-  `**Commit:**`, `**Command:**`. Unrecoverable values are marked `unknown` /
-  `TODO — not recorded`, **never guessed**.
-- **Exact command:** the real recorded `**Command:**` carries the full command line
-  (no illustrative `…`).
-- **Newest first;** an `### Undated — historical baseline` block sorts **last**.
-- **Per-block attribution:** each run's tables and the prose analysing them stay
-  **together** in that run's block. Only environment-invariant explanation belongs
-  in the shared docs.
-- **Adding a new environment:** create `docs/bench/<env>/README.md` (this template)
-  and add a row to the [bench Environments table](../README.md#environments). Shared
-  docs are reused unchanged.
+Results in this tree follow the shared **[recording convention](../recording.md)** —
+append-only dated blocks (newest first) with a mandatory Date / Environment / Commit /
+Command provenance header. Read it before adding results or a new environment.

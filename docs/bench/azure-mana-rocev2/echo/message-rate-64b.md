@@ -85,7 +85,7 @@ cores, so the gRPC-layer throughput is bounded by the stack, not the byte transp
 - **Environment:** [azure-mana-rocev2](../README.md)
 - **Commit:** `unknown` (not recorded)
 - **Command:** `TODO — not recorded`
-- 64 B, `duration=8 warmup=3 threads=64`, reboot-clean NIC
+- 64 B, `warmup=3 threads=64` (duration not recorded; the echo re-validations used `duration=10`), reboot-clean NIC
 
 #### Ring in-flight ceiling (fixed)
 

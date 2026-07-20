@@ -15,7 +15,7 @@ definition for each.
 
 ## CPU efficiency
 
-The echo client samples its own resource use: a sampler task snapshots
+The bench client samples its own resource use: a sampler task snapshots
 `/proc/self/stat` (user + system CPU, summed across all threads) at the warm-up and
 benchmark deadlines, so the delta covers **only the measured window** (excluding
 connection setup and warm-up), plus the `VmHWM` peak RSS. These surface in the

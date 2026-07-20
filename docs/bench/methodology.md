@@ -22,10 +22,12 @@ raise the soft limit to match — the connection counts in these docs are theref
 
 ## Run parameters
 
-64 B message-rate runs use `duration=8 warmup=3 threads=64` unless a result block
-states otherwise (large-payload and thread-per-core sweeps vary these — each block
-records its own parameters). Peaks reported in the results are the **last clean
-point** before throughput regresses or CM setup starts failing.
+64 B message-rate runs typically use `duration≈8–10 warmup=3 threads=64` (the
+HTTP/1.1 baselines recorded `duration=8`; echo re-validations used `duration=10`).
+**Each result block records its own parameters** — large-payload and thread-per-core
+sweeps vary these, and where a run's duration was not recorded it is left unstated
+rather than assumed. Peaks reported in the results are the **last clean point**
+before throughput regresses or CM setup starts failing.
 
 ## Reboot cadence and NIC wedges
 
