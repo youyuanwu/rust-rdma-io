@@ -34,7 +34,10 @@ added as each scenario is migrated.
   [large-payload (8 KiB)](echo/large-payload-8kib.md) ·
   [busy-poll](echo/busy-poll.md) ·
   [thread-per-core (echo-park)](echo/thread-per-core-park.md)
-- **[gRPC](../scenarios/grpc.md)** — _populated during migration_
+- **[gRPC](../scenarios/grpc.md)** —
+  [throughput & pipelining (64 B)](grpc/throughput-64b.md) ·
+  [payload size](grpc/payload.md) ·
+  [client CPU & memory](grpc/cpu-memory.md)
 - **[HTTP/1.1](../scenarios/h1.md)** — _populated during migration_
 
 ## Recording convention (read before adding results)

@@ -46,7 +46,7 @@ Takeaways:
   one-request-per-connection keeps the peers from both write-blocking. This is the
   **opposite** of the 8 KiB *gRPC* result, where the `rh2` rings hit the
   flow-control deadlock at modest fan-out and TCP won decisively (see
-  [gRPC](../grpc/payload.md)).
+  [gRPC](../azure-mana-rocev2/grpc/payload.md)).
 - **read-ring trails raw echo.** h1 read-ring peaks ~26.9 Gbps vs raw-`echo`
   read-ring's ~36 Gbps at 8 KiB: the TLS + hyper + HTTP/1.1 stack (~34 µs/op) plus
   one-in-flight-per-connection request/response cap it below the raw transport's

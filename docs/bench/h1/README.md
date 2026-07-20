@@ -3,7 +3,7 @@
 The HTTP/1.1 benchmark drives the hyper `http1` + OpenSSL/TLS stack with **no
 stream multiplexing** — each connection issues exactly one request at a time
 (`--in-flight` is ignored and reported as 1), so offered load scales with
-`--connections`. This is the structural opposite of the [gRPC](../grpc/README.md)
+`--connections`. This is the structural opposite of the [gRPC](../scenarios/grpc.md)
 `rh2` scenario, where one connection multiplexes many concurrent RPCs.
 
 - **`rh1`** — HTTP/1.1 over the same OpenSSL/TLS layer as `rh2`, carried on the
@@ -35,4 +35,4 @@ all run on one core's `current_thread` runtime (mirroring the
   - [thread-per-core (`rh1-busy` / `rh1-park`)](thread-per-core.md)
   - [large-payload (8 KiB)](large-payload-8kib.md)
   - [methodology](methodology.md)
-- **Other scenarios**: [echo](../scenarios/echo.md) · [gRPC](../grpc/README.md)
+- **Other scenarios**: [echo](../scenarios/echo.md) · [gRPC](../scenarios/grpc.md)
