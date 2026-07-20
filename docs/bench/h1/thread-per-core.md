@@ -14,7 +14,7 @@ RDMA completion handling can all migrate across cores (tokio work-stealing).
 `rh1-busy` and `rh1-park` instead **pin each connection to a core for life** — the
 read-ring transport, the `AsyncRdmaStream`, the OpenSSL session, and the hyper
 `http1` driver all run on one core's `current_thread` runtime — mirroring the
-[`echo-busy` / `echo-park`](../echo/README.md) topologies:
+[`echo-busy` / `echo-park`](../scenarios/echo.md) topologies:
 
 - **`rh1-busy`** drives completions with a shared-CQ busy-poll `CoreDriver` per
   core (100 % core even when idle, zero hot-path syscalls, lowest latency).
@@ -45,7 +45,7 @@ runtime, but paying a wakeup per completion keeps it behind busy-poll.
 
 **Why busy-poll wins here but not for deep-pipeline `echo`.** HTTP/1.1 has no
 request multiplexing, so it is *permanently* in the shallow one-in-flight regime —
-exactly where [`echo`](../echo/busy-poll.md) found busy-poll ahead (2.4–2.9×). There is no deep
+exactly where [`echo`](../azure-mana-rocev2/echo/busy-poll.md) found busy-poll ahead (2.4–2.9×). There is no deep
 pipeline for the shared runtime's work-stealing to amortize the per-message
 interrupt against (the crossover that let plain `echo` overtake busy-poll at
 `in_flight=64` never happens for h1). Pinning also keeps each connection's OpenSSL

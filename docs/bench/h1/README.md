@@ -17,7 +17,7 @@ stream multiplexing** — each connection issues exactly one request at a time
 `rh1-busy` and `rh1-park` pin each connection to a core for life — the read-ring
 transport, `AsyncRdmaStream`, the OpenSSL session, and the hyper `http1` driver
 all run on one core's `current_thread` runtime (mirroring the
-[`echo-busy` / `echo-park`](../echo/README.md) topologies):
+[`echo-busy` / `echo-park`](../scenarios/echo.md) topologies):
 
 - **`rh1-busy`** — shared-CQ busy-poll `CoreDriver` per core (100 % core even
   when idle, no hot-path syscalls, lowest latency).
@@ -35,4 +35,4 @@ all run on one core's `current_thread` runtime (mirroring the
   - [thread-per-core (`rh1-busy` / `rh1-park`)](thread-per-core.md)
   - [large-payload (8 KiB)](large-payload-8kib.md)
   - [methodology](methodology.md)
-- **Other scenarios**: [echo](../echo/README.md) · [gRPC](../grpc/README.md)
+- **Other scenarios**: [echo](../scenarios/echo.md) · [gRPC](../grpc/README.md)

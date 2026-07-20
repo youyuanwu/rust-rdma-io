@@ -5,7 +5,7 @@ HTTP/2 + protobuf + hyper** stack on top of the RDMA byte stream
 (`AsyncRdmaStream`), versus a `tcp` baseline running the *same* tonic + TLS stack
 over a kernel socket. This measures gRPC-over-RDMA end to end — the layers gRPC
 adds on top of the transport, not the raw transport (for that see the
-[echo](../echo/README.md) scenario).
+[echo](../scenarios/echo.md) scenario).
 
 - **`rh2`** — gRPC / HTTP-2 over one of the RDMA transports (`send-recv` /
   `read-ring` / `credit-ring`); MR-rkey fallback is auto-detected per run.
@@ -27,4 +27,4 @@ This is where the high-fan-out **flow-control deadlock** in the
   - [throughput & pipelining (64 B)](throughput-64b.md)
   - [payload size (64 B → 8 KiB)](payload.md)
   - [client CPU & memory](cpu-memory.md)
-- **Other scenarios**: [echo](../echo/README.md) · [HTTP/1.1](../h1/README.md)
+- **Other scenarios**: [echo](../scenarios/echo.md) · [HTTP/1.1](../h1/README.md)
