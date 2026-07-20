@@ -183,7 +183,7 @@ Design documents and background research are in [`docs/`](docs/):
 | [siw-vs-rxe.md](docs/background/siw-vs-rxe.md) | Software provider comparison |
 | [msquic-rdma.md](docs/background/msquic-rdma.md) | msquic RDMA transport architecture analysis |
 | [bench/scenarios/grpc.md](docs/bench/scenarios/grpc.md) | gRPC-over-RDMA (`rh2`) vs TCP benchmark scenario + results |
-| [bench/h1/README.md](docs/bench/h1/README.md) | HTTP/1.1 (`rh1`/`tcp1`) benchmark scenario + results |
+| [bench/scenarios/h1.md](docs/bench/scenarios/h1.md) | HTTP/1.1 (`rh1`/`tcp1`) benchmark scenario + results |
 | [bench/scenarios/echo.md](docs/bench/scenarios/echo.md) | Direct-transport (`--mode echo`) benchmark scenario + results |
 
 ## CI

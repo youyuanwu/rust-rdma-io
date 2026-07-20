@@ -38,7 +38,10 @@ added as each scenario is migrated.
   [throughput & pipelining (64 B)](grpc/throughput-64b.md) ·
   [payload size](grpc/payload.md) ·
   [client CPU & memory](grpc/cpu-memory.md)
-- **[HTTP/1.1](../scenarios/h1.md)** — _populated during migration_
+- **[HTTP/1.1](../scenarios/h1.md)** —
+  [throughput (64 B)](h1/throughput-64b.md) ·
+  [thread-per-core](h1/thread-per-core.md) ·
+  [large-payload (8 KiB)](h1/large-payload-8kib.md)
 
 ## Recording convention (read before adding results)
 
