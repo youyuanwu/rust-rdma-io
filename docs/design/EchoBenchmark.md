@@ -280,4 +280,4 @@ just run-bench mode=echo transport=read-ring in_flight=64 payload=64 \
 
 The measured findings — the ring in-flight ceiling, CPU-efficiency and depth
 scaling, the read-ring / TCP throughput ceilings, and the 2026-07-07
-re-validation — have moved to [../bench/echo/README.md](../bench/echo/README.md).
+re-validation — have moved to [../bench/scenarios/echo.md](../bench/scenarios/echo.md).
