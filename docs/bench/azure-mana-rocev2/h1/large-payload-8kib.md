@@ -19,6 +19,19 @@ that established matches baseline; the read-ring 320/384-conn points failed to
 *establish* (CM setup) on this flaky host, so the read-ring peak could not be pushed
 past 256 conns this session.
 
+**Headline (canonical schema)** — peak throughput per transport this session (in-flight 1; CPU/latency not re-recorded this run):
+
+| transport | throughput | CPU/op | cores@peak | p50 | p99 | peak RSS | vs baseline |
+|---|---:|---:|---:|---:|---:|---:|---|
+| send-recv | 322k | n/r | n/r | n/r | n/r | n/r | n/r · n/r · 74% |
+| read-ring | 349k | n/r | n/r | n/r | n/r | n/r | n/r · n/r · 80% |
+| credit-ring | 321k | n/r | n/r | n/r | n/r | n/r | n/r · n/r · 73% |
+| tcp1 | 437k | n/r | n/r | n/r | n/r | n/r | baseline |
+
+Bandwidth (best config): tcp1 1024c → 28.7 Gbps; read-ring 256c → 22.8 Gbps (its
+measured peak this session; 320/384c would not establish); send-recv 256c →
+21.1 Gbps; credit-ring 128c → 21.0 Gbps.
+
 | conns | tcp1 | read-ring | send-recv | credit-ring |
 |---:|---:|---:|---:|---:|
 | 64   | 234k / 15.3 (240k) | 223k / 14.6 (231k) | — | — |
@@ -53,12 +66,17 @@ ring transports carry each request/response in a single RDMA message by setting
 ring slots) — the same max-message strategy used for the 8 KiB echo and gRPC runs.
 `send-recv` (64 KiB stream buffer) and `tcp1` (kernel) need no tuning.
 
-| mode / transport | peak throughput | bandwidth | peak conns | ~cores | p50 | p99 | ceiling set by |
+| transport | throughput | CPU/op | cores@peak | p50 | p99 | peak RSS | vs baseline |
 |---|---:|---:|---:|---:|---:|---:|---|
-| **tcp1** (kernel) | **~437K** | **28.6 Gbps** | 1024 | ~19 | 2309 µs | 4247 µs | bandwidth (flat past 1024) |
-| **rh1** read-ring | ~410K | 26.9 Gbps | 384 | ~14 | 889 µs | 1954 µs | MANA CM-setup flakiness (≥512) |
-| **rh1** credit-ring | ~314K | 20.6 Gbps | 128 | ~10 | 383 µs | 874 µs | MANA CM-setup flakiness (≥192) |
-| **rh1** send-recv | ~308K | 20.2 Gbps | 256 | ~8 | 819 µs | 1380 µs | latency plateau + CM flakiness |
+| send-recv | 308K | n/r | ~8 | 819 µs | 1380 µs | n/r | n/r · 0.3× · 70% |
+| read-ring | 410K | n/r | ~14 | 889 µs | 1954 µs | n/r | n/r · 0.5× · 94% |
+| credit-ring | 314K | n/r | ~10 | 383 µs | 874 µs | n/r | n/r · 0.2× · 72% |
+| tcp1 | 437K | n/r | ~19 | 2309 µs | 4247 µs | n/r | baseline |
+
+Bandwidth / peak conns / ceiling: tcp1 28.6 Gbps @ 1024c (bandwidth wall, flat past
+1024); read-ring 26.9 Gbps @ 384c (MANA CM-setup flakiness ≥512); credit-ring
+20.6 Gbps @ 128c (CM flakiness ≥192); send-recv 20.2 Gbps @ 256c (latency plateau +
+CM flakiness). CPU/op not measured for this regime (cores reported) → CPU-eff× `n/r`.
 
 Connection scaling (req/s | Gbps), all 0 errors:
 

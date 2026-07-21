@@ -22,6 +22,19 @@ that failed to *establish* (CM setup), which was flakier than usual on this host
 never a data-path failure (consistent with h1's no-deadlock property; TCP scaled
 clean to 5120).
 
+**Headline (canonical schema)** — peak throughput per transport this session (all at in-flight 1; CPU/latency not re-recorded this run):
+
+| transport | throughput | CPU/op | cores@peak | p50 | p99 | peak RSS | vs baseline |
+|---|---:|---:|---:|---:|---:|---:|---|
+| send-recv | 315k | n/r | n/r | n/r | n/r | n/r | n/r · n/r · 40% |
+| read-ring | 541k | n/r | n/r | n/r | n/r | n/r | n/r · n/r · 68% |
+| credit-ring | 360k | n/r | n/r | n/r | n/r | n/r | n/r · n/r · 46% |
+| tcp1 | 790k | n/r | n/r | n/r | n/r | n/r | baseline |
+
+Best config (conns, in-flight 1): read-ring 384; credit-ring 128; send-recv 128;
+tcp1 5120. Higher ring fan-outs failed to *establish* (CM setup), not a data-path
+failure. Baseline is `tcp1` (kernel HTTP/1.1).
+
 **Connection scaling** — req/s, vs baseline:
 
 | conns | tcp1 | read-ring | send-recv | credit-ring |
@@ -52,12 +65,18 @@ completed with 0 errors, and there is no HTTP/1.1 deadlock.
 
 #### Peak throughput (64 B)
 
-| mode / transport | peak throughput | peak conns | ~cores | p50 | p99 | ceiling set by |
-|---|---:|---:|---:|---:|---:|---|
-| **tcp1** (kernel) | **~780K** | 3072 | ~26 | 3817 µs | 7371 µs | TLS/hyper stack + CPU (flat beyond ~3K conns) |
-| **rh1** read-ring | ~582K | 512 | ~12 | 856 µs | 1656 µs | latency knee + MANA CM-setup flakiness (≥768) |
-| **rh1** credit-ring | ~353K | 128 | ~7.3 | 341 µs | 766 µs | MANA CM-setup flakiness (≥192) |
-| **rh1** send-recv | ~310K | 128 | ~5.5 | 403 µs | 702 µs | latency plateau + CM-setup flakiness (≥384) |
+| transport | throughput | CPU/op | cores@peak | p50 | p99 | peak RSS | vs baseline |
+|---|---:|---:|---:|---:|---:|---:|---|
+| send-recv | 310K | n/r | ~5.5 | 403 µs | 702 µs | n/r | n/r · 0.1× · 40% |
+| read-ring | 582K | n/r | ~12 | 856 µs | 1656 µs | n/r | n/r · 0.2× · 75% |
+| credit-ring | 353K | n/r | ~7.3 | 341 µs | 766 µs | n/r | n/r · 0.1× · 45% |
+| tcp1 | 780K | n/r | ~26 | 3817 µs | 7371 µs | n/r | baseline |
+
+Peak conns (in-flight 1) / ceiling: tcp1 3072 (TLS/hyper + CPU wall, flat beyond
+~3K); read-ring 512 (latency knee + MANA CM-setup flakiness ≥768); credit-ring 128
+(CM-setup flakiness ≥192); send-recv 128 (latency plateau + CM-setup ≥384). CPU/op
+was not measured for this regime (cores reported instead), so CPU-eff× is `n/r`;
+every run had **0 errors**.
 
 Every run had **0 errors** — all the "ceilings" are either a latency/throughput knee
 or connection *setup* flakiness, never a data-path failure (see "No data-path
