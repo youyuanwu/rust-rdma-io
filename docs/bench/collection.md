@@ -106,7 +106,9 @@ how its coverage cells are marked.
 
 Each scoreboard number is drawn deterministically so a reader can trace it:
 
-- From the regime's **newest dated result block**.
+- From the regime's **newest dated result block that recorded the headline metric
+  set** (a newer block that only re-validated a subset may be session-limited; the
+  scoreboard notes the source date per regime for traceability).
 - Each transport at its **characteristic peak** (the config the detail page
   presents as that transport's headline — e.g. read-ring at its depth optimum).
 - The **config is annotated** on the regime via a **best-config footnote** where a

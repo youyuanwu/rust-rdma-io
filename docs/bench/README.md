@@ -2,12 +2,15 @@
 
 Measured benchmark write-ups for the `rdma-io-bench` tool, comparing the three
 RDMA transports (`send-recv` / `read-ring` / `credit-ring`) against a kernel
-baseline. This directory is organized so results scale across **hardware
-environments** and **repeated runs over time**:
+baseline. Each environment's **scoreboard** is the comparison-first entry point;
+the directory is organized so results scale across **hardware environments** and
+**repeated runs over time**:
 
+- **Per-environment scoreboards** present the RDMA-vs-TCP comparison (all three
+  transports vs the baseline) in one canonical view, backed by a coverage matrix.
 - **Shared docs** define what/how/why once, independent of any environment.
 - **Environment trees** (`<env>/`) hold the measured results for one NIC/driver
-  era; each environment's `README.md` is the authoritative index of its results.
+  era; each has a `scoreboard.md` (start here) and regime detail pages.
 
 ## Shared documentation
 
@@ -23,9 +26,9 @@ environments** and **repeated runs over time**:
 
 ## Environments
 
-| Environment | Hardware / NIC era | Results index |
-|---|---|---|
-| **azure-mana-rocev2** | Azure MANA RoCEv2, 64-vCPU E-series VMs | [azure-mana-rocev2/README.md](azure-mana-rocev2/README.md) |
+| Environment | Hardware / NIC era | Scoreboard | Environment README |
+|---|---|---|---|
+| **azure-mana-rocev2** | Azure MANA RoCEv2, 64-vCPU E-series VMs | [▶ scoreboard](azure-mana-rocev2/scoreboard.md) | [README](azure-mana-rocev2/README.md) |
 
 ## Adding results / a new environment
 
@@ -33,11 +36,13 @@ See the [collection protocol](collection.md) for the full workflow. In brief:
 
 - **New run of an existing regime** — **prepend** a dated result block (newest on
   top) to the matching `<env>/<scenario>/<regime>.md` file, with its Date /
-  Environment / Commit / Command provenance header.
+  Environment / Commit / Command provenance header and canonical comparison table,
+  then flip the affected cell in that environment's coverage matrix.
 - **A new NIC/driver era** — create a new `<env>/` tree (durable slug
-  `<cloud>-<nic>[-<variant>]`, e.g. `azure-mana-rocev2`) with its own `README.md`
-  (environment definition + results index) and add a row to the Environments table
-  above. Shared docs are reused unchanged.
+  `<cloud>-<nic>[-<variant>]`, e.g. `azure-mana-rocev2`) with its own `scoreboard.md`
+  (comparison-first view + coverage matrix) and `README.md` (environment definition +
+  results index), and add a row to the Environments table above. Shared docs are
+  reused unchanged.
 
 Raw result JSON is archived by the bench tool under the gitignored
 `build/…/archive/`; these docs are the curated write-ups, not the raw log.
