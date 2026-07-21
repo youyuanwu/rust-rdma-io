@@ -21,6 +21,19 @@ Re-run on the current binary as a regression check. **No regression** — being
 pinned-core deterministic, every point reproduces within ~1 % (prior value in
 parentheses):
 
+**Headline (canonical schema)** — read-ring busy-poll (`echo-busy`) vs kernel baseline at matched cores (16 × 64 × 64):
+
+| transport | throughput | CPU/op | cores@peak | p50 | p99 | peak RSS | vs baseline |
+|---|---:|---:|---:|---:|---:|---:|---|
+| send-recv | — N/A (no busy-poll mode) | | | | | | |
+| read-ring (busy-poll) | 5.39M | 2.97 µs | 16 | 423 µs | 2381 µs | n/r | n/r · n/r · 117% |
+| credit-ring | — N/A (no busy-poll mode) | | | | | | |
+| tcp | 4.59M | n/r | 16 | n/r | n/r | n/r | baseline |
+
+Best config: peak at 16 cores; the *efficient* ceiling is ~5.0M on 8 cores. Kernel
+`tcp echo` CPU/op is a range (2.2–3.9 µs/op, footnote below), so per-op ratios are
+`n/r` here — the full sweep and efficiency detail follow.
+
 | cores | conns | in-flight | echo-busy | tcp echo¹ | CPU/op | p50 | p99 |
 |---:|---:|---:|---:|---:|---:|---:|---:|
 | 2 | 8 | 16 | 1.90M (1.91M) | 0.89M | 1.05 µs | 64 µs | 95 µs |
@@ -61,6 +74,17 @@ demuxes completions to its connections by `qp_num` (§4.1 of the busy-poll desig
 `threads` is a **hard core budget** (N fully-consumed cores), not a scheduler hint
 — the interesting question is throughput *per pinned core* and where the shared
 NIC saturates.
+
+**Headline (canonical schema)** — read-ring busy-poll (`echo-busy`) characterization (kernel baseline compared in the 2026-07-17 block above):
+
+| transport | throughput | CPU/op | cores@peak | p50 | p99 | peak RSS | vs baseline |
+|---|---:|---:|---:|---:|---:|---:|---|
+| send-recv | — N/A (no busy-poll mode) | | | | | | |
+| read-ring (busy-poll) | 5.39M | 2.97 µs | 16 | 427 µs | 2403 µs | n/r | n/r · n/r · n/r |
+| credit-ring | — N/A (no busy-poll mode) | | | | | | |
+| tcp | n/r (not measured in this block) | | | | | | baseline |
+
+Best config: efficient ceiling **5.08M on 8 cores** (1 conn/core × 256, p99 630 µs); peak 5.39M at 16 cores. Full per-core sweep:
 
 | cores | conns | /core | in-flight | throughput | CPU/op | p50 | p99 |
 |---:|---:|---:|---:|---:|---:|---:|---:|

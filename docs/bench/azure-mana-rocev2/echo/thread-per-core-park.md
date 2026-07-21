@@ -20,6 +20,15 @@ of all three topologies and mode-selection guidance. See the
 Re-run on the current binary as a regression check. **No regression** — the pinned
 `echo-park` sweep reproduces within ~1 % (prior value in parentheses):
 
+**Headline (canonical schema)** — read-ring thread-per-core arm-park (`echo-park`) vs kernel baseline at matched cores (8 × 32 × 64):
+
+| transport | throughput | CPU/op | cores@peak | p50 | p99 | peak RSS | vs baseline |
+|---|---:|---:|---:|---:|---:|---:|---|
+| send-recv | — N/A (no thread-per-core mode) | | | | | | |
+| read-ring (echo-park) | 4.96M | 1.52 µs | 8 | 353 µs | 1655 µs | n/r | 1.8× · n/r · 192% |
+| credit-ring | — N/A (no thread-per-core mode) | | | | | | |
+| tcp | 2.59M | 2.81 µs | 8 | n/r | n/r | n/r | baseline |
+
 | cores | conns | in-flight | echo-park | tcp echo¹ | CPU/op | p50 | p99 |
 |---:|---:|---:|---:|---:|---:|---:|---:|
 | 2 | 8 | 16 | 1.58M (1.59M) | 0.89M | 1.27 µs | 79 µs | 124 µs |
@@ -77,6 +86,15 @@ It is the middle point between the two existing modes:
 | `echo` (arm-park) | per-conn armed CQ | 0 % (parks) | tokio work-stealing over all vCPUs | elastic (~7–9 cores) |
 | `echo-busy` | shared CQ, 100 % spin | **100 %** | pinned 1 core/CQ, sole reaper | none |
 | `echo-park` | per-conn armed CQ | **0 % (parks)** | **pinned** 1 core/runtime | none (no stealing) |
+
+**Headline (canonical schema)** — read-ring `echo-park` characterization (matched-core kernel comparison in the 2026-07-17 block above):
+
+| transport | throughput | CPU/op | cores@peak | p50 | p99 | peak RSS | vs baseline |
+|---|---:|---:|---:|---:|---:|---:|---|
+| send-recv | — N/A (no thread-per-core mode) | | | | | | |
+| read-ring (echo-park) | 4.93M | 1.52 µs | 8 | 362 µs | 1634 µs | n/r | n/r · n/r · n/r |
+| credit-ring | — N/A (no thread-per-core mode) | | | | | | |
+| tcp | n/r (not measured in this block) | | | | | | baseline |
 
 | cores | conns | /core | in-flight | throughput | CPU/op | p50 | p99 |
 |---:|---:|---:|---:|---:|---:|---:|---:|
