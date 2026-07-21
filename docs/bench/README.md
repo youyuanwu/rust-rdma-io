@@ -16,7 +16,7 @@ environments** and **repeated runs over time**:
 | [strategy.md](strategy.md) | What we measure and why — transports, scenarios, the regime matrix, non-goals |
 | [methodology.md](methodology.md) | How we run — durations, reboot cadence, fd-limit fix, `TCP_NODELAY`, NIC caveats |
 | [metrics.md](metrics.md) | Metric definitions — req/s, p50/p99, `cores busy`, `cpu_us_per_op`, peak RSS, Gbps |
-| [recording.md](recording.md) | How results are recorded — dated provenance blocks, the "adding data / new environment" workflow |
+| [collection.md](collection.md) | How results are recorded & compared — canonical schema, regime kinds, provenance blocks, coverage matrix, the "adding data / new environment" workflow |
 | [scenarios/echo.md](scenarios/echo.md) | Echo scenario — raw `Transport` echo, completion topologies |
 | [scenarios/grpc.md](scenarios/grpc.md) | gRPC scenario — tonic `rh2` over the full TLS + HTTP/2 stack |
 | [scenarios/h1.md](scenarios/h1.md) | HTTP/1.1 scenario — hyper `http1`, one request in flight per connection |
@@ -29,7 +29,7 @@ environments** and **repeated runs over time**:
 
 ## Adding results / a new environment
 
-See the [recording convention](recording.md) for the full workflow. In brief:
+See the [collection protocol](collection.md) for the full workflow. In brief:
 
 - **New run of an existing regime** — **prepend** a dated result block (newest on
   top) to the matching `<env>/<scenario>/<regime>.md` file, with its Date /
