@@ -22,10 +22,14 @@ the limiter flips to **bandwidth**, and the result inverts.
 Re-run on the current binary as a regression check. **No regression** — both
 bandwidth ceilings hold and read-ring still wins 8 KiB (prior value in parentheses):
 
-| transport | config | throughput | bandwidth | p50 | p99 | CPU/op | ~cores |
-|---|---|---:|---:|---:|---:|---:|---:|
-| **read-ring** | 24 × 8 (peak) | 533k (539k) | **35.0 Gbps** (35.3) | 268 µs | 619 µs | 4.95 µs | ~2.6 |
-| **tcp** | 32 × 4 (peak) | 452k (454k) | 29.6 Gbps (29.8) | 262 µs | 443 µs | 8.91 µs | ~4.0 |
+| transport | throughput | CPU/op | cores@peak | p50 | p99 | peak RSS | vs baseline |
+|---|---:|---:|---:|---:|---:|---:|---|
+| send-recv | ⏳ pending | — | — | — | — | — | not yet run at 8 KiB |
+| read-ring | 533k | 4.95 µs | ~2.6 | 268 µs | 619 µs | n/r | 1.8× · 1.4× · 118% |
+| credit-ring | ⏳ pending | — | — | — | — | — | not yet run at 8 KiB |
+| tcp | 452k | 8.91 µs | ~4.0 | 262 µs | 443 µs | n/r | baseline |
+
+Bandwidth (best config): read-ring 24 × 8 → **35.0 Gbps**; tcp 32 × 4 → 29.6 Gbps.
 
 read-ring sweep (req/s | Gbps): 8×8 350k/22.9, 16×16 501k/32.9, **24×8 533k/35.0**,
 24×16 424k/27.8, 32×16 415k/27.2 — same inverted-U, peak at 24×8 (the 24×16 point
@@ -47,11 +51,16 @@ per-connection pipeline depth that gave that row's peak (`threads=64` for all ro
 read-ring lists two rows: `24 × 8` (the best throughput/latency balance) and
 `24 × 16` (its absolute peak throughput).
 
-| transport | best config | throughput | **bandwidth** | p50 | p99 | CPU/op | ~cores |
-|---|---|---:|---:|---:|---:|---:|---:|
-| **read-ring** (RDMA) | 24 × 8  | 539k | **35.3 Gbps** | 259 µs | 607 µs | **5.0 µs** | ~2.7 |
-| read-ring (peak)     | 24 × 16 | **549k** | **36.0 Gbps** | 408 µs | 922 µs | 5.4 µs | ~3.0 |
-| **tcp** (kernel)     | 32 × 4  | 454k | 29.8 Gbps | 260 µs | 439 µs | 8.8 µs | ~4.0 |
+| transport | throughput | CPU/op | cores@peak | p50 | p99 | peak RSS | vs baseline |
+|---|---:|---:|---:|---:|---:|---:|---|
+| send-recv | ⏳ pending | — | — | — | — | — | not yet run at 8 KiB |
+| read-ring | 539k | 5.0 µs | ~2.7 | 259 µs | 607 µs | n/r | 1.8× · 1.4× · 119% |
+| credit-ring | ⏳ pending | — | — | — | — | — | not yet run at 8 KiB |
+| tcp | 454k | 8.8 µs | ~4.0 | 260 µs | 439 µs | n/r | baseline |
+
+Bandwidth (best config): read-ring 24 × 8 → **35.3 Gbps** (its throughput/latency
+balance); tcp 32 × 4 → 29.8 Gbps. read-ring's **absolute** peak is 24 × 16 →
+**549k / 36.0 Gbps** (5.4 µs/op, ~3.0 cores, p50 408 µs, p99 922 µs).
 
 Bandwidth is one-directional (request bytes); echo is request/response, so the wire
 carries ~2× — read-ring drives **~72 Gbps aggregate**. At 8 KiB **read-ring wins**:

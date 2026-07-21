@@ -35,12 +35,16 @@ healthy at 64 B depth and 8 KB here.)
 **Large-payload (8 KiB) peak per transport** — held `in_flight=1`, tuned
 connections:
 
-| transport | best config | throughput | bandwidth | vs baseline |
-|---|---|---:|---:|---|
-| **tcp** | 256 × 8 | **431K** | 28.3 Gbps | 427K / 28.0 |
-| **read-ring** | 128 × 1 | 245K | 16.1 Gbps | 247K / 16.2 |
-| **credit-ring** | 48 × 1 | 204K | 13.4 Gbps | 202K / 13.2 |
-| **send-recv** | 192 × 1 | 114K | 7.5 Gbps | 110K / 7.2 |
+| transport | throughput | CPU/op | cores@peak | p50 | p99 | peak RSS | vs baseline |
+|---|---:|---:|---:|---:|---:|---:|---|
+| send-recv | 114K | n/r | n/r | n/r | n/r | n/r | n/r · n/r · 26% |
+| read-ring | 245K | n/r | n/r | n/r | n/r | n/r | n/r · n/r · 57% |
+| credit-ring | 204K | n/r | n/r | n/r | n/r | n/r | n/r · n/r · 47% |
+| tcp | 431K | n/r | n/r | n/r | n/r | n/r | baseline |
+
+Best config / bandwidth: tcp 256 × 8 → 28.3 Gbps; read-ring 128 × 1 → 16.1 Gbps;
+credit-ring 48 × 1 → 13.4 Gbps; send-recv 192 × 1 → 7.5 Gbps. (CPU/op & latency were
+not re-recorded this run — see the Undated block below for the full-metric table.)
 
 Connection scaling behind each peak reproduced cleanly (read-ring 153/208/228/245K
 at 32/64/96/128×1; credit-ring 91/159/204K at 16/32/48×1; send-recv 97/109/114K at
@@ -76,12 +80,18 @@ transport for **peak** 8 KiB throughput (tuning connections *and* in-flight,
 [echo 8 KiB result](../echo/large-payload-8kib.md#large-payload-8-kib-ceiling-read-ring-vs-tcp),
 where read-ring *wins*. Best config = `connections × in-flight`:
 
-| transport | best config | **max throughput** | bandwidth | p50 | p99 | CPU/op | ~cores | limited by |
-|---|---|---:|---:|---:|---:|---:|---:|---|
-| **tcp** (kernel) | 256 × 8 | **427K** | 28.0 Gbps | 4411 µs | 10167 µs | 118 µs | ~50 | bandwidth + CPU wall |
-| **read-ring** | 128 × 1 | **247K** | 16.2 Gbps | 486 µs | 1090 µs | 95 µs | ~24 | deadlock @ ~160 conns |
-| **credit-ring** | 48 × 1 | **202K** | 13.2 Gbps | 227 µs | 422 µs | 94 µs | ~19 | deadlock @ ~64 conns |
-| **send-recv** | 192 × 1 | **110K** | 7.2 Gbps | 1745 µs | 2623 µs | 117 µs | ~13 | 2-sided recv round-trip |
+| transport | throughput | CPU/op | cores@peak | p50 | p99 | peak RSS | vs baseline |
+|---|---:|---:|---:|---:|---:|---:|---|
+| send-recv | 110K | 117 µs | ~13 | 1745 µs | 2623 µs | n/r | 1.0× · 0.3× · 26% |
+| read-ring | 247K | 95 µs | ~24 | 486 µs | 1090 µs | n/r | 1.2× · 0.1× · 58% |
+| credit-ring | 202K | 94 µs | ~19 | 227 µs | 422 µs | n/r | 1.3× · 0.04× · 47% |
+| tcp | 427K | 118 µs | ~50 | 4411 µs | 10167 µs | n/r | baseline |
+
+Best config / bandwidth / limiter: tcp 256 × 8 → 28.0 Gbps (bandwidth + CPU wall);
+read-ring 128 × 1 → 16.2 Gbps (deadlock @ ~160 conns); credit-ring 48 × 1 →
+13.2 Gbps (deadlock @ ~64 conns); send-recv 192 × 1 → 7.2 Gbps (2-sided recv
+round-trip). **TCP wins the 8 KiB gRPC headline; the one-sided rings win latency
+(~10×) at their peak** — the inverse of the raw-`echo` result.
 
 Scaling behind each peak (RDMA held at `in_flight=1` — connections drive throughput;
 deeper pipelines make the RDMA transports *worse*, e.g. `send-recv` at `in_flight=16`

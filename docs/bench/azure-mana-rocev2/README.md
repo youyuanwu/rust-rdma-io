@@ -24,10 +24,15 @@ here. Shared strategy / methodology / metrics live one level up
 > (`2 sockets × 16 physical × 2 SMT`, the NUMA/SMT knee that shapes the
 > thread-per-core results).
 
-## Results index
+## Results
 
-Results for each scenario (regime files grouped by scenario). The regime files are
-added as each scenario is migrated.
+> **▶ [RDMA-vs-TCP scoreboard](scoreboard.md)** — the comparison-first view of every
+> regime (all three RDMA transports vs the kernel baseline) plus the coverage matrix.
+> Start here.
+
+### Results index
+
+Regime detail pages (full data, sweeps, and per-run analysis), grouped by scenario:
 
 - **[Echo](../scenarios/echo.md)** —
   [message-rate (64 B)](echo/message-rate-64b.md) ·
@@ -43,8 +48,10 @@ added as each scenario is migrated.
   [thread-per-core](h1/thread-per-core.md) ·
   [large-payload (8 KiB)](h1/large-payload-8kib.md)
 
-## Recording convention
+## Collection protocol
 
-Results in this tree follow the shared **[recording convention](../recording.md)** —
-append-only dated blocks (newest first) with a mandatory Date / Environment / Commit /
-Command provenance header. Read it before adding results or a new environment.
+Results in this tree follow the shared **[collection protocol](../collection.md)** —
+the canonical comparison-table schema, regime kinds, append-only dated blocks
+(newest first) with a mandatory Date / Environment / Commit / Command provenance
+header, and the coverage-matrix rules. Read it before adding results or a new
+environment.

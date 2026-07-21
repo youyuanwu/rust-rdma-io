@@ -29,14 +29,14 @@ parentheses).
 | 16 | 1.29M (1.30M) | 1.30M (1.34M) | 1.36M (1.26M) | 1.11M (1.08M) |
 | 64 | 3.98M (3.71M) | 3.98M (4.32M) | 0.996M (1.05M) | 1.89M (1.80M) |
 
-**CPU/op (64×64, in-flight 64)** — unchanged:
+**Headline — CPU/op & tail (64×64, in-flight 64), canonical schema** (prior value in parentheses; each transport's *peak* message rate is higher — read-ring 6.32M this session at 32×512, tcp 8.94M at 512×64 — see the sweeps below):
 
-| transport | throughput | CPU/op | ~cores | p50 | p99 |
-|---|---:|---:|---:|---:|---:|
-| read-ring | 4.77M (4.75M) | 1.24 µs (1.21) | 5.9 | 153 µs | 1760 µs |
-| send-recv | 4.14M (4.40M) | 1.25 µs (1.30) | 5.2 | 345 µs | 1502 µs |
-| tcp | 6.84M (6.75M) | 5.20 µs (5.37) | 35.5 | 272 µs | 1339 µs |
-| credit-ring | 0.98M (1.01M) | 3.18 µs (3.93) | 3.1 | 4183 µs | 4731 µs |
+| transport | throughput | CPU/op | cores@peak | p50 | p99 | peak RSS | vs baseline |
+|---|---:|---:|---:|---:|---:|---:|---|
+| send-recv | 4.14M (4.40M) | 1.25 µs (1.30) | 5.2 | 345 µs | 1502 µs | n/r | 4.2× · 1.1× · 61% |
+| read-ring | 4.77M (4.75M) | 1.24 µs (1.21) | 5.9 | 153 µs | 1760 µs | n/r | 4.2× · 1.3× · 70% |
+| credit-ring | 0.98M (1.01M) | 3.18 µs (3.93) | 3.1 | 4183 µs | 4731 µs | n/r | 1.6× · 3.5× · 14% |
+| tcp | 6.84M (6.75M) | 5.20 µs (5.37) | 35.5 | 272 µs | 1339 µs | n/r | baseline |
 
 **read-ring depth & hard-cap sweeps** — the knee shifted run-to-run (as the baseline
 already flagged, read-ring is noisy in the 5.0–6.4M band) but the architectural
@@ -62,10 +62,14 @@ cores — the ~6× CPU-efficiency and tail-latency story is unchanged.
 
 Re-measured on the current binary, both ceilings hold:
 
-| transport | peak throughput | CPU/op | ~cores | p99 | best config |
-|---|---:|---:|---:|---:|---|
-| tcp (kernel) | **~8.84M** | 6.23 µs | ~55 | 5903 µs | 384 × 64 |
-| read-ring (RDMA) | ~6.4M | **~1.0 µs** | ~6.4 | **2869 µs** | 24 × 768 |
+| transport | throughput | CPU/op | cores@peak | p50 | p99 | peak RSS | vs baseline |
+|---|---:|---:|---:|---:|---:|---:|---|
+| send-recv | n/r | n/r | n/r | n/r | n/r | n/r | not re-measured this run |
+| read-ring | ~6.4M | ~1.0 µs | ~6.4 | n/r | 2869 µs | n/r | 6.2× · 0.5× · 72% |
+| credit-ring | n/r | n/r | n/r | n/r | n/r | n/r | not re-measured this run |
+| tcp | ~8.84M | 6.23 µs | ~55 | n/r | 5903 µs | n/r | baseline |
+
+Best config: read-ring 24 × 768, tcp 384 × 64.
 
 The TCP connection sweep pushed slightly past the earlier 256 × 64 point: 64 × 64 →
 6.68M, 128 × 64 → 7.90M, 256 × 64 → 8.39M, **384 × 64 → 8.84M**, 512 × 64 → 8.58M
@@ -128,12 +132,12 @@ peak RSS are derived.
 Given a large core budget (64 vCPUs), TCP can brute-force *higher* raw throughput —
 but at a very different cost:
 
-| transport | throughput | **CPU/op** | cores busy | peak RSS | p50 | p99 |
-|---|---:|---:|---:|---:|---:|---:|
-| **read-ring** (RDMA) | 4.75M | **1.21 µs** | ~5.8 | 34.8 MB | 217 µs | 1096 µs |
-| **send-recv** (RDMA) | 4.40M | 1.30 µs | ~5.7 | 24.4 MB | 243 µs | 1408 µs |
-| tcp (kernel) | 6.75M | 5.37 µs | ~36.3 | 17.9 MB | 279 µs | 1362 µs |
-| credit-ring (RDMA) | 1.01M | 3.93 µs | ~4.0 | 34.3 MB | 4111 µs | 4463 µs |
+| transport | throughput | CPU/op | cores@peak | p50 | p99 | peak RSS | vs baseline |
+|---|---:|---:|---:|---:|---:|---:|---|
+| send-recv | 4.40M | 1.30 µs | ~5.7 | 243 µs | 1408 µs | 24.4 MB | 4.1× · 1.0× · 65% |
+| read-ring | 4.75M | 1.21 µs | ~5.8 | 217 µs | 1096 µs | 34.8 MB | 4.4× · 0.8× · 70% |
+| credit-ring | 1.01M | 3.93 µs | ~4.0 | 4111 µs | 4463 µs | 34.3 MB | 1.4× · 3.3× · 15% |
+| tcp | 6.75M | 5.37 µs | ~36.3 | 279 µs | 1362 µs | 17.9 MB | baseline |
 
 **RDMA is ~4.4× more CPU-efficient per operation** (read-ring 1.21 µs vs TCP
 5.37 µs). TCP's higher rps costs ~36 cores because it is fully CPU-bound in the

@@ -20,6 +20,19 @@ Re-run on the current binary as a regression check. **No regression** — the pi
 modes reproduce baseline; the only gaps are the 32-core / 256-conn points, which
 failed to *establish* (CM setup) on this flaky host.
 
+**Headline (canonical schema)** — read-ring thread-per-core busy-poll (`rh1-busy`) vs kernel `tcp1` at the busy-poll ceiling (16 cores / 128 conns):
+
+| transport | throughput | CPU/op | cores@peak | p50 | p99 | peak RSS | vs baseline |
+|---|---:|---:|---:|---:|---:|---:|---|
+| send-recv | — N/A (no such mode) | — | — | — | — | — | — |
+| read-ring (rh1-busy) | 1461K | 10.9 µs | 16 | n/r | n/r | n/r | 2.1× · n/r · 423% |
+| credit-ring | — N/A (no such mode) | — | — | — | — | — | — |
+| tcp1 | 345K | 22.8 µs | 16 | n/r | n/r | n/r | baseline |
+
+Best config: `rh1-busy` peaks ~1.46M at 16 pinned cores; `rh1-park` ceiling ~579K at
+8 cores; matched-core (4c/32) `rh1-busy` 431K vs `tcp1` 169K. `tcp1` has no
+thread-per-core mode (kernel baseline at the same core budget).
+
 **Matched-core (4 cores, 32 conns):**
 
 | mode | throughput | p50 | p99 | µs/op |
@@ -82,6 +95,19 @@ read-ring transport, the `AsyncRdmaStream`, the OpenSSL session, and the hyper
 `--threads` is the pinned-core count; connections are sharded round-robin across
 them. HTTP/1.1 keeps one request in flight per connection, so offered load scales
 with `--connections`.
+
+**Headline (canonical schema)** — read-ring `rh1-busy` ceiling characterization (matched-core kernel `tcp1` comparison is in the 2026-07-17 block above):
+
+| transport | throughput | CPU/op | cores@peak | p50 | p99 | peak RSS | vs baseline |
+|---|---:|---:|---:|---:|---:|---:|---|
+| send-recv | — N/A (no such mode) | — | — | — | — | — | — |
+| read-ring (rh1-busy) | 1373K | 11.7 µs | 16 | n/r | n/r | n/r | n/r · n/r · n/r |
+| credit-ring | — N/A (no such mode) | — | — | — | — | — | — |
+| tcp1 | n/r | n/r | n/r | n/r | n/r | n/r | baseline |
+
+Best config: `rh1-busy` ceiling ~1.37M at 16 pinned cores (~108K/core, near-linear
+to one 16-core socket); `rh1-park` ~576K at 8 cores. Kernel `tcp1` not measured in
+this block; full mode sweeps and NUMA/SMT analysis follow.
 
 #### Matched-core comparison (64 B, read-ring)
 

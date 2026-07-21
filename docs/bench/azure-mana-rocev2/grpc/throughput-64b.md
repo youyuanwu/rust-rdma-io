@@ -21,6 +21,19 @@ measurable point; the only gaps are the high-fan-out ring runs, which hit the
 deadlock-prone host this session — not a code change; TCP at the same fan-out ran
 clean).
 
+**Headline (canonical schema)** — peak throughput per transport this session (each at its best clean config; CPU/latency not re-recorded this run):
+
+| transport | throughput | CPU/op | cores@peak | p50 | p99 | peak RSS | vs baseline |
+|---|---:|---:|---:|---:|---:|---:|---|
+| send-recv | 461.2K | n/r | n/r | n/r | n/r | n/r | n/r · n/r · 57% |
+| read-ring | 772.4K | n/r | n/r | n/r | n/r | n/r | n/r · n/r · 96% |
+| credit-ring | 710.3K | n/r | n/r | n/r | n/r | n/r | n/r · n/r · 88% |
+| tcp | 806K | n/r | n/r | n/r | n/r | n/r | baseline |
+
+Best config: read-ring 64c × in-flight 64; credit-ring 64c × in-flight 64; send-recv
+64c × in-flight 8 (deeper runs hung, see below); tcp 256c × in-flight 16. Ratios are
+`n/r` where CPU/op / p99 were not re-recorded this run.
+
 **Connection scaling (in-flight 1)** — req/s, vs baseline:
 
 | conns | credit-ring | read-ring | send-recv | tcp |
@@ -74,6 +87,19 @@ not a data-path change.
 Measured on the two E-series MANA RoCEv2 VMs, comparing `rh2` (gRPC / HTTP-2 over
 RDMA) against the `tcp` baseline (same tonic + TLS stack over a kernel socket).
 Throughput is `req/s`; latency is per-RPC.
+
+**Headline (canonical schema)** — peak throughput per transport (each at its characteristic peak config):
+
+| transport | throughput | CPU/op | cores@peak | p50 | p99 | peak RSS | vs baseline |
+|---|---:|---:|---:|---:|---:|---:|---|
+| send-recv | 510.2K | 85.6 µs | n/r | n/r | n/r | n/r | 0.9× · n/r · 69% |
+| read-ring | 833K | 67.4 µs | ~56 | n/r | 8567 µs | n/r | 1.1× · 0.6× · 113% |
+| credit-ring | 645.8K | 75.9 µs | n/r | n/r | n/r | n/r | 1.0× · n/r · 87% |
+| tcp | 740K | 74.1 µs | ~54.8 | n/r | 13527 µs | n/r | baseline |
+
+Best config: read-ring 192c × in-flight 16; tcp 256c × in-flight 16; credit-ring /
+send-recv at 64c (in-flight 16 / 8). read-ring overtakes TCP (+13 %) at a lower tail;
+full sweeps and the high-fan-out deadlock analysis follow.
 
 #### Connection scaling (in-flight = 1, 64 B payload)
 

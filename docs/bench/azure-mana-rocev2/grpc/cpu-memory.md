@@ -33,11 +33,12 @@ heaviest pool.
 
 **64 conns / 64 threads, in-flight 1:**
 
-| metric | send-recv | read-ring | credit-ring | tcp |
-|---|---:|---:|---:|---:|
-| throughput | 196.3K | 236.1K | 248.6K | 216.3K |
-| CPU/op µs | 65.3 (70.8) | 65.9 (75.5) | 70.8 (75.2) | 74.9 (75.4) |
-| peak RSS MB | 82 (84) | 51 (52) | 51 (52) | 37 (38) |
+| transport | throughput | CPU/op | cores@peak | p50 | p99 | peak RSS | vs baseline |
+|---|---:|---:|---:|---:|---:|---:|---|
+| send-recv | 196.3K | 65.3 µs | n/r | n/r | n/r | 82 MB | 1.1× · n/r · 91% |
+| read-ring | 236.1K | 65.9 µs | n/r | n/r | n/r | 51 MB | 1.1× · n/r · 109% |
+| credit-ring | 248.6K | 70.8 µs | n/r | n/r | n/r | 51 MB | 1.1× · n/r · 115% |
+| tcp | 216.3K | 74.9 µs | n/r | n/r | n/r | 37 MB | baseline |
 
 CPU-per-op stays transport-agnostic (all ~65–75 µs, stack-bound), confirming the
 gRPC-layer picture is unchanged from baseline.
@@ -72,11 +73,12 @@ RDMA carries a higher peak RSS than TCP (registered buffer pools / MRs), and
 At full scale (64 conns / 64 threads, `in_flight=1`, ~17–19 client cores) the
 picture is unchanged — CPU/op stays transport-agnostic:
 
-| metric | send-recv | read-ring | credit-ring | tcp |
-|---|---:|---:|---:|---:|
-| throughput req/s | 191.9K | 255.6K | 237.9K | 220.6K |
-| CPU µs/op | 70.8 | 75.5 | 75.2 | 75.4 |
-| peak RSS MB | 84 | 52 | 52 | 38 |
+| transport | throughput | CPU/op | cores@peak | p50 | p99 | peak RSS | vs baseline |
+|---|---:|---:|---:|---:|---:|---:|---|
+| send-recv | 191.9K | 70.8 µs | ~17–19 | n/r | n/r | 84 MB | 1.1× · n/r · 87% |
+| read-ring | 255.6K | 75.5 µs | ~17–19 | n/r | n/r | 52 MB | 1.0× · n/r · 116% |
+| credit-ring | 237.9K | 75.2 µs | ~17–19 | n/r | n/r | 52 MB | 1.0× · n/r · 108% |
+| tcp | 220.6K | 75.4 µs | ~17–19 | n/r | n/r | 38 MB | baseline |
 
 This is the sharpest contrast with raw `echo`, which at 64×64 measures `read-ring`
 at **1.2 µs/op vs TCP 5.4 µs/op** (RDMA ~4× cheaper): at the gRPC layer that entire
