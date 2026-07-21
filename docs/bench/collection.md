@@ -232,10 +232,10 @@ this protocol + the coverage matrix:
    - **Commit:** `abc1234`
    - **Command:** `just bench-echo --duration 10 --warmup 3 --threads 64 --in-flight 64`
 
-   | transport | throughput | CPU/op | cores@peak | p50 | p99 | peak RSS | vs tcp |
+   | transport | throughput | CPU/op | cores@peak | p50 | p99 | peak RSS | vs baseline |
    |---|---:|---:|---:|---:|---:|---:|---|
-   | read-ring | 4.80M | 1.20 µs | 5.9 | 150 µs | 1740 µs | 34.8 MB | 4.5× · 1.3× · 70% |
    | send-recv | 4.15M | 1.25 µs | 5.2 | 340 µs | 1500 µs | 24.4 MB | 4.3× · 1.1× · 61% |
+   | read-ring | 4.80M | 1.20 µs | 5.9 | 150 µs | 1740 µs | 34.8 MB | 4.5× · 1.3× · 70% |
    | credit-ring | 0.98M | 3.18 µs | 3.1 | 4180 µs | 4730 µs | 34.3 MB | 1.7× · 3.5× · 14% |
    | tcp | 6.84M | 5.40 µs | 35.5 | 270 µs | 1340 µs | 17.9 MB | baseline |
 
