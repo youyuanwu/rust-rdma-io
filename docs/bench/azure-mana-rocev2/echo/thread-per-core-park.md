@@ -24,9 +24,9 @@ Re-run on the current binary as a regression check. **No regression** — the pi
 
 | transport | throughput | CPU/op | cores@peak | p50 | p99 | peak RSS | vs baseline |
 |---|---:|---:|---:|---:|---:|---:|---|
-| send-recv | — N/A (no thread-per-core mode) | | | | | | |
+| send-recv | — N/A (no such mode) | — | — | — | — | — | — |
 | read-ring (echo-park) | 4.96M | 1.52 µs | 8 | 353 µs | 1655 µs | n/r | 1.8× · n/r · 192% |
-| credit-ring | — N/A (no thread-per-core mode) | | | | | | |
+| credit-ring | — N/A (no such mode) | — | — | — | — | — | — |
 | tcp | 2.59M | 2.81 µs | 8 | n/r | n/r | n/r | baseline |
 
 | cores | conns | in-flight | echo-park | tcp echo¹ | CPU/op | p50 | p99 |
@@ -91,10 +91,10 @@ It is the middle point between the two existing modes:
 
 | transport | throughput | CPU/op | cores@peak | p50 | p99 | peak RSS | vs baseline |
 |---|---:|---:|---:|---:|---:|---:|---|
-| send-recv | — N/A (no thread-per-core mode) | | | | | | |
+| send-recv | — N/A (no such mode) | — | — | — | — | — | — |
 | read-ring (echo-park) | 4.93M | 1.52 µs | 8 | 362 µs | 1634 µs | n/r | n/r · n/r · n/r |
-| credit-ring | — N/A (no thread-per-core mode) | | | | | | |
-| tcp | n/r (not measured in this block) | | | | | | baseline |
+| credit-ring | — N/A (no such mode) | — | — | — | — | — | — |
+| tcp | n/r | n/r | n/r | n/r | n/r | n/r | baseline |
 
 | cores | conns | /core | in-flight | throughput | CPU/op | p50 | p99 |
 |---:|---:|---:|---:|---:|---:|---:|---:|

@@ -64,9 +64,9 @@ Re-measured on the current binary, both ceilings hold:
 
 | transport | throughput | CPU/op | cores@peak | p50 | p99 | peak RSS | vs baseline |
 |---|---:|---:|---:|---:|---:|---:|---|
-| send-recv | n/r (not re-measured this run) | | | | | | |
+| send-recv | n/r | n/r | n/r | n/r | n/r | n/r | not re-measured this run |
 | read-ring | ~6.4M | ~1.0 µs | ~6.4 | n/r | 2869 µs | n/r | 6.2× · 0.5× · 72% |
-| credit-ring | n/r (not re-measured this run) | | | | | | |
+| credit-ring | n/r | n/r | n/r | n/r | n/r | n/r | not re-measured this run |
 | tcp | ~8.84M | 6.23 µs | ~55 | n/r | 5903 µs | n/r | baseline |
 
 Best config: read-ring 24 × 768, tcp 384 × 64.

@@ -25,9 +25,9 @@ parentheses):
 
 | transport | throughput | CPU/op | cores@peak | p50 | p99 | peak RSS | vs baseline |
 |---|---:|---:|---:|---:|---:|---:|---|
-| send-recv | — N/A (no busy-poll mode) | | | | | | |
+| send-recv | — N/A (no such mode) | — | — | — | — | — | — |
 | read-ring (busy-poll) | 5.39M | 2.97 µs | 16 | 423 µs | 2381 µs | n/r | n/r · n/r · 117% |
-| credit-ring | — N/A (no busy-poll mode) | | | | | | |
+| credit-ring | — N/A (no such mode) | — | — | — | — | — | — |
 | tcp | 4.59M | n/r | 16 | n/r | n/r | n/r | baseline |
 
 Best config: peak at 16 cores; the *efficient* ceiling is ~5.0M on 8 cores. Kernel
@@ -79,10 +79,10 @@ NIC saturates.
 
 | transport | throughput | CPU/op | cores@peak | p50 | p99 | peak RSS | vs baseline |
 |---|---:|---:|---:|---:|---:|---:|---|
-| send-recv | — N/A (no busy-poll mode) | | | | | | |
+| send-recv | — N/A (no such mode) | — | — | — | — | — | — |
 | read-ring (busy-poll) | 5.39M | 2.97 µs | 16 | 427 µs | 2403 µs | n/r | n/r · n/r · n/r |
-| credit-ring | — N/A (no busy-poll mode) | | | | | | |
-| tcp | n/r (not measured in this block) | | | | | | baseline |
+| credit-ring | — N/A (no such mode) | — | — | — | — | — | — |
+| tcp | n/r | n/r | n/r | n/r | n/r | n/r | baseline |
 
 Best config: efficient ceiling **5.08M on 8 cores** (1 conn/core × 256, p99 630 µs); peak 5.39M at 16 cores. Full per-core sweep:
 

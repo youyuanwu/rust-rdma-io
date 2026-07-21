@@ -24,9 +24,9 @@ bandwidth ceilings hold and read-ring still wins 8 KiB (prior value in parenthes
 
 | transport | throughput | CPU/op | cores@peak | p50 | p99 | peak RSS | vs baseline |
 |---|---:|---:|---:|---:|---:|---:|---|
-| send-recv | ⏳ pending — collectible; not yet run at 8 KiB | | | | | | |
+| send-recv | ⏳ pending | — | — | — | — | — | not yet run at 8 KiB |
 | read-ring | 533k | 4.95 µs | ~2.6 | 268 µs | 619 µs | n/r | 1.8× · 1.4× · 118% |
-| credit-ring | ⏳ pending — collectible; not yet run at 8 KiB | | | | | | |
+| credit-ring | ⏳ pending | — | — | — | — | — | not yet run at 8 KiB |
 | tcp | 452k | 8.91 µs | ~4.0 | 262 µs | 443 µs | n/r | baseline |
 
 Bandwidth (best config): read-ring 24 × 8 → **35.0 Gbps**; tcp 32 × 4 → 29.6 Gbps.
@@ -53,9 +53,9 @@ read-ring lists two rows: `24 × 8` (the best throughput/latency balance) and
 
 | transport | throughput | CPU/op | cores@peak | p50 | p99 | peak RSS | vs baseline |
 |---|---:|---:|---:|---:|---:|---:|---|
-| send-recv | ⏳ pending — collectible; not yet run at 8 KiB | | | | | | |
+| send-recv | ⏳ pending | — | — | — | — | — | not yet run at 8 KiB |
 | read-ring | 539k | 5.0 µs | ~2.7 | 259 µs | 607 µs | n/r | 1.8× · 1.4× · 119% |
-| credit-ring | ⏳ pending — collectible; not yet run at 8 KiB | | | | | | |
+| credit-ring | ⏳ pending | — | — | — | — | — | not yet run at 8 KiB |
 | tcp | 454k | 8.8 µs | ~4.0 | 260 µs | 439 µs | n/r | baseline |
 
 Bandwidth (best config): read-ring 24 × 8 → **35.3 Gbps** (its throughput/latency
