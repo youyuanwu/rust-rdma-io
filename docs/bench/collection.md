@@ -36,6 +36,9 @@ One table per dated result block, comparing the transports head-to-head:
   latency, peak RSS.
 - **`vs baseline`** carries the derived ratios for each RDMA row (§1.3).
 - A metric that was **not recorded** is `n/r` — never blank, never guessed.
+- In a `⏳ pending` or `— N/A (no such mode)` row the remaining metric cells are
+  `—`, inheriting the row's state (the row's first cell carries the explicit
+  `⏳ pending` / `— N/A (no such mode)` marker).
 
 ### 1.2 Scoreboard table (fixed projection)
 
@@ -56,9 +59,11 @@ Computed per RDMA row against the baseline row **in the same block/config**:
 - **p99×** = RDMA p99 ÷ baseline p99 (<1 means RDMA has the lower/better tail).
 - **tput%** = RDMA throughput ÷ baseline throughput × 100.
 
-Rounding: `×` to one decimal, `%` to whole (or one decimal when <10). If the
-baseline value is missing, the ratio is `n/r`. Ratios are **derived**, not source
-data — they are excluded from the migration fidelity corpus (recomputed instead).
+Rounding: `×` to one decimal, except ratios below `0.1×` are shown to one
+significant figure (two decimals, e.g. `0.04×`) so a strong tail win is not rounded
+away; `%` to whole (or one decimal when <10). If the baseline value is missing, the
+ratio is `n/r`. Ratios are **derived**, not source data — they are excluded from the
+migration fidelity corpus (recomputed instead).
 
 ### 1.4 Reformatting rule (no fabricated rows)
 

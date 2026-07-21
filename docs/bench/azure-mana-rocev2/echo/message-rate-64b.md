@@ -29,7 +29,7 @@ parentheses).
 | 16 | 1.29M (1.30M) | 1.30M (1.34M) | 1.36M (1.26M) | 1.11M (1.08M) |
 | 64 | 3.98M (3.71M) | 3.98M (4.32M) | 0.996M (1.05M) | 1.89M (1.80M) |
 
-**Headline — CPU/op & tail (64×64, in-flight 64), canonical schema** (prior value in parentheses):
+**Headline — CPU/op & tail (64×64, in-flight 64), canonical schema** (prior value in parentheses; each transport's *peak* message rate is higher — read-ring 6.32M this session at 32×512, tcp 8.94M at 512×64 — see the sweeps below):
 
 | transport | throughput | CPU/op | cores@peak | p50 | p99 | peak RSS | vs baseline |
 |---|---:|---:|---:|---:|---:|---:|---|
