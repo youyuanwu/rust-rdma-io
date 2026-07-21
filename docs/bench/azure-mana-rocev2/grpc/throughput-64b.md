@@ -30,8 +30,8 @@ clean).
 | credit-ring | 710.3K | n/r | n/r | n/r | n/r | n/r | n/r · n/r · 88% |
 | tcp | 806K | n/r | n/r | n/r | n/r | n/r | baseline |
 
-Best config: read-ring 64c × in-flight 64; credit-ring 64c × in-flight 8; send-recv
-8c × in-flight 8 (deeper runs hung, see below); tcp 256c × in-flight 16. Ratios are
+Best config: read-ring 64c × in-flight 64; credit-ring 64c × in-flight 64; send-recv
+64c × in-flight 8 (deeper runs hung, see below); tcp 256c × in-flight 16. Ratios are
 `n/r` where CPU/op / p99 were not re-recorded this run.
 
 **Connection scaling (in-flight 1)** — req/s, vs baseline:
