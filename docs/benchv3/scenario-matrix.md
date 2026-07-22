@@ -92,10 +92,11 @@ Fixed sizes — message-rate vs bandwidth.
 | **64 B** | Per-request overhead — doorbells, completions, syscalls. Message-rate dominated. |
 | **8 KiB** | Bandwidth regime — copy costs and goodput (report `Gbps`). |
 
-> **8 KiB on the ring transports needs matched message sizing.** The `echo` path truncates any
-> payload larger than `--ring-max-msg` (default 1500 B), so 8 KiB ring runs must set
-> `--ring-max-msg 8192` (via `-e bench_ring_max_msg=8192`) on **both** peers. See the
-> [run-procedure](run-procedure.md).
+> **8 KiB on the ring transports needs matched message sizing.** For `read-ring` /
+> `credit-ring`, the `echo` path truncates any payload larger than `--ring-max-msg`
+> (default 1500 B), so 8 KiB ring runs must set `--ring-max-msg 8192` (via
+> `-e bench_ring_max_msg=8192`) on **both** peers. `send-recv` sizes its buffers from
+> `--payload` and is unaffected. See the [run-procedure](run-procedure.md).
 
 ## The grid
 
