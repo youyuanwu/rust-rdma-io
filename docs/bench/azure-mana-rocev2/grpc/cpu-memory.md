@@ -6,6 +6,61 @@ plus the overall takeaways. See the [gRPC scenario](../../scenarios/grpc.md),
 regimes: [throughput & pipelining (64 B)](throughput-64b.md) ·
 [payload size](payload.md).
 
+## Board: gRPC client CPU & memory — comparison
+
+A **characterization** regime (client CPU/op and peak RSS at in-flight 1, 64 conns × 64 threads), not a
+throughput sweep — all rows are from the single **2026-07-17** block (no cross-block mixing). Headline
+metrics are **CPU/op** and **peak RSS**; `tput%` = throughput ÷ tcp. Tuning tables carry a trailing
+`peak RSS` column. Schema: [collection protocol](../../collection.md#12-per-workload-board-schema).
+
+| transport | peak throughput | CPU/op | cores@peak | p99 | CPU-eff× | p99× | tput% |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| send-recv | 196.3K | 65.3 µs | n/r | n/r | 1.1× | n/r | 91% |
+| read-ring | 236.1K | 65.9 µs | n/r | n/r | 1.1× | n/r | 109% |
+| credit-ring | 248.6K | 70.8 µs | n/r | n/r | 1.1× | n/r | 115% |
+| tcp | 216.3K | 74.9 µs | n/r | n/r | — | — | baseline |
+
+**Peak RSS** (in-flight 64): send-recv 166 MB, read-ring 102 MB, credit-ring 102 MB, tcp 98 MB
+(send-recv carries the heaviest recv pool). At the 64×64 / in-flight-1 point above: send-recv 82 MB,
+read-ring 51 MB, credit-ring 51 MB, tcp 37 MB. **CPU/op is transport-agnostic** (~65–75 µs,
+stack-bound), so RDMA's raw ~4× per-op efficiency (measured in `echo`) is masked by the
+TLS/HTTP-2/protobuf stack here.
+
+### Tuning — CPU/op falls with pipelining depth (8 conns / 8 threads)
+
+**read-ring**:
+
+| config | throughput | CPU/op | cores | p50 | p99 | peak RSS | src |
+|---|---:|---:|---:|---:|---:|---:|---|
+| in-flight 1 | n/r | 66.5 µs | n/r | n/r | n/r | n/r | 2026-07-17 |
+| in-flight 16 | n/r | 47.9 µs | n/r | n/r | n/r | n/r | 2026-07-17 |
+| in-flight 64 | n/r | 41.5 µs | n/r | n/r | n/r | 102 MB | 2026-07-17 |
+| 64×64, IF1 | 236.1K | 65.9 µs | n/r | n/r | n/r | 51 MB | 2026-07-17 |
+
+**send-recv**:
+
+| config | throughput | CPU/op | cores | p50 | p99 | peak RSS | src |
+|---|---:|---:|---:|---:|---:|---:|---|
+| in-flight 1 | n/r | 65.2 µs | n/r | n/r | n/r | n/r | 2026-07-17 |
+| in-flight 64 | n/r | 43.2 µs | n/r | n/r | n/r | 166 MB | 2026-07-17 |
+| 64×64, IF1 | 196.3K | 65.3 µs | n/r | n/r | n/r | 82 MB | 2026-07-17 |
+
+**credit-ring**:
+
+| config | throughput | CPU/op | cores | p50 | p99 | peak RSS | src |
+|---|---:|---:|---:|---:|---:|---:|---|
+| in-flight 1 | n/r | 76.1 µs | n/r | n/r | n/r | n/r | 2026-07-17 |
+| in-flight 64 | n/r | 42.3 µs | n/r | n/r | n/r | 102 MB | 2026-07-17 |
+| 64×64, IF1 | 248.6K | 70.8 µs | n/r | n/r | n/r | 51 MB | 2026-07-17 |
+
+**tcp**:
+
+| config | throughput | CPU/op | cores | p50 | p99 | peak RSS | src |
+|---|---:|---:|---:|---:|---:|---:|---|
+| in-flight 1 | n/r | 64.3 µs | n/r | n/r | n/r | n/r | 2026-07-17 |
+| in-flight 64 | n/r | 44.2 µs | n/r | n/r | n/r | 98 MB | 2026-07-17 |
+| 64×64, IF1 | 216.3K | 74.9 µs | n/r | n/r | n/r | 37 MB | 2026-07-17 |
+
 ## Results
 
 ### 2026-07-17 — regression re-validation

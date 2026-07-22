@@ -7,6 +7,58 @@ per transport (the inverse of the raw-echo result). See the
 [throughput & pipelining (64 B)](throughput-64b.md) ·
 [client CPU & memory](cpu-memory.md).
 
+## Board: gRPC payload 8 KiB — peak comparison
+
+Each transport at its **peak-throughput** config (baseline `tcp`; **bandwidth-bound**, so tuning
+tables carry a trailing `Gbps` column). `tput%` = peak ÷ TCP peak. Full-metric values are the Undated
+ceiling (the 2026-07-17 re-run matched within noise). Schema:
+[collection protocol](../../collection.md#12-per-workload-board-schema).
+
+| transport | peak throughput | CPU/op | cores@peak | p99 | CPU-eff× | p99× | tput% |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| send-recv | 114K¹ | 117 µs | ~13 | 2623 µs | 1.0× | 0.3× | 26% |
+| read-ring | 247K² | 95 µs | ~24 | 1090 µs | 1.2× | 0.1× | 57% |
+| credit-ring | 204K³ | 94 µs | ~19 | 422 µs | 1.3× | 0.04× | 47% |
+| tcp | **431K**⁴ | 118 µs | ~50 | 10167 µs | — | — | baseline |
+
+¹ 192×1 (2026-07-17 peak 114K; Undated full-metric 110K). ² 128×1, Undated. ³ 48×1 (2026-07-17 peak
+204K; Undated full-metric 202K). ⁴ 256×8 (2026-07-17 peak 431K; Undated full-metric 427K). **At 8 KiB
+TCP wins the gRPC headline** — the inverse of raw `echo` — because gRPC 8 KiB is stack-bound
+(~95–118 µs/op) and every RDMA ring hits the high-fan-out deadlock (read-ring ~160 conns, credit-ring
+~64), capping them at 13–24 cores vs TCP's ~50-core / 28 Gbps wall. The rings still win **latency ~10×**
+at their own peak.
+
+### Tuning — how each peak was found
+
+**read-ring** (`conns`, in-flight 1; deadlocks at ~160 conns):
+
+| config | throughput | CPU/op | cores | p50 | p99 | Gbps | src |
+|---|---:|---:|---:|---:|---:|---:|---|
+| 64×1 | 202K | n/r | n/r | n/r | n/r | n/r | Undated |
+| 96×1 | 229K | n/r | n/r | n/r | n/r | n/r | Undated |
+| **128×1** | **247K** | 95 µs | ~24 | 486 µs | 1090 µs | 16.2 | Undated |
+
+**credit-ring** (`conns`, in-flight 1; deadlocks at ~64 conns):
+
+| config | throughput | CPU/op | cores | p50 | p99 | Gbps | src |
+|---|---:|---:|---:|---:|---:|---:|---|
+| 32×1 | 156K | n/r | n/r | n/r | n/r | n/r | Undated |
+| **48×1** | **204K** | 94 µs | ~19 | 227 µs | 422 µs | 13.4 | 2026-07-17 |
+
+**send-recv** (`conns`, in-flight 1; two-sided recv round-trip, no deadlock, plateaus):
+
+| config | throughput | CPU/op | cores | p50 | p99 | Gbps | src |
+|---|---:|---:|---:|---:|---:|---:|---|
+| 128×1 | 107K | n/r | n/r | n/r | n/r | n/r | Undated |
+| **192×1** | **114K** | 117 µs | ~13 | 1745 µs | 2623 µs | 7.5 | 2026-07-17 |
+
+**tcp** (`conns × in-flight`; bandwidth + CPU wall):
+
+| config | throughput | CPU/op | cores | p50 | p99 | Gbps | src |
+|---|---:|---:|---:|---:|---:|---:|---|
+| 128×16 | 412K | n/r | n/r | n/r | n/r | n/r | 2026-07-17 |
+| **256×8** | **431K** | 118 µs | ~50 | 4411 µs | 10167 µs | 28.3 | 2026-07-17 |
+
 ## Results
 
 ### 2026-07-17 — regression re-validation
