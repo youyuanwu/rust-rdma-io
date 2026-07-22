@@ -5,6 +5,60 @@ Bandwidth-bound 8 KiB throughput and connection scaling for `rh1` vs `tcp1`. See
 [metrics](../../metrics.md). Other HTTP/1.1 regimes:
 [throughput (64 B)](throughput-64b.md) · [thread-per-core](thread-per-core.md).
 
+## Board: HTTP/1.1 large-payload 8 KiB — peak comparison
+
+Each transport at its **peak-throughput** config (baseline `tcp1`; **bandwidth-bound**, so tuning
+tables carry a trailing `Gbps` column). `tput%` = peak ÷ tcp1 peak. Schema:
+[collection protocol](../../collection.md#12-per-workload-board-schema).
+
+| transport | peak throughput | CPU/op | cores@peak | p99 | CPU-eff× | p99× | tput% |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| send-recv | 322k¹ | n/r | n/r | n/r | n/r | n/r | 74% |
+| read-ring | 410K² | n/r | ~14 | 1954 µs | n/r | 0.5× | 94% |
+| credit-ring | 321k³ | n/r | n/r | n/r | n/r | n/r | 73% |
+| tcp1 | **437k**⁴ | n/r | ~19 | 4247 µs | — | — | baseline |
+
+¹ 256 conns, 2026-07-17 (21.1 Gbps; Undated full-metric 308K @256c: ~8 cores, p99 1380 µs). ² 384
+conns, Undated (**26.9 Gbps**, ~14 cores, p50 889 / p99 1954 µs); the 2026-07-17 re-run capped at 349k
+@256c because 320/384c would not *establish* on that host's flakier CM setup — a setup ceiling, not a
+data-path change. ³ 128 conns, 2026-07-17 (21.0 Gbps; Undated 314K: ~10 cores, p99 874 µs). ⁴ 1024
+conns (28.6 Gbps bandwidth wall). **read-ring is close behind tcp1** (~27 vs ~29 Gbps) at far fewer
+connections / cores and ~2–3× lower latency, capped only by CM-setup flakiness. Still no deadlock
+(unlike 8 KiB gRPC).
+
+### Tuning — how each peak was found
+
+**read-ring** (`conns`, in-flight 1; capped by CM-setup ≥512):
+
+| config | throughput | CPU/op | cores | p50 | p99 | Gbps | src |
+|---|---:|---:|---:|---:|---:|---:|---|
+| 128c | 283K | n/r | n/r | n/r | n/r | 18.6 | Undated |
+| 256c | 363K | n/r | n/r | n/r | n/r | 23.8 | Undated |
+| 320c | 388K | n/r | n/r | n/r | n/r | 25.5 | Undated |
+| **384c** | **410K** | n/r | ~14 | 889 µs | 1954 µs | 26.9 | Undated |
+
+**tcp1** (`conns`; bandwidth wall, flat past 1024):
+
+| config | throughput | CPU/op | cores | p50 | p99 | Gbps | src |
+|---|---:|---:|---:|---:|---:|---:|---|
+| 256c | 307K | n/r | n/r | n/r | n/r | 20.1 | Undated |
+| 512c | 402K | n/r | n/r | n/r | n/r | 26.4 | Undated |
+| **1024c** | **437K** | n/r | ~19 | 2309 µs | 4247 µs | 28.6 | Undated |
+
+**send-recv** (`conns`, in-flight 1):
+
+| config | throughput | CPU/op | cores | p50 | p99 | Gbps | src |
+|---|---:|---:|---:|---:|---:|---:|---|
+| 128c | 255K | n/r | n/r | n/r | n/r | 16.7 | Undated |
+| **256c** | **322k** | n/r | n/r | n/r | n/r | 21.1 | 2026-07-17 |
+
+**credit-ring** (`conns`, in-flight 1):
+
+| config | throughput | CPU/op | cores | p50 | p99 | Gbps | src |
+|---|---:|---:|---:|---:|---:|---:|---|
+| 128c | 314K | n/r | ~10 | 383 µs | 874 µs | 20.6 | Undated |
+| **128c** | **321k** | n/r | n/r | n/r | n/r | 21.0 | 2026-07-17 |
+
 ## Results
 
 ### 2026-07-17 — regression re-validation
