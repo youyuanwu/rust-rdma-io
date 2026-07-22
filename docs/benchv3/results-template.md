@@ -34,9 +34,11 @@ the full rationale (why CPU is sampled in-process, what `cores busy` means) see
 
 ## Table A — kernel-baseline-vs-RDMA comparison at one coordinate
 
-The core comparable board: one coordinate, all four transport paths side by side. Fill one copy
-per `(scenario, payload, connections, in-flight)` coordinate you care about. State the fixed
-(non-swept) axes in the caption; the transport path is the row dimension.
+The core comparable board: one coordinate, every transport path for the scenario side by side.
+Fill one copy per `(scenario, payload, connections, in-flight)` coordinate you care about. State
+the fixed (non-swept) axes in the caption; the transport path is the row dimension. The example
+below is an **echo** board (6 paths); a **gRPC** board omits the `read-ring (busy-poll)` and
+`read-ring (thread-per-core park)` rows (no gRPC busy/park variant).
 
 > **SKU:** `________` · **vCPU:** `__` · **scenario:** `echo` · **payload:** 64 B ·
 > **connections:** 1× vCPU · **in-flight:** 64 · **duration/warmup:** 10 s / 3 s ·
@@ -45,12 +47,16 @@ per `(scenario, payload, connections, in-flight)` coordinate you care about. Sta
 | Transport path | Throughput (req/s) | p50 (µs) | p95 (µs) | p99 (µs) | CPU/op (µs) | cores | peak RSS (MB) | errors |
 | -------------- | ------------------ | -------- | -------- | -------- | ----------- | ----- | ------------- | ------ |
 | `send-recv`    |                    |          |          |          |             |       |               |        |
-| `read-ring`    |                    |          |          |          |             |       |               |        |
+| `read-ring` (arm-park) |            |          |          |          |             |       |               |        |
+| `read-ring` (busy-poll)² |          |          |          |          |             |       |               |        |
+| `read-ring` (park)² |               |          |          |          |             |       |               |        |
 | `credit-ring`¹ |                    |          |          |          |             |       |               |        |
 | kernel baseline |                   |          |          |          |             |       |               |        |
 
 ¹ Example of an unsustainable coordinate — if `credit-ring` cannot sustain this depth, record
 `fail (over-queue)` / `n/a` in its cells rather than leaving them ambiguous.
+² `read-ring` busy-poll / thread-per-core park are read-ring completion topologies (`echo-busy`/
+`echo-park`, or `rh1-busy`/`rh1-park`); **echo & HTTP/1.1 only** — omit these rows on a gRPC board.
 
 **Illustrative** (how an unsustainable coordinate is recorded — *not* real data):
 
@@ -67,7 +73,9 @@ For **8 KiB** (bandwidth) coordinates, add a `Gbps` column after `throughput`:
 | Transport path | Throughput (req/s) | Gbps | p50 (µs) | p95 (µs) | p99 (µs) | CPU/op (µs) | cores | peak RSS (MB) | errors |
 | -------------- | ------------------ | ---- | -------- | -------- | -------- | ----------- | ----- | ------------- | ------ |
 | `send-recv`    |                    |      |          |          |          |             |       |               |        |
-| `read-ring`    |                    |      |          |          |          |             |       |               |        |
+| `read-ring` (arm-park) |            |      |          |          |          |             |       |               |        |
+| `read-ring` (busy-poll)² |          |      |          |          |          |             |       |               |        |
+| `read-ring` (park)² |               |      |          |          |          |             |       |               |        |
 | `credit-ring`  |                    |      |          |          |          |             |       |               |        |
 | kernel baseline |                   |      |          |          |          |             |       |               |        |
 
@@ -78,7 +86,8 @@ For **8 KiB** (bandwidth) coordinates, add a `Gbps` column after `throughput`:
 Fill one copy **per (scenario, payload, transport)** to see how a single transport moves across
 the fixed grid. The swept axis is the `(connections × in-flight)` coordinate (rows); everything
 else is fixed in the caption. For **HTTP/1.1** the in-flight column is always 1, so it has three
-rows (one per connection multiple) instead of nine.
+rows (one per connection multiple) instead of nine. The `transport` axis includes the read-ring
+completion topologies (`read-ring (busy-poll)` / `read-ring (park)`) for echo & HTTP/1.1 boards.
 
 > **SKU:** `________` · **vCPU:** `__` · **scenario:** `echo` · **payload:** 64 B ·
 > **transport:** `read-ring` · **duration/warmup:** 10 s / 3 s · **git commit:** `________` ·

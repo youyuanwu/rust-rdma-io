@@ -121,6 +121,35 @@ ansible-playbook -i tests/e2e/inventory_local.py tests/e2e/playbooks/bench_run.y
   -e bench_payload=8192
 ```
 
+### Read-ring completion topologies (busy-poll / park)
+
+`read-ring` has two pinned-core completion topologies that bench v3 records as **separate
+transport paths** (echo & HTTP/1.1 only — there is no gRPC busy/park variant). They are selected
+by **mode**, always with `--transport read-ring`, and `--threads` is the number of **pinned
+cores** (set to the vCPU count, same on both peers):
+
+| Path | echo mode | HTTP/1.1 mode |
+|---|---|---|
+| `read-ring` (arm-park, default) | `echo` | `rh1` |
+| `read-ring` (busy-poll) | `echo-busy` | `rh1-busy` |
+| `read-ring` (thread-per-core park) | `echo-park` | `rh1-park` |
+
+Example — echo busy-poll at 1× connections, in-flight 64 (via the direct playbook so warmup /
+in-flight are explicit):
+
+```
+ansible-playbook -i tests/e2e/inventory_local.py tests/e2e/playbooks/bench_run.yml \
+  -e bench_mode=echo-busy -e bench_transport=read-ring \
+  -e bench_connections=64 -e bench_threads=64 \
+  -e bench_in_flight=64 \
+  -e bench_duration=10 -e bench_warmup=3 \
+  -e bench_payload=64
+```
+
+Swap `bench_mode` to `echo-park` (echo) or `rh1-busy` / `rh1-park` (HTTP/1.1) for the other
+topology/scenario. gRPC (`rh2`) has no busy/park mode, so a gRPC board carries only the single
+arm-park `read-ring` path.
+
 ### Deep in-flight (512) — ring queue sizing
 
 The ring transports auto-size their in-flight budget from `--in-flight` when

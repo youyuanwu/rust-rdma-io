@@ -29,16 +29,27 @@ on a specific VM SKU. The executor budget (`--threads`) is **always the vCPU cou
 
 ### Transport paths
 
-The three RDMA [`Transport`](../design/rdma-transport-layer.md) implementations plus a kernel
+The RDMA [`Transport`](../design/rdma-transport-layer.md) implementations plus a kernel
 baseline. The baseline is a **path, not a uniform `--transport` value**: for `echo` it is
 `--transport tcp`; for gRPC and HTTP/1.1 it is a distinct *mode* (`tcp` / `tcp1`).
 
 | Path | Stack | Role |
 |---|---|---|
 | `send-recv` | Two-sided RDMA SEND/RECV, per-connection recv-buffer pool | RDMA transport under test |
-| `read-ring` | One-sided RDMA READ ring (busy-poll capable) | RDMA transport under test |
+| `read-ring` (arm-park) | One-sided RDMA READ ring, shared arm-park tokio runtime (default) | RDMA transport under test |
+| `read-ring` (busy-poll) | Same READ ring, `--threads` **pinned cores** each spinning `ibv_poll_cq` (lowest latency, burns pinned cores) | Read-ring completion topology (echo & HTTP/1.1 only) |
+| `read-ring` (thread-per-core park) | Same READ ring, pinned per-core reactors that **park** in `epoll_wait` when idle | Read-ring completion topology (echo & HTTP/1.1 only) |
 | `credit-ring` | Credit-based ring with explicit credit round-trips | RDMA transport under test |
 | **kernel baseline** | Raw TCP over the same application stack (`--transport tcp` for echo; mode `tcp`/`tcp1` for gRPC/HTTP-1.1) | The reference every RDMA path is compared against |
+
+The two extra **read-ring** rows are completion **topologies** of the same one-sided READ-ring
+wire transport (not new wire protocols): they trade the shared work-stealing runtime for pinned
+cores. They are separate paths because their latency/CPU profile differs. In busy-poll and park
+modes `--threads` is the number of **pinned cores** (still set to the vCPU count). These two
+paths exist for the **echo** and **HTTP/1.1** scenarios only — the tool has **no gRPC (`rh2`)
+busy/park variant** — so a gRPC board carries just the single arm-park `read-ring` path. Each
+maps to a mode: busy-poll = `echo-busy` / `rh1-busy`; park = `echo-park` / `rh1-park`; all
+require `--transport read-ring`.
 
 ### Scenarios
 
@@ -48,9 +59,9 @@ stack. See the shared scenario docs: [echo](../bench/scenarios/echo.md) ·
 
 | Scenario | RDMA mode | Kernel baseline | What it isolates |
 |---|---|---|---|
-| **echo** | `--mode echo --transport <rdma>` | `--mode echo --transport tcp` | Raw `Transport` data path — no gRPC/TLS/HTTP |
+| **echo** | `--mode echo --transport <rdma>` (busy-poll `echo-busy`, park `echo-park`) | `--mode echo --transport tcp` | Raw `Transport` data path — no gRPC/TLS/HTTP |
 | **gRPC** | `--mode rh2 --transport <rdma>` | `--mode tcp` | tonic over TLS 1.3 + HTTP/2 + protobuf + hyper |
-| **HTTP/1.1** | `--mode rh1 --transport <rdma>` | `--mode tcp1` | hyper `http1` + TLS, one request in flight per connection |
+| **HTTP/1.1** | `--mode rh1 --transport <rdma>` (busy-poll `rh1-busy`, park `rh1-park`) | `--mode tcp1` | hyper `http1` + TLS, one request in flight per connection |
 
 ### Threads (fixed)
 
@@ -100,14 +111,20 @@ Fixed sizes — message-rate vs bandwidth.
 
 ## The grid
 
-Every transport path is run at **every** coordinate — no bespoke tuning. Per scenario:
+Every transport path is run at **every** coordinate — no bespoke tuning. Per scenario, each
+coordinate is `(connections × in-flight × payload)`:
 
-- **echo** and **gRPC**: 3 connection multiples × 3 in-flight × 2 payloads = **18 coordinates**.
-- **HTTP/1.1**: 3 connection multiples × (in-flight fixed at 1) × 2 payloads = **6 coordinates**.
+- **echo**: 3 × 3 × 2 = **18 coordinates**, run for each of **6 paths** (`send-recv`,
+  read-ring arm-park / busy-poll / park, `credit-ring`, kernel baseline).
+- **gRPC**: 3 × 3 × 2 = **18 coordinates**, run for each of **4 paths** (`send-recv`, read-ring
+  arm-park, `credit-ring`, kernel baseline — no busy/park variant).
+- **HTTP/1.1**: 3 × (in-flight fixed at 1) × 2 = **6 coordinates**, run for each of **6 paths**
+  (as echo).
 
-…run identically for `send-recv`, `read-ring`, `credit-ring`, and the kernel baseline, so any
-two cells at the same coordinate are directly comparable. Fixed run parameters `--duration` /
-`--warmup` (e.g. `duration=10 warmup=3`) are recorded per table, not swept.
+…run identically across the scenario's paths so any two cells at the same coordinate are directly
+comparable. Fixed run parameters `--duration` / `--warmup` (e.g. `duration=10 warmup=3`) are
+recorded per table, not swept. (`credit-ring` is a path for echo/gRPC/HTTP-1.1; the read-ring
+busy-poll and park paths exist for echo & HTTP/1.1 only.)
 
 The headline metrics for each cell — throughput (`req/s`), tail latency (`p50`/`p95`/`p99`),
 CPU cost per op, `cores busy`, `peak RSS`, and (8 KiB) `Gbps` — are defined once in the
