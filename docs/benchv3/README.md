@@ -23,7 +23,7 @@ procedure, and the result-table shapes so the dataset can grow without re-decidi
 | Piece | Where | Role |
 | ----- | ----- | ---- |
 | Benchmark binaries (`rdma-bench-client` / `rdma-bench-server`) | [`tests/rdma-io-bench/`](../../tests/rdma-io-bench) | The actual load test across the transports and scenarios. |
-| Orchestration (Ansible playbooks + a launcher) | [`tests/e2e/`](../../tests/e2e) (playbooks + in-repo `run_bench.sh`); higher-level `just` matrix recipes live in the outer `rdma-io-bench` repo | Deploys binaries/certs, launches server+client over the private link, fetches JSON results. bench v3 is **launcher-agnostic** — see [run-procedure › Launchers](run-procedure.md#launchers-pluggable). |
+| Orchestration (Ansible playbooks + a launcher) | [`tests/e2e/`](../../tests/e2e) (playbooks + in-repo `run_bench.sh`) | Deploys binaries/certs, launches server+client over the private link, fetches JSON results. bench v3 is **launcher-agnostic** — see [run-procedure › Launchers](run-procedure.md#launchers-pluggable). |
 | Fixed-workload docs (this tree) | `docs/benchv3/` | Defines the grid, the run procedure, and the result-table scaffolds. |
 
 A run flows: **build** the release binaries → **deploy** them + TLS certs to the two VMs →
