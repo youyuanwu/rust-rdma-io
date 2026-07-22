@@ -6,6 +6,48 @@ overtake the kernel TCP stack. See the [echo scenario](../../scenarios/echo.md) 
 regimes: [message-rate (64 B)](message-rate-64b.md) · [busy-poll](busy-poll.md) ·
 [thread-per-core (echo-park)](thread-per-core-park.md).
 
+## Board: echo large-payload 8 KiB — peak comparison
+
+Each transport at its **peak-throughput** config (baseline `tcp`). This workload is **bandwidth-bound**,
+so the tuning tables carry a trailing `Gbps` column (the headline metric). `tput%` = peak ÷ TCP peak.
+Schema: [collection protocol](../../collection.md#12-per-workload-board-schema).
+
+| transport | peak throughput | CPU/op | cores@peak | p99 | CPU-eff× | p99× | tput% |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| send-recv | ⏳ pending | — | — | — | — | — | — |
+| read-ring | **549k**¹ | 5.4 µs | ~3.0 | 922 µs | n/r | n/r | 121% |
+| credit-ring | ⏳ pending | — | — | — | — | — | — |
+| tcp | 454k² | 8.8 µs | ~4.0 | 439 µs | — | — | baseline |
+
+¹ 24×16, Undated (absolute peak, **36.0 Gbps**); the 24×8 balance config gives 533–539k /
+35.0–35.3 Gbps at 4.95–5.0 µs, p99 607–619 µs, where the matched-config ratios are **1.8× CPU-eff /
+1.4× p99 / 118% tput**. ² 32×4, Undated (29.8 Gbps bandwidth wall). **At 8 KiB read-ring wins on all
+axes** — bandwidth (~36 vs ~30 Gbps), CPU/op (~1.8×), cores (~3 vs ~4), and tail — because zero-copy
+RDMA Writes move bulk bytes with less overhead than the kernel TCP stack. send-recv / credit-ring are
+`⏳ pending` (collectible at 8 KiB, not yet run).
+
+### Tuning — how each peak was found
+
+**read-ring** (`conns × in-flight`; inverted-U, over-queues past ~24×16):
+
+| config | throughput | CPU/op | cores | p50 | p99 | Gbps | src |
+|---|---:|---:|---:|---:|---:|---:|---|
+| 8×8 | 364k | n/r | n/r | 124 µs | 267 µs | 23.8 | Undated |
+| 16×16 | 514k | n/r | n/r | 293 µs | 697 µs | 33.7 | Undated |
+| 24×8 | 539k | 5.0 µs | ~2.7 | 259 µs | 607 µs | 35.3 | Undated |
+| **24×16** | **549k** | 5.4 µs | ~3.0 | 408 µs | 922 µs | **36.0** | Undated |
+| 32×16 | 412k | n/r | n/r | 1211 µs | 1672 µs | 27.0 | Undated |
+
+**tcp** (flat at the bandwidth wall; concurrency only buys latency):
+
+| config | throughput | CPU/op | cores | p50 | p99 | Gbps | src |
+|---|---:|---:|---:|---:|---:|---:|---|
+| 32×1 | 226k | n/r | n/r | 134 µs | 245 µs | 14.8 | Undated |
+| **32×4** | **454k** | 8.8 µs | ~4.0 | 260 µs | 439 µs | 29.8 | Undated |
+| 32×8 | 446k | n/r | n/r | 493 µs | 1275 µs | 29.3 | Undated |
+
+**send-recv** / **credit-ring**: ⏳ pending — not yet run at 8 KiB.
+
 ## Large-payload (8 KiB) ceiling: read-ring vs TCP
 
 At 64 B (the [message-rate](message-rate-64b.md) regime) per-op overhead is the
