@@ -25,7 +25,7 @@ Every grid coordinate maps to this fixed set of tool inputs, whatever launcher a
 
 | Grid axis | Client/server flag | Playbook var |
 |---|---|---|
-| scenario/path | `--mode` (`echo`/`rh2`/`rh3`/`rh1`/`tcp`/`tcp1`, or `echo-busy`/`echo-park`/`rh1-busy`/`rh1-park`) | `bench_mode` |
+| scenario/path | `--mode` (`echo`/`rh2`/`rh1`/`tcp`/`tcp1`, or `echo-busy`/`echo-park`/`rh1-busy`/`rh1-park`) | `bench_mode` |
 | transport | `--transport` (`send-recv`/`read-ring`/`credit-ring`; `tcp` for echo baseline) | `bench_transport` |
 | connections = mult × vCPU | `--connections` | `bench_connections` |
 | threads = vCPU | `--threads` | `bench_threads` |
