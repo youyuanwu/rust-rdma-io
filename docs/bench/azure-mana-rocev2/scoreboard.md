@@ -45,10 +45,10 @@ Per-op overhead (doorbells/completions) is the limiter. Read-ring folds three co
 
 | transport | peak throughput | CPU/op | cores@peak | p99 | CPU-eff× | p99× | tput% |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| send-recv | 4.40M | 1.30 µs | ~5.7 | 1408 µs | 4.1× | 1.0× | 49% |
-| read-ring (arm-park) | **6.83M** | 1.38 µs | 9.4 | n/r | n/r | n/r | 76% |
-| credit-ring | 1.36M | n/r | n/r | n/r | n/r | n/r | 15% |
-| tcp | **8.94M** | n/r | ~55 | n/r | — | — | baseline |
+| send-recv | 4.40M¹ | 1.30 µs | ~5.7 | 1408 µs | 4.1× | 1.0× | 49% |
+| read-ring (arm-park) | **6.83M**² | 1.38 µs | 9.4 | n/r | n/r | n/r | 76% |
+| credit-ring | 1.36M³ | n/r | n/r | n/r | n/r | n/r | 15% |
+| tcp | **8.94M**⁴ | n/r | ~55 | n/r | — | — | baseline |
 
 Peak configs: send-recv 64×64 · read-ring 48×512 (arm-park; knee ~32×512) · credit-ring 8×8 IF16 ·
 tcp 512×64. Matched-config efficiency (64×64): read-ring 4.2× CPU-eff / 70% tput. read-ring
@@ -67,9 +67,9 @@ Bandwidth-bound; read-ring wins on all axes.
 | transport | peak throughput | CPU/op | cores@peak | p99 | CPU-eff× | p99× | tput% |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | send-recv | ⏳ pending | — | — | — | — | — | — |
-| read-ring | **549k** | 5.4 µs | ~3.0 | 922 µs | n/r | n/r | 121% |
+| read-ring | **549k**¹ | 5.4 µs | ~3.0 | 922 µs | n/r | n/r | 121% |
 | credit-ring | ⏳ pending | — | — | — | — | — | — |
-| tcp | 454k | 8.8 µs | ~4.0 | 439 µs | — | — | baseline |
+| tcp | 454k² | 8.8 µs | ~4.0 | 439 µs | — | — | baseline |
 
 Peak configs: read-ring 24×16 (**36.0 Gbps**) · tcp 32×4 (29.8 Gbps); send-recv / credit-ring ⏳
 pending at 8 KiB. read-ring peak-finder (full sweeps → [detail](echo/large-payload-8kib.md)):
@@ -89,10 +89,10 @@ The full stack masks RDMA's per-op efficiency; both transports are stack-bound.
 
 | transport | peak throughput | CPU/op | cores@peak | p99 | CPU-eff× | p99× | tput% |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| send-recv | 510.2K | 85.6 µs | n/r | n/r | 0.9× | n/r | 63% |
-| read-ring | **833K** | 67.4 µs | ~56 | 8567 µs | 1.1× | 0.6× | 103% |
-| credit-ring | 710.3K | n/r | n/r | n/r | n/r | n/r | 88% |
-| tcp | **806K** | n/r | ~55 | n/r | — | — | baseline |
+| send-recv | 510.2K¹ | 85.6 µs | n/r | n/r | 0.9× | n/r | 63% |
+| read-ring | **833K**² | 67.4 µs | ~56 | 8567 µs | 1.1× | 0.6× | 103% |
+| credit-ring | 710.3K³ | n/r | n/r | n/r | n/r | n/r | 88% |
+| tcp | **806K**⁴ | n/r | ~55 | n/r | — | — | baseline |
 
 Peak configs: send-recv 64×8 · read-ring 192×16 · credit-ring 64×64 · tcp 256×16. read-ring
 peak-finder (full sweeps → [detail](grpc/throughput-64b.md)):
@@ -109,10 +109,10 @@ TCP wins the 8 KiB gRPC headline (rings hit the high-fan-out deadlock); rings wi
 
 | transport | peak throughput | CPU/op | cores@peak | p99 | CPU-eff× | p99× | tput% |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| send-recv | 114K | 117 µs | ~13 | 2623 µs | 1.0× | 0.3× | 26% |
-| read-ring | 247K | 95 µs | ~24 | 1090 µs | 1.2× | 0.1× | 57% |
-| credit-ring | 204K | 94 µs | ~19 | 422 µs | 1.3× | 0.04× | 47% |
-| tcp | **431K** | 118 µs | ~50 | 10167 µs | — | — | baseline |
+| send-recv | 114K¹ | 117 µs | ~13 | 2623 µs | 1.0× | 0.3× | 26% |
+| read-ring | 247K² | 95 µs | ~24 | 1090 µs | 1.2× | 0.1× | 57% |
+| credit-ring | 204K³ | 94 µs | ~19 | 422 µs | 1.3× | 0.04× | 47% |
+| tcp | **431K**⁴ | 118 µs | ~50 | 10167 µs | — | — | baseline |
 
 Peak configs: send-recv 192×1 · read-ring 128×1 (16.2 Gbps) · credit-ring 48×1 · tcp 256×8
 (28.3 Gbps). read-ring peak-finder (full sweeps → [detail](grpc/payload.md)):
@@ -134,7 +134,13 @@ A CPU/RSS characterization (in-flight 1, 64×64); CPU/op is transport-agnostic.
 | tcp | 216.3K | 74.9 µs | n/r | n/r | — | — | baseline |
 
 Peak RSS (in-flight 64): send-recv 166 MB · read-ring 102 MB · credit-ring 102 MB · tcp 98 MB.
-Depth-scaling peak-finder → [detail](grpc/cpu-memory.md) (CPU/op falls with pipelining depth).
+read-ring depth-scaling peak-finder (full sweeps → [detail](grpc/cpu-memory.md)):
+
+| config | throughput | CPU/op | cores | p50 | p99 | peak RSS | src |
+|---|---:|---:|---:|---:|---:|---:|---|
+| in-flight 1 | n/r | 66.5 µs | n/r | n/r | n/r | n/r | 2026-07-17 |
+| in-flight 64 | n/r | 41.5 µs | n/r | n/r | n/r | 102 MB | 2026-07-17 |
+| **64×64, IF1** | **236.1K** | 65.9 µs | n/r | n/r | n/r | 51 MB | 2026-07-17 |
 
 ---
 
@@ -149,10 +155,10 @@ Read-ring folds the pinned thread-per-core modes (`rh1-busy` / `rh1-park`).
 
 | transport | peak throughput | CPU/op | cores@peak | p99 | CPU-eff× | p99× | tput% |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| send-recv | 315k | n/r | n/r | n/r | n/r | n/r | 40% |
-| read-ring (rh1-busy) | **1461K** | 10.9 µs | 16 | n/r | 2.1× | n/r | 185% |
-| credit-ring | 360k | n/r | n/r | n/r | n/r | n/r | 46% |
-| tcp1 | **790k** | n/r | ~26 | n/r | — | — | baseline |
+| send-recv | 315k¹ | n/r | n/r | n/r | n/r | n/r | 40% |
+| read-ring (rh1-busy) | **1461K**² | 10.9 µs | 16 | n/r | 2.1× | n/r | 185% |
+| credit-ring | 360k³ | n/r | n/r | n/r | n/r | n/r | 46% |
+| tcp1 | **790k**⁴ | n/r | ~26 | n/r | — | — | baseline |
 
 Peak configs: send-recv 128c · read-ring 16 pinned cores/128 conns (rh1-busy) · credit-ring 128c ·
 tcp1 5120c. read-ring peak-finder (full sweeps → [detail](h1/throughput-64b.md)):
@@ -169,10 +175,10 @@ Bandwidth-bound; read-ring close behind tcp1 at far fewer connections, no deadlo
 
 | transport | peak throughput | CPU/op | cores@peak | p99 | CPU-eff× | p99× | tput% |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| send-recv | 322k | n/r | n/r | n/r | n/r | n/r | 74% |
-| read-ring | 410K | n/r | ~14 | 1954 µs | n/r | 0.5× | 94% |
-| credit-ring | 321k | n/r | n/r | n/r | n/r | n/r | 73% |
-| tcp1 | **437k** | n/r | ~19 | 4247 µs | — | — | baseline |
+| send-recv | 322k¹ | n/r | n/r | n/r | n/r | n/r | 74% |
+| read-ring | 410K² | n/r | ~14 | 1954 µs | n/r | 0.5× | 94% |
+| credit-ring | 321k³ | n/r | n/r | n/r | n/r | n/r | 73% |
+| tcp1 | **437k**⁴ | n/r | ~19 | 4247 µs | — | — | baseline |
 
 Peak configs: send-recv 256c · read-ring 384c (**26.9 Gbps**) · credit-ring 128c · tcp1 1024c
 (28.6 Gbps). read-ring peak-finder (full sweeps → [detail](h1/large-payload-8kib.md)):
