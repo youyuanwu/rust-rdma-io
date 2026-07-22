@@ -15,8 +15,9 @@ definitions) · [scenarios](scenarios/) (echo / grpc / h1).
 ## 1. The canonical comparison-table schema
 
 Every cross-transport comparison uses one fixed schema, so results are uniform and
-directly scannable. There are two forms of the *same* schema: the **full** form on
-detail pages and a fixed **projection** on the scoreboard.
+directly scannable. §1.1 is the **per-block** comparison table on detail pages; §1.2
+is the **per-workload board** (summary + tuning tables) that organizes results on the
+scoreboard and at the head of each detail page.
 
 ### 1.1 Detail-page table (full schema)
 
@@ -40,16 +41,57 @@ One table per dated result block, comparing the transports head-to-head:
   `—`, inheriting the row's state (the row's first cell carries the explicit
   `⏳ pending` / `— N/A (no such mode)` marker).
 
-### 1.2 Scoreboard table (fixed projection)
+### 1.2 Per-workload board schema
 
-The [scoreboard](azure-mana-rocev2/scoreboard.md) uses a fixed **projection** of
-the full schema — the headline subset — applied identically everywhere:
+Results are presented as **one board per workload** — on the
+[scoreboard](azure-mana-rocev2/scoreboard.md) (the per-workload index) and on each workload's detail
+page. A board = a leading **cross-transport peak-comparison summary** + **per-transport
+parameter-tuning tables** that show how each peak was found.
 
-| regime | transport | throughput | CPU/op | cores@peak | p99 | CPU-eff× | p99× | tput% |
-|---|---|---:|---:|---:|---:|---:|---:|---:|
+**Summary table** (leads each board; **identical** on the scoreboard board and the detail page):
 
-Same columns, same order, on every scoreboard table (no per-page drift). Detail
-pages add `p50` and `peak RSS`; the scoreboard omits them for scannability.
+| transport | peak throughput | CPU/op | cores@peak | p99 | CPU-eff× | p99× | tput% |
+|---|---:|---:|---:|---:|---:|---:|---:|
+
+- One row per applicable transport, order `send-recv`, `read-ring`, `credit-ring`, baseline
+  (`tcp`/`tcp1`) last.
+- **Peak = each transport's global maximum recorded throughput across the workload's dated blocks.**
+  The row reports that config's own metrics and is annotated with its **source-block date** (a
+  best-config footnote). Never merge metrics measured at different configs/blocks (§1.4).
+- Mode-bearing boards: the read-ring row is annotated with its winning mode (e.g. `read-ring
+  (arm-park)`) and shows its single overall peak across modes.
+- **Ratios** (§1.3): `tput%` = transport peak ÷ baseline peak (always shown). `CPU-eff×` / `p99×` are
+  shown only when a matched baseline was recorded at that transport's peak config, otherwise `n/r` —
+  the matched-config ratios remain in the dated blocks below the headline.
+- `⏳ pending` / `— N/A (no such mode)` rows carry the marker in the throughput cell, remaining cells `—`.
+- **Characterization exception:** a regime whose headline metric is not throughput (grpc client CPU &
+  memory) draws **all** summary metrics from a single consistent block and is framed on CPU/op + peak
+  RSS rather than a max-throughput config.
+
+**Per-transport tuning table** (below the summary — the sweep behind each peak):
+
+| config | mode† | throughput | CPU/op | cores | p50 | p99 | src† |
+|---|---|---:|---:|---:|---:|---:|---|
+
+- `config` names the swept parameters (e.g. `64×64`, `48×512`, `256c`). The **peak-throughput row is
+  bold**. Unrecorded cells are `n/r`.
+- `mode†` is present **only** where the workload has completion-mode variants (echo 64 B, h1 64 B).
+  `src†` (source-block date) is present **only** where the table folds rows from more than one dated
+  block / mode file (so every folded row stays traceable, §3/§4).
+- A workload whose headline metric is peak RSS or bandwidth MAY append one trailing column
+  (`peak RSS` / `Gbps`).
+- A `⏳ pending` transport has **no tuning rows** — a one-line "⏳ pending — not yet run" stands in.
+- The matched-core baseline comparison used in completion-mode studies stays in the dated
+  mode-comparison blocks (§2), **not** in the per-transport read-ring tuning table.
+- **Detail page:** the **full sweep** (every recorded config, folding the mode files). **Scoreboard
+  board:** a compact **peak-finder excerpt** (the peak row + the bracketing knee, ≤ ~5 rows per
+  transport) that links to the detail page for the full sweep.
+
+**Completion modes fold into the base workload board.** The read-ring completion modes (arm-park /
+busy-poll `echo-busy` / park `echo-park`; and h1 `rh1-busy` / `rh1-park`) share **one** read-ring
+tuning table via the `mode` column. Their files (`azure-mana-rocev2/echo/busy-poll.md`,
+`echo/thread-per-core-park.md`, `h1/thread-per-core.md`) remain the **data home** for those rows and
+carry a pointer up to their base workload board — they are folded runs, **not** standalone boards.
 
 ### 1.3 Derived RDMA-vs-baseline ratios
 
@@ -64,6 +106,11 @@ significant figure (two decimals, e.g. `0.04×`) so a strong tail win is not rou
 away; `%` to whole (or one decimal when <10). If the baseline value is missing, the
 ratio is `n/r`. Ratios are **derived**, not source data — they are excluded from the
 migration fidelity corpus (recomputed instead).
+
+In a **board summary** (§1.2) each transport is at its own peak config, which usually differs from the
+baseline's peak config, so only `tput%` (peak ÷ baseline peak) is generally computable there; `CPU-eff×`
+and `p99×` are `n/r` unless a matched baseline was recorded at that peak config. The full matched-config
+ratios stay on the detail page's dated blocks (§1.1), which the board keeps intact below the headline.
 
 ### 1.4 Reformatting rule (no fabricated rows)
 
@@ -86,9 +133,11 @@ how its coverage cells are marked.
   the scoreboard tells.
 - **Completion-topology regime** — a **read-ring completion-mode study**
   (busy-poll / arm-park / thread-per-core) against the baseline. The other RDMA
-  transports have **no such mode**, so their rows are `— N/A (no such mode)`; the
-  read-ring row is annotated with the mode. The mode-comparison tables
-  (busy vs park vs thread-per-core) live in the detail page's analysis.
+  transports have **no such mode**. Under the **board layout** (§1.2) a
+  completion-topology regime is **not** a standalone board: it folds into its base
+  workload's board as read-ring `mode`-column rows (echo `busy-poll`/`thread-per-core-park`
+  → the echo 64 B board; h1 `thread-per-core` → the h1 64 B board), and its file
+  becomes the data home for those rows plus the matched-core baseline comparison.
 
 ### Classification (azure-mana-rocev2)
 
@@ -105,20 +154,28 @@ how its coverage cells are marked.
 | h1 | large-payload-8kib | transport-comparison |
 | h1 | thread-per-core (`rh1-busy`/`rh1-park`) | completion-topology |
 
+The seven **boards** (§1.2) are the transport-comparison regimes; the three
+completion-topology regimes fold into a base board's read-ring `mode` column
+(`echo/busy-poll` + `echo/thread-per-core-park` → **echo message-rate-64b**;
+`h1/thread-per-core` → **h1 throughput-64b**).
+
 ---
 
-## 3. Scoreboard value-selection policy
+## 3. Board value-selection policy
 
-Each scoreboard number is drawn deterministically so a reader can trace it:
+Each board number is drawn deterministically so a reader can trace it:
 
-- From the regime's **newest dated result block that recorded the headline metric
-  set** (a newer block that only re-validated a subset may be session-limited; the
-  scoreboard notes the source date per regime for traceability).
-- Each transport at its **characteristic peak** (the config the detail page
-  presents as that transport's headline — e.g. read-ring at its depth optimum).
-- The **config is annotated** on the regime via a **best-config footnote** where a
-  single number could mislead (e.g. read-ring's depth knee), kept outside the fixed
-  metric columns so the schema stays fixed.
+- A transport's **summary peak = its global maximum recorded throughput across the
+  workload's dated blocks** (§1.2); the row reports that config's own metrics and is
+  annotated with the **source-block date** (a newer block that only re-validated a
+  subset may be session-limited, so an older block can hold the global max — e.g.
+  echo read-ring's 6.83M is from the Undated block). Per-row source dating (a
+  best-config footnote or the `src` column) keeps it traceable.
+- The **config is annotated** via a **best-config footnote** where a single number
+  could mislead (e.g. read-ring's depth knee), kept outside the fixed metric columns
+  so the schema stays fixed.
+- **Characterization regimes** (grpc client CPU & memory) instead take all summary
+  metrics from a **single consistent block** (§1.2), never merging blocks (§1.4).
 - Cells not measured show `⏳ pending` or `— N/A` per the coverage rules (§5).
 
 ---
@@ -197,8 +254,11 @@ send-recv/credit-ring).
 3. Add this run's **canonical comparison table** (§1.1) and its analysis, together
    in the block.
 4. If the run fills a previously-`⏳ pending` cell, flip that cell to `✅` in the
-   environment's coverage matrix, and refresh the scoreboard row if this is now the
-   newest block (§3).
+   environment's coverage matrix.
+5. If the run raises a transport's **peak throughput** for that workload, refresh the
+   affected board (§1.2): update the summary row (with its source-block date) and the
+   tuning tables (detail-page full sweep; scoreboard compact excerpt), on both the
+   detail page and the scoreboard board.
 
 ### 6.2 Add a new environment
 
@@ -209,8 +269,9 @@ send-recv/credit-ring).
 2. Create `docs/bench/<slug>/README.md` — copy an existing environment README as the
    template: environment-definition table + a link to its scoreboard + a link back
    to this protocol.
-3. Create `docs/bench/<slug>/scoreboard.md` (per-scenario canonical tables + coverage
-   matrix + the cross-environment caveat) — copy the existing scoreboard as template.
+3. Create `docs/bench/<slug>/scoreboard.md` (per-workload boards — summary + compact
+   peak-finder tuning excerpts — plus the coverage matrix and the cross-environment
+   caveat) — copy the existing scoreboard as template.
 4. Add a row to the Environments table in [README.md](README.md).
 5. Reuse the shared docs unchanged; add regime files under
    `docs/bench/<slug>/<scenario>/` as data is collected.
@@ -255,7 +316,12 @@ this protocol + the coverage matrix:
 2. This regime's coverage cells were already `✅` — no change. Had this been a
    first run of a previously-`⏳ pending` cell, flip it to `✅`.
 
-3. Because this is now the newest block, refresh the scoreboard's
-   echo/message-rate-64b rows from it (§3), keeping the fixed projection columns.
+3. Update the **echo message-rate 64 B board** (§1.2) — on both the detail page and
+   the scoreboard board — only where this run changes a transport's **peak**: e.g. if
+   the new read-ring 4.80M does **not** exceed the standing global peak (arm-park
+   6.83M @ 48×512, Undated block), the read-ring summary row and its peak footnote are
+   unchanged; you only add this block's row to read-ring's full-sweep tuning table
+   (with its `src` date `2026-08-01`). Bold the peak row only if a transport's global
+   maximum moved.
 
 Nothing else needs to change.
