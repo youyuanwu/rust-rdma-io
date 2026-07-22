@@ -185,6 +185,7 @@ Design documents and background research are in [`docs/`](docs/):
 | [bench/scenarios/grpc.md](docs/bench/scenarios/grpc.md) | gRPC-over-RDMA (`rh2`) vs TCP benchmark scenario + results |
 | [bench/scenarios/h1.md](docs/bench/scenarios/h1.md) | HTTP/1.1 (`rh1`/`tcp1`) benchmark scenario + results |
 | [bench/scenarios/echo.md](docs/bench/scenarios/echo.md) | Direct-transport (`--mode echo`) benchmark scenario + results |
+| [benchv3/README.md](docs/benchv3/README.md) | Fixed-workload benchmark framework (v3) — comparable, reproducible RDMA-vs-TCP grid |
 
 ## CI
 
