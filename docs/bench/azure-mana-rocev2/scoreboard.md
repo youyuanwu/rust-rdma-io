@@ -20,6 +20,11 @@ derived **vs-baseline ratios** — CPU-eff× (baseline CPU/op ÷ RDMA) · p99× 
 config, CPU-eff× / p99× are `n/r` where a matched baseline wasn't recorded at that config — the
 matched-config ratios live in the dated blocks on each detail page.
 
+> **Reading the summaries.** Each board's summary table is identical to the one on its detail page.
+> The superscripts `¹²³⁴` on the peak-throughput values map, in row order, to the per-transport
+> **Peak configs** line directly beneath each board (send-recv ¹, read-ring ², credit-ring ³, baseline
+> ⁴), which names each transport's peak config and source date.
+
 ## The one-paragraph story
 
 On this NIC, **TCP wins absolute small-message throughput by spending cores**, while
@@ -109,13 +114,14 @@ TCP wins the 8 KiB gRPC headline (rings hit the high-fan-out deadlock); rings wi
 
 | transport | peak throughput | CPU/op | cores@peak | p99 | CPU-eff× | p99× | tput% |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| send-recv | 114K¹ | 117 µs | ~13 | 2623 µs | 1.0× | 0.3× | 26% |
+| send-recv | 114K¹ | n/r | n/r | n/r | n/r | n/r | 26% |
 | read-ring | 247K² | 95 µs | ~24 | 1090 µs | 1.2× | 0.1× | 57% |
-| credit-ring | 204K³ | 94 µs | ~19 | 422 µs | 1.3× | 0.04× | 47% |
-| tcp | **431K**⁴ | 118 µs | ~50 | 10167 µs | — | — | baseline |
+| credit-ring | 204K³ | n/r | n/r | n/r | n/r | n/r | 47% |
+| tcp | **431K**⁴ | n/r | n/r | n/r | — | — | baseline |
 
-Peak configs: send-recv 192×1 · read-ring 128×1 (16.2 Gbps) · credit-ring 48×1 · tcp 256×8
-(28.3 Gbps). read-ring peak-finder (full sweeps → [detail](grpc/payload.md)):
+Peak configs: send-recv 192×1 (2026-07-17; Undated full-metric 110K) · read-ring 128×1 (247K, Undated;
+16.2 Gbps) · credit-ring 48×1 (2026-07-17; Undated 202K) · tcp 256×8 (2026-07-17; Undated 427K,
+28.3 Gbps). read-ring peak-finder (full sweeps → [detail](grpc/payload.md)):
 
 | config | throughput | CPU/op | cores | p50 | p99 | Gbps | src |
 |---|---:|---:|---:|---:|---:|---:|---|
@@ -200,16 +206,20 @@ is measured for every workload.
 
 | scenario | workload | send-recv | read-ring | credit-ring | baseline |
 |---|---|:---:|:---:|:---:|:---:|
-| echo | message-rate 64 B | ✅ | ✅ (arm-park/busy-poll/park) | ✅ | ✅ |
+| echo | message-rate 64 B | ✅ | ✅ | ✅ | ✅ |
+| echo | ↳ busy-poll `echo-busy` ᵐ | — N/A | ✅ | — N/A | ✅ |
+| echo | ↳ thread-per-core `echo-park` ᵐ | — N/A | ✅ | — N/A | ✅ |
 | echo | large-payload 8 KiB | ⏳ | ✅ | ⏳ | ✅ |
 | grpc | throughput 64 B | ✅ | ✅ | ✅ | ✅ |
 | grpc | payload 8 KiB | ✅ | ✅ | ✅ | ✅ |
 | grpc | client CPU & memory | ✅ | ✅ | ✅ | ✅ |
-| h1 | throughput 64 B | ✅ | ✅ (rh1-busy/rh1-park) | ✅ | ✅ |
+| h1 | throughput 64 B | ✅ | ✅ | ✅ | ✅ |
+| h1 | ↳ thread-per-core `rh1-busy`/`rh1-park` ᵐ | — N/A | ✅ | — N/A | ✅ |
 | h1 | large-payload 8 KiB | ✅ | ✅ | ✅ | ✅ |
 
-`echo/large-payload-8kib` is the one `⏳ pending` gap — send-recv and credit-ring at 8 KiB are
-collectible but not yet run.
+ᵐ Completion-mode run — folded into its base workload's board via the read-ring `mode` column;
+`send-recv`/`credit-ring` have `— N/A (no such mode)`. `echo/large-payload-8kib` is the one
+`⏳ pending` gap — send-recv and credit-ring at 8 KiB are collectible but not yet run.
 
 To add data, follow the [collection protocol](../collection.md): prepend a dated block to the
 workload's detail page, then refresh its board (summary + tuning) and this coverage matrix.

@@ -76,16 +76,19 @@ parameter-tuning tables** that show how each peak was found.
 - `config` names the swept parameters (e.g. `64×64`, `48×512`, `256c`). The **peak-throughput row is
   bold**. Unrecorded cells are `n/r`.
 - `mode†` is present **only** where the workload has completion-mode variants (echo 64 B, h1 64 B).
-  `src†` (source-block date) is present **only** where the table folds rows from more than one dated
-  block / mode file (so every folded row stays traceable, §3/§4).
-- A workload whose headline metric is peak RSS or bandwidth MAY append one trailing column
-  (`peak RSS` / `Gbps`).
+  `src†` (source-block date) is **required** where a table folds rows from more than one dated block /
+  mode file, and MAY be included elsewhere for per-row traceability (§3/§4); it is the **last** column.
+- A workload whose headline metric is peak RSS or bandwidth MAY append one headline-metric column
+  (`peak RSS` / `Gbps`) as the last **data** column — i.e. after `p99` and before the provenance
+  `src†` column.
 - A `⏳ pending` transport has **no tuning rows** — a one-line "⏳ pending — not yet run" stands in.
 - The matched-core baseline comparison used in completion-mode studies stays in the dated
   mode-comparison blocks (§2), **not** in the per-transport read-ring tuning table.
-- **Detail page:** the **full sweep** (every recorded config, folding the mode files). **Scoreboard
-  board:** a compact **peak-finder excerpt** (the peak row + the bracketing knee, ≤ ~5 rows per
-  transport) that links to the detail page for the full sweep.
+- **Detail page:** the **full sweep** — the board's per-transport tuning tables cover the peak-finding
+  configs, and the complete recorded sweeps are retained verbatim in the dated blocks below (nothing
+  is dropped). **Scoreboard board:** the summary (all transports) + a compact **peak-finder excerpt**
+  (the read-ring peak row + bracketing knee, ≤ ~5 rows) + a per-transport **Peak configs** line, all
+  linking to the detail page for the full sweep.
 
 **Completion modes fold into the base workload board.** The read-ring completion modes (arm-park /
 busy-poll `echo-busy` / park `echo-park`; and h1 `rh1-busy` / `rh1-park`) share **one** read-ring
@@ -318,7 +321,7 @@ this protocol + the coverage matrix:
 
 3. Update the **echo message-rate 64 B board** (§1.2) — on both the detail page and
    the scoreboard board — only where this run changes a transport's **peak**: e.g. if
-   the new read-ring 4.80M does **not** exceed the standing global peak (arm-park
+   the new read-ring result does **not** exceed the standing global peak (arm-park
    6.83M @ 48×512, Undated block), the read-ring summary row and its peak footnote are
    unchanged; you only add this block's row to read-ring's full-sweep tuning table
    (with its `src` date `2026-08-01`). Bold the peak row only if a transport's global

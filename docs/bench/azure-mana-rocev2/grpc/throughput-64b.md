@@ -31,14 +31,14 @@ deadlock — see [read-ring-concurrent-stream-deadlock.md](../../../bugs/read-ri
 
 | config | throughput | CPU/op | cores | p50 | p99 | src |
 |---|---:|---:|---:|---:|---:|---|
-| 64×1 | 191.9K | 70.8 µs | n/r | n/r | n/r | Undated |
+| 64×1 | 191.9K | 70.8 µs | n/r | n/r | n/r | 2026-07-06 |
 | **64×8** | **510.2K** | 85.6 µs | n/r | n/r | n/r | 2026-07-06 |
 
 **read-ring** (`conns × in-flight`; peaks then over-queues past in-flight 16 / deadlocks past ~208 conns):
 
 | config | throughput | CPU/op | cores | p50 | p99 | src |
 |---|---:|---:|---:|---:|---:|---|
-| 64×32 | 744.1K | 71.0 µs | n/r | n/r | n/r | 2026-07-17 |
+| 64×32 | 744.1K | n/r | n/r | n/r | n/r | 2026-07-17 |
 | 128×16 | 784K | 70.0 µs | n/r | n/r | 5635 µs | 2026-07-06 |
 | **192×16** | **833K** | 67.4 µs | ~56 | n/r | 8567 µs | 2026-07-06 |
 | 208×16 | 828K | 67.6 µs | n/r | n/r | 9431 µs | 2026-07-06 |
@@ -54,8 +54,8 @@ deadlock — see [read-ring-concurrent-stream-deadlock.md](../../../bugs/read-ri
 
 | config | throughput | CPU/op | cores | p50 | p99 | src |
 |---|---:|---:|---:|---:|---:|---|
-| 128×16 | 701K | 76.6 µs | 53.7 | n/r | 6451 µs | Undated |
-| 256×16 | 740K | 74.1 µs | 54.8 | n/r | 13527 µs | Undated |
+| 128×16 | 701K | 76.6 µs | 53.7 | n/r | 6451 µs | 2026-07-06 |
+| 256×16 | 740K | 74.1 µs | 54.8 | n/r | 13527 µs | 2026-07-06 |
 | **256×16** | **806K** | n/r | n/r | n/r | n/r | 2026-07-17 |
 
 ## Results

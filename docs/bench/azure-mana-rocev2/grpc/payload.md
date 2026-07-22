@@ -16,10 +16,10 @@ ceiling (the 2026-07-17 re-run matched within noise). Schema:
 
 | transport | peak throughput | CPU/op | cores@peak | p99 | CPU-eff× | p99× | tput% |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| send-recv | 114K¹ | 117 µs | ~13 | 2623 µs | 1.0× | 0.3× | 26% |
+| send-recv | 114K¹ | n/r | n/r | n/r | n/r | n/r | 26% |
 | read-ring | 247K² | 95 µs | ~24 | 1090 µs | 1.2× | 0.1× | 57% |
-| credit-ring | 204K³ | 94 µs | ~19 | 422 µs | 1.3× | 0.04× | 47% |
-| tcp | **431K**⁴ | 118 µs | ~50 | 10167 µs | — | — | baseline |
+| credit-ring | 204K³ | n/r | n/r | n/r | n/r | n/r | 47% |
+| tcp | **431K**⁴ | n/r | n/r | n/r | — | — | baseline |
 
 ¹ 192×1 (2026-07-17 peak 114K; Undated full-metric 110K). ² 128×1, Undated. ³ 48×1 (2026-07-17 peak
 204K; Undated full-metric 202K). ⁴ 256×8 (2026-07-17 peak 431K; Undated full-metric 427K). **At 8 KiB
@@ -43,21 +43,24 @@ at their own peak.
 | config | throughput | CPU/op | cores | p50 | p99 | Gbps | src |
 |---|---:|---:|---:|---:|---:|---:|---|
 | 32×1 | 156K | n/r | n/r | n/r | n/r | n/r | Undated |
-| **48×1** | **204K** | 94 µs | ~19 | 227 µs | 422 µs | 13.4 | 2026-07-17 |
+| **48×1** | **204K** | n/r | n/r | n/r | n/r | 13.4 | 2026-07-17 |
+| 48×1 | 202K | 94 µs | ~19 | 227 µs | 422 µs | 13.2 | Undated |
 
 **send-recv** (`conns`, in-flight 1; two-sided recv round-trip, no deadlock, plateaus):
 
 | config | throughput | CPU/op | cores | p50 | p99 | Gbps | src |
 |---|---:|---:|---:|---:|---:|---:|---|
 | 128×1 | 107K | n/r | n/r | n/r | n/r | n/r | Undated |
-| **192×1** | **114K** | 117 µs | ~13 | 1745 µs | 2623 µs | 7.5 | 2026-07-17 |
+| **192×1** | **114K** | n/r | n/r | n/r | n/r | 7.5 | 2026-07-17 |
+| 192×1 | 110K | 117 µs | ~13 | 1745 µs | 2623 µs | 7.2 | Undated |
 
 **tcp** (`conns × in-flight`; bandwidth + CPU wall):
 
 | config | throughput | CPU/op | cores | p50 | p99 | Gbps | src |
 |---|---:|---:|---:|---:|---:|---:|---|
 | 128×16 | 412K | n/r | n/r | n/r | n/r | n/r | 2026-07-17 |
-| **256×8** | **431K** | 118 µs | ~50 | 4411 µs | 10167 µs | 28.3 | 2026-07-17 |
+| **256×8** | **431K** | n/r | n/r | n/r | n/r | 28.3 | 2026-07-17 |
+| 256×8 | 427K | 118 µs | ~50 | 4411 µs | 10167 µs | 28.0 | Undated |
 
 ## Results
 
