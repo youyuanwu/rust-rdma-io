@@ -33,14 +33,10 @@ tables. See the [run-procedure](run-procedure.md) for the exact commands.
 
 ## Design principle: fixed workload, repeated across SKUs
 
-Every data point is a coordinate in a **fixed grid** defined once in the
-[scenario matrix](scenario-matrix.md):
-
-- `--threads` = the machine's **vCPU count** (executor budget, not a load axis);
-- `--connections` = fixed multiples **{1×, 4×, 16×}** of the vCPU count;
-- `--in-flight` = fixed **{1, 64, 512}** (echo/gRPC; HTTP/1.1 is fixed at 1);
-- `--payload` = fixed **{64 B, 8 KiB}**;
-- run identically for `send-recv`, `read-ring`, `credit-ring`, and the kernel baseline.
+Every data point is a coordinate in the **fixed grid** defined once in the
+[scenario matrix](scenario-matrix.md). That document is the source of truth for the thread,
+connection, in-flight, payload, scenario, and transport-path axes; this README only describes how
+the pieces fit together.
 
 Because the coordinates are fixed and vCPU-relative, any two cells at the same coordinate are
 directly comparable, and the **same grid** re-run on a new SKU or commit extends the dataset

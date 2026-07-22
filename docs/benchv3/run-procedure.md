@@ -91,9 +91,11 @@ in each results-table caption.
 
 ### 8 KiB payload → ring message sizing (required)
 
-The `echo` path truncates any payload larger than `--ring-max-msg` (default **1500 B**). For the
-**8 KiB** rows on the ring transports (`send-recv` / `read-ring` / `credit-ring`), set the ring
-message size to 8192 on **both** peers via the direct playbook (`run_bench.sh` cannot supply it):
+The `echo` path truncates ring-transport payloads larger than `--ring-max-msg` (default
+**1500 B**). For the **8 KiB** rows on the ring transports (`read-ring` / `credit-ring`), set the
+ring message size to 8192 on **both** peers via the direct playbook (`run_bench.sh` cannot supply
+it). `send-recv` sizes its echo buffers from `--payload`; the TCP baseline is not affected by this
+ring knob.
 
 ```
 ansible-playbook -i tests/e2e/inventory_local.py tests/e2e/playbooks/bench_run.yml \
