@@ -23,7 +23,7 @@ Each transport at its **peak-throughput** config (baseline `tcp`). `tput%` = pea
 | send-recv | 4.40M¹ | 1.30 µs | ~5.7 | 1408 µs | 4.1× | 1.0× | 49% |
 | read-ring (arm-park) | **6.83M**² | 1.38 µs | 9.4 | n/r | n/r | n/r | 76% |
 | credit-ring | 1.36M³ | n/r | n/r | n/r | n/r | n/r | 15% |
-| tcp | 6.84M–**8.94M**⁴ | n/r | ~55 | n/r | — | — | baseline |
+| tcp | **8.94M**⁴ | n/r | ~55 | n/r | — | — | baseline |
 
 ¹ 64×64, in-flight 64 (Undated block — its 4.40M is the send-recv global max; the 2026-07-17 re-run
 read 4.14M at the same config). ² arm-park 48×512 (Undated); read-ring hard-caps ~6.8M (session peak

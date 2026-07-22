@@ -30,21 +30,21 @@ RDMA Writes move bulk bytes with less overhead than the kernel TCP stack. send-r
 
 **read-ring** (`conns × in-flight`; inverted-U, over-queues past ~24×16):
 
-| config | throughput | CPU/op | cores | p50 | p99 | Gbps | src |
-|---|---:|---:|---:|---:|---:|---:|---|
-| 8×8 | 364k | n/r | n/r | 124 µs | 267 µs | 23.8 | Undated |
-| 16×16 | 514k | n/r | n/r | 293 µs | 697 µs | 33.7 | Undated |
-| 24×8 | 539k | 5.0 µs | ~2.7 | 259 µs | 607 µs | 35.3 | Undated |
-| **24×16** | **549k** | 5.4 µs | ~3.0 | 408 µs | 922 µs | **36.0** | Undated |
-| 32×16 | 412k | n/r | n/r | 1211 µs | 1672 µs | 27.0 | Undated |
+| config | throughput | CPU/op | cores | p50 | p99 | Gbps |
+|---|---:|---:|---:|---:|---:|---:|
+| 8×8 | 364k | n/r | n/r | 124 µs | 267 µs | 23.8 |
+| 16×16 | 514k | n/r | n/r | 293 µs | 697 µs | 33.7 |
+| 24×8 | 539k | 5.0 µs | ~2.7 | 259 µs | 607 µs | 35.3 |
+| **24×16** | **549k** | 5.4 µs | ~3.0 | 408 µs | 922 µs | **36.0** |
+| 32×16 | 412k | n/r | n/r | 1211 µs | 1672 µs | 27.0 |
 
 **tcp** (flat at the bandwidth wall; concurrency only buys latency):
 
-| config | throughput | CPU/op | cores | p50 | p99 | Gbps | src |
-|---|---:|---:|---:|---:|---:|---:|---|
-| 32×1 | 226k | n/r | n/r | 134 µs | 245 µs | 14.8 | Undated |
-| **32×4** | **454k** | 8.8 µs | ~4.0 | 260 µs | 439 µs | 29.8 | Undated |
-| 32×8 | 446k | n/r | n/r | 493 µs | 1275 µs | 29.3 | Undated |
+| config | throughput | CPU/op | cores | p50 | p99 | Gbps |
+|---|---:|---:|---:|---:|---:|---:|
+| 32×1 | 226k | n/r | n/r | 134 µs | 245 µs | 14.8 |
+| **32×4** | **454k** | 8.8 µs | ~4.0 | 260 µs | 439 µs | 29.8 |
+| 32×8 | 446k | n/r | n/r | 493 µs | 1275 µs | 29.3 |
 
 **send-recv** / **credit-ring**: ⏳ pending — not yet run at 8 KiB.
 
