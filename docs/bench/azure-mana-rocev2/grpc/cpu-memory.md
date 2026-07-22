@@ -35,7 +35,7 @@ TLS/HTTP-2/protobuf stack here.
 | in-flight 1 | n/r | 66.5 µs | n/r | n/r | n/r | n/r | 2026-07-17 |
 | in-flight 16 | n/r | 47.9 µs | n/r | n/r | n/r | n/r | 2026-07-17 |
 | in-flight 64 | n/r | 41.5 µs | n/r | n/r | n/r | 102 MB | 2026-07-17 |
-| 64×64, IF1 | 236.1K | 65.9 µs | n/r | n/r | n/r | 51 MB | 2026-07-17 |
+| **64×64, IF1** | **236.1K** | 65.9 µs | n/r | n/r | n/r | 51 MB | 2026-07-17 |
 
 **send-recv**:
 
@@ -43,7 +43,7 @@ TLS/HTTP-2/protobuf stack here.
 |---|---:|---:|---:|---:|---:|---:|---|
 | in-flight 1 | n/r | 65.2 µs | n/r | n/r | n/r | n/r | 2026-07-17 |
 | in-flight 64 | n/r | 43.2 µs | n/r | n/r | n/r | 166 MB | 2026-07-17 |
-| 64×64, IF1 | 196.3K | 65.3 µs | n/r | n/r | n/r | 82 MB | 2026-07-17 |
+| **64×64, IF1** | **196.3K** | 65.3 µs | n/r | n/r | n/r | 82 MB | 2026-07-17 |
 
 **credit-ring**:
 
@@ -51,7 +51,7 @@ TLS/HTTP-2/protobuf stack here.
 |---|---:|---:|---:|---:|---:|---:|---|
 | in-flight 1 | n/r | 76.1 µs | n/r | n/r | n/r | n/r | 2026-07-17 |
 | in-flight 64 | n/r | 42.3 µs | n/r | n/r | n/r | 102 MB | 2026-07-17 |
-| 64×64, IF1 | 248.6K | 70.8 µs | n/r | n/r | n/r | 51 MB | 2026-07-17 |
+| **64×64, IF1** | **248.6K** | 70.8 µs | n/r | n/r | n/r | 51 MB | 2026-07-17 |
 
 **tcp**:
 
@@ -59,7 +59,7 @@ TLS/HTTP-2/protobuf stack here.
 |---|---:|---:|---:|---:|---:|---:|---|
 | in-flight 1 | n/r | 64.3 µs | n/r | n/r | n/r | n/r | 2026-07-17 |
 | in-flight 64 | n/r | 44.2 µs | n/r | n/r | n/r | 98 MB | 2026-07-17 |
-| 64×64, IF1 | 216.3K | 74.9 µs | n/r | n/r | n/r | 37 MB | 2026-07-17 |
+| **64×64, IF1** | **216.3K** | 74.9 µs | n/r | n/r | n/r | 37 MB | 2026-07-17 |
 
 ## Results
 
