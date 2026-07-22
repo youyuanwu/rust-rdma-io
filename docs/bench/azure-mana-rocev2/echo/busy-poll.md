@@ -8,6 +8,11 @@ and measured. Other echo regimes: [message-rate (64 B)](message-rate-64b.md) ·
 [large-payload (8 KiB)](large-payload-8kib.md) ·
 [thread-per-core (echo-park)](thread-per-core-park.md).
 
+> **Folded run.** `echo-busy` is a read-ring completion mode of the
+> **[echo message-rate 64 B board](message-rate-64b.md)** — its sweep appears in that board's
+> read-ring `mode` column (`busy-poll`). This page is the data home for the full busy-poll sweep and
+> its matched-core `tcp echo` comparison.
+
 ## Results
 
 ### 2026-07-17 — regression re-validation

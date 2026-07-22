@@ -7,6 +7,11 @@ comparisons. See the [HTTP/1.1 scenario](../../scenarios/h1.md),
 regimes: [throughput (64 B)](throughput-64b.md) ·
 [large-payload (8 KiB)](large-payload-8kib.md).
 
+> **Folded run.** `rh1-busy` / `rh1-park` are read-ring completion modes of the
+> **[HTTP/1.1 throughput 64 B board](throughput-64b.md)** — their sweeps appear in that board's
+> read-ring `mode` column. This page is the data home for the full thread-per-core sweeps, the
+> matched-core `tcp1` comparison, and mode-selection guidance.
+
 ## Results
 
 ### 2026-07-17 — regression re-validation

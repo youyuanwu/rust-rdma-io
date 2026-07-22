@@ -6,6 +6,58 @@ the tonic `rh2` transports vs the `tcp` baseline. See the
 [metrics](../../metrics.md). Other gRPC regimes: [payload size](payload.md) ·
 [client CPU & memory](cpu-memory.md).
 
+## Board: gRPC throughput 64 B — peak comparison
+
+Each transport at its **peak-throughput** config (baseline `tcp`). `tput%` = peak ÷ TCP peak. Ratios
+cite the 2026-07-06 full-metric block (tcp 74.1 µs). Schema:
+[collection protocol](../../collection.md#12-per-workload-board-schema).
+
+| transport | peak throughput | CPU/op | cores@peak | p99 | CPU-eff× | p99× | tput% |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| send-recv | 510.2K¹ | 85.6 µs | n/r | n/r | 0.9× | n/r | 63% |
+| read-ring | **833K**² | 67.4 µs | ~56 | 8567 µs | 1.1× | 0.6× | 103% |
+| credit-ring | 710.3K³ | n/r | n/r | n/r | n/r | n/r | 88% |
+| tcp | **806K**⁴ | n/r | ~55 | n/r | — | — | baseline |
+
+¹ 64×8, 2026-07-06. ² 192×16, 2026-07-06 — read-ring overtakes TCP (+13% vs the same-session tcp
+740K) at a lower tail; the full stack (TLS+HTTP/2+protobuf) otherwise masks RDMA's per-op efficiency.
+³ 64×64, 2026-07-17. ⁴ 256×16, 2026-07-17; the 2026-07-06 full-metric tcp peak is 740K at 74.1 µs /
+~54.8 cores / p99 13527 µs. Beyond ~208 connections the RDMA rings hit the high-fan-out flow-control
+deadlock — see [read-ring-concurrent-stream-deadlock.md](../../../bugs/read-ring-concurrent-stream-deadlock.md).
+
+### Tuning — how each peak was found
+
+**send-recv** (`conns × in-flight`; deeper runs hung this session):
+
+| config | throughput | CPU/op | cores | p50 | p99 | src |
+|---|---:|---:|---:|---:|---:|---|
+| 64×1 | 191.9K | 70.8 µs | n/r | n/r | n/r | 2026-07-06 |
+| **64×8** | **510.2K** | 85.6 µs | n/r | n/r | n/r | 2026-07-06 |
+
+**read-ring** (`conns × in-flight`; peaks then over-queues past in-flight 16 / deadlocks past ~208 conns):
+
+| config | throughput | CPU/op | cores | p50 | p99 | src |
+|---|---:|---:|---:|---:|---:|---|
+| 64×32 | 744.1K | n/r | n/r | n/r | n/r | 2026-07-17 |
+| 128×16 | 784K | 70.0 µs | n/r | n/r | 5635 µs | 2026-07-06 |
+| **192×16** | **833K** | 67.4 µs | ~56 | n/r | 8567 µs | 2026-07-06 |
+| 208×16 | 828K | 67.6 µs | n/r | n/r | 9431 µs | 2026-07-06 |
+
+**credit-ring** (`conns × in-flight`):
+
+| config | throughput | CPU/op | cores | p50 | p99 | src |
+|---|---:|---:|---:|---:|---:|---|
+| 64×16 | 645.8K | 75.9 µs | n/r | n/r | n/r | 2026-07-06 |
+| **64×64** | **710.3K** | n/r | n/r | n/r | n/r | 2026-07-17 |
+
+**tcp** (CPU-bound; scales with connection count):
+
+| config | throughput | CPU/op | cores | p50 | p99 | src |
+|---|---:|---:|---:|---:|---:|---|
+| 128×16 | 701K | 76.6 µs | 53.7 | n/r | 6451 µs | 2026-07-06 |
+| 256×16 | 740K | 74.1 µs | 54.8 | n/r | 13527 µs | 2026-07-06 |
+| **256×16** | **806K** | n/r | n/r | n/r | n/r | 2026-07-17 |
+
 ## Results
 
 ### 2026-07-17 — regression re-validation

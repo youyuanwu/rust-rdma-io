@@ -32,20 +32,20 @@ here. Shared strategy / methodology / metrics live one level up
 
 ### Results index
 
-Regime detail pages (full data, sweeps, and per-run analysis), grouped by scenario:
+Regime detail pages (full data, sweeps, and per-run analysis) — one **board** per workload, grouped
+by scenario (completion-mode files are folded runs of a base workload's board):
 
 - **[Echo](../scenarios/echo.md)** —
-  [message-rate (64 B)](echo/message-rate-64b.md) ·
-  [large-payload (8 KiB)](echo/large-payload-8kib.md) ·
-  [busy-poll](echo/busy-poll.md) ·
-  [thread-per-core (echo-park)](echo/thread-per-core-park.md)
+  [message-rate (64 B)](echo/message-rate-64b.md) *(folds [busy-poll](echo/busy-poll.md) ·
+  [thread-per-core `echo-park`](echo/thread-per-core-park.md))* ·
+  [large-payload (8 KiB)](echo/large-payload-8kib.md)
 - **[gRPC](../scenarios/grpc.md)** —
   [throughput & pipelining (64 B)](grpc/throughput-64b.md) ·
   [payload size](grpc/payload.md) ·
   [client CPU & memory](grpc/cpu-memory.md)
 - **[HTTP/1.1](../scenarios/h1.md)** —
-  [throughput (64 B)](h1/throughput-64b.md) ·
-  [thread-per-core](h1/thread-per-core.md) ·
+  [throughput (64 B)](h1/throughput-64b.md) *(folds
+  [thread-per-core `rh1-busy`/`rh1-park`](h1/thread-per-core.md))* ·
   [large-payload (8 KiB)](h1/large-payload-8kib.md)
 
 ## Collection protocol

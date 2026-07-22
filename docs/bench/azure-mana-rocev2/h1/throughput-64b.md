@@ -7,6 +7,69 @@ deadlock. See the [HTTP/1.1 scenario](../../scenarios/h1.md),
 HTTP/1.1 regimes: [thread-per-core](thread-per-core.md) ·
 [large-payload (8 KiB)](large-payload-8kib.md).
 
+This board folds in the read-ring **thread-per-core runs**
+([`rh1-busy` / `rh1-park`](thread-per-core.md)) via the `mode` column of the read-ring tuning table.
+Schema: [collection protocol](../../collection.md#12-per-workload-board-schema).
+
+## Board: HTTP/1.1 throughput 64 B — peak comparison
+
+Each transport at its **peak-throughput** config (baseline `tcp1`). `tput%` = peak ÷ tcp1 peak. h1
+reports **cores**, not CPU/op, so CPU-eff× is `n/r` except for the pinned thread-per-core modes (which
+record µs/op).
+
+| transport | peak throughput | CPU/op | cores@peak | p99 | CPU-eff× | p99× | tput% |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| send-recv | 315k¹ | n/r | n/r | n/r | n/r | n/r | 40% |
+| read-ring (rh1-busy) | **1461K**² | 10.9 µs | 16 | n/r | 2.1× | n/r | 185% |
+| credit-ring | 360k³ | n/r | n/r | n/r | n/r | n/r | 46% |
+| tcp1 | **790k**⁴ | n/r | ~26 | n/r | — | — | baseline |
+
+¹ 128 conns, 2026-07-17 (Undated full-metric 310K @128c: ~5.5 cores, p99 702 µs, p99× 0.1×). ²
+thread-per-core busy-poll `rh1-busy`, 16 pinned cores / 128 conns, 2026-07-17 — CPU-eff× vs the
+matched-core tcp1 (345K, 22.8 µs); at that 16-core budget `rh1-busy` delivers **4.2× tcp1's
+throughput** (423%). Other read-ring modes: plain rh1 582K @512c, rh1-park 579K @8c. ³ 128 conns,
+2026-07-17 (Undated 353K: ~7.3 cores, p99 766 µs). ⁴ 5120 conns, 2026-07-17 (Undated 780K @3072c: ~26
+cores, p99 7371 µs). tcp1 brute-forces the headline with thousands of connections; the pinned read-ring
+`rh1-busy` beats it ~4× at a matched 16-core budget.
+
+### Tuning — how each peak was found
+
+**read-ring** — folds plain `rh1` (shared runtime) + the pinned thread-per-core modes `rh1-busy` /
+`rh1-park` (see [thread-per-core](thread-per-core.md)):
+
+| config | mode | throughput | CPU/op | cores | p50 | p99 | src |
+|---|---|---:|---:|---:|---:|---:|---|
+| 256c | rh1 | 469K | n/r | n/r | n/r | n/r | 2026-07-17 |
+| 384c | rh1 | 541K | n/r | n/r | n/r | n/r | 2026-07-17 |
+| 512c | rh1 | 582K | n/r | ~12 | 856 µs | 1656 µs | Undated |
+| 4c · 32 | rh1-busy | 431K | 9.3 µs | 4 | 73 µs | 100 µs | 2026-07-17 |
+| 8c · 64 | rh1-busy | 852K | 9.4 µs | 8 | n/r | n/r | 2026-07-17 |
+| **16c · 128** | **rh1-busy** | **1461K** | 10.9 µs | 16 | n/r | n/r | 2026-07-17 |
+| 8c · 64 | rh1-park | 579K | 12.8 µs | ~7.4 | n/r | n/r | 2026-07-17 |
+| 16c · 128 | rh1-park | 385K | 16.1 µs | n/r | n/r | n/r | 2026-07-17 |
+
+**send-recv** (`conns`, in-flight 1):
+
+| config | throughput | CPU/op | cores | p50 | p99 | src |
+|---|---:|---:|---:|---:|---:|---|
+| 128c | 310K | n/r | ~5.5 | 403 µs | 702 µs | Undated |
+| **128c** | **315k** | n/r | n/r | n/r | n/r | 2026-07-17 |
+
+**credit-ring** (`conns`, in-flight 1):
+
+| config | throughput | CPU/op | cores | p50 | p99 | src |
+|---|---:|---:|---:|---:|---:|---|
+| 128c | 353K | n/r | ~7.3 | 341 µs | 766 µs | Undated |
+| **128c** | **360k** | n/r | n/r | n/r | n/r | 2026-07-17 |
+
+**tcp1** (`conns`, in-flight 1; connection-count bound):
+
+| config | throughput | CPU/op | cores | p50 | p99 | src |
+|---|---:|---:|---:|---:|---:|---|
+| 1024c | 605k | n/r | n/r | n/r | n/r | Undated |
+| 3072c | 771k | n/r | ~26 | 3817 µs | 7371 µs | Undated |
+| **5120c** | **790k** | n/r | ~26 | n/r | n/r | 2026-07-17 |
+
 ## Results
 
 ### 2026-07-17 — regression re-validation

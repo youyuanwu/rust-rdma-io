@@ -7,6 +7,71 @@ the default arm-park `echo` mode — the message-rate regime where per-op overhe
 regimes: [large-payload (8 KiB)](large-payload-8kib.md) · [busy-poll](busy-poll.md) ·
 [thread-per-core (echo-park)](thread-per-core-park.md).
 
+This board folds in the read-ring **completion-mode runs**
+([busy-poll `echo-busy`](busy-poll.md), [thread-per-core `echo-park`](thread-per-core-park.md)) via
+the `mode` column of the read-ring tuning table below. Schema and rules:
+[collection protocol](../../collection.md#12-per-workload-board-schema).
+
+## Board: echo message-rate 64 B — peak comparison
+
+Each transport at its **peak-throughput** config (baseline `tcp`). `tput%` = peak ÷ TCP peak;
+`CPU-eff×` / `p99×` are shown only where a matched baseline was recorded at that peak config
+(otherwise `n/r` — the matched-config ratios are in the dated blocks below).
+
+| transport | peak throughput | CPU/op | cores@peak | p99 | CPU-eff× | p99× | tput% |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| send-recv | 4.40M¹ | 1.30 µs | ~5.7 | 1408 µs | 4.1× | 1.0× | 49% |
+| read-ring (arm-park) | **6.83M**² | 1.38 µs | 9.4 | n/r | n/r | n/r | 76% |
+| credit-ring | 1.36M³ | n/r | n/r | n/r | n/r | n/r | 15% |
+| tcp | **8.94M**⁴ | n/r | ~55 | n/r | — | — | baseline |
+
+¹ 64×64, in-flight 64 (Undated block — its 4.40M is the send-recv global max; the 2026-07-17 re-run
+read 4.14M at the same config). ² arm-park 48×512 (Undated); read-ring hard-caps ~6.8M (session peak
+6.75M @ 32×512, p99 1942 µs). ³ 8×8 in-flight 16 (2026-07-17 in-flight sweep). ⁴ 512×64 (2026-07-17
+TCP scaling; the 64×64 matched-config headline is 6.84M). **Matched-config efficiency** (at 64×64,
+in the dated blocks below): read-ring **4.2× CPU-eff / 1.3× p99 / 70% tput**, credit-ring 1.6× / 3.5×
+/ 14%, send-recv 4.2× / 1.1× / 61% — this is where RDMA's per-op efficiency shows against TCP at a
+matched config.
+
+### Tuning — how each peak was found
+
+**send-recv** (`conns × in-flight`):
+
+| config | throughput | CPU/op | cores | p50 | p99 | src |
+|---|---:|---:|---:|---:|---:|---|
+| 8×8, in-flight 64 | 3.98M | n/r | n/r | n/r | n/r | 2026-07-17 |
+| **64×64** | **4.40M** | 1.30 µs | ~5.7 | 243 µs | 1408 µs | Undated |
+
+**read-ring** — folds all three completion modes (`arm-park` default, `busy-poll` = `echo-busy`,
+`park` = `echo-park`). The arm-park depth sweep finds the global peak; the pinned modes trade peak for
+determinism/low-latency (see [busy-poll](busy-poll.md) · [echo-park](thread-per-core-park.md)):
+
+| config | mode | throughput | CPU/op | cores | p50 | p99 | src |
+|---|---|---:|---:|---:|---:|---:|---|
+| 16×256 | arm-park | 5.92M | 1.125 µs | 6.7 | 244 µs | 1198 µs | Undated |
+| 16×512 | arm-park | 6.58M | 0.993 µs | 6.5 | 419 µs | 1771 µs | Undated |
+| 32×512 | arm-park | 6.75M | 1.051 µs | 7.1 | 462 µs | 1942 µs | Undated |
+| **48×512** | **arm-park** | **6.83M** | 1.380 µs | 9.4 | 651 µs | n/r | Undated |
+| 16×1024 | arm-park | 4.39M | 0.939 µs | 4.1 | 784 µs | 2723 µs | Undated |
+| 8c · 8×256 | busy-poll | 5.08M | 1.57 µs | 8 | 359 µs | 630 µs | Undated |
+| 16c · 64×64 | busy-poll | 5.39M | 2.97 µs | 16 | 427 µs | 2403 µs | Undated |
+| 8c · 32×64 | park | 4.93M | 1.52 µs | 8 | 362 µs | 1634 µs | Undated |
+
+**credit-ring** (`conns × in-flight`; over-queues past in-flight 16):
+
+| config | throughput | CPU/op | cores | p50 | p99 | src |
+|---|---:|---:|---:|---:|---:|---|
+| 8×8, in-flight 16 | **1.36M** | n/r | n/r | n/r | n/r | 2026-07-17 |
+| 64×64, in-flight 64 | 0.98M | 3.18 µs | 3.1 | 4183 µs | 4731 µs | 2026-07-17 |
+
+**tcp** — CPU-bound; scales with connection count, not depth:
+
+| config | throughput | CPU/op | cores | p50 | p99 | src |
+|---|---:|---:|---:|---:|---:|---|
+| 64×64 | 6.84M | 5.20 µs | 35.5 | 272 µs | 1339 µs | 2026-07-17 |
+| 256×64 | 8.42M | 6.38 µs | 53.7 | 575 µs | 4079 µs | Undated |
+| **512×64** | **8.94M** | n/r | ~55 | n/r | n/r | 2026-07-17 |
+
 ## Results
 
 ### 2026-07-17 — regression re-validation
