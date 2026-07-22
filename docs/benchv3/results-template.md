@@ -148,8 +148,9 @@ fixed axes + commit and re-issue the matching command per the [run-procedure](ru
 pinned to the recorded `git commit`.
 
 > **Filename collision warning.** The orchestration writes results to
-> `/tmp/bench-<mode>-<transport>-<connections>conn-<threads>thr-<in_flight>if.json` — the name
-> encodes **no payload and no date**, so a 64 B run followed by an 8 KiB run at the same
+> `<bench_out_dir>/bench-<mode>-<transport>-<connections>conn-<threads>thr-<in_flight>if.json`
+> (the directory depends on the launcher — see the [run-procedure](run-procedure.md#launchers-pluggable)).
+> The name encodes **no payload and no date**, so a 64 B run followed by an 8 KiB run at the same
 > coordinate (or a repeat) **overwrites** the previous file. Fill the cell immediately, or set a
 > per-payload/per-run `bench_out_dir` (or rename the file to include payload + date + commit)
 > before the next run.

@@ -1,13 +1,41 @@
 # End-to-end run procedure (bench v3)
 
-How to execute the [fixed-workload grid](scenario-matrix.md) with the real `rdma-io-bench`
-tooling and record the numbers into the [results-template](results-template.md). This is the
-"how to run" companion to the scenario matrix (what/why) — see the [bench v3 README](README.md)
-for the framework overview.
+How to execute the [fixed-workload grid](scenario-matrix.md) and record the numbers into the
+[results-template](results-template.md). This is the "how to run" companion to the scenario
+matrix (what/why) — see the [bench v3 README](README.md) for the framework overview.
 
 The benchmark runs across **two RDMA-capable VMs** (a server on `vm1`, a client on `vm2`)
-orchestrated from a control node with Ansible. All commands below run from the repo root on the
-control node unless noted.
+orchestrated from a control node with Ansible.
+
+> **Orchestration is pluggable — bench v3 is launcher-agnostic.** What v3 pins is the **grid**
+> and the **coordinate → flags/vars contract** below; *how* those flags reach the two VMs is an
+> orchestration detail that can evolve independently. Today the same Ansible playbooks
+> (`tests/e2e/playbooks/*.yml`) can be driven several ways — the in-repo `tests/e2e/run_bench.sh`
+> convenience script, a raw `ansible-playbook` invocation, or the higher-level `just` matrix
+> recipes in the **outer `rdma-io-bench` repo** (`deploy-bench` / `echo-matrix` / `bench-matrix` /
+> `run-bench` / `bench-report`, plus `reboot` / `prepare-rdma`). This document shows the raw /
+> in-repo launcher because it is self-contained here; the higher-level matrix + reporting wiring
+> is maintained separately (see [Launchers](#launchers-pluggable)). Pick whichever launcher you
+> have — the coordinate contract and caveats are identical.
+
+## The coordinate → flags/vars contract
+
+Every grid coordinate maps to this fixed set of tool inputs, whatever launcher applies them
+(client/server flags, or the `-e bench_*` playbook vars of the same name):
+
+| Grid axis | Client/server flag | Playbook var |
+|---|---|---|
+| scenario/path | `--mode` (`echo`/`rh2`/`rh1`/`tcp`/`tcp1`, or `echo-busy`/`echo-park`/`rh1-busy`/`rh1-park`) | `bench_mode` |
+| transport | `--transport` (`send-recv`/`read-ring`/`credit-ring`; `tcp` for echo baseline) | `bench_transport` |
+| connections = mult × vCPU | `--connections` | `bench_connections` |
+| threads = vCPU | `--threads` | `bench_threads` |
+| in-flight (echo/gRPC) | `--in-flight` | `bench_in_flight` |
+| payload | `--payload` | `bench_payload` |
+| 8 KiB ring sizing | `--ring-max-msg 8192` | `bench_ring_max_msg` |
+| duration / warmup | `--duration` / `--warmup` | `bench_duration` / `bench_warmup` |
+
+The rest of this doc shows one launcher applying that contract, then the caveats (which are
+launcher-independent facts about the tool/NIC).
 
 ## Prerequisites
 
@@ -177,16 +205,39 @@ NIC. See [`methodology.md`](../bench/methodology.md#reboot-cadence-and-nic-wedge
 
 ### Where results land
 
-`bench_run.yml` writes the client JSON to the control node at:
+`bench_run.yml` writes the client JSON to `<bench_out_dir>/bench-<mode>-<transport>-
+<connections>conn-<threads>thr-<in_flight>if.json`. The directory depends on the launcher's
+`bench_out_dir` (the in-repo `run_bench.sh` / raw playbook default is `/tmp`; the outer-repo
+`just` recipes use `build/bench/`):
 
 ```
-/tmp/bench-<mode>-<transport>-<connections>conn-<threads>thr-<in_flight>if.json
+<bench_out_dir>/bench-<mode>-<transport>-<connections>conn-<threads>thr-<in_flight>if.json
 ```
 
 > **The filename encodes no payload and no date**, so a 64 B then 8 KiB run (or a repeat) at the
 > same coordinate **overwrites** the previous file. Curate each cell into the
 > [results-template](results-template.md) immediately, or set a per-payload/per-run `bench_out_dir`
 > (or rename to include payload + date + commit) before the next run.
+
+## Launchers (pluggable)
+
+bench v3 pins the grid and the [coordinate contract](#the-coordinate--flagsvars-contract), not a
+specific launcher. Any of these apply the same contract to the same playbooks — use whichever your
+environment provides; the matrix + reporting wiring is maintained **separately** from these docs
+and may evolve:
+
+| Launcher | Where | Notes |
+|---|---|---|
+| `tests/e2e/run_bench.sh` | in this repo | Single run (mode/transport/connections/threads/duration/payload) or `--matrix` (in-flight 1); no `--in-flight`/`--warmup`/`--ring-max-msg`. |
+| raw `ansible-playbook … bench_run.yml -e bench_*` | in this repo | Full control of every `bench_*` var (the examples above). |
+| `just` matrix recipes | **outer `rdma-io-bench` repo** (`just/test.just`) | `deploy-bench`, `echo-matrix` (echo grid: `transports × in_flights` at fixed `cpus`), `bench-matrix` (gRPC grid), `run-bench`, `bench-report` (JSON → Markdown/charts), `reboot` / `prepare-rdma`. Writes to `build/bench/`. |
+
+The outer-repo `just` recipes are the higher-level drivers the rest of the docs use; `echo-matrix`'s
+"fixed `cpus`, sweep `in_flights`" shape maps onto the v3 grid (run it per connection multiple and
+per payload). They do **not** cover HTTP/1.1 (`rh1`) or the read-ring busy-poll/park paths — drive
+those with `just run-bench mode=…` / the raw playbook. Because this wiring lives partly in the outer
+repo and is still being shaped, v3 documents the coordinate contract and leaves launcher selection
+open.
 
 ## Teardown
 
