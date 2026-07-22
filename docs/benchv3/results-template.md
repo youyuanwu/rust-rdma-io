@@ -50,7 +50,13 @@ per `(scenario, payload, connections, in-flight)` coordinate you care about. Sta
 | kernel baseline |                   |          |          |          |             |       |               |        |
 
 ¹ Example of an unsustainable coordinate — if `credit-ring` cannot sustain this depth, record
-`fail (over-queue)` / `n/a` in the numeric cells rather than leaving them ambiguous.
+`fail (over-queue)` / `n/a` in its cells rather than leaving them ambiguous.
+
+**Illustrative** (how an unsustainable coordinate is recorded — *not* real data):
+
+| Transport path | Throughput (req/s) | p50 (µs) | p95 (µs) | p99 (µs) | CPU/op (µs) | cores | peak RSS (MB) | errors |
+| -------------- | ------------------ | -------- | -------- | -------- | ----------- | ----- | ------------- | ------ |
+| `credit-ring`  | `fail (CM setup)`  | `n/a`    | `n/a`    | `n/a`    | `n/a`       | `n/a` | `n/a`         | `n/a`  |
 
 For **8 KiB** (bandwidth) coordinates, add a `Gbps` column after `throughput`:
 
@@ -78,17 +84,20 @@ rows (one per connection multiple) instead of nine.
 > **transport:** `read-ring` · **duration/warmup:** 10 s / 3 s · **git commit:** `________` ·
 > **date:** `________`
 
-| connections | in-flight | Throughput (req/s) | p50 (µs) | p95 (µs) | p99 (µs) | CPU/op (µs) | cores | errors |
-| ----------- | --------- | ------------------ | -------- | -------- | -------- | ----------- | ----- | ------ |
-| 1× vCPU     | 1         |                    |          |          |          |             |       |        |
-| 1× vCPU     | 64        |                    |          |          |          |             |       |        |
-| 1× vCPU     | 512       |                    |          |          |          |             |       |        |
-| 4× vCPU     | 1         |                    |          |          |          |             |       |        |
-| 4× vCPU     | 64        |                    |          |          |          |             |       |        |
-| 4× vCPU     | 512       |                    |          |          |          |             |       |        |
-| 16× vCPU    | 1         |                    |          |          |          |             |       |        |
-| 16× vCPU    | 64        |                    |          |          |          |             |       |        |
-| 16× vCPU    | 512       |                    |          |          |          |             |       |        |
+| connections | in-flight | Throughput (req/s) | p50 (µs) | p95 (µs) | p99 (µs) | CPU/op (µs) | cores | peak RSS (MB) | errors |
+| ----------- | --------- | ------------------ | -------- | -------- | -------- | ----------- | ----- | ------------- | ------ |
+| 1× vCPU     | 1         |                    |          |          |          |             |       |               |        |
+| 1× vCPU     | 64        |                    |          |          |          |             |       |               |        |
+| 1× vCPU     | 512       |                    |          |          |          |             |       |               |        |
+| 4× vCPU     | 1         |                    |          |          |          |             |       |               |        |
+| 4× vCPU     | 64        |                    |          |          |          |             |       |               |        |
+| 4× vCPU     | 512       |                    |          |          |          |             |       |               |        |
+| 16× vCPU    | 1         |                    |          |          |          |             |       |               |        |
+| 16× vCPU    | 64        |                    |          |          |          |             |       |               |        |
+| 16× vCPU    | 512       |                    |          |          |          |             |       |               |        |
+
+For an **8 KiB** (bandwidth) copy of Table B, add a `Gbps` column after `Throughput` (as in
+Table A).
 
 ---
 

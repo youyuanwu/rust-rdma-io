@@ -58,15 +58,24 @@ tests/e2e/run_bench.sh \
 ```
 
 The built-in matrix form iterates its own lists (defaults run at in-flight 1); override with the
-`--matrix-*` flags — note single-run `--mode/--transport/...` flags are ignored in matrix mode:
+`--matrix-*` flags — note single-run `--mode/--transport/...` flags are ignored in matrix mode.
+**`--matrix` cross-products modes × transports**, so keep each mode with only transports it
+accepts: `echo` (which alone accepts `--transport tcp` for its baseline) is safe to sweep across
+all four paths, but `rh2`/`rh1` accept only the RDMA transports — their kernel baselines are
+**separate modes** (`tcp` / `tcp1`), not `--transport tcp`. So sweep echo across all paths:
 
 ```
 tests/e2e/run_bench.sh --matrix \
-  --matrix-modes 'echo rh2' \
+  --matrix-modes 'echo' \
   --matrix-transports 'send-recv read-ring credit-ring tcp' \
   --matrix-connections '64 256 1024' \
   --matrix-threads '64'
 ```
+
+…and run the gRPC / HTTP-1.1 rows as their own single-run invocations — the RDMA paths with
+`--mode rh2|rh1 --transport <rdma>`, and the baselines as `--mode tcp` (gRPC) / `--mode tcp1`
+(HTTP/1.1). (Do **not** put `rh2`/`rh1` and `tcp` in one matrix — the cross-product would emit the
+invalid `--mode rh2 --transport tcp`, which the client rejects.)
 
 **in-flight ∈ {64, 512} rows** (echo/gRPC) — invoke the orchestration playbook directly, which
 does accept the in-flight / warmup / ring-message variables:
@@ -88,6 +97,12 @@ The client is launched internally with `--report json`; its stdout is captured t
 `run_bench.sh` has no warmup flag and uses the playbook default (`bench_warmup=5`). To control it,
 use the direct playbook form with `-e bench_warmup=<seconds>`. Record the actual duration/warmup
 in each results-table caption.
+
+> **Hold duration and warmup constant across a grid.** Because bench v3 compares cells at
+> identical coordinates, every cell of a given grid must use the **same** `--duration` and
+> `--warmup`. The convenience-script path defaults to `warmup=5`, so if you mix it with
+> direct-playbook runs, pass the same value there too (`-e bench_warmup=5`) — or run every row
+> via the playbook — rather than leaving the two paths on different warmups.
 
 ### 8 KiB payload → ring message sizing (required)
 

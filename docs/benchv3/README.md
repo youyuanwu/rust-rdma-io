@@ -28,7 +28,7 @@ procedure, and the result-table shapes so the dataset can grow without re-decidi
 
 A run flows: **build** the release binaries → **deploy** them + TLS certs to the two VMs →
 **run** each grid coordinate (server on `vm1`, client on `vm2`, `--report json`) → **fetch** the
-result JSON to the control node → **curate** the interesting numbers by hand into the result
+result JSON to the control node → **transcribe** every coordinate's result by hand into the result
 tables. See the [run-procedure](run-procedure.md) for the exact commands.
 
 ## Design principle: fixed workload, repeated across SKUs
@@ -61,4 +61,4 @@ No framework edits are needed — the grid definition and table shapes are reuse
 | [scenario-matrix.md](scenario-matrix.md) | What/why we measure — transports, scenarios, the fixed grid (single source of truth) |
 | [results-template.md](results-template.md) | Reusable blank result tables + how to fill a cell |
 | [run-procedure.md](run-procedure.md) | How to run the grid with the real tooling + caveats |
-| [../bench/metrics.md](../bench/metrics.md) | Authoritative metric definitions (req/s, p50/p95/p99, CPU/op, cores busy, peak RSS, Gbps) |
+| [../bench/metrics.md](../bench/metrics.md) | Authoritative metric definitions (req/s, p50/p99 tail latencies, CPU/op, cores busy, peak RSS, Gbps; v3 also reports p95) |
