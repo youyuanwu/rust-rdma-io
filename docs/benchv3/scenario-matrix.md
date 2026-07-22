@@ -115,7 +115,7 @@ Every transport path is run at **every** coordinate — no bespoke tuning. Per s
 coordinate is `(connections × in-flight × payload)`:
 
 - **echo**: 3 × 3 × 2 = **18 coordinates**, run for each of **6 paths** (`send-recv`,
-  read-ring arm-park / busy-poll / park, `credit-ring`, kernel baseline).
+  read-ring arm-park / busy-poll / thread-per-core park, `credit-ring`, kernel baseline).
 - **gRPC**: 3 × 3 × 2 = **18 coordinates**, run for each of **4 paths** (`send-recv`, read-ring
   arm-park, `credit-ring`, kernel baseline — no busy/park variant).
 - **HTTP/1.1**: 3 × (in-flight fixed at 1) × 2 = **6 coordinates**, run for each of **6 paths**

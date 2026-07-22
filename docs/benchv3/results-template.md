@@ -49,7 +49,7 @@ below is an **echo** board (6 paths); a **gRPC** board omits the `read-ring (bus
 | `send-recv`    |                    |          |          |          |             |       |               |        |
 | `read-ring` (arm-park) |            |          |          |          |             |       |               |        |
 | `read-ring` (busy-poll)² |          |          |          |          |             |       |               |        |
-| `read-ring` (park)² |               |          |          |          |             |       |               |        |
+| `read-ring` (thread-per-core park)² |   |          |          |          |             |       |               |        |
 | `credit-ring`¹ |                    |          |          |          |             |       |               |        |
 | kernel baseline |                   |          |          |          |             |       |               |        |
 
@@ -75,7 +75,7 @@ For **8 KiB** (bandwidth) coordinates, add a `Gbps` column after `throughput`:
 | `send-recv`    |                    |      |          |          |          |             |       |               |        |
 | `read-ring` (arm-park) |            |      |          |          |          |             |       |               |        |
 | `read-ring` (busy-poll)² |          |      |          |          |          |             |       |               |        |
-| `read-ring` (park)² |               |      |          |          |          |             |       |               |        |
+| `read-ring` (thread-per-core park)² |   |      |          |          |          |             |       |               |        |
 | `credit-ring`  |                    |      |          |          |          |             |       |               |        |
 | kernel baseline |                   |      |          |          |          |             |       |               |        |
 
@@ -87,7 +87,8 @@ Fill one copy **per (scenario, payload, transport)** to see how a single transpo
 the fixed grid. The swept axis is the `(connections × in-flight)` coordinate (rows); everything
 else is fixed in the caption. For **HTTP/1.1** the in-flight column is always 1, so it has three
 rows (one per connection multiple) instead of nine. The `transport` axis includes the read-ring
-completion topologies (`read-ring (busy-poll)` / `read-ring (park)`) for echo & HTTP/1.1 boards.
+completion topologies (`read-ring (busy-poll)` / `read-ring (thread-per-core park)`) for echo &
+HTTP/1.1 boards.
 
 > **SKU:** `________` · **vCPU:** `__` · **scenario:** `echo` · **payload:** 64 B ·
 > **transport:** `read-ring` · **duration/warmup:** 10 s / 3 s · **git commit:** `________` ·
