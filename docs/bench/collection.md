@@ -255,10 +255,10 @@ send-recv/credit-ring).
    in the block.
 4. If the run fills a previously-`⏳ pending` cell, flip that cell to `✅` in the
    environment's coverage matrix.
-5. If the run raises a transport's **peak throughput** for that workload, refresh the
-   affected board (§1.2): update the summary row (with its source-block date) and the
-   tuning tables (detail-page full sweep; scoreboard compact excerpt), on both the
-   detail page and the scoreboard board.
+5. Refresh the affected board (§1.2): add this config to the detail page's
+   full-sweep tuning table, and if the run raises a transport's **peak throughput**
+   for that workload, update the summary row (with its source-block date) plus the
+   scoreboard's compact excerpt.
 
 ### 6.2 Add a new environment
 
