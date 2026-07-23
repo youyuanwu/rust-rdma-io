@@ -275,9 +275,7 @@ pub mod test_helpers {
             match cm.connect(&ConnParam::default()).await {
                 Ok(()) => return (cm, qp_state),
                 Err(e) => {
-                    if is_transient_cm_error(&e)
-                        && attempt + 1 < TRANSIENT_CM_HANDSHAKE_ATTEMPTS
-                    {
+                    if is_transient_cm_error(&e) && attempt + 1 < TRANSIENT_CM_HANDSHAKE_ATTEMPTS {
                         tracing::warn!("client connect attempt {attempt} {e}, retrying...");
                         drop(qp_state);
                         drop(cm);
