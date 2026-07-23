@@ -24,12 +24,14 @@ procedure, and the result-table shapes so the dataset can grow without re-decidi
 | ----- | ----- | ---- |
 | Benchmark binaries (`rdma-bench-client` / `rdma-bench-server`) | [`tests/rdma-io-bench/`](../../tests/rdma-io-bench) | The actual load test across the transports and scenarios. |
 | Orchestration (Ansible playbooks + a launcher) | [`tests/e2e/`](../../tests/e2e) (playbooks + in-repo `run_bench.sh`) | Deploys binaries/certs, launches server+client over the private link, fetches JSON results. bench v3 is **launcher-agnostic** — see [run-procedure › Launchers](run-procedure.md#launchers-pluggable). |
+| Fixed-workload collection tooling | [`tests/benchv3/`](../../tests/benchv3) (`run_matrix.py` + `report.py`) | The primary in-repo launcher: expands the fixed grid, drives each coordinate through the orchestration, saves collision-proof results, and emits the result tables. |
 | Fixed-workload docs (this tree) | `docs/benchv3/` | Defines the grid, the run procedure, and the result-table scaffolds. |
 
 A run flows: **build** the release binaries → **deploy** them + TLS certs to the two VMs →
-**run** each grid coordinate (server on `vm1`, client on `vm2`, `--report json`) → **fetch** the
-result JSON to the control node → **transcribe** every coordinate's result by hand into the result
-tables. See the [run-procedure](run-procedure.md) for the exact commands.
+**run** each grid coordinate (server on `vm1`, client on `vm2`, `--report json`) → **collect** the
+result JSON to the control node under collision-proof names → **generate** the result tables with
+the in-repo [`tests/benchv3/`](../../tests/benchv3) runner + report (or transcribe by hand). See the
+[run-procedure](run-procedure.md) for the exact commands.
 
 ## Design principle: fixed workload, repeated across SKUs
 
@@ -46,9 +48,12 @@ without changing the framework.
 
 To publish a new sweep:
 
-1. Run the grid for the SKU per the [run-procedure](run-procedure.md) (`--threads = nproc`).
-2. Copy a blank table block from the [results-template](results-template.md) and fill each cell
-   from the client's `--report json` output.
+1. Run the grid for the SKU per the [run-procedure](run-procedure.md) (`--threads = nproc`) — the
+   in-repo [`tests/benchv3/run_matrix.py`](../../tests/benchv3) drives the whole grid and saves
+   collision-proof results.
+2. Generate the table blocks with [`tests/benchv3/report.py`](../../tests/benchv3) (paste-ready
+   Table A/B), or copy a blank block from the [results-template](results-template.md) and fill each
+   cell from the client's `--report json` output by hand.
 3. State the fixed axes + provenance (SKU, vCPU, duration/warmup, git commit, date) in the table
    caption. Record any unsustainable coordinate as `n/a` / `fail`.
 
@@ -61,4 +66,5 @@ No framework edits are needed — the grid definition and table shapes are reuse
 | [scenario-matrix.md](scenario-matrix.md) | What/why we measure — transports, scenarios, the fixed grid (single source of truth) |
 | [results-template.md](results-template.md) | Reusable blank result tables + how to fill a cell |
 | [run-procedure.md](run-procedure.md) | How to run the grid with the real tooling + caveats |
+| [../../tests/benchv3/README.md](../../tests/benchv3/README.md) | The in-repo grid runner + report generator (`run_matrix.py` / `report.py`) |
 | [../bench/metrics.md](../bench/metrics.md) | Authoritative metric definitions (req/s, p50/p99 tail latencies, CPU/op, cores busy, peak RSS, Gbps; v3 also reports p95) |
