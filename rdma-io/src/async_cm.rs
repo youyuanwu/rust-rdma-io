@@ -560,7 +560,18 @@ impl AsyncCmListener {
     /// event channel and wrap it as an [`AsyncCmId`]. Synchronous — consuming
     /// `conn_id` only *after* the [`await_established`](Self::await_established)
     /// await has completed.
-    fn migrate_accepted(conn_id: CmId) -> Result<AsyncCmId> {
+    ///
+    /// This is the final phase of a manual two-phase accept. Prefer
+    /// [`complete_accept`](Self::complete_accept) when a single call is
+    /// sufficient. Use the split
+    /// `conn_id.accept()` → [`await_established`](Self::await_established) →
+    /// `migrate_accepted` sequence when the caller must retain ownership of
+    /// `conn_id` across the handshake — e.g. a retry loop that needs the QP
+    /// created against `conn_id` to be destroyed *before* `conn_id`'s CM id on
+    /// a transient failure. Passing `conn_id` into `complete_accept` instead
+    /// destroys the CM id first on the error path, leaving any surviving
+    /// `CmQueuePair`'s `rdma_destroy_qp` to run against a freed id.
+    pub fn migrate_accepted(conn_id: CmId) -> Result<AsyncCmId> {
         let conn_ch = EventChannel::new()?;
         conn_ch.set_nonblocking()?;
         conn_id.migrate(&conn_ch)?;
