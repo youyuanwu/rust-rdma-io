@@ -65,7 +65,17 @@ async fn setup_and_send(send_data: &[u8], recv_wr_id: u64) -> (ServerSetup, Clie
 
     let server_handle = tokio::spawn(async move {
         for attempt in 0..rdma_io_tests::test_helpers::TRANSIENT_CM_HANDSHAKE_ATTEMPTS {
-            // Two-phase accept: get request, set up QP + recv, then complete.
+            // Phased accept: get request, set up QP + recv, reply, await
+            // ESTABLISHED, then migrate.
+            //
+            // `conn_id` is kept as a local and is *never* moved into a
+            // consuming future (e.g. `complete_accept`). On a transient
+            // failure the QP created against it (`cmqp`) must be destroyed
+            // *before* `conn_id`'s CM id — otherwise `cmqp`'s `rdma_destroy_qp`
+            // runs against a freed id (use-after-free → SIGSEGV on siw, and
+            // corrupted librdmacm state that makes every retry fail with EPROTO
+            // on rxe). Reverse-declaration drop order (and the explicit drops
+            // on the retry path below) guarantees that ordering.
             let conn_id = listener.get_request().await.unwrap();
 
             let pd = conn_id.alloc_pd().unwrap();
@@ -102,11 +112,20 @@ async fn setup_and_send(send_data: &[u8], recv_wr_id: u64) -> (ServerSetup, Clie
                 assert_eq!(ret, 0, "server post_recv failed");
             }
 
-            match listener
-                .complete_accept(conn_id, &ConnParam::default())
-                .await
-            {
-                Ok(server_cm) => {
+            // Reply + await ESTABLISHED without moving `conn_id`: `accept`
+            // borrows it (sync) and `await_established` borrows only the
+            // listener, so `conn_id` stays owned by this loop body across the
+            // await and the QP is guaranteed to drop before its CM id.
+            let established = async {
+                conn_id.accept(&ConnParam::default())?;
+                listener.await_established().await
+            }
+            .await;
+
+            match established {
+                Ok(()) => {
+                    let server_cm = rdma_io::async_cm::AsyncCmListener::migrate_accepted(conn_id)
+                        .expect("migrate accepted conn_id");
                     return ServerSetup {
                         _server_cm: server_cm,
                         _cmqp: cmqp,
@@ -121,6 +140,10 @@ async fn setup_and_send(send_data: &[u8], recv_wr_id: u64) -> (ServerSetup, Clie
                             < rdma_io_tests::test_helpers::TRANSIENT_CM_HANDSHAKE_ATTEMPTS =>
                 {
                     tracing::warn!("server accept attempt {attempt} {e}, retrying...");
+                    // Destroy the QP (and its MR) before `conn_id`'s CM id.
+                    drop(recv_mr);
+                    drop(cmqp);
+                    drop(conn_id);
                     tokio::time::sleep(rdma_io_tests::test_helpers::transient_cm_retry_delay(
                         attempt,
                     ))
