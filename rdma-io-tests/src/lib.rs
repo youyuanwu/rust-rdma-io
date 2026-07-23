@@ -121,6 +121,18 @@ pub mod test_helpers {
         matches!(err, rdma_io::Error::Verbs(io) if io.raw_os_error() == Some(98))
     }
 
+    /// Number of attempts used for transient software-RDMA CM handshakes.
+    ///
+    /// siw can take noticeably longer than rxe to settle after a rejected
+    /// async-CM handshake, so the async-CQ tests need a wider retry window than
+    /// the generic EADDRINUSE port-release helpers below.
+    pub const TRANSIENT_CM_HANDSHAKE_ATTEMPTS: u64 = 10;
+
+    /// Backoff used between transient software-RDMA CM handshake retries.
+    pub fn transient_cm_retry_delay(attempt: u64) -> std::time::Duration {
+        std::time::Duration::from_millis(200 * (attempt + 1))
+    }
+
     /// Returns `true` for transient CM errors that software RDMA can raise
     /// during the connect handshake.
     ///
@@ -257,18 +269,19 @@ pub mod test_helpers {
     {
         use rdma_io::cm::ConnParam;
         let mut last_err = None;
-        for attempt in 0u64..5 {
+        for attempt in 0..TRANSIENT_CM_HANDSHAKE_ATTEMPTS {
             let cm = connect_client_cm_with_retry(connect_addr).await;
             let qp_state = setup_qp(&cm);
             match cm.connect(&ConnParam::default()).await {
                 Ok(()) => return (cm, qp_state),
                 Err(e) => {
-                    if is_transient_cm_error(&e) && attempt < 4 {
+                    if is_transient_cm_error(&e)
+                        && attempt + 1 < TRANSIENT_CM_HANDSHAKE_ATTEMPTS
+                    {
                         tracing::warn!("client connect attempt {attempt} {e}, retrying...");
                         drop(qp_state);
                         drop(cm);
-                        tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt + 1)))
-                            .await;
+                        tokio::time::sleep(transient_cm_retry_delay(attempt)).await;
                         last_err = Some(e);
                         continue;
                     }
@@ -276,7 +289,9 @@ pub mod test_helpers {
                 }
             }
         }
-        panic!("client connect failed after 5 attempts: {last_err:?}");
+        panic!(
+            "client connect failed after {TRANSIENT_CM_HANDSHAKE_ATTEMPTS} attempts: {last_err:?}"
+        );
     }
 
     /// Create a synchronous [`CmId`] client on `ch` and call `resolve_addr`,
