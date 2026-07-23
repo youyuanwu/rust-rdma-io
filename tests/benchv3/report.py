@@ -29,6 +29,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import grid
 
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+DEFAULT_RESULTS_DIR = os.path.join(_REPO_ROOT, "tests/benchv3/results")
+
 # --- Verbatim table headers (docs/benchv3/results-template.md) ---------------
 
 TABLE_A_HEADER_64 = (
@@ -78,12 +81,16 @@ class Record:
         self.meta = meta or {}
         self.mode = data.get("mode", "")
         self.transport = data.get("transport", "")
-        self.scenario = self.meta.get("scenario") or grid.scenario_of(self.mode, self.transport)
-        self.path_label = self.meta.get("path_label") or grid.path_label(self.mode, self.transport)
+        # Grid mapping is authoritative for scenario/path label (the plan's
+        # inverse map); the sidecar is provenance only. Fall back to the sidecar
+        # only when (mode,transport) is not a known grid path.
+        self.scenario = grid.scenario_of(self.mode, self.transport) or self.meta.get("scenario")
+        self.path_label = grid.path_label(self.mode, self.transport) or self.meta.get("path_label")
         self.connections = int(data.get("connections", 0))
         self.threads = int(data.get("threads", 0))
         self.in_flight = int(data.get("in_flight", 0))
         self.payload = int(data.get("payload_bytes", self.meta.get("payload", 0)))
+        self.run_id = self.meta.get("run_id")
         cm = self.meta.get("connection_mult")
         if cm is None and self.threads:
             cm = round(self.connections / self.threads)
@@ -94,8 +101,13 @@ class Record:
         return (self.scenario, self.path_label, self.connection_mult, self.in_flight, self.payload)
 
 
-def load_records(results_dir: str) -> List[Record]:
-    """Load all result JSON files, excluding meta sidecars and run summaries."""
+def load_records(results_dir: str, run_id: Optional[str] = None) -> List[Record]:
+    """Load all result JSON files, excluding meta sidecars and run summaries.
+
+    ``run_id`` (if given) scopes the dataset to a single sweep so results from
+    different sweeps/SKUs accumulated in the same dir are not mixed. Unreadable
+    JSON files are warned about on stderr rather than silently dropped.
+    """
     records: List[Record] = []
     for path in sorted(glob.glob(os.path.join(results_dir, "*.json"))):
         base = os.path.basename(path)
@@ -104,7 +116,8 @@ def load_records(results_dir: str) -> List[Record]:
         try:
             with open(path) as fh:
                 data = json.load(fh)
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"warning: skipping unreadable result {base}: {exc}", file=sys.stderr)
             continue
         meta = None
         meta_path = path[: -len(".json")] + ".meta.json"
@@ -114,7 +127,10 @@ def load_records(results_dir: str) -> List[Record]:
                     meta = json.load(fh)
             except (OSError, json.JSONDecodeError):
                 meta = None
-        records.append(Record(data, meta))
+        rec = Record(data, meta)
+        if run_id is not None and rec.run_id != run_id:
+            continue
+        records.append(rec)
     return records
 
 
@@ -179,7 +195,7 @@ def _metric_cells(rec: Optional[Record], with_gbps: bool) -> List[str]:
         _f(rec.data.get("cpu_us_per_op"), ".2f"),
         _cores(rec),
         _rss_mb(rec),
-        str(int(rec.data.get("errors", 0))),
+        (str(int(rec.data["errors"])) if rec.data.get("errors") is not None else NA),
     ]
     return cells
 
@@ -231,12 +247,12 @@ def render_table_a(
     in_flight: int,
 ) -> str:
     with_gbps = payload == grid.LARGE_PAYLOAD
-    idx = index(records)
     matching = [
         r for r in records
         if r.scenario == scenario and r.payload == payload
         and r.connection_mult == connection_mult and r.in_flight == in_flight
     ]
+    idx = index(matching)  # cells + caption both come from the matching set
     prov = _caption_provenance(matching)
     caption = (
         f"> **SKU:** `________` · **vCPU:** {prov['vcpu']} · "
@@ -266,18 +282,17 @@ def render_table_b(
     path_label: str,
 ) -> str:
     with_gbps = payload == grid.LARGE_PAYLOAD
-    idx = index(records)
     matching = [
         r for r in records
         if r.scenario == scenario and r.payload == payload and r.path_label == path_label
     ]
+    idx = index(matching)
     prov = _caption_provenance(matching)
-    transport_token = path_label.split(" (")[0]
     caption = (
         f"> **SKU:** `________` · **vCPU:** {prov['vcpu']} · "
         f"**scenario:** {_SCENARIO_TITLE.get(scenario, scenario)} · "
         f"**payload:** {_payload_str(payload)} · "
-        f"**transport:** `{transport_token}` · "
+        f"**transport:** {_display_label(path_label)} · "
         f"**duration/warmup:** {prov['duration']} s / {prov['warmup']} s · "
         f"**git commit:** {prov['commit']} · **date:** {prov['date']}"
     )
@@ -322,7 +337,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="Render bench v3 Table A/B Markdown from collected results.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--results-dir", default="tests/benchv3/results")
+    p.add_argument("--results-dir", default=DEFAULT_RESULTS_DIR)
+    p.add_argument("--run-id", help="Scope to one sweep's run id (avoids mixing runs/SKUs).")
     p.add_argument("--table", choices=["a", "b"], help="Emit a single Table A or B.")
     p.add_argument("--all", action="store_true", help="Emit all Table A + B for a scenario/payload.")
     p.add_argument("--scenario", choices=grid.SCENARIOS)
@@ -335,7 +351,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
-    records = load_records(args.results_dir)
+    records = load_records(args.results_dir, run_id=args.run_id)
 
     if args.all:
         if args.payload is None:
@@ -367,6 +383,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.table == "b":
         if not args.scenario or args.payload is None or not args.path_label:
             print("--table b requires --scenario --payload --transport", file=sys.stderr)
+            return 2
+        valid = [p.label for p in grid.paths_for(args.scenario)]
+        if args.path_label not in valid:
+            print(f"--transport {args.path_label!r} is not a {args.scenario} path; "
+                  f"expected one of: {valid}", file=sys.stderr)
             return 2
         print(render_table_b(records, args.scenario, args.payload, args.path_label))
         return 0

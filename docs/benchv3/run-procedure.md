@@ -233,7 +233,7 @@ coordinate at a time.
 
 | Launcher | Where | Notes |
 |---|---|---|
-| [`tests/benchv3/run_matrix.py`](../../tests/benchv3) + [`report.py`](../../tests/benchv3) | in this repo (**primary**) | Expands the whole fixed grid (paths × connections × in-flight × payloads, with the invalid-coordinate rules baked in), drives each coordinate through `bench_run.yml`, saves collision-proof results (payload/UTC/commit/run-id in the name), and emits paste-ready Table A/B. `--dry-run` previews the plan. See [`tests/benchv3/README.md`](../../tests/benchv3/README.md). |
+| [`tests/benchv3/run_matrix.py`](../../tests/benchv3/run_matrix.py) + [`report.py`](../../tests/benchv3/report.py) | in this repo (**primary**) | Expands the whole fixed grid (paths × connections × in-flight × payloads, with the invalid-coordinate rules baked in), drives each coordinate through `bench_run.yml`, saves collision-proof results (payload/UTC/commit/run-id in the name), and emits paste-ready Table A/B. `--dry-run` previews the plan. See [`tests/benchv3/README.md`](../../tests/benchv3/README.md). |
 | `tests/e2e/run_bench.sh` | in this repo | Single run (mode/transport/connections/threads/duration/payload) or `--matrix` (in-flight 1); no `--in-flight`/`--warmup`/`--ring-max-msg`. |
 | raw `ansible-playbook … bench_run.yml -e bench_*` | in this repo | Full control of every `bench_*` var (the examples above). |
 

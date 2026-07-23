@@ -25,12 +25,15 @@ def _out_dir_from_extra_vars(extra_vars):
 
 
 def fake_launcher_ok(extra_vars):
-    """Simulate a successful playbook: drop a dummy bench-*.json."""
+    """Simulate a successful playbook: drop the exact bench-*.json the real
+    playbook writes (bench-<mode>-<transport>-<conns>conn-<threads>thr-<if>if.json)."""
     out = _out_dir_from_extra_vars(extra_vars)
     os.makedirs(out, exist_ok=True)
-    payload = {k: v for k, v in (kv.split("=", 1) for kv in extra_vars)}
-    with open(os.path.join(out, "bench-dummy.json"), "w") as fh:
-        json.dump({"throughput_rps": 1.0, "vars": payload}, fh)
+    kv = {k: v for k, v in (x.split("=", 1) for x in extra_vars)}
+    name = (f"bench-{kv['bench_mode']}-{kv['bench_transport']}-{kv['bench_connections']}conn-"
+            f"{kv['bench_threads']}thr-{kv['bench_in_flight']}if.json")
+    with open(os.path.join(out, name), "w") as fh:
+        json.dump({"throughput_rps": 1.0, "vars": kv}, fh)
     return 0
 
 
@@ -40,6 +43,11 @@ def fail_on_credit_ring(extra_vars):
     if kv.get("bench_transport") == "credit-ring":
         return 1  # non-zero, and writes no result file
     return fake_launcher_ok(extra_vars)
+
+
+def raising_launcher(extra_vars):
+    """Simulate ansible-playbook being unavailable / process-creation failure."""
+    raise OSError("ansible-playbook not found")
 
 
 class TestRunSweep(unittest.TestCase):
@@ -116,6 +124,43 @@ class TestRunSweep(unittest.TestCase):
             launcher=fake_launcher_ok, run_id="cleanme", now_fn=lambda: "t", commit="c",
         )
         self.assertFalse(os.path.exists(os.path.join(self.tmp, ".tmp-cleanme")))
+
+    def test_launcher_exception_does_not_abort_sweep(self):
+        coords = self._coords(conn_mults=[1], in_flights=[1], payloads=[64])
+        summary = run_matrix.run_sweep(
+            coords, results_dir=self.tmp, duration=10, warmup=3, vcpu=64,
+            launcher=raising_launcher, run_id="r", now_fn=lambda: "t", commit="c",
+        )
+        # Every coordinate is recorded as failed, none abort, summary persisted.
+        self.assertEqual(summary["failed"], summary["total"])
+        self.assertEqual(summary["succeeded"], 0)
+        self.assertTrue(os.path.exists(summary["summary_path"]))
+        self.assertIn("launcher raised", summary["failed_coordinates"][0]["reason"])
+
+    def test_identity_filename_carries_mode_and_transport(self):
+        coords = self._coords(conn_mults=[1], in_flights=[1], payloads=[64],
+                              path_labels=["read-ring (busy-poll)"])
+        run_matrix.run_sweep(
+            coords, results_dir=self.tmp, duration=10, warmup=3, vcpu=64,
+            launcher=fake_launcher_ok, run_id="r", now_fn=lambda: "t", commit="c",
+        )
+        results = [f for f in os.listdir(self.tmp)
+                   if f.endswith(".json") and not f.endswith(".meta.json")
+                   and not f.startswith("run-summary")]
+        self.assertEqual(len(results), 1)
+        # echo-busy mode + read-ring transport both present in the identity name.
+        self.assertIn("echo-busy", results[0])
+        self.assertIn("read-ring", results[0])
+
+    def test_duplicate_filters_deduped(self):
+        # Simulate argparse append giving a repeated scenario.
+        import argparse
+        args = argparse.Namespace(
+            vcpu=64, scenario=["echo", "echo"], path_labels=["send-recv"],
+            connections_mult=[1], in_flight=[1], payload=[64],
+        )
+        coords = run_matrix.plan_coordinates(args)
+        self.assertEqual(len(coords), 1)  # not 2
 
 
 if __name__ == "__main__":

@@ -49,9 +49,9 @@ without changing the framework.
 To publish a new sweep:
 
 1. Run the grid for the SKU per the [run-procedure](run-procedure.md) (`--threads = nproc`) — the
-   in-repo [`tests/benchv3/run_matrix.py`](../../tests/benchv3) drives the whole grid and saves
+   in-repo [`tests/benchv3/run_matrix.py`](../../tests/benchv3/run_matrix.py) drives the whole grid and saves
    collision-proof results.
-2. Generate the table blocks with [`tests/benchv3/report.py`](../../tests/benchv3) (paste-ready
+2. Generate the table blocks with [`tests/benchv3/report.py`](../../tests/benchv3/report.py) (paste-ready
    Table A/B), or copy a blank block from the [results-template](results-template.md) and fill each
    cell from the client's `--report json` output by hand.
 3. State the fixed axes + provenance (SKU, vCPU, duration/warmup, git commit, date) in the table

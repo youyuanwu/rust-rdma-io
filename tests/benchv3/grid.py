@@ -229,6 +229,8 @@ def identity_filename(
         "bench",
         _slug(coord.scenario),
         _slug(coord.path_label),
+        _slug(coord.mode),
+        _slug(coord.transport),
         f"{coord.connections}conn",
         f"{coord.threads}thr",
         f"{coord.in_flight}if",
@@ -238,3 +240,15 @@ def identity_filename(
         _slug(run_id),
     ]
     return "-".join(parts) + "." + ext
+
+
+def dedupe(coords: Sequence["Coordinate"]) -> List["Coordinate"]:
+    """Drop duplicate coordinates (e.g. from repeated CLI filters), keep order."""
+    seen = set()
+    out: List[Coordinate] = []
+    for c in coords:
+        if c in seen:
+            continue
+        seen.add(c)
+        out.append(c)
+    return out

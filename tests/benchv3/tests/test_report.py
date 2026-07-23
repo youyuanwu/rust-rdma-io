@@ -215,6 +215,50 @@ class TestReport(unittest.TestCase):
         rc = report.main(["--results-dir", self.tmp, "--all", "--payload", "64"])
         self.assertEqual(rc, 0)
 
+    def test_grid_mapping_authoritative_over_stale_sidecar(self):
+        # Result is echo-busy/read-ring but the sidecar lies (path_label=send-recv).
+        # The grid inverse map must win, placing it on the busy-poll row.
+        self._write(
+            "mismatch",
+            _result("echo-busy", "read-ring", 64, 64, 64, 64, rps=555.0),
+            _meta("echo", "send-recv", "echo-busy", "read-ring", 1, 64, 64, 64, 64),
+        )
+        recs = report.load_records(self.tmp)
+        self.assertEqual(recs[0].path_label, "read-ring (busy-poll)")
+        out = report.render_table_a(recs, "echo", 64, 1, 64)
+        busy = [ln for ln in out.splitlines() if ln.startswith("| `read-ring` (busy-poll)")][0]
+        self.assertIn("555", busy)
+        # send-recv row stays n/a (the lie did not land there).
+        sr = [ln for ln in out.splitlines() if ln.startswith("| `send-recv`")][0]
+        self.assertIn("`n/a`", sr)
+
+    def test_table_b_caption_preserves_topology(self):
+        recs = report.load_records(self.tmp)  # empty is fine (structure only)
+        out = report.render_table_b(recs, "echo", 64, "read-ring (busy-poll)")
+        # Caption must carry the full topology, not just `read-ring`.
+        caption = out.splitlines()[0]
+        self.assertIn("busy-poll", caption)
+
+    def test_missing_required_errors_renders_na(self):
+        d = _result("echo", "send-recv", 64, 64, 64, 64)
+        del d["errors"]  # required field absent
+        self._write("noerr", d, _meta("echo", "send-recv", "echo", "send-recv", 1, 64, 64, 64, 64))
+        recs = report.load_records(self.tmp)
+        out = report.render_table_a(recs, "echo", 64, 1, 64)
+        sr = [ln for ln in out.splitlines() if ln.startswith("| `send-recv`")][0]
+        self.assertTrue(sr.rstrip().endswith("`n/a` |"))  # errors cell is n/a, not 0
+
+    def test_run_id_scoping(self):
+        # Two runs at the same coordinate; --run-id keeps them apart.
+        self._write("a", _result("echo", "send-recv", 64, 64, 64, 64, rps=100.0),
+                    _meta("echo", "send-recv", "echo", "send-recv", 1, 64, 64, 64, 64))
+        m2 = _meta("echo", "send-recv", "echo", "send-recv", 1, 64, 64, 64, 64)
+        m2["run_id"] = "run2"
+        self._write("b", _result("echo", "send-recv", 64, 64, 64, 64, rps=200.0), m2)
+        self.assertEqual(len(report.load_records(self.tmp, run_id="r1")), 1)
+        self.assertEqual(len(report.load_records(self.tmp, run_id="run2")), 1)
+        self.assertEqual(len(report.load_records(self.tmp)), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

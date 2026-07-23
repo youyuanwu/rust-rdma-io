@@ -24,10 +24,13 @@ from typing import Callable, Dict, List, Optional, Sequence
 
 import grid
 
-DEFAULT_INVENTORY = "tests/e2e/inventory_local.py"
-DEFAULT_PLAYBOOK = "tests/e2e/playbooks/bench_run.yml"
-DEFAULT_REBOOT_PLAYBOOK = "tests/e2e/playbooks/reboot_vms.yml"
-DEFAULT_RESULTS_DIR = "tests/benchv3/results"
+# Resolve default paths from this file's location (repo root = two levels up
+# from tests/benchv3/), so the tool works regardless of the caller's cwd.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+DEFAULT_INVENTORY = os.path.join(_REPO_ROOT, "tests/e2e/inventory_local.py")
+DEFAULT_PLAYBOOK = os.path.join(_REPO_ROOT, "tests/e2e/playbooks/bench_run.yml")
+DEFAULT_REBOOT_PLAYBOOK = os.path.join(_REPO_ROOT, "tests/e2e/playbooks/reboot_vms.yml")
+DEFAULT_RESULTS_DIR = os.path.join(_REPO_ROOT, "tests/benchv3/results")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -97,8 +100,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def plan_coordinates(args: argparse.Namespace) -> List[grid.Coordinate]:
-    """Expand the grid with the CLI's subset filters applied."""
-    return grid.expand(
+    """Expand the grid with the CLI's subset filters applied (deduplicated)."""
+    coords = grid.expand(
         vcpu=args.vcpu,
         scenarios=args.scenario or grid.SCENARIOS,
         conn_mults=args.connections_mult or grid.CONNECTION_MULTIPLES,
@@ -106,6 +109,7 @@ def plan_coordinates(args: argparse.Namespace) -> List[grid.Coordinate]:
         payloads=args.payload or grid.PAYLOADS,
         path_labels=args.path_labels,
     )
+    return grid.dedupe(coords)
 
 
 def format_coordinate(c: grid.Coordinate) -> str:
@@ -202,12 +206,16 @@ def run_sweep(
 
     succeeded: List[str] = []
     failed: List[Dict[str, object]] = []
-    prev_label: Optional[str] = None
+    reboot_failures: List[str] = []
+    prev_group: Optional[tuple] = None
 
     for coord in coords:
-        if reboot is not None and prev_label is not None and coord.path_label != prev_label:
-            reboot()
-        prev_label = coord.path_label
+        group = (coord.scenario, coord.path_label)
+        if reboot is not None and prev_group is not None and group != prev_group:
+            rc = reboot()
+            if rc != 0:
+                reboot_failures.append(f"before {coord.scenario}/{coord.path_label} (rc={rc})")
+        prev_group = group
 
         utc = now_fn()
         scratch = os.path.join(results_dir, f".tmp-{run_id}", f"{utc}-{uuid.uuid4().hex[:6]}")
@@ -215,8 +223,13 @@ def run_sweep(
         bench_vars = coord.bench_vars(duration=duration, warmup=warmup)
         coord_desc = format_coordinate(coord).strip()
         try:
-            rc = launcher(_extra_vars(bench_vars, scratch))
-            produced = _find_result_json(scratch)
+            try:
+                rc = launcher(_extra_vars(bench_vars, scratch))
+            except Exception as exc:  # launcher/process failure must not abort the sweep
+                failed.append({"coordinate": coord_desc, "exit_code": None,
+                               "reason": f"launcher raised: {exc!r}"})
+                continue
+            produced = _find_result_json(scratch, coord)
             if rc == 0 and produced is not None:
                 identity = grid.identity_filename(coord, utc, commit, run_id)
                 dest = os.path.join(results_dir, identity)
@@ -237,6 +250,7 @@ def run_sweep(
         "succeeded": len(succeeded),
         "failed": len(failed),
         "failed_coordinates": failed,
+        "reboot_failures": reboot_failures,
     }
     summary_path = os.path.join(results_dir, f"run-summary-{run_id}.json")
     with open(summary_path, "w") as fh:
@@ -245,10 +259,22 @@ def run_sweep(
     return summary
 
 
-def _find_result_json(out_dir: str) -> Optional[str]:
-    """The playbook writes exactly one bench-*.json into bench_out_dir."""
+def _find_result_json(out_dir: str, coord: grid.Coordinate) -> Optional[str]:
+    """Locate the playbook's result JSON in bench_out_dir.
+
+    Prefer the exact expected basename the playbook writes
+    (bench-<mode>-<transport>-<conns>conn-<threads>thr-<inflight>if.json); fall
+    back to any single bench-*.json so a future filename tweak still collects.
+    """
     if not os.path.isdir(out_dir):
         return None
+    expected = (
+        f"bench-{coord.mode}-{coord.transport}-{coord.connections}conn-"
+        f"{coord.threads}thr-{coord.in_flight}if.json"
+    )
+    exact = os.path.join(out_dir, expected)
+    if os.path.exists(exact):
+        return exact
     hits = [
         os.path.join(out_dir, f)
         for f in os.listdir(out_dir)
@@ -329,6 +355,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for f in summary["failed_coordinates"]:
         print(f"#   FAILED: {f['coordinate']} ({f['reason']}, rc={f['exit_code']})",
               file=sys.stderr)
+    for rf in summary.get("reboot_failures", []):
+        print(f"#   REBOOT FAILED: {rf}", file=sys.stderr)
     print(f"# summary: {summary['summary_path']}")
     return 0 if summary["failed"] == 0 else 1
 

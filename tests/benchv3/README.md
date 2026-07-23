@@ -76,8 +76,14 @@ artifacts.**
 | `--payload {64,8192}` | Limit to payload size(s) (repeatable). |
 | `--duration S` / `--warmup S` | Fixed run controls (default 10 s / 3 s). |
 | `--results-dir DIR` | Where identity-named results land (default `tests/benchv3/results`). |
-| `--reboot-between` | Reboot the VMs at each sweep boundary (a change of transport-path group). |
+| `--inventory PATH` | Ansible inventory (default the in-repo `tests/e2e/inventory_local.py`). |
+| `--playbook PATH` | Orchestration playbook driven per coordinate (default `tests/e2e/playbooks/bench_run.yml`). |
+| `--reboot-playbook PATH` | Playbook used by `--reboot-between` (default `tests/e2e/playbooks/reboot_vms.yml`). |
+| `--reboot-between` | Reboot the VMs at each sweep boundary (a change of `(scenario, transport-path)` group). |
 | `--dry-run` | List the planned coordinates and exit — run nothing. |
+
+Defaults for the inventory/playbook/results paths are resolved relative to the repo root, so the
+tool works regardless of the caller's working directory.
 
 The grid axes, path→mode/transport mapping, and the invalid-coordinate rules (no gRPC busy/park;
 HTTP/1.1 in-flight=1; 8 KiB → ring message size 8192 on ring transports only) are encoded once in
@@ -89,14 +95,17 @@ re-document them.
 Each result is saved as:
 
 ```
-results/bench-<scenario>-<path>-<conns>conn-<threads>thr-<inflight>if-<payload>B-<utc>-<commit>-<runid>.json
+results/bench-<scenario>-<path>-<mode>-<transport>-<conns>conn-<threads>thr-<inflight>if-<payload>B-<utc>-<commit>-<runid>.json
 ```
 
 with a `.meta.json` provenance sidecar carrying what the result JSON does not record (duration,
-warmup, vCPU, connection multiple, commit, run id). Because the name embeds the **payload**, a UTC
-timestamp, the git commit, and a per-invocation run id, runs across coordinates, payloads, repeats,
-days, and machines never overwrite each other. A `run-summary-<runid>.json` records which
-coordinates succeeded or failed. `report.py` ignores the `.meta.json` sidecars and the run summary
+warmup, vCPU, connection multiple, commit, run id). Because the name embeds the **mode/transport**,
+the **payload**, a UTC timestamp, the git commit, and a per-invocation run id, runs across
+coordinates, payloads, repeats, days, and machines never overwrite each other. A
+`run-summary-<runid>.json` records which coordinates succeeded or failed (a single coordinate
+failure — including a launcher error such as a missing `ansible-playbook` — never aborts the sweep).
+When a `results/` directory accumulates multiple sweeps or SKUs, pass `report.py --run-id <id>` to
+scope a report to one sweep. `report.py` ignores the `.meta.json` sidecars and the run summary
 when parsing results (it reads the sidecars only for caption provenance).
 
 A single coordinate failure never aborts the sweep — it is recorded and the sweep continues.
