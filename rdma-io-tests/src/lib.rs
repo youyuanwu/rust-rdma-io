@@ -121,12 +121,41 @@ pub mod test_helpers {
         matches!(err, rdma_io::Error::Verbs(io) if io.raw_os_error() == Some(98))
     }
 
-    /// Returns `true` for transient CM errors that siw/rxe can raise during the
-    /// connect handshake: `EADDRINUSE` (98, async port release) or `EINVAL`
-    /// (22, stale/half-resolved CM route). Both clear on a fresh CM ID.
-    fn is_transient_cm_error(err: &rdma_io::Error) -> bool {
+    /// Number of attempts used for transient software-RDMA CM handshakes.
+    ///
+    /// siw can take noticeably longer than rxe to settle after a rejected
+    /// async-CM handshake, so the async-CQ tests need a wider retry window than
+    /// the generic EADDRINUSE port-release helpers below.
+    pub const TRANSIENT_CM_HANDSHAKE_ATTEMPTS: u64 = 10;
+
+    /// Backoff used between transient software-RDMA CM handshake retries.
+    pub fn transient_cm_retry_delay(attempt: u64) -> std::time::Duration {
+        std::time::Duration::from_millis(200 * (attempt + 1))
+    }
+
+    /// Returns `true` for transient CM errors that software RDMA can raise
+    /// during the connect handshake.
+    ///
+    /// Covers:
+    /// - `EADDRINUSE` (98): async CM port release
+    /// - `EINVAL` (22): stale/half-resolved route on a fresh CM ID
+    /// - `EPROTO` (71): protocol-level CM failure on the first connection
+    ///   attempt (observed on ARM/RXE — the device's internal state settles
+    ///   after the initial failure and subsequent attempts succeed)
+    /// - async CM event races surfaced as `InvalidArg("expected Established,
+    ///   got Rejected|Unreachable|ConnectError")`
+    ///
+    /// These failures are typically cleared by retrying the handshake with a
+    /// fresh CM ID.
+    pub fn is_transient_cm_error(err: &rdma_io::Error) -> bool {
         matches!(err, rdma_io::Error::Verbs(io)
-            if matches!(io.raw_os_error(), Some(22) | Some(98)))
+            if matches!(io.raw_os_error(), Some(22) | Some(71) | Some(98)))
+            || matches!(err, rdma_io::Error::InvalidArg(msg)
+            if msg.starts_with("expected Established, got ")
+                && matches!(
+                    msg.strip_prefix("expected Established, got "),
+                    Some("Rejected" | "Unreachable" | "ConnectError")
+                ))
     }
 
     /// Bind an [`AsyncCmListener`] to `0.0.0.0:0`, retrying on `EADDRINUSE`.
@@ -149,6 +178,7 @@ pub mod test_helpers {
                         last_err = Some(e);
                         continue;
                     }
+
                     panic!("listener bind failed: {e}");
                 }
             }
@@ -239,18 +269,17 @@ pub mod test_helpers {
     {
         use rdma_io::cm::ConnParam;
         let mut last_err = None;
-        for attempt in 0u64..5 {
+        for attempt in 0..TRANSIENT_CM_HANDSHAKE_ATTEMPTS {
             let cm = connect_client_cm_with_retry(connect_addr).await;
             let qp_state = setup_qp(&cm);
             match cm.connect(&ConnParam::default()).await {
                 Ok(()) => return (cm, qp_state),
                 Err(e) => {
-                    if is_transient_cm_error(&e) && attempt < 4 {
+                    if is_transient_cm_error(&e) && attempt + 1 < TRANSIENT_CM_HANDSHAKE_ATTEMPTS {
                         tracing::warn!("client connect attempt {attempt} {e}, retrying...");
                         drop(qp_state);
                         drop(cm);
-                        tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt + 1)))
-                            .await;
+                        tokio::time::sleep(transient_cm_retry_delay(attempt)).await;
                         last_err = Some(e);
                         continue;
                     }
@@ -258,7 +287,9 @@ pub mod test_helpers {
                 }
             }
         }
-        panic!("client connect failed after 5 attempts: {last_err:?}");
+        panic!(
+            "client connect failed after {TRANSIENT_CM_HANDSHAKE_ATTEMPTS} attempts: {last_err:?}"
+        );
     }
 
     /// Create a synchronous [`CmId`] client on `ch` and call `resolve_addr`,
@@ -355,6 +386,33 @@ pub mod test_helpers {
             }
         }
         panic!("{label} connect failed after 5 attempts: {last_err:?}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_helpers::is_transient_cm_error;
+
+    #[test]
+    fn transient_cm_error_accepts_retryable_async_cm_events() {
+        for event in ["Rejected", "Unreachable", "ConnectError"] {
+            let err = rdma_io::Error::InvalidArg(format!("expected Established, got {event}"));
+            assert!(is_transient_cm_error(&err), "{event} should be retryable");
+        }
+    }
+
+    #[test]
+    fn transient_cm_error_accepts_eproto() {
+        // EPROTO (71) is returned by rdma_get_cm_event on ARM/RXE on the first
+        // connection attempt; subsequent attempts succeed once the device settles.
+        let err = rdma_io::Error::Verbs(std::io::Error::from_raw_os_error(71));
+        assert!(is_transient_cm_error(&err));
+    }
+
+    #[test]
+    fn transient_cm_error_rejects_non_retryable_async_cm_events() {
+        let err = rdma_io::Error::InvalidArg("expected Established, got Established".into());
+        assert!(!is_transient_cm_error(&err));
     }
 }
 

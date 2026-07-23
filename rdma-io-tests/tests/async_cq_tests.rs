@@ -64,55 +64,75 @@ async fn setup_and_send(send_data: &[u8], recv_wr_id: u64) -> (ServerSetup, Clie
     let connect_addr = connect_addr_for(listener.local_addr());
 
     let server_handle = tokio::spawn(async move {
-        // Two-phase accept: get request, set up QP + recv, then complete
-        let conn_id = listener.get_request().await.unwrap();
+        for attempt in 0..rdma_io_tests::test_helpers::TRANSIENT_CM_HANDSHAKE_ATTEMPTS {
+            // Two-phase accept: get request, set up QP + recv, then complete.
+            let conn_id = listener.get_request().await.unwrap();
 
-        let pd = conn_id.alloc_pd().unwrap();
-        let ctx = conn_id.verbs_context().unwrap();
-        let comp_ch = CompletionChannel::new(&ctx).unwrap();
-        let cq = CompletionQueue::with_comp_channel(ctx, 16, &comp_ch).unwrap();
+            let pd = conn_id.alloc_pd().unwrap();
+            let ctx = conn_id.verbs_context().unwrap();
+            let comp_ch = CompletionChannel::new(&ctx).unwrap();
+            let cq = CompletionQueue::with_comp_channel(ctx, 16, &comp_ch).unwrap();
 
-        let cmqp = conn_id
-            .create_qp_with_cq(&pd, &default_qp_attr(), Some(&cq), Some(&cq))
-            .unwrap();
+            let cmqp = conn_id
+                .create_qp_with_cq(&pd, &default_qp_attr(), Some(&cq), Some(&cq))
+                .unwrap();
 
-        let recv_mr = pd
-            .reg_mr_owned(vec![0u8; 64], AccessFlags::LOCAL_WRITE)
-            .unwrap();
+            let recv_mr = pd
+                .reg_mr_owned(vec![0u8; 64], AccessFlags::LOCAL_WRITE)
+                .unwrap();
 
-        // Post raw recv before accept (tests raw verb path)
-        let server_qp = cmqp.as_raw();
-        {
-            let mut sge = rdma_io_sys::ibverbs::ibv_sge {
-                addr: unsafe { (*recv_mr.as_raw()).addr as u64 },
-                length: 64,
-                lkey: recv_mr.lkey(),
-            };
-            let mut wr = rdma_io_sys::ibverbs::ibv_recv_wr {
-                wr_id: recv_wr_id,
-                sg_list: &mut sge,
-                num_sge: 1,
-                ..Default::default()
-            };
-            let mut bad_wr: *mut rdma_io_sys::ibverbs::ibv_recv_wr = std::ptr::null_mut();
-            let ret = unsafe {
-                rdma_io_sys::wrapper::rdma_wrap_ibv_post_recv(server_qp, &mut wr, &mut bad_wr)
-            };
-            assert_eq!(ret, 0, "server post_recv failed");
+            // Post raw recv before accept (tests raw verb path)
+            let server_qp = cmqp.as_raw();
+            {
+                let mut sge = rdma_io_sys::ibverbs::ibv_sge {
+                    addr: unsafe { (*recv_mr.as_raw()).addr as u64 },
+                    length: 64,
+                    lkey: recv_mr.lkey(),
+                };
+                let mut wr = rdma_io_sys::ibverbs::ibv_recv_wr {
+                    wr_id: recv_wr_id,
+                    sg_list: &mut sge,
+                    num_sge: 1,
+                    ..Default::default()
+                };
+                let mut bad_wr: *mut rdma_io_sys::ibverbs::ibv_recv_wr = std::ptr::null_mut();
+                let ret = unsafe {
+                    rdma_io_sys::wrapper::rdma_wrap_ibv_post_recv(server_qp, &mut wr, &mut bad_wr)
+                };
+                assert_eq!(ret, 0, "server post_recv failed");
+            }
+
+            match listener
+                .complete_accept(conn_id, &ConnParam::default())
+                .await
+            {
+                Ok(server_cm) => {
+                    return ServerSetup {
+                        _server_cm: server_cm,
+                        _cmqp: cmqp,
+                        comp_ch,
+                        cq,
+                        recv_mr,
+                    };
+                }
+                Err(e)
+                    if rdma_io_tests::test_helpers::is_transient_cm_error(&e)
+                        && attempt + 1
+                            < rdma_io_tests::test_helpers::TRANSIENT_CM_HANDSHAKE_ATTEMPTS =>
+                {
+                    tracing::warn!("server accept attempt {attempt} {e}, retrying...");
+                    tokio::time::sleep(rdma_io_tests::test_helpers::transient_cm_retry_delay(
+                        attempt,
+                    ))
+                    .await;
+                }
+                Err(e) => panic!("server accept failed: {e}"),
+            }
         }
-
-        let server_cm = listener
-            .complete_accept(conn_id, &ConnParam::default())
-            .await
-            .unwrap();
-
-        ServerSetup {
-            _server_cm: server_cm,
-            _cmqp: cmqp,
-            comp_ch,
-            cq,
-            recv_mr,
-        }
+        panic!(
+            "server accept failed after {} attempts",
+            rdma_io_tests::test_helpers::TRANSIENT_CM_HANDSHAKE_ATTEMPTS
+        );
     });
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
