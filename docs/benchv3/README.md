@@ -65,6 +65,7 @@ No framework edits are needed — the grid definition and table shapes are reuse
 | --- | ------- |
 | [scenario-matrix.md](scenario-matrix.md) | What/why we measure — transports, scenarios, the fixed grid (single source of truth) |
 | [results-template.md](results-template.md) | Reusable blank result tables + how to fill a cell |
+| [results-echo-showcase.md](results-echo-showcase.md) | Collected echo results (RDMA vs kernel-TCP) from a real two-VM run |
 | [run-procedure.md](run-procedure.md) | How to run the grid with the real tooling + caveats |
 | [../../tests/benchv3/README.md](../../tests/benchv3/README.md) | The in-repo grid runner + report generator (`run_matrix.py` / `report.py`) |
 | [../bench/metrics.md](../bench/metrics.md) | Authoritative metric definitions (req/s, p50/p99 tail latencies, CPU/op, cores busy, peak RSS, Gbps; v3 also reports p95) |
