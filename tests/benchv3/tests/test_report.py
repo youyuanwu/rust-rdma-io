@@ -195,6 +195,26 @@ class TestReport(unittest.TestCase):
         # Table B appears once per echo path = 6.
         self.assertEqual(out.count(report.TABLE_B_HEADER_64), 6)
 
+    def test_all_without_scenario_covers_present_scenarios(self):
+        # Seed echo + a gRPC result; --all --payload (no scenario) covers both.
+        self._seed_echo_coordinate(payload=64, in_flight=1, mult=1)
+        self._write(
+            "g-0",
+            _result("rh2", "send-recv", 64, 64, 1, 64),
+            _meta("grpc", "send-recv", "rh2", "send-recv", 1, 64, 64, 1, 64),
+        )
+        recs = report.load_records(self.tmp)
+        scenarios = [s for s in grid.SCENARIOS if any(r.scenario == s for r in recs)]
+        self.assertEqual(set(scenarios), {"echo", "grpc"})
+        out = "\n\n".join(report.render_all(recs, s, 64) for s in scenarios)
+        self.assertIn("## echo", out)
+        self.assertIn("## gRPC", out)
+
+    def test_cli_all_without_scenario_exit_zero(self):
+        self._seed_echo_coordinate(payload=64, in_flight=1, mult=1)
+        rc = report.main(["--results-dir", self.tmp, "--all", "--payload", "64"])
+        self.assertEqual(rc, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

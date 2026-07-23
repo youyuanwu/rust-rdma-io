@@ -338,10 +338,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     records = load_records(args.results_dir)
 
     if args.all:
-        if not args.scenario or args.payload is None:
-            print("--all requires --scenario and --payload", file=sys.stderr)
+        if args.payload is None:
+            print("--all requires --payload", file=sys.stderr)
             return 2
-        print(render_all(records, args.scenario, args.payload))
+        if args.scenario:
+            scenarios = [args.scenario]
+        else:
+            # No scenario given: emit for every scenario present in the results.
+            present = [s for s in grid.SCENARIOS if any(r.scenario == s for r in records)]
+            if not present:
+                print("no results found in results dir", file=sys.stderr)
+                return 2
+            scenarios = present
+        print("\n\n".join(render_all(records, s, args.payload) for s in scenarios))
         return 0
 
     if args.table == "a":
