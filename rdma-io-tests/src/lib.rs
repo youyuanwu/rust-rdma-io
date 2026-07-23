@@ -127,6 +127,9 @@ pub mod test_helpers {
     /// Covers:
     /// - `EADDRINUSE` (98): async CM port release
     /// - `EINVAL` (22): stale/half-resolved route on a fresh CM ID
+    /// - `EPROTO` (71): protocol-level CM failure on the first connection
+    ///   attempt (observed on ARM/RXE — the device's internal state settles
+    ///   after the initial failure and subsequent attempts succeed)
     /// - async CM event races surfaced as `InvalidArg("expected Established,
     ///   got Rejected|Unreachable|ConnectError")`
     ///
@@ -134,7 +137,7 @@ pub mod test_helpers {
     /// fresh CM ID.
     pub fn is_transient_cm_error(err: &rdma_io::Error) -> bool {
         matches!(err, rdma_io::Error::Verbs(io)
-            if matches!(io.raw_os_error(), Some(22) | Some(98)))
+            if matches!(io.raw_os_error(), Some(22) | Some(71) | Some(98)))
             || matches!(err, rdma_io::Error::InvalidArg(msg)
             if msg.starts_with("expected Established, got ")
                 && matches!(
@@ -383,6 +386,14 @@ mod tests {
             let err = rdma_io::Error::InvalidArg(format!("expected Established, got {event}"));
             assert!(is_transient_cm_error(&err), "{event} should be retryable");
         }
+    }
+
+    #[test]
+    fn transient_cm_error_accepts_eproto() {
+        // EPROTO (71) is returned by rdma_get_cm_event on ARM/RXE on the first
+        // connection attempt; subsequent attempts succeed once the device settles.
+        let err = rdma_io::Error::Verbs(std::io::Error::from_raw_os_error(71));
+        assert!(is_transient_cm_error(&err));
     }
 
     #[test]
