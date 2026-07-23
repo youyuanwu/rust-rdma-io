@@ -121,12 +121,26 @@ pub mod test_helpers {
         matches!(err, rdma_io::Error::Verbs(io) if io.raw_os_error() == Some(98))
     }
 
-    /// Returns `true` for transient CM errors that siw/rxe can raise during the
-    /// connect handshake: `EADDRINUSE` (98, async port release) or `EINVAL`
-    /// (22, stale/half-resolved CM route). Both clear on a fresh CM ID.
-    fn is_transient_cm_error(err: &rdma_io::Error) -> bool {
+    /// Returns `true` for transient CM errors that software RDMA can raise
+    /// during the connect handshake.
+    ///
+    /// Covers:
+    /// - `EADDRINUSE` (98): async CM port release
+    /// - `EINVAL` (22): stale/half-resolved route on a fresh CM ID
+    /// - async CM event races surfaced as `InvalidArg("expected Established,
+    ///   got Rejected|Unreachable|ConnectError")`
+    ///
+    /// These failures are typically cleared by retrying the handshake with a
+    /// fresh CM ID.
+    pub fn is_transient_cm_error(err: &rdma_io::Error) -> bool {
         matches!(err, rdma_io::Error::Verbs(io)
             if matches!(io.raw_os_error(), Some(22) | Some(98)))
+            || matches!(err, rdma_io::Error::InvalidArg(msg)
+            if msg.starts_with("expected Established, got ")
+                && matches!(
+                    msg.strip_prefix("expected Established, got "),
+                    Some("Rejected" | "Unreachable" | "ConnectError")
+                ))
     }
 
     /// Bind an [`AsyncCmListener`] to `0.0.0.0:0`, retrying on `EADDRINUSE`.
@@ -149,6 +163,7 @@ pub mod test_helpers {
                         last_err = Some(e);
                         continue;
                     }
+
                     panic!("listener bind failed: {e}");
                 }
             }
@@ -355,6 +370,25 @@ pub mod test_helpers {
             }
         }
         panic!("{label} connect failed after 5 attempts: {last_err:?}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_helpers::is_transient_cm_error;
+
+    #[test]
+    fn transient_cm_error_accepts_retryable_async_cm_events() {
+        for event in ["Rejected", "Unreachable", "ConnectError"] {
+            let err = rdma_io::Error::InvalidArg(format!("expected Established, got {event}"));
+            assert!(is_transient_cm_error(&err), "{event} should be retryable");
+        }
+    }
+
+    #[test]
+    fn transient_cm_error_rejects_non_retryable_async_cm_events() {
+        let err = rdma_io::Error::InvalidArg("expected Established, got Established".into());
+        assert!(!is_transient_cm_error(&err));
     }
 }
 
