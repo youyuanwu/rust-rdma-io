@@ -10,10 +10,11 @@ orchestrated from a control node with Ansible.
 > **Orchestration is pluggable — bench v3 is launcher-agnostic.** What v3 pins is the **grid**
 > and the **coordinate → flags/vars contract** below; *how* those flags reach the two VMs is an
 > orchestration detail that can evolve independently. The same Ansible playbooks
-> (`tests/e2e/playbooks/*.yml`) can be driven several ways — the in-repo `tests/e2e/run_bench.sh`
-> convenience script, a raw `ansible-playbook` invocation, or a higher-level matrix/reporting
-> wrapper layered on top. This document shows the in-repo launchers because they are
-> self-contained here; any matrix + reporting wiring is maintained separately (see
+> (`tests/e2e/playbooks/*.yml`) can be driven several ways — the in-repo
+> [`tests/benchv3/`](../../tests/benchv3) grid runner + report generator (the primary launcher,
+> which loops the whole grid and emits the result tables), the simpler in-repo
+> `tests/e2e/run_bench.sh` convenience script, or a raw `ansible-playbook` invocation. This document
+> shows the in-repo launchers because they are self-contained here (see
 > [Launchers](#launchers-pluggable)). Pick whichever launcher you have — the coordinate contract
 > and caveats are identical.
 
@@ -216,26 +217,30 @@ point it elsewhere):
 > **The filename encodes no payload and no date**, so a 64 B then 8 KiB run (or a repeat) at the
 > same coordinate **overwrites** the previous file. Curate each cell into the
 > [results-template](results-template.md) immediately, or set a per-payload/per-run `bench_out_dir`
-> (or rename to include payload + date + commit) before the next run.
+> (or rename to include payload + date + commit) before the next run. **The
+> [`tests/benchv3/`](../../tests/benchv3) runner does this for you** — it gives each coordinate its
+> own `bench_out_dir` and renames the result to a collision-proof identity name
+> (`…-<payload>B-<utc>-<commit>-<runid>.json`), so use it when collecting more than one coordinate.
 
 ## Launchers (pluggable)
 
 bench v3 pins the grid and the [coordinate contract](#the-coordinate--flagsvars-contract), not a
 specific launcher. Each launcher below applies the same contract to the same playbooks — use
-whichever your environment provides. A higher-level **matrix** driver (looping the grid across
-paths/coordinates) and a **report** step (JSON → Markdown/charts) can be layered on top; that
-wiring is maintained **separately** from these docs and may evolve, so v3 stays agnostic to it.
+whichever your environment provides. The primary in-repo launcher,
+[`tests/benchv3/`](../../tests/benchv3), *is* the matrix driver + report step (looping the grid and
+turning results into the [result tables](results-template.md)); the lower-level launchers run one
+coordinate at a time.
 
 | Launcher | Where | Notes |
 |---|---|---|
+| [`tests/benchv3/run_matrix.py`](../../tests/benchv3/run_matrix.py) + [`report.py`](../../tests/benchv3/report.py) | in this repo (**primary**) | Expands the whole fixed grid (paths × connections × in-flight × payloads, with the invalid-coordinate rules baked in), drives each coordinate through `bench_run.yml`, saves collision-proof results (payload/UTC/commit/run-id in the name), and emits paste-ready Table A/B. `--dry-run` previews the plan. See [`tests/benchv3/README.md`](../../tests/benchv3/README.md). |
 | `tests/e2e/run_bench.sh` | in this repo | Single run (mode/transport/connections/threads/duration/payload) or `--matrix` (in-flight 1); no `--in-flight`/`--warmup`/`--ring-max-msg`. |
 | raw `ansible-playbook … bench_run.yml -e bench_*` | in this repo | Full control of every `bench_*` var (the examples above). |
-| higher-level matrix/report wrapper | external tooling | Loops the grid and aggregates results; drives the same `bench_*` vars. Whatever wrapper you use, keep every cell on the fixed coordinates and hold duration/warmup constant. |
 
-Note that a "sweep transports × in-flights at fixed cpus" matrix maps cleanly onto the v3 grid
-(run it per connection multiple and per payload), but such wrappers typically cover only the
-default arm-park echo/gRPC paths — the HTTP/1.1 (`rh1`) and read-ring busy-poll/park paths are
-driven with single `bench_mode=…` runs (the raw-playbook examples above).
+The `tests/benchv3/` runner already handles the whole grid — including the HTTP/1.1 (`rh1`) and
+read-ring busy-poll/park paths and the 8 KiB ring-sizing rule — so you do not need to hand-assemble
+per-path runs. The lower-level launchers remain useful for one-off single coordinates; when using
+them, keep every cell on the fixed coordinates and hold duration/warmup constant.
 
 ## Teardown
 
