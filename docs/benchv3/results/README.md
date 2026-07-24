@@ -18,7 +18,7 @@ metric definitions are fixed by the [scenario matrix](../scenario-matrix.md) and
 | **threads** | 64 (= vCPU) on both peers |
 | **duration / warmup** | 10 s / 3 s |
 | **git commit** | `a3d99d0` (built + deployed to both VMs) |
-| **date** | 2026-07-23 |
+| **date** | 2026-07-23 → 2026-07-24 (1× first pass; 2× / 4× tiers added later) |
 
 ## Files
 
@@ -30,20 +30,23 @@ metric definitions are fixed by the [scenario matrix](../scenario-matrix.md) and
 
 ## Coverage & caveats (read before citing)
 
-This is a **partial first collection**, not the full grid. Coverage is uneven because of real
+This is a **partial dataset**, not the full grid. Coverage is uneven because of real
 properties of the Azure MANA NIC and the benchmark clients — the empty (`n/a`) cells are documented
-outcomes, not missing work.
+outcomes, not missing work. The fan-out axis is `{1×, 2×, 4×}` vCPU (64 / 128 / 256 connections);
+every tier was collected with the reboot-between-sweeps cadence (`run_matrix.py --reboot-between`).
 
-- **1× vCPU tier (64 connections): ~84% collected.** echo and HTTP/1.1 are essentially complete;
-  gRPC is partial (see below).
-- **2× / 4× vCPU tiers (128 / 256 connections): almost entirely `n/a`.** At higher connection
-  counts the MANA RDMA-CM handshake wedges (`ibverbs Protocol error (os 71)`, `Rejected`,
-  connection timeouts) — a NIC **setup** property, not a data-path result. Collecting these cleanly
-  requires the reboot-between-sweeps cadence (`run_matrix.py --reboot-between`) plus, at the higher
-  multiples, per-coordinate reboots; it was out of scope for this first pass. See the
+- **1× vCPU (64 conn) and 2× vCPU (128 conn): well covered.** echo and HTTP/1.1 are essentially
+  complete; the 2× sweep landed 58/72 coordinates. gRPC is partial at both tiers (see below).
+- **4× vCPU (256 conn): partial, and the split is informative.** The **round-trip regime**
+  (in-flight 1) and **moderate-pipeline ring paths** (in-flight 64) collect cleanly at 256
+  connections. The **deep-pipeline** coordinates (in-flight 512) and the **`send-recv`** path
+  instead wedge or hit the ansible run timeout — the MANA RDMA-CM handshake stalls under the
+  combined connection + outstanding-request pressure (`ibverbs Protocol error (os 71)`, `Rejected`,
+  299 s timeouts). Those cells are `n/a`; it is a NIC **setup**/flow-control property, not a
+  data-path throughput ceiling. See the
   [run procedure](../run-procedure.md#high-connections-4-vcpu).
 
-### Two findings worth calling out
+### Findings worth calling out
 
 1. **The MANA NIC wedges cumulatively, not just at high connection counts.** Running many RDMA-CM
    connect/teardown cycles back-to-back progressively wedges the NIC even at 1× (64 connections),
@@ -55,8 +58,15 @@ outcomes, not missing work.
    send-recv paths hit transient handshake rejects (`expected Established, got Rejected` /
    `ConnectError`) that the gRPC bench client does **not** retry (it gives up after a fixed number
    of connect attempts), where the async-CM code retries with a fresh CM ID. As a result several
-   gRPC 1× cells could not be collected even with reboots and are shown as `n/a`. This is a genuine
-   client-robustness gap, not measurement noise — see [grpc-64B.md](grpc-64B.md).
+   gRPC cells (across all tiers) could not be collected even with reboots and are shown as `n/a`.
+   This is a genuine client-robustness gap, not measurement noise — see [grpc-64B.md](grpc-64B.md).
+
+3. **At 4× (256 conn) the limit is outstanding-request pressure, not raw connection count.** The
+   round-trip (in-flight 1) and moderate-pipeline (in-flight 64) coordinates collect cleanly at 256
+   connections, but the deep-pipeline (in-flight 512) coordinates and the `send-recv` path stall the
+   RDMA-CM handshake and hit the run timeout. So the 4× gaps are concentrated in the deepest-pipeline
+   cells, not spread uniformly — the fan-out itself is sustainable; the fan-out **×** pipeline-depth
+   product is what tips the NIC into its setup-flakiness regime.
 
 ### `errors > 0` cells are suspect
 
