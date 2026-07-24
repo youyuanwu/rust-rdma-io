@@ -68,14 +68,21 @@ every tier was collected with the reboot-between-sweeps cadence (`run_matrix.py 
    cells, not spread uniformly — the fan-out itself is sustainable; the fan-out **×** pipeline-depth
    product is what tips the NIC into its setup-flakiness regime.
 
+4. **8 KiB ring cells use scenario-aware message sizing.** On the ring transports the RDMA message
+   is `payload + framing`, so the 8 KiB rows set `--ring-max-msg` to **8192** for echo (raw
+   payload) but **9216** for gRPC / HTTP-1.1 (payload + protobuf/gRPC/HTTP-2 or HTTP headers + TLS,
+   ~8215 B on the wire). A flat 8192 would silently fragment the framed protocols' 8 KiB messages.
+   The grid encodes this automatically; see the
+   [scenario matrix](../scenario-matrix.md#payload).
+
 ### `errors > 0` cells are suspect
 
 Per the [metric definitions](../results-template.md#how-to-read--fill-a-cell), **a cell with
 non-zero `errors` is not a clean data point.** Several cells here carry small error counts (often
-1–3, likely connection-teardown races) and a few carry large counts — most notably **gRPC
-`credit-ring` 8 KiB / in-flight 64 reported ~25 k errors** (an unsustainable coordinate for that
-path) and some HTTP/1.1 busy-poll cells reported ~60 errors. Treat any row with a non-zero `errors`
-column as **illustrative only** and re-run it in isolation before citing the number.
+1–3, likely connection-teardown races, plus a handful of busy-poll / park cells in the tens–low
+hundreds) and one carries a large count — **gRPC `credit-ring` 8 KiB / in-flight 64 (~24 k
+errors)**, an unsustainable coordinate for that path at any ring size. Treat any row with a non-zero
+`errors` column as **illustrative only** and re-run it in isolation before citing the number.
 
 ## Headline (echo, the most complete scenario)
 
