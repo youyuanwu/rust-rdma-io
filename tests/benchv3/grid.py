@@ -19,7 +19,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 # --- Fixed grid axes (docs/benchv3/scenario-matrix.md) ----------------------
 
 #: Connection counts are these multiples of the target VM vCPU count.
-CONNECTION_MULTIPLES: Tuple[int, ...] = (1, 4, 16)
+CONNECTION_MULTIPLES: Tuple[int, ...] = (1, 2, 4)
 
 #: In-flight depths for echo and gRPC. HTTP/1.1 is pinned to 1 (see PATHS).
 IN_FLIGHTS_ECHO_GRPC: Tuple[int, ...] = (1, 64, 512)

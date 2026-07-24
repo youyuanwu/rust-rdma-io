@@ -68,7 +68,7 @@ copies the release binaries to `~/bin/` and the certs to `~/certs/` on both VMs.
 Every coordinate is run with **`--threads` equal to the target VM's vCPU count** (the executor
 budget, not a load axis — see the [scenario matrix](scenario-matrix.md#threads-fixed)). Determine
 it once with `nproc` on the VM and use it for `bench_threads` below. The **connection** count is
-the chosen `{1×, 4×, 16×}` multiple of that vCPU count.
+the chosen `{1×, 2×, 4×}` multiple of that vCPU count.
 
 ## Step 3 — run a coordinate
 
@@ -96,7 +96,7 @@ all four paths, but `rh2`/`rh1` accept only the RDMA transports — their kernel
 tests/e2e/run_bench.sh --matrix \
   --matrix-modes 'echo' \
   --matrix-transports 'send-recv read-ring credit-ring tcp' \
-  --matrix-connections '64 256 1024' \
+  --matrix-connections '64 128 256' \
   --matrix-threads '64'
 ```
 
@@ -184,7 +184,7 @@ The ring transports auto-size their in-flight budget from `--in-flight` when
 `--ring-queue-depth` is `0` (the default), so a 512-deep run is sized automatically — no manual
 tuning. Override `--ring-queue-depth` only to deliberately reproduce an over-subscription case.
 
-### High connections (16× vCPU)
+### High connections (4× vCPU)
 
 The fd wall is already fixed (`setup_rdma_hw.yml` + launch-time `ulimit -n` in `bench_run.yml`),
 so high connection counts are **not** fd-bound. Beyond a few hundred connections MANA RoCEv2 can

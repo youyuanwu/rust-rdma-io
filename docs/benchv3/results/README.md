@@ -36,12 +36,12 @@ outcomes, not missing work.
 
 - **1× vCPU tier (64 connections): ~84% collected.** echo and HTTP/1.1 are essentially complete;
   gRPC is partial (see below).
-- **4× / 16× vCPU tiers (256 / 1024 connections): almost entirely `n/a`.** At high connection
+- **2× / 4× vCPU tiers (128 / 256 connections): almost entirely `n/a`.** At higher connection
   counts the MANA RDMA-CM handshake wedges (`ibverbs Protocol error (os 71)`, `Rejected`,
   connection timeouts) — a NIC **setup** property, not a data-path result. Collecting these cleanly
-  requires the reboot-between-sweeps cadence (`run_matrix.py --reboot-between`) plus, at 1024
-  connections, per-coordinate reboots; it was out of scope for this first pass. See the
-  [run procedure](../run-procedure.md#high-connections-16-vcpu).
+  requires the reboot-between-sweeps cadence (`run_matrix.py --reboot-between`) plus, at the higher
+  multiples, per-coordinate reboots; it was out of scope for this first pass. See the
+  [run procedure](../run-procedure.md#high-connections-4-vcpu).
 
 ### Two findings worth calling out
 

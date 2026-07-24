@@ -63,7 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         type=int,
         choices=grid.CONNECTION_MULTIPLES,
-        help="Limit to these connection multiples (repeatable). Default: 1,4,16.",
+        help="Limit to these connection multiples (repeatable). Default: 1,2,4.",
     )
     p.add_argument(
         "--in-flight",

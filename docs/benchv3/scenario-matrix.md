@@ -76,8 +76,8 @@ Fixed multiples of the vCPU count — the fan-out axis.
 | Multiple | Example (64-vCPU VM) | What it isolates |
 |---|---|---|
 | **1×** | 64 | One connection per core |
-| **4×** | 256 | Moderate fan-out |
-| **16×** | 1024 | High fan-out — flow-control / CM-setup ceiling |
+| **2×** | 128 | Light fan-out |
+| **4×** | 256 | Moderate fan-out — flow-control / CM-setup ceiling |
 
 ### In-flight
 
@@ -136,7 +136,7 @@ CPU cost per op, `cores busy`, `peak RSS`, and (8 KiB) `Gbps` — are defined on
 To characterize a SKU you run the **whole grid** for each transport path at that SKU:
 
 - record every coordinate's cell from the client's `--report json`;
-- a coordinate a transport cannot sustain (e.g. `credit-ring` at deep pipeline, or 16×
+- a coordinate a transport cannot sustain (e.g. `credit-ring` at deep pipeline, or 4×
   connections hitting MANA RDMA-CM setup flakiness) is recorded as `n/a` / `fail`, not left
   ambiguous (see [results-template](results-template.md));
 - repeat the same grid on new SKUs and commits over time — the dataset grows without changing

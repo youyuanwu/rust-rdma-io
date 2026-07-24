@@ -26,7 +26,7 @@ the full rationale (why CPU is sampled in-process, what `cores busy` means) see
 [`metrics.md`](../bench/metrics.md).
 
 > **Recording an unsustainable coordinate.** Some coordinates a transport simply cannot sustain —
-> e.g. `credit-ring` at a deep pipeline, or 16× connections hitting MANA RDMA-CM setup flakiness.
+> e.g. `credit-ring` at a deep pipeline, or 4× connections hitting MANA RDMA-CM setup flakiness.
 > Record such a cell as `n/a` or `fail (CM setup)` with a footnote (see the example in Table A).
 > A non-numeric cell is an **expected** outcome, not a data bug.
 
@@ -99,12 +99,12 @@ HTTP/1.1 boards.
 | 1× vCPU     | 1         |                    |          |          |          |             |       |               |        |
 | 1× vCPU     | 64        |                    |          |          |          |             |       |               |        |
 | 1× vCPU     | 512       |                    |          |          |          |             |       |               |        |
+| 2× vCPU     | 1         |                    |          |          |          |             |       |               |        |
+| 2× vCPU     | 64        |                    |          |          |          |             |       |               |        |
+| 2× vCPU     | 512       |                    |          |          |          |             |       |               |        |
 | 4× vCPU     | 1         |                    |          |          |          |             |       |               |        |
 | 4× vCPU     | 64        |                    |          |          |          |             |       |               |        |
 | 4× vCPU     | 512       |                    |          |          |          |             |       |               |        |
-| 16× vCPU    | 1         |                    |          |          |          |             |       |               |        |
-| 16× vCPU    | 64        |                    |          |          |          |             |       |               |        |
-| 16× vCPU    | 512       |                    |          |          |          |             |       |               |        |
 
 For an **8 KiB** (bandwidth) copy of Table B, add a `Gbps` column after `Throughput` (as in
 Table A).

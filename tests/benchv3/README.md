@@ -71,7 +71,7 @@ artifacts.**
 | `--vcpu N` (required) | Target VM vCPU count → `threads=N`, `connections=mult×N`. |
 | `--scenario {echo,grpc,http1}` | Limit to scenario(s) (repeatable). Default: all. |
 | `--path LABEL` | Limit to transport-path label(s) (repeatable). Default: all. |
-| `--connections-mult {1,4,16}` | Limit to connection multiple(s) (repeatable). |
+| `--connections-mult {1,2,4}` | Limit to connection multiple(s) (repeatable). |
 | `--in-flight N` | Limit to in-flight depth(s) (repeatable). HTTP/1.1 stays at 1 regardless. |
 | `--payload {64,8192}` | Limit to payload size(s) (repeatable). |
 | `--duration S` / `--warmup S` | Fixed run controls (default 10 s / 3 s). |
