@@ -94,9 +94,33 @@ class TestExpand(unittest.TestCase):
     def test_ring_max_msg_only_for_large_ring(self):
         for c in grid.expand(VCPU):
             if c.payload == grid.LARGE_PAYLOAD and c.transport in grid.RING_TRANSPORTS:
-                self.assertEqual(c.ring_max_msg, grid.RING_MAX_MSG_LARGE)
+                # Framed protocols (gRPC / HTTP-1.1) need headroom for framing +
+                # TLS; echo carries the raw payload.
+                if c.scenario in grid.FRAMED_SCENARIOS:
+                    self.assertEqual(c.ring_max_msg, grid.RING_MAX_MSG_LARGE_FRAMED)
+                else:
+                    self.assertEqual(c.ring_max_msg, grid.RING_MAX_MSG_LARGE)
             else:
                 self.assertIsNone(c.ring_max_msg)
+
+    def test_ring_max_msg_framed_vs_raw(self):
+        # echo ring @ 8 KiB -> raw payload size; gRPC / HTTP-1.1 ring @ 8 KiB -> framed size.
+        echo_ring = [
+            c for c in grid.expand(VCPU, scenarios=["echo"])
+            if c.transport == "read-ring" and c.payload == 8192
+        ]
+        grpc_ring = [
+            c for c in grid.expand(VCPU, scenarios=["grpc"])
+            if c.transport == "read-ring" and c.payload == 8192
+        ]
+        http1_ring = [
+            c for c in grid.expand(VCPU, scenarios=["http1"])
+            if c.transport == "credit-ring" and c.payload == 8192
+        ]
+        self.assertTrue(echo_ring and grpc_ring and http1_ring)
+        self.assertTrue(all(c.ring_max_msg == 8192 for c in echo_ring))
+        self.assertTrue(all(c.ring_max_msg == 9216 for c in grpc_ring))
+        self.assertTrue(all(c.ring_max_msg == 9216 for c in http1_ring))
 
     def test_ring_max_msg_absent_for_sendrecv_and_baseline_and_small(self):
         for c in grid.expand(VCPU):

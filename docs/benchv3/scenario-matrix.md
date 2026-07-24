@@ -103,11 +103,22 @@ Fixed sizes — message-rate vs bandwidth.
 | **64 B** | Per-request overhead — doorbells, completions, syscalls. Message-rate dominated. |
 | **8 KiB** | Bandwidth regime — copy costs and goodput (report `Gbps`). |
 
-> **8 KiB on the ring transports needs matched message sizing.** For `read-ring` /
-> `credit-ring`, the `echo` path truncates any payload larger than `--ring-max-msg`
-> (default 1500 B), so 8 KiB ring runs must set `--ring-max-msg 8192` (via
-> `-e bench_ring_max_msg=8192`) on **both** peers. `send-recv` sizes its buffers from
-> `--payload` and is unaffected. See the [run-procedure](run-procedure.md).
+> **8 KiB on the ring transports needs matched message sizing — and the size is
+> scenario-dependent.** For `read-ring` / `credit-ring` the on-wire ring message is
+> `payload + framing`, and a payload larger than `--ring-max-msg` (default 1500 B) is
+> **truncated** (`echo`) or **fragmented** (byte-stream). So 8 KiB ring runs must raise
+> `--ring-max-msg` on **both** peers:
+>
+> | Scenario | Ring message | `--ring-max-msg` at 8 KiB |
+> |---|---|---|
+> | **echo** | raw payload (no framing) | **8192** |
+> | **gRPC** | payload + protobuf + gRPC-prefix + HTTP/2 DATA header (≈payload+23) | **9216** |
+> | **HTTP/1.1** | payload + request/status line + headers + TLS record | **9216** |
+>
+> `9216` clears the ~8215 B framed message while still leaving 7 ring slots
+> (`65536 / 9216`); don't push it toward the ring capacity or backpressure breaks. The
+> grid sets this automatically (`bench_ring_max_msg`). `send-recv` uses a 64 KiB stream
+> buffer and is unaffected. See the [run-procedure](run-procedure.md).
 
 ## The grid
 

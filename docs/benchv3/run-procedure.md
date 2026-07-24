@@ -31,7 +31,7 @@ Every grid coordinate maps to this fixed set of tool inputs, whatever launcher a
 | threads = vCPU | `--threads` | `bench_threads` |
 | in-flight (echo/gRPC) | `--in-flight` | `bench_in_flight` |
 | payload | `--payload` | `bench_payload` |
-| 8 KiB ring sizing | `--ring-max-msg 8192` | `bench_ring_max_msg` |
+| 8 KiB ring sizing | `--ring-max-msg` (8192 echo / 9216 gRPC & HTTP-1.1) | `bench_ring_max_msg` |
 | duration / warmup | `--duration` / `--warmup` | `bench_duration` / `bench_warmup` |
 
 The rest of this doc shows one launcher applying that contract, then the caveats (which are
@@ -132,13 +132,24 @@ in each results-table caption.
 > direct-playbook runs, pass the same value there too (`-e bench_warmup=5`) — or run every row
 > via the playbook — rather than leaving the two paths on different warmups.
 
-### 8 KiB payload → ring message sizing (required)
+### 8 KiB payload → ring message sizing (required, scenario-dependent)
 
-The `echo` path truncates ring-transport payloads larger than `--ring-max-msg` (default
-**1500 B**). For the **8 KiB** rows on the ring transports (`read-ring` / `credit-ring`), set the
-ring message size to 8192 on **both** peers via the direct playbook (`run_bench.sh` cannot supply
-it). `send-recv` sizes its echo buffers from `--payload`; the TCP baseline is not affected by this
-ring knob.
+On the ring transports (`read-ring` / `credit-ring`) the on-wire message is `payload + framing`,
+and a payload larger than `--ring-max-msg` (default **1500 B**) is **truncated** (`echo`) or
+**fragmented** (byte-stream). For the **8 KiB** rows the ring message size must be raised on
+**both** peers via the direct playbook (`run_bench.sh` cannot supply it). The size depends on the
+scenario's framing:
+
+| Scenario | `--ring-max-msg` at 8 KiB | Why |
+|---|---|---|
+| **echo** | **8192** | raw request/response — the message *is* the payload |
+| **gRPC** (`rh2`) | **9216** | payload + protobuf + gRPC-prefix + HTTP/2 DATA header (≈payload+23) |
+| **HTTP/1.1** (`rh1`) | **9216** | payload + request/status line + headers + TLS record |
+
+`9216` clears the ~8215 B framed message while still leaving 7 ring slots (`65536 / 9216`); do not
+push it toward the ring capacity or backpressure breaks (read-ring hangs, credit-ring collapses).
+`send-recv` sizes its buffers from `--payload`; the TCP baseline is unaffected by this ring knob.
+The matrix runner sets the right value automatically (`bench_ring_max_msg`).
 
 ```
 ansible-playbook -i tests/e2e/inventory_local.py tests/e2e/playbooks/bench_run.yml \
@@ -147,6 +158,7 @@ ansible-playbook -i tests/e2e/inventory_local.py tests/e2e/playbooks/bench_run.y
   -e bench_in_flight=64 -e bench_ring_max_msg=8192 \
   -e bench_duration=10 -e bench_warmup=3 \
   -e bench_payload=8192
+# gRPC / HTTP-1.1 ring rows at 8 KiB: use -e bench_ring_max_msg=9216 instead.
 ```
 
 ### Read-ring completion topologies (busy-poll / park)

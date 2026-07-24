@@ -30,8 +30,19 @@ PAYLOADS: Tuple[int, ...] = (64, 8192)
 
 #: Payload that triggers the ring message-size bump on ring transports.
 LARGE_PAYLOAD: int = 8192
-#: Ring message size to set for the large payload on ring transports.
+#: Ring message size for a large *raw* payload (echo): the ring message is exactly
+#: the payload bytes, so the payload itself is the required size.
 RING_MAX_MSG_LARGE: int = 8192
+#: Ring message size for a large *framed* payload (gRPC / HTTP-1.1): the on-wire
+#: message is ``payload + framing`` — gRPC adds protobuf + gRPC-prefix + HTTP/2
+#: DATA header (~payload+23), and HTTP/1.1 adds request/status line + headers +
+#: TLS record — so the ring message must hold more than the payload. 9216 clears
+#: the ~8215 B framed 8 KiB message while still leaving 7 ring slots
+#: (65536 / 9216). Matches the benchv1 sizing.
+RING_MAX_MSG_LARGE_FRAMED: int = 9216
+#: Scenarios whose on-wire ring message carries protocol framing on top of the
+#: payload (so they need the framed ring size); ``echo`` is raw and does not.
+FRAMED_SCENARIOS: Tuple[str, ...] = ("grpc", "http1")
 #: Transports whose ring buffers must be sized up for the large payload.
 RING_TRANSPORTS: Tuple[str, ...] = ("read-ring", "credit-ring")
 
@@ -148,9 +159,18 @@ class Coordinate:
         return v
 
 
-def _ring_max_msg_for(transport: str, payload: int) -> Optional[int]:
-    """8 KiB payloads on ring transports need the ring message size bumped."""
+def _ring_max_msg_for(scenario: str, transport: str, payload: int) -> Optional[int]:
+    """8 KiB payloads on ring transports need the ring message size bumped.
+
+    Echo carries the raw payload (message == payload), so it uses the payload
+    size directly. gRPC and HTTP/1.1 wrap the payload in protocol framing +
+    (for HTTP/1.1) TLS, so the on-wire ring message exceeds the payload and needs
+    the larger framed size — otherwise the ring transport truncates (echo) /
+    fragments (byte-stream) the message. See the benchv1 sizing rationale.
+    """
     if payload == LARGE_PAYLOAD and transport in RING_TRANSPORTS:
+        if scenario in FRAMED_SCENARIOS:
+            return RING_MAX_MSG_LARGE_FRAMED
         return RING_MAX_MSG_LARGE
     return None
 
@@ -200,7 +220,9 @@ def expand(
                                 threads=vcpu,
                                 in_flight=in_flight,
                                 payload=payload,
-                                ring_max_msg=_ring_max_msg_for(path.transport, payload),
+                                ring_max_msg=_ring_max_msg_for(
+                                    scenario, path.transport, payload
+                                ),
                             )
                         )
     return coords
