@@ -35,8 +35,12 @@ properties of the Azure MANA NIC and the benchmark clients — the empty (`n/a`)
 outcomes, not missing work. The fan-out axis is `{1×, 2×, 4×}` vCPU (64 / 128 / 256 connections);
 every tier was collected with the reboot-between-sweeps cadence (`run_matrix.py --reboot-between`).
 
-- **1× vCPU (64 conn) and 2× vCPU (128 conn): well covered.** echo and HTTP/1.1 are essentially
-  complete; the 2× sweep landed 58/72 coordinates. gRPC is partial at both tiers (see below).
+- **1× vCPU (64 conn) and 2× vCPU (128 conn): well covered.** echo is 67/72 at these two tiers and
+  HTTP/1.1 is essentially complete; the 2× sweep landed 58/72 coordinates. gRPC is partial at both
+  tiers (see below). The five remaining echo `n/a` cells at ≤ 2× are **not** transient misses —
+  they hit two hard limits (see finding 5): four **busy-poll in-flight-512** cells exceed the
+  device CQ depth, and **`send-recv` 128 conn × in-flight 512** wedges RDMA-CM setup on every
+  attempt (including repeated fresh-NIC retries).
 - **4× vCPU (256 conn): partial, and the split is informative.** The **round-trip regime**
   (in-flight 1) and **moderate-pipeline ring paths** (in-flight 64) collect cleanly at 256
   connections. The **deep-pipeline** coordinates (in-flight 512) and the **`send-recv`** path
@@ -74,6 +78,16 @@ every tier was collected with the reboot-between-sweeps cadence (`run_matrix.py 
    ~8215 B on the wire). A flat 8192 would silently fragment the framed protocols' 8 KiB messages.
    The grid encodes this automatically; see the
    [scenario matrix](../scenario-matrix.md#payload).
+
+5. **The read-ring busy-poll pool cannot reach in-flight 512 on this SKU — a hard device limit.**
+   The busy-poll executor sizes a shared completion queue from `max_in_flight` (auto-derived as
+   `in_flight * 2`), and at in-flight 512 it needs a CQ depth of ~2054 send / ~2052 recv, which
+   exceeds the MANA device's `max_cqe = 2048`. The client rejects it immediately
+   (`InvalidArg("busy pool: … shared CQ depth send=2054/recv=2052 > device max_cqe=2048")`), so
+   those four echo cells (busy-poll · in-flight 512 · 1×/2× · 64 B/8 KiB) are a permanent `n/a` on
+   this SKU — not a wedge and not fixable by rebooting. Separately, `send-recv` at 128 conn ×
+   in-flight 512 (65 536 outstanding requests) wedges RDMA-CM setup (`os error 71`) on every
+   attempt, including repeated fresh-NIC retries, and is also `n/a`.
 
 ### `errors > 0` cells are suspect
 
