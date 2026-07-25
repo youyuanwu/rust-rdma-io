@@ -78,8 +78,18 @@ elif rdma link show 2>/dev/null | grep -q siw; then
 elif $CHECK_ONLY; then
     warn "no siw device"
 else
-    # Find first non-lo interface
-    IFACE=$(ip -o link show up | awk -F': ' '{print $2}' | grep -v lo | head -1)
+    # Bind siw to the interface that carries the default route. Tests connect
+    # to `local_ip()` — the source IP of the route to a public address — so the
+    # siw device MUST live on that same netdev. Picking "first non-lo up" can
+    # select a different interface when a runner has several UP links, leaving
+    # the siw endpoint unreachable from the address the client dials (iWARP
+    # then fails the handshake with Unreachable/Rejected/EPROTO). Fall back to
+    # the first non-lo interface if the default route can't be resolved.
+    IFACE=$(ip -o route get 8.8.8.8 2>/dev/null \
+        | awk '{for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit }}')
+    if [[ -z "$IFACE" ]]; then
+        IFACE=$(ip -o link show up | awk -F': ' '{print $2}' | grep -v lo | head -1)
+    fi
     if [[ -z "$IFACE" ]]; then
         fail "no suitable network interface found"
         ((errors++))
