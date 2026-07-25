@@ -308,7 +308,7 @@ where
                     "localhost".to_string(),
                     endpoint,
                 );
-                let channel = tonic_h3::H3Channel::new(connector, uri);
+                let channel = tonic_h3::H3Channel::new(connector, uri, None);
                 Ok(GreeterClient::new(channel))
             }
         })

@@ -144,7 +144,7 @@ fn make_h3_grpc_client(
         "localhost".to_string(),
         endpoint.clone(),
     );
-    let channel = tonic_h3::H3Channel::new(connector, uri);
+    let channel = tonic_h3::H3Channel::new(connector, uri, None);
     GreeterClient::new(channel)
 }
 
