@@ -63,7 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         type=int,
         choices=grid.CONNECTION_MULTIPLES,
-        help="Limit to these connection multiples (repeatable). Default: 1,4,16.",
+        help="Limit to these connection multiples (repeatable). Default: 1,2,4.",
     )
     p.add_argument(
         "--in-flight",
@@ -86,6 +86,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--inventory", default=DEFAULT_INVENTORY)
     p.add_argument("--playbook", default=DEFAULT_PLAYBOOK)
     p.add_argument("--reboot-playbook", default=DEFAULT_REBOOT_PLAYBOOK)
+    p.add_argument(
+        "--commit",
+        default=None,
+        help="Provenance commit to record (default: cwd git HEAD). Set this to the "
+        "commit the deployed benchmark binary was built from when it differs from "
+        "the tooling checkout.",
+    )
     p.add_argument(
         "--reboot-between",
         action="store_true",
@@ -347,6 +354,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         vcpu=args.vcpu,
         launcher=ansible_launcher(args.inventory, args.playbook),
         reboot=reboot,
+        commit=args.commit,
     )
     print(
         f"\n# run {summary['run_id']}: {summary['succeeded']}/{summary['total']} "

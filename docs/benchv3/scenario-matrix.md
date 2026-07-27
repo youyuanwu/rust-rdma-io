@@ -76,8 +76,8 @@ Fixed multiples of the vCPU count — the fan-out axis.
 | Multiple | Example (64-vCPU VM) | What it isolates |
 |---|---|---|
 | **1×** | 64 | One connection per core |
-| **4×** | 256 | Moderate fan-out |
-| **16×** | 1024 | High fan-out — flow-control / CM-setup ceiling |
+| **2×** | 128 | Light fan-out |
+| **4×** | 256 | Moderate fan-out — flow-control / CM-setup ceiling |
 
 ### In-flight
 
@@ -103,11 +103,22 @@ Fixed sizes — message-rate vs bandwidth.
 | **64 B** | Per-request overhead — doorbells, completions, syscalls. Message-rate dominated. |
 | **8 KiB** | Bandwidth regime — copy costs and goodput (report `Gbps`). |
 
-> **8 KiB on the ring transports needs matched message sizing.** For `read-ring` /
-> `credit-ring`, the `echo` path truncates any payload larger than `--ring-max-msg`
-> (default 1500 B), so 8 KiB ring runs must set `--ring-max-msg 8192` (via
-> `-e bench_ring_max_msg=8192`) on **both** peers. `send-recv` sizes its buffers from
-> `--payload` and is unaffected. See the [run-procedure](run-procedure.md).
+> **8 KiB on the ring transports needs matched message sizing — and the size is
+> scenario-dependent.** For `read-ring` / `credit-ring` the on-wire ring message is
+> `payload + framing`, and a payload larger than `--ring-max-msg` (default 1500 B) is
+> **truncated** (`echo`) or **fragmented** (byte-stream). So 8 KiB ring runs must raise
+> `--ring-max-msg` on **both** peers:
+>
+> | Scenario | Ring message | `--ring-max-msg` at 8 KiB |
+> |---|---|---|
+> | **echo** | raw payload (no framing) | **8192** |
+> | **gRPC** | payload + protobuf + gRPC-prefix + HTTP/2 DATA header (≈payload+23) | **9216** |
+> | **HTTP/1.1** | payload + request/status line + headers + TLS record | **9216** |
+>
+> `9216` clears the ~8215 B framed message while still leaving 7 ring slots
+> (`65536 / 9216`); don't push it toward the ring capacity or backpressure breaks. The
+> grid sets this automatically (`bench_ring_max_msg`). `send-recv` uses a 64 KiB stream
+> buffer and is unaffected. See the [run-procedure](run-procedure.md).
 
 ## The grid
 
@@ -136,7 +147,7 @@ CPU cost per op, `cores busy`, `peak RSS`, and (8 KiB) `Gbps` — are defined on
 To characterize a SKU you run the **whole grid** for each transport path at that SKU:
 
 - record every coordinate's cell from the client's `--report json`;
-- a coordinate a transport cannot sustain (e.g. `credit-ring` at deep pipeline, or 16×
+- a coordinate a transport cannot sustain (e.g. `credit-ring` at deep pipeline, or 4×
   connections hitting MANA RDMA-CM setup flakiness) is recorded as `n/a` / `fail`, not left
   ambiguous (see [results-template](results-template.md));
 - repeat the same grid on new SKUs and commits over time — the dataset grows without changing

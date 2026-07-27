@@ -71,7 +71,7 @@ artifacts.**
 | `--vcpu N` (required) | Target VM vCPU count → `threads=N`, `connections=mult×N`. |
 | `--scenario {echo,grpc,http1}` | Limit to scenario(s) (repeatable). Default: all. |
 | `--path LABEL` | Limit to transport-path label(s) (repeatable). Default: all. |
-| `--connections-mult {1,4,16}` | Limit to connection multiple(s) (repeatable). |
+| `--connections-mult {1,2,4}` | Limit to connection multiple(s) (repeatable). |
 | `--in-flight N` | Limit to in-flight depth(s) (repeatable). HTTP/1.1 stays at 1 regardless. |
 | `--payload {64,8192}` | Limit to payload size(s) (repeatable). |
 | `--duration S` / `--warmup S` | Fixed run controls (default 10 s / 3 s). |
@@ -86,7 +86,8 @@ Defaults for the inventory/playbook/results paths are resolved relative to the r
 tool works regardless of the caller's working directory.
 
 The grid axes, path→mode/transport mapping, and the invalid-coordinate rules (no gRPC busy/park;
-HTTP/1.1 in-flight=1; 8 KiB → ring message size 8192 on ring transports only) are encoded once in
+HTTP/1.1 in-flight=1; 8 KiB → ring message size on ring transports only: 8192 for echo,
+9216 for the framed gRPC / HTTP-1.1 paths) are encoded once in
 `grid.py` from the [scenario matrix](../../docs/benchv3/scenario-matrix.md) — this tool does not
 re-document them.
 

@@ -149,7 +149,7 @@ class TestReport(unittest.TestCase):
 
     def test_table_b_headers_and_rows(self):
         # Seed echo read-ring across the whole concurrency grid for payload 64.
-        for mult in (1, 4, 16):
+        for mult in (1, 2, 4):
             for nf in (1, 64, 512):
                 conns = mult * 64
                 self._write(
@@ -164,7 +164,7 @@ class TestReport(unittest.TestCase):
         self.assertIn(report.TABLE_B_SEP_64, out)
         # 9 data rows for echo.
         data_rows = [ln for ln in out.splitlines() if ln.startswith("| 1× vCPU")
-                     or ln.startswith("| 4× vCPU") or ln.startswith("| 16× vCPU")]
+                     or ln.startswith("| 2× vCPU") or ln.startswith("| 4× vCPU")]
         self.assertEqual(len(data_rows), 9)
 
     def test_table_b_http1_three_rows(self):
