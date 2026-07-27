@@ -41,6 +41,11 @@ jobs:
           KVER=$(uname -r)
           echo "Kernel: $KVER"
           sudo apt-get install -y "linux-modules-extra-${KVER}" || true
+          # Some runners expose the host NIC's RDMA function (Azure MANA,
+          # Mellanox VF) on the netdev siw is created on; rdma_cm would then
+          # route the tests over hardware that cannot complete a same-host
+          # handshake (accept fails with EPROTO).
+          sudo ./scripts/unload-hw-rdma.sh
           sudo ./scripts/setup-siw.sh
 
       - name: Install Rust toolchain
@@ -102,8 +107,11 @@ jobs:
 
       - name: Load rdma_rxe and create device
         run: |
-          # Remove Mellanox VFs if present (avoids test device confusion)
-          sudo rmmod mlx5_ib 2>/dev/null || true
+          # Remove hardware RDMA providers (Mellanox VFs, Azure MANA) if
+          # present: they share the netdev rxe is created on, and rdma_cm
+          # would route the tests over hardware that cannot complete a
+          # same-host handshake (accept fails with EPROTO).
+          sudo ./scripts/unload-hw-rdma.sh
           sudo ./scripts/setup-rxe.sh
 
       - name: Install Rust toolchain
