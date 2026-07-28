@@ -202,5 +202,69 @@ class TestIdentityFilename(unittest.TestCase):
         self.assertTrue(name.endswith(".json"))
 
 
+class TestOpenLoadBuilders(unittest.TestCase):
+    def test_loaded_latency_one_coord_per_path_and_rate(self):
+        rates = [100_000, 200_000]
+        coords = grid.expand_loaded_latency(VCPU, "echo", rates, connection_mult=1)
+        paths = grid.paths_for("echo")
+        self.assertEqual(len(coords), len(paths) * len(rates))
+        # every coord carries a target rate and the fixed connection tier
+        self.assertEqual({c.target_rps for c in coords}, set(rates))
+        for c in coords:
+            self.assertEqual(c.scenario, "echo")
+            self.assertEqual(c.connections, 1 * VCPU)
+            self.assertIsNotNone(c.target_rps)
+
+    def test_matched_throughput_one_coord_per_path(self):
+        coords = grid.expand_matched_throughput(VCPU, "echo", 150_000, connection_mult=2)
+        self.assertEqual(len(coords), len(grid.paths_for("echo")))
+        self.assertEqual({c.target_rps for c in coords}, {150_000})
+        self.assertTrue(all(c.connections == 2 * VCPU for c in coords))
+
+    def test_http1_pins_in_flight_to_one(self):
+        coords = grid.expand_loaded_latency(VCPU, "http1", [50_000], in_flight=64)
+        self.assertTrue(all(c.in_flight == 1 for c in coords))
+
+    def test_echo_uses_provided_in_flight_capacity(self):
+        coords = grid.expand_loaded_latency(VCPU, "echo", [50_000], in_flight=128)
+        self.assertTrue(all(c.in_flight == 128 for c in coords))
+
+    def test_transports_filter(self):
+        coords = grid.expand_loaded_latency(
+            VCPU, "echo", [50_000], transports=["send-recv"]
+        )
+        self.assertEqual({c.transport for c in coords}, {"send-recv"})
+
+    def test_grpc_scenario_rejected(self):
+        with self.assertRaises(ValueError):
+            grid.expand_loaded_latency(VCPU, "grpc", [50_000])
+
+    def test_non_positive_rate_rejected(self):
+        with self.assertRaises(ValueError):
+            grid.expand_loaded_latency(VCPU, "echo", [0])
+
+    def test_bench_vars_include_target_rps_only_when_set(self):
+        c = grid.expand_matched_throughput(VCPU, "echo", 42_000)[0]
+        v = c.bench_vars(duration=10, warmup=3)
+        self.assertEqual(v["bench_target_rps"], 42_000)
+        closed = grid.expand(VCPU, scenarios=["echo"])[0]
+        self.assertNotIn("bench_target_rps", closed.bench_vars(10, 3))
+
+    def test_identity_filename_includes_rps_segment(self):
+        c = grid.expand_matched_throughput(VCPU, "echo", 42_000)[0]
+        name = grid.identity_filename(c, "20260723T000000Z", "abc", "r1")
+        self.assertIn("42000rps", name)
+        closed = grid.expand(VCPU, scenarios=["echo"])[0]
+        self.assertNotIn("rps", grid.identity_filename(closed, "t", "abc", "r1"))
+
+    def test_rate_makes_names_distinct(self):
+        a = grid.expand_matched_throughput(VCPU, "echo", 10_000)[0]
+        b = grid.expand_matched_throughput(VCPU, "echo", 20_000)[0]
+        self.assertNotEqual(
+            grid.identity_filename(a, "t", "c", "r"),
+            grid.identity_filename(b, "t", "c", "r"),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

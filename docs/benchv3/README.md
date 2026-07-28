@@ -63,7 +63,7 @@ No framework edits are needed — the grid definition and table shapes are reuse
 
 | Doc | Purpose |
 | --- | ------- |
-| [scenario-matrix.md](scenario-matrix.md) | What/why we measure — transports, scenarios, the fixed grid (single source of truth) |
+| [scenario-matrix.md](scenario-matrix.md) | What/why we measure — transports, scenarios, the fixed grid, and the open-loop offered-load scenarios (single source of truth) |
 | [results-template.md](results-template.md) | Reusable blank result tables + how to fill a cell |
 | [results/](results/README.md) | Collected results from a real two-VM run (per scenario × payload), with coverage caveats |
 | [run-procedure.md](run-procedure.md) | How to run the grid with the real tooling + caveats |

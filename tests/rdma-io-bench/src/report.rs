@@ -14,6 +14,11 @@ pub struct BenchResult {
     pub payload_bytes: usize,
     pub total_requests: u64,
     pub throughput_rps: f64,
+    /// Target offered request rate for open-loop (`--target-rps`) runs; absent
+    /// for the default closed-loop saturation runs (via `skip_serializing_if`).
+    /// `throughput_rps` is always the *achieved* delivered rate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_rps: Option<f64>,
     pub latency_us: LatencyStats,
     pub errors: u64,
     /// Client-side user+system CPU seconds consumed during the measured window
@@ -69,6 +74,7 @@ impl BenchResult {
             payload_bytes,
             total_requests: total,
             throughput_rps: throughput,
+            target_rps: None,
             latency_us: LatencyStats {
                 p50: hist.value_at_quantile(0.50) as f64,
                 p95: hist.value_at_quantile(0.95) as f64,
@@ -97,6 +103,13 @@ impl BenchResult {
         self
     }
 
+    /// Record the open-loop target rate (`--target-rps`). `None` (the default,
+    /// closed-loop) leaves the field absent from the output.
+    pub fn with_target_rps(mut self, target_rps: Option<f64>) -> Self {
+        self.target_rps = target_rps;
+        self
+    }
+
     pub fn print_text(&self) {
         println!("=== RDMA Benchmark Results ===");
         println!("Mode:         {}", self.mode);
@@ -108,6 +121,9 @@ impl BenchResult {
         println!("Payload:      {} bytes", self.payload_bytes);
         println!();
         println!("Throughput:   {:.0} req/s", self.throughput_rps);
+        if let Some(target) = self.target_rps {
+            println!("Target rate:  {target:.0} req/s (open-loop)");
+        }
         println!("Latency:");
         println!("  p50:        {:.1} µs", self.latency_us.p50);
         println!("  p95:        {:.1} µs", self.latency_us.p95);

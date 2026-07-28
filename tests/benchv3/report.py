@@ -91,6 +91,12 @@ class Record:
         self.in_flight = int(data.get("in_flight", 0))
         self.payload = int(data.get("payload_bytes", self.meta.get("payload", 0)))
         self.run_id = self.meta.get("run_id")
+        # Open-loop target rate (req/s); None for closed-loop runs. `throughput_rps`
+        # is always the achieved delivered rate.
+        tr = data.get("target_rps")
+        if tr is None:
+            tr = self.meta.get("target_rps")
+        self.target_rps = tr
         cm = self.meta.get("connection_mult")
         if cm is None and self.threads:
             cm = round(self.connections / self.threads)
@@ -98,7 +104,14 @@ class Record:
 
     @property
     def key(self) -> Tuple:
-        return (self.scenario, self.path_label, self.connection_mult, self.in_flight, self.payload)
+        return (
+            self.scenario,
+            self.path_label,
+            self.connection_mult,
+            self.in_flight,
+            self.payload,
+            self.target_rps,
+        )
 
 
 def load_records(results_dir: str, run_id: Optional[str] = None) -> List[Record]:
@@ -266,7 +279,7 @@ def render_table_a(
     sep = TABLE_A_SEP_8K if with_gbps else TABLE_A_SEP_64
     lines = [caption, "", header, sep]
     for path in grid.paths_for(scenario):
-        rec = idx.get((scenario, path.label, connection_mult, in_flight, payload))
+        rec = idx.get((scenario, path.label, connection_mult, in_flight, payload, None))
         cells = _metric_cells(rec, with_gbps)
         lines.append("| " + " | ".join([_display_label(path.label)] + cells) + " |")
     return "\n".join(lines)
@@ -301,7 +314,7 @@ def render_table_b(
     lines = [caption, "", header, sep]
     for mult in grid.CONNECTION_MULTIPLES:
         for in_flight in grid.in_flights_for(scenario):
-            rec = idx.get((scenario, path_label, mult, in_flight, payload))
+            rec = idx.get((scenario, path_label, mult, in_flight, payload, None))
             cells = _metric_cells(rec, with_gbps)
             row = [f"{mult}× vCPU", str(in_flight)] + cells
             lines.append("| " + " | ".join(row) + " |")
@@ -328,6 +341,106 @@ def render_all(records: Sequence[Record], scenario: str, payload: int) -> str:
     return "\n".join(blocks)
 
 
+# --- Open-loop offered-load tables ------------------------------------------
+
+# transport | target rps | achieved rps | p50 | p99 | p99.9 | CPU/op | cores | errors
+OPEN_LOOP_HEADER = (
+    "| transport | target rps | achieved rps | p50 (µs) | p99 (µs) | p99.9 (µs) | "
+    "CPU/op (µs) | cores | errors |"
+)
+OPEN_LOOP_SEP = "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+
+
+def _open_loop_cells(rec: Optional[Record], target_rps: int) -> List[str]:
+    """Cells (target..errors) for one open-loop coordinate; ``n/a`` when absent.
+
+    Reports the full latency distribution (p50/p99/p99.9) per the spec, plus the
+    achieved rate against the target so a saturation shortfall is readable."""
+    if rec is None:
+        return [str(target_rps), NA, NA, NA, NA, NA, NA, NA]
+    return [
+        str(target_rps),
+        _f(rec.data.get("throughput_rps"), ".0f"),
+        _latency(rec, "p50"),
+        _latency(rec, "p99"),
+        _latency(rec, "p999"),
+        _f(rec.data.get("cpu_us_per_op"), ".2f"),
+        _cores(rec),
+        (str(int(rec.data["errors"])) if rec.data.get("errors") is not None else NA),
+    ]
+
+
+def _open_loop_caption(recs: Sequence[Record], scenario: str, payload: int, mult: int, kind: str) -> str:
+    prov = _caption_provenance(recs)
+    return (
+        f"> **SKU:** `________` · **vCPU:** {prov['vcpu']} · "
+        f"**scenario:** {_SCENARIO_TITLE.get(scenario, scenario)} · "
+        f"**payload:** {_payload_str(payload)} · **connections:** {mult}× vCPU · "
+        f"**load:** open-loop {kind} · "
+        f"**duration/warmup:** {prov['duration']} s / {prov['warmup']} s · "
+        f"**git commit:** {prov['commit']} · **date:** {prov['date']}"
+    )
+
+
+def render_loaded_latency(
+    records: Sequence[Record],
+    scenario: str,
+    payload: int,
+    connection_mult: int,
+    rates: Sequence[int],
+) -> str:
+    """Loaded tail-latency board: rows = (transport path × target rate).
+
+    Keyed by (path, target_rps) — the per-connection queue capacity (`in_flight`)
+    is an implementation detail of the open-loop run, not a table axis."""
+    matching = [
+        r for r in records
+        if r.scenario == scenario and r.payload == payload
+        and r.connection_mult == connection_mult and r.target_rps is not None
+    ]
+    by_key = {(r.path_label, r.target_rps): r for r in matching}
+    lines = [
+        _open_loop_caption(matching, scenario, payload, connection_mult, "loaded-latency"),
+        "",
+        OPEN_LOOP_HEADER,
+        OPEN_LOOP_SEP,
+    ]
+    for path in grid.paths_for(scenario):
+        for rate in rates:
+            rec = by_key.get((path.label, rate))
+            cells = _open_loop_cells(rec, rate)
+            lines.append("| " + " | ".join([_display_label(path.label)] + cells) + " |")
+    return "\n".join(lines)
+
+
+def render_matched_throughput(
+    records: Sequence[Record],
+    scenario: str,
+    payload: int,
+    connection_mult: int,
+    rate: int,
+) -> str:
+    """Matched-throughput board: rows = transports at one shared target rate,
+    for a CPU-cost-at-equal-load comparison."""
+    matching = [
+        r for r in records
+        if r.scenario == scenario and r.payload == payload
+        and r.connection_mult == connection_mult and r.target_rps == rate
+    ]
+    by_label = {r.path_label: r for r in matching}
+    lines = [
+        _open_loop_caption(matching, scenario, payload, connection_mult, "matched-throughput"),
+        "",
+        OPEN_LOOP_HEADER,
+        OPEN_LOOP_SEP,
+    ]
+    for path in grid.paths_for(scenario):
+        rec = by_label.get(path.label)
+        cells = _open_loop_cells(rec, rate)
+        lines.append("| " + " | ".join([_display_label(path.label)] + cells) + " |")
+    return "\n".join(lines)
+
+
 # --- CLI --------------------------------------------------------------------
 
 
@@ -341,6 +454,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--run-id", help="Scope to one sweep's run id (avoids mixing runs/SKUs).")
     p.add_argument("--table", choices=["a", "b"], help="Emit a single Table A or B.")
     p.add_argument("--all", action="store_true", help="Emit all Table A + B for a scenario/payload.")
+    p.add_argument(
+        "--loaded-latency",
+        action="store_true",
+        help="Emit the open-loop loaded-latency board (rows = transport × --rate).",
+    )
+    p.add_argument(
+        "--matched-throughput",
+        action="store_true",
+        help="Emit the open-loop matched-throughput board (all transports at one --rate).",
+    )
+    p.add_argument(
+        "--rate",
+        action="append",
+        type=int,
+        help="Open-loop target rate(s) in req/s (repeatable for --loaded-latency).",
+    )
     p.add_argument("--scenario", choices=grid.SCENARIOS)
     p.add_argument("--payload", type=int, choices=grid.PAYLOADS)
     p.add_argument("--connections-mult", type=int, choices=grid.CONNECTION_MULTIPLES)
@@ -352,6 +481,29 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     records = load_records(args.results_dir, run_id=args.run_id)
+
+    if args.loaded_latency or args.matched_throughput:
+        if not args.scenario or args.payload is None or not args.rate:
+            print(
+                "--loaded-latency / --matched-throughput require --scenario --payload --rate",
+                file=sys.stderr,
+            )
+            return 2
+        if args.scenario not in grid.LOADED_LATENCY_SCENARIOS:
+            print(
+                f"--scenario must be one of {grid.LOADED_LATENCY_SCENARIOS} for open-loop boards",
+                file=sys.stderr,
+            )
+            return 2
+        mult = args.connections_mult or 1
+        if args.loaded_latency:
+            print(render_loaded_latency(records, args.scenario, args.payload, mult, args.rate))
+        else:
+            if len(args.rate) != 1:
+                print("--matched-throughput takes exactly one --rate", file=sys.stderr)
+                return 2
+            print(render_matched_throughput(records, args.scenario, args.payload, mult, args.rate[0]))
+        return 0
 
     if args.all:
         if args.payload is None:

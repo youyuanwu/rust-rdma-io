@@ -43,6 +43,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 
+use crate::load::RateSchedule;
 use crate::metrics::{run_readiness_barrier, spawn_resource_sampler};
 use crate::report::BenchResult;
 
@@ -56,6 +57,12 @@ const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn new_histogram() -> Histogram<u64> {
     Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).expect("create histogram")
+}
+
+/// Per-connection open-loop rate: the run's total `--target-rps` split evenly
+/// across `connections`. `None` (no `--target-rps`) means closed-loop.
+fn per_conn_rate(target_rps: Option<u64>, connections: usize) -> Option<f64> {
+    target_rps.map(|r| r as f64 / connections.max(1) as f64)
 }
 
 /// Log a failed connect attempt and back off, returning `true` if the caller
@@ -98,6 +105,7 @@ fn report_result(
     errors: u64,
     cpu_seconds: f64,
     peak_rss_kb: u64,
+    target_rps: Option<f64>,
     report: &str,
 ) {
     let result = BenchResult::from_histogram(
@@ -111,7 +119,8 @@ fn report_result(
         payload,
         errors,
     )
-    .with_resource_usage(cpu_seconds, peak_rss_kb);
+    .with_resource_usage(cpu_seconds, peak_rss_kb)
+    .with_target_rps(target_rps);
     match report {
         "json" => result.print_json(),
         _ => result.print_text(),
@@ -141,23 +150,48 @@ async fn client_conn_loop<T: Transport + 'static>(
     target: usize,
     warmup_deadline: Instant,
     bench_deadline: Instant,
+    open_loop: Option<f64>,
 ) -> (Histogram<u64>, u64) {
     let mut hist = new_histogram();
     let mut errors = 0u64;
     let mut send_times: VecDeque<Instant> = VecDeque::with_capacity(target + 2);
     let mut in_flight = 0usize;
+    // Open-loop: pace issuing at a fixed per-connection rate and record each
+    // request's scheduled time. Closed-loop (None): fill the pipeline to `target`.
+    let mut sched = open_loop.map(|rate| RateSchedule::new(rate, Instant::now()));
+    // Warmup gating: closed-loop excludes requests *sent* during warmup; open-loop
+    // excludes requests *completing* during warmup, because a behind-schedule
+    // connection's scheduled times stay in the (past) warmup window even for
+    // requests it only manages to issue/complete inside the measured window.
+    let open_loop_active = open_loop.is_some();
 
     'outer: loop {
         if Instant::now() >= bench_deadline {
             break;
         }
 
-        // Fill the pipeline up to the target depth.
+        // Issue requests, bounded by `target` (the transport's queue capacity).
+        // Closed-loop fills to `target`; open-loop issues only requests whose
+        // scheduled time has arrived, storing the *scheduled* time (not now) so
+        // a behind-schedule connection's tail latency is not hidden.
         while in_flight < target {
+            let scheduled = match &mut sched {
+                Some(s) => {
+                    if Instant::now() < s.next_scheduled() {
+                        break; // next request not due yet
+                    }
+                    Some(s)
+                }
+                None => None,
+            };
             match t.send_copy(&payload[..]) {
                 Ok(0) => break, // transport can't accept more right now
                 Ok(_) => {
-                    send_times.push_back(Instant::now());
+                    let stamp = match scheduled {
+                        Some(s) => s.issue(),
+                        None => Instant::now(),
+                    };
+                    send_times.push_back(stamp);
                     in_flight += 1;
                 }
                 Err(e) => {
@@ -168,9 +202,19 @@ async fn client_conn_loop<T: Transport + 'static>(
             }
         }
 
-        // Await progress, bounded by the benchmark deadline so the loop always
-        // terminates even if the pipeline momentarily stalls.
-        let deadline = tokio::time::Instant::from_std(bench_deadline);
+        // Wake deadline: the benchmark end, or — in open-loop with capacity to
+        // spare — the next scheduled send, whichever is sooner, so the loop wakes
+        // to issue on time even when no completion arrives.
+        let mut wake = bench_deadline;
+        if let Some(s) = &sched
+            && in_flight < target
+        {
+            let next = s.next_scheduled();
+            if next < wake {
+                wake = next;
+            }
+        }
+        let deadline = tokio::time::Instant::from_std(wake);
         let step = tokio::time::timeout_at(
             deadline,
             poll_fn(|cx| {
@@ -192,7 +236,12 @@ async fn client_conn_loop<T: Transport + 'static>(
                         let done = Instant::now();
                         for c in &out[..n] {
                             if let Some(start) = send_times.pop_front() {
-                                if start >= warmup_deadline {
+                                let in_window = if open_loop_active {
+                                    done >= warmup_deadline
+                                } else {
+                                    start >= warmup_deadline
+                                };
+                                if in_window {
                                     let us =
                                         done.saturating_duration_since(start).as_micros() as u64;
                                     let _ = hist.record(us);
@@ -220,7 +269,13 @@ async fn client_conn_loop<T: Transport + 'static>(
         .await;
 
         match step {
-            Err(_elapsed) => break,
+            Err(_elapsed) => {
+                // Either the benchmark ended, or (open-loop) we woke for the next
+                // scheduled send — loop to issue it. Distinguish by the clock.
+                if Instant::now() >= bench_deadline {
+                    break;
+                }
+            }
             Ok(ClientStep::Progress) => {}
             Ok(ClientStep::Closed) => {
                 errors += 1;
@@ -247,6 +302,7 @@ pub async fn run_transport_echo_client<B>(
     duration: u64,
     threads: usize,
     transport_label: &str,
+    target_rps: Option<u64>,
     report: &str,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
@@ -282,6 +338,7 @@ where
     );
 
     let target = in_flight.max(1);
+    let open_loop = per_conn_rate(target_rps, connections);
     let warmup_deadline = Instant::now() + Duration::from_secs(warmup);
     let bench_deadline = warmup_deadline + Duration::from_secs(duration);
     eprintln!("Warming up {warmup}s, then benchmarking {duration}s...");
@@ -297,6 +354,7 @@ where
             target,
             warmup_deadline,
             bench_deadline,
+            open_loop,
         )));
     }
 
@@ -326,6 +384,7 @@ where
         errors,
         cpu_seconds,
         peak_rss,
+        target_rps.map(|r| r as f64),
         report,
     );
     Ok(())
@@ -481,6 +540,7 @@ pub async fn run_read_ring_busy_client(
     payload: usize,
     warmup: u64,
     duration: u64,
+    target_rps: Option<u64>,
     report: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let cores = busy_cores.max(1);
@@ -496,6 +556,7 @@ pub async fn run_read_ring_busy_client(
 
     let payload_buf: Arc<[u8]> = vec![b'x'; payload].into();
     let target = in_flight.max(1);
+    let open_loop = per_conn_rate(target_rps, connections);
     eprintln!("Setting up {connections} connection(s) before the timed window...");
 
     // Readiness barrier: every connection finishes `connect_busy` setup, reports
@@ -509,7 +570,7 @@ pub async fn run_read_ring_busy_client(
         pool.spawn_connect(addr, cfg, move |t| async move {
             ready.report().await;
             let (warmup_deadline, bench_deadline) = gate.wait().await;
-            client_conn_loop(t, p, target, warmup_deadline, bench_deadline).await
+            client_conn_loop(t, p, target, warmup_deadline, bench_deadline, open_loop).await
         })
     })
     .await;
@@ -526,6 +587,7 @@ pub async fn run_read_ring_busy_client(
         outcome.errors,
         outcome.cpu_seconds,
         outcome.peak_rss_kb,
+        target_rps.map(|r| r as f64),
         report,
     );
 
@@ -649,6 +711,7 @@ pub async fn run_read_ring_park_client(
     payload: usize,
     warmup: u64,
     duration: u64,
+    target_rps: Option<u64>,
     report: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let cores = park_cores.max(1);
@@ -661,6 +724,7 @@ pub async fn run_read_ring_park_client(
 
     let payload_buf: Arc<[u8]> = vec![b'x'; payload].into();
     let target = in_flight.max(1);
+    let open_loop = per_conn_rate(target_rps, connections);
     eprintln!("Setting up {connections} connection(s) before the timed window...");
 
     // Readiness barrier (see `run_read_ring_busy_client`): start the shared clock
@@ -672,7 +736,7 @@ pub async fn run_read_ring_park_client(
         Some(pool.spawn_connect(addr, cfg, move |t| async move {
             ready.report().await;
             let (warmup_deadline, bench_deadline) = gate.wait().await;
-            client_conn_loop(t, p, target, warmup_deadline, bench_deadline).await
+            client_conn_loop(t, p, target, warmup_deadline, bench_deadline, open_loop).await
         }))
     })
     .await;
@@ -689,6 +753,7 @@ pub async fn run_read_ring_park_client(
         outcome.errors,
         outcome.cpu_seconds,
         outcome.peak_rss_kb,
+        target_rps.map(|r| r as f64),
         report,
     );
 
@@ -768,6 +833,7 @@ async fn tcp_client_conn(
     target: usize,
     warmup_deadline: Instant,
     bench_deadline: Instant,
+    open_loop: Option<f64>,
 ) -> (Histogram<u64>, u64) {
     let (mut rd, mut wr) = stream.into_split();
     let plen = payload.len();
@@ -779,14 +845,32 @@ async fn tcp_client_conn(
     let times_w = times.clone();
     let writer = tokio::spawn(async move {
         let mut errs = 0u64;
+        // Open-loop: pace at the per-connection rate and stamp each request with
+        // its scheduled time; closed-loop: issue as fast as the permit allows and
+        // stamp with the actual send time.
+        let mut sched = open_loop.map(|rate| RateSchedule::new(rate, Instant::now()));
         while Instant::now() < bench_deadline {
+            if let Some(s) = &sched {
+                let next = s.next_scheduled();
+                if Instant::now() < next {
+                    let wake = tokio::time::Instant::from_std(next.min(bench_deadline));
+                    tokio::time::sleep_until(wake).await;
+                    if Instant::now() >= bench_deadline {
+                        break;
+                    }
+                }
+            }
             // Bound outstanding requests; a permit is returned by the reader.
             let permit = match sem_w.acquire().await {
                 Ok(p) => p,
                 Err(_) => break, // semaphore closed => stop
             };
             permit.forget();
-            times_w.lock().await.push_back(Instant::now());
+            let stamp = match &mut sched {
+                Some(s) => s.issue(),
+                None => Instant::now(),
+            };
+            times_w.lock().await.push_back(stamp);
             if wr.write_all(&payload[..]).await.is_err() {
                 errs += 1;
                 break;
@@ -808,11 +892,16 @@ async fn tcp_client_conn(
             Ok(Ok(_)) => {
                 let done = Instant::now();
                 let start = times.lock().await.pop_front();
-                if let Some(start) = start
-                    && start >= warmup_deadline
-                {
-                    let us = done.saturating_duration_since(start).as_micros() as u64;
-                    let _ = hist.record(us);
+                if let Some(start) = start {
+                    let in_window = if open_loop.is_some() {
+                        done >= warmup_deadline
+                    } else {
+                        start >= warmup_deadline
+                    };
+                    if in_window {
+                        let us = done.saturating_duration_since(start).as_micros() as u64;
+                        let _ = hist.record(us);
+                    }
                 }
                 sem.add_permits(1);
             }
@@ -842,6 +931,7 @@ pub async fn run_tcp_echo_client(
     warmup: u64,
     duration: u64,
     threads: usize,
+    target_rps: Option<u64>,
     report: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let payload_buf: Arc<[u8]> = vec![b'x'; payload].into();
@@ -875,6 +965,7 @@ pub async fn run_tcp_echo_client(
     );
 
     let target = in_flight.max(1);
+    let open_loop = per_conn_rate(target_rps, connections);
     let warmup_deadline = Instant::now() + Duration::from_secs(warmup);
     let bench_deadline = warmup_deadline + Duration::from_secs(duration);
     eprintln!("Warming up {warmup}s, then benchmarking {duration}s...");
@@ -890,6 +981,7 @@ pub async fn run_tcp_echo_client(
             target,
             warmup_deadline,
             bench_deadline,
+            open_loop,
         )));
     }
 
@@ -919,6 +1011,7 @@ pub async fn run_tcp_echo_client(
         errors,
         cpu_seconds,
         peak_rss,
+        target_rps.map(|r| r as f64),
         report,
     );
     Ok(())

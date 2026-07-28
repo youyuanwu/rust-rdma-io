@@ -155,3 +155,40 @@ To characterize a SKU you run the **whole grid** for each transport path at that
 
 See [results-template](results-template.md) for the exact table shapes and
 [run-procedure](run-procedure.md) for how to execute each coordinate.
+
+## Offered-load scenarios (open-loop)
+
+Loaded tail-latency and matched throughput.
+
+The fixed grid above is **closed-loop** — every coordinate runs flat-out at saturation, so its
+latency numbers are *saturation* latencies and CPU is only ever compared at each transport's own
+operating point. Two extra scenarios use an **open-loop** load generator (`--target-rps`) that
+issues requests at a fixed rate **independent of completion**, exposing the two dimensions where
+RDMA most clearly differs from kernel TCP. They apply to **echo** and **HTTP/1.1** only (gRPC's
+tonic/HTTP-2 client paces itself internally and is excluded).
+
+- **Loaded tail-latency** — run a transport at several **sub-saturation** target rates and record
+  the latency distribution (p50 / p99 / p99.9) at each. Reveals whether a transport keeps a flat,
+  low tail as load rises or whether its tail blows up before saturation.
+- **Matched throughput** — run **every** transport at the **same** target rate and compare CPU cost
+  (CPU/op, cores busy) to deliver identical work. Makes RDMA's kernel-bypass efficiency directly
+  visible instead of inferred.
+
+How the open-loop generator works:
+
+- The run's `--target-rps` is split evenly across `--connections`; each connection issues at a
+  **constant interval** (`connections / target_rps` seconds apart). Constant-rate is used for
+  simplicity rather than a Poisson process; the trade-off is noted here for readers who need
+  bursty-arrival fidelity.
+- Latency is measured from each request's **scheduled** time, not its actual send time, so a
+  connection that falls behind does not hide its tail (coordinated-omission mitigation).
+- `--in-flight` still sizes the transport's queue capacity and bounds outstanding requests, so it
+  must be provisioned by Little's law (`in_flight ≥ target_rps × latency` per connection) or it,
+  not the network, becomes the limiter. HTTP/1.1 keeps exactly one request per connection, so its
+  achievable rate is bounded by `connections / RTT`.
+- The result reports the **achieved** rate (`throughput_rps`) alongside the **target** (`target_rps`).
+  An achieved rate within **±5%** of target is a valid sub-saturation point; a larger shortfall means
+  the transport could not sustain the offered load (a readable saturation signal, not a data bug).
+
+See [run-procedure](run-procedure.md#offered-load-runs-open-loop) for how to run these and
+[results-template](results-template.md#offered-load-boards-open-loop) for the table shapes.

@@ -141,6 +141,10 @@ class Coordinate:
     in_flight: int
     payload: int
     ring_max_msg: Optional[int] = None
+    #: Open-loop target request rate (req/s) for the loaded-latency and
+    #: matched-throughput scenarios; ``None`` = the default closed-loop
+    #: saturation run. Split across ``connections`` by the client.
+    target_rps: Optional[int] = None
 
     def bench_vars(self, duration: int, warmup: int) -> Dict[str, object]:
         """The ``bench_*`` playbook variables for this coordinate."""
@@ -156,6 +160,8 @@ class Coordinate:
         }
         if self.ring_max_msg is not None:
             v["bench_ring_max_msg"] = self.ring_max_msg
+        if self.target_rps is not None:
+            v["bench_target_rps"] = self.target_rps
         return v
 
 
@@ -257,11 +263,112 @@ def identity_filename(
         f"{coord.threads}thr",
         f"{coord.in_flight}if",
         f"{coord.payload}B",
+    ]
+    # Offered-load runs are distinguished by their target rate so a loaded-latency
+    # sweep's rate levels never collide; closed-loop names are unchanged.
+    if coord.target_rps is not None:
+        parts.append(f"{coord.target_rps}rps")
+    parts += [
         utc,
         _slug(commit),
         _slug(run_id),
     ]
     return "-".join(parts) + "." + ext
+
+
+#: Scenarios that support the open-loop offered-load scenarios (gRPC is excluded
+#: because its tonic/HTTP-2 client paces itself internally).
+LOADED_LATENCY_SCENARIOS: Tuple[str, ...] = ("echo", "http1")
+
+#: Default per-connection queue capacity (``--in-flight``) to provision for the
+#: open-loop echo scenarios, so the transport queue is not the limiter below
+#: saturation (HTTP/1.1 is always pinned to 1). Size by Little's law:
+#: ``in_flight >= target_rps * expected_latency`` per connection.
+DEFAULT_OPEN_LOOP_IN_FLIGHT: int = 64
+
+
+def _open_loop_coords(
+    vcpu: int,
+    scenario: str,
+    rates: Sequence[int],
+    connection_mult: int,
+    payload: int,
+    in_flight: int,
+    transports: Optional[Iterable[str]],
+) -> List[Coordinate]:
+    """Shared expansion for the two offered-load scenarios: one coordinate per
+    (transport path x rate) at a fixed connection tier, carrying ``target_rps``.
+
+    ``transports`` filters by transport-path *label* or *transport* name; ``None``
+    keeps every path for the scenario. HTTP/1.1 pins ``in_flight`` to 1.
+    """
+    if vcpu <= 0:
+        raise ValueError("vcpu must be a positive integer")
+    if scenario not in LOADED_LATENCY_SCENARIOS:
+        raise ValueError(
+            f"scenario {scenario!r} does not support offered-load runs; "
+            f"expected one of {LOADED_LATENCY_SCENARIOS}"
+        )
+    if any(r <= 0 for r in rates):
+        raise ValueError("target rates must be positive integers")
+
+    cap = 1 if scenario == "http1" else in_flight
+    keep = set(transports) if transports is not None else None
+    coords: List[Coordinate] = []
+    for path in paths_for(scenario):
+        if keep is not None and path.label not in keep and path.transport not in keep:
+            continue
+        for rate in rates:
+            coords.append(
+                Coordinate(
+                    scenario=scenario,
+                    path_label=path.label,
+                    mode=path.mode,
+                    transport=path.transport,
+                    connection_mult=connection_mult,
+                    connections=connection_mult * vcpu,
+                    threads=vcpu,
+                    in_flight=cap,
+                    payload=payload,
+                    ring_max_msg=_ring_max_msg_for(scenario, path.transport, payload),
+                    target_rps=rate,
+                )
+            )
+    return coords
+
+
+def expand_loaded_latency(
+    vcpu: int,
+    scenario: str,
+    rates: Sequence[int],
+    connection_mult: int = 1,
+    payload: int = 64,
+    in_flight: int = DEFAULT_OPEN_LOOP_IN_FLIGHT,
+    transports: Optional[Iterable[str]] = None,
+) -> List[Coordinate]:
+    """Loaded tail-latency sweep: each transport path run across several
+    sub-saturation ``rates`` at a fixed connection tier, for ``echo``/``http1``.
+    """
+    return _open_loop_coords(
+        vcpu, scenario, rates, connection_mult, payload, in_flight, transports
+    )
+
+
+def expand_matched_throughput(
+    vcpu: int,
+    scenario: str,
+    rate: int,
+    connection_mult: int = 1,
+    payload: int = 64,
+    in_flight: int = DEFAULT_OPEN_LOOP_IN_FLIGHT,
+    transports: Optional[Iterable[str]] = None,
+) -> List[Coordinate]:
+    """Matched-throughput comparison: every transport path run at one shared
+    ``rate`` so CPU cost is compared at identical delivered load.
+    """
+    return _open_loop_coords(
+        vcpu, scenario, [rate], connection_mult, payload, in_flight, transports
+    )
 
 
 def dedupe(coords: Sequence["Coordinate"]) -> List["Coordinate"]:

@@ -34,6 +34,7 @@ use tokio_openssl::SslStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::common::{ClientOpts, ServerOpts, connect_with_retry, transport_setup_error};
+use crate::load::RateSchedule;
 use crate::metrics::{BenchMetrics, run_readiness_barrier, spawn_resource_sampler};
 use crate::report::BenchResult;
 use crate::tls_common;
@@ -186,6 +187,12 @@ async fn run_h1_clients(
 
     let metrics = BenchMetrics::new(senders.len());
 
+    // Open-loop: pace each connection at target_rps/connections; None = the
+    // default sequential (closed-loop) one-request-at-a-time behavior.
+    let rate_pc = opts
+        .target_rps
+        .map(|r| r as f64 / opts.connections.max(1) as f64);
+
     eprintln!(
         "Benchmarking for {}s (1 request per connection, {} connections)...",
         opts.duration,
@@ -198,8 +205,25 @@ async fn run_h1_clients(
         let body = payload.clone().into_bytes();
         let authority = authority.clone();
         handles.push(tokio::spawn(async move {
+            let mut sched = rate_pc.map(|rate| RateSchedule::new(rate, Instant::now()));
             while Instant::now() < bench_deadline {
-                let start = Instant::now();
+                // Open-loop: wait until this request's scheduled time (non-busy),
+                // and use the scheduled time as its start so tail latency reflects
+                // queuing when the connection cannot keep the offered rate.
+                let start = if let Some(s) = &mut sched {
+                    let next = s.next_scheduled();
+                    if Instant::now() < next {
+                        let wake = tokio::time::Instant::from_std(next.min(bench_deadline));
+                        tokio::time::sleep_until(wake).await;
+                        if Instant::now() >= bench_deadline {
+                            break;
+                        }
+                    }
+                    s.issue()
+                } else {
+                    Instant::now()
+                };
+                let paced = sched.is_some();
                 let req = match hyper::Request::builder()
                     .method(hyper::Method::POST)
                     .uri("/")
@@ -214,13 +238,27 @@ async fn run_h1_clients(
                 };
                 match send_h1(&mut sender, req).await {
                     Ok(()) => {
-                        if start >= warmup_deadline {
-                            m.record(id, start.elapsed()).await;
+                        let done = Instant::now();
+                        // Closed-loop gates the window on send time; open-loop on
+                        // completion time (a behind-schedule connection's scheduled
+                        // start can sit in the past warmup window).
+                        let in_window = if paced {
+                            done >= warmup_deadline
+                        } else {
+                            start >= warmup_deadline
+                        };
+                        if in_window {
+                            m.record(id, done.saturating_duration_since(start)).await;
                         }
                     }
                     Err(e) => {
                         tracing::trace!(id, error = %e, "h1 request failed");
-                        if start >= warmup_deadline {
+                        let in_window = if paced {
+                            Instant::now() >= warmup_deadline
+                        } else {
+                            start >= warmup_deadline
+                        };
+                        if in_window {
                             m.record_error();
                         }
                     }
@@ -248,7 +286,8 @@ async fn run_h1_clients(
         opts.payload,
         metrics.total_errors.load(Ordering::Relaxed),
     )
-    .with_resource_usage(cpu_seconds, peak_rss_kb);
+    .with_resource_usage(cpu_seconds, peak_rss_kb)
+    .with_target_rps(opts.target_rps.map(|r| r as f64));
 
     match opts.report.as_str() {
         "json" => result.print_json(),
@@ -416,6 +455,7 @@ async fn h1_conn_loop<S>(
     body: Vec<u8>,
     warmup_deadline: Instant,
     bench_deadline: Instant,
+    open_loop: Option<f64>,
 ) -> (Histogram<u64>, u64)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -430,8 +470,22 @@ where
     };
 
     let mut errors = 0u64;
+    let mut sched = open_loop.map(|rate| RateSchedule::new(rate, Instant::now()));
     while Instant::now() < bench_deadline {
-        let start = Instant::now();
+        let start = if let Some(s) = &mut sched {
+            let next = s.next_scheduled();
+            if Instant::now() < next {
+                let wake = tokio::time::Instant::from_std(next.min(bench_deadline));
+                tokio::time::sleep_until(wake).await;
+                if Instant::now() >= bench_deadline {
+                    break;
+                }
+            }
+            s.issue()
+        } else {
+            Instant::now()
+        };
+        let paced = sched.is_some();
         let req = match hyper::Request::builder()
             .method(hyper::Method::POST)
             .uri("/")
@@ -446,14 +500,28 @@ where
         };
         match send_h1(&mut sender, req).await {
             Ok(()) => {
-                if start >= warmup_deadline {
-                    let us = start.elapsed().as_micros().min(u64::MAX as u128) as u64;
+                let done = Instant::now();
+                let in_window = if paced {
+                    done >= warmup_deadline
+                } else {
+                    start >= warmup_deadline
+                };
+                if in_window {
+                    let us = done
+                        .saturating_duration_since(start)
+                        .as_micros()
+                        .min(u64::MAX as u128) as u64;
                     let _ = hist.record(us.max(1));
                 }
             }
             Err(e) => {
                 tracing::trace!(error = %e, "h1 request failed");
-                if start >= warmup_deadline {
+                let in_window = if paced {
+                    Instant::now() >= warmup_deadline
+                } else {
+                    start >= warmup_deadline
+                };
+                if in_window {
                     errors += 1;
                 }
             }
@@ -475,6 +543,7 @@ fn report_h1_thread_per_core(
     errors: u64,
     cpu_seconds: f64,
     peak_rss_kb: u64,
+    target_rps: Option<f64>,
     report: &str,
 ) {
     let result = BenchResult::from_histogram(
@@ -488,7 +557,8 @@ fn report_h1_thread_per_core(
         payload,
         errors,
     )
-    .with_resource_usage(cpu_seconds, peak_rss_kb);
+    .with_resource_usage(cpu_seconds, peak_rss_kb)
+    .with_target_rps(target_rps);
     match report {
         "json" => result.print_json(),
         _ => result.print_text(),
@@ -509,6 +579,7 @@ pub async fn run_h1_busy_client(
     warmup: u64,
     duration: u64,
     cert: &Path,
+    target_rps: Option<u64>,
     report: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let cores = busy_cores.max(1);
@@ -525,6 +596,7 @@ pub async fn run_h1_busy_client(
     let connector = tls_common::build_connector_h1(cert);
     let authority = format!("{}:{}", addr.ip(), addr.port());
     let body = "x".repeat(payload).into_bytes();
+    let rate_pc = target_rps.map(|r| r as f64 / connections.max(1) as f64);
     eprintln!("Setting up {connections} connection(s) before the timed window...");
 
     // Readiness barrier: every connection finishes RDMA setup + TLS/hyper
@@ -547,6 +619,7 @@ pub async fn run_h1_busy_client(
                 body,
                 warmup_deadline,
                 bench_deadline,
+                rate_pc,
             )
             .await
         })
@@ -563,6 +636,7 @@ pub async fn run_h1_busy_client(
         outcome.errors,
         outcome.cpu_seconds,
         outcome.peak_rss_kb,
+        target_rps.map(|r| r as f64),
         report,
     );
 
@@ -585,6 +659,7 @@ pub async fn run_h1_park_client(
     warmup: u64,
     duration: u64,
     cert: &Path,
+    target_rps: Option<u64>,
     report: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let cores = park_cores.max(1);
@@ -598,6 +673,7 @@ pub async fn run_h1_park_client(
     let connector = tls_common::build_connector_h1(cert);
     let authority = format!("{}:{}", addr.ip(), addr.port());
     let body = "x".repeat(payload).into_bytes();
+    let rate_pc = target_rps.map(|r| r as f64 / connections.max(1) as f64);
     eprintln!("Setting up {connections} connection(s) before the timed window...");
 
     // Readiness barrier (see `run_h1_busy_client`): start the shared clock +
@@ -618,6 +694,7 @@ pub async fn run_h1_park_client(
                 body,
                 warmup_deadline,
                 bench_deadline,
+                rate_pc,
             )
             .await
         }))
@@ -634,6 +711,7 @@ pub async fn run_h1_park_client(
         outcome.errors,
         outcome.cpu_seconds,
         outcome.peak_rss_kb,
+        target_rps.map(|r| r as f64),
         report,
     );
 

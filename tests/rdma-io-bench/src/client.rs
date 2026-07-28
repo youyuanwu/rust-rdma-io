@@ -98,6 +98,15 @@ struct Args {
     #[arg(long, default_value_t = 64)]
     payload: usize,
 
+    /// Open-loop target request rate (req/s) for `echo` / `rh1` / `tcp1`. When
+    /// set, the client issues at this fixed rate (split evenly across
+    /// `--connections`) instead of running closed-loop at saturation, and
+    /// latency is measured from each request's scheduled time. Omit for the
+    /// default closed-loop behavior. `--in-flight` still sizes the transport
+    /// queues, so set it high enough to hold `target_rps × latency` outstanding.
+    #[arg(long)]
+    target_rps: Option<u64>,
+
     #[arg(long, default_value = "build/certs/cert.pem")]
     cert: PathBuf,
 
@@ -120,6 +129,7 @@ impl Args {
             warmup: self.warmup,
             duration: self.duration,
             payload: self.payload,
+            target_rps: self.target_rps,
             cert: self.cert.clone(),
             key: self.key.clone(),
             report: self.report.clone(),
@@ -162,6 +172,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
+
+    // `--target-rps` (open-loop) is only meaningful for the echo and HTTP/1.1
+    // clients; the gRPC (`rh2`/`rh3`/`tcp`) runners ignore it. Reject misuse
+    // up front rather than silently running closed-loop or emitting a
+    // zero-request result.
+    if let Some(rps) = args.target_rps {
+        const OPEN_LOOP_MODES: &[&str] = &[
+            "echo",
+            "echo-busy",
+            "echo-park",
+            "rh1",
+            "rh1-busy",
+            "rh1-park",
+            "tcp1",
+        ];
+        if rps == 0 {
+            eprintln!("--target-rps must be greater than 0");
+            std::process::exit(1);
+        }
+        if !OPEN_LOOP_MODES.contains(&args.mode.as_str()) {
+            eprintln!(
+                "--target-rps (open-loop) is only supported for echo / rh1 / tcp1 modes; \
+                 got --mode {} (gRPC paces itself internally)",
+                args.mode
+            );
+            std::process::exit(1);
+        }
+    }
 
     // Busy-poll (`--mode echo-busy`) has its own runtime topology: the data path
     // runs on the BusyPool's N pinned `current_thread` runtimes, so `main` uses
@@ -238,6 +276,7 @@ async fn run_echo_busy_client(args: &Args) -> Result<(), Box<dyn std::error::Err
         args.payload,
         args.warmup,
         args.duration,
+        args.target_rps,
         &args.report,
     )
     .await
@@ -263,6 +302,7 @@ async fn run_echo_park_client(args: &Args) -> Result<(), Box<dyn std::error::Err
         args.payload,
         args.warmup,
         args.duration,
+        args.target_rps,
         &args.report,
     )
     .await
@@ -284,6 +324,7 @@ async fn run_rh1_busy_client(args: &Args) -> Result<(), Box<dyn std::error::Erro
         args.warmup,
         args.duration,
         &args.cert,
+        args.target_rps,
         &args.report,
     )
     .await
@@ -305,6 +346,7 @@ async fn run_rh1_park_client(args: &Args) -> Result<(), Box<dyn std::error::Erro
         args.warmup,
         args.duration,
         &args.cert,
+        args.target_rps,
         &args.report,
     )
     .await
@@ -410,6 +452,7 @@ async fn run_echo_bench(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 args.warmup,
                 args.duration,
                 args.threads,
+                args.target_rps,
                 &args.report,
             )
             .await
@@ -479,6 +522,7 @@ where
         args.duration,
         args.threads,
         transport_label,
+        args.target_rps,
         &args.report,
     )
     .await
