@@ -26,6 +26,10 @@ pub struct ClientOpts {
     pub duration: u64,
     /// Payload size in bytes; the runner builds the request body from this.
     pub payload: usize,
+    /// Open-loop target request rate (req/s) split across `connections`; `None`
+    /// runs the default closed-loop saturation load. Used by the `rh1`/`tcp1`
+    /// HTTP/1.1 clients (and threaded to `echo` via explicit args).
+    pub target_rps: Option<u64>,
     pub cert: PathBuf,
     pub key: PathBuf,
     pub report: String,

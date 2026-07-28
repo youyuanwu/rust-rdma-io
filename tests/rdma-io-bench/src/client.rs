@@ -98,6 +98,15 @@ struct Args {
     #[arg(long, default_value_t = 64)]
     payload: usize,
 
+    /// Open-loop target request rate (req/s) for `echo` / `rh1` / `tcp1`. When
+    /// set, the client issues at this fixed rate (split evenly across
+    /// `--connections`) instead of running closed-loop at saturation, and
+    /// latency is measured from each request's scheduled time. Omit for the
+    /// default closed-loop behavior. `--in-flight` still sizes the transport
+    /// queues, so set it high enough to hold `target_rps × latency` outstanding.
+    #[arg(long)]
+    target_rps: Option<u64>,
+
     #[arg(long, default_value = "build/certs/cert.pem")]
     cert: PathBuf,
 
@@ -120,6 +129,7 @@ impl Args {
             warmup: self.warmup,
             duration: self.duration,
             payload: self.payload,
+            target_rps: self.target_rps,
             cert: self.cert.clone(),
             key: self.key.clone(),
             report: self.report.clone(),
@@ -238,6 +248,7 @@ async fn run_echo_busy_client(args: &Args) -> Result<(), Box<dyn std::error::Err
         args.payload,
         args.warmup,
         args.duration,
+        args.target_rps,
         &args.report,
     )
     .await
@@ -263,6 +274,7 @@ async fn run_echo_park_client(args: &Args) -> Result<(), Box<dyn std::error::Err
         args.payload,
         args.warmup,
         args.duration,
+        args.target_rps,
         &args.report,
     )
     .await
@@ -410,6 +422,7 @@ async fn run_echo_bench(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 args.warmup,
                 args.duration,
                 args.threads,
+                args.target_rps,
                 &args.report,
             )
             .await
@@ -479,6 +492,7 @@ where
         args.duration,
         args.threads,
         transport_label,
+        args.target_rps,
         &args.report,
     )
     .await
