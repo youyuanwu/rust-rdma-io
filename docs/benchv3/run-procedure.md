@@ -254,6 +254,49 @@ read-ring busy-poll/park paths and the 8 KiB ring-sizing rule — so you do not 
 per-path runs. The lower-level launchers remain useful for one-off single coordinates; when using
 them, keep every cell on the fixed coordinates and hold duration/warmup constant.
 
+## Offered-load runs (open-loop)
+
+The [loaded-latency and matched-throughput scenarios](scenario-matrix.md#offered-load-scenarios-open-loop)
+add one coordinate axis — the **target request rate** — mapped to a single client flag:
+
+| Contract element | `rdma-bench-client` flag | `bench_run.yml` var |
+|---|---|---|
+| target offered rate (req/s) | `--target-rps N` | `bench_target_rps` |
+
+`--target-rps` is opt-in and applies to `echo` / `rh1` / `tcp1` only. When omitted, the client runs
+the default closed-loop saturation load and the result carries no `target_rps` field, so existing
+grid runs are unchanged. The rate is split evenly across `--connections`; size `--in-flight` (the
+transport queue capacity) by Little's law so it is not the limiter, e.g. `--in-flight 64` for a
+few-hundred-µs service latency at tens of thousands of req/s.
+
+Drive both scenarios through the primary runner:
+
+```
+# Loaded tail-latency: echo swept across sub-saturation rates (repeatable --rate).
+python3 tests/benchv3/run_matrix.py --vcpu 64 --loaded-latency \
+  --scenario echo --rate 100000 --rate 200000 --rate 400000 \
+  --payload 64 --reboot-between
+
+# Matched throughput: every echo transport at one shared rate.
+python3 tests/benchv3/run_matrix.py --vcpu 64 --matched-throughput \
+  --scenario echo --rate 200000 --payload 64 --reboot-between
+```
+
+Render the boards with `report.py`:
+
+```
+python3 tests/benchv3/report.py --loaded-latency --scenario echo --payload 64 \
+  --rate 100000 --rate 200000 --rate 400000 > loaded-latency-echo-64B.md
+python3 tests/benchv3/report.py --matched-throughput --scenario echo --payload 64 \
+  --rate 200000 > matched-throughput-echo-64B.md
+```
+
+A single raw coordinate (no runner) just adds `-e bench_target_rps=N` to the `bench_run.yml`
+invocation. Check the reported **achieved** rate against the target: within ±5% is a valid
+sub-saturation point; a bigger shortfall means the transport (or `--in-flight`) could not sustain
+the offered load. For HTTP/1.1 the achievable rate is capped at `connections / RTT` (one request in
+flight per connection), so an unreachable target simply plateaus below it.
+
 ## Teardown
 
 The VMs are yours to manage — stop or deallocate them when a sweep is done to avoid cost.

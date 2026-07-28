@@ -127,6 +127,43 @@ SKUs.
 
 ---
 
+## Offered-load boards (open-loop)
+
+For the [loaded-latency and matched-throughput scenarios](scenario-matrix.md#offered-load-scenarios-open-loop)
+(echo / HTTP-1.1 only), the swept axis is the **target request rate** and both boards share one
+shape. Every row reports the **target** vs the **achieved** rate and the full latency distribution;
+`report.py --loaded-latency` / `--matched-throughput` emit these verbatim.
+
+> **SKU:** `________` · **vCPU:** `__` · **scenario:** `echo` · **payload:** 64 B ·
+> **connections:** 1× vCPU · **load:** open-loop loaded-latency ·
+> **duration/warmup:** 10 s / 3 s · **git commit:** `________` · **date:** `________`
+
+**Loaded tail-latency** — rows are `(transport × target rate)`; sweep the rate below saturation:
+
+| transport | target rps | achieved rps | p50 (µs) | p99 (µs) | p99.9 (µs) | CPU/op (µs) | cores | errors |
+| --------- | ---------: | -----------: | -------: | -------: | ---------: | ----------: | ----: | -----: |
+| `send-recv` | 100000 |  |  |  |  |  |  |  |
+| `send-recv` | 200000 |  |  |  |  |  |  |  |
+| `read-ring` (arm-park) | 100000 |  |  |  |  |  |  |  |
+| … | … |  |  |  |  |  |  |  |
+| kernel baseline | 100000 |  |  |  |  |  |  |  |
+
+**Matched throughput** — one shared rate, one row per transport, compared on CPU cost at equal load:
+
+| transport | target rps | achieved rps | p50 (µs) | p99 (µs) | p99.9 (µs) | CPU/op (µs) | cores | errors |
+| --------- | ---------: | -----------: | -------: | -------: | ---------: | ----------: | ----: | -----: |
+| `send-recv` | 200000 |  |  |  |  |  |  |  |
+| `read-ring` (arm-park) | 200000 |  |  |  |  |  |  |  |
+| `credit-ring` | 200000 |  |  |  |  |  |  |  |
+| kernel baseline | 200000 |  |  |  |  |  |  |  |
+
+> An **achieved** rate within ±5% of **target** is a valid sub-saturation point; a larger shortfall
+> is a saturation signal (record it, don't discard the row). A cell a transport could not run is
+> `n/a`. The matched-throughput headline is **cores / CPU-per-op at equal delivered load**, not
+> throughput.
+
+---
+
 ## Narrative template
 
 For each published sweep, add a short write-up alongside the tables:

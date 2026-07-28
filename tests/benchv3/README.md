@@ -80,7 +80,16 @@ artifacts.**
 | `--playbook PATH` | Orchestration playbook driven per coordinate (default `tests/e2e/playbooks/bench_run.yml`). |
 | `--reboot-playbook PATH` | Playbook used by `--reboot-between` (default `tests/e2e/playbooks/reboot_vms.yml`). |
 | `--reboot-between` | Reboot the VMs at each sweep boundary (a change of `(scenario, transport-path)` group). |
+| `--loaded-latency` | Open-loop loaded tail-latency sweep: one `--scenario` (echo/http1) across `--rate` levels. |
+| `--matched-throughput` | Open-loop matched-throughput comparison: every transport path at one `--rate`. |
+| `--rate N` | Open-loop target request rate (req/s), repeatable for `--loaded-latency`. Maps to the client's `--target-rps` (`bench_target_rps`). |
 | `--dry-run` | List the planned coordinates and exit — run nothing. |
+
+The default closed-loop grid and the open-loop offered-load scenarios are mutually exclusive per
+invocation: pass `--loaded-latency` or `--matched-throughput` (with `--scenario` + `--rate`) to run
+the open-loop coordinates, or omit both for the fixed saturation grid. `report.py` mirrors this with
+its own `--loaded-latency` / `--matched-throughput` / `--rate` board renderers. See the
+[offered-load scenarios](../../docs/benchv3/scenario-matrix.md#offered-load-scenarios-open-loop).
 
 Defaults for the inventory/playbook/results paths are resolved relative to the repo root, so the
 tool works regardless of the caller's working directory.
