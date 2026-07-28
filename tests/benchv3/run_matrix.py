@@ -146,20 +146,26 @@ def plan_coordinates(args: argparse.Namespace) -> List[grid.Coordinate]:
             raise SystemExit("--loaded-latency / --matched-throughput require --rate")
         scenario = scenarios[0]
         mult = (args.connections_mult or [1])[0]
+        # Open-loop provisions one queue-capacity tier; forward the operator's
+        # --in-flight (Little's-law capacity) to the builders. http1 pins to 1.
+        in_flights = args.in_flight or [grid.DEFAULT_OPEN_LOOP_IN_FLIGHT]
+        if len(in_flights) != 1:
+            raise SystemExit("--loaded-latency / --matched-throughput take a single --in-flight")
+        in_flight = in_flights[0]
         payloads = args.payload or grid.PAYLOADS
         coords: List[grid.Coordinate] = []
         for payload in payloads:
             if args.loaded_latency:
                 coords += grid.expand_loaded_latency(
                     args.vcpu, scenario, rates, mult, payload,
-                    transports=args.path_labels,
+                    in_flight=in_flight, transports=args.path_labels,
                 )
             else:
                 if len(rates) != 1:
                     raise SystemExit("--matched-throughput takes exactly one --rate")
                 coords += grid.expand_matched_throughput(
                     args.vcpu, scenario, rates[0], mult, payload,
-                    transports=args.path_labels,
+                    in_flight=in_flight, transports=args.path_labels,
                 )
         return grid.dedupe(coords)
 

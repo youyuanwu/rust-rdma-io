@@ -199,6 +199,23 @@ class TestRunSweep(unittest.TestCase):
         self.assertTrue(all(c.target_rps is None for c in coords))
         self.assertNotIn("bench_target_rps", coords[0].bench_vars(10, 3))
 
+    def test_loaded_latency_forwards_in_flight_capacity(self):
+        args = run_matrix.build_parser().parse_args([
+            "--vcpu", "64", "--loaded-latency", "--scenario", "echo",
+            "--rate", "100000", "--payload", "64", "--in-flight", "256",
+        ])
+        coords = run_matrix.plan_coordinates(args)
+        self.assertTrue(coords)
+        self.assertTrue(all(c.in_flight == 256 for c in coords))
+
+    def test_loaded_latency_rejects_multiple_in_flight(self):
+        args = run_matrix.build_parser().parse_args([
+            "--vcpu", "64", "--loaded-latency", "--scenario", "echo",
+            "--rate", "100000", "--in-flight", "64", "--in-flight", "128",
+        ])
+        with self.assertRaises(SystemExit):
+            run_matrix.plan_coordinates(args)
+
 
 if __name__ == "__main__":
     unittest.main()

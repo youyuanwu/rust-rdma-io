@@ -173,6 +173,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
+    // `--target-rps` (open-loop) is only meaningful for the echo and HTTP/1.1
+    // clients; the gRPC (`rh2`/`rh3`/`tcp`) runners ignore it. Reject misuse
+    // up front rather than silently running closed-loop or emitting a
+    // zero-request result.
+    if let Some(rps) = args.target_rps {
+        const OPEN_LOOP_MODES: &[&str] = &[
+            "echo", "echo-busy", "echo-park", "rh1", "rh1-busy", "rh1-park", "tcp1",
+        ];
+        if rps == 0 {
+            eprintln!("--target-rps must be greater than 0");
+            std::process::exit(1);
+        }
+        if !OPEN_LOOP_MODES.contains(&args.mode.as_str()) {
+            eprintln!(
+                "--target-rps (open-loop) is only supported for echo / rh1 / tcp1 modes; \
+                 got --mode {} (gRPC paces itself internally)",
+                args.mode
+            );
+            std::process::exit(1);
+        }
+    }
+
     // Busy-poll (`--mode echo-busy`) has its own runtime topology: the data path
     // runs on the BusyPool's N pinned `current_thread` runtimes, so `main` uses
     // only a small single-threaded orchestration runtime (probe + awaiting the
