@@ -138,6 +138,8 @@ For development and testing without RDMA hardware, use one of the software provi
 
 Both scripts check for kernel modules, load them, create a device, and verify with `ibv_devices`.
 
+If the machine also exposes a hardware RDMA device on the same network interface (e.g. a Mellanox VF or an Azure MANA RDMA function on a cloud VM), `rdma_cm` may bind connections to that device instead of the software one, which breaks same-host tests. On a disposable machine, `sudo ./scripts/unload-hw-rdma.sh` unloads those hardware RDMA drivers (netdev drivers are left alone) so only siw/rxe remain.
+
 ## Build
 
 ```sh

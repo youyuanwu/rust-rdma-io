@@ -79,7 +79,7 @@ sudo bash -c 'ulimit -l unlimited && cargo test --features="cm raw"'
 
 **CI strategy — dual platform**:
 
-1. **GitHub Actions** (`ubuntu-latest`): Compile, clippy, and `cargo test` only. Does `sudo rmmod mlx5_ib` to unload the Mellanox driver (GitHub runners expose Mellanox VFs). Does **NOT** load rxe/siw — tests that run here are unit/compile tests that don't need a real RDMA device.
+1. **GitHub Actions** (`ubuntu-latest`): Compile, clippy, and `cargo test` only. Runs `sudo ./scripts/unload-hw-rdma.sh` before creating the software device: hosted runners can expose the host NIC's RDMA function (Mellanox VF `mlx5_ib`, Azure MANA `mana_ib` → `mana_0`/`manae_0`) on the same netdev, and `rdma_cm` would then bind test connections to that hardware device, where the same-host handshake fails with `EPROTO` on accept. Does **NOT** load rxe/siw — tests that run here are unit/compile tests that don't need a real RDMA device.
 
 2. **Cirrus CI** (Google Compute Engine, Rocky Linux 9): Full RDMA integration tests. Has full kernel access:
    - `rdma link add rxe_eth0 type rxe netdev eth0` — creates rxe device (Rocky Linux includes `rdma_rxe` by default)
