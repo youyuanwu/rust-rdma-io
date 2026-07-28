@@ -296,6 +296,7 @@ async fn run_rh1_busy_client(args: &Args) -> Result<(), Box<dyn std::error::Erro
         args.warmup,
         args.duration,
         &args.cert,
+        args.target_rps,
         &args.report,
     )
     .await
@@ -317,6 +318,7 @@ async fn run_rh1_park_client(args: &Args) -> Result<(), Box<dyn std::error::Erro
         args.warmup,
         args.duration,
         &args.cert,
+        args.target_rps,
         &args.report,
     )
     .await
