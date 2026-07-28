@@ -28,6 +28,26 @@ metric definitions are fixed by the [scenario matrix](../scenario-matrix.md) and
 | gRPC (rh2) | [grpc-64B.md](grpc-64B.md) | [grpc-8k.md](grpc-8k.md) |
 | HTTP/1.1 (rh1) | [http1-64B.md](http1-64B.md) | [http1-8k.md](http1-8k.md) |
 
+### Open-loop offered-load boards (64 B, 1× vCPU)
+
+The [loaded-latency and matched-throughput scenarios](../scenario-matrix.md#offered-load-scenarios-open-loop)
+run a fixed sub-saturation offered rate instead of saturation (git commit `2bbfd3d`):
+
+| Scenario | Loaded tail-latency | Matched throughput |
+|---|---|---|
+| echo | [loaded-latency-echo-64B.md](loaded-latency-echo-64B.md) | [matched-throughput-echo-64B.md](matched-throughput-echo-64B.md) |
+| HTTP/1.1 | [loaded-latency-http1-64B.md](loaded-latency-http1-64B.md) | [matched-throughput-http1-64B.md](matched-throughput-http1-64B.md) |
+
+**What they show.** At a **matched 250k req/s** echo load, the RDMA arm-park transports hold p50
+≈ 600–740 µs vs the kernel baseline's ≈ 920 µs, at comparable-or-lower CPU/op; read-ring **busy-poll**
+gives the lowest p50 (≈ 500 µs) but pins all 64 cores. In the **loaded-latency** sweeps,
+`send-recv` / `read-ring` (arm-park) track the target cleanly up to ~2M req/s with a flat ~400–500 µs
+p50, while `credit-ring` and the **thread-per-core park** topology reach a ceiling (achieved falls
+below target and the tail blows up). HTTP/1.1's rate is bounded by `connections / RTT`; its
+read-ring **busy-poll** path breaks above ~50k (errors / zero throughput) and the read-ring
+**arm-park** path wedges RDMA-CM at some mid-range rates (`n/a`) — the same MANA ring-CM flakiness
+seen in the closed-loop grid. `errors > 0` cells remain suspect (see below).
+
 ## Coverage & caveats (read before citing)
 
 This is a **partial dataset**, not the full grid. Coverage is uneven because of real
