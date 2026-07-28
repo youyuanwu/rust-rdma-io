@@ -179,7 +179,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // zero-request result.
     if let Some(rps) = args.target_rps {
         const OPEN_LOOP_MODES: &[&str] = &[
-            "echo", "echo-busy", "echo-park", "rh1", "rh1-busy", "rh1-park", "tcp1",
+            "echo",
+            "echo-busy",
+            "echo-park",
+            "rh1",
+            "rh1-busy",
+            "rh1-park",
+            "tcp1",
         ];
         if rps == 0 {
             eprintln!("--target-rps must be greater than 0");
