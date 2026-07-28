@@ -98,6 +98,26 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Reboot the VMs at each sweep boundary (change of transport-path group).",
     )
+    # Open-loop offered-load scenarios (echo / http1 only). When either is set the
+    # default closed-loop grid is replaced by the corresponding coordinate set.
+    p.add_argument(
+        "--loaded-latency",
+        action="store_true",
+        help="Loaded tail-latency sweep: run one scenario across --rate levels at a "
+        "fixed connection tier (requires --scenario echo|http1 and one or more --rate).",
+    )
+    p.add_argument(
+        "--matched-throughput",
+        action="store_true",
+        help="Matched-throughput comparison: run every transport path at one shared "
+        "--rate (requires --scenario echo|http1 and exactly one --rate).",
+    )
+    p.add_argument(
+        "--rate",
+        action="append",
+        type=int,
+        help="Open-loop target request rate(s) in req/s (repeatable for --loaded-latency).",
+    )
     p.add_argument(
         "--dry-run",
         action="store_true",
@@ -107,7 +127,42 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def plan_coordinates(args: argparse.Namespace) -> List[grid.Coordinate]:
-    """Expand the grid with the CLI's subset filters applied (deduplicated)."""
+    """Expand the grid with the CLI's subset filters applied (deduplicated).
+
+    ``--loaded-latency`` / ``--matched-throughput`` select the open-loop
+    offered-load coordinate sets instead of the default closed-loop grid.
+    """
+    if getattr(args, "loaded_latency", False) or getattr(args, "matched_throughput", False):
+        if getattr(args, "loaded_latency", False) and getattr(args, "matched_throughput", False):
+            raise SystemExit("use only one of --loaded-latency / --matched-throughput")
+        scenarios = args.scenario or []
+        if len(scenarios) != 1 or scenarios[0] not in grid.LOADED_LATENCY_SCENARIOS:
+            raise SystemExit(
+                "--loaded-latency / --matched-throughput require exactly one "
+                f"--scenario from {grid.LOADED_LATENCY_SCENARIOS}"
+            )
+        rates = args.rate or []
+        if not rates:
+            raise SystemExit("--loaded-latency / --matched-throughput require --rate")
+        scenario = scenarios[0]
+        mult = (args.connections_mult or [1])[0]
+        payloads = args.payload or grid.PAYLOADS
+        coords: List[grid.Coordinate] = []
+        for payload in payloads:
+            if args.loaded_latency:
+                coords += grid.expand_loaded_latency(
+                    args.vcpu, scenario, rates, mult, payload,
+                    transports=args.path_labels,
+                )
+            else:
+                if len(rates) != 1:
+                    raise SystemExit("--matched-throughput takes exactly one --rate")
+                coords += grid.expand_matched_throughput(
+                    args.vcpu, scenario, rates[0], mult, payload,
+                    transports=args.path_labels,
+                )
+        return grid.dedupe(coords)
+
     coords = grid.expand(
         vcpu=args.vcpu,
         scenarios=args.scenario or grid.SCENARIOS,
@@ -121,11 +176,12 @@ def plan_coordinates(args: argparse.Namespace) -> List[grid.Coordinate]:
 
 def format_coordinate(c: grid.Coordinate) -> str:
     ring = f" ring_max_msg={c.ring_max_msg}" if c.ring_max_msg is not None else ""
+    rps = f" target_rps={c.target_rps}" if c.target_rps is not None else ""
     return (
         f"{c.scenario:5s}  {c.path_label:34s}  "
         f"mode={c.mode:9s} transport={c.transport:11s} "
         f"conn={c.connections:<6d} thr={c.threads:<4d} "
-        f"if={c.in_flight:<4d} payload={c.payload}B{ring}"
+        f"if={c.in_flight:<4d} payload={c.payload}B{ring}{rps}"
     )
 
 
@@ -313,6 +369,7 @@ def _write_meta(
         "in_flight": coord.in_flight,
         "payload": coord.payload,
         "ring_max_msg": coord.ring_max_msg,
+        "target_rps": coord.target_rps,
         "duration": duration,
         "warmup": warmup,
         "vcpu": vcpu,

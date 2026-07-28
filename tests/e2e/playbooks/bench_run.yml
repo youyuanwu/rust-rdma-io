@@ -66,6 +66,7 @@
           --payload "{{ bench_payload | default(64) }}" \
           --ring-max-msg "{{ bench_ring_max_msg | default(1500) }}" \
           --ring-queue-depth "{{ bench_ring_queue_depth | default(0) }}" \
+          {{ ('--target-rps ' ~ bench_target_rps) if (bench_target_rps is defined) else '' }} \
           --cert ~/certs/cert.pem \
           --key ~/certs/key.pem \
           --report json

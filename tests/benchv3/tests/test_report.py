@@ -260,5 +260,69 @@ class TestReport(unittest.TestCase):
         self.assertEqual(len(report.load_records(self.tmp)), 2)
 
 
+    # --- open-loop offered-load boards ---
+
+    def _write_open_loop(self, name, transport, mode, target_rps, rps, mult=1,
+                         payload=64, in_flight=64, scenario="echo", errors=0):
+        conns = mult * 64
+        d = _result(mode, transport, conns, 64, in_flight, payload, rps=rps, errors=errors)
+        d["target_rps"] = float(target_rps)
+        m = _meta(scenario, grid.path_label(mode, transport) or transport,
+                  mode, transport, mult, conns, 64, in_flight, payload)
+        m["target_rps"] = target_rps
+        self._write(name, d, m)
+
+    def test_loaded_latency_header_and_rows(self):
+        rates = [100000, 200000]
+        # seed send-recv at both rates
+        self._write_open_loop("ll-sr-1", "send-recv", "echo", 100000, 99000.0)
+        self._write_open_loop("ll-sr-2", "send-recv", "echo", 200000, 198000.0)
+        recs = report.load_records(self.tmp)
+        out = report.render_loaded_latency(recs, "echo", 64, 1, rates)
+        self.assertIn(report.OPEN_LOOP_HEADER, out)
+        self.assertIn("target rps", out)
+        self.assertIn("achieved rps", out)
+        self.assertIn("p99.9", out)
+        # one row per (echo path × rate)
+        data_rows = [ln for ln in out.splitlines() if ln.startswith("| `")
+                     or ln.startswith("| kernel")]
+        self.assertEqual(len(data_rows), len(grid.paths_for("echo")) * len(rates))
+        # the send-recv rows show target + achieved
+        sr = [ln for ln in out.splitlines() if ln.startswith("| `send-recv`")]
+        self.assertTrue(any("100000" in ln and "99000" in ln for ln in sr))
+
+    def test_matched_throughput_full_distribution(self):
+        # all transports at one rate; a missing transport degrades to n/a.
+        self._write_open_loop("mt-sr", "send-recv", "echo", 150000, 149000.0)
+        recs = report.load_records(self.tmp)
+        out = report.render_matched_throughput(recs, "echo", 64, 1, 150000)
+        self.assertIn(report.OPEN_LOOP_HEADER, out)
+        # one row per echo path (single rate)
+        data_rows = [ln for ln in out.splitlines() if ln.startswith("| `")
+                     or ln.startswith("| kernel")]
+        self.assertEqual(len(data_rows), len(grid.paths_for("echo")))
+        # send-recv row carries the achieved rate; unseeded paths are n/a
+        sr = [ln for ln in out.splitlines() if ln.startswith("| `send-recv`")][0]
+        self.assertIn("149000", sr)
+        cr = [ln for ln in out.splitlines() if ln.startswith("| `credit-ring`")][0]
+        self.assertIn("`n/a`", cr)
+
+    def test_cli_loaded_latency_exit_zero(self):
+        self._write_open_loop("ll", "send-recv", "echo", 100000, 99000.0)
+        rc = report.main([
+            "--results-dir", self.tmp, "--loaded-latency",
+            "--scenario", "echo", "--payload", "64", "--rate", "100000",
+        ])
+        self.assertEqual(rc, 0)
+
+    def test_cli_matched_throughput_rejects_multiple_rates(self):
+        rc = report.main([
+            "--results-dir", self.tmp, "--matched-throughput",
+            "--scenario", "echo", "--payload", "64",
+            "--rate", "100000", "--rate", "200000",
+        ])
+        self.assertEqual(rc, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

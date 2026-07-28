@@ -162,6 +162,43 @@ class TestRunSweep(unittest.TestCase):
         coords = run_matrix.plan_coordinates(args)
         self.assertEqual(len(coords), 1)  # not 2
 
+    def test_loaded_latency_plan_carries_target_rps(self):
+        args = run_matrix.build_parser().parse_args([
+            "--vcpu", "64", "--loaded-latency", "--scenario", "echo",
+            "--rate", "100000", "--rate", "200000", "--payload", "64",
+        ])
+        coords = run_matrix.plan_coordinates(args)
+        self.assertTrue(coords)
+        self.assertEqual({c.target_rps for c in coords}, {100000, 200000})
+        # bench_vars carry bench_target_rps for these coords.
+        v = coords[0].bench_vars(duration=10, warmup=3)
+        self.assertIn("bench_target_rps", v)
+
+    def test_matched_throughput_plan_one_rate(self):
+        args = run_matrix.build_parser().parse_args([
+            "--vcpu", "64", "--matched-throughput", "--scenario", "echo",
+            "--rate", "150000", "--payload", "64",
+        ])
+        coords = run_matrix.plan_coordinates(args)
+        self.assertEqual({c.target_rps for c in coords}, {150000})
+
+    def test_loaded_latency_requires_supported_scenario(self):
+        args = run_matrix.build_parser().parse_args([
+            "--vcpu", "64", "--loaded-latency", "--scenario", "grpc",
+            "--rate", "100000",
+        ])
+        with self.assertRaises(SystemExit):
+            run_matrix.plan_coordinates(args)
+
+    def test_closed_loop_plan_omits_target_rps(self):
+        args = run_matrix.build_parser().parse_args([
+            "--vcpu", "64", "--scenario", "echo", "--connections-mult", "1",
+            "--in-flight", "1", "--payload", "64",
+        ])
+        coords = run_matrix.plan_coordinates(args)
+        self.assertTrue(all(c.target_rps is None for c in coords))
+        self.assertNotIn("bench_target_rps", coords[0].bench_vars(10, 3))
+
 
 if __name__ == "__main__":
     unittest.main()
