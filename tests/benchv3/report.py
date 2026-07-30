@@ -372,10 +372,15 @@ def _open_loop_cells(rec: Optional[Record], target_rps: int) -> List[str]:
 
 def _open_loop_caption(recs: Sequence[Record], scenario: str, payload: int, mult: int, kind: str) -> str:
     prov = _caption_provenance(recs)
+    # In open-loop, in-flight is the fixed queue-capacity cap (not a swept axis),
+    # so it belongs in the caption. All records for one board share it.
+    inflights = {r.in_flight for r in recs if r.in_flight}
+    inflight = str(next(iter(inflights))) if len(inflights) == 1 else "`__`"
     return (
         f"> **SKU:** `________` · **vCPU:** {prov['vcpu']} · "
         f"**scenario:** {_SCENARIO_TITLE.get(scenario, scenario)} · "
         f"**payload:** {_payload_str(payload)} · **connections:** {mult}× vCPU · "
+        f"**in-flight (capacity):** {inflight} · "
         f"**load:** open-loop {kind} · "
         f"**duration/warmup:** {prov['duration']} s / {prov['warmup']} s · "
         f"**git commit:** {prov['commit']} · **date:** {prov['date']}"

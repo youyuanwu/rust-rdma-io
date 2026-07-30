@@ -2,7 +2,7 @@
 
 HTTP/1.1 at 8 KiB (one request per connection; ring paths use ring_max_msg=9216 for framing+TLS). 1× vCPU / 64 conn.
 
-> **SKU:** `Standard_E64bs_v6` (uksouth) · **vCPU:** 64 · **scenario:** HTTP/1.1 · **payload:** 8 KiB · **connections:** 1× vCPU · **load:** open-loop loaded-latency · **duration/warmup:** 10 s / 3 s · **git commit:** `2bbfd3d` · **date:** `20260728T214756Z`
+> **SKU:** `Standard_E64bs_v6` (uksouth) · **vCPU:** 64 · **scenario:** HTTP/1.1 · **payload:** 8 KiB · **connections:** 1× vCPU · **in-flight (capacity):** 1 · **load:** open-loop loaded-latency · **duration/warmup:** 10 s / 3 s · **git commit:** `2bbfd3d` · **date:** `20260728T214756Z`
 
 | transport | target rps | achieved rps | p50 (µs) | p99 (µs) | p99.9 (µs) | CPU/op (µs) | cores | errors |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |

@@ -2,7 +2,7 @@
 
 Bandwidth-bound regime: achieved-vs-target rate and p50/p99/p99.9 as the offered rate rises (1× vCPU / 64 conn). Ring transports use ring_max_msg=8192 (echo). See the [scenario matrix](../scenario-matrix.md#offered-load-scenarios-open-loop).
 
-> **SKU:** `Standard_E64bs_v6` (uksouth) · **vCPU:** 64 · **scenario:** echo · **payload:** 8 KiB · **connections:** 1× vCPU · **load:** open-loop loaded-latency · **duration/warmup:** 10 s / 3 s · **git commit:** `2bbfd3d` · **date:** `20260728T210035Z`
+> **SKU:** `Standard_E64bs_v6` (uksouth) · **vCPU:** 64 · **scenario:** echo · **payload:** 8 KiB · **connections:** 1× vCPU · **in-flight (capacity):** 64 · **load:** open-loop loaded-latency · **duration/warmup:** 10 s / 3 s · **git commit:** `2bbfd3d` · **date:** `20260728T210035Z`
 
 | transport | target rps | achieved rps | p50 (µs) | p99 (µs) | p99.9 (µs) | CPU/op (µs) | cores | errors |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
