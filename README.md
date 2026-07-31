@@ -133,8 +133,8 @@ For development and testing without RDMA hardware, use one of the software provi
 
 | Provider | Type | Script | Notes |
 |---|---|---|---|
-| **siw** (Soft-iWARP) | iWARP | `sudo ./scripts/setup-siw.sh` | Recommended for testing; works on any Linux |
-| **rxe** (Soft-RoCE) | InfiniBand/RoCE | `sudo ./scripts/setup-rxe.sh` | Supports atomics and Write+Imm; can build from source via `just build-rxe` |
+| **[siw](https://github.com/torvalds/linux/tree/master/drivers/infiniband/sw/siw)** (Soft-iWARP) | iWARP | `sudo ./scripts/setup-siw.sh` | Recommended for testing; works on any Linux |
+| **[rxe](https://github.com/torvalds/linux/tree/master/drivers/infiniband/sw/rxe)** (Soft-RoCE) | InfiniBand/RoCE | `sudo ./scripts/setup-rxe.sh` | Supports atomics and Write+Imm; can build from source via `just build-rxe` |
 
 Both scripts check for kernel modules, load them, create a device, and verify with `ibv_devices`.
 

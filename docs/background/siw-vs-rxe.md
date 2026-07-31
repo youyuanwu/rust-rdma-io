@@ -82,3 +82,8 @@ ibv_devices
 - **Local development / CI**: siw is simpler — just `modprobe siw` and it works. Fewer timing surprises.
 - **CI robustness testing**: rxe exercises more IB-like behavior (completion batching, atomics, immediate data). Catches bugs that siw's TCP reliability masks.
 - **Production**: Neither — use hardware RDMA (ConnectX, etc.). These software providers are for development and testing only.
+
+## External references
+
+- **siw (Soft-iWARP)** — mainline kernel driver: [`drivers/infiniband/sw/siw`](https://github.com/torvalds/linux/tree/master/drivers/infiniband/sw/siw).
+- **rxe (Soft-RoCE)** — mainline kernel driver: [`drivers/infiniband/sw/rxe`](https://github.com/torvalds/linux/tree/master/drivers/infiniband/sw/rxe); setup HOWTO: [rdma-core `Documentation/rxe.md`](https://github.com/linux-rdma/rdma-core/blob/master/Documentation/rxe.md); [`rxe(7)` man page](https://man7.org/linux/man-pages/man7/rxe.7.html).
