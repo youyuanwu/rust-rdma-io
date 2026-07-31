@@ -286,6 +286,16 @@ touches the kernel:
    the only path that needs the fd and the only one that enters the kernel; (1)
    and (2) avoid it, trading a **busy-spun core** for latency.
 
+   **The interrupt never writes the CQE.** In *all three* cases the NIC itself
+   **DMAs the CQE straight into the CQ ring in host memory** — the CPU is passive
+   during that write. Arming (case 3) changes only *notification*: after the NIC
+   has already DMA'd the CQE, it *additionally* raises the MSI-X interrupt, whose
+   sole job is to **wake a parked CPU** so it can run `ibv_poll_cq` and read the
+   CQE the NIC placed there. So the ordering is always **NIC DMAs CQE → (opt-in)
+   interrupt wakes the CPU → CPU polls the ring**; the interrupt is a doorbell,
+   not the producer of the CQE. Busy-poll (cases 1–2) simply skips the interrupt
+   and discovers the same DMA'd CQE by spinning on the ring's ownership bit.
+
 ### Doing (1) correctly — the ordering trap
 
 RDMA does **not** guarantee byte-order *within* a single Write, so you cannot
