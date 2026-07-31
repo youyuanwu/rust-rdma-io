@@ -140,6 +140,8 @@ Both scripts check for kernel modules, load them, create a device, and verify wi
 
 If the machine also exposes a hardware RDMA device on the same network interface (e.g. a Mellanox VF or an Azure MANA RDMA function on a cloud VM), `rdma_cm` may bind connections to that device instead of the software one, which breaks same-host tests. On a disposable machine, `sudo ./scripts/unload-hw-rdma.sh` unloads those hardware RDMA drivers (netdev drivers are left alone) so only siw/rxe remain.
 
+> On Azure, in-guest RDMA over the MANA NIC is provided by **Guest RDMA for Azure Boost** (preview) — see [Announcing Preview of Guest RDMA for Azure Boost](https://techcommunity.microsoft.com/blog/azurecompute/announcing-preview-of-guest-rdma-for-azure-boost/4524589). This is the fabric the [Azure MANA RoCEv2 benchmarks](docs/bench/azure-mana-rocev2/README.md) run on.
+
 ## Build
 
 ```sh
