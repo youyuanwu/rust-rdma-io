@@ -357,6 +357,35 @@ cannot spin a core per connection). So:
   only when a connection goes idle. That is exactly the drain-after-arm hybrid in
   [async_cq.rs](../../rdma-io/src/async_cq.rs) this library uses.
 
+**Where the CPU actually goes in busy-poll.** A useful way to read the split: in
+busy-poll the **NIC/RDMA engine itself consumes no CPU at all** — moving the
+bytes (DMA into the registered ring), consuming the recv WR, and writing the CQE
+into the CQ ring are all done by the NIC's DMA engines over PCIe, with no CPU
+cycles, no interrupt, and no kernel. The **only** CPU cost on the completion path
+is your **userspace poll loop**: `ibv_poll_cq` is just a memory load checking the
+next CQE slot's ownership bit, and spinning that loop is what burns the 100 % core
+— it does so **whether or not traffic is flowing**, because it spins on an empty
+ring while idle. Two caveats keep this honest:
+
+- **It is a whole core, busy or idle.** Busy-poll trades a fixed dedicated core
+  for latency (userspace poll in **ns** instead of the arm-park interrupt + epoll
+  wakeup in **µs**). This is why in the benchmarks busy-poll lights every core
+  regardless of the offered rate.
+- **"Only the poll uses CPU" covers completion *discovery*, not the whole
+  message.** After the poll reaps the CQE, the CPU still runs your code to
+  *process* it, and for **Send/Recv or Write+Imm** the receive path still pays a
+  **CPU copy** out of the recv buffer into the application (see
+  [DataPathCopies.md](../design/DataPathCopies.md)). The ring transports keep the
+  *bulk data* zero-copy (it lands in the ring via the NIC's Write), so their
+  per-message CPU is essentially the poll + framing, not a data copy.
+
+Arm-park differs only in *notification*, not in who moves the data: the NIC still
+DMAs the CQE for free, but then raises an interrupt → kernel ISR → epoll → task
+wakeup, adding **kernel + interrupt CPU per wakeup** in exchange for letting the
+core sleep when idle. In **both** modes the NIC is CPU-free; they differ only in
+how the CPU *learns* a completion exists — spin (one dedicated core) vs interrupt
+(kernel wakeup per event).
+
 ## How this library's transports map to the mechanisms
 
 All three implement the same `Transport` trait and plug into `AsyncRdmaStream`
