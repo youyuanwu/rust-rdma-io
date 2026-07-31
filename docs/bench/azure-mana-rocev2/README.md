@@ -6,6 +6,9 @@ here. Shared strategy / methodology / metrics live one level up
 ([strategy](../strategy.md) · [methodology](../methodology.md) ·
 [metrics](../metrics.md)).
 
+> RDMA from inside the guest is enabled by **Guest RDMA for Azure Boost**
+> (preview): [Announcing Preview of Guest RDMA for Azure Boost](https://techcommunity.microsoft.com/blog/azurecompute/announcing-preview-of-guest-rdma-for-azure-boost/4524589).
+
 ## Environment definition
 
 | Field | Value |
