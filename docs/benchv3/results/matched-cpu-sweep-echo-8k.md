@@ -12,11 +12,18 @@ peak-finding only** (`../../bench/azure-mana-rocev2/echo/large-payload-8kib.md`)
 | target rps | transport | achieved rps | p50 (µs) | p99 (µs) | CPU/op (µs) | cores | Gbps | errors | vs TCP cores |
 | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 | 60,000 | `read-ring` (arm-park) | 60005 | 915.0 | 2271.0 | 12.78 | 0.77 | 3.9 | 0 | **0.71×** (−29%) |
+| 60,000 | `read-ring` (busy-poll)† | 60000 | 545.0 | 1036.0 | 1063.0 | 63.78 | 3.9 | 0 | tail champion, 64 cores |
 | 60,000 | kernel baseline | 60000 | 1031.0 | 2195.0 | 17.95 | 1.08 | 3.9 | 9 | baseline |
 | 100,000 | `read-ring` (arm-park) | 99992 | 767.0 | 1692.0 | 11.11 | 1.11 | 6.6 | 0 | **0.71×** (−29%) |
+| 100,000 | `read-ring` (busy-poll)† | 100000 | 504.0 | 997.0 | 637.9 | 63.79 | 6.6 | 0 | tail champion, 64 cores |
 | 100,000 | kernel baseline | 100000 | 993.0 | 1921.0 | 15.68 | 1.57 | 6.6 | 0 | baseline |
 | 120,000 | `read-ring` (arm-park) | 119992 | 790.0 | 1696.0 | 10.51 | 1.26 | 7.9 | 0 | **0.72×** (−28%) |
+| 120,000 | `read-ring` (busy-poll)† | 120000 | 508.0 | 996.0 | 531.6 | 63.79 | 7.9 | 0 | tail champion, 64 cores |
 | 120,000 | kernel baseline | 119994 | 986.0 | 1950.0 | 14.48 | 1.74 | 7.9 | 0 | baseline |
+
+† `read-ring` busy-poll spins one core per connection, so it pins all 64 cores at any rate — its
+`cores` / CPU/op columns are not comparable to arm-park / TCP. It IS the tail champion here too:
+p99 flat ~1000 µs (well under arm-park ~1700-2271 and TCP ~1921-2195), p50 ~500-545 µs.
 
 ## Reading it
 
