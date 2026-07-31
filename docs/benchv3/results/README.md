@@ -40,6 +40,11 @@ run a fixed sub-saturation offered rate instead of saturation (git commit `2bbfd
 | HTTP/1.1 · 64 B | [loaded-latency-http1-64B.md](loaded-latency-http1-64B.md) | [matched-throughput-http1-64B.md](matched-throughput-http1-64B.md) |
 | HTTP/1.1 · 8 KiB | [loaded-latency-http1-8k.md](loaded-latency-http1-8k.md) | [matched-throughput-http1-8k.md](matched-throughput-http1-8k.md) |
 
+**Matched-throughput CPU sweep (deep pipeline):**
+[matched-cpu-sweep-echo-64B.md](matched-cpu-sweep-echo-64B.md) — read-ring vs kernel TCP at 1M / 2M /
+3M req/s (64 conn / in-flight 512). Shows the iso-throughput CPU-efficiency gap growing with load
+(read-ring −13% cores at 1M → ~47% / nearly 2× at 3M).
+
 **What they show.** At a **matched 250k req/s** echo 64 B load, the RDMA arm-park transports hold p50
 ≈ 600–740 µs vs the kernel baseline's ≈ 920 µs, at comparable-or-lower CPU/op; read-ring **busy-poll**
 gives the lowest p50 (≈ 500 µs) but pins all 64 cores. In the **loaded-latency** sweeps,
