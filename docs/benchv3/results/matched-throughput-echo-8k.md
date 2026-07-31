@@ -2,7 +2,7 @@
 
 CPU cost and latency of every transport at one shared 150k req/s offered load (1× vCPU / 64 conn, 8 KiB ≈ 9.8 Gbps).
 
-> **SKU:** `Standard_E64bs_v6` (uksouth) · **vCPU:** 64 · **scenario:** echo · **payload:** 8 KiB · **connections:** 1× vCPU · **load:** open-loop matched-throughput · **duration/warmup:** 10 s / 3 s · **git commit:** `2bbfd3d` · **date:** `20260728T211843Z`
+> **SKU:** `Standard_E64bs_v6` (uksouth) · **vCPU:** 64 · **scenario:** echo · **payload:** 8 KiB · **connections:** 1× vCPU · **in-flight (capacity):** 64 · **load:** open-loop matched-throughput · **duration/warmup:** 10 s / 3 s · **git commit:** `2bbfd3d` · **date:** `20260728T211843Z`
 
 | transport | target rps | achieved rps | p50 (µs) | p99 (µs) | p99.9 (µs) | CPU/op (µs) | cores | errors |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |

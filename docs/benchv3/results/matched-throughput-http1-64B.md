@@ -2,7 +2,7 @@
 
 Every HTTP/1.1 transport at one shared 100k req/s offered load (1× vCPU / 64 conn).
 
-> **SKU:** `Standard_E64bs_v6` (uksouth) · **vCPU:** 64 · **scenario:** HTTP/1.1 · **payload:** 64 B · **connections:** 1× vCPU · **load:** open-loop matched-throughput · **duration/warmup:** 10 s / 3 s · **git commit:** `2bbfd3d` · **date:** `20260728T192015Z`
+> **SKU:** `Standard_E64bs_v6` (uksouth) · **vCPU:** 64 · **scenario:** HTTP/1.1 · **payload:** 64 B · **connections:** 1× vCPU · **in-flight (capacity):** 1 · **load:** open-loop matched-throughput · **duration/warmup:** 10 s / 3 s · **git commit:** `2bbfd3d` · **date:** `20260728T192015Z`
 
 | transport | target rps | achieved rps | p50 (µs) | p99 (µs) | p99.9 (µs) | CPU/op (µs) | cores | errors |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
