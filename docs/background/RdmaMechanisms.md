@@ -286,6 +286,16 @@ touches the kernel:
    the only path that needs the fd and the only one that enters the kernel; (1)
    and (2) avoid it, trading a **busy-spun core** for latency.
 
+   **The interrupt never writes the CQE.** In *all three* cases the NIC itself
+   **DMAs the CQE straight into the CQ ring in host memory** — the CPU is passive
+   during that write. Arming (case 3) changes only *notification*: after the NIC
+   has already DMA'd the CQE, it *additionally* raises the MSI-X interrupt, whose
+   sole job is to **wake a parked CPU** so it can run `ibv_poll_cq` and read the
+   CQE the NIC placed there. So the ordering is always **NIC DMAs CQE → (opt-in)
+   interrupt wakes the CPU → CPU polls the ring**; the interrupt is a doorbell,
+   not the producer of the CQE. Busy-poll (cases 1–2) simply skips the interrupt
+   and discovers the same DMA'd CQE by spinning on the ring's ownership bit.
+
 ### Doing (1) correctly — the ordering trap
 
 RDMA does **not** guarantee byte-order *within* a single Write, so you cannot
@@ -346,6 +356,35 @@ cannot spin a core per connection). So:
   fallback** — kernel-bypass while completions flow, and 0 CPU (a kernel wakeup)
   only when a connection goes idle. That is exactly the drain-after-arm hybrid in
   [async_cq.rs](../../rdma-io/src/async_cq.rs) this library uses.
+
+**Where the CPU actually goes in busy-poll.** A useful way to read the split: in
+busy-poll the **NIC/RDMA engine itself consumes no CPU at all** — moving the
+bytes (DMA into the registered ring), consuming the recv WR, and writing the CQE
+into the CQ ring are all done by the NIC's DMA engines over PCIe, with no CPU
+cycles, no interrupt, and no kernel. The **only** CPU cost on the completion path
+is your **userspace poll loop**: `ibv_poll_cq` is just a memory load checking the
+next CQE slot's ownership bit, and spinning that loop is what burns the 100 % core
+— it does so **whether or not traffic is flowing**, because it spins on an empty
+ring while idle. Two caveats keep this honest:
+
+- **It is a whole core, busy or idle.** Busy-poll trades a fixed dedicated core
+  for latency (userspace poll in **ns** instead of the arm-park interrupt + epoll
+  wakeup in **µs**). This is why in the benchmarks busy-poll lights every core
+  regardless of the offered rate.
+- **"Only the poll uses CPU" covers completion *discovery*, not the whole
+  message.** After the poll reaps the CQE, the CPU still runs your code to
+  *process* it, and for **Send/Recv or Write+Imm** the receive path still pays a
+  **CPU copy** out of the recv buffer into the application (see
+  [DataPathCopies.md](../design/DataPathCopies.md)). The ring transports keep the
+  *bulk data* zero-copy (it lands in the ring via the NIC's Write), so their
+  per-message CPU is essentially the poll + framing, not a data copy.
+
+Arm-park differs only in *notification*, not in who moves the data: the NIC still
+DMAs the CQE for free, but then raises an interrupt → kernel ISR → epoll → task
+wakeup, adding **kernel + interrupt CPU per wakeup** in exchange for letting the
+core sleep when idle. In **both** modes the NIC is CPU-free; they differ only in
+how the CPU *learns* a completion exists — spin (one dedicated core) vs interrupt
+(kernel wakeup per event).
 
 ## How this library's transports map to the mechanisms
 

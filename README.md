@@ -133,12 +133,14 @@ For development and testing without RDMA hardware, use one of the software provi
 
 | Provider | Type | Script | Notes |
 |---|---|---|---|
-| **siw** (Soft-iWARP) | iWARP | `sudo ./scripts/setup-siw.sh` | Recommended for testing; works on any Linux |
-| **rxe** (Soft-RoCE) | InfiniBand/RoCE | `sudo ./scripts/setup-rxe.sh` | Supports atomics and Write+Imm; can build from source via `just build-rxe` |
+| **[siw](https://github.com/torvalds/linux/tree/master/drivers/infiniband/sw/siw)** (Soft-iWARP) | iWARP | `sudo ./scripts/setup-siw.sh` | Recommended for testing; works on any Linux |
+| **[rxe](https://github.com/torvalds/linux/tree/master/drivers/infiniband/sw/rxe)** (Soft-RoCE) | InfiniBand/RoCE | `sudo ./scripts/setup-rxe.sh` | Supports atomics and Write+Imm; can build from source via `just build-rxe` |
 
 Both scripts check for kernel modules, load them, create a device, and verify with `ibv_devices`.
 
 If the machine also exposes a hardware RDMA device on the same network interface (e.g. a Mellanox VF or an Azure MANA RDMA function on a cloud VM), `rdma_cm` may bind connections to that device instead of the software one, which breaks same-host tests. On a disposable machine, `sudo ./scripts/unload-hw-rdma.sh` unloads those hardware RDMA drivers (netdev drivers are left alone) so only siw/rxe remain.
+
+> On Azure, in-guest RDMA over the MANA NIC is provided by **Guest RDMA for Azure Boost** (preview) — see [Announcing Preview of Guest RDMA for Azure Boost](https://techcommunity.microsoft.com/blog/azurecompute/announcing-preview-of-guest-rdma-for-azure-boost/4524589). This is the fabric the [Azure MANA RoCEv2 benchmarks](docs/bench/azure-mana-rocev2/README.md) run on.
 
 ## Build
 
