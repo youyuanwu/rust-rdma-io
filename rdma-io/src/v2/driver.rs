@@ -215,13 +215,21 @@ impl PollingCqDriver {
     /// and yields cooperatively. Exits when `handle.shutdown()` is called.
     pub async fn run(self) -> super::error::Result<()> {
         let mut wc_buf = vec![WorkCompletion::default(); self.poll_budget];
+        let mut drained_this_round = 0usize;
 
         while !self.handle.is_shutdown() {
             let n = self.cq.poll(&mut wc_buf)?;
             if n > 0 {
                 self.dispatch(&wc_buf[..n]);
+                drained_this_round += n;
+                // Yield after draining budget to stay cooperative
+                if drained_this_round >= self.poll_budget {
+                    drained_this_round = 0;
+                    tokio::task::yield_now().await;
+                }
             } else {
                 // No completions — yield to runtime
+                drained_this_round = 0;
                 tokio::task::yield_now().await;
             }
         }

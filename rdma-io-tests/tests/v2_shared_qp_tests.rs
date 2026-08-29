@@ -3,6 +3,8 @@
 //! Tests the compio/tokio-uring-style per-operation future API with
 //! real RDMA operations on RXE.
 
+use std::sync::Arc;
+
 use rdma_io::cm::ConnParam;
 use rdma_io::v2::*;
 use rdma_io::wc::WcOpcode;
@@ -56,8 +58,8 @@ async fn test_shared_qp_send_recv_fd() {
         let _recv_task = tokio::spawn(recv_driver.run_tokio());
 
         // Use recv handle for recv ops
-        let sqp = SharedQp::new(qp, recv_handle, pd);
-        (sqp, send_handle, async_cm)
+        let sqp = SharedQp::new(qp, Arc::clone(&send_handle), Arc::clone(&recv_handle), pd);
+        (sqp, async_cm)
     });
 
     // Client setup
@@ -88,13 +90,13 @@ async fn test_shared_qp_send_recv_fd() {
         let _recv_task = tokio::spawn(recv_driver.run_tokio());
 
         // Use send handle for send ops
-        let sqp = SharedQp::new(qp, send_handle, pd);
-        (sqp, recv_handle, async_cm)
+        let sqp = SharedQp::new(qp, Arc::clone(&send_handle), Arc::clone(&recv_handle), pd);
+        (sqp, async_cm)
     });
 
     let (server_res, client_res) = tokio::join!(server_handle, client_handle);
-    let (server_sqp, _s_send_handle, _s_cm) = server_res.unwrap();
-    let (client_sqp, _c_recv_handle, _c_cm) = client_res.unwrap();
+    let (server_sqp, _s_cm) = server_res.unwrap();
+    let (client_sqp, _c_cm) = client_res.unwrap();
 
     let msg = b"hello shared qp!";
 
@@ -156,8 +158,13 @@ async fn test_shared_qp_write_read_fd() {
         let (recv_driver, recv_handle) = FdCqDriver::new(recv_cq, 64);
         let _t1 = tokio::spawn(send_driver.run_tokio());
         let _t2 = tokio::spawn(recv_driver.run_tokio());
-        let sqp = SharedQp::new(qp, send_handle, pd.clone());
-        (sqp, recv_handle, pd, async_cm)
+        let sqp = SharedQp::new(
+            qp,
+            Arc::clone(&send_handle),
+            Arc::clone(&recv_handle),
+            pd.clone(),
+        );
+        (sqp, pd, async_cm)
     });
 
     let client_handle = tokio::spawn(async move {
@@ -184,13 +191,18 @@ async fn test_shared_qp_write_read_fd() {
         let (recv_driver, recv_handle) = FdCqDriver::new(recv_cq, 64);
         let _t1 = tokio::spawn(send_driver.run_tokio());
         let _t2 = tokio::spawn(recv_driver.run_tokio());
-        let sqp = SharedQp::new(qp, send_handle, pd.clone());
-        (sqp, recv_handle, pd, async_cm)
+        let sqp = SharedQp::new(
+            qp,
+            Arc::clone(&send_handle),
+            Arc::clone(&recv_handle),
+            pd.clone(),
+        );
+        (sqp, pd, async_cm)
     });
 
     let (server_res, client_res) = tokio::join!(server_handle, client_handle);
-    let (s_sqp, _s_recv_h, s_pd, _s_cm) = server_res.unwrap();
-    let (c_sqp, _c_recv_h, c_pd, _c_cm) = client_res.unwrap();
+    let (s_sqp, s_pd, _s_cm) = server_res.unwrap();
+    let (c_sqp, c_pd, _c_cm) = client_res.unwrap();
 
     // Register remote-accessible MR on server
     let server_data_mr = s_pd.reg_mr(64, AccessIntent::RemoteReadWrite).unwrap();
@@ -243,13 +255,15 @@ async fn test_shared_qp_send_recv_polling() {
             .await
             .unwrap();
         let (recv_driver, recv_handle) = PollingCqDriver::new(recv_cq, 64);
-        let _t = tokio::spawn(recv_driver.run());
-        let sqp = SharedQp::new(qp, recv_handle, pd);
+        let (send_driver, send_handle) = PollingCqDriver::new(send_cq, 64);
+        let _t1 = tokio::spawn(recv_driver.run());
+        let _t2 = tokio::spawn(send_driver.run());
+        let sqp = SharedQp::new(qp, Arc::clone(&send_handle), Arc::clone(&recv_handle), pd);
         (sqp, async_cm)
     });
 
     let client_handle = tokio::spawn(async move {
-        let (async_cm, (pd, send_cq, _recv_cq, qp)) =
+        let (async_cm, (pd, send_cq, recv_cq, qp)) =
             rdma_io_tests::test_helpers::connect_client_with_retry(&connect_addr, |cm| {
                 let verbs_ctx = cm.verbs_context().unwrap();
                 let ctx = Context::from_inner(verbs_ctx);
@@ -269,8 +283,10 @@ async fn test_shared_qp_send_recv_polling() {
             })
             .await;
         let (send_driver, send_handle) = PollingCqDriver::new(send_cq, 64);
-        let _t = tokio::spawn(send_driver.run());
-        let sqp = SharedQp::new(qp, send_handle, pd);
+        let (recv_driver, recv_handle) = PollingCqDriver::new(recv_cq, 64);
+        let _t1 = tokio::spawn(send_driver.run());
+        let _t2 = tokio::spawn(recv_driver.run());
+        let sqp = SharedQp::new(qp, Arc::clone(&send_handle), Arc::clone(&recv_handle), pd);
         (sqp, async_cm)
     });
 
@@ -320,9 +336,11 @@ async fn test_shared_qp_completion_error() {
             .complete_accept(conn_id, &ConnParam::default())
             .await
             .unwrap();
+        let (send_driver, send_handle) = FdCqDriver::new(send_cq, 64);
         let (recv_driver, recv_handle) = FdCqDriver::new(recv_cq, 64);
-        let _t = tokio::spawn(recv_driver.run_tokio());
-        let sqp = SharedQp::new(qp, recv_handle, pd);
+        let _t1 = tokio::spawn(send_driver.run_tokio());
+        let _t2 = tokio::spawn(recv_driver.run_tokio());
+        let sqp = SharedQp::new(qp, Arc::clone(&send_handle), Arc::clone(&recv_handle), pd);
         (sqp, async_cm)
     });
 

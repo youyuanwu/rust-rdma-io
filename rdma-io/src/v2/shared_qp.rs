@@ -73,19 +73,32 @@ use super::qp::Qp;
 /// to a detached lease that is reclaimed when the CQE eventually arrives.
 pub struct SharedQp {
     qp: Arc<Qp>,
-    handle: Arc<CqDriverHandle>,
+    /// Driver handle for send-side completions (send, write, read operations).
+    send_handle: Arc<CqDriverHandle>,
+    /// Driver handle for recv-side completions.
+    recv_handle: Arc<CqDriverHandle>,
     pd: Pd,
 }
 
 impl SharedQp {
-    /// Create a new `SharedQp` from a queue pair and driver handle.
+    /// Create a new `SharedQp` from a queue pair and separate send/recv driver handles.
+    ///
+    /// RDMA uses separate send and recv completion queues; each needs its own
+    /// driver. Send/write/read completions route through `send_handle`, while
+    /// recv completions route through `recv_handle`.
     ///
     /// The `pd` is stored for MR registration convenience.
     /// The `qp` is wrapped in `Arc` for shared access.
-    pub fn new(qp: Qp, handle: Arc<CqDriverHandle>, pd: Pd) -> Self {
+    pub fn new(
+        qp: Qp,
+        send_handle: Arc<CqDriverHandle>,
+        recv_handle: Arc<CqDriverHandle>,
+        pd: Pd,
+    ) -> Self {
         Self {
             qp: Arc::new(qp),
-            handle,
+            send_handle,
+            recv_handle,
             pd,
         }
     }
@@ -111,7 +124,7 @@ impl SharedQp {
         let (offset, len) = range.unwrap_or((0, mr.len()));
         OpFuture::new(
             Arc::clone(&self.qp),
-            Arc::clone(&self.handle),
+            Arc::clone(&self.send_handle),
             OpKind::Send,
             mr,
             None,
@@ -130,7 +143,7 @@ impl SharedQp {
         let (offset, len) = range.unwrap_or((0, mr.len()));
         OpFuture::new(
             Arc::clone(&self.qp),
-            Arc::clone(&self.handle),
+            Arc::clone(&self.recv_handle),
             OpKind::Recv,
             mr,
             None,
@@ -148,7 +161,7 @@ impl SharedQp {
         let (offset, len) = range.unwrap_or((0, local.len()));
         OpFuture::new(
             Arc::clone(&self.qp),
-            Arc::clone(&self.handle),
+            Arc::clone(&self.send_handle),
             OpKind::Write,
             local,
             Some(remote),
@@ -166,7 +179,7 @@ impl SharedQp {
         let (offset, len) = range.unwrap_or((0, local.len()));
         OpFuture::new(
             Arc::clone(&self.qp),
-            Arc::clone(&self.handle),
+            Arc::clone(&self.send_handle),
             OpKind::Read,
             local,
             Some(remote),
@@ -178,7 +191,8 @@ impl SharedQp {
     /// Transition QP to error state, flushing all in-flight operations.
     pub fn shutdown(&self) -> Result<()> {
         self.qp.to_error()?;
-        self.handle.shutdown();
+        self.send_handle.shutdown();
+        self.recv_handle.shutdown();
         Ok(())
     }
 }
@@ -376,12 +390,15 @@ fn post_operation(
     offset: usize,
     len: usize,
 ) -> Result<()> {
+    use crate::wr::SendFlags;
     let addr = mr.addr() + offset as u64;
     let sge = Sge::new(addr, len as u32, mr.lkey());
 
     match kind {
         OpKind::Send => {
-            let mut wr = SendWr::new(wr_id, WrOpcode::Send).sg(sge);
+            let mut wr = SendWr::new(wr_id, WrOpcode::Send)
+                .sg(sge)
+                .flags(SendFlags::SIGNALED);
             qp.post_send_wr_raw(&mut wr)
         }
         OpKind::Recv => {
@@ -392,14 +409,16 @@ fn post_operation(
             let r = remote.expect("Write requires remote");
             let mut wr = SendWr::new(wr_id, WrOpcode::RdmaWrite)
                 .sg(sge)
-                .rdma(r.addr, r.rkey);
+                .rdma(r.addr, r.rkey)
+                .flags(SendFlags::SIGNALED);
             qp.post_send_wr_raw(&mut wr)
         }
         OpKind::Read => {
             let r = remote.expect("Read requires remote");
             let mut wr = SendWr::new(wr_id, WrOpcode::RdmaRead)
                 .sg(sge)
-                .rdma(r.addr, r.rkey);
+                .rdma(r.addr, r.rkey)
+                .flags(SendFlags::SIGNALED);
             qp.post_send_wr_raw(&mut wr)
         }
     }

@@ -12,7 +12,7 @@ use rdma_io_sys::wrapper::*;
 use crate::cm::{CmId, CmQueuePair};
 use crate::error::from_ret;
 use crate::qp::QpInitAttr;
-use crate::wr::{RecvWr, SendWr, Sge, WrOpcode};
+use crate::wr::{RecvWr, SendFlags, SendWr, Sge, WrOpcode};
 
 use super::cq::Cq;
 use super::error::{Error, Result};
@@ -120,8 +120,23 @@ impl<'a> QpBuilder<'a> {
     ///
     /// # Errors
     ///
+    /// - [`Error::InvalidConfig`] if WR or SGE capacities are zero
     /// - [`Error::Verbs`] if QP creation fails
     pub fn build_with_cm(self, cm_id: &CmId) -> Result<Qp> {
+        // Validate builder parameters
+        if self.attr.max_send_wr == 0 {
+            return Err(Error::InvalidConfig("max_send_wr must be > 0".into()));
+        }
+        if self.attr.max_recv_wr == 0 {
+            return Err(Error::InvalidConfig("max_recv_wr must be > 0".into()));
+        }
+        if self.attr.max_send_sge == 0 {
+            return Err(Error::InvalidConfig("max_send_sge must be > 0".into()));
+        }
+        if self.attr.max_recv_sge == 0 {
+            return Err(Error::InvalidConfig("max_recv_sge must be > 0".into()));
+        }
+
         let pd_arc = Arc::clone(self.pd.inner());
         let send_cq_inner = Arc::clone(self.send_cq.inner());
         let recv_cq_inner = Arc::clone(self.recv_cq.inner());
@@ -191,7 +206,9 @@ impl Qp {
     /// - [`Error::PostFailed`] if the WR cannot be posted (e.g., QP in error state)
     pub fn post_send(&self, mr: &Mr, wr_id: u64) -> Result<()> {
         let sge = Sge::new(mr.addr(), mr.len() as u32, mr.lkey());
-        let mut wr = SendWr::new(wr_id, WrOpcode::Send).sg(sge);
+        let mut wr = SendWr::new(wr_id, WrOpcode::Send)
+            .sg(sge)
+            .flags(SendFlags::SIGNALED);
         self.post_send_wr(&mut wr)
     }
 
@@ -221,7 +238,8 @@ impl Qp {
         let sge = Sge::new(local.addr(), local.len() as u32, local.lkey());
         let mut wr = SendWr::new(wr_id, WrOpcode::RdmaWrite)
             .sg(sge)
-            .rdma(remote.addr, remote.rkey);
+            .rdma(remote.addr, remote.rkey)
+            .flags(SendFlags::SIGNALED);
         self.post_send_wr(&mut wr)
     }
 
@@ -237,7 +255,8 @@ impl Qp {
         let sge = Sge::new(local.addr(), local.len() as u32, local.lkey());
         let mut wr = SendWr::new(wr_id, WrOpcode::RdmaRead)
             .sg(sge)
-            .rdma(remote.addr, remote.rkey);
+            .rdma(remote.addr, remote.rkey)
+            .flags(SendFlags::SIGNALED);
         self.post_send_wr(&mut wr)
     }
 
