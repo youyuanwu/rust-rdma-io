@@ -156,13 +156,10 @@ unsafe impl Sync for CqPoller {}
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::context::Context as V2Context;
     use super::super::cq::CqBuilder;
     use super::super::error::Error;
-
-    use std::future::poll_fn;
-    use std::sync::Arc;
+    use super::*;
 
     #[test]
     fn test_cq_poller_creation() {
@@ -181,22 +178,19 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_cq_poller_poll_empty_returns_pending() {
+    #[test]
+    fn test_cq_poller_poll_empty_returns_pending() {
         match V2Context::open_first() {
             Ok(ctx) => {
                 let cq = CqBuilder::new(&ctx, 16).build().unwrap();
-                let poller = Arc::new(CqPoller::new(cq));
+                let poller = CqPoller::new(cq);
+                let mut completions = [WorkCompletion::default(); 4];
+                let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
 
-                // Polling empty CQ should return Pending
-                let poller_ref = Arc::clone(&poller);
-                let result = tokio::time::timeout(
-                    std::time::Duration::from_millis(50),
-                    poll_fn(move |cx| poller_ref.poll_completions(cx, &mut [WorkCompletion::default(); 4])),
-                ).await;
-
-                // Should timeout (Pending, no completions)
-                assert!(result.is_err(), "should timeout — CQ is empty");
+                assert!(matches!(
+                    poller.poll_completions(&mut cx, &mut completions),
+                    Poll::Pending
+                ));
             }
             Err(Error::NoDevices) => {}
             Err(e) => panic!("unexpected: {e}"),

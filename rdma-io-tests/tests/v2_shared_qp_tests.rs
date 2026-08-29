@@ -18,6 +18,14 @@ macro_rules! require_software_rdma {
     };
 }
 
+fn assert_operation_posted(mut future: std::pin::Pin<&mut OpFuture>) {
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(
+        std::future::Future::poll(future.as_mut(), &mut cx).is_pending(),
+        "operation completed before its peer operation was submitted"
+    );
+}
+
 // ---- Send/Recv future test with inline setup ----
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
@@ -51,8 +59,6 @@ async fn test_shared_qp_send_recv_fd() {
         let sqp = SharedQp::new(qp, recv_handle, pd);
         (sqp, send_handle, async_cm)
     });
-
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // Client setup
     let client_handle = tokio::spawn(async move {
@@ -100,15 +106,12 @@ async fn test_shared_qp_send_recv_fd() {
     let mut send_mr = client_sqp.pd().reg_mr(64, AccessIntent::LocalOnly).unwrap();
     send_mr.as_mut_slice()[..msg.len()].copy_from_slice(msg);
 
-    // Run concurrently: server recv + client send
-    let (recv_result, send_result) = tokio::join!(
-        server_sqp.recv(recv_mr, None),
-        async {
-            // Small delay to ensure recv is posted first
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            client_sqp.send(send_mr, None).await
-        }
-    );
+    // Polling the receive future once posts the receive WR deterministically.
+    let mut recv_future = std::pin::pin!(server_sqp.recv(recv_mr, None));
+    assert_operation_posted(recv_future.as_mut());
+
+    let send_result = client_sqp.send(send_mr, None).await;
+    let recv_result = recv_future.await;
 
     let (recv_res, recv_mr) = recv_result;
     let recv_completion = recv_res.expect("recv should succeed");
@@ -157,8 +160,6 @@ async fn test_shared_qp_write_read_fd() {
         (sqp, recv_handle, pd, async_cm)
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
     let client_handle = tokio::spawn(async move {
         let (async_cm, (pd, send_cq, recv_cq, qp)) =
             rdma_io_tests::test_helpers::connect_client_with_retry(&connect_addr, |cm| {
@@ -197,16 +198,18 @@ async fn test_shared_qp_write_read_fd() {
 
     // Client: write data to server's memory
     let write_data = b"hello write future!";
-    let mut write_mr = c_pd.reg_mr(write_data.len(), AccessIntent::LocalOnly).unwrap();
+    let mut write_mr = c_pd
+        .reg_mr(write_data.len(), AccessIntent::LocalOnly)
+        .unwrap();
     write_mr.as_mut_slice().copy_from_slice(write_data);
 
     let (write_result, _write_mr) = c_sqp.write(write_mr, server_remote, None).await;
     write_result.expect("write should succeed");
 
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
     // Client: read server's memory back
-    let read_mr = c_pd.reg_mr(write_data.len(), AccessIntent::LocalOnly).unwrap();
+    let read_mr = c_pd
+        .reg_mr(write_data.len(), AccessIntent::LocalOnly)
+        .unwrap();
     let (read_result, read_mr) = c_sqp.read(read_mr, server_remote, None).await;
     read_result.expect("read should succeed");
 
@@ -245,8 +248,6 @@ async fn test_shared_qp_send_recv_polling() {
         (sqp, async_cm)
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
     let client_handle = tokio::spawn(async move {
         let (async_cm, (pd, send_cq, _recv_cq, qp)) =
             rdma_io_tests::test_helpers::connect_client_with_retry(&connect_addr, |cm| {
@@ -282,13 +283,11 @@ async fn test_shared_qp_send_recv_polling() {
     let mut send_mr = client_sqp.pd().reg_mr(64, AccessIntent::LocalOnly).unwrap();
     send_mr.as_mut_slice()[..msg.len()].copy_from_slice(msg);
 
-    let ((recv_res, recv_mr), (send_res, _send_mr)) = tokio::join!(
-        server_sqp.recv(recv_mr, None),
-        async {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            client_sqp.send(send_mr, None).await
-        }
-    );
+    let mut recv_future = std::pin::pin!(server_sqp.recv(recv_mr, None));
+    assert_operation_posted(recv_future.as_mut());
+
+    let (send_res, _send_mr) = client_sqp.send(send_mr, None).await;
+    let (recv_res, recv_mr) = recv_future.await;
 
     recv_res.expect("recv should succeed");
     assert_eq!(&recv_mr.as_slice()[..msg.len()], msg);
@@ -327,8 +326,6 @@ async fn test_shared_qp_completion_error() {
         (sqp, async_cm)
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
     // Client connects and immediately disconnects so server's recv fails
     let client_handle = tokio::spawn(async move {
         let (async_cm, _) =
@@ -336,12 +333,7 @@ async fn test_shared_qp_completion_error() {
                 let pd = cm.alloc_pd().unwrap();
                 let _ctx = cm.verbs_context().unwrap();
                 let cmqp = cm
-                    .create_qp_with_cq(
-                        &pd,
-                        &rdma_io::qp::QpInitAttr::default(),
-                        None,
-                        None,
-                    )
+                    .create_qp_with_cq(&pd, &rdma_io::qp::QpInitAttr::default(), None, None)
                     .unwrap();
                 (pd, cmqp)
             })
