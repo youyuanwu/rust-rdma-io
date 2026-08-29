@@ -2,7 +2,7 @@
 //!
 //! This module provides a higher-level facade over the core RDMA primitives,
 //! offering builder-driven resource setup, typed operations, and dual
-//! completion models (readiness-based and polling-based).
+//! CQ completion integration models for Rust async runtimes.
 //!
 //! # Overview
 //!
@@ -15,14 +15,21 @@
 //! - **Memory registration**: [`Mr`] with [`AccessIntent`] for clear access semantics
 //! - **Typed operations**: [`Qp::post_send()`], [`Qp::post_recv()`],
 //!   [`Qp::post_write()`], [`Qp::post_read()`]
-//! - **Dual completion models**:
-//!   - Polling: [`Cq::poll()`] for busy-loop or custom event loops
-//!   - Readiness: [`Cq::fd()`] for event-loop registration
+//! - **Dual CQ completion models**:
+//!   - Direct CQ polling: [`Cq::poll()`] — explicit RDMA CQ polling
+//!   - Fd/readiness-based: [`Cq::fd()`] + [`Completions`] — CQ completion
+//!     channel fd registered with a Rust async runtime's reactor
+//!
+//! # Design
+//!
+//! The v2 API targets Rust async runtimes. It provides RDMA/CQ integration
+//! primitives (fd exposure, cancellation-safe async CQ draining) without
+//! implementing event-loop infrastructure, executors, or reactors.
 //!
 //! # Feature Flags
 //!
 //! - Core v2 types are always available (no feature required)
-//! - `async` feature enables [`completion::Completions`] for async completion awaiting
+//! - `async` feature enables [`completion::Completions`] for async CQ notification
 //! - `tokio` feature adds [`Cq::completions_tokio()`] convenience
 
 pub mod context;

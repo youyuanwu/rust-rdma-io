@@ -1,8 +1,11 @@
-//! Async completion integration for the v2 API.
+//! Async CQ completion integration for Rust async runtimes.
 //!
 //! Provides [`Completions`], a cancellation-safe async wrapper around
 //! a channel-backed completion queue. Generic over [`CqNotifier`] to
-//! support any async runtime.
+//! support different Rust async runtimes (Tokio, smol, async-io, etc.).
+//!
+//! This module provides the RDMA/CQ integration primitive — it does not
+//! implement event-loop infrastructure, executors, or reactors.
 //!
 //! # Cancellation Safety
 //!
@@ -34,15 +37,17 @@ enum PollState {
     WaitingFd,
 }
 
-/// Async completion poller for a channel-backed [`Cq`].
+/// Async CQ completion poller for a channel-backed [`Cq`].
 ///
 /// Wraps a [`Cq`] (with completion channel) and a [`CqNotifier`]
-/// to provide async completion awaiting using the drain-after-arm pattern.
+/// to provide async CQ draining using the drain-after-arm pattern,
+/// suitable for integration with Rust async runtimes.
 ///
 /// # Type Parameter
 ///
-/// `N` is the notifier implementation — typically [`TokioCqNotifier`]
-/// for Tokio, but any [`CqNotifier`] works (e.g., for smol, async-io, etc.).
+/// `N` is the notifier implementation for a specific Rust async runtime —
+/// typically [`TokioCqNotifier`] for Tokio. Any [`CqNotifier`] implementor
+/// works (e.g., for smol, async-io, etc.).
 ///
 /// [`TokioCqNotifier`]: crate::tokio_notifier::TokioCqNotifier
 ///

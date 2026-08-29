@@ -1,7 +1,8 @@
-//! V2 completion queue with builder pattern and dual completion models.
+//! V2 completion queue with builder pattern and dual CQ integration models.
 //!
-//! Supports both polling-based completion draining (no completion channel)
-//! and readiness-based notification (with completion channel and fd exposure).
+//! Supports both direct RDMA CQ polling (no completion channel) and
+//! fd/readiness-based CQ notification (with completion channel) for
+//! integration with Rust async runtimes.
 
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
@@ -92,15 +93,17 @@ impl<'a> CqBuilder<'a> {
     }
 }
 
-/// An RDMA completion queue supporting both polling and readiness models.
+/// An RDMA completion queue supporting both direct CQ polling and
+/// fd/readiness-based notification for Rust async runtimes.
 ///
-/// Created via [`CqBuilder`]. The completion model is determined at
+/// Created via [`CqBuilder`]. The CQ integration model is determined at
 /// construction time:
 ///
-/// - **Poll-only** (no channel): Use [`Cq::poll()`] to drain completions
-///   in a busy loop or custom event loop.
-/// - **Channel-backed**: Use [`Cq::fd()`] to obtain a file descriptor
-///   for event-loop registration, or use async completion integration.
+/// - **Poll-only** (no channel): Use [`Cq::poll()`] to directly poll the
+///   RDMA CQ, consistent with v1 CQ polling behavior.
+/// - **Channel-backed**: Use [`Cq::fd()`] to obtain the completion channel
+///   file descriptor for registration with a Rust async runtime's reactor,
+///   then use [`Completions`](super::Completions) for async CQ draining.
 ///
 /// # Thread Safety
 ///
@@ -113,10 +116,11 @@ pub struct Cq {
 }
 
 impl Cq {
-    /// Poll the completion queue for completed operations.
+    /// Poll the RDMA completion queue for completed operations.
     ///
-    /// Fills `completions` with up to `completions.len()` entries and
-    /// returns the number of completions retrieved.
+    /// Directly polls the underlying CQ (consistent with v1 CQ polling
+    /// behavior). Fills `completions` with up to `completions.len()`
+    /// entries and returns the number of completions retrieved.
     ///
     /// Returns `Ok(0)` when no completions are pending (non-blocking).
     ///
@@ -128,13 +132,13 @@ impl Cq {
         Ok(n)
     }
 
-    /// Get the file descriptor for readiness-based notification.
+    /// Get the completion channel file descriptor for async runtime integration.
     ///
     /// Returns `Some(fd)` if this CQ was created with a completion channel
     /// (via [`CqBuilder::with_channel()`]), `None` for poll-only CQs.
     ///
-    /// The fd becomes readable when new completions are available.
-    /// Register it with epoll, poll, or an async runtime's reactor.
+    /// Register this fd with a Rust async runtime's reactor (e.g., Tokio's
+    /// `AsyncFd`) to receive notification when CQ completions are available.
     pub fn fd(&self) -> Option<RawFd> {
         self.channel.as_ref().map(|ch| ch.fd())
     }
