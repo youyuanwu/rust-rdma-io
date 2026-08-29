@@ -46,6 +46,12 @@ pub mod completion;
 #[cfg(feature = "async")]
 pub mod cq_poller;
 #[cfg(feature = "tokio")]
+pub mod driver;
+#[cfg(feature = "async")]
+pub mod inflight;
+#[cfg(feature = "tokio")]
+pub mod shared_qp;
+#[cfg(feature = "tokio")]
 mod tokio_support;
 
 // Re-export primary types at v2 level.
@@ -65,6 +71,12 @@ pub use cq_poller::CqPoller;
 
 #[cfg(feature = "async")]
 pub use crate::async_cq::CqNotifier;
+
+#[cfg(feature = "tokio")]
+pub use driver::{CqDriverHandle, FdCqDriver, PollingCqDriver};
+
+#[cfg(feature = "tokio")]
+pub use shared_qp::{OpFuture, SharedQp};
 
 #[cfg(feature = "tokio")]
 pub use tokio_support::TokioCompletions;

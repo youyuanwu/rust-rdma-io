@@ -342,6 +342,16 @@ impl Qp {
             other => Error::from(other),
         })
     }
+
+    /// Post a raw send WR. Used by the per-operation future infrastructure.
+    pub(crate) fn post_send_wr_raw(&self, wr: &mut SendWr) -> Result<()> {
+        self.post_send_wr(wr)
+    }
+
+    /// Post a raw recv WR. Used by the per-operation future infrastructure.
+    pub(crate) fn post_recv_wr_raw(&self, wr: &mut RecvWr) -> Result<()> {
+        self.post_recv_wr(wr)
+    }
 }
 
 #[cfg(test)]
