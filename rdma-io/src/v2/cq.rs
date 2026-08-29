@@ -132,13 +132,15 @@ impl Cq {
         Ok(n)
     }
 
-    /// Get the completion channel file descriptor for async runtime integration.
+    /// Get the completion channel file descriptor.
     ///
     /// Returns `Some(fd)` if this CQ was created with a completion channel
     /// (via [`CqBuilder::with_channel()`]), `None` for poll-only CQs.
     ///
-    /// Register this fd with a Rust async runtime's reactor (e.g., Tokio's
-    /// `AsyncFd`) to receive notification when CQ completions are available.
+    /// Used internally by [`Completions`](super::Completions) and
+    /// [`CqNotifier`](super::CqNotifier) implementations to register
+    /// with the async runtime's reactor. Exposed for custom notifier
+    /// implementations.
     pub fn fd(&self) -> Option<RawFd> {
         self.channel.as_ref().map(|ch| ch.fd())
     }
