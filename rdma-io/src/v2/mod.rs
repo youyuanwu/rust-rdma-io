@@ -15,10 +15,11 @@
 //! - **Memory registration**: [`Mr`] with [`AccessIntent`] for clear access semantics
 //! - **Typed operations**: [`Qp::post_send()`], [`Qp::post_recv()`],
 //!   [`Qp::post_write()`], [`Qp::post_read()`]
-//! - **Dual CQ completion models**:
-//!   - Direct CQ polling: [`Cq::poll()`] — explicit RDMA CQ polling
-//!   - Fd/readiness-based: [`Cq::fd()`] + [`Completions`] — CQ completion
-//!     channel fd registered with a Rust async runtime's reactor
+//! - **Dual CQ completion models** (both async-native):
+//!   - Fd/readiness-based: [`Completions`] — CQ completion channel fd
+//!     registered with async runtime reactor, arm-drain pattern
+//!   - CQ polling-based: [`CqPoller`] — direct RDMA CQ polling with
+//!     smoltcp-style waker registration for async runtime integration
 //!
 //! # Design
 //!
@@ -41,6 +42,8 @@ pub mod qp;
 
 #[cfg(feature = "async")]
 pub mod completion;
+#[cfg(feature = "async")]
+pub mod cq_poller;
 #[cfg(feature = "tokio")]
 mod tokio_support;
 
@@ -54,6 +57,9 @@ pub use qp::{Qp, QpBuilder};
 
 #[cfg(feature = "async")]
 pub use completion::Completions;
+
+#[cfg(feature = "async")]
+pub use cq_poller::CqPoller;
 
 #[cfg(feature = "async")]
 pub use crate::async_cq::CqNotifier;

@@ -597,3 +597,127 @@ async fn test_v2_completion_error() {
     }
     assert!(found_error, "should have received flushed completion with error status");
 }
+
+// ---- CqPoller async polling test ----
+
+/// Test CqPoller: async-native CQ polling with waker registration.
+/// Posts a send, then uses CqPoller::poll_completions to await the completion
+/// with an external wake source (timer-driven).
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn test_v2_cq_poller_send_recv() {
+    require_software_rdma!();
+    use std::sync::Arc;
+
+    // Build connection with poll-only CQs (no completion channel)
+    let listener = rdma_io_tests::test_helpers::bind_listener_with_retry().await;
+    let connect_addr = connect_addr_for(listener.local_addr());
+
+    let server_handle = tokio::spawn(async move {
+        let conn_id = listener.get_request().await.unwrap();
+        let ctx = Context::from_cm(&conn_id).unwrap();
+        let pd = ctx.alloc_pd().unwrap();
+        // Poll-only CQs — no completion channel
+        let send_cq = CqBuilder::new(&ctx, 32).build().unwrap();
+        let recv_cq = CqBuilder::new(&ctx, 32).build().unwrap();
+        let qp = QpBuilder::new(&pd, &send_cq, &recv_cq)
+            .build_with_cm(&conn_id)
+            .unwrap();
+        let async_cm = listener
+            .complete_accept(conn_id, &ConnParam::default())
+            .await
+            .unwrap();
+        (qp, pd, send_cq, recv_cq, async_cm)
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let client_handle = tokio::spawn(async move {
+        let (async_cm, (pd, send_cq, recv_cq, qp)) =
+            rdma_io_tests::test_helpers::connect_client_with_retry(&connect_addr, |cm| {
+                let verbs_ctx = cm.verbs_context().unwrap();
+                let ctx = Context::from_inner(verbs_ctx);
+                let pd = ctx.alloc_pd().unwrap();
+                let send_cq = CqBuilder::new(&ctx, 32).build().unwrap();
+                let recv_cq = CqBuilder::new(&ctx, 32).build().unwrap();
+                let cmqp = cm
+                    .create_qp_with_cq(
+                        pd.inner(),
+                        &rdma_io::qp::QpInitAttr::default(),
+                        Some(send_cq.inner()),
+                        Some(recv_cq.inner()),
+                    )
+                    .unwrap();
+                let qp = Qp::from_cm_qp(cmqp);
+                (pd, send_cq, recv_cq, qp)
+            })
+            .await;
+        (qp, pd, send_cq, recv_cq, async_cm)
+    });
+
+    let (server_res, client_res) = tokio::join!(server_handle, client_handle);
+    let (s_qp, s_pd, _s_send_cq, s_recv_cq, _s_cm) = server_res.unwrap();
+    let (c_qp, c_pd, c_send_cq, _c_recv_cq, _c_cm) = client_res.unwrap();
+
+    // Wrap poll-only CQs in CqPollers
+    let server_recv_poller = Arc::new(CqPoller::new(s_recv_cq));
+    let client_send_poller = Arc::new(CqPoller::new(c_send_cq));
+
+    let msg = b"hello cq poller!";
+
+    // Server posts recv
+    let mut recv_mr = s_pd.reg_mr(64, AccessIntent::LocalOnly).unwrap();
+    s_qp.post_recv(&mut recv_mr, 10).unwrap();
+
+    // Client posts send
+    let mut send_mr = c_pd.reg_mr(64, AccessIntent::LocalOnly).unwrap();
+    send_mr.as_mut_slice()[..msg.len()].copy_from_slice(msg);
+    c_qp.post_send(&send_mr, 20).unwrap();
+
+    // Use CqPoller with a timer-driven wake source
+
+    // Server: await recv completion via CqPoller
+    let recv_poller = Arc::clone(&server_recv_poller);
+    let recv_task = tokio::spawn(async move {
+        // Spawn wake driver: periodically wake the poller
+        let p = Arc::clone(&recv_poller);
+        let wake_handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                p.wake();
+            }
+        });
+
+        let mut buf = [WorkCompletion::default(); 4];
+        let n = std::future::poll_fn(|cx| recv_poller.poll_completions(cx, &mut buf)).await.unwrap();
+        wake_handle.abort();
+        assert!(n > 0);
+        assert!(buf[0].is_success());
+        assert_eq!(buf[0].wr_id(), 10);
+    });
+
+    // Client: await send completion via CqPoller
+    let send_poller = Arc::clone(&client_send_poller);
+    let send_task = tokio::spawn(async move {
+        let p = Arc::clone(&send_poller);
+        let wake_handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                p.wake();
+            }
+        });
+
+        let mut buf = [WorkCompletion::default(); 4];
+        let n = std::future::poll_fn(|cx| send_poller.poll_completions(cx, &mut buf)).await.unwrap();
+        wake_handle.abort();
+        assert!(n > 0);
+        assert!(buf[0].is_success());
+        assert_eq!(buf[0].wr_id(), 20);
+    });
+
+    let (recv_res, send_res) = tokio::join!(recv_task, send_task);
+    recv_res.unwrap();
+    send_res.unwrap();
+
+    // Verify data arrived
+    assert_eq!(&recv_mr.as_slice()[..msg.len()], msg);
+}
