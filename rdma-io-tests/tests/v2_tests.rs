@@ -37,8 +37,7 @@ fn test_v2_context_and_pd() {
 fn test_v2_context_open_by_name() {
     require_software_rdma!();
     // Try rxe0 first, then siw0
-    let result = Context::open_by_name("rxe0")
-        .or_else(|_| Context::open_by_name("siw0"));
+    let result = Context::open_by_name("rxe0").or_else(|_| Context::open_by_name("siw0"));
     assert!(result.is_ok(), "should open rxe0 or siw0");
 }
 
@@ -481,26 +480,40 @@ async fn test_v2_rdma_write_read() {
 
     // Client writes data to server's remote memory
     let write_data = b"v2 rdma write!";
-    let mut write_mr = c_pd.reg_mr(write_data.len(), AccessIntent::LocalOnly).unwrap();
+    let mut write_mr = c_pd
+        .reg_mr(write_data.len(), AccessIntent::LocalOnly)
+        .unwrap();
     write_mr.as_mut_slice().copy_from_slice(write_data);
-    c_qp.post_write(&write_mr, &server_remote_for_client, 200).unwrap();
+    c_qp.post_write(&write_mr, &server_remote_for_client, 200)
+        .unwrap();
 
     // Wait for write completion
     let mut wc2 = [WorkCompletion::default(); 4];
     let n = c_send_comp.next(&mut wc2).await.unwrap();
     assert!(n > 0);
-    assert!(wc2[0].is_success(), "write should succeed: {:?}", wc2[0].status());
+    assert!(
+        wc2[0].is_success(),
+        "write should succeed: {:?}",
+        wc2[0].status()
+    );
 
     // Brief delay for data to land
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
     // Client reads server's memory to verify
-    let mut read_mr = c_pd.reg_mr(write_data.len(), AccessIntent::LocalOnly).unwrap();
-    c_qp.post_read(&mut read_mr, &server_remote_for_client, 201).unwrap();
+    let mut read_mr = c_pd
+        .reg_mr(write_data.len(), AccessIntent::LocalOnly)
+        .unwrap();
+    c_qp.post_read(&mut read_mr, &server_remote_for_client, 201)
+        .unwrap();
 
     let n = c_send_comp.next(&mut wc2).await.unwrap();
     assert!(n > 0);
-    assert!(wc2[0].is_success(), "read should succeed: {:?}", wc2[0].status());
+    assert!(
+        wc2[0].is_success(),
+        "read should succeed: {:?}",
+        wc2[0].status()
+    );
 
     // Verify data matches
     assert_eq!(read_mr.as_slice(), write_data);
@@ -534,10 +547,7 @@ async fn test_v2_drop_order() {
 
 #[test]
 fn test_v2_access_intent_flags() {
-    assert_eq!(
-        AccessIntent::LocalOnly.to_flags(),
-        AccessFlags::LOCAL_WRITE
-    );
+    assert_eq!(AccessIntent::LocalOnly.to_flags(), AccessFlags::LOCAL_WRITE);
     assert_eq!(
         AccessIntent::RemoteRead.to_flags(),
         AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_READ
@@ -595,7 +605,10 @@ async fn test_v2_completion_error() {
         }
         tokio::task::yield_now().await;
     }
-    assert!(found_error, "should have received flushed completion with error status");
+    assert!(
+        found_error,
+        "should have received flushed completion with error status"
+    );
 }
 
 // ---- CqPoller async polling test ----
@@ -688,7 +701,9 @@ async fn test_v2_cq_poller_send_recv() {
         });
 
         let mut buf = [WorkCompletion::default(); 4];
-        let n = std::future::poll_fn(|cx| recv_poller.poll_completions(cx, &mut buf)).await.unwrap();
+        let n = std::future::poll_fn(|cx| recv_poller.poll_completions(cx, &mut buf))
+            .await
+            .unwrap();
         wake_handle.abort();
         assert!(n > 0);
         assert!(buf[0].is_success());
@@ -707,7 +722,9 @@ async fn test_v2_cq_poller_send_recv() {
         });
 
         let mut buf = [WorkCompletion::default(); 4];
-        let n = std::future::poll_fn(|cx| send_poller.poll_completions(cx, &mut buf)).await.unwrap();
+        let n = std::future::poll_fn(|cx| send_poller.poll_completions(cx, &mut buf))
+            .await
+            .unwrap();
         wake_handle.abort();
         assert!(n > 0);
         assert!(buf[0].is_success());

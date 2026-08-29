@@ -81,9 +81,7 @@ impl Context {
     ///   (address not yet resolved)
     pub fn from_cm(cm_id: &CmId) -> Result<Self> {
         let ctx = cm_id.verbs_context().ok_or_else(|| {
-            Error::InvalidConfig(
-                "CM ID has no verbs context (resolve_addr first)".into(),
-            )
+            Error::InvalidConfig("CM ID has no verbs context (resolve_addr first)".into())
         })?;
         Ok(Self { inner: ctx })
     }

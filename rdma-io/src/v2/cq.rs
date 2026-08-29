@@ -74,11 +74,7 @@ impl<'a> CqBuilder<'a> {
         let inner_ctx = Arc::clone(self.ctx.inner());
         if self.use_channel {
             let channel = CompletionChannel::new(&inner_ctx)?;
-            let cq = CompletionQueue::with_comp_channel(
-                inner_ctx,
-                self.cqe,
-                &channel,
-            )?;
+            let cq = CompletionQueue::with_comp_channel(inner_ctx, self.cqe, &channel)?;
             Ok(Cq {
                 inner: cq,
                 channel: Some(channel),
@@ -168,9 +164,9 @@ impl Cq {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use super::super::error::Error;
     use super::super::context::Context;
+    use super::super::error::Error;
+    use super::*;
 
     #[test]
     fn test_cq_builder_poll_only() {

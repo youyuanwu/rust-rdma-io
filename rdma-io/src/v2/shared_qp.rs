@@ -107,11 +107,7 @@ impl SharedQp {
     ///
     /// `range` optionally specifies a byte sub-range `(offset, length)`
     /// within the MR to send. If `None`, the entire MR is sent.
-    pub fn send(
-        &self,
-        mr: Mr,
-        range: Option<(usize, usize)>,
-    ) -> OpFuture {
+    pub fn send(&self, mr: Mr, range: Option<(usize, usize)>) -> OpFuture {
         let (offset, len) = range.unwrap_or((0, mr.len()));
         OpFuture::new(
             Arc::clone(&self.qp),
@@ -130,11 +126,7 @@ impl SharedQp {
     /// the received data written into it.
     ///
     /// `range` optionally specifies a byte sub-range for the receive buffer.
-    pub fn recv(
-        &self,
-        mr: Mr,
-        range: Option<(usize, usize)>,
-    ) -> OpFuture {
+    pub fn recv(&self, mr: Mr, range: Option<(usize, usize)>) -> OpFuture {
         let (offset, len) = range.unwrap_or((0, mr.len()));
         OpFuture::new(
             Arc::clone(&self.qp),
@@ -152,12 +144,7 @@ impl SharedQp {
     /// Writes data from `local` to the remote memory described by `remote`.
     ///
     /// `range` optionally specifies a byte sub-range of `local` to write.
-    pub fn write(
-        &self,
-        local: Mr,
-        remote: RemoteMr,
-        range: Option<(usize, usize)>,
-    ) -> OpFuture {
+    pub fn write(&self, local: Mr, remote: RemoteMr, range: Option<(usize, usize)>) -> OpFuture {
         let (offset, len) = range.unwrap_or((0, local.len()));
         OpFuture::new(
             Arc::clone(&self.qp),
@@ -175,12 +162,7 @@ impl SharedQp {
     /// Reads data from the remote memory into `local`.
     ///
     /// `range` optionally specifies a byte sub-range of `local` to fill.
-    pub fn read(
-        &self,
-        local: Mr,
-        remote: RemoteMr,
-        range: Option<(usize, usize)>,
-    ) -> OpFuture {
+    pub fn read(&self, local: Mr, remote: RemoteMr, range: Option<(usize, usize)>) -> OpFuture {
         let (offset, len) = range.unwrap_or((0, local.len()));
         OpFuture::new(
             Arc::clone(&self.qp),
@@ -309,7 +291,8 @@ impl Future for OpFuture {
                     let token = reg.token;
 
                     // Post the WR with the token as wr_id
-                    let post_result = post_operation(&qp, kind, &mr, remote.as_ref(), token, offset, len);
+                    let post_result =
+                        post_operation(&qp, kind, &mr, remote.as_ref(), token, offset, len);
 
                     if let Err(e) = post_result {
                         // Post failed — release registry slot and return MR
@@ -318,11 +301,7 @@ impl Future for OpFuture {
                     }
 
                     // Move to inflight state
-                    this.state = OpState::Inflight {
-                        handle,
-                        token,
-                        mr,
-                    };
+                    this.state = OpState::Inflight { handle, token, mr };
                     // Fall through to poll the inflight state
                 }
                 OpState::Inflight { handle, token, .. } => {

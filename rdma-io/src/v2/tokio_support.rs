@@ -21,9 +21,7 @@ impl Cq {
     /// - [`Error::Verbs`] if the Tokio async fd registration fails
     pub fn completions_tokio(self) -> Result<TokioCompletions> {
         let fd = self.fd().ok_or_else(|| {
-            Error::InvalidConfig(
-                "completions_tokio requires a channel-backed CQ".into(),
-            )
+            Error::InvalidConfig("completions_tokio requires a channel-backed CQ".into())
         })?;
         let notifier = TokioCqNotifier::new(fd).map_err(Error::Verbs)?;
         Completions::new(self, notifier)

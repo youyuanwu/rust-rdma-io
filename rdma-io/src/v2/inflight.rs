@@ -15,8 +15,8 @@
 //! generation at registration time. A completion for a stale generation
 //! is logged and discarded rather than delivered to a new occupant.
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::task::Waker;
 
 use crate::wc::WorkCompletion;
@@ -114,9 +114,7 @@ impl InflightMap {
                 inner.completion = None;
                 let gen_val = slot.generation.load(Ordering::Relaxed);
                 let token = encode_token(i as u32, gen_val);
-                return Some(Registration {
-                    token,
-                });
+                return Some(Registration { token });
             }
         }
         None

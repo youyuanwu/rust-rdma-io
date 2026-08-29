@@ -77,7 +77,13 @@ impl FdCqDriver {
             map: InflightMap::new(inflight_capacity),
             shutdown: AtomicBool::new(false),
         });
-        (Self { cq, handle: Arc::clone(&handle) }, handle)
+        (
+            Self {
+                cq,
+                handle: Arc::clone(&handle),
+            },
+            handle,
+        )
     }
 
     /// Run the driver loop with Tokio's CQ notifier.
@@ -87,17 +93,18 @@ impl FdCqDriver {
     #[cfg(feature = "tokio")]
     pub async fn run_tokio(self) -> super::error::Result<()> {
         let fd = self.cq.fd().ok_or_else(|| {
-            super::error::Error::InvalidConfig(
-                "FdCqDriver requires a channel-backed CQ".into(),
-            )
+            super::error::Error::InvalidConfig("FdCqDriver requires a channel-backed CQ".into())
         })?;
-        let notifier = crate::tokio_notifier::TokioCqNotifier::new(fd)
-            .map_err(super::error::Error::Verbs)?;
+        let notifier =
+            crate::tokio_notifier::TokioCqNotifier::new(fd).map_err(super::error::Error::Verbs)?;
         self.run(notifier).await
     }
 
     /// Run the driver loop with a custom `CqNotifier`.
-    pub async fn run<N: crate::async_cq::CqNotifier>(self, notifier: N) -> super::error::Result<()> {
+    pub async fn run<N: crate::async_cq::CqNotifier>(
+        self,
+        notifier: N,
+    ) -> super::error::Result<()> {
         let mut wc_buf = [WorkCompletion::default(); 32];
 
         while !self.handle.is_shutdown() {
@@ -141,7 +148,10 @@ impl FdCqDriver {
         for wc in wcs {
             let token = wc.wr_id();
             if !self.handle.map.complete(token, *wc) {
-                tracing::debug!(token, "driver: unroutable completion (stale or unknown token)");
+                tracing::debug!(
+                    token,
+                    "driver: unroutable completion (stale or unknown token)"
+                );
             }
         }
     }
@@ -239,7 +249,10 @@ impl PollingCqDriver {
 }
 
 /// Drain all pending events from a completion channel and ack them.
-fn drain_channel(ch: &crate::comp_channel::CompletionChannel, cq_raw: *mut rdma_io_sys::ibverbs::ibv_cq) {
+fn drain_channel(
+    ch: &crate::comp_channel::CompletionChannel,
+    cq_raw: *mut rdma_io_sys::ibverbs::ibv_cq,
+) {
     let mut count = 0u32;
     loop {
         match ch.get_cq_event() {
@@ -247,9 +260,7 @@ fn drain_channel(ch: &crate::comp_channel::CompletionChannel, cq_raw: *mut rdma_
                 count += 1;
             }
             Err(crate::Error::WouldBlock) => break,
-            Err(crate::Error::Verbs(ref e))
-                if e.kind() == std::io::ErrorKind::WouldBlock =>
-            {
+            Err(crate::Error::Verbs(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 break;
             }
             Err(e) => {

@@ -36,16 +36,10 @@ impl AccessIntent {
     pub fn to_flags(self) -> AccessFlags {
         match self {
             AccessIntent::LocalOnly => AccessFlags::LOCAL_WRITE,
-            AccessIntent::RemoteRead => {
-                AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_READ
-            }
-            AccessIntent::RemoteWrite => {
-                AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE
-            }
+            AccessIntent::RemoteRead => AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_READ,
+            AccessIntent::RemoteWrite => AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE,
             AccessIntent::RemoteReadWrite => {
-                AccessFlags::LOCAL_WRITE
-                    | AccessFlags::REMOTE_READ
-                    | AccessFlags::REMOTE_WRITE
+                AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_READ | AccessFlags::REMOTE_WRITE
             }
         }
     }
@@ -191,10 +185,7 @@ mod tests {
 
     #[test]
     fn test_access_intent_to_flags() {
-        assert_eq!(
-            AccessIntent::LocalOnly.to_flags(),
-            AccessFlags::LOCAL_WRITE
-        );
+        assert_eq!(AccessIntent::LocalOnly.to_flags(), AccessFlags::LOCAL_WRITE);
         assert_eq!(
             AccessIntent::RemoteRead.to_flags(),
             AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_READ
@@ -205,9 +196,7 @@ mod tests {
         );
         assert_eq!(
             AccessIntent::RemoteReadWrite.to_flags(),
-            AccessFlags::LOCAL_WRITE
-                | AccessFlags::REMOTE_READ
-                | AccessFlags::REMOTE_WRITE
+            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_READ | AccessFlags::REMOTE_WRITE
         );
     }
 

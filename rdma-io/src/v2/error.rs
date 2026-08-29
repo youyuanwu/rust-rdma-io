@@ -81,19 +81,13 @@ impl From<crate::Error> for Error {
             crate::Error::DeviceNotFound(name) => Error::DeviceNotFound(name),
             crate::Error::Verbs(io_err) => Error::Verbs(io_err),
             crate::Error::InvalidArg(msg) => Error::InvalidConfig(msg),
-            crate::Error::WorkCompletion { status, vendor_err } => {
-                Error::CompletionError {
-                    status: WcStatus::from_raw(status),
-                    vendor_err,
-                }
-            }
+            crate::Error::WorkCompletion { status, vendor_err } => Error::CompletionError {
+                status: WcStatus::from_raw(status),
+                vendor_err,
+            },
             crate::Error::WouldBlock => Error::WouldBlock,
-            crate::Error::ConnectionFault(msg) => {
-                Error::Verbs(io::Error::other(msg))
-            }
-            crate::Error::Timeout(msg) => {
-                Error::Verbs(io::Error::other(msg))
-            }
+            crate::Error::ConnectionFault(msg) => Error::Verbs(io::Error::other(msg)),
+            crate::Error::Timeout(msg) => Error::Verbs(io::Error::other(msg)),
         }
     }
 }

@@ -217,12 +217,7 @@ impl Qp {
     /// # Errors
     ///
     /// - [`Error::PostFailed`] if the WR cannot be posted
-    pub fn post_write(
-        &self,
-        local: &Mr,
-        remote: &RemoteMr,
-        wr_id: u64,
-    ) -> Result<()> {
+    pub fn post_write(&self, local: &Mr, remote: &RemoteMr, wr_id: u64) -> Result<()> {
         let sge = Sge::new(local.addr(), local.len() as u32, local.lkey());
         let mut wr = SendWr::new(wr_id, WrOpcode::RdmaWrite)
             .sg(sge)
@@ -238,12 +233,7 @@ impl Qp {
     /// # Errors
     ///
     /// - [`Error::PostFailed`] if the WR cannot be posted
-    pub fn post_read(
-        &self,
-        local: &mut Mr,
-        remote: &RemoteMr,
-        wr_id: u64,
-    ) -> Result<()> {
+    pub fn post_read(&self, local: &mut Mr, remote: &RemoteMr, wr_id: u64) -> Result<()> {
         let sge = Sge::new(local.addr(), local.len() as u32, local.lkey());
         let mut wr = SendWr::new(wr_id, WrOpcode::RdmaRead)
             .sg(sge)
@@ -322,25 +312,21 @@ impl Qp {
     fn post_send_wr(&self, wr: &mut SendWr) -> Result<()> {
         let mut raw = wr.build_raw();
         let mut bad_wr: *mut ibv_send_wr = std::ptr::null_mut();
-        from_ret(unsafe {
-            rdma_wrap_ibv_post_send(self.inner.as_raw(), &mut raw, &mut bad_wr)
-        })
-        .map_err(|e| match e {
-            crate::Error::Verbs(io_err) => Error::PostFailed(io_err),
-            other => Error::from(other),
-        })
+        from_ret(unsafe { rdma_wrap_ibv_post_send(self.inner.as_raw(), &mut raw, &mut bad_wr) })
+            .map_err(|e| match e {
+                crate::Error::Verbs(io_err) => Error::PostFailed(io_err),
+                other => Error::from(other),
+            })
     }
 
     fn post_recv_wr(&self, wr: &mut RecvWr) -> Result<()> {
         let mut raw = wr.build_raw();
         let mut bad_wr: *mut ibv_recv_wr = std::ptr::null_mut();
-        from_ret(unsafe {
-            rdma_wrap_ibv_post_recv(self.inner.as_raw(), &mut raw, &mut bad_wr)
-        })
-        .map_err(|e| match e {
-            crate::Error::Verbs(io_err) => Error::PostFailed(io_err),
-            other => Error::from(other),
-        })
+        from_ret(unsafe { rdma_wrap_ibv_post_recv(self.inner.as_raw(), &mut raw, &mut bad_wr) })
+            .map_err(|e| match e {
+                crate::Error::Verbs(io_err) => Error::PostFailed(io_err),
+                other => Error::from(other),
+            })
     }
 
     /// Post a raw send WR. Used by the per-operation future infrastructure.

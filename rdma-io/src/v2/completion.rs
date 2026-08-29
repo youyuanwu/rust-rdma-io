@@ -124,10 +124,7 @@ impl<N: CqNotifier> Completions<N> {
                 }
                 PollState::WaitingFd => {
                     // 4. Wait for fd readiness
-                    self.notifier
-                        .readable()
-                        .await
-                        .map_err(Error::Verbs)?;
+                    self.notifier.readable().await.map_err(Error::Verbs)?;
 
                     // 5. Drain all channel events (EPOLLET safety)
                     self.drain_channel_events()?;
@@ -225,10 +222,7 @@ impl<N: CqNotifier> Completions<N> {
     fn ack_events(&self, count: u32) {
         self.unacked_events.store(0, Ordering::Relaxed);
         unsafe {
-            rdma_io_sys::ibverbs::ibv_ack_cq_events(
-                self.cq.inner().as_raw(),
-                count,
-            );
+            rdma_io_sys::ibverbs::ibv_ack_cq_events(self.cq.inner().as_raw(), count);
         }
     }
 }

@@ -117,6 +117,41 @@ let channel = tonic_h3::H3Channel::new(connector, uri);
 let client = GreeterClient::new(channel);
 ```
 
+### V2 API — Per-Operation Futures (tokio)
+
+The `v2` module provides ergonomic per-operation async futures with compio-style buffer ownership:
+
+```rust
+use rdma_io::v2::*;
+
+// Resource setup via builders
+let ctx = Context::from_cm(&cm_id)?;
+let pd = ctx.alloc_pd()?;
+let send_cq = CqBuilder::new(&ctx, 64).with_channel().build()?;
+let recv_cq = CqBuilder::new(&ctx, 64).with_channel().build()?;
+let qp = QpBuilder::new(&pd, &send_cq, &recv_cq).build_with_cm(&cm_id)?;
+
+// Spawn completion driver
+let (driver, handle) = FdCqDriver::new(send_cq, 64);
+tokio::spawn(driver.run_tokio());
+
+let sqp = SharedQp::new(qp, handle, pd);
+
+// Per-operation futures: owned buffer in → (result, buffer) out
+let mut mr = sqp.pd().reg_mr(1024, AccessIntent::LocalOnly)?;
+mr.as_mut_slice()[..5].copy_from_slice(b"hello");
+let (result, mr) = sqp.send(mr, None).await;
+result?;
+
+// One-sided RDMA Write
+let (result, mr) = sqp.write(mr, remote_mr, None).await;
+result?;
+```
+
+Also provides lower-level APIs: `Op` enum for typed submission, `CqPoller` for
+direct CQ polling with waker registration, and `Completions<N>` for fd-based
+async CQ draining. See the `rdma_io::v2` module docs for the full API reference.
+
 ## Prerequisites
 
 ```sh
