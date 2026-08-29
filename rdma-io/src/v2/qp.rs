@@ -19,6 +19,8 @@ use super::error::{Error, Result};
 use super::mr::{Mr, RemoteMr};
 use super::pd::Pd;
 
+use crate::wc::WorkCompletion;
+
 /// Builder for creating queue pairs with documented defaults.
 ///
 /// # Defaults
@@ -266,6 +268,21 @@ impl Qp {
     /// Access the underlying CM queue pair for v1 API interop.
     pub fn inner(&self) -> &CmQueuePair {
         &self.inner
+    }
+
+    /// Post a send and return an error if the completion indicates failure.
+    ///
+    /// Higher-level wrapper that checks the `WorkCompletion` status and
+    /// converts failures to [`Error::CompletionError`].
+    pub fn check_completion(wc: &WorkCompletion) -> Result<()> {
+        if wc.is_success() {
+            Ok(())
+        } else {
+            Err(Error::CompletionError {
+                status: wc.status(),
+                vendor_err: wc.vendor_err(),
+            })
+        }
     }
 
     // -- Internal posting helpers --

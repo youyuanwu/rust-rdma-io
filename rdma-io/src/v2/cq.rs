@@ -62,8 +62,14 @@ impl<'a> CqBuilder<'a> {
     ///
     /// # Errors
     ///
+    /// - [`Error::InvalidConfig`] if `cqe` is less than 1
     /// - [`Error::Verbs`] if CQ or completion channel creation fails
     pub fn build(self) -> Result<Cq> {
+        if self.cqe < 1 {
+            return Err(super::error::Error::InvalidConfig(
+                "CQ capacity (cqe) must be >= 1".into(),
+            ));
+        }
         let inner_ctx = Arc::clone(self.ctx.inner());
         if self.use_channel {
             let channel = CompletionChannel::new(&inner_ctx)?;

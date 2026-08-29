@@ -579,6 +579,17 @@ async fn test_v2_completion_error() {
             assert!(!wc[0].is_success(), "flushed WR should have error status");
             assert_eq!(wc[0].status(), rdma_io::wc::WcStatus::WrFlushErr);
             assert_eq!(wc[0].wr_id(), 42);
+
+            // Verify that check_completion surfaces CompletionError
+            let result = Qp::check_completion(&wc[0]);
+            assert!(result.is_err());
+            match result.unwrap_err() {
+                Error::CompletionError { status, .. } => {
+                    assert_eq!(status, rdma_io::wc::WcStatus::WrFlushErr);
+                }
+                other => panic!("expected CompletionError, got: {other}"),
+            }
+
             found_error = true;
             break;
         }
