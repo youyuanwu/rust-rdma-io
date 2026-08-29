@@ -37,6 +37,7 @@ pub mod context;
 pub mod cq;
 pub mod error;
 pub mod mr;
+pub mod op;
 pub mod pd;
 pub mod qp;
 
@@ -52,6 +53,7 @@ pub use context::Context;
 pub use cq::{Cq, CqBuilder};
 pub use error::{Error, Result};
 pub use mr::{AccessIntent, Mr, RemoteMr};
+pub use op::{Completion, Op, OpCode};
 pub use pd::Pd;
 pub use qp::{Qp, QpBuilder};
 

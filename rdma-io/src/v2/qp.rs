@@ -270,6 +270,38 @@ impl Qp {
         &self.inner
     }
 
+    /// Submit a typed RDMA operation.
+    ///
+    /// io_uring/compio-style submission: pass a typed [`Op`] describing
+    /// what to do, and the operation is posted to the hardware queue.
+    /// The completion will carry the `wr_id` from the [`Op`] for correlation.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use rdma_io::v2::*;
+    /// # fn example(qp: &Qp, mr: &Mr) -> Result<()> {
+    /// qp.submit(Op::send(mr, 42))?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn submit(&self, op: super::op::Op<'_>) -> Result<()> {
+        match op {
+            super::op::Op::Send { mr, wr_id } => self.post_send(mr, wr_id),
+            super::op::Op::Recv { mr, wr_id } => self.post_recv(mr, wr_id),
+            super::op::Op::Write {
+                local,
+                remote,
+                wr_id,
+            } => self.post_write(local, remote, wr_id),
+            super::op::Op::Read {
+                local,
+                remote,
+                wr_id,
+            } => self.post_read(local, remote, wr_id),
+        }
+    }
+
     /// Post a send and return an error if the completion indicates failure.
     ///
     /// Higher-level wrapper that checks the `WorkCompletion` status and

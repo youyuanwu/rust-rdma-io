@@ -721,3 +721,95 @@ async fn test_v2_cq_poller_send_recv() {
     // Verify data arrived
     assert_eq!(&recv_mr.as_slice()[..msg.len()], msg);
 }
+
+// ---- Op/Completion (io_uring-style) test ----
+
+/// Test the io_uring/compio-style Op submission + typed Completion API.
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn test_v2_op_submit_completion() {
+    require_software_rdma!();
+
+    let (server, client) = setup_v2_connection().await;
+
+    let msg = b"hello op api!";
+
+    // Server: post recv via Op
+    let mut recv_mr = server.pd.reg_mr(64, AccessIntent::LocalOnly).unwrap();
+    server.qp.submit(Op::recv(&mut recv_mr, 10)).unwrap();
+
+    // Client: post send via Op
+    let mut send_mr = client.pd.reg_mr(64, AccessIntent::LocalOnly).unwrap();
+    send_mr.as_mut_slice()[..msg.len()].copy_from_slice(msg);
+    client.qp.submit(Op::send(&send_mr, 20)).unwrap();
+
+    // Poll for completions and use typed Completion API
+    let mut wc_buf = [rdma_io::wc::WorkCompletion::default(); 4];
+
+    // Client send completion
+    loop {
+        let n = client.send_cq.poll(&mut wc_buf).unwrap();
+        if n > 0 {
+            let cqes = Completion::from_wc_slice(&wc_buf[..n]);
+            let cqe = &cqes[0];
+            assert_eq!(cqe.wr_id(), 20);
+            assert!(cqe.result().is_ok());
+            assert_eq!(cqe.opcode(), rdma_io::wc::WcOpcode::Send);
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    // Server recv completion
+    loop {
+        let n = server.recv_cq.poll(&mut wc_buf).unwrap();
+        if n > 0 {
+            let cqes = Completion::from_wc_slice(&wc_buf[..n]);
+            let cqe = &cqes[0];
+            assert_eq!(cqe.wr_id(), 10);
+            assert!(cqe.result().is_ok());
+            assert_eq!(cqe.opcode(), rdma_io::wc::WcOpcode::Recv);
+            assert_eq!(cqe.byte_len(), 64); // full MR size
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    assert_eq!(&recv_mr.as_slice()[..msg.len()], msg);
+}
+
+/// Test Completion::result() surfaces errors as CompletionError.
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn test_v2_completion_result_error() {
+    require_software_rdma!();
+
+    let (server, _client) = setup_v2_connection().await;
+
+    // Post recv via Op, then force QP to error → flushed WR
+    let mut recv_mr = server.pd.reg_mr(64, AccessIntent::LocalOnly).unwrap();
+    server.qp.submit(Op::recv(&mut recv_mr, 99)).unwrap();
+    server.qp.to_error().unwrap();
+
+    let mut wc_buf = [rdma_io::wc::WorkCompletion::default(); 4];
+    let mut found = false;
+    for _ in 0..100 {
+        let n = server.recv_cq.poll(&mut wc_buf).unwrap();
+        if n > 0 {
+            let cqe = Completion::from(wc_buf[0]);
+            assert_eq!(cqe.wr_id(), 99);
+            assert!(!cqe.is_success());
+
+            // result() should return CompletionError
+            let err = cqe.result().unwrap_err();
+            match err {
+                Error::CompletionError { status, .. } => {
+                    assert_eq!(status, rdma_io::wc::WcStatus::WrFlushErr);
+                }
+                other => panic!("expected CompletionError, got: {other}"),
+            }
+            found = true;
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(found, "should have received flushed completion");
+}
