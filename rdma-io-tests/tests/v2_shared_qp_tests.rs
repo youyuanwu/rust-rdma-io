@@ -319,6 +319,10 @@ async fn test_shared_qp_send_recv_polling() {
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn test_shared_qp_completion_error() {
     require_software_rdma!();
+    // SIW does not reliably produce the flush CQE while this operation is
+    // managed by an asynchronous CQ driver. Raw flush handling remains covered
+    // on SIW by v2_tests; exercise operation-future propagation on RXE.
+    rdma_io_tests::require_no_iwarp!();
 
     let listener = rdma_io_tests::test_helpers::bind_listener_with_retry().await;
     let connect_addr = connect_addr_for(listener.local_addr());
@@ -366,10 +370,15 @@ async fn test_shared_qp_completion_error() {
     // Server posts recv
     let recv_mr = server_sqp.pd().reg_mr(64, AccessIntent::LocalOnly).unwrap();
 
-    // Force QP to error state — the recv will be flushed
+    // Poll once to post the receive WR before transitioning the QP. Posting
+    // after the error transition does not reliably produce a flush CQE.
+    let mut recv_future = std::pin::pin!(server_sqp.recv(recv_mr, None));
+    assert_operation_posted(recv_future.as_mut());
+
+    // Force QP to error state — the posted recv will be flushed.
     server_sqp.qp().to_error().unwrap();
 
-    let (recv_result, _recv_mr) = server_sqp.recv(recv_mr, None).await;
+    let (recv_result, _recv_mr) = recv_future.await;
 
     // Should get CompletionError with WrFlushErr
     match recv_result {
