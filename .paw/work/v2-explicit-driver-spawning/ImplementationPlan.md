@@ -39,7 +39,7 @@ Refactor the v2 message transport API to eliminate all hidden `tokio::spawn` cal
 
 ## Phase Status
 
-- [ ] **Phase 1: Core Driver Composition** — Restructure Connection to not spawn; create MessageTransportDriver composing CQ driver + recv pump + disconnect monitor + HELLO into one future
+- [x] **Phase 1: Core Driver Composition** — Restructure Connection to not spawn; create MessageTransportDriver composing CQ driver + recv pump + disconnect monitor + HELLO into one future
 - [ ] **Phase 2: Frontend Readiness & Lifecycle** — Add ready()/send()/recv() readiness gating, close() without JoinHandle, Drop semantics for both objects, shared state transitions
 - [ ] **Phase 3: Tests & Regression Guard** — Update all test call sites, add lifecycle/determinism tests, add no-hidden-spawn regression check
 - [ ] **Phase 4: Provider Validation** — Full RXE + SIW workspace validation with provider switching

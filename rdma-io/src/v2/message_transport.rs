@@ -4,6 +4,33 @@
 //! message boundaries, bounded backpressure via application-level receive
 //! credits, and cancellation-safe `send()`/`recv()` operations.
 //!
+//! # Explicit Driver Spawning
+//!
+//! Construction returns a `(MessageTransport, MessageTransportDriver)` pair.
+//! The caller must explicitly spawn (or poll) the driver future on a Tokio
+//! runtime for transport progress. Exactly one spawned task per endpoint
+//! is sufficient in both shared and separate CQ modes.
+//!
+//! ```no_run
+//! # use rdma_io::v2::*;
+//! # use rdma_io::v2::message_transport::*;
+//! # async fn example() -> Result<()> {
+//! let (transport, driver) = MessageTransportBuilder::new()
+//!     .completion_mode(CompletionMode::Readiness)
+//!     .connect("192.168.1.1:7471".parse().unwrap())
+//!     .await?;
+//!
+//! let driver_task = tokio::spawn(driver);
+//! transport.ready().await?;
+//! transport.send(b"hello").await?;
+//! let msg = transport.recv().await?;
+//! assert_eq!(msg.as_ref(), b"hello");
+//! transport.close().await;
+//! driver_task.await??;
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! # Wire Protocol
 //!
 //! Every RDMA message carries a [`protocol`] frame header
@@ -36,53 +63,35 @@
 //!
 //! # Disconnect Monitoring
 //!
-//! A dedicated CM event monitor task is the sole consumer of the connection's
-//! CM event channel. On peer disconnect or CM error, the monitor atomically
-//! closes the transport, wakes all pending send/recv/credit waiters with
-//! [`Error::TransportClosed`], and initiates QP/driver shutdown.
-//!
-//! # Usage
-//!
-//! ```no_run
-//! # use rdma_io::v2::*;
-//! # use rdma_io::v2::message_transport::*;
-//! # async fn example() -> Result<()> {
-//! let transport = MessageTransportBuilder::new()
-//!     .recv_buffers(32)
-//!     .send_buffers(16)
-//!     .buffer_size(64 * 1024)
-//!     .completion_mode(CompletionMode::Readiness)
-//!     .connect("192.168.1.1:7471".parse().unwrap())
-//!     .await?;
-//!
-//! transport.send(b"hello").await?;
-//! let msg = transport.recv().await?;
-//! assert_eq!(msg.as_ref(), b"hello");
-//! # Ok(())
-//! # }
-//! ```
+//! The driver future internally monitors CM events. On peer disconnect or
+//! CM error, it atomically closes the transport, wakes all pending
+//! send/recv/credit waiters with [`Error::TransportClosed`], and initiates
+//! QP/driver shutdown.
 
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use tokio::sync::{Mutex, Semaphore, mpsc};
-use tokio::task::JoinHandle;
+use tokio::sync::{Mutex, Notify, Semaphore, mpsc};
 
 use crate::async_cm::AsyncCmListener;
 use crate::cm::ConnParam;
 use crate::wr::{SendFlags, SendWr, Sge, WrOpcode};
 
 use super::connection::{
-    CmMonitorHandle, CompletionMode, Connection, ConnectionBuilder, ConnectionConfig,
+    CmMonitorHandle, CompletionMode, ConnectionBuilder, ConnectionConfig, ConnectionParts,
+    ConnectionResources,
 };
 use super::driver::CqDriverHandle;
 use super::error::{Error, Result};
 use super::mr::{AccessIntent, Mr};
 use super::pd::Pd;
 use super::protocol;
-use super::shared_qp::OpFuture;
+use super::shared_qp::{OpFuture, SharedQp};
 
 /// Builder for creating a [`MessageTransport`].
 ///
@@ -223,16 +232,19 @@ impl MessageTransportBuilder {
 
     /// Connect to a remote endpoint and create a transport (client side).
     ///
-    /// Allocates all MRs, posts receive buffers (before the CM handshake),
-    /// exchanges HELLO with the peer, initializes credits, and returns a
-    /// ready-to-use transport.
+    /// Returns a `(MessageTransport, MessageTransportDriver)` pair. The
+    /// caller must spawn or poll the driver for transport progress.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidConfig`] on invalid builder parameters,
-    /// [`Error::ProtocolViolation`] on HELLO handshake failure, or any
-    /// verbs/CM error during resource allocation and connection setup.
-    pub async fn connect(self, addr: SocketAddr) -> Result<MessageTransport> {
+    /// Returns [`Error::InvalidConfig`] on invalid builder parameters, or
+    /// any verbs/CM error during resource allocation and connection setup.
+    /// HELLO handshake errors are reported through the driver result and
+    /// [`MessageTransport::ready()`], not from this method.
+    pub async fn connect(
+        self,
+        addr: SocketAddr,
+    ) -> Result<(MessageTransport, MessageTransportDriver)> {
         self.validate()?;
         let send_count = self.send_buffer_count;
         let recv_count = self.recv_buffer_count;
@@ -246,7 +258,7 @@ impl MessageTransportBuilder {
         let pre_posted: std::sync::Mutex<Option<Vec<OpFuture>>> = std::sync::Mutex::new(None);
 
         let builder = ConnectionBuilder::new(config)?;
-        let conn = builder
+        let parts = builder
             .connect(&addr, |sqp, pd| {
                 let futures = allocate_and_prepost_recvs(
                     sqp.qp(),
@@ -265,21 +277,24 @@ impl MessageTransportBuilder {
             .unwrap()
             .ok_or_else(|| Error::InvalidConfig("pre_establish not called".into()))?;
 
-        MessageTransport::from_connection(conn, send_count, recv_count, buf_size, pre_posted).await
+        MessageTransport::from_parts(parts, send_count, recv_count, buf_size, pre_posted).await
     }
 
     /// Accept a connection and create a transport (server side).
     ///
-    /// Allocates all MRs, posts receive buffers (before the CM `accept()`),
-    /// exchanges HELLO with the peer, initializes credits, and returns a
-    /// ready-to-use transport.
+    /// Returns a `(MessageTransport, MessageTransportDriver)` pair. The
+    /// caller must spawn or poll the driver for transport progress.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidConfig`] on invalid builder parameters,
-    /// [`Error::ProtocolViolation`] on HELLO handshake failure, or any
-    /// verbs/CM error during resource allocation and connection setup.
-    pub async fn accept(self, listener: &AsyncCmListener) -> Result<MessageTransport> {
+    /// Returns [`Error::InvalidConfig`] on invalid builder parameters, or
+    /// any verbs/CM error during resource allocation and connection setup.
+    /// HELLO handshake errors are reported through the driver result and
+    /// [`MessageTransport::ready()`], not from this method.
+    pub async fn accept(
+        self,
+        listener: &AsyncCmListener,
+    ) -> Result<(MessageTransport, MessageTransportDriver)> {
         self.validate()?;
         let send_count = self.send_buffer_count;
         let recv_count = self.recv_buffer_count;
@@ -291,7 +306,7 @@ impl MessageTransportBuilder {
         let pre_posted: std::sync::Mutex<Option<Vec<OpFuture>>> = std::sync::Mutex::new(None);
 
         let builder = ConnectionBuilder::new(config)?;
-        let conn = builder
+        let parts = builder
             .accept(listener, |sqp, pd| {
                 let futures = allocate_and_prepost_recvs(
                     sqp.qp(),
@@ -310,7 +325,7 @@ impl MessageTransportBuilder {
             .unwrap()
             .ok_or_else(|| Error::InvalidConfig("pre_establish not called".into()))?;
 
-        MessageTransport::from_connection(conn, send_count, recv_count, buf_size, pre_posted).await
+        MessageTransport::from_parts(parts, send_count, recv_count, buf_size, pre_posted).await
     }
 }
 
@@ -393,50 +408,164 @@ impl std::fmt::Debug for ReceivedMessage {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Transport Shared State
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Transport lifecycle states.
+const STATE_CREATED: u8 = 0;
+const STATE_READY: u8 = 2;
+const STATE_CLOSING: u8 = 3;
+const STATE_STOPPED: u8 = 4;
+const STATE_FAILED: u8 = 5;
+
+/// Shared lifecycle state between [`MessageTransport`] and [`MessageTransportDriver`].
+pub(crate) struct TransportSharedState {
+    /// Lifecycle state machine.
+    pub(crate) state: AtomicU8,
+    /// Wakes `ready()`, `send()`, `recv()`, `close()` on state changes.
+    pub(crate) state_notify: Notify,
+    /// Remote receive credits (initialized empty, filled by driver after HELLO).
+    pub(crate) remote_credits: Semaphore,
+    /// Whether the frontend is still alive.
+    pub(crate) frontend_alive: AtomicBool,
+    /// Driver handle refs for shutdown.
+    pub(crate) driver_handles: Vec<Arc<CqDriverHandle>>,
+    /// Shared QP for send operations in both frontend and driver.
+    pub(crate) shared_qp: Arc<SharedQp>,
+}
+
+impl TransportSharedState {
+    fn new(shared_qp: Arc<SharedQp>, driver_handles: Vec<Arc<CqDriverHandle>>) -> Self {
+        Self {
+            state: AtomicU8::new(STATE_CREATED),
+            state_notify: Notify::new(),
+            remote_credits: Semaphore::new(0),
+            frontend_alive: AtomicBool::new(true),
+            driver_handles,
+            shared_qp,
+        }
+    }
+
+    fn is_terminal(&self) -> bool {
+        let s = self.state.load(Ordering::Acquire);
+        s == STATE_STOPPED || s == STATE_FAILED
+    }
+
+    /// Mark the driver as dead and wake all waiters.
+    fn mark_driver_dead(&self) {
+        // Try to transition to Failed; if already terminal, don't overwrite
+        let current = self.state.load(Ordering::Acquire);
+        if current != STATE_STOPPED && current != STATE_FAILED {
+            self.state.store(STATE_FAILED, Ordering::Release);
+        }
+        self.remote_credits.close();
+        self.state_notify.notify_waiters();
+
+        // Shut down the QP and CQ drivers
+        let _ = self.shared_qp.shutdown();
+        for h in &self.driver_handles {
+            h.flush_and_shutdown();
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Message Transport Driver
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The driver future for a message transport.
+///
+/// Owns all background processing: CQ completion driving, receive
+/// pumping, HELLO/credit protocol, CM disconnect monitoring, and
+/// cancellation reclamation. Implements `Future<Output = Result<()>> + Send`.
+///
+/// The caller must spawn this on a Tokio runtime for transport progress.
+/// Exactly one spawned task per endpoint is sufficient in both shared
+/// and separate CQ modes.
+///
+/// # Drop
+///
+/// Dropping the driver (whether never polled, or aborted mid-flight)
+/// transitions the transport to failed state and wakes all frontend
+/// waiters. This is safe and deterministic.
+pub struct MessageTransportDriver {
+    inner: Option<Pin<Box<dyn Future<Output = Result<()>> + Send>>>,
+    state: Arc<TransportSharedState>,
+}
+
+impl Future for MessageTransportDriver {
+    type Output = Result<()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let inner = self
+            .inner
+            .as_mut()
+            .expect("MessageTransportDriver polled after completion");
+        match inner.as_mut().poll(cx) {
+            Poll::Ready(result) => {
+                self.inner = None; // prevent double-poll
+                if result.is_err() {
+                    self.state.mark_driver_dead();
+                } else {
+                    // Normal completion — mark stopped
+                    let current = self.state.state.load(Ordering::Acquire);
+                    if current != STATE_FAILED {
+                        self.state.state.store(STATE_STOPPED, Ordering::Release);
+                    }
+                    self.state.remote_credits.close();
+                    self.state.state_notify.notify_waiters();
+                }
+                Poll::Ready(result)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for MessageTransportDriver {
+    fn drop(&mut self) {
+        // Synchronous cleanup: mark driver dead, close credits,
+        // wake all waiters — runs even if never polled or aborted
+        self.state.mark_driver_dead();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Internal: Completed Receive
+// ═══════════════════════════════════════════════════════════════════════════
+
 /// Internal struct for a completed receive to pass through the channel.
 struct CompletedRecv {
     mr: Mr,
     byte_len: usize,
 }
 
-/// Message-oriented RDMA transport.
+/// Message-oriented RDMA transport (frontend handle).
 ///
 /// Provides async `send()` and `recv()` with pre-registered reusable
 /// buffer pools, message boundaries, credit-based flow control, and
-/// deterministic disconnect handling.
+/// deterministic lifecycle management.
 ///
-/// # Send Semantics
+/// This is the frontend half of the two-object contract. The driver
+/// future ([`MessageTransportDriver`]) must be spawned separately for
+/// transport progress.
 ///
-/// `send().await` means the local send completion (CQE) was received
-/// with success status. It does **not** mean the remote peer has consumed
-/// the message.
+/// # Task Count
 ///
-/// # Credit-Based Backpressure
-///
-/// Each outbound DATA frame requires one remote receive credit, acquired
-/// from a semaphore initialized from the peer's HELLO handshake. When
-/// all credits are consumed, `send()` waits asynchronously. Credits are
-/// returned when the peer reposts a data receive buffer (after dropping
-/// a [`ReceivedMessage`]). RC RNR retry is a safety net, NOT the primary
-/// flow-control mechanism.
-///
-/// # Ordering
-///
-/// Message ordering is guaranteed by RC QP semantics for WRs posted
-/// by a single task. Concurrent multi-task sends may interleave at QP
-/// level.
+/// Exactly one user-spawned driver task per endpoint is sufficient
+/// in both shared and separate CQ modes. `send()` and `recv()` run
+/// in the caller's task context.
 ///
 /// # Cancellation Safety
 ///
 /// - Cancelling `send()` before WR posting: the credit permit is returned
 ///   automatically. No resource leak.
 /// - Cancelling `send()` after WR posting: the MR returns to the send pool
-///   when the CQE arrives via `on_cancel_reclaim`. The credit is correctly
-///   consumed (the WR will use a peer recv buffer).
+///   when the CQE arrives via `on_cancel_reclaim`.
 /// - Cancelling `recv()`: the message stays in the internal channel
 ///   for the next `recv()` call. No message is lost.
 pub struct MessageTransport {
-    connection: Connection,
     buffer_size: usize,
     /// Send pool: bounded channel of available send MRs.
     send_pool_tx: mpsc::Sender<Mr>,
@@ -445,92 +574,31 @@ pub struct MessageTransport {
     recv_msg_rx: Arc<Mutex<mpsc::Receiver<CompletedRecv>>>,
     /// Repost channel: MRs returned from ReceivedMessage for reposting.
     repost_tx: mpsc::UnboundedSender<Mr>,
-    /// Remote receive credits (initialized from peer HELLO).
-    remote_credits: Arc<Semaphore>,
-    /// Transport closed flag — shared with all tasks.
-    closed: Arc<AtomicBool>,
-    /// Recv pump task handle.
-    recv_pump_task: Option<JoinHandle<()>>,
-    /// Disconnect monitor task handle.
-    disconnect_task: Option<JoinHandle<()>>,
+    /// Shared lifecycle state with the driver.
+    state: Arc<TransportSharedState>,
 }
 
 impl MessageTransport {
-    /// Build a transport from an established connection, pre-posted recv
-    /// futures, and send buffer configuration.
-    ///
-    /// Performs the HELLO readiness handshake, initializes credits, and
-    /// spawns the recv pump and disconnect monitor.
-    async fn from_connection(
-        mut connection: Connection,
+    /// Build a transport pair from established connection parts.
+    async fn from_parts(
+        mut parts: ConnectionParts,
         send_count: usize,
         recv_count: usize,
         buffer_size: usize,
         pre_posted_recvs: Vec<OpFuture>,
-    ) -> Result<Self> {
-        let pd = connection.pd().clone();
+    ) -> Result<(Self, MessageTransportDriver)> {
+        let pd = parts.shared_qp.pd().clone();
         let data_mr_size = protocol::data_mr_size(buffer_size);
 
-        // === HELLO Handshake ===
-        // Send our HELLO frame
-        let mut hello_mr = pd.reg_mr(protocol::HELLO_FRAME_SIZE, AccessIntent::LocalOnly)?;
-        let hello_len = protocol::write_hello_frame(
-            hello_mr.as_mut_slice(),
-            recv_count as u32,
-            buffer_size as u32,
-        );
-        let (result, _hello_mr) = connection
-            .shared_qp()
-            .send(hello_mr, Some((0, hello_len)))
-            .await;
-        result?;
+        let shared_qp = Arc::new(parts.shared_qp);
+        let driver_handles = parts.driver_handles;
 
-        // Wait for peer's HELLO (with timeout)
-        let mut remaining_futures = pre_posted_recvs;
-        let peer_capacity = tokio::time::timeout(Duration::from_secs(10), async {
-            let poll_result = poll_any_ready(&mut remaining_futures).await;
-            match poll_result {
-                PollResult::Ready(idx, Ok((completion, mr))) => {
-                    remaining_futures.swap_remove(idx);
-                    let byte_len = completion.byte_len() as usize;
-                    let header = protocol::parse_header(mr.as_slice(), byte_len)?;
-                    if header.frame_type == protocol::FRAME_HELLO {
-                        let hello = protocol::parse_hello(&mr.as_slice()[protocol::HEADER_SIZE..])?;
-                        // Validate peer's max_message_size is compatible
-                        let peer_max = hello.max_message_size as usize;
-                        if peer_max < buffer_size {
-                            return Err(Error::ProtocolViolation(format!(
-                                "peer max_message_size {peer_max} < local buffer_size {buffer_size}; \
-                                 sending max-size messages would overrun peer recv buffers"
-                            )));
-                        }
-                        let capacity = hello.data_recv_capacity as usize;
-                        let qp = connection.shared_qp().qp().clone();
-                        let handle = connection.shared_qp().recv_handle().clone();
-                        let future = post_recv_and_track(&qp, &handle, mr)?;
-                        remaining_futures.push(future);
-                        Ok::<usize, Error>(capacity)
-                    } else {
-                        Err(Error::ProtocolViolation(format!(
-                            "expected HELLO, got frame_type={}",
-                            header.frame_type,
-                        )))
-                    }
-                }
-                PollResult::Ready(idx, Err((err, _mr))) => {
-                    remaining_futures.swap_remove(idx);
-                    Err(err)
-                }
-            }
-        })
-        .await
-        .map_err(|_| Error::ProtocolViolation("HELLO handshake timeout".into()))??;
+        let shared_state = Arc::new(TransportSharedState::new(
+            Arc::clone(&shared_qp),
+            driver_handles.clone(),
+        ));
 
-        // Initialize credit semaphore from peer's announced data recv capacity
-        let remote_credits = Arc::new(Semaphore::new(peer_capacity));
-        let closed = Arc::new(AtomicBool::new(false));
-
-        // === Allocate send buffers (data MR size for protocol header) ===
+        // === Allocate send buffers ===
         let (send_pool_tx, send_pool_rx) = mpsc::channel(send_count);
         for _ in 0..send_count {
             let mr = pd.reg_mr(data_mr_size, AccessIntent::LocalOnly)?;
@@ -554,83 +622,94 @@ impl MessageTransport {
         let (recv_msg_tx, recv_msg_rx) = mpsc::channel(recv_count + protocol::CTRL_RECV_COUNT);
         let (repost_tx, repost_rx) = mpsc::unbounded_channel();
 
-        // Recv pump
-        let pump_qp = connection.shared_qp().qp().clone();
-        let pump_send_handle = connection.shared_qp().send_handle().clone();
-        let pump_recv_handle = if connection.driver_handles().len() > 1 {
-            connection.driver_handles()[1].clone()
-        } else {
-            connection.driver_handles()[0].clone()
-        };
-        let pump_credits = remote_credits.clone();
-        let pump_closed = closed.clone();
+        let cm_monitor_handle = parts.cm_monitor_handle.take();
+        let recv_handle_idx = if driver_handles.len() > 1 { 1 } else { 0 };
+        let driver_recv_handle = driver_handles[recv_handle_idx].clone();
+        let driver_send_handle = driver_handles[0].clone();
 
-        let recv_pump_task = tokio::spawn(recv_pump(
-            pump_qp,
-            pump_send_handle,
-            pump_recv_handle,
-            pd,
-            remaining_futures,
-            recv_msg_tx,
-            repost_rx,
-            ctrl_send_tx.clone(),
-            ctrl_send_rx,
-            pump_credits,
-            pump_closed,
-        ));
+        let driver_future: Pin<Box<dyn Future<Output = Result<()>> + Send>> = Box::pin(
+            driver_run(
+                Arc::clone(&shared_state),
+                Arc::clone(&shared_qp),
+                driver_send_handle,
+                driver_recv_handle,
+                driver_handles.clone(),
+                parts.driver_futures,
+                parts.resources,
+                cm_monitor_handle,
+                pd,
+                pre_posted_recvs,
+                recv_count,
+                buffer_size,
+                recv_msg_tx,
+                repost_rx,
+                ctrl_send_tx,
+                ctrl_send_rx,
+                send_pool_tx.clone(),
+                repost_tx.clone(),
+            ),
+        );
 
-        // === Disconnect Monitor ===
-        let cm_handle = connection.take_cm_monitor_handle();
-        let disc_closed = closed.clone();
-        let disc_credits = remote_credits.clone();
-        let disc_handles: Vec<_> = connection.driver_handles().to_vec();
-
-        let disconnect_task = cm_handle.map(|handle| {
-            tokio::spawn(disconnect_monitor(
-                handle,
-                disc_closed,
-                disc_credits,
-                disc_handles,
-            ))
-        });
-
-        Ok(Self {
-            connection,
+        let transport = Self {
             buffer_size,
             send_pool_tx,
             send_pool_rx: Arc::new(Mutex::new(send_pool_rx)),
             recv_msg_rx: Arc::new(Mutex::new(recv_msg_rx)),
             repost_tx,
-            remote_credits,
-            closed,
-            recv_pump_task: Some(recv_pump_task),
-            disconnect_task,
-        })
+            state: Arc::clone(&shared_state),
+        };
+
+        let driver = MessageTransportDriver {
+            inner: Some(driver_future),
+            state: shared_state,
+        };
+
+        Ok((transport, driver))
+    }
+
+    /// Wait for the transport to become ready (HELLO handshake complete).
+    pub async fn ready(&self) -> Result<()> {
+        loop {
+            let notified = self.state.state_notify.notified();
+            let s = self.state.state.load(Ordering::Acquire);
+            match s {
+                STATE_READY | STATE_CLOSING => return Ok(()),
+                STATE_STOPPED | STATE_FAILED => return Err(Error::TransportClosed),
+                _ => {}
+            }
+            notified.await;
+        }
+    }
+
+    /// Wait for readiness internally.
+    async fn await_ready(&self) -> Result<()> {
+        let s = self.state.state.load(Ordering::Acquire);
+        if s == STATE_READY || s == STATE_CLOSING {
+            return Ok(());
+        }
+        if s == STATE_STOPPED || s == STATE_FAILED {
+            return Err(Error::TransportClosed);
+        }
+        self.ready().await
+    }
+
+    /// Access the shared queue pair.
+    pub fn shared_qp(&self) -> &SharedQp {
+        &self.state.shared_qp
+    }
+
+    /// Access the driver handles.
+    pub fn driver_handles(&self) -> &[Arc<CqDriverHandle>] {
+        &self.state.driver_handles
     }
 
     /// Send a message. Returns when the local send completion arrives.
     ///
-    /// `send().await` is local-completion only — it does NOT guarantee
-    /// remote consumption.
-    ///
-    /// # Credit Flow
-    ///
-    /// Acquires one remote receive credit before posting. If no credits
-    /// are available, waits asynchronously until the peer returns credits
-    /// (by dropping received messages).
-    ///
     /// # Errors
     ///
     /// - [`Error::MessageTooLarge`] if `data.len() > buffer_size`
-    /// - [`Error::TransportClosed`] if the transport is shut down or
-    ///   disconnected (including credit semaphore closed)
+    /// - [`Error::TransportClosed`] if the transport is shut down or disconnected
     /// - [`Error::CompletionError`] if the send WR completed with error
-    ///
-    /// # Cancellation Safety
-    ///
-    /// If cancelled before the WR is posted, the credit permit is returned
-    /// automatically. If cancelled after posting, the `on_cancel_reclaim`
-    /// callback returns the MR to the send pool when the CQE arrives.
     pub async fn send(&self, data: &[u8]) -> Result<()> {
         if data.len() > self.buffer_size {
             return Err(Error::MessageTooLarge {
@@ -639,40 +718,32 @@ impl MessageTransport {
             });
         }
 
-        if self.closed.load(Ordering::Acquire) {
-            return Err(Error::TransportClosed);
-        }
+        // Await readiness (HELLO must be complete)
+        self.await_ready().await?;
 
-        // Acquire remote receive credit (cancellation-safe: permit is
-        // returned automatically if the future is dropped)
+        // Acquire remote receive credit
         let credit_permit = self
+            .state
             .remote_credits
             .acquire()
             .await
             .map_err(|_| Error::TransportClosed)?;
 
-        // Acquire send buffer from the pool (backpressure point)
+        // Acquire send buffer from the pool
         let mut mr = {
             let mut rx = self.send_pool_rx.lock().await;
             rx.recv().await.ok_or(Error::TransportClosed)?
         };
 
-        // === SYNCHRONOUS SECTION (no .await, no cancellation) ===
-
-        // Write protocol frame: header + payload
+        // === SYNCHRONOUS SECTION ===
         let frame_len = protocol::write_data_frame(mr.as_mut_slice(), data);
-
-        // Post send WR directly (avoid OpFuture Pending → Inflight transition
-        // that would create a cancellation window between credit acquire and
-        // WR posting)
-        let qp = self.connection.shared_qp().qp().clone();
-        let handle = self.connection.shared_qp().send_handle().clone();
+        let qp = self.state.shared_qp.qp().clone();
+        let handle = self.state.shared_qp.send_handle().clone();
 
         let reg = match handle.map().register() {
             Some(r) => r,
             None => {
                 let _ = self.send_pool_tx.try_send(mr);
-                // credit_permit drops → credit returned
                 return Err(Error::CapacityExhausted);
             }
         };
@@ -687,28 +758,20 @@ impl MessageTransport {
         if let Err(e) = qp.post_send_wr_raw(&mut wr) {
             handle.map().release(token);
             let _ = self.send_pool_tx.try_send(mr);
-            // credit_permit drops → credit returned
             return Err(e);
         }
         handle.notify_work();
-
-        // WR is posted. The credit is correctly consumed — forget the permit.
         credit_permit.forget();
-
         // === END SYNCHRONOUS SECTION ===
 
-        // Create inflight OpFuture and await CQE
         let send_pool_tx = self.send_pool_tx.clone();
         let op = OpFuture::new_inflight(handle, token, mr).on_cancel_reclaim(Box::new(move |mr| {
             let _ = send_pool_tx.try_send(mr);
         }));
 
         let (result, mr) = op.await;
-
-        // Always return MR to pool first, even on error (prevents pool leak)
         let _ = self.send_pool_tx.try_send(mr);
 
-        // Map flush errors to TransportClosed at the transport boundary
         result.map_err(|e| match &e {
             Error::CompletionError { status, .. } if *status == crate::wc::WcStatus::WrFlushErr => {
                 Error::TransportClosed
@@ -721,20 +784,12 @@ impl MessageTransport {
 
     /// Receive a message. Returns the next completed message.
     ///
-    /// Multiple concurrent `recv()` calls are supported. Each message
-    /// is delivered to exactly one receiver (FIFO from the internal
-    /// mpsc channel serialized by a Mutex).
-    ///
-    /// # Cancellation Safety
-    ///
-    /// Cancelling `recv()` does not consume or lose any message.
-    /// The message remains in the internal channel for the next caller.
-    ///
     /// # Errors
     ///
-    /// - [`Error::TransportClosed`] if the transport is shut down or
-    ///   disconnected
+    /// - [`Error::TransportClosed`] if the transport is shut down or disconnected
     pub async fn recv(&self) -> Result<ReceivedMessage> {
+        self.await_ready().await?;
+
         let completed = {
             let mut rx = self.recv_msg_rx.lock().await;
             rx.recv().await.ok_or(Error::TransportClosed)?
@@ -752,277 +807,442 @@ impl MessageTransport {
         self.buffer_size
     }
 
-    /// Access the underlying connection.
-    pub fn connection(&self) -> &Connection {
-        &self.connection
-    }
-
     /// Graceful async shutdown.
     ///
-    /// Closes all internal channels, aborts the recv pump and disconnect
-    /// monitor, and initiates connection shutdown.
-    pub async fn close(mut self) {
-        // Mark as closed
-        self.closed.store(true, Ordering::Release);
-        self.remote_credits.close();
-
-        // Abort recv pump
-        if let Some(task) = self.recv_pump_task.take() {
-            task.abort();
-            let _ = task.await;
+    /// Signals the driver to shut down and waits for it to reach
+    /// a terminal state. Does NOT own the driver's `JoinHandle` —
+    /// the caller is responsible for awaiting the spawn handle.
+    pub async fn close(&self) {
+        // Transition to Closing
+        let current = self.state.state.load(Ordering::Acquire);
+        if current == STATE_STOPPED || current == STATE_FAILED {
+            return;
         }
+        self.state.state.store(STATE_CLOSING, Ordering::Release);
+        self.state.remote_credits.close();
+        self.state.state_notify.notify_waiters();
 
-        // Abort disconnect monitor
-        if let Some(task) = self.disconnect_task.take() {
-            task.abort();
-            let _ = task.await;
+        // Wait for terminal state
+        loop {
+            let notified = self.state.state_notify.notified();
+            if self.state.is_terminal() {
+                return;
+            }
+            notified.await;
         }
-
-        self.connection.initiate_shutdown();
     }
 }
 
 impl Drop for MessageTransport {
     fn drop(&mut self) {
-        self.closed.store(true, Ordering::Release);
-        self.remote_credits.close();
-
-        if let Some(task) = self.recv_pump_task.take() {
-            task.abort();
-        }
-        if let Some(task) = self.disconnect_task.take() {
-            task.abort();
-        }
-        // Connection::drop handles QP→error + driver shutdown
+        // Signal frontend absence to the driver
+        self.state.frontend_alive.store(false, Ordering::Release);
+        self.state.remote_credits.close();
+        self.state.state_notify.notify_waiters();
     }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Disconnect Monitor
+// Composed Driver Future
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// CM event monitor — sole consumer of the connection's event channel.
+/// The composed driver async function — runs CQ drivers, HELLO handshake,
+/// recv pump, and disconnect monitor all within one task.
 ///
-/// On peer disconnect or CM error, atomically closes the transport.
-/// Does NOT own the `CmId` — that stays in [`Connection`] for safe
-/// QP-before-CmId destruction ordering. Uses `compare_exchange` on the
-/// `closed` flag to ensure idempotent shutdown.
-async fn disconnect_monitor(
-    handle: CmMonitorHandle,
-    closed: Arc<AtomicBool>,
-    credits: Arc<Semaphore>,
-    driver_handles: Vec<Arc<CqDriverHandle>>,
-) {
-    use crate::cm::CmEventType;
-
-    loop {
-        let guard_result = handle.cm_async_fd.readable().await;
-        let mut guard = match guard_result {
-            Ok(g) => g,
-            Err(_) => break,
-        };
-
-        match handle.event_channel.try_get_event() {
-            Ok(event) => {
-                let event_type = event.event_type();
-                tracing::debug!(?event_type, "disconnect_monitor: CM event");
-                match event_type {
-                    CmEventType::Disconnected | CmEventType::DeviceRemoval => break,
-                    _ => {}
-                }
-            }
-            Err(crate::Error::WouldBlock) => {
-                guard.clear_ready();
-                continue;
-            }
-            Err(_) => break,
-        }
-
-        guard.clear_ready();
-    }
-
-    if closed
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
-    {
-        tracing::info!("disconnect_monitor: peer disconnected, closing transport");
-        credits.close();
-        for h in &driver_handles {
-            h.flush_and_shutdown();
-        }
-    }
-
-    // CmMonitorHandle drops: AsyncFd deregistered, Arc<EventChannel> decremented.
-    // CmId stays in Connection — QP-before-CmId ordering maintained.
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Recv Pump
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Background task that manages receive buffer posting, frame parsing,
-/// credit handling, and completion routing.
+/// # Phases
 ///
-/// # Responsibilities
-///
-/// 1. Poll pre-posted recv OpFutures for completions
-/// 2. Parse incoming frame headers (DATA/CREDIT/HELLO)
-/// 3. Deliver DATA frames to the user's recv channel
-/// 4. Process CREDIT frames: add credits to the sender's semaphore
-/// 5. Repost recv MRs from ReceivedMessage drops + send CREDIT to peer
-/// 6. Repost control MRs immediately after processing
+/// - **Phase A (Handshake)**: CQ drivers poll concurrently with HELLO
+///   send/receive. Once HELLO succeeds, credits are initialized and state
+///   transitions to Ready.
+/// - **Phase B (Steady State)**: CQ drivers, recv pump, and disconnect
+///   monitor run concurrently in a select loop.
+/// - **Phase C (Shutdown)**: On close/disconnect/error, the QP is
+///   transitioned to error, CQ drivers drain, then the function exits.
 #[expect(clippy::too_many_arguments)]
-async fn recv_pump(
-    qp: Arc<super::qp::Qp>,
+async fn driver_run(
+    state: Arc<TransportSharedState>,
+    shared_qp: Arc<SharedQp>,
     send_handle: Arc<CqDriverHandle>,
     recv_handle: Arc<CqDriverHandle>,
+    driver_handles: Vec<Arc<CqDriverHandle>>,
+    cq_driver_futures: Vec<Pin<Box<dyn Future<Output = super::error::Result<()>> + Send>>>,
+    _resources: ConnectionResources, // kept alive for drop ordering
+    cm_monitor_handle: Option<CmMonitorHandle>,
     _pd: Pd, // kept alive so MRs remain valid
-    initial_futures: Vec<OpFuture>,
+    initial_recvs: Vec<OpFuture>,
+    recv_count: usize,
+    buffer_size: usize,
     recv_msg_tx: mpsc::Sender<CompletedRecv>,
     mut repost_rx: mpsc::UnboundedReceiver<Mr>,
     ctrl_send_tx: mpsc::Sender<Mr>,
     mut ctrl_send_rx: mpsc::Receiver<Mr>,
-    remote_credits: Arc<Semaphore>,
-    closed: Arc<AtomicBool>,
-) {
-    let mut pending_recvs: Vec<OpFuture> = initial_futures;
-    let mut pending_credits: u32 = 0;
+    _send_pool_tx: mpsc::Sender<Mr>,
+    _repost_tx: mpsc::UnboundedSender<Mr>,
+) -> Result<()> {
+    use crate::cm::CmEventType;
+
+    // Combine all CQ driver futures into one joined future.
+    // We use a FuturesUnordered to poll them all concurrently.
+    let mut cq_futures: futures_util::stream::FuturesUnordered<_> =
+        cq_driver_futures.into_iter().collect();
+
+    // ─── Phase A: HELLO Handshake (concurrent with CQ drivers) ───
+
+    // Send our HELLO frame
+    let mut hello_mr = shared_qp
+        .pd()
+        .reg_mr(protocol::HELLO_FRAME_SIZE, AccessIntent::LocalOnly)?;
+    let hello_len = protocol::write_hello_frame(
+        hello_mr.as_mut_slice(),
+        recv_count as u32,
+        buffer_size as u32,
+    );
+
+    // We need to poll CQ drivers concurrently with HELLO send + recv
+    // because the OpFutures require CQ dispatch to complete.
+    let mut remaining_futures = initial_recvs;
+
+    // Send HELLO — this creates an OpFuture that needs CQ driver to dispatch
+    let hello_send = shared_qp.send(hello_mr, Some((0, hello_len)));
+    tokio::pin!(hello_send);
+
+    // Phase A loop: drive CQ futures while waiting for HELLO send
+    let mut hello_sent = false;
+    let mut peer_capacity: Option<usize> = None;
+
+    let hello_timeout = tokio::time::sleep(Duration::from_secs(10));
+    tokio::pin!(hello_timeout);
 
     loop {
-        if closed.load(Ordering::Acquire) {
-            return;
+        // Check if we're done with handshake
+        if hello_sent && peer_capacity.is_some() {
+            break;
         }
 
-        // Try to send pending credits before blocking
-        if pending_credits > 0
-            && let Ok(mut ctrl_mr) = ctrl_send_rx.try_recv()
-        {
-            let credits_to_send = pending_credits;
-            pending_credits = 0;
-            let frame_len = protocol::write_credit_frame(ctrl_mr.as_mut_slice(), credits_to_send);
-            let ctx = ctrl_send_tx.clone();
-            let _ = post_send_and_detach(
-                &qp,
-                &send_handle,
-                ctrl_mr,
-                frame_len,
-                Box::new(move |mr| {
-                    let _ = ctx.try_send(mr);
-                }),
-            );
+        if !state.frontend_alive.load(Ordering::Acquire) {
+            return Err(Error::TransportClosed);
+        }
+
+        tokio::select! {
+            biased;
+
+            // Drive CQ completions (always)
+            Some(cq_result) = futures_util::StreamExt::next(&mut cq_futures) => {
+                // A CQ driver exited during handshake — this is a problem
+                match cq_result {
+                    Ok(()) => return Err(Error::DriverShutdown),
+                    Err(e) => return Err(e),
+                }
+            }
+
+            // Drive HELLO send if not done
+            result = &mut hello_send, if !hello_sent => {
+                let (send_result, _mr) = result;
+                send_result?;
+                hello_sent = true;
+            }
+
+            // Drive recv completions to catch peer's HELLO
+            result = poll_any_ready(&mut remaining_futures), if peer_capacity.is_none() && !remaining_futures.is_empty() => {
+                match result {
+                    PollResult::Ready(idx, Ok((completion, mr))) => {
+                        remaining_futures.swap_remove(idx);
+                        let byte_len = completion.byte_len() as usize;
+                        let header = protocol::parse_header(mr.as_slice(), byte_len)?;
+                        if header.frame_type == protocol::FRAME_HELLO {
+                            let hello = protocol::parse_hello(&mr.as_slice()[protocol::HEADER_SIZE..])?;
+                            let peer_max = hello.max_message_size as usize;
+                            if peer_max < buffer_size {
+                                return Err(Error::ProtocolViolation(format!(
+                                    "peer max_message_size {peer_max} < local buffer_size {buffer_size}; \
+                                     sending max-size messages would overrun peer recv buffers"
+                                )));
+                            }
+                            peer_capacity = Some(hello.data_recv_capacity as usize);
+                            // Repost the HELLO recv buffer
+                            let qp = shared_qp.qp().clone();
+                            let future = post_recv_and_track(&qp, &recv_handle, mr)?;
+                            remaining_futures.push(future);
+                        } else {
+                            return Err(Error::ProtocolViolation(format!(
+                                "expected HELLO, got frame_type={}",
+                                header.frame_type,
+                            )));
+                        }
+                    }
+                    PollResult::Ready(idx, Err((err, _mr))) => {
+                        remaining_futures.swap_remove(idx);
+                        return Err(err);
+                    }
+                }
+            }
+
+            // Timeout
+            () = &mut hello_timeout => {
+                return Err(Error::ProtocolViolation("HELLO handshake timeout".into()));
+            }
+        }
+    }
+
+    // Initialize credits from peer capacity
+    let credits = peer_capacity.unwrap();
+    state.remote_credits.add_permits(credits);
+
+    // Transition to Ready
+    state.state.store(STATE_READY, Ordering::Release);
+    state.state_notify.notify_waiters();
+
+    // ─── Phase B: Steady State (recv pump + disconnect monitor + CQ drivers) ───
+
+    let mut pending_recvs = remaining_futures;
+    let mut pending_credits: u32 = 0;
+
+    // Set up disconnect monitor as a pinned future
+    let disconnect_future = async {
+        if let Some(handle) = cm_monitor_handle {
+            loop {
+                let guard_result = handle.cm_async_fd.readable().await;
+                let mut guard = match guard_result {
+                    Ok(g) => g,
+                    Err(_) => break,
+                };
+
+                match handle.event_channel.try_get_event() {
+                    Ok(event) => {
+                        let event_type = event.event_type();
+                        tracing::debug!(?event_type, "driver: CM event");
+                        match event_type {
+                            CmEventType::Disconnected | CmEventType::DeviceRemoval => break,
+                            _ => {}
+                        }
+                    }
+                    Err(crate::Error::WouldBlock) => {
+                        guard.clear_ready();
+                        continue;
+                    }
+                    Err(_) => break,
+                }
+
+                guard.clear_ready();
+            }
+        } else {
+            // No CM handle — just pend forever
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::pin!(disconnect_future);
+
+    loop {
+        // Check state: closing, frontend dropped, etc.
+        let current_state = state.state.load(Ordering::Acquire);
+        if current_state == STATE_CLOSING || current_state == STATE_STOPPED || current_state == STATE_FAILED {
+            break;
+        }
+        if !state.frontend_alive.load(Ordering::Acquire) {
+            break;
+        }
+
+        // Flush pending credits if we have a control MR available
+        if pending_credits > 0 {
+            if let Ok(mut ctrl_mr) = ctrl_send_rx.try_recv() {
+                let credits_to_send = pending_credits;
+                pending_credits = 0;
+                let frame_len = protocol::write_credit_frame(ctrl_mr.as_mut_slice(), credits_to_send);
+                let ctx = ctrl_send_tx.clone();
+                let _ = post_send_and_detach(
+                    shared_qp.qp(),
+                    &send_handle,
+                    ctrl_mr,
+                    frame_len,
+                    Box::new(move |mr| {
+                        let _ = ctx.try_send(mr);
+                    }),
+                );
+            }
         }
 
         if pending_recvs.is_empty() {
-            // All buffers are out — wait for repost, ctrl MR, or shutdown
+            // All buffers are out — wait for repost, ctrl MR, CQ, or shutdown
             tokio::select! {
                 biased;
+
+                // CQ driver exit
+                Some(cq_result) = futures_util::StreamExt::next(&mut cq_futures) => {
+                    if let Err(e) = cq_result {
+                        tracing::warn!("driver: CQ driver error: {e}");
+                    }
+                    break;
+                }
+
+                // Disconnect
+                () = &mut disconnect_future => {
+                    tracing::info!("driver: peer disconnected");
+                    break;
+                }
+
                 mr = repost_rx.recv() => {
                     match mr {
                         Some(mr) => {
                             pending_credits += 1;
-                            match post_recv_and_track(&qp, &recv_handle, mr) {
+                            match post_recv_and_track(shared_qp.qp(), &recv_handle, mr) {
                                 Ok(future) => pending_recvs.push(future),
-                                Err(_) => return,
+                                Err(_) => break,
                             }
                         }
-                        None => return,
+                        None => break,
                     }
                     continue;
                 }
-                // Wake when a control send MR returns (so we can flush credits)
+
                 ctrl_mr = ctrl_send_rx.recv(), if pending_credits > 0 => {
                     if let Some(mut ctrl_mr) = ctrl_mr {
                         let credits_to_send = pending_credits;
                         pending_credits = 0;
                         let frame_len = protocol::write_credit_frame(ctrl_mr.as_mut_slice(), credits_to_send);
                         let ctx = ctrl_send_tx.clone();
-                        let _ = post_send_and_detach(&qp, &send_handle, ctrl_mr, frame_len, Box::new(move |mr| { let _ = ctx.try_send(mr); }));
+                        let _ = post_send_and_detach(shared_qp.qp(), &send_handle, ctrl_mr, frame_len, Box::new(move |mr| { let _ = ctx.try_send(mr); }));
                     }
                     continue;
                 }
             }
-        }
+        } else {
+            // Normal operation: poll recv completions, reposts, CQ, disconnect
+            tokio::select! {
+                biased;
 
-        // Wait for: a recv completion, a reposted MR, or shutdown
-        tokio::select! {
-            biased;
-            // Poll pending recvs for the first completion
-            result = poll_any_ready(&mut pending_recvs) => {
-                match result {
-                    PollResult::Ready(idx, Ok((completion, mr))) => {
-                        pending_recvs.swap_remove(idx);
-                        let byte_len = completion.byte_len() as usize;
+                // CQ driver exit
+                Some(cq_result) = futures_util::StreamExt::next(&mut cq_futures) => {
+                    if let Err(e) = cq_result {
+                        tracing::warn!("driver: CQ driver error: {e}");
+                    }
+                    break;
+                }
 
-                        // Parse frame header
-                        match protocol::parse_header(mr.as_slice(), byte_len) {
-                            Ok(header) => {
-                                match header.frame_type {
-                                    protocol::FRAME_DATA => {
-                                        let payload_len = header.payload_len as usize;
-                                        if recv_msg_tx.send(CompletedRecv { mr, byte_len: payload_len }).await.is_err() {
-                                            return; // recv channel closed
+                // Disconnect
+                () = &mut disconnect_future => {
+                    tracing::info!("driver: peer disconnected");
+                    break;
+                }
+
+                // Recv completion
+                result = poll_any_ready(&mut pending_recvs) => {
+                    match result {
+                        PollResult::Ready(idx, Ok((completion, mr))) => {
+                            pending_recvs.swap_remove(idx);
+                            let byte_len = completion.byte_len() as usize;
+
+                            match protocol::parse_header(mr.as_slice(), byte_len) {
+                                Ok(header) => {
+                                    match header.frame_type {
+                                        protocol::FRAME_DATA => {
+                                            let payload_len = header.payload_len as usize;
+                                            if recv_msg_tx.send(CompletedRecv { mr, byte_len: payload_len }).await.is_err() {
+                                                break; // recv channel closed
+                                            }
                                         }
-                                    }
-                                    protocol::FRAME_CREDIT => {
-                                        if let Ok(credit) = protocol::parse_credit(&mr.as_slice()[protocol::HEADER_SIZE..]) {
-                                            remote_credits.add_permits(credit.credits as usize);
+                                        protocol::FRAME_CREDIT => {
+                                            if let Ok(credit) = protocol::parse_credit(&mr.as_slice()[protocol::HEADER_SIZE..]) {
+                                                state.remote_credits.add_permits(credit.credits as usize);
+                                            }
+                                            match post_recv_and_track(shared_qp.qp(), &recv_handle, mr) {
+                                                Ok(future) => pending_recvs.push(future),
+                                                Err(_) => break,
+                                            }
                                         }
-                                        // Repost control buffer immediately
-                                        match post_recv_and_track(&qp, &recv_handle, mr) {
-                                            Ok(future) => pending_recvs.push(future),
-                                            Err(_) => return,
+                                        protocol::FRAME_HELLO => {
+                                            tracing::warn!("driver: unexpected HELLO during normal operation");
+                                            match post_recv_and_track(shared_qp.qp(), &recv_handle, mr) {
+                                                Ok(future) => pending_recvs.push(future),
+                                                Err(_) => break,
+                                            }
                                         }
-                                    }
-                                    protocol::FRAME_HELLO => {
-                                        tracing::warn!("recv_pump: unexpected HELLO during normal operation");
-                                        // Repost immediately
-                                        match post_recv_and_track(&qp, &recv_handle, mr) {
-                                            Ok(future) => pending_recvs.push(future),
-                                            Err(_) => return,
-                                        }
-                                    }
-                                    _ => {
-                                        tracing::warn!(frame_type = header.frame_type, "recv_pump: unknown frame type");
-                                        match post_recv_and_track(&qp, &recv_handle, mr) {
-                                            Ok(future) => pending_recvs.push(future),
-                                            Err(_) => return,
+                                        _ => {
+                                            tracing::warn!(frame_type = header.frame_type, "driver: unknown frame type");
+                                            match post_recv_and_track(shared_qp.qp(), &recv_handle, mr) {
+                                                Ok(future) => pending_recvs.push(future),
+                                                Err(_) => break,
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            Err(e) => {
-                                tracing::warn!("recv_pump: protocol error: {e}");
-                                // Repost the buffer and continue
-                                match post_recv_and_track(&qp, &recv_handle, mr) {
-                                    Ok(future) => pending_recvs.push(future),
-                                    Err(_) => return,
+                                Err(e) => {
+                                    tracing::warn!("driver: protocol error: {e}");
+                                    match post_recv_and_track(shared_qp.qp(), &recv_handle, mr) {
+                                        Ok(future) => pending_recvs.push(future),
+                                        Err(_) => break,
+                                    }
                                 }
                             }
                         }
-                    }
-                    PollResult::Ready(idx, Err((_err, _mr))) => {
-                        pending_recvs.swap_remove(idx);
-                        tracing::debug!("recv_pump: recv completion error, shutting down");
-                        pending_recvs.clear();
-                        return;
+                        PollResult::Ready(idx, Err((_err, _mr))) => {
+                            pending_recvs.swap_remove(idx);
+                            tracing::debug!("driver: recv completion error, shutting down");
+                            pending_recvs.clear();
+                            break;
+                        }
                     }
                 }
-            }
-            // Drain repost channel eagerly
-            mr = repost_rx.recv() => {
-                match mr {
-                    Some(mr) => {
-                        pending_credits += 1;
-                        match post_recv_and_track(&qp, &recv_handle, mr) {
-                            Ok(future) => pending_recvs.push(future),
-                            Err(_) => return,
+
+                // Drain repost channel eagerly
+                mr = repost_rx.recv() => {
+                    match mr {
+                        Some(mr) => {
+                            pending_credits += 1;
+                            match post_recv_and_track(shared_qp.qp(), &recv_handle, mr) {
+                                Ok(future) => pending_recvs.push(future),
+                                Err(_) => break,
+                            }
                         }
+                        None => break,
                     }
-                    None => return,
                 }
             }
         }
     }
+
+    // ─── Phase C: Shutdown ───
+
+    // Transition state
+    let current = state.state.load(Ordering::Acquire);
+    if current != STATE_FAILED {
+        state.state.store(STATE_STOPPED, Ordering::Release);
+    }
+    state.remote_credits.close();
+    state.state_notify.notify_waiters();
+
+    // Initiate QP shutdown and CQ driver flush
+    let _ = shared_qp.shutdown();
+    for h in &driver_handles {
+        h.flush_and_shutdown();
+    }
+
+    // Let CQ drivers drain their final barrier (they'll exit when shutdown is set)
+    // We give them a bounded timeout to complete
+    let drain_timeout = tokio::time::sleep(Duration::from_secs(5));
+    tokio::pin!(drain_timeout);
+
+    loop {
+        tokio::select! {
+            biased;
+            Some(_) = futures_util::StreamExt::next(&mut cq_futures) => {
+                // CQ driver finished
+            }
+            () = &mut drain_timeout => {
+                tracing::warn!("driver: CQ drain timeout");
+                break;
+            }
+        }
+        // Check if all CQ futures are done
+        if cq_futures.is_empty() {
+            break;
+        }
+    }
+
+    // Drop remaining recv futures (they'll be cleaned up by the inflight map)
+    drop(pending_recvs);
+    drop(recv_msg_tx);
+
+    Ok(())
 }
 
 /// Result of polling pending recv futures.

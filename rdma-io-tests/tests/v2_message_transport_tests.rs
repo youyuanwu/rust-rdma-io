@@ -40,9 +40,16 @@ async fn make_transport_pair(
         .buffer_size(buf_size)
         .completion_mode(mode);
 
-    let server_task = tokio::spawn(async move { server_builder.accept(&listener).await.unwrap() });
-    let client_task =
-        tokio::spawn(async move { client_builder.connect(listen_addr).await.unwrap() });
+    let server_task = tokio::spawn(async move {
+        let (transport, driver) = server_builder.accept(&listener).await.unwrap();
+        tokio::spawn(driver);
+        transport
+    });
+    let client_task = tokio::spawn(async move {
+        let (transport, driver) = client_builder.connect(listen_addr).await.unwrap();
+        tokio::spawn(driver);
+        transport
+    });
 
     let (server, client) = tokio::join!(server_task, client_task);
     (client.unwrap(), server.unwrap())
@@ -581,7 +588,7 @@ async fn test_shutdown_wakes_pending_recv() {
     assert_eq!(msg.as_ref(), b"test");
     drop(msg);
 
-    let conn_handles: Vec<_> = server.connection().driver_handles().to_vec();
+    let conn_handles: Vec<_> = server.driver_handles().to_vec();
     let server = std::sync::Arc::new(server);
     let s2 = server.clone();
     let recv_task = tokio::spawn(async move { s2.recv().await });
@@ -647,12 +654,12 @@ async fn test_shared_cq_single_driver() {
     let (client, server) = make_transport_pair(CompletionMode::Readiness, 4, 4, 256).await;
 
     assert_eq!(
-        client.connection().driver_handles().len(),
+        client.driver_handles().len(),
         1,
         "shared CQ should have exactly one driver handle"
     );
     assert_eq!(
-        server.connection().driver_handles().len(),
+        server.driver_handles().len(),
         1,
         "shared CQ should have exactly one driver handle"
     );
