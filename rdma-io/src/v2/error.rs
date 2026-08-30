@@ -79,7 +79,10 @@ impl fmt::Display for Error {
             }
             Error::WouldBlock => write!(f, "operation would block"),
             Error::MessageTooLarge { size, capacity } => {
-                write!(f, "message too large: {size} bytes exceeds {capacity} byte capacity")
+                write!(
+                    f,
+                    "message too large: {size} bytes exceeds {capacity} byte capacity"
+                )
             }
             Error::TransportClosed => write!(f, "transport closed"),
             Error::DriverShutdown => write!(f, "driver shut down"),

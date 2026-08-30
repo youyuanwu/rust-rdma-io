@@ -43,6 +43,8 @@ pub mod qp;
 
 #[cfg(feature = "async")]
 pub mod completion;
+#[cfg(feature = "tokio")]
+pub mod connection;
 #[cfg(feature = "async")]
 pub mod cq_poller;
 #[cfg(feature = "tokio")]
@@ -50,11 +52,9 @@ pub mod driver;
 #[cfg(feature = "async")]
 pub mod inflight;
 #[cfg(feature = "tokio")]
-pub mod shared_qp;
-#[cfg(feature = "tokio")]
-pub mod connection;
-#[cfg(feature = "tokio")]
 pub mod message_transport;
+#[cfg(feature = "tokio")]
+pub mod shared_qp;
 #[cfg(feature = "tokio")]
 mod tokio_support;
 

@@ -58,9 +58,7 @@ impl ConnectionConfig {
             return Err(Error::InvalidConfig("max_recv_wr must be > 0".into()));
         }
         if self.inflight_capacity == 0 {
-            return Err(Error::InvalidConfig(
-                "inflight_capacity must be > 0".into(),
-            ));
+            return Err(Error::InvalidConfig("inflight_capacity must be > 0".into()));
         }
         if !self.separate_cqs && self.inflight_capacity < self.max_send_wr + self.max_recv_wr {
             return Err(Error::InvalidConfig(format!(
@@ -130,8 +128,7 @@ impl Connection {
     pub async fn close(mut self) {
         self.initiate_shutdown();
         for task in &mut self.driver_tasks {
-            let _ =
-                tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
         }
     }
 }
@@ -157,11 +154,7 @@ impl ConnectionBuilder {
     ///
     /// `pre_establish` is called after QP creation but before the CM
     /// handshake, allowing the caller to post receive buffers.
-    pub(crate) async fn connect<F>(
-        self,
-        addr: &SocketAddr,
-        pre_establish: F,
-    ) -> Result<Connection>
+    pub(crate) async fn connect<F>(self, addr: &SocketAddr, pre_establish: F) -> Result<Connection>
     where
         F: FnOnce(&SharedQp, &Pd) -> Result<()>,
     {
@@ -203,10 +196,8 @@ impl ConnectionBuilder {
 
             // Create drivers (consumes CQs)
             let cap = self.config.inflight_capacity;
-            let (send_handle, send_task) =
-                self.spawn_driver(send_cq, cap)?;
-            let (recv_handle, recv_task) =
-                self.spawn_driver(recv_cq, cap)?;
+            let (send_handle, send_task) = self.spawn_driver(send_cq, cap)?;
+            let (recv_handle, recv_task) = self.spawn_driver(recv_cq, cap)?;
 
             let sqp = SharedQp::new(
                 qp,
@@ -222,9 +213,7 @@ impl ConnectionBuilder {
         } else {
             // Shared CQ mode: one CQ, one driver, same handle for both
             let cq = match self.config.completion_mode {
-                CompletionMode::Readiness => {
-                    CqBuilder::new(&ctx, depth).with_channel().build()?
-                }
+                CompletionMode::Readiness => CqBuilder::new(&ctx, depth).with_channel().build()?,
                 CompletionMode::Polling => CqBuilder::new(&ctx, depth).build()?,
             };
 
@@ -240,12 +229,7 @@ impl ConnectionBuilder {
             let cap = self.config.inflight_capacity;
             let (handle, task) = self.spawn_driver(cq, cap)?;
 
-            let sqp = SharedQp::new(
-                qp,
-                Arc::clone(&handle),
-                Arc::clone(&handle),
-                pd.clone(),
-            );
+            let sqp = SharedQp::new(qp, Arc::clone(&handle), Arc::clone(&handle), pd.clone());
             (sqp, vec![handle], vec![task])
         };
 
@@ -328,9 +312,7 @@ impl ConnectionBuilder {
             )
         } else {
             let cq = match self.config.completion_mode {
-                CompletionMode::Readiness => {
-                    CqBuilder::new(&ctx, depth).with_channel().build()?
-                }
+                CompletionMode::Readiness => CqBuilder::new(&ctx, depth).with_channel().build()?,
                 CompletionMode::Polling => CqBuilder::new(&ctx, depth).build()?,
             };
 
@@ -345,12 +327,7 @@ impl ConnectionBuilder {
             let cap = self.config.inflight_capacity;
             let (handle, task) = self.spawn_driver(cq, cap)?;
 
-            let sqp = SharedQp::new(
-                qp,
-                Arc::clone(&handle),
-                Arc::clone(&handle),
-                pd.clone(),
-            );
+            let sqp = SharedQp::new(qp, Arc::clone(&handle), Arc::clone(&handle), pd.clone());
             (sqp, vec![handle], vec![task])
         };
 

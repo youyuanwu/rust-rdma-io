@@ -113,6 +113,16 @@ impl SharedQp {
         &self.qp
     }
 
+    /// Access the send-side driver handle.
+    pub fn send_handle(&self) -> &Arc<CqDriverHandle> {
+        &self.send_handle
+    }
+
+    /// Access the recv-side driver handle.
+    pub fn recv_handle(&self) -> &Arc<CqDriverHandle> {
+        &self.recv_handle
+    }
+
     /// Submit a send operation and await its completion.
     ///
     /// Returns `(Result<Completion>, Mr)` — the MR is always returned
@@ -263,6 +273,10 @@ pub struct OpFuture {
     cancel_reclaim: Option<Box<dyn FnOnce(Mr) + Send>>,
 }
 
+// SAFETY: OpFuture is Unpin because its state machine moves data between
+// enum variants via std::mem::replace — there are no self-referential borrows.
+impl Unpin for OpFuture {}
+
 impl OpFuture {
     fn new(
         qp: Arc<Qp>,
@@ -301,11 +315,7 @@ impl OpFuture {
     ///
     /// Used by the recv pump to create futures for WRs that were posted
     /// directly (not through the Pending → Inflight state machine).
-    pub(crate) fn new_inflight(
-        handle: Arc<CqDriverHandle>,
-        token: u64,
-        mr: Mr,
-    ) -> Self {
+    pub(crate) fn new_inflight(handle: Arc<CqDriverHandle>, token: u64, mr: Mr) -> Self {
         Self {
             state: OpState::Inflight { handle, token, mr },
             cancel_reclaim: None,

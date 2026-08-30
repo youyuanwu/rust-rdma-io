@@ -195,7 +195,7 @@ impl InflightMap {
                 return false;
             }
             if inner.completion.is_some() {
-                tracing::warn!(token, "duplicate completion for occupied slot — discarding");
+                tracing::debug!(token, "duplicate completion for occupied slot — discarding");
                 return false;
             }
             inner.completion = Some(wc);
