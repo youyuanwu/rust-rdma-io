@@ -1182,7 +1182,7 @@ impl Drop for MessageTransport {
 ///
 /// # Connection Lifetime
 ///
-/// The driver retains `Arc<ConnectionLifetime>` (`_conn_lifetime`) for
+/// The driver retains `Arc<ConnectionLifetime>` (`conn_lifetime`) for
 /// the full duration. This guarantees that CmId/EventChannel remain alive
 /// while the driver uses QP/CQ resources. When the driver future drops,
 /// the Arc refcount decreases; if the frontend also dropped, the
@@ -1190,7 +1190,7 @@ impl Drop for MessageTransport {
 #[expect(clippy::too_many_arguments)]
 async fn driver_run(
     state: Arc<TransportSharedState>,
-    _conn_lifetime: Arc<ConnectionLifetime>, // lifetime lease — kept alive for safe drop order
+    conn_lifetime: Arc<ConnectionLifetime>,
     send_handle: Arc<CqDriverHandle>,
     recv_handle: Arc<CqDriverHandle>,
     driver_handles: Vec<Arc<CqDriverHandle>>,
@@ -1209,7 +1209,7 @@ async fn driver_run(
     // Borrow shared QP through the connection lifetime lease.
     // This is a reference, not an Arc clone — the Arc<ConnectionLifetime>
     // parameter keeps everything alive.
-    let shared_qp = _conn_lifetime.shared_qp();
+    let shared_qp = conn_lifetime.shared_qp();
 
     // Combine all CQ driver futures into one joined future.
     // We use a FuturesUnordered to poll them all concurrently.
@@ -1815,7 +1815,7 @@ async fn driver_run(
     }
     state.state_notify.notify_waiters();
 
-    // Connection lifetime lease (_conn_lifetime) is dropped when this
+    // Connection lifetime lease (conn_lifetime) is dropped when this
     // function returns. Combined with the frontend's lease via
     // TransportSharedState, the last holder's drop runs
     // ConnectionLifetime's destructor in safe order:

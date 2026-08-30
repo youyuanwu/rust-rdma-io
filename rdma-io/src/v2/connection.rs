@@ -94,7 +94,7 @@ pub(crate) struct CmMonitorHandle {
 ///    still alive. **Nested invariant**: `SharedQp.qp` must remain the first field.
 ///    Additionally, `CmQueuePair::drop` releases its `Arc<CompletionQueue>` refs,
 ///    so CQs are destroyed at this point (if no other Arc holders remain).
-/// 2. `_completion_channels` drops second → each `Arc<CompletionChannel>` refcount
+/// 2. `completion_channels` drops second → each `Arc<CompletionChannel>` refcount
 ///    decreases. Since the driver's `Cq` may already have dropped its Arc clone,
 ///    this may be the last reference, triggering `ibv_destroy_comp_channel`.
 ///    Because the CQs were destroyed in step 1, `ibv_destroy_comp_channel`
@@ -121,7 +121,7 @@ pub(crate) struct CmMonitorHandle {
 ///
 /// **DO NOT reorder fields.** The destruction order is load-bearing:
 /// - `shared_qp` MUST be first (QP destroyed before anything else)
-/// - `_completion_channels` MUST follow `shared_qp` (channel destroyed after CQ)
+/// - `completion_channels` MUST follow `shared_qp` (channel destroyed after CQ)
 /// - `cm_id` MUST follow `shared_qp` (CmId alive during `rdma_destroy_qp`)
 /// - `event_channel` MUST be last
 ///
@@ -141,12 +141,19 @@ pub(crate) struct ConnectionLifetime {
     /// Completion channel Arcs — must drop AFTER shared_qp (so CQs are
     /// destroyed first) and BEFORE cm_id. Each driver's `Cq` also holds
     /// a clone; this ensures the channel outlives all CQ references.
-    _completion_channels: Vec<Arc<crate::comp_channel::CompletionChannel>>,
-    #[expect(dead_code)] // held for drop ordering / MR lifetime
+    #[expect(
+        dead_code,
+        reason = "keeps completion channels alive until their CQs are destroyed"
+    )]
+    completion_channels: Vec<Arc<crate::comp_channel::CompletionChannel>>,
+    #[expect(
+        dead_code,
+        reason = "keeps the protection domain alive through QP drop"
+    )]
     pd: Pd,
-    #[expect(dead_code)] // held for drop ordering — must drop AFTER shared_qp
+    #[expect(dead_code, reason = "must remain alive until the QP is destroyed")]
     cm_id: crate::cm::CmId,
-    #[expect(dead_code)] // held for drop ordering — closes fd after cm_id
+    #[expect(dead_code, reason = "must close after the CM ID is destroyed")]
     event_channel: Arc<EventChannel>,
 }
 
@@ -161,7 +168,7 @@ impl ConnectionLifetime {
     ) -> Self {
         Self {
             shared_qp,
-            _completion_channels: completion_channels,
+            completion_channels,
             pd,
             cm_id,
             event_channel,
@@ -572,21 +579,22 @@ mod tests {
 
         /// Same field count and order as `ConnectionLifetime`.
         /// If you change `ConnectionLifetime`'s fields, update this too.
+        #[expect(dead_code, reason = "fields are observed through their Drop order")]
         struct LifetimeShape {
-            _shared_qp: Recorder,
-            _completion_channels: Vec<Recorder>,
-            _pd: Recorder,
-            _cm_id: Recorder,
-            _event_channel: Recorder,
+            shared_qp: Recorder,
+            completion_channels: Vec<Recorder>,
+            pd: Recorder,
+            cm_id: Recorder,
+            event_channel: Recorder,
         }
 
         let log = Arc::new(Mutex::new(Vec::new()));
         drop(LifetimeShape {
-            _shared_qp: Recorder("shared_qp", log.clone()),
-            _completion_channels: vec![Recorder("completion_channel", log.clone())],
-            _pd: Recorder("pd", log.clone()),
-            _cm_id: Recorder("cm_id", log.clone()),
-            _event_channel: Recorder("event_channel", log.clone()),
+            shared_qp: Recorder("shared_qp", log.clone()),
+            completion_channels: vec![Recorder("completion_channel", log.clone())],
+            pd: Recorder("pd", log.clone()),
+            cm_id: Recorder("cm_id", log.clone()),
+            event_channel: Recorder("event_channel", log.clone()),
         });
         assert_eq!(
             *log.lock().unwrap(),
