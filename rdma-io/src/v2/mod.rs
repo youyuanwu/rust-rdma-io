@@ -85,6 +85,7 @@ pub use driver::{CqDriverHandle, FdCqDriver, PollingCqDriver};
 pub use shared_qp::{OpFuture, SharedQp};
 
 #[cfg(feature = "tokio")]
+#[allow(deprecated)]
 pub use connection::{CompletionMode, Connection};
 
 #[cfg(feature = "tokio")]

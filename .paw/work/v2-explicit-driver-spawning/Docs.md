@@ -52,7 +52,7 @@ Zero `tokio::spawn` calls exist in `rdma-io/src/v2/*.rs` production code. A sour
 
 5. **`compare_exchange` for state transitions**: Both `close()` (Created/Ready → Closing) and driver readiness (Created → Ready) use `compare_exchange` to detect concurrent transitions, preventing close/ready races.
 
-6. **Connection ownership split**: `ConnectionParts` splits resources between frontend (`Arc<SharedQp>`, channels, shared state) and driver (`ConnectionResources` with Pd/CmId/EventChannel for safe drop ordering). The public `connection()` accessor is replaced by `shared_qp()` and `driver_handles()`.
+6. **Connection ownership split**: `ConnectionParts` splits resources between frontend (`Arc<SharedQp>`, channels, shared state) and driver (`ConnectionResources` with Pd/CmId/EventChannel). The public `connection()` accessor is replaced by `shared_qp()` and `driver_handles()`. Note: QP-before-CmId drop ordering is a known pre-existing limitation inherited from the v2 CM architecture; `Arc<SharedQp>` may outlive `ConnectionResources` due to shared references.
 
 ### Error Observation
 
@@ -106,8 +106,9 @@ result?; // observe driver errors
 ### Failing to Spawn the Driver
 
 If the driver is dropped without being spawned/polled:
-- `ready()`, `send()`, `recv()` immediately return `Error::TransportClosed`
+- `ready()`, `send()`, `recv()` return `Error::TransportFailed(TransportError)` with kind `DriverAborted`
 - `close()` returns immediately (driver already dead)
+- `error()` returns `Some(TransportError)` with kind `DriverAborted`
 - No resources leak — `Drop for MessageTransportDriver` handles cleanup
 
 ### Recommended Shutdown Order

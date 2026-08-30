@@ -1,6 +1,6 @@
 //! Ergonomic v2 connection builder for RDMA transport setup.
 //!
-//! Provides [`ConnectionParts`] and [`CompletionMode`] for establishing RDMA
+//! Provides `ConnectionParts` and [`CompletionMode`] for establishing RDMA
 //! connections with automatic resource wiring. CQ drivers are created but
 //! NOT spawned — the caller composes them into a driver future.
 
@@ -81,16 +81,21 @@ pub(crate) struct CmMonitorHandle {
     pub(crate) event_channel: Arc<EventChannel>,
 }
 
-/// Resources that must be kept alive for the RDMA connection and dropped
-/// in a specific order. Owned by the driver side.
+/// Resources that must be kept alive for the RDMA connection.
+/// Owned by the driver side.
 ///
-/// # Drop Order
+/// # Drop Ordering — Known Limitation
 ///
-/// Fields drop in declaration order:
-/// 1. `shared_qp` — QP destroyed first (flushes outstanding WRs)
-/// 2. `pd` — protection domain (ref-counted)
-/// 3. `cm_id` — disconnect/destroy (AFTER QP)
-/// 4. `event_channel` — closes fd (last, after CM ID)
+/// The `CmQueuePair` destructor calls `rdma_destroy_qp(cm_id_raw)`,
+/// which requires the creating `CmId` to still be alive. However,
+/// `Arc<SharedQp>` may outlive `ConnectionResources` (other references
+/// are held via `TransportSharedState`). The `shared_qp` field here
+/// is cleared by the driver before returning, but other `Arc` clones
+/// may still exist, so the QP may actually be destroyed after the
+/// `CmId`. This is a pre-existing issue inherited from the v2 CM
+/// architecture and is not specific to the explicit-spawn refactoring.
+///
+/// Fields drop in declaration order when the struct is dropped.
 pub(crate) struct ConnectionResources {
     /// SharedQp must drop first — QP must be destroyed before CmId.
     /// The driver also holds an Arc<SharedQp> for operations; this
@@ -121,16 +126,15 @@ pub(crate) struct ConnectionParts {
 /// An established RDMA connection with all resources wired.
 ///
 /// This type is kept for backward compatibility with lower-level v2 APIs.
-/// For message transport, [`ConnectionParts`] is used internally.
+/// For message transport, `ConnectionParts` is used internally.
 ///
-/// # Drop Order
+/// # Deprecation Notice
 ///
-/// Fields drop in declaration order:
-/// 1. `shared_qp` — QP destroyed (flushes outstanding WRs)
-/// 2. `driver_handles` — `Arc<CqDriverHandle>` refs dropped
-/// 3. `pd` — protection domain (ref-counted)
-/// 4. `cm_id` — disconnect/destroy (AFTER QP)
-/// 5. `event_channel` — closes fd (last, after CM ID)
+/// This type is no longer constructible through the public API since the
+/// explicit driver spawning refactoring. Use [`super::message_transport::MessageTransportBuilder`]
+/// for message transport connections.
+#[deprecated(note = "Use MessageTransportBuilder for message transport connections")]
+#[allow(deprecated)]
 pub struct Connection {
     shared_qp: SharedQp,
     driver_handles: Vec<Arc<CqDriverHandle>>,
@@ -144,6 +148,7 @@ pub struct Connection {
     shutdown_initiated: bool,
 }
 
+#[allow(deprecated)]
 impl Connection {
     /// Access the shared queue pair.
     pub fn shared_qp(&self) -> &SharedQp {
@@ -183,6 +188,7 @@ impl Connection {
     }
 }
 
+#[allow(deprecated)]
 impl Drop for Connection {
     fn drop(&mut self) {
         self.initiate_shutdown();
