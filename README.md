@@ -152,6 +152,57 @@ Also provides lower-level APIs: `Op` enum for typed submission, `CqPoller` for
 direct CQ polling with waker registration, and `Completions<N>` for fd-based
 async CQ draining. See the `rdma_io::v2` module docs for the full API reference.
 
+### V2 Message Transport
+
+The v2 message transport provides a builder-driven, message-oriented Send/Recv
+transport on top of `SharedQp` with pre-registered buffer pools, message
+boundaries, bounded backpressure, and cancellation-safe operations:
+
+```rust
+use rdma_io::v2::*;
+use rdma_io::v2::message_transport::MessageTransportBuilder;
+
+// Server: accept a connection with builder configuration
+let listener = rdma_io::async_cm::AsyncCmListener::bind(&"0.0.0.0:7471".parse().unwrap())?;
+let server = MessageTransportBuilder::new()
+    .recv_buffers(32)
+    .send_buffers(16)
+    .buffer_size(64 * 1024)
+    .completion_mode(CompletionMode::Readiness)
+    .accept(&listener)
+    .await?;
+
+// Client: connect to remote endpoint
+let client = MessageTransportBuilder::new()
+    .recv_buffers(32)
+    .send_buffers(16)
+    .buffer_size(64 * 1024)
+    .connect("10.0.0.1:7471".parse().unwrap())
+    .await?;
+
+// Send/recv with message boundaries preserved
+client.send(b"hello rdma transport").await?;
+let msg = server.recv().await?;
+assert_eq!(msg.as_ref(), b"hello rdma transport");
+assert_eq!(msg.len(), 20);
+// ReceivedMessage drop returns the buffer for reposting
+```
+
+Key design properties:
+
+- **Pre-posted receives**: All receive buffers are posted before the CM
+  handshake completes, eliminating RNR errors on first send
+- **Bounded backpressure**: Send pool limits concurrent sends; additional
+  senders wait asynchronously for a buffer
+- **`send().await` = local completion**: The send CQE confirms local
+  completion, not remote consumption
+- **Cancellation safe**: Dropping `send()` returns the MR via the reclaim
+  queue; dropping `recv()` leaves the message for the next caller
+- **Shared CQ by default**: One CQ + one driver for both send and recv
+  completions; separate-CQ mode available via `.separate_cqs(true)`
+- **Completion modes**: `Readiness` (fd/channel-based, lower CPU) or
+  `Polling` (direct CQ poll, lower latency)
+
 ## Prerequisites
 
 ```sh
