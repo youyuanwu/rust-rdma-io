@@ -52,6 +52,8 @@ pub mod inflight;
 #[cfg(feature = "tokio")]
 pub mod shared_qp;
 #[cfg(feature = "tokio")]
+pub mod connection;
+#[cfg(feature = "tokio")]
 mod tokio_support;
 
 // Re-export primary types at v2 level.
@@ -77,6 +79,9 @@ pub use driver::{CqDriverHandle, FdCqDriver, PollingCqDriver};
 
 #[cfg(feature = "tokio")]
 pub use shared_qp::{OpFuture, SharedQp};
+
+#[cfg(feature = "tokio")]
+pub use connection::{CompletionMode, Connection};
 
 #[cfg(feature = "tokio")]
 pub use tokio_support::TokioCompletions;
