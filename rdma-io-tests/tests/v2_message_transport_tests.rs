@@ -712,3 +712,317 @@ async fn test_credit_never_exceeds_capacity() {
         // ReceivedMessage drops here → credit returned
     }
 }
+
+// ============================================================
+// Explicit driver spawning lifecycle tests
+// ============================================================
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn test_no_progress_without_driver_poll() {
+    require_software_rdma!();
+
+    let listener = bind_listener_with_retry().await;
+    let listen_addr = connect_addr_for(listener.local_addr());
+
+    let server_builder = message_transport::MessageTransportBuilder::new()
+        .recv_buffers(4)
+        .send_buffers(4)
+        .buffer_size(256)
+        .completion_mode(CompletionMode::Readiness);
+    let client_builder = message_transport::MessageTransportBuilder::new()
+        .recv_buffers(4)
+        .send_buffers(4)
+        .buffer_size(256)
+        .completion_mode(CompletionMode::Readiness);
+
+    let server_task = tokio::spawn(async move {
+        server_builder.accept(&listener).await.unwrap()
+    });
+    let client_task = tokio::spawn(async move {
+        client_builder.connect(listen_addr).await.unwrap()
+    });
+
+    let (server, client) = tokio::join!(server_task, client_task);
+    let (client_transport, client_driver) = client.unwrap();
+    let (_server_transport, server_driver) = server.unwrap();
+
+    // Without drivers spawned, ready() should not complete
+    let result = tokio::time::timeout(Duration::from_millis(200), client_transport.ready()).await;
+    assert!(result.is_err(), "ready() should timeout without driver running");
+
+    // Drop drivers triggers failure state via Drop guard
+    drop(client_driver);
+    drop(server_driver);
+
+    // Now ready() should return error
+    let result = client_transport.ready().await;
+    assert!(result.is_err(), "ready() should error after driver dropped");
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn test_readiness_completes_after_both_drivers() {
+    require_software_rdma!();
+
+    let (client, server) = make_transport_pair(CompletionMode::Readiness, 4, 4, 256).await;
+
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
+        client.ready().await.unwrap();
+        server.ready().await.unwrap();
+    })
+    .await;
+    assert!(result.is_ok(), "readiness should complete after both drivers spawned");
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn test_drop_unspawned_driver_fails_frontend() {
+    require_software_rdma!();
+
+    let listener = bind_listener_with_retry().await;
+    let listen_addr = connect_addr_for(listener.local_addr());
+
+    let server_builder = message_transport::MessageTransportBuilder::new()
+        .recv_buffers(4)
+        .send_buffers(4)
+        .buffer_size(256)
+        .completion_mode(CompletionMode::Readiness);
+    let client_builder = message_transport::MessageTransportBuilder::new()
+        .recv_buffers(4)
+        .send_buffers(4)
+        .buffer_size(256)
+        .completion_mode(CompletionMode::Readiness);
+
+    let server_task = tokio::spawn(async move {
+        server_builder.accept(&listener).await.unwrap()
+    });
+    let client_task = tokio::spawn(async move {
+        client_builder.connect(listen_addr).await.unwrap()
+    });
+
+    let (server, client) = tokio::join!(server_task, client_task);
+    let (client_transport, client_driver) = client.unwrap();
+    let (_server_transport, server_driver) = server.unwrap();
+
+    // Drop drivers without spawning
+    drop(client_driver);
+    drop(server_driver);
+
+    // Frontend operations should return error
+    assert!(client_transport.ready().await.is_err(), "ready() should fail after driver dropped");
+    assert!(client_transport.send(b"hello").await.is_err(), "send() should fail after driver dropped");
+    assert!(client_transport.recv().await.is_err(), "recv() should fail after driver dropped");
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn test_abort_driver_task_fails_frontend() {
+    require_software_rdma!();
+
+    let (client, server) = make_transport_pair(CompletionMode::Readiness, 4, 4, 256).await;
+
+    client.send(b"before-abort").await.unwrap();
+    let msg = server.recv().await.unwrap();
+    assert_eq!(msg.as_ref(), b"before-abort");
+    drop(msg);
+
+    // Shut down the server's driver handles to simulate driver failure
+    for handle in server.driver_handles() {
+        handle.flush_and_shutdown();
+    }
+
+    // Server's recv should eventually fail
+    let result = tokio::time::timeout(Duration::from_secs(10), server.recv()).await;
+    assert!(result.is_ok(), "recv should not hang after driver abort");
+    assert!(result.unwrap().is_err(), "recv should fail after driver shutdown");
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn test_frontend_close_exits_driver() {
+    require_software_rdma!();
+
+    let listener = bind_listener_with_retry().await;
+    let listen_addr = connect_addr_for(listener.local_addr());
+
+    let server_builder = message_transport::MessageTransportBuilder::new()
+        .recv_buffers(4)
+        .send_buffers(4)
+        .buffer_size(256)
+        .completion_mode(CompletionMode::Readiness);
+    let client_builder = message_transport::MessageTransportBuilder::new()
+        .recv_buffers(4)
+        .send_buffers(4)
+        .buffer_size(256)
+        .completion_mode(CompletionMode::Readiness);
+
+    let server_task = tokio::spawn(async move {
+        let (transport, driver) = server_builder.accept(&listener).await.unwrap();
+        let handle = tokio::spawn(driver);
+        (transport, handle)
+    });
+    let client_task = tokio::spawn(async move {
+        let (transport, driver) = client_builder.connect(listen_addr).await.unwrap();
+        let handle = tokio::spawn(driver);
+        (transport, handle)
+    });
+
+    let (server, client) = tokio::join!(server_task, client_task);
+    let (client_transport, client_driver_handle) = client.unwrap();
+    let (server_transport, server_driver_handle) = server.unwrap();
+
+    client_transport.send(b"test").await.unwrap();
+    let _ = server_transport.recv().await.unwrap();
+
+    client_transport.close().await;
+
+    let result = tokio::time::timeout(Duration::from_secs(10), client_driver_handle).await;
+    assert!(result.is_ok(), "driver should exit after close()");
+
+    drop(server_transport);
+    let _ = server_driver_handle.await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn test_frontend_drop_exits_driver() {
+    require_software_rdma!();
+
+    let listener = bind_listener_with_retry().await;
+    let listen_addr = connect_addr_for(listener.local_addr());
+
+    let server_builder = message_transport::MessageTransportBuilder::new()
+        .recv_buffers(4)
+        .send_buffers(4)
+        .buffer_size(256)
+        .completion_mode(CompletionMode::Readiness);
+    let client_builder = message_transport::MessageTransportBuilder::new()
+        .recv_buffers(4)
+        .send_buffers(4)
+        .buffer_size(256)
+        .completion_mode(CompletionMode::Readiness);
+
+    let server_task = tokio::spawn(async move {
+        let (transport, driver) = server_builder.accept(&listener).await.unwrap();
+        let handle = tokio::spawn(driver);
+        (transport, handle)
+    });
+    let client_task = tokio::spawn(async move {
+        let (transport, driver) = client_builder.connect(listen_addr).await.unwrap();
+        let handle = tokio::spawn(driver);
+        (transport, handle)
+    });
+
+    let (server, client) = tokio::join!(server_task, client_task);
+    let (client_transport, client_driver_handle) = client.unwrap();
+    let (_server_transport, _server_driver_handle) = server.unwrap();
+
+    // Drop frontend — driver should detect and shut down
+    drop(client_transport);
+
+    let result = tokio::time::timeout(Duration::from_secs(10), client_driver_handle).await;
+    assert!(result.is_ok(), "driver should exit after frontend drop");
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn test_close_unspawned_driver_no_hang() {
+    require_software_rdma!();
+
+    let listener = bind_listener_with_retry().await;
+    let listen_addr = connect_addr_for(listener.local_addr());
+
+    let server_builder = message_transport::MessageTransportBuilder::new()
+        .recv_buffers(4)
+        .send_buffers(4)
+        .buffer_size(256)
+        .completion_mode(CompletionMode::Readiness);
+    let client_builder = message_transport::MessageTransportBuilder::new()
+        .recv_buffers(4)
+        .send_buffers(4)
+        .buffer_size(256)
+        .completion_mode(CompletionMode::Readiness);
+
+    let server_task = tokio::spawn(async move {
+        server_builder.accept(&listener).await.unwrap()
+    });
+    let client_task = tokio::spawn(async move {
+        client_builder.connect(listen_addr).await.unwrap()
+    });
+
+    let (server, client) = tokio::join!(server_task, client_task);
+    let (client_transport, client_driver) = client.unwrap();
+    let (_server_transport, _server_driver) = server.unwrap();
+
+    // Drop driver first, then close()
+    drop(client_driver);
+
+    let result = tokio::time::timeout(Duration::from_secs(5), client_transport.close()).await;
+    assert!(result.is_ok(), "close() should return immediately with dropped driver");
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn test_one_task_per_endpoint_separate_cq() {
+    require_software_rdma!();
+
+    let listener = bind_listener_with_retry().await;
+    let listen_addr = connect_addr_for(listener.local_addr());
+
+    let server_builder = message_transport::MessageTransportBuilder::new()
+        .recv_buffers(4)
+        .send_buffers(4)
+        .buffer_size(256)
+        .completion_mode(CompletionMode::Readiness)
+        .separate_cqs(true);
+    let client_builder = message_transport::MessageTransportBuilder::new()
+        .recv_buffers(4)
+        .send_buffers(4)
+        .buffer_size(256)
+        .completion_mode(CompletionMode::Readiness)
+        .separate_cqs(true);
+
+    let server_task = tokio::spawn(async move {
+        let (transport, driver) = server_builder.accept(&listener).await.unwrap();
+        tokio::spawn(driver);
+        transport
+    });
+    let client_task = tokio::spawn(async move {
+        let (transport, driver) = client_builder.connect(listen_addr).await.unwrap();
+        tokio::spawn(driver);
+        transport
+    });
+
+    let (server, client) = tokio::join!(server_task, client_task);
+    let client = client.unwrap();
+    let server = server.unwrap();
+
+    // Separate CQs: two handles but still one driver future/task
+    assert_eq!(client.driver_handles().len(), 2, "separate CQ: two driver handles");
+    assert_eq!(server.driver_handles().len(), 2, "separate CQ: two driver handles");
+
+    client.send(b"separate-cq").await.unwrap();
+    let msg = server.recv().await.unwrap();
+    assert_eq!(msg.as_ref(), b"separate-cq");
+
+    server.send(b"reverse-separate").await.unwrap();
+    let msg = client.recv().await.unwrap();
+    assert_eq!(msg.as_ref(), b"reverse-separate");
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn test_readiness_mode_explicit_spawn() {
+    require_software_rdma!();
+
+    let (client, server) = make_transport_pair(CompletionMode::Readiness, 4, 4, 256).await;
+    client.ready().await.unwrap();
+    server.ready().await.unwrap();
+    client.send(b"readiness-mode").await.unwrap();
+    let msg = server.recv().await.unwrap();
+    assert_eq!(msg.as_ref(), b"readiness-mode");
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn test_polling_mode_explicit_spawn() {
+    require_software_rdma!();
+
+    let (client, server) = make_transport_pair(CompletionMode::Polling, 4, 4, 256).await;
+    client.ready().await.unwrap();
+    server.ready().await.unwrap();
+    client.send(b"polling-mode").await.unwrap();
+    let msg = server.recv().await.unwrap();
+    assert_eq!(msg.as_ref(), b"polling-mode");
+}
