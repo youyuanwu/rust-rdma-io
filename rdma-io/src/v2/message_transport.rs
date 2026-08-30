@@ -628,6 +628,14 @@ impl MessageTransport {
         let driver_recv_handle = driver_handles[recv_handle_idx].clone();
         let driver_send_handle = driver_handles[0].clone();
 
+        // Store SharedQp Arc in resources for proper drop ordering:
+        // SharedQp (QP destroy) must happen before CmId destroy.
+        let mut resources = parts.resources;
+        resources.shared_qp = Some(Arc::clone(&shared_qp));
+
+        // NOTE: Do NOT clone send_pool_tx or repost_tx into the driver.
+        // The driver must not hold these senders — when the frontend drops,
+        // the channel closures signal the driver to shut down.
         let driver_future: Pin<Box<dyn Future<Output = Result<()>> + Send>> = Box::pin(driver_run(
             Arc::clone(&shared_state),
             Arc::clone(&shared_qp),
@@ -635,7 +643,7 @@ impl MessageTransport {
             driver_recv_handle,
             driver_handles.clone(),
             parts.driver_futures,
-            parts.resources,
+            resources,
             cm_monitor_handle,
             pd,
             pre_posted_recvs,
@@ -645,8 +653,6 @@ impl MessageTransport {
             repost_rx,
             ctrl_send_tx,
             ctrl_send_rx,
-            send_pool_tx.clone(),
-            repost_tx.clone(),
         ));
 
         let transport = Self {
@@ -672,8 +678,8 @@ impl MessageTransport {
             let notified = self.state.state_notify.notified();
             let s = self.state.state.load(Ordering::Acquire);
             match s {
-                STATE_READY | STATE_CLOSING => return Ok(()),
-                STATE_STOPPED | STATE_FAILED => return Err(Error::TransportClosed),
+                STATE_READY => return Ok(()),
+                STATE_CLOSING | STATE_STOPPED | STATE_FAILED => return Err(Error::TransportClosed),
                 _ => {}
             }
             notified.await;
@@ -683,10 +689,10 @@ impl MessageTransport {
     /// Wait for readiness internally.
     async fn await_ready(&self) -> Result<()> {
         let s = self.state.state.load(Ordering::Acquire);
-        if s == STATE_READY || s == STATE_CLOSING {
+        if s == STATE_READY {
             return Ok(());
         }
-        if s == STATE_STOPPED || s == STATE_FAILED {
+        if s >= STATE_CLOSING {
             return Err(Error::TransportClosed);
         }
         self.ready().await
@@ -875,7 +881,7 @@ async fn driver_run(
     recv_handle: Arc<CqDriverHandle>,
     driver_handles: Vec<Arc<CqDriverHandle>>,
     cq_driver_futures: Vec<Pin<Box<dyn Future<Output = super::error::Result<()>> + Send>>>,
-    _resources: ConnectionResources, // kept alive for drop ordering
+    mut _resources: ConnectionResources, // kept alive for drop ordering
     cm_monitor_handle: Option<CmMonitorHandle>,
     _pd: Pd, // kept alive so MRs remain valid
     initial_recvs: Vec<OpFuture>,
@@ -885,8 +891,6 @@ async fn driver_run(
     mut repost_rx: mpsc::UnboundedReceiver<Mr>,
     ctrl_send_tx: mpsc::Sender<Mr>,
     mut ctrl_send_rx: mpsc::Receiver<Mr>,
-    _send_pool_tx: mpsc::Sender<Mr>,
-    _repost_tx: mpsc::UnboundedSender<Mr>,
 ) -> Result<()> {
     use crate::cm::CmEventType;
 
@@ -1056,13 +1060,20 @@ async fn driver_run(
     loop {
         // Check state: closing, frontend dropped, etc.
         let current_state = state.state.load(Ordering::Acquire);
-        if current_state == STATE_CLOSING
-            || current_state == STATE_STOPPED
-            || current_state == STATE_FAILED
-        {
+        if current_state >= STATE_CLOSING {
             break;
         }
         if !state.frontend_alive.load(Ordering::Acquire) {
+            break;
+        }
+
+        // Register shutdown interest BEFORE entering select (avoids lost wakeup)
+        let shutdown_notified = state.state_notify.notified();
+        tokio::pin!(shutdown_notified);
+
+        // Re-check after registering (close/drop may have fired between check and register)
+        let current_state = state.state.load(Ordering::Acquire);
+        if current_state >= STATE_CLOSING || !state.frontend_alive.load(Ordering::Acquire) {
             break;
         }
 
@@ -1090,6 +1101,11 @@ async fn driver_run(
             tokio::select! {
                 biased;
 
+                // Shutdown signal (close/drop)
+                () = &mut shutdown_notified => {
+                    continue; // re-evaluates loop-head checks
+                }
+
                 // CQ driver exit
                 Some(cq_result) = futures_util::StreamExt::next(&mut cq_futures) => {
                     if let Err(e) = cq_result {
@@ -1113,7 +1129,7 @@ async fn driver_run(
                                 Err(_) => break,
                             }
                         }
-                        None => break,
+                        None => break, // frontend dropped repost sender
                     }
                     continue;
                 }
@@ -1133,6 +1149,11 @@ async fn driver_run(
             // Normal operation: poll recv completions, reposts, CQ, disconnect
             tokio::select! {
                 biased;
+
+                // Shutdown signal (close/drop)
+                () = &mut shutdown_notified => {
+                    continue; // re-evaluates loop-head checks
+                }
 
                 // CQ driver exit
                 Some(cq_result) = futures_util::StreamExt::next(&mut cq_futures) => {
@@ -1226,22 +1247,21 @@ async fn driver_run(
 
     // ─── Phase C: Shutdown ───
 
-    // Transition state
-    let current = state.state.load(Ordering::Acquire);
-    if current != STATE_FAILED {
-        state.state.store(STATE_STOPPED, Ordering::Release);
-    }
+    // Close credits first to unblock any waiting frontend operations
     state.remote_credits.close();
-    state.state_notify.notify_waiters();
 
-    // Initiate QP shutdown and CQ driver flush
+    // Initiate QP shutdown — transitions QP to error, generating flush CQEs
     let _ = shared_qp.shutdown();
     for h in &driver_handles {
         h.flush_and_shutdown();
     }
 
-    // Let CQ drivers drain their final barrier (they'll exit when shutdown is set)
-    // We give them a bounded timeout to complete
+    // Drop pending recv OpFutures BEFORE CQ drain — releases inflight
+    // registry slots so the drain barrier can reach zero
+    drop(pending_recvs);
+    drop(recv_msg_tx);
+
+    // Let CQ drivers drain their final barrier
     let drain_timeout = tokio::time::sleep(Duration::from_secs(5));
     tokio::pin!(drain_timeout);
 
@@ -1256,15 +1276,22 @@ async fn driver_run(
                 break;
             }
         }
-        // Check if all CQ futures are done
         if cq_futures.is_empty() {
             break;
         }
     }
 
-    // Drop remaining recv futures (they'll be cleaned up by the inflight map)
-    drop(pending_recvs);
-    drop(recv_msg_tx);
+    // Now transition to terminal state and notify waiters
+    // (AFTER drain is complete, so close().await means drain is done)
+    let current = state.state.load(Ordering::Acquire);
+    if current != STATE_FAILED {
+        state.state.store(STATE_STOPPED, Ordering::Release);
+    }
+    state.state_notify.notify_waiters();
+
+    // Drop the SharedQp Arc from resources to ensure QP is destroyed
+    // before CmId (field ordering in ConnectionResources)
+    _resources.shared_qp = None;
 
     Ok(())
 }

@@ -87,10 +87,15 @@ pub(crate) struct CmMonitorHandle {
 /// # Drop Order
 ///
 /// Fields drop in declaration order:
-/// 1. `pd` — protection domain (ref-counted)
-/// 2. `cm_id` — disconnect/destroy (AFTER QP is dropped elsewhere)
-/// 3. `event_channel` — closes fd (last, after CM ID)
+/// 1. `shared_qp` — QP destroyed first (flushes outstanding WRs)
+/// 2. `pd` — protection domain (ref-counted)
+/// 3. `cm_id` — disconnect/destroy (AFTER QP)
+/// 4. `event_channel` — closes fd (last, after CM ID)
 pub(crate) struct ConnectionResources {
+    /// SharedQp must drop first — QP must be destroyed before CmId.
+    /// The driver also holds an Arc<SharedQp> for operations; this
+    /// owned copy ensures the last Arc is dropped here in correct order.
+    pub(crate) shared_qp: Option<Arc<SharedQp>>,
     #[expect(dead_code)] // held for drop ordering / MR lifetime
     pub(crate) pd: Pd,
     #[expect(dead_code)] // held for drop ordering — must drop AFTER shared_qp
@@ -295,6 +300,7 @@ impl ConnectionBuilder {
             driver_handles,
             driver_futures,
             resources: ConnectionResources {
+                shared_qp: None, // populated by message_transport after Arc wrapping
                 pd,
                 cm_id,
                 event_channel: Arc::clone(&event_channel),
@@ -404,6 +410,7 @@ impl ConnectionBuilder {
             driver_handles,
             driver_futures,
             resources: ConnectionResources {
+                shared_qp: None,
                 pd,
                 cm_id: conn_id,
                 event_channel: Arc::clone(&conn_ch),
