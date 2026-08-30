@@ -430,11 +430,13 @@ pub(crate) struct TransportSharedState {
     pub(crate) remote_credits: Semaphore,
     /// Whether the frontend is still alive.
     pub(crate) frontend_alive: AtomicBool,
-    /// Driver handle refs for shutdown.
-    pub(crate) driver_handles: Vec<Arc<CqDriverHandle>>,
-    /// Connection lifetime owner — holds SharedQp, Pd, CmId, EventChannel
-    /// in safe drop order. All QP access is borrowed through this lease.
+    /// Connection lifetime owner — MUST drop FIRST to destroy QP before MRs are freed.
+    /// Holds SharedQp, Pd, CmId, EventChannel in safe drop order. All QP access
+    /// is borrowed through this lease.
     pub(crate) conn_lifetime: Arc<ConnectionLifetime>,
+    /// Driver handle refs for shutdown — dropping these frees quarantined MRs.
+    /// MUST drop AFTER `conn_lifetime`.
+    pub(crate) driver_handles: Vec<Arc<CqDriverHandle>>,
     /// Terminal error snapshot (stored once, readable from frontend).
     pub(crate) error: std::sync::Mutex<Option<TransportError>>,
 }
@@ -449,8 +451,8 @@ impl TransportSharedState {
             state_notify: Notify::new(),
             remote_credits: Semaphore::new(0),
             frontend_alive: AtomicBool::new(true),
-            driver_handles,
             conn_lifetime,
+            driver_handles,
             error: std::sync::Mutex::new(None),
         }
     }
