@@ -691,50 +691,9 @@ async fn recv_pump(
                     PollResult::Ready(idx, Err((_err, _mr))) => {
                         pending_recvs.swap_remove(idx);
                         // Flush/error completion — transport shutting down.
-                        // Don't return immediately: drain remaining completions
-                        // so MRs are not leaked to detached reclaim.
                         tracing::debug!("recv_pump: recv completion error, draining");
-                        // Drop remaining futures (they'll push to reclaim queue)
                         pending_recvs.clear();
                         return;
-                    }
-                    PollResult::AllPending => {
-                        // Also check for reposts while waiting
-                        tokio::select! {
-                            biased;
-                            _ = shutdown_rx.recv() => return,
-                            mr = repost_rx.recv() => {
-                                match mr {
-                                    Some(mr) => {
-                                        match post_recv_and_track(&qp, &handle, mr) {
-                                            Ok(future) => pending_recvs.push(future),
-                                            Err(_) => return,
-                                        }
-                                    }
-                                    None => return,
-                                }
-                            }
-                            result = poll_any_ready(&mut pending_recvs) => {
-                                match result {
-                                    PollResult::Ready(idx, Ok((completion, mr))) => {
-                                        pending_recvs.swap_remove(idx);
-                                        let byte_len = completion.byte_len() as usize;
-                                        if recv_msg_tx.send(CompletedRecv { mr, byte_len }).await.is_err() {
-                                            return;
-                                        }
-                                    }
-                                    PollResult::Ready(idx, Err(_)) => {
-                                        pending_recvs.swap_remove(idx);
-                                        pending_recvs.clear();
-                                        return;
-                                    }
-                                    PollResult::AllPending => {
-                                        // Yield to avoid busy-spinning
-                                        tokio::task::yield_now().await;
-                                    }
-                                }
-                            }
-                        }
                     }
                 }
             }
@@ -761,11 +720,13 @@ enum PollResult {
         usize,
         std::result::Result<(super::op::Completion, Mr), (Error, Mr)>,
     ),
-    /// All futures are still pending.
-    AllPending,
 }
 
-/// Poll all pending recv futures and return the first one that's ready.
+/// Poll all pending recv futures. Returns when the first one is ready.
+///
+/// This future properly parks the task (returns `Poll::Pending`) when
+/// no OpFuture has completed, relying on the wakers registered by each
+/// OpFuture to wake the task when a CQE arrives.
 ///
 /// # Safety
 ///
@@ -788,7 +749,9 @@ async fn poll_any_ready(pending: &mut [OpFuture]) -> PollResult {
                 return Poll::Ready(PollResult::Ready(i, mapped));
             }
         }
-        Poll::Ready(PollResult::AllPending)
+        // All futures are still pending — park the task. Wakers registered
+        // by each OpFuture::poll will wake us when a CQE arrives.
+        Poll::Pending
     })
     .await
 }
