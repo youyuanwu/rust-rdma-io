@@ -171,6 +171,8 @@ pub fn write_hello_frame(buf: &mut [u8], data_recv_capacity: u32, max_message_si
 /// Parse and validate a frame header from `buf`.
 ///
 /// `received_len` is the total bytes received (from the CQE `byte_len`).
+/// The caller must ensure `buf.len() >= received_len`; this is always true
+/// when `buf` is an MR slice and `received_len` comes from a CQE.
 ///
 /// # Errors
 ///
@@ -181,6 +183,11 @@ pub fn write_hello_frame(buf: &mut [u8], data_recv_capacity: u32, max_message_si
 /// - Unknown frame type
 /// - Payload length exceeds received data
 pub fn parse_header(buf: &[u8], received_len: usize) -> Result<FrameHeader> {
+    debug_assert!(
+        buf.len() >= received_len,
+        "buf.len() ({}) < received_len ({received_len})",
+        buf.len()
+    );
     if received_len < HEADER_SIZE {
         return Err(Error::ProtocolViolation(format!(
             "frame too short: {received_len} < {HEADER_SIZE}"
@@ -223,6 +230,13 @@ pub fn parse_header(buf: &[u8], received_len: usize) -> Result<FrameHeader> {
 }
 
 /// Parse a HELLO payload from `payload` (bytes after the header).
+///
+/// Validates payload length and protocol version match.
+///
+/// # Errors
+///
+/// Returns [`Error::ProtocolViolation`] if the payload is too short
+/// or the peer's protocol version does not match [`PROTO_VERSION`].
 pub fn parse_hello(payload: &[u8]) -> Result<HelloPayload> {
     if payload.len() < HELLO_PAYLOAD_SIZE {
         return Err(Error::ProtocolViolation(format!(
@@ -248,6 +262,10 @@ pub fn parse_hello(payload: &[u8]) -> Result<HelloPayload> {
 }
 
 /// Parse a CREDIT payload from `payload` (bytes after the header).
+///
+/// # Errors
+///
+/// Returns [`Error::ProtocolViolation`] if the payload is too short.
 pub fn parse_credit(payload: &[u8]) -> Result<CreditPayload> {
     if payload.len() < CREDIT_PAYLOAD_SIZE {
         return Err(Error::ProtocolViolation(format!(

@@ -796,6 +796,9 @@ impl Drop for MessageTransport {
 /// CM event monitor — sole consumer of the connection's event channel.
 ///
 /// On peer disconnect or CM error, atomically closes the transport.
+/// Uses `compare_exchange` on the `closed` flag to ensure idempotent
+/// shutdown: if the transport was already closed (by `close()` or `Drop`),
+/// the monitor exits without redundant cleanup.
 async fn disconnect_monitor(
     cm: CmResources,
     closed: Arc<AtomicBool>,
