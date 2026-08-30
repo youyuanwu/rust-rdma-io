@@ -62,6 +62,11 @@ Zero `tokio::spawn` calls exist in `rdma-io/src/v2/*.rs` production code. A sour
 
 10. **Protocol and teardown failures are terminal**: Malformed CREDIT frames, general protocol parse failures, repost failures, CM/verbs failures, and CQ-driver failures all set `terminal_error` and terminate the transport. Phase C logs QP shutdown failure as a warning instead of silently ignoring it.
 
+11. **Credit balance invariant**: The driver persists the negotiated peer receive capacity (`peer_recv_capacity: AtomicUsize`) from HELLO and validates every inbound CREDIT frame via `validate_and_add_credits()` before adding permits. The validation logic is extracted into the pure function `check_credit_return()` for testability. Two independent checks run:
+    - **In-flight check** (primary, TOCTOU-safe): `credits <= credits_in_flight`. The `credits_in_flight` counter is incremented only after `credit_permit.forget()` in the synchronous section of `send()` (no async yield between `post_send_wr_raw` and `forget()`). A cancelled or failed send never increments the counter, closing the acquire→forget TOCTOU window.
+    - **Capacity check** (belt-and-suspenders): `available_permits + credits <= capacity` with `saturating_add` for overflow protection on 32-bit targets.
+    The peer's `data_recv_capacity` is validated during HELLO: must be > 0 (zero → permanent hang) and ≤ `Semaphore::MAX_PERMITS` (prevents panic). Zero-credit frames are rejected as protocol violations. CREDIT processing is single-threaded in the driver loop. A violating CREDIT terminates the driver through normal failure/shutdown and exposes the typed cause through `error()`.
+
 ### Error Observation
 
 Errors are observable in two places:

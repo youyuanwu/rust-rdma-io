@@ -52,6 +52,35 @@
 //! [`ReceivedMessage`] is dropped). RNR retry acts as a safety net for
 //! transient races, NOT as the primary flow-control mechanism.
 //!
+//! ## Credit Balance Invariant
+//!
+//! The available credit count (`remote_credits.available_permits()`) plus
+//! in-flight sends must never exceed the negotiated peer receive capacity.
+//! On CREDIT receipt the driver validates:
+//!
+//! - **Nonzero**: zero-credit frames are rejected as protocol violations.
+//! - **In-flight**: returned credits ≤ `credits_in_flight` (sends that have
+//!   been posted and forgotten but not yet credited back).
+//! - **Capacity**: `available_permits + returned_credits <= peer_recv_capacity`
+//!   (belt-and-suspenders, with overflow-safe arithmetic).
+//!
+//! The in-flight check is the primary invariant and is TOCTOU-safe:
+//! `credits_in_flight` is incremented after `credit_permit.forget()` but
+//! BEFORE `post_send_wr_raw()` in the synchronous section of `send()`.
+//! This ensures the DATA cannot reach the peer before `credits_in_flight`
+//! reflects it. On post failure, `send()` rolls back with `checked_sub`
+//! — if a concurrent CREDIT already consumed the phantom entry, the
+//! rollback harmlessly no-ops. CREDIT processing is single-threaded in
+//! the driver loop.
+//!
+//! The peer's `data_recv_capacity` announced during HELLO is validated
+//! (must be > 0 and ≤ `Semaphore::MAX_PERMITS`) before credit
+//! initialization.
+//!
+//! A violating CREDIT triggers [`Error::ProtocolViolation`], terminates
+//! the driver through normal failure/shutdown, and exposes the cause
+//! through the driver result and [`MessageTransport::error()`].
+//!
 //! # Receive-Buffer Invariant
 //!
 //! Every configured receive MR is in exactly one of these states at any time:
@@ -74,7 +103,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -421,6 +450,44 @@ const STATE_CLOSING: u8 = 3;
 const STATE_STOPPED: u8 = 4;
 const STATE_FAILED: u8 = 5;
 
+/// Pure credit-return validation logic (no side effects).
+///
+/// Returns `Ok(())` if the CREDIT is valid, or `Err(ProtocolViolation)` if:
+/// - `credits == 0` (zero-credit frame)
+/// - `credits > in_flight` (more credits returned than sends in flight)
+/// - `available + credits > capacity` (would exceed negotiated capacity,
+///   checked with `saturating_add` to prevent overflow on 32-bit targets)
+///
+/// Extracted as a free function for testability without RDMA hardware.
+fn check_credit_return(
+    credits: u32,
+    in_flight: usize,
+    available: usize,
+    capacity: usize,
+) -> Result<()> {
+    if credits == 0 {
+        return Err(Error::ProtocolViolation(
+            "CREDIT frame with zero credits".into(),
+        ));
+    }
+    let credits_usize = credits as usize;
+    // Primary invariant: can only return credits for in-flight sends.
+    // Immune to acquire→forget TOCTOU: only forgotten permits are counted.
+    if credits_usize > in_flight {
+        return Err(Error::ProtocolViolation(format!(
+            "CREDIT exceeds in-flight sends: returned={credits_usize} > in_flight={in_flight}"
+        )));
+    }
+    // Belt-and-suspenders: check against capacity with overflow protection.
+    if available.saturating_add(credits_usize) > capacity {
+        return Err(Error::ProtocolViolation(format!(
+            "CREDIT would exceed negotiated capacity: \
+             available={available} + returned={credits_usize} > capacity={capacity}"
+        )));
+    }
+    Ok(())
+}
+
 /// Shared lifecycle state between [`MessageTransport`] and [`MessageTransportDriver`].
 pub(crate) struct TransportSharedState {
     /// Lifecycle state machine.
@@ -429,6 +496,27 @@ pub(crate) struct TransportSharedState {
     pub(crate) state_notify: Notify,
     /// Remote receive credits (initialized empty, filled by driver after HELLO).
     pub(crate) remote_credits: Semaphore,
+    /// Negotiated peer receive capacity from HELLO handshake.
+    ///
+    /// Set once during HELLO to the peer's `data_recv_capacity`. The credit
+    /// balance invariant enforced by [`Self::validate_and_add_credits`] is:
+    ///
+    /// `remote_credits.available_permits() + credits_in_flight <= peer_recv_capacity`
+    ///
+    /// This is immutable once set (only transitions from 0 → peer value).
+    pub(crate) peer_recv_capacity: AtomicUsize,
+    /// Number of send permits consumed (forgotten) but not yet returned
+    /// via CREDIT frames. Incremented in `send()` after `permit.forget()`,
+    /// decremented in `validate_and_add_credits()` after validation passes.
+    ///
+    /// This field is the primary invariant for CREDIT validation: a CREDIT
+    /// returning `k` credits is valid only if `k <= credits_in_flight`,
+    /// because a credit can only be generated after the corresponding DATA
+    /// was received by the peer. This is immune to the acquire→forget
+    /// TOCTOU: temporarily-acquired (but not-yet-forgotten) permits do NOT
+    /// increment this counter, so a cancelled/failed send cannot inflate
+    /// the allowance for a concurrent CREDIT.
+    pub(crate) credits_in_flight: AtomicUsize,
     /// Whether the frontend is still alive.
     pub(crate) frontend_alive: AtomicBool,
     /// Connection lifetime owner — MUST drop FIRST to destroy QP before MRs are freed.
@@ -451,6 +539,8 @@ impl TransportSharedState {
             state: AtomicU8::new(STATE_CREATED),
             state_notify: Notify::new(),
             remote_credits: Semaphore::new(0),
+            peer_recv_capacity: AtomicUsize::new(0),
+            credits_in_flight: AtomicUsize::new(0),
             frontend_alive: AtomicBool::new(true),
             conn_lifetime,
             driver_handles,
@@ -469,6 +559,75 @@ impl TransportSharedState {
         if guard.is_none() {
             *guard = Some(TransportError::from_error(error));
         }
+    }
+
+    /// Initialize credits from the negotiated peer capacity after HELLO.
+    ///
+    /// Sets `peer_recv_capacity` (immutable once set) and adds the initial
+    /// permits to the semaphore. Must be called exactly once, before
+    /// transitioning to READY.
+    fn init_credits(&self, capacity: usize) {
+        self.peer_recv_capacity.store(capacity, Ordering::Release);
+        self.remote_credits.add_permits(capacity);
+    }
+
+    /// Record that a send permit was consumed (forgotten). Called from
+    /// `send()` immediately after `credit_permit.forget()`, BEFORE
+    /// `post_send_wr_raw()`.
+    ///
+    /// This ensures that when the DATA reaches the wire and the peer
+    /// returns a CREDIT, `credits_in_flight` already reflects the send.
+    /// On post failure, `send()` rolls back via `checked_sub` (see the
+    /// rollback comment in `send()`'s synchronous section).
+    fn record_send(&self) {
+        self.credits_in_flight.fetch_add(1, Ordering::Release);
+    }
+
+    /// Validate and add credits returned by a peer CREDIT frame.
+    ///
+    /// Enforces two independent invariants:
+    ///
+    /// 1. **In-flight check** (primary, TOCTOU-safe):
+    ///    `credits <= credits_in_flight`. A CREDIT can only return credits
+    ///    for DATA WRs that have been posted (permits forgotten). Concurrent
+    ///    `send()` only increases `credits_in_flight` (via `record_send()`
+    ///    before `post_send_wr_raw()`), which makes this check conservative.
+    ///    On post failure, `send()` rolls back with `checked_sub` — if a
+    ///    concurrent CREDIT consumed the phantom entry, the rollback
+    ///    harmlessly no-ops (the credit accounting is already correct).
+    ///
+    /// 2. **Capacity check** (belt-and-suspenders):
+    ///    `available_permits + credits <= peer_recv_capacity`. Guards against
+    ///    any bug in the in-flight tracking. Uses checked arithmetic to
+    ///    prevent overflow on 32-bit targets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ProtocolViolation`] if:
+    /// - `credits == 0` — a zero-credit frame is a protocol violation
+    /// - Credits exceed in-flight sends or would exceed negotiated capacity
+    fn validate_and_add_credits(&self, credits: u32) -> Result<()> {
+        let k = credits as usize;
+        check_credit_return(
+            credits,
+            self.credits_in_flight.load(Ordering::Acquire),
+            self.remote_credits.available_permits(),
+            self.peer_recv_capacity.load(Ordering::Acquire),
+        )?;
+        // Decrement in_flight atomically with checked_sub. If a concurrent
+        // send() rollback already consumed the entry (race between
+        // post_send_wr_raw failure and CREDIT processing), the checked_sub
+        // fails and we reject the CREDIT — the capacity check would also
+        // catch this since the rollback already returned the permit.
+        self.credits_in_flight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(k))
+            .map_err(|v| {
+                Error::ProtocolViolation(format!(
+                    "CREDIT exceeds in-flight sends (atomic): returned={k} > in_flight={v}"
+                ))
+            })?;
+        self.remote_credits.add_permits(k);
+        Ok(())
     }
 
     /// Mark the driver as dead and wake all waiters.
@@ -849,13 +1008,40 @@ impl MessageTransport {
             .sg(sge)
             .flags(SendFlags::SIGNALED);
 
+        // Commit the credit consumption BEFORE posting the WR to the
+        // hardware. Once `post_send_wr_raw` succeeds, the DATA is on the
+        // wire and a multi-threaded runtime may deliver the peer's CREDIT
+        // response before any subsequent instruction executes. If
+        // `record_send` ran after the post, the driver could see
+        // `credits_in_flight == 0` and spuriously reject a valid CREDIT.
+        //
+        // On post failure, we roll back with `checked_sub` to handle the
+        // narrow race where a concurrent CREDIT already consumed the
+        // phantom in_flight entry. If the decrement succeeds, we also
+        // return the permit; if it fails (CREDIT already consumed it),
+        // the available permits are already correct.
+        credit_permit.forget();
+        self.state.record_send();
+
         if let Err(e) = qp.post_send_wr_raw(&mut wr) {
+            // Roll back credit consumption — DATA never posted.
+            // Use checked_sub: if a concurrent CREDIT already consumed
+            // our phantom in_flight, the counter is 0 and we must not
+            // underflow. In that case the driver already added the
+            // permit via validate_and_add_credits.
+            if self
+                .state
+                .credits_in_flight
+                .fetch_update(Ordering::Release, Ordering::Acquire, |v| v.checked_sub(1))
+                .is_ok()
+            {
+                self.state.remote_credits.add_permits(1);
+            }
             handle.map().release(token);
             let _ = self.send_pool_tx.try_send(mr);
             return Err(e);
         }
         handle.notify_work();
-        credit_permit.forget();
         // === END SYNCHRONOUS SECTION ===
 
         let send_pool_tx = self.send_pool_tx.clone();
@@ -1202,7 +1388,25 @@ async fn driver_run(
                                             )));
                                             break 'handshake;
                                         }
-                                        peer_capacity = Some(hello.data_recv_capacity as usize);
+                                        // Validate peer recv capacity: must be >0
+                                        // (zero → send() blocks forever) and must
+                                        // fit in Semaphore::MAX_PERMITS (prevents
+                                        // add_permits panic).
+                                        let peer_cap = hello.data_recv_capacity as usize;
+                                        if peer_cap == 0 {
+                                            terminal_error = Some(Error::ProtocolViolation(
+                                                "peer data_recv_capacity is 0".into(),
+                                            ));
+                                            break 'handshake;
+                                        }
+                                        if peer_cap > Semaphore::MAX_PERMITS {
+                                            terminal_error = Some(Error::ProtocolViolation(format!(
+                                                "peer data_recv_capacity {peer_cap} exceeds maximum ({max})",
+                                                max = Semaphore::MAX_PERMITS,
+                                            )));
+                                            break 'handshake;
+                                        }
+                                        peer_capacity = Some(peer_cap);
                                         // Repost the HELLO recv buffer
                                         let qp = shared_qp.qp().clone();
                                         match post_recv_and_track(&qp, &recv_handle, mr) {
@@ -1263,7 +1467,7 @@ async fn driver_run(
     if handshake_ok {
         // Initialize credits from peer capacity
         let credits = peer_capacity.unwrap();
-        state.remote_credits.add_permits(credits);
+        state.init_credits(credits);
 
         // Transition to Ready (use compare_exchange to detect concurrent close)
         let ready_ok = state
@@ -1455,7 +1659,11 @@ async fn driver_run(
                                                             ..protocol::HEADER_SIZE + header.payload_len as usize],
                                                     ) {
                                                         Ok(credit) => {
-                                                            state.remote_credits.add_permits(credit.credits as usize);
+                                                            if let Err(e) = state.validate_and_add_credits(credit.credits) {
+                                                                tracing::warn!("driver: credit validation failed: {e}");
+                                                                terminal_error = Some(e);
+                                                                break;
+                                                            }
                                                             match post_recv_and_track(shared_qp.qp(), &recv_handle, mr) {
                                                                 Ok(future) => pending_recvs.push(future),
                                                                 Err(e) => {
@@ -1730,6 +1938,127 @@ fn post_send_and_detach(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Credit Validation Unit Tests ──────────────────────────────────
+    //
+    // All credit tests exercise the production `check_credit_return()`
+    // function directly. No duplicate logic.
+
+    #[test]
+    fn test_credit_exact_capacity_return() {
+        // Capacity 4, all 4 in flight, available=0 → return all 4.
+        assert!(check_credit_return(4, 4, 0, 4).is_ok());
+    }
+
+    #[test]
+    fn test_credit_partial_return() {
+        // Capacity 4, 3 in flight, available=1 → return 2.
+        assert!(check_credit_return(2, 3, 1, 4).is_ok());
+    }
+
+    #[test]
+    fn test_credit_duplicate_return_rejected() {
+        // Capacity 4, 0 in flight, available=4 → return 1 → exceeds in_flight.
+        let err = check_credit_return(1, 0, 4, 4).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds in-flight"),
+            "expected in-flight error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_credit_overflow_large_count() {
+        // Capacity 4, 0 in flight, available=4 → return 100 → exceeds.
+        let err = check_credit_return(100, 0, 4, 4).unwrap_err();
+        assert!(err.to_string().contains("exceeds in-flight"));
+    }
+
+    #[test]
+    fn test_credit_overflow_u32_max() {
+        // Capacity 4, 4 in flight, available=0 → return u32::MAX → exceeds.
+        let err = check_credit_return(u32::MAX, 4, 0, 4).unwrap_err();
+        assert!(err.to_string().contains("exceeds in-flight"));
+    }
+
+    #[test]
+    fn test_credit_zero_count_rejected() {
+        let err = check_credit_return(0, 4, 0, 4).unwrap_err();
+        assert!(
+            err.to_string().contains("zero credits"),
+            "expected zero-credits error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_credit_boundary_exactly_at_cap() {
+        // available=3, in_flight=1, capacity=4 → return 1 → exactly at cap.
+        assert!(check_credit_return(1, 1, 3, 4).is_ok());
+        // Then: available=4, in_flight=0 → return 1 → exceeds.
+        let err = check_credit_return(1, 0, 4, 4).unwrap_err();
+        assert!(err.to_string().contains("exceeds in-flight"));
+    }
+
+    #[test]
+    fn test_credit_multiple_partial_returns() {
+        // Capacity 8, 6 in flight, available=2.
+        // Return 2: ok. Remaining: in_flight=4, available=4.
+        assert!(check_credit_return(2, 6, 2, 8).is_ok());
+        // Return 2: ok. Remaining: in_flight=2, available=6.
+        assert!(check_credit_return(2, 4, 4, 8).is_ok());
+        // Return 2: ok. Remaining: in_flight=0, available=8.
+        assert!(check_credit_return(2, 2, 6, 8).is_ok());
+        // Return 1: exceeds in_flight=0.
+        let err = check_credit_return(1, 0, 8, 8).unwrap_err();
+        assert!(err.to_string().contains("exceeds in-flight"));
+    }
+
+    #[test]
+    fn test_credit_in_flight_check_catches_toctou() {
+        // Scenario: capacity=4, available=3 (1 acquired but NOT forgotten).
+        // A bogus CREDIT(1) would pass the old capacity-only check (3+1=4),
+        // but the in-flight check catches it: 0 in flight, can't return 1.
+        let err = check_credit_return(1, 0, 3, 4).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds in-flight"),
+            "in-flight check should catch bogus credit during acquire window"
+        );
+    }
+
+    #[test]
+    fn test_credit_capacity_check_catches_overflow() {
+        // available=usize::MAX-1, in_flight=usize::MAX, capacity=4 → return 2.
+        // In-flight check passes (2 <= usize::MAX), but capacity check catches
+        // the overflow via saturating_add.
+        let err = check_credit_return(2, usize::MAX, usize::MAX - 1, 4).unwrap_err();
+        assert!(
+            err.to_string().contains("exceed negotiated capacity"),
+            "capacity check should catch arithmetic overflow"
+        );
+    }
+
+    #[test]
+    fn test_credit_error_is_protocol_violation() {
+        use crate::v2::error::TransportErrorKind;
+        let err = check_credit_return(0, 4, 0, 4).unwrap_err();
+        let te = TransportError::from_error(&err);
+        assert_eq!(*te.kind(), TransportErrorKind::ProtocolViolation);
+
+        let err = check_credit_return(10, 0, 4, 4).unwrap_err();
+        let te = TransportError::from_error(&err);
+        assert_eq!(*te.kind(), TransportErrorKind::ProtocolViolation);
+    }
+
+    #[test]
+    fn test_credit_in_flight_valid_range() {
+        // in_flight exactly matches credits → ok.
+        assert!(check_credit_return(3, 3, 1, 4).is_ok());
+        // in_flight exceeds credits → ok (partial return).
+        assert!(check_credit_return(1, 3, 1, 4).is_ok());
+        // credits exceeds in_flight → error.
+        assert!(check_credit_return(4, 3, 0, 4).is_err());
+    }
+
+    // ── Builder Tests ─────────────────────────────────────────────────
 
     #[test]
     fn test_builder_defaults() {

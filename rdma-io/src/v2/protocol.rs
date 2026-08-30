@@ -263,6 +263,10 @@ pub fn parse_hello(payload: &[u8]) -> Result<HelloPayload> {
 
 /// Parse a CREDIT payload from `payload` (bytes after the header).
 ///
+/// This performs wire-format validation only (payload length). Semantic
+/// validation (zero-credit rejection, capacity overflow) is performed by
+/// the driver's credit validation logic in `TransportSharedState`.
+///
 /// # Errors
 ///
 /// Returns [`Error::ProtocolViolation`] if the payload is too short.

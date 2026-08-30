@@ -2056,3 +2056,109 @@ async fn test_graceful_close_drains_real_cqes() {
     drop(client);
     drop(server);
 }
+
+/// Proves: credit validation does not produce false positives under sustained
+/// load. Cycles `2 * recv_bufs` messages (each credit consumed and returned),
+/// verifying no ProtocolViolation occurs during normal operation.
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn test_credit_validation_no_false_positive_under_load() {
+    require_software_rdma!();
+
+    // 4 recv buffers → capacity 4. 40 round trips stress the
+    // consume→return→validate path without triggering false violations.
+    let (client, server) = make_transport_pair(CompletionMode::Readiness, 4, 4, 256).await;
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        for i in 0..40u32 {
+            let msg = format!("credit-val-{i}");
+            client.send(msg.as_bytes()).await.unwrap();
+            let received = server.recv().await.unwrap();
+            assert_eq!(received.as_ref(), msg.as_bytes());
+            // ReceivedMessage drops → credit returned → validate_and_add_credits
+        }
+    })
+    .await
+    .expect("credit validation load test timed out");
+}
+
+/// Proves: saturating all credits then returning them in batches works
+/// correctly with the new validation. Send N messages (saturating credits),
+/// receive all, drop all at once → batch CREDIT return → no violation.
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn test_credit_validation_batch_return() {
+    require_software_rdma!();
+
+    // 4 recv buffers, 4 send buffers
+    let (client, server) = make_transport_pair(CompletionMode::Readiness, 4, 4, 256).await;
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        // Saturate: send 4 messages
+        for i in 0..4u32 {
+            client.send(format!("batch-{i}").as_bytes()).await.unwrap();
+        }
+
+        // Receive all 4, hold them
+        let mut msgs = Vec::new();
+        for _ in 0..4 {
+            msgs.push(server.recv().await.unwrap());
+        }
+
+        // Drop all at once → batch credit return
+        drop(msgs);
+
+        // Now send 4 more — credits should be available again
+        for i in 0..4u32 {
+            client
+                .send(format!("after-batch-{i}").as_bytes())
+                .await
+                .unwrap();
+        }
+        for _ in 0..4 {
+            let _ = server.recv().await.unwrap();
+        }
+    })
+    .await
+    .expect("credit batch return test timed out");
+}
+
+/// Proves: credit validation under concurrent sends does not deadlock
+/// or false-positive. Multiple senders compete for credits while
+/// credits are being returned.
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn test_credit_validation_concurrent_senders() {
+    require_software_rdma!();
+
+    let (client, server) = make_transport_pair(CompletionMode::Readiness, 4, 4, 256).await;
+    let client = std::sync::Arc::new(client);
+    let server = std::sync::Arc::new(server);
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let mut send_handles = Vec::new();
+        // Spawn 4 concurrent senders, each sending 5 messages
+        for t in 0..4u32 {
+            let c = client.clone();
+            send_handles.push(tokio::spawn(async move {
+                for i in 0..5u32 {
+                    c.send(format!("t{t}-m{i}").as_bytes()).await.unwrap();
+                }
+            }));
+        }
+
+        // Receiver consumes all 20 messages
+        let s = server.clone();
+        let recv_handle = tokio::spawn(async move {
+            for _ in 0..20 {
+                let msg = s.recv().await.unwrap();
+                // Drop immediately → credit returned
+                drop(msg);
+            }
+        });
+
+        for h in send_handles {
+            h.await.unwrap();
+        }
+        recv_handle.await.unwrap();
+    })
+    .await
+    .expect("concurrent credit validation test timed out");
+}

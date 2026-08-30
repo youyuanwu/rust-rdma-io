@@ -135,6 +135,7 @@ struct TransportSharedState {
     state: AtomicU8,        // Created=0, Running=1, Ready=2, Closing=3, Stopped=4, Failed=5
     state_notify: Notify,   // wakes ready(), send(), recv(), close() on state changes
     remote_credits: Semaphore, // initialized empty, filled by driver after HELLO
+    peer_recv_capacity: AtomicUsize, // negotiated capacity from HELLO, immutable once set
     error: Mutex<Option<Arc<TransportError>>>, // cloneable error snapshot
     frontend_alive: AtomicBool, // set false in Drop for MessageTransport
 }
