@@ -111,18 +111,18 @@ Critical: CQ drivers are polled from the very first poll of the composed future 
 
 **Design decision** (resolves Connection ownership):
 - `Connection` is split at construction time. `MessageTransport` (frontend) receives:
-  - `Arc<SharedQp>` — for QP access in send/recv operations
+  - Access to `SharedQp` via `Arc<ConnectionLifetime>` — borrowed, not standalone Arc
   - `Arc<CqDriverHandle>` refs — for inflight map registration / work notification
   - Channels (send pool, recv msg, repost)
-  - `Arc<TransportSharedState>` — shared lifecycle state
+  - `Arc<TransportSharedState>` — shared lifecycle state (contains `Arc<ConnectionLifetime>`)
 - `MessageTransportDriver` (driver) receives:
-  - `ConnectionResources` struct (owns `Pd`, `CmId`, `EventChannel`, `AsyncFd`) preserving safe drop order: QP Arc released → Pd → CmId → EventChannel
+  - `Arc<ConnectionLifetime>` — kept alive as lifetime lease for safe drop order
   - CQ driver futures (boxed)
   - `Arc<CqDriverHandle>` refs (for shutdown)
-  - `Arc<SharedQp>` — for HELLO send and recv_pump operations
   - `Arc<TransportSharedState>` — shared lifecycle state
   - Pre-posted recv OpFuture vec and channel endpoints for recv_pump
-- The public `MessageTransport::connection()` accessor is removed (breaking change). Replace with narrower accessors: `shared_qp()`, `driver_handles()` if needed for tests.
+- `ConnectionLifetime` struct owns `SharedQp`, `Pd`, `CmId`, `EventChannel` in field declaration order, ensuring QP is destroyed before CmId when the last Arc holder drops
+- The public `MessageTransport::shared_qp()` and `driver_handles()` accessors are deprecated (breaking change) to prevent standalone `Arc<SharedQp>` from outliving the connection lifetime
 
 ### Shared Lifecycle State (TransportSharedState)
 

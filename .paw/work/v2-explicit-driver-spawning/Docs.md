@@ -52,7 +52,7 @@ Zero `tokio::spawn` calls exist in `rdma-io/src/v2/*.rs` production code. A sour
 
 5. **`compare_exchange` for state transitions**: Both `close()` (Created/Ready → Closing) and driver readiness (Created → Ready) use `compare_exchange` to detect concurrent transitions, preventing close/ready races.
 
-6. **Connection ownership split**: `ConnectionParts` splits resources between frontend (`Arc<SharedQp>`, channels, shared state) and driver (`ConnectionResources` with Pd/CmId/EventChannel). The public `connection()` accessor is replaced by `shared_qp()` and `driver_handles()`. Note: QP-before-CmId drop ordering is a known pre-existing limitation inherited from the v2 CM architecture; `Arc<SharedQp>` may outlive `ConnectionResources` due to shared references.
+6. **Connection ownership split**: `ConnectionLifetime` is a single Arc-shared owner of SharedQp, Pd, CmId, and EventChannel. Both the frontend (`MessageTransport`) and the driver (`MessageTransportDriver`) hold `Arc<ConnectionLifetime>` via `TransportSharedState`. No standalone `Arc<SharedQp>` escapes this owner — all QP access is borrowed through `conn_lifetime.shared_qp()`. The struct's field declaration order guarantees safe destruction: SharedQp (QP → `rdma_destroy_qp`) drops before CmId (`rdma_destroy_id`) drops before EventChannel. When the last holder drops, the destructor runs in this safe order regardless of which side was last.
 
 ### Error Observation
 
@@ -70,6 +70,38 @@ Both channels observe consistent cause information from the same terminal event.
 | Driver aborted | `Some(DriverAborted)` | `TransportFailed(...)` | `JoinError(Cancelled)` |
 | CQ driver error | `Some(CompletionError)` | `TransportFailed(...)` | `Err(...)` |
 | Peer disconnect | `None` | `TransportClosed` | `Ok(())` |
+
+### Ownership Structure and Drop-Order Proof
+
+The core safety invariant is: `rdma_destroy_qp(cm_id_raw)` must run while the `CmId` (owner of `cm_id_raw`) is still alive, because `CmQueuePair::drop()` dereferences the raw `cm_id` pointer.
+
+**`ConnectionLifetime`** enforces this structurally:
+
+```rust
+pub(crate) struct ConnectionLifetime {
+    shared_qp: SharedQp,              // drops FIRST → rdma_destroy_qp
+    pd: Pd,                           // drops second (Arc refcount decrement)
+    cm_id: CmId,                      // drops THIRD → rdma_destroy_id
+    event_channel: Arc<EventChannel>, // drops last
+}
+```
+
+**Nested invariant**: `SharedQp { qp, send_handle, recv_handle, pd }` — `qp: Arc<Qp>` is the **first** field and must remain so, since the Qp destructor (`CmQueuePair::drop → rdma_destroy_qp`) requires the CmId to be alive.
+
+**Precondition**: `SharedQp.qp` must be the last `Arc<Qp>` reference when `ConnectionLifetime` drops. This is enforced by not exposing `SharedQp` or `Arc<Qp>` through any public accessor — `shared_qp()` and `driver_handles()` were removed from `MessageTransport`.
+
+**Arc sharing**: Both `MessageTransport` and `MessageTransportDriver` hold `Arc<ConnectionLifetime>` via `TransportSharedState`. When the driver is dropped/aborted, its Arc refcount decreases; the frontend still holds its reference. When the frontend also drops, the refcount reaches zero and `ConnectionLifetime` destructs in field order: QP before CmId.
+
+**No escape paths**: The public `shared_qp()` and `driver_handles()` methods have been removed from `MessageTransport`. All internal QP access borrows from `ConnectionLifetime` — no standalone `Arc<SharedQp>` or `Arc<Qp>` can outlive the lifetime owner.
+
+**OpFuture safety**: `OpFuture` in the `Inflight` state holds `Arc<CqDriverHandle>` and `Mr` but NOT `Arc<Qp>`. The `Arc<Qp>` is only held during the `Pending → Inflight` transition (first poll). When an OpFuture is cancelled, it pushes its resources to the driver's reclaim queue without retaining a Qp reference. Therefore, no `Arc<Qp>` can outlive the `ConnectionLifetime`.
+
+**Drop test coverage**: Five deterministic tests verify all scenarios:
+- `test_lifetime_unspawned_driver_dropped_frontend_remains` — driver dropped before spawn
+- `test_lifetime_spawned_driver_aborted_frontend_remains` — driver abort mid-flight
+- `test_lifetime_frontend_dropped_driver_remains` — frontend drops first
+- `test_lifetime_inflight_send_recv_cancellation` — cancelled send/recv
+- `test_lifetime_final_owner_drop_order` — structural field-order proof
 
 ### Integration Points
 
@@ -163,3 +195,4 @@ cargo test --workspace
 
 - **Tokio-specific**: The driver future uses `tokio::select!`, `Notify`, `Semaphore`, and `AsyncFd`. It cannot be polled on non-Tokio runtimes.
 - **Frontend not `Clone`**: Share via `Arc<MessageTransport>` if needed.
+- **Deprecated escape hatches**: `shared_qp()` and `driver_handles()` are deprecated because standalone `Arc<SharedQp>` access can outlive the connection lifetime, risking use-after-free. Use `send()`/`recv()`/`close()` instead.

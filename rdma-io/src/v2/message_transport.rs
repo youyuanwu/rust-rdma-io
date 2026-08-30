@@ -84,15 +84,15 @@ use crate::cm::ConnParam;
 use crate::wr::{SendFlags, SendWr, Sge, WrOpcode};
 
 use super::connection::{
-    CmMonitorHandle, CompletionMode, ConnectionBuilder, ConnectionConfig, ConnectionParts,
-    ConnectionResources,
+    CmMonitorHandle, CompletionMode, ConnectionBuilder, ConnectionConfig, ConnectionLifetime,
+    ConnectionParts,
 };
 use super::driver::CqDriverHandle;
 use super::error::{Error, Result, TransportError};
 use super::mr::{AccessIntent, Mr};
 use super::pd::Pd;
 use super::protocol;
-use super::shared_qp::{OpFuture, SharedQp};
+use super::shared_qp::OpFuture;
 
 /// Builder for creating a [`MessageTransport`].
 ///
@@ -432,21 +432,25 @@ pub(crate) struct TransportSharedState {
     pub(crate) frontend_alive: AtomicBool,
     /// Driver handle refs for shutdown.
     pub(crate) driver_handles: Vec<Arc<CqDriverHandle>>,
-    /// Shared QP for send operations in both frontend and driver.
-    pub(crate) shared_qp: Arc<SharedQp>,
+    /// Connection lifetime owner — holds SharedQp, Pd, CmId, EventChannel
+    /// in safe drop order. All QP access is borrowed through this lease.
+    pub(crate) conn_lifetime: Arc<ConnectionLifetime>,
     /// Terminal error snapshot (stored once, readable from frontend).
     pub(crate) error: std::sync::Mutex<Option<TransportError>>,
 }
 
 impl TransportSharedState {
-    fn new(shared_qp: Arc<SharedQp>, driver_handles: Vec<Arc<CqDriverHandle>>) -> Self {
+    fn new(
+        conn_lifetime: Arc<ConnectionLifetime>,
+        driver_handles: Vec<Arc<CqDriverHandle>>,
+    ) -> Self {
         Self {
             state: AtomicU8::new(STATE_CREATED),
             state_notify: Notify::new(),
             remote_credits: Semaphore::new(0),
             frontend_alive: AtomicBool::new(true),
             driver_handles,
-            shared_qp,
+            conn_lifetime,
             error: std::sync::Mutex::new(None),
         }
     }
@@ -477,7 +481,7 @@ impl TransportSharedState {
         self.state_notify.notify_waiters();
 
         // Shut down the QP and CQ drivers
-        let _ = self.shared_qp.shutdown();
+        let _ = self.conn_lifetime.shared_qp().shutdown();
         for h in &self.driver_handles {
             h.flush_and_shutdown();
         }
@@ -607,18 +611,26 @@ impl MessageTransport {
         buffer_size: usize,
         pre_posted_recvs: Vec<OpFuture>,
     ) -> Result<(Self, MessageTransportDriver)> {
-        let pd = parts.shared_qp.pd().clone();
         let data_mr_size = protocol::data_mr_size(buffer_size);
 
-        let shared_qp = Arc::new(parts.shared_qp);
+        // Build the ConnectionLifetime — the single shared owner of all
+        // RDMA resources. Drop order: SharedQp → Pd → CmId → EventChannel.
+        let conn_lifetime = Arc::new(ConnectionLifetime::new(
+            parts.shared_qp,
+            parts.pd,
+            parts.cm_id,
+            parts.event_channel,
+        ));
+
         let driver_handles = parts.driver_handles;
 
         let shared_state = Arc::new(TransportSharedState::new(
-            Arc::clone(&shared_qp),
+            Arc::clone(&conn_lifetime),
             driver_handles.clone(),
         ));
 
         // === Allocate send buffers ===
+        let pd = conn_lifetime.shared_qp().pd().clone();
         let (send_pool_tx, send_pool_rx) = mpsc::channel(send_count);
         for _ in 0..send_count {
             let mr = pd.reg_mr(data_mr_size, AccessIntent::LocalOnly)?;
@@ -647,24 +659,17 @@ impl MessageTransport {
         let driver_recv_handle = driver_handles[recv_handle_idx].clone();
         let driver_send_handle = driver_handles[0].clone();
 
-        // Store SharedQp Arc in resources for proper drop ordering:
-        // SharedQp (QP destroy) must happen before CmId destroy.
-        let mut resources = parts.resources;
-        resources.shared_qp = Some(Arc::clone(&shared_qp));
-
         // NOTE: Do NOT clone send_pool_tx or repost_tx into the driver.
         // The driver must not hold these senders — when the frontend drops,
         // the channel closures signal the driver to shut down.
         let driver_future: Pin<Box<dyn Future<Output = Result<()>> + Send>> = Box::pin(driver_run(
             Arc::clone(&shared_state),
-            Arc::clone(&shared_qp),
+            Arc::clone(&conn_lifetime),
             driver_send_handle,
             driver_recv_handle,
             driver_handles.clone(),
             parts.driver_futures,
-            resources,
             cm_monitor_handle,
-            pd,
             pre_posted_recvs,
             recv_count,
             buffer_size,
@@ -719,16 +724,6 @@ impl MessageTransport {
             return Err(Error::TransportClosed);
         }
         self.ready().await
-    }
-
-    /// Access the shared queue pair.
-    pub fn shared_qp(&self) -> &SharedQp {
-        &self.state.shared_qp
-    }
-
-    /// Access the driver handles.
-    pub fn driver_handles(&self) -> &[Arc<CqDriverHandle>] {
-        &self.state.driver_handles
     }
 
     /// Inspect the terminal driver error, if any.
@@ -808,8 +803,9 @@ impl MessageTransport {
 
         // === SYNCHRONOUS SECTION ===
         let frame_len = protocol::write_data_frame(mr.as_mut_slice(), data);
-        let qp = self.state.shared_qp.qp().clone();
-        let handle = self.state.shared_qp.send_handle().clone();
+        let sqp = self.state.conn_lifetime.shared_qp();
+        let qp = sqp.qp().clone();
+        let handle = sqp.send_handle().clone();
 
         let reg = match handle.map().register() {
             Some(r) => r,
@@ -910,7 +906,9 @@ impl MessageTransport {
     /// the caller is responsible for awaiting the spawn handle.
     ///
     /// Returns immediately if the driver has already stopped (including
-    /// if the driver was never spawned and was dropped).
+    /// if the driver was never spawned and was dropped). If the driver
+    /// has been constructed but neither spawned nor dropped, `close()`
+    /// waits indefinitely; drop the driver to force a terminal state.
     pub async fn close(&self) {
         // Try to transition to Closing atomically
         let _ = self.state.state.compare_exchange(
@@ -964,17 +962,23 @@ impl Drop for MessageTransport {
 ///   monitor run concurrently in a select loop.
 /// - **Phase C (Shutdown)**: On close/disconnect/error, the QP is
 ///   transitioned to error, CQ drivers drain, then the function exits.
+///
+/// # Connection Lifetime
+///
+/// The driver retains `Arc<ConnectionLifetime>` (`_conn_lifetime`) for
+/// the full duration. This guarantees that CmId/EventChannel remain alive
+/// while the driver uses QP/CQ resources. When the driver future drops,
+/// the Arc refcount decreases; if the frontend also dropped, the
+/// ConnectionLifetime destructs in safe order (QP before CmId).
 #[expect(clippy::too_many_arguments)]
 async fn driver_run(
     state: Arc<TransportSharedState>,
-    shared_qp: Arc<SharedQp>,
+    _conn_lifetime: Arc<ConnectionLifetime>, // lifetime lease — kept alive for safe drop order
     send_handle: Arc<CqDriverHandle>,
     recv_handle: Arc<CqDriverHandle>,
     driver_handles: Vec<Arc<CqDriverHandle>>,
     cq_driver_futures: Vec<Pin<Box<dyn Future<Output = super::error::Result<()>> + Send>>>,
-    mut _resources: ConnectionResources, // kept alive for drop ordering
     cm_monitor_handle: Option<CmMonitorHandle>,
-    _pd: Pd, // kept alive so MRs remain valid
     initial_recvs: Vec<OpFuture>,
     recv_count: usize,
     buffer_size: usize,
@@ -984,6 +988,11 @@ async fn driver_run(
     mut ctrl_send_rx: mpsc::Receiver<Mr>,
 ) -> Result<()> {
     use crate::cm::CmEventType;
+
+    // Borrow shared QP through the connection lifetime lease.
+    // This is a reference, not an Arc clone — the Arc<ConnectionLifetime>
+    // parameter keeps everything alive.
+    let shared_qp = _conn_lifetime.shared_qp();
 
     // Combine all CQ driver futures into one joined future.
     // We use a FuturesUnordered to poll them all concurrently.
@@ -1186,9 +1195,12 @@ async fn driver_run(
         }
     }
 
-    // If handshake succeeded, initialize credits and enter Phase B.
-    // Otherwise, remaining_futures are dropped before Phase C.
-    let mut pending_recvs = Vec::new();
+    // Take ownership of all pre-posted recv futures unconditionally.
+    // On the happy path they become Phase B's pending_recvs; on every
+    // failure/early-exit path they are dropped before the Phase C drain
+    // so their inflight registry slots are released and the drain barrier
+    // can reach zero.
+    let mut pending_recvs = remaining_futures;
 
     if handshake_ok {
         // Initialize credits from peer capacity
@@ -1211,7 +1223,8 @@ async fn driver_run(
 
             // ─── Phase B: Steady State (recv pump + disconnect monitor + CQ drivers) ───
 
-            pending_recvs = remaining_futures;
+            // pending_recvs already holds the pre-posted recv futures
+            // (taken unconditionally above).
             let mut pending_credits: u32 = 0;
 
             loop {
@@ -1471,9 +1484,11 @@ async fn driver_run(
     }
     state.state_notify.notify_waiters();
 
-    // Drop the SharedQp Arc from resources to ensure QP is destroyed
-    // before CmId (field ordering in ConnectionResources)
-    _resources.shared_qp = None;
+    // Connection lifetime lease (_conn_lifetime) is dropped when this
+    // function returns. Combined with the frontend's lease via
+    // TransportSharedState, the last holder's drop runs
+    // ConnectionLifetime's destructor in safe order:
+    // SharedQp (QP destroy) → Pd → CmId → EventChannel.
 
     if let Some(err) = terminal_error {
         Err(err)

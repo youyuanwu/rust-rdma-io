@@ -73,40 +73,77 @@ impl ConnectionConfig {
 
 /// Handle for the disconnect monitor — carries the `AsyncFd` and a
 /// shared reference to the `EventChannel` for reading CM events.
-///
-/// Does NOT own the `CmId` — that stays in [`ConnectionResources`] where
-/// field-declaration-order drop guarantees safe cleanup.
 pub(crate) struct CmMonitorHandle {
     pub(crate) cm_async_fd: AsyncFd<RawFd>,
     pub(crate) event_channel: Arc<EventChannel>,
 }
 
-/// Resources that must be kept alive for the RDMA connection.
-/// Owned by the driver side.
+/// Shared connection lifetime owner guaranteeing safe RDMA resource
+/// destruction order.
 ///
-/// # Drop Ordering — Known Limitation
+/// # Drop Safety Proof
 ///
-/// The `CmQueuePair` destructor calls `rdma_destroy_qp(cm_id_raw)`,
-/// which requires the creating `CmId` to still be alive. However,
-/// `Arc<SharedQp>` may outlive `ConnectionResources` (other references
-/// are held via `TransportSharedState`). The `shared_qp` field here
-/// is cleared by the driver before returning, but other `Arc` clones
-/// may still exist, so the QP may actually be destroyed after the
-/// `CmId`. This is a pre-existing issue inherited from the v2 CM
-/// architecture and is not specific to the explicit-spawn refactoring.
+/// `CmQueuePair::drop()` calls `rdma_destroy_qp(cm_id_raw)`, which
+/// requires the `CmId` (owner of `cm_id_raw`) to still be alive.
+/// This struct enforces the invariant structurally: Rust drops fields
+/// in declaration order, so:
 ///
-/// Fields drop in declaration order when the struct is dropped.
-pub(crate) struct ConnectionResources {
-    /// SharedQp must drop first — QP must be destroyed before CmId.
-    /// The driver also holds an Arc<SharedQp> for operations; this
-    /// owned copy ensures the last Arc is dropped here in correct order.
-    pub(crate) shared_qp: Option<Arc<SharedQp>>,
+/// 1. `shared_qp` drops first → `SharedQp { qp, send_handle, recv_handle, pd }`
+///    where `qp: Arc<Qp>` is the **first** field. If this is the last reference,
+///    `Qp` → `CmQueuePair::drop()` calls `rdma_destroy_qp` while `cm_id` is
+///    still alive. **Nested invariant**: `SharedQp.qp` must remain the first field.
+/// 2. `pd` drops second → decrements the `Arc<ProtectionDomain>` refcount.
+///    The PD is only freed once every `Mr`, the `CmQueuePair`, and all other
+///    `Pd` clones are gone; this field is held so the PD cannot be released
+///    before the QP under any drop order.
+/// 3. `cm_id` drops third → `rdma_destroy_id` runs (QP already destroyed).
+/// 4. `event_channel` drops last → closes the event fd.
+///
+/// **Precondition**: `SharedQp.qp` must be the last `Arc<Qp>` reference
+/// when `ConnectionLifetime` drops. This is enforced by not exposing
+/// `SharedQp` or `Arc<Qp>` through any public accessor. All internal QP
+/// access borrows from `ConnectionLifetime`.
+///
+/// Both the frontend (`MessageTransport`) and the driver
+/// (`MessageTransportDriver`) hold `Arc<ConnectionLifetime>` via
+/// `TransportSharedState`. When the last holder drops, the struct
+/// destructs in the safe order above, regardless of which side was last.
+pub(crate) struct ConnectionLifetime {
+    /// SharedQp wraps `Arc<Qp>` wrapping `CmQueuePair`.
+    /// Must drop FIRST — `rdma_destroy_qp` requires live `CmId`.
+    shared_qp: SharedQp,
     #[expect(dead_code)] // held for drop ordering / MR lifetime
-    pub(crate) pd: Pd,
+    pd: Pd,
     #[expect(dead_code)] // held for drop ordering — must drop AFTER shared_qp
-    pub(crate) cm_id: crate::cm::CmId,
+    cm_id: crate::cm::CmId,
     #[expect(dead_code)] // held for drop ordering — closes fd after cm_id
-    pub(crate) event_channel: Arc<EventChannel>,
+    event_channel: Arc<EventChannel>,
+}
+
+impl ConnectionLifetime {
+    /// Create a new connection lifetime owner.
+    pub(crate) fn new(
+        shared_qp: SharedQp,
+        pd: Pd,
+        cm_id: crate::cm::CmId,
+        event_channel: Arc<EventChannel>,
+    ) -> Self {
+        Self {
+            shared_qp,
+            pd,
+            cm_id,
+            event_channel,
+        }
+    }
+
+    /// Borrow the shared queue pair.
+    ///
+    /// All QP access in the message transport goes through this method,
+    /// ensuring no standalone `Arc<SharedQp>` can outlive the lifetime
+    /// owner.
+    pub(crate) fn shared_qp(&self) -> &SharedQp {
+        &self.shared_qp
+    }
 }
 
 /// The result of establishing an RDMA connection — all resources needed
@@ -119,7 +156,10 @@ pub(crate) struct ConnectionParts {
     pub(crate) driver_handles: Vec<Arc<CqDriverHandle>>,
     /// Boxed CQ driver futures ready to be polled. NOT spawned.
     pub(crate) driver_futures: Vec<BoxedCqDriverFuture>,
-    pub(crate) resources: ConnectionResources,
+    /// Resources for building ConnectionLifetime (Pd, CmId, EventChannel).
+    pub(crate) pd: Pd,
+    pub(crate) cm_id: crate::cm::CmId,
+    pub(crate) event_channel: Arc<EventChannel>,
     pub(crate) cm_monitor_handle: Option<CmMonitorHandle>,
 }
 
@@ -305,12 +345,9 @@ impl ConnectionBuilder {
             shared_qp,
             driver_handles,
             driver_futures,
-            resources: ConnectionResources {
-                shared_qp: None, // populated by message_transport after Arc wrapping
-                pd,
-                cm_id,
-                event_channel: Arc::clone(&event_channel),
-            },
+            pd,
+            cm_id,
+            event_channel: Arc::clone(&event_channel),
             cm_monitor_handle: Some(CmMonitorHandle {
                 cm_async_fd,
                 event_channel,
@@ -415,12 +452,9 @@ impl ConnectionBuilder {
             shared_qp,
             driver_handles,
             driver_futures,
-            resources: ConnectionResources {
-                shared_qp: None,
-                pd,
-                cm_id: conn_id,
-                event_channel: Arc::clone(&conn_ch),
-            },
+            pd,
+            cm_id: conn_id,
+            event_channel: Arc::clone(&conn_ch),
             cm_monitor_handle: Some(CmMonitorHandle {
                 cm_async_fd,
                 event_channel: conn_ch,
@@ -531,5 +565,45 @@ mod tests {
             separate_cqs: false,
         };
         assert!(config.validate().is_ok());
+    }
+
+    /// Structural drop-order test using recorder proxies.
+    ///
+    /// Mirrors `ConnectionLifetime`'s field declaration order and asserts
+    /// the exact destruction sequence. If the real struct's fields are
+    /// reordered, this test MUST be updated — and the invariant
+    /// `rdma_destroy_qp(cm_id_raw)` depends on is documented here.
+    #[test]
+    fn test_connection_lifetime_field_drop_order() {
+        use std::sync::Mutex;
+
+        struct Recorder(&'static str, Arc<Mutex<Vec<&'static str>>>);
+        impl Drop for Recorder {
+            fn drop(&mut self) {
+                self.1.lock().unwrap().push(self.0);
+            }
+        }
+
+        /// Same field count and order as `ConnectionLifetime`.
+        /// If you change `ConnectionLifetime`'s fields, update this too.
+        struct LifetimeShape {
+            _shared_qp: Recorder,
+            _pd: Recorder,
+            _cm_id: Recorder,
+            _event_channel: Recorder,
+        }
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        drop(LifetimeShape {
+            _shared_qp: Recorder("shared_qp", log.clone()),
+            _pd: Recorder("pd", log.clone()),
+            _cm_id: Recorder("cm_id", log.clone()),
+            _event_channel: Recorder("event_channel", log.clone()),
+        });
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["shared_qp", "pd", "cm_id", "event_channel"],
+            "ConnectionLifetime field drop order must be: QP → PD → CmId → EventChannel"
+        );
     }
 }
