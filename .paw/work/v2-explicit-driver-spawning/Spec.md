@@ -95,7 +95,7 @@ Acceptance Scenarios:
 - FR-010: Dropping an unspawned driver transitions frontend state to closed/failed and wakes all waiters (Stories: P2)
 - FR-011: Aborting a spawned driver task wakes all pending frontend operations with error (Stories: P2)
 - FR-012: `transport.close().await` signals shutdown to the driver and waits for state transition without owning the `JoinHandle` (Stories: P2)
-- FR-013: Driver shutdown flushes and reclaims all in-flight MRs boundedly without unsafe early deregistration (Stories: P2)
+- FR-013: Driver shutdown ensures all in-flight MRs are safely handled: either (a) real CQEs are reaped during the CQ drain barrier and MRs are returned/dropped only after their CQE, or (b) MRs are quarantined in the reclaim queue and freed only after QP destruction. No synthetic completion may transfer MR ownership back to callers. (Stories: P2)
 - FR-014: Peer disconnect is detected by the driver and propagated to all frontend waiters deterministically (Stories: P2)
 - FR-015: Frontend drop while driver runs causes driver to detect absence and shut down gracefully with no orphan tasks (Stories: P2)
 - FR-016: Driver errors are observable both via the driver future's `Result` output and via frontend state/error inspection (Stories: P2)
@@ -110,6 +110,9 @@ Acceptance Scenarios:
 - FR-025: Both readiness and polling completion modes work with the new explicit spawn API (Stories: P1)
 - FR-026: Receive and control buffers are pre-posted before transport becomes ready; transport readiness requires HELLO validation and remote credit installation (Stories: P1)
 - FR-027: HELLO validation and timeout failures are reported through the driver result and `ready()`, not from `connect()`/`accept()` (Stories: P1, P2)
+- FR-028: Teardown safety invariant: an MR posted to hardware may be returned/reused/dropped only after its actual CQE is reaped OR the owning QP has been synchronously destroyed. `OpFuture` returns `Option<Mr>` — `Some(mr)` on real CQE, `None` when quarantined. `InflightMap::close()` wakes waiters who quarantine MRs via `push_detached`. MRs in the reclaim queue are freed only when `CqDriverHandle` drops, which structurally follows QP destruction per `ConnectionLifetime` field ordering. (Stories: P2)
+- FR-029: On driver abort/drop, the inflight map is closed synchronously, waking all waiters with `DriverShutdown` errors. Waiters quarantine their MRs (return `None` to callers). No task remains to drain CQEs, but QP destruction at `ConnectionLifetime` drop time guarantees hardware is done before MRs are freed. (Stories: P2)
+- FR-030: On wedged provider (RECLAIM_MAX_TURNS exceeded), registry slots are released but MRs are quarantined (kept alive in the reclaim queue). Resources are leaked rather than freed unsafely. (Stories: P2)
 
 ### Key Entities
 

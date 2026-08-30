@@ -88,10 +88,21 @@ impl Slot {
 /// The registry accepts any capacity at construction. Slot allocation is
 /// O(1) amortized via an internal free-list. Generation-protected tokens
 /// reject stale, duplicate, and unknown completions.
+///
+/// # Shutdown Safety
+///
+/// When the map is [`close()`](InflightMap::close)d, all registered wakers
+/// are notified. Waiters that poll after close detect [`is_closed()`] and
+/// transition to quarantine — the MR stays with the driver's reclaim queue
+/// instead of being returned to the caller. This prevents early MR
+/// release while hardware may still DMA.
 pub struct InflightMap {
     slots: Box<[Slot]>,
     /// Free-list of unoccupied slot indices. Pop to allocate, push to release.
     free_list: Mutex<Vec<u32>>,
+    /// When true, the driver is shutting down. Waiters must quarantine
+    /// their MRs rather than returning them to callers.
+    closed: std::sync::atomic::AtomicBool,
 }
 
 // Safety: All interior state uses Mutex/AtomicU32 for synchronization.
@@ -121,6 +132,7 @@ impl InflightMap {
         Self {
             slots: slots.into_boxed_slice(),
             free_list: Mutex::new(free_list),
+            closed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -260,8 +272,16 @@ impl InflightMap {
     }
 
     /// Complete all occupied slots with the given work completion (for teardown).
-    /// Used when the QP is moved to error state and all WRs are flushed.
-    pub fn flush_all(&self, wc: WorkCompletion) {
+    ///
+    /// # Safety Warning
+    ///
+    /// This method writes a synthetic completion that causes `OpFuture` to
+    /// return `Some(mr)` — potentially before the HCA is done with the MR.
+    /// Production shutdown MUST use [`close()`](Self::close) instead, which
+    /// wakes waiters to quarantine their MRs safely. This method exists
+    /// only for testing and must NOT be used on a live QP.
+    #[cfg(test)]
+    pub(crate) fn flush_all(&self, wc: WorkCompletion) {
         for slot in self.slots.iter() {
             let mut inner = slot.inner.lock().unwrap();
             if inner.occupied && inner.completion.is_none() {
@@ -283,6 +303,36 @@ impl InflightMap {
     /// Derived from `capacity - free_list.len()` for O(1) instead of O(n).
     pub fn inflight_count(&self) -> usize {
         self.slots.len() - self.free_list.lock().unwrap().len()
+    }
+
+    /// Close the map, waking all registered wakers.
+    ///
+    /// After close, [`OpFuture`](super::shared_qp::OpFuture) waiters detect
+    /// [`is_closed()`] and quarantine their MRs (push to reclaim queue)
+    /// instead of returning them to callers. This ensures MRs are not
+    /// freed/reused while hardware may still DMA.
+    ///
+    /// Idempotent — calling close() multiple times is safe.
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        // Wake all occupied slots so their waiters can quarantine.
+        for slot in self.slots.iter() {
+            let inner = slot.inner.lock().unwrap();
+            if inner.occupied
+                && let Some(waker) = &inner.waker
+            {
+                waker.wake_by_ref();
+            }
+        }
+    }
+
+    /// Check whether the map has been closed.
+    ///
+    /// When true, callers must quarantine in-flight MRs rather than
+    /// returning them — the driver is shutting down and real CQEs may
+    /// not arrive.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
     }
 }
 
@@ -460,5 +510,46 @@ mod tests {
     fn test_capacity_accessor() {
         let map = InflightMap::new(42);
         assert_eq!(map.capacity(), 42);
+    }
+
+    #[test]
+    fn test_close_sets_flag() {
+        let map = InflightMap::new(4);
+        assert!(!map.is_closed());
+        map.close();
+        assert!(map.is_closed());
+    }
+
+    #[test]
+    fn test_close_idempotent() {
+        let map = InflightMap::new(4);
+        map.close();
+        map.close(); // should not panic
+        assert!(map.is_closed());
+    }
+
+    #[test]
+    fn test_close_wakes_registered_wakers() {
+        let map = InflightMap::new(4);
+        let reg = map.register().unwrap();
+        let waker = std::task::Waker::noop();
+        map.register_waker(reg.token, waker);
+
+        // Close should wake all wakers
+        map.close();
+        assert!(map.is_closed());
+
+        // Can still complete and take after close
+        assert!(map.complete(reg.token, WorkCompletion::default()));
+        assert!(map.take_completion(reg.token).is_some());
+        map.release(reg.token);
+    }
+
+    #[test]
+    fn test_close_unoccupied_slots_safe() {
+        let map = InflightMap::new(4);
+        // No occupied slots — close should not panic
+        map.close();
+        assert!(map.is_closed());
     }
 }

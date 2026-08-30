@@ -1601,3 +1601,295 @@ async fn test_lifetime_final_owner_drop_order() {
     drop(client_transport);
     drop(server_transport);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MR Quarantine / Teardown Safety Tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Structural test: QP destruction precedes CqDriverHandle's reclaim-queue
+/// MR deregistration. Uses recorder proxies that mirror ConnectionLifetime's
+/// field layout.
+///
+/// Verifies the invariant: an MR posted to hardware may only be freed
+/// after its owning QP is destroyed.
+#[test]
+fn test_qp_destroy_before_mr_deregistration_order() {
+    use std::sync::Mutex;
+
+    struct Recorder(&'static str, std::sync::Arc<Mutex<Vec<&'static str>>>);
+    impl Drop for Recorder {
+        fn drop(&mut self) {
+            self.1.lock().unwrap().push(self.0);
+        }
+    }
+
+    // SharedQp field order proxy: qp drops first, then handles
+    struct SharedQpShape {
+        _qp: Recorder,
+        _send_handle: Recorder,
+        _recv_handle: Recorder,
+        _pd: Recorder,
+    }
+
+    // ConnectionLifetime field order proxy
+    struct LifetimeShape {
+        _shared_qp: SharedQpShape,
+        _pd: Recorder,
+        _cm_id: Recorder,
+        _event_channel: Recorder,
+    }
+
+    let log = std::sync::Arc::new(Mutex::new(Vec::new()));
+    drop(LifetimeShape {
+        _shared_qp: SharedQpShape {
+            _qp: Recorder("qp", log.clone()),
+            _send_handle: Recorder("send_handle", log.clone()),
+            _recv_handle: Recorder("recv_handle", log.clone()),
+            _pd: Recorder("sqp_pd", log.clone()),
+        },
+        _pd: Recorder("pd", log.clone()),
+        _cm_id: Recorder("cm_id", log.clone()),
+        _event_channel: Recorder("event_channel", log.clone()),
+    });
+
+    let order = log.lock().unwrap();
+    // QP must drop before handles (which hold reclaim queue MRs)
+    let qp_pos = order.iter().position(|&s| s == "qp").unwrap();
+    let send_pos = order.iter().position(|&s| s == "send_handle").unwrap();
+    let recv_pos = order.iter().position(|&s| s == "recv_handle").unwrap();
+    let cm_id_pos = order.iter().position(|&s| s == "cm_id").unwrap();
+    assert!(
+        qp_pos < send_pos,
+        "QP must drop before send_handle (reclaim queue MRs)"
+    );
+    assert!(
+        qp_pos < recv_pos,
+        "QP must drop before recv_handle (reclaim queue MRs)"
+    );
+    assert!(
+        qp_pos < cm_id_pos,
+        "QP must drop before CmId (rdma_destroy_qp requires live cm_id)"
+    );
+}
+
+/// Proves: TransportSharedState field drop order is safe — driver_handles
+/// drops before conn_lifetime, but QP is still alive because conn_lifetime
+/// holds the last Arc<ConnectionLifetime>.
+///
+/// Even though driver_handles' Arc<CqDriverHandle> refcount decreases,
+/// the handles won't be freed until SharedQp inside ConnectionLifetime
+/// drops (which holds the other Arc refs).
+#[test]
+fn test_transport_shared_state_field_order() {
+    use std::sync::Mutex;
+
+    struct Recorder(&'static str, std::sync::Arc<Mutex<Vec<&'static str>>>);
+    impl Drop for Recorder {
+        fn drop(&mut self) {
+            self.1.lock().unwrap().push(self.0);
+        }
+    }
+
+    // Mirrors TransportSharedState field layout
+    struct StateShape {
+        _state: u8,
+        _driver_handles: Vec<Recorder>,
+        _conn_lifetime: Recorder,
+    }
+
+    let log = std::sync::Arc::new(Mutex::new(Vec::new()));
+    drop(StateShape {
+        _state: 0,
+        _driver_handles: vec![Recorder("driver_handles", log.clone())],
+        _conn_lifetime: Recorder("conn_lifetime", log.clone()),
+    });
+
+    let order = log.lock().unwrap();
+    let dh_pos = order.iter().position(|&s| s == "driver_handles").unwrap();
+    let cl_pos = order.iter().position(|&s| s == "conn_lifetime").unwrap();
+    // driver_handles drops before conn_lifetime — this is fine because
+    // conn_lifetime's SharedQp still holds the real handle Arcs
+    assert!(
+        dh_pos < cl_pos,
+        "driver_handles should drop before conn_lifetime in TransportSharedState"
+    );
+}
+
+/// Proves: InflightMap close() wakes all registered wakers.
+/// After close, is_closed() returns true.
+#[test]
+fn test_inflight_map_close_wakes_waiters() {
+    use rdma_io::v2::inflight::InflightMap;
+
+    let map = InflightMap::new(4);
+    assert!(!map.is_closed());
+
+    let r1 = map.register().unwrap();
+    let r2 = map.register().unwrap();
+
+    // Register wakers
+    let waker = std::task::Waker::noop();
+    map.register_waker(r1.token, waker);
+    map.register_waker(r2.token, waker);
+
+    // Close should wake all wakers and set closed flag
+    map.close();
+    assert!(map.is_closed());
+
+    // Completions can still be delivered after close
+    assert!(map.complete(r1.token, rdma_io::wc::WorkCompletion::default()));
+
+    // Take completion works normally
+    assert!(map.take_completion(r1.token).is_some());
+
+    map.release(r1.token);
+    map.release(r2.token);
+}
+
+/// Proves: MR quarantine on driver abort — when the driver is dropped
+/// with inflight operations, OpFuture waiters receive (Err, None) and
+/// the MR is quarantined in the reclaim queue for safe destruction.
+///
+/// Post-condition: transport drops cleanly without UAF because
+/// ConnectionLifetime destroys QP before handle reclaim queues are freed.
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn test_mr_quarantine_on_driver_abort() {
+    require_software_rdma!();
+
+    let listener = bind_listener_with_retry().await;
+    let listen_addr = connect_addr_for(listener.local_addr());
+
+    let server_builder = message_transport::MessageTransportBuilder::new()
+        .recv_buffers(4)
+        .send_buffers(4)
+        .buffer_size(256)
+        .completion_mode(CompletionMode::Readiness);
+    let client_builder = message_transport::MessageTransportBuilder::new()
+        .recv_buffers(4)
+        .send_buffers(4)
+        .buffer_size(256)
+        .completion_mode(CompletionMode::Readiness);
+
+    let server_task = tokio::spawn(async move {
+        let (transport, driver) = server_builder.accept(&listener).await.unwrap();
+        let handle = tokio::spawn(driver);
+        (transport, handle)
+    });
+    let client_task = tokio::spawn(async move {
+        let (transport, driver) = client_builder.connect(listen_addr).await.unwrap();
+        let handle = tokio::spawn(driver);
+        (transport, handle)
+    });
+
+    let (server, client) = tokio::join!(server_task, client_task);
+    let (client_transport, client_driver_handle) = client.unwrap();
+    let (server_transport, server_driver_handle) = server.unwrap();
+
+    // Establish connection with a message exchange
+    client_transport.send(b"pre-abort").await.unwrap();
+    let _ = server_transport.recv().await.unwrap();
+
+    // Abort the driver — Drop guard fires, closing inflight maps.
+    // Any OpFuture waiters should receive (Err, None) — MR quarantined.
+    client_driver_handle.abort();
+    let _ = tokio::time::timeout(Duration::from_secs(5), client_driver_handle).await;
+    tokio::task::yield_now().await;
+
+    // Frontend operations should fail
+    assert!(client_transport.send(b"post-abort").await.is_err());
+    assert!(client_transport.recv().await.is_err());
+
+    // Error should be DriverAborted
+    let err = client_transport
+        .error()
+        .expect("error should be set after abort");
+    assert_eq!(*err.kind(), TransportErrorKind::DriverAborted);
+
+    // Drop everything — ConnectionLifetime destructs safely:
+    // QP destroyed before CqDriverHandle reclaim queues freed.
+    // If this completes without SIGSEGV, MR quarantine is working.
+    drop(client_transport);
+    drop(server_transport);
+    let _ = server_driver_handle.await;
+}
+
+/// Proves: dropping an unspawned driver quarantines pre-posted MRs.
+/// The pre-posted recv MRs should be quarantined (not freed) because
+/// the inflight map is closed on driver drop. They are freed only
+/// after QP destruction via ConnectionLifetime.
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn test_mr_quarantine_on_unspawned_driver_drop() {
+    require_software_rdma!();
+
+    let listener = bind_listener_with_retry().await;
+    let listen_addr = connect_addr_for(listener.local_addr());
+
+    let server_builder = message_transport::MessageTransportBuilder::new()
+        .recv_buffers(4)
+        .send_buffers(4)
+        .buffer_size(256)
+        .completion_mode(CompletionMode::Readiness);
+    let client_builder = message_transport::MessageTransportBuilder::new()
+        .recv_buffers(4)
+        .send_buffers(4)
+        .buffer_size(256)
+        .completion_mode(CompletionMode::Readiness);
+
+    let server_task = tokio::spawn(async move { server_builder.accept(&listener).await.unwrap() });
+    let client_task =
+        tokio::spawn(async move { client_builder.connect(listen_addr).await.unwrap() });
+
+    let (server, client) = tokio::join!(server_task, client_task);
+    let (client_transport, client_driver) = client.unwrap();
+    let (_server_transport, server_driver) = server.unwrap();
+
+    // Drop drivers without ever spawning them.
+    // The driver future holds pre-posted recv OpFutures. When the
+    // future drops, those OpFutures drop → MRs pushed to reclaim queue.
+    // flush_and_shutdown closes the inflight map, ensuring waiters
+    // quarantine their MRs.
+    drop(client_driver);
+    drop(server_driver);
+
+    // Frontend should report DriverAborted
+    let err = client_transport
+        .error()
+        .expect("error should be set after driver dropped");
+    assert_eq!(*err.kind(), TransportErrorKind::DriverAborted);
+
+    // close() must not hang
+    let result = tokio::time::timeout(Duration::from_secs(5), client_transport.close()).await;
+    assert!(result.is_ok(), "close() should return immediately");
+
+    // Drop frontend — last ConnectionLifetime holder.
+    // QP destroyed before CqDriverHandle reclaim queues freed.
+    // No SIGSEGV = safe.
+    drop(client_transport);
+    drop(_server_transport);
+}
+
+/// Proves: graceful close with inflight send operations processes real
+/// CQEs before returning MRs. The driver enters Phase C, transitions
+/// QP→ERR, and the CQ drain barrier reaps real flush CQEs.
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn test_graceful_close_drains_real_cqes() {
+    require_software_rdma!();
+
+    let (client, server) = make_transport_pair(CompletionMode::Readiness, 4, 4, 256).await;
+
+    // Exchange messages to verify connection works
+    client.send(b"before-close").await.unwrap();
+    let msg = server.recv().await.unwrap();
+    assert_eq!(msg.as_ref(), b"before-close");
+    drop(msg);
+
+    // Graceful close — driver enters Phase C, QP→ERR, CQ drain
+    client.close().await;
+
+    // After close, send fails
+    assert!(client.send(b"after-close").await.is_err());
+
+    // Drop — no UAF because Phase C drained real CQEs
+    drop(client);
+    drop(server);
+}

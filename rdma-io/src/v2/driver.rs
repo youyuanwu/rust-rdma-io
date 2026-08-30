@@ -49,6 +49,10 @@ pub(crate) struct DetachedOp {
     pub(crate) on_reclaim: Option<Box<dyn FnOnce(Mr) + Send>>,
     /// Number of drain passes this entry has survived.
     pub(crate) turns: usize,
+    /// When true, the MR is quarantined — kept alive until CqDriverHandle
+    /// drops (which structurally follows QP destruction). The registry slot
+    /// is released but the MR and entry remain in the queue.
+    pub(crate) quarantined: bool,
 }
 
 /// Shared state between operation futures and the completion driver.
@@ -143,24 +147,37 @@ impl CqDriverHandle {
                 mr: Some(mr),
                 on_reclaim,
                 turns: 0,
+                quarantined: false,
             });
         }
         #[cfg(feature = "tokio")]
         self.reclaim_notify.notify_one();
     }
 
-    /// Drain the reclaim queue, releasing entries whose CQE has arrived.
+    /// Drain the reclaim queue, releasing entries whose real CQE has arrived.
     ///
-    /// On shutdown or after `RECLAIM_MAX_TURNS`, force-releases remaining
-    /// entries. Returns the number of entries still pending.
+    /// Unlike previous versions, this method does NOT force-release entries
+    /// on shutdown. Entries without a real CQE stay in the queue — their MRs
+    /// are freed only when `CqDriverHandle` drops (which structurally occurs
+    /// after QP destruction via `ConnectionLifetime` field ordering).
+    ///
+    /// On `RECLAIM_MAX_TURNS` exceeded (wedged provider), the registry slot
+    /// is released but the MR is quarantined in the queue for safe
+    /// destruction when the handle drops.
+    ///
+    /// Returns the number of entries still pending.
     pub(crate) fn drain_reclaimed(&self) -> usize {
         let mut queue = self.reclaim_queue.lock().unwrap();
-        let is_shutdown = self.is_shutdown();
 
         queue.retain_mut(|entry| {
+            // Quarantined entries stay until CqDriverHandle drops
+            if entry.quarantined {
+                return true;
+            }
+
             entry.turns += 1;
 
-            // Check if completion arrived
+            // Check if real completion arrived
             if self.map.take_completion(entry.token).is_some() {
                 self.map.release(entry.token);
                 if let Some(cb) = entry.on_reclaim.take()
@@ -171,26 +188,20 @@ impl CqDriverHandle {
                 return false; // remove from queue
             }
 
-            // Force-release on shutdown
-            if is_shutdown {
-                self.map.release(entry.token);
-                // Drop MR and skip callback on shutdown
-                entry.mr.take();
-                entry.on_reclaim.take();
-                return false;
-            }
-
-            // Wedge escape hatch
+            // Wedge escape hatch: release registry slot but QUARANTINE MR.
+            // The MR stays alive in this queue entry and is only freed
+            // when CqDriverHandle drops — which structurally follows QP
+            // destruction per ConnectionLifetime field ordering.
             if entry.turns >= RECLAIM_MAX_TURNS {
                 tracing::warn!(
                     token = entry.token,
                     turns = entry.turns,
-                    "reclaim entry exceeded max turns — force-releasing"
+                    "reclaim entry exceeded max turns — quarantining MR"
                 );
                 self.map.release(entry.token);
-                entry.mr.take();
-                entry.on_reclaim.take();
-                return false;
+                entry.on_reclaim.take(); // don't call callback — not safe
+                entry.quarantined = true;
+                return true; // keep in queue for safe destruction
             }
 
             true // keep in queue
@@ -199,14 +210,22 @@ impl CqDriverHandle {
         queue.len()
     }
 
-    /// Flush all occupied slots with a synthetic flush error and signal shutdown.
+    /// Close the inflight map and signal shutdown.
     ///
-    /// Wakes all registered waiters with `WcStatus::WrFlushErr` (not success),
-    /// then sets the shutdown flag and notifies the driver. This ensures
-    /// waiters resolve with typed errors per FR-005/FR-029.
+    /// Wakes all registered waiters so they can quarantine their MRs
+    /// (push to reclaim queue) rather than returning them to callers.
+    /// Does NOT write synthetic completions — MRs are released only
+    /// when real CQEs arrive or when the QP is destroyed (via
+    /// `ConnectionLifetime` drop ordering).
+    ///
+    /// # Safety Invariant
+    ///
+    /// An MR posted to hardware may be returned/reused/dropped only after
+    /// its actual CQE is reaped OR the owning QP has been synchronously
+    /// destroyed. This method enforces the invariant by closing the map
+    /// (preventing MR return via OpFuture) without releasing MRs.
     pub fn flush_and_shutdown(&self) {
-        let flush_wc = WorkCompletion::synthetic_flush();
-        self.map.flush_all(flush_wc);
+        self.map.close();
         self.shutdown();
     }
 
@@ -215,6 +234,19 @@ impl CqDriverHandle {
     #[expect(dead_code)]
     pub(crate) fn reclaim_len(&self) -> usize {
         self.reclaim_queue.lock().unwrap().len()
+    }
+
+    /// Number of non-quarantined entries in the reclaim queue.
+    ///
+    /// Quarantined entries are kept alive for safe destruction and should
+    /// not block drain barrier exit.
+    pub(crate) fn active_reclaim_count(&self) -> usize {
+        self.reclaim_queue
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| !e.quarantined)
+            .count()
     }
 }
 
@@ -344,22 +376,24 @@ impl FdCqDriver {
             self.handle.drain_reclaimed();
         }
 
-        // Final drain barrier: loop until inflight=0 AND reclaim empty AND CQ empty,
+        // Final drain barrier: loop until inflight=0 AND active reclaim empty AND CQ empty,
         // or DRAIN_BARRIER_BUDGET iterations. Ensures all flush CQEs are dispatched.
+        // Quarantined entries (wedged) are excluded — they stay alive for safe destruction.
         for i in 0..DRAIN_BARRIER_BUDGET {
             let n = self.cq.poll(&mut wc_buf)?;
             if n > 0 {
                 self.dispatch(&wc_buf[..n]);
             }
-            let remaining = self.handle.drain_reclaimed();
+            self.handle.drain_reclaimed();
+            let active_reclaim = self.handle.active_reclaim_count();
             let inflight = self.handle.map.inflight_count();
-            if n == 0 && remaining == 0 && inflight == 0 {
+            if n == 0 && active_reclaim == 0 && inflight == 0 {
                 break;
             }
             if i == DRAIN_BARRIER_BUDGET - 1 {
                 tracing::warn!(
                     inflight,
-                    remaining,
+                    active_reclaim,
                     "FdCqDriver: drain barrier budget exhausted"
                 );
             }
@@ -463,15 +497,16 @@ impl PollingCqDriver {
             if n > 0 {
                 self.dispatch(&wc_buf[..n]);
             }
-            let remaining = self.handle.drain_reclaimed();
+            self.handle.drain_reclaimed();
+            let active_reclaim = self.handle.active_reclaim_count();
             let inflight = self.handle.map.inflight_count();
-            if n == 0 && remaining == 0 && inflight == 0 {
+            if n == 0 && active_reclaim == 0 && inflight == 0 {
                 break;
             }
             if i == DRAIN_BARRIER_BUDGET - 1 {
                 tracing::warn!(
                     inflight,
-                    remaining,
+                    active_reclaim,
                     "PollingCqDriver: drain barrier budget exhausted"
                 );
             }

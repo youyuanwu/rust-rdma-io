@@ -116,6 +116,7 @@ async fn test_shared_qp_send_recv_fd() {
     let recv_result = recv_future.await;
 
     let (recv_res, recv_mr) = recv_result;
+    let recv_mr = recv_mr.expect("real CQE should return MR");
     let recv_completion = recv_res.expect("recv should succeed");
     assert_eq!(recv_completion.opcode(), WcOpcode::Recv);
 
@@ -223,6 +224,7 @@ async fn test_shared_qp_write_read_fd() {
         .reg_mr(write_data.len(), AccessIntent::LocalOnly)
         .unwrap();
     let (read_result, read_mr) = c_sqp.read(read_mr, server_remote, None).await;
+    let read_mr = read_mr.expect("real CQE should return MR");
     read_result.expect("read should succeed");
 
     assert_eq!(read_mr.as_slice(), write_data);
@@ -304,6 +306,7 @@ async fn test_shared_qp_send_recv_polling() {
 
     let (send_res, _send_mr) = client_sqp.send(send_mr, None).await;
     let (recv_res, recv_mr) = recv_future.await;
+    let recv_mr = recv_mr.expect("real CQE should return MR");
 
     recv_res.expect("recv should succeed");
     assert_eq!(&recv_mr.as_slice()[..msg.len()], msg);

@@ -795,10 +795,22 @@ impl MessageTransport {
             .await
             .map_err(|_| self.terminal_error())?;
 
-        // Acquire send buffer from the pool
+        // Acquire send buffer from the pool.
+        // Race against terminal state to avoid hanging forever if the
+        // driver dies while all send MRs are quarantined (FR-011).
         let mut mr = {
             let mut rx = self.send_pool_rx.lock().await;
-            rx.recv().await.ok_or_else(|| self.terminal_error())?
+            loop {
+                if self.state.is_terminal() {
+                    return Err(self.terminal_error());
+                }
+                let notified = self.state.state_notify.notified();
+                tokio::select! {
+                    biased;
+                    res = rx.recv() => break res.ok_or_else(|| self.terminal_error())?,
+                    () = notified => continue,
+                }
+            }
         };
 
         // === SYNCHRONOUS SECTION ===
@@ -837,7 +849,11 @@ impl MessageTransport {
         }));
 
         let (result, mr) = op.await;
-        let _ = self.send_pool_tx.try_send(mr);
+        // MR is Some on real CQE, None if quarantined (driver shutdown).
+        // Only return to pool if we actually got the MR back.
+        if let Some(mr) = mr {
+            let _ = self.send_pool_tx.try_send(mr);
+        }
 
         result.map_err(|e| match &e {
             Error::CompletionError { status, .. } if *status == crate::wc::WcStatus::WrFlushErr => {
@@ -1123,7 +1139,7 @@ async fn driver_run(
 
             // Drive HELLO send if not done
             result = &mut hello_send, if !hello_sent => {
-                let (send_result, _mr) = result;
+                let (send_result, _mr_opt) = result;
                 if let Err(e) = send_result {
                     terminal_error = Some(e);
                     break 'handshake;
@@ -1436,35 +1452,60 @@ async fn driver_run(
     // Close credits first to unblock any waiting frontend operations
     state.remote_credits.close();
 
-    // Initiate QP shutdown — transitions QP to error, generating flush CQEs
+    // Initiate QP shutdown — transitions QP to error state, causing the HCA
+    // to generate flush CQEs for all outstanding WRs.
     let _ = shared_qp.shutdown();
+
+    // Signal CQ drivers to enter their final drain barrier. We use
+    // shutdown() (not flush_and_shutdown) to let real flush CQEs arrive
+    // from the hardware rather than writing synthetic completions.
+    // This preserves the teardown invariant: an MR may only be returned
+    // after its real CQE is reaped or the QP is destroyed.
     for h in &driver_handles {
-        h.flush_and_shutdown();
+        h.shutdown();
     }
 
-    // Drop pending recv OpFutures BEFORE CQ drain — releases inflight
-    // registry slots so the drain barrier can reach zero.
+    // Drop pending recv OpFutures — pushes their MRs to the reclaim queue
+    // for safe cleanup during the CQ drain barrier.
     drop(pending_recvs);
     drop(recv_msg_tx);
 
-    // Let CQ drivers drain their final barrier
+    // Let CQ drivers drain their final barrier (processes real flush CQEs).
     let drain_timeout = tokio::time::sleep(DRAIN_TIMEOUT);
     tokio::pin!(drain_timeout);
+    let mut drain_timed_out = false;
 
     loop {
         tokio::select! {
             biased;
             Some(_) = futures_util::StreamExt::next(&mut cq_futures) => {
-                // CQ driver finished
+                // CQ driver finished its drain barrier
             }
             () = &mut drain_timeout => {
                 tracing::warn!("driver: CQ drain timeout");
+                drain_timed_out = true;
                 break;
             }
         }
         if cq_futures.is_empty() {
             break;
         }
+    }
+
+    // If drain timed out (wedged provider), close inflight maps to wake
+    // any remaining OpFuture waiters. They will quarantine their MRs
+    // (push to reclaim queue) which are freed only after QP destruction
+    // per ConnectionLifetime field ordering.
+    //
+    // Close unconditionally: even on clean drain exit, the CQ drivers have
+    // stopped and no further real CQEs can arrive. Any remaining occupied
+    // slots (e.g., from hello_send on failure paths) must be closed so
+    // their waiters don't hang.
+    if drain_timed_out {
+        tracing::warn!("driver: CQ drain timed out — quarantining remaining MRs");
+    }
+    for h in &driver_handles {
+        h.map().close();
     }
 
     // Now transition to terminal state and notify waiters
@@ -1502,7 +1543,7 @@ enum PollResult {
     /// Future at index completed with the given result.
     Ready(
         usize,
-        std::result::Result<(super::op::Completion, Mr), (Error, Mr)>,
+        std::result::Result<(super::op::Completion, Mr), (Error, Option<Mr>)>,
     ),
 }
 
@@ -1520,7 +1561,10 @@ async fn poll_any_ready(pending: &mut [OpFuture]) -> PollResult {
             let pinned = Pin::new(fut);
             if let Poll::Ready((result, mr)) = pinned.poll(cx) {
                 let mapped = match result {
-                    Ok(completion) => Ok((completion, mr)),
+                    Ok(completion) => {
+                        // Real CQE: mr is always Some
+                        Ok((completion, mr.expect("real CQE must return MR")))
+                    }
                     Err(e) => Err((e, mr)),
                 };
                 return Poll::Ready(PollResult::Ready(i, mapped));

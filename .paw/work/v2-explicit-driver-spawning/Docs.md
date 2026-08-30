@@ -42,7 +42,7 @@ Zero `tokio::spawn` calls exist in `rdma-io/src/v2/*.rs` production code. A sour
 1. **Phased driver state machine**: The driver runs three sequential phases:
    - Phase A (Handshake): CQ drivers run concurrently with HELLO send/receive. CQ drivers MUST be polled from the first poll because HELLO send/recv produce `OpFuture`s that require CQ dispatch.
    - Phase B (Steady state): CQ drivers, recv pump, and disconnect monitor run concurrently in a `select!` loop.
-   - Phase C (Shutdown): QP transitions to error, CQ drivers drain their final barriers with a bounded timeout.
+   - Phase C (Shutdown): QP transitions to error state (generating real flush CQEs), CQ drivers enter their final drain barriers to reap real flush completions, then the driver exits. On drain timeout (wedged provider), inflight maps are closed to quarantine remaining MRs.
 
 2. **`Pin<Box<dyn Future>>` for driver**: Avoids exposing complex generic types. The boxed future erases the CQ driver type (Fd vs Polling) and completion mode generics.
 
@@ -53,6 +53,10 @@ Zero `tokio::spawn` calls exist in `rdma-io/src/v2/*.rs` production code. A sour
 5. **`compare_exchange` for state transitions**: Both `close()` (Created/Ready → Closing) and driver readiness (Created → Ready) use `compare_exchange` to detect concurrent transitions, preventing close/ready races.
 
 6. **Connection ownership split**: `ConnectionLifetime` is a single Arc-shared owner of SharedQp, Pd, CmId, and EventChannel. Both the frontend (`MessageTransport`) and the driver (`MessageTransportDriver`) hold `Arc<ConnectionLifetime>` via `TransportSharedState`. No standalone `Arc<SharedQp>` escapes this owner — all QP access is borrowed through `conn_lifetime.shared_qp()`. The struct's field declaration order guarantees safe destruction: SharedQp (QP → `rdma_destroy_qp`) drops before CmId (`rdma_destroy_id`) drops before EventChannel. When the last holder drops, the destructor runs in this safe order regardless of which side was last.
+
+7. **MR quarantine on shutdown/abort**: `OpFuture` returns `(Result<Completion>, Option<Mr>)`. On a real CQE, `Some(mr)` is returned — the hardware is confirmed done. On driver shutdown (inflight map closed), `None` is returned — the MR is pushed to the `CqDriverHandle` reclaim queue for safe destruction. MRs in the reclaim queue are freed only when `CqDriverHandle` drops, which structurally follows QP destruction per `ConnectionLifetime` and `SharedQp` field ordering. This ensures the invariant: **an MR posted to hardware may be returned/reused/dropped only after its actual CQE is reaped OR the owning QP has been synchronously destroyed.**
+
+8. **No synthetic completions**: Previous versions used `flush_all()` to write synthetic WrFlushErr completions during shutdown, which could return MRs to callers before the hardware was done with them. The current design replaces this with `InflightMap::close()` which wakes waiters to quarantine their MRs, and the CQ driver drain barrier processes real flush CQEs from QP→ERR transition.
 
 ### Error Observation
 
@@ -191,8 +195,19 @@ cargo test --workspace
 - `test_one_task_per_endpoint_shared_cq` / `_separate_cq`: Structural task count assertions
 - `test_readiness_mode_explicit_spawn` / `test_polling_mode_explicit_spawn`: Both completion modes
 
+### MR Teardown Safety Tests
+
+- `test_qp_destroy_before_mr_deregistration_order`: Structural drop-recorder test proving QP destruction precedes CqDriverHandle (and thus reclaim-queue MR) deregistration
+- `test_transport_shared_state_field_order`: Verifies `TransportSharedState` field drop order is safe (driver_handles before conn_lifetime)
+- `test_inflight_map_close_wakes_waiters`: Unit test for `InflightMap::close()` mechanism
+- `test_mr_quarantine_on_driver_abort`: Integration test — abort a spawned driver with connection established, verify frontend errors correctly and cleanup is safe
+- `test_mr_quarantine_on_unspawned_driver_drop`: Integration test — drop unspawned driver, verify pre-posted recv MRs are quarantined
+- `test_graceful_close_drains_real_cqes`: Integration test — graceful `close()` with active connection, verify Phase C drains real CQEs
+- `test_connection_lifetime_field_drop_order`: Existing structural test for ConnectionLifetime field order
+
 ## Limitations and Future Work
 
 - **Tokio-specific**: The driver future uses `tokio::select!`, `Notify`, `Semaphore`, and `AsyncFd`. It cannot be polled on non-Tokio runtimes.
 - **Frontend not `Clone`**: Share via `Arc<MessageTransport>` if needed.
-- **Deprecated escape hatches**: `shared_qp()` and `driver_handles()` are deprecated because standalone `Arc<SharedQp>` access can outlive the connection lifetime, risking use-after-free. Use `send()`/`recv()`/`close()` instead.
+- **Wedged provider resource leak**: If a provider fails to generate flush CQEs after QP→ERR within `DRAIN_TIMEOUT`, MRs are quarantined (leaked) rather than freed unsafely. This is a deliberate safety choice — the resources are freed on process exit.
+- **`OpFuture` output change**: `OpFuture::Output` is `(Result<Completion>, Option<Mr>)` rather than `(Result<Completion>, Mr)`. Callers must handle the `None` case (MR quarantined during shutdown). This is a breaking API change from the initial v2 design.
