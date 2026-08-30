@@ -81,11 +81,12 @@ pub struct SharedQp {
 }
 
 impl SharedQp {
-    /// Create a new `SharedQp` from a queue pair and separate send/recv driver handles.
+    /// Create a new `SharedQp` from a queue pair and driver handles.
     ///
-    /// RDMA uses separate send and recv completion queues; each needs its own
-    /// driver. Send/write/read completions route through `send_handle`, while
-    /// recv completions route through `recv_handle`.
+    /// `send_handle` routes send/write/read completions; `recv_handle`
+    /// routes recv completions. In shared-CQ mode, pass the same
+    /// `Arc<CqDriverHandle>` for both (tokens are globally unique via
+    /// generation-protected encoding, so no wr_id partitioning is needed).
     ///
     /// The `pd` is stored for MR registration convenience.
     /// The `qp` is wrapped in `Arc` for shared access.

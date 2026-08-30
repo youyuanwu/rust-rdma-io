@@ -6,7 +6,7 @@
 //!
 //! # Wire Protocol
 //!
-//! Every RDMA message carries a [`protocol`](super::protocol) frame header
+//! Every RDMA message carries a [`protocol`] frame header
 //! (12 bytes) followed by a type-specific payload. Three frame types exist:
 //!
 //! | Type | Purpose |
@@ -75,7 +75,7 @@ use crate::cm::ConnParam;
 use crate::wr::{SendFlags, SendWr, Sge, WrOpcode};
 
 use super::connection::{
-    CmResources, CompletionMode, Connection, ConnectionBuilder, ConnectionConfig,
+    CmMonitorHandle, CompletionMode, Connection, ConnectionBuilder, ConnectionConfig,
 };
 use super::driver::CqDriverHandle;
 use super::error::{Error, Result};
@@ -496,6 +496,14 @@ impl MessageTransport {
                     let header = protocol::parse_header(mr.as_slice(), byte_len)?;
                     if header.frame_type == protocol::FRAME_HELLO {
                         let hello = protocol::parse_hello(&mr.as_slice()[protocol::HEADER_SIZE..])?;
+                        // Validate peer's max_message_size is compatible
+                        let peer_max = hello.max_message_size as usize;
+                        if peer_max < buffer_size {
+                            return Err(Error::ProtocolViolation(format!(
+                                "peer max_message_size {peer_max} < local buffer_size {buffer_size}; \
+                                 sending max-size messages would overrun peer recv buffers"
+                            )));
+                        }
                         let capacity = hello.data_recv_capacity as usize;
                         let qp = connection.shared_qp().qp().clone();
                         let handle = connection.shared_qp().recv_handle().clone();
@@ -572,14 +580,14 @@ impl MessageTransport {
         ));
 
         // === Disconnect Monitor ===
-        let cm_resources = connection.take_cm_resources();
+        let cm_handle = connection.take_cm_monitor_handle();
         let disc_closed = closed.clone();
         let disc_credits = remote_credits.clone();
         let disc_handles: Vec<_> = connection.driver_handles().to_vec();
 
-        let disconnect_task = cm_resources.map(|cm| {
+        let disconnect_task = cm_handle.map(|handle| {
             tokio::spawn(disconnect_monitor(
-                cm,
+                handle,
                 disc_closed,
                 disc_credits,
                 disc_handles,
@@ -696,17 +704,16 @@ impl MessageTransport {
 
         let (result, mr) = op.await;
 
+        // Always return MR to pool first, even on error (prevents pool leak)
+        let _ = self.send_pool_tx.try_send(mr);
+
         // Map flush errors to TransportClosed at the transport boundary
-        let result = result.map_err(|e| match &e {
+        result.map_err(|e| match &e {
             Error::CompletionError { status, .. } if *status == crate::wc::WcStatus::WrFlushErr => {
                 Error::TransportClosed
             }
             _ => e,
-        });
-        result?;
-
-        // Return MR to the send pool
-        let _ = self.send_pool_tx.try_send(mr);
+        })?;
 
         Ok(())
     }
@@ -796,65 +803,56 @@ impl Drop for MessageTransport {
 /// CM event monitor — sole consumer of the connection's event channel.
 ///
 /// On peer disconnect or CM error, atomically closes the transport.
-/// Uses `compare_exchange` on the `closed` flag to ensure idempotent
-/// shutdown: if the transport was already closed (by `close()` or `Drop`),
-/// the monitor exits without redundant cleanup.
+/// Does NOT own the `CmId` — that stays in [`Connection`] for safe
+/// QP-before-CmId destruction ordering. Uses `compare_exchange` on the
+/// `closed` flag to ensure idempotent shutdown.
 async fn disconnect_monitor(
-    cm: CmResources,
+    handle: CmMonitorHandle,
     closed: Arc<AtomicBool>,
     credits: Arc<Semaphore>,
     driver_handles: Vec<Arc<CqDriverHandle>>,
 ) {
     use crate::cm::CmEventType;
 
-    // Read CM events until disconnect or error
     loop {
-        // Wait for the CM event channel fd to be readable
-        let guard_result = cm.cm_async_fd.readable().await;
+        let guard_result = handle.cm_async_fd.readable().await;
         let mut guard = match guard_result {
             Ok(g) => g,
-            Err(_) => break, // fd error → treat as disconnect
+            Err(_) => break,
         };
 
-        // Try to read CM event (non-blocking)
-        match cm.event_channel.try_get_event() {
+        match handle.event_channel.try_get_event() {
             Ok(event) => {
                 let event_type = event.event_type();
                 tracing::debug!(?event_type, "disconnect_monitor: CM event");
                 match event_type {
                     CmEventType::Disconnected | CmEventType::DeviceRemoval => break,
-                    _ => {
-                        // Other events — continue monitoring
-                    }
+                    _ => {}
                 }
             }
             Err(crate::Error::WouldBlock) => {
-                // Spurious wakeup — clear readiness and retry
                 guard.clear_ready();
                 continue;
             }
-            Err(_) => {
-                // Read error → treat as disconnect
-                break;
-            }
+            Err(_) => break,
         }
 
         guard.clear_ready();
     }
 
-    // Atomically close the transport
     if closed
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
         tracing::info!("disconnect_monitor: peer disconnected, closing transport");
         credits.close();
-        for handle in &driver_handles {
-            handle.flush_and_shutdown();
+        for h in &driver_handles {
+            h.flush_and_shutdown();
         }
     }
 
-    // CmResources drops here: AsyncFd, CmId, EventChannel in order
+    // CmMonitorHandle drops: AsyncFd deregistered, Arc<EventChannel> decremented.
+    // CmId stays in Connection — QP-before-CmId ordering maintained.
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -914,7 +912,7 @@ async fn recv_pump(
         }
 
         if pending_recvs.is_empty() {
-            // All buffers are out — wait for repost or shutdown
+            // All buffers are out — wait for repost, ctrl MR, or shutdown
             tokio::select! {
                 biased;
                 mr = repost_rx.recv() => {
@@ -927,6 +925,17 @@ async fn recv_pump(
                             }
                         }
                         None => return,
+                    }
+                    continue;
+                }
+                // Wake when a control send MR returns (so we can flush credits)
+                ctrl_mr = ctrl_send_rx.recv(), if pending_credits > 0 => {
+                    if let Some(mut ctrl_mr) = ctrl_mr {
+                        let credits_to_send = pending_credits;
+                        pending_credits = 0;
+                        let frame_len = protocol::write_credit_frame(ctrl_mr.as_mut_slice(), credits_to_send);
+                        let ctx = ctrl_send_tx.clone();
+                        let _ = post_send_and_detach(&qp, &send_handle, ctrl_mr, frame_len, Box::new(move |mr| { let _ = ctx.try_send(mr); }));
                     }
                     continue;
                 }

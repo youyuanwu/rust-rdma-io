@@ -4,9 +4,9 @@
 //!
 //! | Type | Code | Purpose |
 //! |------|------|---------|
-//! | [`DATA`] | 0 | Application payload |
-//! | [`CREDIT`] | 1 | Return receive credits to sender |
-//! | [`HELLO`] | 2 | Readiness/capability exchange during connect |
+//! | [`FRAME_DATA`] | 0 | Application payload |
+//! | [`FRAME_CREDIT`] | 1 | Return receive credits to sender |
+//! | [`FRAME_HELLO`] | 2 | Readiness/capability exchange during connect |
 //!
 //! # Frame Layout
 //!

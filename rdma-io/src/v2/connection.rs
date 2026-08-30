@@ -70,20 +70,14 @@ impl ConnectionConfig {
     }
 }
 
-/// CM (connection manager) resources bundled for transfer to
-/// the disconnect monitor.
+/// Handle for the disconnect monitor — carries the `AsyncFd` and a
+/// shared reference to the `EventChannel` for reading CM events.
 ///
-/// # Drop Order
-///
-/// Fields drop in declaration order:
-/// 1. `cm_async_fd` — deregistered from epoll
-/// 2. `cm_id` — disconnect/destroy
-/// 3. `event_channel` — closes fd
-pub(crate) struct CmResources {
+/// Does NOT own the `CmId` — that stays in [`Connection`] where
+/// field-declaration-order drop guarantees QP is destroyed before CM ID.
+pub(crate) struct CmMonitorHandle {
     pub(crate) cm_async_fd: AsyncFd<RawFd>,
-    #[expect(dead_code)] // held for drop ordering (must outlive cm_async_fd)
-    pub(crate) cm_id: crate::cm::CmId,
-    pub(crate) event_channel: EventChannel,
+    pub(crate) event_channel: Arc<EventChannel>,
 }
 
 /// An established RDMA connection with all resources wired.
@@ -93,15 +87,19 @@ pub(crate) struct CmResources {
 /// Fields drop in declaration order:
 /// 1. `shared_qp` — QP destroyed (flushes outstanding WRs)
 /// 2. `driver_handles` — `Arc<CqDriverHandle>` refs dropped
-/// 3. `driver_tasks` — `JoinHandle`s dropped (aborted on shutdown)
+/// 3. `driver_tasks` — `JoinHandle`s aborted (synchronous, no await)
 /// 4. `pd` — protection domain (ref-counted)
-/// 5. `cm_resources` — CM AsyncFd, CmId, EventChannel (last)
+/// 5. `cm_id` — disconnect/destroy (AFTER QP)
+/// 6. `event_channel` — closes fd (last, after CM ID)
 pub struct Connection {
     shared_qp: SharedQp,
     driver_handles: Vec<Arc<CqDriverHandle>>,
     driver_tasks: Vec<JoinHandle<super::error::Result<()>>>,
     pd: Pd,
-    cm_resources: Option<CmResources>,
+    #[expect(dead_code)] // held for drop ordering — must drop AFTER shared_qp
+    cm_id: crate::cm::CmId,
+    event_channel: Arc<EventChannel>,
+    cm_async_fd: Option<AsyncFd<RawFd>>,
     shutdown_initiated: bool,
 }
 
@@ -121,16 +119,24 @@ impl Connection {
         &self.driver_handles
     }
 
-    /// Take the CM event channel resources for a disconnect monitor.
+    /// Take the CM monitoring handle for a disconnect monitor task.
     ///
-    /// After this call, the connection no longer holds CM resources and
-    /// will not attempt CM cleanup on drop. The caller is responsible
-    /// for proper drop ordering.
-    pub(crate) fn take_cm_resources(&mut self) -> Option<CmResources> {
-        self.cm_resources.take()
+    /// The returned handle carries the `AsyncFd` and a shared ref to the
+    /// `EventChannel`. The `CmId` stays in this `Connection` to ensure
+    /// QP-before-CmId destruction order.
+    pub(crate) fn take_cm_monitor_handle(&mut self) -> Option<CmMonitorHandle> {
+        let async_fd = self.cm_async_fd.take()?;
+        Some(CmMonitorHandle {
+            cm_async_fd: async_fd,
+            event_channel: Arc::clone(&self.event_channel),
+        })
     }
 
     /// Synchronous, idempotent shutdown initiation. Safe for `Drop`.
+    ///
+    /// Transitions QP to error, flushes all inflight operations with
+    /// synthetic errors, and aborts driver tasks. Does NOT await driver
+    /// completion — use [`close()`](Self::close) for graceful shutdown.
     pub fn initiate_shutdown(&mut self) {
         if self.shutdown_initiated {
             return;
@@ -140,16 +146,33 @@ impl Connection {
         for handle in &self.driver_handles {
             handle.flush_and_shutdown();
         }
+        // Abort only in Drop/sync context; close() awaits first
         for task in &self.driver_tasks {
             task.abort();
         }
     }
 
     /// Graceful async shutdown with bounded timeout.
+    ///
+    /// Transitions QP to error, flushes inflight operations, then awaits
+    /// driver tasks (which perform final drain). Only aborts if a driver
+    /// task exceeds the timeout.
     pub async fn close(mut self) {
-        self.initiate_shutdown();
-        for task in &mut self.driver_tasks {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+        if !self.shutdown_initiated {
+            self.shutdown_initiated = true;
+            let _ = self.shared_qp.shutdown();
+            for handle in &self.driver_handles {
+                handle.flush_and_shutdown();
+            }
+            // Await driver tasks — let them drain, abort only on timeout
+            for task in &mut self.driver_tasks {
+                if tokio::time::timeout(std::time::Duration::from_secs(5), &mut *task)
+                    .await
+                    .is_err()
+                {
+                    task.abort();
+                }
+            }
         }
     }
 }
@@ -268,11 +291,9 @@ impl ConnectionBuilder {
             driver_handles,
             driver_tasks,
             pd,
-            cm_resources: Some(CmResources {
-                cm_async_fd,
-                cm_id,
-                event_channel,
-            }),
+            cm_id,
+            event_channel: Arc::new(event_channel),
+            cm_async_fd: Some(cm_async_fd),
             shutdown_initiated: false,
         })
     }
@@ -372,11 +393,9 @@ impl ConnectionBuilder {
             driver_handles,
             driver_tasks,
             pd,
-            cm_resources: Some(CmResources {
-                cm_async_fd,
-                cm_id: conn_id,
-                event_channel: conn_ch,
-            }),
+            cm_id: conn_id,
+            event_channel: Arc::new(conn_ch),
+            cm_async_fd: Some(cm_async_fd),
             shutdown_initiated: false,
         })
     }

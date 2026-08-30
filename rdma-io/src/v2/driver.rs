@@ -29,6 +29,9 @@ use super::mr::Mr;
 /// Maximum reclaim drain turns before force-releasing a wedged entry.
 const RECLAIM_MAX_TURNS: usize = 4096;
 
+/// Maximum iterations for the final drain barrier after shutdown.
+const DRAIN_BARRIER_BUDGET: usize = 4096;
+
 /// A detached in-flight operation awaiting reclamation.
 pub(crate) struct DetachedOp {
     /// The registry token for this operation.
@@ -309,15 +312,26 @@ impl FdCqDriver {
             self.handle.drain_reclaimed();
         }
 
-        // Final drain on shutdown
-        loop {
+        // Final drain barrier: loop until inflight=0 AND reclaim empty AND CQ empty,
+        // or DRAIN_BARRIER_BUDGET iterations. Ensures all flush CQEs are dispatched.
+        for i in 0..DRAIN_BARRIER_BUDGET {
             let n = self.cq.poll(&mut wc_buf)?;
-            if n == 0 {
+            if n > 0 {
+                self.dispatch(&wc_buf[..n]);
+            }
+            let remaining = self.handle.drain_reclaimed();
+            let inflight = self.handle.map.inflight_count();
+            if n == 0 && remaining == 0 && inflight == 0 {
                 break;
             }
-            self.dispatch(&wc_buf[..n]);
+            if i == DRAIN_BARRIER_BUDGET - 1 {
+                tracing::warn!(
+                    inflight,
+                    remaining,
+                    "FdCqDriver: drain barrier budget exhausted"
+                );
+            }
         }
-        self.handle.drain_reclaimed();
 
         Ok(())
     }
@@ -411,15 +425,25 @@ impl PollingCqDriver {
             }
         }
 
-        // Final drain on shutdown
-        loop {
+        // Final drain barrier
+        for i in 0..DRAIN_BARRIER_BUDGET {
             let n = self.cq.poll(&mut wc_buf)?;
-            if n == 0 {
+            if n > 0 {
+                self.dispatch(&wc_buf[..n]);
+            }
+            let remaining = self.handle.drain_reclaimed();
+            let inflight = self.handle.map.inflight_count();
+            if n == 0 && remaining == 0 && inflight == 0 {
                 break;
             }
-            self.dispatch(&wc_buf[..n]);
+            if i == DRAIN_BARRIER_BUDGET - 1 {
+                tracing::warn!(
+                    inflight,
+                    remaining,
+                    "PollingCqDriver: drain barrier budget exhausted"
+                );
+            }
         }
-        self.handle.drain_reclaimed();
 
         Ok(())
     }
