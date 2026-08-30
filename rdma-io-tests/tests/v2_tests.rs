@@ -22,6 +22,21 @@ macro_rules! require_software_rdma {
     };
 }
 
+async fn wait_for_completion(cq: &Cq) -> WorkCompletion {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut completions = [WorkCompletion::default(); 4];
+        loop {
+            let n = cq.poll(&mut completions).unwrap();
+            if n > 0 {
+                return completions[0];
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("timed out waiting for completion")
+}
+
 // ---- Device / PD ----
 
 #[test]
@@ -580,35 +595,20 @@ async fn test_v2_completion_error() {
     // Transition QP to error state — flushes all outstanding WRs
     server.qp.to_error().unwrap();
 
-    // Poll for the flushed completion — should show error status
-    let mut wc = [WorkCompletion::default(); 4];
-    let mut found_error = false;
-    for _ in 0..100 {
-        let n = server.recv_cq.poll(&mut wc).unwrap();
-        if n > 0 {
-            assert!(!wc[0].is_success(), "flushed WR should have error status");
-            assert_eq!(wc[0].status(), rdma_io::wc::WcStatus::WrFlushErr);
-            assert_eq!(wc[0].wr_id(), 42);
+    let wc = wait_for_completion(&server.recv_cq).await;
+    assert!(!wc.is_success(), "flushed WR should have error status");
+    assert_eq!(wc.status(), rdma_io::wc::WcStatus::WrFlushErr);
+    assert_eq!(wc.wr_id(), 42);
 
-            // Verify that check_completion surfaces CompletionError
-            let result = Qp::check_completion(&wc[0]);
-            assert!(result.is_err());
-            match result.unwrap_err() {
-                Error::CompletionError { status, .. } => {
-                    assert_eq!(status, rdma_io::wc::WcStatus::WrFlushErr);
-                }
-                other => panic!("expected CompletionError, got: {other}"),
-            }
-
-            found_error = true;
-            break;
+    // Verify that check_completion surfaces CompletionError
+    let result = Qp::check_completion(&wc);
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        Error::CompletionError { status, .. } => {
+            assert_eq!(status, rdma_io::wc::WcStatus::WrFlushErr);
         }
-        tokio::task::yield_now().await;
+        other => panic!("expected CompletionError, got: {other}"),
     }
-    assert!(
-        found_error,
-        "should have received flushed completion with error status"
-    );
 }
 
 // ---- CqPoller async polling test ----
@@ -806,27 +806,16 @@ async fn test_v2_completion_result_error() {
     server.qp.submit(Op::recv(&mut recv_mr, 99)).unwrap();
     server.qp.to_error().unwrap();
 
-    let mut wc_buf = [rdma_io::wc::WorkCompletion::default(); 4];
-    let mut found = false;
-    for _ in 0..100 {
-        let n = server.recv_cq.poll(&mut wc_buf).unwrap();
-        if n > 0 {
-            let cqe = Completion::from(wc_buf[0]);
-            assert_eq!(cqe.wr_id(), 99);
-            assert!(!cqe.is_success());
+    let cqe = Completion::from(wait_for_completion(&server.recv_cq).await);
+    assert_eq!(cqe.wr_id(), 99);
+    assert!(!cqe.is_success());
 
-            // result() should return CompletionError
-            let err = cqe.result().unwrap_err();
-            match err {
-                Error::CompletionError { status, .. } => {
-                    assert_eq!(status, rdma_io::wc::WcStatus::WrFlushErr);
-                }
-                other => panic!("expected CompletionError, got: {other}"),
-            }
-            found = true;
-            break;
+    // result() should return CompletionError
+    let err = cqe.result().unwrap_err();
+    match err {
+        Error::CompletionError { status, .. } => {
+            assert_eq!(status, rdma_io::wc::WcStatus::WrFlushErr);
         }
-        tokio::task::yield_now().await;
+        other => panic!("expected CompletionError, got: {other}"),
     }
-    assert!(found, "should have received flushed completion");
 }

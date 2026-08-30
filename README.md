@@ -152,6 +152,82 @@ Also provides lower-level APIs: `Op` enum for typed submission, `CqPoller` for
 direct CQ polling with waker registration, and `Completions<N>` for fd-based
 async CQ draining. See the `rdma_io::v2` module docs for the full API reference.
 
+### V2 Message Transport
+
+The v2 message transport provides a builder-driven, message-oriented Send/Recv
+transport on top of `SharedQp` with pre-registered buffer pools, message
+boundaries, credit-based flow control, deterministic disconnect handling,
+and cancellation-safe operations:
+
+```rust
+use rdma_io::v2::*;
+use rdma_io::v2::message_transport::MessageTransportBuilder;
+
+// Server: accept a connection with builder configuration
+let listener = rdma_io::async_cm::AsyncCmListener::bind(&"0.0.0.0:7471".parse().unwrap())?;
+let server = MessageTransportBuilder::new()
+    .recv_buffers(32)
+    .send_buffers(16)
+    .buffer_size(64 * 1024)
+    .completion_mode(CompletionMode::Readiness)
+    .accept(&listener)
+    .await?;
+
+// Client: connect to remote endpoint
+let client = MessageTransportBuilder::new()
+    .recv_buffers(32)
+    .send_buffers(16)
+    .buffer_size(64 * 1024)
+    .connect("10.0.0.1:7471".parse().unwrap())
+    .await?;
+
+// Send/recv with message boundaries preserved
+client.send(b"hello rdma transport").await?;
+let msg = server.recv().await?;
+assert_eq!(msg.as_ref(), b"hello rdma transport");
+assert_eq!(msg.len(), 20);
+// ReceivedMessage drop returns the buffer for reposting + returns a credit
+```
+
+Key design properties:
+
+- **Wire protocol**: A minimal internal protocol with DATA, CREDIT, and HELLO
+  frame types (12-byte header with magic/version/type/length validation)
+- **Credit-based flow control**: Each `send()` acquires one remote receive
+  credit. Credits are exchanged via HELLO handshake and returned via CREDIT
+  frames when `ReceivedMessage` is dropped. RNR retry is a safety net, not
+  the primary flow-control mechanism.
+- **Readiness handshake**: During `connect()`/`accept()`, both peers exchange
+  HELLO frames carrying data receive capacity and max message size. The
+  transport is not returned until both sides are fully ready for traffic.
+- **Deterministic disconnect**: A dedicated CM event monitor (sole consumer
+  of the connection's event channel) detects peer disconnect and atomically
+  closes the transport, waking all pending `send()`/`recv()`/credit waiters
+  with `Error::TransportClosed`.
+- **Pre-posted receives**: All receive buffers (data + control headroom) are
+  posted before the CM handshake completes
+- **Bounded backpressure**: Both send buffer pool and credit semaphore limit
+  concurrent sends; additional senders wait asynchronously
+- **`send().await` = local completion**: The send CQE confirms local
+  completion, not remote consumption
+- **Cancellation safe**: If cancelled before WR posting, the credit permit is
+  returned automatically. If cancelled after posting, the MR returns via the
+  reclaim queue. Dropping `recv()` leaves the message for the next caller.
+- **Shared CQ by default**: One CQ + one driver for both send and recv
+  completions; separate-CQ mode available via `.separate_cqs(true)`
+- **Completion modes**: `Readiness` (fd/channel-based, lower CPU) or
+  `Polling` (direct CQ poll, lower latency)
+
+#### Non-Goals
+
+The following are explicitly out of scope for the v2 message transport:
+
+- `AsyncRead`/`AsyncWrite` byte-stream adapters (future layering)
+- tonic/gRPC or quinn/QUIC integration (separate crates)
+- Ring transports, atomics, inline data, multi-SGE operations
+- Dynamic buffer pool resizing
+- UD (Unreliable Datagram) queue pair support
+
 ## Prerequisites
 
 ```sh

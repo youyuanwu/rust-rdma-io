@@ -81,11 +81,12 @@ pub struct SharedQp {
 }
 
 impl SharedQp {
-    /// Create a new `SharedQp` from a queue pair and separate send/recv driver handles.
+    /// Create a new `SharedQp` from a queue pair and driver handles.
     ///
-    /// RDMA uses separate send and recv completion queues; each needs its own
-    /// driver. Send/write/read completions route through `send_handle`, while
-    /// recv completions route through `recv_handle`.
+    /// `send_handle` routes send/write/read completions; `recv_handle`
+    /// routes recv completions. In shared-CQ mode, pass the same
+    /// `Arc<CqDriverHandle>` for both (tokens are globally unique via
+    /// generation-protected encoding, so no wr_id partitioning is needed).
     ///
     /// The `pd` is stored for MR registration convenience.
     /// The `qp` is wrapped in `Arc` for shared access.
@@ -111,6 +112,16 @@ impl SharedQp {
     /// Access the underlying QP.
     pub fn qp(&self) -> &Arc<Qp> {
         &self.qp
+    }
+
+    /// Access the send-side driver handle.
+    pub fn send_handle(&self) -> &Arc<CqDriverHandle> {
+        &self.send_handle
+    }
+
+    /// Access the recv-side driver handle.
+    pub fn recv_handle(&self) -> &Arc<CqDriverHandle> {
+        &self.recv_handle
     }
 
     /// Submit a send operation and await its completion.
@@ -189,11 +200,26 @@ impl SharedQp {
     }
 
     /// Transition QP to error state, flushing all in-flight operations.
+    ///
+    /// This moves the QP to `IBV_QPS_ERR`, causing the HCA to flush all
+    /// outstanding WRs. It does NOT stop the completion drivers — they
+    /// continue running to drain the resulting flush CQEs.
+    ///
+    /// Use [`shutdown_drivers()`](Self::shutdown_drivers) when this `SharedQp`
+    /// is the sole owner of its driver handles and the drivers should stop.
     pub fn shutdown(&self) -> Result<()> {
         self.qp.to_error()?;
+        Ok(())
+    }
+
+    /// Signal both completion drivers to shut down.
+    ///
+    /// Only call this when this `SharedQp` is the sole owner of its driver
+    /// handles. If the drivers are shared across multiple QPs, the driver
+    /// owner should call `handle.shutdown()` directly.
+    pub fn shutdown_drivers(&self) {
         self.send_handle.shutdown();
         self.recv_handle.shutdown();
-        Ok(())
     }
 }
 
@@ -237,11 +263,20 @@ enum OpState {
 /// # Cancellation Safety
 ///
 /// Dropping this future does NOT cancel the RDMA operation. The
-/// owned `Mr` and registry slot are moved to a detached cleanup
-/// task that reclaims them when the CQE arrives.
+/// owned `Mr` and registry slot are pushed to the driver's centralized
+/// reclaim queue, which releases them when the CQE arrives. No
+/// per-operation task is spawned.
 pub struct OpFuture {
     state: OpState,
+    /// Optional callback invoked when this future is dropped while in-flight
+    /// and the completion eventually arrives. Used by higher layers (e.g.,
+    /// message transport) to return the MR to a buffer pool.
+    cancel_reclaim: Option<Box<dyn FnOnce(Mr) + Send>>,
 }
+
+// SAFETY: OpFuture is Unpin because its state machine moves data between
+// enum variants via std::mem::replace — there are no self-referential borrows.
+impl Unpin for OpFuture {}
 
 impl OpFuture {
     fn new(
@@ -263,6 +298,28 @@ impl OpFuture {
                 offset,
                 len,
             },
+            cancel_reclaim: None,
+        }
+    }
+
+    /// Attach a callback that will be invoked with the owned `Mr` if this
+    /// future is dropped while in-flight and the CQE eventually arrives.
+    ///
+    /// This enables higher layers to return the MR to a buffer pool after
+    /// cancellation without leaking it.
+    pub fn on_cancel_reclaim(mut self, cb: Box<dyn FnOnce(Mr) + Send>) -> Self {
+        self.cancel_reclaim = Some(cb);
+        self
+    }
+
+    /// Create an `OpFuture` that is already in the inflight state.
+    ///
+    /// Used by the recv pump to create futures for WRs that were posted
+    /// directly (not through the Pending → Inflight state machine).
+    pub(crate) fn new_inflight(handle: Arc<CqDriverHandle>, token: u64, mr: Mr) -> Self {
+        Self {
+            state: OpState::Inflight { handle, token, mr },
+            cancel_reclaim: None,
         }
     }
 }
@@ -295,10 +352,7 @@ impl Future for OpFuture {
                     let reg = match handle.map().register() {
                         Some(r) => r,
                         None => {
-                            let err = Error::InvalidConfig(
-                                "inflight operation capacity exhausted".into(),
-                            );
-                            return Poll::Ready((Err(err), mr));
+                            return Poll::Ready((Err(Error::CapacityExhausted), mr));
                         }
                     };
 
@@ -313,6 +367,7 @@ impl Future for OpFuture {
                         handle.map().release(token);
                         return Poll::Ready((Err(e), mr));
                     }
+                    handle.notify_work();
 
                     // Move to inflight state
                     this.state = OpState::Inflight { handle, token, mr };
@@ -352,25 +407,11 @@ impl Drop for OpFuture {
         match std::mem::replace(&mut self.state, OpState::Done) {
             OpState::Inflight { handle, token, mr } => {
                 // Operation was posted but future is being dropped.
-                // The HCA may still be accessing the MR — we must keep
-                // the MR alive until the CQE arrives.
-                //
-                // Spawn a detached task to hold the MR and wait for
-                // the completion, then release the registry slot.
-                tokio::spawn(async move {
-                    let _mr_lease = mr; // MR stays alive in this task
-                    loop {
-                        if handle.map().take_completion(token).is_some() {
-                            handle.map().release(token);
-                            break;
-                        }
-                        if handle.is_shutdown() {
-                            handle.map().release(token);
-                            break;
-                        }
-                        tokio::task::yield_now().await;
-                    }
-                });
+                // The HCA may still be accessing the MR — push to
+                // the driver's centralized reclaim queue instead of
+                // spawning a per-operation task.
+                let on_reclaim = self.cancel_reclaim.take();
+                handle.push_detached(token, mr, on_reclaim);
             }
             OpState::Pending { .. } => {
                 // Never posted — nothing to clean up.
