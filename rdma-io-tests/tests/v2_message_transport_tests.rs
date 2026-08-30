@@ -1084,7 +1084,7 @@ async fn test_one_task_per_endpoint_shared_cq() {
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
-async fn test_driver_error_propagates() {
+async fn test_driver_abort_propagates_to_frontend() {
     require_software_rdma!();
 
     let listener = bind_listener_with_retry().await;
@@ -1152,6 +1152,151 @@ async fn test_driver_error_propagates() {
 
     drop(client_transport);
     let _ = client_driver_handle.await;
+}
+
+/// FR-027: HELLO validation failure (buffer_size mismatch) is reported
+/// through the driver result and ready(), not from connect()/accept().
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn test_hello_mismatch_fails_ready() {
+    require_software_rdma!();
+
+    let listener = bind_listener_with_retry().await;
+    let listen_addr = connect_addr_for(listener.local_addr());
+
+    // Server: buffer_size(256) — announces max_message_size=256
+    let server_builder = message_transport::MessageTransportBuilder::new()
+        .recv_buffers(4)
+        .send_buffers(4)
+        .buffer_size(256)
+        .completion_mode(CompletionMode::Readiness);
+    // Client: buffer_size(4096) — peer max (256) < local buffer_size (4096)
+    // → protocol violation
+    let client_builder = message_transport::MessageTransportBuilder::new()
+        .recv_buffers(4)
+        .send_buffers(4)
+        .buffer_size(4096)
+        .completion_mode(CompletionMode::Readiness);
+
+    let server_task = tokio::spawn(async move {
+        let (transport, driver) = server_builder.accept(&listener).await.unwrap();
+        let handle = tokio::spawn(driver);
+        (transport, handle)
+    });
+    let client_task = tokio::spawn(async move {
+        let (transport, driver) = client_builder.connect(listen_addr).await.unwrap();
+        let handle = tokio::spawn(driver);
+        (transport, handle)
+    });
+
+    let (server, client) = tokio::join!(server_task, client_task);
+    let (client_transport, client_driver_handle) = client.unwrap();
+    let (_server_transport, _server_driver_handle) = server.unwrap();
+
+    // ready() should fail with TransportFailed (not hang or succeed)
+    let ready_result = tokio::time::timeout(Duration::from_secs(15), client_transport.ready())
+        .await
+        .expect("ready() should not hang on HELLO mismatch");
+    assert!(
+        ready_result.is_err(),
+        "ready() should fail on HELLO mismatch"
+    );
+
+    // error() should report ProtocolViolation
+    // Give driver time to finish
+    tokio::task::yield_now().await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), client_driver_handle).await;
+    tokio::task::yield_now().await;
+
+    let err = client_transport.error();
+    assert!(err.is_some(), "error() should be set after HELLO mismatch");
+    assert_eq!(
+        *err.unwrap().kind(),
+        TransportErrorKind::ProtocolViolation,
+        "HELLO mismatch should produce ProtocolViolation"
+    );
+
+    drop(client_transport);
+    drop(_server_transport);
+    let _ = _server_driver_handle.await;
+}
+
+/// Regression test for M-1: lost wakeup in send() pool wait.
+///
+/// With send_buffers(1), N concurrent senders park on the pool. Aborting
+/// the driver must wake ALL of them with error — none may hang forever.
+/// The bug was that `notify_waiters()` could land between the terminal
+/// check and the `notified()` snapshot, losing the wakeup.
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn test_concurrent_send_abort_no_hang() {
+    require_software_rdma!();
+
+    let listener = bind_listener_with_retry().await;
+    let listen_addr = connect_addr_for(listener.local_addr());
+
+    let server_builder = message_transport::MessageTransportBuilder::new()
+        .recv_buffers(4)
+        .send_buffers(1)
+        .buffer_size(256)
+        .completion_mode(CompletionMode::Readiness);
+    let client_builder = message_transport::MessageTransportBuilder::new()
+        .recv_buffers(4)
+        .send_buffers(1)
+        .buffer_size(256)
+        .completion_mode(CompletionMode::Readiness);
+
+    let server_task = tokio::spawn(async move {
+        let (transport, driver) = server_builder.accept(&listener).await.unwrap();
+        let handle = tokio::spawn(driver);
+        (transport, handle)
+    });
+    let client_task = tokio::spawn(async move {
+        let (transport, driver) = client_builder.connect(listen_addr).await.unwrap();
+        let handle = tokio::spawn(driver);
+        (transport, handle)
+    });
+
+    let (server, client) = tokio::join!(server_task, client_task);
+    let (client_transport, client_driver_handle) = client.unwrap();
+    let (server_transport, _server_driver_handle) = server.unwrap();
+
+    // Wait for readiness
+    client_transport.ready().await.unwrap();
+
+    // Spawn N concurrent senders. With send_buffers(1), one may post while the
+    // rest wait on the send pool; aborting the driver must wake every waiter.
+    let client_arc = std::sync::Arc::new(client_transport);
+    let n = 4;
+    let mut send_handles = Vec::new();
+    for i in 0..n {
+        let c = client_arc.clone();
+        send_handles.push(tokio::spawn(async move {
+            c.send(format!("concurrent-{i}").as_bytes()).await
+        }));
+    }
+
+    // Give the senders a chance to contend on the single-buffer pool, but
+    // abort before completions can recycle the MR back into the pool.
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    // Abort the driver — all parked senders must wake with error
+    client_driver_handle.abort();
+
+    // ALL senders must resolve within timeout — none may hang
+    for (i, h) in send_handles.into_iter().enumerate() {
+        let result = tokio::time::timeout(Duration::from_secs(5), h)
+            .await
+            .unwrap_or_else(|_| panic!("sender {i} hung after driver abort (M-1 regression)"));
+        let send_result = result.unwrap();
+        assert!(
+            send_result.is_err(),
+            "sender {i} should fail after driver abort"
+        );
+    }
+
+    drop(client_arc);
+    drop(server_transport);
+    let _ = _server_driver_handle.await;
 }
 
 // ============================================================

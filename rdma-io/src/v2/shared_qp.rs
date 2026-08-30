@@ -28,7 +28,8 @@
 //! // compio-style: owned buffer in, (result, buffer) out
 //! let (result, mr) = sqp.send(mr, None).await;
 //! result?;
-//! // mr is returned and can be reused
+//! // mr is Some on real CQE, None if quarantined during shutdown
+//! let mr = mr.expect("real CQE should return MR");
 //! # Ok(())
 //! # }
 //! ```

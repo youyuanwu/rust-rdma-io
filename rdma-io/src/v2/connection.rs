@@ -92,12 +92,20 @@ pub(crate) struct CmMonitorHandle {
 ///    where `qp: Arc<Qp>` is the **first** field. If this is the last reference,
 ///    `Qp` → `CmQueuePair::drop()` calls `rdma_destroy_qp` while `cm_id` is
 ///    still alive. **Nested invariant**: `SharedQp.qp` must remain the first field.
-/// 2. `pd` drops second → decrements the `Arc<ProtectionDomain>` refcount.
+///    Additionally, `CmQueuePair::drop` releases its `Arc<CompletionQueue>` refs,
+///    so CQs are destroyed at this point (if no other Arc holders remain).
+/// 2. `_completion_channels` drops second → each `Arc<CompletionChannel>` refcount
+///    decreases. Since the driver's `Cq` may already have dropped its Arc clone,
+///    this may be the last reference, triggering `ibv_destroy_comp_channel`.
+///    Because the CQs were destroyed in step 1, `ibv_destroy_comp_channel`
+///    succeeds (no associated CQ remains). **Critical invariant**: this field
+///    must follow `shared_qp` and precede `cm_id`.
+/// 3. `pd` drops third → decrements the `Arc<ProtectionDomain>` refcount.
 ///    The PD is only freed once every `Mr`, the `CmQueuePair`, and all other
 ///    `Pd` clones are gone; this field is held so the PD cannot be released
 ///    before the QP under any drop order.
-/// 3. `cm_id` drops third → `rdma_destroy_id` runs (QP already destroyed).
-/// 4. `event_channel` drops last → closes the event fd.
+/// 4. `cm_id` drops fourth → `rdma_destroy_id` runs (QP already destroyed).
+/// 5. `event_channel` drops last → closes the event fd.
 ///
 /// **Precondition**: `SharedQp.qp` must be the last `Arc<Qp>` reference
 /// when `ConnectionLifetime` drops. This is enforced by not exposing
@@ -108,10 +116,27 @@ pub(crate) struct CmMonitorHandle {
 /// (`MessageTransportDriver`) hold `Arc<ConnectionLifetime>` via
 /// `TransportSharedState`. When the last holder drops, the struct
 /// destructs in the safe order above, regardless of which side was last.
+///
+/// # Field Ordering Safety
+///
+/// **DO NOT reorder fields.** The destruction order is load-bearing:
+/// - `shared_qp` MUST be first (QP destroyed before anything else)
+/// - `_completion_channels` MUST follow `shared_qp` (channel destroyed after CQ)
+/// - `cm_id` MUST follow `shared_qp` (CmId alive during `rdma_destroy_qp`)
+/// - `event_channel` MUST be last
+///
+/// The structural tests `test_connection_lifetime_field_drop_order` and
+/// `test_completion_channel_drop_order` verify this invariant.
 pub(crate) struct ConnectionLifetime {
     /// SharedQp wraps `Arc<Qp>` wrapping `CmQueuePair`.
-    /// Must drop FIRST — `rdma_destroy_qp` requires live `CmId`.
+    /// Must drop FIRST — `rdma_destroy_qp` requires live `CmId`,
+    /// and dropping the QP releases `Arc<CompletionQueue>` refs so
+    /// completion channels can be destroyed next.
     shared_qp: SharedQp,
+    /// Completion channel Arcs — must drop AFTER shared_qp (so CQs are
+    /// destroyed first) and BEFORE cm_id. Each driver's `Cq` also holds
+    /// a clone; this ensures the channel outlives all CQ references.
+    _completion_channels: Vec<Arc<crate::comp_channel::CompletionChannel>>,
     #[expect(dead_code)] // held for drop ordering / MR lifetime
     pd: Pd,
     #[expect(dead_code)] // held for drop ordering — must drop AFTER shared_qp
@@ -124,12 +149,14 @@ impl ConnectionLifetime {
     /// Create a new connection lifetime owner.
     pub(crate) fn new(
         shared_qp: SharedQp,
+        completion_channels: Vec<Arc<crate::comp_channel::CompletionChannel>>,
         pd: Pd,
         cm_id: crate::cm::CmId,
         event_channel: Arc<EventChannel>,
     ) -> Self {
         Self {
             shared_qp,
+            _completion_channels: completion_channels,
             pd,
             cm_id,
             event_channel,
@@ -156,6 +183,9 @@ pub(crate) struct ConnectionParts {
     pub(crate) driver_handles: Vec<Arc<CqDriverHandle>>,
     /// Boxed CQ driver futures ready to be polled. NOT spawned.
     pub(crate) driver_futures: Vec<BoxedCqDriverFuture>,
+    /// Completion channel Arcs — shared with drivers and ConnectionLifetime
+    /// for correct destruction order (channel destroyed after CQ).
+    pub(crate) completion_channels: Vec<Arc<crate::comp_channel::CompletionChannel>>,
     /// Resources for building ConnectionLifetime (Pd, CmId, EventChannel).
     pub(crate) pd: Pd,
     pub(crate) cm_id: crate::cm::CmId,
@@ -223,7 +253,7 @@ impl Connection {
         self.shutdown_initiated = true;
         let _ = self.shared_qp.shutdown();
         for handle in &self.driver_handles {
-            handle.flush_and_shutdown();
+            handle.close_and_shutdown();
         }
     }
 }
@@ -273,7 +303,10 @@ impl ConnectionBuilder {
 
         // Build CQ(s) and create (but do NOT spawn) drivers
         let depth = self.config.cq_depth as i32;
-        let (shared_qp, driver_handles, driver_futures) = if self.config.separate_cqs {
+        let (shared_qp, driver_handles, driver_futures, completion_channels) = if self
+            .config
+            .separate_cqs
+        {
             let (send_cq, recv_cq) = match self.config.completion_mode {
                 CompletionMode::Readiness => {
                     let sc = CqBuilder::new(&ctx, depth).with_channel().build()?;
@@ -296,8 +329,10 @@ impl ConnectionBuilder {
             let qp = Qp::from_cm_qp(cmqp);
 
             let cap = self.config.inflight_capacity;
-            let (send_handle, send_future) = self.create_driver(send_cq, cap);
-            let (recv_handle, recv_future) = self.create_driver(recv_cq, cap);
+            let (send_handle, send_future, send_channels) = self.create_driver(send_cq, cap);
+            let (recv_handle, recv_future, recv_channels) = self.create_driver(recv_cq, cap);
+            let mut all_channels = send_channels;
+            all_channels.extend(recv_channels);
 
             let sqp = SharedQp::new(
                 qp,
@@ -309,6 +344,7 @@ impl ConnectionBuilder {
                 sqp,
                 vec![send_handle, recv_handle],
                 vec![send_future, recv_future],
+                all_channels,
             )
         } else {
             let cq = match self.config.completion_mode {
@@ -325,10 +361,10 @@ impl ConnectionBuilder {
             let qp = Qp::from_cm_qp(cmqp);
 
             let cap = self.config.inflight_capacity;
-            let (handle, future) = self.create_driver(cq, cap);
+            let (handle, future, channels) = self.create_driver(cq, cap);
 
             let sqp = SharedQp::new(qp, Arc::clone(&handle), Arc::clone(&handle), pd.clone());
-            (sqp, vec![handle], vec![future])
+            (sqp, vec![handle], vec![future], channels)
         };
 
         // Pre-establish hook
@@ -345,6 +381,7 @@ impl ConnectionBuilder {
             shared_qp,
             driver_handles,
             driver_futures,
+            completion_channels,
             pd,
             cm_id,
             event_channel: Arc::clone(&event_channel),
@@ -376,7 +413,10 @@ impl ConnectionBuilder {
         let pd = Pd::new(pd_inner);
 
         let depth = self.config.cq_depth as i32;
-        let (shared_qp, driver_handles, driver_futures) = if self.config.separate_cqs {
+        let (shared_qp, driver_handles, driver_futures, completion_channels) = if self
+            .config
+            .separate_cqs
+        {
             let (send_cq, recv_cq) = match self.config.completion_mode {
                 CompletionMode::Readiness => {
                     let sc = CqBuilder::new(&ctx, depth).with_channel().build()?;
@@ -399,8 +439,10 @@ impl ConnectionBuilder {
             let qp = Qp::from_cm_qp(cmqp);
 
             let cap = self.config.inflight_capacity;
-            let (send_handle, send_future) = self.create_driver(send_cq, cap);
-            let (recv_handle, recv_future) = self.create_driver(recv_cq, cap);
+            let (send_handle, send_future, send_channels) = self.create_driver(send_cq, cap);
+            let (recv_handle, recv_future, recv_channels) = self.create_driver(recv_cq, cap);
+            let mut all_channels = send_channels;
+            all_channels.extend(recv_channels);
 
             let sqp = SharedQp::new(
                 qp,
@@ -412,6 +454,7 @@ impl ConnectionBuilder {
                 sqp,
                 vec![send_handle, recv_handle],
                 vec![send_future, recv_future],
+                all_channels,
             )
         } else {
             let cq = match self.config.completion_mode {
@@ -428,10 +471,10 @@ impl ConnectionBuilder {
             let qp = Qp::from_cm_qp(cmqp);
 
             let cap = self.config.inflight_capacity;
-            let (handle, future) = self.create_driver(cq, cap);
+            let (handle, future, channels) = self.create_driver(cq, cap);
 
             let sqp = SharedQp::new(qp, Arc::clone(&handle), Arc::clone(&handle), pd.clone());
-            (sqp, vec![handle], vec![future])
+            (sqp, vec![handle], vec![future], channels)
         };
 
         // Pre-establish hook
@@ -452,6 +495,7 @@ impl ConnectionBuilder {
             shared_qp,
             driver_handles,
             driver_futures,
+            completion_channels,
             pd,
             cm_id: conn_id,
             event_channel: Arc::clone(&conn_ch),
@@ -463,19 +507,28 @@ impl ConnectionBuilder {
     }
 
     /// Create a CQ driver future without spawning it.
+    ///
+    /// Returns (handle, future, completion_channels) — the channels are
+    /// Arc-shared so ConnectionLifetime can hold a reference that outlives
+    /// the driver, ensuring correct `ibv_destroy_comp_channel` ordering.
     fn create_driver(
         &self,
         cq: super::cq::Cq,
         inflight_capacity: usize,
-    ) -> (Arc<CqDriverHandle>, BoxedCqDriverFuture) {
+    ) -> (
+        Arc<CqDriverHandle>,
+        BoxedCqDriverFuture,
+        Vec<Arc<crate::comp_channel::CompletionChannel>>,
+    ) {
+        let channels: Vec<_> = cq.channel_arc().into_iter().collect();
         match self.config.completion_mode {
             CompletionMode::Readiness => {
                 let (driver, handle) = FdCqDriver::new(cq, inflight_capacity);
-                (handle, Box::pin(driver.run_tokio()))
+                (handle, Box::pin(driver.run_tokio()), channels)
             }
             CompletionMode::Polling => {
                 let (driver, handle) = PollingCqDriver::new(cq, inflight_capacity);
-                (handle, Box::pin(driver.run()))
+                (handle, Box::pin(driver.run()), channels)
             }
         }
     }
@@ -588,6 +641,7 @@ mod tests {
         /// If you change `ConnectionLifetime`'s fields, update this too.
         struct LifetimeShape {
             _shared_qp: Recorder,
+            _completion_channels: Vec<Recorder>,
             _pd: Recorder,
             _cm_id: Recorder,
             _event_channel: Recorder,
@@ -596,14 +650,21 @@ mod tests {
         let log = Arc::new(Mutex::new(Vec::new()));
         drop(LifetimeShape {
             _shared_qp: Recorder("shared_qp", log.clone()),
+            _completion_channels: vec![Recorder("completion_channel", log.clone())],
             _pd: Recorder("pd", log.clone()),
             _cm_id: Recorder("cm_id", log.clone()),
             _event_channel: Recorder("event_channel", log.clone()),
         });
         assert_eq!(
             *log.lock().unwrap(),
-            ["shared_qp", "pd", "cm_id", "event_channel"],
-            "ConnectionLifetime field drop order must be: QP → PD → CmId → EventChannel"
+            [
+                "shared_qp",
+                "completion_channel",
+                "pd",
+                "cm_id",
+                "event_channel"
+            ],
+            "ConnectionLifetime field drop order must be: QP → CompletionChannels → PD → CmId → EventChannel"
         );
     }
 }

@@ -483,7 +483,7 @@ impl TransportSharedState {
         // Shut down the QP and CQ drivers
         let _ = self.conn_lifetime.shared_qp().shutdown();
         for h in &self.driver_handles {
-            h.flush_and_shutdown();
+            h.close_and_shutdown();
         }
     }
 }
@@ -617,6 +617,7 @@ impl MessageTransport {
         // RDMA resources. Drop order: SharedQp → Pd → CmId → EventChannel.
         let conn_lifetime = Arc::new(ConnectionLifetime::new(
             parts.shared_qp,
+            parts.completion_channels,
             parts.pd,
             parts.cm_id,
             parts.event_channel,
@@ -798,13 +799,20 @@ impl MessageTransport {
         // Acquire send buffer from the pool.
         // Race against terminal state to avoid hanging forever if the
         // driver dies while all send MRs are quarantined (FR-011).
+        //
+        // Uses register-check-recheck protocol: create `notified()` FIRST
+        // (snapshots the notify_waiters counter), THEN check terminal state.
+        // If `notify_waiters()` fires between the check and the await,
+        // the already-registered `Notified` wakes immediately. Reversing
+        // this order opens a lost-wakeup window where `mark_driver_dead()`
+        // signals between the terminal check and the `notified()` snapshot.
         let mut mr = {
             let mut rx = self.send_pool_rx.lock().await;
             loop {
+                let notified = self.state.state_notify.notified();
                 if self.state.is_terminal() {
                     return Err(self.terminal_error());
                 }
-                let notified = self.state.state_notify.notified();
                 tokio::select! {
                     biased;
                     res = rx.recv() => break res.ok_or_else(|| self.terminal_error())?,
@@ -1032,8 +1040,7 @@ async fn driver_run(
     let mut remaining_futures = initial_recvs;
 
     // Send HELLO — this creates an OpFuture that needs CQ driver to dispatch
-    let hello_send = shared_qp.send(hello_mr, Some((0, hello_len)));
-    tokio::pin!(hello_send);
+    let mut hello_send = Box::pin(shared_qp.send(hello_mr, Some((0, hello_len))));
 
     // Phase A loop: drive CQ futures while waiting for HELLO send
     let mut hello_sent = false;
@@ -1138,7 +1145,7 @@ async fn driver_run(
             }
 
             // Drive HELLO send if not done
-            result = &mut hello_send, if !hello_sent => {
+            result = hello_send.as_mut(), if !hello_sent => {
                 let (send_result, _mr_opt) = result;
                 if let Err(e) = send_result {
                     terminal_error = Some(e);
@@ -1211,6 +1218,11 @@ async fn driver_run(
         }
     }
 
+    // Drop hello_send to release its inflight registry slot.
+    // On failure paths where the OpFuture is still inflight, this pushes
+    // the MR to the reclaim queue so the drain barrier can reach zero.
+    drop(hello_send);
+
     // Take ownership of all pre-posted recv futures unconditionally.
     // On the happy path they become Phase B's pending_recvs; on every
     // failure/early-exit path they are dropped before the Phase C drain
@@ -1268,11 +1280,10 @@ async fn driver_run(
                     && let Ok(mut ctrl_mr) = ctrl_send_rx.try_recv()
                 {
                     let credits_to_send = pending_credits;
-                    pending_credits = 0;
                     let frame_len =
                         protocol::write_credit_frame(ctrl_mr.as_mut_slice(), credits_to_send);
                     let ctx = ctrl_send_tx.clone();
-                    let _ = post_send_and_detach(
+                    match post_send_and_detach(
                         shared_qp.qp(),
                         &send_handle,
                         ctrl_mr,
@@ -1280,7 +1291,18 @@ async fn driver_run(
                         Box::new(move |mr| {
                             let _ = ctx.try_send(mr);
                         }),
-                    );
+                    ) {
+                        Ok(()) => {
+                            pending_credits = 0;
+                        }
+                        Err(e) => {
+                            tracing::warn!("driver: CREDIT post failed: {e}");
+                            if !matches!(e, Error::CapacityExhausted) {
+                                terminal_error = Some(e);
+                                break;
+                            }
+                        }
+                    }
                 }
 
                 if pending_recvs.is_empty() {
@@ -1314,7 +1336,10 @@ async fn driver_run(
                                     pending_credits += 1;
                                     match post_recv_and_track(shared_qp.qp(), &recv_handle, mr) {
                                         Ok(future) => pending_recvs.push(future),
-                                        Err(_) => break,
+                                        Err(e) => {
+                                            terminal_error = Some(e);
+                                            break;
+                                        }
                                     }
                                 }
                                 None => break, // frontend dropped repost sender
@@ -1325,10 +1350,20 @@ async fn driver_run(
                         ctrl_mr = ctrl_send_rx.recv(), if pending_credits > 0 => {
                             if let Some(mut ctrl_mr) = ctrl_mr {
                                 let credits_to_send = pending_credits;
-                                pending_credits = 0;
                                 let frame_len = protocol::write_credit_frame(ctrl_mr.as_mut_slice(), credits_to_send);
                                 let ctx = ctrl_send_tx.clone();
-                                let _ = post_send_and_detach(shared_qp.qp(), &send_handle, ctrl_mr, frame_len, Box::new(move |mr| { let _ = ctx.try_send(mr); }));
+                                match post_send_and_detach(shared_qp.qp(), &send_handle, ctrl_mr, frame_len, Box::new(move |mr| { let _ = ctx.try_send(mr); })) {
+                                    Ok(()) => {
+                                        pending_credits = 0;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("driver: CREDIT post failed: {e}");
+                                        if !matches!(e, Error::CapacityExhausted) {
+                                            terminal_error = Some(e);
+                                            break;
+                                        }
+                                    }
+                                }
                             }
                             continue;
                         }
@@ -1375,36 +1410,50 @@ async fn driver_run(
                                                     }
                                                 }
                                                 protocol::FRAME_CREDIT => {
-                                                    if let Ok(credit) = protocol::parse_credit(&mr.as_slice()[protocol::HEADER_SIZE..]) {
-                                                        state.remote_credits.add_permits(credit.credits as usize);
-                                                    }
-                                                    match post_recv_and_track(shared_qp.qp(), &recv_handle, mr) {
-                                                        Ok(future) => pending_recvs.push(future),
-                                                        Err(_) => break,
+                                                    match protocol::parse_credit(&mr.as_slice()[protocol::HEADER_SIZE..]) {
+                                                        Ok(credit) => {
+                                                            state.remote_credits.add_permits(credit.credits as usize);
+                                                            match post_recv_and_track(shared_qp.qp(), &recv_handle, mr) {
+                                                                Ok(future) => pending_recvs.push(future),
+                                                                Err(e) => {
+                                                                    terminal_error = Some(e);
+                                                                    break;
+                                                                }
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::warn!("driver: malformed CREDIT frame: {e}");
+                                                            terminal_error = Some(e);
+                                                            break;
+                                                        }
                                                     }
                                                 }
                                                 protocol::FRAME_HELLO => {
                                                     tracing::warn!("driver: unexpected HELLO during normal operation");
                                                     match post_recv_and_track(shared_qp.qp(), &recv_handle, mr) {
                                                         Ok(future) => pending_recvs.push(future),
-                                                        Err(_) => break,
+                                                        Err(e) => {
+                                                            terminal_error = Some(e);
+                                                            break;
+                                                        }
                                                     }
                                                 }
                                                 _ => {
                                                     tracing::warn!(frame_type = header.frame_type, "driver: unknown frame type");
                                                     match post_recv_and_track(shared_qp.qp(), &recv_handle, mr) {
                                                         Ok(future) => pending_recvs.push(future),
-                                                        Err(_) => break,
+                                                        Err(e) => {
+                                                            terminal_error = Some(e);
+                                                            break;
+                                                        }
                                                     }
                                                 }
                                             }
                                         }
                                         Err(e) => {
-                                            tracing::warn!("driver: protocol error: {e}");
-                                            match post_recv_and_track(shared_qp.qp(), &recv_handle, mr) {
-                                                Ok(future) => pending_recvs.push(future),
-                                                Err(_) => break,
-                                            }
+                                            tracing::warn!("driver: protocol parse error: {e}");
+                                            terminal_error = Some(e);
+                                            break;
                                         }
                                     }
                                 }
@@ -1435,7 +1484,10 @@ async fn driver_run(
                                     pending_credits += 1;
                                     match post_recv_and_track(shared_qp.qp(), &recv_handle, mr) {
                                         Ok(future) => pending_recvs.push(future),
-                                        Err(_) => break,
+                                        Err(e) => {
+                                            terminal_error = Some(e);
+                                            break;
+                                        }
                                     }
                                 }
                                 None => break,
@@ -1454,10 +1506,12 @@ async fn driver_run(
 
     // Initiate QP shutdown — transitions QP to error state, causing the HCA
     // to generate flush CQEs for all outstanding WRs.
-    let _ = shared_qp.shutdown();
+    if let Err(e) = shared_qp.shutdown() {
+        tracing::warn!("driver: QP shutdown failed during Phase C: {e}");
+    }
 
     // Signal CQ drivers to enter their final drain barrier. We use
-    // shutdown() (not flush_and_shutdown) to let real flush CQEs arrive
+    // shutdown() (not close_and_shutdown) to let real flush CQEs arrive
     // from the hardware rather than writing synthetic completions.
     // This preserves the teardown invariant: an MR may only be returned
     // after its real CQE is reaped or the QP is destroyed.
@@ -1473,37 +1527,25 @@ async fn driver_run(
     // Let CQ drivers drain their final barrier (processes real flush CQEs).
     let drain_timeout = tokio::time::sleep(DRAIN_TIMEOUT);
     tokio::pin!(drain_timeout);
-    let mut drain_timed_out = false;
-
-    loop {
+    while !cq_futures.is_empty() {
         tokio::select! {
             biased;
-            Some(_) = futures_util::StreamExt::next(&mut cq_futures) => {
-                // CQ driver finished its drain barrier
-            }
+            Some(_) = futures_util::StreamExt::next(&mut cq_futures) => {}
             () = &mut drain_timeout => {
-                tracing::warn!("driver: CQ drain timeout");
-                drain_timed_out = true;
+                tracing::warn!("driver: CQ drain timed out — quarantining remaining MRs");
                 break;
             }
         }
-        if cq_futures.is_empty() {
-            break;
-        }
     }
 
-    // If drain timed out (wedged provider), close inflight maps to wake
-    // any remaining OpFuture waiters. They will quarantine their MRs
-    // (push to reclaim queue) which are freed only after QP destruction
-    // per ConnectionLifetime field ordering.
+    // Close inflight maps to wake any remaining OpFuture waiters. They
+    // will quarantine their MRs (push to reclaim queue), which are freed
+    // only after QP destruction per ConnectionLifetime field ordering.
     //
     // Close unconditionally: even on clean drain exit, the CQ drivers have
     // stopped and no further real CQEs can arrive. Any remaining occupied
     // slots (e.g., from hello_send on failure paths) must be closed so
     // their waiters don't hang.
-    if drain_timed_out {
-        tracing::warn!("driver: CQ drain timed out — quarantining remaining MRs");
-    }
     for h in &driver_handles {
         h.map().close();
     }
@@ -1610,7 +1652,14 @@ fn post_send_and_detach(
     frame_len: usize,
     on_reclaim: Box<dyn FnOnce(Mr) + Send>,
 ) -> Result<()> {
-    let reg = handle.map().register().ok_or(Error::CapacityExhausted)?;
+    let reg = match handle.map().register() {
+        Some(r) => r,
+        None => {
+            // Return MR to pool via callback on registry exhaustion
+            on_reclaim(mr);
+            return Err(Error::CapacityExhausted);
+        }
+    };
     let token = reg.token;
 
     let addr = mr.addr();

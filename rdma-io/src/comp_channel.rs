@@ -81,9 +81,10 @@ impl Drop for CompletionChannel {
     fn drop(&mut self) {
         let ret = unsafe { ibv_destroy_comp_channel(self.inner) };
         if ret != 0 {
+            let errno = if ret < 0 { -ret } else { ret };
             tracing::error!(
                 "ibv_destroy_comp_channel failed: {}",
-                io::Error::from_raw_os_error(-ret)
+                io::Error::from_raw_os_error(errno)
             );
         }
     }

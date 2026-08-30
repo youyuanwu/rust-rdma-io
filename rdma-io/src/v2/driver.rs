@@ -26,11 +26,10 @@ use super::cq::Cq;
 use super::inflight::InflightMap;
 use super::mr::Mr;
 
-/// Maximum reclaim drain turns before force-releasing a wedged entry.
-const RECLAIM_MAX_TURNS: usize = 4096;
-
-/// Maximum iterations for the final drain barrier after shutdown.
-const DRAIN_BARRIER_BUDGET: usize = 4096;
+/// Maximum time a detached operation may wait for its CQE before
+/// being quarantined. Uses wall-clock time instead of loop iterations
+/// to avoid false quarantines under normal scheduling latency.
+const RECLAIM_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Recovery interval while a readiness driver has operations in flight.
 ///
@@ -49,6 +48,8 @@ pub(crate) struct DetachedOp {
     pub(crate) on_reclaim: Option<Box<dyn FnOnce(Mr) + Send>>,
     /// Number of drain passes this entry has survived.
     pub(crate) turns: usize,
+    /// Timestamp when this operation entered the reclaim queue.
+    pub(crate) created_at: tokio::time::Instant,
     /// When true, the MR is quarantined — kept alive until CqDriverHandle
     /// drops (which structurally follows QP destruction). The registry slot
     /// is released but the MR and entry remain in the queue.
@@ -147,6 +148,7 @@ impl CqDriverHandle {
                 mr: Some(mr),
                 on_reclaim,
                 turns: 0,
+                created_at: tokio::time::Instant::now(),
                 quarantined: false,
             });
         }
@@ -161,7 +163,7 @@ impl CqDriverHandle {
     /// are freed only when `CqDriverHandle` drops (which structurally occurs
     /// after QP destruction via `ConnectionLifetime` field ordering).
     ///
-    /// On `RECLAIM_MAX_TURNS` exceeded (wedged provider), the registry slot
+    /// On `RECLAIM_DEADLINE` exceeded (wedged provider), the registry slot
     /// is released but the MR is quarantined in the queue for safe
     /// destruction when the handle drops.
     ///
@@ -192,16 +194,17 @@ impl CqDriverHandle {
             // The MR stays alive in this queue entry and is only freed
             // when CqDriverHandle drops — which structurally follows QP
             // destruction per ConnectionLifetime field ordering.
-            if entry.turns >= RECLAIM_MAX_TURNS {
-                tracing::warn!(
+            if entry.created_at.elapsed() >= RECLAIM_DEADLINE {
+                tracing::error!(
                     token = entry.token,
                     turns = entry.turns,
-                    "reclaim entry exceeded max turns — quarantining MR"
+                    elapsed_ms = entry.created_at.elapsed().as_millis(),
+                    "reclaim entry exceeded deadline — quarantining MR (buffer pool permanently shrunk)"
                 );
                 self.map.release(entry.token);
-                entry.on_reclaim.take(); // don't call callback — not safe
+                entry.on_reclaim.take();
                 entry.quarantined = true;
-                return true; // keep in queue for safe destruction
+                return true;
             }
 
             true // keep in queue
@@ -224,7 +227,7 @@ impl CqDriverHandle {
     /// its actual CQE is reaped OR the owning QP has been synchronously
     /// destroyed. This method enforces the invariant by closing the map
     /// (preventing MR return via OpFuture) without releasing MRs.
-    pub fn flush_and_shutdown(&self) {
+    pub fn close_and_shutdown(&self) {
         self.map.close();
         self.shutdown();
     }
@@ -376,10 +379,12 @@ impl FdCqDriver {
             self.handle.drain_reclaimed();
         }
 
-        // Final drain barrier: loop until inflight=0 AND active reclaim empty AND CQ empty,
-        // or DRAIN_BARRIER_BUDGET iterations. Ensures all flush CQEs are dispatched.
-        // Quarantined entries (wedged) are excluded — they stay alive for safe destruction.
-        for i in 0..DRAIN_BARRIER_BUDGET {
+        // Final drain barrier: cooperatively poll CQ for real flush CQEs
+        // until quiescent or deadline. Yields every 32 iterations to remain
+        // cooperative and allow DRAIN_TIMEOUT in Phase C to fire.
+        let drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut drain_iter = 0usize;
+        loop {
             let n = self.cq.poll(&mut wc_buf)?;
             if n > 0 {
                 self.dispatch(&wc_buf[..n]);
@@ -390,12 +395,17 @@ impl FdCqDriver {
             if n == 0 && active_reclaim == 0 && inflight == 0 {
                 break;
             }
-            if i == DRAIN_BARRIER_BUDGET - 1 {
+            drain_iter += 1;
+            if tokio::time::Instant::now() >= drain_deadline {
                 tracing::warn!(
                     inflight,
                     active_reclaim,
-                    "FdCqDriver: drain barrier budget exhausted"
+                    "FdCqDriver: drain deadline reached"
                 );
+                break;
+            }
+            if drain_iter.is_multiple_of(32) {
+                tokio::task::yield_now().await;
             }
         }
 
@@ -491,8 +501,9 @@ impl PollingCqDriver {
             }
         }
 
-        // Final drain barrier
-        for i in 0..DRAIN_BARRIER_BUDGET {
+        let drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut drain_iter = 0usize;
+        loop {
             let n = self.cq.poll(&mut wc_buf)?;
             if n > 0 {
                 self.dispatch(&wc_buf[..n]);
@@ -503,12 +514,17 @@ impl PollingCqDriver {
             if n == 0 && active_reclaim == 0 && inflight == 0 {
                 break;
             }
-            if i == DRAIN_BARRIER_BUDGET - 1 {
+            drain_iter += 1;
+            if tokio::time::Instant::now() >= drain_deadline {
                 tracing::warn!(
                     inflight,
                     active_reclaim,
-                    "PollingCqDriver: drain barrier budget exhausted"
+                    "PollingCqDriver: drain deadline reached"
                 );
+                break;
+            }
+            if drain_iter.is_multiple_of(32) {
+                tokio::task::yield_now().await;
             }
         }
 

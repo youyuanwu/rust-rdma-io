@@ -141,6 +141,9 @@ impl InflightMap {
     /// Returns `None` if all slots are occupied (registry full).
     /// Allocation is O(1) amortized (free-list pop).
     pub fn register(&self) -> Option<Registration> {
+        if self.is_closed() {
+            return None;
+        }
         let mut free = self.free_list.lock().unwrap();
         let index = free.pop()?;
         let slot = &self.slots[index as usize];

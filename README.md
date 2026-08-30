@@ -142,10 +142,12 @@ let mut mr = sqp.pd().reg_mr(1024, AccessIntent::LocalOnly)?;
 mr.as_mut_slice()[..5].copy_from_slice(b"hello");
 let (result, mr) = sqp.send(mr, None).await;
 result?;
+let mr = mr.expect("real CQE should return MR");
 
 // One-sided RDMA Write
 let (result, mr) = sqp.write(mr, remote_mr, None).await;
 result?;
+let _mr = mr.expect("real CQE should return MR");
 ```
 
 Also provides lower-level APIs: `Op` enum for typed submission, `CqPoller` for
