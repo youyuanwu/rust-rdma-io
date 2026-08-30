@@ -465,7 +465,8 @@ impl CmId {
 ///
 /// Must be dropped **before** the [`CmId`] that created it (since
 /// `rdma_destroy_id` requires the QP to be destroyed first). When used
-/// inside [`AsyncQp`], field declaration order guarantees this.
+/// inside [`AsyncQp`](crate::async_qp::AsyncQp), field declaration order
+/// guarantees this.
 pub struct CmQueuePair {
     qp: *mut ibv_qp,
     cm_id_raw: *mut rdma_cm_id,

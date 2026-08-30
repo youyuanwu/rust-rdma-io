@@ -92,7 +92,8 @@ impl Slot {
 /// # Shutdown Safety
 ///
 /// When the map is [`close()`](InflightMap::close)d, all registered wakers
-/// are notified. Waiters that poll after close detect [`is_closed()`] and
+/// are notified. Waiters that poll after close detect
+/// [`is_closed()`](InflightMap::is_closed) and
 /// transition to quarantine — the MR stays with the driver's reclaim queue
 /// instead of being returned to the caller. This prevents early MR
 /// release while hardware may still DMA.
@@ -151,6 +152,16 @@ impl InflightMap {
         inner.occupied = true;
         inner.waker = None;
         inner.completion = None;
+        // Re-check closed AFTER marking occupied. If close() ran between
+        // our first check and here, it already scanned and woke this slot
+        // (now occupied), so we must not proceed. Roll back.
+        if self.is_closed() {
+            inner.occupied = false;
+            slot.generation.fetch_add(1, Ordering::Relaxed);
+            drop(inner);
+            free.push(index);
+            return None;
+        }
         let gen_val = slot.generation.load(Ordering::Relaxed);
         let token = encode_token(index, gen_val);
         Some(Registration { token })
@@ -311,7 +322,8 @@ impl InflightMap {
     /// Close the map, waking all registered wakers.
     ///
     /// After close, [`OpFuture`](super::shared_qp::OpFuture) waiters detect
-    /// [`is_closed()`] and quarantine their MRs (push to reclaim queue)
+    /// [`is_closed()`](Self::is_closed) and quarantine their MRs (push to
+    /// reclaim queue)
     /// instead of returning them to callers. This ensures MRs are not
     /// freed/reused while hardware may still DMA.
     ///

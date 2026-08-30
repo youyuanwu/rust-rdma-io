@@ -10,7 +10,8 @@
 //! Follows compio/tokio-uring's per-operation future pattern:
 //! - Each async method takes **owned** buffers (`Mr`) and returns them with
 //!   the completion result
-//! - A shared [`InflightMap`] routes CQEs to individual futures by `wr_id` token
+//! - A shared [`InflightMap`](super::inflight::InflightMap) routes CQEs to
+//!   individual futures by `wr_id` token
 //! - A completion driver task (spawned separately) drains the CQ and delivers
 //!   completions
 //! - Dropping a future does NOT cancel the RDMA operation — the owned resources

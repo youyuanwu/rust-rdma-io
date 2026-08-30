@@ -63,8 +63,10 @@ impl<'a> CqBuilder<'a> {
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidConfig`] if `cqe` is less than 1
-    /// - [`Error::Verbs`] if CQ or completion channel creation fails
+    /// - [`Error::InvalidConfig`](super::error::Error::InvalidConfig) if
+    ///   `cqe` is less than 1
+    /// - [`Error::Verbs`](super::error::Error::Verbs) if CQ or completion
+    ///   channel creation fails
     pub fn build(self) -> Result<Cq> {
         if self.cqe < 1 {
             return Err(super::error::Error::InvalidConfig(
@@ -126,7 +128,8 @@ impl Cq {
     ///
     /// # Errors
     ///
-    /// - [`Error::Verbs`] if the underlying poll operation fails
+    /// - [`Error::Verbs`](super::error::Error::Verbs) if the underlying poll
+    ///   operation fails
     pub fn poll(&self, completions: &mut [WorkCompletion]) -> Result<usize> {
         let n = self.inner.poll(completions)?;
         Ok(n)

@@ -1,4 +1,4 @@
-//! SendRecvTransport — concrete [`Transport`](crate::transport::Transport) using RDMA Send/Recv.
+//! SendRecvTransport — concrete [`Transport`] using RDMA Send/Recv.
 //!
 //! Owns the QP, buffers, CQ state, and CM connection lifecycle. Created via
 //! [`connect`](SendRecvTransport::connect) (client) or

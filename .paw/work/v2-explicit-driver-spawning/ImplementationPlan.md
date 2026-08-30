@@ -105,7 +105,7 @@ The inner future uses a phased state machine, NOT a one-shot `select!`:
 
 **Phase B — Steady state**: CQ driver(s), recv_pump, and disconnect_monitor all run in a `loop { select! { ... } }`. When any branch signals terminal state (disconnect, error, close request), the loop breaks.
 
-**Phase C — Shutdown**: Transition QP to error, flush_and_shutdown driver handles, continue polling CQ driver(s) through their final drain barriers, then exit.
+**Phase C — Shutdown**: Transition QP to error, close_and_shutdown driver handles, continue polling CQ driver(s) through their final drain barriers, then exit.
 
 Critical: CQ drivers are polled from the very first poll of the composed future (concurrent with HELLO). They are never dropped by `select!` — they live as pinned futures across all phases.
 
@@ -185,7 +185,7 @@ struct TransportSharedState {
 - **`rdma-io/src/v2/message_transport.rs` (driver internals)**:
   - Driver Phase A (HELLO): concurrent with CQ drivers, send HELLO, await peer HELLO, validate, add credits to shared Semaphore, transition state to Ready, notify waiters
   - Driver Phase B (steady-state): recv_pump + disconnect_monitor + CQ driver(s) in `loop { select! { } }`. Each component returns a typed exit reason rather than silent return
-  - Driver Phase C (shutdown): on close/frontend-drop/error/disconnect, transition QP to error, `flush_and_shutdown` driver handles, continue polling CQ drivers through their final drain barriers (do NOT drop CQ futures before drain completes), then transition state to Stopped and exit
+  - Driver Phase C (shutdown): on close/frontend-drop/error/disconnect, transition QP to error, `close_and_shutdown` driver handles, continue polling CQ drivers through their final drain barriers (do NOT drop CQ futures before drain completes), then transition state to Stopped and exit
   - Error propagation: store `Arc<TransportError>` in shared state, set state=Failed, the same error is returned from the driver's `Result<()>`
 
 - **`rdma-io/src/v2/connection.rs`**:
@@ -337,6 +337,20 @@ After this change, `connect()`/`accept()` no longer fail on HELLO timeout or pro
 - [x] Docs.md covers all required sections
 - [x] Task count documented for both CQ modes
 - [x] Lifecycle/error observation/shutdown order documented
+
+---
+
+## Phase 6: Teardown Safety (MR Quarantine)
+
+### Success Criteria:
+
+#### Automated Verification:
+- [x] Targeted teardown tests cover inflight-map close, driver abort, graceful close, and structural drop ordering
+- [x] `cargo clippy --workspace --all-targets --features tokio -- -D warnings` stays clean after quarantine changes
+
+#### Manual Verification:
+- [x] Shutdown never returns posted MRs to callers without a real CQE
+- [x] Remaining reclaim entries persist until `CqDriverHandle` drop after QP destruction
 
 ---
 

@@ -1,7 +1,7 @@
 //! Async RDMA Stream — async `read` + `write` over a [`Transport`].
 //!
 //! Provides TCP-like async semantics over an RDMA transport, built on
-//! the [`Transport`](crate::transport::Transport) trait for completion-driven I/O.
+//! the [`Transport`] trait for completion-driven I/O.
 //!
 //! # Architecture
 //!

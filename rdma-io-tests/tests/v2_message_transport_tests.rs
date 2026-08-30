@@ -1700,11 +1700,11 @@ async fn test_lifetime_inflight_send_recv_cancellation() {
     // No UAF — QP drops before CmId in ConnectionLifetime
 }
 
-/// Proves: final owner drop guarantees QP destructor precedes CmId/EventChannel
-/// destructor by construction (field declaration order in ConnectionLifetime).
+/// Proves: final owner drop completes cleanly when `ConnectionLifetime`
+/// destruction runs after both frontend and driver leases are gone.
 ///
-/// This is a structural test — ConnectionLifetime's field order is:
-/// shared_qp, pd, cm_id, event_channel. Rust drops in declaration order.
+/// The structural completion-channel ordering proof lives in
+/// `connection.rs:test_connection_lifetime_field_drop_order`.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn test_lifetime_final_owner_drop_order() {
     require_software_rdma!();
@@ -1738,9 +1738,10 @@ async fn test_lifetime_final_owner_drop_order() {
     // Now drop frontends — these are the LAST holders.
     // ConnectionLifetime::drop runs field drops in order:
     //   1. shared_qp (SharedQp → Arc<Qp> → CmQueuePair::drop → rdma_destroy_qp)
-    //   2. pd (Pd drop)
-    //   3. cm_id (CmId::drop → rdma_destroy_id) — CmId alive when QP drops!
-    //   4. event_channel (EventChannel fd close)
+    //   2. completion channels
+    //   3. pd (Pd drop)
+    //   4. cm_id (CmId::drop → rdma_destroy_id) — CmId alive when QP drops!
+    //   5. event_channel (EventChannel fd close)
     //
     // If this test completes without SIGSEGV/SIGABRT, the drop order is safe.
     drop(client_transport);
@@ -1779,6 +1780,7 @@ fn test_qp_destroy_before_mr_deregistration_order() {
     // ConnectionLifetime field order proxy
     struct LifetimeShape {
         _shared_qp: SharedQpShape,
+        _completion_channels: Vec<Recorder>,
         _pd: Recorder,
         _cm_id: Recorder,
         _event_channel: Recorder,
@@ -1792,6 +1794,7 @@ fn test_qp_destroy_before_mr_deregistration_order() {
             _recv_handle: Recorder("recv_handle", log.clone()),
             _pd: Recorder("sqp_pd", log.clone()),
         },
+        _completion_channels: vec![Recorder("completion_channel", log.clone())],
         _pd: Recorder("pd", log.clone()),
         _cm_id: Recorder("cm_id", log.clone()),
         _event_channel: Recorder("event_channel", log.clone()),
@@ -1802,6 +1805,10 @@ fn test_qp_destroy_before_mr_deregistration_order() {
     let qp_pos = order.iter().position(|&s| s == "qp").unwrap();
     let send_pos = order.iter().position(|&s| s == "send_handle").unwrap();
     let recv_pos = order.iter().position(|&s| s == "recv_handle").unwrap();
+    let channel_pos = order
+        .iter()
+        .position(|&s| s == "completion_channel")
+        .unwrap();
     let cm_id_pos = order.iter().position(|&s| s == "cm_id").unwrap();
     assert!(
         qp_pos < send_pos,
@@ -1814,6 +1821,10 @@ fn test_qp_destroy_before_mr_deregistration_order() {
     assert!(
         qp_pos < cm_id_pos,
         "QP must drop before CmId (rdma_destroy_qp requires live cm_id)"
+    );
+    assert!(
+        channel_pos < cm_id_pos,
+        "completion channels must drop before CmId"
     );
 }
 
@@ -1991,7 +2002,7 @@ async fn test_mr_quarantine_on_unspawned_driver_drop() {
     // Drop drivers without ever spawning them.
     // The driver future holds pre-posted recv OpFutures. When the
     // future drops, those OpFutures drop → MRs pushed to reclaim queue.
-    // flush_and_shutdown closes the inflight map, ensuring waiters
+    // close_and_shutdown closes the inflight map, ensuring waiters
     // quarantine their MRs.
     drop(client_driver);
     drop(server_driver);

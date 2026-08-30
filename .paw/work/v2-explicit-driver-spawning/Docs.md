@@ -27,7 +27,7 @@ Zero `tokio::spawn` calls exist in `rdma-io/src/v2/*.rs` production code. A sour
 │                     │     │  ┌─ HELLO Handshake ─────────┐ │
 │                     │     │  │  credit initialization    │ │
 │                     │     │  └──────────────────────────┘ │
-│                     │     │  ConnectionResources (drop)   │
+│                     │     │  ConnectionLifetime (drop)    │
 └─────────────────────┘     └──────────────────────────────┘
 ```
 
@@ -54,7 +54,7 @@ Zero `tokio::spawn` calls exist in `rdma-io/src/v2/*.rs` production code. A sour
 
 6. **Connection ownership split**: `ConnectionLifetime` is a single Arc-shared owner of SharedQp, completion channels, Pd, CmId, and EventChannel. Both the frontend (`MessageTransport`) and the driver (`MessageTransportDriver`) hold `Arc<ConnectionLifetime>` via `TransportSharedState`. No standalone `Arc<SharedQp>` escapes this owner — all QP access is borrowed through `conn_lifetime.shared_qp()`. The struct's field declaration order guarantees safe destruction: SharedQp (QP → `rdma_destroy_qp`) drops before completion channels (`ibv_destroy_comp_channel`), then Pd, then CmId (`rdma_destroy_id`), then EventChannel. When the last holder drops, the destructor runs in this safe order regardless of which side was last.
 
-7. **MR quarantine on shutdown/abort**: `OpFuture` returns `(Result<Completion>, Option<Mr>)`. On a real CQE, `Some(mr)` is returned — the hardware is confirmed done. On driver shutdown (inflight map closed), `None` is returned — the MR is pushed to the `CqDriverHandle` reclaim queue for safe destruction. Reclaim is now time-based: `RECLAIM_DEADLINE` (30 seconds) replaced `RECLAIM_MAX_TURNS`, so wedged-provider quarantine no longer depends on scheduler cadence and does not falsely quarantine under normal scheduling. MRs quarantined by the wedge deadline are freed when `CqDriverHandle` drops, which structurally follows QP destruction per `ConnectionLifetime` and `SharedQp` field ordering, not at process exit. This ensures the invariant: **an MR posted to hardware may be returned/reused/dropped only after its actual CQE is reaped OR the owning QP has been synchronously destroyed.**
+7. **MR quarantine on shutdown/abort**: `OpFuture` returns `(Result<Completion>, Option<Mr>)`. On a real CQE, `Some(mr)` is returned — the hardware is confirmed done. On driver shutdown (inflight map closed), `None` is returned — the MR is pushed to the `CqDriverHandle` reclaim queue for safe destruction. Reclaim is now time-based: `RECLAIM_DEADLINE` (30 seconds) replaced `RECLAIM_MAX_TURNS`, so wedged-provider quarantine during normal driver operation no longer depends on scheduler cadence and does not falsely quarantine under normal scheduling. During shutdown, the CQ driver exits and `drain_reclaimed()` is not called again, so any remaining entries stay queued until `CqDriverHandle::drop`, which structurally follows QP destruction per `ConnectionLifetime` and `SharedQp` field ordering. This ensures the invariant: **an MR posted to hardware may be returned/reused/dropped only after its actual CQE is reaped OR the owning QP has been synchronously destroyed.**
 
 8. **No synthetic completions**: Previous versions used `flush_all()` to write synthetic WrFlushErr completions during shutdown, which could return MRs to callers before the hardware was done with them. The current design replaces this with `InflightMap::close()` which wakes waiters to quarantine their MRs, and the CQ driver drain barrier processes real flush CQEs from QP→ERR transition. The internal shutdown helper is now `close_and_shutdown()`, reflecting that it closes the inflight map before signalling shutdown.
 
@@ -109,12 +109,13 @@ pub(crate) struct ConnectionLifetime {
 
 **Completion-channel proof**: Dropping `SharedQp` first releases the last `Arc<CompletionQueue>` references owned through the QP/CQ graph. Only then do `_completion_channels` drop, so `ibv_destroy_comp_channel` runs after associated CQs are gone and no longer returns `EBUSY`. The previous completion-channel leak signature (about 90 `EBUSY` occurrences per test run) is eliminated by this field ordering.
 
-**Drop test coverage**: Five deterministic tests verify all scenarios:
+**Drop test coverage**: Six deterministic tests verify all scenarios:
 - `test_lifetime_unspawned_driver_dropped_frontend_remains` — driver dropped before spawn
 - `test_lifetime_spawned_driver_aborted_frontend_remains` — driver abort mid-flight
 - `test_lifetime_frontend_dropped_driver_remains` — frontend drops first
 - `test_lifetime_inflight_send_recv_cancellation` — cancelled send/recv
-- `test_lifetime_final_owner_drop_order` — structural field-order proof including completion channels
+- `test_lifetime_final_owner_drop_order` — final-owner drop smoke test
+- `test_connection_lifetime_field_drop_order` (in `connection.rs`) — structural field-order proof including completion channels
 
 ### Integration Points
 
@@ -224,7 +225,7 @@ cargo test --workspace
 
 - **Tokio-specific**: The driver future uses `tokio::select!`, `Notify`, `Semaphore`, and `AsyncFd`. It cannot be polled on non-Tokio runtimes.
 - **Frontend not `Clone`**: Share via `Arc<MessageTransport>` if needed.
-- **Wedged provider quarantine**: If a provider fails to generate flush CQEs after QP→ERR within `DRAIN_TIMEOUT`, the driver stops waiting and remaining reclaim entries rely on the 30-second `RECLAIM_DEADLINE` quarantine path rather than unsafe early free. Quarantined MRs are ultimately freed when `ConnectionLifetime` teardown reaches `CqDriverHandle` drop after QP destruction; what remains lost is reusable pool capacity for that transport instance.
+- **Wedged provider quarantine**: If a provider fails to generate flush CQEs after QP→ERR within `DRAIN_TIMEOUT`, the driver stops waiting rather than freeing MRs unsafely. After that shutdown point, `drain_reclaimed()` is no longer called; remaining reclaim entries simply stay queued until `ConnectionLifetime` teardown reaches `CqDriverHandle` drop after QP destruction. What remains lost is reusable pool capacity for that transport instance.
 - **Shutdown closes registration**: Once an inflight map is closed during teardown, `InflightMap::register()` rejects new work. Late repost/send-control attempts therefore fail fast instead of re-opening shutdown paths.
 - **Drain convergence depends on explicit future drops**: `hello_send` is dropped before the drain barrier so its inflight slot cannot keep Phase C alive indefinitely; any future reordering must preserve that property.
 - **`OpFuture` output change**: `OpFuture::Output` is `(Result<Completion>, Option<Mr>)` rather than `(Result<Completion>, Mr)`. Callers must handle the `None` case (MR quarantined during shutdown). This is a breaking API change from the initial v2 design.

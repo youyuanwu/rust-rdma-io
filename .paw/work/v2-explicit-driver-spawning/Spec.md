@@ -112,7 +112,7 @@ Acceptance Scenarios:
 - FR-027: HELLO validation and timeout failures are reported through the driver result and `ready()`, not from `connect()`/`accept()` (Stories: P1, P2)
 - FR-028: Teardown safety invariant: an MR posted to hardware may be returned/reused/dropped only after its actual CQE is reaped OR the owning QP has been synchronously destroyed. `OpFuture` returns `Option<Mr>` — `Some(mr)` on real CQE, `None` when quarantined. `InflightMap::close()` wakes waiters who quarantine MRs via `push_detached`. MRs in the reclaim queue are freed only when `CqDriverHandle` drops, which structurally follows QP destruction per `ConnectionLifetime` field ordering. (Stories: P2)
 - FR-029: On driver abort/drop, the inflight map is closed synchronously, waking all waiters with `DriverShutdown` errors. Waiters quarantine their MRs (return `None` to callers). No task remains to drain CQEs, but QP destruction at `ConnectionLifetime` drop time guarantees hardware is done before MRs are freed. (Stories: P2)
-- FR-030: On wedged provider (RECLAIM_MAX_TURNS exceeded), registry slots are released but MRs are quarantined (kept alive in the reclaim queue). Resources are leaked rather than freed unsafely. (Stories: P2)
+- FR-030: On wedged provider (RECLAIM_DEADLINE exceeded), registry slots are released but MRs are quarantined (kept alive in the reclaim queue). Resources are leaked rather than freed unsafely. (Stories: P2)
 
 ### Key Entities
 

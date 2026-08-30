@@ -331,6 +331,13 @@ impl FdCqDriver {
             // Drain reclaim queue before parking
             self.handle.drain_reclaimed();
 
+            // Re-check shutdown after work phase to close the window between
+            // the loop-head check and the select!'s Notified snapshot (same
+            // register-check-recheck pattern used in message_transport send()).
+            if self.handle.is_shutdown() {
+                break;
+            }
+
             // Wait for fd readiness, shutdown, or reclaim notification
             tokio::select! {
                 biased;

@@ -238,7 +238,8 @@ impl AsyncCmId {
 
     /// Create a QP with separate send/recv CQs on this CM ID.
     ///
-    /// Returns an owned [`CmQueuePair`] that the caller must keep alive.
+    /// Returns an owned [`CmQueuePair`](crate::cm::CmQueuePair) that the
+    /// caller must keep alive.
     pub fn create_qp_with_cq(
         &self,
         pd: &Arc<ProtectionDomain>,
@@ -276,7 +277,8 @@ impl AsyncCmId {
     /// Await the next CM event on this connection's event channel.
     ///
     /// Returns any event (disconnect, error, etc.). The caller must ack the
-    /// event via [`CmEvent::ack()`]. Useful for monitoring connection
+    /// event via [`CmEvent::ack`](crate::cm::CmEvent::ack). Useful for
+    /// monitoring connection
     /// lifecycle (e.g., detecting peer disconnect via `select!`).
     pub async fn next_event(&self) -> Result<crate::cm::CmEvent> {
         let async_ch = AsyncEventChannel::new(&self.event_channel)?;
@@ -584,7 +586,8 @@ impl AsyncCmListener {
     /// Await the next CM event on the listener's event channel.
     ///
     /// Returns any event (connect request, disconnect, error, etc.).
-    /// The caller must ack the event via [`CmEvent::ack()`].
+    /// The caller must ack the event via
+    /// [`CmEvent::ack`](crate::cm::CmEvent::ack).
     /// For simple accept loops, prefer [`accept()`](Self::accept) instead.
     pub async fn next_event(&self) -> Result<crate::cm::CmEvent> {
         self.async_ch.get_event(&self.event_channel).await

@@ -224,7 +224,7 @@ impl CompletionTracker {
 /// The ring transports expose remote-accessible memory either through a Type-2
 /// Memory Window (per-connection rkey, QP-associated, revocable) or, on NICs
 /// that cannot allocate one, directly through the MR's own rkey. This enum
-/// selects which — resolved once at connect/accept time via [`resolve_mr_rkey`].
+/// selects which — resolved once at connect/accept time via `resolve_mr_rkey`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MemoryWindowMode {
     /// Use Type-2 Memory Windows when the routed device supports them, and

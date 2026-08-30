@@ -831,7 +831,11 @@ impl MessageTransport {
             Some(r) => r,
             None => {
                 let _ = self.send_pool_tx.try_send(mr);
-                return Err(Error::CapacityExhausted);
+                return Err(if handle.map().is_closed() {
+                    self.terminal_error()
+                } else {
+                    Error::CapacityExhausted
+                });
             }
         };
         let token = reg.token;
@@ -1064,7 +1068,7 @@ async fn driver_run(
                 let guard_result = handle.cm_async_fd.readable().await;
                 let mut guard = match guard_result {
                     Ok(g) => g,
-                    Err(_) => break,
+                    Err(e) => break Some(Error::Verbs(e)),
                 };
 
                 match handle.event_channel.try_get_event() {
@@ -1072,22 +1076,30 @@ async fn driver_run(
                         let event_type = event.event_type();
                         tracing::debug!(?event_type, "driver: CM event");
                         match event_type {
-                            CmEventType::Disconnected | CmEventType::DeviceRemoval => break,
-                            _ => {}
+                            CmEventType::Disconnected => break None,
+                            CmEventType::DeviceRemoval => {
+                                break Some(Error::Verbs(std::io::Error::other(
+                                    "RDMA device removed",
+                                )));
+                            }
+                            other => {
+                                tracing::warn!(?other, "driver: unexpected CM event");
+                                break Some(Error::Verbs(std::io::Error::other(format!(
+                                    "unexpected CM event: {other:?}"
+                                ))));
+                            }
                         }
                     }
                     Err(crate::Error::WouldBlock) => {
                         guard.clear_ready();
                         continue;
                     }
-                    Err(_) => break,
+                    Err(e) => break Some(Error::from(e)),
                 }
-
-                guard.clear_ready();
             }
         } else {
             // No CM handle — just pend forever
-            std::future::pending::<()>().await;
+            std::future::pending::<Option<Error>>().await
         }
     };
     tokio::pin!(disconnect_future);
@@ -1129,8 +1141,13 @@ async fn driver_run(
             }
 
             // Disconnect — exit handshake
-            () = &mut disconnect_future => {
-                tracing::info!("driver: peer disconnected during handshake");
+            cm_error = &mut disconnect_future => {
+                if let Some(e) = cm_error {
+                    tracing::warn!("driver: CM error during handshake: {e}");
+                    terminal_error = Some(e);
+                } else {
+                    tracing::info!("driver: peer disconnected during handshake");
+                }
                 break 'handshake;
             }
 
@@ -1162,7 +1179,10 @@ async fn driver_run(
                         let byte_len = completion.byte_len() as usize;
                         match protocol::parse_header(mr.as_slice(), byte_len) {
                             Ok(header) if header.frame_type == protocol::FRAME_HELLO => {
-                                match protocol::parse_hello(&mr.as_slice()[protocol::HEADER_SIZE..]) {
+                                match protocol::parse_hello(
+                                    &mr.as_slice()[protocol::HEADER_SIZE
+                                        ..protocol::HEADER_SIZE + header.payload_len as usize],
+                                ) {
                                     Ok(hello) => {
                                         let peer_max = hello.max_message_size as usize;
                                         if peer_max < buffer_size {
@@ -1325,8 +1345,13 @@ async fn driver_run(
                         }
 
                         // Disconnect
-                        () = &mut disconnect_future => {
-                            tracing::info!("driver: peer disconnected");
+                        cm_error = &mut disconnect_future => {
+                            if let Some(e) = cm_error {
+                                tracing::warn!("driver: CM error: {e}");
+                                terminal_error = Some(e);
+                            } else {
+                                tracing::info!("driver: peer disconnected");
+                            }
                             break;
                         }
 
@@ -1388,8 +1413,13 @@ async fn driver_run(
                         }
 
                         // Disconnect
-                        () = &mut disconnect_future => {
-                            tracing::info!("driver: peer disconnected");
+                        cm_error = &mut disconnect_future => {
+                            if let Some(e) = cm_error {
+                                tracing::warn!("driver: CM error: {e}");
+                                terminal_error = Some(e);
+                            } else {
+                                tracing::info!("driver: peer disconnected");
+                            }
                             break;
                         }
 
@@ -1410,7 +1440,10 @@ async fn driver_run(
                                                     }
                                                 }
                                                 protocol::FRAME_CREDIT => {
-                                                    match protocol::parse_credit(&mr.as_slice()[protocol::HEADER_SIZE..]) {
+                                                    match protocol::parse_credit(
+                                                        &mr.as_slice()[protocol::HEADER_SIZE
+                                                            ..protocol::HEADER_SIZE + header.payload_len as usize],
+                                                    ) {
                                                         Ok(credit) => {
                                                             state.remote_credits.add_permits(credit.credits as usize);
                                                             match post_recv_and_track(shared_qp.qp(), &recv_handle, mr) {
@@ -1625,7 +1658,13 @@ fn post_recv_and_track(
 ) -> Result<OpFuture> {
     let len = mr.len();
 
-    let reg = handle.map().register().ok_or(Error::CapacityExhausted)?;
+    let reg = handle.map().register().ok_or_else(|| {
+        if handle.map().is_closed() {
+            Error::DriverShutdown
+        } else {
+            Error::CapacityExhausted
+        }
+    })?;
     let token = reg.token;
 
     let addr = mr.addr();

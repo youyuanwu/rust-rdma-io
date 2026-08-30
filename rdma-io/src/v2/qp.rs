@@ -281,9 +281,10 @@ impl Qp {
 
     /// Submit a typed RDMA operation.
     ///
-    /// io_uring/compio-style submission: pass a typed [`Op`] describing
-    /// what to do, and the operation is posted to the hardware queue.
-    /// The completion will carry the `wr_id` from the [`Op`] for correlation.
+    /// io_uring/compio-style submission: pass a typed [`Op`](super::op::Op)
+    /// describing what to do, and the operation is posted to the hardware
+    /// queue. The completion will carry the `wr_id` from the
+    /// [`Op`](super::op::Op) for correlation.
     ///
     /// # Example
     ///
