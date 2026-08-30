@@ -61,6 +61,10 @@ pub enum Error {
 
     /// The in-flight registry or buffer pool has no available capacity.
     CapacityExhausted,
+
+    /// A wire-protocol violation was detected (bad magic, version, frame type,
+    /// or payload length).
+    ProtocolViolation(String),
 }
 
 impl fmt::Display for Error {
@@ -87,6 +91,9 @@ impl fmt::Display for Error {
             Error::TransportClosed => write!(f, "transport closed"),
             Error::DriverShutdown => write!(f, "driver shut down"),
             Error::CapacityExhausted => write!(f, "capacity exhausted"),
+            Error::ProtocolViolation(detail) => {
+                write!(f, "protocol violation: {detail}")
+            }
         }
     }
 }

@@ -70,6 +70,22 @@ impl ConnectionConfig {
     }
 }
 
+/// CM (connection manager) resources bundled for transfer to
+/// the disconnect monitor.
+///
+/// # Drop Order
+///
+/// Fields drop in declaration order:
+/// 1. `cm_async_fd` — deregistered from epoll
+/// 2. `cm_id` — disconnect/destroy
+/// 3. `event_channel` — closes fd
+pub(crate) struct CmResources {
+    pub(crate) cm_async_fd: AsyncFd<RawFd>,
+    #[expect(dead_code)] // held for drop ordering (must outlive cm_async_fd)
+    pub(crate) cm_id: crate::cm::CmId,
+    pub(crate) event_channel: EventChannel,
+}
+
 /// An established RDMA connection with all resources wired.
 ///
 /// # Drop Order
@@ -79,17 +95,13 @@ impl ConnectionConfig {
 /// 2. `driver_handles` — `Arc<CqDriverHandle>` refs dropped
 /// 3. `driver_tasks` — `JoinHandle`s dropped (aborted on shutdown)
 /// 4. `pd` — protection domain (ref-counted)
-/// 5. `_cm_async_fd` — deregistered from epoll
-/// 6. `_cm_id` — disconnect/destroy
-/// 7. `_event_channel` — closes fd (last)
+/// 5. `cm_resources` — CM AsyncFd, CmId, EventChannel (last)
 pub struct Connection {
     shared_qp: SharedQp,
     driver_handles: Vec<Arc<CqDriverHandle>>,
     driver_tasks: Vec<JoinHandle<super::error::Result<()>>>,
     pd: Pd,
-    _cm_async_fd: AsyncFd<RawFd>,
-    _cm_id: crate::cm::CmId,
-    _event_channel: EventChannel,
+    cm_resources: Option<CmResources>,
     shutdown_initiated: bool,
 }
 
@@ -107,6 +119,15 @@ impl Connection {
     /// Access the driver handles.
     pub fn driver_handles(&self) -> &[Arc<CqDriverHandle>] {
         &self.driver_handles
+    }
+
+    /// Take the CM event channel resources for a disconnect monitor.
+    ///
+    /// After this call, the connection no longer holds CM resources and
+    /// will not attempt CM cleanup on drop. The caller is responsible
+    /// for proper drop ordering.
+    pub(crate) fn take_cm_resources(&mut self) -> Option<CmResources> {
+        self.cm_resources.take()
     }
 
     /// Synchronous, idempotent shutdown initiation. Safe for `Drop`.
@@ -247,9 +268,11 @@ impl ConnectionBuilder {
             driver_handles,
             driver_tasks,
             pd,
-            _cm_async_fd: cm_async_fd,
-            _cm_id: cm_id,
-            _event_channel: event_channel,
+            cm_resources: Some(CmResources {
+                cm_async_fd,
+                cm_id,
+                event_channel,
+            }),
             shutdown_initiated: false,
         })
     }
@@ -349,9 +372,11 @@ impl ConnectionBuilder {
             driver_handles,
             driver_tasks,
             pd,
-            _cm_async_fd: cm_async_fd,
-            _cm_id: conn_id,
-            _event_channel: conn_ch,
+            cm_resources: Some(CmResources {
+                cm_async_fd,
+                cm_id: conn_id,
+                event_channel: conn_ch,
+            }),
             shutdown_initiated: false,
         })
     }

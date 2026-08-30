@@ -53,6 +53,7 @@ pub mod driver;
 pub mod inflight;
 #[cfg(feature = "tokio")]
 pub mod message_transport;
+pub mod protocol;
 #[cfg(feature = "tokio")]
 pub mod shared_qp;
 #[cfg(feature = "tokio")]

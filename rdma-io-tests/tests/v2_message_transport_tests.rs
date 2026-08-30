@@ -139,7 +139,7 @@ async fn test_buffer_reuse_beyond_pool() {
 
         let received = server.recv().await.unwrap();
         assert_eq!(received.as_ref(), msg.as_bytes());
-        // ReceivedMessage drops here → MR returned for reposting
+        // ReceivedMessage drops here → MR returned for reposting + credit returned
     }
 }
 
@@ -343,7 +343,7 @@ async fn test_concurrent_receivers() {
 }
 
 // ============================================================
-// Backpressure tests
+// Backpressure / credit tests
 // ============================================================
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
@@ -363,20 +363,177 @@ async fn test_send_backpressure() {
     h1.await.unwrap();
     h2.await.unwrap();
 
-    // Receive both to free up buffers
+    // Receive both to free up buffers (and return credits)
     let m1 = server.recv().await.unwrap();
     let m2 = server.recv().await.unwrap();
     drop(m1);
     drop(m2);
 
-    // Now send again — should work (buffers recovered)
-    client.send(b"after-bp").await.unwrap();
+    // Give a moment for credits to propagate
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    // Now send again — should work (buffers recovered + credits returned)
+    let send_result = tokio::time::timeout(Duration::from_secs(5), client.send(b"after-bp"))
+        .await
+        .expect("send should not hang after credit return");
+    send_result.unwrap();
+
     let m3 = server.recv().await.unwrap();
     assert_eq!(m3.as_ref(), b"after-bp");
 }
 
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn test_credit_flow_control() {
+    require_software_rdma!();
+
+    // 3 data recv buffers on the server → client gets 3 credits.
+    // Send 3 messages, hold all, then the 4th send should block on credits.
+    let (client, server) = make_transport_pair(CompletionMode::Readiness, 3, 4, 256).await;
+    let client = std::sync::Arc::new(client);
+
+    // Send 3 messages (consuming all credits)
+    for i in 0..3u32 {
+        client.send(format!("credit-{i}").as_bytes()).await.unwrap();
+    }
+
+    // Hold all 3 messages (don't drop)
+    let m1 = server.recv().await.unwrap();
+    let m2 = server.recv().await.unwrap();
+    let m3 = server.recv().await.unwrap();
+
+    // 4th send should timeout (no credits available)
+    let c4 = client.clone();
+    let fourth = tokio::time::timeout(Duration::from_millis(200), async move {
+        c4.send(b"blocked").await
+    })
+    .await;
+    assert!(fourth.is_err(), "4th send should block on credits");
+
+    // Drop one message → repost + credit return → 4th send unblocks
+    drop(m1);
+
+    let c4 = client.clone();
+    let result = tokio::time::timeout(Duration::from_secs(5), async move {
+        c4.send(b"unblocked").await
+    })
+    .await
+    .expect("send should complete after credit return");
+    result.unwrap();
+
+    let received = server.recv().await.unwrap();
+    assert_eq!(received.as_ref(), b"unblocked");
+
+    drop(m2);
+    drop(m3);
+}
+
 // ============================================================
-// Shutdown and disconnect tests
+// Disconnect tests
+// ============================================================
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn test_disconnect_wakes_pending_recv() {
+    require_software_rdma!();
+
+    let (client, server) = make_transport_pair(CompletionMode::Readiness, 4, 4, 256).await;
+
+    // Verify connection works
+    client.send(b"ping").await.unwrap();
+    let msg = server.recv().await.unwrap();
+    assert_eq!(msg.as_ref(), b"ping");
+    drop(msg);
+
+    // Spawn a pending recv on the server
+    let server = std::sync::Arc::new(server);
+    let s2 = server.clone();
+    let recv_task = tokio::spawn(async move { s2.recv().await });
+
+    // Give recv time to park
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    // Drop client → triggers disconnect
+    drop(client);
+
+    // Server's pending recv should unblock with TransportClosed
+    let result = tokio::time::timeout(Duration::from_secs(10), recv_task)
+        .await
+        .expect("recv should not hang after disconnect");
+    let recv_result = result.unwrap();
+    assert!(
+        recv_result.is_err(),
+        "recv should fail after peer disconnect"
+    );
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn test_disconnect_wakes_pending_send() {
+    require_software_rdma!();
+
+    // 2 recv buffers → 2 credits. Send 2 to exhaust credits, then hold messages.
+    let (client, server) = make_transport_pair(CompletionMode::Readiness, 2, 4, 256).await;
+
+    client.send(b"fill1").await.unwrap();
+    client.send(b"fill2").await.unwrap();
+
+    // Hold messages to prevent credit return
+    let _m1 = server.recv().await.unwrap();
+    let _m2 = server.recv().await.unwrap();
+
+    // Next send blocks on credits
+    let client = std::sync::Arc::new(client);
+    let c2 = client.clone();
+    let send_task = tokio::spawn(async move { c2.send(b"blocked-send").await });
+
+    tokio::task::yield_now().await;
+
+    // Drop server → triggers disconnect
+    drop(server);
+    drop(_m1);
+    drop(_m2);
+
+    // Client's pending send should unblock with error
+    let result = tokio::time::timeout(Duration::from_secs(10), send_task)
+        .await
+        .expect("send should not hang after disconnect");
+    let send_result = result.unwrap();
+    assert!(
+        send_result.is_err(),
+        "send should fail after peer disconnect"
+    );
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn test_disconnect_wakes_pending_recv_polling() {
+    require_software_rdma!();
+
+    let (client, server) = make_transport_pair(CompletionMode::Polling, 4, 4, 256).await;
+
+    client.send(b"ping").await.unwrap();
+    let msg = server.recv().await.unwrap();
+    assert_eq!(msg.as_ref(), b"ping");
+    drop(msg);
+
+    let server = std::sync::Arc::new(server);
+    let s2 = server.clone();
+    let recv_task = tokio::spawn(async move { s2.recv().await });
+
+    tokio::task::yield_now().await;
+    drop(client);
+
+    let result = tokio::time::timeout(Duration::from_secs(10), recv_task)
+        .await
+        .expect("recv should not hang after disconnect (polling mode)");
+    let recv_result = result.unwrap();
+    assert!(
+        recv_result.is_err(),
+        "recv should fail after peer disconnect"
+    );
+}
+
+// ============================================================
+// Shutdown tests
 // ============================================================
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
@@ -398,16 +555,13 @@ async fn test_drop_no_hang() {
 async fn test_shutdown_wakes_recv() {
     require_software_rdma!();
 
-    // Test that closing a transport doesn't hang.
     let (client, server) = make_transport_pair(CompletionMode::Readiness, 4, 4, 256).await;
 
-    // Exchange a message to prove the connection works
     client.send(b"before-shutdown").await.unwrap();
     let msg = server.recv().await.unwrap();
     assert_eq!(msg.as_ref(), b"before-shutdown");
     drop(msg);
 
-    // Close both sides
     server.close().await;
     drop(client);
 }
@@ -416,35 +570,24 @@ async fn test_shutdown_wakes_recv() {
 async fn test_shutdown_wakes_pending_recv() {
     require_software_rdma!();
 
-    // Test that pending recv is woken when the transport's recv channel
-    // closes due to recv pump shutdown.
     let (client, server) = make_transport_pair(CompletionMode::Readiness, 4, 4, 256).await;
 
-    // Exchange a message to prove the connection works
     client.send(b"test").await.unwrap();
     let msg = server.recv().await.unwrap();
     assert_eq!(msg.as_ref(), b"test");
     drop(msg);
 
-    // Get driver handles so we can trigger shutdown from outside
     let conn_handles: Vec<_> = server.connection().driver_handles().to_vec();
-
-    // Spawn recv in a separate task (will block)
     let server = std::sync::Arc::new(server);
     let s2 = server.clone();
     let recv_task = tokio::spawn(async move { s2.recv().await });
 
-    // Give recv time to park
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::task::yield_now().await;
 
-    // Shut down the driver handles — this flushes pending recv ops
-    // with synthetic flush errors, causing recv pump to exit and
-    // close the recv channel.
     for handle in &conn_handles {
         handle.flush_and_shutdown();
     }
 
-    // The recv task should complete with an error
     let result = tokio::time::timeout(Duration::from_secs(10), recv_task)
         .await
         .expect("recv should not hang forever");
@@ -499,7 +642,6 @@ async fn test_shared_cq_single_driver() {
 
     let (client, server) = make_transport_pair(CompletionMode::Readiness, 4, 4, 256).await;
 
-    // Verify shared-CQ mode: one driver handle
     assert_eq!(
         client.connection().driver_handles().len(),
         1,
@@ -511,7 +653,6 @@ async fn test_shared_cq_single_driver() {
         "shared CQ should have exactly one driver handle"
     );
 
-    // Both send and recv completions arrive on the same CQ
     client.send(b"shared-cq-test").await.unwrap();
     let msg = server.recv().await.unwrap();
     assert_eq!(msg.as_ref(), b"shared-cq-test");
@@ -536,5 +677,27 @@ async fn test_inflight_registry_reclaim() {
         client.send(msg.as_bytes()).await.unwrap();
         let received = server.recv().await.unwrap();
         assert_eq!(received.as_ref(), msg.as_bytes());
+    }
+}
+
+// ============================================================
+// Credit accounting invariant tests
+// ============================================================
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn test_credit_never_exceeds_capacity() {
+    require_software_rdma!();
+
+    // Use 4 recv buffers → 4 credits. Do many round trips.
+    // Credits should never exceed 4 (the announced capacity).
+    let (client, server) = make_transport_pair(CompletionMode::Readiness, 4, 4, 256).await;
+
+    // 20 round trips — each time the credit is consumed and returned.
+    for i in 0..20u32 {
+        let msg = format!("credit-cycle-{i}");
+        client.send(msg.as_bytes()).await.unwrap();
+        let received = server.recv().await.unwrap();
+        assert_eq!(received.as_ref(), msg.as_bytes());
+        // ReceivedMessage drops here → credit returned
     }
 }

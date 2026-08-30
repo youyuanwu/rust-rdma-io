@@ -156,7 +156,8 @@ async CQ draining. See the `rdma_io::v2` module docs for the full API reference.
 
 The v2 message transport provides a builder-driven, message-oriented Send/Recv
 transport on top of `SharedQp` with pre-registered buffer pools, message
-boundaries, bounded backpressure, and cancellation-safe operations:
+boundaries, credit-based flow control, deterministic disconnect handling,
+and cancellation-safe operations:
 
 ```rust
 use rdma_io::v2::*;
@@ -185,23 +186,47 @@ client.send(b"hello rdma transport").await?;
 let msg = server.recv().await?;
 assert_eq!(msg.as_ref(), b"hello rdma transport");
 assert_eq!(msg.len(), 20);
-// ReceivedMessage drop returns the buffer for reposting
+// ReceivedMessage drop returns the buffer for reposting + returns a credit
 ```
 
 Key design properties:
 
-- **Pre-posted receives**: All receive buffers are posted before the CM
-  handshake completes, eliminating RNR errors on first send
-- **Bounded backpressure**: Send pool limits concurrent sends; additional
-  senders wait asynchronously for a buffer
+- **Wire protocol**: A minimal internal protocol with DATA, CREDIT, and HELLO
+  frame types (12-byte header with magic/version/type/length validation)
+- **Credit-based flow control**: Each `send()` acquires one remote receive
+  credit. Credits are exchanged via HELLO handshake and returned via CREDIT
+  frames when `ReceivedMessage` is dropped. RNR retry is a safety net, not
+  the primary flow-control mechanism.
+- **Readiness handshake**: During `connect()`/`accept()`, both peers exchange
+  HELLO frames carrying data receive capacity and max message size. The
+  transport is not returned until both sides are fully ready for traffic.
+- **Deterministic disconnect**: A dedicated CM event monitor (sole consumer
+  of the connection's event channel) detects peer disconnect and atomically
+  closes the transport, waking all pending `send()`/`recv()`/credit waiters
+  with `Error::TransportClosed`.
+- **Pre-posted receives**: All receive buffers (data + control headroom) are
+  posted before the CM handshake completes
+- **Bounded backpressure**: Both send buffer pool and credit semaphore limit
+  concurrent sends; additional senders wait asynchronously
 - **`send().await` = local completion**: The send CQE confirms local
   completion, not remote consumption
-- **Cancellation safe**: Dropping `send()` returns the MR via the reclaim
-  queue; dropping `recv()` leaves the message for the next caller
+- **Cancellation safe**: If cancelled before WR posting, the credit permit is
+  returned automatically. If cancelled after posting, the MR returns via the
+  reclaim queue. Dropping `recv()` leaves the message for the next caller.
 - **Shared CQ by default**: One CQ + one driver for both send and recv
   completions; separate-CQ mode available via `.separate_cqs(true)`
 - **Completion modes**: `Readiness` (fd/channel-based, lower CPU) or
   `Polling` (direct CQ poll, lower latency)
+
+#### Non-Goals
+
+The following are explicitly out of scope for the v2 message transport:
+
+- `AsyncRead`/`AsyncWrite` byte-stream adapters (future layering)
+- tonic/gRPC or quinn/QUIC integration (separate crates)
+- Ring transports, atomics, inline data, multi-SGE operations
+- Dynamic buffer pool resizing
+- UD (Unreliable Datagram) queue pair support
 
 ## Prerequisites
 
