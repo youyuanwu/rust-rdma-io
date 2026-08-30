@@ -998,8 +998,15 @@ async fn driver_run(
     let credits = peer_capacity.unwrap();
     state.remote_credits.add_permits(credits);
 
-    // Transition to Ready
-    state.state.store(STATE_READY, Ordering::Release);
+    // Transition to Ready (use compare_exchange to detect concurrent close)
+    if state
+        .state
+        .compare_exchange(STATE_CREATED, STATE_READY, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        // State was changed (e.g., to CLOSING) during handshake — exit
+        return Ok(());
+    }
     state.state_notify.notify_waiters();
 
     // ─── Phase B: Steady State (recv pump + disconnect monitor + CQ drivers) ───
