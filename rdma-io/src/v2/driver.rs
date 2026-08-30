@@ -178,6 +178,17 @@ impl CqDriverHandle {
         queue.len()
     }
 
+    /// Flush all occupied slots with a synthetic flush error and signal shutdown.
+    ///
+    /// Wakes all registered waiters with `WcStatus::WrFlushErr` (not success),
+    /// then sets the shutdown flag and notifies the driver. This ensures
+    /// waiters resolve with typed errors per FR-005/FR-029.
+    pub fn flush_and_shutdown(&self) {
+        let flush_wc = WorkCompletion::synthetic_flush();
+        self.map.flush_all(flush_wc);
+        self.shutdown();
+    }
+
     /// Number of entries currently in the reclaim queue.
     #[cfg(test)]
     #[expect(dead_code)]

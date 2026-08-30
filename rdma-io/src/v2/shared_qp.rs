@@ -189,11 +189,26 @@ impl SharedQp {
     }
 
     /// Transition QP to error state, flushing all in-flight operations.
+    ///
+    /// This moves the QP to `IBV_QPS_ERR`, causing the HCA to flush all
+    /// outstanding WRs. It does NOT stop the completion drivers — they
+    /// continue running to drain the resulting flush CQEs.
+    ///
+    /// Use [`shutdown_drivers()`](Self::shutdown_drivers) when this `SharedQp`
+    /// is the sole owner of its driver handles and the drivers should stop.
     pub fn shutdown(&self) -> Result<()> {
         self.qp.to_error()?;
+        Ok(())
+    }
+
+    /// Signal both completion drivers to shut down.
+    ///
+    /// Only call this when this `SharedQp` is the sole owner of its driver
+    /// handles. If the drivers are shared across multiple QPs, the driver
+    /// owner should call `handle.shutdown()` directly.
+    pub fn shutdown_drivers(&self) {
         self.send_handle.shutdown();
         self.recv_handle.shutdown();
-        Ok(())
     }
 }
 
@@ -311,10 +326,7 @@ impl Future for OpFuture {
                     let reg = match handle.map().register() {
                         Some(r) => r,
                         None => {
-                            let err = Error::InvalidConfig(
-                                "inflight operation capacity exhausted".into(),
-                            );
-                            return Poll::Ready((Err(err), mr));
+                            return Poll::Ready((Err(Error::CapacityExhausted), mr));
                         }
                     };
 

@@ -44,6 +44,23 @@ pub enum Error {
 
     /// A non-blocking operation found nothing ready (EAGAIN/EWOULDBLOCK).
     WouldBlock,
+
+    /// An outbound message exceeds the configured buffer capacity.
+    MessageTooLarge {
+        /// The size of the message that was attempted.
+        size: usize,
+        /// The maximum allowed message size.
+        capacity: usize,
+    },
+
+    /// The transport or connection has been shut down or disconnected.
+    TransportClosed,
+
+    /// The completion driver has stopped.
+    DriverShutdown,
+
+    /// The in-flight registry or buffer pool has no available capacity.
+    CapacityExhausted,
 }
 
 impl fmt::Display for Error {
@@ -61,6 +78,12 @@ impl fmt::Display for Error {
                 )
             }
             Error::WouldBlock => write!(f, "operation would block"),
+            Error::MessageTooLarge { size, capacity } => {
+                write!(f, "message too large: {size} bytes exceeds {capacity} byte capacity")
+            }
+            Error::TransportClosed => write!(f, "transport closed"),
+            Error::DriverShutdown => write!(f, "driver shut down"),
+            Error::CapacityExhausted => write!(f, "capacity exhausted"),
         }
     }
 }
