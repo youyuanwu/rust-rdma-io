@@ -125,6 +125,11 @@ pub(crate) struct CmMonitorHandle {
 /// - `cm_id` MUST follow `shared_qp` (CmId alive during `rdma_destroy_qp`)
 /// - `event_channel` MUST be last
 ///
+/// The fields intentionally use ordinary Rust drop semantics rather than
+/// `ManuallyDrop`. Declaration-order destruction is guaranteed for struct
+/// fields, while `ManuallyDrop` would require an unsafe custom destructor and
+/// make leaks or double-drops possible without strengthening this invariant.
+///
 /// The structural tests `test_connection_lifetime_field_drop_order` and
 /// `test_connection_lifetime_field_drop_order` verify this invariant.
 pub(crate) struct ConnectionLifetime {
