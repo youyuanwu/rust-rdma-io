@@ -1202,11 +1202,17 @@ async fn test_hello_mismatch_fails_ready() {
     );
 
     // error() should report ProtocolViolation
-    // Give driver time to finish
-    tokio::task::yield_now().await;
-    let _ = tokio::time::timeout(Duration::from_secs(5), client_driver_handle).await;
-    tokio::task::yield_now().await;
+    // Verify BOTH observation channels (FR-027): driver Result AND frontend error()
+    let driver_result = tokio::time::timeout(Duration::from_secs(5), client_driver_handle)
+        .await
+        .expect("driver should exit after HELLO mismatch");
+    let driver_inner = driver_result.expect("driver task should not panic");
+    assert!(
+        driver_inner.is_err(),
+        "driver should return Err on HELLO mismatch"
+    );
 
+    // Both channels should agree on ProtocolViolation
     let err = client_transport.error();
     assert!(err.is_some(), "error() should be set after HELLO mismatch");
     assert_eq!(
@@ -1828,13 +1834,13 @@ fn test_qp_destroy_before_mr_deregistration_order() {
     );
 }
 
-/// Proves: TransportSharedState field drop order is safe — driver_handles
-/// drops before conn_lifetime, but QP is still alive because conn_lifetime
-/// holds the last Arc<ConnectionLifetime>.
-///
-/// Even though driver_handles' Arc<CqDriverHandle> refcount decreases,
-/// the handles won't be freed until SharedQp inside ConnectionLifetime
-/// drops (which holds the other Arc refs).
+/// Proves: TransportSharedState field drop order is safe — conn_lifetime
+/// drops before driver_handles. Both hold Arc references (not owned values),
+/// so the actual drop order of the underlying resources is controlled by
+/// ConnectionLifetime's internal field layout, not this struct. Either
+/// ordering is safe because SharedQp inside ConnectionLifetime holds the
+/// final Arc<CqDriverHandle> refs — CqDriverHandle (and its quarantined
+/// MRs) cannot be freed until after QP destruction.
 #[test]
 fn test_transport_shared_state_field_order() {
     use std::sync::Mutex;
@@ -1846,28 +1852,29 @@ fn test_transport_shared_state_field_order() {
         }
     }
 
-    // Mirrors TransportSharedState field layout
+    // Mirrors TransportSharedState field layout (conn_lifetime before driver_handles)
     struct StateShape {
         _state: u8,
-        _driver_handles: Vec<Recorder>,
         _conn_lifetime: Recorder,
+        _driver_handles: Vec<Recorder>,
     }
 
     let log = std::sync::Arc::new(Mutex::new(Vec::new()));
     drop(StateShape {
         _state: 0,
-        _driver_handles: vec![Recorder("driver_handles", log.clone())],
         _conn_lifetime: Recorder("conn_lifetime", log.clone()),
+        _driver_handles: vec![Recorder("driver_handles", log.clone())],
     });
 
     let order = log.lock().unwrap();
     let dh_pos = order.iter().position(|&s| s == "driver_handles").unwrap();
     let cl_pos = order.iter().position(|&s| s == "conn_lifetime").unwrap();
-    // driver_handles drops before conn_lifetime — this is fine because
-    // conn_lifetime's SharedQp still holds the real handle Arcs
+    // conn_lifetime drops before driver_handles. Both are Arc refs so
+    // either order is safe — the actual destruction sequence is enforced
+    // by ConnectionLifetime's internal field layout (SharedQp first).
     assert!(
-        dh_pos < cl_pos,
-        "driver_handles should drop before conn_lifetime in TransportSharedState"
+        cl_pos < dh_pos,
+        "conn_lifetime should drop before driver_handles in TransportSharedState"
     );
 }
 

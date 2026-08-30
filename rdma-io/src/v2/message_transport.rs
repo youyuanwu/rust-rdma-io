@@ -64,10 +64,11 @@
 //!
 //! # Disconnect Monitoring
 //!
-//! The driver future internally monitors CM events. On peer disconnect or
-//! CM error, it atomically closes the transport, wakes all pending
-//! send/recv/credit waiters with [`Error::TransportClosed`], and initiates
-//! QP/driver shutdown.
+//! The driver future internally monitors CM events. On peer disconnect,
+//! the transport is cleanly closed with [`Error::TransportClosed`]. On
+//! CM errors (device removal, connection fault), the error is stored as
+//! [`Error::TransportFailed`] with the typed cause, waking all pending
+//! send/recv/credit waiters and initiating QP/driver shutdown.
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -1076,18 +1077,25 @@ async fn driver_run(
                 match handle.event_channel.try_get_event() {
                     Ok(event) => {
                         let event_type = event.event_type();
-                        tracing::debug!(?event_type, "driver: CM event");
+                        let status = event.status();
+                        tracing::debug!(?event_type, status, "driver: CM event");
                         match event_type {
-                            CmEventType::Disconnected => break None,
+                            CmEventType::Disconnected if status == 0 => break None,
+                            CmEventType::Disconnected => {
+                                // Nonzero status on disconnect indicates a failure
+                                break Some(Error::Verbs(std::io::Error::other(format!(
+                                    "CM disconnect with error status {status}"
+                                ))));
+                            }
                             CmEventType::DeviceRemoval => {
                                 break Some(Error::Verbs(std::io::Error::other(
                                     "RDMA device removed",
                                 )));
                             }
                             other => {
-                                tracing::warn!(?other, "driver: unexpected CM event");
+                                tracing::warn!(?other, status, "driver: unexpected CM event");
                                 break Some(Error::Verbs(std::io::Error::other(format!(
-                                    "unexpected CM event: {other:?}"
+                                    "unexpected CM event: {other:?} (status={status})"
                                 ))));
                             }
                         }
@@ -1464,14 +1472,11 @@ async fn driver_run(
                                                     }
                                                 }
                                                 protocol::FRAME_HELLO => {
-                                                    tracing::warn!("driver: unexpected HELLO during normal operation");
-                                                    match post_recv_and_track(shared_qp.qp(), &recv_handle, mr) {
-                                                        Ok(future) => pending_recvs.push(future),
-                                                        Err(e) => {
-                                                            terminal_error = Some(e);
-                                                            break;
-                                                        }
-                                                    }
+                                                    // Unexpected HELLO after handshake is a protocol violation
+                                                    terminal_error = Some(Error::ProtocolViolation(
+                                                        "unexpected HELLO frame during steady-state operation".into(),
+                                                    ));
+                                                    break;
                                                 }
                                                 _ => {
                                                     tracing::warn!(frame_type = header.frame_type, "driver: unknown frame type");

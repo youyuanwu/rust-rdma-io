@@ -126,7 +126,7 @@ pub(crate) struct CmMonitorHandle {
 /// - `event_channel` MUST be last
 ///
 /// The structural tests `test_connection_lifetime_field_drop_order` and
-/// `test_completion_channel_drop_order` verify this invariant.
+/// `test_connection_lifetime_field_drop_order` verify this invariant.
 pub(crate) struct ConnectionLifetime {
     /// SharedQp wraps `Arc<Qp>` wrapping `CmQueuePair`.
     /// Must drop FIRST — `rdma_destroy_qp` requires live `CmId`,
