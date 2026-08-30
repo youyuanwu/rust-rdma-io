@@ -735,12 +735,9 @@ async fn test_no_progress_without_driver_poll() {
         .buffer_size(256)
         .completion_mode(CompletionMode::Readiness);
 
-    let server_task = tokio::spawn(async move {
-        server_builder.accept(&listener).await.unwrap()
-    });
-    let client_task = tokio::spawn(async move {
-        client_builder.connect(listen_addr).await.unwrap()
-    });
+    let server_task = tokio::spawn(async move { server_builder.accept(&listener).await.unwrap() });
+    let client_task =
+        tokio::spawn(async move { client_builder.connect(listen_addr).await.unwrap() });
 
     let (server, client) = tokio::join!(server_task, client_task);
     let (client_transport, client_driver) = client.unwrap();
@@ -748,7 +745,10 @@ async fn test_no_progress_without_driver_poll() {
 
     // Without drivers spawned, ready() should not complete
     let result = tokio::time::timeout(Duration::from_millis(200), client_transport.ready()).await;
-    assert!(result.is_err(), "ready() should timeout without driver running");
+    assert!(
+        result.is_err(),
+        "ready() should timeout without driver running"
+    );
 
     // Drop drivers triggers failure state via Drop guard
     drop(client_driver);
@@ -770,7 +770,10 @@ async fn test_readiness_completes_after_both_drivers() {
         server.ready().await.unwrap();
     })
     .await;
-    assert!(result.is_ok(), "readiness should complete after both drivers spawned");
+    assert!(
+        result.is_ok(),
+        "readiness should complete after both drivers spawned"
+    );
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
@@ -791,12 +794,9 @@ async fn test_drop_unspawned_driver_fails_frontend() {
         .buffer_size(256)
         .completion_mode(CompletionMode::Readiness);
 
-    let server_task = tokio::spawn(async move {
-        server_builder.accept(&listener).await.unwrap()
-    });
-    let client_task = tokio::spawn(async move {
-        client_builder.connect(listen_addr).await.unwrap()
-    });
+    let server_task = tokio::spawn(async move { server_builder.accept(&listener).await.unwrap() });
+    let client_task =
+        tokio::spawn(async move { client_builder.connect(listen_addr).await.unwrap() });
 
     let (server, client) = tokio::join!(server_task, client_task);
     let (client_transport, client_driver) = client.unwrap();
@@ -807,9 +807,18 @@ async fn test_drop_unspawned_driver_fails_frontend() {
     drop(server_driver);
 
     // Frontend operations should return error
-    assert!(client_transport.ready().await.is_err(), "ready() should fail after driver dropped");
-    assert!(client_transport.send(b"hello").await.is_err(), "send() should fail after driver dropped");
-    assert!(client_transport.recv().await.is_err(), "recv() should fail after driver dropped");
+    assert!(
+        client_transport.ready().await.is_err(),
+        "ready() should fail after driver dropped"
+    );
+    assert!(
+        client_transport.send(b"hello").await.is_err(),
+        "send() should fail after driver dropped"
+    );
+    assert!(
+        client_transport.recv().await.is_err(),
+        "recv() should fail after driver dropped"
+    );
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
@@ -831,7 +840,10 @@ async fn test_abort_driver_task_fails_frontend() {
     // Server's recv should eventually fail
     let result = tokio::time::timeout(Duration::from_secs(10), server.recv()).await;
     assert!(result.is_ok(), "recv should not hang after driver abort");
-    assert!(result.unwrap().is_err(), "recv should fail after driver shutdown");
+    assert!(
+        result.unwrap().is_err(),
+        "recv should fail after driver shutdown"
+    );
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
@@ -937,12 +949,9 @@ async fn test_close_unspawned_driver_no_hang() {
         .buffer_size(256)
         .completion_mode(CompletionMode::Readiness);
 
-    let server_task = tokio::spawn(async move {
-        server_builder.accept(&listener).await.unwrap()
-    });
-    let client_task = tokio::spawn(async move {
-        client_builder.connect(listen_addr).await.unwrap()
-    });
+    let server_task = tokio::spawn(async move { server_builder.accept(&listener).await.unwrap() });
+    let client_task =
+        tokio::spawn(async move { client_builder.connect(listen_addr).await.unwrap() });
 
     let (server, client) = tokio::join!(server_task, client_task);
     let (client_transport, client_driver) = client.unwrap();
@@ -952,7 +961,10 @@ async fn test_close_unspawned_driver_no_hang() {
     drop(client_driver);
 
     let result = tokio::time::timeout(Duration::from_secs(5), client_transport.close()).await;
-    assert!(result.is_ok(), "close() should return immediately with dropped driver");
+    assert!(
+        result.is_ok(),
+        "close() should return immediately with dropped driver"
+    );
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
@@ -991,8 +1003,16 @@ async fn test_one_task_per_endpoint_separate_cq() {
     let server = server.unwrap();
 
     // Separate CQs: two handles but still one driver future/task
-    assert_eq!(client.driver_handles().len(), 2, "separate CQ: two driver handles");
-    assert_eq!(server.driver_handles().len(), 2, "separate CQ: two driver handles");
+    assert_eq!(
+        client.driver_handles().len(),
+        2,
+        "separate CQ: two driver handles"
+    );
+    assert_eq!(
+        server.driver_handles().len(),
+        2,
+        "separate CQ: two driver handles"
+    );
 
     client.send(b"separate-cq").await.unwrap();
     let msg = server.recv().await.unwrap();
@@ -1033,8 +1053,16 @@ async fn test_one_task_per_endpoint_shared_cq() {
 
     let (client, server) = make_transport_pair(CompletionMode::Readiness, 4, 4, 256).await;
 
-    assert_eq!(client.driver_handles().len(), 1, "shared CQ: one driver handle per endpoint");
-    assert_eq!(server.driver_handles().len(), 1, "shared CQ: one driver handle per endpoint");
+    assert_eq!(
+        client.driver_handles().len(),
+        1,
+        "shared CQ: one driver handle per endpoint"
+    );
+    assert_eq!(
+        server.driver_handles().len(),
+        1,
+        "shared CQ: one driver handle per endpoint"
+    );
 
     client.send(b"shared-cq-structural").await.unwrap();
     let msg = server.recv().await.unwrap();
@@ -1089,7 +1117,10 @@ async fn test_driver_error_propagates() {
 
     // Frontend should also observe the error via failed operations
     let recv_result = server_transport.recv().await;
-    assert!(recv_result.is_err(), "frontend recv should fail after driver error");
+    assert!(
+        recv_result.is_err(),
+        "frontend recv should fail after driver error"
+    );
 
     drop(client_transport);
     let _ = client_driver_handle.await;

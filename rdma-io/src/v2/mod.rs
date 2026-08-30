@@ -87,7 +87,9 @@ pub use shared_qp::{OpFuture, SharedQp};
 pub use connection::{CompletionMode, Connection};
 
 #[cfg(feature = "tokio")]
-pub use message_transport::{MessageTransport, MessageTransportBuilder, MessageTransportDriver, ReceivedMessage};
+pub use message_transport::{
+    MessageTransport, MessageTransportBuilder, MessageTransportDriver, ReceivedMessage,
+};
 
 #[cfg(feature = "tokio")]
 pub use tokio_support::TokioCompletions;

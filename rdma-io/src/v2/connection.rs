@@ -11,7 +11,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 /// Boxed CQ driver future — ready to be polled but NOT spawned.
-pub(crate) type BoxedCqDriverFuture = Pin<Box<dyn Future<Output = super::error::Result<()>> + Send>>;
+pub(crate) type BoxedCqDriverFuture =
+    Pin<Box<dyn Future<Output = super::error::Result<()>> + Send>>;
 
 use tokio::io::unix::AsyncFd;
 
@@ -253,7 +254,11 @@ impl ConnectionBuilder {
                 Arc::clone(&recv_handle),
                 pd.clone(),
             );
-            (sqp, vec![send_handle, recv_handle], vec![send_future, recv_future])
+            (
+                sqp,
+                vec![send_handle, recv_handle],
+                vec![send_future, recv_future],
+            )
         } else {
             let cq = match self.config.completion_mode {
                 CompletionMode::Readiness => CqBuilder::new(&ctx, depth).with_channel().build()?,
@@ -354,7 +359,11 @@ impl ConnectionBuilder {
                 Arc::clone(&recv_handle),
                 pd.clone(),
             );
-            (sqp, vec![send_handle, recv_handle], vec![send_future, recv_future])
+            (
+                sqp,
+                vec![send_handle, recv_handle],
+                vec![send_future, recv_future],
+            )
         } else {
             let cq = match self.config.completion_mode {
                 CompletionMode::Readiness => CqBuilder::new(&ctx, depth).with_channel().build()?,

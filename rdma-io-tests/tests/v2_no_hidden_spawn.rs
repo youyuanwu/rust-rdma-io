@@ -20,9 +20,7 @@ fn is_doc_comment(line: &str) -> bool {
 fn test_no_hidden_tokio_spawn_in_v2() {
     // Find the workspace root (this test lives in rdma-io-tests/)
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let workspace_root = Path::new(manifest_dir)
-        .parent()
-        .expect("workspace root");
+    let workspace_root = Path::new(manifest_dir).parent().expect("workspace root");
     let v2_dir = workspace_root.join("rdma-io").join("src").join("v2");
 
     assert!(

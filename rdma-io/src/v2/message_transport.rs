@@ -627,28 +627,26 @@ impl MessageTransport {
         let driver_recv_handle = driver_handles[recv_handle_idx].clone();
         let driver_send_handle = driver_handles[0].clone();
 
-        let driver_future: Pin<Box<dyn Future<Output = Result<()>> + Send>> = Box::pin(
-            driver_run(
-                Arc::clone(&shared_state),
-                Arc::clone(&shared_qp),
-                driver_send_handle,
-                driver_recv_handle,
-                driver_handles.clone(),
-                parts.driver_futures,
-                parts.resources,
-                cm_monitor_handle,
-                pd,
-                pre_posted_recvs,
-                recv_count,
-                buffer_size,
-                recv_msg_tx,
-                repost_rx,
-                ctrl_send_tx,
-                ctrl_send_rx,
-                send_pool_tx.clone(),
-                repost_tx.clone(),
-            ),
-        );
+        let driver_future: Pin<Box<dyn Future<Output = Result<()>> + Send>> = Box::pin(driver_run(
+            Arc::clone(&shared_state),
+            Arc::clone(&shared_qp),
+            driver_send_handle,
+            driver_recv_handle,
+            driver_handles.clone(),
+            parts.driver_futures,
+            parts.resources,
+            cm_monitor_handle,
+            pd,
+            pre_posted_recvs,
+            recv_count,
+            buffer_size,
+            recv_msg_tx,
+            repost_rx,
+            ctrl_send_tx,
+            ctrl_send_rx,
+            send_pool_tx.clone(),
+            repost_tx.clone(),
+        ));
 
         let transport = Self {
             buffer_size,
@@ -1001,7 +999,12 @@ async fn driver_run(
     // Transition to Ready (use compare_exchange to detect concurrent close)
     if state
         .state
-        .compare_exchange(STATE_CREATED, STATE_READY, Ordering::AcqRel, Ordering::Acquire)
+        .compare_exchange(
+            STATE_CREATED,
+            STATE_READY,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
         .is_err()
     {
         // State was changed (e.g., to CLOSING) during handshake — exit
@@ -1052,7 +1055,10 @@ async fn driver_run(
     loop {
         // Check state: closing, frontend dropped, etc.
         let current_state = state.state.load(Ordering::Acquire);
-        if current_state == STATE_CLOSING || current_state == STATE_STOPPED || current_state == STATE_FAILED {
+        if current_state == STATE_CLOSING
+            || current_state == STATE_STOPPED
+            || current_state == STATE_FAILED
+        {
             break;
         }
         if !state.frontend_alive.load(Ordering::Acquire) {
@@ -1060,7 +1066,9 @@ async fn driver_run(
         }
 
         // Flush pending credits if we have a control MR available
-        if pending_credits > 0 && let Ok(mut ctrl_mr) = ctrl_send_rx.try_recv() {
+        if pending_credits > 0
+            && let Ok(mut ctrl_mr) = ctrl_send_rx.try_recv()
+        {
             let credits_to_send = pending_credits;
             pending_credits = 0;
             let frame_len = protocol::write_credit_frame(ctrl_mr.as_mut_slice(), credits_to_send);
