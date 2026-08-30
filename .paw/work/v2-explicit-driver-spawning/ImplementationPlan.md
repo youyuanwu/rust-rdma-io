@@ -153,17 +153,17 @@ struct TransportSharedState {
 ### Success Criteria (Phase 1):
 
 #### Automated Verification:
-- [ ] `cargo check --workspace` compiles without errors
-- [ ] `cargo build --features tokio` compiles without errors
-- [ ] `grep -rn 'tokio::spawn' rdma-io/src/v2/ | grep -vE '^\s*(///|//!)' | grep -v '#\[doc'` returns zero results (canonical exclusion: `///` and `//!` doc-comment lines)
-- [ ] Completion notification recovery pattern preserved in composed driver
-- [ ] Single CQ/sole poller ownership and generation routing unchanged
+- [x] `cargo check --workspace` compiles without errors
+- [x] `cargo build --features tokio` compiles without errors
+- [x] `grep -rn 'tokio::spawn' rdma-io/src/v2/ | grep -vE '^\s*(///|//!)' | grep -v '#\[doc'` returns zero results (canonical exclusion: `///` and `//!` doc-comment lines)
+- [x] Completion notification recovery pattern preserved in composed driver
+- [x] Single CQ/sole poller ownership and generation routing unchanged
 
 #### Manual Verification:
-- [ ] `MessageTransportBuilder::connect()` returns `(MessageTransport, MessageTransportDriver)`
-- [ ] `MessageTransportDriver` is accepted by `tokio::spawn()` (type check)
-- [ ] `Connection` no longer stores `JoinHandle`s
-- [ ] CQ drivers are composed inside the driver future, not spawned separately
+- [x] `MessageTransportBuilder::connect()` returns `(MessageTransport, MessageTransportDriver)`
+- [x] `MessageTransportDriver` is accepted by `tokio::spawn()` (type check)
+- [x] `Connection` no longer stores `JoinHandle`s
+- [x] CQ drivers are composed inside the driver future, not spawned separately
 
 ---
 
@@ -199,16 +199,16 @@ After this change, `connect()`/`accept()` no longer fail on HELLO timeout or pro
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] `cargo build --features tokio` compiles
-- [ ] `cargo clippy --features tokio -- -D warnings` passes
-- [ ] Basic smoke: a simple client/server test with explicit spawn works
+- [x] `cargo build --features tokio` compiles
+- [x] `cargo clippy --features tokio -- -D warnings` passes
+- [x] Basic smoke: a simple client/server test with explicit spawn works
 
 #### Manual Verification:
-- [ ] `ready().await` blocks until HELLO completes
-- [ ] `send()`/`recv()` internally await readiness
-- [ ] `close().await` signals driver without needing JoinHandle
-- [ ] Dropping unspawned driver sets `driver_alive = false` and wakes waiters
-- [ ] Frontend drop while driver runs triggers driver shutdown
+- [x] `ready().await` blocks until HELLO completes
+- [x] `send()`/`recv()` internally await readiness
+- [x] `close().await` signals driver without needing JoinHandle
+- [x] Dropping unspawned driver sets `driver_alive = false` and wakes waiters
+- [x] Frontend drop while driver runs triggers driver shutdown
 
 ---
 
@@ -243,15 +243,15 @@ After this change, `connect()`/`accept()` no longer fail on HELLO timeout or pro
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] All 29 existing message transport tests pass: `cargo test --test v2_message_transport_tests`
-- [ ] All new lifecycle tests pass
-- [ ] No-hidden-spawn regression test passes: `cargo test --test v2_no_hidden_spawn`
-- [ ] `cargo test --workspace` passes
+- [x] All 29 existing message transport tests pass: `cargo test --test v2_message_transport_tests`
+- [x] All new lifecycle tests pass
+- [x] No-hidden-spawn regression test passes: `cargo test --test v2_no_hidden_spawn`
+- [x] `cargo test --workspace` passes
 
 #### Manual Verification:
-- [ ] No test uses wall-clock sleeps for synchronization (channels, barriers, bounded timeouts only)
-- [ ] Test coverage includes both readiness and polling completion modes
-- [ ] Test coverage includes both shared and separate CQ modes
+- [x] No test uses wall-clock sleeps for synchronization (channels, barriers, bounded timeouts only)
+- [x] Test coverage includes both readiness and polling completion modes
+- [x] Test coverage includes both shared and separate CQ modes
 
 ---
 
@@ -287,13 +287,13 @@ After this change, `connect()`/`accept()` no longer fail on HELLO timeout or pro
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] All commands above pass on RXE
-- [ ] All commands above pass on SIW
-- [ ] RXE restored and confirmed active after SIW testing
+- [x] All commands above pass on RXE
+- [x] All commands above pass on SIW
+- [x] RXE restored and confirmed active after SIW testing
 
 #### Manual Verification:
-- [ ] No provider-specific test hangs
-- [ ] Zero clippy warnings with denied warnings
+- [x] No provider-specific test hangs
+- [x] Zero clippy warnings with denied warnings
 
 ---
 
@@ -327,14 +327,14 @@ After this change, `connect()`/`accept()` no longer fail on HELLO timeout or pro
 ### Success Criteria:
 
 #### Automated Verification:
-- [ ] `cargo test --doc` passes
-- [ ] `cargo doc --no-deps` generates without warnings
+- [x] `cargo test --doc` passes
+- [x] `cargo doc --no-deps` generates without warnings (in-scope crates)
 
 #### Manual Verification:
-- [ ] README example shows explicit spawn pattern
-- [ ] Docs.md covers all required sections
-- [ ] Task count documented for both CQ modes
-- [ ] Lifecycle/error observation/shutdown order documented
+- [x] README example shows explicit spawn pattern
+- [x] Docs.md covers all required sections
+- [x] Task count documented for both CQ modes
+- [x] Lifecycle/error observation/shutdown order documented
 
 ---
 

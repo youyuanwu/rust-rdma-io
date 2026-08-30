@@ -58,7 +58,18 @@ Zero `tokio::spawn` calls exist in `rdma-io/src/v2/*.rs` production code. A sour
 
 Errors are observable in two places:
 1. **Driver future `Result<()>`**: The `JoinHandle` result from `tokio::spawn(driver).await`
-2. **Frontend state**: `ready()`/`send()`/`recv()` return `Error::TransportClosed` when the driver has failed or stopped
+2. **Frontend `error()` method**: `transport.error()` returns an `Option<TransportError>` — a cloneable, thread-safe snapshot with typed category (`TransportErrorKind`) and human-readable message
+
+Both channels observe consistent cause information from the same terminal event. The error is stored exactly once with race-safe compare-exchange semantics. Frontend operations (`ready()`, `send()`, `recv()`) return `Error::TransportFailed(TransportError)` when the driver has failed, preserving the typed cause rather than reducing to opaque `TransportClosed`.
+
+| Condition | `error()` | `ready()`/`send()`/`recv()` | Driver `Result` |
+|-----------|-----------|---------------------------|-----------------|
+| Clean close | `None` | `TransportClosed` | `Ok(())` |
+| HELLO timeout | `Some(ProtocolViolation)` | `TransportFailed(...)` | `Err(ProtocolViolation)` |
+| Driver dropped | `Some(DriverAborted)` | `TransportFailed(...)` | N/A (never ran) |
+| Driver aborted | `Some(DriverAborted)` | `TransportFailed(...)` | `JoinError(Cancelled)` |
+| CQ driver error | `Some(CompletionError)` | `TransportFailed(...)` | `Err(...)` |
+| Peer disconnect | `None` | `TransportClosed` | `Ok(())` |
 
 ### Integration Points
 
@@ -103,23 +114,25 @@ If the driver is dropped without being spawned/polled:
 
 1. `transport.close().await` — signals driver to shut down
 2. `driver_task.await` — observe driver completion and errors
-3. Drop the transport (if not already dropped)
+3. `transport.error()` — inspect terminal error if driver failed
+4. Drop the transport (if not already dropped)
 
 ### Lifecycle Matrix
 
-| Frontend action | Driver state | Result |
-|----------------|-------------|--------|
-| `ready()` | Not spawned | Hangs until driver spawned or dropped |
-| `ready()` | Spawned, running | Completes after HELLO |
-| `ready()` | Dropped/failed | `Error::TransportClosed` |
-| `send()` | Not ready | Waits for readiness internally |
-| `send()` | Ready | Normal send |
-| `send()` | Stopped/failed | `Error::TransportClosed` |
-| `close()` | Running | Signals shutdown, waits for terminal state |
-| `close()` | Already stopped | Returns immediately |
-| Drop frontend | Driver running | Driver detects and shuts down |
-| Drop driver | Frontend waiting | Frontend operations fail |
-| Abort driver task | Frontend waiting | `Drop` guard fires, frontend fails |
+| Frontend action | Driver state | Result | `error()` |
+|----------------|-------------|--------|-----------|
+| `ready()` | Not spawned | Hangs until driver spawned or dropped | `None` |
+| `ready()` | Spawned, running | Completes after HELLO | `None` |
+| `ready()` | Dropped/failed | `TransportFailed(DriverAborted)` | `Some(DriverAborted)` |
+| `send()` | Not ready | Waits for readiness internally | `None` |
+| `send()` | Ready | Normal send | `None` |
+| `send()` | Stopped | `TransportClosed` | `None` |
+| `send()` | Failed | `TransportFailed(...)` | `Some(...)` |
+| `close()` | Running | Signals shutdown, waits for terminal state | `None` |
+| `close()` | Already stopped | Returns immediately | `None` |
+| Drop frontend | Driver running | Driver detects and shuts down | — |
+| Drop driver | Frontend waiting | Frontend fails with `TransportFailed` | `Some(DriverAborted)` |
+| Abort driver task | Frontend waiting | `Drop` guard fires, frontend fails | `Some(DriverAborted)` |
 
 ## Testing
 
@@ -148,6 +161,4 @@ cargo test --workspace
 ## Limitations and Future Work
 
 - **Tokio-specific**: The driver future uses `tokio::select!`, `Notify`, `Semaphore`, and `AsyncFd`. It cannot be polled on non-Tokio runtimes.
-- **`error()` API**: A `transport.error()` method for inspecting driver errors was planned but deferred. Errors are currently observed via state transitions and the driver's `Result<()>`.
-- **`TransportError` type**: A cloneable error wrapper for dual-channel error observation was planned but deferred.
 - **Frontend not `Clone`**: Share via `Arc<MessageTransport>` if needed.

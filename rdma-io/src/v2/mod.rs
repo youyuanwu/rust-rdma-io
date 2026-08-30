@@ -63,6 +63,7 @@ mod tokio_support;
 pub use context::Context;
 pub use cq::{Cq, CqBuilder};
 pub use error::{Error, Result};
+pub use error::{TransportError, TransportErrorKind};
 pub use mr::{AccessIntent, Mr, RemoteMr};
 pub use op::{Completion, Op, OpCode};
 pub use pd::Pd;

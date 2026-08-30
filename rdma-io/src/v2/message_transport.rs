@@ -88,7 +88,7 @@ use super::connection::{
     ConnectionResources,
 };
 use super::driver::CqDriverHandle;
-use super::error::{Error, Result};
+use super::error::{Error, Result, TransportError};
 use super::mr::{AccessIntent, Mr};
 use super::pd::Pd;
 use super::protocol;
@@ -434,6 +434,8 @@ pub(crate) struct TransportSharedState {
     pub(crate) driver_handles: Vec<Arc<CqDriverHandle>>,
     /// Shared QP for send operations in both frontend and driver.
     pub(crate) shared_qp: Arc<SharedQp>,
+    /// Terminal error snapshot (stored once, readable from frontend).
+    pub(crate) error: std::sync::Mutex<Option<TransportError>>,
 }
 
 impl TransportSharedState {
@@ -445,6 +447,7 @@ impl TransportSharedState {
             frontend_alive: AtomicBool::new(true),
             driver_handles,
             shared_qp,
+            error: std::sync::Mutex::new(None),
         }
     }
 
@@ -453,7 +456,17 @@ impl TransportSharedState {
         s == STATE_STOPPED || s == STATE_FAILED
     }
 
+    /// Store a terminal error snapshot (once — first error wins).
+    fn store_error(&self, error: &Error) {
+        let mut guard = self.error.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(TransportError::from_error(error));
+        }
+    }
+
     /// Mark the driver as dead and wake all waiters.
+    ///
+    /// Idempotent: does not overwrite a terminal state.
     fn mark_driver_dead(&self) {
         // Try to transition to Failed; if already terminal, don't overwrite
         let current = self.state.load(Ordering::Acquire);
@@ -506,7 +519,8 @@ impl Future for MessageTransportDriver {
         match inner.as_mut().poll(cx) {
             Poll::Ready(result) => {
                 self.inner = None; // prevent double-poll
-                if result.is_err() {
+                if let Err(ref e) = result {
+                    self.state.store_error(e);
                     self.state.mark_driver_dead();
                 } else {
                     // Normal completion — mark stopped
@@ -526,6 +540,11 @@ impl Future for MessageTransportDriver {
 
 impl Drop for MessageTransportDriver {
     fn drop(&mut self) {
+        // If inner future still exists, the driver was dropped before
+        // completing (never polled or aborted mid-flight).
+        if self.inner.is_some() {
+            self.state.store_error(&Error::DriverShutdown);
+        }
         // Synchronous cleanup: mark driver dead, close credits,
         // wake all waiters — runs even if never polled or aborted
         self.state.mark_driver_dead();
@@ -679,7 +698,8 @@ impl MessageTransport {
             let s = self.state.state.load(Ordering::Acquire);
             match s {
                 STATE_READY => return Ok(()),
-                STATE_CLOSING | STATE_STOPPED | STATE_FAILED => return Err(Error::TransportClosed),
+                STATE_FAILED => return Err(self.terminal_error()),
+                STATE_CLOSING | STATE_STOPPED => return Err(Error::TransportClosed),
                 _ => {}
             }
             notified.await;
@@ -691,6 +711,9 @@ impl MessageTransport {
         let s = self.state.state.load(Ordering::Acquire);
         if s == STATE_READY {
             return Ok(());
+        }
+        if s == STATE_FAILED {
+            return Err(self.terminal_error());
         }
         if s >= STATE_CLOSING {
             return Err(Error::TransportClosed);
@@ -706,6 +729,49 @@ impl MessageTransport {
     /// Access the driver handles.
     pub fn driver_handles(&self) -> &[Arc<CqDriverHandle>] {
         &self.state.driver_handles
+    }
+
+    /// Inspect the terminal driver error, if any.
+    ///
+    /// Returns `Some(TransportError)` if the driver exited with an error
+    /// (e.g., HELLO timeout, completion error, driver drop/abort).
+    /// Returns `None` if the transport was cleanly closed, is still running,
+    /// or peer-disconnected without a driver-level error.
+    ///
+    /// The returned [`TransportError`] carries the same cause information
+    /// as the driver future's `Result<()>` output, providing two
+    /// observation channels for the same terminal event.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use rdma_io::v2::*;
+    /// # use rdma_io::v2::error::TransportErrorKind;
+    /// # async fn example(transport: MessageTransport, driver_handle: tokio::task::JoinHandle<Result<()>>) {
+    /// // After driver completes:
+    /// let driver_result = driver_handle.await.expect("panicked");
+    /// if let Err(ref e) = driver_result {
+    ///     // Both channels observe the same cause:
+    ///     let frontend_err = transport.error().expect("error should be set");
+    ///     eprintln!("driver: {e}, frontend: {frontend_err}");
+    /// }
+    /// # }
+    /// ```
+    pub fn error(&self) -> Option<TransportError> {
+        self.state.error.lock().unwrap().clone()
+    }
+
+    /// Return the stored terminal error (if any) or fall back to
+    /// [`Error::TransportClosed`].
+    ///
+    /// Used by `ready()`, `send()`, `recv()` to surface actionable
+    /// error information rather than an opaque `TransportClosed`.
+    fn terminal_error(&self) -> Error {
+        if let Some(te) = self.state.error.lock().unwrap().clone() {
+            Error::TransportFailed(te)
+        } else {
+            Error::TransportClosed
+        }
     }
 
     /// Send a message. Returns when the local send completion arrives.
@@ -732,12 +798,12 @@ impl MessageTransport {
             .remote_credits
             .acquire()
             .await
-            .map_err(|_| Error::TransportClosed)?;
+            .map_err(|_| self.terminal_error())?;
 
         // Acquire send buffer from the pool
         let mut mr = {
             let mut rx = self.send_pool_rx.lock().await;
-            rx.recv().await.ok_or(Error::TransportClosed)?
+            rx.recv().await.ok_or_else(|| self.terminal_error())?
         };
 
         // === SYNCHRONOUS SECTION ===
@@ -797,7 +863,7 @@ impl MessageTransport {
 
         let completed = {
             let mut rx = self.recv_msg_rx.lock().await;
-            rx.recv().await.ok_or(Error::TransportClosed)?
+            rx.recv().await.ok_or_else(|| self.terminal_error())?
         };
 
         Ok(ReceivedMessage {
@@ -1021,6 +1087,7 @@ async fn driver_run(
 
     let mut pending_recvs = remaining_futures;
     let mut pending_credits: u32 = 0;
+    let mut phase_b_error: Option<Error> = None;
 
     // Set up disconnect monitor as a pinned future
     let disconnect_future = async {
@@ -1110,6 +1177,7 @@ async fn driver_run(
                 Some(cq_result) = futures_util::StreamExt::next(&mut cq_futures) => {
                     if let Err(e) = cq_result {
                         tracing::warn!("driver: CQ driver error: {e}");
+                        phase_b_error = Some(e);
                     }
                     break;
                 }
@@ -1159,6 +1227,7 @@ async fn driver_run(
                 Some(cq_result) = futures_util::StreamExt::next(&mut cq_futures) => {
                     if let Err(e) = cq_result {
                         tracing::warn!("driver: CQ driver error: {e}");
+                        phase_b_error = Some(e);
                     }
                     break;
                 }
@@ -1219,9 +1288,10 @@ async fn driver_run(
                                 }
                             }
                         }
-                        PollResult::Ready(idx, Err((_err, _mr))) => {
+                        PollResult::Ready(idx, Err((err, _mr))) => {
                             pending_recvs.swap_remove(idx);
-                            tracing::debug!("driver: recv completion error, shutting down");
+                            tracing::debug!("driver: recv completion error: {err}, shutting down");
+                            phase_b_error = Some(err);
                             pending_recvs.clear();
                             break;
                         }
@@ -1283,9 +1353,18 @@ async fn driver_run(
 
     // Now transition to terminal state and notify waiters
     // (AFTER drain is complete, so close().await means drain is done)
-    let current = state.state.load(Ordering::Acquire);
-    if current != STATE_FAILED {
-        state.state.store(STATE_STOPPED, Ordering::Release);
+    if let Some(ref err) = phase_b_error {
+        // Store the error for frontend inspection before transitioning state
+        state.store_error(err);
+        let current = state.state.load(Ordering::Acquire);
+        if current != STATE_FAILED {
+            state.state.store(STATE_FAILED, Ordering::Release);
+        }
+    } else {
+        let current = state.state.load(Ordering::Acquire);
+        if current != STATE_FAILED {
+            state.state.store(STATE_STOPPED, Ordering::Release);
+        }
     }
     state.state_notify.notify_waiters();
 
@@ -1293,7 +1372,11 @@ async fn driver_run(
     // before CmId (field ordering in ConnectionResources)
     _resources.shared_qp = None;
 
-    Ok(())
+    if let Some(err) = phase_b_error {
+        Err(err)
+    } else {
+        Ok(())
+    }
 }
 
 /// Result of polling pending recv futures.

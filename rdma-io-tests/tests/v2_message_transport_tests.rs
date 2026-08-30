@@ -5,6 +5,7 @@
 //! synchronization (channels, barriers, bounded timeouts) — no wall-clock
 //! sleeps for synchronization.
 
+use rdma_io::v2::error::TransportErrorKind;
 use rdma_io::v2::*;
 use rdma_io_tests::test_helpers::*;
 use std::time::Duration;
@@ -806,18 +807,33 @@ async fn test_drop_unspawned_driver_fails_frontend() {
     drop(client_driver);
     drop(server_driver);
 
-    // Frontend operations should return error
+    // Frontend operations should return error (TransportFailed, not TransportClosed)
+    let ready_err = client_transport.ready().await.unwrap_err();
     assert!(
-        client_transport.ready().await.is_err(),
-        "ready() should fail after driver dropped"
+        matches!(ready_err, Error::TransportFailed(_)),
+        "ready() should return TransportFailed after driver dropped, got {ready_err}"
     );
+
+    let send_err = client_transport.send(b"hello").await.unwrap_err();
     assert!(
-        client_transport.send(b"hello").await.is_err(),
-        "send() should fail after driver dropped"
+        matches!(send_err, Error::TransportFailed(_)),
+        "send() should return TransportFailed after driver dropped, got {send_err}"
     );
+
+    let recv_err = client_transport.recv().await.unwrap_err();
     assert!(
-        client_transport.recv().await.is_err(),
-        "recv() should fail after driver dropped"
+        matches!(recv_err, Error::TransportFailed(_)),
+        "recv() should return TransportFailed after driver dropped, got {recv_err}"
+    );
+
+    // error() should report DriverAborted
+    let err = client_transport
+        .error()
+        .expect("error() should return Some after driver dropped");
+    assert_eq!(
+        *err.kind(),
+        TransportErrorKind::DriverAborted,
+        "error kind should be DriverAborted"
     );
 }
 
@@ -1106,21 +1122,230 @@ async fn test_driver_error_propagates() {
     client_transport.send(b"pre-error").await.unwrap();
     let _ = server_transport.recv().await.unwrap();
 
-    // Force-shutdown the server's driver handles to provoke a driver failure
-    for h in server_transport.driver_handles() {
-        h.flush_and_shutdown();
-    }
+    // Abort the server's driver task (a real tokio abort)
+    server_driver_handle.abort();
 
-    // The driver task should complete (possibly with error)
+    // The driver task should complete as cancelled
     let driver_result = tokio::time::timeout(Duration::from_secs(10), server_driver_handle).await;
-    assert!(driver_result.is_ok(), "driver should exit after shutdown");
+    assert!(driver_result.is_ok(), "driver should exit after abort");
 
-    // Frontend should also observe the error via failed operations
+    // Frontend should observe the error via error()
+    // Give a moment for the Drop guard to fire
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    let err = server_transport.error();
+    assert!(
+        err.is_some(),
+        "error() should return Some after driver abort"
+    );
+    assert_eq!(
+        *err.unwrap().kind(),
+        TransportErrorKind::DriverAborted,
+        "abort should produce DriverAborted error"
+    );
+
+    // Frontend recv should fail with TransportFailed
     let recv_result = server_transport.recv().await;
     assert!(
         recv_result.is_err(),
         "frontend recv should fail after driver error"
     );
+
+    drop(client_transport);
+    let _ = client_driver_handle.await;
+}
+
+// ============================================================
+// Error observation tests (FR-016)
+// ============================================================
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn test_error_observation_clean_close_no_error() {
+    require_software_rdma!();
+
+    let listener = bind_listener_with_retry().await;
+    let listen_addr = connect_addr_for(listener.local_addr());
+
+    let server_builder = message_transport::MessageTransportBuilder::new()
+        .recv_buffers(4)
+        .send_buffers(4)
+        .buffer_size(256)
+        .completion_mode(CompletionMode::Readiness);
+    let client_builder = message_transport::MessageTransportBuilder::new()
+        .recv_buffers(4)
+        .send_buffers(4)
+        .buffer_size(256)
+        .completion_mode(CompletionMode::Readiness);
+
+    let server_task = tokio::spawn(async move {
+        let (transport, driver) = server_builder.accept(&listener).await.unwrap();
+        let handle = tokio::spawn(driver);
+        (transport, handle)
+    });
+    let client_task = tokio::spawn(async move {
+        let (transport, driver) = client_builder.connect(listen_addr).await.unwrap();
+        let handle = tokio::spawn(driver);
+        (transport, handle)
+    });
+
+    let (server, client) = tokio::join!(server_task, client_task);
+    let (client_transport, client_driver_handle) = client.unwrap();
+    let (server_transport, server_driver_handle) = server.unwrap();
+
+    client_transport.send(b"test").await.unwrap();
+    let _ = server_transport.recv().await.unwrap();
+
+    // Clean close
+    client_transport.close().await;
+    let driver_result = tokio::time::timeout(Duration::from_secs(10), client_driver_handle)
+        .await
+        .expect("driver should exit after close");
+    let inner = driver_result.expect("driver should not panic");
+    assert!(inner.is_ok(), "driver should return Ok on clean close");
+
+    // error() should return None for clean close
+    assert!(
+        client_transport.error().is_none(),
+        "error() should be None after clean close"
+    );
+
+    drop(server_transport);
+    let _ = server_driver_handle.await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn test_error_observation_driver_drop_unspawned() {
+    require_software_rdma!();
+
+    let listener = bind_listener_with_retry().await;
+    let listen_addr = connect_addr_for(listener.local_addr());
+
+    let server_builder = message_transport::MessageTransportBuilder::new()
+        .recv_buffers(4)
+        .send_buffers(4)
+        .buffer_size(256)
+        .completion_mode(CompletionMode::Readiness);
+    let client_builder = message_transport::MessageTransportBuilder::new()
+        .recv_buffers(4)
+        .send_buffers(4)
+        .buffer_size(256)
+        .completion_mode(CompletionMode::Readiness);
+
+    let server_task = tokio::spawn(async move { server_builder.accept(&listener).await.unwrap() });
+    let client_task =
+        tokio::spawn(async move { client_builder.connect(listen_addr).await.unwrap() });
+
+    let (server, client) = tokio::join!(server_task, client_task);
+    let (client_transport, client_driver) = client.unwrap();
+    let (_server_transport, server_driver) = server.unwrap();
+
+    // Drop drivers without spawning
+    drop(client_driver);
+    drop(server_driver);
+
+    // error() should report DriverAborted for dropped-before-spawn
+    let err = client_transport
+        .error()
+        .expect("error() should be Some after driver drop");
+    assert_eq!(
+        *err.kind(),
+        TransportErrorKind::DriverAborted,
+        "dropped unspawned driver should be DriverAborted"
+    );
+    assert!(
+        err.message().contains("driver"),
+        "error message should mention driver: {}",
+        err.message()
+    );
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn test_error_observation_peer_disconnect_state() {
+    require_software_rdma!();
+
+    let (client, server) = make_transport_pair(CompletionMode::Readiness, 4, 4, 256).await;
+
+    // Verify connection works
+    client.send(b"ping").await.unwrap();
+    let msg = server.recv().await.unwrap();
+    assert_eq!(msg.as_ref(), b"ping");
+    drop(msg);
+
+    // Drop client — triggers peer disconnect
+    drop(client);
+
+    // Wait for server's recv to fail (peer disconnect detected)
+    let result = tokio::time::timeout(Duration::from_secs(10), server.recv()).await;
+    assert!(result.is_ok(), "recv should not hang after disconnect");
+    assert!(
+        result.unwrap().is_err(),
+        "recv should fail after peer disconnect"
+    );
+
+    // Peer disconnect from clean close is not a driver error
+    // (the peer's driver ran close() successfully)
+    // error() may be None (clean peer-initiated shutdown)
+    // This is expected — peer disconnect ≠ local driver failure
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn test_error_and_driver_result_consistent() {
+    require_software_rdma!();
+
+    let listener = bind_listener_with_retry().await;
+    let listen_addr = connect_addr_for(listener.local_addr());
+
+    let server_builder = message_transport::MessageTransportBuilder::new()
+        .recv_buffers(4)
+        .send_buffers(4)
+        .buffer_size(256)
+        .completion_mode(CompletionMode::Readiness);
+    let client_builder = message_transport::MessageTransportBuilder::new()
+        .recv_buffers(4)
+        .send_buffers(4)
+        .buffer_size(256)
+        .completion_mode(CompletionMode::Readiness);
+
+    let server_task = tokio::spawn(async move {
+        let (transport, driver) = server_builder.accept(&listener).await.unwrap();
+        let handle = tokio::spawn(driver);
+        (transport, handle)
+    });
+    let client_task = tokio::spawn(async move {
+        let (transport, driver) = client_builder.connect(listen_addr).await.unwrap();
+        let handle = tokio::spawn(driver);
+        (transport, handle)
+    });
+
+    let (server, client) = tokio::join!(server_task, client_task);
+    let (client_transport, client_driver_handle) = client.unwrap();
+    let (server_transport, server_driver_handle) = server.unwrap();
+
+    client_transport.send(b"test").await.unwrap();
+    let _ = server_transport.recv().await.unwrap();
+
+    // Abort server driver
+    server_driver_handle.abort();
+
+    let driver_result = tokio::time::timeout(Duration::from_secs(10), server_driver_handle)
+        .await
+        .expect("driver should exit");
+
+    // Give Drop guard time to fire
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    // Both observation channels should be consistent:
+    // - Driver JoinHandle: cancelled (or error)
+    // - Frontend error(): DriverAborted
+    let frontend_err = server_transport
+        .error()
+        .expect("error() should be set after abort");
+    assert_eq!(*frontend_err.kind(), TransportErrorKind::DriverAborted);
+
+    // The JoinHandle was cancelled so driver_result is JoinError(Cancelled)
+    assert!(driver_result.is_err(), "aborted task should be JoinError");
 
     drop(client_transport);
     let _ = client_driver_handle.await;
