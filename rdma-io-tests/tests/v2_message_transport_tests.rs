@@ -1026,3 +1026,71 @@ async fn test_polling_mode_explicit_spawn() {
     let msg = server.recv().await.unwrap();
     assert_eq!(msg.as_ref(), b"polling-mode");
 }
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn test_one_task_per_endpoint_shared_cq() {
+    require_software_rdma!();
+
+    let (client, server) = make_transport_pair(CompletionMode::Readiness, 4, 4, 256).await;
+
+    assert_eq!(client.driver_handles().len(), 1, "shared CQ: one driver handle per endpoint");
+    assert_eq!(server.driver_handles().len(), 1, "shared CQ: one driver handle per endpoint");
+
+    client.send(b"shared-cq-structural").await.unwrap();
+    let msg = server.recv().await.unwrap();
+    assert_eq!(msg.as_ref(), b"shared-cq-structural");
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn test_driver_error_propagates() {
+    require_software_rdma!();
+
+    let listener = bind_listener_with_retry().await;
+    let listen_addr = connect_addr_for(listener.local_addr());
+
+    let server_builder = message_transport::MessageTransportBuilder::new()
+        .recv_buffers(4)
+        .send_buffers(4)
+        .buffer_size(256)
+        .completion_mode(CompletionMode::Readiness);
+    let client_builder = message_transport::MessageTransportBuilder::new()
+        .recv_buffers(4)
+        .send_buffers(4)
+        .buffer_size(256)
+        .completion_mode(CompletionMode::Readiness);
+
+    let server_task = tokio::spawn(async move {
+        let (transport, driver) = server_builder.accept(&listener).await.unwrap();
+        let handle = tokio::spawn(driver);
+        (transport, handle)
+    });
+    let client_task = tokio::spawn(async move {
+        let (transport, driver) = client_builder.connect(listen_addr).await.unwrap();
+        let handle = tokio::spawn(driver);
+        (transport, handle)
+    });
+
+    let (server, client) = tokio::join!(server_task, client_task);
+    let (client_transport, client_driver_handle) = client.unwrap();
+    let (server_transport, server_driver_handle) = server.unwrap();
+
+    // Exchange a message to confirm things work
+    client_transport.send(b"pre-error").await.unwrap();
+    let _ = server_transport.recv().await.unwrap();
+
+    // Force-shutdown the server's driver handles to provoke a driver failure
+    for h in server_transport.driver_handles() {
+        h.flush_and_shutdown();
+    }
+
+    // The driver task should complete (possibly with error)
+    let driver_result = tokio::time::timeout(Duration::from_secs(10), server_driver_handle).await;
+    assert!(driver_result.is_ok(), "driver should exit after shutdown");
+
+    // Frontend should also observe the error via failed operations
+    let recv_result = server_transport.recv().await;
+    assert!(recv_result.is_err(), "frontend recv should fail after driver error");
+
+    drop(client_transport);
+    let _ = client_driver_handle.await;
+}
