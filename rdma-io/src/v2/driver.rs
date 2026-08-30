@@ -8,29 +8,77 @@
 //!   reactor integration (arm-drain pattern)
 //! - [`PollingCqDriver`]: direct CQ polling with bounded poll budget and
 //!   cooperative yielding
+//!
+//! # Centralized Cancellation Reclamation
+//!
+//! When an [`OpFuture`](super::shared_qp::OpFuture) is dropped while in-flight,
+//! the owned MR and registry slot are pushed to the driver's reclaim queue
+//! instead of spawning a detached task. The driver drains the reclaim queue
+//! each loop turn, releasing resources when their CQE arrives.
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::wc::WorkCompletion;
 
 use super::cq::Cq;
 use super::inflight::InflightMap;
+use super::mr::Mr;
+
+/// Maximum reclaim drain turns before force-releasing a wedged entry.
+const RECLAIM_MAX_TURNS: usize = 4096;
+
+/// A detached in-flight operation awaiting reclamation.
+pub(crate) struct DetachedOp {
+    /// The registry token for this operation.
+    pub(crate) token: u64,
+    /// The owned MR kept alive while the HCA may still reference it.
+    pub(crate) mr: Option<Mr>,
+    /// Optional callback invoked with the reclaimed MR.
+    pub(crate) on_reclaim: Option<Box<dyn FnOnce(Mr) + Send>>,
+    /// Number of drain passes this entry has survived.
+    pub(crate) turns: usize,
+}
 
 /// Shared state between operation futures and the completion driver.
 ///
-/// Created by [`CqDriver::new()`] and shared via `Arc`.
+/// Created by driver constructors and shared via `Arc`. Owns the in-flight
+/// operation registry and a reclaim queue for cancelled operations.
 pub struct CqDriverHandle {
     /// The inflight operation registry.
     pub(crate) map: InflightMap,
     /// Signal to stop the driver loop.
     shutdown: AtomicBool,
+    /// Queue of detached operations awaiting reclamation.
+    reclaim_queue: Mutex<Vec<DetachedOp>>,
+    /// Notify to wake an idle FdCqDriver when entries are pushed
+    /// to the reclaim queue or when shutdown is requested.
+    #[cfg(feature = "tokio")]
+    pub(crate) shutdown_notify: tokio::sync::Notify,
+    #[cfg(feature = "tokio")]
+    pub(crate) reclaim_notify: tokio::sync::Notify,
 }
 
 impl CqDriverHandle {
-    /// Signal the driver to shut down.
+    /// Create a new driver handle with the given inflight capacity.
+    pub(crate) fn new(inflight_capacity: usize) -> Self {
+        Self {
+            map: InflightMap::new(inflight_capacity),
+            shutdown: AtomicBool::new(false),
+            reclaim_queue: Mutex::new(Vec::new()),
+            #[cfg(feature = "tokio")]
+            shutdown_notify: tokio::sync::Notify::new(),
+            #[cfg(feature = "tokio")]
+            reclaim_notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Signal the driver to shut down and wake any blocked driver loop.
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
+        #[cfg(feature = "tokio")]
+        self.shutdown_notify.notify_waiters();
     }
 
     /// Check if shutdown was requested.
@@ -41,6 +89,100 @@ impl CqDriverHandle {
     /// Access the inflight map for operation registration.
     pub fn map(&self) -> &InflightMap {
         &self.map
+    }
+
+    /// Push a detached operation for background reclamation.
+    ///
+    /// Fast path: if the completion has already arrived, the slot is
+    /// released immediately and the `on_reclaim` callback is invoked
+    /// (or the MR is dropped). No enqueue occurs.
+    ///
+    /// Slow path: the entry is added to the reclaim queue and the
+    /// driver is notified to drain it.
+    pub(crate) fn push_detached(
+        &self,
+        token: u64,
+        mr: Mr,
+        on_reclaim: Option<Box<dyn FnOnce(Mr) + Send>>,
+    ) {
+        // Fast path: completion already arrived
+        if self.map.take_completion(token).is_some() {
+            self.map.release(token);
+            if let Some(cb) = on_reclaim {
+                cb(mr);
+            }
+            return;
+        }
+
+        // Slow path: enqueue for driver to drain
+        {
+            let mut queue = self.reclaim_queue.lock().unwrap();
+            queue.push(DetachedOp {
+                token,
+                mr: Some(mr),
+                on_reclaim,
+                turns: 0,
+            });
+        }
+        #[cfg(feature = "tokio")]
+        self.reclaim_notify.notify_one();
+    }
+
+    /// Drain the reclaim queue, releasing entries whose CQE has arrived.
+    ///
+    /// On shutdown or after `RECLAIM_MAX_TURNS`, force-releases remaining
+    /// entries. Returns the number of entries still pending.
+    pub(crate) fn drain_reclaimed(&self) -> usize {
+        let mut queue = self.reclaim_queue.lock().unwrap();
+        let is_shutdown = self.is_shutdown();
+
+        queue.retain_mut(|entry| {
+            entry.turns += 1;
+
+            // Check if completion arrived
+            if self.map.take_completion(entry.token).is_some() {
+                self.map.release(entry.token);
+                if let Some(cb) = entry.on_reclaim.take()
+                    && let Some(mr) = entry.mr.take()
+                {
+                    cb(mr);
+                }
+                return false; // remove from queue
+            }
+
+            // Force-release on shutdown
+            if is_shutdown {
+                self.map.release(entry.token);
+                // Drop MR and skip callback on shutdown
+                entry.mr.take();
+                entry.on_reclaim.take();
+                return false;
+            }
+
+            // Wedge escape hatch
+            if entry.turns >= RECLAIM_MAX_TURNS {
+                tracing::warn!(
+                    token = entry.token,
+                    turns = entry.turns,
+                    "reclaim entry exceeded max turns — force-releasing"
+                );
+                self.map.release(entry.token);
+                entry.mr.take();
+                entry.on_reclaim.take();
+                return false;
+            }
+
+            true // keep in queue
+        });
+
+        queue.len()
+    }
+
+    /// Number of entries currently in the reclaim queue.
+    #[cfg(test)]
+    #[expect(dead_code)]
+    pub(crate) fn reclaim_len(&self) -> usize {
+        self.reclaim_queue.lock().unwrap().len()
     }
 }
 
@@ -73,10 +215,7 @@ impl FdCqDriver {
     /// `inflight_capacity` is the max number of concurrent in-flight
     /// operations this driver can track.
     pub fn new(cq: Cq, inflight_capacity: usize) -> (Self, Arc<CqDriverHandle>) {
-        let handle = Arc::new(CqDriverHandle {
-            map: InflightMap::new(inflight_capacity),
-            shutdown: AtomicBool::new(false),
-        });
+        let handle = Arc::new(CqDriverHandle::new(inflight_capacity));
         (
             Self {
                 cq,
@@ -115,15 +254,32 @@ impl FdCqDriver {
             let n = self.cq.poll(&mut wc_buf)?;
             if n > 0 {
                 self.dispatch(&wc_buf[..n]);
+                self.handle.drain_reclaimed();
                 continue;
             }
 
-            // Wait for fd readiness
-            if let Err(e) = notifier.readable().await {
-                if self.handle.is_shutdown() {
+            // Drain reclaim queue before parking
+            self.handle.drain_reclaimed();
+
+            // Wait for fd readiness, shutdown, or reclaim notification
+            tokio::select! {
+                biased;
+                _ = self.handle.shutdown_notify.notified() => {
                     break;
                 }
-                return Err(super::error::Error::Verbs(e));
+                _ = self.handle.reclaim_notify.notified() => {
+                    // Reclaim entries pushed — drain and re-loop
+                    self.handle.drain_reclaimed();
+                    continue;
+                }
+                result = notifier.readable() => {
+                    if let Err(e) = result {
+                        if self.handle.is_shutdown() {
+                            break;
+                        }
+                        return Err(super::error::Error::Verbs(e));
+                    }
+                }
             }
 
             // Drain completion channel events and ack
@@ -139,7 +295,18 @@ impl FdCqDriver {
                 }
                 self.dispatch(&wc_buf[..n]);
             }
+            self.handle.drain_reclaimed();
         }
+
+        // Final drain on shutdown
+        loop {
+            let n = self.cq.poll(&mut wc_buf)?;
+            if n == 0 {
+                break;
+            }
+            self.dispatch(&wc_buf[..n]);
+        }
+        self.handle.drain_reclaimed();
 
         Ok(())
     }
@@ -185,10 +352,7 @@ pub struct PollingCqDriver {
 impl PollingCqDriver {
     /// Create a new polling driver and its shared handle.
     pub fn new(cq: Cq, inflight_capacity: usize) -> (Self, Arc<CqDriverHandle>) {
-        let handle = Arc::new(CqDriverHandle {
-            map: InflightMap::new(inflight_capacity),
-            shutdown: AtomicBool::new(false),
-        });
+        let handle = Arc::new(CqDriverHandle::new(inflight_capacity));
         (
             Self {
                 cq,
@@ -225,11 +389,13 @@ impl PollingCqDriver {
                 // Yield after draining budget to stay cooperative
                 if drained_this_round >= self.poll_budget {
                     drained_this_round = 0;
+                    self.handle.drain_reclaimed();
                     tokio::task::yield_now().await;
                 }
             } else {
                 // No completions — yield to runtime
                 drained_this_round = 0;
+                self.handle.drain_reclaimed();
                 tokio::task::yield_now().await;
             }
         }
@@ -242,6 +408,7 @@ impl PollingCqDriver {
             }
             self.dispatch(&wc_buf[..n]);
         }
+        self.handle.drain_reclaimed();
 
         Ok(())
     }

@@ -237,10 +237,15 @@ enum OpState {
 /// # Cancellation Safety
 ///
 /// Dropping this future does NOT cancel the RDMA operation. The
-/// owned `Mr` and registry slot are moved to a detached cleanup
-/// task that reclaims them when the CQE arrives.
+/// owned `Mr` and registry slot are pushed to the driver's centralized
+/// reclaim queue, which releases them when the CQE arrives. No
+/// per-operation task is spawned.
 pub struct OpFuture {
     state: OpState,
+    /// Optional callback invoked when this future is dropped while in-flight
+    /// and the completion eventually arrives. Used by higher layers (e.g.,
+    /// message transport) to return the MR to a buffer pool.
+    cancel_reclaim: Option<Box<dyn FnOnce(Mr) + Send>>,
 }
 
 impl OpFuture {
@@ -263,7 +268,18 @@ impl OpFuture {
                 offset,
                 len,
             },
+            cancel_reclaim: None,
         }
+    }
+
+    /// Attach a callback that will be invoked with the owned `Mr` if this
+    /// future is dropped while in-flight and the CQE eventually arrives.
+    ///
+    /// This enables higher layers to return the MR to a buffer pool after
+    /// cancellation without leaking it.
+    pub fn on_cancel_reclaim(mut self, cb: Box<dyn FnOnce(Mr) + Send>) -> Self {
+        self.cancel_reclaim = Some(cb);
+        self
     }
 }
 
@@ -352,25 +368,11 @@ impl Drop for OpFuture {
         match std::mem::replace(&mut self.state, OpState::Done) {
             OpState::Inflight { handle, token, mr } => {
                 // Operation was posted but future is being dropped.
-                // The HCA may still be accessing the MR — we must keep
-                // the MR alive until the CQE arrives.
-                //
-                // Spawn a detached task to hold the MR and wait for
-                // the completion, then release the registry slot.
-                tokio::spawn(async move {
-                    let _mr_lease = mr; // MR stays alive in this task
-                    loop {
-                        if handle.map().take_completion(token).is_some() {
-                            handle.map().release(token);
-                            break;
-                        }
-                        if handle.is_shutdown() {
-                            handle.map().release(token);
-                            break;
-                        }
-                        tokio::task::yield_now().await;
-                    }
-                });
+                // The HCA may still be accessing the MR — push to
+                // the driver's centralized reclaim queue instead of
+                // spawning a per-operation task.
+                let on_reclaim = self.cancel_reclaim.take();
+                handle.push_detached(token, mr, on_reclaim);
             }
             OpState::Pending { .. } => {
                 // Never posted — nothing to clean up.
