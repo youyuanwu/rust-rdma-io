@@ -296,6 +296,21 @@ impl OpFuture {
         self.cancel_reclaim = Some(cb);
         self
     }
+
+    /// Create an `OpFuture` that is already in the inflight state.
+    ///
+    /// Used by the recv pump to create futures for WRs that were posted
+    /// directly (not through the Pending → Inflight state machine).
+    pub(crate) fn new_inflight(
+        handle: Arc<CqDriverHandle>,
+        token: u64,
+        mr: Mr,
+    ) -> Self {
+        Self {
+            state: OpState::Inflight { handle, token, mr },
+            cancel_reclaim: None,
+        }
+    }
 }
 
 impl Future for OpFuture {

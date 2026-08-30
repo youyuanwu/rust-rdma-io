@@ -36,7 +36,6 @@ pub enum CompletionMode {
 }
 
 /// Internal connection configuration.
-#[expect(dead_code)] // Used by MessageTransportBuilder in Phase 5
 pub(crate) struct ConnectionConfig {
     pub(crate) completion_mode: CompletionMode,
     pub(crate) cq_depth: usize,
@@ -144,12 +143,10 @@ impl Drop for Connection {
 }
 
 /// Build and establish an RDMA connection.
-#[expect(dead_code)] // Used by MessageTransportBuilder in Phase 5
 pub(crate) struct ConnectionBuilder {
     config: ConnectionConfig,
 }
 
-#[expect(dead_code)] // Used by MessageTransportBuilder in Phase 5
 impl ConnectionBuilder {
     pub(crate) fn new(config: ConnectionConfig) -> Result<Self> {
         config.validate()?;
