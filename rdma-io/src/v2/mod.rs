@@ -44,7 +44,7 @@ pub mod qp;
 #[cfg(feature = "async")]
 pub mod completion;
 #[cfg(feature = "tokio")]
-pub mod connection;
+mod connection;
 #[cfg(feature = "async")]
 pub mod cq_poller;
 #[cfg(feature = "tokio")]
@@ -85,8 +85,7 @@ pub use driver::{CqDriverHandle, FdCqDriver, PollingCqDriver};
 pub use shared_qp::{OpFuture, SharedQp};
 
 #[cfg(feature = "tokio")]
-#[allow(deprecated)]
-pub use connection::{CompletionMode, Connection};
+pub use connection::CompletionMode;
 
 #[cfg(feature = "tokio")]
 pub use message_transport::{
