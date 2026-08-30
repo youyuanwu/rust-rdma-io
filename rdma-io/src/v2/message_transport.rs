@@ -812,17 +812,27 @@ impl MessageTransport {
     /// Signals the driver to shut down and waits for it to reach
     /// a terminal state. Does NOT own the driver's `JoinHandle` —
     /// the caller is responsible for awaiting the spawn handle.
+    ///
+    /// Returns immediately if the driver has already stopped (including
+    /// if the driver was never spawned and was dropped).
     pub async fn close(&self) {
-        // Transition to Closing
-        let current = self.state.state.load(Ordering::Acquire);
-        if current == STATE_STOPPED || current == STATE_FAILED {
-            return;
-        }
-        self.state.state.store(STATE_CLOSING, Ordering::Release);
+        // Try to transition to Closing atomically
+        let _ = self.state.state.compare_exchange(
+            STATE_CREATED,
+            STATE_CLOSING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        let _ = self.state.state.compare_exchange(
+            STATE_READY,
+            STATE_CLOSING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
         self.state.remote_credits.close();
         self.state.state_notify.notify_waiters();
 
-        // Wait for terminal state
+        // Wait for terminal state (or return immediately if already terminal)
         loop {
             let notified = self.state.state_notify.notified();
             if self.state.is_terminal() {
