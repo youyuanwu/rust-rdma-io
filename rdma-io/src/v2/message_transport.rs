@@ -26,7 +26,8 @@
 //! let msg = transport.recv().await?;
 //! assert_eq!(msg.as_ref(), b"hello");
 //! transport.close().await;
-//! driver_task.await??;
+//! let driver_result = driver_task.await.expect("driver task panicked");
+//! driver_result?;
 //! # Ok(())
 //! # }
 //! ```
