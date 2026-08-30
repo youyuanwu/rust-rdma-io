@@ -1,19 +1,20 @@
 //! Ergonomic v2 connection builder for RDMA transport setup.
 //!
-//! Provides [`Connection`] and [`CompletionMode`] for establishing RDMA
-//! connections with automatic resource wiring.
-//!
-//! # Completion Modes
-//!
-//! - [`CompletionMode::Readiness`]: fd/channel-based CQ notification
-//! - [`CompletionMode::Polling`]: direct CQ polling with cooperative yielding
+//! Provides `ConnectionParts` and [`CompletionMode`] for establishing RDMA
+//! connections with automatic resource wiring. CQ drivers are created but
+//! NOT spawned — the caller composes them into a driver future.
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
+use std::pin::Pin;
 use std::sync::Arc;
 
+/// Boxed CQ driver future — ready to be polled but NOT spawned.
+pub(crate) type BoxedCqDriverFuture =
+    Pin<Box<dyn Future<Output = super::error::Result<()>> + Send>>;
+
 use tokio::io::unix::AsyncFd;
-use tokio::task::JoinHandle;
 
 use crate::async_cm::{AsyncCmId, AsyncCmListener};
 use crate::cm::{ConnParam, EventChannel};
@@ -72,115 +73,136 @@ impl ConnectionConfig {
 
 /// Handle for the disconnect monitor — carries the `AsyncFd` and a
 /// shared reference to the `EventChannel` for reading CM events.
-///
-/// Does NOT own the `CmId` — that stays in [`Connection`] where
-/// field-declaration-order drop guarantees QP is destroyed before CM ID.
 pub(crate) struct CmMonitorHandle {
     pub(crate) cm_async_fd: AsyncFd<RawFd>,
     pub(crate) event_channel: Arc<EventChannel>,
 }
 
-/// An established RDMA connection with all resources wired.
+/// Shared connection lifetime owner guaranteeing safe RDMA resource
+/// destruction order.
 ///
-/// # Drop Order
+/// # Drop Safety Proof
 ///
-/// Fields drop in declaration order:
-/// 1. `shared_qp` — QP destroyed (flushes outstanding WRs)
-/// 2. `driver_handles` — `Arc<CqDriverHandle>` refs dropped
-/// 3. `driver_tasks` — `JoinHandle`s aborted (synchronous, no await)
-/// 4. `pd` — protection domain (ref-counted)
-/// 5. `cm_id` — disconnect/destroy (AFTER QP)
-/// 6. `event_channel` — closes fd (last, after CM ID)
-pub struct Connection {
+/// `CmQueuePair::drop()` calls `rdma_destroy_qp(cm_id_raw)`, which
+/// requires the `CmId` (owner of `cm_id_raw`) to still be alive.
+/// This struct enforces the invariant structurally: Rust drops fields
+/// in declaration order, so:
+///
+/// 1. `shared_qp` drops first → `SharedQp { qp, send_handle, recv_handle, pd }`
+///    where `qp: Arc<Qp>` is the **first** field. If this is the last reference,
+///    `Qp` → `CmQueuePair::drop()` calls `rdma_destroy_qp` while `cm_id` is
+///    still alive. **Nested invariant**: `SharedQp.qp` must remain the first field.
+///    Additionally, `CmQueuePair::drop` releases its `Arc<CompletionQueue>` refs,
+///    so CQs are destroyed at this point (if no other Arc holders remain).
+/// 2. `completion_channels` drops second → each `Arc<CompletionChannel>` refcount
+///    decreases. Since the driver's `Cq` may already have dropped its Arc clone,
+///    this may be the last reference, triggering `ibv_destroy_comp_channel`.
+///    Because the CQs were destroyed in step 1, `ibv_destroy_comp_channel`
+///    succeeds (no associated CQ remains). **Critical invariant**: this field
+///    must follow `shared_qp` and precede `cm_id`.
+/// 3. `pd` drops third → decrements the `Arc<ProtectionDomain>` refcount.
+///    The PD is only freed once every `Mr`, the `CmQueuePair`, and all other
+///    `Pd` clones are gone; this field is held so the PD cannot be released
+///    before the QP under any drop order.
+/// 4. `cm_id` drops fourth → `rdma_destroy_id` runs (QP already destroyed).
+/// 5. `event_channel` drops last → closes the event fd.
+///
+/// **Precondition**: `SharedQp.qp` must be the last `Arc<Qp>` reference
+/// when `ConnectionLifetime` drops. This is enforced by not exposing
+/// `SharedQp` or `Arc<Qp>` through any public accessor. All internal QP
+/// access borrows from `ConnectionLifetime`.
+///
+/// Both the frontend (`MessageTransport`) and the driver
+/// (`MessageTransportDriver`) hold `Arc<ConnectionLifetime>` via
+/// `TransportSharedState`. When the last holder drops, the struct
+/// destructs in the safe order above, regardless of which side was last.
+///
+/// # Field Ordering Safety
+///
+/// **DO NOT reorder fields.** The destruction order is load-bearing:
+/// - `shared_qp` MUST be first (QP destroyed before anything else)
+/// - `completion_channels` MUST follow `shared_qp` (channel destroyed after CQ)
+/// - `cm_id` MUST follow `shared_qp` (CmId alive during `rdma_destroy_qp`)
+/// - `event_channel` MUST be last
+///
+/// The fields intentionally use ordinary Rust drop semantics rather than
+/// `ManuallyDrop`. Declaration-order destruction is guaranteed for struct
+/// fields, while `ManuallyDrop` would require an unsafe custom destructor and
+/// make leaks or double-drops possible without strengthening this invariant.
+///
+/// The structural tests `test_connection_lifetime_field_drop_order` and
+/// `test_connection_lifetime_field_drop_order` verify this invariant.
+pub(crate) struct ConnectionLifetime {
+    /// SharedQp wraps `Arc<Qp>` wrapping `CmQueuePair`.
+    /// Must drop FIRST — `rdma_destroy_qp` requires live `CmId`,
+    /// and dropping the QP releases `Arc<CompletionQueue>` refs so
+    /// completion channels can be destroyed next.
     shared_qp: SharedQp,
-    driver_handles: Vec<Arc<CqDriverHandle>>,
-    driver_tasks: Vec<JoinHandle<super::error::Result<()>>>,
+    /// Completion channel Arcs — must drop AFTER shared_qp (so CQs are
+    /// destroyed first) and BEFORE cm_id. Each driver's `Cq` also holds
+    /// a clone; this ensures the channel outlives all CQ references.
+    #[expect(
+        dead_code,
+        reason = "keeps completion channels alive until their CQs are destroyed"
+    )]
+    completion_channels: Vec<Arc<crate::comp_channel::CompletionChannel>>,
+    #[expect(
+        dead_code,
+        reason = "keeps the protection domain alive through QP drop"
+    )]
     pd: Pd,
-    #[expect(dead_code)] // held for drop ordering — must drop AFTER shared_qp
+    #[expect(dead_code, reason = "must remain alive until the QP is destroyed")]
     cm_id: crate::cm::CmId,
+    #[expect(dead_code, reason = "must close after the CM ID is destroyed")]
     event_channel: Arc<EventChannel>,
-    cm_async_fd: Option<AsyncFd<RawFd>>,
-    shutdown_initiated: bool,
 }
 
-impl Connection {
-    /// Access the shared queue pair.
-    pub fn shared_qp(&self) -> &SharedQp {
+impl ConnectionLifetime {
+    /// Create a new connection lifetime owner.
+    pub(crate) fn new(
+        shared_qp: SharedQp,
+        completion_channels: Vec<Arc<crate::comp_channel::CompletionChannel>>,
+        pd: Pd,
+        cm_id: crate::cm::CmId,
+        event_channel: Arc<EventChannel>,
+    ) -> Self {
+        Self {
+            shared_qp,
+            completion_channels,
+            pd,
+            cm_id,
+            event_channel,
+        }
+    }
+
+    /// Borrow the shared queue pair.
+    ///
+    /// All QP access in the message transport goes through this method,
+    /// ensuring no standalone `Arc<SharedQp>` can outlive the lifetime
+    /// owner.
+    pub(crate) fn shared_qp(&self) -> &SharedQp {
         &self.shared_qp
     }
-
-    /// Access the protection domain.
-    pub fn pd(&self) -> &Pd {
-        &self.pd
-    }
-
-    /// Access the driver handles.
-    pub fn driver_handles(&self) -> &[Arc<CqDriverHandle>] {
-        &self.driver_handles
-    }
-
-    /// Take the CM monitoring handle for a disconnect monitor task.
-    ///
-    /// The returned handle carries the `AsyncFd` and a shared ref to the
-    /// `EventChannel`. The `CmId` stays in this `Connection` to ensure
-    /// QP-before-CmId destruction order.
-    pub(crate) fn take_cm_monitor_handle(&mut self) -> Option<CmMonitorHandle> {
-        let async_fd = self.cm_async_fd.take()?;
-        Some(CmMonitorHandle {
-            cm_async_fd: async_fd,
-            event_channel: Arc::clone(&self.event_channel),
-        })
-    }
-
-    /// Synchronous, idempotent shutdown initiation. Safe for `Drop`.
-    ///
-    /// Transitions QP to error, flushes all inflight operations with
-    /// synthetic errors, and aborts driver tasks. Does NOT await driver
-    /// completion — use [`close()`](Self::close) for graceful shutdown.
-    pub fn initiate_shutdown(&mut self) {
-        if self.shutdown_initiated {
-            return;
-        }
-        self.shutdown_initiated = true;
-        let _ = self.shared_qp.shutdown();
-        for handle in &self.driver_handles {
-            handle.flush_and_shutdown();
-        }
-        // Abort only in Drop/sync context; close() awaits first
-        for task in &self.driver_tasks {
-            task.abort();
-        }
-    }
-
-    /// Graceful async shutdown with bounded timeout.
-    ///
-    /// Transitions QP to error, flushes inflight operations, then awaits
-    /// driver tasks (which perform final drain). Only aborts if a driver
-    /// task exceeds the timeout.
-    pub async fn close(mut self) {
-        if !self.shutdown_initiated {
-            self.shutdown_initiated = true;
-            let _ = self.shared_qp.shutdown();
-            for handle in &self.driver_handles {
-                handle.flush_and_shutdown();
-            }
-            // Await driver tasks — let them drain, abort only on timeout
-            for task in &mut self.driver_tasks {
-                if tokio::time::timeout(std::time::Duration::from_secs(5), &mut *task)
-                    .await
-                    .is_err()
-                {
-                    task.abort();
-                }
-            }
-        }
-    }
 }
 
-impl Drop for Connection {
-    fn drop(&mut self) {
-        self.initiate_shutdown();
-    }
+/// The result of establishing an RDMA connection — all resources needed
+/// to construct a frontend transport and a driver future.
+///
+/// CQ drivers are created but NOT spawned. The caller composes them
+/// into a single driver future for explicit user spawning.
+pub(crate) struct ConnectionParts {
+    pub(crate) shared_qp: SharedQp,
+    pub(crate) driver_handles: Vec<Arc<CqDriverHandle>>,
+    /// Boxed CQ driver futures ready to be polled. NOT spawned.
+    pub(crate) driver_futures: Vec<BoxedCqDriverFuture>,
+    /// Completion channel Arcs — shared with drivers and ConnectionLifetime
+    /// for correct destruction order (channel destroyed after CQ).
+    pub(crate) completion_channels: Vec<Arc<crate::comp_channel::CompletionChannel>>,
+    /// Resources for building ConnectionLifetime (Pd, CmId, EventChannel).
+    pub(crate) pd: Pd,
+    pub(crate) cm_id: crate::cm::CmId,
+    pub(crate) event_channel: Arc<EventChannel>,
+    pub(crate) cm_monitor_handle: Option<CmMonitorHandle>,
 }
 
 /// Build and establish an RDMA connection.
@@ -198,7 +220,13 @@ impl ConnectionBuilder {
     ///
     /// `pre_establish` is called after QP creation but before the CM
     /// handshake, allowing the caller to post receive buffers.
-    pub(crate) async fn connect<F>(self, addr: &SocketAddr, pre_establish: F) -> Result<Connection>
+    ///
+    /// Returns [`ConnectionParts`] with CQ drivers NOT spawned.
+    pub(crate) async fn connect<F>(
+        self,
+        addr: &SocketAddr,
+        pre_establish: F,
+    ) -> Result<ConnectionParts>
     where
         F: FnOnce(&SharedQp, &Pd) -> Result<()>,
     {
@@ -213,9 +241,12 @@ impl ConnectionBuilder {
         let pd_inner = async_cm.alloc_pd()?;
         let pd = Pd::new(pd_inner);
 
-        // Build CQ(s)
+        // Build CQ(s) and create (but do NOT spawn) drivers
         let depth = self.config.cq_depth as i32;
-        let (shared_qp, driver_handles, driver_tasks) = if self.config.separate_cqs {
+        let (shared_qp, driver_handles, driver_futures, completion_channels) = if self
+            .config
+            .separate_cqs
+        {
             let (send_cq, recv_cq) = match self.config.completion_mode {
                 CompletionMode::Readiness => {
                     let sc = CqBuilder::new(&ctx, depth).with_channel().build()?;
@@ -229,7 +260,6 @@ impl ConnectionBuilder {
                 }
             };
 
-            // Build QP using CQ inner refs before drivers consume the CQs
             let cmqp = async_cm.create_qp_with_cq(
                 pd.inner(),
                 &self.qp_init_attr(),
@@ -238,10 +268,11 @@ impl ConnectionBuilder {
             )?;
             let qp = Qp::from_cm_qp(cmqp);
 
-            // Create drivers (consumes CQs)
             let cap = self.config.inflight_capacity;
-            let (send_handle, send_task) = self.spawn_driver(send_cq, cap)?;
-            let (recv_handle, recv_task) = self.spawn_driver(recv_cq, cap)?;
+            let (send_handle, send_future, send_channels) = self.create_driver(send_cq, cap);
+            let (recv_handle, recv_future, recv_channels) = self.create_driver(recv_cq, cap);
+            let mut all_channels = send_channels;
+            all_channels.extend(recv_channels);
 
             let sqp = SharedQp::new(
                 qp,
@@ -252,16 +283,15 @@ impl ConnectionBuilder {
             (
                 sqp,
                 vec![send_handle, recv_handle],
-                vec![send_task, recv_task],
+                vec![send_future, recv_future],
+                all_channels,
             )
         } else {
-            // Shared CQ mode: one CQ, one driver, same handle for both
             let cq = match self.config.completion_mode {
                 CompletionMode::Readiness => CqBuilder::new(&ctx, depth).with_channel().build()?,
                 CompletionMode::Polling => CqBuilder::new(&ctx, depth).build()?,
             };
 
-            // Build QP: same CQ for both send and recv
             let cmqp = async_cm.create_qp_with_cq(
                 pd.inner(),
                 &self.qp_init_attr(),
@@ -271,10 +301,10 @@ impl ConnectionBuilder {
             let qp = Qp::from_cm_qp(cmqp);
 
             let cap = self.config.inflight_capacity;
-            let (handle, task) = self.spawn_driver(cq, cap)?;
+            let (handle, future, channels) = self.create_driver(cq, cap);
 
             let sqp = SharedQp::new(qp, Arc::clone(&handle), Arc::clone(&handle), pd.clone());
-            (sqp, vec![handle], vec![task])
+            (sqp, vec![handle], vec![future], channels)
         };
 
         // Pre-establish hook
@@ -284,26 +314,32 @@ impl ConnectionBuilder {
         async_cm.connect(&self.config.conn_param).await?;
 
         let (event_channel, cm_id) = async_cm.into_parts();
+        let event_channel = Arc::new(event_channel);
         let cm_async_fd = AsyncFd::new(event_channel.fd()).map_err(Error::Verbs)?;
 
-        Ok(Connection {
+        Ok(ConnectionParts {
             shared_qp,
             driver_handles,
-            driver_tasks,
+            driver_futures,
+            completion_channels,
             pd,
             cm_id,
-            event_channel: Arc::new(event_channel),
-            cm_async_fd: Some(cm_async_fd),
-            shutdown_initiated: false,
+            event_channel: Arc::clone(&event_channel),
+            cm_monitor_handle: Some(CmMonitorHandle {
+                cm_async_fd,
+                event_channel,
+            }),
         })
     }
 
     /// Accept a connection (server side).
+    ///
+    /// Returns [`ConnectionParts`] with CQ drivers NOT spawned.
     pub(crate) async fn accept<F>(
         self,
         listener: &AsyncCmListener,
         pre_establish: F,
-    ) -> Result<Connection>
+    ) -> Result<ConnectionParts>
     where
         F: FnOnce(&SharedQp, &Pd) -> Result<()>,
     {
@@ -317,7 +353,10 @@ impl ConnectionBuilder {
         let pd = Pd::new(pd_inner);
 
         let depth = self.config.cq_depth as i32;
-        let (shared_qp, driver_handles, driver_tasks) = if self.config.separate_cqs {
+        let (shared_qp, driver_handles, driver_futures, completion_channels) = if self
+            .config
+            .separate_cqs
+        {
             let (send_cq, recv_cq) = match self.config.completion_mode {
                 CompletionMode::Readiness => {
                     let sc = CqBuilder::new(&ctx, depth).with_channel().build()?;
@@ -340,8 +379,10 @@ impl ConnectionBuilder {
             let qp = Qp::from_cm_qp(cmqp);
 
             let cap = self.config.inflight_capacity;
-            let (send_handle, send_task) = self.spawn_driver(send_cq, cap)?;
-            let (recv_handle, recv_task) = self.spawn_driver(recv_cq, cap)?;
+            let (send_handle, send_future, send_channels) = self.create_driver(send_cq, cap);
+            let (recv_handle, recv_future, recv_channels) = self.create_driver(recv_cq, cap);
+            let mut all_channels = send_channels;
+            all_channels.extend(recv_channels);
 
             let sqp = SharedQp::new(
                 qp,
@@ -352,7 +393,8 @@ impl ConnectionBuilder {
             (
                 sqp,
                 vec![send_handle, recv_handle],
-                vec![send_task, recv_task],
+                vec![send_future, recv_future],
+                all_channels,
             )
         } else {
             let cq = match self.config.completion_mode {
@@ -369,10 +411,10 @@ impl ConnectionBuilder {
             let qp = Qp::from_cm_qp(cmqp);
 
             let cap = self.config.inflight_capacity;
-            let (handle, task) = self.spawn_driver(cq, cap)?;
+            let (handle, future, channels) = self.create_driver(cq, cap);
 
             let sqp = SharedQp::new(qp, Arc::clone(&handle), Arc::clone(&handle), pd.clone());
-            (sqp, vec![handle], vec![task])
+            (sqp, vec![handle], vec![future], channels)
         };
 
         // Pre-establish hook
@@ -386,35 +428,47 @@ impl ConnectionBuilder {
         conn_ch.set_nonblocking()?;
         conn_id.migrate(&conn_ch)?;
 
+        let conn_ch = Arc::new(conn_ch);
         let cm_async_fd = AsyncFd::new(conn_ch.fd()).map_err(Error::Verbs)?;
 
-        Ok(Connection {
+        Ok(ConnectionParts {
             shared_qp,
             driver_handles,
-            driver_tasks,
+            driver_futures,
+            completion_channels,
             pd,
             cm_id: conn_id,
-            event_channel: Arc::new(conn_ch),
-            cm_async_fd: Some(cm_async_fd),
-            shutdown_initiated: false,
+            event_channel: Arc::clone(&conn_ch),
+            cm_monitor_handle: Some(CmMonitorHandle {
+                cm_async_fd,
+                event_channel: conn_ch,
+            }),
         })
     }
 
-    fn spawn_driver(
+    /// Create a CQ driver future without spawning it.
+    ///
+    /// Returns (handle, future, completion_channels) — the channels are
+    /// Arc-shared so ConnectionLifetime can hold a reference that outlives
+    /// the driver, ensuring correct `ibv_destroy_comp_channel` ordering.
+    fn create_driver(
         &self,
         cq: super::cq::Cq,
         inflight_capacity: usize,
-    ) -> Result<(Arc<CqDriverHandle>, JoinHandle<super::error::Result<()>>)> {
+    ) -> (
+        Arc<CqDriverHandle>,
+        BoxedCqDriverFuture,
+        Vec<Arc<crate::comp_channel::CompletionChannel>>,
+    ) {
+        let channels: Vec<_> = cq.channel_arc().into_iter().collect();
         match self.config.completion_mode {
             CompletionMode::Readiness => {
                 let (driver, handle) = FdCqDriver::new(cq, inflight_capacity);
-                let task = tokio::spawn(driver.run_tokio());
-                Ok((handle, task))
+                (handle, Box::pin(driver.run_tokio()), channels)
             }
             CompletionMode::Polling => {
                 let (driver, handle) = PollingCqDriver::new(cq, inflight_capacity);
-                let task = tokio::spawn(driver.run());
-                Ok((handle, task))
+                (handle, Box::pin(driver.run()), channels)
             }
         }
     }
@@ -504,5 +558,54 @@ mod tests {
             separate_cqs: false,
         };
         assert!(config.validate().is_ok());
+    }
+
+    /// Structural drop-order test using recorder proxies.
+    ///
+    /// Mirrors `ConnectionLifetime`'s field declaration order and asserts
+    /// the exact destruction sequence. If the real struct's fields are
+    /// reordered, this test MUST be updated — and the invariant
+    /// `rdma_destroy_qp(cm_id_raw)` depends on is documented here.
+    #[test]
+    fn test_connection_lifetime_field_drop_order() {
+        use std::sync::Mutex;
+
+        struct Recorder(&'static str, Arc<Mutex<Vec<&'static str>>>);
+        impl Drop for Recorder {
+            fn drop(&mut self) {
+                self.1.lock().unwrap().push(self.0);
+            }
+        }
+
+        /// Same field count and order as `ConnectionLifetime`.
+        /// If you change `ConnectionLifetime`'s fields, update this too.
+        #[expect(dead_code, reason = "fields are observed through their Drop order")]
+        struct LifetimeShape {
+            shared_qp: Recorder,
+            completion_channels: Vec<Recorder>,
+            pd: Recorder,
+            cm_id: Recorder,
+            event_channel: Recorder,
+        }
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        drop(LifetimeShape {
+            shared_qp: Recorder("shared_qp", log.clone()),
+            completion_channels: vec![Recorder("completion_channel", log.clone())],
+            pd: Recorder("pd", log.clone()),
+            cm_id: Recorder("cm_id", log.clone()),
+            event_channel: Recorder("event_channel", log.clone()),
+        });
+        assert_eq!(
+            *log.lock().unwrap(),
+            [
+                "shared_qp",
+                "completion_channel",
+                "pd",
+                "cm_id",
+                "event_channel"
+            ],
+            "ConnectionLifetime field drop order must be: QP → CompletionChannels → PD → CmId → EventChannel"
+        );
     }
 }

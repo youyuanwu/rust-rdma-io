@@ -63,8 +63,10 @@ impl<'a> CqBuilder<'a> {
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidConfig`] if `cqe` is less than 1
-    /// - [`Error::Verbs`] if CQ or completion channel creation fails
+    /// - [`Error::InvalidConfig`](super::error::Error::InvalidConfig) if
+    ///   `cqe` is less than 1
+    /// - [`Error::Verbs`](super::error::Error::Verbs) if CQ or completion
+    ///   channel creation fails
     pub fn build(self) -> Result<Cq> {
         if self.cqe < 1 {
             return Err(super::error::Error::InvalidConfig(
@@ -73,7 +75,7 @@ impl<'a> CqBuilder<'a> {
         }
         let inner_ctx = Arc::clone(self.ctx.inner());
         if self.use_channel {
-            let channel = CompletionChannel::new(&inner_ctx)?;
+            let channel = Arc::new(CompletionChannel::new(&inner_ctx)?);
             let cq = CompletionQueue::with_comp_channel(inner_ctx, self.cqe, &channel)?;
             Ok(Cq {
                 inner: cq,
@@ -108,7 +110,11 @@ impl<'a> CqBuilder<'a> {
 /// consumes completions that other callers would miss.
 pub struct Cq {
     inner: Arc<CompletionQueue>,
-    channel: Option<CompletionChannel>,
+    /// Completion channel for readiness notification (Arc-shared so that
+    /// `ConnectionLifetime` can hold a reference that outlives the driver,
+    /// ensuring `ibv_destroy_comp_channel` runs only after all CQ refs
+    /// are gone — see the drop-order proof in `connection.rs`).
+    channel: Option<Arc<CompletionChannel>>,
 }
 
 impl Cq {
@@ -122,7 +128,8 @@ impl Cq {
     ///
     /// # Errors
     ///
-    /// - [`Error::Verbs`] if the underlying poll operation fails
+    /// - [`Error::Verbs`](super::error::Error::Verbs) if the underlying poll
+    ///   operation fails
     pub fn poll(&self, completions: &mut [WorkCompletion]) -> Result<usize> {
         let n = self.inner.poll(completions)?;
         Ok(n)
@@ -151,7 +158,16 @@ impl Cq {
     /// Useful for advanced integration patterns or interop with
     /// the v1 async API.
     pub fn channel(&self) -> Option<&CompletionChannel> {
-        self.channel.as_ref()
+        self.channel.as_deref()
+    }
+
+    /// Get a clone of the Arc-shared completion channel.
+    ///
+    /// Used by `ConnectionBuilder` to share channel ownership with
+    /// `ConnectionLifetime`, ensuring the channel outlives the CQ
+    /// for correct `ibv_destroy_comp_channel` ordering.
+    pub(crate) fn channel_arc(&self) -> Option<Arc<CompletionChannel>> {
+        self.channel.clone()
     }
 
     /// Access the underlying completion queue.

@@ -71,16 +71,6 @@ impl WorkCompletion {
     pub fn as_raw(&self) -> &ibv_wc {
         &self.inner
     }
-
-    /// Create a synthetic flush work completion.
-    ///
-    /// Used for teardown/shutdown to wake waiters with a flush error status
-    /// (`IBV_WC_WR_FLUSH_ERR`) rather than a silent success.
-    pub(crate) fn synthetic_flush() -> Self {
-        let mut inner: ibv_wc = unsafe { std::mem::zeroed() };
-        inner.status = IBV_WC_WR_FLUSH_ERR;
-        Self { inner }
-    }
 }
 
 impl std::fmt::Debug for WorkCompletion {

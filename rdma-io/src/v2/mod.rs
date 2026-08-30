@@ -44,7 +44,7 @@ pub mod qp;
 #[cfg(feature = "async")]
 pub mod completion;
 #[cfg(feature = "tokio")]
-pub mod connection;
+mod connection;
 #[cfg(feature = "async")]
 pub mod cq_poller;
 #[cfg(feature = "tokio")]
@@ -63,6 +63,7 @@ mod tokio_support;
 pub use context::Context;
 pub use cq::{Cq, CqBuilder};
 pub use error::{Error, Result};
+pub use error::{TransportError, TransportErrorKind};
 pub use mr::{AccessIntent, Mr, RemoteMr};
 pub use op::{Completion, Op, OpCode};
 pub use pd::Pd;
@@ -84,10 +85,12 @@ pub use driver::{CqDriverHandle, FdCqDriver, PollingCqDriver};
 pub use shared_qp::{OpFuture, SharedQp};
 
 #[cfg(feature = "tokio")]
-pub use connection::{CompletionMode, Connection};
+pub use connection::CompletionMode;
 
 #[cfg(feature = "tokio")]
-pub use message_transport::{MessageTransport, MessageTransportBuilder, ReceivedMessage};
+pub use message_transport::{
+    MessageTransport, MessageTransportBuilder, MessageTransportDriver, ReceivedMessage,
+};
 
 #[cfg(feature = "tokio")]
 pub use tokio_support::TokioCompletions;

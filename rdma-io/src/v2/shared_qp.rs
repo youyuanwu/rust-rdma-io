@@ -10,7 +10,8 @@
 //! Follows compio/tokio-uring's per-operation future pattern:
 //! - Each async method takes **owned** buffers (`Mr`) and returns them with
 //!   the completion result
-//! - A shared [`InflightMap`] routes CQEs to individual futures by `wr_id` token
+//! - A shared [`InflightMap`](super::inflight::InflightMap) routes CQEs to
+//!   individual futures by `wr_id` token
 //! - A completion driver task (spawned separately) drains the CQ and delivers
 //!   completions
 //! - Dropping a future does NOT cancel the RDMA operation — the owned resources
@@ -28,7 +29,8 @@
 //! // compio-style: owned buffer in, (result, buffer) out
 //! let (result, mr) = sqp.send(mr, None).await;
 //! result?;
-//! // mr is returned and can be reused
+//! // mr is Some on real CQE, None if quarantined during shutdown
+//! let mr = mr.expect("real CQE should return MR");
 //! # Ok(())
 //! # }
 //! ```
@@ -126,8 +128,9 @@ impl SharedQp {
 
     /// Submit a send operation and await its completion.
     ///
-    /// Returns `(Result<Completion>, Mr)` — the MR is always returned
-    /// regardless of success or failure.
+    /// Returns `(Result<Completion>, Option<Mr>)` — the MR is returned as
+    /// `Some(mr)` on real CQE, or `None` if the driver shut down and the
+    /// MR was quarantined.
     ///
     /// `range` optionally specifies a byte sub-range `(offset, length)`
     /// within the MR to send. If `None`, the entire MR is sent.
@@ -146,8 +149,8 @@ impl SharedQp {
 
     /// Submit a receive operation and await its completion.
     ///
-    /// Returns `(Result<Completion>, Mr)` — the MR is returned with
-    /// the received data written into it.
+    /// Returns `(Result<Completion>, Option<Mr>)` — the MR is returned as
+    /// `Some(mr)` with received data, or `None` if quarantined.
     ///
     /// `range` optionally specifies a byte sub-range for the receive buffer.
     pub fn recv(&self, mr: Mr, range: Option<(usize, usize)>) -> OpFuture {
@@ -257,15 +260,26 @@ enum OpState {
 
 /// A future representing a single in-flight RDMA operation.
 ///
-/// Resolves to `(Result<Completion>, Mr)` — the owned MR is always
-/// returned regardless of success or failure.
+/// Resolves to `(Result<Completion>, Option<Mr>)` — the owned MR is
+/// returned as `Some(mr)` when a real CQE is reaped, or `None` when
+/// the driver shuts down before a real completion arrives.
+///
+/// # MR Quarantine
+///
+/// When the driver shuts down (inflight map closed) before a real CQE
+/// arrives, the MR is pushed to the driver's reclaim queue for safe
+/// destruction. The caller receives `None` and must not attempt to
+/// reuse the buffer. This guarantees MRs are never freed while the
+/// HCA may still DMA to them — the reclaim queue is freed only after
+/// QP destruction (enforced by `ConnectionLifetime` field ordering).
 ///
 /// # Cancellation Safety
 ///
 /// Dropping this future does NOT cancel the RDMA operation. The
 /// owned `Mr` and registry slot are pushed to the driver's centralized
-/// reclaim queue, which releases them when the CQE arrives. No
-/// per-operation task is spawned.
+/// reclaim queue, which releases them when the CQE eventually arrives
+/// or quarantines them until QP destruction. No per-operation task
+/// is spawned.
 pub struct OpFuture {
     state: OpState,
     /// Optional callback invoked when this future is dropped while in-flight
@@ -325,7 +339,7 @@ impl OpFuture {
 }
 
 impl Future for OpFuture {
-    type Output = (Result<Completion>, Mr);
+    type Output = (Result<Completion>, Option<Mr>);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
@@ -352,7 +366,7 @@ impl Future for OpFuture {
                     let reg = match handle.map().register() {
                         Some(r) => r,
                         None => {
-                            return Poll::Ready((Err(Error::CapacityExhausted), mr));
+                            return Poll::Ready((Err(Error::CapacityExhausted), Some(mr)));
                         }
                     };
 
@@ -365,7 +379,7 @@ impl Future for OpFuture {
                     if let Err(e) = post_result {
                         // Post failed — release registry slot and return MR
                         handle.map().release(token);
-                        return Poll::Ready((Err(e), mr));
+                        return Poll::Ready((Err(e), Some(mr)));
                     }
                     handle.notify_work();
 
@@ -377,7 +391,7 @@ impl Future for OpFuture {
                     // Register waker FIRST (register-check-recheck pattern)
                     handle.map().register_waker(*token, cx.waker());
 
-                    // Check if completion arrived (catches race)
+                    // Check if real completion arrived (catches race with waker)
                     if let Some(wc) = handle.map().take_completion(*token) {
                         let token = *token;
                         let inflight = std::mem::replace(&mut this.state, OpState::Done);
@@ -388,10 +402,26 @@ impl Future for OpFuture {
 
                         let completion = Completion::from(wc);
                         let result = completion.result().map(|()| completion);
-                        return Poll::Ready((result, mr));
+                        return Poll::Ready((result, Some(mr)));
                     }
 
-                    // No completion yet — waker already registered above
+                    // No real completion — check if driver has shut down.
+                    // When the inflight map is closed, the MR must be
+                    // quarantined (pushed to reclaim queue) rather than
+                    // returned to the caller. The reclaim queue is freed
+                    // only after QP destruction per ConnectionLifetime
+                    // field ordering.
+                    if handle.map().is_closed() {
+                        let inflight = std::mem::replace(&mut this.state, OpState::Done);
+                        let OpState::Inflight { handle, token, mr } = inflight else {
+                            unreachable!()
+                        };
+                        let on_reclaim = this.cancel_reclaim.take();
+                        handle.push_detached(token, mr, on_reclaim);
+                        return Poll::Ready((Err(Error::DriverShutdown), None));
+                    }
+
+                    // No completion yet, not closed — waker already registered
                     return Poll::Pending;
                 }
                 OpState::Done => {

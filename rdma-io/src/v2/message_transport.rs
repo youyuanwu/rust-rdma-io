@@ -4,6 +4,34 @@
 //! message boundaries, bounded backpressure via application-level receive
 //! credits, and cancellation-safe `send()`/`recv()` operations.
 //!
+//! # Explicit Driver Spawning
+//!
+//! Construction returns a `(MessageTransport, MessageTransportDriver)` pair.
+//! The caller must explicitly spawn (or poll) the driver future on a Tokio
+//! runtime for transport progress. Exactly one spawned task per endpoint
+//! is sufficient in both shared and separate CQ modes.
+//!
+//! ```no_run
+//! # use rdma_io::v2::*;
+//! # use rdma_io::v2::message_transport::*;
+//! # async fn example() -> Result<()> {
+//! let (transport, driver) = MessageTransportBuilder::new()
+//!     .completion_mode(CompletionMode::Readiness)
+//!     .connect("192.168.1.1:7471".parse().unwrap())
+//!     .await?;
+//!
+//! let driver_task = tokio::spawn(driver);
+//! transport.ready().await?;
+//! transport.send(b"hello").await?;
+//! let msg = transport.recv().await?;
+//! assert_eq!(msg.as_ref(), b"hello");
+//! transport.close().await;
+//! let driver_result = driver_task.await.expect("driver task panicked");
+//! driver_result?;
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! # Wire Protocol
 //!
 //! Every RDMA message carries a [`protocol`] frame header
@@ -24,6 +52,35 @@
 //! [`ReceivedMessage`] is dropped). RNR retry acts as a safety net for
 //! transient races, NOT as the primary flow-control mechanism.
 //!
+//! ## Credit Balance Invariant
+//!
+//! The available credit count (`remote_credits.available_permits()`) plus
+//! in-flight sends must never exceed the negotiated peer receive capacity.
+//! On CREDIT receipt the driver validates:
+//!
+//! - **Nonzero**: zero-credit frames are rejected as protocol violations.
+//! - **In-flight**: returned credits ≤ `credits_in_flight` (sends that have
+//!   been posted and forgotten but not yet credited back).
+//! - **Capacity**: `available_permits + returned_credits <= peer_recv_capacity`
+//!   (belt-and-suspenders, with overflow-safe arithmetic).
+//!
+//! The in-flight check is the primary invariant and is TOCTOU-safe:
+//! `credits_in_flight` is incremented after `credit_permit.forget()` but
+//! BEFORE `post_send_wr_raw()` in the synchronous section of `send()`.
+//! This ensures the DATA cannot reach the peer before `credits_in_flight`
+//! reflects it. On post failure, `send()` rolls back with `checked_sub`
+//! — if a concurrent CREDIT already consumed the phantom entry, the
+//! rollback harmlessly no-ops. CREDIT processing is single-threaded in
+//! the driver loop.
+//!
+//! The peer's `data_recv_capacity` announced during HELLO is validated
+//! (must be > 0 and ≤ `Semaphore::MAX_PERMITS`) before credit
+//! initialization.
+//!
+//! A violating CREDIT triggers [`Error::ProtocolViolation`], terminates
+//! the driver through normal failure/shutdown, and exposes the cause
+//! through the driver result and [`MessageTransport::error()`].
+//!
 //! # Receive-Buffer Invariant
 //!
 //! Every configured receive MR is in exactly one of these states at any time:
@@ -36,49 +93,32 @@
 //!
 //! # Disconnect Monitoring
 //!
-//! A dedicated CM event monitor task is the sole consumer of the connection's
-//! CM event channel. On peer disconnect or CM error, the monitor atomically
-//! closes the transport, wakes all pending send/recv/credit waiters with
-//! [`Error::TransportClosed`], and initiates QP/driver shutdown.
-//!
-//! # Usage
-//!
-//! ```no_run
-//! # use rdma_io::v2::*;
-//! # use rdma_io::v2::message_transport::*;
-//! # async fn example() -> Result<()> {
-//! let transport = MessageTransportBuilder::new()
-//!     .recv_buffers(32)
-//!     .send_buffers(16)
-//!     .buffer_size(64 * 1024)
-//!     .completion_mode(CompletionMode::Readiness)
-//!     .connect("192.168.1.1:7471".parse().unwrap())
-//!     .await?;
-//!
-//! transport.send(b"hello").await?;
-//! let msg = transport.recv().await?;
-//! assert_eq!(msg.as_ref(), b"hello");
-//! # Ok(())
-//! # }
-//! ```
+//! The driver future internally monitors CM events. On peer disconnect,
+//! the transport is cleanly closed with [`Error::TransportClosed`]. On
+//! CM errors (device removal, connection fault), the error is stored as
+//! [`Error::TransportFailed`] with the typed cause, waking all pending
+//! send/recv/credit waiters and initiating QP/driver shutdown.
 
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use tokio::sync::{Mutex, Semaphore, mpsc};
-use tokio::task::JoinHandle;
+use tokio::sync::{Mutex, Notify, Semaphore, mpsc};
 
 use crate::async_cm::AsyncCmListener;
 use crate::cm::ConnParam;
 use crate::wr::{SendFlags, SendWr, Sge, WrOpcode};
 
 use super::connection::{
-    CmMonitorHandle, CompletionMode, Connection, ConnectionBuilder, ConnectionConfig,
+    CmMonitorHandle, CompletionMode, ConnectionBuilder, ConnectionConfig, ConnectionLifetime,
+    ConnectionParts,
 };
 use super::driver::CqDriverHandle;
-use super::error::{Error, Result};
+use super::error::{Error, Result, TransportError};
 use super::mr::{AccessIntent, Mr};
 use super::pd::Pd;
 use super::protocol;
@@ -223,16 +263,19 @@ impl MessageTransportBuilder {
 
     /// Connect to a remote endpoint and create a transport (client side).
     ///
-    /// Allocates all MRs, posts receive buffers (before the CM handshake),
-    /// exchanges HELLO with the peer, initializes credits, and returns a
-    /// ready-to-use transport.
+    /// Returns a `(MessageTransport, MessageTransportDriver)` pair. The
+    /// caller must spawn or poll the driver for transport progress.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidConfig`] on invalid builder parameters,
-    /// [`Error::ProtocolViolation`] on HELLO handshake failure, or any
-    /// verbs/CM error during resource allocation and connection setup.
-    pub async fn connect(self, addr: SocketAddr) -> Result<MessageTransport> {
+    /// Returns [`Error::InvalidConfig`] on invalid builder parameters, or
+    /// any verbs/CM error during resource allocation and connection setup.
+    /// HELLO handshake errors are reported through the driver result and
+    /// [`MessageTransport::ready()`], not from this method.
+    pub async fn connect(
+        self,
+        addr: SocketAddr,
+    ) -> Result<(MessageTransport, MessageTransportDriver)> {
         self.validate()?;
         let send_count = self.send_buffer_count;
         let recv_count = self.recv_buffer_count;
@@ -246,7 +289,7 @@ impl MessageTransportBuilder {
         let pre_posted: std::sync::Mutex<Option<Vec<OpFuture>>> = std::sync::Mutex::new(None);
 
         let builder = ConnectionBuilder::new(config)?;
-        let conn = builder
+        let parts = builder
             .connect(&addr, |sqp, pd| {
                 let futures = allocate_and_prepost_recvs(
                     sqp.qp(),
@@ -265,21 +308,24 @@ impl MessageTransportBuilder {
             .unwrap()
             .ok_or_else(|| Error::InvalidConfig("pre_establish not called".into()))?;
 
-        MessageTransport::from_connection(conn, send_count, recv_count, buf_size, pre_posted).await
+        MessageTransport::from_parts(parts, send_count, recv_count, buf_size, pre_posted).await
     }
 
     /// Accept a connection and create a transport (server side).
     ///
-    /// Allocates all MRs, posts receive buffers (before the CM `accept()`),
-    /// exchanges HELLO with the peer, initializes credits, and returns a
-    /// ready-to-use transport.
+    /// Returns a `(MessageTransport, MessageTransportDriver)` pair. The
+    /// caller must spawn or poll the driver for transport progress.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidConfig`] on invalid builder parameters,
-    /// [`Error::ProtocolViolation`] on HELLO handshake failure, or any
-    /// verbs/CM error during resource allocation and connection setup.
-    pub async fn accept(self, listener: &AsyncCmListener) -> Result<MessageTransport> {
+    /// Returns [`Error::InvalidConfig`] on invalid builder parameters, or
+    /// any verbs/CM error during resource allocation and connection setup.
+    /// HELLO handshake errors are reported through the driver result and
+    /// [`MessageTransport::ready()`], not from this method.
+    pub async fn accept(
+        self,
+        listener: &AsyncCmListener,
+    ) -> Result<(MessageTransport, MessageTransportDriver)> {
         self.validate()?;
         let send_count = self.send_buffer_count;
         let recv_count = self.recv_buffer_count;
@@ -291,7 +337,7 @@ impl MessageTransportBuilder {
         let pre_posted: std::sync::Mutex<Option<Vec<OpFuture>>> = std::sync::Mutex::new(None);
 
         let builder = ConnectionBuilder::new(config)?;
-        let conn = builder
+        let parts = builder
             .accept(listener, |sqp, pd| {
                 let futures = allocate_and_prepost_recvs(
                     sqp.qp(),
@@ -310,7 +356,7 @@ impl MessageTransportBuilder {
             .unwrap()
             .ok_or_else(|| Error::InvalidConfig("pre_establish not called".into()))?;
 
-        MessageTransport::from_connection(conn, send_count, recv_count, buf_size, pre_posted).await
+        MessageTransport::from_parts(parts, send_count, recv_count, buf_size, pre_posted).await
     }
 }
 
@@ -393,50 +439,319 @@ impl std::fmt::Debug for ReceivedMessage {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Transport Shared State
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Transport lifecycle states.
+const STATE_CREATED: u8 = 0;
+const STATE_READY: u8 = 2;
+const STATE_CLOSING: u8 = 3;
+const STATE_STOPPED: u8 = 4;
+const STATE_FAILED: u8 = 5;
+
+/// Pure credit-return validation logic (no side effects).
+///
+/// Returns `Ok(())` if the CREDIT is valid, or `Err(ProtocolViolation)` if:
+/// - `credits == 0` (zero-credit frame)
+/// - `credits > in_flight` (more credits returned than sends in flight)
+/// - `available + credits > capacity` (would exceed negotiated capacity,
+///   checked with `saturating_add` to prevent overflow on 32-bit targets)
+///
+/// Extracted as a free function for testability without RDMA hardware.
+fn check_credit_return(
+    credits: u32,
+    in_flight: usize,
+    available: usize,
+    capacity: usize,
+) -> Result<()> {
+    if credits == 0 {
+        return Err(Error::ProtocolViolation(
+            "CREDIT frame with zero credits".into(),
+        ));
+    }
+    let credits_usize = credits as usize;
+    // Primary invariant: can only return credits for in-flight sends.
+    // Immune to acquire→forget TOCTOU: only forgotten permits are counted.
+    if credits_usize > in_flight {
+        return Err(Error::ProtocolViolation(format!(
+            "CREDIT exceeds in-flight sends: returned={credits_usize} > in_flight={in_flight}"
+        )));
+    }
+    // Belt-and-suspenders: check against capacity with overflow protection.
+    if available.saturating_add(credits_usize) > capacity {
+        return Err(Error::ProtocolViolation(format!(
+            "CREDIT would exceed negotiated capacity: \
+             available={available} + returned={credits_usize} > capacity={capacity}"
+        )));
+    }
+    Ok(())
+}
+
+/// Shared lifecycle state between [`MessageTransport`] and [`MessageTransportDriver`].
+pub(crate) struct TransportSharedState {
+    /// Lifecycle state machine.
+    pub(crate) state: AtomicU8,
+    /// Wakes `ready()`, `send()`, `recv()`, `close()` on state changes.
+    pub(crate) state_notify: Notify,
+    /// Remote receive credits (initialized empty, filled by driver after HELLO).
+    pub(crate) remote_credits: Semaphore,
+    /// Negotiated peer receive capacity from HELLO handshake.
+    ///
+    /// Set once during HELLO to the peer's `data_recv_capacity`. The credit
+    /// balance invariant enforced by [`Self::validate_and_add_credits`] is:
+    ///
+    /// `remote_credits.available_permits() + credits_in_flight <= peer_recv_capacity`
+    ///
+    /// This is immutable once set (only transitions from 0 → peer value).
+    pub(crate) peer_recv_capacity: AtomicUsize,
+    /// Number of send permits consumed (forgotten) but not yet returned
+    /// via CREDIT frames. Incremented in `send()` after `permit.forget()`,
+    /// decremented in `validate_and_add_credits()` after validation passes.
+    ///
+    /// This field is the primary invariant for CREDIT validation: a CREDIT
+    /// returning `k` credits is valid only if `k <= credits_in_flight`,
+    /// because a credit can only be generated after the corresponding DATA
+    /// was received by the peer. This is immune to the acquire→forget
+    /// TOCTOU: temporarily-acquired (but not-yet-forgotten) permits do NOT
+    /// increment this counter, so a cancelled/failed send cannot inflate
+    /// the allowance for a concurrent CREDIT.
+    pub(crate) credits_in_flight: AtomicUsize,
+    /// Whether the frontend is still alive.
+    pub(crate) frontend_alive: AtomicBool,
+    /// Connection lifetime owner — MUST drop FIRST to destroy QP before MRs are freed.
+    /// Holds SharedQp, Pd, CmId, EventChannel in safe drop order. All QP access
+    /// is borrowed through this lease.
+    pub(crate) conn_lifetime: Arc<ConnectionLifetime>,
+    /// Driver handle refs for shutdown — dropping these frees quarantined MRs.
+    /// MUST drop AFTER `conn_lifetime`.
+    pub(crate) driver_handles: Vec<Arc<CqDriverHandle>>,
+    /// Terminal error snapshot (stored once, readable from frontend).
+    pub(crate) error: std::sync::Mutex<Option<TransportError>>,
+}
+
+impl TransportSharedState {
+    fn new(
+        conn_lifetime: Arc<ConnectionLifetime>,
+        driver_handles: Vec<Arc<CqDriverHandle>>,
+    ) -> Self {
+        Self {
+            state: AtomicU8::new(STATE_CREATED),
+            state_notify: Notify::new(),
+            remote_credits: Semaphore::new(0),
+            peer_recv_capacity: AtomicUsize::new(0),
+            credits_in_flight: AtomicUsize::new(0),
+            frontend_alive: AtomicBool::new(true),
+            conn_lifetime,
+            driver_handles,
+            error: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn is_terminal(&self) -> bool {
+        let s = self.state.load(Ordering::Acquire);
+        s == STATE_STOPPED || s == STATE_FAILED
+    }
+
+    /// Store a terminal error snapshot (once — first error wins).
+    fn store_error(&self, error: &Error) {
+        let mut guard = self.error.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(TransportError::from_error(error));
+        }
+    }
+
+    /// Initialize credits from the negotiated peer capacity after HELLO.
+    ///
+    /// Sets `peer_recv_capacity` (immutable once set) and adds the initial
+    /// permits to the semaphore. Must be called exactly once, before
+    /// transitioning to READY.
+    fn init_credits(&self, capacity: usize) {
+        self.peer_recv_capacity.store(capacity, Ordering::Release);
+        self.remote_credits.add_permits(capacity);
+    }
+
+    /// Record that a send permit was consumed (forgotten). Called from
+    /// `send()` immediately after `credit_permit.forget()`, BEFORE
+    /// `post_send_wr_raw()`.
+    ///
+    /// This ensures that when the DATA reaches the wire and the peer
+    /// returns a CREDIT, `credits_in_flight` already reflects the send.
+    /// On post failure, `send()` rolls back via `checked_sub` (see the
+    /// rollback comment in `send()`'s synchronous section).
+    fn record_send(&self) {
+        self.credits_in_flight.fetch_add(1, Ordering::Release);
+    }
+
+    /// Validate and add credits returned by a peer CREDIT frame.
+    ///
+    /// Enforces two independent invariants:
+    ///
+    /// 1. **In-flight check** (primary, TOCTOU-safe):
+    ///    `credits <= credits_in_flight`. A CREDIT can only return credits
+    ///    for DATA WRs that have been posted (permits forgotten). Concurrent
+    ///    `send()` only increases `credits_in_flight` (via `record_send()`
+    ///    before `post_send_wr_raw()`), which makes this check conservative.
+    ///    On post failure, `send()` rolls back with `checked_sub` — if a
+    ///    concurrent CREDIT consumed the phantom entry, the rollback
+    ///    harmlessly no-ops (the credit accounting is already correct).
+    ///
+    /// 2. **Capacity check** (belt-and-suspenders):
+    ///    `available_permits + credits <= peer_recv_capacity`. Guards against
+    ///    any bug in the in-flight tracking. Uses checked arithmetic to
+    ///    prevent overflow on 32-bit targets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ProtocolViolation`] if:
+    /// - `credits == 0` — a zero-credit frame is a protocol violation
+    /// - Credits exceed in-flight sends or would exceed negotiated capacity
+    fn validate_and_add_credits(&self, credits: u32) -> Result<()> {
+        let k = credits as usize;
+        check_credit_return(
+            credits,
+            self.credits_in_flight.load(Ordering::Acquire),
+            self.remote_credits.available_permits(),
+            self.peer_recv_capacity.load(Ordering::Acquire),
+        )?;
+        // Decrement in_flight atomically with checked_sub. If a concurrent
+        // send() rollback already consumed the entry (race between
+        // post_send_wr_raw failure and CREDIT processing), the checked_sub
+        // fails and we reject the CREDIT — the capacity check would also
+        // catch this since the rollback already returned the permit.
+        self.credits_in_flight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(k))
+            .map_err(|v| {
+                Error::ProtocolViolation(format!(
+                    "CREDIT exceeds in-flight sends (atomic): returned={k} > in_flight={v}"
+                ))
+            })?;
+        self.remote_credits.add_permits(k);
+        Ok(())
+    }
+
+    /// Mark the driver as dead and wake all waiters.
+    ///
+    /// Idempotent: does not overwrite a terminal state.
+    fn mark_driver_dead(&self) {
+        // Try to transition to Failed; if already terminal, don't overwrite
+        let current = self.state.load(Ordering::Acquire);
+        if current != STATE_STOPPED && current != STATE_FAILED {
+            self.state.store(STATE_FAILED, Ordering::Release);
+        }
+        self.remote_credits.close();
+        self.state_notify.notify_waiters();
+
+        // Shut down the QP and CQ drivers
+        let _ = self.conn_lifetime.shared_qp().shutdown();
+        for h in &self.driver_handles {
+            h.close_and_shutdown();
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Message Transport Driver
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The driver future for a message transport.
+///
+/// Owns all background processing: CQ completion driving, receive
+/// pumping, HELLO/credit protocol, CM disconnect monitoring, and
+/// cancellation reclamation. Implements `Future<Output = Result<()>> + Send`.
+///
+/// The caller must spawn this on a Tokio runtime for transport progress.
+/// Exactly one spawned task per endpoint is sufficient in both shared
+/// and separate CQ modes.
+///
+/// # Drop
+///
+/// Dropping the driver (whether never polled, or aborted mid-flight)
+/// transitions the transport to failed state and wakes all frontend
+/// waiters. This is safe and deterministic.
+pub struct MessageTransportDriver {
+    inner: Option<Pin<Box<dyn Future<Output = Result<()>> + Send>>>,
+    state: Arc<TransportSharedState>,
+}
+
+impl Future for MessageTransportDriver {
+    type Output = Result<()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let inner = self
+            .inner
+            .as_mut()
+            .expect("MessageTransportDriver polled after completion");
+        match inner.as_mut().poll(cx) {
+            Poll::Ready(result) => {
+                self.inner = None; // prevent double-poll
+                if let Err(ref e) = result {
+                    self.state.store_error(e);
+                    self.state.mark_driver_dead();
+                } else {
+                    // Normal completion — mark stopped
+                    let current = self.state.state.load(Ordering::Acquire);
+                    if current != STATE_FAILED {
+                        self.state.state.store(STATE_STOPPED, Ordering::Release);
+                    }
+                    self.state.remote_credits.close();
+                    self.state.state_notify.notify_waiters();
+                }
+                Poll::Ready(result)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for MessageTransportDriver {
+    fn drop(&mut self) {
+        // If inner future still exists, the driver was dropped before
+        // completing (never polled or aborted mid-flight).
+        if self.inner.is_some() {
+            self.state.store_error(&Error::DriverShutdown);
+        }
+        // Synchronous cleanup: mark driver dead, close credits,
+        // wake all waiters — runs even if never polled or aborted
+        self.state.mark_driver_dead();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Internal: Completed Receive
+// ═══════════════════════════════════════════════════════════════════════════
+
 /// Internal struct for a completed receive to pass through the channel.
 struct CompletedRecv {
     mr: Mr,
     byte_len: usize,
 }
 
-/// Message-oriented RDMA transport.
+/// Message-oriented RDMA transport (frontend handle).
 ///
 /// Provides async `send()` and `recv()` with pre-registered reusable
 /// buffer pools, message boundaries, credit-based flow control, and
-/// deterministic disconnect handling.
+/// deterministic lifecycle management.
 ///
-/// # Send Semantics
+/// This is the frontend half of the two-object contract. The driver
+/// future ([`MessageTransportDriver`]) must be spawned separately for
+/// transport progress.
 ///
-/// `send().await` means the local send completion (CQE) was received
-/// with success status. It does **not** mean the remote peer has consumed
-/// the message.
+/// # Task Count
 ///
-/// # Credit-Based Backpressure
-///
-/// Each outbound DATA frame requires one remote receive credit, acquired
-/// from a semaphore initialized from the peer's HELLO handshake. When
-/// all credits are consumed, `send()` waits asynchronously. Credits are
-/// returned when the peer reposts a data receive buffer (after dropping
-/// a [`ReceivedMessage`]). RC RNR retry is a safety net, NOT the primary
-/// flow-control mechanism.
-///
-/// # Ordering
-///
-/// Message ordering is guaranteed by RC QP semantics for WRs posted
-/// by a single task. Concurrent multi-task sends may interleave at QP
-/// level.
+/// Exactly one user-spawned driver task per endpoint is sufficient
+/// in both shared and separate CQ modes. `send()` and `recv()` run
+/// in the caller's task context.
 ///
 /// # Cancellation Safety
 ///
 /// - Cancelling `send()` before WR posting: the credit permit is returned
 ///   automatically. No resource leak.
 /// - Cancelling `send()` after WR posting: the MR returns to the send pool
-///   when the CQE arrives via `on_cancel_reclaim`. The credit is correctly
-///   consumed (the WR will use a peer recv buffer).
+///   when the CQE arrives via `on_cancel_reclaim`.
 /// - Cancelling `recv()`: the message stays in the internal channel
 ///   for the next `recv()` call. No message is lost.
 pub struct MessageTransport {
-    connection: Connection,
     buffer_size: usize,
     /// Send pool: bounded channel of available send MRs.
     send_pool_tx: mpsc::Sender<Mr>,
@@ -445,92 +760,40 @@ pub struct MessageTransport {
     recv_msg_rx: Arc<Mutex<mpsc::Receiver<CompletedRecv>>>,
     /// Repost channel: MRs returned from ReceivedMessage for reposting.
     repost_tx: mpsc::UnboundedSender<Mr>,
-    /// Remote receive credits (initialized from peer HELLO).
-    remote_credits: Arc<Semaphore>,
-    /// Transport closed flag — shared with all tasks.
-    closed: Arc<AtomicBool>,
-    /// Recv pump task handle.
-    recv_pump_task: Option<JoinHandle<()>>,
-    /// Disconnect monitor task handle.
-    disconnect_task: Option<JoinHandle<()>>,
+    /// Shared lifecycle state with the driver.
+    state: Arc<TransportSharedState>,
 }
 
 impl MessageTransport {
-    /// Build a transport from an established connection, pre-posted recv
-    /// futures, and send buffer configuration.
-    ///
-    /// Performs the HELLO readiness handshake, initializes credits, and
-    /// spawns the recv pump and disconnect monitor.
-    async fn from_connection(
-        mut connection: Connection,
+    /// Build a transport pair from established connection parts.
+    async fn from_parts(
+        mut parts: ConnectionParts,
         send_count: usize,
         recv_count: usize,
         buffer_size: usize,
         pre_posted_recvs: Vec<OpFuture>,
-    ) -> Result<Self> {
-        let pd = connection.pd().clone();
+    ) -> Result<(Self, MessageTransportDriver)> {
         let data_mr_size = protocol::data_mr_size(buffer_size);
 
-        // === HELLO Handshake ===
-        // Send our HELLO frame
-        let mut hello_mr = pd.reg_mr(protocol::HELLO_FRAME_SIZE, AccessIntent::LocalOnly)?;
-        let hello_len = protocol::write_hello_frame(
-            hello_mr.as_mut_slice(),
-            recv_count as u32,
-            buffer_size as u32,
-        );
-        let (result, _hello_mr) = connection
-            .shared_qp()
-            .send(hello_mr, Some((0, hello_len)))
-            .await;
-        result?;
+        // Build the ConnectionLifetime — the single shared owner of all
+        // RDMA resources. Drop order: SharedQp → Pd → CmId → EventChannel.
+        let conn_lifetime = Arc::new(ConnectionLifetime::new(
+            parts.shared_qp,
+            parts.completion_channels,
+            parts.pd,
+            parts.cm_id,
+            parts.event_channel,
+        ));
 
-        // Wait for peer's HELLO (with timeout)
-        let mut remaining_futures = pre_posted_recvs;
-        let peer_capacity = tokio::time::timeout(Duration::from_secs(10), async {
-            let poll_result = poll_any_ready(&mut remaining_futures).await;
-            match poll_result {
-                PollResult::Ready(idx, Ok((completion, mr))) => {
-                    remaining_futures.swap_remove(idx);
-                    let byte_len = completion.byte_len() as usize;
-                    let header = protocol::parse_header(mr.as_slice(), byte_len)?;
-                    if header.frame_type == protocol::FRAME_HELLO {
-                        let hello = protocol::parse_hello(&mr.as_slice()[protocol::HEADER_SIZE..])?;
-                        // Validate peer's max_message_size is compatible
-                        let peer_max = hello.max_message_size as usize;
-                        if peer_max < buffer_size {
-                            return Err(Error::ProtocolViolation(format!(
-                                "peer max_message_size {peer_max} < local buffer_size {buffer_size}; \
-                                 sending max-size messages would overrun peer recv buffers"
-                            )));
-                        }
-                        let capacity = hello.data_recv_capacity as usize;
-                        let qp = connection.shared_qp().qp().clone();
-                        let handle = connection.shared_qp().recv_handle().clone();
-                        let future = post_recv_and_track(&qp, &handle, mr)?;
-                        remaining_futures.push(future);
-                        Ok::<usize, Error>(capacity)
-                    } else {
-                        Err(Error::ProtocolViolation(format!(
-                            "expected HELLO, got frame_type={}",
-                            header.frame_type,
-                        )))
-                    }
-                }
-                PollResult::Ready(idx, Err((err, _mr))) => {
-                    remaining_futures.swap_remove(idx);
-                    Err(err)
-                }
-            }
-        })
-        .await
-        .map_err(|_| Error::ProtocolViolation("HELLO handshake timeout".into()))??;
+        let driver_handles = parts.driver_handles;
 
-        // Initialize credit semaphore from peer's announced data recv capacity
-        let remote_credits = Arc::new(Semaphore::new(peer_capacity));
-        let closed = Arc::new(AtomicBool::new(false));
+        let shared_state = Arc::new(TransportSharedState::new(
+            Arc::clone(&conn_lifetime),
+            driver_handles.clone(),
+        ));
 
-        // === Allocate send buffers (data MR size for protocol header) ===
+        // === Allocate send buffers ===
+        let pd = conn_lifetime.shared_qp().pd().clone();
         let (send_pool_tx, send_pool_rx) = mpsc::channel(send_count);
         for _ in 0..send_count {
             let mr = pd.reg_mr(data_mr_size, AccessIntent::LocalOnly)?;
@@ -554,83 +817,128 @@ impl MessageTransport {
         let (recv_msg_tx, recv_msg_rx) = mpsc::channel(recv_count + protocol::CTRL_RECV_COUNT);
         let (repost_tx, repost_rx) = mpsc::unbounded_channel();
 
-        // Recv pump
-        let pump_qp = connection.shared_qp().qp().clone();
-        let pump_send_handle = connection.shared_qp().send_handle().clone();
-        let pump_recv_handle = if connection.driver_handles().len() > 1 {
-            connection.driver_handles()[1].clone()
-        } else {
-            connection.driver_handles()[0].clone()
-        };
-        let pump_credits = remote_credits.clone();
-        let pump_closed = closed.clone();
+        let cm_monitor_handle = parts.cm_monitor_handle.take();
+        let recv_handle_idx = if driver_handles.len() > 1 { 1 } else { 0 };
+        let driver_recv_handle = driver_handles[recv_handle_idx].clone();
+        let driver_send_handle = driver_handles[0].clone();
 
-        let recv_pump_task = tokio::spawn(recv_pump(
-            pump_qp,
-            pump_send_handle,
-            pump_recv_handle,
-            pd,
-            remaining_futures,
+        // NOTE: Do NOT clone send_pool_tx or repost_tx into the driver.
+        // The driver must not hold these senders — when the frontend drops,
+        // the channel closures signal the driver to shut down.
+        let driver_future: Pin<Box<dyn Future<Output = Result<()>> + Send>> = Box::pin(driver_run(
+            Arc::clone(&shared_state),
+            Arc::clone(&conn_lifetime),
+            driver_send_handle,
+            driver_recv_handle,
+            driver_handles.clone(),
+            parts.driver_futures,
+            cm_monitor_handle,
+            pre_posted_recvs,
+            recv_count,
+            buffer_size,
             recv_msg_tx,
             repost_rx,
-            ctrl_send_tx.clone(),
+            ctrl_send_tx,
             ctrl_send_rx,
-            pump_credits,
-            pump_closed,
         ));
 
-        // === Disconnect Monitor ===
-        let cm_handle = connection.take_cm_monitor_handle();
-        let disc_closed = closed.clone();
-        let disc_credits = remote_credits.clone();
-        let disc_handles: Vec<_> = connection.driver_handles().to_vec();
-
-        let disconnect_task = cm_handle.map(|handle| {
-            tokio::spawn(disconnect_monitor(
-                handle,
-                disc_closed,
-                disc_credits,
-                disc_handles,
-            ))
-        });
-
-        Ok(Self {
-            connection,
+        let transport = Self {
             buffer_size,
             send_pool_tx,
             send_pool_rx: Arc::new(Mutex::new(send_pool_rx)),
             recv_msg_rx: Arc::new(Mutex::new(recv_msg_rx)),
             repost_tx,
-            remote_credits,
-            closed,
-            recv_pump_task: Some(recv_pump_task),
-            disconnect_task,
-        })
+            state: Arc::clone(&shared_state),
+        };
+
+        let driver = MessageTransportDriver {
+            inner: Some(driver_future),
+            state: shared_state,
+        };
+
+        Ok((transport, driver))
+    }
+
+    /// Wait for the transport to become ready (HELLO handshake complete).
+    pub async fn ready(&self) -> Result<()> {
+        loop {
+            let notified = self.state.state_notify.notified();
+            let s = self.state.state.load(Ordering::Acquire);
+            match s {
+                STATE_READY => return Ok(()),
+                STATE_FAILED => return Err(self.terminal_error()),
+                STATE_CLOSING | STATE_STOPPED => return Err(Error::TransportClosed),
+                _ => {}
+            }
+            notified.await;
+        }
+    }
+
+    /// Wait for readiness internally.
+    async fn await_ready(&self) -> Result<()> {
+        let s = self.state.state.load(Ordering::Acquire);
+        if s == STATE_READY {
+            return Ok(());
+        }
+        if s == STATE_FAILED {
+            return Err(self.terminal_error());
+        }
+        if s >= STATE_CLOSING {
+            return Err(Error::TransportClosed);
+        }
+        self.ready().await
+    }
+
+    /// Inspect the terminal driver error, if any.
+    ///
+    /// Returns `Some(TransportError)` if the driver exited with an error
+    /// (e.g., HELLO timeout, completion error, driver drop/abort).
+    /// Returns `None` if the transport was cleanly closed, is still running,
+    /// or peer-disconnected without a driver-level error.
+    ///
+    /// The returned [`TransportError`] carries the same cause information
+    /// as the driver future's `Result<()>` output, providing two
+    /// observation channels for the same terminal event.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use rdma_io::v2::*;
+    /// # use rdma_io::v2::error::TransportErrorKind;
+    /// # async fn example(transport: MessageTransport, driver_handle: tokio::task::JoinHandle<Result<()>>) {
+    /// // After driver completes:
+    /// let driver_result = driver_handle.await.expect("panicked");
+    /// if let Err(ref e) = driver_result {
+    ///     // Both channels observe the same cause:
+    ///     let frontend_err = transport.error().expect("error should be set");
+    ///     eprintln!("driver: {e}, frontend: {frontend_err}");
+    /// }
+    /// # }
+    /// ```
+    pub fn error(&self) -> Option<TransportError> {
+        self.state.error.lock().unwrap().clone()
+    }
+
+    /// Return the stored terminal error (if any) or fall back to
+    /// [`Error::TransportClosed`].
+    ///
+    /// Used by `ready()`, `send()`, `recv()` to surface actionable
+    /// error information rather than an opaque `TransportClosed`.
+    fn terminal_error(&self) -> Error {
+        if let Some(te) = self.state.error.lock().unwrap().clone() {
+            Error::TransportFailed(te)
+        } else {
+            Error::TransportClosed
+        }
     }
 
     /// Send a message. Returns when the local send completion arrives.
     ///
-    /// `send().await` is local-completion only — it does NOT guarantee
-    /// remote consumption.
-    ///
-    /// # Credit Flow
-    ///
-    /// Acquires one remote receive credit before posting. If no credits
-    /// are available, waits asynchronously until the peer returns credits
-    /// (by dropping received messages).
-    ///
     /// # Errors
     ///
     /// - [`Error::MessageTooLarge`] if `data.len() > buffer_size`
-    /// - [`Error::TransportClosed`] if the transport is shut down or
-    ///   disconnected (including credit semaphore closed)
+    /// - [`Error::TransportClosed`] if the transport is shut down or disconnected
     /// - [`Error::CompletionError`] if the send WR completed with error
-    ///
-    /// # Cancellation Safety
-    ///
-    /// If cancelled before the WR is posted, the credit permit is returned
-    /// automatically. If cancelled after posting, the `on_cancel_reclaim`
-    /// callback returns the MR to the send pool when the CQE arrives.
     pub async fn send(&self, data: &[u8]) -> Result<()> {
         if data.len() > self.buffer_size {
             return Err(Error::MessageTooLarge {
@@ -639,41 +947,57 @@ impl MessageTransport {
             });
         }
 
-        if self.closed.load(Ordering::Acquire) {
-            return Err(Error::TransportClosed);
-        }
+        // Await readiness (HELLO must be complete)
+        self.await_ready().await?;
 
-        // Acquire remote receive credit (cancellation-safe: permit is
-        // returned automatically if the future is dropped)
+        // Acquire remote receive credit
         let credit_permit = self
+            .state
             .remote_credits
             .acquire()
             .await
-            .map_err(|_| Error::TransportClosed)?;
+            .map_err(|_| self.terminal_error())?;
 
-        // Acquire send buffer from the pool (backpressure point)
+        // Acquire send buffer from the pool.
+        // Race against terminal state to avoid hanging forever if the
+        // driver dies while all send MRs are quarantined (FR-011).
+        //
+        // Uses register-check-recheck protocol: create `notified()` FIRST
+        // (snapshots the notify_waiters counter), THEN check terminal state.
+        // If `notify_waiters()` fires between the check and the await,
+        // the already-registered `Notified` wakes immediately. Reversing
+        // this order opens a lost-wakeup window where `mark_driver_dead()`
+        // signals between the terminal check and the `notified()` snapshot.
         let mut mr = {
             let mut rx = self.send_pool_rx.lock().await;
-            rx.recv().await.ok_or(Error::TransportClosed)?
+            loop {
+                let notified = self.state.state_notify.notified();
+                if self.state.is_terminal() {
+                    return Err(self.terminal_error());
+                }
+                tokio::select! {
+                    biased;
+                    res = rx.recv() => break res.ok_or_else(|| self.terminal_error())?,
+                    () = notified => continue,
+                }
+            }
         };
 
-        // === SYNCHRONOUS SECTION (no .await, no cancellation) ===
-
-        // Write protocol frame: header + payload
+        // === SYNCHRONOUS SECTION ===
         let frame_len = protocol::write_data_frame(mr.as_mut_slice(), data);
-
-        // Post send WR directly (avoid OpFuture Pending → Inflight transition
-        // that would create a cancellation window between credit acquire and
-        // WR posting)
-        let qp = self.connection.shared_qp().qp().clone();
-        let handle = self.connection.shared_qp().send_handle().clone();
+        let sqp = self.state.conn_lifetime.shared_qp();
+        let qp = sqp.qp().clone();
+        let handle = sqp.send_handle().clone();
 
         let reg = match handle.map().register() {
             Some(r) => r,
             None => {
                 let _ = self.send_pool_tx.try_send(mr);
-                // credit_permit drops → credit returned
-                return Err(Error::CapacityExhausted);
+                return Err(if handle.map().is_closed() {
+                    self.terminal_error()
+                } else {
+                    Error::CapacityExhausted
+                });
             }
         };
         let token = reg.token;
@@ -684,31 +1008,54 @@ impl MessageTransport {
             .sg(sge)
             .flags(SendFlags::SIGNALED);
 
+        // Commit the credit consumption BEFORE posting the WR to the
+        // hardware. Once `post_send_wr_raw` succeeds, the DATA is on the
+        // wire and a multi-threaded runtime may deliver the peer's CREDIT
+        // response before any subsequent instruction executes. If
+        // `record_send` ran after the post, the driver could see
+        // `credits_in_flight == 0` and spuriously reject a valid CREDIT.
+        //
+        // On post failure, we roll back with `checked_sub` to handle the
+        // narrow race where a concurrent CREDIT already consumed the
+        // phantom in_flight entry. If the decrement succeeds, we also
+        // return the permit; if it fails (CREDIT already consumed it),
+        // the available permits are already correct.
+        credit_permit.forget();
+        self.state.record_send();
+
         if let Err(e) = qp.post_send_wr_raw(&mut wr) {
+            // Roll back credit consumption — DATA never posted.
+            // Use checked_sub: if a concurrent CREDIT already consumed
+            // our phantom in_flight, the counter is 0 and we must not
+            // underflow. In that case the driver already added the
+            // permit via validate_and_add_credits.
+            if self
+                .state
+                .credits_in_flight
+                .fetch_update(Ordering::Release, Ordering::Acquire, |v| v.checked_sub(1))
+                .is_ok()
+            {
+                self.state.remote_credits.add_permits(1);
+            }
             handle.map().release(token);
             let _ = self.send_pool_tx.try_send(mr);
-            // credit_permit drops → credit returned
             return Err(e);
         }
         handle.notify_work();
-
-        // WR is posted. The credit is correctly consumed — forget the permit.
-        credit_permit.forget();
-
         // === END SYNCHRONOUS SECTION ===
 
-        // Create inflight OpFuture and await CQE
         let send_pool_tx = self.send_pool_tx.clone();
         let op = OpFuture::new_inflight(handle, token, mr).on_cancel_reclaim(Box::new(move |mr| {
             let _ = send_pool_tx.try_send(mr);
         }));
 
         let (result, mr) = op.await;
+        // MR is Some on real CQE, None if quarantined (driver shutdown).
+        // Only return to pool if we actually got the MR back.
+        if let Some(mr) = mr {
+            let _ = self.send_pool_tx.try_send(mr);
+        }
 
-        // Always return MR to pool first, even on error (prevents pool leak)
-        let _ = self.send_pool_tx.try_send(mr);
-
-        // Map flush errors to TransportClosed at the transport boundary
         result.map_err(|e| match &e {
             Error::CompletionError { status, .. } if *status == crate::wc::WcStatus::WrFlushErr => {
                 Error::TransportClosed
@@ -721,30 +1068,47 @@ impl MessageTransport {
 
     /// Receive a message. Returns the next completed message.
     ///
-    /// Multiple concurrent `recv()` calls are supported. Each message
-    /// is delivered to exactly one receiver (FIFO from the internal
-    /// mpsc channel serialized by a Mutex).
-    ///
-    /// # Cancellation Safety
-    ///
-    /// Cancelling `recv()` does not consume or lose any message.
-    /// The message remains in the internal channel for the next caller.
+    /// Already-delivered messages remain drainable even after the transport
+    /// enters a terminal state. The readiness gate only blocks when no
+    /// messages are buffered and the HELLO handshake has not yet completed.
     ///
     /// # Errors
     ///
-    /// - [`Error::TransportClosed`] if the transport is shut down or
-    ///   disconnected
+    /// - [`Error::TransportClosed`] if cleanly shut down with no buffered messages
+    /// - [`Error::TransportFailed`] if the driver failed with no buffered messages
     pub async fn recv(&self) -> Result<ReceivedMessage> {
-        let completed = {
-            let mut rx = self.recv_msg_rx.lock().await;
-            rx.recv().await.ok_or(Error::TransportClosed)?
-        };
+        let mut rx = self.recv_msg_rx.lock().await;
 
-        Ok(ReceivedMessage {
-            mr: Some(completed.mr),
-            byte_len: completed.byte_len,
-            repost_tx: self.repost_tx.clone(),
-        })
+        // Drain already-delivered messages regardless of lifecycle state.
+        if let Ok(completed) = rx.try_recv() {
+            return Ok(ReceivedMessage {
+                mr: Some(completed.mr),
+                byte_len: completed.byte_len,
+                repost_tx: self.repost_tx.clone(),
+            });
+        }
+
+        // Nothing buffered: gate on readiness only while handshake is pending.
+        drop(rx); // release lock during ready() wait
+        let s = self.state.state.load(Ordering::Acquire);
+        if s == STATE_CREATED {
+            self.ready().await?;
+        } else if s == STATE_FAILED {
+            return Err(self.terminal_error());
+        } else if s >= STATE_CLOSING {
+            return Err(Error::TransportClosed);
+        }
+
+        // Re-acquire lock and wait for next message or channel closure.
+        let mut rx = self.recv_msg_rx.lock().await;
+        rx.recv()
+            .await
+            .map(|completed| ReceivedMessage {
+                mr: Some(completed.mr),
+                byte_len: completed.byte_len,
+                repost_tx: self.repost_tx.clone(),
+            })
+            .ok_or_else(|| self.terminal_error())
     }
 
     /// The configured maximum message payload size.
@@ -752,276 +1116,715 @@ impl MessageTransport {
         self.buffer_size
     }
 
-    /// Access the underlying connection.
-    pub fn connection(&self) -> &Connection {
-        &self.connection
-    }
-
     /// Graceful async shutdown.
     ///
-    /// Closes all internal channels, aborts the recv pump and disconnect
-    /// monitor, and initiates connection shutdown.
-    pub async fn close(mut self) {
-        // Mark as closed
-        self.closed.store(true, Ordering::Release);
-        self.remote_credits.close();
+    /// Signals the driver to shut down and waits for it to reach
+    /// a terminal state. Does NOT own the driver's `JoinHandle` —
+    /// the caller is responsible for awaiting the spawn handle.
+    ///
+    /// Returns immediately if the driver has already stopped (including
+    /// if the driver was never spawned and was dropped). If the driver
+    /// has been constructed but neither spawned nor dropped, `close()`
+    /// waits indefinitely; drop the driver to force a terminal state.
+    pub async fn close(&self) {
+        // Try to transition to Closing atomically
+        let _ = self.state.state.compare_exchange(
+            STATE_CREATED,
+            STATE_CLOSING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        let _ = self.state.state.compare_exchange(
+            STATE_READY,
+            STATE_CLOSING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.state.remote_credits.close();
+        self.state.state_notify.notify_waiters();
 
-        // Abort recv pump
-        if let Some(task) = self.recv_pump_task.take() {
-            task.abort();
-            let _ = task.await;
+        // Wait for terminal state (or return immediately if already terminal)
+        loop {
+            let notified = self.state.state_notify.notified();
+            if self.state.is_terminal() {
+                return;
+            }
+            notified.await;
         }
-
-        // Abort disconnect monitor
-        if let Some(task) = self.disconnect_task.take() {
-            task.abort();
-            let _ = task.await;
-        }
-
-        self.connection.initiate_shutdown();
     }
 }
 
 impl Drop for MessageTransport {
     fn drop(&mut self) {
-        self.closed.store(true, Ordering::Release);
-        self.remote_credits.close();
-
-        if let Some(task) = self.recv_pump_task.take() {
-            task.abort();
-        }
-        if let Some(task) = self.disconnect_task.take() {
-            task.abort();
-        }
-        // Connection::drop handles QP→error + driver shutdown
+        // Signal frontend absence to the driver
+        self.state.frontend_alive.store(false, Ordering::Release);
+        self.state.remote_credits.close();
+        self.state.state_notify.notify_waiters();
     }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Disconnect Monitor
+// Composed Driver Future
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// CM event monitor — sole consumer of the connection's event channel.
+/// The composed driver async function — runs CQ drivers, HELLO handshake,
+/// recv pump, and disconnect monitor all within one task.
 ///
-/// On peer disconnect or CM error, atomically closes the transport.
-/// Does NOT own the `CmId` — that stays in [`Connection`] for safe
-/// QP-before-CmId destruction ordering. Uses `compare_exchange` on the
-/// `closed` flag to ensure idempotent shutdown.
-async fn disconnect_monitor(
-    handle: CmMonitorHandle,
-    closed: Arc<AtomicBool>,
-    credits: Arc<Semaphore>,
-    driver_handles: Vec<Arc<CqDriverHandle>>,
-) {
-    use crate::cm::CmEventType;
-
-    loop {
-        let guard_result = handle.cm_async_fd.readable().await;
-        let mut guard = match guard_result {
-            Ok(g) => g,
-            Err(_) => break,
-        };
-
-        match handle.event_channel.try_get_event() {
-            Ok(event) => {
-                let event_type = event.event_type();
-                tracing::debug!(?event_type, "disconnect_monitor: CM event");
-                match event_type {
-                    CmEventType::Disconnected | CmEventType::DeviceRemoval => break,
-                    _ => {}
-                }
-            }
-            Err(crate::Error::WouldBlock) => {
-                guard.clear_ready();
-                continue;
-            }
-            Err(_) => break,
-        }
-
-        guard.clear_ready();
-    }
-
-    if closed
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
-    {
-        tracing::info!("disconnect_monitor: peer disconnected, closing transport");
-        credits.close();
-        for h in &driver_handles {
-            h.flush_and_shutdown();
-        }
-    }
-
-    // CmMonitorHandle drops: AsyncFd deregistered, Arc<EventChannel> decremented.
-    // CmId stays in Connection — QP-before-CmId ordering maintained.
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Recv Pump
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Background task that manages receive buffer posting, frame parsing,
-/// credit handling, and completion routing.
+/// # Phases
 ///
-/// # Responsibilities
+/// - **Phase A (Handshake)**: CQ drivers poll concurrently with HELLO
+///   send/receive. Once HELLO succeeds, credits are initialized and state
+///   transitions to Ready.
+/// - **Phase B (Steady State)**: CQ drivers, recv pump, and disconnect
+///   monitor run concurrently in a select loop.
+/// - **Phase C (Shutdown)**: On close/disconnect/error, the QP is
+///   transitioned to error, CQ drivers drain, then the function exits.
 ///
-/// 1. Poll pre-posted recv OpFutures for completions
-/// 2. Parse incoming frame headers (DATA/CREDIT/HELLO)
-/// 3. Deliver DATA frames to the user's recv channel
-/// 4. Process CREDIT frames: add credits to the sender's semaphore
-/// 5. Repost recv MRs from ReceivedMessage drops + send CREDIT to peer
-/// 6. Repost control MRs immediately after processing
+/// # Connection Lifetime
+///
+/// The driver retains `Arc<ConnectionLifetime>` (`conn_lifetime`) for
+/// the full duration. This guarantees that CmId/EventChannel remain alive
+/// while the driver uses QP/CQ resources. When the driver future drops,
+/// the Arc refcount decreases; if the frontend also dropped, the
+/// ConnectionLifetime destructs in safe order (QP before CmId).
 #[expect(clippy::too_many_arguments)]
-async fn recv_pump(
-    qp: Arc<super::qp::Qp>,
+async fn driver_run(
+    state: Arc<TransportSharedState>,
+    conn_lifetime: Arc<ConnectionLifetime>,
     send_handle: Arc<CqDriverHandle>,
     recv_handle: Arc<CqDriverHandle>,
-    _pd: Pd, // kept alive so MRs remain valid
-    initial_futures: Vec<OpFuture>,
+    driver_handles: Vec<Arc<CqDriverHandle>>,
+    cq_driver_futures: Vec<Pin<Box<dyn Future<Output = super::error::Result<()>> + Send>>>,
+    cm_monitor_handle: Option<CmMonitorHandle>,
+    initial_recvs: Vec<OpFuture>,
+    recv_count: usize,
+    buffer_size: usize,
     recv_msg_tx: mpsc::Sender<CompletedRecv>,
     mut repost_rx: mpsc::UnboundedReceiver<Mr>,
     ctrl_send_tx: mpsc::Sender<Mr>,
     mut ctrl_send_rx: mpsc::Receiver<Mr>,
-    remote_credits: Arc<Semaphore>,
-    closed: Arc<AtomicBool>,
-) {
-    let mut pending_recvs: Vec<OpFuture> = initial_futures;
-    let mut pending_credits: u32 = 0;
+) -> Result<()> {
+    use crate::cm::CmEventType;
 
-    loop {
-        if closed.load(Ordering::Acquire) {
-            return;
-        }
+    // Borrow shared QP through the connection lifetime lease.
+    // This is a reference, not an Arc clone — the Arc<ConnectionLifetime>
+    // parameter keeps everything alive.
+    let shared_qp = conn_lifetime.shared_qp();
 
-        // Try to send pending credits before blocking
-        if pending_credits > 0
-            && let Ok(mut ctrl_mr) = ctrl_send_rx.try_recv()
-        {
-            let credits_to_send = pending_credits;
-            pending_credits = 0;
-            let frame_len = protocol::write_credit_frame(ctrl_mr.as_mut_slice(), credits_to_send);
-            let ctx = ctrl_send_tx.clone();
-            let _ = post_send_and_detach(
-                &qp,
-                &send_handle,
-                ctrl_mr,
-                frame_len,
-                Box::new(move |mr| {
-                    let _ = ctx.try_send(mr);
-                }),
-            );
-        }
+    // Combine all CQ driver futures into one joined future.
+    // We use a FuturesUnordered to poll them all concurrently.
+    let mut cq_futures: futures_util::stream::FuturesUnordered<_> =
+        cq_driver_futures.into_iter().collect();
 
-        if pending_recvs.is_empty() {
-            // All buffers are out — wait for repost, ctrl MR, or shutdown
-            tokio::select! {
-                biased;
-                mr = repost_rx.recv() => {
-                    match mr {
-                        Some(mr) => {
-                            pending_credits += 1;
-                            match post_recv_and_track(&qp, &recv_handle, mr) {
-                                Ok(future) => pending_recvs.push(future),
-                                Err(_) => return,
+    // ─── Phase A: HELLO Handshake (concurrent with CQ drivers) ───
+
+    // Send our HELLO frame
+    let mut hello_mr = shared_qp
+        .pd()
+        .reg_mr(protocol::HELLO_FRAME_SIZE, AccessIntent::LocalOnly)?;
+    let hello_len = protocol::write_hello_frame(
+        hello_mr.as_mut_slice(),
+        recv_count as u32,
+        buffer_size as u32,
+    );
+
+    // We need to poll CQ drivers concurrently with HELLO send + recv
+    // because the OpFutures require CQ dispatch to complete.
+    let mut remaining_futures = initial_recvs;
+
+    // Send HELLO — this creates an OpFuture that needs CQ driver to dispatch
+    let mut hello_send = Box::pin(shared_qp.send(hello_mr, Some((0, hello_len))));
+
+    // Phase A loop: drive CQ futures while waiting for HELLO send
+    let mut hello_sent = false;
+    let mut peer_capacity: Option<usize> = None;
+
+    /// Named constant for HELLO handshake timeout.
+    const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+    /// Named constant for CQ drain timeout.
+    const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+    let hello_timeout = tokio::time::sleep(HELLO_TIMEOUT);
+    tokio::pin!(hello_timeout);
+
+    // Unified terminal error tracker — shared across Phase A and Phase B.
+    let mut terminal_error: Option<Error> = None;
+
+    // Set up disconnect monitor BEFORE Phase A so both phases can use it.
+    let disconnect_future = async {
+        if let Some(handle) = cm_monitor_handle {
+            loop {
+                let guard_result = handle.cm_async_fd.readable().await;
+                let mut guard = match guard_result {
+                    Ok(g) => g,
+                    Err(e) => break Some(Error::Verbs(e)),
+                };
+
+                match handle.event_channel.try_get_event() {
+                    Ok(event) => {
+                        let event_type = event.event_type();
+                        let status = event.status();
+                        tracing::debug!(?event_type, status, "driver: CM event");
+                        match event_type {
+                            CmEventType::Disconnected if status == 0 => break None,
+                            CmEventType::Disconnected => {
+                                // Nonzero status on disconnect indicates a failure
+                                break Some(Error::Verbs(std::io::Error::other(format!(
+                                    "CM disconnect with error status {status}"
+                                ))));
+                            }
+                            CmEventType::DeviceRemoval => {
+                                break Some(Error::Verbs(std::io::Error::other(
+                                    "RDMA device removed",
+                                )));
+                            }
+                            other => {
+                                tracing::warn!(?other, status, "driver: unexpected CM event");
+                                break Some(Error::Verbs(std::io::Error::other(format!(
+                                    "unexpected CM event: {other:?} (status={status})"
+                                ))));
                             }
                         }
-                        None => return,
                     }
-                    continue;
-                }
-                // Wake when a control send MR returns (so we can flush credits)
-                ctrl_mr = ctrl_send_rx.recv(), if pending_credits > 0 => {
-                    if let Some(mut ctrl_mr) = ctrl_mr {
-                        let credits_to_send = pending_credits;
-                        pending_credits = 0;
-                        let frame_len = protocol::write_credit_frame(ctrl_mr.as_mut_slice(), credits_to_send);
-                        let ctx = ctrl_send_tx.clone();
-                        let _ = post_send_and_detach(&qp, &send_handle, ctrl_mr, frame_len, Box::new(move |mr| { let _ = ctx.try_send(mr); }));
+                    Err(crate::Error::WouldBlock) => {
+                        guard.clear_ready();
+                        continue;
                     }
-                    continue;
+                    Err(e) => break Some(Error::from(e)),
                 }
             }
+        } else {
+            // No CM handle — just pend forever
+            std::future::pending::<Option<Error>>().await
+        }
+    };
+    tokio::pin!(disconnect_future);
+
+    // Track whether handshake completed successfully.
+    let mut handshake_ok = false;
+
+    'handshake: loop {
+        // Check if we're done with handshake
+        if hello_sent && peer_capacity.is_some() {
+            handshake_ok = true;
+            break;
         }
 
-        // Wait for: a recv completion, a reposted MR, or shutdown
+        // Check lifecycle: close/frontend-drop/terminal state
+        if !state.frontend_alive.load(Ordering::Acquire)
+            || state.state.load(Ordering::Acquire) >= STATE_CLOSING
+        {
+            break;
+        }
+
+        // Register shutdown interest BEFORE entering select (avoids lost wakeup)
+        let shutdown_notified = state.state_notify.notified();
+        tokio::pin!(shutdown_notified);
+
+        // Re-check after registering
+        if !state.frontend_alive.load(Ordering::Acquire)
+            || state.state.load(Ordering::Acquire) >= STATE_CLOSING
+        {
+            break;
+        }
+
         tokio::select! {
             biased;
-            // Poll pending recvs for the first completion
-            result = poll_any_ready(&mut pending_recvs) => {
+
+            // Shutdown signal (close/drop) — exit handshake cleanly
+            () = &mut shutdown_notified => {
+                continue 'handshake; // re-evaluates loop-head checks
+            }
+
+            // Disconnect — exit handshake
+            cm_error = &mut disconnect_future => {
+                if let Some(e) = cm_error {
+                    tracing::warn!("driver: CM error during handshake: {e}");
+                    terminal_error = Some(e);
+                } else {
+                    tracing::info!("driver: peer disconnected during handshake");
+                }
+                break 'handshake;
+            }
+
+            // Drive CQ completions (always)
+            Some(cq_result) = futures_util::StreamExt::next(&mut cq_futures) => {
+                // A CQ driver exited during handshake — this is a problem
+                match cq_result {
+                    Ok(()) => terminal_error = Some(Error::DriverShutdown),
+                    Err(e) => terminal_error = Some(e),
+                }
+                break 'handshake;
+            }
+
+            // Drive HELLO send if not done
+            result = hello_send.as_mut(), if !hello_sent => {
+                let (send_result, _mr_opt) = result;
+                if let Err(e) = send_result {
+                    terminal_error = Some(e);
+                    break 'handshake;
+                }
+                hello_sent = true;
+            }
+
+            // Drive recv completions to catch peer's HELLO
+            result = poll_any_ready(&mut remaining_futures), if peer_capacity.is_none() && !remaining_futures.is_empty() => {
                 match result {
                     PollResult::Ready(idx, Ok((completion, mr))) => {
-                        pending_recvs.swap_remove(idx);
+                        remaining_futures.swap_remove(idx);
                         let byte_len = completion.byte_len() as usize;
-
-                        // Parse frame header
                         match protocol::parse_header(mr.as_slice(), byte_len) {
-                            Ok(header) => {
-                                match header.frame_type {
-                                    protocol::FRAME_DATA => {
-                                        let payload_len = header.payload_len as usize;
-                                        if recv_msg_tx.send(CompletedRecv { mr, byte_len: payload_len }).await.is_err() {
-                                            return; // recv channel closed
+                            Ok(header) if header.frame_type == protocol::FRAME_HELLO => {
+                                match protocol::parse_hello(
+                                    &mr.as_slice()[protocol::HEADER_SIZE
+                                        ..protocol::HEADER_SIZE + header.payload_len as usize],
+                                ) {
+                                    Ok(hello) => {
+                                        let peer_max = hello.max_message_size as usize;
+                                        if peer_max < buffer_size {
+                                            terminal_error = Some(Error::ProtocolViolation(format!(
+                                                "peer max_message_size {peer_max} < local buffer_size {buffer_size}; \
+                                                 sending max-size messages would overrun peer recv buffers"
+                                            )));
+                                            break 'handshake;
+                                        }
+                                        // Validate peer recv capacity: must be >0
+                                        // (zero → send() blocks forever) and must
+                                        // fit in Semaphore::MAX_PERMITS (prevents
+                                        // add_permits panic).
+                                        let peer_cap = hello.data_recv_capacity as usize;
+                                        if peer_cap == 0 {
+                                            terminal_error = Some(Error::ProtocolViolation(
+                                                "peer data_recv_capacity is 0".into(),
+                                            ));
+                                            break 'handshake;
+                                        }
+                                        if peer_cap > Semaphore::MAX_PERMITS {
+                                            terminal_error = Some(Error::ProtocolViolation(format!(
+                                                "peer data_recv_capacity {peer_cap} exceeds maximum ({max})",
+                                                max = Semaphore::MAX_PERMITS,
+                                            )));
+                                            break 'handshake;
+                                        }
+                                        peer_capacity = Some(peer_cap);
+                                        // Repost the HELLO recv buffer
+                                        let qp = shared_qp.qp().clone();
+                                        match post_recv_and_track(&qp, &recv_handle, mr) {
+                                            Ok(future) => remaining_futures.push(future),
+                                            Err(e) => {
+                                                terminal_error = Some(e);
+                                                break 'handshake;
+                                            }
                                         }
                                     }
-                                    protocol::FRAME_CREDIT => {
-                                        if let Ok(credit) = protocol::parse_credit(&mr.as_slice()[protocol::HEADER_SIZE..]) {
-                                            remote_credits.add_permits(credit.credits as usize);
-                                        }
-                                        // Repost control buffer immediately
-                                        match post_recv_and_track(&qp, &recv_handle, mr) {
-                                            Ok(future) => pending_recvs.push(future),
-                                            Err(_) => return,
-                                        }
-                                    }
-                                    protocol::FRAME_HELLO => {
-                                        tracing::warn!("recv_pump: unexpected HELLO during normal operation");
-                                        // Repost immediately
-                                        match post_recv_and_track(&qp, &recv_handle, mr) {
-                                            Ok(future) => pending_recvs.push(future),
-                                            Err(_) => return,
-                                        }
-                                    }
-                                    _ => {
-                                        tracing::warn!(frame_type = header.frame_type, "recv_pump: unknown frame type");
-                                        match post_recv_and_track(&qp, &recv_handle, mr) {
-                                            Ok(future) => pending_recvs.push(future),
-                                            Err(_) => return,
-                                        }
+                                    Err(e) => {
+                                        terminal_error = Some(e);
+                                        break 'handshake;
                                     }
                                 }
+                            }
+                            Ok(header) => {
+                                terminal_error = Some(Error::ProtocolViolation(format!(
+                                    "expected HELLO, got frame_type={}",
+                                    header.frame_type,
+                                )));
+                                break 'handshake;
                             }
                             Err(e) => {
-                                tracing::warn!("recv_pump: protocol error: {e}");
-                                // Repost the buffer and continue
-                                match post_recv_and_track(&qp, &recv_handle, mr) {
-                                    Ok(future) => pending_recvs.push(future),
-                                    Err(_) => return,
-                                }
+                                terminal_error = Some(e);
+                                break 'handshake;
                             }
                         }
                     }
-                    PollResult::Ready(idx, Err((_err, _mr))) => {
-                        pending_recvs.swap_remove(idx);
-                        tracing::debug!("recv_pump: recv completion error, shutting down");
-                        pending_recvs.clear();
-                        return;
+                    PollResult::Ready(idx, Err((err, _mr))) => {
+                        remaining_futures.swap_remove(idx);
+                        terminal_error = Some(err);
+                        break 'handshake;
                     }
                 }
             }
-            // Drain repost channel eagerly
-            mr = repost_rx.recv() => {
-                match mr {
-                    Some(mr) => {
-                        pending_credits += 1;
-                        match post_recv_and_track(&qp, &recv_handle, mr) {
-                            Ok(future) => pending_recvs.push(future),
-                            Err(_) => return,
-                        }
-                    }
-                    None => return,
-                }
+
+            // Timeout
+            () = &mut hello_timeout => {
+                terminal_error = Some(Error::ProtocolViolation("HELLO handshake timeout".into()));
+                break 'handshake;
             }
         }
+    }
+
+    // Drop hello_send to release its inflight registry slot.
+    // On failure paths where the OpFuture is still inflight, this pushes
+    // the MR to the reclaim queue so the drain barrier can reach zero.
+    drop(hello_send);
+
+    // Take ownership of all pre-posted recv futures unconditionally.
+    // On the happy path they become Phase B's pending_recvs; on every
+    // failure/early-exit path they are dropped before the Phase C drain
+    // so their inflight registry slots are released and the drain barrier
+    // can reach zero.
+    let mut pending_recvs = remaining_futures;
+
+    if handshake_ok {
+        // Initialize credits from peer capacity
+        let credits = peer_capacity.unwrap();
+        state.init_credits(credits);
+
+        // Transition to Ready (use compare_exchange to detect concurrent close)
+        let ready_ok = state
+            .state
+            .compare_exchange(
+                STATE_CREATED,
+                STATE_READY,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok();
+
+        if ready_ok {
+            state.state_notify.notify_waiters();
+
+            // ─── Phase B: Steady State (recv pump + disconnect monitor + CQ drivers) ───
+
+            // pending_recvs already holds the pre-posted recv futures
+            // (taken unconditionally above).
+            let mut pending_credits: u32 = 0;
+
+            loop {
+                // Check state: closing, frontend dropped, etc.
+                let current_state = state.state.load(Ordering::Acquire);
+                if current_state >= STATE_CLOSING {
+                    break;
+                }
+                if !state.frontend_alive.load(Ordering::Acquire) {
+                    break;
+                }
+
+                // Register shutdown interest BEFORE entering select (avoids lost wakeup)
+                let shutdown_notified = state.state_notify.notified();
+                tokio::pin!(shutdown_notified);
+
+                // Re-check after registering (close/drop may have fired between check and register)
+                let current_state = state.state.load(Ordering::Acquire);
+                if current_state >= STATE_CLOSING || !state.frontend_alive.load(Ordering::Acquire) {
+                    break;
+                }
+
+                // Flush pending credits if we have a control MR available
+                if pending_credits > 0
+                    && let Ok(mut ctrl_mr) = ctrl_send_rx.try_recv()
+                {
+                    let credits_to_send = pending_credits;
+                    let frame_len =
+                        protocol::write_credit_frame(ctrl_mr.as_mut_slice(), credits_to_send);
+                    let ctx = ctrl_send_tx.clone();
+                    match post_send_and_detach(
+                        shared_qp.qp(),
+                        &send_handle,
+                        ctrl_mr,
+                        frame_len,
+                        Box::new(move |mr| {
+                            let _ = ctx.try_send(mr);
+                        }),
+                    ) {
+                        Ok(()) => {
+                            pending_credits = 0;
+                        }
+                        Err(e) => {
+                            tracing::warn!("driver: CREDIT post failed: {e}");
+                            if !matches!(e, Error::CapacityExhausted) {
+                                terminal_error = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if pending_recvs.is_empty() {
+                    // All buffers are out — wait for repost, ctrl MR, CQ, or shutdown
+                    tokio::select! {
+                        biased;
+
+                        // Shutdown signal (close/drop)
+                        () = &mut shutdown_notified => {
+                            continue; // re-evaluates loop-head checks
+                        }
+
+                        // CQ driver exit
+                        Some(cq_result) = futures_util::StreamExt::next(&mut cq_futures) => {
+                            if let Err(e) = cq_result {
+                                tracing::warn!("driver: CQ driver error: {e}");
+                                terminal_error = Some(e);
+                            }
+                            break;
+                        }
+
+                        // Disconnect
+                        cm_error = &mut disconnect_future => {
+                            if let Some(e) = cm_error {
+                                tracing::warn!("driver: CM error: {e}");
+                                terminal_error = Some(e);
+                            } else {
+                                tracing::info!("driver: peer disconnected");
+                            }
+                            break;
+                        }
+
+                        mr = repost_rx.recv() => {
+                            match mr {
+                                Some(mr) => {
+                                    pending_credits += 1;
+                                    match post_recv_and_track(shared_qp.qp(), &recv_handle, mr) {
+                                        Ok(future) => pending_recvs.push(future),
+                                        Err(e) => {
+                                            terminal_error = Some(e);
+                                            break;
+                                        }
+                                    }
+                                }
+                                None => break, // frontend dropped repost sender
+                            }
+                            continue;
+                        }
+
+                        ctrl_mr = ctrl_send_rx.recv(), if pending_credits > 0 => {
+                            if let Some(mut ctrl_mr) = ctrl_mr {
+                                let credits_to_send = pending_credits;
+                                let frame_len = protocol::write_credit_frame(ctrl_mr.as_mut_slice(), credits_to_send);
+                                let ctx = ctrl_send_tx.clone();
+                                match post_send_and_detach(shared_qp.qp(), &send_handle, ctrl_mr, frame_len, Box::new(move |mr| { let _ = ctx.try_send(mr); })) {
+                                    Ok(()) => {
+                                        pending_credits = 0;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("driver: CREDIT post failed: {e}");
+                                        if !matches!(e, Error::CapacityExhausted) {
+                                            terminal_error = Some(e);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                } else {
+                    // Normal operation: poll recv completions, reposts, CQ, disconnect
+                    tokio::select! {
+                        biased;
+
+                        // Shutdown signal (close/drop)
+                        () = &mut shutdown_notified => {
+                            continue; // re-evaluates loop-head checks
+                        }
+
+                        // CQ driver exit
+                        Some(cq_result) = futures_util::StreamExt::next(&mut cq_futures) => {
+                            if let Err(e) = cq_result {
+                                tracing::warn!("driver: CQ driver error: {e}");
+                                terminal_error = Some(e);
+                            }
+                            break;
+                        }
+
+                        // Disconnect
+                        cm_error = &mut disconnect_future => {
+                            if let Some(e) = cm_error {
+                                tracing::warn!("driver: CM error: {e}");
+                                terminal_error = Some(e);
+                            } else {
+                                tracing::info!("driver: peer disconnected");
+                            }
+                            break;
+                        }
+
+                        // Recv completion
+                        result = poll_any_ready(&mut pending_recvs) => {
+                            match result {
+                                PollResult::Ready(idx, Ok((completion, mr))) => {
+                                    pending_recvs.swap_remove(idx);
+                                    let byte_len = completion.byte_len() as usize;
+
+                                    match protocol::parse_header(mr.as_slice(), byte_len) {
+                                        Ok(header) => {
+                                            match header.frame_type {
+                                                protocol::FRAME_DATA => {
+                                                    let payload_len = header.payload_len as usize;
+                                                    if recv_msg_tx.send(CompletedRecv { mr, byte_len: payload_len }).await.is_err() {
+                                                        break; // recv channel closed
+                                                    }
+                                                }
+                                                protocol::FRAME_CREDIT => {
+                                                    match protocol::parse_credit(
+                                                        &mr.as_slice()[protocol::HEADER_SIZE
+                                                            ..protocol::HEADER_SIZE + header.payload_len as usize],
+                                                    ) {
+                                                        Ok(credit) => {
+                                                            if let Err(e) = state.validate_and_add_credits(credit.credits) {
+                                                                tracing::warn!("driver: credit validation failed: {e}");
+                                                                terminal_error = Some(e);
+                                                                break;
+                                                            }
+                                                            match post_recv_and_track(shared_qp.qp(), &recv_handle, mr) {
+                                                                Ok(future) => pending_recvs.push(future),
+                                                                Err(e) => {
+                                                                    terminal_error = Some(e);
+                                                                    break;
+                                                                }
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::warn!("driver: malformed CREDIT frame: {e}");
+                                                            terminal_error = Some(e);
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                protocol::FRAME_HELLO => {
+                                                    // Unexpected HELLO after handshake is a protocol violation
+                                                    terminal_error = Some(Error::ProtocolViolation(
+                                                        "unexpected HELLO frame during steady-state operation".into(),
+                                                    ));
+                                                    break;
+                                                }
+                                                _ => {
+                                                    tracing::warn!(frame_type = header.frame_type, "driver: unknown frame type");
+                                                    match post_recv_and_track(shared_qp.qp(), &recv_handle, mr) {
+                                                        Ok(future) => pending_recvs.push(future),
+                                                        Err(e) => {
+                                                            terminal_error = Some(e);
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("driver: protocol parse error: {e}");
+                                            terminal_error = Some(e);
+                                            break;
+                                        }
+                                    }
+                                }
+                                PollResult::Ready(idx, Err((err, _mr))) => {
+                                    pending_recvs.swap_remove(idx);
+                                    // WrFlushErr during shutdown/disconnect is expected,
+                                    // not a driver error (same mapping as send()).
+                                    match &err {
+                                        Error::CompletionError { status, .. }
+                                            if *status == crate::wc::WcStatus::WrFlushErr => {
+                                            tracing::debug!("driver: recv flush error during shutdown");
+                                        }
+                                        _ => {
+                                            tracing::debug!("driver: recv completion error: {err}");
+                                            terminal_error = Some(err);
+                                        }
+                                    }
+                                    pending_recvs.clear();
+                                    break;
+                                }
+                            }
+                        }
+
+                        // Drain repost channel eagerly
+                        mr = repost_rx.recv() => {
+                            match mr {
+                                Some(mr) => {
+                                    pending_credits += 1;
+                                    match post_recv_and_track(shared_qp.qp(), &recv_handle, mr) {
+                                        Ok(future) => pending_recvs.push(future),
+                                        Err(e) => {
+                                            terminal_error = Some(e);
+                                            break;
+                                        }
+                                    }
+                                }
+                                None => break,
+                            }
+                        }
+                    }
+                }
+            }
+        } // end else (state compare_exchange ok → Phase B ran)
+    } // end if (handshake_ok → tried Phase B)
+
+    // ─── Phase C: Shutdown ───
+
+    // Close credits first to unblock any waiting frontend operations
+    state.remote_credits.close();
+
+    // Initiate QP shutdown — transitions QP to error state, causing the HCA
+    // to generate flush CQEs for all outstanding WRs.
+    if let Err(e) = shared_qp.shutdown() {
+        tracing::warn!("driver: QP shutdown failed during Phase C: {e}");
+    }
+
+    // Signal CQ drivers to enter their final drain barrier. We use
+    // shutdown() (not close_and_shutdown) to let real flush CQEs arrive
+    // from the hardware rather than writing synthetic completions.
+    // This preserves the teardown invariant: an MR may only be returned
+    // after its real CQE is reaped or the QP is destroyed.
+    for h in &driver_handles {
+        h.shutdown();
+    }
+
+    // Drop pending recv OpFutures — pushes their MRs to the reclaim queue
+    // for safe cleanup during the CQ drain barrier.
+    drop(pending_recvs);
+    drop(recv_msg_tx);
+
+    // Let CQ drivers drain their final barrier (processes real flush CQEs).
+    let drain_timeout = tokio::time::sleep(DRAIN_TIMEOUT);
+    tokio::pin!(drain_timeout);
+    while !cq_futures.is_empty() {
+        tokio::select! {
+            biased;
+            Some(_) = futures_util::StreamExt::next(&mut cq_futures) => {}
+            () = &mut drain_timeout => {
+                tracing::warn!("driver: CQ drain timed out — quarantining remaining MRs");
+                break;
+            }
+        }
+    }
+
+    // Close inflight maps to wake any remaining OpFuture waiters. They
+    // will quarantine their MRs (push to reclaim queue), which are freed
+    // only after QP destruction per ConnectionLifetime field ordering.
+    //
+    // Close unconditionally: even on clean drain exit, the CQ drivers have
+    // stopped and no further real CQEs can arrive. Any remaining occupied
+    // slots (e.g., from hello_send on failure paths) must be closed so
+    // their waiters don't hang.
+    for h in &driver_handles {
+        h.map().close();
+    }
+
+    // Now transition to terminal state and notify waiters
+    // (AFTER drain is complete, so close().await means drain is done)
+    if let Some(ref err) = terminal_error {
+        // Store the error for frontend inspection before transitioning state
+        state.store_error(err);
+        let current = state.state.load(Ordering::Acquire);
+        if current != STATE_FAILED {
+            state.state.store(STATE_FAILED, Ordering::Release);
+        }
+    } else {
+        let current = state.state.load(Ordering::Acquire);
+        if current != STATE_FAILED {
+            state.state.store(STATE_STOPPED, Ordering::Release);
+        }
+    }
+    state.state_notify.notify_waiters();
+
+    // Connection lifetime lease (conn_lifetime) is dropped when this
+    // function returns. Combined with the frontend's lease via
+    // TransportSharedState, the last holder's drop runs
+    // ConnectionLifetime's destructor in safe order:
+    // SharedQp (QP destroy) → Pd → CmId → EventChannel.
+
+    if let Some(err) = terminal_error {
+        Err(err)
+    } else {
+        Ok(())
     }
 }
 
@@ -1030,7 +1833,7 @@ enum PollResult {
     /// Future at index completed with the given result.
     Ready(
         usize,
-        std::result::Result<(super::op::Completion, Mr), (Error, Mr)>,
+        std::result::Result<(super::op::Completion, Mr), (Error, Option<Mr>)>,
     ),
 }
 
@@ -1048,7 +1851,10 @@ async fn poll_any_ready(pending: &mut [OpFuture]) -> PollResult {
             let pinned = Pin::new(fut);
             if let Poll::Ready((result, mr)) = pinned.poll(cx) {
                 let mapped = match result {
-                    Ok(completion) => Ok((completion, mr)),
+                    Ok(completion) => {
+                        // Real CQE: mr is always Some
+                        Ok((completion, mr.expect("real CQE must return MR")))
+                    }
                     Err(e) => Err((e, mr)),
                 };
                 return Poll::Ready(PollResult::Ready(i, mapped));
@@ -1067,7 +1873,13 @@ fn post_recv_and_track(
 ) -> Result<OpFuture> {
     let len = mr.len();
 
-    let reg = handle.map().register().ok_or(Error::CapacityExhausted)?;
+    let reg = handle.map().register().ok_or_else(|| {
+        if handle.map().is_closed() {
+            Error::DriverShutdown
+        } else {
+            Error::CapacityExhausted
+        }
+    })?;
     let token = reg.token;
 
     let addr = mr.addr();
@@ -1094,7 +1906,14 @@ fn post_send_and_detach(
     frame_len: usize,
     on_reclaim: Box<dyn FnOnce(Mr) + Send>,
 ) -> Result<()> {
-    let reg = handle.map().register().ok_or(Error::CapacityExhausted)?;
+    let reg = match handle.map().register() {
+        Some(r) => r,
+        None => {
+            // Return MR to pool via callback on registry exhaustion
+            on_reclaim(mr);
+            return Err(Error::CapacityExhausted);
+        }
+    };
     let token = reg.token;
 
     let addr = mr.addr();
@@ -1119,6 +1938,127 @@ fn post_send_and_detach(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Credit Validation Unit Tests ──────────────────────────────────
+    //
+    // All credit tests exercise the production `check_credit_return()`
+    // function directly. No duplicate logic.
+
+    #[test]
+    fn test_credit_exact_capacity_return() {
+        // Capacity 4, all 4 in flight, available=0 → return all 4.
+        assert!(check_credit_return(4, 4, 0, 4).is_ok());
+    }
+
+    #[test]
+    fn test_credit_partial_return() {
+        // Capacity 4, 3 in flight, available=1 → return 2.
+        assert!(check_credit_return(2, 3, 1, 4).is_ok());
+    }
+
+    #[test]
+    fn test_credit_duplicate_return_rejected() {
+        // Capacity 4, 0 in flight, available=4 → return 1 → exceeds in_flight.
+        let err = check_credit_return(1, 0, 4, 4).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds in-flight"),
+            "expected in-flight error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_credit_overflow_large_count() {
+        // Capacity 4, 0 in flight, available=4 → return 100 → exceeds.
+        let err = check_credit_return(100, 0, 4, 4).unwrap_err();
+        assert!(err.to_string().contains("exceeds in-flight"));
+    }
+
+    #[test]
+    fn test_credit_overflow_u32_max() {
+        // Capacity 4, 4 in flight, available=0 → return u32::MAX → exceeds.
+        let err = check_credit_return(u32::MAX, 4, 0, 4).unwrap_err();
+        assert!(err.to_string().contains("exceeds in-flight"));
+    }
+
+    #[test]
+    fn test_credit_zero_count_rejected() {
+        let err = check_credit_return(0, 4, 0, 4).unwrap_err();
+        assert!(
+            err.to_string().contains("zero credits"),
+            "expected zero-credits error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_credit_boundary_exactly_at_cap() {
+        // available=3, in_flight=1, capacity=4 → return 1 → exactly at cap.
+        assert!(check_credit_return(1, 1, 3, 4).is_ok());
+        // Then: available=4, in_flight=0 → return 1 → exceeds.
+        let err = check_credit_return(1, 0, 4, 4).unwrap_err();
+        assert!(err.to_string().contains("exceeds in-flight"));
+    }
+
+    #[test]
+    fn test_credit_multiple_partial_returns() {
+        // Capacity 8, 6 in flight, available=2.
+        // Return 2: ok. Remaining: in_flight=4, available=4.
+        assert!(check_credit_return(2, 6, 2, 8).is_ok());
+        // Return 2: ok. Remaining: in_flight=2, available=6.
+        assert!(check_credit_return(2, 4, 4, 8).is_ok());
+        // Return 2: ok. Remaining: in_flight=0, available=8.
+        assert!(check_credit_return(2, 2, 6, 8).is_ok());
+        // Return 1: exceeds in_flight=0.
+        let err = check_credit_return(1, 0, 8, 8).unwrap_err();
+        assert!(err.to_string().contains("exceeds in-flight"));
+    }
+
+    #[test]
+    fn test_credit_in_flight_check_catches_toctou() {
+        // Scenario: capacity=4, available=3 (1 acquired but NOT forgotten).
+        // A bogus CREDIT(1) would pass the old capacity-only check (3+1=4),
+        // but the in-flight check catches it: 0 in flight, can't return 1.
+        let err = check_credit_return(1, 0, 3, 4).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds in-flight"),
+            "in-flight check should catch bogus credit during acquire window"
+        );
+    }
+
+    #[test]
+    fn test_credit_capacity_check_catches_overflow() {
+        // available=usize::MAX-1, in_flight=usize::MAX, capacity=4 → return 2.
+        // In-flight check passes (2 <= usize::MAX), but capacity check catches
+        // the overflow via saturating_add.
+        let err = check_credit_return(2, usize::MAX, usize::MAX - 1, 4).unwrap_err();
+        assert!(
+            err.to_string().contains("exceed negotiated capacity"),
+            "capacity check should catch arithmetic overflow"
+        );
+    }
+
+    #[test]
+    fn test_credit_error_is_protocol_violation() {
+        use crate::v2::error::TransportErrorKind;
+        let err = check_credit_return(0, 4, 0, 4).unwrap_err();
+        let te = TransportError::from_error(&err);
+        assert_eq!(*te.kind(), TransportErrorKind::ProtocolViolation);
+
+        let err = check_credit_return(10, 0, 4, 4).unwrap_err();
+        let te = TransportError::from_error(&err);
+        assert_eq!(*te.kind(), TransportErrorKind::ProtocolViolation);
+    }
+
+    #[test]
+    fn test_credit_in_flight_valid_range() {
+        // in_flight exactly matches credits → ok.
+        assert!(check_credit_return(3, 3, 1, 4).is_ok());
+        // in_flight exceeds credits → ok (partial return).
+        assert!(check_credit_return(1, 3, 1, 4).is_ok());
+        // credits exceeds in_flight → error.
+        assert!(check_credit_return(4, 3, 0, 4).is_err());
+    }
+
+    // ── Builder Tests ─────────────────────────────────────────────────
 
     #[test]
     fn test_builder_defaults() {

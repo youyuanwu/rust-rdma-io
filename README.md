@@ -142,10 +142,12 @@ let mut mr = sqp.pd().reg_mr(1024, AccessIntent::LocalOnly)?;
 mr.as_mut_slice()[..5].copy_from_slice(b"hello");
 let (result, mr) = sqp.send(mr, None).await;
 result?;
+let mr = mr.expect("real CQE should return MR");
 
 // One-sided RDMA Write
 let (result, mr) = sqp.write(mr, remote_mr, None).await;
 result?;
+let _mr = mr.expect("real CQE should return MR");
 ```
 
 Also provides lower-level APIs: `Op` enum for typed submission, `CqPoller` for
@@ -157,53 +159,67 @@ async CQ draining. See the `rdma_io::v2` module docs for the full API reference.
 The v2 message transport provides a builder-driven, message-oriented Send/Recv
 transport on top of `SharedQp` with pre-registered buffer pools, message
 boundaries, credit-based flow control, deterministic disconnect handling,
-and cancellation-safe operations:
+and cancellation-safe operations.
+
+Construction returns a `(MessageTransport, MessageTransportDriver)` pair. The
+caller explicitly spawns the driver future — exactly one task per endpoint:
 
 ```rust
 use rdma_io::v2::*;
 use rdma_io::v2::message_transport::MessageTransportBuilder;
 
-// Server: accept a connection with builder configuration
+// Server
 let listener = rdma_io::async_cm::AsyncCmListener::bind(&"0.0.0.0:7471".parse().unwrap())?;
-let server = MessageTransportBuilder::new()
+let (server, server_driver) = MessageTransportBuilder::new()
     .recv_buffers(32)
     .send_buffers(16)
     .buffer_size(64 * 1024)
     .completion_mode(CompletionMode::Readiness)
     .accept(&listener)
     .await?;
+let server_task = tokio::spawn(server_driver);
 
-// Client: connect to remote endpoint
-let client = MessageTransportBuilder::new()
+// Client
+let (client, client_driver) = MessageTransportBuilder::new()
     .recv_buffers(32)
     .send_buffers(16)
     .buffer_size(64 * 1024)
     .connect("10.0.0.1:7471".parse().unwrap())
     .await?;
+let client_task = tokio::spawn(client_driver);
 
-// Send/recv with message boundaries preserved
+// Wait for readiness (HELLO handshake), then send/recv
+client.ready().await?;
 client.send(b"hello rdma transport").await?;
 let msg = server.recv().await?;
 assert_eq!(msg.as_ref(), b"hello rdma transport");
-assert_eq!(msg.len(), 20);
-// ReceivedMessage drop returns the buffer for reposting + returns a credit
+
+// Shutdown: close frontend, then await driver
+client.close().await;
+let driver_result = client_task.await.expect("driver panicked");
+driver_result?;
 ```
 
 Key design properties:
 
+- **Explicit driver spawning**: No hidden `tokio::spawn` — the driver future
+  composes CQ driving, receive pumping, HELLO/credit protocol, CM disconnect
+  monitoring, and cancellation reclamation into one `Future + Send + 'static`.
+  One user-spawned task per endpoint in both shared and separate CQ modes.
 - **Wire protocol**: A minimal internal protocol with DATA, CREDIT, and HELLO
   frame types (12-byte header with magic/version/type/length validation)
 - **Credit-based flow control**: Each `send()` acquires one remote receive
   credit. Credits are exchanged via HELLO handshake and returned via CREDIT
   frames when `ReceivedMessage` is dropped. RNR retry is a safety net, not
   the primary flow-control mechanism.
-- **Readiness handshake**: During `connect()`/`accept()`, both peers exchange
-  HELLO frames carrying data receive capacity and max message size. The
-  transport is not returned until both sides are fully ready for traffic.
-- **Deterministic disconnect**: A dedicated CM event monitor (sole consumer
-  of the connection's event channel) detects peer disconnect and atomically
-  closes the transport, waking all pending `send()`/`recv()`/credit waiters
-  with `Error::TransportClosed`.
+- **Readiness handshake**: The driver performs the HELLO handshake after being
+  spawned. `ready().await` completes when both peers have exchanged HELLO
+  frames and credits are installed. `send()`/`recv()` internally await
+  readiness.
+- **Deterministic lifecycle**: Dropping the unspawned driver, aborting the
+  driver task, or driver failure all transition the frontend to a failed
+  state and wake all waiters. `close().await` signals the driver to shut
+  down and waits for completion without owning the `JoinHandle`.
 - **Pre-posted receives**: All receive buffers (data + control headroom) are
   posted before the CM handshake completes
 - **Bounded backpressure**: Both send buffer pool and credit semaphore limit

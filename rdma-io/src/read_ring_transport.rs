@@ -1,6 +1,6 @@
 //! ReadRingTransport — ring-buffer transport using RDMA Write + RDMA Read flow control.
 //!
-//! Implements the [`Transport`](crate::transport::Transport) trait using one-sided
+//! Implements the [`Transport`] trait using one-sided
 //! RDMA Write with Immediate Data and ring buffers, with RDMA Read–based flow
 //! control instead of credit push messages.
 //!
@@ -347,7 +347,7 @@ struct ReadRingInner {
 
 /// Ring-buffer RDMA transport using RDMA Read–based flow control.
 ///
-/// A thin wrapper over [`ReadRingInner`]: the RDMA/CM resources and live
+/// A thin wrapper over `ReadRingInner`: the RDMA/CM resources and live
 /// protocol state live in `inner`, held behind an `Option` so teardown can move
 /// them out (`Drop` `take()`s it). See §6.2 / §10 for the reclaim protocol.
 pub struct ReadRingTransport {

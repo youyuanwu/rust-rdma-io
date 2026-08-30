@@ -238,9 +238,9 @@ pub fn parse_header(buf: &[u8], received_len: usize) -> Result<FrameHeader> {
 /// Returns [`Error::ProtocolViolation`] if the payload is too short
 /// or the peer's protocol version does not match [`PROTO_VERSION`].
 pub fn parse_hello(payload: &[u8]) -> Result<HelloPayload> {
-    if payload.len() < HELLO_PAYLOAD_SIZE {
+    if payload.len() != HELLO_PAYLOAD_SIZE {
         return Err(Error::ProtocolViolation(format!(
-            "HELLO payload too short: {} < {HELLO_PAYLOAD_SIZE}",
+            "HELLO payload size mismatch: {} != {HELLO_PAYLOAD_SIZE}",
             payload.len()
         )));
     }
@@ -263,13 +263,17 @@ pub fn parse_hello(payload: &[u8]) -> Result<HelloPayload> {
 
 /// Parse a CREDIT payload from `payload` (bytes after the header).
 ///
+/// This performs wire-format validation only (payload length). Semantic
+/// validation (zero-credit rejection, capacity overflow) is performed by
+/// the driver's credit validation logic in `TransportSharedState`.
+///
 /// # Errors
 ///
 /// Returns [`Error::ProtocolViolation`] if the payload is too short.
 pub fn parse_credit(payload: &[u8]) -> Result<CreditPayload> {
-    if payload.len() < CREDIT_PAYLOAD_SIZE {
+    if payload.len() != CREDIT_PAYLOAD_SIZE {
         return Err(Error::ProtocolViolation(format!(
-            "CREDIT payload too short: {} < {CREDIT_PAYLOAD_SIZE}",
+            "CREDIT payload size mismatch: {} != {CREDIT_PAYLOAD_SIZE}",
             payload.len()
         )));
     }

@@ -1,6 +1,6 @@
 //! CreditRingTransport — ring-buffer transport using RDMA Write + Immediate Data.
 //!
-//! Implements the [`Transport`](crate::transport::Transport) trait using one-sided
+//! Implements the [`Transport`] trait using one-sided
 //! RDMA Write with Immediate Data and ring buffers, providing zero-copy receive
 //! for datagram workloads (e.g., QUIC via Quinn).
 //!
