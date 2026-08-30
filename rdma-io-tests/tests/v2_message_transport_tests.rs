@@ -75,14 +75,18 @@ async fn test_single_message_readiness() {
 async fn test_multiple_messages_readiness() {
     require_software_rdma!();
 
-    let (client, server) = make_transport_pair(CompletionMode::Readiness, 8, 4, 4096).await;
-    for i in 0..10u32 {
-        let msg = format!("message {i}");
-        client.send(msg.as_bytes()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (client, server) = make_transport_pair(CompletionMode::Readiness, 8, 4, 4096).await;
+        for i in 0..10u32 {
+            let msg = format!("message {i}");
+            client.send(msg.as_bytes()).await.unwrap();
 
-        let received = server.recv().await.unwrap();
-        assert_eq!(received.as_ref(), msg.as_bytes());
-    }
+            let received = server.recv().await.unwrap();
+            assert_eq!(received.as_ref(), msg.as_bytes());
+        }
+    })
+    .await
+    .expect("readiness message sequence timed out");
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]

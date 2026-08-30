@@ -690,6 +690,7 @@ impl MessageTransport {
             // credit_permit drops → credit returned
             return Err(e);
         }
+        handle.notify_work();
 
         // WR is posted. The credit is correctly consumed — forget the permit.
         credit_permit.forget();
@@ -1077,6 +1078,7 @@ fn post_recv_and_track(
         handle.map().release(token);
         return Err(e);
     }
+    handle.notify_work();
 
     Ok(OpFuture::new_inflight(handle.clone(), token, mr))
 }
@@ -1107,6 +1109,7 @@ fn post_send_and_detach(
         on_reclaim(mr);
         return Err(e);
     }
+    handle.notify_work();
 
     // Detach — driver will reclaim when CQE arrives
     handle.push_detached(token, mr, Some(on_reclaim));

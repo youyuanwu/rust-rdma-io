@@ -367,6 +367,7 @@ impl Future for OpFuture {
                         handle.map().release(token);
                         return Poll::Ready((Err(e), mr));
                     }
+                    handle.notify_work();
 
                     // Move to inflight state
                     this.state = OpState::Inflight { handle, token, mr };

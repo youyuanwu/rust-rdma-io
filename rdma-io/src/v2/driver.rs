@@ -32,6 +32,13 @@ const RECLAIM_MAX_TURNS: usize = 4096;
 /// Maximum iterations for the final drain barrier after shutdown.
 const DRAIN_BARRIER_BUDGET: usize = 4096;
 
+/// Recovery interval while a readiness driver has operations in flight.
+///
+/// Completion-channel notification is still the primary wake source. The
+/// bounded poll prevents a missed provider notification from parking an
+/// operation forever.
+const READINESS_POLL_FALLBACK: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// A detached in-flight operation awaiting reclamation.
 pub(crate) struct DetachedOp {
     /// The registry token for this operation.
@@ -61,6 +68,9 @@ pub struct CqDriverHandle {
     pub(crate) shutdown_notify: tokio::sync::Notify,
     #[cfg(feature = "tokio")]
     pub(crate) reclaim_notify: tokio::sync::Notify,
+    /// Coalesced notification that a new WR was posted.
+    #[cfg(feature = "tokio")]
+    work_notify: tokio::sync::Notify,
 }
 
 impl CqDriverHandle {
@@ -74,7 +84,15 @@ impl CqDriverHandle {
             shutdown_notify: tokio::sync::Notify::new(),
             #[cfg(feature = "tokio")]
             reclaim_notify: tokio::sync::Notify::new(),
+            #[cfg(feature = "tokio")]
+            work_notify: tokio::sync::Notify::new(),
         }
+    }
+
+    /// Wake the readiness driver after posting a work request.
+    pub(crate) fn notify_work(&self) {
+        #[cfg(feature = "tokio")]
+        self.work_notify.notify_one();
     }
 
     /// Signal the driver to shut down and wake any blocked driver loop.
@@ -269,6 +287,9 @@ impl FdCqDriver {
             if n > 0 {
                 self.dispatch(&wc_buf[..n]);
                 self.handle.drain_reclaimed();
+                if let Some(ch) = self.cq.channel() {
+                    drain_channel(ch, self.cq.inner().as_raw());
+                }
                 continue;
             }
 
@@ -286,6 +307,12 @@ impl FdCqDriver {
                     self.handle.drain_reclaimed();
                     continue;
                 }
+                _ = self.handle.work_notify.notified() => {
+                    // A WR was posted while the driver was parked. Re-poll now;
+                    // if it is not complete yet, the in-flight fallback below
+                    // prevents a missed provider event from parking forever.
+                    continue;
+                }
                 result = notifier.readable() => {
                     if let Err(e) = result {
                         if self.handle.is_shutdown() {
@@ -293,6 +320,11 @@ impl FdCqDriver {
                         }
                         return Err(super::error::Error::Verbs(e));
                     }
+                }
+                _ = tokio::time::sleep(READINESS_POLL_FALLBACK),
+                    if self.handle.map.inflight_count() > 0 =>
+                {
+                    continue;
                 }
             }
 
