@@ -1043,22 +1043,20 @@ async fn driver_run(
         }
 
         // Flush pending credits if we have a control MR available
-        if pending_credits > 0 {
-            if let Ok(mut ctrl_mr) = ctrl_send_rx.try_recv() {
-                let credits_to_send = pending_credits;
-                pending_credits = 0;
-                let frame_len = protocol::write_credit_frame(ctrl_mr.as_mut_slice(), credits_to_send);
-                let ctx = ctrl_send_tx.clone();
-                let _ = post_send_and_detach(
-                    shared_qp.qp(),
-                    &send_handle,
-                    ctrl_mr,
-                    frame_len,
-                    Box::new(move |mr| {
-                        let _ = ctx.try_send(mr);
-                    }),
-                );
-            }
+        if pending_credits > 0 && let Ok(mut ctrl_mr) = ctrl_send_rx.try_recv() {
+            let credits_to_send = pending_credits;
+            pending_credits = 0;
+            let frame_len = protocol::write_credit_frame(ctrl_mr.as_mut_slice(), credits_to_send);
+            let ctx = ctrl_send_tx.clone();
+            let _ = post_send_and_detach(
+                shared_qp.qp(),
+                &send_handle,
+                ctrl_mr,
+                frame_len,
+                Box::new(move |mr| {
+                    let _ = ctx.try_send(mr);
+                }),
+            );
         }
 
         if pending_recvs.is_empty() {

@@ -10,6 +10,9 @@ use std::os::unix::io::RawFd;
 use std::pin::Pin;
 use std::sync::Arc;
 
+/// Boxed CQ driver future — ready to be polled but NOT spawned.
+pub(crate) type BoxedCqDriverFuture = Pin<Box<dyn Future<Output = super::error::Result<()>> + Send>>;
+
 use tokio::io::unix::AsyncFd;
 
 use crate::async_cm::{AsyncCmId, AsyncCmListener};
@@ -104,8 +107,7 @@ pub(crate) struct ConnectionParts {
     pub(crate) shared_qp: SharedQp,
     pub(crate) driver_handles: Vec<Arc<CqDriverHandle>>,
     /// Boxed CQ driver futures ready to be polled. NOT spawned.
-    pub(crate) driver_futures:
-        Vec<Pin<Box<dyn Future<Output = super::error::Result<()>> + Send>>>,
+    pub(crate) driver_futures: Vec<BoxedCqDriverFuture>,
     pub(crate) resources: ConnectionResources,
     pub(crate) cm_monitor_handle: Option<CmMonitorHandle>,
 }
@@ -409,10 +411,7 @@ impl ConnectionBuilder {
         &self,
         cq: super::cq::Cq,
         inflight_capacity: usize,
-    ) -> (
-        Arc<CqDriverHandle>,
-        Pin<Box<dyn Future<Output = super::error::Result<()>> + Send>>,
-    ) {
+    ) -> (Arc<CqDriverHandle>, BoxedCqDriverFuture) {
         match self.config.completion_mode {
             CompletionMode::Readiness => {
                 let (driver, handle) = FdCqDriver::new(cq, inflight_capacity);
