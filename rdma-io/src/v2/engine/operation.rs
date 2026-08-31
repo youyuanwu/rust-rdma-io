@@ -2044,6 +2044,7 @@ mod tests {
         assert_eq!(shared.operations.live(), 1);
         assert_eq!(shared.cq_credits.free(), 7);
         assert_eq!(shared.cq_credits.retained(), 1);
+        assert_eq!(shared.pending_reclamations.load(Ordering::Acquire), 0);
         assert_eq!(shared.quarantined_operations.load(Ordering::Acquire), 1);
         assert_eq!(shared.quarantined_mrs.load(Ordering::Acquire), 1);
         assert_eq!(shared.quarantined_bytes.load(Ordering::Acquire), 1);
@@ -2060,7 +2061,9 @@ mod tests {
         assert_eq!(shared.operations.live(), 0);
         assert_eq!(shared.cq_credits.free(), 8);
         assert_eq!(shared.cq_credits.retained(), 0);
+        assert_eq!(shared.pending_reclamations.load(Ordering::Acquire), 0);
         assert_eq!(shared.quarantined_operations.load(Ordering::Acquire), 0);
+        assert_eq!(shared.quarantined_mrs.load(Ordering::Acquire), 0);
         assert_eq!(shared.quarantined_bytes.load(Ordering::Acquire), 0);
     }
 

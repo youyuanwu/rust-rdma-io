@@ -308,7 +308,6 @@ struct EngineShared {
     config: EngineConfig,
     resources: ResourceSummary,
     provider: Option<config::ProviderLimits>,
-    resource_refs: Option<EngineResourceRefs>,
     connection_admission: Arc<ConnectionAdmissionPool>,
     connections: ConnectionRegistry,
     operations: OperationRegistry,
@@ -341,6 +340,10 @@ struct EngineShared {
     test_resources: Option<resources::TestResourceRefs>,
     #[cfg(any(test, feature = "test-hooks"))]
     test_driver: driver::test_api::TestDriverState,
+    // Rust drops fields in declaration order. Keep this root retain after every
+    // registry/test owner so quarantined QP/CM/MR descendants are released
+    // before the shared CQ, PD, CM event channel, and context can disappear.
+    resource_refs: Option<EngineResourceRefs>,
 }
 
 impl EngineShared {
@@ -359,7 +362,6 @@ impl EngineShared {
             config,
             resources,
             provider,
-            resource_refs,
             connection_admission,
             connections,
             operations,
@@ -390,6 +392,7 @@ impl EngineShared {
             test_resources: None,
             #[cfg(any(test, feature = "test-hooks"))]
             test_driver: driver::test_api::TestDriverState::new(),
+            resource_refs,
         })
     }
 
@@ -438,6 +441,10 @@ impl EngineShared {
             if matches!(outcome, EngineOutcome::Failure(_)) {
                 for operation in self.operations.occupied() {
                     let terminalized = operation.finalize_terminal(&outcome);
+                    debug_assert!(
+                        !terminalized.was_reclaiming || terminalized.newly_quarantined,
+                        "terminal reclamation must transfer its retained MR and CQ debt to quarantine"
+                    );
                     if terminalized.was_reclaiming {
                         self.pending_reclamations.fetch_sub(1, Ordering::AcqRel);
                     }

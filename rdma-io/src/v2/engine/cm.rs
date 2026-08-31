@@ -231,6 +231,9 @@ impl CmState {
         resources: Option<&EngineResources>,
         budget: usize,
     ) -> Result<usize> {
+        // Snapshot each class depth at pass entry. Work requeued while it is
+        // transitioning is therefore deferred to a later driver poll instead
+        // of consuming this pass's bounded budget repeatedly.
         let mut remaining = [
             lock_unpoison(&self.cancellations).len(),
             lock_unpoison(&self.retirements).len(),
@@ -3649,7 +3652,7 @@ mod tests {
     }
 
     #[test]
-    fn a_transitioning_route_resets_the_retirement_latch_and_retries() {
+    fn transitioning_route_requeues_retirement_once_per_service_pass() {
         let (engine, driver) =
             super::super::test_engine_pair(super::super::CompletionMode::Polling);
         let request = Arc::new(test_request());

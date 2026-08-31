@@ -468,6 +468,10 @@ impl Future for RdmaEngineDriver {
             }
             self.runtime_checked = true;
         }
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(error) = self.shared.test_driver.take_injected_failure() {
+            return self.fail(EngineFailure::from_progress(error));
+        }
         self.shared.transition_running();
         self.poll_deadline_timer(cx);
 
@@ -644,7 +648,7 @@ pub(super) mod test_api {
     use crate::v2::{AccessIntent, Mr, Qp, QpBuilder, RdmaConnection, RdmaConnectionConfig};
     use crate::wc::{WcOpcode, WorkCompletion};
 
-    use super::{EngineShared, Error, READY_CONNECTION_WORK, Result};
+    use super::{EngineShared, Error, READY_CONNECTION_WORK, Result, TERMINAL_WORK};
 
     /// Test-only connection identity used by the Phase 2 routing gate.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -840,6 +844,14 @@ pub(super) mod test_api {
                 ));
             }
             connection.state.disconnect_for_test()
+        }
+
+        /// Terminate the real driver on its next poll with an exact test error.
+        pub fn inject_driver_failure(&self, error: Error) -> Result<()> {
+            let shared = self.ensure_active()?;
+            shared.test_driver.inject_failure(error)?;
+            shared.work_signal.publish(TERMINAL_WORK);
+            Ok(())
         }
 
         /// Pause the next CQ arm-to-post-poll window until released.
@@ -1247,6 +1259,7 @@ pub(super) mod test_api {
         connection_cqe_suppression: Mutex<Option<ConnectionCqeSuppressionState>>,
         released_connection_cqes: Mutex<VecDeque<WorkCompletion>>,
         connection_cqe_notify: Notify,
+        injected_failure: Mutex<Option<Error>>,
     }
 
     struct ConnectionCqeSuppressionState {
@@ -1275,7 +1288,29 @@ pub(super) mod test_api {
                 connection_cqe_suppression: Mutex::new(None),
                 released_connection_cqes: Mutex::new(VecDeque::new()),
                 connection_cqe_notify: Notify::new(),
+                injected_failure: Mutex::new(None),
             }
+        }
+
+        fn inject_failure(&self, error: Error) -> Result<()> {
+            let mut pending = self
+                .injected_failure
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if pending.is_some() {
+                return Err(Error::InvalidConfig(
+                    "a driver failure is already pending".into(),
+                ));
+            }
+            *pending = Some(error);
+            Ok(())
+        }
+
+        pub(super) fn take_injected_failure(&self) -> Option<Error> {
+            self.injected_failure
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
         }
 
         fn start_connection_cqe_suppression(
