@@ -37,6 +37,7 @@ const WORK_CLASS_COUNT: usize = 5;
 pub(super) struct WorkSignal {
     pending: std::sync::atomic::AtomicUsize,
     epoch: std::sync::atomic::AtomicU64,
+    wakeups: std::sync::atomic::AtomicU64,
     waker: futures_util::task::AtomicWaker,
 }
 
@@ -45,6 +46,7 @@ impl WorkSignal {
         Self {
             pending: std::sync::atomic::AtomicUsize::new(0),
             epoch: std::sync::atomic::AtomicU64::new(0),
+            wakeups: std::sync::atomic::AtomicU64::new(0),
             waker: futures_util::task::AtomicWaker::new(),
         }
     }
@@ -53,6 +55,8 @@ impl WorkSignal {
         self.pending
             .fetch_or(work, std::sync::atomic::Ordering::Release);
         self.epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.wakeups
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.waker.wake();
     }
 
@@ -62,6 +66,10 @@ impl WorkSignal {
 
     fn epoch(&self) -> u64 {
         self.epoch.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(super) fn wakeups(&self) -> u64 {
+        self.wakeups.load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn register_and_recheck(&self, waker: &std::task::Waker, observed_epoch: u64) -> usize {
@@ -432,16 +440,22 @@ impl RdmaEngineDriver {
             self.scheduler.enqueue_connection(connection.ready());
         }
         let Some(connection) = self.scheduler.pop_connection() else {
+            #[cfg(any(test, feature = "test-hooks"))]
+            self.shared.test_driver.record_idle_connection_visit();
             self.shared.update_ready_queue_depth(0);
             return false;
         };
-        let (_, remains_ready) = self.shared.process_connection_ready(
+        let (_processed, remains_ready) = self.shared.process_connection_ready(
             super::registry::ConnectionToken {
                 slot: connection.slot,
                 generation: connection.generation,
             },
             self.shared.config.ready_connection_quantum,
         );
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.shared
+            .test_driver
+            .record_connection_selection(_processed);
         if remains_ready {
             self.scheduler.requeue_connection(connection);
         }
@@ -497,6 +511,8 @@ impl Future for RdmaEngineDriver {
             let Some(class) = self.scheduler.next_class() else {
                 break;
             };
+            #[cfg(any(test, feature = "test-hooks"))]
+            self.shared.test_driver.record_class_selection(class);
             let result = match class {
                 WorkClass::Terminal => match self.service_terminal() {
                     Ok(true) => break,
@@ -637,12 +653,17 @@ pub(super) mod test_api {
 
     use crate::async_cm::AsyncCmId;
     use crate::cm::CmId;
-    use crate::v2::engine::connection::{VerbsConnectionResources, install_connection};
+    use crate::v2::engine::connection::{
+        VerbsConnectionResources, WorkRequestPoster, install_connection,
+    };
     use crate::v2::engine::resources::TestResourceRefs;
+    use crate::v2::qp::{BatchPostOutcome, QpCapabilities};
     use crate::v2::{AccessIntent, Mr, Qp, QpBuilder, RdmaConnection, RdmaConnectionConfig};
     use crate::wc::{WcOpcode, WorkCompletion};
+    use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
 
     use super::{EngineShared, Error, READY_CONNECTION_WORK, Result, TERMINAL_WORK};
+    use crate::v2::engine::registry::Lookup;
 
     /// Test-only connection identity used by the Phase 2 routing gate.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -668,11 +689,36 @@ pub(super) mod test_api {
         }
     }
 
-    /// Safe test-only lease for the engine's exact context, PD, and shared CQ.
+    /// Identity of one real CQE held by deterministic test instrumentation.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct TestCompletionIdentity {
+        pub wr_id: u64,
+        pub qp_num: u32,
+        pub opcode: WcOpcode,
+    }
+
+    /// Bounded-work and direct-routing instrumentation for integration tests.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct TestEngineInstrumentation {
+        /// Terminal, CM, CQ, reclamation, and ready-connection selections.
+        pub work_class_selections: [u64; 5],
+        pub connection_selections: u64,
+        pub connection_quantum_work: u64,
+        pub maximum_connection_quantum_work: u64,
+        pub idle_connection_visits: u64,
+        pub connection_registry_probes: u64,
+        pub operation_registry_probes: u64,
+        pub operations_posted: u64,
+        pub cqes_routed: u64,
+        pub cqes_rejected: u64,
+        pub driver_wakeups: u64,
+        pub driver_yields: u64,
+    }
+
+    /// Safe test-only lease for shared resources and bounded driver fixtures.
     ///
-    /// The lease exposes only MR registration and verified QP construction. It
-    /// does not expose raw pointers, file descriptors, CQ polling, or mutable
-    /// production engine state.
+    /// The lease exposes no raw pointers, file descriptors, or CQ consumer. Its
+    /// mutation surface is compiled only for deterministic engine validation.
     #[doc(hidden)]
     #[derive(Clone)]
     pub struct TestEngineResources {
@@ -742,6 +788,52 @@ pub(super) mod test_api {
     #[doc(hidden)]
     pub struct TestEngineQp {
         qp: Qp,
+    }
+
+    struct TestIdlePoster {
+        qp_num: u32,
+    }
+
+    impl WorkRequestPoster for TestIdlePoster {
+        fn qp_num(&self) -> u32 {
+            self.qp_num
+        }
+
+        fn capabilities(&self) -> Option<QpCapabilities> {
+            None
+        }
+
+        fn post_send(&self, _batch: &mut PreparedSendBatch) -> BatchPostOutcome {
+            unreachable!("idle registry fixtures never post")
+        }
+
+        fn post_recv(&self, _batch: &mut PreparedRecvBatch) -> BatchPostOutcome {
+            unreachable!("idle registry fixtures never post")
+        }
+
+        fn to_error(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn destroy_qp(&self) -> bool {
+            true
+        }
+
+        fn disconnect(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn raw_wc_opcode(opcode: WcOpcode) -> Result<u32> {
+        match opcode {
+            WcOpcode::Send => Ok(rdma_io_sys::ibverbs::IBV_WC_SEND),
+            WcOpcode::RdmaWrite => Ok(rdma_io_sys::ibverbs::IBV_WC_RDMA_WRITE),
+            WcOpcode::RdmaRead => Ok(rdma_io_sys::ibverbs::IBV_WC_RDMA_READ),
+            WcOpcode::Recv => Ok(rdma_io_sys::ibverbs::IBV_WC_RECV),
+            _ => Err(Error::InvalidConfig(
+                "test completion opcode is not supported".into(),
+            )),
+        }
     }
 
     impl TestEngineResources {
@@ -905,6 +997,23 @@ pub(super) mod test_api {
             &self,
             connection: &RdmaConnection,
         ) -> Result<TestConnectionCqeSuppression> {
+            self.suppress_next_connection_cqe_matching(connection, None)
+        }
+
+        /// Hold the next real CQE with the requested opcode for `connection`.
+        pub fn suppress_next_connection_cqe_with_opcode(
+            &self,
+            connection: &RdmaConnection,
+            opcode: WcOpcode,
+        ) -> Result<TestConnectionCqeSuppression> {
+            self.suppress_next_connection_cqe_matching(connection, Some(opcode))
+        }
+
+        fn suppress_next_connection_cqe_matching(
+            &self,
+            connection: &RdmaConnection,
+            expected_opcode: Option<WcOpcode>,
+        ) -> Result<TestConnectionCqeSuppression> {
             let shared = self.ensure_active()?;
             if !Arc::ptr_eq(&shared, &connection.shared) {
                 return Err(Error::InvalidConfig(
@@ -914,6 +1023,7 @@ pub(super) mod test_api {
             shared.test_driver.start_connection_cqe_suppression(
                 connection.state.token,
                 connection.identity().qp_num,
+                expected_opcode,
             )?;
             Ok(TestConnectionCqeSuppression {
                 shared: Arc::downgrade(&shared),
@@ -931,6 +1041,48 @@ pub(super) mod test_api {
                 shared: Arc::downgrade(&shared),
                 active: true,
             })
+        }
+
+        /// Snapshot bounded-work and direct-routing instrumentation.
+        pub fn instrumentation(&self) -> Result<TestEngineInstrumentation> {
+            let shared = self.ensure_not_terminal()?;
+            Ok(shared.test_driver.instrumentation(&shared))
+        }
+
+        /// Install registry-level idle fixtures without allocating provider QPs.
+        pub fn install_idle_connections(&self, count: usize) -> Result<Vec<RdmaConnection>> {
+            let shared = self.ensure_active()?;
+            let mut connections = Vec::new();
+            connections
+                .try_reserve_exact(count)
+                .map_err(|_| Error::CapacityExhausted)?;
+            for _ in 0..count {
+                let qp_num = shared.test_driver.next_idle_qp()?;
+                connections.push(install_connection(
+                    &shared,
+                    Arc::new(TestIdlePoster { qp_num }),
+                    RdmaConnectionConfig::default(),
+                    None,
+                    None,
+                )?);
+            }
+            Ok(connections)
+        }
+
+        /// Inject a synthetic CQE through the production exact router.
+        pub fn inject_completion(&self, wr_id: u64, qp_num: u32, opcode: WcOpcode) -> Result<()> {
+            let shared = self.ensure_active()?;
+            let mut completion = WorkCompletion::default();
+            completion.inner.wr_id = wr_id;
+            completion.inner.qp_num = qp_num;
+            completion.inner.status = rdma_io_sys::ibverbs::IBV_WC_SUCCESS;
+            completion.inner.opcode = raw_wc_opcode(opcode)?;
+            if let Some(token) = shared.enqueue_completion(completion)
+                && let Lookup::Occupied(connection) = shared.connections.lookup(token)
+            {
+                shared.publish_connection_ready(&connection);
+            }
+            Ok(())
         }
 
         fn pause_next_admission(&self, point: AdmissionPausePoint) -> Result<TestAdmissionBarrier> {
@@ -1078,6 +1230,14 @@ pub(super) mod test_api {
                 }
                 notified.await;
             }
+        }
+
+        /// Return the exact identity of the held real CQE.
+        pub fn completion_identity(&self) -> Result<TestCompletionIdentity> {
+            let shared = self.shared.upgrade().ok_or(Error::DriverShutdown)?;
+            shared
+                .test_driver
+                .connection_cqe_identity(self.connection, self.qp_num)
         }
 
         /// Release the held real CQE through normal exact production routing.
@@ -1283,6 +1443,7 @@ pub(super) mod test_api {
     pub(in crate::v2::engine) struct TestDriverState {
         routes: Mutex<HashMap<u32, Arc<TestRouteState>>>,
         next_slot: AtomicU32,
+        next_idle_qp: AtomicU32,
         cq_arms: AtomicU64,
         cq_arm_controller_active: AtomicBool,
         cq_pre_arm_controlled: AtomicBool,
@@ -1296,11 +1457,17 @@ pub(super) mod test_api {
         connection_cqe_notify: Notify,
         injected_failure: Mutex<Option<Error>>,
         ready_work_paused: AtomicBool,
+        work_class_selections: [AtomicU64; 5],
+        connection_selections: AtomicU64,
+        connection_quantum_work: AtomicU64,
+        maximum_connection_quantum_work: AtomicU64,
+        idle_connection_visits: AtomicU64,
     }
 
     struct ConnectionCqeSuppressionState {
         connection: super::super::registry::ConnectionToken,
         qp_num: u32,
+        expected_opcode: Option<WcOpcode>,
         completion: Option<WorkCompletion>,
         abandoned: bool,
     }
@@ -1310,6 +1477,7 @@ pub(super) mod test_api {
             Self {
                 routes: Mutex::new(HashMap::new()),
                 next_slot: AtomicU32::new(0),
+                next_idle_qp: AtomicU32::new(0x7000_0000),
                 cq_arms: AtomicU64::new(0),
                 cq_arm_controller_active: AtomicBool::new(false),
                 cq_pre_arm_controlled: AtomicBool::new(false),
@@ -1326,6 +1494,63 @@ pub(super) mod test_api {
                 connection_cqe_notify: Notify::new(),
                 injected_failure: Mutex::new(None),
                 ready_work_paused: AtomicBool::new(false),
+                work_class_selections: std::array::from_fn(|_| AtomicU64::new(0)),
+                connection_selections: AtomicU64::new(0),
+                connection_quantum_work: AtomicU64::new(0),
+                maximum_connection_quantum_work: AtomicU64::new(0),
+                idle_connection_visits: AtomicU64::new(0),
+            }
+        }
+
+        pub(super) fn record_class_selection(&self, class: super::WorkClass) {
+            self.work_class_selections[class.index()].fetch_add(1, Ordering::Relaxed);
+        }
+
+        pub(super) fn record_idle_connection_visit(&self) {
+            self.idle_connection_visits.fetch_add(1, Ordering::Relaxed);
+        }
+
+        pub(super) fn record_connection_selection(&self, work: usize) {
+            self.connection_selections.fetch_add(1, Ordering::Relaxed);
+            self.connection_quantum_work
+                .fetch_add(work as u64, Ordering::Relaxed);
+            self.maximum_connection_quantum_work
+                .fetch_max(work as u64, Ordering::Relaxed);
+        }
+
+        fn next_idle_qp(&self) -> Result<u32> {
+            self.next_idle_qp
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    current.checked_add(1)
+                })
+                .map_err(|_| Error::CapacityExhausted)
+        }
+
+        fn instrumentation(&self, shared: &EngineShared) -> TestEngineInstrumentation {
+            let counters = &shared.diagnostic_counters;
+            TestEngineInstrumentation {
+                work_class_selections: std::array::from_fn(|index| {
+                    self.work_class_selections[index].load(Ordering::Acquire)
+                }),
+                connection_selections: self.connection_selections.load(Ordering::Acquire),
+                connection_quantum_work: self.connection_quantum_work.load(Ordering::Acquire),
+                maximum_connection_quantum_work: self
+                    .maximum_connection_quantum_work
+                    .load(Ordering::Acquire),
+                idle_connection_visits: self.idle_connection_visits.load(Ordering::Acquire),
+                connection_registry_probes: shared.connections.probes(),
+                operation_registry_probes: shared.operations.probes(),
+                operations_posted: counters.operations_posted.load(Ordering::Acquire),
+                cqes_routed: counters.cqes_routed.load(Ordering::Acquire),
+                cqes_rejected: counters.stale_connection_cqes.load(Ordering::Acquire)
+                    + counters.stale_operation_cqes.load(Ordering::Acquire)
+                    + counters.unknown_cqes.load(Ordering::Acquire)
+                    + counters.duplicate_cqes.load(Ordering::Acquire)
+                    + counters.wrong_connection_cqes.load(Ordering::Acquire)
+                    + counters.wrong_qp_num_cqes.load(Ordering::Acquire)
+                    + counters.unexpected_opcode_cqes.load(Ordering::Acquire),
+                driver_wakeups: shared.work_signal.wakeups(),
+                driver_yields: shared.driver_yields.load(Ordering::Acquire),
             }
         }
 
@@ -1369,6 +1594,7 @@ pub(super) mod test_api {
             &self,
             connection: super::super::registry::ConnectionToken,
             qp_num: u32,
+            expected_opcode: Option<WcOpcode>,
         ) -> Result<()> {
             let mut control = self
                 .connection_cqe_suppression
@@ -1382,6 +1608,7 @@ pub(super) mod test_api {
             *control = Some(ConnectionCqeSuppressionState {
                 connection,
                 qp_num,
+                expected_opcode,
                 completion: None,
                 abandoned: false,
             });
@@ -1398,6 +1625,9 @@ pub(super) mod test_api {
             };
             if control.completion.is_some()
                 || control.qp_num != completion.qp_num()
+                || control
+                    .expected_opcode
+                    .is_some_and(|opcode| opcode != completion.opcode())
                 || control.abandoned
             {
                 return false;
@@ -1422,6 +1652,33 @@ pub(super) mod test_api {
                         && control.qp_num == qp_num
                         && control.completion.is_some()
                 })
+        }
+
+        fn connection_cqe_identity(
+            &self,
+            connection: super::super::registry::ConnectionToken,
+            qp_num: u32,
+        ) -> Result<TestCompletionIdentity> {
+            let control = self
+                .connection_cqe_suppression
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let active = control.as_ref().ok_or_else(|| {
+                Error::InvalidConfig("connection CQE suppression is not active".into())
+            })?;
+            if active.connection != connection || active.qp_num != qp_num {
+                return Err(Error::InvalidConfig(
+                    "connection CQE suppression identity changed".into(),
+                ));
+            }
+            let completion = active.completion.ok_or_else(|| {
+                Error::InvalidConfig("connection CQE has not been observed".into())
+            })?;
+            Ok(TestCompletionIdentity {
+                wr_id: completion.wr_id(),
+                qp_num: completion.qp_num(),
+                opcode: completion.opcode(),
+            })
         }
 
         fn release_connection_cqe(
@@ -1959,9 +2216,10 @@ pub(super) mod test_api {
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub use test_api::{
-    TestAcceptedOperation, TestAdmissionBarrier, TestConnectionCqeSuppression,
-    TestConnectionIdentity, TestCqArmWindowControl, TestCqeSuppression, TestEngineQp,
-    TestEngineResources, TestReadyWorkControl, TestRouteHandle,
+    TestAcceptedOperation, TestAdmissionBarrier, TestCompletionIdentity,
+    TestConnectionCqeSuppression, TestConnectionIdentity, TestCqArmWindowControl,
+    TestCqeSuppression, TestEngineInstrumentation, TestEngineQp, TestEngineResources,
+    TestReadyWorkControl, TestRouteHandle,
 };
 
 #[cfg(test)]

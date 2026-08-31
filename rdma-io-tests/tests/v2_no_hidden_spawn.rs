@@ -2,14 +2,16 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
+use proc_macro2::{TokenStream, TokenTree};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{
-    Attribute, Expr, ExprBlock, ExprMethodCall, ExprPath, ForeignItem, ImplItem, Item, Local, Meta,
-    Pat, Token, TraitItem, Type, UseTree,
+    Attribute, Expr, ExprBlock, ExprMethodCall, ExprPath, ForeignItem, ImplItem, Item, Local,
+    Macro, Meta, Pat, Token, TraitItem, Type, UseTree,
 };
 
 const SPAWN_NAMES: &[&str] = &[
@@ -36,20 +38,33 @@ const EXECUTOR_TYPES: &[&str] = &[
 ];
 const CONSTRUCTOR_NAMES: &[&str] = &["build", "new", "new_current_thread", "new_multi_thread"];
 
-fn collect_rs_files(dir: &Path) -> Vec<PathBuf> {
+fn collect_rs_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let metadata = fs::symlink_metadata(dir)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("scan root must be a real directory: {}", dir.display()),
+        ));
+    }
     let mut files = Vec::new();
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                files.extend(collect_rs_files(&path));
-            } else if path.extension().is_some_and(|ext| ext == "rs") {
-                files.push(path);
-            }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("source scan refuses symlink: {}", path.display()),
+            ));
+        }
+        if metadata.is_dir() {
+            files.extend(collect_rs_files(&path)?);
+        } else if metadata.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
+            files.push(path);
         }
     }
     files.sort();
-    files
+    Ok(files)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -406,6 +421,21 @@ impl<'a> SpawnDetector<'a> {
             .entry((line, label.clone()))
             .or_insert_with(|| format!("line {line}: [{label}] {snippet}"));
     }
+
+    fn scan_macro_tokens(&mut self, tokens: TokenStream) {
+        for token in tokens {
+            match token {
+                TokenTree::Group(group) => self.scan_macro_tokens(group.stream()),
+                TokenTree::Ident(ident) => {
+                    let name = ident.to_string();
+                    if is_spawn_name(&name) || self.aliases.call_aliases.contains(&name) {
+                        self.record(ident.span(), format!("macro-token::{name}"));
+                    }
+                }
+                TokenTree::Punct(_) | TokenTree::Literal(_) => {}
+            }
+        }
+    }
 }
 
 impl<'ast> Visit<'ast> for SpawnDetector<'_> {
@@ -453,6 +483,14 @@ impl<'ast> Visit<'ast> for SpawnDetector<'_> {
         }
         visit::visit_expr_method_call(self, expression);
     }
+
+    fn visit_macro(&mut self, mac: &'ast Macro) {
+        if let Some(label) = self.forbidden_path(&mac.path) {
+            self.record(mac.path.span(), format!("macro::{label}"));
+        }
+        self.scan_macro_tokens(mac.tokens.clone());
+        visit::visit_macro(self, mac);
+    }
 }
 
 fn find_spawn_violations(source: &str) -> Vec<String> {
@@ -488,6 +526,10 @@ fn production() {
     PoolMaker::new().build().unwrap();
     async_executor::Executor::new();
     std::thread::scope(|_| {});
+    wrapper! {
+        tokio::task::spawn(async {});
+        launch(async {});
+    }
 }
 "#;
     let violations = find_spawn_violations(source);
@@ -500,6 +542,8 @@ fn production() {
         "PoolMaker",
         "Executor",
         "scope",
+        "macro-token::spawn",
+        "macro-token::launch",
     ] {
         assert!(
             violations
@@ -508,6 +552,12 @@ fn production() {
             "missing {expected:?} in {violations:#?}"
         );
     }
+}
+
+#[test]
+fn recursive_source_collection_fails_closed() {
+    let missing = Path::new(env!("CARGO_MANIFEST_DIR")).join("missing-v2-source-root");
+    assert!(collect_rs_files(&missing).is_err());
 }
 
 #[test]
@@ -567,12 +617,24 @@ fn test_no_hidden_spawn_in_v2() {
         v2_dir.display()
     );
 
-    let files = collect_rs_files(&v2_dir);
+    let files = collect_rs_files(&v2_dir).expect("recursively enumerate every v2 Rust source");
     assert!(
         !files.is_empty(),
         "no .rs files found under {}",
         v2_dir.display()
     );
+    for required in [
+        v2_dir.join("mod.rs"),
+        v2_dir.join("message_transport.rs"),
+        v2_dir.join("engine").join("mod.rs"),
+        v2_dir.join("engine").join("driver.rs"),
+    ] {
+        assert!(
+            files.binary_search(&required).is_ok(),
+            "expected production source missing from scan scope: {}",
+            required.display()
+        );
+    }
 
     let mut violations = Vec::new();
     for path in &files {

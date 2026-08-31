@@ -16,12 +16,12 @@ mod scheduler;
 #[cfg(test)]
 mod api_tests;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(panic = "unwind")]
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 
@@ -35,14 +35,18 @@ use connection::ConnectionAdmissionPool;
 pub(crate) use connection::ConnectionState;
 pub use connection::{RdmaConnection, RdmaConnectionIdentity};
 use diagnostics::DiagnosticsState;
-pub use diagnostics::{RdmaEngineDiagnostics, RdmaEngineLifecycle, RdmaEngineTerminalError};
+pub use diagnostics::{
+    RdmaConnectionDiagnostics, RdmaEngineDiagnostics, RdmaEngineLifecycle, RdmaEngineTerminalError,
+    RdmaListenerDiagnostics,
+};
 use driver::WorkSignal;
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
 pub use driver::{
-    TestAcceptedOperation, TestAdmissionBarrier, TestConnectionCqeSuppression,
-    TestConnectionIdentity, TestCqArmWindowControl, TestCqeSuppression, TestEngineQp,
-    TestEngineResources, TestReadyWorkControl, TestRouteHandle,
+    TestAcceptedOperation, TestAdmissionBarrier, TestCompletionIdentity,
+    TestConnectionCqeSuppression, TestConnectionIdentity, TestCqArmWindowControl,
+    TestCqeSuppression, TestEngineInstrumentation, TestEngineQp, TestEngineResources,
+    TestReadyWorkControl, TestRouteHandle,
 };
 pub use listener::{RdmaListener, RdmaListenerConfig};
 pub(crate) use operation::DetachedOperationCompletion;
@@ -51,6 +55,9 @@ pub use operation::RdmaOperation;
 pub(crate) use operation::{BatchOwnershipTransfer, PreparedBatchOwnership};
 use operation::{CqCreditPool, OperationRegistry};
 use registry::{ConnectionRegistry, OperationToken, lock_unpoison, write_unpoison};
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub use registry::{TestRegistryProbe, probe_connection_registry};
 use resources::{EngineResourceRefs, EngineResources, ResourceSummary};
 use scheduler::WorkScheduler;
 use scheduler::{DeadlineKind, DeadlineRequest};
@@ -370,6 +377,7 @@ pub(crate) struct EngineShared {
     terminal_notify: Notify,
     terminal: Mutex<Option<EngineOutcome>>,
     driver_yields: AtomicU64,
+    quarantines: Mutex<HashMap<QuarantineKey, QuarantineEntry>>,
     #[cfg(any(test, feature = "test-hooks"))]
     test_resources: Option<resources::TestResourceRefs>,
     #[cfg(any(test, feature = "test-hooks"))]
@@ -378,6 +386,18 @@ pub(crate) struct EngineShared {
     // registry/test owner so quarantined QP/CM/MR descendants are released
     // before the shared CQ, PD, CM event channel, and context can disappear.
     resource_refs: Option<EngineResourceRefs>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum QuarantineKey {
+    Connection(registry::ConnectionToken),
+    Operation(registry::OperationToken),
+}
+
+#[derive(Clone, Copy)]
+struct QuarantineEntry {
+    connection: registry::ConnectionToken,
+    started: Instant,
 }
 
 impl EngineShared {
@@ -423,6 +443,7 @@ impl EngineShared {
             terminal_notify: Notify::new(),
             terminal: Mutex::new(None),
             driver_yields: AtomicU64::new(0),
+            quarantines: Mutex::new(HashMap::new()),
             #[cfg(any(test, feature = "test-hooks"))]
             test_resources: None,
             #[cfg(any(test, feature = "test-hooks"))]
@@ -472,7 +493,12 @@ impl EngineShared {
             self.transition_shutdown_requested();
             let lifecycle = match &outcome {
                 EngineOutcome::Success => RdmaEngineLifecycle::Terminated,
-                EngineOutcome::Failure(_) => RdmaEngineLifecycle::Failed,
+                EngineOutcome::Failure(_) => {
+                    self.diagnostic_counters
+                        .terminal_driver_errors
+                        .fetch_add(1, Ordering::Relaxed);
+                    RdmaEngineLifecycle::Failed
+                }
             };
             *terminal = Some(outcome.clone());
             self.transition_terminal(lifecycle);
@@ -497,6 +523,11 @@ impl EngineShared {
                         self.diagnostic_counters
                             .cq_credits_retained
                             .fetch_add(1, Ordering::Relaxed);
+                        if self.track_operation_quarantine(&operation) {
+                            self.diagnostic_counters
+                                .connections_quarantined
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     if terminalized.should_wake {
                         operations_to_wake.push(operation);
@@ -515,9 +546,11 @@ impl EngineShared {
                 && connection.retain_bundle_for_engine_failure()
             {
                 self.quarantined_connections.fetch_add(1, Ordering::AcqRel);
-                self.diagnostic_counters
-                    .connections_quarantined
-                    .fetch_add(1, Ordering::Relaxed);
+                if self.track_connection_quarantine(connection.token) {
+                    self.diagnostic_counters
+                        .connections_quarantined
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
             connection.finalize_engine(&outcome);
         }
@@ -627,10 +660,109 @@ impl EngineShared {
             .push(Arc::clone(shared));
     }
 
+    fn shared_driver_wakeups(&self) -> u64 {
+        self.work_signal.wakeups()
+    }
+
+    fn track_connection_quarantine(&self, token: registry::ConnectionToken) -> bool {
+        self.track_quarantine(
+            QuarantineKey::Connection(token),
+            QuarantineEntry {
+                connection: token,
+                started: Instant::now(),
+            },
+        )
+    }
+
+    fn track_operation_quarantine(&self, operation: &operation::OperationState) -> bool {
+        self.track_quarantine(
+            QuarantineKey::Operation(operation.token()),
+            QuarantineEntry {
+                connection: operation.connection_token(),
+                started: Instant::now(),
+            },
+        )
+    }
+
+    fn track_quarantine(&self, key: QuarantineKey, entry: QuarantineEntry) -> bool {
+        let mut quarantines = lock_unpoison(&self.quarantines);
+        let existed = quarantines.contains_key(&key);
+        let connection_was_quarantined = quarantines
+            .values()
+            .any(|current| current.connection == entry.connection);
+        if !existed {
+            quarantines.insert(key, entry);
+        }
+        !existed && !connection_was_quarantined
+    }
+
+    fn clear_connection_quarantine(&self, token: registry::ConnectionToken) -> bool {
+        self.clear_quarantine(QuarantineKey::Connection(token), token)
+    }
+
+    fn clear_operation_quarantine(&self, operation: &operation::OperationState) -> bool {
+        self.clear_quarantine(
+            QuarantineKey::Operation(operation.token()),
+            operation.connection_token(),
+        )
+    }
+
+    fn clear_quarantine(&self, key: QuarantineKey, connection: registry::ConnectionToken) -> bool {
+        let mut quarantines = lock_unpoison(&self.quarantines);
+        if quarantines.remove(&key).is_none() {
+            return false;
+        }
+        !quarantines
+            .values()
+            .any(|current| current.connection == connection)
+    }
+
+    fn quarantine_snapshot(&self) -> (usize, Option<Duration>, HashSet<registry::ConnectionToken>) {
+        let quarantines = lock_unpoison(&self.quarantines);
+        let connections = quarantines
+            .values()
+            .map(|entry| entry.connection)
+            .collect::<HashSet<_>>();
+        let now = Instant::now();
+        let oldest = quarantines
+            .values()
+            .map(|entry| now.saturating_duration_since(entry.started))
+            .max();
+        (connections.len(), oldest, connections)
+    }
+
     fn diagnostics(&self) -> RdmaEngineDiagnostics {
         let outcome = self.outcome();
         let (listener_count, queued_inbound_requests, pending_accepts, selected_accepts) =
             self.cm.listener_counts();
+        let listeners = self.cm.listener_diagnostics();
+        let (quarantined_bundles, oldest_quarantine_age, quarantined_connections) =
+            self.quarantine_snapshot();
+        let registered_connections = self.connections.live();
+        let establishing_connection_reservations = self
+            .connection_admission
+            .used()
+            .saturating_sub(registered_connections);
+        let draining_connection_reservations = self.draining_connections.load(Ordering::Acquire);
+        let mut connections = self
+            .connections
+            .occupied()
+            .into_iter()
+            .map(|connection| {
+                connection.diagnostics(quarantined_connections.contains(&connection.token))
+            })
+            .collect::<Vec<_>>();
+        connections.sort_by_key(|connection| {
+            (
+                connection.identity.slot,
+                connection.identity.generation,
+                connection.identity.qp_num,
+            )
+        });
+        let established_connection_reservations = connections
+            .iter()
+            .filter(|connection| !connection.draining && !connection.quarantined)
+            .count();
         RdmaEngineDiagnostics {
             lifecycle: self.lifecycle(),
             terminal_error: outcome.and_then(|outcome| outcome.summary()),
@@ -639,22 +771,28 @@ impl EngineShared {
             maximum_live_connections: self.config.max_live_connections,
             maximum_inflight_operations: self.config.max_inflight_operations,
             cq_capacity: self.config.cq_capacity,
+            cq_completion_budget: self.config.cq_completion_budget,
+            cm_event_budget: self.config.cm_event_budget,
+            reclamation_budget: self.config.reclamation_budget,
+            ready_connection_quantum: self.config.ready_connection_quantum,
             shared_contexts: self.resources.contexts,
             shared_protection_domains: self.resources.protection_domains,
             shared_completion_queues: self.resources.completion_queues,
             shared_completion_channels: self.resources.completion_channels,
+            shared_cq_notification_fds: self.resources.cq_notification_fds,
             shared_cm_event_channels: self.resources.cm_event_channels,
+            shared_cm_event_fds: self.resources.cm_event_fds,
+            explicit_engine_drivers: self.resources.explicit_drivers,
+            library_owned_tasks: self.resources.library_owned_tasks,
+            driver_wakeups: self.shared_driver_wakeups(),
             driver_yields: self.driver_yields.load(Ordering::Acquire),
             live_connection_reservations: self.connection_admission.used(),
-            draining_connection_reservations: self.draining_connections.load(Ordering::Acquire),
-            quarantined_connection_reservations: self
-                .quarantined_connections
-                .load(Ordering::Acquire),
-            registered_live_qps: self
-                .connections
-                .live()
-                .saturating_sub(self.quarantined_connections.load(Ordering::Acquire)),
-            registered_quarantined_qps: self.quarantined_connections.load(Ordering::Acquire),
+            establishing_connection_reservations,
+            established_connection_reservations,
+            draining_connection_reservations,
+            quarantined_connection_reservations: quarantined_bundles,
+            registered_live_qps: registered_connections.saturating_sub(quarantined_bundles),
+            registered_quarantined_qps: quarantined_bundles,
             free_connection_slots: self.connections.free(),
             retired_connection_slots: self.connections.retired(),
             registered_operations: self.operations.live(),
@@ -667,11 +805,19 @@ impl EngineShared {
             quarantined_operations: self.quarantined_operations.load(Ordering::Acquire),
             quarantined_mrs: self.quarantined_mrs.load(Ordering::Acquire),
             quarantined_bytes: self.quarantined_bytes.load(Ordering::Acquire),
+            quarantined_bundles,
+            oldest_quarantine_age,
+            connections,
             ready_queue_depth: self.ready_queue_depth.load(Ordering::Acquire),
             listener_count,
             queued_inbound_requests,
             pending_accepts,
             selected_accepts,
+            listeners,
+            connections_admitted: self
+                .diagnostic_counters
+                .connections_admitted
+                .load(Ordering::Acquire),
             operations_offered: self
                 .diagnostic_counters
                 .operations_offered
@@ -758,6 +904,8 @@ impl EngineShared {
                 .diagnostic_counters
                 .cq_capacity_exhausted
                 .load(Ordering::Acquire),
+            connection_slots_retired: self.connections.retired() as u64,
+            operation_slots_retired: self.operations.retired() as u64,
             connections_opened: self
                 .diagnostic_counters
                 .connections_opened
@@ -799,6 +947,10 @@ impl EngineShared {
             engine_wedges: self
                 .diagnostic_counters
                 .engine_wedges
+                .load(Ordering::Acquire),
+            terminal_driver_errors: self
+                .diagnostic_counters
+                .terminal_driver_errors
                 .load(Ordering::Acquire),
             cq_credits_reserved: self
                 .diagnostic_counters
@@ -1131,7 +1283,11 @@ pub(crate) fn test_engine_pair(mode: CompletionMode) -> (RdmaEngine, RdmaEngineD
                 protection_domains: 1,
                 completion_queues: 1,
                 completion_channels: 0,
+                cq_notification_fds: 0,
                 cm_event_channels: 1,
+                cm_event_fds: 1,
+                explicit_drivers: 1,
+                library_owned_tasks: 0,
             },
             None,
             None,

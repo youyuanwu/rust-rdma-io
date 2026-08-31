@@ -108,9 +108,11 @@ impl EngineShared {
         };
         if let Some((_outstanding, _cq_debt)) = connection.apply_drain_deadline() {
             self.quarantined_connections.fetch_add(1, Ordering::AcqRel);
-            self.diagnostic_counters
-                .connections_quarantined
-                .fetch_add(1, Ordering::Relaxed);
+            if self.track_connection_quarantine(connection.token) {
+                self.diagnostic_counters
+                    .connections_quarantined
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             self.diagnostic_counters
                 .connection_quarantine_outcomes
                 .fetch_add(1, Ordering::Relaxed);
@@ -130,9 +132,11 @@ impl EngineShared {
             return;
         }
         self.quarantined_connections.fetch_sub(1, Ordering::AcqRel);
-        self.diagnostic_counters
-            .quarantine_recoveries
-            .fetch_add(1, Ordering::Relaxed);
+        if self.clear_connection_quarantine(connection.token) {
+            self.diagnostic_counters
+                .quarantine_recoveries
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub(super) fn record_connection_drained(&self, connection: &ConnectionState) {
@@ -151,6 +155,7 @@ impl EngineShared {
 
     pub(super) fn record_connection_retired(&self, connection: &ConnectionState) {
         self.finish_connection_drain_count(connection);
+        let _ = self.clear_connection_quarantine(connection.token);
         self.diagnostic_counters
             .connections_closed
             .fetch_add(1, Ordering::Relaxed);

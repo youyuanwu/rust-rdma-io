@@ -8,6 +8,7 @@ primary_status=0
 primary_step=""
 restoration_status=0
 RUN_FULL_WORKSPACE=0
+ENGINE_CONFORMANCE=0
 
 if [[ -z "${CARGO:-}" ]]; then
     if command -v cargo >/dev/null 2>&1; then
@@ -68,8 +69,14 @@ case "$MODE" in
         MODE_LABEL="Phase 8 engine message DATA/CREDIT progress"
         RUN_FULL_WORKSPACE=1
         ;;
+    --engine-conformance)
+        TEST_TARGET=""
+        REPETITIONS=1
+        MODE_LABEL="Phase 10 engine conformance"
+        ENGINE_CONFORMANCE=1
+        ;;
     *)
-        echo "usage: sudo -E ./scripts/validate-v2-engine-providers.sh {--provider-probe|--readiness-race|--driver-flush-gate|--phase3-operations|--phase4-connections|--phase5-listeners|--phase6-lifecycle|--phase7-message-setup|--phase8-message}" >&2
+        echo "usage: sudo -E ./scripts/validate-v2-engine-providers.sh {--provider-probe|--readiness-race|--driver-flush-gate|--phase3-operations|--phase4-connections|--phase5-listeners|--phase6-lifecycle|--phase7-message-setup|--phase8-message|--engine-conformance}" >&2
         exit 2
         ;;
 esac
@@ -104,6 +111,7 @@ run_step() {
 }
 
 run_selected_test() {
+    local target="${1:-$TEST_TARGET}"
     if [[ -n "${SUDO_USER:-}" ]]; then
         local user_home
         user_home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
@@ -111,18 +119,30 @@ run_selected_test() {
             HOME="$user_home" \
             PATH="$TOOLCHAIN_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
             RUST_TEST_THREADS=1 \
-            "$CARGO" test -p rdma-io-tests --test "$TEST_TARGET" -- --nocapture
+            "$CARGO" test -p rdma-io-tests --test "$target" -- --nocapture
     else
         env \
             PATH="$TOOLCHAIN_BIN:$PATH" \
             RUST_TEST_THREADS=1 \
-            "$CARGO" test -p rdma-io-tests --test "$TEST_TARGET" -- --nocapture
+            "$CARGO" test -p rdma-io-tests --test "$target" -- --nocapture
     fi
 }
 
 run_provider_test() {
     local provider="$1"
     local iteration
+    if [[ "$ENGINE_CONFORMANCE" -eq 1 ]]; then
+        run_step "Run $provider Phase 2 driver flush gate" run_selected_test v2_engine_driver_flush_gate
+        for ((iteration = 1; iteration <= 5; iteration++)); do
+            run_step \
+                "Run $provider Phase 2 readiness race ($iteration/5)" \
+                run_selected_test v2_engine_readiness_race
+        done
+        run_step "Run $provider Phase 10 eight-connection conformance" run_selected_test v2_engine_tests
+        run_step "Run $provider Phase 10 diagnostics" run_selected_test v2_engine_diagnostics_tests
+        run_step "Run $provider Phase 10 scaling" run_selected_test v2_engine_scaling_tests
+        return
+    fi
     for ((iteration = 1; iteration <= REPETITIONS; iteration++)); do
         run_step \
             "Run $provider $MODE_LABEL ($iteration/$REPETITIONS)" \

@@ -60,7 +60,11 @@ pub(super) struct ResourceSummary {
     pub(super) protection_domains: usize,
     pub(super) completion_queues: usize,
     pub(super) completion_channels: usize,
+    pub(super) cq_notification_fds: usize,
     pub(super) cm_event_channels: usize,
+    pub(super) cm_event_fds: usize,
+    pub(super) explicit_drivers: usize,
+    pub(super) library_owned_tasks: usize,
 }
 
 impl EngineResources {
@@ -132,7 +136,11 @@ impl EngineResources {
             protection_domains: 1,
             completion_queues: 1,
             completion_channels: usize::from(self.cq.has_channel()),
+            cq_notification_fds: usize::from(self.cq.fd().is_some()),
             cm_event_channels: 1,
+            cm_event_fds: 1,
+            explicit_drivers: 1,
+            library_owned_tasks: 0,
         }
     }
 

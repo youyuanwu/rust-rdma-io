@@ -276,13 +276,13 @@ impl<K: RegistryToken, T> PagedRegistry<K, T> {
             .saturating_sub(self.retired())
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     fn allocated_pages(&self) -> usize {
         self.allocated_pages.load(Ordering::Acquire)
     }
 
-    #[cfg(test)]
-    fn probes(&self) -> u64 {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(super) fn probes(&self) -> u64 {
         self.probes.load(Ordering::Acquire)
     }
 
@@ -309,7 +309,7 @@ impl<K: RegistryToken, T> PagedRegistry<K, T> {
             .collect()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     fn insert_at_for_test(&self, slot: u32, value: T) -> K {
         assert!((slot as usize) < self.capacity);
         let mut inner = lock_unpoison(&self.inner);
@@ -449,10 +449,62 @@ impl ConnectionRegistry {
         self.slots.occupied_cloned()
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(super) fn probes(&self) -> u64 {
+        self.slots.probes()
+    }
+
     #[cfg(test)]
     pub(super) fn set_qp_mapping_for_test(&self, qp_num: u32, token: ConnectionToken) {
         lock_unpoison(&self.qp_index).insert(qp_num, token);
     }
+}
+
+/// Allocation and direct-lookup evidence for one configured registry size.
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TestRegistryProbe {
+    pub configured_capacity: usize,
+    pub page_directory_entries: usize,
+    pub touched_pages: usize,
+    pub direct_lookup_probes: u64,
+    pub touched_slots: Vec<usize>,
+}
+
+/// Probe representative low/middle/high slots without creating provider QPs.
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub fn probe_connection_registry(capacity: usize) -> Result<TestRegistryProbe> {
+    if capacity == 0 {
+        return Err(Error::InvalidConfig(
+            "registry probe capacity must be nonzero".into(),
+        ));
+    }
+    let registry = PagedRegistry::<ConnectionToken, usize>::new(capacity)?;
+    let mut touched_slots = vec![0, capacity / 2, capacity - 1];
+    touched_slots.sort_unstable();
+    touched_slots.dedup();
+    let tokens = touched_slots
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(value, slot)| registry.insert_at_for_test(slot as u32, value))
+        .collect::<Vec<_>>();
+    for (expected, token) in tokens.into_iter().enumerate() {
+        if !matches!(registry.lookup_cloned(token), Lookup::Occupied(value) if value == expected) {
+            return Err(Error::InvalidConfig(
+                "registry probe failed a direct representative lookup".into(),
+            ));
+        }
+    }
+    Ok(TestRegistryProbe {
+        configured_capacity: capacity,
+        page_directory_entries: capacity.div_ceil(PAGE_SIZE),
+        touched_pages: registry.allocated_pages(),
+        direct_lookup_probes: registry.probes(),
+        touched_slots,
+    })
 }
 
 pub(super) fn lock_unpoison<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

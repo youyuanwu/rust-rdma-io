@@ -260,8 +260,14 @@ async fn run_malformed_hello(mode: CompletionMode) {
         })
         .await
         .expect("malformed message close timed out");
-        assert!(matches!(server_close, Err(Error::ProtocolViolation(_))));
-        assert!(matches!(client_close, Ok(()) | Err(Error::TransportClosed)));
+        assert!(
+            matches!(server_close, Err(Error::ProtocolViolation(_))),
+            "unexpected malformed server close: {server_close:?}"
+        );
+        assert!(
+            matches!(client_close, Ok(()) | Err(Error::TransportClosed)),
+            "unexpected malformed client close: {client_close:?}"
+        );
     }
     listener.close().await.unwrap();
     server_engine.shutdown().await.unwrap();
@@ -429,7 +435,9 @@ async fn run_driver_withholding(mode: CompletionMode) {
             .connect_on(&connect_engine, address)
             .await
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
 
     assert!(!accept.is_finished());
     assert!(!connect.is_finished());
@@ -476,7 +484,10 @@ async fn wait_pending_accepts(engine: &RdmaEngine, expected: usize) {
 }
 
 fn assert_clean_or_disconnected(result: Result<()>) {
-    assert!(matches!(result, Ok(()) | Err(Error::TransportClosed)));
+    assert!(
+        matches!(result, Ok(()) | Err(Error::TransportClosed)),
+        "unexpected message close result: {result:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

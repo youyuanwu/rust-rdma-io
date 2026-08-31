@@ -25,6 +25,7 @@ use super::connection::{
     VerbsConnectionResources, WorkRequestPoster, install_reserved_connection, reserve_connection,
 };
 use super::diagnostics::CmEventReject;
+use super::diagnostics::RdmaListenerDiagnostics;
 use super::listener::{
     AcceptRequest, EmptyPreEstablishSetup, InboundRejectReason, IncomingChild,
     KERNEL_LISTEN_BACKLOG_REQUEST, ListenRequest, ListenerAction, ListenerState, RdmaListener,
@@ -458,6 +459,15 @@ impl CmState {
             pending_accepts,
             selected_accepts,
         )
+    }
+
+    pub(super) fn listener_diagnostics(&self) -> Vec<RdmaListenerDiagnostics> {
+        let mut listeners = lock_unpoison(&self.listeners)
+            .values()
+            .map(|listener| listener.diagnostics())
+            .collect::<Vec<_>>();
+        listeners.sort_by_key(|listener| listener.token);
+        listeners
     }
 
     pub(super) fn service_cm_destructions(

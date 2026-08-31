@@ -1242,7 +1242,7 @@ impl EngineMessageState {
                             lock_std(&self.handshake).hello_send_complete = true;
                             self.try_mark_ready();
                         }
-                        Err(error) => self.fail(error, true),
+                        Err(error) => self.fail(normalize_message_completion_error(error), true),
                     }
                 }
             },
@@ -1270,7 +1270,7 @@ impl EngineMessageState {
                         return;
                     }
                 }
-                if let Err(error) = result
+                if let Err(error) = result.map_err(normalize_message_completion_error)
                     && self.state.load(Ordering::Acquire) == STATE_READY
                 {
                     self.fail(error, true);
@@ -1298,7 +1298,7 @@ impl EngineMessageState {
             Ok(completion) => completion,
             Err(error) => {
                 drop(mr);
-                self.fail(error, true);
+                self.fail(normalize_message_completion_error(error), true);
                 return;
             }
         };
@@ -1488,13 +1488,9 @@ impl EngineMessageState {
         {
             pools.data_sends.put(mr);
         }
-        let result = result.map(|_| ()).map_err(|error| match error {
-            Error::CompletionError {
-                status: crate::wc::WcStatus::WrFlushErr,
-                ..
-            } => Error::TransportClosed,
-            error => error,
-        });
+        let result = result
+            .map(|_| ())
+            .map_err(normalize_message_completion_error);
         request.complete(result.clone());
         if let Err(error) = result
             && self.state.load(Ordering::Acquire) == STATE_READY
@@ -1732,7 +1728,7 @@ impl EngineMessageState {
             Ok(completion) => completion,
             Err(error) => {
                 drop(mr);
-                self.fail(error, true);
+                self.fail(normalize_message_completion_error(error), true);
                 return;
             }
         };
@@ -2370,6 +2366,16 @@ mod hello_tests {
             state.fail(Error::ProtocolViolation("late failure".into()), false);
             assert_eq!(state.state.load(Ordering::Acquire), terminal);
         }
+    }
+}
+
+fn normalize_message_completion_error(error: Error) -> Error {
+    match error {
+        Error::CompletionError {
+            status: crate::wc::WcStatus::WrFlushErr,
+            ..
+        } => Error::TransportClosed,
+        error => error,
     }
 }
 

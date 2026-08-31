@@ -526,6 +526,11 @@ impl OperationRegistry {
     pub(super) fn occupied(&self) -> Vec<Arc<OperationState>> {
         self.slots.occupied_cloned()
     }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(super) fn probes(&self) -> u64 {
+        self.slots.probes()
+    }
 }
 
 pub(super) struct CqCreditPool {
@@ -619,6 +624,14 @@ enum OperationLifecycle {
 }
 
 impl OperationState {
+    pub(super) fn token(&self) -> OperationToken {
+        self.token
+    }
+
+    pub(super) fn connection_token(&self) -> ConnectionToken {
+        self.connection.token
+    }
+
     fn new(
         token: OperationToken,
         connection: Arc<ConnectionState>,
@@ -1494,6 +1507,11 @@ impl EngineShared {
             self.quarantined_mrs.fetch_sub(1, Ordering::AcqRel);
             self.quarantined_bytes
                 .fetch_sub(operation.mr_len, Ordering::AcqRel);
+            if self.clear_operation_quarantine(&operation) {
+                self.diagnostic_counters
+                    .quarantine_recoveries
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
         self.diagnostic_counters
             .operations_completed
@@ -1545,6 +1563,11 @@ impl EngineShared {
         self.diagnostic_counters
             .cq_credits_retained
             .fetch_add(1, Ordering::Relaxed);
+        if self.track_operation_quarantine(&operation) {
+            self.diagnostic_counters
+                .connections_quarantined
+                .fetch_add(1, Ordering::Relaxed);
+        }
         true
     }
 }
@@ -3020,7 +3043,11 @@ mod tests {
                     protection_domains: 0,
                     completion_queues: 0,
                     completion_channels: 0,
+                    cq_notification_fds: 0,
                     cm_event_channels: 0,
+                    cm_event_fds: 0,
+                    explicit_drivers: 1,
+                    library_owned_tasks: 0,
                 },
                 None,
                 None,

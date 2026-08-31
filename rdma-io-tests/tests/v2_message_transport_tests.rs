@@ -6,6 +6,7 @@
 //! scenarios.
 
 use std::collections::BTreeSet;
+use syn::{Attribute, Item};
 
 const MESSAGE_BEHAVIOR: &[&str] = &[
     "test_single_message_readiness",
@@ -90,13 +91,56 @@ const NO_HIDDEN_WORK_SOURCE: &str = include_str!("v2_no_hidden_spawn.rs");
 const MESSAGE_UNIT_SOURCE: &str = include_str!("../../rdma-io/src/v2/message_transport.rs");
 const REGISTRY_UNIT_SOURCE: &str = include_str!("../../rdma-io/src/v2/engine/registry.rs");
 
-fn assert_markers(source: &str, markers: &[&str]) {
-    for marker in markers {
+fn collect_functions(items: &[Item], functions: &mut BTreeSet<(String, bool)>) {
+    for item in items {
+        match item {
+            Item::Fn(function) => {
+                functions.insert((
+                    function.sig.ident.to_string(),
+                    function.attrs.iter().any(is_test_attribute),
+                ));
+            }
+            Item::Mod(module) => {
+                if let Some((_, items)) = &module.content {
+                    collect_functions(items, functions);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn is_test_attribute(attribute: &Attribute) -> bool {
+    attribute
+        .path()
+        .segments
+        .last()
+        .is_some_and(|segment| segment.ident == "test")
+}
+
+fn parsed_functions(source: &str) -> BTreeSet<(String, bool)> {
+    let syntax = syn::parse_file(source).expect("replacement evidence source must parse");
+    let mut functions = BTreeSet::new();
+    collect_functions(&syntax.items, &mut functions);
+    functions
+}
+
+fn assert_test_functions(source: &str, functions: &[&str]) {
+    let parsed = parsed_functions(source);
+    for function in functions {
         assert!(
-            source.contains(marker),
-            "replacement evidence is missing marker {marker}"
+            parsed.contains(&(function.to_string(), true)),
+            "replacement evidence is missing test function {function}"
         );
     }
+}
+
+fn assert_function(source: &str, function: &str) {
+    let parsed = parsed_functions(source);
+    assert!(
+        parsed.iter().any(|(name, _)| name == function),
+        "replacement evidence is missing function {function}"
+    );
 }
 
 #[test]
@@ -118,18 +162,19 @@ fn all_61_message_cases_have_one_engine_disposition_and_live_evidence() {
     assert_eq!(all.len(), 61);
     assert_eq!(all.iter().copied().collect::<BTreeSet<_>>().len(), 61);
 
-    assert_markers(
+    assert_test_functions(
         MESSAGE_SOURCE,
         &[
             "data_boundaries_registered_reuse_and_negotiated_credits",
             "received_message_drop_reposts_and_returns_credit_only_in_engine_work",
             "malformed_and_duplicate_control_frames_fail_connection_locally",
             "queued_send_cancellation_and_disconnect_wake_observers",
+            "cancelled_recv_does_not_consume_successor_message_in_both_modes",
             "hot_message_work_rotates_and_connection_close_is_independent",
             "cancelled_data_send_retains_mr_until_exact_cqe_and_memoizes_quarantine",
         ],
     );
-    assert_markers(
+    assert_test_functions(
         SETUP_SOURCE,
         &[
             "readiness_malformed_hello_is_connection_local",
@@ -137,7 +182,7 @@ fn all_61_message_cases_have_one_engine_disposition_and_live_evidence() {
             "message_setup_requires_the_owning_driver_to_be_polled",
         ],
     );
-    assert_markers(
+    assert_test_functions(
         LIFECYCLE_SOURCE,
         &[
             "clean_close_records_real_qp_mr_cm_and_canonical_ack_order_in_both_modes",
@@ -148,29 +193,27 @@ fn all_61_message_cases_have_one_engine_disposition_and_live_evidence() {
             "peer_disconnect_uses_the_same_explicit_local_qp_err_close_path_in_both_modes",
         ],
     );
-    assert_markers(
+    assert_test_functions(
         CONNECTION_SOURCE,
         &[
             "withholding_the_driver_prevents_cm_progress_and_cancellation_releases_admission",
             "outbound_api_surface_has_exact_future_outputs",
         ],
     );
-    assert_markers(
+    assert_test_functions(
         OPERATION_SOURCE,
         &["owned_operations_route_by_generation_qp_and_token_in_both_modes"],
     );
-    assert_markers(
-        NO_HIDDEN_WORK_SOURCE,
-        &["test_no_hidden_spawn_in_v2", "collect_rs_files"],
-    );
-    assert_markers(
+    assert_test_functions(NO_HIDDEN_WORK_SOURCE, &["test_no_hidden_spawn_in_v2"]);
+    assert_function(NO_HIDDEN_WORK_SOURCE, "collect_rs_files");
+    assert_test_functions(
         MESSAGE_UNIT_SOURCE,
         &[
             "engine_credit_returns_are_atomic_capped_and_duplicate_safe",
             "engine_terminal_failure_wakes_ready_recv_and_send_terminal_waiters",
         ],
     );
-    assert_markers(
+    assert_test_functions(
         REGISTRY_UNIT_SOURCE,
         &[
             "concurrent_registrations_fill_and_release_exact_capacity",

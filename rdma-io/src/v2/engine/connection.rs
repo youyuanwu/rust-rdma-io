@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard};
 use tokio::sync::Notify;
 
 use self::qp::QpCapabilitiesExt;
+use super::diagnostics::RdmaConnectionDiagnostics;
 use super::operation::RdmaOperation;
 use super::registry::{
     ConnectionToken, OperationToken, lock_unpoison, read_unpoison, write_unpoison,
@@ -335,6 +336,15 @@ impl ConnectionState {
 
     pub(super) fn accepted_count(&self) -> usize {
         lock_unpoison(&self.accepted).len()
+    }
+
+    pub(super) fn diagnostics(&self, quarantined: bool) -> RdmaConnectionDiagnostics {
+        RdmaConnectionDiagnostics {
+            identity: self.identity(),
+            accepted_outstanding_operations: self.accepted_count(),
+            draining: self.close_started(),
+            quarantined,
+        }
     }
 
     pub(super) fn enqueue_completion(&self, completion: WorkCompletion) {
@@ -1001,6 +1011,10 @@ pub(super) fn reserve_connection(
             .fetch_add(1, Ordering::Relaxed);
         Error::CapacityExhausted
     })?;
+    shared
+        .diagnostic_counters
+        .connections_admitted
+        .fetch_add(1, Ordering::Relaxed);
     Ok((admission, reservation))
 }
 

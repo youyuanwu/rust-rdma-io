@@ -21,7 +21,7 @@ pub(super) enum WorkClass {
 }
 
 impl WorkClass {
-    const fn index(self) -> usize {
+    pub(super) const fn index(self) -> usize {
         match self {
             Self::Terminal => 0,
             Self::Cm => 1,

@@ -1,5 +1,8 @@
 use super::config::CompletionMode;
+use super::connection::RdmaConnectionIdentity;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 /// Public engine lifecycle state included in diagnostics snapshots.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,6 +28,34 @@ pub struct RdmaEngineTerminalError {
     pub message: String,
 }
 
+/// Per-connection state included in an engine diagnostics snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RdmaConnectionDiagnostics {
+    /// Current generational connection and provider QP identity.
+    pub identity: RdmaConnectionIdentity,
+    /// Exact provider-accepted WRs still awaiting validated CQEs.
+    pub accepted_outstanding_operations: usize,
+    /// Whether posting has stopped and ordered drain has started.
+    pub draining: bool,
+    /// Whether this connection owns any retained quarantine state.
+    pub quarantined: bool,
+}
+
+/// Per-listener queue state included in an engine diagnostics snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RdmaListenerDiagnostics {
+    /// Stable engine-local listener token.
+    pub token: u64,
+    /// Bound listener address.
+    pub local_addr: SocketAddr,
+    /// Admitted children waiting in arrival order.
+    pub queued_inbound_requests: usize,
+    /// Unselected accept waiters waiting in registration order.
+    pub pending_accepts: usize,
+    /// Selected/setup or accepted-but-cleaning pairs.
+    pub selected_accepts: usize,
+}
+
 /// Concurrently readable snapshot of engine state and configured capacity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -43,6 +74,14 @@ pub struct RdmaEngineDiagnostics {
     pub maximum_inflight_operations: usize,
     /// Configured shared-CQ capacity.
     pub cq_capacity: usize,
+    /// Maximum CQEs routed in one CQ service turn.
+    pub cq_completion_budget: usize,
+    /// Maximum CM actions handled in one CM service turn.
+    pub cm_event_budget: usize,
+    /// Maximum reclamation/deadline actions handled in one service turn.
+    pub reclamation_budget: usize,
+    /// Maximum connection-local work handled before ready-queue rotation.
+    pub ready_connection_quantum: usize,
     /// Number of engine-owned context facades.
     pub shared_contexts: usize,
     /// Number of engine-owned protection domains.
@@ -51,15 +90,29 @@ pub struct RdmaEngineDiagnostics {
     pub shared_completion_queues: usize,
     /// Number of engine-owned CQ completion channels.
     pub shared_completion_channels: usize,
+    /// Number of shared CQ notification file descriptors.
+    pub shared_cq_notification_fds: usize,
     /// Number of engine-owned CM event channels.
     pub shared_cm_event_channels: usize,
+    /// Number of shared CM event-channel file descriptors.
+    pub shared_cm_event_fds: usize,
+    /// Number of explicit engine driver futures created by `build()`.
+    pub explicit_engine_drivers: usize,
+    /// Tasks or threads created internally by the v2 engine.
+    pub library_owned_tasks: usize,
+    /// Monotonic software producer wake count.
+    pub driver_wakeups: u64,
     /// Monotonic cooperative-yield count in polling mode.
     pub driver_yields: u64,
     /// Current aggregate connection reservations.
     pub live_connection_reservations: usize,
+    /// Reservations admitted before a connection registration becomes live.
+    pub establishing_connection_reservations: usize,
+    /// Registered reservations that are neither draining nor quarantined.
+    pub established_connection_reservations: usize,
     /// Reservations whose connections have stopped posting and are draining.
     pub draining_connection_reservations: usize,
-    /// Draining reservations retained after a connection deadline.
+    /// Reservations retained by any whole-bundle quarantine state.
     pub quarantined_connection_reservations: usize,
     /// Registered QPs that are not currently quarantined.
     pub registered_live_qps: usize,
@@ -89,6 +142,12 @@ pub struct RdmaEngineDiagnostics {
     pub quarantined_mrs: usize,
     /// Bytes retained by quarantined operation MRs.
     pub quarantined_bytes: usize,
+    /// Unique connection bundles with retained quarantine state.
+    pub quarantined_bundles: usize,
+    /// Age of the oldest currently retained quarantine entry.
+    pub oldest_quarantine_age: Option<Duration>,
+    /// Exact accepted-outstanding state for each registered connection.
+    pub connections: Vec<RdmaConnectionDiagnostics>,
     /// Connections currently queued for bounded driver-local work.
     pub ready_queue_depth: usize,
     /// Engine-owned listeners currently registered with the shared CM router.
@@ -99,6 +158,10 @@ pub struct RdmaEngineDiagnostics {
     pub pending_accepts: usize,
     /// Listener-local selected/setup or accepted-but-cleaning pairs.
     pub selected_accepts: usize,
+    /// Per-listener queue state, ordered by listener token.
+    pub listeners: Vec<RdmaListenerDiagnostics>,
+    /// Connection admission reservations successfully acquired.
+    pub connections_admitted: u64,
     /// WRs for which admission/posting was attempted.
     pub operations_offered: u64,
     /// WRs accepted or conservatively treated as acceptance-ambiguous.
@@ -145,7 +208,11 @@ pub struct RdmaEngineDiagnostics {
     pub operation_capacity_exhausted: u64,
     /// Capacity failures for CQ admission.
     pub cq_capacity_exhausted: u64,
-    /// Outbound connections that reached RDMA-CM ESTABLISHED.
+    /// Connection slots permanently retired since engine construction.
+    pub connection_slots_retired: u64,
+    /// Operation slots permanently retired since engine construction.
+    pub operation_slots_retired: u64,
+    /// Inbound and outbound connections that reached RDMA-CM ESTABLISHED.
     pub connections_opened: u64,
     /// Connections that atomically stopped posting and entered drain.
     pub connections_drain_started: u64,
@@ -155,7 +222,7 @@ pub struct RdmaEngineDiagnostics {
     pub connections_closed: u64,
     /// Connections retained in whole-bundle quarantine.
     pub connections_quarantined: u64,
-    /// Outbound connections or requests terminated by CM/setup failure.
+    /// Connections or requests terminated by CM/setup/retirement failure.
     pub connections_failed: u64,
     /// Local QP transitions to ERR initiated by lifecycle teardown.
     pub qp_error_transitions: u64,
@@ -169,6 +236,8 @@ pub struct RdmaEngineDiagnostics {
     pub shutdowns: u64,
     /// Engine-wide `EngineWedged` terminal outcomes.
     pub engine_wedges: u64,
+    /// Terminal driver failures published to engine frontends.
+    pub terminal_driver_errors: u64,
     /// CQ admission credits reserved before provider posting.
     pub cq_credits_reserved: u64,
     /// CQ credits rolled back for provider-proven unaccepted WRs.
@@ -242,6 +311,7 @@ pub(super) enum CmEventReject {
 
 #[derive(Default)]
 pub(super) struct DiagnosticsState {
+    pub(super) connections_admitted: AtomicU64,
     pub(super) operations_offered: AtomicU64,
     pub(super) operations_accepted: AtomicU64,
     pub(super) operations_unaccepted: AtomicU64,
@@ -277,6 +347,7 @@ pub(super) struct DiagnosticsState {
     pub(super) connection_quarantine_outcomes: AtomicU64,
     pub(super) shutdowns: AtomicU64,
     pub(super) engine_wedges: AtomicU64,
+    pub(super) terminal_driver_errors: AtomicU64,
     pub(super) cq_credits_reserved: AtomicU64,
     pub(super) cq_credits_rolled_back: AtomicU64,
     pub(super) cq_credits_released: AtomicU64,
@@ -326,5 +397,67 @@ impl DiagnosticsState {
             CmEventReject::Unexpected => &self.unexpected_cm_events,
         };
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::v2::engine::{CompletionMode, test_engine_pair};
+
+    #[test]
+    fn snapshot_keeps_capacity_resource_lifecycle_and_reject_counters_distinct() {
+        let (engine, driver) = test_engine_pair(CompletionMode::Polling);
+        let counters = &engine.shared.diagnostic_counters;
+        counters.connections_admitted.store(2, Ordering::Release);
+        counters.operations_offered.store(11, Ordering::Release);
+        counters.operations_accepted.store(10, Ordering::Release);
+        counters.operations_unaccepted.store(1, Ordering::Release);
+        counters.stale_connection_cqes.store(3, Ordering::Release);
+        counters.stale_operation_cqes.store(5, Ordering::Release);
+        counters.unknown_cqes.store(7, Ordering::Release);
+        counters.duplicate_cqes.store(9, Ordering::Release);
+        counters.wrong_connection_cqes.store(11, Ordering::Release);
+        counters.wrong_qp_num_cqes.store(13, Ordering::Release);
+        counters.unexpected_opcode_cqes.store(15, Ordering::Release);
+        counters.stale_cm_events.store(17, Ordering::Release);
+        counters.unknown_cm_events.store(19, Ordering::Release);
+        counters.duplicate_cm_events.store(21, Ordering::Release);
+        counters.terminal_driver_errors.store(23, Ordering::Release);
+
+        let diagnostics = engine.diagnostics();
+        assert_eq!(diagnostics.lifecycle, RdmaEngineLifecycle::Created);
+        assert_eq!(diagnostics.completion_mode, CompletionMode::Polling);
+        assert_eq!(diagnostics.maximum_live_connections, 256);
+        assert_eq!(diagnostics.maximum_inflight_operations, 16_384);
+        assert_eq!(diagnostics.cq_capacity, 16_384);
+        assert_eq!(diagnostics.cq_completion_budget, 32);
+        assert_eq!(diagnostics.cm_event_budget, 32);
+        assert_eq!(diagnostics.reclamation_budget, 32);
+        assert_eq!(diagnostics.ready_connection_quantum, 32);
+        assert_eq!(diagnostics.shared_completion_queues, 1);
+        assert_eq!(diagnostics.shared_cq_notification_fds, 0);
+        assert_eq!(diagnostics.shared_cm_event_fds, 1);
+        assert_eq!(diagnostics.explicit_engine_drivers, 1);
+        assert_eq!(diagnostics.library_owned_tasks, 0);
+        assert_eq!(diagnostics.connections_admitted, 2);
+        assert_eq!(diagnostics.operations_offered, 11);
+        assert_eq!(diagnostics.operations_accepted, 10);
+        assert_eq!(diagnostics.operations_unaccepted, 1);
+        assert_eq!(diagnostics.stale_connection_cqes, 3);
+        assert_eq!(diagnostics.stale_operation_cqes, 5);
+        assert_eq!(diagnostics.unknown_cqes, 7);
+        assert_eq!(diagnostics.duplicate_cqes, 9);
+        assert_eq!(diagnostics.wrong_connection_cqes, 11);
+        assert_eq!(diagnostics.wrong_qp_num_cqes, 13);
+        assert_eq!(diagnostics.unexpected_opcode_cqes, 15);
+        assert_eq!(diagnostics.stale_cm_events, 17);
+        assert_eq!(diagnostics.unknown_cm_events, 19);
+        assert_eq!(diagnostics.duplicate_cm_events, 21);
+        assert_eq!(diagnostics.terminal_driver_errors, 23);
+        assert!(diagnostics.connections.is_empty());
+        assert!(diagnostics.listeners.is_empty());
+        assert_eq!(diagnostics.oldest_quarantine_age, None);
+        drop(driver);
     }
 }

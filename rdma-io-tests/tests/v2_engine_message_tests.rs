@@ -1,4 +1,6 @@
+use std::future::{Future, poll_fn};
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 use std::{collections::HashSet, iter};
 
@@ -9,6 +11,7 @@ use rdma_io::v2::{
     CompletionMode, Error, MessageTransport, MessageTransportBuilder, RdmaEngine,
     RdmaEngineBuilder, RdmaListener, RdmaListenerConfig, Result,
 };
+use rdma_io::wc::WcOpcode;
 use rdma_io_tests::test_helpers::{connect_addr_for, has_software_rdma};
 
 #[derive(Clone, Copy)]
@@ -261,7 +264,9 @@ async fn run_held_repost(mode: CompletionMode) {
     })
     .await
     .expect("ReceivedMessage drop did not publish repost work");
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
     assert!(!second.is_finished());
     assert_eq!(
         server_engine.diagnostics().accepted_outstanding_operations,
@@ -377,6 +382,33 @@ async fn run_cancellation_and_disconnect(mode: CompletionMode) {
     shutdown_engine(client_engine, client_driver).await;
 }
 
+async fn run_recv_cancellation_no_loss(mode: CompletionMode) {
+    let (server_engine, server_driver) = build_engine(mode, 1, Duration::from_secs(5));
+    let (client_engine, client_driver) = build_engine(mode, 1, Duration::from_secs(5));
+    let (listener, server, client) =
+        establish_on(&server_engine, &client_engine, MessageConfig::default()).await;
+
+    let mut cancelled = Box::pin(server.recv());
+    poll_fn(|cx| {
+        assert!(cancelled.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    drop(cancelled);
+
+    client.send(b"successor").await.unwrap();
+    let successor = tokio::time::timeout(Duration::from_secs(10), server.recv())
+        .await
+        .expect("successor message was lost after recv cancellation")
+        .unwrap();
+    assert_eq!(&*successor, b"successor");
+    drop(successor);
+
+    close_connection_pair(listener, server, client).await;
+    shutdown_engine(server_engine, server_driver).await;
+    shutdown_engine(client_engine, client_driver).await;
+}
+
 async fn run_fairness_and_independent_close(mode: CompletionMode) {
     let (server_engine, server_driver) = build_engine(mode, 1, Duration::from_secs(5));
     let (client_engine, client_driver) = build_engine(mode, 1, Duration::from_secs(5));
@@ -477,7 +509,7 @@ async fn run_cancelled_send_quarantine(mode: CompletionMode) {
     let suppression = client_engine
         .test_resources()
         .unwrap()
-        .suppress_next_connection_cqe(&connection)
+        .suppress_next_connection_cqe_with_opcode(&connection, WcOpcode::Send)
         .unwrap();
     let sending_client = Arc::clone(&client);
     let send = tokio::spawn(async move { sending_client.send(b"quarantine").await });
@@ -589,6 +621,15 @@ async fn queued_send_cancellation_and_disconnect_wake_observers() {
     }
     run_cancellation_and_disconnect(CompletionMode::Readiness).await;
     run_cancellation_and_disconnect(CompletionMode::Polling).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn cancelled_recv_does_not_consume_successor_message_in_both_modes() {
+    if !has_software_rdma() {
+        return;
+    }
+    run_recv_cancellation_no_loss(CompletionMode::Readiness).await;
+    run_recv_cancellation_no_loss(CompletionMode::Polling).await;
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]

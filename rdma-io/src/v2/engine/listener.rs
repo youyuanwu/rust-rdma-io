@@ -12,6 +12,7 @@ use futures_util::task::AtomicWaker;
 use tokio::sync::Notify;
 
 use super::connection::{ConnectionReservation, SharedCmId};
+use super::diagnostics::RdmaListenerDiagnostics;
 use super::registry::{lock_unpoison, read_unpoison};
 use super::{EngineShared, PreEstablishSetup, RdmaConnection, RdmaConnectionConfig, SetupSummary};
 use crate::v2::error::{Error, Result};
@@ -1008,6 +1009,17 @@ impl ListenerState {
             queues.waiters.len(),
             usize::from(queues.selected.is_some()),
         )
+    }
+
+    pub(super) fn diagnostics(&self) -> RdmaListenerDiagnostics {
+        let (queued_inbound_requests, pending_accepts, selected_accepts) = self.queue_counts();
+        RdmaListenerDiagnostics {
+            token: self.token,
+            local_addr: self.local_addr,
+            queued_inbound_requests,
+            pending_accepts,
+            selected_accepts,
+        }
     }
 }
 
