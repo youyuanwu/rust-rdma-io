@@ -47,9 +47,12 @@ fn state() -> &'static Mutex<RecorderState> {
 
 /// A bounded, explicitly armed destruction recorder.
 ///
-/// Only one recorder is armed process-wide at a time. Concurrent tests wait
-/// for the current recorder to be dropped, preventing one test from clearing
-/// or consuming another test's observations.
+/// Only one recorder is armed process-wide at a time, so one test can never
+/// clear or consume another test's observations. Arming never blocks: a second
+/// concurrent request is reported as [`RecorderBusy`] instead of waiting, which
+/// keeps the recorder usable from executor threads. Test binaries that use it
+/// therefore rely on the workspace-wide `RUST_TEST_THREADS=1` setting in
+/// `.cargo/config.toml` to serialize their own runs.
 #[derive(Debug)]
 pub struct DestructionRecorder {
     id: u64,
@@ -71,11 +74,19 @@ impl DestructionRecorder {
     /// Arm a recorder that retains at most `capacity` events.
     ///
     /// A zero capacity is rejected because it could silently prove nothing.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `capacity` is zero or when another recorder is already
+    /// armed process-wide. Use [`Self::try_arm`] to handle contention.
     pub fn arm(capacity: usize) -> Self {
         Self::try_arm(capacity).unwrap_or_else(|error| panic!("{error}"))
     }
 
     /// Try to arm without blocking an executor or test thread.
+    ///
+    /// Returns [`RecorderBusy`] when another recorder is already armed or when
+    /// `capacity` is zero.
     pub fn try_arm(capacity: usize) -> Result<Self, RecorderBusy> {
         if capacity == 0 {
             return Err(RecorderBusy);
