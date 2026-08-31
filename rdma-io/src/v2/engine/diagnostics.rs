@@ -129,6 +129,24 @@ pub struct RdmaEngineDiagnostics {
     pub operation_capacity_exhausted: u64,
     /// Capacity failures for CQ admission.
     pub cq_capacity_exhausted: u64,
+    /// Outbound connections that reached RDMA-CM ESTABLISHED.
+    pub connections_opened: u64,
+    /// Outbound connections or requests terminated by CM/setup failure.
+    pub connections_failed: u64,
+    /// CM events consumed and acknowledged by the sole engine driver.
+    pub cm_events_processed: u64,
+    /// CM events rejected from live routing.
+    pub cm_events_rejected: u64,
+    /// CM events carrying a stale route generation.
+    pub stale_cm_events: u64,
+    /// Duplicate CM events for a completed transition.
+    pub duplicate_cm_events: u64,
+    /// CM events with no current engine route.
+    pub unknown_cm_events: u64,
+    /// CM events whose ID did not match their route token.
+    pub wrong_id_cm_events: u64,
+    /// CM events that were invalid for the route's current state.
+    pub unexpected_cm_events: u64,
     #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     pub accepted_test_operations: usize,
@@ -143,6 +161,15 @@ pub(super) enum CqeReject {
     WrongConnection,
     WrongQpNum,
     UnexpectedOpcode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CmEventReject {
+    Stale,
+    Duplicate,
+    Unknown,
+    WrongId,
+    Unexpected,
 }
 
 #[derive(Default)]
@@ -170,6 +197,15 @@ pub(super) struct DiagnosticsState {
     pub(super) connection_capacity_exhausted: AtomicU64,
     pub(super) operation_capacity_exhausted: AtomicU64,
     pub(super) cq_capacity_exhausted: AtomicU64,
+    pub(super) connections_opened: AtomicU64,
+    pub(super) connections_failed: AtomicU64,
+    pub(super) cm_events_processed: AtomicU64,
+    pub(super) cm_events_rejected: AtomicU64,
+    pub(super) stale_cm_events: AtomicU64,
+    pub(super) duplicate_cm_events: AtomicU64,
+    pub(super) unknown_cm_events: AtomicU64,
+    pub(super) wrong_id_cm_events: AtomicU64,
+    pub(super) unexpected_cm_events: AtomicU64,
 }
 
 impl DiagnosticsState {
@@ -182,6 +218,18 @@ impl DiagnosticsState {
             CqeReject::WrongConnection => &self.wrong_connection_cqes,
             CqeReject::WrongQpNum => &self.wrong_qp_num_cqes,
             CqeReject::UnexpectedOpcode => &self.unexpected_opcode_cqes,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn reject_cm_event(&self, reject: CmEventReject) {
+        self.cm_events_rejected.fetch_add(1, Ordering::Relaxed);
+        let counter = match reject {
+            CmEventReject::Stale => &self.stale_cm_events,
+            CmEventReject::Duplicate => &self.duplicate_cm_events,
+            CmEventReject::Unknown => &self.unknown_cm_events,
+            CmEventReject::WrongId => &self.wrong_id_cm_events,
+            CmEventReject::Unexpected => &self.unexpected_cm_events,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }

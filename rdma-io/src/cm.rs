@@ -224,17 +224,46 @@ impl CmEvent {
         unsafe { (*self.inner).id }
     }
 
+    /// The listener CM ID associated with this event, if any.
+    pub fn listen_id_raw(&self) -> *mut rdma_cm_id {
+        unsafe { (*self.inner).listen_id }
+    }
+
+    /// Opaque user-context pointer associated with the event's CM ID.
+    ///
+    /// The pointer is never dereferenced by this wrapper. Engine code uses it
+    /// only as an identity key for a separately owned generational route.
+    pub(crate) fn context_key(&self) -> usize {
+        let id = self.cm_id_raw();
+        if id.is_null() {
+            0
+        } else {
+            unsafe { (*id).context as usize }
+        }
+    }
+
+    /// Acknowledge and consume this event, preserving acknowledgement errors.
+    pub(crate) fn ack_checked(mut self) -> Result<()> {
+        let event = std::mem::replace(&mut self.inner, std::ptr::null_mut());
+        from_ret_errno(unsafe { rdma_ack_cm_event(event) })
+    }
+
     /// Acknowledge and consume this event. Must be called for every event.
     pub fn ack(self) {
-        unsafe { rdma_ack_cm_event(self.inner) };
-        std::mem::forget(self); // prevent double-free in Drop
+        if let Err(error) = self.ack_checked() {
+            tracing::error!("rdma_ack_cm_event failed: {error}");
+        }
     }
 }
 
 impl Drop for CmEvent {
     fn drop(&mut self) {
+        if self.inner.is_null() {
+            return;
+        }
         // If not ack'd, ack now to avoid leaking the event.
         let ret = unsafe { rdma_ack_cm_event(self.inner) };
+        self.inner = std::ptr::null_mut();
         if ret != 0 {
             tracing::error!(
                 "rdma_ack_cm_event failed: {}",
@@ -251,6 +280,12 @@ pub struct CmId {
     pub(crate) inner: *mut rdma_cm_id,
     /// Whether this CmId owns the underlying rdma_cm_id (should call rdma_destroy_id).
     owned: bool,
+    _context_token: Option<Box<CmContextToken>>,
+}
+
+struct CmContextToken {
+    #[allow(dead_code, reason = "the engine owns the decoded generational route")]
+    route: u64,
 }
 
 // Safety: rdma_cm_id operations are serialized by the caller.
@@ -291,6 +326,26 @@ impl CmId {
         Ok(Self {
             inner: id,
             owned: true,
+            _context_token: None,
+        })
+    }
+
+    /// Create a CM ID associated with one engine-owned generational route.
+    pub(crate) fn new_with_context_token(
+        channel: &EventChannel,
+        port_space: PortSpace,
+        route: u64,
+    ) -> Result<Self> {
+        let mut context_token = Box::new(CmContextToken { route });
+        let context = std::ptr::from_mut(context_token.as_mut()).cast();
+        let mut id: *mut rdma_cm_id = std::ptr::null_mut();
+        from_ret_errno(unsafe {
+            rdma_create_id(channel.inner, &mut id, context, port_space.as_raw())
+        })?;
+        Ok(Self {
+            inner: id,
+            owned: true,
+            _context_token: Some(context_token),
         })
     }
 
@@ -300,7 +355,11 @@ impl CmId {
     /// The caller must ensure the pointer is valid and that ownership semantics
     /// are correctly handled.
     pub unsafe fn from_raw(id: *mut rdma_cm_id, owned: bool) -> Self {
-        Self { inner: id, owned }
+        Self {
+            inner: id,
+            owned,
+            _context_token: None,
+        }
     }
 
     /// Resolve the destination address.
@@ -389,6 +448,19 @@ impl CmId {
         from_ret_errno(unsafe { rdma_accept(self.inner, &mut raw) })
     }
 
+    /// Reject an incoming connection request with optional private data.
+    pub fn reject(&self, private_data: &[u8]) -> Result<()> {
+        let len = u8::try_from(private_data.len()).map_err(|_| {
+            crate::Error::InvalidArg("reject private data exceeds 255 bytes".into())
+        })?;
+        let data = if private_data.is_empty() {
+            std::ptr::null()
+        } else {
+            private_data.as_ptr().cast()
+        };
+        from_ret_errno(unsafe { rdma_reject(self.inner, data, len) })
+    }
+
     /// Disconnect from the remote peer.
     pub fn disconnect(&self) -> Result<()> {
         from_ret_errno(unsafe { rdma_disconnect(self.inner) })
@@ -474,6 +546,11 @@ impl CmId {
         self.inner
     }
 
+    /// Opaque context identity installed when this CM ID was created.
+    pub(crate) fn context_key(&self) -> usize {
+        unsafe { (*self.inner).context as usize }
+    }
+
     /// Migrate this CM ID to a different event channel.
     ///
     /// After migration, events for this CM ID will be reported on the new channel.
@@ -557,7 +634,6 @@ impl CmQueuePair {
     }
 
     /// Consume and synchronously destroy this CM-managed QP exactly once.
-    #[expect(dead_code, reason = "used by the engine close path in Phase 6")]
     pub(crate) fn destroy(mut self) {
         self.destroy_once();
     }

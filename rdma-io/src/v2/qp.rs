@@ -324,7 +324,6 @@ impl Qp {
         &self.inner
     }
 
-    #[expect(dead_code, reason = "used by the engine close path in Phase 6")]
     pub(crate) fn destroy(self) {
         self.inner.destroy();
     }

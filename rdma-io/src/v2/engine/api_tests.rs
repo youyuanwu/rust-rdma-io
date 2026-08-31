@@ -13,6 +13,7 @@ fn assert_operation_traits<
     T: Future<Output = (Result<Completion>, Option<Mr>)> + Send + 'static,
 >() {
 }
+fn assert_connect_future<T: Future<Output = Result<RdmaConnection>> + Send>(_: T) {}
 
 struct CountingWaker(AtomicUsize);
 
@@ -80,6 +81,12 @@ fn exact_public_types_and_traits_compile() {
     let _: fn(&RdmaConnection, Mr, Option<(usize, usize)>) -> RdmaOperation = RdmaConnection::send;
     let _: fn(&RdmaConnection, Mr, Option<(usize, usize)>) -> RdmaOperation = RdmaConnection::recv;
     let _: fn(&RdmaConnection) -> RdmaConnectionIdentity = RdmaConnection::identity;
+
+    fn check_connect_methods(engine: &RdmaEngine, address: std::net::SocketAddr) {
+        assert_connect_future(engine.connect(address));
+        assert_connect_future(engine.connect_with_config(address, RdmaConnectionConfig::default()));
+    }
+    let _ = check_connect_methods;
 }
 
 #[test]

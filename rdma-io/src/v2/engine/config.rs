@@ -4,6 +4,7 @@ use std::time::Duration;
 use rdma_io_sys::ibverbs::ibv_device_attr;
 
 use super::super::error::{Error, Result};
+use crate::cm::ConnParam;
 
 pub(crate) const DEFAULT_MAX_LIVE_CONNECTIONS: usize = 256;
 pub(crate) const DEFAULT_MAX_INFLIGHT_OPERATIONS: usize = 16_384;
@@ -153,6 +154,19 @@ impl RdmaConnectionConfig {
     )]
     pub(crate) fn max_recv_sge_value(&self) -> usize {
         self.max_recv_sge
+    }
+
+    pub(crate) fn conn_param(&self) -> Result<ConnParam> {
+        Ok(ConnParam {
+            responder_resources: u8::try_from(self.responder_resources)
+                .map_err(|_| invalid("responder resources do not fit u8"))?,
+            initiator_depth: u8::try_from(self.initiator_depth)
+                .map_err(|_| invalid("initiator depth does not fit u8"))?,
+            retry_count: u8::try_from(self.retry_count)
+                .map_err(|_| invalid("retry count does not fit u8"))?,
+            rnr_retry_count: u8::try_from(self.rnr_retry_count)
+                .map_err(|_| invalid("RNR retry count does not fit u8"))?,
+        })
     }
 
     #[allow(

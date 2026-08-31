@@ -652,9 +652,11 @@ fn start_operation(
         Ok(validated) => validated,
         Err(error) => return StartResult::Immediate((Err(error), Some(mr))),
     };
-    let _admission = read_unpoison(&shared.admission);
-    if let Some(error) = shared.admission_error() {
-        return StartResult::Immediate((Err(error), Some(mr)));
+    {
+        let _admission = read_unpoison(&shared.admission);
+        if let Some(error) = shared.admission_error() {
+            return StartResult::Immediate((Err(error), Some(mr)));
+        }
     }
     let _posting = match connection.begin_posting() {
         Ok(posting) => posting,
@@ -2085,6 +2087,13 @@ mod tests {
             self.error_transitions.fetch_add(1, Ordering::AcqRel);
             Ok(())
         }
+
+        fn destroy_qp(&self) {}
+
+        #[cfg(any(test, feature = "test-hooks"))]
+        fn disconnect(&self) -> Result<()> {
+            Ok(())
+        }
     }
 
     fn production_engine(
@@ -2165,6 +2174,11 @@ mod tests {
             BatchPostOutcome::AllAccepted
         }
         fn to_error(&self) -> Result<()> {
+            Ok(())
+        }
+        fn destroy_qp(&self) {}
+        #[cfg(any(test, feature = "test-hooks"))]
+        fn disconnect(&self) -> Result<()> {
             Ok(())
         }
     }

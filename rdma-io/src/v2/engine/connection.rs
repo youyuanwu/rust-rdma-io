@@ -2,7 +2,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 
 use tokio::sync::Notify;
@@ -13,6 +13,7 @@ use super::registry::{
     ConnectionToken, OperationToken, lock_unpoison, read_unpoison, write_unpoison,
 };
 use super::{EngineShared, RdmaConnectionConfig};
+use crate::cm::{CmId, ConnParam, EventChannel};
 use crate::v2::error::{Error, Result};
 use crate::v2::mr::{AccessIntent, Mr, RemoteMr};
 use crate::v2::qp::{BatchPostOutcome, Qp, QpCapabilities};
@@ -132,7 +133,9 @@ impl RdmaConnection {
             }
             if self.state.accepted_count() == 0 {
                 self.state.finish_close_success();
-                continue;
+                if let Some(outcome) = self.state.close_outcome() {
+                    return outcome.into_result();
+                }
             }
             notified.await;
         }
@@ -161,6 +164,13 @@ pub(super) struct ConnectionState {
     close_notify: Notify,
     quarantined: AtomicBool,
     error_transition_started: AtomicBool,
+    #[allow(
+        dead_code,
+        reason = "released after Phase 6 ordered connection retirement"
+    )]
+    admission: Option<ConnectionReservation>,
+    #[allow(dead_code, reason = "released with the shared CM route in Phase 6")]
+    cm_route_token: Option<u64>,
 }
 
 impl ConnectionState {
@@ -174,6 +184,8 @@ impl ConnectionState {
         config: RdmaConnectionConfig,
         local_addr: Option<SocketAddr>,
         peer_addr: Option<SocketAddr>,
+        admission: Option<ConnectionReservation>,
+        cm_route_token: Option<u64>,
     ) -> Self {
         Self {
             token,
@@ -192,6 +204,8 @@ impl ConnectionState {
             close_notify: Notify::new(),
             quarantined: AtomicBool::new(false),
             error_transition_started: AtomicBool::new(false),
+            admission,
+            cm_route_token,
         }
     }
 
@@ -278,9 +292,46 @@ impl ConnectionState {
 
     pub(super) fn finalize_engine(&self, force_error: bool) {
         self.stop_posting();
-        if force_error && !self.error_transition_started.swap(true, Ordering::AcqRel) {
-            let _ = self.poster.to_error();
+        if force_error {
+            let _ = self.transition_to_error_once();
         }
+    }
+
+    pub(super) fn mark_disconnected(&self) {
+        self.stop_posting();
+        let _ = self.transition_to_error_once();
+        if self.accepted_count() == 0 {
+            self.finish_close_success();
+        }
+    }
+
+    pub(super) fn mark_cm_failure(&self, message: String) {
+        self.stop_posting();
+        let _ = self.transition_to_error_once();
+        let mut outcome = lock_unpoison(&self.close_outcome);
+        if outcome.is_none() {
+            *outcome = Some(CloseOutcome::Failed(Arc::from(message)));
+        }
+        drop(outcome);
+        self.close_notify.notify_waiters();
+    }
+
+    pub(super) fn transition_to_error_once(&self) -> Result<()> {
+        if self.error_transition_started.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        self.poster.to_error()
+    }
+
+    pub(super) fn destroy_qp_zero_outstanding(&self) {
+        debug_assert_eq!(self.accepted_count(), 0);
+        self.stop_posting();
+        self.poster.destroy_qp();
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(super) fn disconnect_for_test(&self) -> Result<()> {
+        self.poster.disconnect()
     }
 
     pub(super) fn wake_close(&self) {
@@ -321,14 +372,15 @@ impl ConnectionState {
     }
 
     fn close_outcome(&self) -> Option<CloseOutcome> {
-        *lock_unpoison(&self.close_outcome)
+        lock_unpoison(&self.close_outcome).clone()
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum CloseOutcome {
     Success,
     Quarantined { outstanding: usize, cq_debt: usize },
+    Failed(Arc<str>),
 }
 
 impl CloseOutcome {
@@ -342,7 +394,59 @@ impl CloseOutcome {
                 outstanding_operations: outstanding,
                 cq_debt,
             }),
+            Self::Failed(message) => Err(Error::Verbs(std::io::Error::other(message.to_string()))),
         }
+    }
+}
+
+pub(super) struct ConnectionAdmissionPool {
+    capacity: usize,
+    used: AtomicUsize,
+}
+
+impl ConnectionAdmissionPool {
+    pub(super) fn new(capacity: usize) -> Arc<Self> {
+        Arc::new(Self {
+            capacity,
+            used: AtomicUsize::new(0),
+        })
+    }
+
+    pub(super) fn try_acquire(self: &Arc<Self>) -> Option<ConnectionReservation> {
+        let mut used = self.used.load(Ordering::Acquire);
+        loop {
+            if used >= self.capacity {
+                return None;
+            }
+            match self.used.compare_exchange_weak(
+                used,
+                used + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(ConnectionReservation {
+                        pool: Arc::clone(self),
+                    });
+                }
+                Err(observed) => used = observed,
+            }
+        }
+    }
+
+    pub(super) fn used(&self) -> usize {
+        self.used.load(Ordering::Acquire)
+    }
+}
+
+pub(super) struct ConnectionReservation {
+    pool: Arc<ConnectionAdmissionPool>,
+}
+
+impl Drop for ConnectionReservation {
+    fn drop(&mut self) {
+        let previous = self.pool.used.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "connection admission must be reserved");
     }
 }
 
@@ -385,6 +489,9 @@ pub(super) trait WorkRequestPoster: Send + Sync {
     fn post_send(&self, batch: &mut PreparedSendBatch) -> BatchPostOutcome;
     fn post_recv(&self, batch: &mut PreparedRecvBatch) -> BatchPostOutcome;
     fn to_error(&self) -> Result<()>;
+    fn destroy_qp(&self);
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn disconnect(&self) -> Result<()>;
 }
 
 #[allow(
@@ -392,9 +499,11 @@ pub(super) trait WorkRequestPoster: Send + Sync {
     reason = "used by Phase 3 test installation and Phase 4 CM paths"
 )]
 pub(super) struct VerbsConnectionResources {
-    qp: Qp,
+    qp: Mutex<Option<Qp>>,
+    qp_num: u32,
+    capabilities: QpCapabilities,
     // Declared after `qp`: Rust drops the QP before the CM owner.
-    _cm_owner: Box<dyn Send + Sync>,
+    cm_owner: ConnectionCmOwner,
 }
 
 impl VerbsConnectionResources {
@@ -402,33 +511,95 @@ impl VerbsConnectionResources {
         dead_code,
         reason = "used by Phase 3 test installation and Phase 4 CM paths"
     )]
-    pub(super) fn new(qp: Qp, cm_owner: impl Send + Sync + 'static) -> Self {
+    pub(super) fn new(qp: Qp, cm_owner: crate::async_cm::AsyncCmId) -> Self {
+        let qp_num = qp.qp_num();
+        let capabilities = qp.capabilities();
         Self {
-            qp,
-            _cm_owner: Box::new(cm_owner),
+            qp: Mutex::new(Some(qp)),
+            qp_num,
+            capabilities,
+            cm_owner: ConnectionCmOwner::External { _cm_id: cm_owner },
+        }
+    }
+
+    pub(super) fn new_shared(qp: Qp, cm_id: CmId, channel: Arc<EventChannel>) -> Self {
+        let qp_num = qp.qp_num();
+        let capabilities = qp.capabilities();
+        Self {
+            qp: Mutex::new(Some(qp)),
+            qp_num,
+            capabilities,
+            cm_owner: ConnectionCmOwner::Shared {
+                cm_id,
+                _channel: channel,
+            },
+        }
+    }
+
+    pub(super) fn connect(&self, param: &ConnParam) -> Result<()> {
+        match &self.cm_owner {
+            ConnectionCmOwner::Shared { cm_id, .. } => cm_id.connect(param).map_err(Error::from),
+            ConnectionCmOwner::External { .. } => Err(Error::InvalidConfig(
+                "external CM owner cannot initiate an engine connection".into(),
+            )),
         }
     }
 }
 
+enum ConnectionCmOwner {
+    Shared {
+        cm_id: CmId,
+        _channel: Arc<EventChannel>,
+    },
+    External {
+        _cm_id: crate::async_cm::AsyncCmId,
+    },
+}
+
 impl WorkRequestPoster for VerbsConnectionResources {
     fn qp_num(&self) -> u32 {
-        self.qp.qp_num()
+        self.qp_num
     }
 
     fn capabilities(&self) -> Option<QpCapabilities> {
-        Some(self.qp.capabilities())
+        Some(self.capabilities)
     }
 
     fn post_send(&self, batch: &mut PreparedSendBatch) -> BatchPostOutcome {
-        self.qp.post_send_batch(batch)
+        let qp = lock_unpoison(&self.qp);
+        qp.as_ref()
+            .expect("posting is stopped before engine QP destruction")
+            .post_send_batch(batch)
     }
 
     fn post_recv(&self, batch: &mut PreparedRecvBatch) -> BatchPostOutcome {
-        self.qp.post_recv_batch(batch)
+        let qp = lock_unpoison(&self.qp);
+        qp.as_ref()
+            .expect("posting is stopped before engine QP destruction")
+            .post_recv_batch(batch)
     }
 
     fn to_error(&self) -> Result<()> {
-        self.qp.to_error()
+        let qp = lock_unpoison(&self.qp);
+        match qp.as_ref() {
+            Some(qp) => qp.to_error(),
+            None => Ok(()),
+        }
+    }
+
+    fn destroy_qp(&self) {
+        let qp = lock_unpoison(&self.qp).take();
+        if let Some(qp) = qp {
+            qp.destroy();
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn disconnect(&self) -> Result<()> {
+        match &self.cm_owner {
+            ConnectionCmOwner::Shared { cm_id, .. } => cm_id.disconnect().map_err(Error::from),
+            ConnectionCmOwner::External { _cm_id } => _cm_id.disconnect().map_err(Error::from),
+        }
     }
 }
 
@@ -444,17 +615,55 @@ pub(super) fn install_connection(
     peer_addr: Option<SocketAddr>,
 ) -> Result<RdmaConnection> {
     config.validate(&shared.config, shared.provider.as_ref())?;
-    if let Some(capabilities) = poster.capabilities() {
-        capabilities.require(&config)?;
-    }
+    let reservation = reserve_connection(shared)?;
+    install_reserved_connection(
+        shared,
+        poster,
+        config,
+        local_addr,
+        peer_addr,
+        reservation,
+        None,
+    )
+}
+
+pub(super) fn reserve_connection(shared: &Arc<EngineShared>) -> Result<ConnectionReservation> {
     let _admission = read_unpoison(&shared.admission);
     if let Some(error) = shared.admission_error() {
         return Err(error);
     }
+    shared.connection_admission.try_acquire().ok_or_else(|| {
+        shared
+            .diagnostic_counters
+            .connection_capacity_exhausted
+            .fetch_add(1, Ordering::Relaxed);
+        Error::CapacityExhausted
+    })
+}
+
+pub(super) fn install_reserved_connection(
+    shared: &Arc<EngineShared>,
+    poster: Arc<dyn WorkRequestPoster>,
+    config: RdmaConnectionConfig,
+    local_addr: Option<SocketAddr>,
+    peer_addr: Option<SocketAddr>,
+    reservation: ConnectionReservation,
+    cm_route_token: Option<u64>,
+) -> Result<RdmaConnection> {
+    config.validate(&shared.config, shared.provider.as_ref())?;
+    if let Some(capabilities) = poster.capabilities() {
+        capabilities.require(&config)?;
+    }
     let qp_num = poster.qp_num();
     let registration = shared.connections.register(qp_num, |token| {
         Arc::new(ConnectionState::new(
-            token, poster, config, local_addr, peer_addr,
+            token,
+            poster,
+            config,
+            local_addr,
+            peer_addr,
+            Some(reservation),
+            cm_route_token,
         ))
     });
     let (_, state) = match registration {

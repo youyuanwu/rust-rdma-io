@@ -1,5 +1,6 @@
 //! Explicitly driven, shared v2 RDMA engine.
 
+mod cm;
 mod config;
 mod connection;
 mod diagnostics;
@@ -23,6 +24,7 @@ use tokio::sync::Notify;
 
 use config::EngineConfig;
 pub use config::{CompletionMode, RdmaConnectionConfig};
+use connection::ConnectionAdmissionPool;
 pub use connection::{RdmaConnection, RdmaConnectionIdentity};
 use diagnostics::DiagnosticsState;
 pub use diagnostics::{RdmaEngineDiagnostics, RdmaEngineLifecycle, RdmaEngineTerminalError};
@@ -203,6 +205,27 @@ impl RdmaEngine {
         self.shared.diagnostics()
     }
 
+    /// Establish an outbound low-level connection with the default QP/CM
+    /// configuration. The engine driver owns every CM and CQ progress step.
+    pub async fn connect(&self, address: std::net::SocketAddr) -> Result<RdmaConnection> {
+        cm::connect(
+            Arc::clone(&self.shared),
+            address,
+            RdmaConnectionConfig::default(),
+        )
+        .await
+    }
+
+    /// Establish an outbound low-level connection with an explicit validated
+    /// QP/CM configuration.
+    pub async fn connect_with_config(
+        &self,
+        address: std::net::SocketAddr,
+        config: RdmaConnectionConfig,
+    ) -> Result<RdmaConnection> {
+        cm::connect(Arc::clone(&self.shared), address, config).await
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     pub fn test_resources(&self) -> Result<driver::TestEngineResources> {
@@ -255,8 +278,10 @@ struct EngineShared {
     )]
     provider: Option<config::ProviderLimits>,
     resource_refs: Option<EngineResourceRefs>,
+    connection_admission: Arc<ConnectionAdmissionPool>,
     connections: ConnectionRegistry,
     operations: OperationRegistry,
+    cm: cm::CmState,
     cq_credits: CqCreditPool,
     diagnostic_counters: DiagnosticsState,
     accepted_operations: AtomicUsize,
@@ -293,13 +318,17 @@ impl EngineShared {
         let connections = ConnectionRegistry::new(config.max_live_connections)?;
         let operations = OperationRegistry::new(config.max_inflight_operations)?;
         let cq_credits = CqCreditPool::new(config.cq_capacity);
+        let connection_admission = ConnectionAdmissionPool::new(config.max_live_connections);
+        let cm = cm::CmState::new(config.max_live_connections)?;
         Ok(Self {
             config,
             resources,
             provider,
             resource_refs,
+            connection_admission,
             connections,
             operations,
+            cm,
             cq_credits,
             diagnostic_counters: DiagnosticsState::default(),
             accepted_operations: AtomicUsize::new(0),
@@ -336,7 +365,7 @@ impl EngineShared {
     }
 
     fn finish(&self, outcome: EngineOutcome) {
-        let (operations_to_wake, connections_to_wake) = {
+        let (operations_to_wake, connections_to_wake, force_connection_error) = {
             let _admission = write_unpoison(&self.admission);
             let mut terminal = lock_unpoison(&self.terminal);
             if terminal.is_some() {
@@ -373,13 +402,14 @@ impl EngineShared {
 
             let connections_to_wake = self.connections.occupied();
             let force_error = matches!(outcome, EngineOutcome::Failure(_));
-            for connection in &connections_to_wake {
-                connection.finalize_engine(force_error);
-            }
             drop(terminal);
-            (operations_to_wake, connections_to_wake)
+            (operations_to_wake, connections_to_wake, force_error)
         };
 
+        self.cm.terminalize(&outcome);
+        for connection in &connections_to_wake {
+            connection.finalize_engine(force_connection_error);
+        }
         for operation in operations_to_wake {
             operation.wake();
         }
@@ -485,7 +515,7 @@ impl EngineShared {
     }
 
     fn retain_after_failure(shared: &Arc<Self>) {
-        if shared.unsafe_outstanding_operations() == 0
+        if (shared.unsafe_outstanding_operations() == 0 && shared.cm.route_count() == 0)
             || shared.failure_retained.swap(true, Ordering::AcqRel)
         {
             return;
@@ -512,7 +542,7 @@ impl EngineShared {
             shared_completion_channels: self.resources.completion_channels,
             shared_cm_event_channels: self.resources.cm_event_channels,
             driver_yields: self.driver_yields.load(Ordering::Acquire),
-            live_connection_reservations: self.connections.live(),
+            live_connection_reservations: self.connection_admission.used(),
             free_connection_slots: self.connections.free(),
             retired_connection_slots: self.connections.retired(),
             registered_operations: self.operations.live(),
@@ -611,6 +641,42 @@ impl EngineShared {
             cq_capacity_exhausted: self
                 .diagnostic_counters
                 .cq_capacity_exhausted
+                .load(Ordering::Acquire),
+            connections_opened: self
+                .diagnostic_counters
+                .connections_opened
+                .load(Ordering::Acquire),
+            connections_failed: self
+                .diagnostic_counters
+                .connections_failed
+                .load(Ordering::Acquire),
+            cm_events_processed: self
+                .diagnostic_counters
+                .cm_events_processed
+                .load(Ordering::Acquire),
+            cm_events_rejected: self
+                .diagnostic_counters
+                .cm_events_rejected
+                .load(Ordering::Acquire),
+            stale_cm_events: self
+                .diagnostic_counters
+                .stale_cm_events
+                .load(Ordering::Acquire),
+            duplicate_cm_events: self
+                .diagnostic_counters
+                .duplicate_cm_events
+                .load(Ordering::Acquire),
+            unknown_cm_events: self
+                .diagnostic_counters
+                .unknown_cm_events
+                .load(Ordering::Acquire),
+            wrong_id_cm_events: self
+                .diagnostic_counters
+                .wrong_id_cm_events
+                .load(Ordering::Acquire),
+            unexpected_cm_events: self
+                .diagnostic_counters
+                .unexpected_cm_events
                 .load(Ordering::Acquire),
             #[cfg(any(test, feature = "test-hooks"))]
             accepted_test_operations: self.test_driver.accepted_outstanding(),

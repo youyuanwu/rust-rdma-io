@@ -438,6 +438,7 @@ impl ConnectionRegistry {
         self.slots.release(token, true)
     }
 
+    #[allow(dead_code, reason = "used by Phase 6 connection lifecycle accounting")]
     pub(super) fn live(&self) -> usize {
         self.slots.live()
     }

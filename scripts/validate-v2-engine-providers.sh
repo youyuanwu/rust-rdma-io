@@ -41,8 +41,13 @@ case "$MODE" in
         REPETITIONS=1
         MODE_LABEL="Phase 3 owned-operation routing"
         ;;
+    --phase4-connections)
+        TEST_TARGET="v2_engine_connection_tests"
+        REPETITIONS=1
+        MODE_LABEL="Phase 4 shared-CM outbound connections"
+        ;;
     *)
-        echo "usage: sudo -E ./scripts/validate-v2-engine-providers.sh {--provider-probe|--readiness-race|--driver-flush-gate|--phase3-operations}" >&2
+        echo "usage: sudo -E ./scripts/validate-v2-engine-providers.sh {--provider-probe|--readiness-race|--driver-flush-gate|--phase3-operations|--phase4-connections}" >&2
         exit 2
         ;;
 esac

@@ -18,7 +18,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 
-use crate::cm::EventChannel;
 use crate::wc::WorkCompletion;
 
 #[cfg(panic = "unwind")]
@@ -72,20 +71,6 @@ impl WorkSignal {
             waker.wake_by_ref();
         }
         pending
-    }
-}
-
-fn try_ack_cm_event(channel: &EventChannel) -> Result<bool> {
-    match channel.try_get_event() {
-        Ok(event) => {
-            event.ack();
-            Ok(true)
-        }
-        Err(crate::Error::WouldBlock) => Ok(false),
-        Err(crate::Error::Verbs(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
-            Ok(false)
-        }
-        Err(error) => Err(error.into()),
     }
 }
 
@@ -149,6 +134,9 @@ impl RdmaEngineDriver {
         if published & READY_CONNECTION_WORK != 0 {
             self.scheduler.mark_class_ready(WorkClass::ReadyConnection);
         }
+        if published & super::cm::CM_WORK != 0 {
+            self.scheduler.mark_class_ready(WorkClass::Cm);
+        }
     }
 
     fn fail(&mut self, failure: EngineFailure) -> Poll<Result<()>> {
@@ -172,6 +160,12 @@ impl RdmaEngineDriver {
             .shutdown_requested
             .load(std::sync::atomic::Ordering::Acquire)
         {
+            return false;
+        }
+        self.shared
+            .cm
+            .begin_shutdown(&EngineOutcome::Failure(EngineFailure::DriverShutdown));
+        if self.shared.cm.pending_route_count() != 0 {
             return false;
         }
 
@@ -259,39 +253,44 @@ impl RdmaEngineDriver {
         let Some(resources) = self.resources.as_ref() else {
             return Ok(false);
         };
+        let budget = self.shared.config.cm_event_budget;
+        let mut processed = self
+            .shared
+            .cm
+            .service_software(&self.shared, resources, budget)?;
+        while processed < budget && self.shared.cm.try_process_event(&self.shared, resources)? {
+            processed += 1;
+        }
 
-        let processed = match self.shared.config.completion_mode {
+        let readiness_processed = match self.shared.config.completion_mode {
             CompletionMode::Readiness => {
-                let async_fd = resources.cm_async_fd.as_ref().ok_or_else(|| {
-                    Error::InvalidConfig("readiness engine has no CM AsyncFd".into())
-                })?;
-                match poll_readiness_events(
-                    cx,
-                    self.shared.config.cm_event_budget,
-                    |cx| match async_fd.poll_read_ready(cx) {
-                        Poll::Ready(Ok(guard)) => Poll::Ready(Ok(guard)),
-                        Poll::Ready(Err(error)) => Poll::Ready(Err(Error::Verbs(error))),
-                        Poll::Pending => Poll::Pending,
-                    },
-                    |guard| guard.clear_ready(),
-                    || try_ack_cm_event(&resources.cm_event_channel),
-                ) {
-                    Poll::Ready(result) => result?,
-                    Poll::Pending => return Ok(false),
+                if processed == budget {
+                    0
+                } else {
+                    let async_fd = resources.cm_async_fd.as_ref().ok_or_else(|| {
+                        Error::InvalidConfig("readiness engine has no CM AsyncFd".into())
+                    })?;
+                    match poll_readiness_events(
+                        cx,
+                        budget - processed,
+                        |cx| match async_fd.poll_read_ready(cx) {
+                            Poll::Ready(Ok(guard)) => Poll::Ready(Ok(guard)),
+                            Poll::Ready(Err(error)) => Poll::Ready(Err(Error::Verbs(error))),
+                            Poll::Pending => Poll::Pending,
+                        },
+                        |guard| guard.clear_ready(),
+                        || self.shared.cm.try_process_event(&self.shared, resources),
+                    ) {
+                        Poll::Ready(result) => result?,
+                        Poll::Pending => 0,
+                    }
                 }
             }
-            CompletionMode::Polling => {
-                let mut processed = 0;
-                while processed < self.shared.config.cm_event_budget
-                    && try_ack_cm_event(&resources.cm_event_channel)?
-                {
-                    processed += 1;
-                }
-                processed
-            }
+            CompletionMode::Polling => 0,
         };
+        processed += readiness_processed;
 
-        if processed == self.shared.config.cm_event_budget {
+        if processed == budget || self.shared.cm.has_software_work() {
             self.scheduler.mark_class_ready(WorkClass::Cm);
         }
         Ok(processed > 0)
@@ -497,7 +496,8 @@ impl Drop for RdmaEngineDriver {
                 .accepted_operations
                 .load(std::sync::atomic::Ordering::Acquire);
             let outstanding = test_outstanding + production;
-            let failure = if outstanding == 0 {
+            let cm_routes = self.shared.cm.route_count();
+            let failure = if outstanding == 0 && cm_routes == 0 {
                 EngineFailure::DriverShutdown
             } else {
                 #[cfg(any(test, feature = "test-hooks"))]
@@ -505,7 +505,9 @@ impl Drop for RdmaEngineDriver {
                 #[cfg(not(any(test, feature = "test-hooks")))]
                 let test_bundles = 0;
                 EngineFailure::Wedged {
-                    retained_bundles: (self.shared.retained_bundle_count() + test_bundles).max(1),
+                    retained_bundles: (self.shared.retained_bundle_count().max(cm_routes)
+                        + test_bundles)
+                        .max(1),
                     outstanding_operations: outstanding,
                 }
             };
@@ -710,6 +712,17 @@ pub(super) mod test_api {
                 ));
             }
             connection.transition_to_error_for_test()
+        }
+
+        /// Request an RDMA-CM disconnect for an outbound engine connection.
+        pub fn disconnect_connection(&self, connection: &RdmaConnection) -> Result<()> {
+            let shared = self.ensure_active()?;
+            if !Arc::ptr_eq(&shared, &connection.shared) {
+                return Err(Error::InvalidConfig(
+                    "connection belongs to another engine".into(),
+                ));
+            }
+            connection.state.disconnect_for_test()
         }
 
         /// Pause the next CQ arm-to-post-poll window until released.
