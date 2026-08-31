@@ -70,7 +70,10 @@ impl RdmaListenerConfig {
     }
 }
 
-/// Engine-owned inbound listener with no private progress future or resources.
+/// Engine-owned inbound listener whose progress and resources belong to its engine driver.
+///
+/// Clones share one listener endpoint. Dropping the final clone requests an
+/// asynchronous close; call [`Self::close`] when the result must be observed.
 pub struct RdmaListener {
     pub(super) shared: Arc<EngineShared>,
     pub(super) state: Arc<ListenerState>,
@@ -87,10 +90,16 @@ impl Clone for RdmaListener {
 }
 
 impl RdmaListener {
+    /// Return the address assigned to this listener.
     pub fn local_addr(&self) -> Result<SocketAddr> {
         Ok(self.state.local_addr)
     }
 
+    /// Accept the next inbound connection with the default connection configuration.
+    ///
+    /// Pending accepts are cancelled safely if their futures are dropped. Once
+    /// closing starts, new accepts fail with the listener's contextual close
+    /// error, or with the engine-wide terminal error if the driver has failed.
     pub async fn accept(&self) -> Result<RdmaConnection> {
         accept_with_setup(
             Arc::clone(&self.shared),
@@ -101,6 +110,10 @@ impl RdmaListener {
         .await
     }
 
+    /// Accept the next inbound connection with an explicit connection configuration.
+    ///
+    /// The configuration is validated before the accept waiter is registered.
+    /// Cancellation and listener-close behavior are the same as [`Self::accept`].
     pub async fn accept_with_config(&self, config: RdmaConnectionConfig) -> Result<RdmaConnection> {
         accept_with_setup(
             Arc::clone(&self.shared),
@@ -111,6 +124,12 @@ impl RdmaListener {
         .await
     }
 
+    /// Close the listener and wait for CM destruction or engine termination.
+    ///
+    /// Close is idempotent across clones. If the engine driver fails while the
+    /// CM ID is awaiting destruction, every close waiter is woken with the same
+    /// engine-wide terminal error and the ID remains quarantined with the failed
+    /// engine rather than being destroyed without CM progress.
     pub async fn close(&self) -> Result<()> {
         self.state.request_close(&self.shared);
         loop {
@@ -621,11 +640,11 @@ impl ListenerState {
 
     pub(super) fn register_waiter(&self, request: Arc<AcceptRequest>) -> Result<()> {
         if self.closing.load(Ordering::Acquire) {
-            return Err(Error::TransportClosed);
+            return Err(self.close_error());
         }
         let mut queues = lock_unpoison(&self.queues);
         if self.closing.load(Ordering::Acquire) {
-            return Err(Error::TransportClosed);
+            return Err(self.close_error());
         }
         queues.waiters.push_back(request);
         select_pair(&mut queues);
@@ -904,6 +923,12 @@ impl ListenerState {
 
     pub(super) fn terminalize(&self, outcome: &super::EngineOutcome) {
         self.closing.store(true, Ordering::Release);
+        {
+            let mut close_outcome = lock_unpoison(&self.close_outcome);
+            if close_outcome.is_none() {
+                *close_outcome = Some(ListenerCloseOutcome::Terminal(outcome.clone()));
+            }
+        }
         let mut queues = lock_unpoison(&self.queues);
         let mut requests: Vec<_> = queues
             .waiters
@@ -1031,6 +1056,7 @@ pub(super) enum InboundRejectReason {
 enum ListenerCloseOutcome {
     Success,
     Failed(Arc<str>),
+    Terminal(super::EngineOutcome),
 }
 
 impl ListenerCloseOutcome {
@@ -1038,6 +1064,7 @@ impl ListenerCloseOutcome {
         match self {
             Self::Success => Ok(()),
             Self::Failed(message) => Err(Error::Verbs(std::io::Error::other(message.to_string()))),
+            Self::Terminal(outcome) => outcome.into_result(),
         }
     }
 }
@@ -1074,6 +1101,17 @@ mod tests {
             RdmaListenerConfig::default().backlog_capacity(),
             DEFAULT_LISTENER_BACKLOG
         );
+    }
+
+    #[test]
+    fn waiter_registration_reports_the_listener_failure_context() {
+        let listener = ListenerState::test_only(1);
+        *lock_unpoison(&listener.failure) = Some(Arc::from("listener CM close failed"));
+        listener.closing.store(true, Ordering::Release);
+
+        let error = listener.register_waiter(request()).unwrap_err();
+        assert!(matches!(error, Error::Verbs(_)));
+        assert!(error.to_string().contains("listener CM close failed"));
     }
 
     #[test]

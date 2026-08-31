@@ -132,6 +132,18 @@ impl CmState {
         lock_unpoison(&self.cm_destructions).push_back(PendingCmDestruction::Route(cm_id));
     }
 
+    #[cfg(test)]
+    pub(super) fn defer_test_listener_destruction(
+        &self,
+        listener: Arc<ListenerState>,
+        destroy_count: Arc<AtomicUsize>,
+    ) {
+        lock_unpoison(&self.cm_destructions).push_back(PendingCmDestruction::Test {
+            destroy_count,
+            listener: Some(listener),
+        });
+    }
+
     fn enqueue_cancellation(&self, request: Arc<OutboundRequest>) {
         if request.try_enqueue_cancellation() {
             lock_unpoison(&self.cancellations).push_back(request);
@@ -453,8 +465,14 @@ impl CmState {
                             listener.finish_close(None);
                         }
                         #[cfg(test)]
-                        PendingCmDestruction::Test { destroyed } => {
-                            destroyed.store(true, Ordering::Release);
+                        PendingCmDestruction::Test {
+                            destroy_count,
+                            listener,
+                        } => {
+                            destroy_count.fetch_add(1, Ordering::AcqRel);
+                            if let Some(listener) = listener {
+                                listener.finish_close(None);
+                            }
                         }
                     }
                 }
@@ -488,7 +506,20 @@ impl CmState {
         for request in pending_listens {
             request.complete(Err(terminal_error(outcome)));
         }
-        let listeners: Vec<_> = lock_unpoison(&self.listeners).values().cloned().collect();
+        let mut listeners: Vec<_> = lock_unpoison(&self.listeners).values().cloned().collect();
+        let pending_listeners: Vec<_> = lock_unpoison(&self.cm_destructions)
+            .iter()
+            .filter_map(PendingCmDestruction::listener)
+            .cloned()
+            .collect();
+        for listener in pending_listeners {
+            if !listeners
+                .iter()
+                .any(|active| Arc::ptr_eq(active, &listener))
+            {
+                listeners.push(listener);
+            }
+        }
         for listener in listeners {
             listener.terminalize(outcome);
         }
@@ -2403,7 +2434,8 @@ enum PendingCmDestruction {
     },
     #[cfg(test)]
     Test {
-        destroyed: Arc<AtomicBool>,
+        destroy_count: Arc<AtomicUsize>,
+        listener: Option<Arc<ListenerState>>,
     },
 }
 
@@ -2415,6 +2447,15 @@ impl PendingCmDestruction {
             }
             #[cfg(test)]
             Self::Test { .. } => None,
+        }
+    }
+
+    fn listener(&self) -> Option<&Arc<ListenerState>> {
+        match self {
+            Self::Listener { listener, .. } => Some(listener),
+            #[cfg(test)]
+            Self::Test { listener, .. } => listener.as_ref(),
+            Self::Route(_) | Self::Connection { .. } => None,
         }
     }
 }
@@ -3409,9 +3450,18 @@ mod tests {
     fn cm_destroy_barrier_is_budgeted_across_service_passes() {
         let (engine, driver) =
             super::super::test_engine_pair(super::super::CompletionMode::Polling);
-        let destroyed = Arc::new(AtomicBool::new(false));
+        let listener_state = ListenerState::test_only(1);
+        let listener = RdmaListener {
+            shared: Arc::clone(&engine.shared),
+            state: Arc::clone(&listener_state),
+        };
+        let mut close = Box::pin(listener.close());
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(close.as_mut().poll(&mut cx).is_pending());
+        let destroy_count = Arc::new(AtomicUsize::new(0));
         lock_unpoison(&engine.shared.cm.cm_destructions).push_back(PendingCmDestruction::Test {
-            destroyed: Arc::clone(&destroyed),
+            destroy_count: Arc::clone(&destroy_count),
+            listener: Some(listener_state),
         });
         let mut pending = VecDeque::from(["target", "peer"]);
         let mut routed = Vec::new();
@@ -3432,7 +3482,7 @@ mod tests {
                 .unwrap();
             assert_eq!(processed, 1);
             assert_eq!(routed.last().copied(), Some(expected));
-            assert!(!destroyed.load(Ordering::Acquire));
+            assert_eq!(destroy_count.load(Ordering::Acquire), 0);
             assert_eq!(lock_unpoison(&engine.shared.cm.cm_destructions).len(), 1);
         }
         let processed = engine
@@ -3447,8 +3497,26 @@ mod tests {
         assert_eq!(probes, 3);
         assert_eq!(routed, ["target", "peer"]);
         assert!(pending.is_empty());
-        assert!(destroyed.load(Ordering::Acquire));
+        assert_eq!(destroy_count.load(Ordering::Acquire), 1);
         assert!(lock_unpoison(&engine.shared.cm.cm_destructions).is_empty());
+        assert!(matches!(close.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
+        listener
+            .state
+            .finish_close(Some("late duplicate finish".into()));
+        let mut repeated_close = Box::pin(listener.close());
+        assert!(matches!(
+            repeated_close.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(
+            engine
+                .shared
+                .cm
+                .service_cm_destructions(&engine.shared, 1, || Ok(false))
+                .unwrap(),
+            0
+        );
+        assert_eq!(destroy_count.load(Ordering::Acquire), 1);
         drop(engine);
         drop(driver);
     }

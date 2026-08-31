@@ -1624,7 +1624,10 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::v2::engine::{RdmaEngineLifecycle, test_engine_pair};
+    use crate::v2::engine::listener::ListenerState;
+    use crate::v2::engine::{
+        RdmaEngineLifecycle, RdmaEngineTerminalError, RdmaListener, test_engine_pair,
+    };
 
     struct CountingWaker(AtomicUsize);
 
@@ -1906,5 +1909,93 @@ mod tests {
         ));
         engine.shared.transition_running();
         assert_eq!(engine.shared.lifecycle(), RdmaEngineLifecycle::Terminated);
+    }
+
+    fn pending_destruction_listener(
+        engine: &super::super::RdmaEngine,
+    ) -> (RdmaListener, Arc<AtomicUsize>) {
+        let state = ListenerState::test_only(1);
+        let destroy_count = Arc::new(AtomicUsize::new(0));
+        engine
+            .shared
+            .cm
+            .defer_test_listener_destruction(Arc::clone(&state), Arc::clone(&destroy_count));
+        (
+            RdmaListener {
+                shared: Arc::clone(&engine.shared),
+                state,
+            },
+            destroy_count,
+        )
+    }
+
+    fn assert_terminal_close(
+        close: &mut Pin<Box<impl Future<Output = Result<()>>>>,
+        cx: &mut TaskContext<'_>,
+        expected: &RdmaEngineTerminalError,
+    ) {
+        let Poll::Ready(Err(error)) = close.as_mut().poll(cx) else {
+            panic!("pending listener close was not terminalized");
+        };
+        assert_eq!(error.to_string(), expected.message);
+    }
+
+    #[test]
+    fn driver_drop_wakes_listener_close_pending_cm_destruction() {
+        let (engine, driver) = test_engine_pair(CompletionMode::Polling);
+        let (listener, destroy_count) = pending_destruction_listener(&engine);
+        let counter = CountingWaker::new();
+        let waker = counter.waker();
+        let mut cx = TaskContext::from_waker(&waker);
+        let mut close = Box::pin(listener.close());
+
+        assert!(close.as_mut().poll(&mut cx).is_pending());
+        drop(driver);
+
+        let terminal = engine
+            .diagnostics()
+            .terminal_error
+            .expect("driver drop must publish a terminal error");
+        assert_eq!(terminal.class, "EngineWedged");
+        assert_terminal_close(&mut close, &mut cx, &terminal);
+        assert_eq!(counter.count(), 1);
+        assert_eq!(destroy_count.load(Ordering::Acquire), 0);
+        assert_eq!(engine.shared.cm.retained_owner_count(), 1);
+    }
+
+    #[test]
+    fn driver_error_wakes_listener_close_once_and_preserves_pending_destruction() {
+        let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
+        let (listener, destroy_count) = pending_destruction_listener(&engine);
+        let counter = CountingWaker::new();
+        let waker = counter.waker();
+        let mut cx = TaskContext::from_waker(&waker);
+        let mut close = Box::pin(listener.close());
+
+        assert!(close.as_mut().poll(&mut cx).is_pending());
+        let Poll::Ready(Err(driver_error)) = driver.fail(EngineFailure::Progress(
+            "injected driver progress failure".into(),
+        )) else {
+            panic!("injected driver failure did not terminate the driver");
+        };
+        let terminal = engine
+            .diagnostics()
+            .terminal_error
+            .expect("driver error must publish a terminal error");
+        assert_eq!(driver_error.to_string(), terminal.message);
+        assert_terminal_close(&mut close, &mut cx, &terminal);
+        assert_eq!(counter.count(), 1);
+        assert_eq!(destroy_count.load(Ordering::Acquire), 0);
+        assert_eq!(engine.shared.cm.retained_owner_count(), 1);
+
+        drop(driver);
+        assert_eq!(counter.count(), 1, "driver drop must not finish twice");
+        assert_eq!(
+            engine
+                .diagnostics()
+                .terminal_error
+                .expect("terminal error remains available"),
+            terminal
+        );
     }
 }
