@@ -503,7 +503,9 @@ async fn run_unspawned_driver_drop(mode: CompletionMode) {
         engine.shutdown().await,
         Err(Error::DriverShutdown)
     ));
-    let terminal = engine.diagnostics().terminal_error.unwrap();
+    let diagnostics = engine.diagnostics();
+    assert_eq!(diagnostics.shutdowns, 0);
+    let terminal = diagnostics.terminal_error.unwrap();
     assert_eq!(terminal.class, "DriverShutdown");
 }
 

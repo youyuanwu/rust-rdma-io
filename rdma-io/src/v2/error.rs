@@ -70,9 +70,10 @@ pub enum Error {
         cq_debt: usize,
     },
 
-    /// Engine termination retained one or more unsafe live bundles.
+    /// Engine termination retained unsafe live state.
     EngineWedged {
-        /// Complete QP/CM/MR/operation bundles retained fail-closed.
+        /// Complete QP/CM/MR/operation bundles retained fail-closed. This can
+        /// be zero when only non-bundle CM routing work remains pending.
         retained_bundles: usize,
         /// Accepted operations still awaiting exact completions.
         outstanding_operations: usize,

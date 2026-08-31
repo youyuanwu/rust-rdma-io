@@ -18,9 +18,11 @@ impl EngineShared {
         self.diagnostic_counters
             .engine_wedges
             .fetch_add(1, Ordering::Relaxed);
+        // Pending CM work can wedge shutdown without owning a retained bundle.
         Some(EngineFailure::Wedged {
-            retained_bundles: retained_bundles.max(1),
+            retained_bundles,
             outstanding_operations,
+            cq_debt: outstanding_operations,
         })
     }
 
@@ -33,8 +35,10 @@ impl EngineShared {
                     .qp_error_transitions
                     .fetch_add(1, Ordering::Relaxed);
             }
-            if connection.accepted_count() == 0 && !connection.is_retired() {
-                connection.poster.destroy_qp();
+            if connection.accepted_count() == 0
+                && !connection.is_retired()
+                && connection.poster.destroy_qp()
+            {
                 self.record_qp_destroy();
             }
         }
@@ -87,8 +91,10 @@ mod tests {
             Ok(())
         }
 
-        fn destroy_qp(&self) {
-            self.destroys.fetch_add(1, Ordering::AcqRel);
+        fn destroy_qp(&self) -> bool {
+            self.destroys
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
         }
 
         fn disconnect(&self) -> Result<()> {
@@ -122,6 +128,31 @@ mod tests {
             invalid.shutdown_deadline = deadline;
             assert!(invalid.validate_without_provider().is_err());
         }
+    }
+
+    #[test]
+    fn driver_drop_counts_only_the_take_once_qp_destroy() {
+        let (engine, driver) = test_engine_pair(CompletionMode::Polling);
+        let poster = Arc::new(HeldPoster {
+            qp_num: 31,
+            destroys: AtomicUsize::new(0),
+        });
+        install_connection(
+            &engine.shared,
+            Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
+            RdmaConnectionConfig::default(),
+            None,
+            None,
+        )
+        .unwrap();
+
+        engine.shared.synchronously_prepare_driver_drop();
+        engine.shared.synchronously_prepare_driver_drop();
+
+        assert_eq!(poster.destroys.load(Ordering::Acquire), 1);
+        assert_eq!(engine.diagnostics().qp_destroys, 1);
+        engine.shared.finish(super::super::EngineOutcome::Success);
+        drop(driver);
     }
 
     #[tokio::test(start_paused = true)]

@@ -399,14 +399,10 @@ impl EngineShared {
     fn request_shutdown(&self) {
         #[cfg(any(test, feature = "test-hooks"))]
         self.test_driver.record_shutdown_attempt();
-        {
-            let _admission = write_unpoison(&self.admission);
-            if !self.shutdown_requested.swap(true, Ordering::AcqRel) {
-                self.transition_shutdown_requested();
-                self.diagnostic_counters
-                    .shutdowns
-                    .fetch_add(1, Ordering::Relaxed);
-            }
+        if self.mark_shutdown_requested() {
+            self.diagnostic_counters
+                .shutdowns
+                .fetch_add(1, Ordering::Relaxed);
         }
         if !self
             .shutdown_deadline_scheduled
@@ -419,6 +415,15 @@ impl EngineShared {
             );
         }
         self.work_signal.publish(driver::TERMINAL_WORK);
+    }
+
+    fn mark_shutdown_requested(&self) -> bool {
+        let _admission = write_unpoison(&self.admission);
+        if self.shutdown_requested.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        self.transition_shutdown_requested();
+        true
     }
 
     fn finish(&self, outcome: EngineOutcome) {
@@ -933,6 +938,7 @@ enum EngineFailure {
     Wedged {
         retained_bundles: usize,
         outstanding_operations: usize,
+        cq_debt: usize,
     },
 }
 
@@ -944,10 +950,11 @@ impl EngineFailure {
             Self::Wedged {
                 retained_bundles,
                 outstanding_operations,
+                cq_debt,
             } => Error::EngineWedged {
                 retained_bundles,
                 outstanding_operations,
-                cq_debt: outstanding_operations,
+                cq_debt,
             },
         }
     }
@@ -971,10 +978,11 @@ impl EngineFailure {
             Error::EngineWedged {
                 retained_bundles,
                 outstanding_operations,
-                ..
+                cq_debt,
             } => Self::Wedged {
                 retained_bundles,
                 outstanding_operations,
+                cq_debt,
             },
             error => Self::Progress(error),
         }

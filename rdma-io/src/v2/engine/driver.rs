@@ -562,7 +562,7 @@ impl Future for RdmaEngineDriver {
 impl Drop for RdmaEngineDriver {
     fn drop(&mut self) {
         if self.shared.outcome().is_none() {
-            self.shared.request_shutdown();
+            self.shared.mark_shutdown_requested();
             self.shared.synchronously_prepare_driver_drop();
             #[cfg(any(test, feature = "test-hooks"))]
             let test_outstanding = self.shared.test_driver.accepted_outstanding();
@@ -594,6 +594,7 @@ impl Drop for RdmaEngineDriver {
                         + test_bundles)
                         .max(1),
                     outstanding_operations: outstanding,
+                    cq_debt: outstanding,
                 }
             };
             self.shared.finish(EngineOutcome::Failure(failure));

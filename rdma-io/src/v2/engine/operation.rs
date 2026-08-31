@@ -1993,6 +1993,7 @@ mod tests {
         shared.finish(EngineOutcome::Failure(EngineFailure::Wedged {
             retained_bundles: 1,
             outstanding_operations: 1,
+            cq_debt: 1,
         }));
 
         assert!(
@@ -2160,7 +2161,9 @@ mod tests {
             Ok(())
         }
 
-        fn destroy_qp(&self) {}
+        fn destroy_qp(&self) -> bool {
+            false
+        }
 
         #[cfg(any(test, feature = "test-hooks"))]
         fn disconnect(&self) -> Result<()> {
@@ -2248,7 +2251,9 @@ mod tests {
         fn to_error(&self) -> Result<()> {
             Ok(())
         }
-        fn destroy_qp(&self) {}
+        fn destroy_qp(&self) -> bool {
+            false
+        }
         #[cfg(any(test, feature = "test-hooks"))]
         fn disconnect(&self) -> Result<()> {
             Ok(())

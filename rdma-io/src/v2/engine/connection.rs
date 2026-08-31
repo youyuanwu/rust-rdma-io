@@ -371,7 +371,7 @@ impl ConnectionState {
         self.error_transition_complete.load(Ordering::Acquire)
     }
 
-    pub(super) fn destroy_connection_resources(&self) -> Option<SharedCmId> {
+    pub(super) fn destroy_connection_resources(&self) -> (Option<SharedCmId>, bool) {
         debug_assert_eq!(self.accepted_count(), 0);
         self.stop_posting();
         self.poster.destroy_connection()
@@ -621,10 +621,10 @@ pub(super) trait WorkRequestPoster: Send + Sync {
     fn post_send(&self, batch: &mut PreparedSendBatch) -> BatchPostOutcome;
     fn post_recv(&self, batch: &mut PreparedRecvBatch) -> BatchPostOutcome;
     fn to_error(&self) -> Result<()>;
-    fn destroy_qp(&self);
-    fn destroy_connection(&self) -> Option<SharedCmId> {
-        self.destroy_qp();
-        None
+    /// Returns true only when this call takes and destroys the owned QP.
+    fn destroy_qp(&self) -> bool;
+    fn destroy_connection(&self) -> (Option<SharedCmId>, bool) {
+        (None, self.destroy_qp())
     }
     #[cfg(any(test, feature = "test-hooks"))]
     fn disconnect(&self) -> Result<()>;
@@ -841,16 +841,19 @@ impl WorkRequestPoster for VerbsConnectionResources {
         }
     }
 
-    fn destroy_qp(&self) {
+    fn destroy_qp(&self) -> bool {
         let qp = lock_unpoison(&self.qp).take();
         if let Some(qp) = qp {
             qp.destroy();
+            true
+        } else {
+            false
         }
     }
 
-    fn destroy_connection(&self) -> Option<SharedCmId> {
-        self.destroy_qp();
-        match lock_unpoison(&self.cm_owner).take() {
+    fn destroy_connection(&self) -> (Option<SharedCmId>, bool) {
+        let qp_destroyed = self.destroy_qp();
+        let cm_id = match lock_unpoison(&self.cm_owner).take() {
             Some(ConnectionCmOwner::Shared { cm_id }) => Some(cm_id),
             #[cfg(any(test, feature = "test-hooks"))]
             Some(ConnectionCmOwner::External { _cm_id }) => {
@@ -858,7 +861,8 @@ impl WorkRequestPoster for VerbsConnectionResources {
                 None
             }
             None => None,
-        }
+        };
+        (cm_id, qp_destroyed)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

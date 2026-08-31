@@ -982,7 +982,10 @@ impl CmState {
         ) {
             Ok(connection) => connection,
             Err(error) => {
-                let cm_id = verbs.destroy_connection();
+                let (cm_id, qp_destroyed) = verbs.destroy_connection();
+                if qp_destroyed {
+                    shared.record_qp_destroy();
+                }
                 if let Some(cm_id) = cm_id {
                     self.reject_unreserved_child(shared, cm_id, InboundRejectReason::SetupFailure)?;
                 }
@@ -1445,8 +1448,10 @@ impl CmState {
             self.enqueue_retirement(token);
             return Ok(());
         };
-        let cm_id = connection.destroy_connection_resources();
-        shared.record_qp_destroy();
+        let (cm_id, qp_destroyed) = connection.destroy_connection_resources();
+        if qp_destroyed {
+            shared.record_qp_destroy();
+        }
         if let Some(cm_id) = cm_id {
             if let Some(reason) = reject {
                 self.record_inbound_reject(shared, reason);
@@ -2148,7 +2153,11 @@ impl CmState {
         ) {
             Ok(connection) => connection,
             Err(error) => {
-                if let Some(cm_id) = verbs.destroy_connection() {
+                let (cm_id, qp_destroyed) = verbs.destroy_connection();
+                if qp_destroyed {
+                    shared.record_qp_destroy();
+                }
+                if let Some(cm_id) = cm_id {
                     self.defer_cm_id(cm_id);
                 }
                 drop(verbs);
@@ -4080,7 +4089,9 @@ mod tests {
             Ok(())
         }
 
-        fn destroy_qp(&self) {}
+        fn destroy_qp(&self) -> bool {
+            false
+        }
 
         #[cfg(any(test, feature = "test-hooks"))]
         fn disconnect(&self) -> Result<()> {

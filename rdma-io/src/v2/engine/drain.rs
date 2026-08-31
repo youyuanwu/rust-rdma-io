@@ -219,8 +219,9 @@ mod tests {
             Ok(())
         }
 
-        fn destroy_qp(&self) {
+        fn destroy_qp(&self) -> bool {
             self.destroys.fetch_add(1, Ordering::AcqRel);
+            true
         }
 
         fn disconnect(&self) -> Result<()> {

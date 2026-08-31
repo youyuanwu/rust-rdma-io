@@ -106,6 +106,23 @@ fn exact_public_types_and_traits_compile() {
 }
 
 #[test]
+fn engine_failure_preserves_explicit_cq_debt() {
+    let failure = EngineFailure::from_progress(Error::EngineWedged {
+        retained_bundles: 2,
+        outstanding_operations: 3,
+        cq_debt: 5,
+    });
+    assert!(matches!(
+        failure.into_error(),
+        Error::EngineWedged {
+            retained_bundles: 2,
+            outstanding_operations: 3,
+            cq_debt: 5,
+        }
+    ));
+}
+
+#[test]
 fn readiness_build_outside_tokio_is_contextual() {
     let error = RdmaEngineBuilder::new("unreachable-device")
         .build()
@@ -200,7 +217,9 @@ fn shutdown_initiates_each_preexisting_connection_close_once() {
             Ok(())
         }
 
-        fn destroy_qp(&self) {}
+        fn destroy_qp(&self) -> bool {
+            true
+        }
 
         #[cfg(any(test, feature = "test-hooks"))]
         fn disconnect(&self) -> Result<()> {
