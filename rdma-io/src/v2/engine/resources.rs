@@ -10,6 +10,7 @@ use super::super::cq::{Cq, CqBuilder};
 use super::super::error::{Error, Result};
 use super::super::pd::Pd;
 use super::config::{CompletionMode, EngineConfig, ProviderLimits};
+#[cfg(panic = "unwind")]
 use super::{RuntimeProbe, probe_runtime};
 
 pub(super) struct EngineResources {
@@ -157,17 +158,28 @@ impl EngineResources {
 }
 
 fn try_async_fd(fd: RawFd, resource: &str) -> Result<AsyncFd<RawFd>> {
-    match probe_runtime(|| AsyncFd::with_interest(fd, Interest::READABLE)) {
-        RuntimeProbe::Completed(Ok(async_fd)) => Ok(async_fd),
-        RuntimeProbe::Completed(Err(error)) => Err(Error::InvalidConfig(format!(
-            "failed to register {resource} with Tokio I/O: {error}"
-        ))),
-        RuntimeProbe::Panicked => Err(Error::InvalidConfig(format!(
-            "readiness mode requires an active Tokio I/O driver for {resource}"
-        ))),
-        RuntimeProbe::Unavailable => Err(Error::InvalidConfig(format!(
-            "readiness mode cannot safely verify Tokio I/O for {resource} with panic=abort"
-        ))),
+    #[cfg(panic = "unwind")]
+    {
+        match probe_runtime(|| AsyncFd::with_interest(fd, Interest::READABLE)) {
+            RuntimeProbe::Completed(Ok(async_fd)) => Ok(async_fd),
+            RuntimeProbe::Completed(Err(error)) => Err(Error::InvalidConfig(format!(
+                "failed to register {resource} with Tokio I/O: {error}"
+            ))),
+            RuntimeProbe::Panicked => Err(Error::InvalidConfig(format!(
+                "readiness mode requires an active Tokio I/O driver for {resource}"
+            ))),
+        }
+    }
+    #[cfg(not(panic = "unwind"))]
+    {
+        // The runtime-presence check has already used Handle::try_current.
+        // Tokio has no safe optional-I/O capability query, so do only the
+        // required registration and preserve errors from its fallible path.
+        AsyncFd::with_interest(fd, Interest::READABLE).map_err(|error| {
+            Error::InvalidConfig(format!(
+                "failed to register {resource} with Tokio I/O: {error}"
+            ))
+        })
     }
 }
 
@@ -198,5 +210,17 @@ mod tests {
     fn invalid_provider_limits_fail_before_resource_construction() {
         let attr = ibv_device_attr::default();
         assert!(ProviderLimits::from_device_attr(&attr).is_err());
+    }
+
+    #[cfg(not(panic = "unwind"))]
+    #[test]
+    fn abort_build_preserves_fallible_async_fd_registration_errors() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        let error = try_async_fd(-1, "invalid test descriptor").unwrap_err();
+        assert!(error.to_string().contains("failed to register"));
     }
 }

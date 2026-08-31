@@ -21,10 +21,12 @@ use std::task::{Context as TaskContext, Poll};
 use crate::cm::EventChannel;
 use crate::wc::WorkCompletion;
 
+#[cfg(panic = "unwind")]
+use super::RuntimeProbe;
 use super::config::CompletionMode;
 use super::resources::EngineResources;
 use super::scheduler::{Deadline, DeadlineKind, WorkClass, WorkScheduler};
-use super::{EngineFailure, EngineOutcome, EngineShared, RdmaEngineDriver, RuntimeProbe};
+use super::{EngineFailure, EngineOutcome, EngineShared, RdmaEngineDriver};
 use crate::v2::completion::CqReadiness;
 use crate::v2::error::{Error, Result};
 
@@ -521,17 +523,24 @@ fn preflight_driver_runtime() -> Result<()> {
                 .into(),
         ));
     }
-    match super::probe_runtime(|| tokio::time::sleep(std::time::Duration::ZERO)) {
-        RuntimeProbe::Completed(sleep) => {
-            drop(sleep);
-            Ok(())
+    #[cfg(panic = "unwind")]
+    {
+        match super::probe_runtime(|| tokio::time::sleep(std::time::Duration::ZERO)) {
+            RuntimeProbe::Completed(sleep) => {
+                drop(sleep);
+                Ok(())
+            }
+            RuntimeProbe::Panicked => Err(Error::InvalidConfig(
+                "RdmaEngineDriver requires Tokio time to be enabled".into(),
+            )),
         }
-        RuntimeProbe::Panicked => Err(Error::InvalidConfig(
-            "RdmaEngineDriver requires Tokio time to be enabled".into(),
-        )),
-        RuntimeProbe::Unavailable => Err(Error::InvalidConfig(
-            "RdmaEngineDriver cannot safely verify Tokio time with panic=abort".into(),
-        )),
+    }
+    #[cfg(not(panic = "unwind"))]
+    {
+        // Tokio exposes no non-panicking query for its optional time driver.
+        // Do not panic-probe under abort: polling can progress without a timer
+        // until the application requests an operation that arms a deadline.
+        Ok(())
     }
 }
 
@@ -1518,6 +1527,7 @@ mod tests {
         assert_eq!(counter.count(), 0);
     }
 
+    #[cfg(panic = "unwind")]
     #[test]
     fn driver_poll_without_tokio_time_returns_contextual_error_without_panicking() {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1528,6 +1538,23 @@ mod tests {
         let result = runtime
             .block_on(async { std::future::poll_fn(|cx| Pin::new(&mut driver).poll(cx)).await });
         assert!(matches!(result, Err(Error::Verbs(_))));
+    }
+
+    #[cfg(not(panic = "unwind"))]
+    #[test]
+    fn abort_build_polling_driver_progresses_without_a_time_probe() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        let (_engine, mut driver) = test_engine_pair(CompletionMode::Polling);
+        let counter = CountingWaker::new();
+        let waker = counter.waker();
+        let mut cx = TaskContext::from_waker(&waker);
+
+        assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
+        assert_eq!(counter.count(), 1);
     }
 
     #[tokio::test(start_paused = true)]

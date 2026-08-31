@@ -428,7 +428,7 @@ impl OperationState {
         self.cancelled.store(true, Ordering::Release);
     }
 
-    pub(super) fn fail_terminal(&self, outcome: &EngineOutcome) -> TerminalizeState {
+    pub(super) fn finalize_terminal(&self, outcome: &EngineOutcome) -> TerminalizeState {
         let mut inner = lock_unpoison(&self.inner);
         let was_reclaiming = inner.reclamation_pending;
         let newly_quarantined = match inner.lifecycle {
@@ -445,6 +445,7 @@ impl OperationState {
                 return TerminalizeState {
                     was_reclaiming: false,
                     newly_quarantined: false,
+                    should_wake: false,
                 };
             }
         };
@@ -458,11 +459,15 @@ impl OperationState {
             inner.output = Some((Err(error), None));
         }
         drop(inner);
-        self.waker.wake();
         TerminalizeState {
             was_reclaiming,
             newly_quarantined,
+            should_wake: true,
         }
+    }
+
+    pub(super) fn wake(&self) {
+        self.waker.wake();
     }
 
     #[cfg(test)]
@@ -485,6 +490,7 @@ struct FinishState {
 pub(super) struct TerminalizeState {
     pub(super) was_reclaiming: bool,
     pub(super) newly_quarantined: bool,
+    pub(super) should_wake: bool,
 }
 
 enum StartResult {
@@ -1016,6 +1022,7 @@ mod tests {
     use super::*;
     use crate::test_support::destruction::{DestructionKind, DestructionRecorder};
     use crate::v2::AccessIntent;
+    use crate::v2::engine::EngineFailure;
     use crate::v2::engine::config::EngineConfig;
     use crate::v2::engine::connection::{WorkRequestPoster, install_connection};
     use crate::v2::engine::resources::ResourceSummary;
@@ -1865,6 +1872,78 @@ mod tests {
             "accepted MRs remain in process-lifetime fail-closed ownership"
         );
         drop(recorder);
+    }
+
+    #[tokio::test]
+    async fn terminal_wakers_can_reenter_after_terminal_guards_drop() {
+        use futures_util::task::{ArcWake, waker};
+
+        struct ReentrantWaker {
+            shared: Arc<EngineShared>,
+            wakes: AtomicUsize,
+            lock_failures: AtomicUsize,
+        }
+
+        impl ArcWake for ReentrantWaker {
+            fn wake_by_ref(arc_self: &Arc<Self>) {
+                arc_self.wakes.fetch_add(1, Ordering::AcqRel);
+                let admission_unlocked = arc_self.shared.admission.try_write().is_ok();
+                let terminal_unlocked = arc_self.shared.terminal.try_lock().is_ok();
+                if admission_unlocked && terminal_unlocked {
+                    let _ = arc_self.shared.diagnostics();
+                } else {
+                    arc_self.lock_failures.fetch_add(1, Ordering::AcqRel);
+                }
+            }
+        }
+
+        let shared = synthetic_engine(8);
+        let connection = synthetic_connection_on(&shared, 50);
+        let token = install_accepted(&shared, &connection.state, WcOpcode::Send);
+        let Lookup::Occupied(operation) = shared.operations.lookup(token) else {
+            panic!("accepted operation")
+        };
+        let reentrant = Arc::new(ReentrantWaker {
+            shared: Arc::clone(&shared),
+            wakes: AtomicUsize::new(0),
+            lock_failures: AtomicUsize::new(0),
+        });
+        let task_waker = waker(Arc::clone(&reentrant));
+        operation.waker.register(&task_waker);
+        let mut cx = Context::from_waker(&task_waker);
+        let mut close = Box::pin(connection.close());
+        assert!(close.as_mut().poll(&mut cx).is_pending());
+        let engine = super::super::RdmaEngine {
+            shared: Arc::clone(&shared),
+        };
+        let mut shutdown = Box::pin(engine.shutdown());
+        assert!(shutdown.as_mut().poll(&mut cx).is_pending());
+
+        shared.finish(EngineOutcome::Failure(EngineFailure::Wedged {
+            retained_bundles: 1,
+            outstanding_operations: 1,
+        }));
+
+        assert!(
+            reentrant.wakes.load(Ordering::Acquire) >= 3,
+            "operation, connection, and terminal waiters must all wake"
+        );
+        assert_eq!(
+            reentrant.lock_failures.load(Ordering::Acquire),
+            0,
+            "terminal wake callbacks must run after admission and terminal guards drop"
+        );
+        assert!(matches!(
+            shutdown.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::EngineWedged { .. }))
+        ));
+        assert!(matches!(
+            close.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::EngineWedged { .. }))
+        ));
+        assert_eq!(shared.quarantined_operations.load(Ordering::Acquire), 1);
+        assert_eq!(shared.quarantined_mrs.load(Ordering::Acquire), 1);
+        assert_eq!(shared.cq_credits.retained(), 1);
     }
 
     #[tokio::test(start_paused = true)]

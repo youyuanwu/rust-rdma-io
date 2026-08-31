@@ -13,6 +13,7 @@ mod scheduler;
 mod api_tests;
 
 use std::collections::VecDeque;
+#[cfg(panic = "unwind")]
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -48,6 +49,14 @@ use super::error::{Error, Result};
 /// A kernel RDMA device name is mandatory. Readiness is the default completion
 /// mode and `build()` must run inside a Tokio runtime with I/O enabled. Polling
 /// mode creates no Tokio I/O registration and may be built outside a runtime.
+///
+/// With `panic=abort`, the engine never probes optional Tokio capabilities by
+/// deliberately triggering and catching a panic. An absent runtime is still
+/// rejected with [`tokio::runtime::Handle::try_current`]. Readiness mode then
+/// performs its required `AsyncFd` registrations and returns registration
+/// errors reported through Tokio's fallible API. Tokio exposes no non-panicking
+/// query for an active runtime whose I/O driver is disabled, so such a runtime
+/// can still abort inside Tokio; callers using `panic=abort` must enable I/O.
 pub struct RdmaEngineBuilder {
     config: EngineConfig,
 }
@@ -220,6 +229,12 @@ impl Drop for RdmaEngine {
 /// only on registered event sources and published software work; polling mode
 /// performs one bounded nonblocking iteration followed by a cooperative yield.
 /// Dropping the driver publishes a terminal failure and wakes observed waiters.
+///
+/// With `panic=abort`, polling deliberately skips Tokio's panic-based optional
+/// time-driver probe. Polling without an armed deadline therefore works on any
+/// active Tokio runtime. Tokio exposes no safe time-capability query, so a
+/// runtime without time enabled can still abort if later work arms a lifecycle
+/// deadline; callers using those operations must enable Tokio time.
 pub struct RdmaEngineDriver {
     shared: Arc<EngineShared>,
     resources: Option<EngineResources>,
@@ -321,50 +336,61 @@ impl EngineShared {
     }
 
     fn finish(&self, outcome: EngineOutcome) {
-        let _admission = write_unpoison(&self.admission);
-        let mut terminal = self
-            .terminal
-            .lock()
-            .expect("engine terminal state poisoned");
-        if terminal.is_some() {
-            return;
-        }
-        self.shutdown_requested.store(true, Ordering::Release);
-        self.transition_shutdown_requested();
-        let lifecycle = match &outcome {
-            EngineOutcome::Success => RdmaEngineLifecycle::Terminated,
-            EngineOutcome::Failure(_) => RdmaEngineLifecycle::Failed,
-        };
-        *terminal = Some(outcome.clone());
-        self.transition_terminal(lifecycle);
-        if matches!(outcome, EngineOutcome::Failure(_)) {
-            for operation in self.operations.occupied() {
-                let terminalized = operation.fail_terminal(&outcome);
-                if terminalized.was_reclaiming {
-                    self.pending_reclamations.fetch_sub(1, Ordering::AcqRel);
-                }
-                if terminalized.newly_quarantined {
-                    self.quarantined_operations.fetch_add(1, Ordering::AcqRel);
-                    self.quarantined_mrs.fetch_add(1, Ordering::AcqRel);
-                    self.quarantined_bytes
-                        .fetch_add(operation.mr_len, Ordering::AcqRel);
-                    self.cq_credits.retain();
+        let (operations_to_wake, connections_to_wake) = {
+            let _admission = write_unpoison(&self.admission);
+            let mut terminal = lock_unpoison(&self.terminal);
+            if terminal.is_some() {
+                return;
+            }
+            self.shutdown_requested.store(true, Ordering::Release);
+            self.transition_shutdown_requested();
+            let lifecycle = match &outcome {
+                EngineOutcome::Success => RdmaEngineLifecycle::Terminated,
+                EngineOutcome::Failure(_) => RdmaEngineLifecycle::Failed,
+            };
+            *terminal = Some(outcome.clone());
+            self.transition_terminal(lifecycle);
+
+            let mut operations_to_wake = Vec::new();
+            if matches!(outcome, EngineOutcome::Failure(_)) {
+                for operation in self.operations.occupied() {
+                    let terminalized = operation.finalize_terminal(&outcome);
+                    if terminalized.was_reclaiming {
+                        self.pending_reclamations.fetch_sub(1, Ordering::AcqRel);
+                    }
+                    if terminalized.newly_quarantined {
+                        self.quarantined_operations.fetch_add(1, Ordering::AcqRel);
+                        self.quarantined_mrs.fetch_add(1, Ordering::AcqRel);
+                        self.quarantined_bytes
+                            .fetch_add(operation.mr_len, Ordering::AcqRel);
+                        self.cq_credits.retain();
+                    }
+                    if terminalized.should_wake {
+                        operations_to_wake.push(operation);
+                    }
                 }
             }
+
+            let connections_to_wake = self.connections.occupied();
+            let force_error = matches!(outcome, EngineOutcome::Failure(_));
+            for connection in &connections_to_wake {
+                connection.finalize_engine(force_error);
+            }
+            drop(terminal);
+            (operations_to_wake, connections_to_wake)
+        };
+
+        for operation in operations_to_wake {
+            operation.wake();
         }
-        let force_error = matches!(outcome, EngineOutcome::Failure(_));
-        for connection in self.connections.occupied() {
-            connection.finish_engine(force_error);
+        for connection in connections_to_wake {
+            connection.wake_close();
         }
-        drop(terminal);
         self.terminal_notify.notify_waiters();
     }
 
     fn outcome(&self) -> Option<EngineOutcome> {
-        self.terminal
-            .lock()
-            .expect("engine terminal state poisoned")
-            .clone()
+        lock_unpoison(&self.terminal).clone()
     }
 
     fn transition_running(&self) {
@@ -710,11 +736,10 @@ fn preflight_tokio_io() -> Result<()> {
     Ok(())
 }
 
+#[cfg(panic = "unwind")]
 pub(super) enum RuntimeProbe<T> {
     Completed(T),
     Panicked,
-    #[allow(dead_code, reason = "constructed only by panic=abort builds")]
-    Unavailable,
 }
 
 #[cfg(panic = "unwind")]
@@ -751,11 +776,6 @@ pub(super) fn probe_runtime<T>(probe: impl FnOnce() -> T) -> RuntimeProbe<T> {
         Ok(value) => RuntimeProbe::Completed(value),
         Err(_) => RuntimeProbe::Panicked,
     }
-}
-
-#[cfg(not(panic = "unwind"))]
-pub(super) fn probe_runtime<T>(_: impl FnOnce() -> T) -> RuntimeProbe<T> {
-    RuntimeProbe::Unavailable
 }
 
 fn failed_engine_quarantine() -> &'static Mutex<Vec<Arc<EngineShared>>> {

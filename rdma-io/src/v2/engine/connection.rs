@@ -276,11 +276,14 @@ impl ConnectionState {
         self.posting_open.store(false, Ordering::Release);
     }
 
-    pub(super) fn finish_engine(&self, force_error: bool) {
+    pub(super) fn finalize_engine(&self, force_error: bool) {
         self.stop_posting();
         if force_error && !self.error_transition_started.swap(true, Ordering::AcqRel) {
             let _ = self.poster.to_error();
         }
+    }
+
+    pub(super) fn wake_close(&self) {
         self.close_notify.notify_waiters();
     }
 
