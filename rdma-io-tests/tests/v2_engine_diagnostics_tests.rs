@@ -131,7 +131,7 @@ async fn wait_for(
 }
 
 async fn assert_routing_and_quarantine_metrics(mode: CompletionMode) {
-    let (engine, driver) = build_engine(mode, Duration::from_millis(100));
+    let (engine, driver) = build_engine(mode, Duration::from_secs(1));
     let resources = engine.test_resources().unwrap();
     let driver = tokio::spawn(driver);
     let listener = engine
@@ -162,8 +162,8 @@ async fn assert_routing_and_quarantine_metrics(mode: CompletionMode) {
 
     let established = wait_for(&engine, |diagnostics| {
         diagnostics.accepted_outstanding_operations == 8
-            && diagnostics.connections.len() == 2
-            && diagnostics.listeners.len() == 1
+            && diagnostics.connections().len() == 2
+            && diagnostics.listeners().len() == 1
     })
     .await;
     assert_eq!(established.connections_admitted, 2);
@@ -176,13 +176,14 @@ async fn assert_routing_and_quarantine_metrics(mode: CompletionMode) {
     assert_eq!(established.free_cq_credits, 504);
     assert!(
         established
-            .connections
+            .connections()
             .iter()
             .all(|connection| connection.accepted_outstanding_operations == 4)
     );
-    assert_eq!(established.listeners[0].queued_inbound_requests, 0);
-    assert_eq!(established.listeners[0].pending_accepts, 0);
-    assert_eq!(established.listeners[0].selected_accepts, 0);
+    let listeners = established.listeners();
+    assert_eq!(listeners[0].queued_inbound_requests, 0);
+    assert_eq!(listeners[0].pending_accepts, 0);
+    assert_eq!(listeners[0].selected_accepts, 0);
 
     let client = Arc::new(client);
     let connection = client.test_connection().unwrap();
@@ -248,7 +249,7 @@ async fn assert_routing_and_quarantine_metrics(mode: CompletionMode) {
     held.wait_observed().await.unwrap();
     sending.abort();
     assert!(sending.await.unwrap_err().is_cancelled());
-    let close = tokio::time::timeout(Duration::from_secs(2), client.close())
+    let close = tokio::time::timeout(Duration::from_secs(3), client.close())
         .await
         .expect("connection drain deadline did not fire");
     assert!(matches!(
@@ -260,15 +261,13 @@ async fn assert_routing_and_quarantine_metrics(mode: CompletionMode) {
     ));
     let quarantined = engine.diagnostics();
     assert_eq!(quarantined.quarantined_bundles, 1);
-    assert_eq!(quarantined.quarantined_connection_reservations, 1);
-    assert_eq!(quarantined.registered_quarantined_qps, 1);
     assert_eq!(quarantined.quarantined_operations, 1);
     assert_eq!(quarantined.quarantined_mrs, 1);
     assert!(quarantined.quarantined_bytes >= 128);
     assert_eq!(quarantined.retained_cq_credits, 1);
     assert!(quarantined.oldest_quarantine_age.is_some());
     assert_eq!(quarantined.connection_quarantine_outcomes, 1);
-    assert!(quarantined.connections.iter().any(
+    assert!(quarantined.connections().iter().any(
         |connection| connection.quarantined && connection.accepted_outstanding_operations == 1
     ));
 

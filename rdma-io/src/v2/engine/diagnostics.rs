@@ -1,6 +1,8 @@
+use super::EngineShared;
 use super::config::CompletionMode;
 use super::connection::RdmaConnectionIdentity;
 use std::net::SocketAddr;
+use std::sync::Weak;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -30,6 +32,7 @@ pub struct RdmaEngineTerminalError {
 
 /// Per-connection state included in an engine diagnostics snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RdmaConnectionDiagnostics {
     /// Current generational connection and provider QP identity.
     pub identity: RdmaConnectionIdentity,
@@ -43,6 +46,7 @@ pub struct RdmaConnectionDiagnostics {
 
 /// Per-listener queue state included in an engine diagnostics snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RdmaListenerDiagnostics {
     /// Stable engine-local listener token.
     pub token: u64,
@@ -57,7 +61,11 @@ pub struct RdmaListenerDiagnostics {
 }
 
 /// Concurrently readable snapshot of engine state and configured capacity.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Creating the aggregate snapshot is constant-time with respect to registered
+/// connections and listeners. Per-object detail is collected only when
+/// [`Self::connections`] or [`Self::listeners`] is called.
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct RdmaEngineDiagnostics {
     /// Current monotonic engine lifecycle state.
@@ -112,12 +120,8 @@ pub struct RdmaEngineDiagnostics {
     pub established_connection_reservations: usize,
     /// Reservations whose connections have stopped posting and are draining.
     pub draining_connection_reservations: usize,
-    /// Reservations retained by any whole-bundle quarantine state.
-    pub quarantined_connection_reservations: usize,
     /// Registered QPs that are not currently quarantined.
     pub registered_live_qps: usize,
-    /// Registered QPs retained in whole-bundle quarantine.
-    pub registered_quarantined_qps: usize,
     /// Connection slots still available for this engine instance.
     pub free_connection_slots: usize,
     /// Connection slots permanently retired after generation exhaustion.
@@ -142,12 +146,13 @@ pub struct RdmaEngineDiagnostics {
     pub quarantined_mrs: usize,
     /// Bytes retained by quarantined operation MRs.
     pub quarantined_bytes: usize,
-    /// Unique connection bundles with retained quarantine state.
+    /// Unique quarantined connection bundles.
+    ///
+    /// Each bundle retains its QP registration, connection admission
+    /// reservation, and unresolved operation/CQ debt.
     pub quarantined_bundles: usize,
     /// Age of the oldest currently retained quarantine entry.
     pub oldest_quarantine_age: Option<Duration>,
-    /// Exact accepted-outstanding state for each registered connection.
-    pub connections: Vec<RdmaConnectionDiagnostics>,
     /// Connections currently queued for bounded driver-local work.
     pub ready_queue_depth: usize,
     /// Engine-owned listeners currently registered with the shared CM router.
@@ -158,8 +163,6 @@ pub struct RdmaEngineDiagnostics {
     pub pending_accepts: usize,
     /// Listener-local selected/setup or accepted-but-cleaning pairs.
     pub selected_accepts: usize,
-    /// Per-listener queue state, ordered by listener token.
-    pub listeners: Vec<RdmaListenerDiagnostics>,
     /// Connection admission reservations successfully acquired.
     pub connections_admitted: u64,
     /// WRs for which admission/posting was attempted.
@@ -208,10 +211,6 @@ pub struct RdmaEngineDiagnostics {
     pub operation_capacity_exhausted: u64,
     /// Capacity failures for CQ admission.
     pub cq_capacity_exhausted: u64,
-    /// Connection slots permanently retired since engine construction.
-    pub connection_slots_retired: u64,
-    /// Operation slots permanently retired since engine construction.
-    pub operation_slots_retired: u64,
     /// Inbound and outbound connections that reached RDMA-CM ESTABLISHED.
     pub connections_opened: u64,
     /// Connections that atomically stopped posting and entered drain.
@@ -287,6 +286,30 @@ pub struct RdmaEngineDiagnostics {
     #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     pub accepted_test_operations: usize,
+    pub(super) detail_source: Weak<EngineShared>,
+}
+
+impl RdmaEngineDiagnostics {
+    /// Collect exact state for each currently registered connection.
+    ///
+    /// This explicit detail query is O(number of registered connections);
+    /// unlike [`crate::v2::RdmaEngine::diagnostics`], it intentionally visits
+    /// connection registrations and locks their accepted-WR sets.
+    pub fn connections(&self) -> Vec<RdmaConnectionDiagnostics> {
+        self.detail_source
+            .upgrade()
+            .map_or_else(Vec::new, |shared| shared.connection_diagnostics())
+    }
+
+    /// Collect queue state for each currently registered listener.
+    ///
+    /// This explicit detail query is O(number of listeners). Entries are
+    /// ordered by listener token.
+    pub fn listeners(&self) -> Vec<RdmaListenerDiagnostics> {
+        self.detail_source
+            .upgrade()
+            .map_or_else(Vec::new, |shared| shared.listener_diagnostics())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -455,8 +478,8 @@ mod tests {
         assert_eq!(diagnostics.unknown_cm_events, 19);
         assert_eq!(diagnostics.duplicate_cm_events, 21);
         assert_eq!(diagnostics.terminal_driver_errors, 23);
-        assert!(diagnostics.connections.is_empty());
-        assert!(diagnostics.listeners.is_empty());
+        assert!(diagnostics.connections().is_empty());
+        assert!(diagnostics.listeners().is_empty());
         assert_eq!(diagnostics.oldest_quarantine_age, None);
         drop(driver);
     }

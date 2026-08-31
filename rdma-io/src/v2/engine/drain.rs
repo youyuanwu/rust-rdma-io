@@ -18,6 +18,7 @@ impl EngineShared {
         let first = connection.begin_close();
         let mut operations_to_wake = Vec::new();
         if first {
+            self.mark_quarantined_connection_draining(connection.token);
             if connection.mark_draining_counted() {
                 self.draining_connections.fetch_add(1, Ordering::AcqRel);
             }
@@ -107,7 +108,6 @@ impl EngineShared {
             return;
         };
         if let Some((_outstanding, _cq_debt)) = connection.apply_drain_deadline() {
-            self.quarantined_connections.fetch_add(1, Ordering::AcqRel);
             if self.track_connection_quarantine(connection.token) {
                 self.diagnostic_counters
                     .connections_quarantined
@@ -131,7 +131,6 @@ impl EngineShared {
         if !connection.recover_quarantine() {
             return;
         }
-        self.quarantined_connections.fetch_sub(1, Ordering::AcqRel);
         if self.clear_connection_quarantine(connection.token) {
             self.diagnostic_counters
                 .quarantine_recoveries
@@ -155,6 +154,10 @@ impl EngineShared {
 
     pub(super) fn record_connection_retired(&self, connection: &ConnectionState) {
         self.finish_connection_drain_count(connection);
+        // Successful retirement may clear the connection-level marker after
+        // exact accepted-WR accounting reached zero. Any operation-level
+        // quarantine entry remains tracked, so a mismatched retirement cannot
+        // make retained debt appear recovered.
         let _ = self.clear_connection_quarantine(connection.token);
         self.diagnostic_counters
             .connections_closed
@@ -163,6 +166,9 @@ impl EngineShared {
 
     pub(super) fn record_connection_retirement_failure(&self, connection: &ConnectionState) {
         self.finish_connection_drain_count(connection);
+        // Fail closed: keep the quarantine entry and oldest-age gauge pinned.
+        // A failed generation retirement cannot prove that routing identity or
+        // retained provider ownership is safe to recycle.
         self.diagnostic_counters
             .connections_failed
             .fetch_add(1, Ordering::Relaxed);
@@ -337,7 +343,7 @@ mod tests {
                 cq_debt: 1
             }))
         ));
-        assert_eq!(engine.diagnostics().registered_quarantined_qps, 1);
+        assert_eq!(engine.diagnostics().quarantined_bundles, 1);
         assert_eq!(poster.destroys.load(Ordering::Acquire), 0);
 
         assert!(connection.state.remove_accepted(token));

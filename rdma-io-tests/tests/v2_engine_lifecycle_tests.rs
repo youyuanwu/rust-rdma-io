@@ -231,8 +231,8 @@ async fn run_clean_close(mode: CompletionMode) {
         client_engine.diagnostics().accepted_outstanding_operations,
         0
     );
-    assert_eq!(server_engine.diagnostics().registered_quarantined_qps, 0);
-    assert_eq!(client_engine.diagnostics().registered_quarantined_qps, 0);
+    assert_eq!(server_engine.diagnostics().quarantined_bundles, 0);
+    assert_eq!(client_engine.diagnostics().quarantined_bundles, 0);
     assert_eq!(server_engine.diagnostics().qp_destroys, 1);
     assert_eq!(client_engine.diagnostics().qp_destroys, 1);
 
@@ -337,7 +337,7 @@ async fn run_missing_cqe_recovery(mode: CompletionMode) {
     assert!(returned_recv.is_none());
 
     let quarantined = server_engine.diagnostics();
-    assert_eq!(quarantined.registered_quarantined_qps, 1);
+    assert_eq!(quarantined.quarantined_bundles, 1);
     assert_eq!(quarantined.quarantined_operations, 1);
     assert_eq!(quarantined.retained_cq_credits, 1);
     assert_eq!(quarantined.live_connection_reservations, 1);
@@ -357,7 +357,7 @@ async fn run_missing_cqe_recovery(mode: CompletionMode) {
             let diagnostics = server_engine.diagnostics();
             diagnostics.live_connection_reservations == 0
                 && diagnostics.registered_operations == 0
-                && diagnostics.registered_quarantined_qps == 0
+                && diagnostics.quarantined_bundles == 0
                 && diagnostics.qp_destroys == 1
         },
     )
@@ -468,7 +468,7 @@ async fn run_shutdown_wedge(mode: CompletionMode) {
         diagnostics.terminal_error.unwrap().message,
         shutdown_error.to_string()
     );
-    assert_eq!(diagnostics.registered_quarantined_qps, 1);
+    assert_eq!(diagnostics.quarantined_bundles, 1);
     assert_eq!(diagnostics.qp_destroys, 0);
     assert_eq!(diagnostics.engine_wedges, 1);
     drop(suppression);
@@ -578,7 +578,7 @@ async fn run_driver_abort_with_accepted_wr(mode: CompletionMode) {
         diagnostics.terminal_error.unwrap().message,
         shutdown_error.to_string()
     );
-    assert_eq!(diagnostics.registered_quarantined_qps, 1);
+    assert_eq!(diagnostics.quarantined_bundles, 1);
     assert_eq!(diagnostics.qp_destroys, 0);
     drop(suppression);
 

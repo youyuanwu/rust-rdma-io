@@ -30,10 +30,15 @@ fn million_slot_registry_uses_paged_constant_probe_lookup() {
     for capacity in [1, 1_024, 1_048_576] {
         let probe = probe_connection_registry(capacity).unwrap();
         assert_eq!(probe.configured_capacity, capacity);
-        assert_eq!(probe.page_directory_entries, capacity.div_ceil(256));
         assert_eq!(probe.direct_lookup_probes, probe.touched_slots.len() as u64);
         assert!(probe.touched_pages <= 3);
         assert!(probe.touched_pages <= probe.touched_slots.len());
+        assert!(probe.resident_slot_capacity <= 3 * 256);
+        assert!(
+            probe.estimated_heap_bytes < 256 * 1024,
+            "representative million-slot probe allocated {} bytes",
+            probe.estimated_heap_bytes
+        );
         assert_eq!(probe.touched_slots.first(), Some(&0));
         assert_eq!(probe.touched_slots.last(), Some(&(capacity - 1)));
     }

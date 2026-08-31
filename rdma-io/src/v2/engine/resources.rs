@@ -132,13 +132,13 @@ impl EngineResources {
 
     pub(super) fn summary(&self) -> ResourceSummary {
         ResourceSummary {
-            contexts: 1,
-            protection_domains: 1,
-            completion_queues: 1,
+            contexts: usize::from(!self.context.inner().as_raw().is_null()),
+            protection_domains: usize::from(!self.pd.inner().as_raw().is_null()),
+            completion_queues: usize::from(!self.cq.inner().as_raw().is_null()),
             completion_channels: usize::from(self.cq.has_channel()),
             cq_notification_fds: usize::from(self.cq.fd().is_some()),
-            cm_event_channels: 1,
-            cm_event_fds: 1,
+            cm_event_channels: usize::from(!self.cm_event_channel.as_raw().is_null()),
+            cm_event_fds: usize::from(self.cm_event_channel.fd() >= 0),
             explicit_drivers: 1,
             library_owned_tasks: 0,
         }

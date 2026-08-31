@@ -466,8 +466,9 @@ impl ConnectionRegistry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TestRegistryProbe {
     pub configured_capacity: usize,
-    pub page_directory_entries: usize,
     pub touched_pages: usize,
+    pub resident_slot_capacity: usize,
+    pub estimated_heap_bytes: usize,
     pub direct_lookup_probes: u64,
     pub touched_slots: Vec<usize>,
 }
@@ -498,10 +499,23 @@ pub fn probe_connection_registry(capacity: usize) -> Result<TestRegistryProbe> {
             ));
         }
     }
+    let inner = lock_unpoison(&registry.inner);
+    let page_directory_bytes =
+        inner.pages.capacity() * std::mem::size_of::<Option<Box<[RegistrySlot<usize>]>>>();
+    let resident_slot_capacity = inner
+        .pages
+        .iter()
+        .filter_map(Option::as_ref)
+        .map(|page| page.len())
+        .sum::<usize>();
+    let resident_page_bytes = resident_slot_capacity * std::mem::size_of::<RegistrySlot<usize>>();
+    let recycled_bytes = inner.recycled.capacity() * std::mem::size_of::<u32>();
+    drop(inner);
     Ok(TestRegistryProbe {
         configured_capacity: capacity,
-        page_directory_entries: capacity.div_ceil(PAGE_SIZE),
         touched_pages: registry.allocated_pages(),
+        resident_slot_capacity,
+        estimated_heap_bytes: page_directory_bytes + resident_page_bytes + recycled_bytes,
         direct_lookup_probes: registry.probes(),
         touched_slots,
     })

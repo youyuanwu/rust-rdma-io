@@ -23,9 +23,12 @@ use crate::wr::{PreparedRecvBatch, PreparedSendBatch, RecvWr, SendFlags, SendWr,
 
 /// Future for one engine-owned SEND, RECV, READ, or WRITE.
 ///
-/// The future owns its MR. Dropping it after posting transfers observation to
-/// the engine; the MR and admission debt remain registered until the exact CQE
-/// is consumed or a later phase establishes another positive safety boundary.
+/// The future owns its MR and returns
+/// `(rdma_io::v2::Result<Completion>, Option<Mr>)`. Dropping it after posting
+/// transfers observation to the engine; the MR, operation registration, and CQ
+/// debt remain owned until the provider proves the WR unaccepted or the engine
+/// consumes its exact validated success/error/flush CQE. Timeout, QP ERR,
+/// driver loss, and CQ emptiness are not release boundaries.
 pub struct RdmaOperation {
     state: FutureState,
 }

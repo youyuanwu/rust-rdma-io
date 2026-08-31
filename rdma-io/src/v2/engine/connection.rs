@@ -25,15 +25,19 @@ use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
 /// Non-owning connection identity suitable for diagnostics and correlation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RdmaConnectionIdentity {
+    /// Direct-index connection registry slot.
     pub slot: u32,
+    /// Non-wrapping registration generation.
     pub generation: u32,
+    /// Provider-reported queue-pair number.
     pub qp_num: u32,
 }
 
 /// Engine-owned low-level RDMA connection.
 ///
 /// The connection exposes owned operation futures but no raw PD, QP, CQ, CM,
-/// or independently pollable completion-driver handle.
+/// or independently pollable completion-driver handle. Establishment posts
+/// zero initial receives.
 pub struct RdmaConnection {
     pub(crate) shared: Arc<EngineShared>,
     pub(crate) state: Arc<ConnectionState>,
@@ -56,11 +60,17 @@ impl RdmaConnection {
     }
 
     /// Register owned memory against this engine's shared protection domain.
+    ///
+    /// The returned MR remains owned by the caller until it is submitted in an
+    /// [`RdmaOperation`]. Length must be nonzero and fit the provider ABI.
     pub fn register_memory(&self, len: usize, access: AccessIntent) -> Result<Mr> {
         self.shared.register_memory(len, access)
     }
 
-    /// Submit a two-sided SEND on first poll.
+    /// Create a two-sided SEND operation submitted on first poll.
+    ///
+    /// The optional `(offset, length)` selects a checked MR range. Awaiting the
+    /// future returns `(Result<Completion>, Option<Mr>)`.
     pub fn send(&self, mr: Mr, range: Option<(usize, usize)>) -> RdmaOperation {
         RdmaOperation::new(
             Arc::clone(&self.shared),
@@ -72,7 +82,7 @@ impl RdmaConnection {
         )
     }
 
-    /// Submit a two-sided RECV on first poll.
+    /// Create a two-sided RECV operation submitted on first poll.
     pub fn recv(&self, mr: Mr, range: Option<(usize, usize)>) -> RdmaOperation {
         RdmaOperation::new(
             Arc::clone(&self.shared),
@@ -84,7 +94,7 @@ impl RdmaConnection {
         )
     }
 
-    /// Submit an RDMA WRITE on first poll.
+    /// Create an RDMA WRITE operation submitted on first poll.
     pub fn write(&self, mr: Mr, remote: RemoteMr, range: Option<(usize, usize)>) -> RdmaOperation {
         RdmaOperation::new(
             Arc::clone(&self.shared),
@@ -96,7 +106,7 @@ impl RdmaConnection {
         )
     }
 
-    /// Submit an RDMA READ on first poll.
+    /// Create an RDMA READ operation submitted on first poll.
     pub fn read(&self, mr: Mr, remote: RemoteMr, range: Option<(usize, usize)>) -> RdmaOperation {
         RdmaOperation::new(
             Arc::clone(&self.shared),
@@ -108,18 +118,21 @@ impl RdmaConnection {
         )
     }
 
+    /// Return the local socket address reported by RDMA-CM.
     pub fn local_addr(&self) -> Result<SocketAddr> {
         self.state
             .local_addr
             .ok_or_else(|| Error::InvalidConfig("connection local address is unavailable".into()))
     }
 
+    /// Return the peer socket address reported by RDMA-CM.
     pub fn peer_addr(&self) -> Result<SocketAddr> {
         self.state
             .peer_addr
             .ok_or_else(|| Error::InvalidConfig("connection peer address is unavailable".into()))
     }
 
+    /// Return the current connection slot, generation, and exact `qp_num`.
     pub fn identity(&self) -> RdmaConnectionIdentity {
         self.state.identity()
     }
@@ -143,6 +156,8 @@ impl RdmaConnection {
     /// registration, and CQ credit in the quarantined connection bundle. The
     /// default deadline is five seconds, and its typed quarantine result is
     /// permanently memoized even if exact late CQEs later recover the bundle.
+    /// Peer disconnect uses this same local QP-to-ERR drain path; it does not
+    /// permit destruction or MR release without exact CQEs.
     pub async fn close(&self) -> Result<()> {
         self.shared.begin_connection_close(&self.state);
         loop {

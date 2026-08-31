@@ -120,13 +120,16 @@ let client = GreeterClient::new(channel);
 ### V2 API — Shared RDMA Engine (tokio)
 
 The `v2` module provides one explicitly driven engine for many low-level and
-message connections:
+message connections. Its ownership model resembles one io_uring instance or
+IOCP completion port: frontend handles submit work, while one application-owned
+driver is the sole CQ/CM consumer and routes completions by connection
+generation, operation generation, and exact `qp_num`.
 
 ```rust
 use rdma_io::v2::*;
 
 let (engine, driver) = RdmaEngineBuilder::new("rxe0").build()?;
-tokio::spawn(driver);
+let driver_task = tokio::spawn(driver);
 
 let connection = engine
     .connect("10.0.0.1:7471".parse().unwrap())
@@ -143,7 +146,28 @@ let mr = mr.expect("real CQE should return MR");
 let (result, mr) = connection.write(mr, remote_mr, None).await;
 result?;
 let _mr = mr.expect("real CQE should return MR");
+
+connection.close().await?;
+engine.shutdown().await?;
+driver_task.await.expect("engine driver panicked")?;
 ```
+
+Readiness is the default and `build()` requires an active Tokio I/O runtime.
+Polling mode creates no CQ notification channel and may be built outside a
+runtime, but every driver poll still requires active Tokio time support when a
+lifecycle deadline can be armed:
+
+```rust
+let (engine, driver) = RdmaEngineBuilder::new("rxe0")
+    .completion_mode(CompletionMode::Polling)
+    .build()?;
+```
+
+One engine owns one anchored context facade, PD, CQ, and CM event channel.
+Readiness adds one CQ completion channel/fd; polling adds none. There is exactly
+one explicit engine driver and zero library-owned tasks or threads, regardless
+of connection count. Low-level `connect`/`connect_with_config` and listener
+`accept`/`accept_with_config` post zero initial receives.
 
 The independent low-level `Context`, `Pd`, `Cq`, `Mr`, `Qp`, typed `Op`,
 `CqPoller`, and `Completions` resources remain available for callers that do
@@ -203,7 +227,8 @@ server_task.await.expect("driver panicked")?;
 Key design properties:
 
 - **Explicit driver spawning**: No hidden `tokio::spawn`; one engine driver
-  composes shared CQ/CM driving, message protocol progress, and reclamation.
+  composes shared CQ/CM driving, message protocol progress, receive reposting,
+  disconnect handling, and reclamation. There is no receive-pump task.
 - **Wire protocol**: A minimal internal protocol with DATA, CREDIT, and HELLO
   frame types (12-byte header with magic/version/type/length validation)
 - **Credit-based flow control**: Each `send()` acquires one remote receive
@@ -213,7 +238,9 @@ Key design properties:
 - **Readiness handshake**: Engine progress performs HELLO negotiation;
   `ready().await` completes when both peers have exchanged capabilities.
 - **Deterministic lifecycle**: Driver failure wakes frontend waiters, while
-  `close().await` returns the contextual connection result.
+  `close().await` returns the contextual connection result. There is no public
+  error accessor; observe `ready`/`send`/`recv`/`close` errors and
+  `RdmaEngine::diagnostics()`.
 - **Pre-posted receives**: All receive buffers (data + control headroom) are
   posted before the CM handshake completes
 - **Bounded backpressure**: Both send buffer pool and credit semaphore limit
@@ -227,6 +254,14 @@ Key design properties:
   protection domain, CQ, notification resource, and CM event channel
 - **Completion modes**: `Readiness` (fd/channel-based, lower CPU) or
   `Polling` (direct CQ poll, lower latency)
+- **Exact default capacity**: 19 send WRs and 34 receive WRs per connection;
+  message setup pre-posts exactly 34 receives. At 256 default connections,
+  `256 × 53 = 13,568`, leaving `2,816` positions in the default 16,384-entry
+  global operation/CQ budget.
+- **Fail-closed teardown**: Cancellation retains accepted MRs until their exact
+  CQE. A connection deadline returns `ConnectionQuarantined`; an unresolved
+  engine shutdown returns `EngineWedged`. Quarantined bundles retain their QP,
+  CM ID, registrations, MRs, admission, and CQ debt.
 
 #### Non-Goals
 
@@ -237,6 +272,12 @@ The following are explicitly out of scope for the v2 message transport:
 - Ring transports, atomics, inline data, multi-SGE operations
 - Dynamic buffer pool resizing
 - UD (Unreliable Datagram) queue pair support
+- Compatibility adapters for the removed endpoint-owned v2 surface. V1 remains
+  unchanged.
+
+See [V2 Runtime RDMA Engine](docs/design/v2-rdma-engine.md) for the complete
+public API, resource counts, listener ordering, wakeup proof, routing,
+cancellation, shutdown, diagnostics, provider limits, and RXE/SIW validation.
 
 ## Prerequisites
 
@@ -295,6 +336,7 @@ Design documents and background research are in [`docs/`](docs/):
 | Document | Description |
 |---|---|
 | [SafeApi.md](docs/design/SafeApi.md) | Safe API design and RAII ownership model |
+| [v2-rdma-engine.md](docs/design/v2-rdma-engine.md) | Explicitly driven shared v2 engine API, ownership, routing, lifecycle, and provider validation |
 | [RdmaOperations.md](docs/design/RdmaOperations.md) | RDMA verb operations and data path patterns |
 | [rdma-transport-layer.md](docs/design/rdma-transport-layer.md) | Transport trait architecture and transport implementations |
 | [DataPathCopies.md](docs/design/DataPathCopies.md) | Send/recv copy audit of the transport & stream interfaces, and where `Buf`/`Bytes` would help |

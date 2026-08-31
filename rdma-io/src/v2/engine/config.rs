@@ -23,7 +23,7 @@ const MAX_CQ_CAPACITY: usize = 16_777_216;
 const MAX_WORK_BUDGET: usize = 4_096;
 const REGISTRY_PAGE_SIZE: usize = 256;
 
-/// Completion integration used by an RDMA engine or retained v2 endpoint.
+/// Completion integration used by an [`RdmaEngine`](super::RdmaEngine).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompletionMode {
     /// Use one completion channel registered with Tokio I/O readiness.
@@ -34,6 +34,11 @@ pub enum CompletionMode {
 }
 
 /// Per-connection QP capacity and RDMA-CM handshake configuration.
+///
+/// Defaults are 19 send WRs, 34 receive WRs, one SGE in each direction,
+/// responder/initiator depth 1, and retry/RNR retry 7. The 19/34 values
+/// compose exactly with the default message pools: `16 + 2 + 1` sends and
+/// `32 + 2` receives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RdmaConnectionConfig {
     max_send_wr: usize,
@@ -62,74 +67,92 @@ impl Default for RdmaConnectionConfig {
 }
 
 impl RdmaConnectionConfig {
+    /// Set maximum send WRs in `1..=1_048_576`.
     pub fn max_send_wr(mut self, value: usize) -> Self {
         self.max_send_wr = value;
         self
     }
 
+    /// Set maximum receive WRs in `1..=1_048_576`.
     pub fn max_recv_wr(mut self, value: usize) -> Self {
         self.max_recv_wr = value;
         self
     }
 
+    /// Set maximum send SGEs in `1..=32`.
     pub fn max_send_sge(mut self, value: usize) -> Self {
         self.max_send_sge = value;
         self
     }
 
+    /// Set maximum receive SGEs in `1..=32`.
     pub fn max_recv_sge(mut self, value: usize) -> Self {
         self.max_recv_sge = value;
         self
     }
 
+    /// Set responder resources in `0..=255`.
     pub fn responder_resources(mut self, value: usize) -> Self {
         self.responder_resources = value;
         self
     }
 
+    /// Set initiator depth in `0..=255`.
     pub fn initiator_depth(mut self, value: usize) -> Self {
         self.initiator_depth = value;
         self
     }
 
+    /// Set the RDMA-CM retry count in `0..=7`.
     pub fn retry_count(mut self, value: usize) -> Self {
         self.retry_count = value;
         self
     }
 
+    /// Set the RDMA-CM RNR retry count in `0..=7`.
+    ///
+    /// Seven retains the verbs infinite-retry encoding.
     pub fn rnr_retry_count(mut self, value: usize) -> Self {
         self.rnr_retry_count = value;
         self
     }
 
+    /// Return the configured maximum send WR count.
     pub fn maximum_send_work_requests(&self) -> usize {
         self.max_send_wr
     }
 
+    /// Return the configured maximum receive WR count.
     pub fn maximum_receive_work_requests(&self) -> usize {
         self.max_recv_wr
     }
 
+    /// Return the configured maximum send SGE count.
     pub fn maximum_send_sges(&self) -> usize {
         self.max_send_sge
     }
 
+    /// Return the configured maximum receive SGE count.
     pub fn maximum_receive_sges(&self) -> usize {
         self.max_recv_sge
     }
 
+    /// Return the configured responder resource count.
     pub fn responder_resource_count(&self) -> usize {
         self.responder_resources
     }
 
+    /// Return the configured initiator depth.
     pub fn initiator_depth_count(&self) -> usize {
         self.initiator_depth
     }
 
+    /// Return the configured RDMA-CM retry count.
     pub fn retry_count_value(&self) -> usize {
         self.retry_count
     }
 
+    /// Return the configured RDMA-CM RNR retry count.
     pub fn rnr_retry_count_value(&self) -> usize {
         self.rnr_retry_count
     }

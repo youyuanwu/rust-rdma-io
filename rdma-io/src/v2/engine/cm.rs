@@ -28,8 +28,8 @@ use super::diagnostics::CmEventReject;
 use super::diagnostics::RdmaListenerDiagnostics;
 use super::listener::{
     AcceptRequest, EmptyPreEstablishSetup, InboundRejectReason, IncomingChild,
-    KERNEL_LISTEN_BACKLOG_REQUEST, ListenRequest, ListenerAction, ListenerState, RdmaListener,
-    run_setup_before_establish,
+    KERNEL_LISTEN_BACKLOG_REQUEST, ListenRequest, ListenerAction, ListenerDiagnosticTotals,
+    ListenerState, RdmaListener, run_setup_before_establish,
 };
 use super::registry::{ConnectionToken, Lookup, PagedRegistry, RegistryToken, lock_unpoison};
 use super::resources::EngineResources;
@@ -90,6 +90,7 @@ pub(super) struct CmState {
     listener_work: Mutex<VecDeque<Arc<ListenerState>>>,
     listeners: Mutex<HashMap<u64, Arc<ListenerState>>>,
     listener_ids: Mutex<HashMap<usize, u64>>,
+    listener_diagnostics: Arc<ListenerDiagnosticTotals>,
     next_listener_token: AtomicU64,
     retirements: Mutex<VecDeque<ConnectionToken>>,
     cm_destructions: Mutex<VecDeque<PendingCmDestruction>>,
@@ -108,6 +109,7 @@ impl CmState {
             listener_work: Mutex::new(VecDeque::new()),
             listeners: Mutex::new(HashMap::new()),
             listener_ids: Mutex::new(HashMap::new()),
+            listener_diagnostics: Arc::new(ListenerDiagnosticTotals::default()),
             next_listener_token: AtomicU64::new(1),
             retirements: Mutex::new(VecDeque::new()),
             cm_destructions: Mutex::new(VecDeque::new()),
@@ -214,6 +216,7 @@ impl CmState {
         };
         listener_entry.insert(listener);
         identity_entry.insert(token);
+        self.listener_diagnostics.listener_added();
         true
     }
 
@@ -443,22 +446,7 @@ impl CmState {
     }
 
     pub(super) fn listener_counts(&self) -> (usize, usize, usize, usize) {
-        let listeners: Vec<_> = lock_unpoison(&self.listeners).values().cloned().collect();
-        let mut queued_children = 0;
-        let mut pending_accepts = 0;
-        let mut selected_accepts = 0;
-        for listener in &listeners {
-            let (children, waiters, selected) = listener.queue_counts();
-            queued_children += children;
-            pending_accepts += waiters;
-            selected_accepts += selected;
-        }
-        (
-            listeners.len(),
-            queued_children,
-            pending_accepts,
-            selected_accepts,
-        )
+        self.listener_diagnostics.snapshot()
     }
 
     pub(super) fn listener_diagnostics(&self) -> Vec<RdmaListenerDiagnostics> {
@@ -731,6 +719,7 @@ impl CmState {
             local_addr,
             request.config.clone(),
             cm_id,
+            Arc::clone(&self.listener_diagnostics),
         ));
         if !self.insert_listener_identity(token, raw_id, Arc::clone(&state)) {
             let cm_id = state
@@ -1256,6 +1245,7 @@ impl CmState {
             .is_some_and(|current| Arc::ptr_eq(current, listener));
         if owned {
             listeners.remove(&listener.token);
+            self.listener_diagnostics.listener_removed();
             if listener_ids.get(&raw_id) == Some(&listener.token) {
                 listener_ids.remove(&raw_id);
             }

@@ -1,4 +1,19 @@
 //! Explicitly driven, shared v2 RDMA engine.
+//!
+//! One engine owns one anchored verbs context facade, one protection domain,
+//! one send/receive CQ, one CM event channel, and mode-specific CQ
+//! notification resources. Readiness owns one completion channel/fd; polling
+//! owns none. Every connection shares those objects.
+//!
+//! The driver routes a CQE only when the current connection generation,
+//! operation generation, operation owner, and provider-reported `qp_num` all
+//! agree. It is also the sole CM event consumer. Cancellation, close, shutdown,
+//! and driver loss retain accepted or acceptance-ambiguous MRs until an exact
+//! completion or provider-proven rejection establishes a positive safety
+//! boundary.
+//!
+//! See the crate repository's `docs/design/v2-rdma-engine.md` for the complete
+//! architecture, configuration table, wakeup proof, and provider procedure.
 
 mod cm;
 mod config;
@@ -16,7 +31,7 @@ mod scheduler;
 #[cfg(test)]
 mod api_tests;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 #[cfg(panic = "unwind")]
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -99,67 +114,87 @@ pub struct RdmaEngineBuilder {
 }
 
 impl RdmaEngineBuilder {
+    /// Select the exact kernel RDMA device used by this engine.
+    ///
+    /// The name must be non-empty and must identify a context returned by
+    /// librdmacm. Every routed CM ID must later report the same raw context
+    /// pointer before the engine creates a QP.
     pub fn new(device_name: impl Into<String>) -> Self {
         Self {
             config: EngineConfig::new(device_name.into()),
         }
     }
 
+    /// Select readiness (default) or direct shared-CQ polling.
     pub fn completion_mode(mut self, mode: CompletionMode) -> Self {
         self.config.completion_mode = mode;
         self
     }
 
+    /// Set aggregate connection admission in `1..=1_048_576`.
     pub fn maximum_live_connections(mut self, value: usize) -> Self {
         self.config.max_live_connections = value;
         self
     }
 
+    /// Set global operation registrations in `2..=16_777_216`.
     pub fn maximum_inflight_operations(mut self, value: usize) -> Self {
         self.config.max_inflight_operations = value;
         self
     }
 
+    /// Set shared-CQ capacity in `2..=16_777_216`.
+    ///
+    /// This must be at least the maximum in-flight operation count and no
+    /// greater than the selected provider's `max_cqe`.
     pub fn cq_capacity(mut self, value: usize) -> Self {
         self.config.cq_capacity = value;
         self
     }
 
+    /// Set CQ completions handled per CQ service turn in `1..=4096`.
     pub fn cq_completion_budget(mut self, value: usize) -> Self {
         self.config.cq_completion_budget = value;
         self
     }
 
+    /// Set CM actions handled per CM service turn in `1..=4096`.
     pub fn cm_event_budget(mut self, value: usize) -> Self {
         self.config.cm_event_budget = value;
         self
     }
 
+    /// Set reclamation/deadline actions per service turn in `1..=4096`.
     pub fn reclamation_budget(mut self, value: usize) -> Self {
         self.config.reclamation_budget = value;
         self
     }
 
+    /// Set connection-local work before tail rotation in `1..=4096`.
     pub fn ready_connection_quantum(mut self, value: usize) -> Self {
         self.config.ready_connection_quantum = value;
         self
     }
 
+    /// Set the cancellation reclamation deadline in `1 second..=24 hours`.
     pub fn missing_cqe_deadline(mut self, value: Duration) -> Self {
         self.config.missing_cqe_deadline = value;
         self
     }
 
+    /// Set the connection drain deadline in `1 millisecond..=5 minutes`.
     pub fn connection_drain_deadline(mut self, value: Duration) -> Self {
         self.config.connection_drain_deadline = value;
         self
     }
 
+    /// Set the engine shutdown deadline in `1 millisecond..=10 minutes`.
     pub fn shutdown_deadline(mut self, value: Duration) -> Self {
         self.config.shutdown_deadline = value;
         self
     }
 
+    /// Set the message HELLO deadline in `1 millisecond..=5 minutes`.
     pub fn message_hello_deadline(mut self, value: Duration) -> Self {
         self.config.hello_deadline = value;
         self
@@ -205,6 +240,7 @@ impl RdmaEngineBuilder {
 ///
 /// Cloning this value never starts work. All CQ, CM, reclamation, and
 /// connection-local progress remains owned by the paired [`RdmaEngineDriver`].
+/// The handle is `Clone + Send + Sync + 'static`.
 pub struct RdmaEngine {
     pub(crate) shared: Arc<EngineShared>,
 }
@@ -238,13 +274,22 @@ impl RdmaEngine {
         }
     }
 
-    /// Return a non-blocking snapshot of lifecycle, terminal, and capacity state.
+    /// Return an O(1), non-blocking aggregate snapshot.
+    ///
+    /// The snapshot remains readable after terminal state. Per-connection and
+    /// per-listener detail is collected only through
+    /// [`RdmaEngineDiagnostics::connections`] and
+    /// [`RdmaEngineDiagnostics::listeners`].
     pub fn diagnostics(&self) -> RdmaEngineDiagnostics {
         self.shared.diagnostics()
     }
 
     /// Establish an outbound low-level connection with the default QP/CM
     /// configuration. The engine driver owns every CM and CQ progress step.
+    ///
+    /// Low-level establishment posts zero initial receives. With the default
+    /// infinite RNR retry, a peer's early send can wait until the application
+    /// posts a receive.
     pub async fn connect(&self, address: std::net::SocketAddr) -> Result<RdmaConnection> {
         cm::connect(
             Arc::clone(&self.shared),
@@ -256,6 +301,9 @@ impl RdmaEngine {
 
     /// Establish an outbound low-level connection with an explicit validated
     /// QP/CM configuration.
+    ///
+    /// Validation and aggregate admission complete before QP creation or WR
+    /// posting. No requested value is silently clamped.
     pub async fn connect_with_config(
         &self,
         address: std::net::SocketAddr,
@@ -333,6 +381,10 @@ impl Drop for RdmaEngine {
 /// active Tokio runtime. Tokio exposes no safe time-capability query, so a
 /// runtime without time enabled can still abort if later work arms a lifecycle
 /// deadline; callers using those operations must enable Tokio time.
+///
+/// The future output is `rdma_io::v2::Result<()>`; it can be passed directly
+/// to `tokio::spawn` without a wrapper method. Exactly one driver is returned
+/// per successful build, and the engine creates zero internal tasks.
 pub struct RdmaEngineDriver {
     shared: Arc<EngineShared>,
     resources: Option<EngineResources>,
@@ -360,7 +412,6 @@ pub(crate) struct EngineShared {
     quarantined_mrs: AtomicUsize,
     quarantined_bytes: AtomicUsize,
     draining_connections: AtomicUsize,
-    quarantined_connections: AtomicUsize,
     ready_queue_depth: AtomicUsize,
     published_ready_connections: Mutex<VecDeque<registry::ConnectionToken>>,
     deadline_requests: Mutex<VecDeque<DeadlineRequest>>,
@@ -377,7 +428,7 @@ pub(crate) struct EngineShared {
     terminal_notify: Notify,
     terminal: Mutex<Option<EngineOutcome>>,
     driver_yields: AtomicU64,
-    quarantines: Mutex<HashMap<QuarantineKey, QuarantineEntry>>,
+    quarantines: Mutex<QuarantineState>,
     #[cfg(any(test, feature = "test-hooks"))]
     test_resources: Option<resources::TestResourceRefs>,
     #[cfg(any(test, feature = "test-hooks"))]
@@ -398,6 +449,15 @@ enum QuarantineKey {
 struct QuarantineEntry {
     connection: registry::ConnectionToken,
     started: Instant,
+}
+
+#[derive(Default)]
+struct QuarantineState {
+    entries: HashMap<QuarantineKey, QuarantineEntry>,
+    starts: BTreeMap<Instant, usize>,
+    oldest: Option<Instant>,
+    connection_entries: HashMap<registry::ConnectionToken, usize>,
+    non_draining_connections: HashSet<registry::ConnectionToken>,
 }
 
 impl EngineShared {
@@ -428,7 +488,6 @@ impl EngineShared {
             quarantined_mrs: AtomicUsize::new(0),
             quarantined_bytes: AtomicUsize::new(0),
             draining_connections: AtomicUsize::new(0),
-            quarantined_connections: AtomicUsize::new(0),
             ready_queue_depth: AtomicUsize::new(0),
             published_ready_connections: Mutex::new(VecDeque::new()),
             deadline_requests: Mutex::new(VecDeque::new()),
@@ -443,7 +502,7 @@ impl EngineShared {
             terminal_notify: Notify::new(),
             terminal: Mutex::new(None),
             driver_yields: AtomicU64::new(0),
-            quarantines: Mutex::new(HashMap::new()),
+            quarantines: Mutex::new(QuarantineState::default()),
             #[cfg(any(test, feature = "test-hooks"))]
             test_resources: None,
             #[cfg(any(test, feature = "test-hooks"))]
@@ -544,13 +603,11 @@ impl EngineShared {
         for connection in &connections_to_wake {
             if matches!(outcome, EngineOutcome::Failure(_))
                 && connection.retain_bundle_for_engine_failure()
+                && self.track_connection_quarantine(connection.token)
             {
-                self.quarantined_connections.fetch_add(1, Ordering::AcqRel);
-                if self.track_connection_quarantine(connection.token) {
-                    self.diagnostic_counters
-                        .connections_quarantined
-                        .fetch_add(1, Ordering::Relaxed);
-                }
+                self.diagnostic_counters
+                    .connections_quarantined
+                    .fetch_add(1, Ordering::Relaxed);
             }
             connection.finalize_engine(&outcome);
         }
@@ -685,15 +742,50 @@ impl EngineShared {
     }
 
     fn track_quarantine(&self, key: QuarantineKey, entry: QuarantineEntry) -> bool {
+        let connection_is_draining = matches!(
+            self.connections.lookup(entry.connection),
+            registry::Lookup::Occupied(connection) if connection.close_started()
+        );
         let mut quarantines = lock_unpoison(&self.quarantines);
-        let existed = quarantines.contains_key(&key);
-        let connection_was_quarantined = quarantines
-            .values()
-            .any(|current| current.connection == entry.connection);
-        if !existed {
-            quarantines.insert(key, entry);
+        if quarantines.entries.contains_key(&key) {
+            return false;
         }
-        !existed && !connection_was_quarantined
+        quarantines.entries.insert(key, entry);
+        *quarantines.starts.entry(entry.started).or_insert(0) += 1;
+        if quarantines
+            .oldest
+            .is_none_or(|oldest| entry.started < oldest)
+        {
+            quarantines.oldest = Some(entry.started);
+        }
+        let connection_entries = quarantines
+            .connection_entries
+            .entry(entry.connection)
+            .or_insert(0);
+        let first_for_connection = *connection_entries == 0;
+        *connection_entries += 1;
+        if first_for_connection && !connection_is_draining {
+            quarantines
+                .non_draining_connections
+                .insert(entry.connection);
+        }
+        drop(quarantines);
+        if first_for_connection
+            && !connection_is_draining
+            && matches!(
+                self.connections.lookup(entry.connection),
+                registry::Lookup::Occupied(connection) if connection.close_started()
+            )
+        {
+            self.mark_quarantined_connection_draining(entry.connection);
+        }
+        first_for_connection
+    }
+
+    fn mark_quarantined_connection_draining(&self, token: registry::ConnectionToken) {
+        lock_unpoison(&self.quarantines)
+            .non_draining_connections
+            .remove(&token);
     }
 
     fn clear_connection_quarantine(&self, token: registry::ConnectionToken) -> bool {
@@ -709,47 +801,57 @@ impl EngineShared {
 
     fn clear_quarantine(&self, key: QuarantineKey, connection: registry::ConnectionToken) -> bool {
         let mut quarantines = lock_unpoison(&self.quarantines);
-        if quarantines.remove(&key).is_none() {
+        let Some(entry) = quarantines.entries.remove(&key) else {
+            return false;
+        };
+        if let Some(count) = quarantines.starts.get_mut(&entry.started) {
+            *count -= 1;
+            if *count == 0 {
+                quarantines.starts.remove(&entry.started);
+                if quarantines.oldest == Some(entry.started) {
+                    quarantines.oldest =
+                        quarantines.starts.first_key_value().map(|(time, _)| *time);
+                }
+            }
+        }
+        let Some(connection_entries) = quarantines.connection_entries.get_mut(&connection) else {
+            debug_assert!(false, "quarantine entry must have a connection count");
+            return false;
+        };
+        *connection_entries -= 1;
+        if *connection_entries != 0 {
             return false;
         }
-        !quarantines
-            .values()
-            .any(|current| current.connection == connection)
+        quarantines.connection_entries.remove(&connection);
+        quarantines.non_draining_connections.remove(&connection);
+        true
     }
 
-    fn quarantine_snapshot(&self) -> (usize, Option<Duration>, HashSet<registry::ConnectionToken>) {
+    fn quarantine_summary(&self) -> (usize, usize, Option<Duration>) {
         let quarantines = lock_unpoison(&self.quarantines);
-        let connections = quarantines
-            .values()
-            .map(|entry| entry.connection)
-            .collect::<HashSet<_>>();
         let now = Instant::now();
         let oldest = quarantines
-            .values()
-            .map(|entry| now.saturating_duration_since(entry.started))
-            .max();
-        (connections.len(), oldest, connections)
+            .oldest
+            .map(|started| now.saturating_duration_since(started));
+        (
+            quarantines.connection_entries.len(),
+            quarantines.non_draining_connections.len(),
+            oldest,
+        )
     }
 
-    fn diagnostics(&self) -> RdmaEngineDiagnostics {
-        let outcome = self.outcome();
-        let (listener_count, queued_inbound_requests, pending_accepts, selected_accepts) =
-            self.cm.listener_counts();
-        let listeners = self.cm.listener_diagnostics();
-        let (quarantined_bundles, oldest_quarantine_age, quarantined_connections) =
-            self.quarantine_snapshot();
-        let registered_connections = self.connections.live();
-        let establishing_connection_reservations = self
-            .connection_admission
-            .used()
-            .saturating_sub(registered_connections);
-        let draining_connection_reservations = self.draining_connections.load(Ordering::Acquire);
+    fn connection_diagnostics(&self) -> Vec<RdmaConnectionDiagnostics> {
+        let quarantined_tokens = lock_unpoison(&self.quarantines)
+            .connection_entries
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>();
         let mut connections = self
             .connections
             .occupied()
             .into_iter()
             .map(|connection| {
-                connection.diagnostics(quarantined_connections.contains(&connection.token))
+                connection.diagnostics(quarantined_tokens.contains(&connection.token))
             })
             .collect::<Vec<_>>();
         connections.sort_by_key(|connection| {
@@ -759,10 +861,28 @@ impl EngineShared {
                 connection.identity.qp_num,
             )
         });
-        let established_connection_reservations = connections
-            .iter()
-            .filter(|connection| !connection.draining && !connection.quarantined)
-            .count();
+        connections
+    }
+
+    fn listener_diagnostics(&self) -> Vec<RdmaListenerDiagnostics> {
+        self.cm.listener_diagnostics()
+    }
+
+    fn diagnostics(self: &Arc<Self>) -> RdmaEngineDiagnostics {
+        let outcome = self.outcome();
+        let (listener_count, queued_inbound_requests, pending_accepts, selected_accepts) =
+            self.cm.listener_counts();
+        let (quarantined_bundles, non_draining_quarantined_bundles, oldest_quarantine_age) =
+            self.quarantine_summary();
+        let registered_connections = self.connections.live();
+        let establishing_connection_reservations = self
+            .connection_admission
+            .used()
+            .saturating_sub(registered_connections);
+        let draining_connection_reservations = self.draining_connections.load(Ordering::Acquire);
+        let established_connection_reservations = registered_connections
+            .saturating_sub(draining_connection_reservations)
+            .saturating_sub(non_draining_quarantined_bundles);
         RdmaEngineDiagnostics {
             lifecycle: self.lifecycle(),
             terminal_error: outcome.and_then(|outcome| outcome.summary()),
@@ -790,9 +910,7 @@ impl EngineShared {
             establishing_connection_reservations,
             established_connection_reservations,
             draining_connection_reservations,
-            quarantined_connection_reservations: quarantined_bundles,
             registered_live_qps: registered_connections.saturating_sub(quarantined_bundles),
-            registered_quarantined_qps: quarantined_bundles,
             free_connection_slots: self.connections.free(),
             retired_connection_slots: self.connections.retired(),
             registered_operations: self.operations.live(),
@@ -807,13 +925,11 @@ impl EngineShared {
             quarantined_bytes: self.quarantined_bytes.load(Ordering::Acquire),
             quarantined_bundles,
             oldest_quarantine_age,
-            connections,
             ready_queue_depth: self.ready_queue_depth.load(Ordering::Acquire),
             listener_count,
             queued_inbound_requests,
             pending_accepts,
             selected_accepts,
-            listeners,
             connections_admitted: self
                 .diagnostic_counters
                 .connections_admitted
@@ -904,8 +1020,6 @@ impl EngineShared {
                 .diagnostic_counters
                 .cq_capacity_exhausted
                 .load(Ordering::Acquire),
-            connection_slots_retired: self.connections.retired() as u64,
-            operation_slots_retired: self.operations.retired() as u64,
             connections_opened: self
                 .diagnostic_counters
                 .connections_opened
@@ -1046,6 +1160,7 @@ impl EngineShared {
                 .load(Ordering::Acquire),
             #[cfg(any(test, feature = "test-hooks"))]
             accepted_test_operations: self.test_driver.accepted_outstanding(),
+            detail_source: Arc::downgrade(self),
         }
     }
 

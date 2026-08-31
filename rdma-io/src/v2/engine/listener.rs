@@ -3,9 +3,10 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 
 use futures_util::task::AtomicWaker;
@@ -20,6 +21,49 @@ use crate::v2::error::{Error, Result};
 pub(crate) const DEFAULT_LISTENER_BACKLOG: usize = 128;
 const MAX_LISTENER_BACKLOG: usize = 4_096;
 pub(super) const KERNEL_LISTEN_BACKLOG_REQUEST: i32 = i32::MAX;
+
+#[derive(Default)]
+pub(super) struct ListenerDiagnosticTotals {
+    listeners: AtomicUsize,
+    queued_children: AtomicUsize,
+    pending_accepts: AtomicUsize,
+    selected_accepts: AtomicUsize,
+}
+
+impl ListenerDiagnosticTotals {
+    pub(super) fn listener_added(&self) {
+        self.listeners.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(super) fn listener_removed(&self) {
+        let previous = self.listeners.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "removed listener must be counted");
+    }
+
+    pub(super) fn snapshot(&self) -> (usize, usize, usize, usize) {
+        (
+            self.listeners.load(Ordering::Acquire),
+            self.queued_children.load(Ordering::Acquire),
+            self.pending_accepts.load(Ordering::Acquire),
+            self.selected_accepts.load(Ordering::Acquire),
+        )
+    }
+
+    fn update_queue_counts(&self, old: (usize, usize, usize), new: (usize, usize, usize)) {
+        update_gauge(&self.queued_children, old.0, new.0);
+        update_gauge(&self.pending_accepts, old.1, new.1);
+        update_gauge(&self.selected_accepts, old.2, new.2);
+    }
+}
+
+fn update_gauge(gauge: &AtomicUsize, old: usize, new: usize) {
+    if new >= old {
+        gauge.fetch_add(new - old, Ordering::AcqRel);
+    } else {
+        let previous = gauge.fetch_sub(old - new, Ordering::AcqRel);
+        debug_assert!(previous >= old - new, "listener gauge underflow");
+    }
+}
 
 /// Configuration for one engine-owned listener.
 ///
@@ -75,6 +119,11 @@ impl RdmaListenerConfig {
 ///
 /// Clones share one listener endpoint. Dropping the final clone requests an
 /// asynchronous close; call [`Self::close`] when the result must be observed.
+///
+/// Waiters are ordered by registration and admitted children by CM arrival.
+/// The oldest live waiter is paired with the oldest eligible child, with only
+/// one selected/setup pair at a time. Cancellation after selection owns that
+/// child through rejection or close, so a later waiter cannot overtake it.
 pub struct RdmaListener {
     pub(super) shared: Arc<EngineShared>,
     pub(super) state: Arc<ListenerState>,
@@ -101,6 +150,7 @@ impl RdmaListener {
     /// Pending accepts are cancelled safely if their futures are dropped. Once
     /// closing starts, new accepts fail with the listener's contextual close
     /// error, or with the engine-wide terminal error if the driver has failed.
+    /// Low-level setup posts zero initial receives.
     pub async fn accept(&self) -> Result<RdmaConnection> {
         accept_with_setup(
             Arc::clone(&self.shared),
@@ -115,6 +165,7 @@ impl RdmaListener {
     ///
     /// The configuration is validated before the accept waiter is registered.
     /// Cancellation and listener-close behavior are the same as [`Self::accept`].
+    /// No value is silently clamped, and low-level setup posts zero receives.
     pub async fn accept_with_config(&self, config: RdmaConnectionConfig) -> Result<RdmaConnection> {
         accept_with_setup(
             Arc::clone(&self.shared),
@@ -627,6 +678,10 @@ pub(super) struct ListenerState {
     pub(super) backlog: usize,
     pub(super) cm_id: Mutex<Option<SharedCmId>>,
     queues: Mutex<ListenerQueues>,
+    diagnostic_totals: Arc<ListenerDiagnosticTotals>,
+    queued_children: AtomicUsize,
+    pending_accepts: AtomicUsize,
+    selected_accepts: AtomicUsize,
     closing: AtomicBool,
     finalization_started: AtomicBool,
     failure: Mutex<Option<Error>>,
@@ -642,6 +697,7 @@ impl ListenerState {
         local_addr: SocketAddr,
         config: RdmaListenerConfig,
         cm_id: SharedCmId,
+        diagnostic_totals: Arc<ListenerDiagnosticTotals>,
     ) -> Self {
         Self {
             token,
@@ -649,6 +705,10 @@ impl ListenerState {
             backlog: config.backlog,
             cm_id: Mutex::new(Some(cm_id)),
             queues: Mutex::new(ListenerQueues::default()),
+            diagnostic_totals,
+            queued_children: AtomicUsize::new(0),
+            pending_accepts: AtomicUsize::new(0),
+            selected_accepts: AtomicUsize::new(0),
             closing: AtomicBool::new(false),
             finalization_started: AtomicBool::new(false),
             failure: Mutex::new(None),
@@ -667,6 +727,10 @@ impl ListenerState {
             backlog,
             cm_id: Mutex::new(None),
             queues: Mutex::new(ListenerQueues::default()),
+            diagnostic_totals: Arc::new(ListenerDiagnosticTotals::default()),
+            queued_children: AtomicUsize::new(0),
+            pending_accepts: AtomicUsize::new(0),
+            selected_accepts: AtomicUsize::new(0),
             closing: AtomicBool::new(false),
             finalization_started: AtomicBool::new(false),
             failure: Mutex::new(None),
@@ -677,11 +741,28 @@ impl ListenerState {
         })
     }
 
+    fn lock_queues(&self) -> ListenerQueueGuard<'_> {
+        let guard = lock_unpoison(&self.queues);
+        let before = queue_counts(&guard);
+        ListenerQueueGuard {
+            listener: self,
+            guard,
+            before,
+        }
+    }
+
+    fn publish_queue_counts(&self, before: (usize, usize, usize), after: (usize, usize, usize)) {
+        self.queued_children.store(after.0, Ordering::Release);
+        self.pending_accepts.store(after.1, Ordering::Release);
+        self.selected_accepts.store(after.2, Ordering::Release);
+        self.diagnostic_totals.update_queue_counts(before, after);
+    }
+
     pub(super) fn register_waiter(&self, request: Arc<AcceptRequest>) -> Result<()> {
         if self.closing.load(Ordering::Acquire) {
             return Err(self.close_error());
         }
-        let mut queues = lock_unpoison(&self.queues);
+        let mut queues = self.lock_queues();
         if self.closing.load(Ordering::Acquire) {
             return Err(self.close_error());
         }
@@ -691,7 +772,7 @@ impl ListenerState {
     }
 
     pub(super) fn admit_child(&self, child: IncomingChild) -> ChildAdmission {
-        let mut queues = lock_unpoison(&self.queues);
+        let mut queues = self.lock_queues();
         let mut cancelled = Vec::new();
         while queues
             .waiters
@@ -730,7 +811,7 @@ impl ListenerState {
     }
 
     pub(super) fn next_action(&self) -> ListenerAction {
-        let mut queues = lock_unpoison(&self.queues);
+        let mut queues = self.lock_queues();
         if let Some(position) = queues
             .waiters
             .iter()
@@ -817,7 +898,7 @@ impl ListenerState {
     }
 
     pub(super) fn route_selected(&self, request: &Arc<AcceptRequest>, route: u64) -> Result<()> {
-        let mut queues = lock_unpoison(&self.queues);
+        let mut queues = self.lock_queues();
         match queues.selected.take() {
             Some(SelectedAccept::Processing { request: current })
                 if Arc::ptr_eq(&current, request) =>
@@ -842,7 +923,7 @@ impl ListenerState {
     }
 
     pub(super) fn finish_selected_request(&self, request: &Arc<AcceptRequest>) -> bool {
-        let mut queues = lock_unpoison(&self.queues);
+        let mut queues = self.lock_queues();
         let matches = match queues.selected.as_ref() {
             Some(SelectedAccept::Processing { request: current })
             | Some(SelectedAccept::Ready {
@@ -861,7 +942,7 @@ impl ListenerState {
     }
 
     pub(super) fn finish_selected_route(&self, route: u64) -> bool {
-        let mut queues = lock_unpoison(&self.queues);
+        let mut queues = self.lock_queues();
         let matches = matches!(
             queues.selected.as_ref(),
             Some(SelectedAccept::Routed {
@@ -910,7 +991,7 @@ impl ListenerState {
     }
 
     pub(super) fn has_work(&self) -> bool {
-        let queues = lock_unpoison(&self.queues);
+        let queues = self.lock_queues();
         if self.closing.load(Ordering::Acquire) {
             return !queues.waiters.is_empty()
                 || !queues.children.is_empty()
@@ -965,7 +1046,7 @@ impl ListenerState {
                 *close_outcome = Some(ListenerCloseOutcome::Terminal(outcome.clone()));
             }
         }
-        let mut queues = lock_unpoison(&self.queues);
+        let mut queues = self.lock_queues();
         let mut requests: Vec<_> = queues
             .waiters
             .drain(..)
@@ -1003,11 +1084,10 @@ impl ListenerState {
     }
 
     pub(super) fn queue_counts(&self) -> (usize, usize, usize) {
-        let queues = lock_unpoison(&self.queues);
         (
-            queues.children.len(),
-            queues.waiters.len(),
-            usize::from(queues.selected.is_some()),
+            self.queued_children.load(Ordering::Acquire),
+            self.pending_accepts.load(Ordering::Acquire),
+            self.selected_accepts.load(Ordering::Acquire),
         )
     }
 
@@ -1021,6 +1101,41 @@ impl ListenerState {
             selected_accepts,
         }
     }
+}
+
+struct ListenerQueueGuard<'a> {
+    listener: &'a ListenerState,
+    guard: MutexGuard<'a, ListenerQueues>,
+    before: (usize, usize, usize),
+}
+
+impl Deref for ListenerQueueGuard<'_> {
+    type Target = ListenerQueues;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl DerefMut for ListenerQueueGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl Drop for ListenerQueueGuard<'_> {
+    fn drop(&mut self) {
+        self.listener
+            .publish_queue_counts(self.before, queue_counts(&self.guard));
+    }
+}
+
+fn queue_counts(queues: &ListenerQueues) -> (usize, usize, usize) {
+    (
+        queues.children.len(),
+        queues.waiters.len(),
+        usize::from(queues.selected.is_some()),
+    )
 }
 
 fn select_pair(queues: &mut ListenerQueues) {

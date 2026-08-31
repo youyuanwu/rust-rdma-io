@@ -43,13 +43,25 @@ async fn build_engine(mode: CompletionMode) -> (RdmaEngine, tokio::task::JoinHan
 }
 
 async fn listen(engine: &RdmaEngine) -> RdmaListener {
-    engine
-        .listen(
-            "0.0.0.0:0".parse().unwrap(),
-            RdmaListenerConfig::default().backlog(4),
-        )
-        .await
-        .unwrap()
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match engine
+                .listen(
+                    "0.0.0.0:0".parse().unwrap(),
+                    RdmaListenerConfig::default().backlog(4),
+                )
+                .await
+            {
+                Ok(listener) => return listener,
+                Err(Error::Verbs(error)) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("listener setup failed: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("listener setup remained busy")
 }
 
 async fn establish_messages(

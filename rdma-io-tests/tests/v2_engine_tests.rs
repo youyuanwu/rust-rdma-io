@@ -1,5 +1,6 @@
 use std::future::{Future, poll_fn};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
 use std::time::Duration;
 
@@ -28,11 +29,28 @@ fn message_builder() -> MessageTransportBuilder {
 
 fn assert_clean(result: rdma_io::v2::Result<()>) {
     assert!(
-        matches!(
-            result,
-            Ok(()) | Err(Error::TransportClosed) | Err(Error::ProtocolViolation(_))
-        ),
+        matches!(result, Ok(()) | Err(Error::TransportClosed)),
         "unexpected close result: {result:?}"
+    );
+}
+
+fn assert_protocol_pair_close(result: rdma_io::v2::Result<()>) {
+    assert!(
+        matches!(
+            &result,
+            Err(Error::ProtocolViolation(message)) if message.contains("zero credits")
+        ) || matches!(&result, Err(Error::TransportClosed)),
+        "expected zero-credit protocol failure or its peer close, got: {result:?}"
+    );
+}
+
+fn assert_local_protocol_violation(result: rdma_io::v2::Result<()>) {
+    assert!(
+        matches!(
+            &result,
+            Err(Error::ProtocolViolation(message)) if message.contains("zero credits")
+        ),
+        "expected zero-credit protocol violation, got: {result:?}"
     );
 }
 
@@ -99,22 +117,36 @@ async fn assert_out_of_order_isolation(pairs: &[(Arc<MessageTransport>, Arc<Mess
 }
 
 async fn assert_hot_connection_fairness(pairs: &[(Arc<MessageTransport>, Arc<MessageTransport>)]) {
-    let hot_send = {
-        let client = Arc::clone(&pairs[0].1);
-        tokio::spawn(async move {
-            for sequence in 0..128_u32 {
-                client.send(&sequence.to_le_bytes()).await.unwrap();
-            }
-        })
-    };
-    let hot_recv = {
+    let stop = Arc::new(AtomicBool::new(false));
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let hot = {
         let server = Arc::clone(&pairs[0].0);
+        let client = Arc::clone(&pairs[0].1);
+        let stop = Arc::clone(&stop);
         tokio::spawn(async move {
-            for _ in 0..128 {
-                drop(server.recv().await.unwrap());
+            let mut sequence = 0_u32;
+            let mut started_tx = Some(started_tx);
+            while !stop.load(Ordering::Acquire) {
+                let payload = sequence.to_le_bytes();
+                client.send(&payload).await.unwrap();
+                let request = server.recv().await.unwrap();
+                assert_eq!(&*request, &payload);
+                drop(request);
+                server.send(&payload).await.unwrap();
+                let response = client.recv().await.unwrap();
+                assert_eq!(&*response, &payload);
+                drop(response);
+                sequence = sequence.wrapping_add(1);
+                if let Some(started_tx) = started_tx.take() {
+                    let _ = started_tx.send(());
+                }
             }
         })
     };
+    tokio::time::timeout(Duration::from_secs(10), started_rx)
+        .await
+        .expect("hot connection did not start")
+        .expect("hot connection ended before starting");
 
     let intermittent = join_all((1..8).map(|index| {
         let server = Arc::clone(&pairs[index].0);
@@ -141,8 +173,11 @@ async fn assert_hot_connection_fairness(pairs: &[(Arc<MessageTransport>, Arc<Mes
     }))
     .await;
     assert_eq!(intermittent.len(), 7);
-    hot_send.await.unwrap();
-    hot_recv.await.unwrap();
+    stop.store(true, Ordering::Release);
+    tokio::time::timeout(Duration::from_secs(10), hot)
+        .await
+        .expect("hot connection did not stop")
+        .unwrap();
 }
 
 async fn assert_held_credit_and_cancellation(
@@ -234,7 +269,7 @@ async fn run_mode(mode: CompletionMode) {
     assert_eq!(shared.live_connection_reservations, 18);
     assert_eq!(shared.establishing_connection_reservations, 0);
     assert_eq!(shared.established_connection_reservations, 18);
-    assert_eq!(shared.connections.len(), 18);
+    assert_eq!(shared.connections().len(), 18);
     assert_eq!(shared.connections_admitted, 18);
     assert_eq!(shared.connections_opened, 18);
     assert_eq!(shared.inbound_requests_accepted, 9);
@@ -282,8 +317,8 @@ async fn run_mode(mode: CompletionMode) {
         pairs[4].0.recv().await,
         Err(Error::ProtocolViolation(message)) if message.contains("zero credits")
     ));
-    assert_clean(pairs[4].0.close().await);
-    assert_clean(pairs[4].1.close().await);
+    assert_local_protocol_violation(pairs[4].0.close().await);
+    assert_protocol_pair_close(pairs[4].1.close().await);
 
     let stale_connection = pairs[5].1.test_connection().unwrap();
     let held = resources
@@ -356,10 +391,15 @@ async fn run_mode(mode: CompletionMode) {
         assert!(instrumentation.driver_yields > 0);
     }
 
-    for (server, client) in &pairs {
+    for (index, (server, client)) in pairs.iter().enumerate() {
         let (server_close, client_close) = tokio::join!(server.close(), client.close());
-        assert_clean(server_close);
-        assert_clean(client_close);
+        if index == 4 {
+            assert_local_protocol_violation(server_close);
+            assert_protocol_pair_close(client_close);
+        } else {
+            assert_clean(server_close);
+            assert_clean(client_close);
+        }
     }
     listener.close().await.unwrap();
     engine.shutdown().await.unwrap();
@@ -370,12 +410,11 @@ async fn run_mode(mode: CompletionMode) {
     assert_eq!(terminal.registered_operations, 0);
     assert_eq!(terminal.free_cq_credits, 2_048);
     assert_eq!(terminal.quarantined_bundles, 0);
-    assert_eq!(terminal.registered_quarantined_qps, 0);
     assert_eq!(terminal.retained_cq_credits, 0);
     assert_eq!(terminal.connections_closed, 18);
     assert_eq!(terminal.qp_destroys, 18);
-    assert_eq!(terminal.connection_slots_retired, 0);
-    assert_eq!(terminal.operation_slots_retired, 0);
+    assert_eq!(terminal.retired_connection_slots, 0);
+    assert_eq!(terminal.retired_operation_slots, 0);
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 8))]

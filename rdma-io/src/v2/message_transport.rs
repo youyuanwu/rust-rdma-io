@@ -9,7 +9,8 @@
 //! Engine attachment through [`MessageTransportBuilder::connect_on`] or
 //! [`MessageTransportBuilder::accept_on`] returns only [`MessageTransport`];
 //! the engine driver performs message setup and protocol progress with zero
-//! additional message tasks.
+//! additional message tasks. There is no dedicated receive pump or disconnect
+//! monitor.
 //!
 //! ```no_run
 //! # use rdma_io::v2::*;
@@ -90,10 +91,13 @@
 //!
 //! # Disconnect Monitoring
 //!
-//! The engine driver monitors CM events. On peer disconnect, the transport is
-//! closed with [`Error::TransportClosed`]. CM failures retain their contextual
-//! [`Error`] in engine-owned state, wake pending waiters, and initiate
-//! connection shutdown.
+//! The sole engine driver consumes CM events and completion errors. Peer
+//! disconnect and ordinary `WrFlushErr` teardown on HELLO, receive, and
+//! steady-state paths are normalized to [`Error::TransportClosed`]. Other CM,
+//! protocol, and provider failures retain their contextual [`Error`], wake
+//! pending waiters, and initiate the same explicit local QP-to-ERR drain.
+//! Errors are observed from `ready`, `send`, `recv`, and `close`; there is no
+//! separate public error accessor.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -132,6 +136,11 @@ use super::protocol;
 /// | recv_buffers | 32 |
 /// | send_buffers | 16 |
 /// | buffer_size | 65536 (64 KB) |
+///
+/// The default QP requirement is exactly 19 send WRs
+/// (`16 + 2 control + 1 HELLO`) and 34 receive WRs
+/// (`32 + 2 control`). All 34 receives are posted before `rdma_connect` or
+/// `rdma_accept`; HELLO reuses one control receive rather than adding another.
 ///
 /// # Errors
 ///
@@ -293,6 +302,8 @@ impl MessageTransportBuilder {
     ///
     /// The returned frontend has no connection-local driver. The engine driver
     /// owns receive pre-posting, HELLO negotiation, CQ routing, and readiness.
+    /// The full checked receive batch is accepted before `rdma_connect`; setup
+    /// failure follows exact `bad_wr` prefix/suffix/ambiguity ownership.
     pub async fn connect_on(
         self,
         engine: &RdmaEngine,
@@ -320,7 +331,8 @@ impl MessageTransportBuilder {
     /// Attach an inbound message transport to an engine-owned listener.
     ///
     /// This registers one message waiter in the listener's existing ordered
-    /// accept queue and returns no listener- or message-specific driver.
+    /// accept queue and returns no listener- or message-specific driver. The
+    /// full checked receive batch is accepted before `rdma_accept`.
     pub async fn accept_on(self, listener: &RdmaListener) -> Result<MessageTransport> {
         let config = self.derive_engine_config()?;
         listener.validate_message_connection_config(&config.connection)?;
@@ -598,7 +610,8 @@ impl PreEstablishSetup for MessagePreEstablishSetup {
 /// # Cancellation Safety
 ///
 /// Dropping a `ReceivedMessage` safely returns its buffer for reposting.
-/// The repost channel is unbounded so `Drop` never blocks.
+/// Drop briefly enqueues connection-local engine work and publishes a driver
+/// wake; it does not await or run a receive-pump task.
 pub struct ReceivedMessage {
     mr: Option<Mr>,
     byte_len: usize,
@@ -714,17 +727,23 @@ fn check_credit_return(
     Ok(())
 }
 
-fn subtract_pending_credit_returns(pending: &AtomicUsize, credits: usize) -> Result<()> {
-    pending
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-            value.checked_sub(credits)
-        })
-        .map(|_| ())
-        .map_err(|observed| {
-            Error::ProtocolViolation(format!(
-                "pending CREDIT subtraction underflow: sent={credits} > pending={observed}"
-            ))
-        })
+fn claim_pending_credit_returns(pending: &AtomicUsize) -> usize {
+    let mut observed = pending.load(Ordering::Acquire);
+    loop {
+        if observed == 0 {
+            return 0;
+        }
+        let claimed = observed.min(u32::MAX as usize);
+        match pending.compare_exchange_weak(
+            observed,
+            observed - claimed,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return claimed,
+            Err(current) => observed = current,
+        }
+    }
 }
 
 /// Internal struct for a completed receive to pass through the channel.
@@ -1537,8 +1556,9 @@ impl EngineMessageState {
     }
 
     fn flush_one_credit(&self) -> bool {
-        let pending = self.pending_credit_returns.load(Ordering::Acquire);
-        if pending == 0 || self.state.load(Ordering::Acquire) != STATE_READY {
+        if self.pending_credit_returns.load(Ordering::Acquire) == 0
+            || self.state.load(Ordering::Acquire) != STATE_READY
+        {
             return false;
         }
         let pools = match self.pools() {
@@ -1551,12 +1571,20 @@ impl EngineMessageState {
         let Some(mut mr) = pools.control_sends.try_take() else {
             return false;
         };
-        let credits = pending.min(u32::MAX as usize);
+        let credits = claim_pending_credit_returns(&self.pending_credit_returns);
+        if credits == 0 {
+            pools.control_sends.put(mr);
+            return false;
+        }
         let frame_len = protocol::write_credit_frame(mr.as_mut_slice(), credits as u32);
         let connection = match self.connection() {
             Ok(connection) => connection,
             Err(error) => {
                 pools.control_sends.put(mr);
+                if self.state.load(Ordering::Acquire) == STATE_READY {
+                    self.pending_credit_returns
+                        .fetch_add(credits, Ordering::AcqRel);
+                }
                 self.fail(error, false);
                 return true;
             }
@@ -1573,17 +1601,16 @@ impl EngineMessageState {
                 }
             }),
         ) {
-            Ok(()) => {
-                if let Err(error) =
-                    subtract_pending_credit_returns(&self.pending_credit_returns, credits)
-                {
-                    self.fail(error, true);
-                }
-            }
+            Ok(()) => {}
             Err(error) if error.potentially_accepted() => {
                 self.fail(error.error().clone(), true);
             }
-            Err(_) => {}
+            Err(_) => {
+                if self.state.load(Ordering::Acquire) == STATE_READY {
+                    self.pending_credit_returns
+                        .fetch_add(credits, Ordering::AcqRel);
+                }
+            }
         }
         true
     }
@@ -1941,6 +1968,10 @@ fn validate_peer_hello(hello: protocol::HelloPayload, local_buffer_size: usize) 
 ///   the exact CQE arrives.
 /// - Cancelling `recv()`: the message stays in the internal channel
 ///   for the next `recv()` call. No message is lost.
+///
+/// There is no public error snapshot method. Observe the contextual result of
+/// [`Self::ready`], [`Self::send`], [`Self::recv`], and [`Self::close`], plus
+/// engine-wide summaries from [`RdmaEngine::diagnostics`].
 pub struct MessageTransport {
     buffer_size: usize,
     connection: RdmaConnection,
@@ -1976,7 +2007,8 @@ impl MessageTransport {
     ///
     /// - [`Error::MessageTooLarge`] if `data.len() > buffer_size`
     /// - [`Error::TransportClosed`] if the transport is shut down or disconnected
-    /// - [`Error::CompletionError`] if the send WR completed with error
+    /// - [`Error::CompletionError`] if a non-flush send WR completed with error
+    /// - [`Error::TransportClosed`] for peer disconnect or ordinary flush teardown
     pub async fn send(&self, data: &[u8]) -> Result<()> {
         if data.len() > self.buffer_size {
             return Err(Error::MessageTooLarge {
@@ -2119,7 +2151,9 @@ impl MessageTransport {
     /// Graceful async shutdown.
     ///
     /// Closes the engine-owned connection and returns its contextual result.
-    /// Repeated calls observe the same connection close outcome.
+    /// Repeated calls observe the same connection close outcome. A connection
+    /// drain timeout returns memoized [`Error::ConnectionQuarantined`]; an
+    /// engine-wide terminal drain failure returns [`Error::EngineWedged`].
     pub async fn close(&self) -> Result<()> {
         self.state.begin_close();
         let result = self.connection.close().await;
@@ -2621,13 +2655,11 @@ mod tests {
     }
 
     #[test]
-    fn pending_credit_subtraction_is_checked_and_non_wrapping() {
-        let pending = AtomicUsize::new(1);
-        let error = subtract_pending_credit_returns(&pending, 2).unwrap_err();
-        assert!(matches!(error, Error::ProtocolViolation(_)));
-        assert_eq!(pending.load(Ordering::Acquire), 1);
-        subtract_pending_credit_returns(&pending, 1).unwrap();
+    fn pending_credit_claim_is_atomic_and_non_wrapping() {
+        let pending = AtomicUsize::new(3);
+        assert_eq!(claim_pending_credit_returns(&pending), 3);
         assert_eq!(pending.load(Ordering::Acquire), 0);
+        assert_eq!(claim_pending_credit_returns(&pending), 0);
     }
 
     #[test]

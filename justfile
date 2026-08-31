@@ -91,6 +91,18 @@ test:
 test-doc:
     cargo test --doc
 
+# Run the complete RXE-then-SIW v2 engine provider validation and restore RXE.
+validate-v2-engine:
+    cargo check --workspace --all-targets --features tokio
+    cargo check -p rdma-io --no-default-features
+    cargo build --no-default-features --features async
+    cargo check -p rdma-io --no-default-features --features tokio
+    cargo fmt --all -- --check
+    cargo clippy --workspace --all-targets --features tokio -- -D warnings
+    cargo doc --workspace --features tokio --no-deps
+    cargo test --doc --workspace --features tokio
+    sudo -E env CARGO="$(command -v cargo)" ./scripts/validate-v2-engine-providers.sh
+
 # Set up the Soft-iWARP (siw) software RDMA provider.
 setup-siw:
     sudo ./scripts/setup-siw.sh
