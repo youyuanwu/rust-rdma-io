@@ -23,6 +23,11 @@ unsafe impl Sync for CompletionQueue {}
 
 impl Drop for CompletionQueue {
     fn drop(&mut self) {
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::test_support::destruction::record(
+            crate::test_support::destruction::DestructionKind::CompletionQueue,
+            self.inner as usize,
+        );
         let ret = unsafe { ibv_destroy_cq(self.inner) };
         if ret != 0 {
             tracing::error!(

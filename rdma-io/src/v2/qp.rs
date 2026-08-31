@@ -279,6 +279,11 @@ impl Qp {
         &self.inner
     }
 
+    #[expect(dead_code, reason = "used by the engine close path in Phase 6")]
+    pub(crate) fn destroy(self) {
+        self.inner.destroy();
+    }
+
     /// Submit a typed RDMA operation.
     ///
     /// io_uring/compio-style submission: pass a typed [`Op`](super::op::Op)

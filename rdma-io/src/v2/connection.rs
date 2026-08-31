@@ -21,20 +21,11 @@ use crate::cm::{ConnParam, EventChannel};
 
 use super::cq::CqBuilder;
 use super::driver::{CqDriverHandle, FdCqDriver, PollingCqDriver};
+use super::engine::CompletionMode;
 use super::error::{Error, Result};
 use super::pd::Pd;
 use super::qp::Qp;
 use super::shared_qp::SharedQp;
-
-/// CQ completion integration mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CompletionMode {
-    /// Fd/readiness-based: lower CPU, slightly higher latency.
-    #[default]
-    Readiness,
-    /// Direct CQ polling: higher CPU, lower latency.
-    Polling,
-}
 
 /// Internal connection configuration.
 pub(crate) struct ConnectionConfig {

@@ -10,7 +10,7 @@ publish = false
 
 [dependencies]
 rdma-io-sys.workspace = true
-rdma-io = { workspace = true, features = ["tokio"] }
+rdma-io = { workspace = true, features = ["tokio", "test-hooks"] }
 rdma-io-tonic = { workspace = true, features = ["tls"] }
 rdma-io-quinn.workspace = true
 quinn.workspace = true
@@ -22,7 +22,7 @@ prost.workspace = true
 http.workspace = true
 openssl.workspace = true
 rcgen.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "time", "test-util"] }
 tokio-stream.workspace = true
 futures-io.workspace = true
 futures-util.workspace = true

@@ -12,6 +12,7 @@ readme = "../README.md"
 default = ["tokio"]
 async = ["dep:futures-io", "dep:futures-util"]
 tokio = ["async", "dep:tokio", "tokio/rt", "tokio/sync", "tokio/time", "tokio/macros"]
+test-hooks = []
 
 [dependencies]
 rdma-io-sys.workspace = true
@@ -23,3 +24,6 @@ libc.workspace = true
 futures-io = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

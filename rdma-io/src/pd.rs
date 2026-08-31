@@ -25,6 +25,11 @@ unsafe impl Sync for ProtectionDomain {}
 
 impl Drop for ProtectionDomain {
     fn drop(&mut self) {
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::test_support::destruction::record(
+            crate::test_support::destruction::DestructionKind::ProtectionDomain,
+            self.inner as usize,
+        );
         let ret = unsafe { ibv_dealloc_pd(self.inner) };
         if ret != 0 {
             tracing::error!(

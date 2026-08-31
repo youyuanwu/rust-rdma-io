@@ -114,10 +114,10 @@ use crate::cm::ConnParam;
 use crate::wr::{SendFlags, SendWr, Sge, WrOpcode};
 
 use super::connection::{
-    CmMonitorHandle, CompletionMode, ConnectionBuilder, ConnectionConfig, ConnectionLifetime,
-    ConnectionParts,
+    CmMonitorHandle, ConnectionBuilder, ConnectionConfig, ConnectionLifetime, ConnectionParts,
 };
 use super::driver::CqDriverHandle;
+use super::engine::CompletionMode;
 use super::error::{Error, Result, TransportError};
 use super::mr::{AccessIntent, Mr};
 use super::pd::Pd;

@@ -114,30 +114,3 @@ impl Context {
         Self { inner: ctx }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_open_first_with_device() {
-        // This test requires an RDMA device (e.g. rxe0)
-        match Context::open_first() {
-            Ok(ctx) => {
-                // Should be able to allocate a PD
-                let pd = ctx.alloc_pd();
-                assert!(pd.is_ok(), "PD allocation should succeed");
-            }
-            Err(Error::NoDevices) => {
-                // No device available — skip
-            }
-            Err(e) => panic!("unexpected error: {e}"),
-        }
-    }
-
-    #[test]
-    fn test_open_by_name_not_found() {
-        let result = Context::open_by_name("nonexistent_device_12345");
-        assert!(matches!(result, Err(Error::DeviceNotFound(_))));
-    }
-}

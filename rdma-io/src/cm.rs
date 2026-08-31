@@ -5,6 +5,7 @@
 
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
+use std::ptr::NonNull;
 use std::sync::Arc;
 
 use rdma_io_sys::ibverbs::*;
@@ -12,7 +13,7 @@ use rdma_io_sys::rdmacm::*;
 
 use crate::Result;
 use crate::cq::CompletionQueue;
-use crate::device::Context;
+use crate::device::{Context, ContextAnchor};
 use crate::error::{from_ptr, from_ret_errno};
 use crate::pd::ProtectionDomain;
 use crate::qp::QpInitAttr;
@@ -132,6 +133,11 @@ unsafe impl Sync for EventChannel {}
 
 impl Drop for EventChannel {
     fn drop(&mut self) {
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::test_support::destruction::record(
+            crate::test_support::destruction::DestructionKind::CmEventChannel,
+            self.inner as usize,
+        );
         unsafe { rdma_destroy_event_channel(self.inner) };
     }
 }
@@ -254,6 +260,11 @@ unsafe impl Sync for CmId {}
 impl Drop for CmId {
     fn drop(&mut self) {
         if self.owned {
+            #[cfg(any(test, feature = "test-hooks"))]
+            crate::test_support::destruction::record(
+                crate::test_support::destruction::DestructionKind::CmId,
+                self.inner as usize,
+            );
             let ret = unsafe { rdma_destroy_id(self.inner) };
             if ret != 0 {
                 tracing::error!(
@@ -356,7 +367,9 @@ impl CmId {
         from_ret_errno(unsafe { rdma_create_qp(self.inner, pd.inner, &mut raw_attr) })?;
         Ok(CmQueuePair {
             qp: self.qp_raw(),
-            cm_id_raw: self.inner,
+            cm_id_raw: Some(
+                NonNull::new(self.inner).expect("rdma_create_qp requires a non-null CM ID"),
+            ),
             _pd: Arc::clone(pd),
             _send_cq: send_cq.map(Arc::clone),
             _recv_cq: recv_cq.map(Arc::clone),
@@ -405,6 +418,43 @@ impl CmId {
         } else {
             // rdma_cm owns this context — don't close on drop
             Some(Arc::new(unsafe { Context::from_raw(ctx, false) }))
+        }
+    }
+
+    /// Whether this CM ID is associated with the exact supplied verbs context.
+    pub fn uses_context(&self, context: &Context) -> bool {
+        unsafe { (*self.inner).verbs == context.as_raw() }
+    }
+
+    /// Require exact raw-context identity before creating context-bound resources.
+    pub fn require_context(&self, context: &Context) -> Result<()> {
+        if self.uses_context(context) {
+            Ok(())
+        } else {
+            Err(crate::Error::InvalidArg(format!(
+                "CM route context does not match pinned context for device {}",
+                context.device_name().unwrap_or("<unknown>")
+            )))
+        }
+    }
+
+    /// Kernel device name selected for this CM ID, if address resolution has run.
+    pub fn device_name(&self) -> Option<&str> {
+        let context = unsafe { (*self.inner).verbs };
+        if context.is_null() {
+            return None;
+        }
+        let device = unsafe { (*context).device };
+        if device.is_null() {
+            return None;
+        }
+        let name = unsafe { ibv_get_device_name(device) };
+        if name.is_null() {
+            None
+        } else {
+            unsafe { std::ffi::CStr::from_ptr(name.cast()) }
+                .to_str()
+                .ok()
         }
     }
 
@@ -469,7 +519,7 @@ impl CmId {
 /// guarantees this.
 pub struct CmQueuePair {
     qp: *mut ibv_qp,
-    cm_id_raw: *mut rdma_cm_id,
+    cm_id_raw: Option<NonNull<rdma_cm_id>>,
     _pd: Arc<ProtectionDomain>,
     _send_cq: Option<Arc<CompletionQueue>>,
     _recv_cq: Option<Arc<CompletionQueue>>,
@@ -481,13 +531,31 @@ unsafe impl Sync for CmQueuePair {}
 
 impl Drop for CmQueuePair {
     fn drop(&mut self) {
-        // Safety: QP was created by rdma_create_qp on this cm_id.
-        // Arc refs to PD/CQs keep them alive until after this returns.
-        unsafe { rdma_destroy_qp(self.cm_id_raw) };
+        self.destroy_once();
     }
 }
 
 impl CmQueuePair {
+    fn destroy_once(&mut self) {
+        let Some(cm_id_raw) = self.cm_id_raw.take() else {
+            return;
+        };
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::test_support::destruction::record(
+            crate::test_support::destruction::DestructionKind::QueuePair,
+            self.qp as usize,
+        );
+        // Safety: QP was created by rdma_create_qp on this CM ID. The retained
+        // PD/CQ Arcs and the caller's owning CmId remain alive for this call.
+        unsafe { rdma_destroy_qp(cm_id_raw.as_ptr()) };
+    }
+
+    /// Consume and synchronously destroy this CM-managed QP exactly once.
+    #[expect(dead_code, reason = "used by the engine close path in Phase 6")]
+    pub(crate) fn destroy(mut self) {
+        self.destroy_once();
+    }
+
     /// Raw QP pointer for posting work requests.
     pub fn as_raw(&self) -> *mut ibv_qp {
         self.qp
@@ -516,6 +584,124 @@ impl CmQueuePair {
         };
         crate::error::from_ret(unsafe { ibv_modify_qp(self.qp, &mut attr, IBV_QP_STATE as i32) })
     }
+}
+
+/// Owns the complete context list returned by `rdma_get_devices`.
+///
+/// Contexts selected from this list are non-closing facades that retain the
+/// list until every cloned child resource has been destroyed.
+pub struct RdmaCmDeviceList {
+    list: NonNull<*mut ibv_context>,
+    count: usize,
+}
+
+// Safety: librdmacm contexts are process resources and child access is
+// synchronized by libibverbs.
+unsafe impl Send for RdmaCmDeviceList {}
+unsafe impl Sync for RdmaCmDeviceList {}
+impl ContextAnchor for RdmaCmDeviceList {}
+
+impl RdmaCmDeviceList {
+    /// Enumerate the verbs contexts owned by librdmacm.
+    pub fn new() -> Result<Arc<Self>> {
+        let mut count = 0i32;
+        let list = unsafe { rdma_get_devices(&mut count) };
+        let Some(list) = NonNull::new(list) else {
+            if count == 0 {
+                return Err(crate::Error::NoDevices);
+            }
+            return Err(crate::Error::Verbs(std::io::Error::last_os_error()));
+        };
+        if count <= 0 {
+            #[cfg(any(test, feature = "test-hooks"))]
+            crate::test_support::destruction::record(
+                crate::test_support::destruction::DestructionKind::RdmaFreeDevices,
+                list.as_ptr() as usize,
+            );
+            unsafe { rdma_free_devices(list.as_ptr()) };
+            return Err(crate::Error::NoDevices);
+        }
+        Ok(Arc::new(Self {
+            list,
+            count: count as usize,
+        }))
+    }
+
+    /// Number of contexts returned by librdmacm.
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    /// Whether the list contains no contexts.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Kernel names of all contexts in the list.
+    pub fn device_names(&self) -> Vec<String> {
+        (0..self.count)
+            .filter_map(|index| self.context_name(index).map(str::to_owned))
+            .collect()
+    }
+
+    /// Select an exact kernel device name and return an anchored context facade.
+    pub fn context_by_name(self: &Arc<Self>, name: &str) -> Result<Arc<Context>> {
+        let index = select_name_index((0..self.count).map(|index| self.context_name(index)), name)
+            .ok_or_else(|| crate::Error::DeviceNotFound(name.to_owned()))?;
+        let raw = self.context_raw(index);
+        let anchor: Arc<dyn ContextAnchor> = self.clone();
+        Ok(Arc::new(unsafe { Context::from_raw_anchored(raw, anchor) }))
+    }
+
+    /// Whether `context` is one of the exact raw contexts owned by this list.
+    pub fn contains_context(&self, context: &Context) -> bool {
+        (0..self.count).any(|index| self.context_raw(index) == context.as_raw())
+    }
+
+    fn context_raw(&self, index: usize) -> *mut ibv_context {
+        assert!(index < self.count);
+        unsafe { *self.list.as_ptr().add(index) }
+    }
+
+    fn context_name(&self, index: usize) -> Option<&str> {
+        let context = self.context_raw(index);
+        if context.is_null() {
+            return None;
+        }
+        let device = unsafe { (*context).device };
+        if device.is_null() {
+            return None;
+        }
+        let name = unsafe { ibv_get_device_name(device) };
+        if name.is_null() {
+            None
+        } else {
+            unsafe { std::ffi::CStr::from_ptr(name.cast()) }
+                .to_str()
+                .ok()
+        }
+    }
+}
+
+impl Drop for RdmaCmDeviceList {
+    fn drop(&mut self) {
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::test_support::destruction::record(
+            crate::test_support::destruction::DestructionKind::RdmaFreeDevices,
+            self.list.as_ptr() as usize,
+        );
+        unsafe { rdma_free_devices(self.list.as_ptr()) };
+    }
+}
+
+fn select_name_index<'a>(
+    names: impl IntoIterator<Item = Option<&'a str>>,
+    requested: &str,
+) -> Option<usize> {
+    names
+        .into_iter()
+        .enumerate()
+        .find_map(|(index, name)| (name == Some(requested)).then_some(index))
 }
 
 // --- Socket address helpers ---
@@ -617,5 +803,18 @@ unsafe fn sockaddr_to_std(
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod device_list_tests {
+    use super::select_name_index;
+
+    #[test]
+    fn exact_name_selection_uses_injected_entries() {
+        let names = [Some("rxe0"), Some("siw0"), None];
+        assert_eq!(select_name_index(names, "siw0"), Some(1));
+        assert_eq!(select_name_index(names, "rxe"), None);
+        assert_eq!(select_name_index(names, "missing"), None);
     }
 }

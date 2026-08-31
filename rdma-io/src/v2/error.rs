@@ -62,6 +62,24 @@ pub enum Error {
     /// The in-flight registry or buffer pool has no available capacity.
     CapacityExhausted,
 
+    /// A connection close deadline expired while accepted WRs remain live.
+    ConnectionQuarantined {
+        /// Accepted operations still awaiting exact completions.
+        outstanding_operations: usize,
+        /// CQ admission credits retained with those operations.
+        cq_debt: usize,
+    },
+
+    /// Engine termination retained one or more unsafe live bundles.
+    EngineWedged {
+        /// Complete QP/CM/MR/operation bundles retained fail-closed.
+        retained_bundles: usize,
+        /// Accepted operations still awaiting exact completions.
+        outstanding_operations: usize,
+        /// CQ admission credits retained with those operations.
+        cq_debt: usize,
+    },
+
     /// A wire-protocol violation was detected (bad magic, version, frame type,
     /// or payload length).
     ProtocolViolation(String),
@@ -99,6 +117,21 @@ impl fmt::Display for Error {
             Error::TransportClosed => write!(f, "transport closed"),
             Error::DriverShutdown => write!(f, "driver shut down"),
             Error::CapacityExhausted => write!(f, "capacity exhausted"),
+            Error::ConnectionQuarantined {
+                outstanding_operations,
+                cq_debt,
+            } => write!(
+                f,
+                "connection quarantined with {outstanding_operations} outstanding operations and {cq_debt} retained CQ credits"
+            ),
+            Error::EngineWedged {
+                retained_bundles,
+                outstanding_operations,
+                cq_debt,
+            } => write!(
+                f,
+                "engine wedged with {retained_bundles} retained bundles, {outstanding_operations} outstanding operations, and {cq_debt} retained CQ credits"
+            ),
             Error::ProtocolViolation(detail) => {
                 write!(f, "protocol violation: {detail}")
             }

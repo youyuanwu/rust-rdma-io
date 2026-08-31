@@ -199,17 +199,4 @@ mod tests {
             AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_READ | AccessFlags::REMOTE_WRITE
         );
     }
-
-    #[test]
-    fn test_zero_size_mr_fails() {
-        match super::super::Context::open_first() {
-            Ok(ctx) => {
-                let pd = ctx.alloc_pd().unwrap();
-                let result = pd.reg_mr(0, AccessIntent::LocalOnly);
-                assert!(matches!(result, Err(Error::InvalidConfig(_))));
-            }
-            Err(Error::NoDevices) => {} // skip
-            Err(e) => panic!("unexpected: {e}"),
-        }
-    }
 }

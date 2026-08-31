@@ -49,6 +49,8 @@ mod connection;
 pub mod cq_poller;
 #[cfg(feature = "tokio")]
 pub mod driver;
+#[cfg(feature = "tokio")]
+pub mod engine;
 #[cfg(feature = "async")]
 pub mod inflight;
 #[cfg(feature = "tokio")]
@@ -85,7 +87,10 @@ pub use driver::{CqDriverHandle, FdCqDriver, PollingCqDriver};
 pub use shared_qp::{OpFuture, SharedQp};
 
 #[cfg(feature = "tokio")]
-pub use connection::CompletionMode;
+pub use engine::{
+    CompletionMode, RdmaConnectionConfig, RdmaEngine, RdmaEngineBuilder, RdmaEngineDiagnostics,
+    RdmaEngineDriver, RdmaEngineLifecycle, RdmaEngineTerminalError,
+};
 
 #[cfg(feature = "tokio")]
 pub use message_transport::{
