@@ -13,8 +13,9 @@ mod scheduler;
 mod api_tests;
 
 use std::collections::VecDeque;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use tokio::sync::Notify;
@@ -33,7 +34,9 @@ pub use driver::{
 };
 pub use operation::RdmaOperation;
 use operation::{CqCreditPool, OperationRegistry};
-use registry::{ConnectionRegistry, ConnectionToken, OperationToken, lock_unpoison};
+use registry::{
+    ConnectionRegistry, ConnectionToken, OperationToken, lock_unpoison, write_unpoison,
+};
 use resources::{EngineResourceRefs, EngineResources, ResourceSummary};
 use scheduler::WorkScheduler;
 use scheduler::{DeadlineKind, DeadlineRequest};
@@ -248,8 +251,10 @@ struct EngineShared {
     quarantined_bytes: AtomicUsize,
     ready_queue_depth: AtomicUsize,
     deadline_requests: Mutex<VecDeque<DeadlineRequest>>,
+    admission: RwLock<()>,
     lifecycle: AtomicU8,
     shutdown_requested: AtomicBool,
+    failure_retained: AtomicBool,
     frontend_count: AtomicUsize,
     work_signal: WorkSignal,
     // Notify stores only live Notified futures and wakes every concurrent
@@ -289,8 +294,10 @@ impl EngineShared {
             quarantined_bytes: AtomicUsize::new(0),
             ready_queue_depth: AtomicUsize::new(0),
             deadline_requests: Mutex::new(VecDeque::new()),
+            admission: RwLock::new(()),
             lifecycle: AtomicU8::new(lifecycle_to_u8(RdmaEngineLifecycle::Created)),
             shutdown_requested: AtomicBool::new(false),
+            failure_retained: AtomicBool::new(false),
             frontend_count: AtomicUsize::new(1),
             work_signal: WorkSignal::new(),
             terminal_notify: Notify::new(),
@@ -304,13 +311,17 @@ impl EngineShared {
     }
 
     fn request_shutdown(&self) {
-        if !self.shutdown_requested.swap(true, Ordering::AcqRel) {
-            self.transition_shutdown_requested();
+        {
+            let _admission = write_unpoison(&self.admission);
+            if !self.shutdown_requested.swap(true, Ordering::AcqRel) {
+                self.transition_shutdown_requested();
+            }
         }
         self.work_signal.publish(driver::TERMINAL_WORK);
     }
 
     fn finish(&self, outcome: EngineOutcome) {
+        let _admission = write_unpoison(&self.admission);
         let mut terminal = self
             .terminal
             .lock()
@@ -318,12 +329,33 @@ impl EngineShared {
         if terminal.is_some() {
             return;
         }
-        let lifecycle = match outcome {
+        self.shutdown_requested.store(true, Ordering::Release);
+        self.transition_shutdown_requested();
+        let lifecycle = match &outcome {
             EngineOutcome::Success => RdmaEngineLifecycle::Terminated,
             EngineOutcome::Failure(_) => RdmaEngineLifecycle::Failed,
         };
-        *terminal = Some(outcome);
+        *terminal = Some(outcome.clone());
         self.transition_terminal(lifecycle);
+        if matches!(outcome, EngineOutcome::Failure(_)) {
+            for operation in self.operations.occupied() {
+                let terminalized = operation.fail_terminal(&outcome);
+                if terminalized.was_reclaiming {
+                    self.pending_reclamations.fetch_sub(1, Ordering::AcqRel);
+                }
+                if terminalized.newly_quarantined {
+                    self.quarantined_operations.fetch_add(1, Ordering::AcqRel);
+                    self.quarantined_mrs.fetch_add(1, Ordering::AcqRel);
+                    self.quarantined_bytes
+                        .fetch_add(operation.mr_len, Ordering::AcqRel);
+                    self.cq_credits.retain();
+                }
+            }
+        }
+        let force_error = matches!(outcome, EngineOutcome::Failure(_));
+        for connection in self.connections.occupied() {
+            connection.finish_engine(force_error);
+        }
         drop(terminal);
         self.terminal_notify.notify_waiters();
     }
@@ -395,6 +427,47 @@ impl EngineShared {
 
     fn lifecycle(&self) -> RdmaEngineLifecycle {
         lifecycle_from_u8(self.lifecycle.load(Ordering::Acquire))
+    }
+
+    fn admission_error(&self) -> Option<Error> {
+        if let Some(outcome) = self.outcome() {
+            return outcome.into_result().err();
+        }
+        self.shutdown_requested
+            .load(Ordering::Acquire)
+            .then_some(Error::DriverShutdown)
+    }
+
+    fn retained_bundle_count(&self) -> usize {
+        self.connections
+            .occupied()
+            .into_iter()
+            .filter(|connection| connection.accepted_count() != 0)
+            .count()
+    }
+
+    fn unsafe_outstanding_operations(&self) -> usize {
+        let production = self.accepted_operations.load(Ordering::Acquire);
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            production + self.test_driver.accepted_outstanding()
+        }
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        {
+            production
+        }
+    }
+
+    fn retain_after_failure(shared: &Arc<Self>) {
+        if shared.unsafe_outstanding_operations() == 0
+            || shared.failure_retained.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        failed_engine_quarantine()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(Arc::clone(shared));
     }
 
     fn diagnostics(&self) -> RdmaEngineDiagnostics {
@@ -591,7 +664,6 @@ impl EngineOutcome {
 enum EngineFailure {
     DriverShutdown,
     Progress(String),
-    #[cfg(any(test, feature = "test-hooks"))]
     Wedged {
         retained_bundles: usize,
         outstanding_operations: usize,
@@ -603,7 +675,6 @@ impl EngineFailure {
         match self {
             Self::DriverShutdown => Error::DriverShutdown,
             Self::Progress(message) => Error::Verbs(std::io::Error::other(message)),
-            #[cfg(any(test, feature = "test-hooks"))]
             Self::Wedged {
                 retained_bundles,
                 outstanding_operations,
@@ -637,6 +708,61 @@ fn preflight_tokio_io() -> Result<()> {
         ));
     }
     Ok(())
+}
+
+pub(super) enum RuntimeProbe<T> {
+    Completed(T),
+    Panicked,
+    #[allow(dead_code, reason = "constructed only by panic=abort builds")]
+    Unavailable,
+}
+
+#[cfg(panic = "unwind")]
+pub(super) fn probe_runtime<T>(probe: impl FnOnce() -> T) -> RuntimeProbe<T> {
+    // Tokio exposes no capability query for optional I/O/time drivers. Serialize
+    // the constructor probe and suppress only its current-thread panic; panics
+    // from every other thread still reach the application's installed hook.
+    static PROBE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _probe = PROBE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let thread = std::thread::current().id();
+    type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static>;
+    let previous: Arc<Mutex<Option<PanicHook>>> =
+        Arc::new(Mutex::new(Some(std::panic::take_hook())));
+    let fallback = Arc::clone(&previous);
+    std::panic::set_hook(Box::new(move |info| {
+        if std::thread::current().id() != thread {
+            let hook = fallback.lock().unwrap_or_else(|error| error.into_inner());
+            if let Some(hook) = hook.as_ref() {
+                hook(info);
+            }
+        }
+    }));
+    let result = catch_unwind(AssertUnwindSafe(probe));
+    let previous = previous
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take()
+        .expect("runtime probe panic hook");
+    std::panic::set_hook(previous);
+    match result {
+        Ok(value) => RuntimeProbe::Completed(value),
+        Err(_) => RuntimeProbe::Panicked,
+    }
+}
+
+#[cfg(not(panic = "unwind"))]
+pub(super) fn probe_runtime<T>(_: impl FnOnce() -> T) -> RuntimeProbe<T> {
+    RuntimeProbe::Unavailable
+}
+
+fn failed_engine_quarantine() -> &'static Mutex<Vec<Arc<EngineShared>>> {
+    // No progress source remains after terminal driver failure, so accepted
+    // QP/CM/MR bundles cannot reach a positive release boundary.
+    static ENGINES: OnceLock<Mutex<Vec<Arc<EngineShared>>>> = OnceLock::new();
+    ENGINES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 const fn lifecycle_to_u8(lifecycle: RdmaEngineLifecycle) -> u8 {

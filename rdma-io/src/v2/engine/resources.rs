@@ -1,5 +1,4 @@
 use std::os::unix::io::RawFd;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 use tokio::io::{Interest, unix::AsyncFd};
@@ -11,6 +10,7 @@ use super::super::cq::{Cq, CqBuilder};
 use super::super::error::{Error, Result};
 use super::super::pd::Pd;
 use super::config::{CompletionMode, EngineConfig, ProviderLimits};
+use super::{RuntimeProbe, probe_runtime};
 
 pub(super) struct EngineResources {
     // Rust drops fields in declaration order. Keep both Tokio adapters before
@@ -157,15 +157,16 @@ impl EngineResources {
 }
 
 fn try_async_fd(fd: RawFd, resource: &str) -> Result<AsyncFd<RawFd>> {
-    match catch_unwind(AssertUnwindSafe(|| {
-        AsyncFd::with_interest(fd, Interest::READABLE)
-    })) {
-        Ok(Ok(async_fd)) => Ok(async_fd),
-        Ok(Err(error)) => Err(Error::InvalidConfig(format!(
+    match probe_runtime(|| AsyncFd::with_interest(fd, Interest::READABLE)) {
+        RuntimeProbe::Completed(Ok(async_fd)) => Ok(async_fd),
+        RuntimeProbe::Completed(Err(error)) => Err(Error::InvalidConfig(format!(
             "failed to register {resource} with Tokio I/O: {error}"
         ))),
-        Err(_) => Err(Error::InvalidConfig(format!(
+        RuntimeProbe::Panicked => Err(Error::InvalidConfig(format!(
             "readiness mode requires an active Tokio I/O driver for {resource}"
+        ))),
+        RuntimeProbe::Unavailable => Err(Error::InvalidConfig(format!(
+            "readiness mode cannot safely verify Tokio I/O for {resource} with panic=abort"
         ))),
     }
 }

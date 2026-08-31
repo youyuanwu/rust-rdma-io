@@ -1,8 +1,10 @@
 //! Lazily paged generational registries used by the shared engine.
 
 use std::collections::HashMap;
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::connection::ConnectionState;
 use crate::v2::error::{Error, Result};
@@ -104,6 +106,8 @@ pub(super) struct PagedRegistry<K, T> {
     retired: AtomicUsize,
     allocated_pages: AtomicUsize,
     probes: AtomicU64,
+    #[cfg(test)]
+    fail_next_page_allocation: AtomicBool,
     _token: std::marker::PhantomData<fn() -> K>,
 }
 
@@ -157,14 +161,19 @@ impl<K: RegistryToken, T> PagedRegistry<K, T> {
             retired: AtomicUsize::new(0),
             allocated_pages: AtomicUsize::new(0),
             probes: AtomicU64::new(0),
+            #[cfg(test)]
+            fail_next_page_allocation: AtomicBool::new(false),
             _token: std::marker::PhantomData,
         })
     }
 
-    pub(super) fn allocate_with(&self, make: impl FnOnce(K) -> T) -> Result<K> {
+    pub(super) fn allocate_with(&self, make: impl FnOnce(K) -> T) -> Result<(K, T)>
+    where
+        T: Clone,
+    {
         let mut inner = lock_unpoison(&self.inner);
-        let slot = if let Some(slot) = inner.recycled.pop() {
-            slot
+        let (slot, recycled) = if let Some(slot) = inner.recycled.pop() {
+            (slot, true)
         } else {
             let next = inner.next_unused as usize;
             if next >= self.capacity {
@@ -174,18 +183,34 @@ impl<K: RegistryToken, T> PagedRegistry<K, T> {
                 .next_unused
                 .checked_add(1)
                 .ok_or(Error::CapacityExhausted)?;
-            next as u32
+            (next as u32, false)
         };
-        let entry = self.slot_mut(&mut inner, slot, true)?;
+        let entry = match self.slot_mut(&mut inner, slot, true) {
+            Ok(entry) => entry,
+            Err(error) => {
+                if recycled {
+                    inner.recycled.push(slot);
+                } else {
+                    inner.next_unused = slot;
+                }
+                return Err(error);
+            }
+        };
         if !matches!(entry.state, SlotState::Vacant) {
+            if recycled {
+                inner.recycled.push(slot);
+            } else {
+                inner.next_unused = slot;
+            }
             return Err(Error::InvalidConfig(
                 "registry allocator selected a non-vacant slot".into(),
             ));
         }
         let token = K::from_parts(slot, entry.generation);
-        entry.state = SlotState::Occupied(make(token));
+        let value = make(token);
+        entry.state = SlotState::Occupied(value.clone());
         self.live.fetch_add(1, Ordering::AcqRel);
-        Ok(token)
+        Ok((token, value))
     }
 
     pub(super) fn lookup_cloned(&self, token: K) -> Lookup<T>
@@ -262,6 +287,29 @@ impl<K: RegistryToken, T> PagedRegistry<K, T> {
     }
 
     #[cfg(test)]
+    fn fail_next_page_allocation(&self) {
+        self.fail_next_page_allocation
+            .store(true, Ordering::Release);
+    }
+
+    pub(super) fn occupied_cloned(&self) -> Vec<T>
+    where
+        T: Clone,
+    {
+        let inner = lock_unpoison(&self.inner);
+        inner
+            .pages
+            .iter()
+            .filter_map(Option::as_ref)
+            .flat_map(|page| page.iter())
+            .filter_map(|slot| match &slot.state {
+                SlotState::Occupied(value) => Some(value.clone()),
+                SlotState::Vacant | SlotState::Retired => None,
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
     fn insert_at_for_test(&self, slot: u32, value: T) -> K {
         assert!((slot as usize) < self.capacity);
         let mut inner = lock_unpoison(&self.inner);
@@ -306,6 +354,12 @@ impl<K: RegistryToken, T> PagedRegistry<K, T> {
             if !allocate_page {
                 return Err(Error::CapacityExhausted);
             }
+            #[cfg(test)]
+            if self.fail_next_page_allocation.swap(false, Ordering::AcqRel) {
+                return Err(Error::InvalidConfig(
+                    "registry page allocation failed".into(),
+                ));
+            }
             let mut page = Vec::new();
             page.try_reserve_exact(PAGE_SIZE)
                 .map_err(|_| Error::InvalidConfig("registry page allocation failed".into()))?;
@@ -341,20 +395,25 @@ impl ConnectionRegistry {
         &self,
         qp_num: u32,
         make: impl FnOnce(ConnectionToken) -> Arc<ConnectionState>,
-    ) -> Result<ConnectionToken> {
+    ) -> Result<(ConnectionToken, Arc<ConnectionState>)> {
         if qp_num == 0 {
             return Err(Error::InvalidConfig("provider returned zero qp_num".into()));
         }
-        let token = self.slots.allocate_with(make)?;
+        let (token, state) = self.slots.allocate_with(make)?;
         let mut index = lock_unpoison(&self.qp_index);
-        if index.insert(qp_num, token).is_some() {
-            drop(index);
-            self.slots.release(token, false);
-            return Err(Error::InvalidConfig(format!(
-                "qp_num {qp_num} is already registered"
-            )));
+        match index.entry(qp_num) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(token);
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {
+                drop(index);
+                self.slots.release(token, false);
+                return Err(Error::InvalidConfig(format!(
+                    "qp_num {qp_num} is already registered"
+                )));
+            }
         }
-        Ok(token)
+        Ok((token, state))
     }
 
     pub(super) fn lookup(&self, token: ConnectionToken) -> Lookup<Arc<ConnectionState>> {
@@ -391,6 +450,10 @@ impl ConnectionRegistry {
         self.slots.free()
     }
 
+    pub(super) fn occupied(&self) -> Vec<Arc<ConnectionState>> {
+        self.slots.occupied_cloned()
+    }
+
     #[cfg(test)]
     #[allow(dead_code, reason = "used by routing rejection tests")]
     pub(super) fn set_qp_mapping_for_test(&self, qp_num: u32, token: ConnectionToken) {
@@ -400,6 +463,14 @@ impl ConnectionRegistry {
 
 pub(super) fn lock_unpoison<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|error| error.into_inner())
+}
+
+pub(super) fn read_unpoison<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|error| error.into_inner())
+}
+
+pub(super) fn write_unpoison<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(|error| error.into_inner())
 }
 
 #[cfg(test)]
@@ -436,12 +507,33 @@ mod tests {
     }
 
     #[test]
+    fn page_allocation_failure_restores_the_exact_fresh_slot() {
+        let registry = TestRegistry::new(1).unwrap();
+        registry.fail_next_page_allocation();
+
+        assert!(matches!(
+            registry.allocate_with(|_| 7),
+            Err(Error::InvalidConfig(message)) if message == "registry page allocation failed"
+        ));
+        assert_eq!(registry.live(), 0);
+        assert_eq!(registry.free(), 1);
+        assert_eq!(registry.allocated_pages(), 0);
+
+        let (token, value) = registry.allocate_with(|_| 9).unwrap();
+        assert_eq!(token.slot, 0);
+        assert_eq!(token.generation, 1);
+        assert_eq!(value, 9);
+        assert_eq!(registry.live(), 1);
+        assert_eq!(registry.free(), 0);
+    }
+
+    #[test]
     fn release_invalidates_before_reuse_and_duplicate_is_distinct() {
         let registry = TestRegistry::new(1).unwrap();
-        let first = registry.allocate_with(|_| 7).unwrap();
+        let (first, _) = registry.allocate_with(|_| 7).unwrap();
         assert_eq!(registry.release(first, true), Some(7));
         assert!(matches!(registry.lookup_cloned(first), Lookup::Duplicate));
-        let second = registry.allocate_with(|_| 9).unwrap();
+        let (second, _) = registry.allocate_with(|_| 9).unwrap();
         assert_eq!(first.slot, second.slot);
         assert_eq!(second.generation, first.generation + 1);
         assert!(matches!(registry.lookup_cloned(first), Lookup::Duplicate));
@@ -454,7 +546,7 @@ mod tests {
     #[test]
     fn maximum_generation_retires_without_wrapping() {
         let registry = TestRegistry::new(1).unwrap();
-        let token = registry.allocate_with(|_| 1).unwrap();
+        let (token, _) = registry.allocate_with(|_| 1).unwrap();
         let exhausted = registry.force_generation_for_test(token, u32::MAX);
         assert_eq!(registry.release(exhausted, true), Some(1));
         assert_eq!(registry.retired(), 1);

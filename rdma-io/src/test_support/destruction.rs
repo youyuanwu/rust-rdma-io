@@ -49,26 +49,40 @@ fn state() -> &'static Mutex<RecorderState> {
 ///
 /// Only one recorder is armed process-wide at a time, so one test can never
 /// clear or consume another test's observations. Arming never blocks: a second
-/// concurrent request is reported as [`RecorderBusy`] instead of waiting, which
-/// keeps the recorder usable from executor threads. Test binaries that use it
-/// therefore rely on the workspace-wide `RUST_TEST_THREADS=1` setting in
-/// `.cargo/config.toml` to serialize their own runs.
+/// concurrent request is reported as [`RecorderArmError::Busy`] instead of
+/// waiting, which keeps the recorder usable from executor threads. Test
+/// binaries that use it therefore rely on the workspace-wide
+/// `RUST_TEST_THREADS=1` setting in `.cargo/config.toml` to serialize their own
+/// runs.
 #[derive(Debug)]
 pub struct DestructionRecorder {
     id: u64,
 }
 
-/// A process-wide recorder was already armed.
+/// Failure to arm the process-wide destruction recorder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RecorderBusy;
+pub enum RecorderArmError {
+    /// A process-wide recorder was already armed.
+    Busy,
+    /// A zero-capacity recorder could not retain any evidence.
+    ZeroCapacity,
+    /// The recorder identity space was exhausted.
+    IdentityExhausted,
+}
 
-impl fmt::Display for RecorderBusy {
+impl fmt::Display for RecorderArmError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("a destruction recorder is already armed")
+        match self {
+            Self::Busy => f.write_str("a destruction recorder is already armed"),
+            Self::ZeroCapacity => {
+                f.write_str("destruction recorder capacity must be greater than zero")
+            }
+            Self::IdentityExhausted => f.write_str("destruction recorder identity exhausted"),
+        }
     }
 }
 
-impl std::error::Error for RecorderBusy {}
+impl std::error::Error for RecorderArmError {}
 
 impl DestructionRecorder {
     /// Arm a recorder that retains at most `capacity` events.
@@ -85,18 +99,21 @@ impl DestructionRecorder {
 
     /// Try to arm without blocking an executor or test thread.
     ///
-    /// Returns [`RecorderBusy`] when another recorder is already armed or when
-    /// `capacity` is zero.
-    pub fn try_arm(capacity: usize) -> Result<Self, RecorderBusy> {
+    /// Returns a distinct error for contention, zero capacity, or identity
+    /// exhaustion.
+    pub fn try_arm(capacity: usize) -> Result<Self, RecorderArmError> {
         if capacity == 0 {
-            return Err(RecorderBusy);
+            return Err(RecorderArmError::ZeroCapacity);
         }
         let mut state = state().lock().unwrap_or_else(|error| error.into_inner());
         if state.active.is_some() {
-            return Err(RecorderBusy);
+            return Err(RecorderArmError::Busy);
         }
         let id = state.next_id;
-        state.next_id = state.next_id.checked_add(1).ok_or(RecorderBusy)?;
+        state.next_id = state
+            .next_id
+            .checked_add(1)
+            .ok_or(RecorderArmError::IdentityExhausted)?;
         state.active = Some(ActiveRecorder {
             id,
             capacity,
@@ -202,8 +219,21 @@ mod tests {
     #[test]
     fn recorder_contention_is_reported_without_blocking() {
         let recorder = DestructionRecorder::arm(1);
-        assert_eq!(DestructionRecorder::try_arm(1).unwrap_err(), RecorderBusy);
+        assert_eq!(
+            DestructionRecorder::try_arm(1).unwrap_err(),
+            RecorderArmError::Busy
+        );
         drop(recorder);
         assert!(DestructionRecorder::try_arm(1).is_ok());
+    }
+
+    #[test]
+    fn recorder_zero_capacity_is_not_reported_as_contention() {
+        let error = DestructionRecorder::try_arm(0).unwrap_err();
+        assert_eq!(error, RecorderArmError::ZeroCapacity);
+        assert_eq!(
+            error.to_string(),
+            "destruction recorder capacity must be greater than zero"
+        );
     }
 }

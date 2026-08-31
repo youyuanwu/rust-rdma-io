@@ -89,7 +89,7 @@ pub struct RdmaEngineDiagnostics {
     pub operations_accepted: u64,
     /// WRs proven provider-unaccepted through a valid `bad_wr`.
     pub operations_unaccepted: u64,
-    /// WRs successfully offered to the provider.
+    /// WRs provider-accepted or conservatively retained as acceptance-ambiguous.
     pub operations_posted: u64,
     /// Exact validated CQEs consumed.
     pub operations_completed: u64,
@@ -97,9 +97,9 @@ pub struct RdmaEngineDiagnostics {
     pub operations_cancelled: u64,
     /// Batch verbs calls attempted.
     pub batch_posts_attempted: u64,
-    /// WRs transferred from accepted batch prefixes.
+    /// WRs transferred from provider-proven accepted batch prefixes.
     pub batch_accepted_prefix: u64,
-    /// WRs rolled back from proven-unaccepted suffixes.
+    /// WRs rolled back from provider-proven unaccepted batch suffixes.
     pub batch_unaccepted_suffix: u64,
     /// Batch calls whose acceptance could not be proven from `bad_wr`.
     pub batch_ambiguous_results: u64,

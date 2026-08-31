@@ -24,7 +24,7 @@ use crate::wc::WorkCompletion;
 use super::config::CompletionMode;
 use super::resources::EngineResources;
 use super::scheduler::{Deadline, DeadlineKind, WorkClass, WorkScheduler};
-use super::{EngineFailure, EngineOutcome, EngineShared, RdmaEngineDriver};
+use super::{EngineFailure, EngineOutcome, EngineShared, RdmaEngineDriver, RuntimeProbe};
 use crate::v2::completion::CqReadiness;
 use crate::v2::error::{Error, Result};
 
@@ -152,6 +152,7 @@ impl RdmaEngineDriver {
     fn fail(&mut self, failure: EngineFailure) -> Poll<Result<()>> {
         let outcome = EngineOutcome::Failure(failure);
         self.shared.finish(outcome.clone());
+        EngineShared::retain_after_failure(&self.shared);
         self.release_resources();
         Poll::Ready(outcome.into_result())
     }
@@ -484,28 +485,32 @@ impl Future for RdmaEngineDriver {
 
 impl Drop for RdmaEngineDriver {
     fn drop(&mut self) {
-        self.release_resources();
         if self.shared.outcome().is_none() {
             #[cfg(any(test, feature = "test-hooks"))]
-            let failure = {
-                let outstanding = self.shared.test_driver.accepted_outstanding();
-                let production = self
-                    .shared
-                    .accepted_operations
-                    .load(std::sync::atomic::Ordering::Acquire);
-                if outstanding == 0 && production == 0 {
-                    EngineFailure::DriverShutdown
-                } else {
-                    EngineFailure::Wedged {
-                        retained_bundles: self.shared.test_driver.route_count(),
-                        outstanding_operations: outstanding + production,
-                    }
+            let test_outstanding = self.shared.test_driver.accepted_outstanding();
+            #[cfg(not(any(test, feature = "test-hooks")))]
+            let test_outstanding = 0;
+            let production = self
+                .shared
+                .accepted_operations
+                .load(std::sync::atomic::Ordering::Acquire);
+            let outstanding = test_outstanding + production;
+            let failure = if outstanding == 0 {
+                EngineFailure::DriverShutdown
+            } else {
+                #[cfg(any(test, feature = "test-hooks"))]
+                let test_bundles = self.shared.test_driver.route_count();
+                #[cfg(not(any(test, feature = "test-hooks")))]
+                let test_bundles = 0;
+                EngineFailure::Wedged {
+                    retained_bundles: (self.shared.retained_bundle_count() + test_bundles).max(1),
+                    outstanding_operations: outstanding,
                 }
             };
-            #[cfg(not(any(test, feature = "test-hooks")))]
-            let failure = EngineFailure::DriverShutdown;
             self.shared.finish(EngineOutcome::Failure(failure));
+            EngineShared::retain_after_failure(&self.shared);
         }
+        self.release_resources();
     }
 }
 
@@ -516,15 +521,16 @@ fn preflight_driver_runtime() -> Result<()> {
                 .into(),
         ));
     }
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        tokio::time::sleep(std::time::Duration::ZERO)
-    })) {
-        Ok(sleep) => {
+    match super::probe_runtime(|| tokio::time::sleep(std::time::Duration::ZERO)) {
+        RuntimeProbe::Completed(sleep) => {
             drop(sleep);
             Ok(())
         }
-        Err(_) => Err(Error::InvalidConfig(
+        RuntimeProbe::Panicked => Err(Error::InvalidConfig(
             "RdmaEngineDriver requires Tokio time to be enabled".into(),
+        )),
+        RuntimeProbe::Unavailable => Err(Error::InvalidConfig(
+            "RdmaEngineDriver cannot safely verify Tokio time with panic=abort".into(),
         )),
     }
 }
@@ -1510,6 +1516,18 @@ mod tests {
             Poll::Ready(Err(Error::Verbs(_)))
         ));
         assert_eq!(counter.count(), 0);
+    }
+
+    #[test]
+    fn driver_poll_without_tokio_time_returns_contextual_error_without_panicking() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .unwrap();
+        let (_engine, mut driver) = test_engine_pair(CompletionMode::Polling);
+        let result = runtime
+            .block_on(async { std::future::poll_fn(|cx| Pin::new(&mut driver).poll(cx)).await });
+        assert!(matches!(result, Err(Error::Verbs(_))));
     }
 
     #[tokio::test(start_paused = true)]

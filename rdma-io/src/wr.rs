@@ -443,6 +443,11 @@ impl PreparedSendBatch {
     }
 
     #[cfg(test)]
+    pub(crate) fn wr_id_for_test(&self, index: usize) -> u64 {
+        self.raw[index].wr_id
+    }
+
+    #[cfg(test)]
     pub(crate) fn make_cycle_for_test(&mut self) {
         let head = self.raw.as_mut_ptr();
         self.raw.last_mut().unwrap().next = head;
@@ -534,6 +539,11 @@ impl PreparedRecvBatch {
     pub(crate) fn member_ptr_for_test(&mut self, index: usize) -> *mut ibv_recv_wr {
         assert!(index < self.raw.len());
         unsafe { self.raw.as_mut_ptr().add(index) }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wr_id_for_test(&self, index: usize) -> u64 {
+        self.raw[index].wr_id
     }
 
     #[cfg(test)]

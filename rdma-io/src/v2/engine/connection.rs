@@ -3,13 +3,15 @@
 use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 
 use tokio::sync::Notify;
 
 use self::qp::QpCapabilitiesExt;
 use super::operation::RdmaOperation;
-use super::registry::{ConnectionToken, OperationToken, lock_unpoison};
+use super::registry::{
+    ConnectionToken, OperationToken, lock_unpoison, read_unpoison, write_unpoison,
+};
 use super::{EngineShared, RdmaConnectionConfig};
 use crate::v2::error::{Error, Result};
 use crate::v2::mr::{AccessIntent, Mr, RemoteMr};
@@ -112,6 +114,9 @@ impl RdmaConnection {
     /// every unresolved operation, MR, registration, and CQ credit.
     pub async fn close(&self) -> Result<()> {
         self.state.stop_posting();
+        if let Some(outcome) = self.shared.outcome() {
+            return outcome.into_result();
+        }
         if !self.state.close_started.swap(true, Ordering::AcqRel) {
             self.shared.schedule_connection_drain(self.state.token);
         }
@@ -122,12 +127,12 @@ impl RdmaConnection {
             if let Some(outcome) = self.state.close_outcome() {
                 return outcome.into_result();
             }
+            if let Some(outcome) = self.shared.outcome() {
+                return outcome.into_result();
+            }
             if self.state.accepted_count() == 0 {
                 self.state.finish_close_success();
                 continue;
-            }
-            if let Some(outcome) = self.shared.outcome() {
-                return outcome.into_result();
             }
             notified.await;
         }
@@ -147,6 +152,7 @@ pub(super) struct ConnectionState {
     local_addr: Option<SocketAddr>,
     peer_addr: Option<SocketAddr>,
     posting_open: AtomicBool,
+    posting_gate: RwLock<()>,
     local_credits: Mutex<LocalCredits>,
     accepted: Mutex<HashSet<OperationToken>>,
     completions: Mutex<VecDeque<WorkCompletion>>,
@@ -154,6 +160,7 @@ pub(super) struct ConnectionState {
     close_outcome: Mutex<Option<CloseOutcome>>,
     close_notify: Notify,
     quarantined: AtomicBool,
+    error_transition_started: AtomicBool,
 }
 
 impl ConnectionState {
@@ -176,6 +183,7 @@ impl ConnectionState {
             local_addr,
             peer_addr,
             posting_open: AtomicBool::new(true),
+            posting_gate: RwLock::new(()),
             local_credits: Mutex::new(LocalCredits::default()),
             accepted: Mutex::new(HashSet::new()),
             completions: Mutex::new(VecDeque::new()),
@@ -183,6 +191,7 @@ impl ConnectionState {
             close_outcome: Mutex::new(None),
             close_notify: Notify::new(),
             quarantined: AtomicBool::new(false),
+            error_transition_started: AtomicBool::new(false),
         }
     }
 
@@ -212,6 +221,14 @@ impl ConnectionState {
         }
         *used += 1;
         Ok(())
+    }
+
+    pub(super) fn begin_posting(&self) -> Result<RwLockReadGuard<'_, ()>> {
+        let guard = read_unpoison(&self.posting_gate);
+        if !self.posting_open.load(Ordering::Acquire) {
+            return Err(Error::TransportClosed);
+        }
+        Ok(guard)
     }
 
     pub(super) fn release_local(&self, direction: Direction) {
@@ -255,7 +272,16 @@ impl ConnectionState {
     }
 
     pub(super) fn stop_posting(&self) {
+        let _posting = write_unpoison(&self.posting_gate);
         self.posting_open.store(false, Ordering::Release);
+    }
+
+    pub(super) fn finish_engine(&self, force_error: bool) {
+        self.stop_posting();
+        if force_error && !self.error_transition_started.swap(true, Ordering::AcqRel) {
+            let _ = self.poster.to_error();
+        }
+        self.close_notify.notify_waiters();
     }
 
     pub(super) fn apply_drain_deadline(&self) {
@@ -418,14 +444,18 @@ pub(super) fn install_connection(
     if let Some(capabilities) = poster.capabilities() {
         capabilities.require(&config)?;
     }
+    let _admission = read_unpoison(&shared.admission);
+    if let Some(error) = shared.admission_error() {
+        return Err(error);
+    }
     let qp_num = poster.qp_num();
-    let token = shared.connections.register(qp_num, |token| {
+    let registration = shared.connections.register(qp_num, |token| {
         Arc::new(ConnectionState::new(
             token, poster, config, local_addr, peer_addr,
         ))
     });
-    let token = match token {
-        Ok(token) => token,
+    let (_, state) = match registration {
+        Ok(registration) => registration,
         Err(error) => {
             if matches!(error, Error::CapacityExhausted) {
                 shared
@@ -434,14 +464,6 @@ pub(super) fn install_connection(
                     .fetch_add(1, Ordering::Relaxed);
             }
             return Err(error);
-        }
-    };
-    let state = match shared.connections.lookup(token) {
-        super::registry::Lookup::Occupied(state) => state,
-        _ => {
-            return Err(Error::InvalidConfig(
-                "new connection registration was not observable".into(),
-            ));
         }
     };
     Ok(RdmaConnection {
