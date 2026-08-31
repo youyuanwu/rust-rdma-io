@@ -491,11 +491,7 @@ impl EngineShared {
     }
 
     fn retained_bundle_count(&self) -> usize {
-        self.connections
-            .occupied()
-            .into_iter()
-            .filter(|connection| connection.accepted_count() != 0)
-            .count()
+        self.connections.live()
     }
 
     fn unsafe_outstanding_operations(&self) -> usize {
@@ -511,7 +507,9 @@ impl EngineShared {
     }
 
     fn retain_after_failure(shared: &Arc<Self>) {
-        if (shared.unsafe_outstanding_operations() == 0 && shared.cm.retained_owner_count() == 0)
+        if (shared.unsafe_outstanding_operations() == 0
+            && shared.connections.live() == 0
+            && shared.cm.retained_owner_count() == 0)
             || shared.failure_retained.swap(true, Ordering::AcqRel)
         {
             return;

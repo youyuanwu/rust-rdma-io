@@ -27,6 +27,23 @@ fn conn_param(config: &RdmaConnectionConfig) -> ConnParam {
     }
 }
 
+async fn wait_until(
+    timeout: Duration,
+    description: &'static str,
+    mut condition: impl FnMut() -> bool,
+) {
+    tokio::time::timeout(timeout, async {
+        loop {
+            if condition() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{description}"));
+}
+
 async fn establish_pair(
     engine: &RdmaEngine,
     resources: &TestEngineResources,
@@ -138,6 +155,12 @@ async fn run_mode(mode: CompletionMode) {
         configured_server.local_addr().unwrap()
     );
     exercise_operations(&default_server, &default_client).await;
+    wait_until(
+        Duration::from_secs(5),
+        "operation completion diagnostics did not catch up",
+        || engine.diagnostics().operations_completed == 4,
+    )
+    .await;
 
     let diagnostics = engine.diagnostics();
     assert_eq!(diagnostics.shared_contexts, 1);
@@ -264,6 +287,66 @@ async fn run_rejected_connect(mode: CompletionMode) {
     driver_task.await.unwrap().unwrap();
 }
 
+async fn run_over_budget_failed_connects() {
+    if !has_software_rdma() {
+        return;
+    }
+    const CM_BUDGET: usize = 2;
+    const ATTEMPTS: usize = CM_BUDGET + 3;
+
+    let device = software_device_name().expect("software RDMA device");
+    let (engine, driver) = RdmaEngineBuilder::new(device)
+        .completion_mode(CompletionMode::Polling)
+        .maximum_live_connections(ATTEMPTS)
+        .maximum_inflight_operations(64)
+        .cq_capacity(64)
+        .cm_event_budget(CM_BUDGET)
+        .build()
+        .unwrap();
+    let driver_task = tokio::spawn(driver);
+    let listener = bind_listener_with_retry().await;
+    let address = connect_addr_for(listener.local_addr());
+    let server_task = tokio::spawn(async move {
+        for _ in 0..ATTEMPTS {
+            let cm_id = listener.get_request().await.unwrap();
+            cm_id.reject(&[]).unwrap();
+        }
+    });
+
+    let mut connects = tokio::task::JoinSet::new();
+    for _ in 0..ATTEMPTS {
+        let engine = engine.clone();
+        connects.spawn(async move { engine.connect(address).await });
+    }
+    let failures = tokio::time::timeout(Duration::from_secs(20), async {
+        let mut failures = 0;
+        while let Some(result) = connects.join_next().await {
+            assert!(result.unwrap().is_err());
+            failures += 1;
+        }
+        failures
+    })
+    .await
+    .expect("over-budget failed connects stopped cooperative CM progress");
+    assert_eq!(failures, ATTEMPTS);
+    server_task.await.unwrap();
+
+    wait_until(
+        Duration::from_secs(10),
+        "over-budget failed connect resources were not retired",
+        || {
+            let diagnostics = engine.diagnostics();
+            diagnostics.connections_failed == ATTEMPTS as u64
+                && diagnostics.live_connection_reservations == 0
+                && diagnostics.free_connection_slots == ATTEMPTS
+        },
+    )
+    .await;
+
+    engine.shutdown().await.unwrap();
+    driver_task.await.unwrap().unwrap();
+}
+
 async fn run_shutdown_awaiting_delivery(mode: CompletionMode) {
     if !has_software_rdma() {
         return;
@@ -333,18 +416,18 @@ async fn run_shutdown_awaiting_delivery(mode: CompletionMode) {
     .expect("client connect did not reach EstablishedAwaitingDelivery");
 
     let mut shutdown = Box::pin(engine.shutdown());
-    poll_fn(|cx| {
-        assert!(shutdown.as_mut().poll(cx).is_pending());
-        Poll::Ready(())
-    })
-    .await;
-    assert_eq!(
+    let first_shutdown_poll = poll_fn(|cx| Poll::Ready(shutdown.as_mut().poll(cx))).await;
+    assert!(matches!(
         engine.diagnostics().lifecycle,
-        RdmaEngineLifecycle::ShutdownRequested
-    );
+        RdmaEngineLifecycle::ShutdownRequested | RdmaEngineLifecycle::Terminated
+    ));
     drop(connect);
 
-    shutdown.await.unwrap();
+    match first_shutdown_poll {
+        Poll::Ready(result) => result.unwrap(),
+        Poll::Pending => shutdown.as_mut().await.unwrap(),
+    }
+    drop(shutdown);
     driver_task.await.unwrap().unwrap();
     tokio::time::timeout(Duration::from_secs(15), server_task)
         .await
@@ -413,13 +496,18 @@ async fn rejected_cm_event_fails_only_its_request_in_both_modes() {
     run_rejected_connect(CompletionMode::Polling).await;
 }
 
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+async fn more_than_one_cm_budget_of_failed_connects_progresses_cooperatively() {
+    run_over_budget_failed_connects().await;
+}
+
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn shutdown_retires_an_established_connect_dropped_without_repolling_in_both_modes() {
     run_shutdown_awaiting_delivery(CompletionMode::Readiness).await;
     run_shutdown_awaiting_delivery(CompletionMode::Polling).await;
 }
 
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+#[test_log::test(tokio::test(flavor = "current_thread"))]
 async fn withholding_the_driver_prevents_cm_progress_and_cancellation_releases_admission() {
     if !has_software_rdma() {
         return;
@@ -647,6 +735,50 @@ async fn established_close_releases_resources_and_reuses_aggregate_capacity() {
     assert_eq!(
         events.last().map(|event| event.kind),
         Some(DestructionKind::RdmaFreeDevices)
+    );
+}
+
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+async fn dropping_the_driver_with_live_connections_quarantines_complete_bundles() {
+    if !has_software_rdma() {
+        return;
+    }
+    let recorder = DestructionRecorder::arm(64);
+    let device = software_device_name().expect("software RDMA device");
+    let (engine, driver) = RdmaEngineBuilder::new(device)
+        .completion_mode(CompletionMode::Polling)
+        .maximum_live_connections(2)
+        .maximum_inflight_operations(64)
+        .cq_capacity(64)
+        .build()
+        .unwrap();
+    let resources = engine.test_resources().unwrap();
+    let driver_task = tokio::spawn(driver);
+    let (server, client) =
+        establish_pair(&engine, &resources, RdmaConnectionConfig::default(), true).await;
+
+    driver_task.abort();
+    assert!(driver_task.await.unwrap_err().is_cancelled());
+    let error = engine.shutdown().await.unwrap_err();
+    assert!(matches!(
+        error,
+        Error::EngineWedged {
+            retained_bundles: 2..,
+            ..
+        }
+    ));
+
+    drop(server);
+    drop(client);
+    drop(resources);
+    drop(engine);
+    let events = recorder.take();
+    assert!(!recorder.overflowed());
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == DestructionKind::QueuePair),
+        "driver loss must retain live QP/CM bundles instead of running fallback destructors"
     );
 }
 

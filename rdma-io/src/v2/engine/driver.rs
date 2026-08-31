@@ -254,10 +254,8 @@ impl RdmaEngineDriver {
             return Ok(false);
         };
         let budget = self.shared.config.cm_event_budget;
-        let mut processed = self
-            .shared
-            .cm
-            .service_software(&self.shared, resources, budget)?;
+        let cm = &self.shared.cm;
+        let mut processed = cm.service_software(&self.shared, Some(resources), budget)?;
         while processed < budget && self.shared.cm.try_process_event(&self.shared, resources)? {
             processed += 1;
         }
@@ -289,11 +287,10 @@ impl RdmaEngineDriver {
             CompletionMode::Polling => 0,
         };
         processed += readiness_processed;
-        processed = processed.saturating_add(
-            self.shared
-                .cm
-                .service_cm_destructions(&self.shared, resources)?,
-        );
+        processed +=
+            cm.service_cm_destructions(&self.shared, budget.saturating_sub(processed), || {
+                cm.try_process_event(&self.shared, resources)
+            })?;
 
         if processed >= budget || self.shared.cm.has_software_work() {
             self.scheduler.mark_class_ready(WorkClass::Cm);
@@ -501,7 +498,11 @@ impl Drop for RdmaEngineDriver {
                 .accepted_operations
                 .load(std::sync::atomic::Ordering::Acquire);
             let outstanding = test_outstanding + production;
-            let cm_owners = self.shared.cm.retained_owner_count();
+            let cm_owners = self
+                .shared
+                .cm
+                .retained_owner_count()
+                .max(self.shared.connections.live());
             let failure = if outstanding == 0 && cm_owners == 0 {
                 EngineFailure::DriverShutdown
             } else {

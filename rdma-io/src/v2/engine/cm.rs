@@ -90,10 +90,8 @@ impl CmState {
         lock_unpoison(&self.pending).push_back(request);
     }
 
-    fn defer_cm_id(&self, cm_id: CmId, resources: &EngineResources) {
-        lock_unpoison(&self.cm_destructions).push_back(PendingCmDestruction::Route(
-            SharedCmId::new(cm_id, Arc::clone(&resources.cm_event_channel)),
-        ));
+    fn defer_cm_id(&self, cm_id: SharedCmId) {
+        lock_unpoison(&self.cm_destructions).push_back(PendingCmDestruction::Route(cm_id));
     }
 
     fn enqueue_cancellation(&self, request: Arc<OutboundRequest>) {
@@ -126,26 +124,59 @@ impl CmState {
     pub(super) fn service_software(
         &self,
         shared: &Arc<EngineShared>,
-        resources: &EngineResources,
+        resources: Option<&EngineResources>,
         budget: usize,
     ) -> Result<usize> {
+        let mut remaining = [
+            lock_unpoison(&self.cancellations).len(),
+            lock_unpoison(&self.retirements).len(),
+            lock_unpoison(&self.pending).len(),
+        ];
+        let mut next_class = 0;
         let mut processed = 0;
-        while processed < budget {
-            if let Some(request) = lock_unpoison(&self.cancellations).pop_front() {
-                self.process_cancellation(shared, request)?;
-                processed += 1;
-                continue;
+        while processed < budget && remaining.iter().any(|count| *count != 0) {
+            let mut selected = None;
+            for offset in 0..remaining.len() {
+                let class = (next_class + offset) % remaining.len();
+                if remaining[class] != 0 {
+                    remaining[class] -= 1;
+                    next_class = (class + 1) % remaining.len();
+                    selected = Some(class);
+                    break;
+                }
             }
-            if let Some(token) = lock_unpoison(&self.retirements).pop_front() {
-                self.retire_registered_connection(shared, token)?;
-                processed += 1;
-                continue;
-            }
-            let Some(request) = lock_unpoison(&self.pending).pop_front() else {
+            let Some(class) = selected else {
                 break;
             };
-            self.start_outbound(shared, resources, request)?;
-            processed += 1;
+            match class {
+                0 => {
+                    let request = { lock_unpoison(&self.cancellations).pop_front() };
+                    if let Some(request) = request {
+                        self.process_cancellation(shared, request)?;
+                        processed += 1;
+                    }
+                }
+                1 => {
+                    let token = { lock_unpoison(&self.retirements).pop_front() };
+                    if let Some(token) = token {
+                        self.retire_registered_connection(shared, token)?;
+                        processed += 1;
+                    }
+                }
+                2 => {
+                    let request = { lock_unpoison(&self.pending).pop_front() };
+                    if let Some(request) = request {
+                        let resources = resources.ok_or_else(|| {
+                            Error::InvalidConfig(
+                                "CM pending work requires live engine resources".into(),
+                            )
+                        })?;
+                        self.start_outbound(shared, resources, request)?;
+                        processed += 1;
+                    }
+                }
+                _ => unreachable!("software work has three classes"),
+            }
         }
         Ok(processed)
     }
@@ -238,24 +269,41 @@ impl CmState {
     pub(super) fn service_cm_destructions(
         &self,
         shared: &Arc<EngineShared>,
-        resources: &EngineResources,
+        budget: usize,
+        mut try_process_event: impl FnMut() -> Result<bool>,
     ) -> Result<usize> {
-        let mut destroyed = 0;
-        while let Some(pending) = lock_unpoison(&self.cm_destructions).pop_front() {
-            if let Err(error) = drain_to_would_block(|| self.try_process_event(shared, resources)) {
-                lock_unpoison(&self.cm_destructions).push_front(pending);
-                return Err(error);
-            }
-            match pending {
-                PendingCmDestruction::Route(cm_id) => cm_id.destroy()?,
-                PendingCmDestruction::Connection { cm_id, connection } => {
-                    cm_id.destroy()?;
-                    self.finalize_connection_retirement(shared, connection)?;
+        let mut processed = 0;
+        while processed < budget {
+            let pending = { lock_unpoison(&self.cm_destructions).pop_front() };
+            let Some(pending) = pending else {
+                break;
+            };
+            match try_process_event() {
+                Ok(true) => {
+                    lock_unpoison(&self.cm_destructions).push_back(pending);
+                }
+                Ok(false) => {
+                    self.remove_context_route(pending.cm_id());
+                    match pending {
+                        PendingCmDestruction::Route(cm_id) => cm_id.destroy()?,
+                        PendingCmDestruction::Connection { cm_id, connection } => {
+                            cm_id.destroy()?;
+                            self.finalize_connection_retirement(shared, connection)?;
+                        }
+                        #[cfg(test)]
+                        PendingCmDestruction::Test { destroyed } => {
+                            destroyed.store(true, Ordering::Release);
+                        }
+                    }
+                }
+                Err(error) => {
+                    lock_unpoison(&self.cm_destructions).push_front(pending);
+                    return Err(error);
                 }
             }
-            destroyed += 1;
+            processed += 1;
         }
-        Ok(destroyed)
+        Ok(processed)
     }
 
     pub(super) fn terminalize(&self, outcome: &EngineOutcome) {
@@ -308,7 +356,7 @@ impl CmState {
             PortSpace::Tcp,
             token.encode(),
         ) {
-            Ok(cm_id) => cm_id,
+            Ok(cm_id) => SharedCmId::new(cm_id, Arc::clone(&resources.cm_event_channel)),
             Err(error) => {
                 self.routes.release(token, false);
                 drop(reservation);
@@ -317,7 +365,7 @@ impl CmState {
             }
         };
         let Some(context_token) = cm_id.context_token() else {
-            self.defer_cm_id(cm_id, resources);
+            self.defer_cm_id(cm_id);
             self.routes.release(token, false);
             drop(reservation);
             request.complete_failure(
@@ -328,7 +376,7 @@ impl CmState {
         };
         let context_route = CmRouteToken::decode(context_token);
         if context_route != token {
-            self.defer_cm_id(cm_id, resources);
+            self.defer_cm_id(cm_id);
             self.routes.release(token, false);
             drop(reservation);
             request.complete_failure(
@@ -343,7 +391,7 @@ impl CmState {
             let mut contexts = lock_unpoison(&self.context_routes);
             if contexts.insert(context_key, context_route).is_some() {
                 drop(contexts);
-                self.defer_cm_id(cm_id, resources);
+                self.defer_cm_id(cm_id);
                 self.routes.release(token, false);
                 drop(reservation);
                 request.complete_failure(
@@ -362,7 +410,7 @@ impl CmState {
                 reservation,
             }),
             Err(error) => {
-                self.defer_cm_id(cm_id, resources);
+                self.defer_cm_id(cm_id);
                 self.retire_route(&route, false);
                 drop(reservation);
                 request.complete_failure(shared, error.into());
@@ -550,7 +598,7 @@ impl CmState {
         snapshot: CmEventSnapshot,
     ) -> Result<EventDisposition> {
         if is_failure_event(snapshot.event_type) || snapshot.status != 0 {
-            return self.handle_failure_event(shared, resources, route, snapshot);
+            return self.handle_failure_event(shared, route, snapshot);
         }
         match snapshot.event_type {
             CmEventType::AddrResolved => self.handle_addr_resolved(shared, resources, route),
@@ -585,14 +633,14 @@ impl CmState {
         if request.cancelled.load(Ordering::Acquire)
             || shared.shutdown_requested.load(Ordering::Acquire)
         {
-            self.defer_cm_id(cm_id, resources);
+            self.defer_cm_id(cm_id);
             drop(reservation);
             self.retire_route(route, true);
             request.complete(Err(Error::DriverShutdown));
             return Ok(EventDisposition::Handled);
         }
         if let Err(error) = cm_id.require_context(resources.context.inner()) {
-            self.defer_cm_id(cm_id, resources);
+            self.defer_cm_id(cm_id);
             drop(reservation);
             self.retire_route(route, true);
             request.complete_failure(shared, error.into());
@@ -605,7 +653,7 @@ impl CmState {
                 reservation,
             }),
             Err(error) => {
-                self.defer_cm_id(cm_id, resources);
+                self.defer_cm_id(cm_id);
                 drop(reservation);
                 self.retire_route(route, true);
                 request.complete_failure(shared, error.into());
@@ -631,14 +679,14 @@ impl CmState {
         if request.cancelled.load(Ordering::Acquire)
             || shared.shutdown_requested.load(Ordering::Acquire)
         {
-            self.defer_cm_id(cm_id, resources);
+            self.defer_cm_id(cm_id);
             drop(reservation);
             self.retire_route(route, true);
             request.complete(Err(Error::DriverShutdown));
             return Ok(EventDisposition::Handled);
         }
         if let Err(error) = cm_id.require_context(resources.context.inner()) {
-            self.defer_cm_id(cm_id, resources);
+            self.defer_cm_id(cm_id);
             drop(reservation);
             self.retire_route(route, true);
             request.complete_failure(shared, error.into());
@@ -650,18 +698,14 @@ impl CmState {
         let qp = match build_qp(resources, &cm_id, &request.config) {
             Ok(qp) => qp,
             Err(error) => {
-                self.defer_cm_id(cm_id, resources);
+                self.defer_cm_id(cm_id);
                 drop(reservation);
                 self.retire_route(route, true);
                 request.complete_failure(shared, error);
                 return Ok(EventDisposition::Handled);
             }
         };
-        let verbs = Arc::new(VerbsConnectionResources::new_shared(
-            qp,
-            cm_id,
-            Arc::clone(&resources.cm_event_channel),
-        ));
+        let verbs = Arc::new(VerbsConnectionResources::new_shared(qp, cm_id));
         let connection = match install_reserved_connection(
             shared,
             Arc::clone(&verbs) as Arc<_>,
@@ -673,7 +717,9 @@ impl CmState {
         ) {
             Ok(connection) => connection,
             Err(error) => {
-                verbs.destroy_qp();
+                if let Some(cm_id) = verbs.destroy_connection() {
+                    self.defer_cm_id(cm_id);
+                }
                 drop(verbs);
                 self.retire_route(route, true);
                 request.complete_failure(shared, error);
@@ -857,7 +903,6 @@ impl CmState {
     fn handle_failure_event(
         &self,
         shared: &Arc<EngineShared>,
-        resources: &EngineResources,
         route: &Arc<OutboundRoute>,
         snapshot: CmEventSnapshot,
     ) -> Result<EventDisposition> {
@@ -880,7 +925,7 @@ impl CmState {
                 request,
                 reservation,
             } => {
-                self.defer_cm_id(cm_id, resources);
+                self.defer_cm_id(cm_id);
                 drop(reservation);
                 self.retire_route(route, true);
                 request.complete_failure(shared, Error::Verbs(std::io::Error::other(message)));
@@ -973,13 +1018,22 @@ impl CmState {
     }
 
     fn retire_route(&self, route: &Arc<OutboundRoute>, completed: bool) {
-        let context_key = route.context_key.load(Ordering::Acquire);
+        self.routes.release(route.token, completed);
+    }
+
+    fn remove_context_route(&self, cm_id: Option<&SharedCmId>) {
+        let Some(cm_id) = cm_id else {
+            return;
+        };
+        let Some(encoded) = cm_id.context_token() else {
+            return;
+        };
+        let token = CmRouteToken::decode(encoded);
+        let context_key = cm_id.context_key();
         let mut contexts = lock_unpoison(&self.context_routes);
-        if contexts.get(&context_key).copied() == Some(route.token) {
+        if contexts.get(&context_key).copied() == Some(token) {
             contexts.remove(&context_key);
         }
-        drop(contexts);
-        self.routes.release(route.token, completed);
     }
 }
 
@@ -1130,14 +1184,20 @@ enum PendingCmDestruction {
         cm_id: SharedCmId,
         connection: Arc<ConnectionState>,
     },
+    #[cfg(test)]
+    Test {
+        destroyed: Arc<AtomicBool>,
+    },
 }
 
-fn drain_to_would_block(mut try_process_event: impl FnMut() -> Result<bool>) -> Result<usize> {
-    let mut drained = 0;
-    while try_process_event()? {
-        drained += 1;
+impl PendingCmDestruction {
+    fn cm_id(&self) -> Option<&SharedCmId> {
+        match self {
+            Self::Route(cm_id) | Self::Connection { cm_id, .. } => Some(cm_id),
+            #[cfg(test)]
+            Self::Test { .. } => None,
+        }
     }
-    Ok(drained)
 }
 
 struct OutboundRoute {
@@ -1272,12 +1332,12 @@ impl EstablishedConnectionRoute {
 
 enum OutboundState {
     AwaitAddr {
-        cm_id: CmId,
+        cm_id: SharedCmId,
         request: Arc<OutboundRequest>,
         reservation: ConnectionReservation,
     },
     AwaitRoute {
-        cm_id: CmId,
+        cm_id: SharedCmId,
         request: Arc<OutboundRequest>,
         reservation: ConnectionReservation,
     },
@@ -1571,11 +1631,20 @@ mod tests {
             Err(CmEventReject::Stale)
         ));
 
-        cm.routes.release(token, true);
-        assert!(matches!(
-            cm.lookup_event_route(exact),
-            Err(CmEventReject::Duplicate)
-        ));
+        cm.retire_route(&route, true);
+        for event_type in [
+            CmEventType::AddrResolved,
+            CmEventType::Disconnected,
+            CmEventType::TimewaitExit,
+        ] {
+            assert!(matches!(
+                cm.lookup_event_route(CmEventSnapshot {
+                    event_type,
+                    ..exact
+                }),
+                Err(CmEventReject::Duplicate)
+            ));
+        }
     }
 
     #[test]
@@ -1755,7 +1824,18 @@ mod tests {
         ));
         assert_eq!(lock_unpoison(&engine.shared.cm.cancellations).len(), 1);
 
-        engine.shared.cm.retire_route(&route, true);
+        let processed = engine
+            .shared
+            .cm
+            .service_software(&engine.shared, None, 1)
+            .unwrap();
+        assert_eq!(processed, 1);
+        assert!(lock_unpoison(&engine.shared.cm.cancellations).is_empty());
+        let _ = engine
+            .shared
+            .cm
+            .service_software(&engine.shared, None, 1)
+            .unwrap();
         drop(engine);
         drop(driver);
     }
@@ -1785,25 +1865,29 @@ mod tests {
         )
         .unwrap();
 
-        engine
+        engine.shared.cm.enqueue_retirement(connection.state.token);
+        let processed = engine
             .shared
             .cm
-            .retire_registered_connection(&engine.shared, connection.state.token)
+            .service_software(&engine.shared, None, 32)
             .unwrap();
+        assert_eq!(
+            processed, 1,
+            "a requeued retirement may run only once per service pass"
+        );
         assert_eq!(lock_unpoison(&engine.shared.cm.retirements).len(), 1);
         assert!(!connection.state.is_retired());
 
         route.set_state(OutboundState::Closing {
             connection: EstablishedConnectionRoute::new(&connection.state),
         });
-        let token = lock_unpoison(&engine.shared.cm.retirements)
-            .pop_front()
-            .unwrap();
-        engine
+        let processed = engine
             .shared
             .cm
-            .retire_registered_connection(&engine.shared, token)
+            .service_software(&engine.shared, None, 32)
             .unwrap();
+        assert_eq!(processed, 1);
+        assert!(lock_unpoison(&engine.shared.cm.retirements).is_empty());
         assert!(connection.state.is_retired());
         assert!(matches!(
             engine.shared.connections.lookup(connection.state.token),
@@ -1817,25 +1901,51 @@ mod tests {
     }
 
     #[test]
-    fn cm_destroy_barrier_routes_target_and_peer_events_to_would_block() {
+    fn cm_destroy_barrier_is_budgeted_across_service_passes() {
+        let (engine, driver) =
+            super::super::test_engine_pair(super::super::CompletionMode::Polling);
+        let destroyed = Arc::new(AtomicBool::new(false));
+        lock_unpoison(&engine.shared.cm.cm_destructions).push_back(PendingCmDestruction::Test {
+            destroyed: Arc::clone(&destroyed),
+        });
         let mut pending = VecDeque::from(["target", "peer"]);
         let mut routed = Vec::new();
         let mut probes = 0;
 
-        let drained = drain_to_would_block(|| {
-            probes += 1;
-            let Some(event) = pending.pop_front() else {
-                return Ok(false);
-            };
-            routed.push(event);
-            Ok(true)
-        })
-        .unwrap();
-
-        assert_eq!(drained, 2);
+        for expected in ["target", "peer"] {
+            let processed = engine
+                .shared
+                .cm
+                .service_cm_destructions(&engine.shared, 1, || {
+                    probes += 1;
+                    let Some(event) = pending.pop_front() else {
+                        return Ok(false);
+                    };
+                    routed.push(event);
+                    Ok(true)
+                })
+                .unwrap();
+            assert_eq!(processed, 1);
+            assert_eq!(routed.last().copied(), Some(expected));
+            assert!(!destroyed.load(Ordering::Acquire));
+            assert_eq!(lock_unpoison(&engine.shared.cm.cm_destructions).len(), 1);
+        }
+        let processed = engine
+            .shared
+            .cm
+            .service_cm_destructions(&engine.shared, 1, || {
+                probes += 1;
+                Ok(false)
+            })
+            .unwrap();
+        assert_eq!(processed, 1);
         assert_eq!(probes, 3);
         assert_eq!(routed, ["target", "peer"]);
         assert!(pending.is_empty());
+        assert!(destroyed.load(Ordering::Acquire));
+        assert!(lock_unpoison(&engine.shared.cm.cm_destructions).is_empty());
+        drop(engine);
+        drop(driver);
     }
 
     #[test]

@@ -2,8 +2,9 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
+use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard};
 
 use tokio::sync::Notify;
 
@@ -550,21 +551,68 @@ pub(super) struct VerbsConnectionResources {
 }
 
 pub(super) struct SharedCmId {
-    cm_id: CmId,
-    _channel: Arc<EventChannel>,
+    cm_id: Option<CmId>,
+    channel: Option<Arc<EventChannel>>,
 }
 
 impl SharedCmId {
     pub(super) fn new(cm_id: CmId, channel: Arc<EventChannel>) -> Self {
         Self {
-            cm_id,
-            _channel: channel,
+            cm_id: Some(cm_id),
+            channel: Some(channel),
         }
     }
 
-    pub(super) fn destroy(self) -> Result<()> {
-        self.cm_id.destroy().map_err(Error::from)
+    pub(super) fn destroy(mut self) -> Result<()> {
+        let cm_id = self
+            .cm_id
+            .take()
+            .expect("shared CM ID is destroyed exactly once");
+        let result = cm_id.destroy().map_err(Error::from);
+        self.channel.take();
+        result
     }
+}
+
+impl Deref for SharedCmId {
+    type Target = CmId;
+
+    fn deref(&self) -> &Self::Target {
+        self.cm_id
+            .as_ref()
+            .expect("shared CM ID remains live until driver destruction")
+    }
+}
+
+impl Drop for SharedCmId {
+    fn drop(&mut self) {
+        let Some(cm_id) = self.cm_id.take() else {
+            return;
+        };
+        // Without the sole driver there is no safe way to prove that every
+        // event referencing this ID was acknowledged. Retain it instead.
+        let channel = self
+            .channel
+            .take()
+            .expect("a live shared CM ID retains its event channel");
+        fallback_cm_quarantine()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(RetainedCmId {
+                _cm_id: cm_id,
+                _channel: channel,
+            });
+    }
+}
+
+struct RetainedCmId {
+    _cm_id: CmId,
+    _channel: Arc<EventChannel>,
+}
+
+fn fallback_cm_quarantine() -> &'static Mutex<Vec<RetainedCmId>> {
+    static IDS: OnceLock<Mutex<Vec<RetainedCmId>>> = OnceLock::new();
+    IDS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 impl VerbsConnectionResources {
@@ -580,17 +628,14 @@ impl VerbsConnectionResources {
         }
     }
 
-    pub(super) fn new_shared(qp: Qp, cm_id: CmId, channel: Arc<EventChannel>) -> Self {
+    pub(super) fn new_shared(qp: Qp, cm_id: SharedCmId) -> Self {
         let qp_num = qp.qp_num();
         let capabilities = qp.capabilities();
         Self {
             qp: Mutex::new(Some(qp)),
             qp_num,
             capabilities,
-            cm_owner: Mutex::new(Some(ConnectionCmOwner::Shared {
-                cm_id,
-                _channel: channel,
-            })),
+            cm_owner: Mutex::new(Some(ConnectionCmOwner::Shared { cm_id })),
         }
     }
 
@@ -611,11 +656,49 @@ impl VerbsConnectionResources {
 
 enum ConnectionCmOwner {
     Shared {
-        cm_id: CmId,
-        _channel: Arc<EventChannel>,
+        cm_id: SharedCmId,
     },
     #[cfg(any(test, feature = "test-hooks"))]
-    External { _cm_id: crate::async_cm::AsyncCmId },
+    External {
+        _cm_id: crate::async_cm::AsyncCmId,
+    },
+}
+
+impl Drop for VerbsConnectionResources {
+    fn drop(&mut self) {
+        let cm_owner = self
+            .cm_owner
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        let Some(cm_owner) = cm_owner else {
+            return;
+        };
+        // The driver removes the owner only after the accepted set reaches
+        // zero. Any other drop path must retain the complete live bundle.
+        let qp = self
+            .qp
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        fallback_verbs_quarantine()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(RetainedVerbsConnectionResources {
+                _qp: qp,
+                _cm_owner: cm_owner,
+            });
+    }
+}
+
+struct RetainedVerbsConnectionResources {
+    _qp: Option<Qp>,
+    _cm_owner: ConnectionCmOwner,
+}
+
+fn fallback_verbs_quarantine() -> &'static Mutex<Vec<RetainedVerbsConnectionResources>> {
+    static RESOURCES: OnceLock<Mutex<Vec<RetainedVerbsConnectionResources>>> = OnceLock::new();
+    RESOURCES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 impl WorkRequestPoster for VerbsConnectionResources {
@@ -659,9 +742,7 @@ impl WorkRequestPoster for VerbsConnectionResources {
     fn destroy_connection(&self) -> Option<SharedCmId> {
         self.destroy_qp();
         match lock_unpoison(&self.cm_owner).take() {
-            Some(ConnectionCmOwner::Shared { cm_id, _channel }) => {
-                Some(SharedCmId::new(cm_id, _channel))
-            }
+            Some(ConnectionCmOwner::Shared { cm_id }) => Some(cm_id),
             #[cfg(any(test, feature = "test-hooks"))]
             Some(ConnectionCmOwner::External { _cm_id }) => {
                 drop(_cm_id);
