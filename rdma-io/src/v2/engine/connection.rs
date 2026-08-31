@@ -191,7 +191,7 @@ pub(super) struct ConnectionState {
     retirement_started: AtomicBool,
     retired: AtomicBool,
     admission: Mutex<Option<ConnectionReservation>>,
-    outbound_route_token: Option<u64>,
+    cm_route: Option<ConnectionCmRoute>,
 }
 
 impl ConnectionState {
@@ -202,7 +202,7 @@ impl ConnectionState {
         local_addr: Option<SocketAddr>,
         peer_addr: Option<SocketAddr>,
         admission: Option<ConnectionReservation>,
-        outbound_route_token: Option<u64>,
+        cm_route: Option<ConnectionCmRoute>,
     ) -> Self {
         Self {
             token,
@@ -226,7 +226,7 @@ impl ConnectionState {
             retirement_started: AtomicBool::new(false),
             retired: AtomicBool::new(false),
             admission: Mutex::new(admission),
-            outbound_route_token,
+            cm_route,
         }
     }
 
@@ -416,8 +416,8 @@ impl ConnectionState {
         self.retired.load(Ordering::Acquire)
     }
 
-    pub(super) fn outbound_route_token(&self) -> Option<u64> {
-        self.outbound_route_token
+    pub(super) fn cm_route(&self) -> Option<ConnectionCmRoute> {
+        self.cm_route
     }
 
     pub(super) fn release_admission(&self) {
@@ -519,6 +519,12 @@ pub(super) enum OperationKind {
     Read,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ConnectionCmRoute {
+    Outbound(u64),
+    Inbound(u64),
+}
+
 impl OperationKind {
     pub(super) const fn direction(self) -> Direction {
         match self {
@@ -571,6 +577,14 @@ impl SharedCmId {
         let result = cm_id.destroy().map_err(Error::from);
         self.channel.take();
         result
+    }
+
+    pub(super) fn install_context_token(&mut self, route: u64) -> Result<()> {
+        self.cm_id
+            .as_mut()
+            .expect("shared CM ID remains live until driver destruction")
+            .install_context_token(route)
+            .map_err(Error::from)
     }
 }
 
@@ -648,6 +662,20 @@ impl VerbsConnectionResources {
             #[cfg(any(test, feature = "test-hooks"))]
             Some(ConnectionCmOwner::External { .. }) => Err(Error::InvalidConfig(
                 "external CM owner cannot initiate an engine connection".into(),
+            )),
+            None => Err(Error::TransportClosed),
+        }
+    }
+
+    pub(super) fn accept(&self, param: &ConnParam) -> Result<()> {
+        let cm_owner = lock_unpoison(&self.cm_owner);
+        match cm_owner.as_ref() {
+            Some(ConnectionCmOwner::Shared { cm_id, .. }) => {
+                cm_id.accept(param).map_err(Error::from)
+            }
+            #[cfg(any(test, feature = "test-hooks"))]
+            Some(ConnectionCmOwner::External { .. }) => Err(Error::InvalidConfig(
+                "external CM owner cannot accept an engine connection".into(),
             )),
             None => Err(Error::TransportClosed),
         }
@@ -817,7 +845,7 @@ pub(super) fn install_reserved_connection(
     local_addr: Option<SocketAddr>,
     peer_addr: Option<SocketAddr>,
     reservation: ConnectionReservation,
-    outbound_route_token: Option<u64>,
+    cm_route: Option<ConnectionCmRoute>,
 ) -> Result<RdmaConnection> {
     config.validate(&shared.config, shared.provider.as_ref())?;
     if let Some(capabilities) = poster.capabilities() {
@@ -832,7 +860,7 @@ pub(super) fn install_reserved_connection(
             local_addr,
             peer_addr,
             Some(reservation),
-            outbound_route_token,
+            cm_route,
         ))
     });
     let (_, state) = match registration {

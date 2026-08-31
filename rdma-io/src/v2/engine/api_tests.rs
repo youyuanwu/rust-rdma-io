@@ -14,6 +14,8 @@ fn assert_operation_traits<
 >() {
 }
 fn assert_connect_future<T: Future<Output = Result<RdmaConnection>> + Send>(_: T) {}
+fn assert_listen_future<T: Future<Output = Result<RdmaListener>> + Send>(_: T) {}
+fn assert_accept_future<T: Future<Output = Result<RdmaConnection>> + Send>(_: T) {}
 
 struct CountingWaker(AtomicUsize);
 
@@ -54,6 +56,7 @@ impl CountingWaker {
 #[test]
 fn exact_public_types_and_traits_compile() {
     assert_engine_traits::<RdmaEngine>();
+    assert_engine_traits::<RdmaListener>();
     assert_driver_traits::<RdmaEngineDriver>();
     assert_operation_traits::<RdmaOperation>();
 
@@ -64,6 +67,10 @@ fn exact_public_types_and_traits_compile() {
     let config = RdmaConnectionConfig::default();
     assert_eq!(config.maximum_send_work_requests(), 19);
     assert_eq!(config.maximum_receive_work_requests(), 34);
+    assert_eq!(
+        RdmaListenerConfig::default().backlog_capacity(),
+        listener::DEFAULT_LISTENER_BACKLOG
+    );
 
     let connection = Error::ConnectionQuarantined {
         outstanding_operations: 1,
@@ -85,8 +92,14 @@ fn exact_public_types_and_traits_compile() {
     fn check_connect_methods(engine: &RdmaEngine, address: std::net::SocketAddr) {
         assert_connect_future(engine.connect(address));
         assert_connect_future(engine.connect_with_config(address, RdmaConnectionConfig::default()));
+        assert_listen_future(engine.listen(address, RdmaListenerConfig::default()));
+    }
+    fn check_accept_methods(listener: &RdmaListener) {
+        assert_accept_future(listener.accept());
+        assert_accept_future(listener.accept_with_config(RdmaConnectionConfig::default()));
     }
     let _ = check_connect_methods;
+    let _ = check_accept_methods;
 }
 
 #[test]
@@ -153,4 +166,24 @@ fn dropped_shutdown_future_unregisters_its_waiter() {
         0,
         "a cancelled shutdown must not retain its waker"
     );
+}
+
+#[test]
+fn pending_listen_waiter_is_woken_when_driver_drops() {
+    let (engine, driver) = test_engine_pair(CompletionMode::Polling);
+    let counter = CountingWaker::new();
+    let waker = counter.waker();
+    let mut cx = TaskContext::from_waker(&waker);
+    let mut listen = Box::pin(engine.listen(
+        "127.0.0.1:0".parse().unwrap(),
+        RdmaListenerConfig::default(),
+    ));
+
+    assert!(Pin::new(&mut listen).poll(&mut cx).is_pending());
+    drop(driver);
+    assert!(matches!(
+        Pin::new(&mut listen).poll(&mut cx),
+        Poll::Ready(Err(Error::DriverShutdown))
+    ));
+    assert_eq!(counter.count(), 1);
 }

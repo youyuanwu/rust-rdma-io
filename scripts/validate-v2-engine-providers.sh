@@ -46,8 +46,13 @@ case "$MODE" in
         REPETITIONS=1
         MODE_LABEL="Phase 4 shared-CM outbound connections"
         ;;
+    --phase5-listeners)
+        TEST_TARGET="v2_engine_listener_tests"
+        REPETITIONS=1
+        MODE_LABEL="Phase 5 listener backlog and accept arbitration"
+        ;;
     *)
-        echo "usage: sudo -E ./scripts/validate-v2-engine-providers.sh {--provider-probe|--readiness-race|--driver-flush-gate|--phase3-operations|--phase4-connections}" >&2
+        echo "usage: sudo -E ./scripts/validate-v2-engine-providers.sh {--provider-probe|--readiness-race|--driver-flush-gate|--phase3-operations|--phase4-connections|--phase5-listeners}" >&2
         exit 2
         ;;
 esac

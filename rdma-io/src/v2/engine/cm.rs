@@ -16,15 +16,22 @@ use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 
 use futures_util::task::AtomicWaker;
+use rdma_io_sys::rdmacm::rdma_cm_id;
 
+#[cfg(test)]
+use super::SetupSummary;
 use super::connection::{
-    ConnectionReservation, ConnectionState, SharedCmId, VerbsConnectionResources,
-    WorkRequestPoster, install_reserved_connection, reserve_connection,
+    ConnectionCmRoute, ConnectionReservation, ConnectionState, SharedCmId,
+    VerbsConnectionResources, WorkRequestPoster, install_reserved_connection, reserve_connection,
 };
 use super::diagnostics::CmEventReject;
+use super::listener::{
+    AcceptRequest, EmptyPreEstablishSetup, InboundRejectReason, IncomingChild, ListenRequest,
+    ListenerAction, ListenerState, RdmaListener, run_setup_before_establish,
+};
 use super::registry::{ConnectionToken, Lookup, PagedRegistry, RegistryToken, lock_unpoison};
 use super::resources::EngineResources;
-use super::{EngineOutcome, EngineShared, RdmaConnection, RdmaConnectionConfig};
+use super::{EngineOutcome, EngineShared, PreEstablishSetup, RdmaConnection, RdmaConnectionConfig};
 use crate::cm::{CmEventType, CmId, PortSpace};
 use crate::v2::error::{Error, Result};
 use crate::v2::qp::QpBuilder;
@@ -64,11 +71,24 @@ impl RegistryToken for CmRouteToken {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContextRoute {
+    Outbound(CmRouteToken),
+    Inbound(CmRouteToken),
+    Listener(u64),
+}
+
 pub(super) struct CmState {
     routes: PagedRegistry<CmRouteToken, Arc<OutboundRoute>>,
-    context_routes: Mutex<HashMap<usize, CmRouteToken>>,
+    inbound_routes: PagedRegistry<CmRouteToken, Arc<InboundRoute>>,
+    context_routes: Mutex<HashMap<usize, ContextRoute>>,
     pending: Mutex<VecDeque<Arc<OutboundRequest>>>,
+    pending_listens: Mutex<VecDeque<Arc<ListenRequest>>>,
     cancellations: Mutex<VecDeque<Arc<OutboundRequest>>>,
+    listener_work: Mutex<VecDeque<Arc<ListenerState>>>,
+    listeners: Mutex<HashMap<u64, Arc<ListenerState>>>,
+    listener_ids: Mutex<HashMap<usize, u64>>,
+    next_listener_token: AtomicU64,
     retirements: Mutex<VecDeque<ConnectionToken>>,
     cm_destructions: Mutex<VecDeque<PendingCmDestruction>>,
     shutting_down: AtomicBool,
@@ -78,9 +98,15 @@ impl CmState {
     pub(super) fn new(capacity: usize) -> Result<Self> {
         Ok(Self {
             routes: PagedRegistry::new(capacity)?,
+            inbound_routes: PagedRegistry::new(capacity)?,
             context_routes: Mutex::new(HashMap::new()),
             pending: Mutex::new(VecDeque::new()),
+            pending_listens: Mutex::new(VecDeque::new()),
             cancellations: Mutex::new(VecDeque::new()),
+            listener_work: Mutex::new(VecDeque::new()),
+            listeners: Mutex::new(HashMap::new()),
+            listener_ids: Mutex::new(HashMap::new()),
+            next_listener_token: AtomicU64::new(1),
             retirements: Mutex::new(VecDeque::new()),
             cm_destructions: Mutex::new(VecDeque::new()),
             shutting_down: AtomicBool::new(false),
@@ -89,6 +115,16 @@ impl CmState {
 
     fn enqueue(&self, request: Arc<OutboundRequest>) {
         lock_unpoison(&self.pending).push_back(request);
+    }
+
+    pub(super) fn enqueue_listen(&self, request: Arc<ListenRequest>) {
+        lock_unpoison(&self.pending_listens).push_back(request);
+    }
+
+    pub(super) fn enqueue_listener_work(&self, listener: &Arc<ListenerState>) {
+        if listener.try_enqueue_work() {
+            lock_unpoison(&self.listener_work).push_back(Arc::clone(listener));
+        }
     }
 
     fn defer_cm_id(&self, cm_id: SharedCmId) {
@@ -115,10 +151,26 @@ impl CmState {
         }
     }
 
-    fn insert_context_route(&self, context_key: usize, token: CmRouteToken) -> bool {
+    pub(super) fn mark_accept_delivered(&self, request: &Arc<AcceptRequest>) {
+        let encoded = request.route_token();
+        if encoded == 0 {
+            return;
+        }
+        if let Lookup::Occupied(route) = self
+            .inbound_routes
+            .lookup_cloned(CmRouteToken::decode(encoded))
+            && route.mark_delivered(request)
+            && let Some(listener) = route.listener.upgrade()
+            && listener.finish_selected_route(encoded)
+        {
+            self.enqueue_listener_work(&listener);
+        }
+    }
+
+    fn insert_context_route(&self, context_key: usize, route: ContextRoute) -> bool {
         match lock_unpoison(&self.context_routes).entry(context_key) {
             Entry::Vacant(entry) => {
-                entry.insert(token);
+                entry.insert(route);
                 true
             }
             Entry::Occupied(_) => false,
@@ -127,7 +179,9 @@ impl CmState {
 
     pub(super) fn has_software_work(&self) -> bool {
         !lock_unpoison(&self.pending).is_empty()
+            || !lock_unpoison(&self.pending_listens).is_empty()
             || !lock_unpoison(&self.cancellations).is_empty()
+            || !lock_unpoison(&self.listener_work).is_empty()
             || !lock_unpoison(&self.retirements).is_empty()
             || !lock_unpoison(&self.cm_destructions).is_empty()
     }
@@ -142,6 +196,8 @@ impl CmState {
             lock_unpoison(&self.cancellations).len(),
             lock_unpoison(&self.retirements).len(),
             lock_unpoison(&self.pending).len(),
+            lock_unpoison(&self.pending_listens).len(),
+            lock_unpoison(&self.listener_work).len(),
         ];
         let mut next_class = 0;
         let mut processed = 0;
@@ -186,7 +242,35 @@ impl CmState {
                         processed += 1;
                     }
                 }
-                _ => unreachable!("software work has three classes"),
+                3 => {
+                    let request = { lock_unpoison(&self.pending_listens).pop_front() };
+                    if let Some(request) = request {
+                        let resources = resources.ok_or_else(|| {
+                            Error::InvalidConfig(
+                                "listener creation requires live engine resources".into(),
+                            )
+                        })?;
+                        self.start_listener(shared, resources, request)?;
+                        processed += 1;
+                    }
+                }
+                4 => {
+                    let listener = { lock_unpoison(&self.listener_work).pop_front() };
+                    if let Some(listener) = listener {
+                        listener.begin_work();
+                        let resources = resources.ok_or_else(|| {
+                            Error::InvalidConfig(
+                                "listener progress requires live engine resources".into(),
+                            )
+                        })?;
+                        self.service_listener(shared, resources, &listener)?;
+                        if listener.has_work() {
+                            self.enqueue_listener_work(&listener);
+                        }
+                        processed += 1;
+                    }
+                }
+                _ => unreachable!("software work has five classes"),
             }
         }
         Ok(processed)
@@ -212,7 +296,7 @@ impl CmState {
             listen_id: event.listen_id_raw() as usize,
             context_key: event.context_key(),
         };
-        let route = self.lookup_event_route(snapshot);
+        let route = self.lookup_dispatch_route(snapshot);
         event.ack_checked().map_err(Error::from)?;
         shared
             .diagnostic_counters
@@ -223,10 +307,33 @@ impl CmState {
             Ok(route) => route,
             Err(reject) => {
                 shared.diagnostic_counters.reject_cm_event(reject);
+                if snapshot.event_type == CmEventType::ConnectRequest {
+                    self.reject_raw_child(
+                        shared,
+                        resources,
+                        snapshot.id,
+                        InboundRejectReason::ListenerClosed,
+                    )?;
+                }
                 return Ok(true);
             }
         };
-        match self.handle_event(shared, resources, &route, snapshot)? {
+        let disposition = match route {
+            CmDispatchRoute::Outbound(route) => {
+                self.handle_event(shared, resources, &route, snapshot)?
+            }
+            CmDispatchRoute::Inbound(route) => {
+                self.handle_inbound_event(shared, &route, snapshot)?
+            }
+            CmDispatchRoute::Listener(listener) => {
+                if snapshot.event_type == CmEventType::ConnectRequest {
+                    self.handle_connect_request(shared, resources, &listener, snapshot)?
+                } else {
+                    self.handle_listener_event(shared, &listener, snapshot)?
+                }
+            }
+        };
+        match disposition {
             EventDisposition::Handled => {}
             EventDisposition::Rejected(reject) => {
                 shared.diagnostic_counters.reject_cm_event(reject);
@@ -235,7 +342,7 @@ impl CmState {
         Ok(true)
     }
 
-    pub(super) fn begin_shutdown(&self, outcome: &EngineOutcome) {
+    pub(super) fn begin_shutdown(&self, shared: &Arc<EngineShared>, outcome: &EngineOutcome) {
         if self.shutting_down.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -257,6 +364,14 @@ impl CmState {
             request.cancel(terminal_error(outcome));
             self.enqueue_cancellation(request);
         }
+        let pending_listens: Vec<_> = lock_unpoison(&self.pending_listens).drain(..).collect();
+        for request in pending_listens {
+            request.complete(Err(terminal_error(outcome)));
+        }
+        let listeners: Vec<_> = lock_unpoison(&self.listeners).values().cloned().collect();
+        for listener in listeners {
+            listener.request_close(shared);
+        }
     }
 
     pub(super) fn pending_route_count(&self) -> usize {
@@ -268,13 +383,39 @@ impl CmState {
             .count();
         establishing
             + lock_unpoison(&self.pending).len()
+            + lock_unpoison(&self.pending_listens).len()
             + lock_unpoison(&self.cancellations).len()
+            + lock_unpoison(&self.listener_work).len()
             + lock_unpoison(&self.retirements).len()
             + lock_unpoison(&self.cm_destructions).len()
+            + self.inbound_routes.live()
+            + lock_unpoison(&self.listeners).len()
     }
 
     pub(super) fn retained_owner_count(&self) -> usize {
-        self.routes.live() + lock_unpoison(&self.cm_destructions).len()
+        self.routes.live()
+            + self.inbound_routes.live()
+            + lock_unpoison(&self.listeners).len()
+            + lock_unpoison(&self.cm_destructions).len()
+    }
+
+    pub(super) fn listener_counts(&self) -> (usize, usize, usize, usize) {
+        let listeners: Vec<_> = lock_unpoison(&self.listeners).values().cloned().collect();
+        let mut queued_children = 0;
+        let mut pending_accepts = 0;
+        let mut selected_accepts = 0;
+        for listener in &listeners {
+            let (children, waiters, selected) = listener.queue_counts();
+            queued_children += children;
+            pending_accepts += waiters;
+            selected_accepts += selected;
+        }
+        (
+            listeners.len(),
+            queued_children,
+            pending_accepts,
+            selected_accepts,
+        )
     }
 
     pub(super) fn service_cm_destructions(
@@ -297,9 +438,18 @@ impl CmState {
                     self.remove_context_route(pending.cm_id());
                     match pending {
                         PendingCmDestruction::Route(cm_id) => cm_id.destroy()?,
-                        PendingCmDestruction::Connection { cm_id, connection } => {
+                        PendingCmDestruction::Connection {
+                            cm_id,
+                            connection,
+                            completion,
+                        } => {
                             cm_id.destroy()?;
                             self.finalize_connection_retirement(shared, connection)?;
+                            self.finish_inbound_retirement(completion);
+                        }
+                        PendingCmDestruction::Listener { cm_id, listener } => {
+                            cm_id.destroy()?;
+                            listener.finish_close(None);
                         }
                         #[cfg(test)]
                         PendingCmDestruction::Test { destroyed } => {
@@ -333,6 +483,623 @@ impl CmState {
             drop(request.take_reservation());
             request.cancel(terminal_error(outcome));
         }
+        let pending_listens: Vec<_> = lock_unpoison(&self.pending_listens).drain(..).collect();
+        for request in pending_listens {
+            request.complete(Err(terminal_error(outcome)));
+        }
+        let listeners: Vec<_> = lock_unpoison(&self.listeners).values().cloned().collect();
+        for listener in listeners {
+            listener.terminalize(outcome);
+        }
+    }
+
+    fn start_listener(
+        &self,
+        shared: &Arc<EngineShared>,
+        resources: &EngineResources,
+        request: Arc<ListenRequest>,
+    ) -> Result<()> {
+        if request.is_cancelled()
+            || self.shutting_down.load(Ordering::Acquire)
+            || shared.shutdown_requested.load(Ordering::Acquire)
+        {
+            request.complete(Err(Error::DriverShutdown));
+            return Ok(());
+        }
+        let token = self
+            .next_listener_token
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| Error::CapacityExhausted)?;
+        let cm_id = match CmId::new_with_context_token(
+            &resources.cm_event_channel,
+            PortSpace::Tcp,
+            token,
+        ) {
+            Ok(cm_id) => SharedCmId::new(cm_id, Arc::clone(&resources.cm_event_channel)),
+            Err(error) => {
+                request.complete(Err(contextual_cm_error(
+                    format!("create listener {}", request.address),
+                    error.into(),
+                )));
+                return Ok(());
+            }
+        };
+        let context_key = cm_id.context_key();
+        if !self.insert_context_route(context_key, ContextRoute::Listener(token)) {
+            self.defer_cm_id(cm_id);
+            request.complete(Err(Error::InvalidConfig(
+                "duplicate listener CM context identity".into(),
+            )));
+            return Ok(());
+        }
+        if let Err(error) = cm_id.listen(&request.address, i32::MAX) {
+            self.defer_cm_id(cm_id);
+            request.complete(Err(contextual_cm_error(
+                format!(
+                    "listen on {} with requested kernel backlog {}",
+                    request.address,
+                    i32::MAX
+                ),
+                error.into(),
+            )));
+            return Ok(());
+        }
+        let local_addr = cm_id.local_addr().ok_or_else(|| {
+            Error::InvalidConfig(format!(
+                "listener {} has no local address after rdma_listen",
+                request.address
+            ))
+        });
+        let local_addr = match local_addr {
+            Ok(local_addr) => local_addr,
+            Err(error) => {
+                self.defer_cm_id(cm_id);
+                request.complete(Err(error));
+                return Ok(());
+            }
+        };
+        let raw_id = cm_id.as_raw() as usize;
+        let state = Arc::new(ListenerState::new(
+            token,
+            local_addr,
+            request.config.clone(),
+            cm_id,
+        ));
+        if lock_unpoison(&self.listeners)
+            .insert(token, Arc::clone(&state))
+            .is_some()
+            || lock_unpoison(&self.listener_ids)
+                .insert(raw_id, token)
+                .is_some()
+        {
+            state.request_close(shared);
+            request.complete(Err(Error::InvalidConfig(
+                "duplicate listener route identity".into(),
+            )));
+            return Ok(());
+        }
+        shared
+            .diagnostic_counters
+            .listeners_created
+            .fetch_add(1, Ordering::Relaxed);
+        if request.is_cancelled() {
+            state.request_close(shared);
+            request.complete(Err(Error::DriverShutdown));
+        } else {
+            request.complete(Ok(RdmaListener {
+                shared: Arc::clone(shared),
+                state,
+            }));
+        }
+        Ok(())
+    }
+
+    fn service_listener(
+        &self,
+        shared: &Arc<EngineShared>,
+        resources: &EngineResources,
+        listener: &Arc<ListenerState>,
+    ) -> Result<()> {
+        match listener.next_action() {
+            ListenerAction::CancelledBeforeSelection(request) => {
+                if request.mark_cancellation_counted() {
+                    shared
+                        .diagnostic_counters
+                        .accept_cancellations_before_selection
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                request.complete(Err(Error::DriverShutdown));
+            }
+            ListenerAction::FailUnselected(request) => {
+                request.complete(Err(listener.close_error()));
+            }
+            ListenerAction::RejectChild(child, reason) => {
+                self.reject_child(shared, child, reason)?;
+            }
+            ListenerAction::ProcessSelected { request, child } => {
+                self.process_selected_pair(shared, resources, listener, request, child)?;
+            }
+            ListenerAction::RejectSelected {
+                request,
+                child,
+                reason,
+            } => {
+                self.reject_child(shared, child, InboundRejectReason::ListenerClosed)?;
+                request.complete(Err(reason));
+                listener.finish_selected_request(&request);
+            }
+            ListenerAction::CancelAfterAccept { request, route } => {
+                if request.is_cancelled() && request.mark_cancellation_counted() {
+                    shared
+                        .diagnostic_counters
+                        .accept_cancellations_after_selection
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                self.cancel_inbound_route(shared, route)?;
+            }
+            ListenerAction::FinalizeClose => {
+                self.finalize_listener(listener)?;
+            }
+            ListenerAction::None => {}
+        }
+        Ok(())
+    }
+
+    fn handle_connect_request(
+        &self,
+        shared: &Arc<EngineShared>,
+        resources: &EngineResources,
+        listener: &Arc<ListenerState>,
+        snapshot: CmEventSnapshot,
+    ) -> Result<EventDisposition> {
+        if snapshot.status != 0 || listener.is_closing() {
+            self.reject_raw_child(
+                shared,
+                resources,
+                snapshot.id,
+                InboundRejectReason::ListenerClosed,
+            )?;
+            return Ok(EventDisposition::Handled);
+        }
+        let raw = snapshot.id as *mut rdma_cm_id;
+        if raw.is_null() {
+            return Ok(EventDisposition::Rejected(CmEventReject::Unknown));
+        }
+        let child_id = unsafe { CmId::from_raw(raw, true) };
+        let child_id = SharedCmId::new(child_id, Arc::clone(&resources.cm_event_channel));
+        if let Err(error) = child_id.require_context(resources.context.inner()) {
+            tracing::warn!(
+                listener = %listener.local_addr,
+                "rejecting inbound child with mismatched verbs context: {error}"
+            );
+            self.reject_unreserved_child(shared, child_id, InboundRejectReason::ContextMismatch)?;
+            return Ok(EventDisposition::Handled);
+        }
+
+        let (admission, reservation) = match reserve_connection(shared) {
+            Ok(value) => value,
+            Err(error) => {
+                let reason = if matches!(error, Error::CapacityExhausted) {
+                    InboundRejectReason::ConnectionCapacity
+                } else {
+                    InboundRejectReason::AdmissionClosed
+                };
+                self.reject_unreserved_child(shared, child_id, reason)?;
+                return Ok(EventDisposition::Handled);
+            }
+        };
+        let admitted = listener.admit_child(IncomingChild::new(child_id, reservation));
+        drop(admission);
+        for request in admitted.cancelled {
+            if request.mark_cancellation_counted() {
+                shared
+                    .diagnostic_counters
+                    .accept_cancellations_before_selection
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            request.complete(Err(Error::DriverShutdown));
+        }
+        if let Some((child, reason)) = admitted.rejected {
+            self.reject_child(shared, child, reason)?;
+        } else {
+            self.enqueue_listener_work(listener);
+        }
+        Ok(EventDisposition::Handled)
+    }
+
+    fn handle_listener_event(
+        &self,
+        shared: &Arc<EngineShared>,
+        listener: &Arc<ListenerState>,
+        snapshot: CmEventSnapshot,
+    ) -> Result<EventDisposition> {
+        if !is_failure_event(snapshot.event_type) && snapshot.status == 0 {
+            return Ok(EventDisposition::Rejected(CmEventReject::Unexpected));
+        }
+        let message = format!(
+            "listener {} RDMA CM {:?} failed with status {} for id={:#x}",
+            listener.local_addr, snapshot.event_type, snapshot.status, snapshot.id
+        );
+        if snapshot.event_type == CmEventType::DeviceRemoval {
+            return Err(Error::Verbs(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                message,
+            )));
+        }
+        listener.fail(shared, message);
+        Ok(EventDisposition::Handled)
+    }
+
+    fn process_selected_pair(
+        &self,
+        shared: &Arc<EngineShared>,
+        resources: &EngineResources,
+        listener: &Arc<ListenerState>,
+        request: Arc<AcceptRequest>,
+        child: IncomingChild,
+    ) -> Result<()> {
+        if request.is_cancelled()
+            || listener.is_closing()
+            || shared.shutdown_requested.load(Ordering::Acquire)
+        {
+            if request.is_cancelled() && request.mark_cancellation_counted() {
+                shared
+                    .diagnostic_counters
+                    .accept_cancellations_after_selection
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            let error = if listener.is_closing() {
+                listener.close_error()
+            } else {
+                Error::DriverShutdown
+            };
+            self.reject_child(shared, child, InboundRejectReason::ListenerClosed)?;
+            request.complete(Err(error));
+            listener.finish_selected_request(&request);
+            return Ok(());
+        }
+        let intent = request.take_intent().ok_or_else(|| {
+            Error::InvalidConfig("selected accept intent was consumed more than once".into())
+        })?;
+        let (config, setup) = intent.into_parts()?;
+        let (mut child_cm_id, child_reservation) = child.into_resources()?;
+        let (token, route) = self
+            .inbound_routes
+            .allocate_with(|token| Arc::new(InboundRoute::new(token, Arc::downgrade(listener))))?;
+        request.set_route_token(token.encode());
+        if let Err(error) = child_cm_id.install_context_token(token.encode()) {
+            self.inbound_routes.release(token, false);
+            self.reject_unreserved_child(shared, child_cm_id, InboundRejectReason::SetupFailure)?;
+            drop(child_reservation);
+            request.complete(Err(error));
+            listener.finish_selected_request(&request);
+            return Ok(());
+        }
+        let raw_id = child_cm_id.as_raw() as usize;
+        let context_key = child_cm_id.context_key();
+        route.set_identity(raw_id, context_key);
+        if !self.insert_context_route(context_key, ContextRoute::Inbound(token)) {
+            self.inbound_routes.release(token, false);
+            self.reject_unreserved_child(shared, child_cm_id, InboundRejectReason::SetupFailure)?;
+            drop(child_reservation);
+            request.complete(Err(Error::InvalidConfig(
+                "duplicate inbound CM context identity".into(),
+            )));
+            listener.finish_selected_request(&request);
+            return Ok(());
+        }
+        listener.route_selected(&request, token.encode())?;
+
+        let local_addr = child_cm_id.local_addr();
+        let peer_addr = child_cm_id.peer_addr();
+        let qp = match build_qp(resources, &child_cm_id, &config) {
+            Ok(qp) => qp,
+            Err(error) => {
+                self.remove_context_route(Some(&child_cm_id));
+                self.inbound_routes.release(token, false);
+                self.reject_unreserved_child(
+                    shared,
+                    child_cm_id,
+                    InboundRejectReason::SetupFailure,
+                )?;
+                drop(child_reservation);
+                request.complete(Err(contextual_cm_error(
+                    format!("build inbound QP for {}", listener.local_addr),
+                    error,
+                )));
+                listener.finish_selected_route(token.encode());
+                return Ok(());
+            }
+        };
+        let verbs = Arc::new(VerbsConnectionResources::new_shared(qp, child_cm_id));
+        let connection = match install_reserved_connection(
+            shared,
+            Arc::clone(&verbs) as Arc<_>,
+            config.clone(),
+            local_addr,
+            peer_addr,
+            child_reservation,
+            Some(ConnectionCmRoute::Inbound(token.encode())),
+        ) {
+            Ok(connection) => connection,
+            Err(error) => {
+                let cm_id = verbs.destroy_connection();
+                if let Some(cm_id) = cm_id {
+                    self.reject_unreserved_child(shared, cm_id, InboundRejectReason::SetupFailure)?;
+                }
+                self.inbound_routes.release(token, false);
+                request.complete(Err(error));
+                listener.finish_selected_route(token.encode());
+                return Ok(());
+            }
+        };
+
+        let conn_param = match config.conn_param() {
+            Ok(param) => param,
+            Err(error) => {
+                drop(verbs);
+                self.fail_selected_connection(shared, &route, request, connection, error)?;
+                return Ok(());
+            }
+        };
+        let establish = run_setup_before_establish(
+            setup,
+            &connection,
+            || {
+                if request.is_cancelled()
+                    || listener.is_closing()
+                    || shared.shutdown_requested.load(Ordering::Acquire)
+                {
+                    Err(if listener.is_closing() {
+                        listener.close_error()
+                    } else {
+                        Error::DriverShutdown
+                    })
+                } else {
+                    Ok(())
+                }
+            },
+            || verbs.accept(&conn_param),
+        );
+        if let Err(error) = establish {
+            drop(verbs);
+            self.fail_selected_connection(shared, &route, request, connection, error)?;
+            return Ok(());
+        }
+        drop(verbs);
+        route.set_state(InboundState::AwaitEstablished {
+            request,
+            connection,
+        });
+        Ok(())
+    }
+
+    fn fail_selected_connection(
+        &self,
+        shared: &Arc<EngineShared>,
+        route: &Arc<InboundRoute>,
+        request: Arc<AcceptRequest>,
+        connection: RdmaConnection,
+        error: Error,
+    ) -> Result<()> {
+        let connection_state = Arc::clone(&connection.state);
+        let teardown = matches!(error, Error::DriverShutdown | Error::TransportClosed);
+        let reject = match &error {
+            Error::DriverShutdown if !request.is_cancelled() => {
+                InboundRejectReason::AdmissionClosed
+            }
+            Error::DriverShutdown | Error::TransportClosed => InboundRejectReason::ListenerClosed,
+            _ => InboundRejectReason::SetupFailure,
+        };
+        if request.is_cancelled() {
+            if request.mark_cancellation_counted() {
+                shared
+                    .diagnostic_counters
+                    .accept_cancellations_after_selection
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        } else if !teardown {
+            shared
+                .diagnostic_counters
+                .accept_setup_failures
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        route.set_state(InboundState::Closing {
+            connection: EstablishedConnectionRoute::new(&connection_state),
+            request: Some(request),
+            completion: Some(error),
+            selected: true,
+            reject: Some(reject),
+        });
+        shared.begin_connection_close(&connection_state, true);
+        drop(connection);
+        if connection_state.accepted_count() == 0 {
+            self.retire_registered_connection(shared, connection_state.token)?;
+        }
+        Ok(())
+    }
+
+    fn reject_raw_child(
+        &self,
+        shared: &Arc<EngineShared>,
+        resources: &EngineResources,
+        raw_id: usize,
+        reason: InboundRejectReason,
+    ) -> Result<()> {
+        if raw_id == 0 {
+            return Ok(());
+        }
+        let cm_id = unsafe { CmId::from_raw(raw_id as *mut rdma_cm_id, true) };
+        self.reject_unreserved_child(
+            shared,
+            SharedCmId::new(cm_id, Arc::clone(&resources.cm_event_channel)),
+            reason,
+        )
+    }
+
+    fn reject_unreserved_child(
+        &self,
+        shared: &Arc<EngineShared>,
+        cm_id: SharedCmId,
+        reason: InboundRejectReason,
+    ) -> Result<()> {
+        self.record_inbound_reject(shared, reason);
+        cm_id.reject(&[]).map_err(|error| {
+            contextual_cm_error(format!("reject inbound child ({reason:?})"), error.into())
+        })?;
+        self.defer_cm_id(cm_id);
+        Ok(())
+    }
+
+    fn reject_child(
+        &self,
+        shared: &Arc<EngineShared>,
+        child: IncomingChild,
+        reason: InboundRejectReason,
+    ) -> Result<()> {
+        let (cm_id, reservation) = child.into_resources()?;
+        let result = self.reject_unreserved_child(shared, cm_id, reason);
+        drop(reservation);
+        result
+    }
+
+    fn record_inbound_reject(&self, shared: &EngineShared, reason: InboundRejectReason) {
+        shared
+            .diagnostic_counters
+            .inbound_requests_rejected
+            .fetch_add(1, Ordering::Relaxed);
+        let counter = match reason {
+            InboundRejectReason::BacklogFull => {
+                &shared.diagnostic_counters.inbound_rejected_backlog_full
+            }
+            InboundRejectReason::ConnectionCapacity => {
+                &shared
+                    .diagnostic_counters
+                    .inbound_rejected_connection_capacity
+            }
+            InboundRejectReason::AdmissionClosed => {
+                &shared.diagnostic_counters.inbound_rejected_admission_closed
+            }
+            InboundRejectReason::ListenerClosed => {
+                &shared.diagnostic_counters.inbound_rejected_listener_closed
+            }
+            InboundRejectReason::ContextMismatch => {
+                &shared.diagnostic_counters.inbound_rejected_context_mismatch
+            }
+            InboundRejectReason::SetupFailure => {
+                &shared.diagnostic_counters.inbound_rejected_setup_failure
+            }
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn cancel_inbound_route(&self, shared: &Arc<EngineShared>, encoded: u64) -> Result<()> {
+        let token = CmRouteToken::decode(encoded);
+        let Lookup::Occupied(route) = self.inbound_routes.lookup_cloned(token) else {
+            return Ok(());
+        };
+        let state = route.take_state_if(|state| {
+            matches!(
+                state,
+                InboundState::AwaitEstablished { .. }
+                    | InboundState::EstablishedAwaitingDelivery { .. }
+            )
+        });
+        let Some(state) = state else {
+            return Ok(());
+        };
+        match state {
+            InboundState::AwaitEstablished {
+                request,
+                connection,
+            } => {
+                let connection_state = Arc::clone(&connection.state);
+                let error = if route
+                    .listener
+                    .upgrade()
+                    .is_some_and(|listener| listener.is_closing())
+                {
+                    route
+                        .listener
+                        .upgrade()
+                        .map_or(Error::TransportClosed, |listener| listener.close_error())
+                } else {
+                    Error::DriverShutdown
+                };
+                route.set_state(InboundState::Closing {
+                    connection: EstablishedConnectionRoute::new(&connection_state),
+                    request: Some(request),
+                    completion: Some(error),
+                    selected: true,
+                    reject: None,
+                });
+                shared.begin_connection_close(&connection_state, true);
+                drop(connection);
+                if connection_state.accepted_count() == 0 {
+                    self.retire_registered_connection(shared, connection_state.token)?;
+                }
+            }
+            InboundState::EstablishedAwaitingDelivery {
+                request,
+                connection,
+            } => {
+                let Some(connection_state) = connection.upgrade() else {
+                    self.inbound_routes.release(token, true);
+                    return Ok(());
+                };
+                let error = if route
+                    .listener
+                    .upgrade()
+                    .is_some_and(|listener| listener.is_closing())
+                {
+                    route
+                        .listener
+                        .upgrade()
+                        .map_or(Error::TransportClosed, |listener| listener.close_error())
+                } else {
+                    Error::DriverShutdown
+                };
+                if request.fail_undelivered(error) {
+                    route.set_state(InboundState::Established {
+                        connection: connection.clone(),
+                    });
+                    if let Some(listener) = route.listener.upgrade()
+                        && listener.finish_selected_route(encoded)
+                    {
+                        self.enqueue_listener_work(&listener);
+                    }
+                    return Ok(());
+                }
+                route.set_state(InboundState::Closing {
+                    connection: connection.clone(),
+                    request: None,
+                    completion: None,
+                    selected: true,
+                    reject: None,
+                });
+                shared.begin_connection_close(&connection_state, true);
+                if connection_state.accepted_count() == 0 {
+                    self.retire_registered_connection(shared, connection_state.token)?;
+                }
+            }
+            _ => unreachable!("inbound cancellation state was pre-filtered"),
+        }
+        Ok(())
+    }
+
+    fn finalize_listener(&self, listener: &Arc<ListenerState>) -> Result<()> {
+        let Some(cm_id) = listener.take_cm_id() else {
+            return Ok(());
+        };
+        lock_unpoison(&self.listener_ids).remove(&(cm_id.as_raw() as usize));
+        lock_unpoison(&self.listeners).remove(&listener.token);
+        lock_unpoison(&self.cm_destructions).push_back(PendingCmDestruction::Listener {
+            cm_id,
+            listener: Arc::clone(listener),
+        });
+        Ok(())
     }
 
     fn start_outbound(
@@ -398,7 +1165,7 @@ impl CmState {
         }
         let context_key = cm_id.context_key();
         route.set_identity(cm_id.as_raw() as usize, context_key);
-        if !self.insert_context_route(context_key, context_route) {
+        if !self.insert_context_route(context_key, ContextRoute::Outbound(context_route)) {
             self.defer_cm_id(cm_id);
             self.routes.release(token, false);
             drop(reservation);
@@ -493,23 +1260,44 @@ impl CmState {
         if connection.accepted_count() != 0 || !connection.try_begin_retirement() {
             return Ok(());
         }
-        if let Some(encoded) = connection.outbound_route_token() {
-            match self.retire_connection_route(encoded, &connection)? {
-                RouteRetirement::Complete => {}
-                RouteRetirement::Retry => {
-                    connection.retry_retirement();
-                    self.enqueue_retirement(token);
-                    return Ok(());
-                }
+        let retirement = match connection.cm_route() {
+            Some(ConnectionCmRoute::Outbound(encoded)) => {
+                self.retire_outbound_connection_route(encoded, &connection)?
             }
-        }
+            Some(ConnectionCmRoute::Inbound(encoded)) => {
+                self.retire_inbound_connection_route(shared, encoded, &connection)?
+            }
+            None => RouteRetirement::Complete {
+                completion: None,
+                reject: None,
+            },
+        };
+        let RouteRetirement::Complete { completion, reject } = retirement else {
+            connection.retry_retirement();
+            self.enqueue_retirement(token);
+            return Ok(());
+        };
         let cm_id = connection.destroy_connection_resources();
         if let Some(cm_id) = cm_id {
-            lock_unpoison(&self.cm_destructions)
-                .push_back(PendingCmDestruction::Connection { cm_id, connection });
+            if let Some(reason) = reject {
+                self.record_inbound_reject(shared, reason);
+                cm_id.reject(&[]).map_err(|error| {
+                    contextual_cm_error(
+                        "reject selected inbound child after setup rollback",
+                        error.into(),
+                    )
+                })?;
+            }
+            lock_unpoison(&self.cm_destructions).push_back(PendingCmDestruction::Connection {
+                cm_id,
+                connection,
+                completion,
+            });
             return Ok(());
         }
-        self.finalize_connection_retirement(shared, connection)
+        self.finalize_connection_retirement(shared, connection)?;
+        self.finish_inbound_retirement(completion);
+        Ok(())
     }
 
     fn finalize_connection_retirement(
@@ -533,7 +1321,24 @@ impl CmState {
         Ok(())
     }
 
-    fn retire_connection_route(
+    fn finish_inbound_retirement(&self, completion: Option<InboundRetirementCompletion>) {
+        let Some(completion) = completion else {
+            return;
+        };
+        if let Some(request) = completion.request
+            && let Some(result) = completion.result
+        {
+            request.complete(Err(result));
+        }
+        if completion.selected
+            && let Some(listener) = completion.listener.upgrade()
+            && listener.finish_selected_route(completion.route)
+        {
+            self.enqueue_listener_work(&listener);
+        }
+    }
+
+    fn retire_outbound_connection_route(
         &self,
         encoded: u64,
         connection: &Arc<ConnectionState>,
@@ -542,7 +1347,10 @@ impl CmState {
         let route = match self.routes.lookup_cloned(token) {
             Lookup::Occupied(route) => route,
             Lookup::Duplicate | Lookup::Stale | Lookup::Unknown | Lookup::Retired => {
-                return Ok(RouteRetirement::Complete);
+                return Ok(RouteRetirement::Complete {
+                    completion: None,
+                    reject: None,
+                });
             }
         };
         let state = route.take_state_if(|state| state.references_connection(connection.token));
@@ -557,7 +1365,10 @@ impl CmState {
                 | OutboundState::Closing { .. },
             ) => {
                 self.retire_route(&route, true);
-                Ok(RouteRetirement::Complete)
+                Ok(RouteRetirement::Complete {
+                    completion: None,
+                    reject: None,
+                })
             }
             Some(state) => {
                 route.set_state(state);
@@ -574,6 +1385,151 @@ impl CmState {
         }
     }
 
+    fn retire_inbound_connection_route(
+        &self,
+        shared: &EngineShared,
+        encoded: u64,
+        connection: &Arc<ConnectionState>,
+    ) -> Result<RouteRetirement> {
+        let token = CmRouteToken::decode(encoded);
+        let route = match self.inbound_routes.lookup_cloned(token) {
+            Lookup::Occupied(route) => route,
+            Lookup::Duplicate | Lookup::Stale | Lookup::Unknown | Lookup::Retired => {
+                return Ok(RouteRetirement::Complete {
+                    completion: None,
+                    reject: None,
+                });
+            }
+        };
+        let state = route.take_state_if(|state| state.references_connection(connection.token));
+        match state {
+            Some(InboundState::EstablishedAwaitingDelivery { request, .. }) => {
+                if request.is_cancelled() && request.mark_cancellation_counted() {
+                    shared
+                        .diagnostic_counters
+                        .accept_cancellations_after_selection
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                let delivered = request.fail_undelivered(Error::DriverShutdown);
+                if delivered
+                    && let Some(listener) = route.listener.upgrade()
+                    && listener.finish_selected_route(encoded)
+                {
+                    self.enqueue_listener_work(&listener);
+                }
+                self.inbound_routes.release(token, true);
+                Ok(RouteRetirement::Complete {
+                    completion: (!delivered).then(|| InboundRetirementCompletion {
+                        listener: route.listener.clone(),
+                        route: encoded,
+                        request: None,
+                        result: None,
+                        selected: true,
+                    }),
+                    reject: None,
+                })
+            }
+            Some(InboundState::Established { .. }) => {
+                self.inbound_routes.release(token, true);
+                Ok(RouteRetirement::Complete {
+                    completion: None,
+                    reject: None,
+                })
+            }
+            Some(InboundState::Closing {
+                request,
+                completion,
+                selected,
+                reject,
+                ..
+            }) => {
+                if let Some(request) = request.as_ref()
+                    && request.is_cancelled()
+                    && request.mark_cancellation_counted()
+                {
+                    shared
+                        .diagnostic_counters
+                        .accept_cancellations_after_selection
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                self.inbound_routes.release(token, true);
+                Ok(RouteRetirement::Complete {
+                    completion: Some(InboundRetirementCompletion {
+                        listener: route.listener.clone(),
+                        route: encoded,
+                        request,
+                        result: completion,
+                        selected,
+                    }),
+                    reject,
+                })
+            }
+            Some(state) => {
+                route.set_state(state);
+                Err(Error::InvalidConfig(
+                    "inbound connection route was not established during retirement".into(),
+                ))
+            }
+            None if matches!(&*lock_unpoison(&route.state), InboundState::Transitioning) => {
+                Ok(RouteRetirement::Retry)
+            }
+            None => Err(Error::InvalidConfig(
+                "inbound connection route generation did not match retirement".into(),
+            )),
+        }
+    }
+
+    fn lookup_dispatch_route(
+        &self,
+        snapshot: CmEventSnapshot,
+    ) -> std::result::Result<CmDispatchRoute, CmEventReject> {
+        if snapshot.event_type == CmEventType::ConnectRequest {
+            let token = lock_unpoison(&self.listener_ids)
+                .get(&snapshot.listen_id)
+                .copied()
+                .ok_or(CmEventReject::Unknown)?;
+            let listener = lock_unpoison(&self.listeners)
+                .get(&token)
+                .cloned()
+                .ok_or(CmEventReject::Stale)?;
+            return Ok(CmDispatchRoute::Listener(listener));
+        }
+        if snapshot.context_key == 0 {
+            return Err(CmEventReject::Unknown);
+        }
+        let route = lock_unpoison(&self.context_routes)
+            .get(&snapshot.context_key)
+            .copied()
+            .ok_or(CmEventReject::Unknown)?;
+        match route {
+            ContextRoute::Outbound(_) => self
+                .lookup_event_route(snapshot)
+                .map(CmDispatchRoute::Outbound),
+            ContextRoute::Inbound(token) => {
+                let route = match self.inbound_routes.lookup_cloned(token) {
+                    Lookup::Occupied(route) => route,
+                    Lookup::Duplicate => return Err(CmEventReject::Duplicate),
+                    Lookup::Stale | Lookup::Retired => return Err(CmEventReject::Stale),
+                    Lookup::Unknown => return Err(CmEventReject::Unknown),
+                };
+                if route.raw_id.load(Ordering::Acquire) != snapshot.id {
+                    return Err(CmEventReject::WrongId);
+                }
+                Ok(CmDispatchRoute::Inbound(route))
+            }
+            ContextRoute::Listener(token) => {
+                let listener = lock_unpoison(&self.listeners)
+                    .get(&token)
+                    .cloned()
+                    .ok_or(CmEventReject::Stale)?;
+                if listener.raw_cm_id() != Some(snapshot.id) {
+                    return Err(CmEventReject::WrongId);
+                }
+                Ok(CmDispatchRoute::Listener(listener))
+            }
+        }
+    }
+
     fn lookup_event_route(
         &self,
         snapshot: CmEventSnapshot,
@@ -581,10 +1537,13 @@ impl CmState {
         if snapshot.context_key == 0 {
             return Err(CmEventReject::Unknown);
         }
-        let token = lock_unpoison(&self.context_routes)
+        let route = lock_unpoison(&self.context_routes)
             .get(&snapshot.context_key)
             .copied()
             .ok_or(CmEventReject::Unknown)?;
+        let ContextRoute::Outbound(token) = route else {
+            return Err(CmEventReject::Unexpected);
+        };
         let route = match self.routes.lookup_cloned(token) {
             Lookup::Occupied(route) => route,
             Lookup::Duplicate => return Err(CmEventReject::Duplicate),
@@ -621,6 +1580,252 @@ impl CmState {
             }
             _ => Ok(EventDisposition::Rejected(CmEventReject::Unexpected)),
         }
+    }
+
+    fn handle_inbound_event(
+        &self,
+        shared: &Arc<EngineShared>,
+        route: &Arc<InboundRoute>,
+        snapshot: CmEventSnapshot,
+    ) -> Result<EventDisposition> {
+        if is_failure_event(snapshot.event_type) || snapshot.status != 0 {
+            return self.handle_inbound_failure(shared, route, snapshot);
+        }
+        match snapshot.event_type {
+            CmEventType::Established => {
+                let Some(InboundState::AwaitEstablished {
+                    request,
+                    connection,
+                }) = route
+                    .take_state_if(|state| matches!(state, InboundState::AwaitEstablished { .. }))
+                else {
+                    return Ok(EventDisposition::Rejected(CmEventReject::Duplicate));
+                };
+                let listener = route.listener.upgrade();
+                if request.is_cancelled()
+                    || listener
+                        .as_ref()
+                        .is_none_or(|listener| listener.is_closing())
+                    || shared.shutdown_requested.load(Ordering::Acquire)
+                {
+                    let connection_state = Arc::clone(&connection.state);
+                    let completion = if request.is_cancelled() {
+                        None
+                    } else if let Some(listener) = listener.as_ref() {
+                        Some(listener.close_error())
+                    } else {
+                        Some(Error::DriverShutdown)
+                    };
+                    route.set_state(InboundState::Closing {
+                        connection: EstablishedConnectionRoute::new(&connection_state),
+                        request: Some(request),
+                        completion,
+                        selected: true,
+                        reject: None,
+                    });
+                    shared.begin_connection_close(&connection_state, true);
+                    drop(connection);
+                    if connection_state.accepted_count() == 0 {
+                        self.retire_registered_connection(shared, connection_state.token)?;
+                    }
+                    return Ok(EventDisposition::Handled);
+                }
+
+                let connection_route = EstablishedConnectionRoute::new(&connection.state);
+                route.set_state(InboundState::EstablishedAwaitingDelivery {
+                    request: Arc::clone(&request),
+                    connection: connection_route,
+                });
+                shared
+                    .diagnostic_counters
+                    .connections_opened
+                    .fetch_add(1, Ordering::Relaxed);
+                shared
+                    .diagnostic_counters
+                    .inbound_requests_accepted
+                    .fetch_add(1, Ordering::Relaxed);
+                request.complete_success(connection);
+                Ok(EventDisposition::Handled)
+            }
+            CmEventType::Disconnected => self.handle_inbound_disconnected(shared, route),
+            CmEventType::TimewaitExit => Ok(EventDisposition::Handled),
+            _ => Ok(EventDisposition::Rejected(CmEventReject::Unexpected)),
+        }
+    }
+
+    fn handle_inbound_disconnected(
+        &self,
+        shared: &Arc<EngineShared>,
+        route: &Arc<InboundRoute>,
+    ) -> Result<EventDisposition> {
+        let state = route.take_state_if(|state| {
+            matches!(
+                state,
+                InboundState::AwaitEstablished { .. }
+                    | InboundState::EstablishedAwaitingDelivery { .. }
+                    | InboundState::Established { .. }
+            )
+        });
+        let Some(state) = state else {
+            return Ok(EventDisposition::Rejected(CmEventReject::Duplicate));
+        };
+        let (connection, request, selected) = match state {
+            InboundState::AwaitEstablished {
+                request,
+                connection,
+            } => (
+                EstablishedConnectionRoute::new(&connection.state),
+                Some(request),
+                true,
+            ),
+            InboundState::EstablishedAwaitingDelivery {
+                request,
+                connection,
+            } => (connection, Some(request), true),
+            InboundState::Established { connection } => (connection, None, false),
+            _ => unreachable!("inbound disconnect state was pre-filtered"),
+        };
+        let Some(connection_state) = connection.upgrade() else {
+            self.inbound_routes.release(route.token, true);
+            return Ok(EventDisposition::Handled);
+        };
+        connection_state.mark_disconnected();
+        route.set_state(InboundState::Closing {
+            connection: connection.clone(),
+            request: request.clone(),
+            completion: request.as_ref().map(|_| {
+                Error::Verbs(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "inbound connection disconnected during establishment",
+                ))
+            }),
+            selected,
+            reject: None,
+        });
+        if let Some(request) = request
+            && request.fail_undelivered(Error::Verbs(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "inbound connection disconnected before accept delivery",
+            )))
+        {
+            route.set_state(InboundState::Closing {
+                connection: connection.clone(),
+                request: None,
+                completion: None,
+                selected: false,
+                reject: None,
+            });
+            if let Some(listener) = route.listener.upgrade()
+                && listener.finish_selected_route(route.token.encode())
+            {
+                self.enqueue_listener_work(&listener);
+            }
+        }
+        shared.begin_connection_close(&connection_state, true);
+        if connection_state.accepted_count() == 0 {
+            self.retire_registered_connection(shared, connection_state.token)?;
+        }
+        Ok(EventDisposition::Handled)
+    }
+
+    fn handle_inbound_failure(
+        &self,
+        shared: &Arc<EngineShared>,
+        route: &Arc<InboundRoute>,
+        snapshot: CmEventSnapshot,
+    ) -> Result<EventDisposition> {
+        let message = format!(
+            "inbound RDMA CM {:?} failed with status {} for id={:#x} listen_id={:#x}",
+            snapshot.event_type, snapshot.status, snapshot.id, snapshot.listen_id
+        );
+        let state = route.take_state_if(|_| true);
+        let Some(state) = state else {
+            return Ok(EventDisposition::Rejected(CmEventReject::Duplicate));
+        };
+        match state {
+            InboundState::AwaitEstablished {
+                request,
+                connection,
+            } => {
+                let connection_state = Arc::clone(&connection.state);
+                connection_state.mark_cm_failure(message.clone());
+                route.set_state(InboundState::Closing {
+                    connection: EstablishedConnectionRoute::new(&connection_state),
+                    request: Some(request),
+                    completion: Some(Error::Verbs(std::io::Error::other(message))),
+                    selected: true,
+                    reject: None,
+                });
+                shared.begin_connection_close(&connection_state, true);
+                drop(connection);
+                if connection_state.accepted_count() == 0 {
+                    self.retire_registered_connection(shared, connection_state.token)?;
+                }
+            }
+            InboundState::EstablishedAwaitingDelivery {
+                request,
+                connection,
+            } => {
+                let Some(connection_state) = connection.upgrade() else {
+                    self.inbound_routes.release(route.token, true);
+                    return Ok(EventDisposition::Handled);
+                };
+                connection_state.mark_cm_failure(message.clone());
+                route.set_state(InboundState::Closing {
+                    connection: connection.clone(),
+                    request: Some(Arc::clone(&request)),
+                    completion: Some(Error::Verbs(std::io::Error::other(message.clone()))),
+                    selected: true,
+                    reject: None,
+                });
+                if request.fail_undelivered(Error::Verbs(std::io::Error::other(message))) {
+                    route.set_state(InboundState::Closing {
+                        connection: connection.clone(),
+                        request: None,
+                        completion: None,
+                        selected: false,
+                        reject: None,
+                    });
+                    if let Some(listener) = route.listener.upgrade()
+                        && listener.finish_selected_route(route.token.encode())
+                    {
+                        self.enqueue_listener_work(&listener);
+                    }
+                }
+                shared.begin_connection_close(&connection_state, true);
+                if connection_state.accepted_count() == 0 {
+                    self.retire_registered_connection(shared, connection_state.token)?;
+                }
+            }
+            InboundState::Established { connection } => {
+                let Some(connection_state) = connection.upgrade() else {
+                    self.inbound_routes.release(route.token, true);
+                    return Ok(EventDisposition::Handled);
+                };
+                connection_state.mark_cm_failure(message);
+                route.set_state(InboundState::Closing {
+                    connection: connection.clone(),
+                    request: None,
+                    completion: None,
+                    selected: false,
+                    reject: None,
+                });
+                shared.begin_connection_close(&connection_state, true);
+                if connection_state.accepted_count() == 0 {
+                    self.retire_registered_connection(shared, connection_state.token)?;
+                }
+            }
+            state @ InboundState::Closing { .. } => {
+                route.set_state(state);
+                return Ok(EventDisposition::Rejected(CmEventReject::Duplicate));
+            }
+            InboundState::Transitioning => {
+                return Err(Error::InvalidConfig(
+                    "inbound CM route was re-entered while transitioning".into(),
+                ));
+            }
+        }
+        Ok(EventDisposition::Handled)
     }
 
     fn handle_addr_resolved(
@@ -720,7 +1925,7 @@ impl CmState {
             local_addr,
             peer_addr,
             reservation,
-            Some(route.token.encode()),
+            Some(ConnectionCmRoute::Outbound(route.token.encode())),
         ) {
             Ok(connection) => connection,
             Err(error) => {
@@ -753,9 +1958,8 @@ impl CmState {
                 return Ok(EventDisposition::Handled);
             }
         };
-        let establish = run_setup_before_connect(
+        let establish = run_setup_before_establish(
             setup,
-            shared,
             &connection,
             || {
                 if request.cancelled.load(Ordering::Acquire)
@@ -1032,15 +2236,8 @@ impl CmState {
         let Some(cm_id) = cm_id else {
             return;
         };
-        let Some(encoded) = cm_id.context_token() else {
-            return;
-        };
-        let token = CmRouteToken::decode(encoded);
         let context_key = cm_id.context_key();
-        let mut contexts = lock_unpoison(&self.context_routes);
-        if contexts.get(&context_key).copied() == Some(token) {
-            contexts.remove(&context_key);
-        }
+        lock_unpoison(&self.context_routes).remove(&context_key);
     }
 }
 
@@ -1074,55 +2271,6 @@ pub(super) async fn connect_with_setup(
         finished: false,
     }
     .await
-}
-
-pub(super) trait PreEstablishSetup: Send {
-    fn run(
-        self: Box<Self>,
-        shared: &Arc<EngineShared>,
-        connection: &RdmaConnection,
-    ) -> Result<SetupSummary>;
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct SetupSummary {
-    pub(super) posted_wrs: usize,
-}
-
-struct EmptyPreEstablishSetup;
-
-impl PreEstablishSetup for EmptyPreEstablishSetup {
-    fn run(
-        self: Box<Self>,
-        _shared: &Arc<EngineShared>,
-        _connection: &RdmaConnection,
-    ) -> Result<SetupSummary> {
-        Ok(SetupSummary { posted_wrs: 0 })
-    }
-}
-
-fn run_setup_before_connect(
-    setup: Box<dyn PreEstablishSetup>,
-    shared: &Arc<EngineShared>,
-    connection: &RdmaConnection,
-    before_connect: impl FnOnce() -> Result<()>,
-    connect: impl FnOnce() -> Result<()>,
-) -> Result<SetupSummary> {
-    let accepted_before = connection.state.accepted_count();
-    let summary = setup.run(shared, connection)?;
-    let accepted_after = connection.state.accepted_count();
-    let posted_wrs = accepted_after.checked_sub(accepted_before).ok_or_else(|| {
-        Error::InvalidConfig("pre-establishment setup reduced the accepted WR set".into())
-    })?;
-    if posted_wrs != summary.posted_wrs {
-        return Err(Error::InvalidConfig(format!(
-            "pre-establishment setup reported {} posted WRs but registered {posted_wrs}",
-            summary.posted_wrs
-        )));
-    }
-    before_connect()?;
-    connect()?;
-    Ok(summary)
 }
 
 fn build_qp(
@@ -1171,6 +2319,17 @@ fn terminal_error(outcome: &EngineOutcome) -> Error {
     }
 }
 
+fn contextual_cm_error(context: impl Into<String>, error: Error) -> Error {
+    let context = context.into();
+    match error {
+        Error::Verbs(source) => Error::Verbs(std::io::Error::new(
+            source.kind(),
+            format!("{context}: {source}"),
+        )),
+        other => Error::InvalidConfig(format!("{context}: {other}")),
+    }
+}
+
 #[derive(Clone, Copy)]
 struct CmEventSnapshot {
     event_type: CmEventType,
@@ -1186,7 +2345,10 @@ enum EventDisposition {
 }
 
 enum RouteRetirement {
-    Complete,
+    Complete {
+        completion: Option<InboundRetirementCompletion>,
+        reject: Option<InboundRejectReason>,
+    },
     Retry,
 }
 
@@ -1195,6 +2357,11 @@ enum PendingCmDestruction {
     Connection {
         cm_id: SharedCmId,
         connection: Arc<ConnectionState>,
+        completion: Option<InboundRetirementCompletion>,
+    },
+    Listener {
+        cm_id: SharedCmId,
+        listener: Arc<ListenerState>,
     },
     #[cfg(test)]
     Test {
@@ -1205,11 +2372,117 @@ enum PendingCmDestruction {
 impl PendingCmDestruction {
     fn cm_id(&self) -> Option<&SharedCmId> {
         match self {
-            Self::Route(cm_id) | Self::Connection { cm_id, .. } => Some(cm_id),
+            Self::Route(cm_id) | Self::Connection { cm_id, .. } | Self::Listener { cm_id, .. } => {
+                Some(cm_id)
+            }
             #[cfg(test)]
             Self::Test { .. } => None,
         }
     }
+}
+
+enum CmDispatchRoute {
+    Outbound(Arc<OutboundRoute>),
+    Inbound(Arc<InboundRoute>),
+    Listener(Arc<ListenerState>),
+}
+
+struct InboundRoute {
+    token: CmRouteToken,
+    raw_id: AtomicUsize,
+    context_key: AtomicUsize,
+    listener: Weak<ListenerState>,
+    state: Mutex<InboundState>,
+}
+
+impl InboundRoute {
+    fn new(token: CmRouteToken, listener: Weak<ListenerState>) -> Self {
+        Self {
+            token,
+            raw_id: AtomicUsize::new(0),
+            context_key: AtomicUsize::new(0),
+            listener,
+            state: Mutex::new(InboundState::Transitioning),
+        }
+    }
+
+    fn set_identity(&self, raw_id: usize, context_key: usize) {
+        self.raw_id.store(raw_id, Ordering::Release);
+        self.context_key.store(context_key, Ordering::Release);
+    }
+
+    fn set_state(&self, state: InboundState) {
+        *lock_unpoison(&self.state) = state;
+    }
+
+    fn take_state_if(&self, predicate: impl FnOnce(&InboundState) -> bool) -> Option<InboundState> {
+        let mut state = lock_unpoison(&self.state);
+        if !predicate(&state) {
+            return None;
+        }
+        Some(std::mem::replace(&mut *state, InboundState::Transitioning))
+    }
+
+    fn mark_delivered(&self, request: &Arc<AcceptRequest>) -> bool {
+        let mut state = lock_unpoison(&self.state);
+        let replacement = match &*state {
+            InboundState::EstablishedAwaitingDelivery {
+                request: current,
+                connection,
+            } if Arc::ptr_eq(current, request) => Some(InboundState::Established {
+                connection: connection.clone(),
+            }),
+            _ => None,
+        };
+        if let Some(replacement) = replacement {
+            *state = replacement;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+enum InboundState {
+    AwaitEstablished {
+        request: Arc<AcceptRequest>,
+        connection: RdmaConnection,
+    },
+    EstablishedAwaitingDelivery {
+        request: Arc<AcceptRequest>,
+        connection: EstablishedConnectionRoute,
+    },
+    Established {
+        connection: EstablishedConnectionRoute,
+    },
+    Closing {
+        connection: EstablishedConnectionRoute,
+        request: Option<Arc<AcceptRequest>>,
+        completion: Option<Error>,
+        selected: bool,
+        reject: Option<InboundRejectReason>,
+    },
+    Transitioning,
+}
+
+impl InboundState {
+    fn references_connection(&self, token: ConnectionToken) -> bool {
+        match self {
+            Self::AwaitEstablished { connection, .. } => connection.state.token == token,
+            Self::EstablishedAwaitingDelivery { connection, .. }
+            | Self::Established { connection }
+            | Self::Closing { connection, .. } => connection.token == token,
+            Self::Transitioning => false,
+        }
+    }
+}
+
+struct InboundRetirementCompletion {
+    listener: Weak<ListenerState>,
+    route: u64,
+    request: Option<Arc<AcceptRequest>>,
+    result: Option<Error>,
+    selected: bool,
 }
 
 struct OutboundRoute {
@@ -1604,7 +2877,7 @@ mod tests {
             .allocate_with(|token| Arc::new(OutboundRoute::new(token, request)))
             .unwrap();
         route.set_identity(0x1000, 0x2000);
-        lock_unpoison(&cm.context_routes).insert(0x2000, token);
+        lock_unpoison(&cm.context_routes).insert(0x2000, ContextRoute::Outbound(token));
 
         let exact = CmEventSnapshot {
             event_type: CmEventType::AddrResolved,
@@ -1630,10 +2903,10 @@ mod tests {
         ));
         lock_unpoison(&cm.context_routes).insert(
             0x3001,
-            CmRouteToken {
+            ContextRoute::Outbound(CmRouteToken {
                 slot: token.slot,
                 generation: token.generation + 1,
-            },
+            }),
         );
         assert!(matches!(
             cm.lookup_event_route(CmEventSnapshot {
@@ -1660,6 +2933,77 @@ mod tests {
     }
 
     #[test]
+    fn inbound_routes_use_exact_generational_context_and_id_identity() {
+        let cm = CmState::new(2).unwrap();
+        let listener = ListenerState::test_only(2);
+        let (token, route) = cm
+            .inbound_routes
+            .allocate_with(|token| Arc::new(InboundRoute::new(token, Arc::downgrade(&listener))))
+            .unwrap();
+        route.set_identity(0x4000, 0x5000);
+        lock_unpoison(&cm.context_routes).insert(0x5000, ContextRoute::Inbound(token));
+        let exact = CmEventSnapshot {
+            event_type: CmEventType::Established,
+            status: 0,
+            id: 0x4000,
+            listen_id: 0,
+            context_key: 0x5000,
+        };
+        assert!(matches!(
+            cm.lookup_dispatch_route(exact),
+            Ok(CmDispatchRoute::Inbound(_))
+        ));
+        assert!(matches!(
+            cm.lookup_dispatch_route(CmEventSnapshot {
+                id: 0x4001,
+                ..exact
+            }),
+            Err(CmEventReject::WrongId)
+        ));
+        cm.inbound_routes.release(token, true);
+        assert!(matches!(
+            cm.lookup_dispatch_route(exact),
+            Err(CmEventReject::Duplicate)
+        ));
+    }
+
+    #[test]
+    fn listener_failure_events_close_locally_and_device_removal_fails_progress() {
+        let (engine, driver) =
+            super::super::test_engine_pair(super::super::CompletionMode::Polling);
+        let listener = ListenerState::test_only(2);
+        let snapshot = CmEventSnapshot {
+            event_type: CmEventType::AddrChange,
+            status: libc::EADDRNOTAVAIL,
+            id: 0x4000,
+            listen_id: 0,
+            context_key: 0x5000,
+        };
+        assert!(matches!(
+            engine
+                .shared
+                .cm
+                .handle_listener_event(&engine.shared, &listener, snapshot),
+            Ok(EventDisposition::Handled)
+        ));
+        assert!(listener.is_closing());
+        assert!(matches!(listener.close_error(), Error::Verbs(_)));
+
+        let removed = CmEventSnapshot {
+            event_type: CmEventType::DeviceRemoval,
+            ..snapshot
+        };
+        assert!(matches!(
+            engine
+                .shared
+                .cm
+                .handle_listener_event(&engine.shared, &listener, removed),
+            Err(Error::Verbs(_))
+        ));
+        drop(driver);
+    }
+
+    #[test]
     fn duplicate_context_route_keeps_the_incumbent_mapping() {
         let cm = CmState::new(2).unwrap();
         let incumbent = CmRouteToken {
@@ -1671,11 +3015,11 @@ mod tests {
             generation: 1,
         };
 
-        assert!(cm.insert_context_route(0x2000, incumbent));
-        assert!(!cm.insert_context_route(0x2000, duplicate));
+        assert!(cm.insert_context_route(0x2000, ContextRoute::Outbound(incumbent)));
+        assert!(!cm.insert_context_route(0x2000, ContextRoute::Outbound(duplicate)));
         assert_eq!(
             lock_unpoison(&cm.context_routes).get(&0x2000).copied(),
-            Some(incumbent)
+            Some(ContextRoute::Outbound(incumbent))
         );
     }
 
@@ -1694,12 +3038,11 @@ mod tests {
         )
         .unwrap();
         let order = Arc::new(Mutex::new(Vec::new()));
-        let summary = run_setup_before_connect(
+        let summary = run_setup_before_establish(
             Box::new(RecordingSetup {
                 order: Arc::clone(&order),
                 result: Ok(SetupSummary { posted_wrs: 0 }),
             }),
-            &engine.shared,
             &connection,
             || {
                 lock_unpoison(&order).push("pre-connect");
@@ -1718,12 +3061,11 @@ mod tests {
         );
 
         lock_unpoison(&order).clear();
-        let error = run_setup_before_connect(
+        let error = run_setup_before_establish(
             Box::new(RecordingSetup {
                 order: Arc::clone(&order),
                 result: Err(Error::InvalidConfig("setup failed".into())),
             }),
-            &engine.shared,
             &connection,
             || {
                 lock_unpoison(&order).push("pre-connect");
@@ -1739,12 +3081,11 @@ mod tests {
         assert_eq!(&*lock_unpoison(&order), &["setup"]);
 
         lock_unpoison(&order).clear();
-        let error = run_setup_before_connect(
+        let error = run_setup_before_establish(
             Box::new(RecordingSetup {
                 order: Arc::clone(&order),
                 result: Ok(SetupSummary { posted_wrs: 1 }),
             }),
-            &engine.shared,
             &connection,
             || {
                 lock_unpoison(&order).push("pre-connect");
@@ -1846,9 +3187,10 @@ mod tests {
         });
         request.complete(Ok(connection));
 
-        engine.shared.cm.begin_shutdown(&EngineOutcome::Failure(
-            super::super::EngineFailure::DriverShutdown,
-        ));
+        engine.shared.cm.begin_shutdown(
+            &engine.shared,
+            &EngineOutcome::Failure(super::super::EngineFailure::DriverShutdown),
+        );
 
         assert!(matches!(
             request.take_result(),
@@ -1893,7 +3235,7 @@ mod tests {
             None,
             None,
             reservation,
-            Some(route_token.encode()),
+            Some(ConnectionCmRoute::Outbound(route_token.encode())),
         )
         .unwrap();
         drop(admission);
@@ -2013,11 +3355,7 @@ mod tests {
     }
 
     impl PreEstablishSetup for RecordingSetup {
-        fn run(
-            self: Box<Self>,
-            _shared: &Arc<EngineShared>,
-            _connection: &RdmaConnection,
-        ) -> Result<SetupSummary> {
+        fn run(self: Box<Self>, _connection: &RdmaConnection) -> Result<SetupSummary> {
             lock_unpoison(&self.order).push("setup");
             self.result
         }

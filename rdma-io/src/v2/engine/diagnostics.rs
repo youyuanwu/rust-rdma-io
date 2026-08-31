@@ -83,6 +83,14 @@ pub struct RdmaEngineDiagnostics {
     pub quarantined_bytes: usize,
     /// Connections currently queued for bounded driver-local work.
     pub ready_queue_depth: usize,
+    /// Engine-owned listeners currently registered with the shared CM router.
+    pub listener_count: usize,
+    /// Admitted unmatched inbound children across all listeners.
+    pub queued_inbound_requests: usize,
+    /// Unselected accept waiters across all listeners.
+    pub pending_accepts: usize,
+    /// Listener-local selected/setup or accepted-but-cleaning pairs.
+    pub selected_accepts: usize,
     /// WRs for which admission/posting was attempted.
     pub operations_offered: u64,
     /// WRs accepted or conservatively treated as acceptance-ambiguous.
@@ -133,6 +141,30 @@ pub struct RdmaEngineDiagnostics {
     pub connections_opened: u64,
     /// Outbound connections or requests terminated by CM/setup failure.
     pub connections_failed: u64,
+    /// Listeners successfully created on the shared CM channel.
+    pub listeners_created: u64,
+    /// Inbound children that reached RDMA-CM ESTABLISHED.
+    pub inbound_requests_accepted: u64,
+    /// Inbound children rejected by the engine.
+    pub inbound_requests_rejected: u64,
+    /// Inbound children rejected because the userspace backlog was full.
+    pub inbound_rejected_backlog_full: u64,
+    /// Inbound children rejected because aggregate connection capacity was full.
+    pub inbound_rejected_connection_capacity: u64,
+    /// Inbound children rejected after engine admission closed.
+    pub inbound_rejected_admission_closed: u64,
+    /// Inbound children rejected because their listener was closing.
+    pub inbound_rejected_listener_closed: u64,
+    /// Inbound children rejected for exact verbs-context mismatch.
+    pub inbound_rejected_context_mismatch: u64,
+    /// Selected inbound children rejected after setup failure.
+    pub inbound_rejected_setup_failure: u64,
+    /// Accept futures cancelled before selection.
+    pub accept_cancellations_before_selection: u64,
+    /// Accept futures cancelled after selection.
+    pub accept_cancellations_after_selection: u64,
+    /// Selected pre-establishment setup failures.
+    pub accept_setup_failures: u64,
     /// CM events consumed and acknowledged by the sole engine driver.
     pub cm_events_processed: u64,
     /// CM events rejected from live routing.
@@ -199,6 +231,18 @@ pub(super) struct DiagnosticsState {
     pub(super) cq_capacity_exhausted: AtomicU64,
     pub(super) connections_opened: AtomicU64,
     pub(super) connections_failed: AtomicU64,
+    pub(super) listeners_created: AtomicU64,
+    pub(super) inbound_requests_accepted: AtomicU64,
+    pub(super) inbound_requests_rejected: AtomicU64,
+    pub(super) inbound_rejected_backlog_full: AtomicU64,
+    pub(super) inbound_rejected_connection_capacity: AtomicU64,
+    pub(super) inbound_rejected_admission_closed: AtomicU64,
+    pub(super) inbound_rejected_listener_closed: AtomicU64,
+    pub(super) inbound_rejected_context_mismatch: AtomicU64,
+    pub(super) inbound_rejected_setup_failure: AtomicU64,
+    pub(super) accept_cancellations_before_selection: AtomicU64,
+    pub(super) accept_cancellations_after_selection: AtomicU64,
+    pub(super) accept_setup_failures: AtomicU64,
     pub(super) cm_events_processed: AtomicU64,
     pub(super) cm_events_rejected: AtomicU64,
     pub(super) stale_cm_events: AtomicU64,

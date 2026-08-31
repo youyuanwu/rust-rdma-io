@@ -972,7 +972,11 @@ impl EngineShared {
         let removed = operation.connection.remove_accepted(operation.token);
         operation.connection.release_local(operation.direction);
         self.cq_credits.release();
-        self.accepted_operations.fetch_sub(1, Ordering::AcqRel);
+        let previous = self.accepted_operations.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "accepted operation count must be positive");
+        if previous == 1 && self.shutdown_requested.load(Ordering::Acquire) {
+            self.work_signal.publish(super::driver::TERMINAL_WORK);
+        }
         let finished = operation.finish_completion(completion);
         if finished.was_reclaiming {
             self.pending_reclamations.fetch_sub(1, Ordering::AcqRel);

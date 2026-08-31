@@ -380,6 +380,23 @@ impl CmId {
         }
     }
 
+    /// Install a new engine-owned generational route on an accepted CM ID.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn install_context_token(&mut self, route: u64) -> Result<()> {
+        if self.context_token.is_some() {
+            return Err(crate::Error::InvalidArg(
+                "CM ID already owns an engine context token".into(),
+            ));
+        }
+        let mut context_token = Box::new(CmContextToken { route });
+        let context = std::ptr::from_mut(context_token.as_mut()).cast();
+        unsafe {
+            (*self.inner).context = context;
+        }
+        self.context_token = Some(context_token);
+        Ok(())
+    }
+
     /// Resolve the destination address.
     pub fn resolve_addr(
         &self,
@@ -628,7 +645,7 @@ pub struct CmQueuePair {
     cm_id_raw: Option<NonNull<rdma_cm_id>>,
     #[allow(
         dead_code,
-        reason = "consumed by Phase 3 engine connection installation"
+        reason = "read by the Tokio engine when shared-CM QPs are enabled"
     )]
     capabilities: ibv_qp_cap,
     _pd: Arc<ProtectionDomain>,
@@ -680,7 +697,7 @@ impl CmQueuePair {
     /// Capabilities returned by the provider from `rdma_create_qp`.
     #[allow(
         dead_code,
-        reason = "consumed by Phase 3 engine connection installation"
+        reason = "read by the Tokio engine when shared-CM QPs are enabled"
     )]
     pub(crate) fn capabilities(&self) -> ibv_qp_cap {
         self.capabilities
@@ -688,7 +705,7 @@ impl CmQueuePair {
 
     #[allow(
         dead_code,
-        reason = "consumed by engine test hooks and Phase 4 CM installation"
+        reason = "used by Tokio engine resource-identity test hooks"
     )]
     pub(crate) fn uses_resources(
         &self,

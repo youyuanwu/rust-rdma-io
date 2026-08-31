@@ -26,7 +26,7 @@ use crate::wc::WorkCompletion;
 #[derive(Debug)]
 #[allow(
     dead_code,
-    reason = "prefix fields are consumed by the Tokio-gated engine"
+    reason = "batch outcomes are consumed only when the Tokio engine is enabled"
 )]
 pub(crate) enum BatchPostOutcome {
     AllAccepted,
@@ -44,7 +44,7 @@ pub(crate) enum BatchPostOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(
     dead_code,
-    reason = "consumed by Phase 3 test hooks and Phase 4 CM installation"
+    reason = "provider-returned capabilities are consumed by the Tokio engine"
 )]
 pub(crate) struct QpCapabilities {
     pub(crate) max_send_wr: u32,
@@ -299,7 +299,7 @@ impl Qp {
 
     #[allow(
         dead_code,
-        reason = "consumed by Phase 3 test hooks and Phase 4 CM installation"
+        reason = "provider-returned capabilities are consumed by the Tokio engine"
     )]
     pub(crate) fn capabilities(&self) -> QpCapabilities {
         let capabilities = self.inner.capabilities();
@@ -332,7 +332,7 @@ impl Qp {
 
     #[allow(
         dead_code,
-        reason = "consumed by engine test hooks and Phase 4 CM installation"
+        reason = "used by Tokio engine resource-identity test hooks"
     )]
     pub(crate) fn uses_resources(&self, pd: &Pd, cq: &Cq) -> bool {
         self.inner

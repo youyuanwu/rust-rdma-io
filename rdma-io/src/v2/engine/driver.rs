@@ -162,10 +162,15 @@ impl RdmaEngineDriver {
         {
             return false;
         }
-        self.shared
-            .cm
-            .begin_shutdown(&EngineOutcome::Failure(EngineFailure::DriverShutdown));
+        self.shared.cm.begin_shutdown(
+            &self.shared,
+            &EngineOutcome::Failure(EngineFailure::DriverShutdown),
+        );
+        self.shared.begin_all_connection_close();
         if self.shared.cm.pending_route_count() != 0 {
+            return false;
+        }
+        if self.shared.connections.live() != 0 {
             return false;
         }
 

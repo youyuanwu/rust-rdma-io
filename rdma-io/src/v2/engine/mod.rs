@@ -5,6 +5,7 @@ mod config;
 mod connection;
 mod diagnostics;
 mod driver;
+mod listener;
 mod operation;
 mod registry;
 mod resources;
@@ -35,6 +36,7 @@ pub use driver::{
     TestAcceptedOperation, TestAdmissionBarrier, TestConnectionIdentity, TestCqArmWindowControl,
     TestCqeSuppression, TestEngineQp, TestEngineResources, TestRouteHandle,
 };
+pub use listener::{RdmaListener, RdmaListenerConfig};
 pub use operation::RdmaOperation;
 use operation::{CqCreditPool, OperationRegistry};
 use registry::{
@@ -45,6 +47,15 @@ use scheduler::WorkScheduler;
 use scheduler::{DeadlineKind, DeadlineRequest};
 
 use super::error::{Error, Result};
+
+pub(crate) trait PreEstablishSetup: Send {
+    fn run(self: Box<Self>, connection: &RdmaConnection) -> Result<SetupSummary>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SetupSummary {
+    pub(crate) posted_wrs: usize,
+}
 
 /// Builder for one device-bound, explicitly driven RDMA engine.
 ///
@@ -224,6 +235,15 @@ impl RdmaEngine {
         config: RdmaConnectionConfig,
     ) -> Result<RdmaConnection> {
         cm::connect(Arc::clone(&self.shared), address, config).await
+    }
+
+    /// Bind an engine-owned listener on the shared CM event channel.
+    pub async fn listen(
+        &self,
+        address: std::net::SocketAddr,
+        config: RdmaListenerConfig,
+    ) -> Result<RdmaListener> {
+        listener::listen(Arc::clone(&self.shared), address, config).await
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -524,6 +544,8 @@ impl EngineShared {
 
     fn diagnostics(&self) -> RdmaEngineDiagnostics {
         let outcome = self.outcome();
+        let (listener_count, queued_inbound_requests, pending_accepts, selected_accepts) =
+            self.cm.listener_counts();
         RdmaEngineDiagnostics {
             lifecycle: self.lifecycle(),
             terminal_error: outcome.and_then(|outcome| outcome.summary()),
@@ -552,6 +574,10 @@ impl EngineShared {
             quarantined_mrs: self.quarantined_mrs.load(Ordering::Acquire),
             quarantined_bytes: self.quarantined_bytes.load(Ordering::Acquire),
             ready_queue_depth: self.ready_queue_depth.load(Ordering::Acquire),
+            listener_count,
+            queued_inbound_requests,
+            pending_accepts,
+            selected_accepts,
             operations_offered: self
                 .diagnostic_counters
                 .operations_offered
@@ -646,6 +672,54 @@ impl EngineShared {
                 .diagnostic_counters
                 .connections_failed
                 .load(Ordering::Acquire),
+            listeners_created: self
+                .diagnostic_counters
+                .listeners_created
+                .load(Ordering::Acquire),
+            inbound_requests_accepted: self
+                .diagnostic_counters
+                .inbound_requests_accepted
+                .load(Ordering::Acquire),
+            inbound_requests_rejected: self
+                .diagnostic_counters
+                .inbound_requests_rejected
+                .load(Ordering::Acquire),
+            inbound_rejected_backlog_full: self
+                .diagnostic_counters
+                .inbound_rejected_backlog_full
+                .load(Ordering::Acquire),
+            inbound_rejected_connection_capacity: self
+                .diagnostic_counters
+                .inbound_rejected_connection_capacity
+                .load(Ordering::Acquire),
+            inbound_rejected_admission_closed: self
+                .diagnostic_counters
+                .inbound_rejected_admission_closed
+                .load(Ordering::Acquire),
+            inbound_rejected_listener_closed: self
+                .diagnostic_counters
+                .inbound_rejected_listener_closed
+                .load(Ordering::Acquire),
+            inbound_rejected_context_mismatch: self
+                .diagnostic_counters
+                .inbound_rejected_context_mismatch
+                .load(Ordering::Acquire),
+            inbound_rejected_setup_failure: self
+                .diagnostic_counters
+                .inbound_rejected_setup_failure
+                .load(Ordering::Acquire),
+            accept_cancellations_before_selection: self
+                .diagnostic_counters
+                .accept_cancellations_before_selection
+                .load(Ordering::Acquire),
+            accept_cancellations_after_selection: self
+                .diagnostic_counters
+                .accept_cancellations_after_selection
+                .load(Ordering::Acquire),
+            accept_setup_failures: self
+                .diagnostic_counters
+                .accept_setup_failures
+                .load(Ordering::Acquire),
             cm_events_processed: self
                 .diagnostic_counters
                 .cm_events_processed
@@ -713,6 +787,12 @@ impl EngineShared {
         }
         if connection.accepted_count() == 0 {
             self.schedule_connection_retirement(connection);
+        }
+    }
+
+    fn begin_all_connection_close(&self) {
+        for connection in self.connections.occupied() {
+            self.begin_connection_close(&connection, true);
         }
     }
 
