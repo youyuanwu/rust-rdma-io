@@ -18,11 +18,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 
+use crate::cm::EventChannel;
 use crate::wc::WorkCompletion;
 
 use super::config::CompletionMode;
 use super::resources::EngineResources;
-use super::scheduler::{WorkClass, WorkScheduler};
+use super::scheduler::{Deadline, DeadlineKind, WorkClass, WorkScheduler};
 use super::{EngineFailure, EngineOutcome, EngineShared, RdmaEngineDriver};
 use crate::v2::completion::CqReadiness;
 use crate::v2::error::{Error, Result};
@@ -72,6 +73,55 @@ impl WorkSignal {
     }
 }
 
+fn try_ack_cm_event(channel: &EventChannel) -> Result<bool> {
+    match channel.try_get_event() {
+        Ok(event) => {
+            event.ack();
+            Ok(true)
+        }
+        Err(crate::Error::WouldBlock) => Ok(false),
+        Err(crate::Error::Verbs(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Ok(false)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn poll_readiness_events<G>(
+    cx: &mut TaskContext<'_>,
+    budget: usize,
+    mut poll_read_ready: impl FnMut(&mut TaskContext<'_>) -> Poll<Result<G>>,
+    mut clear_ready: impl FnMut(&mut G),
+    mut try_one: impl FnMut() -> Result<bool>,
+) -> Poll<Result<usize>> {
+    debug_assert!(budget > 0);
+    let mut processed = 0;
+    loop {
+        let mut guard = match poll_read_ready(cx) {
+            Poll::Ready(Ok(guard)) => guard,
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending if processed == 0 => return Poll::Pending,
+            Poll::Pending => return Poll::Ready(Ok(processed)),
+        };
+        loop {
+            if processed == budget {
+                return Poll::Ready(Ok(processed));
+            }
+            match try_one() {
+                Ok(true) => processed += 1,
+                Ok(false) => {
+                    clear_ready(&mut guard);
+                    break;
+                }
+                Err(error) => return Poll::Ready(Err(error)),
+            }
+        }
+        // Clearing an AsyncFd readiness tick can race a new edge. Re-polling
+        // here either observes it immediately or registers the task waker
+        // before this driver poll is allowed to return Pending.
+    }
+}
+
 impl RdmaEngineDriver {
     pub(super) fn new(shared: Arc<EngineShared>, resources: Option<EngineResources>) -> Self {
         let cq_budget = shared.config.cq_completion_budget;
@@ -81,7 +131,8 @@ impl RdmaEngineDriver {
             scheduler: WorkScheduler::new(),
             cq_readiness: CqReadiness::default(),
             cq_buffer: vec![WorkCompletion::default(); cq_budget].into_boxed_slice(),
-            time_context_checked: false,
+            deadline_sleep: None,
+            deadline_at: None,
         }
     }
 
@@ -139,19 +190,24 @@ impl RdmaEngineDriver {
                     Error::InvalidConfig("readiness engine has no CQ AsyncFd".into())
                 })?;
                 #[cfg(any(test, feature = "test-hooks"))]
-                let arms_before = self.cq_readiness.arm_count();
-                let polled = self.cq_readiness.poll_with_async_fd(
+                let polled = {
+                    let shared = Arc::clone(&self.shared);
+                    self.cq_readiness.poll_with_async_fd_and_arm_hook(
+                        &resources.cq,
+                        async_fd,
+                        cx,
+                        &mut self.cq_buffer,
+                        move |generation| shared.test_driver.record_cq_arm(generation),
+                    )
+                };
+                #[cfg(not(any(test, feature = "test-hooks")))]
+                let polled = self.cq_readiness.poll_with_async_fd_and_arm_hook(
                     &resources.cq,
                     async_fd,
                     cx,
                     &mut self.cq_buffer,
+                    |_| false,
                 );
-                #[cfg(any(test, feature = "test-hooks"))]
-                if self.cq_readiness.arm_count() != arms_before {
-                    self.shared
-                        .test_driver
-                        .record_cq_arms(self.cq_readiness.arm_count() - arms_before);
-                }
                 match polled {
                     Poll::Ready(result) => result?,
                     Poll::Pending => return Ok(false),
@@ -178,58 +234,52 @@ impl RdmaEngineDriver {
             return Ok(false);
         };
 
-        let mut readiness_guard = match self.shared.config.completion_mode {
+        let processed = match self.shared.config.completion_mode {
             CompletionMode::Readiness => {
                 let async_fd = resources.cm_async_fd.as_ref().ok_or_else(|| {
                     Error::InvalidConfig("readiness engine has no CM AsyncFd".into())
                 })?;
-                match async_fd.poll_read_ready(cx) {
-                    Poll::Ready(Ok(guard)) => Some(guard),
-                    Poll::Ready(Err(error)) => return Err(Error::Verbs(error)),
+                match poll_readiness_events(
+                    cx,
+                    self.shared.config.cm_event_budget,
+                    |cx| match async_fd.poll_read_ready(cx) {
+                        Poll::Ready(Ok(guard)) => Poll::Ready(Ok(guard)),
+                        Poll::Ready(Err(error)) => Poll::Ready(Err(Error::Verbs(error))),
+                        Poll::Pending => Poll::Pending,
+                    },
+                    |guard| guard.clear_ready(),
+                    || try_ack_cm_event(&resources.cm_event_channel),
+                ) {
+                    Poll::Ready(result) => result?,
                     Poll::Pending => return Ok(false),
                 }
             }
-            CompletionMode::Polling => None,
-        };
-
-        let mut processed = 0usize;
-        let mut reached_empty = false;
-        while processed < self.shared.config.cm_event_budget {
-            match resources.cm_event_channel.try_get_event() {
-                Ok(event) => {
-                    event.ack();
+            CompletionMode::Polling => {
+                let mut processed = 0;
+                while processed < self.shared.config.cm_event_budget
+                    && try_ack_cm_event(&resources.cm_event_channel)?
+                {
                     processed += 1;
                 }
-                Err(crate::Error::WouldBlock) => {
-                    reached_empty = true;
-                    break;
-                }
-                Err(crate::Error::Verbs(error))
-                    if error.kind() == std::io::ErrorKind::WouldBlock =>
-                {
-                    reached_empty = true;
-                    break;
-                }
-                Err(error) => return Err(error.into()),
+                processed
             }
-        }
+        };
 
-        if reached_empty {
-            if let Some(guard) = readiness_guard.as_mut() {
-                guard.clear_ready();
-            }
-        } else if processed == self.shared.config.cm_event_budget {
+        if processed == self.shared.config.cm_event_budget {
             self.scheduler.mark_class_ready(WorkClass::Cm);
         }
         Ok(processed > 0)
     }
 
-    fn service_reclamation(&mut self) -> bool {
+    fn service_reclamation(&mut self) -> Result<bool> {
         let now = tokio::time::Instant::now();
         let due = self
             .scheduler
             .deadlines()
             .pop_due(now, self.shared.config.reclamation_budget);
+        for deadline in due.iter().copied() {
+            self.process_deadline(deadline)?;
+        }
         if self
             .scheduler
             .deadlines()
@@ -238,7 +288,39 @@ impl RdmaEngineDriver {
         {
             self.scheduler.mark_class_ready(WorkClass::Reclamation);
         }
-        !due.is_empty()
+        Ok(!due.is_empty())
+    }
+
+    fn process_deadline(&mut self, deadline: Deadline) -> Result<()> {
+        match deadline.kind {
+            DeadlineKind::EngineShutdown => {
+                self.shared.request_shutdown();
+                self.scheduler.mark_class_ready(WorkClass::Terminal);
+                Ok(())
+            }
+            kind => Err(Error::InvalidConfig(format!(
+                "deadline {kind:?} for token {} became due before its handler was installed",
+                deadline.token
+            ))),
+        }
+    }
+
+    fn poll_deadline_timer(&mut self, cx: &mut TaskContext<'_>) -> bool {
+        let next = self.scheduler.next_deadline();
+        if self.deadline_at != next {
+            self.deadline_sleep = next.map(|at| Box::pin(tokio::time::sleep_until(at)));
+            self.deadline_at = next;
+        }
+        let Some(sleep) = self.deadline_sleep.as_mut() else {
+            return false;
+        };
+        if sleep.as_mut().poll(cx).is_pending() {
+            return false;
+        }
+        self.deadline_sleep = None;
+        self.deadline_at = None;
+        self.scheduler.mark_class_ready(WorkClass::Reclamation);
+        true
     }
 
     fn service_ready_connection(&mut self) -> bool {
@@ -263,13 +345,8 @@ impl Future for RdmaEngineDriver {
             return Poll::Ready(outcome.into_result());
         }
 
-        if !self.time_context_checked {
-            if let Err(error) = super::preflight_tokio_time() {
-                return self.fail(EngineFailure::InvalidRuntime(error));
-            }
-            self.time_context_checked = true;
-            self.shared.transition_running();
-        }
+        self.shared.transition_running();
+        self.poll_deadline_timer(cx);
 
         let observed_epoch = self.shared.work_signal.epoch();
         let published = self.shared.work_signal.take();
@@ -298,7 +375,7 @@ impl Future for RdmaEngineDriver {
                 }
                 WorkClass::Cm => self.service_cm(cx),
                 WorkClass::Cq => self.service_cq(cx),
-                WorkClass::Reclamation => Ok(self.service_reclamation()),
+                WorkClass::Reclamation => self.service_reclamation(),
                 WorkClass::ReadyConnection => Ok(self.service_ready_connection()),
             };
             if let Err(error) = result {
@@ -312,6 +389,10 @@ impl Future for RdmaEngineDriver {
         if let Some(outcome) = self.shared.outcome() {
             self.release_resources();
             return Poll::Ready(outcome.into_result());
+        }
+
+        if self.poll_deadline_timer(cx) {
+            cx.waker().wake_by_ref();
         }
 
         match self.shared.config.completion_mode {
@@ -411,6 +492,14 @@ pub(super) mod test_api {
         resources: TestResourceRefs,
     }
 
+    /// Controller that pauses the driver after CQ notification arming and
+    /// before its mandatory post-arm CQ poll.
+    #[doc(hidden)]
+    pub struct TestCqArmWindowControl {
+        shared: Weak<EngineShared>,
+        active: bool,
+    }
+
     /// Non-clonable test QP that must be consumed by route installation.
     #[doc(hidden)]
     pub struct TestEngineQp {
@@ -475,6 +564,19 @@ pub(super) mod test_api {
                 .install(&shared, self.resources.clone(), Arc::new(qp.qp), operations)
         }
 
+        /// Pause the next CQ arm-to-post-poll window until released.
+        ///
+        /// Only one controller may be active for an engine. Dropping it
+        /// cancels an unobserved request or releases the paused arm.
+        pub fn pause_next_cq_arm_window(&self) -> Result<TestCqArmWindowControl> {
+            let shared = self.ensure_active()?;
+            shared.test_driver.start_cq_arm_control()?;
+            Ok(TestCqArmWindowControl {
+                shared: Arc::downgrade(&shared),
+                active: true,
+            })
+        }
+
         fn ensure_active(&self) -> Result<Arc<EngineShared>> {
             let shared = self.shared.upgrade().ok_or(Error::DriverShutdown)?;
             if shared.outcome().is_some() || shared.shutdown_requested.load(Ordering::Acquire) {
@@ -482,25 +584,47 @@ pub(super) mod test_api {
             }
             Ok(shared)
         }
+    }
 
-        /// Current successful CQ-arm generation, for coordinated race tests.
-        pub fn cq_arm_generation(&self) -> u64 {
-            self.shared.upgrade().map_or(0, |shared| {
-                shared.test_driver.cq_arms.load(Ordering::Acquire)
-            })
-        }
-
-        /// Wait until the readiness driver completes a CQ arm after `previous`.
-        pub async fn wait_for_cq_arm_after(&self, previous: u64) -> Result<u64> {
+    impl TestCqArmWindowControl {
+        /// Wait until the driver is paused in an arm-to-post-poll window.
+        pub async fn wait_for_pause_after(&self, previous: u64) -> Result<u64> {
             let shared = self.shared.upgrade().ok_or(Error::DriverShutdown)?;
             loop {
                 let notified = shared.test_driver.cq_arm_notify.notified();
-                let current = shared.test_driver.cq_arms.load(Ordering::Acquire);
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let current = shared.test_driver.cq_arm_paused.load(Ordering::Acquire);
                 if current > previous {
                     return Ok(current);
                 }
+                if shared.outcome().is_some() {
+                    return Err(Error::DriverShutdown);
+                }
                 notified.await;
             }
+        }
+
+        /// Resume the exact arm generation after the test posts its CQE.
+        pub fn release(mut self, generation: u64) -> Result<()> {
+            let shared = self.shared.upgrade().ok_or(Error::DriverShutdown)?;
+            shared.test_driver.release_cq_arm(generation)?;
+            shared.work_signal.publish(0);
+            self.active = false;
+            Ok(())
+        }
+    }
+
+    impl Drop for TestCqArmWindowControl {
+        fn drop(&mut self) {
+            if !self.active {
+                return;
+            }
+            if let Some(shared) = self.shared.upgrade() {
+                shared.test_driver.stop_cq_arm_control();
+                shared.work_signal.publish(0);
+            }
+            self.active = false;
         }
     }
 
@@ -673,6 +797,9 @@ pub(super) mod test_api {
         routes: Mutex<HashMap<u32, Arc<TestRouteState>>>,
         next_slot: AtomicU32,
         cq_arms: AtomicU64,
+        cq_arm_controller_active: AtomicBool,
+        cq_arm_controlled: AtomicBool,
+        cq_arm_paused: AtomicU64,
         cq_arm_notify: Notify,
     }
 
@@ -682,6 +809,9 @@ pub(super) mod test_api {
                 routes: Mutex::new(HashMap::new()),
                 next_slot: AtomicU32::new(0),
                 cq_arms: AtomicU64::new(0),
+                cq_arm_controller_active: AtomicBool::new(false),
+                cq_arm_controlled: AtomicBool::new(false),
+                cq_arm_paused: AtomicU64::new(0),
                 cq_arm_notify: Notify::new(),
             }
         }
@@ -785,8 +915,53 @@ pub(super) mod test_api {
             self.routes.lock().expect("test route table poisoned").len()
         }
 
-        pub(super) fn record_cq_arms(&self, count: u64) {
-            self.cq_arms.fetch_add(count, Ordering::AcqRel);
+        pub(super) fn record_cq_arm(&self, generation: u64) -> bool {
+            let previous = self.cq_arms.swap(generation, Ordering::AcqRel);
+            debug_assert!(generation > previous, "CQ arm generations must increase");
+            self.cq_arm_notify.notify_waiters();
+            if !self.cq_arm_controlled.swap(false, Ordering::AcqRel) {
+                return false;
+            }
+            if self
+                .cq_arm_paused
+                .compare_exchange(0, generation, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                debug_assert!(false, "a CQ arm was already paused");
+                return false;
+            }
+            self.cq_arm_notify.notify_waiters();
+            true
+        }
+
+        fn start_cq_arm_control(&self) -> Result<()> {
+            self.cq_arm_controller_active
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .map_err(|_| {
+                    Error::InvalidConfig("CQ arm-window control is already active".into())
+                })?;
+            self.cq_arm_controlled.store(true, Ordering::Release);
+            Ok(())
+        }
+
+        fn release_cq_arm(&self, generation: u64) -> Result<()> {
+            self.cq_arm_paused
+                .compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire)
+                .map_err(|observed| {
+                    Error::InvalidConfig(format!(
+                        "CQ arm generation {generation} is not paused (observed {observed})"
+                    ))
+                })?;
+            self.cq_arm_controller_active
+                .store(false, Ordering::Release);
+            Ok(())
+        }
+
+        fn stop_cq_arm_control(&self) {
+            self.cq_arm_controlled.store(false, Ordering::Release);
+            self.cq_arm_paused.store(0, Ordering::Release);
+            self.cq_arm_controller_active
+                .store(false, Ordering::Release);
             self.cq_arm_notify.notify_waiters();
         }
 
@@ -924,15 +1099,18 @@ pub(super) mod test_api {
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub use test_api::{
-    TestAcceptedOperation, TestConnectionIdentity, TestCqeSuppression, TestEngineQp,
-    TestEngineResources, TestRouteHandle,
+    TestAcceptedOperation, TestConnectionIdentity, TestCqArmWindowControl, TestCqeSuppression,
+    TestEngineQp, TestEngineResources, TestRouteHandle,
 };
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{RawWaker, RawWakerVTable, Waker};
+    use std::time::Duration;
 
     use super::*;
     use crate::v2::engine::{RdmaEngineLifecycle, test_engine_pair};
@@ -1037,6 +1215,110 @@ mod tests {
             signal.take(),
             TERMINAL_WORK | RECLAMATION_WORK | READY_CONNECTION_WORK
         );
+    }
+
+    #[test]
+    fn cm_event_arriving_during_clear_is_drained_after_reregister() {
+        #[derive(Default)]
+        struct FakeReadiness {
+            ready: bool,
+            event_available: bool,
+            polls: usize,
+            clears: usize,
+        }
+
+        let state = Rc::new(RefCell::new(FakeReadiness {
+            ready: true,
+            ..FakeReadiness::default()
+        }));
+        let waker = Waker::noop();
+        let mut cx = TaskContext::from_waker(waker);
+        let result = poll_readiness_events(
+            &mut cx,
+            8,
+            {
+                let state = Rc::clone(&state);
+                move |_| {
+                    let mut state = state.borrow_mut();
+                    state.polls += 1;
+                    if state.ready {
+                        Poll::Ready(Ok(()))
+                    } else {
+                        Poll::Pending
+                    }
+                }
+            },
+            {
+                let state = Rc::clone(&state);
+                move |_| {
+                    let mut state = state.borrow_mut();
+                    state.clears += 1;
+                    if state.clears == 1 {
+                        // Exact regression: a new event edge appears after the
+                        // empty read but while the stale readiness is cleared.
+                        state.event_available = true;
+                        state.ready = true;
+                    } else {
+                        state.ready = false;
+                    }
+                }
+            },
+            {
+                let state = Rc::clone(&state);
+                move || {
+                    let mut state = state.borrow_mut();
+                    if state.event_available {
+                        state.event_available = false;
+                        Ok(true)
+                    } else {
+                        Ok(false)
+                    }
+                }
+            },
+        );
+
+        assert!(matches!(result, Poll::Ready(Ok(1))));
+        let state = state.borrow();
+        assert_eq!(
+            state.polls, 3,
+            "clear must be followed by a readiness re-poll"
+        );
+        assert_eq!(state.clears, 2);
+        assert!(!state.event_available);
+    }
+
+    #[test]
+    fn empty_driver_poll_avoids_a_panicking_tokio_time_probe() {
+        let (_engine, mut driver) = test_engine_pair(CompletionMode::Polling);
+        let counter = CountingWaker::new();
+        let waker = counter.waker();
+        let mut cx = TaskContext::from_waker(&waker);
+        assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
+        assert_eq!(counter.count(), 1, "polling mode only cooperatively wakes");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_timer_wakes_driver_and_processes_shutdown() {
+        let (_engine, mut driver) = test_engine_pair(CompletionMode::Readiness);
+        driver.scheduler.deadlines().push(
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            DeadlineKind::EngineShutdown,
+            7,
+        );
+        let counter = CountingWaker::new();
+        let waker = counter.waker();
+        let mut cx = TaskContext::from_waker(&waker);
+
+        assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
+        assert_eq!(counter.count(), 0, "an unexpired deadline stays idle");
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(counter.count() > 0, "the Tokio timer must wake the driver");
+        assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
+        assert!(matches!(
+            Pin::new(&mut driver).poll(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
     }
 
     #[tokio::test]

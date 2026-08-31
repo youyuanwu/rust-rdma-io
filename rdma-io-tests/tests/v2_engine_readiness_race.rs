@@ -42,34 +42,53 @@ async fn readiness_arm_post_race_observes_each_cqe_exactly_once() {
         .build()
         .unwrap();
     let resources = engine.test_resources().unwrap();
-    let driver_task = tokio::spawn(driver);
     let mut pair = setup_engine_pair(&resources).await;
 
     let recv_route = take_endpoint_route(
         &resources,
         &mut pair.server,
-        (0..RACE_ITERATIONS)
+        (0..RACE_ITERATIONS * 2)
             .map(|index| TestAcceptedOperation::new(100_000 + index as u64, WcOpcode::Recv)),
     );
     let send_route = take_endpoint_route(
         &resources,
         &mut pair.client,
-        (0..RACE_ITERATIONS)
+        (0..RACE_ITERATIONS * 2)
             .map(|index| TestAcceptedOperation::new(200_000 + index as u64, WcOpcode::Send)),
     );
 
+    let driver_task = tokio::spawn(driver);
     let mut arm_generation = 0;
     for index in 0..RACE_ITERATIONS {
+        let arm_window = resources.pause_next_cq_arm_window().unwrap();
+        let kick_index = index * 2;
+        let kick_recv_id = 100_000 + kick_index as u64;
+        let kick_send_id = 200_000 + kick_index as u64;
+        let mut kick_recv = resources
+            .register_memory(64, AccessIntent::LocalOnly)
+            .unwrap();
+        recv_route
+            .qp()
+            .post_recv(&mut kick_recv, kick_recv_id)
+            .unwrap();
+        recv_route.retain(kick_recv);
+        let kick_send = resources
+            .register_memory(64, AccessIntent::LocalOnly)
+            .unwrap();
+        send_route.qp().post_send(&kick_send, kick_send_id).unwrap();
+        send_route.retain(kick_send);
+
         arm_generation = tokio::time::timeout(
             Duration::from_secs(10),
-            resources.wait_for_cq_arm_after(arm_generation),
+            arm_window.wait_for_pause_after(arm_generation),
         )
         .await
-        .expect("driver did not re-arm the shared CQ")
+        .expect("driver did not pause in the CQ arm-to-post-poll window")
         .unwrap();
 
-        let recv_id = 100_000 + index as u64;
-        let send_id = 200_000 + index as u64;
+        let race_index = kick_index + 1;
+        let recv_id = 100_000 + race_index as u64;
+        let send_id = 200_000 + race_index as u64;
         let mut recv = resources
             .register_memory(64, AccessIntent::LocalOnly)
             .unwrap();
@@ -80,11 +99,13 @@ async fn readiness_arm_post_race_observes_each_cqe_exactly_once() {
             .unwrap();
         send_route.qp().post_send(&send, send_id).unwrap();
         send_route.retain(send);
+        arm_window.release(arm_generation).unwrap();
 
         tokio::time::timeout(Duration::from_secs(10), async {
+            let expected = (index + 1) * 2;
             tokio::join!(
-                recv_route.wait_for_completion_count(index + 1),
-                send_route.wait_for_completion_count(index + 1)
+                recv_route.wait_for_completion_count(expected),
+                send_route.wait_for_completion_count(expected)
             );
         })
         .await
@@ -93,15 +114,15 @@ async fn readiness_arm_post_race_observes_each_cqe_exactly_once() {
 
     let recv_completions = recv_route.remove().unwrap();
     let send_completions = send_route.remove().unwrap();
-    assert_eq!(recv_completions.len(), RACE_ITERATIONS);
-    assert_eq!(send_completions.len(), RACE_ITERATIONS);
+    assert_eq!(recv_completions.len(), RACE_ITERATIONS * 2);
+    assert_eq!(send_completions.len(), RACE_ITERATIONS * 2);
     assert_eq!(
         recv_completions
             .iter()
             .map(|completion| completion.wr_id())
             .collect::<HashSet<_>>()
             .len(),
-        RACE_ITERATIONS
+        RACE_ITERATIONS * 2
     );
     assert_eq!(
         send_completions
@@ -109,7 +130,7 @@ async fn readiness_arm_post_race_observes_each_cqe_exactly_once() {
             .map(|completion| completion.wr_id())
             .collect::<HashSet<_>>()
             .len(),
-        RACE_ITERATIONS
+        RACE_ITERATIONS * 2
     );
     assert!(
         recv_completions

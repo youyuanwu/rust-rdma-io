@@ -61,24 +61,31 @@ impl CqReadiness {
         cx: &mut Context<'_>,
         buf: &mut [WorkCompletion],
     ) -> Poll<Result<usize>> {
-        self.poll_with(cq, cx, buf, |cx| notifier.poll_readable(cx))
+        self.poll_with(cq, cx, buf, |cx| notifier.poll_readable(cx), |_| false)
     }
 
-    pub(crate) fn poll_with_async_fd(
+    pub(crate) fn poll_with_async_fd_and_arm_hook(
         &mut self,
         cq: &Cq,
         async_fd: &AsyncFd<RawFd>,
         cx: &mut Context<'_>,
         buf: &mut [WorkCompletion],
+        after_arm: impl FnMut(u64) -> bool,
     ) -> Poll<Result<usize>> {
-        self.poll_with(cq, cx, buf, |cx| match async_fd.poll_read_ready(cx) {
-            Poll::Ready(Ok(mut guard)) => {
-                guard.clear_ready();
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
-            Poll::Pending => Poll::Pending,
-        })
+        self.poll_with(
+            cq,
+            cx,
+            buf,
+            |cx| match async_fd.poll_read_ready(cx) {
+                Poll::Ready(Ok(mut guard)) => {
+                    guard.clear_ready();
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+                Poll::Pending => Poll::Pending,
+            },
+            after_arm,
+        )
     }
 
     fn poll_with(
@@ -87,6 +94,7 @@ impl CqReadiness {
         cx: &mut Context<'_>,
         buf: &mut [WorkCompletion],
         mut poll_readable: impl FnMut(&mut Context<'_>) -> Poll<io::Result<()>>,
+        mut after_arm: impl FnMut(u64) -> bool,
     ) -> Poll<Result<usize>> {
         loop {
             match self.state {
@@ -107,6 +115,9 @@ impl CqReadiness {
                     Ok(()) => {
                         self.arms = self.arms.saturating_add(1);
                         self.state = PollState::PollAfterArm;
+                        if after_arm(self.arms) {
+                            return Poll::Pending;
+                        }
                     }
                     Err(error) => return Poll::Ready(Err(error.into())),
                 },
@@ -128,11 +139,6 @@ impl CqReadiness {
     #[cfg(test)]
     fn state(&self) -> PollState {
         self.state
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn arm_count(&self) -> u64 {
-        self.arms
     }
 
     #[cfg(test)]

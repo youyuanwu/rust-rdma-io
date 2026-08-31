@@ -34,3 +34,7 @@ tracing-subscriber.workspace = true
 
 [build-dependencies]
 tonic-prost-build.workspace = true
+
+[dev-dependencies]
+proc-macro2 = { version = "1", features = ["span-locations"] }
+syn = { version = "2", features = ["full", "visit"] }

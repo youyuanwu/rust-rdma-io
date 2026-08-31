@@ -9,11 +9,11 @@ mod scheduler;
 #[cfg(test)]
 mod api_tests;
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Poll, Waker};
 use std::time::Duration;
+
+use tokio::sync::Notify;
 
 use config::EngineConfig;
 pub use config::{CompletionMode, RdmaConnectionConfig};
@@ -22,8 +22,8 @@ use driver::WorkSignal;
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
 pub use driver::{
-    TestAcceptedOperation, TestConnectionIdentity, TestCqeSuppression, TestEngineQp,
-    TestEngineResources, TestRouteHandle,
+    TestAcceptedOperation, TestConnectionIdentity, TestCqArmWindowControl, TestCqeSuppression,
+    TestEngineQp, TestEngineResources, TestRouteHandle,
 };
 use resources::{EngineResources, ResourceSummary};
 use scheduler::WorkScheduler;
@@ -154,19 +154,20 @@ impl Clone for RdmaEngine {
 
 impl RdmaEngine {
     /// Request graceful shutdown and await the engine driver's result.
+    ///
+    /// Dropping this future removes its `Notify` registration, so cancelled
+    /// shutdown attempts do not accumulate retained task wakers.
     pub async fn shutdown(&self) -> Result<()> {
         self.shared.request_shutdown();
-        std::future::poll_fn(|cx| {
+        loop {
+            let notified = self.shared.terminal_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if let Some(outcome) = self.shared.outcome() {
-                return Poll::Ready(outcome.into_result());
+                return outcome.into_result();
             }
-            self.shared.register_terminal_waiter(cx.waker());
-            match self.shared.outcome() {
-                Some(outcome) => Poll::Ready(outcome.into_result()),
-                None => Poll::Pending,
-            }
-        })
-        .await
+            notified.await;
+        }
     }
 
     /// Return a non-blocking snapshot of lifecycle, terminal, and capacity state.
@@ -206,7 +207,8 @@ pub struct RdmaEngineDriver {
     scheduler: WorkScheduler,
     cq_readiness: crate::v2::completion::CqReadiness,
     cq_buffer: Box<[crate::wc::WorkCompletion]>,
-    time_context_checked: bool,
+    deadline_sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    deadline_at: Option<tokio::time::Instant>,
 }
 
 struct EngineShared {
@@ -216,7 +218,9 @@ struct EngineShared {
     shutdown_requested: AtomicBool,
     frontend_count: AtomicUsize,
     work_signal: WorkSignal,
-    terminal_waiters: Mutex<Vec<Waker>>,
+    // Notify stores only live Notified futures and wakes every concurrent
+    // shutdown waiter without retaining registrations from dropped futures.
+    terminal_notify: Notify,
     terminal: Mutex<Option<EngineOutcome>>,
     driver_yields: AtomicU64,
     #[cfg(any(test, feature = "test-hooks"))]
@@ -234,7 +238,7 @@ impl EngineShared {
             shutdown_requested: AtomicBool::new(false),
             frontend_count: AtomicUsize::new(1),
             work_signal: WorkSignal::new(),
-            terminal_waiters: Mutex::new(Vec::new()),
+            terminal_notify: Notify::new(),
             terminal: Mutex::new(None),
             driver_yields: AtomicU64::new(0),
             #[cfg(any(test, feature = "test-hooks"))]
@@ -249,19 +253,6 @@ impl EngineShared {
             self.transition_shutdown_requested();
         }
         self.work_signal.publish(driver::TERMINAL_WORK);
-    }
-
-    fn register_terminal_waiter(&self, waker: &Waker) {
-        let mut waiters = self
-            .terminal_waiters
-            .lock()
-            .expect("engine terminal waiter list poisoned");
-        if waiters
-            .iter()
-            .all(|registered| !registered.will_wake(waker))
-        {
-            waiters.push(waker.clone());
-        }
     }
 
     fn finish(&self, outcome: EngineOutcome) {
@@ -279,15 +270,7 @@ impl EngineShared {
         *terminal = Some(outcome);
         self.transition_terminal(lifecycle);
         drop(terminal);
-        let waiters: Vec<_> = self
-            .terminal_waiters
-            .lock()
-            .expect("engine terminal waiter list poisoned")
-            .drain(..)
-            .collect();
-        for waiter in waiters {
-            waiter.wake();
-        }
+        self.terminal_notify.notify_waiters();
     }
 
     fn outcome(&self) -> Option<EngineOutcome> {
@@ -406,7 +389,6 @@ impl EngineOutcome {
 #[derive(Clone)]
 enum EngineFailure {
     DriverShutdown,
-    InvalidRuntime(String),
     Progress(String),
     #[cfg(any(test, feature = "test-hooks"))]
     Wedged {
@@ -419,7 +401,6 @@ impl EngineFailure {
     fn into_error(self) -> Error {
         match self {
             Self::DriverShutdown => Error::DriverShutdown,
-            Self::InvalidRuntime(message) => Error::InvalidConfig(message),
             Self::Progress(message) => Error::Verbs(std::io::Error::other(message)),
             #[cfg(any(test, feature = "test-hooks"))]
             Self::Wedged {
@@ -455,16 +436,6 @@ fn preflight_tokio_io() -> Result<()> {
         ));
     }
     Ok(())
-}
-
-fn preflight_tokio_time() -> std::result::Result<(), String> {
-    if tokio::runtime::Handle::try_current().is_err() {
-        return Err("engine driver must be polled inside an active Tokio runtime".into());
-    }
-    match catch_unwind(AssertUnwindSafe(|| tokio::time::sleep(Duration::ZERO))) {
-        Ok(_sleep) => Ok(()),
-        Err(_) => Err("engine driver requires Tokio time support".into()),
-    }
 }
 
 const fn lifecycle_to_u8(lifecycle: RdmaEngineLifecycle) -> u8 {

@@ -97,6 +97,10 @@ impl WorkScheduler {
     pub(super) fn deadlines(&mut self) -> &mut DeadlineQueue {
         &mut self.deadlines
     }
+
+    pub(super) fn next_deadline(&self) -> Option<Instant> {
+        self.deadlines.next()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -189,7 +193,10 @@ impl DeadlineQueue {
     #[allow(dead_code, reason = "deadline insertion begins in Phase 3")]
     pub(super) fn push(&mut self, at: Instant, kind: DeadlineKind, token: u64) {
         let sequence = self.next_sequence;
-        self.next_sequence = self.next_sequence.saturating_add(1);
+        self.next_sequence = self
+            .next_sequence
+            .checked_add(1)
+            .expect("deadline insertion sequence exhausted");
         self.entries.push(Reverse(DeadlineEntry {
             at,
             sequence,

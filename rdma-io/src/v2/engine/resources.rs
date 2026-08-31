@@ -13,6 +13,8 @@ use super::super::pd::Pd;
 use super::config::{CompletionMode, EngineConfig, ProviderLimits};
 
 pub(super) struct EngineResources {
+    // Rust drops fields in declaration order. Keep both Tokio adapters before
+    // the CQ/channel owners whose raw descriptors they register.
     pub(super) cq_async_fd: Option<AsyncFd<RawFd>>,
     pub(super) cm_async_fd: Option<AsyncFd<RawFd>>,
     pub(super) cq: Arc<Cq>,
@@ -86,6 +88,15 @@ impl EngineResources {
             }
             CompletionMode::Polling => (None, None),
         };
+
+        debug_assert_eq!(
+            cq_async_fd.is_some(),
+            config.completion_mode == CompletionMode::Readiness
+        );
+        debug_assert_eq!(
+            cm_async_fd.is_some(),
+            config.completion_mode == CompletionMode::Readiness
+        );
 
         Ok((
             Self {
