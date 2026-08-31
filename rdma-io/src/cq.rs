@@ -29,6 +29,12 @@ impl Drop for CompletionQueue {
             self.inner as usize,
         );
         let ret = unsafe { ibv_destroy_cq(self.inner) };
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::test_support::destruction::record_result(
+            crate::test_support::destruction::DestructionKind::CompletionQueue,
+            self.inner as usize,
+            ret,
+        );
         if ret != 0 {
             tracing::error!(
                 "ibv_destroy_cq failed: {}",

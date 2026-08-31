@@ -374,17 +374,44 @@ impl OperationState {
         }
     }
 
-    fn mark_quarantined(&self) -> bool {
+    pub(super) fn mark_quarantined(&self) -> QuarantineTransition {
         let mut inner = lock_unpoison(&self.inner);
+        let was_reclaiming = inner.reclamation_pending;
         match inner.lifecycle {
-            OperationLifecycle::Cancelled | OperationLifecycle::Reclaiming => {
+            OperationLifecycle::InFlight
+            | OperationLifecycle::Cancelled
+            | OperationLifecycle::Reclaiming => {
                 inner.lifecycle = OperationLifecycle::Quarantined;
                 inner.reclamation_pending = false;
-                self.quarantined.store(true, Ordering::Release);
-                true
+                QuarantineTransition {
+                    newly_quarantined: !self.quarantined.swap(true, Ordering::AcqRel),
+                    was_reclaiming,
+                }
             }
-            _ => false,
+            _ => QuarantineTransition {
+                newly_quarantined: false,
+                was_reclaiming: false,
+            },
         }
+    }
+
+    pub(super) fn fail_observer_for_close(&self, error: Error) -> bool {
+        let mut inner = lock_unpoison(&self.inner);
+        if !inner.detached
+            && inner.output.is_none()
+            && matches!(
+                inner.lifecycle,
+                OperationLifecycle::InFlight
+                    | OperationLifecycle::Cancelled
+                    | OperationLifecycle::Reclaiming
+                    | OperationLifecycle::Quarantined
+            )
+        {
+            inner.detached = true;
+            inner.output = Some((Err(error), None));
+            return true;
+        }
+        false
     }
 
     fn finish_completion(&self, completion: WorkCompletion) -> FinishState {
@@ -485,6 +512,11 @@ enum CompletionDisposition {
 struct FinishState {
     was_reclaiming: bool,
     was_quarantined: bool,
+}
+
+pub(super) struct QuarantineTransition {
+    pub(super) newly_quarantined: bool,
+    pub(super) was_reclaiming: bool,
 }
 
 pub(super) struct TerminalizeState {
@@ -702,6 +734,10 @@ fn start_operation(
             .fetch_add(1, Ordering::Relaxed);
         return StartResult::Immediate((Err(Error::CapacityExhausted), state.take_mr()));
     }
+    shared
+        .diagnostic_counters
+        .cq_credits_reserved
+        .fetch_add(1, Ordering::Relaxed);
 
     shared
         .diagnostic_counters
@@ -712,6 +748,10 @@ fn start_operation(
         Err(error) => {
             let state = shared.operations.release(token, false).unwrap_or(state);
             shared.cq_credits.release();
+            shared
+                .diagnostic_counters
+                .cq_credits_rolled_back
+                .fetch_add(1, Ordering::Relaxed);
             connection.release_local(direction);
             return StartResult::Immediate((Err(error), state.take_mr()));
         }
@@ -747,6 +787,10 @@ fn start_operation(
                 BatchWrAccounting::exact_prefix(1, accepted).record(shared);
                 let state = shared.operations.release(token, false).unwrap_or(state);
                 shared.cq_credits.release();
+                shared
+                    .diagnostic_counters
+                    .cq_credits_rolled_back
+                    .fetch_add(1, Ordering::Relaxed);
                 connection.release_local(direction);
                 StartResult::Immediate((Err(Error::PostFailed(source)), state.take_mr()))
             }
@@ -972,6 +1016,9 @@ impl EngineShared {
         let removed = operation.connection.remove_accepted(operation.token);
         operation.connection.release_local(operation.direction);
         self.cq_credits.release();
+        self.diagnostic_counters
+            .cq_credits_released
+            .fetch_add(1, Ordering::Relaxed);
         let previous = self.accepted_operations.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0, "accepted operation count must be positive");
         if previous == 1 && self.shutdown_requested.load(Ordering::Acquire) {
@@ -998,6 +1045,8 @@ impl EngineShared {
             && operation.connection.close_started()
             && operation.connection.accepted_count() == 0
         {
+            self.recover_connection_quarantine(&operation.connection);
+            self.record_connection_drained(&operation.connection);
             self.schedule_connection_retirement(&operation.connection);
         }
     }
@@ -1009,31 +1058,33 @@ impl EngineShared {
     }
 
     pub(super) fn handle_reclamation_deadline(&self, token: OperationToken) {
-        let Lookup::Occupied(operation) = self.operations.lookup(token) else {
-            return;
-        };
-        if !operation.mark_quarantined() {
-            return;
+        if self.quarantine_operation(token) {
+            self.diagnostic_counters
+                .reclamation_deadlines
+                .fetch_add(1, Ordering::Relaxed);
         }
-        self.pending_reclamations.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    pub(super) fn quarantine_operation(&self, token: OperationToken) -> bool {
+        let Lookup::Occupied(operation) = self.operations.lookup(token) else {
+            return false;
+        };
+        let transition = operation.mark_quarantined();
+        if !transition.newly_quarantined {
+            return false;
+        }
+        if transition.was_reclaiming {
+            self.pending_reclamations.fetch_sub(1, Ordering::AcqRel);
+        }
         self.quarantined_operations.fetch_add(1, Ordering::AcqRel);
         self.quarantined_mrs.fetch_add(1, Ordering::AcqRel);
         self.quarantined_bytes
             .fetch_add(operation.mr_len, Ordering::AcqRel);
         self.cq_credits.retain();
         self.diagnostic_counters
-            .reclamation_deadlines
+            .cq_credits_retained
             .fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub(super) fn handle_connection_drain_deadline(&self, token: ConnectionToken) {
-        let Lookup::Occupied(connection) = self.connections.lookup(token) else {
-            return;
-        };
-        connection.apply_drain_deadline();
-        if connection.close_started() && connection.accepted_count() == 0 {
-            self.schedule_connection_retirement(&connection);
-        }
+        true
     }
 }
 

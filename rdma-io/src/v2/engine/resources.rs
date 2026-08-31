@@ -26,22 +26,32 @@ pub(super) struct EngineResources {
 
 #[derive(Clone)]
 pub(super) struct EngineResourceRefs {
+    #[allow(dead_code, reason = "retains the shared CQ for connection descendants")]
+    pub(super) cq: Arc<Cq>,
+    pub(super) pd: Pd,
+    #[allow(
+        dead_code,
+        reason = "keeps the shared CM fd alive until after CQ and PD teardown"
+    )]
+    pub(super) cm_event_channel: Arc<EventChannel>,
     #[allow(
         dead_code,
         reason = "retains the anchored context for connection descendants"
     )]
     pub(super) context: Context,
-    pub(super) pd: Pd,
-    #[allow(dead_code, reason = "retains the shared CQ for connection descendants")]
-    pub(super) cq: Arc<Cq>,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
 #[derive(Clone)]
 pub(super) struct TestResourceRefs {
-    pub(super) context: Context,
-    pub(super) pd: Pd,
     pub(super) cq: Arc<Cq>,
+    pub(super) pd: Pd,
+    #[allow(
+        dead_code,
+        reason = "keeps canonical root order while safe test leases are live"
+    )]
+    pub(super) cm_event_channel: Arc<EventChannel>,
+    pub(super) context: Context,
 }
 
 #[derive(Clone, Copy)]
@@ -128,23 +138,39 @@ impl EngineResources {
 
     pub(super) fn connection_resource_refs(&self) -> EngineResourceRefs {
         EngineResourceRefs {
-            context: self.context.clone(),
-            pd: self.pd.clone(),
             cq: Arc::clone(&self.cq),
+            pd: self.pd.clone(),
+            cm_event_channel: Arc::clone(&self.cm_event_channel),
+            context: self.context.clone(),
         }
     }
 
     pub(super) fn drop_readiness_adapters(&mut self) {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(adapter) = self.cq_async_fd.as_ref() {
+            crate::test_support::destruction::record(
+                crate::test_support::destruction::DestructionKind::CqReadinessAdapter,
+                *adapter.get_ref() as usize,
+            );
+        }
         self.cq_async_fd.take();
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(adapter) = self.cm_async_fd.as_ref() {
+            crate::test_support::destruction::record(
+                crate::test_support::destruction::DestructionKind::CmReadinessAdapter,
+                *adapter.get_ref() as usize,
+            );
+        }
         self.cm_async_fd.take();
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub(super) fn test_resource_refs(&self) -> TestResourceRefs {
         TestResourceRefs {
-            context: self.context.clone(),
-            pd: self.pd.clone(),
             cq: Arc::clone(&self.cq),
+            pd: self.pd.clone(),
+            cm_event_channel: Arc::clone(&self.cm_event_channel),
+            context: self.context.clone(),
         }
     }
 }
@@ -174,6 +200,9 @@ fn try_async_fd(fd: RawFd, resource: &str) -> Result<AsyncFd<RawFd>> {
         })
     }
 }
+
+#[cfg(test)]
+mod drop_tests;
 
 #[cfg(test)]
 mod tests {

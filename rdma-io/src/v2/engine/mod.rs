@@ -4,7 +4,9 @@ mod cm;
 mod config;
 mod connection;
 mod diagnostics;
+mod drain;
 mod driver;
+mod lifecycle;
 mod listener;
 mod operation;
 mod registry;
@@ -25,7 +27,7 @@ use tokio::sync::Notify;
 
 use config::EngineConfig;
 pub use config::{CompletionMode, RdmaConnectionConfig};
-use connection::{ConnectionAdmissionPool, ConnectionState};
+use connection::ConnectionAdmissionPool;
 pub use connection::{RdmaConnection, RdmaConnectionIdentity};
 use diagnostics::DiagnosticsState;
 pub use diagnostics::{RdmaEngineDiagnostics, RdmaEngineLifecycle, RdmaEngineTerminalError};
@@ -33,15 +35,14 @@ use driver::WorkSignal;
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
 pub use driver::{
-    TestAcceptedOperation, TestAdmissionBarrier, TestConnectionIdentity, TestCqArmWindowControl,
-    TestCqeSuppression, TestEngineQp, TestEngineResources, TestRouteHandle,
+    TestAcceptedOperation, TestAdmissionBarrier, TestConnectionCqeSuppression,
+    TestConnectionIdentity, TestCqArmWindowControl, TestCqeSuppression, TestEngineQp,
+    TestEngineResources, TestRouteHandle,
 };
 pub use listener::{RdmaListener, RdmaListenerConfig};
 pub use operation::RdmaOperation;
 use operation::{CqCreditPool, OperationRegistry};
-use registry::{
-    ConnectionRegistry, ConnectionToken, OperationToken, lock_unpoison, write_unpoison,
-};
+use registry::{ConnectionRegistry, OperationToken, lock_unpoison, write_unpoison};
 use resources::{EngineResourceRefs, EngineResources, ResourceSummary};
 use scheduler::WorkScheduler;
 use scheduler::{DeadlineKind, DeadlineRequest};
@@ -197,7 +198,9 @@ impl RdmaEngine {
     /// Request graceful shutdown and await the engine driver's result.
     ///
     /// Dropping this future removes its `Notify` registration, so cancelled
-    /// shutdown attempts do not accumulate retained task wakers.
+    /// shutdown attempts do not accumulate retained task wakers. The default
+    /// deadline is 30 seconds; unresolved accepted WR bundles return
+    /// [`Error::EngineWedged`] and remain retained fail-closed.
     pub async fn shutdown(&self) -> Result<()> {
         self.shared.request_shutdown();
         loop {
@@ -279,6 +282,11 @@ impl Drop for RdmaEngine {
 /// only on registered event sources and published software work; polling mode
 /// performs one bounded nonblocking iteration followed by a cooperative yield.
 /// Dropping the driver publishes a terminal failure and wakes observed waiters.
+/// Drop performs one bounded pass over registered connections, with at most
+/// one QP ERR transition and one zero-outstanding QP destroy attempt per
+/// connection. Individual verbs/librdmacm destructors have no wall-clock
+/// guarantee, so latency-sensitive runtimes should await graceful shutdown
+/// before dropping or aborting the driver task.
 ///
 /// With `panic=abort`, polling deliberately skips Tokio's panic-based optional
 /// time-driver probe. Polling without an armed deadline therefore works on any
@@ -312,11 +320,14 @@ struct EngineShared {
     quarantined_operations: AtomicUsize,
     quarantined_mrs: AtomicUsize,
     quarantined_bytes: AtomicUsize,
+    draining_connections: AtomicUsize,
+    quarantined_connections: AtomicUsize,
     ready_queue_depth: AtomicUsize,
     deadline_requests: Mutex<VecDeque<DeadlineRequest>>,
     admission: RwLock<()>,
     lifecycle: AtomicU8,
     shutdown_requested: AtomicBool,
+    shutdown_deadline_scheduled: AtomicBool,
     shutdown_connection_close_started: AtomicBool,
     failure_retained: AtomicBool,
     frontend_count: AtomicUsize,
@@ -360,11 +371,14 @@ impl EngineShared {
             quarantined_operations: AtomicUsize::new(0),
             quarantined_mrs: AtomicUsize::new(0),
             quarantined_bytes: AtomicUsize::new(0),
+            draining_connections: AtomicUsize::new(0),
+            quarantined_connections: AtomicUsize::new(0),
             ready_queue_depth: AtomicUsize::new(0),
             deadline_requests: Mutex::new(VecDeque::new()),
             admission: RwLock::new(()),
             lifecycle: AtomicU8::new(lifecycle_to_u8(RdmaEngineLifecycle::Created)),
             shutdown_requested: AtomicBool::new(false),
+            shutdown_deadline_scheduled: AtomicBool::new(false),
             shutdown_connection_close_started: AtomicBool::new(false),
             failure_retained: AtomicBool::new(false),
             frontend_count: AtomicUsize::new(1),
@@ -386,13 +400,26 @@ impl EngineShared {
             let _admission = write_unpoison(&self.admission);
             if !self.shutdown_requested.swap(true, Ordering::AcqRel) {
                 self.transition_shutdown_requested();
+                self.diagnostic_counters
+                    .shutdowns
+                    .fetch_add(1, Ordering::Relaxed);
             }
+        }
+        if !self
+            .shutdown_deadline_scheduled
+            .swap(true, Ordering::AcqRel)
+        {
+            self.schedule_deadline(
+                DeadlineKind::EngineShutdown,
+                0,
+                self.config.shutdown_deadline,
+            );
         }
         self.work_signal.publish(driver::TERMINAL_WORK);
     }
 
     fn finish(&self, outcome: EngineOutcome) {
-        let (operations_to_wake, connections_to_wake, force_connection_error) = {
+        let (operations_to_wake, connections_to_wake) = {
             let _admission = write_unpoison(&self.admission);
             let mut terminal = lock_unpoison(&self.terminal);
             if terminal.is_some() {
@@ -420,6 +447,9 @@ impl EngineShared {
                         self.quarantined_bytes
                             .fetch_add(operation.mr_len, Ordering::AcqRel);
                         self.cq_credits.retain();
+                        self.diagnostic_counters
+                            .cq_credits_retained
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                     if terminalized.should_wake {
                         operations_to_wake.push(operation);
@@ -428,14 +458,21 @@ impl EngineShared {
             }
 
             let connections_to_wake = self.connections.occupied();
-            let force_error = matches!(outcome, EngineOutcome::Failure(_));
             drop(terminal);
-            (operations_to_wake, connections_to_wake, force_error)
+            (operations_to_wake, connections_to_wake)
         };
 
         self.cm.terminalize(&outcome);
         for connection in &connections_to_wake {
-            connection.finalize_engine(force_connection_error);
+            if matches!(outcome, EngineOutcome::Failure(_))
+                && connection.retain_bundle_for_engine_failure()
+            {
+                self.quarantined_connections.fetch_add(1, Ordering::AcqRel);
+                self.diagnostic_counters
+                    .connections_quarantined
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            connection.finalize_engine(&outcome);
         }
         for operation in operations_to_wake {
             operation.wake();
@@ -570,6 +607,15 @@ impl EngineShared {
             shared_cm_event_channels: self.resources.cm_event_channels,
             driver_yields: self.driver_yields.load(Ordering::Acquire),
             live_connection_reservations: self.connection_admission.used(),
+            draining_connection_reservations: self.draining_connections.load(Ordering::Acquire),
+            quarantined_connection_reservations: self
+                .quarantined_connections
+                .load(Ordering::Acquire),
+            registered_live_qps: self
+                .connections
+                .live()
+                .saturating_sub(self.quarantined_connections.load(Ordering::Acquire)),
+            registered_quarantined_qps: self.quarantined_connections.load(Ordering::Acquire),
             free_connection_slots: self.connections.free(),
             retired_connection_slots: self.connections.retired(),
             registered_operations: self.operations.live(),
@@ -677,9 +723,59 @@ impl EngineShared {
                 .diagnostic_counters
                 .connections_opened
                 .load(Ordering::Acquire),
+            connections_drain_started: self
+                .diagnostic_counters
+                .connections_drain_started
+                .load(Ordering::Acquire),
+            connections_drained: self
+                .diagnostic_counters
+                .connections_drained
+                .load(Ordering::Acquire),
+            connections_closed: self
+                .diagnostic_counters
+                .connections_closed
+                .load(Ordering::Acquire),
+            connections_quarantined: self
+                .diagnostic_counters
+                .connections_quarantined
+                .load(Ordering::Acquire),
             connections_failed: self
                 .diagnostic_counters
                 .connections_failed
+                .load(Ordering::Acquire),
+            qp_error_transitions: self
+                .diagnostic_counters
+                .qp_error_transitions
+                .load(Ordering::Acquire),
+            qp_destroys: self.diagnostic_counters.qp_destroys.load(Ordering::Acquire),
+            quarantine_recoveries: self
+                .diagnostic_counters
+                .quarantine_recoveries
+                .load(Ordering::Acquire),
+            connection_quarantine_outcomes: self
+                .diagnostic_counters
+                .connection_quarantine_outcomes
+                .load(Ordering::Acquire),
+            shutdowns: self.diagnostic_counters.shutdowns.load(Ordering::Acquire),
+            engine_wedges: self
+                .diagnostic_counters
+                .engine_wedges
+                .load(Ordering::Acquire),
+            cq_credits_reserved: self
+                .diagnostic_counters
+                .cq_credits_reserved
+                .load(Ordering::Acquire),
+            cq_credits_rolled_back: self
+                .diagnostic_counters
+                .cq_credits_rolled_back
+                .load(Ordering::Acquire),
+            cq_credits_released: self
+                .diagnostic_counters
+                .cq_credits_released
+                .load(Ordering::Acquire),
+            cq_credits_retained: self
+                .diagnostic_counters
+                .cq_credits_retained
                 .load(Ordering::Acquire),
             listeners_created: self
                 .diagnostic_counters
@@ -783,50 +879,6 @@ impl EngineShared {
         );
     }
 
-    fn begin_connection_close(&self, connection: &Arc<ConnectionState>, force_error: bool) {
-        if connection.is_retired() {
-            return;
-        }
-        let first = connection.begin_close();
-        if force_error {
-            let _ = connection.transition_to_error_once();
-        }
-        if first {
-            self.schedule_connection_drain(connection.token);
-        }
-        if connection.accepted_count() == 0 {
-            self.schedule_connection_retirement(connection);
-        }
-    }
-
-    fn begin_all_connection_close(&self) {
-        if self
-            .shutdown_connection_close_started
-            .swap(true, Ordering::AcqRel)
-        {
-            return;
-        }
-        for connection in self.connections.occupied() {
-            self.begin_connection_close(&connection, true);
-        }
-    }
-
-    fn schedule_connection_retirement(&self, connection: &ConnectionState) {
-        if connection.is_retired() || !connection.try_request_retirement() {
-            return;
-        }
-        self.cm.enqueue_retirement(connection.token);
-        self.work_signal.publish(cm::CM_WORK);
-    }
-
-    fn schedule_connection_drain(&self, token: ConnectionToken) {
-        self.schedule_deadline(
-            DeadlineKind::ConnectionDrain,
-            token.encode(),
-            self.config.connection_drain_deadline,
-        );
-    }
-
     fn schedule_deadline(&self, kind: DeadlineKind, token: u64, after: Duration) {
         let now = tokio::time::Instant::now();
         let at = now.checked_add(after).unwrap_or(now);
@@ -870,7 +922,7 @@ impl EngineOutcome {
 #[derive(Clone)]
 enum EngineFailure {
     DriverShutdown,
-    Progress(String),
+    Progress(Error),
     Wedged {
         retained_bundles: usize,
         outstanding_operations: usize,
@@ -881,7 +933,7 @@ impl EngineFailure {
     fn into_error(self) -> Error {
         match self {
             Self::DriverShutdown => Error::DriverShutdown,
-            Self::Progress(message) => Error::Verbs(std::io::Error::other(message)),
+            Self::Progress(error) => error,
             Self::Wedged {
                 retained_bundles,
                 outstanding_operations,
@@ -904,6 +956,20 @@ impl EngineFailure {
             }
             .into(),
             message: error.to_string(),
+        }
+    }
+
+    fn from_progress(error: Error) -> Self {
+        match error {
+            Error::EngineWedged {
+                retained_bundles,
+                outstanding_operations,
+                ..
+            } => Self::Wedged {
+                retained_bundles,
+                outstanding_operations,
+            },
+            error => Self::Progress(error),
         }
     }
 }

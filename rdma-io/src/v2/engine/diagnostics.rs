@@ -57,6 +57,14 @@ pub struct RdmaEngineDiagnostics {
     pub driver_yields: u64,
     /// Current aggregate connection reservations.
     pub live_connection_reservations: usize,
+    /// Reservations whose connections have stopped posting and are draining.
+    pub draining_connection_reservations: usize,
+    /// Draining reservations retained after a connection deadline.
+    pub quarantined_connection_reservations: usize,
+    /// Registered QPs that are not currently quarantined.
+    pub registered_live_qps: usize,
+    /// Registered QPs retained in whole-bundle quarantine.
+    pub registered_quarantined_qps: usize,
     /// Connection slots still available for this engine instance.
     pub free_connection_slots: usize,
     /// Connection slots permanently retired after generation exhaustion.
@@ -139,8 +147,36 @@ pub struct RdmaEngineDiagnostics {
     pub cq_capacity_exhausted: u64,
     /// Outbound connections that reached RDMA-CM ESTABLISHED.
     pub connections_opened: u64,
+    /// Connections that atomically stopped posting and entered drain.
+    pub connections_drain_started: u64,
+    /// Connections whose accepted outstanding set reached zero.
+    pub connections_drained: u64,
+    /// Connections that completed QP/CM destruction and generation retirement.
+    pub connections_closed: u64,
+    /// Connections retained in whole-bundle quarantine.
+    pub connections_quarantined: u64,
     /// Outbound connections or requests terminated by CM/setup failure.
     pub connections_failed: u64,
+    /// Local QP transitions to ERR initiated by lifecycle teardown.
+    pub qp_error_transitions: u64,
+    /// Synchronous consuming `rdma_destroy_qp` invocations at zero outstanding.
+    pub qp_destroys: u64,
+    /// Quarantined connections later recovered by exact CQE routing.
+    pub quarantine_recoveries: u64,
+    /// Connection-local `ConnectionQuarantined` outcomes published.
+    pub connection_quarantine_outcomes: u64,
+    /// Graceful shutdown requests accepted by the admission barrier.
+    pub shutdowns: u64,
+    /// Engine-wide `EngineWedged` terminal outcomes.
+    pub engine_wedges: u64,
+    /// CQ admission credits reserved before provider posting.
+    pub cq_credits_reserved: u64,
+    /// CQ credits rolled back for provider-proven unaccepted WRs.
+    pub cq_credits_rolled_back: u64,
+    /// CQ credits released after exact validated CQEs.
+    pub cq_credits_released: u64,
+    /// CQ credits marked retained by quarantine.
+    pub cq_credits_retained: u64,
     /// Listeners successfully created on the shared CM channel.
     pub listeners_created: u64,
     /// Inbound children that reached RDMA-CM ESTABLISHED.
@@ -230,7 +266,21 @@ pub(super) struct DiagnosticsState {
     pub(super) operation_capacity_exhausted: AtomicU64,
     pub(super) cq_capacity_exhausted: AtomicU64,
     pub(super) connections_opened: AtomicU64,
+    pub(super) connections_drain_started: AtomicU64,
+    pub(super) connections_drained: AtomicU64,
+    pub(super) connections_closed: AtomicU64,
+    pub(super) connections_quarantined: AtomicU64,
     pub(super) connections_failed: AtomicU64,
+    pub(super) qp_error_transitions: AtomicU64,
+    pub(super) qp_destroys: AtomicU64,
+    pub(super) quarantine_recoveries: AtomicU64,
+    pub(super) connection_quarantine_outcomes: AtomicU64,
+    pub(super) shutdowns: AtomicU64,
+    pub(super) engine_wedges: AtomicU64,
+    pub(super) cq_credits_reserved: AtomicU64,
+    pub(super) cq_credits_rolled_back: AtomicU64,
+    pub(super) cq_credits_released: AtomicU64,
+    pub(super) cq_credits_retained: AtomicU64,
     pub(super) listeners_created: AtomicU64,
     pub(super) inbound_requests_accepted: AtomicU64,
     pub(super) inbound_requests_rejected: AtomicU64,

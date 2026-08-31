@@ -4,7 +4,7 @@ use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard};
 
 use tokio::sync::Notify;
 
@@ -123,12 +123,11 @@ impl RdmaConnection {
     /// A successful close retires the CM route and connection registry
     /// generation, destroys the QP before its CM ID, and returns aggregate
     /// admission once. A drain timeout retains every unresolved operation, MR,
-    /// registration, and CQ credit in the quarantined connection bundle.
+    /// registration, and CQ credit in the quarantined connection bundle. The
+    /// default deadline is five seconds, and its typed quarantine result is
+    /// permanently memoized even if exact late CQEs later recover the bundle.
     pub async fn close(&self) -> Result<()> {
-        self.shared.begin_connection_close(&self.state, false);
-        if let Some(outcome) = self.shared.outcome() {
-            return outcome.into_result();
-        }
+        self.shared.begin_connection_close(&self.state);
         loop {
             let notified = self.state.close_notify.notified();
             tokio::pin!(notified);
@@ -164,7 +163,7 @@ impl Drop for RdmaConnection {
         let previous = self.state.frontend_count.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0, "connection frontend count must be positive");
         if previous == 1 && !self.state.is_retired() {
-            self.shared.begin_connection_close(&self.state, true);
+            self.shared.begin_connection_close(&self.state);
         }
     }
 }
@@ -178,17 +177,20 @@ pub(super) struct ConnectionState {
     peer_addr: Option<SocketAddr>,
     posting_open: AtomicBool,
     posting_gate: RwLock<()>,
+    lifecycle_gate: Mutex<()>,
     local_credits: Mutex<LocalCredits>,
-    accepted: Mutex<HashSet<OperationToken>>,
+    accepted: Mutex<HashSet<AcceptedWrIdentity>>,
     completions: Mutex<VecDeque<WorkCompletion>>,
     close_started: AtomicBool,
     close_outcome: Mutex<Option<CloseOutcome>>,
     close_notify: Notify,
     quarantined: AtomicBool,
     error_transition_started: AtomicBool,
+    error_transition_complete: AtomicBool,
     frontend_count: AtomicUsize,
     retirement_requested: AtomicBool,
     retirement_started: AtomicBool,
+    drained_recorded: AtomicBool,
     retired: AtomicBool,
     admission: Mutex<Option<ConnectionReservation>>,
     cm_route: Option<ConnectionCmRoute>,
@@ -213,6 +215,7 @@ impl ConnectionState {
             peer_addr,
             posting_open: AtomicBool::new(true),
             posting_gate: RwLock::new(()),
+            lifecycle_gate: Mutex::new(()),
             local_credits: Mutex::new(LocalCredits::default()),
             accepted: Mutex::new(HashSet::new()),
             completions: Mutex::new(VecDeque::new()),
@@ -221,9 +224,11 @@ impl ConnectionState {
             close_notify: Notify::new(),
             quarantined: AtomicBool::new(false),
             error_transition_started: AtomicBool::new(false),
+            error_transition_complete: AtomicBool::new(false),
             frontend_count: AtomicUsize::new(1),
             retirement_requested: AtomicBool::new(false),
             retirement_started: AtomicBool::new(false),
+            drained_recorded: AtomicBool::new(false),
             retired: AtomicBool::new(false),
             admission: Mutex::new(admission),
             cm_route,
@@ -276,15 +281,30 @@ impl ConnectionState {
     }
 
     pub(super) fn add_accepted(&self, token: OperationToken) {
-        lock_unpoison(&self.accepted).insert(token);
+        lock_unpoison(&self.accepted).insert(AcceptedWrIdentity {
+            connection: self.token,
+            qp_num: self.qp_num,
+            operation: token,
+        });
     }
 
     pub(super) fn remove_accepted(&self, token: OperationToken) -> bool {
-        let removed = lock_unpoison(&self.accepted).remove(&token);
+        let removed = lock_unpoison(&self.accepted).remove(&AcceptedWrIdentity {
+            connection: self.token,
+            qp_num: self.qp_num,
+            operation: token,
+        });
         if removed {
             self.close_notify.notify_waiters();
         }
         removed
+    }
+
+    pub(super) fn accepted_tokens(&self) -> Vec<OperationToken> {
+        lock_unpoison(&self.accepted)
+            .iter()
+            .map(|identity| identity.operation)
+            .collect()
     }
 
     pub(super) fn accepted_count(&self) -> usize {
@@ -308,34 +328,47 @@ impl ConnectionState {
         self.posting_open.store(false, Ordering::Release);
     }
 
-    pub(super) fn finalize_engine(&self, force_error: bool) {
+    pub(super) fn lock_lifecycle(&self) -> MutexGuard<'_, ()> {
+        lock_unpoison(&self.lifecycle_gate)
+    }
+
+    pub(super) fn finalize_engine(&self, outcome: &super::EngineOutcome) {
         self.stop_posting();
-        if force_error {
-            let _ = self.transition_to_error_once();
+        let _ = self.transition_to_error_once();
+        if let Some(error) = outcome.clone().into_result().err() {
+            let mut close_outcome = lock_unpoison(&self.close_outcome);
+            if close_outcome.is_none() {
+                *close_outcome = Some(CloseOutcome::Failed(error));
+            }
         }
     }
 
     pub(super) fn mark_disconnected(&self) {
         self.stop_posting();
-        let _ = self.transition_to_error_once();
     }
 
-    pub(super) fn mark_cm_failure(&self, message: String) {
+    pub(super) fn mark_cm_failure(&self, error: Error) {
         self.stop_posting();
-        let _ = self.transition_to_error_once();
         let mut outcome = lock_unpoison(&self.close_outcome);
         if outcome.is_none() {
-            *outcome = Some(CloseOutcome::Failed(Arc::from(message)));
+            *outcome = Some(CloseOutcome::Failed(error));
         }
         drop(outcome);
         self.close_notify.notify_waiters();
     }
 
-    pub(super) fn transition_to_error_once(&self) -> Result<()> {
+    pub(super) fn transition_to_error_once(&self) -> Result<bool> {
         if self.error_transition_started.swap(true, Ordering::AcqRel) {
-            return Ok(());
+            return Ok(false);
         }
-        self.poster.to_error()
+        self.poster.to_error()?;
+        self.error_transition_complete
+            .store(true, Ordering::Release);
+        Ok(true)
+    }
+
+    pub(super) fn error_transition_complete(&self) -> bool {
+        self.error_transition_complete.load(Ordering::Acquire)
     }
 
     pub(super) fn destroy_connection_resources(&self) -> Option<SharedCmId> {
@@ -353,13 +386,15 @@ impl ConnectionState {
         self.close_notify.notify_waiters();
     }
 
-    pub(super) fn apply_drain_deadline(&self) {
+    pub(super) fn apply_drain_deadline(&self) -> Option<(usize, usize)> {
         let accepted = lock_unpoison(&self.accepted);
         let outstanding = accepted.len();
         if outstanding == 0 {
-            return;
+            return None;
         }
-        self.quarantined.store(true, Ordering::Release);
+        if self.quarantined.swap(true, Ordering::AcqRel) {
+            return None;
+        }
         let mut outcome = lock_unpoison(&self.close_outcome);
         if outcome.is_none() {
             *outcome = Some(CloseOutcome::Quarantined {
@@ -370,6 +405,15 @@ impl ConnectionState {
         drop(accepted);
         drop(outcome);
         self.close_notify.notify_waiters();
+        Some((outstanding, outstanding))
+    }
+
+    pub(super) fn recover_quarantine(&self) -> bool {
+        self.quarantined.swap(false, Ordering::AcqRel)
+    }
+
+    pub(super) fn retain_bundle_for_engine_failure(&self) -> bool {
+        self.accepted_count() != 0 && !self.quarantined.swap(true, Ordering::AcqRel)
     }
 
     pub(super) fn finish_retirement(&self) {
@@ -382,12 +426,13 @@ impl ConnectionState {
         self.close_notify.notify_waiters();
     }
 
-    pub(super) fn fail_retirement(&self, message: String) {
+    pub(super) fn fail_retirement(&self, error: Error) {
         self.stop_posting();
-        let _ = self.transition_to_error_once();
         self.release_admission();
         let mut outcome = lock_unpoison(&self.close_outcome);
-        *outcome = Some(CloseOutcome::Failed(Arc::from(message)));
+        if !matches!(*outcome, Some(CloseOutcome::Quarantined { .. })) {
+            *outcome = Some(CloseOutcome::Failed(error));
+        }
         drop(outcome);
         self.retired.store(true, Ordering::Release);
         self.close_notify.notify_waiters();
@@ -399,6 +444,20 @@ impl ConnectionState {
             Some(CloseOutcome::Quarantined { .. }) => outcome,
             Some(_) if self.is_retired() => outcome,
             _ => None,
+        }
+    }
+
+    pub(super) fn operation_close_error(&self) -> Error {
+        match lock_unpoison(&self.close_outcome).clone() {
+            Some(CloseOutcome::Failed(error)) => error,
+            Some(CloseOutcome::Quarantined {
+                outstanding,
+                cq_debt,
+            }) => Error::ConnectionQuarantined {
+                outstanding_operations: outstanding,
+                cq_debt,
+            },
+            Some(CloseOutcome::Success) | None => Error::TransportClosed,
         }
     }
 
@@ -427,6 +486,10 @@ impl ConnectionState {
         self.retired.load(Ordering::Acquire)
     }
 
+    pub(super) fn mark_drained_once(&self) -> bool {
+        !self.drained_recorded.swap(true, Ordering::AcqRel)
+    }
+
     pub(super) fn cm_route(&self) -> Option<ConnectionCmRoute> {
         self.cm_route
     }
@@ -440,7 +503,7 @@ impl ConnectionState {
 enum CloseOutcome {
     Success,
     Quarantined { outstanding: usize, cq_debt: usize },
-    Failed(Arc<str>),
+    Failed(Error),
 }
 
 impl CloseOutcome {
@@ -454,9 +517,16 @@ impl CloseOutcome {
                 outstanding_operations: outstanding,
                 cq_debt,
             }),
-            Self::Failed(message) => Err(Error::Verbs(std::io::Error::other(message.to_string()))),
+            Self::Failed(error) => Err(error),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) struct AcceptedWrIdentity {
+    pub(super) connection: ConnectionToken,
+    pub(super) qp_num: u32,
+    pub(super) operation: OperationToken,
 }
 
 pub(super) struct ConnectionAdmissionPool {
@@ -969,5 +1039,15 @@ mod tests {
         let _: fn(&RdmaConnection) -> RdmaConnectionIdentity = RdmaConnection::identity;
         let _: fn(&RdmaConnection) -> Result<SocketAddr> = RdmaConnection::local_addr;
         let _: fn(&RdmaConnection) -> Result<SocketAddr> = RdmaConnection::peer_addr;
+    }
+
+    #[test]
+    fn memoized_close_failure_preserves_its_typed_error() {
+        let outcome = CloseOutcome::Failed(Error::InvalidConfig("typed close failure".into()));
+        for result in [outcome.clone().into_result(), outcome.into_result()] {
+            assert!(
+                matches!(result, Err(Error::InvalidConfig(ref message)) if message == "typed close failure")
+            );
+        }
     }
 }

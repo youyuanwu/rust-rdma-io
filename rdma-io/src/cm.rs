@@ -248,7 +248,19 @@ impl CmEvent {
     /// Acknowledge and consume this event, preserving acknowledgement errors.
     pub(crate) fn ack_checked(mut self) -> Result<()> {
         let event = std::mem::replace(&mut self.inner, std::ptr::null_mut());
-        from_ret_errno(unsafe { rdma_ack_cm_event(event) })
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::test_support::destruction::record(
+            crate::test_support::destruction::DestructionKind::CmEventAck,
+            event as usize,
+        );
+        let ret = unsafe { rdma_ack_cm_event(event) };
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::test_support::destruction::record_result(
+            crate::test_support::destruction::DestructionKind::CmEventAck,
+            event as usize,
+            ret,
+        );
+        from_ret_errno(ret)
     }
 
     /// Acknowledge and consume this event. Must be called for every event.
@@ -265,7 +277,19 @@ impl Drop for CmEvent {
             return;
         }
         // If not ack'd, ack now to avoid leaking the event.
-        let ret = unsafe { rdma_ack_cm_event(self.inner) };
+        let event = self.inner;
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::test_support::destruction::record(
+            crate::test_support::destruction::DestructionKind::CmEventAck,
+            event as usize,
+        );
+        let ret = unsafe { rdma_ack_cm_event(event) };
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::test_support::destruction::record_result(
+            crate::test_support::destruction::DestructionKind::CmEventAck,
+            event as usize,
+            ret,
+        );
         self.inner = std::ptr::null_mut();
         if ret != 0 {
             tracing::error!(
@@ -311,11 +335,20 @@ impl CmId {
         }
         self.owned = false;
         #[cfg(any(test, feature = "test-hooks"))]
+        let address = self.inner as usize;
+        #[cfg(any(test, feature = "test-hooks"))]
         crate::test_support::destruction::record(
             crate::test_support::destruction::DestructionKind::CmId,
-            self.inner as usize,
+            address,
         );
-        from_ret_errno(unsafe { rdma_destroy_id(self.inner) })
+        let ret = unsafe { rdma_destroy_id(self.inner) };
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::test_support::destruction::record_result(
+            crate::test_support::destruction::DestructionKind::CmId,
+            address,
+            ret,
+        );
+        from_ret_errno(ret)
     }
 
     /// Consume and synchronously destroy this CM ID exactly once.

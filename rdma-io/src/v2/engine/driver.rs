@@ -154,13 +154,13 @@ impl RdmaEngineDriver {
         self.resources.take();
     }
 
-    fn service_terminal(&mut self) -> bool {
+    fn service_terminal(&mut self) -> Result<bool> {
         if !self
             .shared
             .shutdown_requested
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            return false;
+            return Ok(false);
         }
         self.shared.cm.begin_shutdown(
             &self.shared,
@@ -168,15 +168,15 @@ impl RdmaEngineDriver {
         );
         self.shared.begin_all_connection_close();
         if self.shared.cm.pending_route_count() != 0 {
-            return false;
+            return Ok(false);
         }
         if self.shared.connections.live() != 0 {
-            return false;
+            return Ok(false);
         }
 
         #[cfg(any(test, feature = "test-hooks"))]
         if self.shared.test_driver.accepted_outstanding() != 0 {
-            return false;
+            return Ok(false);
         }
         if self
             .shared
@@ -184,14 +184,56 @@ impl RdmaEngineDriver {
             .load(std::sync::atomic::Ordering::Acquire)
             != 0
         {
-            return false;
+            return Ok(false);
+        }
+
+        if let Some(resources) = self.resources.as_ref() {
+            let mut processed = 0;
+            while processed < self.shared.config.cm_event_budget {
+                if !self.shared.cm.try_process_event(&self.shared, resources)? {
+                    if self.shared.cm.pending_route_count() != 0
+                        || self.shared.connections.live() != 0
+                        || self
+                            .shared
+                            .accepted_operations
+                            .load(std::sync::atomic::Ordering::Acquire)
+                            != 0
+                    {
+                        self.scheduler.mark_class_ready(WorkClass::Cm);
+                        return Ok(false);
+                    }
+                    #[cfg(any(test, feature = "test-hooks"))]
+                    crate::test_support::destruction::record(
+                        crate::test_support::destruction::DestructionKind::CmFinalDrainToWouldBlock,
+                        resources.cm_event_channel.as_raw() as usize,
+                    );
+                    self.shared.finish(EngineOutcome::Success);
+                    return Ok(true);
+                }
+                processed += 1;
+            }
+            self.scheduler.mark_class_ready(WorkClass::Cm);
+            return Ok(false);
         }
 
         self.shared.finish(EngineOutcome::Success);
-        true
+        Ok(true)
     }
 
     fn service_cq(&mut self, cx: &mut TaskContext<'_>) -> Result<bool> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(completion) = self.shared.test_driver.take_released_connection_cqe() {
+            if let Some(connection) = self.shared.enqueue_completion(completion) {
+                self.scheduler.enqueue_connection(connection.ready());
+            }
+            self.shared.ready_queue_depth.store(
+                self.scheduler.ready_connection_count(),
+                std::sync::atomic::Ordering::Release,
+            );
+            self.scheduler.mark_class_ready(WorkClass::Cq);
+            return Ok(true);
+        }
+
         let Some(resources) = self.resources.as_ref() else {
             return Ok(false);
         };
@@ -238,6 +280,10 @@ impl RdmaEngineDriver {
             .cqes_polled
             .fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
         for completion in self.cq_buffer[..count].iter().copied() {
+            #[cfg(any(test, feature = "test-hooks"))]
+            if self.shared.test_driver.suppress_connection_cqe(completion) {
+                continue;
+            }
             if let Some(connection) = self.shared.enqueue_completion(completion) {
                 self.scheduler.enqueue_connection(connection.ready());
             }
@@ -338,9 +384,12 @@ impl RdmaEngineDriver {
     fn process_deadline(&mut self, deadline: Deadline) -> Result<()> {
         match deadline.kind {
             DeadlineKind::EngineShutdown => {
-                self.shared.request_shutdown();
-                self.scheduler.mark_class_ready(WorkClass::Terminal);
-                Ok(())
+                if let Some(failure) = self.shared.shutdown_deadline_failure() {
+                    Err(failure.into_error())
+                } else {
+                    self.scheduler.mark_class_ready(WorkClass::Terminal);
+                    Ok(())
+                }
             }
             DeadlineKind::Reclamation => {
                 self.shared
@@ -415,7 +464,7 @@ impl Future for RdmaEngineDriver {
 
         if !self.runtime_checked {
             if let Err(error) = preflight_driver_runtime() {
-                return self.fail(EngineFailure::Progress(error.to_string()));
+                return self.fail(EngineFailure::from_progress(error));
             }
             self.runtime_checked = true;
         }
@@ -441,12 +490,11 @@ impl Future for RdmaEngineDriver {
                 break;
             };
             let result = match class {
-                WorkClass::Terminal => {
-                    if self.service_terminal() {
-                        break;
-                    }
-                    Ok(false)
-                }
+                WorkClass::Terminal => match self.service_terminal() {
+                    Ok(true) => break,
+                    Ok(false) => Ok(false),
+                    Err(error) => Err(error),
+                },
                 WorkClass::Cm => self.service_cm(cx),
                 WorkClass::Cq => self.service_cq(cx),
                 WorkClass::Reclamation => self.service_reclamation(),
@@ -454,7 +502,7 @@ impl Future for RdmaEngineDriver {
             };
             let progressed = match result {
                 Ok(progressed) => progressed,
-                Err(error) => return self.fail(EngineFailure::Progress(error.to_string())),
+                Err(error) => return self.fail(EngineFailure::from_progress(error)),
             };
             // CM progress can remove the final shutdown owner after the
             // Terminal class already ran in this poll.
@@ -464,9 +512,12 @@ impl Future for RdmaEngineDriver {
                     .shared
                     .shutdown_requested
                     .load(std::sync::atomic::Ordering::Acquire)
-                && self.service_terminal()
             {
-                break;
+                match self.service_terminal() {
+                    Ok(true) => break,
+                    Ok(false) => {}
+                    Err(error) => return self.fail(EngineFailure::from_progress(error)),
+                }
             }
             if self.shared.outcome().is_some() {
                 break;
@@ -507,6 +558,8 @@ impl Future for RdmaEngineDriver {
 impl Drop for RdmaEngineDriver {
     fn drop(&mut self) {
         if self.shared.outcome().is_none() {
+            self.shared.request_shutdown();
+            self.shared.synchronously_prepare_driver_drop();
             #[cfg(any(test, feature = "test-hooks"))]
             let test_outstanding = self.shared.test_driver.accepted_outstanding();
             #[cfg(not(any(test, feature = "test-hooks")))]
@@ -528,6 +581,10 @@ impl Drop for RdmaEngineDriver {
                 let test_bundles = self.shared.test_driver.route_count();
                 #[cfg(not(any(test, feature = "test-hooks")))]
                 let test_bundles = 0;
+                self.shared
+                    .diagnostic_counters
+                    .engine_wedges
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 EngineFailure::Wedged {
                     retained_bundles: (self.shared.retained_bundle_count().max(cm_owners)
                         + test_bundles)
@@ -573,7 +630,7 @@ fn preflight_driver_runtime() -> Result<()> {
 #[cfg(any(test, feature = "test-hooks"))]
 pub(super) mod test_api {
     use std::any::Any;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{HashMap, HashSet, VecDeque};
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
     use std::time::Duration;
@@ -631,6 +688,15 @@ pub(super) mod test_api {
     pub struct TestCqArmWindowControl {
         shared: Weak<EngineShared>,
         point: CqArmRacePoint,
+        active: bool,
+    }
+
+    /// Controller for one exact production connection CQE held after polling.
+    #[doc(hidden)]
+    pub struct TestConnectionCqeSuppression {
+        shared: Weak<EngineShared>,
+        connection: super::super::registry::ConnectionToken,
+        qp_num: u32,
         active: bool,
     }
 
@@ -817,6 +883,32 @@ pub(super) mod test_api {
             self.pause_next_admission(AdmissionPausePoint::OperationBeforeRegister)
         }
 
+        /// Hold the next real CQE routed to `connection` after it is polled.
+        ///
+        /// The held CQE remains an actual provider completion and can later be
+        /// released back through the normal exact production router.
+        pub fn suppress_next_connection_cqe(
+            &self,
+            connection: &RdmaConnection,
+        ) -> Result<TestConnectionCqeSuppression> {
+            let shared = self.ensure_active()?;
+            if !Arc::ptr_eq(&shared, &connection.shared) {
+                return Err(Error::InvalidConfig(
+                    "connection belongs to another engine".into(),
+                ));
+            }
+            shared.test_driver.start_connection_cqe_suppression(
+                connection.state.token,
+                connection.identity().qp_num,
+            )?;
+            Ok(TestConnectionCqeSuppression {
+                shared: Arc::downgrade(&shared),
+                connection: connection.state.token,
+                qp_num: connection.identity().qp_num,
+                active: true,
+            })
+        }
+
         fn pause_next_admission(&self, point: AdmissionPausePoint) -> Result<TestAdmissionBarrier> {
             let shared = self.ensure_active()?;
             shared.test_driver.start_admission_control(point)?;
@@ -915,6 +1007,53 @@ pub(super) mod test_api {
             if let Some(shared) = self.shared.upgrade() {
                 shared.test_driver.stop_cq_arm_control(self.point);
                 shared.work_signal.publish(0);
+            }
+            self.active = false;
+        }
+    }
+
+    impl TestConnectionCqeSuppression {
+        /// Wait until the engine has polled and held the matching real CQE.
+        pub async fn wait_observed(&self) -> Result<()> {
+            let shared = self.shared.upgrade().ok_or(Error::DriverShutdown)?;
+            loop {
+                let notified = shared.test_driver.connection_cqe_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if shared
+                    .test_driver
+                    .connection_cqe_is_observed(self.connection, self.qp_num)
+                {
+                    return Ok(());
+                }
+                if shared.outcome().is_some() {
+                    return Err(Error::DriverShutdown);
+                }
+                notified.await;
+            }
+        }
+
+        /// Release the held real CQE through normal exact production routing.
+        pub fn release(mut self) -> Result<()> {
+            let shared = self.shared.upgrade().ok_or(Error::DriverShutdown)?;
+            shared
+                .test_driver
+                .release_connection_cqe(self.connection, self.qp_num)?;
+            shared.work_signal.publish(0);
+            self.active = false;
+            Ok(())
+        }
+    }
+
+    impl Drop for TestConnectionCqeSuppression {
+        fn drop(&mut self) {
+            if !self.active {
+                return;
+            }
+            if let Some(shared) = self.shared.upgrade() {
+                shared
+                    .test_driver
+                    .abandon_connection_cqe(self.connection, self.qp_num);
             }
             self.active = false;
         }
@@ -1105,6 +1244,16 @@ pub(super) mod test_api {
         cq_arm_paused: AtomicU64,
         cq_arm_notify: Notify,
         admission_barrier: AdmissionBarrierState,
+        connection_cqe_suppression: Mutex<Option<ConnectionCqeSuppressionState>>,
+        released_connection_cqes: Mutex<VecDeque<WorkCompletion>>,
+        connection_cqe_notify: Notify,
+    }
+
+    struct ConnectionCqeSuppressionState {
+        connection: super::super::registry::ConnectionToken,
+        qp_num: u32,
+        completion: Option<WorkCompletion>,
+        abandoned: bool,
     }
 
     impl TestDriverState {
@@ -1123,7 +1272,124 @@ pub(super) mod test_api {
                     control: Mutex::new(None),
                     changed: Condvar::new(),
                 },
+                connection_cqe_suppression: Mutex::new(None),
+                released_connection_cqes: Mutex::new(VecDeque::new()),
+                connection_cqe_notify: Notify::new(),
             }
+        }
+
+        fn start_connection_cqe_suppression(
+            &self,
+            connection: super::super::registry::ConnectionToken,
+            qp_num: u32,
+        ) -> Result<()> {
+            let mut control = self
+                .connection_cqe_suppression
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if control.is_some() {
+                return Err(Error::InvalidConfig(
+                    "connection CQE suppression is already active".into(),
+                ));
+            }
+            *control = Some(ConnectionCqeSuppressionState {
+                connection,
+                qp_num,
+                completion: None,
+                abandoned: false,
+            });
+            Ok(())
+        }
+
+        pub(super) fn suppress_connection_cqe(&self, completion: WorkCompletion) -> bool {
+            let mut guard = self
+                .connection_cqe_suppression
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let Some(control) = guard.as_mut() else {
+                return false;
+            };
+            if control.completion.is_some()
+                || control.qp_num != completion.qp_num()
+                || control.abandoned
+            {
+                return false;
+            }
+            control.completion = Some(completion);
+            drop(guard);
+            self.connection_cqe_notify.notify_waiters();
+            true
+        }
+
+        fn connection_cqe_is_observed(
+            &self,
+            connection: super::super::registry::ConnectionToken,
+            qp_num: u32,
+        ) -> bool {
+            self.connection_cqe_suppression
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_ref()
+                .is_some_and(|control| {
+                    control.connection == connection
+                        && control.qp_num == qp_num
+                        && control.completion.is_some()
+                })
+        }
+
+        fn release_connection_cqe(
+            &self,
+            connection: super::super::registry::ConnectionToken,
+            qp_num: u32,
+        ) -> Result<()> {
+            let mut control = self
+                .connection_cqe_suppression
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let Some(active) = control.as_ref() else {
+                return Err(Error::InvalidConfig(
+                    "connection CQE suppression is not active".into(),
+                ));
+            };
+            if active.connection != connection || active.qp_num != qp_num {
+                return Err(Error::InvalidConfig(
+                    "connection CQE suppression identity changed".into(),
+                ));
+            }
+            let completion = active.completion.ok_or_else(|| {
+                Error::InvalidConfig("connection CQE has not been observed".into())
+            })?;
+            *control = None;
+            drop(control);
+            self.released_connection_cqes
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push_back(completion);
+            Ok(())
+        }
+
+        fn abandon_connection_cqe(
+            &self,
+            connection: super::super::registry::ConnectionToken,
+            qp_num: u32,
+        ) {
+            if let Some(control) = self
+                .connection_cqe_suppression
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_mut()
+                && control.connection == connection
+                && control.qp_num == qp_num
+            {
+                control.abandoned = true;
+            }
+        }
+
+        pub(super) fn take_released_connection_cqe(&self) -> Option<WorkCompletion> {
+            self.released_connection_cqes
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .pop_front()
         }
 
         pub(in crate::v2::engine) fn pause_admission(&self, point: AdmissionPausePoint) {
@@ -1610,8 +1876,9 @@ pub(super) mod test_api {
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub use test_api::{
-    TestAcceptedOperation, TestAdmissionBarrier, TestConnectionIdentity, TestCqArmWindowControl,
-    TestCqeSuppression, TestEngineQp, TestEngineResources, TestRouteHandle,
+    TestAcceptedOperation, TestAdmissionBarrier, TestConnectionCqeSuppression,
+    TestConnectionIdentity, TestCqArmWindowControl, TestCqeSuppression, TestEngineQp,
+    TestEngineResources, TestRouteHandle,
 };
 
 #[cfg(test)]
@@ -1809,7 +2076,7 @@ mod tests {
         let mut cx = TaskContext::from_waker(&waker);
         assert!(matches!(
             Pin::new(&mut driver).poll(&mut cx),
-            Poll::Ready(Err(Error::Verbs(_)))
+            Poll::Ready(Err(Error::InvalidConfig(_)))
         ));
         assert_eq!(counter.count(), 0);
     }
@@ -1824,7 +2091,7 @@ mod tests {
         let (_engine, mut driver) = test_engine_pair(CompletionMode::Polling);
         let result = runtime
             .block_on(async { std::future::poll_fn(|cx| Pin::new(&mut driver).poll(cx)).await });
-        assert!(matches!(result, Err(Error::Verbs(_))));
+        assert!(matches!(result, Err(Error::InvalidConfig(_))));
     }
 
     #[cfg(not(panic = "unwind"))]
@@ -1845,11 +2112,11 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn deadline_timer_wakes_driver_and_processes_shutdown() {
+    async fn deadline_timer_wakes_driver_and_processes_due_work() {
         let (_engine, mut driver) = test_engine_pair(CompletionMode::Readiness);
         assert!(driver.scheduler.deadlines().push(
             tokio::time::Instant::now() + Duration::from_secs(5),
-            DeadlineKind::EngineShutdown,
+            DeadlineKind::Reclamation,
             7,
         ));
         let counter = CountingWaker::new();
@@ -1862,10 +2129,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(5)).await;
         assert!(counter.count() > 0, "the Tokio timer must wake the driver");
         assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
-        assert!(matches!(
-            Pin::new(&mut driver).poll(&mut cx),
-            Poll::Ready(Ok(()))
-        ));
+        assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
     }
 
     #[tokio::test]
@@ -1974,7 +2238,7 @@ mod tests {
 
         assert!(close.as_mut().poll(&mut cx).is_pending());
         let Poll::Ready(Err(driver_error)) = driver.fail(EngineFailure::Progress(
-            "injected driver progress failure".into(),
+            Error::InvalidConfig("injected driver progress failure".into()),
         )) else {
             panic!("injected driver failure did not terminate the driver");
         };

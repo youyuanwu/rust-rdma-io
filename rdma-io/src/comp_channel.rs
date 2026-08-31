@@ -85,6 +85,12 @@ impl Drop for CompletionChannel {
             self.inner as usize,
         );
         let ret = unsafe { ibv_destroy_comp_channel(self.inner) };
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::test_support::destruction::record_result(
+            crate::test_support::destruction::DestructionKind::CompletionChannel,
+            self.inner as usize,
+            ret,
+        );
         if ret != 0 {
             let errno = if ret < 0 { -ret } else { ret };
             tracing::error!(

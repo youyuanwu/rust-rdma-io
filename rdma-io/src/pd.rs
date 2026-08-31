@@ -31,6 +31,12 @@ impl Drop for ProtectionDomain {
             self.inner as usize,
         );
         let ret = unsafe { ibv_dealloc_pd(self.inner) };
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::test_support::destruction::record_result(
+            crate::test_support::destruction::DestructionKind::ProtectionDomain,
+            self.inner as usize,
+            ret,
+        );
         if ret != 0 {
             tracing::error!(
                 "ibv_dealloc_pd failed: {}",

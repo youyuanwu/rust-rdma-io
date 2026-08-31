@@ -93,6 +93,55 @@ pub enum Error {
     TransportFailed(TransportError),
 }
 
+impl Clone for Error {
+    fn clone(&self) -> Self {
+        match self {
+            Self::NoDevices => Self::NoDevices,
+            Self::DeviceNotFound(name) => Self::DeviceNotFound(name.clone()),
+            Self::Verbs(error) => Self::Verbs(clone_io_error(error)),
+            Self::InvalidConfig(message) => Self::InvalidConfig(message.clone()),
+            Self::PostFailed(error) => Self::PostFailed(clone_io_error(error)),
+            Self::CompletionError { status, vendor_err } => Self::CompletionError {
+                status: *status,
+                vendor_err: *vendor_err,
+            },
+            Self::WouldBlock => Self::WouldBlock,
+            Self::MessageTooLarge { size, capacity } => Self::MessageTooLarge {
+                size: *size,
+                capacity: *capacity,
+            },
+            Self::TransportClosed => Self::TransportClosed,
+            Self::DriverShutdown => Self::DriverShutdown,
+            Self::CapacityExhausted => Self::CapacityExhausted,
+            Self::ConnectionQuarantined {
+                outstanding_operations,
+                cq_debt,
+            } => Self::ConnectionQuarantined {
+                outstanding_operations: *outstanding_operations,
+                cq_debt: *cq_debt,
+            },
+            Self::EngineWedged {
+                retained_bundles,
+                outstanding_operations,
+                cq_debt,
+            } => Self::EngineWedged {
+                retained_bundles: *retained_bundles,
+                outstanding_operations: *outstanding_operations,
+                cq_debt: *cq_debt,
+            },
+            Self::ProtocolViolation(message) => Self::ProtocolViolation(message.clone()),
+            Self::TransportFailed(error) => Self::TransportFailed(error.clone()),
+        }
+    }
+}
+
+fn clone_io_error(error: &io::Error) -> io::Error {
+    match error.raw_os_error() {
+        Some(code) => io::Error::from_raw_os_error(code),
+        None => io::Error::new(error.kind(), error.to_string()),
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

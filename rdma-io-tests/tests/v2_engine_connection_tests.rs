@@ -1071,11 +1071,13 @@ async fn dropping_the_driver_with_live_connections_quarantines_complete_bundles(
     drop(engine);
     let events = recorder.take();
     assert!(!recorder.overflowed());
-    assert!(
-        !events
+    assert_eq!(
+        events
             .iter()
-            .any(|event| event.kind == DestructionKind::QueuePair),
-        "driver loss must retain live QP/CM bundles instead of running fallback destructors"
+            .filter(|event| event.kind == DestructionKind::QueuePair)
+            .count(),
+        2,
+        "driver loss synchronously destroys only zero-outstanding QPs"
     );
 }
 

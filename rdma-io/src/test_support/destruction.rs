@@ -10,6 +10,11 @@ pub struct DestructionEvent {
     pub kind: DestructionKind,
     /// Address of the resource passed to the underlying FFI call.
     pub address: usize,
+    /// Return code from a fallible destruction primitive, when it has one.
+    ///
+    /// Void primitives such as `rdma_destroy_qp` and `rdma_free_devices`
+    /// leave this as `None`.
+    pub result: Option<i32>,
 }
 
 /// Resource destruction/free operations instrumented at their FFI call sites.
@@ -25,6 +30,11 @@ pub enum DestructionKind {
     CmId,
     CmEventChannel,
     RdmaFreeDevices,
+    CqReadinessAdapter,
+    CmReadinessAdapter,
+    CmEventAck,
+    CmDrainToWouldBlock,
+    CmFinalDrainToWouldBlock,
 }
 
 struct ActiveRecorder {
@@ -173,9 +183,28 @@ pub(crate) fn record(kind: DestructionKind, address: usize) {
         return;
     };
     if active.events.len() < active.capacity {
-        active.events.push(DestructionEvent { kind, address });
+        active.events.push(DestructionEvent {
+            kind,
+            address,
+            result: None,
+        });
     } else {
         active.overflowed = true;
+    }
+}
+
+pub(crate) fn record_result(kind: DestructionKind, address: usize, result: i32) {
+    let mut state = state().lock().unwrap_or_else(|error| error.into_inner());
+    let Some(active) = state.active.as_mut() else {
+        return;
+    };
+    if let Some(event) = active
+        .events
+        .iter_mut()
+        .rev()
+        .find(|event| event.kind == kind && event.address == address && event.result.is_none())
+    {
+        event.result = Some(result);
     }
 }
 

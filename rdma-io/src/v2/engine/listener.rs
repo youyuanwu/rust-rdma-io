@@ -565,7 +565,9 @@ impl Future for AcceptWaiter {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if let Some(result) = self.request.take_result() {
             if result.is_ok() {
-                self.shared.cm.mark_accept_delivered(&self.request);
+                self.shared
+                    .cm
+                    .mark_accept_delivered(&self.listener, &self.request);
                 self.shared.work_signal.publish(super::cm::CM_WORK);
             }
             self.finished = true;
@@ -574,7 +576,9 @@ impl Future for AcceptWaiter {
         self.request.waker.register(cx.waker());
         if let Some(result) = self.request.take_result() {
             if result.is_ok() {
-                self.shared.cm.mark_accept_delivered(&self.request);
+                self.shared
+                    .cm
+                    .mark_accept_delivered(&self.listener, &self.request);
                 self.shared.work_signal.publish(super::cm::CM_WORK);
             }
             self.finished = true;
@@ -603,7 +607,7 @@ pub(super) struct ListenerState {
     queues: Mutex<ListenerQueues>,
     closing: AtomicBool,
     finalization_started: AtomicBool,
-    failure: Mutex<Option<Arc<str>>>,
+    failure: Mutex<Option<Error>>,
     close_outcome: Mutex<Option<ListenerCloseOutcome>>,
     pub(super) close_notify: Notify,
     pub(super) frontend_count: AtomicUsize,
@@ -856,20 +860,19 @@ impl ListenerState {
         }
     }
 
-    pub(super) fn fail(self: &Arc<Self>, shared: &Arc<EngineShared>, message: String) {
+    pub(super) fn fail(self: &Arc<Self>, shared: &Arc<EngineShared>, error: Error) {
         let mut failure = lock_unpoison(&self.failure);
         if failure.is_none() {
-            *failure = Some(Arc::from(message));
+            *failure = Some(error);
         }
         drop(failure);
         self.request_close(shared);
     }
 
     pub(super) fn close_error(&self) -> Error {
-        match lock_unpoison(&self.failure).clone() {
-            Some(message) => Error::Verbs(std::io::Error::other(message.to_string())),
-            None => Error::TransportClosed,
-        }
+        lock_unpoison(&self.failure)
+            .clone()
+            .unwrap_or(Error::TransportClosed)
     }
 
     pub(super) fn is_closing(&self) -> bool {
@@ -919,14 +922,12 @@ impl ListenerState {
         lock_unpoison(&self.cm_id).take()
     }
 
-    pub(super) fn finish_close(&self, error: Option<String>) {
+    pub(super) fn finish_close(&self, error: Option<Error>) {
         let mut outcome = lock_unpoison(&self.close_outcome);
         if outcome.is_none() {
-            let failure = error
-                .map(Arc::from)
-                .or_else(|| lock_unpoison(&self.failure).clone());
+            let failure = error.or_else(|| lock_unpoison(&self.failure).clone());
             *outcome = Some(match failure {
-                Some(message) => ListenerCloseOutcome::Failed(message),
+                Some(error) => ListenerCloseOutcome::Failed(error),
                 None => ListenerCloseOutcome::Success,
             });
         }
@@ -1068,7 +1069,7 @@ pub(super) enum InboundRejectReason {
 #[derive(Clone)]
 enum ListenerCloseOutcome {
     Success,
-    Failed(Arc<str>),
+    Failed(Error),
     Terminal(super::EngineOutcome),
 }
 
@@ -1076,7 +1077,7 @@ impl ListenerCloseOutcome {
     fn into_result(self) -> Result<()> {
         match self {
             Self::Success => Ok(()),
-            Self::Failed(message) => Err(Error::Verbs(std::io::Error::other(message.to_string()))),
+            Self::Failed(error) => Err(error),
             Self::Terminal(outcome) => outcome.into_result(),
         }
     }
@@ -1119,11 +1120,12 @@ mod tests {
     #[test]
     fn waiter_registration_reports_the_listener_failure_context() {
         let listener = ListenerState::test_only(1);
-        *lock_unpoison(&listener.failure) = Some(Arc::from("listener CM close failed"));
+        *lock_unpoison(&listener.failure) =
+            Some(Error::InvalidConfig("listener CM close failed".into()));
         listener.closing.store(true, Ordering::Release);
 
         let error = listener.register_waiter(request()).unwrap_err();
-        assert!(matches!(error, Error::Verbs(_)));
+        assert!(matches!(error, Error::InvalidConfig(_)));
         assert!(error.to_string().contains("listener CM close failed"));
     }
 
@@ -1162,6 +1164,34 @@ mod tests {
             }
             _ => panic!("later waiter overtook the selected pair"),
         }
+    }
+
+    #[test]
+    fn delivered_accept_defensively_releases_selection_after_route_retirement() {
+        let (engine, driver) =
+            super::super::test_engine_pair(super::super::CompletionMode::Polling);
+        let listener = ListenerState::test_only(1);
+        let request = request();
+        listener.register_waiter(Arc::clone(&request)).unwrap();
+        assert!(
+            listener
+                .admit_child(IncomingChild::test_only())
+                .rejected
+                .is_none()
+        );
+        assert!(matches!(
+            listener.next_action(),
+            ListenerAction::ProcessSelected { .. }
+        ));
+        request.set_route_token(42);
+        listener.route_selected(&request, 42).unwrap();
+        assert_eq!(listener.queue_counts().2, 1);
+
+        engine.shared.cm.mark_accept_delivered(&listener, &request);
+        assert_eq!(listener.queue_counts().2, 0);
+
+        drop(engine);
+        drop(driver);
     }
 
     #[test]

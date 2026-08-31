@@ -51,8 +51,13 @@ case "$MODE" in
         REPETITIONS=1
         MODE_LABEL="Phase 5 listener backlog and accept arbitration"
         ;;
+    --phase6-lifecycle)
+        TEST_TARGET="v2_engine_lifecycle_tests"
+        REPETITIONS=1
+        MODE_LABEL="Phase 6 accepted-WR drain and shutdown lifecycle"
+        ;;
     *)
-        echo "usage: sudo -E ./scripts/validate-v2-engine-providers.sh {--provider-probe|--readiness-race|--driver-flush-gate|--phase3-operations|--phase4-connections|--phase5-listeners}" >&2
+        echo "usage: sudo -E ./scripts/validate-v2-engine-providers.sh {--provider-probe|--readiness-race|--driver-flush-gate|--phase3-operations|--phase4-connections|--phase5-listeners|--phase6-lifecycle}" >&2
         exit 2
         ;;
 esac

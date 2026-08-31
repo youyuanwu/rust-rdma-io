@@ -167,7 +167,11 @@ impl CmState {
         }
     }
 
-    pub(super) fn mark_accept_delivered(&self, request: &Arc<AcceptRequest>) {
+    pub(super) fn mark_accept_delivered(
+        &self,
+        listener: &Arc<ListenerState>,
+        request: &Arc<AcceptRequest>,
+    ) {
         let encoded = request.route_token();
         if encoded == 0 {
             return;
@@ -175,11 +179,11 @@ impl CmState {
         if let Lookup::Occupied(route) = self
             .inbound_routes
             .lookup_cloned(CmRouteToken::decode(encoded))
-            && route.mark_delivered(request)
-            && let Some(listener) = route.listener.upgrade()
-            && listener.finish_selected_route(encoded)
         {
-            self.enqueue_listener_work(&listener);
+            route.mark_delivered(request);
+        }
+        if listener.finish_selected_route(encoded) {
+            self.enqueue_listener_work(listener);
         }
     }
 
@@ -470,6 +474,13 @@ impl CmState {
                     lock_unpoison(&self.cm_destructions).push_back(pending);
                 }
                 Ok(false) => {
+                    #[cfg(any(test, feature = "test-hooks"))]
+                    if let Some(cm_id) = pending.cm_id() {
+                        crate::test_support::destruction::record(
+                            crate::test_support::destruction::DestructionKind::CmDrainToWouldBlock,
+                            cm_id.as_raw() as usize,
+                        );
+                    }
                     self.remove_owned_context_route(pending.cm_id());
                     match pending {
                         PendingCmDestruction::Route(cm_id) => cm_id.destroy()?,
@@ -490,6 +501,7 @@ impl CmState {
                             let finalize_result =
                                 self.release_connection_retirement(shared, &connection);
                             self.complete_connection_cm_destruction(
+                                shared,
                                 connection,
                                 completion,
                                 destroy_result,
@@ -532,6 +544,7 @@ impl CmState {
                                         }
                                     };
                                     self.complete_connection_cm_destruction(
+                                        shared,
                                         connection,
                                         completion,
                                         injected_cm_result(destroy_error),
@@ -562,7 +575,7 @@ impl CmState {
                 Ok(())
             }
             Err(error) => {
-                listener.finish_close(Some(error_detail(&error)));
+                listener.finish_close(Some(error.clone()));
                 Err(error)
             }
         }
@@ -570,6 +583,7 @@ impl CmState {
 
     fn complete_connection_cm_destruction(
         &self,
+        shared: &EngineShared,
         connection: Arc<ConnectionState>,
         completion: Option<InboundRetirementCompletion>,
         destroy_result: Result<()>,
@@ -578,13 +592,15 @@ impl CmState {
         match (destroy_result, finalize_result) {
             (Ok(()), Ok(())) => {
                 connection.finish_retirement();
+                shared.record_connection_retired(&connection);
                 self.finish_inbound_retirement(completion);
                 Ok(())
             }
             (destroy_result, finalize_result) => {
                 let error = connection_destruction_error(destroy_result, finalize_result);
                 let message = error_detail(&error);
-                connection.fail_retirement(message.clone());
+                connection.fail_retirement(error.clone());
+                shared.record_connection_retirement_failure(&connection);
                 self.fail_inbound_retirement(completion, message);
                 Err(error)
             }
@@ -861,7 +877,7 @@ impl CmState {
                 message,
             )));
         }
-        listener.fail(shared, message);
+        listener.fail(shared, Error::Verbs(std::io::Error::other(message)));
         Ok(EventDisposition::Handled)
     }
 
@@ -1051,7 +1067,7 @@ impl CmState {
             selected: true,
             reject: Some(reject),
         });
-        shared.begin_connection_close(&connection_state, true);
+        shared.begin_connection_close(&connection_state);
         drop(connection);
         if connection_state.accepted_count() == 0 {
             self.retire_registered_connection(shared, connection_state.token)?;
@@ -1169,7 +1185,7 @@ impl CmState {
                     selected: true,
                     reject: None,
                 });
-                shared.begin_connection_close(&connection_state, true);
+                shared.begin_connection_close(&connection_state);
                 drop(connection);
                 if connection_state.accepted_count() == 0 {
                     self.retire_registered_connection(shared, connection_state.token)?;
@@ -1202,7 +1218,7 @@ impl CmState {
                     selected: true,
                     reject: None,
                 });
-                shared.begin_connection_close(&connection_state, true);
+                shared.begin_connection_close(&connection_state);
                 if connection_state.accepted_count() == 0 {
                     self.retire_registered_connection(shared, connection_state.token)?;
                 }
@@ -1382,7 +1398,7 @@ impl CmState {
         route.set_state(OutboundState::Closing {
             connection: connection.clone(),
         });
-        shared.begin_connection_close(&connection_state, true);
+        shared.begin_connection_close(&connection_state);
         drop(request.take_result());
         if connection_state.accepted_count() == 0 {
             self.retire_registered_connection(shared, connection_state.token)?;
@@ -1399,7 +1415,14 @@ impl CmState {
         let Lookup::Occupied(connection) = shared.connections.lookup(token) else {
             return Ok(());
         };
-        if connection.accepted_count() != 0 || !connection.try_begin_retirement() {
+        if connection.accepted_count() != 0 {
+            return Ok(());
+        }
+        if !connection.error_transition_complete() {
+            self.enqueue_retirement(token);
+            return Ok(());
+        }
+        if !connection.try_begin_retirement() {
             return Ok(());
         }
         let retirement = match connection.cm_route() {
@@ -1420,6 +1443,7 @@ impl CmState {
             return Ok(());
         };
         let cm_id = connection.destroy_connection_resources();
+        shared.record_qp_destroy();
         if let Some(cm_id) = cm_id {
             if let Some(reason) = reject {
                 self.record_inbound_reject(shared, reason);
@@ -1449,6 +1473,7 @@ impl CmState {
     ) -> Result<()> {
         self.release_connection_retirement(shared, &connection)?;
         connection.finish_retirement();
+        shared.record_connection_retired(&connection);
         Ok(())
     }
 
@@ -1799,7 +1824,7 @@ impl CmState {
                         selected: true,
                         reject: None,
                     });
-                    shared.begin_connection_close(&connection_state, true);
+                    shared.begin_connection_close(&connection_state);
                     drop(connection);
                     if connection_state.accepted_count() == 0 {
                         self.retire_registered_connection(shared, connection_state.token)?;
@@ -1909,7 +1934,7 @@ impl CmState {
                 self.enqueue_listener_work(&listener);
             }
         }
-        shared.begin_connection_close(&connection_state, true);
+        shared.begin_connection_close(&connection_state);
         if connection_state.accepted_count() == 0 {
             self.retire_registered_connection(shared, connection_state.token)?;
         }
@@ -1936,7 +1961,8 @@ impl CmState {
                 connection,
             } => {
                 let connection_state = Arc::clone(&connection.state);
-                connection_state.mark_cm_failure(message.clone());
+                connection_state
+                    .mark_cm_failure(Error::Verbs(std::io::Error::other(message.clone())));
                 route.set_state(InboundState::Closing {
                     connection: EstablishedConnectionRoute::new(&connection_state),
                     request: Some(request),
@@ -1944,7 +1970,7 @@ impl CmState {
                     selected: true,
                     reject: None,
                 });
-                shared.begin_connection_close(&connection_state, true);
+                shared.begin_connection_close(&connection_state);
                 drop(connection);
                 if connection_state.accepted_count() == 0 {
                     self.retire_registered_connection(shared, connection_state.token)?;
@@ -1958,7 +1984,8 @@ impl CmState {
                     self.inbound_routes.release(route.token, true);
                     return Ok(EventDisposition::Handled);
                 };
-                connection_state.mark_cm_failure(message.clone());
+                connection_state
+                    .mark_cm_failure(Error::Verbs(std::io::Error::other(message.clone())));
                 route.set_state(InboundState::Closing {
                     connection: connection.clone(),
                     request: Some(Arc::clone(&request)),
@@ -1980,7 +2007,7 @@ impl CmState {
                         self.enqueue_listener_work(&listener);
                     }
                 }
-                shared.begin_connection_close(&connection_state, true);
+                shared.begin_connection_close(&connection_state);
                 if connection_state.accepted_count() == 0 {
                     self.retire_registered_connection(shared, connection_state.token)?;
                 }
@@ -1990,7 +2017,8 @@ impl CmState {
                     self.inbound_routes.release(route.token, true);
                     return Ok(EventDisposition::Handled);
                 };
-                connection_state.mark_cm_failure(message);
+                connection_state
+                    .mark_cm_failure(Error::Verbs(std::io::Error::other(message.clone())));
                 route.set_state(InboundState::Closing {
                     connection: connection.clone(),
                     request: None,
@@ -1998,7 +2026,7 @@ impl CmState {
                     selected: false,
                     reject: None,
                 });
-                shared.begin_connection_close(&connection_state, true);
+                shared.begin_connection_close(&connection_state);
                 if connection_state.accepted_count() == 0 {
                     self.retire_registered_connection(shared, connection_state.token)?;
                 }
@@ -2198,7 +2226,7 @@ impl CmState {
         route.set_state(OutboundState::Closing {
             connection: EstablishedConnectionRoute::new(&connection_state),
         });
-        shared.begin_connection_close(&connection_state, true);
+        shared.begin_connection_close(&connection_state);
         drop(connection);
         if connection_state.accepted_count() == 0 {
             self.retire_registered_connection(shared, connection_state.token)?;
@@ -2292,7 +2320,7 @@ impl CmState {
                 connection: connection.clone(),
             });
         }
-        shared.begin_connection_close(&connection_state, true);
+        shared.begin_connection_close(&connection_state);
         if connection_state.accepted_count() == 0 {
             self.retire_registered_connection(shared, connection_state.token)?;
         }
@@ -2354,7 +2382,8 @@ impl CmState {
                     self.retire_route(route, true);
                     return Ok(EventDisposition::Handled);
                 };
-                connection_state.mark_cm_failure(message);
+                connection_state
+                    .mark_cm_failure(Error::Verbs(std::io::Error::other(message.clone())));
                 if request.delivered.load(Ordering::Acquire) {
                     route.set_state(OutboundState::Failed {
                         connection: connection.clone(),
@@ -2365,7 +2394,7 @@ impl CmState {
                         connection: connection.clone(),
                     });
                 }
-                shared.begin_connection_close(&connection_state, true);
+                shared.begin_connection_close(&connection_state);
                 if connection_state.accepted_count() == 0 {
                     self.retire_registered_connection(shared, connection_state.token)?;
                 }
@@ -2380,11 +2409,12 @@ impl CmState {
                     self.retire_route(route, true);
                     return Ok(EventDisposition::Handled);
                 };
-                connection_state.mark_cm_failure(message);
+                connection_state
+                    .mark_cm_failure(Error::Verbs(std::io::Error::other(message.clone())));
                 route.set_state(OutboundState::Failed {
                     connection: connection.clone(),
                 });
-                shared.begin_connection_close(&connection_state, true);
+                shared.begin_connection_close(&connection_state);
                 if connection_state.accepted_count() == 0 {
                     self.retire_registered_connection(shared, connection_state.token)?;
                 }
@@ -3660,6 +3690,7 @@ mod tests {
         route.set_state(OutboundState::Closing {
             connection: EstablishedConnectionRoute::new(&connection.state),
         });
+        assert!(connection.state.transition_to_error_once().unwrap());
         let processed = engine
             .shared
             .cm
@@ -3866,7 +3897,7 @@ mod tests {
         assert!(matches!(close.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
         listener
             .state
-            .finish_close(Some("late duplicate finish".into()));
+            .finish_close(Some(Error::InvalidConfig("late duplicate finish".into())));
         let mut repeated_close = Box::pin(listener.close());
         assert!(matches!(
             repeated_close.as_mut().poll(&mut cx),
