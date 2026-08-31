@@ -308,7 +308,7 @@ impl IncomingChild {
     }
 
     #[cfg(test)]
-    fn test_only() -> Self {
+    pub(super) fn test_only() -> Self {
         Self {
             cm_id: None,
             reservation: None,
@@ -440,6 +440,14 @@ impl AcceptRequest {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn test_only() -> Arc<Self> {
+        Arc::new(Self::new(AcceptIntent::new(
+            RdmaConnectionConfig::default(),
+            Box::new(EmptyPreEstablishSetup),
+        )))
+    }
+
     pub(super) fn take_intent(&self) -> Option<AcceptIntent> {
         lock_unpoison(&self.intent).take()
     }
@@ -513,6 +521,11 @@ impl AcceptRequest {
             }
             AcceptResult::Taken => None,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn take_result_for_test(&self) -> Option<Result<RdmaConnection>> {
+        self.take_result()
     }
 
     fn cancel(&self) {

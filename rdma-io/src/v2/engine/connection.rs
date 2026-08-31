@@ -382,6 +382,17 @@ impl ConnectionState {
         self.close_notify.notify_waiters();
     }
 
+    pub(super) fn fail_retirement(&self, message: String) {
+        self.stop_posting();
+        let _ = self.transition_to_error_once();
+        self.release_admission();
+        let mut outcome = lock_unpoison(&self.close_outcome);
+        *outcome = Some(CloseOutcome::Failed(Arc::from(message)));
+        drop(outcome);
+        self.retired.store(true, Ordering::Release);
+        self.close_notify.notify_waiters();
+    }
+
     fn close_outcome(&self) -> Option<CloseOutcome> {
         let outcome = lock_unpoison(&self.close_outcome).clone();
         match outcome {

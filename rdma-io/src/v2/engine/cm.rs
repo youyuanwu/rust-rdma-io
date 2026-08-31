@@ -140,7 +140,10 @@ impl CmState {
     ) {
         lock_unpoison(&self.cm_destructions).push_back(PendingCmDestruction::Test {
             destroy_count,
-            listener: Some(listener),
+            target: TestCmDestruction::Listener {
+                listener,
+                destroy_error: None,
+            },
         });
     }
 
@@ -188,6 +191,25 @@ impl CmState {
             }
             Entry::Occupied(_) => false,
         }
+    }
+
+    fn insert_listener_identity(
+        &self,
+        token: u64,
+        raw_id: usize,
+        listener: Arc<ListenerState>,
+    ) -> bool {
+        let mut listeners = lock_unpoison(&self.listeners);
+        let mut listener_ids = lock_unpoison(&self.listener_ids);
+        let Entry::Vacant(listener_entry) = listeners.entry(token) else {
+            return false;
+        };
+        let Entry::Vacant(identity_entry) = listener_ids.entry(raw_id) else {
+            return false;
+        };
+        listener_entry.insert(listener);
+        identity_entry.insert(token);
+        true
     }
 
     pub(super) fn has_software_work(&self) -> bool {
@@ -456,22 +478,66 @@ impl CmState {
                             connection,
                             completion,
                         } => {
-                            cm_id.destroy()?;
-                            self.finalize_connection_retirement(shared, connection)?;
-                            self.finish_inbound_retirement(completion);
+                            let destroy_result = cm_id.destroy().map_err(|error| {
+                                contextual_cm_error(
+                                    format!(
+                                        "destroy connection CM ID for slot {} generation {}",
+                                        connection.token.slot, connection.token.generation
+                                    ),
+                                    error,
+                                )
+                            });
+                            let finalize_result =
+                                self.release_connection_retirement(shared, &connection);
+                            self.complete_connection_cm_destruction(
+                                connection,
+                                completion,
+                                destroy_result,
+                                finalize_result,
+                            )?;
                         }
                         PendingCmDestruction::Listener { cm_id, listener } => {
-                            cm_id.destroy()?;
-                            listener.finish_close(None);
+                            let destroy_result = cm_id.destroy().map_err(|error| {
+                                contextual_cm_error(
+                                    format!("destroy listener CM ID for {}", listener.local_addr),
+                                    error,
+                                )
+                            });
+                            Self::complete_listener_cm_destruction(listener, destroy_result)?;
                         }
                         #[cfg(test)]
                         PendingCmDestruction::Test {
                             destroy_count,
-                            listener,
+                            target,
                         } => {
                             destroy_count.fetch_add(1, Ordering::AcqRel);
-                            if let Some(listener) = listener {
-                                listener.finish_close(None);
+                            match target {
+                                TestCmDestruction::Listener {
+                                    listener,
+                                    destroy_error,
+                                } => Self::complete_listener_cm_destruction(
+                                    listener,
+                                    injected_cm_result(destroy_error),
+                                )?,
+                                TestCmDestruction::Connection {
+                                    connection,
+                                    completion,
+                                    destroy_error,
+                                    finalize_error,
+                                } => {
+                                    let finalize_result = match finalize_error {
+                                        Some(error) => injected_cm_result(Some(error)),
+                                        None => {
+                                            self.release_connection_retirement(shared, &connection)
+                                        }
+                                    };
+                                    self.complete_connection_cm_destruction(
+                                        connection,
+                                        completion,
+                                        injected_cm_result(destroy_error),
+                                        finalize_result,
+                                    )?
+                                }
                             }
                         }
                     }
@@ -484,6 +550,45 @@ impl CmState {
             processed += 1;
         }
         Ok(processed)
+    }
+
+    fn complete_listener_cm_destruction(
+        listener: Arc<ListenerState>,
+        result: Result<()>,
+    ) -> Result<()> {
+        match result {
+            Ok(()) => {
+                listener.finish_close(None);
+                Ok(())
+            }
+            Err(error) => {
+                listener.finish_close(Some(error_detail(&error)));
+                Err(error)
+            }
+        }
+    }
+
+    fn complete_connection_cm_destruction(
+        &self,
+        connection: Arc<ConnectionState>,
+        completion: Option<InboundRetirementCompletion>,
+        destroy_result: Result<()>,
+        finalize_result: Result<()>,
+    ) -> Result<()> {
+        match (destroy_result, finalize_result) {
+            (Ok(()), Ok(())) => {
+                connection.finish_retirement();
+                self.finish_inbound_retirement(completion);
+                Ok(())
+            }
+            (destroy_result, finalize_result) => {
+                let error = connection_destruction_error(destroy_result, finalize_result);
+                let message = error_detail(&error);
+                connection.fail_retirement(message.clone());
+                self.fail_inbound_retirement(completion, message);
+                Err(error)
+            }
+        }
     }
 
     pub(super) fn terminalize(&self, outcome: &EngineOutcome) {
@@ -598,14 +703,11 @@ impl CmState {
             request.config.clone(),
             cm_id,
         ));
-        if lock_unpoison(&self.listeners)
-            .insert(token, Arc::clone(&state))
-            .is_some()
-            || lock_unpoison(&self.listener_ids)
-                .insert(raw_id, token)
-                .is_some()
-        {
-            state.request_close(shared);
+        if !self.insert_listener_identity(token, raw_id, Arc::clone(&state)) {
+            let cm_id = state
+                .take_cm_id()
+                .expect("new duplicate listener still owns its CM ID");
+            self.defer_cm_id(cm_id);
             request.complete(Err(Error::InvalidConfig(
                 "duplicate listener route identity".into(),
             )));
@@ -1114,8 +1216,20 @@ impl CmState {
         let Some(cm_id) = listener.take_cm_id() else {
             return Ok(());
         };
-        lock_unpoison(&self.listener_ids).remove(&(cm_id.as_raw() as usize));
-        lock_unpoison(&self.listeners).remove(&listener.token);
+        let raw_id = cm_id.as_raw() as usize;
+        let mut listeners = lock_unpoison(&self.listeners);
+        let mut listener_ids = lock_unpoison(&self.listener_ids);
+        let owned = listeners
+            .get(&listener.token)
+            .is_some_and(|current| Arc::ptr_eq(current, listener));
+        if owned {
+            listeners.remove(&listener.token);
+            if listener_ids.get(&raw_id) == Some(&listener.token) {
+                listener_ids.remove(&raw_id);
+            }
+        }
+        drop(listener_ids);
+        drop(listeners);
         lock_unpoison(&self.cm_destructions).push_back(PendingCmDestruction::Listener {
             cm_id,
             listener: Arc::clone(listener),
@@ -1333,19 +1447,28 @@ impl CmState {
         shared: &EngineShared,
         connection: Arc<ConnectionState>,
     ) -> Result<()> {
+        self.release_connection_retirement(shared, &connection)?;
+        connection.finish_retirement();
+        Ok(())
+    }
+
+    fn release_connection_retirement(
+        &self,
+        shared: &EngineShared,
+        connection: &Arc<ConnectionState>,
+    ) -> Result<()> {
         let released = shared
             .connections
             .release(connection.token, connection.qp_num())
             .ok_or_else(|| {
                 Error::InvalidConfig("connection registry retirement lost its entry".into())
             })?;
-        if !Arc::ptr_eq(&released, &connection) {
+        if !Arc::ptr_eq(&released, connection) {
             return Err(Error::InvalidConfig(
                 "connection registry retired a mismatched generation".into(),
             ));
         }
         connection.release_admission();
-        connection.finish_retirement();
         Ok(())
     }
 
@@ -1357,6 +1480,25 @@ impl CmState {
             && let Some(result) = completion.result
         {
             request.complete(Err(result));
+        }
+        if completion.selected
+            && let Some(listener) = completion.listener.upgrade()
+            && listener.finish_selected_route(completion.route)
+        {
+            self.enqueue_listener_work(&listener);
+        }
+    }
+
+    fn fail_inbound_retirement(
+        &self,
+        completion: Option<InboundRetirementCompletion>,
+        message: String,
+    ) {
+        let Some(completion) = completion else {
+            return;
+        };
+        if let Some(request) = completion.request {
+            let _ = request.fail_undelivered(Error::Verbs(std::io::Error::other(message)));
         }
         if completion.selected
             && let Some(listener) = completion.listener.upgrade()
@@ -1720,6 +1862,18 @@ impl CmState {
             _ => unreachable!("inbound disconnect state was pre-filtered"),
         };
         let Some(connection_state) = connection.upgrade() else {
+            if let Some(request) = request {
+                let _ = request.fail_undelivered(Error::Verbs(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "inbound disconnect lost connection state before accept retirement",
+                )));
+            }
+            if selected
+                && let Some(listener) = route.listener.upgrade()
+                && listener.finish_selected_route(route.token.encode())
+            {
+                self.enqueue_listener_work(&listener);
+            }
             self.inbound_routes.release(route.token, true);
             return Ok(EventDisposition::Handled);
         };
@@ -2399,6 +2553,40 @@ fn contextual_cm_error(context: impl Into<String>, error: Error) -> Error {
     }
 }
 
+fn error_detail(error: &Error) -> String {
+    match error {
+        Error::Verbs(source) | Error::PostFailed(source) => source.to_string(),
+        Error::InvalidConfig(message) | Error::ProtocolViolation(message) => message.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn connection_destruction_error(destroy_result: Result<()>, finalize_result: Result<()>) -> Error {
+    match (destroy_result, finalize_result) {
+        (Err(destroy), Ok(())) => destroy,
+        (Ok(()), Err(finalize)) => contextual_cm_error(
+            "finalize connection retirement after CM destruction",
+            finalize,
+        ),
+        (Err(destroy), Err(finalize)) => Error::Verbs(std::io::Error::other(format!(
+            "{}; additionally failed to finalize connection retirement: {}",
+            error_detail(&destroy),
+            error_detail(&finalize)
+        ))),
+        (Ok(()), Ok(())) => {
+            unreachable!("connection destruction error requires at least one failure")
+        }
+    }
+}
+
+#[cfg(test)]
+fn injected_cm_result(error: Option<String>) -> Result<()> {
+    match error {
+        Some(error) => Err(Error::Verbs(std::io::Error::other(error))),
+        None => Ok(()),
+    }
+}
+
 #[derive(Clone, Copy)]
 struct CmEventSnapshot {
     event_type: CmEventType,
@@ -2435,7 +2623,21 @@ enum PendingCmDestruction {
     #[cfg(test)]
     Test {
         destroy_count: Arc<AtomicUsize>,
-        listener: Option<Arc<ListenerState>>,
+        target: TestCmDestruction,
+    },
+}
+
+#[cfg(test)]
+enum TestCmDestruction {
+    Listener {
+        listener: Arc<ListenerState>,
+        destroy_error: Option<String>,
+    },
+    Connection {
+        connection: Arc<ConnectionState>,
+        completion: Option<InboundRetirementCompletion>,
+        destroy_error: Option<String>,
+        finalize_error: Option<String>,
     },
 }
 
@@ -2454,7 +2656,15 @@ impl PendingCmDestruction {
         match self {
             Self::Listener { listener, .. } => Some(listener),
             #[cfg(test)]
-            Self::Test { listener, .. } => listener.as_ref(),
+            Self::Test {
+                target: TestCmDestruction::Listener { listener, .. },
+                ..
+            } => Some(listener),
+            #[cfg(test)]
+            Self::Test {
+                target: TestCmDestruction::Connection { .. },
+                ..
+            } => None,
             Self::Route(_) | Self::Connection { .. } => None,
         }
     }
@@ -3195,6 +3405,29 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_listener_identity_keeps_both_incumbent_mappings() {
+        let cm = CmState::new(2).unwrap();
+        let incumbent = ListenerState::test_only(1);
+        let duplicate_token = ListenerState::test_only(1);
+        let duplicate_id = ListenerState::test_only(1);
+
+        assert!(cm.insert_listener_identity(7, 0x1000, Arc::clone(&incumbent)));
+        assert!(!cm.insert_listener_identity(7, 0x2000, duplicate_token));
+        assert!(!cm.insert_listener_identity(8, 0x1000, duplicate_id));
+        assert!(
+            lock_unpoison(&cm.listeners)
+                .get(&7)
+                .is_some_and(|listener| Arc::ptr_eq(listener, &incumbent))
+        );
+        assert_eq!(lock_unpoison(&cm.listeners).len(), 1);
+        assert_eq!(
+            lock_unpoison(&cm.listener_ids).get(&0x1000).copied(),
+            Some(7)
+        );
+        assert_eq!(lock_unpoison(&cm.listener_ids).len(), 1);
+    }
+
+    #[test]
     fn pre_establish_setup_completes_before_connect_and_failure_skips_connect() {
         let (engine, driver) =
             super::super::test_engine_pair(super::super::CompletionMode::Polling);
@@ -3447,6 +3680,134 @@ mod tests {
     }
 
     #[test]
+    fn inbound_disconnect_without_connection_state_fails_and_retires_selected_accept() {
+        let (engine, driver) =
+            super::super::test_engine_pair(super::super::CompletionMode::Polling);
+        let listener = ListenerState::test_only(1);
+        let (route_token, route) = engine
+            .shared
+            .cm
+            .inbound_routes
+            .allocate_with(|token| Arc::new(InboundRoute::new(token, Arc::downgrade(&listener))))
+            .unwrap();
+        let request = selected_accept(&listener, route_token.encode());
+        let connection = Arc::new(ConnectionState::new(
+            ConnectionToken {
+                slot: 9,
+                generation: 3,
+            },
+            Arc::new(NoopPoster(31)),
+            RdmaConnectionConfig::default()
+                .max_send_wr(1)
+                .max_recv_wr(1),
+            None,
+            None,
+            None,
+            None,
+        ));
+        route.set_state(InboundState::EstablishedAwaitingDelivery {
+            request: Arc::clone(&request),
+            connection: EstablishedConnectionRoute::new(&connection),
+        });
+        drop(connection);
+
+        assert!(matches!(
+            engine
+                .shared
+                .cm
+                .handle_inbound_disconnected(&engine.shared, &route),
+            Ok(EventDisposition::Handled)
+        ));
+        let Some(Err(error)) = request.take_result_for_test() else {
+            panic!("selected accept must fail");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("lost connection state before accept retirement")
+        );
+        assert_eq!(listener.queue_counts().2, 0);
+        assert!(matches!(
+            engine.shared.cm.inbound_routes.lookup_cloned(route_token),
+            Lookup::Duplicate
+        ));
+
+        drop(engine);
+        drop(driver);
+    }
+
+    #[test]
+    fn listener_destroy_error_completes_close_once_before_propagation() {
+        let (engine, driver) =
+            super::super::test_engine_pair(super::super::CompletionMode::Polling);
+        let listener_state = ListenerState::test_only(1);
+        let listener = RdmaListener {
+            shared: Arc::clone(&engine.shared),
+            state: Arc::clone(&listener_state),
+        };
+        let mut close = Box::pin(listener.close());
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(close.as_mut().poll(&mut cx).is_pending());
+        let destroy_count = Arc::new(AtomicUsize::new(0));
+        lock_unpoison(&engine.shared.cm.cm_destructions).push_back(PendingCmDestruction::Test {
+            destroy_count: Arc::clone(&destroy_count),
+            target: TestCmDestruction::Listener {
+                listener: listener_state,
+                destroy_error: Some(
+                    "destroy listener CM ID for 127.0.0.1:1: injected failure".into(),
+                ),
+            },
+        });
+
+        let error = engine
+            .shared
+            .cm
+            .service_cm_destructions(&engine.shared, 1, || Ok(false))
+            .unwrap_err();
+        assert!(error.to_string().contains("injected failure"));
+        let Poll::Ready(Err(close_error)) = close.as_mut().poll(&mut cx) else {
+            panic!("listener close was not completed before destroy failure propagation");
+        };
+        assert_eq!(close_error.to_string(), error.to_string());
+        assert_eq!(destroy_count.load(Ordering::Acquire), 1);
+        assert!(lock_unpoison(&engine.shared.cm.cm_destructions).is_empty());
+        assert_eq!(
+            engine
+                .shared
+                .cm
+                .service_cm_destructions(&engine.shared, 1, || Ok(false))
+                .unwrap(),
+            0
+        );
+        assert_eq!(destroy_count.load(Ordering::Acquire), 1);
+
+        drop(close);
+        drop(listener);
+        drop(engine);
+        drop(driver);
+    }
+
+    #[test]
+    fn connection_destroy_error_fails_accept_and_retirement_once() {
+        assert_connection_cm_destruction_failure(
+            Some("destroy connection CM ID: injected destroy failure"),
+            None,
+            "injected destroy failure",
+            false,
+        );
+    }
+
+    #[test]
+    fn connection_finalize_error_fails_accept_and_retirement_once() {
+        assert_connection_cm_destruction_failure(
+            None,
+            Some("injected finalization failure"),
+            "finalize connection retirement after CM destruction",
+            true,
+        );
+    }
+
+    #[test]
     fn cm_destroy_barrier_is_budgeted_across_service_passes() {
         let (engine, driver) =
             super::super::test_engine_pair(super::super::CompletionMode::Polling);
@@ -3461,7 +3822,10 @@ mod tests {
         let destroy_count = Arc::new(AtomicUsize::new(0));
         lock_unpoison(&engine.shared.cm.cm_destructions).push_back(PendingCmDestruction::Test {
             destroy_count: Arc::clone(&destroy_count),
-            listener: Some(listener_state),
+            target: TestCmDestruction::Listener {
+                listener: listener_state,
+                destroy_error: None,
+            },
         });
         let mut pending = VecDeque::from(["target", "peer"]);
         let mut routed = Vec::new();
@@ -3517,6 +3881,106 @@ mod tests {
             0
         );
         assert_eq!(destroy_count.load(Ordering::Acquire), 1);
+        drop(engine);
+        drop(driver);
+    }
+
+    fn selected_accept(listener: &Arc<ListenerState>, route: u64) -> Arc<AcceptRequest> {
+        let request = AcceptRequest::test_only();
+        listener.register_waiter(Arc::clone(&request)).unwrap();
+        assert!(
+            listener
+                .admit_child(IncomingChild::test_only())
+                .rejected
+                .is_none()
+        );
+        let ListenerAction::ProcessSelected {
+            request: selected, ..
+        } = listener.next_action()
+        else {
+            panic!("accept was not selected");
+        };
+        assert!(Arc::ptr_eq(&selected, &request));
+        listener.route_selected(&request, route).unwrap();
+        request
+    }
+
+    fn assert_connection_cm_destruction_failure(
+        destroy_error: Option<&str>,
+        finalize_error: Option<&str>,
+        expected: &str,
+        registry_retained: bool,
+    ) {
+        let (engine, driver) =
+            super::super::test_engine_pair(super::super::CompletionMode::Polling);
+        let connection = install_connection(
+            &engine.shared,
+            Arc::new(NoopPoster(32)),
+            RdmaConnectionConfig::default()
+                .max_send_wr(1)
+                .max_recv_wr(1),
+            None,
+            None,
+        )
+        .unwrap();
+        let listener = ListenerState::test_only(1);
+        let route = 0x0000_0001_0000_0001;
+        let request = selected_accept(&listener, route);
+        let completion = InboundRetirementCompletion {
+            listener: Arc::downgrade(&listener),
+            route,
+            request: Some(Arc::clone(&request)),
+            result: Some(Error::TransportClosed),
+            selected: true,
+        };
+        let destroy_count = Arc::new(AtomicUsize::new(0));
+        lock_unpoison(&engine.shared.cm.cm_destructions).push_back(PendingCmDestruction::Test {
+            destroy_count: Arc::clone(&destroy_count),
+            target: TestCmDestruction::Connection {
+                connection: Arc::clone(&connection.state),
+                completion: Some(completion),
+                destroy_error: destroy_error.map(str::to_owned),
+                finalize_error: finalize_error.map(str::to_owned),
+            },
+        });
+
+        let error = engine
+            .shared
+            .cm
+            .service_cm_destructions(&engine.shared, 1, || Ok(false))
+            .unwrap_err();
+        assert!(error.to_string().contains(expected));
+        assert!(connection.state.is_retired());
+        let Some(Err(request_error)) = request.take_result_for_test() else {
+            panic!("inbound accept must fail before propagation");
+        };
+        assert!(request_error.to_string().contains(expected));
+        assert_eq!(listener.queue_counts().2, 0);
+        let mut close = Box::pin(connection.close());
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let Poll::Ready(Err(close_error)) = close.as_mut().poll(&mut cx) else {
+            panic!("connection retirement was not completed before propagation");
+        };
+        assert!(close_error.to_string().contains(expected));
+        assert_eq!(destroy_count.load(Ordering::Acquire), 1);
+        assert!(lock_unpoison(&engine.shared.cm.cm_destructions).is_empty());
+        assert_eq!(
+            engine
+                .shared
+                .cm
+                .service_cm_destructions(&engine.shared, 1, || Ok(false))
+                .unwrap(),
+            0
+        );
+        assert_eq!(destroy_count.load(Ordering::Acquire), 1);
+
+        let retained = engine
+            .shared
+            .connections
+            .release(connection.state.token, connection.state.qp_num());
+        assert_eq!(retained.is_some(), registry_retained);
+        drop(close);
+        drop(connection);
         drop(engine);
         drop(driver);
     }
