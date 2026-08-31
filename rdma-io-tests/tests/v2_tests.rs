@@ -1,9 +1,9 @@
 //! V2 API integration tests.
 //!
 //! Tests the ergonomic v2 API with a real RDMA device (RXE/siw).
-//! Covers device discovery, CQ builder, MR registration, QP builder,
-//! send/recv with poll and async completions, one-sided RDMA read/write,
-//! error handling, and resource drop ordering.
+//! Covers CQ builder, MR registration, QP builder, send/recv with poll and
+//! async completions, one-sided RDMA read/write, error handling, and resource
+//! drop ordering. Independent context/PD tests live in `v2_resource_tests`.
 
 use rdma_io::async_cm::AsyncCmId;
 use rdma_io::cm::ConnParam;
@@ -35,31 +35,6 @@ async fn wait_for_completion(cq: &Cq) -> WorkCompletion {
     })
     .await
     .expect("timed out waiting for completion")
-}
-
-// ---- Device / PD ----
-
-#[test]
-fn test_v2_context_and_pd() {
-    require_software_rdma!();
-    let ctx = Context::open_first().expect("open device");
-    let pd = ctx.alloc_pd().expect("alloc pd");
-    // PD should reference the same context
-    assert!(!pd.inner().as_raw().is_null());
-}
-
-#[test]
-fn test_v2_context_open_by_name() {
-    require_software_rdma!();
-    // Try rxe0 first, then siw0
-    let result = Context::open_by_name("rxe0").or_else(|_| Context::open_by_name("siw0"));
-    assert!(result.is_ok(), "should open rxe0 or siw0");
-}
-
-#[test]
-fn test_v2_context_not_found() {
-    let result = Context::open_by_name("nonexistent_device_12345");
-    assert!(matches!(result, Err(Error::DeviceNotFound(_))));
 }
 
 // ---- CQ Builder ----

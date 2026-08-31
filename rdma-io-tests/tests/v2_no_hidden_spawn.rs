@@ -8,8 +8,8 @@ use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{
-    Attribute, ExprBlock, ExprMethodCall, ExprPath, ForeignItem, ImplItem, Item, Meta, Token,
-    TraitItem, UseTree,
+    Attribute, Expr, ExprBlock, ExprMethodCall, ExprPath, ForeignItem, ImplItem, Item, Local, Meta,
+    Pat, Token, TraitItem, Type, UseTree,
 };
 
 const SPAWN_NAMES: &[&str] = &[
@@ -24,7 +24,16 @@ const SPAWN_NAMES: &[&str] = &[
     "pthread_create",
     "thrd_create",
 ];
-const EXECUTOR_TYPES: &[&str] = &["Builder", "Runtime", "ThreadPool"];
+const EXECUTOR_TYPES: &[&str] = &[
+    "Builder",
+    "Executor",
+    "LocalExecutor",
+    "LocalExecutorBuilder",
+    "LocalSet",
+    "Runtime",
+    "ThreadPool",
+    "ThreadPoolBuilder",
+];
 const CONSTRUCTOR_NAMES: &[&str] = &["build", "new", "new_current_thread", "new_multi_thread"];
 
 fn collect_rs_files(dir: &Path) -> Vec<PathBuf> {
@@ -184,6 +193,7 @@ fn is_executor_type(name: &str) -> bool {
 struct AliasCollector {
     call_aliases: HashSet<String>,
     executor_aliases: HashSet<String>,
+    namespace_aliases: HashSet<String>,
 }
 
 impl AliasCollector {
@@ -214,11 +224,52 @@ impl AliasCollector {
 
     fn register_alias(&mut self, prefix: &[String], original: &str, alias: &str) {
         if is_spawn_name(original) {
-            self.call_aliases.insert(alias.to_owned());
+            self.call_aliases.insert(alias.to_string());
         }
-        if is_executor_type(original) && is_forbidden_namespace(prefix) {
+        if is_executor_type(original) && is_forbidden_namespace_base(prefix) {
             self.executor_aliases.insert(alias.to_owned());
         }
+        if is_forbidden_namespace_name(original) || is_forbidden_namespace_base(prefix) {
+            self.namespace_aliases.insert(alias.to_owned());
+        }
+    }
+
+    fn collect_local_alias(&mut self, local: &Local) {
+        let Some(alias) = pat_ident(&local.pat) else {
+            return;
+        };
+        let Some(init) = &local.init else {
+            return;
+        };
+        let Expr::Path(path) = init.expr.as_ref() else {
+            return;
+        };
+        let segments = path_segments(&path.path);
+        let Some(last) = segments.last() else {
+            return;
+        };
+        if is_spawn_name(last) || (segments.len() == 1 && self.call_aliases.contains(last)) {
+            self.call_aliases.insert(alias.to_string());
+        }
+    }
+
+    fn collect_type_alias(&mut self, item: &syn::ItemType) {
+        let Type::Path(target) = item.ty.as_ref() else {
+            return;
+        };
+        let segments = path_segments(&target.path);
+        if segments.iter().any(|segment| is_executor_type(segment))
+            && self.is_forbidden_namespace(&segments)
+        {
+            self.executor_aliases.insert(item.ident.to_string());
+        }
+    }
+
+    fn is_forbidden_namespace(&self, segments: &[String]) -> bool {
+        is_forbidden_namespace_base(segments)
+            || segments
+                .iter()
+                .any(|segment| self.namespace_aliases.contains(segment))
     }
 }
 
@@ -256,15 +307,55 @@ impl<'ast> Visit<'ast> for AliasCollector {
     fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
         self.collect_use(&item.tree, &mut Vec::new());
     }
+
+    fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+        self.collect_type_alias(item);
+        visit::visit_item_type(self, item);
+    }
+
+    fn visit_local(&mut self, local: &'ast Local) {
+        if !is_test_only(&local.attrs) {
+            self.collect_local_alias(local);
+            visit::visit_local(self, local);
+        }
+    }
 }
 
-fn is_forbidden_namespace(segments: &[String]) -> bool {
-    segments.iter().any(|segment| {
-        matches!(
-            segment.as_str(),
-            "async_std" | "futures" | "rayon" | "runtime" | "smol" | "std" | "thread" | "tokio"
-        )
-    })
+fn pat_ident(pattern: &Pat) -> Option<&syn::Ident> {
+    match pattern {
+        Pat::Ident(ident) => Some(&ident.ident),
+        Pat::Type(typed) => pat_ident(&typed.pat),
+        _ => None,
+    }
+}
+
+fn path_segments(path: &syn::Path) -> Vec<String> {
+    path.segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect()
+}
+
+fn is_forbidden_namespace_name(segment: &str) -> bool {
+    matches!(
+        segment,
+        "async_executor"
+            | "async_std"
+            | "futures"
+            | "glommio"
+            | "rayon"
+            | "runtime"
+            | "smol"
+            | "std"
+            | "thread"
+            | "tokio"
+    )
+}
+
+fn is_forbidden_namespace_base(segments: &[String]) -> bool {
+    segments
+        .iter()
+        .any(|segment| is_forbidden_namespace_name(segment))
 }
 
 struct SpawnDetector<'a> {
@@ -283,11 +374,7 @@ impl<'a> SpawnDetector<'a> {
     }
 
     fn forbidden_path(&self, path: &syn::Path) -> Option<String> {
-        let segments: Vec<_> = path
-            .segments
-            .iter()
-            .map(|segment| segment.ident.to_string())
-            .collect();
+        let segments = path_segments(path);
         let last = segments.last()?;
         if is_spawn_name(last) || (segments.len() == 1 && self.aliases.call_aliases.contains(last))
         {
@@ -301,7 +388,7 @@ impl<'a> SpawnDetector<'a> {
         }
         if CONSTRUCTOR_NAMES.contains(&last.as_str())
             && segments.iter().any(|segment| is_executor_type(segment))
-            && is_forbidden_namespace(&segments)
+            && self.aliases.is_forbidden_namespace(&segments)
         {
             return Some(segments.join("::"));
         }
@@ -385,17 +472,35 @@ fn detector_catches_aliases_qualified_calls_and_runtime_builders() {
     let source = r#"
 use tokio::spawn as launch;
 use tokio::runtime::Builder as RuntimeBuilder;
+use std::thread as os_thread;
+type PoolMaker = rayon::ThreadPoolBuilder;
 
 fn production() {
     launch(async {});
+    let local_launch = tokio::task::spawn;
+    let chained_launch = local_launch;
+    chained_launch(async {});
     tokio::task::spawn_local(async {});
+    <tokio::runtime::Handle>::spawn(&tokio::runtime::Handle::current(), async {});
     std::thread::Builder::new().spawn(|| {});
+    os_thread::Builder::new().spawn(|| {});
     RuntimeBuilder::new_multi_thread().build().unwrap();
+    PoolMaker::new().build().unwrap();
+    async_executor::Executor::new();
     std::thread::scope(|_| {});
 }
 "#;
     let violations = find_spawn_violations(source);
-    for expected in ["launch", "spawn_local", "spawn", "RuntimeBuilder", "scope"] {
+    for expected in [
+        "launch",
+        "chained_launch",
+        "spawn_local",
+        "spawn",
+        "RuntimeBuilder",
+        "PoolMaker",
+        "Executor",
+        "scope",
+    ] {
         assert!(
             violations
                 .iter()

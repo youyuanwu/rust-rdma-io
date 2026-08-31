@@ -469,6 +469,8 @@ pub(super) fn write_unpoison<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Barrier};
+
     use super::*;
 
     type TestRegistry = PagedRegistry<ConnectionToken, usize>;
@@ -553,6 +555,39 @@ mod tests {
             registry.allocate_with(|_| 2),
             Err(Error::CapacityExhausted)
         ));
+    }
+
+    #[test]
+    fn concurrent_registrations_fill_and_release_exact_capacity() {
+        let registry = Arc::new(TestRegistry::new(8).unwrap());
+        let start = Arc::new(Barrier::new(9));
+        let workers = (0..8)
+            .map(|value| {
+                let registry = Arc::clone(&registry);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    registry.allocate_with(|_| value).unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        let entries = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(registry.live(), 8);
+        assert_eq!(registry.free(), 0);
+        assert!(matches!(
+            registry.allocate_with(|_| usize::MAX),
+            Err(Error::CapacityExhausted)
+        ));
+        for (token, value) in entries {
+            assert_eq!(registry.release(token, true), Some(value));
+        }
+        assert_eq!(registry.live(), 0);
+        assert_eq!(registry.free(), 8);
     }
 
     #[test]

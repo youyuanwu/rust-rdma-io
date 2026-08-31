@@ -10,8 +10,6 @@ use rdma_io_sys::ibverbs::*;
 use rdma_io_sys::wrapper::*;
 
 use crate::cm::{CmId, CmQueuePair};
-#[cfg(feature = "tokio")]
-use crate::error::from_ret;
 use crate::qp::QpInitAttr;
 use crate::wr::{PreparedRecvBatch, PreparedSendBatch, RecvWr, SendFlags, SendWr, Sge, WrOpcode};
 
@@ -397,40 +395,6 @@ impl Qp {
     fn post_single_recv(&self, wr: RecvWr) -> Result<()> {
         let mut batch = PreparedRecvBatch::new(vec![wr]).map_err(Error::from)?;
         batch_outcome_to_single(self.post_recv_batch(&mut batch))
-    }
-
-    #[cfg(feature = "tokio")]
-    fn post_send_wr(&self, wr: &mut SendWr) -> Result<()> {
-        let mut raw = wr.build_raw();
-        let mut bad_wr: *mut ibv_send_wr = std::ptr::null_mut();
-        from_ret(unsafe { rdma_wrap_ibv_post_send(self.inner.as_raw(), &mut raw, &mut bad_wr) })
-            .map_err(|e| match e {
-                crate::Error::Verbs(io_err) => Error::PostFailed(io_err),
-                other => Error::from(other),
-            })
-    }
-
-    #[cfg(feature = "tokio")]
-    fn post_recv_wr(&self, wr: &mut RecvWr) -> Result<()> {
-        let mut raw = wr.build_raw();
-        let mut bad_wr: *mut ibv_recv_wr = std::ptr::null_mut();
-        from_ret(unsafe { rdma_wrap_ibv_post_recv(self.inner.as_raw(), &mut raw, &mut bad_wr) })
-            .map_err(|e| match e {
-                crate::Error::Verbs(io_err) => Error::PostFailed(io_err),
-                other => Error::from(other),
-            })
-    }
-
-    /// Post a raw send WR. Used by the per-operation future infrastructure.
-    #[cfg(feature = "tokio")]
-    pub(crate) fn post_send_wr_raw(&self, wr: &mut SendWr) -> Result<()> {
-        self.post_send_wr(wr)
-    }
-
-    /// Post a raw recv WR. Used by the per-operation future infrastructure.
-    #[cfg(feature = "tokio")]
-    pub(crate) fn post_recv_wr_raw(&self, wr: &mut RecvWr) -> Result<()> {
-        self.post_recv_wr(wr)
     }
 
     pub(crate) fn post_send_batch(&self, batch: &mut PreparedSendBatch) -> BatchPostOutcome {

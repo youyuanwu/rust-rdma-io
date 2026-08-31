@@ -13,7 +13,7 @@ use rdma_io::wc::{WcStatus, WorkCompletion};
 use rdma_io_tests::test_helpers::{connect_addr_for, has_software_rdma};
 
 const DIRECT_FLUSH_SOURCE: &str = include_str!("v2_tests.rs");
-const OLD_ASYNC_FLUSH_SOURCE: &str = include_str!("v2_shared_qp_tests.rs");
+const ENGINE_ASYNC_FLUSH_SOURCE: &str = include_str!("v2_engine_driver_flush_gate.rs");
 
 struct Endpoint {
     qp: Qp,
@@ -160,11 +160,15 @@ async fn collect_expected(
 }
 
 #[test]
-fn baseline_sources_distinguish_provider_capability_from_old_async_skip() {
+fn direct_and_engine_async_flush_sources_require_provider_cqes() {
     assert!(DIRECT_FLUSH_SOURCE.contains("async fn test_v2_completion_error"));
     assert!(DIRECT_FLUSH_SOURCE.contains("WrFlushErr"));
-    assert!(OLD_ASYNC_FLUSH_SOURCE.contains("async fn test_shared_qp_completion_error"));
-    assert!(OLD_ASYNC_FLUSH_SOURCE.contains("require_no_iwarp!"));
+    assert!(
+        ENGINE_ASYNC_FLUSH_SOURCE
+            .contains("explicit_qp_err_flushes_every_accepted_wr_in_readiness_and_polling_modes")
+    );
+    assert!(ENGINE_ASYNC_FLUSH_SOURCE.contains("WcStatus::WrFlushErr"));
+    assert!(!ENGINE_ASYNC_FLUSH_SOURCE.contains("require_no_iwarp!"));
 }
 
 #[test]

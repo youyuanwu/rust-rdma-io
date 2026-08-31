@@ -161,16 +161,6 @@ impl Cq {
         self.channel.as_deref()
     }
 
-    /// Get a clone of the Arc-shared completion channel.
-    ///
-    /// Used by `ConnectionBuilder` to share channel ownership with
-    /// `ConnectionLifetime`, ensuring the channel outlives the CQ
-    /// for correct `ibv_destroy_comp_channel` ordering.
-    #[cfg(feature = "tokio")]
-    pub(crate) fn channel_arc(&self) -> Option<Arc<CompletionChannel>> {
-        self.channel.clone()
-    }
-
     /// Access the underlying completion queue.
     ///
     /// Use this for interop with the v1 API or advanced operations.

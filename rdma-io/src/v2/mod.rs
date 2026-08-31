@@ -43,21 +43,13 @@ pub mod qp;
 
 #[cfg(feature = "async")]
 pub mod completion;
-#[cfg(feature = "tokio")]
-mod connection;
 #[cfg(feature = "async")]
 pub mod cq_poller;
 #[cfg(feature = "tokio")]
-pub mod driver;
-#[cfg(feature = "tokio")]
 pub mod engine;
-#[cfg(feature = "async")]
-pub mod inflight;
 #[cfg(feature = "tokio")]
 pub mod message_transport;
 pub mod protocol;
-#[cfg(feature = "tokio")]
-pub mod shared_qp;
 #[cfg(feature = "tokio")]
 mod tokio_support;
 
@@ -65,7 +57,6 @@ mod tokio_support;
 pub use context::Context;
 pub use cq::{Cq, CqBuilder};
 pub use error::{Error, Result};
-pub use error::{TransportError, TransportErrorKind};
 pub use mr::{AccessIntent, Mr, RemoteMr};
 pub use op::{Completion, Op, OpCode};
 pub use pd::Pd;
@@ -81,12 +72,6 @@ pub use cq_poller::CqPoller;
 pub use crate::async_cq::CqNotifier;
 
 #[cfg(feature = "tokio")]
-pub use driver::{CqDriverHandle, FdCqDriver, PollingCqDriver};
-
-#[cfg(feature = "tokio")]
-pub use shared_qp::{OpFuture, SharedQp};
-
-#[cfg(feature = "tokio")]
 pub use engine::{
     CompletionMode, RdmaConnection, RdmaConnectionConfig, RdmaConnectionIdentity, RdmaEngine,
     RdmaEngineBuilder, RdmaEngineDiagnostics, RdmaEngineDriver, RdmaEngineLifecycle,
@@ -94,9 +79,7 @@ pub use engine::{
 };
 
 #[cfg(feature = "tokio")]
-pub use message_transport::{
-    MessageTransport, MessageTransportBuilder, MessageTransportDriver, ReceivedMessage,
-};
+pub use message_transport::{MessageTransport, MessageTransportBuilder, ReceivedMessage};
 
 #[cfg(feature = "tokio")]
 pub use tokio_support::TokioCompletions;

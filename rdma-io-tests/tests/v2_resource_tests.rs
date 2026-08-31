@@ -12,6 +12,31 @@ fn software_device_name(list: &RdmaCmDeviceList) -> Option<String> {
 }
 
 #[test]
+fn test_v2_context_and_pd() {
+    if !has_software_rdma() {
+        return;
+    }
+    let context = Context::open_first().expect("open device");
+    let pd = context.alloc_pd().expect("allocate protection domain");
+    assert!(!pd.inner().as_raw().is_null());
+}
+
+#[test]
+fn test_v2_context_open_by_name() {
+    if !has_software_rdma() {
+        return;
+    }
+    let result = Context::open_by_name("rxe0").or_else(|_| Context::open_by_name("siw0"));
+    assert!(result.is_ok(), "should open rxe0 or siw0");
+}
+
+#[test]
+fn test_v2_context_not_found() {
+    let result = Context::open_by_name("nonexistent_device_12345");
+    assert!(matches!(result, Err(Error::DeviceNotFound(_))));
+}
+
+#[test]
 fn pinned_context_owns_pd_cq_and_mr_until_last_child_drop() {
     if !has_software_rdma() {
         return;
