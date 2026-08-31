@@ -9,7 +9,7 @@ use super::scheduler::DeadlineKind;
 use super::{EngineFailure, EngineOutcome, EngineShared};
 
 impl EngineShared {
-    pub(super) fn begin_connection_close(&self, connection: &Arc<ConnectionState>) {
+    pub(crate) fn begin_connection_close(&self, connection: &Arc<ConnectionState>) {
         if connection.is_retired() {
             return;
         }
@@ -18,7 +18,9 @@ impl EngineShared {
         let first = connection.begin_close();
         let mut operations_to_wake = Vec::new();
         if first {
-            self.draining_connections.fetch_add(1, Ordering::AcqRel);
+            if connection.mark_draining_counted() {
+                self.draining_connections.fetch_add(1, Ordering::AcqRel);
+            }
             self.diagnostic_counters
                 .connections_drain_started
                 .fetch_add(1, Ordering::Relaxed);
@@ -32,6 +34,10 @@ impl EngineShared {
                 Ok(false) => {}
                 Err(error) => {
                     connection.mark_cm_failure(error.clone());
+                    if connection.take_draining_counted() {
+                        let previous = self.draining_connections.fetch_sub(1, Ordering::AcqRel);
+                        debug_assert!(previous > 0, "failed drain must have been counted");
+                    }
                     drop(lifecycle);
                     drop(admission);
                     self.finish(EngineOutcome::Failure(EngineFailure::from_progress(error)));
@@ -158,7 +164,7 @@ impl EngineShared {
     }
 
     fn finish_connection_drain_count(&self, connection: &ConnectionState) {
-        if connection.close_started() {
+        if connection.take_draining_counted() {
             let previous = self.draining_connections.fetch_sub(1, Ordering::AcqRel);
             debug_assert!(previous > 0, "retired draining connection must be counted");
         }
@@ -185,6 +191,7 @@ mod tests {
         qp_num: u32,
         error_transitions: AtomicUsize,
         destroys: AtomicUsize,
+        fail_error_transition: bool,
     }
 
     impl TestPoster {
@@ -193,6 +200,16 @@ mod tests {
                 qp_num,
                 error_transitions: AtomicUsize::new(0),
                 destroys: AtomicUsize::new(0),
+                fail_error_transition: false,
+            })
+        }
+
+        fn failing(qp_num: u32) -> Arc<Self> {
+            Arc::new(Self {
+                qp_num,
+                error_transitions: AtomicUsize::new(0),
+                destroys: AtomicUsize::new(0),
+                fail_error_transition: true,
             })
         }
     }
@@ -216,7 +233,13 @@ mod tests {
 
         fn to_error(&self) -> Result<()> {
             self.error_transitions.fetch_add(1, Ordering::AcqRel);
-            Ok(())
+            if self.fail_error_transition {
+                Err(Error::Verbs(std::io::Error::other(
+                    "injected QP ERR transition failure",
+                )))
+            } else {
+                Ok(())
+            }
         }
 
         fn destroy_qp(&self) -> bool {
@@ -227,6 +250,27 @@ mod tests {
         fn disconnect(&self) -> Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn failed_error_transition_rolls_back_the_draining_gauge() {
+        let (engine, driver) = test_engine_pair(CompletionMode::Polling);
+        let poster = TestPoster::failing(19);
+        let connection = install_connection(
+            &engine.shared,
+            poster,
+            RdmaConnectionConfig::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let mut close = Box::pin(connection.close());
+        assert!(matches!(
+            poll_once(close.as_mut()),
+            Poll::Ready(Err(Error::Verbs(_)))
+        ));
+        assert_eq!(engine.diagnostics().draining_connection_reservations, 0);
+        drop(driver);
     }
 
     fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {

@@ -14,6 +14,8 @@ pub(crate) const DEFAULT_MISSING_CQE_DEADLINE: Duration = Duration::from_secs(30
 pub(crate) const DEFAULT_CONNECTION_DRAIN_DEADLINE: Duration = Duration::from_secs(5);
 pub(crate) const DEFAULT_ENGINE_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(30);
 pub(crate) const DEFAULT_MESSAGE_HELLO_DEADLINE: Duration = Duration::from_secs(10);
+pub(crate) const MIN_MESSAGE_HELLO_DEADLINE: Duration = Duration::from_millis(1);
+pub(crate) const MAX_MESSAGE_HELLO_DEADLINE: Duration = Duration::from_secs(5 * 60);
 
 const MAX_LIVE_CONNECTIONS: usize = 1_048_576;
 const MAX_INFLIGHT_OPERATIONS: usize = 16_777_216;
@@ -307,8 +309,8 @@ impl EngineConfig {
         validate_duration(
             "message HELLO deadline",
             self.hello_deadline,
-            Duration::from_millis(1),
-            Duration::from_secs(5 * 60),
+            MIN_MESSAGE_HELLO_DEADLINE,
+            MAX_MESSAGE_HELLO_DEADLINE,
         )?;
 
         if self.max_inflight_operations > self.cq_capacity {

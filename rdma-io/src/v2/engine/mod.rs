@@ -27,7 +27,12 @@ use tokio::sync::Notify;
 
 use config::EngineConfig;
 pub use config::{CompletionMode, RdmaConnectionConfig};
+#[cfg(test)]
+pub(crate) use config::{
+    DEFAULT_MESSAGE_HELLO_DEADLINE, MAX_MESSAGE_HELLO_DEADLINE, MIN_MESSAGE_HELLO_DEADLINE,
+};
 use connection::ConnectionAdmissionPool;
+pub(crate) use connection::ConnectionState;
 pub use connection::{RdmaConnection, RdmaConnectionIdentity};
 use diagnostics::DiagnosticsState;
 pub use diagnostics::{RdmaEngineDiagnostics, RdmaEngineLifecycle, RdmaEngineTerminalError};
@@ -41,6 +46,8 @@ pub use driver::{
 };
 pub use listener::{RdmaListener, RdmaListenerConfig};
 pub use operation::RdmaOperation;
+#[cfg(test)]
+pub(crate) use operation::{BatchOwnershipTransfer, PreparedBatchOwnership};
 use operation::{CqCreditPool, OperationRegistry};
 use registry::{ConnectionRegistry, OperationToken, lock_unpoison, write_unpoison};
 use resources::{EngineResourceRefs, EngineResources, ResourceSummary};
@@ -51,6 +58,14 @@ use super::error::{Error, Result};
 
 pub(crate) trait PreEstablishSetup: Send {
     fn run(self: Box<Self>, connection: &RdmaConnection) -> Result<SetupSummary>;
+}
+
+pub(crate) trait ConnectionReadyWork: Send + Sync {
+    fn process(&self, budget: usize) -> usize;
+    fn has_work(&self) -> bool;
+    fn deadline_expired(&self);
+    fn disconnected(&self);
+    fn terminalize(&self, error: Error);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,7 +197,7 @@ impl RdmaEngineBuilder {
 /// Cloning this value never starts work. All CQ, CM, reclamation, and
 /// connection-local progress remains owned by the paired [`RdmaEngineDriver`].
 pub struct RdmaEngine {
-    shared: Arc<EngineShared>,
+    pub(crate) shared: Arc<EngineShared>,
 }
 
 impl Clone for RdmaEngine {
@@ -238,6 +253,22 @@ impl RdmaEngine {
         config: RdmaConnectionConfig,
     ) -> Result<RdmaConnection> {
         cm::connect(Arc::clone(&self.shared), address, config).await
+    }
+
+    pub(crate) async fn connect_with_setup(
+        &self,
+        address: std::net::SocketAddr,
+        config: RdmaConnectionConfig,
+        setup: Box<dyn PreEstablishSetup>,
+    ) -> Result<RdmaConnection> {
+        cm::connect_with_setup(Arc::clone(&self.shared), address, config, setup).await
+    }
+
+    pub(crate) fn validate_message_connection_config(
+        &self,
+        config: &RdmaConnectionConfig,
+    ) -> Result<()> {
+        config.validate(&self.shared.config, self.shared.provider.as_ref())
     }
 
     /// Bind an engine-owned listener on the shared CM event channel.
@@ -304,7 +335,7 @@ pub struct RdmaEngineDriver {
     runtime_checked: bool,
 }
 
-struct EngineShared {
+pub(crate) struct EngineShared {
     config: EngineConfig,
     resources: ResourceSummary,
     provider: Option<config::ProviderLimits>,
@@ -322,6 +353,7 @@ struct EngineShared {
     draining_connections: AtomicUsize,
     quarantined_connections: AtomicUsize,
     ready_queue_depth: AtomicUsize,
+    published_ready_connections: Mutex<VecDeque<registry::ConnectionToken>>,
     deadline_requests: Mutex<VecDeque<DeadlineRequest>>,
     admission: RwLock<()>,
     lifecycle: AtomicU8,
@@ -376,6 +408,7 @@ impl EngineShared {
             draining_connections: AtomicUsize::new(0),
             quarantined_connections: AtomicUsize::new(0),
             ready_queue_depth: AtomicUsize::new(0),
+            published_ready_connections: Mutex::new(VecDeque::new()),
             deadline_requests: Mutex::new(VecDeque::new()),
             admission: RwLock::new(()),
             lifecycle: AtomicU8::new(lifecycle_to_u8(RdmaEngineLifecycle::Created)),
@@ -571,7 +604,15 @@ impl EngineShared {
     }
 
     fn retained_bundle_count(&self) -> usize {
-        self.connections.live()
+        let retained = self.connections.live().max(self.cm.retained_owner_count());
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            retained.saturating_add(self.test_driver.route_count())
+        }
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        {
+            retained
+        }
     }
 
     fn unsafe_outstanding_operations(&self) -> usize {
@@ -882,6 +923,31 @@ impl EngineShared {
         resources.pd.reg_mr(len, access)
     }
 
+    pub(crate) fn publish_connection_ready(&self, connection: &Arc<connection::ConnectionState>) {
+        if connection.mark_ready_published() {
+            lock_unpoison(&self.published_ready_connections).push_back(connection.token);
+        }
+        self.work_signal.publish(driver::READY_CONNECTION_WORK);
+    }
+
+    fn take_published_connection(&self) -> Option<registry::ConnectionToken> {
+        let connection = lock_unpoison(&self.published_ready_connections).pop_front()?;
+        if let registry::Lookup::Occupied(state) = self.connections.lookup(connection) {
+            state.clear_ready_published();
+        }
+        Some(connection)
+    }
+
+    fn has_published_connections(&self) -> bool {
+        !lock_unpoison(&self.published_ready_connections).is_empty()
+    }
+
+    fn update_ready_queue_depth(&self, scheduled: usize) {
+        let published = lock_unpoison(&self.published_ready_connections).len();
+        self.ready_queue_depth
+            .store(scheduled.saturating_add(published), Ordering::Release);
+    }
+
     fn schedule_reclamation(&self, token: OperationToken) {
         self.begin_reclamation(token);
         self.schedule_deadline(
@@ -1068,7 +1134,7 @@ const fn lifecycle_from_u8(value: u8) -> RdmaEngineLifecycle {
 }
 
 #[cfg(test)]
-fn test_engine_pair(mode: CompletionMode) -> (RdmaEngine, RdmaEngineDriver) {
+pub(crate) fn test_engine_pair(mode: CompletionMode) -> (RdmaEngine, RdmaEngineDriver) {
     let mut config = EngineConfig::new("test0".into());
     config.completion_mode = mode;
     let shared = Arc::new(

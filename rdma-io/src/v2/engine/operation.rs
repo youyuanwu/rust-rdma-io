@@ -8,7 +8,7 @@ use std::task::{Context, Poll};
 
 use futures_util::task::AtomicWaker;
 
-use super::connection::{ConnectionState, Direction, OperationKind};
+use super::connection::{ConnectionState, Direction, OperationKind, RdmaConnection};
 use super::diagnostics::CqeReject;
 use super::registry::{
     ConnectionToken, Lookup, OperationToken, PagedRegistry, lock_unpoison, read_unpoison,
@@ -28,6 +28,260 @@ use crate::wr::{PreparedRecvBatch, PreparedSendBatch, RecvWr, SendFlags, SendWr,
 /// is consumed or a later phase establishes another positive safety boundary.
 pub struct RdmaOperation {
     state: FutureState,
+}
+
+struct InternalBatchEntry {
+    token: OperationToken,
+    state: Arc<OperationState>,
+    sge: Sge,
+}
+
+type InternalPostInput = (Mr, Option<(usize, usize)>, DetachedOperationCallback);
+
+impl RdmaConnection {
+    pub(crate) fn post_detached_recv_batch(
+        &self,
+        entries: Vec<(Mr, DetachedOperationCallback)>,
+    ) -> Result<usize> {
+        post_detached_batch(
+            &self.shared,
+            &self.state,
+            OperationKind::Recv,
+            entries
+                .into_iter()
+                .map(|(mr, callback)| (mr, None, callback))
+                .collect(),
+        )
+    }
+
+    pub(crate) fn post_detached_send(
+        &self,
+        mr: Mr,
+        len: usize,
+        callback: DetachedOperationCallback,
+    ) -> Result<()> {
+        post_detached_batch(
+            &self.shared,
+            &self.state,
+            OperationKind::Send,
+            vec![(mr, Some((0, len)), callback)],
+        )
+        .map(|_| ())
+    }
+}
+
+fn post_detached_batch(
+    shared: &Arc<EngineShared>,
+    connection: &Arc<ConnectionState>,
+    kind: OperationKind,
+    entries: Vec<InternalPostInput>,
+) -> Result<usize> {
+    if entries.is_empty() {
+        return Err(Error::InvalidConfig(
+            "detached operation batch must not be empty".into(),
+        ));
+    }
+    let count = entries.len();
+    shared
+        .diagnostic_counters
+        .operations_offered
+        .fetch_add(count as u64, Ordering::Relaxed);
+    let admission = read_unpoison(&shared.admission);
+    if let Some(error) = shared.admission_error() {
+        return Err(error);
+    }
+    let posting = connection.begin_posting()?;
+    let direction = kind.direction();
+    let expected_opcode = match kind {
+        OperationKind::Recv => WcOpcode::Recv,
+        OperationKind::Send => WcOpcode::Send,
+        OperationKind::Write | OperationKind::Read => {
+            return Err(Error::InvalidConfig(
+                "detached batches support only SEND and RECV".into(),
+            ));
+        }
+    };
+    let mut reserved = Vec::with_capacity(count);
+    for (mr, range, callback) in entries {
+        let validated = match ValidatedOperation::new(kind, &mr, None, range) {
+            Ok(validated) => validated,
+            Err(error) => {
+                rollback_internal_entries(shared, connection, direction, reserved);
+                return Err(error);
+            }
+        };
+        if let Err(error) = connection.reserve_local(direction) {
+            rollback_internal_entries(shared, connection, direction, reserved);
+            return Err(error);
+        }
+        let mr_len = mr.len();
+        let mut mr = Some(mr);
+        let mut callback = Some(callback);
+        let (token, state) = match shared.operations.allocate(|token| {
+            Arc::new(OperationState::new_with_callback(
+                token,
+                Arc::clone(connection),
+                direction,
+                expected_opcode,
+                mr.take(),
+                mr_len,
+                callback.take(),
+            ))
+        }) {
+            Ok(allocated) => allocated,
+            Err(error) => {
+                connection.release_local(direction);
+                rollback_internal_entries(shared, connection, direction, reserved);
+                shared
+                    .diagnostic_counters
+                    .operation_capacity_exhausted
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(error);
+            }
+        };
+        if !shared.cq_credits.reserve() {
+            let released = shared.operations.release(token, false).unwrap_or(state);
+            connection.release_local(direction);
+            drop(released);
+            rollback_internal_entries(shared, connection, direction, reserved);
+            shared
+                .diagnostic_counters
+                .cq_capacity_exhausted
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(Error::CapacityExhausted);
+        }
+        shared
+            .diagnostic_counters
+            .cq_credits_reserved
+            .fetch_add(1, Ordering::Relaxed);
+        reserved.push(InternalBatchEntry {
+            token,
+            state,
+            sge: validated.sge,
+        });
+    }
+
+    let requests = match kind {
+        OperationKind::Recv => {
+            let requests = reserved
+                .iter()
+                .map(|entry| RecvWr::new(entry.token.encode()).sg(entry.sge))
+                .collect();
+            match PreparedRecvBatch::new(requests) {
+                Ok(batch) => InternalPreparedBatch::Recv(batch),
+                Err(error) => {
+                    rollback_internal_entries(shared, connection, direction, reserved);
+                    return Err(Error::from(error));
+                }
+            }
+        }
+        OperationKind::Send => {
+            let requests = reserved
+                .iter()
+                .map(|entry| {
+                    SendWr::new(entry.token.encode(), WrOpcode::Send)
+                        .sg(entry.sge)
+                        .flags(SendFlags::SIGNALED)
+                })
+                .collect();
+            match PreparedSendBatch::new(requests) {
+                Ok(batch) => InternalPreparedBatch::Send(batch),
+                Err(error) => {
+                    rollback_internal_entries(shared, connection, direction, reserved);
+                    return Err(Error::from(error));
+                }
+            }
+        }
+        OperationKind::Write | OperationKind::Read => unreachable!(),
+    };
+    let mut requests = requests;
+    shared
+        .diagnostic_counters
+        .batch_posts_attempted
+        .fetch_add(1, Ordering::Relaxed);
+    let outcome = match &mut requests {
+        InternalPreparedBatch::Recv(batch) => connection.poster.post_recv(batch),
+        InternalPreparedBatch::Send(batch) => connection.poster.post_send(batch),
+    };
+    let transfer = PreparedBatchOwnership::new(reserved)?.consume(outcome);
+    match transfer {
+        BatchOwnershipTransfer::Accepted(accepted) => {
+            BatchWrAccounting::from_outcome(count, &BatchPostOutcome::AllAccepted).record(shared);
+            commit_internal_entries(shared, accepted);
+            drop(posting);
+            drop(admission);
+            Ok(count)
+        }
+        BatchOwnershipTransfer::Partial {
+            mut accepted,
+            unaccepted,
+            source,
+        } => {
+            if unaccepted
+                .iter()
+                .any(|entry| entry.state.has_early_completion())
+            {
+                accepted.extend(unaccepted);
+                BatchWrAccounting::ambiguous(count).record(shared);
+                commit_internal_entries(shared, accepted);
+            } else {
+                BatchWrAccounting::exact_prefix(count, accepted.len()).record(shared);
+                commit_internal_entries(shared, accepted);
+                rollback_internal_entries(shared, connection, direction, unaccepted);
+            }
+            drop(posting);
+            drop(admission);
+            Err(Error::PostFailed(source))
+        }
+        BatchOwnershipTransfer::Ambiguous { retained, source } => {
+            BatchWrAccounting::ambiguous(count).record(shared);
+            commit_internal_entries(shared, retained);
+            drop(posting);
+            drop(admission);
+            Err(Error::PostFailed(source))
+        }
+    }
+}
+
+enum InternalPreparedBatch {
+    Recv(PreparedRecvBatch),
+    Send(PreparedSendBatch),
+}
+
+fn commit_internal_entries(shared: &EngineShared, entries: Vec<InternalBatchEntry>) {
+    shared
+        .accepted_operations
+        .fetch_add(entries.len(), Ordering::AcqRel);
+    let mut early = Vec::new();
+    for entry in entries {
+        if let Some(completion) = entry.state.commit_accepted() {
+            early.push((entry.state, completion));
+        }
+    }
+    for (state, completion) in early {
+        shared.finish_operation(state, completion);
+    }
+}
+
+fn rollback_internal_entries(
+    shared: &EngineShared,
+    connection: &ConnectionState,
+    direction: Direction,
+    entries: Vec<InternalBatchEntry>,
+) {
+    for entry in entries {
+        let state = shared
+            .operations
+            .release(entry.token, false)
+            .unwrap_or(entry.state);
+        shared.cq_credits.release();
+        shared
+            .diagnostic_counters
+            .cq_credits_rolled_back
+            .fetch_add(1, Ordering::Relaxed);
+        connection.release_local(direction);
+        drop(state);
+    }
 }
 
 enum FutureState {
@@ -256,6 +510,7 @@ struct OperationInner {
     output: Option<(Result<Completion>, Option<Mr>)>,
     detached: bool,
     reclamation_pending: bool,
+    callback: Option<DetachedOperationCallback>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -278,6 +533,27 @@ impl OperationState {
         mr: Option<Mr>,
         mr_len: usize,
     ) -> Self {
+        Self::new_with_callback(
+            token,
+            connection,
+            direction,
+            expected_opcode,
+            mr,
+            mr_len,
+            None,
+        )
+    }
+
+    fn new_with_callback(
+        token: OperationToken,
+        connection: Arc<ConnectionState>,
+        direction: Direction,
+        expected_opcode: WcOpcode,
+        mr: Option<Mr>,
+        mr_len: usize,
+        callback: Option<DetachedOperationCallback>,
+    ) -> Self {
+        let detached = callback.is_some();
         Self {
             token,
             connection,
@@ -289,8 +565,9 @@ impl OperationState {
                 mr,
                 early_completion: None,
                 output: None,
-                detached: false,
+                detached,
                 reclamation_pending: false,
+                callback,
             }),
             waker: AtomicWaker::new(),
             cancelled: AtomicBool::new(false),
@@ -419,10 +696,16 @@ impl OperationState {
         let was_reclaiming = inner.reclamation_pending;
         inner.reclamation_pending = false;
         let was_quarantined = self.quarantined.swap(false, Ordering::AcqRel);
-        let mr = inner.mr.take();
+        let mut mr = inner.mr.take();
         let typed = Completion::from(completion);
         let result = typed.result().map(|()| typed);
-        let detached_mr = if inner.detached || inner.output.is_some() {
+        let callback = inner.callback.take().map(|callback| {
+            let callback_mr = mr.take();
+            (callback, result.clone(), callback_mr)
+        });
+        let detached_mr = if callback.is_some() {
+            None
+        } else if inner.detached || inner.output.is_some() {
             mr
         } else {
             inner.output = Some((result, mr));
@@ -435,6 +718,7 @@ impl OperationState {
         FinishState {
             was_reclaiming,
             was_quarantined,
+            callback,
         }
     }
 
@@ -444,6 +728,10 @@ impl OperationState {
 
     fn take_output(&self) -> Option<(Result<Completion>, Option<Mr>)> {
         lock_unpoison(&self.inner).output.take()
+    }
+
+    fn has_early_completion(&self) -> bool {
+        lock_unpoison(&self.inner).early_completion.is_some()
     }
 
     fn detach_with_post_error(&self, shared: &EngineShared) {
@@ -512,7 +800,13 @@ enum CompletionDisposition {
 struct FinishState {
     was_reclaiming: bool,
     was_quarantined: bool,
+    callback: Option<DetachedCompletion>,
 }
+
+pub(crate) type DetachedOperationCallback =
+    Box<dyn FnOnce(Result<Completion>, Option<Mr>) + Send + 'static>;
+
+type DetachedCompletion = (DetachedOperationCallback, Result<Completion>, Option<Mr>);
 
 pub(super) struct QuarantineTransition {
     pub(super) newly_quarantined: bool,
@@ -535,7 +829,7 @@ enum StartResult {
     dead_code,
     reason = "message pre-posting consumes this ledger in Phase 7"
 )]
-pub(super) struct PreparedBatchOwnership<T> {
+pub(crate) struct PreparedBatchOwnership<T> {
     entries: Vec<T>,
 }
 
@@ -543,7 +837,7 @@ pub(super) struct PreparedBatchOwnership<T> {
     dead_code,
     reason = "message pre-posting consumes this ledger in Phase 7"
 )]
-pub(super) enum BatchOwnershipTransfer<T> {
+pub(crate) enum BatchOwnershipTransfer<T> {
     Accepted(Vec<T>),
     Partial {
         accepted: Vec<T>,
@@ -561,7 +855,7 @@ pub(super) enum BatchOwnershipTransfer<T> {
     reason = "message pre-posting consumes this ledger in Phase 7"
 )]
 impl<T> PreparedBatchOwnership<T> {
-    pub(super) fn new(entries: Vec<T>) -> Result<Self> {
+    pub(crate) fn new(entries: Vec<T>) -> Result<Self> {
         if entries.is_empty() {
             return Err(Error::InvalidConfig(
                 "batch ownership ledger must not be empty".into(),
@@ -570,7 +864,7 @@ impl<T> PreparedBatchOwnership<T> {
         Ok(Self { entries })
     }
 
-    pub(super) fn consume(mut self, outcome: BatchPostOutcome) -> BatchOwnershipTransfer<T> {
+    pub(crate) fn consume(mut self, outcome: BatchPostOutcome) -> BatchOwnershipTransfer<T> {
         match outcome {
             BatchPostOutcome::AllAccepted => BatchOwnershipTransfer::Accepted(self.entries),
             BatchPostOutcome::PrefixAccepted {
@@ -970,13 +1264,28 @@ impl EngineShared {
         };
         let mut processed = 0;
         while processed < quantum {
-            let Some(completion) = connection.pop_completion() else {
+            if let Some(completion) = connection.pop_completion() {
+                self.dispatch_queued_completion(completion);
+                processed += 1;
+                continue;
+            }
+            let protocol = connection.process_ready_work(quantum - processed);
+            if protocol == 0 {
                 break;
-            };
-            self.dispatch_queued_completion(completion);
-            processed += 1;
+            }
+            processed += protocol;
         }
-        (processed, connection.has_completion_work())
+        (
+            processed,
+            connection.has_completion_work() || connection.has_attached_work(),
+        )
+    }
+
+    pub(super) fn handle_message_hello_deadline(&self, token: ConnectionToken) {
+        let Lookup::Occupied(connection) = self.connections.lookup(token) else {
+            return;
+        };
+        connection.handle_message_deadline();
     }
 
     fn dispatch_queued_completion(&self, completion: WorkCompletion) {
@@ -1041,6 +1350,9 @@ impl EngineShared {
         self.diagnostic_counters
             .cqes_routed
             .fetch_add(1, Ordering::Relaxed);
+        if let Some((callback, result, mr)) = finished.callback {
+            callback(result, mr);
+        }
         if removed
             && operation.connection.close_started()
             && operation.connection.accepted_count() == 0

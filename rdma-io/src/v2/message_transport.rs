@@ -4,12 +4,14 @@
 //! message boundaries, bounded backpressure via application-level receive
 //! credits, and cancellation-safe `send()`/`recv()` operations.
 //!
-//! # Explicit Driver Spawning
+//! # Progress Ownership
 //!
-//! Construction returns a `(MessageTransport, MessageTransportDriver)` pair.
-//! The caller must explicitly spawn (or poll) the driver future on a Tokio
-//! runtime for transport progress. Exactly one spawned task per endpoint
-//! is sufficient in both shared and separate CQ modes.
+//! Engine attachment through [`MessageTransportBuilder::connect_on`] or
+//! [`MessageTransportBuilder::accept_on`] returns only [`MessageTransport`];
+//! the engine driver performs message setup and protocol progress with zero
+//! additional message tasks. The legacy endpoint-oriented `connect`/`accept`
+//! surface remains available until the v2 surface cutover and returns a
+//! `(MessageTransport, MessageTransportDriver)` pair for explicit polling.
 //!
 //! ```no_run
 //! # use rdma_io::v2::*;
@@ -25,7 +27,7 @@
 //! transport.send(b"hello").await?;
 //! let msg = transport.recv().await?;
 //! assert_eq!(msg.as_ref(), b"hello");
-//! transport.close().await;
+//! transport.close().await?;
 //! let driver_result = driver_task.await.expect("driver task panicked");
 //! driver_result?;
 //! # Ok(())
@@ -99,11 +101,12 @@
 //! [`Error::TransportFailed`] with the typed cause, waking all pending
 //! send/recv/credit waiters and initiating QP/driver shutdown.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -117,7 +120,10 @@ use super::connection::{
     CmMonitorHandle, ConnectionBuilder, ConnectionConfig, ConnectionLifetime, ConnectionParts,
 };
 use super::driver::CqDriverHandle;
-use super::engine::CompletionMode;
+use super::engine::{
+    CompletionMode, ConnectionReadyWork, ConnectionState, EngineShared, PreEstablishSetup,
+    RdmaConnection, RdmaConnectionConfig, RdmaEngine, RdmaListener, SetupSummary,
+};
 use super::error::{Error, Result, TransportError};
 use super::mr::{AccessIntent, Mr};
 use super::pd::Pd;
@@ -152,6 +158,9 @@ pub struct MessageTransportBuilder {
     conn_param: ConnParam,
     inflight_capacity: Option<usize>,
     separate_cqs: bool,
+    connection_config: Option<RdmaConnectionConfig>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    hello_override: Option<TestHelloOverride>,
 }
 
 impl Default for MessageTransportBuilder {
@@ -171,6 +180,9 @@ impl MessageTransportBuilder {
             conn_param: ConnParam::default(),
             inflight_capacity: None,
             separate_cqs: false,
+            connection_config: None,
+            #[cfg(any(test, feature = "test-hooks"))]
+            hello_override: None,
         }
     }
 
@@ -227,6 +239,23 @@ impl MessageTransportBuilder {
         self
     }
 
+    /// Supply the base QP/CM configuration for engine-attached message transport.
+    ///
+    /// The configured send and receive WR maxima may exceed, but must not
+    /// undershoot, the checked `send_buffers + 2 + 1` and
+    /// `recv_buffers + 2` protocol requirements.
+    pub fn connection_config(mut self, config: RdmaConnectionConfig) -> Self {
+        self.connection_config = Some(config);
+        self
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn test_hello_override(mut self, value: TestHelloOverride) -> Self {
+        self.hello_override = Some(value);
+        self
+    }
+
     fn validate(&self) -> Result<()> {
         if self.recv_buffer_count == 0 {
             return Err(Error::InvalidConfig("recv_buffers must be > 0".into()));
@@ -243,9 +272,9 @@ impl MessageTransportBuilder {
     fn derive_config(&self) -> ConnectionConfig {
         let ctrl_send_headroom = protocol::CTRL_SEND_COUNT;
         let ctrl_recv_count = protocol::CTRL_RECV_COUNT;
-        // +1 headroom on each direction for the HELLO frame during handshake
+        // HELLO needs one distinct send WR and reuses one control receive.
         let max_send_wr = self.send_buffer_count + ctrl_send_headroom + 1;
-        let max_recv_wr = self.recv_buffer_count + ctrl_recv_count + 1;
+        let max_recv_wr = self.recv_buffer_count + ctrl_recv_count;
         let total_wr = max_send_wr + max_recv_wr;
         let inflight = self.inflight_capacity.unwrap_or(total_wr);
         let cq_depth = total_wr + 4; // headroom
@@ -259,6 +288,114 @@ impl MessageTransportBuilder {
             conn_param: self.conn_param.clone(),
             separate_cqs: self.separate_cqs,
         }
+    }
+
+    fn derive_engine_config(&self) -> Result<EngineMessageConfig> {
+        self.validate()?;
+        let required_send_wr = self
+            .send_buffer_count
+            .checked_add(protocol::CTRL_SEND_COUNT)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| Error::InvalidConfig("message send WR derivation overflow".into()))?;
+        let required_recv_wr = self
+            .recv_buffer_count
+            .checked_add(protocol::CTRL_RECV_COUNT)
+            .ok_or_else(|| Error::InvalidConfig("message receive WR derivation overflow".into()))?;
+        let mr_size = protocol::HEADER_SIZE
+            .checked_add(self.buffer_size)
+            .ok_or_else(|| Error::InvalidConfig("message MR size overflow".into()))?;
+        u32::try_from(self.recv_buffer_count).map_err(|_| {
+            Error::InvalidConfig("recv_buffers does not fit the HELLO wire field".into())
+        })?;
+        u32::try_from(self.buffer_size).map_err(|_| {
+            Error::InvalidConfig("buffer_size does not fit the HELLO wire field".into())
+        })?;
+        u32::try_from(mr_size).map_err(|_| {
+            Error::InvalidConfig("message MR size does not fit a receive SGE".into())
+        })?;
+
+        let connection = match self.connection_config.clone() {
+            Some(config) => {
+                if config.maximum_send_work_requests() < required_send_wr {
+                    return Err(Error::InvalidConfig(format!(
+                        "connection maximum send WRs ({}) is below the message requirement ({required_send_wr})",
+                        config.maximum_send_work_requests()
+                    )));
+                }
+                if config.maximum_receive_work_requests() < required_recv_wr {
+                    return Err(Error::InvalidConfig(format!(
+                        "connection maximum receive WRs ({}) is below the message requirement ({required_recv_wr})",
+                        config.maximum_receive_work_requests()
+                    )));
+                }
+                config
+            }
+            None => RdmaConnectionConfig::default()
+                .max_send_wr(required_send_wr)
+                .max_recv_wr(required_recv_wr),
+        };
+
+        Ok(EngineMessageConfig {
+            connection,
+            send_count: self.send_buffer_count,
+            recv_count: self.recv_buffer_count,
+            buffer_size: self.buffer_size,
+            mr_size,
+            #[cfg(any(test, feature = "test-hooks"))]
+            hello_override: self.hello_override,
+        })
+    }
+
+    /// Attach an outbound message transport to an RDMA engine.
+    ///
+    /// The returned frontend has no connection-local driver. The engine driver
+    /// owns receive pre-posting, HELLO negotiation, CQ routing, and readiness.
+    pub async fn connect_on(
+        self,
+        engine: &RdmaEngine,
+        addr: SocketAddr,
+    ) -> Result<MessageTransport> {
+        let config = self.derive_engine_config()?;
+        engine.validate_message_connection_config(&config.connection)?;
+        let state = Arc::new(EngineMessageState::new(&config));
+        let setup = MessagePreEstablishSetup {
+            state: Arc::clone(&state),
+            recv_count: config.recv_count,
+            mr_size: config.mr_size,
+        };
+        let connection = engine
+            .connect_with_setup(addr, config.connection, Box::new(setup))
+            .await?;
+        state.attach(&connection)?;
+        Ok(MessageTransport::from_engine(
+            connection,
+            state,
+            config.buffer_size,
+        ))
+    }
+
+    /// Attach an inbound message transport to an engine-owned listener.
+    ///
+    /// This registers one message waiter in the listener's existing ordered
+    /// accept queue and returns no listener- or message-specific driver.
+    pub async fn accept_on(self, listener: &RdmaListener) -> Result<MessageTransport> {
+        let config = self.derive_engine_config()?;
+        listener.validate_message_connection_config(&config.connection)?;
+        let state = Arc::new(EngineMessageState::new(&config));
+        let setup = MessagePreEstablishSetup {
+            state: Arc::clone(&state),
+            recv_count: config.recv_count,
+            mr_size: config.mr_size,
+        };
+        let connection = listener
+            .accept_with_setup(config.connection, Box::new(setup))
+            .await?;
+        state.attach(&connection)?;
+        Ok(MessageTransport::from_engine(
+            connection,
+            state,
+            config.buffer_size,
+        ))
     }
 
     /// Connect to a remote endpoint and create a transport (client side).
@@ -357,6 +494,57 @@ impl MessageTransportBuilder {
             .ok_or_else(|| Error::InvalidConfig("pre_establish not called".into()))?;
 
         MessageTransport::from_parts(parts, send_count, recv_count, buf_size, pre_posted).await
+    }
+}
+
+struct EngineMessageConfig {
+    connection: RdmaConnectionConfig,
+    send_count: usize,
+    recv_count: usize,
+    buffer_size: usize,
+    mr_size: usize,
+    #[cfg(any(test, feature = "test-hooks"))]
+    hello_override: Option<TestHelloOverride>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum TestHelloOverride {
+    BadMagic,
+    BadVersion,
+    WrongFrameType,
+    ZeroReceiveCredits,
+    SmallerMaximumMessage,
+}
+
+struct MessagePreEstablishSetup {
+    state: Arc<EngineMessageState>,
+    recv_count: usize,
+    mr_size: usize,
+}
+
+impl PreEstablishSetup for MessagePreEstablishSetup {
+    fn run(self: Box<Self>, connection: &RdmaConnection) -> Result<SetupSummary> {
+        let total = self
+            .recv_count
+            .checked_add(protocol::CTRL_RECV_COUNT)
+            .ok_or_else(|| Error::InvalidConfig("message receive batch overflow".into()))?;
+        let mut entries = Vec::with_capacity(total);
+        for _ in 0..total {
+            let mr = connection.register_memory(self.mr_size, AccessIntent::LocalOnly)?;
+            let state = Arc::downgrade(&self.state);
+            entries.push((
+                mr,
+                Box::new(move |result, mr| {
+                    if let Some(state) = state.upgrade() {
+                        state.enqueue_event(EngineMessageEvent::Receive { result, mr });
+                    }
+                }) as _,
+            ));
+        }
+        let posted = connection.post_detached_recv_batch(entries)?;
+        Ok(SetupSummary { posted_wrs: posted })
     }
 }
 
@@ -727,21 +915,481 @@ struct CompletedRecv {
     byte_len: usize,
 }
 
+struct EngineMessageLink {
+    shared: Weak<EngineShared>,
+    connection: Weak<ConnectionState>,
+}
+
+struct EngineHandshake {
+    hello_send_posted: bool,
+    hello_send_complete: bool,
+    hello_receive_complete: bool,
+}
+
+enum EngineMessageEvent {
+    Start,
+    Send {
+        result: Result<super::op::Completion>,
+        mr: Option<Mr>,
+    },
+    Receive {
+        result: Result<super::op::Completion>,
+        mr: Option<Mr>,
+    },
+}
+
+struct EngineMessageState {
+    state: AtomicU8,
+    state_notify: Notify,
+    error: StdMutex<Option<Error>>,
+    remote_credits: Semaphore,
+    peer_recv_capacity: AtomicUsize,
+    local_recv_capacity: usize,
+    _local_send_capacity: usize,
+    buffer_size: usize,
+    handshake: StdMutex<EngineHandshake>,
+    events: StdMutex<VecDeque<EngineMessageEvent>>,
+    steady_inbox: StdMutex<VecDeque<(Result<super::op::Completion>, Option<Mr>)>>,
+    link: OnceLock<EngineMessageLink>,
+    self_weak: OnceLock<Weak<EngineMessageState>>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    hello_override: Option<TestHelloOverride>,
+}
+
+impl EngineMessageState {
+    fn new(config: &EngineMessageConfig) -> Self {
+        Self {
+            state: AtomicU8::new(STATE_CREATED),
+            state_notify: Notify::new(),
+            error: StdMutex::new(None),
+            remote_credits: Semaphore::new(0),
+            peer_recv_capacity: AtomicUsize::new(0),
+            local_recv_capacity: config.recv_count,
+            _local_send_capacity: config.send_count,
+            buffer_size: config.buffer_size,
+            handshake: StdMutex::new(EngineHandshake {
+                hello_send_posted: false,
+                hello_send_complete: false,
+                hello_receive_complete: false,
+            }),
+            events: StdMutex::new(VecDeque::new()),
+            steady_inbox: StdMutex::new(VecDeque::new()),
+            link: OnceLock::new(),
+            self_weak: OnceLock::new(),
+            #[cfg(any(test, feature = "test-hooks"))]
+            hello_override: config.hello_override,
+        }
+    }
+
+    fn attach(self: &Arc<Self>, connection: &RdmaConnection) -> Result<()> {
+        connection.attach_ready_work(Arc::clone(self) as Arc<dyn ConnectionReadyWork>)?;
+        self.self_weak
+            .set(Arc::downgrade(self))
+            .map_err(|_| Error::InvalidConfig("message state attached more than once".into()))?;
+        self.link
+            .set(EngineMessageLink {
+                shared: Arc::downgrade(&connection.shared),
+                connection: Arc::downgrade(&connection.state),
+            })
+            .map_err(|_| Error::InvalidConfig("message state attached more than once".into()))?;
+        self.enqueue_event(EngineMessageEvent::Start);
+        connection.publish_ready_work();
+        Ok(())
+    }
+
+    fn weak_self(&self) -> Weak<Self> {
+        self.self_weak.get().cloned().unwrap_or_default()
+    }
+
+    fn enqueue_event(&self, event: EngineMessageEvent) {
+        lock_std(&self.events).push_back(event);
+        self.publish();
+    }
+
+    fn publish(&self) {
+        let Some(link) = self.link.get() else {
+            return;
+        };
+        let (Some(shared), Some(connection)) = (link.shared.upgrade(), link.connection.upgrade())
+        else {
+            return;
+        };
+        shared.publish_connection_ready(&connection);
+    }
+
+    fn fail(&self, error: Error, close_connection: bool) {
+        let state = self.state.load(Ordering::Acquire);
+        if matches!(state, STATE_STOPPED | STATE_FAILED) {
+            return;
+        }
+        {
+            let mut stored = lock_std(&self.error);
+            if stored.is_none() {
+                *stored = Some(error);
+            }
+        }
+        self.state.store(STATE_FAILED, Ordering::Release);
+        self.remote_credits.close();
+        self.state_notify.notify_waiters();
+        if close_connection
+            && let Some(link) = self.link.get()
+            && let (Some(shared), Some(connection)) =
+                (link.shared.upgrade(), link.connection.upgrade())
+        {
+            shared.begin_connection_close(&connection);
+        }
+    }
+
+    fn terminal_error(&self) -> Error {
+        lock_std(&self.error)
+            .clone()
+            .unwrap_or(Error::TransportClosed)
+    }
+
+    async fn ready(&self) -> Result<()> {
+        loop {
+            let notified = self.state_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match self.state.load(Ordering::Acquire) {
+                STATE_READY => return Ok(()),
+                STATE_FAILED => return Err(self.terminal_error()),
+                STATE_CLOSING | STATE_STOPPED => return Err(Error::TransportClosed),
+                _ => notified.await,
+            }
+        }
+    }
+
+    fn begin_close(&self) {
+        let _ = self.state.compare_exchange(
+            STATE_CREATED,
+            STATE_CLOSING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        let _ = self.state.compare_exchange(
+            STATE_READY,
+            STATE_CLOSING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.remote_credits.close();
+        self.state_notify.notify_waiters();
+    }
+
+    fn finish_close(&self, result: &Result<()>) {
+        match result {
+            Ok(()) => {
+                if self.state.load(Ordering::Acquire) != STATE_FAILED {
+                    self.state.store(STATE_STOPPED, Ordering::Release);
+                }
+            }
+            Err(error) => self.fail(error.clone(), false),
+        }
+        self.state_notify.notify_waiters();
+    }
+
+    fn process_event(&self, event: EngineMessageEvent) {
+        match event {
+            EngineMessageEvent::Start => self.start_hello_send(),
+            EngineMessageEvent::Send { result, mr } => {
+                drop(mr);
+                match result {
+                    Ok(_) => {
+                        lock_std(&self.handshake).hello_send_complete = true;
+                        self.try_mark_ready();
+                    }
+                    Err(error) => self.fail(error, true),
+                }
+            }
+            EngineMessageEvent::Receive { result, mr } => {
+                if self.state.load(Ordering::Acquire) == STATE_READY {
+                    lock_std(&self.steady_inbox).push_back((result, mr));
+                    return;
+                }
+                if self.state.load(Ordering::Acquire) != STATE_CREATED {
+                    drop(mr);
+                    return;
+                }
+                self.process_hello_receive(result, mr);
+            }
+        }
+    }
+
+    fn connection(&self) -> Result<RdmaConnection> {
+        let link = self
+            .link
+            .get()
+            .ok_or_else(|| Error::InvalidConfig("message state has no engine connection".into()))?;
+        let shared = link.shared.upgrade().ok_or(Error::TransportClosed)?;
+        let connection = link.connection.upgrade().ok_or(Error::TransportClosed)?;
+        Ok(RdmaConnection::from_state(shared, connection))
+    }
+
+    fn start_hello_send(&self) {
+        if self.state.load(Ordering::Acquire) != STATE_CREATED {
+            return;
+        }
+        {
+            let mut handshake = lock_std(&self.handshake);
+            if handshake.hello_send_posted {
+                return;
+            }
+            handshake.hello_send_posted = true;
+        }
+        let connection = match self.connection() {
+            Ok(connection) => connection,
+            Err(error) => {
+                self.fail(error, false);
+                return;
+            }
+        };
+        let mut mr =
+            match connection.register_memory(protocol::HELLO_FRAME_SIZE, AccessIntent::LocalOnly) {
+                Ok(mr) => mr,
+                Err(error) => {
+                    self.fail(error, true);
+                    return;
+                }
+            };
+        #[allow(unused_mut)]
+        let mut advertised_recv = self.local_recv_capacity as u32;
+        #[allow(unused_mut)]
+        let mut advertised_size = self.buffer_size as u32;
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            match self.hello_override {
+                Some(TestHelloOverride::ZeroReceiveCredits) => advertised_recv = 0,
+                Some(TestHelloOverride::SmallerMaximumMessage) => {
+                    advertised_size = advertised_size.saturating_sub(1);
+                }
+                _ => {}
+            }
+        }
+        let len = protocol::write_hello_frame(mr.as_mut_slice(), advertised_recv, advertised_size);
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            match self.hello_override {
+                Some(TestHelloOverride::BadMagic) => mr.as_mut_slice()[0] ^= 0xff,
+                Some(TestHelloOverride::BadVersion) => {
+                    mr.as_mut_slice()[4] = protocol::PROTO_VERSION.wrapping_add(1);
+                }
+                Some(TestHelloOverride::WrongFrameType) => {
+                    mr.as_mut_slice()[5] = protocol::FRAME_DATA;
+                }
+                _ => {}
+            }
+        }
+        let state = self.weak_self();
+        if let Err(error) = connection.post_detached_send(
+            mr,
+            len,
+            Box::new(move |result, mr| {
+                if let Some(state) = state.upgrade() {
+                    state.enqueue_event(EngineMessageEvent::Send { result, mr });
+                }
+            }),
+        ) {
+            self.fail(error, true);
+        }
+    }
+
+    fn process_hello_receive(&self, result: Result<super::op::Completion>, mr: Option<Mr>) {
+        let completion = match result {
+            Ok(completion) => completion,
+            Err(error) => {
+                drop(mr);
+                self.fail(error, true);
+                return;
+            }
+        };
+        let Some(mr) = mr else {
+            self.fail(Error::DriverShutdown, true);
+            return;
+        };
+        let received_len = completion.byte_len() as usize;
+        if received_len > mr.len() {
+            self.fail(
+                Error::ProtocolViolation(format!(
+                    "HELLO receive length {received_len} exceeds MR length {}",
+                    mr.len()
+                )),
+                true,
+            );
+            return;
+        }
+        let header = match protocol::parse_header(mr.as_slice(), received_len) {
+            Ok(header) => header,
+            Err(error) => {
+                self.fail(error, true);
+                return;
+            }
+        };
+        if header.frame_type != protocol::FRAME_HELLO {
+            self.fail(
+                Error::ProtocolViolation(format!(
+                    "expected HELLO, got frame_type={}",
+                    header.frame_type
+                )),
+                true,
+            );
+            return;
+        }
+        let payload_end = match protocol::HEADER_SIZE.checked_add(header.payload_len as usize) {
+            Some(end) => end,
+            None => {
+                self.fail(
+                    Error::ProtocolViolation("HELLO payload length overflow".into()),
+                    true,
+                );
+                return;
+            }
+        };
+        let hello = match protocol::parse_hello(&mr.as_slice()[protocol::HEADER_SIZE..payload_end])
+        {
+            Ok(hello) => hello,
+            Err(error) => {
+                self.fail(error, true);
+                return;
+            }
+        };
+        let peer_capacity = match validate_peer_hello(hello, self.buffer_size) {
+            Ok(capacity) => capacity,
+            Err(error) => {
+                self.fail(error, true);
+                return;
+            }
+        };
+        if lock_std(&self.handshake).hello_receive_complete {
+            self.fail(
+                Error::ProtocolViolation("duplicate HELLO during negotiation".into()),
+                true,
+            );
+            return;
+        }
+        let connection = match self.connection() {
+            Ok(connection) => connection,
+            Err(error) => {
+                self.fail(error, false);
+                return;
+            }
+        };
+        let state = self.weak_self();
+        if let Err(error) = connection.post_detached_recv_batch(vec![(
+            mr,
+            Box::new(move |result, mr| {
+                if let Some(state) = state.upgrade() {
+                    state.enqueue_event(EngineMessageEvent::Receive { result, mr });
+                }
+            }),
+        )]) {
+            self.fail(error, true);
+            return;
+        }
+        self.peer_recv_capacity
+            .store(peer_capacity, Ordering::Release);
+        self.remote_credits.add_permits(peer_capacity);
+        lock_std(&self.handshake).hello_receive_complete = true;
+        self.try_mark_ready();
+    }
+
+    fn try_mark_ready(&self) {
+        let handshake = lock_std(&self.handshake);
+        if !handshake.hello_send_complete || !handshake.hello_receive_complete {
+            return;
+        }
+        drop(handshake);
+        if self
+            .state
+            .compare_exchange(
+                STATE_CREATED,
+                STATE_READY,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.state_notify.notify_waiters();
+        }
+    }
+}
+
+impl ConnectionReadyWork for EngineMessageState {
+    fn process(&self, budget: usize) -> usize {
+        let mut processed = 0;
+        while processed < budget {
+            let Some(event) = lock_std(&self.events).pop_front() else {
+                break;
+            };
+            self.process_event(event);
+            processed += 1;
+        }
+        processed
+    }
+
+    fn has_work(&self) -> bool {
+        !lock_std(&self.events).is_empty()
+    }
+
+    fn deadline_expired(&self) {
+        if self.state.load(Ordering::Acquire) == STATE_CREATED {
+            self.fail(
+                Error::ProtocolViolation("HELLO handshake timeout".into()),
+                true,
+            );
+        }
+    }
+
+    fn disconnected(&self) {
+        self.fail(Error::TransportClosed, true);
+    }
+
+    fn terminalize(&self, error: Error) {
+        self.fail(error, false);
+    }
+}
+
+fn lock_std<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|error| error.into_inner())
+}
+
+fn validate_peer_hello(hello: protocol::HelloPayload, local_buffer_size: usize) -> Result<usize> {
+    let peer_capacity = hello.data_recv_capacity as usize;
+    if peer_capacity == 0 {
+        return Err(Error::ProtocolViolation(
+            "peer data_recv_capacity is 0".into(),
+        ));
+    }
+    if peer_capacity > Semaphore::MAX_PERMITS {
+        return Err(Error::ProtocolViolation(format!(
+            "peer data_recv_capacity {peer_capacity} exceeds maximum ({})",
+            Semaphore::MAX_PERMITS
+        )));
+    }
+    let peer_max = hello.max_message_size as usize;
+    if peer_max < local_buffer_size {
+        return Err(Error::ProtocolViolation(format!(
+            "peer max_message_size {peer_max} < local buffer_size {local_buffer_size}"
+        )));
+    }
+    Ok(peer_capacity)
+}
+
 /// Message-oriented RDMA transport (frontend handle).
 ///
 /// Provides async `send()` and `recv()` with pre-registered reusable
 /// buffer pools, message boundaries, credit-based flow control, and
 /// deterministic lifecycle management.
 ///
-/// This is the frontend half of the two-object contract. The driver
-/// future ([`MessageTransportDriver`]) must be spawned separately for
-/// transport progress.
+/// Engine-attached transports use the owning engine driver and return no
+/// message driver. The retained endpoint-oriented construction path still
+/// pairs this frontend with [`MessageTransportDriver`].
 ///
 /// # Task Count
 ///
-/// Exactly one user-spawned driver task per endpoint is sufficient
-/// in both shared and separate CQ modes. `send()` and `recv()` run
-/// in the caller's task context.
+/// Engine attachment adds zero tasks beyond the engine driver. The retained
+/// endpoint-oriented path uses one user-spawned driver task per endpoint.
+/// `send()` and `recv()` run in the caller's task context.
 ///
 /// # Cancellation Safety
 ///
@@ -753,6 +1401,10 @@ struct CompletedRecv {
 ///   for the next `recv()` call. No message is lost.
 pub struct MessageTransport {
     buffer_size: usize,
+    backend: MessageTransportBackend,
+}
+
+struct LegacyMessageFrontend {
     /// Send pool: bounded channel of available send MRs.
     send_pool_tx: mpsc::Sender<Mr>,
     send_pool_rx: Arc<Mutex<mpsc::Receiver<Mr>>>,
@@ -764,7 +1416,37 @@ pub struct MessageTransport {
     state: Arc<TransportSharedState>,
 }
 
+struct EngineMessageFrontend {
+    connection: RdmaConnection,
+    state: Arc<EngineMessageState>,
+}
+
+enum MessageTransportBackend {
+    Legacy(LegacyMessageFrontend),
+    Engine(EngineMessageFrontend),
+}
+
 impl MessageTransport {
+    fn from_engine(
+        connection: RdmaConnection,
+        state: Arc<EngineMessageState>,
+        buffer_size: usize,
+    ) -> Self {
+        Self {
+            buffer_size,
+            backend: MessageTransportBackend::Engine(EngineMessageFrontend { connection, state }),
+        }
+    }
+
+    fn legacy(&self) -> &LegacyMessageFrontend {
+        match &self.backend {
+            MessageTransportBackend::Legacy(legacy) => legacy,
+            MessageTransportBackend::Engine(_) => {
+                unreachable!("engine-attached message transport uses its engine backend")
+            }
+        }
+    }
+
     /// Build a transport pair from established connection parts.
     async fn from_parts(
         mut parts: ConnectionParts,
@@ -844,11 +1526,13 @@ impl MessageTransport {
 
         let transport = Self {
             buffer_size,
-            send_pool_tx,
-            send_pool_rx: Arc::new(Mutex::new(send_pool_rx)),
-            recv_msg_rx: Arc::new(Mutex::new(recv_msg_rx)),
-            repost_tx,
-            state: Arc::clone(&shared_state),
+            backend: MessageTransportBackend::Legacy(LegacyMessageFrontend {
+                send_pool_tx,
+                send_pool_rx: Arc::new(Mutex::new(send_pool_rx)),
+                recv_msg_rx: Arc::new(Mutex::new(recv_msg_rx)),
+                repost_tx,
+                state: Arc::clone(&shared_state),
+            }),
         };
 
         let driver = MessageTransportDriver {
@@ -861,9 +1545,13 @@ impl MessageTransport {
 
     /// Wait for the transport to become ready (HELLO handshake complete).
     pub async fn ready(&self) -> Result<()> {
+        if let MessageTransportBackend::Engine(engine) = &self.backend {
+            return engine.state.ready().await;
+        }
+        let state = &self.legacy().state;
         loop {
-            let notified = self.state.state_notify.notified();
-            let s = self.state.state.load(Ordering::Acquire);
+            let notified = state.state_notify.notified();
+            let s = state.state.load(Ordering::Acquire);
             match s {
                 STATE_READY => return Ok(()),
                 STATE_FAILED => return Err(self.terminal_error()),
@@ -876,7 +1564,10 @@ impl MessageTransport {
 
     /// Wait for readiness internally.
     async fn await_ready(&self) -> Result<()> {
-        let s = self.state.state.load(Ordering::Acquire);
+        if matches!(self.backend, MessageTransportBackend::Engine(_)) {
+            return self.ready().await;
+        }
+        let s = self.legacy().state.state.load(Ordering::Acquire);
         if s == STATE_READY {
             return Ok(());
         }
@@ -916,7 +1607,12 @@ impl MessageTransport {
     /// # }
     /// ```
     pub fn error(&self) -> Option<TransportError> {
-        self.state.error.lock().unwrap().clone()
+        match &self.backend {
+            MessageTransportBackend::Legacy(legacy) => legacy.state.error.lock().unwrap().clone(),
+            MessageTransportBackend::Engine(engine) => lock_std(&engine.state.error)
+                .as_ref()
+                .map(TransportError::from_error),
+        }
     }
 
     /// Return the stored terminal error (if any) or fall back to
@@ -925,10 +1621,15 @@ impl MessageTransport {
     /// Used by `ready()`, `send()`, `recv()` to surface actionable
     /// error information rather than an opaque `TransportClosed`.
     fn terminal_error(&self) -> Error {
-        if let Some(te) = self.state.error.lock().unwrap().clone() {
-            Error::TransportFailed(te)
-        } else {
-            Error::TransportClosed
+        match &self.backend {
+            MessageTransportBackend::Legacy(legacy) => {
+                if let Some(te) = legacy.state.error.lock().unwrap().clone() {
+                    Error::TransportFailed(te)
+                } else {
+                    Error::TransportClosed
+                }
+            }
+            MessageTransportBackend::Engine(engine) => engine.state.terminal_error(),
         }
     }
 
@@ -946,12 +1647,20 @@ impl MessageTransport {
                 capacity: self.buffer_size,
             });
         }
+        if matches!(self.backend, MessageTransportBackend::Engine(_)) {
+            self.await_ready().await?;
+            return Err(Error::InvalidConfig(
+                "engine-attached DATA progress is introduced in Phase 8".into(),
+            ));
+        }
+        let legacy = self.legacy();
 
         // Await readiness (HELLO must be complete)
         self.await_ready().await?;
 
         // Acquire remote receive credit
         let credit_permit = self
+            .legacy()
             .state
             .remote_credits
             .acquire()
@@ -969,10 +1678,10 @@ impl MessageTransport {
         // this order opens a lost-wakeup window where `mark_driver_dead()`
         // signals between the terminal check and the `notified()` snapshot.
         let mut mr = {
-            let mut rx = self.send_pool_rx.lock().await;
+            let mut rx = legacy.send_pool_rx.lock().await;
             loop {
-                let notified = self.state.state_notify.notified();
-                if self.state.is_terminal() {
+                let notified = legacy.state.state_notify.notified();
+                if legacy.state.is_terminal() {
                     return Err(self.terminal_error());
                 }
                 tokio::select! {
@@ -985,14 +1694,14 @@ impl MessageTransport {
 
         // === SYNCHRONOUS SECTION ===
         let frame_len = protocol::write_data_frame(mr.as_mut_slice(), data);
-        let sqp = self.state.conn_lifetime.shared_qp();
+        let sqp = legacy.state.conn_lifetime.shared_qp();
         let qp = sqp.qp().clone();
         let handle = sqp.send_handle().clone();
 
         let reg = match handle.map().register() {
             Some(r) => r,
             None => {
-                let _ = self.send_pool_tx.try_send(mr);
+                let _ = legacy.send_pool_tx.try_send(mr);
                 return Err(if handle.map().is_closed() {
                     self.terminal_error()
                 } else {
@@ -1021,7 +1730,7 @@ impl MessageTransport {
         // return the permit; if it fails (CREDIT already consumed it),
         // the available permits are already correct.
         credit_permit.forget();
-        self.state.record_send();
+        legacy.state.record_send();
 
         if let Err(e) = qp.post_send_wr_raw(&mut wr) {
             // Roll back credit consumption — DATA never posted.
@@ -1030,21 +1739,22 @@ impl MessageTransport {
             // underflow. In that case the driver already added the
             // permit via validate_and_add_credits.
             if self
+                .legacy()
                 .state
                 .credits_in_flight
                 .fetch_update(Ordering::Release, Ordering::Acquire, |v| v.checked_sub(1))
                 .is_ok()
             {
-                self.state.remote_credits.add_permits(1);
+                legacy.state.remote_credits.add_permits(1);
             }
             handle.map().release(token);
-            let _ = self.send_pool_tx.try_send(mr);
+            let _ = legacy.send_pool_tx.try_send(mr);
             return Err(e);
         }
         handle.notify_work();
         // === END SYNCHRONOUS SECTION ===
 
-        let send_pool_tx = self.send_pool_tx.clone();
+        let send_pool_tx = legacy.send_pool_tx.clone();
         let op = OpFuture::new_inflight(handle, token, mr).on_cancel_reclaim(Box::new(move |mr| {
             let _ = send_pool_tx.try_send(mr);
         }));
@@ -1053,7 +1763,7 @@ impl MessageTransport {
         // MR is Some on real CQE, None if quarantined (driver shutdown).
         // Only return to pool if we actually got the MR back.
         if let Some(mr) = mr {
-            let _ = self.send_pool_tx.try_send(mr);
+            let _ = legacy.send_pool_tx.try_send(mr);
         }
 
         result.map_err(|e| match &e {
@@ -1077,20 +1787,27 @@ impl MessageTransport {
     /// - [`Error::TransportClosed`] if cleanly shut down with no buffered messages
     /// - [`Error::TransportFailed`] if the driver failed with no buffered messages
     pub async fn recv(&self) -> Result<ReceivedMessage> {
-        let mut rx = self.recv_msg_rx.lock().await;
+        if matches!(self.backend, MessageTransportBackend::Engine(_)) {
+            self.await_ready().await?;
+            return Err(Error::InvalidConfig(
+                "engine-attached DATA progress is introduced in Phase 8".into(),
+            ));
+        }
+        let legacy = self.legacy();
+        let mut rx = legacy.recv_msg_rx.lock().await;
 
         // Drain already-delivered messages regardless of lifecycle state.
         if let Ok(completed) = rx.try_recv() {
             return Ok(ReceivedMessage {
                 mr: Some(completed.mr),
                 byte_len: completed.byte_len,
-                repost_tx: self.repost_tx.clone(),
+                repost_tx: legacy.repost_tx.clone(),
             });
         }
 
         // Nothing buffered: gate on readiness only while handshake is pending.
         drop(rx); // release lock during ready() wait
-        let s = self.state.state.load(Ordering::Acquire);
+        let s = legacy.state.state.load(Ordering::Acquire);
         if s == STATE_CREATED {
             self.ready().await?;
         } else if s == STATE_FAILED {
@@ -1100,13 +1817,13 @@ impl MessageTransport {
         }
 
         // Re-acquire lock and wait for next message or channel closure.
-        let mut rx = self.recv_msg_rx.lock().await;
+        let mut rx = legacy.recv_msg_rx.lock().await;
         rx.recv()
             .await
             .map(|completed| ReceivedMessage {
                 mr: Some(completed.mr),
                 byte_len: completed.byte_len,
-                repost_tx: self.repost_tx.clone(),
+                repost_tx: legacy.repost_tx.clone(),
             })
             .ok_or_else(|| self.terminal_error())
     }
@@ -1118,36 +1835,48 @@ impl MessageTransport {
 
     /// Graceful async shutdown.
     ///
-    /// Signals the driver to shut down and waits for it to reach
-    /// a terminal state. Does NOT own the driver's `JoinHandle` —
-    /// the caller is responsible for awaiting the spawn handle.
+    /// Engine-attached transports close their engine-owned connection and
+    /// return its contextual result. Endpoint-oriented transports signal
+    /// their explicit driver and wait for its terminal state; the caller still
+    /// owns and awaits that driver's `JoinHandle`.
     ///
     /// Returns immediately if the driver has already stopped (including
     /// if the driver was never spawned and was dropped). If the driver
     /// has been constructed but neither spawned nor dropped, `close()`
     /// waits indefinitely; drop the driver to force a terminal state.
-    pub async fn close(&self) {
+    pub async fn close(&self) -> Result<()> {
+        if let MessageTransportBackend::Engine(engine) = &self.backend {
+            engine.state.begin_close();
+            let prior_error = lock_std(&engine.state.error).clone();
+            let result = engine.connection.close().await;
+            engine.state.finish_close(&result);
+            return match result {
+                Err(error) => Err(error),
+                Ok(()) => prior_error.map_or(Ok(()), Err),
+            };
+        }
+        let state = &self.legacy().state;
         // Try to transition to Closing atomically
-        let _ = self.state.state.compare_exchange(
+        let _ = state.state.compare_exchange(
             STATE_CREATED,
             STATE_CLOSING,
             Ordering::AcqRel,
             Ordering::Acquire,
         );
-        let _ = self.state.state.compare_exchange(
+        let _ = state.state.compare_exchange(
             STATE_READY,
             STATE_CLOSING,
             Ordering::AcqRel,
             Ordering::Acquire,
         );
-        self.state.remote_credits.close();
-        self.state.state_notify.notify_waiters();
+        state.remote_credits.close();
+        state.state_notify.notify_waiters();
 
         // Wait for terminal state (or return immediately if already terminal)
         loop {
-            let notified = self.state.state_notify.notified();
-            if self.state.is_terminal() {
-                return;
+            let notified = state.state_notify.notified();
+            if state.is_terminal() {
+                return Ok(());
             }
             notified.await;
         }
@@ -1156,10 +1885,14 @@ impl MessageTransport {
 
 impl Drop for MessageTransport {
     fn drop(&mut self) {
-        // Signal frontend absence to the driver
-        self.state.frontend_alive.store(false, Ordering::Release);
-        self.state.remote_credits.close();
-        self.state.state_notify.notify_waiters();
+        match &self.backend {
+            MessageTransportBackend::Legacy(legacy) => {
+                legacy.state.frontend_alive.store(false, Ordering::Release);
+                legacy.state.remote_credits.close();
+                legacy.state.state_notify.notify_waiters();
+            }
+            MessageTransportBackend::Engine(engine) => engine.state.begin_close(),
+        }
     }
 }
 
@@ -1936,6 +2669,199 @@ fn post_send_and_detach(
 }
 
 #[cfg(test)]
+mod setup_tests {
+    use super::*;
+    use crate::v2::engine::{BatchOwnershipTransfer, PreparedBatchOwnership};
+    use crate::v2::qp::BatchPostOutcome;
+
+    #[test]
+    fn checked_message_capacity_derivation_and_default_headroom_are_exact() {
+        let config = MessageTransportBuilder::new()
+            .derive_engine_config()
+            .unwrap();
+        assert_eq!(config.connection.maximum_send_work_requests(), 19);
+        assert_eq!(config.connection.maximum_receive_work_requests(), 34);
+        assert_eq!(
+            config.connection.maximum_send_work_requests()
+                + config.connection.maximum_receive_work_requests(),
+            53
+        );
+        assert_eq!(256 * 53, 13_568);
+        assert_eq!(16_384 - 13_568, 2_816);
+
+        let minimum = MessageTransportBuilder::new()
+            .send_buffers(1)
+            .recv_buffers(1)
+            .derive_engine_config()
+            .unwrap();
+        assert_eq!(minimum.connection.maximum_send_work_requests(), 4);
+        assert_eq!(minimum.connection.maximum_receive_work_requests(), 3);
+    }
+
+    #[test]
+    fn explicit_connection_config_may_exceed_but_not_undershoot_derivation() {
+        let exact = RdmaConnectionConfig::default()
+            .max_send_wr(7)
+            .max_recv_wr(10);
+        let config = MessageTransportBuilder::new()
+            .send_buffers(4)
+            .recv_buffers(8)
+            .connection_config(exact.clone())
+            .derive_engine_config()
+            .unwrap();
+        assert_eq!(config.connection, exact);
+
+        let larger = RdmaConnectionConfig::default()
+            .max_send_wr(8)
+            .max_recv_wr(11);
+        assert!(
+            MessageTransportBuilder::new()
+                .send_buffers(4)
+                .recv_buffers(8)
+                .connection_config(larger)
+                .derive_engine_config()
+                .is_ok()
+        );
+        for insufficient in [
+            RdmaConnectionConfig::default()
+                .max_send_wr(6)
+                .max_recv_wr(10),
+            RdmaConnectionConfig::default()
+                .max_send_wr(7)
+                .max_recv_wr(9),
+        ] {
+            assert!(matches!(
+                MessageTransportBuilder::new()
+                    .send_buffers(4)
+                    .recv_buffers(8)
+                    .connection_config(insufficient)
+                    .derive_engine_config(),
+                Err(Error::InvalidConfig(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn zero_and_overflow_inputs_fail_before_engine_establishment() {
+        for builder in [
+            MessageTransportBuilder::new().send_buffers(0),
+            MessageTransportBuilder::new().recv_buffers(0),
+            MessageTransportBuilder::new().buffer_size(0),
+            MessageTransportBuilder::new().send_buffers(usize::MAX),
+            MessageTransportBuilder::new().recv_buffers(usize::MAX),
+        ] {
+            assert!(matches!(
+                builder.derive_engine_config(),
+                Err(Error::InvalidConfig(_))
+            ));
+        }
+        if usize::BITS > 32 {
+            let builder = MessageTransportBuilder::new().buffer_size(u32::MAX as usize + 1);
+            assert!(matches!(
+                builder.derive_engine_config(),
+                Err(Error::InvalidConfig(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn accepted_prefix_and_ambiguous_setup_ownership_are_exact() {
+        let count = 5;
+        for first_unaccepted in 0..count {
+            let transfer = PreparedBatchOwnership::new((0..count).collect::<Vec<_>>())
+                .unwrap()
+                .consume(BatchPostOutcome::PrefixAccepted {
+                    accepted: first_unaccepted,
+                    first_unaccepted,
+                    source: std::io::Error::from_raw_os_error(libc::ENOMEM),
+                });
+            let BatchOwnershipTransfer::Partial {
+                accepted,
+                unaccepted,
+                ..
+            } = transfer
+            else {
+                panic!("valid bad_wr membership must produce an exact split");
+            };
+            assert_eq!(accepted, (0..first_unaccepted).collect::<Vec<_>>());
+            assert_eq!(unaccepted, (first_unaccepted..count).collect::<Vec<_>>());
+        }
+
+        let accepted = PreparedBatchOwnership::new((0..count).collect::<Vec<_>>())
+            .unwrap()
+            .consume(BatchPostOutcome::AllAccepted);
+        assert!(matches!(
+            accepted,
+            BatchOwnershipTransfer::Accepted(entries) if entries.len() == count
+        ));
+
+        let ambiguous = PreparedBatchOwnership::new((0..count).collect::<Vec<_>>())
+            .unwrap()
+            .consume(BatchPostOutcome::Ambiguous {
+                source: std::io::Error::from_raw_os_error(libc::EIO),
+            });
+        assert!(matches!(
+            ambiguous,
+            BatchOwnershipTransfer::Ambiguous { retained, .. }
+                if retained.len() == count
+        ));
+    }
+}
+
+#[cfg(test)]
+mod hello_tests {
+    use super::*;
+    use crate::v2::engine::{
+        DEFAULT_MESSAGE_HELLO_DEADLINE, MAX_MESSAGE_HELLO_DEADLINE, MIN_MESSAGE_HELLO_DEADLINE,
+    };
+
+    fn hello(capacity: u32, maximum: u32) -> protocol::HelloPayload {
+        protocol::HelloPayload {
+            data_recv_capacity: capacity,
+            max_message_size: maximum,
+            protocol_version: protocol::PROTO_VERSION as u32,
+        }
+    }
+
+    #[test]
+    fn hello_deadline_default_and_bounds_are_exact() {
+        assert_eq!(DEFAULT_MESSAGE_HELLO_DEADLINE, Duration::from_secs(10));
+        assert_eq!(MIN_MESSAGE_HELLO_DEADLINE, Duration::from_millis(1));
+        assert_eq!(MAX_MESSAGE_HELLO_DEADLINE, Duration::from_secs(5 * 60));
+    }
+
+    #[test]
+    fn hello_negotiates_exact_peer_receive_credits_and_message_boundary() {
+        assert_eq!(validate_peer_hello(hello(32, 65_536), 65_536).unwrap(), 32);
+        assert!(matches!(
+            validate_peer_hello(hello(0, 65_536), 65_536),
+            Err(Error::ProtocolViolation(_))
+        ));
+        assert!(matches!(
+            validate_peer_hello(hello(32, 65_535), 65_536),
+            Err(Error::ProtocolViolation(_))
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hello_timeout_is_contextual_and_wakes_ready_waiters() {
+        let config = MessageTransportBuilder::new()
+            .derive_engine_config()
+            .unwrap();
+        let state = Arc::new(EngineMessageState::new(&config));
+        let ready_state = Arc::clone(&state);
+        let ready = tokio::spawn(async move { ready_state.ready().await });
+        tokio::task::yield_now().await;
+        state.deadline_expired();
+        let error = ready.await.unwrap().unwrap_err();
+        assert!(matches!(
+            error,
+            Error::ProtocolViolation(message) if message == "HELLO handshake timeout"
+        ));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2116,9 +3042,9 @@ mod tests {
         let cfg = b.derive_config();
         // max_send_wr = send_count + ctrl_send_count + 1 = 4 + 2 + 1 = 7
         assert_eq!(cfg.max_send_wr, 7);
-        // max_recv_wr = recv_count + ctrl_recv_count + 1 = 8 + 2 + 1 = 11
-        assert_eq!(cfg.max_recv_wr, 11);
-        // total = 7 + 11 = 18; inflight = 18
-        assert_eq!(cfg.inflight_capacity, 18);
+        // max_recv_wr = recv_count + ctrl_recv_count = 8 + 2 = 10
+        assert_eq!(cfg.max_recv_wr, 10);
+        // total = 7 + 10 = 17; inflight = 17
+        assert_eq!(cfg.inflight_capacity, 17);
     }
 }

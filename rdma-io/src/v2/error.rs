@@ -138,7 +138,14 @@ impl Clone for Error {
 
 fn clone_io_error(error: &io::Error) -> io::Error {
     match error.raw_os_error() {
-        Some(code) => io::Error::from_raw_os_error(code),
+        Some(code) => {
+            let os_error = io::Error::from_raw_os_error(code);
+            if os_error.kind() == error.kind() && os_error.to_string() == error.to_string() {
+                os_error
+            } else {
+                io::Error::new(error.kind(), error.to_string())
+            }
+        }
         None => io::Error::new(error.kind(), error.to_string()),
     }
 }
@@ -372,6 +379,22 @@ mod tests {
         let te = TransportError::from_error(&Error::DriverShutdown);
         let e = Error::TransportFailed(te);
         assert!(e.source().is_some());
+    }
+
+    #[test]
+    fn cloning_contextual_io_error_preserves_its_message() {
+        let original = io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "connect 192.0.2.1:7471: provider rejected route",
+        );
+        let cloned = clone_io_error(&original);
+        assert_eq!(cloned.kind(), original.kind());
+        assert_eq!(cloned.to_string(), original.to_string());
+
+        let original = io::Error::from_raw_os_error(libc::ENOMEM);
+        let cloned = clone_io_error(&original);
+        assert_eq!(cloned.raw_os_error(), original.raw_os_error());
+        assert_eq!(cloned.to_string(), original.to_string());
     }
 
     #[test]

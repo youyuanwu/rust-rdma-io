@@ -124,6 +124,27 @@ impl RdmaListener {
         .await
     }
 
+    pub(crate) async fn accept_with_setup(
+        &self,
+        config: RdmaConnectionConfig,
+        setup: Box<dyn PreEstablishSetup>,
+    ) -> Result<RdmaConnection> {
+        accept_with_setup(
+            Arc::clone(&self.shared),
+            Arc::clone(&self.state),
+            config,
+            setup,
+        )
+        .await
+    }
+
+    pub(crate) fn validate_message_connection_config(
+        &self,
+        config: &RdmaConnectionConfig,
+    ) -> Result<()> {
+        config.validate(&self.shared.config, self.shared.provider.as_ref())
+    }
+
     /// Close the listener and wait for CM destruction or engine termination.
     ///
     /// Close is idempotent across clones. If the engine driver fails while the

@@ -31,7 +31,7 @@ use crate::v2::error::{Error, Result};
 
 pub(super) const TERMINAL_WORK: usize = 1 << 0;
 pub(super) const RECLAMATION_WORK: usize = 1 << 1;
-const READY_CONNECTION_WORK: usize = 1 << 2;
+pub(super) const READY_CONNECTION_WORK: usize = 1 << 2;
 const WORK_CLASS_COUNT: usize = 5;
 
 pub(super) struct WorkSignal {
@@ -226,10 +226,8 @@ impl RdmaEngineDriver {
             if let Some(connection) = self.shared.enqueue_completion(completion) {
                 self.scheduler.enqueue_connection(connection.ready());
             }
-            self.shared.ready_queue_depth.store(
-                self.scheduler.ready_connection_count(),
-                std::sync::atomic::Ordering::Release,
-            );
+            self.shared
+                .update_ready_queue_depth(self.scheduler.ready_connection_count());
             self.scheduler.mark_class_ready(WorkClass::Cq);
             return Ok(true);
         }
@@ -292,10 +290,8 @@ impl RdmaEngineDriver {
             #[cfg(not(any(test, feature = "test-hooks")))]
             let _ = completion;
         }
-        self.shared.ready_queue_depth.store(
-            self.scheduler.ready_connection_count(),
-            std::sync::atomic::Ordering::Release,
-        );
+        self.shared
+            .update_ready_queue_depth(self.scheduler.ready_connection_count());
         self.scheduler.mark_class_ready(WorkClass::Cq);
         Ok(true)
     }
@@ -404,6 +400,12 @@ impl RdmaEngineDriver {
                 );
                 Ok(())
             }
+            DeadlineKind::MessageHello => {
+                self.shared.handle_message_hello_deadline(
+                    super::registry::ConnectionToken::decode(deadline.token),
+                );
+                Ok(())
+            }
         }
     }
 
@@ -426,10 +428,11 @@ impl RdmaEngineDriver {
     }
 
     fn service_ready_connection(&mut self) -> bool {
+        if let Some(connection) = self.shared.take_published_connection() {
+            self.scheduler.enqueue_connection(connection.ready());
+        }
         let Some(connection) = self.scheduler.pop_connection() else {
-            self.shared
-                .ready_queue_depth
-                .store(0, std::sync::atomic::Ordering::Release);
+            self.shared.update_ready_queue_depth(0);
             return false;
         };
         let (_, remains_ready) = self.shared.process_connection_ready(
@@ -445,10 +448,11 @@ impl RdmaEngineDriver {
         if self.scheduler.ready_connection_count() > 0 {
             self.scheduler.mark_class_ready(WorkClass::ReadyConnection);
         }
-        self.shared.ready_queue_depth.store(
-            self.scheduler.ready_connection_count(),
-            std::sync::atomic::Ordering::Release,
-        );
+        if self.shared.has_published_connections() {
+            self.scheduler.mark_class_ready(WorkClass::ReadyConnection);
+        }
+        self.shared
+            .update_ready_queue_depth(self.scheduler.ready_connection_count());
         true
     }
 }
@@ -581,18 +585,12 @@ impl Drop for RdmaEngineDriver {
             let failure = if outstanding == 0 && cm_owners == 0 {
                 EngineFailure::DriverShutdown
             } else {
-                #[cfg(any(test, feature = "test-hooks"))]
-                let test_bundles = self.shared.test_driver.route_count();
-                #[cfg(not(any(test, feature = "test-hooks")))]
-                let test_bundles = 0;
                 self.shared
                     .diagnostic_counters
                     .engine_wedges
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 EngineFailure::Wedged {
-                    retained_bundles: (self.shared.retained_bundle_count().max(cm_owners)
-                        + test_bundles)
-                        .max(1),
+                    retained_bundles: self.shared.retained_bundle_count().max(1),
                     outstanding_operations: outstanding,
                     cq_debt: outstanding,
                 }
@@ -1675,7 +1673,7 @@ pub(super) mod test_api {
             routes.values().map(|route| route.remaining()).sum()
         }
 
-        pub(super) fn route_count(&self) -> usize {
+        pub(crate) fn route_count(&self) -> usize {
             self.routes.lock().expect("test route table poisoned").len()
         }
 

@@ -9,7 +9,7 @@ impl EngineShared {
         if self.outcome().is_some() {
             return None;
         }
-        let retained_bundles = self.connections.live().max(self.cm.retained_owner_count());
+        let retained_bundles = self.retained_bundle_count();
         let outstanding_operations = self.unsafe_outstanding_operations();
         let pending_routes = self.cm.pending_route_count();
         if retained_bundles == 0 && outstanding_operations == 0 && pending_routes == 0 {

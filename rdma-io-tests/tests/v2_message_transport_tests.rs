@@ -574,7 +574,7 @@ async fn test_shutdown_wakes_recv() {
     assert_eq!(msg.as_ref(), b"before-shutdown");
     drop(msg);
 
-    server.close().await;
+    server.close().await.unwrap();
     drop(client);
 }
 
@@ -596,7 +596,7 @@ async fn test_shutdown_wakes_pending_recv() {
     tokio::task::yield_now().await;
 
     // Use close() to trigger shutdown (driver_handles is deprecated)
-    server.close().await;
+    server.close().await.unwrap();
 
     let result = tokio::time::timeout(Duration::from_secs(10), recv_task)
         .await
@@ -616,8 +616,8 @@ async fn test_close_no_hang() {
         let (client, server) = make_transport_pair(CompletionMode::Readiness, 4, 4, 256).await;
         client.send(b"before close").await.unwrap();
         let _ = server.recv().await.unwrap();
-        client.close().await;
-        server.close().await;
+        client.close().await.unwrap();
+        server.close().await.unwrap();
     })
     .await;
     assert!(result.is_ok(), "close should not hang");
@@ -912,7 +912,7 @@ async fn test_frontend_close_exits_driver() {
     client_transport.send(b"test").await.unwrap();
     let _ = server_transport.recv().await.unwrap();
 
-    client_transport.close().await;
+    client_transport.close().await.unwrap();
 
     let result = tokio::time::timeout(Duration::from_secs(10), client_driver_handle).await;
     assert!(result.is_ok(), "driver should exit after close()");
@@ -1346,7 +1346,7 @@ async fn test_error_observation_clean_close_no_error() {
     let _ = server_transport.recv().await.unwrap();
 
     // Clean close
-    client_transport.close().await;
+    client_transport.close().await.unwrap();
     let driver_result = tokio::time::timeout(Duration::from_secs(10), client_driver_handle)
         .await
         .expect("driver should exit after close");
@@ -2047,7 +2047,7 @@ async fn test_graceful_close_drains_real_cqes() {
     drop(msg);
 
     // Graceful close — driver enters Phase C, QP→ERR, CQ drain
-    client.close().await;
+    client.close().await.unwrap();
 
     // After close, send fails
     assert!(client.send(b"after-close").await.is_err());

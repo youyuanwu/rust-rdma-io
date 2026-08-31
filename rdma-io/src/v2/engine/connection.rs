@@ -13,7 +13,7 @@ use super::operation::RdmaOperation;
 use super::registry::{
     ConnectionToken, OperationToken, lock_unpoison, read_unpoison, write_unpoison,
 };
-use super::{EngineShared, RdmaConnectionConfig};
+use super::{ConnectionReadyWork, EngineShared, RdmaConnectionConfig};
 use crate::cm::{CmId, ConnParam, EventChannel};
 use crate::v2::error::{Error, Result};
 use crate::v2::mr::{AccessIntent, Mr, RemoteMr};
@@ -34,8 +34,8 @@ pub struct RdmaConnectionIdentity {
 /// The connection exposes owned operation futures but no raw PD, QP, CQ, CM,
 /// or independently pollable completion-driver handle.
 pub struct RdmaConnection {
-    pub(super) shared: Arc<EngineShared>,
-    pub(super) state: Arc<ConnectionState>,
+    pub(crate) shared: Arc<EngineShared>,
+    pub(crate) state: Arc<ConnectionState>,
 }
 
 impl Clone for RdmaConnection {
@@ -49,6 +49,11 @@ impl Clone for RdmaConnection {
 }
 
 impl RdmaConnection {
+    pub(crate) fn from_state(shared: Arc<EngineShared>, state: Arc<ConnectionState>) -> Self {
+        state.frontend_count.fetch_add(1, Ordering::Relaxed);
+        Self { shared, state }
+    }
+
     /// Register owned memory against this engine's shared protection domain.
     pub fn register_memory(&self, len: usize, access: AccessIntent) -> Result<Mr> {
         self.shared.register_memory(len, access)
@@ -118,6 +123,21 @@ impl RdmaConnection {
         self.state.identity()
     }
 
+    pub(crate) fn attach_ready_work(&self, work: Arc<dyn ConnectionReadyWork>) -> Result<()> {
+        self.state.attach_ready_work(work)?;
+        self.shared.schedule_deadline(
+            super::DeadlineKind::MessageHello,
+            self.state.token.encode(),
+            self.shared.config.hello_deadline,
+        );
+        self.shared.publish_connection_ready(&self.state);
+        Ok(())
+    }
+
+    pub(crate) fn publish_ready_work(&self) {
+        self.shared.publish_connection_ready(&self.state);
+    }
+
     /// Stop new posting and wait for the exact accepted set to drain.
     ///
     /// A successful close retires the CM route and connection registry
@@ -168,7 +188,7 @@ impl Drop for RdmaConnection {
     }
 }
 
-pub(super) struct ConnectionState {
+pub(crate) struct ConnectionState {
     pub(super) token: ConnectionToken,
     qp_num: u32,
     config: RdmaConnectionConfig,
@@ -181,6 +201,8 @@ pub(super) struct ConnectionState {
     local_credits: Mutex<LocalCredits>,
     accepted: Mutex<HashSet<AcceptedWrIdentity>>,
     completions: Mutex<VecDeque<WorkCompletion>>,
+    ready_work: Mutex<Option<Arc<dyn ConnectionReadyWork>>>,
+    ready_published: AtomicBool,
     close_started: AtomicBool,
     close_outcome: Mutex<Option<CloseOutcome>>,
     close_notify: Notify,
@@ -191,6 +213,7 @@ pub(super) struct ConnectionState {
     retirement_requested: AtomicBool,
     retirement_started: AtomicBool,
     drained_recorded: AtomicBool,
+    draining_counted: AtomicBool,
     retired: AtomicBool,
     admission: Mutex<Option<ConnectionReservation>>,
     cm_route: Option<ConnectionCmRoute>,
@@ -219,6 +242,8 @@ impl ConnectionState {
             local_credits: Mutex::new(LocalCredits::default()),
             accepted: Mutex::new(HashSet::new()),
             completions: Mutex::new(VecDeque::new()),
+            ready_work: Mutex::new(None),
+            ready_published: AtomicBool::new(false),
             close_started: AtomicBool::new(false),
             close_outcome: Mutex::new(None),
             close_notify: Notify::new(),
@@ -229,6 +254,7 @@ impl ConnectionState {
             retirement_requested: AtomicBool::new(false),
             retirement_started: AtomicBool::new(false),
             drained_recorded: AtomicBool::new(false),
+            draining_counted: AtomicBool::new(false),
             retired: AtomicBool::new(false),
             admission: Mutex::new(admission),
             cm_route,
@@ -323,6 +349,43 @@ impl ConnectionState {
         !lock_unpoison(&self.completions).is_empty()
     }
 
+    pub(super) fn attach_ready_work(&self, work: Arc<dyn ConnectionReadyWork>) -> Result<()> {
+        let mut current = lock_unpoison(&self.ready_work);
+        if current.is_some() {
+            return Err(Error::InvalidConfig(
+                "connection already has attached ready work".into(),
+            ));
+        }
+        *current = Some(work);
+        Ok(())
+    }
+
+    pub(super) fn process_ready_work(&self, budget: usize) -> usize {
+        lock_unpoison(&self.ready_work)
+            .as_ref()
+            .map_or(0, |work| work.process(budget))
+    }
+
+    pub(super) fn has_attached_work(&self) -> bool {
+        lock_unpoison(&self.ready_work)
+            .as_ref()
+            .is_some_and(|work| work.has_work())
+    }
+
+    pub(super) fn handle_message_deadline(&self) {
+        if let Some(work) = lock_unpoison(&self.ready_work).as_ref() {
+            work.deadline_expired();
+        }
+    }
+
+    pub(super) fn mark_ready_published(&self) -> bool {
+        !self.ready_published.swap(true, Ordering::AcqRel)
+    }
+
+    pub(super) fn clear_ready_published(&self) {
+        self.ready_published.store(false, Ordering::Release);
+    }
+
     pub(super) fn stop_posting(&self) {
         let _posting = write_unpoison(&self.posting_gate);
         self.posting_open.store(false, Ordering::Release);
@@ -338,22 +401,32 @@ impl ConnectionState {
         if let Some(error) = outcome.clone().into_result().err() {
             let mut close_outcome = lock_unpoison(&self.close_outcome);
             if close_outcome.is_none() {
-                *close_outcome = Some(CloseOutcome::Failed(error));
+                *close_outcome = Some(CloseOutcome::Failed(error.clone()));
+            }
+            drop(close_outcome);
+            if let Some(work) = lock_unpoison(&self.ready_work).as_ref() {
+                work.terminalize(error);
             }
         }
     }
 
     pub(super) fn mark_disconnected(&self) {
         self.stop_posting();
+        if let Some(work) = lock_unpoison(&self.ready_work).as_ref() {
+            work.disconnected();
+        }
     }
 
     pub(super) fn mark_cm_failure(&self, error: Error) {
         self.stop_posting();
         let mut outcome = lock_unpoison(&self.close_outcome);
         if outcome.is_none() {
-            *outcome = Some(CloseOutcome::Failed(error));
+            *outcome = Some(CloseOutcome::Failed(error.clone()));
         }
         drop(outcome);
+        if let Some(work) = lock_unpoison(&self.ready_work).as_ref() {
+            work.terminalize(error);
+        }
         self.close_notify.notify_waiters();
     }
 
@@ -490,6 +563,14 @@ impl ConnectionState {
         !self.drained_recorded.swap(true, Ordering::AcqRel)
     }
 
+    pub(super) fn mark_draining_counted(&self) -> bool {
+        !self.draining_counted.swap(true, Ordering::AcqRel)
+    }
+
+    pub(super) fn take_draining_counted(&self) -> bool {
+        self.draining_counted.swap(false, Ordering::AcqRel)
+    }
+
     pub(super) fn cm_route(&self) -> Option<ConnectionCmRoute> {
         self.cm_route
     }
@@ -615,7 +696,7 @@ impl OperationKind {
     }
 }
 
-pub(super) trait WorkRequestPoster: Send + Sync {
+pub(crate) trait WorkRequestPoster: Send + Sync {
     fn qp_num(&self) -> u32;
     fn capabilities(&self) -> Option<QpCapabilities>;
     fn post_send(&self, batch: &mut PreparedSendBatch) -> BatchPostOutcome;
@@ -884,7 +965,7 @@ impl WorkRequestPoster for VerbsConnectionResources {
     dead_code,
     reason = "used by the test-only external-CM connection installer"
 )]
-pub(super) fn install_connection(
+pub(crate) fn install_connection(
     shared: &Arc<EngineShared>,
     poster: Arc<dyn WorkRequestPoster>,
     config: RdmaConnectionConfig,
