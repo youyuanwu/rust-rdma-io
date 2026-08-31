@@ -607,6 +607,11 @@ impl PreEstablishSetup for MessagePreEstablishSetup {
 /// the transport's receive pool for reposting, which also sends a
 /// CREDIT frame to the peer.
 ///
+/// `ReceivedMessage` implements `AsRef<[u8]>` and
+/// `Deref<Target = [u8]>`. Both views are exactly the application payload:
+/// they exclude the public [`crate::v2::protocol`] header and have length
+/// [`Self::len`].
+///
 /// # Cancellation Safety
 ///
 /// Dropping a `ReceivedMessage` safely returns its buffer for reposting.
@@ -1292,6 +1297,10 @@ impl EngineMessageState {
                 if let Err(error) = result.map_err(normalize_message_completion_error)
                     && self.state.load(Ordering::Acquire) == STATE_READY
                 {
+                    // A control-send CapacityExhausted result is deliberately
+                    // terminal, unlike queued DATA backpressure. Retrying it
+                    // inside the same bounded work budget could repeatedly
+                    // claim and restore CREDIT returns without yielding.
                     self.fail(error, true);
                 }
             }

@@ -33,12 +33,24 @@ pub mod test_helpers {
     /// can pick a device that rejects raw PD/QP/GID operations (ENODEV/EPERM).
     /// Those tests gate on this so they run in CI and skip on such hardware.
     pub fn has_software_rdma() -> bool {
-        rdma_io::device::devices()
+        let present = rdma_io::device::devices()
             .map(|ds| {
                 ds.iter()
                     .any(|d| d.name().starts_with("siw") || d.name().starts_with("rxe"))
             })
-            .unwrap_or(false)
+            .unwrap_or(false);
+        enforce_software_rdma_requirement(
+            present,
+            std::env::var_os("RDMA_REQUIRE_PROVIDER").is_some_and(|value| value == "1"),
+        )
+    }
+
+    pub(crate) fn enforce_software_rdma_requirement(present: bool, required: bool) -> bool {
+        assert!(
+            present || !required,
+            "RDMA_REQUIRE_PROVIDER=1 but no rxe/siw software RDMA device is available"
+        );
+        present
     }
 
     /// Returns `true` if any local device advertises RDMA atomic support
@@ -448,7 +460,18 @@ pub mod engine_test_helpers {
 
 #[cfg(test)]
 mod tests {
-    use super::test_helpers::is_transient_cm_error;
+    use super::test_helpers::{enforce_software_rdma_requirement, is_transient_cm_error};
+
+    #[test]
+    #[should_panic(expected = "RDMA_REQUIRE_PROVIDER=1")]
+    fn required_provider_absence_is_a_hard_failure() {
+        enforce_software_rdma_requirement(false, true);
+    }
+
+    #[test]
+    fn optional_provider_absence_still_allows_skip_guards() {
+        assert!(!enforce_software_rdma_requirement(false, false));
+    }
 
     #[test]
     fn transient_cm_error_accepts_retryable_async_cm_events() {

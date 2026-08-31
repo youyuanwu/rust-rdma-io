@@ -139,6 +139,9 @@ impl EngineResources {
             cq_notification_fds: usize::from(self.cq.fd().is_some()),
             cm_event_channels: usize::from(!self.cm_event_channel.as_raw().is_null()),
             cm_event_fds: usize::from(self.cm_event_channel.fd() >= 0),
+            // These are declarative construction invariants rather than
+            // runtime-observed task counts. `build()` returns one driver, and
+            // v2_no_hidden_spawn independently rejects internal task creation.
             explicit_drivers: 1,
             library_owned_tasks: 0,
         }

@@ -803,11 +803,11 @@ pub(super) mod test_api {
             None
         }
 
-        fn post_send(&self, _batch: &mut PreparedSendBatch) -> BatchPostOutcome {
+        fn post_send(&self, _batch: &mut PreparedSendBatch) -> Result<BatchPostOutcome> {
             unreachable!("idle registry fixtures never post")
         }
 
-        fn post_recv(&self, _batch: &mut PreparedRecvBatch) -> BatchPostOutcome {
+        fn post_recv(&self, _batch: &mut PreparedRecvBatch) -> Result<BatchPostOutcome> {
             unreachable!("idle registry fixtures never post")
         }
 

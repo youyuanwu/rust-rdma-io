@@ -18,10 +18,6 @@ impl EngineShared {
         let first = connection.begin_close();
         let mut operations_to_wake = Vec::new();
         if first {
-            self.mark_quarantined_connection_draining(connection.token);
-            if connection.mark_draining_counted() {
-                self.draining_connections.fetch_add(1, Ordering::AcqRel);
-            }
             self.diagnostic_counters
                 .connections_drain_started
                 .fetch_add(1, Ordering::Relaxed);
@@ -35,10 +31,7 @@ impl EngineShared {
                 Ok(false) => {}
                 Err(error) => {
                     connection.mark_cm_failure(error.clone());
-                    if connection.take_draining_counted() {
-                        let previous = self.draining_connections.fetch_sub(1, Ordering::AcqRel);
-                        debug_assert!(previous > 0, "failed drain must have been counted");
-                    }
+                    connection.rollback_draining_count();
                     drop(lifecycle);
                     drop(admission);
                     self.finish(EngineOutcome::Failure(EngineFailure::from_progress(error)));
@@ -131,11 +124,7 @@ impl EngineShared {
         if !connection.recover_quarantine() {
             return;
         }
-        if self.clear_connection_quarantine(connection.token) {
-            self.diagnostic_counters
-                .quarantine_recoveries
-                .fetch_add(1, Ordering::Relaxed);
-        }
+        self.recover_connection_quarantine_entry(connection.token);
     }
 
     pub(super) fn record_connection_drained(&self, connection: &ConnectionState) {
@@ -153,7 +142,6 @@ impl EngineShared {
     }
 
     pub(super) fn record_connection_retired(&self, connection: &ConnectionState) {
-        self.finish_connection_drain_count(connection);
         // Successful retirement may clear the connection-level marker after
         // exact accepted-WR accounting reached zero. Any operation-level
         // quarantine entry remains tracked, so a mismatched retirement cannot
@@ -164,21 +152,13 @@ impl EngineShared {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(super) fn record_connection_retirement_failure(&self, connection: &ConnectionState) {
-        self.finish_connection_drain_count(connection);
+    pub(super) fn record_connection_retirement_failure(&self, _connection: &ConnectionState) {
         // Fail closed: keep the quarantine entry and oldest-age gauge pinned.
         // A failed generation retirement cannot prove that routing identity or
         // retained provider ownership is safe to recycle.
         self.diagnostic_counters
             .connections_failed
             .fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn finish_connection_drain_count(&self, connection: &ConnectionState) {
-        if connection.take_draining_counted() {
-            let previous = self.draining_connections.fetch_sub(1, Ordering::AcqRel);
-            debug_assert!(previous > 0, "retired draining connection must be counted");
-        }
     }
 }
 
@@ -234,11 +214,11 @@ mod tests {
             None
         }
 
-        fn post_send(&self, _: &mut PreparedSendBatch) -> BatchPostOutcome {
+        fn post_send(&self, _: &mut PreparedSendBatch) -> Result<BatchPostOutcome> {
             unreachable!("drain test does not post")
         }
 
-        fn post_recv(&self, _: &mut PreparedRecvBatch) -> BatchPostOutcome {
+        fn post_recv(&self, _: &mut PreparedRecvBatch) -> Result<BatchPostOutcome> {
             unreachable!("drain test does not post")
         }
 

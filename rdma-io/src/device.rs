@@ -156,8 +156,7 @@ impl Drop for Context {
                     self.inner as usize,
                 );
             }
-            ContextOwnership::Anchored(anchor) => {
-                let _ = Arc::strong_count(anchor);
+            ContextOwnership::Anchored(_anchor) => {
                 #[cfg(any(test, feature = "test-hooks"))]
                 crate::test_support::destruction::record(
                     crate::test_support::destruction::DestructionKind::ContextFacade,

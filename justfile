@@ -97,6 +97,7 @@ validate-v2-engine:
     cargo check -p rdma-io --no-default-features
     cargo build --no-default-features --features async
     cargo check -p rdma-io --no-default-features --features tokio
+    cargo build -p rdma-io --release --no-default-features --features tokio
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets --features tokio -- -D warnings
     cargo doc --workspace --features tokio --no-deps

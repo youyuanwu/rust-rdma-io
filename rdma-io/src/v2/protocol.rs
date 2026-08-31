@@ -1,6 +1,6 @@
-//! Wire protocol for the v2 message transport.
+//! Public wire protocol helpers for the v2 message transport.
 //!
-//! Defines a minimal internal protocol with three frame types:
+//! Defines the message transport protocol with three frame types:
 //!
 //! | Type | Code | Purpose |
 //! |------|------|---------|
@@ -33,6 +33,10 @@
 //! [`parse_header`] validates magic, version, and frame type.
 //! [`parse_hello`] / [`parse_credit`] validate payload lengths.
 //! Protocol violations produce [`Error::ProtocolViolation`].
+//!
+//! The module is public so applications, packet analyzers, and interoperability
+//! tests can use the exact frame constants and parsing/writing helpers. Normal
+//! [`crate::v2::MessageTransport`] users do not need to encode frames directly.
 
 use super::error::{Error, Result};
 
@@ -216,7 +220,9 @@ pub fn parse_header(buf: &[u8], received_len: usize) -> Result<FrameHeader> {
     }
 
     let payload_len = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
-    let total = HEADER_SIZE + payload_len as usize;
+    let total = HEADER_SIZE
+        .checked_add(payload_len as usize)
+        .ok_or_else(|| Error::ProtocolViolation("frame length overflow".into()))?;
     if total > received_len {
         return Err(Error::ProtocolViolation(format!(
             "payload extends past received data: header says {total}, got {received_len}"

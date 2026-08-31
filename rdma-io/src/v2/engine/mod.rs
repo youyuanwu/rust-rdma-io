@@ -12,6 +12,19 @@
 //! completion or provider-proven rejection establishes a positive safety
 //! boundary.
 //!
+//! ```no_run
+//! # use rdma_io::v2::{RdmaEngineBuilder, Result};
+//! # async fn run_engine() -> Result<()> {
+//! let (engine, driver) = RdmaEngineBuilder::new("rxe0").build()?;
+//! let driver_task = tokio::spawn(driver);
+//!
+//! // All connections and listeners created through `engine` share this driver.
+//! engine.shutdown().await?;
+//! driver_task.await.expect("engine driver task panicked")?;
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! See the crate repository's `docs/design/v2-rdma-engine.md` for the complete
 //! architecture, configuration table, wakeup proof, and provider procedure.
 
@@ -241,6 +254,13 @@ impl RdmaEngineBuilder {
 /// Cloning this value never starts work. All CQ, CM, reclamation, and
 /// connection-local progress remains owned by the paired [`RdmaEngineDriver`].
 /// The handle is `Clone + Send + Sync + 'static`.
+///
+/// Dropping the last `RdmaEngine` handle requests engine shutdown. Existing
+/// [`RdmaConnection`], [`RdmaListener`], and message-transport handles retain
+/// shared safety state but do not count as engine frontend handles and do not
+/// prevent that shutdown request. Keep at least one engine clone alive until
+/// new submissions are finished, and prefer [`RdmaEngine::shutdown`] when the
+/// terminal result must be observed.
 pub struct RdmaEngine {
     pub(crate) shared: Arc<EngineShared>,
 }
@@ -376,6 +396,14 @@ impl Drop for RdmaEngine {
 /// guarantee, so latency-sensitive runtimes should await graceful shutdown
 /// before dropping or aborting the driver task.
 ///
+/// Ordinary polls can also execute synchronous FFI. Depending on the selected
+/// work, a poll may poll/arm/get/ack CQ events; create, bind, listen, resolve,
+/// connect, accept, reject, disconnect, or destroy CM IDs; create/modify/post
+/// SEND or RECV work to/destroy QPs; and register or deregister MRs. These
+/// provider calls have no wall-clock latency guarantee; run the driver where
+/// occasional blocking provider work cannot stall unrelated latency-sensitive
+/// futures.
+///
 /// With `panic=abort`, polling deliberately skips Tokio's panic-based optional
 /// time-driver probe. Polling without an armed deadline therefore works on any
 /// active Tokio runtime. Tokio exposes no safe time-capability query, so a
@@ -411,7 +439,6 @@ pub(crate) struct EngineShared {
     quarantined_operations: AtomicUsize,
     quarantined_mrs: AtomicUsize,
     quarantined_bytes: AtomicUsize,
-    draining_connections: AtomicUsize,
     ready_queue_depth: AtomicUsize,
     published_ready_connections: Mutex<VecDeque<registry::ConnectionToken>>,
     deadline_requests: Mutex<VecDeque<DeadlineRequest>>,
@@ -457,7 +484,6 @@ struct QuarantineState {
     starts: BTreeMap<Instant, usize>,
     oldest: Option<Instant>,
     connection_entries: HashMap<registry::ConnectionToken, usize>,
-    non_draining_connections: HashSet<registry::ConnectionToken>,
 }
 
 impl EngineShared {
@@ -487,7 +513,6 @@ impl EngineShared {
             quarantined_operations: AtomicUsize::new(0),
             quarantined_mrs: AtomicUsize::new(0),
             quarantined_bytes: AtomicUsize::new(0),
-            draining_connections: AtomicUsize::new(0),
             ready_queue_depth: AtomicUsize::new(0),
             published_ready_connections: Mutex::new(VecDeque::new()),
             deadline_requests: Mutex::new(VecDeque::new()),
@@ -742,10 +767,6 @@ impl EngineShared {
     }
 
     fn track_quarantine(&self, key: QuarantineKey, entry: QuarantineEntry) -> bool {
-        let connection_is_draining = matches!(
-            self.connections.lookup(entry.connection),
-            registry::Lookup::Occupied(connection) if connection.close_started()
-        );
         let mut quarantines = lock_unpoison(&self.quarantines);
         if quarantines.entries.contains_key(&key) {
             return false;
@@ -764,42 +785,37 @@ impl EngineShared {
             .or_insert(0);
         let first_for_connection = *connection_entries == 0;
         *connection_entries += 1;
-        if first_for_connection && !connection_is_draining {
-            quarantines
-                .non_draining_connections
-                .insert(entry.connection);
-        }
-        drop(quarantines);
         if first_for_connection
-            && !connection_is_draining
-            && matches!(
-                self.connections.lookup(entry.connection),
-                registry::Lookup::Occupied(connection) if connection.close_started()
-            )
+            && let registry::Lookup::Occupied(connection) =
+                self.connections.lookup(entry.connection)
         {
-            self.mark_quarantined_connection_draining(entry.connection);
+            connection.mark_diagnostic_quarantined();
         }
         first_for_connection
     }
 
-    fn mark_quarantined_connection_draining(&self, token: registry::ConnectionToken) {
-        lock_unpoison(&self.quarantines)
-            .non_draining_connections
-            .remove(&token);
+    fn clear_connection_quarantine(&self, token: registry::ConnectionToken) -> bool {
+        self.clear_quarantine(QuarantineKey::Connection(token), token, false)
     }
 
-    fn clear_connection_quarantine(&self, token: registry::ConnectionToken) -> bool {
-        self.clear_quarantine(QuarantineKey::Connection(token), token)
+    fn recover_connection_quarantine_entry(&self, token: registry::ConnectionToken) -> bool {
+        self.clear_quarantine(QuarantineKey::Connection(token), token, true)
     }
 
     fn clear_operation_quarantine(&self, operation: &operation::OperationState) -> bool {
         self.clear_quarantine(
             QuarantineKey::Operation(operation.token()),
             operation.connection_token(),
+            true,
         )
     }
 
-    fn clear_quarantine(&self, key: QuarantineKey, connection: registry::ConnectionToken) -> bool {
+    fn clear_quarantine(
+        &self,
+        key: QuarantineKey,
+        connection: registry::ConnectionToken,
+        record_recovery: bool,
+    ) -> bool {
         let mut quarantines = lock_unpoison(&self.quarantines);
         let Some(entry) = quarantines.entries.remove(&key) else {
             return false;
@@ -822,22 +838,30 @@ impl EngineShared {
         if *connection_entries != 0 {
             return false;
         }
+        if record_recovery {
+            self.diagnostic_counters
+                .quarantine_recoveries
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if let registry::Lookup::Occupied(connection) = self.connections.lookup(connection) {
+            connection.mark_diagnostic_recovered();
+        } else {
+            self.connection_admission.clear_retained_quarantine();
+        }
         quarantines.connection_entries.remove(&connection);
-        quarantines.non_draining_connections.remove(&connection);
         true
     }
 
-    fn quarantine_summary(&self) -> (usize, usize, Option<Duration>) {
+    fn connection_diagnostic_summary(
+        &self,
+    ) -> (connection::ConnectionStateCountSnapshot, Option<Duration>) {
         let quarantines = lock_unpoison(&self.quarantines);
+        let counts = self.connection_admission.snapshot();
         let now = Instant::now();
         let oldest = quarantines
             .oldest
             .map(|started| now.saturating_duration_since(started));
-        (
-            quarantines.connection_entries.len(),
-            quarantines.non_draining_connections.len(),
-            oldest,
-        )
+        (counts, oldest)
     }
 
     fn connection_diagnostics(&self) -> Vec<RdmaConnectionDiagnostics> {
@@ -872,17 +896,7 @@ impl EngineShared {
         let outcome = self.outcome();
         let (listener_count, queued_inbound_requests, pending_accepts, selected_accepts) =
             self.cm.listener_counts();
-        let (quarantined_bundles, non_draining_quarantined_bundles, oldest_quarantine_age) =
-            self.quarantine_summary();
-        let registered_connections = self.connections.live();
-        let establishing_connection_reservations = self
-            .connection_admission
-            .used()
-            .saturating_sub(registered_connections);
-        let draining_connection_reservations = self.draining_connections.load(Ordering::Acquire);
-        let established_connection_reservations = registered_connections
-            .saturating_sub(draining_connection_reservations)
-            .saturating_sub(non_draining_quarantined_bundles);
+        let (connection_counts, oldest_quarantine_age) = self.connection_diagnostic_summary();
         RdmaEngineDiagnostics {
             lifecycle: self.lifecycle(),
             terminal_error: outcome.and_then(|outcome| outcome.summary()),
@@ -906,11 +920,11 @@ impl EngineShared {
             library_owned_tasks: self.resources.library_owned_tasks,
             driver_wakeups: self.shared_driver_wakeups(),
             driver_yields: self.driver_yields.load(Ordering::Acquire),
-            live_connection_reservations: self.connection_admission.used(),
-            establishing_connection_reservations,
-            established_connection_reservations,
-            draining_connection_reservations,
-            registered_live_qps: registered_connections.saturating_sub(quarantined_bundles),
+            live_connection_reservations: connection_counts.live,
+            establishing_connection_reservations: connection_counts.establishing,
+            established_connection_reservations: connection_counts.established,
+            draining_connection_reservations: connection_counts.draining,
+            registered_live_qps: connection_counts.registered_live_qps,
             free_connection_slots: self.connections.free(),
             retired_connection_slots: self.connections.retired(),
             registered_operations: self.operations.live(),
@@ -923,7 +937,7 @@ impl EngineShared {
             quarantined_operations: self.quarantined_operations.load(Ordering::Acquire),
             quarantined_mrs: self.quarantined_mrs.load(Ordering::Acquire),
             quarantined_bytes: self.quarantined_bytes.load(Ordering::Acquire),
-            quarantined_bundles,
+            quarantined_bundles: connection_counts.quarantined_bundles,
             oldest_quarantine_age,
             ready_queue_depth: self.ready_queue_depth.load(Ordering::Acquire),
             listener_count,
@@ -1160,7 +1174,7 @@ impl EngineShared {
                 .load(Ordering::Acquire),
             #[cfg(any(test, feature = "test-hooks"))]
             accepted_test_operations: self.test_driver.accepted_outstanding(),
-            detail_source: Arc::downgrade(self),
+            detail_source: diagnostics::DiagnosticsDetailSource(Arc::downgrade(self)),
         }
     }
 

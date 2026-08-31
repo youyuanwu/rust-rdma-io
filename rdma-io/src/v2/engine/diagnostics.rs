@@ -65,7 +65,7 @@ pub struct RdmaListenerDiagnostics {
 /// Creating the aggregate snapshot is constant-time with respect to registered
 /// connections and listeners. Per-object detail is collected only when
 /// [`Self::connections`] or [`Self::listeners`] is called.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RdmaEngineDiagnostics {
     /// Current monotonic engine lifecycle state.
@@ -104,9 +104,11 @@ pub struct RdmaEngineDiagnostics {
     pub shared_cm_event_channels: usize,
     /// Number of shared CM event-channel file descriptors.
     pub shared_cm_event_fds: usize,
-    /// Number of explicit engine driver futures created by `build()`.
+    /// Declarative number of driver futures returned by the one successful
+    /// `build()` call, fixed at one by construction.
     pub explicit_engine_drivers: usize,
-    /// Tasks or threads created internally by the v2 engine.
+    /// Declarative engine design invariant, fixed at zero by construction and
+    /// independently guarded by the source-level no-hidden-spawn test.
     pub library_owned_tasks: usize,
     /// Monotonic software producer wake count.
     pub driver_wakeups: u64,
@@ -125,12 +127,18 @@ pub struct RdmaEngineDiagnostics {
     /// Connection slots still available for this engine instance.
     pub free_connection_slots: usize,
     /// Connection slots permanently retired after generation exhaustion.
+    ///
+    /// Retirement never reverses, so this gauge is also the monotonic
+    /// connection-slot retirement counter.
     pub retired_connection_slots: usize,
     /// Current operation registrations, including retained quarantined WRs.
     pub registered_operations: usize,
     /// Operation slots still available for this engine instance.
     pub free_operation_slots: usize,
     /// Operation slots permanently retired after generation exhaustion.
+    ///
+    /// Retirement never reverses, so this gauge is also the monotonic
+    /// operation-slot retirement counter.
     pub retired_operation_slots: usize,
     /// Provider-accepted or acceptance-ambiguous WRs awaiting exact CQEs.
     pub accepted_outstanding_operations: usize,
@@ -286,7 +294,7 @@ pub struct RdmaEngineDiagnostics {
     #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     pub accepted_test_operations: usize,
-    pub(super) detail_source: Weak<EngineShared>,
+    pub(super) detail_source: DiagnosticsDetailSource,
 }
 
 impl RdmaEngineDiagnostics {
@@ -294,7 +302,10 @@ impl RdmaEngineDiagnostics {
     ///
     /// This explicit detail query is O(number of registered connections);
     /// unlike [`crate::v2::RdmaEngine::diagnostics`], it intentionally visits
-    /// connection registrations and locks their accepted-WR sets.
+    /// connection registrations and locks their accepted-WR sets. It returns
+    /// an empty vector if every engine handle has been dropped and the
+    /// snapshot's internal weak detail source can no longer be upgraded; that
+    /// case is indistinguishable from an engine with no registered connections.
     pub fn connections(&self) -> Vec<RdmaConnectionDiagnostics> {
         self.detail_source
             .upgrade()
@@ -304,13 +315,32 @@ impl RdmaEngineDiagnostics {
     /// Collect queue state for each currently registered listener.
     ///
     /// This explicit detail query is O(number of listeners). Entries are
-    /// ordered by listener token.
+    /// ordered by listener token. It returns an empty vector if every engine
+    /// handle has been dropped and the snapshot's internal weak detail source
+    /// can no longer be upgraded.
     pub fn listeners(&self) -> Vec<RdmaListenerDiagnostics> {
         self.detail_source
             .upgrade()
             .map_or_else(Vec::new, |shared| shared.listener_diagnostics())
     }
 }
+
+#[derive(Clone, Debug)]
+pub(super) struct DiagnosticsDetailSource(pub(super) Weak<EngineShared>);
+
+impl DiagnosticsDetailSource {
+    fn upgrade(&self) -> Option<std::sync::Arc<EngineShared>> {
+        self.0.upgrade()
+    }
+}
+
+impl PartialEq for DiagnosticsDetailSource {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for DiagnosticsDetailSource {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CqeReject {
@@ -482,5 +512,28 @@ mod tests {
         assert!(diagnostics.listeners().is_empty());
         assert_eq!(diagnostics.oldest_quarantine_age, None);
         drop(driver);
+    }
+
+    #[test]
+    fn snapshot_equality_ignores_the_internal_weak_detail_source() {
+        let (first_engine, first_driver) = test_engine_pair(CompletionMode::Polling);
+        let (second_engine, second_driver) = test_engine_pair(CompletionMode::Polling);
+
+        assert_eq!(first_engine.diagnostics(), second_engine.diagnostics());
+
+        drop(first_driver);
+        drop(second_driver);
+    }
+
+    #[test]
+    fn detail_queries_are_empty_after_the_last_engine_owner_is_gone() {
+        let (engine, driver) = test_engine_pair(CompletionMode::Polling);
+        let diagnostics = engine.diagnostics();
+
+        drop(engine);
+        drop(driver);
+
+        assert!(diagnostics.connections().is_empty());
+        assert!(diagnostics.listeners().is_empty());
     }
 }

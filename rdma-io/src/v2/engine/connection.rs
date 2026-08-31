@@ -3,7 +3,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard};
 
 use tokio::sync::Notify;
@@ -229,7 +229,6 @@ pub(crate) struct ConnectionState {
     retirement_requested: AtomicBool,
     retirement_started: AtomicBool,
     drained_recorded: AtomicBool,
-    draining_counted: AtomicBool,
     retired: AtomicBool,
     admission: Mutex<Option<ConnectionReservation>>,
     cm_route: Option<ConnectionCmRoute>,
@@ -242,9 +241,12 @@ impl ConnectionState {
         config: RdmaConnectionConfig,
         local_addr: Option<SocketAddr>,
         peer_addr: Option<SocketAddr>,
-        admission: Option<ConnectionReservation>,
+        mut admission: Option<ConnectionReservation>,
         cm_route: Option<ConnectionCmRoute>,
     ) -> Self {
+        if let Some(reservation) = admission.as_mut() {
+            reservation.mark_registered();
+        }
         Self {
             token,
             qp_num: poster.qp_num(),
@@ -270,7 +272,6 @@ impl ConnectionState {
             retirement_requested: AtomicBool::new(false),
             retirement_started: AtomicBool::new(false),
             drained_recorded: AtomicBool::new(false),
-            draining_counted: AtomicBool::new(false),
             retired: AtomicBool::new(false),
             admission: Mutex::new(admission),
             cm_route,
@@ -469,10 +470,21 @@ impl ConnectionState {
         self.error_transition_complete.load(Ordering::Acquire)
     }
 
-    pub(super) fn destroy_connection_resources(&self) -> (Option<SharedCmId>, bool) {
-        debug_assert_eq!(self.accepted_count(), 0);
+    pub(super) fn destroy_connection_resources(&self) -> Result<(Option<SharedCmId>, bool)> {
+        let outstanding_operations = self.accepted_count();
+        if outstanding_operations != 0 {
+            return Err(Error::EngineWedged {
+                retained_bundles: 1,
+                outstanding_operations,
+                cq_debt: outstanding_operations,
+            });
+        }
         self.stop_posting();
-        self.poster.destroy_connection()
+        let resources = self.poster.destroy_connection();
+        if resources.1 {
+            self.mark_qp_destroyed();
+        }
+        Ok(resources)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -565,7 +577,11 @@ impl ConnectionState {
 
     pub(super) fn begin_close(&self) -> bool {
         self.stop_posting();
-        !self.close_started.swap(true, Ordering::AcqRel)
+        let first = !self.close_started.swap(true, Ordering::AcqRel);
+        if first && let Some(reservation) = lock_unpoison(&self.admission).as_mut() {
+            reservation.mark_draining();
+        }
+        first
     }
 
     pub(super) fn try_request_retirement(&self) -> bool {
@@ -588,12 +604,28 @@ impl ConnectionState {
         !self.drained_recorded.swap(true, Ordering::AcqRel)
     }
 
-    pub(super) fn mark_draining_counted(&self) -> bool {
-        !self.draining_counted.swap(true, Ordering::AcqRel)
+    pub(super) fn rollback_draining_count(&self) {
+        if let Some(reservation) = lock_unpoison(&self.admission).as_mut() {
+            reservation.rollback_draining();
+        }
     }
 
-    pub(super) fn take_draining_counted(&self) -> bool {
-        self.draining_counted.swap(false, Ordering::AcqRel)
+    pub(super) fn mark_diagnostic_quarantined(&self) {
+        if let Some(reservation) = lock_unpoison(&self.admission).as_mut() {
+            reservation.mark_quarantined();
+        }
+    }
+
+    pub(super) fn mark_diagnostic_recovered(&self) {
+        if let Some(reservation) = lock_unpoison(&self.admission).as_mut() {
+            reservation.recover_quarantine();
+        }
+    }
+
+    pub(super) fn mark_qp_destroyed(&self) {
+        if let Some(reservation) = lock_unpoison(&self.admission).as_mut() {
+            reservation.mark_qp_destroyed();
+        }
     }
 
     pub(super) fn cm_route(&self) -> Option<ConnectionCmRoute> {
@@ -637,52 +669,276 @@ pub(super) struct AcceptedWrIdentity {
 
 pub(super) struct ConnectionAdmissionPool {
     capacity: usize,
-    used: AtomicUsize,
+    counts: Arc<ConnectionStateCounts>,
 }
 
 impl ConnectionAdmissionPool {
     pub(super) fn new(capacity: usize) -> Arc<Self> {
         Arc::new(Self {
             capacity,
-            used: AtomicUsize::new(0),
+            counts: Arc::new(ConnectionStateCounts::default()),
         })
     }
 
     pub(super) fn try_acquire(self: &Arc<Self>) -> Option<ConnectionReservation> {
-        let mut used = self.used.load(Ordering::Acquire);
-        loop {
-            if used >= self.capacity {
-                return None;
-            }
-            match self.used.compare_exchange_weak(
-                used,
-                used + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    return Some(ConnectionReservation {
-                        pool: Arc::clone(self),
-                    });
-                }
-                Err(observed) => used = observed,
-            }
+        if !self.counts.try_acquire(self.capacity) {
+            return None;
         }
+        Some(ConnectionReservation {
+            counts: Arc::clone(&self.counts),
+            state: ReservationState::Establishing,
+            qp_counted: false,
+        })
     }
 
-    pub(super) fn used(&self) -> usize {
-        self.used.load(Ordering::Acquire)
+    pub(super) fn snapshot(&self) -> ConnectionStateCountSnapshot {
+        self.counts.snapshot()
+    }
+
+    pub(super) fn clear_retained_quarantine(&self) {
+        self.counts.update(|counts| {
+            counts.quarantined_bundles = counts.quarantined_bundles.saturating_sub(1);
+        });
     }
 }
 
 pub(super) struct ConnectionReservation {
-    pool: Arc<ConnectionAdmissionPool>,
+    counts: Arc<ConnectionStateCounts>,
+    state: ReservationState,
+    qp_counted: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReservationState {
+    Establishing,
+    Established,
+    Draining,
+    QuarantinedEstablished,
+    QuarantinedDraining,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ConnectionStateCountSnapshot {
+    pub(super) live: usize,
+    pub(super) establishing: usize,
+    pub(super) established: usize,
+    pub(super) draining: usize,
+    pub(super) registered_live_qps: usize,
+    pub(super) quarantined_bundles: usize,
+}
+
+#[derive(Default)]
+struct ConnectionStateCounts {
+    writer: Mutex<()>,
+    version: AtomicU64,
+    live: AtomicUsize,
+    establishing: AtomicUsize,
+    established: AtomicUsize,
+    draining: AtomicUsize,
+    registered_live_qps: AtomicUsize,
+    quarantined_bundles: AtomicUsize,
+}
+
+impl ConnectionStateCounts {
+    fn try_acquire(&self, capacity: usize) -> bool {
+        self.update(|counts| {
+            if counts.live >= capacity {
+                return false;
+            }
+            counts.live += 1;
+            counts.establishing += 1;
+            true
+        })
+    }
+
+    fn update<T>(&self, update: impl FnOnce(&mut ConnectionStateCountSnapshot) -> T) -> T {
+        let _writer = lock_unpoison(&self.writer);
+        let previous = self.version.fetch_add(1, Ordering::AcqRel);
+        debug_assert_eq!(previous & 1, 0, "connection gauge writer must be exclusive");
+        let mut counts = ConnectionStateCountSnapshot {
+            live: self.live.load(Ordering::Relaxed),
+            establishing: self.establishing.load(Ordering::Relaxed),
+            established: self.established.load(Ordering::Relaxed),
+            draining: self.draining.load(Ordering::Relaxed),
+            registered_live_qps: self.registered_live_qps.load(Ordering::Relaxed),
+            quarantined_bundles: self.quarantined_bundles.load(Ordering::Relaxed),
+        };
+        let result = update(&mut counts);
+        self.live.store(counts.live, Ordering::Relaxed);
+        self.establishing
+            .store(counts.establishing, Ordering::Relaxed);
+        self.established
+            .store(counts.established, Ordering::Relaxed);
+        self.draining.store(counts.draining, Ordering::Relaxed);
+        self.registered_live_qps
+            .store(counts.registered_live_qps, Ordering::Relaxed);
+        self.quarantined_bundles
+            .store(counts.quarantined_bundles, Ordering::Relaxed);
+        self.version.fetch_add(1, Ordering::Release);
+        result
+    }
+
+    fn snapshot(&self) -> ConnectionStateCountSnapshot {
+        loop {
+            let before = self.version.load(Ordering::Acquire);
+            if before & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let counts = ConnectionStateCountSnapshot {
+                live: self.live.load(Ordering::Relaxed),
+                establishing: self.establishing.load(Ordering::Relaxed),
+                established: self.established.load(Ordering::Relaxed),
+                draining: self.draining.load(Ordering::Relaxed),
+                registered_live_qps: self.registered_live_qps.load(Ordering::Relaxed),
+                quarantined_bundles: self.quarantined_bundles.load(Ordering::Relaxed),
+            };
+            if self.version.load(Ordering::Acquire) == before {
+                return counts;
+            }
+        }
+    }
+}
+
+impl ConnectionReservation {
+    fn mark_registered(&mut self) {
+        if self.state != ReservationState::Establishing {
+            return;
+        }
+        self.counts.update(|counts| {
+            counts.establishing = counts.establishing.saturating_sub(1);
+            counts.established += 1;
+            counts.registered_live_qps += 1;
+        });
+        self.state = ReservationState::Established;
+        self.qp_counted = true;
+    }
+
+    fn mark_draining(&mut self) {
+        match self.state {
+            ReservationState::Established => {
+                self.counts.update(|counts| {
+                    counts.established = counts.established.saturating_sub(1);
+                    counts.draining += 1;
+                });
+                self.state = ReservationState::Draining;
+            }
+            ReservationState::QuarantinedEstablished => {
+                self.counts.update(|counts| counts.draining += 1);
+                self.state = ReservationState::QuarantinedDraining;
+            }
+            ReservationState::Establishing
+            | ReservationState::Draining
+            | ReservationState::QuarantinedDraining => {}
+        }
+    }
+
+    fn rollback_draining(&mut self) {
+        match self.state {
+            ReservationState::Draining => {
+                self.counts.update(|counts| {
+                    counts.draining = counts.draining.saturating_sub(1);
+                    counts.established += 1;
+                });
+                self.state = ReservationState::Established;
+            }
+            ReservationState::QuarantinedDraining => {
+                self.counts
+                    .update(|counts| counts.draining = counts.draining.saturating_sub(1));
+                self.state = ReservationState::QuarantinedEstablished;
+            }
+            ReservationState::Establishing
+            | ReservationState::Established
+            | ReservationState::QuarantinedEstablished => {}
+        }
+    }
+
+    fn mark_quarantined(&mut self) {
+        match self.state {
+            ReservationState::Established => {
+                self.counts.update(|counts| {
+                    counts.established = counts.established.saturating_sub(1);
+                    if self.qp_counted {
+                        counts.registered_live_qps = counts.registered_live_qps.saturating_sub(1);
+                    }
+                    counts.quarantined_bundles += 1;
+                });
+                self.state = ReservationState::QuarantinedEstablished;
+            }
+            ReservationState::Draining => {
+                if self.qp_counted {
+                    self.counts.update(|counts| {
+                        counts.registered_live_qps = counts.registered_live_qps.saturating_sub(1);
+                        counts.quarantined_bundles += 1;
+                    });
+                } else {
+                    self.counts.update(|counts| counts.quarantined_bundles += 1);
+                }
+                self.state = ReservationState::QuarantinedDraining;
+            }
+            ReservationState::Establishing
+            | ReservationState::QuarantinedEstablished
+            | ReservationState::QuarantinedDraining => {}
+        }
+        self.qp_counted = false;
+    }
+
+    fn recover_quarantine(&mut self) {
+        match self.state {
+            ReservationState::QuarantinedEstablished => {
+                self.counts.update(|counts| {
+                    counts.established += 1;
+                    counts.registered_live_qps += 1;
+                    counts.quarantined_bundles = counts.quarantined_bundles.saturating_sub(1);
+                });
+                self.state = ReservationState::Established;
+                self.qp_counted = true;
+            }
+            ReservationState::QuarantinedDraining => {
+                self.counts.update(|counts| {
+                    counts.registered_live_qps += 1;
+                    counts.quarantined_bundles = counts.quarantined_bundles.saturating_sub(1);
+                });
+                self.state = ReservationState::Draining;
+                self.qp_counted = true;
+            }
+            ReservationState::Establishing
+            | ReservationState::Established
+            | ReservationState::Draining => {}
+        }
+    }
+
+    fn mark_qp_destroyed(&mut self) {
+        if !self.qp_counted {
+            return;
+        }
+        self.counts.update(|counts| {
+            counts.registered_live_qps = counts.registered_live_qps.saturating_sub(1);
+        });
+        self.qp_counted = false;
+    }
 }
 
 impl Drop for ConnectionReservation {
     fn drop(&mut self) {
-        let previous = self.pool.used.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "connection admission must be reserved");
+        self.counts.update(|counts| {
+            counts.live = counts.live.saturating_sub(1);
+            match self.state {
+                ReservationState::Establishing => {
+                    counts.establishing = counts.establishing.saturating_sub(1);
+                }
+                ReservationState::Established => {
+                    counts.established = counts.established.saturating_sub(1);
+                }
+                ReservationState::Draining | ReservationState::QuarantinedDraining => {
+                    counts.draining = counts.draining.saturating_sub(1);
+                }
+                ReservationState::QuarantinedEstablished => {}
+            }
+            if self.qp_counted {
+                counts.registered_live_qps = counts.registered_live_qps.saturating_sub(1);
+            }
+        });
     }
 }
 
@@ -724,8 +980,8 @@ impl OperationKind {
 pub(crate) trait WorkRequestPoster: Send + Sync {
     fn qp_num(&self) -> u32;
     fn capabilities(&self) -> Option<QpCapabilities>;
-    fn post_send(&self, batch: &mut PreparedSendBatch) -> BatchPostOutcome;
-    fn post_recv(&self, batch: &mut PreparedRecvBatch) -> BatchPostOutcome;
+    fn post_send(&self, batch: &mut PreparedSendBatch) -> Result<BatchPostOutcome>;
+    fn post_recv(&self, batch: &mut PreparedRecvBatch) -> Result<BatchPostOutcome>;
     fn to_error(&self) -> Result<()>;
     /// Returns true only when this call takes and destroys the owned QP.
     fn destroy_qp(&self) -> bool;
@@ -925,18 +1181,18 @@ impl WorkRequestPoster for VerbsConnectionResources {
         Some(self.capabilities)
     }
 
-    fn post_send(&self, batch: &mut PreparedSendBatch) -> BatchPostOutcome {
+    fn post_send(&self, batch: &mut PreparedSendBatch) -> Result<BatchPostOutcome> {
         let qp = lock_unpoison(&self.qp);
         qp.as_ref()
-            .expect("posting is stopped before engine QP destruction")
-            .post_send_batch(batch)
+            .ok_or(Error::TransportClosed)
+            .map(|qp| qp.post_send_batch(batch))
     }
 
-    fn post_recv(&self, batch: &mut PreparedRecvBatch) -> BatchPostOutcome {
+    fn post_recv(&self, batch: &mut PreparedRecvBatch) -> Result<BatchPostOutcome> {
         let qp = lock_unpoison(&self.qp);
         qp.as_ref()
-            .expect("posting is stopped before engine QP destruction")
-            .post_recv_batch(batch)
+            .ok_or(Error::TransportClosed)
+            .map(|qp| qp.post_recv_batch(batch))
     }
 
     fn to_error(&self) -> Result<()> {
@@ -1122,6 +1378,7 @@ mod qp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wr::{RecvWr, SendWr, WrOpcode};
     use std::sync::Weak;
 
     struct TestPoster;
@@ -1135,12 +1392,12 @@ mod tests {
             None
         }
 
-        fn post_send(&self, _batch: &mut PreparedSendBatch) -> BatchPostOutcome {
-            BatchPostOutcome::AllAccepted
+        fn post_send(&self, _batch: &mut PreparedSendBatch) -> Result<BatchPostOutcome> {
+            Ok(BatchPostOutcome::AllAccepted)
         }
 
-        fn post_recv(&self, _batch: &mut PreparedRecvBatch) -> BatchPostOutcome {
-            BatchPostOutcome::AllAccepted
+        fn post_recv(&self, _batch: &mut PreparedRecvBatch) -> Result<BatchPostOutcome> {
+            Ok(BatchPostOutcome::AllAccepted)
         }
 
         fn to_error(&self) -> Result<()> {
@@ -1266,5 +1523,151 @@ mod tests {
                 matches!(result, Err(Error::InvalidConfig(ref message)) if message == "typed close failure")
             );
         }
+    }
+
+    #[test]
+    fn connection_state_counts_follow_exact_reservation_transitions() {
+        let pool = ConnectionAdmissionPool::new(1);
+        let mut reservation = pool.try_acquire().expect("reservation");
+        assert_eq!(
+            pool.snapshot(),
+            ConnectionStateCountSnapshot {
+                live: 1,
+                establishing: 1,
+                ..ConnectionStateCountSnapshot::default()
+            }
+        );
+
+        reservation.mark_registered();
+        assert_eq!(
+            pool.snapshot(),
+            ConnectionStateCountSnapshot {
+                live: 1,
+                established: 1,
+                registered_live_qps: 1,
+                ..ConnectionStateCountSnapshot::default()
+            }
+        );
+
+        reservation.mark_draining();
+        reservation.mark_quarantined();
+        assert_eq!(
+            pool.snapshot(),
+            ConnectionStateCountSnapshot {
+                live: 1,
+                draining: 1,
+                quarantined_bundles: 1,
+                ..ConnectionStateCountSnapshot::default()
+            }
+        );
+
+        reservation.recover_quarantine();
+        reservation.mark_qp_destroyed();
+        assert_eq!(
+            pool.snapshot(),
+            ConnectionStateCountSnapshot {
+                live: 1,
+                draining: 1,
+                ..ConnectionStateCountSnapshot::default()
+            }
+        );
+
+        drop(reservation);
+        assert_eq!(pool.snapshot(), ConnectionStateCountSnapshot::default());
+    }
+
+    #[test]
+    fn destroy_with_accepted_work_fails_closed_without_destroying() {
+        struct DestroyPoster(AtomicUsize);
+
+        impl WorkRequestPoster for DestroyPoster {
+            fn qp_num(&self) -> u32 {
+                7
+            }
+
+            fn capabilities(&self) -> Option<QpCapabilities> {
+                None
+            }
+
+            fn post_send(&self, _: &mut PreparedSendBatch) -> Result<BatchPostOutcome> {
+                Ok(BatchPostOutcome::AllAccepted)
+            }
+
+            fn post_recv(&self, _: &mut PreparedRecvBatch) -> Result<BatchPostOutcome> {
+                Ok(BatchPostOutcome::AllAccepted)
+            }
+
+            fn to_error(&self) -> Result<()> {
+                Ok(())
+            }
+
+            fn destroy_qp(&self) -> bool {
+                self.0.fetch_add(1, Ordering::AcqRel);
+                true
+            }
+
+            fn disconnect(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let poster = Arc::new(DestroyPoster(AtomicUsize::new(0)));
+        let connection = ConnectionState::new(
+            ConnectionToken {
+                slot: 1,
+                generation: 1,
+            },
+            Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
+            RdmaConnectionConfig::default(),
+            None,
+            None,
+            None,
+            None,
+        );
+        connection.add_accepted(OperationToken {
+            slot: 2,
+            generation: 1,
+        });
+
+        let error = match connection.destroy_connection_resources() {
+            Ok(_) => panic!("accepted work must prevent connection destruction"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            Error::EngineWedged {
+                retained_bundles: 1,
+                outstanding_operations: 1,
+                cq_debt: 1
+            }
+        ));
+        assert_eq!(poster.0.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn missing_qp_returns_typed_post_errors() {
+        let resources = VerbsConnectionResources {
+            qp: Mutex::new(None),
+            qp_num: 9,
+            capabilities: QpCapabilities {
+                max_send_wr: 1,
+                max_recv_wr: 1,
+                max_send_sge: 1,
+                max_recv_sge: 1,
+            },
+            cm_owner: Mutex::new(None),
+        };
+        let mut send =
+            PreparedSendBatch::new(vec![SendWr::new(1, WrOpcode::Send)]).expect("send batch");
+        let mut recv = PreparedRecvBatch::new(vec![RecvWr::new(2)]).expect("recv batch");
+
+        assert!(matches!(
+            resources.post_send(&mut send),
+            Err(Error::TransportClosed)
+        ));
+        assert!(matches!(
+            resources.post_recv(&mut recv),
+            Err(Error::TransportClosed)
+        ));
     }
 }

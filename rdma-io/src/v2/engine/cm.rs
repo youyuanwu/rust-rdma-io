@@ -1448,7 +1448,7 @@ impl CmState {
             self.enqueue_retirement(token);
             return Ok(());
         };
-        let (cm_id, qp_destroyed) = connection.destroy_connection_resources();
+        let (cm_id, qp_destroyed) = connection.destroy_connection_resources()?;
         if qp_destroyed {
             shared.record_qp_destroy();
         }
@@ -4077,12 +4077,12 @@ mod tests {
             None
         }
 
-        fn post_send(&self, _batch: &mut PreparedSendBatch) -> BatchPostOutcome {
-            BatchPostOutcome::AllAccepted
+        fn post_send(&self, _batch: &mut PreparedSendBatch) -> Result<BatchPostOutcome> {
+            Ok(BatchPostOutcome::AllAccepted)
         }
 
-        fn post_recv(&self, _batch: &mut PreparedRecvBatch) -> BatchPostOutcome {
-            BatchPostOutcome::AllAccepted
+        fn post_recv(&self, _batch: &mut PreparedRecvBatch) -> Result<BatchPostOutcome> {
+            Ok(BatchPostOutcome::AllAccepted)
         }
 
         fn to_error(&self) -> Result<()> {

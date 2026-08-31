@@ -129,11 +129,13 @@ run_selected_test() {
         sudo -u "$SUDO_USER" env \
             HOME="$user_home" \
             PATH="$TOOLCHAIN_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            RDMA_REQUIRE_PROVIDER=1 \
             RUST_TEST_THREADS=1 \
             "$CARGO" test -p rdma-io-tests --test "$target" -- --nocapture
     else
         env \
             PATH="$TOOLCHAIN_BIN:$PATH" \
+            RDMA_REQUIRE_PROVIDER=1 \
             RUST_TEST_THREADS=1 \
             "$CARGO" test -p rdma-io-tests --test "$target" -- --nocapture
     fi
@@ -143,6 +145,7 @@ run_provider_test() {
     local provider="$1"
     local iteration
     if [[ "$FULL_VALIDATION" -eq 1 ]]; then
+        run_step "Build $provider production rdma-io without test-hooks" run_production_build
         run_step "Run $provider Phase 1 provider probe" run_selected_test v2_engine_provider_probe
         run_step "Run $provider Phase 2 driver flush gate" run_selected_test v2_engine_driver_flush_gate
         for ((iteration = 1; iteration <= 5; iteration++)); do
@@ -189,6 +192,21 @@ run_provider_test() {
     fi
 }
 
+run_production_build() {
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        local user_home
+        user_home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+        sudo -u "$SUDO_USER" env \
+            HOME="$user_home" \
+            PATH="$TOOLCHAIN_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            "$CARGO" build -p rdma-io --release --no-default-features --features tokio
+    else
+        env \
+            PATH="$TOOLCHAIN_BIN:$PATH" \
+            "$CARGO" build -p rdma-io --release --no-default-features --features tokio
+    fi
+}
+
 run_full_workspace() {
     if [[ -n "${SUDO_USER:-}" ]]; then
         local user_home
@@ -196,11 +214,13 @@ run_full_workspace() {
         sudo -u "$SUDO_USER" env \
             HOME="$user_home" \
             PATH="$TOOLCHAIN_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            RDMA_REQUIRE_PROVIDER=1 \
             RUST_TEST_THREADS=1 \
             "$CARGO" test --workspace --all-features
     else
         env \
             PATH="$TOOLCHAIN_BIN:$PATH" \
+            RDMA_REQUIRE_PROVIDER=1 \
             RUST_TEST_THREADS=1 \
             "$CARGO" test --workspace --all-features
     fi

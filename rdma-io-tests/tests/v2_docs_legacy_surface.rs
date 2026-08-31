@@ -8,7 +8,7 @@ const LEGACY_NAMES: &[&str] = &[
     "v2_shared_qp_tests",
 ];
 
-fn collect_rs_files(root: &Path, files: &mut Vec<PathBuf>) {
+fn collect_files_with_extension(root: &Path, extension: &str, files: &mut Vec<PathBuf>) {
     let entries = fs::read_dir(root)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", root.display()));
     for entry in entries {
@@ -25,8 +25,11 @@ fn collect_rs_files(root: &Path, files: &mut Vec<PathBuf>) {
             path.display()
         );
         if file_type.is_dir() {
-            collect_rs_files(&path, files);
-        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            collect_files_with_extension(&path, extension, files);
+        } else if path
+            .extension()
+            .is_some_and(|candidate| candidate == extension)
+        {
             files.push(path);
         }
     }
@@ -80,15 +83,34 @@ fn public_v2_documentation_has_no_legacy_endpoint_surface() {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("workspace root");
-    for relative in ["README.md", "docs/design/v2-rdma-engine.md"] {
-        let path = workspace.join(relative);
+
+    let mut markdown_files = vec![workspace.join("README.md")];
+    collect_files_with_extension(&workspace.join("docs"), "md", &mut markdown_files);
+    for entry in fs::read_dir(workspace).expect("workspace root must be readable") {
+        let entry = entry.expect("workspace entry");
+        if entry.file_type().expect("workspace entry type").is_dir() {
+            let readme = entry.path().join("README.md");
+            if readme.is_file() {
+                markdown_files.push(readme);
+            }
+        }
+    }
+    markdown_files.sort();
+    markdown_files.dedup();
+    for path in markdown_files {
         let source = fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
-        assert_no_legacy_public_surface(relative, &source);
+        assert_no_legacy_public_surface(
+            path.strip_prefix(workspace)
+                .expect("public Markdown path is in the workspace")
+                .to_str()
+                .expect("public Markdown path must be UTF-8"),
+            &source,
+        );
     }
 
     let mut rust_files = Vec::new();
-    collect_rs_files(&workspace.join("rdma-io/src/v2"), &mut rust_files);
+    collect_files_with_extension(&workspace.join("rdma-io/src/v2"), "rs", &mut rust_files);
     assert!(!rust_files.is_empty(), "v2 rustdoc scope must not be empty");
     rust_files.sort();
     for path in rust_files {

@@ -39,6 +39,7 @@ impl EngineShared {
                 && !connection.is_retired()
                 && connection.poster.destroy_qp()
             {
+                connection.mark_qp_destroyed();
                 self.record_qp_destroy();
             }
         }
@@ -79,11 +80,11 @@ mod tests {
             None
         }
 
-        fn post_send(&self, _: &mut PreparedSendBatch) -> BatchPostOutcome {
+        fn post_send(&self, _: &mut PreparedSendBatch) -> Result<BatchPostOutcome> {
             unreachable!("lifecycle test does not post")
         }
 
-        fn post_recv(&self, _: &mut PreparedRecvBatch) -> BatchPostOutcome {
+        fn post_recv(&self, _: &mut PreparedRecvBatch) -> Result<BatchPostOutcome> {
             unreachable!("lifecycle test does not post")
         }
 

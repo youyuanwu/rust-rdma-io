@@ -291,10 +291,22 @@ impl<N: CqNotifier> Drop for Completions<N> {
 
 fn drain_and_ack_channel_events(cq: &Cq) -> Result<()> {
     let channel = cq.channel().expect("channel-backed CQ");
+    drain_and_ack_events(
+        || channel.get_cq_event().map(|_| ()),
+        |count| unsafe {
+            rdma_io_sys::ibverbs::ibv_ack_cq_events(cq.inner().as_raw(), count);
+        },
+    )
+}
+
+fn drain_and_ack_events(
+    mut get_event: impl FnMut() -> crate::Result<()>,
+    mut acknowledge: impl FnMut(u32),
+) -> Result<()> {
     let mut count = 0u32;
     loop {
-        match channel.get_cq_event() {
-            Ok(_cq_ptr) => {
+        match get_event() {
+            Ok(()) => {
                 count = count.saturating_add(1);
             }
             Err(crate::Error::WouldBlock) => break,
@@ -306,14 +318,15 @@ fn drain_and_ack_channel_events(cq: &Cq) -> Result<()> {
                 if io_error.kind() == io::ErrorKind::WouldBlock {
                     break;
                 }
+                if count > 0 {
+                    acknowledge(count);
+                }
                 return Err(Error::Verbs(io_error));
             }
         }
     }
     if count > 0 {
-        unsafe {
-            rdma_io_sys::ibverbs::ibv_ack_cq_events(cq.inner().as_raw(), count);
-        }
+        acknowledge(count);
     }
     Ok(())
 }
@@ -376,5 +389,29 @@ mod tests {
         state.observe_empty_poll();
         assert_eq!(state.state(), PollState::WaitingFd);
         assert_eq!(state.state(), PollState::WaitingFd);
+    }
+
+    #[test]
+    fn drained_events_are_acknowledged_before_a_later_error_is_propagated() {
+        let mut calls = 0;
+        let mut acknowledged = Vec::new();
+        let error = drain_and_ack_events(
+            || {
+                calls += 1;
+                match calls {
+                    1 | 2 => Ok(()),
+                    _ => Err(crate::Error::Verbs(io::Error::other(
+                        "injected completion-channel failure",
+                    ))),
+                }
+            },
+            |count| acknowledged.push(count),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(error, Error::Verbs(ref source) if source.to_string().contains("injected"))
+        );
+        assert_eq!(acknowledged, [2]);
     }
 }

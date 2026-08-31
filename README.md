@@ -169,6 +169,14 @@ one explicit engine driver and zero library-owned tasks or threads, regardless
 of connection count. Low-level `connect`/`connect_with_config` and listener
 `accept`/`accept_with_config` post zero initial receives.
 
+Dropping the last `RdmaEngine` clone requests shutdown; connections, listeners,
+and message transports retain safety state but do not keep an engine frontend
+alive. Keep an engine clone until submissions are complete and use
+`shutdown().await` to observe the terminal result. The first low-level
+operation poll, engine-driver polling, and driver/resource `Drop` can execute
+synchronous libibverbs/librdmacm calls, so they should not share a
+latency-sensitive executor lane that cannot tolerate provider stalls.
+
 The independent low-level `Context`, `Pd`, `Cq`, `Mr`, `Qp`, typed `Op`,
 `CqPoller`, and `Completions` resources remain available for callers that do
 not need engine-owned connection progress.
@@ -229,12 +237,14 @@ Key design properties:
 - **Explicit driver spawning**: No hidden `tokio::spawn`; one engine driver
   composes shared CQ/CM driving, message protocol progress, receive reposting,
   disconnect handling, and reclamation. There is no receive-pump task.
-- **Wire protocol**: A minimal internal protocol with DATA, CREDIT, and HELLO
-  frame types (12-byte header with magic/version/type/length validation)
+- **Wire protocol**: The public `rdma_io::v2::protocol` module exposes the
+  exact DATA, CREDIT, and HELLO frame constants and parsing/writing helpers
+  (12-byte header with magic/version/type/length validation)
 - **Credit-based flow control**: Each `send()` acquires one remote receive
   credit. Credits are exchanged via HELLO handshake and returned via CREDIT
   frames when `ReceivedMessage` is dropped. RNR retry is a safety net, not
-  the primary flow-control mechanism.
+  the primary flow-control mechanism. Holding messages intentionally withholds
+  receive buffers and can stall the peer when all negotiated credits are held.
 - **Readiness handshake**: Engine progress performs HELLO negotiation;
   `ready().await` completes when both peers have exchanged capabilities.
 - **Deterministic lifecycle**: Driver failure wakes frontend waiters, while
@@ -261,7 +271,9 @@ Key design properties:
 - **Fail-closed teardown**: Cancellation retains accepted MRs until their exact
   CQE. A connection deadline returns `ConnectionQuarantined`; an unresolved
   engine shutdown returns `EngineWedged`. Quarantined bundles retain their QP,
-  CM ID, registrations, MRs, admission, and CQ debt.
+  CM ID, registrations, MRs, admission, and CQ debt. Terminal fallback
+  quarantine is process-lifetime retention; repeated unrecoverable failures
+  can consume capacity until the process restarts.
 
 #### Non-Goals
 

@@ -204,12 +204,12 @@ fn shutdown_initiates_each_preexisting_connection_close_once() {
             None
         }
 
-        fn post_send(&self, _batch: &mut PreparedSendBatch) -> BatchPostOutcome {
-            BatchPostOutcome::AllAccepted
+        fn post_send(&self, _batch: &mut PreparedSendBatch) -> Result<BatchPostOutcome> {
+            Ok(BatchPostOutcome::AllAccepted)
         }
 
-        fn post_recv(&self, _batch: &mut PreparedRecvBatch) -> BatchPostOutcome {
-            BatchPostOutcome::AllAccepted
+        fn post_recv(&self, _batch: &mut PreparedRecvBatch) -> Result<BatchPostOutcome> {
+            Ok(BatchPostOutcome::AllAccepted)
         }
 
         fn to_error(&self) -> Result<()> {

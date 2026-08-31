@@ -29,6 +29,10 @@ use crate::wr::{PreparedRecvBatch, PreparedSendBatch, RecvWr, SendFlags, SendWr,
 /// debt remain owned until the provider proves the WR unaccepted or the engine
 /// consumes its exact validated success/error/flush CQE. Timeout, QP ERR,
 /// driver loss, and CQ emptiness are not release boundaries.
+///
+/// The first poll performs the synchronous `ibv_post_send` or `ibv_post_recv`
+/// call. Provider posting has no wall-clock latency guarantee even though
+/// completion is asynchronous.
 pub struct RdmaOperation {
     state: FutureState,
 }
@@ -265,9 +269,19 @@ fn post_detached_batch(
         .diagnostic_counters
         .batch_posts_attempted
         .fetch_add(1, Ordering::Relaxed);
-    let outcome = match &mut requests {
+    let outcome = match match &mut requests {
         InternalPreparedBatch::Recv(batch) => connection.poster.post_recv(batch),
         InternalPreparedBatch::Send(batch) => connection.poster.post_send(batch),
+    } {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let entries = ownership.into_entries();
+            BatchWrAccounting::exact_prefix(count, 0).record(shared);
+            rollback_internal_entries(shared, connection, direction, entries, error.clone());
+            drop(posting);
+            drop(admission);
+            return Err(DetachedPostError::unaccepted(error));
+        }
     };
     let transfer = ownership.consume(outcome);
     match transfer {
@@ -1048,6 +1062,10 @@ impl<T> PreparedBatchOwnership<T> {
             },
         }
     }
+
+    fn into_entries(self) -> Vec<T> {
+        self.entries
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1342,7 +1360,7 @@ impl ValidatedOperation {
                 let mut batch =
                     PreparedRecvBatch::new(vec![RecvWr::new(token.encode()).sg(self.sge)])
                         .map_err(Error::from)?;
-                Ok(connection.poster.post_recv(&mut batch))
+                connection.poster.post_recv(&mut batch)
             }
             OperationKind::Send | OperationKind::Write | OperationKind::Read => {
                 let opcode = match self.kind {
@@ -1362,7 +1380,7 @@ impl ValidatedOperation {
                     wr = wr.rdma(remote.addr, remote.rkey);
                 }
                 let mut batch = PreparedSendBatch::new(vec![wr]).map_err(Error::from)?;
-                Ok(connection.poster.post_send(&mut batch))
+                connection.poster.post_send(&mut batch)
             }
         }
     }
@@ -1510,11 +1528,7 @@ impl EngineShared {
             self.quarantined_mrs.fetch_sub(1, Ordering::AcqRel);
             self.quarantined_bytes
                 .fetch_sub(operation.mr_len, Ordering::AcqRel);
-            if self.clear_operation_quarantine(&operation) {
-                self.diagnostic_counters
-                    .quarantine_recoveries
-                    .fetch_add(1, Ordering::Relaxed);
-            }
+            self.clear_operation_quarantine(&operation);
         }
         self.diagnostic_counters
             .operations_completed
@@ -2910,12 +2924,12 @@ mod tests {
             None
         }
 
-        fn post_send(&self, batch: &mut PreparedSendBatch) -> BatchPostOutcome {
-            self.post(OperationToken::decode(batch.wr_id_for_test(0)), IBV_WC_SEND)
+        fn post_send(&self, batch: &mut PreparedSendBatch) -> Result<BatchPostOutcome> {
+            Ok(self.post(OperationToken::decode(batch.wr_id_for_test(0)), IBV_WC_SEND))
         }
 
-        fn post_recv(&self, batch: &mut PreparedRecvBatch) -> BatchPostOutcome {
-            self.post(OperationToken::decode(batch.wr_id_for_test(0)), IBV_WC_RECV)
+        fn post_recv(&self, batch: &mut PreparedRecvBatch) -> Result<BatchPostOutcome> {
+            Ok(self.post(OperationToken::decode(batch.wr_id_for_test(0)), IBV_WC_RECV))
         }
 
         fn to_error(&self) -> Result<()> {
@@ -3004,11 +3018,11 @@ mod tests {
         fn capabilities(&self) -> Option<crate::v2::qp::QpCapabilities> {
             None
         }
-        fn post_send(&self, _: &mut PreparedSendBatch) -> BatchPostOutcome {
-            BatchPostOutcome::AllAccepted
+        fn post_send(&self, _: &mut PreparedSendBatch) -> Result<BatchPostOutcome> {
+            Ok(BatchPostOutcome::AllAccepted)
         }
-        fn post_recv(&self, _: &mut PreparedRecvBatch) -> BatchPostOutcome {
-            BatchPostOutcome::AllAccepted
+        fn post_recv(&self, _: &mut PreparedRecvBatch) -> Result<BatchPostOutcome> {
+            Ok(BatchPostOutcome::AllAccepted)
         }
         fn to_error(&self) -> Result<()> {
             Ok(())

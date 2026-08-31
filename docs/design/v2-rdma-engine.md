@@ -73,6 +73,12 @@ If the driver is never polled, connect, accept, completion, message readiness,
 close, and shutdown work does not progress. Readiness mode does not use a
 periodic timer to compensate for a missing wakeup.
 
+Dropping the last `RdmaEngine` clone requests shutdown. Connections, listeners,
+and message transports retain the shared state needed for memory safety, but
+they are not engine frontend handles and do not prevent that request. Keep an
+engine clone alive while submissions remain possible, and call
+`shutdown().await` when the terminal result must be observed.
+
 ### Tokio requirements
 
 - `CompletionMode::Readiness` is the default. `build()` must run inside an
@@ -211,6 +217,7 @@ MessageTransport::close() -> impl Future<Output = Result<()>>
 
 ReceivedMessage::len() -> usize
 ReceivedMessage::is_empty() -> bool
+ReceivedMessage: AsRef<[u8]> + Deref<Target = [u8]>
 ```
 
 There is no public transport error accessor. Errors are observed from
@@ -231,8 +238,17 @@ checked maxima `send_buffers + 2 + 1` and `recv_buffers + 2`. An explicit
 configuration may exceed but may not undershoot either requirement.
 
 `ready()` waits for HELLO exchange. `send()` also waits for readiness and
-returns on local send completion, not remote consumption. Dropping
-`ReceivedMessage` schedules its MR for engine-driven repost and CREDIT return.
+returns on local send completion, not remote consumption. `AsRef<[u8]>` and
+`Deref<Target = [u8]>` expose exactly the received application payload,
+excluding the 12-byte frame header. Dropping `ReceivedMessage` schedules its MR
+for engine-driven repost and CREDIT return. Holding all received messages
+therefore withholds all negotiated DATA credits and can intentionally stall
+the peer until at least one handle is dropped.
+
+The public `rdma_io::v2::protocol` module exposes the exact frame constants,
+parsed header/control types, and parse/write helpers for interoperability tests
+and packet analysis. Ordinary message-transport users do not need to encode
+frames directly.
 
 Peer disconnect and normal flush completions are normalized to
 `Error::TransportClosed` on HELLO, receive, and steady-state message paths.
@@ -323,6 +339,12 @@ One engine owns:
 | Library-created tasks/threads | 0 | 0 |
 | Additional message tasks | 0 | 0 |
 
+Resource-object counts are measured from the owned handles. The
+`explicit_engine_drivers = 1` and `library_owned_tasks = 0` values are
+declarative construction invariants rather than runtime task observation:
+`build()` returns exactly one driver, and the source-level
+`v2_no_hidden_spawn` test independently rejects engine task creation.
+
 All connections use the exact `ibv_context*` selected from
 `rdma_get_devices`. The engine retains the complete device-list owner as a
 context anchor. The safe context facade never calls `ibv_close_device`; every
@@ -392,6 +414,22 @@ ready connections. Ready connections are duplicate-suppressed and tail-rotated
 after at most `ready_connection_quantum` work. Idle connections are not
 visited. This is bounded fairness, not a hard real-time latency guarantee.
 
+### Synchronous provider calls
+
+Future polling is nonblocking only in the Rust scheduling sense; individual
+provider calls are synchronous and have no wall-clock guarantee.
+`RdmaOperation` first poll can call `ibv_post_send` or `ibv_post_recv`.
+`RdmaEngineDriver::poll` can poll/arm/get/ack CQ events; create, bind, listen,
+resolve, connect, accept, reject, disconnect, or destroy CM IDs; create,
+modify, post SEND/RECV work to, transition, or destroy QPs; and register or
+deregister MRs.
+
+Driver and resource `Drop` paths can additionally transition/destroy QPs,
+destroy CM IDs/listeners, deregister MRs, destroy CQs and completion channels,
+deallocate the PD and CM event channel, release context facades, and finally
+free the anchored device list. Applications should run the driver where an
+occasional provider stall cannot block unrelated latency-sensitive futures.
+
 ## Cancellation, Close, and Shutdown
 
 Dropping an unposted operation returns local admission immediately. Dropping a
@@ -421,6 +459,13 @@ is the shared engine-wide terminal result. Unresolved resources move to
 fail-closed retention rather than being destroyed unsafely. Abrupt driver drop
 or task abort wakes observed waiters and follows the same safety rule.
 
+Fallback quarantine sinks are intentionally process-lifetime and unbounded.
+They cannot be drained after the sole progress driver is gone because the
+positive CQE/CM acknowledgement boundaries can no longer be proved. Repeated
+unrecoverable engine failures in a long-lived process can therefore retain
+kernel objects, memory, connection admission, and CQ credit until process
+restart.
+
 Graceful shutdown should be awaited before dropping the driver. Driver drop
 performs bounded synchronous preparation, but individual ibverbs/librdmacm
 destructors can block and have no wall-clock latency guarantee.
@@ -428,8 +473,10 @@ destructors can block and have no wall-clock latency guarantee.
 ## Diagnostics
 
 `RdmaEngine::diagnostics()` returns an O(1), nonblocking aggregate snapshot
-that remains readable after terminal state while an engine handle exists. It
-contains:
+that remains readable after terminal state while an engine handle exists.
+Connection reservation/QP state uses maintained atomic state counts with a
+versioned consistent read, rather than subtracting independently sampled
+registry, drain, and quarantine sources during retirement. It contains:
 
 - lifecycle and terminal error class/message;
 - configured capacities, budgets, device, and completion mode;
@@ -446,12 +493,17 @@ queries. They are O(number of current objects), return sorted snapshots, and
 are separate from aggregate snapshot creation. Connection details include
 identity, exact accepted outstanding count, drain state, and quarantine state.
 Listener details include token, address, queued children, pending waiters, and
-selected-pair count.
+selected-pair count. A snapshot holds only a `Weak` detail source. If every
+engine owner is gone before a detail query, the query returns an empty vector;
+that result is intentionally indistinguishable from an engine with no current
+objects. `PartialEq`/`Eq` compare all public snapshot data and ignore only this
+internal weak handle.
 
 The canonical public quarantine gauge is `quarantined_bundles`; each counted
 bundle retains its QP registration, admission reservation, and unsafe debt.
 The canonical retired-slot gauges are `retired_connection_slots` and
-`retired_operation_slots`.
+`retired_operation_slots`. Slot retirement is permanent, so each gauge also
+serves as its monotonic retirement counter.
 
 ## Provider Validation
 
@@ -465,6 +517,20 @@ Run the complete sequential provider validation with:
 ```sh
 sudo -E ./scripts/validate-v2-engine-providers.sh
 ```
+
+The script sets `RDMA_REQUIRE_PROVIDER=1`, so a missing rxe/siw device is a hard
+test failure rather than a silently green early return. It also builds an
+isolated release `rdma-io` artifact with `tokio` and without `test-hooks`
+before running the full hook-enabled provider suites.
+
+The `rdma-io-tests` helper library necessarily enables `test-hooks`: its shared
+engine fixtures call doc-hidden injection, resource-lease, and destruction
+recording APIs, and all integration targets link that helper crate. Cargo
+therefore unifies `test-hooks` for workspace-wide test commands. Moving only
+the dependency stanza cannot isolate the feature without splitting and
+rewriting the shared test crate. Production configuration is instead validated
+by the explicit isolated no-`test-hooks` release build; full RXE/SIW behavior,
+including injected failure paths, remains validated with hooks enabled.
 
 The script validates RXE first, removes it, validates SIW second, then always
 removes SIW and restores/verifies RXE. It preserves the original test failure
