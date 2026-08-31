@@ -52,6 +52,21 @@ impl RdmaConnection {
                 .map(|(mr, callback)| (mr, None, callback))
                 .collect(),
         )
+        .map_err(DetachedPostError::into_error)
+    }
+
+    pub(crate) fn post_detached_recv(
+        &self,
+        mr: Mr,
+        callback: DetachedOperationCallback,
+    ) -> std::result::Result<(), DetachedPostError> {
+        post_detached_batch(
+            &self.shared,
+            &self.state,
+            OperationKind::Recv,
+            vec![(mr, None, callback)],
+        )
+        .map(|_| ())
     }
 
     pub(crate) fn post_detached_send(
@@ -59,7 +74,7 @@ impl RdmaConnection {
         mr: Mr,
         len: usize,
         callback: DetachedOperationCallback,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), DetachedPostError> {
         post_detached_batch(
             &self.shared,
             &self.state,
@@ -75,11 +90,11 @@ fn post_detached_batch(
     connection: &Arc<ConnectionState>,
     kind: OperationKind,
     entries: Vec<InternalPostInput>,
-) -> Result<usize> {
+) -> std::result::Result<usize, DetachedPostError> {
     if entries.is_empty() {
-        return Err(Error::InvalidConfig(
+        return Err(DetachedPostError::unaccepted(Error::InvalidConfig(
             "detached operation batch must not be empty".into(),
-        ));
+        )));
     }
     let count = entries.len();
     shared
@@ -88,31 +103,49 @@ fn post_detached_batch(
         .fetch_add(count as u64, Ordering::Relaxed);
     let admission = read_unpoison(&shared.admission);
     if let Some(error) = shared.admission_error() {
-        return Err(error);
+        complete_unreserved_entries(entries, error.clone());
+        return Err(DetachedPostError::unaccepted(error));
     }
-    let posting = connection.begin_posting()?;
+    let posting = match connection.begin_posting() {
+        Ok(posting) => posting,
+        Err(error) => {
+            complete_unreserved_entries(entries, error.clone());
+            return Err(DetachedPostError::unaccepted(error));
+        }
+    };
     let direction = kind.direction();
     let expected_opcode = match kind {
         OperationKind::Recv => WcOpcode::Recv,
         OperationKind::Send => WcOpcode::Send,
         OperationKind::Write | OperationKind::Read => {
-            return Err(Error::InvalidConfig(
-                "detached batches support only SEND and RECV".into(),
-            ));
+            let error = Error::InvalidConfig("detached batches support only SEND and RECV".into());
+            complete_unreserved_entries(entries, error.clone());
+            return Err(DetachedPostError::unaccepted(error));
         }
     };
     let mut reserved = Vec::with_capacity(count);
-    for (mr, range, callback) in entries {
+    let mut entries = entries.into_iter();
+    while let Some((mr, range, callback)) = entries.next() {
         let validated = match ValidatedOperation::new(kind, &mr, None, range) {
             Ok(validated) => validated,
             Err(error) => {
-                rollback_internal_entries(shared, connection, direction, reserved);
-                return Err(error);
+                rollback_internal_entries(shared, connection, direction, reserved, error.clone());
+                callback(DetachedOperationCompletion::Unaccepted {
+                    error: error.clone(),
+                    mr,
+                });
+                complete_unreserved_entries(entries, error.clone());
+                return Err(DetachedPostError::unaccepted(error));
             }
         };
         if let Err(error) = connection.reserve_local(direction) {
-            rollback_internal_entries(shared, connection, direction, reserved);
-            return Err(error);
+            rollback_internal_entries(shared, connection, direction, reserved, error.clone());
+            callback(DetachedOperationCompletion::Unaccepted {
+                error: error.clone(),
+                mr,
+            });
+            complete_unreserved_entries(entries, error.clone());
+            return Err(DetachedPostError::unaccepted(error));
         }
         let mr_len = mr.len();
         let mut mr = Some(mr);
@@ -131,24 +164,38 @@ fn post_detached_batch(
             Ok(allocated) => allocated,
             Err(error) => {
                 connection.release_local(direction);
-                rollback_internal_entries(shared, connection, direction, reserved);
+                let mr = mr
+                    .take()
+                    .expect("operation allocation failure retains detached MR");
+                let callback = callback
+                    .take()
+                    .expect("operation allocation failure retains detached callback");
+                rollback_internal_entries(shared, connection, direction, reserved, error.clone());
+                callback(DetachedOperationCompletion::Unaccepted {
+                    error: error.clone(),
+                    mr,
+                });
+                complete_unreserved_entries(entries, error.clone());
                 shared
                     .diagnostic_counters
                     .operation_capacity_exhausted
                     .fetch_add(1, Ordering::Relaxed);
-                return Err(error);
+                return Err(DetachedPostError::unaccepted(error));
             }
         };
         if !shared.cq_credits.reserve() {
             let released = shared.operations.release(token, false).unwrap_or(state);
             connection.release_local(direction);
-            drop(released);
-            rollback_internal_entries(shared, connection, direction, reserved);
+            let error = Error::CapacityExhausted;
+            let completion = released.take_unaccepted(error.clone());
+            rollback_internal_entries(shared, connection, direction, reserved, error.clone());
+            invoke_detached_completion(completion);
+            complete_unreserved_entries(entries, error.clone());
             shared
                 .diagnostic_counters
                 .cq_capacity_exhausted
                 .fetch_add(1, Ordering::Relaxed);
-            return Err(Error::CapacityExhausted);
+            return Err(DetachedPostError::unaccepted(error));
         }
         shared
             .diagnostic_counters
@@ -170,8 +217,15 @@ fn post_detached_batch(
             match PreparedRecvBatch::new(requests) {
                 Ok(batch) => InternalPreparedBatch::Recv(batch),
                 Err(error) => {
-                    rollback_internal_entries(shared, connection, direction, reserved);
-                    return Err(Error::from(error));
+                    let error = Error::from(error);
+                    rollback_internal_entries(
+                        shared,
+                        connection,
+                        direction,
+                        reserved,
+                        error.clone(),
+                    );
+                    return Err(DetachedPostError::unaccepted(error));
                 }
             }
         }
@@ -187,13 +241,22 @@ fn post_detached_batch(
             match PreparedSendBatch::new(requests) {
                 Ok(batch) => InternalPreparedBatch::Send(batch),
                 Err(error) => {
-                    rollback_internal_entries(shared, connection, direction, reserved);
-                    return Err(Error::from(error));
+                    let error = Error::from(error);
+                    rollback_internal_entries(
+                        shared,
+                        connection,
+                        direction,
+                        reserved,
+                        error.clone(),
+                    );
+                    return Err(DetachedPostError::unaccepted(error));
                 }
             }
         }
         OperationKind::Write | OperationKind::Read => unreachable!(),
     };
+    let ownership =
+        PreparedBatchOwnership::new(reserved).expect("non-empty detached batch ownership");
     let mut requests = requests;
     shared
         .diagnostic_counters
@@ -203,7 +266,7 @@ fn post_detached_batch(
         InternalPreparedBatch::Recv(batch) => connection.poster.post_recv(batch),
         InternalPreparedBatch::Send(batch) => connection.poster.post_send(batch),
     };
-    let transfer = PreparedBatchOwnership::new(reserved)?.consume(outcome);
+    let transfer = ownership.consume(outcome);
     match transfer {
         BatchOwnershipTransfer::Accepted(accepted) => {
             BatchWrAccounting::from_outcome(count, &BatchPostOutcome::AllAccepted).record(shared);
@@ -217,6 +280,7 @@ fn post_detached_batch(
             unaccepted,
             source,
         } => {
+            let error = Error::PostFailed(clone_io_error(&source));
             if unaccepted
                 .iter()
                 .any(|entry| entry.state.has_early_completion())
@@ -224,21 +288,28 @@ fn post_detached_batch(
                 accepted.extend(unaccepted);
                 BatchWrAccounting::ambiguous(count).record(shared);
                 commit_internal_entries(shared, accepted);
+                drop(posting);
+                drop(admission);
+                Err(DetachedPostError::retained(Error::PostFailed(source)))
             } else {
                 BatchWrAccounting::exact_prefix(count, accepted.len()).record(shared);
+                let potentially_accepted = !accepted.is_empty();
                 commit_internal_entries(shared, accepted);
-                rollback_internal_entries(shared, connection, direction, unaccepted);
+                rollback_internal_entries(shared, connection, direction, unaccepted, error);
+                drop(posting);
+                drop(admission);
+                Err(DetachedPostError {
+                    error: Error::PostFailed(source),
+                    potentially_accepted,
+                })
             }
-            drop(posting);
-            drop(admission);
-            Err(Error::PostFailed(source))
         }
         BatchOwnershipTransfer::Ambiguous { retained, source } => {
             BatchWrAccounting::ambiguous(count).record(shared);
             commit_internal_entries(shared, retained);
             drop(posting);
             drop(admission);
-            Err(Error::PostFailed(source))
+            Err(DetachedPostError::retained(Error::PostFailed(source)))
         }
     }
 }
@@ -268,6 +339,7 @@ fn rollback_internal_entries(
     connection: &ConnectionState,
     direction: Direction,
     entries: Vec<InternalBatchEntry>,
+    error: Error,
 ) {
     for entry in entries {
         let state = shared
@@ -280,7 +352,29 @@ fn rollback_internal_entries(
             .cq_credits_rolled_back
             .fetch_add(1, Ordering::Relaxed);
         connection.release_local(direction);
-        drop(state);
+        invoke_detached_completion(state.take_unaccepted(error.clone()));
+    }
+}
+
+fn complete_unreserved_entries(entries: impl IntoIterator<Item = InternalPostInput>, error: Error) {
+    for (mr, _, callback) in entries {
+        callback(DetachedOperationCompletion::Unaccepted {
+            error: error.clone(),
+            mr,
+        });
+    }
+}
+
+fn invoke_detached_completion(completion: Option<DetachedCompletion>) {
+    if let Some((callback, completion)) = completion {
+        callback(completion);
+    }
+}
+
+fn clone_io_error(error: &std::io::Error) -> std::io::Error {
+    match error.raw_os_error() {
+        Some(code) => std::io::Error::from_raw_os_error(code),
+        None => std::io::Error::new(error.kind(), error.to_string()),
     }
 }
 
@@ -701,7 +795,13 @@ impl OperationState {
         let result = typed.result().map(|()| typed);
         let callback = inner.callback.take().map(|callback| {
             let callback_mr = mr.take();
-            (callback, result.clone(), callback_mr)
+            (
+                callback,
+                DetachedOperationCompletion::Completed {
+                    result: result.clone(),
+                    mr: callback_mr,
+                },
+            )
         });
         let detached_mr = if callback.is_some() {
             None
@@ -724,6 +824,20 @@ impl OperationState {
 
     fn take_mr(&self) -> Option<Mr> {
         lock_unpoison(&self.inner).mr.take()
+    }
+
+    fn take_unaccepted(&self, error: Error) -> Option<DetachedCompletion> {
+        let mut inner = lock_unpoison(&self.inner);
+        inner.lifecycle = OperationLifecycle::Released;
+        let callback = inner.callback.take()?;
+        let mr = inner
+            .mr
+            .take()
+            .expect("unaccepted detached operation retains its MR");
+        Some((
+            callback,
+            DetachedOperationCompletion::Unaccepted { error, mr },
+        ))
     }
 
     fn take_output(&self) -> Option<(Result<Completion>, Option<Mr>)> {
@@ -803,10 +917,54 @@ struct FinishState {
     callback: Option<DetachedCompletion>,
 }
 
-pub(crate) type DetachedOperationCallback =
-    Box<dyn FnOnce(Result<Completion>, Option<Mr>) + Send + 'static>;
+type DetachedCompletion = (DetachedOperationCallback, DetachedOperationCompletion);
 
-type DetachedCompletion = (DetachedOperationCallback, Result<Completion>, Option<Mr>);
+pub(crate) enum DetachedOperationCompletion {
+    Unaccepted {
+        error: Error,
+        mr: Mr,
+    },
+    Completed {
+        result: Result<Completion>,
+        mr: Option<Mr>,
+    },
+}
+
+pub(crate) type DetachedOperationCallback =
+    Box<dyn FnOnce(DetachedOperationCompletion) + Send + 'static>;
+
+pub(crate) struct DetachedPostError {
+    error: Error,
+    potentially_accepted: bool,
+}
+
+impl DetachedPostError {
+    fn unaccepted(error: Error) -> Self {
+        Self {
+            error,
+            potentially_accepted: false,
+        }
+    }
+
+    fn retained(error: Error) -> Self {
+        Self {
+            error,
+            potentially_accepted: true,
+        }
+    }
+
+    pub(crate) fn potentially_accepted(&self) -> bool {
+        self.potentially_accepted
+    }
+
+    pub(crate) fn error(&self) -> &Error {
+        &self.error
+    }
+
+    fn into_error(self) -> Error {
+        self.error
+    }
+}
 
 pub(super) struct QuarantineTransition {
     pub(super) newly_quarantined: bool,
@@ -825,18 +983,10 @@ enum StartResult {
 }
 
 /// Take-once ownership ledger paired with stable raw batch storage.
-#[allow(
-    dead_code,
-    reason = "message pre-posting consumes this ledger in Phase 7"
-)]
 pub(crate) struct PreparedBatchOwnership<T> {
     entries: Vec<T>,
 }
 
-#[allow(
-    dead_code,
-    reason = "message pre-posting consumes this ledger in Phase 7"
-)]
 pub(crate) enum BatchOwnershipTransfer<T> {
     Accepted(Vec<T>),
     Partial {
@@ -850,10 +1000,6 @@ pub(crate) enum BatchOwnershipTransfer<T> {
     },
 }
 
-#[allow(
-    dead_code,
-    reason = "message pre-posting consumes this ledger in Phase 7"
-)]
 impl<T> PreparedBatchOwnership<T> {
     pub(crate) fn new(entries: Vec<T>) -> Result<Self> {
         if entries.is_empty() {
@@ -1355,9 +1501,7 @@ impl EngineShared {
         self.diagnostic_counters
             .cqes_routed
             .fetch_add(1, Ordering::Relaxed);
-        if let Some((callback, result, mr)) = finished.callback {
-            callback(result, mr);
-        }
+        invoke_detached_completion(finished.callback);
         if removed
             && operation.connection.close_started()
             && operation.connection.accepted_count() == 0
@@ -1440,8 +1584,9 @@ mod tests {
             let state = self.connection.upgrade().expect("connection state");
             let connection = RdmaConnection::from_state(shared, state);
             let mr = lock_unpoison(&self.mr).take().expect("test MR");
-            let result =
-                connection.post_detached_send(mr, 1, Box::new(|_result, _mr| unreachable!()));
+            let result = connection
+                .post_detached_send(mr, 1, Box::new(|_completion| {}))
+                .map_err(DetachedPostError::into_error);
             *lock_unpoison(&self.result) = Some(result);
             1
         }
@@ -2259,7 +2404,7 @@ mod tests {
             let callback_calls = Arc::clone(&callback_calls);
             entries.push((
                 mr,
-                Box::new(move |_result, _mr| {
+                Box::new(move |_completion| {
                     callback_calls.fetch_add(1, Ordering::AcqRel);
                 }) as DetachedOperationCallback,
             ));
@@ -2268,7 +2413,7 @@ mod tests {
             connection.post_detached_recv_batch(entries),
             Err(Error::PostFailed(_))
         ));
-        assert_eq!(callback_calls.load(Ordering::Acquire), 0);
+        assert_eq!(callback_calls.load(Ordering::Acquire), 2);
         assert_eq!(poster.calls(), 1);
         assert_eq!(shared.operations.live(), 0);
         assert_eq!(shared.cq_credits.free(), 4);

@@ -42,9 +42,10 @@ use driver::WorkSignal;
 pub use driver::{
     TestAcceptedOperation, TestAdmissionBarrier, TestConnectionCqeSuppression,
     TestConnectionIdentity, TestCqArmWindowControl, TestCqeSuppression, TestEngineQp,
-    TestEngineResources, TestRouteHandle,
+    TestEngineResources, TestReadyWorkControl, TestRouteHandle,
 };
 pub use listener::{RdmaListener, RdmaListenerConfig};
+pub(crate) use operation::DetachedOperationCompletion;
 pub use operation::RdmaOperation;
 #[cfg(test)]
 pub(crate) use operation::{BatchOwnershipTransfer, PreparedBatchOwnership};
@@ -172,17 +173,18 @@ impl RdmaEngineBuilder {
         let (resources, provider) = EngineResources::build(&self.config)?;
         let resource_summary = resources.summary();
         let resource_refs = resources.connection_resource_refs();
-        #[allow(unused_mut, reason = "test hooks attach safe resource references")]
-        let mut shared = EngineShared::new(
+        let shared = EngineShared::new(
             self.config,
             resource_summary,
             Some(provider),
             Some(resource_refs),
         )?;
         #[cfg(any(test, feature = "test-hooks"))]
-        {
+        let shared = {
+            let mut shared = shared;
             shared.test_resources = Some(resources.test_resource_refs());
-        }
+            shared
+        };
         let shared = Arc::new(shared);
         let engine = RdmaEngine {
             shared: Arc::clone(&shared),
@@ -604,27 +606,11 @@ impl EngineShared {
     }
 
     fn retained_bundle_count(&self) -> usize {
-        let retained = self.connections.live().max(self.cm.retained_owner_count());
-        #[cfg(any(test, feature = "test-hooks"))]
-        {
-            retained.saturating_add(self.test_driver.route_count())
-        }
-        #[cfg(not(any(test, feature = "test-hooks")))]
-        {
-            retained
-        }
+        self.connections.live().max(self.cm.retained_owner_count())
     }
 
     fn unsafe_outstanding_operations(&self) -> usize {
-        let production = self.accepted_operations.load(Ordering::Acquire);
-        #[cfg(any(test, feature = "test-hooks"))]
-        {
-            production + self.test_driver.accepted_outstanding()
-        }
-        #[cfg(not(any(test, feature = "test-hooks")))]
-        {
-            production
-        }
+        self.accepted_operations.load(Ordering::Acquire)
     }
 
     fn retain_after_failure(shared: &Arc<Self>) {

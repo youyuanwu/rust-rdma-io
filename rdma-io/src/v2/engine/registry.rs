@@ -450,7 +450,6 @@ impl ConnectionRegistry {
     }
 
     #[cfg(test)]
-    #[allow(dead_code, reason = "used by routing rejection tests")]
     pub(super) fn set_qp_mapping_for_test(&self, qp_num: u32, token: ConnectionToken) {
         lock_unpoison(&self.qp_index).insert(qp_num, token);
     }

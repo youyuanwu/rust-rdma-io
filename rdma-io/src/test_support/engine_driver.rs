@@ -2,5 +2,5 @@
 
 pub use crate::v2::engine::{
     TestAcceptedOperation, TestAdmissionBarrier, TestConnectionIdentity, TestCqArmWindowControl,
-    TestCqeSuppression, TestEngineQp, TestEngineResources, TestRouteHandle,
+    TestCqeSuppression, TestEngineQp, TestEngineResources, TestReadyWorkControl, TestRouteHandle,
 };

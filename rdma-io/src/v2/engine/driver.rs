@@ -174,10 +174,6 @@ impl RdmaEngineDriver {
             return Ok(false);
         }
 
-        #[cfg(any(test, feature = "test-hooks"))]
-        if self.shared.test_driver.accepted_outstanding() != 0 {
-            return Ok(false);
-        }
         if self
             .shared
             .accepted_operations
@@ -428,6 +424,10 @@ impl RdmaEngineDriver {
     }
 
     fn service_ready_connection(&mut self) -> bool {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if self.shared.test_driver.ready_work_paused() {
+            return false;
+        }
         if let Some(connection) = self.shared.take_published_connection() {
             self.scheduler.enqueue_connection(connection.ready());
         }
@@ -568,15 +568,10 @@ impl Drop for RdmaEngineDriver {
         if self.shared.outcome().is_none() {
             self.shared.mark_shutdown_requested();
             self.shared.synchronously_prepare_driver_drop();
-            #[cfg(any(test, feature = "test-hooks"))]
-            let test_outstanding = self.shared.test_driver.accepted_outstanding();
-            #[cfg(not(any(test, feature = "test-hooks")))]
-            let test_outstanding = 0;
-            let production = self
+            let outstanding = self
                 .shared
                 .accepted_operations
                 .load(std::sync::atomic::Ordering::Acquire);
-            let outstanding = test_outstanding + production;
             let cm_owners = self
                 .shared
                 .cm
@@ -700,6 +695,14 @@ pub(super) mod test_api {
         shared: Weak<EngineShared>,
         connection: super::super::registry::ConnectionToken,
         qp_num: u32,
+        active: bool,
+    }
+
+    /// Controller that withholds connection-local ready work while CQ and CM
+    /// progress remain active.
+    #[doc(hidden)]
+    pub struct TestReadyWorkControl {
+        shared: Weak<EngineShared>,
         active: bool,
     }
 
@@ -920,6 +923,16 @@ pub(super) mod test_api {
             })
         }
 
+        /// Pause connection-local ready work without pausing shared CQ or CM work.
+        pub fn pause_ready_work(&self) -> Result<TestReadyWorkControl> {
+            let shared = self.ensure_active()?;
+            shared.test_driver.pause_ready_work()?;
+            Ok(TestReadyWorkControl {
+                shared: Arc::downgrade(&shared),
+                active: true,
+            })
+        }
+
         fn pause_next_admission(&self, point: AdmissionPausePoint) -> Result<TestAdmissionBarrier> {
             let shared = self.ensure_active()?;
             shared.test_driver.start_admission_control(point)?;
@@ -976,6 +989,29 @@ pub(super) mod test_api {
             }
             if let Some(shared) = self.shared.upgrade() {
                 shared.test_driver.stop_admission_control(self.point);
+            }
+            self.active = false;
+        }
+    }
+
+    impl TestReadyWorkControl {
+        pub fn release(mut self) {
+            if let Some(shared) = self.shared.upgrade() {
+                shared.test_driver.resume_ready_work();
+                shared.work_signal.publish(READY_CONNECTION_WORK);
+            }
+            self.active = false;
+        }
+    }
+
+    impl Drop for TestReadyWorkControl {
+        fn drop(&mut self) {
+            if !self.active {
+                return;
+            }
+            if let Some(shared) = self.shared.upgrade() {
+                shared.test_driver.resume_ready_work();
+                shared.work_signal.publish(READY_CONNECTION_WORK);
             }
             self.active = false;
         }
@@ -1259,6 +1295,7 @@ pub(super) mod test_api {
         released_connection_cqes: Mutex<VecDeque<WorkCompletion>>,
         connection_cqe_notify: Notify,
         injected_failure: Mutex<Option<Error>>,
+        ready_work_paused: AtomicBool,
     }
 
     struct ConnectionCqeSuppressionState {
@@ -1288,7 +1325,23 @@ pub(super) mod test_api {
                 released_connection_cqes: Mutex::new(VecDeque::new()),
                 connection_cqe_notify: Notify::new(),
                 injected_failure: Mutex::new(None),
+                ready_work_paused: AtomicBool::new(false),
             }
+        }
+
+        fn pause_ready_work(&self) -> Result<()> {
+            self.ready_work_paused
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .map_err(|_| Error::InvalidConfig("ready work is already paused".into()))?;
+            Ok(())
+        }
+
+        fn resume_ready_work(&self) {
+            self.ready_work_paused.store(false, Ordering::Release);
+        }
+
+        pub(super) fn ready_work_paused(&self) -> bool {
+            self.ready_work_paused.load(Ordering::Acquire)
         }
 
         fn inject_failure(&self, error: Error) -> Result<()> {
@@ -1673,10 +1726,6 @@ pub(super) mod test_api {
             routes.values().map(|route| route.remaining()).sum()
         }
 
-        pub(crate) fn route_count(&self) -> usize {
-            self.routes.lock().expect("test route table poisoned").len()
-        }
-
         pub(super) fn record_cq_arm(&self, generation: u64) -> bool {
             let previous = self.cq_arms.swap(generation, Ordering::AcqRel);
             debug_assert!(generation > previous, "CQ arm generations must increase");
@@ -1912,7 +1961,7 @@ pub(super) mod test_api {
 pub use test_api::{
     TestAcceptedOperation, TestAdmissionBarrier, TestConnectionCqeSuppression,
     TestConnectionIdentity, TestCqArmWindowControl, TestCqeSuppression, TestEngineQp,
-    TestEngineResources, TestRouteHandle,
+    TestEngineResources, TestReadyWorkControl, TestRouteHandle,
 };
 
 #[cfg(test)]

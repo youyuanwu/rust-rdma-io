@@ -112,7 +112,8 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use tokio::sync::{Mutex, Notify, Semaphore, mpsc};
+use futures_util::task::AtomicWaker;
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::async_cm::AsyncCmListener;
 use crate::cm::ConnParam;
@@ -123,8 +124,9 @@ use super::connection::{
 };
 use super::driver::CqDriverHandle;
 use super::engine::{
-    CompletionMode, ConnectionReadyWork, ConnectionState, EngineShared, PreEstablishSetup,
-    RdmaConnection, RdmaConnectionConfig, RdmaEngine, RdmaListener, SetupSummary,
+    CompletionMode, ConnectionReadyWork, ConnectionState, DetachedOperationCompletion,
+    EngineShared, PreEstablishSetup, RdmaConnection, RdmaConnectionConfig, RdmaEngine,
+    RdmaListener, SetupSummary,
 };
 use super::error::{Error, Result, TransportError};
 use super::mr::{AccessIntent, Mr};
@@ -536,6 +538,17 @@ pub enum TestHelloOverride {
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum TestSteadyFrame {
+    Credit(u32),
+    Hello,
+    BadMagicData,
+    TrailingDataByte,
+    TruncatedDataPayload,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
 #[derive(Clone, Default)]
 #[doc(hidden)]
 pub struct TestHelloAttachHook {
@@ -705,6 +718,20 @@ impl PreEstablishSetup for MessagePreEstablishSetup {
             .recv_count
             .checked_add(protocol::CTRL_RECV_COUNT)
             .ok_or_else(|| Error::InvalidConfig("message receive batch overflow".into()))?;
+        let mut data_sends = Vec::with_capacity(self.state.local_send_capacity);
+        for _ in 0..self.state.local_send_capacity {
+            data_sends.push(connection.register_memory(self.mr_size, AccessIntent::LocalOnly)?);
+        }
+        let mut control_sends = Vec::with_capacity(protocol::CTRL_SEND_COUNT);
+        for _ in 0..protocol::CTRL_SEND_COUNT {
+            control_sends.push(
+                connection.register_memory(protocol::CTRL_BUF_SIZE, AccessIntent::LocalOnly)?,
+            );
+        }
+        let hello_send =
+            connection.register_memory(protocol::HELLO_FRAME_SIZE, AccessIntent::LocalOnly)?;
+        self.state
+            .install_pools(data_sends, control_sends, hello_send)?;
         #[cfg(any(test, feature = "test-hooks"))]
         if let Some(hook) = self.state.attach_hook.as_ref() {
             hook.prepare_hello_mr(
@@ -717,9 +744,9 @@ impl PreEstablishSetup for MessagePreEstablishSetup {
             let state = Arc::downgrade(&self.state);
             entries.push((
                 mr,
-                Box::new(move |result, mr| {
+                Box::new(move |completion| {
                     if let Some(state) = state.upgrade() {
-                        state.enqueue_event(EngineMessageEvent::Receive { result, mr });
+                        state.enqueue_event(EngineMessageEvent::Receive(completion));
                     }
                 }) as _,
             ));
@@ -760,7 +787,12 @@ fn allocate_and_prepost_recvs(
 pub struct ReceivedMessage {
     mr: Option<Mr>,
     byte_len: usize,
-    repost_tx: mpsc::UnboundedSender<Mr>,
+    repost: ReceivedMessageRepost,
+}
+
+enum ReceivedMessageRepost {
+    Legacy(mpsc::UnboundedSender<Mr>),
+    Engine(Weak<EngineMessageState>),
 }
 
 impl ReceivedMessage {
@@ -794,8 +826,16 @@ impl std::ops::Deref for ReceivedMessage {
 impl Drop for ReceivedMessage {
     fn drop(&mut self) {
         if let Some(mr) = self.mr.take() {
-            // Return MR to recv pump for reposting + credit return.
-            let _ = self.repost_tx.send(mr);
+            match &self.repost {
+                ReceivedMessageRepost::Legacy(repost_tx) => {
+                    let _ = repost_tx.send(mr);
+                }
+                ReceivedMessageRepost::Engine(state) => {
+                    if let Some(state) = state.upgrade() {
+                        state.enqueue_event(EngineMessageEvent::Repost(mr));
+                    }
+                }
+            }
         }
     }
 }
@@ -1103,6 +1143,91 @@ struct CompletedRecv {
     byte_len: usize,
 }
 
+struct RegisteredMrPool {
+    inner: StdMutex<RegisteredMrPoolInner>,
+    available: Arc<Semaphore>,
+}
+
+struct RegisteredMrPoolInner {
+    closed: bool,
+    entries: Vec<Mr>,
+}
+
+impl RegisteredMrPool {
+    fn new(entries: Vec<Mr>) -> Arc<Self> {
+        Arc::new(Self {
+            available: Arc::new(Semaphore::new(entries.len())),
+            inner: StdMutex::new(RegisteredMrPoolInner {
+                closed: false,
+                entries,
+            }),
+        })
+    }
+
+    async fn take(self: &Arc<Self>) -> Result<Mr> {
+        let permit = Arc::clone(&self.available)
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::TransportClosed)?;
+        let mut inner = lock_std(&self.inner);
+        if inner.closed {
+            return Err(Error::TransportClosed);
+        }
+        let mr = inner
+            .entries
+            .pop()
+            .ok_or_else(|| Error::InvalidConfig("registered MR pool accounting mismatch".into()))?;
+        permit.forget();
+        Ok(mr)
+    }
+
+    fn try_take(self: &Arc<Self>) -> Option<Mr> {
+        let permit = Arc::clone(&self.available).try_acquire_owned().ok()?;
+        let mut inner = lock_std(&self.inner);
+        if inner.closed {
+            return None;
+        }
+        let mr = inner.entries.pop()?;
+        permit.forget();
+        Some(mr)
+    }
+
+    fn put(&self, mr: Mr) {
+        let mut inner = lock_std(&self.inner);
+        if inner.closed {
+            drop(inner);
+            drop(mr);
+            return;
+        }
+        inner.entries.push(mr);
+        drop(inner);
+        self.available.add_permits(1);
+    }
+
+    fn close(&self) {
+        let entries = {
+            let mut inner = lock_std(&self.inner);
+            if inner.closed {
+                return;
+            }
+            inner.closed = true;
+            self.available.close();
+            std::mem::take(&mut inner.entries)
+        };
+        drop(entries);
+    }
+
+    fn available(&self) -> usize {
+        lock_std(&self.inner).entries.len()
+    }
+}
+
+struct EngineMessagePools {
+    data_sends: Arc<RegisteredMrPool>,
+    control_sends: Arc<RegisteredMrPool>,
+    hello_send: StdMutex<Option<Mr>>,
+}
+
 struct EngineMessageLink {
     shared: Weak<EngineShared>,
     connection: Weak<ConnectionState>,
@@ -1116,28 +1241,145 @@ struct EngineHandshake {
 
 enum EngineMessageEvent {
     Start,
-    Send {
-        result: Result<super::op::Completion>,
-        mr: Option<Mr>,
+    HelloSend(DetachedOperationCompletion),
+    Receive(DetachedOperationCompletion),
+    Repost(Mr),
+    SendRequest(Arc<EngineSendRequest>),
+    SendComplete {
+        request: Arc<EngineSendRequest>,
+        completion: DetachedOperationCompletion,
     },
-    Receive {
-        result: Result<super::op::Completion>,
-        mr: Option<Mr>,
+    ControlSendComplete(DetachedOperationCompletion),
+}
+
+struct EngineSendRequest {
+    inner: StdMutex<EngineSendRequestInner>,
+    cancelled: AtomicBool,
+    credit_committed: AtomicBool,
+    waker: AtomicWaker,
+}
+
+struct EngineSendRequestInner {
+    mr: Option<Mr>,
+    credit: Option<OwnedSemaphorePermit>,
+    frame_len: usize,
+    output: Option<Result<()>>,
+}
+
+enum EngineSendRequestAction {
+    Post {
+        mr: Mr,
+        credit: Option<OwnedSemaphorePermit>,
+        frame_len: usize,
     },
+    Cancelled {
+        mr: Mr,
+        credit: Option<OwnedSemaphorePermit>,
+    },
+    AlreadyHandled,
+}
+
+impl EngineSendRequest {
+    fn new(mr: Mr, credit: Option<OwnedSemaphorePermit>, frame_len: usize) -> Arc<Self> {
+        Arc::new(Self {
+            inner: StdMutex::new(EngineSendRequestInner {
+                mr: Some(mr),
+                credit,
+                frame_len,
+                output: None,
+            }),
+            cancelled: AtomicBool::new(false),
+            credit_committed: AtomicBool::new(false),
+            waker: AtomicWaker::new(),
+        })
+    }
+
+    fn start(&self) -> EngineSendRequestAction {
+        let mut inner = lock_std(&self.inner);
+        let Some(mr) = inner.mr.take() else {
+            return EngineSendRequestAction::AlreadyHandled;
+        };
+        let credit = inner.credit.take();
+        if self.cancelled.load(Ordering::Acquire) {
+            return EngineSendRequestAction::Cancelled { mr, credit };
+        }
+        EngineSendRequestAction::Post {
+            mr,
+            credit,
+            frame_len: inner.frame_len,
+        }
+    }
+
+    fn complete(&self, result: Result<()>) {
+        let mut inner = lock_std(&self.inner);
+        if inner.output.is_none() {
+            inner.output = Some(result);
+        }
+        drop(inner);
+        self.waker.wake();
+    }
+
+    fn take_output(&self) -> Option<Result<()>> {
+        lock_std(&self.inner).output.take()
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+struct EngineSendWaiter {
+    request: Arc<EngineSendRequest>,
+    state: Weak<EngineMessageState>,
+    done: bool,
+}
+
+impl Future for EngineSendWaiter {
+    type Output = Result<()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if let Some(result) = self.request.take_output() {
+            self.done = true;
+            return Poll::Ready(result);
+        }
+        self.request.waker.register(cx.waker());
+        if let Some(result) = self.request.take_output() {
+            self.done = true;
+            Poll::Ready(result)
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl Drop for EngineSendWaiter {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        self.request.cancel();
+        if let Some(state) = self.state.upgrade() {
+            state.publish();
+        }
+    }
 }
 
 struct EngineMessageState {
     state: AtomicU8,
     state_notify: Notify,
     error: StdMutex<Option<Error>>,
-    remote_credits: Semaphore,
+    remote_credits: Arc<Semaphore>,
     peer_recv_capacity: AtomicUsize,
+    credits_in_flight: AtomicUsize,
     local_recv_capacity: usize,
-    _local_send_capacity: usize,
+    local_send_capacity: usize,
     buffer_size: usize,
+    pools: OnceLock<EngineMessagePools>,
     handshake: StdMutex<EngineHandshake>,
     events: StdMutex<VecDeque<EngineMessageEvent>>,
-    steady_inbox: StdMutex<VecDeque<(Result<super::op::Completion>, Option<Mr>)>>,
+    received: StdMutex<VecDeque<CompletedRecv>>,
+    recv_notify: Notify,
+    pending_credit_returns: AtomicUsize,
     link: OnceLock<EngineMessageLink>,
     self_weak: OnceLock<Weak<EngineMessageState>>,
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1152,18 +1394,22 @@ impl EngineMessageState {
             state: AtomicU8::new(STATE_CREATED),
             state_notify: Notify::new(),
             error: StdMutex::new(None),
-            remote_credits: Semaphore::new(0),
+            remote_credits: Arc::new(Semaphore::new(0)),
             peer_recv_capacity: AtomicUsize::new(0),
+            credits_in_flight: AtomicUsize::new(0),
             local_recv_capacity: config.recv_count,
-            _local_send_capacity: config.send_count,
+            local_send_capacity: config.send_count,
             buffer_size: config.buffer_size,
+            pools: OnceLock::new(),
             handshake: StdMutex::new(EngineHandshake {
                 hello_send_posted: false,
                 hello_send_complete: false,
                 hello_receive_complete: false,
             }),
             events: StdMutex::new(VecDeque::new()),
-            steady_inbox: StdMutex::new(VecDeque::new()),
+            received: StdMutex::new(VecDeque::new()),
+            recv_notify: Notify::new(),
+            pending_credit_returns: AtomicUsize::new(0),
             link: OnceLock::new(),
             self_weak: OnceLock::new(),
             #[cfg(any(test, feature = "test-hooks"))]
@@ -1173,7 +1419,51 @@ impl EngineMessageState {
         }
     }
 
+    fn install_pools(
+        &self,
+        data_sends: Vec<Mr>,
+        control_sends: Vec<Mr>,
+        hello_send: Mr,
+    ) -> Result<()> {
+        if data_sends.len() != self.local_send_capacity {
+            return Err(Error::InvalidConfig(format!(
+                "message data-send pool has {} buffers, expected {}",
+                data_sends.len(),
+                self.local_send_capacity
+            )));
+        }
+        if control_sends.len() != protocol::CTRL_SEND_COUNT {
+            return Err(Error::InvalidConfig(format!(
+                "message control-send pool has {} buffers, expected {}",
+                control_sends.len(),
+                protocol::CTRL_SEND_COUNT
+            )));
+        }
+        self.pools
+            .set(EngineMessagePools {
+                data_sends: RegisteredMrPool::new(data_sends),
+                control_sends: RegisteredMrPool::new(control_sends),
+                hello_send: StdMutex::new(Some(hello_send)),
+            })
+            .map_err(|_| Error::InvalidConfig("message pools installed more than once".into()))
+    }
+
+    fn pools(&self) -> Result<&EngineMessagePools> {
+        self.pools
+            .get()
+            .ok_or_else(|| Error::InvalidConfig("message pools are not installed".into()))
+    }
+
+    fn close_pools(&self) {
+        if let Some(pools) = self.pools.get() {
+            pools.data_sends.close();
+            pools.control_sends.close();
+            drop(lock_std(&pools.hello_send).take());
+        }
+    }
+
     fn attach(self: &Arc<Self>, connection: &RdmaConnection) -> Result<()> {
+        self.pools()?;
         self.self_weak
             .set(Arc::downgrade(self))
             .map_err(|_| Error::InvalidConfig("message state attached more than once".into()))?;
@@ -1197,8 +1487,56 @@ impl EngineMessageState {
     }
 
     fn enqueue_event(&self, event: EngineMessageEvent) {
+        if self.state.load(Ordering::Acquire) >= STATE_CLOSING {
+            self.dispose_terminal_event(event);
+            return;
+        }
         lock_std(&self.events).push_back(event);
         self.publish();
+    }
+
+    fn dispose_terminal_event(&self, event: EngineMessageEvent) {
+        match event {
+            EngineMessageEvent::Start => {}
+            EngineMessageEvent::HelloSend(completion)
+            | EngineMessageEvent::Receive(completion)
+            | EngineMessageEvent::ControlSendComplete(completion) => match completion {
+                DetachedOperationCompletion::Unaccepted { mr, .. }
+                | DetachedOperationCompletion::Completed { mr: Some(mr), .. } => drop(mr),
+                DetachedOperationCompletion::Completed { mr: None, .. } => {}
+            },
+            EngineMessageEvent::Repost(mr) => drop(mr),
+            EngineMessageEvent::SendRequest(request) => match request.start() {
+                EngineSendRequestAction::Post { mr, credit, .. }
+                | EngineSendRequestAction::Cancelled { mr, credit } => {
+                    drop(credit);
+                    drop(mr);
+                    request.complete(Err(self.terminal_error()));
+                }
+                EngineSendRequestAction::AlreadyHandled => {}
+            },
+            EngineMessageEvent::SendComplete {
+                request,
+                completion,
+            } => {
+                if matches!(&completion, DetachedOperationCompletion::Unaccepted { .. }) {
+                    self.rollback_unaccepted_send(&request);
+                }
+                match completion {
+                    DetachedOperationCompletion::Unaccepted { mr, .. }
+                    | DetachedOperationCompletion::Completed { mr: Some(mr), .. } => drop(mr),
+                    DetachedOperationCompletion::Completed { mr: None, .. } => {}
+                }
+                request.complete(Err(self.terminal_error()));
+            }
+        }
+    }
+
+    fn drain_terminal_events(&self) {
+        let events = std::mem::take(&mut *lock_std(&self.events));
+        for event in events {
+            self.dispose_terminal_event(event);
+        }
     }
 
     fn publish(&self) {
@@ -1224,7 +1562,11 @@ impl EngineMessageState {
         }
         drop(stored);
         self.remote_credits.close();
+        self.pending_credit_returns.store(0, Ordering::Release);
+        self.close_pools();
+        self.drain_terminal_events();
         self.state_notify.notify_waiters();
+        self.recv_notify.notify_waiters();
         if close_connection
             && let Some(link) = self.link.get()
             && let (Some(shared), Some(connection)) =
@@ -1268,7 +1610,12 @@ impl EngineMessageState {
             Ordering::Acquire,
         );
         self.remote_credits.close();
+        self.pending_credit_returns.store(0, Ordering::Release);
+        self.close_pools();
+        self.drain_terminal_events();
         self.state_notify.notify_waiters();
+        self.recv_notify.notify_waiters();
+        self.publish();
     }
 
     fn finish_close(&self, result: &Result<()>) {
@@ -1278,32 +1625,403 @@ impl EngineMessageState {
             }
             Err(error) => self.fail(error.clone(), false),
         }
+        self.close_pools();
+        self.drain_terminal_events();
         self.state_notify.notify_waiters();
+        self.recv_notify.notify_waiters();
     }
 
     fn process_event(&self, event: EngineMessageEvent) {
         match event {
             EngineMessageEvent::Start => self.start_hello_send(),
-            EngineMessageEvent::Send { result, mr } => {
-                drop(mr);
-                match result {
-                    Ok(_) => {
-                        lock_std(&self.handshake).hello_send_complete = true;
-                        self.try_mark_ready();
+            EngineMessageEvent::HelloSend(completion) => match completion {
+                DetachedOperationCompletion::Unaccepted { error, mr } => {
+                    drop(mr);
+                    self.fail(error, true);
+                }
+                DetachedOperationCompletion::Completed { result, mr } => {
+                    drop(mr);
+                    match result {
+                        Ok(_) => {
+                            lock_std(&self.handshake).hello_send_complete = true;
+                            self.try_mark_ready();
+                        }
+                        Err(error) => self.fail(error, true),
                     }
-                    Err(error) => self.fail(error, true),
+                }
+            },
+            EngineMessageEvent::Receive(completion) => self.process_receive(completion),
+            EngineMessageEvent::Repost(mr) => self.process_repost(mr),
+            EngineMessageEvent::SendRequest(request) => self.process_send_request(request),
+            EngineMessageEvent::SendComplete {
+                request,
+                completion,
+            } => self.process_send_completion(request, completion),
+            EngineMessageEvent::ControlSendComplete(completion) => {
+                let (result, mr) = match completion {
+                    DetachedOperationCompletion::Unaccepted { error, mr } => (Err(error), Some(mr)),
+                    DetachedOperationCompletion::Completed { result, mr } => (result, mr),
+                };
+                if let Some(mr) = mr
+                    && let Ok(pools) = self.pools()
+                {
+                    pools.control_sends.put(mr);
+                }
+                if let Err(error) = result
+                    && self.state.load(Ordering::Acquire) == STATE_READY
+                {
+                    self.fail(error, true);
                 }
             }
-            EngineMessageEvent::Receive { result, mr } => {
-                if self.state.load(Ordering::Acquire) == STATE_READY {
-                    lock_std(&self.steady_inbox).push_back((result, mr));
+        }
+    }
+
+    fn process_receive(&self, completion: DetachedOperationCompletion) {
+        let (result, mr) = match completion {
+            DetachedOperationCompletion::Unaccepted { error, mr } => (Err(error), Some(mr)),
+            DetachedOperationCompletion::Completed { result, mr } => (result, mr),
+        };
+        let state = self.state.load(Ordering::Acquire);
+        if state == STATE_CREATED {
+            self.process_hello_receive(result, mr);
+            return;
+        }
+        if state != STATE_READY {
+            drop(mr);
+            return;
+        }
+
+        let completion = match result {
+            Ok(completion) => completion,
+            Err(error) => {
+                drop(mr);
+                self.fail(error, true);
+                return;
+            }
+        };
+        let Some(mr) = mr else {
+            self.fail(Error::DriverShutdown, true);
+            return;
+        };
+        let received_len = completion.byte_len() as usize;
+        if received_len > mr.len() {
+            self.fail(
+                Error::ProtocolViolation(format!(
+                    "receive length {received_len} exceeds MR length {}",
+                    mr.len()
+                )),
+                true,
+            );
+            return;
+        }
+        let header = match protocol::parse_header(mr.as_slice(), received_len) {
+            Ok(header) => header,
+            Err(error) => {
+                self.fail(error, true);
+                return;
+            }
+        };
+        let payload_end = protocol::HEADER_SIZE + header.payload_len as usize;
+        match header.frame_type {
+            protocol::FRAME_DATA => {
+                let payload_len = header.payload_len as usize;
+                if payload_len > self.buffer_size {
+                    self.fail(
+                        Error::ProtocolViolation(format!(
+                            "DATA payload {payload_len} exceeds negotiated maximum {}",
+                            self.buffer_size
+                        )),
+                        true,
+                    );
                     return;
                 }
-                if self.state.load(Ordering::Acquire) != STATE_CREATED {
-                    drop(mr);
+                lock_std(&self.received).push_back(CompletedRecv {
+                    mr,
+                    byte_len: payload_len,
+                });
+                self.recv_notify.notify_one();
+            }
+            protocol::FRAME_CREDIT => {
+                let credit = match protocol::parse_credit(
+                    &mr.as_slice()[protocol::HEADER_SIZE..payload_end],
+                ) {
+                    Ok(credit) => credit,
+                    Err(error) => {
+                        self.fail(error, true);
+                        return;
+                    }
+                };
+                if let Err(error) = self.validate_and_add_credits(credit.credits) {
+                    self.fail(error, true);
                     return;
                 }
-                self.process_hello_receive(result, mr);
+                self.post_receive(mr, false);
+            }
+            protocol::FRAME_HELLO => self.fail(
+                Error::ProtocolViolation(
+                    "unexpected HELLO frame during steady-state operation".into(),
+                ),
+                true,
+            ),
+            _ => unreachable!("parse_header rejects unknown frame types"),
+        }
+    }
+
+    fn process_repost(&self, mr: Mr) {
+        if self.state.load(Ordering::Acquire) != STATE_READY {
+            drop(mr);
+            return;
+        }
+        self.post_receive(mr, true);
+    }
+
+    fn post_receive(&self, mr: Mr, return_credit: bool) {
+        let connection = match self.connection() {
+            Ok(connection) => connection,
+            Err(error) => {
+                self.fail(error, false);
+                return;
+            }
+        };
+        let state = self.weak_self();
+        let posted = connection.post_detached_recv(
+            mr,
+            Box::new(move |completion| {
+                if let Some(state) = state.upgrade() {
+                    state.enqueue_event(EngineMessageEvent::Receive(completion));
+                }
+            }),
+        );
+        match posted {
+            Ok(()) => {
+                if return_credit {
+                    self.pending_credit_returns.fetch_add(1, Ordering::AcqRel);
+                }
+            }
+            Err(error) if error.potentially_accepted() => {
+                self.fail(error.error().clone(), true);
+            }
+            Err(_) => {}
+        }
+    }
+
+    fn process_send_request(&self, request: Arc<EngineSendRequest>) {
+        match request.start() {
+            EngineSendRequestAction::Cancelled { mr, credit } => {
+                drop(credit);
+                if let Ok(pools) = self.pools() {
+                    pools.data_sends.put(mr);
+                }
+            }
+            EngineSendRequestAction::AlreadyHandled => {}
+            EngineSendRequestAction::Post {
+                mr,
+                credit,
+                frame_len,
+            } => {
+                if self.state.load(Ordering::Acquire) != STATE_READY {
+                    drop(credit);
+                    if let Ok(pools) = self.pools() {
+                        pools.data_sends.put(mr);
+                    }
+                    request.complete(Err(self.terminal_error()));
+                    return;
+                }
+                if let Some(credit) = credit {
+                    credit.forget();
+                    self.credits_in_flight.fetch_add(1, Ordering::AcqRel);
+                    request.credit_committed.store(true, Ordering::Release);
+                }
+                let connection = match self.connection() {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        self.rollback_unaccepted_send(&request);
+                        if let Ok(pools) = self.pools() {
+                            pools.data_sends.put(mr);
+                        }
+                        request.complete(Err(error));
+                        return;
+                    }
+                };
+                let state = self.weak_self();
+                let callback_request = Arc::clone(&request);
+                if let Err(error) = connection.post_detached_send(
+                    mr,
+                    frame_len,
+                    Box::new(move |completion| {
+                        if let Some(state) = state.upgrade() {
+                            state.enqueue_event(EngineMessageEvent::SendComplete {
+                                request: callback_request,
+                                completion,
+                            });
+                        }
+                    }),
+                ) && error.potentially_accepted()
+                {
+                    request.complete(Err(error.error().clone()));
+                    self.fail(error.error().clone(), true);
+                }
+            }
+        }
+    }
+
+    fn process_send_completion(
+        &self,
+        request: Arc<EngineSendRequest>,
+        completion: DetachedOperationCompletion,
+    ) {
+        let (result, mr, unaccepted) = match completion {
+            DetachedOperationCompletion::Unaccepted { error, mr } => (Err(error), Some(mr), true),
+            DetachedOperationCompletion::Completed { result, mr } => (result, mr, false),
+        };
+        if unaccepted {
+            self.rollback_unaccepted_send(&request);
+        }
+        if let Some(mr) = mr
+            && let Ok(pools) = self.pools()
+        {
+            pools.data_sends.put(mr);
+        }
+        let result = result.map(|_| ()).map_err(|error| match error {
+            Error::CompletionError {
+                status: crate::wc::WcStatus::WrFlushErr,
+                ..
+            } => Error::TransportClosed,
+            error => error,
+        });
+        request.complete(result.clone());
+        if let Err(error) = result
+            && self.state.load(Ordering::Acquire) == STATE_READY
+            && !matches!(error, Error::CapacityExhausted)
+        {
+            self.fail(error, true);
+        }
+    }
+
+    fn rollback_unaccepted_send(&self, request: &EngineSendRequest) {
+        if !request.credit_committed.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        if self
+            .credits_in_flight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_sub(1)
+            })
+            .is_ok()
+        {
+            self.remote_credits.add_permits(1);
+        }
+    }
+
+    fn validate_and_add_credits(&self, credits: u32) -> Result<()> {
+        let credits = credits as usize;
+        check_credit_return(
+            credits as u32,
+            self.credits_in_flight.load(Ordering::Acquire),
+            self.remote_credits.available_permits(),
+            self.peer_recv_capacity.load(Ordering::Acquire),
+        )?;
+        self.credits_in_flight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_sub(credits)
+            })
+            .map_err(|value| {
+                Error::ProtocolViolation(format!(
+                    "CREDIT exceeds in-flight sends (atomic): returned={credits} > in_flight={value}"
+                ))
+            })?;
+        self.remote_credits.add_permits(credits);
+        Ok(())
+    }
+
+    fn flush_one_credit(&self) -> bool {
+        let pending = self.pending_credit_returns.load(Ordering::Acquire);
+        if pending == 0 || self.state.load(Ordering::Acquire) != STATE_READY {
+            return false;
+        }
+        let pools = match self.pools() {
+            Ok(pools) => pools,
+            Err(error) => {
+                self.fail(error, true);
+                return true;
+            }
+        };
+        let Some(mut mr) = pools.control_sends.try_take() else {
+            return false;
+        };
+        let credits = pending.min(u32::MAX as usize);
+        let frame_len = protocol::write_credit_frame(mr.as_mut_slice(), credits as u32);
+        let connection = match self.connection() {
+            Ok(connection) => connection,
+            Err(error) => {
+                pools.control_sends.put(mr);
+                self.fail(error, false);
+                return true;
+            }
+        };
+        let state = self.weak_self();
+        match connection.post_detached_send(
+            mr,
+            frame_len,
+            Box::new(move |completion| {
+                if let Some(state) = state.upgrade() {
+                    state.enqueue_event(EngineMessageEvent::ControlSendComplete(completion));
+                }
+            }),
+        ) {
+            Ok(()) => {
+                self.pending_credit_returns
+                    .fetch_sub(credits, Ordering::AcqRel);
+            }
+            Err(error) if error.potentially_accepted() => {
+                self.fail(error.error().clone(), true);
+            }
+            Err(_) => {}
+        }
+        true
+    }
+
+    fn enqueue_send_request(&self, request: Arc<EngineSendRequest>) {
+        self.enqueue_event(EngineMessageEvent::SendRequest(request));
+    }
+
+    async fn recv(self: &Arc<Self>) -> Result<ReceivedMessage> {
+        loop {
+            let recv_notified = self.recv_notify.notified();
+            tokio::pin!(recv_notified);
+            recv_notified.as_mut().enable();
+            let state_notified = self.state_notify.notified();
+            tokio::pin!(state_notified);
+            state_notified.as_mut().enable();
+
+            if let Some(completed) = lock_std(&self.received).pop_front() {
+                return Ok(ReceivedMessage {
+                    mr: Some(completed.mr),
+                    byte_len: completed.byte_len,
+                    repost: ReceivedMessageRepost::Engine(self.weak_self()),
+                });
+            }
+            match self.state.load(Ordering::Acquire) {
+                STATE_FAILED => return Err(self.terminal_error()),
+                STATE_CLOSING | STATE_STOPPED => return Err(Error::TransportClosed),
+                _ => {}
+            }
+            tokio::select! {
+                _ = recv_notified.as_mut() => {}
+                _ = state_notified.as_mut() => {}
+            }
+        }
+    }
+
+    async fn wait_terminal(&self) -> Error {
+        loop {
+            let notified = self.state_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match self.state.load(Ordering::Acquire) {
+                STATE_FAILED => return self.terminal_error(),
+                STATE_CLOSING | STATE_STOPPED => return Error::TransportClosed,
+                _ => notified.await,
             }
         }
     }
@@ -1336,28 +2054,39 @@ impl EngineMessageState {
                 return;
             }
         };
-        let mut mr =
-            match connection.register_memory(protocol::HELLO_FRAME_SIZE, AccessIntent::LocalOnly) {
-                Ok(mr) => mr,
-                Err(error) => {
-                    self.fail(error, true);
+        let mut mr = match self.pools() {
+            Ok(pools) => match lock_std(&pools.hello_send).take() {
+                Some(mr) => mr,
+                None => {
+                    self.fail(
+                        Error::InvalidConfig("HELLO send buffer is unavailable".into()),
+                        true,
+                    );
                     return;
                 }
-            };
-        #[allow(unused_mut)]
-        let mut advertised_recv = self.local_recv_capacity as u32;
-        #[allow(unused_mut)]
-        let mut advertised_size = self.buffer_size as u32;
+            },
+            Err(error) => {
+                self.fail(error, true);
+                return;
+            }
+        };
+        let advertised_recv = self.local_recv_capacity as u32;
+        let advertised_size = self.buffer_size as u32;
         #[cfg(any(test, feature = "test-hooks"))]
-        {
+        let (advertised_recv, advertised_size) = {
+            let mut advertised_recv = advertised_recv;
+            let mut advertised_size = advertised_size;
             match self.hello_override {
-                Some(TestHelloOverride::ZeroReceiveCredits) => advertised_recv = 0,
+                Some(TestHelloOverride::ZeroReceiveCredits) => {
+                    advertised_recv = 0;
+                }
                 Some(TestHelloOverride::SmallerMaximumMessage) => {
                     advertised_size = advertised_size.saturating_sub(1);
                 }
                 _ => {}
             }
-        }
+            (advertised_recv, advertised_size)
+        };
         let len = protocol::write_hello_frame(mr.as_mut_slice(), advertised_recv, advertised_size);
         #[cfg(any(test, feature = "test-hooks"))]
         {
@@ -1376,13 +2105,14 @@ impl EngineMessageState {
         if let Err(error) = connection.post_detached_send(
             mr,
             len,
-            Box::new(move |result, mr| {
+            Box::new(move |completion| {
                 if let Some(state) = state.upgrade() {
-                    state.enqueue_event(EngineMessageEvent::Send { result, mr });
+                    state.enqueue_event(EngineMessageEvent::HelloSend(completion));
                 }
             }),
-        ) {
-            self.fail(error, true);
+        ) && error.potentially_accepted()
+        {
+            self.fail(error.error().clone(), true);
         }
     }
 
@@ -1421,15 +2151,17 @@ impl EngineMessageState {
             }
         };
         let state = self.weak_self();
-        if let Err(error) = connection.post_detached_recv_batch(vec![(
+        if let Err(error) = connection.post_detached_recv(
             mr,
-            Box::new(move |result, mr| {
+            Box::new(move |completion| {
                 if let Some(state) = state.upgrade() {
-                    state.enqueue_event(EngineMessageEvent::Receive { result, mr });
+                    state.enqueue_event(EngineMessageEvent::Receive(completion));
                 }
             }),
-        )]) {
-            self.fail(error, true);
+        ) {
+            if error.potentially_accepted() {
+                self.fail(error.error().clone(), true);
+            }
             return;
         }
         self.peer_recv_capacity
@@ -1490,10 +2222,12 @@ impl ConnectionReadyWork for EngineMessageState {
     fn process(&self, budget: usize) -> usize {
         let mut processed = 0;
         while processed < budget {
-            let Some(event) = lock_std(&self.events).pop_front() else {
+            let event = { lock_std(&self.events).pop_front() };
+            if let Some(event) = event {
+                self.process_event(event);
+            } else if !self.flush_one_credit() {
                 break;
-            };
-            self.process_event(event);
+            }
             processed += 1;
         }
         processed
@@ -1501,6 +2235,11 @@ impl ConnectionReadyWork for EngineMessageState {
 
     fn has_work(&self) -> bool {
         !lock_std(&self.events).is_empty()
+            || (self.pending_credit_returns.load(Ordering::Acquire) != 0
+                && self
+                    .pools
+                    .get()
+                    .is_some_and(|pools| pools.control_sends.available() != 0))
     }
 
     fn deadline_expired(&self) {
@@ -1845,11 +2584,38 @@ impl MessageTransport {
                 capacity: self.buffer_size,
             });
         }
-        if matches!(self.backend, MessageTransportBackend::Engine(_)) {
+        if let MessageTransportBackend::Engine(engine) = &self.backend {
             self.await_ready().await?;
-            return Err(Error::InvalidConfig(
-                "engine-attached DATA progress is introduced in Phase 8".into(),
-            ));
+            let state = Arc::clone(&engine.state);
+            let acquire_credit = Arc::clone(&state.remote_credits).acquire_owned();
+            tokio::pin!(acquire_credit);
+            let credit = tokio::select! {
+                biased;
+                credit = &mut acquire_credit => credit.map_err(|_| state.terminal_error())?,
+                error = state.wait_terminal() => return Err(error),
+            };
+            let pools = state.pools()?;
+            let take_mr = pools.data_sends.take();
+            tokio::pin!(take_mr);
+            let mut mr = tokio::select! {
+                biased;
+                mr = &mut take_mr => mr.map_err(|_| state.terminal_error())?,
+                error = state.wait_terminal() => return Err(error),
+            };
+            let frame_len = protocol::write_data_frame(mr.as_mut_slice(), data);
+            let request = EngineSendRequest::new(mr, Some(credit), frame_len);
+            state.enqueue_send_request(Arc::clone(&request));
+            let waiter = EngineSendWaiter {
+                request,
+                state: Arc::downgrade(&state),
+                done: false,
+            };
+            tokio::pin!(waiter);
+            return tokio::select! {
+                biased;
+                result = &mut waiter => result,
+                error = state.wait_terminal() => Err(error),
+            };
         }
         let legacy = self.legacy();
 
@@ -1985,11 +2751,8 @@ impl MessageTransport {
     /// - [`Error::TransportClosed`] if cleanly shut down with no buffered messages
     /// - [`Error::TransportFailed`] if the driver failed with no buffered messages
     pub async fn recv(&self) -> Result<ReceivedMessage> {
-        if matches!(self.backend, MessageTransportBackend::Engine(_)) {
-            self.await_ready().await?;
-            return Err(Error::InvalidConfig(
-                "engine-attached DATA progress is introduced in Phase 8".into(),
-            ));
+        if let MessageTransportBackend::Engine(engine) = &self.backend {
+            return Arc::clone(&engine.state).recv().await;
         }
         let legacy = self.legacy();
         let mut rx = legacy.recv_msg_rx.lock().await;
@@ -1999,7 +2762,7 @@ impl MessageTransport {
             return Ok(ReceivedMessage {
                 mr: Some(completed.mr),
                 byte_len: completed.byte_len,
-                repost_tx: legacy.repost_tx.clone(),
+                repost: ReceivedMessageRepost::Legacy(legacy.repost_tx.clone()),
             });
         }
 
@@ -2021,7 +2784,7 @@ impl MessageTransport {
             .map(|completed| ReceivedMessage {
                 mr: Some(completed.mr),
                 byte_len: completed.byte_len,
-                repost_tx: legacy.repost_tx.clone(),
+                repost: ReceivedMessageRepost::Legacy(legacy.repost_tx.clone()),
             })
             .ok_or_else(|| self.terminal_error())
     }
@@ -2029,6 +2792,113 @@ impl MessageTransport {
     /// The configured maximum message payload size.
     pub fn buffer_size(&self) -> usize {
         self.buffer_size
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn test_connection(&self) -> Result<RdmaConnection> {
+        match &self.backend {
+            MessageTransportBackend::Engine(engine) => Ok(engine.connection.clone()),
+            MessageTransportBackend::Legacy(_) => Err(Error::InvalidConfig(
+                "test connection access requires an engine-attached transport".into(),
+            )),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn test_pending_ready_work(&self) -> Result<usize> {
+        match &self.backend {
+            MessageTransportBackend::Engine(engine) => Ok(lock_std(&engine.state.events).len()),
+            MessageTransportBackend::Legacy(_) => Err(Error::InvalidConfig(
+                "test ready-work access requires an engine-attached transport".into(),
+            )),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn test_available_send_buffers(&self) -> Result<usize> {
+        match &self.backend {
+            MessageTransportBackend::Engine(engine) => {
+                Ok(engine.state.pools()?.data_sends.available())
+            }
+            MessageTransportBackend::Legacy(_) => Err(Error::InvalidConfig(
+                "test send-pool access requires an engine-attached transport".into(),
+            )),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn test_negotiated_credits(&self) -> Result<(usize, usize)> {
+        match &self.backend {
+            MessageTransportBackend::Engine(engine) => Ok((
+                engine.state.remote_credits.available_permits(),
+                engine.state.credits_in_flight.load(Ordering::Acquire),
+            )),
+            MessageTransportBackend::Legacy(_) => Err(Error::InvalidConfig(
+                "test credit access requires an engine-attached transport".into(),
+            )),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub async fn test_send_frame(&self, frame: TestSteadyFrame) -> Result<()> {
+        let MessageTransportBackend::Engine(engine) = &self.backend else {
+            return Err(Error::InvalidConfig(
+                "test frame injection requires an engine-attached transport".into(),
+            ));
+        };
+        engine.state.ready().await?;
+        let state = Arc::clone(&engine.state);
+        let pools = state.pools()?;
+        let take_mr = pools.data_sends.take();
+        tokio::pin!(take_mr);
+        let mut mr = tokio::select! {
+            biased;
+            mr = &mut take_mr => mr.map_err(|_| state.terminal_error())?,
+            error = state.wait_terminal() => return Err(error),
+        };
+        let frame_len = match frame {
+            TestSteadyFrame::Credit(credits) => {
+                protocol::write_credit_frame(mr.as_mut_slice(), credits)
+            }
+            TestSteadyFrame::Hello => protocol::write_hello_frame(
+                mr.as_mut_slice(),
+                state.local_recv_capacity as u32,
+                state.buffer_size as u32,
+            ),
+            TestSteadyFrame::BadMagicData => {
+                let len = protocol::write_data_frame(mr.as_mut_slice(), b"x");
+                mr.as_mut_slice()[0] ^= 0xff;
+                len
+            }
+            TestSteadyFrame::TrailingDataByte => {
+                let len = protocol::write_data_frame(mr.as_mut_slice(), b"");
+                mr.as_mut_slice()[len] = 0xff;
+                len + 1
+            }
+            TestSteadyFrame::TruncatedDataPayload => {
+                let len = protocol::write_data_frame(mr.as_mut_slice(), b"x");
+                mr.as_mut_slice()[8..12].copy_from_slice(&2u32.to_le_bytes());
+                len
+            }
+        };
+        let request = EngineSendRequest::new(mr, None, frame_len);
+        state.enqueue_send_request(Arc::clone(&request));
+        let waiter = EngineSendWaiter {
+            request,
+            state: Arc::downgrade(&state),
+            done: false,
+        };
+        tokio::pin!(waiter);
+        tokio::select! {
+            biased;
+            result = &mut waiter => result,
+            error = state.wait_terminal() => Err(error),
+        }
     }
 
     /// Graceful async shutdown.
@@ -3095,6 +3965,65 @@ mod hello_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn engine_state() -> Arc<EngineMessageState> {
+        let config = MessageTransportBuilder::new()
+            .derive_engine_config()
+            .expect("default engine message configuration");
+        Arc::new(EngineMessageState::new(&config))
+    }
+
+    #[test]
+    fn engine_credit_returns_are_atomic_capped_and_duplicate_safe() {
+        let state = engine_state();
+        state.peer_recv_capacity.store(4, Ordering::Release);
+        state.remote_credits.add_permits(1);
+        state.credits_in_flight.store(3, Ordering::Release);
+
+        state.validate_and_add_credits(2).unwrap();
+        assert_eq!(state.remote_credits.available_permits(), 3);
+        assert_eq!(state.credits_in_flight.load(Ordering::Acquire), 1);
+        assert!(matches!(
+            state.validate_and_add_credits(2),
+            Err(Error::ProtocolViolation(message)) if message.contains("exceeds in-flight")
+        ));
+        assert_eq!(state.remote_credits.available_permits(), 3);
+        assert_eq!(state.credits_in_flight.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn engine_terminal_failure_wakes_ready_recv_and_send_terminal_waiters() {
+        let state = engine_state();
+        let ready_state = Arc::clone(&state);
+        let ready = tokio::spawn(async move { ready_state.ready().await });
+        let recv_state = Arc::clone(&state);
+        let recv = tokio::spawn(async move { recv_state.recv().await });
+        let terminal_state = Arc::clone(&state);
+        let terminal = tokio::spawn(async move { terminal_state.wait_terminal().await });
+        tokio::task::yield_now().await;
+
+        state.terminalize(Error::ProtocolViolation("steady-state failure".into()));
+        assert!(matches!(
+            ready.await.unwrap(),
+            Err(Error::ProtocolViolation(message)) if message == "steady-state failure"
+        ));
+        assert!(matches!(
+            recv.await.unwrap(),
+            Err(Error::ProtocolViolation(message)) if message == "steady-state failure"
+        ));
+        assert!(matches!(
+            terminal.await.unwrap(),
+            Error::ProtocolViolation(message) if message == "steady-state failure"
+        ));
+    }
+
+    #[test]
+    fn disconnected_engine_message_state_is_connection_local_terminal() {
+        let state = engine_state();
+        state.disconnected();
+        assert_eq!(state.state.load(Ordering::Acquire), STATE_FAILED);
+        assert!(matches!(state.terminal_error(), Error::TransportClosed));
+    }
 
     // ── Credit Validation Unit Tests ──────────────────────────────────
     //

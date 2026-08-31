@@ -222,6 +222,11 @@ pub fn parse_header(buf: &[u8], received_len: usize) -> Result<FrameHeader> {
             "payload extends past received data: header says {total}, got {received_len}"
         )));
     }
+    if total < received_len {
+        return Err(Error::ProtocolViolation(format!(
+            "frame has trailing bytes: header says {total}, got {received_len}"
+        )));
+    }
 
     Ok(FrameHeader {
         frame_type,
@@ -389,6 +394,17 @@ mod tests {
         let result = parse_header(&buf, HEADER_SIZE);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("extends past"));
+    }
+
+    #[test]
+    fn test_trailing_bytes_are_rejected() {
+        let mut buf = vec![0u8; HEADER_SIZE + 1];
+        write_data_frame(&mut buf, b"");
+        let result = parse_header(&buf, HEADER_SIZE + 1);
+        assert!(matches!(
+            result,
+            Err(Error::ProtocolViolation(message)) if message.contains("trailing bytes")
+        ));
     }
 
     #[test]

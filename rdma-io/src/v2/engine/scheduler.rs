@@ -132,10 +132,6 @@ pub(super) enum DeadlineKind {
     Reclamation,
     ConnectionDrain,
     MessageHello,
-    #[allow(
-        dead_code,
-        reason = "graceful shutdown scheduling is completed in Phase 6"
-    )]
     EngineShutdown,
 }
 

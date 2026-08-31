@@ -7,6 +7,7 @@ MODE="${1:-}"
 primary_status=0
 primary_step=""
 restoration_status=0
+RUN_FULL_WORKSPACE=0
 
 if [[ -z "${CARGO:-}" ]]; then
     if command -v cargo >/dev/null 2>&1; then
@@ -61,8 +62,14 @@ case "$MODE" in
         REPETITIONS=1
         MODE_LABEL="Phase 7 engine message setup"
         ;;
+    --phase8-message)
+        TEST_TARGET="v2_engine_message_tests"
+        REPETITIONS=1
+        MODE_LABEL="Phase 8 engine message DATA/CREDIT progress"
+        RUN_FULL_WORKSPACE=1
+        ;;
     *)
-        echo "usage: sudo -E ./scripts/validate-v2-engine-providers.sh {--provider-probe|--readiness-race|--driver-flush-gate|--phase3-operations|--phase4-connections|--phase5-listeners|--phase6-lifecycle|--phase7-message-setup}" >&2
+        echo "usage: sudo -E ./scripts/validate-v2-engine-providers.sh {--provider-probe|--readiness-race|--driver-flush-gate|--phase3-operations|--phase4-connections|--phase5-listeners|--phase6-lifecycle|--phase7-message-setup|--phase8-message}" >&2
         exit 2
         ;;
 esac
@@ -121,6 +128,28 @@ run_provider_test() {
             "Run $provider $MODE_LABEL ($iteration/$REPETITIONS)" \
             run_selected_test
     done
+    if [[ "$RUN_FULL_WORKSPACE" -eq 1 ]]; then
+        run_step \
+            "Run $provider full workspace with all features" \
+            run_full_workspace
+    fi
+}
+
+run_full_workspace() {
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        local user_home
+        user_home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+        sudo -u "$SUDO_USER" env \
+            HOME="$user_home" \
+            PATH="$TOOLCHAIN_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            RUST_TEST_THREADS=1 \
+            "$CARGO" test --workspace --all-features
+    else
+        env \
+            PATH="$TOOLCHAIN_BIN:$PATH" \
+            RUST_TEST_THREADS=1 \
+            "$CARGO" test --workspace --all-features
+    fi
 }
 
 restore_rxe() {
