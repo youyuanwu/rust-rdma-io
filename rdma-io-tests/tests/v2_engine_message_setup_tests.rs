@@ -4,10 +4,10 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use rdma_io::cm::RdmaCmDeviceList;
-use rdma_io::v2::message_transport::TestHelloOverride;
+use rdma_io::v2::message_transport::{TestHelloAttachHook, TestHelloOverride};
 use rdma_io::v2::{
     CompletionMode, Error, MessageTransport, MessageTransportBuilder, RdmaConnectionConfig,
-    RdmaEngine, RdmaEngineBuilder, RdmaListener, RdmaListenerConfig, Result,
+    RdmaEngine, RdmaEngineBuilder, RdmaEngineDriver, RdmaListener, RdmaListenerConfig, Result,
 };
 use rdma_io_tests::test_helpers::{connect_addr_for, has_software_rdma};
 
@@ -26,15 +26,19 @@ fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
 
 fn assert_message_future<F: Future<Output = Result<MessageTransport>>>(_: &F) {}
 
-async fn build_engine(mode: CompletionMode) -> (RdmaEngine, tokio::task::JoinHandle<Result<()>>) {
+fn build_engine_unspawned(mode: CompletionMode) -> (RdmaEngine, RdmaEngineDriver) {
     let device = software_device_name().expect("software RDMA device");
-    let (engine, driver) = RdmaEngineBuilder::new(device)
+    RdmaEngineBuilder::new(device)
         .completion_mode(mode)
         .maximum_live_connections(8)
         .maximum_inflight_operations(256)
         .cq_capacity(256)
         .build()
-        .unwrap();
+        .unwrap()
+}
+
+async fn build_engine(mode: CompletionMode) -> (RdmaEngine, tokio::task::JoinHandle<Result<()>>) {
+    let (engine, driver) = build_engine_unspawned(mode);
     (engine, tokio::spawn(driver))
 }
 
@@ -404,6 +408,63 @@ async fn run_mixed_accept_order(mode: CompletionMode) {
     client_driver.await.unwrap().unwrap();
 }
 
+async fn run_driver_withholding(mode: CompletionMode) {
+    if !has_software_rdma() {
+        return;
+    }
+    let (server_engine, server_driver) = build_engine(mode).await;
+    let (client_engine, client_driver) = build_engine_unspawned(mode);
+    let listener = listen(&server_engine).await;
+    let address = connect_addr_for(Some(listener.local_addr().unwrap()));
+
+    let accept_listener = listener.clone();
+    let accept = tokio::spawn(async move {
+        MessageTransportBuilder::new()
+            .accept_on(&accept_listener)
+            .await
+    });
+    let connect_engine = client_engine.clone();
+    let connect = tokio::spawn(async move {
+        MessageTransportBuilder::new()
+            .connect_on(&connect_engine, address)
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert!(!accept.is_finished());
+    assert!(!connect.is_finished());
+    assert_eq!(client_engine.diagnostics().operations_offered, 0);
+    assert_eq!(client_engine.diagnostics().connections_opened, 0);
+    assert_eq!(server_engine.diagnostics().operations_offered, 0);
+
+    let client_driver = tokio::spawn(client_driver);
+    let (server, client) = tokio::time::timeout(Duration::from_secs(15), async {
+        tokio::join!(accept, connect)
+    })
+    .await
+    .expect("message setup did not progress after polling the withheld driver");
+    let server = server.unwrap().unwrap();
+    let client = client.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let (server_ready, client_ready) = tokio::join!(server.ready(), client.ready());
+        server_ready.unwrap();
+        client_ready.unwrap();
+    })
+    .await
+    .expect("withheld-driver HELLO negotiation timed out");
+
+    close_pair(
+        listener,
+        server,
+        client,
+        server_engine,
+        client_engine,
+        server_driver,
+        client_driver,
+    )
+    .await;
+}
+
 async fn wait_pending_accepts(engine: &RdmaEngine, expected: usize) {
     tokio::time::timeout(Duration::from_secs(5), async {
         while engine.diagnostics().pending_accepts != expected {
@@ -466,4 +527,87 @@ async fn readiness_mixed_accepts_preserve_registration_order() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn polling_mixed_accepts_preserve_registration_order() {
     run_mixed_accept_order(CompletionMode::Polling).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn message_setup_requires_the_owning_driver_to_be_polled() {
+    run_driver_withholding(CompletionMode::Readiness).await;
+    run_driver_withholding(CompletionMode::Polling).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hello_delivered_during_ready_work_attachment_is_processed() {
+    if !has_software_rdma() {
+        return;
+    }
+    let (server_engine, server_driver) = build_engine(CompletionMode::Readiness).await;
+    let (client_engine, client_driver) = build_engine(CompletionMode::Readiness).await;
+    let listener = listen(&server_engine).await;
+    let address = connect_addr_for(Some(listener.local_addr().unwrap()));
+    let hook = TestHelloAttachHook::new();
+
+    let accept_listener = listener.clone();
+    let accept = tokio::spawn(async move {
+        MessageTransportBuilder::new()
+            .accept_on(&accept_listener)
+            .await
+    });
+    let connect_engine = client_engine.clone();
+    let connect_hook = hook.clone();
+    let connect = tokio::spawn(async move {
+        MessageTransportBuilder::new()
+            .test_hello_attach_hook(connect_hook)
+            .connect_on(&connect_engine, address)
+            .await
+    });
+
+    let attached_hook = hook.clone();
+    let attached =
+        tokio::task::spawn_blocking(move || attached_hook.wait_until_ready_work_attached())
+            .await
+            .unwrap();
+    if attached.is_err() {
+        hook.release();
+    }
+    attached.unwrap();
+
+    hook.deliver_hello().unwrap();
+    let hello_hook = hook.clone();
+    let hello = tokio::task::spawn_blocking(move || hello_hook.wait_until_hello_processed())
+        .await
+        .unwrap();
+    hook.release();
+    if let Err(error) = hello {
+        panic!(
+            "{error}; server={:?}; client={:?}",
+            server_engine.diagnostics(),
+            client_engine.diagnostics()
+        );
+    }
+
+    let (server, client) = tokio::time::timeout(Duration::from_secs(15), async {
+        tokio::join!(accept, connect)
+    })
+    .await
+    .expect("message attachment hook did not resume");
+    let server = server.unwrap().unwrap();
+    let client = client.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let (server_ready, client_ready) = tokio::join!(server.ready(), client.ready());
+        server_ready.unwrap();
+        client_ready.unwrap();
+    })
+    .await
+    .expect("HELLO delivered during attachment was lost");
+
+    close_pair(
+        listener,
+        server,
+        client,
+        server_engine,
+        client_engine,
+        server_driver,
+        client_driver,
+    )
+    .await;
 }

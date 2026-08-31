@@ -105,6 +105,8 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
+#[cfg(any(test, feature = "test-hooks"))]
+use std::sync::Condvar;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::task::{Context, Poll};
@@ -161,6 +163,8 @@ pub struct MessageTransportBuilder {
     connection_config: Option<RdmaConnectionConfig>,
     #[cfg(any(test, feature = "test-hooks"))]
     hello_override: Option<TestHelloOverride>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    attach_hook: Option<TestHelloAttachHook>,
 }
 
 impl Default for MessageTransportBuilder {
@@ -183,6 +187,8 @@ impl MessageTransportBuilder {
             connection_config: None,
             #[cfg(any(test, feature = "test-hooks"))]
             hello_override: None,
+            #[cfg(any(test, feature = "test-hooks"))]
+            attach_hook: None,
         }
     }
 
@@ -253,6 +259,13 @@ impl MessageTransportBuilder {
     #[doc(hidden)]
     pub fn test_hello_override(mut self, value: TestHelloOverride) -> Self {
         self.hello_override = Some(value);
+        self
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn test_hello_attach_hook(mut self, hook: TestHelloAttachHook) -> Self {
+        self.attach_hook = Some(hook);
         self
     }
 
@@ -343,6 +356,8 @@ impl MessageTransportBuilder {
             mr_size,
             #[cfg(any(test, feature = "test-hooks"))]
             hello_override: self.hello_override,
+            #[cfg(any(test, feature = "test-hooks"))]
+            attach_hook: self.attach_hook.clone(),
         })
     }
 
@@ -505,6 +520,8 @@ struct EngineMessageConfig {
     mr_size: usize,
     #[cfg(any(test, feature = "test-hooks"))]
     hello_override: Option<TestHelloOverride>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    attach_hook: Option<TestHelloAttachHook>,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -516,6 +533,164 @@ pub enum TestHelloOverride {
     WrongFrameType,
     ZeroReceiveCredits,
     SmallerMaximumMessage,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Clone, Default)]
+#[doc(hidden)]
+pub struct TestHelloAttachHook {
+    inner: Arc<TestHelloAttachHookInner>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Default)]
+struct TestHelloAttachHookInner {
+    state: StdMutex<TestHelloAttachHookState>,
+    changed: Condvar,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Default)]
+struct TestHelloAttachHookState {
+    ready_work_attached: bool,
+    hello_processed: bool,
+    released: bool,
+    message_state: Option<Weak<EngineMessageState>>,
+    hello_mr: Option<Mr>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl TestHelloAttachHook {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn wait_until_ready_work_attached(&self) -> Result<()> {
+        self.wait_until(
+            |state| state.ready_work_attached,
+            "message ready work attachment",
+        )
+    }
+
+    pub fn wait_until_hello_processed(&self) -> Result<()> {
+        self.wait_until(
+            |state| state.hello_processed,
+            "HELLO processing during message attachment",
+        )
+    }
+
+    pub fn deliver_hello(&self) -> Result<()> {
+        let (state, mut mr) = {
+            let mut hook = lock_std(&self.inner.state);
+            let state = hook
+                .message_state
+                .clone()
+                .and_then(|state| state.upgrade())
+                .ok_or_else(|| {
+                    Error::InvalidConfig(
+                        "message ready work is not attached for HELLO delivery".into(),
+                    )
+                })?;
+            let mr = hook.hello_mr.take().ok_or_else(|| {
+                Error::InvalidConfig("test HELLO receive MR is unavailable".into())
+            })?;
+            (state, mr)
+        };
+        if !state
+            .weak_self()
+            .upgrade()
+            .is_some_and(|self_state| Arc::ptr_eq(&self_state, &state))
+        {
+            return Err(Error::InvalidConfig(
+                "message self reference was not initialized before HELLO delivery".into(),
+            ));
+        }
+        drop(state.connection()?);
+        let len = protocol::write_hello_frame(
+            mr.as_mut_slice(),
+            u32::try_from(state.local_recv_capacity)
+                .map_err(|_| Error::InvalidConfig("test HELLO capacity overflow".into()))?,
+            u32::try_from(state.buffer_size)
+                .map_err(|_| Error::InvalidConfig("test HELLO size overflow".into()))?,
+        );
+        let mut completion = crate::wc::WorkCompletion::default();
+        completion.inner.status = rdma_io_sys::ibverbs::IBV_WC_SUCCESS;
+        completion.inner.opcode = rdma_io_sys::ibverbs::IBV_WC_RECV;
+        completion.inner.byte_len = u32::try_from(len)
+            .map_err(|_| Error::InvalidConfig("test HELLO length overflow".into()))?;
+        state.parse_hello_receive(&super::op::Completion::from(completion), &mr)?;
+        self.record_hello_processed();
+        Ok(())
+    }
+
+    fn prepare_hello_mr(&self, mr: Mr) -> Result<()> {
+        let mut state = lock_std(&self.inner.state);
+        if state.hello_mr.is_some() {
+            return Err(Error::InvalidConfig(
+                "test HELLO receive MR is already prepared".into(),
+            ));
+        }
+        state.hello_mr = Some(mr);
+        Ok(())
+    }
+
+    pub fn release(&self) {
+        let mut state = lock_std(&self.inner.state);
+        state.released = true;
+        self.inner.changed.notify_all();
+    }
+
+    fn pause_after_ready_work_attach(&self, message_state: &Arc<EngineMessageState>) {
+        let mut state = lock_std(&self.inner.state);
+        state.message_state = Some(Arc::downgrade(message_state));
+        state.ready_work_attached = true;
+        self.inner.changed.notify_all();
+        while !state.released {
+            let (next, timeout) = self
+                .inner
+                .changed
+                .wait_timeout(state, Duration::from_secs(15))
+                .unwrap_or_else(|error| error.into_inner());
+            state = next;
+            if timeout.timed_out() {
+                state.released = true;
+            }
+        }
+    }
+
+    fn record_hello_processed(&self) {
+        let mut state = lock_std(&self.inner.state);
+        state.hello_processed = true;
+        self.inner.changed.notify_all();
+    }
+
+    fn wait_until(
+        &self,
+        mut predicate: impl FnMut(&TestHelloAttachHookState) -> bool,
+        description: &str,
+    ) -> Result<()> {
+        let mut state = lock_std(&self.inner.state);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !predicate(&state) {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return Err(Error::InvalidConfig(format!(
+                    "timed out waiting for {description}"
+                )));
+            };
+            let (next, timeout) = self
+                .inner
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|error| error.into_inner());
+            state = next;
+            if timeout.timed_out() && !predicate(&state) {
+                return Err(Error::InvalidConfig(format!(
+                    "timed out waiting for {description}"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 struct MessagePreEstablishSetup {
@@ -530,6 +705,12 @@ impl PreEstablishSetup for MessagePreEstablishSetup {
             .recv_count
             .checked_add(protocol::CTRL_RECV_COUNT)
             .ok_or_else(|| Error::InvalidConfig("message receive batch overflow".into()))?;
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(hook) = self.state.attach_hook.as_ref() {
+            hook.prepare_hello_mr(
+                connection.register_memory(self.mr_size, AccessIntent::LocalOnly)?,
+            )?;
+        }
         let mut entries = Vec::with_capacity(total);
         for _ in 0..total {
             let mr = connection.register_memory(self.mr_size, AccessIntent::LocalOnly)?;
@@ -637,6 +818,20 @@ const STATE_READY: u8 = 2;
 const STATE_CLOSING: u8 = 3;
 const STATE_STOPPED: u8 = 4;
 const STATE_FAILED: u8 = 5;
+
+fn transition_terminal(state: &AtomicU8, target: u8) -> bool {
+    debug_assert!(matches!(target, STATE_STOPPED | STATE_FAILED));
+    let mut current = state.load(Ordering::Acquire);
+    loop {
+        if matches!(current, STATE_STOPPED | STATE_FAILED) {
+            return false;
+        }
+        match state.compare_exchange_weak(current, target, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
+}
 
 /// Pure credit-return validation logic (no side effects).
 ///
@@ -822,11 +1017,7 @@ impl TransportSharedState {
     ///
     /// Idempotent: does not overwrite a terminal state.
     fn mark_driver_dead(&self) {
-        // Try to transition to Failed; if already terminal, don't overwrite
-        let current = self.state.load(Ordering::Acquire);
-        if current != STATE_STOPPED && current != STATE_FAILED {
-            self.state.store(STATE_FAILED, Ordering::Release);
-        }
+        transition_terminal(&self.state, STATE_FAILED);
         self.remote_credits.close();
         self.state_notify.notify_waiters();
 
@@ -878,10 +1069,7 @@ impl Future for MessageTransportDriver {
                     self.state.mark_driver_dead();
                 } else {
                     // Normal completion — mark stopped
-                    let current = self.state.state.load(Ordering::Acquire);
-                    if current != STATE_FAILED {
-                        self.state.state.store(STATE_STOPPED, Ordering::Release);
-                    }
+                    transition_terminal(&self.state.state, STATE_STOPPED);
                     self.state.remote_credits.close();
                     self.state.state_notify.notify_waiters();
                 }
@@ -954,6 +1142,8 @@ struct EngineMessageState {
     self_weak: OnceLock<Weak<EngineMessageState>>,
     #[cfg(any(test, feature = "test-hooks"))]
     hello_override: Option<TestHelloOverride>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    attach_hook: Option<TestHelloAttachHook>,
 }
 
 impl EngineMessageState {
@@ -978,11 +1168,12 @@ impl EngineMessageState {
             self_weak: OnceLock::new(),
             #[cfg(any(test, feature = "test-hooks"))]
             hello_override: config.hello_override,
+            #[cfg(any(test, feature = "test-hooks"))]
+            attach_hook: config.attach_hook.clone(),
         }
     }
 
     fn attach(self: &Arc<Self>, connection: &RdmaConnection) -> Result<()> {
-        connection.attach_ready_work(Arc::clone(self) as Arc<dyn ConnectionReadyWork>)?;
         self.self_weak
             .set(Arc::downgrade(self))
             .map_err(|_| Error::InvalidConfig("message state attached more than once".into()))?;
@@ -992,8 +1183,12 @@ impl EngineMessageState {
                 connection: Arc::downgrade(&connection.state),
             })
             .map_err(|_| Error::InvalidConfig("message state attached more than once".into()))?;
+        connection.attach_ready_work(Arc::clone(self) as Arc<dyn ConnectionReadyWork>)?;
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(hook) = self.attach_hook.as_ref() {
+            hook.pause_after_ready_work_attach(self);
+        }
         self.enqueue_event(EngineMessageEvent::Start);
-        connection.publish_ready_work();
         Ok(())
     }
 
@@ -1018,17 +1213,16 @@ impl EngineMessageState {
     }
 
     fn fail(&self, error: Error, close_connection: bool) {
-        let state = self.state.load(Ordering::Acquire);
-        if matches!(state, STATE_STOPPED | STATE_FAILED) {
+        // Hold the error mutex across the CAS. A waiter that observes FAILED
+        // then blocks on this mutex until the contextual error is published.
+        let mut stored = lock_std(&self.error);
+        if !transition_terminal(&self.state, STATE_FAILED) {
             return;
         }
-        {
-            let mut stored = lock_std(&self.error);
-            if stored.is_none() {
-                *stored = Some(error);
-            }
+        if stored.is_none() {
+            *stored = Some(error);
         }
-        self.state.store(STATE_FAILED, Ordering::Release);
+        drop(stored);
         self.remote_credits.close();
         self.state_notify.notify_waiters();
         if close_connection
@@ -1080,9 +1274,7 @@ impl EngineMessageState {
     fn finish_close(&self, result: &Result<()>) {
         match result {
             Ok(()) => {
-                if self.state.load(Ordering::Acquire) != STATE_FAILED {
-                    self.state.store(STATE_STOPPED, Ordering::Release);
-                }
+                transition_terminal(&self.state, STATE_STOPPED);
             }
             Err(error) => self.fail(error.clone(), false),
         }
@@ -1207,53 +1399,7 @@ impl EngineMessageState {
             self.fail(Error::DriverShutdown, true);
             return;
         };
-        let received_len = completion.byte_len() as usize;
-        if received_len > mr.len() {
-            self.fail(
-                Error::ProtocolViolation(format!(
-                    "HELLO receive length {received_len} exceeds MR length {}",
-                    mr.len()
-                )),
-                true,
-            );
-            return;
-        }
-        let header = match protocol::parse_header(mr.as_slice(), received_len) {
-            Ok(header) => header,
-            Err(error) => {
-                self.fail(error, true);
-                return;
-            }
-        };
-        if header.frame_type != protocol::FRAME_HELLO {
-            self.fail(
-                Error::ProtocolViolation(format!(
-                    "expected HELLO, got frame_type={}",
-                    header.frame_type
-                )),
-                true,
-            );
-            return;
-        }
-        let payload_end = match protocol::HEADER_SIZE.checked_add(header.payload_len as usize) {
-            Some(end) => end,
-            None => {
-                self.fail(
-                    Error::ProtocolViolation("HELLO payload length overflow".into()),
-                    true,
-                );
-                return;
-            }
-        };
-        let hello = match protocol::parse_hello(&mr.as_slice()[protocol::HEADER_SIZE..payload_end])
-        {
-            Ok(hello) => hello,
-            Err(error) => {
-                self.fail(error, true);
-                return;
-            }
-        };
-        let peer_capacity = match validate_peer_hello(hello, self.buffer_size) {
+        let peer_capacity = match self.parse_hello_receive(&completion, &mr) {
             Ok(capacity) => capacity,
             Err(error) => {
                 self.fail(error, true);
@@ -1290,7 +1436,33 @@ impl EngineMessageState {
             .store(peer_capacity, Ordering::Release);
         self.remote_credits.add_permits(peer_capacity);
         lock_std(&self.handshake).hello_receive_complete = true;
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(hook) = self.attach_hook.as_ref() {
+            hook.record_hello_processed();
+        }
         self.try_mark_ready();
+    }
+
+    fn parse_hello_receive(&self, completion: &super::op::Completion, mr: &Mr) -> Result<usize> {
+        let received_len = completion.byte_len() as usize;
+        if received_len > mr.len() {
+            return Err(Error::ProtocolViolation(format!(
+                "HELLO receive length {received_len} exceeds MR length {}",
+                mr.len()
+            )));
+        }
+        let header = protocol::parse_header(mr.as_slice(), received_len)?;
+        if header.frame_type != protocol::FRAME_HELLO {
+            return Err(Error::ProtocolViolation(format!(
+                "expected HELLO, got frame_type={}",
+                header.frame_type
+            )));
+        }
+        let payload_end = protocol::HEADER_SIZE
+            .checked_add(header.payload_len as usize)
+            .ok_or_else(|| Error::ProtocolViolation("HELLO payload length overflow".into()))?;
+        let hello = protocol::parse_hello(&mr.as_slice()[protocol::HEADER_SIZE..payload_end])?;
+        validate_peer_hello(hello, self.buffer_size)
     }
 
     fn try_mark_ready(&self) {
@@ -1346,6 +1518,32 @@ impl ConnectionReadyWork for EngineMessageState {
 
     fn terminalize(&self, error: Error) {
         self.fail(error, false);
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct TestEngineHelloDeadlineState {
+    state: Arc<EngineMessageState>,
+}
+
+#[cfg(test)]
+impl TestEngineHelloDeadlineState {
+    pub(crate) fn new() -> Self {
+        let config = MessageTransportBuilder::new()
+            .derive_engine_config()
+            .expect("default message config");
+        Self {
+            state: Arc::new(EngineMessageState::new(&config)),
+        }
+    }
+
+    pub(crate) fn ready_work(&self) -> Arc<dyn ConnectionReadyWork> {
+        Arc::clone(&self.state) as Arc<dyn ConnectionReadyWork>
+    }
+
+    pub(crate) async fn ready(&self) -> Result<()> {
+        self.state.ready().await
     }
 }
 
@@ -2536,15 +2734,9 @@ async fn driver_run(
     if let Some(ref err) = terminal_error {
         // Store the error for frontend inspection before transitioning state
         state.store_error(err);
-        let current = state.state.load(Ordering::Acquire);
-        if current != STATE_FAILED {
-            state.state.store(STATE_FAILED, Ordering::Release);
-        }
+        transition_terminal(&state.state, STATE_FAILED);
     } else {
-        let current = state.state.load(Ordering::Acquire);
-        if current != STATE_FAILED {
-            state.state.store(STATE_STOPPED, Ordering::Release);
-        }
+        transition_terminal(&state.state, STATE_STOPPED);
     }
     state.state_notify.notify_waiters();
 
@@ -2814,6 +3006,7 @@ mod hello_tests {
     use crate::v2::engine::{
         DEFAULT_MESSAGE_HELLO_DEADLINE, MAX_MESSAGE_HELLO_DEADLINE, MIN_MESSAGE_HELLO_DEADLINE,
     };
+    use std::sync::Barrier;
 
     fn hello(capacity: u32, maximum: u32) -> protocol::HelloPayload {
         protocol::HelloPayload {
@@ -2858,6 +3051,44 @@ mod hello_tests {
             error,
             Error::ProtocolViolation(message) if message == "HELLO handshake timeout"
         ));
+    }
+
+    #[test]
+    fn failed_transition_never_overwrites_stopped() {
+        let config = MessageTransportBuilder::new()
+            .derive_engine_config()
+            .unwrap();
+        for _ in 0..256 {
+            let state = Arc::new(EngineMessageState::new(&config));
+            let race = Arc::new(Barrier::new(3));
+            let stopped_state = Arc::clone(&state);
+            let stopped_race = Arc::clone(&race);
+            let stopped = std::thread::spawn(move || {
+                stopped_race.wait();
+                stopped_state.finish_close(&Ok(()));
+            });
+            let failed_state = Arc::clone(&state);
+            let failed_race = Arc::clone(&race);
+            let failed = std::thread::spawn(move || {
+                failed_race.wait();
+                failed_state.fail(Error::DriverShutdown, false);
+            });
+            race.wait();
+            stopped.join().unwrap();
+            failed.join().unwrap();
+
+            match state.state.load(Ordering::Acquire) {
+                STATE_STOPPED => assert!(lock_std(&state.error).is_none()),
+                STATE_FAILED => assert!(matches!(
+                    lock_std(&state.error).as_ref(),
+                    Some(Error::DriverShutdown)
+                )),
+                other => panic!("unexpected terminal state {other}"),
+            }
+            let terminal = state.state.load(Ordering::Acquire);
+            state.fail(Error::ProtocolViolation("late failure".into()), false);
+            assert_eq!(state.state.load(Ordering::Acquire), terminal);
+        }
     }
 }
 

@@ -1257,7 +1257,6 @@ impl EngineShared {
         token: ConnectionToken,
         quantum: usize,
     ) -> (usize, bool) {
-        let _admission = read_unpoison(&self.admission);
         let connection = match self.connections.lookup(token) {
             Lookup::Occupied(connection) => connection,
             _ => return (0, false),
@@ -1265,6 +1264,12 @@ impl EngineShared {
         let mut processed = 0;
         while processed < quantum {
             if let Some(completion) = connection.pop_completion() {
+                // Completion routing must remain serialized with terminal
+                // publication, but protocol callbacks acquire admission for
+                // each concrete post/close themselves. Holding this read lock
+                // across ready work would re-enter the RwLock and deadlock
+                // once a shutdown writer is queued.
+                let _admission = read_unpoison(&self.admission);
                 self.dispatch_queued_completion(completion);
                 processed += 1;
                 continue;
@@ -1405,13 +1410,78 @@ mod tests {
     use super::*;
     use crate::test_support::destruction::{DestructionKind, DestructionRecorder};
     use crate::v2::AccessIntent;
-    use crate::v2::engine::EngineFailure;
     use crate::v2::engine::config::EngineConfig;
     use crate::v2::engine::connection::{WorkRequestPoster, install_connection};
     use crate::v2::engine::resources::ResourceSummary;
+    use crate::v2::engine::{ConnectionReadyWork, EngineFailure};
+    use crate::v2::message_transport::TestEngineHelloDeadlineState;
     use rdma_io_sys::ibverbs::{IBV_WC_RECV, IBV_WC_SEND, IBV_WC_SUCCESS};
     use std::sync::Barrier;
     use std::sync::Weak;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    struct ShutdownPostingReadyWork {
+        shared: Weak<EngineShared>,
+        connection: Weak<ConnectionState>,
+        mr: Mutex<Option<Mr>>,
+        start_shutdown: Mutex<Option<mpsc::Sender<()>>>,
+        shutdown_complete: Mutex<mpsc::Receiver<()>>,
+        result: Mutex<Option<Result<()>>>,
+    }
+
+    impl ConnectionReadyWork for ShutdownPostingReadyWork {
+        fn process(&self, _budget: usize) -> usize {
+            if let Some(start) = lock_unpoison(&self.start_shutdown).take() {
+                start.send(()).unwrap();
+            }
+            lock_unpoison(&self.shutdown_complete).recv().unwrap();
+            let shared = self.shared.upgrade().expect("engine shared state");
+            let state = self.connection.upgrade().expect("connection state");
+            let connection = RdmaConnection::from_state(shared, state);
+            let mr = lock_unpoison(&self.mr).take().expect("test MR");
+            let result =
+                connection.post_detached_send(mr, 1, Box::new(|_result, _mr| unreachable!()));
+            *lock_unpoison(&self.result) = Some(result);
+            1
+        }
+
+        fn has_work(&self) -> bool {
+            false
+        }
+
+        fn deadline_expired(&self) {}
+
+        fn disconnected(&self) {}
+
+        fn terminalize(&self, _error: Error) {}
+    }
+
+    struct ClosingReadyWork {
+        shared: Weak<EngineShared>,
+        connection: Weak<ConnectionState>,
+        race: Arc<Barrier>,
+    }
+
+    impl ConnectionReadyWork for ClosingReadyWork {
+        fn process(&self, _budget: usize) -> usize {
+            self.race.wait();
+            let shared = self.shared.upgrade().expect("engine shared state");
+            let connection = self.connection.upgrade().expect("connection state");
+            shared.begin_connection_close(&connection);
+            1
+        }
+
+        fn has_work(&self) -> bool {
+            false
+        }
+
+        fn deadline_expired(&self) {}
+
+        fn disconnected(&self) {}
+
+        fn terminalize(&self, _error: Error) {}
+    }
 
     #[test]
     fn credit_pool_never_oversubscribes_or_reuses_retained_debt() {
@@ -1706,6 +1776,152 @@ mod tests {
                 .load(Ordering::Acquire),
             3
         );
+    }
+
+    #[test]
+    fn ready_work_post_rechecks_terminal_state_after_shutdown_writer() {
+        let Some((engine, driver)) = production_engine(2, 4, 4) else {
+            return;
+        };
+        let shared = Arc::clone(&engine.shared);
+        let poster = Arc::new(ScriptedPoster::new(&shared, 18, ScriptedPost::Accepted));
+        let connection = scripted_connection(&shared, Arc::clone(&poster), 1, 1);
+        let mr = shared.register_memory(64, AccessIntent::LocalOnly).unwrap();
+        let (start_shutdown, shutdown_started) = mpsc::channel();
+        let (shutdown_finished, shutdown_complete) = mpsc::channel();
+        let work = Arc::new(ShutdownPostingReadyWork {
+            shared: Arc::downgrade(&shared),
+            connection: Arc::downgrade(&connection.state),
+            mr: Mutex::new(Some(mr)),
+            start_shutdown: Mutex::new(Some(start_shutdown)),
+            shutdown_complete: Mutex::new(shutdown_complete),
+            result: Mutex::new(None),
+        });
+        connection
+            .state
+            .attach_ready_work(Arc::clone(&work) as Arc<dyn ConnectionReadyWork>)
+            .unwrap();
+
+        let shutdown_shared = Arc::clone(&shared);
+        std::thread::spawn(move || {
+            shutdown_started.recv().unwrap();
+            assert!(shutdown_shared.mark_shutdown_requested());
+            shutdown_finished.send(()).unwrap();
+        });
+        let process_shared = Arc::clone(&shared);
+        let token = connection.state.token;
+        let (process_finished, process_complete) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = process_shared.process_connection_ready(token, 1);
+            process_finished.send(result).unwrap();
+        });
+
+        assert_eq!(
+            process_complete
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap(),
+            (1, false),
+            "ready work must not retain/re-enter admission while shutdown waits"
+        );
+        assert!(matches!(
+            lock_unpoison(&work.result).take(),
+            Some(Err(Error::DriverShutdown))
+        ));
+        assert_eq!(poster.calls(), 0);
+        assert_eq!(shared.operations.live(), 0);
+        assert_eq!(shared.cq_credits.free(), 4);
+
+        drop(connection);
+        drop(driver);
+        drop(engine);
+    }
+
+    #[test]
+    fn ready_work_and_lifecycle_failure_have_no_abba_lock_cycle() {
+        let shared = synthetic_engine(8);
+        let connection = synthetic_connection_on(&shared, 19);
+        let race = Arc::new(Barrier::new(2));
+        connection
+            .state
+            .attach_ready_work(Arc::new(ClosingReadyWork {
+                shared: Arc::downgrade(&shared),
+                connection: Arc::downgrade(&connection.state),
+                race: Arc::clone(&race),
+            }))
+            .unwrap();
+
+        let process_shared = Arc::clone(&shared);
+        let token = connection.state.token;
+        let (process_finished, process_complete) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = process_shared.process_connection_ready(token, 1);
+            process_finished.send(result).unwrap();
+        });
+
+        let failure_connection = Arc::clone(&connection.state);
+        let (failure_finished, failure_complete) = mpsc::channel();
+        std::thread::spawn(move || {
+            let lifecycle = failure_connection.lock_lifecycle();
+            race.wait();
+            failure_connection.mark_cm_failure(Error::DriverShutdown);
+            drop(lifecycle);
+            failure_finished.send(()).unwrap();
+        });
+
+        failure_complete
+            .recv_timeout(Duration::from_secs(5))
+            .expect("lifecycle failure must not wait on a callback-held ready_work mutex");
+        assert_eq!(
+            process_complete
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap(),
+            (1, false)
+        );
+        assert!(connection.state.close_started());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn message_hello_deadlines_use_real_queue_timer_and_contextual_wake() {
+        use crate::v2::engine::config::{
+            DEFAULT_MESSAGE_HELLO_DEADLINE, MAX_MESSAGE_HELLO_DEADLINE, MIN_MESSAGE_HELLO_DEADLINE,
+        };
+
+        for (index, deadline) in [
+            MIN_MESSAGE_HELLO_DEADLINE,
+            DEFAULT_MESSAGE_HELLO_DEADLINE,
+            MAX_MESSAGE_HELLO_DEADLINE,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let shared = synthetic_engine_with_hello_deadline(8, deadline);
+            let connection = synthetic_connection_on(&shared, 20 + index as u32);
+            let probe = TestEngineHelloDeadlineState::new();
+            connection.attach_ready_work(probe.ready_work()).unwrap();
+            let waiter_probe = probe.clone();
+            let waiter = tokio::spawn(async move { waiter_probe.ready().await });
+            tokio::task::yield_now().await;
+
+            let mut driver = super::super::RdmaEngineDriver::new(Arc::clone(&shared), None);
+            let waker = futures_util::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
+
+            tokio::time::advance(deadline - Duration::from_nanos(1)).await;
+            assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
+            assert!(!waiter.is_finished());
+
+            tokio::time::advance(Duration::from_nanos(1)).await;
+            assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
+            let error = waiter.await.unwrap().unwrap_err();
+            assert!(matches!(
+                error,
+                Error::ProtocolViolation(message) if message == "HELLO handshake timeout"
+            ));
+
+            drop(driver);
+            drop(connection);
+        }
     }
 
     #[test]
@@ -2016,6 +2232,69 @@ mod tests {
         drop(connection);
         drop(driver);
         drop(engine);
+    }
+
+    #[test]
+    fn empty_and_zero_accepted_detached_batches_reject_and_roll_back_every_reservation() {
+        let Some((engine, driver)) = production_engine(2, 4, 4) else {
+            return;
+        };
+        let shared = Arc::clone(&engine.shared);
+        let poster = Arc::new(ScriptedPoster::new(&shared, 51, ScriptedPost::Unaccepted));
+        let connection = scripted_connection(&shared, Arc::clone(&poster), 1, 2);
+
+        assert!(matches!(
+            connection.post_detached_recv_batch(Vec::new()),
+            Err(Error::InvalidConfig(_))
+        ));
+        assert_eq!(poster.calls(), 0);
+        assert_eq!(shared.operations.live(), 0);
+        assert_eq!(shared.cq_credits.free(), 4);
+
+        let recorder = DestructionRecorder::arm(8);
+        let callback_calls = Arc::new(AtomicUsize::new(0));
+        let mut entries = Vec::new();
+        for _ in 0..2 {
+            let mr = shared.register_memory(64, AccessIntent::LocalOnly).unwrap();
+            let callback_calls = Arc::clone(&callback_calls);
+            entries.push((
+                mr,
+                Box::new(move |_result, _mr| {
+                    callback_calls.fetch_add(1, Ordering::AcqRel);
+                }) as DetachedOperationCallback,
+            ));
+        }
+        assert!(matches!(
+            connection.post_detached_recv_batch(entries),
+            Err(Error::PostFailed(_))
+        ));
+        assert_eq!(callback_calls.load(Ordering::Acquire), 0);
+        assert_eq!(poster.calls(), 1);
+        assert_eq!(shared.operations.live(), 0);
+        assert_eq!(shared.cq_credits.free(), 4);
+        assert_eq!(connection.state.accepted_count(), 0);
+        connection.state.reserve_local(Direction::Recv).unwrap();
+        connection.state.reserve_local(Direction::Recv).unwrap();
+        connection.state.release_local(Direction::Recv);
+        connection.state.release_local(Direction::Recv);
+        let diagnostics = engine.diagnostics();
+        assert_eq!(diagnostics.operations_offered, 2);
+        assert_eq!(diagnostics.operations_accepted, 0);
+        assert_eq!(diagnostics.operations_unaccepted, 2);
+        assert_eq!(diagnostics.batch_unaccepted_suffix, 2);
+        assert_eq!(
+            recorder
+                .snapshot()
+                .iter()
+                .filter(|event| event.kind == DestructionKind::MemoryRegion)
+                .count(),
+            2
+        );
+
+        drop(connection);
+        drop(driver);
+        drop(engine);
+        drop(recorder);
     }
 
     #[test]
@@ -2573,10 +2852,21 @@ mod tests {
     }
 
     fn synthetic_engine(capacity: usize) -> Arc<EngineShared> {
+        synthetic_engine_with_hello_deadline(
+            capacity,
+            crate::v2::engine::config::DEFAULT_MESSAGE_HELLO_DEADLINE,
+        )
+    }
+
+    fn synthetic_engine_with_hello_deadline(
+        capacity: usize,
+        hello_deadline: Duration,
+    ) -> Arc<EngineShared> {
         let mut config = EngineConfig::new("test0".into());
         config.max_live_connections = capacity;
         config.max_inflight_operations = capacity;
         config.cq_capacity = capacity;
+        config.hello_deadline = hello_deadline;
         Arc::new(
             EngineShared::new(
                 config,

@@ -56,8 +56,13 @@ case "$MODE" in
         REPETITIONS=1
         MODE_LABEL="Phase 6 accepted-WR drain and shutdown lifecycle"
         ;;
+    --phase7-message-setup)
+        TEST_TARGET="v2_engine_message_setup_tests"
+        REPETITIONS=1
+        MODE_LABEL="Phase 7 engine message setup"
+        ;;
     *)
-        echo "usage: sudo -E ./scripts/validate-v2-engine-providers.sh {--provider-probe|--readiness-race|--driver-flush-gate|--phase3-operations|--phase4-connections|--phase5-listeners|--phase6-lifecycle}" >&2
+        echo "usage: sudo -E ./scripts/validate-v2-engine-providers.sh {--provider-probe|--readiness-race|--driver-flush-gate|--phase3-operations|--phase4-connections|--phase5-listeners|--phase6-lifecycle|--phase7-message-setup}" >&2
         exit 2
         ;;
 esac

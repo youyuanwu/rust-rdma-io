@@ -134,10 +134,6 @@ impl RdmaConnection {
         Ok(())
     }
 
-    pub(crate) fn publish_ready_work(&self) {
-        self.shared.publish_connection_ready(&self.state);
-    }
-
     /// Stop new posting and wait for the exact accepted set to drain.
     ///
     /// A successful close retires the CM route and connection registry
@@ -196,6 +192,10 @@ pub(crate) struct ConnectionState {
     local_addr: Option<SocketAddr>,
     peer_addr: Option<SocketAddr>,
     posting_open: AtomicBool,
+    // Nested lifecycle synchronization always follows:
+    // EngineShared::admission -> lifecycle_gate -> posting_gate.
+    // ready_work is only held long enough to clone/install its Arc and is
+    // never held while invoking ConnectionReadyWork.
     posting_gate: RwLock<()>,
     lifecycle_gate: Mutex<()>,
     local_credits: Mutex<LocalCredits>,
@@ -361,21 +361,21 @@ impl ConnectionState {
     }
 
     pub(super) fn process_ready_work(&self, budget: usize) -> usize {
-        lock_unpoison(&self.ready_work)
-            .as_ref()
-            .map_or(0, |work| work.process(budget))
+        self.ready_work().map_or(0, |work| work.process(budget))
     }
 
     pub(super) fn has_attached_work(&self) -> bool {
-        lock_unpoison(&self.ready_work)
-            .as_ref()
-            .is_some_and(|work| work.has_work())
+        self.ready_work().is_some_and(|work| work.has_work())
     }
 
     pub(super) fn handle_message_deadline(&self) {
-        if let Some(work) = lock_unpoison(&self.ready_work).as_ref() {
+        if let Some(work) = self.ready_work() {
             work.deadline_expired();
         }
+    }
+
+    fn ready_work(&self) -> Option<Arc<dyn ConnectionReadyWork>> {
+        lock_unpoison(&self.ready_work).clone()
     }
 
     pub(super) fn mark_ready_published(&self) -> bool {
@@ -404,7 +404,7 @@ impl ConnectionState {
                 *close_outcome = Some(CloseOutcome::Failed(error.clone()));
             }
             drop(close_outcome);
-            if let Some(work) = lock_unpoison(&self.ready_work).as_ref() {
+            if let Some(work) = self.ready_work() {
                 work.terminalize(error);
             }
         }
@@ -412,7 +412,7 @@ impl ConnectionState {
 
     pub(super) fn mark_disconnected(&self) {
         self.stop_posting();
-        if let Some(work) = lock_unpoison(&self.ready_work).as_ref() {
+        if let Some(work) = self.ready_work() {
             work.disconnected();
         }
     }
@@ -424,7 +424,7 @@ impl ConnectionState {
             *outcome = Some(CloseOutcome::Failed(error.clone()));
         }
         drop(outcome);
-        if let Some(work) = lock_unpoison(&self.ready_work).as_ref() {
+        if let Some(work) = self.ready_work() {
             work.terminalize(error);
         }
         self.close_notify.notify_waiters();
@@ -1093,6 +1093,109 @@ mod qp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Weak;
+
+    struct TestPoster;
+
+    impl WorkRequestPoster for TestPoster {
+        fn qp_num(&self) -> u32 {
+            1
+        }
+
+        fn capabilities(&self) -> Option<QpCapabilities> {
+            None
+        }
+
+        fn post_send(&self, _batch: &mut PreparedSendBatch) -> BatchPostOutcome {
+            BatchPostOutcome::AllAccepted
+        }
+
+        fn post_recv(&self, _batch: &mut PreparedRecvBatch) -> BatchPostOutcome {
+            BatchPostOutcome::AllAccepted
+        }
+
+        fn to_error(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn destroy_qp(&self) -> bool {
+            false
+        }
+
+        fn disconnect(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct LockCheckingReadyWork {
+        connection: Weak<ConnectionState>,
+        calls: AtomicUsize,
+    }
+
+    impl LockCheckingReadyWork {
+        fn check_ready_work_unlocked(&self) {
+            let connection = self.connection.upgrade().expect("connection state");
+            assert!(
+                connection.ready_work.try_lock().is_ok(),
+                "ConnectionReadyWork callback ran while ready_work was locked"
+            );
+            self.calls.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    impl ConnectionReadyWork for LockCheckingReadyWork {
+        fn process(&self, _budget: usize) -> usize {
+            self.check_ready_work_unlocked();
+            1
+        }
+
+        fn has_work(&self) -> bool {
+            self.check_ready_work_unlocked();
+            false
+        }
+
+        fn deadline_expired(&self) {
+            self.check_ready_work_unlocked();
+        }
+
+        fn disconnected(&self) {
+            self.check_ready_work_unlocked();
+        }
+
+        fn terminalize(&self, _error: Error) {
+            self.check_ready_work_unlocked();
+        }
+    }
+
+    #[test]
+    fn ready_work_mutex_is_released_before_every_callback() {
+        let connection = Arc::new(ConnectionState::new(
+            ConnectionToken {
+                slot: 0,
+                generation: 1,
+            },
+            Arc::new(TestPoster),
+            RdmaConnectionConfig::default(),
+            None,
+            None,
+            None,
+            None,
+        ));
+        let work = Arc::new(LockCheckingReadyWork {
+            connection: Arc::downgrade(&connection),
+            calls: AtomicUsize::new(0),
+        });
+        connection
+            .attach_ready_work(Arc::clone(&work) as Arc<dyn ConnectionReadyWork>)
+            .unwrap();
+
+        assert_eq!(connection.process_ready_work(1), 1);
+        assert!(!connection.has_attached_work());
+        connection.handle_message_deadline();
+        connection.mark_disconnected();
+        connection.mark_cm_failure(Error::DriverShutdown);
+        assert_eq!(work.calls.load(Ordering::Acquire), 5);
+    }
 
     #[test]
     fn returned_qp_capabilities_must_not_be_reduced() {
