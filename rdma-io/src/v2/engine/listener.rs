@@ -18,8 +18,16 @@ use crate::v2::error::{Error, Result};
 
 pub(crate) const DEFAULT_LISTENER_BACKLOG: usize = 128;
 const MAX_LISTENER_BACKLOG: usize = 4_096;
+pub(super) const KERNEL_LISTEN_BACKLOG_REQUEST: i32 = i32::MAX;
 
 /// Configuration for one engine-owned listener.
+///
+/// The configurable backlog is a userspace queue limit, not the kernel
+/// `rdma_listen` backlog. It must be in `1..=4096` when
+/// [`RdmaEngine::listen`](super::RdmaEngine::listen) is called. The engine
+/// independently requests `i32::MAX` from `rdma_listen`; a provider or kernel
+/// may clamp that request, or may refuse it before any child reaches the
+/// userspace queue.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RdmaListenerConfig {
     backlog: usize,
@@ -34,12 +42,19 @@ impl Default for RdmaListenerConfig {
 }
 
 impl RdmaListenerConfig {
-    /// Store the userspace child-queue limit for later validation by `listen`.
+    /// Store the userspace pending-child queue limit for validation by `listen`.
+    ///
+    /// Valid values are `1..=4096`. This setter deliberately does not validate,
+    /// panic, or clamp. The independent kernel `rdma_listen` request is always
+    /// `i32::MAX`; provider/kernel clamping does not change this configured
+    /// userspace limit, while refusal is reported by `listen` as a contextual
+    /// listener-creation error rather than as a userspace backlog rejection.
     pub fn backlog(mut self, value: usize) -> Self {
         self.backlog = value;
         self
     }
 
+    /// Return the configured userspace pending-child queue limit.
     pub fn backlog_capacity(&self) -> usize {
         self.backlog
     }
@@ -872,12 +887,6 @@ impl ListenerState {
         lock_unpoison(&self.cm_id).take()
     }
 
-    pub(super) fn raw_cm_id(&self) -> Option<usize> {
-        lock_unpoison(&self.cm_id)
-            .as_ref()
-            .map(|cm_id| cm_id.as_raw() as usize)
-    }
-
     pub(super) fn finish_close(&self, error: Option<String>) {
         let mut outcome = lock_unpoison(&self.close_outcome);
         if outcome.is_none() {
@@ -1207,5 +1216,50 @@ mod tests {
             }
             _ => panic!("later waiter did not remain blocked through selected close"),
         }
+    }
+
+    #[test]
+    fn close_actions_dispose_each_queue_owner_once_before_finalization() {
+        let listener = ListenerState::test_only(2);
+        let selected = request();
+        let pending = request();
+        listener.register_waiter(Arc::clone(&selected)).unwrap();
+        listener.register_waiter(Arc::clone(&pending)).unwrap();
+        assert!(
+            listener
+                .admit_child(IncomingChild::test_only())
+                .rejected
+                .is_none()
+        );
+        assert!(
+            listener
+                .admit_child(IncomingChild::test_only())
+                .rejected
+                .is_none()
+        );
+        listener.closing.store(true, Ordering::Release);
+
+        match listener.next_action() {
+            ListenerAction::FailUnselected(request) => {
+                assert!(Arc::ptr_eq(&request, &pending));
+            }
+            _ => panic!("close must fail the unselected waiter first"),
+        }
+        assert!(matches!(
+            listener.next_action(),
+            ListenerAction::RejectChild(_, InboundRejectReason::ListenerClosed)
+        ));
+        match listener.next_action() {
+            ListenerAction::RejectSelected { request, .. } => {
+                assert!(Arc::ptr_eq(&request, &selected));
+                assert!(listener.finish_selected_request(&request));
+            }
+            _ => panic!("close must reject the selected pair exactly once"),
+        }
+        assert!(matches!(
+            listener.next_action(),
+            ListenerAction::FinalizeClose
+        ));
+        assert!(matches!(listener.next_action(), ListenerAction::None));
     }
 }

@@ -180,9 +180,13 @@ async fn run_basic_listener(mode: CompletionMode) {
     assert_eq!(queued_clients.len(), 2);
     assert_eq!(backlog_rejections, 1);
 
+    let (server_after_reject, client_after_reject) =
+        accept_pair(&listener, &client_engine, false).await;
+    exchange(&server_after_reject, &client_after_reject, 11).await;
+
     let diagnostics = server_engine.diagnostics();
     assert_eq!(diagnostics.listener_count, 1);
-    assert_eq!(diagnostics.inbound_requests_accepted, 4);
+    assert_eq!(diagnostics.inbound_requests_accepted, 5);
     assert_eq!(diagnostics.shared_cm_event_channels, 1);
     assert_eq!(diagnostics.queued_inbound_requests, 0);
     assert_eq!(diagnostics.pending_accepts, 0);
@@ -194,12 +198,14 @@ async fn run_basic_listener(mode: CompletionMode) {
     for connection in &queued_servers {
         connection.close().await.unwrap();
     }
+    server_after_reject.close().await.unwrap();
     for connection in [&client_default, &client_configured] {
         connection.close().await.unwrap();
     }
     for connection in &queued_clients {
         connection.close().await.unwrap();
     }
+    client_after_reject.close().await.unwrap();
     listener.close().await.unwrap();
     server_engine.shutdown().await.unwrap();
     client_engine.shutdown().await.unwrap();

@@ -26,8 +26,9 @@ use super::connection::{
 };
 use super::diagnostics::CmEventReject;
 use super::listener::{
-    AcceptRequest, EmptyPreEstablishSetup, InboundRejectReason, IncomingChild, ListenRequest,
-    ListenerAction, ListenerState, RdmaListener, run_setup_before_establish,
+    AcceptRequest, EmptyPreEstablishSetup, InboundRejectReason, IncomingChild,
+    KERNEL_LISTEN_BACKLOG_REQUEST, ListenRequest, ListenerAction, ListenerState, RdmaListener,
+    run_setup_before_establish,
 };
 use super::registry::{ConnectionToken, Lookup, PagedRegistry, RegistryToken, lock_unpoison};
 use super::resources::EngineResources;
@@ -73,9 +74,9 @@ impl RegistryToken for CmRouteToken {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ContextRoute {
-    Outbound(CmRouteToken),
-    Inbound(CmRouteToken),
-    Listener(u64),
+    Outbound { token: CmRouteToken, raw_id: usize },
+    Inbound { token: CmRouteToken, raw_id: usize },
+    Listener { token: u64, raw_id: usize },
 }
 
 pub(super) struct CmState {
@@ -435,7 +436,7 @@ impl CmState {
                     lock_unpoison(&self.cm_destructions).push_back(pending);
                 }
                 Ok(false) => {
-                    self.remove_context_route(pending.cm_id());
+                    self.remove_owned_context_route(pending.cm_id());
                     match pending {
                         PendingCmDestruction::Route(cm_id) => cm_id.destroy()?,
                         PendingCmDestruction::Connection {
@@ -527,20 +528,20 @@ impl CmState {
             }
         };
         let context_key = cm_id.context_key();
-        if !self.insert_context_route(context_key, ContextRoute::Listener(token)) {
+        let raw_id = cm_id.as_raw() as usize;
+        if !self.insert_context_route(context_key, ContextRoute::Listener { token, raw_id }) {
             self.defer_cm_id(cm_id);
             request.complete(Err(Error::InvalidConfig(
                 "duplicate listener CM context identity".into(),
             )));
             return Ok(());
         }
-        if let Err(error) = cm_id.listen(&request.address, i32::MAX) {
+        if let Err(error) = cm_id.listen(&request.address, KERNEL_LISTEN_BACKLOG_REQUEST) {
             self.defer_cm_id(cm_id);
             request.complete(Err(contextual_cm_error(
                 format!(
                     "listen on {} with requested kernel backlog {}",
-                    request.address,
-                    i32::MAX
+                    request.address, KERNEL_LISTEN_BACKLOG_REQUEST
                 ),
                 error.into(),
             )));
@@ -560,7 +561,6 @@ impl CmState {
                 return Ok(());
             }
         };
-        let raw_id = cm_id.as_raw() as usize;
         let state = Arc::new(ListenerState::new(
             token,
             local_addr,
@@ -755,7 +755,12 @@ impl CmState {
             } else {
                 Error::DriverShutdown
             };
-            self.reject_child(shared, child, InboundRejectReason::ListenerClosed)?;
+            let reject = if listener.is_closing() || request.is_cancelled() {
+                InboundRejectReason::ListenerClosed
+            } else {
+                InboundRejectReason::AdmissionClosed
+            };
+            self.reject_child(shared, child, reject)?;
             request.complete(Err(error));
             listener.finish_selected_request(&request);
             return Ok(());
@@ -780,7 +785,7 @@ impl CmState {
         let raw_id = child_cm_id.as_raw() as usize;
         let context_key = child_cm_id.context_key();
         route.set_identity(raw_id, context_key);
-        if !self.insert_context_route(context_key, ContextRoute::Inbound(token)) {
+        if !self.insert_context_route(context_key, ContextRoute::Inbound { token, raw_id }) {
             self.inbound_routes.release(token, false);
             self.reject_unreserved_child(shared, child_cm_id, InboundRejectReason::SetupFailure)?;
             drop(child_reservation);
@@ -797,7 +802,7 @@ impl CmState {
         let qp = match build_qp(resources, &child_cm_id, &config) {
             Ok(qp) => qp,
             Err(error) => {
-                self.remove_context_route(Some(&child_cm_id));
+                self.remove_owned_context_route(Some(&child_cm_id));
                 self.inbound_routes.release(token, false);
                 self.reject_unreserved_child(
                     shared,
@@ -1010,24 +1015,20 @@ impl CmState {
         let Some(state) = state else {
             return Ok(());
         };
+        let cancellation_error = || {
+            route
+                .listener
+                .upgrade()
+                .filter(|listener| listener.is_closing())
+                .map_or(Error::DriverShutdown, |listener| listener.close_error())
+        };
         match state {
             InboundState::AwaitEstablished {
                 request,
                 connection,
             } => {
                 let connection_state = Arc::clone(&connection.state);
-                let error = if route
-                    .listener
-                    .upgrade()
-                    .is_some_and(|listener| listener.is_closing())
-                {
-                    route
-                        .listener
-                        .upgrade()
-                        .map_or(Error::TransportClosed, |listener| listener.close_error())
-                } else {
-                    Error::DriverShutdown
-                };
+                let error = cancellation_error();
                 route.set_state(InboundState::Closing {
                     connection: EstablishedConnectionRoute::new(&connection_state),
                     request: Some(request),
@@ -1049,18 +1050,7 @@ impl CmState {
                     self.inbound_routes.release(token, true);
                     return Ok(());
                 };
-                let error = if route
-                    .listener
-                    .upgrade()
-                    .is_some_and(|listener| listener.is_closing())
-                {
-                    route
-                        .listener
-                        .upgrade()
-                        .map_or(Error::TransportClosed, |listener| listener.close_error())
-                } else {
-                    Error::DriverShutdown
-                };
+                let error = cancellation_error();
                 if request.fail_undelivered(error) {
                     route.set_state(InboundState::Established {
                         connection: connection.clone(),
@@ -1165,7 +1155,14 @@ impl CmState {
         }
         let context_key = cm_id.context_key();
         route.set_identity(cm_id.as_raw() as usize, context_key);
-        if !self.insert_context_route(context_key, ContextRoute::Outbound(context_route)) {
+        let raw_id = cm_id.as_raw() as usize;
+        if !self.insert_context_route(
+            context_key,
+            ContextRoute::Outbound {
+                token: context_route,
+                raw_id,
+            },
+        ) {
             self.defer_cm_id(cm_id);
             self.routes.release(token, false);
             drop(reservation);
@@ -1502,29 +1499,32 @@ impl CmState {
             .copied()
             .ok_or(CmEventReject::Unknown)?;
         match route {
-            ContextRoute::Outbound(_) => self
+            ContextRoute::Outbound { .. } => self
                 .lookup_event_route(snapshot)
                 .map(CmDispatchRoute::Outbound),
-            ContextRoute::Inbound(token) => {
+            ContextRoute::Inbound { token, raw_id } => {
+                if raw_id != snapshot.id {
+                    return Err(CmEventReject::WrongId);
+                }
                 let route = match self.inbound_routes.lookup_cloned(token) {
                     Lookup::Occupied(route) => route,
                     Lookup::Duplicate => return Err(CmEventReject::Duplicate),
                     Lookup::Stale | Lookup::Retired => return Err(CmEventReject::Stale),
                     Lookup::Unknown => return Err(CmEventReject::Unknown),
                 };
-                if route.raw_id.load(Ordering::Acquire) != snapshot.id {
+                if route.raw_id.load(Ordering::Acquire) != raw_id {
                     return Err(CmEventReject::WrongId);
                 }
                 Ok(CmDispatchRoute::Inbound(route))
             }
-            ContextRoute::Listener(token) => {
+            ContextRoute::Listener { token, raw_id } => {
+                if raw_id != snapshot.id {
+                    return Err(CmEventReject::WrongId);
+                }
                 let listener = lock_unpoison(&self.listeners)
                     .get(&token)
                     .cloned()
                     .ok_or(CmEventReject::Stale)?;
-                if listener.raw_cm_id() != Some(snapshot.id) {
-                    return Err(CmEventReject::WrongId);
-                }
                 Ok(CmDispatchRoute::Listener(listener))
             }
         }
@@ -1541,16 +1541,19 @@ impl CmState {
             .get(&snapshot.context_key)
             .copied()
             .ok_or(CmEventReject::Unknown)?;
-        let ContextRoute::Outbound(token) = route else {
+        let ContextRoute::Outbound { token, raw_id } = route else {
             return Err(CmEventReject::Unexpected);
         };
+        if raw_id != snapshot.id {
+            return Err(CmEventReject::WrongId);
+        }
         let route = match self.routes.lookup_cloned(token) {
             Lookup::Occupied(route) => route,
             Lookup::Duplicate => return Err(CmEventReject::Duplicate),
             Lookup::Stale | Lookup::Retired => return Err(CmEventReject::Stale),
             Lookup::Unknown => return Err(CmEventReject::Unknown),
         };
-        if route.raw_id.load(Ordering::Acquire) != snapshot.id {
+        if route.raw_id.load(Ordering::Acquire) != raw_id {
             return Err(CmEventReject::WrongId);
         }
         Ok(route)
@@ -2232,12 +2235,47 @@ impl CmState {
         self.routes.release(route.token, completed);
     }
 
-    fn remove_context_route(&self, cm_id: Option<&SharedCmId>) {
+    fn remove_owned_context_route(&self, cm_id: Option<&SharedCmId>) {
         let Some(cm_id) = cm_id else {
             return;
         };
+        let Some(route_token) = cm_id.context_token() else {
+            return;
+        };
         let context_key = cm_id.context_key();
-        lock_unpoison(&self.context_routes).remove(&context_key);
+        let raw_id = cm_id.as_raw() as usize;
+        self.remove_context_route_if_owned(context_key, raw_id, Some(route_token));
+    }
+
+    fn remove_context_route_if_owned(
+        &self,
+        context_key: usize,
+        raw_id: usize,
+        route_token: Option<u64>,
+    ) -> bool {
+        let Some(route_token) = route_token else {
+            return false;
+        };
+        let mut routes = lock_unpoison(&self.context_routes);
+        let owned = match routes.get(&context_key).copied() {
+            Some(ContextRoute::Outbound {
+                token,
+                raw_id: owner,
+            })
+            | Some(ContextRoute::Inbound {
+                token,
+                raw_id: owner,
+            }) => token.encode() == route_token && owner == raw_id,
+            Some(ContextRoute::Listener {
+                token,
+                raw_id: owner,
+            }) => token == route_token && owner == raw_id,
+            None => false,
+        };
+        if owned {
+            routes.remove(&context_key);
+        }
+        owned
     }
 }
 
@@ -2877,7 +2915,13 @@ mod tests {
             .allocate_with(|token| Arc::new(OutboundRoute::new(token, request)))
             .unwrap();
         route.set_identity(0x1000, 0x2000);
-        lock_unpoison(&cm.context_routes).insert(0x2000, ContextRoute::Outbound(token));
+        lock_unpoison(&cm.context_routes).insert(
+            0x2000,
+            ContextRoute::Outbound {
+                token,
+                raw_id: 0x1000,
+            },
+        );
 
         let exact = CmEventSnapshot {
             event_type: CmEventType::AddrResolved,
@@ -2903,10 +2947,13 @@ mod tests {
         ));
         lock_unpoison(&cm.context_routes).insert(
             0x3001,
-            ContextRoute::Outbound(CmRouteToken {
-                slot: token.slot,
-                generation: token.generation + 1,
-            }),
+            ContextRoute::Outbound {
+                token: CmRouteToken {
+                    slot: token.slot,
+                    generation: token.generation + 1,
+                },
+                raw_id: 0x1000,
+            },
         );
         assert!(matches!(
             cm.lookup_event_route(CmEventSnapshot {
@@ -2941,7 +2988,13 @@ mod tests {
             .allocate_with(|token| Arc::new(InboundRoute::new(token, Arc::downgrade(&listener))))
             .unwrap();
         route.set_identity(0x4000, 0x5000);
-        lock_unpoison(&cm.context_routes).insert(0x5000, ContextRoute::Inbound(token));
+        lock_unpoison(&cm.context_routes).insert(
+            0x5000,
+            ContextRoute::Inbound {
+                token,
+                raw_id: 0x4000,
+            },
+        );
         let exact = CmEventSnapshot {
             event_type: CmEventType::Established,
             status: 0,
@@ -2965,13 +3018,54 @@ mod tests {
             cm.lookup_dispatch_route(exact),
             Err(CmEventReject::Duplicate)
         ));
+        assert!(!cm.remove_context_route_if_owned(0x5000, 0x4001, Some(token.encode())));
+        assert!(
+            !cm.remove_context_route_if_owned(
+                0x5000,
+                0x4000,
+                Some(
+                    CmRouteToken {
+                        slot: token.slot,
+                        generation: token.generation + 1,
+                    }
+                    .encode()
+                )
+            )
+        );
+        assert!(cm.remove_context_route_if_owned(0x5000, 0x4000, Some(token.encode())));
     }
 
     #[test]
-    fn listener_failure_events_close_locally_and_device_removal_fails_progress() {
+    fn unowned_child_context_never_removes_listener_event_route() {
         let (engine, driver) =
             super::super::test_engine_pair(super::super::CompletionMode::Polling);
         let listener = ListenerState::test_only(2);
+        let listener_token = 17;
+        lock_unpoison(&engine.shared.cm.listeners).insert(listener_token, Arc::clone(&listener));
+        lock_unpoison(&engine.shared.cm.context_routes).insert(
+            0x5000,
+            ContextRoute::Listener {
+                token: listener_token,
+                raw_id: 0x4000,
+            },
+        );
+
+        assert!(
+            !engine
+                .shared
+                .cm
+                .remove_context_route_if_owned(0x5000, 0x4001, None)
+        );
+        assert!(matches!(
+            lock_unpoison(&engine.shared.cm.context_routes)
+                .get(&0x5000)
+                .copied(),
+            Some(ContextRoute::Listener {
+                token: 17,
+                raw_id: 0x4000
+            })
+        ));
+
         let snapshot = CmEventSnapshot {
             event_type: CmEventType::AddrChange,
             status: libc::EADDRNOTAVAIL,
@@ -2979,6 +3073,11 @@ mod tests {
             listen_id: 0,
             context_key: 0x5000,
         };
+        let routed = engine.shared.cm.lookup_dispatch_route(snapshot).unwrap();
+        let CmDispatchRoute::Listener(routed_listener) = routed else {
+            panic!("listener context route changed after unowned child rejection");
+        };
+        assert!(Arc::ptr_eq(&routed_listener, &listener));
         assert!(matches!(
             engine
                 .shared
@@ -3000,6 +3099,22 @@ mod tests {
                 .handle_listener_event(&engine.shared, &listener, removed),
             Err(Error::Verbs(_))
         ));
+
+        let wrong_generation = CmRouteToken {
+            slot: 0,
+            generation: 2,
+        }
+        .encode();
+        assert!(!engine.shared.cm.remove_context_route_if_owned(
+            0x5000,
+            0x4000,
+            Some(wrong_generation)
+        ));
+        assert!(engine.shared.cm.remove_context_route_if_owned(
+            0x5000,
+            0x4000,
+            Some(listener_token)
+        ));
         drop(driver);
     }
 
@@ -3015,11 +3130,26 @@ mod tests {
             generation: 1,
         };
 
-        assert!(cm.insert_context_route(0x2000, ContextRoute::Outbound(incumbent)));
-        assert!(!cm.insert_context_route(0x2000, ContextRoute::Outbound(duplicate)));
+        assert!(cm.insert_context_route(
+            0x2000,
+            ContextRoute::Outbound {
+                token: incumbent,
+                raw_id: 0x1000,
+            }
+        ));
+        assert!(!cm.insert_context_route(
+            0x2000,
+            ContextRoute::Outbound {
+                token: duplicate,
+                raw_id: 0x1001,
+            }
+        ));
         assert_eq!(
             lock_unpoison(&cm.context_routes).get(&0x2000).copied(),
-            Some(ContextRoute::Outbound(incumbent))
+            Some(ContextRoute::Outbound {
+                token: incumbent,
+                raw_id: 0x1000,
+            })
         );
     }
 

@@ -5,7 +5,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context as TaskContext, Poll, RawWaker, RawWakerVTable, Waker};
 
 use super::*;
+use crate::v2::engine::connection::{WorkRequestPoster, install_connection};
+use crate::v2::qp::{BatchPostOutcome, QpCapabilities};
 use crate::v2::{AccessIntent, Completion, Mr};
+use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
 
 fn assert_engine_traits<T: Clone + Send + Sync + 'static>() {}
 fn assert_driver_traits<T: Future<Output = Result<()>> + Send + 'static>() {}
@@ -166,6 +169,88 @@ fn dropped_shutdown_future_unregisters_its_waiter() {
         0,
         "a cancelled shutdown must not retain its waker"
     );
+}
+
+#[test]
+fn shutdown_initiates_each_preexisting_connection_close_once() {
+    struct ShutdownPoster {
+        qp_num: u32,
+        error_transitions: AtomicUsize,
+    }
+
+    impl WorkRequestPoster for ShutdownPoster {
+        fn qp_num(&self) -> u32 {
+            self.qp_num
+        }
+
+        fn capabilities(&self) -> Option<QpCapabilities> {
+            None
+        }
+
+        fn post_send(&self, _batch: &mut PreparedSendBatch) -> BatchPostOutcome {
+            BatchPostOutcome::AllAccepted
+        }
+
+        fn post_recv(&self, _batch: &mut PreparedRecvBatch) -> BatchPostOutcome {
+            BatchPostOutcome::AllAccepted
+        }
+
+        fn to_error(&self) -> Result<()> {
+            self.error_transitions.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+
+        fn destroy_qp(&self) {}
+
+        #[cfg(any(test, feature = "test-hooks"))]
+        fn disconnect(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    let (engine, driver) = test_engine_pair(CompletionMode::Polling);
+    let mut connections = Vec::new();
+    let mut posters = Vec::new();
+    for qp_num in 1..=3 {
+        let poster = Arc::new(ShutdownPoster {
+            qp_num,
+            error_transitions: AtomicUsize::new(0),
+        });
+        let connection = install_connection(
+            &engine.shared,
+            Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
+            RdmaConnectionConfig::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        posters.push(poster);
+        connections.push(connection);
+    }
+
+    engine.shared.request_shutdown();
+    engine.shared.begin_all_connection_close();
+    engine.shared.begin_all_connection_close();
+
+    assert!(
+        engine
+            .shared
+            .shutdown_connection_close_started
+            .load(Ordering::Acquire)
+    );
+    assert!(
+        connections
+            .iter()
+            .all(|connection| connection.state.close_started())
+    );
+    assert!(
+        posters
+            .iter()
+            .all(|poster| poster.error_transitions.load(Ordering::Acquire) == 1)
+    );
+
+    drop(connections);
+    drop(driver);
 }
 
 #[test]

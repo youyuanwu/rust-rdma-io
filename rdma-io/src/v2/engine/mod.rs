@@ -238,6 +238,13 @@ impl RdmaEngine {
     }
 
     /// Bind an engine-owned listener on the shared CM event channel.
+    ///
+    /// `config.backlog_capacity()` is the userspace pending-child queue limit
+    /// and must be in `1..=4096`. Independently, the engine requests
+    /// `i32::MAX` from the kernel through `rdma_listen`. Providers may clamp
+    /// that kernel request, reducing how many requests reach userspace, or
+    /// refuse it. Refusal is returned here as a contextual listener-creation
+    /// error and is not counted as a userspace `BacklogFull` rejection.
     pub async fn listen(
         &self,
         address: std::net::SocketAddr,
@@ -310,6 +317,7 @@ struct EngineShared {
     admission: RwLock<()>,
     lifecycle: AtomicU8,
     shutdown_requested: AtomicBool,
+    shutdown_connection_close_started: AtomicBool,
     failure_retained: AtomicBool,
     frontend_count: AtomicUsize,
     work_signal: WorkSignal,
@@ -357,6 +365,7 @@ impl EngineShared {
             admission: RwLock::new(()),
             lifecycle: AtomicU8::new(lifecycle_to_u8(RdmaEngineLifecycle::Created)),
             shutdown_requested: AtomicBool::new(false),
+            shutdown_connection_close_started: AtomicBool::new(false),
             failure_retained: AtomicBool::new(false),
             frontend_count: AtomicUsize::new(1),
             work_signal: WorkSignal::new(),
@@ -791,6 +800,12 @@ impl EngineShared {
     }
 
     fn begin_all_connection_close(&self) {
+        if self
+            .shutdown_connection_close_started
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
         for connection in self.connections.occupied() {
             self.begin_connection_close(&connection, true);
         }
