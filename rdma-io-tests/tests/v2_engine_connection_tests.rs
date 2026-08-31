@@ -3,6 +3,7 @@ use std::task::Poll;
 use std::time::Duration;
 
 use rdma_io::cm::{ConnParam, RdmaCmDeviceList};
+use rdma_io::test_support::destruction::{DestructionKind, DestructionRecorder};
 use rdma_io::test_support::engine_driver::TestEngineResources;
 use rdma_io::v2::{
     AccessIntent, CompletionMode, Error, RdmaConnection, RdmaConnectionConfig, RdmaEngine,
@@ -390,6 +391,110 @@ async fn cancellation_after_rdma_connect_waits_for_the_routed_terminal_event() {
 
     engine.shutdown().await.unwrap();
     driver_task.await.unwrap().unwrap();
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn established_close_releases_resources_and_reuses_aggregate_capacity() {
+    if !has_software_rdma() {
+        return;
+    }
+    let recorder = DestructionRecorder::arm(128);
+    let device = software_device_name().expect("software RDMA device");
+    let (engine, driver) = RdmaEngineBuilder::new(device)
+        .completion_mode(CompletionMode::Polling)
+        .maximum_live_connections(2)
+        .maximum_inflight_operations(64)
+        .cq_capacity(64)
+        .build()
+        .unwrap();
+    let resources = engine.test_resources().unwrap();
+    let driver_task = tokio::spawn(driver);
+
+    let (first_server, first_client) =
+        establish_pair(&engine, &resources, RdmaConnectionConfig::default(), true).await;
+    assert_eq!(engine.diagnostics().live_connection_reservations, 2);
+    assert_eq!(engine.diagnostics().free_connection_slots, 0);
+
+    let first_client_close_one = first_client.clone();
+    let first_client_close_two = first_client.clone();
+    drop(first_client);
+    let (server_close, client_close_one, client_close_two) = tokio::join!(
+        first_server.close(),
+        first_client_close_one.close(),
+        first_client_close_two.close(),
+    );
+    server_close.unwrap();
+    client_close_one.unwrap();
+    client_close_two.unwrap();
+    drop(first_server);
+    drop(first_client_close_one);
+    drop(first_client_close_two);
+    assert_eq!(engine.diagnostics().live_connection_reservations, 0);
+    assert_eq!(engine.diagnostics().free_connection_slots, 2);
+
+    let (second_server, second_client) =
+        establish_pair(&engine, &resources, RdmaConnectionConfig::default(), true).await;
+    assert_eq!(engine.diagnostics().live_connection_reservations, 2);
+    assert_eq!(engine.diagnostics().free_connection_slots, 0);
+    let second_client_duplicate = second_client.clone();
+    let (server_close, client_close, duplicate_close) = tokio::join!(
+        second_server.close(),
+        second_client.close(),
+        second_client_duplicate.close(),
+    );
+    server_close.unwrap();
+    client_close.unwrap();
+    duplicate_close.unwrap();
+    assert_eq!(engine.diagnostics().live_connection_reservations, 0);
+    assert_eq!(engine.diagnostics().free_connection_slots, 2);
+    drop(second_server);
+    drop(second_client);
+    drop(second_client_duplicate);
+
+    driver_task.abort();
+    assert!(driver_task.await.unwrap_err().is_cancelled());
+    let shutdown = engine.shutdown().await.unwrap_err();
+    assert!(matches!(shutdown, Error::DriverShutdown));
+
+    drop(resources);
+    drop(engine);
+    let events = recorder.take();
+    assert!(!recorder.overflowed());
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == DestructionKind::QueuePair)
+            .count(),
+        4
+    );
+    assert!(
+        events
+            .iter()
+            .filter(|event| event.kind == DestructionKind::CmId)
+            .count()
+            >= 4
+    );
+    for kind in [
+        DestructionKind::ProtectionDomain,
+        DestructionKind::CompletionQueue,
+        DestructionKind::CmEventChannel,
+        DestructionKind::ContextFacade,
+        DestructionKind::RdmaFreeDevices,
+    ] {
+        assert!(
+            events.iter().any(|event| event.kind == kind),
+            "missing destruction evidence for {kind:?}"
+        );
+    }
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == DestructionKind::IbvCloseDevice)
+    );
+    assert_eq!(
+        events.last().map(|event| event.kind),
+        Some(DestructionKind::RdmaFreeDevices)
+    );
 }
 
 #[test]

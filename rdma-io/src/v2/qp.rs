@@ -10,6 +10,7 @@ use rdma_io_sys::ibverbs::*;
 use rdma_io_sys::wrapper::*;
 
 use crate::cm::{CmId, CmQueuePair};
+#[cfg(feature = "tokio")]
 use crate::error::from_ret;
 use crate::qp::QpInitAttr;
 use crate::wr::{PreparedRecvBatch, PreparedSendBatch, RecvWr, SendFlags, SendWr, Sge, WrOpcode};
@@ -324,6 +325,7 @@ impl Qp {
         &self.inner
     }
 
+    #[cfg(feature = "tokio")]
     pub(crate) fn destroy(self) {
         self.inner.destroy();
     }
@@ -397,6 +399,7 @@ impl Qp {
         batch_outcome_to_single(self.post_recv_batch(&mut batch))
     }
 
+    #[cfg(feature = "tokio")]
     fn post_send_wr(&self, wr: &mut SendWr) -> Result<()> {
         let mut raw = wr.build_raw();
         let mut bad_wr: *mut ibv_send_wr = std::ptr::null_mut();
@@ -407,6 +410,7 @@ impl Qp {
             })
     }
 
+    #[cfg(feature = "tokio")]
     fn post_recv_wr(&self, wr: &mut RecvWr) -> Result<()> {
         let mut raw = wr.build_raw();
         let mut bad_wr: *mut ibv_recv_wr = std::ptr::null_mut();
@@ -418,11 +422,13 @@ impl Qp {
     }
 
     /// Post a raw send WR. Used by the per-operation future infrastructure.
+    #[cfg(feature = "tokio")]
     pub(crate) fn post_send_wr_raw(&self, wr: &mut SendWr) -> Result<()> {
         self.post_send_wr(wr)
     }
 
     /// Post a raw recv WR. Used by the per-operation future infrastructure.
+    #[cfg(feature = "tokio")]
     pub(crate) fn post_recv_wr_raw(&self, wr: &mut RecvWr) -> Result<()> {
         self.post_recv_wr(wr)
     }

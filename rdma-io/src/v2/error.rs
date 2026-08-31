@@ -245,6 +245,7 @@ pub struct TransportError {
 
 impl TransportError {
     /// Create a `TransportError` snapshot from a driver [`Error`].
+    #[cfg(feature = "tokio")]
     pub(crate) fn from_error(err: &Error) -> Self {
         let message = err.to_string();
         let kind = match err {

@@ -964,7 +964,7 @@ impl EngineShared {
             self.diagnostic_counters.reject_cqe(CqeReject::Duplicate);
             return;
         }
-        operation.connection.remove_accepted(operation.token);
+        let removed = operation.connection.remove_accepted(operation.token);
         operation.connection.release_local(operation.direction);
         self.cq_credits.release();
         self.accepted_operations.fetch_sub(1, Ordering::AcqRel);
@@ -985,6 +985,12 @@ impl EngineShared {
         self.diagnostic_counters
             .cqes_routed
             .fetch_add(1, Ordering::Relaxed);
+        if removed
+            && operation.connection.close_started()
+            && operation.connection.accepted_count() == 0
+        {
+            self.schedule_connection_retirement(&operation.connection);
+        }
     }
 
     pub(super) fn begin_reclamation(&self, token: OperationToken) {
@@ -1016,6 +1022,9 @@ impl EngineShared {
             return;
         };
         connection.apply_drain_deadline();
+        if connection.close_started() && connection.accepted_count() == 0 {
+            self.schedule_connection_retirement(&connection);
+        }
     }
 }
 
@@ -2222,7 +2231,7 @@ mod tests {
     }
 
     fn synthetic_connection() -> Arc<ConnectionState> {
-        synthetic_connection_on(&synthetic_engine(8), 7).state
+        synthetic_connection_on(&synthetic_engine(8), 7).into_state_without_close_for_test()
     }
 
     fn install_accepted(

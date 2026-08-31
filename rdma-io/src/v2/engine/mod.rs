@@ -24,7 +24,7 @@ use tokio::sync::Notify;
 
 use config::EngineConfig;
 pub use config::{CompletionMode, RdmaConnectionConfig};
-use connection::ConnectionAdmissionPool;
+use connection::{ConnectionAdmissionPool, ConnectionState};
 pub use connection::{RdmaConnection, RdmaConnectionIdentity};
 use diagnostics::DiagnosticsState;
 pub use diagnostics::{RdmaEngineDiagnostics, RdmaEngineLifecycle, RdmaEngineTerminalError};
@@ -272,10 +272,6 @@ pub struct RdmaEngineDriver {
 struct EngineShared {
     config: EngineConfig,
     resources: ResourceSummary,
-    #[allow(
-        dead_code,
-        reason = "used by Phase 3 test installation and Phase 4 CM paths"
-    )]
     provider: Option<config::ProviderLimits>,
     resource_refs: Option<EngineResourceRefs>,
     connection_admission: Arc<ConnectionAdmissionPool>,
@@ -702,6 +698,30 @@ impl EngineShared {
             token.encode(),
             self.config.missing_cqe_deadline,
         );
+    }
+
+    fn begin_connection_close(&self, connection: &Arc<ConnectionState>, force_error: bool) {
+        if connection.is_retired() {
+            return;
+        }
+        let first = connection.begin_close();
+        if force_error {
+            let _ = connection.transition_to_error_once();
+        }
+        if first {
+            self.schedule_connection_drain(connection.token);
+        }
+        if connection.accepted_count() == 0 {
+            self.schedule_connection_retirement(connection);
+        }
+    }
+
+    fn schedule_connection_retirement(&self, connection: &ConnectionState) {
+        if connection.is_retired() || !connection.try_request_retirement() {
+            return;
+        }
+        self.cm.enqueue_retirement(connection.token);
+        self.work_signal.publish(cm::CM_WORK);
     }
 
     fn schedule_connection_drain(&self, token: ConnectionToken) {

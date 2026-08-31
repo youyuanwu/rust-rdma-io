@@ -166,6 +166,7 @@ impl Cq {
     /// Used by `ConnectionBuilder` to share channel ownership with
     /// `ConnectionLifetime`, ensuring the channel outlives the CQ
     /// for correct `ibv_destroy_comp_channel` ordering.
+    #[cfg(feature = "tokio")]
     pub(crate) fn channel_arc(&self) -> Option<Arc<CompletionChannel>> {
         self.channel.clone()
     }

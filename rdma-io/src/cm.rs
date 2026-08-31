@@ -231,8 +231,11 @@ impl CmEvent {
 
     /// Opaque user-context pointer associated with the event's CM ID.
     ///
-    /// The pointer is never dereferenced by this wrapper. Engine code uses it
-    /// only as an identity key for a separately owned generational route.
+    /// The pointer is never dereferenced from an event. Engine routing uses the
+    /// allocation address only as an identity key, then resolves the separately
+    /// registered generational token that was read safely from the owning
+    /// [`CmId`] when the route was created.
+    #[cfg(feature = "tokio")]
     pub(crate) fn context_key(&self) -> usize {
         let id = self.cm_id_raw();
         if id.is_null() {
@@ -280,11 +283,12 @@ pub struct CmId {
     pub(crate) inner: *mut rdma_cm_id,
     /// Whether this CmId owns the underlying rdma_cm_id (should call rdma_destroy_id).
     owned: bool,
-    _context_token: Option<Box<CmContextToken>>,
+    #[cfg(feature = "tokio")]
+    context_token: Option<Box<CmContextToken>>,
 }
 
+#[cfg(feature = "tokio")]
 struct CmContextToken {
-    #[allow(dead_code, reason = "the engine owns the decoded generational route")]
     route: u64,
 }
 
@@ -326,11 +330,13 @@ impl CmId {
         Ok(Self {
             inner: id,
             owned: true,
-            _context_token: None,
+            #[cfg(feature = "tokio")]
+            context_token: None,
         })
     }
 
     /// Create a CM ID associated with one engine-owned generational route.
+    #[cfg(feature = "tokio")]
     pub(crate) fn new_with_context_token(
         channel: &EventChannel,
         port_space: PortSpace,
@@ -345,7 +351,7 @@ impl CmId {
         Ok(Self {
             inner: id,
             owned: true,
-            _context_token: Some(context_token),
+            context_token: Some(context_token),
         })
     }
 
@@ -358,7 +364,8 @@ impl CmId {
         Self {
             inner: id,
             owned,
-            _context_token: None,
+            #[cfg(feature = "tokio")]
+            context_token: None,
         }
     }
 
@@ -547,8 +554,18 @@ impl CmId {
     }
 
     /// Opaque context identity installed when this CM ID was created.
+    #[cfg(feature = "tokio")]
     pub(crate) fn context_key(&self) -> usize {
         unsafe { (*self.inner).context as usize }
+    }
+
+    /// Generational route token owned by this CM ID's context allocation.
+    ///
+    /// This reads the Rust-owned allocation directly. CM events use only its
+    /// stable address and resolve that address through the engine route table.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn context_token(&self) -> Option<u64> {
+        self.context_token.as_ref().map(|token| token.route)
     }
 
     /// Migrate this CM ID to a different event channel.
@@ -634,6 +651,7 @@ impl CmQueuePair {
     }
 
     /// Consume and synchronously destroy this CM-managed QP exactly once.
+    #[cfg(feature = "tokio")]
     pub(crate) fn destroy(mut self) {
         self.destroy_once();
     }

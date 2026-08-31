@@ -32,10 +32,19 @@ pub struct RdmaConnectionIdentity {
 ///
 /// The connection exposes owned operation futures but no raw PD, QP, CQ, CM,
 /// or independently pollable completion-driver handle.
-#[derive(Clone)]
 pub struct RdmaConnection {
     pub(super) shared: Arc<EngineShared>,
     pub(super) state: Arc<ConnectionState>,
+}
+
+impl Clone for RdmaConnection {
+    fn clone(&self) -> Self {
+        self.state.frontend_count.fetch_add(1, Ordering::Relaxed);
+        Self {
+            shared: Arc::clone(&self.shared),
+            state: Arc::clone(&self.state),
+        }
+    }
 }
 
 impl RdmaConnection {
@@ -108,18 +117,16 @@ impl RdmaConnection {
         self.state.identity()
     }
 
-    /// Stop new posting and wait for this phase's exact accepted set to drain.
+    /// Stop new posting and wait for the exact accepted set to drain.
     ///
-    /// Phase 6 adds the canonical QP-ERR and destruction sequence. This phase
-    /// already memoizes the connection-local quarantine result while retaining
-    /// every unresolved operation, MR, registration, and CQ credit.
+    /// A successful close retires the CM route and connection registry
+    /// generation, destroys the QP before its CM ID, and returns aggregate
+    /// admission once. A drain timeout retains every unresolved operation, MR,
+    /// registration, and CQ credit in the quarantined connection bundle.
     pub async fn close(&self) -> Result<()> {
-        self.state.stop_posting();
+        self.shared.begin_connection_close(&self.state, false);
         if let Some(outcome) = self.shared.outcome() {
             return outcome.into_result();
-        }
-        if !self.state.close_started.swap(true, Ordering::AcqRel) {
-            self.shared.schedule_connection_drain(self.state.token);
         }
         loop {
             let notified = self.state.close_notify.notified();
@@ -131,12 +138,6 @@ impl RdmaConnection {
             if let Some(outcome) = self.shared.outcome() {
                 return outcome.into_result();
             }
-            if self.state.accepted_count() == 0 {
-                self.state.finish_close_success();
-                if let Some(outcome) = self.state.close_outcome() {
-                    return outcome.into_result();
-                }
-            }
             notified.await;
         }
     }
@@ -144,6 +145,26 @@ impl RdmaConnection {
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn transition_to_error_for_test(&self) -> Result<()> {
         self.state.poster.to_error()
+    }
+
+    #[cfg(test)]
+    pub(super) fn into_state_without_close_for_test(self) -> Arc<ConnectionState> {
+        let state = Arc::clone(&self.state);
+        state.frontend_count.fetch_add(1, Ordering::Relaxed);
+        drop(self);
+        let previous = state.frontend_count.fetch_sub(1, Ordering::AcqRel);
+        debug_assert_eq!(previous, 1);
+        state
+    }
+}
+
+impl Drop for RdmaConnection {
+    fn drop(&mut self) {
+        let previous = self.state.frontend_count.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "connection frontend count must be positive");
+        if previous == 1 && !self.state.is_retired() {
+            self.shared.begin_connection_close(&self.state, true);
+        }
     }
 }
 
@@ -164,20 +185,15 @@ pub(super) struct ConnectionState {
     close_notify: Notify,
     quarantined: AtomicBool,
     error_transition_started: AtomicBool,
-    #[allow(
-        dead_code,
-        reason = "released after Phase 6 ordered connection retirement"
-    )]
-    admission: Option<ConnectionReservation>,
-    #[allow(dead_code, reason = "released with the shared CM route in Phase 6")]
-    cm_route_token: Option<u64>,
+    frontend_count: AtomicUsize,
+    retirement_requested: AtomicBool,
+    retirement_started: AtomicBool,
+    retired: AtomicBool,
+    admission: Mutex<Option<ConnectionReservation>>,
+    outbound_route_token: Option<u64>,
 }
 
 impl ConnectionState {
-    #[allow(
-        dead_code,
-        reason = "used by Phase 3 test installation and Phase 4 CM paths"
-    )]
     pub(super) fn new(
         token: ConnectionToken,
         poster: Arc<dyn WorkRequestPoster>,
@@ -185,7 +201,7 @@ impl ConnectionState {
         local_addr: Option<SocketAddr>,
         peer_addr: Option<SocketAddr>,
         admission: Option<ConnectionReservation>,
-        cm_route_token: Option<u64>,
+        outbound_route_token: Option<u64>,
     ) -> Self {
         Self {
             token,
@@ -204,8 +220,12 @@ impl ConnectionState {
             close_notify: Notify::new(),
             quarantined: AtomicBool::new(false),
             error_transition_started: AtomicBool::new(false),
-            admission,
-            cm_route_token,
+            frontend_count: AtomicUsize::new(1),
+            retirement_requested: AtomicBool::new(false),
+            retirement_started: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
+            admission: Mutex::new(admission),
+            outbound_route_token,
         }
     }
 
@@ -262,9 +282,6 @@ impl ConnectionState {
         let removed = lock_unpoison(&self.accepted).remove(&token);
         if removed {
             self.close_notify.notify_waiters();
-            if self.accepted_count() == 0 {
-                self.finish_close_success();
-            }
         }
         removed
     }
@@ -300,9 +317,6 @@ impl ConnectionState {
     pub(super) fn mark_disconnected(&self) {
         self.stop_posting();
         let _ = self.transition_to_error_once();
-        if self.accepted_count() == 0 {
-            self.finish_close_success();
-        }
     }
 
     pub(super) fn mark_cm_failure(&self, message: String) {
@@ -323,10 +337,10 @@ impl ConnectionState {
         self.poster.to_error()
     }
 
-    pub(super) fn destroy_qp_zero_outstanding(&self) {
+    pub(super) fn destroy_connection_resources(&self) {
         debug_assert_eq!(self.accepted_count(), 0);
         self.stop_posting();
-        self.poster.destroy_qp();
+        self.poster.destroy_connection();
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -342,8 +356,6 @@ impl ConnectionState {
         let accepted = lock_unpoison(&self.accepted);
         let outstanding = accepted.len();
         if outstanding == 0 {
-            drop(accepted);
-            self.finish_close_success();
             return;
         }
         self.quarantined.store(true, Ordering::Release);
@@ -359,20 +371,52 @@ impl ConnectionState {
         self.close_notify.notify_waiters();
     }
 
-    pub(super) fn finish_close_success(&self) {
-        if !self.close_started.load(Ordering::Acquire) || self.quarantined.load(Ordering::Acquire) {
-            return;
-        }
+    pub(super) fn finish_retirement(&self) {
         let mut outcome = lock_unpoison(&self.close_outcome);
         if outcome.is_none() {
             *outcome = Some(CloseOutcome::Success);
         }
         drop(outcome);
+        self.retired.store(true, Ordering::Release);
         self.close_notify.notify_waiters();
     }
 
     fn close_outcome(&self) -> Option<CloseOutcome> {
-        lock_unpoison(&self.close_outcome).clone()
+        let outcome = lock_unpoison(&self.close_outcome).clone();
+        match outcome {
+            Some(CloseOutcome::Quarantined { .. }) => outcome,
+            Some(_) if self.is_retired() => outcome,
+            _ => None,
+        }
+    }
+
+    pub(super) fn close_started(&self) -> bool {
+        self.close_started.load(Ordering::Acquire)
+    }
+
+    pub(super) fn begin_close(&self) -> bool {
+        self.stop_posting();
+        !self.close_started.swap(true, Ordering::AcqRel)
+    }
+
+    pub(super) fn try_request_retirement(&self) -> bool {
+        !self.retirement_requested.swap(true, Ordering::AcqRel)
+    }
+
+    pub(super) fn try_begin_retirement(&self) -> bool {
+        !self.retirement_started.swap(true, Ordering::AcqRel)
+    }
+
+    pub(super) fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::Acquire)
+    }
+
+    pub(super) fn outbound_route_token(&self) -> Option<u64> {
+        self.outbound_route_token
+    }
+
+    pub(super) fn release_admission(&self) {
+        drop(lock_unpoison(&self.admission).take());
     }
 }
 
@@ -479,10 +523,6 @@ impl OperationKind {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "verbs methods are activated through test hooks and Phase 4 CM paths"
-)]
 pub(super) trait WorkRequestPoster: Send + Sync {
     fn qp_num(&self) -> u32;
     fn capabilities(&self) -> Option<QpCapabilities>;
@@ -490,27 +530,22 @@ pub(super) trait WorkRequestPoster: Send + Sync {
     fn post_recv(&self, batch: &mut PreparedRecvBatch) -> BatchPostOutcome;
     fn to_error(&self) -> Result<()>;
     fn destroy_qp(&self);
+    fn destroy_connection(&self) {
+        self.destroy_qp();
+    }
     #[cfg(any(test, feature = "test-hooks"))]
     fn disconnect(&self) -> Result<()>;
 }
 
-#[allow(
-    dead_code,
-    reason = "used by Phase 3 test installation and Phase 4 CM paths"
-)]
 pub(super) struct VerbsConnectionResources {
     qp: Mutex<Option<Qp>>,
     qp_num: u32,
     capabilities: QpCapabilities,
-    // Declared after `qp`: Rust drops the QP before the CM owner.
-    cm_owner: ConnectionCmOwner,
+    cm_owner: Mutex<Option<ConnectionCmOwner>>,
 }
 
 impl VerbsConnectionResources {
-    #[allow(
-        dead_code,
-        reason = "used by Phase 3 test installation and Phase 4 CM paths"
-    )]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(super) fn new(qp: Qp, cm_owner: crate::async_cm::AsyncCmId) -> Self {
         let qp_num = qp.qp_num();
         let capabilities = qp.capabilities();
@@ -518,7 +553,7 @@ impl VerbsConnectionResources {
             qp: Mutex::new(Some(qp)),
             qp_num,
             capabilities,
-            cm_owner: ConnectionCmOwner::External { _cm_id: cm_owner },
+            cm_owner: Mutex::new(Some(ConnectionCmOwner::External { _cm_id: cm_owner })),
         }
     }
 
@@ -529,19 +564,24 @@ impl VerbsConnectionResources {
             qp: Mutex::new(Some(qp)),
             qp_num,
             capabilities,
-            cm_owner: ConnectionCmOwner::Shared {
+            cm_owner: Mutex::new(Some(ConnectionCmOwner::Shared {
                 cm_id,
                 _channel: channel,
-            },
+            })),
         }
     }
 
     pub(super) fn connect(&self, param: &ConnParam) -> Result<()> {
-        match &self.cm_owner {
-            ConnectionCmOwner::Shared { cm_id, .. } => cm_id.connect(param).map_err(Error::from),
-            ConnectionCmOwner::External { .. } => Err(Error::InvalidConfig(
+        let cm_owner = lock_unpoison(&self.cm_owner);
+        match cm_owner.as_ref() {
+            Some(ConnectionCmOwner::Shared { cm_id, .. }) => {
+                cm_id.connect(param).map_err(Error::from)
+            }
+            #[cfg(any(test, feature = "test-hooks"))]
+            Some(ConnectionCmOwner::External { .. }) => Err(Error::InvalidConfig(
                 "external CM owner cannot initiate an engine connection".into(),
             )),
+            None => Err(Error::TransportClosed),
         }
     }
 }
@@ -551,9 +591,8 @@ enum ConnectionCmOwner {
         cm_id: CmId,
         _channel: Arc<EventChannel>,
     },
-    External {
-        _cm_id: crate::async_cm::AsyncCmId,
-    },
+    #[cfg(any(test, feature = "test-hooks"))]
+    External { _cm_id: crate::async_cm::AsyncCmId },
 }
 
 impl WorkRequestPoster for VerbsConnectionResources {
@@ -594,11 +633,22 @@ impl WorkRequestPoster for VerbsConnectionResources {
         }
     }
 
+    fn destroy_connection(&self) {
+        self.destroy_qp();
+        lock_unpoison(&self.cm_owner).take();
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     fn disconnect(&self) -> Result<()> {
-        match &self.cm_owner {
-            ConnectionCmOwner::Shared { cm_id, .. } => cm_id.disconnect().map_err(Error::from),
-            ConnectionCmOwner::External { _cm_id } => _cm_id.disconnect().map_err(Error::from),
+        let cm_owner = lock_unpoison(&self.cm_owner);
+        match cm_owner.as_ref() {
+            Some(ConnectionCmOwner::Shared { cm_id, .. }) => {
+                cm_id.disconnect().map_err(Error::from)
+            }
+            Some(ConnectionCmOwner::External { _cm_id }) => {
+                _cm_id.disconnect().map_err(Error::from)
+            }
+            None => Err(Error::TransportClosed),
         }
     }
 }
@@ -648,7 +698,7 @@ pub(super) fn install_reserved_connection(
     local_addr: Option<SocketAddr>,
     peer_addr: Option<SocketAddr>,
     reservation: ConnectionReservation,
-    cm_route_token: Option<u64>,
+    outbound_route_token: Option<u64>,
 ) -> Result<RdmaConnection> {
     config.validate(&shared.config, shared.provider.as_ref())?;
     if let Some(capabilities) = poster.capabilities() {
@@ -663,7 +713,7 @@ pub(super) fn install_reserved_connection(
             local_addr,
             peer_addr,
             Some(reservation),
-            cm_route_token,
+            outbound_route_token,
         ))
     });
     let (_, state) = match registration {

@@ -387,10 +387,6 @@ impl ConnectionRegistry {
         })
     }
 
-    #[allow(
-        dead_code,
-        reason = "used by Phase 3 test installation and Phase 4 CM paths"
-    )]
     pub(super) fn register(
         &self,
         qp_num: u32,
@@ -424,7 +420,6 @@ impl ConnectionRegistry {
         lock_unpoison(&self.qp_index).get(&qp_num).copied()
     }
 
-    #[allow(dead_code, reason = "connection release is completed in Phase 6")]
     pub(super) fn release(
         &self,
         token: ConnectionToken,
