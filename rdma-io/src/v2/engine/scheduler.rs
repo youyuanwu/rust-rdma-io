@@ -67,10 +67,6 @@ impl WorkScheduler {
         self.classes.len()
     }
 
-    #[allow(
-        dead_code,
-        reason = "used by connection-local work beginning in Phase 3"
-    )]
     pub(super) fn enqueue_connection(&mut self, connection: ReadyConnection) {
         if self.ready_connections.enqueue(connection) {
             self.mark_class_ready(WorkClass::ReadyConnection);
@@ -81,10 +77,6 @@ impl WorkScheduler {
         self.ready_connections.pop()
     }
 
-    #[allow(
-        dead_code,
-        reason = "used by connection-local work beginning in Phase 3"
-    )]
     pub(super) fn requeue_connection(&mut self, connection: ReadyConnection) {
         self.ready_connections.enqueue(connection);
         self.mark_class_ready(WorkClass::ReadyConnection);

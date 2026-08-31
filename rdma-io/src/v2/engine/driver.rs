@@ -447,8 +447,21 @@ impl Future for RdmaEngineDriver {
                 WorkClass::Reclamation => self.service_reclamation(),
                 WorkClass::ReadyConnection => Ok(self.service_ready_connection()),
             };
-            if let Err(error) = result {
-                return self.fail(EngineFailure::Progress(error.to_string()));
+            let progressed = match result {
+                Ok(progressed) => progressed,
+                Err(error) => return self.fail(EngineFailure::Progress(error.to_string())),
+            };
+            // CM progress can remove the final shutdown owner after the
+            // Terminal class already ran in this poll.
+            if progressed
+                && class == WorkClass::Cm
+                && self
+                    .shared
+                    .shutdown_requested
+                    .load(std::sync::atomic::Ordering::Acquire)
+                && self.service_terminal()
+            {
+                break;
             }
             if self.shared.outcome().is_some() {
                 break;

@@ -9,7 +9,9 @@ use rdma_io::v2::{
     AccessIntent, CompletionMode, Error, RdmaConnection, RdmaConnectionConfig, RdmaEngine,
     RdmaEngineBuilder, RdmaEngineLifecycle,
 };
-use rdma_io_tests::test_helpers::{bind_listener_with_retry, connect_addr_for, has_software_rdma};
+use rdma_io_tests::test_helpers::{
+    bind_listener_with_retry, connect_addr_for, has_software_rdma, local_ip,
+};
 
 fn software_device_name() -> Option<String> {
     let list = RdmaCmDeviceList::new().ok()?;
@@ -287,7 +289,7 @@ async fn run_rejected_connect(mode: CompletionMode) {
     driver_task.await.unwrap().unwrap();
 }
 
-async fn run_over_budget_failed_connects() {
+async fn run_over_budget_failed_connects(mode: CompletionMode) {
     if !has_software_rdma() {
         return;
     }
@@ -296,7 +298,7 @@ async fn run_over_budget_failed_connects() {
 
     let device = software_device_name().expect("software RDMA device");
     let (engine, driver) = RdmaEngineBuilder::new(device)
-        .completion_mode(CompletionMode::Polling)
+        .completion_mode(mode)
         .maximum_live_connections(ATTEMPTS)
         .maximum_inflight_operations(64)
         .cq_capacity(64)
@@ -345,6 +347,67 @@ async fn run_over_budget_failed_connects() {
 
     engine.shutdown().await.unwrap();
     driver_task.await.unwrap().unwrap();
+}
+
+fn unresolved_neighbor_addr() -> std::net::SocketAddr {
+    let mut octets = local_ip()
+        .parse::<std::net::Ipv4Addr>()
+        .expect("software RDMA test address must be IPv4")
+        .octets();
+    octets[3] = if octets[3] == 250 { 251 } else { 250 };
+    std::net::SocketAddr::from((std::net::Ipv4Addr::from(octets), 9))
+}
+
+async fn run_readiness_shutdown_after_addr_error() {
+    if !has_software_rdma() {
+        return;
+    }
+    let device = software_device_name().expect("software RDMA device");
+    let (engine, mut driver) = RdmaEngineBuilder::new(device)
+        .completion_mode(CompletionMode::Readiness)
+        .maximum_live_connections(1)
+        .maximum_inflight_operations(64)
+        .cq_capacity(64)
+        .cm_event_budget(4)
+        .build()
+        .unwrap();
+
+    let mut connect = Box::pin(engine.connect(unresolved_neighbor_addr()));
+    poll_fn(|cx| {
+        assert!(connect.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    poll_fn(|cx| {
+        assert!(std::pin::Pin::new(&mut driver).poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    let before_shutdown = engine.diagnostics();
+    assert_eq!(before_shutdown.cm_events_processed, 0);
+    assert_eq!(before_shutdown.connections_failed, 0);
+    assert_eq!(before_shutdown.live_connection_reservations, 1);
+
+    let mut shutdown = Box::pin(engine.shutdown());
+    assert!(
+        poll_fn(|cx| Poll::Ready(shutdown.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    let driver_task = tokio::spawn(driver);
+
+    tokio::time::timeout(Duration::from_secs(10), shutdown.as_mut())
+        .await
+        .expect("readiness shutdown lost its terminal wake after ADDR_ERROR")
+        .unwrap();
+    driver_task.await.unwrap().unwrap();
+    assert!(connect.await.is_err());
+
+    let diagnostics = engine.diagnostics();
+    assert_eq!(diagnostics.lifecycle, RdmaEngineLifecycle::Terminated);
+    assert!(diagnostics.cm_events_processed >= 1);
+    assert_eq!(diagnostics.live_connection_reservations, 0);
+    assert_eq!(diagnostics.free_connection_slots, 1);
 }
 
 async fn run_shutdown_awaiting_delivery(mode: CompletionMode) {
@@ -498,7 +561,13 @@ async fn rejected_cm_event_fails_only_its_request_in_both_modes() {
 
 #[test_log::test(tokio::test(flavor = "current_thread"))]
 async fn more_than_one_cm_budget_of_failed_connects_progresses_cooperatively() {
-    run_over_budget_failed_connects().await;
+    run_over_budget_failed_connects(CompletionMode::Readiness).await;
+    run_over_budget_failed_connects(CompletionMode::Polling).await;
+}
+
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+async fn readiness_shutdown_rechecks_terminal_after_await_addr_error_on_one_core() {
+    run_readiness_shutdown_after_addr_error().await;
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]

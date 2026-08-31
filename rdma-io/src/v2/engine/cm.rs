@@ -6,6 +6,7 @@
 //! acknowledged before state ownership advances or any potentially blocking
 //! librdmacm/verbs call runs.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::net::SocketAddr;
@@ -111,6 +112,16 @@ impl CmState {
         }
         if let Lookup::Occupied(route) = self.routes.lookup_cloned(CmRouteToken::decode(encoded)) {
             route.mark_delivered(request);
+        }
+    }
+
+    fn insert_context_route(&self, context_key: usize, token: CmRouteToken) -> bool {
+        match lock_unpoison(&self.context_routes).entry(context_key) {
+            Entry::Vacant(entry) => {
+                entry.insert(token);
+                true
+            }
+            Entry::Occupied(_) => false,
         }
     }
 
@@ -387,19 +398,15 @@ impl CmState {
         }
         let context_key = cm_id.context_key();
         route.set_identity(cm_id.as_raw() as usize, context_key);
-        {
-            let mut contexts = lock_unpoison(&self.context_routes);
-            if contexts.insert(context_key, context_route).is_some() {
-                drop(contexts);
-                self.defer_cm_id(cm_id);
-                self.routes.release(token, false);
-                drop(reservation);
-                request.complete_failure(
-                    shared,
-                    Error::InvalidConfig("duplicate CM context identity".into()),
-                );
-                return Ok(());
-            }
+        if !self.insert_context_route(context_key, context_route) {
+            self.defer_cm_id(cm_id);
+            self.routes.release(token, false);
+            drop(reservation);
+            request.complete_failure(
+                shared,
+                Error::InvalidConfig("duplicate CM context identity".into()),
+            );
+            return Ok(());
         }
 
         let resolve = cm_id.resolve_addr(None, &request.address, 2_000);
@@ -1645,6 +1652,26 @@ mod tests {
                 Err(CmEventReject::Duplicate)
             ));
         }
+    }
+
+    #[test]
+    fn duplicate_context_route_keeps_the_incumbent_mapping() {
+        let cm = CmState::new(2).unwrap();
+        let incumbent = CmRouteToken {
+            slot: 0,
+            generation: 1,
+        };
+        let duplicate = CmRouteToken {
+            slot: 1,
+            generation: 1,
+        };
+
+        assert!(cm.insert_context_route(0x2000, incumbent));
+        assert!(!cm.insert_context_route(0x2000, duplicate));
+        assert_eq!(
+            lock_unpoison(&cm.context_routes).get(&0x2000).copied(),
+            Some(incumbent)
+        );
     }
 
     #[test]
