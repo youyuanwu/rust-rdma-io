@@ -337,10 +337,10 @@ impl ConnectionState {
         self.poster.to_error()
     }
 
-    pub(super) fn destroy_connection_resources(&self) {
+    pub(super) fn destroy_connection_resources(&self) -> Option<SharedCmId> {
         debug_assert_eq!(self.accepted_count(), 0);
         self.stop_posting();
-        self.poster.destroy_connection();
+        self.poster.destroy_connection()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -405,6 +405,10 @@ impl ConnectionState {
 
     pub(super) fn try_begin_retirement(&self) -> bool {
         !self.retirement_started.swap(true, Ordering::AcqRel)
+    }
+
+    pub(super) fn retry_retirement(&self) {
+        self.retirement_started.store(false, Ordering::Release);
     }
 
     pub(super) fn is_retired(&self) -> bool {
@@ -530,8 +534,9 @@ pub(super) trait WorkRequestPoster: Send + Sync {
     fn post_recv(&self, batch: &mut PreparedRecvBatch) -> BatchPostOutcome;
     fn to_error(&self) -> Result<()>;
     fn destroy_qp(&self);
-    fn destroy_connection(&self) {
+    fn destroy_connection(&self) -> Option<SharedCmId> {
         self.destroy_qp();
+        None
     }
     #[cfg(any(test, feature = "test-hooks"))]
     fn disconnect(&self) -> Result<()>;
@@ -542,6 +547,24 @@ pub(super) struct VerbsConnectionResources {
     qp_num: u32,
     capabilities: QpCapabilities,
     cm_owner: Mutex<Option<ConnectionCmOwner>>,
+}
+
+pub(super) struct SharedCmId {
+    cm_id: CmId,
+    _channel: Arc<EventChannel>,
+}
+
+impl SharedCmId {
+    pub(super) fn new(cm_id: CmId, channel: Arc<EventChannel>) -> Self {
+        Self {
+            cm_id,
+            _channel: channel,
+        }
+    }
+
+    pub(super) fn destroy(self) -> Result<()> {
+        self.cm_id.destroy().map_err(Error::from)
+    }
 }
 
 impl VerbsConnectionResources {
@@ -633,9 +656,19 @@ impl WorkRequestPoster for VerbsConnectionResources {
         }
     }
 
-    fn destroy_connection(&self) {
+    fn destroy_connection(&self) -> Option<SharedCmId> {
         self.destroy_qp();
-        lock_unpoison(&self.cm_owner).take();
+        match lock_unpoison(&self.cm_owner).take() {
+            Some(ConnectionCmOwner::Shared { cm_id, _channel }) => {
+                Some(SharedCmId::new(cm_id, _channel))
+            }
+            #[cfg(any(test, feature = "test-hooks"))]
+            Some(ConnectionCmOwner::External { _cm_id }) => {
+                drop(_cm_id);
+                None
+            }
+            None => None,
+        }
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

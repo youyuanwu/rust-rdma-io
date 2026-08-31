@@ -2,12 +2,12 @@ use std::future::{Future, poll_fn};
 use std::task::Poll;
 use std::time::Duration;
 
-use rdma_io::cm::{ConnParam, RdmaCmDeviceList};
+use rdma_io::cm::{CmEventType, ConnParam, RdmaCmDeviceList};
 use rdma_io::test_support::destruction::{DestructionKind, DestructionRecorder};
 use rdma_io::test_support::engine_driver::TestEngineResources;
 use rdma_io::v2::{
     AccessIntent, CompletionMode, Error, RdmaConnection, RdmaConnectionConfig, RdmaEngine,
-    RdmaEngineBuilder,
+    RdmaEngineBuilder, RdmaEngineLifecycle,
 };
 use rdma_io_tests::test_helpers::{bind_listener_with_retry, connect_addr_for, has_software_rdma};
 
@@ -172,6 +172,9 @@ async fn run_mode(mode: CompletionMode) {
     let (disconnected, returned) = default_client.send(disconnected_mr, None).await;
     assert!(matches!(disconnected, Err(Error::TransportClosed)));
     assert!(returned.is_some());
+    default_server.close().await.unwrap();
+    default_client.close().await.unwrap();
+    assert_eq!(engine.diagnostics().live_connection_reservations, 2);
 
     let configured_recv = configured_server
         .register_memory(64, AccessIntent::LocalOnly)
@@ -188,12 +191,7 @@ async fn run_mode(mode: CompletionMode) {
     assert!(recv.is_some());
     assert!(send.is_some());
 
-    for connection in [
-        &default_server,
-        &default_client,
-        &configured_server,
-        &configured_client,
-    ] {
+    for connection in [&configured_server, &configured_client] {
         connection.close().await.unwrap();
     }
     engine.shutdown().await.unwrap();
@@ -236,6 +234,18 @@ async fn run_rejected_connect(mode: CompletionMode) {
     .await
     .expect("rejected outbound connection timed out");
     assert!(rejected.is_err());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let diagnostics = engine.diagnostics();
+            if diagnostics.live_connection_reservations == 2 && diagnostics.connections_failed == 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("rejected connection resources were not retired");
     assert_eq!(engine.diagnostics().live_connection_reservations, 2);
     assert_eq!(engine.diagnostics().connections_failed, 1);
 
@@ -254,6 +264,143 @@ async fn run_rejected_connect(mode: CompletionMode) {
     driver_task.await.unwrap().unwrap();
 }
 
+async fn run_shutdown_awaiting_delivery(mode: CompletionMode) {
+    if !has_software_rdma() {
+        return;
+    }
+    let recorder = DestructionRecorder::arm(128);
+    let device = software_device_name().expect("software RDMA device");
+    let (engine, driver) = RdmaEngineBuilder::new(device)
+        .completion_mode(mode)
+        .maximum_live_connections(1)
+        .maximum_inflight_operations(64)
+        .cq_capacity(64)
+        .build()
+        .unwrap();
+    let resources = engine.test_resources().unwrap();
+    let driver_task = tokio::spawn(driver);
+    let listener = bind_listener_with_retry().await;
+    let address = connect_addr_for(listener.local_addr());
+    let server_resources = resources.clone();
+    let (server_established_tx, server_established_rx) = tokio::sync::oneshot::channel();
+    let server_task = tokio::spawn(async move {
+        let cm_id = listener.get_request().await.unwrap();
+        server_resources.require_context(&cm_id).unwrap();
+        let qp = server_resources
+            .create_qp(
+                &cm_id,
+                RdmaConnectionConfig::default().maximum_send_work_requests() as u32,
+                RdmaConnectionConfig::default().maximum_receive_work_requests() as u32,
+            )
+            .unwrap();
+        cm_id
+            .accept(&conn_param(&RdmaConnectionConfig::default()))
+            .unwrap();
+        listener.await_established().await.unwrap();
+        server_established_tx.send(()).unwrap();
+        loop {
+            let event = listener.next_event().await.unwrap();
+            let event_type = event.event_type();
+            event.ack();
+            if event_type == CmEventType::Disconnected {
+                break;
+            }
+        }
+        drop(qp);
+        drop(cm_id);
+        drop(listener);
+    });
+
+    let mut connect = Box::pin(engine.connect(address));
+    poll_fn(|cx| {
+        assert!(connect.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    tokio::time::timeout(Duration::from_secs(15), server_established_rx)
+        .await
+        .expect("server did not establish the undelivered client connection")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if engine.diagnostics().connections_opened == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("client connect did not reach EstablishedAwaitingDelivery");
+
+    let mut shutdown = Box::pin(engine.shutdown());
+    poll_fn(|cx| {
+        assert!(shutdown.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    assert_eq!(
+        engine.diagnostics().lifecycle,
+        RdmaEngineLifecycle::ShutdownRequested
+    );
+    drop(connect);
+
+    shutdown.await.unwrap();
+    driver_task.await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(15), server_task)
+        .await
+        .expect("server did not observe client CM destruction")
+        .unwrap();
+
+    let diagnostics = engine.diagnostics();
+    assert_eq!(diagnostics.lifecycle, RdmaEngineLifecycle::Terminated);
+    assert!(diagnostics.terminal_error.is_none());
+    assert_eq!(diagnostics.live_connection_reservations, 0);
+    assert_eq!(diagnostics.free_connection_slots, 1);
+    assert_eq!(diagnostics.retired_connection_slots, 0);
+    assert_eq!(diagnostics.connections_opened, 1);
+    assert_eq!(diagnostics.connections_failed, 0);
+
+    drop(resources);
+    drop(engine);
+    let events = recorder.take();
+    assert!(!recorder.overflowed());
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == DestructionKind::QueuePair)
+            .count(),
+        2
+    );
+    for kind in [
+        DestructionKind::ProtectionDomain,
+        DestructionKind::CompletionQueue,
+        DestructionKind::CmEventChannel,
+        DestructionKind::ContextFacade,
+        DestructionKind::RdmaFreeDevices,
+    ] {
+        assert!(
+            events.iter().any(|event| event.kind == kind),
+            "missing destruction evidence for {kind:?} in {mode:?}"
+        );
+    }
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == DestructionKind::CompletionChannel)
+            .count(),
+        usize::from(mode == CompletionMode::Readiness)
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == DestructionKind::IbvCloseDevice)
+    );
+    assert_eq!(
+        events.last().map(|event| event.kind),
+        Some(DestructionKind::RdmaFreeDevices)
+    );
+}
+
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn outbound_connect_and_operations_use_one_shared_engine_in_both_modes() {
     run_mode(CompletionMode::Readiness).await;
@@ -264,6 +411,12 @@ async fn outbound_connect_and_operations_use_one_shared_engine_in_both_modes() {
 async fn rejected_cm_event_fails_only_its_request_in_both_modes() {
     run_rejected_connect(CompletionMode::Readiness).await;
     run_rejected_connect(CompletionMode::Polling).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn shutdown_retires_an_established_connect_dropped_without_repolling_in_both_modes() {
+    run_shutdown_awaiting_delivery(CompletionMode::Readiness).await;
+    run_shutdown_awaiting_delivery(CompletionMode::Polling).await;
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]

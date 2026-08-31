@@ -17,8 +17,8 @@ use std::task::{Context, Poll};
 use futures_util::task::AtomicWaker;
 
 use super::connection::{
-    ConnectionReservation, ConnectionState, VerbsConnectionResources, WorkRequestPoster,
-    install_reserved_connection, reserve_connection,
+    ConnectionReservation, ConnectionState, SharedCmId, VerbsConnectionResources,
+    WorkRequestPoster, install_reserved_connection, reserve_connection,
 };
 use super::diagnostics::CmEventReject;
 use super::registry::{ConnectionToken, Lookup, PagedRegistry, RegistryToken, lock_unpoison};
@@ -69,6 +69,7 @@ pub(super) struct CmState {
     pending: Mutex<VecDeque<Arc<OutboundRequest>>>,
     cancellations: Mutex<VecDeque<Arc<OutboundRequest>>>,
     retirements: Mutex<VecDeque<ConnectionToken>>,
+    cm_destructions: Mutex<VecDeque<PendingCmDestruction>>,
     shutting_down: AtomicBool,
 }
 
@@ -80,6 +81,7 @@ impl CmState {
             pending: Mutex::new(VecDeque::new()),
             cancellations: Mutex::new(VecDeque::new()),
             retirements: Mutex::new(VecDeque::new()),
+            cm_destructions: Mutex::new(VecDeque::new()),
             shutting_down: AtomicBool::new(false),
         })
     }
@@ -88,8 +90,16 @@ impl CmState {
         lock_unpoison(&self.pending).push_back(request);
     }
 
+    fn defer_cm_id(&self, cm_id: CmId, resources: &EngineResources) {
+        lock_unpoison(&self.cm_destructions).push_back(PendingCmDestruction::Route(
+            SharedCmId::new(cm_id, Arc::clone(&resources.cm_event_channel)),
+        ));
+    }
+
     fn enqueue_cancellation(&self, request: Arc<OutboundRequest>) {
-        lock_unpoison(&self.cancellations).push_back(request);
+        if request.try_enqueue_cancellation() {
+            lock_unpoison(&self.cancellations).push_back(request);
+        }
     }
 
     pub(super) fn enqueue_retirement(&self, token: ConnectionToken) {
@@ -110,6 +120,7 @@ impl CmState {
         !lock_unpoison(&self.pending).is_empty()
             || !lock_unpoison(&self.cancellations).is_empty()
             || !lock_unpoison(&self.retirements).is_empty()
+            || !lock_unpoison(&self.cm_destructions).is_empty()
     }
 
     pub(super) fn service_software(
@@ -190,20 +201,19 @@ impl CmState {
             return;
         }
         let pending: Vec<_> = lock_unpoison(&self.pending).drain(..).collect();
+        for request in pending {
+            request.cancel(terminal_error(outcome));
+            drop(request.take_reservation());
+        }
         let requests: Vec<_> = self
             .routes
             .occupied_cloned()
             .into_iter()
             .filter_map(|route| route.request())
-            .chain(pending)
             .collect();
         for request in requests {
-            request.cancelled.store(true, Ordering::Release);
-            drop(request.take_reservation());
-            request.complete(match outcome.clone().into_result() {
-                Err(error) => Err(error),
-                Ok(()) => unreachable!("successful engine outcome was filtered"),
-            });
+            request.cancel(terminal_error(outcome));
+            self.enqueue_cancellation(request);
         }
     }
 
@@ -218,10 +228,34 @@ impl CmState {
             + lock_unpoison(&self.pending).len()
             + lock_unpoison(&self.cancellations).len()
             + lock_unpoison(&self.retirements).len()
+            + lock_unpoison(&self.cm_destructions).len()
     }
 
-    pub(super) fn route_count(&self) -> usize {
-        self.routes.live()
+    pub(super) fn retained_owner_count(&self) -> usize {
+        self.routes.live() + lock_unpoison(&self.cm_destructions).len()
+    }
+
+    pub(super) fn service_cm_destructions(
+        &self,
+        shared: &Arc<EngineShared>,
+        resources: &EngineResources,
+    ) -> Result<usize> {
+        let mut destroyed = 0;
+        while let Some(pending) = lock_unpoison(&self.cm_destructions).pop_front() {
+            if let Err(error) = drain_to_would_block(|| self.try_process_event(shared, resources)) {
+                lock_unpoison(&self.cm_destructions).push_front(pending);
+                return Err(error);
+            }
+            match pending {
+                PendingCmDestruction::Route(cm_id) => cm_id.destroy()?,
+                PendingCmDestruction::Connection { cm_id, connection } => {
+                    cm_id.destroy()?;
+                    self.finalize_connection_retirement(shared, connection)?;
+                }
+            }
+            destroyed += 1;
+        }
+        Ok(destroyed)
     }
 
     pub(super) fn terminalize(&self, outcome: &EngineOutcome) {
@@ -238,16 +272,13 @@ impl CmState {
             .collect();
         for request in requests {
             drop(request.take_reservation());
-            request.complete(match outcome.clone().into_result() {
-                Err(error) => Err(error),
-                Ok(()) => unreachable!("successful engine outcome was filtered"),
-            });
+            request.cancel(terminal_error(outcome));
         }
     }
 
     fn start_outbound(
         &self,
-        _shared: &Arc<EngineShared>,
+        shared: &Arc<EngineShared>,
         resources: &EngineResources,
         request: Arc<OutboundRequest>,
     ) -> Result<()> {
@@ -266,7 +297,7 @@ impl CmState {
             Ok(route) => route,
             Err(error) => {
                 drop(reservation);
-                request.complete(Err(error));
+                request.complete_failure(shared, error);
                 return Ok(());
             }
         };
@@ -281,21 +312,29 @@ impl CmState {
             Err(error) => {
                 self.routes.release(token, false);
                 drop(reservation);
-                request.complete(Err(error.into()));
+                request.complete_failure(shared, error.into());
                 return Ok(());
             }
         };
-        let context_token = cm_id.context_token().ok_or_else(|| {
-            Error::InvalidConfig("engine CM ID lost its route context token".into())
-        })?;
-        let context_route = CmRouteToken::decode(context_token);
-        if context_route != token {
-            drop(cm_id);
+        let Some(context_token) = cm_id.context_token() else {
+            self.defer_cm_id(cm_id, resources);
             self.routes.release(token, false);
             drop(reservation);
-            request.complete(Err(Error::InvalidConfig(
-                "engine CM context token did not match its route".into(),
-            )));
+            request.complete_failure(
+                shared,
+                Error::InvalidConfig("engine CM ID lost its route context token".into()),
+            );
+            return Ok(());
+        };
+        let context_route = CmRouteToken::decode(context_token);
+        if context_route != token {
+            self.defer_cm_id(cm_id, resources);
+            self.routes.release(token, false);
+            drop(reservation);
+            request.complete_failure(
+                shared,
+                Error::InvalidConfig("engine CM context token did not match its route".into()),
+            );
             return Ok(());
         }
         let context_key = cm_id.context_key();
@@ -304,12 +343,13 @@ impl CmState {
             let mut contexts = lock_unpoison(&self.context_routes);
             if contexts.insert(context_key, context_route).is_some() {
                 drop(contexts);
-                drop(cm_id);
+                self.defer_cm_id(cm_id, resources);
                 self.routes.release(token, false);
                 drop(reservation);
-                request.complete(Err(Error::InvalidConfig(
-                    "duplicate CM context identity".into(),
-                )));
+                request.complete_failure(
+                    shared,
+                    Error::InvalidConfig("duplicate CM context identity".into()),
+                );
                 return Ok(());
             }
         }
@@ -322,10 +362,10 @@ impl CmState {
                 reservation,
             }),
             Err(error) => {
-                drop(cm_id);
+                self.defer_cm_id(cm_id, resources);
                 self.retire_route(&route, false);
                 drop(reservation);
-                request.complete(Err(error.into()));
+                request.complete_failure(shared, error.into());
             }
         }
         Ok(())
@@ -399,8 +439,29 @@ impl CmState {
             return Ok(());
         }
         if let Some(encoded) = connection.outbound_route_token() {
-            self.retire_connection_route(encoded, &connection)?;
+            match self.retire_connection_route(encoded, &connection)? {
+                RouteRetirement::Complete => {}
+                RouteRetirement::Retry => {
+                    connection.retry_retirement();
+                    self.enqueue_retirement(token);
+                    return Ok(());
+                }
+            }
         }
+        let cm_id = connection.destroy_connection_resources();
+        if let Some(cm_id) = cm_id {
+            lock_unpoison(&self.cm_destructions)
+                .push_back(PendingCmDestruction::Connection { cm_id, connection });
+            return Ok(());
+        }
+        self.finalize_connection_retirement(shared, connection)
+    }
+
+    fn finalize_connection_retirement(
+        &self,
+        shared: &EngineShared,
+        connection: Arc<ConnectionState>,
+    ) -> Result<()> {
         let released = shared
             .connections
             .release(connection.token, connection.qp_num())
@@ -412,7 +473,6 @@ impl CmState {
                 "connection registry retired a mismatched generation".into(),
             ));
         }
-        connection.destroy_connection_resources();
         connection.release_admission();
         connection.finish_retirement();
         Ok(())
@@ -422,12 +482,12 @@ impl CmState {
         &self,
         encoded: u64,
         connection: &Arc<ConnectionState>,
-    ) -> Result<()> {
+    ) -> Result<RouteRetirement> {
         let token = CmRouteToken::decode(encoded);
         let route = match self.routes.lookup_cloned(token) {
             Lookup::Occupied(route) => route,
             Lookup::Duplicate | Lookup::Stale | Lookup::Unknown | Lookup::Retired => {
-                return Ok(());
+                return Ok(RouteRetirement::Complete);
             }
         };
         let state = route.take_state_if(|state| state.references_connection(connection.token));
@@ -442,13 +502,16 @@ impl CmState {
                 | OutboundState::Closing { .. },
             ) => {
                 self.retire_route(&route, true);
-                Ok(())
+                Ok(RouteRetirement::Complete)
             }
             Some(state) => {
                 route.set_state(state);
                 Err(Error::InvalidConfig(
                     "connection route was not established during retirement".into(),
                 ))
+            }
+            None if matches!(&*lock_unpoison(&route.state), OutboundState::Transitioning) => {
+                Ok(RouteRetirement::Retry)
             }
             None => Err(Error::InvalidConfig(
                 "connection route generation did not match retirement".into(),
@@ -487,7 +550,7 @@ impl CmState {
         snapshot: CmEventSnapshot,
     ) -> Result<EventDisposition> {
         if is_failure_event(snapshot.event_type) || snapshot.status != 0 {
-            return self.handle_failure_event(shared, route, snapshot);
+            return self.handle_failure_event(shared, resources, route, snapshot);
         }
         match snapshot.event_type {
             CmEventType::AddrResolved => self.handle_addr_resolved(shared, resources, route),
@@ -522,17 +585,17 @@ impl CmState {
         if request.cancelled.load(Ordering::Acquire)
             || shared.shutdown_requested.load(Ordering::Acquire)
         {
-            drop(cm_id);
+            self.defer_cm_id(cm_id, resources);
             drop(reservation);
             self.retire_route(route, true);
             request.complete(Err(Error::DriverShutdown));
             return Ok(EventDisposition::Handled);
         }
         if let Err(error) = cm_id.require_context(resources.context.inner()) {
-            drop(cm_id);
+            self.defer_cm_id(cm_id, resources);
             drop(reservation);
             self.retire_route(route, true);
-            request.complete(Err(error.into()));
+            request.complete_failure(shared, error.into());
             return Ok(EventDisposition::Handled);
         }
         match cm_id.resolve_route(2_000) {
@@ -542,10 +605,10 @@ impl CmState {
                 reservation,
             }),
             Err(error) => {
-                drop(cm_id);
+                self.defer_cm_id(cm_id, resources);
                 drop(reservation);
                 self.retire_route(route, true);
-                request.complete(Err(error.into()));
+                request.complete_failure(shared, error.into());
             }
         }
         Ok(EventDisposition::Handled)
@@ -568,17 +631,17 @@ impl CmState {
         if request.cancelled.load(Ordering::Acquire)
             || shared.shutdown_requested.load(Ordering::Acquire)
         {
-            drop(cm_id);
+            self.defer_cm_id(cm_id, resources);
             drop(reservation);
             self.retire_route(route, true);
             request.complete(Err(Error::DriverShutdown));
             return Ok(EventDisposition::Handled);
         }
         if let Err(error) = cm_id.require_context(resources.context.inner()) {
-            drop(cm_id);
+            self.defer_cm_id(cm_id, resources);
             drop(reservation);
             self.retire_route(route, true);
-            request.complete(Err(error.into()));
+            request.complete_failure(shared, error.into());
             return Ok(EventDisposition::Handled);
         }
 
@@ -587,10 +650,10 @@ impl CmState {
         let qp = match build_qp(resources, &cm_id, &request.config) {
             Ok(qp) => qp,
             Err(error) => {
-                drop(cm_id);
+                self.defer_cm_id(cm_id, resources);
                 drop(reservation);
                 self.retire_route(route, true);
-                request.complete(Err(error));
+                request.complete_failure(shared, error);
                 return Ok(EventDisposition::Handled);
             }
         };
@@ -613,7 +676,7 @@ impl CmState {
                 verbs.destroy_qp();
                 drop(verbs);
                 self.retire_route(route, true);
-                request.complete(Err(error));
+                request.complete_failure(shared, error);
                 return Ok(EventDisposition::Handled);
             }
         };
@@ -695,7 +758,11 @@ impl CmState {
         if connection_state.accepted_count() == 0 {
             self.retire_registered_connection(shared, connection_state.token)?;
         }
-        request.complete(Err(error));
+        if matches!(&error, Error::DriverShutdown) {
+            request.complete(Err(error));
+        } else {
+            request.complete_failure(shared, error);
+        }
         Ok(())
     }
 
@@ -790,6 +857,7 @@ impl CmState {
     fn handle_failure_event(
         &self,
         shared: &Arc<EngineShared>,
+        resources: &EngineResources,
         route: &Arc<OutboundRoute>,
         snapshot: CmEventSnapshot,
     ) -> Result<EventDisposition> {
@@ -812,10 +880,10 @@ impl CmState {
                 request,
                 reservation,
             } => {
-                drop(cm_id);
+                self.defer_cm_id(cm_id, resources);
                 drop(reservation);
                 self.retire_route(route, true);
-                request.complete(Err(Error::Verbs(std::io::Error::other(message))));
+                request.complete_failure(shared, Error::Verbs(std::io::Error::other(message)));
             }
             OutboundState::AwaitEstablished {
                 request,
@@ -837,6 +905,7 @@ impl CmState {
                 request,
                 connection,
             } => {
+                request.record_failure(shared);
                 let Some(connection_state) = connection.upgrade() else {
                     self.retire_route(route, true);
                     return Ok(EventDisposition::Handled);
@@ -859,6 +928,10 @@ impl CmState {
             }
             OutboundState::Established { connection }
             | OutboundState::Disconnected { connection } => {
+                shared
+                    .diagnostic_counters
+                    .connections_failed
+                    .fetch_add(1, Ordering::Relaxed);
                 let Some(connection_state) = connection.upgrade() else {
                     self.retire_route(route, true);
                     return Ok(EventDisposition::Handled);
@@ -896,10 +969,6 @@ impl CmState {
                 ));
             }
         }
-        shared
-            .diagnostic_counters
-            .connections_failed
-            .fetch_add(1, Ordering::Relaxed);
         Ok(EventDisposition::Handled)
     }
 
@@ -936,7 +1005,7 @@ pub(super) async fn connect_with_setup(
     ConnectWaiter {
         shared,
         request,
-        delivered: false,
+        finished: false,
     }
     .await
 }
@@ -1029,6 +1098,13 @@ fn is_failure_event(event: CmEventType) -> bool {
     )
 }
 
+fn terminal_error(outcome: &EngineOutcome) -> Error {
+    match outcome.clone().into_result() {
+        Err(error) => error,
+        Ok(()) => unreachable!("successful engine outcome was filtered"),
+    }
+}
+
 #[derive(Clone, Copy)]
 struct CmEventSnapshot {
     event_type: CmEventType,
@@ -1041,6 +1117,27 @@ struct CmEventSnapshot {
 enum EventDisposition {
     Handled,
     Rejected(CmEventReject),
+}
+
+enum RouteRetirement {
+    Complete,
+    Retry,
+}
+
+enum PendingCmDestruction {
+    Route(SharedCmId),
+    Connection {
+        cm_id: SharedCmId,
+        connection: Arc<ConnectionState>,
+    },
+}
+
+fn drain_to_would_block(mut try_process_event: impl FnMut() -> Result<bool>) -> Result<usize> {
+    let mut drained = 0;
+    while try_process_event()? {
+        drained += 1;
+    }
+    Ok(drained)
 }
 
 struct OutboundRoute {
@@ -1236,9 +1333,10 @@ struct OutboundRequest {
     config: RdmaConnectionConfig,
     setup: Mutex<Option<Box<dyn PreEstablishSetup>>>,
     reservation: Mutex<Option<ConnectionReservation>>,
-    result: Mutex<Option<Result<RdmaConnection>>>,
-    result_set: AtomicBool,
+    result: Mutex<OutboundResult>,
     cancelled: AtomicBool,
+    cancellation_enqueued: AtomicBool,
+    failure_counted: AtomicBool,
     delivered: AtomicBool,
     route_token: AtomicU64,
     waker: AtomicWaker,
@@ -1256,9 +1354,10 @@ impl OutboundRequest {
             config,
             setup: Mutex::new(Some(setup)),
             reservation: Mutex::new(Some(reservation)),
-            result: Mutex::new(None),
-            result_set: AtomicBool::new(false),
+            result: Mutex::new(OutboundResult::Pending),
             cancelled: AtomicBool::new(false),
+            cancellation_enqueued: AtomicBool::new(false),
+            failure_counted: AtomicBool::new(false),
             delivered: AtomicBool::new(false),
             route_token: AtomicU64::new(0),
             waker: AtomicWaker::new(),
@@ -1274,22 +1373,75 @@ impl OutboundRequest {
     }
 
     fn complete(&self, result: Result<RdmaConnection>) {
-        if self.result_set.swap(true, Ordering::AcqRel) {
-            return;
+        let mut current = lock_unpoison(&self.result);
+        if matches!(&*current, OutboundResult::Pending) {
+            *current = OutboundResult::Ready(result);
+            drop(current);
+            self.waker.wake();
         }
-        *lock_unpoison(&self.result) = Some(result);
-        self.waker.wake();
+    }
+
+    fn complete_failure(&self, shared: &EngineShared, error: Error) {
+        self.record_failure(shared);
+        self.complete(Err(error));
+    }
+
+    fn record_failure(&self, shared: &EngineShared) {
+        if !self.failure_counted.swap(true, Ordering::AcqRel) {
+            shared
+                .diagnostic_counters
+                .connections_failed
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn take_result(&self) -> Option<Result<RdmaConnection>> {
-        lock_unpoison(&self.result).take()
+        let mut current = lock_unpoison(&self.result);
+        match std::mem::replace(&mut *current, OutboundResult::Taken) {
+            OutboundResult::Ready(result) => Some(result),
+            OutboundResult::Pending => {
+                *current = OutboundResult::Pending;
+                None
+            }
+            OutboundResult::Taken => None,
+        }
     }
+
+    fn cancel(&self, error: Error) {
+        self.cancelled.store(true, Ordering::Release);
+        let mut current = lock_unpoison(&self.result);
+        let (replacement, undelivered) =
+            match std::mem::replace(&mut *current, OutboundResult::Taken) {
+                OutboundResult::Pending => (OutboundResult::Ready(Err(error)), None),
+                OutboundResult::Ready(Ok(connection)) => {
+                    (OutboundResult::Ready(Err(error)), Some(connection))
+                }
+                OutboundResult::Ready(Err(existing)) => {
+                    (OutboundResult::Ready(Err(existing)), None)
+                }
+                OutboundResult::Taken => (OutboundResult::Taken, None),
+            };
+        *current = replacement;
+        drop(current);
+        drop(undelivered);
+        self.waker.wake();
+    }
+
+    fn try_enqueue_cancellation(&self) -> bool {
+        !self.cancellation_enqueued.swap(true, Ordering::AcqRel)
+    }
+}
+
+enum OutboundResult {
+    Pending,
+    Ready(Result<RdmaConnection>),
+    Taken,
 }
 
 struct ConnectWaiter {
     shared: Arc<EngineShared>,
     request: Arc<OutboundRequest>,
-    delivered: bool,
+    finished: bool,
 }
 
 impl Future for ConnectWaiter {
@@ -1297,16 +1449,20 @@ impl Future for ConnectWaiter {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if let Some(result) = self.request.take_result() {
-            self.request.delivered.store(true, Ordering::Release);
-            self.shared.cm.mark_request_delivered(&self.request);
-            self.delivered = true;
+            if result.is_ok() {
+                self.request.delivered.store(true, Ordering::Release);
+                self.shared.cm.mark_request_delivered(&self.request);
+            }
+            self.finished = true;
             return Poll::Ready(result);
         }
         self.request.waker.register(cx.waker());
         if let Some(result) = self.request.take_result() {
-            self.request.delivered.store(true, Ordering::Release);
-            self.shared.cm.mark_request_delivered(&self.request);
-            self.delivered = true;
+            if result.is_ok() {
+                self.request.delivered.store(true, Ordering::Release);
+                self.shared.cm.mark_request_delivered(&self.request);
+            }
+            self.finished = true;
             return Poll::Ready(result);
         }
         Poll::Pending
@@ -1315,9 +1471,10 @@ impl Future for ConnectWaiter {
 
 impl Drop for ConnectWaiter {
     fn drop(&mut self) {
-        if self.delivered || self.request.cancelled.swap(true, Ordering::AcqRel) {
+        if self.finished {
             return;
         }
+        self.request.cancel(Error::DriverShutdown);
         self.shared
             .cm
             .enqueue_cancellation(Arc::clone(&self.request));
@@ -1532,7 +1689,7 @@ mod tests {
         let mut waiter = Box::pin(ConnectWaiter {
             shared: Arc::clone(&engine.shared),
             request,
-            delivered: false,
+            finished: false,
         });
         let waker = futures_util::task::noop_waker();
         let mut context = Context::from_waker(&waker);
@@ -1557,6 +1714,152 @@ mod tests {
 
         engine.shared.cm.retire_route(&route, true);
         drop(connection);
+        drop(engine);
+        drop(driver);
+    }
+
+    #[test]
+    fn shutdown_replaces_an_undelivered_success_and_enqueues_route_cleanup() {
+        let (engine, driver) =
+            super::super::test_engine_pair(super::super::CompletionMode::Polling);
+        let connection = install_connection(
+            &engine.shared,
+            Arc::new(NoopPoster(12)),
+            RdmaConnectionConfig::default()
+                .max_send_wr(1)
+                .max_recv_wr(1),
+            None,
+            None,
+        )
+        .unwrap();
+        let request = Arc::new(test_request());
+        let (_, route) = engine
+            .shared
+            .cm
+            .routes
+            .allocate_with(|token| Arc::new(OutboundRoute::new(token, Arc::clone(&request))))
+            .unwrap();
+        route.set_state(OutboundState::EstablishedAwaitingDelivery {
+            request: Arc::clone(&request),
+            connection: EstablishedConnectionRoute::new(&connection.state),
+        });
+        request.complete(Ok(connection));
+
+        engine.shared.cm.begin_shutdown(&EngineOutcome::Failure(
+            super::super::EngineFailure::DriverShutdown,
+        ));
+
+        assert!(matches!(
+            request.take_result(),
+            Some(Err(Error::DriverShutdown))
+        ));
+        assert_eq!(lock_unpoison(&engine.shared.cm.cancellations).len(), 1);
+
+        engine.shared.cm.retire_route(&route, true);
+        drop(engine);
+        drop(driver);
+    }
+
+    #[test]
+    fn a_transitioning_route_resets_the_retirement_latch_and_retries() {
+        let (engine, driver) =
+            super::super::test_engine_pair(super::super::CompletionMode::Polling);
+        let request = Arc::new(test_request());
+        let (route_token, route) = engine
+            .shared
+            .cm
+            .routes
+            .allocate_with(|token| Arc::new(OutboundRoute::new(token, Arc::clone(&request))))
+            .unwrap();
+        let reservation = reserve_connection(&engine.shared).unwrap();
+        let connection = install_reserved_connection(
+            &engine.shared,
+            Arc::new(NoopPoster(13)),
+            RdmaConnectionConfig::default()
+                .max_send_wr(1)
+                .max_recv_wr(1),
+            None,
+            None,
+            reservation,
+            Some(route_token.encode()),
+        )
+        .unwrap();
+
+        engine
+            .shared
+            .cm
+            .retire_registered_connection(&engine.shared, connection.state.token)
+            .unwrap();
+        assert_eq!(lock_unpoison(&engine.shared.cm.retirements).len(), 1);
+        assert!(!connection.state.is_retired());
+
+        route.set_state(OutboundState::Closing {
+            connection: EstablishedConnectionRoute::new(&connection.state),
+        });
+        let token = lock_unpoison(&engine.shared.cm.retirements)
+            .pop_front()
+            .unwrap();
+        engine
+            .shared
+            .cm
+            .retire_registered_connection(&engine.shared, token)
+            .unwrap();
+        assert!(connection.state.is_retired());
+        assert!(matches!(
+            engine.shared.connections.lookup(connection.state.token),
+            Lookup::Duplicate
+        ));
+
+        drop(connection);
+        drop(request);
+        drop(engine);
+        drop(driver);
+    }
+
+    #[test]
+    fn cm_destroy_barrier_routes_target_and_peer_events_to_would_block() {
+        let mut pending = VecDeque::from(["target", "peer"]);
+        let mut routed = Vec::new();
+        let mut probes = 0;
+
+        let drained = drain_to_would_block(|| {
+            probes += 1;
+            let Some(event) = pending.pop_front() else {
+                return Ok(false);
+            };
+            routed.push(event);
+            Ok(true)
+        })
+        .unwrap();
+
+        assert_eq!(drained, 2);
+        assert_eq!(probes, 3);
+        assert_eq!(routed, ["target", "peer"]);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn request_failures_are_counted_once_but_shutdown_cancellation_is_not() {
+        let (engine, driver) =
+            super::super::test_engine_pair(super::super::CompletionMode::Polling);
+        let failed = test_request();
+        failed.complete_failure(&engine.shared, Error::InvalidConfig("first failure".into()));
+        failed.complete_failure(
+            &engine.shared,
+            Error::InvalidConfig("duplicate failure".into()),
+        );
+        let cancelled = test_request();
+        cancelled.cancel(Error::DriverShutdown);
+
+        assert_eq!(
+            engine
+                .shared
+                .diagnostic_counters
+                .connections_failed
+                .load(Ordering::Acquire),
+            1
+        );
+
         drop(engine);
         drop(driver);
     }

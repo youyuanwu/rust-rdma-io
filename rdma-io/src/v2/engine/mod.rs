@@ -511,7 +511,7 @@ impl EngineShared {
     }
 
     fn retain_after_failure(shared: &Arc<Self>) {
-        if (shared.unsafe_outstanding_operations() == 0 && shared.cm.route_count() == 0)
+        if (shared.unsafe_outstanding_operations() == 0 && shared.cm.retained_owner_count() == 0)
             || shared.failure_retained.swap(true, Ordering::AcqRel)
         {
             return;

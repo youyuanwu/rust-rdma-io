@@ -298,24 +298,35 @@ unsafe impl Sync for CmId {}
 
 impl Drop for CmId {
     fn drop(&mut self) {
-        if self.owned {
-            #[cfg(any(test, feature = "test-hooks"))]
-            crate::test_support::destruction::record(
-                crate::test_support::destruction::DestructionKind::CmId,
-                self.inner as usize,
-            );
-            let ret = unsafe { rdma_destroy_id(self.inner) };
-            if ret != 0 {
-                tracing::error!(
-                    "rdma_destroy_id failed: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
+        if let Err(error) = self.destroy_once() {
+            tracing::error!("rdma_destroy_id failed: {error}");
         }
     }
 }
 
 impl CmId {
+    fn destroy_once(&mut self) -> Result<()> {
+        if !self.owned {
+            return Ok(());
+        }
+        self.owned = false;
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::test_support::destruction::record(
+            crate::test_support::destruction::DestructionKind::CmId,
+            self.inner as usize,
+        );
+        from_ret_errno(unsafe { rdma_destroy_id(self.inner) })
+    }
+
+    /// Consume and synchronously destroy this CM ID exactly once.
+    ///
+    /// Shared-channel callers must drain and acknowledge pending events through
+    /// their normal router immediately before invoking this method.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn destroy(mut self) -> Result<()> {
+        self.destroy_once()
+    }
+
     /// Create a new CM ID on the given event channel.
     pub fn new(channel: &EventChannel, port_space: PortSpace) -> Result<Self> {
         let mut id: *mut rdma_cm_id = std::ptr::null_mut();

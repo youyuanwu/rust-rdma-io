@@ -289,8 +289,13 @@ impl RdmaEngineDriver {
             CompletionMode::Polling => 0,
         };
         processed += readiness_processed;
+        processed = processed.saturating_add(
+            self.shared
+                .cm
+                .service_cm_destructions(&self.shared, resources)?,
+        );
 
-        if processed == budget || self.shared.cm.has_software_work() {
+        if processed >= budget || self.shared.cm.has_software_work() {
             self.scheduler.mark_class_ready(WorkClass::Cm);
         }
         Ok(processed > 0)
@@ -496,8 +501,8 @@ impl Drop for RdmaEngineDriver {
                 .accepted_operations
                 .load(std::sync::atomic::Ordering::Acquire);
             let outstanding = test_outstanding + production;
-            let cm_routes = self.shared.cm.route_count();
-            let failure = if outstanding == 0 && cm_routes == 0 {
+            let cm_owners = self.shared.cm.retained_owner_count();
+            let failure = if outstanding == 0 && cm_owners == 0 {
                 EngineFailure::DriverShutdown
             } else {
                 #[cfg(any(test, feature = "test-hooks"))]
@@ -505,7 +510,7 @@ impl Drop for RdmaEngineDriver {
                 #[cfg(not(any(test, feature = "test-hooks")))]
                 let test_bundles = 0;
                 EngineFailure::Wedged {
-                    retained_bundles: (self.shared.retained_bundle_count().max(cm_routes)
+                    retained_bundles: (self.shared.retained_bundle_count().max(cm_owners)
                         + test_bundles)
                         .max(1),
                     outstanding_operations: outstanding,
