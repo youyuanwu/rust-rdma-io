@@ -570,7 +570,8 @@ pub(super) mod test_api {
     use std::any::Any;
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-    use std::sync::{Arc, Mutex, OnceLock, Weak};
+    use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+    use std::time::Duration;
 
     use tokio::sync::Notify;
 
@@ -628,10 +629,36 @@ pub(super) mod test_api {
         active: bool,
     }
 
+    /// Controller for one deterministic engine-admission shutdown race.
+    #[doc(hidden)]
+    pub struct TestAdmissionBarrier {
+        shared: Weak<EngineShared>,
+        point: AdmissionPausePoint,
+        active: bool,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(in crate::v2::engine) enum AdmissionPausePoint {
+        ConnectBeforeEnqueue,
+        OperationBeforeRegister,
+    }
+
     #[derive(Clone, Copy)]
     enum CqArmRacePoint {
         BeforeArm,
         AfterArm,
+    }
+
+    struct AdmissionBarrierState {
+        control: Mutex<Option<AdmissionControl>>,
+        changed: Condvar,
+    }
+
+    struct AdmissionControl {
+        point: AdmissionPausePoint,
+        paused: bool,
+        shutdown_attempted: bool,
+        released: bool,
     }
 
     /// Non-clonable test QP that must be consumed by route installation.
@@ -724,7 +751,7 @@ pub(super) mod test_api {
 
         /// Explicitly transition an installed Phase 3 connection to QP ERR.
         pub fn transition_connection_to_error(&self, connection: &RdmaConnection) -> Result<()> {
-            let shared = self.ensure_active()?;
+            let shared = self.ensure_not_terminal()?;
             if !Arc::ptr_eq(&shared, &connection.shared) {
                 return Err(Error::InvalidConfig(
                     "connection belongs to another engine".into(),
@@ -773,12 +800,76 @@ pub(super) mod test_api {
             })
         }
 
+        /// Pause the next accepted connect after its shutdown check and before
+        /// its request becomes visible to the driver.
+        pub fn pause_next_connect_before_enqueue(&self) -> Result<TestAdmissionBarrier> {
+            self.pause_next_admission(AdmissionPausePoint::ConnectBeforeEnqueue)
+        }
+
+        /// Pause the next accepted operation after its shutdown check and
+        /// before operation registration and provider posting.
+        pub fn pause_next_operation_before_register(&self) -> Result<TestAdmissionBarrier> {
+            self.pause_next_admission(AdmissionPausePoint::OperationBeforeRegister)
+        }
+
+        fn pause_next_admission(&self, point: AdmissionPausePoint) -> Result<TestAdmissionBarrier> {
+            let shared = self.ensure_active()?;
+            shared.test_driver.start_admission_control(point)?;
+            Ok(TestAdmissionBarrier {
+                shared: Arc::downgrade(&shared),
+                point,
+                active: true,
+            })
+        }
+
         fn ensure_active(&self) -> Result<Arc<EngineShared>> {
             let shared = self.shared.upgrade().ok_or(Error::DriverShutdown)?;
             if shared.outcome().is_some() || shared.shutdown_requested.load(Ordering::Acquire) {
                 return Err(Error::DriverShutdown);
             }
             Ok(shared)
+        }
+
+        fn ensure_not_terminal(&self) -> Result<Arc<EngineShared>> {
+            let shared = self.shared.upgrade().ok_or(Error::DriverShutdown)?;
+            if shared.outcome().is_some() {
+                return Err(Error::DriverShutdown);
+            }
+            Ok(shared)
+        }
+    }
+
+    impl TestAdmissionBarrier {
+        /// Wait until the accepted request is paused while holding admission.
+        pub fn wait_until_paused(&self) -> Result<()> {
+            let shared = self.shared.upgrade().ok_or(Error::DriverShutdown)?;
+            shared.test_driver.wait_for_admission(self.point, false)
+        }
+
+        /// Wait until shutdown has reached the admission write barrier.
+        pub fn wait_until_shutdown_attempted(&self) -> Result<()> {
+            let shared = self.shared.upgrade().ok_or(Error::DriverShutdown)?;
+            shared.test_driver.wait_for_admission(self.point, true)
+        }
+
+        /// Release the accepted request to publish or post before shutdown.
+        pub fn release(mut self) -> Result<()> {
+            let shared = self.shared.upgrade().ok_or(Error::DriverShutdown)?;
+            shared.test_driver.release_admission(self.point)?;
+            self.active = false;
+            Ok(())
+        }
+    }
+
+    impl Drop for TestAdmissionBarrier {
+        fn drop(&mut self) {
+            if !self.active {
+                return;
+            }
+            if let Some(shared) = self.shared.upgrade() {
+                shared.test_driver.stop_admission_control(self.point);
+            }
+            self.active = false;
         }
     }
 
@@ -1008,6 +1099,7 @@ pub(super) mod test_api {
         cq_arm_controlled: AtomicBool,
         cq_arm_paused: AtomicU64,
         cq_arm_notify: Notify,
+        admission_barrier: AdmissionBarrierState,
     }
 
     impl TestDriverState {
@@ -1022,6 +1114,161 @@ pub(super) mod test_api {
                 cq_arm_controlled: AtomicBool::new(false),
                 cq_arm_paused: AtomicU64::new(0),
                 cq_arm_notify: Notify::new(),
+                admission_barrier: AdmissionBarrierState {
+                    control: Mutex::new(None),
+                    changed: Condvar::new(),
+                },
+            }
+        }
+
+        pub(in crate::v2::engine) fn pause_admission(&self, point: AdmissionPausePoint) {
+            let mut control = self
+                .admission_barrier
+                .control
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let Some(active) = control.as_mut() else {
+                return;
+            };
+            if active.point != point || active.released {
+                return;
+            }
+            active.paused = true;
+            self.admission_barrier.changed.notify_all();
+            while control
+                .as_ref()
+                .is_some_and(|active| active.point == point && !active.released)
+            {
+                control = self
+                    .admission_barrier
+                    .changed
+                    .wait(control)
+                    .unwrap_or_else(|error| error.into_inner());
+            }
+            if control
+                .as_ref()
+                .is_some_and(|active| active.point == point && active.released)
+            {
+                *control = None;
+                self.admission_barrier.changed.notify_all();
+            }
+        }
+
+        pub(in crate::v2::engine) fn record_shutdown_attempt(&self) {
+            let mut control = self
+                .admission_barrier
+                .control
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let Some(active) = control.as_mut() else {
+                return;
+            };
+            if active.paused && !active.released {
+                active.shutdown_attempted = true;
+                self.admission_barrier.changed.notify_all();
+            }
+        }
+
+        fn start_admission_control(&self, point: AdmissionPausePoint) -> Result<()> {
+            let mut control = self
+                .admission_barrier
+                .control
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if control.is_some() {
+                return Err(Error::InvalidConfig(
+                    "engine admission barrier is already active".into(),
+                ));
+            }
+            *control = Some(AdmissionControl {
+                point,
+                paused: false,
+                shutdown_attempted: false,
+                released: false,
+            });
+            Ok(())
+        }
+
+        fn wait_for_admission(
+            &self,
+            point: AdmissionPausePoint,
+            shutdown_attempted: bool,
+        ) -> Result<()> {
+            let mut control = self
+                .admission_barrier
+                .control
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            loop {
+                match control.as_ref() {
+                    Some(active)
+                        if active.point == point
+                            && active.paused
+                            && (!shutdown_attempted || active.shutdown_attempted) =>
+                    {
+                        return Ok(());
+                    }
+                    Some(active) if active.point != point || active.released => {
+                        return Err(Error::InvalidConfig(
+                            "engine admission barrier changed before observation".into(),
+                        ));
+                    }
+                    None => {
+                        return Err(Error::InvalidConfig(
+                            "engine admission barrier is not active".into(),
+                        ));
+                    }
+                    Some(_) => {}
+                }
+                let (next, timeout) = self
+                    .admission_barrier
+                    .changed
+                    .wait_timeout(control, Duration::from_secs(10))
+                    .unwrap_or_else(|error| error.into_inner());
+                control = next;
+                if timeout.timed_out() {
+                    return Err(Error::InvalidConfig(
+                        "timed out waiting for engine admission barrier".into(),
+                    ));
+                }
+            }
+        }
+
+        fn release_admission(&self, point: AdmissionPausePoint) -> Result<()> {
+            let mut control = self
+                .admission_barrier
+                .control
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let Some(active) = control.as_mut() else {
+                return Err(Error::InvalidConfig(
+                    "engine admission barrier is not active".into(),
+                ));
+            };
+            if active.point != point || !active.paused {
+                return Err(Error::InvalidConfig(
+                    "engine admission barrier is not paused at the requested point".into(),
+                ));
+            }
+            active.released = true;
+            self.admission_barrier.changed.notify_all();
+            Ok(())
+        }
+
+        fn stop_admission_control(&self, point: AdmissionPausePoint) {
+            let mut control = self
+                .admission_barrier
+                .control
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(active) = control.as_mut()
+                && active.point == point
+            {
+                active.released = true;
+                self.admission_barrier.changed.notify_all();
+                if !active.paused {
+                    *control = None;
+                }
             }
         }
 
@@ -1358,8 +1605,8 @@ pub(super) mod test_api {
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub use test_api::{
-    TestAcceptedOperation, TestConnectionIdentity, TestCqArmWindowControl, TestCqeSuppression,
-    TestEngineQp, TestEngineResources, TestRouteHandle,
+    TestAcceptedOperation, TestAdmissionBarrier, TestConnectionIdentity, TestCqArmWindowControl,
+    TestCqeSuppression, TestEngineQp, TestEngineResources, TestRouteHandle,
 };
 
 #[cfg(test)]

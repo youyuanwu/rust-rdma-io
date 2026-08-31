@@ -652,12 +652,14 @@ fn start_operation(
         Ok(validated) => validated,
         Err(error) => return StartResult::Immediate((Err(error), Some(mr))),
     };
-    {
-        let _admission = read_unpoison(&shared.admission);
-        if let Some(error) = shared.admission_error() {
-            return StartResult::Immediate((Err(error), Some(mr)));
-        }
+    let admission = read_unpoison(&shared.admission);
+    if let Some(error) = shared.admission_error() {
+        return StartResult::Immediate((Err(error), Some(mr)));
     }
+    #[cfg(any(test, feature = "test-hooks"))]
+    shared
+        .test_driver
+        .pause_admission(super::driver::test_api::AdmissionPausePoint::OperationBeforeRegister);
     let _posting = match connection.begin_posting() {
         Ok(posting) => posting,
         Err(error) => return StartResult::Immediate((Err(error), Some(mr))),
@@ -719,6 +721,7 @@ fn start_operation(
             BatchWrAccounting::from_outcome(1, &BatchPostOutcome::AllAccepted).record(shared);
             shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
             let early = state.commit_accepted();
+            drop(admission);
             if let Some(completion) = early {
                 shared.finish_operation(Arc::clone(&state), completion);
             }
@@ -737,6 +740,7 @@ fn start_operation(
                 BatchWrAccounting::ambiguous(1).record(shared);
                 shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
                 state.commit_accepted();
+                drop(admission);
                 shared.finish_operation(Arc::clone(&state), completion);
                 StartResult::InFlight(state)
             } else {
@@ -752,6 +756,7 @@ fn start_operation(
             BatchWrAccounting::ambiguous(1).record(shared);
             shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
             let early = state.commit_accepted();
+            drop(admission);
             if let Some(completion) = early {
                 shared.finish_operation(Arc::clone(&state), completion);
                 StartResult::InFlight(state)

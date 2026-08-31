@@ -1,5 +1,6 @@
 use std::future::{Future, poll_fn};
-use std::task::Poll;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use rdma_io::cm::{CmEventType, ConnParam, RdmaCmDeviceList};
@@ -27,6 +28,12 @@ fn conn_param(config: &RdmaConnectionConfig) -> ConnParam {
         retry_count: config.retry_count_value() as u8,
         rnr_retry_count: config.rnr_retry_count_value() as u8,
     }
+}
+
+fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
+    let waker = futures_util::task::noop_waker();
+    let mut context = Context::from_waker(&waker);
+    future.poll(&mut context)
 }
 
 async fn wait_until(
@@ -547,6 +554,215 @@ async fn run_shutdown_awaiting_delivery(mode: CompletionMode) {
     );
 }
 
+async fn run_connect_admission_shutdown_barrier(mode: CompletionMode) {
+    if !has_software_rdma() {
+        return;
+    }
+    const OPERATIONS: usize = 64;
+
+    let device = software_device_name().expect("software RDMA device");
+    let (engine, driver) = RdmaEngineBuilder::new(device)
+        .completion_mode(mode)
+        .maximum_live_connections(1)
+        .maximum_inflight_operations(OPERATIONS)
+        .cq_capacity(OPERATIONS)
+        .build()
+        .unwrap();
+    let resources = engine.test_resources().unwrap();
+    let barrier = resources.pause_next_connect_before_enqueue().unwrap();
+    let connect_engine = engine.clone();
+    let connect_thread = std::thread::spawn(move || {
+        let mut connect =
+            Box::pin(async move { connect_engine.connect("127.0.0.1:9".parse().unwrap()).await });
+        assert!(poll_once(connect.as_mut()).is_pending());
+        connect
+    });
+
+    barrier.wait_until_paused().unwrap();
+    let paused = engine.diagnostics();
+    assert_ne!(paused.lifecycle, RdmaEngineLifecycle::ShutdownRequested);
+    assert_eq!(paused.live_connection_reservations, 1);
+    assert_eq!(paused.free_connection_slots, 1);
+    assert_eq!(paused.registered_operations, 0);
+    assert_eq!(paused.free_operation_slots, OPERATIONS);
+    assert_eq!(paused.free_cq_credits, OPERATIONS);
+
+    let shutdown_engine = engine.clone();
+    let shutdown_thread = std::thread::spawn(move || {
+        let mut shutdown = Box::pin(async move { shutdown_engine.shutdown().await });
+        assert!(poll_once(shutdown.as_mut()).is_pending());
+        shutdown
+    });
+    barrier.wait_until_shutdown_attempted().unwrap();
+    barrier.release().unwrap();
+
+    let mut connect = connect_thread.join().expect("connect poll thread panicked");
+    let mut shutdown = shutdown_thread
+        .join()
+        .expect("shutdown poll thread panicked");
+    let admitted = engine.diagnostics();
+    assert_eq!(admitted.lifecycle, RdmaEngineLifecycle::ShutdownRequested);
+    assert_eq!(admitted.live_connection_reservations, 1);
+    assert_eq!(admitted.free_connection_slots, 1);
+
+    let driver_task = tokio::spawn(driver);
+    let (connect_result, shutdown_result) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(connect.as_mut(), shutdown.as_mut())
+    })
+    .await
+    .expect("connect admission shutdown barrier did not drain");
+    assert!(matches!(connect_result, Err(Error::DriverShutdown)));
+    shutdown_result.unwrap();
+    driver_task.await.unwrap().unwrap();
+
+    let diagnostics = engine.diagnostics();
+    assert_eq!(diagnostics.lifecycle, RdmaEngineLifecycle::Terminated);
+    assert!(diagnostics.terminal_error.is_none());
+    assert_eq!(diagnostics.live_connection_reservations, 0);
+    assert_eq!(diagnostics.free_connection_slots, 1);
+    assert_eq!(diagnostics.registered_operations, 0);
+    assert_eq!(diagnostics.free_operation_slots, OPERATIONS);
+    assert_eq!(diagnostics.accepted_outstanding_operations, 0);
+    assert_eq!(diagnostics.free_cq_credits, OPERATIONS);
+    assert_eq!(diagnostics.retained_cq_credits, 0);
+
+    drop(resources);
+    drop(engine);
+}
+
+async fn run_operation_admission_shutdown_barrier(mode: CompletionMode) {
+    if !has_software_rdma() {
+        return;
+    }
+    const OPERATIONS: usize = 64;
+
+    let device = software_device_name().expect("software RDMA device");
+    let (engine, driver) = RdmaEngineBuilder::new(device)
+        .completion_mode(mode)
+        .maximum_live_connections(2)
+        .maximum_inflight_operations(OPERATIONS)
+        .cq_capacity(OPERATIONS)
+        .build()
+        .unwrap();
+    let resources = engine.test_resources().unwrap();
+    let driver_task = tokio::spawn(driver);
+    let (server, client) =
+        establish_pair(&engine, &resources, RdmaConnectionConfig::default(), true).await;
+    let recorder = DestructionRecorder::arm(64);
+    let barrier = resources.pause_next_operation_before_register().unwrap();
+    let recv = server.register_memory(64, AccessIntent::LocalOnly).unwrap();
+    let operation = server.recv(recv, None);
+    let operation_thread = std::thread::spawn(move || {
+        let mut operation = Box::pin(operation);
+        assert!(poll_once(operation.as_mut()).is_pending());
+        operation
+    });
+
+    barrier.wait_until_paused().unwrap();
+    let paused = engine.diagnostics();
+    assert_ne!(paused.lifecycle, RdmaEngineLifecycle::ShutdownRequested);
+    assert_eq!(paused.live_connection_reservations, 2);
+    assert_eq!(paused.free_connection_slots, 0);
+    assert_eq!(paused.registered_operations, 0);
+    assert_eq!(paused.free_operation_slots, OPERATIONS);
+    assert_eq!(paused.accepted_outstanding_operations, 0);
+    assert_eq!(paused.free_cq_credits, OPERATIONS);
+    assert_eq!(
+        recorder
+            .snapshot()
+            .iter()
+            .filter(|event| event.kind == DestructionKind::MemoryRegion)
+            .count(),
+        0
+    );
+
+    let shutdown_engine = engine.clone();
+    let shutdown_thread = std::thread::spawn(move || {
+        let mut shutdown = Box::pin(async move { shutdown_engine.shutdown().await });
+        assert!(poll_once(shutdown.as_mut()).is_pending());
+        shutdown
+    });
+    barrier.wait_until_shutdown_attempted().unwrap();
+    barrier.release().unwrap();
+
+    let mut operation = operation_thread
+        .join()
+        .expect("operation poll thread panicked");
+    let mut shutdown = shutdown_thread
+        .join()
+        .expect("shutdown poll thread panicked");
+    let admitted = engine.diagnostics();
+    assert_eq!(admitted.lifecycle, RdmaEngineLifecycle::ShutdownRequested);
+    assert_eq!(admitted.registered_operations, 1);
+    assert_eq!(admitted.free_operation_slots, OPERATIONS - 1);
+    assert_eq!(admitted.accepted_outstanding_operations, 1);
+    assert_eq!(admitted.free_cq_credits, OPERATIONS - 1);
+    assert_eq!(admitted.retained_cq_credits, 0);
+
+    let mut server_close = Box::pin(server.close());
+    let mut client_close = Box::pin(client.close());
+    assert!(poll_once(server_close.as_mut()).is_pending());
+    assert!(poll_once(client_close.as_mut()).is_pending());
+    resources.transition_connection_to_error(&server).unwrap();
+
+    let ((operation_result, returned), server_result, client_result, shutdown_result) =
+        tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::join!(
+                operation.as_mut(),
+                server_close.as_mut(),
+                client_close.as_mut(),
+                shutdown.as_mut(),
+            )
+        })
+        .await
+        .expect("operation admission shutdown barrier did not drain");
+    assert!(operation_result.is_err());
+    let returned = returned.expect("flush completion must return the registered MR");
+    server_result.unwrap();
+    client_result.unwrap();
+    shutdown_result.unwrap();
+    driver_task.await.unwrap().unwrap();
+
+    let diagnostics = engine.diagnostics();
+    assert_eq!(diagnostics.lifecycle, RdmaEngineLifecycle::Terminated);
+    assert!(diagnostics.terminal_error.is_none());
+    assert_eq!(diagnostics.live_connection_reservations, 0);
+    assert_eq!(diagnostics.free_connection_slots, 2);
+    assert_eq!(diagnostics.registered_operations, 0);
+    assert_eq!(diagnostics.free_operation_slots, OPERATIONS);
+    assert_eq!(diagnostics.accepted_outstanding_operations, 0);
+    assert_eq!(diagnostics.free_cq_credits, OPERATIONS);
+    assert_eq!(diagnostics.retained_cq_credits, 0);
+    assert_eq!(
+        recorder
+            .snapshot()
+            .iter()
+            .filter(|event| event.kind == DestructionKind::MemoryRegion)
+            .count(),
+        0,
+        "accepted operation MR must remain registered until its flush CQE"
+    );
+    drop(returned);
+    assert_eq!(
+        recorder
+            .snapshot()
+            .iter()
+            .filter(|event| event.kind == DestructionKind::MemoryRegion)
+            .count(),
+        1
+    );
+
+    drop(operation);
+    drop(server_close);
+    drop(client_close);
+    drop(shutdown);
+    drop(server);
+    drop(client);
+    drop(resources);
+    drop(engine);
+    drop(recorder);
+}
+
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn outbound_connect_and_operations_use_one_shared_engine_in_both_modes() {
     run_mode(CompletionMode::Readiness).await;
@@ -574,6 +790,18 @@ async fn readiness_shutdown_rechecks_terminal_after_await_addr_error_on_one_core
 async fn shutdown_retires_an_established_connect_dropped_without_repolling_in_both_modes() {
     run_shutdown_awaiting_delivery(CompletionMode::Readiness).await;
     run_shutdown_awaiting_delivery(CompletionMode::Polling).await;
+}
+
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+async fn shutdown_waits_for_connect_admission_publication_in_both_modes() {
+    run_connect_admission_shutdown_barrier(CompletionMode::Readiness).await;
+    run_connect_admission_shutdown_barrier(CompletionMode::Polling).await;
+}
+
+#[test_log::test(tokio::test(flavor = "current_thread"))]
+async fn shutdown_waits_for_operation_registration_and_post_in_both_modes() {
+    run_operation_admission_shutdown_barrier(CompletionMode::Readiness).await;
+    run_operation_admission_shutdown_barrier(CompletionMode::Polling).await;
 }
 
 #[test_log::test(tokio::test(flavor = "current_thread"))]

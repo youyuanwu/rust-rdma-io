@@ -19,16 +19,8 @@ pub(super) struct EngineResources {
     pub(super) cq_async_fd: Option<AsyncFd<RawFd>>,
     pub(super) cm_async_fd: Option<AsyncFd<RawFd>>,
     pub(super) cq: Arc<Cq>,
-    #[allow(
-        dead_code,
-        reason = "shared by engine connections beginning in Phase 3"
-    )]
     pub(super) pd: Pd,
     pub(super) cm_event_channel: Arc<EventChannel>,
-    #[allow(
-        dead_code,
-        reason = "keeps the anchored context alive and is used by connections beginning in Phase 3"
-    )]
     pub(super) context: Context,
 }
 

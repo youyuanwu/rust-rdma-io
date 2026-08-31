@@ -32,8 +32,8 @@ use driver::WorkSignal;
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
 pub use driver::{
-    TestAcceptedOperation, TestConnectionIdentity, TestCqArmWindowControl, TestCqeSuppression,
-    TestEngineQp, TestEngineResources, TestRouteHandle,
+    TestAcceptedOperation, TestAdmissionBarrier, TestConnectionIdentity, TestCqArmWindowControl,
+    TestCqeSuppression, TestEngineQp, TestEngineResources, TestRouteHandle,
 };
 pub use operation::RdmaOperation;
 use operation::{CqCreditPool, OperationRegistry};
@@ -351,6 +351,8 @@ impl EngineShared {
     }
 
     fn request_shutdown(&self) {
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.test_driver.record_shutdown_attempt();
         {
             let _admission = write_unpoison(&self.admission);
             if !self.shutdown_requested.swap(true, Ordering::AcqRel) {

@@ -769,7 +769,7 @@ impl WorkRequestPoster for VerbsConnectionResources {
 
 #[allow(
     dead_code,
-    reason = "used by Phase 3 test installation and Phase 4 CM paths"
+    reason = "used by the test-only external-CM connection installer"
 )]
 pub(super) fn install_connection(
     shared: &Arc<EngineShared>,
@@ -779,8 +779,8 @@ pub(super) fn install_connection(
     peer_addr: Option<SocketAddr>,
 ) -> Result<RdmaConnection> {
     config.validate(&shared.config, shared.provider.as_ref())?;
-    let reservation = reserve_connection(shared)?;
-    install_reserved_connection(
+    let (admission, reservation) = reserve_connection(shared)?;
+    let connection = install_reserved_connection(
         shared,
         poster,
         config,
@@ -788,21 +788,26 @@ pub(super) fn install_connection(
         peer_addr,
         reservation,
         None,
-    )
+    );
+    drop(admission);
+    connection
 }
 
-pub(super) fn reserve_connection(shared: &Arc<EngineShared>) -> Result<ConnectionReservation> {
-    let _admission = read_unpoison(&shared.admission);
+pub(super) fn reserve_connection(
+    shared: &Arc<EngineShared>,
+) -> Result<(RwLockReadGuard<'_, ()>, ConnectionReservation)> {
+    let admission = read_unpoison(&shared.admission);
     if let Some(error) = shared.admission_error() {
         return Err(error);
     }
-    shared.connection_admission.try_acquire().ok_or_else(|| {
+    let reservation = shared.connection_admission.try_acquire().ok_or_else(|| {
         shared
             .diagnostic_counters
             .connection_capacity_exhausted
             .fetch_add(1, Ordering::Relaxed);
         Error::CapacityExhausted
-    })
+    })?;
+    Ok((admission, reservation))
 }
 
 pub(super) fn install_reserved_connection(
@@ -851,10 +856,6 @@ pub(super) fn install_reserved_connection(
 mod qp {
     use super::*;
 
-    #[allow(
-        dead_code,
-        reason = "used by Phase 3 test installation and Phase 4 CM paths"
-    )]
     pub(super) trait QpCapabilitiesExt {
         fn require(&self, config: &RdmaConnectionConfig) -> Result<()>;
     }

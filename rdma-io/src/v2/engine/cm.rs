@@ -1059,9 +1059,14 @@ pub(super) async fn connect_with_setup(
     setup: Box<dyn PreEstablishSetup>,
 ) -> Result<RdmaConnection> {
     config.validate(&shared.config, shared.provider.as_ref())?;
-    let reservation = reserve_connection(&shared)?;
+    let (admission, reservation) = reserve_connection(&shared)?;
     let request = Arc::new(OutboundRequest::new(address, config, setup, reservation));
+    #[cfg(any(test, feature = "test-hooks"))]
+    shared
+        .test_driver
+        .pause_admission(super::driver::test_api::AdmissionPausePoint::ConnectBeforeEnqueue);
     shared.cm.enqueue(Arc::clone(&request));
+    drop(admission);
     shared.work_signal.publish(CM_WORK);
     ConnectWaiter {
         shared,
@@ -1878,7 +1883,7 @@ mod tests {
             .routes
             .allocate_with(|token| Arc::new(OutboundRoute::new(token, Arc::clone(&request))))
             .unwrap();
-        let reservation = reserve_connection(&engine.shared).unwrap();
+        let (admission, reservation) = reserve_connection(&engine.shared).unwrap();
         let connection = install_reserved_connection(
             &engine.shared,
             Arc::new(NoopPoster(13)),
@@ -1891,6 +1896,7 @@ mod tests {
             Some(route_token.encode()),
         )
         .unwrap();
+        drop(admission);
 
         engine.shared.cm.enqueue_retirement(connection.state.token);
         let processed = engine
