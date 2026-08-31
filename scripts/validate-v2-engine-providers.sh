@@ -36,8 +36,13 @@ case "$MODE" in
         REPETITIONS=1
         MODE_LABEL="Phase 2 driver flush gate"
         ;;
+    --phase3-operations)
+        TEST_TARGET="v2_engine_operation_tests"
+        REPETITIONS=1
+        MODE_LABEL="Phase 3 owned-operation routing"
+        ;;
     *)
-        echo "usage: sudo -E ./scripts/validate-v2-engine-providers.sh {--provider-probe|--readiness-race|--driver-flush-gate}" >&2
+        echo "usage: sudo -E ./scripts/validate-v2-engine-providers.sh {--provider-probe|--readiness-race|--driver-flush-gate|--phase3-operations}" >&2
         exit 2
         ;;
 esac

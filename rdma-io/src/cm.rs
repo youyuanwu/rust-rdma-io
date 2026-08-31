@@ -370,6 +370,7 @@ impl CmId {
             cm_id_raw: Some(
                 NonNull::new(self.inner).expect("rdma_create_qp requires a non-null CM ID"),
             ),
+            capabilities: raw_attr.cap,
             _pd: Arc::clone(pd),
             _send_cq: send_cq.map(Arc::clone),
             _recv_cq: recv_cq.map(Arc::clone),
@@ -520,6 +521,11 @@ impl CmId {
 pub struct CmQueuePair {
     qp: *mut ibv_qp,
     cm_id_raw: Option<NonNull<rdma_cm_id>>,
+    #[allow(
+        dead_code,
+        reason = "consumed by Phase 3 engine connection installation"
+    )]
+    capabilities: ibv_qp_cap,
     _pd: Arc<ProtectionDomain>,
     _send_cq: Option<Arc<CompletionQueue>>,
     _recv_cq: Option<Arc<CompletionQueue>>,
@@ -566,7 +572,19 @@ impl CmQueuePair {
         unsafe { (*self.qp).qp_num }
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
+    /// Capabilities returned by the provider from `rdma_create_qp`.
+    #[allow(
+        dead_code,
+        reason = "consumed by Phase 3 engine connection installation"
+    )]
+    pub(crate) fn capabilities(&self) -> ibv_qp_cap {
+        self.capabilities
+    }
+
+    #[allow(
+        dead_code,
+        reason = "consumed by engine test hooks and Phase 4 CM installation"
+    )]
     pub(crate) fn uses_resources(
         &self,
         pd: &Arc<ProtectionDomain>,

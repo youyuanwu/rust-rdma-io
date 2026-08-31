@@ -172,7 +172,10 @@ impl Pd {
                 "memory region size must be > 0".into(),
             ));
         }
-        let buf = vec![0u8; size];
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(size)
+            .map_err(|_| Error::InvalidConfig("memory region allocation failed".into()))?;
+        buf.resize(size, 0);
         let flags = access.to_flags();
         let omr = self.inner().reg_mr_owned(buf, flags)?;
         Ok(Mr { inner: omr })

@@ -137,24 +137,24 @@ impl ReadyConnections {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum DeadlineKind {
-    #[allow(
-        dead_code,
-        reason = "used by operation reclamation beginning in Phase 3"
-    )]
     Reclamation,
-    #[allow(dead_code, reason = "used by connection teardown beginning in Phase 6")]
     ConnectionDrain,
-    #[allow(dead_code, reason = "used by graceful shutdown beginning in Phase 6")]
-    EngineShutdown,
     #[allow(
         dead_code,
-        reason = "used by message establishment beginning in Phase 7"
+        reason = "graceful shutdown scheduling is completed in Phase 6"
     )]
-    MessageHello,
+    EngineShutdown,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Deadline {
+    pub(super) at: Instant,
+    pub(super) kind: DeadlineKind,
+    pub(super) token: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct DeadlineRequest {
     pub(super) at: Instant,
     pub(super) kind: DeadlineKind,
     pub(super) token: u64,
@@ -185,24 +185,23 @@ impl PartialOrd for DeadlineEntry {
 #[derive(Default)]
 pub(super) struct DeadlineQueue {
     entries: BinaryHeap<Reverse<DeadlineEntry>>,
-    #[allow(dead_code, reason = "deadline insertion begins in Phase 3")]
     next_sequence: u64,
 }
 
 impl DeadlineQueue {
-    #[allow(dead_code, reason = "deadline insertion begins in Phase 3")]
-    pub(super) fn push(&mut self, at: Instant, kind: DeadlineKind, token: u64) {
+    pub(super) fn push(&mut self, at: Instant, kind: DeadlineKind, token: u64) -> bool {
         let sequence = self.next_sequence;
-        self.next_sequence = self
-            .next_sequence
-            .checked_add(1)
-            .expect("deadline insertion sequence exhausted");
+        let Some(next_sequence) = self.next_sequence.checked_add(1) else {
+            return false;
+        };
+        self.next_sequence = next_sequence;
         self.entries.push(Reverse(DeadlineEntry {
             at,
             sequence,
             kind,
             token,
         }));
+        true
     }
 
     pub(super) fn pop_due(&mut self, now: Instant, budget: usize) -> Vec<Deadline> {
@@ -309,17 +308,17 @@ mod tests {
     fn deadlines_are_ordered_and_budgeted() {
         let now = Instant::now();
         let mut deadlines = DeadlineQueue::default();
-        deadlines.push(
+        assert!(deadlines.push(
             now + Duration::from_secs(2),
             DeadlineKind::EngineShutdown,
             2,
-        );
-        deadlines.push(now, DeadlineKind::Reclamation, 0);
-        deadlines.push(
+        ));
+        assert!(deadlines.push(now, DeadlineKind::Reclamation, 0));
+        assert!(deadlines.push(
             now + Duration::from_secs(1),
             DeadlineKind::ConnectionDrain,
             1,
-        );
+        ));
 
         let due = deadlines.pop_due(now + Duration::from_secs(2), 2);
         assert_eq!(due.len(), 2);

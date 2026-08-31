@@ -131,6 +131,30 @@ impl RdmaConnectionConfig {
         self.rnr_retry_count
     }
 
+    pub(crate) fn max_send_wr_value(&self) -> usize {
+        self.max_send_wr
+    }
+
+    pub(crate) fn max_recv_wr_value(&self) -> usize {
+        self.max_recv_wr
+    }
+
+    #[allow(
+        dead_code,
+        reason = "used by Phase 3 test installation and Phase 4 CM paths"
+    )]
+    pub(crate) fn max_send_sge_value(&self) -> usize {
+        self.max_send_sge
+    }
+
+    #[allow(
+        dead_code,
+        reason = "used by Phase 3 test installation and Phase 4 CM paths"
+    )]
+    pub(crate) fn max_recv_sge_value(&self) -> usize {
+        self.max_recv_sge
+    }
+
     #[allow(
         dead_code,
         reason = "consumed by engine connection construction beginning in Phase 3"

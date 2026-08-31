@@ -61,15 +61,23 @@ impl CqReadiness {
         cx: &mut Context<'_>,
         buf: &mut [WorkCompletion],
     ) -> Poll<Result<usize>> {
-        self.poll_with(cq, cx, buf, |cx| notifier.poll_readable(cx), |_| false)
+        self.poll_with(
+            cq,
+            cx,
+            buf,
+            |cx| notifier.poll_readable(cx),
+            |_| false,
+            |_| false,
+        )
     }
 
-    pub(crate) fn poll_with_async_fd_and_arm_hook(
+    pub(crate) fn poll_with_async_fd_and_hooks(
         &mut self,
         cq: &Cq,
         async_fd: &AsyncFd<RawFd>,
         cx: &mut Context<'_>,
         buf: &mut [WorkCompletion],
+        before_arm: impl FnMut(u64) -> bool,
         after_arm: impl FnMut(u64) -> bool,
     ) -> Poll<Result<usize>> {
         self.poll_with(
@@ -84,6 +92,7 @@ impl CqReadiness {
                 Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
                 Poll::Pending => Poll::Pending,
             },
+            before_arm,
             after_arm,
         )
     }
@@ -94,6 +103,7 @@ impl CqReadiness {
         cx: &mut Context<'_>,
         buf: &mut [WorkCompletion],
         mut poll_readable: impl FnMut(&mut Context<'_>) -> Poll<io::Result<()>>,
+        mut before_arm: impl FnMut(u64) -> bool,
         mut after_arm: impl FnMut(u64) -> bool,
     ) -> Poll<Result<usize>> {
         loop {
@@ -111,6 +121,9 @@ impl CqReadiness {
                     }
                     Err(error) => return Poll::Ready(Err(error)),
                 },
+                PollState::Arm if before_arm(self.arms.saturating_add(1)) => {
+                    return Poll::Pending;
+                }
                 PollState::Arm => match cq.inner().req_notify(false) {
                     Ok(()) => {
                         self.arms = self.arms.saturating_add(1);

@@ -88,8 +88,9 @@ pub use shared_qp::{OpFuture, SharedQp};
 
 #[cfg(feature = "tokio")]
 pub use engine::{
-    CompletionMode, RdmaConnectionConfig, RdmaEngine, RdmaEngineBuilder, RdmaEngineDiagnostics,
-    RdmaEngineDriver, RdmaEngineLifecycle, RdmaEngineTerminalError,
+    CompletionMode, RdmaConnection, RdmaConnectionConfig, RdmaConnectionIdentity, RdmaEngine,
+    RdmaEngineBuilder, RdmaEngineDiagnostics, RdmaEngineDriver, RdmaEngineLifecycle,
+    RdmaEngineTerminalError, RdmaOperation,
 };
 
 #[cfg(feature = "tokio")]

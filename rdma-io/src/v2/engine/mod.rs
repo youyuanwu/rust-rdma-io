@@ -1,14 +1,18 @@
 //! Explicitly driven, shared v2 RDMA engine.
 
 mod config;
+mod connection;
 mod diagnostics;
 mod driver;
+mod operation;
+mod registry;
 mod resources;
 mod scheduler;
 
 #[cfg(test)]
 mod api_tests;
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -17,6 +21,8 @@ use tokio::sync::Notify;
 
 use config::EngineConfig;
 pub use config::{CompletionMode, RdmaConnectionConfig};
+pub use connection::{RdmaConnection, RdmaConnectionIdentity};
+use diagnostics::DiagnosticsState;
 pub use diagnostics::{RdmaEngineDiagnostics, RdmaEngineLifecycle, RdmaEngineTerminalError};
 use driver::WorkSignal;
 #[cfg(any(test, feature = "test-hooks"))]
@@ -25,8 +31,12 @@ pub use driver::{
     TestAcceptedOperation, TestConnectionIdentity, TestCqArmWindowControl, TestCqeSuppression,
     TestEngineQp, TestEngineResources, TestRouteHandle,
 };
-use resources::{EngineResources, ResourceSummary};
+pub use operation::RdmaOperation;
+use operation::{CqCreditPool, OperationRegistry};
+use registry::{ConnectionRegistry, ConnectionToken, OperationToken, lock_unpoison};
+use resources::{EngineResourceRefs, EngineResources, ResourceSummary};
 use scheduler::WorkScheduler;
+use scheduler::{DeadlineKind, DeadlineRequest};
 
 use super::error::{Error, Result};
 
@@ -118,10 +128,16 @@ impl RdmaEngineBuilder {
             preflight_tokio_io()?;
         }
 
-        let (resources, _provider) = EngineResources::build(&self.config)?;
+        let (resources, provider) = EngineResources::build(&self.config)?;
         let resource_summary = resources.summary();
+        let resource_refs = resources.connection_resource_refs();
         #[allow(unused_mut, reason = "test hooks attach safe resource references")]
-        let mut shared = EngineShared::new(self.config, resource_summary);
+        let mut shared = EngineShared::new(
+            self.config,
+            resource_summary,
+            Some(provider),
+            Some(resource_refs),
+        )?;
         #[cfg(any(test, feature = "test-hooks"))]
         {
             shared.test_resources = Some(resources.test_resource_refs());
@@ -209,11 +225,29 @@ pub struct RdmaEngineDriver {
     cq_buffer: Box<[crate::wc::WorkCompletion]>,
     deadline_sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
     deadline_at: Option<tokio::time::Instant>,
+    runtime_checked: bool,
 }
 
 struct EngineShared {
     config: EngineConfig,
     resources: ResourceSummary,
+    #[allow(
+        dead_code,
+        reason = "used by Phase 3 test installation and Phase 4 CM paths"
+    )]
+    provider: Option<config::ProviderLimits>,
+    resource_refs: Option<EngineResourceRefs>,
+    connections: ConnectionRegistry,
+    operations: OperationRegistry,
+    cq_credits: CqCreditPool,
+    diagnostic_counters: DiagnosticsState,
+    accepted_operations: AtomicUsize,
+    pending_reclamations: AtomicUsize,
+    quarantined_operations: AtomicUsize,
+    quarantined_mrs: AtomicUsize,
+    quarantined_bytes: AtomicUsize,
+    ready_queue_depth: AtomicUsize,
+    deadline_requests: Mutex<VecDeque<DeadlineRequest>>,
     lifecycle: AtomicU8,
     shutdown_requested: AtomicBool,
     frontend_count: AtomicUsize,
@@ -230,10 +264,31 @@ struct EngineShared {
 }
 
 impl EngineShared {
-    fn new(config: EngineConfig, resources: ResourceSummary) -> Self {
-        Self {
+    fn new(
+        config: EngineConfig,
+        resources: ResourceSummary,
+        provider: Option<config::ProviderLimits>,
+        resource_refs: Option<EngineResourceRefs>,
+    ) -> Result<Self> {
+        let connections = ConnectionRegistry::new(config.max_live_connections)?;
+        let operations = OperationRegistry::new(config.max_inflight_operations)?;
+        let cq_credits = CqCreditPool::new(config.cq_capacity);
+        Ok(Self {
             config,
             resources,
+            provider,
+            resource_refs,
+            connections,
+            operations,
+            cq_credits,
+            diagnostic_counters: DiagnosticsState::default(),
+            accepted_operations: AtomicUsize::new(0),
+            pending_reclamations: AtomicUsize::new(0),
+            quarantined_operations: AtomicUsize::new(0),
+            quarantined_mrs: AtomicUsize::new(0),
+            quarantined_bytes: AtomicUsize::new(0),
+            ready_queue_depth: AtomicUsize::new(0),
+            deadline_requests: Mutex::new(VecDeque::new()),
             lifecycle: AtomicU8::new(lifecycle_to_u8(RdmaEngineLifecycle::Created)),
             shutdown_requested: AtomicBool::new(false),
             frontend_count: AtomicUsize::new(1),
@@ -245,7 +300,7 @@ impl EngineShared {
             test_resources: None,
             #[cfg(any(test, feature = "test-hooks"))]
             test_driver: driver::test_api::TestDriverState::new(),
-        }
+        })
     }
 
     fn request_shutdown(&self) {
@@ -358,9 +413,155 @@ impl EngineShared {
             shared_completion_channels: self.resources.completion_channels,
             shared_cm_event_channels: self.resources.cm_event_channels,
             driver_yields: self.driver_yields.load(Ordering::Acquire),
+            live_connection_reservations: self.connections.live(),
+            free_connection_slots: self.connections.free(),
+            retired_connection_slots: self.connections.retired(),
+            registered_operations: self.operations.live(),
+            free_operation_slots: self.operations.free(),
+            retired_operation_slots: self.operations.retired(),
+            accepted_outstanding_operations: self.accepted_operations.load(Ordering::Acquire),
+            free_cq_credits: self.cq_credits.free(),
+            retained_cq_credits: self.cq_credits.retained(),
+            pending_reclamations: self.pending_reclamations.load(Ordering::Acquire),
+            quarantined_operations: self.quarantined_operations.load(Ordering::Acquire),
+            quarantined_mrs: self.quarantined_mrs.load(Ordering::Acquire),
+            quarantined_bytes: self.quarantined_bytes.load(Ordering::Acquire),
+            ready_queue_depth: self.ready_queue_depth.load(Ordering::Acquire),
+            operations_offered: self
+                .diagnostic_counters
+                .operations_offered
+                .load(Ordering::Acquire),
+            operations_accepted: self
+                .diagnostic_counters
+                .operations_accepted
+                .load(Ordering::Acquire),
+            operations_unaccepted: self
+                .diagnostic_counters
+                .operations_unaccepted
+                .load(Ordering::Acquire),
+            operations_posted: self
+                .diagnostic_counters
+                .operations_posted
+                .load(Ordering::Acquire),
+            operations_completed: self
+                .diagnostic_counters
+                .operations_completed
+                .load(Ordering::Acquire),
+            operations_cancelled: self
+                .diagnostic_counters
+                .operations_cancelled
+                .load(Ordering::Acquire),
+            batch_posts_attempted: self
+                .diagnostic_counters
+                .batch_posts_attempted
+                .load(Ordering::Acquire),
+            batch_accepted_prefix: self
+                .diagnostic_counters
+                .batch_accepted_prefix
+                .load(Ordering::Acquire),
+            batch_unaccepted_suffix: self
+                .diagnostic_counters
+                .batch_unaccepted_suffix
+                .load(Ordering::Acquire),
+            batch_ambiguous_results: self
+                .diagnostic_counters
+                .batch_ambiguous_results
+                .load(Ordering::Acquire),
+            cqes_polled: self.diagnostic_counters.cqes_polled.load(Ordering::Acquire),
+            cqes_routed: self.diagnostic_counters.cqes_routed.load(Ordering::Acquire),
+            stale_connection_cqes: self
+                .diagnostic_counters
+                .stale_connection_cqes
+                .load(Ordering::Acquire),
+            stale_operation_cqes: self
+                .diagnostic_counters
+                .stale_operation_cqes
+                .load(Ordering::Acquire),
+            unknown_cqes: self
+                .diagnostic_counters
+                .unknown_cqes
+                .load(Ordering::Acquire),
+            duplicate_cqes: self
+                .diagnostic_counters
+                .duplicate_cqes
+                .load(Ordering::Acquire),
+            wrong_connection_cqes: self
+                .diagnostic_counters
+                .wrong_connection_cqes
+                .load(Ordering::Acquire),
+            wrong_qp_num_cqes: self
+                .diagnostic_counters
+                .wrong_qp_num_cqes
+                .load(Ordering::Acquire),
+            unexpected_opcode_cqes: self
+                .diagnostic_counters
+                .unexpected_opcode_cqes
+                .load(Ordering::Acquire),
+            reclamation_deadlines: self
+                .diagnostic_counters
+                .reclamation_deadlines
+                .load(Ordering::Acquire),
+            connection_capacity_exhausted: self
+                .diagnostic_counters
+                .connection_capacity_exhausted
+                .load(Ordering::Acquire),
+            operation_capacity_exhausted: self
+                .diagnostic_counters
+                .operation_capacity_exhausted
+                .load(Ordering::Acquire),
+            cq_capacity_exhausted: self
+                .diagnostic_counters
+                .cq_capacity_exhausted
+                .load(Ordering::Acquire),
             #[cfg(any(test, feature = "test-hooks"))]
             accepted_test_operations: self.test_driver.accepted_outstanding(),
         }
+    }
+
+    fn register_memory(&self, len: usize, access: super::AccessIntent) -> Result<super::Mr> {
+        if len == 0 || u32::try_from(len).is_err() {
+            return Err(Error::InvalidConfig(
+                "engine MR length must be in 1..=u32::MAX".into(),
+            ));
+        }
+        let resources = self.resource_refs.as_ref().ok_or_else(|| {
+            Error::InvalidConfig("engine shared protection domain is unavailable".into())
+        })?;
+        resources.pd.reg_mr(len, access)
+    }
+
+    fn schedule_reclamation(&self, token: OperationToken) {
+        self.begin_reclamation(token);
+        self.schedule_deadline(
+            DeadlineKind::Reclamation,
+            token.encode(),
+            self.config.missing_cqe_deadline,
+        );
+    }
+
+    fn schedule_connection_drain(&self, token: ConnectionToken) {
+        self.schedule_deadline(
+            DeadlineKind::ConnectionDrain,
+            token.encode(),
+            self.config.connection_drain_deadline,
+        );
+    }
+
+    fn schedule_deadline(&self, kind: DeadlineKind, token: u64, after: Duration) {
+        let now = tokio::time::Instant::now();
+        let at = now.checked_add(after).unwrap_or(now);
+        lock_unpoison(&self.deadline_requests).push_back(DeadlineRequest { at, kind, token });
+        self.work_signal.publish(driver::RECLAMATION_WORK);
+    }
+
+    fn take_deadline_requests(&self, budget: usize) -> Vec<DeadlineRequest> {
+        let mut requests = lock_unpoison(&self.deadline_requests);
+        let count = requests.len().min(budget);
+        requests.drain(..count).collect()
+    }
+
+    fn has_deadline_requests(&self) -> bool {
+        !lock_unpoison(&self.deadline_requests).is_empty()
     }
 }
 
@@ -462,16 +663,21 @@ const fn lifecycle_from_u8(value: u8) -> RdmaEngineLifecycle {
 fn test_engine_pair(mode: CompletionMode) -> (RdmaEngine, RdmaEngineDriver) {
     let mut config = EngineConfig::new("test0".into());
     config.completion_mode = mode;
-    let shared = Arc::new(EngineShared::new(
-        config,
-        ResourceSummary {
-            contexts: 1,
-            protection_domains: 1,
-            completion_queues: 1,
-            completion_channels: 0,
-            cm_event_channels: 1,
-        },
-    ));
+    let shared = Arc::new(
+        EngineShared::new(
+            config,
+            ResourceSummary {
+                contexts: 1,
+                protection_domains: 1,
+                completion_queues: 1,
+                completion_channels: 0,
+                cm_event_channels: 1,
+            },
+            None,
+            None,
+        )
+        .unwrap(),
+    );
     (
         RdmaEngine {
             shared: Arc::clone(&shared),

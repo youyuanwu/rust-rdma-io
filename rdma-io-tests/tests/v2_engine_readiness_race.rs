@@ -28,6 +28,26 @@ fn take_endpoint_route(
     route
 }
 
+fn post_pair(
+    resources: &TestEngineResources,
+    recv_route: &rdma_io::test_support::engine_driver::TestRouteHandle,
+    send_route: &rdma_io::test_support::engine_driver::TestRouteHandle,
+    index: usize,
+) {
+    let recv_id = 100_000 + index as u64;
+    let send_id = 200_000 + index as u64;
+    let mut recv = resources
+        .register_memory(64, AccessIntent::LocalOnly)
+        .unwrap();
+    recv_route.qp().post_recv(&mut recv, recv_id).unwrap();
+    recv_route.retain_until_completion(recv_id, recv);
+    let send = resources
+        .register_memory(64, AccessIntent::LocalOnly)
+        .unwrap();
+    send_route.qp().post_send(&send, send_id).unwrap();
+    send_route.retain_until_completion(send_id, send);
+}
+
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn readiness_arm_post_race_observes_each_cqe_exactly_once() {
     if !has_software_rdma() {
@@ -47,36 +67,44 @@ async fn readiness_arm_post_race_observes_each_cqe_exactly_once() {
     let recv_route = take_endpoint_route(
         &resources,
         &mut pair.server,
-        (0..RACE_ITERATIONS * 2)
+        (0..RACE_ITERATIONS * 4)
             .map(|index| TestAcceptedOperation::new(100_000 + index as u64, WcOpcode::Recv)),
     );
     let send_route = take_endpoint_route(
         &resources,
         &mut pair.client,
-        (0..RACE_ITERATIONS * 2)
+        (0..RACE_ITERATIONS * 4)
             .map(|index| TestAcceptedOperation::new(200_000 + index as u64, WcOpcode::Send)),
     );
 
     let driver_task = tokio::spawn(driver);
     let mut arm_generation = 0;
     for index in 0..RACE_ITERATIONS {
+        let pre_arm_window = resources.pause_next_cq_pre_arm_window().unwrap();
+        let base = index * 4;
+        post_pair(&resources, &recv_route, &send_route, base);
+        arm_generation = tokio::time::timeout(
+            Duration::from_secs(10),
+            pre_arm_window.wait_for_pause_after(arm_generation),
+        )
+        .await
+        .expect("driver did not pause in the CQ poll-to-arm window")
+        .unwrap();
+        post_pair(&resources, &recv_route, &send_route, base + 1);
+        pre_arm_window.release(arm_generation).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let expected = base + 2;
+            tokio::join!(
+                recv_route.wait_for_completion_count(expected),
+                send_route.wait_for_completion_count(expected)
+            );
+        })
+        .await
+        .expect("pre-arm race lost a shared-CQ completion");
+
         let arm_window = resources.pause_next_cq_arm_window().unwrap();
-        let kick_index = index * 2;
-        let kick_recv_id = 100_000 + kick_index as u64;
-        let kick_send_id = 200_000 + kick_index as u64;
-        let mut kick_recv = resources
-            .register_memory(64, AccessIntent::LocalOnly)
-            .unwrap();
-        recv_route
-            .qp()
-            .post_recv(&mut kick_recv, kick_recv_id)
-            .unwrap();
-        recv_route.retain(kick_recv);
-        let kick_send = resources
-            .register_memory(64, AccessIntent::LocalOnly)
-            .unwrap();
-        send_route.qp().post_send(&kick_send, kick_send_id).unwrap();
-        send_route.retain(kick_send);
+        post_pair(&resources, &recv_route, &send_route, base + 2);
 
         arm_generation = tokio::time::timeout(
             Duration::from_secs(10),
@@ -86,23 +114,11 @@ async fn readiness_arm_post_race_observes_each_cqe_exactly_once() {
         .expect("driver did not pause in the CQ arm-to-post-poll window")
         .unwrap();
 
-        let race_index = kick_index + 1;
-        let recv_id = 100_000 + race_index as u64;
-        let send_id = 200_000 + race_index as u64;
-        let mut recv = resources
-            .register_memory(64, AccessIntent::LocalOnly)
-            .unwrap();
-        recv_route.qp().post_recv(&mut recv, recv_id).unwrap();
-        recv_route.retain(recv);
-        let send = resources
-            .register_memory(64, AccessIntent::LocalOnly)
-            .unwrap();
-        send_route.qp().post_send(&send, send_id).unwrap();
-        send_route.retain(send);
+        post_pair(&resources, &recv_route, &send_route, base + 3);
         arm_window.release(arm_generation).unwrap();
 
         tokio::time::timeout(Duration::from_secs(10), async {
-            let expected = (index + 1) * 2;
+            let expected = (index + 1) * 4;
             tokio::join!(
                 recv_route.wait_for_completion_count(expected),
                 send_route.wait_for_completion_count(expected)
@@ -114,15 +130,15 @@ async fn readiness_arm_post_race_observes_each_cqe_exactly_once() {
 
     let recv_completions = recv_route.remove().unwrap();
     let send_completions = send_route.remove().unwrap();
-    assert_eq!(recv_completions.len(), RACE_ITERATIONS * 2);
-    assert_eq!(send_completions.len(), RACE_ITERATIONS * 2);
+    assert_eq!(recv_completions.len(), RACE_ITERATIONS * 4);
+    assert_eq!(send_completions.len(), RACE_ITERATIONS * 4);
     assert_eq!(
         recv_completions
             .iter()
             .map(|completion| completion.wr_id())
             .collect::<HashSet<_>>()
             .len(),
-        RACE_ITERATIONS * 2
+        RACE_ITERATIONS * 4
     );
     assert_eq!(
         send_completions
@@ -130,7 +146,7 @@ async fn readiness_arm_post_race_observes_each_cqe_exactly_once() {
             .map(|completion| completion.wr_id())
             .collect::<HashSet<_>>()
             .len(),
-        RACE_ITERATIONS * 2
+        RACE_ITERATIONS * 4
     );
     assert!(
         recv_completions

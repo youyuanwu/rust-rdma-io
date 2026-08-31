@@ -31,6 +31,18 @@ pub(super) struct EngineResources {
     pub(super) context: Context,
 }
 
+#[derive(Clone)]
+pub(super) struct EngineResourceRefs {
+    #[allow(
+        dead_code,
+        reason = "retains the anchored context for connection descendants"
+    )]
+    pub(super) context: Context,
+    pub(super) pd: Pd,
+    #[allow(dead_code, reason = "retains the shared CQ for connection descendants")]
+    pub(super) cq: Arc<Cq>,
+}
+
 #[cfg(any(test, feature = "test-hooks"))]
 #[derive(Clone)]
 pub(super) struct TestResourceRefs {
@@ -118,6 +130,14 @@ impl EngineResources {
             completion_queues: 1,
             completion_channels: usize::from(self.cq.has_channel()),
             cm_event_channels: 1,
+        }
+    }
+
+    pub(super) fn connection_resource_refs(&self) -> EngineResourceRefs {
+        EngineResourceRefs {
+            context: self.context.clone(),
+            pd: self.pd.clone(),
+            cq: Arc::clone(&self.cq),
         }
     }
 

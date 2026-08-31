@@ -1,6 +1,7 @@
 //! Test-only destruction event recording.
 
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::fmt;
+use std::sync::{Mutex, OnceLock};
 
 /// An actual resource destruction/free call observed by a test hook.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,9 +40,9 @@ struct RecorderState {
     active: Option<ActiveRecorder>,
 }
 
-fn state() -> &'static (Mutex<RecorderState>, Condvar) {
-    static STATE: OnceLock<(Mutex<RecorderState>, Condvar)> = OnceLock::new();
-    STATE.get_or_init(|| (Mutex::new(RecorderState::default()), Condvar::new()))
+fn state() -> &'static Mutex<RecorderState> {
+    static STATE: OnceLock<Mutex<RecorderState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(RecorderState::default()))
 }
 
 /// A bounded, explicitly armed destruction recorder.
@@ -49,41 +50,54 @@ fn state() -> &'static (Mutex<RecorderState>, Condvar) {
 /// Only one recorder is armed process-wide at a time. Concurrent tests wait
 /// for the current recorder to be dropped, preventing one test from clearing
 /// or consuming another test's observations.
+#[derive(Debug)]
 pub struct DestructionRecorder {
     id: u64,
 }
+
+/// A process-wide recorder was already armed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecorderBusy;
+
+impl fmt::Display for RecorderBusy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a destruction recorder is already armed")
+    }
+}
+
+impl std::error::Error for RecorderBusy {}
 
 impl DestructionRecorder {
     /// Arm a recorder that retains at most `capacity` events.
     ///
     /// A zero capacity is rejected because it could silently prove nothing.
     pub fn arm(capacity: usize) -> Self {
-        assert!(
-            capacity > 0,
-            "destruction recorder capacity must be nonzero"
-        );
-        let (lock, available) = state();
-        let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
-        while state.active.is_some() {
-            state = available
-                .wait(state)
-                .unwrap_or_else(|error| error.into_inner());
+        Self::try_arm(capacity).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Try to arm without blocking an executor or test thread.
+    pub fn try_arm(capacity: usize) -> Result<Self, RecorderBusy> {
+        if capacity == 0 {
+            return Err(RecorderBusy);
+        }
+        let mut state = state().lock().unwrap_or_else(|error| error.into_inner());
+        if state.active.is_some() {
+            return Err(RecorderBusy);
         }
         let id = state.next_id;
-        state.next_id = state.next_id.saturating_add(1);
+        state.next_id = state.next_id.checked_add(1).ok_or(RecorderBusy)?;
         state.active = Some(ActiveRecorder {
             id,
             capacity,
             events: Vec::with_capacity(capacity.min(64)),
             overflowed: false,
         });
-        Self { id }
+        Ok(Self { id })
     }
 
     /// Return a copy of events recorded since this recorder was armed.
     pub fn snapshot(&self) -> Vec<DestructionEvent> {
-        let (lock, _) = state();
-        let state = lock.lock().unwrap_or_else(|error| error.into_inner());
+        let state = state().lock().unwrap_or_else(|error| error.into_inner());
         state
             .active
             .as_ref()
@@ -94,8 +108,7 @@ impl DestructionRecorder {
 
     /// Remove and return events recorded since this recorder was armed.
     pub fn take(&self) -> Vec<DestructionEvent> {
-        let (lock, _) = state();
-        let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = state().lock().unwrap_or_else(|error| error.into_inner());
         let Some(active) = state.active.as_mut().filter(|active| active.id == self.id) else {
             return Vec::new();
         };
@@ -104,8 +117,7 @@ impl DestructionRecorder {
 
     /// Whether more events occurred than the configured bounded capacity.
     pub fn overflowed(&self) -> bool {
-        let (lock, _) = state();
-        let state = lock.lock().unwrap_or_else(|error| error.into_inner());
+        let state = state().lock().unwrap_or_else(|error| error.into_inner());
         state
             .active
             .as_ref()
@@ -116,23 +128,19 @@ impl DestructionRecorder {
 
 impl Drop for DestructionRecorder {
     fn drop(&mut self) {
-        let (lock, available) = state();
-        let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = state().lock().unwrap_or_else(|error| error.into_inner());
         if state
             .active
             .as_ref()
             .is_some_and(|active| active.id == self.id)
         {
             state.active = None;
-            drop(state);
-            available.notify_one();
         }
     }
 }
 
 pub(crate) fn record(kind: DestructionKind, address: usize) {
-    let (lock, _) = state();
-    let mut state = lock.lock().unwrap_or_else(|error| error.into_inner());
+    let mut state = state().lock().unwrap_or_else(|error| error.into_inner());
     let Some(active) = state.active.as_mut() else {
         return;
     };
@@ -178,5 +186,13 @@ mod tests {
         }
         assert_eq!(recorder.take().len(), 8);
         assert!(!recorder.overflowed());
+    }
+
+    #[test]
+    fn recorder_contention_is_reported_without_blocking() {
+        let recorder = DestructionRecorder::arm(1);
+        assert_eq!(DestructionRecorder::try_arm(1).unwrap_err(), RecorderBusy);
+        drop(recorder);
+        assert!(DestructionRecorder::try_arm(1).is_ok());
     }
 }

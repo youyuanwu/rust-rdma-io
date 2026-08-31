@@ -5,9 +5,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context as TaskContext, Poll, RawWaker, RawWakerVTable, Waker};
 
 use super::*;
+use crate::v2::{AccessIntent, Completion, Mr};
 
 fn assert_engine_traits<T: Clone + Send + Sync + 'static>() {}
 fn assert_driver_traits<T: Future<Output = Result<()>> + Send + 'static>() {}
+fn assert_operation_traits<
+    T: Future<Output = (Result<Completion>, Option<Mr>)> + Send + 'static,
+>() {
+}
 
 struct CountingWaker(AtomicUsize);
 
@@ -49,6 +54,7 @@ impl CountingWaker {
 fn exact_public_types_and_traits_compile() {
     assert_engine_traits::<RdmaEngine>();
     assert_driver_traits::<RdmaEngineDriver>();
+    assert_operation_traits::<RdmaOperation>();
 
     let _: fn(&RdmaEngine) -> RdmaEngineDiagnostics = RdmaEngine::diagnostics;
     let _: Result<(RdmaEngine, RdmaEngineDriver)> =
@@ -69,6 +75,11 @@ fn exact_public_types_and_traits_compile() {
         cq_debt: 1,
     };
     assert!(matches!(engine, Error::EngineWedged { .. }));
+
+    let _: fn(&RdmaConnection, usize, AccessIntent) -> Result<Mr> = RdmaConnection::register_memory;
+    let _: fn(&RdmaConnection, Mr, Option<(usize, usize)>) -> RdmaOperation = RdmaConnection::send;
+    let _: fn(&RdmaConnection, Mr, Option<(usize, usize)>) -> RdmaOperation = RdmaConnection::recv;
+    let _: fn(&RdmaConnection) -> RdmaConnectionIdentity = RdmaConnection::identity;
 }
 
 #[test]
