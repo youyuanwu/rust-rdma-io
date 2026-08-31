@@ -1,5 +1,5 @@
 use rdma_io::cm::RdmaCmDeviceList;
-use rdma_io::test_support::destruction::{self, DestructionKind};
+use rdma_io::test_support::destruction::{DestructionKind, DestructionRecorder};
 use rdma_io::v2::{
     AccessIntent, CompletionMode, Context, CqBuilder, Error, RdmaEngineBuilder, RdmaEngineLifecycle,
 };
@@ -17,7 +17,7 @@ fn pinned_context_owns_pd_cq_and_mr_until_last_child_drop() {
         return;
     }
 
-    destruction::clear();
+    let recorder = DestructionRecorder::arm(32);
     let list = RdmaCmDeviceList::new().expect("enumerate librdmacm devices");
     let name = software_device_name(&list).expect("software RDMA context");
     let inner = list.context_by_name(&name).expect("select exact context");
@@ -35,7 +35,8 @@ fn pinned_context_owns_pd_cq_and_mr_until_last_child_drop() {
         .expect("register anchored MR");
 
     assert!(
-        !destruction::snapshot()
+        !recorder
+            .snapshot()
             .iter()
             .any(|event| event.kind == DestructionKind::RdmaFreeDevices)
     );
@@ -44,7 +45,8 @@ fn pinned_context_owns_pd_cq_and_mr_until_last_child_drop() {
     drop(pd);
     drop(context);
 
-    let events = destruction::take();
+    let events = recorder.take();
+    assert!(!recorder.overflowed());
     assert!(
         !events
             .iter()
@@ -140,11 +142,12 @@ async fn readiness_engine_builds_with_one_channel_and_direct_driver() {
 
 #[test]
 fn invalid_engine_configuration_allocates_no_provider_resources() {
-    destruction::clear();
+    let recorder = DestructionRecorder::arm(8);
     let result = RdmaEngineBuilder::new("rxe0")
         .completion_mode(CompletionMode::Polling)
         .maximum_live_connections(0)
         .build();
     assert!(matches!(result, Err(Error::InvalidConfig(_))));
-    assert!(destruction::take().is_empty());
+    assert!(recorder.take().is_empty());
+    assert!(!recorder.overflowed());
 }

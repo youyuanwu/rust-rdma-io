@@ -43,7 +43,7 @@ fn readiness_build_outside_tokio_is_contextual() {
 
 #[tokio::test]
 async fn driver_is_directly_spawnable_and_shutdown_is_idempotent() {
-    let (engine, driver) = test_engine_pair();
+    let (engine, driver) = test_engine_pair(CompletionMode::Readiness);
     let (driver_result, shutdown_result) = tokio::join!(driver, engine.shutdown());
     driver_result.unwrap();
     shutdown_result.unwrap();
@@ -56,7 +56,7 @@ async fn driver_is_directly_spawnable_and_shutdown_is_idempotent() {
 
 #[tokio::test]
 async fn driver_drop_wakes_shutdown_with_terminal_error() {
-    let (engine, driver) = test_engine_pair();
+    let (engine, driver) = test_engine_pair(CompletionMode::Readiness);
     drop(driver);
     assert!(matches!(
         engine.shutdown().await,

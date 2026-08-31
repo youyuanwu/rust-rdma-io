@@ -284,6 +284,12 @@ impl Qp {
         self.inner.destroy();
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn uses_resources(&self, pd: &Pd, cq: &Cq) -> bool {
+        self.inner
+            .uses_resources(pd.inner(), cq.inner(), cq.inner())
+    }
+
     /// Submit a typed RDMA operation.
     ///
     /// io_uring/compio-style submission: pass a typed [`Op`](super::op::Op)

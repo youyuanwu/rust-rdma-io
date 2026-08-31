@@ -389,6 +389,63 @@ pub mod test_helpers {
     }
 }
 
+/// Shared setup for tests that attach QPs to the v2 engine's test-only lease.
+pub mod engine_test_helpers {
+    use rdma_io::async_cm::{AsyncCmId, AsyncCmListener};
+    use rdma_io::cm::ConnParam;
+    use rdma_io::test_support::engine_driver::{TestEngineQp, TestEngineResources};
+
+    use crate::test_helpers::{connect_addr_for, connect_client_with_retry};
+
+    pub struct EngineTestEndpoint {
+        pub qp: Option<TestEngineQp>,
+        pub cm: Option<AsyncCmId>,
+    }
+
+    pub struct EngineTestPair {
+        pub server: EngineTestEndpoint,
+        pub client: EngineTestEndpoint,
+    }
+
+    pub async fn setup_engine_pair(resources: &TestEngineResources) -> EngineTestPair {
+        let listener = crate::test_helpers::bind_listener_with_retry().await;
+        let connect_addr = connect_addr_for(listener.local_addr());
+
+        let server_resources = resources.clone();
+        let server = tokio::spawn(async move {
+            let conn_id = listener.get_request().await.unwrap();
+            server_resources.require_context(&conn_id).unwrap();
+            let qp = server_resources.create_qp(&conn_id, 64, 64).unwrap();
+            conn_id.accept(&ConnParam::default()).unwrap();
+            listener.await_established().await.unwrap();
+            let cm = AsyncCmListener::migrate_accepted(conn_id).unwrap();
+            EngineTestEndpoint {
+                qp: Some(qp),
+                cm: Some(cm),
+            }
+        });
+
+        let client_resources = resources.clone();
+        let client = tokio::spawn(async move {
+            let (cm, qp) = connect_client_with_retry(&connect_addr, |cm| {
+                client_resources.require_context(cm.cm_id()).unwrap();
+                client_resources.create_qp(cm.cm_id(), 64, 64).unwrap()
+            })
+            .await;
+            EngineTestEndpoint {
+                qp: Some(qp),
+                cm: Some(cm),
+            }
+        });
+
+        let (server, client) = tokio::join!(server, client);
+        EngineTestPair {
+            server: server.unwrap(),
+            client: client.unwrap(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::test_helpers::is_transient_cm_error;

@@ -20,10 +20,27 @@ if [[ -z "${CARGO:-}" ]]; then
 fi
 TOOLCHAIN_BIN="$(dirname "$CARGO")"
 
-if [[ "$MODE" != "--provider-probe" ]]; then
-    echo "usage: sudo -E ./scripts/validate-v2-engine-providers.sh --provider-probe" >&2
-    exit 2
-fi
+case "$MODE" in
+    --provider-probe)
+        TEST_TARGET="v2_engine_provider_probe"
+        REPETITIONS=1
+        MODE_LABEL="Phase 1 provider probe"
+        ;;
+    --readiness-race)
+        TEST_TARGET="v2_engine_readiness_race"
+        REPETITIONS=5
+        MODE_LABEL="Phase 2 readiness race"
+        ;;
+    --driver-flush-gate)
+        TEST_TARGET="v2_engine_driver_flush_gate"
+        REPETITIONS=1
+        MODE_LABEL="Phase 2 driver flush gate"
+        ;;
+    *)
+        echo "usage: sudo -E ./scripts/validate-v2-engine-providers.sh {--provider-probe|--readiness-race|--driver-flush-gate}" >&2
+        exit 2
+        ;;
+esac
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     echo "provider validation must run as root" >&2
     exit 2
@@ -54,7 +71,7 @@ run_step() {
     return 0
 }
 
-run_probe_test() {
+run_selected_test() {
     if [[ -n "${SUDO_USER:-}" ]]; then
         local user_home
         user_home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
@@ -62,13 +79,23 @@ run_probe_test() {
             HOME="$user_home" \
             PATH="$TOOLCHAIN_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
             RUST_TEST_THREADS=1 \
-            "$CARGO" test -p rdma-io-tests --test v2_engine_provider_probe -- --nocapture
+            "$CARGO" test -p rdma-io-tests --test "$TEST_TARGET" -- --nocapture
     else
         env \
             PATH="$TOOLCHAIN_BIN:$PATH" \
             RUST_TEST_THREADS=1 \
-            "$CARGO" test -p rdma-io-tests --test v2_engine_provider_probe -- --nocapture
+            "$CARGO" test -p rdma-io-tests --test "$TEST_TARGET" -- --nocapture
     fi
+}
+
+run_provider_test() {
+    local provider="$1"
+    local iteration
+    for ((iteration = 1; iteration <= REPETITIONS; iteration++)); do
+        run_step \
+            "Run $provider $MODE_LABEL ($iteration/$REPETITIONS)" \
+            run_selected_test
+    done
 }
 
 restore_rxe() {
@@ -96,13 +123,13 @@ trap restore_rxe EXIT
 
 cd "$ROOT_DIR" || exit 1
 run_step "Unload hardware RDMA providers" "$ROOT_DIR/scripts/unload-hw-rdma.sh"
-run_step "Remove SIW before RXE probe" "$ROOT_DIR/scripts/teardown-siw.sh"
+run_step "Remove SIW before RXE validation" "$ROOT_DIR/scripts/teardown-siw.sh"
 run_step "Set up RXE" "$ROOT_DIR/scripts/setup-rxe.sh"
-run_step "Run RXE Phase 1 provider probe" run_probe_test
+run_provider_test "RXE"
 
-run_step "Remove RXE before SIW probe" "$ROOT_DIR/scripts/teardown-rxe.sh"
+run_step "Remove RXE before SIW validation" "$ROOT_DIR/scripts/teardown-rxe.sh"
 run_step "Set up SIW" "$ROOT_DIR/scripts/setup-siw.sh"
-run_step "Run SIW Phase 1 provider probe" run_probe_test
+run_provider_test "SIW"
 
 restore_rxe
 trap - EXIT
@@ -119,4 +146,4 @@ if [[ "$restoration_status" -ne 0 ]]; then
     exit "$restoration_status"
 fi
 
-echo "Phase 1 provider probes passed on RXE and SIW; RXE restored and SIW removed."
+echo "$MODE_LABEL passed on RXE and SIW; RXE restored and SIW removed."

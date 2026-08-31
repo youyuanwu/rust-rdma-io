@@ -1,7 +1,8 @@
 use std::os::unix::io::RawFd;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
-use tokio::io::unix::AsyncFd;
+use tokio::io::{Interest, unix::AsyncFd};
 
 use crate::cm::{EventChannel, RdmaCmDeviceList};
 
@@ -12,17 +13,28 @@ use super::super::pd::Pd;
 use super::config::{CompletionMode, EngineConfig, ProviderLimits};
 
 pub(super) struct EngineResources {
-    #[expect(dead_code, reason = "consumed by the Phase 2 readiness driver")]
     pub(super) cq_async_fd: Option<AsyncFd<RawFd>>,
-    #[expect(dead_code, reason = "consumed by the Phase 2 readiness driver")]
     pub(super) cm_async_fd: Option<AsyncFd<RawFd>>,
-    pub(super) cq: Cq,
-    #[expect(dead_code, reason = "shared by engine connections in later phases")]
+    pub(super) cq: Arc<Cq>,
+    #[allow(
+        dead_code,
+        reason = "shared by engine connections beginning in Phase 3"
+    )]
     pub(super) pd: Pd,
-    #[expect(dead_code, reason = "consumed by the Phase 2 CM driver")]
     pub(super) cm_event_channel: Arc<EventChannel>,
-    #[expect(dead_code, reason = "keeps the selected anchored context facade alive")]
+    #[allow(
+        dead_code,
+        reason = "keeps the anchored context alive and is used by connections beginning in Phase 3"
+    )]
     pub(super) context: Context,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Clone)]
+pub(super) struct TestResourceRefs {
+    pub(super) context: Context,
+    pub(super) pd: Pd,
+    pub(super) cq: Arc<Cq>,
 }
 
 #[derive(Clone, Copy)]
@@ -51,12 +63,12 @@ impl EngineResources {
         let pd = context.alloc_pd()?;
         let cq_entries = i32::try_from(config.cq_capacity)
             .map_err(|_| Error::InvalidConfig("CQ capacity does not fit i32".into()))?;
-        let cq = match config.completion_mode {
+        let cq = Arc::new(match config.completion_mode {
             CompletionMode::Readiness => CqBuilder::new(&context, cq_entries)
                 .with_channel()
                 .build()?,
             CompletionMode::Polling => CqBuilder::new(&context, cq_entries).build()?,
-        };
+        });
         let cm_event_channel = Arc::new(EventChannel::new().map_err(Error::from)?);
         cm_event_channel.set_nonblocking().map_err(Error::from)?;
 
@@ -68,8 +80,8 @@ impl EngineResources {
                     )
                 })?;
                 (
-                    Some(AsyncFd::new(cq_fd).map_err(Error::Verbs)?),
-                    Some(AsyncFd::new(cm_event_channel.fd()).map_err(Error::Verbs)?),
+                    Some(try_async_fd(cq_fd, "CQ completion channel")?),
+                    Some(try_async_fd(cm_event_channel.fd(), "CM event channel")?),
                 )
             }
             CompletionMode::Polling => (None, None),
@@ -96,6 +108,34 @@ impl EngineResources {
             completion_channels: usize::from(self.cq.has_channel()),
             cm_event_channels: 1,
         }
+    }
+
+    pub(super) fn drop_readiness_adapters(&mut self) {
+        self.cq_async_fd.take();
+        self.cm_async_fd.take();
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(super) fn test_resource_refs(&self) -> TestResourceRefs {
+        TestResourceRefs {
+            context: self.context.clone(),
+            pd: self.pd.clone(),
+            cq: Arc::clone(&self.cq),
+        }
+    }
+}
+
+fn try_async_fd(fd: RawFd, resource: &str) -> Result<AsyncFd<RawFd>> {
+    match catch_unwind(AssertUnwindSafe(|| {
+        AsyncFd::with_interest(fd, Interest::READABLE)
+    })) {
+        Ok(Ok(async_fd)) => Ok(async_fd),
+        Ok(Err(error)) => Err(Error::InvalidConfig(format!(
+            "failed to register {resource} with Tokio I/O: {error}"
+        ))),
+        Err(_) => Err(Error::InvalidConfig(format!(
+            "readiness mode requires an active Tokio I/O driver for {resource}"
+        ))),
     }
 }
 

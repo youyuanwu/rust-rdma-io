@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use rdma_io::async_cm::AsyncCmId;
 use rdma_io::cm::{ConnParam, RdmaCmDeviceList};
-use rdma_io::test_support::destruction::{self, DestructionKind};
+use rdma_io::test_support::destruction::{DestructionKind, DestructionRecorder};
 use rdma_io::v2::{
     AccessIntent, CompletionMode, Context, Cq, CqBuilder, Error, Pd, Qp, QpBuilder,
     RdmaEngineBuilder,
@@ -203,33 +203,34 @@ fn provider_limits_reject_unreachable_engine_requests_before_pd_or_cq_creation()
     let max_cqe = attr.max_cqe as usize;
     drop(resources);
 
-    destruction::clear();
+    let recorder = DestructionRecorder::arm(16);
     let connection_result = RdmaEngineBuilder::new(&name)
         .completion_mode(CompletionMode::Polling)
         .maximum_live_connections(max_qp + 1)
         .build();
     assert!(matches!(connection_result, Err(Error::InvalidConfig(_))));
-    let events = destruction::take();
+    let events = recorder.take();
     assert!(!events.iter().any(|event| {
         matches!(
             event.kind,
             DestructionKind::ProtectionDomain | DestructionKind::CompletionQueue
         )
     }));
+    assert!(!recorder.overflowed());
 
-    destruction::clear();
     let cq_result = RdmaEngineBuilder::new(name)
         .completion_mode(CompletionMode::Polling)
         .cq_capacity(max_cqe + 1)
         .build();
     assert!(matches!(cq_result, Err(Error::InvalidConfig(_))));
-    let events = destruction::take();
+    let events = recorder.take();
     assert!(!events.iter().any(|event| {
         matches!(
             event.kind,
             DestructionKind::ProtectionDomain | DestructionKind::CompletionQueue
         )
     }));
+    assert!(!recorder.overflowed());
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
@@ -276,7 +277,7 @@ async fn shared_cq_reports_exact_qp_for_normal_and_explicit_err_completions() {
         unrelated_sends.push(send);
     }
 
-    destruction::clear();
+    let recorder = DestructionRecorder::arm(128);
     pair_one.server.qp.to_error().unwrap();
     let mut expected = HashMap::from([
         (200, (pair_one.server.qp.qp_num(), None)),
@@ -296,7 +297,8 @@ async fn shared_cq_reports_exact_qp_for_normal_and_explicit_err_completions() {
         "explicit local QP ERR must produce at least one flush completion"
     );
     assert!(
-        !destruction::snapshot()
+        !recorder
+            .snapshot()
             .iter()
             .any(|event| event.kind == DestructionKind::QueuePair),
         "routing/draining completions must not destroy a live QP"
@@ -312,10 +314,12 @@ async fn shared_cq_reports_exact_qp_for_normal_and_explicit_err_completions() {
     drop(pair_one);
     drop(pair_two);
 
-    let qp_destroys = destruction::take()
+    let qp_destroys = recorder
+        .take()
         .into_iter()
         .filter(|event| event.kind == DestructionKind::QueuePair)
         .count();
+    assert!(!recorder.overflowed());
     assert_eq!(qp_destroys, 4);
 }
 

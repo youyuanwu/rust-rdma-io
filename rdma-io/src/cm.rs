@@ -566,6 +566,24 @@ impl CmQueuePair {
         unsafe { (*self.qp).qp_num }
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn uses_resources(
+        &self,
+        pd: &Arc<ProtectionDomain>,
+        send_cq: &Arc<CompletionQueue>,
+        recv_cq: &Arc<CompletionQueue>,
+    ) -> bool {
+        Arc::ptr_eq(&self._pd, pd)
+            && self
+                ._send_cq
+                .as_ref()
+                .is_some_and(|cq| Arc::ptr_eq(cq, send_cq))
+            && self
+                ._recv_cq
+                .as_ref()
+                .is_some_and(|cq| Arc::ptr_eq(cq, recv_cq))
+    }
+
     /// Transition the QP to the ERROR state (`IBV_QPS_ERR`).
     ///
     /// Legal from any state. Forces every outstanding send/recv work request to
