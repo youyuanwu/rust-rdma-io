@@ -3,10 +3,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use rdma_io::cm::RdmaCmDeviceList;
+use rdma_io::v2::test_support::TestHelloOverride;
 use rdma_io::v2::{
     CompletionMode, Error, MessageTransportBuilder, RdmaEngine, RdmaEngineBuilder, Result,
 };
-use rdma_io_tests::engine_test_helpers::establish_message_pair_with_retry_after_ready;
+use rdma_io_tests::engine_test_helpers::establish_message_pair_with_retry_before_connect_accept;
 use rdma_io_tests::test_helpers::has_software_rdma;
 
 fn software_device_name() -> Option<String> {
@@ -44,7 +45,7 @@ async fn transient_retry_reclaims_capacity_routes_and_requests_before_retry() {
     let (client_engine, client_driver) = build_engine();
     let attempts = Arc::new(AtomicUsize::new(0));
     let attempts_for_check = Arc::clone(&attempts);
-    let (listener, server, client) = establish_message_pair_with_retry_after_ready(
+    let (listener, server, client) = establish_message_pair_with_retry_before_connect_accept(
         &server_engine,
         &client_engine,
         MessageTransportBuilder::new,
@@ -82,6 +83,38 @@ async fn transient_retry_reclaims_capacity_routes_and_requests_before_retry() {
         assert_eq!(instrumentation.cm_retained_owners, 0);
     }
     assert_eq!(server_engine.diagnostics().listener_count, 0);
+
+    shutdown_engine(server_engine, server_driver).await;
+    shutdown_engine(client_engine, client_driver).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn hello_protocol_failure_is_never_retried() {
+    if !has_software_rdma() {
+        return;
+    }
+    let (server_engine, server_driver) = build_engine();
+    let (client_engine, client_driver) = build_engine();
+    let builder_calls = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::clone(&builder_calls);
+
+    let result = establish_message_pair_with_retry_before_connect_accept(
+        &server_engine,
+        &client_engine,
+        move || {
+            calls.fetch_add(1, Ordering::AcqRel);
+            MessageTransportBuilder::new().test_hello_override(TestHelloOverride::BadMagic)
+        },
+        |_| Ok(()),
+    )
+    .await;
+
+    assert!(result.is_err(), "malformed HELLO unexpectedly succeeded");
+    assert_eq!(
+        builder_calls.load(Ordering::Acquire),
+        2,
+        "HELLO failure must not start a second connect/accept attempt"
+    );
 
     shutdown_engine(server_engine, server_driver).await;
     shutdown_engine(client_engine, client_driver).await;

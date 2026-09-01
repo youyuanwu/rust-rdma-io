@@ -226,12 +226,18 @@ impl CmState {
     }
 
     pub(super) fn has_software_work(&self) -> bool {
-        !lock_unpoison(&self.pending).is_empty()
-            || !lock_unpoison(&self.pending_listens).is_empty()
-            || !lock_unpoison(&self.cancellations).is_empty()
-            || !lock_unpoison(&self.listener_work).is_empty()
-            || !lock_unpoison(&self.retirements).is_empty()
-            || !lock_unpoison(&self.cm_destructions).is_empty()
+        let pending = !lock_unpoison(&self.pending).is_empty();
+        let pending_listens = !lock_unpoison(&self.pending_listens).is_empty();
+        let cancellations = !lock_unpoison(&self.cancellations).is_empty();
+        let listener_work = !lock_unpoison(&self.listener_work).is_empty();
+        let retirements = !lock_unpoison(&self.retirements).is_empty();
+        let cm_destructions = !lock_unpoison(&self.cm_destructions).is_empty();
+        pending
+            || pending_listens
+            || cancellations
+            || listener_work
+            || retirements
+            || cm_destructions
     }
 
     pub(super) fn service_software(
@@ -243,12 +249,17 @@ impl CmState {
         // Snapshot each class depth at pass entry. Work requeued while it is
         // transitioning is therefore deferred to a later driver poll instead
         // of consuming this pass's bounded budget repeatedly.
+        let cancellations = lock_unpoison(&self.cancellations).len();
+        let retirements = lock_unpoison(&self.retirements).len();
+        let pending = lock_unpoison(&self.pending).len();
+        let pending_listens = lock_unpoison(&self.pending_listens).len();
+        let listener_work = lock_unpoison(&self.listener_work).len();
         let mut remaining = [
-            lock_unpoison(&self.cancellations).len(),
-            lock_unpoison(&self.retirements).len(),
-            lock_unpoison(&self.pending).len(),
-            lock_unpoison(&self.pending_listens).len(),
-            lock_unpoison(&self.listener_work).len(),
+            cancellations,
+            retirements,
+            pending,
+            pending_listens,
+            listener_work,
         ];
         let mut next_class = 0;
         let mut processed = 0;
@@ -349,14 +360,14 @@ impl CmState {
         };
         let route = self.lookup_dispatch_route(snapshot);
         event.ack_checked().map_err(Error::from_v1)?;
-        shared
-            .diagnostic_counters
-            .cm_events_processed
-            .fetch_add(1, Ordering::Relaxed);
 
         let route = match route {
             Ok(route) => route,
             Err(reject) => {
+                shared
+                    .diagnostic_counters
+                    .cm_events_processed
+                    .fetch_add(1, Ordering::Relaxed);
                 shared.diagnostic_counters.reject_cm_event(reject);
                 if snapshot.event_type == CmEventType::ConnectRequest {
                     self.reject_raw_child(
@@ -385,14 +396,18 @@ impl CmState {
             }
         };
         match disposition {
-            EventDisposition::Handled => {}
-            EventDisposition::IgnoredAfterShutdown => {
+            EventDisposition::Handled => {
                 shared
                     .diagnostic_counters
                     .cm_events_processed
-                    .fetch_sub(1, Ordering::Relaxed);
+                    .fetch_add(1, Ordering::Relaxed);
             }
+            EventDisposition::IgnoredAfterShutdown => {}
             EventDisposition::Rejected(reject) => {
+                shared
+                    .diagnostic_counters
+                    .cm_events_processed
+                    .fetch_add(1, Ordering::Relaxed);
                 shared.diagnostic_counters.reject_cm_event(reject);
             }
         }
@@ -442,26 +457,36 @@ impl CmState {
             .into_iter()
             .filter(|route| route.is_establishing())
             .count();
+        let pending = lock_unpoison(&self.pending).len();
+        let pending_listens = lock_unpoison(&self.pending_listens).len();
+        let cancellations = lock_unpoison(&self.cancellations).len();
+        let listener_work = lock_unpoison(&self.listener_work).len();
+        let retirements = lock_unpoison(&self.retirements).len();
+        let cm_destructions = lock_unpoison(&self.cm_destructions).len();
+        let inbound_routes = self.inbound_routes.live();
+        let listeners = lock_unpoison(&self.listeners).len();
         establishing
-            + lock_unpoison(&self.pending).len()
-            + lock_unpoison(&self.pending_listens).len()
-            + lock_unpoison(&self.cancellations).len()
-            + lock_unpoison(&self.listener_work).len()
-            + lock_unpoison(&self.retirements).len()
-            + lock_unpoison(&self.cm_destructions).len()
-            + self.inbound_routes.live()
-            + lock_unpoison(&self.listeners).len()
+            + pending
+            + pending_listens
+            + cancellations
+            + listener_work
+            + retirements
+            + cm_destructions
+            + inbound_routes
+            + listeners
     }
 
     pub(super) fn retained_owner_count(&self) -> usize {
-        let routed_owners = self.routes.live()
-            + self.inbound_routes.live()
-            + lock_unpoison(&self.listeners).len()
-            + lock_unpoison(&self.cm_destructions).len();
+        let routes = self.routes.live();
+        let inbound_routes = self.inbound_routes.live();
+        let listeners = lock_unpoison(&self.listeners).len();
+        let cm_destructions = lock_unpoison(&self.cm_destructions).len();
+        let routed_owners = routes + inbound_routes + listeners + cm_destructions;
         // Every retained setup rollback still owns its live CM route. The
         // maximum counts those overlapping owners once while flooring the
         // result if a future unregistered rollback ever loses route coverage.
-        routed_owners.max(lock_unpoison(&self.setup_rollback_quarantines).len())
+        let setup_rollback_quarantines = lock_unpoison(&self.setup_rollback_quarantines).len();
+        routed_owners.max(setup_rollback_quarantines)
     }
 
     pub(super) fn oldest_setup_rollback_quarantine(&self) -> Option<Instant> {
@@ -2558,6 +2583,14 @@ impl CmState {
                 drop(reservation);
                 self.retire_route(route, true);
                 if shutdown_won {
+                    tracing::debug!(
+                        cm_event = ?snapshot.event_type,
+                        status = snapshot.status,
+                        id = snapshot.id,
+                        listen_id = snapshot.listen_id,
+                        failure = %message,
+                        "ignoring outbound CM setup failure after shutdown won the request"
+                    );
                     request.complete(Err(Error::DriverShutdown));
                     return Ok(EventDisposition::IgnoredAfterShutdown);
                 }
@@ -3384,6 +3417,7 @@ mod tests {
     };
     use crate::v2::qp::{BatchPostOutcome, QpCapabilities};
     use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
+    use std::sync::Barrier;
     use std::task::{Context, Poll};
 
     #[test]
@@ -3417,6 +3451,89 @@ mod tests {
         ] {
             assert!(!is_failure_event(event));
         }
+    }
+
+    #[test]
+    fn former_pending_cancellation_lock_order_forms_an_abba_cycle() {
+        let cm = Arc::new(CmState::new(1).unwrap());
+        let first_locks_held = Arc::new(Barrier::new(2));
+        let second_locks_checked = Arc::new(Barrier::new(2));
+
+        let diagnostics_cm = Arc::clone(&cm);
+        let diagnostics_first = Arc::clone(&first_locks_held);
+        let diagnostics_checked = Arc::clone(&second_locks_checked);
+        let diagnostics = std::thread::spawn(move || {
+            let pending = lock_unpoison(&diagnostics_cm.pending);
+            diagnostics_first.wait();
+            assert!(
+                diagnostics_cm.cancellations.try_lock().is_err(),
+                "the former diagnostics order must observe cancellations held"
+            );
+            diagnostics_checked.wait();
+            drop(pending);
+        });
+
+        let service_cm = Arc::clone(&cm);
+        let service_first = Arc::clone(&first_locks_held);
+        let service_checked = Arc::clone(&second_locks_checked);
+        let service = std::thread::spawn(move || {
+            let cancellations = lock_unpoison(&service_cm.cancellations);
+            service_first.wait();
+            assert!(
+                service_cm.pending.try_lock().is_err(),
+                "the former service order must observe pending held"
+            );
+            service_checked.wait();
+            drop(cancellations);
+        });
+
+        diagnostics.join().unwrap();
+        service.join().unwrap();
+    }
+
+    #[test]
+    fn diagnostics_and_cm_service_complete_under_lock_order_stress() {
+        let (engine, driver) =
+            super::super::test_engine_pair(super::super::CompletionMode::Polling);
+        let shared = Arc::clone(&engine.shared);
+        let start = Arc::new(Barrier::new(3));
+
+        let diagnostics_shared = Arc::clone(&shared);
+        let diagnostics_start = Arc::clone(&start);
+        let diagnostics = std::thread::spawn(move || {
+            diagnostics_start.wait();
+            for _ in 0..1_000 {
+                let _ = diagnostics_shared.cm.pending_route_count();
+                let _ = diagnostics_shared.cm.retained_owner_count();
+                let _ = diagnostics_shared.cm.has_software_work();
+            }
+        });
+
+        let service_shared = Arc::clone(&shared);
+        let service_start = Arc::clone(&start);
+        let service = std::thread::spawn(move || {
+            service_start.wait();
+            for _ in 0..1_000 {
+                service_shared
+                    .cm
+                    .enqueue_cancellation(Arc::new(test_request()));
+                assert_eq!(
+                    service_shared
+                        .cm
+                        .service_software(&service_shared, None, 1)
+                        .unwrap(),
+                    1
+                );
+            }
+        });
+
+        start.wait();
+        diagnostics.join().unwrap();
+        service.join().unwrap();
+        assert!(lock_unpoison(&shared.cm.cancellations).is_empty());
+
+        drop(engine);
+        drop(driver);
     }
 
     #[test]

@@ -177,26 +177,58 @@ pub mod test_helpers {
     }
 
     fn is_transient_cm_event_message(message: &str) -> bool {
-        message.contains("RDMA CM")
-            && (["Rejected", "Unreachable", "ConnectError"]
-                .iter()
-                .any(|event| message.contains(event))
-                || [
-                    "status 22",
-                    "status -22",
-                    "status 71",
-                    "status -71",
-                    "status 98",
-                    "status -98",
-                ]
-                .iter()
-                .any(|status| message.contains(status)))
+        transient_cm_event(message).is_some_and(|(event, status)| {
+            matches!(
+                event,
+                "AddrError" | "RouteError" | "Rejected" | "Unreachable" | "ConnectError"
+            ) && is_transient_cm_status(status)
+        })
     }
 
-    /// Returns `true` for transient V2 engine CM errors raised before a test
-    /// connection's protocol-specific work begins.
-    pub fn is_transient_v2_engine_cm_error(err: &rdma_io::v2::Error) -> bool {
-        matches!(err, rdma_io::v2::Error::Verbs(io) if is_transient_cm_io_error(io))
+    fn transient_cm_event(message: &str) -> Option<(&str, i32)> {
+        let message = message.strip_prefix("RDMA CM ")?;
+        let (event, status) = message.split_once(" failed with status ")?;
+        let status = status.split_whitespace().next()?.parse().ok()?;
+        Some((event, status))
+    }
+
+    fn is_transient_cm_status(status: i32) -> bool {
+        matches!(status.checked_abs(), Some(22 | 71 | 98))
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum V2EngineCmSetupStage {
+        Listen,
+        ConnectAccept,
+    }
+
+    /// Returns `true` only for known software-provider failures from an
+    /// explicitly identified V2 listener/connect/accept setup stage.
+    pub(crate) fn is_transient_v2_engine_cm_setup_error(
+        stage: V2EngineCmSetupStage,
+        err: &rdma_io::v2::Error,
+    ) -> bool {
+        let rdma_io::v2::Error::Verbs(error) = err else {
+            return false;
+        };
+        match stage {
+            V2EngineCmSetupStage::Listen | V2EngineCmSetupStage::ConnectAccept => {
+                error.raw_os_error().is_some_and(is_transient_cm_status)
+                    || is_transient_cm_event_message(&error.to_string())
+            }
+        }
+    }
+
+    pub(crate) fn are_v2_engine_cm_setup_errors_retryable(
+        stage: V2EngineCmSetupStage,
+        errors: &[rdma_io::v2::Error],
+        reject_event_counters_unchanged: bool,
+    ) -> bool {
+        reject_event_counters_unchanged
+            && !errors.is_empty()
+            && errors
+                .iter()
+                .all(|error| is_transient_v2_engine_cm_setup_error(stage, error))
     }
 
     /// Bind an [`AsyncCmListener`] to `0.0.0.0:0`, retrying on `EADDRINUSE`.
@@ -432,6 +464,8 @@ pub mod test_helpers {
 
 /// Shared setup for tests that attach QPs to the v2 engine's test-only lease.
 pub mod engine_test_helpers {
+    use std::error::Error as StdError;
+    use std::fmt;
     use std::time::Duration;
 
     use rdma_io::async_cm::{AsyncCmId, AsyncCmListener};
@@ -443,9 +477,39 @@ pub mod engine_test_helpers {
     };
 
     use crate::test_helpers::{
-        TRANSIENT_CM_HANDSHAKE_ATTEMPTS, connect_addr_for, connect_client_with_retry,
-        is_transient_v2_engine_cm_error, transient_cm_retry_delay,
+        TRANSIENT_CM_HANDSHAKE_ATTEMPTS, V2EngineCmSetupStage,
+        are_v2_engine_cm_setup_errors_retryable, connect_addr_for, connect_client_with_retry,
+        transient_cm_retry_delay,
     };
+
+    const V2_SETUP_STAGE_TIMEOUT: Duration = Duration::from_secs(15);
+    const V2_SETUP_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
+    const V2_SETUP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
+    const V2_SETUP_CLEANUP_MIN_BACKOFF: Duration = Duration::from_millis(1);
+    const V2_SETUP_CLEANUP_MAX_BACKOFF: Duration = Duration::from_millis(10);
+
+    #[derive(Debug)]
+    struct ExhaustedV2SetupRetries {
+        attempts: u64,
+        last_transient: Error,
+    }
+
+    impl fmt::Display for ExhaustedV2SetupRetries {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                formatter,
+                "V2 software-provider CM setup retries exhausted after {} attempts; \
+                 last transient cause: {}",
+                self.attempts, self.last_transient
+            )
+        }
+    }
+
+    impl StdError for ExhaustedV2SetupRetries {
+        fn source(&self) -> Option<&(dyn StdError + 'static)> {
+            Some(&self.last_transient)
+        }
+    }
 
     pub struct EngineTestEndpoint {
         pub qp: Option<TestEngineQp>,
@@ -484,6 +548,19 @@ pub mod engine_test_helpers {
         listener_details: usize,
         cm_pending_routes: usize,
         cm_retained_owners: usize,
+        inbound_requests_rejected: u64,
+        inbound_rejected_backlog_full: u64,
+        inbound_rejected_connection_capacity: u64,
+        inbound_rejected_admission_closed: u64,
+        inbound_rejected_listener_closed: u64,
+        inbound_rejected_context_mismatch: u64,
+        inbound_rejected_setup_failure: u64,
+        cm_events_rejected: u64,
+        stale_cm_events: u64,
+        duplicate_cm_events: u64,
+        unknown_cm_events: u64,
+        wrong_id_cm_events: u64,
+        unexpected_cm_events: u64,
     }
 
     impl EngineCleanupBaseline {
@@ -517,7 +594,72 @@ pub mod engine_test_helpers {
                 listener_details: diagnostics.listeners().len(),
                 cm_pending_routes: instrumentation.cm_pending_routes,
                 cm_retained_owners: instrumentation.cm_retained_owners,
+                inbound_requests_rejected: diagnostics.inbound_requests_rejected,
+                inbound_rejected_backlog_full: diagnostics.inbound_rejected_backlog_full,
+                inbound_rejected_connection_capacity: diagnostics
+                    .inbound_rejected_connection_capacity,
+                inbound_rejected_admission_closed: diagnostics.inbound_rejected_admission_closed,
+                inbound_rejected_listener_closed: diagnostics.inbound_rejected_listener_closed,
+                inbound_rejected_context_mismatch: diagnostics.inbound_rejected_context_mismatch,
+                inbound_rejected_setup_failure: diagnostics.inbound_rejected_setup_failure,
+                cm_events_rejected: diagnostics.cm_events_rejected,
+                stale_cm_events: diagnostics.stale_cm_events,
+                duplicate_cm_events: diagnostics.duplicate_cm_events,
+                unknown_cm_events: diagnostics.unknown_cm_events,
+                wrong_id_cm_events: diagnostics.wrong_id_cm_events,
+                unexpected_cm_events: diagnostics.unexpected_cm_events,
             }
+        }
+
+        fn cleanup_gauges_match(&self, expected: &Self) -> bool {
+            self.live_connection_reservations == expected.live_connection_reservations
+                && self.establishing_connection_reservations
+                    == expected.establishing_connection_reservations
+                && self.established_connection_reservations
+                    == expected.established_connection_reservations
+                && self.draining_connection_reservations
+                    == expected.draining_connection_reservations
+                && self.registered_live_qps == expected.registered_live_qps
+                && self.free_connection_slots == expected.free_connection_slots
+                && self.registered_operations == expected.registered_operations
+                && self.free_operation_slots == expected.free_operation_slots
+                && self.accepted_outstanding_operations == expected.accepted_outstanding_operations
+                && self.free_cq_credits == expected.free_cq_credits
+                && self.retained_cq_credits == expected.retained_cq_credits
+                && self.pending_reclamations == expected.pending_reclamations
+                && self.quarantined_operations == expected.quarantined_operations
+                && self.quarantined_mrs == expected.quarantined_mrs
+                && self.quarantined_bytes == expected.quarantined_bytes
+                && self.quarantined_bundles == expected.quarantined_bundles
+                && self.ready_queue_depth == expected.ready_queue_depth
+                && self.listener_count == expected.listener_count
+                && self.queued_inbound_requests == expected.queued_inbound_requests
+                && self.pending_accepts == expected.pending_accepts
+                && self.selected_accepts == expected.selected_accepts
+                && self.connection_details == expected.connection_details
+                && self.listener_details == expected.listener_details
+                && self.cm_pending_routes == expected.cm_pending_routes
+                && self.cm_retained_owners == expected.cm_retained_owners
+        }
+
+        fn reject_event_counters_match(&self, expected: &Self) -> bool {
+            self.inbound_requests_rejected == expected.inbound_requests_rejected
+                && self.inbound_rejected_backlog_full == expected.inbound_rejected_backlog_full
+                && self.inbound_rejected_connection_capacity
+                    == expected.inbound_rejected_connection_capacity
+                && self.inbound_rejected_admission_closed
+                    == expected.inbound_rejected_admission_closed
+                && self.inbound_rejected_listener_closed
+                    == expected.inbound_rejected_listener_closed
+                && self.inbound_rejected_context_mismatch
+                    == expected.inbound_rejected_context_mismatch
+                && self.inbound_rejected_setup_failure == expected.inbound_rejected_setup_failure
+                && self.cm_events_rejected == expected.cm_events_rejected
+                && self.stale_cm_events == expected.stale_cm_events
+                && self.duplicate_cm_events == expected.duplicate_cm_events
+                && self.unknown_cm_events == expected.unknown_cm_events
+                && self.wrong_id_cm_events == expected.wrong_id_cm_events
+                && self.unexpected_cm_events == expected.unexpected_cm_events
         }
     }
 
@@ -528,8 +670,10 @@ pub mod engine_test_helpers {
         client_engine: &RdmaEngine,
         client_resources: &TestEngineResources,
         client_baseline: &EngineCleanupBaseline,
-    ) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        failure_context: &str,
+    ) -> (EngineCleanupBaseline, EngineCleanupBaseline) {
+        let deadline = std::time::Instant::now() + V2_SETUP_CLEANUP_TIMEOUT;
+        let mut backoff = V2_SETUP_CLEANUP_MIN_BACKOFF;
         loop {
             let server = EngineCleanupBaseline::capture(
                 server_engine,
@@ -539,16 +683,21 @@ pub mod engine_test_helpers {
                 client_engine,
                 client_resources.instrumentation().unwrap(),
             );
-            if &server == server_baseline && &client == client_baseline {
-                return;
+            if server.cleanup_gauges_match(server_baseline)
+                && client.cleanup_gauges_match(client_baseline)
+            {
+                return (server, client);
             }
+            let now = std::time::Instant::now();
             assert!(
-                std::time::Instant::now() < deadline,
+                now < deadline,
                 "V2 engine retry cleanup did not restore its exact baseline: \
+                 pending failure {failure_context}; \
                  server expected {server_baseline:?}, observed {server:?}; \
                  client expected {client_baseline:?}, observed {client:?}"
             );
-            tokio::task::yield_now().await;
+            tokio::time::sleep(backoff.min(deadline.saturating_duration_since(now))).await;
+            backoff = (backoff * 2).min(V2_SETUP_CLEANUP_MAX_BACKOFF);
         }
     }
 
@@ -581,9 +730,37 @@ pub mod engine_test_helpers {
         drop(listener);
     }
 
+    pub(crate) fn retry_exhausted(last_transient: Error) -> Error {
+        Error::Verbs(std::io::Error::other(ExhaustedV2SetupRetries {
+            attempts: TRANSIENT_CM_HANDSHAKE_ATTEMPTS,
+            last_transient,
+        }))
+    }
+
+    fn setup_timeout(stage: &str, elapsed: tokio::time::error::Elapsed) -> Error {
+        Error::Verbs(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("V2 message {stage} timed out: {elapsed}"),
+        ))
+    }
+
+    fn attempt_has_no_engine_rejects(
+        server: &EngineCleanupBaseline,
+        server_baseline: &EngineCleanupBaseline,
+        client: &EngineCleanupBaseline,
+        client_baseline: &EngineCleanupBaseline,
+    ) -> bool {
+        server.reject_event_counters_match(server_baseline)
+            && client.reject_event_counters_match(client_baseline)
+    }
+
     /// Establish a ready message pair, retrying only known transient
-    /// software-RDMA CM failures from listener creation, connect/accept, or
-    /// the HELLO handshake.
+    /// software-RDMA failures from listener or connect/accept CM setup.
+    ///
+    /// Retries are test-only provider recovery. They never cover HELLO,
+    /// protocol, or data-operation errors. All attempts share a 60-second
+    /// wall-clock budget; cancellation of that outer budget is followed by
+    /// at most 15 seconds of exact cleanup verification.
     pub async fn establish_message_pair_with_retry<F>(
         server_engine: &RdmaEngine,
         client_engine: &RdmaEngine,
@@ -592,7 +769,7 @@ pub mod engine_test_helpers {
     where
         F: FnMut() -> MessageTransportBuilder,
     {
-        establish_message_pair_with_retry_after_ready(
+        establish_message_pair_with_retry_before_connect_accept(
             server_engine,
             client_engine,
             make_builder,
@@ -601,13 +778,13 @@ pub mod engine_test_helpers {
         .await
     }
 
-    /// Variant with a post-ready check used to deterministically exercise the
-    /// retry and cleanup path without injecting failures into production code.
-    pub async fn establish_message_pair_with_retry_after_ready<F, C>(
+    /// Variant with a pre-connect/accept check used to exercise setup retry
+    /// and listener cleanup without injecting failures into production code.
+    pub async fn establish_message_pair_with_retry_before_connect_accept<F, C>(
         server_engine: &RdmaEngine,
         client_engine: &RdmaEngine,
         mut make_builder: F,
-        mut after_ready: C,
+        mut before_connect_accept: C,
     ) -> Result<(RdmaListener, MessageTransport, MessageTransport)>
     where
         F: FnMut() -> MessageTransportBuilder,
@@ -615,87 +792,76 @@ pub mod engine_test_helpers {
     {
         let server_resources = server_engine.test_resources().unwrap();
         let client_resources = client_engine.test_resources().unwrap();
-        let mut last_transient = None;
+        let total_server_baseline = EngineCleanupBaseline::capture(
+            server_engine,
+            server_resources.instrumentation().unwrap(),
+        );
+        let total_client_baseline = EngineCleanupBaseline::capture(
+            client_engine,
+            client_resources.instrumentation().unwrap(),
+        );
+        let mut attempt_history = Vec::new();
 
-        for attempt in 0..TRANSIENT_CM_HANDSHAKE_ATTEMPTS {
-            let server_baseline = EngineCleanupBaseline::capture(
-                server_engine,
-                server_resources.instrumentation().unwrap(),
-            );
-            let client_baseline = EngineCleanupBaseline::capture(
-                client_engine,
-                client_resources.instrumentation().unwrap(),
-            );
-            let listener = match server_engine
-                .listen(
-                    "0.0.0.0:0".parse().unwrap(),
-                    RdmaListenerConfig::default().backlog(8),
+        let establish = async {
+            for attempt in 0..TRANSIENT_CM_HANDSHAKE_ATTEMPTS {
+                let server_baseline = EngineCleanupBaseline::capture(
+                    server_engine,
+                    server_resources.instrumentation().unwrap(),
+                );
+                let client_baseline = EngineCleanupBaseline::capture(
+                    client_engine,
+                    client_resources.instrumentation().unwrap(),
+                );
+                let listener = match tokio::time::timeout(
+                    V2_SETUP_STAGE_TIMEOUT,
+                    server_engine.listen(
+                        "0.0.0.0:0".parse().unwrap(),
+                        RdmaListenerConfig::default().backlog(8),
+                    ),
                 )
                 .await
-            {
-                Ok(listener) => listener,
-                Err(error) if is_transient_v2_engine_cm_error(&error) => {
-                    if attempt + 1 == TRANSIENT_CM_HANDSHAKE_ATTEMPTS {
-                        return Err(error);
+                {
+                    Ok(Ok(listener)) => listener,
+                    Ok(Err(error)) => {
+                        let context = format!("listener setup failed: {error}");
+                        attempt_history.push(format!("attempt {attempt}: {context}"));
+                        let (server, client) = wait_for_engine_cleanup(
+                            server_engine,
+                            &server_resources,
+                            &server_baseline,
+                            client_engine,
+                            &client_resources,
+                            &client_baseline,
+                            &context,
+                        )
+                        .await;
+                        let no_engine_rejects = attempt_has_no_engine_rejects(
+                            &server,
+                            &server_baseline,
+                            &client,
+                            &client_baseline,
+                        );
+                        let retry = are_v2_engine_cm_setup_errors_retryable(
+                            V2EngineCmSetupStage::Listen,
+                            std::slice::from_ref(&error),
+                            no_engine_rejects,
+                        );
+                        if !retry {
+                            return Err(error);
+                        }
+                        if attempt + 1 == TRANSIENT_CM_HANDSHAKE_ATTEMPTS {
+                            return Err(retry_exhausted(error));
+                        }
+                        tracing::warn!(
+                            "V2 message listener attempt {attempt} failed transiently: {error}"
+                        );
+                        tokio::time::sleep(transient_cm_retry_delay(attempt)).await;
+                        continue;
                     }
-                    wait_for_engine_cleanup(
-                        server_engine,
-                        &server_resources,
-                        &server_baseline,
-                        client_engine,
-                        &client_resources,
-                        &client_baseline,
-                    )
-                    .await;
-                    tracing::warn!(
-                        "V2 message listener attempt {attempt} failed transiently: {error}"
-                    );
-                    last_transient = Some(error);
-                    // Cleanup is already complete. This bounded sleep is only
-                    // for kernel/CM resource recovery, never state synchronization.
-                    tokio::time::sleep(transient_cm_retry_delay(attempt)).await;
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            let address = connect_addr_for(Some(listener.local_addr()?));
-            let established = tokio::time::timeout(Duration::from_secs(15), async {
-                tokio::try_join!(
-                    make_builder().accept_on(&listener),
-                    make_builder().connect_on(client_engine, address)
-                )
-            })
-            .await;
-            let (server, client, mut errors) = match established {
-                Ok(Ok((server, client))) => (Some(server), Some(client), Vec::new()),
-                Ok(Err(error)) => (None, None, vec![error]),
-                Err(elapsed) => {
-                    close_message_attempt(Some(listener), None, None).await;
-                    wait_for_engine_cleanup(
-                        server_engine,
-                        &server_resources,
-                        &server_baseline,
-                        client_engine,
-                        &client_resources,
-                        &client_baseline,
-                    )
-                    .await;
-                    panic!("V2 message establishment timed out: {elapsed}");
-                }
-            };
-
-            if errors.is_empty() {
-                let server_ref = server.as_ref().expect("successful server establishment");
-                let client_ref = client.as_ref().expect("successful client establishment");
-                let ready = tokio::time::timeout(Duration::from_secs(15), async {
-                    tokio::try_join!(server_ref.ready(), client_ref.ready())
-                })
-                .await;
-                match ready {
-                    Ok(Ok(((), ()))) => {}
-                    Ok(Err(error)) => errors.push(error),
                     Err(elapsed) => {
-                        close_message_attempt(Some(listener), server, client).await;
+                        let error = setup_timeout("listener setup", elapsed);
+                        let context = error.to_string();
+                        attempt_history.push(format!("attempt {attempt}: {context}"));
                         wait_for_engine_cleanup(
                             server_engine,
                             &server_resources,
@@ -703,62 +869,234 @@ pub mod engine_test_helpers {
                             client_engine,
                             &client_resources,
                             &client_baseline,
+                            &context,
                         )
                         .await;
-                        panic!("V2 message HELLO timed out: {elapsed}");
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = before_connect_accept(attempt) {
+                    let context = format!("injected connect/accept setup failure: {error}");
+                    attempt_history.push(format!("attempt {attempt}: {context}"));
+                    close_message_attempt(Some(listener), None, None).await;
+                    let (server, client) = wait_for_engine_cleanup(
+                        server_engine,
+                        &server_resources,
+                        &server_baseline,
+                        client_engine,
+                        &client_resources,
+                        &client_baseline,
+                        &context,
+                    )
+                    .await;
+                    let no_engine_rejects = attempt_has_no_engine_rejects(
+                        &server,
+                        &server_baseline,
+                        &client,
+                        &client_baseline,
+                    );
+                    if !are_v2_engine_cm_setup_errors_retryable(
+                        V2EngineCmSetupStage::ConnectAccept,
+                        std::slice::from_ref(&error),
+                        no_engine_rejects,
+                    ) {
+                        return Err(error);
+                    }
+                    if attempt + 1 == TRANSIENT_CM_HANDSHAKE_ATTEMPTS {
+                        return Err(retry_exhausted(error));
+                    }
+                    tracing::warn!(
+                        "V2 message connect/accept attempt {attempt} failed transiently: {error}"
+                    );
+                    tokio::time::sleep(transient_cm_retry_delay(attempt)).await;
+                    continue;
+                }
+                let address = match listener.local_addr() {
+                    Ok(address) => connect_addr_for(Some(address)),
+                    Err(error) => {
+                        let context = format!("listener local address failed: {error}");
+                        attempt_history.push(format!("attempt {attempt}: {context}"));
+                        close_message_attempt(Some(listener), None, None).await;
+                        wait_for_engine_cleanup(
+                            server_engine,
+                            &server_resources,
+                            &server_baseline,
+                            client_engine,
+                            &client_resources,
+                            &client_baseline,
+                            &context,
+                        )
+                        .await;
+                        return Err(error);
+                    }
+                };
+                let established = tokio::time::timeout(V2_SETUP_STAGE_TIMEOUT, async {
+                    tokio::join!(
+                        make_builder().accept_on(&listener),
+                        make_builder().connect_on(client_engine, address)
+                    )
+                })
+                .await;
+                let (server, client, setup_errors) = match established {
+                    Ok((server, client)) => {
+                        let mut errors = Vec::new();
+                        let server = match server {
+                            Ok(server) => Some(server),
+                            Err(error) => {
+                                errors.push(error);
+                                None
+                            }
+                        };
+                        let client = match client {
+                            Ok(client) => Some(client),
+                            Err(error) => {
+                                errors.push(error);
+                                None
+                            }
+                        };
+                        (server, client, errors)
+                    }
+                    Err(elapsed) => {
+                        close_message_attempt(Some(listener), None, None).await;
+                        let error = setup_timeout("connect/accept setup", elapsed);
+                        let context = error.to_string();
+                        attempt_history.push(format!("attempt {attempt}: {context}"));
+                        wait_for_engine_cleanup(
+                            server_engine,
+                            &server_resources,
+                            &server_baseline,
+                            client_engine,
+                            &client_resources,
+                            &client_baseline,
+                            &context,
+                        )
+                        .await;
+                        return Err(error);
+                    }
+                };
+
+                if !setup_errors.is_empty() {
+                    let context = format!("connect/accept setup failed: {setup_errors:?}");
+                    attempt_history.push(format!("attempt {attempt}: {context}"));
+                    close_message_attempt(Some(listener), server, client).await;
+                    let (server, client) = wait_for_engine_cleanup(
+                        server_engine,
+                        &server_resources,
+                        &server_baseline,
+                        client_engine,
+                        &client_resources,
+                        &client_baseline,
+                        &context,
+                    )
+                    .await;
+                    let no_engine_rejects = attempt_has_no_engine_rejects(
+                        &server,
+                        &server_baseline,
+                        &client,
+                        &client_baseline,
+                    );
+                    if !no_engine_rejects {
+                        tracing::warn!(
+                            "V2 setup retry disabled by engine reject/event counter delta: \
+                             server before {server_baseline:?}, after {server:?}; \
+                             client before {client_baseline:?}, after {client:?}"
+                        );
+                    }
+                    if !are_v2_engine_cm_setup_errors_retryable(
+                        V2EngineCmSetupStage::ConnectAccept,
+                        &setup_errors,
+                        no_engine_rejects,
+                    ) {
+                        return Err(setup_errors[0].clone());
+                    }
+                    let error = setup_errors
+                        .into_iter()
+                        .next()
+                        .expect("failed setup must carry an error");
+                    if attempt + 1 == TRANSIENT_CM_HANDSHAKE_ATTEMPTS {
+                        return Err(retry_exhausted(error));
+                    }
+                    tracing::warn!(
+                        "V2 message connect/accept attempt {attempt} failed transiently: {error}"
+                    );
+                    tokio::time::sleep(transient_cm_retry_delay(attempt)).await;
+                    continue;
+                }
+
+                let server = server.expect("successful server establishment");
+                let client = client.expect("successful client establishment");
+                let ready = tokio::time::timeout(V2_SETUP_STAGE_TIMEOUT, async {
+                    tokio::join!(server.ready(), client.ready())
+                })
+                .await;
+                match ready {
+                    Ok((Ok(()), Ok(()))) => return Ok((listener, server, client)),
+                    Ok((server_ready, client_ready)) => {
+                        let error = server_ready
+                            .err()
+                            .or_else(|| client_ready.err())
+                            .expect("failed HELLO must carry an error");
+                        let context = format!("HELLO failed without retry: {error}");
+                        attempt_history.push(format!("attempt {attempt}: {context}"));
+                        close_message_attempt(Some(listener), Some(server), Some(client)).await;
+                        wait_for_engine_cleanup(
+                            server_engine,
+                            &server_resources,
+                            &server_baseline,
+                            client_engine,
+                            &client_resources,
+                            &client_baseline,
+                            &context,
+                        )
+                        .await;
+                        return Err(error);
+                    }
+                    Err(elapsed) => {
+                        let error = setup_timeout("HELLO", elapsed);
+                        let context = error.to_string();
+                        attempt_history.push(format!("attempt {attempt}: {context}"));
+                        close_message_attempt(Some(listener), Some(server), Some(client)).await;
+                        wait_for_engine_cleanup(
+                            server_engine,
+                            &server_resources,
+                            &server_baseline,
+                            client_engine,
+                            &client_resources,
+                            &client_baseline,
+                            &context,
+                        )
+                        .await;
+                        return Err(error);
                     }
                 }
             }
+            unreachable!("the fixed nonzero retry count returns from every terminal attempt")
+        };
 
-            if errors.is_empty()
-                && let Err(error) = after_ready(attempt)
-            {
-                errors.push(error);
-            }
-            if errors.is_empty() {
-                return Ok((
-                    listener,
-                    server.expect("ready server transport"),
-                    client.expect("ready client transport"),
+        match tokio::time::timeout(V2_SETUP_TOTAL_TIMEOUT, establish).await {
+            Ok(result) => result,
+            Err(elapsed) => {
+                let error = Error::Verbs(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "V2 message overall setup retry budget timed out: {elapsed}; \
+                         attempt history: {attempt_history:?}"
+                    ),
                 ));
+                let context = error.to_string();
+                wait_for_engine_cleanup(
+                    server_engine,
+                    &server_resources,
+                    &total_server_baseline,
+                    client_engine,
+                    &client_resources,
+                    &total_client_baseline,
+                    &context,
+                )
+                .await;
+                Err(error)
             }
-
-            close_message_attempt(Some(listener), server, client).await;
-            wait_for_engine_cleanup(
-                server_engine,
-                &server_resources,
-                &server_baseline,
-                client_engine,
-                &client_resources,
-                &client_baseline,
-            )
-            .await;
-
-            if let Some(error) = errors
-                .iter()
-                .find(|error| !is_transient_v2_engine_cm_error(error))
-            {
-                return Err(error.clone());
-            }
-            let error = errors
-                .into_iter()
-                .next()
-                .expect("failed establishment must carry an error");
-            if attempt + 1 == TRANSIENT_CM_HANDSHAKE_ATTEMPTS {
-                return Err(error);
-            }
-            tracing::warn!(
-                "V2 message establishment attempt {attempt} failed transiently: {error}"
-            );
-            last_transient = Some(error);
-            // Cleanup is already complete. This bounded sleep is only for
-            // kernel/CM resource recovery, never state synchronization.
-            tokio::time::sleep(transient_cm_retry_delay(attempt)).await;
         }
-
-        Err(last_transient.unwrap_or_else(|| {
-            Error::InvalidConfig("V2 message establishment made no attempts".into())
-        }))
     }
 
     pub async fn setup_engine_pair(resources: &TestEngineResources) -> EngineTestPair {
@@ -802,8 +1140,13 @@ pub mod engine_test_helpers {
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error as StdError;
+
+    use super::engine_test_helpers::retry_exhausted;
     use super::test_helpers::{
-        enforce_software_rdma_requirement, is_transient_cm_error, is_transient_v2_engine_cm_error,
+        V2EngineCmSetupStage, are_v2_engine_cm_setup_errors_retryable,
+        enforce_software_rdma_requirement, is_transient_cm_error,
+        is_transient_v2_engine_cm_setup_error,
     };
 
     #[test]
@@ -848,25 +1191,90 @@ mod tests {
                 "RDMA CM {event} failed with status -22 for id=0x1 listen_id=0x0"
             )));
             assert!(
-                is_transient_v2_engine_cm_error(&err),
+                is_transient_v2_engine_cm_setup_error(V2EngineCmSetupStage::ConnectAccept, &err),
                 "{event} should be retryable"
             );
         }
         let eproto = rdma_io::v2::Error::Verbs(std::io::Error::other(
             "RDMA CM AddrError failed with status -71 for id=0x1 listen_id=0x0",
         ));
-        assert!(is_transient_v2_engine_cm_error(&eproto));
+        assert!(is_transient_v2_engine_cm_setup_error(
+            V2EngineCmSetupStage::Listen,
+            &eproto
+        ));
     }
 
     #[test]
-    fn v2_transient_cm_error_rejects_addr_and_protocol_failures() {
+    fn v2_transient_cm_error_requires_exact_setup_status_and_error_type() {
         let addr_error = rdma_io::v2::Error::Verbs(std::io::Error::other(
             "RDMA CM AddrError failed with status -110 for id=0x1 listen_id=0x0",
         ));
-        assert!(!is_transient_v2_engine_cm_error(&addr_error));
-        assert!(!is_transient_v2_engine_cm_error(
+        let permanent_reject = rdma_io::v2::Error::Verbs(std::io::Error::other(
+            "RDMA CM Rejected failed with status -13 for id=0x1 listen_id=0x0",
+        ));
+        let substring_trap = rdma_io::v2::Error::Verbs(std::io::Error::other(
+            "RDMA CM ConnectError failed with status -220 for id=0x1 listen_id=0x0",
+        ));
+        let event_without_status = rdma_io::v2::Error::Verbs(std::io::Error::other(
+            "RDMA CM Rejected failed for id=0x1 listen_id=0x0",
+        ));
+        for error in [
+            &addr_error,
+            &permanent_reject,
+            &substring_trap,
+            &event_without_status,
+        ] {
+            assert!(!is_transient_v2_engine_cm_setup_error(
+                V2EngineCmSetupStage::ConnectAccept,
+                error
+            ));
+        }
+        assert!(!is_transient_v2_engine_cm_setup_error(
+            V2EngineCmSetupStage::ConnectAccept,
             &rdma_io::v2::Error::ProtocolViolation("bad magic".into())
         ));
+        assert!(is_transient_v2_engine_cm_setup_error(
+            V2EngineCmSetupStage::Listen,
+            &rdma_io::v2::Error::Verbs(std::io::Error::from_raw_os_error(98))
+        ));
+    }
+
+    #[test]
+    fn v2_setup_retry_requires_zero_engine_reject_event_deltas() {
+        let transient = rdma_io::v2::Error::Verbs(std::io::Error::other(
+            "RDMA CM Rejected failed with status -22 for id=0x1 listen_id=0x0",
+        ));
+        assert!(are_v2_engine_cm_setup_errors_retryable(
+            V2EngineCmSetupStage::ConnectAccept,
+            std::slice::from_ref(&transient),
+            true,
+        ));
+        assert!(!are_v2_engine_cm_setup_errors_retryable(
+            V2EngineCmSetupStage::ConnectAccept,
+            std::slice::from_ref(&transient),
+            false,
+        ));
+        assert!(!are_v2_engine_cm_setup_errors_retryable(
+            V2EngineCmSetupStage::ConnectAccept,
+            &[rdma_io::v2::Error::ProtocolViolation(
+                "duplicate HELLO".into()
+            )],
+            true,
+        ));
+    }
+
+    #[test]
+    fn exhausted_v2_setup_retry_preserves_the_last_transient_source() {
+        let exhausted = retry_exhausted(rdma_io::v2::Error::Verbs(std::io::Error::other(
+            "RDMA CM ConnectError failed with status -71 for id=0x1 listen_id=0x0",
+        )));
+        assert!(exhausted.to_string().contains("retries exhausted"));
+        let io_source = StdError::source(&exhausted).expect("V2 verbs wrapper source");
+        let exhausted_source = io_source.source().expect("exhausted retry source");
+        let last_transient = exhausted_source
+            .source()
+            .expect("last transient setup cause");
+        assert!(last_transient.to_string().contains("status -71"));
     }
 
     #[test]
