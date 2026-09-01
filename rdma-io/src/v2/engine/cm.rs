@@ -986,7 +986,7 @@ impl CmState {
         ) {
             Ok(connection) => connection,
             Err(error) => {
-                let (cm_id, qp_destroyed) = verbs.destroy_connection();
+                let (cm_id, qp_destroyed) = verbs.destroy_connection(true)?;
                 if qp_destroyed {
                     shared.record_qp_destroy();
                 }
@@ -1456,7 +1456,9 @@ impl CmState {
             self.enqueue_retirement(token);
             return Ok(());
         };
-        let (cm_id, qp_destroyed) = connection.destroy_connection_resources()?;
+        let lifecycle = connection.lock_lifecycle();
+        let (cm_id, qp_destroyed) = connection.destroy_connection_resources(&lifecycle)?;
+        drop(lifecycle);
         if qp_destroyed {
             shared.record_qp_destroy();
         }
@@ -2161,7 +2163,7 @@ impl CmState {
         ) {
             Ok(connection) => connection,
             Err(error) => {
-                let (cm_id, qp_destroyed) = verbs.destroy_connection();
+                let (cm_id, qp_destroyed) = verbs.destroy_connection(true)?;
                 if qp_destroyed {
                     shared.record_qp_destroy();
                 }
@@ -4091,8 +4093,8 @@ mod tests {
             Ok(())
         }
 
-        fn destroy_qp(&self) -> bool {
-            false
+        fn destroy_qp(&self) -> Result<bool> {
+            Ok(false)
         }
 
         #[cfg(any(test, feature = "test-hooks"))]

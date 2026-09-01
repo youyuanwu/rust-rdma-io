@@ -998,6 +998,7 @@ struct EngineMessageState {
     recv_notify: Notify,
     pending_credit_returns: AtomicUsize,
     close_connection_pending: AtomicBool,
+    local_close_started: AtomicBool,
     link: OnceLock<EngineMessageLink>,
     self_weak: OnceLock<Weak<EngineMessageState>>,
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1029,6 +1030,7 @@ impl EngineMessageState {
             recv_notify: Notify::new(),
             pending_credit_returns: AtomicUsize::new(0),
             close_connection_pending: AtomicBool::new(false),
+            local_close_started: AtomicBool::new(false),
             link: OnceLock::new(),
             self_weak: OnceLock::new(),
             #[cfg(any(test, feature = "test-hooks"))]
@@ -1241,19 +1243,23 @@ impl EngineMessageState {
         }
     }
 
-    fn begin_close(&self) {
-        let _ = self.state.compare_exchange(
+    fn begin_close(&self) -> bool {
+        let created = self.state.compare_exchange(
             STATE_CREATED,
             STATE_CLOSING,
             Ordering::AcqRel,
             Ordering::Acquire,
         );
-        let _ = self.state.compare_exchange(
+        let ready = self.state.compare_exchange(
             STATE_READY,
             STATE_CLOSING,
             Ordering::AcqRel,
             Ordering::Acquire,
         );
+        let locally_initiated = created.is_ok() || ready.is_ok();
+        if locally_initiated {
+            self.local_close_started.store(true, Ordering::Release);
+        }
         self.remote_credits.close();
         self.pending_credit_returns.store(0, Ordering::Release);
         self.close_pools();
@@ -1261,6 +1267,7 @@ impl EngineMessageState {
         self.state_notify.notify_waiters();
         self.recv_notify.notify_waiters();
         self.publish();
+        locally_initiated
     }
 
     fn finish_close(&self, result: &Result<()>) {
@@ -2214,13 +2221,21 @@ impl MessageTransport {
     /// before MR reclamation. [`Error::ConnectionQuarantined`] is reserved for
     /// inability to establish that boundary or another connection-local
     /// retirement wedge; an engine-wide terminal drain failure returns
-    /// [`Error::EngineWedged`].
+    /// [`Error::EngineWedged`]. A peer disconnect observed before this call is
+    /// returned as [`Error::TransportClosed`]; only flush errors produced by
+    /// the locally initiated close are normalized to success.
     pub async fn close(&self) -> Result<()> {
-        self.state.begin_close();
+        let _ = self.state.begin_close();
+        let preexisting_error = (!self.state.local_close_started.load(Ordering::Acquire)
+            && self.state.state.load(Ordering::Acquire) == STATE_FAILED)
+            .then(|| self.state.terminal_error());
         let result = self.connection.close().await;
         self.state.finish_close(&result);
         match result {
             Err(error) => Err(error),
+            Ok(()) if preexisting_error.is_some() => {
+                Err(preexisting_error.expect("checked as present"))
+            }
             Ok(()) => match lock_std(&self.state.error).clone() {
                 None | Some(Error::TransportClosed) => Ok(()),
                 Some(error) => Err(error),
@@ -2231,7 +2246,7 @@ impl MessageTransport {
 
 impl Drop for MessageTransport {
     fn drop(&mut self) {
-        self.state.begin_close();
+        let _ = self.state.begin_close();
     }
 }
 

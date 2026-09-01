@@ -95,12 +95,18 @@ impl EngineShared {
                     .qp_error_transitions
                     .fetch_add(1, Ordering::Relaxed);
             }
-            if connection.accepted_count() == 0
-                && !connection.is_retired()
-                && connection.poster.destroy_qp()
-            {
-                connection.mark_qp_destroyed();
-                self.record_qp_destroy();
+            if connection.accepted_count() == 0 && !connection.is_retired() {
+                match connection.establish_qp_destruction_boundary(&_lifecycle) {
+                    Ok(true) => self.record_qp_destroy(),
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            qp_num = connection.qp_num(),
+                            %error,
+                            "failed to establish QP destruction boundary during driver drop"
+                        );
+                    }
+                }
             }
         }
     }
@@ -153,10 +159,11 @@ mod tests {
             Ok(())
         }
 
-        fn destroy_qp(&self) -> bool {
-            self.destroys
+        fn destroy_qp(&self) -> Result<bool> {
+            Ok(self
+                .destroys
                 .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
+                .is_ok())
         }
 
         fn disconnect(&self) -> Result<()> {
@@ -262,7 +269,11 @@ mod tests {
         tokio::time::advance(Duration::from_millis(29_999)).await;
         assert!(poll_once(Pin::new(&mut driver)).is_pending());
         assert!(poll_once(shutdown.as_mut()).is_pending());
-        assert_eq!(poster.destroys.load(Ordering::Acquire), 0);
+        assert_eq!(
+            poster.destroys.load(Ordering::Acquire),
+            1,
+            "the fabricated unknown token is defensive-only; the live QP still has a safe boundary"
+        );
 
         tokio::time::advance(Duration::from_millis(1)).await;
         assert!(matches!(
@@ -283,6 +294,6 @@ mod tests {
         ));
         let terminal = engine.diagnostics().terminal_error.unwrap();
         assert_eq!(terminal.class, "EngineWedged");
-        assert_eq!(poster.destroys.load(Ordering::Acquire), 0);
+        assert_eq!(poster.destroys.load(Ordering::Acquire), 1);
     }
 }

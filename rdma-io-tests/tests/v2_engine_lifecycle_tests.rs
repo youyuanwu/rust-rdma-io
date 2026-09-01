@@ -343,6 +343,9 @@ async fn run_missing_flush_cqe_qp_destroy_fallback(mode: CompletionMode) {
     assert_eq!(closed.retained_cq_credits, 0);
     assert_eq!(closed.live_connection_reservations, 1);
     assert_eq!(closed.qp_destroys, 1);
+    assert_eq!(closed.operations_released_after_qp_destroy, 1);
+    assert!(closed.connections_drain_started >= 1);
+    assert!(closed.qp_error_transitions >= 1);
     let after_close = recorder.snapshot();
     let qp_destroy = position(&after_close, DestructionKind::QueuePair);
     let mr_release = position(&after_close, DestructionKind::MemoryRegion);
@@ -492,7 +495,10 @@ async fn run_shutdown_qp_destroy_fallback(mode: CompletionMode) {
     assert_eq!(diagnostics.registered_operations, 0);
     assert_eq!(diagnostics.quarantined_bundles, 0);
     assert_eq!(diagnostics.qp_destroys, 1);
+    assert_eq!(diagnostics.operations_released_after_qp_destroy, 1);
     assert_eq!(diagnostics.engine_wedges, 0);
+    assert!(diagnostics.connections_drain_started >= 1);
+    assert!(diagnostics.qp_error_transitions >= 1);
     drop(suppression);
 
     drop(returned_send);
@@ -506,6 +512,141 @@ async fn run_shutdown_qp_destroy_fallback(mode: CompletionMode) {
     drop(listener);
     drop(server_engine);
     drop(client_engine);
+}
+
+async fn run_qp_destroy_failure_quarantine(mode: CompletionMode) {
+    if !has_software_rdma() {
+        return;
+    }
+    let device = software_device_name().expect("software RDMA device");
+    let (server_engine, server_driver) = RdmaEngineBuilder::new(device.clone())
+        .completion_mode(mode)
+        .maximum_live_connections(1)
+        .maximum_inflight_operations(64)
+        .cq_capacity(64)
+        .connection_drain_deadline(Duration::from_millis(50))
+        .shutdown_deadline(Duration::from_millis(200))
+        .build()
+        .unwrap();
+    let (client_engine, client_driver) = RdmaEngineBuilder::new(device)
+        .completion_mode(mode)
+        .maximum_live_connections(1)
+        .maximum_inflight_operations(64)
+        .cq_capacity(64)
+        .build()
+        .unwrap();
+    let server_resources = server_engine.test_resources().unwrap();
+    let server_task = tokio::spawn(server_driver);
+    let client_task = tokio::spawn(client_driver);
+    let listener = server_engine
+        .listen("0.0.0.0:0".parse().unwrap(), RdmaListenerConfig::default())
+        .await
+        .unwrap();
+    let (server, client) = accept_pair(&listener, &client_engine).await;
+    let recv_mr = server.register_memory(64, AccessIntent::LocalOnly).unwrap();
+    let mut recv = Box::pin(server.recv(recv_mr, None));
+    futures_util::future::poll_fn(|cx| {
+        assert!(recv.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    let suppression = server_resources
+        .suppress_next_connection_flush_cqe(&server)
+        .unwrap();
+    server_resources
+        .fail_next_connection_qp_destroy(&server)
+        .unwrap();
+    let recorder = DestructionRecorder::arm(64);
+
+    let close_error = tokio::time::timeout(Duration::from_secs(3), server.close())
+        .await
+        .expect("destroy failure did not publish connection quarantine")
+        .unwrap_err();
+    assert!(matches!(
+        close_error,
+        Error::ConnectionQuarantined {
+            outstanding_operations: 1,
+            cq_debt: 1
+        }
+    ));
+    let (operation_error, returned_recv) = recv.await;
+    assert!(matches!(operation_error, Err(Error::TransportClosed)));
+    assert!(returned_recv.is_none());
+
+    let diagnostics = server_engine.diagnostics();
+    assert_eq!(diagnostics.qp_destroys, 0);
+    assert_eq!(diagnostics.operations_released_after_qp_destroy, 0);
+    assert_eq!(diagnostics.accepted_outstanding_operations, 1);
+    assert_eq!(diagnostics.registered_operations, 1);
+    assert_eq!(diagnostics.free_cq_credits, 63);
+    assert_eq!(diagnostics.retained_cq_credits, 1);
+    assert_eq!(diagnostics.quarantined_operations, 1);
+    assert_eq!(diagnostics.quarantined_mrs, 1);
+    assert_eq!(diagnostics.quarantined_bundles, 1);
+    let events = recorder.snapshot();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                event.kind == DestructionKind::QueuePair
+                    && event.result.is_some_and(|result| result != 0)
+            })
+            .count(),
+        1,
+        "exactly one injected result-aware QP destruction must fail"
+    );
+    assert!(events.iter().any(|event| {
+        event.kind == DestructionKind::QueuePair && event.result.is_some_and(|result| result != 0)
+    }));
+    assert!(
+        events
+            .iter()
+            .all(|event| event.kind != DestructionKind::MemoryRegion),
+        "QP destroy failure must retain the posted MR"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.kind != DestructionKind::CompletionQueue),
+        "the externally supplied shared CQ must remain owned exactly once"
+    );
+
+    drop(suppression);
+    let shutdown_error = server_engine.shutdown().await.unwrap_err();
+    assert!(matches!(
+        shutdown_error,
+        Error::EngineWedged {
+            retained_bundles: 1,
+            outstanding_operations: 1,
+            cq_debt: 1
+        }
+    ));
+    assert!(matches!(
+        server_task.await.unwrap(),
+        Err(Error::EngineWedged {
+            retained_bundles: 1,
+            outstanding_operations: 1,
+            cq_debt: 1
+        })
+    ));
+
+    let _ = client.close().await;
+    let _ = listener.close().await;
+    let _ = client_engine.shutdown().await;
+    let _ = client_task.await;
+    drop(server_resources);
+    drop(server);
+    drop(client);
+    drop(listener);
+    drop(server_engine);
+    drop(client_engine);
+    let final_events = recorder.take();
+    assert!(
+        final_events
+            .iter()
+            .all(|event| event.kind != DestructionKind::MemoryRegion),
+        "terminal quarantine must keep the failed QP's MR registered"
+    );
 }
 
 async fn run_unspawned_driver_drop(mode: CompletionMode) {
@@ -841,6 +982,12 @@ async fn omitted_flush_cqe_uses_qp_destroy_before_clean_reclaim_in_both_modes() 
 async fn held_real_cqe_uses_qp_destroy_for_clean_shutdown_in_both_modes() {
     run_shutdown_qp_destroy_fallback(CompletionMode::Readiness).await;
     run_shutdown_qp_destroy_fallback(CompletionMode::Polling).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn result_aware_qp_destroy_failure_quarantines_mr_and_debt_in_both_modes() {
+    run_qp_destroy_failure_quarantine(CompletionMode::Readiness).await;
+    run_qp_destroy_failure_quarantine(CompletionMode::Polling).await;
 }
 
 #[test_log::test(tokio::test(flavor = "current_thread"))]

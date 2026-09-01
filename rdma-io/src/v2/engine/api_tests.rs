@@ -217,8 +217,8 @@ fn shutdown_initiates_each_preexisting_connection_close_once() {
             Ok(())
         }
 
-        fn destroy_qp(&self) -> bool {
-            true
+        fn destroy_qp(&self) -> Result<bool> {
+            Ok(true)
         }
 
         #[cfg(any(test, feature = "test-hooks"))]

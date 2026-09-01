@@ -832,8 +832,8 @@ pub(super) mod test_api {
             Ok(())
         }
 
-        fn destroy_qp(&self) -> bool {
-            true
+        fn destroy_qp(&self) -> Result<bool> {
+            Ok(true)
         }
 
         fn disconnect(&self) -> Result<()> {
@@ -979,6 +979,17 @@ pub(super) mod test_api {
                 ));
             }
             connection.state.disconnect_for_test()
+        }
+
+        /// Make the next result-aware destruction of this connection's QP fail.
+        pub fn fail_next_connection_qp_destroy(&self, connection: &RdmaConnection) -> Result<()> {
+            let shared = self.ensure_active()?;
+            if !Arc::ptr_eq(&shared, &connection.shared) {
+                return Err(Error::InvalidConfig(
+                    "connection belongs to another engine".into(),
+                ));
+            }
+            connection.state.poster.fail_next_qp_destroy()
         }
 
         /// Terminate the real driver on its next poll with an exact test error.
@@ -1868,6 +1879,14 @@ pub(super) mod test_api {
                 .pop_front()
         }
 
+        #[cfg(test)]
+        pub(super) fn queue_released_connection_cqe(&self, completion: WorkCompletion) {
+            self.released_connection_cqes
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push_back(completion);
+        }
+
         pub(in crate::v2::engine) fn pause_admission(&self, point: AdmissionPausePoint) {
             let mut control = self
                 .admission_barrier
@@ -2363,10 +2382,17 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::v2::engine::connection::{WorkRequestPoster, install_connection};
     use crate::v2::engine::listener::ListenerState;
-    use crate::v2::engine::{
-        RdmaEngineLifecycle, RdmaEngineTerminalError, RdmaListener, test_engine_pair,
+    use crate::v2::engine::operation::{
+        completion_for_driver_test, install_accepted_operation_for_driver_test,
     };
+    use crate::v2::engine::{
+        RdmaConnectionConfig, RdmaEngineLifecycle, RdmaEngineTerminalError, RdmaListener,
+        test_engine_pair,
+    };
+    use crate::v2::qp::{BatchPostOutcome, QpCapabilities};
+    use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
 
     struct CountingWaker(AtomicUsize);
 
@@ -2468,6 +2494,119 @@ mod tests {
             signal.take(),
             TERMINAL_WORK | RECLAMATION_WORK | READY_CONNECTION_WORK
         );
+    }
+
+    struct DrainInterleavingPoster {
+        qp_num: u32,
+        destroys: AtomicUsize,
+    }
+
+    impl WorkRequestPoster for DrainInterleavingPoster {
+        fn qp_num(&self) -> u32 {
+            self.qp_num
+        }
+
+        fn capabilities(&self) -> Option<QpCapabilities> {
+            None
+        }
+
+        fn post_send(&self, _: &mut PreparedSendBatch) -> Result<BatchPostOutcome> {
+            unreachable!("interleaving test installs an accepted operation directly")
+        }
+
+        fn post_recv(&self, _: &mut PreparedRecvBatch) -> Result<BatchPostOutcome> {
+            unreachable!("interleaving test installs an accepted operation directly")
+        }
+
+        fn to_error(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn destroy_qp(&self) -> Result<bool> {
+            self.destroys.fetch_add(1, Ordering::AcqRel);
+            Ok(true)
+        }
+
+        fn disconnect(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cq_reclamation_ready_interleaving_dispatches_queued_success_and_flush_exactly() {
+        for mode in [CompletionMode::Readiness, CompletionMode::Polling] {
+            for (opcode, status) in [
+                (
+                    rdma_io_sys::ibverbs::IBV_WC_SEND,
+                    rdma_io_sys::ibverbs::IBV_WC_SUCCESS,
+                ),
+                (
+                    rdma_io_sys::ibverbs::IBV_WC_RECV,
+                    rdma_io_sys::ibverbs::IBV_WC_WR_FLUSH_ERR,
+                ),
+            ] {
+                let (engine, mut driver) = test_engine_pair(mode);
+                let poster = Arc::new(DrainInterleavingPoster {
+                    qp_num: 71,
+                    destroys: AtomicUsize::new(0),
+                });
+                let connection = install_connection(
+                    &engine.shared,
+                    Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
+                    RdmaConnectionConfig::default(),
+                    None,
+                    None,
+                )
+                .unwrap();
+                let expected = if opcode == rdma_io_sys::ibverbs::IBV_WC_RECV {
+                    crate::wc::WcOpcode::Recv
+                } else {
+                    crate::wc::WcOpcode::Send
+                };
+                let operation = install_accepted_operation_for_driver_test(
+                    &engine.shared,
+                    &connection.state,
+                    expected,
+                );
+                connection.state.begin_close();
+                connection.state.transition_to_error_once().unwrap();
+                engine.shared.test_driver.queue_released_connection_cqe(
+                    completion_for_driver_test(operation, poster.qp_num, opcode, status),
+                );
+                assert!(driver.scheduler.deadlines().push(
+                    tokio::time::Instant::now(),
+                    DeadlineKind::ConnectionDrain,
+                    connection.state.token.encode(),
+                ));
+                driver.scheduler.mark_class_ready(WorkClass::Cq);
+                driver.scheduler.mark_class_ready(WorkClass::Reclamation);
+                let waker = Waker::noop();
+                let mut cx = TaskContext::from_waker(waker);
+
+                assert_eq!(driver.scheduler.next_class(), Some(WorkClass::Cq));
+                assert!(driver.service_cq(&mut cx).unwrap());
+                assert_eq!(driver.scheduler.next_class(), Some(WorkClass::Reclamation));
+                assert!(driver.service_reclamation().unwrap());
+                assert_eq!(
+                    driver.scheduler.next_class(),
+                    Some(WorkClass::ReadyConnection)
+                );
+                assert!(driver.service_ready_connection());
+
+                let diagnostics = engine.diagnostics();
+                assert_eq!(diagnostics.operations_completed, 1);
+                assert_eq!(diagnostics.operations_released_after_qp_destroy, 0);
+                assert_eq!(diagnostics.cqes_routed, 1);
+                assert_eq!(diagnostics.stale_operation_cqes, 0);
+                assert_eq!(diagnostics.qp_destroys, 0);
+                assert_eq!(diagnostics.accepted_outstanding_operations, 0);
+                assert_eq!(diagnostics.registered_operations, 0);
+                assert_eq!(poster.destroys.load(Ordering::Acquire), 0);
+
+                engine.shared.finish(MemoizedTerminalResult::success());
+                drop(driver);
+            }
+        }
     }
 
     #[test]

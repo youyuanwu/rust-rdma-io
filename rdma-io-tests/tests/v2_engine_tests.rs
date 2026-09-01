@@ -319,6 +319,13 @@ async fn run_mode(mode: CompletionMode) {
     ));
     assert_local_protocol_violation(pairs[4].0.close().await);
     assert_protocol_pair_close(pairs[4].1.close().await);
+    assert!(
+        matches!(
+            pairs[4].1.send(b"after-protocol-close").await,
+            Err(Error::TransportClosed) | Err(Error::ProtocolViolation(_))
+        ),
+        "the peer must observe terminal protocol close before a subsequent send"
+    );
 
     let stale_connection = pairs[5].1.test_connection().unwrap();
     let held = resources

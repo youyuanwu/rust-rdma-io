@@ -501,6 +501,8 @@ impl CmId {
             _pd: Arc::clone(pd),
             _send_cq: send_cq.map(Arc::clone),
             _recv_cq: recv_cq.map(Arc::clone),
+            #[cfg(any(test, feature = "test-hooks"))]
+            fail_next_verbs_destroy: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -663,7 +665,9 @@ impl CmId {
 
 /// A Queue Pair created via `rdma_create_qp` on a [`CmId`].
 ///
-/// Owns the QP lifecycle. [`Drop`] calls `rdma_destroy_qp`.
+/// Owns the QP lifecycle. [`Drop`] calls `rdma_destroy_qp`; the Tokio engine
+/// uses a result-aware consuming `ibv_destroy_qp` path for QPs with externally
+/// supplied CQs.
 /// Captures `Arc` references to PD and CQs to prevent premature destruction
 /// of resources the QP depends on.
 ///
@@ -684,6 +688,8 @@ pub struct CmQueuePair {
     _pd: Arc<ProtectionDomain>,
     _send_cq: Option<Arc<CompletionQueue>>,
     _recv_cq: Option<Arc<CompletionQueue>>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    fail_next_verbs_destroy: std::sync::atomic::AtomicBool,
 }
 
 // Safety: ibv_qp is thread-safe (protected by internal locking in libibverbs).
@@ -713,10 +719,78 @@ impl CmQueuePair {
         unsafe { rdma_destroy_qp(cm_id_raw.as_ptr()) };
     }
 
-    /// Consume and synchronously destroy this CM-managed QP exactly once.
+    /// Destroy a CM-created QP through the result-returning verbs primitive.
+    ///
+    /// This path is restricted to QPs created with caller-owned CQs. Unlike
+    /// `rdma_destroy_qp`, `ibv_destroy_qp` reports failure and does not destroy
+    /// librdmacm-created CQs. The CM ID's QP pointer is cleared only after the
+    /// verbs call succeeds.
     #[cfg(feature = "tokio")]
-    pub(crate) fn destroy(mut self) {
-        self.destroy_once();
+    pub(crate) fn try_destroy_verbs(mut self) -> std::result::Result<(), (Self, crate::Error)> {
+        let Some(cm_id_raw) = self.cm_id_raw else {
+            return Ok(());
+        };
+        if self._send_cq.is_none() || self._recv_cq.is_none() {
+            return Err((
+                self,
+                crate::Error::InvalidArg(
+                    "result-aware QP destruction requires externally supplied CQs".into(),
+                ),
+            ));
+        }
+        let cm_qp = unsafe { (*cm_id_raw.as_ptr()).qp };
+        if cm_qp != self.qp {
+            return Err((
+                self,
+                crate::Error::InvalidArg(
+                    "CM ID no longer owns the QP selected for destruction".into(),
+                ),
+            ));
+        }
+
+        #[cfg(any(test, feature = "test-hooks"))]
+        let ret = if self
+            .fail_next_verbs_destroy
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            -libc::EBUSY
+        } else {
+            unsafe { ibv_destroy_qp(self.qp) }
+        };
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        let ret = unsafe { ibv_destroy_qp(self.qp) };
+
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            crate::test_support::destruction::record(
+                crate::test_support::destruction::DestructionKind::QueuePair,
+                self.qp as usize,
+            );
+            crate::test_support::destruction::record_result(
+                crate::test_support::destruction::DestructionKind::QueuePair,
+                self.qp as usize,
+                ret,
+            );
+        }
+        if ret != 0 {
+            let errno = ret.checked_abs().unwrap_or(i32::MAX);
+            return Err((
+                self,
+                crate::Error::Verbs(std::io::Error::from_raw_os_error(errno)),
+            ));
+        }
+
+        unsafe {
+            (*cm_id_raw.as_ptr()).qp = std::ptr::null_mut();
+        }
+        self.cm_id_raw = None;
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn fail_next_verbs_destroy(&self) {
+        self.fail_next_verbs_destroy
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Raw QP pointer for posting work requests.

@@ -12,8 +12,9 @@ pub struct DestructionEvent {
     pub address: usize,
     /// Return code from a fallible destruction primitive, when it has one.
     ///
-    /// Void primitives such as `rdma_destroy_qp` and `rdma_free_devices`
-    /// leave this as `None`.
+    /// Void primitives such as the ordinary `rdma_destroy_qp` drop path and
+    /// `rdma_free_devices` leave this as `None`. The engine's result-aware
+    /// `ibv_destroy_qp` path records its return code.
     pub result: Option<i32>,
 }
 

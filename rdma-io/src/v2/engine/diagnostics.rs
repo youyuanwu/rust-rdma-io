@@ -201,8 +201,13 @@ pub struct RdmaEngineDiagnostics {
     pub operations_unaccepted: u64,
     /// WRs provider-accepted or conservatively retained as acceptance-ambiguous.
     pub operations_posted: u64,
-    /// Exact validated CQEs consumed.
+    /// Operations released after consuming exact validated CQEs.
     pub operations_completed: u64,
+    /// Operations released after synchronous destruction of their owning QP.
+    ///
+    /// Together with `operations_completed`, this explains accepted WRs that
+    /// no longer appear in the live-operation gauges.
+    pub operations_released_after_qp_destroy: u64,
     /// Posted operation futures dropped by callers.
     pub operations_cancelled: u64,
     /// Batch verbs calls attempted.
@@ -253,7 +258,7 @@ pub struct RdmaEngineDiagnostics {
     pub connections_failed: u64,
     /// Local QP transitions to ERR initiated by lifecycle teardown.
     pub qp_error_transitions: u64,
-    /// Synchronous consuming `rdma_destroy_qp` invocations, including close
+    /// Successful synchronous consuming QP destructions, including close
     /// fallbacks that establish the safe MR-reclamation boundary.
     pub qp_destroys: u64,
     /// Quarantined connections later recovered by exact CQE routing.
@@ -270,7 +275,8 @@ pub struct RdmaEngineDiagnostics {
     pub cq_credits_reserved: u64,
     /// CQ credits rolled back for provider-proven unaccepted WRs.
     pub cq_credits_rolled_back: u64,
-    /// CQ credits released after exact validated CQEs.
+    /// CQ credits released after an exact validated CQE or successful
+    /// synchronous destruction of the owning QP.
     pub cq_credits_released: u64,
     /// CQ credits marked retained by quarantine.
     pub cq_credits_retained: u64,
@@ -391,6 +397,7 @@ pub(super) struct DiagnosticsState {
     pub(super) operations_unaccepted: AtomicU64,
     pub(super) operations_posted: AtomicU64,
     pub(super) operations_completed: AtomicU64,
+    pub(super) operations_released_after_qp_destroy: AtomicU64,
     pub(super) operations_cancelled: AtomicU64,
     pub(super) batch_posts_attempted: AtomicU64,
     pub(super) batch_accepted_prefix: AtomicU64,

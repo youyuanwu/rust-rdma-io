@@ -244,9 +244,9 @@ impl<'a> QpBuilder<'a> {
 ///
 /// # Safety and limits
 ///
-/// Posted MRs must remain live until typed completions arrive or synchronous
-/// destruction of this owning QP completes. The creating CM ID must outlive
-/// the QP and its destruction call.
+/// Posted MRs must remain live until typed completions arrive or result-aware
+/// synchronous destruction of this owning QP succeeds. The creating CM ID
+/// must outlive the QP and its destruction call.
 ///
 /// # Availability
 ///
@@ -350,8 +350,16 @@ impl Qp {
     }
 
     #[cfg(feature = "tokio")]
-    pub(crate) fn destroy(self) {
-        self.inner.destroy();
+    pub(crate) fn try_destroy(self) -> std::result::Result<(), (Self, Error)> {
+        match self.inner.try_destroy_verbs() {
+            Ok(()) => Ok(()),
+            Err((inner, error)) => Err((Self { inner }, Error::from_v1(error))),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn fail_next_destroy(&self) {
+        self.inner.fail_next_verbs_destroy();
     }
 
     #[allow(

@@ -1477,13 +1477,7 @@ impl EngineShared {
         let mut processed = 0;
         while processed < quantum {
             if let Some(completion) = connection.pop_completion() {
-                // Completion routing must remain serialized with terminal
-                // publication, but protocol callbacks acquire admission for
-                // each concrete post/close themselves. Holding this read lock
-                // across ready work would re-enter the RwLock and deadlock
-                // once a shutdown writer is queued.
-                let _admission = read_unpoison(&self.admission);
-                self.dispatch_queued_completion(completion);
+                self.dispatch_connection_completion(completion);
                 processed += 1;
                 continue;
             }
@@ -1551,6 +1545,12 @@ impl EngineShared {
         if previous == 1 && self.shutdown_requested.load(Ordering::Acquire) {
             self.work_signal.publish(super::driver::TERMINAL_WORK);
         }
+        self.diagnostic_counters
+            .operations_completed
+            .fetch_add(1, Ordering::Relaxed);
+        self.diagnostic_counters
+            .cqes_routed
+            .fetch_add(1, Ordering::Relaxed);
         let finished = operation.finish_completion(completion);
         if finished.was_reclaiming {
             self.pending_reclamations.fetch_sub(1, Ordering::AcqRel);
@@ -1563,12 +1563,6 @@ impl EngineShared {
                 .fetch_sub(operation.mr_len, Ordering::AcqRel);
             self.clear_operation_quarantine(&operation);
         }
-        self.diagnostic_counters
-            .operations_completed
-            .fetch_add(1, Ordering::Relaxed);
-        self.diagnostic_counters
-            .cqes_routed
-            .fetch_add(1, Ordering::Relaxed);
         invoke_detached_completion(finished.callback);
         if removed
             && operation.connection.close_started()
@@ -1580,34 +1574,43 @@ impl EngineShared {
         }
     }
 
-    pub(super) fn can_reclaim_after_qp_destroy(
-        &self,
-        connection: &ConnectionState,
-        tokens: &[OperationToken],
-    ) -> bool {
-        tokens.iter().all(|token| {
-            matches!(
-                self.operations.lookup(*token),
-                Lookup::Occupied(operation)
-                    if operation.connection_token() == connection.token
-            )
-        })
-    }
-
     pub(super) fn reclaim_after_qp_destroy(
         &self,
         connection: &ConnectionState,
         token: OperationToken,
     ) -> bool {
         let Lookup::Occupied(operation) = self.operations.lookup(token) else {
+            tracing::warn!(
+                connection = connection.token.encode(),
+                operation = token.encode(),
+                "QP destruction left an accepted token without an operation registration"
+            );
             return false;
         };
-        if operation.connection_token() != connection.token
-            || self.operations.release(token, false).is_none()
-        {
+        if operation.connection_token() != connection.token {
+            tracing::warn!(
+                connection = connection.token.encode(),
+                operation = token.encode(),
+                owner = operation.connection_token().encode(),
+                "QP destruction found an accepted token owned by another connection"
+            );
             return false;
         }
         if !connection.remove_accepted(token) {
+            tracing::warn!(
+                connection = connection.token.encode(),
+                operation = token.encode(),
+                "QP destruction reclaim lost accepted-set membership"
+            );
+            return false;
+        }
+        if self.operations.release(token, false).is_none() {
+            connection.add_accepted(token);
+            tracing::warn!(
+                connection = connection.token.encode(),
+                operation = token.encode(),
+                "QP destruction reclaim could not retire the operation registration"
+            );
             return false;
         }
         connection.release_local(operation.direction);
@@ -1620,7 +1623,10 @@ impl EngineShared {
         if previous == 1 && self.shutdown_requested.load(Ordering::Acquire) {
             self.work_signal.publish(super::driver::TERMINAL_WORK);
         }
-        let finished = operation.finish_after_qp_destroy(Error::TransportClosed);
+        self.diagnostic_counters
+            .operations_released_after_qp_destroy
+            .fetch_add(1, Ordering::Relaxed);
+        let finished = operation.finish_after_qp_destroy(connection.operation_close_error());
         if finished.was_reclaiming {
             self.pending_reclamations.fetch_sub(1, Ordering::AcqRel);
         }
@@ -1636,10 +1642,25 @@ impl EngineShared {
         true
     }
 
-    pub(super) fn reject_queued_completions_after_qp_destroy(&self, connection: &ConnectionState) {
+    fn dispatch_connection_completion(&self, completion: WorkCompletion) {
+        // CQ routing and terminal publication share the admission barrier.
+        // The lock covers only one completion; protocol ready work runs after
+        // it is released so callbacks may safely initiate posts or close.
+        let _admission = read_unpoison(&self.admission);
+        self.dispatch_queued_completion(completion);
+    }
+
+    pub(super) fn dispatch_queued_completions(&self, connection: &ConnectionState) {
         while let Some(completion) = connection.pop_completion() {
-            self.dispatch_queued_completion(completion);
+            self.dispatch_connection_completion(completion);
         }
+    }
+
+    pub(super) fn reject_queued_completions_after_qp_destroy(&self, connection: &ConnectionState) {
+        // The sole driver invokes this after the destruction boundary. CQEs
+        // queued before the boundary were already dispatched normally; only
+        // completions arriving after that boundary are rejected as stale.
+        self.dispatch_queued_completions(connection);
     }
 
     pub(super) fn begin_reclamation(&self, token: OperationToken) {
@@ -1682,6 +1703,52 @@ impl EngineShared {
         }
         true
     }
+}
+
+#[cfg(test)]
+pub(super) fn install_accepted_operation_for_driver_test(
+    shared: &Arc<EngineShared>,
+    connection: &Arc<ConnectionState>,
+    opcode: WcOpcode,
+) -> OperationToken {
+    let direction = if opcode == WcOpcode::Recv {
+        Direction::Recv
+    } else {
+        Direction::Send
+    };
+    connection.reserve_local(direction).unwrap();
+    assert!(shared.cq_credits.reserve());
+    let (token, operation) = shared
+        .operations
+        .allocate(|token| {
+            Arc::new(OperationState::new(
+                token,
+                Arc::clone(connection),
+                direction,
+                opcode,
+                None,
+                1,
+            ))
+        })
+        .unwrap();
+    operation.commit_accepted();
+    shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
+    token
+}
+
+#[cfg(test)]
+pub(super) fn completion_for_driver_test(
+    token: OperationToken,
+    qp_num: u32,
+    opcode: u32,
+    status: u32,
+) -> WorkCompletion {
+    let mut completion = WorkCompletion::default();
+    completion.inner.wr_id = token.encode();
+    completion.inner.qp_num = qp_num;
+    completion.inner.opcode = opcode;
+    completion.inner.status = status;
+    completion
 }
 
 #[cfg(test)]
@@ -1870,6 +1937,48 @@ mod tests {
         assert_eq!(operation.lifecycle(), OperationLifecycle::Completing);
         shared.finish_operation(Arc::clone(&operation), completion);
         assert_eq!(operation.lifecycle(), OperationLifecycle::Released);
+    }
+
+    #[test]
+    fn qp_destroy_callback_uses_the_contextual_connection_close_error() {
+        let shared = synthetic_engine(8);
+        let connection = synthetic_connection_on(&shared, 18);
+        connection.state.reserve_local(Direction::Send).unwrap();
+        assert!(shared.cq_credits.reserve());
+        let observed = Arc::new(Mutex::new(None));
+        let callback_observed = Arc::clone(&observed);
+        let (token, operation) = shared
+            .operations
+            .allocate(|token| {
+                Arc::new(OperationState::new_with_callback(
+                    token,
+                    Arc::clone(&connection.state),
+                    Direction::Send,
+                    WcOpcode::Send,
+                    None,
+                    1,
+                    Some(Box::new(move |completion| {
+                        let DetachedOperationCompletion::Completed { result, .. } = completion
+                        else {
+                            panic!("accepted operation cannot become unaccepted")
+                        };
+                        *lock_unpoison(&callback_observed) = result.err();
+                    })),
+                ))
+            })
+            .unwrap();
+        operation.commit_accepted();
+        shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
+        connection
+            .state
+            .mark_cm_failure(Error::ProtocolViolation("contextual close failure".into()));
+        connection.state.mark_qp_destroyed();
+
+        assert!(shared.reclaim_after_qp_destroy(&connection.state, token));
+        assert!(matches!(
+            lock_unpoison(&observed).as_ref(),
+            Some(Error::ProtocolViolation(message)) if message == "contextual close failure"
+        ));
     }
 
     #[test]
@@ -3033,8 +3142,8 @@ mod tests {
             Ok(())
         }
 
-        fn destroy_qp(&self) -> bool {
-            false
+        fn destroy_qp(&self) -> Result<bool> {
+            Ok(false)
         }
 
         #[cfg(any(test, feature = "test-hooks"))]
@@ -3123,8 +3232,8 @@ mod tests {
         fn to_error(&self) -> Result<()> {
             Ok(())
         }
-        fn destroy_qp(&self) -> bool {
-            false
+        fn destroy_qp(&self) -> Result<bool> {
+            Ok(false)
         }
         #[cfg(any(test, feature = "test-hooks"))]
         fn disconnect(&self) -> Result<()> {

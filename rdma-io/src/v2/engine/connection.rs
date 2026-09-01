@@ -503,7 +503,10 @@ impl ConnectionState {
         self.error_transition_complete.load(Ordering::Acquire)
     }
 
-    pub(super) fn destroy_connection_resources(&self) -> Result<(Option<SharedCmId>, bool)> {
+    pub(super) fn destroy_connection_resources(
+        &self,
+        _lifecycle: &MutexGuard<'_, ()>,
+    ) -> Result<(Option<SharedCmId>, bool)> {
         let outstanding_operations = self.accepted_count();
         if outstanding_operations != 0 {
             return Err(Error::EngineWedged {
@@ -513,23 +516,45 @@ impl ConnectionState {
             });
         }
         self.stop_posting();
-        let resources = self.poster.destroy_connection();
+        let destroy_qp = !self.qp_destruction_boundary.load(Ordering::Acquire);
+        let resources = self.poster.destroy_connection(destroy_qp)?;
         if resources.1 {
             self.mark_qp_destroyed();
         }
         Ok(resources)
     }
 
-    pub(super) fn establish_qp_destruction_boundary(&self) -> (bool, bool) {
+    pub(super) fn establish_qp_destruction_boundary(
+        &self,
+        _lifecycle: &MutexGuard<'_, ()>,
+    ) -> Result<bool> {
         self.stop_posting();
         if self.qp_destruction_boundary.load(Ordering::Acquire) {
-            return (true, false);
+            return Ok(false);
         }
-        if !self.poster.destroy_qp() {
-            return (false, false);
+        match self.poster.destroy_qp() {
+            Ok(true) => {
+                self.mark_qp_destroyed();
+                Ok(true)
+            }
+            Ok(false) => {
+                if self.qp_destruction_boundary.load(Ordering::Acquire) {
+                    Ok(false)
+                } else {
+                    Err(Error::InvalidConfig(
+                        "QP ownership disappeared before its destruction boundary was recorded"
+                            .into(),
+                    ))
+                }
+            }
+            Err(error) => {
+                if self.qp_destruction_boundary.load(Ordering::Acquire) {
+                    Ok(false)
+                } else {
+                    Err(error)
+                }
+            }
         }
-        self.mark_qp_destroyed();
-        (true, true)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -663,7 +688,7 @@ impl ConnectionState {
 
     pub(super) fn mark_diagnostic_recovered(&self) {
         if let Some(reservation) = lock_unpoison(&self.admission).as_mut() {
-            reservation.recover_quarantine();
+            reservation.recover_quarantine(!self.qp_destruction_boundary.load(Ordering::Acquire));
         }
     }
 
@@ -907,24 +932,28 @@ impl ConnectionReservation {
         self.qp_counted = false;
     }
 
-    fn recover_quarantine(&mut self) {
+    fn recover_quarantine(&mut self, qp_is_live: bool) {
         match self.state {
             ReservationState::QuarantinedEstablished => {
                 self.counts.update(|counts| {
                     counts.established += 1;
-                    counts.registered_live_qps += 1;
+                    if qp_is_live {
+                        counts.registered_live_qps += 1;
+                    }
                     counts.quarantined_bundles = counts.quarantined_bundles.saturating_sub(1);
                 });
                 self.state = ReservationState::Established;
-                self.qp_counted = true;
+                self.qp_counted = qp_is_live;
             }
             ReservationState::QuarantinedDraining => {
                 self.counts.update(|counts| {
-                    counts.registered_live_qps += 1;
+                    if qp_is_live {
+                        counts.registered_live_qps += 1;
+                    }
                     counts.quarantined_bundles = counts.quarantined_bundles.saturating_sub(1);
                 });
                 self.state = ReservationState::Draining;
-                self.qp_counted = true;
+                self.qp_counted = qp_is_live;
             }
             ReservationState::Establishing
             | ReservationState::Established
@@ -1007,13 +1036,27 @@ pub(crate) trait WorkRequestPoster: Send + Sync {
     fn post_send(&self, batch: &mut PreparedSendBatch) -> Result<BatchPostOutcome>;
     fn post_recv(&self, batch: &mut PreparedRecvBatch) -> Result<BatchPostOutcome>;
     fn to_error(&self) -> Result<()>;
-    /// Returns true only when this call takes and destroys the owned QP.
-    fn destroy_qp(&self) -> bool;
-    fn destroy_connection(&self) -> (Option<SharedCmId>, bool) {
-        (None, self.destroy_qp())
+    /// Returns true only when this call successfully takes and destroys the
+    /// owned QP. A failure must retain the QP and return its error.
+    fn destroy_qp(&self) -> Result<bool>;
+    fn destroy_connection(&self, destroy_qp: bool) -> Result<(Option<SharedCmId>, bool)> {
+        Ok((
+            None,
+            if destroy_qp {
+                self.destroy_qp()?
+            } else {
+                false
+            },
+        ))
     }
     #[cfg(any(test, feature = "test-hooks"))]
     fn disconnect(&self) -> Result<()>;
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn fail_next_qp_destroy(&self) -> Result<()> {
+        Err(Error::InvalidConfig(
+            "QP destroy-failure injection is unavailable for this poster".into(),
+        ))
+    }
 }
 
 pub(super) struct VerbsConnectionResources {
@@ -1227,18 +1270,26 @@ impl WorkRequestPoster for VerbsConnectionResources {
         }
     }
 
-    fn destroy_qp(&self) -> bool {
-        let qp = lock_unpoison(&self.qp).take();
-        if let Some(qp) = qp {
-            qp.destroy();
-            true
-        } else {
-            false
+    fn destroy_qp(&self) -> Result<bool> {
+        let mut qp = lock_unpoison(&self.qp);
+        let Some(owned) = qp.take() else {
+            return Ok(false);
+        };
+        match owned.try_destroy() {
+            Ok(()) => Ok(true),
+            Err((owned, error)) => {
+                *qp = Some(owned);
+                Err(error)
+            }
         }
     }
 
-    fn destroy_connection(&self) -> (Option<SharedCmId>, bool) {
-        let qp_destroyed = self.destroy_qp();
+    fn destroy_connection(&self, destroy_qp: bool) -> Result<(Option<SharedCmId>, bool)> {
+        let qp_destroyed = if destroy_qp {
+            self.destroy_qp()?
+        } else {
+            false
+        };
         let cm_id = match lock_unpoison(&self.cm_owner).take() {
             Some(ConnectionCmOwner::Shared { cm_id }) => Some(cm_id),
             #[cfg(any(test, feature = "test-hooks"))]
@@ -1248,7 +1299,7 @@ impl WorkRequestPoster for VerbsConnectionResources {
             }
             None => None,
         };
-        (cm_id, qp_destroyed)
+        Ok((cm_id, qp_destroyed))
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1263,6 +1314,14 @@ impl WorkRequestPoster for VerbsConnectionResources {
             }
             None => Err(Error::TransportClosed),
         }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn fail_next_qp_destroy(&self) -> Result<()> {
+        let qp = lock_unpoison(&self.qp);
+        let qp = qp.as_ref().ok_or(Error::TransportClosed)?;
+        qp.fail_next_destroy();
+        Ok(())
     }
 }
 
@@ -1428,8 +1487,8 @@ mod tests {
             Ok(())
         }
 
-        fn destroy_qp(&self) -> bool {
-            false
+        fn destroy_qp(&self) -> Result<bool> {
+            Ok(false)
         }
 
         fn disconnect(&self) -> Result<()> {
@@ -1586,7 +1645,7 @@ mod tests {
             }
         );
 
-        reservation.recover_quarantine();
+        reservation.recover_quarantine(true);
         reservation.mark_qp_destroyed();
         assert_eq!(
             pool.snapshot(),
@@ -1626,9 +1685,9 @@ mod tests {
                 Ok(())
             }
 
-            fn destroy_qp(&self) -> bool {
+            fn destroy_qp(&self) -> Result<bool> {
                 self.0.fetch_add(1, Ordering::AcqRel);
-                true
+                Ok(true)
             }
 
             fn disconnect(&self) -> Result<()> {
@@ -1654,7 +1713,8 @@ mod tests {
             generation: 1,
         });
 
-        let error = match connection.destroy_connection_resources() {
+        let lifecycle = connection.lock_lifecycle();
+        let error = match connection.destroy_connection_resources(&lifecycle) {
             Ok(_) => panic!("accepted work must prevent connection destruction"),
             Err(error) => error,
         };

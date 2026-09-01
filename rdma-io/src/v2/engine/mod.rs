@@ -985,6 +985,10 @@ impl EngineShared {
                 .diagnostic_counters
                 .operations_completed
                 .load(Ordering::Acquire),
+            operations_released_after_qp_destroy: self
+                .diagnostic_counters
+                .operations_released_after_qp_destroy
+                .load(Ordering::Acquire),
             operations_cancelled: self
                 .diagnostic_counters
                 .operations_cancelled

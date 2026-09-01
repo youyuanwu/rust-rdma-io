@@ -188,6 +188,7 @@ fn all_61_message_cases_have_one_engine_disposition_and_live_evidence() {
             "clean_close_records_real_qp_mr_cm_and_canonical_ack_order_in_both_modes",
             "omitted_flush_cqe_uses_qp_destroy_before_clean_reclaim_in_both_modes",
             "held_real_cqe_uses_qp_destroy_for_clean_shutdown_in_both_modes",
+            "result_aware_qp_destroy_failure_quarantines_mr_and_debt_in_both_modes",
             "dropping_an_unspawned_driver_is_typed_and_consistent_in_both_modes",
             "aborting_the_driver_with_an_accepted_wr_wedges_and_wakes_in_both_modes",
             "peer_disconnect_uses_the_same_explicit_local_qp_err_close_path_in_both_modes",

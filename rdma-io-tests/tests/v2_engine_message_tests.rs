@@ -374,7 +374,10 @@ async fn run_cancellation_and_disconnect(mode: CompletionMode) {
         matches!(pending_result, Err(Error::TransportClosed)),
         "disconnect recv returned {pending_result:?}"
     );
-    assert_clean_close(server.close().await);
+    assert!(
+        matches!(server.close().await, Err(Error::TransportClosed)),
+        "close after an observed peer disconnect must preserve TransportClosed"
+    );
     listener.close().await.unwrap();
     drop(server);
     drop(client);
@@ -525,6 +528,11 @@ async fn run_cancelled_send_qp_destroy_fallback(mode: CompletionMode) {
         .instrumentation()
         .unwrap()
         .cqes_rejected;
+    let before_close = recorder.snapshot();
+    let mr_deregistrations = before_close
+        .iter()
+        .filter(|event| event.kind == DestructionKind::MemoryRegion)
+        .count();
 
     tokio::time::timeout(Duration::from_secs(2), client.close())
         .await
@@ -536,6 +544,32 @@ async fn run_cancelled_send_qp_destroy_fallback(mode: CompletionMode) {
     assert_eq!(diagnostics.quarantined_operations, 0);
     assert_eq!(diagnostics.retained_cq_credits, 0);
     assert_eq!(diagnostics.qp_destroys, 1);
+    assert_eq!(diagnostics.operations_released_after_qp_destroy, 1);
+    let after_close = recorder.snapshot();
+    assert!(
+        after_close
+            .iter()
+            .filter(|event| event.kind == DestructionKind::MemoryRegion)
+            .count()
+            > mr_deregistrations,
+        "the cancelled DATA MR must add an MR deregistration"
+    );
+    let qp_destroy = after_close
+        .iter()
+        .enumerate()
+        .skip(before_close.len())
+        .find_map(|(index, event)| (event.kind == DestructionKind::QueuePair).then_some(index))
+        .expect("cancelled DATA close must destroy its QP");
+    let mr_release = after_close
+        .iter()
+        .enumerate()
+        .skip(qp_destroy + 1)
+        .find_map(|(index, event)| (event.kind == DestructionKind::MemoryRegion).then_some(index))
+        .expect("cancelled DATA close must release an MR");
+    assert!(
+        qp_destroy < mr_release,
+        "the QP destruction boundary must precede cancelled DATA MR release"
+    );
 
     suppression.release().unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -558,13 +592,6 @@ async fn run_cancelled_send_qp_destroy_fallback(mode: CompletionMode) {
     client.close().await.unwrap();
     drop(connection);
     drop(client);
-    assert!(
-        recorder
-            .snapshot()
-            .iter()
-            .any(|event| event.kind == DestructionKind::MemoryRegion),
-        "the cancelled DATA MR and closed message pools must be safely released"
-    );
 
     assert_clean_close(server.close().await);
     listener.close().await.unwrap();

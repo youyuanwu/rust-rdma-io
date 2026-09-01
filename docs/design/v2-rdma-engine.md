@@ -470,23 +470,41 @@ MR, operation token, and CQ credit until an exhaustive positive safety boundary:
    its CM ID remains alive.
 
 QP ERR, timeout, CQ emptiness, driver loss, and a no-match poll are not release
-boundaries. QP destruction is a boundary only after the consuming synchronous
-call returns; no MR or accepted-WR debt is released before that point.
+boundaries. QP destruction is a boundary only after the result-returning
+`ibv_destroy_qp` call succeeds; no MR or accepted-WR debt is released before
+that point. Engine QPs use caller-owned shared CQs, so this direct verbs call
+does not invoke librdmacm's internal-CQ cleanup and cannot double-destroy the
+shared CQ. The engine clears `cm_id->qp` only after success.
 
 Connection close atomically stops posting, transitions the local QP to ERR
 even after peer disconnect, and drains only exact identity-matching CQEs.
-At accepted count zero, the consuming `rdma_destroy_qp` call runs while its CM
-ID is alive. If accepted WRs remain at the drain deadline because the provider
-omitted flush CQEs, close first consumes and destroys that same per-connection
-QP, then resolves operation observers/callbacks, releases MRs and CQ/local
+At the drain deadline, the sole driver first dispatches every exact CQE already
+queued on that connection through the normal admission-serialized completion
+path, then re-reads the accepted set. If it is empty, normal retirement runs
+without an unnecessary fallback destroy. If accepted WRs remain because the
+provider omitted or delayed flush CQEs, close destroys that same
+per-connection QP while its CM ID remains alive, then resolves operation
+observers/callbacks with the contextual close error, releases MRs and CQ/local
 admission, retires operation generations, drains and destroys the CM ID, and
-finally retires the connection generation. Late CQEs are stale or unknown and
-cannot touch reused slots.
+finally retires the connection generation. The post-destroy drain rejects only
+CQEs that arrive after the boundary.
+
+This deadline fallback is destructive: a provider success that was not polled
+and queued before successful QP destruction is not fabricated or returned.
+The operation completes with the contextual close error and any receive payload
+is discarded. QP destruction failure retains the live QP, CM ID, MRs,
+registrations, and CQ debt and publishes connection quarantine instead.
 
 `Error::ConnectionQuarantined { outstanding_operations, cq_debt }` is reserved
 for inability to establish the synchronous QP-destruction boundary, ambiguous
 ownership, or another connection-local retirement wedge. It is not the normal
 result of provider-omitted flush CQEs.
+
+Accepted-set/operation-registry mismatches are defensive corruption guards:
+normal production posting and completion mutate both on the sole driver. If a
+mismatch is nevertheless observed after a successful QP boundary, every
+ownership-valid token is still reclaimed; anomalous tokens remain quarantined
+with explicit diagnostics rather than stranding the safe tokens.
 
 If engine shutdown reaches its deadline with unsafe ownership,
 `Error::EngineWedged { retained_bundles, outstanding_operations, cq_debt }`
@@ -523,6 +541,11 @@ registry, drain, and quarantine sources during retirement. It contains:
 - monotonic admission, posting, batch, CQE/CM routing/rejection, lifecycle,
   cancellation, deadline, QP, quarantine, shutdown, wake, and yield counters.
 
+The operation ledger separates `operations_completed` (exact CQEs) from
+`operations_released_after_qp_destroy` (CQE-less forced releases).
+`cq_credits_released` is their combined release count, so accepted/completed/
+forced accounting remains explainable to terminal observers.
+
 `RdmaEngineDiagnostics::connections()` and `listeners()` are explicit detailed
 queries. They are O(number of current objects), return sorted snapshots, and
 are separate from aggregate snapshot creation. Connection details include
@@ -547,6 +570,8 @@ and polling modes with no provider-specific skip. Real flush CQEs are consumed
 when delivered. If a provider omits one, deterministic suppression tests prove
 that synchronous owning-QP destruction precedes MR release, close remains
 clean, accounting/generations are reusable, and late CQEs are rejected.
+Injected result-aware destruction failures prove that MRs and CQ debt remain
+quarantined and that externally supplied shared CQs are not destroyed twice.
 
 Run the complete sequential provider validation with:
 

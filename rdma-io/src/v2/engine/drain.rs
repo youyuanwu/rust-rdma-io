@@ -102,29 +102,39 @@ impl EngineShared {
         let Lookup::Occupied(connection) = self.connections.lookup(token) else {
             return;
         };
+        // A CQ service turn may have routed exact CQEs into this connection
+        // immediately before reclamation won the next scheduler turn. Deliver
+        // all such CQEs through the normal path before deciding whether a
+        // destructive fallback is necessary.
+        self.dispatch_queued_completions(&connection);
         let forced_tokens = {
             let _admission = read_unpoison(&self.admission);
-            let _lifecycle = connection.lock_lifecycle();
+            let lifecycle = connection.lock_lifecycle();
             let tokens = connection.accepted_tokens();
-            if tokens.is_empty() || !self.can_reclaim_after_qp_destroy(&connection, &tokens) {
+            if tokens.is_empty() {
                 None
             } else {
-                let (safe_boundary, destroyed_now) = connection.establish_qp_destruction_boundary();
-                if safe_boundary {
-                    if destroyed_now {
-                        self.record_qp_destroy();
+                match connection.establish_qp_destruction_boundary(&lifecycle) {
+                    Ok(destroyed_now) => {
+                        if destroyed_now {
+                            self.record_qp_destroy();
+                        }
+                        Some(tokens)
                     }
-                    Some(tokens)
-                } else {
-                    None
+                    Err(error) => {
+                        tracing::warn!(
+                            qp_num = connection.qp_num(),
+                            %error,
+                            "failed to establish result-aware QP destruction boundary"
+                        );
+                        None
+                    }
                 }
             }
         };
         if let Some(tokens) = forced_tokens {
             for operation in tokens {
-                if !self.reclaim_after_qp_destroy(&connection, operation) {
-                    break;
-                }
+                let _ = self.reclaim_after_qp_destroy(&connection, operation);
             }
             self.reject_queued_completions_after_qp_destroy(&connection);
         }
@@ -201,6 +211,7 @@ mod tests {
     use std::time::Duration;
 
     use super::super::connection::{WorkRequestPoster, install_connection};
+    use super::super::operation::install_accepted_operation_for_driver_test;
     use super::super::registry::OperationToken;
     use super::super::{CompletionMode, RdmaConnectionConfig, test_engine_pair};
     use crate::v2::error::{Error, Result};
@@ -212,6 +223,7 @@ mod tests {
         error_transitions: AtomicUsize,
         destroys: AtomicUsize,
         fail_error_transition: bool,
+        fail_destroy: bool,
     }
 
     impl TestPoster {
@@ -221,6 +233,7 @@ mod tests {
                 error_transitions: AtomicUsize::new(0),
                 destroys: AtomicUsize::new(0),
                 fail_error_transition: false,
+                fail_destroy: false,
             })
         }
 
@@ -230,6 +243,17 @@ mod tests {
                 error_transitions: AtomicUsize::new(0),
                 destroys: AtomicUsize::new(0),
                 fail_error_transition: true,
+                fail_destroy: false,
+            })
+        }
+
+        fn destroy_failing(qp_num: u32) -> Arc<Self> {
+            Arc::new(Self {
+                qp_num,
+                error_transitions: AtomicUsize::new(0),
+                destroys: AtomicUsize::new(0),
+                fail_error_transition: false,
+                fail_destroy: true,
             })
         }
     }
@@ -262,9 +286,13 @@ mod tests {
             }
         }
 
-        fn destroy_qp(&self) -> bool {
+        fn destroy_qp(&self) -> Result<bool> {
             self.destroys.fetch_add(1, Ordering::AcqRel);
-            true
+            if self.fail_destroy {
+                Err(Error::Verbs(std::io::Error::from_raw_os_error(libc::EBUSY)))
+            } else {
+                Ok(true)
+            }
         }
 
         fn disconnect(&self) -> Result<()> {
@@ -356,7 +384,12 @@ mod tests {
         assert_eq!(published.quarantined_bundles, 1);
         assert_eq!(published.connections_quarantined, 1);
         assert_eq!(published.connection_quarantine_outcomes, 1);
-        assert_eq!(poster.destroys.load(Ordering::Acquire), 0);
+        assert_eq!(published.registered_live_qps, 0);
+        assert_eq!(
+            poster.destroys.load(Ordering::Acquire),
+            1,
+            "the defensive unknown-token branch retains accounting after a safe QP boundary"
+        );
 
         assert!(connection.state.remove_accepted(token));
         engine
@@ -366,6 +399,7 @@ mod tests {
         engine
             .shared
             .recover_connection_quarantine(&connection.state);
+        assert_eq!(engine.diagnostics().registered_live_qps, 0);
         engine.shared.record_connection_drained(&connection.state);
         engine
             .shared
@@ -395,5 +429,92 @@ mod tests {
             }
         }
         assert!(completed);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn registered_operation_is_retained_when_qp_destruction_fails() {
+        let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
+        let poster = TestPoster::destroy_failing(23);
+        let connection = install_connection(
+            &engine.shared,
+            Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
+            RdmaConnectionConfig::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        install_accepted_operation_for_driver_test(
+            &engine.shared,
+            &connection.state,
+            crate::wc::WcOpcode::Recv,
+        );
+        let mut close = Box::pin(connection.close());
+
+        assert!(poll_once(close.as_mut()).is_pending());
+        assert!(poll_once(Pin::new(&mut driver)).is_pending());
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(poll_once(Pin::new(&mut driver)).is_pending());
+        assert!(matches!(
+            poll_once(close.as_mut()),
+            Poll::Ready(Err(Error::ConnectionQuarantined {
+                outstanding_operations: 1,
+                cq_debt: 1
+            }))
+        ));
+
+        let diagnostics = engine.diagnostics();
+        assert_eq!(poster.destroys.load(Ordering::Acquire), 1);
+        assert_eq!(diagnostics.qp_destroys, 0);
+        assert_eq!(diagnostics.operations_released_after_qp_destroy, 0);
+        assert_eq!(diagnostics.registered_operations, 1);
+        assert_eq!(diagnostics.accepted_outstanding_operations, 1);
+        assert_eq!(diagnostics.free_cq_credits, 16_383);
+        assert_eq!(diagnostics.retained_cq_credits, 1);
+        assert_eq!(diagnostics.quarantined_operations, 1);
+        assert_eq!(diagnostics.quarantined_bundles, 1);
+
+        drop(driver);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn anomalous_token_does_not_strand_reclaimable_operations_after_qp_destroy() {
+        let (engine, _driver) = test_engine_pair(CompletionMode::Polling);
+        let poster = TestPoster::new(24);
+        let connection = install_connection(
+            &engine.shared,
+            Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
+            RdmaConnectionConfig::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        for opcode in [crate::wc::WcOpcode::Send, crate::wc::WcOpcode::Recv] {
+            install_accepted_operation_for_driver_test(&engine.shared, &connection.state, opcode);
+        }
+        let anomalous = OperationToken {
+            slot: u32::MAX,
+            generation: 1,
+        };
+        connection.state.add_accepted(anomalous);
+        engine
+            .shared
+            .accepted_operations
+            .fetch_add(1, Ordering::AcqRel);
+        connection.state.begin_close();
+        connection.state.transition_to_error_once().unwrap();
+
+        engine
+            .shared
+            .handle_connection_drain_deadline(connection.state.token);
+
+        let diagnostics = engine.diagnostics();
+        assert_eq!(poster.destroys.load(Ordering::Acquire), 1);
+        assert_eq!(diagnostics.qp_destroys, 1);
+        assert_eq!(diagnostics.operations_released_after_qp_destroy, 2);
+        assert_eq!(diagnostics.registered_operations, 0);
+        assert_eq!(diagnostics.accepted_outstanding_operations, 1);
+        assert_eq!(connection.state.accepted_tokens(), vec![anomalous]);
+        assert_eq!(diagnostics.quarantined_bundles, 1);
+        assert_eq!(diagnostics.connection_quarantine_outcomes, 1);
     }
 }

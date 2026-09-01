@@ -282,12 +282,14 @@ Key design properties:
   `256 × 53 = 13,568`, leaving `2,816` positions in the default 16,384-entry
   global operation/CQ budget.
 - **Fail-closed teardown**: Cancellation retains accepted MRs until their exact
-  CQE or synchronous destruction of the owning per-connection QP. Close first
-  drains real CQEs, then uses QP destruction as the deterministic boundary when
-  a provider omits flush CQEs. `ConnectionQuarantined` is reserved for failure
-  to establish that boundary or another local wedge; unresolved driver loss
-  returns `EngineWedged`. Terminal fallback quarantine is process-lifetime
-  retention and can consume capacity until restart.
+  CQE or successful synchronous destruction of the owning per-connection QP.
+  At the drain deadline, every exact CQE already queued for the connection is
+  dispatched before the accepted set is re-read; an empty set retires cleanly
+  without destroying the QP early. Otherwise the engine uses result-returning
+  verbs destruction, retaining the QP/MRs/debt in `ConnectionQuarantined` if
+  destruction fails. A late success not queued before that boundary is
+  intentionally reported as closed and its payload is discarded. Terminal
+  driver-loss quarantine is process-lifetime retention until restart.
 
 #### Non-Goals
 
