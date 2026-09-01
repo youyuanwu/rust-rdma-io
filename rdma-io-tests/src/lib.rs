@@ -186,10 +186,62 @@ pub mod test_helpers {
     }
 
     fn transient_cm_event(message: &str) -> Option<(&str, i32)> {
-        let message = message.strip_prefix("RDMA CM ")?;
-        let (event, status) = message.split_once(" failed with status ")?;
-        let status = status.split_whitespace().next()?.parse().ok()?;
+        const ANCHOR: &str = "RDMA CM ";
+
+        let mut anchors = message.match_indices(ANCHOR);
+        let (anchor, _) = anchors.next()?;
+        if anchors.next().is_some()
+            || (anchor != 0 && !message.as_bytes()[anchor - 1].is_ascii_whitespace())
+        {
+            return None;
+        }
+
+        let prefix = &message[..anchor];
+        let has_listen_id = match prefix {
+            "" => true,
+            "inbound " => true,
+            _ => {
+                let address = prefix
+                    .strip_prefix("listener ")?
+                    .strip_suffix(' ')?
+                    .parse::<std::net::SocketAddr>()
+                    .ok()?;
+                if prefix != format!("listener {address} ") {
+                    return None;
+                }
+                false
+            }
+        };
+
+        let message = &message[anchor + ANCHOR.len()..];
+        let (event, status_and_ids) = message.split_once(" failed with status ")?;
+        let (status_token, ids) = status_and_ids.split_once(" for id=")?;
+        let status = status_token.parse::<i32>().ok()?;
+        if status.to_string() != status_token {
+            return None;
+        }
+
+        if has_listen_id {
+            let (id, listen_id) = ids.split_once(" listen_id=")?;
+            if !is_canonical_lower_hex(id) || !is_canonical_lower_hex(listen_id) {
+                return None;
+            }
+        } else if !is_canonical_lower_hex(ids) {
+            return None;
+        }
+
         Some((event, status))
+    }
+
+    fn is_canonical_lower_hex(value: &str) -> bool {
+        let Some(digits) = value.strip_prefix("0x") else {
+            return false;
+        };
+        !digits.is_empty()
+            && (digits == "0" || !digits.starts_with('0'))
+            && digits
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
     }
 
     fn is_transient_cm_status(status: i32) -> bool {
@@ -1202,6 +1254,58 @@ mod tests {
             V2EngineCmSetupStage::Listen,
             &eproto
         ));
+    }
+
+    #[test]
+    fn v2_transient_cm_error_accepts_exact_production_message_formats() {
+        for (stage, message) in [
+            (
+                V2EngineCmSetupStage::ConnectAccept,
+                "RDMA CM ConnectError failed with status -22 for id=0x1 listen_id=0x0",
+            ),
+            (
+                V2EngineCmSetupStage::Listen,
+                "listener 0.0.0.0:0 RDMA CM AddrError failed with status -98 for id=0x2",
+            ),
+            (
+                V2EngineCmSetupStage::ConnectAccept,
+                "inbound RDMA CM Rejected failed with status -71 for id=0x3 listen_id=0x2",
+            ),
+        ] {
+            let error = rdma_io::v2::Error::Verbs(std::io::Error::other(message.to_owned()));
+            assert!(
+                is_transient_v2_engine_cm_setup_error(stage, &error),
+                "{message:?} should be retryable"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_transient_cm_error_rejects_non_production_message_grammar() {
+        for message in [
+            "XRDMA CM ConnectError failed with status -22 for id=0x1 listen_id=0x0",
+            "RDMA  CM ConnectError failed with status -22 for id=0x1 listen_id=0x0",
+            "inbound RDMA CMConnectError failed with status -22 for id=0x1 listen_id=0x0",
+            "protocol violation: peer said RDMA CM ConnectError failed with status -22 for id=0x1 listen_id=0x0",
+            "listener not-an-address RDMA CM AddrError failed with status -98 for id=0x1",
+            "RDMA CM Unknown failed with status -22 for id=0x1 listen_id=0x0",
+            "RDMA CM ConnectError failed with status -110 for id=0x1 listen_id=0x0",
+            "RDMA CM ConnectError failed with status -220 for id=0x1 listen_id=0x0",
+            "RDMA CM ConnectError failed with status -22suffix for id=0x1 listen_id=0x0",
+            "RDMA CM ConnectError failed with status +22 for id=0x1 listen_id=0x0",
+            "RDMA CM ConnectError failed with status -22 extra for id=0x1 listen_id=0x0",
+            "RDMA CM ConnectError failed with status -22 for id=0x1 listen_id=0x0 trailing",
+            "RDMA CM ConnectError failed with status -22 for id=0x1",
+            "listener 0.0.0.0:0 RDMA CM AddrError failed with status -98 for id=0x1 listen_id=0x0",
+            "RDMA CM RDMA CM ConnectError failed with status -22 for id=0x1 listen_id=0x0",
+            "inbound RDMA CM ConnectError failed with status -22 for id=0x1 listen_id=0x0 RDMA CM Rejected failed with status -22 for id=0x2 listen_id=0x0",
+        ] {
+            let error = rdma_io::v2::Error::Verbs(std::io::Error::other(message.to_owned()));
+            assert!(
+                !is_transient_v2_engine_cm_setup_error(V2EngineCmSetupStage::ConnectAccept, &error),
+                "{message:?} should not be retryable"
+            );
+        }
     }
 
     #[test]
