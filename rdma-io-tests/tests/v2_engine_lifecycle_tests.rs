@@ -940,6 +940,8 @@ async fn run_setup_rollback_destroy_quarantines(mode: CompletionMode) {
             && diagnostics.live_connection_reservations == 1
             && diagnostics.establishing_connection_reservations == 0
             && diagnostics.free_connection_slots == 3
+            && diagnostics.connections_quarantined == 1
+            && diagnostics.connection_quarantine_outcomes == 1
     })
     .await;
     assert!(!client_task.is_finished());
@@ -964,18 +966,51 @@ async fn run_setup_rollback_destroy_quarantines(mode: CompletionMode) {
         inbound_error,
         Error::InvalidConfig(ref message) if message == inbound_original
     ));
-    failed_client_task.abort();
-    let _ = failed_client_task.await;
+    let peer_result = tokio::time::timeout(Duration::from_secs(3), failed_client_task)
+        .await
+        .expect("inbound rollback did not reject the peer promptly")
+        .expect("failed peer connect task panicked");
+    let peer_error = match peer_result {
+        Ok(_) => panic!("inbound rollback peer unexpectedly connected"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(peer_error, Error::Verbs(_)),
+        "unexpected inbound rollback peer outcome: {peer_error}"
+    );
     wait_until("inbound rollback quarantine was not published", || {
         let diagnostics = server_engine.diagnostics();
         diagnostics.quarantined_bundles == 1
             && diagnostics.live_connection_reservations == 1
             && diagnostics.establishing_connection_reservations == 0
             && diagnostics.free_connection_slots == 3
+            && diagnostics.connections_quarantined == 1
+            && diagnostics.connection_quarantine_outcomes == 1
+            && diagnostics.inbound_requests_rejected == 1
+            && diagnostics.inbound_rejected_setup_failure == 1
     })
     .await;
     assert!(!server_task.is_finished());
     assert!(server_engine.diagnostics().terminal_error.is_none());
+
+    let rollback_events = recorder.snapshot();
+    assert!(!recorder.overflowed());
+    assert_eq!(
+        rollback_events
+            .iter()
+            .filter(|event| {
+                event.kind == DestructionKind::QueuePair
+                    && event.result.is_some_and(|result| result != 0)
+            })
+            .count(),
+        2
+    );
+    assert!(
+        rollback_events
+            .iter()
+            .all(|event| event.kind != DestructionKind::MemoryRegion),
+        "setup rollback quarantine must not release retained connection resources"
+    );
 
     let (healthy_server, healthy_client) = accept_pair(&listener, &client_engine).await;
     exchange_byte(&healthy_client, &healthy_server, 0xa5).await;
@@ -985,13 +1020,19 @@ async fn run_setup_rollback_destroy_quarantines(mode: CompletionMode) {
     assert_eq!(server_diagnostics.free_connection_slots, 2);
     assert_eq!(server_diagnostics.live_connection_reservations, 2);
     assert_eq!(server_diagnostics.retired_connection_slots, 0);
+    assert_eq!(server_diagnostics.connections_quarantined, 1);
+    assert_eq!(server_diagnostics.connection_quarantine_outcomes, 1);
+    assert_eq!(server_diagnostics.inbound_requests_rejected, 1);
+    assert_eq!(server_diagnostics.inbound_rejected_setup_failure, 1);
     assert!(!server_task.is_finished());
     let client_diagnostics = client_engine.diagnostics();
     assert!(client_diagnostics.terminal_error.is_none());
     assert_eq!(client_diagnostics.quarantined_bundles, 1);
-    assert_eq!(client_diagnostics.free_connection_slots, 1);
-    assert!(client_diagnostics.live_connection_reservations >= 3);
+    assert_eq!(client_diagnostics.free_connection_slots, 2);
+    assert_eq!(client_diagnostics.live_connection_reservations, 2);
     assert_eq!(client_diagnostics.retired_connection_slots, 0);
+    assert_eq!(client_diagnostics.connections_quarantined, 1);
+    assert_eq!(client_diagnostics.connection_quarantine_outcomes, 1);
     assert!(!client_task.is_finished());
 
     let events = recorder.snapshot();

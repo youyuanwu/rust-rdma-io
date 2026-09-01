@@ -594,13 +594,18 @@ impl ConnectionState {
         self.close_notify.notify_waiters();
     }
 
-    pub(super) fn publish_destroy_quarantine(&self, error: &Error) {
+    pub(super) fn publish_destroy_quarantine(
+        &self,
+        error: &Error,
+        before_publish: impl FnOnce(),
+    ) -> bool {
         self.retirement_quarantined.store(true, Ordering::Release);
         let mut outcome = lock_unpoison(&self.close_outcome);
-        if !outcome
+        let newly_published = !outcome
             .as_ref()
-            .is_some_and(MemoizedTerminalResult::is_connection_quarantined)
-        {
+            .is_some_and(MemoizedTerminalResult::is_connection_quarantined);
+        if newly_published {
+            before_publish();
             *outcome = Some(MemoizedTerminalResult::from_error(
                 Error::ConnectionDestroyQuarantined {
                     cause: error.to_string(),
@@ -609,6 +614,7 @@ impl ConnectionState {
         }
         drop(outcome);
         self.close_notify.notify_waiters();
+        newly_published
     }
 
     pub(super) fn recover_quarantine(&self) -> bool {
@@ -1015,21 +1021,25 @@ impl ConnectionReservation {
 impl Drop for ConnectionReservation {
     fn drop(&mut self) {
         self.counts.update(|counts| {
-            counts.live = counts.live.saturating_sub(1);
             match self.state {
                 ReservationState::Establishing => {
+                    counts.live = counts.live.saturating_sub(1);
                     counts.establishing = counts.establishing.saturating_sub(1);
                 }
-                ReservationState::QuarantinedEstablishing => {
-                    counts.quarantined_bundles = counts.quarantined_bundles.saturating_sub(1);
-                }
                 ReservationState::Established => {
+                    counts.live = counts.live.saturating_sub(1);
                     counts.established = counts.established.saturating_sub(1);
                 }
-                ReservationState::Draining | ReservationState::QuarantinedDraining => {
+                ReservationState::Draining => {
+                    counts.live = counts.live.saturating_sub(1);
                     counts.draining = counts.draining.saturating_sub(1);
                 }
-                ReservationState::QuarantinedEstablished => {}
+                ReservationState::QuarantinedEstablishing
+                | ReservationState::QuarantinedEstablished
+                | ReservationState::QuarantinedDraining => {
+                    // A quarantined reservation pins admission and bundle
+                    // diagnostics even if a future owner is dropped.
+                }
             }
             if self.qp_counted {
                 counts.registered_live_qps = counts.registered_live_qps.saturating_sub(1);
@@ -1039,8 +1049,15 @@ impl Drop for ConnectionReservation {
 }
 
 impl ConnectionReservation {
-    pub(super) fn retain_setup_quarantine(&mut self) {
+    pub(super) fn retain_setup_quarantine(&mut self) -> bool {
+        let newly_quarantined = !matches!(
+            self.state,
+            ReservationState::QuarantinedEstablishing
+                | ReservationState::QuarantinedEstablished
+                | ReservationState::QuarantinedDraining
+        );
         self.mark_quarantined();
+        newly_quarantined
     }
 }
 
@@ -1221,6 +1238,20 @@ impl VerbsConnectionResources {
             #[cfg(any(test, feature = "test-hooks"))]
             Some(ConnectionCmOwner::External { .. }) => Err(Error::InvalidConfig(
                 "external CM owner cannot initiate an engine connection".into(),
+            )),
+            None => Err(Error::TransportClosed),
+        }
+    }
+
+    pub(super) fn reject(&self) -> Result<()> {
+        let cm_owner = lock_unpoison(&self.cm_owner);
+        match cm_owner.as_ref() {
+            Some(ConnectionCmOwner::Shared { cm_id, .. }) => {
+                cm_id.reject(&[]).map_err(Error::from_v1)
+            }
+            #[cfg(any(test, feature = "test-hooks"))]
+            Some(ConnectionCmOwner::External { .. }) => Err(Error::InvalidConfig(
+                "external CM owner cannot reject an engine connection".into(),
             )),
             None => Err(Error::TransportClosed),
         }
@@ -1764,6 +1795,43 @@ mod tests {
     }
 
     #[test]
+    fn destroy_quarantine_publishes_callback_and_outcome_once() {
+        let connection = ConnectionState::new(
+            ConnectionToken {
+                slot: 0,
+                generation: 1,
+            },
+            Arc::new(TestPoster),
+            RdmaConnectionConfig::default(),
+            None,
+            None,
+            None,
+            None,
+        );
+        let publications = AtomicUsize::new(0);
+
+        assert!(connection.publish_destroy_quarantine(
+            &Error::InvalidConfig("first destroy failure".into()),
+            || {
+                publications.fetch_add(1, Ordering::Relaxed);
+            },
+        ));
+        assert!(!connection.publish_destroy_quarantine(
+            &Error::InvalidConfig("repeated destroy failure".into()),
+            || {
+                publications.fetch_add(1, Ordering::Relaxed);
+            },
+        ));
+
+        assert_eq!(publications.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            connection.close_outcome().unwrap().into_result(),
+            Err(Error::ConnectionDestroyQuarantined { cause })
+                if cause.contains("first destroy failure")
+        ));
+    }
+
+    #[test]
     fn connection_state_counts_follow_exact_reservation_transitions() {
         let pool = ConnectionAdmissionPool::new(1);
         let mut reservation = pool.try_acquire().expect("reservation");
@@ -1812,6 +1880,26 @@ mod tests {
 
         drop(reservation);
         assert_eq!(pool.snapshot(), ConnectionStateCountSnapshot::default());
+    }
+
+    #[test]
+    fn dropped_setup_quarantine_keeps_admission_and_bundle_pinned() {
+        let pool = ConnectionAdmissionPool::new(1);
+        let mut reservation = pool.try_acquire().expect("reservation");
+
+        assert!(reservation.retain_setup_quarantine());
+        assert!(!reservation.retain_setup_quarantine());
+        drop(reservation);
+
+        assert_eq!(
+            pool.snapshot(),
+            ConnectionStateCountSnapshot {
+                live: 1,
+                quarantined_bundles: 1,
+                ..ConnectionStateCountSnapshot::default()
+            }
+        );
+        assert!(pool.try_acquire().is_none());
     }
 
     #[test]

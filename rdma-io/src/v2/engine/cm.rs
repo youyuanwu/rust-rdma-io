@@ -447,10 +447,11 @@ impl CmState {
     }
 
     pub(super) fn retained_owner_count(&self) -> usize {
-        self.routes.live()
+        let routed_owners = self.routes.live()
             + self.inbound_routes.live()
             + lock_unpoison(&self.listeners).len()
-            + lock_unpoison(&self.cm_destructions).len()
+            + lock_unpoison(&self.cm_destructions).len();
+        routed_owners.max(lock_unpoison(&self.setup_rollback_quarantines).len())
     }
 
     pub(super) fn listener_counts(&self) -> (usize, usize, usize, usize) {
@@ -1006,7 +1007,8 @@ impl CmState {
                         self.inbound_routes.release(token, false);
                     }
                     Err(destroy_error) => {
-                        self.record_setup_rollback_quarantine(shared, &destroy_error);
+                        Self::record_setup_rollback_quarantine(&destroy_error);
+                        self.reject_retained_inbound_child(shared, &verbs);
                         let connection =
                             self.retain_failed_install(shared, failed_resources, &destroy_error);
                         route.set_state(InboundState::Quarantined { connection });
@@ -1136,6 +1138,20 @@ impl CmState {
         })?;
         self.defer_cm_id(cm_id);
         Ok(())
+    }
+
+    fn reject_retained_inbound_child(
+        &self,
+        shared: &EngineShared,
+        verbs: &VerbsConnectionResources,
+    ) {
+        self.record_inbound_reject(shared, InboundRejectReason::SetupFailure);
+        if let Err(error) = verbs.reject() {
+            tracing::warn!(
+                %error,
+                "failed to reject inbound child before retaining setup rollback quarantine"
+            );
+        }
     }
 
     fn reject_child(
@@ -1487,18 +1503,15 @@ impl CmState {
                     %error,
                     "connection QP destroy failed; retaining terminal quarantine"
                 );
-                if shared.track_connection_quarantine(connection.token) {
-                    shared
-                        .diagnostic_counters
-                        .connections_quarantined
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                shared
-                    .diagnostic_counters
-                    .connection_quarantine_outcomes
-                    .fetch_add(1, Ordering::Relaxed);
+                let first_connection_quarantine =
+                    shared.track_connection_quarantine(connection.token);
                 shared.record_connection_retirement_failure(&connection);
-                connection.publish_destroy_quarantine(&error);
+                connection.publish_destroy_quarantine(&error, || {
+                    Self::record_connection_destroy_quarantine_outcome(
+                        shared,
+                        first_connection_quarantine,
+                    );
+                });
                 self.finish_inbound_retirement(completion);
                 return Ok(());
             }
@@ -1566,7 +1579,11 @@ impl CmState {
                 poster,
                 mut reservation,
             } => {
-                reservation.retain_setup_quarantine();
+                let first_connection_quarantine = reservation.retain_setup_quarantine();
+                Self::record_connection_destroy_quarantine_outcome(
+                    shared,
+                    first_connection_quarantine,
+                );
                 lock_unpoison(&self.setup_rollback_quarantines).push(RetainedSetupRollback {
                     _poster: poster,
                     _reservation: reservation,
@@ -1576,18 +1593,36 @@ impl CmState {
             FailedConnectionInstallResources::Registered(connection) => {
                 connection.begin_close();
                 let _ = connection.try_begin_retirement();
-                let _ = shared.track_connection_quarantine(connection.token);
-                connection.publish_destroy_quarantine(destroy_error);
+                let first_connection_quarantine =
+                    shared.track_connection_quarantine(connection.token);
+                connection.publish_destroy_quarantine(destroy_error, || {
+                    Self::record_connection_destroy_quarantine_outcome(
+                        shared,
+                        first_connection_quarantine,
+                    );
+                });
                 Some(EstablishedConnectionRoute::new(&connection))
             }
         }
     }
 
-    fn record_setup_rollback_quarantine(&self, shared: &EngineShared, destroy_error: &Error) {
+    fn record_connection_destroy_quarantine_outcome(
+        shared: &EngineShared,
+        first_connection_quarantine: bool,
+    ) {
+        if first_connection_quarantine {
+            shared
+                .diagnostic_counters
+                .connections_quarantined
+                .fetch_add(1, Ordering::Relaxed);
+        }
         shared
             .diagnostic_counters
-            .connections_quarantined
+            .connection_quarantine_outcomes
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_setup_rollback_quarantine(destroy_error: &Error) {
         tracing::warn!(
             %destroy_error,
             "setup rollback QP destroy failed; retaining connection resources"
@@ -2290,7 +2325,7 @@ impl CmState {
                         self.retire_route(route, true);
                     }
                     Err(destroy_error) => {
-                        self.record_setup_rollback_quarantine(shared, &destroy_error);
+                        Self::record_setup_rollback_quarantine(&destroy_error);
                         let connection =
                             self.retain_failed_install(shared, failed_resources, &destroy_error);
                         route.set_state(OutboundState::Quarantined { connection });

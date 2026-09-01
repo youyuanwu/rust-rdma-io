@@ -289,10 +289,11 @@ Key design properties:
   verbs destruction. A failed drain boundary retains QP/MRs/debt in
   `ConnectionQuarantined`; a failed zero-debt retirement retains the complete
   QP/CM/admission/generation bundle in `ConnectionDestroyQuarantined`. Setup
-  rollback preserves its original setup error while retaining the failed
-  destroy as connection-local quarantine. A late success not queued before that boundary is
-  intentionally reported as closed and its payload is discarded. Terminal
-  driver-loss quarantine is process-lifetime retention until restart.
+  rollback preserves its original setup error, promptly rejects an inbound
+  peer, and retains the failed destroy as connection-local quarantine. A late
+  success not queued before that boundary is intentionally reported as closed
+  and its payload is discarded. Terminal driver-loss quarantine is
+  process-lifetime retention until restart.
 
 #### Non-Goals
 

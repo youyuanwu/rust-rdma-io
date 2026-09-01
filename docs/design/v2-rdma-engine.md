@@ -505,9 +505,14 @@ retirement enters terminal retained quarantine and `close()` returns
 `ConnectionDestroyQuarantined` without failing the shared driver. The
 connection registry generation, admission reservation, QP, and CM ID remain
 owned and cannot be reused. A pre-registration setup rollback applies the same
-retention to its establishing reservation and CM route, but the connect or
-accept caller still receives the original setup error; the destroy failure is
-reported separately through diagnostics and warning logs.
+retention to its establishing reservation and CM route. A quarantined
+establishing reservation permanently pins its admission slot and quarantine
+gauge even if a future owner is accidentally dropped. Before retaining an
+inbound child, the engine sends a legal pre-accept RDMA-CM rejection so the
+peer fails promptly rather than waiting for its CM timeout. The connect or
+accept caller still receives the original setup error; secondary reject and
+destroy failures remain diagnostic, and the retained bundle is never retried
+by driver-drop cleanup.
 
 Accepted-set/operation-registry mismatches are defensive corruption guards:
 normal production posting and completion mutate both on the sole driver. If a

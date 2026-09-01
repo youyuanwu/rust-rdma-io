@@ -99,7 +99,10 @@ impl EngineShared {
                     .qp_error_transitions
                     .fetch_add(1, Ordering::Relaxed);
             }
-            if connection.accepted_count() == 0 && !connection.is_retired() {
+            if connection.accepted_count() == 0
+                && !connection.is_retired()
+                && !connection.retirement_is_quarantined()
+            {
                 match connection.establish_qp_destruction_boundary(&_lifecycle) {
                     Ok(true) => self.record_qp_destroy(),
                     Ok(false) => {}
@@ -224,6 +227,37 @@ mod tests {
 
         assert_eq!(poster.destroys.load(Ordering::Acquire), 1);
         assert_eq!(engine.diagnostics().qp_destroys, 1);
+        engine.shared.finish(MemoizedTerminalResult::success());
+        drop(driver);
+    }
+
+    #[test]
+    fn driver_drop_does_not_retry_destroy_quarantined_qp() {
+        let (engine, driver) = test_engine_pair(CompletionMode::Polling);
+        let poster = Arc::new(HeldPoster {
+            qp_num: 32,
+            destroys: AtomicUsize::new(0),
+        });
+        let connection = install_connection(
+            &engine.shared,
+            Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
+            RdmaConnectionConfig::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        connection.state.begin_close();
+        assert!(connection.state.try_begin_retirement());
+        connection.state.publish_destroy_quarantine(
+            &Error::InvalidConfig("injected destroy failure".into()),
+            || {},
+        );
+
+        engine.shared.synchronously_prepare_driver_drop();
+        engine.shared.synchronously_prepare_driver_drop();
+
+        assert_eq!(poster.destroys.load(Ordering::Acquire), 0);
+        assert_eq!(engine.diagnostics().qp_destroys, 0);
         engine.shared.finish(MemoizedTerminalResult::success());
         drop(driver);
     }
