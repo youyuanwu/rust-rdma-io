@@ -171,7 +171,7 @@ fn all_61_message_cases_have_one_engine_disposition_and_live_evidence() {
             "queued_send_cancellation_and_disconnect_wake_observers",
             "cancelled_recv_does_not_consume_successor_message_in_both_modes",
             "hot_message_work_rotates_and_connection_close_is_independent",
-            "cancelled_data_send_retains_mr_until_exact_cqe_and_memoizes_quarantine",
+            "cancelled_data_send_reclaims_after_qp_destroy_and_rejects_late_cqe",
         ],
     );
     assert_test_functions(
@@ -186,8 +186,8 @@ fn all_61_message_cases_have_one_engine_disposition_and_live_evidence() {
         LIFECYCLE_SOURCE,
         &[
             "clean_close_records_real_qp_mr_cm_and_canonical_ack_order_in_both_modes",
-            "held_real_cqe_quarantines_then_recovers_without_rewriting_close_in_both_modes",
-            "held_real_cqe_wedges_shutdown_and_wakes_all_observers_in_both_modes",
+            "omitted_flush_cqe_uses_qp_destroy_before_clean_reclaim_in_both_modes",
+            "held_real_cqe_uses_qp_destroy_for_clean_shutdown_in_both_modes",
             "dropping_an_unspawned_driver_is_typed_and_consistent_in_both_modes",
             "aborting_the_driver_with_an_accepted_wr_wedges_and_wakes_in_both_modes",
             "peer_disconnect_uses_the_same_explicit_local_qp_err_close_path_in_both_modes",

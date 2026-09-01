@@ -668,11 +668,11 @@ pub(super) mod test_api {
     use crate::v2::{
         AccessIntent, Completion, Mr, Qp, QpBuilder, RdmaConnection, RdmaConnectionConfig,
     };
-    use crate::wc::{WcOpcode, WorkCompletion};
+    use crate::wc::{WcOpcode, WcStatus, WorkCompletion};
     use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
 
     use super::{EngineShared, Error, READY_CONNECTION_WORK, Result, TERMINAL_WORK};
-    use crate::v2::engine::registry::Lookup;
+    use crate::v2::engine::registry::{Lookup, OperationToken};
 
     /// Test-only connection identity used by the Phase 2 routing gate.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1038,7 +1038,7 @@ pub(super) mod test_api {
             &self,
             connection: &RdmaConnection,
         ) -> Result<TestConnectionCqeSuppression> {
-            self.suppress_next_connection_cqe_matching(connection, None)
+            self.suppress_next_connection_cqe_matching(connection, None, false)
         }
 
         /// Hold the next real CQE with the requested opcode for `connection`.
@@ -1047,13 +1047,25 @@ pub(super) mod test_api {
             connection: &RdmaConnection,
             opcode: WcOpcode,
         ) -> Result<TestConnectionCqeSuppression> {
-            self.suppress_next_connection_cqe_matching(connection, Some(opcode))
+            self.suppress_next_connection_cqe_matching(connection, Some(opcode), false)
+        }
+
+        /// Hold the next real flush CQE for `connection` after polling.
+        ///
+        /// If the provider omits the flush CQE, the controller remains
+        /// unobserved while the production QP-destruction fallback proceeds.
+        pub fn suppress_next_connection_flush_cqe(
+            &self,
+            connection: &RdmaConnection,
+        ) -> Result<TestConnectionCqeSuppression> {
+            self.suppress_next_connection_cqe_matching(connection, None, true)
         }
 
         fn suppress_next_connection_cqe_matching(
             &self,
             connection: &RdmaConnection,
             expected_opcode: Option<WcOpcode>,
+            require_flush: bool,
         ) -> Result<TestConnectionCqeSuppression> {
             let shared = self.ensure_active()?;
             if !Arc::ptr_eq(&shared, &connection.shared) {
@@ -1065,6 +1077,7 @@ pub(super) mod test_api {
                 connection.state.token,
                 connection.identity().qp_num(),
                 expected_opcode,
+                require_flush,
             )?;
             Ok(TestConnectionCqeSuppression {
                 shared: Arc::downgrade(&shared),
@@ -1072,6 +1085,44 @@ pub(super) mod test_api {
                 qp_num: connection.identity().qp_num(),
                 active: true,
             })
+        }
+
+        /// Return the exact accepted WR IDs currently owned by `connection`.
+        pub fn accepted_operation_wr_ids(&self, connection: &RdmaConnection) -> Result<Vec<u64>> {
+            let shared = self.ensure_active()?;
+            if !Arc::ptr_eq(&shared, &connection.shared) {
+                return Err(Error::InvalidConfig(
+                    "connection belongs to another engine".into(),
+                ));
+            }
+            Ok(connection
+                .state
+                .accepted_tokens()
+                .into_iter()
+                .map(OperationToken::encode)
+                .collect())
+        }
+
+        /// Return the private registry slot and generation for a connection.
+        pub fn connection_registry_identity(
+            &self,
+            connection: &RdmaConnection,
+        ) -> Result<(u32, u32)> {
+            let shared = self.ensure_active()?;
+            if !Arc::ptr_eq(&shared, &connection.shared) {
+                return Err(Error::InvalidConfig(
+                    "connection belongs to another engine".into(),
+                ));
+            }
+            let identity = connection.identity();
+            Ok((identity.registry_slot(), identity.registration_generation()))
+        }
+
+        /// Decode a test-observed WR ID into its operation slot and generation.
+        pub fn operation_registry_identity(&self, wr_id: u64) -> Result<(u32, u32)> {
+            self.ensure_active()?;
+            let token = OperationToken::decode(wr_id);
+            Ok((token.slot, token.generation))
         }
 
         /// Pause connection-local ready work without pausing shared CQ or CM work.
@@ -1549,6 +1600,7 @@ pub(super) mod test_api {
         connection: super::super::registry::ConnectionToken,
         qp_num: u32,
         expected_opcode: Option<WcOpcode>,
+        require_flush: bool,
         completion: Option<WorkCompletion>,
         abandoned: bool,
     }
@@ -1676,6 +1728,7 @@ pub(super) mod test_api {
             connection: super::super::registry::ConnectionToken,
             qp_num: u32,
             expected_opcode: Option<WcOpcode>,
+            require_flush: bool,
         ) -> Result<()> {
             let mut control = self
                 .connection_cqe_suppression
@@ -1690,6 +1743,7 @@ pub(super) mod test_api {
                 connection,
                 qp_num,
                 expected_opcode,
+                require_flush,
                 completion: None,
                 abandoned: false,
             });
@@ -1709,6 +1763,7 @@ pub(super) mod test_api {
                 || control
                     .expected_opcode
                     .is_some_and(|opcode| opcode != completion.opcode())
+                || (control.require_flush && completion.status() != WcStatus::WrFlushErr)
                 || control.abandoned
             {
                 return false;

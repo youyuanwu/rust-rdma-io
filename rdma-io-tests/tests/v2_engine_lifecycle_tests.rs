@@ -7,6 +7,7 @@ use rdma_io::v2::{
     AccessIntent, CompletionMode, Error, RdmaConnection, RdmaEngine, RdmaEngineBuilder,
     RdmaListener, RdmaListenerConfig,
 };
+use rdma_io::wc::WcOpcode;
 use rdma_io_tests::test_helpers::{connect_addr_for, has_software_rdma};
 
 fn software_device_name() -> Option<String> {
@@ -272,7 +273,7 @@ async fn run_clean_close(mode: CompletionMode) {
     assert_provider_root_drop_order(&events, mode, 2, true);
 }
 
-async fn run_missing_cqe_recovery(mode: CompletionMode) {
+async fn run_missing_flush_cqe_qp_destroy_fallback(mode: CompletionMode) {
     if !has_software_rdma() {
         return;
     }
@@ -303,95 +304,112 @@ async fn run_missing_cqe_recovery(mode: CompletionMode) {
     let (server, client) = accept_pair(&listener, &client_engine).await;
 
     let recv_mr = server.register_memory(64, AccessIntent::LocalOnly).unwrap();
-    let mut send_mr = client.register_memory(64, AccessIntent::LocalOnly).unwrap();
-    send_mr.as_mut_slice()[0] = 37;
-    let recorder = DestructionRecorder::arm(128);
+    let (server_b, client_b) = accept_pair(&listener, &client_engine).await;
+    let old_connection_identity = server_resources
+        .connection_registry_identity(&server)
+        .unwrap();
+    let old_qp_num = server.identity().qp_num();
     let mut recv = Box::pin(server.recv(recv_mr, None));
     futures_util::future::poll_fn(|cx| {
         assert!(recv.as_mut().poll(cx).is_pending());
         Poll::Ready(())
     })
     .await;
-    let suppression = server_resources
-        .suppress_next_connection_cqe(&server)
+    let accepted = server_resources.accepted_operation_wr_ids(&server).unwrap();
+    assert_eq!(accepted.len(), 1);
+    let old_wr_id = accepted[0];
+    let old_operation_identity = server_resources
+        .operation_registry_identity(old_wr_id)
         .unwrap();
-    let (send_result, returned_send) = client.send(send_mr, None).await;
-    send_result.unwrap();
-    let returned_send = returned_send.expect("send MR must return after its exact CQE");
-    suppression.wait_observed().await.unwrap();
+    let suppression = server_resources
+        .suppress_next_connection_flush_cqe(&server)
+        .unwrap();
+    let recorder = DestructionRecorder::arm(256);
 
-    let close_result = tokio::time::timeout(Duration::from_secs(3), server.close())
+    tokio::time::timeout(Duration::from_secs(3), server.close())
         .await
         .expect("connection close did not reach its configured deadline")
-        .unwrap_err();
-    assert!(matches!(
-        close_result,
-        Error::ConnectionQuarantined {
-            outstanding_operations: 1,
-            cq_debt: 1
-        }
-    ));
+        .unwrap();
     let (operation_result, returned_recv) = recv.await;
     assert!(matches!(operation_result, Err(Error::TransportClosed)));
     assert!(returned_recv.is_none());
 
-    let quarantined = server_engine.diagnostics();
-    assert_eq!(quarantined.quarantined_bundles, 1);
-    assert_eq!(quarantined.quarantined_operations, 1);
-    assert_eq!(quarantined.retained_cq_credits, 1);
-    assert_eq!(quarantined.live_connection_reservations, 1);
-    assert_eq!(quarantined.qp_destroys, 0);
-    let before_recovery = recorder.snapshot();
+    let closed = server_engine.diagnostics();
+    assert_eq!(closed.accepted_outstanding_operations, 0);
+    assert_eq!(closed.registered_operations, 0);
+    assert_eq!(closed.free_cq_credits, 64);
+    assert_eq!(closed.quarantined_bundles, 0);
+    assert_eq!(closed.quarantined_operations, 0);
+    assert_eq!(closed.retained_cq_credits, 0);
+    assert_eq!(closed.live_connection_reservations, 1);
+    assert_eq!(closed.qp_destroys, 1);
+    let after_close = recorder.snapshot();
+    let qp_destroy = position(&after_close, DestructionKind::QueuePair);
+    let mr_release = position(&after_close, DestructionKind::MemoryRegion);
     assert!(
-        !before_recovery
-            .iter()
-            .any(|event| matches!(event.kind, DestructionKind::MemoryRegion))
+        qp_destroy < mr_release,
+        "the owning QP must be synchronously destroyed before its unresolved MR is released"
     );
 
-    suppression.release().unwrap();
-    wait_until(
-        "late real CQE did not recover and retire the connection",
-        || {
-            let diagnostics = server_engine.diagnostics();
-            diagnostics.live_connection_reservations == 0
-                && diagnostics.registered_operations == 0
-                && diagnostics.quarantined_bundles == 0
-                && diagnostics.qp_destroys == 1
-        },
-    )
+    drop(suppression);
+    let recv_b_mr = server_b
+        .register_memory(64, AccessIntent::LocalOnly)
+        .unwrap();
+    let mut recv_b = Box::pin(server_b.recv(recv_b_mr, None));
+    futures_util::future::poll_fn(|cx| {
+        assert!(recv_b.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
     .await;
-    assert_eq!(server_engine.diagnostics().quarantine_recoveries, 1);
-    let after_recovery = recorder.snapshot();
-    let mr_events = after_recovery
-        .iter()
-        .filter(|event| event.kind == DestructionKind::MemoryRegion)
-        .collect::<Vec<_>>();
-    assert_eq!(
-        mr_events.len(),
-        1,
-        "with the completed send MR retained, recovery must deregister exactly the quarantined receive MR"
-    );
-    assert_eq!(mr_events[0].result, Some(0));
-    let repeated = server.close().await.unwrap_err();
-    assert!(matches!(
-        repeated,
-        Error::ConnectionQuarantined {
-            outstanding_operations: 1,
-            cq_debt: 1
-        }
-    ));
+    let accepted_b = server_resources
+        .accepted_operation_wr_ids(&server_b)
+        .unwrap();
+    assert_eq!(accepted_b.len(), 1);
+    let new_operation_identity = server_resources
+        .operation_registry_identity(accepted_b[0])
+        .unwrap();
+    assert_eq!(new_operation_identity.0, old_operation_identity.0);
+    assert_ne!(new_operation_identity.1, old_operation_identity.1);
 
-    drop(returned_send);
+    let rejected_before = server_resources.instrumentation().unwrap().cqes_rejected;
+    server_resources
+        .inject_completion(old_wr_id, old_qp_num, WcOpcode::Recv)
+        .unwrap();
     assert_eq!(
-        recorder
-            .snapshot()
-            .iter()
-            .filter(|event| event.kind == DestructionKind::MemoryRegion)
-            .count(),
-        2,
-        "dropping the retained send MR must produce the next distinct deregistration"
+        server_resources.instrumentation().unwrap().cqes_rejected,
+        rejected_before + 1
     );
+    futures_util::future::poll_fn(|cx| {
+        assert!(recv_b.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+
+    let mut send_b_mr = client_b
+        .register_memory(64, AccessIntent::LocalOnly)
+        .unwrap();
+    send_b_mr.as_mut_slice()[0] = 73;
+    let ((recv_b_result, returned_recv_b), (send_b_result, returned_send_b)) =
+        tokio::join!(recv_b, client_b.send(send_b_mr, None));
+    recv_b_result.unwrap();
+    send_b_result.unwrap();
+    assert_eq!(returned_recv_b.unwrap().as_slice()[0], 73);
+    drop(returned_send_b);
+
     client.close().await.unwrap();
+    let (server_c, client_c) = accept_pair(&listener, &client_engine).await;
+    let new_connection_identity = server_resources
+        .connection_registry_identity(&server_c)
+        .unwrap();
+    assert_eq!(new_connection_identity.0, old_connection_identity.0);
+    assert_ne!(new_connection_identity.1, old_connection_identity.1);
+
+    let (server_c_close, client_c_close) = tokio::join!(server_c.close(), client_c.close());
+    server_c_close.unwrap();
+    client_c_close.unwrap();
+    let (server_b_close, client_b_close) = tokio::join!(server_b.close(), client_b.close());
+    server_b_close.unwrap();
+    client_b_close.unwrap();
     listener.close().await.unwrap();
     let (server_shutdown, client_shutdown) =
         tokio::join!(server_engine.shutdown(), client_engine.shutdown());
@@ -402,6 +420,10 @@ async fn run_missing_cqe_recovery(mode: CompletionMode) {
     drop(server_resources);
     drop(server);
     drop(client);
+    drop(server_b);
+    drop(client_b);
+    drop(server_c);
+    drop(client_c);
     drop(listener);
     drop(server_engine);
     drop(client_engine);
@@ -411,7 +433,7 @@ async fn run_missing_cqe_recovery(mode: CompletionMode) {
     assert_cm_ids_were_drained_before_destroy(&events);
 }
 
-async fn run_shutdown_wedge(mode: CompletionMode) {
+async fn run_shutdown_qp_destroy_fallback(mode: CompletionMode) {
     if !has_software_rdma() {
         return;
     }
@@ -456,34 +478,21 @@ async fn run_shutdown_wedge(mode: CompletionMode) {
     send_result.unwrap();
     suppression.wait_observed().await.unwrap();
 
-    let shutdown_error = tokio::time::timeout(Duration::from_secs(3), server_engine.shutdown())
+    tokio::time::timeout(Duration::from_secs(3), server_engine.shutdown())
         .await
-        .expect("engine shutdown did not reach its configured wedge deadline")
-        .unwrap_err();
-    assert!(matches!(
-        shutdown_error,
-        Error::EngineWedged {
-            retained_bundles: 1..,
-            outstanding_operations: 1,
-            cq_debt: 1
-        }
-    ));
-    let driver_error = server_task.await.unwrap().unwrap_err();
-    assert_eq!(driver_error.to_string(), shutdown_error.to_string());
+        .expect("engine shutdown did not reach its configured close deadline")
+        .unwrap();
+    server_task.await.unwrap().unwrap();
     let (operation_error, returned_recv) = recv.await;
-    assert_eq!(
-        operation_error.unwrap_err().to_string(),
-        shutdown_error.to_string()
-    );
+    assert!(matches!(operation_error, Err(Error::TransportClosed)));
     assert!(returned_recv.is_none());
     let diagnostics = server_engine.diagnostics();
-    assert_eq!(
-        diagnostics.terminal_error.unwrap().message,
-        shutdown_error.to_string()
-    );
-    assert_eq!(diagnostics.quarantined_bundles, 1);
-    assert_eq!(diagnostics.qp_destroys, 0);
-    assert_eq!(diagnostics.engine_wedges, 1);
+    assert!(diagnostics.terminal_error.is_none());
+    assert_eq!(diagnostics.accepted_outstanding_operations, 0);
+    assert_eq!(diagnostics.registered_operations, 0);
+    assert_eq!(diagnostics.quarantined_bundles, 0);
+    assert_eq!(diagnostics.qp_destroys, 1);
+    assert_eq!(diagnostics.engine_wedges, 0);
     drop(suppression);
 
     drop(returned_send);
@@ -823,15 +832,15 @@ async fn clean_close_records_real_qp_mr_cm_and_canonical_ack_order_in_both_modes
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
-async fn held_real_cqe_quarantines_then_recovers_without_rewriting_close_in_both_modes() {
-    run_missing_cqe_recovery(CompletionMode::Readiness).await;
-    run_missing_cqe_recovery(CompletionMode::Polling).await;
+async fn omitted_flush_cqe_uses_qp_destroy_before_clean_reclaim_in_both_modes() {
+    run_missing_flush_cqe_qp_destroy_fallback(CompletionMode::Readiness).await;
+    run_missing_flush_cqe_qp_destroy_fallback(CompletionMode::Polling).await;
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
-async fn held_real_cqe_wedges_shutdown_and_wakes_all_observers_in_both_modes() {
-    run_shutdown_wedge(CompletionMode::Readiness).await;
-    run_shutdown_wedge(CompletionMode::Polling).await;
+async fn held_real_cqe_uses_qp_destroy_for_clean_shutdown_in_both_modes() {
+    run_shutdown_qp_destroy_fallback(CompletionMode::Readiness).await;
+    run_shutdown_qp_destroy_fallback(CompletionMode::Polling).await;
 }
 
 #[test_log::test(tokio::test(flavor = "current_thread"))]

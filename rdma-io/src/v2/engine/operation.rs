@@ -28,8 +28,10 @@ use crate::wr::{PreparedRecvBatch, PreparedSendBatch, RecvWr, SendFlags, SendWr,
 /// `(rdma_io::v2::Result<Completion>, Option<Mr>)`. Dropping it after posting
 /// transfers observation to the engine; the MR, operation registration, and CQ
 /// debt remain owned until the provider proves the WR unaccepted or the engine
-/// consumes its exact validated success/error/flush CQE. Timeout, QP ERR,
-/// driver loss, and CQ emptiness are not release boundaries.
+/// consumes its exact validated success/error/flush CQE, or until synchronous
+/// destruction of the owning per-connection QP proves that the HCA can no
+/// longer access the MR. Timeout, QP ERR, driver loss, and CQ emptiness alone
+/// are not release boundaries.
 ///
 /// The first poll performs the synchronous `ibv_post_send` or `ibv_post_recv`
 /// call. Provider posting has no wall-clock latency guarantee even though
@@ -854,6 +856,36 @@ impl OperationState {
         }
     }
 
+    fn finish_after_qp_destroy(&self, error: Error) -> FinishState {
+        let mut inner = lock_unpoison(&self.inner);
+        let was_reclaiming = inner.reclamation_pending;
+        inner.reclamation_pending = false;
+        let was_quarantined = self.quarantined.swap(false, Ordering::AcqRel);
+        let mut mr = inner.mr.take();
+        let callback = inner.callback.take().map(|callback| {
+            let callback_mr = mr.take();
+            (
+                callback,
+                DetachedOperationCompletion::Completed {
+                    result: Err(error.clone()),
+                    mr: callback_mr,
+                },
+            )
+        });
+        if callback.is_none() && !inner.detached && inner.output.is_none() {
+            inner.output = Some((Err(error), None));
+        }
+        inner.lifecycle = OperationLifecycle::Released;
+        drop(inner);
+        drop(mr);
+        self.waker.wake();
+        FinishState {
+            was_reclaiming,
+            was_quarantined,
+            callback,
+        }
+    }
+
     fn take_mr(&self) -> Option<Mr> {
         lock_unpoison(&self.inner).mr.take()
     }
@@ -1545,6 +1577,68 @@ impl EngineShared {
             self.recover_connection_quarantine(&operation.connection);
             self.record_connection_drained(&operation.connection);
             self.schedule_connection_retirement(&operation.connection);
+        }
+    }
+
+    pub(super) fn can_reclaim_after_qp_destroy(
+        &self,
+        connection: &ConnectionState,
+        tokens: &[OperationToken],
+    ) -> bool {
+        tokens.iter().all(|token| {
+            matches!(
+                self.operations.lookup(*token),
+                Lookup::Occupied(operation)
+                    if operation.connection_token() == connection.token
+            )
+        })
+    }
+
+    pub(super) fn reclaim_after_qp_destroy(
+        &self,
+        connection: &ConnectionState,
+        token: OperationToken,
+    ) -> bool {
+        let Lookup::Occupied(operation) = self.operations.lookup(token) else {
+            return false;
+        };
+        if operation.connection_token() != connection.token
+            || self.operations.release(token, false).is_none()
+        {
+            return false;
+        }
+        if !connection.remove_accepted(token) {
+            return false;
+        }
+        connection.release_local(operation.direction);
+        self.cq_credits.release();
+        self.diagnostic_counters
+            .cq_credits_released
+            .fetch_add(1, Ordering::Relaxed);
+        let previous = self.accepted_operations.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "accepted operation count must be positive");
+        if previous == 1 && self.shutdown_requested.load(Ordering::Acquire) {
+            self.work_signal.publish(super::driver::TERMINAL_WORK);
+        }
+        let finished = operation.finish_after_qp_destroy(Error::TransportClosed);
+        if finished.was_reclaiming {
+            self.pending_reclamations.fetch_sub(1, Ordering::AcqRel);
+        }
+        if finished.was_quarantined {
+            self.cq_credits.release_retained();
+            self.quarantined_operations.fetch_sub(1, Ordering::AcqRel);
+            self.quarantined_mrs.fetch_sub(1, Ordering::AcqRel);
+            self.quarantined_bytes
+                .fetch_sub(operation.mr_len, Ordering::AcqRel);
+            self.clear_operation_quarantine(&operation);
+        }
+        invoke_detached_completion(finished.callback);
+        true
+    }
+
+    pub(super) fn reject_queued_completions_after_qp_destroy(&self, connection: &ConnectionState) {
+        while let Some(completion) = connection.pop_completion() {
+            self.dispatch_queued_completion(completion);
         }
     }
 

@@ -102,6 +102,32 @@ impl EngineShared {
         let Lookup::Occupied(connection) = self.connections.lookup(token) else {
             return;
         };
+        let forced_tokens = {
+            let _admission = read_unpoison(&self.admission);
+            let _lifecycle = connection.lock_lifecycle();
+            let tokens = connection.accepted_tokens();
+            if tokens.is_empty() || !self.can_reclaim_after_qp_destroy(&connection, &tokens) {
+                None
+            } else {
+                let (safe_boundary, destroyed_now) = connection.establish_qp_destruction_boundary();
+                if safe_boundary {
+                    if destroyed_now {
+                        self.record_qp_destroy();
+                    }
+                    Some(tokens)
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(tokens) = forced_tokens {
+            for operation in tokens {
+                if !self.reclaim_after_qp_destroy(&connection, operation) {
+                    break;
+                }
+            }
+            self.reject_queued_completions_after_qp_destroy(&connection);
+        }
         if let Some((outstanding, _cq_debt)) = connection.begin_quarantine() {
             if self.track_connection_quarantine(connection.token) {
                 self.diagnostic_counters
@@ -304,7 +330,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn close_deadline_is_exact_memoized_and_recovers_only_from_exact_removal() {
+    async fn ambiguous_operation_ownership_quarantines_until_exact_removal() {
         let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
         let (connection, poster, token) = install_accepted_connection(&engine, 17);
         let mut close = Box::pin(connection.close());

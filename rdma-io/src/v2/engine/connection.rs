@@ -178,16 +178,17 @@ impl RdmaConnection {
         Ok(())
     }
 
-    /// Stop new posting and wait for the exact accepted set to drain.
+    /// Stop new posting and wait for the exact accepted set to drain safely.
     ///
     /// A successful close retires the CM route and connection registry
     /// generation, destroys the QP before its CM ID, and returns aggregate
-    /// admission once. A drain timeout retains every unresolved operation, MR,
-    /// registration, and CQ credit in the quarantined connection bundle. The
-    /// default deadline is five seconds, and its typed quarantine result is
-    /// permanently memoized even if exact late CQEs later recover the bundle.
-    /// Peer disconnect uses this same local QP-to-ERR drain path; it does not
-    /// permit destruction or MR release without exact CQEs.
+    /// admission once. The engine first consumes real exact CQEs. If the
+    /// provider omits flush CQEs through the drain deadline, it synchronously
+    /// destroys the owning per-connection QP while its CM ID remains alive;
+    /// only that completed destruction permits unresolved operations and MRs
+    /// to be reclaimed. Quarantine is reserved for inability to establish that
+    /// destruction boundary or another retirement wedge. Peer disconnect uses
+    /// the same local QP-to-ERR and safe-destruction path.
     pub async fn close(&self) -> Result<()> {
         self.shared.begin_connection_close(&self.state);
         loop {
@@ -255,6 +256,7 @@ pub(crate) struct ConnectionState {
     quarantined: AtomicBool,
     error_transition_started: AtomicBool,
     error_transition_complete: AtomicBool,
+    qp_destruction_boundary: AtomicBool,
     frontend_count: AtomicUsize,
     retirement_requested: AtomicBool,
     retirement_started: AtomicBool,
@@ -298,6 +300,7 @@ impl ConnectionState {
             quarantined: AtomicBool::new(false),
             error_transition_started: AtomicBool::new(false),
             error_transition_complete: AtomicBool::new(false),
+            qp_destruction_boundary: AtomicBool::new(false),
             frontend_count: AtomicUsize::new(1),
             retirement_requested: AtomicBool::new(false),
             retirement_started: AtomicBool::new(false),
@@ -517,6 +520,18 @@ impl ConnectionState {
         Ok(resources)
     }
 
+    pub(super) fn establish_qp_destruction_boundary(&self) -> (bool, bool) {
+        self.stop_posting();
+        if self.qp_destruction_boundary.load(Ordering::Acquire) {
+            return (true, false);
+        }
+        if !self.poster.destroy_qp() {
+            return (false, false);
+        }
+        self.mark_qp_destroyed();
+        (true, true)
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     pub(super) fn disconnect_for_test(&self) -> Result<()> {
         self.poster.disconnect()
@@ -653,7 +668,9 @@ impl ConnectionState {
     }
 
     pub(super) fn mark_qp_destroyed(&self) {
-        if let Some(reservation) = lock_unpoison(&self.admission).as_mut() {
+        if !self.qp_destruction_boundary.swap(true, Ordering::AcqRel)
+            && let Some(reservation) = lock_unpoison(&self.admission).as_mut()
+        {
             reservation.mark_qp_destroyed();
         }
     }

@@ -159,7 +159,8 @@ pub struct RdmaEngineDiagnostics {
     /// Retirement never reverses, so this gauge is also the monotonic
     /// operation-slot retirement counter.
     pub retired_operation_slots: usize,
-    /// Provider-accepted or acceptance-ambiguous WRs awaiting exact CQEs.
+    /// Provider-accepted or acceptance-ambiguous WRs awaiting an exact CQE or
+    /// synchronous destruction of their owning per-connection QP.
     pub accepted_outstanding_operations: usize,
     /// CQ admission credits currently available.
     pub free_cq_credits: usize,
@@ -252,7 +253,8 @@ pub struct RdmaEngineDiagnostics {
     pub connections_failed: u64,
     /// Local QP transitions to ERR initiated by lifecycle teardown.
     pub qp_error_transitions: u64,
-    /// Synchronous consuming `rdma_destroy_qp` invocations at zero outstanding.
+    /// Synchronous consuming `rdma_destroy_qp` invocations, including close
+    /// fallbacks that establish the safe MR-reclamation boundary.
     pub qp_destroys: u64,
     /// Quarantined connections later recovered by exact CQE routing.
     pub quarantine_recoveries: u64,

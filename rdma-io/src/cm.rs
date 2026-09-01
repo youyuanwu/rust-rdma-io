@@ -708,6 +708,8 @@ impl CmQueuePair {
         );
         // Safety: QP was created by rdma_create_qp on this CM ID. The retained
         // PD/CQ Arcs and the caller's owning CmId remain alive for this call.
+        // rdma_destroy_qp synchronously consumes that QP. Once it returns, no
+        // HCA work owned by this QP can access its formerly posted MRs.
         unsafe { rdma_destroy_qp(cm_id_raw.as_ptr()) };
     }
 

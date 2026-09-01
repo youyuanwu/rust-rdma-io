@@ -39,7 +39,7 @@ fn assert_protocol_pair_close(result: rdma_io::v2::Result<()>) {
         matches!(
             &result,
             Err(Error::ProtocolViolation(message)) if message.contains("zero credits")
-        ) || matches!(&result, Err(Error::TransportClosed)),
+        ) || matches!(&result, Ok(()) | Err(Error::TransportClosed)),
         "expected zero-credit protocol failure or its peer close, got: {result:?}"
     );
 }

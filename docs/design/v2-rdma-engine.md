@@ -463,22 +463,30 @@ Dropping an unposted operation returns local admission immediately. Dropping a
 posted operation transfers observation to the engine. The engine retains its
 MR, operation token, and CQ credit until an exhaustive positive safety boundary:
 
-1. the provider proves that the WR was not accepted; or
-2. the engine consumes that WR's exact validated success, error, or flush CQE.
+1. the provider proves that the WR was not accepted;
+2. the engine consumes that WR's exact validated success, error, or flush CQE;
+   or
+3. synchronous destruction of the owning per-connection QP completes while
+   its CM ID remains alive.
 
-QP ERR, timeout, CQ emptiness, driver loss, a no-match poll, and an attempted
-destructor are not release boundaries.
+QP ERR, timeout, CQ emptiness, driver loss, and a no-match poll are not release
+boundaries. QP destruction is a boundary only after the consuming synchronous
+call returns; no MR or accepted-WR debt is released before that point.
 
 Connection close atomically stops posting, transitions the local QP to ERR
 even after peer disconnect, and drains only exact identity-matching CQEs.
 At accepted count zero, the consuming `rdma_destroy_qp` call runs while its CM
-ID is alive, the connection generation retires, and admission is released.
+ID is alive. If accepted WRs remain at the drain deadline because the provider
+omitted flush CQEs, close first consumes and destroys that same per-connection
+QP, then resolves operation observers/callbacks, releases MRs and CQ/local
+admission, retires operation generations, drains and destroys the CM ID, and
+finally retires the connection generation. Late CQEs are stale or unknown and
+cannot touch reused slots.
 
-If the connection drain deadline expires first,
-`Error::ConnectionQuarantined { outstanding_operations, cq_debt }` is
-memoized for that connection. Exact late CQEs can still let the engine recover
-and destroy the bundle, but repeated `close()` calls retain the original
-connection-local result.
+`Error::ConnectionQuarantined { outstanding_operations, cq_debt }` is reserved
+for inability to establish the synchronous QP-destruction boundary, ambiguous
+ownership, or another connection-local retirement wedge. It is not the normal
+result of provider-omitted flush CQEs.
 
 If engine shutdown reaches its deadline with unsafe ownership,
 `Error::EngineWedged { retained_bundles, outstanding_operations, cq_debt }`
@@ -534,10 +542,11 @@ serves as its monotonic retirement counter.
 
 ## Provider Validation
 
-RXE and SIW must both produce exact success/error/flush CQEs after the local QP
-is moved to ERR in readiness and polling modes. There is no provider-specific
-safety skip. A missing real CQE is a validation failure; deterministic CQE
-suppression is used separately to prove fail-closed quarantine.
+RXE and SIW both run exact success/error routing and close stress in readiness
+and polling modes with no provider-specific skip. Real flush CQEs are consumed
+when delivered. If a provider omits one, deterministic suppression tests prove
+that synchronous owning-QP destruction precedes MR release, close remains
+clean, accounting/generations are reusable, and late CQEs are rejected.
 
 Run the complete sequential provider validation with:
 

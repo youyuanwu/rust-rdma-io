@@ -130,7 +130,7 @@ async fn wait_for(
     .expect("diagnostic condition timed out")
 }
 
-async fn assert_routing_and_quarantine_metrics(mode: CompletionMode) {
+async fn assert_routing_and_destroy_fallback_metrics(mode: CompletionMode) {
     let (engine, driver) = build_engine(mode, Duration::from_secs(1));
     let resources = engine.test_resources().unwrap();
     let driver = tokio::spawn(driver);
@@ -249,44 +249,38 @@ async fn assert_routing_and_quarantine_metrics(mode: CompletionMode) {
     held.wait_observed().await.unwrap();
     sending.abort();
     assert!(sending.await.unwrap_err().is_cancelled());
-    let close = tokio::time::timeout(Duration::from_secs(3), client.close())
+    let before_fallback = engine.diagnostics();
+    tokio::time::timeout(Duration::from_secs(3), client.close())
         .await
-        .expect("connection drain deadline did not fire");
-    assert!(matches!(
-        close,
-        Err(Error::ConnectionQuarantined {
-            outstanding_operations: 1,
-            cq_debt: 1
-        })
-    ));
-    let quarantined = engine.diagnostics();
-    assert_eq!(quarantined.quarantined_bundles, 1);
-    assert_eq!(quarantined.quarantined_operations, 1);
-    assert_eq!(quarantined.quarantined_mrs, 1);
-    assert!(quarantined.quarantined_bytes >= 128);
-    assert_eq!(quarantined.retained_cq_credits, 1);
-    assert!(quarantined.oldest_quarantine_age.is_some());
-    assert_eq!(quarantined.connection_quarantine_outcomes, 1);
-    assert!(quarantined.connections().iter().any(
-        |connection| connection.quarantined && connection.accepted_outstanding_operations == 1
-    ));
+        .expect("connection drain deadline did not fire")
+        .unwrap();
+    let closed = engine.diagnostics();
+    assert_eq!(closed.quarantined_bundles, 0);
+    assert_eq!(closed.quarantined_operations, 0);
+    assert_eq!(closed.quarantined_mrs, 0);
+    assert_eq!(closed.quarantined_bytes, 0);
+    assert_eq!(closed.retained_cq_credits, 0);
+    assert_eq!(closed.oldest_quarantine_age, None);
+    assert_eq!(
+        closed.connection_quarantine_outcomes,
+        before_fallback.connection_quarantine_outcomes
+    );
+    assert!(closed.qp_destroys > before_fallback.qp_destroys);
 
     held.release().unwrap();
     let recovered = wait_for(&engine, |diagnostics| {
-        diagnostics.quarantined_bundles == 0
-            && diagnostics.retained_cq_credits == 0
-            && diagnostics.live_connection_reservations == 1
+        diagnostics.stale_operation_cqes > closed.stale_operation_cqes
     })
     .await;
-    assert!(recovered.quarantine_recoveries >= 1);
+    assert_eq!(
+        recovered.quarantine_recoveries,
+        before_fallback.quarantine_recoveries
+    );
     assert_eq!(recovered.oldest_quarantine_age, None);
     assert!(recovered.operations_offered >= established.operations_offered);
     assert!(recovered.operations_completed >= established.operations_completed);
     assert!(recovered.driver_wakeups >= established.driver_wakeups);
-    assert!(matches!(
-        client.close().await,
-        Err(Error::ConnectionQuarantined { .. })
-    ));
+    client.close().await.unwrap();
 
     drop(connection);
     drop(client);
@@ -314,10 +308,10 @@ async fn capacities_resources_modes_lifecycle_and_16_thread_snapshots_are_exact(
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
-async fn routing_quarantine_and_monotonic_counters_are_exact_in_both_modes() {
+async fn routing_destroy_fallback_and_monotonic_counters_are_exact_in_both_modes() {
     if !has_software_rdma() {
         return;
     }
-    assert_routing_and_quarantine_metrics(CompletionMode::Readiness).await;
-    assert_routing_and_quarantine_metrics(CompletionMode::Polling).await;
+    assert_routing_and_destroy_fallback_metrics(CompletionMode::Readiness).await;
+    assert_routing_and_destroy_fallback_metrics(CompletionMode::Polling).await;
 }

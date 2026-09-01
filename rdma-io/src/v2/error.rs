@@ -79,9 +79,10 @@ pub enum Error {
     /// The in-flight registry or buffer pool has no available capacity.
     CapacityExhausted,
 
-    /// A connection close deadline expired while accepted WRs remain live.
+    /// Connection close could not establish an exact-CQE or owning-QP
+    /// destruction boundary for accepted WRs.
     ConnectionQuarantined {
-        /// Accepted operations still awaiting exact completions.
+        /// Accepted operations still awaiting a safe ownership boundary.
         outstanding_operations: usize,
         /// CQ admission credits retained with those operations.
         cq_debt: usize,

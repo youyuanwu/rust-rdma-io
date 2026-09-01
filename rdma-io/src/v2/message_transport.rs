@@ -68,7 +68,8 @@
 //! engine-ready work increments `credits_in_flight` immediately after
 //! forgetting the permit and before offering the DATA WR to the provider.
 //! Provider-proven unaccepted WRs roll back with checked atomic subtraction;
-//! accepted or ambiguous WRs retain their accounting until the exact CQE.
+//! accepted or ambiguous WRs retain their accounting until the exact CQE or
+//! synchronous destruction of their owning per-connection QP.
 //!
 //! The peer's `data_recv_capacity` announced during HELLO is validated
 //! (must be > 0 and ≤ `Semaphore::MAX_PERMITS`) before credit
@@ -1208,6 +1209,11 @@ impl EngineMessageState {
     }
 
     fn fail_from_completion_callback(&self, error: Error) {
+        if self.state.load(Ordering::Acquire) >= STATE_CLOSING
+            && matches!(error, Error::TransportClosed)
+        {
+            return;
+        }
         if !self.enter_failed(error) {
             return;
         }
@@ -2021,7 +2027,8 @@ fn validate_peer_hello(hello: protocol::HelloPayload, local_buffer_size: usize) 
 /// - Cancelling `send()` before WR posting: the credit permit is returned
 ///   automatically. No resource leak.
 /// - Cancelling `send()` after WR posting: the engine retains the MR until
-///   the exact CQE arrives.
+///   the exact CQE arrives or synchronous owning-QP destruction makes the MR
+///   inaccessible to the HCA.
 /// - Cancelling `recv()`: the message stays in the internal channel
 ///   for the next `recv()` call. No message is lost.
 ///
@@ -2202,16 +2209,22 @@ impl MessageTransport {
     /// Graceful async shutdown.
     ///
     /// Closes the engine-owned connection and returns its contextual result.
-    /// Repeated calls observe the same connection close outcome. A connection
-    /// drain timeout returns memoized [`Error::ConnectionQuarantined`]; an
-    /// engine-wide terminal drain failure returns [`Error::EngineWedged`].
+    /// Repeated calls observe the same connection close outcome. Provider
+    /// omission of flush CQEs is resolved by synchronous owning-QP destruction
+    /// before MR reclamation. [`Error::ConnectionQuarantined`] is reserved for
+    /// inability to establish that boundary or another connection-local
+    /// retirement wedge; an engine-wide terminal drain failure returns
+    /// [`Error::EngineWedged`].
     pub async fn close(&self) -> Result<()> {
         self.state.begin_close();
         let result = self.connection.close().await;
         self.state.finish_close(&result);
         match result {
             Err(error) => Err(error),
-            Ok(()) => lock_std(&self.state.error).clone().map_or(Ok(()), Err),
+            Ok(()) => match lock_std(&self.state.error).clone() {
+                None | Some(Error::TransportClosed) => Ok(()),
+                Some(error) => Err(error),
+            },
         }
     }
 }

@@ -244,8 +244,9 @@ impl<'a> QpBuilder<'a> {
 ///
 /// # Safety and limits
 ///
-/// Posted MRs must remain live until typed completions arrive. The creating
-/// CM ID must outlive the QP.
+/// Posted MRs must remain live until typed completions arrive or synchronous
+/// destruction of this owning QP completes. The creating CM ID must outlive
+/// the QP and its destruction call.
 ///
 /// # Availability
 ///
@@ -340,8 +341,9 @@ impl Qp {
 
     /// Transition the QP to error state for teardown.
     ///
-    /// Forces all outstanding WRs to complete (with flush error),
-    /// enabling clean shutdown.
+    /// Requests provider flush of outstanding WRs. Providers may omit some
+    /// flush CQEs, so engine close retains ownership until exact CQEs arrive
+    /// or this QP is synchronously destroyed.
     pub fn to_error(&self) -> Result<()> {
         self.inner.to_error().map_err(Error::from_v1)?;
         Ok(())

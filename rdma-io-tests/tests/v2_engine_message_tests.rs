@@ -366,13 +366,14 @@ async fn run_cancellation_and_disconnect(mode: CompletionMode) {
     let pending_recv = tokio::spawn(async move { waiting_server.recv().await });
     tokio::task::yield_now().await;
     assert_clean_close(client.close().await);
-    assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(10), pending_recv)
-            .await
-            .expect("disconnect did not wake recv")
-            .unwrap(),
-        Err(Error::TransportClosed)
-    ));
+    let pending_result = tokio::time::timeout(Duration::from_secs(10), pending_recv)
+        .await
+        .expect("disconnect did not wake recv")
+        .unwrap();
+    assert!(
+        matches!(pending_result, Err(Error::TransportClosed)),
+        "disconnect recv returned {pending_result:?}"
+    );
     assert_clean_close(server.close().await);
     listener.close().await.unwrap();
     drop(server);
@@ -497,7 +498,7 @@ async fn run_fairness_and_independent_close(mode: CompletionMode) {
     shutdown_engine(client_engine, client_driver).await;
 }
 
-async fn run_cancelled_send_quarantine(mode: CompletionMode) {
+async fn run_cancelled_send_qp_destroy_fallback(mode: CompletionMode) {
     let recorder = DestructionRecorder::arm(512);
     let (server_engine, server_driver) = build_engine(mode, 1, Duration::from_millis(100));
     let (client_engine, client_driver) = build_engine(mode, 1, Duration::from_millis(100));
@@ -518,33 +519,34 @@ async fn run_cancelled_send_quarantine(mode: CompletionMode) {
         .unwrap();
     send.abort();
     assert!(send.await.unwrap_err().is_cancelled());
+    let rejected_before = client_engine
+        .test_resources()
+        .unwrap()
+        .instrumentation()
+        .unwrap()
+        .cqes_rejected;
 
-    let close = tokio::time::timeout(Duration::from_secs(2), client.close())
+    tokio::time::timeout(Duration::from_secs(2), client.close())
         .await
-        .expect("message close did not reach its drain deadline");
-    assert!(matches!(
-        close,
-        Err(Error::ConnectionQuarantined {
-            outstanding_operations: 1,
-            cq_debt: 1
-        })
-    ));
+        .expect("message close did not reach its drain deadline")
+        .unwrap();
     let diagnostics = client_engine.diagnostics();
-    assert_eq!(diagnostics.quarantined_operations, 1);
-    assert_eq!(diagnostics.retained_cq_credits, 1);
-    let before_release = recorder.snapshot();
-    let mr_deregistrations = before_release
-        .iter()
-        .filter(|event| event.kind == DestructionKind::MemoryRegion)
-        .count();
+    assert_eq!(diagnostics.accepted_outstanding_operations, 0);
+    assert_eq!(diagnostics.registered_operations, 0);
+    assert_eq!(diagnostics.quarantined_operations, 0);
+    assert_eq!(diagnostics.retained_cq_credits, 0);
+    assert_eq!(diagnostics.qp_destroys, 1);
 
     suppression.release().unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            let diagnostics = client_engine.diagnostics();
-            if diagnostics.live_connection_reservations == 0
-                && diagnostics.quarantined_operations == 0
-                && diagnostics.retained_cq_credits == 0
+            if client_engine
+                .test_resources()
+                .unwrap()
+                .instrumentation()
+                .unwrap()
+                .cqes_rejected
+                == rejected_before + 1
             {
                 break;
             }
@@ -552,32 +554,17 @@ async fn run_cancelled_send_quarantine(mode: CompletionMode) {
         }
     })
     .await
-    .expect("released message CQE did not recover quarantine");
-    assert!(matches!(
-        client.close().await,
-        Err(Error::ConnectionQuarantined {
-            outstanding_operations: 1,
-            cq_debt: 1
-        })
-    ));
+    .expect("released late message CQE was not rejected as stale");
+    client.close().await.unwrap();
     drop(connection);
     drop(client);
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if recorder
-                .snapshot()
-                .iter()
-                .filter(|event| event.kind == DestructionKind::MemoryRegion)
-                .count()
-                > mr_deregistrations
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the cancelled DATA MR was not released after its exact CQE");
+    assert!(
+        recorder
+            .snapshot()
+            .iter()
+            .any(|event| event.kind == DestructionKind::MemoryRegion),
+        "the cancelled DATA MR and closed message pools must be safely released"
+    );
 
     assert_clean_close(server.close().await);
     listener.close().await.unwrap();
@@ -641,10 +628,10 @@ async fn hot_message_work_rotates_and_connection_close_is_independent() {
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
-async fn cancelled_data_send_retains_mr_until_exact_cqe_and_memoizes_quarantine() {
+async fn cancelled_data_send_reclaims_after_qp_destroy_and_rejects_late_cqe() {
     if !has_software_rdma() {
         return;
     }
-    run_cancelled_send_quarantine(CompletionMode::Readiness).await;
-    run_cancelled_send_quarantine(CompletionMode::Polling).await;
+    run_cancelled_send_qp_destroy_fallback(CompletionMode::Readiness).await;
+    run_cancelled_send_qp_destroy_fallback(CompletionMode::Polling).await;
 }
