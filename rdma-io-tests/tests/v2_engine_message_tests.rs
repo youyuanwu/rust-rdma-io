@@ -8,10 +8,11 @@ use rdma_io::cm::RdmaCmDeviceList;
 use rdma_io::v2::test_support::{DestructionKind, DestructionRecorder, TestSteadyFrame};
 use rdma_io::v2::{
     CompletionMode, Error, MessageTransport, MessageTransportBuilder, RdmaEngine,
-    RdmaEngineBuilder, RdmaListener, RdmaListenerConfig, Result,
+    RdmaEngineBuilder, RdmaListener, Result,
 };
 use rdma_io::wc::WcOpcode;
-use rdma_io_tests::test_helpers::{connect_addr_for, has_software_rdma};
+use rdma_io_tests::engine_test_helpers::establish_message_pair_with_retry;
+use rdma_io_tests::test_helpers::has_software_rdma;
 
 #[derive(Clone, Copy)]
 struct MessageConfig {
@@ -63,41 +64,14 @@ fn build_engine(
     (engine, tokio::spawn(driver))
 }
 
-async fn listen(engine: &RdmaEngine) -> RdmaListener {
-    engine
-        .listen(
-            "0.0.0.0:0".parse().unwrap(),
-            RdmaListenerConfig::default().backlog(8),
-        )
-        .await
-        .unwrap()
-}
-
 async fn establish_on(
     server_engine: &RdmaEngine,
     client_engine: &RdmaEngine,
     config: MessageConfig,
 ) -> (RdmaListener, MessageTransport, MessageTransport) {
-    let listener = listen(server_engine).await;
-    let address = connect_addr_for(Some(listener.local_addr().unwrap()));
-    let (server, client) = tokio::time::timeout(Duration::from_secs(15), async {
-        tokio::join!(
-            builder(config).accept_on(&listener),
-            builder(config).connect_on(client_engine, address)
-        )
-    })
-    .await
-    .expect("message establishment timed out");
-    let server = server.unwrap();
-    let client = client.unwrap();
-    tokio::time::timeout(Duration::from_secs(15), async {
-        let (server_ready, client_ready) = tokio::join!(server.ready(), client.ready());
-        server_ready.unwrap();
-        client_ready.unwrap();
-    })
-    .await
-    .expect("message HELLO timed out");
-    (listener, server, client)
+    establish_message_pair_with_retry(server_engine, client_engine, move || builder(config))
+        .await
+        .unwrap()
 }
 
 fn assert_clean_close(result: Result<()>) {

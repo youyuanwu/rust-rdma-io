@@ -160,14 +160,43 @@ pub mod test_helpers {
     /// These failures are typically cleared by retrying the handshake with a
     /// fresh CM ID.
     pub fn is_transient_cm_error(err: &rdma_io::Error) -> bool {
-        matches!(err, rdma_io::Error::Verbs(io)
-            if matches!(io.raw_os_error(), Some(22) | Some(71) | Some(98)))
+        matches!(err, rdma_io::Error::Verbs(io) if is_transient_cm_io_error(io))
             || matches!(err, rdma_io::Error::InvalidArg(msg)
             if msg.starts_with("expected Established, got ")
                 && matches!(
                     msg.strip_prefix("expected Established, got "),
                     Some("Rejected" | "Unreachable" | "ConnectError")
                 ))
+    }
+
+    fn is_transient_cm_io_error(error: &std::io::Error) -> bool {
+        error
+            .raw_os_error()
+            .is_some_and(|code| matches!(code.checked_abs(), Some(22 | 71 | 98)))
+            || is_transient_cm_event_message(&error.to_string())
+    }
+
+    fn is_transient_cm_event_message(message: &str) -> bool {
+        message.contains("RDMA CM")
+            && (["Rejected", "Unreachable", "ConnectError"]
+                .iter()
+                .any(|event| message.contains(event))
+                || [
+                    "status 22",
+                    "status -22",
+                    "status 71",
+                    "status -71",
+                    "status 98",
+                    "status -98",
+                ]
+                .iter()
+                .any(|status| message.contains(status)))
+    }
+
+    /// Returns `true` for transient V2 engine CM errors raised before a test
+    /// connection's protocol-specific work begins.
+    pub fn is_transient_v2_engine_cm_error(err: &rdma_io::v2::Error) -> bool {
+        matches!(err, rdma_io::v2::Error::Verbs(io) if is_transient_cm_io_error(io))
     }
 
     /// Bind an [`AsyncCmListener`] to `0.0.0.0:0`, retrying on `EADDRINUSE`.
@@ -403,11 +432,20 @@ pub mod test_helpers {
 
 /// Shared setup for tests that attach QPs to the v2 engine's test-only lease.
 pub mod engine_test_helpers {
+    use std::time::Duration;
+
     use rdma_io::async_cm::{AsyncCmId, AsyncCmListener};
     use rdma_io::cm::ConnParam;
-    use rdma_io::v2::test_support::{TestEngineQp, TestEngineResources};
+    use rdma_io::v2::test_support::{TestEngineInstrumentation, TestEngineQp, TestEngineResources};
+    use rdma_io::v2::{
+        Error, MessageTransport, MessageTransportBuilder, RdmaEngine, RdmaListener,
+        RdmaListenerConfig, Result,
+    };
 
-    use crate::test_helpers::{connect_addr_for, connect_client_with_retry};
+    use crate::test_helpers::{
+        TRANSIENT_CM_HANDSHAKE_ATTEMPTS, connect_addr_for, connect_client_with_retry,
+        is_transient_v2_engine_cm_error, transient_cm_retry_delay,
+    };
 
     pub struct EngineTestEndpoint {
         pub qp: Option<TestEngineQp>,
@@ -417,6 +455,310 @@ pub mod engine_test_helpers {
     pub struct EngineTestPair {
         pub server: EngineTestEndpoint,
         pub client: EngineTestEndpoint,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct EngineCleanupBaseline {
+        live_connection_reservations: usize,
+        establishing_connection_reservations: usize,
+        established_connection_reservations: usize,
+        draining_connection_reservations: usize,
+        registered_live_qps: usize,
+        free_connection_slots: usize,
+        registered_operations: usize,
+        free_operation_slots: usize,
+        accepted_outstanding_operations: usize,
+        free_cq_credits: usize,
+        retained_cq_credits: usize,
+        pending_reclamations: usize,
+        quarantined_operations: usize,
+        quarantined_mrs: usize,
+        quarantined_bytes: usize,
+        quarantined_bundles: usize,
+        ready_queue_depth: usize,
+        listener_count: usize,
+        queued_inbound_requests: usize,
+        pending_accepts: usize,
+        selected_accepts: usize,
+        connection_details: usize,
+        listener_details: usize,
+        cm_pending_routes: usize,
+        cm_retained_owners: usize,
+    }
+
+    impl EngineCleanupBaseline {
+        fn capture(engine: &RdmaEngine, instrumentation: TestEngineInstrumentation) -> Self {
+            let diagnostics = engine.diagnostics();
+            Self {
+                live_connection_reservations: diagnostics.live_connection_reservations,
+                establishing_connection_reservations: diagnostics
+                    .establishing_connection_reservations,
+                established_connection_reservations: diagnostics
+                    .established_connection_reservations,
+                draining_connection_reservations: diagnostics.draining_connection_reservations,
+                registered_live_qps: diagnostics.registered_live_qps,
+                free_connection_slots: diagnostics.free_connection_slots,
+                registered_operations: diagnostics.registered_operations,
+                free_operation_slots: diagnostics.free_operation_slots,
+                accepted_outstanding_operations: diagnostics.accepted_outstanding_operations,
+                free_cq_credits: diagnostics.free_cq_credits,
+                retained_cq_credits: diagnostics.retained_cq_credits,
+                pending_reclamations: diagnostics.pending_reclamations,
+                quarantined_operations: diagnostics.quarantined_operations,
+                quarantined_mrs: diagnostics.quarantined_mrs,
+                quarantined_bytes: diagnostics.quarantined_bytes,
+                quarantined_bundles: diagnostics.quarantined_bundles,
+                ready_queue_depth: diagnostics.ready_queue_depth,
+                listener_count: diagnostics.listener_count,
+                queued_inbound_requests: diagnostics.queued_inbound_requests,
+                pending_accepts: diagnostics.pending_accepts,
+                selected_accepts: diagnostics.selected_accepts,
+                connection_details: diagnostics.connections().len(),
+                listener_details: diagnostics.listeners().len(),
+                cm_pending_routes: instrumentation.cm_pending_routes,
+                cm_retained_owners: instrumentation.cm_retained_owners,
+            }
+        }
+    }
+
+    async fn wait_for_engine_cleanup(
+        server_engine: &RdmaEngine,
+        server_resources: &TestEngineResources,
+        server_baseline: &EngineCleanupBaseline,
+        client_engine: &RdmaEngine,
+        client_resources: &TestEngineResources,
+        client_baseline: &EngineCleanupBaseline,
+    ) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let server = EngineCleanupBaseline::capture(
+                server_engine,
+                server_resources.instrumentation().unwrap(),
+            );
+            let client = EngineCleanupBaseline::capture(
+                client_engine,
+                client_resources.instrumentation().unwrap(),
+            );
+            if &server == server_baseline && &client == client_baseline {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "V2 engine retry cleanup did not restore its exact baseline: \
+                 server expected {server_baseline:?}, observed {server:?}; \
+                 client expected {client_baseline:?}, observed {client:?}"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn close_message_attempt(
+        listener: Option<RdmaListener>,
+        server: Option<MessageTransport>,
+        client: Option<MessageTransport>,
+    ) {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            match (&server, &client) {
+                (Some(server), Some(client)) => {
+                    let _ = tokio::join!(server.close(), client.close());
+                }
+                (Some(server), None) => {
+                    let _ = server.close().await;
+                }
+                (None, Some(client)) => {
+                    let _ = client.close().await;
+                }
+                (None, None) => {}
+            }
+            if let Some(listener) = &listener {
+                let _ = listener.close().await;
+            }
+        })
+        .await
+        .expect("V2 engine retry attempt cleanup timed out");
+        drop(server);
+        drop(client);
+        drop(listener);
+    }
+
+    /// Establish a ready message pair, retrying only known transient
+    /// software-RDMA CM failures from listener creation, connect/accept, or
+    /// the HELLO handshake.
+    pub async fn establish_message_pair_with_retry<F>(
+        server_engine: &RdmaEngine,
+        client_engine: &RdmaEngine,
+        make_builder: F,
+    ) -> Result<(RdmaListener, MessageTransport, MessageTransport)>
+    where
+        F: FnMut() -> MessageTransportBuilder,
+    {
+        establish_message_pair_with_retry_after_ready(
+            server_engine,
+            client_engine,
+            make_builder,
+            |_| Ok(()),
+        )
+        .await
+    }
+
+    /// Variant with a post-ready check used to deterministically exercise the
+    /// retry and cleanup path without injecting failures into production code.
+    pub async fn establish_message_pair_with_retry_after_ready<F, C>(
+        server_engine: &RdmaEngine,
+        client_engine: &RdmaEngine,
+        mut make_builder: F,
+        mut after_ready: C,
+    ) -> Result<(RdmaListener, MessageTransport, MessageTransport)>
+    where
+        F: FnMut() -> MessageTransportBuilder,
+        C: FnMut(u64) -> Result<()>,
+    {
+        let server_resources = server_engine.test_resources().unwrap();
+        let client_resources = client_engine.test_resources().unwrap();
+        let mut last_transient = None;
+
+        for attempt in 0..TRANSIENT_CM_HANDSHAKE_ATTEMPTS {
+            let server_baseline = EngineCleanupBaseline::capture(
+                server_engine,
+                server_resources.instrumentation().unwrap(),
+            );
+            let client_baseline = EngineCleanupBaseline::capture(
+                client_engine,
+                client_resources.instrumentation().unwrap(),
+            );
+            let listener = match server_engine
+                .listen(
+                    "0.0.0.0:0".parse().unwrap(),
+                    RdmaListenerConfig::default().backlog(8),
+                )
+                .await
+            {
+                Ok(listener) => listener,
+                Err(error) if is_transient_v2_engine_cm_error(&error) => {
+                    if attempt + 1 == TRANSIENT_CM_HANDSHAKE_ATTEMPTS {
+                        return Err(error);
+                    }
+                    wait_for_engine_cleanup(
+                        server_engine,
+                        &server_resources,
+                        &server_baseline,
+                        client_engine,
+                        &client_resources,
+                        &client_baseline,
+                    )
+                    .await;
+                    tracing::warn!(
+                        "V2 message listener attempt {attempt} failed transiently: {error}"
+                    );
+                    last_transient = Some(error);
+                    // Cleanup is already complete. This bounded sleep is only
+                    // for kernel/CM resource recovery, never state synchronization.
+                    tokio::time::sleep(transient_cm_retry_delay(attempt)).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let address = connect_addr_for(Some(listener.local_addr()?));
+            let established = tokio::time::timeout(Duration::from_secs(15), async {
+                tokio::try_join!(
+                    make_builder().accept_on(&listener),
+                    make_builder().connect_on(client_engine, address)
+                )
+            })
+            .await;
+            let (server, client, mut errors) = match established {
+                Ok(Ok((server, client))) => (Some(server), Some(client), Vec::new()),
+                Ok(Err(error)) => (None, None, vec![error]),
+                Err(elapsed) => {
+                    close_message_attempt(Some(listener), None, None).await;
+                    wait_for_engine_cleanup(
+                        server_engine,
+                        &server_resources,
+                        &server_baseline,
+                        client_engine,
+                        &client_resources,
+                        &client_baseline,
+                    )
+                    .await;
+                    panic!("V2 message establishment timed out: {elapsed}");
+                }
+            };
+
+            if errors.is_empty() {
+                let server_ref = server.as_ref().expect("successful server establishment");
+                let client_ref = client.as_ref().expect("successful client establishment");
+                let ready = tokio::time::timeout(Duration::from_secs(15), async {
+                    tokio::try_join!(server_ref.ready(), client_ref.ready())
+                })
+                .await;
+                match ready {
+                    Ok(Ok(((), ()))) => {}
+                    Ok(Err(error)) => errors.push(error),
+                    Err(elapsed) => {
+                        close_message_attempt(Some(listener), server, client).await;
+                        wait_for_engine_cleanup(
+                            server_engine,
+                            &server_resources,
+                            &server_baseline,
+                            client_engine,
+                            &client_resources,
+                            &client_baseline,
+                        )
+                        .await;
+                        panic!("V2 message HELLO timed out: {elapsed}");
+                    }
+                }
+            }
+
+            if errors.is_empty()
+                && let Err(error) = after_ready(attempt)
+            {
+                errors.push(error);
+            }
+            if errors.is_empty() {
+                return Ok((
+                    listener,
+                    server.expect("ready server transport"),
+                    client.expect("ready client transport"),
+                ));
+            }
+
+            close_message_attempt(Some(listener), server, client).await;
+            wait_for_engine_cleanup(
+                server_engine,
+                &server_resources,
+                &server_baseline,
+                client_engine,
+                &client_resources,
+                &client_baseline,
+            )
+            .await;
+
+            if let Some(error) = errors
+                .iter()
+                .find(|error| !is_transient_v2_engine_cm_error(error))
+            {
+                return Err(error.clone());
+            }
+            let error = errors
+                .into_iter()
+                .next()
+                .expect("failed establishment must carry an error");
+            if attempt + 1 == TRANSIENT_CM_HANDSHAKE_ATTEMPTS {
+                return Err(error);
+            }
+            tracing::warn!(
+                "V2 message establishment attempt {attempt} failed transiently: {error}"
+            );
+            last_transient = Some(error);
+            // Cleanup is already complete. This bounded sleep is only for
+            // kernel/CM resource recovery, never state synchronization.
+            tokio::time::sleep(transient_cm_retry_delay(attempt)).await;
+        }
+
+        Err(last_transient.unwrap_or_else(|| {
+            Error::InvalidConfig("V2 message establishment made no attempts".into())
+        }))
     }
 
     pub async fn setup_engine_pair(resources: &TestEngineResources) -> EngineTestPair {
@@ -460,7 +802,9 @@ pub mod engine_test_helpers {
 
 #[cfg(test)]
 mod tests {
-    use super::test_helpers::{enforce_software_rdma_requirement, is_transient_cm_error};
+    use super::test_helpers::{
+        enforce_software_rdma_requirement, is_transient_cm_error, is_transient_v2_engine_cm_error,
+    };
 
     #[test]
     #[should_panic(expected = "RDMA_REQUIRE_PROVIDER=1")]
@@ -487,6 +831,42 @@ mod tests {
         // connection attempt; subsequent attempts succeed once the device settles.
         let err = rdma_io::Error::Verbs(std::io::Error::from_raw_os_error(71));
         assert!(is_transient_cm_error(&err));
+    }
+
+    #[test]
+    fn transient_cm_error_accepts_all_retryable_errnos() {
+        for errno in [22, 71, 98] {
+            let err = rdma_io::Error::Verbs(std::io::Error::from_raw_os_error(errno));
+            assert!(is_transient_cm_error(&err), "errno {errno} should retry");
+        }
+    }
+
+    #[test]
+    fn v2_transient_cm_error_accepts_known_software_provider_events() {
+        for event in ["Rejected", "Unreachable", "ConnectError"] {
+            let err = rdma_io::v2::Error::Verbs(std::io::Error::other(format!(
+                "RDMA CM {event} failed with status -22 for id=0x1 listen_id=0x0"
+            )));
+            assert!(
+                is_transient_v2_engine_cm_error(&err),
+                "{event} should be retryable"
+            );
+        }
+        let eproto = rdma_io::v2::Error::Verbs(std::io::Error::other(
+            "RDMA CM AddrError failed with status -71 for id=0x1 listen_id=0x0",
+        ));
+        assert!(is_transient_v2_engine_cm_error(&eproto));
+    }
+
+    #[test]
+    fn v2_transient_cm_error_rejects_addr_and_protocol_failures() {
+        let addr_error = rdma_io::v2::Error::Verbs(std::io::Error::other(
+            "RDMA CM AddrError failed with status -110 for id=0x1 listen_id=0x0",
+        ));
+        assert!(!is_transient_v2_engine_cm_error(&addr_error));
+        assert!(!is_transient_v2_engine_cm_error(
+            &rdma_io::v2::Error::ProtocolViolation("bad magic".into())
+        ));
     }
 
     #[test]

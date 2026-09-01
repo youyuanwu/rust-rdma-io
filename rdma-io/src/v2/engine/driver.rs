@@ -709,6 +709,10 @@ pub(super) mod test_api {
         pub idle_connection_visits: u64,
         pub connection_registry_probes: u64,
         pub operation_registry_probes: u64,
+        /// CM requests and routes that still require driver progress.
+        pub cm_pending_routes: usize,
+        /// CM routes, listeners, or deferred destructions retaining ownership.
+        pub cm_retained_owners: usize,
         pub operations_posted: u64,
         pub cqes_routed: u64,
         pub cqes_rejected: u64,
@@ -1703,6 +1707,8 @@ pub(super) mod test_api {
                 idle_connection_visits: self.idle_connection_visits.load(Ordering::Acquire),
                 connection_registry_probes: shared.connections.probes(),
                 operation_registry_probes: shared.operations.probes(),
+                cm_pending_routes: shared.cm.pending_route_count(),
+                cm_retained_owners: shared.cm.retained_owner_count(),
                 operations_posted: counters.operations_posted.load(Ordering::Acquire),
                 cqes_routed: counters.cqes_routed.load(Ordering::Acquire),
                 cqes_rejected: counters.stale_connection_cqes.load(Ordering::Acquire)

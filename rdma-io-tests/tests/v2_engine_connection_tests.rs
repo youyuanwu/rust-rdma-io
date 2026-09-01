@@ -445,12 +445,13 @@ async fn run_readiness_shutdown_after_addr_error() {
     }
 
     let diagnostics = engine.diagnostics();
+    let expected_failure_events = u64::from(addr_error_won);
     assert_eq!(diagnostics.lifecycle, RdmaEngineLifecycle::Terminated);
     assert!(diagnostics.terminal_error.is_none());
     assert_eq!(diagnostics.shutdowns, 1);
     assert_eq!(diagnostics.connections_admitted, 1);
-    assert_eq!(diagnostics.connections_failed, 1);
-    assert_eq!(diagnostics.cm_events_processed, 1);
+    assert_eq!(diagnostics.connections_failed, expected_failure_events);
+    assert_eq!(diagnostics.cm_events_processed, expected_failure_events);
     assert_eq!(diagnostics.cm_events_rejected, 0);
     assert_eq!(diagnostics.stale_cm_events, 0);
     assert_eq!(diagnostics.duplicate_cm_events, 0);
@@ -468,23 +469,31 @@ async fn run_readiness_shutdown_after_addr_error() {
     assert_eq!(diagnostics.connections_closed, 0);
     assert_eq!(diagnostics.connections_quarantined, 0);
     assert_eq!(diagnostics.registered_operations, 0);
+    assert_eq!(diagnostics.free_operation_slots, 64);
+    assert_eq!(diagnostics.retired_operation_slots, 0);
     assert_eq!(diagnostics.accepted_outstanding_operations, 0);
+    assert_eq!(diagnostics.free_cq_credits, 64);
+    assert_eq!(diagnostics.retained_cq_credits, 0);
+    assert_eq!(diagnostics.pending_reclamations, 0);
+    assert_eq!(diagnostics.quarantined_operations, 0);
+    assert_eq!(diagnostics.quarantined_mrs, 0);
+    assert_eq!(diagnostics.quarantined_bytes, 0);
+    assert_eq!(diagnostics.quarantined_bundles, 0);
+    assert_eq!(diagnostics.ready_queue_depth, 0);
+    assert_eq!(diagnostics.listener_count, 0);
+    assert_eq!(diagnostics.queued_inbound_requests, 0);
+    assert_eq!(diagnostics.pending_accepts, 0);
+    assert_eq!(diagnostics.selected_accepts, 0);
+    assert_eq!(diagnostics.inbound_requests_accepted, 0);
+    assert_eq!(diagnostics.inbound_requests_rejected, 0);
     assert!(diagnostics.connections().is_empty());
     assert!(diagnostics.listeners().is_empty());
 
     tokio::task::yield_now().await;
     let stable = engine.diagnostics();
-    assert_eq!(stable.lifecycle, RdmaEngineLifecycle::Terminated);
-    assert!(stable.terminal_error.is_none());
-    assert_eq!(stable.cm_events_processed, diagnostics.cm_events_processed);
-    assert_eq!(stable.connections_failed, diagnostics.connections_failed);
     assert_eq!(
-        stable.live_connection_reservations,
-        diagnostics.live_connection_reservations
-    );
-    assert_eq!(
-        stable.free_connection_slots,
-        diagnostics.free_connection_slots
+        stable, diagnostics,
+        "driver termination must freeze the complete diagnostic ledger"
     );
 }
 

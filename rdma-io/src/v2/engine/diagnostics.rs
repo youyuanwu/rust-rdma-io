@@ -304,7 +304,10 @@ pub struct RdmaEngineDiagnostics {
     pub accept_cancellations_after_selection: u64,
     /// Selected pre-establishment setup failures.
     pub accept_setup_failures: u64,
-    /// CM events consumed and acknowledged by the sole engine driver.
+    /// CM events handled or rejected by the sole engine driver.
+    ///
+    /// A failure event acknowledged only to finish teardown after shutdown
+    /// already won its request race is intentionally excluded.
     pub cm_events_processed: u64,
     /// CM events rejected from live routing.
     pub cm_events_rejected: u64,

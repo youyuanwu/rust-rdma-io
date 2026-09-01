@@ -386,6 +386,12 @@ impl CmState {
         };
         match disposition {
             EventDisposition::Handled => {}
+            EventDisposition::IgnoredAfterShutdown => {
+                shared
+                    .diagnostic_counters
+                    .cm_events_processed
+                    .fetch_sub(1, Ordering::Relaxed);
+            }
             EventDisposition::Rejected(reject) => {
                 shared.diagnostic_counters.reject_cm_event(reject);
             }
@@ -2546,9 +2552,15 @@ impl CmState {
                 request,
                 reservation,
             } => {
+                let shutdown_won = request.cancelled.load(Ordering::Acquire)
+                    || shared.shutdown_requested.load(Ordering::Acquire);
                 self.defer_cm_id(cm_id);
                 drop(reservation);
                 self.retire_route(route, true);
+                if shutdown_won {
+                    request.complete(Err(Error::DriverShutdown));
+                    return Ok(EventDisposition::IgnoredAfterShutdown);
+                }
                 request.complete_failure(shared, Error::Verbs(std::io::Error::other(message)));
             }
             OutboundState::AwaitEstablished {
@@ -2826,6 +2838,7 @@ struct CmEventSnapshot {
 
 enum EventDisposition {
     Handled,
+    IgnoredAfterShutdown,
     Rejected(CmEventReject),
 }
 
@@ -3264,8 +3277,13 @@ impl OutboundRequest {
     }
 
     fn complete_failure(&self, shared: &EngineShared, error: Error) {
-        self.record_failure(shared);
-        self.complete(Err(error));
+        let mut current = lock_unpoison(&self.result);
+        if matches!(&*current, TakeOnceResult::Pending) {
+            self.record_failure(shared);
+            *current = TakeOnceResult::Ready(Err(error));
+            drop(current);
+            self.waker.wake();
+        }
     }
 
     fn record_failure(&self, shared: &EngineShared) {
@@ -4263,6 +4281,10 @@ mod tests {
         );
         let cancelled = test_request();
         cancelled.cancel(Error::DriverShutdown);
+        cancelled.complete_failure(
+            &engine.shared,
+            Error::InvalidConfig("late failure after shutdown".into()),
+        );
 
         assert_eq!(
             engine
