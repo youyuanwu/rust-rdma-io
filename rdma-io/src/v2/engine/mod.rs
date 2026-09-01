@@ -872,11 +872,13 @@ impl EngineShared {
     fn connection_diagnostic_summary(
         &self,
     ) -> (connection::ConnectionStateCountSnapshot, Option<Duration>) {
-        let quarantines = lock_unpoison(&self.quarantines);
         let counts = self.connection_admission.snapshot();
         let now = Instant::now();
-        let oldest = quarantines
-            .oldest
+        let connection_oldest = lock_unpoison(&self.quarantines).oldest;
+        let oldest = connection_oldest
+            .into_iter()
+            .chain(self.cm.oldest_setup_rollback_quarantine())
+            .min()
             .map(|started| now.saturating_duration_since(started));
         (counts, oldest)
     }

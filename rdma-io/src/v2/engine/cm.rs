@@ -14,6 +14,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use futures_util::task::AtomicWaker;
 use rdma_io_sys::rdmacm::rdma_cm_id;
@@ -451,7 +452,17 @@ impl CmState {
             + self.inbound_routes.live()
             + lock_unpoison(&self.listeners).len()
             + lock_unpoison(&self.cm_destructions).len();
+        // Every retained setup rollback still owns its live CM route. The
+        // maximum counts those overlapping owners once while flooring the
+        // result if a future unregistered rollback ever loses route coverage.
         routed_owners.max(lock_unpoison(&self.setup_rollback_quarantines).len())
+    }
+
+    pub(super) fn oldest_setup_rollback_quarantine(&self) -> Option<Instant> {
+        lock_unpoison(&self.setup_rollback_quarantines)
+            .iter()
+            .map(|retained| retained.started)
+            .min()
     }
 
     pub(super) fn listener_counts(&self) -> (usize, usize, usize, usize) {
@@ -1587,6 +1598,7 @@ impl CmState {
                 lock_unpoison(&self.setup_rollback_quarantines).push(RetainedSetupRollback {
                     _poster: poster,
                     _reservation: reservation,
+                    started: Instant::now(),
                 });
                 None
             }
@@ -2846,6 +2858,7 @@ enum PendingCmDestruction {
 struct RetainedSetupRollback {
     _poster: Arc<dyn WorkRequestPoster>,
     _reservation: ConnectionReservation,
+    started: Instant,
 }
 
 #[cfg(test)]
@@ -3348,7 +3361,9 @@ impl Drop for ConnectWaiter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2::engine::connection::{WorkRequestPoster, install_connection};
+    use crate::v2::engine::connection::{
+        ConnectionAdmissionPool, WorkRequestPoster, install_connection,
+    };
     use crate::v2::qp::{BatchPostOutcome, QpCapabilities};
     use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
     use std::task::{Context, Poll};
@@ -3384,6 +3399,27 @@ mod tests {
         ] {
             assert!(!is_failure_event(event));
         }
+    }
+
+    #[test]
+    fn retained_setup_rollback_route_is_counted_once_and_contributes_age() {
+        let cm = CmState::new(1).unwrap();
+        let request = Arc::new(test_request());
+        cm.routes
+            .allocate_with(|token| Arc::new(OutboundRoute::new(token, request)))
+            .unwrap();
+        let pool = ConnectionAdmissionPool::new(1);
+        let mut reservation = pool.try_acquire().unwrap();
+        assert!(reservation.retain_setup_quarantine());
+        let started = Instant::now();
+        lock_unpoison(&cm.setup_rollback_quarantines).push(RetainedSetupRollback {
+            _poster: Arc::new(NoopPoster(7)),
+            _reservation: reservation,
+            started,
+        });
+
+        assert_eq!(cm.retained_owner_count(), 1);
+        assert_eq!(cm.oldest_setup_rollback_quarantine(), Some(started));
     }
 
     #[test]

@@ -507,8 +507,10 @@ connection registry generation, admission reservation, QP, and CM ID remain
 owned and cannot be reused. A pre-registration setup rollback applies the same
 retention to its establishing reservation and CM route. A quarantined
 establishing reservation permanently pins its admission slot and quarantine
-gauge even if a future owner is accidentally dropped. Before retaining an
-inbound child, the engine sends a legal pre-accept RDMA-CM rejection so the
+gauge even if a future owner is accidentally dropped. Its retention timestamp
+also participates in `oldest_quarantine_age` even though it has no connection
+registry token. Before retaining an inbound child, the engine sends a legal
+pre-accept RDMA-CM rejection so the
 peer fails promptly rather than waiting for its CM timeout. The connect or
 accept caller still receives the original setup error; secondary reject and
 destroy failures remain diagnostic, and the retained bundle is never retried

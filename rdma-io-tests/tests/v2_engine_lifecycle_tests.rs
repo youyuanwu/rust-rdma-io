@@ -937,6 +937,7 @@ async fn run_setup_rollback_destroy_quarantines(mode: CompletionMode) {
     wait_until("outbound rollback quarantine was not published", || {
         let diagnostics = client_engine.diagnostics();
         diagnostics.quarantined_bundles == 1
+            && diagnostics.oldest_quarantine_age.is_some()
             && diagnostics.live_connection_reservations == 1
             && diagnostics.establishing_connection_reservations == 0
             && diagnostics.free_connection_slots == 3
@@ -975,12 +976,13 @@ async fn run_setup_rollback_destroy_quarantines(mode: CompletionMode) {
         Err(error) => error,
     };
     assert!(
-        matches!(peer_error, Error::Verbs(_)),
+        matches!(&peer_error, Error::Verbs(_)) && peer_error.to_string().contains("Rejected"),
         "unexpected inbound rollback peer outcome: {peer_error}"
     );
     wait_until("inbound rollback quarantine was not published", || {
         let diagnostics = server_engine.diagnostics();
         diagnostics.quarantined_bundles == 1
+            && diagnostics.oldest_quarantine_age.is_some()
             && diagnostics.live_connection_reservations == 1
             && diagnostics.establishing_connection_reservations == 0
             && diagnostics.free_connection_slots == 3
@@ -1009,11 +1011,19 @@ async fn run_setup_rollback_destroy_quarantines(mode: CompletionMode) {
         rollback_events
             .iter()
             .all(|event| event.kind != DestructionKind::MemoryRegion),
-        "setup rollback quarantine must not release retained connection resources"
+        "setup rollback quarantine released one of its two registered retained MRs before the failed QP destruction boundary"
     );
 
     let (healthy_server, healthy_client) = accept_pair(&listener, &client_engine).await;
     exchange_byte(&healthy_client, &healthy_server, 0xa5).await;
+    wait_until(
+        "rejected peer reservation was not retired before diagnostics",
+        || {
+            let diagnostics = client_engine.diagnostics();
+            diagnostics.free_connection_slots == 2 && diagnostics.live_connection_reservations == 2
+        },
+    )
+    .await;
     let server_diagnostics = server_engine.diagnostics();
     assert!(server_diagnostics.terminal_error.is_none());
     assert_eq!(server_diagnostics.quarantined_bundles, 1);
@@ -1037,6 +1047,14 @@ async fn run_setup_rollback_destroy_quarantines(mode: CompletionMode) {
 
     let events = recorder.snapshot();
     assert!(!recorder.overflowed());
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == DestructionKind::MemoryRegion)
+            .count(),
+        2,
+        "only the healthy exchange MRs may be deregistered while setup rollback MRs remain retained"
+    );
     let failed_qps = events
         .iter()
         .filter(|event| {
@@ -1079,6 +1097,16 @@ async fn run_setup_rollback_destroy_quarantines(mode: CompletionMode) {
     client_task.abort();
     let _ = client_task.await;
     drop(client_engine);
+    let final_events = recorder.snapshot();
+    assert!(!recorder.overflowed());
+    assert_eq!(
+        final_events
+            .iter()
+            .filter(|event| event.kind == DestructionKind::MemoryRegion)
+            .count(),
+        2,
+        "terminal setup rollback quarantine released one of its registered retained MRs"
+    );
 }
 
 async fn run_peer_disconnect(mode: CompletionMode) {

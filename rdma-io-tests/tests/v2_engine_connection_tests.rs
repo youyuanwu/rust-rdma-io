@@ -391,9 +391,21 @@ async fn run_readiness_shutdown_after_addr_error() {
     })
     .await;
     let before_shutdown = engine.diagnostics();
-    assert_eq!(before_shutdown.cm_events_processed, 0);
-    assert_eq!(before_shutdown.connections_failed, 0);
-    assert_eq!(before_shutdown.live_connection_reservations, 1);
+    assert_eq!(before_shutdown.lifecycle, RdmaEngineLifecycle::Running);
+    assert!(before_shutdown.terminal_error.is_none());
+    assert_eq!(before_shutdown.connections_admitted, 1);
+    assert_eq!(before_shutdown.free_connection_slots, 1);
+    assert_eq!(before_shutdown.cm_events_rejected, 0);
+    let addr_error_won = match (
+        before_shutdown.cm_events_processed,
+        before_shutdown.connections_failed,
+        before_shutdown.live_connection_reservations,
+        before_shutdown.establishing_connection_reservations,
+    ) {
+        (0, 0, 1, 1) => false,
+        (1, 1, 0, 0) => true,
+        ledger => panic!("invalid pre-shutdown ADDR_ERROR ledger: {ledger:?}"),
+    };
 
     let mut shutdown = Box::pin(engine.shutdown());
     assert!(
@@ -401,6 +413,13 @@ async fn run_readiness_shutdown_after_addr_error() {
             .await
             .is_pending()
     );
+    let shutdown_requested = engine.diagnostics();
+    assert_eq!(
+        shutdown_requested.lifecycle,
+        RdmaEngineLifecycle::ShutdownRequested
+    );
+    assert!(shutdown_requested.terminal_error.is_none());
+    assert_eq!(shutdown_requested.shutdowns, 1);
     let driver_task = tokio::spawn(driver);
 
     tokio::time::timeout(Duration::from_secs(10), shutdown.as_mut())
@@ -408,13 +427,65 @@ async fn run_readiness_shutdown_after_addr_error() {
         .expect("readiness shutdown lost its terminal wake after ADDR_ERROR")
         .unwrap();
     driver_task.await.unwrap().unwrap();
-    assert!(connect.await.is_err());
+    let connect_error = match connect.await {
+        Ok(_) => panic!("unresolved neighbor unexpectedly connected"),
+        Err(error) => error,
+    };
+    if addr_error_won {
+        assert!(
+            matches!(&connect_error, Error::Verbs(_))
+                && connect_error.to_string().contains("AddrError"),
+            "ADDR_ERROR winner published the wrong connect cause: {connect_error}"
+        );
+    } else {
+        assert!(
+            matches!(&connect_error, Error::DriverShutdown),
+            "shutdown winner published the wrong connect cause: {connect_error}"
+        );
+    }
 
     let diagnostics = engine.diagnostics();
     assert_eq!(diagnostics.lifecycle, RdmaEngineLifecycle::Terminated);
-    assert!(diagnostics.cm_events_processed >= 1);
+    assert!(diagnostics.terminal_error.is_none());
+    assert_eq!(diagnostics.shutdowns, 1);
+    assert_eq!(diagnostics.connections_admitted, 1);
+    assert_eq!(diagnostics.connections_failed, 1);
+    assert_eq!(diagnostics.cm_events_processed, 1);
+    assert_eq!(diagnostics.cm_events_rejected, 0);
+    assert_eq!(diagnostics.stale_cm_events, 0);
+    assert_eq!(diagnostics.duplicate_cm_events, 0);
+    assert_eq!(diagnostics.unknown_cm_events, 0);
+    assert_eq!(diagnostics.wrong_id_cm_events, 0);
+    assert_eq!(diagnostics.unexpected_cm_events, 0);
     assert_eq!(diagnostics.live_connection_reservations, 0);
+    assert_eq!(diagnostics.establishing_connection_reservations, 0);
+    assert_eq!(diagnostics.established_connection_reservations, 0);
+    assert_eq!(diagnostics.draining_connection_reservations, 0);
+    assert_eq!(diagnostics.registered_live_qps, 0);
     assert_eq!(diagnostics.free_connection_slots, 1);
+    assert_eq!(diagnostics.retired_connection_slots, 0);
+    assert_eq!(diagnostics.connections_opened, 0);
+    assert_eq!(diagnostics.connections_closed, 0);
+    assert_eq!(diagnostics.connections_quarantined, 0);
+    assert_eq!(diagnostics.registered_operations, 0);
+    assert_eq!(diagnostics.accepted_outstanding_operations, 0);
+    assert!(diagnostics.connections().is_empty());
+    assert!(diagnostics.listeners().is_empty());
+
+    tokio::task::yield_now().await;
+    let stable = engine.diagnostics();
+    assert_eq!(stable.lifecycle, RdmaEngineLifecycle::Terminated);
+    assert!(stable.terminal_error.is_none());
+    assert_eq!(stable.cm_events_processed, diagnostics.cm_events_processed);
+    assert_eq!(stable.connections_failed, diagnostics.connections_failed);
+    assert_eq!(
+        stable.live_connection_reservations,
+        diagnostics.live_connection_reservations
+    );
+    assert_eq!(
+        stable.free_connection_slots,
+        diagnostics.free_connection_slots
+    );
 }
 
 async fn run_shutdown_awaiting_delivery(mode: CompletionMode) {

@@ -265,6 +265,8 @@ pub(crate) struct ConnectionState {
     retired: AtomicBool,
     admission: Mutex<Option<ConnectionReservation>>,
     cm_route: Option<ConnectionCmRoute>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    retained_setup_rollback_mr: Mutex<Option<Mr>>,
 }
 
 impl ConnectionState {
@@ -310,6 +312,8 @@ impl ConnectionState {
             retired: AtomicBool::new(false),
             admission: Mutex::new(admission),
             cm_route,
+            #[cfg(any(test, feature = "test-hooks"))]
+            retained_setup_rollback_mr: Mutex::new(None),
         }
     }
 
@@ -742,6 +746,15 @@ impl ConnectionState {
     pub(super) fn release_admission(&self) {
         drop(lock_unpoison(&self.admission).take());
     }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(super) fn retain_setup_rollback_mr(&self, mr: Mr) {
+        let previous = lock_unpoison(&self.retained_setup_rollback_mr).replace(mr);
+        assert!(
+            previous.is_none(),
+            "setup rollback retains at most one test MR"
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -781,6 +794,7 @@ impl ConnectionAdmissionPool {
 
     pub(super) fn clear_retained_quarantine(&self) {
         self.counts.update(|counts| {
+            counts.live = counts.live.saturating_sub(1);
             counts.quarantined_bundles = counts.quarantined_bundles.saturating_sub(1);
         });
     }
@@ -1532,7 +1546,8 @@ pub(super) fn install_reserved_connection(
     #[cfg(not(any(test, feature = "test-hooks")))]
     let _ = token;
     #[cfg(any(test, feature = "test-hooks"))]
-    if let Some(error) = shared.test_driver.take_setup_rollback_failure() {
+    if let Some(failure) = shared.test_driver.take_setup_rollback_failure() {
+        state.retain_setup_rollback_mr(failure.retained_mr);
         if !shared.connections.detach_qp_index(token, qp_num) {
             return Err(ConnectionInstallFailure {
                 error: Error::InvalidConfig(
@@ -1548,7 +1563,7 @@ pub(super) fn install_reserved_connection(
             });
         }
         return Err(ConnectionInstallFailure {
-            error,
+            error: failure.error,
             resources: FailedConnectionInstallResources::Registered(state),
         });
     }
@@ -1900,6 +1915,19 @@ mod tests {
             }
         );
         assert!(pool.try_acquire().is_none());
+    }
+
+    #[test]
+    fn clearing_dropped_setup_quarantine_releases_live_and_bundle_gauges_together() {
+        let pool = ConnectionAdmissionPool::new(1);
+        let mut reservation = pool.try_acquire().unwrap();
+        assert!(reservation.retain_setup_quarantine());
+        drop(reservation);
+
+        pool.clear_retained_quarantine();
+
+        assert_eq!(pool.snapshot(), ConnectionStateCountSnapshot::default());
+        assert!(pool.try_acquire().is_some());
     }
 
     #[test]

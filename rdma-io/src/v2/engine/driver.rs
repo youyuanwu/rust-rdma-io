@@ -993,9 +993,16 @@ pub(super) mod test_api {
         }
 
         /// Fail the next newly created connection installation and its QP rollback.
+        ///
+        /// A real MR is retained by the failed connection state so tests can
+        /// prove rollback ownership is not released before the failed QP
+        /// destruction boundary.
         pub fn fail_next_setup_rollback_qp_destroy(&self, error: Error) -> Result<()> {
             let shared = self.ensure_active()?;
-            shared.test_driver.inject_setup_rollback_failure(error)?;
+            let mr = self.resources.pd.reg_mr(64, AccessIntent::LocalOnly)?;
+            shared
+                .test_driver
+                .inject_setup_rollback_failure(error, mr)?;
             Ok(())
         }
 
@@ -1606,7 +1613,7 @@ pub(super) mod test_api {
         released_connection_cqes: Mutex<VecDeque<WorkCompletion>>,
         connection_cqe_notify: Notify,
         injected_failure: Mutex<Option<Error>>,
-        setup_rollback_failure: Mutex<Option<Error>>,
+        setup_rollback_failure: Mutex<Option<SetupRollbackFailure>>,
         ready_work_paused: AtomicBool,
         work_class_selections: [AtomicU64; 5],
         connection_selections: AtomicU64,
@@ -1622,6 +1629,11 @@ pub(super) mod test_api {
         require_flush: bool,
         completion: Option<WorkCompletion>,
         abandoned: bool,
+    }
+
+    pub(in crate::v2::engine) struct SetupRollbackFailure {
+        pub(in crate::v2::engine) error: Error,
+        pub(in crate::v2::engine) retained_mr: Mr,
     }
 
     impl TestDriverState {
@@ -1743,7 +1755,7 @@ pub(super) mod test_api {
                 .take()
         }
 
-        fn inject_setup_rollback_failure(&self, error: Error) -> Result<()> {
+        fn inject_setup_rollback_failure(&self, error: Error, retained_mr: Mr) -> Result<()> {
             let mut pending = self
                 .setup_rollback_failure
                 .lock()
@@ -1753,11 +1765,13 @@ pub(super) mod test_api {
                     "a setup rollback failure is already pending".into(),
                 ));
             }
-            *pending = Some(error);
+            *pending = Some(SetupRollbackFailure { error, retained_mr });
             Ok(())
         }
 
-        pub(in crate::v2::engine) fn take_setup_rollback_failure(&self) -> Option<Error> {
+        pub(in crate::v2::engine) fn take_setup_rollback_failure(
+            &self,
+        ) -> Option<SetupRollbackFailure> {
             self.setup_rollback_failure
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
