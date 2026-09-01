@@ -286,7 +286,7 @@ pub const UNITS: &[Unit] = &[
         "S-033",
         Signature,
         Retain,
-        "diagnostics types/methods/105 fields",
+        "diagnostics types/methods/108 fields",
         "typed O(1)/O(N) diagnostics",
         "RdmaEngineDiagnostics"
     ),
@@ -757,6 +757,7 @@ pub const METHOD_SETS: &[MethodSet] = &[
             "create_qp",
             "disconnect_connection",
             "fail_next_connection_qp_destroy",
+            "fail_next_setup_rollback_qp_destroy",
             "inject_completion",
             "inject_driver_failure",
             "install_connection",

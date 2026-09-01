@@ -1650,17 +1650,24 @@ impl EngineShared {
         self.dispatch_queued_completion(completion);
     }
 
-    pub(super) fn dispatch_queued_completions(&self, connection: &ConnectionState) {
-        while let Some(completion) = connection.pop_completion() {
+    fn dispatch_queued_completions(&self, connection: &ConnectionState, budget: usize) -> bool {
+        for _ in 0..budget {
+            let Some(completion) = connection.pop_completion() else {
+                return false;
+            };
             self.dispatch_connection_completion(completion);
         }
+        connection.has_completion_work()
     }
 
-    pub(super) fn reject_queued_completions_after_qp_destroy(&self, connection: &ConnectionState) {
+    pub(super) fn reject_queued_completions_after_qp_destroy(
+        &self,
+        connection: &ConnectionState,
+    ) -> bool {
         // The sole driver invokes this after the destruction boundary. CQEs
         // queued before the boundary were already dispatched normally; only
         // completions arriving after that boundary are rejected as stale.
-        self.dispatch_queued_completions(connection);
+        self.dispatch_queued_completions(connection, self.config.ready_connection_quantum)
     }
 
     pub(super) fn begin_reclamation(&self, token: OperationToken) {

@@ -260,6 +260,7 @@ pub(crate) struct ConnectionState {
     frontend_count: AtomicUsize,
     retirement_requested: AtomicBool,
     retirement_started: AtomicBool,
+    retirement_quarantined: AtomicBool,
     drained_recorded: AtomicBool,
     retired: AtomicBool,
     admission: Mutex<Option<ConnectionReservation>>,
@@ -304,6 +305,7 @@ impl ConnectionState {
             frontend_count: AtomicUsize::new(1),
             retirement_requested: AtomicBool::new(false),
             retirement_started: AtomicBool::new(false),
+            retirement_quarantined: AtomicBool::new(false),
             drained_recorded: AtomicBool::new(false),
             retired: AtomicBool::new(false),
             admission: Mutex::new(admission),
@@ -592,6 +594,23 @@ impl ConnectionState {
         self.close_notify.notify_waiters();
     }
 
+    pub(super) fn publish_destroy_quarantine(&self, error: &Error) {
+        self.retirement_quarantined.store(true, Ordering::Release);
+        let mut outcome = lock_unpoison(&self.close_outcome);
+        if !outcome
+            .as_ref()
+            .is_some_and(MemoizedTerminalResult::is_connection_quarantined)
+        {
+            *outcome = Some(MemoizedTerminalResult::from_error(
+                Error::ConnectionDestroyQuarantined {
+                    cause: error.to_string(),
+                },
+            ));
+        }
+        drop(outcome);
+        self.close_notify.notify_waiters();
+    }
+
     pub(super) fn recover_quarantine(&self) -> bool {
         self.quarantined.swap(false, Ordering::AcqRel)
     }
@@ -659,11 +678,21 @@ impl ConnectionState {
     }
 
     pub(super) fn try_begin_retirement(&self) -> bool {
+        if self.retirement_quarantined.load(Ordering::Acquire) {
+            return false;
+        }
         !self.retirement_started.swap(true, Ordering::AcqRel)
     }
 
     pub(super) fn retry_retirement(&self) {
+        if self.retirement_quarantined.load(Ordering::Acquire) {
+            return;
+        }
         self.retirement_started.store(false, Ordering::Release);
+    }
+
+    pub(super) fn retirement_is_quarantined(&self) -> bool {
+        self.retirement_quarantined.load(Ordering::Acquire)
     }
 
     pub(super) fn is_retired(&self) -> bool {
@@ -762,6 +791,7 @@ enum ReservationState {
     Establishing,
     Established,
     Draining,
+    QuarantinedEstablishing,
     QuarantinedEstablished,
     QuarantinedDraining,
 }
@@ -877,6 +907,7 @@ impl ConnectionReservation {
                 self.state = ReservationState::QuarantinedDraining;
             }
             ReservationState::Establishing
+            | ReservationState::QuarantinedEstablishing
             | ReservationState::Draining
             | ReservationState::QuarantinedDraining => {}
         }
@@ -897,6 +928,7 @@ impl ConnectionReservation {
                 self.state = ReservationState::QuarantinedEstablished;
             }
             ReservationState::Establishing
+            | ReservationState::QuarantinedEstablishing
             | ReservationState::Established
             | ReservationState::QuarantinedEstablished => {}
         }
@@ -904,6 +936,13 @@ impl ConnectionReservation {
 
     fn mark_quarantined(&mut self) {
         match self.state {
+            ReservationState::Establishing => {
+                self.counts.update(|counts| {
+                    counts.establishing = counts.establishing.saturating_sub(1);
+                    counts.quarantined_bundles += 1;
+                });
+                self.state = ReservationState::QuarantinedEstablishing;
+            }
             ReservationState::Established => {
                 self.counts.update(|counts| {
                     counts.established = counts.established.saturating_sub(1);
@@ -925,7 +964,7 @@ impl ConnectionReservation {
                 }
                 self.state = ReservationState::QuarantinedDraining;
             }
-            ReservationState::Establishing
+            ReservationState::QuarantinedEstablishing
             | ReservationState::QuarantinedEstablished
             | ReservationState::QuarantinedDraining => {}
         }
@@ -956,6 +995,7 @@ impl ConnectionReservation {
                 self.qp_counted = qp_is_live;
             }
             ReservationState::Establishing
+            | ReservationState::QuarantinedEstablishing
             | ReservationState::Established
             | ReservationState::Draining => {}
         }
@@ -980,6 +1020,9 @@ impl Drop for ConnectionReservation {
                 ReservationState::Establishing => {
                     counts.establishing = counts.establishing.saturating_sub(1);
                 }
+                ReservationState::QuarantinedEstablishing => {
+                    counts.quarantined_bundles = counts.quarantined_bundles.saturating_sub(1);
+                }
                 ReservationState::Established => {
                     counts.established = counts.established.saturating_sub(1);
                 }
@@ -992,6 +1035,12 @@ impl Drop for ConnectionReservation {
                 counts.registered_live_qps = counts.registered_live_qps.saturating_sub(1);
             }
         });
+    }
+}
+
+impl ConnectionReservation {
+    pub(super) fn retain_setup_quarantine(&mut self) {
+        self.mark_quarantined();
     }
 }
 
@@ -1348,7 +1397,17 @@ pub(crate) fn install_connection(
         None,
     );
     drop(admission);
-    connection
+    match connection {
+        Ok(connection) => Ok(connection),
+        Err(failure) => {
+            let (error, resources) = failure.into_parts();
+            if let FailedConnectionInstallResources::Registered(connection) = resources {
+                let _ = shared.connections.release_unindexed(connection.token);
+                connection.release_admission();
+            }
+            Err(error)
+        }
+    }
 }
 
 pub(super) fn reserve_connection(
@@ -1380,13 +1439,30 @@ pub(super) fn install_reserved_connection(
     peer_addr: Option<SocketAddr>,
     reservation: ConnectionReservation,
     cm_route: Option<ConnectionCmRoute>,
-) -> Result<RdmaConnection> {
-    config.validate(&shared.config, shared.provider.as_ref())?;
-    if let Some(capabilities) = poster.capabilities() {
-        capabilities.require(&config)?;
+) -> std::result::Result<RdmaConnection, ConnectionInstallFailure> {
+    if let Err(error) = config.validate(&shared.config, shared.provider.as_ref()) {
+        return Err(ConnectionInstallFailure::unregistered(
+            error,
+            poster,
+            reservation,
+        ));
+    }
+    if let Some(capabilities) = poster.capabilities()
+        && let Err(error) = capabilities.require(&config)
+    {
+        return Err(ConnectionInstallFailure::unregistered(
+            error,
+            poster,
+            reservation,
+        ));
     }
     let qp_num = poster.qp_num();
-    let registration = shared.connections.register(qp_num, |token| {
+    let pending = Arc::new(Mutex::new(Some((poster, reservation))));
+    let make_pending = Arc::clone(&pending);
+    let registration = shared.connections.register(qp_num, move |token| {
+        let (poster, reservation) = lock_unpoison(&make_pending)
+            .take()
+            .expect("connection registration factory runs exactly once");
         Arc::new(ConnectionState::new(
             token,
             poster,
@@ -1397,22 +1473,100 @@ pub(super) fn install_reserved_connection(
             cm_route,
         ))
     });
-    let (_, state) = match registration {
+    let (token, state) = match registration {
         Ok(registration) => registration,
-        Err(error) => {
-            if matches!(error, Error::CapacityExhausted) {
+        Err(failure) => {
+            if matches!(failure.error, Error::CapacityExhausted) {
                 shared
                     .diagnostic_counters
                     .connection_capacity_exhausted
                     .fetch_add(1, Ordering::Relaxed);
             }
-            return Err(error);
+            if let Some((_token, state)) = failure.retained {
+                return Err(ConnectionInstallFailure {
+                    error: failure.error,
+                    resources: FailedConnectionInstallResources::Registered(state),
+                });
+            }
+            let (poster, reservation) = lock_unpoison(&pending)
+                .take()
+                .expect("failed registration retains unconsumed resources");
+            return Err(ConnectionInstallFailure::unregistered(
+                failure.error,
+                poster,
+                reservation,
+            ));
         }
     };
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    let _ = token;
+    #[cfg(any(test, feature = "test-hooks"))]
+    if let Some(error) = shared.test_driver.take_setup_rollback_failure() {
+        if !shared.connections.detach_qp_index(token, qp_num) {
+            return Err(ConnectionInstallFailure {
+                error: Error::InvalidConfig(
+                    "setup rollback injection lost its QP registration".into(),
+                ),
+                resources: FailedConnectionInstallResources::Registered(state),
+            });
+        }
+        if let Err(injection_error) = state.poster.fail_next_qp_destroy() {
+            return Err(ConnectionInstallFailure {
+                error: injection_error,
+                resources: FailedConnectionInstallResources::Registered(state),
+            });
+        }
+        return Err(ConnectionInstallFailure {
+            error,
+            resources: FailedConnectionInstallResources::Registered(state),
+        });
+    }
     Ok(RdmaConnection {
         shared: Arc::clone(shared),
         state,
     })
+}
+
+pub(super) struct ConnectionInstallFailure {
+    error: Error,
+    resources: FailedConnectionInstallResources,
+}
+
+impl std::fmt::Debug for ConnectionInstallFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConnectionInstallFailure")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+pub(super) enum FailedConnectionInstallResources {
+    Unregistered {
+        poster: Arc<dyn WorkRequestPoster>,
+        reservation: ConnectionReservation,
+    },
+    Registered(Arc<ConnectionState>),
+}
+
+impl ConnectionInstallFailure {
+    fn unregistered(
+        error: Error,
+        poster: Arc<dyn WorkRequestPoster>,
+        reservation: ConnectionReservation,
+    ) -> Self {
+        Self {
+            error,
+            resources: FailedConnectionInstallResources::Unregistered {
+                poster,
+                reservation,
+            },
+        }
+    }
+
+    pub(super) fn into_parts(self) -> (Error, FailedConnectionInstallResources) {
+        (self.error, self.resources)
+    }
 }
 
 mod qp {

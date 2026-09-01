@@ -13,9 +13,10 @@ pub(super) enum TakeOnceResult<T> {
 
 /// Cloneable terminal outcome used by both engine-wide and object-local waiters.
 ///
-/// `ConnectionQuarantined` is a connection-local close disposition only. It
-/// may be memoized by a connection, but must never become the engine driver's
-/// terminal outcome; engine-wide terminal causes must match the driver result.
+/// Connection quarantine variants are connection-local close dispositions
+/// only. They may be memoized by a connection, but must never become the
+/// engine driver's terminal outcome; engine-wide terminal causes must match
+/// the driver result.
 #[derive(Clone)]
 pub(super) struct MemoizedTerminalResult {
     result: Result<()>,
@@ -43,7 +44,10 @@ impl MemoizedTerminalResult {
     }
 
     pub(super) fn is_connection_quarantined(&self) -> bool {
-        matches!(self.result, Err(Error::ConnectionQuarantined { .. }))
+        matches!(
+            self.result,
+            Err(Error::ConnectionQuarantined { .. } | Error::ConnectionDestroyQuarantined { .. })
+        )
     }
 
     pub(super) fn into_result(self) -> Result<()> {

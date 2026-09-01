@@ -88,6 +88,13 @@ pub enum Error {
         cq_debt: usize,
     },
 
+    /// Connection retirement retained its complete resource bundle because
+    /// the owning queue pair could not be destroyed.
+    ConnectionDestroyQuarantined {
+        /// Contextual provider destruction failure.
+        cause: String,
+    },
+
     /// Engine termination retained unsafe live state.
     EngineWedged {
         /// Complete QP/CM/MR/operation bundles retained fail-closed. This can
@@ -130,6 +137,9 @@ impl Clone for Error {
             } => Self::ConnectionQuarantined {
                 outstanding_operations: *outstanding_operations,
                 cq_debt: *cq_debt,
+            },
+            Self::ConnectionDestroyQuarantined { cause } => Self::ConnectionDestroyQuarantined {
+                cause: cause.clone(),
             },
             Self::EngineWedged {
                 retained_bundles,
@@ -190,6 +200,9 @@ impl fmt::Display for Error {
                 f,
                 "connection quarantined with {outstanding_operations} outstanding operations and {cq_debt} retained CQ credits"
             ),
+            Error::ConnectionDestroyQuarantined { cause } => {
+                write!(f, "connection destroy quarantined: {cause}")
+            }
             Error::EngineWedged {
                 retained_bundles,
                 outstanding_operations,

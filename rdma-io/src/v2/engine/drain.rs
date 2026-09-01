@@ -81,6 +81,7 @@ impl EngineShared {
 
     pub(super) fn schedule_connection_retirement(&self, connection: &ConnectionState) {
         if connection.is_retired()
+            || connection.retirement_is_quarantined()
             || (connection.close_started() && !connection.error_transition_complete())
             || !connection.try_request_retirement()
         {
@@ -102,11 +103,17 @@ impl EngineShared {
         let Lookup::Occupied(connection) = self.connections.lookup(token) else {
             return;
         };
-        // A CQ service turn may have routed exact CQEs into this connection
-        // immediately before reclamation won the next scheduler turn. Deliver
-        // all such CQEs through the normal path before deciding whether a
-        // destructive fallback is necessary.
-        self.dispatch_queued_completions(&connection);
+        // CQEs already copied out of the hardware CQ must take the ordinary
+        // quantum-bounded ready path before a destructive fallback can run.
+        if connection.has_completion_work() {
+            self.publish_connection_ready(&connection);
+            self.schedule_deadline(
+                DeadlineKind::ConnectionDrain,
+                token.encode(),
+                std::time::Duration::ZERO,
+            );
+            return;
+        }
         let forced_tokens = {
             let _admission = read_unpoison(&self.admission);
             let lifecycle = connection.lock_lifecycle();
@@ -136,7 +143,15 @@ impl EngineShared {
             for operation in tokens {
                 let _ = self.reclaim_after_qp_destroy(&connection, operation);
             }
-            self.reject_queued_completions_after_qp_destroy(&connection);
+            if self.reject_queued_completions_after_qp_destroy(&connection) {
+                self.publish_connection_ready(&connection);
+                self.schedule_deadline(
+                    DeadlineKind::ConnectionDrain,
+                    token.encode(),
+                    std::time::Duration::ZERO,
+                );
+                return;
+            }
         }
         if let Some((outstanding, _cq_debt)) = connection.begin_quarantine() {
             if self.track_connection_quarantine(connection.token) {

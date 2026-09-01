@@ -286,8 +286,11 @@ Key design properties:
   At the drain deadline, every exact CQE already queued for the connection is
   dispatched before the accepted set is re-read; an empty set retires cleanly
   without destroying the QP early. Otherwise the engine uses result-returning
-  verbs destruction, retaining the QP/MRs/debt in `ConnectionQuarantined` if
-  destruction fails. A late success not queued before that boundary is
+  verbs destruction. A failed drain boundary retains QP/MRs/debt in
+  `ConnectionQuarantined`; a failed zero-debt retirement retains the complete
+  QP/CM/admission/generation bundle in `ConnectionDestroyQuarantined`. Setup
+  rollback preserves its original setup error while retaining the failed
+  destroy as connection-local quarantine. A late success not queued before that boundary is
   intentionally reported as closed and its payload is discarded. Terminal
   driver-loss quarantine is process-lifetime retention until restart.
 

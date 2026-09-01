@@ -992,6 +992,13 @@ pub(super) mod test_api {
             connection.state.poster.fail_next_qp_destroy()
         }
 
+        /// Fail the next newly created connection installation and its QP rollback.
+        pub fn fail_next_setup_rollback_qp_destroy(&self, error: Error) -> Result<()> {
+            let shared = self.ensure_active()?;
+            shared.test_driver.inject_setup_rollback_failure(error)?;
+            Ok(())
+        }
+
         /// Terminate the real driver on its next poll with an exact test error.
         pub fn inject_driver_failure(&self, error: Error) -> Result<()> {
             let shared = self.ensure_active()?;
@@ -1599,6 +1606,7 @@ pub(super) mod test_api {
         released_connection_cqes: Mutex<VecDeque<WorkCompletion>>,
         connection_cqe_notify: Notify,
         injected_failure: Mutex<Option<Error>>,
+        setup_rollback_failure: Mutex<Option<Error>>,
         ready_work_paused: AtomicBool,
         work_class_selections: [AtomicU64; 5],
         connection_selections: AtomicU64,
@@ -1637,6 +1645,7 @@ pub(super) mod test_api {
                 released_connection_cqes: Mutex::new(VecDeque::new()),
                 connection_cqe_notify: Notify::new(),
                 injected_failure: Mutex::new(None),
+                setup_rollback_failure: Mutex::new(None),
                 ready_work_paused: AtomicBool::new(false),
                 work_class_selections: std::array::from_fn(|_| AtomicU64::new(0)),
                 connection_selections: AtomicU64::new(0),
@@ -1729,6 +1738,27 @@ pub(super) mod test_api {
 
         pub(super) fn take_injected_failure(&self) -> Option<Error> {
             self.injected_failure
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+        }
+
+        fn inject_setup_rollback_failure(&self, error: Error) -> Result<()> {
+            let mut pending = self
+                .setup_rollback_failure
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if pending.is_some() {
+                return Err(Error::InvalidConfig(
+                    "a setup rollback failure is already pending".into(),
+                ));
+            }
+            *pending = Some(error);
+            Ok(())
+        }
+
+        pub(in crate::v2::engine) fn take_setup_rollback_failure(&self) -> Option<Error> {
+            self.setup_rollback_failure
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take()

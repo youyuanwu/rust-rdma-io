@@ -583,7 +583,7 @@ impl EngineShared {
     fn finish(&self, outcome: MemoizedTerminalResult) {
         assert!(
             !outcome.is_connection_quarantined(),
-            "ConnectionQuarantined is connection-local and cannot terminate the engine driver"
+            "ConnectionQuarantined is connection-local; no connection quarantine can terminate the engine driver"
         );
         let (operations_to_wake, connections_to_wake) = {
             let _admission = write_unpoison(&self.admission);

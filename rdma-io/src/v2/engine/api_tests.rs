@@ -80,6 +80,13 @@ fn exact_public_types_and_traits_compile() {
         cq_debt: 1,
     };
     assert!(matches!(connection, Error::ConnectionQuarantined { .. }));
+    let destroy = Error::ConnectionDestroyQuarantined {
+        cause: "provider busy".into(),
+    };
+    assert!(matches!(
+        destroy,
+        Error::ConnectionDestroyQuarantined { .. }
+    ));
     let engine = Error::EngineWedged {
         retained_bundles: 1,
         outstanding_operations: 1,

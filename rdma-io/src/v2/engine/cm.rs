@@ -21,8 +21,9 @@ use rdma_io_sys::rdmacm::rdma_cm_id;
 #[cfg(test)]
 use super::SetupSummary;
 use super::connection::{
-    ConnectionCmRoute, ConnectionReservation, ConnectionState, SharedCmId,
-    VerbsConnectionResources, WorkRequestPoster, install_reserved_connection, reserve_connection,
+    ConnectionCmRoute, ConnectionReservation, ConnectionState, FailedConnectionInstallResources,
+    SharedCmId, VerbsConnectionResources, WorkRequestPoster, install_reserved_connection,
+    reserve_connection,
 };
 use super::diagnostics::CmEventReject;
 use super::diagnostics::RdmaListenerDiagnostics;
@@ -95,6 +96,7 @@ pub(super) struct CmState {
     next_listener_token: AtomicU64,
     retirements: Mutex<VecDeque<ConnectionToken>>,
     cm_destructions: Mutex<VecDeque<PendingCmDestruction>>,
+    setup_rollback_quarantines: Mutex<Vec<RetainedSetupRollback>>,
     shutting_down: AtomicBool,
 }
 
@@ -114,6 +116,7 @@ impl CmState {
             next_listener_token: AtomicU64::new(1),
             retirements: Mutex::new(VecDeque::new()),
             cm_destructions: Mutex::new(VecDeque::new()),
+            setup_rollback_quarantines: Mutex::new(Vec::new()),
             shutting_down: AtomicBool::new(false),
         })
     }
@@ -985,15 +988,30 @@ impl CmState {
             Some(ConnectionCmRoute::Inbound(token.encode())),
         ) {
             Ok(connection) => connection,
-            Err(error) => {
-                let (cm_id, qp_destroyed) = verbs.destroy_connection(true)?;
-                if qp_destroyed {
-                    shared.record_qp_destroy();
+            Err(failure) => {
+                let (error, failed_resources) = failure.into_parts();
+                match verbs.destroy_connection(true) {
+                    Ok((cm_id, qp_destroyed)) => {
+                        if qp_destroyed {
+                            shared.record_qp_destroy();
+                        }
+                        self.release_failed_install(shared, failed_resources)?;
+                        if let Some(cm_id) = cm_id {
+                            self.reject_unreserved_child(
+                                shared,
+                                cm_id,
+                                InboundRejectReason::SetupFailure,
+                            )?;
+                        }
+                        self.inbound_routes.release(token, false);
+                    }
+                    Err(destroy_error) => {
+                        self.record_setup_rollback_quarantine(shared, &destroy_error);
+                        let connection =
+                            self.retain_failed_install(shared, failed_resources, &destroy_error);
+                        route.set_state(InboundState::Quarantined { connection });
+                    }
                 }
-                if let Some(cm_id) = cm_id {
-                    self.reject_unreserved_child(shared, cm_id, InboundRejectReason::SetupFailure)?;
-                }
-                self.inbound_routes.release(token, false);
                 request.complete(Err(error));
                 listener.finish_selected_route(token.encode());
                 return Ok(());
@@ -1457,8 +1475,34 @@ impl CmState {
             return Ok(());
         };
         let lifecycle = connection.lock_lifecycle();
-        let (cm_id, qp_destroyed) = connection.destroy_connection_resources(&lifecycle)?;
+        let resources = connection.destroy_connection_resources(&lifecycle);
         drop(lifecycle);
+        let (cm_id, qp_destroyed) = match resources {
+            Ok(resources) => resources,
+            Err(error) => {
+                tracing::warn!(
+                    slot = connection.token.slot,
+                    generation = connection.token.generation,
+                    qp_num = connection.qp_num(),
+                    %error,
+                    "connection QP destroy failed; retaining terminal quarantine"
+                );
+                if shared.track_connection_quarantine(connection.token) {
+                    shared
+                        .diagnostic_counters
+                        .connections_quarantined
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                shared
+                    .diagnostic_counters
+                    .connection_quarantine_outcomes
+                    .fetch_add(1, Ordering::Relaxed);
+                shared.record_connection_retirement_failure(&connection);
+                connection.publish_destroy_quarantine(&error);
+                self.finish_inbound_retirement(completion);
+                return Ok(());
+            }
+        };
         if qp_destroyed {
             shared.record_qp_destroy();
         }
@@ -1482,6 +1526,72 @@ impl CmState {
         self.finalize_connection_retirement(shared, connection)?;
         self.finish_inbound_retirement(completion);
         Ok(())
+    }
+
+    fn release_failed_install(
+        &self,
+        shared: &EngineShared,
+        resources: FailedConnectionInstallResources,
+    ) -> Result<()> {
+        match resources {
+            FailedConnectionInstallResources::Unregistered { .. } => Ok(()),
+            FailedConnectionInstallResources::Registered(connection) => {
+                let released = shared
+                    .connections
+                    .release_unindexed(connection.token)
+                    .ok_or_else(|| {
+                        Error::InvalidConfig(
+                            "failed connection installation lost its reserved generation".into(),
+                        )
+                    })?;
+                if !Arc::ptr_eq(&released, &connection) {
+                    return Err(Error::InvalidConfig(
+                        "failed connection installation released a mismatched generation".into(),
+                    ));
+                }
+                connection.release_admission();
+                Ok(())
+            }
+        }
+    }
+
+    fn retain_failed_install(
+        &self,
+        shared: &EngineShared,
+        resources: FailedConnectionInstallResources,
+        destroy_error: &Error,
+    ) -> Option<EstablishedConnectionRoute> {
+        match resources {
+            FailedConnectionInstallResources::Unregistered {
+                poster,
+                mut reservation,
+            } => {
+                reservation.retain_setup_quarantine();
+                lock_unpoison(&self.setup_rollback_quarantines).push(RetainedSetupRollback {
+                    _poster: poster,
+                    _reservation: reservation,
+                });
+                None
+            }
+            FailedConnectionInstallResources::Registered(connection) => {
+                connection.begin_close();
+                let _ = connection.try_begin_retirement();
+                let _ = shared.track_connection_quarantine(connection.token);
+                connection.publish_destroy_quarantine(destroy_error);
+                Some(EstablishedConnectionRoute::new(&connection))
+            }
+        }
+    }
+
+    fn record_setup_rollback_quarantine(&self, shared: &EngineShared, destroy_error: &Error) {
+        shared
+            .diagnostic_counters
+            .connections_quarantined
+            .fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            %destroy_error,
+            "setup rollback QP destroy failed; retaining connection resources"
+        );
     }
 
     fn finalize_connection_retirement(
@@ -2053,6 +2163,10 @@ impl CmState {
                 route.set_state(state);
                 return Ok(EventDisposition::Rejected(CmEventReject::Duplicate));
             }
+            state @ InboundState::Quarantined { .. } => {
+                route.set_state(state);
+                return Ok(EventDisposition::Rejected(CmEventReject::Duplicate));
+            }
             InboundState::Transitioning => {
                 return Err(Error::InvalidConfig(
                     "inbound CM route was re-entered while transitioning".into(),
@@ -2162,16 +2276,27 @@ impl CmState {
             Some(ConnectionCmRoute::Outbound(route.token.encode())),
         ) {
             Ok(connection) => connection,
-            Err(error) => {
-                let (cm_id, qp_destroyed) = verbs.destroy_connection(true)?;
-                if qp_destroyed {
-                    shared.record_qp_destroy();
-                }
-                if let Some(cm_id) = cm_id {
-                    self.defer_cm_id(cm_id);
+            Err(failure) => {
+                let (error, failed_resources) = failure.into_parts();
+                match verbs.destroy_connection(true) {
+                    Ok((cm_id, qp_destroyed)) => {
+                        if qp_destroyed {
+                            shared.record_qp_destroy();
+                        }
+                        self.release_failed_install(shared, failed_resources)?;
+                        if let Some(cm_id) = cm_id {
+                            self.defer_cm_id(cm_id);
+                        }
+                        self.retire_route(route, true);
+                    }
+                    Err(destroy_error) => {
+                        self.record_setup_rollback_quarantine(shared, &destroy_error);
+                        let connection =
+                            self.retain_failed_install(shared, failed_resources, &destroy_error);
+                        route.set_state(OutboundState::Quarantined { connection });
+                    }
                 }
                 drop(verbs);
-                self.retire_route(route, true);
                 request.complete_failure(shared, error);
                 return Ok(EventDisposition::Handled);
             }
@@ -2459,6 +2584,10 @@ impl CmState {
                 route.set_state(OutboundState::Closing { connection });
                 return Ok(EventDisposition::Rejected(CmEventReject::Duplicate));
             }
+            state @ OutboundState::Quarantined { .. } => {
+                route.set_state(state);
+                return Ok(EventDisposition::Rejected(CmEventReject::Duplicate));
+            }
             OutboundState::Transitioning => {
                 return Err(Error::InvalidConfig(
                     "CM route was re-entered while transitioning".into(),
@@ -2679,6 +2808,11 @@ enum PendingCmDestruction {
     },
 }
 
+struct RetainedSetupRollback {
+    _poster: Arc<dyn WorkRequestPoster>,
+    _reservation: ConnectionReservation,
+}
+
 #[cfg(test)]
 enum TestCmDestruction {
     Listener {
@@ -2803,6 +2937,9 @@ enum InboundState {
         selected: bool,
         reject: Option<InboundRejectReason>,
     },
+    Quarantined {
+        connection: Option<EstablishedConnectionRoute>,
+    },
     Transitioning,
 }
 
@@ -2813,6 +2950,9 @@ impl InboundState {
             Self::EstablishedAwaitingDelivery { connection, .. }
             | Self::Established { connection }
             | Self::Closing { connection, .. } => connection.token == token,
+            Self::Quarantined { connection } => connection
+                .as_ref()
+                .is_some_and(|connection| connection.token == token),
             Self::Transitioning => false,
         }
     }
@@ -2883,6 +3023,7 @@ impl OutboundRoute {
             | OutboundState::Disconnected { .. }
             | OutboundState::Failed { .. }
             | OutboundState::Closing { .. }
+            | OutboundState::Quarantined { .. }
             | OutboundState::Transitioning => None,
         }
     }
@@ -2905,6 +3046,7 @@ impl OutboundRoute {
                 | OutboundState::FailedAwaitingDelivery { .. }
                 | OutboundState::Failed { .. }
                 | OutboundState::Closing { .. }
+                | OutboundState::Quarantined { .. }
         )
     }
 
@@ -2995,6 +3137,9 @@ enum OutboundState {
     Closing {
         connection: EstablishedConnectionRoute,
     },
+    Quarantined {
+        connection: Option<EstablishedConnectionRoute>,
+    },
     Transitioning,
 }
 
@@ -3009,6 +3154,9 @@ impl OutboundState {
             | Self::FailedAwaitingDelivery { connection, .. }
             | Self::Failed { connection }
             | Self::Closing { connection } => connection.token == token,
+            Self::Quarantined { connection } => connection
+                .as_ref()
+                .is_some_and(|connection| connection.token == token),
             Self::AwaitAddr { .. } | Self::AwaitRoute { .. } | Self::Transitioning => false,
         }
     }

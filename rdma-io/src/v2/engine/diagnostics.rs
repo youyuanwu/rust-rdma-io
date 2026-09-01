@@ -263,7 +263,7 @@ pub struct RdmaEngineDiagnostics {
     pub qp_destroys: u64,
     /// Quarantined connections later recovered by exact CQE routing.
     pub quarantine_recoveries: u64,
-    /// Connection-local `ConnectionQuarantined` outcomes published.
+    /// Connection-local quarantine outcomes published.
     pub connection_quarantine_outcomes: u64,
     /// Graceful shutdown requests accepted by the admission barrier.
     pub shutdowns: u64,

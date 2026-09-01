@@ -391,11 +391,21 @@ impl ConnectionRegistry {
         &self,
         qp_num: u32,
         make: impl FnOnce(ConnectionToken) -> Arc<ConnectionState>,
-    ) -> Result<(ConnectionToken, Arc<ConnectionState>)> {
+    ) -> std::result::Result<(ConnectionToken, Arc<ConnectionState>), ConnectionRegistrationFailure>
+    {
         if qp_num == 0 {
-            return Err(Error::InvalidConfig("provider returned zero qp_num".into()));
+            return Err(ConnectionRegistrationFailure {
+                error: Error::InvalidConfig("provider returned zero qp_num".into()),
+                retained: None,
+            });
         }
-        let (token, state) = self.slots.allocate_with(make)?;
+        let (token, state) =
+            self.slots
+                .allocate_with(make)
+                .map_err(|error| ConnectionRegistrationFailure {
+                    error,
+                    retained: None,
+                })?;
         let mut index = lock_unpoison(&self.qp_index);
         match index.entry(qp_num) {
             std::collections::hash_map::Entry::Vacant(entry) => {
@@ -403,13 +413,17 @@ impl ConnectionRegistry {
             }
             std::collections::hash_map::Entry::Occupied(_) => {
                 drop(index);
-                self.slots.release(token, false);
-                return Err(Error::InvalidConfig(format!(
-                    "qp_num {qp_num} is already registered"
-                )));
+                return Err(ConnectionRegistrationFailure {
+                    error: Error::InvalidConfig(format!("qp_num {qp_num} is already registered")),
+                    retained: Some((token, state)),
+                });
             }
         }
         Ok((token, state))
+    }
+
+    pub(super) fn release_unindexed(&self, token: ConnectionToken) -> Option<Arc<ConnectionState>> {
+        self.slots.release(token, true)
     }
 
     pub(super) fn lookup(&self, token: ConnectionToken) -> Lookup<Arc<ConnectionState>> {
@@ -431,6 +445,16 @@ impl ConnectionRegistry {
         }
         drop(index);
         self.slots.release(token, true)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(super) fn detach_qp_index(&self, token: ConnectionToken, qp_num: u32) -> bool {
+        let mut index = lock_unpoison(&self.qp_index);
+        if index.get(&qp_num).copied() != Some(token) {
+            return false;
+        }
+        index.remove(&qp_num);
+        true
     }
 
     pub(super) fn live(&self) -> usize {
@@ -458,6 +482,11 @@ impl ConnectionRegistry {
     pub(super) fn set_qp_mapping_for_test(&self, qp_num: u32, token: ConnectionToken) {
         lock_unpoison(&self.qp_index).insert(qp_num, token);
     }
+}
+
+pub(super) struct ConnectionRegistrationFailure {
+    pub(super) error: Error,
+    pub(super) retained: Option<(ConnectionToken, Arc<ConnectionState>)>,
 }
 
 pub(super) fn lock_unpoison<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

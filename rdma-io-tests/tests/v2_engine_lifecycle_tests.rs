@@ -556,7 +556,7 @@ async fn run_qp_destroy_failure_quarantine(mode: CompletionMode) {
     server_resources
         .fail_next_connection_qp_destroy(&server)
         .unwrap();
-    let recorder = DestructionRecorder::arm(64);
+    let recorder = DestructionRecorder::arm(256);
 
     let close_error = tokio::time::timeout(Duration::from_secs(3), server.close())
         .await
@@ -584,6 +584,7 @@ async fn run_qp_destroy_failure_quarantine(mode: CompletionMode) {
     assert_eq!(diagnostics.quarantined_mrs, 1);
     assert_eq!(diagnostics.quarantined_bundles, 1);
     let events = recorder.snapshot();
+    assert!(!recorder.overflowed());
     assert_eq!(
         events
             .iter()
@@ -755,6 +756,287 @@ async fn run_driver_abort_with_accepted_wr(mode: CompletionMode) {
     drop(client);
     drop(listener);
     drop(server_engine);
+    drop(client_engine);
+}
+
+async fn exchange_byte(sender: &RdmaConnection, receiver: &RdmaConnection, value: u8) {
+    let recv = receiver
+        .register_memory(8, AccessIntent::LocalOnly)
+        .unwrap();
+    let mut send = sender.register_memory(8, AccessIntent::LocalOnly).unwrap();
+    send.as_mut_slice()[0] = value;
+    let ((recv_result, recv), (send_result, send)) =
+        tokio::join!(receiver.recv(recv, None), sender.send(send, None));
+    recv_result.unwrap();
+    send_result.unwrap();
+    assert_eq!(recv.unwrap().as_slice()[0], value);
+    drop(send);
+}
+
+async fn run_clean_retirement_destroy_quarantine(mode: CompletionMode) {
+    if !has_software_rdma() {
+        return;
+    }
+    let device = software_device_name().expect("software RDMA device");
+    let (server_engine, server_driver) = RdmaEngineBuilder::new(device.clone())
+        .completion_mode(mode)
+        .maximum_live_connections(4)
+        .maximum_inflight_operations(128)
+        .cq_capacity(128)
+        .connection_drain_deadline(Duration::from_millis(100))
+        .shutdown_deadline(Duration::from_millis(300))
+        .build()
+        .unwrap();
+    let (client_engine, client_driver) = RdmaEngineBuilder::new(device)
+        .completion_mode(mode)
+        .maximum_live_connections(4)
+        .maximum_inflight_operations(128)
+        .cq_capacity(128)
+        .connection_drain_deadline(Duration::from_millis(100))
+        .shutdown_deadline(Duration::from_millis(300))
+        .build()
+        .unwrap();
+    let server_resources = server_engine.test_resources().unwrap();
+    let server_task = tokio::spawn(server_driver);
+    let client_task = tokio::spawn(client_driver);
+    let listener = server_engine
+        .listen(
+            "0.0.0.0:0".parse().unwrap(),
+            RdmaListenerConfig::default().backlog(4),
+        )
+        .await
+        .unwrap();
+    let (failed_server, failed_client) = accept_pair(&listener, &client_engine).await;
+    let (healthy_server, healthy_client) = accept_pair(&listener, &client_engine).await;
+    server_resources
+        .fail_next_connection_qp_destroy(&failed_server)
+        .unwrap();
+    let recorder = DestructionRecorder::arm(256);
+
+    let close_error = tokio::time::timeout(Duration::from_secs(5), failed_server.close())
+        .await
+        .expect("clean retirement destroy failure did not publish")
+        .unwrap_err();
+    let Error::ConnectionDestroyQuarantined { cause } = close_error else {
+        panic!("unexpected clean retirement outcome: {close_error}");
+    };
+    assert!(cause.contains("Device or resource busy") || cause.contains("os error 16"));
+    let repeated = failed_server.close().await.unwrap_err();
+    assert!(matches!(
+        repeated,
+        Error::ConnectionDestroyQuarantined {
+            cause: ref repeated_cause
+        } if repeated_cause == &cause
+    ));
+
+    let diagnostics = server_engine.diagnostics();
+    assert!(diagnostics.terminal_error.is_none());
+    assert_eq!(diagnostics.quarantined_bundles, 1);
+    assert_eq!(diagnostics.live_connection_reservations, 2);
+    assert_eq!(diagnostics.draining_connection_reservations, 1);
+    assert_eq!(diagnostics.registered_live_qps, 1);
+    assert_eq!(diagnostics.free_connection_slots, 2);
+    assert_eq!(diagnostics.connections_quarantined, 1);
+    assert_eq!(diagnostics.connection_quarantine_outcomes, 1);
+    assert_eq!(diagnostics.qp_destroys, 0);
+    assert!(!server_task.is_finished());
+
+    exchange_byte(&healthy_client, &healthy_server, 0x5a).await;
+    assert!(!server_task.is_finished());
+    assert!(server_engine.diagnostics().terminal_error.is_none());
+
+    let events = recorder.snapshot();
+    assert!(!recorder.overflowed());
+    let failed_qps = events
+        .iter()
+        .filter(|event| {
+            event.kind == DestructionKind::QueuePair
+                && event.result.is_some_and(|result| result != 0)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(failed_qps.len(), 1);
+    assert!(!events.iter().any(|event| {
+        event.kind == DestructionKind::QueuePair
+            && event.address == failed_qps[0].address
+            && event.result == Some(0)
+    }));
+
+    healthy_server.close().await.unwrap();
+    healthy_client.close().await.unwrap();
+    drop(failed_client);
+    listener.close().await.unwrap();
+    assert!(matches!(
+        server_engine.shutdown().await,
+        Err(Error::EngineWedged {
+            retained_bundles: 1,
+            outstanding_operations: 0,
+            cq_debt: 0
+        })
+    ));
+    assert!(matches!(
+        server_task.await.unwrap(),
+        Err(Error::EngineWedged {
+            retained_bundles: 1,
+            outstanding_operations: 0,
+            cq_debt: 0
+        })
+    ));
+    client_engine.shutdown().await.unwrap();
+    client_task.await.unwrap().unwrap();
+}
+
+async fn run_setup_rollback_destroy_quarantines(mode: CompletionMode) {
+    if !has_software_rdma() {
+        return;
+    }
+    let device = software_device_name().expect("software RDMA device");
+    let (server_engine, server_driver) = RdmaEngineBuilder::new(device.clone())
+        .completion_mode(mode)
+        .maximum_live_connections(4)
+        .maximum_inflight_operations(128)
+        .cq_capacity(128)
+        .connection_drain_deadline(Duration::from_millis(100))
+        .shutdown_deadline(Duration::from_millis(300))
+        .build()
+        .unwrap();
+    let (client_engine, client_driver) = RdmaEngineBuilder::new(device)
+        .completion_mode(mode)
+        .maximum_live_connections(4)
+        .maximum_inflight_operations(128)
+        .cq_capacity(128)
+        .connection_drain_deadline(Duration::from_millis(100))
+        .shutdown_deadline(Duration::from_millis(300))
+        .build()
+        .unwrap();
+    let server_resources = server_engine.test_resources().unwrap();
+    let client_resources = client_engine.test_resources().unwrap();
+    let server_task = tokio::spawn(server_driver);
+    let client_task = tokio::spawn(client_driver);
+    let listener = server_engine
+        .listen(
+            "0.0.0.0:0".parse().unwrap(),
+            RdmaListenerConfig::default().backlog(4),
+        )
+        .await
+        .unwrap();
+    let address = connect_addr_for(Some(listener.local_addr().unwrap()));
+    let recorder = DestructionRecorder::arm(256);
+
+    let outbound_original = "injected outbound installation failure";
+    client_resources
+        .fail_next_setup_rollback_qp_destroy(Error::InvalidConfig(outbound_original.into()))
+        .unwrap();
+    let outbound_error = match client_engine.connect(address).await {
+        Ok(_) => panic!("outbound setup rollback unexpectedly succeeded"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        outbound_error,
+        Error::InvalidConfig(ref message) if message == outbound_original
+    ));
+    wait_until("outbound rollback quarantine was not published", || {
+        let diagnostics = client_engine.diagnostics();
+        diagnostics.quarantined_bundles == 1
+            && diagnostics.live_connection_reservations == 1
+            && diagnostics.establishing_connection_reservations == 0
+            && diagnostics.free_connection_slots == 3
+    })
+    .await;
+    assert!(!client_task.is_finished());
+    assert!(client_engine.diagnostics().terminal_error.is_none());
+
+    let inbound_original = "injected inbound installation failure";
+    server_resources
+        .fail_next_setup_rollback_qp_destroy(Error::InvalidConfig(inbound_original.into()))
+        .unwrap();
+    let failed_client_task = tokio::spawn({
+        let client_engine = client_engine.clone();
+        async move { client_engine.connect(address).await }
+    });
+    let inbound_error = match tokio::time::timeout(Duration::from_secs(10), listener.accept())
+        .await
+        .expect("inbound rollback failure did not complete accept")
+    {
+        Ok(_) => panic!("inbound setup rollback unexpectedly succeeded"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        inbound_error,
+        Error::InvalidConfig(ref message) if message == inbound_original
+    ));
+    failed_client_task.abort();
+    let _ = failed_client_task.await;
+    wait_until("inbound rollback quarantine was not published", || {
+        let diagnostics = server_engine.diagnostics();
+        diagnostics.quarantined_bundles == 1
+            && diagnostics.live_connection_reservations == 1
+            && diagnostics.establishing_connection_reservations == 0
+            && diagnostics.free_connection_slots == 3
+    })
+    .await;
+    assert!(!server_task.is_finished());
+    assert!(server_engine.diagnostics().terminal_error.is_none());
+
+    let (healthy_server, healthy_client) = accept_pair(&listener, &client_engine).await;
+    exchange_byte(&healthy_client, &healthy_server, 0xa5).await;
+    let server_diagnostics = server_engine.diagnostics();
+    assert!(server_diagnostics.terminal_error.is_none());
+    assert_eq!(server_diagnostics.quarantined_bundles, 1);
+    assert_eq!(server_diagnostics.free_connection_slots, 2);
+    assert_eq!(server_diagnostics.live_connection_reservations, 2);
+    assert_eq!(server_diagnostics.retired_connection_slots, 0);
+    assert!(!server_task.is_finished());
+    let client_diagnostics = client_engine.diagnostics();
+    assert!(client_diagnostics.terminal_error.is_none());
+    assert_eq!(client_diagnostics.quarantined_bundles, 1);
+    assert_eq!(client_diagnostics.free_connection_slots, 1);
+    assert!(client_diagnostics.live_connection_reservations >= 3);
+    assert_eq!(client_diagnostics.retired_connection_slots, 0);
+    assert!(!client_task.is_finished());
+
+    let events = recorder.snapshot();
+    assert!(!recorder.overflowed());
+    let failed_qps = events
+        .iter()
+        .filter(|event| {
+            event.kind == DestructionKind::QueuePair
+                && event.result.is_some_and(|result| result != 0)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(failed_qps.len(), 2);
+    for failed in failed_qps {
+        assert!(!events.iter().any(|event| {
+            event.kind == DestructionKind::QueuePair
+                && event.address == failed.address
+                && event.result == Some(0)
+        }));
+    }
+
+    healthy_server.close().await.unwrap();
+    healthy_client.close().await.unwrap();
+    listener.close().await.unwrap();
+    let server_shutdown = server_engine.shutdown().await;
+    assert!(
+        matches!(
+            server_shutdown,
+            Err(Error::EngineWedged {
+                retained_bundles: 1,
+                outstanding_operations: 0,
+                cq_debt: 0
+            })
+        ),
+        "unexpected server shutdown outcome: {server_shutdown:?}"
+    );
+    assert!(matches!(
+        server_task.await.unwrap(),
+        Err(Error::EngineWedged {
+            retained_bundles: 1,
+            outstanding_operations: 0,
+            cq_debt: 0
+        })
+    ));
+    client_task.abort();
+    let _ = client_task.await;
     drop(client_engine);
 }
 
@@ -988,6 +1270,18 @@ async fn held_real_cqe_uses_qp_destroy_for_clean_shutdown_in_both_modes() {
 async fn result_aware_qp_destroy_failure_quarantines_mr_and_debt_in_both_modes() {
     run_qp_destroy_failure_quarantine(CompletionMode::Readiness).await;
     run_qp_destroy_failure_quarantine(CompletionMode::Polling).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn clean_retirement_destroy_failure_is_connection_local_in_both_modes() {
+    run_clean_retirement_destroy_quarantine(CompletionMode::Readiness).await;
+    run_clean_retirement_destroy_quarantine(CompletionMode::Polling).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn setup_rollback_destroy_failures_preserve_primary_errors_in_both_modes() {
+    run_setup_rollback_destroy_quarantines(CompletionMode::Readiness).await;
+    run_setup_rollback_destroy_quarantines(CompletionMode::Polling).await;
 }
 
 #[test_log::test(tokio::test(flavor = "current_thread"))]

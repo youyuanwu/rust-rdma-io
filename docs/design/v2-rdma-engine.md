@@ -167,7 +167,7 @@ observe the same engine-wide outcome.
 `NoDevices`, `DeviceNotFound`, `Verbs`, `InvalidConfig`, `PostFailed`,
 `CompletionError`, `WouldBlock`, `MessageTooLarge`, `TransportClosed`,
 `DriverShutdown`, `CapacityExhausted`, `ConnectionQuarantined`,
-`EngineWedged`, and `ProtocolViolation`.
+`ConnectionDestroyQuarantined`, `EngineWedged`, and `ProtocolViolation`.
 
 ### Listener API
 
@@ -499,6 +499,15 @@ registrations, and CQ debt and publishes connection quarantine instead.
 for inability to establish the synchronous QP-destruction boundary, ambiguous
 ownership, or another connection-local retirement wedge. It is not the normal
 result of provider-omitted flush CQEs.
+
+If result-aware destruction fails after the accepted set is already empty,
+retirement enters terminal retained quarantine and `close()` returns
+`ConnectionDestroyQuarantined` without failing the shared driver. The
+connection registry generation, admission reservation, QP, and CM ID remain
+owned and cannot be reused. A pre-registration setup rollback applies the same
+retention to its establishing reservation and CM route, but the connect or
+accept caller still receives the original setup error; the destroy failure is
+reported separately through diagnostics and warning logs.
 
 Accepted-set/operation-registry mismatches are defensive corruption guards:
 normal production posting and completion mutate both on the sole driver. If a

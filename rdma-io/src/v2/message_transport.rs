@@ -2219,8 +2219,9 @@ impl MessageTransport {
     /// Repeated calls observe the same connection close outcome. Provider
     /// omission of flush CQEs is resolved by synchronous owning-QP destruction
     /// before MR reclamation. [`Error::ConnectionQuarantined`] is reserved for
-    /// inability to establish that boundary or another connection-local
-    /// retirement wedge; an engine-wide terminal drain failure returns
+    /// inability to establish that boundary, while
+    /// [`Error::ConnectionDestroyQuarantined`] reports a failed clean
+    /// retirement destroy; an engine-wide terminal drain failure returns
     /// [`Error::EngineWedged`]. A peer disconnect observed before this call is
     /// returned as [`Error::TransportClosed`]; only flush errors produced by
     /// the locally initiated close are normalized to success.
