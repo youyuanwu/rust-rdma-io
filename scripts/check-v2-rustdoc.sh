@@ -6,6 +6,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CARGO="${CARGO:-cargo}"
 NO_HOOKS_TARGET="$ROOT/target/v2-rustdoc/no-hooks"
 ALL_FEATURES_TARGET="$ROOT/target/v2-rustdoc/all-features"
+MANIFEST="$ROOT/rdma-io-tests/tests/fixtures/v2_rustdoc_manifest.tsv"
 
 RUSTDOCFLAGS="-D warnings" CARGO_TARGET_DIR="$NO_HOOKS_TARGET" \
     "$CARGO" doc --quiet -p rdma-io --no-default-features --features tokio --no-deps
@@ -18,55 +19,43 @@ if [[ ! -f "$DOC/index.html" ]]; then
     exit 1
 fi
 
-anchors=(
-    "index.html"
-    "enum.Error.html"
-    "struct.Context.html"
-    "struct.Pd.html"
-    "enum.AccessIntent.html"
-    "struct.Mr.html"
-    "struct.RemoteMr.html"
-    "struct.CqBuilder.html"
-    "struct.Cq.html"
-    "struct.Completions.html"
-    "type.TokioCompletions.html"
-    "struct.CqPoller.html"
-    "struct.QpBuilder.html"
-    "struct.Qp.html"
-    "struct.Completion.html"
-    "struct.RdmaEngineBuilder.html"
-    "struct.RdmaEngineDiagnostics.html"
-    "struct.RdmaConnectionIdentity.html"
-)
+if [[ ! -f "$MANIFEST" ]]; then
+    echo "missing rustdoc manifest: $MANIFEST" >&2
+    exit 1
+fi
 
-for anchor in "${anchors[@]}"; do
-    page="$DOC/$anchor"
-    if [[ ! -f "$page" ]]; then
-        echo "missing rendered V2 documentation anchor: $anchor" >&2
-        exit 1
-    fi
-    for marker in "Use case" "Ownership and progress" "Safety and limits" "Availability"; do
-        set +e
-        grep -F "$marker" "$page" >/dev/null
-        marker_status=$?
-        set -e
-        if [[ "$marker_status" -ne 0 ]]; then
-            echo "rendered anchor $anchor is missing marker '$marker'" >&2
+while IFS='|' read -r disposition key source item rendered; do
+    [[ -n "$disposition" ]] || continue
+    case "$disposition" in
+        anchor)
+            page="$DOC/$rendered"
+            if [[ ! -f "$page" ]]; then
+                echo "missing rendered V2 documentation anchor $key: $rendered" >&2
+                exit 1
+            fi
+            for marker in "Use case" "Ownership and progress" "Safety and limits" "Availability"; do
+                set +e
+                grep -F "$marker" "$page" >/dev/null
+                marker_status=$?
+                set -e
+                if [[ "$marker_status" -ne 0 ]]; then
+                    echo "rendered anchor $key ($rendered) is missing marker '$marker'" >&2
+                    exit 1
+                fi
+            done
+            ;;
+        removed)
+            if [[ -e "$DOC/$rendered" ]]; then
+                echo "removed/internalized V2 rustdoc page remains: $rendered" >&2
+                exit 1
+            fi
+            ;;
+        *)
+            echo "invalid rustdoc manifest disposition '$disposition'" >&2
             exit 1
-        fi
-    done
-done
-
-for removed_page in \
-    context/index.html cq/index.html error/index.html mr/index.html op/index.html \
-    pd/index.html qp/index.html completion/index.html cq_poller/index.html \
-    engine/index.html message_transport/index.html protocol/index.html \
-    struct.Op.html enum.OpCode.html; do
-    if [[ -e "$DOC/$removed_page" ]]; then
-        echo "removed/internalized V2 rustdoc page remains: $removed_page" >&2
-        exit 1
-    fi
-done
+            ;;
+    esac
+done <"$MANIFEST"
 
 for profile in "$NO_HOOKS_TARGET" "$ALL_FEATURES_TARGET"; do
     set +e

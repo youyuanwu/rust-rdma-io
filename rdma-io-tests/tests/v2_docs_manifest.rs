@@ -1,89 +1,21 @@
 //! Stable source-documentation anchor checks for retained V2 production units.
 
+#[allow(dead_code)]
+#[path = "fixtures/v2_surface_manifest.rs"]
+mod manifest;
+
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use syn::{Attribute, Item};
 
-struct Anchor {
-    file: &'static str,
-    item: Option<&'static str>,
+struct Anchor<'a> {
+    key: &'a str,
+    file: &'a str,
+    item: Option<&'a str>,
+    rendered: &'a str,
 }
-
-const ANCHORS: &[Anchor] = &[
-    Anchor {
-        file: "mod.rs",
-        item: None,
-    },
-    Anchor {
-        file: "error.rs",
-        item: Some("Error"),
-    },
-    Anchor {
-        file: "context.rs",
-        item: Some("Context"),
-    },
-    Anchor {
-        file: "pd.rs",
-        item: Some("Pd"),
-    },
-    Anchor {
-        file: "mr.rs",
-        item: Some("AccessIntent"),
-    },
-    Anchor {
-        file: "mr.rs",
-        item: Some("Mr"),
-    },
-    Anchor {
-        file: "mr.rs",
-        item: Some("RemoteMr"),
-    },
-    Anchor {
-        file: "cq.rs",
-        item: Some("CqBuilder"),
-    },
-    Anchor {
-        file: "cq.rs",
-        item: Some("Cq"),
-    },
-    Anchor {
-        file: "completion.rs",
-        item: Some("Completions"),
-    },
-    Anchor {
-        file: "tokio_support.rs",
-        item: Some("TokioCompletions"),
-    },
-    Anchor {
-        file: "cq_poller.rs",
-        item: Some("CqPoller"),
-    },
-    Anchor {
-        file: "qp.rs",
-        item: Some("QpBuilder"),
-    },
-    Anchor {
-        file: "qp.rs",
-        item: Some("Qp"),
-    },
-    Anchor {
-        file: "op.rs",
-        item: Some("Completion"),
-    },
-    Anchor {
-        file: "engine/mod.rs",
-        item: Some("RdmaEngineBuilder"),
-    },
-    Anchor {
-        file: "engine/diagnostics.rs",
-        item: Some("RdmaEngineDiagnostics"),
-    },
-    Anchor {
-        file: "engine/connection.rs",
-        item: Some("RdmaConnectionIdentity"),
-    },
-];
 
 fn source_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -122,9 +54,51 @@ fn item_name(item: &Item) -> Option<String> {
     }
 }
 
+fn anchors() -> Vec<Anchor<'static>> {
+    manifest::RUSTDOC_MANIFEST
+        .lines()
+        .filter_map(|line| {
+            let columns = line.split('|').collect::<Vec<_>>();
+            match columns.as_slice() {
+                ["anchor", key, file, item, rendered] => Some(Anchor {
+                    key,
+                    file,
+                    item: (*item != "-").then_some(*item),
+                    rendered,
+                }),
+                ["removed", "-", "-", "-", _] => None,
+                _ => panic!("invalid rustdoc manifest row: {line}"),
+            }
+        })
+        .collect()
+}
+
 #[test]
 fn every_retained_anchor_has_all_four_literal_sections() {
-    for anchor in ANCHORS {
+    let anchors = anchors();
+    let keys = anchors
+        .iter()
+        .map(|anchor| anchor.key)
+        .collect::<BTreeSet<_>>();
+    for unit in manifest::UNITS.iter().filter(|unit| {
+        unit.disposition == manifest::Disposition::Retain
+            && matches!(
+                unit.domain,
+                manifest::Domain::Signature | manifest::Domain::Module
+            )
+            && unit.id != "M-017"
+    }) {
+        let key = unit
+            .doc_anchor
+            .expect("retained production unit doc anchor");
+        assert!(
+            keys.contains(key),
+            "{} references unknown documentation anchor {key}",
+            unit.id
+        );
+    }
+
+    for anchor in &anchors {
         let path = source_root().join(anchor.file);
         let parsed = syn::parse_file(
             &fs::read_to_string(&path)
@@ -163,6 +137,11 @@ fn every_retained_anchor_has_all_four_literal_sections() {
                 anchor.item
             );
         }
+        assert!(
+            !anchor.rendered.is_empty(),
+            "{} must name a rendered rustdoc page",
+            anchor.key
+        );
     }
 }
 

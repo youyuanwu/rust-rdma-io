@@ -361,11 +361,17 @@ async fn run_missing_cqe_recovery(mode: CompletionMode) {
     )
     .await;
     assert_eq!(server_engine.diagnostics().quarantine_recoveries, 1);
-    assert!(
-        recorder.snapshot().iter().any(|event| {
-            event.kind == DestructionKind::MemoryRegion && event.result == Some(0)
-        })
+    let after_recovery = recorder.snapshot();
+    let mr_events = after_recovery
+        .iter()
+        .filter(|event| event.kind == DestructionKind::MemoryRegion)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        mr_events.len(),
+        1,
+        "with the completed send MR retained, recovery must deregister exactly the quarantined receive MR"
     );
+    assert_eq!(mr_events[0].result, Some(0));
     let repeated = server.close().await.unwrap_err();
     assert!(matches!(
         repeated,
@@ -376,6 +382,15 @@ async fn run_missing_cqe_recovery(mode: CompletionMode) {
     ));
 
     drop(returned_send);
+    assert_eq!(
+        recorder
+            .snapshot()
+            .iter()
+            .filter(|event| event.kind == DestructionKind::MemoryRegion)
+            .count(),
+        2,
+        "dropping the retained send MR must produce the next distinct deregistration"
+    );
     client.close().await.unwrap();
     listener.close().await.unwrap();
     let (server_shutdown, client_shutdown) =

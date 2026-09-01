@@ -14,6 +14,28 @@ pub enum Disposition {
     Consolidate,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SurfaceProfile {
+    Core,
+    Production,
+    Hooks,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct MethodSet {
+    pub profile: SurfaceProfile,
+    pub type_name: &'static str,
+    pub modules: &'static [&'static str],
+    pub methods: &'static [&'static str],
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TraitImplSelector {
+    pub module: &'static str,
+    pub self_type: &'static str,
+    pub trait_path: &'static str,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Unit {
     pub id: &'static str,
@@ -563,6 +585,354 @@ pub const UNITS: &[Unit] = &[
         "no alternate builders"
     ),
 ];
+
+const LOW_LEVEL_MODULES: &[&str] = &[
+    "v2/context.rs",
+    "v2/cq.rs",
+    "v2/mr.rs",
+    "v2/pd.rs",
+    "v2/qp.rs",
+    "v2/op.rs",
+    "v2/completion.rs",
+    "v2/cq_poller.rs",
+    "v2/tokio_support.rs",
+];
+
+const CORE_LOW_LEVEL_MODULES: &[&str] = &[
+    "v2/context.rs",
+    "v2/cq.rs",
+    "v2/mr.rs",
+    "v2/pd.rs",
+    "v2/qp.rs",
+    "v2/op.rs",
+];
+
+pub const METHOD_SETS: &[MethodSet] = &[
+    MethodSet {
+        profile: SurfaceProfile::Core,
+        type_name: "Context",
+        modules: CORE_LOW_LEVEL_MODULES,
+        methods: &["alloc_pd", "open_by_name", "open_first"],
+    },
+    MethodSet {
+        profile: SurfaceProfile::Core,
+        type_name: "Cq",
+        modules: CORE_LOW_LEVEL_MODULES,
+        methods: &["fd", "has_channel", "poll"],
+    },
+    MethodSet {
+        profile: SurfaceProfile::Production,
+        type_name: "Context",
+        modules: LOW_LEVEL_MODULES,
+        methods: &["alloc_pd", "open_by_name", "open_first"],
+    },
+    MethodSet {
+        profile: SurfaceProfile::Production,
+        type_name: "Pd",
+        modules: LOW_LEVEL_MODULES,
+        methods: &["reg_mr"],
+    },
+    MethodSet {
+        profile: SurfaceProfile::Production,
+        type_name: "CqBuilder",
+        modules: LOW_LEVEL_MODULES,
+        methods: &["build", "new", "with_channel"],
+    },
+    MethodSet {
+        profile: SurfaceProfile::Production,
+        type_name: "Cq",
+        modules: LOW_LEVEL_MODULES,
+        methods: &["completions_tokio", "fd", "has_channel", "poll"],
+    },
+    MethodSet {
+        profile: SurfaceProfile::Production,
+        type_name: "Mr",
+        modules: LOW_LEVEL_MODULES,
+        methods: &[
+            "addr",
+            "as_mut_slice",
+            "as_slice",
+            "is_empty",
+            "len",
+            "lkey",
+            "rkey",
+            "to_remote",
+        ],
+    },
+    MethodSet {
+        profile: SurfaceProfile::Production,
+        type_name: "RemoteMr",
+        modules: LOW_LEVEL_MODULES,
+        methods: &[],
+    },
+    MethodSet {
+        profile: SurfaceProfile::Production,
+        type_name: "QpBuilder",
+        modules: LOW_LEVEL_MODULES,
+        methods: &[
+            "build_with_cm",
+            "max_recv_sge",
+            "max_recv_wr",
+            "max_send_sge",
+            "max_send_wr",
+            "new",
+            "sq_sig_all",
+        ],
+    },
+    MethodSet {
+        profile: SurfaceProfile::Production,
+        type_name: "Qp",
+        modules: LOW_LEVEL_MODULES,
+        methods: &[
+            "post_read",
+            "post_recv",
+            "post_send",
+            "post_write",
+            "qp_num",
+            "to_error",
+        ],
+    },
+    MethodSet {
+        profile: SurfaceProfile::Production,
+        type_name: "Completion",
+        modules: LOW_LEVEL_MODULES,
+        methods: &[
+            "byte_len",
+            "is_success",
+            "opcode",
+            "qp_num",
+            "result",
+            "status",
+            "vendor_err",
+            "wr_id",
+        ],
+    },
+    MethodSet {
+        profile: SurfaceProfile::Production,
+        type_name: "Completions",
+        modules: LOW_LEVEL_MODULES,
+        methods: &["cq", "new", "next"],
+    },
+    MethodSet {
+        profile: SurfaceProfile::Production,
+        type_name: "CqPoller",
+        modules: LOW_LEVEL_MODULES,
+        methods: &["cq", "new", "poll_completions", "wake"],
+    },
+    MethodSet {
+        profile: SurfaceProfile::Production,
+        type_name: "RdmaConnectionConfig",
+        modules: &["v2/engine/config.rs"],
+        methods: &[
+            "initiator_depth",
+            "max_recv_sge",
+            "max_recv_wr",
+            "max_send_sge",
+            "max_send_wr",
+            "responder_resources",
+            "retry_count",
+            "rnr_retry_count",
+        ],
+    },
+    MethodSet {
+        profile: SurfaceProfile::Production,
+        type_name: "RdmaConnectionIdentity",
+        modules: &["v2/engine/connection.rs"],
+        methods: &["qp_num"],
+    },
+    MethodSet {
+        profile: SurfaceProfile::Production,
+        type_name: "MessageTransport",
+        modules: &["v2/message_transport.rs"],
+        methods: &["close", "ready", "recv", "send"],
+    },
+    MethodSet {
+        profile: SurfaceProfile::Hooks,
+        type_name: "TestEngineResources",
+        modules: &["v2/engine/driver.rs"],
+        methods: &[
+            "context_identity",
+            "create_qp",
+            "disconnect_connection",
+            "inject_completion",
+            "inject_driver_failure",
+            "install_connection",
+            "install_idle_connections",
+            "install_route",
+            "instrumentation",
+            "pause_next_connect_before_enqueue",
+            "pause_next_cq_arm_window",
+            "pause_next_cq_pre_arm_window",
+            "pause_next_operation_before_register",
+            "pause_ready_work",
+            "provider_limits",
+            "register_memory",
+            "require_context",
+            "suppress_next_connection_cqe",
+            "suppress_next_connection_cqe_with_opcode",
+            "transition_connection_to_error",
+        ],
+    },
+    MethodSet {
+        profile: SurfaceProfile::Hooks,
+        type_name: "TestProviderLimits",
+        modules: &["v2/engine/driver.rs"],
+        methods: &[
+            "max_cqe",
+            "max_qp",
+            "max_qp_init_rd_atom",
+            "max_qp_rd_atom",
+            "max_qp_wr",
+            "max_sge",
+        ],
+    },
+    MethodSet {
+        profile: SurfaceProfile::Hooks,
+        type_name: "TestRouteHandle",
+        modules: &["v2/engine/driver.rs"],
+        methods: &[
+            "accepted_outstanding",
+            "completions",
+            "qp",
+            "qp_num",
+            "remove",
+            "retain",
+            "retain_until_completion",
+            "suppress_next",
+            "wait_for_completion_count",
+            "wait_until_drained",
+        ],
+    },
+];
+
+pub const PRODUCTION_EXPORTS: &[&str] = &[
+    "AccessIntent",
+    "Completion",
+    "CompletionMode",
+    "Completions",
+    "Context",
+    "Cq",
+    "CqBuilder",
+    "CqNotifier",
+    "CqPoller",
+    "Error",
+    "MessageTransport",
+    "MessageTransportBuilder",
+    "Mr",
+    "Pd",
+    "Qp",
+    "QpBuilder",
+    "RdmaConnection",
+    "RdmaConnectionConfig",
+    "RdmaConnectionDiagnostics",
+    "RdmaConnectionIdentity",
+    "RdmaEngine",
+    "RdmaEngineBuilder",
+    "RdmaEngineDiagnostics",
+    "RdmaEngineDriver",
+    "RdmaEngineLifecycle",
+    "RdmaEngineTerminalError",
+    "RdmaListener",
+    "RdmaListenerConfig",
+    "RdmaListenerDiagnostics",
+    "RdmaOperation",
+    "ReceivedMessage",
+    "RemoteMr",
+    "Result",
+    "TokioCompletions",
+];
+
+pub const HOOK_EXPORTS: &[&str] = &[
+    "DestructionEvent",
+    "DestructionKind",
+    "DestructionRecorder",
+    "RecorderArmError",
+    "TestAcceptedOperation",
+    "TestAdmissionBarrier",
+    "TestConnectionCqeSuppression",
+    "TestContextIdentity",
+    "TestCqArmWindowControl",
+    "TestCqeSuppression",
+    "TestEngineInstrumentation",
+    "TestEngineQp",
+    "TestEngineResources",
+    "TestHelloAttachHook",
+    "TestHelloOverride",
+    "TestProviderLimits",
+    "TestReadyWorkControl",
+    "TestRouteHandle",
+    "TestSteadyFrame",
+];
+
+pub const REMOVED_ARCHITECTURE_TYPES: &[&str] = &[
+    "AcceptResult",
+    "CloseOutcome",
+    "EngineFailure",
+    "EngineOutcome",
+    "ListenResult",
+    "ListenerCloseOutcome",
+    "OutboundResult",
+    "Op",
+    "OpCode",
+    "TestCompletionIdentity",
+    "TestRegistryProbe",
+];
+
+pub const RETAINED_ARCHITECTURE_TYPES: &[&str] = &[
+    "TakeOnceResult",
+    "MemoizedTerminalResult",
+    "PollState",
+    "FutureState",
+    "OperationLifecycle",
+    "BatchPostOutcome",
+    "InternalPreparedBatch",
+    "PreparedBatchOwnership",
+    "CompletionDisposition",
+    "DetachedOperationCompletion",
+    "StartResult",
+    "BatchOwnershipTransfer",
+    "ReservationState",
+    "SelectedAccept",
+    "InboundState",
+    "OutboundState",
+    "ConnectionCmOwner",
+    "EngineMessageEvent",
+    "EngineSendRequestAction",
+    "PagedRegistry",
+    "SlotState",
+    "ConnectionRegistry",
+    "OperationRegistry",
+    "OperationState",
+    "QuarantineTransition",
+    "QuarantineKey",
+    "ContextRoute",
+    "CmDispatchRoute",
+    "EventDisposition",
+    "RouteRetirement",
+    "PendingCmDestruction",
+    "ListenerQueues",
+];
+
+pub const TRAIT_IMPL_REMOVALS: &[TraitImplSelector] = &[
+    TraitImplSelector {
+        module: "v2/error.rs",
+        self_type: "Error",
+        trait_path: "From<crate::Error>",
+    },
+    TraitImplSelector {
+        module: "v2/op.rs",
+        self_type: "Completion",
+        trait_path: "From<WorkCompletion>",
+    },
+    TraitImplSelector {
+        module: "v2/op.rs",
+        self_type: "Completion",
+        trait_path: "AsRef<WorkCompletion>",
+    },
+];
+
+pub const API_FIXTURE_MANIFEST: &str = include_str!("v2_api_fixture_manifest.tsv");
+pub const RUSTDOC_MANIFEST: &str = include_str!("v2_rustdoc_manifest.tsv");
 
 pub const BASELINE_MODULES: &[&str] = &[
     "v2/mod.rs",

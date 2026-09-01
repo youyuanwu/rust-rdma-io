@@ -7,9 +7,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use manifest::{Disposition, Domain, FINAL_MODULES, UNITS};
+use manifest::{
+    Disposition, Domain, FINAL_MODULES, HOOK_EXPORTS, METHOD_SETS, PRODUCTION_EXPORTS,
+    REMOVED_ARCHITECTURE_TYPES, RETAINED_ARCHITECTURE_TYPES, SurfaceProfile, TRAIT_IMPL_REMOVALS,
+    UNITS,
+};
+use syn::parse::Parser;
 use syn::visit::Visit;
-use syn::{ImplItem, Item, Type, UseTree, Visibility};
+use syn::{
+    Attribute, Expr, GenericArgument, ImplItem, Item, Lit, Meta, PathArguments, Type, UseTree,
+    Visibility,
+};
 
 fn workspace() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -35,6 +43,144 @@ fn is_public(visibility: &Visibility) -> bool {
     matches!(visibility, Visibility::Public(_))
 }
 
+#[derive(Clone, Copy)]
+struct CfgProfile {
+    test: bool,
+    async_feature: bool,
+    tokio: bool,
+    test_hooks: bool,
+    panic_unwind: bool,
+}
+
+impl From<SurfaceProfile> for CfgProfile {
+    fn from(profile: SurfaceProfile) -> Self {
+        match profile {
+            SurfaceProfile::Core => Self {
+                test: false,
+                async_feature: false,
+                tokio: false,
+                test_hooks: false,
+                panic_unwind: true,
+            },
+            SurfaceProfile::Production => Self {
+                test: false,
+                async_feature: true,
+                tokio: true,
+                test_hooks: false,
+                panic_unwind: true,
+            },
+            SurfaceProfile::Hooks => Self {
+                test: false,
+                async_feature: true,
+                tokio: true,
+                test_hooks: true,
+                panic_unwind: true,
+            },
+        }
+    }
+}
+
+fn cfg_meta_enabled(meta: &Meta, profile: CfgProfile) -> bool {
+    match meta {
+        Meta::Path(path) if path.is_ident("test") => profile.test,
+        Meta::Path(path) if path.is_ident("unix") => true,
+        Meta::Path(_) => true,
+        Meta::NameValue(value) if value.path.is_ident("feature") => {
+            let Expr::Lit(literal) = &value.value else {
+                panic!("cfg(feature) must use a string literal");
+            };
+            let Lit::Str(feature) = &literal.lit else {
+                panic!("cfg(feature) must use a string literal");
+            };
+            match feature.value().as_str() {
+                "async" => profile.async_feature,
+                "tokio" => profile.tokio,
+                "test-hooks" => profile.test_hooks,
+                other => panic!("unhandled V2 feature predicate: {other}"),
+            }
+        }
+        Meta::NameValue(value) if value.path.is_ident("panic") => {
+            let Expr::Lit(literal) = &value.value else {
+                panic!("cfg(panic) must use a string literal");
+            };
+            let Lit::Str(strategy) = &literal.lit else {
+                panic!("cfg(panic) must use a string literal");
+            };
+            match strategy.value().as_str() {
+                "unwind" => profile.panic_unwind,
+                "abort" => !profile.panic_unwind,
+                other => panic!("unhandled panic strategy: {other}"),
+            }
+        }
+        Meta::NameValue(_) => true,
+        Meta::List(list) => {
+            let nested = syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated
+                .parse2(list.tokens.clone())
+                .unwrap_or_else(|error| panic!("invalid cfg predicate: {error}"));
+            if list.path.is_ident("all") {
+                nested.iter().all(|meta| cfg_meta_enabled(meta, profile))
+            } else if list.path.is_ident("any") {
+                nested.iter().any(|meta| cfg_meta_enabled(meta, profile))
+            } else if list.path.is_ident("not") {
+                assert_eq!(nested.len(), 1, "cfg(not) requires one predicate");
+                !cfg_meta_enabled(&nested[0], profile)
+            } else {
+                true
+            }
+        }
+    }
+}
+
+fn cfg_enabled(attributes: &[Attribute], profile: CfgProfile) -> bool {
+    attributes
+        .iter()
+        .filter(|attribute| attribute.path().is_ident("cfg"))
+        .all(|attribute| {
+            let Meta::List(list) = &attribute.meta else {
+                panic!("cfg attribute must be a predicate list");
+            };
+            let predicate = syn::parse2::<Meta>(list.tokens.clone())
+                .unwrap_or_else(|error| panic!("invalid cfg attribute: {error}"));
+            cfg_meta_enabled(&predicate, profile)
+        })
+}
+
+fn item_attributes(item: &Item) -> &[Attribute] {
+    match item {
+        Item::Const(item) => &item.attrs,
+        Item::Enum(item) => &item.attrs,
+        Item::ExternCrate(item) => &item.attrs,
+        Item::Fn(item) => &item.attrs,
+        Item::ForeignMod(item) => &item.attrs,
+        Item::Impl(item) => &item.attrs,
+        Item::Macro(item) => &item.attrs,
+        Item::Mod(item) => &item.attrs,
+        Item::Static(item) => &item.attrs,
+        Item::Struct(item) => &item.attrs,
+        Item::Trait(item) => &item.attrs,
+        Item::TraitAlias(item) => &item.attrs,
+        Item::Type(item) => &item.attrs,
+        Item::Union(item) => &item.attrs,
+        Item::Use(item) => &item.attrs,
+        Item::Verbatim(_) => &[],
+        _ => &[],
+    }
+}
+
+fn walk_enabled_items(items: &[Item], profile: CfgProfile, visit: &mut impl FnMut(&Item)) {
+    for item in items {
+        if !cfg_enabled(item_attributes(item), profile) {
+            continue;
+        }
+        visit(item);
+        if let Item::Mod(module) = item
+            && let Some((_, nested)) = &module.content
+        {
+            walk_enabled_items(nested, profile, visit);
+        }
+    }
+}
+
 fn use_names(tree: &UseTree, names: &mut BTreeSet<String>) {
     match tree {
         UseTree::Path(path) => use_names(&path.tree, names),
@@ -53,69 +199,64 @@ fn use_names(tree: &UseTree, names: &mut BTreeSet<String>) {
     }
 }
 
-fn public_reexports(relative: &str) -> BTreeSet<String> {
-    parse(relative)
-        .items
-        .iter()
-        .filter_map(|item| match item {
-            Item::Use(item) if is_public(&item.vis) => Some(item),
-            _ => None,
-        })
-        .fold(BTreeSet::new(), |mut names, item| {
+fn public_reexports(relative: &str, profile: CfgProfile) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    walk_enabled_items(&parse(relative).items, profile, &mut |item| {
+        if let Item::Use(item) = item
+            && is_public(&item.vis)
+        {
             use_names(&item.tree, &mut names);
-            names
-        })
+        }
+    });
+    names
 }
 
-fn public_modules(relative: &str) -> BTreeSet<String> {
-    parse(relative)
-        .items
-        .iter()
-        .filter_map(|item| match item {
-            Item::Mod(item) if is_public(&item.vis) => Some(item.ident.to_string()),
-            _ => None,
-        })
-        .collect()
+fn public_modules(relative: &str, profile: CfgProfile) -> BTreeSet<String> {
+    let mut modules = BTreeSet::new();
+    walk_enabled_items(&parse(relative).items, profile, &mut |item| {
+        if let Item::Mod(item) = item
+            && is_public(&item.vis)
+        {
+            modules.insert(item.ident.to_string());
+        }
+    });
+    modules
 }
 
-fn collect_public_methods(relative: &str, methods: &mut BTreeMap<String, BTreeSet<String>>) {
-    fn walk(items: &[Item], methods: &mut BTreeMap<String, BTreeSet<String>>) {
-        for item in items {
-            if let Item::Mod(module) = item
-                && let Some((_, nested)) = &module.content
+fn collect_public_methods(
+    relative: &str,
+    profile: CfgProfile,
+    methods: &mut BTreeMap<String, BTreeSet<String>>,
+) {
+    walk_enabled_items(&parse(relative).items, profile, &mut |item| {
+        let Item::Impl(item) = item else {
+            return;
+        };
+        if item.trait_.is_some() {
+            return;
+        }
+        let Type::Path(self_type) = item.self_ty.as_ref() else {
+            return;
+        };
+        let Some(type_name) = self_type.path.segments.last() else {
+            return;
+        };
+        let target = methods.entry(type_name.ident.to_string()).or_default();
+        for member in &item.items {
+            if let ImplItem::Fn(function) = member
+                && cfg_enabled(&function.attrs, profile)
+                && is_public(&function.vis)
             {
-                walk(nested, methods);
-            }
-            let Item::Impl(item) = item else {
-                continue;
-            };
-            if item.trait_.is_some() {
-                continue;
-            }
-            let Type::Path(self_type) = item.self_ty.as_ref() else {
-                continue;
-            };
-            let Some(type_name) = self_type.path.segments.last() else {
-                continue;
-            };
-            let target = methods.entry(type_name.ident.to_string()).or_default();
-            for member in &item.items {
-                if let ImplItem::Fn(function) = member
-                    && is_public(&function.vis)
-                    && !function.sig.ident.to_string().starts_with("test_")
-                {
-                    target.insert(function.sig.ident.to_string());
-                }
+                target.insert(function.sig.ident.to_string());
             }
         }
-    }
-    walk(&parse(relative).items, methods);
+    });
 }
 
-fn method_set(type_name: &str, files: &[&str]) -> BTreeSet<String> {
+fn method_set(type_name: &str, files: &[&str], profile: CfgProfile) -> BTreeSet<String> {
     let mut methods = BTreeMap::new();
     for file in files {
-        collect_public_methods(file, &mut methods);
+        collect_public_methods(file, profile, &mut methods);
     }
     methods.remove(type_name).unwrap_or_default()
 }
@@ -146,59 +287,107 @@ impl<'ast> Visit<'ast> for TypeReferenceCounter {
 fn public_signature_type_counts(
     relative: &str,
     allowed_types: &BTreeSet<String>,
+    profile: CfgProfile,
 ) -> (usize, usize) {
-    fn walk(items: &[Item], allowed_types: &BTreeSet<String>, counts: &mut (usize, usize)) {
-        for item in items {
-            if let Item::Mod(module) = item
-                && let Some((_, nested)) = &module.content
+    let mut counts = (0, 0);
+    walk_enabled_items(&parse(relative).items, profile, &mut |item| {
+        let Item::Impl(item) = item else {
+            return;
+        };
+        let Type::Path(self_type) = item.self_ty.as_ref() else {
+            return;
+        };
+        let Some(type_name) = self_type.path.segments.last() else {
+            return;
+        };
+        if !allowed_types.contains(&type_name.ident.to_string()) {
+            return;
+        }
+        for member in &item.items {
+            if let ImplItem::Fn(function) = member
+                && cfg_enabled(&function.attrs, profile)
+                && is_public(&function.vis)
             {
-                walk(nested, allowed_types, counts);
-            }
-            let Item::Impl(item) = item else {
-                continue;
-            };
-            let Type::Path(self_type) = item.self_ty.as_ref() else {
-                continue;
-            };
-            let Some(type_name) = self_type.path.segments.last() else {
-                continue;
-            };
-            if !allowed_types.contains(&type_name.ident.to_string()) {
-                continue;
-            }
-            for member in &item.items {
-                if let ImplItem::Fn(function) = member
-                    && is_public(&function.vis)
-                {
-                    let mut visitor = TypeReferenceCounter::default();
-                    visitor.visit_signature(&function.sig);
-                    if visitor.cm_id > 0 {
-                        counts.0 += 1;
-                    }
-                    if visitor.async_cm_id > 0 {
-                        counts.1 += 1;
-                    }
+                let mut visitor = TypeReferenceCounter::default();
+                visitor.visit_signature(&function.sig);
+                if visitor.cm_id > 0 {
+                    counts.0 += 1;
+                }
+                if visitor.async_cm_id > 0 {
+                    counts.1 += 1;
                 }
             }
         }
-    }
-    let mut counts = (0, 0);
-    walk(&parse(relative).items, allowed_types, &mut counts);
+    });
     counts
 }
 
-fn declared_types(relative: &str) -> BTreeSet<String> {
-    parse(relative)
-        .items
-        .into_iter()
-        .filter_map(|item| match item {
+fn declared_types(relative: &str, profile: CfgProfile) -> BTreeSet<String> {
+    let mut declared = BTreeSet::new();
+    walk_enabled_items(&parse(relative).items, profile, &mut |item| {
+        let name = match item {
             Item::Enum(item) => Some(item.ident.to_string()),
             Item::Struct(item) => Some(item.ident.to_string()),
             Item::Type(item) => Some(item.ident.to_string()),
             Item::Trait(item) => Some(item.ident.to_string()),
             _ => None,
+        };
+        declared.extend(name);
+    });
+    declared
+}
+
+fn type_path(path: &syn::Path) -> String {
+    path.segments
+        .iter()
+        .map(|segment| {
+            let mut normalized = segment.ident.to_string();
+            if let PathArguments::AngleBracketed(arguments) = &segment.arguments {
+                let arguments = arguments
+                    .args
+                    .iter()
+                    .filter_map(|argument| match argument {
+                        GenericArgument::Type(ty) => Some(type_name(ty)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                normalized.push('<');
+                normalized.push_str(&arguments.join(","));
+                normalized.push('>');
+            }
+            normalized
         })
-        .collect()
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
+fn type_name(ty: &Type) -> String {
+    match ty {
+        Type::Path(path) if path.qself.is_none() => type_path(&path.path),
+        Type::Reference(reference) => {
+            let mut normalized = "&".to_owned();
+            if reference.mutability.is_some() {
+                normalized.push_str("mut ");
+            }
+            normalized.push_str(&type_name(&reference.elem));
+            normalized
+        }
+        _ => panic!("unsupported trait-selector type"),
+    }
+}
+
+fn trait_impls(relative: &str, profile: CfgProfile) -> BTreeSet<(String, String)> {
+    let mut implementations = BTreeSet::new();
+    walk_enabled_items(&parse(relative).items, profile, &mut |item| {
+        let Item::Impl(item) = item else {
+            return;
+        };
+        let Some((_, trait_path, _)) = &item.trait_ else {
+            return;
+        };
+        implementations.insert((type_name(&item.self_ty), type_path(trait_path)));
+    });
+    implementations
 }
 
 #[test]
@@ -254,175 +443,157 @@ fn manifest_has_exact_ids_domains_and_dispositions() {
     assert_eq!(FINAL_MODULES.len(), 31);
     assert!(manifest::BASELINE_MODULES.contains(&"test_support/engine_driver.rs"));
     assert!(!FINAL_MODULES.contains(&"test_support/engine_driver.rs"));
+    assert!(!manifest::RUSTDOC_MANIFEST.is_empty());
+}
+
+#[test]
+fn api_fixture_manifest_is_complete_unique_and_has_real_positive_controls() {
+    let fixture_root = workspace().join("rdma-io-tests/api-fixtures/v2-surface");
+    let mut positive_profiles = BTreeSet::new();
+    let mut cases = BTreeSet::new();
+    for (line_number, line) in manifest::API_FIXTURE_MANIFEST.lines().enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let columns = line.split('|').collect::<Vec<_>>();
+        match columns.as_slice() {
+            ["positive", fixture, binary] => {
+                assert!(
+                    positive_profiles.insert(*fixture),
+                    "duplicate positive fixture profile {fixture}"
+                );
+                assert!(cases.insert((*fixture, *binary)));
+                let source = fixture_root
+                    .join(fixture)
+                    .join("src/bin")
+                    .join(format!("{binary}.rs"));
+                let source_text = fs::read_to_string(&source).unwrap_or_else(|error| {
+                    panic!(
+                        "failed to read positive fixture {}: {error}",
+                        source.display()
+                    )
+                });
+                assert!(
+                    source_text
+                        .lines()
+                        .filter(|line| !line.trim().is_empty())
+                        .count()
+                        >= 10,
+                    "{} must exercise nontrivial retained behavior",
+                    source.display()
+                );
+                let marker = match *fixture {
+                    "production" => "build_with_cm",
+                    "hooks" => "require_context",
+                    "no-hooks" => "operation_traits",
+                    other => panic!("unexpected positive fixture profile {other}"),
+                };
+                assert!(
+                    source_text.contains(marker),
+                    "{} is missing positive control marker {marker}",
+                    source.display()
+                );
+            }
+            ["negative", fixture, binary, diagnostic, symbol, message] => {
+                assert!(
+                    diagnostic.starts_with('E') && diagnostic.len() == 5,
+                    "invalid diagnostic at fixture-manifest line {}",
+                    line_number + 1
+                );
+                assert!(!symbol.is_empty() && !message.is_empty());
+                assert!(
+                    cases.insert((*fixture, *binary)),
+                    "duplicate fixture case {fixture}/{binary}"
+                );
+                let source = fixture_root
+                    .join(fixture)
+                    .join("src/bin")
+                    .join(format!("{binary}.rs"));
+                let source_text = fs::read_to_string(&source).unwrap_or_else(|error| {
+                    panic!(
+                        "failed to read negative fixture {}: {error}",
+                        source.display()
+                    )
+                });
+                assert!(
+                    source_text.contains(symbol),
+                    "{} does not name removed symbol {symbol}",
+                    source.display()
+                );
+            }
+            _ => panic!(
+                "invalid API fixture manifest line {}: {line}",
+                line_number + 1
+            ),
+        }
+    }
+    assert_eq!(
+        positive_profiles,
+        ["hooks", "no-hooks", "production"]
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+    );
+    assert_eq!(
+        cases.len(),
+        manifest::API_FIXTURE_MANIFEST.lines().count(),
+        "every fixture manifest row must select one unique binary"
+    );
 }
 
 #[test]
 fn root_exports_and_module_paths_are_exact() {
-    let exports = public_reexports("v2/mod.rs");
+    let production = CfgProfile::from(SurfaceProfile::Production);
+    let hooks = CfgProfile::from(SurfaceProfile::Hooks);
     assert_eq!(
-        exports,
-        expected(&[
-            "AccessIntent",
-            "Completion",
-            "CompletionMode",
-            "Completions",
-            "Context",
-            "Cq",
-            "CqBuilder",
-            "CqNotifier",
-            "CqPoller",
-            "Error",
-            "MessageTransport",
-            "MessageTransportBuilder",
-            "Mr",
-            "Pd",
-            "Qp",
-            "QpBuilder",
-            "RdmaConnection",
-            "RdmaConnectionConfig",
-            "RdmaConnectionDiagnostics",
-            "RdmaConnectionIdentity",
-            "RdmaEngine",
-            "RdmaEngineBuilder",
-            "RdmaEngineDiagnostics",
-            "RdmaEngineDriver",
-            "RdmaEngineLifecycle",
-            "RdmaEngineTerminalError",
-            "RdmaListener",
-            "RdmaListenerConfig",
-            "RdmaListenerDiagnostics",
-            "RdmaOperation",
-            "ReceivedMessage",
-            "RemoteMr",
-            "Result",
-            "TokioCompletions",
-        ])
+        public_reexports("v2/mod.rs", production),
+        expected(PRODUCTION_EXPORTS)
     );
-    assert_eq!(public_modules("v2/mod.rs"), expected(&["test_support"]));
-    assert!(public_modules("lib.rs").contains("v2"));
-    assert!(!public_modules("lib.rs").contains("test_support"));
+    assert!(public_modules("v2/mod.rs", production).is_empty());
+    assert_eq!(
+        public_modules("v2/mod.rs", hooks),
+        expected(&["test_support"])
+    );
+    assert!(public_modules("lib.rs", production).contains("v2"));
+    assert!(!public_modules("lib.rs", production).contains("test_support"));
     assert!(!v2_file("test_support/engine_driver.rs").exists());
 }
 
 #[test]
 fn retained_and_removed_inherent_method_sets_are_exact() {
-    let low_level = [
-        "v2/context.rs",
-        "v2/cq.rs",
-        "v2/mr.rs",
-        "v2/pd.rs",
-        "v2/qp.rs",
-        "v2/op.rs",
-        "v2/completion.rs",
-        "v2/cq_poller.rs",
-        "v2/tokio_support.rs",
-    ];
-    assert_eq!(
-        method_set("Context", &low_level),
-        expected(&["alloc_pd", "open_by_name", "open_first"])
-    );
-    assert_eq!(method_set("Pd", &low_level), expected(&["reg_mr"]));
-    assert_eq!(
-        method_set("CqBuilder", &low_level),
-        expected(&["build", "new", "with_channel"])
-    );
-    assert_eq!(
-        method_set("Cq", &low_level),
-        expected(&["completions_tokio", "fd", "has_channel", "poll"])
-    );
-    assert_eq!(
-        method_set("Mr", &low_level),
-        expected(&[
-            "addr",
-            "as_mut_slice",
-            "as_slice",
-            "is_empty",
-            "len",
-            "lkey",
-            "rkey",
-            "to_remote",
-        ])
-    );
-    assert!(method_set("RemoteMr", &low_level).is_empty());
-    assert_eq!(
-        method_set("QpBuilder", &low_level),
-        expected(&[
-            "build_with_cm",
-            "max_recv_sge",
-            "max_recv_wr",
-            "max_send_sge",
-            "max_send_wr",
-            "new",
-            "sq_sig_all",
-        ])
-    );
-    assert_eq!(
-        method_set("Qp", &low_level),
-        expected(&[
-            "post_read",
-            "post_recv",
-            "post_send",
-            "post_write",
-            "qp_num",
-            "to_error",
-        ])
-    );
-    assert_eq!(
-        method_set("Completion", &low_level),
-        expected(&[
-            "byte_len",
-            "is_success",
-            "opcode",
-            "qp_num",
-            "result",
-            "status",
-            "vendor_err",
-            "wr_id",
-        ])
-    );
-    assert_eq!(
-        method_set("Completions", &low_level),
-        expected(&["cq", "new", "next"])
-    );
-    assert_eq!(
-        method_set("CqPoller", &low_level),
-        expected(&["cq", "new", "poll_completions", "wake"])
-    );
-
-    assert_eq!(
-        method_set("RdmaConnectionConfig", &["v2/engine/config.rs"]),
-        expected(&[
-            "initiator_depth",
-            "max_recv_sge",
-            "max_recv_wr",
-            "max_send_sge",
-            "max_send_wr",
-            "responder_resources",
-            "retry_count",
-            "rnr_retry_count",
-        ])
-    );
-    assert_eq!(
-        method_set("RdmaConnectionIdentity", &["v2/engine/connection.rs"]),
-        expected(&["qp_num"])
-    );
-    assert_eq!(
-        method_set("MessageTransport", &["v2/message_transport.rs"]),
-        expected(&["close", "ready", "recv", "send"])
-    );
+    for expectation in METHOD_SETS {
+        assert_eq!(
+            method_set(
+                expectation.type_name,
+                expectation.modules,
+                expectation.profile.into(),
+            ),
+            expected(expectation.methods),
+            "{:?} method set for {}",
+            expectation.profile,
+            expectation.type_name
+        );
+    }
 
     let protocol = parse("v2/protocol.rs");
-    assert!(
-        protocol.items.iter().all(|item| match item {
-            Item::Const(item) => !is_public(&item.vis),
-            Item::Enum(item) => !is_public(&item.vis),
-            Item::Fn(item) => !is_public(&item.vis),
-            Item::Struct(item) => !is_public(&item.vis),
-            Item::Type(item) => !is_public(&item.vis),
-            _ => true,
-        }),
-        "protocol implementation leaked a public item"
+    let mut leaked = 0usize;
+    walk_enabled_items(
+        &protocol.items,
+        SurfaceProfile::Production.into(),
+        &mut |item| {
+            let private = match item {
+                Item::Const(item) => !is_public(&item.vis),
+                Item::Enum(item) => !is_public(&item.vis),
+                Item::Fn(item) => !is_public(&item.vis),
+                Item::Struct(item) => !is_public(&item.vis),
+                Item::Type(item) => !is_public(&item.vis),
+                _ => true,
+            };
+            if !private {
+                leaked += 1;
+            }
+        },
     );
+    assert_eq!(leaked, 0, "protocol leaked {leaked} public item(s)");
 }
 
 #[test]
@@ -453,106 +624,48 @@ fn signature_profiles_and_hook_namespace_are_exact() {
             && *file != "v2/engine/driver.rs"
             && *file != "v2/engine/api_tests.rs"
     }) {
-        let counts = public_signature_type_counts(file, &production_types);
+        let counts = public_signature_type_counts(
+            file,
+            &production_types,
+            SurfaceProfile::Production.into(),
+        );
         production.0 += counts.0;
         production.1 += counts.1;
     }
     assert_eq!(production, (1, 0));
 
-    let hook_exports = public_reexports("v2/test_support.rs");
-    assert_eq!(
-        hook_exports,
-        expected(&[
-            "DestructionEvent",
-            "DestructionKind",
-            "DestructionRecorder",
-            "RecorderArmError",
-            "TestAcceptedOperation",
-            "TestAdmissionBarrier",
-            "TestConnectionCqeSuppression",
-            "TestContextIdentity",
-            "TestCqArmWindowControl",
-            "TestCqeSuppression",
-            "TestEngineInstrumentation",
-            "TestEngineQp",
-            "TestEngineResources",
-            "TestHelloAttachHook",
-            "TestHelloOverride",
-            "TestProviderLimits",
-            "TestReadyWorkControl",
-            "TestRouteHandle",
-            "TestSteadyFrame",
-        ])
-    );
+    let hook_exports = public_reexports("v2/test_support.rs", SurfaceProfile::Hooks.into());
+    assert_eq!(hook_exports, expected(HOOK_EXPORTS));
     let hook_types = expected(&[
         "TestEngineResources",
         "TestContextIdentity",
         "TestProviderLimits",
     ]);
     assert_eq!(
-        public_signature_type_counts("v2/engine/driver.rs", &hook_types),
+        public_signature_type_counts(
+            "v2/engine/driver.rs",
+            &hook_types,
+            SurfaceProfile::Hooks.into(),
+        ),
         (2, 1)
-    );
-    assert_eq!(
-        method_set("TestEngineResources", &["v2/engine/driver.rs"]),
-        expected(&[
-            "context_identity",
-            "create_qp",
-            "disconnect_connection",
-            "inject_completion",
-            "inject_driver_failure",
-            "install_connection",
-            "install_idle_connections",
-            "install_route",
-            "instrumentation",
-            "pause_next_connect_before_enqueue",
-            "pause_next_cq_arm_window",
-            "pause_next_cq_pre_arm_window",
-            "pause_next_operation_before_register",
-            "pause_ready_work",
-            "provider_limits",
-            "register_memory",
-            "require_context",
-            "suppress_next_connection_cqe",
-            "suppress_next_connection_cqe_with_opcode",
-            "transition_connection_to_error",
-        ])
-    );
-    assert_eq!(
-        method_set("TestProviderLimits", &["v2/engine/driver.rs"]),
-        expected(&[
-            "max_cqe",
-            "max_qp",
-            "max_qp_init_rd_atom",
-            "max_qp_rd_atom",
-            "max_qp_wr",
-            "max_sge",
-        ])
-    );
-    assert_eq!(
-        method_set("TestRouteHandle", &["v2/engine/driver.rs"]),
-        expected(&[
-            "accepted_outstanding",
-            "completions",
-            "qp",
-            "qp_num",
-            "remove",
-            "retain",
-            "retain_until_completion",
-            "suppress_next",
-            "wait_for_completion_count",
-            "wait_until_drained",
-        ])
     );
 }
 
 #[test]
 fn trait_removals_and_architecture_consolidations_are_exact() {
-    let error_source = fs::read_to_string(v2_file("v2/error.rs")).unwrap();
-    let completion_source = fs::read_to_string(v2_file("v2/op.rs")).unwrap();
-    assert!(!error_source.contains("impl From<crate::Error> for Error"));
-    assert!(!completion_source.contains("impl From<WorkCompletion> for Completion"));
-    assert!(!completion_source.contains("impl AsRef<WorkCompletion> for Completion"));
+    for selector in TRAIT_IMPL_REMOVALS {
+        let implementations = trait_impls(selector.module, SurfaceProfile::Production.into());
+        assert!(
+            !implementations.contains(&(
+                selector.self_type.to_owned(),
+                selector.trait_path.to_owned()
+            )),
+            "removed trait impl remains: {} for {} in {}",
+            selector.trait_path,
+            selector.self_type,
+            selector.module
+        );
+    }
 
     let mut declared = BTreeSet::new();
     for file in FINAL_MODULES
@@ -560,62 +673,17 @@ fn trait_removals_and_architecture_consolidations_are_exact() {
         .copied()
         .filter(|file| file.starts_with("v2/"))
     {
-        declared.extend(declared_types(file));
+        declared.extend(declared_types(file, SurfaceProfile::Hooks.into()));
     }
-    for removed in [
-        "AcceptResult",
-        "CloseOutcome",
-        "EngineFailure",
-        "EngineOutcome",
-        "ListenResult",
-        "ListenerCloseOutcome",
-        "OutboundResult",
-        "Op",
-        "OpCode",
-        "TestCompletionIdentity",
-        "TestRegistryProbe",
-    ] {
+    for removed in REMOVED_ARCHITECTURE_TYPES {
         assert!(
-            !declared.contains(removed),
+            !declared.contains(*removed),
             "removed type remains: {removed}"
         );
     }
-    for retained in [
-        "TakeOnceResult",
-        "MemoizedTerminalResult",
-        "PollState",
-        "FutureState",
-        "OperationLifecycle",
-        "BatchPostOutcome",
-        "InternalPreparedBatch",
-        "PreparedBatchOwnership",
-        "CompletionDisposition",
-        "DetachedOperationCompletion",
-        "StartResult",
-        "BatchOwnershipTransfer",
-        "ReservationState",
-        "SelectedAccept",
-        "InboundState",
-        "OutboundState",
-        "ConnectionCmOwner",
-        "EngineMessageEvent",
-        "EngineSendRequestAction",
-        "PagedRegistry",
-        "SlotState",
-        "ConnectionRegistry",
-        "OperationRegistry",
-        "OperationState",
-        "QuarantineTransition",
-        "QuarantineKey",
-        "ContextRoute",
-        "CmDispatchRoute",
-        "EventDisposition",
-        "RouteRetirement",
-        "PendingCmDestruction",
-        "ListenerQueues",
-    ] {
+    for retained in RETAINED_ARCHITECTURE_TYPES {
         assert!(
-            declared.contains(retained),
+            declared.contains(*retained),
             "named architecture leaf missing: {retained}"
         );
     }
@@ -660,6 +728,19 @@ fn aggregate_validation_wires_static_guards_once_per_entry_point() {
         assert!(
             provider.contains(guard),
             "provider full validation is missing {guard}"
+        );
+    }
+    for command in [
+        "check -p rdma-io --no-default-features",
+        "check -p rdma-io --no-default-features --features tokio",
+    ] {
+        assert!(
+            justfile.contains(&format!("cargo {command}")),
+            "just validate-v2-engine is missing cargo {command}"
+        );
+        assert!(
+            provider.contains(&format!("\"$CARGO\" {command}")),
+            "provider full validation is missing $CARGO {command}"
         );
     }
     assert_eq!(

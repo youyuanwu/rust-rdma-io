@@ -90,15 +90,19 @@ impl Completion {
         }
     }
 
+    #[cfg(feature = "tokio")]
     pub(crate) fn from_raw(wc: WorkCompletion) -> Self {
         Self { wc }
     }
 
+    #[cfg(feature = "tokio")]
     pub(crate) fn into_raw(self) -> WorkCompletion {
         self.wc
     }
 
     pub(crate) fn raw_slice_mut(completions: &mut [Completion]) -> &mut [WorkCompletion] {
+        // SAFETY: Completion is repr(transparent) over WorkCompletion, so the
+        // slice data pointer, length, alignment, and element layout are equal.
         unsafe { &mut *(completions as *mut [Completion] as *mut [WorkCompletion]) }
     }
 }

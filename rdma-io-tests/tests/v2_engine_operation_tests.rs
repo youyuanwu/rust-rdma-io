@@ -101,18 +101,34 @@ async fn run_owned_operations(mode: CompletionMode) {
         "cancellation alone must not deregister the posted MR"
     );
     let matching_send = client.register_memory(64, AccessIntent::LocalOnly).unwrap();
-    let (send_result, returned) = client.send(matching_send, None).await;
+    let (send_result, matching_send) = client.send(matching_send, None).await;
     send_result.unwrap();
-    assert!(returned.is_some());
+    let matching_send = matching_send.expect("matching send must return its MR");
     wait_for_no_accepted(&engine).await;
+    let after_cancelled_cqe = recorder.snapshot();
+    let mr_events = after_cancelled_cqe
+        .iter()
+        .filter(|event| event.kind == DestructionKind::MemoryRegion)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        mr_events.len(),
+        1,
+        "with every other MR retained, the cancelled MR must be the sole deregistration after its exact CQE"
+    );
+    assert_eq!(
+        mr_events[0].result,
+        Some(0),
+        "the sole cancelled-MR deregistration must succeed"
+    );
+    drop(matching_send);
     assert_eq!(
         recorder
             .snapshot()
             .iter()
             .filter(|event| event.kind == DestructionKind::MemoryRegion)
             .count(),
-        1,
-        "the cancelled MR is released only after its exact CQE"
+        2,
+        "dropping the returned matching-send MR must produce the next distinct deregistration"
     );
     let after_cancel = engine.diagnostics();
     assert_eq!(after_cancel.operations_cancelled, 1);

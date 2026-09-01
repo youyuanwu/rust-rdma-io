@@ -503,6 +503,26 @@ mod tests {
                 registry.allocated_pages() <= 3,
                 "only touched pages may be allocated"
             );
+            let inner = lock_unpoison(&registry.inner);
+            let resident_slot_capacity = inner
+                .pages
+                .iter()
+                .filter_map(Option::as_ref)
+                .map(|page| page.len())
+                .sum::<usize>();
+            let estimated_heap_bytes = inner.pages.capacity()
+                * std::mem::size_of::<Option<Box<[RegistrySlot<usize>]>>>()
+                + resident_slot_capacity * std::mem::size_of::<RegistrySlot<usize>>()
+                + inner.recycled.capacity() * std::mem::size_of::<u32>();
+            drop(inner);
+            assert!(
+                resident_slot_capacity <= 3 * PAGE_SIZE,
+                "representative slots must allocate at most three pages"
+            );
+            assert!(
+                estimated_heap_bytes < 256 * 1024,
+                "representative million-slot registry allocated {estimated_heap_bytes} bytes"
+            );
             assert_eq!(registry.probes(), tokens.len() as u64);
         }
     }

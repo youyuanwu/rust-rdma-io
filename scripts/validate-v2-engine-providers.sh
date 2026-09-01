@@ -83,7 +83,7 @@ case "$MODE" in
     "")
         TEST_TARGET=""
         REPETITIONS=1
-        MODE_LABEL="Phase 11 full v2 engine validation"
+        MODE_LABEL="Phase 12 full v2 engine validation"
         FULL_VALIDATION=1
         ;;
     *)
@@ -233,6 +233,16 @@ run_static_preflight() {
         sudo -u "$SUDO_USER" env \
             HOME="$user_home" \
             PATH="$TOOLCHAIN_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            RUSTFLAGS="-D warnings" \
+            "$CARGO" check -p rdma-io --no-default-features || return $?
+        sudo -u "$SUDO_USER" env \
+            HOME="$user_home" \
+            PATH="$TOOLCHAIN_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            RUSTFLAGS="-D warnings" \
+            "$CARGO" check -p rdma-io --no-default-features --features tokio || return $?
+        sudo -u "$SUDO_USER" env \
+            HOME="$user_home" \
+            PATH="$TOOLCHAIN_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
             CARGO="$CARGO" \
             "$CARGO" test -p rdma-io-tests \
                 --test v2_surface_cutover_tests \
@@ -250,6 +260,10 @@ run_static_preflight() {
             CARGO="$CARGO" \
             "$ROOT_DIR/scripts/check-v2-rustdoc.sh"
     else
+        env PATH="$TOOLCHAIN_BIN:$PATH" RUSTFLAGS="-D warnings" \
+            "$CARGO" check -p rdma-io --no-default-features || return $?
+        env PATH="$TOOLCHAIN_BIN:$PATH" RUSTFLAGS="-D warnings" \
+            "$CARGO" check -p rdma-io --no-default-features --features tokio || return $?
         env PATH="$TOOLCHAIN_BIN:$PATH" CARGO="$CARGO" \
             "$CARGO" test -p rdma-io-tests \
                 --test v2_surface_cutover_tests \

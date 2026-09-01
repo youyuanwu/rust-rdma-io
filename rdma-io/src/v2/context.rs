@@ -84,7 +84,54 @@ impl Context {
         &self.inner
     }
 
+    #[cfg(feature = "tokio")]
     pub(crate) fn from_anchored(inner: Arc<device::Context>) -> Self {
         Self { inner }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn first_device_name(devices: &RdmaCmDeviceList) -> Option<String> {
+        devices.device_names().into_iter().next()
+    }
+
+    #[test]
+    fn open_first_uses_the_first_librdmacm_context() {
+        let Ok(devices) = RdmaCmDeviceList::new() else {
+            return;
+        };
+        let Some(first_name) = first_device_name(&devices) else {
+            return;
+        };
+        let first = Context::open_first().expect("open first librdmacm context");
+        let by_name =
+            Context::open_by_name(&first_name).expect("open first librdmacm context by name");
+
+        assert_eq!(
+            first.raw_context().as_raw(),
+            by_name.raw_context().as_raw(),
+            "open_first must select the context at librdmacm list index zero"
+        );
+    }
+
+    #[test]
+    fn same_name_openers_share_librdmacm_cached_raw_context() {
+        let Ok(devices) = RdmaCmDeviceList::new() else {
+            return;
+        };
+        let Some(name) = first_device_name(&devices) else {
+            return;
+        };
+        let first = Context::open_by_name(&name).expect("first same-name context open");
+        let second = Context::open_by_name(&name).expect("second same-name context open");
+
+        assert_eq!(
+            first.raw_context().as_raw(),
+            second.raw_context().as_raw(),
+            "same-name librdmacm opens must preserve the cached raw-context identity"
+        );
     }
 }

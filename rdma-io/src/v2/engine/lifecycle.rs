@@ -11,6 +11,11 @@ pub(super) enum TakeOnceResult<T> {
     Taken,
 }
 
+/// Cloneable terminal outcome used by both engine-wide and object-local waiters.
+///
+/// `ConnectionQuarantined` is a connection-local close disposition only. It
+/// may be memoized by a connection, but must never become the engine driver's
+/// terminal outcome; engine-wide terminal causes must match the driver result.
 #[derive(Clone)]
 pub(super) struct MemoizedTerminalResult {
     result: Result<()>,
@@ -210,6 +215,18 @@ mod tests {
         assert_eq!(engine.diagnostics().qp_destroys, 1);
         engine.shared.finish(MemoizedTerminalResult::success());
         drop(driver);
+    }
+
+    #[test]
+    #[should_panic(expected = "ConnectionQuarantined is connection-local")]
+    fn engine_terminal_rejects_connection_quarantined() {
+        let (engine, _driver) = test_engine_pair(CompletionMode::Polling);
+        engine.shared.finish(MemoizedTerminalResult::from_error(
+            Error::ConnectionQuarantined {
+                outstanding_operations: 1,
+                cq_debt: 1,
+            },
+        ));
     }
 
     #[tokio::test(start_paused = true)]

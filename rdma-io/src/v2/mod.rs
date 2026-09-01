@@ -79,6 +79,7 @@ mod message_transport;
 mod mr;
 mod op;
 mod pd;
+#[cfg(any(test, feature = "tokio"))]
 mod protocol;
 mod qp;
 #[cfg(any(test, feature = "test-hooks"))]

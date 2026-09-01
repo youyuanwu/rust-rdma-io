@@ -192,6 +192,7 @@ impl Cq {
         self.channel.is_some()
     }
 
+    #[cfg(feature = "async")]
     pub(crate) fn completion_channel(&self) -> Option<&CompletionChannel> {
         self.channel.as_deref()
     }

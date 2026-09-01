@@ -93,6 +93,8 @@ test-doc:
 
 # Run the complete RXE-then-SIW v2 engine provider validation and restore RXE.
 validate-v2-engine:
+    RUSTFLAGS="-D warnings" cargo check -p rdma-io --no-default-features
+    RUSTFLAGS="-D warnings" cargo check -p rdma-io --no-default-features --features tokio
     cargo check --workspace --all-targets --all-features
     cargo build --workspace --all-targets --all-features
     cargo build --no-default-features --features async
