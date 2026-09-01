@@ -999,11 +999,9 @@ pub(super) mod test_api {
         /// destruction boundary.
         pub fn fail_next_setup_rollback_qp_destroy(&self, error: Error) -> Result<()> {
             let shared = self.ensure_active()?;
-            let mr = self.resources.pd.reg_mr(64, AccessIntent::LocalOnly)?;
-            shared
-                .test_driver
-                .inject_setup_rollback_failure(error, mr)?;
-            Ok(())
+            shared.test_driver.inject_setup_rollback_failure(error, || {
+                self.resources.pd.reg_mr(64, AccessIntent::LocalOnly)
+            })
         }
 
         /// Terminate the real driver on its next poll with an exact test error.
@@ -1755,7 +1753,11 @@ pub(super) mod test_api {
                 .take()
         }
 
-        fn inject_setup_rollback_failure(&self, error: Error, retained_mr: Mr) -> Result<()> {
+        fn inject_setup_rollback_failure(
+            &self,
+            error: Error,
+            register_mr: impl FnOnce() -> Result<Mr>,
+        ) -> Result<()> {
             let mut pending = self
                 .setup_rollback_failure
                 .lock()
@@ -1765,6 +1767,7 @@ pub(super) mod test_api {
                     "a setup rollback failure is already pending".into(),
                 ));
             }
+            let retained_mr = register_mr()?;
             *pending = Some(SetupRollbackFailure { error, retained_mr });
             Ok(())
         }

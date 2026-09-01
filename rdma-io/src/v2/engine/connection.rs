@@ -793,10 +793,7 @@ impl ConnectionAdmissionPool {
     }
 
     pub(super) fn clear_retained_quarantine(&self) {
-        self.counts.update(|counts| {
-            counts.live = counts.live.saturating_sub(1);
-            counts.quarantined_bundles = counts.quarantined_bundles.saturating_sub(1);
-        });
+        self.counts.release_retained_quarantine();
     }
 }
 
@@ -875,6 +872,29 @@ impl ConnectionStateCounts {
             .store(counts.quarantined_bundles, Ordering::Relaxed);
         self.version.fetch_add(1, Ordering::Release);
         result
+    }
+
+    fn release_retained_quarantine(&self) {
+        let _writer = lock_unpoison(&self.writer);
+        let live = self.live.load(Ordering::Relaxed);
+        let quarantined_bundles = self.quarantined_bundles.load(Ordering::Relaxed);
+        assert!(
+            live > 0 && quarantined_bundles > 0,
+            "retained connection quarantine release requires positive live and bundle gauges; live={live}, quarantined_bundles={quarantined_bundles}"
+        );
+        let next_live = live
+            .checked_sub(1)
+            .expect("positive retained live gauge must decrement");
+        let next_quarantined_bundles = quarantined_bundles
+            .checked_sub(1)
+            .expect("positive retained bundle gauge must decrement");
+
+        let previous = self.version.fetch_add(1, Ordering::AcqRel);
+        debug_assert_eq!(previous & 1, 0, "connection gauge writer must be exclusive");
+        self.live.store(next_live, Ordering::Relaxed);
+        self.quarantined_bundles
+            .store(next_quarantined_bundles, Ordering::Relaxed);
+        self.version.fetch_add(1, Ordering::Release);
     }
 
     fn snapshot(&self) -> ConnectionStateCountSnapshot {
@@ -1919,15 +1939,53 @@ mod tests {
 
     #[test]
     fn clearing_dropped_setup_quarantine_releases_live_and_bundle_gauges_together() {
-        let pool = ConnectionAdmissionPool::new(1);
-        let mut reservation = pool.try_acquire().unwrap();
-        assert!(reservation.retain_setup_quarantine());
-        drop(reservation);
+        let pool = ConnectionAdmissionPool::new(2);
+        let retained = {
+            let mut reservation = pool.try_acquire().unwrap();
+            assert!(reservation.retain_setup_quarantine());
+            reservation
+        };
+        let live = pool.try_acquire().unwrap();
+        drop(retained);
 
         pool.clear_retained_quarantine();
 
-        assert_eq!(pool.snapshot(), ConnectionStateCountSnapshot::default());
+        assert_eq!(
+            pool.snapshot(),
+            ConnectionStateCountSnapshot {
+                live: 1,
+                establishing: 1,
+                ..ConnectionStateCountSnapshot::default()
+            }
+        );
         assert!(pool.try_acquire().is_some());
+        drop(live);
+    }
+
+    #[test]
+    fn invalid_retained_quarantine_release_panics_without_corrupting_gauges() {
+        let pool = ConnectionAdmissionPool::new(1);
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let pool = Arc::clone(&pool);
+            move || pool.clear_retained_quarantine()
+        }));
+
+        let panic = panic.expect_err("zero retained gauges must fail deterministically");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("retained gauge assertion uses a string panic");
+        assert_eq!(
+            message,
+            "retained connection quarantine release requires positive live and bundle gauges; live=0, quarantined_bundles=0"
+        );
+        assert_eq!(pool.snapshot(), ConnectionStateCountSnapshot::default());
+        let reservation = pool.try_acquire().expect("admission remains available");
+        assert!(pool.try_acquire().is_none());
+        drop(reservation);
+        assert_eq!(pool.snapshot(), ConnectionStateCountSnapshot::default());
     }
 
     #[test]

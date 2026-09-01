@@ -926,6 +926,22 @@ async fn run_setup_rollback_destroy_quarantines(mode: CompletionMode) {
     client_resources
         .fail_next_setup_rollback_qp_destroy(Error::InvalidConfig(outbound_original.into()))
         .unwrap();
+    assert_eq!(recorder.snapshot().len(), 0);
+    let duplicate_error = client_resources
+        .fail_next_setup_rollback_qp_destroy(Error::InvalidConfig(
+            "rejected duplicate setup rollback failure".into(),
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        duplicate_error,
+        Error::InvalidConfig(ref message)
+            if message == "a setup rollback failure is already pending"
+    ));
+    assert_eq!(
+        recorder.snapshot().len(),
+        0,
+        "rejecting a duplicate setup rollback injection must not register and drop an MR"
+    );
     let outbound_error = match client_engine.connect(address).await {
         Ok(_) => panic!("outbound setup rollback unexpectedly succeeded"),
         Err(error) => error,
