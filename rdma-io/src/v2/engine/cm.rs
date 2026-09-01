@@ -597,16 +597,16 @@ impl CmState {
     ) -> Result<()> {
         match (destroy_result, finalize_result) {
             (Ok(()), Ok(())) => {
-                connection.finish_retirement();
                 shared.record_connection_retired(&connection);
+                connection.finish_retirement();
                 self.finish_inbound_retirement(completion);
                 Ok(())
             }
             (destroy_result, finalize_result) => {
                 let error = connection_destruction_error(destroy_result, finalize_result);
                 let message = error_detail(&error);
-                connection.fail_retirement(error.clone());
                 shared.record_connection_retirement_failure(&connection);
+                connection.fail_retirement(error.clone());
                 self.fail_inbound_retirement(completion, message);
                 Err(error)
             }
@@ -1488,8 +1488,8 @@ impl CmState {
         connection: Arc<ConnectionState>,
     ) -> Result<()> {
         self.release_connection_retirement(shared, &connection)?;
-        connection.finish_retirement();
         shared.record_connection_retired(&connection);
+        connection.finish_retirement();
         Ok(())
     }
 

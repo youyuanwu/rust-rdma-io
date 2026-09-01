@@ -39,6 +39,7 @@ impl EngineShared {
                     return;
                 }
             }
+            self.work_signal.publish(super::driver::CQ_RECHECK_WORK);
 
             let engine_is_terminating = self.shutdown_requested.load(Ordering::Acquire);
             if !engine_is_terminating {
@@ -101,7 +102,7 @@ impl EngineShared {
         let Lookup::Occupied(connection) = self.connections.lookup(token) else {
             return;
         };
-        if let Some((_outstanding, _cq_debt)) = connection.apply_drain_deadline() {
+        if let Some((outstanding, _cq_debt)) = connection.begin_quarantine() {
             if self.track_connection_quarantine(connection.token) {
                 self.diagnostic_counters
                     .connections_quarantined
@@ -113,6 +114,7 @@ impl EngineShared {
             for operation in connection.accepted_tokens() {
                 self.quarantine_operation(operation);
             }
+            connection.publish_quarantine(outstanding);
         }
         if connection.close_started() && connection.accepted_count() == 0 {
             self.recover_connection_quarantine(&connection);
@@ -324,7 +326,10 @@ mod tests {
                 cq_debt: 1
             }))
         ));
-        assert_eq!(engine.diagnostics().quarantined_bundles, 1);
+        let published = engine.diagnostics();
+        assert_eq!(published.quarantined_bundles, 1);
+        assert_eq!(published.connections_quarantined, 1);
+        assert_eq!(published.connection_quarantine_outcomes, 1);
         assert_eq!(poster.destroys.load(Ordering::Acquire), 0);
 
         assert!(connection.state.remove_accepted(token));

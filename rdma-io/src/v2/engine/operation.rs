@@ -347,6 +347,7 @@ fn commit_internal_entries(shared: &EngineShared, entries: Vec<InternalBatchEntr
             early.push((entry.state, completion));
         }
     }
+    shared.work_signal.publish(super::driver::CQ_RECHECK_WORK);
     for (state, completion) in early {
         shared.finish_operation(state, completion);
     }
@@ -1232,6 +1233,7 @@ fn start_operation(
             BatchWrAccounting::from_outcome(1, &BatchPostOutcome::AllAccepted).record(shared);
             shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
             let early = state.commit_accepted();
+            shared.work_signal.publish(super::driver::CQ_RECHECK_WORK);
             drop(admission);
             if let Some(completion) = early {
                 shared.finish_operation(Arc::clone(&state), completion);
@@ -1251,6 +1253,7 @@ fn start_operation(
                 BatchWrAccounting::ambiguous(1).record(shared);
                 shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
                 state.commit_accepted();
+                shared.work_signal.publish(super::driver::CQ_RECHECK_WORK);
                 drop(admission);
                 shared.finish_operation(Arc::clone(&state), completion);
                 StartResult::InFlight(state)
@@ -1271,6 +1274,7 @@ fn start_operation(
             BatchWrAccounting::ambiguous(1).record(shared);
             shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
             let early = state.commit_accepted();
+            shared.work_signal.publish(super::driver::CQ_RECHECK_WORK);
             drop(admission);
             if let Some(completion) = early {
                 shared.finish_operation(Arc::clone(&state), completion);

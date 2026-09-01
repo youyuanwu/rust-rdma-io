@@ -586,6 +586,9 @@ impl PreEstablishSetup for MessagePreEstablishSetup {
                 mr,
                 Box::new(move |completion| {
                     if let Some(state) = state.upgrade() {
+                        if let Some(error) = detached_completion_error(&completion) {
+                            state.fail_from_completion_callback(error);
+                        }
                         state.enqueue_event(EngineMessageEvent::Receive(completion));
                     } else {
                         // The callback owns the completion and its MR; dropping
@@ -993,6 +996,7 @@ struct EngineMessageState {
     received: StdMutex<VecDeque<CompletedRecv>>,
     recv_notify: Notify,
     pending_credit_returns: AtomicUsize,
+    close_connection_pending: AtomicBool,
     link: OnceLock<EngineMessageLink>,
     self_weak: OnceLock<Weak<EngineMessageState>>,
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1023,6 +1027,7 @@ impl EngineMessageState {
             received: StdMutex::new(VecDeque::new()),
             recv_notify: Notify::new(),
             pending_credit_returns: AtomicUsize::new(0),
+            close_connection_pending: AtomicBool::new(false),
             link: OnceLock::new(),
             self_weak: OnceLock::new(),
             #[cfg(any(test, feature = "test-hooks"))]
@@ -1169,12 +1174,12 @@ impl EngineMessageState {
         shared.publish_connection_ready(&connection);
     }
 
-    fn fail(&self, error: Error, close_connection: bool) {
+    fn enter_failed(&self, error: Error) -> bool {
         // Hold the error mutex across the CAS. A waiter that observes FAILED
         // then blocks on this mutex until the contextual error is published.
         let mut stored = lock_std(&self.error);
         if !transition_terminal(&self.state, STATE_FAILED) {
-            return;
+            return false;
         }
         if stored.is_none() {
             *stored = Some(error);
@@ -1186,6 +1191,13 @@ impl EngineMessageState {
         self.drain_terminal_events();
         self.state_notify.notify_waiters();
         self.recv_notify.notify_waiters();
+        true
+    }
+
+    fn fail(&self, error: Error, close_connection: bool) {
+        if !self.enter_failed(error) {
+            return;
+        }
         if close_connection
             && let Some(link) = self.link.get()
             && let (Some(shared), Some(connection)) =
@@ -1193,6 +1205,14 @@ impl EngineMessageState {
         {
             shared.begin_connection_close(&connection);
         }
+    }
+
+    fn fail_from_completion_callback(&self, error: Error) {
+        if !self.enter_failed(error) {
+            return;
+        }
+        self.close_connection_pending.store(true, Ordering::Release);
+        self.publish();
     }
 
     fn terminal_error(&self) -> Error {
@@ -1418,6 +1438,9 @@ impl EngineMessageState {
             mr,
             Box::new(move |completion| {
                 if let Some(state) = state.upgrade() {
+                    if let Some(error) = detached_completion_error(&completion) {
+                        state.fail_from_completion_callback(error);
+                    }
                     state.enqueue_event(EngineMessageEvent::Receive(completion));
                 } else {
                     // Completion callback ownership includes the receive MR.
@@ -1483,6 +1506,11 @@ impl EngineMessageState {
                     frame_len,
                     Box::new(move |completion| {
                         if let Some(state) = state.upgrade() {
+                            if let Some(error) = detached_completion_error(&completion)
+                                && !matches!(error, Error::CapacityExhausted)
+                            {
+                                state.fail_from_completion_callback(error);
+                            }
                             state.enqueue_event(EngineMessageEvent::SendComplete {
                                 request: callback_request,
                                 completion,
@@ -1603,6 +1631,9 @@ impl EngineMessageState {
             frame_len,
             Box::new(move |completion| {
                 if let Some(state) = state.upgrade() {
+                    if let Some(error) = detached_completion_error(&completion) {
+                        state.fail_from_completion_callback(error);
+                    }
                     state.enqueue_event(EngineMessageEvent::ControlSendComplete(completion));
                 } else {
                     drop(completion);
@@ -1749,6 +1780,9 @@ impl EngineMessageState {
             len,
             Box::new(move |completion| {
                 if let Some(state) = state.upgrade() {
+                    if let Some(error) = detached_completion_error(&completion) {
+                        state.fail_from_completion_callback(error);
+                    }
                     state.enqueue_event(EngineMessageEvent::HelloSend(completion));
                 }
             }),
@@ -1797,6 +1831,9 @@ impl EngineMessageState {
             mr,
             Box::new(move |completion| {
                 if let Some(state) = state.upgrade() {
+                    if let Some(error) = detached_completion_error(&completion) {
+                        state.fail_from_completion_callback(error);
+                    }
                     state.enqueue_event(EngineMessageEvent::Receive(completion));
                 } else {
                     // Completion callback ownership includes the receive MR.
@@ -1867,6 +1904,16 @@ impl ConnectionReadyWork for EngineMessageState {
     fn process(&self, budget: usize) -> usize {
         let mut processed = 0;
         while processed < budget {
+            if self.close_connection_pending.swap(false, Ordering::AcqRel) {
+                if let Some(link) = self.link.get()
+                    && let (Some(shared), Some(connection)) =
+                        (link.shared.upgrade(), link.connection.upgrade())
+                {
+                    shared.begin_connection_close(&connection);
+                }
+                processed += 1;
+                continue;
+            }
             let event = { lock_std(&self.events).pop_front() };
             if let Some(event) = event {
                 self.process_event(event);
@@ -1879,7 +1926,8 @@ impl ConnectionReadyWork for EngineMessageState {
     }
 
     fn has_work(&self) -> bool {
-        !lock_std(&self.events).is_empty()
+        self.close_connection_pending.load(Ordering::Acquire)
+            || !lock_std(&self.events).is_empty()
             || (self.pending_credit_returns.load(Ordering::Acquire) != 0
                 && self
                     .pools
@@ -2404,6 +2452,18 @@ mod hello_tests {
     }
 }
 
+fn detached_completion_error(completion: &DetachedOperationCompletion) -> Option<Error> {
+    match completion {
+        DetachedOperationCompletion::Unaccepted { error, .. } => {
+            Some(normalize_message_completion_error(error.clone()))
+        }
+        DetachedOperationCompletion::Completed {
+            result: Err(error), ..
+        } => Some(normalize_message_completion_error(error.clone())),
+        DetachedOperationCompletion::Completed { result: Ok(_), .. } => None,
+    }
+}
+
 fn normalize_message_completion_error(error: Error) -> Error {
     match error {
         Error::CompletionError {
@@ -2475,6 +2535,31 @@ mod tests {
         state.disconnected();
         assert_eq!(state.state.load(Ordering::Acquire), STATE_FAILED);
         assert!(matches!(state.terminal_error(), Error::TransportClosed));
+    }
+
+    #[test]
+    fn completion_failure_terminalizes_before_older_ready_work_can_post() {
+        let state = engine_state();
+        state.state.store(STATE_READY, Ordering::Release);
+        lock_std(&state.events).push_back(EngineMessageEvent::Start);
+
+        let completion = DetachedOperationCompletion::Completed {
+            result: Err(Error::CompletionError {
+                status: crate::wc::WcStatus::WrFlushErr,
+                vendor_err: 0,
+            }),
+            mr: None,
+        };
+        let error = detached_completion_error(&completion).unwrap();
+        state.fail_from_completion_callback(error);
+        state.enqueue_event(EngineMessageEvent::Receive(completion));
+
+        assert_eq!(state.state.load(Ordering::Acquire), STATE_FAILED);
+        assert!(matches!(state.terminal_error(), Error::TransportClosed));
+        assert!(lock_std(&state.events).is_empty());
+        assert!(state.close_connection_pending.load(Ordering::Acquire));
+        assert_eq!(state.process(1), 1);
+        assert!(!state.close_connection_pending.load(Ordering::Acquire));
     }
 
     // ── Credit Validation Unit Tests ──────────────────────────────────

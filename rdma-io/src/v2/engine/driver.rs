@@ -32,6 +32,7 @@ use crate::v2::error::{Error, Result};
 pub(super) const TERMINAL_WORK: usize = 1 << 0;
 pub(super) const RECLAMATION_WORK: usize = 1 << 1;
 pub(super) const READY_CONNECTION_WORK: usize = 1 << 2;
+pub(super) const CQ_RECHECK_WORK: usize = 1 << 4;
 const WORK_CLASS_COUNT: usize = 5;
 
 pub(super) struct WorkSignal {
@@ -144,6 +145,9 @@ impl RdmaEngineDriver {
         }
         if published & super::cm::CM_WORK != 0 {
             self.scheduler.mark_class_ready(WorkClass::Cm);
+        }
+        if published & CQ_RECHECK_WORK != 0 {
+            self.scheduler.mark_class_ready(WorkClass::Cq);
         }
     }
 

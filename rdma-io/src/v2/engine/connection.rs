@@ -526,7 +526,7 @@ impl ConnectionState {
         self.close_notify.notify_waiters();
     }
 
-    pub(super) fn apply_drain_deadline(&self) -> Option<(usize, usize)> {
+    pub(super) fn begin_quarantine(&self) -> Option<(usize, usize)> {
         let accepted = lock_unpoison(&self.accepted);
         let outstanding = accepted.len();
         if outstanding == 0 {
@@ -535,6 +535,10 @@ impl ConnectionState {
         if self.quarantined.swap(true, Ordering::AcqRel) {
             return None;
         }
+        Some((outstanding, outstanding))
+    }
+
+    pub(super) fn publish_quarantine(&self, outstanding: usize) {
         let mut outcome = lock_unpoison(&self.close_outcome);
         if outcome.is_none() {
             *outcome = Some(MemoizedTerminalResult::from_error(
@@ -544,10 +548,8 @@ impl ConnectionState {
                 },
             ));
         }
-        drop(accepted);
         drop(outcome);
         self.close_notify.notify_waiters();
-        Some((outstanding, outstanding))
     }
 
     pub(super) fn recover_quarantine(&self) -> bool {
