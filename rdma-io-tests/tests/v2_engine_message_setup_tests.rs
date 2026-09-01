@@ -4,7 +4,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use rdma_io::cm::RdmaCmDeviceList;
-use rdma_io::v2::message_transport::{TestHelloAttachHook, TestHelloOverride};
+use rdma_io::v2::test_support::{TestHelloAttachHook, TestHelloOverride};
 use rdma_io::v2::{
     CompletionMode, Error, MessageTransport, MessageTransportBuilder, RdmaConnectionConfig,
     RdmaEngine, RdmaEngineBuilder, RdmaEngineDriver, RdmaListener, RdmaListenerConfig, Result,

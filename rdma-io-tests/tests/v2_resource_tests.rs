@@ -1,5 +1,5 @@
 use rdma_io::cm::RdmaCmDeviceList;
-use rdma_io::test_support::destruction::{DestructionKind, DestructionRecorder};
+use rdma_io::v2::test_support::{DestructionKind, DestructionRecorder};
 use rdma_io::v2::{
     AccessIntent, CompletionMode, Context, CqBuilder, Error, RdmaEngineBuilder, RdmaEngineLifecycle,
 };
@@ -18,7 +18,12 @@ fn test_v2_context_and_pd() {
     }
     let context = Context::open_first().expect("open device");
     let pd = context.alloc_pd().expect("allocate protection domain");
-    assert!(!pd.inner().as_raw().is_null());
+    assert_eq!(
+        pd.reg_mr(64, AccessIntent::LocalOnly)
+            .expect("register memory")
+            .len(),
+        64
+    );
 }
 
 #[test]
@@ -42,15 +47,12 @@ fn pinned_context_owns_pd_cq_and_mr_until_last_child_drop() {
         return;
     }
 
-    let recorder = DestructionRecorder::arm(32);
     let list = RdmaCmDeviceList::new().expect("enumerate librdmacm devices");
     let name = software_device_name(&list).expect("software RDMA context");
-    let inner = list.context_by_name(&name).expect("select exact context");
-    assert!(list.contains_context(&inner));
-    assert_eq!(inner.device_name(), Some(name.as_str()));
     drop(list);
 
-    let context = Context::from_inner(inner);
+    let recorder = DestructionRecorder::arm(32);
+    let context = Context::open_by_name(&name).expect("select anchored context");
     let pd = context.alloc_pd().expect("allocate anchored PD");
     let cq = CqBuilder::new(&context, 16)
         .build()
@@ -95,7 +97,8 @@ fn provider_resources_and_mr_validation_live_in_integration_tests() {
     }
     let list = RdmaCmDeviceList::new().expect("enumerate librdmacm devices");
     let name = software_device_name(&list).expect("software RDMA context");
-    let context = Context::from_inner(list.context_by_name(&name).unwrap());
+    drop(list);
+    let context = Context::open_by_name(&name).unwrap();
     let pd = context.alloc_pd().unwrap();
 
     let poll_cq = CqBuilder::new(&context, 16).build().unwrap();

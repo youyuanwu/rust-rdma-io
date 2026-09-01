@@ -7,6 +7,26 @@
 //! or IOCP completion port, although the implementation uses libibverbs and
 //! librdmacm directly.
 //!
+//! # Use case
+//!
+//! Import retained production types from `rdma_io::v2`; implementation modules
+//! are private and each item has one public spelling.
+//!
+//! # Ownership and progress
+//!
+//! Independent resources are caller-driven. Engine resources progress only
+//! while the returned [`RdmaEngineDriver`] is polled.
+//!
+//! # Safety and limits
+//!
+//! V2 exposes typed ownership and completion APIs without raw V1 resource
+//! adoption, borrowed contexts, or raw completion buffers.
+//!
+//! # Availability
+//!
+//! Core resources are always available; async and engine APIs follow the
+//! feature flags documented below.
+//!
 //! The library creates no task or thread. Applications must spawn or directly
 //! poll the one driver future, and no engine work progresses otherwise.
 //! Message transport adds zero tasks: receive completions, reposts, DATA,
@@ -32,33 +52,38 @@
 //! an active Tokio runtime with time enabled before deadlines are armed.
 //!
 //! The retained independent resource surface includes [`Context`], [`Pd`],
-//! [`Cq`], [`Mr`], [`Qp`], typed [`Op`] values, [`Completions`], and
-//! [`CqPoller`]. V1 APIs are separate and unchanged; existing v2 endpoint
-//! compatibility is not provided.
+//! [`Cq`], [`Mr`], [`Qp`], the four named [`Qp::post_send`],
+//! [`Qp::post_recv`], [`Qp::post_write`], and [`Qp::post_read`] operations,
+//! [`Completions`], and [`CqPoller`]. V1 APIs are separate and unchanged;
+//! existing v2 endpoint compatibility is not provided.
 //!
 //! # Feature Flags
 //!
 //! - Core v2 types are always available (no feature required)
-//! - `async` feature enables [`completion::Completions`] for async CQ notification
+//! - `async` feature enables [`Completions`] for async CQ notification
 //! - `tokio` feature adds [`Cq::completions_tokio()`] convenience
 
-pub mod context;
-pub mod cq;
-pub mod error;
-pub mod mr;
-pub mod op;
-pub mod pd;
-pub mod qp;
+#![deny(missing_docs)]
 
 #[cfg(feature = "async")]
-pub mod completion;
+mod completion;
+mod context;
+mod cq;
 #[cfg(feature = "async")]
-pub mod cq_poller;
+mod cq_poller;
 #[cfg(feature = "tokio")]
-pub mod engine;
+mod engine;
+mod error;
 #[cfg(feature = "tokio")]
-pub mod message_transport;
-pub mod protocol;
+mod message_transport;
+mod mr;
+mod op;
+mod pd;
+mod protocol;
+mod qp;
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub mod test_support;
 #[cfg(feature = "tokio")]
 mod tokio_support;
 
@@ -67,7 +92,7 @@ pub use context::Context;
 pub use cq::{Cq, CqBuilder};
 pub use error::{Error, Result};
 pub use mr::{AccessIntent, Mr, RemoteMr};
-pub use op::{Completion, Op, OpCode};
+pub use op::Completion;
 pub use pd::Pd;
 pub use qp::{Qp, QpBuilder};
 

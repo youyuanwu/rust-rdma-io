@@ -226,6 +226,43 @@ run_full_workspace() {
     fi
 }
 
+run_static_preflight() {
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        local user_home
+        user_home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+        sudo -u "$SUDO_USER" env \
+            HOME="$user_home" \
+            PATH="$TOOLCHAIN_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            CARGO="$CARGO" \
+            "$CARGO" test -p rdma-io-tests \
+                --test v2_surface_cutover_tests \
+                --test v2_docs_manifest \
+                --test v2_docs_legacy_surface \
+                --test v2_no_hidden_spawn || return $?
+        sudo -u "$SUDO_USER" env \
+            HOME="$user_home" \
+            PATH="$TOOLCHAIN_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            CARGO="$CARGO" \
+            "$ROOT_DIR/scripts/check-v2-api-surface.sh" || return $?
+        sudo -u "$SUDO_USER" env \
+            HOME="$user_home" \
+            PATH="$TOOLCHAIN_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            CARGO="$CARGO" \
+            "$ROOT_DIR/scripts/check-v2-rustdoc.sh"
+    else
+        env PATH="$TOOLCHAIN_BIN:$PATH" CARGO="$CARGO" \
+            "$CARGO" test -p rdma-io-tests \
+                --test v2_surface_cutover_tests \
+                --test v2_docs_manifest \
+                --test v2_docs_legacy_surface \
+                --test v2_no_hidden_spawn || return $?
+        env PATH="$TOOLCHAIN_BIN:$PATH" CARGO="$CARGO" \
+            "$ROOT_DIR/scripts/check-v2-api-surface.sh" || return $?
+        env PATH="$TOOLCHAIN_BIN:$PATH" CARGO="$CARGO" \
+            "$ROOT_DIR/scripts/check-v2-rustdoc.sh"
+    fi
+}
+
 restore_rxe() {
     echo "=== Restoring RXE ==="
     "$ROOT_DIR/scripts/teardown-siw.sh" || restoration_status=$?
@@ -247,9 +284,19 @@ restore_rxe() {
     fi
 }
 
+cd "$ROOT_DIR" || exit 1
+if [[ "$FULL_VALIDATION" -eq 1 ]]; then
+    echo "=== Run Phase 12 static surface and rustdoc preflight ==="
+    run_static_preflight
+    static_status=$?
+    if [[ "$static_status" -ne 0 ]]; then
+        echo "Phase 12 static preflight failed before provider switching (status $static_status)" >&2
+        exit "$static_status"
+    fi
+fi
+
 trap restore_rxe EXIT
 
-cd "$ROOT_DIR" || exit 1
 run_step "Unload hardware RDMA providers" "$ROOT_DIR/scripts/unload-hw-rdma.sh"
 run_step "Remove SIW before RXE validation" "$ROOT_DIR/scripts/teardown-siw.sh"
 run_step "Set up RXE" "$ROOT_DIR/scripts/setup-rxe.sh"

@@ -4,8 +4,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use rdma_io::cm::{CmEventType, ConnParam, RdmaCmDeviceList};
-use rdma_io::test_support::destruction::{DestructionKind, DestructionRecorder};
-use rdma_io::test_support::engine_driver::TestEngineResources;
+use rdma_io::v2::test_support::{DestructionKind, DestructionRecorder, TestEngineResources};
 use rdma_io::v2::{
     AccessIntent, CompletionMode, Error, RdmaConnection, RdmaConnectionConfig, RdmaEngine,
     RdmaEngineBuilder, RdmaEngineLifecycle,
@@ -19,15 +18,6 @@ fn software_device_name() -> Option<String> {
     list.device_names()
         .into_iter()
         .find(|name| name.starts_with("rxe") || name.starts_with("siw"))
-}
-
-fn conn_param(config: &RdmaConnectionConfig) -> ConnParam {
-    ConnParam {
-        responder_resources: config.responder_resource_count() as u8,
-        initiator_depth: config.initiator_depth_count() as u8,
-        retry_count: config.retry_count_value() as u8,
-        rnr_retry_count: config.rnr_retry_count_value() as u8,
-    }
 }
 
 fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
@@ -62,18 +52,28 @@ async fn establish_pair(
     let listener = bind_listener_with_retry().await;
     let address = connect_addr_for(listener.local_addr());
     let server_config = config.clone();
+    let (max_send_wr, max_recv_wr, parameter) = if use_default_client {
+        (19, 34, ConnParam::default())
+    } else {
+        (
+            8,
+            8,
+            ConnParam {
+                responder_resources: 0,
+                initiator_depth: 0,
+                retry_count: 7,
+                rnr_retry_count: 7,
+            },
+        )
+    };
     let server_resources = resources.clone();
     let server = async move {
         let cm_id = listener.get_request().await.unwrap();
         server_resources.require_context(&cm_id).unwrap();
         let qp = server_resources
-            .create_qp(
-                &cm_id,
-                server_config.maximum_send_work_requests() as u32,
-                server_config.maximum_receive_work_requests() as u32,
-            )
+            .create_qp(&cm_id, max_send_wr, max_recv_wr)
             .unwrap();
-        cm_id.accept(&conn_param(&server_config)).unwrap();
+        cm_id.accept(&parameter).unwrap();
         listener.await_established().await.unwrap();
         let cm = rdma_io::async_cm::AsyncCmListener::migrate_accepted(cm_id).unwrap();
         server_resources
@@ -439,16 +439,8 @@ async fn run_shutdown_awaiting_delivery(mode: CompletionMode) {
     let server_task = tokio::spawn(async move {
         let cm_id = listener.get_request().await.unwrap();
         server_resources.require_context(&cm_id).unwrap();
-        let qp = server_resources
-            .create_qp(
-                &cm_id,
-                RdmaConnectionConfig::default().maximum_send_work_requests() as u32,
-                RdmaConnectionConfig::default().maximum_receive_work_requests() as u32,
-            )
-            .unwrap();
-        cm_id
-            .accept(&conn_param(&RdmaConnectionConfig::default()))
-            .unwrap();
+        let qp = server_resources.create_qp(&cm_id, 19, 34).unwrap();
+        cm_id.accept(&ConnParam::default()).unwrap();
         listener.await_established().await.unwrap();
         server_established_tx.send(()).unwrap();
         loop {

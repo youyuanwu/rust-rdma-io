@@ -193,23 +193,23 @@ async fn assert_routing_and_quarantine_metrics(mode: CompletionMode) {
     let sending_client = Arc::clone(&client);
     let send = tokio::spawn(async move { sending_client.send(b"routed").await });
     held.wait_observed().await.unwrap();
-    let identity = held.completion_identity().unwrap();
+    let identity = held.completion().unwrap();
     let before_rejects = engine.diagnostics();
     resources
-        .inject_completion(identity.wr_id, identity.qp_num + 1, identity.opcode)
+        .inject_completion(identity.wr_id(), identity.qp_num() + 1, identity.opcode())
         .unwrap();
     resources
         .inject_completion(
-            identity.wr_id.wrapping_add(1_u64 << 32),
-            identity.qp_num,
-            identity.opcode,
+            identity.wr_id().wrapping_add(1_u64 << 32),
+            identity.qp_num(),
+            identity.opcode(),
         )
         .unwrap();
     resources
-        .inject_completion(u64::MAX, identity.qp_num, identity.opcode)
+        .inject_completion(u64::MAX, identity.qp_num(), identity.opcode())
         .unwrap();
     resources
-        .inject_completion(identity.wr_id, identity.qp_num, WcOpcode::Recv)
+        .inject_completion(identity.wr_id(), identity.qp_num(), WcOpcode::Recv)
         .unwrap();
     let rejected = engine.diagnostics();
     assert_eq!(
@@ -231,7 +231,7 @@ async fn assert_routing_and_quarantine_metrics(mode: CompletionMode) {
     assert_eq!(&*routed, b"routed");
     drop(routed);
     resources
-        .inject_completion(identity.wr_id, identity.qp_num, identity.opcode)
+        .inject_completion(identity.wr_id(), identity.qp_num(), identity.opcode())
         .unwrap();
     assert_eq!(
         engine.diagnostics().duplicate_cqes,

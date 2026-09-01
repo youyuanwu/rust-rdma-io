@@ -71,11 +71,11 @@ use driver::WorkSignal;
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
 pub use driver::{
-    TestAcceptedOperation, TestAdmissionBarrier, TestCompletionIdentity,
-    TestConnectionCqeSuppression, TestConnectionIdentity, TestCqArmWindowControl,
-    TestCqeSuppression, TestEngineInstrumentation, TestEngineQp, TestEngineResources,
-    TestReadyWorkControl, TestRouteHandle,
+    TestAcceptedOperation, TestAdmissionBarrier, TestConnectionCqeSuppression, TestContextIdentity,
+    TestCqArmWindowControl, TestCqeSuppression, TestEngineInstrumentation, TestEngineQp,
+    TestEngineResources, TestProviderLimits, TestReadyWorkControl, TestRouteHandle,
 };
+use lifecycle::MemoizedTerminalResult;
 pub use listener::{RdmaListener, RdmaListenerConfig};
 pub(crate) use operation::DetachedOperationCompletion;
 pub use operation::RdmaOperation;
@@ -83,9 +83,6 @@ pub use operation::RdmaOperation;
 pub(crate) use operation::{BatchOwnershipTransfer, PreparedBatchOwnership};
 use operation::{CqCreditPool, OperationRegistry};
 use registry::{ConnectionRegistry, OperationToken, lock_unpoison, write_unpoison};
-#[cfg(any(test, feature = "test-hooks"))]
-#[doc(hidden)]
-pub use registry::{TestRegistryProbe, probe_connection_registry};
 use resources::{EngineResourceRefs, EngineResources, ResourceSummary};
 use scheduler::WorkScheduler;
 use scheduler::{DeadlineKind, DeadlineRequest};
@@ -122,6 +119,23 @@ pub(crate) struct SetupSummary {
 /// errors reported through Tokio's fallible API. Tokio exposes no non-panicking
 /// query for an active runtime whose I/O driver is disabled, so such a runtime
 /// can still abort inside Tokio; callers using `panic=abort` must enable I/O.
+///
+/// # Use case
+///
+/// Construct one device-bound engine and its sole explicit driver future.
+///
+/// # Ownership and progress
+///
+/// `build` returns the handle and driver without spawning either.
+///
+/// # Safety and limits
+///
+/// Configuration, provider limits, registry layouts, and checked arithmetic
+/// are validated before dependent resources escape.
+///
+/// # Availability
+///
+/// Available with the `tokio` feature.
 pub struct RdmaEngineBuilder {
     config: EngineConfig,
 }
@@ -418,7 +432,7 @@ pub struct RdmaEngineDriver {
     resources: Option<EngineResources>,
     scheduler: WorkScheduler,
     cq_readiness: crate::v2::completion::CqReadiness,
-    cq_buffer: Box<[crate::wc::WorkCompletion]>,
+    cq_buffer: Box<[super::Completion]>,
     deadline_sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
     deadline_at: Option<tokio::time::Instant>,
     runtime_checked: bool,
@@ -453,7 +467,7 @@ pub(crate) struct EngineShared {
     // Notify stores only live Notified futures and wakes every concurrent
     // shutdown waiter without retaining registrations from dropped futures.
     terminal_notify: Notify,
-    terminal: Mutex<Option<EngineOutcome>>,
+    terminal: Mutex<Option<MemoizedTerminalResult>>,
     driver_yields: AtomicU64,
     quarantines: Mutex<QuarantineState>,
     #[cfg(any(test, feature = "test-hooks"))]
@@ -566,7 +580,7 @@ impl EngineShared {
         true
     }
 
-    fn finish(&self, outcome: EngineOutcome) {
+    fn finish(&self, outcome: MemoizedTerminalResult) {
         let (operations_to_wake, connections_to_wake) = {
             let _admission = write_unpoison(&self.admission);
             let mut terminal = lock_unpoison(&self.terminal);
@@ -575,20 +589,19 @@ impl EngineShared {
             }
             self.shutdown_requested.store(true, Ordering::Release);
             self.transition_shutdown_requested();
-            let lifecycle = match &outcome {
-                EngineOutcome::Success => RdmaEngineLifecycle::Terminated,
-                EngineOutcome::Failure(_) => {
-                    self.diagnostic_counters
-                        .terminal_driver_errors
-                        .fetch_add(1, Ordering::Relaxed);
-                    RdmaEngineLifecycle::Failed
-                }
+            let lifecycle = if outcome.is_success() {
+                RdmaEngineLifecycle::Terminated
+            } else {
+                self.diagnostic_counters
+                    .terminal_driver_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                RdmaEngineLifecycle::Failed
             };
             *terminal = Some(outcome.clone());
             self.transition_terminal(lifecycle);
 
             let mut operations_to_wake = Vec::new();
-            if matches!(outcome, EngineOutcome::Failure(_)) {
+            if outcome.is_error() {
                 for operation in self.operations.occupied() {
                     let terminalized = operation.finalize_terminal(&outcome);
                     debug_assert!(
@@ -626,7 +639,7 @@ impl EngineShared {
 
         self.cm.terminalize(&outcome);
         for connection in &connections_to_wake {
-            if matches!(outcome, EngineOutcome::Failure(_))
+            if outcome.is_error()
                 && connection.retain_bundle_for_engine_failure()
                 && self.track_connection_quarantine(connection.token)
             {
@@ -645,7 +658,7 @@ impl EngineShared {
         self.terminal_notify.notify_waiters();
     }
 
-    fn outcome(&self) -> Option<EngineOutcome> {
+    fn outcome(&self) -> Option<MemoizedTerminalResult> {
         lock_unpoison(&self.terminal).clone()
     }
 
@@ -880,9 +893,9 @@ impl EngineShared {
             .collect::<Vec<_>>();
         connections.sort_by_key(|connection| {
             (
-                connection.identity.slot,
-                connection.identity.generation,
-                connection.identity.qp_num,
+                connection.identity.registry_slot(),
+                connection.identity.registration_generation(),
+                connection.identity.qp_num(),
             )
         });
         connections
@@ -1239,86 +1252,6 @@ impl EngineShared {
 
     fn has_deadline_requests(&self) -> bool {
         !lock_unpoison(&self.deadline_requests).is_empty()
-    }
-}
-
-#[derive(Clone)]
-enum EngineOutcome {
-    Success,
-    Failure(EngineFailure),
-}
-
-impl EngineOutcome {
-    fn into_result(self) -> Result<()> {
-        match self {
-            Self::Success => Ok(()),
-            Self::Failure(error) => Err(error.into_error()),
-        }
-    }
-
-    fn summary(self) -> Option<RdmaEngineTerminalError> {
-        match self {
-            Self::Success => None,
-            Self::Failure(error) => Some(error.summary()),
-        }
-    }
-}
-
-#[derive(Clone)]
-enum EngineFailure {
-    DriverShutdown,
-    Progress(Error),
-    Wedged {
-        retained_bundles: usize,
-        outstanding_operations: usize,
-        cq_debt: usize,
-    },
-}
-
-impl EngineFailure {
-    fn into_error(self) -> Error {
-        match self {
-            Self::DriverShutdown => Error::DriverShutdown,
-            Self::Progress(error) => error,
-            Self::Wedged {
-                retained_bundles,
-                outstanding_operations,
-                cq_debt,
-            } => Error::EngineWedged {
-                retained_bundles,
-                outstanding_operations,
-                cq_debt,
-            },
-        }
-    }
-
-    fn summary(self) -> RdmaEngineTerminalError {
-        let error = self.into_error();
-        RdmaEngineTerminalError {
-            class: match error {
-                Error::DriverShutdown => "DriverShutdown",
-                Error::InvalidConfig(_) => "InvalidConfig",
-                Error::EngineWedged { .. } => "EngineWedged",
-                _ => "EngineError",
-            }
-            .into(),
-            message: error.to_string(),
-        }
-    }
-
-    fn from_progress(error: Error) -> Self {
-        match error {
-            Error::EngineWedged {
-                retained_bundles,
-                outstanding_operations,
-                cq_debt,
-            } => Self::Wedged {
-                retained_bundles,
-                outstanding_operations,
-                cq_debt,
-            },
-            error => Self::Progress(error),
-        }
     }
 }
 

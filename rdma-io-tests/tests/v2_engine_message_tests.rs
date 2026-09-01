@@ -5,8 +5,7 @@ use std::time::Duration;
 use std::{collections::HashSet, iter};
 
 use rdma_io::cm::RdmaCmDeviceList;
-use rdma_io::test_support::destruction::{DestructionKind, DestructionRecorder};
-use rdma_io::v2::message_transport::TestSteadyFrame;
+use rdma_io::v2::test_support::{DestructionKind, DestructionRecorder, TestSteadyFrame};
 use rdma_io::v2::{
     CompletionMode, Error, MessageTransport, MessageTransportBuilder, RdmaEngine,
     RdmaEngineBuilder, RdmaListener, RdmaListenerConfig, Result,

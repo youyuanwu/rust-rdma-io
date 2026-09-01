@@ -5,7 +5,7 @@ use std::task::Poll;
 use std::time::Duration;
 
 use futures_util::future::join_all;
-use rdma_io::v2::message_transport::TestSteadyFrame;
+use rdma_io::v2::test_support::TestSteadyFrame;
 use rdma_io::v2::{
     AccessIntent, CompletionMode, Error, MessageTransport, MessageTransportBuilder, RdmaConnection,
     RdmaEngine, RdmaEngineBuilder, RdmaListenerConfig,
@@ -329,23 +329,23 @@ async fn run_mode(mode: CompletionMode) {
         tokio::spawn(async move { client.send(b"stale-safe").await })
     };
     held.wait_observed().await.unwrap();
-    let identity = held.completion_identity().unwrap();
+    let identity = held.completion().unwrap();
     let before = engine.diagnostics();
     resources
         .inject_completion(
-            identity.wr_id.wrapping_add(1_u64 << 32),
-            identity.qp_num,
-            identity.opcode,
+            identity.wr_id().wrapping_add(1_u64 << 32),
+            identity.qp_num(),
+            identity.opcode(),
         )
         .unwrap();
     resources
-        .inject_completion(u64::MAX, identity.qp_num, identity.opcode)
+        .inject_completion(u64::MAX, identity.qp_num(), identity.opcode())
         .unwrap();
     resources
-        .inject_completion(identity.wr_id, identity.qp_num + 1, identity.opcode)
+        .inject_completion(identity.wr_id(), identity.qp_num() + 1, identity.opcode())
         .unwrap();
     resources
-        .inject_completion(identity.wr_id, identity.qp_num, WcOpcode::Recv)
+        .inject_completion(identity.wr_id(), identity.qp_num(), WcOpcode::Recv)
         .unwrap();
     let rejected = engine.diagnostics();
     assert_eq!(
@@ -364,7 +364,7 @@ async fn run_mode(mode: CompletionMode) {
     assert_eq!(&*stale_safe, b"stale-safe");
     drop(stale_safe);
     resources
-        .inject_completion(identity.wr_id, identity.qp_num, identity.opcode)
+        .inject_completion(identity.wr_id(), identity.qp_num(), identity.opcode())
         .unwrap();
     assert_eq!(
         engine.diagnostics().duplicate_cqes,

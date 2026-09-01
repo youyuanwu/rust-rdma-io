@@ -10,6 +10,7 @@ use tokio::sync::Notify;
 
 use self::qp::QpCapabilitiesExt;
 use super::diagnostics::RdmaConnectionDiagnostics;
+use super::lifecycle::MemoizedTerminalResult;
 use super::operation::RdmaOperation;
 use super::registry::{
     ConnectionToken, OperationToken, lock_unpoison, read_unpoison, write_unpoison,
@@ -23,14 +24,43 @@ use crate::wc::WorkCompletion;
 use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
 
 /// Non-owning connection identity suitable for diagnostics and correlation.
+///
+/// # Use case
+///
+/// Compare, hash, and log connection identity while observing its `qp_num`.
+///
+/// # Ownership and progress
+///
+/// The copied value retains no connection or engine ownership.
+///
+/// # Safety and limits
+///
+/// Registry slot and generation remain private so callers cannot construct
+/// stale routing identities.
+///
+/// # Availability
+///
+/// Returned by [`RdmaConnection::identity`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RdmaConnectionIdentity {
-    /// Direct-index connection registry slot.
-    pub slot: u32,
-    /// Non-wrapping registration generation.
-    pub generation: u32,
-    /// Provider-reported queue-pair number.
-    pub qp_num: u32,
+    slot: u32,
+    generation: u32,
+    qp_num: u32,
+}
+
+impl RdmaConnectionIdentity {
+    /// Return the provider-reported queue-pair number.
+    pub fn qp_num(&self) -> u32 {
+        self.qp_num
+    }
+
+    pub(super) fn registry_slot(&self) -> u32 {
+        self.slot
+    }
+
+    pub(super) fn registration_generation(&self) -> u32 {
+        self.generation
+    }
 }
 
 /// Engine-owned low-level RDMA connection.
@@ -132,7 +162,7 @@ impl RdmaConnection {
             .ok_or_else(|| Error::InvalidConfig("connection peer address is unavailable".into()))
     }
 
-    /// Return the current connection slot, generation, and exact `qp_num`.
+    /// Return the opaque current connection identity and exact `qp_num`.
     pub fn identity(&self) -> RdmaConnectionIdentity {
         self.state.identity()
     }
@@ -220,7 +250,7 @@ pub(crate) struct ConnectionState {
     ready_work: Mutex<Option<Arc<dyn ConnectionReadyWork>>>,
     ready_published: AtomicBool,
     close_started: AtomicBool,
-    close_outcome: Mutex<Option<CloseOutcome>>,
+    close_outcome: Mutex<Option<MemoizedTerminalResult>>,
     close_notify: Notify,
     quarantined: AtomicBool,
     error_transition_started: AtomicBool,
@@ -296,8 +326,8 @@ impl ConnectionState {
         }
         let mut credits = lock_unpoison(&self.local_credits);
         let (used, maximum) = match direction {
-            Direction::Send => (&mut credits.send, self.config.max_send_wr_value()),
-            Direction::Recv => (&mut credits.recv, self.config.max_recv_wr_value()),
+            Direction::Send => (&mut credits.send, self.config.max_send_wr),
+            Direction::Recv => (&mut credits.recv, self.config.max_recv_wr),
         };
         if *used >= maximum {
             return Err(Error::CapacityExhausted);
@@ -421,13 +451,13 @@ impl ConnectionState {
         lock_unpoison(&self.lifecycle_gate)
     }
 
-    pub(super) fn finalize_engine(&self, outcome: &super::EngineOutcome) {
+    pub(super) fn finalize_engine(&self, outcome: &MemoizedTerminalResult) {
         self.stop_posting();
         let _ = self.transition_to_error_once();
-        if let Some(error) = outcome.clone().into_result().err() {
+        if let Some(error) = outcome.error() {
             let mut close_outcome = lock_unpoison(&self.close_outcome);
             if close_outcome.is_none() {
-                *close_outcome = Some(CloseOutcome::Failed(error.clone()));
+                *close_outcome = Some(MemoizedTerminalResult::from_error(error.clone()));
             }
             drop(close_outcome);
             if let Some(work) = self.ready_work() {
@@ -447,7 +477,7 @@ impl ConnectionState {
         self.stop_posting();
         let mut outcome = lock_unpoison(&self.close_outcome);
         if outcome.is_none() {
-            *outcome = Some(CloseOutcome::Failed(error.clone()));
+            *outcome = Some(MemoizedTerminalResult::from_error(error.clone()));
         }
         drop(outcome);
         if let Some(work) = self.ready_work() {
@@ -507,10 +537,12 @@ impl ConnectionState {
         }
         let mut outcome = lock_unpoison(&self.close_outcome);
         if outcome.is_none() {
-            *outcome = Some(CloseOutcome::Quarantined {
-                outstanding,
-                cq_debt: outstanding,
-            });
+            *outcome = Some(MemoizedTerminalResult::from_error(
+                Error::ConnectionQuarantined {
+                    outstanding_operations: outstanding,
+                    cq_debt: outstanding,
+                },
+            ));
         }
         drop(accepted);
         drop(outcome);
@@ -529,7 +561,7 @@ impl ConnectionState {
     pub(super) fn finish_retirement(&self) {
         let mut outcome = lock_unpoison(&self.close_outcome);
         if outcome.is_none() {
-            *outcome = Some(CloseOutcome::Success);
+            *outcome = Some(MemoizedTerminalResult::success());
         }
         drop(outcome);
         self.retired.store(true, Ordering::Release);
@@ -540,35 +572,31 @@ impl ConnectionState {
         self.stop_posting();
         self.release_admission();
         let mut outcome = lock_unpoison(&self.close_outcome);
-        if !matches!(*outcome, Some(CloseOutcome::Quarantined { .. })) {
-            *outcome = Some(CloseOutcome::Failed(error));
+        if !outcome
+            .as_ref()
+            .is_some_and(MemoizedTerminalResult::is_connection_quarantined)
+        {
+            *outcome = Some(MemoizedTerminalResult::from_error(error));
         }
         drop(outcome);
         self.retired.store(true, Ordering::Release);
         self.close_notify.notify_waiters();
     }
 
-    fn close_outcome(&self) -> Option<CloseOutcome> {
+    fn close_outcome(&self) -> Option<MemoizedTerminalResult> {
         let outcome = lock_unpoison(&self.close_outcome).clone();
         match outcome {
-            Some(CloseOutcome::Quarantined { .. }) => outcome,
+            Some(ref value) if value.is_connection_quarantined() => outcome,
             Some(_) if self.is_retired() => outcome,
             _ => None,
         }
     }
 
     pub(super) fn operation_close_error(&self) -> Error {
-        match lock_unpoison(&self.close_outcome).clone() {
-            Some(CloseOutcome::Failed(error)) => error,
-            Some(CloseOutcome::Quarantined {
-                outstanding,
-                cq_debt,
-            }) => Error::ConnectionQuarantined {
-                outstanding_operations: outstanding,
-                cq_debt,
-            },
-            Some(CloseOutcome::Success) | None => Error::TransportClosed,
-        }
+        lock_unpoison(&self.close_outcome)
+            .as_ref()
+            .and_then(MemoizedTerminalResult::error)
+            .unwrap_or(Error::TransportClosed)
     }
 
     pub(super) fn close_started(&self) -> bool {
@@ -634,29 +662,6 @@ impl ConnectionState {
 
     pub(super) fn release_admission(&self) {
         drop(lock_unpoison(&self.admission).take());
-    }
-}
-
-#[derive(Clone)]
-enum CloseOutcome {
-    Success,
-    Quarantined { outstanding: usize, cq_debt: usize },
-    Failed(Error),
-}
-
-impl CloseOutcome {
-    fn into_result(self) -> Result<()> {
-        match self {
-            Self::Success => Ok(()),
-            Self::Quarantined {
-                outstanding,
-                cq_debt,
-            } => Err(Error::ConnectionQuarantined {
-                outstanding_operations: outstanding,
-                cq_debt,
-            }),
-            Self::Failed(error) => Err(error),
-        }
     }
 }
 
@@ -1017,7 +1022,7 @@ impl SharedCmId {
             .cm_id
             .take()
             .expect("shared CM ID is destroyed exactly once");
-        let result = cm_id.destroy().map_err(Error::from);
+        let result = cm_id.destroy().map_err(Error::from_v1);
         self.channel.take();
         result
     }
@@ -1027,7 +1032,7 @@ impl SharedCmId {
             .as_mut()
             .expect("shared CM ID remains live until driver destruction")
             .install_context_token(route)
-            .map_err(Error::from)
+            .map_err(Error::from_v1)
     }
 }
 
@@ -1100,7 +1105,7 @@ impl VerbsConnectionResources {
         let cm_owner = lock_unpoison(&self.cm_owner);
         match cm_owner.as_ref() {
             Some(ConnectionCmOwner::Shared { cm_id, .. }) => {
-                cm_id.connect(param).map_err(Error::from)
+                cm_id.connect(param).map_err(Error::from_v1)
             }
             #[cfg(any(test, feature = "test-hooks"))]
             Some(ConnectionCmOwner::External { .. }) => Err(Error::InvalidConfig(
@@ -1114,7 +1119,7 @@ impl VerbsConnectionResources {
         let cm_owner = lock_unpoison(&self.cm_owner);
         match cm_owner.as_ref() {
             Some(ConnectionCmOwner::Shared { cm_id, .. }) => {
-                cm_id.accept(param).map_err(Error::from)
+                cm_id.accept(param).map_err(Error::from_v1)
             }
             #[cfg(any(test, feature = "test-hooks"))]
             Some(ConnectionCmOwner::External { .. }) => Err(Error::InvalidConfig(
@@ -1232,10 +1237,10 @@ impl WorkRequestPoster for VerbsConnectionResources {
         let cm_owner = lock_unpoison(&self.cm_owner);
         match cm_owner.as_ref() {
             Some(ConnectionCmOwner::Shared { cm_id, .. }) => {
-                cm_id.disconnect().map_err(Error::from)
+                cm_id.disconnect().map_err(Error::from_v1)
             }
             Some(ConnectionCmOwner::External { _cm_id }) => {
-                _cm_id.disconnect().map_err(Error::from)
+                _cm_id.disconnect().map_err(Error::from_v1)
             }
             None => Err(Error::TransportClosed),
         }
@@ -1345,22 +1350,22 @@ mod qp {
                 (
                     "maximum send WRs",
                     self.max_send_wr as usize,
-                    config.max_send_wr_value(),
+                    config.max_send_wr,
                 ),
                 (
                     "maximum receive WRs",
                     self.max_recv_wr as usize,
-                    config.max_recv_wr_value(),
+                    config.max_recv_wr,
                 ),
                 (
                     "maximum send SGEs",
                     self.max_send_sge as usize,
-                    config.max_send_sge_value(),
+                    config.max_send_sge,
                 ),
                 (
                     "maximum receive SGEs",
                     self.max_recv_sge as usize,
-                    config.max_recv_sge_value(),
+                    config.max_recv_sge,
                 ),
             ];
             for (name, actual, requested) in required {
@@ -1517,7 +1522,8 @@ mod tests {
 
     #[test]
     fn memoized_close_failure_preserves_its_typed_error() {
-        let outcome = CloseOutcome::Failed(Error::InvalidConfig("typed close failure".into()));
+        let outcome =
+            MemoizedTerminalResult::from_error(Error::InvalidConfig("typed close failure".into()));
         for result in [outcome.clone().into_result(), outcome.into_result()] {
             assert!(
                 matches!(result, Err(Error::InvalidConfig(ref message)) if message == "typed close failure")

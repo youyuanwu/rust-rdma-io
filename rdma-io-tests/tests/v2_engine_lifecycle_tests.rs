@@ -2,7 +2,7 @@ use std::task::Poll;
 use std::time::Duration;
 
 use rdma_io::cm::RdmaCmDeviceList;
-use rdma_io::test_support::destruction::{DestructionEvent, DestructionKind, DestructionRecorder};
+use rdma_io::v2::test_support::{DestructionEvent, DestructionKind, DestructionRecorder};
 use rdma_io::v2::{
     AccessIntent, CompletionMode, Error, RdmaConnection, RdmaEngine, RdmaEngineBuilder,
     RdmaListener, RdmaListenerConfig,
@@ -303,7 +303,6 @@ async fn run_missing_cqe_recovery(mode: CompletionMode) {
     let (server, client) = accept_pair(&listener, &client_engine).await;
 
     let recv_mr = server.register_memory(64, AccessIntent::LocalOnly).unwrap();
-    let recv_mr_address = recv_mr.inner().as_raw() as usize;
     let mut send_mr = client.register_memory(64, AccessIntent::LocalOnly).unwrap();
     send_mr.as_mut_slice()[0] = 37;
     let recorder = DestructionRecorder::arm(128);
@@ -346,8 +345,7 @@ async fn run_missing_cqe_recovery(mode: CompletionMode) {
     assert!(
         !before_recovery
             .iter()
-            .any(|event| matches!(event.kind, DestructionKind::MemoryRegion)
-                && event.address == recv_mr_address)
+            .any(|event| matches!(event.kind, DestructionKind::MemoryRegion))
     );
 
     suppression.release().unwrap();
@@ -363,11 +361,11 @@ async fn run_missing_cqe_recovery(mode: CompletionMode) {
     )
     .await;
     assert_eq!(server_engine.diagnostics().quarantine_recoveries, 1);
-    assert!(recorder.snapshot().iter().any(|event| {
-        event.kind == DestructionKind::MemoryRegion
-            && event.address == recv_mr_address
-            && event.result == Some(0)
-    }));
+    assert!(
+        recorder.snapshot().iter().any(|event| {
+            event.kind == DestructionKind::MemoryRegion && event.result == Some(0)
+        })
+    );
     let repeated = server.close().await.unwrap_err();
     assert!(matches!(
         repeated,
@@ -625,7 +623,6 @@ async fn run_peer_disconnect(mode: CompletionMode) {
     let (server, client) = accept_pair(&listener, &client_engine).await;
 
     let recv_mr = server.register_memory(64, AccessIntent::LocalOnly).unwrap();
-    let recv_mr_address = recv_mr.inner().as_raw() as usize;
     let mut recv = Box::pin(server.recv(recv_mr, None));
     futures_util::future::poll_fn(|cx| {
         assert!(recv.as_mut().poll(cx).is_pending());
@@ -653,13 +650,12 @@ async fn run_peer_disconnect(mode: CompletionMode) {
         "peer disconnect did not complete real MR/QP/CM destruction",
         || {
             let events = recorder.snapshot();
-            events.iter().any(|event| {
-                event.kind == DestructionKind::MemoryRegion
-                    && event.address == recv_mr_address
-                    && event.result == Some(0)
-            }) && events
+            events
                 .iter()
-                .any(|event| event.kind == DestructionKind::QueuePair)
+                .any(|event| event.kind == DestructionKind::MemoryRegion && event.result == Some(0))
+                && events
+                    .iter()
+                    .any(|event| event.kind == DestructionKind::QueuePair)
                 && events
                     .iter()
                     .any(|event| event.kind == DestructionKind::CmId)
@@ -670,9 +666,7 @@ async fn run_peer_disconnect(mode: CompletionMode) {
     assert_cm_ids_were_drained_before_destroy(&disconnect_events);
     let mr = disconnect_events
         .iter()
-        .position(|event| {
-            event.kind == DestructionKind::MemoryRegion && event.address == recv_mr_address
-        })
+        .position(|event| event.kind == DestructionKind::MemoryRegion)
         .expect("missing peer-disconnect MR destruction");
     assert_eq!(disconnect_events[mr].result, Some(0));
     let qp = disconnect_events
@@ -758,7 +752,6 @@ async fn run_injected_driver_failure(mode: CompletionMode) {
     let mr = resources
         .register_memory(32, AccessIntent::LocalOnly)
         .unwrap();
-    let mr_address = mr.inner().as_raw() as usize;
     let frontend = engine.clone();
     let driver_task = tokio::spawn(driver);
     tokio::task::yield_now().await;
@@ -804,7 +797,6 @@ async fn run_injected_driver_failure(mode: CompletionMode) {
     let events = recorder.take();
     assert!(!recorder.overflowed());
     let mr_event = &events[position(&events, DestructionKind::MemoryRegion)];
-    assert_eq!(mr_event.address, mr_address);
     assert_eq!(mr_event.result, Some(0));
     assert_provider_root_drop_order(&events, mode, 1, false);
 }

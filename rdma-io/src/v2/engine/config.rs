@@ -41,14 +41,14 @@ pub enum CompletionMode {
 /// `32 + 2` receives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RdmaConnectionConfig {
-    max_send_wr: usize,
-    max_recv_wr: usize,
-    max_send_sge: usize,
-    max_recv_sge: usize,
-    responder_resources: usize,
-    initiator_depth: usize,
-    retry_count: usize,
-    rnr_retry_count: usize,
+    pub(crate) max_send_wr: usize,
+    pub(crate) max_recv_wr: usize,
+    pub(crate) max_send_sge: usize,
+    pub(crate) max_recv_sge: usize,
+    pub(crate) responder_resources: usize,
+    pub(crate) initiator_depth: usize,
+    pub(crate) retry_count: usize,
+    pub(crate) rnr_retry_count: usize,
 }
 
 impl Default for RdmaConnectionConfig {
@@ -115,62 +115,6 @@ impl RdmaConnectionConfig {
     pub fn rnr_retry_count(mut self, value: usize) -> Self {
         self.rnr_retry_count = value;
         self
-    }
-
-    /// Return the configured maximum send WR count.
-    pub fn maximum_send_work_requests(&self) -> usize {
-        self.max_send_wr
-    }
-
-    /// Return the configured maximum receive WR count.
-    pub fn maximum_receive_work_requests(&self) -> usize {
-        self.max_recv_wr
-    }
-
-    /// Return the configured maximum send SGE count.
-    pub fn maximum_send_sges(&self) -> usize {
-        self.max_send_sge
-    }
-
-    /// Return the configured maximum receive SGE count.
-    pub fn maximum_receive_sges(&self) -> usize {
-        self.max_recv_sge
-    }
-
-    /// Return the configured responder resource count.
-    pub fn responder_resource_count(&self) -> usize {
-        self.responder_resources
-    }
-
-    /// Return the configured initiator depth.
-    pub fn initiator_depth_count(&self) -> usize {
-        self.initiator_depth
-    }
-
-    /// Return the configured RDMA-CM retry count.
-    pub fn retry_count_value(&self) -> usize {
-        self.retry_count
-    }
-
-    /// Return the configured RDMA-CM RNR retry count.
-    pub fn rnr_retry_count_value(&self) -> usize {
-        self.rnr_retry_count
-    }
-
-    pub(crate) fn max_send_wr_value(&self) -> usize {
-        self.max_send_wr
-    }
-
-    pub(crate) fn max_recv_wr_value(&self) -> usize {
-        self.max_recv_wr
-    }
-
-    pub(crate) fn max_send_sge_value(&self) -> usize {
-        self.max_send_sge
-    }
-
-    pub(crate) fn max_recv_sge_value(&self) -> usize {
-        self.max_recv_sge
     }
 
     pub(crate) fn conn_param(&self) -> Result<ConnParam> {
@@ -523,8 +467,8 @@ mod tests {
         config.validate_without_provider().unwrap();
         config.validate_provider(&default_provider()).unwrap();
         let connection = RdmaConnectionConfig::default();
-        assert_eq!(connection.maximum_send_work_requests(), 19);
-        assert_eq!(connection.maximum_receive_work_requests(), 34);
+        assert_eq!(connection.max_send_wr, 19);
+        assert_eq!(connection.max_recv_wr, 34);
         assert_eq!(19 + 34, 53);
         assert_eq!(256 * 53, 13_568);
         assert_eq!(16_384 - 13_568, 2_816);

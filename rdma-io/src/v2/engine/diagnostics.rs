@@ -65,6 +65,25 @@ pub struct RdmaListenerDiagnostics {
 /// Creating the aggregate snapshot is constant-time with respect to registered
 /// connections and listeners. Per-object detail is collected only when
 /// [`Self::connections`] or [`Self::listeners`] is called.
+///
+/// # Use case
+///
+/// Observe engine lifecycle, capacity, routing rejects, and retained safety
+/// state without stopping the driver.
+///
+/// # Ownership and progress
+///
+/// Aggregate fields are copied. Explicit detail methods use a weak engine
+/// reference and do not keep the engine alive.
+///
+/// # Safety and limits
+///
+/// Aggregate collection is O(1); `connections()` and `listeners()` are O(N)
+/// detail queries and expose no raw resource identity.
+///
+/// # Availability
+///
+/// Available with the `tokio` feature through `RdmaEngine::diagnostics`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RdmaEngineDiagnostics {

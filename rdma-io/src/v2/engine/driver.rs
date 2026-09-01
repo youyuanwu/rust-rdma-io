@@ -18,14 +18,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 
-use crate::wc::WorkCompletion;
-
 #[cfg(panic = "unwind")]
 use super::RuntimeProbe;
 use super::config::CompletionMode;
+use super::lifecycle::MemoizedTerminalResult;
 use super::resources::EngineResources;
 use super::scheduler::{Deadline, DeadlineKind, WorkClass, WorkScheduler};
-use super::{EngineFailure, EngineOutcome, EngineShared, RdmaEngineDriver};
+use super::{EngineShared, RdmaEngineDriver};
+use crate::v2::Completion;
 use crate::v2::completion::CqReadiness;
 use crate::v2::error::{Error, Result};
 
@@ -125,7 +125,7 @@ impl RdmaEngineDriver {
             resources,
             scheduler: WorkScheduler::new(),
             cq_readiness: CqReadiness::default(),
-            cq_buffer: vec![WorkCompletion::default(); cq_budget].into_boxed_slice(),
+            cq_buffer: vec![Completion::default(); cq_budget].into_boxed_slice(),
             deadline_sleep: None,
             deadline_at: None,
             runtime_checked: false,
@@ -147,8 +147,8 @@ impl RdmaEngineDriver {
         }
     }
 
-    fn fail(&mut self, failure: EngineFailure) -> Poll<Result<()>> {
-        let outcome = EngineOutcome::Failure(failure);
+    fn fail(&mut self, error: Error) -> Poll<Result<()>> {
+        let outcome = MemoizedTerminalResult::from_error(error);
         self.shared.finish(outcome.clone());
         EngineShared::retain_after_failure(&self.shared);
         self.release_resources();
@@ -172,7 +172,7 @@ impl RdmaEngineDriver {
         }
         self.shared.cm.begin_shutdown(
             &self.shared,
-            &EngineOutcome::Failure(EngineFailure::DriverShutdown),
+            &MemoizedTerminalResult::from_error(Error::DriverShutdown),
         );
         self.shared.begin_all_connection_close();
         if self.shared.cm.pending_route_count() != 0 {
@@ -211,7 +211,7 @@ impl RdmaEngineDriver {
                         crate::test_support::destruction::DestructionKind::CmFinalDrainToWouldBlock,
                         resources.cm_event_channel.as_raw() as usize,
                     );
-                    self.shared.finish(EngineOutcome::Success);
+                    self.shared.finish(MemoizedTerminalResult::success());
                     return Ok(true);
                 }
                 processed += 1;
@@ -220,7 +220,7 @@ impl RdmaEngineDriver {
             return Ok(false);
         }
 
-        self.shared.finish(EngineOutcome::Success);
+        self.shared.finish(MemoizedTerminalResult::success());
         Ok(true)
     }
 
@@ -282,6 +282,7 @@ impl RdmaEngineDriver {
             .cqes_polled
             .fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
         for completion in self.cq_buffer[..count].iter().copied() {
+            let completion = completion.into_raw();
             #[cfg(any(test, feature = "test-hooks"))]
             if self.shared.test_driver.suppress_connection_cqe(completion) {
                 continue;
@@ -385,7 +386,7 @@ impl RdmaEngineDriver {
         match deadline.kind {
             DeadlineKind::EngineShutdown => {
                 if let Some(failure) = self.shared.shutdown_deadline_failure() {
-                    Err(failure.into_error())
+                    Err(failure)
                 } else {
                     self.scheduler.mark_class_ready(WorkClass::Terminal);
                     Ok(())
@@ -482,13 +483,13 @@ impl Future for RdmaEngineDriver {
 
         if !self.runtime_checked {
             if let Err(error) = preflight_driver_runtime() {
-                return self.fail(EngineFailure::from_progress(error));
+                return self.fail(error);
             }
             self.runtime_checked = true;
         }
         #[cfg(any(test, feature = "test-hooks"))]
         if let Some(error) = self.shared.test_driver.take_injected_failure() {
-            return self.fail(EngineFailure::from_progress(error));
+            return self.fail(error);
         }
         self.shared.transition_running();
         self.poll_deadline_timer(cx);
@@ -526,7 +527,7 @@ impl Future for RdmaEngineDriver {
             };
             let progressed = match result {
                 Ok(progressed) => progressed,
-                Err(error) => return self.fail(EngineFailure::from_progress(error)),
+                Err(error) => return self.fail(error),
             };
             // CM progress can remove the final shutdown owner after the
             // Terminal class already ran in this poll.
@@ -540,7 +541,7 @@ impl Future for RdmaEngineDriver {
                 match self.service_terminal() {
                     Ok(true) => break,
                     Ok(false) => {}
-                    Err(error) => return self.fail(EngineFailure::from_progress(error)),
+                    Err(error) => return self.fail(error),
                 }
             }
             if self.shared.outcome().is_some() {
@@ -593,20 +594,21 @@ impl Drop for RdmaEngineDriver {
                 .cm
                 .retained_owner_count()
                 .max(self.shared.connections.live());
-            let failure = if outstanding == 0 && cm_owners == 0 {
-                EngineFailure::DriverShutdown
+            let error = if outstanding == 0 && cm_owners == 0 {
+                Error::DriverShutdown
             } else {
                 self.shared
                     .diagnostic_counters
                     .engine_wedges
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                EngineFailure::Wedged {
+                Error::EngineWedged {
                     retained_bundles: self.shared.retained_bundle_count().max(1),
                     outstanding_operations: outstanding,
                     cq_debt: outstanding,
                 }
             };
-            self.shared.finish(EngineOutcome::Failure(failure));
+            self.shared
+                .finish(MemoizedTerminalResult::from_error(error));
             EngineShared::retain_after_failure(&self.shared);
         }
         self.release_resources();
@@ -642,6 +644,7 @@ fn preflight_driver_runtime() -> Result<()> {
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
 pub(super) mod test_api {
     use std::any::Any;
     use std::collections::{HashMap, HashSet, VecDeque};
@@ -658,7 +661,9 @@ pub(super) mod test_api {
     };
     use crate::v2::engine::resources::TestResourceRefs;
     use crate::v2::qp::{BatchPostOutcome, QpCapabilities};
-    use crate::v2::{AccessIntent, Mr, Qp, QpBuilder, RdmaConnection, RdmaConnectionConfig};
+    use crate::v2::{
+        AccessIntent, Completion, Mr, Qp, QpBuilder, RdmaConnection, RdmaConnectionConfig,
+    };
     use crate::wc::{WcOpcode, WorkCompletion};
     use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
 
@@ -667,7 +672,7 @@ pub(super) mod test_api {
 
     /// Test-only connection identity used by the Phase 2 routing gate.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct TestConnectionIdentity {
+    struct RouteIdentity {
         pub slot: u32,
         pub generation: u32,
         pub qp_num: u32,
@@ -687,14 +692,6 @@ pub(super) mod test_api {
                 expected_opcode,
             }
         }
-    }
-
-    /// Identity of one real CQE held by deterministic test instrumentation.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct TestCompletionIdentity {
-        pub wr_id: u64,
-        pub qp_num: u32,
-        pub opcode: WcOpcode,
     }
 
     /// Bounded-work and direct-routing instrumentation for integration tests.
@@ -724,6 +721,22 @@ pub(super) mod test_api {
     pub struct TestEngineResources {
         shared: Weak<EngineShared>,
         resources: TestResourceRefs,
+    }
+
+    /// Opaque equality-only identity for the engine's anchored context.
+    pub struct TestContextIdentity {
+        raw_context: usize,
+    }
+
+    /// Read-only provider-capability projection for validation fixtures.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct TestProviderLimits {
+        max_qp: usize,
+        max_qp_wr: usize,
+        max_sge: usize,
+        max_cqe: usize,
+        max_qp_rd_atom: usize,
+        max_qp_init_rd_atom: usize,
     }
 
     /// Controller that pauses the driver after CQ notification arming and
@@ -850,8 +863,32 @@ pub(super) mod test_api {
         /// Verify that a CM route selected the engine's exact anchored context.
         pub fn require_context(&self, cm_id: &CmId) -> Result<()> {
             cm_id
-                .require_context(self.resources.context.inner())
-                .map_err(Error::from)
+                .require_context(self.resources.context.raw_context())
+                .map_err(Error::from_v1)
+        }
+
+        /// Return copied numeric provider limits without exposing validation internals.
+        pub fn provider_limits(&self) -> Result<TestProviderLimits> {
+            let shared = self.ensure_active()?;
+            let limits = shared.provider.ok_or_else(|| {
+                Error::InvalidConfig("engine has no provider limits snapshot".into())
+            })?;
+            Ok(TestProviderLimits {
+                max_qp: limits.max_qp,
+                max_qp_wr: limits.max_qp_wr,
+                max_sge: limits.max_sge,
+                max_cqe: limits.max_cqe,
+                max_qp_rd_atom: limits.max_qp_rd_atom,
+                max_qp_init_rd_atom: limits.max_qp_init_rd_atom,
+            })
+        }
+
+        /// Return an opaque equality-only identity for the anchored context.
+        pub fn context_identity(&self) -> Result<TestContextIdentity> {
+            self.ensure_active()?;
+            Ok(TestContextIdentity {
+                raw_context: self.resources.context.raw_context().as_raw() as usize,
+            })
         }
 
         /// Register owned test memory through the engine's shared PD.
@@ -1022,13 +1059,13 @@ pub(super) mod test_api {
             }
             shared.test_driver.start_connection_cqe_suppression(
                 connection.state.token,
-                connection.identity().qp_num,
+                connection.identity().qp_num(),
                 expected_opcode,
             )?;
             Ok(TestConnectionCqeSuppression {
                 shared: Arc::downgrade(&shared),
                 connection: connection.state.token,
-                qp_num: connection.identity().qp_num,
+                qp_num: connection.identity().qp_num(),
                 active: true,
             })
         }
@@ -1109,6 +1146,43 @@ pub(super) mod test_api {
                 return Err(Error::DriverShutdown);
             }
             Ok(shared)
+        }
+    }
+
+    impl TestContextIdentity {
+        /// Compare with one independently verbs-opened context of the same device.
+        pub fn matches_independently_opened(&self, device_name: &str) -> Result<bool> {
+            let independent =
+                crate::device::open_device_by_name(device_name).map_err(Error::from_v1)?;
+            let matches = independent.as_raw() as usize == self.raw_context;
+            drop(independent);
+            Ok(matches)
+        }
+    }
+
+    impl TestProviderLimits {
+        pub fn max_qp(&self) -> usize {
+            self.max_qp
+        }
+
+        pub fn max_qp_wr(&self) -> usize {
+            self.max_qp_wr
+        }
+
+        pub fn max_sge(&self) -> usize {
+            self.max_sge
+        }
+
+        pub fn max_cqe(&self) -> usize {
+            self.max_cqe
+        }
+
+        pub fn max_qp_rd_atom(&self) -> usize {
+            self.max_qp_rd_atom
+        }
+
+        pub fn max_qp_init_rd_atom(&self) -> usize {
+            self.max_qp_init_rd_atom
         }
     }
 
@@ -1232,12 +1306,12 @@ pub(super) mod test_api {
             }
         }
 
-        /// Return the exact identity of the held real CQE.
-        pub fn completion_identity(&self) -> Result<TestCompletionIdentity> {
+        /// Return the held real CQE as a typed completion.
+        pub fn completion(&self) -> Result<Completion> {
             let shared = self.shared.upgrade().ok_or(Error::DriverShutdown)?;
             shared
                 .test_driver
-                .connection_cqe_identity(self.connection, self.qp_num)
+                .connection_cqe(self.connection, self.qp_num)
         }
 
         /// Release the held real CQE through normal exact production routing.
@@ -1275,8 +1349,8 @@ pub(super) mod test_api {
     }
 
     impl TestRouteHandle {
-        pub fn identity(&self) -> TestConnectionIdentity {
-            self.route.identity
+        pub fn qp_num(&self) -> u32 {
+            self.route.identity.qp_num
         }
 
         pub fn qp(&self) -> &Qp {
@@ -1315,12 +1389,15 @@ pub(super) mod test_api {
             }
         }
 
-        pub fn completions(&self) -> Vec<WorkCompletion> {
+        pub fn completions(&self) -> Vec<Completion> {
             self.route
                 .completions
                 .lock()
                 .expect("test route completions poisoned")
-                .clone()
+                .iter()
+                .copied()
+                .map(Completion::from_raw)
+                .collect()
         }
 
         pub async fn wait_for_completion_count(&self, expected: usize) {
@@ -1351,7 +1428,7 @@ pub(super) mod test_api {
         }
 
         /// Remove this route after its exact accepted set reaches zero.
-        pub fn remove(mut self) -> Result<Vec<WorkCompletion>> {
+        pub fn remove(mut self) -> Result<Vec<Completion>> {
             if self.route.remaining() != 0 {
                 return Err(Error::InvalidConfig(
                     "cannot remove a test route with accepted WRs outstanding".into(),
@@ -1654,11 +1731,11 @@ pub(super) mod test_api {
                 })
         }
 
-        fn connection_cqe_identity(
+        fn connection_cqe(
             &self,
             connection: super::super::registry::ConnectionToken,
             qp_num: u32,
-        ) -> Result<TestCompletionIdentity> {
+        ) -> Result<Completion> {
             let control = self
                 .connection_cqe_suppression
                 .lock()
@@ -1674,11 +1751,7 @@ pub(super) mod test_api {
             let completion = active.completion.ok_or_else(|| {
                 Error::InvalidConfig("connection CQE has not been observed".into())
             })?;
-            Ok(TestCompletionIdentity {
-                wr_id: completion.wr_id(),
-                qp_num: completion.qp_num(),
-                opcode: completion.opcode(),
-            })
+            Ok(Completion::from_raw(completion))
         }
 
         fn release_connection_cqe(
@@ -1919,7 +1992,7 @@ pub(super) mod test_api {
                 })
                 .map_err(|_| Error::CapacityExhausted)?;
             let route = Arc::new(TestRouteState {
-                identity: TestConnectionIdentity {
+                identity: RouteIdentity {
                     slot,
                     generation: 1,
                     qp_num,
@@ -2095,7 +2168,7 @@ pub(super) mod test_api {
     }
 
     struct TestRouteState {
-        identity: TestConnectionIdentity,
+        identity: RouteIdentity,
         qp: Arc<Qp>,
         retained: Mutex<Vec<Box<dyn Any + Send>>>,
         operation_retained: Mutex<HashMap<u64, Box<dyn Any + Send>>>,
@@ -2216,10 +2289,9 @@ pub(super) mod test_api {
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub use test_api::{
-    TestAcceptedOperation, TestAdmissionBarrier, TestCompletionIdentity,
-    TestConnectionCqeSuppression, TestConnectionIdentity, TestCqArmWindowControl,
-    TestCqeSuppression, TestEngineInstrumentation, TestEngineQp, TestEngineResources,
-    TestReadyWorkControl, TestRouteHandle,
+    TestAcceptedOperation, TestAdmissionBarrier, TestConnectionCqeSuppression, TestContextIdentity,
+    TestCqArmWindowControl, TestCqeSuppression, TestEngineInstrumentation, TestEngineQp,
+    TestEngineResources, TestProviderLimits, TestReadyWorkControl, TestRouteHandle,
 };
 
 #[cfg(test)]
@@ -2578,8 +2650,8 @@ mod tests {
         let mut close = Box::pin(listener.close());
 
         assert!(close.as_mut().poll(&mut cx).is_pending());
-        let Poll::Ready(Err(driver_error)) = driver.fail(EngineFailure::Progress(
-            Error::InvalidConfig("injected driver progress failure".into()),
+        let Poll::Ready(Err(driver_error)) = driver.fail(Error::InvalidConfig(
+            "injected driver progress failure".into(),
         )) else {
             panic!("injected driver failure did not terminate the driver");
         };

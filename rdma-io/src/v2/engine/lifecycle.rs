@@ -2,10 +2,65 @@
 
 use std::sync::atomic::Ordering;
 
-use super::{EngineFailure, EngineShared};
+use super::{EngineShared, RdmaEngineTerminalError};
+use crate::v2::error::{Error, Result};
+
+pub(super) enum TakeOnceResult<T> {
+    Pending,
+    Ready(Result<T>),
+    Taken,
+}
+
+#[derive(Clone)]
+pub(super) struct MemoizedTerminalResult {
+    result: Result<()>,
+}
+
+impl MemoizedTerminalResult {
+    pub(super) fn success() -> Self {
+        Self { result: Ok(()) }
+    }
+
+    pub(super) fn from_error(error: Error) -> Self {
+        Self { result: Err(error) }
+    }
+
+    pub(super) fn is_success(&self) -> bool {
+        self.result.is_ok()
+    }
+
+    pub(super) fn is_error(&self) -> bool {
+        self.result.is_err()
+    }
+
+    pub(super) fn error(&self) -> Option<Error> {
+        self.result.clone().err()
+    }
+
+    pub(super) fn is_connection_quarantined(&self) -> bool {
+        matches!(self.result, Err(Error::ConnectionQuarantined { .. }))
+    }
+
+    pub(super) fn into_result(self) -> Result<()> {
+        self.result
+    }
+
+    pub(super) fn summary(&self) -> Option<RdmaEngineTerminalError> {
+        self.error().map(|error| RdmaEngineTerminalError {
+            class: match error {
+                Error::DriverShutdown => "DriverShutdown",
+                Error::InvalidConfig(_) => "InvalidConfig",
+                Error::EngineWedged { .. } => "EngineWedged",
+                _ => "EngineError",
+            }
+            .into(),
+            message: error.to_string(),
+        })
+    }
+}
 
 impl EngineShared {
-    pub(super) fn shutdown_deadline_failure(&self) -> Option<EngineFailure> {
+    pub(super) fn shutdown_deadline_failure(&self) -> Option<Error> {
         if self.outcome().is_some() {
             return None;
         }
@@ -19,7 +74,7 @@ impl EngineShared {
             .engine_wedges
             .fetch_add(1, Ordering::Relaxed);
         // Pending CM work can wedge shutdown without owning a retained bundle.
-        Some(EngineFailure::Wedged {
+        Some(Error::EngineWedged {
             retained_bundles,
             outstanding_operations,
             cq_debt: outstanding_operations,
@@ -62,6 +117,7 @@ mod tests {
     use super::super::connection::{WorkRequestPoster, install_connection};
     use super::super::registry::OperationToken;
     use super::super::{CompletionMode, RdmaConnectionConfig, test_engine_pair};
+    use super::MemoizedTerminalResult;
     use crate::v2::error::{Error, Result};
     use crate::v2::qp::{BatchPostOutcome, QpCapabilities};
     use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
@@ -152,7 +208,7 @@ mod tests {
 
         assert_eq!(poster.destroys.load(Ordering::Acquire), 1);
         assert_eq!(engine.diagnostics().qp_destroys, 1);
-        engine.shared.finish(super::super::EngineOutcome::Success);
+        engine.shared.finish(MemoizedTerminalResult::success());
         drop(driver);
     }
 

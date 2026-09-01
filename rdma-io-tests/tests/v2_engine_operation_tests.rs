@@ -2,7 +2,7 @@ use std::future::{Future, poll_fn};
 use std::task::Poll;
 use std::time::Duration;
 
-use rdma_io::test_support::destruction::{DestructionKind, DestructionRecorder};
+use rdma_io::v2::test_support::{DestructionKind, DestructionRecorder};
 use rdma_io::v2::{AccessIntent, CompletionMode, RdmaConnectionConfig, RdmaEngineBuilder};
 use rdma_io_tests::engine_test_helpers::setup_engine_pair;
 use rdma_io_tests::test_helpers::has_software_rdma;
@@ -73,12 +73,12 @@ async fn run_owned_operations(mode: CompletionMode) {
     let (recv_completion, recv_mr) = recv;
     let (send_completion, send_mr) = send;
     assert_eq!(
-        recv_completion.unwrap().as_wc().qp_num(),
-        server.identity().qp_num
+        recv_completion.unwrap().qp_num(),
+        server.identity().qp_num()
     );
     assert_eq!(
-        send_completion.unwrap().as_wc().qp_num(),
-        client.identity().qp_num
+        send_completion.unwrap().qp_num(),
+        client.identity().qp_num()
     );
     assert!(recv_mr.is_some());
     assert!(send_mr.is_some());

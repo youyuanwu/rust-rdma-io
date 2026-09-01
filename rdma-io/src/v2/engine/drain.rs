@@ -3,10 +3,11 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use super::EngineShared;
 use super::connection::ConnectionState;
+use super::lifecycle::MemoizedTerminalResult;
 use super::registry::{ConnectionToken, Lookup, read_unpoison};
 use super::scheduler::DeadlineKind;
-use super::{EngineFailure, EngineOutcome, EngineShared};
 
 impl EngineShared {
     pub(crate) fn begin_connection_close(&self, connection: &Arc<ConnectionState>) {
@@ -34,7 +35,7 @@ impl EngineShared {
                     connection.rollback_draining_count();
                     drop(lifecycle);
                     drop(admission);
-                    self.finish(EngineOutcome::Failure(EngineFailure::from_progress(error)));
+                    self.finish(MemoizedTerminalResult::from_error(error));
                     return;
                 }
             }

@@ -1,34 +1,24 @@
-use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 
-use rdma_io::async_cm::AsyncCmId;
-use rdma_io::cm::{ConnParam, RdmaCmDeviceList};
-use rdma_io::test_support::destruction::{DestructionKind, DestructionRecorder};
-use rdma_io::v2::{
-    AccessIntent, CompletionMode, Context, Cq, CqBuilder, Error, Pd, Qp, QpBuilder,
-    RdmaEngineBuilder,
+use rdma_io::cm::RdmaCmDeviceList;
+use rdma_io::v2::test_support::{
+    DestructionKind, DestructionRecorder, TestAcceptedOperation, TestEngineResources,
+    TestRouteHandle,
 };
-use rdma_io::wc::{WcStatus, WorkCompletion};
+use rdma_io::v2::{
+    AccessIntent, CompletionMode, Context, Error, RdmaEngine, RdmaEngineBuilder, RdmaEngineDriver,
+};
+use rdma_io::wc::{WcOpcode, WcStatus};
+use rdma_io_tests::engine_test_helpers::{EngineTestEndpoint, setup_engine_pair};
 use rdma_io_tests::test_helpers::{connect_addr_for, has_software_rdma};
 
 const DIRECT_FLUSH_SOURCE: &str = include_str!("v2_tests.rs");
 const ENGINE_ASYNC_FLUSH_SOURCE: &str = include_str!("v2_engine_driver_flush_gate.rs");
 
-struct Endpoint {
-    qp: Qp,
-    _cm: AsyncCmId,
-}
-
-struct Pair {
-    server: Endpoint,
-    client: Endpoint,
-}
-
 struct SharedProbeResources {
-    anchored_context: Arc<rdma_io::device::Context>,
-    pd: Pd,
-    cq: Arc<Cq>,
+    engine: RdmaEngine,
+    driver: Option<RdmaEngineDriver>,
+    lease: TestEngineResources,
 }
 
 fn software_device_name(list: &RdmaCmDeviceList) -> Option<String> {
@@ -43,120 +33,45 @@ fn pinned_resources() -> Option<(String, SharedProbeResources)> {
     }
     let list = RdmaCmDeviceList::new().expect("enumerate librdmacm devices");
     let name = software_device_name(&list)?;
-    let anchored_context = list.context_by_name(&name).expect("select exact context");
     drop(list);
-    let context = Context::from_inner(Arc::clone(&anchored_context));
-    let pd = context.alloc_pd().expect("allocate shared PD");
-    let cq = Arc::new(
-        CqBuilder::new(&context, 256)
-            .build()
-            .expect("allocate shared CQ"),
-    );
+    let independent = Context::open_by_name(&name).expect("open anchored public context");
+    let independent_pd = independent.alloc_pd().expect("allocate independent PD");
+    drop(independent_pd);
+    drop(independent);
+    let (engine, driver) = RdmaEngineBuilder::new(&name)
+        .completion_mode(CompletionMode::Polling)
+        .maximum_live_connections(8)
+        .maximum_inflight_operations(256)
+        .cq_capacity(16_384)
+        .build()
+        .expect("build pinned provider-probe engine");
+    let lease = engine.test_resources().expect("engine test resource lease");
     Some((
         name,
         SharedProbeResources {
-            anchored_context,
-            pd,
-            cq,
+            engine,
+            driver: Some(driver),
+            lease,
         },
     ))
 }
 
-async fn setup_pair(resources: &SharedProbeResources) -> Pair {
-    let listener = rdma_io_tests::test_helpers::bind_listener_with_retry().await;
-    let connect_addr = connect_addr_for(listener.local_addr());
-
-    let server_pd = resources.pd.clone();
-    let server_cq = Arc::clone(&resources.cq);
-    let server_context = Arc::clone(&resources.anchored_context);
-    let server = tokio::spawn(async move {
-        let conn_id = listener.get_request().await.unwrap();
-        assert!(
-            conn_id.uses_context(&server_context),
-            "inbound child must use the exact pinned context"
-        );
-        let qp = QpBuilder::new(&server_pd, &server_cq, &server_cq)
-            .max_send_wr(64)
-            .max_recv_wr(64)
-            .build_with_cm(&conn_id)
-            .unwrap();
-        let cm = listener
-            .complete_accept(conn_id, &ConnParam::default())
-            .await
-            .unwrap();
-        Endpoint { qp, _cm: cm }
-    });
-
-    let client_pd = resources.pd.clone();
-    let client_cq = Arc::clone(&resources.cq);
-    let client_context = Arc::clone(&resources.anchored_context);
-    let client = tokio::spawn(async move {
-        let (cm, qp) =
-            rdma_io_tests::test_helpers::connect_client_with_retry(&connect_addr, |cm| {
-                assert!(
-                    cm.cm_id().uses_context(&client_context),
-                    "outbound route must use the exact pinned context"
-                );
-                let cm_qp = cm
-                    .create_qp_with_cq(
-                        client_pd.inner(),
-                        &rdma_io::qp::QpInitAttr {
-                            max_send_wr: 64,
-                            max_recv_wr: 64,
-                            ..Default::default()
-                        },
-                        Some(client_cq.inner()),
-                        Some(client_cq.inner()),
-                    )
-                    .unwrap();
-                Qp::from_cm_qp(cm_qp)
-            })
-            .await;
-        Endpoint { qp, _cm: cm }
-    });
-
-    let (server, client) = tokio::join!(server, client);
-    Pair {
-        server: server.unwrap(),
-        client: client.unwrap(),
-    }
+fn install_endpoint_route(
+    resources: &TestEngineResources,
+    endpoint: &mut EngineTestEndpoint,
+    operations: impl IntoIterator<Item = TestAcceptedOperation>,
+) -> TestRouteHandle {
+    let route = resources
+        .install_route(endpoint.qp.take().expect("endpoint QP"), operations)
+        .unwrap();
+    route.retain(endpoint.cm.take().expect("endpoint CM owner"));
+    route
 }
 
-async fn collect_expected(
-    cq: &Cq,
-    expected: &HashMap<u64, (u32, Option<bool>)>,
-) -> HashMap<u64, WorkCompletion> {
-    tokio::time::timeout(Duration::from_secs(10), async {
-        let mut observed = HashMap::new();
-        let mut completions = [WorkCompletion::default(); 16];
-        while observed.len() < expected.len() {
-            let count = cq.poll(&mut completions).unwrap();
-            if count == 0 {
-                tokio::task::yield_now().await;
-                continue;
-            }
-            for completion in &completions[..count] {
-                let wr_id = completion.wr_id();
-                if let Some((expected_qp, should_succeed)) = expected.get(&wr_id) {
-                    assert_eq!(
-                        completion.qp_num(),
-                        *expected_qp,
-                        "CQE must report its exact owning QP"
-                    );
-                    if let Some(should_succeed) = should_succeed {
-                        assert_eq!(completion.is_success(), *should_succeed);
-                    }
-                    assert!(
-                        observed.insert(wr_id, *completion).is_none(),
-                        "duplicate completion for WR {wr_id}"
-                    );
-                }
-            }
-        }
-        observed
-    })
-    .await
-    .expect("timed out draining shared CQ")
+async fn wait_drained(route: &TestRouteHandle) {
+    tokio::time::timeout(Duration::from_secs(10), route.wait_until_drained())
+        .await
+        .expect("timed out draining provider-probe route");
 }
 
 #[test]
@@ -176,13 +91,13 @@ fn pinned_provider_limits_include_portable_engine_defaults() {
     let Some((name, resources)) = pinned_resources() else {
         return;
     };
-    let attr = resources.anchored_context.query_device().unwrap();
-    let max_qp = attr.max_qp;
-    let max_qp_wr = attr.max_qp_wr;
-    let max_sge = attr.max_sge;
-    let max_cqe = attr.max_cqe;
-    let max_qp_rd_atom = attr.max_qp_rd_atom;
-    let max_qp_init_rd_atom = attr.max_qp_init_rd_atom;
+    let limits = resources.lease.provider_limits().unwrap();
+    let max_qp = limits.max_qp();
+    let max_qp_wr = limits.max_qp_wr();
+    let max_sge = limits.max_sge();
+    let max_cqe = limits.max_cqe();
+    let max_qp_rd_atom = limits.max_qp_rd_atom();
+    let max_qp_init_rd_atom = limits.max_qp_init_rd_atom();
     println!(
         "provider={name} max_qp={max_qp} max_qp_wr={max_qp_wr} max_sge={max_sge} max_cqe={max_cqe} max_qp_rd_atom={max_qp_rd_atom} max_qp_init_rd_atom={max_qp_init_rd_atom}"
     );
@@ -202,9 +117,9 @@ fn provider_limits_reject_unreachable_engine_requests_before_pd_or_cq_creation()
     let Some((name, resources)) = pinned_resources() else {
         return;
     };
-    let attr = resources.anchored_context.query_device().unwrap();
-    let max_qp = attr.max_qp as usize;
-    let max_cqe = attr.max_cqe as usize;
+    let limits = resources.lease.provider_limits().unwrap();
+    let max_qp = limits.max_qp();
+    let max_cqe = limits.max_cqe();
     drop(resources);
 
     let recorder = DestructionRecorder::arm(16);
@@ -239,66 +154,132 @@ fn provider_limits_reject_unreachable_engine_requests_before_pd_or_cq_creation()
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn shared_cq_reports_exact_qp_for_normal_and_explicit_err_completions() {
-    let Some((_name, resources)) = pinned_resources() else {
+    let Some((_name, mut resources)) = pinned_resources() else {
         return;
     };
-    let pair_one = setup_pair(&resources).await;
-    let pair_two = setup_pair(&resources).await;
+    let driver_task = tokio::spawn(resources.driver.take().expect("provider-probe driver"));
+    let mut pair_one = setup_engine_pair(&resources.lease).await;
+    let mut pair_two = setup_engine_pair(&resources.lease).await;
+    let primary_route = install_endpoint_route(
+        &resources.lease,
+        &mut pair_one.server,
+        [
+            TestAcceptedOperation::new(100, WcOpcode::Recv),
+            TestAcceptedOperation::new(200, WcOpcode::Recv),
+            TestAcceptedOperation::new(202, WcOpcode::Recv),
+            TestAcceptedOperation::new(201, WcOpcode::Send),
+        ],
+    );
+    let normal_send_route = install_endpoint_route(
+        &resources.lease,
+        &mut pair_one.client,
+        [TestAcceptedOperation::new(101, WcOpcode::Send)],
+    );
+    let traffic_recv_route = install_endpoint_route(
+        &resources.lease,
+        &mut pair_two.server,
+        (0..8).map(|index| TestAcceptedOperation::new(300 + index, WcOpcode::Recv)),
+    );
+    let traffic_send_route = install_endpoint_route(
+        &resources.lease,
+        &mut pair_two.client,
+        (0..8).map(|index| TestAcceptedOperation::new(400 + index, WcOpcode::Send)),
+    );
 
-    let mut normal_recv = resources.pd.reg_mr(64, AccessIntent::LocalOnly).unwrap();
-    pair_one.server.qp.post_recv(&mut normal_recv, 100).unwrap();
-    let normal_send = resources.pd.reg_mr(64, AccessIntent::LocalOnly).unwrap();
-    pair_one.client.qp.post_send(&normal_send, 101).unwrap();
-    let normal_expected = HashMap::from([
-        (100, (pair_one.server.qp.qp_num(), Some(true))),
-        (101, (pair_one.client.qp.qp_num(), Some(true))),
-    ]);
-    collect_expected(&resources.cq, &normal_expected).await;
+    let mut normal_recv = resources
+        .lease
+        .register_memory(64, AccessIntent::LocalOnly)
+        .unwrap();
+    primary_route.qp().post_recv(&mut normal_recv, 100).unwrap();
+    primary_route.retain(normal_recv);
+    let normal_send = resources
+        .lease
+        .register_memory(64, AccessIntent::LocalOnly)
+        .unwrap();
+    normal_send_route.qp().post_send(&normal_send, 101).unwrap();
+    normal_send_route.retain(normal_send);
+    primary_route.wait_for_completion_count(1).await;
+    normal_send_route.wait_for_completion_count(1).await;
+    assert!(primary_route.completions()[0].is_success());
+    assert!(normal_send_route.completions()[0].is_success());
 
-    let mut flush_recv = resources.pd.reg_mr(64, AccessIntent::LocalOnly).unwrap();
-    pair_one.server.qp.post_recv(&mut flush_recv, 200).unwrap();
-    let mut second_flush_recv = resources.pd.reg_mr(64, AccessIntent::LocalOnly).unwrap();
-    pair_one
-        .server
-        .qp
+    let mut flush_recv = resources
+        .lease
+        .register_memory(64, AccessIntent::LocalOnly)
+        .unwrap();
+    primary_route.qp().post_recv(&mut flush_recv, 200).unwrap();
+    primary_route.retain(flush_recv);
+    let mut second_flush_recv = resources
+        .lease
+        .register_memory(64, AccessIntent::LocalOnly)
+        .unwrap();
+    primary_route
+        .qp()
         .post_recv(&mut second_flush_recv, 202)
         .unwrap();
-    let flush_send = resources.pd.reg_mr(64, AccessIntent::LocalOnly).unwrap();
-    pair_one.server.qp.post_send(&flush_send, 201).unwrap();
+    primary_route.retain(second_flush_recv);
+    let flush_send = resources
+        .lease
+        .register_memory(64, AccessIntent::LocalOnly)
+        .unwrap();
+    primary_route.qp().post_send(&flush_send, 201).unwrap();
+    primary_route.retain(flush_send);
 
-    let mut unrelated_recvs = Vec::new();
-    let mut unrelated_sends = Vec::new();
     for index in 0..8u64 {
-        let mut recv = resources.pd.reg_mr(64, AccessIntent::LocalOnly).unwrap();
-        pair_two
-            .server
-            .qp
+        let mut recv = resources
+            .lease
+            .register_memory(64, AccessIntent::LocalOnly)
+            .unwrap();
+        traffic_recv_route
+            .qp()
             .post_recv(&mut recv, 300 + index)
             .unwrap();
-        let send = resources.pd.reg_mr(64, AccessIntent::LocalOnly).unwrap();
-        pair_two.client.qp.post_send(&send, 400 + index).unwrap();
-        unrelated_recvs.push(recv);
-        unrelated_sends.push(send);
+        traffic_recv_route.retain(recv);
+        let send = resources
+            .lease
+            .register_memory(64, AccessIntent::LocalOnly)
+            .unwrap();
+        traffic_send_route
+            .qp()
+            .post_send(&send, 400 + index)
+            .unwrap();
+        traffic_send_route.retain(send);
     }
 
     let recorder = DestructionRecorder::arm(128);
-    pair_one.server.qp.to_error().unwrap();
-    let mut expected = HashMap::from([
-        (200, (pair_one.server.qp.qp_num(), None)),
-        (201, (pair_one.server.qp.qp_num(), None)),
-        (202, (pair_one.server.qp.qp_num(), None)),
-    ]);
-    for index in 0..8u64 {
-        expected.insert(300 + index, (pair_two.server.qp.qp_num(), Some(true)));
-        expected.insert(400 + index, (pair_two.client.qp.qp_num(), Some(true)));
-    }
-    let observed = collect_expected(&resources.cq, &expected).await;
+    primary_route.qp().to_error().unwrap();
+    let ((), (), ()) = tokio::join!(
+        wait_drained(&primary_route),
+        wait_drained(&traffic_recv_route),
+        wait_drained(&traffic_send_route)
+    );
+    wait_drained(&normal_send_route).await;
+    let primary_qp = primary_route.qp_num();
+    let observed = primary_route.completions();
 
     assert!(
-        [200, 201, 202]
-            .into_iter()
-            .any(|wr_id| observed[&wr_id].status() == WcStatus::WrFlushErr),
+        observed
+            .iter()
+            .filter(|completion| matches!(completion.wr_id(), 200..=202))
+            .any(|completion| completion.status() == WcStatus::WrFlushErr),
         "explicit local QP ERR must produce at least one flush completion"
+    );
+    assert!(
+        observed
+            .iter()
+            .all(|completion| completion.qp_num() == primary_qp)
+    );
+    assert!(
+        traffic_recv_route
+            .completions()
+            .iter()
+            .all(|completion| completion.is_success())
+    );
+    assert!(
+        traffic_send_route
+            .completions()
+            .iter()
+            .all(|completion| completion.is_success())
     );
     assert!(
         !recorder
@@ -308,15 +289,16 @@ async fn shared_cq_reports_exact_qp_for_normal_and_explicit_err_completions() {
         "routing/draining completions must not destroy a live QP"
     );
 
-    drop(normal_recv);
-    drop(normal_send);
-    drop(flush_recv);
-    drop(second_flush_recv);
-    drop(flush_send);
-    drop(unrelated_recvs);
-    drop(unrelated_sends);
+    primary_route.remove().unwrap();
+    normal_send_route.remove().unwrap();
+    traffic_recv_route.remove().unwrap();
+    traffic_send_route.remove().unwrap();
     drop(pair_one);
     drop(pair_two);
+    resources.engine.shutdown().await.unwrap();
+    driver_task.await.unwrap().unwrap();
+    drop(resources.lease);
+    drop(resources.engine);
 
     let qp_destroys = recorder
         .take()
@@ -335,11 +317,14 @@ async fn independently_opened_same_device_context_is_rejected_by_pointer_gate() 
     let listener = rdma_io_tests::test_helpers::bind_listener_with_retry().await;
     let connect_addr = connect_addr_for(listener.local_addr());
     let cm = rdma_io_tests::test_helpers::connect_client_cm_with_retry(&connect_addr).await;
-    let independent = Context::open_by_name(&name).unwrap();
-
-    cm.cm_id()
-        .require_context(&resources.anchored_context)
-        .unwrap();
-    assert!(cm.cm_id().require_context(independent.inner()).is_err());
+    resources.lease.require_context(cm.cm_id()).unwrap();
+    assert!(
+        !resources
+            .lease
+            .context_identity()
+            .unwrap()
+            .matches_independently_opened(&name)
+            .unwrap()
+    );
     assert_eq!(cm.cm_id().device_name(), Some(name.as_str()));
 }

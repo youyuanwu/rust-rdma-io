@@ -26,6 +26,7 @@ use super::connection::{
 };
 use super::diagnostics::CmEventReject;
 use super::diagnostics::RdmaListenerDiagnostics;
+use super::lifecycle::{MemoizedTerminalResult, TakeOnceResult};
 use super::listener::{
     AcceptRequest, EmptyPreEstablishSetup, InboundRejectReason, IncomingChild,
     KERNEL_LISTEN_BACKLOG_REQUEST, ListenRequest, ListenerAction, ListenerDiagnosticTotals,
@@ -33,7 +34,7 @@ use super::listener::{
 };
 use super::registry::{ConnectionToken, Lookup, PagedRegistry, RegistryToken, lock_unpoison};
 use super::resources::EngineResources;
-use super::{EngineOutcome, EngineShared, PreEstablishSetup, RdmaConnection, RdmaConnectionConfig};
+use super::{EngineShared, PreEstablishSetup, RdmaConnection, RdmaConnectionConfig};
 use crate::cm::{CmEventType, CmId, PortSpace};
 use crate::v2::error::{Error, Result};
 use crate::v2::qp::QpBuilder;
@@ -333,7 +334,7 @@ impl CmState {
             Err(crate::Error::Verbs(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 return Ok(false);
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(Error::from_v1(error)),
         };
         let snapshot = CmEventSnapshot {
             event_type: event.event_type(),
@@ -343,7 +344,7 @@ impl CmState {
             context_key: event.context_key(),
         };
         let route = self.lookup_dispatch_route(snapshot);
-        event.ack_checked().map_err(Error::from)?;
+        event.ack_checked().map_err(Error::from_v1)?;
         shared
             .diagnostic_counters
             .cm_events_processed
@@ -388,11 +389,15 @@ impl CmState {
         Ok(true)
     }
 
-    pub(super) fn begin_shutdown(&self, shared: &Arc<EngineShared>, outcome: &EngineOutcome) {
+    pub(super) fn begin_shutdown(
+        &self,
+        shared: &Arc<EngineShared>,
+        outcome: &MemoizedTerminalResult,
+    ) {
         if self.shutting_down.swap(true, Ordering::AcqRel) {
             return;
         }
-        if matches!(outcome, EngineOutcome::Success) {
+        if outcome.is_success() {
             return;
         }
         let pending: Vec<_> = lock_unpoison(&self.pending).drain(..).collect();
@@ -608,8 +613,8 @@ impl CmState {
         }
     }
 
-    pub(super) fn terminalize(&self, outcome: &EngineOutcome) {
-        if matches!(outcome, EngineOutcome::Success) {
+    pub(super) fn terminalize(&self, outcome: &MemoizedTerminalResult) {
+        if outcome.is_success() {
             return;
         }
         let pending: Vec<_> = lock_unpoison(&self.pending).drain(..).collect();
@@ -675,7 +680,7 @@ impl CmState {
             Err(error) => {
                 request.complete(Err(contextual_cm_error(
                     format!("create listener {}", request.address),
-                    error.into(),
+                    Error::from_v1(error),
                 )));
                 return Ok(());
             }
@@ -696,7 +701,7 @@ impl CmState {
                     "listen on {} with requested kernel backlog {}",
                     request.address, KERNEL_LISTEN_BACKLOG_REQUEST
                 ),
-                error.into(),
+                Error::from_v1(error),
             )));
             return Ok(());
         }
@@ -820,7 +825,7 @@ impl CmState {
         }
         let child_id = unsafe { CmId::from_raw(raw, true) };
         let child_id = SharedCmId::new(child_id, Arc::clone(&resources.cm_event_channel));
-        if let Err(error) = child_id.require_context(resources.context.inner()) {
+        if let Err(error) = child_id.require_context(resources.context.raw_context()) {
             tracing::warn!(
                 listener = %listener.local_addr,
                 "rejecting inbound child with mismatched verbs context: {error}"
@@ -1106,7 +1111,10 @@ impl CmState {
     ) -> Result<()> {
         self.record_inbound_reject(shared, reason);
         cm_id.reject(&[]).map_err(|error| {
-            contextual_cm_error(format!("reject inbound child ({reason:?})"), error.into())
+            contextual_cm_error(
+                format!("reject inbound child ({reason:?})"),
+                Error::from_v1(error),
+            )
         })?;
         self.defer_cm_id(cm_id);
         Ok(())
@@ -1295,7 +1303,7 @@ impl CmState {
             Err(error) => {
                 self.routes.release(token, false);
                 drop(reservation);
-                request.complete_failure(shared, error.into());
+                request.complete_failure(shared, Error::from_v1(error));
                 return Ok(());
             }
         };
@@ -1351,7 +1359,7 @@ impl CmState {
                 self.defer_cm_id(cm_id);
                 self.retire_route(&route, false);
                 drop(reservation);
-                request.complete_failure(shared, error.into());
+                request.complete_failure(shared, Error::from_v1(error));
             }
         }
         Ok(())
@@ -1458,7 +1466,7 @@ impl CmState {
                 cm_id.reject(&[]).map_err(|error| {
                     contextual_cm_error(
                         "reject selected inbound child after setup rollback",
-                        error.into(),
+                        Error::from_v1(error),
                     )
                 })?;
             }
@@ -2075,11 +2083,11 @@ impl CmState {
             request.complete(Err(Error::DriverShutdown));
             return Ok(EventDisposition::Handled);
         }
-        if let Err(error) = cm_id.require_context(resources.context.inner()) {
+        if let Err(error) = cm_id.require_context(resources.context.raw_context()) {
             self.defer_cm_id(cm_id);
             drop(reservation);
             self.retire_route(route, true);
-            request.complete_failure(shared, error.into());
+            request.complete_failure(shared, Error::from_v1(error));
             return Ok(EventDisposition::Handled);
         }
         match cm_id.resolve_route(2_000) {
@@ -2092,7 +2100,7 @@ impl CmState {
                 self.defer_cm_id(cm_id);
                 drop(reservation);
                 self.retire_route(route, true);
-                request.complete_failure(shared, error.into());
+                request.complete_failure(shared, Error::from_v1(error));
             }
         }
         Ok(EventDisposition::Handled)
@@ -2121,11 +2129,11 @@ impl CmState {
             request.complete(Err(Error::DriverShutdown));
             return Ok(EventDisposition::Handled);
         }
-        if let Err(error) = cm_id.require_context(resources.context.inner()) {
+        if let Err(error) = cm_id.require_context(resources.context.raw_context()) {
             self.defer_cm_id(cm_id);
             drop(reservation);
             self.retire_route(route, true);
-            request.complete_failure(shared, error.into());
+            request.complete_failure(shared, Error::from_v1(error));
             return Ok(EventDisposition::Handled);
         }
 
@@ -2545,19 +2553,19 @@ fn build_qp(
 ) -> Result<crate::v2::Qp> {
     QpBuilder::new(&resources.pd, &resources.cq, &resources.cq)
         .max_send_wr(
-            u32::try_from(config.maximum_send_work_requests())
+            u32::try_from(config.max_send_wr)
                 .map_err(|_| Error::InvalidConfig("maximum send WRs do not fit u32".into()))?,
         )
         .max_recv_wr(
-            u32::try_from(config.maximum_receive_work_requests())
+            u32::try_from(config.max_recv_wr)
                 .map_err(|_| Error::InvalidConfig("maximum receive WRs do not fit u32".into()))?,
         )
         .max_send_sge(
-            u32::try_from(config.maximum_send_sges())
+            u32::try_from(config.max_send_sge)
                 .map_err(|_| Error::InvalidConfig("maximum send SGEs do not fit u32".into()))?,
         )
         .max_recv_sge(
-            u32::try_from(config.maximum_receive_sges())
+            u32::try_from(config.max_recv_sge)
                 .map_err(|_| Error::InvalidConfig("maximum receive SGEs do not fit u32".into()))?,
         )
         .sq_sig_all(true)
@@ -2577,7 +2585,7 @@ fn is_failure_event(event: CmEventType) -> bool {
     )
 }
 
-fn terminal_error(outcome: &EngineOutcome) -> Error {
+fn terminal_error(outcome: &MemoizedTerminalResult) -> Error {
     match outcome.clone().into_result() {
         Err(error) => error,
         Ok(()) => unreachable!("successful engine outcome was filtered"),
@@ -3009,7 +3017,7 @@ struct OutboundRequest {
     config: RdmaConnectionConfig,
     setup: Mutex<Option<Box<dyn PreEstablishSetup>>>,
     reservation: Mutex<Option<ConnectionReservation>>,
-    result: Mutex<OutboundResult>,
+    result: Mutex<TakeOnceResult<RdmaConnection>>,
     cancelled: AtomicBool,
     cancellation_enqueued: AtomicBool,
     failure_counted: AtomicBool,
@@ -3030,7 +3038,7 @@ impl OutboundRequest {
             config,
             setup: Mutex::new(Some(setup)),
             reservation: Mutex::new(Some(reservation)),
-            result: Mutex::new(OutboundResult::Pending),
+            result: Mutex::new(TakeOnceResult::Pending),
             cancelled: AtomicBool::new(false),
             cancellation_enqueued: AtomicBool::new(false),
             failure_counted: AtomicBool::new(false),
@@ -3050,8 +3058,8 @@ impl OutboundRequest {
 
     fn complete(&self, result: Result<RdmaConnection>) {
         let mut current = lock_unpoison(&self.result);
-        if matches!(&*current, OutboundResult::Pending) {
-            *current = OutboundResult::Ready(result);
+        if matches!(&*current, TakeOnceResult::Pending) {
+            *current = TakeOnceResult::Ready(result);
             drop(current);
             self.waker.wake();
         }
@@ -3073,13 +3081,13 @@ impl OutboundRequest {
 
     fn take_result(&self) -> Option<Result<RdmaConnection>> {
         let mut current = lock_unpoison(&self.result);
-        match std::mem::replace(&mut *current, OutboundResult::Taken) {
-            OutboundResult::Ready(result) => Some(result),
-            OutboundResult::Pending => {
-                *current = OutboundResult::Pending;
+        match std::mem::replace(&mut *current, TakeOnceResult::Taken) {
+            TakeOnceResult::Ready(result) => Some(result),
+            TakeOnceResult::Pending => {
+                *current = TakeOnceResult::Pending;
                 None
             }
-            OutboundResult::Taken => None,
+            TakeOnceResult::Taken => None,
         }
     }
 
@@ -3087,15 +3095,15 @@ impl OutboundRequest {
         self.cancelled.store(true, Ordering::Release);
         let mut current = lock_unpoison(&self.result);
         let (replacement, undelivered) =
-            match std::mem::replace(&mut *current, OutboundResult::Taken) {
-                OutboundResult::Pending => (OutboundResult::Ready(Err(error)), None),
-                OutboundResult::Ready(Ok(connection)) => {
-                    (OutboundResult::Ready(Err(error)), Some(connection))
+            match std::mem::replace(&mut *current, TakeOnceResult::Taken) {
+                TakeOnceResult::Pending => (TakeOnceResult::Ready(Err(error)), None),
+                TakeOnceResult::Ready(Ok(connection)) => {
+                    (TakeOnceResult::Ready(Err(error)), Some(connection))
                 }
-                OutboundResult::Ready(Err(existing)) => {
-                    (OutboundResult::Ready(Err(existing)), None)
+                TakeOnceResult::Ready(Err(existing)) => {
+                    (TakeOnceResult::Ready(Err(existing)), None)
                 }
-                OutboundResult::Taken => (OutboundResult::Taken, None),
+                TakeOnceResult::Taken => (TakeOnceResult::Taken, None),
             };
         *current = replacement;
         drop(current);
@@ -3106,12 +3114,6 @@ impl OutboundRequest {
     fn try_enqueue_cancellation(&self) -> bool {
         !self.cancellation_enqueued.swap(true, Ordering::AcqRel)
     }
-}
-
-enum OutboundResult {
-    Pending,
-    Ready(Result<RdmaConnection>),
-    Taken,
 }
 
 struct ConnectWaiter {
@@ -3635,7 +3637,7 @@ mod tests {
 
         engine.shared.cm.begin_shutdown(
             &engine.shared,
-            &EngineOutcome::Failure(super::super::EngineFailure::DriverShutdown),
+            &MemoizedTerminalResult::from_error(Error::DriverShutdown),
         );
 
         assert!(matches!(

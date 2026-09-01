@@ -17,6 +17,23 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Each variant corresponds to a distinct failure category, enabling
 /// callers to handle errors with pattern matching rather than inspecting
 /// opaque error codes.
+///
+/// # Use case
+///
+/// Match typed resource, completion, transport, quarantine, and engine errors.
+///
+/// # Ownership and progress
+///
+/// Errors are owned values and do not drive progress or retain V1 errors.
+///
+/// # Safety and limits
+///
+/// Quarantine and wedge variants report retained ownership rather than
+/// claiming unsafe cleanup succeeded.
+///
+/// # Availability
+///
+/// Available in every V2 feature profile.
 #[derive(Debug)]
 pub enum Error {
     /// No RDMA devices were found on this system.
@@ -196,8 +213,8 @@ impl std::error::Error for Error {
     }
 }
 
-impl From<crate::Error> for Error {
-    fn from(e: crate::Error) -> Self {
+impl Error {
+    pub(crate) fn from_v1(e: crate::Error) -> Self {
         match e {
             crate::Error::NoDevices => Error::NoDevices,
             crate::Error::DeviceNotFound(name) => Error::DeviceNotFound(name),
@@ -241,13 +258,13 @@ mod tests {
 
     #[test]
     fn test_from_crate_error() {
-        let e: Error = crate::Error::NoDevices.into();
+        let e = Error::from_v1(crate::Error::NoDevices);
         assert!(matches!(e, Error::NoDevices));
 
-        let e: Error = crate::Error::DeviceNotFound("test".into()).into();
+        let e = Error::from_v1(crate::Error::DeviceNotFound("test".into()));
         assert!(matches!(e, Error::DeviceNotFound(_)));
 
-        let e: Error = crate::Error::WouldBlock.into();
+        let e = Error::from_v1(crate::Error::WouldBlock);
         assert!(matches!(e, Error::WouldBlock));
     }
 

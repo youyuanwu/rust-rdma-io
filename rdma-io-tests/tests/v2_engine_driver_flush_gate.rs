@@ -1,8 +1,8 @@
 use std::time::Duration;
 
-use rdma_io::test_support::destruction::{DestructionKind, DestructionRecorder};
-use rdma_io::test_support::engine_driver::{
-    TestAcceptedOperation, TestEngineResources, TestRouteHandle,
+use rdma_io::v2::test_support::{
+    DestructionKind, DestructionRecorder, TestAcceptedOperation, TestEngineResources,
+    TestRouteHandle,
 };
 use rdma_io::v2::{AccessIntent, CompletionMode, RdmaEngineBuilder};
 use rdma_io::wc::{WcOpcode, WcStatus};
@@ -131,7 +131,7 @@ async fn run_flush_gate(mode: CompletionMode) {
         wait_drained("traffic send route", &traffic_send_route),
     );
 
-    let flush_qp_num = flush_route.identity().qp_num;
+    let flush_qp_num = flush_route.qp_num();
     let flush_completions = flush_route.completions();
     assert_eq!(flush_completions.len(), 3);
     assert!(
@@ -248,6 +248,6 @@ async fn deterministic_cqe_suppression_retains_the_accepted_set_until_released()
 fn route_handle_and_qp_are_send_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     fn assert_send<T: Send>() {}
-    assert_send_sync::<rdma_io::test_support::engine_driver::TestEngineQp>();
+    assert_send_sync::<rdma_io::v2::test_support::TestEngineQp>();
     assert_send::<TestRouteHandle>();
 }

@@ -69,18 +69,18 @@ pub(super) struct ResourceSummary {
 
 impl EngineResources {
     pub(super) fn build(config: &EngineConfig) -> Result<(Self, ProviderLimits)> {
-        let device_list = RdmaCmDeviceList::new().map_err(Error::from)?;
+        let device_list = RdmaCmDeviceList::new().map_err(Error::from_v1)?;
         let inner_context = device_list
             .context_by_name(&config.device_name)
-            .map_err(Error::from)?;
+            .map_err(Error::from_v1)?;
         debug_assert!(device_list.contains_context(&inner_context));
         drop(device_list);
 
-        let attr = inner_context.query_device().map_err(Error::from)?;
+        let attr = inner_context.query_device().map_err(Error::from_v1)?;
         let provider = ProviderLimits::from_device_attr(&attr)?;
         config.validate_provider(&provider)?;
 
-        let context = Context::from_inner(inner_context);
+        let context = Context::from_anchored(inner_context);
         let pd = context.alloc_pd()?;
         let cq_entries = i32::try_from(config.cq_capacity)
             .map_err(|_| Error::InvalidConfig("CQ capacity does not fit i32".into()))?;
@@ -90,8 +90,8 @@ impl EngineResources {
                 .build()?,
             CompletionMode::Polling => CqBuilder::new(&context, cq_entries).build()?,
         });
-        let cm_event_channel = Arc::new(EventChannel::new().map_err(Error::from)?);
-        cm_event_channel.set_nonblocking().map_err(Error::from)?;
+        let cm_event_channel = Arc::new(EventChannel::new().map_err(Error::from_v1)?);
+        cm_event_channel.set_nonblocking().map_err(Error::from_v1)?;
 
         let (cq_async_fd, cm_async_fd) = match config.completion_mode {
             CompletionMode::Readiness => {
@@ -132,9 +132,9 @@ impl EngineResources {
 
     pub(super) fn summary(&self) -> ResourceSummary {
         ResourceSummary {
-            contexts: usize::from(!self.context.inner().as_raw().is_null()),
-            protection_domains: usize::from(!self.pd.inner().as_raw().is_null()),
-            completion_queues: usize::from(!self.cq.inner().as_raw().is_null()),
+            contexts: usize::from(!self.context.raw_context().as_raw().is_null()),
+            protection_domains: usize::from(!self.pd.raw_pd().as_raw().is_null()),
+            completion_queues: usize::from(!self.cq.raw_cq().as_raw().is_null()),
             completion_channels: usize::from(self.cq.has_channel()),
             cq_notification_fds: usize::from(self.cq.fd().is_some()),
             cm_event_channels: usize::from(!self.cm_event_channel.as_raw().is_null()),

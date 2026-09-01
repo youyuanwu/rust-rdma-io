@@ -20,11 +20,10 @@ use std::task::{Context, Poll};
 
 use tokio::io::unix::AsyncFd;
 
-use crate::async_cq::CqNotifier;
-use crate::wc::WorkCompletion;
-
+use super::Completion;
 use super::cq::Cq;
 use super::error::{Error, Result};
+use crate::async_cq::CqNotifier;
 
 /// State for the drain-after-arm loop.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -59,7 +58,7 @@ impl CqReadiness {
         cq: &Cq,
         notifier: &N,
         cx: &mut Context<'_>,
-        buf: &mut [WorkCompletion],
+        buf: &mut [Completion],
     ) -> Poll<Result<usize>> {
         self.poll_with(
             cq,
@@ -76,7 +75,7 @@ impl CqReadiness {
         cq: &Cq,
         async_fd: &AsyncFd<RawFd>,
         cx: &mut Context<'_>,
-        buf: &mut [WorkCompletion],
+        buf: &mut [Completion],
         before_arm: impl FnMut(u64) -> bool,
         after_arm: impl FnMut(u64) -> bool,
     ) -> Poll<Result<usize>> {
@@ -101,7 +100,7 @@ impl CqReadiness {
         &mut self,
         cq: &Cq,
         cx: &mut Context<'_>,
-        buf: &mut [WorkCompletion],
+        buf: &mut [Completion],
         mut poll_readable: impl FnMut(&mut Context<'_>) -> Poll<io::Result<()>>,
         mut before_arm: impl FnMut(u64) -> bool,
         mut after_arm: impl FnMut(u64) -> bool,
@@ -124,7 +123,7 @@ impl CqReadiness {
                 PollState::Arm if before_arm(self.arms.saturating_add(1)) => {
                     return Poll::Pending;
                 }
-                PollState::Arm => match cq.inner().req_notify(false) {
+                PollState::Arm => match cq.raw_cq().req_notify(false) {
                     Ok(()) => {
                         self.arms = self.arms.saturating_add(1);
                         self.state = PollState::PollAfterArm;
@@ -132,7 +131,7 @@ impl CqReadiness {
                             return Poll::Pending;
                         }
                     }
-                    Err(error) => return Poll::Ready(Err(error.into())),
+                    Err(error) => return Poll::Ready(Err(Error::from_v1(error))),
                 },
                 PollState::WaitingFd => match poll_readable(cx) {
                     Poll::Ready(Ok(())) => self.state = PollState::DrainFd,
@@ -201,6 +200,23 @@ impl CqReadiness {
 ///
 /// [`TokioCqNotifier`]: crate::tokio_notifier::TokioCqNotifier
 ///
+/// # Use case
+///
+/// Await typed completion batches with a custom readiness notifier.
+///
+/// # Ownership and progress
+///
+/// The adapter owns its CQ and notifier; the caller polls `next()` and owns the
+/// surrounding executor task.
+///
+/// # Safety and limits
+///
+/// It is the sole CQ consumer and preserves arm/re-poll/drain ordering.
+///
+/// # Availability
+///
+/// Available with the `async` feature.
+///
 /// # Example
 ///
 /// ```no_run
@@ -209,7 +225,7 @@ impl CqReadiness {
 /// let ctx = Context::open_first()?;
 /// let cq = CqBuilder::new(&ctx, 32).with_channel().build()?;
 /// let mut completions = cq.completions_tokio()?;
-/// let mut buf = [rdma_io::wc::WorkCompletion::default(); 16];
+/// let mut buf = [Completion::default(); 16];
 /// let n = completions.next(&mut buf).await?;
 /// println!("Got {n} completions");
 /// # Ok(())
@@ -254,25 +270,12 @@ impl<N: CqNotifier> Completions<N> {
     /// This method is cancellation-safe. If the future is dropped before
     /// completion, no completions are lost and the CQ remains in a
     /// consistent state.
-    pub async fn next(&mut self, buf: &mut [WorkCompletion]) -> Result<usize> {
+    pub async fn next(&mut self, buf: &mut [Completion]) -> Result<usize> {
         std::future::poll_fn(|cx| {
             self.readiness
                 .poll_with_notifier(&self.cq, &self.notifier, cx, buf)
         })
         .await
-    }
-
-    /// Poll-based completion interface for manual event-loop integration.
-    ///
-    /// Returns `Poll::Ready(Ok(n))` when completions are available,
-    /// or `Poll::Pending` when waiting for fd readiness.
-    pub fn poll_next(
-        &mut self,
-        cx: &mut Context<'_>,
-        buf: &mut [WorkCompletion],
-    ) -> Poll<Result<usize>> {
-        self.readiness
-            .poll_with_notifier(&self.cq, &self.notifier, cx, buf)
     }
 
     /// Access the underlying CQ.
@@ -290,11 +293,11 @@ impl<N: CqNotifier> Drop for Completions<N> {
 }
 
 fn drain_and_ack_channel_events(cq: &Cq) -> Result<()> {
-    let channel = cq.channel().expect("channel-backed CQ");
+    let channel = cq.completion_channel().expect("channel-backed CQ");
     drain_and_ack_events(
         || channel.get_cq_event().map(|_| ()),
         |count| unsafe {
-            rdma_io_sys::ibverbs::ibv_ack_cq_events(cq.inner().as_raw(), count);
+            rdma_io_sys::ibverbs::ibv_ack_cq_events(cq.raw_cq().as_raw(), count);
         },
     )
 }

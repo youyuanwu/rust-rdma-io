@@ -7,6 +7,23 @@ use super::cq::Cq;
 use super::error::{Error, Result};
 
 /// Type alias for Tokio-backed async completions.
+///
+/// # Use case
+///
+/// Name the canonical Tokio specialization of [`Completions`].
+///
+/// # Ownership and progress
+///
+/// The alias owns the CQ/notifier through `Completions`; applications own the
+/// Tokio task that awaits it.
+///
+/// # Safety and limits
+///
+/// The CQ must be channel-backed and have one logical consumer.
+///
+/// # Availability
+///
+/// Available with the `tokio` feature.
 pub type TokioCompletions = Completions<TokioCqNotifier>;
 
 impl Cq {

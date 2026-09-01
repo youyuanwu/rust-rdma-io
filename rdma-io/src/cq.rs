@@ -86,6 +86,10 @@ impl CompletionQueue {
         self.inner
     }
 
+    pub(crate) fn context(&self) -> &Arc<Context> {
+        &self._ctx
+    }
+
     /// Create a CQ associated with a completion channel.
     ///
     /// When completions arrive, the channel's fd becomes readable,

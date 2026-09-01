@@ -38,8 +38,7 @@ use std::task::{Context, Poll};
 
 use futures_util::task::AtomicWaker;
 
-use crate::wc::WorkCompletion;
-
+use super::Completion;
 use super::cq::Cq;
 use super::error::Result;
 
@@ -64,11 +63,28 @@ use super::error::Result;
 /// let poller = CqPoller::new(cq);
 ///
 /// // In an async task, poll for completions:
-/// let mut buf = [rdma_io::wc::WorkCompletion::default(); 16];
+/// let mut buf = [Completion::default(); 16];
 /// let n = poll_fn(|cx| poller.poll_completions(cx, &mut buf)).await?;
 /// # Ok(())
 /// # }
 /// ```
+///
+/// # Use case
+///
+/// Integrate a poll-only CQ with an externally supplied wake source.
+///
+/// # Ownership and progress
+///
+/// The poller owns the CQ; callers own wake scheduling and task polling.
+///
+/// # Safety and limits
+///
+/// Only typed [`Completion`] buffers are exposed, and one logical consumer
+/// must own CQ draining.
+///
+/// # Availability
+///
+/// Available with the `async` feature.
 pub struct CqPoller {
     cq: Cq,
     waker: AtomicWaker,
@@ -101,7 +117,7 @@ impl CqPoller {
     pub fn poll_completions(
         &self,
         cx: &mut Context<'_>,
-        buf: &mut [WorkCompletion],
+        buf: &mut [Completion],
     ) -> Poll<Result<usize>> {
         // 1. Fast path: poll before touching the waker.
         let n = self.cq.poll(buf)?;
@@ -141,11 +157,6 @@ impl CqPoller {
     pub fn cq(&self) -> &Cq {
         &self.cq
     }
-
-    /// Consume the poller and return the underlying CQ.
-    pub fn into_cq(self) -> Cq {
-        self.cq
-    }
 }
 
 // Safety: CqPoller is Send + Sync because:
@@ -184,7 +195,7 @@ mod tests {
             Ok(ctx) => {
                 let cq = CqBuilder::new(&ctx, 16).build().unwrap();
                 let poller = CqPoller::new(cq);
-                let mut completions = [WorkCompletion::default(); 4];
+                let mut completions = [Completion::default(); 4];
                 let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
 
                 assert!(matches!(

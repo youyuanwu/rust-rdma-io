@@ -1,0 +1,10 @@
+[package]
+name = "v2-surface-production-fixtures"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+rdma-io = { path = "../../../../rdma-io", default-features = false, features = ["tokio"] }
+
+[workspace]

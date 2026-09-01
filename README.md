@@ -177,9 +177,22 @@ operation poll, engine-driver polling, and driver/resource `Drop` can execute
 synchronous libibverbs/librdmacm calls, so they should not share a
 latency-sensitive executor lane that cannot tolerate provider stalls.
 
-The independent low-level `Context`, `Pd`, `Cq`, `Mr`, `Qp`, typed `Op`,
-`CqPoller`, and `Completions` resources remain available for callers that do
-not need engine-owned connection progress.
+The independent low-level `Context`, `Pd`, `Cq`, `Mr`, `Qp`, typed
+`Completion`, `CqPoller`, and `Completions` resources remain available for
+callers that do not need engine-owned connection progress. `Context::open_first`
+and `Context::open_by_name` retain the complete librdmacm device-list anchor;
+availability and first-device ordering therefore follow `rdma_get_devices`.
+The facade never calls `ibv_close_device`, and the list is released with
+`rdma_free_devices` only after all dependent resources are gone.
+All retained production types are exported only as `rdma_io::v2::<Item>`;
+implementation modules are private. `QpBuilder::build_with_cm(&CmId)` is the
+sole production CM-wrapper bridge and validates exact anchored-context identity.
+Direct, generic, Tokio, and externally woken CQ paths all use `Completion`
+buffers, while SEND/RECV/READ/WRITE use the four named `Qp` methods.
+
+The non-default `test-hooks` feature has one doc-hidden namespace:
+`rdma_io::v2::test_support`. It exists only for deterministic V2 validation,
+exposes no raw pointer/fd/resource consumer, and is not a V1 API.
 
 ### V2 Message Transport
 
@@ -237,9 +250,9 @@ Key design properties:
 - **Explicit driver spawning**: No hidden `tokio::spawn`; one engine driver
   composes shared CQ/CM driving, message protocol progress, receive reposting,
   disconnect handling, and reclamation. There is no receive-pump task.
-- **Wire protocol**: The public `rdma_io::v2::protocol` module exposes the
-  exact DATA, CREDIT, and HELLO frame constants and parsing/writing helpers
-  (12-byte header with magic/version/type/length validation)
+- **Wire protocol**: DATA, CREDIT, and HELLO use an internal 12-byte
+  magic/version/type/length header. Wire behavior is stable through
+  `MessageTransport`; codec helpers are not public API.
 - **Credit-based flow control**: Each `send()` acquires one remote receive
   credit. Credits are exchanged via HELLO handshake and returned via CREDIT
   frames when `ReceivedMessage` is dropped. RNR retry is a safety net, not

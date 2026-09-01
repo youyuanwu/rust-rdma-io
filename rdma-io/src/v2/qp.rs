@@ -18,8 +18,6 @@ use super::error::{Error, Result};
 use super::mr::{Mr, RemoteMr};
 use super::pd::Pd;
 
-use crate::wc::WorkCompletion;
-
 /// Provider result for one linked work-request batch.
 #[derive(Debug)]
 #[allow(
@@ -63,6 +61,24 @@ pub(crate) struct QpCapabilities {
 /// | max_send_sge | 1 |
 /// | max_recv_sge | 1 |
 /// | sq_sig_all | true |
+///
+/// # Use case
+///
+/// Configure and create one independent RC QP on typed V2 resources.
+///
+/// # Ownership and progress
+///
+/// The built QP retains its PD/CQs; the caller owns posting and completion
+/// progress.
+///
+/// # Safety and limits
+///
+/// `build_with_cm` validates exact anchored context identity and the QP must
+/// be dropped before its creating CM ID.
+///
+/// # Availability
+///
+/// Available in every V2 feature profile.
 ///
 /// # Example
 ///
@@ -139,11 +155,8 @@ impl<'a> QpBuilder<'a> {
 
     /// Build the QP using RDMA CM for connection management.
     ///
-    /// The typical v2 flow is:
-    /// 1. Establish CM connection (resolve address and route)
-    /// 2. `Context::from_cm(&cm_id)` to get the device context
-    /// 3. Allocate PD and CQs from that context
-    /// 4. Call this method to create the QP
+    /// The CM route must select the same anchored context as the builder's
+    /// protection domain and completion queues.
     ///
     /// The resulting [`Qp`] must be dropped **before** the `CmId` that
     /// created it. Use struct field ordering to ensure correct drop order.
@@ -167,25 +180,32 @@ impl<'a> QpBuilder<'a> {
             return Err(Error::InvalidConfig("max_recv_sge must be > 0".into()));
         }
 
-        let pd_arc = Arc::clone(self.pd.inner());
-        let send_cq_inner = Arc::clone(self.send_cq.inner());
-        let recv_cq_inner = Arc::clone(self.recv_cq.inner());
+        let context = self.pd.raw_context().as_raw();
+        if self.send_cq.raw_context().as_raw() != context
+            || self.recv_cq.raw_context().as_raw() != context
+        {
+            return Err(Error::InvalidConfig(
+                "QP protection domain and completion queues must use the same anchored context"
+                    .into(),
+            ));
+        }
+        cm_id
+            .require_context(self.pd.raw_context())
+            .map_err(Error::from_v1)?;
+        let pd_arc = Arc::clone(self.pd.raw_pd());
+        let send_cq_inner = Arc::clone(self.send_cq.raw_cq());
+        let recv_cq_inner = Arc::clone(self.recv_cq.raw_cq());
 
-        let cmqp = cm_id.create_qp_with_cq(
-            &pd_arc,
-            &self.attr,
-            Some(&send_cq_inner),
-            Some(&recv_cq_inner),
-        )?;
+        let cmqp = cm_id
+            .create_qp_with_cq(
+                &pd_arc,
+                &self.attr,
+                Some(&send_cq_inner),
+                Some(&recv_cq_inner),
+            )
+            .map_err(Error::from_v1)?;
 
         Ok(Qp { inner: cmqp })
-    }
-
-    /// Get the current QP initialization attributes.
-    ///
-    /// Useful for inspecting defaults or debugging.
-    pub fn attr(&self) -> &QpInitAttr {
-        &self.attr
     }
 }
 
@@ -213,19 +233,28 @@ impl<'a> QpBuilder<'a> {
 /// `Qp` is `Send + Sync`. The underlying QP uses internal locking
 /// in libibverbs. However, callers must coordinate work request
 /// submission and completion draining to avoid logical races.
+///
+/// # Use case
+///
+/// Post SEND, RECV, RDMA WRITE, and RDMA READ through four named methods.
+///
+/// # Ownership and progress
+///
+/// The QP retains its PD/CQs and owns no completion driver or task.
+///
+/// # Safety and limits
+///
+/// Posted MRs must remain live until typed completions arrive. The creating
+/// CM ID must outlive the QP.
+///
+/// # Availability
+///
+/// Created by [`QpBuilder::build_with_cm`].
 pub struct Qp {
     inner: CmQueuePair,
 }
 
 impl Qp {
-    /// Create from an existing `CmQueuePair`.
-    ///
-    /// Useful for interop when the QP was created through the v1 API
-    /// (e.g., via `AsyncCmId::create_qp_with_cq()`).
-    pub fn from_cm_qp(cmqp: CmQueuePair) -> Self {
-        Self { inner: cmqp }
-    }
-
     /// Post a send work request.
     ///
     /// Sends data from `mr` with the given `wr_id`. The `wr_id` is
@@ -314,13 +343,8 @@ impl Qp {
     /// Forces all outstanding WRs to complete (with flush error),
     /// enabling clean shutdown.
     pub fn to_error(&self) -> Result<()> {
-        self.inner.to_error()?;
+        self.inner.to_error().map_err(Error::from_v1)?;
         Ok(())
-    }
-
-    /// Access the underlying CM queue pair for v1 API interop.
-    pub fn inner(&self) -> &CmQueuePair {
-        &self.inner
     }
 
     #[cfg(feature = "tokio")]
@@ -334,66 +358,18 @@ impl Qp {
     )]
     pub(crate) fn uses_resources(&self, pd: &Pd, cq: &Cq) -> bool {
         self.inner
-            .uses_resources(pd.inner(), cq.inner(), cq.inner())
-    }
-
-    /// Submit a typed RDMA operation.
-    ///
-    /// io_uring/compio-style submission: pass a typed [`Op`](super::op::Op)
-    /// describing what to do, and the operation is posted to the hardware
-    /// queue. The completion will carry the `wr_id` from the
-    /// [`Op`](super::op::Op) for correlation.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use rdma_io::v2::*;
-    /// # fn example(qp: &Qp, mr: &Mr) -> Result<()> {
-    /// qp.submit(Op::send(mr, 42))?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn submit(&self, op: super::op::Op<'_>) -> Result<()> {
-        match op {
-            super::op::Op::Send { mr, wr_id } => self.post_send(mr, wr_id),
-            super::op::Op::Recv { mr, wr_id } => self.post_recv(mr, wr_id),
-            super::op::Op::Write {
-                local,
-                remote,
-                wr_id,
-            } => self.post_write(local, remote, wr_id),
-            super::op::Op::Read {
-                local,
-                remote,
-                wr_id,
-            } => self.post_read(local, remote, wr_id),
-        }
-    }
-
-    /// Post a send and return an error if the completion indicates failure.
-    ///
-    /// Higher-level wrapper that checks the `WorkCompletion` status and
-    /// converts failures to [`Error::CompletionError`].
-    pub fn check_completion(wc: &WorkCompletion) -> Result<()> {
-        if wc.is_success() {
-            Ok(())
-        } else {
-            Err(Error::CompletionError {
-                status: wc.status(),
-                vendor_err: wc.vendor_err(),
-            })
-        }
+            .uses_resources(pd.raw_pd(), cq.raw_cq(), cq.raw_cq())
     }
 
     // -- Internal posting helpers --
 
     fn post_single_send(&self, wr: SendWr) -> Result<()> {
-        let mut batch = PreparedSendBatch::new(vec![wr]).map_err(Error::from)?;
+        let mut batch = PreparedSendBatch::new(vec![wr]).map_err(Error::from_v1)?;
         batch_outcome_to_single(self.post_send_batch(&mut batch))
     }
 
     fn post_single_recv(&self, wr: RecvWr) -> Result<()> {
-        let mut batch = PreparedRecvBatch::new(vec![wr]).map_err(Error::from)?;
+        let mut batch = PreparedRecvBatch::new(vec![wr]).map_err(Error::from_v1)?;
         batch_outcome_to_single(self.post_recv_batch(&mut batch))
     }
 

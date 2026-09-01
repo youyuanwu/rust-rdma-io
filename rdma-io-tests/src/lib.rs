@@ -405,7 +405,7 @@ pub mod test_helpers {
 pub mod engine_test_helpers {
     use rdma_io::async_cm::{AsyncCmId, AsyncCmListener};
     use rdma_io::cm::ConnParam;
-    use rdma_io::test_support::engine_driver::{TestEngineQp, TestEngineResources};
+    use rdma_io::v2::test_support::{TestEngineQp, TestEngineResources};
 
     use crate::test_helpers::{connect_addr_for, connect_client_with_retry};
 

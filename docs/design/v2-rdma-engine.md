@@ -92,6 +92,39 @@ engine clone alive while submissions remain possible, and call
 - With `panic=abort`, callers must enable the needed Tokio I/O/time drivers;
   Tokio does not expose non-panicking capability probes for every case.
 
+## Retained Independent V2 Surface
+
+Production types have one public spelling under `rdma_io::v2::<Item>`.
+Implementation modules such as `v2::context`, `v2::engine`,
+`v2::message_transport`, and `v2::protocol` are private.
+
+`Context::open_first()` and `Context::open_by_name()` select from
+`rdma_get_devices` and retain that complete librdmacm list as their lifetime
+anchor. First-device order and named availability follow librdmacm enumeration;
+an independently verbs-openable device missing from that list is unavailable.
+Repeated same-name opens may share librdmacm's cached raw context. Facade drop
+never calls `ibv_close_device`; `rdma_free_devices` runs after the last
+dependent PD, CQ, MR, and facade.
+
+The one production CM-wrapper bridge is
+`QpBuilder::build_with_cm(&rdma_io::cm::CmId)`. It validates exact raw context
+identity before QP creation, and the resulting QP must be dropped before its CM
+ID. There is no borrowed `Context::from_cm`, raw resource adoption/accessor, or
+public V1 error/remote-MR conversion.
+
+Direct CQ polling, generic notifier readiness, Tokio readiness, and externally
+woken polling all use `rdma_io::v2::Completion` buffers. The typed completion
+exposes `wr_id`, success, status, opcode, `qp_num`, byte length, vendor error,
+and `result()`. SEND, RECV, RDMA WRITE, and RDMA READ are posted only through
+the four named `Qp` methods; there is no duplicate `Op`/`OpCode` submission
+facade.
+
+The non-default `test-hooks` feature exposes one doc-hidden validation
+namespace, `rdma_io::v2::test_support`. It owns V2 lifecycle observations even
+though private instrumentation is placed at shared wrapper destructor sites.
+It is not a V1 consumer API, raw-resource escape, CQ/CM consumer, or alternate
+progress path.
+
 ## Public Engine API
 
 The engine API is available with the `tokio` feature and is re-exported from
@@ -212,7 +245,6 @@ MessageTransportBuilder::accept_on(&RdmaListener)
 MessageTransport::ready() -> impl Future<Output = Result<()>>
 MessageTransport::send(&[u8]) -> impl Future<Output = Result<()>>
 MessageTransport::recv() -> impl Future<Output = Result<ReceivedMessage>>
-MessageTransport::buffer_size() -> usize
 MessageTransport::close() -> impl Future<Output = Result<()>>
 
 ReceivedMessage::len() -> usize
@@ -245,10 +277,9 @@ for engine-driven repost and CREDIT return. Holding all received messages
 therefore withholds all negotiated DATA credits and can intentionally stall
 the peer until at least one handle is dropped.
 
-The public `rdma_io::v2::protocol` module exposes the exact frame constants,
-parsed header/control types, and parse/write helpers for interoperability tests
-and packet analysis. Ordinary message-transport users do not need to encode
-frames directly.
+The DATA, CREDIT, and HELLO format remains an internal wire contract exercised
+through `MessageTransport`. V2 does not expose packet construction or parsing
+helpers as public API.
 
 Peer disconnect and normal flush completions are normalized to
 `Error::TransportClosed` on HELLO, receive, and steady-state message paths.
@@ -282,8 +313,8 @@ without clamping.
 
 ### Connection settings
 
-`RdmaConnectionConfig::default()` plus the following consuming setters and
-read-only accessors form the exact public configuration surface:
+`RdmaConnectionConfig::default()` plus the following consuming setters form
+the exact public configuration surface:
 
 ```text
 max_send_wr(usize) -> RdmaConnectionConfig
@@ -294,16 +325,12 @@ responder_resources(usize) -> RdmaConnectionConfig
 initiator_depth(usize) -> RdmaConnectionConfig
 retry_count(usize) -> RdmaConnectionConfig
 rnr_retry_count(usize) -> RdmaConnectionConfig
-
-maximum_send_work_requests() -> usize
-maximum_receive_work_requests() -> usize
-maximum_send_sges() -> usize
-maximum_receive_sges() -> usize
-responder_resource_count() -> usize
-initiator_depth_count() -> usize
-retry_count_value() -> usize
-rnr_retry_count_value() -> usize
 ```
+
+Configuration is write-only after construction: callers already own the values
+they supply, defaults are documented below, and effective/provider state is
+reported through connection or engine diagnostics rather than duplicate
+builder getters.
 
 | Setting | Default | Inclusive range | Provider limit |
 |---|---:|---:|---|

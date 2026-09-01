@@ -68,8 +68,8 @@ fn exact_public_types_and_traits_compile() {
         Err(Error::InvalidConfig("signature check".into()));
 
     let config = RdmaConnectionConfig::default();
-    assert_eq!(config.maximum_send_work_requests(), 19);
-    assert_eq!(config.maximum_receive_work_requests(), 34);
+    assert_eq!(config.max_send_wr, 19);
+    assert_eq!(config.max_recv_wr, 34);
     assert_eq!(
         RdmaListenerConfig::default().backlog_capacity(),
         listener::DEFAULT_LISTENER_BACKLOG
@@ -107,18 +107,18 @@ fn exact_public_types_and_traits_compile() {
 
 #[test]
 fn engine_failure_preserves_explicit_cq_debt() {
-    let failure = EngineFailure::from_progress(Error::EngineWedged {
+    let failure = lifecycle::MemoizedTerminalResult::from_error(Error::EngineWedged {
         retained_bundles: 2,
         outstanding_operations: 3,
         cq_debt: 5,
     });
     assert!(matches!(
-        failure.into_error(),
-        Error::EngineWedged {
+        failure.into_result(),
+        Err(Error::EngineWedged {
             retained_bundles: 2,
             outstanding_operations: 3,
             cq_debt: 5,
-        }
+        })
     ));
 }
 

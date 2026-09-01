@@ -266,16 +266,16 @@ impl MessageTransportBuilder {
 
         let connection = match self.connection_config.clone() {
             Some(config) => {
-                if config.maximum_send_work_requests() < required_send_wr {
+                if config.max_send_wr < required_send_wr {
                     return Err(Error::InvalidConfig(format!(
                         "connection maximum send WRs ({}) is below the message requirement ({required_send_wr})",
-                        config.maximum_send_work_requests()
+                        config.max_send_wr
                     )));
                 }
-                if config.maximum_receive_work_requests() < required_recv_wr {
+                if config.max_recv_wr < required_recv_wr {
                     return Err(Error::InvalidConfig(format!(
                         "connection maximum receive WRs ({}) is below the message requirement ({required_recv_wr})",
-                        config.maximum_receive_work_requests()
+                        config.max_recv_wr
                     )));
                 }
                 config
@@ -471,7 +471,7 @@ impl TestHelloAttachHook {
         completion.inner.opcode = rdma_io_sys::ibverbs::IBV_WC_RECV;
         completion.inner.byte_len = u32::try_from(len)
             .map_err(|_| Error::InvalidConfig("test HELLO length overflow".into()))?;
-        state.parse_hello_receive(&super::op::Completion::from(completion), &mr)?;
+        state.parse_hello_receive(&super::op::Completion::from_raw(completion), &mr)?;
         self.record_hello_processed();
         Ok(())
     }
@@ -609,8 +609,7 @@ impl PreEstablishSetup for MessagePreEstablishSetup {
 ///
 /// `ReceivedMessage` implements `AsRef<[u8]>` and
 /// `Deref<Target = [u8]>`. Both views are exactly the application payload:
-/// they exclude the public [`crate::v2::protocol`] header and have length
-/// [`Self::len`].
+/// they exclude the internal wire header and have length [`Self::len`].
 ///
 /// # Cancellation Safety
 ///
@@ -2072,11 +2071,6 @@ impl MessageTransport {
         Arc::clone(&self.state).recv().await
     }
 
-    /// The configured maximum message payload size.
-    pub fn buffer_size(&self) -> usize {
-        self.buffer_size
-    }
-
     #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     pub fn test_connection(&self) -> Result<RdmaConnection> {
@@ -2191,11 +2185,10 @@ mod setup_tests {
         let config = MessageTransportBuilder::new()
             .derive_engine_config()
             .unwrap();
-        assert_eq!(config.connection.maximum_send_work_requests(), 19);
-        assert_eq!(config.connection.maximum_receive_work_requests(), 34);
+        assert_eq!(config.connection.max_send_wr, 19);
+        assert_eq!(config.connection.max_recv_wr, 34);
         assert_eq!(
-            config.connection.maximum_send_work_requests()
-                + config.connection.maximum_receive_work_requests(),
+            config.connection.max_send_wr + config.connection.max_recv_wr,
             53
         );
         assert_eq!(256 * 53, 13_568);
@@ -2206,8 +2199,8 @@ mod setup_tests {
             .recv_buffers(1)
             .derive_engine_config()
             .unwrap();
-        assert_eq!(minimum.connection.maximum_send_work_requests(), 4);
-        assert_eq!(minimum.connection.maximum_receive_work_requests(), 3);
+        assert_eq!(minimum.connection.max_send_wr, 4);
+        assert_eq!(minimum.connection.max_recv_wr, 3);
     }
 
     #[test]
@@ -2332,7 +2325,6 @@ mod hello_tests {
         protocol::HelloPayload {
             data_recv_capacity: capacity,
             max_message_size: maximum,
-            protocol_version: protocol::PROTO_VERSION as u32,
         }
     }
 
@@ -2658,9 +2650,9 @@ mod tests {
             .send_buffers(4);
         let cfg = b.derive_engine_config().unwrap();
         // max_send_wr = send_count + ctrl_send_count + 1 = 4 + 2 + 1 = 7
-        assert_eq!(cfg.connection.maximum_send_work_requests(), 7);
+        assert_eq!(cfg.connection.max_send_wr, 7);
         // max_recv_wr = recv_count + ctrl_recv_count = 8 + 2 = 10
-        assert_eq!(cfg.connection.maximum_receive_work_requests(), 10);
+        assert_eq!(cfg.connection.max_recv_wr, 10);
     }
 
     #[test]

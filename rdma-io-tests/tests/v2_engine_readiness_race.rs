@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use rdma_io::test_support::engine_driver::{TestAcceptedOperation, TestEngineResources};
+use rdma_io::v2::test_support::{TestAcceptedOperation, TestEngineResources, TestRouteHandle};
 use rdma_io::v2::{AccessIntent, CompletionMode, RdmaEngineBuilder};
 use rdma_io::wc::WcOpcode;
 use rdma_io_tests::engine_test_helpers::{EngineTestEndpoint, setup_engine_pair};
@@ -20,7 +20,7 @@ fn take_endpoint_route(
     resources: &TestEngineResources,
     endpoint: &mut EngineTestEndpoint,
     operations: impl IntoIterator<Item = TestAcceptedOperation>,
-) -> rdma_io::test_support::engine_driver::TestRouteHandle {
+) -> TestRouteHandle {
     let route = resources
         .install_route(endpoint.qp.take().expect("endpoint QP"), operations)
         .unwrap();
@@ -30,8 +30,8 @@ fn take_endpoint_route(
 
 fn post_pair(
     resources: &TestEngineResources,
-    recv_route: &rdma_io::test_support::engine_driver::TestRouteHandle,
-    send_route: &rdma_io::test_support::engine_driver::TestRouteHandle,
+    recv_route: &TestRouteHandle,
+    send_route: &TestRouteHandle,
     index: usize,
 ) {
     let recv_id = 100_000 + index as u64;

@@ -7,14 +7,29 @@
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
-use crate::comp_channel::CompletionChannel;
-use crate::cq::CompletionQueue;
-use crate::wc::WorkCompletion;
-
+use super::Completion;
 use super::context::Context;
 use super::error::Result;
+use crate::comp_channel::CompletionChannel;
+use crate::cq::CompletionQueue;
 
 /// Builder for creating completion queues with explicit configuration.
+///
+/// # Use case
+///
+/// Create either a directly polled CQ or a channel-backed CQ.
+///
+/// # Ownership and progress
+///
+/// The resulting CQ retains its anchored context and owns no task.
+///
+/// # Safety and limits
+///
+/// The requested entry count must be positive and provider-supported.
+///
+/// # Availability
+///
+/// Available in every V2 feature profile.
 ///
 /// # Examples
 ///
@@ -73,16 +88,19 @@ impl<'a> CqBuilder<'a> {
                 "CQ capacity (cqe) must be >= 1".into(),
             ));
         }
-        let inner_ctx = Arc::clone(self.ctx.inner());
+        let inner_ctx = Arc::clone(self.ctx.raw_context());
         if self.use_channel {
-            let channel = Arc::new(CompletionChannel::new(&inner_ctx)?);
-            let cq = CompletionQueue::with_comp_channel(inner_ctx, self.cqe, &channel)?;
+            let channel =
+                Arc::new(CompletionChannel::new(&inner_ctx).map_err(super::error::Error::from_v1)?);
+            let cq = CompletionQueue::with_comp_channel(inner_ctx, self.cqe, &channel)
+                .map_err(super::error::Error::from_v1)?;
             Ok(Cq {
                 inner: cq,
                 channel: Some(channel),
             })
         } else {
-            let cq = CompletionQueue::new(inner_ctx, self.cqe)?;
+            let cq =
+                CompletionQueue::new(inner_ctx, self.cqe).map_err(super::error::Error::from_v1)?;
             Ok(Cq {
                 inner: cq,
                 channel: None,
@@ -91,8 +109,26 @@ impl<'a> CqBuilder<'a> {
     }
 }
 
-/// An RDMA completion queue supporting both direct CQ polling and
-/// fd/readiness-based notification for Rust async runtimes.
+/// An RDMA completion queue supporting direct and readiness-based polling.
+///
+/// # Use case
+///
+/// Poll typed [`Completion`] values directly or attach a runtime notifier.
+///
+/// # Ownership and progress
+///
+/// The CQ retains its anchored context and optional completion channel. The
+/// caller remains the sole completion consumer.
+///
+/// # Safety and limits
+///
+/// Concurrent consumers can steal each other's completions and require
+/// external synchronization.
+///
+/// # Availability
+///
+/// Direct polling is always available; readiness adapters require their
+/// corresponding feature.
 ///
 /// Created via [`CqBuilder`]. The CQ integration model is determined at
 /// construction time:
@@ -130,8 +166,11 @@ impl Cq {
     ///
     /// - [`Error::Verbs`](super::error::Error::Verbs) if the underlying poll
     ///   operation fails
-    pub fn poll(&self, completions: &mut [WorkCompletion]) -> Result<usize> {
-        let n = self.inner.poll(completions)?;
+    pub fn poll(&self, completions: &mut [Completion]) -> Result<usize> {
+        let n = self
+            .inner
+            .poll(Completion::raw_slice_mut(completions))
+            .map_err(super::error::Error::from_v1)?;
         Ok(n)
     }
 
@@ -153,18 +192,15 @@ impl Cq {
         self.channel.is_some()
     }
 
-    /// Access the completion channel, if present.
-    ///
-    /// Useful for advanced integration patterns or interop with
-    /// the v1 async API.
-    pub fn channel(&self) -> Option<&CompletionChannel> {
+    pub(crate) fn completion_channel(&self) -> Option<&CompletionChannel> {
         self.channel.as_deref()
     }
 
-    /// Access the underlying completion queue.
-    ///
-    /// Use this for interop with the v1 API or advanced operations.
-    pub fn inner(&self) -> &Arc<CompletionQueue> {
+    pub(crate) fn raw_cq(&self) -> &Arc<CompletionQueue> {
         &self.inner
+    }
+
+    pub(crate) fn raw_context(&self) -> &Arc<crate::device::Context> {
+        self.inner.context()
     }
 }

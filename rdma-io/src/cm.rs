@@ -839,7 +839,22 @@ impl RdmaCmDeviceList {
     pub fn context_by_name(self: &Arc<Self>, name: &str) -> Result<Arc<Context>> {
         let index = select_name_index((0..self.count).map(|index| self.context_name(index)), name)
             .ok_or_else(|| crate::Error::DeviceNotFound(name.to_owned()))?;
+        self.context_at(index)
+    }
+
+    /// Select the first librdmacm-enumerated context.
+    pub(crate) fn first_context(self: &Arc<Self>) -> Result<Arc<Context>> {
+        if self.count == 0 {
+            return Err(crate::Error::NoDevices);
+        }
+        self.context_at(0)
+    }
+
+    fn context_at(self: &Arc<Self>, index: usize) -> Result<Arc<Context>> {
         let raw = self.context_raw(index);
+        if raw.is_null() {
+            return Err(crate::Error::NoDevices);
+        }
         let anchor: Arc<dyn ContextAnchor> = self.clone();
         Ok(Arc::new(unsafe { Context::from_raw_anchored(raw, anchor) }))
     }

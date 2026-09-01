@@ -1,89 +1,70 @@
 //! V2 device context facade.
 //!
-//! Provides ergonomic device discovery and context management,
-//! wrapping the lower-level [`crate::device`] API with simplified
-//! constructors and automatic error handling.
+//! Provides owned, librdmacm-anchored device discovery and context management.
 
 use std::sync::Arc;
 
-use crate::cm::CmId;
+use crate::cm::RdmaCmDeviceList;
 use crate::device;
 
 use super::error::{Error, Result};
 use super::pd::Pd;
 
-/// An opened RDMA device context.
+/// An owned, non-closing RDMA device context facade.
 ///
-/// `Context` is the entry point for the v2 API. It wraps an opened
-/// RDMA device and provides methods to allocate child resources
-/// (protection domains, completion queues, etc.).
+/// # Use case
 ///
-/// # Construction
+/// Use [`Context::open_first`] or [`Context::open_by_name`] to construct
+/// independent V2 protection domains, completion queues, and queue pairs.
 ///
-/// Use [`Context::open_first()`] for quick setup or
-/// [`Context::open_by_name()`] when targeting a specific device.
-/// For CM-based connections, use [`Context::from_cm()`] to obtain
-/// the context from an established CM connection.
+/// # Ownership and progress
 ///
-/// # Thread Safety
+/// Each context retains the complete list returned by `rdma_get_devices`.
+/// Child resources retain the facade transitively. Contexts do not drive
+/// progress or create tasks.
 ///
-/// `Context` is `Send + Sync` and can be shared across threads.
-/// The inner device context uses reference counting to ensure
-/// proper cleanup.
+/// # Safety and limits
+///
+/// The facade never calls `ibv_close_device`. The retained librdmacm list is
+/// released with `rdma_free_devices` only after the facade and all descendants
+/// are gone. Repeated same-name opens may refer to librdmacm's cached raw
+/// context.
+///
+/// # Availability
+///
+/// Device availability and first-device ordering follow librdmacm enumeration.
+/// A verbs-openable device absent from that enumeration is unavailable through
+/// these constructors.
 #[derive(Clone)]
 pub struct Context {
     inner: Arc<device::Context>,
 }
 
 impl Context {
-    /// Open the first available RDMA device.
+    /// Open the first librdmacm-enumerated RDMA device.
     ///
     /// Returns an error if no RDMA devices are found on the system.
     ///
     /// # Errors
     ///
     /// - [`Error::NoDevices`] if no RDMA devices are available
-    /// - [`Error::Verbs`] if the device cannot be opened
+    /// - [`Error::Verbs`] if librdmacm enumeration fails
     pub fn open_first() -> Result<Self> {
-        let ctx = device::open_first_device()?;
-        Ok(Self {
-            inner: Arc::new(ctx),
-        })
+        let devices = RdmaCmDeviceList::new().map_err(Error::from_v1)?;
+        let inner = devices.first_context().map_err(Error::from_v1)?;
+        Ok(Self { inner })
     }
 
-    /// Open an RDMA device by its kernel name (e.g., `"rxe0"`, `"mlx5_0"`).
+    /// Open a librdmacm-enumerated device by kernel name.
     ///
     /// # Errors
     ///
     /// - [`Error::DeviceNotFound`] if no device with that name exists
-    /// - [`Error::Verbs`] if the device cannot be opened
+    /// - [`Error::Verbs`] if librdmacm enumeration fails
     pub fn open_by_name(name: &str) -> Result<Self> {
-        let ctx = device::open_device_by_name(name)?;
-        Ok(Self {
-            inner: Arc::new(ctx),
-        })
-    }
-
-    /// Obtain a context from a CM connection.
-    ///
-    /// This wraps the CM-owned verbs context, enabling resource creation
-    /// (PD, CQ, MR) from a connection established through RDMA CM.
-    /// The typical flow is:
-    ///
-    /// 1. Establish a CM connection (resolve address, route)
-    /// 2. Call `Context::from_cm(&cm_id)` to get the device context
-    /// 3. Allocate PD and CQs from this context
-    /// 4. Build a QP using those resources
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::InvalidConfig`] if the CM ID has no verbs context
-    ///   (address not yet resolved)
-    pub fn from_cm(cm_id: &CmId) -> Result<Self> {
-        let ctx = cm_id.verbs_context().ok_or_else(|| {
-            Error::InvalidConfig("CM ID has no verbs context (resolve_addr first)".into())
-        })?;
-        Ok(Self { inner: ctx })
+        let devices = RdmaCmDeviceList::new().map_err(Error::from_v1)?;
+        let inner = devices.context_by_name(name).map_err(Error::from_v1)?;
+        Ok(Self { inner })
     }
 
     /// Allocate a protection domain from this context.
@@ -94,23 +75,16 @@ impl Context {
     ///
     /// - [`Error::Verbs`] if PD allocation fails
     pub fn alloc_pd(&self) -> Result<Pd> {
-        let pd = crate::pd::ProtectionDomain::new(Arc::clone(&self.inner))?;
+        let pd =
+            crate::pd::ProtectionDomain::new(Arc::clone(&self.inner)).map_err(Error::from_v1)?;
         Ok(Pd::new(pd))
     }
 
-    /// Access the underlying device context.
-    ///
-    /// Use this for interop with the v1 API or advanced operations
-    /// not covered by the v2 facade.
-    pub fn inner(&self) -> &Arc<device::Context> {
+    pub(crate) fn raw_context(&self) -> &Arc<device::Context> {
         &self.inner
     }
 
-    /// Create from an existing `Arc<Context>`.
-    ///
-    /// Useful for wrapping a verbs context obtained from other sources
-    /// (e.g., `AsyncCmId::verbs_context()`).
-    pub fn from_inner(ctx: Arc<device::Context>) -> Self {
-        Self { inner: ctx }
+    pub(crate) fn from_anchored(inner: Arc<device::Context>) -> Self {
+        Self { inner }
     }
 }

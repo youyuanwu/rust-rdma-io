@@ -14,6 +14,7 @@ use tokio::sync::Notify;
 
 use super::connection::{ConnectionReservation, SharedCmId};
 use super::diagnostics::RdmaListenerDiagnostics;
+use super::lifecycle::{MemoizedTerminalResult, TakeOnceResult};
 use super::registry::{lock_unpoison, read_unpoison};
 use super::{EngineShared, PreEstablishSetup, RdmaConnection, RdmaConnectionConfig, SetupSummary};
 use crate::v2::error::{Error, Result};
@@ -392,7 +393,7 @@ impl IncomingChild {
 pub(super) struct ListenRequest {
     pub(super) address: SocketAddr,
     pub(super) config: RdmaListenerConfig,
-    result: Mutex<ListenResult>,
+    result: Mutex<TakeOnceResult<RdmaListener>>,
     cancelled: AtomicBool,
     waker: AtomicWaker,
 }
@@ -402,7 +403,7 @@ impl ListenRequest {
         Self {
             address,
             config,
-            result: Mutex::new(ListenResult::Pending),
+            result: Mutex::new(TakeOnceResult::Pending),
             cancelled: AtomicBool::new(false),
             waker: AtomicWaker::new(),
         }
@@ -414,8 +415,8 @@ impl ListenRequest {
 
     pub(super) fn complete(&self, result: Result<RdmaListener>) {
         let mut current = lock_unpoison(&self.result);
-        if matches!(&*current, ListenResult::Pending) {
-            *current = ListenResult::Ready(result);
+        if matches!(&*current, TakeOnceResult::Pending) {
+            *current = TakeOnceResult::Ready(result);
             drop(current);
             self.waker.wake();
         }
@@ -423,38 +424,32 @@ impl ListenRequest {
 
     fn take_result(&self) -> Option<Result<RdmaListener>> {
         let mut current = lock_unpoison(&self.result);
-        match std::mem::replace(&mut *current, ListenResult::Taken) {
-            ListenResult::Ready(result) => Some(result),
-            ListenResult::Pending => {
-                *current = ListenResult::Pending;
+        match std::mem::replace(&mut *current, TakeOnceResult::Taken) {
+            TakeOnceResult::Ready(result) => Some(result),
+            TakeOnceResult::Pending => {
+                *current = TakeOnceResult::Pending;
                 None
             }
-            ListenResult::Taken => None,
+            TakeOnceResult::Taken => None,
         }
     }
 
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
         let mut current = lock_unpoison(&self.result);
-        let replacement = match std::mem::replace(&mut *current, ListenResult::Taken) {
-            ListenResult::Pending => ListenResult::Ready(Err(Error::DriverShutdown)),
-            ListenResult::Ready(Ok(listener)) => {
+        let replacement = match std::mem::replace(&mut *current, TakeOnceResult::Taken) {
+            TakeOnceResult::Pending => TakeOnceResult::Ready(Err(Error::DriverShutdown)),
+            TakeOnceResult::Ready(Ok(listener)) => {
                 drop(listener);
-                ListenResult::Ready(Err(Error::DriverShutdown))
+                TakeOnceResult::Ready(Err(Error::DriverShutdown))
             }
-            ListenResult::Ready(Err(error)) => ListenResult::Ready(Err(error)),
-            ListenResult::Taken => ListenResult::Taken,
+            TakeOnceResult::Ready(Err(error)) => TakeOnceResult::Ready(Err(error)),
+            TakeOnceResult::Taken => TakeOnceResult::Taken,
         };
         *current = replacement;
         drop(current);
         self.waker.wake();
     }
-}
-
-enum ListenResult {
-    Pending,
-    Ready(Result<RdmaListener>),
-    Taken,
 }
 
 struct ListenWaiter {
@@ -492,7 +487,7 @@ impl Drop for ListenWaiter {
 
 pub(super) struct AcceptRequest {
     intent: Mutex<Option<AcceptIntent>>,
-    result: Mutex<AcceptResult>,
+    result: Mutex<TakeOnceResult<RdmaConnection>>,
     cancelled: AtomicBool,
     cancellation_counted: AtomicBool,
     delivered: AtomicBool,
@@ -504,7 +499,7 @@ impl AcceptRequest {
     fn new(intent: AcceptIntent) -> Self {
         Self {
             intent: Mutex::new(Some(intent)),
-            result: Mutex::new(AcceptResult::Pending),
+            result: Mutex::new(TakeOnceResult::Pending),
             cancelled: AtomicBool::new(false),
             cancellation_counted: AtomicBool::new(false),
             delivered: AtomicBool::new(false),
@@ -547,8 +542,8 @@ impl AcceptRequest {
 
     pub(super) fn complete(&self, result: Result<RdmaConnection>) {
         let mut current = lock_unpoison(&self.result);
-        if matches!(&*current, AcceptResult::Pending) {
-            *current = AcceptResult::Ready(result);
+        if matches!(&*current, TakeOnceResult::Pending) {
+            *current = TakeOnceResult::Ready(result);
             drop(current);
             self.waker.wake();
         }
@@ -556,22 +551,24 @@ impl AcceptRequest {
 
     pub(super) fn complete_success(&self, connection: RdmaConnection) {
         let mut current = lock_unpoison(&self.result);
-        if self.cancelled.load(Ordering::Acquire) || !matches!(&*current, AcceptResult::Pending) {
+        if self.cancelled.load(Ordering::Acquire) || !matches!(&*current, TakeOnceResult::Pending) {
             drop(current);
             drop(connection);
             return;
         }
-        *current = AcceptResult::Ready(Ok(connection));
+        *current = TakeOnceResult::Ready(Ok(connection));
         drop(current);
         self.waker.wake();
     }
 
     pub(super) fn fail_undelivered(&self, error: Error) -> bool {
         let mut current = lock_unpoison(&self.result);
-        let replacement = match std::mem::replace(&mut *current, AcceptResult::Taken) {
-            AcceptResult::Pending | AcceptResult::Ready(Ok(_)) => AcceptResult::Ready(Err(error)),
-            AcceptResult::Ready(Err(existing)) => AcceptResult::Ready(Err(existing)),
-            AcceptResult::Taken => AcceptResult::Taken,
+        let replacement = match std::mem::replace(&mut *current, TakeOnceResult::Taken) {
+            TakeOnceResult::Pending | TakeOnceResult::Ready(Ok(_)) => {
+                TakeOnceResult::Ready(Err(error))
+            }
+            TakeOnceResult::Ready(Err(existing)) => TakeOnceResult::Ready(Err(existing)),
+            TakeOnceResult::Taken => TakeOnceResult::Taken,
         };
         *current = replacement;
         drop(current);
@@ -581,18 +578,18 @@ impl AcceptRequest {
 
     fn take_result(&self) -> Option<Result<RdmaConnection>> {
         let mut current = lock_unpoison(&self.result);
-        match std::mem::replace(&mut *current, AcceptResult::Taken) {
-            AcceptResult::Ready(result) => {
+        match std::mem::replace(&mut *current, TakeOnceResult::Taken) {
+            TakeOnceResult::Ready(result) => {
                 if result.is_ok() {
                     self.delivered.store(true, Ordering::Release);
                 }
                 Some(result)
             }
-            AcceptResult::Pending => {
-                *current = AcceptResult::Pending;
+            TakeOnceResult::Pending => {
+                *current = TakeOnceResult::Pending;
                 None
             }
-            AcceptResult::Taken => None,
+            TakeOnceResult::Taken => None,
         }
     }
 
@@ -604,25 +601,19 @@ impl AcceptRequest {
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
         let mut current = lock_unpoison(&self.result);
-        let replacement = match std::mem::replace(&mut *current, AcceptResult::Taken) {
-            AcceptResult::Pending => AcceptResult::Pending,
-            AcceptResult::Ready(Ok(connection)) => {
+        let replacement = match std::mem::replace(&mut *current, TakeOnceResult::Taken) {
+            TakeOnceResult::Pending => TakeOnceResult::Pending,
+            TakeOnceResult::Ready(Ok(connection)) => {
                 drop(connection);
-                AcceptResult::Taken
+                TakeOnceResult::Taken
             }
-            AcceptResult::Ready(Err(error)) => AcceptResult::Ready(Err(error)),
-            AcceptResult::Taken => AcceptResult::Taken,
+            TakeOnceResult::Ready(Err(error)) => TakeOnceResult::Ready(Err(error)),
+            TakeOnceResult::Taken => TakeOnceResult::Taken,
         };
         *current = replacement;
         drop(current);
         self.waker.wake();
     }
-}
-
-enum AcceptResult {
-    Pending,
-    Ready(Result<RdmaConnection>),
-    Taken,
 }
 
 struct AcceptWaiter {
@@ -685,7 +676,7 @@ pub(super) struct ListenerState {
     closing: AtomicBool,
     finalization_started: AtomicBool,
     failure: Mutex<Option<Error>>,
-    close_outcome: Mutex<Option<ListenerCloseOutcome>>,
+    close_outcome: Mutex<Option<MemoizedTerminalResult>>,
     pub(super) close_notify: Notify,
     pub(super) frontend_count: AtomicUsize,
     work_enqueued: AtomicBool,
@@ -1030,20 +1021,20 @@ impl ListenerState {
         if outcome.is_none() {
             let failure = error.or_else(|| lock_unpoison(&self.failure).clone());
             *outcome = Some(match failure {
-                Some(error) => ListenerCloseOutcome::Failed(error),
-                None => ListenerCloseOutcome::Success,
+                Some(error) => MemoizedTerminalResult::from_error(error),
+                None => MemoizedTerminalResult::success(),
             });
         }
         drop(outcome);
         self.close_notify.notify_waiters();
     }
 
-    pub(super) fn terminalize(&self, outcome: &super::EngineOutcome) {
+    pub(super) fn terminalize(&self, outcome: &MemoizedTerminalResult) {
         self.closing.store(true, Ordering::Release);
         {
             let mut close_outcome = lock_unpoison(&self.close_outcome);
             if close_outcome.is_none() {
-                *close_outcome = Some(ListenerCloseOutcome::Terminal(outcome.clone()));
+                *close_outcome = Some(outcome.clone());
             }
         }
         let mut queues = self.lock_queues();
@@ -1080,7 +1071,7 @@ impl ListenerState {
     fn close_result(&self) -> Option<Result<()>> {
         lock_unpoison(&self.close_outcome)
             .clone()
-            .map(ListenerCloseOutcome::into_result)
+            .map(MemoizedTerminalResult::into_result)
     }
 
     pub(super) fn queue_counts(&self) -> (usize, usize, usize) {
@@ -1212,23 +1203,6 @@ pub(super) enum InboundRejectReason {
     ListenerClosed,
     ContextMismatch,
     SetupFailure,
-}
-
-#[derive(Clone)]
-enum ListenerCloseOutcome {
-    Success,
-    Failed(Error),
-    Terminal(super::EngineOutcome),
-}
-
-impl ListenerCloseOutcome {
-    fn into_result(self) -> Result<()> {
-        match self {
-            Self::Success => Ok(()),
-            Self::Failed(error) => Err(error),
-            Self::Terminal(outcome) => outcome.into_result(),
-        }
-    }
 }
 
 #[cfg(test)]

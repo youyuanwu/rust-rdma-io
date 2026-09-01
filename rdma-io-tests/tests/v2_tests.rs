@@ -7,9 +7,7 @@
 
 use rdma_io::async_cm::AsyncCmId;
 use rdma_io::cm::ConnParam;
-use rdma_io::mr::AccessFlags;
 use rdma_io::v2::*;
-use rdma_io::wc::WorkCompletion;
 use rdma_io_tests::test_helpers::{connect_addr_for, has_software_rdma};
 
 #[macro_export]
@@ -22,9 +20,9 @@ macro_rules! require_software_rdma {
     };
 }
 
-async fn wait_for_completion(cq: &Cq) -> WorkCompletion {
+async fn wait_for_completion(cq: &Cq) -> Completion {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        let mut completions = [WorkCompletion::default(); 4];
+        let mut completions = [Completion::default(); 4];
         loop {
             let n = cq.poll(&mut completions).unwrap();
             if n > 0 {
@@ -49,7 +47,7 @@ fn test_v2_cq_poll_only() {
     assert!(cq.fd().is_none());
 
     // Empty poll returns 0
-    let mut wc = [WorkCompletion::default(); 4];
+    let mut wc = [Completion::default(); 4];
     assert_eq!(cq.poll(&mut wc).unwrap(), 0);
 }
 
@@ -101,25 +99,6 @@ fn test_v2_mr_zero_size_rejected() {
     assert!(matches!(result, Err(Error::InvalidConfig(_))));
 }
 
-// ---- Builder Defaults ----
-
-#[test]
-fn test_v2_builder_defaults() {
-    require_software_rdma!();
-    let ctx = Context::open_first().unwrap();
-    let pd = ctx.alloc_pd().unwrap();
-    let send_cq = CqBuilder::new(&ctx, 16).build().unwrap();
-    let recv_cq = CqBuilder::new(&ctx, 16).build().unwrap();
-
-    let builder = QpBuilder::new(&pd, &send_cq, &recv_cq);
-    let attr = builder.attr();
-    assert_eq!(attr.max_send_wr, 16);
-    assert_eq!(attr.max_recv_wr, 16);
-    assert_eq!(attr.max_send_sge, 1);
-    assert_eq!(attr.max_recv_sge, 1);
-    assert!(attr.sq_sig_all);
-}
-
 // ---- Endpoint helper ----
 
 /// Holds v2 resources for a connected endpoint.
@@ -140,7 +119,8 @@ async fn setup_v2_connection() -> (V2Endpoint, V2Endpoint) {
     let server_handle = tokio::spawn(async move {
         let conn_id = listener.get_request().await.unwrap();
 
-        let ctx = Context::from_cm(&conn_id).unwrap();
+        let device_name = conn_id.device_name().expect("resolved inbound device");
+        let ctx = Context::open_by_name(device_name).unwrap();
         let pd = ctx.alloc_pd().unwrap();
         let send_cq = CqBuilder::new(&ctx, 32).with_channel().build().unwrap();
         let recv_cq = CqBuilder::new(&ctx, 32).with_channel().build().unwrap();
@@ -168,22 +148,14 @@ async fn setup_v2_connection() -> (V2Endpoint, V2Endpoint) {
     let client_handle = tokio::spawn(async move {
         let (async_cm, endpoint) =
             rdma_io_tests::test_helpers::connect_client_with_retry(&connect_addr, |cm| {
-                // cm is &AsyncCmId — get verbs context and build v2 resources
-                let verbs_ctx = cm.verbs_context().unwrap();
-                let ctx = Context::from_inner(verbs_ctx);
+                let device_name = cm.cm_id().device_name().expect("resolved outbound device");
+                let ctx = Context::open_by_name(device_name).unwrap();
                 let pd = ctx.alloc_pd().unwrap();
                 let send_cq = CqBuilder::new(&ctx, 32).with_channel().build().unwrap();
                 let recv_cq = CqBuilder::new(&ctx, 32).with_channel().build().unwrap();
-
-                let cmqp = cm
-                    .create_qp_with_cq(
-                        pd.inner(),
-                        &rdma_io::qp::QpInitAttr::default(),
-                        Some(send_cq.inner()),
-                        Some(recv_cq.inner()),
-                    )
+                let qp = QpBuilder::new(&pd, &send_cq, &recv_cq)
+                    .build_with_cm(cm.cm_id())
                     .unwrap();
-                let qp = Qp::from_cm_qp(cmqp);
 
                 (pd, send_cq, recv_cq, qp)
             })
@@ -221,7 +193,7 @@ async fn test_v2_send_recv_poll() {
     client.qp.post_send(&send_mr, 2).unwrap();
 
     // Poll for send completion on client
-    let mut wc = [WorkCompletion::default(); 4];
+    let mut wc = [Completion::default(); 4];
     loop {
         let n = client.send_cq.poll(&mut wc).unwrap();
         if n > 0 {
@@ -261,7 +233,8 @@ async fn test_v2_send_recv_async() {
 
     let server_handle = tokio::spawn(async move {
         let conn_id = listener.get_request().await.unwrap();
-        let ctx = Context::from_cm(&conn_id).unwrap();
+        let device_name = conn_id.device_name().expect("resolved inbound device");
+        let ctx = Context::open_by_name(device_name).unwrap();
         let pd = ctx.alloc_pd().unwrap();
         let send_cq = CqBuilder::new(&ctx, 32).with_channel().build().unwrap();
         let recv_cq = CqBuilder::new(&ctx, 32).with_channel().build().unwrap();
@@ -280,20 +253,14 @@ async fn test_v2_send_recv_async() {
     let client_handle = tokio::spawn(async move {
         let (async_cm, (pd, send_cq, recv_cq, qp)) =
             rdma_io_tests::test_helpers::connect_client_with_retry(&connect_addr, |cm| {
-                let verbs_ctx = cm.verbs_context().unwrap();
-                let ctx = Context::from_inner(verbs_ctx);
+                let device_name = cm.cm_id().device_name().expect("resolved outbound device");
+                let ctx = Context::open_by_name(device_name).unwrap();
                 let pd = ctx.alloc_pd().unwrap();
                 let send_cq = CqBuilder::new(&ctx, 32).with_channel().build().unwrap();
                 let recv_cq = CqBuilder::new(&ctx, 32).with_channel().build().unwrap();
-                let cmqp = cm
-                    .create_qp_with_cq(
-                        pd.inner(),
-                        &rdma_io::qp::QpInitAttr::default(),
-                        Some(send_cq.inner()),
-                        Some(recv_cq.inner()),
-                    )
+                let qp = QpBuilder::new(&pd, &send_cq, &recv_cq)
+                    .build_with_cm(cm.cm_id())
                     .unwrap();
-                let qp = Qp::from_cm_qp(cmqp);
                 (pd, send_cq, recv_cq, qp)
             })
             .await;
@@ -320,7 +287,7 @@ async fn test_v2_send_recv_async() {
     c_qp.post_send(&send_mr, 20).unwrap();
 
     // Await completions concurrently
-    let mut wc = [WorkCompletion::default(); 4];
+    let mut wc = [Completion::default(); 4];
 
     let (_, _) = tokio::join!(
         async {
@@ -330,7 +297,7 @@ async fn test_v2_send_recv_async() {
             assert_eq!(wc[0].wr_id(), 20);
         },
         async {
-            let mut wc2 = [WorkCompletion::default(); 4];
+            let mut wc2 = [Completion::default(); 4];
             let n = server_recv_completions.next(&mut wc2).await.unwrap();
             assert!(n > 0);
             assert!(wc2[0].is_success());
@@ -342,6 +309,10 @@ async fn test_v2_send_recv_async() {
 
     // Verify data arrived
     assert_eq!(&recv_mr.as_slice()[..msg.len()], msg);
+    drop(s_qp);
+    drop(c_qp);
+    drop(server_recv_completions);
+    drop(client_send_completions);
 }
 
 // ---- RDMA Write + Read ----
@@ -357,7 +328,8 @@ async fn test_v2_rdma_write_read() {
 
     let server_handle = tokio::spawn(async move {
         let conn_id = listener.get_request().await.unwrap();
-        let ctx = Context::from_cm(&conn_id).unwrap();
+        let device_name = conn_id.device_name().expect("resolved inbound device");
+        let ctx = Context::open_by_name(device_name).unwrap();
         let pd = ctx.alloc_pd().unwrap();
         let send_cq = CqBuilder::new(&ctx, 32).with_channel().build().unwrap();
         let recv_cq = CqBuilder::new(&ctx, 32).with_channel().build().unwrap();
@@ -376,20 +348,14 @@ async fn test_v2_rdma_write_read() {
     let client_handle = tokio::spawn(async move {
         let (async_cm, (pd, send_cq, recv_cq, qp)) =
             rdma_io_tests::test_helpers::connect_client_with_retry(&connect_addr, |cm| {
-                let verbs_ctx = cm.verbs_context().unwrap();
-                let ctx = Context::from_inner(verbs_ctx);
+                let device_name = cm.cm_id().device_name().expect("resolved outbound device");
+                let ctx = Context::open_by_name(device_name).unwrap();
                 let pd = ctx.alloc_pd().unwrap();
                 let send_cq = CqBuilder::new(&ctx, 32).with_channel().build().unwrap();
                 let recv_cq = CqBuilder::new(&ctx, 32).with_channel().build().unwrap();
-                let cmqp = cm
-                    .create_qp_with_cq(
-                        pd.inner(),
-                        &rdma_io::qp::QpInitAttr::default(),
-                        Some(send_cq.inner()),
-                        Some(recv_cq.inner()),
-                    )
+                let qp = QpBuilder::new(&pd, &send_cq, &recv_cq)
+                    .build_with_cm(cm.cm_id())
                     .unwrap();
-                let qp = Qp::from_cm_qp(cmqp);
                 (pd, send_cq, recv_cq, qp)
             })
             .await;
@@ -436,24 +402,24 @@ async fn test_v2_rdma_write_read() {
     c_qp.post_send(&c_desc_send, 103).unwrap();
 
     // Wait for all 4 exchange completions
-    let mut wc = [WorkCompletion::default(); 4];
+    let mut wc = [Completion::default(); 4];
     let (_, _, _, _) = tokio::join!(
         async {
             let n = s_send_comp.next(&mut wc).await.unwrap();
             assert!(n > 0 && wc[0].is_success());
         },
         async {
-            let mut w = [WorkCompletion::default(); 4];
+            let mut w = [Completion::default(); 4];
             let n = s_recv_comp.next(&mut w).await.unwrap();
             assert!(n > 0 && w[0].is_success());
         },
         async {
-            let mut w = [WorkCompletion::default(); 4];
+            let mut w = [Completion::default(); 4];
             let n = c_send_comp.next(&mut w).await.unwrap();
             assert!(n > 0 && w[0].is_success());
         },
         async {
-            let mut w = [WorkCompletion::default(); 4];
+            let mut w = [Completion::default(); 4];
             let n = c_recv_comp.next(&mut w).await.unwrap();
             assert!(n > 0 && w[0].is_success());
         }
@@ -478,7 +444,7 @@ async fn test_v2_rdma_write_read() {
         .unwrap();
 
     // Wait for write completion
-    let mut wc2 = [WorkCompletion::default(); 4];
+    let mut wc2 = [Completion::default(); 4];
     let n = c_send_comp.next(&mut wc2).await.unwrap();
     assert!(n > 0);
     assert!(
@@ -507,6 +473,12 @@ async fn test_v2_rdma_write_read() {
 
     // Verify data matches
     assert_eq!(read_mr.as_slice(), write_data);
+    drop(s_qp);
+    drop(c_qp);
+    drop(s_send_comp);
+    drop(s_recv_comp);
+    drop(c_send_comp);
+    drop(c_recv_comp);
 }
 
 // ---- Drop Order Test ----
@@ -533,25 +505,6 @@ async fn test_v2_drop_order() {
     // No panics = success
 }
 
-// ---- Access intent flags test ----
-
-#[test]
-fn test_v2_access_intent_flags() {
-    assert_eq!(AccessIntent::LocalOnly.to_flags(), AccessFlags::LOCAL_WRITE);
-    assert_eq!(
-        AccessIntent::RemoteRead.to_flags(),
-        AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_READ
-    );
-    assert_eq!(
-        AccessIntent::RemoteWrite.to_flags(),
-        AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE
-    );
-    assert_eq!(
-        AccessIntent::RemoteReadWrite.to_flags(),
-        AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_READ | AccessFlags::REMOTE_WRITE
-    );
-}
-
 // ---- Completion Error Test ----
 
 /// Test that failed completions surface error status through v2 APIs.
@@ -575,8 +528,8 @@ async fn test_v2_completion_error() {
     assert_eq!(wc.status(), rdma_io::wc::WcStatus::WrFlushErr);
     assert_eq!(wc.wr_id(), 42);
 
-    // Verify that check_completion surfaces CompletionError
-    let result = Qp::check_completion(&wc);
+    // Verify that typed completion status surfaces CompletionError.
+    let result = wc.result();
     assert!(result.is_err());
     match result.unwrap_err() {
         Error::CompletionError { status, .. } => {
@@ -602,7 +555,8 @@ async fn test_v2_cq_poller_send_recv() {
 
     let server_handle = tokio::spawn(async move {
         let conn_id = listener.get_request().await.unwrap();
-        let ctx = Context::from_cm(&conn_id).unwrap();
+        let device_name = conn_id.device_name().expect("resolved inbound device");
+        let ctx = Context::open_by_name(device_name).unwrap();
         let pd = ctx.alloc_pd().unwrap();
         // Poll-only CQs — no completion channel
         let send_cq = CqBuilder::new(&ctx, 32).build().unwrap();
@@ -622,20 +576,14 @@ async fn test_v2_cq_poller_send_recv() {
     let client_handle = tokio::spawn(async move {
         let (async_cm, (pd, send_cq, recv_cq, qp)) =
             rdma_io_tests::test_helpers::connect_client_with_retry(&connect_addr, |cm| {
-                let verbs_ctx = cm.verbs_context().unwrap();
-                let ctx = Context::from_inner(verbs_ctx);
+                let device_name = cm.cm_id().device_name().expect("resolved outbound device");
+                let ctx = Context::open_by_name(device_name).unwrap();
                 let pd = ctx.alloc_pd().unwrap();
                 let send_cq = CqBuilder::new(&ctx, 32).build().unwrap();
                 let recv_cq = CqBuilder::new(&ctx, 32).build().unwrap();
-                let cmqp = cm
-                    .create_qp_with_cq(
-                        pd.inner(),
-                        &rdma_io::qp::QpInitAttr::default(),
-                        Some(send_cq.inner()),
-                        Some(recv_cq.inner()),
-                    )
+                let qp = QpBuilder::new(&pd, &send_cq, &recv_cq)
+                    .build_with_cm(cm.cm_id())
                     .unwrap();
-                let qp = Qp::from_cm_qp(cmqp);
                 (pd, send_cq, recv_cq, qp)
             })
             .await;
@@ -675,7 +623,7 @@ async fn test_v2_cq_poller_send_recv() {
             }
         });
 
-        let mut buf = [WorkCompletion::default(); 4];
+        let mut buf = [Completion::default(); 4];
         let n = std::future::poll_fn(|cx| recv_poller.poll_completions(cx, &mut buf))
             .await
             .unwrap();
@@ -696,7 +644,7 @@ async fn test_v2_cq_poller_send_recv() {
             }
         });
 
-        let mut buf = [WorkCompletion::default(); 4];
+        let mut buf = [Completion::default(); 4];
         let n = std::future::poll_fn(|cx| send_poller.poll_completions(cx, &mut buf))
             .await
             .unwrap();
@@ -714,35 +662,34 @@ async fn test_v2_cq_poller_send_recv() {
     assert_eq!(&recv_mr.as_slice()[..msg.len()], msg);
 }
 
-// ---- Op/Completion (io_uring-style) test ----
+// ---- Named QP methods and typed completion test ----
 
-/// Test the io_uring/compio-style Op submission + typed Completion API.
+/// Test the named QP submission methods plus typed completion API.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
-async fn test_v2_op_submit_completion() {
+async fn test_v2_named_qp_methods_completion() {
     require_software_rdma!();
 
     let (server, client) = setup_v2_connection().await;
 
     let msg = b"hello op api!";
 
-    // Server: post recv via Op
+    // Server: post recv through the named method.
     let mut recv_mr = server.pd.reg_mr(64, AccessIntent::LocalOnly).unwrap();
-    server.qp.submit(Op::recv(&mut recv_mr, 10)).unwrap();
+    server.qp.post_recv(&mut recv_mr, 10).unwrap();
 
-    // Client: post send via Op
+    // Client: post send through the named method.
     let mut send_mr = client.pd.reg_mr(64, AccessIntent::LocalOnly).unwrap();
     send_mr.as_mut_slice()[..msg.len()].copy_from_slice(msg);
-    client.qp.submit(Op::send(&send_mr, 20)).unwrap();
+    client.qp.post_send(&send_mr, 20).unwrap();
 
     // Poll for completions and use typed Completion API
-    let mut wc_buf = [rdma_io::wc::WorkCompletion::default(); 4];
+    let mut wc_buf = [Completion::default(); 4];
 
     // Client send completion
     loop {
         let n = client.send_cq.poll(&mut wc_buf).unwrap();
         if n > 0 {
-            let cqes = Completion::from_wc_slice(&wc_buf[..n]);
-            let cqe = &cqes[0];
+            let cqe = &wc_buf[0];
             assert_eq!(cqe.wr_id(), 20);
             assert!(cqe.result().is_ok());
             assert_eq!(cqe.opcode(), rdma_io::wc::WcOpcode::Send);
@@ -755,8 +702,7 @@ async fn test_v2_op_submit_completion() {
     loop {
         let n = server.recv_cq.poll(&mut wc_buf).unwrap();
         if n > 0 {
-            let cqes = Completion::from_wc_slice(&wc_buf[..n]);
-            let cqe = &cqes[0];
+            let cqe = &wc_buf[0];
             assert_eq!(cqe.wr_id(), 10);
             assert!(cqe.result().is_ok());
             assert_eq!(cqe.opcode(), rdma_io::wc::WcOpcode::Recv);
@@ -776,12 +722,12 @@ async fn test_v2_completion_result_error() {
 
     let (server, _client) = setup_v2_connection().await;
 
-    // Post recv via Op, then force QP to error → flushed WR
+    // Post recv, then force QP to error → flushed WR.
     let mut recv_mr = server.pd.reg_mr(64, AccessIntent::LocalOnly).unwrap();
-    server.qp.submit(Op::recv(&mut recv_mr, 99)).unwrap();
+    server.qp.post_recv(&mut recv_mr, 99).unwrap();
     server.qp.to_error().unwrap();
 
-    let cqe = Completion::from(wait_for_completion(&server.recv_cq).await);
+    let cqe = wait_for_completion(&server.recv_cq).await;
     assert_eq!(cqe.wr_id(), 99);
     assert!(!cqe.is_success());
 

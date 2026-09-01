@@ -8,12 +8,13 @@ use std::task::{Context, Poll};
 
 use futures_util::task::AtomicWaker;
 
+use super::EngineShared;
 use super::connection::{ConnectionState, Direction, OperationKind, RdmaConnection};
 use super::diagnostics::CqeReject;
+use super::lifecycle::MemoizedTerminalResult;
 use super::registry::{
     ConnectionToken, Lookup, OperationToken, PagedRegistry, lock_unpoison, read_unpoison,
 };
-use super::{EngineOutcome, EngineShared};
 use crate::v2::error::{Error, Result};
 use crate::v2::mr::{Mr, RemoteMr};
 use crate::v2::op::Completion;
@@ -224,7 +225,7 @@ fn post_detached_batch(
             match PreparedRecvBatch::new(requests) {
                 Ok(batch) => InternalPreparedBatch::Recv(batch),
                 Err(error) => {
-                    let error = Error::from(error);
+                    let error = Error::from_v1(error);
                     rollback_internal_entries(
                         shared,
                         connection,
@@ -248,7 +249,7 @@ fn post_detached_batch(
             match PreparedSendBatch::new(requests) {
                 Ok(batch) => InternalPreparedBatch::Send(batch),
                 Err(error) => {
-                    let error = Error::from(error);
+                    let error = Error::from_v1(error);
                     rollback_internal_entries(
                         shared,
                         connection,
@@ -821,7 +822,7 @@ impl OperationState {
         inner.reclamation_pending = false;
         let was_quarantined = self.quarantined.swap(false, Ordering::AcqRel);
         let mut mr = inner.mr.take();
-        let typed = Completion::from(completion);
+        let typed = Completion::from_raw(completion);
         let result = typed.result().map(|()| typed);
         let callback = inner.callback.take().map(|callback| {
             let callback_mr = mr.take();
@@ -887,7 +888,7 @@ impl OperationState {
         self.cancelled.store(true, Ordering::Release);
     }
 
-    pub(super) fn finalize_terminal(&self, outcome: &EngineOutcome) -> TerminalizeState {
+    pub(super) fn finalize_terminal(&self, outcome: &MemoizedTerminalResult) -> TerminalizeState {
         let mut inner = lock_unpoison(&self.inner);
         let was_reclaiming = inner.reclamation_pending;
         let newly_quarantined = match inner.lifecycle {
@@ -910,11 +911,7 @@ impl OperationState {
         };
         inner.reclamation_pending = false;
         if !inner.detached && inner.output.is_none() {
-            let error = outcome
-                .clone()
-                .into_result()
-                .err()
-                .unwrap_or(Error::DriverShutdown);
+            let error = outcome.error().unwrap_or(Error::DriverShutdown);
             inner.output = Some((Err(error), None));
         }
         drop(inner);
@@ -1359,7 +1356,7 @@ impl ValidatedOperation {
             OperationKind::Recv => {
                 let mut batch =
                     PreparedRecvBatch::new(vec![RecvWr::new(token.encode()).sg(self.sge)])
-                        .map_err(Error::from)?;
+                        .map_err(Error::from_v1)?;
                 connection.poster.post_recv(&mut batch)
             }
             OperationKind::Send | OperationKind::Write | OperationKind::Read => {
@@ -1379,7 +1376,7 @@ impl ValidatedOperation {
                 if let Some(remote) = self.remote {
                     wr = wr.rdma(remote.addr, remote.rkey);
                 }
-                let mut batch = PreparedSendBatch::new(vec![wr]).map_err(Error::from)?;
+                let mut batch = PreparedSendBatch::new(vec![wr]).map_err(Error::from_v1)?;
                 connection.poster.post_send(&mut batch)
             }
         }
@@ -1594,10 +1591,11 @@ mod tests {
     use super::*;
     use crate::test_support::destruction::{DestructionKind, DestructionRecorder};
     use crate::v2::AccessIntent;
+    use crate::v2::engine::ConnectionReadyWork;
     use crate::v2::engine::config::EngineConfig;
     use crate::v2::engine::connection::{WorkRequestPoster, install_connection};
+    use crate::v2::engine::lifecycle::MemoizedTerminalResult;
     use crate::v2::engine::resources::ResourceSummary;
-    use crate::v2::engine::{ConnectionReadyWork, EngineFailure};
     use crate::v2::message_transport::TestEngineHelloDeadlineState;
     use rdma_io_sys::ibverbs::{IBV_WC_RECV, IBV_WC_SEND, IBV_WC_SUCCESS};
     use std::sync::Barrier;
@@ -2766,7 +2764,7 @@ mod tests {
         let mut shutdown = Box::pin(engine.shutdown());
         assert!(shutdown.as_mut().poll(&mut cx).is_pending());
 
-        shared.finish(EngineOutcome::Failure(EngineFailure::Wedged {
+        shared.finish(MemoizedTerminalResult::from_error(Error::EngineWedged {
             retained_bundles: 1,
             outstanding_operations: 1,
             cq_debt: 1,
