@@ -1753,6 +1753,11 @@ impl ConnectionTerminalSink for EngineMessageState {
 /// HELLO, DATA, CREDIT, receive reposting, message-local fairness, pools, and
 /// message lifecycle; shared CQ/CM progress and safe QP teardown remain with
 /// [`super::RdmaEngineDriver`].
+///
+/// The HELLO deadline is armed on first poll. A never-polled driver therefore
+/// provides neither protocol progress nor a timeout guarantee. Dropping an
+/// unfinished driver publishes [`Error::DriverShutdown`] to the frontend and
+/// requests engine-owned safe connection close.
 #[must_use = "message protocol progress requires polling or spawning the driver"]
 pub struct MessageTransportDriver {
     state: Arc<EngineMessageState>,
@@ -1859,7 +1864,7 @@ fn validate_peer_hello(hello: protocol::HelloPayload, local_buffer_size: usize) 
     Ok(peer_capacity)
 }
 
-/// Message-oriented RDMA transport (frontend handle).
+/// Message-oriented RDMA transport (non-cloneable frontend handle).
 ///
 /// Provides async `send()` and `recv()` with pre-registered reusable
 /// buffer pools, message boundaries, credit-based flow control, and

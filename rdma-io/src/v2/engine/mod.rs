@@ -9,8 +9,8 @@
 //! operation generation, operation owner, and provider-reported `qp_num` all
 //! agree. It is also the sole CM event consumer. Cancellation, close, shutdown,
 //! and driver loss retain accepted or acceptance-ambiguous MRs until an exact
-//! completion or provider-proven rejection establishes a positive safety
-//! boundary.
+//! completion, provider-proven rejection, or successful synchronous
+//! destruction of the owning QP establishes a positive safety boundary.
 //!
 //! ```no_run
 //! # use rdma_io::v2::{RdmaEngineBuilder, Result};
@@ -246,7 +246,9 @@ impl RdmaEngineBuilder {
 /// Cloneable frontend for one explicitly driven engine instance.
 ///
 /// Cloning this value never starts work. All CQ, CM, reclamation, and
-/// connection-local progress remains owned by the paired [`RdmaEngineDriver`].
+/// per-connection completion dispatch remains owned by the paired
+/// [`RdmaEngineDriver`]. Message protocol progress belongs to each returned
+/// [`crate::v2::MessageTransportDriver`].
 /// The handle is `Clone + Send + Sync + 'static`.
 ///
 /// Dropping the last `RdmaEngine` handle requests engine shutdown. Existing

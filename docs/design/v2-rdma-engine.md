@@ -1,296 +1,250 @@
-# V2 Runtime RDMA Engine
+# V2 RDMA Engine and Message Driver
 
 ## Overview
 
-The v2 runtime engine is an explicitly driven, device-bound RDMA reactor for
-many low-level and message connections. `RdmaEngineBuilder::build()` returns a
-cloneable frontend and one `RdmaEngineDriver` future. The library starts no
-task or thread: progress occurs only while the application polls that driver.
+V2 separates shared RDMA runtime mechanics from per-connection message
+protocol policy.
 
-The ownership model is analogous to an io_uring instance or an IOCP completion
-port:
+An `RdmaEngine` owns one device-scoped resource set and one explicit
+`RdmaEngineDriver`. Low-level connections use that shared engine directly.
+Each engine-bound message connection additionally returns one non-cloneable
+`MessageTransport` frontend and one explicit `MessageTransportDriver`.
 
-- `RdmaEngine` and its connection/listener handles submit work and hold
-  application-visible state.
-- `RdmaEngineDriver` is the sole completion and connection-management
-  consumer, comparable to the task that drains a completion ring or port.
-- connection and operation generations are the engine's completion keys.
-- the reported provider `qp_num` is an additional routing identity, not merely
-  diagnostic data.
+```text
+application
+  ├─ one RdmaEngineDriver task
+  │    ├─ shared Context / PD / CQ / completion channel
+  │    ├─ CM channel and generational route registries
+  │    ├─ exact CQE validation and callback dispatch
+  │    └─ safe QP / CmId teardown and quarantine
+  │
+  └─ one MessageTransportDriver task per message connection
+       ├─ HELLO negotiation and timeout
+       ├─ DATA / CREDIT parsing and production
+       ├─ receive reposting and registered-buffer pools
+       ├─ connection-local fairness
+       └─ message lifecycle and terminal outcomes
+```
 
-This is an analogy for ownership and progress. The implementation uses
-libibverbs and librdmacm, not io_uring or IOCP.
+The library creates no task or thread. Applications may spawn the returned
+drivers or poll them directly. V1 remains a separate API and is unchanged.
 
-V2 compatibility was not preserved. Endpoint-owned v2 drivers and
-separate-CQ construction were removed rather than adapted. V1 modules, feature
-behavior, APIs, and tests remain unchanged.
+## Progress and Task Contract
 
-## Runtime and Task Contract
+`RdmaEngineBuilder::build()` returns:
 
-One engine has exactly one driver future. An application normally runs exactly
-one task for that future, independent of the number of connections:
+```text
+Result<(RdmaEngine, RdmaEngineDriver)>
+```
+
+`MessageTransportBuilder::connect_on()` and `accept_on()` return:
+
+```text
+Result<(MessageTransport, MessageTransportDriver)>
+```
+
+A typical client explicitly starts both progress owners:
 
 ```rust,no_run
-use rdma_io::v2::{RdmaEngineBuilder, Result};
+use rdma_io::v2::*;
 
 async fn run() -> Result<()> {
-    let (engine, driver) = RdmaEngineBuilder::new("rxe0").build()?;
-    let driver_task = tokio::spawn(driver);
+    let (engine, engine_driver) = RdmaEngineBuilder::new("rxe0").build()?;
+    let engine_task = tokio::spawn(engine_driver);
 
-    // Create listeners, connections, and message transports through `engine`.
+    let (transport, message_driver) = MessageTransportBuilder::new()
+        .connect_on(&engine, "192.0.2.1:7471".parse().unwrap())
+        .await?;
+    let message_task = tokio::spawn(message_driver);
+
+    transport.ready().await?;
+    transport.send(b"hello").await?;
+    transport.close().await?;
+    message_task.await.expect("message driver panicked")?;
 
     engine.shutdown().await?;
-    driver_task.await.expect("engine driver task panicked")?;
+    engine_task.await.expect("engine driver panicked")?;
     Ok(())
 }
 ```
 
-The driver can instead be polled directly in an application-owned future:
+An unpolled engine driver provides no CM, CQ, reclamation, or shutdown
+progress. An unpolled message driver provides no HELLO, DATA, CREDIT, repost,
+or message-lifecycle progress. Its HELLO timer is armed on first poll, so a
+never-polled driver also provides no timeout guarantee. Dropping an unfinished
+message driver publishes `Error::DriverShutdown` and asks the engine to close
+the connection safely.
 
-```rust,no_run
-use rdma_io::v2::{RdmaEngineBuilder, Result};
+Readiness is the default engine completion mode. Building it requires an
+active Tokio I/O runtime. Polling mode allocates no CQ completion channel and
+may be built outside a runtime, but polling either driver still requires an
+active Tokio runtime; Tokio time must be enabled before a deadline is armed.
 
-async fn run_without_spawning() -> Result<()> {
-    let (engine, driver) = RdmaEngineBuilder::new("rxe0").build()?;
-    let application = async {
-        // Submit work through cloned engine handles.
-        engine.shutdown().await
-    };
-    let (driver_result, application_result) = tokio::join!(driver, application);
-    application_result?;
-    driver_result
-}
-```
+## Layer Responsibilities
 
-`RdmaEngine` is `Clone + Send + Sync + 'static`.
-`RdmaEngineDriver` is `Future<Output = rdma_io::v2::Result<()>> + Send +
-'static`. Connections, listeners, and message transports add zero library
-tasks. There is no receive-pump task: receive completions, reposts, DATA,
-CREDIT, HELLO, CM events, and reclamation are bounded work inside the engine
-driver.
+### Shared engine layer
 
-If the driver is never polled, connect, accept, completion, message readiness,
-close, and shutdown work does not progress. Readiness mode does not use a
-periodic timer to compensate for a missing wakeup.
+One engine owns:
 
-Dropping the last `RdmaEngine` clone requests shutdown. Connections, listeners,
-and message transports retain the shared state needed for memory safety, but
-they are not engine frontend handles and do not prevent that request. Keep an
-engine clone alive while submissions remain possible, and call
-`shutdown().await` when the terminal result must be observed.
+- an anchored `Context`;
+- one `Pd`;
+- one shared send/receive `Cq`;
+- one CM event channel;
+- one CQ completion channel in readiness mode, or none in polling mode;
+- connection, operation, and CM-route registries;
+- aggregate connection, operation, and CQ-credit admission;
+- exact CQE validation and completion callback dispatch;
+- connection drain, QP destruction, CmId destruction, and fail-closed
+  quarantine.
 
-### Tokio requirements
-
-- `CompletionMode::Readiness` is the default. `build()` must run inside an
-  active Tokio runtime with I/O enabled because it registers the shared CQ and
-  CM descriptors.
-- `CompletionMode::Polling` allocates no CQ completion channel and may be built
-  outside a runtime.
-- Every driver poll must occur inside a Tokio runtime. Tokio time must be
-  enabled before an operation can arm a HELLO, reclamation, connection-drain,
-  or shutdown deadline.
-- With `panic=abort`, callers must enable the needed Tokio I/O/time drivers;
-  Tokio does not expose non-panicking capability probes for every case.
-
-## Retained Independent V2 Surface
-
-Production types have one public spelling under `rdma_io::v2::<Item>`.
-Implementation modules such as `v2::context`, `v2::engine`,
-`v2::message_transport`, and `v2::protocol` are private.
-
-`Context::open_first()` and `Context::open_by_name()` select from
-`rdma_get_devices` and retain that complete librdmacm list as their lifetime
-anchor. First-device order and named availability follow librdmacm enumeration;
-an independently verbs-openable device missing from that list is unavailable.
-Repeated same-name opens may share librdmacm's cached raw context. Facade drop
-never calls `ibv_close_device`; `rdma_free_devices` runs after the last
-dependent PD, CQ, MR, and facade.
-
-The one production CM-wrapper bridge is
-`QpBuilder::build_with_cm(&rdma_io::cm::CmId)`. It validates exact raw context
-identity before QP creation, and the resulting QP must be dropped before its CM
-ID. There is no borrowed `Context::from_cm`, raw resource adoption/accessor, or
-public V1 error/remote-MR conversion.
-
-Direct CQ polling, generic notifier readiness, Tokio readiness, and externally
-woken polling all use `rdma_io::v2::Completion` buffers. The typed completion
-exposes `wr_id`, success, status, opcode, `qp_num`, byte length, vendor error,
-and `result()`. SEND, RECV, RDMA WRITE, and RDMA READ are posted only through
-the four named `Qp` methods; there is no duplicate `Op`/`OpCode` submission
-facade.
-
-The non-default `test-hooks` feature exposes one doc-hidden validation
-namespace, `rdma_io::v2::test_support`. It owns V2 lifecycle observations even
-though private instrumentation is placed at shared wrapper destructor sites.
-It is not a V1 consumer API, raw-resource escape, CQ/CM consumer, or alternate
-progress path.
-
-## Public Engine API
-
-The engine API is available with the `tokio` feature and is re-exported from
-`rdma_io::v2`.
-
-### Construction and lifecycle
-
-```text
-RdmaEngineBuilder::new(device_name: impl Into<String>) -> RdmaEngineBuilder
-RdmaEngineBuilder::completion_mode(CompletionMode) -> RdmaEngineBuilder
-RdmaEngineBuilder::maximum_live_connections(usize) -> RdmaEngineBuilder
-RdmaEngineBuilder::maximum_inflight_operations(usize) -> RdmaEngineBuilder
-RdmaEngineBuilder::cq_capacity(usize) -> RdmaEngineBuilder
-RdmaEngineBuilder::cq_completion_budget(usize) -> RdmaEngineBuilder
-RdmaEngineBuilder::cm_event_budget(usize) -> RdmaEngineBuilder
-RdmaEngineBuilder::reclamation_budget(usize) -> RdmaEngineBuilder
-RdmaEngineBuilder::ready_connection_quantum(usize) -> RdmaEngineBuilder
-RdmaEngineBuilder::missing_cqe_deadline(Duration) -> RdmaEngineBuilder
-RdmaEngineBuilder::connection_drain_deadline(Duration) -> RdmaEngineBuilder
-RdmaEngineBuilder::shutdown_deadline(Duration) -> RdmaEngineBuilder
-RdmaEngineBuilder::message_hello_deadline(Duration) -> RdmaEngineBuilder
-RdmaEngineBuilder::build() -> Result<(RdmaEngine, RdmaEngineDriver)>
-
-RdmaEngine::connect(SocketAddr) -> impl Future<Output = Result<RdmaConnection>>
-RdmaEngine::connect_with_config(SocketAddr, RdmaConnectionConfig)
-    -> impl Future<Output = Result<RdmaConnection>>
-RdmaEngine::listen(SocketAddr, RdmaListenerConfig)
-    -> impl Future<Output = Result<RdmaListener>>
-RdmaEngine::diagnostics() -> RdmaEngineDiagnostics
-RdmaEngine::shutdown() -> impl Future<Output = Result<()>>
-```
-
-`shutdown()` is idempotent. It closes admission, drains listeners and
-connections, and returns the driver's terminal result. Concurrent callers
-observe the same engine-wide outcome.
-
-`CompletionMode` has exactly `Readiness` (default) and `Polling`.
-`RdmaEngineLifecycle` reports `Created`, `Running`, `ShutdownRequested`,
-`Terminated`, or `Failed`. The contextual v2 error family remains
-`NoDevices`, `DeviceNotFound`, `Verbs`, `InvalidConfig`, `PostFailed`,
-`CompletionError`, `WouldBlock`, `MessageTooLarge`, `TransportClosed`,
-`DriverShutdown`, `CapacityExhausted`, `ConnectionQuarantined`,
-`ConnectionDestroyQuarantined`, `EngineWedged`, and `ProtocolViolation`.
-
-### Listener API
-
-```text
-RdmaListenerConfig::default()                         // userspace backlog 128
-RdmaListenerConfig::backlog(usize) -> RdmaListenerConfig
-RdmaListenerConfig::backlog_capacity() -> usize
-
-RdmaListener::local_addr() -> Result<SocketAddr>
-RdmaListener::accept() -> impl Future<Output = Result<RdmaConnection>>
-RdmaListener::accept_with_config(RdmaConnectionConfig)
-    -> impl Future<Output = Result<RdmaConnection>>
-RdmaListener::close() -> impl Future<Output = Result<()>>
-```
-
-The userspace backlog is validated at `RdmaEngine::listen`, not by the setter,
-and must be `1..=4,096`. The engine separately requests `i32::MAX` from
-`rdma_listen`. A provider or kernel may clamp the kernel backlog, so some
-requests may be refused before reaching the engine. A kernel refusal is a
-listener-creation/provider error, not a userspace `BacklogFull` event.
-
-Each listener has:
-
-1. accept waiters ordered by registration;
-2. admitted children ordered by CM request arrival; and
-3. at most one selected/setup pair.
-
-The oldest live waiter is paired with the oldest eligible child. Once selected,
-that child cannot overtake to a later waiter. Cancellation before selection
-removes only that waiter. Cancellation or setup failure after selection owns
-the selected child through one reject/close disposition before another pair is
-selected. Different listeners progress independently.
-
-### Low-level connection API
-
-```text
-RdmaConnection::register_memory(usize, AccessIntent) -> Result<Mr>
-RdmaConnection::send(Mr, Option<(usize, usize)>) -> RdmaOperation
-RdmaConnection::recv(Mr, Option<(usize, usize)>) -> RdmaOperation
-RdmaConnection::write(Mr, RemoteMr, Option<(usize, usize)>) -> RdmaOperation
-RdmaConnection::read(Mr, RemoteMr, Option<(usize, usize)>) -> RdmaOperation
-RdmaConnection::local_addr() -> Result<SocketAddr>
-RdmaConnection::peer_addr() -> Result<SocketAddr>
-RdmaConnection::identity() -> RdmaConnectionIdentity
-RdmaConnection::close() -> impl Future<Output = Result<()>>
-
-RdmaOperation: Future<Output = (Result<Completion>, Option<Mr>)>
-```
-
-An operation is submitted on first poll. The returned `Option<Mr>` is `Some`
-after a positive completion/rejection boundary returns ownership to the
-caller. It can be `None` when an accepted or acceptance-ambiguous WR must
-remain engine-owned after cancellation or terminal failure.
+The engine has a per-connection completion-dispatch queue so one connection
+cannot monopolize callback delivery. That queue contains validated low-level
+completions only. It is not a message scheduler and does not parse frames,
+manage message credits or pools, repost message receives, or own HELLO
+deadlines.
 
 Low-level `connect`, `connect_with_config`, `accept`, and
-`accept_with_config` post exactly zero initial receives. A peer that sends
-before the application posts a receive can therefore encounter RNR. The
-default RNR retry value is 7 (infinite retry in the verbs encoding), so an
-early send can stall until a receive is posted.
+`accept_with_config` post no initial receives. Their callers own all operation
+submission and buffers.
 
-### Message transport API
+### Message layer
 
-```text
-MessageTransportBuilder::new() -> MessageTransportBuilder
-MessageTransportBuilder::recv_buffers(usize) -> MessageTransportBuilder
-MessageTransportBuilder::send_buffers(usize) -> MessageTransportBuilder
-MessageTransportBuilder::buffer_size(usize) -> MessageTransportBuilder
-MessageTransportBuilder::connection_config(RdmaConnectionConfig)
-    -> MessageTransportBuilder
-MessageTransportBuilder::connect_on(&RdmaEngine, SocketAddr)
-    -> impl Future<Output = Result<MessageTransport>>
-MessageTransportBuilder::accept_on(&RdmaListener)
-    -> impl Future<Output = Result<MessageTransport>>
+`MessageTransport` is the sole, non-cloneable application frontend for one
+message connection. Its `send`, `recv`, `ready`, and `close` futures run in
+the caller's task and communicate with the connection's driver.
 
-MessageTransport::ready() -> impl Future<Output = Result<()>>
-MessageTransport::send(&[u8]) -> impl Future<Output = Result<()>>
-MessageTransport::recv() -> impl Future<Output = Result<ReceivedMessage>>
-MessageTransport::close() -> impl Future<Output = Result<()>>
+`MessageTransportDriver` is the single logical writer for protocol state. It
+owns:
 
-ReceivedMessage::len() -> usize
-ReceivedMessage::is_empty() -> bool
-ReceivedMessage: AsRef<[u8]> + Deref<Target = [u8]>
-```
+- the HELLO deadline and capability negotiation;
+- DATA and CREDIT frame processing;
+- registered send/control pools and remote-credit accounting;
+- completed receive delivery and receive reposting;
+- connection-local scheduling and fairness; and
+- translation of protocol, engine, peer-disconnect, and close events into one
+  terminal message outcome.
 
-There is no public transport error accessor. Errors are observed from
-`ready`, `send`, `recv`, and `close`, with engine-wide summaries available in
-`RdmaEngine::diagnostics()`.
+Message setup allocates and posts every configured receive before
+`rdma_connect` or `rdma_accept`. With defaults, the QP requirements are:
 
-The default message builder uses 16 reusable DATA send buffers, 32 DATA receive
-buffers, and a 64-KiB maximum payload. Its QP requirements are:
+- 19 send WRs: 16 DATA, 2 control, and 1 HELLO;
+- 34 receive WRs: 32 DATA and 2 control.
 
-- send: `16 DATA + 2 control + 1 distinct HELLO = 19`;
-- receive: `32 DATA + 2 control = 34`;
-- message establishment pre-posts exactly all 34 receives before
-  `rdma_connect` or `rdma_accept`.
+HELLO reuses a control receive; there is no additional receive.
 
-HELLO consumes one control receive and that MR is reposted; there is no 35th
-receive. With no explicit `connection_config`, the builder derives the exact
-checked maxima `send_buffers + 2 + 1` and `recv_buffers + 2`. An explicit
-configuration may exceed but may not undershoot either requirement.
+## Completion-to-Message Handoff
 
-`ready()` waits for HELLO exchange. `send()` also waits for readiness and
-returns on local send completion, not remote consumption. `AsRef<[u8]>` and
-`Deref<Target = [u8]>` expose exactly the received application payload,
-excluding the 12-byte frame header. Dropping `ReceivedMessage` schedules its MR
-for engine-driven repost and CREDIT return. Holding all received messages
-therefore withholds all negotiated DATA credits and can intentionally stall
-the peer until at least one handle is dropped.
+The engine remains the only component allowed to validate and consume CQEs.
+A completion must match the current operation generation, connection
+generation, owning connection, provider-reported `qp_num`, and expected opcode
+where the status is successful.
 
-The DATA, CREDIT, and HELLO format remains an internal wire contract exercised
-through `MessageTransport`. V2 does not expose packet construction or parsing
-helpers as public API.
+After validation, the engine removes operation ownership and detaches its
+callback. The callback runs only after registry and admission locks needed by
+new posting have been released. A message callback transfers its owned
+completion and MR into the connection-local message event queue and wakes that
+connection's message driver.
 
-Peer disconnect and normal flush completions are normalized to
-`Error::TransportClosed` on HELLO, receive, and steady-state message paths.
-Protocol and provider failures keep their contextual error. Pending waiters
-are woken; there is no separate disconnect monitor or receive-pump task.
+The driver then parses the frame or advances the corresponding send/repost
+state. Neither the frontend nor the engine callback directly mutates
+driver-owned protocol state.
 
-## Configuration and Provider Limits
+Suspension uses check-register-recheck behavior: the driver checks for work,
+registers its waker, and checks again before returning `Pending`. This prevents
+an event, terminal notification, frontend close, or timeout from being lost
+between an empty-queue observation and suspension.
 
-### Engine settings
+## Wire Protocol, Credits, and Fairness
 
-| Setting | Default | Inclusive range |
+The internal message protocol has a 12-byte magic/version/type/length header
+and three frame types:
+
+- `HELLO` exchanges receive capacity and maximum message size;
+- `DATA` carries one application message;
+- `CREDIT` reports reposted receive capacity to the peer.
+
+The codec is not public API.
+
+Each DATA send consumes one negotiated remote receive credit. Dropping a
+`ReceivedMessage` returns its MR to driver-owned repost work; after the repost
+is accepted, the driver returns CREDIT to the peer. Holding all received
+messages intentionally withholds all DATA receive capacity.
+
+Within one driver turn, ready application events, control credit work, and
+reposts are bounded and rotated. Pending CREDIT/repost work is explicitly
+given opportunities between message events, so sustained DATA demand cannot
+indefinitely starve control progress. The engine separately rotates validated
+completion dispatch across connections. Neither layer promises real-time
+latency.
+
+## Hardware Ownership and CQE Routing
+
+An MR offered to a provider remains owned by the engine until one of these
+positive boundaries:
+
+1. the provider proves the WR was not accepted;
+2. the engine consumes the WR's exact validated CQE; or
+3. synchronous destruction of the owning QP succeeds while its owning CmId is
+   still alive.
+
+QP ERR, cancellation, a deadline, CQ emptiness, driver loss, or an attempted
+QP destruction is not a release boundary.
+
+Connection and operation slots use non-wrapping generations. Exhausting a
+generation retires the slot permanently. Stale, retired, duplicate, unknown,
+wrong-connection, wrong-`qp_num`, and unexpected-success-opcode CQEs cannot
+change live ownership. An exact error CQE, including a provider fatal or
+unknown status, is consumed for that operation and delivered as
+`Error::CompletionError`.
+
+For linked posting batches, only a valid `bad_wr` pointer into the exact batch
+proves a suffix unaccepted. A null, foreign, misaligned, or otherwise invalid
+pointer leaves the complete batch acceptance-ambiguous, so all entries are
+retained.
+
+Providers differ in whether and when they emit flush CQEs. Teardown consumes
+the exact flush CQEs that arrive, but never assumes that every accepted WR
+will produce one.
+
+## Close, Shutdown, and Quarantine
+
+All shutdown orderings converge on engine-owned hardware teardown:
+
+- **Frontend first:** dropping or closing `MessageTransport` wakes its driver;
+  the driver stops message work and requests connection close.
+- **Message driver first:** dropping the driver terminalizes pending frontend
+  operations with `DriverShutdown` and requests close.
+- **Engine first:** engine shutdown stops admission, publishes engine
+  unavailability to each message driver, and safely drains or quarantines
+  every connection.
+
+The engine stops posting, transitions the local QP to ERR, and drains exact
+CQEs. If accepted WRs remain at the drain deadline, it attempts synchronous
+destruction of that exact QP before releasing any associated operation or MR.
+
+For a clean zero-debt retirement, successful QP destruction is also
+established before the connection's CM route is retired. The owning CmId is
+destroyed only after the QP and any required CM acknowledgement. Connection
+and operation generations are retired only after their ownership is no longer
+live.
+
+If QP destruction fails or its result is uncertain, the engine fails closed.
+It retains the exact QP, owning CmId, CM route and generation, admission
+reservation, accepted operation records, CQ debt, and MRs as one bundle.
+Neither another connection nor a later generation can reuse those resources.
+
+`ConnectionQuarantined` describes outstanding hardware-visible work whose
+release boundary could not be established.
+`ConnectionDestroyQuarantined` describes failed zero-debt connection
+finalization. If engine-wide shutdown cannot resolve unsafe ownership before
+its deadline, it returns `EngineWedged`. After the sole engine driver is gone,
+unresolved bundles are intentionally retained until process exit.
+
+## Configuration
+
+### Engine defaults
+
+| Setting | Default | Range |
 |---|---:|---:|
 | Completion mode | Readiness | Readiness or Polling |
 | Maximum live connections | 256 | 1–1,048,576 |
@@ -299,346 +253,90 @@ are woken; there is no separate disconnect monitor or receive-pump task.
 | CQ completion budget | 32 | 1–4,096 |
 | CM event budget | 32 | 1–4,096 |
 | Reclamation budget | 32 | 1–4,096 |
-| Ready-connection quantum | 32 | 1–4,096 |
+| Completion-dispatch budget | 32 | 1–4,096 |
 | Missing-CQE deadline | 30 s | 1 s–24 h |
 | Connection drain deadline | 5 s | 1 ms–5 min |
 | Engine shutdown deadline | 30 s | 1 ms–10 min |
-| Message HELLO deadline | 10 s | 1 ms–5 min |
 
-Maximum in-flight operations must not exceed CQ capacity. Maximum live
-connections must not exceed provider `max_qp`; CQ capacity must not exceed
-`max_cqe`. Registry layout, integer conversion, checked arithmetic, requested
-QP capabilities, and provider-returned actual QP capabilities are validated
+Maximum in-flight operations cannot exceed CQ capacity. Device limits such as
+`max_qp`, `max_qp_wr`, `max_sge`, `max_cqe`, and RDMA atomic depths are checked
 without clamping.
 
-### Connection settings
+### Message defaults
 
-`RdmaConnectionConfig::default()` plus the following consuming setters form
-the exact public configuration surface:
+| Setting | Default | Validation |
+|---|---:|---|
+| DATA receive buffers | 32 | greater than zero |
+| DATA send buffers | 16 | greater than zero |
+| Maximum payload | 64 KiB | greater than zero and wire-representable |
+| HELLO deadline | 10 s | 1 ms–5 min |
 
-```text
-max_send_wr(usize) -> RdmaConnectionConfig
-max_recv_wr(usize) -> RdmaConnectionConfig
-max_send_sge(usize) -> RdmaConnectionConfig
-max_recv_sge(usize) -> RdmaConnectionConfig
-responder_resources(usize) -> RdmaConnectionConfig
-initiator_depth(usize) -> RdmaConnectionConfig
-retry_count(usize) -> RdmaConnectionConfig
-rnr_retry_count(usize) -> RdmaConnectionConfig
-```
+An explicit `RdmaConnectionConfig` may exceed, but cannot undershoot, the WR
+requirements derived from the message configuration.
 
-Configuration is write-only after construction: callers already own the values
-they supply, defaults are documented below, and effective/provider state is
-reported through connection or engine diagnostics rather than duplicate
-builder getters.
+## Compact Diagnostics and Test Support
 
-| Setting | Default | Inclusive range | Provider limit |
-|---|---:|---:|---|
-| Maximum send WRs | 19 | 1–1,048,576 | `max_qp_wr` |
-| Maximum receive WRs | 34 | 1–1,048,576 | `max_qp_wr` |
-| Maximum send SGEs | 1 | 1–32 | `max_sge` |
-| Maximum receive SGEs | 1 | 1–32 | `max_sge` |
-| Responder resources | 1 | 0–255 | `max_qp_rd_atom` |
-| Initiator depth | 1 | 0–255 | `max_qp_init_rd_atom` |
-| Retry count | 7 | 0–7 | CM field |
-| RNR retry count | 7 | 0–7 | CM field |
+`RdmaEngine::diagnostics()` is an O(1) lifecycle and hardware-debt snapshot.
+It reports only:
 
-RC, signaled sends, zero inline data, and one SGE per default operation are
-fixed. One default connection exposes 53 local WR positions. At the default
-connection limit, `256 × 53 = 13,568`; the default global capacity leaves
-`16,384 − 13,568 = 2,816` application-available positions. Admission charges
-actual work and retained debt, not every unused QP position.
+- lifecycle and an optional engine-wide terminal error;
+- live connections;
+- registered and accepted operations;
+- pending reclamations;
+- available and retained CQ credits;
+- quarantined operations, MRs, bytes, and connections.
 
-## Resource Ownership and Counts
+It intentionally has no per-object listings, configuration echoes, scheduler
+visits, task-count declarations, event ledger, or message-protocol counters.
+Operation and message futures carry their contextual errors.
 
-One engine owns:
+The non-default, doc-hidden `rdma_io::v2::test_support` namespace is limited to
+otherwise unobservable safety boundaries: exact-CQE suppression and routing,
+posting acceptance, readiness-arm races, forced QP-destroy failure,
+destruction order, exact route retention, and opaque shared-resource identity.
+Malformed protocol tests use an independently encoded test peer rather than a
+production frame-mutation hook.
 
-| Object | Readiness | Polling |
-|---|---:|---:|
-| Anchored verbs context facade | 1 | 1 |
-| Protection domain | 1 | 1 |
-| Send/receive completion queue | 1 | 1 |
-| CQ completion channel/fd | 1 | 0 |
-| CM event channel/fd | 1 | 1 |
-| Tokio CQ `AsyncFd` adapter | 1 | 0 |
-| Tokio CM `AsyncFd` adapter | 1 | 0 |
-| Explicit engine driver future | 1 | 1 |
-| Library-created tasks/threads | 0 | 0 |
-| Additional message tasks | 0 | 0 |
+## Validation
 
-Resource-object counts are measured from the owned handles. The
-`explicit_engine_drivers = 1` and `library_owned_tasks = 0` values are
-declarative construction invariants rather than runtime task observation:
-`build()` returns exactly one driver, and the source-level
-`v2_no_hidden_spawn` test independently rejects engine task creation.
-
-All connections use the exact `ibv_context*` selected from
-`rdma_get_devices`. The engine retains the complete device-list owner as a
-context anchor. The safe context facade never calls `ibv_close_device`; every
-outbound route-resolved ID and inbound child must have raw-pointer-equal
-`id->verbs` before QP creation. `rdma_free_devices` runs only after all QPs,
-CM IDs, MRs, CQ/channel resources, the PD, and context facades are gone.
-
-Polling mode still owns the CM event channel and its nonblocking fd. It simply
-does not register that fd with Tokio; the sole driver checks CM events within
-its bounded polling turn.
-
-Connection admission is aggregate across engine clones, listeners, outbound
-requests, queued inbound children, selected setup, established connections,
-drains, and quarantine. A quarantined bundle retains its connection
-reservation, QP registration, operation registrations, MRs, and CQ debt.
-
-## Completion Routing and Batch Ownership
-
-Connection slots and operation slots use non-wrapping generations. Exhausting
-a generation retires that slot permanently instead of wrapping. Registries are
-lazily paged in groups of 256 slots, and exact lookup does a constant number of
-direct probes without scanning idle connections.
-
-Every CQE must agree with all of:
-
-1. current connection slot and generation;
-2. current operation slot and generation encoded in `wr_id`;
-3. the operation's owning connection; and
-4. the provider-reported `qp_num`.
-
-Stale, duplicate, unknown, wrong-connection, wrong-`qp_num`, and
-unexpected-opcode completions are rejected and counted. They never decrement
-the accepted set or release a CQ credit.
-
-Linked SEND/RECV batches keep stable WR storage across the provider call.
-When posting fails, `bad_wr` is interpreted only if it points to a valid member
-of that exact batch:
-
-- WRs before `bad_wr` are an accepted prefix and retain operation/MR/CQ debt.
-- `bad_wr` and the following suffix are provider-proven unaccepted and roll
-  back.
-- null, foreign, misaligned, or otherwise invalid `bad_wr` makes the complete
-  batch acceptance-ambiguous, so all entries are retained conservatively.
-
-## Wakeups, Polling, and Fairness
-
-Software producers publish work before waking the driver. The driver registers
-its waker and rechecks the published epoch/queue before sleeping. This
-publish/wake/register/recheck order closes wake-before-register and
-wake-during-register races.
-
-CQ readiness uses:
-
-1. drain the CQ;
-2. arm notification;
-3. immediately poll again;
-4. await/read the shared completion fd only if still empty;
-5. drain/ack events; and
-6. recheck the CQ.
-
-This closes CQE-before-arm and CQE-after-arm/before-wait races without a timer.
-Polling mode performs one bounded CQ/CM/software turn and then cooperatively
-yields.
-
-Work classes rotate across terminal/control, CM, CQ, reclamation/deadlines, and
-ready connections. Ready connections are duplicate-suppressed and tail-rotated
-after at most `ready_connection_quantum` work. Idle connections are not
-visited. This is bounded fairness, not a hard real-time latency guarantee.
-
-### Synchronous provider calls
-
-Future polling is nonblocking only in the Rust scheduling sense; individual
-provider calls are synchronous and have no wall-clock guarantee.
-`RdmaOperation` first poll can call `ibv_post_send` or `ibv_post_recv`.
-`RdmaEngineDriver::poll` can poll/arm/get/ack CQ events; create, bind, listen,
-resolve, connect, accept, reject, disconnect, or destroy CM IDs; create,
-modify, post SEND/RECV work to, transition, or destroy QPs; and register or
-deregister MRs.
-
-Driver and resource `Drop` paths can additionally transition/destroy QPs,
-destroy CM IDs/listeners, deregister MRs, destroy CQs and completion channels,
-deallocate the PD and CM event channel, release context facades, and finally
-free the anchored device list. Applications should run the driver where an
-occasional provider stall cannot block unrelated latency-sensitive futures.
-
-## Cancellation, Close, and Shutdown
-
-Dropping an unposted operation returns local admission immediately. Dropping a
-posted operation transfers observation to the engine. The engine retains its
-MR, operation token, and CQ credit until an exhaustive positive safety boundary:
-
-1. the provider proves that the WR was not accepted;
-2. the engine consumes that WR's exact validated success, error, or flush CQE;
-   or
-3. synchronous destruction of the owning per-connection QP completes while
-   its CM ID remains alive.
-
-QP ERR, timeout, CQ emptiness, driver loss, and a no-match poll are not release
-boundaries. QP destruction is a boundary only after the result-returning
-`ibv_destroy_qp` call succeeds; no MR or accepted-WR debt is released before
-that point. Engine QPs use caller-owned shared CQs, so this direct verbs call
-does not invoke librdmacm's internal-CQ cleanup and cannot double-destroy the
-shared CQ. The engine clears `cm_id->qp` only after success.
-
-Connection close atomically stops posting, transitions the local QP to ERR
-even after peer disconnect, and drains only exact identity-matching CQEs.
-At the drain deadline, the sole driver first dispatches every exact CQE already
-queued on that connection through the normal admission-serialized completion
-path, then re-reads the accepted set. If it is empty, normal retirement runs
-without an unnecessary fallback destroy. If accepted WRs remain because the
-provider omitted or delayed flush CQEs, close destroys that same
-per-connection QP while its CM ID remains alive, then resolves operation
-observers/callbacks with the contextual close error, releases MRs and CQ/local
-admission, retires operation generations, drains and destroys the CM ID, and
-finally retires the connection generation. The post-destroy drain rejects only
-CQEs that arrive after the boundary.
-
-This deadline fallback is destructive: a provider success that was not polled
-and queued before successful QP destruction is not fabricated or returned.
-The operation completes with the contextual close error and any receive payload
-is discarded. QP destruction failure retains the live QP, CM ID, MRs,
-registrations, and CQ debt and publishes connection quarantine instead.
-
-`Error::ConnectionQuarantined { outstanding_operations, cq_debt }` is reserved
-for inability to establish the synchronous QP-destruction boundary, ambiguous
-ownership, or another connection-local retirement wedge. It is not the normal
-result of provider-omitted flush CQEs.
-
-If result-aware destruction fails after the accepted set is already empty,
-retirement enters terminal retained quarantine and `close()` returns
-`ConnectionDestroyQuarantined` without failing the shared driver. The
-connection registry generation, admission reservation, QP, and CM ID remain
-owned and cannot be reused. A pre-registration setup rollback applies the same
-retention to its establishing reservation and CM route. A quarantined
-establishing reservation permanently pins its admission slot and quarantine
-gauge even if a future owner is accidentally dropped. Its retention timestamp
-also participates in `oldest_quarantine_age` even though it has no connection
-registry token. Before retaining an inbound child, the engine sends a legal
-pre-accept RDMA-CM rejection so the
-peer fails promptly rather than waiting for its CM timeout. The connect or
-accept caller still receives the original setup error; secondary reject and
-destroy failures remain diagnostic, and the retained bundle is never retried
-by driver-drop cleanup.
-
-Accepted-set/operation-registry mismatches are defensive corruption guards:
-normal production posting and completion mutate both on the sole driver. If a
-mismatch is nevertheless observed after a successful QP boundary, every
-ownership-valid token is still reclaimed; anomalous tokens remain quarantined
-with explicit diagnostics rather than stranding the safe tokens.
-
-If engine shutdown reaches its deadline with unsafe ownership,
-`Error::EngineWedged { retained_bundles, outstanding_operations, cq_debt }`
-is the shared engine-wide terminal result. Unresolved resources move to
-fail-closed retention rather than being destroyed unsafely. Abrupt driver drop
-or task abort wakes observed waiters and follows the same safety rule.
-
-Fallback quarantine sinks are intentionally process-lifetime and unbounded.
-They cannot be drained after the sole progress driver is gone because the
-positive CQE/CM acknowledgement boundaries can no longer be proved. Repeated
-unrecoverable engine failures in a long-lived process can therefore retain
-kernel objects, memory, connection admission, and CQ credit until process
-restart.
-
-Graceful shutdown should be awaited before dropping the driver. Driver drop
-performs bounded synchronous preparation, but individual ibverbs/librdmacm
-destructors can block and have no wall-clock latency guarantee.
-
-## Diagnostics
-
-`RdmaEngine::diagnostics()` returns an O(1), nonblocking aggregate snapshot
-that remains readable after terminal state while an engine handle exists.
-Connection reservation/QP state uses maintained atomic state counts with a
-versioned consistent read, rather than subtracting independently sampled
-registry, drain, and quarantine sources during retirement. It contains:
-
-- lifecycle and terminal error class/message;
-- configured capacities, budgets, device, and completion mode;
-- actual shared resource/object counts and task counts;
-- aggregate establishing, established, draining, live, and quarantine gauges;
-- free/retired registry slots, accepted operations, CQ credits, reclamation,
-  retained MR/byte/bundle counts, and oldest quarantine age;
-- listener queue totals and ready-queue depth; and
-- monotonic admission, posting, batch, CQE/CM routing/rejection, lifecycle,
-  cancellation, deadline, QP, quarantine, shutdown, wake, and yield counters.
-
-The operation ledger separates `operations_completed` (exact CQEs) from
-`operations_released_after_qp_destroy` (CQE-less forced releases).
-`cq_credits_released` is their combined release count, so accepted/completed/
-forced accounting remains explainable to terminal observers.
-
-`RdmaEngineDiagnostics::connections()` and `listeners()` are explicit detailed
-queries. They are O(number of current objects), return sorted snapshots, and
-are separate from aggregate snapshot creation. Connection details include
-identity, exact accepted outstanding count, drain state, and quarantine state.
-Listener details include token, address, queued children, pending waiters, and
-selected-pair count. A snapshot holds only a `Weak` detail source. If every
-engine owner is gone before a detail query, the query returns an empty vector;
-that result is intentionally indistinguishable from an engine with no current
-objects. `PartialEq`/`Eq` compare all public snapshot data and ignore only this
-internal weak handle.
-
-The canonical public quarantine gauge is `quarantined_bundles`; each counted
-bundle retains its QP registration, admission reservation, and unsafe debt.
-The canonical retired-slot gauges are `retired_connection_slots` and
-`retired_operation_slots`. Slot retirement is permanent, so each gauge also
-serves as its monotonic retirement counter.
-
-## Provider Validation
-
-RXE and SIW both run exact success/error routing and close stress in readiness
-and polling modes with no provider-specific skip. Real flush CQEs are consumed
-when delivered. If a provider omits one, deterministic suppression tests prove
-that synchronous owning-QP destruction precedes MR release, close remains
-clean, accounting/generations are reusable, and late CQEs are rejected.
-Injected result-aware destruction failures prove that MRs and CQ debt remain
-quarantined and that externally supplied shared CQs are not destroyed twice.
-
-Run the complete validation, including feature builds, linting, rustdoc,
-doctests, no-hidden-spawn checks, and both providers, with:
+The complete local gate is:
 
 ```sh
 just validate-v2-engine
 ```
 
-To run only the build-profile/no-hidden-spawn preflight followed by the
-sequential provider suites, use:
+It runs warning-denied feature builds, all-target workspace builds, formatting,
+strict Clippy, rustdoc, doctests, the recursive no-hidden-spawn guard, an
+isolated production build without `test-hooks`, and serialized integration
+suites on both RXE and SIW.
+
+The provider-only matrix is:
 
 ```sh
-sudo -E ./scripts/validate-v2-engine-providers.sh
+sudo -E env CARGO="$(command -v cargo)" \
+  ./scripts/validate-v2-engine-providers.sh
 ```
 
-The script sets `RDMA_REQUIRE_PROVIDER=1`, so a missing rxe/siw device is a hard
-test failure rather than a silently green early return. It also builds an
-isolated release `rdma-io` artifact with `tokio` and without `test-hooks`
-before running the full hook-enabled provider suites.
+The script positively identifies each provider, sets
+`RDMA_REQUIRE_PROVIDER=1`, runs routing, readiness-race, lifecycle, listener,
+message setup/behavior/retry, diagnostics, multi-connection, full-workspace,
+and v1 safe-resource suites, then restores RXE. A self-skipped provider suite
+is not a pass.
 
-The `rdma-io-tests` helper library necessarily enables `test-hooks`: its shared
-engine fixtures call doc-hidden injection, resource-lease, and destruction
-recording APIs, and all integration targets link that helper crate. Cargo
-therefore unifies `test-hooks` for workspace-wide test commands. Moving only
-the dependency stanza cannot isolate the feature without splitting and
-rewriting the shared test crate. Production configuration is instead validated
-by the explicit isolated no-`test-hooks` release build; full RXE/SIW behavior,
-including injected failure paths, remains validated with hooks enabled.
-
-The script validates RXE first, removes it, validates SIW second, then always
-removes SIW and restores/verifies RXE. It preserves the original test failure
-while also reporting restoration failure.
-
-Useful focused modes include `--provider-probe`, `--driver-flush-gate`,
-`--readiness-race`, `--phase6-lifecycle`, and `--engine-conformance`.
+Useful focused modes include `--provider-probe`, `--readiness-race`,
+`--driver-flush-gate`, `--operations`, `--connections`, `--listeners`,
+`--lifecycle`, `--message-setup`, `--message`, and `--engine-conformance`.
 
 ## Limitations
 
-- one RDMA device and one exact verbs context per engine;
-- one shared CQ, not separate send/receive or per-connection CQs;
-- RC QPs only; no UD, inline-data configuration, multi-SGE operation builder,
-  atomics, or message ring transport in the engine surface;
-- Tokio is the current driver runtime integration;
-- no byte-stream, tonic, Quinn, or V1 transport adapter for the v2 engine;
-- no dynamic message buffer resizing;
-- message send completion means local completion, not remote consumption;
-- low-level early sends can wait indefinitely under RNR retry 7 until a receive
-  is posted;
-- whole-bundle quarantine intentionally retains kernel/user resources and
-  capacity when safety cannot be proven;
-- bounded fairness is not a hard latency or real-time guarantee;
-- provider limits may reject otherwise syntactically valid maximum settings;
-- existing v2 endpoint callers must migrate; no compatibility layer is
-  provided.
+- One RDMA device, anchored context, PD, and shared CQ per engine.
+- RC QPs only; no UD, inline-data configuration, multi-SGE message API,
+  atomics, or message ring transport in this layer.
+- Tokio is the current engine/message-driver runtime integration.
+- No byte-stream, tonic, Quinn, or V1 adapter is built into the v2 engine.
+- Message send completion is local completion, not remote consumption.
+- Message buffer pools are fixed for the connection lifetime.
+- Low-level early SENDs can wait under RNR retry until a receive is posted.
+- Quarantine intentionally retains memory, kernel objects, and admission when
+  safe release cannot be proven.
+- Bounded fairness is not a real-time guarantee.
