@@ -409,12 +409,6 @@ impl RdmaEngineDriver {
                 );
                 Ok(())
             }
-            DeadlineKind::MessageHello => {
-                self.shared.handle_message_hello_deadline(
-                    super::registry::ConnectionToken::decode(deadline.token),
-                );
-                Ok(())
-            }
         }
     }
 
@@ -437,10 +431,6 @@ impl RdmaEngineDriver {
     }
 
     fn service_ready_connection(&mut self) -> bool {
-        #[cfg(any(test, feature = "test-hooks"))]
-        if self.shared.test_driver.ready_work_paused() {
-            return false;
-        }
         if let Some(connection) = self.shared.take_published_connection() {
             self.scheduler.enqueue_connection(connection.ready());
         }
@@ -619,7 +609,7 @@ impl Drop for RdmaEngineDriver {
     }
 }
 
-fn preflight_driver_runtime() -> Result<()> {
+pub(crate) fn preflight_driver_runtime() -> Result<()> {
     if tokio::runtime::Handle::try_current().is_err() {
         return Err(Error::InvalidConfig(
             "RdmaEngineDriver must be polled inside an active Tokio runtime with time enabled"
@@ -762,14 +752,6 @@ pub(super) mod test_api {
         shared: Weak<EngineShared>,
         connection: super::super::registry::ConnectionToken,
         qp_num: u32,
-        active: bool,
-    }
-
-    /// Controller that withholds connection-local ready work while CQ and CM
-    /// progress remain active.
-    #[doc(hidden)]
-    pub struct TestReadyWorkControl {
-        shared: Weak<EngineShared>,
         active: bool,
     }
 
@@ -1152,16 +1134,6 @@ pub(super) mod test_api {
             Ok((token.slot, token.generation))
         }
 
-        /// Pause connection-local ready work without pausing shared CQ or CM work.
-        pub fn pause_ready_work(&self) -> Result<TestReadyWorkControl> {
-            let shared = self.ensure_active()?;
-            shared.test_driver.pause_ready_work()?;
-            Ok(TestReadyWorkControl {
-                shared: Arc::downgrade(&shared),
-                active: true,
-            })
-        }
-
         /// Snapshot bounded-work and direct-routing instrumentation.
         ///
         /// Unlike mutation fixtures, this read-only snapshot remains available
@@ -1301,29 +1273,6 @@ pub(super) mod test_api {
             }
             if let Some(shared) = self.shared.upgrade() {
                 shared.test_driver.stop_admission_control(self.point);
-            }
-            self.active = false;
-        }
-    }
-
-    impl TestReadyWorkControl {
-        pub fn release(mut self) {
-            if let Some(shared) = self.shared.upgrade() {
-                shared.test_driver.resume_ready_work();
-                shared.work_signal.publish(READY_CONNECTION_WORK);
-            }
-            self.active = false;
-        }
-    }
-
-    impl Drop for TestReadyWorkControl {
-        fn drop(&mut self) {
-            if !self.active {
-                return;
-            }
-            if let Some(shared) = self.shared.upgrade() {
-                shared.test_driver.resume_ready_work();
-                shared.work_signal.publish(READY_CONNECTION_WORK);
             }
             self.active = false;
         }
@@ -1620,7 +1569,6 @@ pub(super) mod test_api {
         connection_cqe_notify: Notify,
         injected_failure: Mutex<Option<Error>>,
         setup_rollback_failure: Mutex<Option<SetupRollbackFailure>>,
-        ready_work_paused: AtomicBool,
         work_class_selections: [AtomicU64; 5],
         connection_selections: AtomicU64,
         connection_quantum_work: AtomicU64,
@@ -1664,7 +1612,6 @@ pub(super) mod test_api {
                 connection_cqe_notify: Notify::new(),
                 injected_failure: Mutex::new(None),
                 setup_rollback_failure: Mutex::new(None),
-                ready_work_paused: AtomicBool::new(false),
                 work_class_selections: std::array::from_fn(|_| AtomicU64::new(0)),
                 connection_selections: AtomicU64::new(0),
                 connection_quantum_work: AtomicU64::new(0),
@@ -1725,21 +1672,6 @@ pub(super) mod test_api {
                 driver_wakeups: shared.work_signal.wakeups(),
                 driver_yields: shared.driver_yields.load(Ordering::Acquire),
             }
-        }
-
-        fn pause_ready_work(&self) -> Result<()> {
-            self.ready_work_paused
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .map_err(|_| Error::InvalidConfig("ready work is already paused".into()))?;
-            Ok(())
-        }
-
-        fn resume_ready_work(&self) {
-            self.ready_work_paused.store(false, Ordering::Release);
-        }
-
-        pub(super) fn ready_work_paused(&self) -> bool {
-            self.ready_work_paused.load(Ordering::Acquire)
         }
 
         fn inject_failure(&self, error: Error) -> Result<()> {
@@ -2426,7 +2358,7 @@ pub(super) mod test_api {
 pub use test_api::{
     TestAcceptedOperation, TestAdmissionBarrier, TestConnectionCqeSuppression, TestContextIdentity,
     TestCqArmWindowControl, TestCqeSuppression, TestEngineInstrumentation, TestEngineQp,
-    TestEngineResources, TestProviderLimits, TestReadyWorkControl, TestRouteHandle,
+    TestEngineResources, TestProviderLimits, TestRouteHandle,
 };
 
 #[cfg(test)]

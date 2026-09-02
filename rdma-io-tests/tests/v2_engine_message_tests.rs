@@ -7,11 +7,13 @@ use std::{collections::HashSet, iter};
 use rdma_io::cm::RdmaCmDeviceList;
 use rdma_io::v2::test_support::{DestructionKind, DestructionRecorder, TestSteadyFrame};
 use rdma_io::v2::{
-    CompletionMode, Error, MessageTransport, MessageTransportBuilder, RdmaEngine,
-    RdmaEngineBuilder, RdmaListener, Result,
+    CompletionMode, Error, MessageTransportBuilder, RdmaEngine, RdmaEngineBuilder, RdmaListener,
+    Result,
 };
 use rdma_io::wc::WcOpcode;
-use rdma_io_tests::engine_test_helpers::establish_message_pair_with_retry;
+use rdma_io_tests::engine_test_helpers::{
+    DrivenMessageTransport, establish_message_pair_with_retry,
+};
 use rdma_io_tests::test_helpers::has_software_rdma;
 
 #[derive(Clone, Copy)]
@@ -68,7 +70,7 @@ async fn establish_on(
     server_engine: &RdmaEngine,
     client_engine: &RdmaEngine,
     config: MessageConfig,
-) -> (RdmaListener, MessageTransport, MessageTransport) {
+) -> (RdmaListener, DrivenMessageTransport, DrivenMessageTransport) {
     establish_message_pair_with_retry(server_engine, client_engine, move || builder(config))
         .await
         .unwrap()
@@ -83,11 +85,11 @@ fn assert_clean_close(result: Result<()>) {
 
 async fn close_connection_pair(
     listener: RdmaListener,
-    server: MessageTransport,
-    client: MessageTransport,
+    server: DrivenMessageTransport,
+    client: DrivenMessageTransport,
 ) {
     let (server_close, client_close) = tokio::time::timeout(Duration::from_secs(15), async {
-        tokio::join!(server.close(), client.close())
+        tokio::join!(server.shutdown(), client.shutdown())
     })
     .await
     .expect("message close timed out");
@@ -198,19 +200,7 @@ async fn run_held_repost(mode: CompletionMode) {
     };
     let (listener, server, client) = establish_on(&server_engine, &client_engine, config).await;
 
-    let receive_control = server_engine
-        .test_resources()
-        .unwrap()
-        .pause_ready_work()
-        .unwrap();
     client.send(b"first").await.unwrap();
-    assert!(
-        tokio::time::timeout(Duration::from_millis(30), server.recv())
-            .await
-            .is_err(),
-        "server message delivery must remain engine-ready work"
-    );
-    receive_control.release();
     let first = server.recv().await.unwrap();
     assert_eq!(&*first, b"first");
     assert_eq!(client.test_negotiated_credits().unwrap(), (0, 1));
@@ -223,32 +213,12 @@ async fn run_held_repost(mode: CompletionMode) {
         "held receive must apply backpressure"
     );
 
-    let ready_control = server_engine
-        .test_resources()
-        .unwrap()
-        .pause_ready_work()
-        .unwrap();
-    let accepted_before_drop = server_engine.diagnostics().accepted_outstanding_operations;
     drop(first);
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while server.test_pending_ready_work().unwrap() == 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("ReceivedMessage drop did not publish repost work");
-    for _ in 0..64 {
-        tokio::task::yield_now().await;
-    }
-    assert!(!second.is_finished());
-    assert_eq!(
-        server_engine.diagnostics().accepted_outstanding_operations,
-        accepted_before_drop,
-        "repost must not reach the provider while ready work is withheld"
-    );
-
-    ready_control.release();
-    second.await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), second)
+        .await
+        .expect("message driver did not repost and return credit")
+        .unwrap()
+        .unwrap();
     let message = server.recv().await.unwrap();
     assert_eq!(&*message, b"second");
     drop(message);
@@ -307,29 +277,14 @@ async fn run_cancellation_and_disconnect(mode: CompletionMode) {
     let server = Arc::new(server);
     let client = Arc::new(client);
 
-    let ready_control = client_engine
-        .test_resources()
-        .unwrap()
-        .pause_ready_work()
-        .unwrap();
-    let cancelled_client = Arc::clone(&client);
-    let cancelled = tokio::spawn(async move { cancelled_client.send(b"cancelled").await });
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while client.test_pending_ready_work().unwrap() == 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("cancelled send was not queued");
-    cancelled.abort();
-    assert!(cancelled.await.unwrap_err().is_cancelled());
-    ready_control.release();
+    let cancelled = client.send(b"cancelled");
+    drop(cancelled);
 
     assert!(
         tokio::time::timeout(Duration::from_millis(100), server.recv())
             .await
             .is_err(),
-        "cancelling before engine posting must not deliver a message"
+        "cancelling before polling must not deliver a message"
     );
     client.send(b"survives").await.unwrap();
     let message = server.recv().await.unwrap();
@@ -384,6 +339,134 @@ async fn run_recv_cancellation_no_loss(mode: CompletionMode) {
     close_connection_pair(listener, server, client).await;
     shutdown_engine(server_engine, server_driver).await;
     shutdown_engine(client_engine, client_driver).await;
+}
+
+async fn run_intra_connection_fairness(mode: CompletionMode) {
+    const PRODUCERS: usize = 4;
+    const MESSAGES_PER_PRODUCER: usize = 16;
+    let (server_engine, server_driver) = build_engine(mode, 1, Duration::from_secs(5));
+    let (client_engine, client_driver) = build_engine(mode, 1, Duration::from_secs(5));
+    let config = MessageConfig {
+        sends: PRODUCERS,
+        recvs: 2,
+        size: 64,
+    };
+    let (listener, server, client) = establish_on(&server_engine, &client_engine, config).await;
+    let server = Arc::new(server);
+    let client = Arc::new(client);
+
+    let receiving = {
+        let server = Arc::clone(&server);
+        tokio::spawn(async move {
+            for _ in 0..PRODUCERS * MESSAGES_PER_PRODUCER {
+                let message = server.recv().await?;
+                drop(message);
+            }
+            Result::Ok(())
+        })
+    };
+    let mut senders = tokio::task::JoinSet::new();
+    for producer in 0..PRODUCERS {
+        let client = Arc::clone(&client);
+        senders.spawn(async move {
+            for sequence in 0..MESSAGES_PER_PRODUCER {
+                let payload = [producer as u8, sequence as u8];
+                client.send(&payload).await?;
+            }
+            Result::Ok(())
+        });
+    }
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while let Some(result) = senders.join_next().await {
+            result.unwrap().unwrap();
+        }
+        receiving.await.unwrap().unwrap();
+    })
+    .await
+    .expect("DATA work starved CREDIT or receive-repost progress");
+
+    let server = Arc::try_unwrap(server).ok().expect("single server owner");
+    let client = Arc::try_unwrap(client).ok().expect("single client owner");
+    close_connection_pair(listener, server, client).await;
+    shutdown_engine(server_engine, server_driver).await;
+    shutdown_engine(client_engine, client_driver).await;
+}
+
+async fn run_message_driver_first_is_connection_local(mode: CompletionMode) {
+    let (server_engine, server_engine_driver) = build_engine(mode, 2, Duration::from_secs(5));
+    let (client_engine, client_engine_driver) = build_engine(mode, 2, Duration::from_secs(5));
+    let (failed_listener, failed_server, mut failed_client) =
+        establish_on(&server_engine, &client_engine, MessageConfig::default()).await;
+    let (healthy_listener, healthy_server, healthy_client) =
+        establish_on(&server_engine, &client_engine, MessageConfig::default()).await;
+
+    failed_client.abort_driver().await;
+    let failed = tokio::time::timeout(Duration::from_secs(5), failed_client.send(b"stopped"))
+        .await
+        .expect("frontend did not observe message-driver loss")
+        .unwrap_err();
+    assert!(matches!(
+        failed,
+        Error::DriverShutdown | Error::TransportClosed
+    ));
+
+    healthy_client.send(b"healthy").await.unwrap();
+    let message = healthy_server.recv().await.unwrap();
+    assert_eq!(&*message, b"healthy");
+    drop(message);
+
+    let _ = failed_client.shutdown().await;
+    let _ = failed_server.shutdown().await;
+    failed_listener.close().await.unwrap();
+    close_connection_pair(healthy_listener, healthy_server, healthy_client).await;
+    shutdown_engine(server_engine, server_engine_driver).await;
+    shutdown_engine(client_engine, client_engine_driver).await;
+}
+
+async fn run_frontend_first_closes_its_driver(mode: CompletionMode) {
+    let (server_engine, server_engine_driver) = build_engine(mode, 1, Duration::from_secs(5));
+    let (client_engine, client_engine_driver) = build_engine(mode, 1, Duration::from_secs(5));
+    let (listener, server, client) =
+        establish_on(&server_engine, &client_engine, MessageConfig::default()).await;
+
+    let result = tokio::time::timeout(Duration::from_secs(10), client.drop_frontend_and_wait())
+        .await
+        .expect("message driver did not stop after its sole frontend was dropped");
+    assert_clean_close(result);
+    assert!(matches!(
+        server.shutdown().await,
+        Ok(()) | Err(Error::TransportClosed)
+    ));
+    listener.close().await.unwrap();
+    shutdown_engine(server_engine, server_engine_driver).await;
+    shutdown_engine(client_engine, client_engine_driver).await;
+}
+
+async fn run_engine_first_terminalizes_message_driver(mode: CompletionMode) {
+    let (server_engine, server_engine_driver) = build_engine(mode, 1, Duration::from_secs(5));
+    let (client_engine, client_engine_driver) = build_engine(mode, 1, Duration::from_secs(5));
+    let (listener, server, client) =
+        establish_on(&server_engine, &client_engine, MessageConfig::default()).await;
+
+    client_engine_driver.abort();
+    assert!(client_engine_driver.await.unwrap_err().is_cancelled());
+    let result = tokio::time::timeout(Duration::from_secs(10), client.wait_for_driver())
+        .await
+        .expect("engine loss did not terminalize the message driver")
+        .unwrap_err();
+    assert!(matches!(
+        result,
+        Error::DriverShutdown | Error::EngineWedged { .. }
+    ));
+    assert!(matches!(
+        server.shutdown().await,
+        Ok(()) | Err(Error::TransportClosed) | Err(Error::DriverShutdown)
+    ));
+    let _ = listener.close().await;
+    let _ = server_engine.shutdown().await;
+    let _ = server_engine_driver.await;
+    drop(client_engine);
 }
 
 async fn run_fairness_and_independent_close(mode: CompletionMode) {
@@ -584,7 +667,7 @@ async fn data_boundaries_registered_reuse_and_negotiated_credits() {
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
-async fn received_message_drop_reposts_and_returns_credit_only_in_engine_work() {
+async fn received_message_drop_reposts_and_returns_credit_in_message_driver_work() {
     if !has_software_rdma() {
         return;
     }
@@ -626,6 +709,27 @@ async fn hot_message_work_rotates_and_connection_close_is_independent() {
     }
     run_fairness_and_independent_close(CompletionMode::Readiness).await;
     run_fairness_and_independent_close(CompletionMode::Polling).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn intra_connection_data_credit_and_repost_work_cannot_starve() {
+    if !has_software_rdma() {
+        return;
+    }
+    run_intra_connection_fairness(CompletionMode::Readiness).await;
+    run_intra_connection_fairness(CompletionMode::Polling).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn driver_engine_and_frontend_shutdown_orderings_are_explicit() {
+    if !has_software_rdma() {
+        return;
+    }
+    for mode in [CompletionMode::Readiness, CompletionMode::Polling] {
+        run_message_driver_first_is_connection_local(mode).await;
+        run_frontend_first_closes_its_driver(mode).await;
+        run_engine_first_terminalizes_message_driver(mode).await;
+    }
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]

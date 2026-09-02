@@ -131,7 +131,6 @@ impl ReadyConnections {
 pub(super) enum DeadlineKind {
     Reclamation,
     ConnectionDrain,
-    MessageHello,
     EngineShutdown,
 }
 

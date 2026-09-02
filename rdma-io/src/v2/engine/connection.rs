@@ -15,7 +15,7 @@ use super::operation::RdmaOperation;
 use super::registry::{
     ConnectionToken, OperationToken, lock_unpoison, read_unpoison, write_unpoison,
 };
-use super::{ConnectionReadyWork, EngineShared, RdmaConnectionConfig};
+use super::{ConnectionTerminalSink, EngineShared, RdmaConnectionConfig};
 use crate::cm::{CmId, ConnParam, EventChannel};
 use crate::v2::error::{Error, Result};
 use crate::v2::mr::{AccessIntent, Mr, RemoteMr};
@@ -167,15 +167,8 @@ impl RdmaConnection {
         self.state.identity()
     }
 
-    pub(crate) fn attach_ready_work(&self, work: Arc<dyn ConnectionReadyWork>) -> Result<()> {
-        self.state.attach_ready_work(work)?;
-        self.shared.schedule_deadline(
-            super::DeadlineKind::MessageHello,
-            self.state.token.encode(),
-            self.shared.config.hello_deadline,
-        );
-        self.shared.publish_connection_ready(&self.state);
-        Ok(())
+    pub(crate) fn attach_terminal_sink(&self, sink: Arc<dyn ConnectionTerminalSink>) -> Result<()> {
+        self.state.attach_terminal_sink(sink)
     }
 
     /// Stop new posting and wait for the exact accepted set to drain safely.
@@ -241,14 +234,14 @@ pub(crate) struct ConnectionState {
     posting_open: AtomicBool,
     // Nested lifecycle synchronization always follows:
     // EngineShared::admission -> lifecycle_gate -> posting_gate.
-    // ready_work is only held long enough to clone/install its Arc and is
-    // never held while invoking ConnectionReadyWork.
+    // terminal_sink is held only long enough to clone/install its Arc and is
+    // never held while invoking ConnectionTerminalSink.
     posting_gate: RwLock<()>,
     lifecycle_gate: Mutex<()>,
     local_credits: Mutex<LocalCredits>,
     accepted: Mutex<HashSet<AcceptedWrIdentity>>,
     completions: Mutex<VecDeque<WorkCompletion>>,
-    ready_work: Mutex<Option<Arc<dyn ConnectionReadyWork>>>,
+    terminal_sink: Mutex<Option<Arc<dyn ConnectionTerminalSink>>>,
     ready_published: AtomicBool,
     close_started: AtomicBool,
     close_outcome: Mutex<Option<MemoizedTerminalResult>>,
@@ -295,7 +288,7 @@ impl ConnectionState {
             local_credits: Mutex::new(LocalCredits::default()),
             accepted: Mutex::new(HashSet::new()),
             completions: Mutex::new(VecDeque::new()),
-            ready_work: Mutex::new(None),
+            terminal_sink: Mutex::new(None),
             ready_published: AtomicBool::new(false),
             close_started: AtomicBool::new(false),
             close_outcome: Mutex::new(None),
@@ -414,33 +407,29 @@ impl ConnectionState {
         !lock_unpoison(&self.completions).is_empty()
     }
 
-    pub(super) fn attach_ready_work(&self, work: Arc<dyn ConnectionReadyWork>) -> Result<()> {
-        let mut current = lock_unpoison(&self.ready_work);
+    pub(super) fn attach_terminal_sink(&self, sink: Arc<dyn ConnectionTerminalSink>) -> Result<()> {
+        let mut current = lock_unpoison(&self.terminal_sink);
         if current.is_some() {
             return Err(Error::InvalidConfig(
-                "connection already has attached ready work".into(),
+                "connection already has an attached terminal sink".into(),
             ));
         }
-        *current = Some(work);
+        *current = Some(Arc::clone(&sink));
+        let already_terminal = !self.posting_open.load(Ordering::Acquire);
+        drop(current);
+        if already_terminal {
+            let error = self.operation_close_error();
+            if matches!(error, Error::TransportClosed) {
+                sink.disconnected();
+            } else {
+                sink.terminalize(error);
+            }
+        }
         Ok(())
     }
 
-    pub(super) fn process_ready_work(&self, budget: usize) -> usize {
-        self.ready_work().map_or(0, |work| work.process(budget))
-    }
-
-    pub(super) fn has_attached_work(&self) -> bool {
-        self.ready_work().is_some_and(|work| work.has_work())
-    }
-
-    pub(super) fn handle_message_deadline(&self) {
-        if let Some(work) = self.ready_work() {
-            work.deadline_expired();
-        }
-    }
-
-    fn ready_work(&self) -> Option<Arc<dyn ConnectionReadyWork>> {
-        lock_unpoison(&self.ready_work).clone()
+    fn terminal_sink(&self) -> Option<Arc<dyn ConnectionTerminalSink>> {
+        lock_unpoison(&self.terminal_sink).clone()
     }
 
     pub(super) fn mark_ready_published(&self) -> bool {
@@ -469,16 +458,16 @@ impl ConnectionState {
                 *close_outcome = Some(MemoizedTerminalResult::from_error(error.clone()));
             }
             drop(close_outcome);
-            if let Some(work) = self.ready_work() {
-                work.terminalize(error);
+            if let Some(sink) = self.terminal_sink() {
+                sink.terminalize(error);
             }
         }
     }
 
     pub(super) fn mark_disconnected(&self) {
         self.stop_posting();
-        if let Some(work) = self.ready_work() {
-            work.disconnected();
+        if let Some(sink) = self.terminal_sink() {
+            sink.disconnected();
         }
     }
 
@@ -489,8 +478,8 @@ impl ConnectionState {
             *outcome = Some(MemoizedTerminalResult::from_error(error.clone()));
         }
         drop(outcome);
-        if let Some(work) = self.ready_work() {
-            work.terminalize(error);
+        if let Some(sink) = self.terminal_sink() {
+            sink.terminalize(error);
         }
         self.close_notify.notify_waiters();
     }
@@ -585,16 +574,18 @@ impl ConnectionState {
     }
 
     pub(super) fn publish_quarantine(&self, outstanding: usize) {
+        let error = Error::ConnectionQuarantined {
+            outstanding_operations: outstanding,
+            cq_debt: outstanding,
+        };
         let mut outcome = lock_unpoison(&self.close_outcome);
         if outcome.is_none() {
-            *outcome = Some(MemoizedTerminalResult::from_error(
-                Error::ConnectionQuarantined {
-                    outstanding_operations: outstanding,
-                    cq_debt: outstanding,
-                },
-            ));
+            *outcome = Some(MemoizedTerminalResult::from_error(error.clone()));
         }
         drop(outcome);
+        if let Some(sink) = self.terminal_sink() {
+            sink.terminalize(error);
+        }
         self.close_notify.notify_waiters();
     }
 
@@ -610,13 +601,17 @@ impl ConnectionState {
             .is_some_and(MemoizedTerminalResult::is_connection_quarantined);
         if newly_published {
             before_publish();
-            *outcome = Some(MemoizedTerminalResult::from_error(
-                Error::ConnectionDestroyQuarantined {
-                    cause: error.to_string(),
-                },
-            ));
+            let published = Error::ConnectionDestroyQuarantined {
+                cause: error.to_string(),
+            };
+            *outcome = Some(MemoizedTerminalResult::from_error(published.clone()));
+            drop(outcome);
+            if let Some(sink) = self.terminal_sink() {
+                sink.terminalize(published);
+            }
+        } else {
+            drop(outcome);
         }
-        drop(outcome);
         self.close_notify.notify_waiters();
         newly_published
     }
@@ -636,6 +631,9 @@ impl ConnectionState {
         }
         drop(outcome);
         self.retired.store(true, Ordering::Release);
+        if let Some(sink) = self.terminal_sink() {
+            sink.closed(Ok(()));
+        }
         self.close_notify.notify_waiters();
     }
 
@@ -647,10 +645,13 @@ impl ConnectionState {
             .as_ref()
             .is_some_and(MemoizedTerminalResult::is_connection_quarantined)
         {
-            *outcome = Some(MemoizedTerminalResult::from_error(error));
+            *outcome = Some(MemoizedTerminalResult::from_error(error.clone()));
         }
         drop(outcome);
         self.retired.store(true, Ordering::Release);
+        if let Some(sink) = self.terminal_sink() {
+            sink.closed(Err(error));
+        }
         self.close_notify.notify_waiters();
     }
 
@@ -1716,48 +1717,38 @@ mod tests {
         }
     }
 
-    struct LockCheckingReadyWork {
+    struct LockCheckingTerminalSink {
         connection: Weak<ConnectionState>,
         calls: AtomicUsize,
     }
 
-    impl LockCheckingReadyWork {
-        fn check_ready_work_unlocked(&self) {
+    impl LockCheckingTerminalSink {
+        fn check_sink_unlocked(&self) {
             let connection = self.connection.upgrade().expect("connection state");
             assert!(
-                connection.ready_work.try_lock().is_ok(),
-                "ConnectionReadyWork callback ran while ready_work was locked"
+                connection.terminal_sink.try_lock().is_ok(),
+                "ConnectionTerminalSink callback ran while terminal_sink was locked"
             );
             self.calls.fetch_add(1, Ordering::AcqRel);
         }
     }
 
-    impl ConnectionReadyWork for LockCheckingReadyWork {
-        fn process(&self, _budget: usize) -> usize {
-            self.check_ready_work_unlocked();
-            1
-        }
-
-        fn has_work(&self) -> bool {
-            self.check_ready_work_unlocked();
-            false
-        }
-
-        fn deadline_expired(&self) {
-            self.check_ready_work_unlocked();
-        }
-
+    impl ConnectionTerminalSink for LockCheckingTerminalSink {
         fn disconnected(&self) {
-            self.check_ready_work_unlocked();
+            self.check_sink_unlocked();
         }
 
         fn terminalize(&self, _error: Error) {
-            self.check_ready_work_unlocked();
+            self.check_sink_unlocked();
+        }
+
+        fn closed(&self, _result: Result<()>) {
+            self.check_sink_unlocked();
         }
     }
 
     #[test]
-    fn ready_work_mutex_is_released_before_every_callback() {
+    fn terminal_sink_mutex_is_released_before_every_callback() {
         let connection = Arc::new(ConnectionState::new(
             ConnectionToken {
                 slot: 0,
@@ -1770,20 +1761,18 @@ mod tests {
             None,
             None,
         ));
-        let work = Arc::new(LockCheckingReadyWork {
+        let sink = Arc::new(LockCheckingTerminalSink {
             connection: Arc::downgrade(&connection),
             calls: AtomicUsize::new(0),
         });
         connection
-            .attach_ready_work(Arc::clone(&work) as Arc<dyn ConnectionReadyWork>)
+            .attach_terminal_sink(Arc::clone(&sink) as Arc<dyn ConnectionTerminalSink>)
             .unwrap();
 
-        assert_eq!(connection.process_ready_work(1), 1);
-        assert!(!connection.has_attached_work());
-        connection.handle_message_deadline();
         connection.mark_disconnected();
         connection.mark_cm_failure(Error::DriverShutdown);
-        assert_eq!(work.calls.load(Ordering::Acquire), 5);
+        connection.finish_retirement();
+        assert_eq!(sink.calls.load(Ordering::Acquire), 3);
     }
 
     #[test]

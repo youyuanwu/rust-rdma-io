@@ -16,7 +16,7 @@ use super::connection::{ConnectionReservation, SharedCmId};
 use super::diagnostics::RdmaListenerDiagnostics;
 use super::lifecycle::{MemoizedTerminalResult, TakeOnceResult};
 use super::registry::{lock_unpoison, read_unpoison};
-use super::{EngineShared, PreEstablishSetup, RdmaConnection, RdmaConnectionConfig, SetupSummary};
+use super::{ConnectionSetup, EngineShared, RdmaConnection, RdmaConnectionConfig, SetupSummary};
 use crate::v2::error::{Error, Result};
 
 pub(crate) const DEFAULT_LISTENER_BACKLOG: usize = 128;
@@ -157,7 +157,7 @@ impl RdmaListener {
             Arc::clone(&self.shared),
             Arc::clone(&self.state),
             RdmaConnectionConfig::default(),
-            Box::new(EmptyPreEstablishSetup),
+            empty_connection_setup(),
         )
         .await
     }
@@ -172,7 +172,7 @@ impl RdmaListener {
             Arc::clone(&self.shared),
             Arc::clone(&self.state),
             config,
-            Box::new(EmptyPreEstablishSetup),
+            empty_connection_setup(),
         )
         .await
     }
@@ -180,7 +180,7 @@ impl RdmaListener {
     pub(crate) async fn accept_with_setup(
         &self,
         config: RdmaConnectionConfig,
-        setup: Box<dyn PreEstablishSetup>,
+        setup: ConnectionSetup,
     ) -> Result<RdmaConnection> {
         accept_with_setup(
             Arc::clone(&self.shared),
@@ -230,7 +230,7 @@ impl RdmaListener {
             Arc::clone(&self.shared),
             Arc::clone(&self.state),
             RdmaConnectionConfig::default(),
-            Box::new(FailingPreEstablishSetup(message.into())),
+            failing_connection_setup(message.into()),
         )
         .await
     }
@@ -272,7 +272,7 @@ pub(super) async fn accept_with_setup(
     shared: Arc<EngineShared>,
     listener: Arc<ListenerState>,
     config: RdmaConnectionConfig,
-    setup: Box<dyn PreEstablishSetup>,
+    setup: ConnectionSetup,
 ) -> Result<RdmaConnection> {
     config.validate(&shared.config, shared.provider.as_ref())?;
     let admission = read_unpoison(&shared.admission);
@@ -293,32 +293,23 @@ pub(super) async fn accept_with_setup(
     .await
 }
 
-pub(super) struct EmptyPreEstablishSetup;
-
-impl PreEstablishSetup for EmptyPreEstablishSetup {
-    fn run(self: Box<Self>, _connection: &RdmaConnection) -> Result<SetupSummary> {
-        Ok(SetupSummary { posted_wrs: 0 })
-    }
+pub(super) fn empty_connection_setup() -> ConnectionSetup {
+    Box::new(|_connection| Ok(SetupSummary { posted_wrs: 0 }))
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-struct FailingPreEstablishSetup(String);
-
-#[cfg(any(test, feature = "test-hooks"))]
-impl PreEstablishSetup for FailingPreEstablishSetup {
-    fn run(self: Box<Self>, _connection: &RdmaConnection) -> Result<SetupSummary> {
-        Err(Error::InvalidConfig(self.0))
-    }
+fn failing_connection_setup(message: String) -> ConnectionSetup {
+    Box::new(move |_connection| Err(Error::InvalidConfig(message)))
 }
 
 pub(super) fn run_setup_before_establish(
-    setup: Box<dyn PreEstablishSetup>,
+    setup: ConnectionSetup,
     connection: &RdmaConnection,
     before_establish: impl FnOnce() -> Result<()>,
     establish: impl FnOnce() -> Result<()>,
 ) -> Result<SetupSummary> {
     let accepted_before = connection.state.accepted_count();
-    let summary = setup.run(connection)?;
+    let summary = setup(connection)?;
     let accepted_after = connection.state.accepted_count();
     let posted_wrs = accepted_after.checked_sub(accepted_before).ok_or_else(|| {
         Error::InvalidConfig("pre-establishment setup reduced the accepted WR set".into())
@@ -336,20 +327,18 @@ pub(super) fn run_setup_before_establish(
 
 pub(super) struct AcceptIntent {
     config: RdmaConnectionConfig,
-    setup: Option<Box<dyn PreEstablishSetup>>,
+    setup: Option<ConnectionSetup>,
 }
 
 impl AcceptIntent {
-    fn new(config: RdmaConnectionConfig, setup: Box<dyn PreEstablishSetup>) -> Self {
+    fn new(config: RdmaConnectionConfig, setup: ConnectionSetup) -> Self {
         Self {
             config,
             setup: Some(setup),
         }
     }
 
-    pub(super) fn into_parts(
-        mut self,
-    ) -> Result<(RdmaConnectionConfig, Box<dyn PreEstablishSetup>)> {
+    pub(super) fn into_parts(mut self) -> Result<(RdmaConnectionConfig, ConnectionSetup)> {
         let setup = self.setup.take().ok_or_else(|| {
             Error::InvalidConfig("accept setup was consumed more than once".into())
         })?;
@@ -512,7 +501,7 @@ impl AcceptRequest {
     pub(super) fn test_only() -> Arc<Self> {
         Arc::new(Self::new(AcceptIntent::new(
             RdmaConnectionConfig::default(),
-            Box::new(EmptyPreEstablishSetup),
+            empty_connection_setup(),
         )))
     }
 
@@ -1212,7 +1201,7 @@ mod tests {
     fn request() -> Arc<AcceptRequest> {
         Arc::new(AcceptRequest::new(AcceptIntent::new(
             RdmaConnectionConfig::default(),
-            Box::new(EmptyPreEstablishSetup),
+            empty_connection_setup(),
         )))
     }
 

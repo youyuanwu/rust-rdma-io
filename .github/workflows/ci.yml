@@ -16,6 +16,8 @@ env:
 jobs:
   build-siw:
     runs-on: ${{ matrix.os }}
+    env:
+      RDMA_REQUIRE_PROVIDER: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -65,6 +67,16 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --features tokio -- -D warnings
 
+      - name: V2 engine Phase 1 provider suites
+        run: |
+          cargo test -p rdma-io-tests --test v2_engine_message_setup_tests -- --nocapture
+          cargo test -p rdma-io-tests --test v2_engine_message_tests -- --nocapture
+          cargo test -p rdma-io-tests --test v2_engine_message_retry_tests -- --nocapture
+          cargo test -p rdma-io-tests --test v2_engine_lifecycle_tests -- --nocapture
+          cargo test -p rdma-io-tests --test v2_engine_diagnostics_tests -- --nocapture
+          cargo test -p rdma-io-tests --test v2_engine_tests -- --nocapture
+          cargo test -p rdma-io-tests --test safe_api_tests -- --nocapture
+
       - name: Test
         run: |
           for i in $(seq 1 5); do
@@ -79,6 +91,8 @@ jobs:
 
   build-rxe:
     runs-on: ${{ matrix.os }}
+    env:
+      RDMA_REQUIRE_PROVIDER: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -121,6 +135,16 @@ jobs:
 
       - name: Build
         run: cargo build --all-targets
+
+      - name: V2 engine Phase 1 provider suites
+        run: |
+          cargo test -p rdma-io-tests --test v2_engine_message_setup_tests -- --nocapture
+          cargo test -p rdma-io-tests --test v2_engine_message_tests -- --nocapture
+          cargo test -p rdma-io-tests --test v2_engine_message_retry_tests -- --nocapture
+          cargo test -p rdma-io-tests --test v2_engine_lifecycle_tests -- --nocapture
+          cargo test -p rdma-io-tests --test v2_engine_diagnostics_tests -- --nocapture
+          cargo test -p rdma-io-tests --test v2_engine_tests -- --nocapture
+          cargo test -p rdma-io-tests --test safe_api_tests -- --nocapture
 
       - name: Test
         run: |

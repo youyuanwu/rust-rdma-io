@@ -1363,13 +1363,3 @@ async fn dropping_the_driver_with_live_connections_quarantines_complete_bundles(
         "driver loss synchronously destroys only zero-outstanding QPs"
     );
 }
-
-#[test]
-fn outbound_api_surface_has_exact_future_outputs() {
-    fn assert_send<T: Send>(_: T) {}
-    fn check(engine: &RdmaEngine, address: std::net::SocketAddr) {
-        assert_send(engine.connect(address));
-        assert_send(engine.connect_with_config(address, RdmaConnectionConfig::default()));
-    }
-    let _ = check;
-}

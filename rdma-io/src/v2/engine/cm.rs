@@ -30,13 +30,13 @@ use super::diagnostics::CmEventReject;
 use super::diagnostics::RdmaListenerDiagnostics;
 use super::lifecycle::{MemoizedTerminalResult, TakeOnceResult};
 use super::listener::{
-    AcceptRequest, EmptyPreEstablishSetup, InboundRejectReason, IncomingChild,
-    KERNEL_LISTEN_BACKLOG_REQUEST, ListenRequest, ListenerAction, ListenerDiagnosticTotals,
-    ListenerState, RdmaListener, run_setup_before_establish,
+    AcceptRequest, InboundRejectReason, IncomingChild, KERNEL_LISTEN_BACKLOG_REQUEST,
+    ListenRequest, ListenerAction, ListenerDiagnosticTotals, ListenerState, RdmaListener,
+    empty_connection_setup, run_setup_before_establish,
 };
 use super::registry::{ConnectionToken, Lookup, PagedRegistry, RegistryToken, lock_unpoison};
 use super::resources::EngineResources;
-use super::{EngineShared, PreEstablishSetup, RdmaConnection, RdmaConnectionConfig};
+use super::{ConnectionSetup, EngineShared, RdmaConnection, RdmaConnectionConfig};
 use crate::cm::{CmEventType, CmId, PortSpace};
 use crate::v2::error::{Error, Result};
 use crate::v2::qp::QpBuilder;
@@ -2742,14 +2742,14 @@ pub(super) async fn connect(
     address: SocketAddr,
     config: RdmaConnectionConfig,
 ) -> Result<RdmaConnection> {
-    connect_with_setup(shared, address, config, Box::new(EmptyPreEstablishSetup)).await
+    connect_with_setup(shared, address, config, empty_connection_setup()).await
 }
 
 pub(super) async fn connect_with_setup(
     shared: Arc<EngineShared>,
     address: SocketAddr,
     config: RdmaConnectionConfig,
-    setup: Box<dyn PreEstablishSetup>,
+    setup: ConnectionSetup,
 ) -> Result<RdmaConnection> {
     config.validate(&shared.config, shared.provider.as_ref())?;
     let (admission, reservation) = reserve_connection(&shared)?;
@@ -3259,7 +3259,7 @@ impl OutboundState {
 struct OutboundRequest {
     address: SocketAddr,
     config: RdmaConnectionConfig,
-    setup: Mutex<Option<Box<dyn PreEstablishSetup>>>,
+    setup: Mutex<Option<ConnectionSetup>>,
     reservation: Mutex<Option<ConnectionReservation>>,
     result: Mutex<TakeOnceResult<RdmaConnection>>,
     cancelled: AtomicBool,
@@ -3274,7 +3274,7 @@ impl OutboundRequest {
     fn new(
         address: SocketAddr,
         config: RdmaConnectionConfig,
-        setup: Box<dyn PreEstablishSetup>,
+        setup: ConnectionSetup,
         reservation: ConnectionReservation,
     ) -> Self {
         Self {
@@ -3292,7 +3292,7 @@ impl OutboundRequest {
         }
     }
 
-    fn take_setup(&self) -> Option<Box<dyn PreEstablishSetup>> {
+    fn take_setup(&self) -> Option<ConnectionSetup> {
         lock_unpoison(&self.setup).take()
     }
 
@@ -3843,10 +3843,7 @@ mod tests {
         .unwrap();
         let order = Arc::new(Mutex::new(Vec::new()));
         let summary = run_setup_before_establish(
-            Box::new(RecordingSetup {
-                order: Arc::clone(&order),
-                result: Ok(SetupSummary { posted_wrs: 0 }),
-            }),
+            recording_setup(Arc::clone(&order), Ok(SetupSummary { posted_wrs: 0 })),
             &connection,
             || {
                 lock_unpoison(&order).push("pre-connect");
@@ -3866,10 +3863,10 @@ mod tests {
 
         lock_unpoison(&order).clear();
         let error = run_setup_before_establish(
-            Box::new(RecordingSetup {
-                order: Arc::clone(&order),
-                result: Err(Error::InvalidConfig("setup failed".into())),
-            }),
+            recording_setup(
+                Arc::clone(&order),
+                Err(Error::InvalidConfig("setup failed".into())),
+            ),
             &connection,
             || {
                 lock_unpoison(&order).push("pre-connect");
@@ -3886,10 +3883,7 @@ mod tests {
 
         lock_unpoison(&order).clear();
         let error = run_setup_before_establish(
-            Box::new(RecordingSetup {
-                order: Arc::clone(&order),
-                result: Ok(SetupSummary { posted_wrs: 1 }),
-            }),
+            recording_setup(Arc::clone(&order), Ok(SetupSummary { posted_wrs: 1 })),
             &connection,
             || {
                 lock_unpoison(&order).push("pre-connect");
@@ -4416,16 +4410,14 @@ mod tests {
         drop(driver);
     }
 
-    struct RecordingSetup {
+    fn recording_setup(
         order: Arc<Mutex<Vec<&'static str>>>,
         result: Result<SetupSummary>,
-    }
-
-    impl PreEstablishSetup for RecordingSetup {
-        fn run(self: Box<Self>, _connection: &RdmaConnection) -> Result<SetupSummary> {
-            lock_unpoison(&self.order).push("setup");
-            self.result
-        }
+    ) -> ConnectionSetup {
+        Box::new(move |_connection| {
+            lock_unpoison(&order).push("setup");
+            result
+        })
     }
 
     struct NoopPoster(u32);
@@ -4466,7 +4458,7 @@ mod tests {
         OutboundRequest::new(
             "127.0.0.1:1".parse().unwrap(),
             RdmaConnectionConfig::default(),
-            Box::new(EmptyPreEstablishSetup),
+            empty_connection_setup(),
             pool.try_acquire().unwrap(),
         )
     }

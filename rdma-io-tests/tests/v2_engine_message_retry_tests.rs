@@ -72,8 +72,6 @@ async fn transient_retry_reclaims_capacity_routes_and_requests_before_retry() {
 
     let _ = tokio::join!(server.close(), client.close());
     listener.close().await.unwrap();
-    drop(server);
-    drop(client);
     drop(listener);
     for engine in [&server_engine, &client_engine] {
         let diagnostics = engine.diagnostics();
@@ -125,8 +123,6 @@ async fn ready_transient_restores_exact_baseline_before_retry() {
 
     let _ = tokio::join!(server.close(), client.close());
     listener.close().await.unwrap();
-    drop(server);
-    drop(client);
     drop(listener);
     for engine in [&server_engine, &client_engine] {
         let diagnostics = engine.diagnostics();

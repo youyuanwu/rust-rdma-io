@@ -4,11 +4,13 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use rdma_io::cm::RdmaCmDeviceList;
-use rdma_io::v2::test_support::{TestHelloAttachHook, TestHelloOverride};
+use rdma_io::v2::test_support::TestHelloOverride;
 use rdma_io::v2::{
-    CompletionMode, Error, MessageTransport, MessageTransportBuilder, RdmaConnectionConfig,
-    RdmaEngine, RdmaEngineBuilder, RdmaEngineDriver, RdmaListener, RdmaListenerConfig, Result,
+    CompletionMode, Error, MessageTransport, MessageTransportBuilder, MessageTransportDriver,
+    RdmaConnectionConfig, RdmaEngine, RdmaEngineBuilder, RdmaEngineDriver, RdmaListener,
+    RdmaListenerConfig, Result,
 };
+use rdma_io_tests::engine_test_helpers::DrivenMessageTransport;
 use rdma_io_tests::test_helpers::{connect_addr_for, has_software_rdma};
 
 fn software_device_name() -> Option<String> {
@@ -24,7 +26,9 @@ fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
     future.poll(&mut context)
 }
 
-fn assert_message_future<F: Future<Output = Result<MessageTransport>>>(_: &F) {}
+fn drive(pair: (MessageTransport, MessageTransportDriver)) -> DrivenMessageTransport {
+    DrivenMessageTransport::new(pair.0, pair.1)
+}
 
 fn build_engine_unspawned(mode: CompletionMode) -> (RdmaEngine, RdmaEngineDriver) {
     let device = software_device_name().expect("software RDMA device");
@@ -67,32 +71,34 @@ async fn listen(engine: &RdmaEngine) -> RdmaListener {
 async fn establish_messages(
     server: &RdmaEngine,
     client: &RdmaEngine,
-) -> (RdmaListener, MessageTransport, MessageTransport) {
+) -> (RdmaListener, DrivenMessageTransport, DrivenMessageTransport) {
     let listener = listen(server).await;
     let address = connect_addr_for(Some(listener.local_addr().unwrap()));
     let accept = MessageTransportBuilder::new().accept_on(&listener);
     let connect = MessageTransportBuilder::new().connect_on(client, address);
-    assert_message_future(&accept);
-    assert_message_future(&connect);
     let (accepted, connected) = tokio::time::timeout(Duration::from_secs(15), async {
         tokio::join!(accept, connect)
     })
     .await
     .expect("message CM establishment timed out");
-    (listener, accepted.unwrap(), connected.unwrap())
+    (
+        listener,
+        drive(accepted.unwrap()),
+        drive(connected.unwrap()),
+    )
 }
 
 async fn close_pair(
     listener: RdmaListener,
-    server: MessageTransport,
-    client: MessageTransport,
+    server: DrivenMessageTransport,
+    client: DrivenMessageTransport,
     server_engine: RdmaEngine,
     client_engine: RdmaEngine,
     server_driver: tokio::task::JoinHandle<Result<()>>,
     client_driver: tokio::task::JoinHandle<Result<()>>,
 ) {
     let (server_close, client_close) = tokio::time::timeout(Duration::from_secs(15), async {
-        tokio::join!(server.close(), client.close())
+        tokio::join!(server.shutdown(), client.shutdown())
     })
     .await
     .expect("message close timed out");
@@ -205,8 +211,8 @@ async fn run_cancelled_accept(mode: CompletionMode) {
     })
     .await
     .expect("post-cancellation message establishment timed out");
-    let server = server.unwrap();
-    let client = client.unwrap();
+    let server = drive(server.unwrap());
+    let client = drive(client.unwrap());
     tokio::time::timeout(Duration::from_secs(15), async {
         let (server_ready, client_ready) = tokio::join!(server.ready(), client.ready());
         server_ready.unwrap();
@@ -257,8 +263,8 @@ async fn run_malformed_hello(mode: CompletionMode) {
         })
         .await
         .expect("malformed HELLO connection establishment timed out");
-        let server = server.unwrap();
-        let client = client.unwrap();
+        let server = drive(server.unwrap());
+        let client = drive(client.unwrap());
         let error = tokio::time::timeout(Duration::from_secs(15), server.ready())
             .await
             .expect("malformed HELLO did not resolve readiness")
@@ -387,6 +393,8 @@ async fn run_mixed_accept_order(mode: CompletionMode) {
         .expect("mixed message accept timed out")
         .unwrap()
         .unwrap();
+    let message_client = drive(message_client);
+    let message_server = drive(message_server);
     tokio::time::timeout(Duration::from_secs(15), async {
         let (server_ready, client_ready) =
             tokio::join!(message_server.ready(), message_client.ready());
@@ -463,8 +471,18 @@ async fn run_driver_withholding(mode: CompletionMode) {
     })
     .await
     .expect("message setup did not progress after polling the withheld driver");
-    let server = server.unwrap().unwrap();
-    let client = client.unwrap().unwrap();
+    let (server, server_message_driver) = server.unwrap().unwrap();
+    let (client, client_message_driver) = client.unwrap().unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), async {
+            tokio::join!(server.ready(), client.ready())
+        })
+        .await
+        .is_err(),
+        "HELLO unexpectedly progressed without polling message drivers"
+    );
+    let server = DrivenMessageTransport::new(server, server_message_driver);
+    let client = DrivenMessageTransport::new(client, client_message_driver);
     tokio::time::timeout(Duration::from_secs(15), async {
         let (server_ready, client_ready) = tokio::join!(server.ready(), client.ready());
         server_ready.unwrap();
@@ -556,81 +574,4 @@ async fn polling_mixed_accepts_preserve_registration_order() {
 async fn message_setup_requires_the_owning_driver_to_be_polled() {
     run_driver_withholding(CompletionMode::Readiness).await;
     run_driver_withholding(CompletionMode::Polling).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn hello_delivered_during_ready_work_attachment_is_processed() {
-    if !has_software_rdma() {
-        return;
-    }
-    let (server_engine, server_driver) = build_engine(CompletionMode::Readiness).await;
-    let (client_engine, client_driver) = build_engine(CompletionMode::Readiness).await;
-    let listener = listen(&server_engine).await;
-    let address = connect_addr_for(Some(listener.local_addr().unwrap()));
-    let hook = TestHelloAttachHook::new();
-
-    let accept_listener = listener.clone();
-    let accept = tokio::spawn(async move {
-        MessageTransportBuilder::new()
-            .accept_on(&accept_listener)
-            .await
-    });
-    let connect_engine = client_engine.clone();
-    let connect_hook = hook.clone();
-    let connect = tokio::spawn(async move {
-        MessageTransportBuilder::new()
-            .test_hello_attach_hook(connect_hook)
-            .connect_on(&connect_engine, address)
-            .await
-    });
-
-    let attached_hook = hook.clone();
-    let attached =
-        tokio::task::spawn_blocking(move || attached_hook.wait_until_ready_work_attached())
-            .await
-            .unwrap();
-    if attached.is_err() {
-        hook.release();
-    }
-    attached.unwrap();
-
-    hook.deliver_hello().unwrap();
-    let hello_hook = hook.clone();
-    let hello = tokio::task::spawn_blocking(move || hello_hook.wait_until_hello_processed())
-        .await
-        .unwrap();
-    hook.release();
-    if let Err(error) = hello {
-        panic!(
-            "{error}; server={:?}; client={:?}",
-            server_engine.diagnostics(),
-            client_engine.diagnostics()
-        );
-    }
-
-    let (server, client) = tokio::time::timeout(Duration::from_secs(15), async {
-        tokio::join!(accept, connect)
-    })
-    .await
-    .expect("message attachment hook did not resume");
-    let server = server.unwrap().unwrap();
-    let client = client.unwrap().unwrap();
-    tokio::time::timeout(Duration::from_secs(15), async {
-        let (server_ready, client_ready) = tokio::join!(server.ready(), client.ready());
-        server_ready.unwrap();
-        client_ready.unwrap();
-    })
-    .await
-    .expect("HELLO delivered during attachment was lost");
-
-    close_pair(
-        listener,
-        server,
-        client,
-        server_engine,
-        client_engine,
-        server_driver,
-        client_driver,
-    )
-    .await;
 }

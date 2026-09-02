@@ -555,14 +555,15 @@ pub mod test_helpers {
 pub mod engine_test_helpers {
     use std::error::Error as StdError;
     use std::fmt;
+    use std::ops::Deref;
     use std::time::Duration;
 
     use rdma_io::async_cm::{AsyncCmId, AsyncCmListener};
     use rdma_io::cm::ConnParam;
     use rdma_io::v2::test_support::{TestEngineInstrumentation, TestEngineQp, TestEngineResources};
     use rdma_io::v2::{
-        Error, MessageTransport, MessageTransportBuilder, RdmaEngine, RdmaListener,
-        RdmaListenerConfig, Result,
+        Error, MessageTransport, MessageTransportBuilder, MessageTransportDriver, RdmaEngine,
+        RdmaListener, RdmaListenerConfig, Result,
     };
 
     use crate::test_helpers::{
@@ -608,6 +609,84 @@ pub mod engine_test_helpers {
     pub struct EngineTestPair {
         pub server: EngineTestEndpoint,
         pub client: EngineTestEndpoint,
+    }
+
+    /// Test-owned message frontend plus its explicitly spawned driver task.
+    pub struct DrivenMessageTransport {
+        transport: Option<MessageTransport>,
+        driver: Option<tokio::task::JoinHandle<Result<()>>>,
+    }
+
+    impl DrivenMessageTransport {
+        pub fn new(transport: MessageTransport, driver: MessageTransportDriver) -> Self {
+            Self {
+                transport: Some(transport),
+                driver: Some(tokio::spawn(driver)),
+            }
+        }
+
+        pub async fn shutdown(mut self) -> Result<()> {
+            let result = self
+                .transport
+                .as_ref()
+                .expect("driven transport is present")
+                .close()
+                .await;
+            drop(self.transport.take());
+            let driver_result = match self.driver.take() {
+                Some(driver) => driver.await.expect("message driver task panicked"),
+                None => Ok(()),
+            };
+            match result {
+                Err(error) => Err(error),
+                Ok(()) => driver_result,
+            }
+        }
+
+        pub async fn abort_driver(&mut self) {
+            if let Some(driver) = self.driver.take() {
+                driver.abort();
+                assert!(driver.await.unwrap_err().is_cancelled());
+            }
+        }
+
+        pub async fn drop_frontend_and_wait(mut self) -> Result<()> {
+            drop(self.transport.take());
+            self.driver
+                .take()
+                .expect("message driver task is present")
+                .await
+                .expect("message driver task panicked")
+        }
+
+        pub async fn wait_for_driver(mut self) -> Result<()> {
+            let result = self
+                .driver
+                .take()
+                .expect("message driver task is present")
+                .await
+                .expect("message driver task panicked");
+            drop(self.transport.take());
+            result
+        }
+    }
+
+    impl Deref for DrivenMessageTransport {
+        type Target = MessageTransport;
+
+        fn deref(&self) -> &Self::Target {
+            self.transport
+                .as_ref()
+                .expect("driven transport is present")
+        }
+    }
+
+    impl Drop for DrivenMessageTransport {
+        fn drop(&mut self) {
+            if let Some(driver) = self.driver.take() {
+                driver.abort();
+            }
+        }
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -792,31 +871,28 @@ pub mod engine_test_helpers {
 
     async fn close_message_attempt(
         listener: Option<RdmaListener>,
-        server: Option<MessageTransport>,
-        client: Option<MessageTransport>,
+        server: Option<DrivenMessageTransport>,
+        client: Option<DrivenMessageTransport>,
     ) {
-        tokio::time::timeout(Duration::from_secs(15), async {
-            match (&server, &client) {
+        tokio::time::timeout(Duration::from_secs(15), async move {
+            match (server, client) {
                 (Some(server), Some(client)) => {
-                    let _ = tokio::join!(server.close(), client.close());
+                    let _ = tokio::join!(server.shutdown(), client.shutdown());
                 }
                 (Some(server), None) => {
-                    let _ = server.close().await;
+                    let _ = server.shutdown().await;
                 }
                 (None, Some(client)) => {
-                    let _ = client.close().await;
+                    let _ = client.shutdown().await;
                 }
                 (None, None) => {}
             }
-            if let Some(listener) = &listener {
+            if let Some(listener) = listener {
                 let _ = listener.close().await;
             }
         })
         .await
         .expect("V2 engine retry attempt cleanup timed out");
-        drop(server);
-        drop(client);
-        drop(listener);
     }
 
     pub(crate) fn retry_exhausted(last_transient: Error) -> Error {
@@ -856,7 +932,7 @@ pub mod engine_test_helpers {
         server_engine: &RdmaEngine,
         client_engine: &RdmaEngine,
         make_builder: F,
-    ) -> Result<(RdmaListener, MessageTransport, MessageTransport)>
+    ) -> Result<(RdmaListener, DrivenMessageTransport, DrivenMessageTransport)>
     where
         F: FnMut() -> MessageTransportBuilder,
     {
@@ -876,7 +952,7 @@ pub mod engine_test_helpers {
         client_engine: &RdmaEngine,
         make_builder: F,
         before_connect_accept: C,
-    ) -> Result<(RdmaListener, MessageTransport, MessageTransport)>
+    ) -> Result<(RdmaListener, DrivenMessageTransport, DrivenMessageTransport)>
     where
         F: FnMut() -> MessageTransportBuilder,
         C: FnMut(u64) -> Result<()>,
@@ -899,7 +975,7 @@ pub mod engine_test_helpers {
         mut make_builder: F,
         mut before_connect_accept: C,
         mut before_ready: R,
-    ) -> Result<(RdmaListener, MessageTransport, MessageTransport)>
+    ) -> Result<(RdmaListener, DrivenMessageTransport, DrivenMessageTransport)>
     where
         F: FnMut() -> MessageTransportBuilder,
         C: FnMut(u64) -> Result<()>,
@@ -1056,14 +1132,18 @@ pub mod engine_test_helpers {
                     Ok((server, client)) => {
                         let mut errors = Vec::new();
                         let server = match server {
-                            Ok(server) => Some(server),
+                            Ok((transport, driver)) => {
+                                Some(DrivenMessageTransport::new(transport, driver))
+                            }
                             Err(error) => {
                                 errors.push(error);
                                 None
                             }
                         };
                         let client = match client {
-                            Ok(client) => Some(client),
+                            Ok((transport, driver)) => {
+                                Some(DrivenMessageTransport::new(transport, driver))
+                            }
                             Err(error) => {
                                 errors.push(error);
                                 None

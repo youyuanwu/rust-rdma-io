@@ -7,25 +7,28 @@
 //! # Progress Ownership
 //!
 //! Engine attachment through [`MessageTransportBuilder::connect_on`] or
-//! [`MessageTransportBuilder::accept_on`] returns only [`MessageTransport`];
-//! the engine driver performs message setup and protocol progress with zero
-//! additional message tasks. There is no dedicated receive pump or disconnect
-//! monitor.
+//! [`MessageTransportBuilder::accept_on`] returns a [`MessageTransport`]
+//! frontend and a distinct [`MessageTransportDriver`]. The application must
+//! poll or explicitly spawn that one driver per connection. The shared engine
+//! driver continues CQ/CM and safe teardown progress; the message driver owns
+//! HELLO, DATA, CREDIT, receive reposting, fairness, and message lifecycle.
 //!
 //! ```no_run
 //! # use rdma_io::v2::*;
 //! # async fn example() -> Result<()> {
 //! let (engine, driver) = RdmaEngineBuilder::new("rxe0").build()?;
 //! let driver_task = tokio::spawn(driver);
-//! let transport = MessageTransportBuilder::new()
+//! let (transport, message_driver) = MessageTransportBuilder::new()
 //!     .connect_on(&engine, "192.168.1.1:7471".parse().unwrap())
 //!     .await?;
+//! let message_task = tokio::spawn(message_driver);
 //!
 //! transport.ready().await?;
 //! transport.send(b"hello").await?;
 //! let msg = transport.recv().await?;
 //! assert_eq!(msg.as_ref(), b"hello");
 //! transport.close().await?;
+//! message_task.await.expect("message driver task panicked")?;
 //! engine.shutdown().await?;
 //! driver_task.await.expect("driver task panicked")?;
 //! # Ok(())
@@ -65,7 +68,7 @@
 //!   (belt-and-suspenders, with overflow-safe arithmetic).
 //!
 //! The in-flight check is the primary invariant and is TOCTOU-safe:
-//! engine-ready work increments `credits_in_flight` immediately after
+//! message-driver work increments `credits_in_flight` immediately after
 //! forgetting the permit and before offering the DATA WR to the provider.
 //! Provider-proven unaccepted WRs roll back with checked atomic subtraction;
 //! accepted or ambiguous WRs retain their accounting until the exact CQE or
@@ -87,7 +90,7 @@
 //! - **Delivered** — completed by the HCA, queued internally or held
 //!   by a [`ReceivedMessage`] handle
 //! - **Queued for repost** — returned by [`ReceivedMessage::drop`] to
-//!   connection-local engine work
+//!   connection-local message-driver work
 //! - **Teardown-owned** — transport is shutting down; the MR will be dropped
 //!
 //! # Disconnect Monitoring
@@ -104,25 +107,27 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-#[cfg(any(test, feature = "test-hooks"))]
-use std::sync::Condvar;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::task::{Context, Poll};
-#[cfg(any(test, feature = "test-hooks"))]
 use std::time::Duration;
 
 use futures_util::task::AtomicWaker;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use super::engine::{
-    ConnectionReadyWork, ConnectionState, DetachedOperationCompletion, EngineShared,
-    PreEstablishSetup, RdmaConnection, RdmaConnectionConfig, RdmaEngine, RdmaListener,
-    SetupSummary,
+    ConnectionState, ConnectionTerminalSink, DetachedOperationCompletion, EngineShared,
+    RdmaConnection, RdmaConnectionConfig, RdmaEngine, RdmaListener, SetupSummary,
+    preflight_driver_runtime,
 };
 use super::error::{Error, Result};
 use super::mr::{AccessIntent, Mr};
 use super::protocol;
+
+const DEFAULT_MESSAGE_HELLO_DEADLINE: Duration = Duration::from_secs(10);
+const MIN_MESSAGE_HELLO_DEADLINE: Duration = Duration::from_millis(1);
+const MAX_MESSAGE_HELLO_DEADLINE: Duration = Duration::from_secs(5 * 60);
+const MESSAGE_DRIVER_BUDGET: usize = 32;
 
 /// Builder for creating a [`MessageTransport`].
 ///
@@ -137,6 +142,7 @@ use super::protocol;
 /// | recv_buffers | 32 |
 /// | send_buffers | 16 |
 /// | buffer_size | 65536 (64 KB) |
+/// | hello_deadline | 10 seconds |
 ///
 /// The default QP requirement is exactly 19 send WRs
 /// (`16 + 2 control + 1 HELLO`) and 34 receive WRs
@@ -151,11 +157,10 @@ pub struct MessageTransportBuilder {
     recv_buffer_count: usize,
     send_buffer_count: usize,
     buffer_size: usize,
+    hello_deadline: Duration,
     connection_config: Option<RdmaConnectionConfig>,
     #[cfg(any(test, feature = "test-hooks"))]
     hello_override: Option<TestHelloOverride>,
-    #[cfg(any(test, feature = "test-hooks"))]
-    attach_hook: Option<TestHelloAttachHook>,
 }
 
 impl Default for MessageTransportBuilder {
@@ -171,11 +176,10 @@ impl MessageTransportBuilder {
             recv_buffer_count: 32,
             send_buffer_count: 16,
             buffer_size: 64 * 1024,
+            hello_deadline: DEFAULT_MESSAGE_HELLO_DEADLINE,
             connection_config: None,
             #[cfg(any(test, feature = "test-hooks"))]
             hello_override: None,
-            #[cfg(any(test, feature = "test-hooks"))]
-            attach_hook: None,
         }
     }
 
@@ -204,6 +208,15 @@ impl MessageTransportBuilder {
         self
     }
 
+    /// Set the HELLO handshake deadline in `1 millisecond..=5 minutes`.
+    ///
+    /// The per-connection [`MessageTransportDriver`] owns and advances this
+    /// deadline. An unpolled driver makes no handshake progress.
+    pub fn hello_deadline(mut self, value: Duration) -> Self {
+        self.hello_deadline = value;
+        self
+    }
+
     /// Supply the base QP/CM configuration for engine-attached message transport.
     ///
     /// The configured send and receive WR maxima may exceed, but must not
@@ -221,13 +234,6 @@ impl MessageTransportBuilder {
         self
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[doc(hidden)]
-    pub fn test_hello_attach_hook(mut self, hook: TestHelloAttachHook) -> Self {
-        self.attach_hook = Some(hook);
-        self
-    }
-
     fn validate(&self) -> Result<()> {
         if self.recv_buffer_count == 0 {
             return Err(Error::InvalidConfig("recv_buffers must be > 0".into()));
@@ -237,6 +243,13 @@ impl MessageTransportBuilder {
         }
         if self.buffer_size == 0 {
             return Err(Error::InvalidConfig("buffer_size must be > 0".into()));
+        }
+        if !(MIN_MESSAGE_HELLO_DEADLINE..=MAX_MESSAGE_HELLO_DEADLINE).contains(&self.hello_deadline)
+        {
+            return Err(Error::InvalidConfig(format!(
+                "message HELLO deadline must be in {:?}..={:?}",
+                MIN_MESSAGE_HELLO_DEADLINE, MAX_MESSAGE_HELLO_DEADLINE
+            )));
         }
         Ok(())
     }
@@ -292,66 +305,70 @@ impl MessageTransportBuilder {
             recv_count: self.recv_buffer_count,
             buffer_size: self.buffer_size,
             mr_size,
+            hello_deadline: self.hello_deadline,
             #[cfg(any(test, feature = "test-hooks"))]
             hello_override: self.hello_override,
-            #[cfg(any(test, feature = "test-hooks"))]
-            attach_hook: self.attach_hook.clone(),
         })
     }
 
     /// Attach an outbound message transport to an RDMA engine.
     ///
-    /// The returned frontend has no connection-local driver. The engine driver
-    /// owns receive pre-posting, HELLO negotiation, CQ routing, and readiness.
+    /// Returns the frontend and its sole explicit connection-local driver.
     /// The full checked receive batch is accepted before `rdma_connect`; setup
     /// failure follows exact `bad_wr` prefix/suffix/ambiguity ownership.
     pub async fn connect_on(
         self,
         engine: &RdmaEngine,
         addr: SocketAddr,
-    ) -> Result<MessageTransport> {
+    ) -> Result<(MessageTransport, MessageTransportDriver)> {
         let config = self.derive_engine_config()?;
         engine.validate_message_connection_config(&config.connection)?;
         let state = Arc::new(EngineMessageState::new(&config));
-        let setup = MessagePreEstablishSetup {
+        let setup = MessagePreparation {
             state: Arc::clone(&state),
             recv_count: config.recv_count,
             mr_size: config.mr_size,
         };
         let connection = engine
-            .connect_with_setup(addr, config.connection, Box::new(setup))
+            .connect_with_setup(
+                addr,
+                config.connection,
+                Box::new(move |connection| setup.run(connection)),
+            )
             .await?;
         state.attach(&connection)?;
-        Ok(MessageTransport::from_engine(
-            connection,
-            state,
-            config.buffer_size,
-        ))
+        let driver = MessageTransportDriver::new(Arc::clone(&state), config.hello_deadline);
+        let transport = MessageTransport::from_engine(connection, state, config.buffer_size);
+        Ok((transport, driver))
     }
 
     /// Attach an inbound message transport to an engine-owned listener.
     ///
     /// This registers one message waiter in the listener's existing ordered
-    /// accept queue and returns no listener- or message-specific driver. The
+    /// accept queue and returns the frontend with its sole message driver. The
     /// full checked receive batch is accepted before `rdma_accept`.
-    pub async fn accept_on(self, listener: &RdmaListener) -> Result<MessageTransport> {
+    pub async fn accept_on(
+        self,
+        listener: &RdmaListener,
+    ) -> Result<(MessageTransport, MessageTransportDriver)> {
         let config = self.derive_engine_config()?;
         listener.validate_message_connection_config(&config.connection)?;
         let state = Arc::new(EngineMessageState::new(&config));
-        let setup = MessagePreEstablishSetup {
+        let setup = MessagePreparation {
             state: Arc::clone(&state),
             recv_count: config.recv_count,
             mr_size: config.mr_size,
         };
         let connection = listener
-            .accept_with_setup(config.connection, Box::new(setup))
+            .accept_with_setup(
+                config.connection,
+                Box::new(move |connection| setup.run(connection)),
+            )
             .await?;
         state.attach(&connection)?;
-        Ok(MessageTransport::from_engine(
-            connection,
-            state,
-            config.buffer_size,
-        ))
+        let driver = MessageTransportDriver::new(Arc::clone(&state), config.hello_deadline);
+        let transport = MessageTransport::from_engine(connection, state, config.buffer_size);
+        Ok((transport, driver))
     }
 }
 
@@ -361,10 +378,9 @@ struct EngineMessageConfig {
     recv_count: usize,
     buffer_size: usize,
     mr_size: usize,
+    hello_deadline: Duration,
     #[cfg(any(test, feature = "test-hooks"))]
     hello_override: Option<TestHelloOverride>,
-    #[cfg(any(test, feature = "test-hooks"))]
-    attach_hook: Option<TestHelloAttachHook>,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -389,172 +405,14 @@ pub enum TestSteadyFrame {
     TruncatedDataPayload,
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
-#[derive(Clone, Default)]
-#[doc(hidden)]
-pub struct TestHelloAttachHook {
-    inner: Arc<TestHelloAttachHookInner>,
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-#[derive(Default)]
-struct TestHelloAttachHookInner {
-    state: StdMutex<TestHelloAttachHookState>,
-    changed: Condvar,
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-#[derive(Default)]
-struct TestHelloAttachHookState {
-    ready_work_attached: bool,
-    hello_processed: bool,
-    released: bool,
-    message_state: Option<Weak<EngineMessageState>>,
-    hello_mr: Option<Mr>,
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-impl TestHelloAttachHook {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn wait_until_ready_work_attached(&self) -> Result<()> {
-        self.wait_until(
-            |state| state.ready_work_attached,
-            "message ready work attachment",
-        )
-    }
-
-    pub fn wait_until_hello_processed(&self) -> Result<()> {
-        self.wait_until(
-            |state| state.hello_processed,
-            "HELLO processing during message attachment",
-        )
-    }
-
-    pub fn deliver_hello(&self) -> Result<()> {
-        let (state, mut mr) = {
-            let mut hook = lock_std(&self.inner.state);
-            let state = hook
-                .message_state
-                .clone()
-                .and_then(|state| state.upgrade())
-                .ok_or_else(|| {
-                    Error::InvalidConfig(
-                        "message ready work is not attached for HELLO delivery".into(),
-                    )
-                })?;
-            let mr = hook.hello_mr.take().ok_or_else(|| {
-                Error::InvalidConfig("test HELLO receive MR is unavailable".into())
-            })?;
-            (state, mr)
-        };
-        if !state
-            .weak_self()
-            .upgrade()
-            .is_some_and(|self_state| Arc::ptr_eq(&self_state, &state))
-        {
-            return Err(Error::InvalidConfig(
-                "message self reference was not initialized before HELLO delivery".into(),
-            ));
-        }
-        drop(state.connection()?);
-        let len = protocol::write_hello_frame(
-            mr.as_mut_slice(),
-            u32::try_from(state.local_recv_capacity)
-                .map_err(|_| Error::InvalidConfig("test HELLO capacity overflow".into()))?,
-            u32::try_from(state.buffer_size)
-                .map_err(|_| Error::InvalidConfig("test HELLO size overflow".into()))?,
-        );
-        let mut completion = crate::wc::WorkCompletion::default();
-        completion.inner.status = rdma_io_sys::ibverbs::IBV_WC_SUCCESS;
-        completion.inner.opcode = rdma_io_sys::ibverbs::IBV_WC_RECV;
-        completion.inner.byte_len = u32::try_from(len)
-            .map_err(|_| Error::InvalidConfig("test HELLO length overflow".into()))?;
-        state.parse_hello_receive(&super::op::Completion::from_raw(completion), &mr)?;
-        self.record_hello_processed();
-        Ok(())
-    }
-
-    fn prepare_hello_mr(&self, mr: Mr) -> Result<()> {
-        let mut state = lock_std(&self.inner.state);
-        if state.hello_mr.is_some() {
-            return Err(Error::InvalidConfig(
-                "test HELLO receive MR is already prepared".into(),
-            ));
-        }
-        state.hello_mr = Some(mr);
-        Ok(())
-    }
-
-    pub fn release(&self) {
-        let mut state = lock_std(&self.inner.state);
-        state.released = true;
-        self.inner.changed.notify_all();
-    }
-
-    fn pause_after_ready_work_attach(&self, message_state: &Arc<EngineMessageState>) {
-        let mut state = lock_std(&self.inner.state);
-        state.message_state = Some(Arc::downgrade(message_state));
-        state.ready_work_attached = true;
-        self.inner.changed.notify_all();
-        while !state.released {
-            let (next, timeout) = self
-                .inner
-                .changed
-                .wait_timeout(state, Duration::from_secs(15))
-                .unwrap_or_else(|error| error.into_inner());
-            state = next;
-            if timeout.timed_out() {
-                state.released = true;
-            }
-        }
-    }
-
-    fn record_hello_processed(&self) {
-        let mut state = lock_std(&self.inner.state);
-        state.hello_processed = true;
-        self.inner.changed.notify_all();
-    }
-
-    fn wait_until(
-        &self,
-        mut predicate: impl FnMut(&TestHelloAttachHookState) -> bool,
-        description: &str,
-    ) -> Result<()> {
-        let mut state = lock_std(&self.inner.state);
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !predicate(&state) {
-            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
-                return Err(Error::InvalidConfig(format!(
-                    "timed out waiting for {description}"
-                )));
-            };
-            let (next, timeout) = self
-                .inner
-                .changed
-                .wait_timeout(state, remaining)
-                .unwrap_or_else(|error| error.into_inner());
-            state = next;
-            if timeout.timed_out() && !predicate(&state) {
-                return Err(Error::InvalidConfig(format!(
-                    "timed out waiting for {description}"
-                )));
-            }
-        }
-        Ok(())
-    }
-}
-
-struct MessagePreEstablishSetup {
+struct MessagePreparation {
     state: Arc<EngineMessageState>,
     recv_count: usize,
     mr_size: usize,
 }
 
-impl PreEstablishSetup for MessagePreEstablishSetup {
-    fn run(self: Box<Self>, connection: &RdmaConnection) -> Result<SetupSummary> {
+impl MessagePreparation {
+    fn run(self, connection: &RdmaConnection) -> Result<SetupSummary> {
         let total = self
             .recv_count
             .checked_add(protocol::CTRL_RECV_COUNT)
@@ -573,12 +431,6 @@ impl PreEstablishSetup for MessagePreEstablishSetup {
             connection.register_memory(protocol::HELLO_FRAME_SIZE, AccessIntent::LocalOnly)?;
         self.state
             .install_pools(data_sends, control_sends, hello_send)?;
-        #[cfg(any(test, feature = "test-hooks"))]
-        if let Some(hook) = self.state.attach_hook.as_ref() {
-            hook.prepare_hello_mr(
-                connection.register_memory(self.mr_size, AccessIntent::LocalOnly)?,
-            )?;
-        }
         let mut entries = Vec::with_capacity(total);
         for _ in 0..total {
             let mr = connection.register_memory(self.mr_size, AccessIntent::LocalOnly)?;
@@ -587,9 +439,6 @@ impl PreEstablishSetup for MessagePreEstablishSetup {
                 mr,
                 Box::new(move |completion| {
                     if let Some(state) = state.upgrade() {
-                        if let Some(error) = detached_completion_error(&completion) {
-                            state.fail_from_completion_callback(error);
-                        }
                         state.enqueue_event(EngineMessageEvent::Receive(completion));
                     } else {
                         // The callback owns the completion and its MR; dropping
@@ -858,6 +707,9 @@ struct EngineHandshake {
 
 enum EngineMessageEvent {
     Start,
+    Disconnected,
+    Terminal(Error),
+    Closed(Result<()>),
     HelloSend(DetachedOperationCompletion),
     Receive(DetachedOperationCompletion),
     Repost(Mr),
@@ -994,17 +846,15 @@ struct EngineMessageState {
     pools: OnceLock<EngineMessagePools>,
     handshake: StdMutex<EngineHandshake>,
     events: StdMutex<VecDeque<EngineMessageEvent>>,
+    driver_waker: AtomicWaker,
     received: StdMutex<VecDeque<CompletedRecv>>,
     recv_notify: Notify,
     pending_credit_returns: AtomicUsize,
-    close_connection_pending: AtomicBool,
     local_close_started: AtomicBool,
     link: OnceLock<EngineMessageLink>,
     self_weak: OnceLock<Weak<EngineMessageState>>,
     #[cfg(any(test, feature = "test-hooks"))]
     hello_override: Option<TestHelloOverride>,
-    #[cfg(any(test, feature = "test-hooks"))]
-    attach_hook: Option<TestHelloAttachHook>,
 }
 
 impl EngineMessageState {
@@ -1026,17 +876,15 @@ impl EngineMessageState {
                 hello_receive_complete: false,
             }),
             events: StdMutex::new(VecDeque::new()),
+            driver_waker: AtomicWaker::new(),
             received: StdMutex::new(VecDeque::new()),
             recv_notify: Notify::new(),
             pending_credit_returns: AtomicUsize::new(0),
-            close_connection_pending: AtomicBool::new(false),
             local_close_started: AtomicBool::new(false),
             link: OnceLock::new(),
             self_weak: OnceLock::new(),
             #[cfg(any(test, feature = "test-hooks"))]
             hello_override: config.hello_override,
-            #[cfg(any(test, feature = "test-hooks"))]
-            attach_hook: config.attach_hook.clone(),
         }
     }
 
@@ -1094,11 +942,7 @@ impl EngineMessageState {
                 connection: Arc::downgrade(&connection.state),
             })
             .map_err(|_| Error::InvalidConfig("message state attached more than once".into()))?;
-        connection.attach_ready_work(Arc::clone(self) as Arc<dyn ConnectionReadyWork>)?;
-        #[cfg(any(test, feature = "test-hooks"))]
-        if let Some(hook) = self.attach_hook.as_ref() {
-            hook.pause_after_ready_work_attach(self);
-        }
+        connection.attach_terminal_sink(Arc::clone(self) as Arc<dyn ConnectionTerminalSink>)?;
         self.enqueue_event(EngineMessageEvent::Start);
         Ok(())
     }
@@ -1108,10 +952,16 @@ impl EngineMessageState {
     }
 
     fn enqueue_event(&self, event: EngineMessageEvent) {
+        let terminal_notice = matches!(
+            &event,
+            EngineMessageEvent::Disconnected
+                | EngineMessageEvent::Terminal(_)
+                | EngineMessageEvent::Closed(_)
+        );
         let mut event = Some(event);
         {
             let mut events = lock_std(&self.events);
-            if self.state.load(Ordering::Acquire) < STATE_CLOSING {
+            if terminal_notice || self.state.load(Ordering::Acquire) < STATE_CLOSING {
                 events.push_back(event.take().expect("event is present"));
             }
         }
@@ -1125,6 +975,9 @@ impl EngineMessageState {
     fn dispose_terminal_event(&self, event: EngineMessageEvent) {
         match event {
             EngineMessageEvent::Start => {}
+            EngineMessageEvent::Disconnected
+            | EngineMessageEvent::Terminal(_)
+            | EngineMessageEvent::Closed(_) => {}
             EngineMessageEvent::HelloSend(completion)
             | EngineMessageEvent::Receive(completion)
             | EngineMessageEvent::ControlSendComplete(completion) => match completion {
@@ -1167,14 +1020,7 @@ impl EngineMessageState {
     }
 
     fn publish(&self) {
-        let Some(link) = self.link.get() else {
-            return;
-        };
-        let (Some(shared), Some(connection)) = (link.shared.upgrade(), link.connection.upgrade())
-        else {
-            return;
-        };
-        shared.publish_connection_ready(&connection);
+        self.driver_waker.wake();
     }
 
     fn enter_failed(&self, error: Error) -> bool {
@@ -1208,19 +1054,6 @@ impl EngineMessageState {
         {
             shared.begin_connection_close(&connection);
         }
-    }
-
-    fn fail_from_completion_callback(&self, error: Error) {
-        if self.state.load(Ordering::Acquire) >= STATE_CLOSING
-            && matches!(error, Error::TransportClosed)
-        {
-            return;
-        }
-        if !self.enter_failed(error) {
-            return;
-        }
-        self.close_connection_pending.store(true, Ordering::Release);
-        self.publish();
     }
 
     fn terminal_error(&self) -> Error {
@@ -1286,6 +1119,9 @@ impl EngineMessageState {
     fn process_event(&self, event: EngineMessageEvent) {
         match event {
             EngineMessageEvent::Start => self.start_hello_send(),
+            EngineMessageEvent::Disconnected => self.fail(Error::TransportClosed, true),
+            EngineMessageEvent::Terminal(error) => self.fail(error, false),
+            EngineMessageEvent::Closed(result) => self.finish_close(&result),
             EngineMessageEvent::HelloSend(completion) => match completion {
                 DetachedOperationCompletion::Unaccepted { error, mr } => {
                     drop(mr);
@@ -1451,9 +1287,6 @@ impl EngineMessageState {
             mr,
             Box::new(move |completion| {
                 if let Some(state) = state.upgrade() {
-                    if let Some(error) = detached_completion_error(&completion) {
-                        state.fail_from_completion_callback(error);
-                    }
                     state.enqueue_event(EngineMessageEvent::Receive(completion));
                 } else {
                     // Completion callback ownership includes the receive MR.
@@ -1519,11 +1352,6 @@ impl EngineMessageState {
                     frame_len,
                     Box::new(move |completion| {
                         if let Some(state) = state.upgrade() {
-                            if let Some(error) = detached_completion_error(&completion)
-                                && !matches!(error, Error::CapacityExhausted)
-                            {
-                                state.fail_from_completion_callback(error);
-                            }
                             state.enqueue_event(EngineMessageEvent::SendComplete {
                                 request: callback_request,
                                 completion,
@@ -1644,9 +1472,6 @@ impl EngineMessageState {
             frame_len,
             Box::new(move |completion| {
                 if let Some(state) = state.upgrade() {
-                    if let Some(error) = detached_completion_error(&completion) {
-                        state.fail_from_completion_callback(error);
-                    }
                     state.enqueue_event(EngineMessageEvent::ControlSendComplete(completion));
                 } else {
                     drop(completion);
@@ -1793,9 +1618,6 @@ impl EngineMessageState {
             len,
             Box::new(move |completion| {
                 if let Some(state) = state.upgrade() {
-                    if let Some(error) = detached_completion_error(&completion) {
-                        state.fail_from_completion_callback(error);
-                    }
                     state.enqueue_event(EngineMessageEvent::HelloSend(completion));
                 }
             }),
@@ -1844,9 +1666,6 @@ impl EngineMessageState {
             mr,
             Box::new(move |completion| {
                 if let Some(state) = state.upgrade() {
-                    if let Some(error) = detached_completion_error(&completion) {
-                        state.fail_from_completion_callback(error);
-                    }
                     state.enqueue_event(EngineMessageEvent::Receive(completion));
                 } else {
                     // Completion callback ownership includes the receive MR.
@@ -1863,10 +1682,6 @@ impl EngineMessageState {
             .store(peer_capacity, Ordering::Release);
         self.remote_credits.add_permits(peer_capacity);
         lock_std(&self.handshake).hello_receive_complete = true;
-        #[cfg(any(test, feature = "test-hooks"))]
-        if let Some(hook) = self.attach_hook.as_ref() {
-            hook.record_hello_processed();
-        }
         self.try_mark_ready();
     }
 
@@ -1913,23 +1728,19 @@ impl EngineMessageState {
     }
 }
 
-impl ConnectionReadyWork for EngineMessageState {
-    fn process(&self, budget: usize) -> usize {
+impl EngineMessageState {
+    fn process(&self, budget: usize, prefer_credit: &mut bool) -> usize {
         let mut processed = 0;
         while processed < budget {
-            if self.close_connection_pending.swap(false, Ordering::AcqRel) {
-                if let Some(link) = self.link.get()
-                    && let (Some(shared), Some(connection)) =
-                        (link.shared.upgrade(), link.connection.upgrade())
-                {
-                    shared.begin_connection_close(&connection);
-                }
+            if *prefer_credit && self.flush_one_credit() {
+                *prefer_credit = false;
                 processed += 1;
                 continue;
             }
             let event = { lock_std(&self.events).pop_front() };
             if let Some(event) = event {
                 self.process_event(event);
+                *prefer_credit = true;
             } else if !self.flush_one_credit() {
                 break;
             }
@@ -1939,8 +1750,7 @@ impl ConnectionReadyWork for EngineMessageState {
     }
 
     fn has_work(&self) -> bool {
-        self.close_connection_pending.load(Ordering::Acquire)
-            || !lock_std(&self.events).is_empty()
+        !lock_std(&self.events).is_empty()
             || (self.pending_credit_returns.load(Ordering::Acquire) != 0
                 && self
                     .pools
@@ -1957,38 +1767,113 @@ impl ConnectionReadyWork for EngineMessageState {
         }
     }
 
+    fn driver_result(&self) -> Option<Result<()>> {
+        match self.state.load(Ordering::Acquire) {
+            STATE_STOPPED => Some(Ok(())),
+            STATE_FAILED => Some(Err(self.terminal_error())),
+            _ => None,
+        }
+    }
+}
+
+impl ConnectionTerminalSink for EngineMessageState {
     fn disconnected(&self) {
-        self.fail(Error::TransportClosed, true);
+        self.enqueue_event(EngineMessageEvent::Disconnected);
     }
 
     fn terminalize(&self, error: Error) {
-        self.fail(error, false);
+        self.enqueue_event(EngineMessageEvent::Terminal(error));
+    }
+
+    fn closed(&self, result: Result<()>) {
+        self.enqueue_event(EngineMessageEvent::Closed(result));
     }
 }
 
-#[cfg(test)]
-#[derive(Clone)]
-pub(crate) struct TestEngineHelloDeadlineState {
+/// Explicit per-connection message-protocol progress driver.
+///
+/// The application must poll or spawn exactly one driver returned alongside
+/// each [`MessageTransport`]. The library never spawns this future. It owns
+/// HELLO, DATA, CREDIT, receive reposting, message-local fairness, pools, and
+/// message lifecycle; shared CQ/CM progress and safe QP teardown remain with
+/// [`super::RdmaEngineDriver`].
+#[must_use = "message protocol progress requires polling or spawning the driver"]
+pub struct MessageTransportDriver {
     state: Arc<EngineMessageState>,
+    hello_deadline: Duration,
+    hello_sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+    runtime_checked: bool,
+    prefer_credit: bool,
+    completed: bool,
 }
 
-#[cfg(test)]
-impl TestEngineHelloDeadlineState {
-    pub(crate) fn new() -> Self {
-        let config = MessageTransportBuilder::new()
-            .derive_engine_config()
-            .expect("default message config");
+impl MessageTransportDriver {
+    fn new(state: Arc<EngineMessageState>, hello_deadline: Duration) -> Self {
         Self {
-            state: Arc::new(EngineMessageState::new(&config)),
+            state,
+            hello_deadline,
+            hello_sleep: None,
+            runtime_checked: false,
+            prefer_credit: false,
+            completed: false,
         }
     }
+}
 
-    pub(crate) fn ready_work(&self) -> Arc<dyn ConnectionReadyWork> {
-        Arc::clone(&self.state) as Arc<dyn ConnectionReadyWork>
+impl Future for MessageTransportDriver {
+    type Output = Result<()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if let Some(result) = this.state.driver_result() {
+            this.completed = true;
+            return Poll::Ready(result);
+        }
+        if !this.runtime_checked {
+            if let Err(error) = preflight_driver_runtime() {
+                this.state.fail(error.clone(), true);
+                this.completed = true;
+                return Poll::Ready(Err(error));
+            }
+            this.runtime_checked = true;
+        }
+        if this.state.state.load(Ordering::Acquire) == STATE_CREATED {
+            if this.hello_sleep.is_none() {
+                this.hello_sleep = Some(Box::pin(tokio::time::sleep(this.hello_deadline)));
+            }
+            if this
+                .hello_sleep
+                .as_mut()
+                .is_some_and(|sleep| sleep.as_mut().poll(cx).is_ready())
+            {
+                this.hello_sleep = None;
+                this.state.deadline_expired();
+            }
+        } else {
+            this.hello_sleep = None;
+        }
+
+        this.state
+            .process(MESSAGE_DRIVER_BUDGET, &mut this.prefer_credit);
+        if let Some(result) = this.state.driver_result() {
+            this.completed = true;
+            return Poll::Ready(result);
+        }
+
+        let observed_work = this.state.has_work();
+        this.state.driver_waker.register(cx.waker());
+        if observed_work || this.state.has_work() {
+            cx.waker().wake_by_ref();
+        }
+        Poll::Pending
     }
+}
 
-    pub(crate) async fn ready(&self) -> Result<()> {
-        self.state.ready().await
+impl Drop for MessageTransportDriver {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.state.fail(Error::DriverShutdown, true);
+        }
     }
 }
 
@@ -2026,8 +1911,9 @@ fn validate_peer_hello(hello: protocol::HelloPayload, local_buffer_size: usize) 
 ///
 /// # Task Count
 ///
-/// Message transport adds zero tasks beyond the engine driver. `send()` and
-/// `recv()` run in the caller's task context.
+/// Setup returns one [`MessageTransportDriver`] that the application must poll
+/// or explicitly spawn. `send()` and `recv()` run in the caller's task context;
+/// the library creates no task.
 ///
 /// # Cancellation Safety
 ///
@@ -2137,12 +2023,6 @@ impl MessageTransport {
     #[doc(hidden)]
     pub fn test_connection(&self) -> Result<RdmaConnection> {
         Ok(self.connection.clone())
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[doc(hidden)]
-    pub fn test_pending_ready_work(&self) -> Result<usize> {
-        Ok(lock_std(&self.state.events).len())
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -2393,9 +2273,6 @@ mod setup_tests {
 #[cfg(test)]
 mod hello_tests {
     use super::*;
-    use crate::v2::engine::{
-        DEFAULT_MESSAGE_HELLO_DEADLINE, MAX_MESSAGE_HELLO_DEADLINE, MIN_MESSAGE_HELLO_DEADLINE,
-    };
     use std::sync::Barrier;
 
     fn hello(capacity: u32, maximum: u32) -> protocol::HelloPayload {
@@ -2428,17 +2305,41 @@ mod hello_tests {
     #[tokio::test(start_paused = true)]
     async fn hello_timeout_is_contextual_and_wakes_ready_waiters() {
         let config = MessageTransportBuilder::new()
+            .hello_deadline(Duration::from_secs(1))
             .derive_engine_config()
             .unwrap();
         let state = Arc::new(EngineMessageState::new(&config));
         let ready_state = Arc::clone(&state);
         let ready = tokio::spawn(async move { ready_state.ready().await });
+        let driver = MessageTransportDriver::new(Arc::clone(&state), config.hello_deadline);
+        let driver = tokio::spawn(driver);
         tokio::task::yield_now().await;
-        state.deadline_expired();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let driver_error = driver.await.unwrap().unwrap_err();
+        assert!(matches!(
+            driver_error,
+            Error::ProtocolViolation(ref message) if message == "HELLO handshake timeout"
+        ));
         let error = ready.await.unwrap().unwrap_err();
         assert!(matches!(
             error,
             Error::ProtocolViolation(message) if message == "HELLO handshake timeout"
+        ));
+    }
+
+    #[test]
+    fn message_driver_reports_missing_runtime_without_panicking() {
+        let config = MessageTransportBuilder::new()
+            .derive_engine_config()
+            .unwrap();
+        let state = Arc::new(EngineMessageState::new(&config));
+        let mut driver = MessageTransportDriver::new(state, config.hello_deadline);
+        let waker = futures_util::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(
+            Pin::new(&mut driver).poll(&mut cx),
+            Poll::Ready(Err(Error::InvalidConfig(message)))
+                if message.contains("active Tokio runtime")
         ));
     }
 
@@ -2478,18 +2379,6 @@ mod hello_tests {
             state.fail(Error::ProtocolViolation("late failure".into()), false);
             assert_eq!(state.state.load(Ordering::Acquire), terminal);
         }
-    }
-}
-
-fn detached_completion_error(completion: &DetachedOperationCompletion) -> Option<Error> {
-    match completion {
-        DetachedOperationCompletion::Unaccepted { error, .. } => {
-            Some(normalize_message_completion_error(error.clone()))
-        }
-        DetachedOperationCompletion::Completed {
-            result: Err(error), ..
-        } => Some(normalize_message_completion_error(error.clone())),
-        DetachedOperationCompletion::Completed { result: Ok(_), .. } => None,
     }
 }
 
@@ -2544,6 +2433,8 @@ mod tests {
         tokio::task::yield_now().await;
 
         state.terminalize(Error::ProtocolViolation("steady-state failure".into()));
+        let mut prefer_credit = false;
+        assert_eq!(state.process(1, &mut prefer_credit), 1);
         assert!(matches!(
             ready.await.unwrap(),
             Err(Error::ProtocolViolation(message)) if message == "steady-state failure"
@@ -2562,15 +2453,16 @@ mod tests {
     fn disconnected_engine_message_state_is_connection_local_terminal() {
         let state = engine_state();
         state.disconnected();
+        let mut prefer_credit = false;
+        assert_eq!(state.process(1, &mut prefer_credit), 1);
         assert_eq!(state.state.load(Ordering::Acquire), STATE_FAILED);
         assert!(matches!(state.terminal_error(), Error::TransportClosed));
     }
 
     #[test]
-    fn completion_failure_terminalizes_before_older_ready_work_can_post() {
+    fn completion_failure_is_terminalized_by_the_message_driver() {
         let state = engine_state();
         state.state.store(STATE_READY, Ordering::Release);
-        lock_std(&state.events).push_back(EngineMessageEvent::Start);
 
         let completion = DetachedOperationCompletion::Completed {
             result: Err(Error::CompletionError {
@@ -2579,16 +2471,13 @@ mod tests {
             }),
             mr: None,
         };
-        let error = detached_completion_error(&completion).unwrap();
-        state.fail_from_completion_callback(error);
         state.enqueue_event(EngineMessageEvent::Receive(completion));
 
+        assert_eq!(state.state.load(Ordering::Acquire), STATE_READY);
+        let mut prefer_credit = false;
+        assert_eq!(state.process(1, &mut prefer_credit), 1);
         assert_eq!(state.state.load(Ordering::Acquire), STATE_FAILED);
         assert!(matches!(state.terminal_error(), Error::TransportClosed));
-        assert!(lock_std(&state.events).is_empty());
-        assert!(state.close_connection_pending.load(Ordering::Acquire));
-        assert_eq!(state.process(1), 1);
-        assert!(!state.close_connection_pending.load(Ordering::Acquire));
     }
 
     // ── Credit Validation Unit Tests ──────────────────────────────────
@@ -2714,6 +2603,7 @@ mod tests {
         assert_eq!(builder.recv_buffer_count, 32);
         assert_eq!(builder.send_buffer_count, 16);
         assert_eq!(builder.buffer_size, 64 * 1024);
+        assert_eq!(builder.hello_deadline, Duration::from_secs(10));
         assert!(builder.connection_config.is_none());
     }
 
@@ -2733,6 +2623,28 @@ mod tests {
     fn test_builder_validation_zero_size() {
         let builder = MessageTransportBuilder::new().buffer_size(0);
         assert!(builder.validate().is_err());
+    }
+
+    #[test]
+    fn test_builder_validation_hello_deadline_bounds() {
+        assert!(
+            MessageTransportBuilder::new()
+                .hello_deadline(Duration::ZERO)
+                .validate()
+                .is_err()
+        );
+        assert!(
+            MessageTransportBuilder::new()
+                .hello_deadline(MAX_MESSAGE_HELLO_DEADLINE + Duration::from_nanos(1))
+                .validate()
+                .is_err()
+        );
+        assert!(
+            MessageTransportBuilder::new()
+                .hello_deadline(MIN_MESSAGE_HELLO_DEADLINE)
+                .validate()
+                .is_ok()
+        );
     }
 
     #[test]

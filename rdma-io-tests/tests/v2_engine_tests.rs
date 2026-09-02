@@ -58,7 +58,13 @@ async fn establish_message_pair(
     engine: &RdmaEngine,
     listener: &rdma_io::v2::RdmaListener,
     address: std::net::SocketAddr,
-) -> (Arc<MessageTransport>, Arc<MessageTransport>) {
+) -> (
+    (Arc<MessageTransport>, Arc<MessageTransport>),
+    (
+        tokio::task::JoinHandle<rdma_io::v2::Result<()>>,
+        tokio::task::JoinHandle<rdma_io::v2::Result<()>>,
+    ),
+) {
     let (server, client) = tokio::time::timeout(Duration::from_secs(15), async {
         tokio::join!(
             message_builder().accept_on(listener),
@@ -67,12 +73,16 @@ async fn establish_message_pair(
     })
     .await
     .expect("message establishment timed out");
-    let server = Arc::new(server.unwrap());
-    let client = Arc::new(client.unwrap());
+    let (server, server_driver) = server.unwrap();
+    let (client, client_driver) = client.unwrap();
+    let server_driver = tokio::spawn(server_driver);
+    let client_driver = tokio::spawn(client_driver);
+    let server = Arc::new(server);
+    let client = Arc::new(client);
     let (server_ready, client_ready) = tokio::join!(server.ready(), client.ready());
     server_ready.unwrap();
     client_ready.unwrap();
-    (server, client)
+    ((server, client), (server_driver, client_driver))
 }
 
 async fn bidirectional_low_level(server: &RdmaConnection, client: &RdmaConnection) {
@@ -254,8 +264,11 @@ async fn run_mode(mode: CompletionMode) {
     let address = connect_addr_for(Some(listener.local_addr().unwrap()));
 
     let mut pairs = Vec::new();
+    let mut message_drivers = Vec::new();
     for _ in 0..8 {
-        pairs.push(establish_message_pair(&engine, &listener, address).await);
+        let (pair, drivers) = establish_message_pair(&engine, &listener, address).await;
+        pairs.push(pair);
+        message_drivers.push(drivers);
     }
     let (low_server, low_client) = tokio::time::timeout(Duration::from_secs(15), async {
         tokio::join!(listener.accept(), engine.connect(address))
@@ -406,6 +419,20 @@ async fn run_mode(mode: CompletionMode) {
         } else {
             assert_clean(server_close);
             assert_clean(client_close);
+        }
+    }
+    for (server_driver, client_driver) in message_drivers {
+        let (server_result, client_result) = tokio::join!(server_driver, client_driver);
+        let server_result = server_result.expect("server message driver task panicked");
+        let client_result = client_result.expect("client message driver task panicked");
+        for result in [server_result, client_result] {
+            assert!(
+                matches!(
+                    result,
+                    Ok(()) | Err(Error::TransportClosed) | Err(Error::ProtocolViolation(_))
+                ),
+                "unexpected message-driver terminal result: {result:?}"
+            );
         }
     }
     listener.close().await.unwrap();

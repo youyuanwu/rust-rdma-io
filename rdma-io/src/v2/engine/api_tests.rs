@@ -1,4 +1,3 @@
-use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -7,18 +6,7 @@ use std::task::{Context as TaskContext, Poll, RawWaker, RawWakerVTable, Waker};
 use super::*;
 use crate::v2::engine::connection::{WorkRequestPoster, install_connection};
 use crate::v2::qp::{BatchPostOutcome, QpCapabilities};
-use crate::v2::{AccessIntent, Completion, Mr};
 use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
-
-fn assert_engine_traits<T: Clone + Send + Sync + 'static>() {}
-fn assert_driver_traits<T: Future<Output = Result<()>> + Send + 'static>() {}
-fn assert_operation_traits<
-    T: Future<Output = (Result<Completion>, Option<Mr>)> + Send + 'static,
->() {
-}
-fn assert_connect_future<T: Future<Output = Result<RdmaConnection>> + Send>(_: T) {}
-fn assert_listen_future<T: Future<Output = Result<RdmaListener>> + Send>(_: T) {}
-fn assert_accept_future<T: Future<Output = Result<RdmaConnection>> + Send>(_: T) {}
 
 struct CountingWaker(AtomicUsize);
 
@@ -54,62 +42,6 @@ impl CountingWaker {
         let raw = RawWaker::new(Arc::into_raw(Arc::clone(self)).cast(), &VTABLE);
         unsafe { Waker::from_raw(raw) }
     }
-}
-
-#[test]
-fn exact_public_types_and_traits_compile() {
-    assert_engine_traits::<RdmaEngine>();
-    assert_engine_traits::<RdmaListener>();
-    assert_driver_traits::<RdmaEngineDriver>();
-    assert_operation_traits::<RdmaOperation>();
-
-    let _: fn(&RdmaEngine) -> RdmaEngineDiagnostics = RdmaEngine::diagnostics;
-    let _: Result<(RdmaEngine, RdmaEngineDriver)> =
-        Err(Error::InvalidConfig("signature check".into()));
-
-    let config = RdmaConnectionConfig::default();
-    assert_eq!(config.max_send_wr, 19);
-    assert_eq!(config.max_recv_wr, 34);
-    assert_eq!(
-        RdmaListenerConfig::default().backlog_capacity(),
-        listener::DEFAULT_LISTENER_BACKLOG
-    );
-
-    let connection = Error::ConnectionQuarantined {
-        outstanding_operations: 1,
-        cq_debt: 1,
-    };
-    assert!(matches!(connection, Error::ConnectionQuarantined { .. }));
-    let destroy = Error::ConnectionDestroyQuarantined {
-        cause: "provider busy".into(),
-    };
-    assert!(matches!(
-        destroy,
-        Error::ConnectionDestroyQuarantined { .. }
-    ));
-    let engine = Error::EngineWedged {
-        retained_bundles: 1,
-        outstanding_operations: 1,
-        cq_debt: 1,
-    };
-    assert!(matches!(engine, Error::EngineWedged { .. }));
-
-    let _: fn(&RdmaConnection, usize, AccessIntent) -> Result<Mr> = RdmaConnection::register_memory;
-    let _: fn(&RdmaConnection, Mr, Option<(usize, usize)>) -> RdmaOperation = RdmaConnection::send;
-    let _: fn(&RdmaConnection, Mr, Option<(usize, usize)>) -> RdmaOperation = RdmaConnection::recv;
-    let _: fn(&RdmaConnection) -> RdmaConnectionIdentity = RdmaConnection::identity;
-
-    fn check_connect_methods(engine: &RdmaEngine, address: std::net::SocketAddr) {
-        assert_connect_future(engine.connect(address));
-        assert_connect_future(engine.connect_with_config(address, RdmaConnectionConfig::default()));
-        assert_listen_future(engine.listen(address, RdmaListenerConfig::default()));
-    }
-    fn check_accept_methods(listener: &RdmaListener) {
-        assert_accept_future(listener.accept());
-        assert_accept_future(listener.accept_with_config(RdmaConnectionConfig::default()));
-    }
-    let _ = check_connect_methods;
-    let _ = check_accept_methods;
 }
 
 #[test]

@@ -6,6 +6,7 @@ use rdma_io::v2::{
     RdmaEngineLifecycle, RdmaListenerConfig,
 };
 use rdma_io::wc::WcOpcode;
+use rdma_io_tests::engine_test_helpers::DrivenMessageTransport;
 use rdma_io_tests::test_helpers::{connect_addr_for, has_software_rdma};
 
 fn software_device_name() -> Option<String> {
@@ -154,8 +155,10 @@ async fn assert_routing_and_destroy_fallback_metrics(mode: CompletionMode) {
             .buffer_size(128)
             .connect_on(&engine, address)
     );
-    let server = server.unwrap();
-    let client = client.unwrap();
+    let (server, server_driver) = server.unwrap();
+    let (client, client_driver) = client.unwrap();
+    let server = DrivenMessageTransport::new(server, server_driver);
+    let client = DrivenMessageTransport::new(client, client_driver);
     let (server_ready, client_ready) = tokio::join!(server.ready(), client.ready());
     server_ready.unwrap();
     client_ready.unwrap();
@@ -294,9 +297,10 @@ async fn assert_routing_and_destroy_fallback_metrics(mode: CompletionMode) {
     client.close().await.unwrap();
 
     drop(connection);
-    drop(client);
+    let client = Arc::try_unwrap(client).ok().expect("single client owner");
+    let _ = client.shutdown().await;
     assert!(matches!(
-        server.close().await,
+        server.shutdown().await,
         Ok(()) | Err(Error::TransportClosed)
     ));
     listener.close().await.unwrap();

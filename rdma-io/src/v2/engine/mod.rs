@@ -55,10 +55,6 @@ use tokio::sync::Notify;
 
 use config::EngineConfig;
 pub use config::{CompletionMode, RdmaConnectionConfig};
-#[cfg(test)]
-pub(crate) use config::{
-    DEFAULT_MESSAGE_HELLO_DEADLINE, MAX_MESSAGE_HELLO_DEADLINE, MIN_MESSAGE_HELLO_DEADLINE,
-};
 use connection::ConnectionAdmissionPool;
 pub(crate) use connection::ConnectionState;
 pub use connection::{RdmaConnection, RdmaConnectionIdentity};
@@ -68,12 +64,13 @@ pub use diagnostics::{
     RdmaListenerDiagnostics,
 };
 use driver::WorkSignal;
+pub(crate) use driver::preflight_driver_runtime;
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
 pub use driver::{
     TestAcceptedOperation, TestAdmissionBarrier, TestConnectionCqeSuppression, TestContextIdentity,
     TestCqArmWindowControl, TestCqeSuppression, TestEngineInstrumentation, TestEngineQp,
-    TestEngineResources, TestProviderLimits, TestReadyWorkControl, TestRouteHandle,
+    TestEngineResources, TestProviderLimits, TestRouteHandle,
 };
 use lifecycle::MemoizedTerminalResult;
 pub use listener::{RdmaListener, RdmaListenerConfig};
@@ -89,16 +86,12 @@ use scheduler::{DeadlineKind, DeadlineRequest};
 
 use super::error::{Error, Result};
 
-pub(crate) trait PreEstablishSetup: Send {
-    fn run(self: Box<Self>, connection: &RdmaConnection) -> Result<SetupSummary>;
-}
+pub(crate) type ConnectionSetup = Box<dyn FnOnce(&RdmaConnection) -> Result<SetupSummary> + Send>;
 
-pub(crate) trait ConnectionReadyWork: Send + Sync {
-    fn process(&self, budget: usize) -> usize;
-    fn has_work(&self) -> bool;
-    fn deadline_expired(&self);
+pub(crate) trait ConnectionTerminalSink: Send + Sync {
     fn disconnected(&self);
     fn terminalize(&self, error: Error);
+    fn closed(&self, result: Result<()>);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -218,12 +211,6 @@ impl RdmaEngineBuilder {
     /// Set the engine shutdown deadline in `1 millisecond..=10 minutes`.
     pub fn shutdown_deadline(mut self, value: Duration) -> Self {
         self.config.shutdown_deadline = value;
-        self
-    }
-
-    /// Set the message HELLO deadline in `1 millisecond..=5 minutes`.
-    pub fn message_hello_deadline(mut self, value: Duration) -> Self {
-        self.config.hello_deadline = value;
         self
     }
 
@@ -350,7 +337,7 @@ impl RdmaEngine {
         &self,
         address: std::net::SocketAddr,
         config: RdmaConnectionConfig,
-        setup: Box<dyn PreEstablishSetup>,
+        setup: ConnectionSetup,
     ) -> Result<RdmaConnection> {
         cm::connect_with_setup(Arc::clone(&self.shared), address, config, setup).await
     }
@@ -400,7 +387,9 @@ impl Drop for RdmaEngine {
 /// Sole progress future for an [`RdmaEngine`].
 ///
 /// The driver performs bounded rotating service across terminal/control, CM,
-/// CQ, reclamation/deadline, and ready-connection work. Readiness mode sleeps
+/// CQ, reclamation/deadline, and per-connection completion dispatch. Message
+/// protocol work belongs to [`crate::v2::MessageTransportDriver`]. Readiness
+/// mode sleeps
 /// only on registered event sources and published software work; polling mode
 /// performs one bounded nonblocking iteration followed by a cooperative yield.
 /// Dropping the driver publishes a terminal failure and wakes observed waiters.
