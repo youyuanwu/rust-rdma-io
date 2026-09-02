@@ -365,6 +365,124 @@ fn unresolved_neighbor_addr() -> std::net::SocketAddr {
     std::net::SocketAddr::from((std::net::Ipv4Addr::from(octets), 9))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreShutdownState {
+    Pending,
+    // The initial manual driver poll consumed setup progress such as
+    // AddrResolved, but the route is still establishing and no failure won.
+    SetupProgress,
+    AddrErrorWon,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TerminalLedger {
+    pre_shutdown_state: PreShutdownState,
+    connect_is_addr_error: bool,
+    connect_is_shutdown: bool,
+    cm_events_processed: u64,
+    connections_failed: u64,
+    live: usize,
+    establishing: usize,
+    pending_routes: usize,
+    retained_owners: usize,
+    rejected: u64,
+    stale: u64,
+    duplicate: u64,
+    unknown: u64,
+    wrong_id: u64,
+    unexpected: u64,
+}
+
+fn classify_pre_shutdown_ledger(
+    cm_events_processed: u64,
+    connections_failed: u64,
+    live: usize,
+    establishing: usize,
+) -> Option<PreShutdownState> {
+    match (cm_events_processed, connections_failed, live, establishing) {
+        (0, 0, 1, 1) => Some(PreShutdownState::Pending),
+        (1, 0, 1, 1) => Some(PreShutdownState::SetupProgress),
+        (1, 1, 0, 0) => Some(PreShutdownState::AddrErrorWon),
+        _ => None,
+    }
+}
+
+fn is_allowed_terminal_ledger(ledger: &TerminalLedger) -> bool {
+    match ledger {
+        TerminalLedger {
+            pre_shutdown_state: PreShutdownState::AddrErrorWon,
+            connect_is_addr_error: true,
+            connect_is_shutdown: false,
+            cm_events_processed: 1,
+            connections_failed: 1,
+            live: 0,
+            establishing: 0,
+            pending_routes: 0,
+            retained_owners: 0,
+            rejected: 0,
+            stale: 0,
+            duplicate: 0,
+            unknown: 0,
+            wrong_id: 0,
+            unexpected: 0,
+        } => true,
+        TerminalLedger {
+            pre_shutdown_state: PreShutdownState::Pending,
+            connect_is_addr_error: false,
+            connect_is_shutdown: true,
+            cm_events_processed: 0,
+            connections_failed: 0,
+            live: 0,
+            establishing: 0,
+            pending_routes: 0,
+            retained_owners: 0,
+            rejected: 0,
+            stale: 0,
+            duplicate: 0,
+            unknown: 0,
+            wrong_id: 0,
+            unexpected: 0,
+        } => true,
+        // Setup progress may arrive after a Pending snapshot but before
+        // shutdown cancels the route.
+        TerminalLedger {
+            pre_shutdown_state: PreShutdownState::Pending,
+            connect_is_addr_error: false,
+            connect_is_shutdown: true,
+            cm_events_processed: 1,
+            connections_failed: 0,
+            live: 0,
+            establishing: 0,
+            pending_routes: 0,
+            retained_owners: 0,
+            rejected: 0,
+            stale: 0,
+            duplicate: 0,
+            unknown: 0,
+            wrong_id: 0,
+            unexpected: 0,
+        } => true,
+        TerminalLedger {
+            pre_shutdown_state: PreShutdownState::SetupProgress,
+            connect_is_addr_error: false,
+            connect_is_shutdown: true,
+            cm_events_processed: 1,
+            connections_failed: 0,
+            live: 0,
+            establishing: 0,
+            pending_routes: 0,
+            retained_owners: 0,
+            rejected: 0,
+            stale: 0,
+            duplicate: 0,
+            unknown: 0,
+            wrong_id: 0,
+            unexpected: 0,
+        } => true,
+        _ => false,
+    }
+}
+
 async fn run_readiness_shutdown_after_addr_error() {
     if !has_software_rdma() {
         return;
@@ -397,39 +515,19 @@ async fn run_readiness_shutdown_after_addr_error() {
     assert_eq!(before_shutdown.connections_admitted, 1);
     assert_eq!(before_shutdown.free_connection_slots, 1);
     assert_eq!(before_shutdown.cm_events_rejected, 0);
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum PreShutdownState {
-        Pending,
-        AddrErrorWon,
-    }
-    #[derive(Debug, PartialEq, Eq)]
-    struct TerminalLedger {
-        pre_shutdown_state: PreShutdownState,
-        connect_is_addr_error: bool,
-        connect_is_shutdown: bool,
-        cm_events_processed: u64,
-        connections_failed: u64,
-        live: usize,
-        establishing: usize,
-        pending_routes: usize,
-        retained_owners: usize,
-        rejected: u64,
-        stale: u64,
-        duplicate: u64,
-        unknown: u64,
-        wrong_id: u64,
-        unexpected: u64,
-    }
-    let pre_shutdown_state = match (
+    let pre_shutdown_ledger = (
         before_shutdown.cm_events_processed,
         before_shutdown.connections_failed,
         before_shutdown.live_connection_reservations,
         before_shutdown.establishing_connection_reservations,
-    ) {
-        (0, 0, 1, 1) => PreShutdownState::Pending,
-        (1, 1, 0, 0) => PreShutdownState::AddrErrorWon,
-        ledger => panic!("invalid pre-shutdown ADDR_ERROR ledger: {ledger:?}"),
-    };
+    );
+    let pre_shutdown_state = classify_pre_shutdown_ledger(
+        pre_shutdown_ledger.0,
+        pre_shutdown_ledger.1,
+        pre_shutdown_ledger.2,
+        pre_shutdown_ledger.3,
+    )
+    .unwrap_or_else(|| panic!("invalid pre-shutdown ADDR_ERROR ledger: {pre_shutdown_ledger:?}"));
 
     let mut shutdown = Box::pin(engine.shutdown());
     assert!(
@@ -511,64 +609,10 @@ async fn run_readiness_shutdown_after_addr_error() {
         wrong_id: diagnostics.wrong_id_cm_events,
         unexpected: diagnostics.unexpected_cm_events,
     };
-    match terminal_ledger {
-        TerminalLedger {
-            pre_shutdown_state: PreShutdownState::AddrErrorWon,
-            connect_is_addr_error: true,
-            connect_is_shutdown: false,
-            cm_events_processed: 1,
-            connections_failed: 1,
-            live: 0,
-            establishing: 0,
-            pending_routes: 0,
-            retained_owners: 0,
-            rejected: 0,
-            stale: 0,
-            duplicate: 0,
-            unknown: 0,
-            wrong_id: 0,
-            unexpected: 0,
-        }
-        | TerminalLedger {
-            pre_shutdown_state: PreShutdownState::Pending,
-            connect_is_addr_error: false,
-            connect_is_shutdown: true,
-            cm_events_processed: 0,
-            connections_failed: 0,
-            live: 0,
-            establishing: 0,
-            pending_routes: 0,
-            retained_owners: 0,
-            rejected: 0,
-            stale: 0,
-            duplicate: 0,
-            unknown: 0,
-            wrong_id: 0,
-            unexpected: 0,
-        }
-        // A processed event with no failure is setup progress (for example
-        // AddrResolved) consumed after the snapshot before shutdown cancels
-        // the route; it is not a loosely tolerated failure.
-        | TerminalLedger {
-            pre_shutdown_state: PreShutdownState::Pending,
-            connect_is_addr_error: false,
-            connect_is_shutdown: true,
-            cm_events_processed: 1,
-            connections_failed: 0,
-            live: 0,
-            establishing: 0,
-            pending_routes: 0,
-            retained_owners: 0,
-            rejected: 0,
-            stale: 0,
-            duplicate: 0,
-            unknown: 0,
-            wrong_id: 0,
-            unexpected: 0,
-        } => {}
-        ledger => panic!(
-            "invalid terminal ADDR/shutdown ledger {ledger:?}; connect error: {connect_error}"
-        ),
+    if !is_allowed_terminal_ledger(&terminal_ledger) {
+        panic!(
+            "invalid terminal ADDR/shutdown ledger {terminal_ledger:?}; connect error: {connect_error}"
+        );
     }
 
     tokio::task::yield_now().await;
@@ -915,6 +959,91 @@ async fn run_operation_admission_shutdown_barrier(mode: CompletionMode) {
     drop(resources);
     drop(engine);
     drop(recorder);
+}
+
+#[test]
+fn readiness_shutdown_addr_error_state_table_is_exact() {
+    assert_eq!(
+        classify_pre_shutdown_ledger(0, 0, 1, 1),
+        Some(PreShutdownState::Pending)
+    );
+    assert_eq!(
+        classify_pre_shutdown_ledger(1, 0, 1, 1),
+        Some(PreShutdownState::SetupProgress)
+    );
+    assert_eq!(
+        classify_pre_shutdown_ledger(1, 1, 0, 0),
+        Some(PreShutdownState::AddrErrorWon)
+    );
+    for ledger in [(1, 0, 0, 1), (1, 0, 1, 0), (1, 1, 1, 1), (2, 0, 1, 1)] {
+        assert_eq!(
+            classify_pre_shutdown_ledger(ledger.0, ledger.1, ledger.2, ledger.3),
+            None,
+            "near-miss pre-shutdown ledger must be rejected: {ledger:?}"
+        );
+    }
+
+    let shutdown_ledger = |pre_shutdown_state, cm_events_processed| TerminalLedger {
+        pre_shutdown_state,
+        connect_is_addr_error: false,
+        connect_is_shutdown: true,
+        cm_events_processed,
+        connections_failed: 0,
+        live: 0,
+        establishing: 0,
+        pending_routes: 0,
+        retained_owners: 0,
+        rejected: 0,
+        stale: 0,
+        duplicate: 0,
+        unknown: 0,
+        wrong_id: 0,
+        unexpected: 0,
+    };
+    let addr_error_won = TerminalLedger {
+        pre_shutdown_state: PreShutdownState::AddrErrorWon,
+        connect_is_addr_error: true,
+        connect_is_shutdown: false,
+        cm_events_processed: 1,
+        connections_failed: 1,
+        live: 0,
+        establishing: 0,
+        pending_routes: 0,
+        retained_owners: 0,
+        rejected: 0,
+        stale: 0,
+        duplicate: 0,
+        unknown: 0,
+        wrong_id: 0,
+        unexpected: 0,
+    };
+    let allowed = [
+        shutdown_ledger(PreShutdownState::Pending, 0),
+        shutdown_ledger(PreShutdownState::Pending, 1),
+        shutdown_ledger(PreShutdownState::SetupProgress, 1),
+        addr_error_won.clone(),
+    ];
+    for ledger in &allowed {
+        assert!(
+            is_allowed_terminal_ledger(ledger),
+            "allowed transition was rejected: {ledger:?}"
+        );
+    }
+
+    let mut near_misses = [
+        shutdown_ledger(PreShutdownState::SetupProgress, 0),
+        shutdown_ledger(PreShutdownState::Pending, 2),
+        addr_error_won.clone(),
+        addr_error_won,
+    ];
+    near_misses[2].connections_failed = 0;
+    near_misses[3].rejected = 1;
+    for ledger in &near_misses {
+        assert!(
+            !is_allowed_terminal_ledger(ledger),
+            "near-miss terminal ledger must be rejected: {ledger:?}"
+        );
+    }
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
