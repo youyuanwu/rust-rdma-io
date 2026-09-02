@@ -2397,6 +2397,28 @@ mod hello_tests {
     }
 
     #[tokio::test]
+    async fn message_driver_publication_wakes_a_registered_poll() {
+        let config = MessageTransportBuilder::new()
+            .derive_engine_config()
+            .unwrap();
+        let state = Arc::new(EngineMessageState::new(&config));
+        let mut driver = MessageTransportDriver::new(Arc::clone(&state), config.hello_deadline);
+        let wake = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let waker = futures_util::task::waker(Arc::clone(&wake));
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
+        assert_eq!(wake.0.load(Ordering::Acquire), 0);
+
+        state.terminalize(Error::ProtocolViolation("wake registered poll".into()));
+        assert_eq!(wake.0.load(Ordering::Acquire), 1);
+        assert!(matches!(
+            Pin::new(&mut driver).poll(&mut cx),
+            Poll::Ready(Err(Error::ProtocolViolation(message)))
+                if message == "wake registered poll"
+        ));
+    }
+
+    #[tokio::test]
     async fn message_driver_register_recheck_does_not_lose_concurrent_terminal_work() {
         for _ in 0..128 {
             let config = MessageTransportBuilder::new()
@@ -2420,10 +2442,16 @@ mod hello_tests {
             publisher.join().unwrap();
             let result = match first {
                 Poll::Ready(result) => result,
-                Poll::Pending => match Pin::new(&mut driver).poll(&mut cx) {
-                    Poll::Ready(result) => result,
-                    Poll::Pending => panic!("concurrent terminal publication was lost"),
-                },
+                Poll::Pending => {
+                    assert!(
+                        wake.0.load(Ordering::Acquire) > 0,
+                        "concurrent publication did not wake the registered driver"
+                    );
+                    match Pin::new(&mut driver).poll(&mut cx) {
+                        Poll::Ready(result) => result,
+                        Poll::Pending => panic!("woken terminal publication was not observable"),
+                    }
+                }
             };
             assert!(matches!(
                 result,

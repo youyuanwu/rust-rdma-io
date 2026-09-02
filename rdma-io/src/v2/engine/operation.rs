@@ -346,7 +346,7 @@ enum InternalPreparedBatch {
 fn commit_internal_entries(
     shared: &EngineShared,
     entries: Vec<InternalBatchEntry>,
-) -> Vec<DetachedCallbackAfterUnlock> {
+) -> Vec<DetachedCompletion> {
     shared
         .accepted_operations
         .fetch_add(entries.len(), Ordering::AcqRel);
@@ -359,15 +359,13 @@ fn commit_internal_entries(
     shared.work_signal.publish(super::driver::CQ_RECHECK_WORK);
     early
         .into_iter()
-        .filter_map(|(state, completion)| {
-            prepare_detached_completion(shared.finish_operation(state, completion))
-        })
+        .filter_map(|(state, completion)| shared.finish_operation(state, completion))
         .collect()
 }
 
-fn invoke_after_unlock(actions: Vec<DetachedCallbackAfterUnlock>) {
-    for action in actions {
-        action();
+fn invoke_after_unlock(completions: Vec<DetachedCompletion>) {
+    for completion in completions {
+        invoke_detached_completion(Some(completion));
     }
 }
 
@@ -2625,6 +2623,51 @@ mod tests {
         assert_eq!(shared.cq_credits.free(), 4);
         assert_eq!(engine.diagnostics().operations_completed, 1);
         drop(returned);
+        drop(connection);
+        drop(driver);
+        drop(engine);
+    }
+
+    #[test]
+    fn detached_early_completion_callback_runs_after_post_guards_are_released() {
+        let Some((engine, driver)) = production_engine(2, 4, 4) else {
+            return;
+        };
+        let shared = Arc::clone(&engine.shared);
+        let poster = Arc::new(ScriptedPoster::new(
+            &shared,
+            49,
+            ScriptedPost::DispatchDuringPost,
+        ));
+        let connection = scripted_connection(&shared, Arc::clone(&poster), 1, 1);
+        let observed = Arc::new(AtomicBool::new(false));
+        let callback_observed = Arc::clone(&observed);
+        let callback_shared = Arc::downgrade(&shared);
+        let posted = connection.post_detached_send(
+            shared.register_memory(64, AccessIntent::LocalOnly).unwrap(),
+            1,
+            Box::new(move |completion| {
+                assert!(matches!(
+                    completion,
+                    DetachedOperationCompletion::Completed {
+                        result: Ok(_),
+                        mr: Some(_)
+                    }
+                ));
+                let shared = callback_shared.upgrade().expect("engine shared state");
+                assert!(
+                    shared.admission.try_write().is_ok(),
+                    "early completion callback ran while admission remained locked"
+                );
+                callback_observed.store(true, Ordering::Release);
+                None
+            }),
+        );
+        assert!(posted.is_ok(), "detached early-completion post failed");
+        assert!(observed.load(Ordering::Acquire));
+        assert_eq!(shared.operations.live(), 0);
+        assert_eq!(shared.accepted_operations.load(Ordering::Acquire), 0);
+        assert_eq!(shared.cq_credits.free(), 4);
         drop(connection);
         drop(driver);
         drop(engine);
