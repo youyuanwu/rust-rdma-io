@@ -120,13 +120,17 @@ fn post_detached_batch(
     let count = entries.len();
     let admission = read_unpoison(&shared.admission);
     if let Some(error) = shared.admission_error() {
-        complete_unreserved_entries(entries, error.clone());
+        let after_unlock = detach_unreserved_entries(entries, error.clone());
+        drop(admission);
+        invoke_after_unlock(after_unlock);
         return Err(DetachedPostError::unaccepted(error));
     }
     let posting = match connection.begin_posting() {
         Ok(posting) => posting,
         Err(error) => {
-            complete_unreserved_entries(entries, error.clone());
+            let after_unlock = detach_unreserved_entries(entries, error.clone());
+            drop(admission);
+            invoke_after_unlock(after_unlock);
             return Err(DetachedPostError::unaccepted(error));
         }
     };
@@ -136,7 +140,10 @@ fn post_detached_batch(
         OperationKind::Send => WcOpcode::Send,
         OperationKind::Write | OperationKind::Read => {
             let error = Error::InvalidConfig("detached batches support only SEND and RECV".into());
-            complete_unreserved_entries(entries, error.clone());
+            let after_unlock = detach_unreserved_entries(entries, error.clone());
+            drop(posting);
+            drop(admission);
+            invoke_after_unlock(after_unlock);
             return Err(DetachedPostError::unaccepted(error));
         }
     };
@@ -146,22 +153,41 @@ fn post_detached_batch(
         let validated = match ValidatedOperation::new(kind, &mr, None, range) {
             Ok(validated) => validated,
             Err(error) => {
-                rollback_internal_entries(shared, connection, direction, reserved, error.clone());
-                callback(DetachedOperationCompletion::Unaccepted {
-                    error: error.clone(),
-                    mr,
-                });
-                complete_unreserved_entries(entries, error.clone());
+                let mut after_unlock = rollback_internal_entries(
+                    shared,
+                    connection,
+                    direction,
+                    reserved,
+                    error.clone(),
+                );
+                after_unlock.push((
+                    callback,
+                    DetachedOperationCompletion::Unaccepted {
+                        error: error.clone(),
+                        mr,
+                    },
+                ));
+                after_unlock.extend(detach_unreserved_entries(entries, error.clone()));
+                drop(posting);
+                drop(admission);
+                invoke_after_unlock(after_unlock);
                 return Err(DetachedPostError::unaccepted(error));
             }
         };
         if let Err(error) = connection.reserve_local(direction) {
-            rollback_internal_entries(shared, connection, direction, reserved, error.clone());
-            callback(DetachedOperationCompletion::Unaccepted {
-                error: error.clone(),
-                mr,
-            });
-            complete_unreserved_entries(entries, error.clone());
+            let mut after_unlock =
+                rollback_internal_entries(shared, connection, direction, reserved, error.clone());
+            after_unlock.push((
+                callback,
+                DetachedOperationCompletion::Unaccepted {
+                    error: error.clone(),
+                    mr,
+                },
+            ));
+            after_unlock.extend(detach_unreserved_entries(entries, error.clone()));
+            drop(posting);
+            drop(admission);
+            invoke_after_unlock(after_unlock);
             return Err(DetachedPostError::unaccepted(error));
         }
         let mr_len = mr.len();
@@ -187,12 +213,24 @@ fn post_detached_batch(
                 let callback = callback
                     .take()
                     .expect("operation allocation failure retains detached callback");
-                rollback_internal_entries(shared, connection, direction, reserved, error.clone());
-                callback(DetachedOperationCompletion::Unaccepted {
-                    error: error.clone(),
-                    mr,
-                });
-                complete_unreserved_entries(entries, error.clone());
+                let mut after_unlock = rollback_internal_entries(
+                    shared,
+                    connection,
+                    direction,
+                    reserved,
+                    error.clone(),
+                );
+                after_unlock.push((
+                    callback,
+                    DetachedOperationCompletion::Unaccepted {
+                        error: error.clone(),
+                        mr,
+                    },
+                ));
+                after_unlock.extend(detach_unreserved_entries(entries, error.clone()));
+                drop(posting);
+                drop(admission);
+                invoke_after_unlock(after_unlock);
                 return Err(DetachedPostError::unaccepted(error));
             }
         };
@@ -201,9 +239,13 @@ fn post_detached_batch(
             connection.release_local(direction);
             let error = Error::CapacityExhausted;
             let completion = released.take_unaccepted(error.clone());
-            rollback_internal_entries(shared, connection, direction, reserved, error.clone());
-            invoke_detached_completion(completion);
-            complete_unreserved_entries(entries, error.clone());
+            let mut after_unlock =
+                rollback_internal_entries(shared, connection, direction, reserved, error.clone());
+            after_unlock.extend(completion);
+            after_unlock.extend(detach_unreserved_entries(entries, error.clone()));
+            drop(posting);
+            drop(admission);
+            invoke_after_unlock(after_unlock);
             return Err(DetachedPostError::unaccepted(error));
         }
         reserved.push(InternalBatchEntry {
@@ -223,13 +265,16 @@ fn post_detached_batch(
                 Ok(batch) => InternalPreparedBatch::Recv(batch),
                 Err(error) => {
                     let error = Error::from_v1(error);
-                    rollback_internal_entries(
+                    let after_unlock = rollback_internal_entries(
                         shared,
                         connection,
                         direction,
                         reserved,
                         error.clone(),
                     );
+                    drop(posting);
+                    drop(admission);
+                    invoke_after_unlock(after_unlock);
                     return Err(DetachedPostError::unaccepted(error));
                 }
             }
@@ -247,13 +292,16 @@ fn post_detached_batch(
                 Ok(batch) => InternalPreparedBatch::Send(batch),
                 Err(error) => {
                     let error = Error::from_v1(error);
-                    rollback_internal_entries(
+                    let after_unlock = rollback_internal_entries(
                         shared,
                         connection,
                         direction,
                         reserved,
                         error.clone(),
                     );
+                    drop(posting);
+                    drop(admission);
+                    invoke_after_unlock(after_unlock);
                     return Err(DetachedPostError::unaccepted(error));
                 }
             }
@@ -270,9 +318,11 @@ fn post_detached_batch(
         Ok(outcome) => outcome,
         Err(error) => {
             let entries = ownership.into_entries();
-            rollback_internal_entries(shared, connection, direction, entries, error.clone());
+            let after_unlock =
+                rollback_internal_entries(shared, connection, direction, entries, error.clone());
             drop(posting);
             drop(admission);
+            invoke_after_unlock(after_unlock);
             return Err(DetachedPostError::unaccepted(error));
         }
     };
@@ -303,8 +353,10 @@ fn post_detached_batch(
                 Err(DetachedPostError::retained(Error::PostFailed(source)))
             } else {
                 let potentially_accepted = !accepted.is_empty();
-                let after_unlock = commit_internal_entries(shared, accepted);
-                rollback_internal_entries(shared, connection, direction, unaccepted, error);
+                let accepted_after_unlock = commit_internal_entries(shared, accepted);
+                let mut after_unlock =
+                    rollback_internal_entries(shared, connection, direction, unaccepted, error);
+                after_unlock.extend(accepted_after_unlock);
                 drop(posting);
                 drop(admission);
                 invoke_after_unlock(after_unlock);
@@ -361,7 +413,8 @@ fn rollback_internal_entries(
     direction: Direction,
     entries: Vec<InternalBatchEntry>,
     error: Error,
-) {
+) -> Vec<DetachedCompletion> {
+    let mut completions = Vec::with_capacity(entries.len());
     for entry in entries {
         let state = shared
             .operations
@@ -369,17 +422,29 @@ fn rollback_internal_entries(
             .unwrap_or(entry.state);
         shared.cq_credits.release();
         connection.release_local(direction);
-        invoke_detached_completion(state.take_unaccepted(error.clone()));
+        if let Some(completion) = state.take_unaccepted(error.clone()) {
+            completions.push(completion);
+        }
     }
+    completions
 }
 
-fn complete_unreserved_entries(entries: impl IntoIterator<Item = InternalPostInput>, error: Error) {
-    for (mr, _, callback) in entries {
-        callback(DetachedOperationCompletion::Unaccepted {
-            error: error.clone(),
-            mr,
-        });
-    }
+fn detach_unreserved_entries(
+    entries: impl IntoIterator<Item = InternalPostInput>,
+    error: Error,
+) -> Vec<DetachedCompletion> {
+    entries
+        .into_iter()
+        .map(|(mr, _, callback)| {
+            (
+                callback,
+                DetachedOperationCompletion::Unaccepted {
+                    error: error.clone(),
+                    mr,
+                },
+            )
+        })
+        .collect()
 }
 
 fn invoke_detached_completion(completion: Option<DetachedCompletion>) {
@@ -2386,6 +2451,59 @@ mod tests {
             }),
         );
         assert!(posted.is_ok(), "detached early-completion post failed");
+        assert!(observed.load(Ordering::Acquire));
+        assert_eq!(shared.operations.live(), 0);
+        assert_eq!(shared.accepted_operations.load(Ordering::Acquire), 0);
+        assert_eq!(shared.cq_credits.free(), 4);
+        drop(connection);
+        drop(driver);
+        drop(engine);
+    }
+
+    #[test]
+    fn detached_unaccepted_callback_runs_after_post_guards_are_released() {
+        let Some((engine, driver)) = production_engine(2, 4, 4) else {
+            return;
+        };
+        let shared = Arc::clone(&engine.shared);
+        let poster = Arc::new(ScriptedPoster::new(&shared, 52, ScriptedPost::Unaccepted));
+        let connection = scripted_connection(&shared, Arc::clone(&poster), 1, 1);
+        let observed = Arc::new(AtomicBool::new(false));
+        let callback_observed = Arc::clone(&observed);
+        let callback_shared = Arc::downgrade(&shared);
+        let callback_connection = Arc::downgrade(&connection.state);
+        let posted = connection.post_detached_send(
+            shared.register_memory(64, AccessIntent::LocalOnly).unwrap(),
+            1,
+            Box::new(move |completion| {
+                assert!(matches!(
+                    completion,
+                    DetachedOperationCompletion::Unaccepted {
+                        error: Error::PostFailed(_),
+                        ..
+                    }
+                ));
+                let shared = callback_shared.upgrade().expect("engine shared state");
+                assert!(
+                    shared.admission.try_write().is_ok(),
+                    "unaccepted callback ran while admission remained locked"
+                );
+                let connection = callback_connection.upgrade().expect("connection state");
+                assert!(
+                    connection.begin_posting().is_ok(),
+                    "unaccepted callback ran while the posting gate remained locked"
+                );
+                callback_observed.store(true, Ordering::Release);
+                None
+            }),
+        );
+        assert!(matches!(
+            posted,
+            Err(DetachedPostError {
+                potentially_accepted: false,
+                ..
+            })
+        ));
         assert!(observed.load(Ordering::Acquire));
         assert_eq!(shared.operations.live(), 0);
         assert_eq!(shared.accepted_operations.load(Ordering::Acquire), 0);

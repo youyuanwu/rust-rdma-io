@@ -546,8 +546,10 @@ impl Future for RdmaEngineDriver {
                 // Tokio's yield future defers this task to the back of the
                 // scheduler queue. A direct self-wake can monopolize a worker
                 // and starve the explicit per-connection message drivers.
-                let mut yield_now = Box::pin(tokio::task::yield_now());
-                let _ = yield_now.as_mut().poll(cx);
+                let mut yield_now = std::pin::pin!(tokio::task::yield_now());
+                if yield_now.as_mut().poll(cx).is_ready() {
+                    cx.waker().wake_by_ref();
+                }
             }
         }
         Poll::Pending

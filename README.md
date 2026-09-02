@@ -281,8 +281,10 @@ Key design properties:
 - **`send().await` = local completion**: The send CQE confirms local
   completion, not remote consumption.
 - **Cancellation safe**: If cancelled before WR posting, the credit permit is
-  returned automatically. If cancelled after posting, the MR returns via the
-  reclaim queue. Dropping `recv()` leaves the message for the next caller.
+  returned automatically. If cancelled after posting, the engine retains the
+  MR until its exact CQE arrives or the owning QP is successfully destroyed
+  synchronously while its CmId remains alive. Dropping `recv()` leaves the
+  message for the next caller.
 - **Shared engine resources**: Connections use the engine's one context,
   protection domain, CQ, notification resource, and CM event channel.
 - **Completion modes**: `Readiness` (fd/channel-based, lower CPU) or

@@ -87,7 +87,7 @@ case "$MODE" in
         FULL_VALIDATION=1
         ;;
     *)
-        echo "usage: sudo ./scripts/validate-v2-engine-providers.sh [--provider-probe|--readiness-race|--driver-flush-gate|--operations|--connections|--listeners|--lifecycle|--message-setup|--message|--engine-conformance]" >&2
+        echo 'usage: sudo -E env CARGO="$(command -v cargo)" ./scripts/validate-v2-engine-providers.sh [--provider-probe|--readiness-race|--driver-flush-gate|--operations|--connections|--listeners|--lifecycle|--message-setup|--message|--engine-conformance]' >&2
         exit 2
         ;;
 esac

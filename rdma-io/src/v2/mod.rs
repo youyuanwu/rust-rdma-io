@@ -56,8 +56,7 @@
 //! The retained independent resource surface includes [`Context`], [`Pd`],
 //! [`Cq`], [`Mr`], [`Qp`], the four named [`Qp::post_send`],
 //! [`Qp::post_recv`], [`Qp::post_write`], and [`Qp::post_read`] operations,
-//! [`Completions`], and [`CqPoller`]. V1 APIs are separate and unchanged;
-//! existing v2 endpoint compatibility is not provided.
+//! [`Completions`], and [`CqPoller`]. V1 APIs are separate and unchanged.
 //!
 //! # Feature Flags
 //!
