@@ -138,11 +138,16 @@ fn polling_engine_builds_outside_a_runtime_without_io_adapters() {
         .expect("polling build outside Tokio");
     let diagnostics = engine.diagnostics();
     assert_eq!(diagnostics.lifecycle, RdmaEngineLifecycle::Created);
-    assert_eq!(diagnostics.shared_contexts, 1);
-    assert_eq!(diagnostics.shared_protection_domains, 1);
-    assert_eq!(diagnostics.shared_completion_queues, 1);
-    assert_eq!(diagnostics.shared_completion_channels, 0);
-    assert_eq!(diagnostics.shared_cm_event_channels, 1);
+    let resources = engine
+        .test_resources()
+        .unwrap()
+        .shared_resource_identity()
+        .unwrap();
+    assert_ne!(resources.context, 0);
+    assert_ne!(resources.protection_domain, 0);
+    assert_ne!(resources.completion_queue, 0);
+    assert_ne!(resources.cm_event_channel, 0);
+    assert!(!resources.has_completion_channel);
     drop(engine);
     drop(driver);
 }
@@ -157,8 +162,14 @@ async fn readiness_engine_builds_with_one_channel_and_direct_driver() {
     drop(list);
 
     let (engine, driver) = RdmaEngineBuilder::new(name).build().unwrap();
-    let diagnostics = engine.diagnostics();
-    assert_eq!(diagnostics.shared_completion_channels, 1);
+    assert!(
+        engine
+            .test_resources()
+            .unwrap()
+            .shared_resource_identity()
+            .unwrap()
+            .has_completion_channel
+    );
     let task = tokio::spawn(driver);
     engine.shutdown().await.unwrap();
     task.await.unwrap().unwrap();

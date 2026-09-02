@@ -12,9 +12,6 @@ use rdma_io::wc::{WcOpcode, WcStatus};
 use rdma_io_tests::engine_test_helpers::{EngineTestEndpoint, setup_engine_pair};
 use rdma_io_tests::test_helpers::{connect_addr_for, has_software_rdma};
 
-const DIRECT_FLUSH_SOURCE: &str = include_str!("v2_tests.rs");
-const ENGINE_ASYNC_FLUSH_SOURCE: &str = include_str!("v2_engine_driver_flush_gate.rs");
-
 struct SharedProbeResources {
     engine: RdmaEngine,
     driver: Option<RdmaEngineDriver>,
@@ -72,18 +69,6 @@ async fn wait_drained(route: &TestRouteHandle) {
     tokio::time::timeout(Duration::from_secs(10), route.wait_until_drained())
         .await
         .expect("timed out draining provider-probe route");
-}
-
-#[test]
-fn direct_and_engine_async_flush_sources_require_provider_cqes() {
-    assert!(DIRECT_FLUSH_SOURCE.contains("async fn test_v2_completion_error"));
-    assert!(DIRECT_FLUSH_SOURCE.contains("WrFlushErr"));
-    assert!(
-        ENGINE_ASYNC_FLUSH_SOURCE
-            .contains("explicit_qp_err_flushes_every_accepted_wr_in_readiness_and_polling_modes")
-    );
-    assert!(ENGINE_ASYNC_FLUSH_SOURCE.contains("WcStatus::WrFlushErr"));
-    assert!(!ENGINE_ASYNC_FLUSH_SOURCE.contains("require_no_iwarp!"));
 }
 
 #[test]

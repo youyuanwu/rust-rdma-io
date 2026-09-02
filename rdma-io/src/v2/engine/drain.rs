@@ -19,17 +19,8 @@ impl EngineShared {
         let first = connection.begin_close();
         let mut operations_to_wake = Vec::new();
         if first {
-            self.diagnostic_counters
-                .connections_drain_started
-                .fetch_add(1, Ordering::Relaxed);
-
             match connection.transition_to_error_once() {
-                Ok(true) => {
-                    self.diagnostic_counters
-                        .qp_error_transitions
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                Ok(false) => {}
+                Ok(_) => {}
                 Err(error) => {
                     connection.mark_cm_failure(error.clone());
                     connection.rollback_draining_count();
@@ -106,7 +97,7 @@ impl EngineShared {
         // CQEs already copied out of the hardware CQ must take the ordinary
         // quantum-bounded ready path before a destructive fallback can run.
         if connection.has_completion_work() {
-            self.publish_connection_ready(&connection);
+            self.publish_completion(&connection);
             self.schedule_deadline(
                 DeadlineKind::ConnectionDrain,
                 token.encode(),
@@ -122,12 +113,7 @@ impl EngineShared {
                 None
             } else {
                 match connection.establish_qp_destruction_boundary(&lifecycle) {
-                    Ok(destroyed_now) => {
-                        if destroyed_now {
-                            self.record_qp_destroy();
-                        }
-                        Some(tokens)
-                    }
+                    Ok(_) => Some(tokens),
                     Err(error) => {
                         tracing::warn!(
                             qp_num = connection.qp_num(),
@@ -144,7 +130,7 @@ impl EngineShared {
                 let _ = self.reclaim_after_qp_destroy(&connection, operation);
             }
             if self.reject_queued_completions_after_qp_destroy(&connection) {
-                self.publish_connection_ready(&connection);
+                self.publish_completion(&connection);
                 self.schedule_deadline(
                     DeadlineKind::ConnectionDrain,
                     token.encode(),
@@ -154,14 +140,7 @@ impl EngineShared {
             }
         }
         if let Some((outstanding, _cq_debt)) = connection.begin_quarantine() {
-            if self.track_connection_quarantine(connection.token) {
-                self.diagnostic_counters
-                    .connections_quarantined
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            self.diagnostic_counters
-                .connection_quarantine_outcomes
-                .fetch_add(1, Ordering::Relaxed);
+            self.track_connection_quarantine(connection.token);
             for operation in connection.accepted_tokens() {
                 self.quarantine_operation(operation);
             }
@@ -182,17 +161,7 @@ impl EngineShared {
     }
 
     pub(super) fn record_connection_drained(&self, connection: &ConnectionState) {
-        if connection.mark_drained_once() {
-            self.diagnostic_counters
-                .connections_drained
-                .fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    pub(super) fn record_qp_destroy(&self) {
-        self.diagnostic_counters
-            .qp_destroys
-            .fetch_add(1, Ordering::Relaxed);
+        connection.mark_drained_once();
     }
 
     pub(super) fn record_connection_retired(&self, connection: &ConnectionState) {
@@ -201,18 +170,6 @@ impl EngineShared {
         // quarantine entry remains tracked, so a mismatched retirement cannot
         // make retained debt appear recovered.
         let _ = self.clear_connection_quarantine(connection.token);
-        self.diagnostic_counters
-            .connections_closed
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub(super) fn record_connection_retirement_failure(&self, _connection: &ConnectionState) {
-        // Fail closed: keep the quarantine entry and oldest-age gauge pinned.
-        // A failed generation retirement cannot prove that routing identity or
-        // retained provider ownership is safe to recycle.
-        self.diagnostic_counters
-            .connections_failed
-            .fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -332,7 +289,7 @@ mod tests {
             poll_once(close.as_mut()),
             Poll::Ready(Err(Error::Verbs(_)))
         ));
-        assert_eq!(engine.diagnostics().draining_connection_reservations, 0);
+        assert_eq!(engine.shared.connection_admission.snapshot().draining, 0);
         drop(driver);
     }
 
@@ -396,10 +353,15 @@ mod tests {
             }))
         ));
         let published = engine.diagnostics();
-        assert_eq!(published.quarantined_bundles, 1);
-        assert_eq!(published.connections_quarantined, 1);
-        assert_eq!(published.connection_quarantine_outcomes, 1);
-        assert_eq!(published.registered_live_qps, 0);
+        assert_eq!(published.quarantined_connections, 1);
+        assert_eq!(
+            engine
+                .shared
+                .connection_admission
+                .snapshot()
+                .registered_live_qps,
+            0
+        );
         assert_eq!(
             poster.destroys.load(Ordering::Acquire),
             1,
@@ -414,7 +376,14 @@ mod tests {
         engine
             .shared
             .recover_connection_quarantine(&connection.state);
-        assert_eq!(engine.diagnostics().registered_live_qps, 0);
+        assert_eq!(
+            engine
+                .shared
+                .connection_admission
+                .snapshot()
+                .registered_live_qps,
+            0
+        );
         engine.shared.record_connection_drained(&connection.state);
         engine
             .shared
@@ -479,14 +448,12 @@ mod tests {
 
         let diagnostics = engine.diagnostics();
         assert_eq!(poster.destroys.load(Ordering::Acquire), 1);
-        assert_eq!(diagnostics.qp_destroys, 0);
-        assert_eq!(diagnostics.operations_released_after_qp_destroy, 0);
         assert_eq!(diagnostics.registered_operations, 1);
-        assert_eq!(diagnostics.accepted_outstanding_operations, 1);
-        assert_eq!(diagnostics.free_cq_credits, 16_383);
+        assert_eq!(diagnostics.accepted_operations, 1);
+        assert_eq!(diagnostics.available_cq_credits, 16_383);
         assert_eq!(diagnostics.retained_cq_credits, 1);
         assert_eq!(diagnostics.quarantined_operations, 1);
-        assert_eq!(diagnostics.quarantined_bundles, 1);
+        assert_eq!(diagnostics.quarantined_connections, 1);
 
         drop(driver);
     }
@@ -524,12 +491,9 @@ mod tests {
 
         let diagnostics = engine.diagnostics();
         assert_eq!(poster.destroys.load(Ordering::Acquire), 1);
-        assert_eq!(diagnostics.qp_destroys, 1);
-        assert_eq!(diagnostics.operations_released_after_qp_destroy, 2);
         assert_eq!(diagnostics.registered_operations, 0);
-        assert_eq!(diagnostics.accepted_outstanding_operations, 1);
+        assert_eq!(diagnostics.accepted_operations, 1);
         assert_eq!(connection.state.accepted_tokens(), vec![anomalous]);
-        assert_eq!(diagnostics.quarantined_bundles, 1);
-        assert_eq!(diagnostics.connection_quarantine_outcomes, 1);
+        assert_eq!(diagnostics.quarantined_connections, 1);
     }
 }

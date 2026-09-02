@@ -247,7 +247,7 @@ async fn run_mode(mode: CompletionMode) {
             .cq_completion_budget(7)
             .cm_event_budget(7)
             .reclamation_budget(7)
-            .ready_connection_quantum(1)
+            .completion_dispatch_budget(1)
             .connection_drain_deadline(Duration::from_secs(5))
             .shutdown_deadline(Duration::from_secs(10))
             .build()
@@ -279,23 +279,15 @@ async fn run_mode(mode: CompletionMode) {
     let low_client = low_client.unwrap();
 
     let shared = engine.diagnostics();
-    assert_eq!(shared.live_connection_reservations, 18);
-    assert_eq!(shared.establishing_connection_reservations, 0);
-    assert_eq!(shared.established_connection_reservations, 18);
-    assert_eq!(shared.connections().len(), 18);
-    assert_eq!(shared.connections_admitted, 18);
-    assert_eq!(shared.connections_opened, 18);
-    assert_eq!(shared.inbound_requests_accepted, 9);
-    assert_eq!(shared.shared_contexts, 1);
-    assert_eq!(shared.shared_protection_domains, 1);
-    assert_eq!(shared.shared_completion_queues, 1);
-    assert_eq!(shared.shared_cm_event_channels, 1);
-    assert_eq!(shared.shared_cm_event_fds, 1);
-    assert_eq!(shared.explicit_engine_drivers, 1);
-    assert_eq!(shared.library_owned_tasks, 0);
+    assert_eq!(shared.live_connections, 18);
+    let shared_resources = resources.shared_resource_identity().unwrap();
+    assert_ne!(shared_resources.context, 0);
+    assert_ne!(shared_resources.protection_domain, 0);
+    assert_ne!(shared_resources.completion_queue, 0);
+    assert_ne!(shared_resources.cm_event_channel, 0);
     assert_eq!(
-        shared.shared_cq_notification_fds,
-        usize::from(mode == CompletionMode::Readiness)
+        shared_resources.has_completion_channel,
+        mode == CompletionMode::Readiness
     );
 
     bidirectional_low_level(&low_server, &low_client).await;
@@ -350,7 +342,7 @@ async fn run_mode(mode: CompletionMode) {
     };
     held.wait_observed().await.unwrap();
     let identity = held.completion().unwrap();
-    let before = engine.diagnostics();
+    let rejected_before = resources.instrumentation().unwrap().cqes_rejected;
     resources
         .inject_completion(
             identity.wr_id().wrapping_add(1_u64 << 32),
@@ -367,16 +359,9 @@ async fn run_mode(mode: CompletionMode) {
     resources
         .inject_completion(identity.wr_id(), identity.qp_num(), WcOpcode::Recv)
         .unwrap();
-    let rejected = engine.diagnostics();
     assert_eq!(
-        rejected.stale_operation_cqes,
-        before.stale_operation_cqes + 1
-    );
-    assert_eq!(rejected.unknown_cqes, before.unknown_cqes + 1);
-    assert_eq!(rejected.wrong_qp_num_cqes, before.wrong_qp_num_cqes + 1);
-    assert_eq!(
-        rejected.unexpected_opcode_cqes,
-        before.unexpected_opcode_cqes + 1
+        resources.instrumentation().unwrap().cqes_rejected,
+        rejected_before + 4
     );
     held.release().unwrap();
     stale_sender.await.unwrap().unwrap();
@@ -387,8 +372,8 @@ async fn run_mode(mode: CompletionMode) {
         .inject_completion(identity.wr_id(), identity.qp_num(), identity.opcode())
         .unwrap();
     assert_eq!(
-        engine.diagnostics().duplicate_cqes,
-        rejected.duplicate_cqes + 1
+        resources.instrumentation().unwrap().cqes_rejected,
+        rejected_before + 5
     );
 
     for index in [5_usize, 6, 7] {
@@ -396,19 +381,6 @@ async fn run_mode(mode: CompletionMode) {
         let message = pairs[index].0.recv().await.unwrap();
         assert_eq!(&*message, &[index as u8]);
         drop(message);
-    }
-
-    let instrumentation = resources.instrumentation().unwrap();
-    assert!(instrumentation.connection_selections > 0);
-    assert!(instrumentation.connection_quantum_work > 0);
-    assert!(instrumentation.maximum_connection_quantum_work <= 1);
-    assert!(instrumentation.idle_connection_visits < instrumentation.connection_selections);
-    assert!(instrumentation.operations_posted > 0);
-    assert!(instrumentation.cqes_routed > 0);
-    assert!(instrumentation.cqes_rejected >= 5);
-    assert!(instrumentation.driver_wakeups > 0);
-    if mode == CompletionMode::Polling {
-        assert!(instrumentation.driver_yields > 0);
     }
 
     for (index, (server, client)) in pairs.iter().enumerate() {
@@ -440,15 +412,11 @@ async fn run_mode(mode: CompletionMode) {
     driver.await.unwrap().unwrap();
 
     let terminal = engine.diagnostics();
-    assert_eq!(terminal.live_connection_reservations, 0);
+    assert_eq!(terminal.live_connections, 0);
     assert_eq!(terminal.registered_operations, 0);
-    assert_eq!(terminal.free_cq_credits, 2_048);
-    assert_eq!(terminal.quarantined_bundles, 0);
+    assert_eq!(terminal.available_cq_credits, 2_048);
+    assert_eq!(terminal.quarantined_connections, 0);
     assert_eq!(terminal.retained_cq_credits, 0);
-    assert_eq!(terminal.connections_closed, 18);
-    assert_eq!(terminal.qp_destroys, 18);
-    assert_eq!(terminal.retired_connection_slots, 0);
-    assert_eq!(terminal.retired_operation_slots, 0);
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 8))]

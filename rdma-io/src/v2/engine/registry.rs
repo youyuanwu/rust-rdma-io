@@ -18,8 +18,8 @@ pub(super) struct ConnectionToken {
 }
 
 impl ConnectionToken {
-    pub(super) const fn ready(self) -> super::scheduler::ReadyConnection {
-        super::scheduler::ReadyConnection {
+    pub(super) const fn completion_ready(self) -> super::scheduler::CompletionReadyConnection {
+        super::scheduler::CompletionReadyConnection {
             slot: self.slot,
             generation: self.generation,
         }
@@ -266,10 +266,12 @@ impl<K: RegistryToken, T> PagedRegistry<K, T> {
         self.live.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     pub(super) fn retired(&self) -> usize {
         self.retired.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     pub(super) fn free(&self) -> usize {
         self.capacity
             .saturating_sub(self.live())
@@ -281,7 +283,7 @@ impl<K: RegistryToken, T> PagedRegistry<K, T> {
         self.allocated_pages.load(Ordering::Acquire)
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(test)]
     pub(super) fn probes(&self) -> u64 {
         self.probes.load(Ordering::Acquire)
     }
@@ -461,21 +463,13 @@ impl ConnectionRegistry {
         self.slots.live()
     }
 
-    pub(super) fn retired(&self) -> usize {
-        self.slots.retired()
-    }
-
+    #[cfg(test)]
     pub(super) fn free(&self) -> usize {
         self.slots.free()
     }
 
     pub(super) fn occupied(&self) -> Vec<Arc<ConnectionState>> {
         self.slots.occupied_cloned()
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn probes(&self) -> u64 {
-        self.slots.probes()
     }
 
     #[cfg(test)]

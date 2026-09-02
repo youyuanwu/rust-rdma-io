@@ -1,4 +1,4 @@
-//! Bounded work-class, ready-connection, and deadline scheduling.
+//! Bounded engine work-class, completion-dispatch, and deadline scheduling.
 //!
 //! Each work class and connection can occupy its queue at most once. A class
 //! that remains ready is appended at the tail, and a continuously ready
@@ -17,7 +17,7 @@ pub(super) enum WorkClass {
     Cm,
     Cq,
     Reclamation,
-    ReadyConnection,
+    CompletionDispatch,
 }
 
 impl WorkClass {
@@ -27,7 +27,7 @@ impl WorkClass {
             Self::Cm => 1,
             Self::Cq => 2,
             Self::Reclamation => 3,
-            Self::ReadyConnection => 4,
+            Self::CompletionDispatch => 4,
         }
     }
 }
@@ -35,7 +35,7 @@ impl WorkClass {
 pub(super) struct WorkScheduler {
     classes: VecDeque<WorkClass>,
     class_queued: [bool; WORK_CLASS_COUNT],
-    ready_connections: ReadyConnections,
+    completion_connections: CompletionConnections,
     deadlines: DeadlineQueue,
 }
 
@@ -44,7 +44,7 @@ impl WorkScheduler {
         Self {
             classes: VecDeque::with_capacity(WORK_CLASS_COUNT),
             class_queued: [false; WORK_CLASS_COUNT],
-            ready_connections: ReadyConnections::default(),
+            completion_connections: CompletionConnections::default(),
             deadlines: DeadlineQueue::default(),
         }
     }
@@ -67,23 +67,23 @@ impl WorkScheduler {
         self.classes.len()
     }
 
-    pub(super) fn enqueue_connection(&mut self, connection: ReadyConnection) {
-        if self.ready_connections.enqueue(connection) {
-            self.mark_class_ready(WorkClass::ReadyConnection);
+    pub(super) fn enqueue_connection(&mut self, connection: CompletionReadyConnection) {
+        if self.completion_connections.enqueue(connection) {
+            self.mark_class_ready(WorkClass::CompletionDispatch);
         }
     }
 
-    pub(super) fn pop_connection(&mut self) -> Option<ReadyConnection> {
-        self.ready_connections.pop()
+    pub(super) fn pop_connection(&mut self) -> Option<CompletionReadyConnection> {
+        self.completion_connections.pop()
     }
 
-    pub(super) fn requeue_connection(&mut self, connection: ReadyConnection) {
-        self.ready_connections.enqueue(connection);
-        self.mark_class_ready(WorkClass::ReadyConnection);
+    pub(super) fn requeue_connection(&mut self, connection: CompletionReadyConnection) {
+        self.completion_connections.enqueue(connection);
+        self.mark_class_ready(WorkClass::CompletionDispatch);
     }
 
-    pub(super) fn ready_connection_count(&self) -> usize {
-        self.ready_connections.len()
+    pub(super) fn completion_connection_count(&self) -> usize {
+        self.completion_connections.len()
     }
 
     pub(super) fn deadlines(&mut self) -> &mut DeadlineQueue {
@@ -96,19 +96,19 @@ impl WorkScheduler {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(super) struct ReadyConnection {
+pub(super) struct CompletionReadyConnection {
     pub(super) slot: u32,
     pub(super) generation: u32,
 }
 
 #[derive(Default)]
-struct ReadyConnections {
-    queue: VecDeque<ReadyConnection>,
-    queued: HashSet<ReadyConnection>,
+struct CompletionConnections {
+    queue: VecDeque<CompletionReadyConnection>,
+    queued: HashSet<CompletionReadyConnection>,
 }
 
-impl ReadyConnections {
-    fn enqueue(&mut self, connection: ReadyConnection) -> bool {
+impl CompletionConnections {
+    fn enqueue(&mut self, connection: CompletionReadyConnection) -> bool {
         if !self.queued.insert(connection) {
             return false;
         }
@@ -116,7 +116,7 @@ impl ReadyConnections {
         true
     }
 
-    fn pop(&mut self) -> Option<ReadyConnection> {
+    fn pop(&mut self) -> Option<CompletionReadyConnection> {
         let connection = self.queue.pop_front()?;
         self.queued.remove(&connection);
         Some(connection)
@@ -221,8 +221,8 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    fn connection(slot: u32) -> ReadyConnection {
-        ReadyConnection {
+    fn connection(slot: u32) -> CompletionReadyConnection {
+        CompletionReadyConnection {
             slot,
             generation: 1,
         }
@@ -236,7 +236,7 @@ mod tests {
             WorkClass::Cm,
             WorkClass::Cq,
             WorkClass::Reclamation,
-            WorkClass::ReadyConnection,
+            WorkClass::CompletionDispatch,
         ] {
             scheduler.mark_class_ready(class);
         }
@@ -255,7 +255,7 @@ mod tests {
                 WorkClass::Cm,
                 WorkClass::Cq,
                 WorkClass::Reclamation,
-                WorkClass::ReadyConnection,
+                WorkClass::CompletionDispatch,
             ]
         );
         assert_eq!(
@@ -266,17 +266,17 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_ready_connections_are_suppressed() {
+    fn duplicate_completion_connections_are_suppressed() {
         let mut scheduler = WorkScheduler::new();
         scheduler.enqueue_connection(connection(7));
         scheduler.enqueue_connection(connection(7));
-        assert_eq!(scheduler.ready_connection_count(), 1);
+        assert_eq!(scheduler.completion_connection_count(), 1);
         assert_eq!(scheduler.pop_connection(), Some(connection(7)));
         assert_eq!(scheduler.pop_connection(), None);
     }
 
     #[test]
-    fn continuously_ready_connections_receive_one_quantum_per_round() {
+    fn continuously_ready_completion_connections_rotate() {
         let mut scheduler = WorkScheduler::new();
         for slot in 0..8 {
             scheduler.enqueue_connection(connection(slot));

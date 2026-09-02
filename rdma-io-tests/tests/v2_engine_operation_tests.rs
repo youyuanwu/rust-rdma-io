@@ -25,7 +25,7 @@ async fn post_once_then_cancel(operation: &mut std::pin::Pin<Box<rdma_io::v2::Rd
 async fn wait_for_no_accepted(engine: &rdma_io::v2::RdmaEngine) {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if engine.diagnostics().accepted_outstanding_operations == 0 {
+            if engine.diagnostics().accepted_operations == 0 {
                 return;
             }
             tokio::task::yield_now().await;
@@ -45,7 +45,7 @@ async fn run_owned_operations(mode: CompletionMode) {
         .maximum_live_connections(4)
         .maximum_inflight_operations(256)
         .cq_capacity(256)
-        .ready_connection_quantum(1)
+        .completion_dispatch_budget(1)
         .build()
         .unwrap();
     let resources = engine.test_resources().unwrap();
@@ -88,9 +88,9 @@ async fn run_owned_operations(mode: CompletionMode) {
     post_once_then_cancel(&mut cancelled).await;
     drop(cancelled);
     let cancelled_diagnostics = engine.diagnostics();
-    assert_eq!(cancelled_diagnostics.accepted_outstanding_operations, 1);
+    assert_eq!(cancelled_diagnostics.accepted_operations, 1);
     assert_eq!(cancelled_diagnostics.registered_operations, 1);
-    assert_eq!(cancelled_diagnostics.free_cq_credits, 255);
+    assert_eq!(cancelled_diagnostics.available_cq_credits, 255);
     assert_eq!(
         recorder
             .snapshot()
@@ -131,9 +131,8 @@ async fn run_owned_operations(mode: CompletionMode) {
         "dropping the returned matching-send MR must produce the next distinct deregistration"
     );
     let after_cancel = engine.diagnostics();
-    assert_eq!(after_cancel.operations_cancelled, 1);
     assert_eq!(after_cancel.registered_operations, 0);
-    assert_eq!(after_cancel.free_cq_credits, 256);
+    assert_eq!(after_cancel.available_cq_credits, 256);
 
     let flushed_recv = server.register_memory(64, AccessIntent::LocalOnly).unwrap();
     let mut flushed = Box::pin(server.recv(flushed_recv, None));

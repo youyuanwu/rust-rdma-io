@@ -7,7 +7,7 @@
 pub use super::engine::{
     TestAcceptedOperation, TestAdmissionBarrier, TestConnectionCqeSuppression, TestContextIdentity,
     TestCqArmWindowControl, TestCqeSuppression, TestEngineInstrumentation, TestEngineQp,
-    TestEngineResources, TestProviderLimits, TestRouteHandle,
+    TestEngineResources, TestProviderLimits, TestRouteHandle, TestSharedResourceIdentity,
 };
 pub use super::message_transport::{TestHelloOverride, TestSteadyFrame};
 pub use crate::test_support::destruction::{

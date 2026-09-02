@@ -129,19 +129,9 @@ async fn run_success(mode: CompletionMode) {
 
     for engine in [&server_engine, &client_engine] {
         let diagnostics = engine.diagnostics();
-        assert_eq!(diagnostics.shared_contexts, 1);
-        assert_eq!(diagnostics.shared_protection_domains, 1);
-        assert_eq!(diagnostics.shared_completion_queues, 1);
-        assert_eq!(diagnostics.shared_cm_event_channels, 1);
-        assert_eq!(
-            diagnostics.shared_completion_channels,
-            usize::from(mode == CompletionMode::Readiness)
-        );
-        assert_eq!(diagnostics.live_connection_reservations, 1);
-        assert_eq!(diagnostics.operations_offered, 36);
-        assert_eq!(diagnostics.operations_accepted, 36);
-        assert_eq!(diagnostics.operations_completed, 2);
-        assert_eq!(diagnostics.accepted_outstanding_operations, 34);
+        assert_eq!(diagnostics.live_connections, 1);
+        assert_eq!(diagnostics.registered_operations, 34);
+        assert_eq!(diagnostics.accepted_operations, 34);
     }
 
     close_pair(
@@ -176,9 +166,8 @@ async fn run_capacity_rejection(mode: CompletionMode) {
         .await;
     assert!(matches!(result, Err(Error::InvalidConfig(_))));
     let diagnostics = engine.diagnostics();
-    assert_eq!(diagnostics.live_connection_reservations, 0);
+    assert_eq!(diagnostics.live_connections, 0);
     assert_eq!(diagnostics.registered_operations, 0);
-    assert_eq!(diagnostics.operations_offered, 0);
     engine.shutdown().await.unwrap();
     driver.await.unwrap().unwrap();
 }
@@ -195,7 +184,7 @@ async fn run_cancelled_accept(mode: CompletionMode) {
     drop(cancelled);
 
     tokio::time::timeout(Duration::from_secs(5), async {
-        while server_engine.diagnostics().pending_accepts != 0 {
+        while listener.test_queue_counts().1 != 0 {
             tokio::task::yield_now().await;
         }
     })
@@ -307,7 +296,7 @@ async fn run_mixed_accept_order(mode: CompletionMode) {
 
     let first_default = first.clone();
     let default_accept = tokio::spawn(async move { first_default.accept().await });
-    wait_pending_accepts(&server_engine, 1).await;
+    wait_pending_accepts(&first, 1).await;
     let first_configured = first.clone();
     let configured = RdmaConnectionConfig::default()
         .max_send_wr(8)
@@ -317,17 +306,17 @@ async fn run_mixed_accept_order(mode: CompletionMode) {
             .accept_with_config(configured.clone())
             .await
     });
-    wait_pending_accepts(&server_engine, 2).await;
+    wait_pending_accepts(&first, 2).await;
     let first_message = first.clone();
     let message_accept = tokio::spawn(async move {
         MessageTransportBuilder::new()
             .accept_on(&first_message)
             .await
     });
-    wait_pending_accepts(&server_engine, 3).await;
+    wait_pending_accepts(&first, 3).await;
     let second_default = second.clone();
     let independent_accept = tokio::spawn(async move { second_default.accept().await });
-    wait_pending_accepts(&server_engine, 4).await;
+    wait_pending_accepts(&second, 1).await;
 
     let independent_client = tokio::time::timeout(
         Duration::from_secs(15),
@@ -379,7 +368,6 @@ async fn run_mixed_accept_order(mode: CompletionMode) {
             ),
         };
     assert!(!message_accept.is_finished());
-    assert_eq!(server_engine.diagnostics().operations_offered, 0);
 
     let message_client = tokio::time::timeout(
         Duration::from_secs(15),
@@ -403,7 +391,6 @@ async fn run_mixed_accept_order(mode: CompletionMode) {
     })
     .await
     .expect("mixed message accept HELLO timed out");
-    assert_eq!(server_engine.diagnostics().operations_offered, 36);
 
     let (message_server_close, message_client_close) =
         tokio::time::timeout(Duration::from_secs(15), async {
@@ -461,9 +448,6 @@ async fn run_driver_withholding(mode: CompletionMode) {
 
     assert!(!accept.is_finished());
     assert!(!connect.is_finished());
-    assert_eq!(client_engine.diagnostics().operations_offered, 0);
-    assert_eq!(client_engine.diagnostics().connections_opened, 0);
-    assert_eq!(server_engine.diagnostics().operations_offered, 0);
 
     let client_driver = tokio::spawn(client_driver);
     let (server, client) = tokio::time::timeout(Duration::from_secs(15), async {
@@ -545,9 +529,9 @@ async fn run_message_driver_hello_timeout(mode: CompletionMode) {
     client_engine_driver.await.unwrap().unwrap();
 }
 
-async fn wait_pending_accepts(engine: &RdmaEngine, expected: usize) {
+async fn wait_pending_accepts(listener: &RdmaListener, expected: usize) {
     tokio::time::timeout(Duration::from_secs(5), async {
-        while engine.diagnostics().pending_accepts != expected {
+        while listener.test_queue_counts().1 != expected {
             tokio::task::yield_now().await;
         }
     })

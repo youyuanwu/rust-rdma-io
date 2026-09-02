@@ -31,63 +31,63 @@ case "$MODE" in
     --provider-probe)
         TEST_TARGET="v2_engine_provider_probe"
         REPETITIONS=1
-        MODE_LABEL="Phase 1 provider probe"
+        MODE_LABEL="provider probe"
         ;;
     --readiness-race)
         TEST_TARGET="v2_engine_readiness_race"
         REPETITIONS=5
-        MODE_LABEL="Phase 2 readiness race"
+        MODE_LABEL="readiness race"
         ;;
     --driver-flush-gate)
         TEST_TARGET="v2_engine_driver_flush_gate"
         REPETITIONS=1
-        MODE_LABEL="Phase 2 driver flush gate"
+        MODE_LABEL="driver flush gate"
         ;;
-    --phase3-operations)
+    --operations)
         TEST_TARGET="v2_engine_operation_tests"
         REPETITIONS=1
-        MODE_LABEL="Phase 3 owned-operation routing"
+        MODE_LABEL="owned-operation routing"
         ;;
-    --phase4-connections)
+    --connections)
         TEST_TARGET="v2_engine_connection_tests"
         REPETITIONS=1
-        MODE_LABEL="Phase 4 shared-CM outbound connections"
+        MODE_LABEL="shared-CM outbound connections"
         ;;
-    --phase5-listeners)
+    --listeners)
         TEST_TARGET="v2_engine_listener_tests"
         REPETITIONS=1
-        MODE_LABEL="Phase 5 listener backlog and accept arbitration"
+        MODE_LABEL="listener backlog and accept arbitration"
         ;;
-    --phase6-lifecycle)
+    --lifecycle)
         TEST_TARGET="v2_engine_lifecycle_tests"
         REPETITIONS=1
-        MODE_LABEL="Phase 6 accepted-WR drain and shutdown lifecycle"
+        MODE_LABEL="accepted-WR drain and shutdown lifecycle"
         ;;
-    --phase7-message-setup)
+    --message-setup)
         TEST_TARGET="v2_engine_message_setup_tests"
         REPETITIONS=1
-        MODE_LABEL="Phase 7 engine message setup"
+        MODE_LABEL="message-driver setup"
         ;;
-    --phase8-message)
+    --message)
         TEST_TARGET="v2_engine_message_tests"
         REPETITIONS=1
-        MODE_LABEL="Phase 8 engine message DATA/CREDIT progress"
+        MODE_LABEL="message-driver DATA/CREDIT progress"
         RUN_FULL_WORKSPACE=1
         ;;
     --engine-conformance)
         TEST_TARGET=""
         REPETITIONS=1
-        MODE_LABEL="Phase 10 engine conformance"
+        MODE_LABEL="engine conformance"
         ENGINE_CONFORMANCE=1
         ;;
     "")
         TEST_TARGET=""
         REPETITIONS=1
-        MODE_LABEL="Phase 12 full v2 engine validation"
+        MODE_LABEL="full v2 engine validation"
         FULL_VALIDATION=1
         ;;
     *)
-        echo "usage: sudo -E ./scripts/validate-v2-engine-providers.sh [--provider-probe|--readiness-race|--driver-flush-gate|--phase3-operations|--phase4-connections|--phase5-listeners|--phase6-lifecycle|--phase7-message-setup|--phase8-message|--engine-conformance]" >&2
+        echo "usage: sudo ./scripts/validate-v2-engine-providers.sh [--provider-probe|--readiness-race|--driver-flush-gate|--operations|--connections|--listeners|--lifecycle|--message-setup|--message|--engine-conformance]" >&2
         exit 2
         ;;
 esac
@@ -146,11 +146,11 @@ run_provider_test() {
     local iteration
     if [[ "$FULL_VALIDATION" -eq 1 ]]; then
         run_step "Build $provider production rdma-io without test-hooks" run_production_build
-        run_step "Run $provider Phase 1 provider probe" run_selected_test v2_engine_provider_probe
-        run_step "Run $provider Phase 2 driver flush gate" run_selected_test v2_engine_driver_flush_gate
+        run_step "Run $provider provider probe" run_selected_test v2_engine_provider_probe
+        run_step "Run $provider driver flush gate" run_selected_test v2_engine_driver_flush_gate
         for ((iteration = 1; iteration <= 5; iteration++)); do
             run_step \
-                "Run $provider Phase 2 readiness race ($iteration/5)" \
+                "Run $provider readiness race ($iteration/5)" \
                 run_selected_test v2_engine_readiness_race
         done
         run_step "Run $provider engine resource suite" run_selected_test v2_resource_tests
@@ -158,26 +158,29 @@ run_provider_test() {
         run_step "Run $provider engine connection suite" run_selected_test v2_engine_connection_tests
         run_step "Run $provider engine listener suite" run_selected_test v2_engine_listener_tests
         run_step "Run $provider engine lifecycle suite" run_selected_test v2_engine_lifecycle_tests
-        run_step "Run $provider engine message setup suite" run_selected_test v2_engine_message_setup_tests
-        run_step "Run $provider engine message suite" run_selected_test v2_engine_message_tests
-        run_step "Run $provider engine diagnostics suite" run_selected_test v2_engine_diagnostics_tests
-        run_step "Run $provider engine scaling suite" run_selected_test v2_engine_scaling_tests
+        run_step "Run $provider message-driver setup suite" run_selected_test v2_engine_message_setup_tests
+        run_step "Run $provider message-driver behavior suite" run_selected_test v2_engine_message_tests
+        run_step "Run $provider message-driver retry suite" run_selected_test v2_engine_message_retry_tests
+        run_step "Run $provider compact diagnostics suite" run_selected_test v2_engine_diagnostics_tests
         run_step "Run $provider eight-connection conformance" run_selected_test v2_engine_tests
+        run_step "Run $provider v1 safe-resource suite" run_selected_test safe_api_tests
         run_step "Run $provider full workspace with all features" run_full_workspace
         return
     fi
     if [[ "$ENGINE_CONFORMANCE" -eq 1 ]]; then
-        run_step "Run $provider Phase 2 driver flush gate" run_selected_test v2_engine_driver_flush_gate
+        run_step "Run $provider driver flush gate" run_selected_test v2_engine_driver_flush_gate
         for ((iteration = 1; iteration <= 5; iteration++)); do
             run_step \
-                "Run $provider Phase 2 readiness race ($iteration/5)" \
+                "Run $provider readiness race ($iteration/5)" \
                 run_selected_test v2_engine_readiness_race
         done
         run_step "Run $provider lifecycle/drop composite coverage" run_selected_test v2_engine_lifecycle_tests
         run_step "Run $provider driver-withholding composite coverage" run_selected_test v2_engine_message_setup_tests
-        run_step "Run $provider Phase 10 eight-connection conformance" run_selected_test v2_engine_tests
-        run_step "Run $provider Phase 10 diagnostics" run_selected_test v2_engine_diagnostics_tests
-        run_step "Run $provider Phase 10 scaling" run_selected_test v2_engine_scaling_tests
+        run_step "Run $provider message fairness/shutdown coverage" run_selected_test v2_engine_message_tests
+        run_step "Run $provider message retry coverage" run_selected_test v2_engine_message_retry_tests
+        run_step "Run $provider eight-connection conformance" run_selected_test v2_engine_tests
+        run_step "Run $provider compact diagnostics" run_selected_test v2_engine_diagnostics_tests
+        run_step "Run $provider v1 safe-resource suite" run_selected_test safe_api_tests
         return
     fi
     for ((iteration = 1; iteration <= REPETITIONS; iteration++)); do

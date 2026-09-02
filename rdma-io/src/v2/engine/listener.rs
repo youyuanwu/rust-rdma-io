@@ -13,7 +13,6 @@ use futures_util::task::AtomicWaker;
 use tokio::sync::Notify;
 
 use super::connection::{ConnectionReservation, SharedCmId};
-use super::diagnostics::RdmaListenerDiagnostics;
 use super::lifecycle::{MemoizedTerminalResult, TakeOnceResult};
 use super::registry::{lock_unpoison, read_unpoison};
 use super::{ConnectionSetup, EngineShared, RdmaConnection, RdmaConnectionConfig, SetupSummary};
@@ -22,49 +21,6 @@ use crate::v2::error::{Error, Result};
 pub(crate) const DEFAULT_LISTENER_BACKLOG: usize = 128;
 const MAX_LISTENER_BACKLOG: usize = 4_096;
 pub(super) const KERNEL_LISTEN_BACKLOG_REQUEST: i32 = i32::MAX;
-
-#[derive(Default)]
-pub(super) struct ListenerDiagnosticTotals {
-    listeners: AtomicUsize,
-    queued_children: AtomicUsize,
-    pending_accepts: AtomicUsize,
-    selected_accepts: AtomicUsize,
-}
-
-impl ListenerDiagnosticTotals {
-    pub(super) fn listener_added(&self) {
-        self.listeners.fetch_add(1, Ordering::AcqRel);
-    }
-
-    pub(super) fn listener_removed(&self) {
-        let previous = self.listeners.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "removed listener must be counted");
-    }
-
-    pub(super) fn snapshot(&self) -> (usize, usize, usize, usize) {
-        (
-            self.listeners.load(Ordering::Acquire),
-            self.queued_children.load(Ordering::Acquire),
-            self.pending_accepts.load(Ordering::Acquire),
-            self.selected_accepts.load(Ordering::Acquire),
-        )
-    }
-
-    fn update_queue_counts(&self, old: (usize, usize, usize), new: (usize, usize, usize)) {
-        update_gauge(&self.queued_children, old.0, new.0);
-        update_gauge(&self.pending_accepts, old.1, new.1);
-        update_gauge(&self.selected_accepts, old.2, new.2);
-    }
-}
-
-fn update_gauge(gauge: &AtomicUsize, old: usize, new: usize) {
-    if new >= old {
-        gauge.fetch_add(new - old, Ordering::AcqRel);
-    } else {
-        let previous = gauge.fetch_sub(old - new, Ordering::AcqRel);
-        debug_assert!(previous >= old - new, "listener gauge underflow");
-    }
-}
 
 /// Configuration for one engine-owned listener.
 ///
@@ -198,6 +154,12 @@ impl RdmaListener {
         config.validate(&self.shared.config, self.shared.provider.as_ref())
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn test_queue_counts(&self) -> (usize, usize, usize) {
+        self.state.queue_counts()
+    }
+
     /// Close the listener and wait for CM destruction or engine termination.
     ///
     /// Close is idempotent across clones. If the engine driver fails while the
@@ -218,21 +180,6 @@ impl RdmaListener {
             }
             notified.await;
         }
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[doc(hidden)]
-    pub async fn accept_with_test_setup_failure(
-        &self,
-        message: impl Into<String>,
-    ) -> Result<RdmaConnection> {
-        accept_with_setup(
-            Arc::clone(&self.shared),
-            Arc::clone(&self.state),
-            RdmaConnectionConfig::default(),
-            failing_connection_setup(message.into()),
-        )
-        .await
     }
 }
 
@@ -295,11 +242,6 @@ pub(super) async fn accept_with_setup(
 
 pub(super) fn empty_connection_setup() -> ConnectionSetup {
     Box::new(|_connection| Ok(SetupSummary { posted_wrs: 0 }))
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-fn failing_connection_setup(message: String) -> ConnectionSetup {
-    Box::new(move |_connection| Err(Error::InvalidConfig(message)))
 }
 
 pub(super) fn run_setup_before_establish(
@@ -478,7 +420,6 @@ pub(super) struct AcceptRequest {
     intent: Mutex<Option<AcceptIntent>>,
     result: Mutex<TakeOnceResult<RdmaConnection>>,
     cancelled: AtomicBool,
-    cancellation_counted: AtomicBool,
     delivered: AtomicBool,
     route_token: AtomicU64,
     waker: AtomicWaker,
@@ -490,7 +431,6 @@ impl AcceptRequest {
             intent: Mutex::new(Some(intent)),
             result: Mutex::new(TakeOnceResult::Pending),
             cancelled: AtomicBool::new(false),
-            cancellation_counted: AtomicBool::new(false),
             delivered: AtomicBool::new(false),
             route_token: AtomicU64::new(0),
             waker: AtomicWaker::new(),
@@ -511,10 +451,6 @@ impl AcceptRequest {
 
     pub(super) fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
-    }
-
-    pub(super) fn mark_cancellation_counted(&self) -> bool {
-        !self.cancellation_counted.swap(true, Ordering::AcqRel)
     }
 
     pub(super) fn set_route_token(&self, token: u64) {
@@ -658,7 +594,6 @@ pub(super) struct ListenerState {
     pub(super) backlog: usize,
     pub(super) cm_id: Mutex<Option<SharedCmId>>,
     queues: Mutex<ListenerQueues>,
-    diagnostic_totals: Arc<ListenerDiagnosticTotals>,
     queued_children: AtomicUsize,
     pending_accepts: AtomicUsize,
     selected_accepts: AtomicUsize,
@@ -677,7 +612,6 @@ impl ListenerState {
         local_addr: SocketAddr,
         config: RdmaListenerConfig,
         cm_id: SharedCmId,
-        diagnostic_totals: Arc<ListenerDiagnosticTotals>,
     ) -> Self {
         Self {
             token,
@@ -685,7 +619,6 @@ impl ListenerState {
             backlog: config.backlog,
             cm_id: Mutex::new(Some(cm_id)),
             queues: Mutex::new(ListenerQueues::default()),
-            diagnostic_totals,
             queued_children: AtomicUsize::new(0),
             pending_accepts: AtomicUsize::new(0),
             selected_accepts: AtomicUsize::new(0),
@@ -707,7 +640,6 @@ impl ListenerState {
             backlog,
             cm_id: Mutex::new(None),
             queues: Mutex::new(ListenerQueues::default()),
-            diagnostic_totals: Arc::new(ListenerDiagnosticTotals::default()),
             queued_children: AtomicUsize::new(0),
             pending_accepts: AtomicUsize::new(0),
             selected_accepts: AtomicUsize::new(0),
@@ -723,19 +655,16 @@ impl ListenerState {
 
     fn lock_queues(&self) -> ListenerQueueGuard<'_> {
         let guard = lock_unpoison(&self.queues);
-        let before = queue_counts(&guard);
         ListenerQueueGuard {
             listener: self,
             guard,
-            before,
         }
     }
 
-    fn publish_queue_counts(&self, before: (usize, usize, usize), after: (usize, usize, usize)) {
+    fn publish_queue_counts(&self, after: (usize, usize, usize)) {
         self.queued_children.store(after.0, Ordering::Release);
         self.pending_accepts.store(after.1, Ordering::Release);
         self.selected_accepts.store(after.2, Ordering::Release);
-        self.diagnostic_totals.update_queue_counts(before, after);
     }
 
     pub(super) fn register_waiter(&self, request: Arc<AcceptRequest>) -> Result<()> {
@@ -1063,6 +992,7 @@ impl ListenerState {
             .map(MemoizedTerminalResult::into_result)
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(super) fn queue_counts(&self) -> (usize, usize, usize) {
         (
             self.queued_children.load(Ordering::Acquire),
@@ -1070,23 +1000,11 @@ impl ListenerState {
             self.selected_accepts.load(Ordering::Acquire),
         )
     }
-
-    pub(super) fn diagnostics(&self) -> RdmaListenerDiagnostics {
-        let (queued_inbound_requests, pending_accepts, selected_accepts) = self.queue_counts();
-        RdmaListenerDiagnostics {
-            token: self.token,
-            local_addr: self.local_addr,
-            queued_inbound_requests,
-            pending_accepts,
-            selected_accepts,
-        }
-    }
 }
 
 struct ListenerQueueGuard<'a> {
     listener: &'a ListenerState,
     guard: MutexGuard<'a, ListenerQueues>,
-    before: (usize, usize, usize),
 }
 
 impl Deref for ListenerQueueGuard<'_> {
@@ -1106,7 +1024,7 @@ impl DerefMut for ListenerQueueGuard<'_> {
 impl Drop for ListenerQueueGuard<'_> {
     fn drop(&mut self) {
         self.listener
-            .publish_queue_counts(self.before, queue_counts(&self.guard));
+            .publish_queue_counts(queue_counts(&self.guard));
     }
 }
 

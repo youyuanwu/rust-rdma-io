@@ -110,10 +110,9 @@ pub use crate::async_cq::CqNotifier;
 
 #[cfg(feature = "tokio")]
 pub use engine::{
-    CompletionMode, RdmaConnection, RdmaConnectionConfig, RdmaConnectionDiagnostics,
-    RdmaConnectionIdentity, RdmaEngine, RdmaEngineBuilder, RdmaEngineDiagnostics, RdmaEngineDriver,
-    RdmaEngineLifecycle, RdmaEngineTerminalError, RdmaListener, RdmaListenerConfig,
-    RdmaListenerDiagnostics, RdmaOperation,
+    CompletionMode, RdmaConnection, RdmaConnectionConfig, RdmaConnectionIdentity, RdmaEngine,
+    RdmaEngineBuilder, RdmaEngineDiagnostics, RdmaEngineDriver, RdmaEngineLifecycle,
+    RdmaEngineTerminalError, RdmaListener, RdmaListenerConfig, RdmaOperation,
 };
 
 #[cfg(feature = "tokio")]

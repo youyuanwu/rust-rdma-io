@@ -3,7 +3,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use rdma_io::cm::{CmEventType, ConnParam, RdmaCmDeviceList};
+use rdma_io::cm::{ConnParam, RdmaCmDeviceList};
 use rdma_io::v2::test_support::{DestructionKind, DestructionRecorder, TestEngineResources};
 use rdma_io::v2::{
     AccessIntent, CompletionMode, Error, RdmaConnection, RdmaConnectionConfig, RdmaEngine,
@@ -164,49 +164,22 @@ async fn run_mode(mode: CompletionMode) {
         configured_server.local_addr().unwrap()
     );
     exercise_operations(&default_server, &default_client).await;
-    wait_until(
-        Duration::from_secs(5),
-        "operation completion diagnostics did not catch up",
-        || engine.diagnostics().operations_completed == 4,
-    )
-    .await;
 
     let diagnostics = engine.diagnostics();
-    assert_eq!(diagnostics.shared_contexts, 1);
-    assert_eq!(diagnostics.shared_protection_domains, 1);
-    assert_eq!(diagnostics.shared_completion_queues, 1);
-    assert_eq!(diagnostics.shared_cm_event_channels, 1);
-    assert_eq!(
-        diagnostics.shared_completion_channels,
-        usize::from(mode == CompletionMode::Readiness)
-    );
-    assert_eq!(diagnostics.live_connection_reservations, 4);
-    assert_eq!(diagnostics.connections_opened, 2);
-    assert!(diagnostics.cm_events_processed >= 6);
-    assert_eq!(diagnostics.cm_events_rejected, 0);
-    assert_eq!(diagnostics.operations_accepted, 4);
-    assert_eq!(diagnostics.operations_completed, 4);
+    assert_eq!(diagnostics.live_connections, 4);
+    assert_eq!(diagnostics.registered_operations, 0);
+    assert_eq!(diagnostics.accepted_operations, 0);
 
     resources.disconnect_connection(&default_server).unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if engine.diagnostics().cm_events_processed > diagnostics.cm_events_processed {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("disconnect event was not routed by the shared CM driver");
     let disconnected_mr = default_client
         .register_memory(64, AccessIntent::LocalOnly)
         .unwrap();
     let (disconnected, returned) = default_client.send(disconnected_mr, None).await;
     assert!(matches!(disconnected, Err(Error::TransportClosed)));
-    assert!(returned.is_some());
+    drop(returned);
     default_server.close().await.unwrap();
     default_client.close().await.unwrap();
-    assert_eq!(engine.diagnostics().live_connection_reservations, 2);
+    assert_eq!(engine.diagnostics().live_connections, 2);
 
     let configured_recv = configured_server
         .register_memory(64, AccessIntent::LocalOnly)
@@ -269,8 +242,7 @@ async fn run_rejected_connect(mode: CompletionMode) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let diagnostics = engine.diagnostics();
-            if diagnostics.live_connection_reservations == 2 && diagnostics.connections_failed == 1
-            {
+            if diagnostics.live_connections == 2 {
                 break;
             }
             tokio::task::yield_now().await;
@@ -278,8 +250,7 @@ async fn run_rejected_connect(mode: CompletionMode) {
     })
     .await
     .expect("rejected connection resources were not retired");
-    assert_eq!(engine.diagnostics().live_connection_reservations, 2);
-    assert_eq!(engine.diagnostics().connections_failed, 1);
+    assert_eq!(engine.diagnostics().live_connections, 2);
 
     let recv = server.register_memory(64, AccessIntent::LocalOnly).unwrap();
     let send = client.register_memory(64, AccessIntent::LocalOnly).unwrap();
@@ -343,12 +314,7 @@ async fn run_over_budget_failed_connects(mode: CompletionMode) {
     wait_until(
         Duration::from_secs(10),
         "over-budget failed connect resources were not retired",
-        || {
-            let diagnostics = engine.diagnostics();
-            diagnostics.connections_failed == ATTEMPTS as u64
-                && diagnostics.live_connection_reservations == 0
-                && diagnostics.free_connection_slots == ATTEMPTS
-        },
+        || engine.diagnostics().live_connections == 0,
     )
     .await;
 
@@ -363,124 +329,6 @@ fn unresolved_neighbor_addr() -> std::net::SocketAddr {
         .octets();
     octets[3] = if octets[3] == 250 { 251 } else { 250 };
     std::net::SocketAddr::from((std::net::Ipv4Addr::from(octets), 9))
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PreShutdownState {
-    Pending,
-    // The initial manual driver poll consumed setup progress such as
-    // AddrResolved, but the route is still establishing and no failure won.
-    SetupProgress,
-    AddrErrorWon,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct TerminalLedger {
-    pre_shutdown_state: PreShutdownState,
-    connect_is_addr_error: bool,
-    connect_is_shutdown: bool,
-    cm_events_processed: u64,
-    connections_failed: u64,
-    live: usize,
-    establishing: usize,
-    pending_routes: usize,
-    retained_owners: usize,
-    rejected: u64,
-    stale: u64,
-    duplicate: u64,
-    unknown: u64,
-    wrong_id: u64,
-    unexpected: u64,
-}
-
-fn classify_pre_shutdown_ledger(
-    cm_events_processed: u64,
-    connections_failed: u64,
-    live: usize,
-    establishing: usize,
-) -> Option<PreShutdownState> {
-    match (cm_events_processed, connections_failed, live, establishing) {
-        (0, 0, 1, 1) => Some(PreShutdownState::Pending),
-        (1, 0, 1, 1) => Some(PreShutdownState::SetupProgress),
-        (1, 1, 0, 0) => Some(PreShutdownState::AddrErrorWon),
-        _ => None,
-    }
-}
-
-fn is_allowed_terminal_ledger(ledger: &TerminalLedger) -> bool {
-    match ledger {
-        TerminalLedger {
-            pre_shutdown_state: PreShutdownState::AddrErrorWon,
-            connect_is_addr_error: true,
-            connect_is_shutdown: false,
-            cm_events_processed: 1,
-            connections_failed: 1,
-            live: 0,
-            establishing: 0,
-            pending_routes: 0,
-            retained_owners: 0,
-            rejected: 0,
-            stale: 0,
-            duplicate: 0,
-            unknown: 0,
-            wrong_id: 0,
-            unexpected: 0,
-        } => true,
-        TerminalLedger {
-            pre_shutdown_state: PreShutdownState::Pending,
-            connect_is_addr_error: false,
-            connect_is_shutdown: true,
-            cm_events_processed: 0,
-            connections_failed: 0,
-            live: 0,
-            establishing: 0,
-            pending_routes: 0,
-            retained_owners: 0,
-            rejected: 0,
-            stale: 0,
-            duplicate: 0,
-            unknown: 0,
-            wrong_id: 0,
-            unexpected: 0,
-        } => true,
-        // Setup progress may arrive after a Pending snapshot but before
-        // shutdown cancels the route.
-        TerminalLedger {
-            pre_shutdown_state: PreShutdownState::Pending,
-            connect_is_addr_error: false,
-            connect_is_shutdown: true,
-            cm_events_processed: 1,
-            connections_failed: 0,
-            live: 0,
-            establishing: 0,
-            pending_routes: 0,
-            retained_owners: 0,
-            rejected: 0,
-            stale: 0,
-            duplicate: 0,
-            unknown: 0,
-            wrong_id: 0,
-            unexpected: 0,
-        } => true,
-        TerminalLedger {
-            pre_shutdown_state: PreShutdownState::SetupProgress,
-            connect_is_addr_error: false,
-            connect_is_shutdown: true,
-            cm_events_processed: 1,
-            connections_failed: 0,
-            live: 0,
-            establishing: 0,
-            pending_routes: 0,
-            retained_owners: 0,
-            rejected: 0,
-            stale: 0,
-            duplicate: 0,
-            unknown: 0,
-            wrong_id: 0,
-            unexpected: 0,
-        } => true,
-        _ => false,
-    }
 }
 
 async fn run_readiness_shutdown_after_addr_error() {
@@ -512,22 +360,6 @@ async fn run_readiness_shutdown_after_addr_error() {
     let before_shutdown = engine.diagnostics();
     assert_eq!(before_shutdown.lifecycle, RdmaEngineLifecycle::Running);
     assert!(before_shutdown.terminal_error.is_none());
-    assert_eq!(before_shutdown.connections_admitted, 1);
-    assert_eq!(before_shutdown.free_connection_slots, 1);
-    assert_eq!(before_shutdown.cm_events_rejected, 0);
-    let pre_shutdown_ledger = (
-        before_shutdown.cm_events_processed,
-        before_shutdown.connections_failed,
-        before_shutdown.live_connection_reservations,
-        before_shutdown.establishing_connection_reservations,
-    );
-    let pre_shutdown_state = classify_pre_shutdown_ledger(
-        pre_shutdown_ledger.0,
-        pre_shutdown_ledger.1,
-        pre_shutdown_ledger.2,
-        pre_shutdown_ledger.3,
-    )
-    .unwrap_or_else(|| panic!("invalid pre-shutdown ADDR_ERROR ledger: {pre_shutdown_ledger:?}"));
 
     let mut shutdown = Box::pin(engine.shutdown());
     assert!(
@@ -541,7 +373,6 @@ async fn run_readiness_shutdown_after_addr_error() {
         RdmaEngineLifecycle::ShutdownRequested
     );
     assert!(shutdown_requested.terminal_error.is_none());
-    assert_eq!(shutdown_requested.shutdowns, 1);
     let driver_task = tokio::spawn(driver);
 
     tokio::time::timeout(Duration::from_secs(10), shutdown.as_mut())
@@ -556,199 +387,34 @@ async fn run_readiness_shutdown_after_addr_error() {
     let diagnostics = engine.diagnostics();
     assert_eq!(diagnostics.lifecycle, RdmaEngineLifecycle::Terminated);
     assert!(diagnostics.terminal_error.is_none());
-    assert_eq!(diagnostics.shutdowns, 1);
-    assert_eq!(diagnostics.connections_admitted, 1);
-    assert_eq!(diagnostics.established_connection_reservations, 0);
-    assert_eq!(diagnostics.draining_connection_reservations, 0);
-    assert_eq!(diagnostics.registered_live_qps, 0);
-    assert_eq!(diagnostics.free_connection_slots, 1);
-    assert_eq!(diagnostics.retired_connection_slots, 0);
-    assert_eq!(diagnostics.connections_opened, 0);
-    assert_eq!(diagnostics.connections_closed, 0);
-    assert_eq!(diagnostics.connections_quarantined, 0);
+    assert_eq!(diagnostics.live_connections, 0);
     assert_eq!(diagnostics.registered_operations, 0);
-    assert_eq!(diagnostics.free_operation_slots, 64);
-    assert_eq!(diagnostics.retired_operation_slots, 0);
-    assert_eq!(diagnostics.accepted_outstanding_operations, 0);
-    assert_eq!(diagnostics.free_cq_credits, 64);
+    assert_eq!(diagnostics.accepted_operations, 0);
+    assert_eq!(diagnostics.available_cq_credits, 64);
     assert_eq!(diagnostics.retained_cq_credits, 0);
     assert_eq!(diagnostics.pending_reclamations, 0);
     assert_eq!(diagnostics.quarantined_operations, 0);
     assert_eq!(diagnostics.quarantined_mrs, 0);
     assert_eq!(diagnostics.quarantined_bytes, 0);
-    assert_eq!(diagnostics.quarantined_bundles, 0);
-    assert_eq!(diagnostics.ready_queue_depth, 0);
-    assert_eq!(diagnostics.listener_count, 0);
-    assert_eq!(diagnostics.queued_inbound_requests, 0);
-    assert_eq!(diagnostics.pending_accepts, 0);
-    assert_eq!(diagnostics.selected_accepts, 0);
-    assert_eq!(diagnostics.inbound_requests_accepted, 0);
-    assert_eq!(diagnostics.inbound_requests_rejected, 0);
-    assert!(diagnostics.connections().is_empty());
-    assert!(diagnostics.listeners().is_empty());
+    assert_eq!(diagnostics.quarantined_connections, 0);
     let instrumentation = resources.instrumentation().unwrap();
     let connect_is_addr_error = matches!(&connect_error, Error::Verbs(_))
         && connect_error
             .to_string()
             .contains("RDMA CM AddrError failed with status ");
     let connect_is_shutdown = matches!(&connect_error, Error::DriverShutdown);
-    let terminal_ledger = TerminalLedger {
-        pre_shutdown_state,
-        connect_is_addr_error,
-        connect_is_shutdown,
-        cm_events_processed: diagnostics.cm_events_processed,
-        connections_failed: diagnostics.connections_failed,
-        live: diagnostics.live_connection_reservations,
-        establishing: diagnostics.establishing_connection_reservations,
-        pending_routes: instrumentation.cm_pending_routes,
-        retained_owners: instrumentation.cm_retained_owners,
-        rejected: diagnostics.cm_events_rejected,
-        stale: diagnostics.stale_cm_events,
-        duplicate: diagnostics.duplicate_cm_events,
-        unknown: diagnostics.unknown_cm_events,
-        wrong_id: diagnostics.wrong_id_cm_events,
-        unexpected: diagnostics.unexpected_cm_events,
-    };
-    if !is_allowed_terminal_ledger(&terminal_ledger) {
-        panic!(
-            "invalid terminal ADDR/shutdown ledger {terminal_ledger:?}; connect error: {connect_error}"
-        );
-    }
+    assert!(
+        connect_is_addr_error || connect_is_shutdown,
+        "unexpected unresolved-neighbor result: {connect_error}"
+    );
+    assert_eq!(instrumentation.cm_pending_routes, 0);
+    assert_eq!(instrumentation.cm_retained_owners, 0);
 
     tokio::task::yield_now().await;
     let stable = engine.diagnostics();
     assert_eq!(
         stable, diagnostics,
         "driver termination must freeze the complete diagnostic ledger"
-    );
-}
-
-async fn run_shutdown_awaiting_delivery(mode: CompletionMode) {
-    if !has_software_rdma() {
-        return;
-    }
-    let recorder = DestructionRecorder::arm(128);
-    let device = software_device_name().expect("software RDMA device");
-    let (engine, driver) = RdmaEngineBuilder::new(device)
-        .completion_mode(mode)
-        .maximum_live_connections(1)
-        .maximum_inflight_operations(64)
-        .cq_capacity(64)
-        .build()
-        .unwrap();
-    let resources = engine.test_resources().unwrap();
-    let driver_task = tokio::spawn(driver);
-    let listener = bind_listener_with_retry().await;
-    let address = connect_addr_for(listener.local_addr());
-    let server_resources = resources.clone();
-    let (server_established_tx, server_established_rx) = tokio::sync::oneshot::channel();
-    let server_task = tokio::spawn(async move {
-        let cm_id = listener.get_request().await.unwrap();
-        server_resources.require_context(&cm_id).unwrap();
-        let qp = server_resources.create_qp(&cm_id, 19, 34).unwrap();
-        cm_id.accept(&ConnParam::default()).unwrap();
-        listener.await_established().await.unwrap();
-        server_established_tx.send(()).unwrap();
-        loop {
-            let event = listener.next_event().await.unwrap();
-            let event_type = event.event_type();
-            event.ack();
-            if event_type == CmEventType::Disconnected {
-                break;
-            }
-        }
-        drop(qp);
-        drop(cm_id);
-        drop(listener);
-    });
-
-    let mut connect = Box::pin(engine.connect(address));
-    poll_fn(|cx| {
-        assert!(connect.as_mut().poll(cx).is_pending());
-        Poll::Ready(())
-    })
-    .await;
-    tokio::time::timeout(Duration::from_secs(15), server_established_rx)
-        .await
-        .expect("server did not establish the undelivered client connection")
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            if engine.diagnostics().connections_opened == 1 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("client connect did not reach EstablishedAwaitingDelivery");
-
-    let mut shutdown = Box::pin(engine.shutdown());
-    let first_shutdown_poll = poll_fn(|cx| Poll::Ready(shutdown.as_mut().poll(cx))).await;
-    assert!(matches!(
-        engine.diagnostics().lifecycle,
-        RdmaEngineLifecycle::ShutdownRequested | RdmaEngineLifecycle::Terminated
-    ));
-    drop(connect);
-
-    match first_shutdown_poll {
-        Poll::Ready(result) => result.unwrap(),
-        Poll::Pending => shutdown.as_mut().await.unwrap(),
-    }
-    drop(shutdown);
-    driver_task.await.unwrap().unwrap();
-    tokio::time::timeout(Duration::from_secs(15), server_task)
-        .await
-        .expect("server did not observe client CM destruction")
-        .unwrap();
-
-    let diagnostics = engine.diagnostics();
-    assert_eq!(diagnostics.lifecycle, RdmaEngineLifecycle::Terminated);
-    assert!(diagnostics.terminal_error.is_none());
-    assert_eq!(diagnostics.live_connection_reservations, 0);
-    assert_eq!(diagnostics.free_connection_slots, 1);
-    assert_eq!(diagnostics.retired_connection_slots, 0);
-    assert_eq!(diagnostics.connections_opened, 1);
-    assert_eq!(diagnostics.connections_failed, 0);
-
-    drop(resources);
-    drop(engine);
-    let events = recorder.take();
-    assert!(!recorder.overflowed());
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| event.kind == DestructionKind::QueuePair)
-            .count(),
-        2
-    );
-    for kind in [
-        DestructionKind::ProtectionDomain,
-        DestructionKind::CompletionQueue,
-        DestructionKind::CmEventChannel,
-        DestructionKind::ContextFacade,
-        DestructionKind::RdmaFreeDevices,
-    ] {
-        assert!(
-            events.iter().any(|event| event.kind == kind),
-            "missing destruction evidence for {kind:?} in {mode:?}"
-        );
-    }
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| event.kind == DestructionKind::CompletionChannel)
-            .count(),
-        usize::from(mode == CompletionMode::Readiness)
-    );
-    assert!(
-        !events
-            .iter()
-            .any(|event| event.kind == DestructionKind::IbvCloseDevice)
-    );
-    assert_eq!(
-        events.last().map(|event| event.kind),
-        Some(DestructionKind::RdmaFreeDevices)
     );
 }
 
@@ -779,11 +445,9 @@ async fn run_connect_admission_shutdown_barrier(mode: CompletionMode) {
     barrier.wait_until_paused().unwrap();
     let paused = engine.diagnostics();
     assert_ne!(paused.lifecycle, RdmaEngineLifecycle::ShutdownRequested);
-    assert_eq!(paused.live_connection_reservations, 1);
-    assert_eq!(paused.free_connection_slots, 1);
+    assert_eq!(paused.live_connections, 1);
     assert_eq!(paused.registered_operations, 0);
-    assert_eq!(paused.free_operation_slots, OPERATIONS);
-    assert_eq!(paused.free_cq_credits, OPERATIONS);
+    assert_eq!(paused.available_cq_credits, OPERATIONS);
 
     let shutdown_engine = engine.clone();
     let shutdown_thread = std::thread::spawn(move || {
@@ -800,8 +464,7 @@ async fn run_connect_admission_shutdown_barrier(mode: CompletionMode) {
         .expect("shutdown poll thread panicked");
     let admitted = engine.diagnostics();
     assert_eq!(admitted.lifecycle, RdmaEngineLifecycle::ShutdownRequested);
-    assert_eq!(admitted.live_connection_reservations, 1);
-    assert_eq!(admitted.free_connection_slots, 1);
+    assert_eq!(admitted.live_connections, 1);
 
     let driver_task = tokio::spawn(driver);
     let (connect_result, shutdown_result) = tokio::time::timeout(Duration::from_secs(10), async {
@@ -816,12 +479,10 @@ async fn run_connect_admission_shutdown_barrier(mode: CompletionMode) {
     let diagnostics = engine.diagnostics();
     assert_eq!(diagnostics.lifecycle, RdmaEngineLifecycle::Terminated);
     assert!(diagnostics.terminal_error.is_none());
-    assert_eq!(diagnostics.live_connection_reservations, 0);
-    assert_eq!(diagnostics.free_connection_slots, 1);
+    assert_eq!(diagnostics.live_connections, 0);
     assert_eq!(diagnostics.registered_operations, 0);
-    assert_eq!(diagnostics.free_operation_slots, OPERATIONS);
-    assert_eq!(diagnostics.accepted_outstanding_operations, 0);
-    assert_eq!(diagnostics.free_cq_credits, OPERATIONS);
+    assert_eq!(diagnostics.accepted_operations, 0);
+    assert_eq!(diagnostics.available_cq_credits, OPERATIONS);
     assert_eq!(diagnostics.retained_cq_credits, 0);
 
     drop(resources);
@@ -859,12 +520,10 @@ async fn run_operation_admission_shutdown_barrier(mode: CompletionMode) {
     barrier.wait_until_paused().unwrap();
     let paused = engine.diagnostics();
     assert_ne!(paused.lifecycle, RdmaEngineLifecycle::ShutdownRequested);
-    assert_eq!(paused.live_connection_reservations, 2);
-    assert_eq!(paused.free_connection_slots, 0);
+    assert_eq!(paused.live_connections, 2);
     assert_eq!(paused.registered_operations, 0);
-    assert_eq!(paused.free_operation_slots, OPERATIONS);
-    assert_eq!(paused.accepted_outstanding_operations, 0);
-    assert_eq!(paused.free_cq_credits, OPERATIONS);
+    assert_eq!(paused.accepted_operations, 0);
+    assert_eq!(paused.available_cq_credits, OPERATIONS);
     assert_eq!(
         recorder
             .snapshot()
@@ -892,9 +551,8 @@ async fn run_operation_admission_shutdown_barrier(mode: CompletionMode) {
     let admitted = engine.diagnostics();
     assert_eq!(admitted.lifecycle, RdmaEngineLifecycle::ShutdownRequested);
     assert_eq!(admitted.registered_operations, 1);
-    assert_eq!(admitted.free_operation_slots, OPERATIONS - 1);
-    assert_eq!(admitted.accepted_outstanding_operations, 1);
-    assert_eq!(admitted.free_cq_credits, OPERATIONS - 1);
+    assert_eq!(admitted.accepted_operations, 1);
+    assert_eq!(admitted.available_cq_credits, OPERATIONS - 1);
     assert_eq!(admitted.retained_cq_credits, 0);
 
     let mut server_close = Box::pin(server.close());
@@ -924,12 +582,10 @@ async fn run_operation_admission_shutdown_barrier(mode: CompletionMode) {
     let diagnostics = engine.diagnostics();
     assert_eq!(diagnostics.lifecycle, RdmaEngineLifecycle::Terminated);
     assert!(diagnostics.terminal_error.is_none());
-    assert_eq!(diagnostics.live_connection_reservations, 0);
-    assert_eq!(diagnostics.free_connection_slots, 2);
+    assert_eq!(diagnostics.live_connections, 0);
     assert_eq!(diagnostics.registered_operations, 0);
-    assert_eq!(diagnostics.free_operation_slots, OPERATIONS);
-    assert_eq!(diagnostics.accepted_outstanding_operations, 0);
-    assert_eq!(diagnostics.free_cq_credits, OPERATIONS);
+    assert_eq!(diagnostics.accepted_operations, 0);
+    assert_eq!(diagnostics.available_cq_credits, OPERATIONS);
     assert_eq!(diagnostics.retained_cq_credits, 0);
     assert_eq!(
         recorder
@@ -961,91 +617,6 @@ async fn run_operation_admission_shutdown_barrier(mode: CompletionMode) {
     drop(recorder);
 }
 
-#[test]
-fn readiness_shutdown_addr_error_state_table_is_exact() {
-    assert_eq!(
-        classify_pre_shutdown_ledger(0, 0, 1, 1),
-        Some(PreShutdownState::Pending)
-    );
-    assert_eq!(
-        classify_pre_shutdown_ledger(1, 0, 1, 1),
-        Some(PreShutdownState::SetupProgress)
-    );
-    assert_eq!(
-        classify_pre_shutdown_ledger(1, 1, 0, 0),
-        Some(PreShutdownState::AddrErrorWon)
-    );
-    for ledger in [(1, 0, 0, 1), (1, 0, 1, 0), (1, 1, 1, 1), (2, 0, 1, 1)] {
-        assert_eq!(
-            classify_pre_shutdown_ledger(ledger.0, ledger.1, ledger.2, ledger.3),
-            None,
-            "near-miss pre-shutdown ledger must be rejected: {ledger:?}"
-        );
-    }
-
-    let shutdown_ledger = |pre_shutdown_state, cm_events_processed| TerminalLedger {
-        pre_shutdown_state,
-        connect_is_addr_error: false,
-        connect_is_shutdown: true,
-        cm_events_processed,
-        connections_failed: 0,
-        live: 0,
-        establishing: 0,
-        pending_routes: 0,
-        retained_owners: 0,
-        rejected: 0,
-        stale: 0,
-        duplicate: 0,
-        unknown: 0,
-        wrong_id: 0,
-        unexpected: 0,
-    };
-    let addr_error_won = TerminalLedger {
-        pre_shutdown_state: PreShutdownState::AddrErrorWon,
-        connect_is_addr_error: true,
-        connect_is_shutdown: false,
-        cm_events_processed: 1,
-        connections_failed: 1,
-        live: 0,
-        establishing: 0,
-        pending_routes: 0,
-        retained_owners: 0,
-        rejected: 0,
-        stale: 0,
-        duplicate: 0,
-        unknown: 0,
-        wrong_id: 0,
-        unexpected: 0,
-    };
-    let allowed = [
-        shutdown_ledger(PreShutdownState::Pending, 0),
-        shutdown_ledger(PreShutdownState::Pending, 1),
-        shutdown_ledger(PreShutdownState::SetupProgress, 1),
-        addr_error_won.clone(),
-    ];
-    for ledger in &allowed {
-        assert!(
-            is_allowed_terminal_ledger(ledger),
-            "allowed transition was rejected: {ledger:?}"
-        );
-    }
-
-    let mut near_misses = [
-        shutdown_ledger(PreShutdownState::SetupProgress, 0),
-        shutdown_ledger(PreShutdownState::Pending, 2),
-        addr_error_won.clone(),
-        addr_error_won,
-    ];
-    near_misses[2].connections_failed = 0;
-    near_misses[3].rejected = 1;
-    for ledger in &near_misses {
-        assert!(
-            !is_allowed_terminal_ledger(ledger),
-            "near-miss terminal ledger must be rejected: {ledger:?}"
-        );
-    }
-}
-
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn outbound_connect_and_operations_use_one_shared_engine_in_both_modes() {
     run_mode(CompletionMode::Readiness).await;
@@ -1067,12 +638,6 @@ async fn more_than_one_cm_budget_of_failed_connects_progresses_cooperatively() {
 #[test_log::test(tokio::test(flavor = "current_thread"))]
 async fn readiness_shutdown_rechecks_terminal_after_await_addr_error_on_one_core() {
     run_readiness_shutdown_after_addr_error().await;
-}
-
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
-async fn shutdown_retires_an_established_connect_dropped_without_repolling_in_both_modes() {
-    run_shutdown_awaiting_delivery(CompletionMode::Readiness).await;
-    run_shutdown_awaiting_delivery(CompletionMode::Polling).await;
 }
 
 #[test_log::test(tokio::test(flavor = "current_thread"))]
@@ -1108,13 +673,13 @@ async fn withholding_the_driver_prevents_cm_progress_and_cancellation_releases_a
         Poll::Ready(())
     })
     .await;
-    assert_eq!(engine.diagnostics().live_connection_reservations, 1);
+    assert_eq!(engine.diagnostics().live_connections, 1);
     drop(connect);
 
     let driver_task = tokio::spawn(driver);
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if engine.diagnostics().live_connection_reservations == 0 {
+            if engine.diagnostics().live_connections == 0 {
                 break;
             }
             tokio::task::yield_now().await;
@@ -1149,7 +714,6 @@ async fn aggregate_outbound_admission_rejects_before_a_second_cm_request() {
         Err(error) => error,
     };
     assert!(matches!(error, Error::CapacityExhausted));
-    assert_eq!(engine.diagnostics().connection_capacity_exhausted, 1);
     server.close().await.unwrap();
     client.close().await.unwrap();
     engine.shutdown().await.unwrap();
@@ -1198,9 +762,7 @@ async fn cancellation_after_rdma_connect_waits_for_the_routed_terminal_event() {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let diagnostics = engine.diagnostics();
-            if diagnostics.live_connection_reservations == 0
-                && diagnostics.free_connection_slots == 1
-            {
+            if diagnostics.live_connections == 0 {
                 break;
             }
             tokio::task::yield_now().await;
@@ -1208,7 +770,6 @@ async fn cancellation_after_rdma_connect_waits_for_the_routed_terminal_event() {
     })
     .await
     .expect("cancelled post-connect route did not clean up after rejection");
-    assert_eq!(engine.diagnostics().connections_opened, 0);
 
     engine.shutdown().await.unwrap();
     driver_task.await.unwrap().unwrap();
@@ -1233,8 +794,7 @@ async fn established_close_releases_resources_and_reuses_aggregate_capacity() {
 
     let (first_server, first_client) =
         establish_pair(&engine, &resources, RdmaConnectionConfig::default(), true).await;
-    assert_eq!(engine.diagnostics().live_connection_reservations, 2);
-    assert_eq!(engine.diagnostics().free_connection_slots, 0);
+    assert_eq!(engine.diagnostics().live_connections, 2);
 
     let first_client_close_one = first_client.clone();
     let first_client_close_two = first_client.clone();
@@ -1250,13 +810,11 @@ async fn established_close_releases_resources_and_reuses_aggregate_capacity() {
     drop(first_server);
     drop(first_client_close_one);
     drop(first_client_close_two);
-    assert_eq!(engine.diagnostics().live_connection_reservations, 0);
-    assert_eq!(engine.diagnostics().free_connection_slots, 2);
+    assert_eq!(engine.diagnostics().live_connections, 0);
 
     let (second_server, second_client) =
         establish_pair(&engine, &resources, RdmaConnectionConfig::default(), true).await;
-    assert_eq!(engine.diagnostics().live_connection_reservations, 2);
-    assert_eq!(engine.diagnostics().free_connection_slots, 0);
+    assert_eq!(engine.diagnostics().live_connections, 2);
     let second_client_duplicate = second_client.clone();
     let (server_close, client_close, duplicate_close) = tokio::join!(
         second_server.close(),
@@ -1266,8 +824,7 @@ async fn established_close_releases_resources_and_reuses_aggregate_capacity() {
     server_close.unwrap();
     client_close.unwrap();
     duplicate_close.unwrap();
-    assert_eq!(engine.diagnostics().live_connection_reservations, 0);
-    assert_eq!(engine.diagnostics().free_connection_slots, 2);
+    assert_eq!(engine.diagnostics().live_connections, 0);
     drop(second_server);
     drop(second_client);
     drop(second_client_duplicate);

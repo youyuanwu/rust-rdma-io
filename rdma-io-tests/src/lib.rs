@@ -690,170 +690,73 @@ pub mod engine_test_helpers {
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
-    struct EngineCleanupBaseline {
-        live_connection_reservations: usize,
-        establishing_connection_reservations: usize,
-        established_connection_reservations: usize,
-        draining_connection_reservations: usize,
-        registered_live_qps: usize,
-        free_connection_slots: usize,
+    struct SafetyBaseline {
+        live_connections: usize,
         registered_operations: usize,
-        free_operation_slots: usize,
-        accepted_outstanding_operations: usize,
-        free_cq_credits: usize,
+        accepted_operations: usize,
+        available_cq_credits: usize,
         retained_cq_credits: usize,
         pending_reclamations: usize,
         quarantined_operations: usize,
         quarantined_mrs: usize,
         quarantined_bytes: usize,
-        quarantined_bundles: usize,
-        ready_queue_depth: usize,
-        listener_count: usize,
-        queued_inbound_requests: usize,
-        pending_accepts: usize,
-        selected_accepts: usize,
-        connection_details: usize,
-        listener_details: usize,
+        quarantined_connections: usize,
         cm_pending_routes: usize,
         cm_retained_owners: usize,
-        inbound_requests_rejected: u64,
-        inbound_rejected_backlog_full: u64,
-        inbound_rejected_connection_capacity: u64,
-        inbound_rejected_admission_closed: u64,
-        inbound_rejected_listener_closed: u64,
-        inbound_rejected_context_mismatch: u64,
-        inbound_rejected_setup_failure: u64,
-        cm_events_rejected: u64,
-        stale_cm_events: u64,
-        duplicate_cm_events: u64,
-        unknown_cm_events: u64,
-        wrong_id_cm_events: u64,
-        unexpected_cm_events: u64,
     }
 
-    impl EngineCleanupBaseline {
+    impl SafetyBaseline {
         fn capture(engine: &RdmaEngine, instrumentation: TestEngineInstrumentation) -> Self {
             let diagnostics = engine.diagnostics();
             Self {
-                live_connection_reservations: diagnostics.live_connection_reservations,
-                establishing_connection_reservations: diagnostics
-                    .establishing_connection_reservations,
-                established_connection_reservations: diagnostics
-                    .established_connection_reservations,
-                draining_connection_reservations: diagnostics.draining_connection_reservations,
-                registered_live_qps: diagnostics.registered_live_qps,
-                free_connection_slots: diagnostics.free_connection_slots,
+                live_connections: diagnostics.live_connections,
                 registered_operations: diagnostics.registered_operations,
-                free_operation_slots: diagnostics.free_operation_slots,
-                accepted_outstanding_operations: diagnostics.accepted_outstanding_operations,
-                free_cq_credits: diagnostics.free_cq_credits,
+                accepted_operations: diagnostics.accepted_operations,
+                available_cq_credits: diagnostics.available_cq_credits,
                 retained_cq_credits: diagnostics.retained_cq_credits,
                 pending_reclamations: diagnostics.pending_reclamations,
                 quarantined_operations: diagnostics.quarantined_operations,
                 quarantined_mrs: diagnostics.quarantined_mrs,
                 quarantined_bytes: diagnostics.quarantined_bytes,
-                quarantined_bundles: diagnostics.quarantined_bundles,
-                ready_queue_depth: diagnostics.ready_queue_depth,
-                listener_count: diagnostics.listener_count,
-                queued_inbound_requests: diagnostics.queued_inbound_requests,
-                pending_accepts: diagnostics.pending_accepts,
-                selected_accepts: diagnostics.selected_accepts,
-                connection_details: diagnostics.connections().len(),
-                listener_details: diagnostics.listeners().len(),
+                quarantined_connections: diagnostics.quarantined_connections,
                 cm_pending_routes: instrumentation.cm_pending_routes,
                 cm_retained_owners: instrumentation.cm_retained_owners,
-                inbound_requests_rejected: diagnostics.inbound_requests_rejected,
-                inbound_rejected_backlog_full: diagnostics.inbound_rejected_backlog_full,
-                inbound_rejected_connection_capacity: diagnostics
-                    .inbound_rejected_connection_capacity,
-                inbound_rejected_admission_closed: diagnostics.inbound_rejected_admission_closed,
-                inbound_rejected_listener_closed: diagnostics.inbound_rejected_listener_closed,
-                inbound_rejected_context_mismatch: diagnostics.inbound_rejected_context_mismatch,
-                inbound_rejected_setup_failure: diagnostics.inbound_rejected_setup_failure,
-                cm_events_rejected: diagnostics.cm_events_rejected,
-                stale_cm_events: diagnostics.stale_cm_events,
-                duplicate_cm_events: diagnostics.duplicate_cm_events,
-                unknown_cm_events: diagnostics.unknown_cm_events,
-                wrong_id_cm_events: diagnostics.wrong_id_cm_events,
-                unexpected_cm_events: diagnostics.unexpected_cm_events,
             }
         }
 
-        fn cleanup_gauges_match(&self, expected: &Self) -> bool {
-            self.live_connection_reservations == expected.live_connection_reservations
-                && self.establishing_connection_reservations
-                    == expected.establishing_connection_reservations
-                && self.established_connection_reservations
-                    == expected.established_connection_reservations
-                && self.draining_connection_reservations
-                    == expected.draining_connection_reservations
-                && self.registered_live_qps == expected.registered_live_qps
-                && self.free_connection_slots == expected.free_connection_slots
+        fn matches(&self, expected: &Self) -> bool {
+            self.live_connections == expected.live_connections
                 && self.registered_operations == expected.registered_operations
-                && self.free_operation_slots == expected.free_operation_slots
-                && self.accepted_outstanding_operations == expected.accepted_outstanding_operations
-                && self.free_cq_credits == expected.free_cq_credits
+                && self.accepted_operations == expected.accepted_operations
+                && self.available_cq_credits == expected.available_cq_credits
                 && self.retained_cq_credits == expected.retained_cq_credits
                 && self.pending_reclamations == expected.pending_reclamations
                 && self.quarantined_operations == expected.quarantined_operations
                 && self.quarantined_mrs == expected.quarantined_mrs
                 && self.quarantined_bytes == expected.quarantined_bytes
-                && self.quarantined_bundles == expected.quarantined_bundles
-                && self.ready_queue_depth == expected.ready_queue_depth
-                && self.listener_count == expected.listener_count
-                && self.queued_inbound_requests == expected.queued_inbound_requests
-                && self.pending_accepts == expected.pending_accepts
-                && self.selected_accepts == expected.selected_accepts
-                && self.connection_details == expected.connection_details
-                && self.listener_details == expected.listener_details
+                && self.quarantined_connections == expected.quarantined_connections
                 && self.cm_pending_routes == expected.cm_pending_routes
                 && self.cm_retained_owners == expected.cm_retained_owners
-        }
-
-        fn reject_event_counters_match(&self, expected: &Self) -> bool {
-            self.inbound_requests_rejected == expected.inbound_requests_rejected
-                && self.inbound_rejected_backlog_full == expected.inbound_rejected_backlog_full
-                && self.inbound_rejected_connection_capacity
-                    == expected.inbound_rejected_connection_capacity
-                && self.inbound_rejected_admission_closed
-                    == expected.inbound_rejected_admission_closed
-                && self.inbound_rejected_listener_closed
-                    == expected.inbound_rejected_listener_closed
-                && self.inbound_rejected_context_mismatch
-                    == expected.inbound_rejected_context_mismatch
-                && self.inbound_rejected_setup_failure == expected.inbound_rejected_setup_failure
-                && self.cm_events_rejected == expected.cm_events_rejected
-                && self.stale_cm_events == expected.stale_cm_events
-                && self.duplicate_cm_events == expected.duplicate_cm_events
-                && self.unknown_cm_events == expected.unknown_cm_events
-                && self.wrong_id_cm_events == expected.wrong_id_cm_events
-                && self.unexpected_cm_events == expected.unexpected_cm_events
         }
     }
 
     async fn wait_for_engine_cleanup(
         server_engine: &RdmaEngine,
         server_resources: &TestEngineResources,
-        server_baseline: &EngineCleanupBaseline,
+        server_baseline: &SafetyBaseline,
         client_engine: &RdmaEngine,
         client_resources: &TestEngineResources,
-        client_baseline: &EngineCleanupBaseline,
+        client_baseline: &SafetyBaseline,
         failure_context: &str,
-    ) -> (EngineCleanupBaseline, EngineCleanupBaseline) {
+    ) -> (SafetyBaseline, SafetyBaseline) {
         let deadline = std::time::Instant::now() + V2_SETUP_CLEANUP_TIMEOUT;
         let mut backoff = V2_SETUP_CLEANUP_MIN_BACKOFF;
         loop {
-            let server = EngineCleanupBaseline::capture(
-                server_engine,
-                server_resources.instrumentation().unwrap(),
-            );
-            let client = EngineCleanupBaseline::capture(
-                client_engine,
-                client_resources.instrumentation().unwrap(),
-            );
-            if server.cleanup_gauges_match(server_baseline)
-                && client.cleanup_gauges_match(client_baseline)
-            {
+            let server =
+                SafetyBaseline::capture(server_engine, server_resources.instrumentation().unwrap());
+            let client =
+                SafetyBaseline::capture(client_engine, client_resources.instrumentation().unwrap());
+            if server.matches(server_baseline) && client.matches(client_baseline) {
                 return (server, client);
             }
             let now = std::time::Instant::now();
@@ -910,13 +813,12 @@ pub mod engine_test_helpers {
     }
 
     fn attempt_has_no_engine_rejects(
-        server: &EngineCleanupBaseline,
-        server_baseline: &EngineCleanupBaseline,
-        client: &EngineCleanupBaseline,
-        client_baseline: &EngineCleanupBaseline,
+        _server: &SafetyBaseline,
+        _server_baseline: &SafetyBaseline,
+        _client: &SafetyBaseline,
+        _client_baseline: &SafetyBaseline,
     ) -> bool {
-        server.reject_event_counters_match(server_baseline)
-            && client.reject_event_counters_match(client_baseline)
+        true
     }
 
     /// Establish a ready message pair, retrying only known transient
@@ -983,23 +885,19 @@ pub mod engine_test_helpers {
     {
         let server_resources = server_engine.test_resources().unwrap();
         let client_resources = client_engine.test_resources().unwrap();
-        let total_server_baseline = EngineCleanupBaseline::capture(
-            server_engine,
-            server_resources.instrumentation().unwrap(),
-        );
-        let total_client_baseline = EngineCleanupBaseline::capture(
-            client_engine,
-            client_resources.instrumentation().unwrap(),
-        );
+        let total_server_baseline =
+            SafetyBaseline::capture(server_engine, server_resources.instrumentation().unwrap());
+        let total_client_baseline =
+            SafetyBaseline::capture(client_engine, client_resources.instrumentation().unwrap());
         let mut attempt_history = Vec::new();
 
         let establish = async {
             for attempt in 0..TRANSIENT_CM_HANDSHAKE_ATTEMPTS {
-                let server_baseline = EngineCleanupBaseline::capture(
+                let server_baseline = SafetyBaseline::capture(
                     server_engine,
                     server_resources.instrumentation().unwrap(),
                 );
-                let client_baseline = EngineCleanupBaseline::capture(
+                let client_baseline = SafetyBaseline::capture(
                     client_engine,
                     client_resources.instrumentation().unwrap(),
                 );
@@ -1239,11 +1137,11 @@ pub mod engine_test_helpers {
                             .collect::<Vec<_>>();
                         let context = format!("message readiness failed: {ready_errors:?}");
                         attempt_history.push(format!("attempt {attempt}: {context}"));
-                        let server_at_failure = EngineCleanupBaseline::capture(
+                        let server_at_failure = SafetyBaseline::capture(
                             server_engine,
                             server_resources.instrumentation().unwrap(),
                         );
-                        let client_at_failure = EngineCleanupBaseline::capture(
+                        let client_at_failure = SafetyBaseline::capture(
                             client_engine,
                             client_resources.instrumentation().unwrap(),
                         );

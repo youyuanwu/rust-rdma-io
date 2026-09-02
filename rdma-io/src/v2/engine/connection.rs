@@ -9,7 +9,6 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard};
 use tokio::sync::Notify;
 
 use self::qp::QpCapabilitiesExt;
-use super::diagnostics::RdmaConnectionDiagnostics;
 use super::lifecycle::MemoizedTerminalResult;
 use super::operation::RdmaOperation;
 use super::registry::{
@@ -54,10 +53,12 @@ impl RdmaConnectionIdentity {
         self.qp_num
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(super) fn registry_slot(&self) -> u32 {
         self.slot
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(super) fn registration_generation(&self) -> u32 {
         self.generation
     }
@@ -242,7 +243,7 @@ pub(crate) struct ConnectionState {
     accepted: Mutex<HashSet<AcceptedWrIdentity>>,
     completions: Mutex<VecDeque<WorkCompletion>>,
     terminal_sink: Mutex<Option<Arc<dyn ConnectionTerminalSink>>>,
-    ready_published: AtomicBool,
+    completion_published: AtomicBool,
     close_started: AtomicBool,
     close_outcome: Mutex<Option<MemoizedTerminalResult>>,
     close_notify: Notify,
@@ -289,7 +290,7 @@ impl ConnectionState {
             accepted: Mutex::new(HashSet::new()),
             completions: Mutex::new(VecDeque::new()),
             terminal_sink: Mutex::new(None),
-            ready_published: AtomicBool::new(false),
+            completion_published: AtomicBool::new(false),
             close_started: AtomicBool::new(false),
             close_outcome: Mutex::new(None),
             close_notify: Notify::new(),
@@ -386,15 +387,6 @@ impl ConnectionState {
         lock_unpoison(&self.accepted).len()
     }
 
-    pub(super) fn diagnostics(&self, quarantined: bool) -> RdmaConnectionDiagnostics {
-        RdmaConnectionDiagnostics {
-            identity: self.identity(),
-            accepted_outstanding_operations: self.accepted_count(),
-            draining: self.close_started(),
-            quarantined,
-        }
-    }
-
     pub(super) fn enqueue_completion(&self, completion: WorkCompletion) {
         lock_unpoison(&self.completions).push_back(completion);
     }
@@ -432,12 +424,12 @@ impl ConnectionState {
         lock_unpoison(&self.terminal_sink).clone()
     }
 
-    pub(super) fn mark_ready_published(&self) -> bool {
-        !self.ready_published.swap(true, Ordering::AcqRel)
+    pub(super) fn mark_completion_published(&self) -> bool {
+        !self.completion_published.swap(true, Ordering::AcqRel)
     }
 
-    pub(super) fn clear_ready_published(&self) {
-        self.ready_published.store(false, Ordering::Release);
+    pub(super) fn clear_completion_published(&self) {
+        self.completion_published.store(false, Ordering::Release);
     }
 
     pub(super) fn stop_posting(&self) {
@@ -720,13 +712,13 @@ impl ConnectionState {
         }
     }
 
-    pub(super) fn mark_diagnostic_quarantined(&self) {
+    pub(super) fn mark_reservation_quarantined(&self) {
         if let Some(reservation) = lock_unpoison(&self.admission).as_mut() {
             reservation.mark_quarantined();
         }
     }
 
-    pub(super) fn mark_diagnostic_recovered(&self) {
+    pub(super) fn recover_reservation_quarantine(&self) {
         if let Some(reservation) = lock_unpoison(&self.admission).as_mut() {
             reservation.recover_quarantine(!self.qp_destruction_boundary.load(Ordering::Acquire));
         }
@@ -1483,17 +1475,10 @@ pub(super) fn reserve_connection(
     if let Some(error) = shared.admission_error() {
         return Err(error);
     }
-    let reservation = shared.connection_admission.try_acquire().ok_or_else(|| {
-        shared
-            .diagnostic_counters
-            .connection_capacity_exhausted
-            .fetch_add(1, Ordering::Relaxed);
-        Error::CapacityExhausted
-    })?;
-    shared
-        .diagnostic_counters
-        .connections_admitted
-        .fetch_add(1, Ordering::Relaxed);
+    let reservation = shared
+        .connection_admission
+        .try_acquire()
+        .ok_or(Error::CapacityExhausted)?;
     Ok((admission, reservation))
 }
 
@@ -1542,12 +1527,6 @@ pub(super) fn install_reserved_connection(
     let (token, state) = match registration {
         Ok(registration) => registration,
         Err(failure) => {
-            if matches!(failure.error, Error::CapacityExhausted) {
-                shared
-                    .diagnostic_counters
-                    .connection_capacity_exhausted
-                    .fetch_add(1, Ordering::Relaxed);
-            }
             if let Some((_token, state)) = failure.retained {
                 return Err(ConnectionInstallFailure {
                     error: failure.error,

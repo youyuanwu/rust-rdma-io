@@ -58,7 +58,7 @@ fn build_engine(
         .maximum_live_connections(8)
         .maximum_inflight_operations(512)
         .cq_capacity(512)
-        .ready_connection_quantum(quantum)
+        .completion_dispatch_budget(quantum)
         .connection_drain_deadline(drain_deadline)
         .shutdown_deadline(Duration::from_secs(5))
         .build()
@@ -629,12 +629,10 @@ async fn run_cancelled_send_qp_destroy_fallback(mode: CompletionMode) {
         .expect("message close did not reach its drain deadline")
         .unwrap();
     let diagnostics = client_engine.diagnostics();
-    assert_eq!(diagnostics.accepted_outstanding_operations, 0);
+    assert_eq!(diagnostics.accepted_operations, 0);
     assert_eq!(diagnostics.registered_operations, 0);
     assert_eq!(diagnostics.quarantined_operations, 0);
     assert_eq!(diagnostics.retained_cq_credits, 0);
-    assert_eq!(diagnostics.qp_destroys, 1);
-    assert_eq!(diagnostics.operations_released_after_qp_destroy, 1);
     let after_close = recorder.snapshot();
     assert!(
         after_close

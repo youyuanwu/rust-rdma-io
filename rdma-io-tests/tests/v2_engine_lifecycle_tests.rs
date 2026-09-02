@@ -17,6 +17,25 @@ fn software_device_name() -> Option<String> {
         .find(|name| name.starts_with("rxe") || name.starts_with("siw"))
 }
 
+async fn listen_with_retry(engine: &RdmaEngine) -> RdmaListener {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match engine
+                .listen("0.0.0.0:0".parse().unwrap(), RdmaListenerConfig::default())
+                .await
+            {
+                Ok(listener) => return listener,
+                Err(Error::Verbs(error)) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => panic!("engine listener setup failed: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("engine listener remained busy")
+}
+
 async fn accept_pair(
     listener: &RdmaListener,
     client_engine: &RdmaEngine,
@@ -224,18 +243,10 @@ async fn run_clean_close(mode: CompletionMode) {
     let (server_close, client_close) = tokio::join!(server.close(), client.close());
     server_close.unwrap();
     client_close.unwrap();
-    assert_eq!(
-        server_engine.diagnostics().accepted_outstanding_operations,
-        0
-    );
-    assert_eq!(
-        client_engine.diagnostics().accepted_outstanding_operations,
-        0
-    );
-    assert_eq!(server_engine.diagnostics().quarantined_bundles, 0);
-    assert_eq!(client_engine.diagnostics().quarantined_bundles, 0);
-    assert_eq!(server_engine.diagnostics().qp_destroys, 1);
-    assert_eq!(client_engine.diagnostics().qp_destroys, 1);
+    assert_eq!(server_engine.diagnostics().accepted_operations, 0);
+    assert_eq!(client_engine.diagnostics().accepted_operations, 0);
+    assert_eq!(server_engine.diagnostics().quarantined_connections, 0);
+    assert_eq!(client_engine.diagnostics().quarantined_connections, 0);
 
     listener.close().await.unwrap();
     let (server_shutdown, client_shutdown) =
@@ -297,10 +308,7 @@ async fn run_missing_flush_cqe_qp_destroy_fallback(mode: CompletionMode) {
     let server_resources = server_engine.test_resources().unwrap();
     let server_task = tokio::spawn(server_driver);
     let client_task = tokio::spawn(client_driver);
-    let listener = server_engine
-        .listen("0.0.0.0:0".parse().unwrap(), RdmaListenerConfig::default())
-        .await
-        .unwrap();
+    let listener = listen_with_retry(&server_engine).await;
     let (server, client) = accept_pair(&listener, &client_engine).await;
 
     let recv_mr = server.register_memory(64, AccessIntent::LocalOnly).unwrap();
@@ -335,17 +343,13 @@ async fn run_missing_flush_cqe_qp_destroy_fallback(mode: CompletionMode) {
     assert!(returned_recv.is_none());
 
     let closed = server_engine.diagnostics();
-    assert_eq!(closed.accepted_outstanding_operations, 0);
+    assert_eq!(closed.accepted_operations, 0);
     assert_eq!(closed.registered_operations, 0);
-    assert_eq!(closed.free_cq_credits, 64);
-    assert_eq!(closed.quarantined_bundles, 0);
+    assert_eq!(closed.available_cq_credits, 64);
+    assert_eq!(closed.quarantined_connections, 0);
     assert_eq!(closed.quarantined_operations, 0);
     assert_eq!(closed.retained_cq_credits, 0);
-    assert_eq!(closed.live_connection_reservations, 1);
-    assert_eq!(closed.qp_destroys, 1);
-    assert_eq!(closed.operations_released_after_qp_destroy, 1);
-    assert!(closed.connections_drain_started >= 1);
-    assert!(closed.qp_error_transitions >= 1);
+    assert_eq!(closed.live_connections, 1);
     let after_close = recorder.snapshot();
     let qp_destroy = position(&after_close, DestructionKind::QueuePair);
     let mr_release = position(&after_close, DestructionKind::MemoryRegion);
@@ -491,14 +495,9 @@ async fn run_shutdown_qp_destroy_fallback(mode: CompletionMode) {
     assert!(returned_recv.is_none());
     let diagnostics = server_engine.diagnostics();
     assert!(diagnostics.terminal_error.is_none());
-    assert_eq!(diagnostics.accepted_outstanding_operations, 0);
+    assert_eq!(diagnostics.accepted_operations, 0);
     assert_eq!(diagnostics.registered_operations, 0);
-    assert_eq!(diagnostics.quarantined_bundles, 0);
-    assert_eq!(diagnostics.qp_destroys, 1);
-    assert_eq!(diagnostics.operations_released_after_qp_destroy, 1);
-    assert_eq!(diagnostics.engine_wedges, 0);
-    assert!(diagnostics.connections_drain_started >= 1);
-    assert!(diagnostics.qp_error_transitions >= 1);
+    assert_eq!(diagnostics.quarantined_connections, 0);
     drop(suppression);
 
     drop(returned_send);
@@ -574,15 +573,13 @@ async fn run_qp_destroy_failure_quarantine(mode: CompletionMode) {
     assert!(returned_recv.is_none());
 
     let diagnostics = server_engine.diagnostics();
-    assert_eq!(diagnostics.qp_destroys, 0);
-    assert_eq!(diagnostics.operations_released_after_qp_destroy, 0);
-    assert_eq!(diagnostics.accepted_outstanding_operations, 1);
+    assert_eq!(diagnostics.accepted_operations, 1);
     assert_eq!(diagnostics.registered_operations, 1);
-    assert_eq!(diagnostics.free_cq_credits, 63);
+    assert_eq!(diagnostics.available_cq_credits, 63);
     assert_eq!(diagnostics.retained_cq_credits, 1);
     assert_eq!(diagnostics.quarantined_operations, 1);
     assert_eq!(diagnostics.quarantined_mrs, 1);
-    assert_eq!(diagnostics.quarantined_bundles, 1);
+    assert_eq!(diagnostics.quarantined_connections, 1);
     let events = recorder.snapshot();
     assert!(!recorder.overflowed());
     assert_eq!(
@@ -668,7 +665,6 @@ async fn run_unspawned_driver_drop(mode: CompletionMode) {
         Err(Error::DriverShutdown)
     ));
     let diagnostics = engine.diagnostics();
-    assert_eq!(diagnostics.shutdowns, 0);
     let terminal = diagnostics.terminal_error.unwrap();
     assert_eq!(terminal.class, "DriverShutdown");
 }
@@ -742,8 +738,7 @@ async fn run_driver_abort_with_accepted_wr(mode: CompletionMode) {
         diagnostics.terminal_error.unwrap().message,
         shutdown_error.to_string()
     );
-    assert_eq!(diagnostics.quarantined_bundles, 1);
-    assert_eq!(diagnostics.qp_destroys, 0);
+    assert_eq!(diagnostics.quarantined_connections, 1);
     drop(suppression);
 
     drop(returned_send);
@@ -831,14 +826,9 @@ async fn run_clean_retirement_destroy_quarantine(mode: CompletionMode) {
 
     let diagnostics = server_engine.diagnostics();
     assert!(diagnostics.terminal_error.is_none());
-    assert_eq!(diagnostics.quarantined_bundles, 1);
-    assert_eq!(diagnostics.live_connection_reservations, 2);
-    assert_eq!(diagnostics.draining_connection_reservations, 1);
-    assert_eq!(diagnostics.registered_live_qps, 1);
-    assert_eq!(diagnostics.free_connection_slots, 2);
-    assert_eq!(diagnostics.connections_quarantined, 1);
-    assert_eq!(diagnostics.connection_quarantine_outcomes, 1);
-    assert_eq!(diagnostics.qp_destroys, 0);
+    assert_eq!(diagnostics.quarantined_connections, 1);
+    assert_eq!(diagnostics.live_connections, 2);
+    assert_eq!(diagnostics.registered_operations, 0);
     assert!(!server_task.is_finished());
 
     exchange_byte(&healthy_client, &healthy_server, 0x5a).await;
@@ -952,13 +942,7 @@ async fn run_setup_rollback_destroy_quarantines(mode: CompletionMode) {
     ));
     wait_until("outbound rollback quarantine was not published", || {
         let diagnostics = client_engine.diagnostics();
-        diagnostics.quarantined_bundles == 1
-            && diagnostics.oldest_quarantine_age.is_some()
-            && diagnostics.live_connection_reservations == 1
-            && diagnostics.establishing_connection_reservations == 0
-            && diagnostics.free_connection_slots == 3
-            && diagnostics.connections_quarantined == 1
-            && diagnostics.connection_quarantine_outcomes == 1
+        diagnostics.quarantined_connections == 1 && diagnostics.live_connections == 1
     })
     .await;
     assert!(!client_task.is_finished());
@@ -997,15 +981,7 @@ async fn run_setup_rollback_destroy_quarantines(mode: CompletionMode) {
     );
     wait_until("inbound rollback quarantine was not published", || {
         let diagnostics = server_engine.diagnostics();
-        diagnostics.quarantined_bundles == 1
-            && diagnostics.oldest_quarantine_age.is_some()
-            && diagnostics.live_connection_reservations == 1
-            && diagnostics.establishing_connection_reservations == 0
-            && diagnostics.free_connection_slots == 3
-            && diagnostics.connections_quarantined == 1
-            && diagnostics.connection_quarantine_outcomes == 1
-            && diagnostics.inbound_requests_rejected == 1
-            && diagnostics.inbound_rejected_setup_failure == 1
+        diagnostics.quarantined_connections == 1 && diagnostics.live_connections == 1
     })
     .await;
     assert!(!server_task.is_finished());
@@ -1034,31 +1010,18 @@ async fn run_setup_rollback_destroy_quarantines(mode: CompletionMode) {
     exchange_byte(&healthy_client, &healthy_server, 0xa5).await;
     wait_until(
         "rejected peer reservation was not retired before diagnostics",
-        || {
-            let diagnostics = client_engine.diagnostics();
-            diagnostics.free_connection_slots == 2 && diagnostics.live_connection_reservations == 2
-        },
+        || client_engine.diagnostics().live_connections == 2,
     )
     .await;
     let server_diagnostics = server_engine.diagnostics();
     assert!(server_diagnostics.terminal_error.is_none());
-    assert_eq!(server_diagnostics.quarantined_bundles, 1);
-    assert_eq!(server_diagnostics.free_connection_slots, 2);
-    assert_eq!(server_diagnostics.live_connection_reservations, 2);
-    assert_eq!(server_diagnostics.retired_connection_slots, 0);
-    assert_eq!(server_diagnostics.connections_quarantined, 1);
-    assert_eq!(server_diagnostics.connection_quarantine_outcomes, 1);
-    assert_eq!(server_diagnostics.inbound_requests_rejected, 1);
-    assert_eq!(server_diagnostics.inbound_rejected_setup_failure, 1);
+    assert_eq!(server_diagnostics.quarantined_connections, 1);
+    assert_eq!(server_diagnostics.live_connections, 2);
     assert!(!server_task.is_finished());
     let client_diagnostics = client_engine.diagnostics();
     assert!(client_diagnostics.terminal_error.is_none());
-    assert_eq!(client_diagnostics.quarantined_bundles, 1);
-    assert_eq!(client_diagnostics.free_connection_slots, 2);
-    assert_eq!(client_diagnostics.live_connection_reservations, 2);
-    assert_eq!(client_diagnostics.retired_connection_slots, 0);
-    assert_eq!(client_diagnostics.connections_quarantined, 1);
-    assert_eq!(client_diagnostics.connection_quarantine_outcomes, 1);
+    assert_eq!(client_diagnostics.quarantined_connections, 1);
+    assert_eq!(client_diagnostics.live_connections, 2);
     assert!(!client_task.is_finished());
 
     let events = recorder.snapshot();
@@ -1148,10 +1111,7 @@ async fn run_peer_disconnect(mode: CompletionMode) {
     let client_resources = client_engine.test_resources().unwrap();
     let server_task = tokio::spawn(server_driver);
     let client_task = tokio::spawn(client_driver);
-    let listener = server_engine
-        .listen("0.0.0.0:0".parse().unwrap(), RdmaListenerConfig::default())
-        .await
-        .unwrap();
+    let listener = listen_with_retry(&server_engine).await;
     let (server, client) = accept_pair(&listener, &client_engine).await;
 
     let recv_mr = server.register_memory(64, AccessIntent::LocalOnly).unwrap();
@@ -1164,12 +1124,7 @@ async fn run_peer_disconnect(mode: CompletionMode) {
     client_resources.disconnect_connection(&client).unwrap();
     wait_until(
         "peer disconnect did not enter the local QP ERR close path",
-        || {
-            let diagnostics = server_engine.diagnostics();
-            diagnostics.qp_error_transitions == 1
-                && diagnostics.qp_destroys == 1
-                && diagnostics.live_connection_reservations == 0
-        },
+        || server_engine.diagnostics().live_connections == 0,
     )
     .await;
     let (recv_result, returned_recv) = recv.await;

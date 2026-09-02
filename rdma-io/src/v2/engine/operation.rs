@@ -10,7 +10,6 @@ use futures_util::task::AtomicWaker;
 
 use super::EngineShared;
 use super::connection::{ConnectionState, Direction, OperationKind, RdmaConnection};
-use super::diagnostics::CqeReject;
 use super::lifecycle::MemoizedTerminalResult;
 use super::registry::{
     ConnectionToken, Lookup, OperationToken, PagedRegistry, lock_unpoison, read_unpoison,
@@ -21,6 +20,17 @@ use crate::v2::op::Completion;
 use crate::v2::qp::BatchPostOutcome;
 use crate::wc::{WcOpcode, WorkCompletion};
 use crate::wr::{PreparedRecvBatch, PreparedSendBatch, RecvWr, SendFlags, SendWr, Sge, WrOpcode};
+
+#[derive(Clone, Copy)]
+enum CqeReject {
+    StaleConnection,
+    StaleOperation,
+    Unknown,
+    Duplicate,
+    WrongConnection,
+    WrongQpNum,
+    UnexpectedOpcode,
+}
 
 /// Future for one engine-owned SEND, RECV, READ, or WRITE.
 ///
@@ -107,10 +117,6 @@ fn post_detached_batch(
         )));
     }
     let count = entries.len();
-    shared
-        .diagnostic_counters
-        .operations_offered
-        .fetch_add(count as u64, Ordering::Relaxed);
     let admission = read_unpoison(&shared.admission);
     if let Some(error) = shared.admission_error() {
         complete_unreserved_entries(entries, error.clone());
@@ -186,10 +192,6 @@ fn post_detached_batch(
                     mr,
                 });
                 complete_unreserved_entries(entries, error.clone());
-                shared
-                    .diagnostic_counters
-                    .operation_capacity_exhausted
-                    .fetch_add(1, Ordering::Relaxed);
                 return Err(DetachedPostError::unaccepted(error));
             }
         };
@@ -201,16 +203,8 @@ fn post_detached_batch(
             rollback_internal_entries(shared, connection, direction, reserved, error.clone());
             invoke_detached_completion(completion);
             complete_unreserved_entries(entries, error.clone());
-            shared
-                .diagnostic_counters
-                .cq_capacity_exhausted
-                .fetch_add(1, Ordering::Relaxed);
             return Err(DetachedPostError::unaccepted(error));
         }
-        shared
-            .diagnostic_counters
-            .cq_credits_reserved
-            .fetch_add(1, Ordering::Relaxed);
         reserved.push(InternalBatchEntry {
             token,
             state,
@@ -268,10 +262,6 @@ fn post_detached_batch(
     let ownership =
         PreparedBatchOwnership::new(reserved).expect("non-empty detached batch ownership");
     let mut requests = requests;
-    shared
-        .diagnostic_counters
-        .batch_posts_attempted
-        .fetch_add(1, Ordering::Relaxed);
     let outcome = match match &mut requests {
         InternalPreparedBatch::Recv(batch) => connection.poster.post_recv(batch),
         InternalPreparedBatch::Send(batch) => connection.poster.post_send(batch),
@@ -279,7 +269,6 @@ fn post_detached_batch(
         Ok(outcome) => outcome,
         Err(error) => {
             let entries = ownership.into_entries();
-            BatchWrAccounting::exact_prefix(count, 0).record(shared);
             rollback_internal_entries(shared, connection, direction, entries, error.clone());
             drop(posting);
             drop(admission);
@@ -289,7 +278,6 @@ fn post_detached_batch(
     let transfer = ownership.consume(outcome);
     match transfer {
         BatchOwnershipTransfer::Accepted(accepted) => {
-            BatchWrAccounting::from_outcome(count, &BatchPostOutcome::AllAccepted).record(shared);
             let after_unlock = commit_internal_entries(shared, accepted);
             drop(posting);
             drop(admission);
@@ -307,14 +295,12 @@ fn post_detached_batch(
                 .any(|entry| entry.state.has_early_completion())
             {
                 accepted.extend(unaccepted);
-                BatchWrAccounting::ambiguous(count).record(shared);
                 let after_unlock = commit_internal_entries(shared, accepted);
                 drop(posting);
                 drop(admission);
                 invoke_after_unlock(after_unlock);
                 Err(DetachedPostError::retained(Error::PostFailed(source)))
             } else {
-                BatchWrAccounting::exact_prefix(count, accepted.len()).record(shared);
                 let potentially_accepted = !accepted.is_empty();
                 let after_unlock = commit_internal_entries(shared, accepted);
                 rollback_internal_entries(shared, connection, direction, unaccepted, error);
@@ -328,7 +314,6 @@ fn post_detached_batch(
             }
         }
         BatchOwnershipTransfer::Ambiguous { retained, source } => {
-            BatchWrAccounting::ambiguous(count).record(shared);
             let after_unlock = commit_internal_entries(shared, retained);
             drop(posting);
             drop(admission);
@@ -382,10 +367,6 @@ fn rollback_internal_entries(
             .release(entry.token, false)
             .unwrap_or(entry.state);
         shared.cq_credits.release();
-        shared
-            .diagnostic_counters
-            .cq_credits_rolled_back
-            .fetch_add(1, Ordering::Relaxed);
         connection.release_local(direction);
         invoke_detached_completion(state.take_unaccepted(error.clone()));
     }
@@ -521,10 +502,6 @@ impl Drop for RdmaOperation {
         if let FutureState::InFlight { shared, operation } = state
             && operation.cancel(&shared)
         {
-            shared
-                .diagnostic_counters
-                .operations_cancelled
-                .fetch_add(1, Ordering::Relaxed);
             shared.schedule_reclamation(operation.token);
         }
     }
@@ -560,21 +537,8 @@ impl OperationRegistry {
         self.slots.live()
     }
 
-    pub(super) fn retired(&self) -> usize {
-        self.slots.retired()
-    }
-
-    pub(super) fn free(&self) -> usize {
-        self.slots.free()
-    }
-
     pub(super) fn occupied(&self) -> Vec<Arc<OperationState>> {
         self.slots.occupied_cloned()
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn probes(&self) -> u64 {
-        self.slots.probes()
     }
 }
 
@@ -1125,79 +1089,6 @@ impl<T> PreparedBatchOwnership<T> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct BatchWrAccounting {
-    accepted_or_ambiguous: usize,
-    accepted_prefix: usize,
-    unaccepted_suffix: usize,
-    ambiguous: bool,
-}
-
-impl BatchWrAccounting {
-    fn from_outcome(wr_count: usize, outcome: &BatchPostOutcome) -> Self {
-        match outcome {
-            BatchPostOutcome::AllAccepted => Self {
-                accepted_or_ambiguous: wr_count,
-                accepted_prefix: wr_count,
-                unaccepted_suffix: 0,
-                ambiguous: false,
-            },
-            BatchPostOutcome::PrefixAccepted {
-                accepted,
-                first_unaccepted,
-                ..
-            } if accepted == first_unaccepted && *accepted <= wr_count => {
-                Self::exact_prefix(wr_count, *accepted)
-            }
-            BatchPostOutcome::PrefixAccepted { .. } | BatchPostOutcome::Ambiguous { .. } => {
-                Self::ambiguous(wr_count)
-            }
-        }
-    }
-
-    fn ambiguous(wr_count: usize) -> Self {
-        Self {
-            accepted_or_ambiguous: wr_count,
-            accepted_prefix: 0,
-            unaccepted_suffix: 0,
-            ambiguous: true,
-        }
-    }
-
-    fn exact_prefix(wr_count: usize, accepted: usize) -> Self {
-        Self {
-            accepted_or_ambiguous: accepted,
-            accepted_prefix: accepted,
-            unaccepted_suffix: wr_count - accepted,
-            ambiguous: false,
-        }
-    }
-
-    fn record(self, shared: &EngineShared) {
-        let counters = &shared.diagnostic_counters;
-        counters
-            .operations_accepted
-            .fetch_add(self.accepted_or_ambiguous as u64, Ordering::Relaxed);
-        counters
-            .operations_posted
-            .fetch_add(self.accepted_or_ambiguous as u64, Ordering::Relaxed);
-        counters
-            .operations_unaccepted
-            .fetch_add(self.unaccepted_suffix as u64, Ordering::Relaxed);
-        counters
-            .batch_accepted_prefix
-            .fetch_add(self.accepted_prefix as u64, Ordering::Relaxed);
-        counters
-            .batch_unaccepted_suffix
-            .fetch_add(self.unaccepted_suffix as u64, Ordering::Relaxed);
-        if self.ambiguous {
-            counters
-                .batch_ambiguous_results
-                .fetch_add(1, Ordering::Relaxed);
-        }
-    }
-}
-
 fn start_operation(
     shared: &Arc<EngineShared>,
     connection: &Arc<ConnectionState>,
@@ -1206,11 +1097,6 @@ fn start_operation(
     remote: Option<RemoteMr>,
     range: Option<(usize, usize)>,
 ) -> StartResult {
-    shared
-        .diagnostic_counters
-        .operations_offered
-        .fetch_add(1, Ordering::Relaxed);
-
     let validated = match ValidatedOperation::new(kind, &mr, remote, range) {
         Ok(validated) => validated,
         Err(error) => return StartResult::Immediate((Err(error), Some(mr))),
@@ -1248,10 +1134,6 @@ fn start_operation(
         Ok(token) => token,
         Err(error) => {
             connection.release_local(direction);
-            shared
-                .diagnostic_counters
-                .operation_capacity_exhausted
-                .fetch_add(1, Ordering::Relaxed);
             return StartResult::Immediate((Err(error), mr));
         }
     };
@@ -1259,37 +1141,19 @@ fn start_operation(
     if !shared.cq_credits.reserve() {
         let state = shared.operations.release(token, false).unwrap_or(state);
         connection.release_local(direction);
-        shared
-            .diagnostic_counters
-            .cq_capacity_exhausted
-            .fetch_add(1, Ordering::Relaxed);
         return StartResult::Immediate((Err(Error::CapacityExhausted), state.take_mr()));
     }
-    shared
-        .diagnostic_counters
-        .cq_credits_reserved
-        .fetch_add(1, Ordering::Relaxed);
-
-    shared
-        .diagnostic_counters
-        .batch_posts_attempted
-        .fetch_add(1, Ordering::Relaxed);
     let outcome = match validated.post(connection, token) {
         Ok(outcome) => outcome,
         Err(error) => {
             let state = shared.operations.release(token, false).unwrap_or(state);
             shared.cq_credits.release();
-            shared
-                .diagnostic_counters
-                .cq_credits_rolled_back
-                .fetch_add(1, Ordering::Relaxed);
             connection.release_local(direction);
             return StartResult::Immediate((Err(error), state.take_mr()));
         }
     };
     match outcome {
         BatchPostOutcome::AllAccepted => {
-            BatchWrAccounting::from_outcome(1, &BatchPostOutcome::AllAccepted).record(shared);
             shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
             let early = state.commit_accepted();
             shared.work_signal.publish(super::driver::CQ_RECHECK_WORK);
@@ -1309,7 +1173,6 @@ fn start_operation(
                 inner.early_completion.take()
             };
             if let Some(completion) = early {
-                BatchWrAccounting::ambiguous(1).record(shared);
                 shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
                 state.commit_accepted();
                 shared.work_signal.publish(super::driver::CQ_RECHECK_WORK);
@@ -1317,20 +1180,14 @@ fn start_operation(
                 invoke_detached_completion(shared.finish_operation(Arc::clone(&state), completion));
                 StartResult::InFlight(state)
             } else {
-                BatchWrAccounting::exact_prefix(1, accepted).record(shared);
                 let state = shared.operations.release(token, false).unwrap_or(state);
                 shared.cq_credits.release();
-                shared
-                    .diagnostic_counters
-                    .cq_credits_rolled_back
-                    .fetch_add(1, Ordering::Relaxed);
                 connection.release_local(direction);
                 StartResult::Immediate((Err(Error::PostFailed(source)), state.take_mr()))
             }
         }
         BatchPostOutcome::PrefixAccepted { source, .. }
         | BatchPostOutcome::Ambiguous { source } => {
-            BatchWrAccounting::ambiguous(1).record(shared);
             shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
             let early = state.commit_accepted();
             shared.work_signal.publish(super::driver::CQ_RECHECK_WORK);
@@ -1447,52 +1304,53 @@ impl ValidatedOperation {
 }
 
 impl EngineShared {
+    fn reject_cqe(&self, _reason: CqeReject) {
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.rejected_cqes.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(super) fn enqueue_completion(&self, completion: WorkCompletion) -> Option<ConnectionToken> {
         let _admission = read_unpoison(&self.admission);
         let token = OperationToken::decode(completion.wr_id());
         let operation = match self.operations.lookup(token) {
             Lookup::Occupied(operation) => operation,
             Lookup::Duplicate => {
-                self.diagnostic_counters.reject_cqe(CqeReject::Duplicate);
+                self.reject_cqe(CqeReject::Duplicate);
                 return None;
             }
             Lookup::Stale | Lookup::Retired => {
-                self.diagnostic_counters
-                    .reject_cqe(CqeReject::StaleOperation);
+                self.reject_cqe(CqeReject::StaleOperation);
                 return None;
             }
             Lookup::Unknown => {
-                self.diagnostic_counters.reject_cqe(CqeReject::Unknown);
+                self.reject_cqe(CqeReject::Unknown);
                 return None;
             }
         };
         let connection = match self.connections.lookup(operation.connection.token) {
             Lookup::Occupied(connection) => connection,
             _ => {
-                self.diagnostic_counters
-                    .reject_cqe(CqeReject::StaleConnection);
+                self.reject_cqe(CqeReject::StaleConnection);
                 return None;
             }
         };
         if completion.qp_num() != operation.connection.qp_num() {
-            self.diagnostic_counters.reject_cqe(CqeReject::WrongQpNum);
+            self.reject_cqe(CqeReject::WrongQpNum);
             return None;
         }
         if self.connections.lookup_qp(completion.qp_num()) != Some(operation.connection.token) {
-            self.diagnostic_counters
-                .reject_cqe(CqeReject::WrongConnection);
+            self.reject_cqe(CqeReject::WrongConnection);
             return None;
         }
         if completion.is_success() && completion.opcode() != operation.expected_opcode {
-            self.diagnostic_counters
-                .reject_cqe(CqeReject::UnexpectedOpcode);
+            self.reject_cqe(CqeReject::UnexpectedOpcode);
             return None;
         }
         connection.enqueue_completion(completion);
         Some(connection.token)
     }
 
-    pub(super) fn process_connection_ready(
+    pub(super) fn dispatch_connection_completions(
         &self,
         token: ConnectionToken,
         quantum: usize,
@@ -1518,16 +1376,15 @@ impl EngineShared {
         let operation = match self.operations.lookup(token) {
             Lookup::Occupied(operation) => operation,
             Lookup::Duplicate => {
-                self.diagnostic_counters.reject_cqe(CqeReject::Duplicate);
+                self.reject_cqe(CqeReject::Duplicate);
                 return None;
             }
             Lookup::Stale | Lookup::Retired => {
-                self.diagnostic_counters
-                    .reject_cqe(CqeReject::StaleOperation);
+                self.reject_cqe(CqeReject::StaleOperation);
                 return None;
             }
             Lookup::Unknown => {
-                self.diagnostic_counters.reject_cqe(CqeReject::Unknown);
+                self.reject_cqe(CqeReject::Unknown);
                 return None;
             }
         };
@@ -1535,7 +1392,7 @@ impl EngineShared {
             CompletionDisposition::Deferred => None,
             CompletionDisposition::Complete => self.finish_operation(operation, completion),
             CompletionDisposition::Duplicate => {
-                self.diagnostic_counters.reject_cqe(CqeReject::Duplicate);
+                self.reject_cqe(CqeReject::Duplicate);
                 None
             }
         }
@@ -1547,26 +1404,17 @@ impl EngineShared {
         completion: WorkCompletion,
     ) -> Option<DetachedCompletion> {
         if self.operations.release(operation.token, true).is_none() {
-            self.diagnostic_counters.reject_cqe(CqeReject::Duplicate);
+            self.reject_cqe(CqeReject::Duplicate);
             return None;
         }
         let removed = operation.connection.remove_accepted(operation.token);
         operation.connection.release_local(operation.direction);
         self.cq_credits.release();
-        self.diagnostic_counters
-            .cq_credits_released
-            .fetch_add(1, Ordering::Relaxed);
         let previous = self.accepted_operations.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0, "accepted operation count must be positive");
         if previous == 1 && self.shutdown_requested.load(Ordering::Acquire) {
             self.work_signal.publish(super::driver::TERMINAL_WORK);
         }
-        self.diagnostic_counters
-            .operations_completed
-            .fetch_add(1, Ordering::Relaxed);
-        self.diagnostic_counters
-            .cqes_routed
-            .fetch_add(1, Ordering::Relaxed);
         let finished = operation.finish_completion(completion);
         if finished.was_reclaiming {
             self.pending_reclamations.fetch_sub(1, Ordering::AcqRel);
@@ -1632,17 +1480,11 @@ impl EngineShared {
         }
         connection.release_local(operation.direction);
         self.cq_credits.release();
-        self.diagnostic_counters
-            .cq_credits_released
-            .fetch_add(1, Ordering::Relaxed);
         let previous = self.accepted_operations.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0, "accepted operation count must be positive");
         if previous == 1 && self.shutdown_requested.load(Ordering::Acquire) {
             self.work_signal.publish(super::driver::TERMINAL_WORK);
         }
-        self.diagnostic_counters
-            .operations_released_after_qp_destroy
-            .fetch_add(1, Ordering::Relaxed);
         let finished = operation.finish_after_qp_destroy(connection.operation_close_error());
         if finished.was_reclaiming {
             self.pending_reclamations.fetch_sub(1, Ordering::AcqRel);
@@ -1687,7 +1529,7 @@ impl EngineShared {
         // The sole driver invokes this after the destruction boundary. CQEs
         // queued before the boundary were already dispatched normally; only
         // completions arriving after that boundary are rejected as stale.
-        self.dispatch_queued_completions(connection, self.config.ready_connection_quantum)
+        self.dispatch_queued_completions(connection, self.config.completion_dispatch_budget)
     }
 
     pub(super) fn begin_reclamation(&self, token: OperationToken) {
@@ -1697,11 +1539,7 @@ impl EngineShared {
     }
 
     pub(super) fn handle_reclamation_deadline(&self, token: OperationToken) {
-        if self.quarantine_operation(token) {
-            self.diagnostic_counters
-                .reclamation_deadlines
-                .fetch_add(1, Ordering::Relaxed);
-        }
+        self.quarantine_operation(token);
     }
 
     pub(super) fn quarantine_operation(&self, token: OperationToken) -> bool {
@@ -1720,14 +1558,7 @@ impl EngineShared {
         self.quarantined_bytes
             .fetch_add(operation.mr_len, Ordering::AcqRel);
         self.cq_credits.retain();
-        self.diagnostic_counters
-            .cq_credits_retained
-            .fetch_add(1, Ordering::Relaxed);
-        if self.track_operation_quarantine(&operation) {
-            self.diagnostic_counters
-                .connections_quarantined
-                .fetch_add(1, Ordering::Relaxed);
-        }
+        self.track_operation_quarantine(&operation);
         true
     }
 }
@@ -1786,7 +1617,6 @@ mod tests {
     use crate::v2::engine::config::EngineConfig;
     use crate::v2::engine::connection::{WorkRequestPoster, install_connection};
     use crate::v2::engine::lifecycle::MemoizedTerminalResult;
-    use crate::v2::engine::resources::ResourceSummary;
     use rdma_io_sys::ibverbs::{IBV_WC_RECV, IBV_WC_SEND, IBV_WC_SUCCESS};
     use std::sync::Barrier;
     use std::sync::Weak;
@@ -1938,7 +1768,7 @@ mod tests {
             .enqueue_completion(wc(token, connection.identity().qp_num(), IBV_WC_SEND));
 
         assert_eq!(
-            shared.process_connection_ready(connection.state.token, 1),
+            shared.dispatch_connection_completions(connection.state.token, 1),
             (1, false)
         );
         assert!(observed.load(Ordering::Acquire));
@@ -1995,24 +1825,11 @@ mod tests {
         let exact_wc = wc(exact, 7, IBV_WC_SEND);
         assert_eq!(shared.enqueue_completion(exact_wc), Some(first.state.token));
         assert_eq!(
-            shared.process_connection_ready(first.state.token, 1),
+            shared.dispatch_connection_completions(first.state.token, 1),
             (1, false)
         );
-        assert_eq!(
-            shared
-                .diagnostic_counters
-                .cqes_routed
-                .load(Ordering::Acquire),
-            1
-        );
         assert!(shared.enqueue_completion(exact_wc).is_none());
-        assert_eq!(
-            shared
-                .diagnostic_counters
-                .duplicate_cqes
-                .load(Ordering::Acquire),
-            1
-        );
+        assert_eq!(shared.rejected_cqes.load(Ordering::Acquire), 1);
 
         let unknown = OperationToken {
             slot: 99,
@@ -2079,48 +1896,7 @@ mod tests {
                 .is_none()
         );
 
-        assert_eq!(
-            shared
-                .diagnostic_counters
-                .unknown_cqes
-                .load(Ordering::Acquire),
-            1
-        );
-        assert_eq!(
-            shared
-                .diagnostic_counters
-                .stale_operation_cqes
-                .load(Ordering::Acquire),
-            1
-        );
-        assert_eq!(
-            shared
-                .diagnostic_counters
-                .wrong_qp_num_cqes
-                .load(Ordering::Acquire),
-            1
-        );
-        assert_eq!(
-            shared
-                .diagnostic_counters
-                .unexpected_opcode_cqes
-                .load(Ordering::Acquire),
-            1
-        );
-        assert_eq!(
-            shared
-                .diagnostic_counters
-                .wrong_connection_cqes
-                .load(Ordering::Acquire),
-            1
-        );
-        assert_eq!(
-            shared
-                .diagnostic_counters
-                .stale_connection_cqes
-                .load(Ordering::Acquire),
-            1
-        );
+        assert_eq!(shared.rejected_cqes.load(Ordering::Acquire), 7);
     }
 
     #[test]
@@ -2147,7 +1923,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_connection_quantum_bounds_routed_work_without_idle_scans() {
+    fn completion_dispatch_budget_bounds_routed_work_without_idle_scans() {
         let shared = synthetic_engine(8);
         let connection = synthetic_connection_on(&shared, 17);
         for _ in 0..3 {
@@ -2158,19 +1934,12 @@ mod tests {
             );
         }
         assert_eq!(
-            shared.process_connection_ready(connection.state.token, 2),
+            shared.dispatch_connection_completions(connection.state.token, 2),
             (2, true)
         );
         assert_eq!(
-            shared.process_connection_ready(connection.state.token, 2),
+            shared.dispatch_connection_completions(connection.state.token, 2),
             (1, false)
-        );
-        assert_eq!(
-            shared
-                .diagnostic_counters
-                .cqes_routed
-                .load(Ordering::Acquire),
-            3
         );
     }
 
@@ -2205,85 +1974,6 @@ mod tests {
             panic!("ambiguous bad_wr must retain the complete batch")
         };
         assert_eq!(retained, vec![1, 2, 3]);
-    }
-
-    #[test]
-    fn batch_counters_count_wrs_and_exact_partial_prefixes() {
-        let shared = synthetic_engine(8);
-        let partial = BatchPostOutcome::PrefixAccepted {
-            accepted: 2,
-            first_unaccepted: 2,
-            source: std::io::Error::from_raw_os_error(libc::ENOMEM),
-        };
-        BatchWrAccounting::from_outcome(5, &partial).record(&shared);
-        assert_eq!(
-            shared
-                .diagnostic_counters
-                .operations_accepted
-                .load(Ordering::Acquire),
-            2
-        );
-        assert_eq!(
-            shared
-                .diagnostic_counters
-                .operations_posted
-                .load(Ordering::Acquire),
-            2
-        );
-        assert_eq!(
-            shared
-                .diagnostic_counters
-                .operations_unaccepted
-                .load(Ordering::Acquire),
-            3
-        );
-        assert_eq!(
-            shared
-                .diagnostic_counters
-                .batch_accepted_prefix
-                .load(Ordering::Acquire),
-            2
-        );
-        assert_eq!(
-            shared
-                .diagnostic_counters
-                .batch_unaccepted_suffix
-                .load(Ordering::Acquire),
-            3
-        );
-
-        let ambiguous = BatchPostOutcome::Ambiguous {
-            source: std::io::Error::from_raw_os_error(libc::EIO),
-        };
-        BatchWrAccounting::from_outcome(4, &ambiguous).record(&shared);
-        assert_eq!(
-            shared
-                .diagnostic_counters
-                .operations_accepted
-                .load(Ordering::Acquire),
-            6
-        );
-        assert_eq!(
-            shared
-                .diagnostic_counters
-                .operations_posted
-                .load(Ordering::Acquire),
-            6
-        );
-        assert_eq!(
-            shared
-                .diagnostic_counters
-                .batch_accepted_prefix
-                .load(Ordering::Acquire),
-            2
-        );
-        assert_eq!(
-            shared
-                .diagnostic_counters
-                .batch_ambiguous_results
-                .load(Ordering::Acquire),
-            1
-        );
     }
 
     #[test]
@@ -2411,21 +2101,6 @@ mod tests {
         assert_eq!(second_poster.calls(), 0);
         assert_eq!(shared.operations.live(), 2);
         assert_eq!(shared.cq_credits.free(), 0);
-        assert_eq!(
-            shared
-                .diagnostic_counters
-                .operation_capacity_exhausted
-                .load(Ordering::Acquire),
-            1
-        );
-        assert_eq!(
-            shared
-                .diagnostic_counters
-                .cq_capacity_exhausted
-                .load(Ordering::Acquire),
-            0,
-            "validated max_inflight_operations <= cq_capacity makes CQ exhaustion unreachable"
-        );
         second
             .state
             .reserve_local(Direction::Send)
@@ -2470,14 +2145,6 @@ mod tests {
             .reserve_local(Direction::Send)
             .expect("proven-unaccepted rollback must restore local credit");
         connection.state.release_local(Direction::Send);
-        let diagnostics = engine.diagnostics();
-        assert_eq!(diagnostics.operations_accepted, 0);
-        assert_eq!(diagnostics.operations_posted, 0);
-        assert_eq!(diagnostics.operations_unaccepted, 1);
-        assert_eq!(diagnostics.batch_accepted_prefix, 0);
-        assert_eq!(diagnostics.batch_unaccepted_suffix, 1);
-        assert_eq!(diagnostics.batch_ambiguous_results, 0);
-
         drop(returned);
         drop(connection);
         drop(driver);
@@ -2528,11 +2195,6 @@ mod tests {
         connection.state.reserve_local(Direction::Recv).unwrap();
         connection.state.release_local(Direction::Recv);
         connection.state.release_local(Direction::Recv);
-        let diagnostics = engine.diagnostics();
-        assert_eq!(diagnostics.operations_offered, 2);
-        assert_eq!(diagnostics.operations_accepted, 0);
-        assert_eq!(diagnostics.operations_unaccepted, 2);
-        assert_eq!(diagnostics.batch_unaccepted_suffix, 2);
         assert_eq!(
             recorder
                 .snapshot()
@@ -2570,14 +2232,6 @@ mod tests {
         assert_eq!(shared.pending_reclamations.load(Ordering::Acquire), 1);
         assert_eq!(connection.state.accepted_count(), 1);
         assert!(recorder.snapshot().is_empty());
-        let diagnostics = engine.diagnostics();
-        assert_eq!(diagnostics.operations_accepted, 1);
-        assert_eq!(diagnostics.operations_posted, 1);
-        assert_eq!(diagnostics.operations_unaccepted, 0);
-        assert_eq!(diagnostics.batch_accepted_prefix, 0);
-        assert_eq!(diagnostics.batch_unaccepted_suffix, 0);
-        assert_eq!(diagnostics.batch_ambiguous_results, 1);
-
         complete(&shared, &connection.state, poster.tokens()[0], IBV_WC_SEND);
         assert_eq!(shared.operations.live(), 0);
         assert_eq!(shared.cq_credits.free(), 4);
@@ -2621,7 +2275,6 @@ mod tests {
         assert_eq!(shared.operations.live(), 0);
         assert_eq!(shared.accepted_operations.load(Ordering::Acquire), 0);
         assert_eq!(shared.cq_credits.free(), 4);
-        assert_eq!(engine.diagnostics().operations_completed, 1);
         drop(returned);
         drop(connection);
         drop(driver);
@@ -2711,7 +2364,6 @@ mod tests {
             assert_eq!(shared.pending_reclamations.load(Ordering::Acquire), 0);
             assert_eq!(shared.cq_credits.free(), 4);
         }
-        assert_eq!(engine.diagnostics().operations_completed, 32);
         assert_eq!(
             recorder
                 .snapshot()
@@ -2943,7 +2595,7 @@ mod tests {
             Some(connection.state.token)
         );
         assert_eq!(
-            shared.process_connection_ready(connection.state.token, 1),
+            shared.dispatch_connection_completions(connection.state.token, 1),
             (1, false)
         );
         assert_eq!(shared.operations.live(), 0);
@@ -3007,7 +2659,10 @@ mod tests {
                         .connections
                         .lookup_qp(self.qp_num)
                         .expect("connection token");
-                    assert_eq!(shared.process_connection_ready(connection, 1), (1, false));
+                    assert_eq!(
+                        shared.dispatch_connection_completions(connection, 1),
+                        (1, false)
+                    );
                     BatchPostOutcome::AllAccepted
                 }
             }
@@ -3115,7 +2770,7 @@ mod tests {
             Some(connection.token)
         );
         assert_eq!(
-            shared.process_connection_ready(connection.token, 1),
+            shared.dispatch_connection_completions(connection.token, 1),
             (1, false)
         );
     }
@@ -3152,25 +2807,7 @@ mod tests {
         config.max_live_connections = capacity;
         config.max_inflight_operations = capacity;
         config.cq_capacity = capacity;
-        Arc::new(
-            EngineShared::new(
-                config,
-                ResourceSummary {
-                    contexts: 0,
-                    protection_domains: 0,
-                    completion_queues: 0,
-                    completion_channels: 0,
-                    cq_notification_fds: 0,
-                    cm_event_channels: 0,
-                    cm_event_fds: 0,
-                    explicit_drivers: 1,
-                    library_owned_tasks: 0,
-                },
-                None,
-                None,
-            )
-            .unwrap(),
-        )
+        Arc::new(EngineShared::new(config, None, None).unwrap())
     }
 
     fn synthetic_connection_on(
