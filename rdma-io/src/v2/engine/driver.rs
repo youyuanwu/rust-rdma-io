@@ -1163,8 +1163,12 @@ pub(super) mod test_api {
         }
 
         /// Snapshot bounded-work and direct-routing instrumentation.
+        ///
+        /// Unlike mutation fixtures, this read-only snapshot remains available
+        /// after driver termination so tests can verify the frozen terminal
+        /// route ledger.
         pub fn instrumentation(&self) -> Result<TestEngineInstrumentation> {
-            let shared = self.ensure_not_terminal()?;
+            let shared = self.shared.upgrade().ok_or(Error::DriverShutdown)?;
             Ok(shared.test_driver.instrumentation(&shared))
         }
 

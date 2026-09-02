@@ -378,6 +378,7 @@ async fn run_readiness_shutdown_after_addr_error() {
         .cm_event_budget(4)
         .build()
         .unwrap();
+    let resources = engine.test_resources().unwrap();
 
     let mut connect = Box::pin(engine.connect(unresolved_neighbor_addr()));
     poll_fn(|cx| {
@@ -396,14 +397,37 @@ async fn run_readiness_shutdown_after_addr_error() {
     assert_eq!(before_shutdown.connections_admitted, 1);
     assert_eq!(before_shutdown.free_connection_slots, 1);
     assert_eq!(before_shutdown.cm_events_rejected, 0);
-    let addr_error_won = match (
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum PreShutdownState {
+        Pending,
+        AddrErrorWon,
+    }
+    #[derive(Debug, PartialEq, Eq)]
+    struct TerminalLedger {
+        pre_shutdown_state: PreShutdownState,
+        connect_is_addr_error: bool,
+        connect_is_shutdown: bool,
+        cm_events_processed: u64,
+        connections_failed: u64,
+        live: usize,
+        establishing: usize,
+        pending_routes: usize,
+        retained_owners: usize,
+        rejected: u64,
+        stale: u64,
+        duplicate: u64,
+        unknown: u64,
+        wrong_id: u64,
+        unexpected: u64,
+    }
+    let pre_shutdown_state = match (
         before_shutdown.cm_events_processed,
         before_shutdown.connections_failed,
         before_shutdown.live_connection_reservations,
         before_shutdown.establishing_connection_reservations,
     ) {
-        (0, 0, 1, 1) => false,
-        (1, 1, 0, 0) => true,
+        (0, 0, 1, 1) => PreShutdownState::Pending,
+        (1, 1, 0, 0) => PreShutdownState::AddrErrorWon,
         ledger => panic!("invalid pre-shutdown ADDR_ERROR ledger: {ledger:?}"),
     };
 
@@ -431,35 +455,11 @@ async fn run_readiness_shutdown_after_addr_error() {
         Ok(_) => panic!("unresolved neighbor unexpectedly connected"),
         Err(error) => error,
     };
-    if addr_error_won {
-        assert!(
-            matches!(&connect_error, Error::Verbs(_))
-                && connect_error.to_string().contains("AddrError"),
-            "ADDR_ERROR winner published the wrong connect cause: {connect_error}"
-        );
-    } else {
-        assert!(
-            matches!(&connect_error, Error::DriverShutdown),
-            "shutdown winner published the wrong connect cause: {connect_error}"
-        );
-    }
-
     let diagnostics = engine.diagnostics();
-    let expected_failure_events = u64::from(addr_error_won);
     assert_eq!(diagnostics.lifecycle, RdmaEngineLifecycle::Terminated);
     assert!(diagnostics.terminal_error.is_none());
     assert_eq!(diagnostics.shutdowns, 1);
     assert_eq!(diagnostics.connections_admitted, 1);
-    assert_eq!(diagnostics.connections_failed, expected_failure_events);
-    assert_eq!(diagnostics.cm_events_processed, expected_failure_events);
-    assert_eq!(diagnostics.cm_events_rejected, 0);
-    assert_eq!(diagnostics.stale_cm_events, 0);
-    assert_eq!(diagnostics.duplicate_cm_events, 0);
-    assert_eq!(diagnostics.unknown_cm_events, 0);
-    assert_eq!(diagnostics.wrong_id_cm_events, 0);
-    assert_eq!(diagnostics.unexpected_cm_events, 0);
-    assert_eq!(diagnostics.live_connection_reservations, 0);
-    assert_eq!(diagnostics.establishing_connection_reservations, 0);
     assert_eq!(diagnostics.established_connection_reservations, 0);
     assert_eq!(diagnostics.draining_connection_reservations, 0);
     assert_eq!(diagnostics.registered_live_qps, 0);
@@ -488,6 +488,88 @@ async fn run_readiness_shutdown_after_addr_error() {
     assert_eq!(diagnostics.inbound_requests_rejected, 0);
     assert!(diagnostics.connections().is_empty());
     assert!(diagnostics.listeners().is_empty());
+    let instrumentation = resources.instrumentation().unwrap();
+    let connect_is_addr_error = matches!(&connect_error, Error::Verbs(_))
+        && connect_error
+            .to_string()
+            .contains("RDMA CM AddrError failed with status ");
+    let connect_is_shutdown = matches!(&connect_error, Error::DriverShutdown);
+    let terminal_ledger = TerminalLedger {
+        pre_shutdown_state,
+        connect_is_addr_error,
+        connect_is_shutdown,
+        cm_events_processed: diagnostics.cm_events_processed,
+        connections_failed: diagnostics.connections_failed,
+        live: diagnostics.live_connection_reservations,
+        establishing: diagnostics.establishing_connection_reservations,
+        pending_routes: instrumentation.cm_pending_routes,
+        retained_owners: instrumentation.cm_retained_owners,
+        rejected: diagnostics.cm_events_rejected,
+        stale: diagnostics.stale_cm_events,
+        duplicate: diagnostics.duplicate_cm_events,
+        unknown: diagnostics.unknown_cm_events,
+        wrong_id: diagnostics.wrong_id_cm_events,
+        unexpected: diagnostics.unexpected_cm_events,
+    };
+    match terminal_ledger {
+        TerminalLedger {
+            pre_shutdown_state: PreShutdownState::AddrErrorWon,
+            connect_is_addr_error: true,
+            connect_is_shutdown: false,
+            cm_events_processed: 1,
+            connections_failed: 1,
+            live: 0,
+            establishing: 0,
+            pending_routes: 0,
+            retained_owners: 0,
+            rejected: 0,
+            stale: 0,
+            duplicate: 0,
+            unknown: 0,
+            wrong_id: 0,
+            unexpected: 0,
+        }
+        | TerminalLedger {
+            pre_shutdown_state: PreShutdownState::Pending,
+            connect_is_addr_error: false,
+            connect_is_shutdown: true,
+            cm_events_processed: 0,
+            connections_failed: 0,
+            live: 0,
+            establishing: 0,
+            pending_routes: 0,
+            retained_owners: 0,
+            rejected: 0,
+            stale: 0,
+            duplicate: 0,
+            unknown: 0,
+            wrong_id: 0,
+            unexpected: 0,
+        }
+        // A processed event with no failure is setup progress (for example
+        // AddrResolved) consumed after the snapshot before shutdown cancels
+        // the route; it is not a loosely tolerated failure.
+        | TerminalLedger {
+            pre_shutdown_state: PreShutdownState::Pending,
+            connect_is_addr_error: false,
+            connect_is_shutdown: true,
+            cm_events_processed: 1,
+            connections_failed: 0,
+            live: 0,
+            establishing: 0,
+            pending_routes: 0,
+            retained_owners: 0,
+            rejected: 0,
+            stale: 0,
+            duplicate: 0,
+            unknown: 0,
+            wrong_id: 0,
+            unexpected: 0,
+        } => {}
+        ledger => panic!(
+            "invalid terminal ADDR/shutdown ledger {ledger:?}; connect error: {connect_error}"
+        ),
+    }
 
     tokio::task::yield_now().await;
     let stable = engine.diagnostics();

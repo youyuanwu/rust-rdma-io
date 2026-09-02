@@ -185,6 +185,24 @@ pub mod test_helpers {
         })
     }
 
+    fn is_transient_v2_listener_message(message: &str) -> bool {
+        const PREFIX: &str = "listen on ";
+        const BACKLOG: &str = " with requested kernel backlog 2147483647: ";
+
+        let Some((address, source)) = message
+            .strip_prefix(PREFIX)
+            .and_then(|message| message.split_once(BACKLOG))
+        else {
+            return false;
+        };
+        let Ok(address) = address.parse::<std::net::SocketAddr>() else {
+            return false;
+        };
+        let expected_source = std::io::Error::from_raw_os_error(98).to_string();
+        message == format!("{PREFIX}{address}{BACKLOG}{expected_source}")
+            && source == expected_source
+    }
+
     fn transient_cm_event(message: &str) -> Option<(&str, i32)> {
         const ANCHOR: &str = "RDMA CM ";
 
@@ -252,6 +270,7 @@ pub mod test_helpers {
     pub(crate) enum V2EngineCmSetupStage {
         Listen,
         ConnectAccept,
+        Ready,
     }
 
     /// Returns `true` only for known software-provider failures from an
@@ -264,10 +283,16 @@ pub mod test_helpers {
             return false;
         };
         match stage {
-            V2EngineCmSetupStage::Listen | V2EngineCmSetupStage::ConnectAccept => {
+            V2EngineCmSetupStage::Listen => {
+                error.raw_os_error().is_some_and(is_transient_cm_status)
+                    || is_transient_cm_event_message(&error.to_string())
+                    || is_transient_v2_listener_message(&error.to_string())
+            }
+            V2EngineCmSetupStage::ConnectAccept => {
                 error.raw_os_error().is_some_and(is_transient_cm_status)
                     || is_transient_cm_event_message(&error.to_string())
             }
+            V2EngineCmSetupStage::Ready => is_transient_cm_event_message(&error.to_string()),
         }
     }
 
@@ -276,11 +301,23 @@ pub mod test_helpers {
         errors: &[rdma_io::v2::Error],
         reject_event_counters_unchanged: bool,
     ) -> bool {
-        reject_event_counters_unchanged
-            && !errors.is_empty()
-            && errors
+        if !reject_event_counters_unchanged || errors.is_empty() {
+            return false;
+        }
+        match stage {
+            V2EngineCmSetupStage::Listen | V2EngineCmSetupStage::ConnectAccept => errors
                 .iter()
-                .all(|error| is_transient_v2_engine_cm_setup_error(stage, error))
+                .all(|error| is_transient_v2_engine_cm_setup_error(stage, error)),
+            V2EngineCmSetupStage::Ready => {
+                errors
+                    .iter()
+                    .any(|error| is_transient_v2_engine_cm_setup_error(stage, error))
+                    && errors.iter().all(|error| {
+                        is_transient_v2_engine_cm_setup_error(stage, error)
+                            || matches!(error, rdma_io::v2::Error::TransportClosed)
+                    })
+            }
+        }
     }
 
     /// Bind an [`AsyncCmListener`] to `0.0.0.0:0`, retrying on `EADDRINUSE`.
@@ -531,7 +568,7 @@ pub mod engine_test_helpers {
     use crate::test_helpers::{
         TRANSIENT_CM_HANDSHAKE_ATTEMPTS, V2EngineCmSetupStage,
         are_v2_engine_cm_setup_errors_retryable, connect_addr_for, connect_client_with_retry,
-        transient_cm_retry_delay,
+        is_transient_v2_engine_cm_setup_error, transient_cm_retry_delay,
     };
 
     const V2_SETUP_STAGE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -807,12 +844,14 @@ pub mod engine_test_helpers {
     }
 
     /// Establish a ready message pair, retrying only known transient
-    /// software-RDMA failures from listener or connect/accept CM setup.
+    /// software-RDMA failures from listener, connect/accept, or readiness CM
+    /// setup.
     ///
-    /// Retries are test-only provider recovery. They never cover HELLO,
-    /// protocol, or data-operation errors. All attempts share a 60-second
-    /// wall-clock budget; cancellation of that outer budget is followed by
-    /// at most 15 seconds of exact cleanup verification.
+    /// Readiness retries require the exact production CM-event grammar; raw
+    /// errno, HELLO, protocol, and data-operation errors are never retried.
+    /// All attempts share a 60-second wall-clock budget; cancellation of that
+    /// outer budget is followed by at most 15 seconds of exact cleanup
+    /// verification.
     pub async fn establish_message_pair_with_retry<F>(
         server_engine: &RdmaEngine,
         client_engine: &RdmaEngine,
@@ -835,12 +874,36 @@ pub mod engine_test_helpers {
     pub async fn establish_message_pair_with_retry_before_connect_accept<F, C>(
         server_engine: &RdmaEngine,
         client_engine: &RdmaEngine,
-        mut make_builder: F,
-        mut before_connect_accept: C,
+        make_builder: F,
+        before_connect_accept: C,
     ) -> Result<(RdmaListener, MessageTransport, MessageTransport)>
     where
         F: FnMut() -> MessageTransportBuilder,
         C: FnMut(u64) -> Result<()>,
+    {
+        establish_message_pair_with_retry_before_stages(
+            server_engine,
+            client_engine,
+            make_builder,
+            before_connect_accept,
+            |_| Ok(()),
+        )
+        .await
+    }
+
+    /// Variant with test-only stage hooks for proving exact retry policy and
+    /// cleanup without changing production engine behavior.
+    pub async fn establish_message_pair_with_retry_before_stages<F, C, R>(
+        server_engine: &RdmaEngine,
+        client_engine: &RdmaEngine,
+        mut make_builder: F,
+        mut before_connect_accept: C,
+        mut before_ready: R,
+    ) -> Result<(RdmaListener, MessageTransport, MessageTransport)>
+    where
+        F: FnMut() -> MessageTransportBuilder,
+        C: FnMut(u64) -> Result<()>,
+        R: FnMut(u64) -> Result<()>,
     {
         let server_resources = server_engine.test_resources().unwrap();
         let client_resources = client_engine.test_resources().unwrap();
@@ -1077,21 +1140,41 @@ pub mod engine_test_helpers {
 
                 let server = server.expect("successful server establishment");
                 let client = client.expect("successful client establishment");
-                let ready = tokio::time::timeout(V2_SETUP_STAGE_TIMEOUT, async {
+                let injected_ready_error = before_ready(attempt).err();
+                let mut ready = tokio::time::timeout(V2_SETUP_STAGE_TIMEOUT, async {
                     tokio::join!(server.ready(), client.ready())
                 })
                 .await;
+                if matches!(&ready, Ok((Ok(()), Ok(()))))
+                    && let Some(error) = injected_ready_error
+                {
+                    ready = Ok((Err(error), Ok(())));
+                }
                 match ready {
                     Ok((Ok(()), Ok(()))) => return Ok((listener, server, client)),
                     Ok((server_ready, client_ready)) => {
-                        let error = server_ready
-                            .err()
-                            .or_else(|| client_ready.err())
-                            .expect("failed HELLO must carry an error");
-                        let context = format!("HELLO failed without retry: {error}");
+                        let ready_errors = [server_ready.err(), client_ready.err()]
+                            .into_iter()
+                            .flatten()
+                            .collect::<Vec<_>>();
+                        let context = format!("message readiness failed: {ready_errors:?}");
                         attempt_history.push(format!("attempt {attempt}: {context}"));
+                        let server_at_failure = EngineCleanupBaseline::capture(
+                            server_engine,
+                            server_resources.instrumentation().unwrap(),
+                        );
+                        let client_at_failure = EngineCleanupBaseline::capture(
+                            client_engine,
+                            client_resources.instrumentation().unwrap(),
+                        );
+                        let no_engine_rejects = attempt_has_no_engine_rejects(
+                            &server_at_failure,
+                            &server_baseline,
+                            &client_at_failure,
+                            &client_baseline,
+                        );
                         close_message_attempt(Some(listener), Some(server), Some(client)).await;
-                        wait_for_engine_cleanup(
+                        let (server, client) = wait_for_engine_cleanup(
                             server_engine,
                             &server_resources,
                             &server_baseline,
@@ -1101,7 +1184,52 @@ pub mod engine_test_helpers {
                             &context,
                         )
                         .await;
-                        return Err(error);
+                        if !no_engine_rejects {
+                            tracing::warn!(
+                                "V2 ready retry disabled by engine reject/event counter delta: \
+                                 server before {server_baseline:?}, at failure {server_at_failure:?}; \
+                                 client before {client_baseline:?}, at failure {client_at_failure:?}; \
+                                 post-cleanup server {server:?}, client {client:?}"
+                            );
+                        }
+                        if !are_v2_engine_cm_setup_errors_retryable(
+                            V2EngineCmSetupStage::Ready,
+                            &ready_errors,
+                            no_engine_rejects,
+                        ) {
+                            let error = ready_errors
+                                .iter()
+                                .find(|error| {
+                                    !is_transient_v2_engine_cm_setup_error(
+                                        V2EngineCmSetupStage::Ready,
+                                        error,
+                                    ) && !matches!(error, Error::TransportClosed)
+                                })
+                                .unwrap_or_else(|| {
+                                    ready_errors
+                                        .first()
+                                        .expect("failed readiness must carry an error")
+                                })
+                                .clone();
+                            return Err(error);
+                        }
+                        let error = ready_errors
+                            .into_iter()
+                            .find(|error| {
+                                is_transient_v2_engine_cm_setup_error(
+                                    V2EngineCmSetupStage::Ready,
+                                    error,
+                                )
+                            })
+                            .expect("retryable readiness must carry an exact CM event error");
+                        if attempt + 1 == TRANSIENT_CM_HANDSHAKE_ATTEMPTS {
+                            return Err(retry_exhausted(error));
+                        }
+                        tracing::warn!(
+                            "V2 message readiness attempt {attempt} failed transiently: {error}"
+                        );
+                        tokio::time::sleep(transient_cm_retry_delay(attempt)).await;
+                        continue;
                     }
                     Err(elapsed) => {
                         let error = setup_timeout("HELLO", elapsed);
@@ -1271,6 +1399,10 @@ mod tests {
                 V2EngineCmSetupStage::ConnectAccept,
                 "inbound RDMA CM Rejected failed with status -71 for id=0x3 listen_id=0x2",
             ),
+            (
+                V2EngineCmSetupStage::Ready,
+                "RDMA CM ConnectError failed with status -22 for id=0x4 listen_id=0x0",
+            ),
         ] {
             let error = rdma_io::v2::Error::Verbs(std::io::Error::other(message.to_owned()));
             assert!(
@@ -1278,6 +1410,18 @@ mod tests {
                 "{message:?} should be retryable"
             );
         }
+        let listener_busy = format!(
+            "listen on 0.0.0.0:0 with requested kernel backlog 2147483647: {}",
+            std::io::Error::from_raw_os_error(98)
+        );
+        let error = rdma_io::v2::Error::Verbs(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            listener_busy,
+        ));
+        assert!(is_transient_v2_engine_cm_setup_error(
+            V2EngineCmSetupStage::Listen,
+            &error,
+        ));
     }
 
     #[test]
@@ -1305,6 +1449,21 @@ mod tests {
                 !is_transient_v2_engine_cm_setup_error(V2EngineCmSetupStage::ConnectAccept, &error),
                 "{message:?} should not be retryable"
             );
+        }
+        for message in [
+            "listen on not-an-address with requested kernel backlog 2147483647: Address already in use (os error 98)",
+            "listen on 0.0.0.0:0 with requested kernel backlog 8: Address already in use (os error 98)",
+            "listen on 0.0.0.0:0 with requested kernel backlog 2147483647: Invalid argument (os error 22)",
+            "prefix listen on 0.0.0.0:0 with requested kernel backlog 2147483647: Address already in use (os error 98)",
+        ] {
+            let error = rdma_io::v2::Error::Verbs(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                message,
+            ));
+            assert!(!is_transient_v2_engine_cm_setup_error(
+                V2EngineCmSetupStage::Listen,
+                &error,
+            ));
         }
     }
 
@@ -1340,6 +1499,46 @@ mod tests {
         assert!(is_transient_v2_engine_cm_setup_error(
             V2EngineCmSetupStage::Listen,
             &rdma_io::v2::Error::Verbs(std::io::Error::from_raw_os_error(98))
+        ));
+    }
+
+    #[test]
+    fn v2_ready_retry_rejects_raw_errno_and_protocol_errors() {
+        for error in [
+            rdma_io::v2::Error::Verbs(std::io::Error::from_raw_os_error(22)),
+            rdma_io::v2::Error::Verbs(std::io::Error::from_raw_os_error(71)),
+            rdma_io::v2::Error::Verbs(std::io::Error::from_raw_os_error(98)),
+            rdma_io::v2::Error::ProtocolViolation("bad HELLO magic".into()),
+        ] {
+            assert!(!is_transient_v2_engine_cm_setup_error(
+                V2EngineCmSetupStage::Ready,
+                &error
+            ));
+            assert!(!are_v2_engine_cm_setup_errors_retryable(
+                V2EngineCmSetupStage::Ready,
+                std::slice::from_ref(&error),
+                true,
+            ));
+        }
+    }
+
+    #[test]
+    fn v2_ready_retry_allows_only_exact_cm_error_with_transport_close_companion() {
+        let transient = rdma_io::v2::Error::Verbs(std::io::Error::other(
+            "RDMA CM ConnectError failed with status 71 for id=0x1 listen_id=0x0",
+        ));
+        assert!(are_v2_engine_cm_setup_errors_retryable(
+            V2EngineCmSetupStage::Ready,
+            &[transient.clone(), rdma_io::v2::Error::TransportClosed],
+            true,
+        ));
+        assert!(!are_v2_engine_cm_setup_errors_retryable(
+            V2EngineCmSetupStage::Ready,
+            &[
+                transient,
+                rdma_io::v2::Error::ProtocolViolation("HELLO mismatch".into()),
+            ],
+            true,
         ));
     }
 
