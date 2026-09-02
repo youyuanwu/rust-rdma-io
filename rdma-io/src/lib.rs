@@ -44,4 +44,8 @@ pub mod transport_common;
 
 pub use error::{Error, Result};
 
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+mod test_support;
+
 pub mod v2;

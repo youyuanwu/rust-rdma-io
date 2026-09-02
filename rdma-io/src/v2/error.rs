@@ -17,6 +17,23 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Each variant corresponds to a distinct failure category, enabling
 /// callers to handle errors with pattern matching rather than inspecting
 /// opaque error codes.
+///
+/// # Use case
+///
+/// Match typed resource, completion, transport, quarantine, and engine errors.
+///
+/// # Ownership and progress
+///
+/// Errors are owned values and do not drive progress or retain V1 errors.
+///
+/// # Safety and limits
+///
+/// Quarantine and wedge variants report retained ownership rather than
+/// claiming unsafe cleanup succeeded.
+///
+/// # Availability
+///
+/// Available in every V2 feature profile.
 #[derive(Debug)]
 pub enum Error {
     /// No RDMA devices were found on this system.
@@ -62,17 +79,94 @@ pub enum Error {
     /// The in-flight registry or buffer pool has no available capacity.
     CapacityExhausted,
 
+    /// Connection close could not establish an exact-CQE or owning-QP
+    /// destruction boundary for accepted WRs.
+    ConnectionQuarantined {
+        /// Accepted operations still awaiting a safe ownership boundary.
+        outstanding_operations: usize,
+        /// CQ admission credits retained with those operations.
+        cq_debt: usize,
+    },
+
+    /// Connection retirement retained its complete resource bundle because
+    /// the owning queue pair could not be destroyed.
+    ConnectionDestroyQuarantined {
+        /// Contextual provider destruction failure.
+        cause: String,
+    },
+
+    /// Engine termination retained unsafe live state.
+    EngineWedged {
+        /// Complete QP/CM/MR/operation bundles retained fail-closed. This can
+        /// be zero when only non-bundle CM routing work remains pending.
+        retained_bundles: usize,
+        /// Accepted operations still awaiting exact completions.
+        outstanding_operations: usize,
+        /// CQ admission credits retained with those operations.
+        cq_debt: usize,
+    },
+
     /// A wire-protocol violation was detected (bad magic, version, frame type,
     /// or payload length).
     ProtocolViolation(String),
+}
 
-    /// The transport has failed with a terminal error.
-    ///
-    /// Contains a [`TransportError`] snapshot describing the failure cause.
-    /// Returned by frontend operations (`ready()`, `send()`, `recv()`) when
-    /// the driver has exited with an error. Use [`super::message_transport::MessageTransport::error()`]
-    /// for the same information.
-    TransportFailed(TransportError),
+impl Clone for Error {
+    fn clone(&self) -> Self {
+        match self {
+            Self::NoDevices => Self::NoDevices,
+            Self::DeviceNotFound(name) => Self::DeviceNotFound(name.clone()),
+            Self::Verbs(error) => Self::Verbs(clone_io_error(error)),
+            Self::InvalidConfig(message) => Self::InvalidConfig(message.clone()),
+            Self::PostFailed(error) => Self::PostFailed(clone_io_error(error)),
+            Self::CompletionError { status, vendor_err } => Self::CompletionError {
+                status: *status,
+                vendor_err: *vendor_err,
+            },
+            Self::WouldBlock => Self::WouldBlock,
+            Self::MessageTooLarge { size, capacity } => Self::MessageTooLarge {
+                size: *size,
+                capacity: *capacity,
+            },
+            Self::TransportClosed => Self::TransportClosed,
+            Self::DriverShutdown => Self::DriverShutdown,
+            Self::CapacityExhausted => Self::CapacityExhausted,
+            Self::ConnectionQuarantined {
+                outstanding_operations,
+                cq_debt,
+            } => Self::ConnectionQuarantined {
+                outstanding_operations: *outstanding_operations,
+                cq_debt: *cq_debt,
+            },
+            Self::ConnectionDestroyQuarantined { cause } => Self::ConnectionDestroyQuarantined {
+                cause: cause.clone(),
+            },
+            Self::EngineWedged {
+                retained_bundles,
+                outstanding_operations,
+                cq_debt,
+            } => Self::EngineWedged {
+                retained_bundles: *retained_bundles,
+                outstanding_operations: *outstanding_operations,
+                cq_debt: *cq_debt,
+            },
+            Self::ProtocolViolation(message) => Self::ProtocolViolation(message.clone()),
+        }
+    }
+}
+
+fn clone_io_error(error: &io::Error) -> io::Error {
+    match error.raw_os_error() {
+        Some(code) => {
+            let os_error = io::Error::from_raw_os_error(code);
+            if os_error.kind() == error.kind() && os_error.to_string() == error.to_string() {
+                os_error
+            } else {
+                io::Error::new(error.kind(), error.to_string())
+            }
+        }
+        None => io::Error::new(error.kind(), error.to_string()),
+    }
 }
 
 impl fmt::Display for Error {
@@ -99,10 +193,27 @@ impl fmt::Display for Error {
             Error::TransportClosed => write!(f, "transport closed"),
             Error::DriverShutdown => write!(f, "driver shut down"),
             Error::CapacityExhausted => write!(f, "capacity exhausted"),
+            Error::ConnectionQuarantined {
+                outstanding_operations,
+                cq_debt,
+            } => write!(
+                f,
+                "connection quarantined with {outstanding_operations} outstanding operations and {cq_debt} retained CQ credits"
+            ),
+            Error::ConnectionDestroyQuarantined { cause } => {
+                write!(f, "connection destroy quarantined: {cause}")
+            }
+            Error::EngineWedged {
+                retained_bundles,
+                outstanding_operations,
+                cq_debt,
+            } => write!(
+                f,
+                "engine wedged with {retained_bundles} retained bundles, {outstanding_operations} outstanding operations, and {cq_debt} retained CQ credits"
+            ),
             Error::ProtocolViolation(detail) => {
                 write!(f, "protocol violation: {detail}")
             }
-            Error::TransportFailed(te) => write!(f, "transport failed: {te}"),
         }
     }
 }
@@ -111,14 +222,13 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Verbs(e) | Error::PostFailed(e) => Some(e),
-            Error::TransportFailed(te) => Some(te),
             _ => None,
         }
     }
 }
 
-impl From<crate::Error> for Error {
-    fn from(e: crate::Error) -> Self {
+impl Error {
+    pub(crate) fn from_v1(e: crate::Error) -> Self {
         match e {
             crate::Error::NoDevices => Error::NoDevices,
             crate::Error::DeviceNotFound(name) => Error::DeviceNotFound(name),
@@ -141,108 +251,6 @@ impl From<io::Error> for Error {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Transport Error (cloneable terminal error snapshot)
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Categories of terminal transport errors.
-///
-/// Provides typed failure classification for programmatic error handling.
-/// Obtained from [`TransportError::kind()`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TransportErrorKind {
-    /// HELLO handshake failed (timeout or validation error).
-    ProtocolViolation,
-    /// The driver was dropped or aborted without completing.
-    DriverAborted,
-    /// A completion queue driver error.
-    CompletionError,
-    /// An RDMA verbs or connection-level error.
-    ConnectionError,
-    /// The transport was shut down (clean or forced).
-    Shutdown,
-}
-
-impl fmt::Display for TransportErrorKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TransportErrorKind::ProtocolViolation => write!(f, "protocol violation"),
-            TransportErrorKind::DriverAborted => write!(f, "driver aborted"),
-            TransportErrorKind::CompletionError => write!(f, "completion error"),
-            TransportErrorKind::ConnectionError => write!(f, "connection error"),
-            TransportErrorKind::Shutdown => write!(f, "shutdown"),
-        }
-    }
-}
-
-/// A cloneable, thread-safe terminal error representation for frontend
-/// inspection.
-///
-/// Created from the driver's terminal error and stored exactly once via
-/// race-safe state transition semantics. Both the driver's
-/// `Future<Output = Result<()>>` output and this frontend-observable snapshot
-/// carry consistent cause information.
-///
-/// Obtained via [`super::message_transport::MessageTransport::error()`].
-///
-/// # Examples
-///
-/// ```no_run
-/// # use rdma_io::v2::*;
-/// # use rdma_io::v2::error::TransportErrorKind;
-/// # async fn example(transport: MessageTransport) {
-/// if let Some(err) = transport.error() {
-///     match err.kind() {
-///         TransportErrorKind::ProtocolViolation => {
-///             eprintln!("handshake failed: {err}");
-///         }
-///         TransportErrorKind::DriverAborted => {
-///             eprintln!("driver was dropped/aborted: {err}");
-///         }
-///         _ => eprintln!("transport error: {err}"),
-///     }
-/// }
-/// # }
-/// ```
-#[derive(Clone, Debug)]
-pub struct TransportError {
-    kind: TransportErrorKind,
-    message: String,
-}
-
-impl TransportError {
-    /// Create a `TransportError` snapshot from a driver [`Error`].
-    pub(crate) fn from_error(err: &Error) -> Self {
-        let message = err.to_string();
-        let kind = match err {
-            Error::ProtocolViolation(_) => TransportErrorKind::ProtocolViolation,
-            Error::DriverShutdown => TransportErrorKind::DriverAborted,
-            Error::CompletionError { .. } => TransportErrorKind::CompletionError,
-            Error::TransportClosed => TransportErrorKind::Shutdown,
-            _ => TransportErrorKind::ConnectionError,
-        };
-        Self { kind, message }
-    }
-
-    /// The typed error category for programmatic matching.
-    pub fn kind(&self) -> &TransportErrorKind {
-        &self.kind
-    }
-
-    /// Human-readable error description preserving the original error message.
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-}
-
-impl fmt::Display for TransportError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.message)
-    }
-}
-
-impl std::error::Error for TransportError {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,13 +272,13 @@ mod tests {
 
     #[test]
     fn test_from_crate_error() {
-        let e: Error = crate::Error::NoDevices.into();
+        let e = Error::from_v1(crate::Error::NoDevices);
         assert!(matches!(e, Error::NoDevices));
 
-        let e: Error = crate::Error::DeviceNotFound("test".into()).into();
+        let e = Error::from_v1(crate::Error::DeviceNotFound("test".into()));
         assert!(matches!(e, Error::DeviceNotFound(_)));
 
-        let e: Error = crate::Error::WouldBlock.into();
+        let e = Error::from_v1(crate::Error::WouldBlock);
         assert!(matches!(e, Error::WouldBlock));
     }
 
@@ -284,53 +292,21 @@ mod tests {
 
         let e = Error::NoDevices;
         assert!(e.source().is_none());
-
-        let te = TransportError::from_error(&Error::DriverShutdown);
-        let e = Error::TransportFailed(te);
-        assert!(e.source().is_some());
     }
 
     #[test]
-    fn test_transport_error_from_error() {
-        let te = TransportError::from_error(&Error::ProtocolViolation("HELLO timeout".into()));
-        assert_eq!(*te.kind(), TransportErrorKind::ProtocolViolation);
-        assert!(te.message().contains("HELLO timeout"));
+    fn cloning_contextual_io_error_preserves_its_message() {
+        let original = io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "connect 192.0.2.1:7471: provider rejected route",
+        );
+        let cloned = clone_io_error(&original);
+        assert_eq!(cloned.kind(), original.kind());
+        assert_eq!(cloned.to_string(), original.to_string());
 
-        let te = TransportError::from_error(&Error::DriverShutdown);
-        assert_eq!(*te.kind(), TransportErrorKind::DriverAborted);
-
-        let te = TransportError::from_error(&Error::TransportClosed);
-        assert_eq!(*te.kind(), TransportErrorKind::Shutdown);
-
-        let te = TransportError::from_error(&Error::CompletionError {
-            status: WcStatus::from_raw(5),
-            vendor_err: 0,
-        });
-        assert_eq!(*te.kind(), TransportErrorKind::CompletionError);
-
-        let te = TransportError::from_error(&Error::Verbs(io::Error::other("test")));
-        assert_eq!(*te.kind(), TransportErrorKind::ConnectionError);
-    }
-
-    #[test]
-    fn test_transport_error_clone() {
-        let te = TransportError::from_error(&Error::DriverShutdown);
-        let te2 = te.clone();
-        assert_eq!(*te.kind(), *te2.kind());
-        assert_eq!(te.message(), te2.message());
-    }
-
-    #[test]
-    fn test_transport_error_display() {
-        let te = TransportError::from_error(&Error::ProtocolViolation("bad magic".into()));
-        let display = te.to_string();
-        assert!(display.contains("bad magic"));
-    }
-
-    #[test]
-    fn test_transport_failed_display() {
-        let te = TransportError::from_error(&Error::DriverShutdown);
-        let e = Error::TransportFailed(te);
-        assert!(e.to_string().contains("transport failed"));
+        let original = io::Error::from_raw_os_error(libc::ENOMEM);
+        let cloned = clone_io_error(&original);
+        assert_eq!(cloned.raw_os_error(), original.raw_os_error());
+        assert_eq!(cloned.to_string(), original.to_string());
     }
 }

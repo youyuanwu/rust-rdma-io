@@ -15,26 +15,175 @@
 //! [`Completions`] struct.
 
 use std::io;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::os::unix::io::RawFd;
 use std::task::{Context, Poll};
 
-use crate::async_cq::CqNotifier;
-use crate::wc::WorkCompletion;
+use tokio::io::unix::AsyncFd;
 
+use super::Completion;
 use super::cq::Cq;
 use super::error::{Error, Result};
-
-/// Ack CQ events in batches to amortize kernel call cost.
-const ACK_BATCH_SIZE: u32 = 16;
+use crate::async_cq::CqNotifier;
 
 /// State for the drain-after-arm loop.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum PollState {
-    /// Start a fresh drain-after-arm cycle.
+    /// Poll before arming so work already in the CQ is observed immediately.
     #[default]
-    Idle,
-    /// CQ was armed and polled empty; waiting for fd readiness.
+    PollBeforeArm,
+    /// Arm the CQ notification source.
+    Arm,
+    /// Poll after arming to close the arm-to-wait race.
+    PollAfterArm,
+    /// CQ was armed and both polls were empty; wait for fd readiness.
     WaitingFd,
+    /// Drain and acknowledge completion-channel notifications.
+    DrainFd,
+}
+
+/// Reusable lost-wakeup-safe CQ notification protocol.
+///
+/// The state machine preserves the required ordering across future polls:
+/// poll, arm, immediate re-poll, wait for readiness, drain/acknowledge the
+/// channel, then start again. It never uses a fallback timer.
+#[derive(Debug, Default)]
+pub(crate) struct CqReadiness {
+    state: PollState,
+    arms: u64,
+}
+
+impl CqReadiness {
+    pub(crate) fn poll_with_notifier<N: CqNotifier>(
+        &mut self,
+        cq: &Cq,
+        notifier: &N,
+        cx: &mut Context<'_>,
+        buf: &mut [Completion],
+    ) -> Poll<Result<usize>> {
+        self.poll_with(
+            cq,
+            cx,
+            buf,
+            |cx| notifier.poll_readable(cx),
+            |_| false,
+            |_| false,
+        )
+    }
+
+    pub(crate) fn poll_with_async_fd_and_hooks(
+        &mut self,
+        cq: &Cq,
+        async_fd: &AsyncFd<RawFd>,
+        cx: &mut Context<'_>,
+        buf: &mut [Completion],
+        before_arm: impl FnMut(u64) -> bool,
+        after_arm: impl FnMut(u64) -> bool,
+    ) -> Poll<Result<usize>> {
+        self.poll_with(
+            cq,
+            cx,
+            buf,
+            |cx| match async_fd.poll_read_ready(cx) {
+                Poll::Ready(Ok(mut guard)) => {
+                    guard.clear_ready();
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+                Poll::Pending => Poll::Pending,
+            },
+            before_arm,
+            after_arm,
+        )
+    }
+
+    fn poll_with(
+        &mut self,
+        cq: &Cq,
+        cx: &mut Context<'_>,
+        buf: &mut [Completion],
+        mut poll_readable: impl FnMut(&mut Context<'_>) -> Poll<io::Result<()>>,
+        mut before_arm: impl FnMut(u64) -> bool,
+        mut after_arm: impl FnMut(u64) -> bool,
+    ) -> Poll<Result<usize>> {
+        loop {
+            match self.state {
+                PollState::PollBeforeArm | PollState::PollAfterArm => match cq.poll(buf) {
+                    Ok(count) if count > 0 => {
+                        self.state = PollState::PollBeforeArm;
+                        return Poll::Ready(Ok(count));
+                    }
+                    Ok(_) if self.state == PollState::PollBeforeArm => {
+                        self.state = PollState::Arm;
+                    }
+                    Ok(_) => {
+                        self.state = PollState::WaitingFd;
+                    }
+                    Err(error) => return Poll::Ready(Err(error)),
+                },
+                PollState::Arm if before_arm(self.arms.saturating_add(1)) => {
+                    return Poll::Pending;
+                }
+                PollState::Arm => match cq.raw_cq().req_notify(false) {
+                    Ok(()) => {
+                        self.arms = self.arms.saturating_add(1);
+                        self.state = PollState::PollAfterArm;
+                        if after_arm(self.arms) {
+                            return Poll::Pending;
+                        }
+                    }
+                    Err(error) => return Poll::Ready(Err(Error::from_v1(error))),
+                },
+                PollState::WaitingFd => match poll_readable(cx) {
+                    Poll::Ready(Ok(())) => self.state = PollState::DrainFd,
+                    Poll::Ready(Err(error)) => {
+                        return Poll::Ready(Err(Error::Verbs(error)));
+                    }
+                    Poll::Pending => return Poll::Pending,
+                },
+                PollState::DrainFd => match drain_and_ack_channel_events(cq) {
+                    Ok(()) => self.state = PollState::PollBeforeArm,
+                    Err(error) => return Poll::Ready(Err(error)),
+                },
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn state(&self) -> PollState {
+        self.state
+    }
+
+    #[cfg(test)]
+    fn observe_empty_poll(&mut self) {
+        self.state = match self.state {
+            PollState::PollBeforeArm => PollState::Arm,
+            PollState::PollAfterArm => PollState::WaitingFd,
+            state => state,
+        };
+    }
+
+    #[cfg(test)]
+    fn observe_completion(&mut self) {
+        self.state = PollState::PollBeforeArm;
+    }
+
+    #[cfg(test)]
+    fn observe_arm(&mut self) {
+        debug_assert_eq!(self.state, PollState::Arm);
+        self.state = PollState::PollAfterArm;
+    }
+
+    #[cfg(test)]
+    fn observe_fd_ready(&mut self) {
+        debug_assert_eq!(self.state, PollState::WaitingFd);
+        self.state = PollState::DrainFd;
+    }
+
+    #[cfg(test)]
+    fn observe_fd_drained(&mut self) {
+        debug_assert_eq!(self.state, PollState::DrainFd);
+        self.state = PollState::PollBeforeArm;
+    }
 }
 
 /// Async CQ completion poller for a channel-backed [`Cq`].
@@ -51,6 +200,23 @@ enum PollState {
 ///
 /// [`TokioCqNotifier`]: crate::tokio_notifier::TokioCqNotifier
 ///
+/// # Use case
+///
+/// Await typed completion batches with a custom readiness notifier.
+///
+/// # Ownership and progress
+///
+/// The adapter owns its CQ and notifier; the caller polls `next()` and owns the
+/// surrounding executor task.
+///
+/// # Safety and limits
+///
+/// It is the sole CQ consumer and preserves arm/re-poll/drain ordering.
+///
+/// # Availability
+///
+/// Available with the `async` feature.
+///
 /// # Example
 ///
 /// ```no_run
@@ -59,7 +225,7 @@ enum PollState {
 /// let ctx = Context::open_first()?;
 /// let cq = CqBuilder::new(&ctx, 32).with_channel().build()?;
 /// let mut completions = cq.completions_tokio()?;
-/// let mut buf = [rdma_io::wc::WorkCompletion::default(); 16];
+/// let mut buf = [Completion::default(); 16];
 /// let n = completions.next(&mut buf).await?;
 /// println!("Got {n} completions");
 /// # Ok(())
@@ -68,8 +234,7 @@ enum PollState {
 pub struct Completions<N: CqNotifier> {
     cq: Cq,
     notifier: N,
-    state: PollState,
-    unacked_events: AtomicU32,
+    readiness: CqReadiness,
 }
 
 impl<N: CqNotifier> Completions<N> {
@@ -90,8 +255,7 @@ impl<N: CqNotifier> Completions<N> {
         Ok(Self {
             cq,
             notifier,
-            state: PollState::Idle,
-            unacked_events: AtomicU32::new(0),
+            readiness: CqReadiness::default(),
         })
     }
 
@@ -106,137 +270,151 @@ impl<N: CqNotifier> Completions<N> {
     /// This method is cancellation-safe. If the future is dropped before
     /// completion, no completions are lost and the CQ remains in a
     /// consistent state.
-    pub async fn next(&mut self, buf: &mut [WorkCompletion]) -> Result<usize> {
-        loop {
-            match self.state {
-                PollState::Idle => {
-                    // 1. Arm CQ notification
-                    self.cq.inner().req_notify(false)?;
-
-                    // 2. Drain any pending completions (catches arm-race)
-                    let n = self.cq.poll(buf)?;
-                    if n > 0 {
-                        return Ok(n);
-                    }
-
-                    // 3. No completions — need to wait for fd
-                    self.state = PollState::WaitingFd;
-                }
-                PollState::WaitingFd => {
-                    // 4. Wait for fd readiness
-                    self.notifier.readable().await.map_err(Error::Verbs)?;
-
-                    // 5. Drain all channel events (EPOLLET safety)
-                    self.drain_channel_events()?;
-
-                    // 6. Back to idle for next arm-drain cycle
-                    self.state = PollState::Idle;
-                }
-            }
-        }
-    }
-
-    /// Poll-based completion interface for manual event-loop integration.
-    ///
-    /// Returns `Poll::Ready(Ok(n))` when completions are available,
-    /// or `Poll::Pending` when waiting for fd readiness.
-    pub fn poll_next(
-        &mut self,
-        cx: &mut Context<'_>,
-        buf: &mut [WorkCompletion],
-    ) -> Poll<Result<usize>> {
-        loop {
-            match self.state {
-                PollState::Idle => {
-                    // Arm notification
-                    match self.cq.inner().req_notify(false) {
-                        Ok(()) => {}
-                        Err(e) => return Poll::Ready(Err(e.into())),
-                    }
-
-                    // Drain pending
-                    match self.cq.poll(buf) {
-                        Ok(n) if n > 0 => return Poll::Ready(Ok(n)),
-                        Ok(_) => {
-                            self.state = PollState::WaitingFd;
-                        }
-                        Err(e) => return Poll::Ready(Err(e)),
-                    }
-                }
-                PollState::WaitingFd => {
-                    // Check fd readiness
-                    match self.notifier.poll_readable(cx) {
-                        Poll::Ready(Ok(())) => {
-                            // Drain channel events
-                            match self.drain_channel_events() {
-                                Ok(()) => {
-                                    self.state = PollState::Idle;
-                                    // Continue loop to re-arm and drain
-                                }
-                                Err(e) => return Poll::Ready(Err(e)),
-                            }
-                        }
-                        Poll::Ready(Err(e)) => {
-                            return Poll::Ready(Err(Error::Verbs(e)));
-                        }
-                        Poll::Pending => return Poll::Pending,
-                    }
-                }
-            }
-        }
+    pub async fn next(&mut self, buf: &mut [Completion]) -> Result<usize> {
+        std::future::poll_fn(|cx| {
+            self.readiness
+                .poll_with_notifier(&self.cq, &self.notifier, cx, buf)
+        })
+        .await
     }
 
     /// Access the underlying CQ.
     pub fn cq(&self) -> &Cq {
         &self.cq
     }
-
-    /// Drain all pending events from the completion channel.
-    fn drain_channel_events(&self) -> Result<()> {
-        let channel = self.cq.channel().expect("channel-backed CQ");
-        loop {
-            match channel.get_cq_event() {
-                Ok(_cq_ptr) => {
-                    let count = self.unacked_events.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count >= ACK_BATCH_SIZE {
-                        self.ack_events(count);
-                    }
-                }
-                Err(crate::Error::WouldBlock) => return Ok(()),
-                Err(e) => {
-                    // Non-blocking read returned a real error
-                    let io_err = match e {
-                        crate::Error::Verbs(io_err) => io_err,
-                        _ => io::Error::other(e.to_string()),
-                    };
-                    if io_err.kind() == io::ErrorKind::WouldBlock {
-                        return Ok(());
-                    }
-                    return Err(Error::Verbs(io_err));
-                }
-            }
-        }
-    }
-
-    /// Batch-ack CQ events.
-    fn ack_events(&self, count: u32) {
-        self.unacked_events.store(0, Ordering::Relaxed);
-        unsafe {
-            rdma_io_sys::ibverbs::ibv_ack_cq_events(self.cq.inner().as_raw(), count);
-        }
-    }
 }
 
 impl<N: CqNotifier> Drop for Completions<N> {
     fn drop(&mut self) {
-        // Drain any remaining channel events
         if self.cq.has_channel() {
-            let _ = self.drain_channel_events();
+            let _ = drain_and_ack_channel_events(&self.cq);
         }
-        // Ack any unacked events
-        let remaining = self.unacked_events.load(Ordering::Relaxed);
-        if remaining > 0 {
-            self.ack_events(remaining);
+    }
+}
+
+fn drain_and_ack_channel_events(cq: &Cq) -> Result<()> {
+    let channel = cq.completion_channel().expect("channel-backed CQ");
+    drain_and_ack_events(
+        || channel.get_cq_event().map(|_| ()),
+        |count| unsafe {
+            rdma_io_sys::ibverbs::ibv_ack_cq_events(cq.raw_cq().as_raw(), count);
+        },
+    )
+}
+
+fn drain_and_ack_events(
+    mut get_event: impl FnMut() -> crate::Result<()>,
+    mut acknowledge: impl FnMut(u32),
+) -> Result<()> {
+    let mut count = 0u32;
+    loop {
+        match get_event() {
+            Ok(()) => {
+                count = count.saturating_add(1);
+            }
+            Err(crate::Error::WouldBlock) => break,
+            Err(error) => {
+                let io_error = match error {
+                    crate::Error::Verbs(io_error) => io_error,
+                    other => io::Error::other(other.to_string()),
+                };
+                if io_error.kind() == io::ErrorKind::WouldBlock {
+                    break;
+                }
+                if count > 0 {
+                    acknowledge(count);
+                }
+                return Err(Error::Verbs(io_error));
+            }
         }
+    }
+    if count > 0 {
+        acknowledge(count);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cqe_before_arm_restarts_at_the_initial_poll() {
+        let mut state = CqReadiness::default();
+        assert_eq!(state.state(), PollState::PollBeforeArm);
+        state.observe_completion();
+        assert_eq!(state.state(), PollState::PollBeforeArm);
+    }
+
+    #[test]
+    fn cqe_after_arm_before_wait_is_observed_by_the_recheck() {
+        let mut state = CqReadiness::default();
+        state.observe_empty_poll();
+        assert_eq!(state.state(), PollState::Arm);
+        state.observe_arm();
+        assert_eq!(state.state(), PollState::PollAfterArm);
+        state.observe_completion();
+        assert_eq!(state.state(), PollState::PollBeforeArm);
+    }
+
+    #[test]
+    fn fd_ready_before_registration_is_drained_then_rechecked() {
+        let mut state = CqReadiness::default();
+        state.observe_empty_poll();
+        state.observe_arm();
+        state.observe_empty_poll();
+        assert_eq!(state.state(), PollState::WaitingFd);
+        state.observe_fd_ready();
+        assert_eq!(state.state(), PollState::DrainFd);
+        state.observe_fd_drained();
+        assert_eq!(state.state(), PollState::PollBeforeArm);
+    }
+
+    #[test]
+    fn stale_notification_returns_to_arm_after_an_empty_recheck() {
+        let mut state = CqReadiness::default();
+        state.observe_empty_poll();
+        state.observe_arm();
+        state.observe_empty_poll();
+        state.observe_fd_ready();
+        state.observe_fd_drained();
+        state.observe_empty_poll();
+        state.observe_arm();
+        state.observe_empty_poll();
+        assert_eq!(state.state(), PollState::WaitingFd);
+    }
+
+    #[test]
+    fn spurious_software_wake_does_not_change_cq_wait_state() {
+        let mut state = CqReadiness::default();
+        state.observe_empty_poll();
+        state.observe_arm();
+        state.observe_empty_poll();
+        assert_eq!(state.state(), PollState::WaitingFd);
+        assert_eq!(state.state(), PollState::WaitingFd);
+    }
+
+    #[test]
+    fn drained_events_are_acknowledged_before_a_later_error_is_propagated() {
+        let mut calls = 0;
+        let mut acknowledged = Vec::new();
+        let error = drain_and_ack_events(
+            || {
+                calls += 1;
+                match calls {
+                    1 | 2 => Ok(()),
+                    _ => Err(crate::Error::Verbs(io::Error::other(
+                        "injected completion-channel failure",
+                    ))),
+                }
+            },
+            |count| acknowledged.push(count),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(error, Error::Verbs(ref source) if source.to_string().contains("injected"))
+        );
+        assert_eq!(acknowledged, [2]);
     }
 }

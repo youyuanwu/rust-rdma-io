@@ -1,61 +1,90 @@
-//! Ergonomic v2 RDMA API.
+//! Ergonomic RDMA resources plus one explicitly driven shared runtime engine.
 //!
-//! This module provides a higher-level facade over the core RDMA primitives,
-//! offering builder-driven resource setup, typed operations, and dual
-//! CQ completion integration models for Rust async runtimes.
+//! With the `tokio` feature, [`RdmaEngineBuilder::build`] returns
+//! ([`RdmaEngine`], [`RdmaEngineDriver`]). The handle submits connection,
+//! listener, operation, message, and lifecycle work; the driver is the sole
+//! CQ/CM consumer. This resembles the ownership split of an io_uring instance
+//! or IOCP completion port, although the implementation uses libibverbs and
+//! librdmacm directly.
 //!
-//! # Overview
+//! # Use case
 //!
-//! The v2 API reduces RDMA setup complexity from ~8 manual steps to a
-//! guided builder flow. It supports:
+//! Import retained production types from `rdma_io::v2`; implementation modules
+//! are private and each item has one public spelling.
 //!
-//! - **Device discovery**: [`Context::open_first()`] and [`Context::open_by_name()`]
-//! - **Resource builders**: [`CqBuilder`] for completion queues, [`QpBuilder`]
-//!   for queue pairs
-//! - **Memory registration**: [`Mr`] with [`AccessIntent`] for clear access semantics
-//! - **Typed operations**: [`Qp::post_send()`], [`Qp::post_recv()`],
-//!   [`Qp::post_write()`], [`Qp::post_read()`]
-//! - **Dual CQ completion models** (both async-native):
-//!   - Fd/readiness-based: [`Completions`] — CQ completion channel fd
-//!     registered with async runtime reactor, arm-drain pattern
-//!   - CQ polling-based: [`CqPoller`] — direct RDMA CQ polling with
-//!     smoltcp-style waker registration for async runtime integration
+//! # Ownership and progress
 //!
-//! # Design
+//! Independent resources are caller-driven. Engine resources progress only
+//! while the returned [`RdmaEngineDriver`] is polled.
 //!
-//! The v2 API targets Rust async runtimes. It provides RDMA/CQ integration
-//! primitives (fd exposure, cancellation-safe async CQ draining) without
-//! implementing event-loop infrastructure, executors, or reactors.
+//! # Safety and limits
+//!
+//! V2 exposes typed ownership and completion APIs without raw V1 resource
+//! adoption, borrowed contexts, or raw completion buffers.
+//!
+//! # Availability
+//!
+//! Core resources are always available; async and engine APIs follow the
+//! feature flags documented below.
+//!
+//! The library creates no task or thread. Applications must spawn or directly
+//! poll the one driver future, and no engine work progresses otherwise.
+//! Message transport adds zero tasks: receive completions, reposts, DATA,
+//! CREDIT, HELLO, disconnect handling, and reclamation all run as bounded
+//! engine-driver work.
+//!
+//! ```no_run
+//! # use rdma_io::v2::*;
+//! # async fn example() -> Result<()> {
+//! let (engine, driver) = RdmaEngineBuilder::new("rxe0").build()?;
+//! let driver_task = tokio::spawn(driver);
+//! let connection = engine.connect("192.0.2.1:7471".parse().unwrap()).await?;
+//! connection.close().await?;
+//! engine.shutdown().await?;
+//! driver_task.await.expect("engine driver panicked")?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Readiness is the default completion mode and requires active Tokio I/O
+//! during `build()`. Polling mode may be built outside a runtime because it
+//! allocates no CQ notification channel, but every driver poll must occur in
+//! an active Tokio runtime with time enabled before deadlines are armed.
+//!
+//! The retained independent resource surface includes [`Context`], [`Pd`],
+//! [`Cq`], [`Mr`], [`Qp`], the four named [`Qp::post_send`],
+//! [`Qp::post_recv`], [`Qp::post_write`], and [`Qp::post_read`] operations,
+//! [`Completions`], and [`CqPoller`]. V1 APIs are separate and unchanged;
+//! existing v2 endpoint compatibility is not provided.
 //!
 //! # Feature Flags
 //!
 //! - Core v2 types are always available (no feature required)
-//! - `async` feature enables [`completion::Completions`] for async CQ notification
+//! - `async` feature enables [`Completions`] for async CQ notification
 //! - `tokio` feature adds [`Cq::completions_tokio()`] convenience
 
-pub mod context;
-pub mod cq;
-pub mod error;
-pub mod mr;
-pub mod op;
-pub mod pd;
-pub mod qp;
+#![deny(missing_docs)]
 
 #[cfg(feature = "async")]
-pub mod completion;
-#[cfg(feature = "tokio")]
-mod connection;
+mod completion;
+mod context;
+mod cq;
 #[cfg(feature = "async")]
-pub mod cq_poller;
+mod cq_poller;
 #[cfg(feature = "tokio")]
-pub mod driver;
-#[cfg(feature = "async")]
-pub mod inflight;
+mod engine;
+mod error;
 #[cfg(feature = "tokio")]
-pub mod message_transport;
-pub mod protocol;
-#[cfg(feature = "tokio")]
-pub mod shared_qp;
+mod message_transport;
+mod mr;
+mod op;
+mod pd;
+#[cfg(any(test, feature = "tokio"))]
+mod protocol;
+mod qp;
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub mod test_support;
 #[cfg(feature = "tokio")]
 mod tokio_support;
 
@@ -63,9 +92,8 @@ mod tokio_support;
 pub use context::Context;
 pub use cq::{Cq, CqBuilder};
 pub use error::{Error, Result};
-pub use error::{TransportError, TransportErrorKind};
 pub use mr::{AccessIntent, Mr, RemoteMr};
-pub use op::{Completion, Op, OpCode};
+pub use op::Completion;
 pub use pd::Pd;
 pub use qp::{Qp, QpBuilder};
 
@@ -79,18 +107,15 @@ pub use cq_poller::CqPoller;
 pub use crate::async_cq::CqNotifier;
 
 #[cfg(feature = "tokio")]
-pub use driver::{CqDriverHandle, FdCqDriver, PollingCqDriver};
-
-#[cfg(feature = "tokio")]
-pub use shared_qp::{OpFuture, SharedQp};
-
-#[cfg(feature = "tokio")]
-pub use connection::CompletionMode;
-
-#[cfg(feature = "tokio")]
-pub use message_transport::{
-    MessageTransport, MessageTransportBuilder, MessageTransportDriver, ReceivedMessage,
+pub use engine::{
+    CompletionMode, RdmaConnection, RdmaConnectionConfig, RdmaConnectionDiagnostics,
+    RdmaConnectionIdentity, RdmaEngine, RdmaEngineBuilder, RdmaEngineDiagnostics, RdmaEngineDriver,
+    RdmaEngineLifecycle, RdmaEngineTerminalError, RdmaListener, RdmaListenerConfig,
+    RdmaListenerDiagnostics, RdmaOperation,
 };
+
+#[cfg(feature = "tokio")]
+pub use message_transport::{MessageTransport, MessageTransportBuilder, ReceivedMessage};
 
 #[cfg(feature = "tokio")]
 pub use tokio_support::TokioCompletions;

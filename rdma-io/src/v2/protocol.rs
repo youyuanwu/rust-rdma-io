@@ -1,6 +1,6 @@
-//! Wire protocol for the v2 message transport.
+//! Public wire protocol helpers for the v2 message transport.
 //!
-//! Defines a minimal internal protocol with three frame types:
+//! Defines the message transport protocol with three frame types:
 //!
 //! | Type | Code | Purpose |
 //! |------|------|---------|
@@ -33,75 +33,76 @@
 //! [`parse_header`] validates magic, version, and frame type.
 //! [`parse_hello`] / [`parse_credit`] validate payload lengths.
 //! Protocol violations produce [`Error::ProtocolViolation`].
+//!
+//! The wire implementation is private. Applications use
+//! [`crate::v2::MessageTransport`] rather than constructing frames directly.
 
 use super::error::{Error, Result};
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 /// Protocol magic number: "RDMA" in little-endian.
-pub const PROTO_MAGIC: u32 = 0x52444D41;
+pub(crate) const PROTO_MAGIC: u32 = 0x52444D41;
 
 /// Current protocol version.
-pub const PROTO_VERSION: u8 = 1;
+pub(crate) const PROTO_VERSION: u8 = 1;
 
 /// Frame header size in bytes.
-pub const HEADER_SIZE: usize = 12;
+pub(crate) const HEADER_SIZE: usize = 12;
 
 /// Frame type: application data.
-pub const FRAME_DATA: u8 = 0;
+pub(crate) const FRAME_DATA: u8 = 0;
 
 /// Frame type: credit return.
-pub const FRAME_CREDIT: u8 = 1;
+pub(crate) const FRAME_CREDIT: u8 = 1;
 
 /// Frame type: readiness/hello exchange.
-pub const FRAME_HELLO: u8 = 2;
+pub(crate) const FRAME_HELLO: u8 = 2;
 
 /// CREDIT payload size in bytes.
-pub const CREDIT_PAYLOAD_SIZE: usize = 4;
+pub(crate) const CREDIT_PAYLOAD_SIZE: usize = 4;
 
 /// HELLO payload size in bytes.
-pub const HELLO_PAYLOAD_SIZE: usize = 12;
+pub(crate) const HELLO_PAYLOAD_SIZE: usize = 12;
 
 /// Total CREDIT frame size (header + payload).
-pub const CREDIT_FRAME_SIZE: usize = HEADER_SIZE + CREDIT_PAYLOAD_SIZE;
+pub(crate) const CREDIT_FRAME_SIZE: usize = HEADER_SIZE + CREDIT_PAYLOAD_SIZE;
 
 /// Total HELLO frame size (header + payload).
-pub const HELLO_FRAME_SIZE: usize = HEADER_SIZE + HELLO_PAYLOAD_SIZE;
+pub(crate) const HELLO_FRAME_SIZE: usize = HEADER_SIZE + HELLO_PAYLOAD_SIZE;
 
 /// Minimum size for a control receive buffer (fits any control frame).
-pub const CTRL_BUF_SIZE: usize = HELLO_FRAME_SIZE; // 24 bytes — largest control frame
+pub(crate) const CTRL_BUF_SIZE: usize = HELLO_FRAME_SIZE; // 24 bytes — largest control frame
 
 /// Number of dedicated control receive buffers.
-pub const CTRL_RECV_COUNT: usize = 2;
+pub(crate) const CTRL_RECV_COUNT: usize = 2;
 
 /// Number of control send MRs.
-pub const CTRL_SEND_COUNT: usize = 2;
+pub(crate) const CTRL_SEND_COUNT: usize = 2;
 
 // ─── Parsed Types ────────────────────────────────────────────────────────────
 
 /// Parsed frame header.
 #[derive(Debug, Clone, Copy)]
-pub struct FrameHeader {
-    pub frame_type: u8,
-    pub payload_len: u32,
+pub(crate) struct FrameHeader {
+    pub(crate) frame_type: u8,
+    pub(crate) payload_len: u32,
 }
 
 /// Parsed HELLO payload.
 #[derive(Debug, Clone, Copy)]
-pub struct HelloPayload {
+pub(crate) struct HelloPayload {
     /// Number of data receive buffers the sender has posted.
-    pub data_recv_capacity: u32,
+    pub(crate) data_recv_capacity: u32,
     /// Maximum message (payload) size the sender supports.
-    pub max_message_size: u32,
-    /// Protocol version (currently 1).
-    pub protocol_version: u32,
+    pub(crate) max_message_size: u32,
 }
 
 /// Parsed CREDIT payload.
 #[derive(Debug, Clone, Copy)]
-pub struct CreditPayload {
+pub(crate) struct CreditPayload {
     /// Number of credits being returned.
-    pub credits: u32,
+    pub(crate) credits: u32,
 }
 
 // ─── Serialization ───────────────────────────────────────────────────────────
@@ -127,7 +128,7 @@ fn write_header(buf: &mut [u8], frame_type: u8, payload_len: u32) {
 /// # Panics
 ///
 /// Panics if `buf` is too small for the header + data.
-pub fn write_data_frame(buf: &mut [u8], data: &[u8]) -> usize {
+pub(crate) fn write_data_frame(buf: &mut [u8], data: &[u8]) -> usize {
     let total = HEADER_SIZE + data.len();
     assert!(buf.len() >= total);
     write_header(buf, FRAME_DATA, data.len() as u32);
@@ -142,7 +143,7 @@ pub fn write_data_frame(buf: &mut [u8], data: &[u8]) -> usize {
 /// # Panics
 ///
 /// Panics if `buf.len() < CREDIT_FRAME_SIZE`.
-pub fn write_credit_frame(buf: &mut [u8], credits: u32) -> usize {
+pub(crate) fn write_credit_frame(buf: &mut [u8], credits: u32) -> usize {
     assert!(buf.len() >= CREDIT_FRAME_SIZE);
     write_header(buf, FRAME_CREDIT, CREDIT_PAYLOAD_SIZE as u32);
     buf[HEADER_SIZE..CREDIT_FRAME_SIZE].copy_from_slice(&credits.to_le_bytes());
@@ -156,7 +157,11 @@ pub fn write_credit_frame(buf: &mut [u8], credits: u32) -> usize {
 /// # Panics
 ///
 /// Panics if `buf.len() < HELLO_FRAME_SIZE`.
-pub fn write_hello_frame(buf: &mut [u8], data_recv_capacity: u32, max_message_size: u32) -> usize {
+pub(crate) fn write_hello_frame(
+    buf: &mut [u8],
+    data_recv_capacity: u32,
+    max_message_size: u32,
+) -> usize {
     assert!(buf.len() >= HELLO_FRAME_SIZE);
     write_header(buf, FRAME_HELLO, HELLO_PAYLOAD_SIZE as u32);
     let p = HEADER_SIZE;
@@ -182,7 +187,7 @@ pub fn write_hello_frame(buf: &mut [u8], data_recv_capacity: u32, max_message_si
 /// - Unsupported version
 /// - Unknown frame type
 /// - Payload length exceeds received data
-pub fn parse_header(buf: &[u8], received_len: usize) -> Result<FrameHeader> {
+pub(crate) fn parse_header(buf: &[u8], received_len: usize) -> Result<FrameHeader> {
     debug_assert!(
         buf.len() >= received_len,
         "buf.len() ({}) < received_len ({received_len})",
@@ -216,10 +221,17 @@ pub fn parse_header(buf: &[u8], received_len: usize) -> Result<FrameHeader> {
     }
 
     let payload_len = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
-    let total = HEADER_SIZE + payload_len as usize;
+    let total = HEADER_SIZE
+        .checked_add(payload_len as usize)
+        .ok_or_else(|| Error::ProtocolViolation("frame length overflow".into()))?;
     if total > received_len {
         return Err(Error::ProtocolViolation(format!(
             "payload extends past received data: header says {total}, got {received_len}"
+        )));
+    }
+    if total < received_len {
+        return Err(Error::ProtocolViolation(format!(
+            "frame has trailing bytes: header says {total}, got {received_len}"
         )));
     }
 
@@ -237,7 +249,7 @@ pub fn parse_header(buf: &[u8], received_len: usize) -> Result<FrameHeader> {
 ///
 /// Returns [`Error::ProtocolViolation`] if the payload is too short
 /// or the peer's protocol version does not match [`PROTO_VERSION`].
-pub fn parse_hello(payload: &[u8]) -> Result<HelloPayload> {
+pub(crate) fn parse_hello(payload: &[u8]) -> Result<HelloPayload> {
     if payload.len() != HELLO_PAYLOAD_SIZE {
         return Err(Error::ProtocolViolation(format!(
             "HELLO payload size mismatch: {} != {HELLO_PAYLOAD_SIZE}",
@@ -257,7 +269,6 @@ pub fn parse_hello(payload: &[u8]) -> Result<HelloPayload> {
     Ok(HelloPayload {
         data_recv_capacity,
         max_message_size,
-        protocol_version,
     })
 }
 
@@ -270,7 +281,7 @@ pub fn parse_hello(payload: &[u8]) -> Result<HelloPayload> {
 /// # Errors
 ///
 /// Returns [`Error::ProtocolViolation`] if the payload is too short.
-pub fn parse_credit(payload: &[u8]) -> Result<CreditPayload> {
+pub(crate) fn parse_credit(payload: &[u8]) -> Result<CreditPayload> {
     if payload.len() != CREDIT_PAYLOAD_SIZE {
         return Err(Error::ProtocolViolation(format!(
             "CREDIT payload size mismatch: {} != {CREDIT_PAYLOAD_SIZE}",
@@ -279,14 +290,6 @@ pub fn parse_credit(payload: &[u8]) -> Result<CreditPayload> {
     }
     let credits = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
     Ok(CreditPayload { credits })
-}
-
-/// Compute the required data recv MR size for a given max message payload.
-///
-/// The MR must be large enough for the protocol header plus the full payload.
-#[inline]
-pub fn data_mr_size(max_payload: usize) -> usize {
-    HEADER_SIZE + max_payload
 }
 
 #[cfg(test)]
@@ -329,7 +332,6 @@ mod tests {
         let hello = parse_hello(&buf[HEADER_SIZE..]).unwrap();
         assert_eq!(hello.data_recv_capacity, 32);
         assert_eq!(hello.max_message_size, 65536);
-        assert_eq!(hello.protocol_version, PROTO_VERSION as u32);
     }
 
     #[test]
@@ -392,9 +394,13 @@ mod tests {
     }
 
     #[test]
-    fn test_data_mr_size() {
-        assert_eq!(data_mr_size(0), HEADER_SIZE);
-        assert_eq!(data_mr_size(1024), HEADER_SIZE + 1024);
-        assert_eq!(data_mr_size(65536), HEADER_SIZE + 65536);
+    fn test_trailing_bytes_are_rejected() {
+        let mut buf = vec![0u8; HEADER_SIZE + 1];
+        write_data_frame(&mut buf, b"");
+        let result = parse_header(&buf, HEADER_SIZE + 1);
+        assert!(matches!(
+            result,
+            Err(Error::ProtocolViolation(message)) if message.contains("trailing bytes")
+        ));
     }
 }

@@ -117,76 +117,118 @@ let channel = tonic_h3::H3Channel::new(connector, uri);
 let client = GreeterClient::new(channel);
 ```
 
-### V2 API — Per-Operation Futures (tokio)
+### V2 API — Shared RDMA Engine (tokio)
 
-The `v2` module provides ergonomic per-operation async futures with compio-style buffer ownership:
+The `v2` module provides one explicitly driven engine for many low-level and
+message connections. Its ownership model resembles one io_uring instance or
+IOCP completion port: frontend handles submit work, while one application-owned
+driver is the sole CQ/CM consumer and routes completions by connection
+generation, operation generation, and exact `qp_num`.
 
 ```rust
 use rdma_io::v2::*;
 
-// Resource setup via builders
-let ctx = Context::from_cm(&cm_id)?;
-let pd = ctx.alloc_pd()?;
-let send_cq = CqBuilder::new(&ctx, 64).with_channel().build()?;
-let recv_cq = CqBuilder::new(&ctx, 64).with_channel().build()?;
-let qp = QpBuilder::new(&pd, &send_cq, &recv_cq).build_with_cm(&cm_id)?;
+let (engine, driver) = RdmaEngineBuilder::new("rxe0").build()?;
+let driver_task = tokio::spawn(driver);
 
-// Spawn completion driver
-let (driver, handle) = FdCqDriver::new(send_cq, 64);
-tokio::spawn(driver.run_tokio());
-
-let sqp = SharedQp::new(qp, handle, pd);
+let connection = engine
+    .connect("10.0.0.1:7471".parse().unwrap())
+    .await?;
 
 // Per-operation futures: owned buffer in → (result, buffer) out
-let mut mr = sqp.pd().reg_mr(1024, AccessIntent::LocalOnly)?;
+let mut mr = connection.register_memory(1024, AccessIntent::LocalOnly)?;
 mr.as_mut_slice()[..5].copy_from_slice(b"hello");
-let (result, mr) = sqp.send(mr, None).await;
+let (result, mr) = connection.send(mr, Some((0, 5))).await;
 result?;
 let mr = mr.expect("real CQE should return MR");
 
 // One-sided RDMA Write
-let (result, mr) = sqp.write(mr, remote_mr, None).await;
+let (result, mr) = connection.write(mr, remote_mr, None).await;
 result?;
 let _mr = mr.expect("real CQE should return MR");
+
+connection.close().await?;
+engine.shutdown().await?;
+driver_task.await.expect("engine driver panicked")?;
 ```
 
-Also provides lower-level APIs: `Op` enum for typed submission, `CqPoller` for
-direct CQ polling with waker registration, and `Completions<N>` for fd-based
-async CQ draining. See the `rdma_io::v2` module docs for the full API reference.
+Readiness is the default and `build()` requires an active Tokio I/O runtime.
+Polling mode creates no CQ notification channel and may be built outside a
+runtime, but every driver poll still requires active Tokio time support when a
+lifecycle deadline can be armed:
+
+```rust
+let (engine, driver) = RdmaEngineBuilder::new("rxe0")
+    .completion_mode(CompletionMode::Polling)
+    .build()?;
+```
+
+One engine owns one anchored context facade, PD, CQ, and CM event channel.
+Readiness adds one CQ completion channel/fd; polling adds none. There is exactly
+one explicit engine driver and zero library-owned tasks or threads, regardless
+of connection count. Low-level `connect`/`connect_with_config` and listener
+`accept`/`accept_with_config` post zero initial receives.
+
+Dropping the last `RdmaEngine` clone requests shutdown; connections, listeners,
+and message transports retain safety state but do not keep an engine frontend
+alive. Keep an engine clone until submissions are complete and use
+`shutdown().await` to observe the terminal result. The first low-level
+operation poll, engine-driver polling, and driver/resource `Drop` can execute
+synchronous libibverbs/librdmacm calls, so they should not share a
+latency-sensitive executor lane that cannot tolerate provider stalls.
+
+The independent low-level `Context`, `Pd`, `Cq`, `Mr`, `Qp`, typed
+`Completion`, `CqPoller`, and `Completions` resources remain available for
+callers that do not need engine-owned connection progress. `Context::open_first`
+and `Context::open_by_name` retain the complete librdmacm device-list anchor;
+availability and first-device ordering therefore follow `rdma_get_devices`.
+The facade never calls `ibv_close_device`, and the list is released with
+`rdma_free_devices` only after all dependent resources are gone.
+All retained production types are exported only as `rdma_io::v2::<Item>`;
+implementation modules are private. `QpBuilder::build_with_cm(&CmId)` is the
+sole production CM-wrapper bridge and validates exact anchored-context identity.
+Direct, generic, Tokio, and externally woken CQ paths all use `Completion`
+buffers, while SEND/RECV/READ/WRITE use the four named `Qp` methods.
+
+The non-default `test-hooks` feature has one doc-hidden namespace:
+`rdma_io::v2::test_support`. It exists only for deterministic V2 validation,
+exposes no raw pointer/fd/resource consumer, and is not a V1 API.
 
 ### V2 Message Transport
 
 The v2 message transport provides a builder-driven, message-oriented Send/Recv
-transport on top of `SharedQp` with pre-registered buffer pools, message
-boundaries, credit-based flow control, deterministic disconnect handling,
-and cancellation-safe operations.
-
-Construction returns a `(MessageTransport, MessageTransportDriver)` pair. The
-caller explicitly spawns the driver future — exactly one task per endpoint:
+transport on top of an `RdmaEngine`, with pre-registered buffer pools, message
+boundaries, credit-based flow control, deterministic disconnect handling, and
+cancellation-safe operations. Message progress adds no task beyond the owning
+engine driver:
 
 ```rust
 use rdma_io::v2::*;
-use rdma_io::v2::message_transport::MessageTransportBuilder;
 
-// Server
-let listener = rdma_io::async_cm::AsyncCmListener::bind(&"0.0.0.0:7471".parse().unwrap())?;
-let (server, server_driver) = MessageTransportBuilder::new()
-    .recv_buffers(32)
-    .send_buffers(16)
-    .buffer_size(64 * 1024)
-    .completion_mode(CompletionMode::Readiness)
-    .accept(&listener)
-    .await?;
+let (server_engine, server_driver) = RdmaEngineBuilder::new("rxe0").build()?;
+let (client_engine, client_driver) = RdmaEngineBuilder::new("rxe0").build()?;
 let server_task = tokio::spawn(server_driver);
+let client_task = tokio::spawn(client_driver);
 
-// Client
-let (client, client_driver) = MessageTransportBuilder::new()
+let listener = server_engine
+    .listen(
+        "0.0.0.0:7471".parse().unwrap(),
+        RdmaListenerConfig::default(),
+    )
+    .await?;
+let server = MessageTransportBuilder::new()
     .recv_buffers(32)
     .send_buffers(16)
     .buffer_size(64 * 1024)
-    .connect("10.0.0.1:7471".parse().unwrap())
+    .accept_on(&listener)
     .await?;
-let client_task = tokio::spawn(client_driver);
+
+let client = MessageTransportBuilder::new()
+    .recv_buffers(32)
+    .send_buffers(16)
+    .buffer_size(64 * 1024)
+    .connect_on(&client_engine, "10.0.0.1:7471".parse().unwrap())
+    .await?;
 
 // Wait for readiness (HELLO handshake), then send/recv
 client.ready().await?;
@@ -194,32 +236,34 @@ client.send(b"hello rdma transport").await?;
 let msg = server.recv().await?;
 assert_eq!(msg.as_ref(), b"hello rdma transport");
 
-// Shutdown: close frontend, then await driver
-client.close().await;
-let driver_result = client_task.await.expect("driver panicked");
-driver_result?;
+client.close().await?;
+server.close().await?;
+listener.close().await?;
+client_engine.shutdown().await?;
+server_engine.shutdown().await?;
+client_task.await.expect("driver panicked")?;
+server_task.await.expect("driver panicked")?;
 ```
 
 Key design properties:
 
-- **Explicit driver spawning**: No hidden `tokio::spawn` — the driver future
-  composes CQ driving, receive pumping, HELLO/credit protocol, CM disconnect
-  monitoring, and cancellation reclamation into one `Future + Send + 'static`.
-  One user-spawned task per endpoint in both shared and separate CQ modes.
-- **Wire protocol**: A minimal internal protocol with DATA, CREDIT, and HELLO
-  frame types (12-byte header with magic/version/type/length validation)
+- **Explicit driver spawning**: No hidden `tokio::spawn`; one engine driver
+  composes shared CQ/CM driving, message protocol progress, receive reposting,
+  disconnect handling, and reclamation. There is no receive-pump task.
+- **Wire protocol**: DATA, CREDIT, and HELLO use an internal 12-byte
+  magic/version/type/length header. Wire behavior is stable through
+  `MessageTransport`; codec helpers are not public API.
 - **Credit-based flow control**: Each `send()` acquires one remote receive
   credit. Credits are exchanged via HELLO handshake and returned via CREDIT
   frames when `ReceivedMessage` is dropped. RNR retry is a safety net, not
-  the primary flow-control mechanism.
-- **Readiness handshake**: The driver performs the HELLO handshake after being
-  spawned. `ready().await` completes when both peers have exchanged HELLO
-  frames and credits are installed. `send()`/`recv()` internally await
-  readiness.
-- **Deterministic lifecycle**: Dropping the unspawned driver, aborting the
-  driver task, or driver failure all transition the frontend to a failed
-  state and wake all waiters. `close().await` signals the driver to shut
-  down and waits for completion without owning the `JoinHandle`.
+  the primary flow-control mechanism. Holding messages intentionally withholds
+  receive buffers and can stall the peer when all negotiated credits are held.
+- **Readiness handshake**: Engine progress performs HELLO negotiation;
+  `ready().await` completes when both peers have exchanged capabilities.
+- **Deterministic lifecycle**: Driver failure wakes frontend waiters, while
+  `close().await` returns the contextual connection result. There is no public
+  error accessor; observe `ready`/`send`/`recv`/`close` errors and
+  `RdmaEngine::diagnostics()`.
 - **Pre-posted receives**: All receive buffers (data + control headroom) are
   posted before the CM handshake completes
 - **Bounded backpressure**: Both send buffer pool and credit semaphore limit
@@ -229,10 +273,27 @@ Key design properties:
 - **Cancellation safe**: If cancelled before WR posting, the credit permit is
   returned automatically. If cancelled after posting, the MR returns via the
   reclaim queue. Dropping `recv()` leaves the message for the next caller.
-- **Shared CQ by default**: One CQ + one driver for both send and recv
-  completions; separate-CQ mode available via `.separate_cqs(true)`
+- **Shared engine resources**: Connections use the engine's one context,
+  protection domain, CQ, notification resource, and CM event channel
 - **Completion modes**: `Readiness` (fd/channel-based, lower CPU) or
   `Polling` (direct CQ poll, lower latency)
+- **Exact default capacity**: 19 send WRs and 34 receive WRs per connection;
+  message setup pre-posts exactly 34 receives. At 256 default connections,
+  `256 × 53 = 13,568`, leaving `2,816` positions in the default 16,384-entry
+  global operation/CQ budget.
+- **Fail-closed teardown**: Cancellation retains accepted MRs until their exact
+  CQE or successful synchronous destruction of the owning per-connection QP.
+  At the drain deadline, every exact CQE already queued for the connection is
+  dispatched before the accepted set is re-read; an empty set retires cleanly
+  without destroying the QP early. Otherwise the engine uses result-returning
+  verbs destruction. A failed drain boundary retains QP/MRs/debt in
+  `ConnectionQuarantined`; a failed zero-debt retirement retains the complete
+  QP/CM/admission/generation bundle in `ConnectionDestroyQuarantined`. Setup
+  rollback preserves its original setup error, promptly rejects an inbound
+  peer, and retains the failed destroy as connection-local quarantine. A late
+  success not queued before that boundary is intentionally reported as closed
+  and its payload is discarded. Terminal driver-loss quarantine is
+  process-lifetime retention until restart.
 
 #### Non-Goals
 
@@ -243,6 +304,12 @@ The following are explicitly out of scope for the v2 message transport:
 - Ring transports, atomics, inline data, multi-SGE operations
 - Dynamic buffer pool resizing
 - UD (Unreliable Datagram) queue pair support
+- Compatibility adapters for the removed endpoint-owned v2 surface. V1 remains
+  unchanged.
+
+See [V2 Runtime RDMA Engine](docs/design/v2-rdma-engine.md) for the complete
+public API, resource counts, listener ordering, wakeup proof, routing,
+cancellation, shutdown, diagnostics, provider limits, and RXE/SIW validation.
 
 ## Prerequisites
 
@@ -301,6 +368,7 @@ Design documents and background research are in [`docs/`](docs/):
 | Document | Description |
 |---|---|
 | [SafeApi.md](docs/design/SafeApi.md) | Safe API design and RAII ownership model |
+| [v2-rdma-engine.md](docs/design/v2-rdma-engine.md) | Explicitly driven shared v2 engine API, ownership, routing, lifecycle, and provider validation |
 | [RdmaOperations.md](docs/design/RdmaOperations.md) | RDMA verb operations and data path patterns |
 | [rdma-transport-layer.md](docs/design/rdma-transport-layer.md) | Transport trait architecture and transport implementations |
 | [DataPathCopies.md](docs/design/DataPathCopies.md) | Send/recv copy audit of the transport & stream interfaces, and where `Buf`/`Bytes` would help |

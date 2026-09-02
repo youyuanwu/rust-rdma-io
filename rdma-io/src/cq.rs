@@ -23,7 +23,18 @@ unsafe impl Sync for CompletionQueue {}
 
 impl Drop for CompletionQueue {
     fn drop(&mut self) {
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::test_support::destruction::record(
+            crate::test_support::destruction::DestructionKind::CompletionQueue,
+            self.inner as usize,
+        );
         let ret = unsafe { ibv_destroy_cq(self.inner) };
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::test_support::destruction::record_result(
+            crate::test_support::destruction::DestructionKind::CompletionQueue,
+            self.inner as usize,
+            ret,
+        );
         if ret != 0 {
             tracing::error!(
                 "ibv_destroy_cq failed: {}",
@@ -73,6 +84,10 @@ impl CompletionQueue {
     /// Raw pointer (for advanced/FFI use).
     pub fn as_raw(&self) -> *mut ibv_cq {
         self.inner
+    }
+
+    pub(crate) fn context(&self) -> &Arc<Context> {
+        &self._ctx
     }
 
     /// Create a CQ associated with a completion channel.

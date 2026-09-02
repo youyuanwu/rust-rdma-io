@@ -95,7 +95,7 @@ impl Device {
         let ctx = from_ptr(unsafe { ibv_open_device(self.as_ptr()) })?;
         Ok(Context {
             inner: ctx,
-            owned: true,
+            ownership: ContextOwnership::Owned,
         })
     }
 
@@ -111,8 +111,15 @@ impl Device {
 /// the context alive.
 pub struct Context {
     pub(crate) inner: *mut ibv_context,
-    /// If false, we don't call ibv_close_device on drop (e.g. rdma_cm-owned).
-    owned: bool,
+    ownership: ContextOwnership,
+}
+
+pub(crate) trait ContextAnchor: Send + Sync {}
+
+enum ContextOwnership {
+    Owned,
+    Borrowed,
+    Anchored(Arc<dyn ContextAnchor>),
 }
 
 // Safety: ibv_context is thread-safe (protected by internal locking).
@@ -121,12 +128,39 @@ unsafe impl Sync for Context {}
 
 impl Drop for Context {
     fn drop(&mut self) {
-        if self.owned {
-            let ret = unsafe { ibv_close_device(self.inner) };
-            if ret != 0 {
-                tracing::error!(
-                    "ibv_close_device failed: {}",
-                    std::io::Error::from_raw_os_error(-ret)
+        match &self.ownership {
+            ContextOwnership::Owned => {
+                #[cfg(any(test, feature = "test-hooks"))]
+                crate::test_support::destruction::record(
+                    crate::test_support::destruction::DestructionKind::IbvCloseDevice,
+                    self.inner as usize,
+                );
+                let ret = unsafe { ibv_close_device(self.inner) };
+                #[cfg(any(test, feature = "test-hooks"))]
+                crate::test_support::destruction::record_result(
+                    crate::test_support::destruction::DestructionKind::IbvCloseDevice,
+                    self.inner as usize,
+                    ret,
+                );
+                if ret != 0 {
+                    tracing::error!(
+                        "ibv_close_device failed: {}",
+                        std::io::Error::from_raw_os_error(-ret)
+                    );
+                }
+            }
+            ContextOwnership::Borrowed => {
+                #[cfg(any(test, feature = "test-hooks"))]
+                crate::test_support::destruction::record(
+                    crate::test_support::destruction::DestructionKind::ContextFacade,
+                    self.inner as usize,
+                );
+            }
+            ContextOwnership::Anchored(_anchor) => {
+                #[cfg(any(test, feature = "test-hooks"))]
+                crate::test_support::destruction::record(
+                    crate::test_support::destruction::DestructionKind::ContextFacade,
+                    self.inner as usize,
                 );
             }
         }
@@ -140,7 +174,28 @@ impl Context {
     /// The pointer must be valid. If `owned` is true, `ibv_close_device` will
     /// be called on drop. Set `owned` to false for rdma_cm-managed contexts.
     pub unsafe fn from_raw(ctx: *mut ibv_context, owned: bool) -> Self {
-        Self { inner: ctx, owned }
+        Self {
+            inner: ctx,
+            ownership: if owned {
+                ContextOwnership::Owned
+            } else {
+                ContextOwnership::Borrowed
+            },
+        }
+    }
+
+    /// Wrap a non-closing raw context while retaining its external owner.
+    ///
+    /// # Safety
+    /// `ctx` must be one of the contexts kept alive by `anchor`.
+    pub(crate) unsafe fn from_raw_anchored(
+        ctx: *mut ibv_context,
+        anchor: Arc<dyn ContextAnchor>,
+    ) -> Self {
+        Self {
+            inner: ctx,
+            ownership: ContextOwnership::Anchored(anchor),
+        }
     }
 
     /// Query device attributes.
@@ -167,6 +222,25 @@ impl Context {
     /// Raw `ibv_context` pointer (for advanced/FFI use).
     pub fn as_raw(&self) -> *mut ibv_context {
         self.inner
+    }
+
+    /// Kernel device name associated with this exact context.
+    pub fn device_name(&self) -> Option<&str> {
+        let device = unsafe { (*self.inner).device };
+        if device.is_null() {
+            return None;
+        }
+        let name = unsafe { ibv_get_device_name(device) };
+        if name.is_null() {
+            None
+        } else {
+            unsafe { CStr::from_ptr(name.cast()) }.to_str().ok()
+        }
+    }
+
+    /// Whether two facades refer to the same raw verbs context.
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        self.inner == other.inner
     }
 }
 

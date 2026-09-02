@@ -7,14 +7,29 @@
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
-use crate::comp_channel::CompletionChannel;
-use crate::cq::CompletionQueue;
-use crate::wc::WorkCompletion;
-
+use super::Completion;
 use super::context::Context;
 use super::error::Result;
+use crate::comp_channel::CompletionChannel;
+use crate::cq::CompletionQueue;
 
 /// Builder for creating completion queues with explicit configuration.
+///
+/// # Use case
+///
+/// Create either a directly polled CQ or a channel-backed CQ.
+///
+/// # Ownership and progress
+///
+/// The resulting CQ retains its anchored context and owns no task.
+///
+/// # Safety and limits
+///
+/// The requested entry count must be positive and provider-supported.
+///
+/// # Availability
+///
+/// Available in every V2 feature profile.
 ///
 /// # Examples
 ///
@@ -73,16 +88,19 @@ impl<'a> CqBuilder<'a> {
                 "CQ capacity (cqe) must be >= 1".into(),
             ));
         }
-        let inner_ctx = Arc::clone(self.ctx.inner());
+        let inner_ctx = Arc::clone(self.ctx.raw_context());
         if self.use_channel {
-            let channel = Arc::new(CompletionChannel::new(&inner_ctx)?);
-            let cq = CompletionQueue::with_comp_channel(inner_ctx, self.cqe, &channel)?;
+            let channel =
+                Arc::new(CompletionChannel::new(&inner_ctx).map_err(super::error::Error::from_v1)?);
+            let cq = CompletionQueue::with_comp_channel(inner_ctx, self.cqe, &channel)
+                .map_err(super::error::Error::from_v1)?;
             Ok(Cq {
                 inner: cq,
                 channel: Some(channel),
             })
         } else {
-            let cq = CompletionQueue::new(inner_ctx, self.cqe)?;
+            let cq =
+                CompletionQueue::new(inner_ctx, self.cqe).map_err(super::error::Error::from_v1)?;
             Ok(Cq {
                 inner: cq,
                 channel: None,
@@ -91,8 +109,26 @@ impl<'a> CqBuilder<'a> {
     }
 }
 
-/// An RDMA completion queue supporting both direct CQ polling and
-/// fd/readiness-based notification for Rust async runtimes.
+/// An RDMA completion queue supporting direct and readiness-based polling.
+///
+/// # Use case
+///
+/// Poll typed [`Completion`] values directly or attach a runtime notifier.
+///
+/// # Ownership and progress
+///
+/// The CQ retains its anchored context and optional completion channel. The
+/// caller remains the sole completion consumer.
+///
+/// # Safety and limits
+///
+/// Concurrent consumers can steal each other's completions and require
+/// external synchronization.
+///
+/// # Availability
+///
+/// Direct polling is always available; readiness adapters require their
+/// corresponding feature.
 ///
 /// Created via [`CqBuilder`]. The CQ integration model is determined at
 /// construction time:
@@ -130,8 +166,11 @@ impl Cq {
     ///
     /// - [`Error::Verbs`](super::error::Error::Verbs) if the underlying poll
     ///   operation fails
-    pub fn poll(&self, completions: &mut [WorkCompletion]) -> Result<usize> {
-        let n = self.inner.poll(completions)?;
+    pub fn poll(&self, completions: &mut [Completion]) -> Result<usize> {
+        let n = self
+            .inner
+            .poll(Completion::raw_slice_mut(completions))
+            .map_err(super::error::Error::from_v1)?;
         Ok(n)
     }
 
@@ -153,71 +192,16 @@ impl Cq {
         self.channel.is_some()
     }
 
-    /// Access the completion channel, if present.
-    ///
-    /// Useful for advanced integration patterns or interop with
-    /// the v1 async API.
-    pub fn channel(&self) -> Option<&CompletionChannel> {
+    #[cfg(feature = "async")]
+    pub(crate) fn completion_channel(&self) -> Option<&CompletionChannel> {
         self.channel.as_deref()
     }
 
-    /// Get a clone of the Arc-shared completion channel.
-    ///
-    /// Used by `ConnectionBuilder` to share channel ownership with
-    /// `ConnectionLifetime`, ensuring the channel outlives the CQ
-    /// for correct `ibv_destroy_comp_channel` ordering.
-    pub(crate) fn channel_arc(&self) -> Option<Arc<CompletionChannel>> {
-        self.channel.clone()
-    }
-
-    /// Access the underlying completion queue.
-    ///
-    /// Use this for interop with the v1 API or advanced operations.
-    pub fn inner(&self) -> &Arc<CompletionQueue> {
+    pub(crate) fn raw_cq(&self) -> &Arc<CompletionQueue> {
         &self.inner
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::super::context::Context;
-    use super::super::error::Error;
-    use super::*;
-
-    #[test]
-    fn test_cq_builder_poll_only() {
-        match Context::open_first() {
-            Ok(ctx) => {
-                let cq = CqBuilder::new(&ctx, 16).build();
-                assert!(cq.is_ok());
-                let cq = cq.unwrap();
-                assert!(!cq.has_channel());
-                assert!(cq.fd().is_none());
-
-                // Polling empty CQ should return 0
-                let mut completions = [WorkCompletion::default(); 4];
-                let n = cq.poll(&mut completions).unwrap();
-                assert_eq!(n, 0);
-            }
-            Err(Error::NoDevices) => {} // skip
-            Err(e) => panic!("unexpected: {e}"),
-        }
-    }
-
-    #[test]
-    fn test_cq_builder_with_channel() {
-        match Context::open_first() {
-            Ok(ctx) => {
-                let cq = CqBuilder::new(&ctx, 16).with_channel().build();
-                assert!(cq.is_ok());
-                let cq = cq.unwrap();
-                assert!(cq.has_channel());
-                assert!(cq.fd().is_some());
-                // fd should be positive
-                assert!(cq.fd().unwrap() >= 0);
-            }
-            Err(Error::NoDevices) => {} // skip
-            Err(e) => panic!("unexpected: {e}"),
-        }
+    pub(crate) fn raw_context(&self) -> &Arc<crate::device::Context> {
+        self.inner.context()
     }
 }

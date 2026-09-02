@@ -10,16 +10,44 @@ use rdma_io_sys::ibverbs::*;
 use rdma_io_sys::wrapper::*;
 
 use crate::cm::{CmId, CmQueuePair};
-use crate::error::from_ret;
 use crate::qp::QpInitAttr;
-use crate::wr::{RecvWr, SendFlags, SendWr, Sge, WrOpcode};
+use crate::wr::{PreparedRecvBatch, PreparedSendBatch, RecvWr, SendFlags, SendWr, Sge, WrOpcode};
 
 use super::cq::Cq;
 use super::error::{Error, Result};
 use super::mr::{Mr, RemoteMr};
 use super::pd::Pd;
 
-use crate::wc::WorkCompletion;
+/// Provider result for one linked work-request batch.
+#[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "batch outcomes are consumed only when the Tokio engine is enabled"
+)]
+pub(crate) enum BatchPostOutcome {
+    AllAccepted,
+    PrefixAccepted {
+        accepted: usize,
+        first_unaccepted: usize,
+        source: std::io::Error,
+    },
+    Ambiguous {
+        source: std::io::Error,
+    },
+}
+
+/// QP capacities returned by the provider after creation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "provider-returned capabilities are consumed by the Tokio engine"
+)]
+pub(crate) struct QpCapabilities {
+    pub(crate) max_send_wr: u32,
+    pub(crate) max_recv_wr: u32,
+    pub(crate) max_send_sge: u32,
+    pub(crate) max_recv_sge: u32,
+}
 
 /// Builder for creating queue pairs with documented defaults.
 ///
@@ -33,6 +61,24 @@ use crate::wc::WorkCompletion;
 /// | max_send_sge | 1 |
 /// | max_recv_sge | 1 |
 /// | sq_sig_all | true |
+///
+/// # Use case
+///
+/// Configure and create one independent RC QP on typed V2 resources.
+///
+/// # Ownership and progress
+///
+/// The built QP retains its PD/CQs; the caller owns posting and completion
+/// progress.
+///
+/// # Safety and limits
+///
+/// `build_with_cm` validates exact anchored context identity and the QP must
+/// be dropped before its creating CM ID.
+///
+/// # Availability
+///
+/// Available in every V2 feature profile.
 ///
 /// # Example
 ///
@@ -109,11 +155,8 @@ impl<'a> QpBuilder<'a> {
 
     /// Build the QP using RDMA CM for connection management.
     ///
-    /// The typical v2 flow is:
-    /// 1. Establish CM connection (resolve address and route)
-    /// 2. `Context::from_cm(&cm_id)` to get the device context
-    /// 3. Allocate PD and CQs from that context
-    /// 4. Call this method to create the QP
+    /// The CM route must select the same anchored context as the builder's
+    /// protection domain and completion queues.
     ///
     /// The resulting [`Qp`] must be dropped **before** the `CmId` that
     /// created it. Use struct field ordering to ensure correct drop order.
@@ -137,25 +180,32 @@ impl<'a> QpBuilder<'a> {
             return Err(Error::InvalidConfig("max_recv_sge must be > 0".into()));
         }
 
-        let pd_arc = Arc::clone(self.pd.inner());
-        let send_cq_inner = Arc::clone(self.send_cq.inner());
-        let recv_cq_inner = Arc::clone(self.recv_cq.inner());
+        let context = self.pd.raw_context().as_raw();
+        if self.send_cq.raw_context().as_raw() != context
+            || self.recv_cq.raw_context().as_raw() != context
+        {
+            return Err(Error::InvalidConfig(
+                "QP protection domain and completion queues must use the same anchored context"
+                    .into(),
+            ));
+        }
+        cm_id
+            .require_context(self.pd.raw_context())
+            .map_err(Error::from_v1)?;
+        let pd_arc = Arc::clone(self.pd.raw_pd());
+        let send_cq_inner = Arc::clone(self.send_cq.raw_cq());
+        let recv_cq_inner = Arc::clone(self.recv_cq.raw_cq());
 
-        let cmqp = cm_id.create_qp_with_cq(
-            &pd_arc,
-            &self.attr,
-            Some(&send_cq_inner),
-            Some(&recv_cq_inner),
-        )?;
+        let cmqp = cm_id
+            .create_qp_with_cq(
+                &pd_arc,
+                &self.attr,
+                Some(&send_cq_inner),
+                Some(&recv_cq_inner),
+            )
+            .map_err(Error::from_v1)?;
 
         Ok(Qp { inner: cmqp })
-    }
-
-    /// Get the current QP initialization attributes.
-    ///
-    /// Useful for inspecting defaults or debugging.
-    pub fn attr(&self) -> &QpInitAttr {
-        &self.attr
     }
 }
 
@@ -183,19 +233,29 @@ impl<'a> QpBuilder<'a> {
 /// `Qp` is `Send + Sync`. The underlying QP uses internal locking
 /// in libibverbs. However, callers must coordinate work request
 /// submission and completion draining to avoid logical races.
+///
+/// # Use case
+///
+/// Post SEND, RECV, RDMA WRITE, and RDMA READ through four named methods.
+///
+/// # Ownership and progress
+///
+/// The QP retains its PD/CQs and owns no completion driver or task.
+///
+/// # Safety and limits
+///
+/// Posted MRs must remain live until typed completions arrive or result-aware
+/// synchronous destruction of this owning QP succeeds. The creating CM ID
+/// must outlive the QP and its destruction call.
+///
+/// # Availability
+///
+/// Created by [`QpBuilder::build_with_cm`].
 pub struct Qp {
     inner: CmQueuePair,
 }
 
 impl Qp {
-    /// Create from an existing `CmQueuePair`.
-    ///
-    /// Useful for interop when the QP was created through the v1 API
-    /// (e.g., via `AsyncCmId::create_qp_with_cq()`).
-    pub fn from_cm_qp(cmqp: CmQueuePair) -> Self {
-        Self { inner: cmqp }
-    }
-
     /// Post a send work request.
     ///
     /// Sends data from `mr` with the given `wr_id`. The `wr_id` is
@@ -206,10 +266,10 @@ impl Qp {
     /// - [`Error::PostFailed`] if the WR cannot be posted (e.g., QP in error state)
     pub fn post_send(&self, mr: &Mr, wr_id: u64) -> Result<()> {
         let sge = Sge::new(mr.addr(), mr.len() as u32, mr.lkey());
-        let mut wr = SendWr::new(wr_id, WrOpcode::Send)
+        let wr = SendWr::new(wr_id, WrOpcode::Send)
             .sg(sge)
             .flags(SendFlags::SIGNALED);
-        self.post_send_wr(&mut wr)
+        self.post_single_send(wr)
     }
 
     /// Post a receive work request.
@@ -222,8 +282,8 @@ impl Qp {
     /// - [`Error::PostFailed`] if the WR cannot be posted
     pub fn post_recv(&self, mr: &mut Mr, wr_id: u64) -> Result<()> {
         let sge = Sge::new(mr.addr(), mr.len() as u32, mr.lkey());
-        let mut wr = RecvWr::new(wr_id).sg(sge);
-        self.post_recv_wr(&mut wr)
+        let wr = RecvWr::new(wr_id).sg(sge);
+        self.post_single_recv(wr)
     }
 
     /// Post an RDMA Write operation.
@@ -236,11 +296,11 @@ impl Qp {
     /// - [`Error::PostFailed`] if the WR cannot be posted
     pub fn post_write(&self, local: &Mr, remote: &RemoteMr, wr_id: u64) -> Result<()> {
         let sge = Sge::new(local.addr(), local.len() as u32, local.lkey());
-        let mut wr = SendWr::new(wr_id, WrOpcode::RdmaWrite)
+        let wr = SendWr::new(wr_id, WrOpcode::RdmaWrite)
             .sg(sge)
             .rdma(remote.addr, remote.rkey)
             .flags(SendFlags::SIGNALED);
-        self.post_send_wr(&mut wr)
+        self.post_single_send(wr)
     }
 
     /// Post an RDMA Read operation.
@@ -253,11 +313,11 @@ impl Qp {
     /// - [`Error::PostFailed`] if the WR cannot be posted
     pub fn post_read(&self, local: &mut Mr, remote: &RemoteMr, wr_id: u64) -> Result<()> {
         let sge = Sge::new(local.addr(), local.len() as u32, local.lkey());
-        let mut wr = SendWr::new(wr_id, WrOpcode::RdmaRead)
+        let wr = SendWr::new(wr_id, WrOpcode::RdmaRead)
             .sg(sge)
             .rdma(remote.addr, remote.rkey)
             .flags(SendFlags::SIGNALED);
-        self.post_send_wr(&mut wr)
+        self.post_single_send(wr)
     }
 
     /// QP number assigned by the HCA.
@@ -265,98 +325,144 @@ impl Qp {
         self.inner.qp_num()
     }
 
+    #[allow(
+        dead_code,
+        reason = "provider-returned capabilities are consumed by the Tokio engine"
+    )]
+    pub(crate) fn capabilities(&self) -> QpCapabilities {
+        let capabilities = self.inner.capabilities();
+        QpCapabilities {
+            max_send_wr: capabilities.max_send_wr,
+            max_recv_wr: capabilities.max_recv_wr,
+            max_send_sge: capabilities.max_send_sge,
+            max_recv_sge: capabilities.max_recv_sge,
+        }
+    }
+
     /// Transition the QP to error state for teardown.
     ///
-    /// Forces all outstanding WRs to complete (with flush error),
-    /// enabling clean shutdown.
+    /// Requests provider flush of outstanding WRs. Providers may omit some
+    /// flush CQEs, so engine close retains ownership until exact CQEs arrive
+    /// or this QP is synchronously destroyed.
     pub fn to_error(&self) -> Result<()> {
-        self.inner.to_error()?;
+        self.inner.to_error().map_err(Error::from_v1)?;
         Ok(())
     }
 
-    /// Access the underlying CM queue pair for v1 API interop.
-    pub fn inner(&self) -> &CmQueuePair {
-        &self.inner
-    }
-
-    /// Submit a typed RDMA operation.
-    ///
-    /// io_uring/compio-style submission: pass a typed [`Op`](super::op::Op)
-    /// describing what to do, and the operation is posted to the hardware
-    /// queue. The completion will carry the `wr_id` from the
-    /// [`Op`](super::op::Op) for correlation.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use rdma_io::v2::*;
-    /// # fn example(qp: &Qp, mr: &Mr) -> Result<()> {
-    /// qp.submit(Op::send(mr, 42))?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn submit(&self, op: super::op::Op<'_>) -> Result<()> {
-        match op {
-            super::op::Op::Send { mr, wr_id } => self.post_send(mr, wr_id),
-            super::op::Op::Recv { mr, wr_id } => self.post_recv(mr, wr_id),
-            super::op::Op::Write {
-                local,
-                remote,
-                wr_id,
-            } => self.post_write(local, remote, wr_id),
-            super::op::Op::Read {
-                local,
-                remote,
-                wr_id,
-            } => self.post_read(local, remote, wr_id),
+    #[cfg(feature = "tokio")]
+    pub(crate) fn try_destroy(self) -> std::result::Result<(), (Self, Error)> {
+        match self.inner.try_destroy_verbs() {
+            Ok(()) => Ok(()),
+            Err((inner, error)) => Err((Self { inner }, Error::from_v1(error))),
         }
     }
 
-    /// Post a send and return an error if the completion indicates failure.
-    ///
-    /// Higher-level wrapper that checks the `WorkCompletion` status and
-    /// converts failures to [`Error::CompletionError`].
-    pub fn check_completion(wc: &WorkCompletion) -> Result<()> {
-        if wc.is_success() {
-            Ok(())
-        } else {
-            Err(Error::CompletionError {
-                status: wc.status(),
-                vendor_err: wc.vendor_err(),
-            })
-        }
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn fail_next_destroy(&self) {
+        self.inner.fail_next_verbs_destroy();
+    }
+
+    #[allow(
+        dead_code,
+        reason = "used by Tokio engine resource-identity test hooks"
+    )]
+    pub(crate) fn uses_resources(&self, pd: &Pd, cq: &Cq) -> bool {
+        self.inner
+            .uses_resources(pd.raw_pd(), cq.raw_cq(), cq.raw_cq())
     }
 
     // -- Internal posting helpers --
 
-    fn post_send_wr(&self, wr: &mut SendWr) -> Result<()> {
-        let mut raw = wr.build_raw();
-        let mut bad_wr: *mut ibv_send_wr = std::ptr::null_mut();
-        from_ret(unsafe { rdma_wrap_ibv_post_send(self.inner.as_raw(), &mut raw, &mut bad_wr) })
-            .map_err(|e| match e {
-                crate::Error::Verbs(io_err) => Error::PostFailed(io_err),
-                other => Error::from(other),
-            })
+    fn post_single_send(&self, wr: SendWr) -> Result<()> {
+        let mut batch = PreparedSendBatch::new(vec![wr]).map_err(Error::from_v1)?;
+        batch_outcome_to_single(self.post_send_batch(&mut batch))
     }
 
-    fn post_recv_wr(&self, wr: &mut RecvWr) -> Result<()> {
-        let mut raw = wr.build_raw();
-        let mut bad_wr: *mut ibv_recv_wr = std::ptr::null_mut();
-        from_ret(unsafe { rdma_wrap_ibv_post_recv(self.inner.as_raw(), &mut raw, &mut bad_wr) })
-            .map_err(|e| match e {
-                crate::Error::Verbs(io_err) => Error::PostFailed(io_err),
-                other => Error::from(other),
-            })
+    fn post_single_recv(&self, wr: RecvWr) -> Result<()> {
+        let mut batch = PreparedRecvBatch::new(vec![wr]).map_err(Error::from_v1)?;
+        batch_outcome_to_single(self.post_recv_batch(&mut batch))
     }
 
-    /// Post a raw send WR. Used by the per-operation future infrastructure.
-    pub(crate) fn post_send_wr_raw(&self, wr: &mut SendWr) -> Result<()> {
-        self.post_send_wr(wr)
+    pub(crate) fn post_send_batch(&self, batch: &mut PreparedSendBatch) -> BatchPostOutcome {
+        debug_assert!(!batch.is_empty());
+        let mut bad_wr = std::ptr::null_mut();
+        let ret =
+            unsafe { rdma_wrap_ibv_post_send(self.inner.as_raw(), batch.head_mut(), &mut bad_wr) };
+        classify_send_post_result(batch, ret, bad_wr)
     }
 
-    /// Post a raw recv WR. Used by the per-operation future infrastructure.
-    pub(crate) fn post_recv_wr_raw(&self, wr: &mut RecvWr) -> Result<()> {
-        self.post_recv_wr(wr)
+    pub(crate) fn post_recv_batch(&self, batch: &mut PreparedRecvBatch) -> BatchPostOutcome {
+        debug_assert!(!batch.is_empty());
+        let mut bad_wr = std::ptr::null_mut();
+        let ret =
+            unsafe { rdma_wrap_ibv_post_recv(self.inner.as_raw(), batch.head_mut(), &mut bad_wr) };
+        classify_recv_post_result(batch, ret, bad_wr)
+    }
+}
+
+fn post_error(ret: i32) -> std::io::Error {
+    match crate::error::from_ret(ret) {
+        Err(crate::Error::Verbs(error)) => error,
+        Err(error) => std::io::Error::other(error.to_string()),
+        Ok(()) => std::io::Error::other("verbs post unexpectedly reported success"),
+    }
+}
+
+fn classify_send_post_result(
+    batch: &PreparedSendBatch,
+    ret: i32,
+    bad_wr: *mut ibv_send_wr,
+) -> BatchPostOutcome {
+    if ret == 0 {
+        return BatchPostOutcome::AllAccepted;
+    }
+    let source = post_error(ret);
+    match batch.first_unaccepted(bad_wr) {
+        Some(first_unaccepted)
+            if first_unaccepted < batch.len()
+                && batch.ledger_index(first_unaccepted) == Some(first_unaccepted) =>
+        {
+            BatchPostOutcome::PrefixAccepted {
+                accepted: first_unaccepted,
+                first_unaccepted,
+                source,
+            }
+        }
+        None => BatchPostOutcome::Ambiguous { source },
+        Some(_) => BatchPostOutcome::Ambiguous { source },
+    }
+}
+
+fn classify_recv_post_result(
+    batch: &PreparedRecvBatch,
+    ret: i32,
+    bad_wr: *mut ibv_recv_wr,
+) -> BatchPostOutcome {
+    if ret == 0 {
+        return BatchPostOutcome::AllAccepted;
+    }
+    let source = post_error(ret);
+    match batch.first_unaccepted(bad_wr) {
+        Some(first_unaccepted)
+            if first_unaccepted < batch.len()
+                && batch.ledger_index(first_unaccepted) == Some(first_unaccepted) =>
+        {
+            BatchPostOutcome::PrefixAccepted {
+                accepted: first_unaccepted,
+                first_unaccepted,
+                source,
+            }
+        }
+        None => BatchPostOutcome::Ambiguous { source },
+        Some(_) => BatchPostOutcome::Ambiguous { source },
+    }
+}
+
+fn batch_outcome_to_single(outcome: BatchPostOutcome) -> Result<()> {
+    match outcome {
+        BatchPostOutcome::AllAccepted => Ok(()),
+        BatchPostOutcome::PrefixAccepted { source, .. }
+        | BatchPostOutcome::Ambiguous { source } => Err(Error::PostFailed(source)),
     }
 }
 
@@ -376,5 +482,50 @@ mod tests {
         assert_eq!(attr.max_recv_sge, 1);
         assert!(attr.sq_sig_all);
         assert_eq!(attr.qp_type, QpType::Rc);
+    }
+
+    #[test]
+    fn bad_wr_classifies_every_send_prefix_and_ambiguity() {
+        for first_unaccepted in 0..4 {
+            let mut batch = PreparedSendBatch::new(
+                (0..4)
+                    .map(|index| SendWr::new(index, WrOpcode::Send))
+                    .collect(),
+            )
+            .unwrap();
+            let bad_wr = batch.member_ptr_for_test(first_unaccepted);
+            assert!(matches!(
+                classify_send_post_result(&batch, -libc::ENOMEM, bad_wr),
+                BatchPostOutcome::PrefixAccepted {
+                    accepted,
+                    first_unaccepted: first,
+                    ..
+                } if accepted == first_unaccepted && first == first_unaccepted
+            ));
+        }
+
+        let batch = PreparedSendBatch::new(vec![SendWr::new(1, WrOpcode::Send)]).unwrap();
+        assert!(matches!(
+            classify_send_post_result(&batch, -libc::ENOMEM, std::ptr::null_mut()),
+            BatchPostOutcome::Ambiguous { .. }
+        ));
+    }
+
+    #[test]
+    fn bad_wr_classifies_every_recv_prefix_and_ambiguity() {
+        let mut batch = PreparedRecvBatch::new((0..3).map(RecvWr::new).collect()).unwrap();
+        let bad_wr = batch.member_ptr_for_test(2);
+        assert!(matches!(
+            classify_recv_post_result(&batch, -libc::ENOMEM, bad_wr),
+            BatchPostOutcome::PrefixAccepted {
+                accepted: 2,
+                first_unaccepted: 2,
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify_recv_post_result(&batch, -libc::ENOMEM, std::ptr::null_mut()),
+            BatchPostOutcome::Ambiguous { .. }
+        ));
     }
 }

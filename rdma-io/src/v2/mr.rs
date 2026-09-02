@@ -7,7 +7,7 @@
 use super::error::{Error, Result};
 use super::pd::Pd;
 
-use crate::mr::{self, AccessFlags, OwnedMemoryRegion};
+use crate::mr::{AccessFlags, OwnedMemoryRegion};
 
 /// Declares the intended access pattern for a memory registration.
 ///
@@ -19,6 +19,22 @@ use crate::mr::{self, AccessFlags, OwnedMemoryRegion};
 /// | `RemoteRead` | `LOCAL_WRITE \| REMOTE_READ` |
 /// | `RemoteWrite` | `LOCAL_WRITE \| REMOTE_WRITE` |
 /// | `RemoteReadWrite` | `LOCAL_WRITE \| REMOTE_READ \| REMOTE_WRITE` |
+///
+/// # Use case
+///
+/// Select domain-level registration intent without composing raw flags.
+///
+/// # Ownership and progress
+///
+/// The value owns no resource and creates no progress source.
+///
+/// # Safety and limits
+///
+/// Raw `AccessFlags` conversion remains an implementation detail.
+///
+/// # Availability
+///
+/// Available in every V2 feature profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessIntent {
     /// Local read/write only. Cannot be accessed remotely.
@@ -32,8 +48,7 @@ pub enum AccessIntent {
 }
 
 impl AccessIntent {
-    /// Convert to the underlying [`AccessFlags`].
-    pub fn to_flags(self) -> AccessFlags {
+    pub(crate) fn to_flags(self) -> AccessFlags {
         match self {
             AccessIntent::LocalOnly => AccessFlags::LOCAL_WRITE,
             AccessIntent::RemoteRead => AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_READ,
@@ -47,13 +62,22 @@ impl AccessIntent {
 
 /// A registered memory region with owned buffer.
 ///
-/// Created via [`Pd::reg_mr()`]. The buffer is allocated and registered
-/// with the RDMA device, and deregistered + freed on drop.
+/// # Use case
 ///
-/// # Thread Safety
+/// Own a registered local buffer for named QP or engine operations.
 ///
-/// `Mr` is `Send + Sync`. The registered buffer can be accessed
-/// via [`Mr::as_slice()`] and [`Mr::as_mut_slice()`].
+/// # Ownership and progress
+///
+/// The MR owns its buffer and retains its protection domain. It owns no task.
+///
+/// # Safety and limits
+///
+/// Deregistration occurs on drop only after operation ownership returns it.
+/// No raw V1 memory-region accessor is exposed.
+///
+/// # Availability
+///
+/// Created through [`Pd::reg_mr`].
 pub struct Mr {
     inner: OwnedMemoryRegion,
 }
@@ -106,16 +130,6 @@ impl Mr {
             len: r.len,
         }
     }
-
-    /// Access the underlying owned memory region for v1 API interop.
-    pub fn inner(&self) -> &OwnedMemoryRegion {
-        &self.inner
-    }
-
-    /// Mutable access to the underlying owned memory region.
-    pub fn inner_mut(&mut self) -> &mut OwnedMemoryRegion {
-        &mut self.inner
-    }
 }
 
 /// Descriptor for a remote peer's registered memory.
@@ -125,6 +139,22 @@ impl Mr {
 ///
 /// Typically obtained by receiving a [`Mr::to_remote()`] descriptor
 /// from the remote peer via a SEND/RECV exchange.
+///
+/// # Use case
+///
+/// Describe a peer buffer for named RDMA read and write operations.
+///
+/// # Ownership and progress
+///
+/// This copied descriptor owns no local registration or progress source.
+///
+/// # Safety and limits
+///
+/// The peer controls validity and lifetime; V1 conversion helpers are absent.
+///
+/// # Availability
+///
+/// Available whenever the peer communicates address, key, and length.
 #[derive(Debug, Clone, Copy)]
 pub struct RemoteMr {
     /// Remote virtual address.
@@ -133,26 +163,6 @@ pub struct RemoteMr {
     pub rkey: u32,
     /// Length of the remote buffer in bytes.
     pub len: u32,
-}
-
-impl RemoteMr {
-    /// Create from the v1 [`mr::RemoteMr`] type.
-    pub fn from_v1(r: mr::RemoteMr) -> Self {
-        Self {
-            addr: r.addr,
-            rkey: r.rkey,
-            len: r.len,
-        }
-    }
-
-    /// Convert to the v1 [`mr::RemoteMr`] type.
-    pub fn to_v1(&self) -> mr::RemoteMr {
-        mr::RemoteMr {
-            addr: self.addr,
-            rkey: self.rkey,
-            len: self.len,
-        }
-    }
 }
 
 impl Pd {
@@ -172,9 +182,15 @@ impl Pd {
                 "memory region size must be > 0".into(),
             ));
         }
-        let buf = vec![0u8; size];
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(size)
+            .map_err(|_| Error::InvalidConfig("memory region allocation failed".into()))?;
+        buf.resize(size, 0);
         let flags = access.to_flags();
-        let omr = self.inner().reg_mr_owned(buf, flags)?;
+        let omr = self
+            .raw_pd()
+            .reg_mr_owned(buf, flags)
+            .map_err(Error::from_v1)?;
         Ok(Mr { inner: omr })
     }
 }
@@ -198,18 +214,5 @@ mod tests {
             AccessIntent::RemoteReadWrite.to_flags(),
             AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_READ | AccessFlags::REMOTE_WRITE
         );
-    }
-
-    #[test]
-    fn test_zero_size_mr_fails() {
-        match super::super::Context::open_first() {
-            Ok(ctx) => {
-                let pd = ctx.alloc_pd().unwrap();
-                let result = pd.reg_mr(0, AccessIntent::LocalOnly);
-                assert!(matches!(result, Err(Error::InvalidConfig(_))));
-            }
-            Err(Error::NoDevices) => {} // skip
-            Err(e) => panic!("unexpected: {e}"),
-        }
     }
 }

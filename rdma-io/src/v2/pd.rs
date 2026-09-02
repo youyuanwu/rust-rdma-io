@@ -9,13 +9,21 @@ use crate::pd::ProtectionDomain;
 
 /// An RDMA protection domain.
 ///
-/// Scopes memory registrations and queue pairs. Created via
-/// [`Context::alloc_pd()`](super::Context::alloc_pd).
+/// # Use case
 ///
-/// # Thread Safety
+/// Register typed memory and build queue pairs on an independent V2 context.
 ///
-/// `Pd` is `Send + Sync` and can be shared across threads via cloning
-/// (internally reference-counted).
+/// # Ownership and progress
+///
+/// A `Pd` retains its anchored parent context and owns no progress task.
+///
+/// # Safety and limits
+///
+/// Registered memory and queue pairs keep the protection domain alive.
+///
+/// # Availability
+///
+/// Created by [`Context::alloc_pd`](super::Context::alloc_pd).
 #[derive(Clone)]
 pub struct Pd {
     inner: Arc<ProtectionDomain>,
@@ -27,15 +35,11 @@ impl Pd {
         Self { inner: pd }
     }
 
-    /// Access the underlying protection domain.
-    ///
-    /// Use this for interop with the v1 API or advanced operations.
-    pub fn inner(&self) -> &Arc<ProtectionDomain> {
+    pub(crate) fn raw_pd(&self) -> &Arc<ProtectionDomain> {
         &self.inner
     }
 
-    /// Access the parent context.
-    pub fn context(&self) -> &Arc<crate::device::Context> {
+    pub(crate) fn raw_context(&self) -> &Arc<crate::device::Context> {
         self.inner.context()
     }
 }
