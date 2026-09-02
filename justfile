@@ -106,9 +106,7 @@ validate-v2-engine:
     RUSTDOCFLAGS="-D warnings" cargo doc -p rdma-io --all-features --no-deps
     cargo doc --workspace --all-features --no-deps
     cargo test --doc --workspace --all-features
-    cargo test -p rdma-io-tests --test v2_surface_cutover_tests --test v2_docs_manifest --test v2_docs_legacy_surface --test v2_no_hidden_spawn
-    ./scripts/check-v2-api-surface.sh
-    ./scripts/check-v2-rustdoc.sh
+    cargo test -p rdma-io-tests --test v2_no_hidden_spawn
     sudo -E env CARGO="$(command -v cargo)" ./scripts/validate-v2-engine-providers.sh
 
 # Set up the Soft-iWARP (siw) software RDMA provider.

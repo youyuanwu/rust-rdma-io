@@ -589,7 +589,15 @@ clean, accounting/generations are reusable, and late CQEs are rejected.
 Injected result-aware destruction failures prove that MRs and CQ debt remain
 quarantined and that externally supplied shared CQs are not destroyed twice.
 
-Run the complete sequential provider validation with:
+Run the complete validation, including feature builds, linting, rustdoc,
+doctests, no-hidden-spawn checks, and both providers, with:
+
+```sh
+just validate-v2-engine
+```
+
+To run only the build-profile/no-hidden-spawn preflight followed by the
+sequential provider suites, use:
 
 ```sh
 sudo -E ./scripts/validate-v2-engine-providers.sh

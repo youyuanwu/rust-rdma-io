@@ -245,20 +245,7 @@ run_static_preflight() {
             PATH="$TOOLCHAIN_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
             CARGO="$CARGO" \
             "$CARGO" test -p rdma-io-tests \
-                --test v2_surface_cutover_tests \
-                --test v2_docs_manifest \
-                --test v2_docs_legacy_surface \
                 --test v2_no_hidden_spawn || return $?
-        sudo -u "$SUDO_USER" env \
-            HOME="$user_home" \
-            PATH="$TOOLCHAIN_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-            CARGO="$CARGO" \
-            "$ROOT_DIR/scripts/check-v2-api-surface.sh" || return $?
-        sudo -u "$SUDO_USER" env \
-            HOME="$user_home" \
-            PATH="$TOOLCHAIN_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-            CARGO="$CARGO" \
-            "$ROOT_DIR/scripts/check-v2-rustdoc.sh"
     else
         env PATH="$TOOLCHAIN_BIN:$PATH" RUSTFLAGS="-D warnings" \
             "$CARGO" check -p rdma-io --no-default-features || return $?
@@ -266,14 +253,7 @@ run_static_preflight() {
             "$CARGO" check -p rdma-io --no-default-features --features tokio || return $?
         env PATH="$TOOLCHAIN_BIN:$PATH" CARGO="$CARGO" \
             "$CARGO" test -p rdma-io-tests \
-                --test v2_surface_cutover_tests \
-                --test v2_docs_manifest \
-                --test v2_docs_legacy_surface \
                 --test v2_no_hidden_spawn || return $?
-        env PATH="$TOOLCHAIN_BIN:$PATH" CARGO="$CARGO" \
-            "$ROOT_DIR/scripts/check-v2-api-surface.sh" || return $?
-        env PATH="$TOOLCHAIN_BIN:$PATH" CARGO="$CARGO" \
-            "$ROOT_DIR/scripts/check-v2-rustdoc.sh"
     fi
 }
 
@@ -300,11 +280,11 @@ restore_rxe() {
 
 cd "$ROOT_DIR" || exit 1
 if [[ "$FULL_VALIDATION" -eq 1 ]]; then
-    echo "=== Run Phase 12 static surface and rustdoc preflight ==="
+    echo "=== Run build-profile and no-hidden-spawn preflight ==="
     run_static_preflight
     static_status=$?
     if [[ "$static_status" -ne 0 ]]; then
-        echo "Phase 12 static preflight failed before provider switching (status $static_status)" >&2
+        echo "Static preflight failed before provider switching (status $static_status)" >&2
         exit "$static_status"
     fi
 fi

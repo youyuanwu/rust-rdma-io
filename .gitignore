@@ -2,4 +2,3 @@ target
 build
 .paw
 .vscode
-/rdma-io-tests/api-fixtures/v2-surface/**/Cargo.lock
