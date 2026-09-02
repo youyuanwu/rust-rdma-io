@@ -314,8 +314,6 @@ The following are explicitly out of scope for the v2 message transport:
 - Ring transports, atomics, inline data, multi-SGE operations
 - Dynamic buffer pool resizing
 - UD (Unreliable Datagram) queue pair support
-- Compatibility adapters for the removed endpoint-owned v2 surface. V1 remains
-  unchanged.
 
 See [V2 Runtime RDMA Engine](docs/design/v2-rdma-engine.md) for the complete
 public API, resource counts, listener ordering, wakeup proof, routing,
