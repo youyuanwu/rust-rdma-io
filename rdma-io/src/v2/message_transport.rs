@@ -159,8 +159,6 @@ pub struct MessageTransportBuilder {
     buffer_size: usize,
     hello_deadline: Duration,
     connection_config: Option<RdmaConnectionConfig>,
-    #[cfg(any(test, feature = "test-hooks"))]
-    hello_override: Option<TestHelloOverride>,
 }
 
 impl Default for MessageTransportBuilder {
@@ -178,8 +176,6 @@ impl MessageTransportBuilder {
             buffer_size: 64 * 1024,
             hello_deadline: DEFAULT_MESSAGE_HELLO_DEADLINE,
             connection_config: None,
-            #[cfg(any(test, feature = "test-hooks"))]
-            hello_override: None,
         }
     }
 
@@ -224,13 +220,6 @@ impl MessageTransportBuilder {
     /// `recv_buffers + 2` protocol requirements.
     pub fn connection_config(mut self, config: RdmaConnectionConfig) -> Self {
         self.connection_config = Some(config);
-        self
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[doc(hidden)]
-    pub fn test_hello_override(mut self, value: TestHelloOverride) -> Self {
-        self.hello_override = Some(value);
         self
     }
 
@@ -306,8 +295,6 @@ impl MessageTransportBuilder {
             buffer_size: self.buffer_size,
             mr_size,
             hello_deadline: self.hello_deadline,
-            #[cfg(any(test, feature = "test-hooks"))]
-            hello_override: self.hello_override,
         })
     }
 
@@ -379,30 +366,6 @@ struct EngineMessageConfig {
     buffer_size: usize,
     mr_size: usize,
     hello_deadline: Duration,
-    #[cfg(any(test, feature = "test-hooks"))]
-    hello_override: Option<TestHelloOverride>,
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[doc(hidden)]
-pub enum TestHelloOverride {
-    BadMagic,
-    BadVersion,
-    WrongFrameType,
-    ZeroReceiveCredits,
-    SmallerMaximumMessage,
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[doc(hidden)]
-pub enum TestSteadyFrame {
-    Credit(u32),
-    Hello,
-    BadMagicData,
-    TrailingDataByte,
-    TruncatedDataPayload,
 }
 
 struct MessagePreparation {
@@ -854,8 +817,6 @@ struct EngineMessageState {
     local_close_started: AtomicBool,
     link: OnceLock<EngineMessageLink>,
     self_weak: OnceLock<Weak<EngineMessageState>>,
-    #[cfg(any(test, feature = "test-hooks"))]
-    hello_override: Option<TestHelloOverride>,
 }
 
 impl EngineMessageState {
@@ -884,8 +845,6 @@ impl EngineMessageState {
             local_close_started: AtomicBool::new(false),
             link: OnceLock::new(),
             self_weak: OnceLock::new(),
-            #[cfg(any(test, feature = "test-hooks"))]
-            hello_override: config.hello_override,
         }
     }
 
@@ -1604,35 +1563,7 @@ impl EngineMessageState {
         };
         let advertised_recv = self.local_recv_capacity as u32;
         let advertised_size = self.buffer_size as u32;
-        #[cfg(any(test, feature = "test-hooks"))]
-        let (advertised_recv, advertised_size) = {
-            let mut advertised_recv = advertised_recv;
-            let mut advertised_size = advertised_size;
-            match self.hello_override {
-                Some(TestHelloOverride::ZeroReceiveCredits) => {
-                    advertised_recv = 0;
-                }
-                Some(TestHelloOverride::SmallerMaximumMessage) => {
-                    advertised_size = advertised_size.saturating_sub(1);
-                }
-                _ => {}
-            }
-            (advertised_recv, advertised_size)
-        };
         let len = protocol::write_hello_frame(mr.as_mut_slice(), advertised_recv, advertised_size);
-        #[cfg(any(test, feature = "test-hooks"))]
-        {
-            match self.hello_override {
-                Some(TestHelloOverride::BadMagic) => mr.as_mut_slice()[0] ^= 0xff,
-                Some(TestHelloOverride::BadVersion) => {
-                    mr.as_mut_slice()[4] = protocol::PROTO_VERSION.wrapping_add(1);
-                }
-                Some(TestHelloOverride::WrongFrameType) => {
-                    mr.as_mut_slice()[5] = protocol::FRAME_DATA;
-                }
-                _ => {}
-            }
-        }
         let state = self.weak_self();
         if let Err(error) = connection.post_detached_send(
             mr,
@@ -2063,59 +1994,6 @@ impl MessageTransport {
             self.state.remote_credits.available_permits(),
             self.state.credits_in_flight.load(Ordering::Acquire),
         ))
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[doc(hidden)]
-    pub async fn test_send_frame(&self, frame: TestSteadyFrame) -> Result<()> {
-        self.state.ready().await?;
-        let state = Arc::clone(&self.state);
-        let pools = state.pools()?;
-        let take_mr = pools.data_sends.take();
-        tokio::pin!(take_mr);
-        let mut mr = tokio::select! {
-            biased;
-            mr = &mut take_mr => mr.map_err(|_| state.terminal_error())?,
-            error = state.wait_terminal() => return Err(error),
-        };
-        let frame_len = match frame {
-            TestSteadyFrame::Credit(credits) => {
-                protocol::write_credit_frame(mr.as_mut_slice(), credits)
-            }
-            TestSteadyFrame::Hello => protocol::write_hello_frame(
-                mr.as_mut_slice(),
-                state.local_recv_capacity as u32,
-                state.buffer_size as u32,
-            ),
-            TestSteadyFrame::BadMagicData => {
-                let len = protocol::write_data_frame(mr.as_mut_slice(), b"x");
-                mr.as_mut_slice()[0] ^= 0xff;
-                len
-            }
-            TestSteadyFrame::TrailingDataByte => {
-                let len = protocol::write_data_frame(mr.as_mut_slice(), b"");
-                mr.as_mut_slice()[len] = 0xff;
-                len + 1
-            }
-            TestSteadyFrame::TruncatedDataPayload => {
-                let len = protocol::write_data_frame(mr.as_mut_slice(), b"x");
-                mr.as_mut_slice()[8..12].copy_from_slice(&2u32.to_le_bytes());
-                len
-            }
-        };
-        let request = EngineSendRequest::new(mr, None, frame_len);
-        state.enqueue_send_request(Arc::clone(&request));
-        let waiter = EngineSendWaiter {
-            request,
-            state: Arc::downgrade(&state),
-            done: false,
-        };
-        tokio::pin!(waiter);
-        tokio::select! {
-            biased;
-            result = &mut waiter => result,
-            error = state.wait_terminal() => Err(error),
-        }
     }
 
     /// Graceful async shutdown.

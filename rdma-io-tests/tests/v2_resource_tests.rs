@@ -132,19 +132,36 @@ fn polling_engine_builds_outside_a_runtime_without_io_adapters() {
     let name = software_device_name(&list).unwrap();
     drop(list);
 
-    let (engine, driver) = RdmaEngineBuilder::new(name)
+    let (engine, driver) = RdmaEngineBuilder::new(name.clone())
         .completion_mode(CompletionMode::Polling)
         .build()
         .expect("polling build outside Tokio");
     let diagnostics = engine.diagnostics();
     assert_eq!(diagnostics.lifecycle, RdmaEngineLifecycle::Created);
-    let resources = engine
-        .test_resources()
-        .unwrap()
-        .shared_resource_identity()
-        .unwrap();
-    assert!(resources.is_complete());
-    assert!(!resources.has_completion_channel());
+    let lease = engine.test_resources().unwrap();
+    let resources = lease.shared_resource_identity().unwrap();
+    assert!(
+        resources
+            == engine
+                .test_resources()
+                .unwrap()
+                .shared_resource_identity()
+                .unwrap()
+    );
+    let (other_engine, other_driver) = RdmaEngineBuilder::new(name)
+        .completion_mode(CompletionMode::Polling)
+        .build()
+        .expect("second polling engine");
+    assert!(
+        resources
+            != other_engine
+                .test_resources()
+                .unwrap()
+                .shared_resource_identity()
+                .unwrap()
+    );
+    drop(other_engine);
+    drop(other_driver);
     drop(engine);
     drop(driver);
 }
@@ -158,18 +175,32 @@ async fn readiness_engine_builds_with_one_channel_and_direct_driver() {
     let name = software_device_name(&list).unwrap();
     drop(list);
 
-    let (engine, driver) = RdmaEngineBuilder::new(name).build().unwrap();
+    let (engine, driver) = RdmaEngineBuilder::new(name.clone()).build().unwrap();
+    let lease = engine.test_resources().unwrap();
+    let resources = lease.shared_resource_identity().unwrap();
     assert!(
-        engine
-            .test_resources()
-            .unwrap()
-            .shared_resource_identity()
-            .unwrap()
-            .has_completion_channel()
+        resources
+            == engine
+                .test_resources()
+                .unwrap()
+                .shared_resource_identity()
+                .unwrap()
+    );
+    let (other_engine, other_driver) = RdmaEngineBuilder::new(name).build().unwrap();
+    assert!(
+        resources
+            != other_engine
+                .test_resources()
+                .unwrap()
+                .shared_resource_identity()
+                .unwrap()
     );
     let task = tokio::spawn(driver);
+    let other_task = tokio::spawn(other_driver);
     engine.shutdown().await.unwrap();
+    other_engine.shutdown().await.unwrap();
     task.await.unwrap().unwrap();
+    other_task.await.unwrap().unwrap();
     assert_eq!(
         engine.diagnostics().lifecycle,
         RdmaEngineLifecycle::Terminated

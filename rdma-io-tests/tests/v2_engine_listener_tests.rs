@@ -1,5 +1,7 @@
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -19,6 +21,23 @@ fn software_device_name() -> Option<String> {
 
 fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
     let waker = futures_util::task::noop_waker();
+    let mut context = Context::from_waker(&waker);
+    future.poll(&mut context)
+}
+
+struct WakeCounter(AtomicUsize);
+
+impl futures_util::task::ArcWake for WakeCounter {
+    fn wake_by_ref(arc_self: &Arc<Self>) {
+        arc_self.0.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+fn poll_with_wake_counter<F: Future>(
+    future: Pin<&mut F>,
+    wake: &Arc<WakeCounter>,
+) -> Poll<F::Output> {
+    let waker = futures_util::task::waker(Arc::clone(wake));
     let mut context = Context::from_waker(&waker);
     future.poll(&mut context)
 }
@@ -135,12 +154,17 @@ async fn run_basic_listener(mode: CompletionMode) {
         queued_connects.spawn(async move { engine.connect(address).await });
     }
     tokio::time::timeout(Duration::from_secs(15), async {
-        while listener.test_queue_counts().0 != 2 {
+        while server_engine.diagnostics().live_connections != 4 {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("listener userspace backlog did not fill");
+    .unwrap_or_else(|_| {
+        panic!(
+            "listener backlog children did not become live: {:?}",
+            server_engine.diagnostics()
+        )
+    });
     let overflow_engine = client_engine.clone();
     let overflow = tokio::spawn(async move { overflow_engine.connect(address).await });
     let overflow = tokio::time::timeout(Duration::from_secs(15), overflow)
@@ -162,8 +186,6 @@ async fn run_basic_listener(mode: CompletionMode) {
     let (server_after_reject, client_after_reject) =
         accept_pair(&listener, &client_engine, false).await;
     exchange(&server_after_reject, &client_after_reject, 11).await;
-
-    assert_eq!(listener.test_queue_counts(), (0, 0, 0));
 
     for connection in [&server_default, &server_configured] {
         connection.close().await.unwrap();
@@ -232,10 +254,7 @@ async fn run_two_listener_backlog_and_capacity(mode: CompletionMode) {
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             let diagnostics = server_engine.diagnostics();
-            if first.test_queue_counts().0 == 2
-                && second.test_queue_counts().0 == 2
-                && diagnostics.live_connections == 4
-            {
+            if diagnostics.live_connections == 4 {
                 break;
             }
             tokio::task::yield_now().await;
@@ -330,60 +349,35 @@ async fn run_accept_cancellation_and_live_shutdown(mode: CompletionMode) {
         )
         .await
         .unwrap();
-    let cancelled_listener = listener.clone();
-    let cancelled = tokio::spawn(async move { cancelled_listener.accept().await });
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while listener.test_queue_counts().1 != 1 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("accept waiter was not registered");
-    cancelled.abort();
-    match cancelled.await {
-        Err(error) => assert!(error.is_cancelled()),
-        Ok(_) => panic!("accept task completed before cancellation"),
-    }
-
+    let mut cancelled = Box::pin(listener.accept());
+    assert!(poll_once(cancelled.as_mut()).is_pending());
+    drop(cancelled);
     let address = connect_addr_for(Some(listener.local_addr().unwrap()));
-    let connect_engine = client_engine.clone();
-    let connect = tokio::spawn(async move { connect_engine.connect(address).await });
-    tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            if listener.test_queue_counts() == (1, 0, 0) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("cancelled accept was not removed before child selection");
-    let server_connection = listener.accept().await.unwrap();
-    let client_connection = connect.await.unwrap().unwrap();
+    let (server_connection, client_connection) =
+        tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::join!(listener.accept(), client_engine.connect(address))
+        })
+        .await
+        .expect("replacement accept did not receive the next child");
+    let server_connection = server_connection.unwrap();
+    let client_connection = client_connection.unwrap();
 
     let mut cancelled_after_accept = Box::pin(listener.accept());
-    assert!(poll_once(cancelled_after_accept.as_mut()).is_pending());
+    let selected_wake = Arc::new(WakeCounter(AtomicUsize::new(0)));
+    assert!(poll_with_wake_counter(cancelled_after_accept.as_mut(), &selected_wake).is_pending());
     let second_address = connect_addr_for(Some(listener.local_addr().unwrap()));
     let second_engine = client_engine.clone();
     let second_connect = tokio::spawn(async move { second_engine.connect(second_address).await });
     tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            if listener.test_queue_counts().2 == 1 {
-                break;
-            }
+        while selected_wake.0.load(Ordering::Acquire) == 0 {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("selected accept did not reach undelivered ESTABLISHED");
+    .expect("selected accept result was not published");
     drop(cancelled_after_accept);
     tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            if listener.test_queue_counts().2 == 0
-                && server_engine.diagnostics().live_connections == 1
-            {
-                break;
-            }
+        while server_engine.diagnostics().live_connections != 1 {
             tokio::task::yield_now().await;
         }
     })
@@ -409,25 +403,17 @@ async fn run_accept_cancellation_and_live_shutdown(mode: CompletionMode) {
     .expect("cancelled accept client connection did not retire");
 
     let mut selected_during_close = Box::pin(listener.accept());
-    assert!(poll_once(selected_during_close.as_mut()).is_pending());
-    let pending_listener = listener.clone();
-    let pending_accept = tokio::spawn(async move { pending_listener.accept().await });
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while listener.test_queue_counts().1 != 2 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("listener-close waiters were not registered");
+    let close_selection_wake = Arc::new(WakeCounter(AtomicUsize::new(0)));
+    assert!(
+        poll_with_wake_counter(selected_during_close.as_mut(), &close_selection_wake).is_pending()
+    );
+    let mut pending_accept = Box::pin(listener.accept());
+    assert!(poll_once(pending_accept.as_mut()).is_pending());
     let close_address = connect_addr_for(Some(listener.local_addr().unwrap()));
     let close_engine = client_engine.clone();
     let close_connect = tokio::spawn(async move { close_engine.connect(close_address).await });
     tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            let counts = listener.test_queue_counts();
-            if counts.2 == 1 && counts.1 == 1 {
-                break;
-            }
+        while close_selection_wake.0.load(Ordering::Acquire) == 0 {
             tokio::task::yield_now().await;
         }
     })
@@ -443,7 +429,7 @@ async fn run_accept_cancellation_and_live_shutdown(mode: CompletionMode) {
     close_listener.await.unwrap();
     let selected_result = selected_during_close.await;
     assert!(matches!(selected_result, Err(Error::TransportClosed)));
-    match pending_accept.await.unwrap() {
+    match pending_accept.await {
         Err(Error::TransportClosed) => {}
         Err(error) => panic!("unexpected listener-close accept error: {error}"),
         Ok(_) => panic!("listener close completed a pending accept successfully"),

@@ -639,6 +639,7 @@ pub(super) mod test_api {
     use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
 
     use super::{COMPLETION_DISPATCH_WORK, EngineShared, Error, Result, TERMINAL_WORK};
+    use crate::v2::engine::operation::CqeReject;
     use crate::v2::engine::registry::{Lookup, OperationToken};
 
     /// Test-only connection identity used by the Phase 2 routing gate.
@@ -654,6 +655,34 @@ pub(super) mod test_api {
     pub struct TestAcceptedOperation {
         pub wr_id: u64,
         pub expected_opcode: WcOpcode,
+    }
+
+    /// Exact class of a CQE rejected before it could mutate live ownership.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum TestCqeRejection {
+        StaleConnection,
+        StaleOperation,
+        RetiredOperation,
+        Unknown,
+        Duplicate,
+        WrongConnection,
+        WrongQpNum,
+        UnexpectedOpcode,
+    }
+
+    impl From<CqeReject> for TestCqeRejection {
+        fn from(value: CqeReject) -> Self {
+            match value {
+                CqeReject::StaleConnection => Self::StaleConnection,
+                CqeReject::StaleOperation => Self::StaleOperation,
+                CqeReject::RetiredOperation => Self::RetiredOperation,
+                CqeReject::Unknown => Self::Unknown,
+                CqeReject::Duplicate => Self::Duplicate,
+                CqeReject::WrongConnection => Self::WrongConnection,
+                CqeReject::WrongQpNum => Self::WrongQpNum,
+                CqeReject::UnexpectedOpcode => Self::UnexpectedOpcode,
+            }
+        }
     }
 
     impl TestAcceptedOperation {
@@ -695,28 +724,13 @@ pub(super) mod test_api {
     }
 
     /// Test-only identity of one engine's shared RDMA resource set.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[derive(Clone, Copy, PartialEq, Eq)]
     pub struct TestSharedResourceIdentity {
         context: usize,
         protection_domain: usize,
         completion_queue: usize,
         cm_event_channel: usize,
-        has_completion_channel: bool,
-    }
-
-    impl TestSharedResourceIdentity {
-        /// Whether every shared resource identity is present.
-        pub fn is_complete(&self) -> bool {
-            self.context != 0
-                && self.protection_domain != 0
-                && self.completion_queue != 0
-                && self.cm_event_channel != 0
-        }
-
-        /// Whether the shared CQ owns a completion channel.
-        pub fn has_completion_channel(&self) -> bool {
-            self.has_completion_channel
-        }
+        completion_channel: Option<usize>,
     }
 
     /// Read-only provider-capability projection for validation fixtures.
@@ -884,7 +898,11 @@ pub(super) mod test_api {
                 protection_domain: self.resources.pd.raw_pd().as_raw() as usize,
                 completion_queue: self.resources.cq.raw_cq().as_raw() as usize,
                 cm_event_channel: self.resources.cm_event_channel.as_raw() as usize,
-                has_completion_channel: self.resources.cq.has_channel(),
+                completion_channel: self
+                    .resources
+                    .cq
+                    .completion_channel()
+                    .map(|channel| channel.as_raw() as usize),
             })
         }
 
@@ -901,6 +919,34 @@ pub(super) mod test_api {
                 .state
                 .poster
                 .uses_resources(&self.resources.pd, &self.resources.cq))
+        }
+
+        /// Verify that the connection's exact generational CM route is live.
+        pub fn connection_route_is_live(&self, connection: &RdmaConnection) -> Result<bool> {
+            let shared = self.ensure_active()?;
+            if !Arc::ptr_eq(&shared, &connection.shared) {
+                return Ok(false);
+            }
+            let route = connection
+                .state
+                .cm_route()
+                .ok_or_else(|| Error::InvalidConfig("connection has no CM route".into()))?;
+            Ok(shared
+                .cm
+                .connection_route_is_live(route, connection.state.token))
+        }
+
+        /// Snapshot the exact rejection classes observed by CQE routing.
+        pub fn cqe_rejections(&self) -> Result<Vec<TestCqeRejection>> {
+            let shared = self.ensure_active()?;
+            Ok(shared
+                .rejected_cqe_reasons
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .copied()
+                .map(TestCqeRejection::from)
+                .collect())
         }
 
         /// Register owned test memory through the engine's shared PD.
@@ -2329,8 +2375,9 @@ pub(super) mod test_api {
 #[cfg(any(test, feature = "test-hooks"))]
 pub use test_api::{
     TestAcceptedOperation, TestAdmissionBarrier, TestConnectionCqeSuppression, TestContextIdentity,
-    TestCqArmWindowControl, TestCqeSuppression, TestEngineInstrumentation, TestEngineQp,
-    TestEngineResources, TestProviderLimits, TestRouteHandle, TestSharedResourceIdentity,
+    TestCqArmWindowControl, TestCqeRejection, TestCqeSuppression, TestEngineInstrumentation,
+    TestEngineQp, TestEngineResources, TestProviderLimits, TestRouteHandle,
+    TestSharedResourceIdentity,
 };
 
 #[cfg(test)]

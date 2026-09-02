@@ -586,6 +586,10 @@ async fn run_qp_destroy_failure_quarantine(mode: CompletionMode) {
         "failed QP destruction must retain its CM route"
     );
     assert!(
+        server_resources.connection_route_is_live(&server).unwrap(),
+        "failed QP destruction must retain the exact connection generation route"
+    );
+    assert!(
         ownership.cm_retained_owners > 0,
         "failed QP destruction must keep the owning CM ID live"
     );

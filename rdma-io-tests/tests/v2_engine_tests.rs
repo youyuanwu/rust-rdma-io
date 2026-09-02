@@ -5,12 +5,13 @@ use std::task::Poll;
 use std::time::Duration;
 
 use futures_util::future::join_all;
-use rdma_io::v2::test_support::TestSteadyFrame;
+use rdma_io::v2::test_support::TestCqeRejection;
 use rdma_io::v2::{
     AccessIntent, CompletionMode, Error, MessageTransport, MessageTransportBuilder, RdmaConnection,
     RdmaEngine, RdmaEngineBuilder, RdmaListenerConfig,
 };
 use rdma_io::wc::WcOpcode;
+use rdma_io_tests::engine_test_helpers::{peer_credit_frame, send_peer_frame};
 use rdma_io_tests::test_helpers::{connect_addr_for, has_software_rdma};
 
 fn software_device_name() -> Option<String> {
@@ -281,10 +282,13 @@ async fn run_mode(mode: CompletionMode) {
     let shared = engine.diagnostics();
     assert_eq!(shared.live_connections, 18);
     let shared_resources = resources.shared_resource_identity().unwrap();
-    assert!(shared_resources.is_complete());
-    assert_eq!(
-        shared_resources.has_completion_channel(),
-        mode == CompletionMode::Readiness
+    assert!(
+        shared_resources
+            == engine
+                .test_resources()
+                .unwrap()
+                .shared_resource_identity()
+                .unwrap()
     );
     assert!(
         resources
@@ -324,7 +328,8 @@ async fn run_mode(mode: CompletionMode) {
     ));
     assert_clean(pairs[3].0.close().await);
 
-    let _ = pairs[4].1.test_send_frame(TestSteadyFrame::Credit(0)).await;
+    let malformed_peer = pairs[4].1.test_connection().unwrap();
+    let _ = send_peer_frame(&malformed_peer, &peer_credit_frame(0)).await;
     assert!(matches!(
         pairs[4].0.recv().await,
         Err(Error::ProtocolViolation(message)) if message.contains("zero credits")
@@ -350,6 +355,7 @@ async fn run_mode(mode: CompletionMode) {
     held.wait_observed().await.unwrap();
     let identity = held.completion().unwrap();
     let rejected_before = resources.instrumentation().unwrap().cqes_rejected;
+    let rejection_classes_before = resources.cqe_rejections().unwrap().len();
     resources
         .inject_completion(
             identity.wr_id().wrapping_add(1_u64 << 32),
@@ -370,6 +376,15 @@ async fn run_mode(mode: CompletionMode) {
         resources.instrumentation().unwrap().cqes_rejected,
         rejected_before + 4
     );
+    assert_eq!(
+        &resources.cqe_rejections().unwrap()[rejection_classes_before..],
+        &[
+            TestCqeRejection::StaleOperation,
+            TestCqeRejection::Unknown,
+            TestCqeRejection::WrongQpNum,
+            TestCqeRejection::UnexpectedOpcode,
+        ]
+    );
     held.release().unwrap();
     stale_sender.await.unwrap().unwrap();
     let stale_safe = pairs[5].0.recv().await.unwrap();
@@ -381,6 +396,10 @@ async fn run_mode(mode: CompletionMode) {
     assert_eq!(
         resources.instrumentation().unwrap().cqes_rejected,
         rejected_before + 5
+    );
+    assert_eq!(
+        resources.cqe_rejections().unwrap().last(),
+        Some(&TestCqeRejection::Duplicate)
     );
 
     for index in [5_usize, 6, 7] {

@@ -488,6 +488,33 @@ impl CmState {
         routed_owners.max(setup_rollback_quarantines)
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(super) fn connection_route_is_live(
+        &self,
+        route: ConnectionCmRoute,
+        connection: ConnectionToken,
+    ) -> bool {
+        let token = match route {
+            ConnectionCmRoute::Outbound(encoded) | ConnectionCmRoute::Inbound(encoded) => {
+                CmRouteToken::decode(encoded)
+            }
+        };
+        match route {
+            ConnectionCmRoute::Outbound(_) => {
+                let Lookup::Occupied(route) = self.routes.lookup_cloned(token) else {
+                    return false;
+                };
+                lock_unpoison(&route.state).references_connection(connection)
+            }
+            ConnectionCmRoute::Inbound(_) => {
+                let Lookup::Occupied(route) = self.inbound_routes.lookup_cloned(token) else {
+                    return false;
+                };
+                lock_unpoison(&route.state).references_connection(connection)
+            }
+        }
+    }
+
     pub(super) fn service_cm_destructions(
         &self,
         shared: &Arc<EngineShared>,
@@ -1415,6 +1442,21 @@ impl CmState {
         if !connection.try_begin_retirement() {
             return Ok(());
         }
+        let lifecycle = connection.lock_lifecycle();
+        let qp_boundary = connection.establish_qp_destruction_boundary(&lifecycle);
+        drop(lifecycle);
+        if let Err(error) = qp_boundary {
+            tracing::warn!(
+                slot = connection.token.slot,
+                generation = connection.token.generation,
+                qp_num = connection.qp_num(),
+                %error,
+                "connection QP destroy failed; retaining CM route and ownership bundle"
+            );
+            shared.track_connection_quarantine(connection.token);
+            connection.publish_destroy_quarantine(&error, || {});
+            return Ok(());
+        }
         let retirement = match connection.cm_route() {
             Some(ConnectionCmRoute::Outbound(encoded)) => {
                 self.retire_outbound_connection_route(encoded, &connection)?
@@ -1443,7 +1485,7 @@ impl CmState {
                     generation = connection.token.generation,
                     qp_num = connection.qp_num(),
                     %error,
-                    "connection QP destroy failed; retaining terminal quarantine"
+                    "connection resource finalization failed; retaining terminal quarantine"
                 );
                 shared.track_connection_quarantine(connection.token);
                 connection.publish_destroy_quarantine(&error, || {});
@@ -3849,6 +3891,9 @@ mod tests {
         )
         .unwrap();
         drop(admission);
+        // This scheduler-only fixture has no real QP, so record its synthetic
+        // destruction boundary before exercising route-state retry behavior.
+        connection.state.mark_qp_destroyed();
 
         engine.shared.cm.enqueue_retirement(connection.state.token);
         let processed = engine
@@ -3933,7 +3978,6 @@ mod tests {
                 .to_string()
                 .contains("lost connection state before accept retirement")
         );
-        assert_eq!(listener.queue_counts().2, 0);
         assert!(matches!(
             engine.shared.cm.inbound_routes.lookup_cloned(route_token),
             Lookup::Duplicate
@@ -4162,7 +4206,6 @@ mod tests {
             panic!("inbound accept must fail before propagation");
         };
         assert!(request_error.to_string().contains(expected));
-        assert_eq!(listener.queue_counts().2, 0);
         let mut close = Box::pin(connection.close());
         let mut cx = Context::from_waker(std::task::Waker::noop());
         let Poll::Ready(Err(close_error)) = close.as_mut().poll(&mut cx) else {

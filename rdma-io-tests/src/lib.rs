@@ -562,8 +562,8 @@ pub mod engine_test_helpers {
     use rdma_io::cm::ConnParam;
     use rdma_io::v2::test_support::{TestEngineInstrumentation, TestEngineQp, TestEngineResources};
     use rdma_io::v2::{
-        Error, MessageTransport, MessageTransportBuilder, MessageTransportDriver, RdmaEngine,
-        RdmaListener, RdmaListenerConfig, Result,
+        AccessIntent, Error, MessageTransport, MessageTransportBuilder, MessageTransportDriver,
+        RdmaConnection, RdmaEngine, RdmaListener, RdmaListenerConfig, Result,
     };
 
     use crate::test_helpers::{
@@ -577,6 +577,52 @@ pub mod engine_test_helpers {
     const V2_SETUP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
     const V2_SETUP_CLEANUP_MIN_BACKOFF: Duration = Duration::from_millis(1);
     const V2_SETUP_CLEANUP_MAX_BACKOFF: Duration = Duration::from_millis(10);
+    const MESSAGE_MAGIC: u32 = 0x5244_4d41;
+    const MESSAGE_VERSION: u8 = 1;
+    const MESSAGE_HEADER_SIZE: usize = 12;
+    const MESSAGE_FRAME_DATA: u8 = 0;
+    const MESSAGE_FRAME_CREDIT: u8 = 1;
+    const MESSAGE_FRAME_HELLO: u8 = 2;
+
+    fn peer_message_frame(frame_type: u8, payload: &[u8]) -> Vec<u8> {
+        let mut frame = vec![0; MESSAGE_HEADER_SIZE + payload.len()];
+        frame[0..4].copy_from_slice(&MESSAGE_MAGIC.to_le_bytes());
+        frame[4] = MESSAGE_VERSION;
+        frame[5] = frame_type;
+        frame[8..12].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame[MESSAGE_HEADER_SIZE..].copy_from_slice(payload);
+        frame
+    }
+
+    /// Encode a HELLO as an independent wire peer rather than mutating the
+    /// message transport's production framing path.
+    pub fn peer_hello_frame(data_recv_capacity: u32, max_message_size: u32) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(12);
+        payload.extend_from_slice(&data_recv_capacity.to_le_bytes());
+        payload.extend_from_slice(&max_message_size.to_le_bytes());
+        payload.extend_from_slice(&(MESSAGE_VERSION as u32).to_le_bytes());
+        peer_message_frame(MESSAGE_FRAME_HELLO, &payload)
+    }
+
+    /// Encode a CREDIT frame as an independent wire peer.
+    pub fn peer_credit_frame(credits: u32) -> Vec<u8> {
+        peer_message_frame(MESSAGE_FRAME_CREDIT, &credits.to_le_bytes())
+    }
+
+    /// Encode a DATA frame as an independent wire peer.
+    pub fn peer_data_frame(payload: &[u8]) -> Vec<u8> {
+        peer_message_frame(MESSAGE_FRAME_DATA, payload)
+    }
+
+    /// Send one independently encoded message-protocol frame through the
+    /// low-level connection underlying a test peer.
+    pub async fn send_peer_frame(connection: &RdmaConnection, frame: &[u8]) -> Result<()> {
+        let mut mr = connection.register_memory(frame.len(), AccessIntent::LocalOnly)?;
+        mr.as_mut_slice().copy_from_slice(frame);
+        let (result, mr) = connection.send(mr, None).await;
+        drop(mr);
+        result.map(|_| ())
+    }
 
     #[derive(Debug)]
     struct ExhaustedV2SetupRetries {

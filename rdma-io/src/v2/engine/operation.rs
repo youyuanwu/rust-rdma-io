@@ -21,10 +21,11 @@ use crate::v2::qp::BatchPostOutcome;
 use crate::wc::{WcOpcode, WorkCompletion};
 use crate::wr::{PreparedRecvBatch, PreparedSendBatch, RecvWr, SendFlags, SendWr, Sge, WrOpcode};
 
-#[derive(Clone, Copy)]
-enum CqeReject {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CqeReject {
     StaleConnection,
     StaleOperation,
+    RetiredOperation,
     Unknown,
     Duplicate,
     WrongConnection,
@@ -1304,9 +1305,14 @@ impl ValidatedOperation {
 }
 
 impl EngineShared {
-    fn reject_cqe(&self, _reason: CqeReject) {
+    fn reject_cqe(&self, reason: CqeReject) {
         #[cfg(any(test, feature = "test-hooks"))]
-        self.rejected_cqes.fetch_add(1, Ordering::Relaxed);
+        {
+            self.rejected_cqes.fetch_add(1, Ordering::Relaxed);
+            lock_unpoison(&self.rejected_cqe_reasons).push(reason);
+        }
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        let _ = reason;
     }
 
     pub(super) fn enqueue_completion(&self, completion: WorkCompletion) -> Option<ConnectionToken> {
@@ -1318,8 +1324,12 @@ impl EngineShared {
                 self.reject_cqe(CqeReject::Duplicate);
                 return None;
             }
-            Lookup::Stale | Lookup::Retired => {
+            Lookup::Stale => {
                 self.reject_cqe(CqeReject::StaleOperation);
+                return None;
+            }
+            Lookup::Retired => {
+                self.reject_cqe(CqeReject::RetiredOperation);
                 return None;
             }
             Lookup::Unknown => {
@@ -1379,8 +1389,12 @@ impl EngineShared {
                 self.reject_cqe(CqeReject::Duplicate);
                 return None;
             }
-            Lookup::Stale | Lookup::Retired => {
+            Lookup::Stale => {
                 self.reject_cqe(CqeReject::StaleOperation);
+                return None;
+            }
+            Lookup::Retired => {
+                self.reject_cqe(CqeReject::RetiredOperation);
                 return None;
             }
             Lookup::Unknown => {
@@ -1617,7 +1631,8 @@ mod tests {
     use crate::v2::engine::config::EngineConfig;
     use crate::v2::engine::connection::{WorkRequestPoster, install_connection};
     use crate::v2::engine::lifecycle::MemoizedTerminalResult;
-    use rdma_io_sys::ibverbs::{IBV_WC_RECV, IBV_WC_SEND, IBV_WC_SUCCESS};
+    use crate::wc::WcStatus;
+    use rdma_io_sys::ibverbs::{IBV_WC_FATAL_ERR, IBV_WC_RECV, IBV_WC_SEND, IBV_WC_SUCCESS};
     use std::sync::Barrier;
     use std::sync::Weak;
 
@@ -1818,7 +1833,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_routing_rejects_unknown_stale_duplicate_qp_and_opcode_classes() {
+    fn exact_routing_rejects_invalid_classes_and_delivers_fatal_statuses() {
         let shared = synthetic_engine(8);
         let first = synthetic_connection_on(&shared, 7);
         let exact = install_accepted(&shared, &first.state, WcOpcode::Send);
@@ -1829,14 +1844,25 @@ mod tests {
             (1, false)
         );
 
-        let fatal = install_accepted(&shared, &first.state, WcOpcode::Send);
-        let mut fatal_wc = wc(fatal, 7, IBV_WC_SEND);
-        fatal_wc.inner.status = u32::MAX;
-        assert_eq!(shared.enqueue_completion(fatal_wc), Some(first.state.token));
-        assert_eq!(
-            shared.dispatch_connection_completions(first.state.token, 1),
-            (1, false)
-        );
+        for (raw_status, expected_status) in [
+            (IBV_WC_FATAL_ERR, WcStatus::FatalErr),
+            (u32::MAX, WcStatus::Unknown(u32::MAX)),
+        ] {
+            let (fatal, observed) =
+                install_accepted_with_result(&shared, &first.state, WcOpcode::Send);
+            let mut fatal_wc = wc(fatal, 7, IBV_WC_SEND);
+            fatal_wc.inner.status = raw_status;
+            assert_eq!(shared.enqueue_completion(fatal_wc), Some(first.state.token));
+            assert_eq!(
+                shared.dispatch_connection_completions(first.state.token, 1),
+                (1, false)
+            );
+            assert!(matches!(
+                lock_unpoison(&observed).as_ref(),
+                Some(Err(Error::CompletionError { status, vendor_err: 0 }))
+                    if *status == expected_status
+            ));
+        }
         assert_eq!(shared.rejected_cqes.load(Ordering::Acquire), 0);
 
         assert!(shared.enqueue_completion(exact_wc).is_none());
@@ -1886,6 +1912,35 @@ mod tests {
                 .is_none()
         );
 
+        let (retired, _) = shared
+            .operations
+            .allocate(|token| {
+                Arc::new(OperationState::new(
+                    token,
+                    Arc::clone(&first.state),
+                    Direction::Send,
+                    WcOpcode::Send,
+                    None,
+                    1,
+                ))
+            })
+            .unwrap();
+        let retired = shared
+            .operations
+            .slots
+            .force_generation_for_test(retired, u32::MAX);
+        shared.operations.release(retired, false).unwrap();
+        assert!(matches!(shared.operations.lookup(retired), Lookup::Retired));
+        assert!(
+            shared
+                .enqueue_completion(wc(retired, 7, IBV_WC_SEND))
+                .is_none()
+        );
+        assert_eq!(
+            lock_unpoison(&shared.rejected_cqe_reasons).last(),
+            Some(&CqeReject::RetiredOperation)
+        );
+
         let second = synthetic_connection_on(&shared, 8);
         let wrong_connection = install_accepted(&shared, &first.state, WcOpcode::Send);
         shared
@@ -1907,7 +1962,10 @@ mod tests {
                 .is_none()
         );
 
-        assert_eq!(shared.rejected_cqes.load(Ordering::Acquire), 7);
+        assert_eq!(shared.rejected_cqes.load(Ordering::Acquire), 8);
+        let rejection_reasons = lock_unpoison(&shared.rejected_cqe_reasons);
+        assert!(rejection_reasons.contains(&CqeReject::StaleOperation));
+        assert!(rejection_reasons.contains(&CqeReject::RetiredOperation));
     }
 
     #[test]
@@ -2874,6 +2932,46 @@ mod tests {
         operation.commit_accepted();
         shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
         token
+    }
+
+    fn install_accepted_with_result(
+        shared: &Arc<EngineShared>,
+        connection: &Arc<ConnectionState>,
+        opcode: WcOpcode,
+    ) -> (OperationToken, Arc<Mutex<Option<Result<Completion>>>>) {
+        let direction = match opcode {
+            WcOpcode::Recv => Direction::Recv,
+            _ => Direction::Send,
+        };
+        connection.reserve_local(direction).unwrap();
+        assert!(shared.cq_credits.reserve());
+        let observed = Arc::new(Mutex::new(None));
+        let callback_observed = Arc::clone(&observed);
+        let (token, operation) = shared
+            .operations
+            .allocate(|token| {
+                Arc::new(OperationState::new_with_callback(
+                    token,
+                    Arc::clone(connection),
+                    direction,
+                    opcode,
+                    None,
+                    1,
+                    Some(Box::new(move |completion| {
+                        let DetachedOperationCompletion::Completed { result, mr } = completion
+                        else {
+                            panic!("accepted completion cannot become unaccepted")
+                        };
+                        assert!(mr.is_none());
+                        *lock_unpoison(&callback_observed) = Some(result);
+                        None
+                    })),
+                ))
+            })
+            .unwrap();
+        operation.commit_accepted();
+        shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
+        (token, observed)
     }
 
     fn wc(token: OperationToken, qp_num: u32, opcode: u32) -> WorkCompletion {

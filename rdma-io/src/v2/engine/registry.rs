@@ -322,7 +322,7 @@ impl<K: RegistryToken, T> PagedRegistry<K, T> {
     }
 
     #[cfg(test)]
-    fn force_generation_for_test(&self, token: K, generation: u32) -> K {
+    pub(super) fn force_generation_for_test(&self, token: K, generation: u32) -> K {
         let mut inner = lock_unpoison(&self.inner);
         let entry = self.slot_mut(&mut inner, token.slot(), false).unwrap();
         assert_eq!(entry.generation, token.generation());

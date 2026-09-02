@@ -4,13 +4,14 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use rdma_io::cm::RdmaCmDeviceList;
-use rdma_io::v2::test_support::TestHelloOverride;
 use rdma_io::v2::{
     CompletionMode, Error, MessageTransport, MessageTransportBuilder, MessageTransportDriver,
     RdmaConnectionConfig, RdmaEngine, RdmaEngineBuilder, RdmaEngineDriver, RdmaListener,
     RdmaListenerConfig, Result,
 };
-use rdma_io_tests::engine_test_helpers::DrivenMessageTransport;
+use rdma_io_tests::engine_test_helpers::{
+    DrivenMessageTransport, peer_hello_frame, send_peer_frame,
+};
 use rdma_io_tests::test_helpers::{connect_addr_for, has_software_rdma};
 
 fn software_device_name() -> Option<String> {
@@ -183,14 +184,6 @@ async fn run_cancelled_accept(mode: CompletionMode) {
     assert!(poll_once(cancelled.as_mut()).is_pending());
     drop(cancelled);
 
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while listener.test_queue_counts().1 != 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("cancelled message accept remained registered");
-
     let address = connect_addr_for(Some(listener.local_addr().unwrap()));
     let (server, client) = tokio::time::timeout(Duration::from_secs(15), async {
         tokio::join!(
@@ -229,31 +222,32 @@ async fn run_malformed_hello(mode: CompletionMode) {
     let (client_engine, client_driver) = build_engine(mode).await;
     let listener = listen(&server_engine).await;
     let address = connect_addr_for(Some(listener.local_addr().unwrap()));
-    for (hello_override, expected) in [
-        (TestHelloOverride::BadMagic, "bad magic"),
-        (TestHelloOverride::BadVersion, "unsupported version"),
-        (TestHelloOverride::WrongFrameType, "expected HELLO"),
-        (
-            TestHelloOverride::ZeroReceiveCredits,
-            "data_recv_capacity is 0",
-        ),
-        (
-            TestHelloOverride::SmallerMaximumMessage,
-            "peer max_message_size",
-        ),
+    let mut bad_magic = peer_hello_frame(32, 64 * 1024);
+    bad_magic[0] ^= 0xff;
+    let mut bad_version = peer_hello_frame(32, 64 * 1024);
+    bad_version[4] = 2;
+    let mut wrong_type = peer_hello_frame(32, 64 * 1024);
+    wrong_type[5] = 0;
+    for (frame, expected) in [
+        (bad_magic, "bad magic"),
+        (bad_version, "unsupported version"),
+        (wrong_type, "expected HELLO"),
+        (peer_hello_frame(0, 64 * 1024), "data_recv_capacity is 0"),
+        (peer_hello_frame(32, 64 * 1024 - 1), "peer max_message_size"),
     ] {
         let (server, client) = tokio::time::timeout(Duration::from_secs(15), async {
             tokio::join!(
                 MessageTransportBuilder::new().accept_on(&listener),
-                MessageTransportBuilder::new()
-                    .test_hello_override(hello_override)
-                    .connect_on(&client_engine, address)
+                MessageTransportBuilder::new().connect_on(&client_engine, address)
             )
         })
         .await
         .expect("malformed HELLO connection establishment timed out");
-        let server = drive(server.unwrap());
-        let client = drive(client.unwrap());
+        let (server, server_message_driver) = server.unwrap();
+        let (client, client_message_driver) = client.unwrap();
+        let peer = client.test_connection().unwrap();
+        let server = DrivenMessageTransport::new(server, server_message_driver);
+        send_peer_frame(&peer, &frame).await.unwrap();
         let error = tokio::time::timeout(Duration::from_secs(15), server.ready())
             .await
             .expect("malformed HELLO did not resolve readiness")
@@ -262,19 +256,17 @@ async fn run_malformed_hello(mode: CompletionMode) {
             error,
             Error::ProtocolViolation(message) if message.contains(expected)
         ));
-        let (server_close, client_close) = tokio::time::timeout(Duration::from_secs(15), async {
-            tokio::join!(server.close(), client.close())
-        })
-        .await
-        .expect("malformed message close timed out");
+        let server_close = tokio::time::timeout(Duration::from_secs(15), server.shutdown())
+            .await
+            .expect("malformed server shutdown timed out");
         assert!(
             matches!(server_close, Err(Error::ProtocolViolation(_))),
             "unexpected malformed server close: {server_close:?}"
         );
-        assert!(
-            matches!(client_close, Ok(()) | Err(Error::TransportClosed)),
-            "unexpected malformed client close: {client_close:?}"
-        );
+        drop(client_message_driver);
+        let _ = client.close().await;
+        drop(peer);
+        drop(client);
     }
     listener.close().await.unwrap();
     server_engine.shutdown().await.unwrap();
@@ -294,29 +286,17 @@ async fn run_mixed_accept_order(mode: CompletionMode) {
     let first_address = connect_addr_for(Some(first.local_addr().unwrap()));
     let second_address = connect_addr_for(Some(second.local_addr().unwrap()));
 
-    let first_default = first.clone();
-    let default_accept = tokio::spawn(async move { first_default.accept().await });
-    wait_pending_accepts(&first, 1).await;
-    let first_configured = first.clone();
+    let mut default_accept = Box::pin(first.accept());
+    assert!(poll_once(default_accept.as_mut()).is_pending());
     let configured = RdmaConnectionConfig::default()
         .max_send_wr(8)
         .max_recv_wr(8);
-    let configured_accept = tokio::spawn(async move {
-        first_configured
-            .accept_with_config(configured.clone())
-            .await
-    });
-    wait_pending_accepts(&first, 2).await;
-    let first_message = first.clone();
-    let message_accept = tokio::spawn(async move {
-        MessageTransportBuilder::new()
-            .accept_on(&first_message)
-            .await
-    });
-    wait_pending_accepts(&first, 3).await;
-    let second_default = second.clone();
-    let independent_accept = tokio::spawn(async move { second_default.accept().await });
-    wait_pending_accepts(&second, 1).await;
+    let mut configured_accept = Box::pin(first.accept_with_config(configured.clone()));
+    assert!(poll_once(configured_accept.as_mut()).is_pending());
+    let mut message_accept = Box::pin(MessageTransportBuilder::new().accept_on(&first));
+    assert!(poll_once(message_accept.as_mut()).is_pending());
+    let mut independent_accept = Box::pin(second.accept());
+    assert!(poll_once(independent_accept.as_mut()).is_pending());
 
     let independent_client = tokio::time::timeout(
         Duration::from_secs(15),
@@ -325,14 +305,14 @@ async fn run_mixed_accept_order(mode: CompletionMode) {
     .await
     .expect("independent listener client timed out")
     .unwrap();
-    let independent_server = tokio::time::timeout(Duration::from_secs(15), independent_accept)
-        .await
-        .expect("independent listener accept timed out")
-        .unwrap()
-        .unwrap();
-    assert!(!default_accept.is_finished());
-    assert!(!configured_accept.is_finished());
-    assert!(!message_accept.is_finished());
+    let independent_server =
+        tokio::time::timeout(Duration::from_secs(15), independent_accept.as_mut())
+            .await
+            .expect("independent listener accept timed out")
+            .unwrap();
+    assert!(poll_once(default_accept.as_mut()).is_pending());
+    assert!(poll_once(configured_accept.as_mut()).is_pending());
+    assert!(poll_once(message_accept.as_mut()).is_pending());
 
     let default_client = tokio::time::timeout(
         Duration::from_secs(15),
@@ -341,13 +321,12 @@ async fn run_mixed_accept_order(mode: CompletionMode) {
     .await
     .expect("default mixed client timed out")
     .unwrap();
-    let default_server = tokio::time::timeout(Duration::from_secs(15), default_accept)
+    let default_server = tokio::time::timeout(Duration::from_secs(15), default_accept.as_mut())
         .await
         .expect("default mixed accept timed out")
-        .unwrap()
         .unwrap();
-    assert!(!configured_accept.is_finished());
-    assert!(!message_accept.is_finished());
+    assert!(poll_once(configured_accept.as_mut()).is_pending());
+    assert!(poll_once(message_accept.as_mut()).is_pending());
 
     let configured = RdmaConnectionConfig::default()
         .max_send_wr(8)
@@ -360,14 +339,14 @@ async fn run_mixed_accept_order(mode: CompletionMode) {
     .expect("configured mixed client timed out")
     .unwrap();
     let configured_server =
-        match tokio::time::timeout(Duration::from_secs(15), configured_accept).await {
-            Ok(result) => result.unwrap().unwrap(),
+        match tokio::time::timeout(Duration::from_secs(15), configured_accept.as_mut()).await {
+            Ok(result) => result.unwrap(),
             Err(_) => panic!(
                 "configured mixed accept timed out: {:?}",
                 server_engine.diagnostics()
             ),
         };
-    assert!(!message_accept.is_finished());
+    assert!(poll_once(message_accept.as_mut()).is_pending());
 
     let message_client = tokio::time::timeout(
         Duration::from_secs(15),
@@ -376,10 +355,9 @@ async fn run_mixed_accept_order(mode: CompletionMode) {
     .await
     .expect("mixed message client timed out")
     .unwrap();
-    let message_server = tokio::time::timeout(Duration::from_secs(15), message_accept)
+    let message_server = tokio::time::timeout(Duration::from_secs(15), message_accept.as_mut())
         .await
         .expect("mixed message accept timed out")
-        .unwrap()
         .unwrap();
     let message_client = drive(message_client);
     let message_server = drive(message_server);
@@ -527,16 +505,6 @@ async fn run_message_driver_hello_timeout(mode: CompletionMode) {
     client_engine.shutdown().await.unwrap();
     server_engine_driver.await.unwrap().unwrap();
     client_engine_driver.await.unwrap().unwrap();
-}
-
-async fn wait_pending_accepts(listener: &RdmaListener, expected: usize) {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while listener.test_queue_counts().1 != expected {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("expected {expected} pending accept waiters"));
 }
 
 fn assert_clean_or_disconnected(result: Result<()>) {

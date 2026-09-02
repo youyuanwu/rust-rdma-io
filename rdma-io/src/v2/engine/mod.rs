@@ -67,8 +67,9 @@ pub(crate) use driver::preflight_driver_runtime;
 #[doc(hidden)]
 pub use driver::{
     TestAcceptedOperation, TestAdmissionBarrier, TestConnectionCqeSuppression, TestContextIdentity,
-    TestCqArmWindowControl, TestCqeSuppression, TestEngineInstrumentation, TestEngineQp,
-    TestEngineResources, TestProviderLimits, TestRouteHandle, TestSharedResourceIdentity,
+    TestCqArmWindowControl, TestCqeRejection, TestCqeSuppression, TestEngineInstrumentation,
+    TestEngineQp, TestEngineResources, TestProviderLimits, TestRouteHandle,
+    TestSharedResourceIdentity,
 };
 use lifecycle::MemoizedTerminalResult;
 pub use listener::{RdmaListener, RdmaListenerConfig};
@@ -428,6 +429,8 @@ pub(crate) struct EngineShared {
     #[cfg(any(test, feature = "test-hooks"))]
     rejected_cqes: AtomicU64,
     #[cfg(any(test, feature = "test-hooks"))]
+    rejected_cqe_reasons: Mutex<Vec<operation::CqeReject>>,
+    #[cfg(any(test, feature = "test-hooks"))]
     rejected_cm_events: AtomicU64,
     accepted_operations: AtomicUsize,
     pending_reclamations: AtomicUsize,
@@ -497,6 +500,8 @@ impl EngineShared {
             cq_credits,
             #[cfg(any(test, feature = "test-hooks"))]
             rejected_cqes: AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
+            rejected_cqe_reasons: Mutex::new(Vec::new()),
             #[cfg(any(test, feature = "test-hooks"))]
             rejected_cm_events: AtomicU64::new(0),
             accepted_operations: AtomicUsize::new(0),

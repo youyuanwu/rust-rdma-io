@@ -5,14 +5,15 @@ use std::time::Duration;
 use std::{collections::HashSet, iter};
 
 use rdma_io::cm::RdmaCmDeviceList;
-use rdma_io::v2::test_support::{DestructionKind, DestructionRecorder, TestSteadyFrame};
+use rdma_io::v2::test_support::{DestructionKind, DestructionRecorder};
 use rdma_io::v2::{
     CompletionMode, Error, MessageTransportBuilder, RdmaEngine, RdmaEngineBuilder, RdmaListener,
     Result,
 };
 use rdma_io::wc::WcOpcode;
 use rdma_io_tests::engine_test_helpers::{
-    DrivenMessageTransport, establish_message_pair_with_retry,
+    DrivenMessageTransport, establish_message_pair_with_retry, peer_credit_frame, peer_data_frame,
+    peer_hello_frame, send_peer_frame,
 };
 use rdma_io_tests::test_helpers::has_software_rdma;
 
@@ -255,26 +256,30 @@ async fn run_held_repost(mode: CompletionMode) {
 }
 
 async fn run_malformed_frames(mode: CompletionMode) {
+    let mut bad_magic = peer_data_frame(b"x");
+    bad_magic[0] ^= 0xff;
+    let mut trailing_data = peer_data_frame(b"");
+    trailing_data.push(0xff);
+    let mut truncated_data = peer_data_frame(b"x");
+    truncated_data[8..12].copy_from_slice(&2u32.to_le_bytes());
     for (frame, expected) in [
-        (TestSteadyFrame::Credit(0), "zero credits"),
-        (TestSteadyFrame::Credit(1), "exceeds in-flight"),
+        (peer_credit_frame(0), "zero credits"),
+        (peer_credit_frame(1), "exceeds in-flight"),
         (
-            TestSteadyFrame::Hello,
+            peer_hello_frame(4, 1024),
             "unexpected HELLO frame during steady-state",
         ),
-        (TestSteadyFrame::BadMagicData, "bad magic"),
-        (TestSteadyFrame::TrailingDataByte, "trailing bytes"),
-        (
-            TestSteadyFrame::TruncatedDataPayload,
-            "payload extends past received data",
-        ),
+        (bad_magic, "bad magic"),
+        (trailing_data, "trailing bytes"),
+        (truncated_data, "payload extends past received data"),
     ] {
         let (server_engine, server_driver) = build_engine(mode, 2, Duration::from_secs(5));
         let (client_engine, client_driver) = build_engine(mode, 2, Duration::from_secs(5));
         let (listener, server, client) =
             establish_on(&server_engine, &client_engine, MessageConfig::default()).await;
 
-        let _ = client.test_send_frame(frame).await;
+        let peer = client.test_connection().unwrap();
+        let _ = send_peer_frame(&peer, &frame).await;
         let error = tokio::time::timeout(Duration::from_secs(10), server.recv())
             .await
             .expect("malformed frame did not wake recv")
@@ -544,9 +549,8 @@ async fn run_fairness_and_independent_close(mode: CompletionMode) {
     hot_sender.await.unwrap();
     hot_receiver.await.unwrap();
 
-    let _ = first_client
-        .test_send_frame(TestSteadyFrame::Credit(0))
-        .await;
+    let first_peer = first_client.test_connection().unwrap();
+    let _ = send_peer_frame(&first_peer, &peer_credit_frame(0)).await;
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(10), first_server.recv())
             .await

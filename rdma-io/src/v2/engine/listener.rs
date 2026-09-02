@@ -153,12 +153,6 @@ impl RdmaListener {
         config.validate(&self.shared.config, self.shared.provider.as_ref())
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[doc(hidden)]
-    pub fn test_queue_counts(&self) -> (usize, usize, usize) {
-        self.state.queue_counts()
-    }
-
     /// Close the listener and wait for CM destruction or engine termination.
     ///
     /// Close is idempotent across clones. If the engine driver fails while the
@@ -971,20 +965,6 @@ impl ListenerState {
             .clone()
             .map(MemoizedTerminalResult::into_result)
     }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn queue_counts(&self) -> (usize, usize, usize) {
-        queue_counts(&lock_unpoison(&self.queues))
-    }
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-fn queue_counts(queues: &ListenerQueues) -> (usize, usize, usize) {
-    (
-        queues.children.len(),
-        queues.waiters.len(),
-        usize::from(queues.selected.is_some()),
-    )
 }
 
 fn select_pair(queues: &mut ListenerQueues) {
@@ -1165,10 +1145,10 @@ mod tests {
         ));
         request.set_route_token(42);
         listener.route_selected(&request, 42).unwrap();
-        assert_eq!(listener.queue_counts().2, 1);
+        assert!(lock_unpoison(&listener.queues).selected.is_some());
 
         engine.shared.cm.mark_accept_delivered(&listener, &request);
-        assert_eq!(listener.queue_counts().2, 0);
+        assert!(lock_unpoison(&listener.queues).selected.is_none());
 
         drop(engine);
         drop(driver);
@@ -1226,16 +1206,16 @@ mod tests {
                 Some((_, InboundRejectReason::BacklogFull))
             ));
         }
-        assert_eq!(first.queue_counts(), (2, 0, 0));
-        assert_eq!(second.queue_counts(), (2, 0, 0));
-
         let first_waiter = request();
         first.register_waiter(Arc::clone(&first_waiter)).unwrap();
         assert!(matches!(
             first.next_action(),
             ListenerAction::ProcessSelected { .. }
         ));
-        assert_eq!(second.queue_counts(), (2, 0, 0));
+        assert!(matches!(
+            second.admit_child(IncomingChild::test_only()).rejected,
+            Some((_, InboundRejectReason::BacklogFull))
+        ));
     }
 
     #[test]
