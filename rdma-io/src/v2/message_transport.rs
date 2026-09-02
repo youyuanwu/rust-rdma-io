@@ -2620,6 +2620,32 @@ mod tests {
         assert!(matches!(state.terminal_error(), Error::TransportClosed));
     }
 
+    #[test]
+    fn unknown_completion_status_fails_the_message_connection_closed() {
+        let state = engine_state();
+        state.state.store(STATE_READY, Ordering::Release);
+        state.enqueue_event(EngineMessageEvent::Receive(
+            DetachedOperationCompletion::Completed {
+                result: Err(Error::CompletionError {
+                    status: crate::wc::WcStatus::Unknown(u32::MAX),
+                    vendor_err: 7,
+                }),
+                mr: None,
+            },
+        ));
+
+        let mut prefer_credit = false;
+        assert_eq!(state.process(1, &mut prefer_credit), 1);
+        assert_eq!(state.state.load(Ordering::Acquire), STATE_FAILED);
+        assert!(matches!(
+            state.terminal_error(),
+            Error::CompletionError {
+                status: crate::wc::WcStatus::Unknown(u32::MAX),
+                vendor_err: 7
+            }
+        ));
+    }
+
     // ── Credit Validation Unit Tests ──────────────────────────────────
     //
     // All credit tests exercise the production `check_credit_return()`

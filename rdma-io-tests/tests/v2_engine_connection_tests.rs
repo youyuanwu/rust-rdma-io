@@ -1,17 +1,17 @@
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use rdma_io::cm::{ConnParam, RdmaCmDeviceList};
+use rdma_io::cm::{CmEventType, ConnParam, RdmaCmDeviceList};
 use rdma_io::v2::test_support::{DestructionKind, DestructionRecorder, TestEngineResources};
 use rdma_io::v2::{
     AccessIntent, CompletionMode, Error, RdmaConnection, RdmaConnectionConfig, RdmaEngine,
     RdmaEngineBuilder, RdmaEngineLifecycle,
 };
-use rdma_io_tests::test_helpers::{
-    bind_listener_with_retry, connect_addr_for, has_software_rdma, local_ip,
-};
+use rdma_io_tests::test_helpers::{bind_listener_with_retry, connect_addr_for, has_software_rdma};
 
 fn software_device_name() -> Option<String> {
     let list = RdmaCmDeviceList::new().ok()?;
@@ -322,99 +322,85 @@ async fn run_over_budget_failed_connects(mode: CompletionMode) {
     driver_task.await.unwrap().unwrap();
 }
 
-fn unresolved_neighbor_addr() -> std::net::SocketAddr {
-    let mut octets = local_ip()
-        .parse::<std::net::Ipv4Addr>()
-        .expect("software RDMA test address must be IPv4")
-        .octets();
-    octets[3] = if octets[3] == 250 { 251 } else { 250 };
-    std::net::SocketAddr::from((std::net::Ipv4Addr::from(octets), 9))
-}
-
-async fn run_readiness_shutdown_after_addr_error() {
-    if !has_software_rdma() {
-        return;
+async fn run_shutdown_with_undelivered_connect(mode: CompletionMode) {
+    struct WakeCounter(AtomicUsize);
+    impl futures_util::task::ArcWake for WakeCounter {
+        fn wake_by_ref(arc_self: &Arc<Self>) {
+            arc_self.0.fetch_add(1, Ordering::AcqRel);
+        }
     }
-    let device = software_device_name().expect("software RDMA device");
-    let (engine, mut driver) = RdmaEngineBuilder::new(device)
-        .completion_mode(CompletionMode::Readiness)
+
+    let recorder = DestructionRecorder::arm(128);
+    let (engine, driver) = RdmaEngineBuilder::new(software_device_name().unwrap())
+        .completion_mode(mode)
         .maximum_live_connections(1)
         .maximum_inflight_operations(64)
         .cq_capacity(64)
-        .cm_event_budget(4)
         .build()
         .unwrap();
     let resources = engine.test_resources().unwrap();
-
-    let mut connect = Box::pin(engine.connect(unresolved_neighbor_addr()));
-    poll_fn(|cx| {
-        assert!(connect.as_mut().poll(cx).is_pending());
-        Poll::Ready(())
-    })
-    .await;
-    poll_fn(|cx| {
-        assert!(std::pin::Pin::new(&mut driver).poll(cx).is_pending());
-        Poll::Ready(())
-    })
-    .await;
-    let before_shutdown = engine.diagnostics();
-    assert_eq!(before_shutdown.lifecycle, RdmaEngineLifecycle::Running);
-    assert!(before_shutdown.terminal_error.is_none());
-
-    let mut shutdown = Box::pin(engine.shutdown());
-    assert!(
-        poll_fn(|cx| Poll::Ready(shutdown.as_mut().poll(cx)))
-            .await
-            .is_pending()
-    );
-    let shutdown_requested = engine.diagnostics();
-    assert_eq!(
-        shutdown_requested.lifecycle,
-        RdmaEngineLifecycle::ShutdownRequested
-    );
-    assert!(shutdown_requested.terminal_error.is_none());
     let driver_task = tokio::spawn(driver);
+    let listener = bind_listener_with_retry().await;
+    let address = connect_addr_for(listener.local_addr());
+    let server_resources = resources.clone();
+    let (established_tx, established_rx) = tokio::sync::oneshot::channel();
+    let server_task = tokio::spawn(async move {
+        let cm_id = listener.get_request().await.unwrap();
+        server_resources.require_context(&cm_id).unwrap();
+        let qp = server_resources.create_qp(&cm_id, 19, 34).unwrap();
+        cm_id.accept(&ConnParam::default()).unwrap();
+        listener.await_established().await.unwrap();
+        established_tx.send(()).unwrap();
+        loop {
+            let event = listener.next_event().await.unwrap();
+            let event_type = event.event_type();
+            event.ack();
+            if event_type == CmEventType::Disconnected {
+                break;
+            }
+        }
+        drop(qp);
+        drop(cm_id);
+        drop(listener);
+    });
 
-    tokio::time::timeout(Duration::from_secs(10), shutdown.as_mut())
+    let mut connect = Box::pin(engine.connect(address));
+    let wake = Arc::new(WakeCounter(AtomicUsize::new(0)));
+    let waker = futures_util::task::waker(Arc::clone(&wake));
+    let mut context = Context::from_waker(&waker);
+    assert!(connect.as_mut().poll(&mut context).is_pending());
+    established_rx.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while wake.0.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("established connect result was not published");
+
+    drop(connect);
+    tokio::time::timeout(Duration::from_secs(15), engine.shutdown())
         .await
-        .expect("readiness shutdown lost its terminal wake after ADDR_ERROR")
+        .expect("shutdown did not retire the undelivered connection")
         .unwrap();
     driver_task.await.unwrap().unwrap();
-    let connect_error = match connect.await {
-        Ok(_) => panic!("unresolved neighbor unexpectedly connected"),
-        Err(error) => error,
-    };
+    tokio::time::timeout(Duration::from_secs(15), server_task)
+        .await
+        .expect("peer did not observe undelivered connection teardown")
+        .unwrap();
     let diagnostics = engine.diagnostics();
     assert_eq!(diagnostics.lifecycle, RdmaEngineLifecycle::Terminated);
-    assert!(diagnostics.terminal_error.is_none());
     assert_eq!(diagnostics.live_connections, 0);
-    assert_eq!(diagnostics.registered_operations, 0);
-    assert_eq!(diagnostics.accepted_operations, 0);
-    assert_eq!(diagnostics.available_cq_credits, 64);
-    assert_eq!(diagnostics.retained_cq_credits, 0);
-    assert_eq!(diagnostics.pending_reclamations, 0);
-    assert_eq!(diagnostics.quarantined_operations, 0);
-    assert_eq!(diagnostics.quarantined_mrs, 0);
-    assert_eq!(diagnostics.quarantined_bytes, 0);
-    assert_eq!(diagnostics.quarantined_connections, 0);
-    let instrumentation = resources.instrumentation().unwrap();
-    let connect_is_addr_error = matches!(&connect_error, Error::Verbs(_))
-        && connect_error
-            .to_string()
-            .contains("RDMA CM AddrError failed with status ");
-    let connect_is_shutdown = matches!(&connect_error, Error::DriverShutdown);
-    assert!(
-        connect_is_addr_error || connect_is_shutdown,
-        "unexpected unresolved-neighbor result: {connect_error}"
-    );
-    assert_eq!(instrumentation.cm_pending_routes, 0);
-    assert_eq!(instrumentation.cm_retained_owners, 0);
 
-    tokio::task::yield_now().await;
-    let stable = engine.diagnostics();
+    drop(resources);
+    drop(engine);
+    let events = recorder.take();
     assert_eq!(
-        stable, diagnostics,
-        "driver termination must freeze the complete diagnostic ledger"
+        events
+            .iter()
+            .filter(|event| event.kind == DestructionKind::QueuePair)
+            .count(),
+        2
     );
 }
 
@@ -635,9 +621,13 @@ async fn more_than_one_cm_budget_of_failed_connects_progresses_cooperatively() {
     run_over_budget_failed_connects(CompletionMode::Polling).await;
 }
 
-#[test_log::test(tokio::test(flavor = "current_thread"))]
-async fn readiness_shutdown_rechecks_terminal_after_await_addr_error_on_one_core() {
-    run_readiness_shutdown_after_addr_error().await;
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn shutdown_retires_an_established_but_undelivered_connect() {
+    if !has_software_rdma() {
+        return;
+    }
+    run_shutdown_with_undelivered_connect(CompletionMode::Readiness).await;
+    run_shutdown_with_undelivered_connect(CompletionMode::Polling).await;
 }
 
 #[test_log::test(tokio::test(flavor = "current_thread"))]

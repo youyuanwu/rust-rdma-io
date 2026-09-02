@@ -427,6 +427,8 @@ pub(crate) struct EngineShared {
     cq_credits: CqCreditPool,
     #[cfg(any(test, feature = "test-hooks"))]
     rejected_cqes: AtomicU64,
+    #[cfg(any(test, feature = "test-hooks"))]
+    rejected_cm_events: AtomicU64,
     accepted_operations: AtomicUsize,
     pending_reclamations: AtomicUsize,
     quarantined_operations: AtomicUsize,
@@ -495,6 +497,8 @@ impl EngineShared {
             cq_credits,
             #[cfg(any(test, feature = "test-hooks"))]
             rejected_cqes: AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
+            rejected_cm_events: AtomicU64::new(0),
             accepted_operations: AtomicUsize::new(0),
             pending_reclamations: AtomicUsize::new(0),
             quarantined_operations: AtomicUsize::new(0),

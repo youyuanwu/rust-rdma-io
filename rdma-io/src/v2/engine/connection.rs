@@ -1150,6 +1150,10 @@ pub(crate) trait WorkRequestPoster: Send + Sync {
             "QP destroy-failure injection is unavailable for this poster".into(),
         ))
     }
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn uses_resources(&self, _pd: &crate::v2::Pd, _cq: &crate::v2::Cq) -> bool {
+        false
+    }
 }
 
 pub(super) struct VerbsConnectionResources {
@@ -1429,6 +1433,13 @@ impl WorkRequestPoster for VerbsConnectionResources {
         let qp = qp.as_ref().ok_or(Error::TransportClosed)?;
         qp.fail_next_destroy();
         Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn uses_resources(&self, pd: &crate::v2::Pd, cq: &crate::v2::Cq) -> bool {
+        lock_unpoison(&self.qp)
+            .as_ref()
+            .is_some_and(|qp| qp.uses_resources(pd, cq))
     }
 }
 

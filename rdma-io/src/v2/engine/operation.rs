@@ -1828,6 +1828,17 @@ mod tests {
             shared.dispatch_connection_completions(first.state.token, 1),
             (1, false)
         );
+
+        let fatal = install_accepted(&shared, &first.state, WcOpcode::Send);
+        let mut fatal_wc = wc(fatal, 7, IBV_WC_SEND);
+        fatal_wc.inner.status = u32::MAX;
+        assert_eq!(shared.enqueue_completion(fatal_wc), Some(first.state.token));
+        assert_eq!(
+            shared.dispatch_connection_completions(first.state.token, 1),
+            (1, false)
+        );
+        assert_eq!(shared.rejected_cqes.load(Ordering::Acquire), 0);
+
         assert!(shared.enqueue_completion(exact_wc).is_none());
         assert_eq!(shared.rejected_cqes.load(Ordering::Acquire), 1);
 

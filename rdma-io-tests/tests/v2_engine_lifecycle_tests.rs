@@ -580,6 +580,15 @@ async fn run_qp_destroy_failure_quarantine(mode: CompletionMode) {
     assert_eq!(diagnostics.quarantined_operations, 1);
     assert_eq!(diagnostics.quarantined_mrs, 1);
     assert_eq!(diagnostics.quarantined_connections, 1);
+    let ownership = server_resources.instrumentation().unwrap();
+    assert!(
+        ownership.cm_pending_routes > 0,
+        "failed QP destruction must retain its CM route"
+    );
+    assert!(
+        ownership.cm_retained_owners > 0,
+        "failed QP destruction must keep the owning CM ID live"
+    );
     let events = recorder.snapshot();
     assert!(!recorder.overflowed());
     assert_eq!(

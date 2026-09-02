@@ -49,6 +49,15 @@ enum CmEventReject {
     Unexpected,
 }
 
+fn record_cm_reject(shared: &EngineShared, reject: CmEventReject) {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if !matches!(reject, CmEventReject::Duplicate) {
+        shared.rejected_cm_events.fetch_add(1, Ordering::Relaxed);
+    }
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    let _ = (shared, reject);
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct CmRouteToken {
     slot: u32,
@@ -366,7 +375,8 @@ impl CmState {
 
         let route = match route {
             Ok(route) => route,
-            Err(_reject) => {
+            Err(reject) => {
+                record_cm_reject(shared, reject);
                 if snapshot.event_type == CmEventType::ConnectRequest {
                     self.reject_raw_child(
                         shared,
@@ -397,7 +407,7 @@ impl CmState {
             EventDisposition::Handled => {}
             EventDisposition::IgnoredAfterShutdown => {}
             EventDisposition::Rejected(reject) => {
-                let _ = reject;
+                record_cm_reject(shared, reject);
             }
         }
         Ok(true)

@@ -281,13 +281,20 @@ async fn run_mode(mode: CompletionMode) {
     let shared = engine.diagnostics();
     assert_eq!(shared.live_connections, 18);
     let shared_resources = resources.shared_resource_identity().unwrap();
-    assert_ne!(shared_resources.context, 0);
-    assert_ne!(shared_resources.protection_domain, 0);
-    assert_ne!(shared_resources.completion_queue, 0);
-    assert_ne!(shared_resources.cm_event_channel, 0);
+    assert!(shared_resources.is_complete());
     assert_eq!(
-        shared_resources.has_completion_channel,
+        shared_resources.has_completion_channel(),
         mode == CompletionMode::Readiness
+    );
+    assert!(
+        resources
+            .connection_uses_shared_resources(&low_server)
+            .unwrap()
+    );
+    assert!(
+        resources
+            .connection_uses_shared_resources(&low_client)
+            .unwrap()
     );
 
     bidirectional_low_level(&low_server, &low_client).await;

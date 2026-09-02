@@ -703,6 +703,8 @@ pub mod engine_test_helpers {
         quarantined_connections: usize,
         cm_pending_routes: usize,
         cm_retained_owners: usize,
+        cqes_rejected: u64,
+        cm_events_rejected: u64,
     }
 
     impl SafetyBaseline {
@@ -721,6 +723,8 @@ pub mod engine_test_helpers {
                 quarantined_connections: diagnostics.quarantined_connections,
                 cm_pending_routes: instrumentation.cm_pending_routes,
                 cm_retained_owners: instrumentation.cm_retained_owners,
+                cqes_rejected: instrumentation.cqes_rejected,
+                cm_events_rejected: instrumentation.cm_events_rejected,
             }
         }
 
@@ -737,6 +741,8 @@ pub mod engine_test_helpers {
                 && self.quarantined_connections == expected.quarantined_connections
                 && self.cm_pending_routes == expected.cm_pending_routes
                 && self.cm_retained_owners == expected.cm_retained_owners
+                && self.cqes_rejected == expected.cqes_rejected
+                && self.cm_events_rejected == expected.cm_events_rejected
         }
     }
 
@@ -813,12 +819,15 @@ pub mod engine_test_helpers {
     }
 
     fn attempt_has_no_engine_rejects(
-        _server: &SafetyBaseline,
-        _server_baseline: &SafetyBaseline,
-        _client: &SafetyBaseline,
-        _client_baseline: &SafetyBaseline,
+        server: &SafetyBaseline,
+        server_baseline: &SafetyBaseline,
+        client: &SafetyBaseline,
+        client_baseline: &SafetyBaseline,
     ) -> bool {
-        true
+        server.cqes_rejected == server_baseline.cqes_rejected
+            && client.cqes_rejected == client_baseline.cqes_rejected
+            && server.cm_events_rejected == server_baseline.cm_events_rejected
+            && client.cm_events_rejected == client_baseline.cm_events_rejected
     }
 
     /// Establish a ready message pair, retrying only known transient

@@ -3,10 +3,9 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use futures_util::task::AtomicWaker;
@@ -594,9 +593,6 @@ pub(super) struct ListenerState {
     pub(super) backlog: usize,
     pub(super) cm_id: Mutex<Option<SharedCmId>>,
     queues: Mutex<ListenerQueues>,
-    queued_children: AtomicUsize,
-    pending_accepts: AtomicUsize,
-    selected_accepts: AtomicUsize,
     closing: AtomicBool,
     finalization_started: AtomicBool,
     failure: Mutex<Option<Error>>,
@@ -619,9 +615,6 @@ impl ListenerState {
             backlog: config.backlog,
             cm_id: Mutex::new(Some(cm_id)),
             queues: Mutex::new(ListenerQueues::default()),
-            queued_children: AtomicUsize::new(0),
-            pending_accepts: AtomicUsize::new(0),
-            selected_accepts: AtomicUsize::new(0),
             closing: AtomicBool::new(false),
             finalization_started: AtomicBool::new(false),
             failure: Mutex::new(None),
@@ -640,9 +633,6 @@ impl ListenerState {
             backlog,
             cm_id: Mutex::new(None),
             queues: Mutex::new(ListenerQueues::default()),
-            queued_children: AtomicUsize::new(0),
-            pending_accepts: AtomicUsize::new(0),
-            selected_accepts: AtomicUsize::new(0),
             closing: AtomicBool::new(false),
             finalization_started: AtomicBool::new(false),
             failure: Mutex::new(None),
@@ -653,18 +643,8 @@ impl ListenerState {
         })
     }
 
-    fn lock_queues(&self) -> ListenerQueueGuard<'_> {
-        let guard = lock_unpoison(&self.queues);
-        ListenerQueueGuard {
-            listener: self,
-            guard,
-        }
-    }
-
-    fn publish_queue_counts(&self, after: (usize, usize, usize)) {
-        self.queued_children.store(after.0, Ordering::Release);
-        self.pending_accepts.store(after.1, Ordering::Release);
-        self.selected_accepts.store(after.2, Ordering::Release);
+    fn lock_queues(&self) -> std::sync::MutexGuard<'_, ListenerQueues> {
+        lock_unpoison(&self.queues)
     }
 
     pub(super) fn register_waiter(&self, request: Arc<AcceptRequest>) -> Result<()> {
@@ -994,40 +974,11 @@ impl ListenerState {
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub(super) fn queue_counts(&self) -> (usize, usize, usize) {
-        (
-            self.queued_children.load(Ordering::Acquire),
-            self.pending_accepts.load(Ordering::Acquire),
-            self.selected_accepts.load(Ordering::Acquire),
-        )
+        queue_counts(&lock_unpoison(&self.queues))
     }
 }
 
-struct ListenerQueueGuard<'a> {
-    listener: &'a ListenerState,
-    guard: MutexGuard<'a, ListenerQueues>,
-}
-
-impl Deref for ListenerQueueGuard<'_> {
-    type Target = ListenerQueues;
-
-    fn deref(&self) -> &Self::Target {
-        &self.guard
-    }
-}
-
-impl DerefMut for ListenerQueueGuard<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.guard
-    }
-}
-
-impl Drop for ListenerQueueGuard<'_> {
-    fn drop(&mut self) {
-        self.listener
-            .publish_queue_counts(queue_counts(&self.guard));
-    }
-}
-
+#[cfg(any(test, feature = "test-hooks"))]
 fn queue_counts(queues: &ListenerQueues) -> (usize, usize, usize) {
     (
         queues.children.len(),

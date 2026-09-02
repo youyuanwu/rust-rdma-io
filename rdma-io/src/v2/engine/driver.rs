@@ -674,6 +674,8 @@ pub(super) mod test_api {
         pub cm_retained_owners: usize,
         /// CQEs rejected before they could affect a live operation.
         pub cqes_rejected: u64,
+        /// CM events rejected before they could mutate a live route.
+        pub cm_events_rejected: u64,
     }
 
     /// Safe test-only lease for shared resources and bounded driver fixtures.
@@ -695,16 +697,26 @@ pub(super) mod test_api {
     /// Test-only identity of one engine's shared RDMA resource set.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct TestSharedResourceIdentity {
-        /// Anchored verbs context address.
-        pub context: usize,
-        /// Shared protection-domain address.
-        pub protection_domain: usize,
-        /// Shared completion-queue address.
-        pub completion_queue: usize,
-        /// Shared CM event-channel address.
-        pub cm_event_channel: usize,
+        context: usize,
+        protection_domain: usize,
+        completion_queue: usize,
+        cm_event_channel: usize,
+        has_completion_channel: bool,
+    }
+
+    impl TestSharedResourceIdentity {
+        /// Whether every shared resource identity is present.
+        pub fn is_complete(&self) -> bool {
+            self.context != 0
+                && self.protection_domain != 0
+                && self.completion_queue != 0
+                && self.cm_event_channel != 0
+        }
+
         /// Whether the shared CQ owns a completion channel.
-        pub has_completion_channel: bool,
+        pub fn has_completion_channel(&self) -> bool {
+            self.has_completion_channel
+        }
     }
 
     /// Read-only provider-capability projection for validation fixtures.
@@ -874,6 +886,21 @@ pub(super) mod test_api {
                 cm_event_channel: self.resources.cm_event_channel.as_raw() as usize,
                 has_completion_channel: self.resources.cq.has_channel(),
             })
+        }
+
+        /// Verify that a connection posts through this engine's shared PD/CQ.
+        pub fn connection_uses_shared_resources(
+            &self,
+            connection: &RdmaConnection,
+        ) -> Result<bool> {
+            let shared = self.ensure_active()?;
+            if !Arc::ptr_eq(&shared, &connection.shared) {
+                return Ok(false);
+            }
+            Ok(connection
+                .state
+                .poster
+                .uses_resources(&self.resources.pd, &self.resources.cq))
         }
 
         /// Register owned test memory through the engine's shared PD.
@@ -1620,6 +1647,7 @@ pub(super) mod test_api {
                 cm_pending_routes: shared.cm.pending_route_count(),
                 cm_retained_owners: shared.cm.retained_owner_count(),
                 cqes_rejected: shared.rejected_cqes.load(Ordering::Acquire),
+                cm_events_rejected: shared.rejected_cm_events.load(Ordering::Acquire),
             }
         }
 
