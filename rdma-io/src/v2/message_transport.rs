@@ -116,9 +116,9 @@ use futures_util::task::AtomicWaker;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use super::engine::{
-    ConnectionState, ConnectionTerminalSink, DetachedOperationCompletion, EngineShared,
-    RdmaConnection, RdmaConnectionConfig, RdmaEngine, RdmaListener, SetupSummary,
-    preflight_driver_runtime,
+    ConnectionState, ConnectionTerminalSink, DetachedCallbackAfterUnlock,
+    DetachedOperationCompletion, EngineShared, RdmaConnection, RdmaConnectionConfig, RdmaEngine,
+    RdmaListener, SetupSummary, preflight_driver_runtime,
 };
 use super::error::{Error, Result};
 use super::mr::{AccessIntent, Mr};
@@ -439,11 +439,12 @@ impl MessagePreparation {
                 mr,
                 Box::new(move |completion| {
                     if let Some(state) = state.upgrade() {
-                        state.enqueue_event(EngineMessageEvent::Receive(completion));
+                        state.enqueue_callback_event(EngineMessageEvent::Receive(completion))
                     } else {
                         // The callback owns the completion and its MR; dropping
                         // it here is the only release path after state teardown.
                         drop(completion);
+                        None
                     }
                 }) as _,
             ));
@@ -952,6 +953,20 @@ impl EngineMessageState {
     }
 
     fn enqueue_event(&self, event: EngineMessageEvent) {
+        if self.queue_event(event) {
+            self.publish();
+        }
+    }
+
+    fn enqueue_callback_event(
+        self: Arc<Self>,
+        event: EngineMessageEvent,
+    ) -> Option<DetachedCallbackAfterUnlock> {
+        self.queue_event(event)
+            .then(|| Box::new(move || self.publish()) as DetachedCallbackAfterUnlock)
+    }
+
+    fn queue_event(&self, event: EngineMessageEvent) -> bool {
         let terminal_notice = matches!(
             &event,
             EngineMessageEvent::Disconnected
@@ -967,9 +982,9 @@ impl EngineMessageState {
         }
         if let Some(event) = event {
             self.dispose_terminal_event(event);
-            return;
+            return false;
         }
-        self.publish();
+        true
     }
 
     fn dispose_terminal_event(&self, event: EngineMessageEvent) {
@@ -1287,10 +1302,11 @@ impl EngineMessageState {
             mr,
             Box::new(move |completion| {
                 if let Some(state) = state.upgrade() {
-                    state.enqueue_event(EngineMessageEvent::Receive(completion));
+                    state.enqueue_callback_event(EngineMessageEvent::Receive(completion))
                 } else {
                     // Completion callback ownership includes the receive MR.
                     drop(completion);
+                    None
                 }
             }),
         );
@@ -1352,10 +1368,13 @@ impl EngineMessageState {
                     frame_len,
                     Box::new(move |completion| {
                         if let Some(state) = state.upgrade() {
-                            state.enqueue_event(EngineMessageEvent::SendComplete {
+                            state.enqueue_callback_event(EngineMessageEvent::SendComplete {
                                 request: callback_request,
                                 completion,
-                            });
+                            })
+                        } else {
+                            drop(completion);
+                            None
                         }
                     }),
                 ) && error.potentially_accepted()
@@ -1472,9 +1491,11 @@ impl EngineMessageState {
             frame_len,
             Box::new(move |completion| {
                 if let Some(state) = state.upgrade() {
-                    state.enqueue_event(EngineMessageEvent::ControlSendComplete(completion));
+                    state
+                        .enqueue_callback_event(EngineMessageEvent::ControlSendComplete(completion))
                 } else {
                     drop(completion);
+                    None
                 }
             }),
         ) {
@@ -1618,7 +1639,10 @@ impl EngineMessageState {
             len,
             Box::new(move |completion| {
                 if let Some(state) = state.upgrade() {
-                    state.enqueue_event(EngineMessageEvent::HelloSend(completion));
+                    state.enqueue_callback_event(EngineMessageEvent::HelloSend(completion))
+                } else {
+                    drop(completion);
+                    None
                 }
             }),
         ) && error.potentially_accepted()
@@ -1666,10 +1690,11 @@ impl EngineMessageState {
             mr,
             Box::new(move |completion| {
                 if let Some(state) = state.upgrade() {
-                    state.enqueue_event(EngineMessageEvent::Receive(completion));
+                    state.enqueue_callback_event(EngineMessageEvent::Receive(completion))
                 } else {
                     // Completion callback ownership includes the receive MR.
                     drop(completion);
+                    None
                 }
             }),
         ) {
@@ -1830,7 +1855,7 @@ impl Future for MessageTransportDriver {
             return Poll::Ready(result);
         }
         if !this.runtime_checked {
-            if let Err(error) = preflight_driver_runtime() {
+            if let Err(error) = preflight_driver_runtime("MessageTransportDriver") {
                 this.state.fail(error.clone(), true);
                 this.completed = true;
                 return Poll::Ready(Err(error));
@@ -2274,6 +2299,15 @@ mod setup_tests {
 mod hello_tests {
     use super::*;
     use std::sync::Barrier;
+    use std::sync::atomic::AtomicUsize;
+
+    struct CountingWake(AtomicUsize);
+
+    impl futures_util::task::ArcWake for CountingWake {
+        fn wake_by_ref(arc_self: &Arc<Self>) {
+            arc_self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
 
     fn hello(capacity: u32, maximum: u32) -> protocol::HelloPayload {
         protocol::HelloPayload {
@@ -2339,7 +2373,85 @@ mod hello_tests {
         assert!(matches!(
             Pin::new(&mut driver).poll(&mut cx),
             Poll::Ready(Err(Error::InvalidConfig(message)))
-                if message.contains("active Tokio runtime")
+                if message.contains("MessageTransportDriver")
+                    && message.contains("active Tokio runtime")
+        ));
+    }
+
+    #[tokio::test]
+    async fn message_driver_observes_terminal_work_published_before_registration() {
+        let config = MessageTransportBuilder::new()
+            .derive_engine_config()
+            .unwrap();
+        let state = Arc::new(EngineMessageState::new(&config));
+        state.terminalize(Error::ProtocolViolation("published first".into()));
+        let mut driver = MessageTransportDriver::new(state, config.hello_deadline);
+        let wake = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let waker = futures_util::task::waker(Arc::clone(&wake));
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(
+            Pin::new(&mut driver).poll(&mut cx),
+            Poll::Ready(Err(Error::ProtocolViolation(message)))
+                if message == "published first"
+        ));
+    }
+
+    #[tokio::test]
+    async fn message_driver_register_recheck_does_not_lose_concurrent_terminal_work() {
+        for _ in 0..128 {
+            let config = MessageTransportBuilder::new()
+                .derive_engine_config()
+                .unwrap();
+            let state = Arc::new(EngineMessageState::new(&config));
+            let mut driver = MessageTransportDriver::new(Arc::clone(&state), config.hello_deadline);
+            let wake = Arc::new(CountingWake(AtomicUsize::new(0)));
+            let waker = futures_util::task::waker(Arc::clone(&wake));
+            let mut cx = Context::from_waker(&waker);
+            let race = Arc::new(Barrier::new(2));
+            let publisher_state = Arc::clone(&state);
+            let publisher_race = Arc::clone(&race);
+            let publisher = std::thread::spawn(move || {
+                publisher_race.wait();
+                publisher_state
+                    .terminalize(Error::ProtocolViolation("concurrent publication".into()));
+            });
+            race.wait();
+            let first = Pin::new(&mut driver).poll(&mut cx);
+            publisher.join().unwrap();
+            let result = match first {
+                Poll::Ready(result) => result,
+                Poll::Pending => match Pin::new(&mut driver).poll(&mut cx) {
+                    Poll::Ready(result) => result,
+                    Poll::Pending => panic!("concurrent terminal publication was lost"),
+                },
+            };
+            assert!(matches!(
+                result,
+                Err(Error::ProtocolViolation(message))
+                    if message == "concurrent publication"
+            ));
+        }
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn message_driver_reports_missing_tokio_time_without_panicking() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .unwrap();
+        let config = MessageTransportBuilder::new()
+            .derive_engine_config()
+            .unwrap();
+        let state = Arc::new(EngineMessageState::new(&config));
+        let mut driver = MessageTransportDriver::new(state, config.hello_deadline);
+        let result = runtime
+            .block_on(async { std::future::poll_fn(|cx| Pin::new(&mut driver).poll(cx)).await });
+        assert!(matches!(
+            result,
+            Err(Error::InvalidConfig(message))
+                if message.contains("MessageTransportDriver")
+                    && message.contains("Tokio time")
         ));
     }
 

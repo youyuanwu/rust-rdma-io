@@ -503,6 +503,48 @@ async fn run_driver_withholding(mode: CompletionMode) {
     .await;
 }
 
+async fn run_message_driver_hello_timeout(mode: CompletionMode) {
+    let (server_engine, server_engine_driver) = build_engine(mode).await;
+    let (client_engine, client_engine_driver) = build_engine(mode).await;
+    let listener = listen(&server_engine).await;
+    let address = connect_addr_for(Some(listener.local_addr().unwrap()));
+    let (server, client) = tokio::time::timeout(Duration::from_secs(15), async {
+        tokio::join!(
+            MessageTransportBuilder::new()
+                .hello_deadline(Duration::from_millis(50))
+                .accept_on(&listener),
+            MessageTransportBuilder::new()
+                .hello_deadline(Duration::from_millis(50))
+                .connect_on(&client_engine, address)
+        )
+    })
+    .await
+    .expect("message setup timed out");
+    let (server, server_message_driver) = server.unwrap();
+    let (client, client_message_driver) = client.unwrap();
+    let server_message_driver = tokio::spawn(server_message_driver);
+
+    let error = tokio::time::timeout(Duration::from_secs(5), server.ready())
+        .await
+        .expect("message driver HELLO deadline did not fire")
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        Error::ProtocolViolation(message) if message == "HELLO handshake timeout"
+    ));
+    assert!(matches!(
+        server_message_driver.await.unwrap(),
+        Err(Error::ProtocolViolation(message)) if message == "HELLO handshake timeout"
+    ));
+    drop(client_message_driver);
+    let _ = tokio::join!(server.close(), client.close());
+    listener.close().await.unwrap();
+    server_engine.shutdown().await.unwrap();
+    client_engine.shutdown().await.unwrap();
+    server_engine_driver.await.unwrap().unwrap();
+    client_engine_driver.await.unwrap().unwrap();
+}
+
 async fn wait_pending_accepts(engine: &RdmaEngine, expected: usize) {
     tokio::time::timeout(Duration::from_secs(5), async {
         while engine.diagnostics().pending_accepts != expected {
@@ -574,4 +616,13 @@ async fn polling_mixed_accepts_preserve_registration_order() {
 async fn message_setup_requires_the_owning_driver_to_be_polled() {
     run_driver_withholding(CompletionMode::Readiness).await;
     run_driver_withholding(CompletionMode::Polling).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn message_driver_owns_hello_timeout_in_both_completion_modes() {
+    if !has_software_rdma() {
+        return;
+    }
+    run_message_driver_hello_timeout(CompletionMode::Readiness).await;
+    run_message_driver_hello_timeout(CompletionMode::Polling).await;
 }

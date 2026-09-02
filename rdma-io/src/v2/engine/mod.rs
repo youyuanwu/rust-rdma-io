@@ -74,11 +74,11 @@ pub use driver::{
 };
 use lifecycle::MemoizedTerminalResult;
 pub use listener::{RdmaListener, RdmaListenerConfig};
-pub(crate) use operation::DetachedOperationCompletion;
 pub use operation::RdmaOperation;
 #[cfg(test)]
 pub(crate) use operation::{BatchOwnershipTransfer, PreparedBatchOwnership};
 use operation::{CqCreditPool, OperationRegistry};
+pub(crate) use operation::{DetachedCallbackAfterUnlock, DetachedOperationCompletion};
 use registry::{ConnectionRegistry, OperationToken, lock_unpoison, write_unpoison};
 use resources::{EngineResourceRefs, EngineResources, ResourceSummary};
 use scheduler::WorkScheduler;

@@ -290,9 +290,10 @@ fn post_detached_batch(
     match transfer {
         BatchOwnershipTransfer::Accepted(accepted) => {
             BatchWrAccounting::from_outcome(count, &BatchPostOutcome::AllAccepted).record(shared);
-            commit_internal_entries(shared, accepted);
+            let after_unlock = commit_internal_entries(shared, accepted);
             drop(posting);
             drop(admission);
+            invoke_after_unlock(after_unlock);
             Ok(count)
         }
         BatchOwnershipTransfer::Partial {
@@ -307,17 +308,19 @@ fn post_detached_batch(
             {
                 accepted.extend(unaccepted);
                 BatchWrAccounting::ambiguous(count).record(shared);
-                commit_internal_entries(shared, accepted);
+                let after_unlock = commit_internal_entries(shared, accepted);
                 drop(posting);
                 drop(admission);
+                invoke_after_unlock(after_unlock);
                 Err(DetachedPostError::retained(Error::PostFailed(source)))
             } else {
                 BatchWrAccounting::exact_prefix(count, accepted.len()).record(shared);
                 let potentially_accepted = !accepted.is_empty();
-                commit_internal_entries(shared, accepted);
+                let after_unlock = commit_internal_entries(shared, accepted);
                 rollback_internal_entries(shared, connection, direction, unaccepted, error);
                 drop(posting);
                 drop(admission);
+                invoke_after_unlock(after_unlock);
                 Err(DetachedPostError {
                     error: Error::PostFailed(source),
                     potentially_accepted,
@@ -326,9 +329,10 @@ fn post_detached_batch(
         }
         BatchOwnershipTransfer::Ambiguous { retained, source } => {
             BatchWrAccounting::ambiguous(count).record(shared);
-            commit_internal_entries(shared, retained);
+            let after_unlock = commit_internal_entries(shared, retained);
             drop(posting);
             drop(admission);
+            invoke_after_unlock(after_unlock);
             Err(DetachedPostError::retained(Error::PostFailed(source)))
         }
     }
@@ -339,7 +343,10 @@ enum InternalPreparedBatch {
     Send(PreparedSendBatch),
 }
 
-fn commit_internal_entries(shared: &EngineShared, entries: Vec<InternalBatchEntry>) {
+fn commit_internal_entries(
+    shared: &EngineShared,
+    entries: Vec<InternalBatchEntry>,
+) -> Vec<DetachedCallbackAfterUnlock> {
     shared
         .accepted_operations
         .fetch_add(entries.len(), Ordering::AcqRel);
@@ -350,8 +357,17 @@ fn commit_internal_entries(shared: &EngineShared, entries: Vec<InternalBatchEntr
         }
     }
     shared.work_signal.publish(super::driver::CQ_RECHECK_WORK);
-    for (state, completion) in early {
-        shared.finish_operation(state, completion);
+    early
+        .into_iter()
+        .filter_map(|(state, completion)| {
+            prepare_detached_completion(shared.finish_operation(state, completion))
+        })
+        .collect()
+}
+
+fn invoke_after_unlock(actions: Vec<DetachedCallbackAfterUnlock>) {
+    for action in actions {
+        action();
     }
 }
 
@@ -387,8 +403,18 @@ fn complete_unreserved_entries(entries: impl IntoIterator<Item = InternalPostInp
 }
 
 fn invoke_detached_completion(completion: Option<DetachedCompletion>) {
+    if let Some(after_unlock) = prepare_detached_completion(completion) {
+        after_unlock();
+    }
+}
+
+fn prepare_detached_completion(
+    completion: Option<DetachedCompletion>,
+) -> Option<DetachedCallbackAfterUnlock> {
     if let Some((callback, completion)) = completion {
-        callback(completion);
+        callback(completion)
+    } else {
+        None
     }
 }
 
@@ -990,8 +1016,11 @@ pub(crate) enum DetachedOperationCompletion {
     },
 }
 
-pub(crate) type DetachedOperationCallback =
-    Box<dyn FnOnce(DetachedOperationCompletion) + Send + 'static>;
+pub(crate) type DetachedOperationCallback = Box<
+    dyn FnOnce(DetachedOperationCompletion) -> Option<DetachedCallbackAfterUnlock> + Send + 'static,
+>;
+
+pub(crate) type DetachedCallbackAfterUnlock = Box<dyn FnOnce() + Send + 'static>;
 
 pub(crate) struct DetachedPostError {
     error: Error,
@@ -1268,7 +1297,7 @@ fn start_operation(
             shared.work_signal.publish(super::driver::CQ_RECHECK_WORK);
             drop(admission);
             if let Some(completion) = early {
-                shared.finish_operation(Arc::clone(&state), completion);
+                invoke_detached_completion(shared.finish_operation(Arc::clone(&state), completion));
             }
             StartResult::InFlight(state)
         }
@@ -1287,7 +1316,7 @@ fn start_operation(
                 state.commit_accepted();
                 shared.work_signal.publish(super::driver::CQ_RECHECK_WORK);
                 drop(admission);
-                shared.finish_operation(Arc::clone(&state), completion);
+                invoke_detached_completion(shared.finish_operation(Arc::clone(&state), completion));
                 StartResult::InFlight(state)
             } else {
                 BatchWrAccounting::exact_prefix(1, accepted).record(shared);
@@ -1309,7 +1338,7 @@ fn start_operation(
             shared.work_signal.publish(super::driver::CQ_RECHECK_WORK);
             drop(admission);
             if let Some(completion) = early {
-                shared.finish_operation(Arc::clone(&state), completion);
+                invoke_detached_completion(shared.finish_operation(Arc::clone(&state), completion));
                 StartResult::InFlight(state)
             } else {
                 state.detach_with_post_error(shared);
@@ -1486,39 +1515,42 @@ impl EngineShared {
         (processed, connection.has_completion_work())
     }
 
-    fn dispatch_queued_completion(&self, completion: WorkCompletion) {
+    fn dispatch_queued_completion(&self, completion: WorkCompletion) -> Option<DetachedCompletion> {
         let token = OperationToken::decode(completion.wr_id());
         let operation = match self.operations.lookup(token) {
             Lookup::Occupied(operation) => operation,
             Lookup::Duplicate => {
                 self.diagnostic_counters.reject_cqe(CqeReject::Duplicate);
-                return;
+                return None;
             }
             Lookup::Stale | Lookup::Retired => {
                 self.diagnostic_counters
                     .reject_cqe(CqeReject::StaleOperation);
-                return;
+                return None;
             }
             Lookup::Unknown => {
                 self.diagnostic_counters.reject_cqe(CqeReject::Unknown);
-                return;
+                return None;
             }
         };
         match operation.record_completion(completion) {
-            CompletionDisposition::Deferred => {}
-            CompletionDisposition::Complete => {
-                self.finish_operation(operation, completion);
-            }
+            CompletionDisposition::Deferred => None,
+            CompletionDisposition::Complete => self.finish_operation(operation, completion),
             CompletionDisposition::Duplicate => {
                 self.diagnostic_counters.reject_cqe(CqeReject::Duplicate);
+                None
             }
         }
     }
 
-    fn finish_operation(&self, operation: Arc<OperationState>, completion: WorkCompletion) {
+    fn finish_operation(
+        &self,
+        operation: Arc<OperationState>,
+        completion: WorkCompletion,
+    ) -> Option<DetachedCompletion> {
         if self.operations.release(operation.token, true).is_none() {
             self.diagnostic_counters.reject_cqe(CqeReject::Duplicate);
-            return;
+            return None;
         }
         let removed = operation.connection.remove_accepted(operation.token);
         operation.connection.release_local(operation.direction);
@@ -1549,7 +1581,7 @@ impl EngineShared {
                 .fetch_sub(operation.mr_len, Ordering::AcqRel);
             self.clear_operation_quarantine(&operation);
         }
-        invoke_detached_completion(finished.callback);
+        let callback = finished.callback;
         if removed
             && operation.connection.close_started()
             && operation.connection.accepted_count() == 0
@@ -1558,6 +1590,7 @@ impl EngineShared {
             self.record_connection_drained(&operation.connection);
             self.schedule_connection_retirement(&operation.connection);
         }
+        callback
     }
 
     pub(super) fn reclaim_after_qp_destroy(
@@ -1630,10 +1663,13 @@ impl EngineShared {
 
     fn dispatch_connection_completion(&self, completion: WorkCompletion) {
         // CQ routing and terminal publication share the admission barrier.
-        // The lock covers only one completion. Detached callbacks only enqueue
-        // driver-local work; message posting and close run after this returns.
-        let _admission = read_unpoison(&self.admission);
-        self.dispatch_queued_completion(completion);
+        // The lock covers only one completion and is released before a
+        // detached callback can wake/re-enter message posting or close.
+        let callback = {
+            let _admission = read_unpoison(&self.admission);
+            self.dispatch_queued_completion(completion)
+        };
+        invoke_detached_completion(callback);
     }
 
     fn dispatch_queued_completions(&self, connection: &ConnectionState, budget: usize) -> bool {
@@ -1841,7 +1877,7 @@ mod tests {
         let early = operation.commit_accepted().expect("early completion");
         shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
         assert_eq!(operation.lifecycle(), OperationLifecycle::InFlight);
-        shared.finish_operation(Arc::clone(&operation), early);
+        invoke_detached_completion(shared.finish_operation(Arc::clone(&operation), early));
         assert_eq!(operation.lifecycle(), OperationLifecycle::Released);
 
         let token = install_accepted(&shared, &connection.state, WcOpcode::Send);
@@ -1861,8 +1897,53 @@ mod tests {
             CompletionDisposition::Complete
         ));
         assert_eq!(operation.lifecycle(), OperationLifecycle::Completing);
-        shared.finish_operation(Arc::clone(&operation), completion);
+        invoke_detached_completion(shared.finish_operation(Arc::clone(&operation), completion));
         assert_eq!(operation.lifecycle(), OperationLifecycle::Released);
+    }
+
+    #[test]
+    fn detached_completion_callback_runs_after_admission_guard_is_released() {
+        let shared = synthetic_engine(8);
+        let connection = synthetic_connection_on(&shared, 21);
+        connection.state.reserve_local(Direction::Send).unwrap();
+        assert!(shared.cq_credits.reserve());
+        let observed = Arc::new(AtomicBool::new(false));
+        let callback_observed = Arc::clone(&observed);
+        let callback_shared = Arc::downgrade(&shared);
+        let (token, operation) = shared
+            .operations
+            .allocate(|token| {
+                Arc::new(OperationState::new_with_callback(
+                    token,
+                    Arc::clone(&connection.state),
+                    Direction::Send,
+                    WcOpcode::Send,
+                    None,
+                    1,
+                    Some(Box::new(move |_completion| {
+                        let shared = callback_shared.upgrade().expect("engine shared state");
+                        assert!(
+                            shared.admission.try_write().is_ok(),
+                            "detached callback ran while admission remained locked"
+                        );
+                        callback_observed.store(true, Ordering::Release);
+                        None
+                    })),
+                ))
+            })
+            .unwrap();
+        connection.state.add_accepted(token);
+        operation.commit_accepted();
+        shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
+        connection
+            .state
+            .enqueue_completion(wc(token, connection.identity().qp_num(), IBV_WC_SEND));
+
+        assert_eq!(
+            shared.process_connection_ready(connection.state.token, 1),
+            (1, false)
+        );
+        assert!(observed.load(Ordering::Acquire));
     }
 
     #[test]
@@ -1889,6 +1970,7 @@ mod tests {
                             panic!("accepted operation cannot become unaccepted")
                         };
                         *lock_unpoison(&callback_observed) = result.err();
+                        None
                     })),
                 ))
             })
@@ -2431,6 +2513,7 @@ mod tests {
                 mr,
                 Box::new(move |_completion| {
                     callback_calls.fetch_add(1, Ordering::AcqRel);
+                    None
                 }) as DetachedOperationCallback,
             ));
         }

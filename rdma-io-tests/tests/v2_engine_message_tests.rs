@@ -112,7 +112,6 @@ async fn run_boundaries_and_reuse(mode: CompletionMode) {
         size: 256,
     };
     let (listener, server, client) = establish_on(&server_engine, &client_engine, config).await;
-
     assert_eq!(client.test_negotiated_credits().unwrap(), (2, 0));
     client.send(b"").await.unwrap();
     let empty = server.recv().await.unwrap();
@@ -134,8 +133,23 @@ async fn run_boundaries_and_reuse(mode: CompletionMode) {
 
     for sequence in 0..32u32 {
         let payload = sequence.to_le_bytes();
-        client.send(&payload).await.unwrap();
-        let message = server.recv().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), client.send(&payload))
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{mode:?} send {sequence} timed out: client credits={:?}, client buffers={}, server buffers={}, client engine={:?}, server engine={:?}",
+                    client.test_negotiated_credits().unwrap(),
+                    client.test_available_send_buffers().unwrap(),
+                    server.test_available_send_buffers().unwrap(),
+                    client_engine.diagnostics(),
+                    server_engine.diagnostics()
+                )
+            })
+            .unwrap();
+        let message = tokio::time::timeout(Duration::from_secs(5), server.recv())
+            .await
+            .unwrap_or_else(|_| panic!("{mode:?} receive {sequence} timed out"))
+            .unwrap();
         assert_eq!(&*message, payload.as_slice());
         drop(message);
     }
@@ -161,13 +175,24 @@ async fn run_boundaries_and_reuse(mode: CompletionMode) {
     })
     .take(16)
     .collect::<Vec<_>>();
-    for sender in senders {
-        sender.await.unwrap();
-    }
-    let mut received = HashSet::new();
-    for receiver in receivers {
-        received.insert(receiver.await.unwrap());
-    }
+    let received = tokio::time::timeout(Duration::from_secs(15), async {
+        for sender in senders {
+            sender.await.unwrap();
+        }
+        let mut received = HashSet::new();
+        for receiver in receivers {
+            received.insert(receiver.await.unwrap());
+        }
+        received
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "{mode:?} concurrent exchange timed out: client credits={:?}, server buffers={}",
+            client.test_negotiated_credits().unwrap(),
+            server.test_available_send_buffers().unwrap()
+        )
+    });
     assert_eq!(received, (0..16u32).collect());
 
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -258,11 +283,11 @@ async fn run_malformed_frames(mode: CompletionMode) {
             matches!(&error, Error::ProtocolViolation(message) if message.contains(expected)),
             "unexpected malformed-frame error: {error:?}"
         );
-        let server_close = server.close().await;
+        let server_close = server.shutdown().await;
         assert!(
             matches!(server_close, Err(Error::ProtocolViolation(message)) if message.contains(expected))
         );
-        assert_clean_close(client.close().await);
+        assert_clean_close(client.shutdown().await);
         listener.close().await.unwrap();
         shutdown_engine(server_engine, server_driver).await;
         shutdown_engine(client_engine, client_driver).await;
@@ -307,9 +332,10 @@ async fn run_cancellation_and_disconnect(mode: CompletionMode) {
         matches!(server.close().await, Err(Error::TransportClosed)),
         "close after an observed peer disconnect must preserve TransportClosed"
     );
+    let server = Arc::try_unwrap(server).ok().expect("single server owner");
+    let client = Arc::try_unwrap(client).ok().expect("single client owner");
+    let _ = tokio::join!(server.shutdown(), client.shutdown());
     listener.close().await.unwrap();
-    drop(server);
-    drop(client);
     shutdown_engine(server_engine, server_driver).await;
     shutdown_engine(client_engine, client_driver).await;
 }
@@ -532,6 +558,13 @@ async fn run_fairness_and_independent_close(mode: CompletionMode) {
         Err(Error::ProtocolViolation(message)) if message.contains("zero credits")
     ));
     assert_clean_close(first_client.close().await);
+    let first_server = Arc::try_unwrap(first_server)
+        .ok()
+        .expect("single first-server owner");
+    let first_client = Arc::try_unwrap(first_client)
+        .ok()
+        .expect("single first-client owner");
+    let _ = tokio::join!(first_server.shutdown(), first_client.shutdown());
     first_listener.close().await.unwrap();
 
     second_client.send(b"independent").await.unwrap();
@@ -542,18 +575,18 @@ async fn run_fairness_and_independent_close(mode: CompletionMode) {
     let second_client = Arc::try_unwrap(second_client)
         .ok()
         .expect("single second-client owner");
-    drop(second_client);
+    assert_clean_close(second_client.drop_frontend_and_wait().await);
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(10), second_server.recv())
             .await
             .expect("frontend drop did not wake peer recv"),
         Err(Error::TransportClosed)
     ));
-    assert_clean_close(second_server.close().await);
+    let second_server = Arc::try_unwrap(second_server)
+        .ok()
+        .expect("single second-server owner");
+    assert_clean_close(second_server.shutdown().await);
     second_listener.close().await.unwrap();
-    drop(first_server);
-    drop(first_client);
-    drop(second_server);
     shutdown_engine(server_engine, server_driver).await;
     shutdown_engine(client_engine, client_driver).await;
 }
@@ -648,9 +681,10 @@ async fn run_cancelled_send_qp_destroy_fallback(mode: CompletionMode) {
     .expect("released late message CQE was not rejected as stale");
     client.close().await.unwrap();
     drop(connection);
-    drop(client);
+    let client = Arc::try_unwrap(client).ok().expect("single client owner");
+    assert_clean_close(client.shutdown().await);
 
-    assert_clean_close(server.close().await);
+    assert_clean_close(server.shutdown().await);
     listener.close().await.unwrap();
     shutdown_engine(server_engine, server_driver).await;
     shutdown_engine(client_engine, client_driver).await;

@@ -476,7 +476,7 @@ impl Future for RdmaEngineDriver {
         }
 
         if !self.runtime_checked {
-            if let Err(error) = preflight_driver_runtime() {
+            if let Err(error) = preflight_driver_runtime("RdmaEngineDriver") {
                 return self.fail(error);
             }
             self.runtime_checked = true;
@@ -567,7 +567,11 @@ impl Future for RdmaEngineDriver {
                 self.shared
                     .driver_yields
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                cx.waker().wake_by_ref();
+                // Tokio's yield future defers this task to the back of the
+                // scheduler queue. A direct self-wake can monopolize a worker
+                // and starve the explicit per-connection message drivers.
+                let mut yield_now = Box::pin(tokio::task::yield_now());
+                let _ = yield_now.as_mut().poll(cx);
             }
         }
         Poll::Pending
@@ -609,12 +613,11 @@ impl Drop for RdmaEngineDriver {
     }
 }
 
-pub(crate) fn preflight_driver_runtime() -> Result<()> {
+pub(crate) fn preflight_driver_runtime(driver_name: &str) -> Result<()> {
     if tokio::runtime::Handle::try_current().is_err() {
-        return Err(Error::InvalidConfig(
-            "RdmaEngineDriver must be polled inside an active Tokio runtime with time enabled"
-                .into(),
-        ));
+        return Err(Error::InvalidConfig(format!(
+            "{driver_name} must be polled inside an active Tokio runtime with time enabled"
+        )));
     }
     #[cfg(panic = "unwind")]
     {
@@ -623,9 +626,9 @@ pub(crate) fn preflight_driver_runtime() -> Result<()> {
                 drop(sleep);
                 Ok(())
             }
-            RuntimeProbe::Panicked => Err(Error::InvalidConfig(
-                "RdmaEngineDriver requires Tokio time to be enabled".into(),
-            )),
+            RuntimeProbe::Panicked => Err(Error::InvalidConfig(format!(
+                "{driver_name} requires Tokio time to be enabled"
+            ))),
         }
     }
     #[cfg(not(panic = "unwind"))]
@@ -2748,8 +2751,11 @@ mod tests {
         let (_engine, mut driver) = test_engine_pair(CompletionMode::Polling);
         let counter = CountingWaker::new();
         let waker = counter.waker();
-        let mut cx = TaskContext::from_waker(&waker);
-        assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
+        {
+            let mut cx = TaskContext::from_waker(&waker);
+            assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
+        }
+        tokio::task::yield_now().await;
         assert_eq!(counter.count(), 1);
         assert_eq!(
             driver.shared.driver_yields.load(Ordering::Acquire),
