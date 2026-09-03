@@ -116,13 +116,16 @@ use futures_util::task::AtomicWaker;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use super::engine::{
-    ConnectionState, ConnectionTerminalSink, DetachedCallbackAfterUnlock,
-    DetachedOperationCompletion, EngineShared, RdmaConnection, RdmaConnectionConfig, RdmaEngine,
-    RdmaListener, SetupSummary, preflight_driver_runtime,
+    RdmaConnection, RdmaConnectionConfig, RdmaEngine, RdmaListener,
+    io::{
+        IoConnection, IoEvent, IoEventReceiver, IoOperationContext, IoRecvRequest, IoSendRequest,
+        IoTerminalEvent,
+    },
 };
 use super::error::{Error, Result};
 use super::mr::{AccessIntent, Mr};
 use super::protocol;
+use super::runtime::preflight_driver_runtime;
 
 const DEFAULT_MESSAGE_HELLO_DEADLINE: Duration = Duration::from_secs(10);
 const MIN_MESSAGE_HELLO_DEADLINE: Duration = Duration::from_millis(1);
@@ -317,13 +320,11 @@ impl MessageTransportBuilder {
             mr_size: config.mr_size,
         };
         let connection = engine
-            .connect_with_setup(
-                addr,
-                config.connection,
-                Box::new(move |connection| setup.run(connection)),
-            )
+            .connect_with_io_setup(addr, config.connection, move |connection, events| {
+                setup.run(connection, events)
+            })
             .await?;
-        state.attach(&connection)?;
+        state.attach()?;
         let driver = MessageTransportDriver::new(Arc::clone(&state), config.hello_deadline);
         let transport = MessageTransport::from_engine(connection, state, config.buffer_size);
         Ok((transport, driver))
@@ -347,12 +348,11 @@ impl MessageTransportBuilder {
             mr_size: config.mr_size,
         };
         let connection = listener
-            .accept_with_setup(
-                config.connection,
-                Box::new(move |connection| setup.run(connection)),
-            )
+            .accept_with_io_setup(config.connection, move |connection, events| {
+                setup.run(connection, events)
+            })
             .await?;
-        state.attach(&connection)?;
+        state.attach()?;
         let driver = MessageTransportDriver::new(Arc::clone(&state), config.hello_deadline);
         let transport = MessageTransport::from_engine(connection, state, config.buffer_size);
         Ok((transport, driver))
@@ -375,7 +375,7 @@ struct MessagePreparation {
 }
 
 impl MessagePreparation {
-    fn run(self, connection: &RdmaConnection) -> Result<SetupSummary> {
+    fn run(self, connection: IoConnection, events: IoEventReceiver) -> Result<usize> {
         let total = self
             .recv_count
             .checked_add(protocol::CTRL_RECV_COUNT)
@@ -397,23 +397,24 @@ impl MessagePreparation {
         let mut entries = Vec::with_capacity(total);
         for _ in 0..total {
             let mr = connection.register_memory(self.mr_size, AccessIntent::LocalOnly)?;
-            let state = Arc::downgrade(&self.state);
-            entries.push((
+            entries.push(IoRecvRequest::new(
                 mr,
-                Box::new(move |completion| {
-                    if let Some(state) = state.upgrade() {
-                        state.enqueue_callback_event(EngineMessageEvent::Receive(completion))
-                    } else {
-                        // The callback owns the completion and its MR; dropping
-                        // it here is the only release path after state teardown.
-                        drop(completion);
-                        None
-                    }
-                }) as _,
+                IoOperationContext::new(MessageIoContext::Receive),
             ));
         }
-        let posted = connection.post_detached_recv_batch(entries)?;
-        Ok(SetupSummary { posted_wrs: posted })
+        let disposition = connection.post_recv_batch(entries);
+        debug_assert_eq!(
+            disposition.accepted() + disposition.proven_unaccepted(),
+            total
+        );
+        if !disposition.all_accepted() {
+            return Err(disposition.error().cloned().unwrap_or_else(|| {
+                Error::InvalidConfig("I/O setup failed without an error".into())
+            }));
+        }
+        let posted = disposition.accepted();
+        self.state.install_io(connection, events)?;
+        Ok(posted)
     }
 }
 
@@ -658,9 +659,9 @@ struct EngineMessagePools {
     hello_send: StdMutex<Option<Mr>>,
 }
 
-struct EngineMessageLink {
-    shared: Weak<EngineShared>,
-    connection: Weak<ConnectionState>,
+struct EngineMessageIo {
+    connection: IoConnection,
+    events: IoEventReceiver,
 }
 
 struct EngineHandshake {
@@ -671,18 +672,24 @@ struct EngineHandshake {
 
 enum EngineMessageEvent {
     Start,
-    Disconnected,
-    Terminal(Error),
-    Closed(Result<()>),
-    HelloSend(DetachedOperationCompletion),
-    Receive(DetachedOperationCompletion),
     Repost(Mr),
     SendRequest(Arc<EngineSendRequest>),
-    SendComplete {
-        request: Arc<EngineSendRequest>,
-        completion: DetachedOperationCompletion,
-    },
-    ControlSendComplete(DetachedOperationCompletion),
+    #[cfg(test)]
+    TestDisconnected,
+    #[cfg(test)]
+    TestTerminal(Error),
+}
+
+enum EngineMessageWork {
+    Protocol(EngineMessageEvent),
+    Io(IoEvent),
+}
+
+enum MessageIoContext {
+    HelloSend,
+    Receive,
+    Send(Arc<EngineSendRequest>),
+    ControlSend,
 }
 
 struct EngineSendRequest {
@@ -815,8 +822,12 @@ struct EngineMessageState {
     recv_notify: Notify,
     pending_credit_returns: AtomicUsize,
     local_close_started: AtomicBool,
-    link: OnceLock<EngineMessageLink>,
+    io: OnceLock<EngineMessageIo>,
     self_weak: OnceLock<Weak<EngineMessageState>>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    hold_io_events: AtomicBool,
+    #[cfg(any(test, feature = "test-hooks"))]
+    disposed_owned_io_completions: AtomicUsize,
 }
 
 impl EngineMessageState {
@@ -843,8 +854,12 @@ impl EngineMessageState {
             recv_notify: Notify::new(),
             pending_credit_returns: AtomicUsize::new(0),
             local_close_started: AtomicBool::new(false),
-            link: OnceLock::new(),
+            io: OnceLock::new(),
             self_weak: OnceLock::new(),
+            #[cfg(any(test, feature = "test-hooks"))]
+            hold_io_events: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-hooks"))]
+            disposed_owned_io_completions: AtomicUsize::new(0),
         }
     }
 
@@ -891,18 +906,24 @@ impl EngineMessageState {
         }
     }
 
-    fn attach(self: &Arc<Self>, connection: &RdmaConnection) -> Result<()> {
+    fn install_io(&self, connection: IoConnection, events: IoEventReceiver) -> Result<()> {
+        self.io
+            .set(EngineMessageIo { connection, events })
+            .map_err(|_| Error::InvalidConfig("message I/O installed more than once".into()))
+    }
+
+    fn io(&self) -> Result<&EngineMessageIo> {
+        self.io
+            .get()
+            .ok_or_else(|| Error::InvalidConfig("message I/O is not installed".into()))
+    }
+
+    fn attach(self: &Arc<Self>) -> Result<()> {
         self.pools()?;
+        self.io()?;
         self.self_weak
             .set(Arc::downgrade(self))
             .map_err(|_| Error::InvalidConfig("message state attached more than once".into()))?;
-        self.link
-            .set(EngineMessageLink {
-                shared: Arc::downgrade(&connection.shared),
-                connection: Arc::downgrade(&connection.state),
-            })
-            .map_err(|_| Error::InvalidConfig("message state attached more than once".into()))?;
-        connection.attach_terminal_sink(Arc::clone(self) as Arc<dyn ConnectionTerminalSink>)?;
         self.enqueue_event(EngineMessageEvent::Start);
         Ok(())
     }
@@ -917,25 +938,11 @@ impl EngineMessageState {
         }
     }
 
-    fn enqueue_callback_event(
-        self: Arc<Self>,
-        event: EngineMessageEvent,
-    ) -> Option<DetachedCallbackAfterUnlock> {
-        self.queue_event(event)
-            .then(|| Box::new(move || self.publish()) as DetachedCallbackAfterUnlock)
-    }
-
     fn queue_event(&self, event: EngineMessageEvent) -> bool {
-        let terminal_notice = matches!(
-            &event,
-            EngineMessageEvent::Disconnected
-                | EngineMessageEvent::Terminal(_)
-                | EngineMessageEvent::Closed(_)
-        );
         let mut event = Some(event);
         {
             let mut events = lock_std(&self.events);
-            if terminal_notice || self.state.load(Ordering::Acquire) < STATE_CLOSING {
+            if self.state.load(Ordering::Acquire) < STATE_CLOSING {
                 events.push_back(event.take().expect("event is present"));
             }
         }
@@ -949,16 +956,6 @@ impl EngineMessageState {
     fn dispose_terminal_event(&self, event: EngineMessageEvent) {
         match event {
             EngineMessageEvent::Start => {}
-            EngineMessageEvent::Disconnected
-            | EngineMessageEvent::Terminal(_)
-            | EngineMessageEvent::Closed(_) => {}
-            EngineMessageEvent::HelloSend(completion)
-            | EngineMessageEvent::Receive(completion)
-            | EngineMessageEvent::ControlSendComplete(completion) => match completion {
-                DetachedOperationCompletion::Unaccepted { mr, .. }
-                | DetachedOperationCompletion::Completed { mr: Some(mr), .. } => drop(mr),
-                DetachedOperationCompletion::Completed { mr: None, .. } => {}
-            },
             EngineMessageEvent::Repost(mr) => drop(mr),
             EngineMessageEvent::SendRequest(request) => match request.start() {
                 EngineSendRequestAction::Post { mr, credit, .. }
@@ -969,27 +966,56 @@ impl EngineMessageState {
                 }
                 EngineSendRequestAction::AlreadyHandled => {}
             },
-            EngineMessageEvent::SendComplete {
-                request,
-                completion,
-            } => {
-                if matches!(&completion, DetachedOperationCompletion::Unaccepted { .. }) {
-                    self.rollback_unaccepted_send(&request);
-                }
-                match completion {
-                    DetachedOperationCompletion::Unaccepted { mr, .. }
-                    | DetachedOperationCompletion::Completed { mr: Some(mr), .. } => drop(mr),
-                    DetachedOperationCompletion::Completed { mr: None, .. } => {}
-                }
-                request.complete(Err(self.terminal_error()));
-            }
+            #[cfg(test)]
+            EngineMessageEvent::TestDisconnected | EngineMessageEvent::TestTerminal(_) => {}
         }
     }
 
-    fn drain_terminal_events(&self) {
+    fn dispose_io_event(&self, event: IoEvent) {
+        let IoEvent::Completion(completion) = event else {
+            return;
+        };
+        let (_, context, _result, mr, proven_unaccepted) = completion.into_parts();
+        #[cfg(any(test, feature = "test-hooks"))]
+        if mr.is_some() {
+            self.disposed_owned_io_completions
+                .fetch_add(1, Ordering::AcqRel);
+        }
+        match context.downcast::<MessageIoContext>() {
+            Ok(MessageIoContext::Send(request)) => {
+                if proven_unaccepted {
+                    self.rollback_unaccepted_send(&request);
+                }
+                drop(mr);
+                request.complete(Err(self.terminal_error()));
+            }
+            Ok(
+                MessageIoContext::HelloSend
+                | MessageIoContext::Receive
+                | MessageIoContext::ControlSend,
+            )
+            | Err(_) => drop(mr),
+        }
+    }
+
+    fn drain_terminal_events(&self, close_io: bool) {
         let events = std::mem::take(&mut *lock_std(&self.events));
         for event in events {
             self.dispose_terminal_event(event);
+        }
+        if let Some(io) = self.io.get() {
+            let events = if close_io {
+                io.events.close()
+            } else {
+                io.events.drain()
+            };
+            for event in events {
+                if close_io {
+                    self.dispose_io_event(event);
+                } else {
+                    self.process_io_event(event);
+                }
+            }
         }
     }
 
@@ -1011,9 +1037,10 @@ impl EngineMessageState {
         self.remote_credits.close();
         self.pending_credit_returns.store(0, Ordering::Release);
         self.close_pools();
-        self.drain_terminal_events();
+        self.drain_terminal_events(true);
         self.state_notify.notify_waiters();
         self.recv_notify.notify_waiters();
+        self.publish();
         true
     }
 
@@ -1021,12 +1048,8 @@ impl EngineMessageState {
         if !self.enter_failed(error) {
             return;
         }
-        if close_connection
-            && let Some(link) = self.link.get()
-            && let (Some(shared), Some(connection)) =
-                (link.shared.upgrade(), link.connection.upgrade())
-        {
-            shared.begin_connection_close(&connection);
+        if close_connection && let Some(io) = self.io.get() {
+            io.connection.request_close();
         }
     }
 
@@ -1070,60 +1093,113 @@ impl EngineMessageState {
         self.remote_credits.close();
         self.pending_credit_returns.store(0, Ordering::Release);
         self.close_pools();
-        self.drain_terminal_events();
+        self.drain_terminal_events(false);
         self.state_notify.notify_waiters();
         self.recv_notify.notify_waiters();
         self.publish();
+        if locally_initiated && let Some(io) = self.io.get() {
+            io.connection.request_close();
+        }
         locally_initiated
     }
 
     fn finish_close(&self, result: &Result<()>) {
-        match result {
-            Ok(()) => {
-                transition_terminal(&self.state, STATE_STOPPED);
-            }
-            Err(error) => self.fail(error.clone(), false),
+        if let Err(error) = result {
+            self.fail(error.clone(), false);
+            return;
         }
+        let newly_stopped = transition_terminal(&self.state, STATE_STOPPED);
         self.close_pools();
-        self.drain_terminal_events();
+        self.drain_terminal_events(true);
         self.state_notify.notify_waiters();
         self.recv_notify.notify_waiters();
+        if newly_stopped {
+            self.publish();
+        }
     }
 
     fn process_event(&self, event: EngineMessageEvent) {
         match event {
             EngineMessageEvent::Start => self.start_hello_send(),
-            EngineMessageEvent::Disconnected => self.fail(Error::TransportClosed, true),
-            EngineMessageEvent::Terminal(error) => self.fail(error, false),
-            EngineMessageEvent::Closed(result) => self.finish_close(&result),
-            EngineMessageEvent::HelloSend(completion) => match completion {
-                DetachedOperationCompletion::Unaccepted { error, mr } => {
-                    drop(mr);
-                    self.fail(error, true);
-                }
-                DetachedOperationCompletion::Completed { result, mr } => {
-                    drop(mr);
-                    match result {
-                        Ok(_) => {
-                            lock_std(&self.handshake).hello_send_complete = true;
-                            self.try_mark_ready();
-                        }
-                        Err(error) => self.fail(normalize_message_completion_error(error), true),
-                    }
-                }
-            },
-            EngineMessageEvent::Receive(completion) => self.process_receive(completion),
             EngineMessageEvent::Repost(mr) => self.process_repost(mr),
             EngineMessageEvent::SendRequest(request) => self.process_send_request(request),
-            EngineMessageEvent::SendComplete {
-                request,
-                completion,
-            } => self.process_send_completion(request, completion),
-            EngineMessageEvent::ControlSendComplete(completion) => {
-                let (result, mr) = match completion {
-                    DetachedOperationCompletion::Unaccepted { error, mr } => (Err(error), Some(mr)),
-                    DetachedOperationCompletion::Completed { result, mr } => (result, mr),
-                };
+            #[cfg(test)]
+            EngineMessageEvent::TestDisconnected => self.fail(Error::TransportClosed, true),
+            #[cfg(test)]
+            EngineMessageEvent::TestTerminal(error) => self.fail(error, false),
+        }
+    }
+
+    fn process_io_event(&self, event: IoEvent) {
+        let completion = match event {
+            IoEvent::Terminal(IoTerminalEvent::Disconnected) => {
+                self.fail(Error::TransportClosed, true);
+                return;
+            }
+            IoEvent::Terminal(IoTerminalEvent::Terminal(error)) => {
+                self.fail(error, false);
+                return;
+            }
+            IoEvent::Terminal(IoTerminalEvent::Closed(result)) => {
+                self.finish_close(&result);
+                return;
+            }
+            IoEvent::Completion(completion) => {
+                if self.state.load(Ordering::Acquire) >= STATE_CLOSING {
+                    self.dispose_io_event(IoEvent::Completion(completion));
+                    return;
+                }
+                completion
+            }
+        };
+        let (_identity, context, result, mr, proven_unaccepted) = completion.into_parts();
+        self.process_io_completion(context, result, mr, proven_unaccepted);
+    }
+
+    fn process_io_completion(
+        &self,
+        context: IoOperationContext,
+        result: Result<super::op::Completion>,
+        mr: Option<Mr>,
+        proven_unaccepted: bool,
+    ) {
+        let context = match context.downcast::<MessageIoContext>() {
+            Ok(context) => context,
+            Err(_) => {
+                drop(mr);
+                self.fail(
+                    Error::InvalidConfig(
+                        "message I/O completion carried an unknown context".into(),
+                    ),
+                    true,
+                );
+                return;
+            }
+        };
+        match context {
+            MessageIoContext::HelloSend => {
+                drop(mr);
+                match result {
+                    Ok(_) if !proven_unaccepted => {
+                        lock_std(&self.handshake).hello_send_complete = true;
+                        self.try_mark_ready();
+                    }
+                    Ok(_) => self.fail(
+                        Error::InvalidConfig(
+                            "proven-unaccepted HELLO completion reported success".into(),
+                        ),
+                        true,
+                    ),
+                    Err(error) => {
+                        self.fail(normalize_message_completion_error(error), true);
+                    }
+                }
+            }
+            MessageIoContext::Receive => self.process_receive(result, mr),
+            MessageIoContext::Send(request) => {
+                self.process_send_completion(request, result, mr, proven_unaccepted);
+            }
+            MessageIoContext::ControlSend => {
                 let Some(mr) = mr else {
                     self.fail(Error::DriverShutdown, true);
                     return;
@@ -1149,11 +1225,7 @@ impl EngineMessageState {
         }
     }
 
-    fn process_receive(&self, completion: DetachedOperationCompletion) {
-        let (result, mr) = match completion {
-            DetachedOperationCompletion::Unaccepted { error, mr } => (Err(error), Some(mr)),
-            DetachedOperationCompletion::Completed { result, mr } => (result, mr),
-        };
+    fn process_receive(&self, result: Result<super::op::Completion>, mr: Option<Mr>) {
         let state = self.state.load(Ordering::Acquire);
         if state == STATE_CREATED {
             self.process_hello_receive(result, mr);
@@ -1249,36 +1321,26 @@ impl EngineMessageState {
     }
 
     fn post_receive(&self, mr: Mr, return_credit: bool) {
-        let connection = match self.connection() {
-            Ok(connection) => connection,
+        let io = match self.io() {
+            Ok(io) => io,
             Err(error) => {
+                drop(mr);
                 self.fail(error, false);
                 return;
             }
         };
-        let state = self.weak_self();
-        let posted = connection.post_detached_recv(
+        let disposition = io.connection.post_recv(IoRecvRequest::new(
             mr,
-            Box::new(move |completion| {
-                if let Some(state) = state.upgrade() {
-                    state.enqueue_callback_event(EngineMessageEvent::Receive(completion))
-                } else {
-                    // Completion callback ownership includes the receive MR.
-                    drop(completion);
-                    None
-                }
-            }),
-        );
-        match posted {
-            Ok(()) => {
-                if return_credit {
-                    self.pending_credit_returns.fetch_add(1, Ordering::AcqRel);
-                }
+            IoOperationContext::new(MessageIoContext::Receive),
+        ));
+        if disposition.all_accepted() {
+            if return_credit {
+                self.pending_credit_returns.fetch_add(1, Ordering::AcqRel);
             }
-            Err(error) if error.potentially_accepted() => {
-                self.fail(error.error().clone(), true);
-            }
-            Err(_) => {}
+        } else if disposition.potentially_accepted()
+            && let Some(error) = disposition.error()
+        {
+            self.fail(error.clone(), true);
         }
     }
 
@@ -1309,8 +1371,8 @@ impl EngineMessageState {
                     self.credits_in_flight.fetch_add(1, Ordering::AcqRel);
                     request.credit_committed.store(true, Ordering::Release);
                 }
-                let connection = match self.connection() {
-                    Ok(connection) => connection,
+                let io = match self.io() {
+                    Ok(io) => io,
                     Err(error) => {
                         self.rollback_unaccepted_send(&request);
                         if let Ok(pools) = self.pools() {
@@ -1320,26 +1382,17 @@ impl EngineMessageState {
                         return;
                     }
                 };
-                let state = self.weak_self();
-                let callback_request = Arc::clone(&request);
-                if let Err(error) = connection.post_detached_send(
+                let disposition = io.connection.post_send(IoSendRequest::new(
                     mr,
                     frame_len,
-                    Box::new(move |completion| {
-                        if let Some(state) = state.upgrade() {
-                            state.enqueue_callback_event(EngineMessageEvent::SendComplete {
-                                request: callback_request,
-                                completion,
-                            })
-                        } else {
-                            drop(completion);
-                            None
-                        }
-                    }),
-                ) && error.potentially_accepted()
+                    IoOperationContext::new(MessageIoContext::Send(Arc::clone(&request))),
+                ));
+                if disposition.potentially_accepted()
+                    && !disposition.all_accepted()
+                    && let Some(error) = disposition.error()
                 {
-                    request.complete(Err(error.error().clone()));
-                    self.fail(error.error().clone(), true);
+                    request.complete(Err(error.clone()));
+                    self.fail(error.clone(), true);
                 }
             }
         }
@@ -1348,12 +1401,10 @@ impl EngineMessageState {
     fn process_send_completion(
         &self,
         request: Arc<EngineSendRequest>,
-        completion: DetachedOperationCompletion,
+        result: Result<super::op::Completion>,
+        mr: Option<Mr>,
+        unaccepted: bool,
     ) {
-        let (result, mr, unaccepted) = match completion {
-            DetachedOperationCompletion::Unaccepted { error, mr } => (Err(error), Some(mr), true),
-            DetachedOperationCompletion::Completed { result, mr } => (result, mr, false),
-        };
         if unaccepted {
             self.rollback_unaccepted_send(&request);
         }
@@ -1432,8 +1483,8 @@ impl EngineMessageState {
             return false;
         }
         let frame_len = protocol::write_credit_frame(mr.as_mut_slice(), credits as u32);
-        let connection = match self.connection() {
-            Ok(connection) => connection,
+        let io = match self.io() {
+            Ok(io) => io,
             Err(error) => {
                 pools.control_sends.put(mr);
                 if self.state.load(Ordering::Acquire) == STATE_READY {
@@ -1444,29 +1495,19 @@ impl EngineMessageState {
                 return true;
             }
         };
-        let state = self.weak_self();
-        match connection.post_detached_send(
+        let disposition = io.connection.post_send(IoSendRequest::new(
             mr,
             frame_len,
-            Box::new(move |completion| {
-                if let Some(state) = state.upgrade() {
-                    state
-                        .enqueue_callback_event(EngineMessageEvent::ControlSendComplete(completion))
-                } else {
-                    drop(completion);
-                    None
+            IoOperationContext::new(MessageIoContext::ControlSend),
+        ));
+        if !disposition.all_accepted() {
+            if disposition.potentially_accepted() {
+                if let Some(error) = disposition.error() {
+                    self.fail(error.clone(), true);
                 }
-            }),
-        ) {
-            Ok(()) => {}
-            Err(error) if error.potentially_accepted() => {
-                self.fail(error.error().clone(), true);
-            }
-            Err(_) => {
-                if self.state.load(Ordering::Acquire) == STATE_READY {
-                    self.pending_credit_returns
-                        .fetch_add(credits, Ordering::AcqRel);
-                }
+            } else if self.state.load(Ordering::Acquire) == STATE_READY {
+                self.pending_credit_returns
+                    .fetch_add(credits, Ordering::AcqRel);
             }
         }
         true
@@ -1517,16 +1558,6 @@ impl EngineMessageState {
         }
     }
 
-    fn connection(&self) -> Result<RdmaConnection> {
-        let link = self
-            .link
-            .get()
-            .ok_or_else(|| Error::InvalidConfig("message state has no engine connection".into()))?;
-        let shared = link.shared.upgrade().ok_or(Error::TransportClosed)?;
-        let connection = link.connection.upgrade().ok_or(Error::TransportClosed)?;
-        Ok(RdmaConnection::from_state(shared, connection))
-    }
-
     fn start_hello_send(&self) {
         if self.state.load(Ordering::Acquire) != STATE_CREATED {
             return;
@@ -1538,8 +1569,8 @@ impl EngineMessageState {
             }
             handshake.hello_send_posted = true;
         }
-        let connection = match self.connection() {
-            Ok(connection) => connection,
+        let io = match self.io() {
+            Ok(io) => io,
             Err(error) => {
                 self.fail(error, false);
                 return;
@@ -1564,21 +1595,16 @@ impl EngineMessageState {
         let advertised_recv = self.local_recv_capacity as u32;
         let advertised_size = self.buffer_size as u32;
         let len = protocol::write_hello_frame(mr.as_mut_slice(), advertised_recv, advertised_size);
-        let state = self.weak_self();
-        if let Err(error) = connection.post_detached_send(
+        let disposition = io.connection.post_send(IoSendRequest::new(
             mr,
             len,
-            Box::new(move |completion| {
-                if let Some(state) = state.upgrade() {
-                    state.enqueue_callback_event(EngineMessageEvent::HelloSend(completion))
-                } else {
-                    drop(completion);
-                    None
-                }
-            }),
-        ) && error.potentially_accepted()
+            IoOperationContext::new(MessageIoContext::HelloSend),
+        ));
+        if disposition.potentially_accepted()
+            && !disposition.all_accepted()
+            && let Some(error) = disposition.error()
         {
-            self.fail(error.error().clone(), true);
+            self.fail(error.clone(), true);
         }
     }
 
@@ -1609,28 +1635,23 @@ impl EngineMessageState {
             );
             return;
         }
-        let connection = match self.connection() {
-            Ok(connection) => connection,
+        let io = match self.io() {
+            Ok(io) => io,
             Err(error) => {
+                drop(mr);
                 self.fail(error, false);
                 return;
             }
         };
-        let state = self.weak_self();
-        if let Err(error) = connection.post_detached_recv(
+        let disposition = io.connection.post_recv(IoRecvRequest::new(
             mr,
-            Box::new(move |completion| {
-                if let Some(state) = state.upgrade() {
-                    state.enqueue_callback_event(EngineMessageEvent::Receive(completion))
-                } else {
-                    // Completion callback ownership includes the receive MR.
-                    drop(completion);
-                    None
-                }
-            }),
-        ) {
-            if error.potentially_accepted() {
-                self.fail(error.error().clone(), true);
+            IoOperationContext::new(MessageIoContext::Receive),
+        ));
+        if !disposition.all_accepted() {
+            if disposition.potentially_accepted()
+                && let Some(error) = disposition.error()
+            {
+                self.fail(error.clone(), true);
             }
             return;
         }
@@ -1685,7 +1706,7 @@ impl EngineMessageState {
 }
 
 impl EngineMessageState {
-    fn process(&self, budget: usize, prefer_credit: &mut bool) -> usize {
+    fn process(&self, budget: usize, prefer_credit: &mut bool, prefer_io: &mut bool) -> usize {
         let mut processed = 0;
         while processed < budget {
             if *prefer_credit && self.flush_one_credit() {
@@ -1693,9 +1714,12 @@ impl EngineMessageState {
                 processed += 1;
                 continue;
             }
-            let event = { lock_std(&self.events).pop_front() };
-            if let Some(event) = event {
-                self.process_event(event);
+            let work = self.pop_work(prefer_io);
+            if let Some(work) = work {
+                match work {
+                    EngineMessageWork::Protocol(event) => self.process_event(event),
+                    EngineMessageWork::Io(event) => self.process_io_event(event),
+                }
                 *prefer_credit = true;
             } else if !self.flush_one_credit() {
                 break;
@@ -1705,8 +1729,47 @@ impl EngineMessageState {
         processed
     }
 
+    fn pop_work(&self, prefer_io: &mut bool) -> Option<EngineMessageWork> {
+        let pop_protocol = || {
+            lock_std(&self.events)
+                .pop_front()
+                .map(EngineMessageWork::Protocol)
+        };
+        let pop_io = || {
+            if self.io_events_held() {
+                None
+            } else {
+                self.io
+                    .get()
+                    .and_then(|io| io.events.pop())
+                    .map(EngineMessageWork::Io)
+            }
+        };
+        let work = if *prefer_io {
+            pop_io().or_else(pop_protocol)
+        } else {
+            pop_protocol().or_else(pop_io)
+        };
+        match &work {
+            Some(EngineMessageWork::Protocol(_)) => *prefer_io = true,
+            Some(EngineMessageWork::Io(_)) => *prefer_io = false,
+            None => {}
+        }
+        work
+    }
+
+    fn io_events_held(&self) -> bool {
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            self.hold_io_events.load(Ordering::Acquire)
+        }
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        false
+    }
+
     fn has_work(&self) -> bool {
         !lock_std(&self.events).is_empty()
+            || (!self.io_events_held() && self.io.get().is_some_and(|io| io.events.has_events()))
             || (self.pending_credit_returns.load(Ordering::Acquire) != 0
                 && self
                     .pools
@@ -1732,20 +1795,6 @@ impl EngineMessageState {
     }
 }
 
-impl ConnectionTerminalSink for EngineMessageState {
-    fn disconnected(&self) {
-        self.enqueue_event(EngineMessageEvent::Disconnected);
-    }
-
-    fn terminalize(&self, error: Error) {
-        self.enqueue_event(EngineMessageEvent::Terminal(error));
-    }
-
-    fn closed(&self, result: Result<()>) {
-        self.enqueue_event(EngineMessageEvent::Closed(result));
-    }
-}
-
 /// Explicit per-connection message-protocol progress driver.
 ///
 /// The application must poll or spawn exactly one driver returned alongside
@@ -1765,6 +1814,7 @@ pub struct MessageTransportDriver {
     hello_sleep: Option<Pin<Box<tokio::time::Sleep>>>,
     runtime_checked: bool,
     prefer_credit: bool,
+    prefer_io: bool,
     completed: bool,
 }
 
@@ -1776,6 +1826,7 @@ impl MessageTransportDriver {
             hello_sleep: None,
             runtime_checked: false,
             prefer_credit: false,
+            prefer_io: false,
             completed: false,
         }
     }
@@ -1814,8 +1865,11 @@ impl Future for MessageTransportDriver {
             this.hello_sleep = None;
         }
 
-        this.state
-            .process(MESSAGE_DRIVER_BUDGET, &mut this.prefer_credit);
+        this.state.process(
+            MESSAGE_DRIVER_BUDGET,
+            &mut this.prefer_credit,
+            &mut this.prefer_io,
+        );
         if let Some(result) = this.state.driver_result() {
             this.completed = true;
             return Poll::Ready(result);
@@ -1823,7 +1877,14 @@ impl Future for MessageTransportDriver {
 
         let observed_work = this.state.has_work();
         this.state.driver_waker.register(cx.waker());
-        if observed_work || this.state.has_work() {
+        if let Some(io) = this.state.io.get() {
+            io.events.register(cx.waker());
+        }
+        let terminal = matches!(
+            this.state.state.load(Ordering::Acquire),
+            STATE_STOPPED | STATE_FAILED
+        );
+        if observed_work || this.state.has_work() || terminal {
             cx.waker().wake_by_ref();
         }
         Poll::Pending
@@ -1891,7 +1952,7 @@ fn validate_peer_hello(hello: protocol::HelloPayload, local_buffer_size: usize) 
 /// engine-wide summaries from [`RdmaEngine::diagnostics`].
 pub struct MessageTransport {
     buffer_size: usize,
-    connection: RdmaConnection,
+    _connection: RdmaConnection,
     state: Arc<EngineMessageState>,
 }
 
@@ -1903,7 +1964,7 @@ impl MessageTransport {
     ) -> Self {
         Self {
             buffer_size,
-            connection,
+            _connection: connection,
             state,
         }
     }
@@ -1983,7 +2044,7 @@ impl MessageTransport {
     #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     pub fn test_connection(&self) -> Result<RdmaConnection> {
-        Ok(self.connection.clone())
+        Ok(self._connection.clone())
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1999,6 +2060,34 @@ impl MessageTransport {
             self.state.remote_credits.available_permits(),
             self.state.credits_in_flight.load(Ordering::Acquire),
         ))
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn test_hold_io_events(&self, hold: bool) -> Result<()> {
+        self.state.hold_io_events.store(hold, Ordering::Release);
+        self.state.publish();
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn test_queued_io_events(&self) -> Result<usize> {
+        Ok(self.state.io()?.events.queued_len())
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn test_queued_owned_io_completions(&self) -> Result<usize> {
+        Ok(self.state.io()?.events.queued_owned_completions())
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn test_disposed_owned_io_completions(&self) -> usize {
+        self.state
+            .disposed_owned_io_completions
+            .load(Ordering::Acquire)
     }
 
     /// Graceful async shutdown.
@@ -2018,7 +2107,7 @@ impl MessageTransport {
         let preexisting_error = (!self.state.local_close_started.load(Ordering::Acquire)
             && self.state.state.load(Ordering::Acquire) == STATE_FAILED)
             .then(|| self.state.terminal_error());
-        let result = self.connection.close().await;
+        let result = self.state.io()?.connection.close().await;
         self.state.finish_close(&result);
         match result {
             Err(error) => Err(error),
@@ -2042,8 +2131,6 @@ impl Drop for MessageTransport {
 #[cfg(test)]
 mod setup_tests {
     use super::*;
-    use crate::v2::engine::{BatchOwnershipTransfer, PreparedBatchOwnership};
-    use crate::v2::qp::BatchPostOutcome;
 
     #[test]
     fn checked_message_capacity_derivation_and_default_headroom_are_exact() {
@@ -2132,49 +2219,6 @@ mod setup_tests {
                 Err(Error::InvalidConfig(_))
             ));
         }
-    }
-
-    #[test]
-    fn accepted_prefix_and_ambiguous_setup_ownership_are_exact() {
-        let count = 5;
-        for first_unaccepted in 0..count {
-            let transfer = PreparedBatchOwnership::new((0..count).collect::<Vec<_>>())
-                .unwrap()
-                .consume(BatchPostOutcome::PrefixAccepted {
-                    accepted: first_unaccepted,
-                    first_unaccepted,
-                    source: std::io::Error::from_raw_os_error(libc::ENOMEM),
-                });
-            let BatchOwnershipTransfer::Partial {
-                accepted,
-                unaccepted,
-                ..
-            } = transfer
-            else {
-                panic!("valid bad_wr membership must produce an exact split");
-            };
-            assert_eq!(accepted, (0..first_unaccepted).collect::<Vec<_>>());
-            assert_eq!(unaccepted, (first_unaccepted..count).collect::<Vec<_>>());
-        }
-
-        let accepted = PreparedBatchOwnership::new((0..count).collect::<Vec<_>>())
-            .unwrap()
-            .consume(BatchPostOutcome::AllAccepted);
-        assert!(matches!(
-            accepted,
-            BatchOwnershipTransfer::Accepted(entries) if entries.len() == count
-        ));
-
-        let ambiguous = PreparedBatchOwnership::new((0..count).collect::<Vec<_>>())
-            .unwrap()
-            .consume(BatchPostOutcome::Ambiguous {
-                source: std::io::Error::from_raw_os_error(libc::EIO),
-            });
-        assert!(matches!(
-            ambiguous,
-            BatchOwnershipTransfer::Ambiguous { retained, .. }
-                if retained.len() == count
-        ));
     }
 }
 
@@ -2267,7 +2311,9 @@ mod hello_tests {
             .derive_engine_config()
             .unwrap();
         let state = Arc::new(EngineMessageState::new(&config));
-        state.terminalize(Error::ProtocolViolation("published first".into()));
+        state.enqueue_event(EngineMessageEvent::TestTerminal(Error::ProtocolViolation(
+            "published first".into(),
+        )));
         let mut driver = MessageTransportDriver::new(state, config.hello_deadline);
         let wake = Arc::new(CountingWake(AtomicUsize::new(0)));
         let waker = futures_util::task::waker(Arc::clone(&wake));
@@ -2292,12 +2338,122 @@ mod hello_tests {
         assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
         assert_eq!(wake.0.load(Ordering::Acquire), 0);
 
-        state.terminalize(Error::ProtocolViolation("wake registered poll".into()));
+        state.enqueue_event(EngineMessageEvent::TestTerminal(Error::ProtocolViolation(
+            "wake registered poll".into(),
+        )));
         assert_eq!(wake.0.load(Ordering::Acquire), 1);
         assert!(matches!(
             Pin::new(&mut driver).poll(&mut cx),
             Poll::Ready(Err(Error::ProtocolViolation(message)))
                 if message == "wake registered poll"
+        ));
+    }
+
+    #[tokio::test]
+    async fn successful_close_result_wakes_driver_before_late_engine_terminal_delivery() {
+        struct TerminalCheckingWake {
+            state: Arc<EngineMessageState>,
+            wakes: AtomicUsize,
+        }
+
+        impl futures_util::task::ArcWake for TerminalCheckingWake {
+            fn wake_by_ref(arc_self: &Arc<Self>) {
+                assert!(arc_self.state.error.try_lock().is_ok());
+                assert!(arc_self.state.events.try_lock().is_ok());
+                arc_self.wakes.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        let config = MessageTransportBuilder::new()
+            .derive_engine_config()
+            .unwrap();
+        let state = Arc::new(EngineMessageState::new(&config));
+        let (io, events, deliver_late_terminal) = IoConnection::with_delayed_close_event_for_test();
+        state.install_io(io, events).unwrap();
+        let frontend = Arc::clone(&state);
+        assert!(frontend.begin_close());
+
+        let mut driver = MessageTransportDriver::new(Arc::clone(&state), config.hello_deadline);
+        let wake = Arc::new(TerminalCheckingWake {
+            state: Arc::clone(&state),
+            wakes: AtomicUsize::new(0),
+        });
+        let waker = futures_util::task::waker(Arc::clone(&wake));
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
+        assert_eq!(wake.wakes.load(Ordering::Acquire), 0);
+
+        // The frontend close waiter can observe the connection result and
+        // close the I/O receiver before the engine delivers its terminal event.
+        // That late event is intentionally not needed to make driver progress.
+        frontend.finish_close(&Ok(()));
+        assert_eq!(wake.wakes.load(Ordering::Acquire), 1);
+        deliver_late_terminal();
+        assert_eq!(
+            wake.wakes.load(Ordering::Acquire),
+            1,
+            "the closed I/O receiver must discard the late terminal event"
+        );
+        assert!(Arc::strong_count(&frontend) > 1, "frontend remains alive");
+        assert!(matches!(
+            Pin::new(&mut driver).poll(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+    }
+
+    #[tokio::test]
+    async fn frontend_close_applies_an_already_queued_terminal_event() {
+        let config = MessageTransportBuilder::new()
+            .derive_engine_config()
+            .unwrap();
+        let state = Arc::new(EngineMessageState::new(&config));
+        let (io, events, deliver_terminal) = IoConnection::with_delayed_close_event_for_test();
+        state.install_io(io, events).unwrap();
+        deliver_terminal();
+        assert_eq!(
+            state.io().unwrap().events.queued_len(),
+            1,
+            "the engine close event must be queued before frontend close"
+        );
+
+        assert!(state.begin_close());
+        assert_eq!(
+            state.state.load(Ordering::Acquire),
+            STATE_STOPPED,
+            "frontend close must apply, not discard, a queued close event"
+        );
+
+        let mut driver = MessageTransportDriver::new(state, config.hello_deadline);
+        let wake = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let waker = futures_util::task::waker(wake);
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(
+            Pin::new(&mut driver).poll(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+    }
+
+    #[tokio::test]
+    async fn externally_published_failure_wakes_the_registered_driver() {
+        let config = MessageTransportBuilder::new()
+            .derive_engine_config()
+            .unwrap();
+        let state = Arc::new(EngineMessageState::new(&config));
+        let mut driver = MessageTransportDriver::new(Arc::clone(&state), config.hello_deadline);
+        let wake = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let waker = futures_util::task::waker(Arc::clone(&wake));
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
+
+        state.fail(
+            Error::ProtocolViolation("external terminal publication".into()),
+            false,
+        );
+        assert_eq!(wake.0.load(Ordering::Acquire), 1);
+        assert!(matches!(
+            Pin::new(&mut driver).poll(&mut cx),
+            Poll::Ready(Err(Error::ProtocolViolation(message)))
+                if message == "external terminal publication"
         ));
     }
 
@@ -2317,8 +2473,9 @@ mod hello_tests {
             let publisher_race = Arc::clone(&race);
             let publisher = std::thread::spawn(move || {
                 publisher_race.wait();
-                publisher_state
-                    .terminalize(Error::ProtocolViolation("concurrent publication".into()));
+                publisher_state.enqueue_event(EngineMessageEvent::TestTerminal(
+                    Error::ProtocolViolation("concurrent publication".into()),
+                ));
             });
             race.wait();
             let first = Pin::new(&mut driver).poll(&mut cx);
@@ -2455,9 +2612,12 @@ mod tests {
         let terminal = tokio::spawn(async move { terminal_state.wait_terminal().await });
         tokio::task::yield_now().await;
 
-        state.terminalize(Error::ProtocolViolation("steady-state failure".into()));
+        state.enqueue_event(EngineMessageEvent::TestTerminal(Error::ProtocolViolation(
+            "steady-state failure".into(),
+        )));
         let mut prefer_credit = false;
-        assert_eq!(state.process(1, &mut prefer_credit), 1);
+        let mut prefer_io = false;
+        assert_eq!(state.process(1, &mut prefer_credit, &mut prefer_io), 1);
         assert!(matches!(
             ready.await.unwrap(),
             Err(Error::ProtocolViolation(message)) if message == "steady-state failure"
@@ -2475,9 +2635,10 @@ mod tests {
     #[test]
     fn disconnected_engine_message_state_is_connection_local_terminal() {
         let state = engine_state();
-        state.disconnected();
+        state.enqueue_event(EngineMessageEvent::TestDisconnected);
         let mut prefer_credit = false;
-        assert_eq!(state.process(1, &mut prefer_credit), 1);
+        let mut prefer_io = false;
+        assert_eq!(state.process(1, &mut prefer_credit, &mut prefer_io), 1);
         assert_eq!(state.state.load(Ordering::Acquire), STATE_FAILED);
         assert!(matches!(state.terminal_error(), Error::TransportClosed));
     }
@@ -2487,18 +2648,16 @@ mod tests {
         let state = engine_state();
         state.state.store(STATE_READY, Ordering::Release);
 
-        let completion = DetachedOperationCompletion::Completed {
-            result: Err(Error::CompletionError {
+        state.process_io_completion(
+            IoOperationContext::new(MessageIoContext::Receive),
+            Err(Error::CompletionError {
                 status: crate::wc::WcStatus::WrFlushErr,
                 vendor_err: 0,
             }),
-            mr: None,
-        };
-        state.enqueue_event(EngineMessageEvent::Receive(completion));
+            None,
+            false,
+        );
 
-        assert_eq!(state.state.load(Ordering::Acquire), STATE_READY);
-        let mut prefer_credit = false;
-        assert_eq!(state.process(1, &mut prefer_credit), 1);
         assert_eq!(state.state.load(Ordering::Acquire), STATE_FAILED);
         assert!(matches!(state.terminal_error(), Error::TransportClosed));
     }
@@ -2507,18 +2666,16 @@ mod tests {
     fn unknown_completion_status_fails_the_message_connection_closed() {
         let state = engine_state();
         state.state.store(STATE_READY, Ordering::Release);
-        state.enqueue_event(EngineMessageEvent::Receive(
-            DetachedOperationCompletion::Completed {
-                result: Err(Error::CompletionError {
-                    status: crate::wc::WcStatus::Unknown(u32::MAX),
-                    vendor_err: 7,
-                }),
-                mr: None,
-            },
-        ));
+        state.process_io_completion(
+            IoOperationContext::new(MessageIoContext::Receive),
+            Err(Error::CompletionError {
+                status: crate::wc::WcStatus::Unknown(u32::MAX),
+                vendor_err: 7,
+            }),
+            None,
+            false,
+        );
 
-        let mut prefer_credit = false;
-        assert_eq!(state.process(1, &mut prefer_credit), 1);
         assert_eq!(state.state.load(Ordering::Acquire), STATE_FAILED);
         assert!(matches!(
             state.terminal_error(),
@@ -2742,12 +2899,12 @@ mod tests {
     fn missing_control_send_mr_fails_the_message_connection() {
         let state = engine_state();
         state.state.store(STATE_READY, Ordering::Release);
-        state.process_event(EngineMessageEvent::ControlSendComplete(
-            DetachedOperationCompletion::Completed {
-                result: Err(Error::TransportClosed),
-                mr: None,
-            },
-        ));
+        state.process_io_completion(
+            IoOperationContext::new(MessageIoContext::ControlSend),
+            Err(Error::TransportClosed),
+            None,
+            false,
+        );
         assert_eq!(state.state.load(Ordering::Acquire), STATE_FAILED);
         assert!(matches!(state.terminal_error(), Error::DriverShutdown));
     }

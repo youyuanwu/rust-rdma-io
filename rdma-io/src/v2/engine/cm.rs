@@ -650,14 +650,18 @@ impl CmState {
         match (destroy_result, finalize_result) {
             (Ok(()), Ok(())) => {
                 shared.record_connection_retired(&connection);
-                connection.finish_retirement();
+                if let Some(event) = connection.finish_retirement() {
+                    event.deliver();
+                }
                 self.finish_inbound_retirement(completion);
                 Ok(())
             }
             (destroy_result, finalize_result) => {
                 let error = connection_destruction_error(destroy_result, finalize_result);
                 let message = error_detail(&error);
-                connection.fail_retirement(error.clone());
+                if let Some(event) = connection.fail_retirement(error.clone()) {
+                    event.deliver();
+                }
                 self.fail_inbound_retirement(completion, message);
                 Err(error)
             }
@@ -1445,18 +1449,24 @@ impl CmState {
         let lifecycle = connection.lock_lifecycle();
         let qp_boundary = connection.establish_qp_destruction_boundary(&lifecycle);
         drop(lifecycle);
-        if let Err(error) = qp_boundary {
-            tracing::warn!(
-                slot = connection.token.slot,
-                generation = connection.token.generation,
-                qp_num = connection.qp_num(),
-                %error,
-                "connection QP destroy failed; retaining CM route and ownership bundle"
-            );
-            shared.track_connection_quarantine(connection.token);
-            connection.publish_destroy_quarantine(&error, || {});
-            return Ok(());
-        }
+        let _qp_destruction_proof = match qp_boundary {
+            Ok(proof) => proof,
+            Err(error) => {
+                tracing::warn!(
+                    slot = connection.token.slot,
+                    generation = connection.token.generation,
+                    qp_num = connection.qp_num(),
+                    %error,
+                    "connection QP destroy failed; retaining CM route and ownership bundle"
+                );
+                shared.track_connection_quarantine(connection.token);
+                let (_, event) = connection.publish_destroy_quarantine(&error, || {});
+                if let Some(event) = event {
+                    event.deliver();
+                }
+                return Ok(());
+            }
+        };
         let retirement = match connection.cm_route() {
             Some(ConnectionCmRoute::Outbound(encoded)) => {
                 self.retire_outbound_connection_route(encoded, &connection)?
@@ -1477,7 +1487,7 @@ impl CmState {
         let lifecycle = connection.lock_lifecycle();
         let resources = connection.destroy_connection_resources(&lifecycle);
         drop(lifecycle);
-        let (cm_id, qp_destroyed) = match resources {
+        let (cm_id, _qp_destruction_proof) = match resources {
             Ok(resources) => resources,
             Err(error) => {
                 tracing::warn!(
@@ -1488,12 +1498,14 @@ impl CmState {
                     "connection resource finalization failed; retaining terminal quarantine"
                 );
                 shared.track_connection_quarantine(connection.token);
-                connection.publish_destroy_quarantine(&error, || {});
+                let (_, event) = connection.publish_destroy_quarantine(&error, || {});
+                if let Some(event) = event {
+                    event.deliver();
+                }
                 self.finish_inbound_retirement(completion);
                 return Ok(());
             }
         };
-        let _ = qp_destroyed;
         if let Some(cm_id) = cm_id {
             if reject.is_some() {
                 cm_id.reject(&[]).map_err(|error| {
@@ -1564,7 +1576,10 @@ impl CmState {
                 connection.begin_close();
                 let _ = connection.try_begin_retirement();
                 shared.track_connection_quarantine(connection.token);
-                connection.publish_destroy_quarantine(destroy_error, || {});
+                let (_, event) = connection.publish_destroy_quarantine(destroy_error, || {});
+                if let Some(event) = event {
+                    event.deliver();
+                }
                 Some(EstablishedConnectionRoute::new(&connection))
             }
         }
@@ -1584,7 +1599,9 @@ impl CmState {
     ) -> Result<()> {
         self.release_connection_retirement(shared, &connection)?;
         shared.record_connection_retired(&connection);
-        connection.finish_retirement();
+        if let Some(event) = connection.finish_retirement() {
+            event.deliver();
+        }
         Ok(())
     }
 
@@ -1990,7 +2007,9 @@ impl CmState {
             self.inbound_routes.release(route.token, true);
             return Ok(EventDisposition::Handled);
         };
-        connection_state.mark_disconnected();
+        if let Some(event) = connection_state.mark_disconnected() {
+            event.deliver();
+        }
         route.set_state(InboundState::Closing {
             connection: connection.clone(),
             request: request.clone(),
@@ -2049,8 +2068,11 @@ impl CmState {
                 connection,
             } => {
                 let connection_state = Arc::clone(&connection.state);
-                connection_state
-                    .mark_cm_failure(Error::Verbs(std::io::Error::other(message.clone())));
+                if let Some(event) = connection_state
+                    .mark_cm_failure(Error::Verbs(std::io::Error::other(message.clone())))
+                {
+                    event.deliver();
+                }
                 route.set_state(InboundState::Closing {
                     connection: EstablishedConnectionRoute::new(&connection_state),
                     request: Some(request),
@@ -2072,8 +2094,11 @@ impl CmState {
                     self.inbound_routes.release(route.token, true);
                     return Ok(EventDisposition::Handled);
                 };
-                connection_state
-                    .mark_cm_failure(Error::Verbs(std::io::Error::other(message.clone())));
+                if let Some(event) = connection_state
+                    .mark_cm_failure(Error::Verbs(std::io::Error::other(message.clone())))
+                {
+                    event.deliver();
+                }
                 route.set_state(InboundState::Closing {
                     connection: connection.clone(),
                     request: Some(Arc::clone(&request)),
@@ -2105,8 +2130,11 @@ impl CmState {
                     self.inbound_routes.release(route.token, true);
                     return Ok(EventDisposition::Handled);
                 };
-                connection_state
-                    .mark_cm_failure(Error::Verbs(std::io::Error::other(message.clone())));
+                if let Some(event) = connection_state
+                    .mark_cm_failure(Error::Verbs(std::io::Error::other(message.clone())))
+                {
+                    event.deliver();
+                }
                 route.set_state(InboundState::Closing {
                     connection: connection.clone(),
                     request: None,
@@ -2406,7 +2434,9 @@ impl CmState {
             self.retire_route(route, true);
             return Ok(EventDisposition::Handled);
         };
-        connection_state.mark_disconnected();
+        if let Some(event) = connection_state.mark_disconnected() {
+            event.deliver();
+        }
         let awaiting_delivery = request
             .as_ref()
             .is_some_and(|request| !request.delivered.load(Ordering::Acquire));
@@ -2495,8 +2525,11 @@ impl CmState {
                     self.retire_route(route, true);
                     return Ok(EventDisposition::Handled);
                 };
-                connection_state
-                    .mark_cm_failure(Error::Verbs(std::io::Error::other(message.clone())));
+                if let Some(event) = connection_state
+                    .mark_cm_failure(Error::Verbs(std::io::Error::other(message.clone())))
+                {
+                    event.deliver();
+                }
                 if request.delivered.load(Ordering::Acquire) {
                     route.set_state(OutboundState::Failed {
                         connection: connection.clone(),
@@ -2518,8 +2551,11 @@ impl CmState {
                     self.retire_route(route, true);
                     return Ok(EventDisposition::Handled);
                 };
-                connection_state
-                    .mark_cm_failure(Error::Verbs(std::io::Error::other(message.clone())));
+                if let Some(event) = connection_state
+                    .mark_cm_failure(Error::Verbs(std::io::Error::other(message.clone())))
+                {
+                    event.deliver();
+                }
                 route.set_state(OutboundState::Failed {
                     connection: connection.clone(),
                 });
@@ -3715,13 +3751,23 @@ mod tests {
             &["setup", "pre-connect", "connect"]
         );
 
+        let failed_connection = install_connection(
+            &engine.shared,
+            Arc::new(NoopPoster(8)),
+            RdmaConnectionConfig::default()
+                .max_send_wr(1)
+                .max_recv_wr(1),
+            None,
+            None,
+        )
+        .unwrap();
         lock_unpoison(&order).clear();
         let error = run_setup_before_establish(
             recording_setup(
                 Arc::clone(&order),
                 Err(Error::InvalidConfig("setup failed".into())),
             ),
-            &connection,
+            &failed_connection,
             || {
                 lock_unpoison(&order).push("pre-connect");
                 Ok(())
@@ -3735,10 +3781,20 @@ mod tests {
         assert!(matches!(error, Error::InvalidConfig(_)));
         assert_eq!(&*lock_unpoison(&order), &["setup"]);
 
+        let mismatched_connection = install_connection(
+            &engine.shared,
+            Arc::new(NoopPoster(9)),
+            RdmaConnectionConfig::default()
+                .max_send_wr(1)
+                .max_recv_wr(1),
+            None,
+            None,
+        )
+        .unwrap();
         lock_unpoison(&order).clear();
         let error = run_setup_before_establish(
             recording_setup(Arc::clone(&order), Ok(SetupSummary { posted_wrs: 1 })),
-            &connection,
+            &mismatched_connection,
             || {
                 lock_unpoison(&order).push("pre-connect");
                 Ok(())
@@ -3751,6 +3807,9 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, Error::InvalidConfig(_)));
         assert_eq!(&*lock_unpoison(&order), &["setup"]);
+        drop(mismatched_connection);
+        drop(failed_connection);
+        drop(connection);
         drop(driver);
     }
 
@@ -3893,7 +3952,7 @@ mod tests {
         drop(admission);
         // This scheduler-only fixture has no real QP, so record its synthetic
         // destruction boundary before exercising route-state retry behavior.
-        connection.state.mark_qp_destroyed();
+        let _proof = connection.state.mint_qp_destruction_proof_for_test();
 
         engine.shared.cm.enqueue_retirement(connection.state.token);
         let processed = engine
@@ -4260,9 +4319,9 @@ mod tests {
         order: Arc<Mutex<Vec<&'static str>>>,
         result: Result<SetupSummary>,
     ) -> ConnectionSetup {
-        Box::new(move |_connection| {
+        Box::new(move |_connection, _events| {
             lock_unpoison(&order).push("setup");
-            result
+            result.map(|summary| summary.posted_wrs)
         })
     }
 

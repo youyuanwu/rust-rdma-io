@@ -455,6 +455,84 @@ async fn run_message_driver_first_is_connection_local(mode: CompletionMode) {
     shutdown_engine(client_engine, client_engine_driver).await;
 }
 
+async fn run_queued_owned_completion_is_drained_on_driver_drop(mode: CompletionMode) {
+    let recorder = DestructionRecorder::arm(512);
+    let (server_engine, server_driver) = build_engine(mode, 1, Duration::from_secs(5));
+    let (client_engine, client_driver) = build_engine(mode, 1, Duration::from_secs(5));
+    let config = MessageConfig {
+        sends: 1,
+        recvs: 2,
+        size: 64,
+    };
+    let (listener, server, mut client) = establish_on(&server_engine, &client_engine, config).await;
+    let baseline = client_engine.diagnostics();
+
+    client.test_hold_io_events(true).unwrap();
+    let mut send = Box::pin(client.send(b"queued-owned-completion"));
+    poll_fn(|cx| {
+        assert!(send.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if client.test_queued_io_events().unwrap() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("local SEND completion was not queued at the message I/O boundary");
+
+    assert_eq!(client.test_queued_owned_io_completions().unwrap(), 1);
+    assert_eq!(client.test_available_send_buffers().unwrap(), 0);
+    let before = client_engine.diagnostics();
+    assert_eq!(before.accepted_operations, baseline.accepted_operations);
+    assert_eq!(before.registered_operations, baseline.registered_operations);
+    assert_eq!(before.quarantined_operations, 0);
+    assert_eq!(before.retained_cq_credits, 0);
+    let disposed_before = client.test_disposed_owned_io_completions();
+    let deregistered_before = recorder
+        .snapshot()
+        .iter()
+        .filter(|event| event.kind == DestructionKind::MemoryRegion)
+        .count();
+
+    drop(send);
+    client.abort_driver().await;
+
+    assert_eq!(client.test_queued_io_events().unwrap(), 0);
+    assert_eq!(
+        client.test_disposed_owned_io_completions(),
+        disposed_before + 1
+    );
+    assert!(
+        recorder
+            .snapshot()
+            .iter()
+            .filter(|event| event.kind == DestructionKind::MemoryRegion)
+            .count()
+            > deregistered_before,
+        "dropping the driver must release the exact-CQE-owned queued MR"
+    );
+    let after = client_engine.diagnostics();
+    assert_eq!(after.quarantined_operations, 0);
+    assert_eq!(after.retained_cq_credits, 0);
+
+    let _ = client.shutdown().await;
+    let closed = client_engine.diagnostics();
+    assert_eq!(closed.accepted_operations, 0);
+    assert_eq!(closed.registered_operations, 0);
+    assert_eq!(closed.quarantined_operations, 0);
+    assert_eq!(closed.retained_cq_credits, 0);
+    let _ = server.shutdown().await;
+    listener.close().await.unwrap();
+    shutdown_engine(server_engine, server_driver).await;
+    shutdown_engine(client_engine, client_driver).await;
+    let _ = recorder.take();
+}
+
 async fn run_frontend_first_closes_its_driver(mode: CompletionMode) {
     let (server_engine, server_engine_driver) = build_engine(mode, 1, Duration::from_secs(5));
     let (client_engine, client_engine_driver) = build_engine(mode, 1, Duration::from_secs(5));
@@ -763,6 +841,7 @@ async fn driver_engine_and_frontend_shutdown_orderings_are_explicit() {
     }
     for mode in [CompletionMode::Readiness, CompletionMode::Polling] {
         run_message_driver_first_is_connection_local(mode).await;
+        run_queued_owned_completion_is_drained_on_driver_drop(mode).await;
         run_frontend_first_closes_its_driver(mode).await;
         run_engine_first_terminalizes_message_driver(mode).await;
     }

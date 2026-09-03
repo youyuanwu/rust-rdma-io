@@ -83,6 +83,8 @@ mod pd;
 #[cfg(any(test, feature = "tokio"))]
 mod protocol;
 mod qp;
+#[cfg(feature = "tokio")]
+mod runtime;
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
 pub mod test_support;

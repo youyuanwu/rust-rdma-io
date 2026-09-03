@@ -95,7 +95,7 @@ impl EngineShared {
                 && !connection.retirement_is_quarantined()
             {
                 match connection.establish_qp_destruction_boundary(&_lifecycle) {
-                    Ok(_) => {}
+                    Ok(_proof) => {}
                     Err(error) => {
                         tracing::warn!(
                             qp_num = connection.qp_num(),
@@ -237,10 +237,13 @@ mod tests {
         .unwrap();
         connection.state.begin_close();
         assert!(connection.state.try_begin_retirement());
-        connection.state.publish_destroy_quarantine(
+        let (_, event) = connection.state.publish_destroy_quarantine(
             &Error::InvalidConfig("injected destroy failure".into()),
             || {},
         );
+        if let Some(event) = event {
+            event.deliver();
+        }
 
         engine.shared.synchronously_prepare_driver_drop();
         engine.shared.synchronously_prepare_driver_drop();

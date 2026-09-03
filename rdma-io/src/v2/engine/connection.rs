@@ -9,12 +9,13 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard};
 use tokio::sync::Notify;
 
 use self::qp::QpCapabilitiesExt;
+use super::io::{IoEventSender, IoTerminalEvent, PendingIoEvent};
 use super::lifecycle::MemoizedTerminalResult;
 use super::operation::RdmaOperation;
 use super::registry::{
     ConnectionToken, OperationToken, lock_unpoison, read_unpoison, write_unpoison,
 };
-use super::{ConnectionTerminalSink, EngineShared, RdmaConnectionConfig};
+use super::{EngineShared, RdmaConnectionConfig};
 use crate::cm::{CmId, ConnParam, EventChannel};
 use crate::v2::error::{Error, Result};
 use crate::v2::mr::{AccessIntent, Mr, RemoteMr};
@@ -64,14 +65,27 @@ impl RdmaConnectionIdentity {
     }
 }
 
+#[derive(Clone)]
+pub(super) struct QpDestructionProof {
+    connection: ConnectionToken,
+    qp_num: u32,
+    _private: (),
+}
+
+impl QpDestructionProof {
+    pub(super) fn proves(&self, connection: &ConnectionState) -> bool {
+        self.connection == connection.token && self.qp_num == connection.qp_num
+    }
+}
+
 /// Engine-owned low-level RDMA connection.
 ///
 /// The connection exposes owned operation futures but no raw PD, QP, CQ, CM,
 /// or independently pollable completion-driver handle. Establishment posts
 /// zero initial receives.
 pub struct RdmaConnection {
-    pub(crate) shared: Arc<EngineShared>,
-    pub(crate) state: Arc<ConnectionState>,
+    pub(super) shared: Arc<EngineShared>,
+    pub(super) state: Arc<ConnectionState>,
 }
 
 impl Clone for RdmaConnection {
@@ -85,11 +99,6 @@ impl Clone for RdmaConnection {
 }
 
 impl RdmaConnection {
-    pub(crate) fn from_state(shared: Arc<EngineShared>, state: Arc<ConnectionState>) -> Self {
-        state.frontend_count.fetch_add(1, Ordering::Relaxed);
-        Self { shared, state }
-    }
-
     /// Register owned memory against this engine's shared protection domain.
     ///
     /// The returned MR remains owned by the caller until it is submitted in an
@@ -168,10 +177,6 @@ impl RdmaConnection {
         self.state.identity()
     }
 
-    pub(crate) fn attach_terminal_sink(&self, sink: Arc<dyn ConnectionTerminalSink>) -> Result<()> {
-        self.state.attach_terminal_sink(sink)
-    }
-
     /// Stop new posting and wait for the exact accepted set to drain safely.
     ///
     /// A successful close retires the CM route and connection registry
@@ -225,7 +230,7 @@ impl Drop for RdmaConnection {
     }
 }
 
-pub(crate) struct ConnectionState {
+pub(super) struct ConnectionState {
     pub(super) token: ConnectionToken,
     qp_num: u32,
     config: RdmaConnectionConfig,
@@ -235,22 +240,22 @@ pub(crate) struct ConnectionState {
     posting_open: AtomicBool,
     // Nested lifecycle synchronization always follows:
     // EngineShared::admission -> lifecycle_gate -> posting_gate.
-    // terminal_sink is held only long enough to clone/install its Arc and is
-    // never held while invoking ConnectionTerminalSink.
+    // io_events is held only long enough to clone/install its sender and is
+    // never held while enqueuing or waking a protocol consumer.
     posting_gate: RwLock<()>,
     lifecycle_gate: Mutex<()>,
     local_credits: Mutex<LocalCredits>,
     accepted: Mutex<HashSet<AcceptedWrIdentity>>,
     completions: Mutex<VecDeque<WorkCompletion>>,
-    terminal_sink: Mutex<Option<Arc<dyn ConnectionTerminalSink>>>,
+    io_events: Mutex<Option<IoEventSender>>,
     completion_published: AtomicBool,
     close_started: AtomicBool,
     close_outcome: Mutex<Option<MemoizedTerminalResult>>,
-    close_notify: Notify,
+    pub(super) close_notify: Notify,
     quarantined: AtomicBool,
     error_transition_started: AtomicBool,
     error_transition_complete: AtomicBool,
-    qp_destruction_boundary: AtomicBool,
+    qp_destruction_proof: OnceLock<QpDestructionProof>,
     frontend_count: AtomicUsize,
     retirement_requested: AtomicBool,
     retirement_started: AtomicBool,
@@ -289,7 +294,7 @@ impl ConnectionState {
             local_credits: Mutex::new(LocalCredits::default()),
             accepted: Mutex::new(HashSet::new()),
             completions: Mutex::new(VecDeque::new()),
-            terminal_sink: Mutex::new(None),
+            io_events: Mutex::new(None),
             completion_published: AtomicBool::new(false),
             close_started: AtomicBool::new(false),
             close_outcome: Mutex::new(None),
@@ -297,7 +302,7 @@ impl ConnectionState {
             quarantined: AtomicBool::new(false),
             error_transition_started: AtomicBool::new(false),
             error_transition_complete: AtomicBool::new(false),
-            qp_destruction_boundary: AtomicBool::new(false),
+            qp_destruction_proof: OnceLock::new(),
             frontend_count: AtomicUsize::new(1),
             retirement_requested: AtomicBool::new(false),
             retirement_started: AtomicBool::new(false),
@@ -399,29 +404,35 @@ impl ConnectionState {
         !lock_unpoison(&self.completions).is_empty()
     }
 
-    pub(super) fn attach_terminal_sink(&self, sink: Arc<dyn ConnectionTerminalSink>) -> Result<()> {
-        let mut current = lock_unpoison(&self.terminal_sink);
+    pub(super) fn install_io_event_sender(
+        &self,
+        sender: IoEventSender,
+    ) -> Result<Option<PendingIoEvent>> {
+        let mut current = lock_unpoison(&self.io_events);
         if current.is_some() {
             return Err(Error::InvalidConfig(
-                "connection already has an attached terminal sink".into(),
+                "connection already has an attached I/O event port".into(),
             ));
         }
-        *current = Some(Arc::clone(&sink));
+        *current = Some(sender);
         let already_terminal = !self.posting_open.load(Ordering::Acquire);
         drop(current);
-        if already_terminal {
-            let error = self.operation_close_error();
-            if matches!(error, Error::TransportClosed) {
-                sink.disconnected();
-            } else {
-                sink.terminalize(error);
-            }
+        if !already_terminal {
+            return Ok(None);
         }
-        Ok(())
+        let error = self.operation_close_error();
+        Ok(
+            self.pending_io_event(if matches!(error, Error::TransportClosed) {
+                IoTerminalEvent::Disconnected
+            } else {
+                IoTerminalEvent::Terminal(error)
+            }),
+        )
     }
 
-    fn terminal_sink(&self) -> Option<Arc<dyn ConnectionTerminalSink>> {
-        lock_unpoison(&self.terminal_sink).clone()
+    fn pending_io_event(&self, event: IoTerminalEvent) -> Option<PendingIoEvent> {
+        let sender = lock_unpoison(&self.io_events).clone();
+        sender.map(|sender| sender.terminal(event))
     }
 
     pub(super) fn mark_completion_published(&self) -> bool {
@@ -441,7 +452,10 @@ impl ConnectionState {
         lock_unpoison(&self.lifecycle_gate)
     }
 
-    pub(super) fn finalize_engine(&self, outcome: &MemoizedTerminalResult) {
+    pub(super) fn finalize_engine(
+        &self,
+        outcome: &MemoizedTerminalResult,
+    ) -> Option<PendingIoEvent> {
         self.stop_posting();
         let _ = self.transition_to_error_once();
         if let Some(error) = outcome.error() {
@@ -450,30 +464,25 @@ impl ConnectionState {
                 *close_outcome = Some(MemoizedTerminalResult::from_error(error.clone()));
             }
             drop(close_outcome);
-            if let Some(sink) = self.terminal_sink() {
-                sink.terminalize(error);
-            }
+            return self.pending_io_event(IoTerminalEvent::Terminal(error));
         }
+        None
     }
 
-    pub(super) fn mark_disconnected(&self) {
+    pub(super) fn mark_disconnected(&self) -> Option<PendingIoEvent> {
         self.stop_posting();
-        if let Some(sink) = self.terminal_sink() {
-            sink.disconnected();
-        }
+        self.pending_io_event(IoTerminalEvent::Disconnected)
     }
 
-    pub(super) fn mark_cm_failure(&self, error: Error) {
+    pub(super) fn mark_cm_failure(&self, error: Error) -> Option<PendingIoEvent> {
         self.stop_posting();
         let mut outcome = lock_unpoison(&self.close_outcome);
         if outcome.is_none() {
             *outcome = Some(MemoizedTerminalResult::from_error(error.clone()));
         }
         drop(outcome);
-        if let Some(sink) = self.terminal_sink() {
-            sink.terminalize(error);
-        }
         self.close_notify.notify_waiters();
+        self.pending_io_event(IoTerminalEvent::Terminal(error))
     }
 
     pub(super) fn transition_to_error_once(&self) -> Result<bool> {
@@ -493,7 +502,7 @@ impl ConnectionState {
     pub(super) fn destroy_connection_resources(
         &self,
         _lifecycle: &MutexGuard<'_, ()>,
-    ) -> Result<(Option<SharedCmId>, bool)> {
+    ) -> Result<(Option<SharedCmId>, QpDestructionProof)> {
         let outstanding_operations = self.accepted_count();
         if outstanding_operations != 0 {
             return Err(Error::EngineWedged {
@@ -503,30 +512,33 @@ impl ConnectionState {
             });
         }
         self.stop_posting();
-        let destroy_qp = !self.qp_destruction_boundary.load(Ordering::Acquire);
-        let resources = self.poster.destroy_connection(destroy_qp)?;
-        if resources.1 {
-            self.mark_qp_destroyed();
-        }
-        Ok(resources)
+        let destroy_qp = self.qp_destruction_proof.get().is_none();
+        let (cm_id, qp_destroyed) = self.poster.destroy_connection(destroy_qp)?;
+        let proof = if qp_destroyed {
+            self.mint_qp_destruction_proof()
+        } else {
+            self.qp_destruction_proof.get().cloned().ok_or_else(|| {
+                Error::InvalidConfig(
+                    "connection resources lost QP ownership without a destruction proof".into(),
+                )
+            })?
+        };
+        Ok((cm_id, proof))
     }
 
     pub(super) fn establish_qp_destruction_boundary(
         &self,
         _lifecycle: &MutexGuard<'_, ()>,
-    ) -> Result<bool> {
+    ) -> Result<QpDestructionProof> {
         self.stop_posting();
-        if self.qp_destruction_boundary.load(Ordering::Acquire) {
-            return Ok(false);
+        if let Some(proof) = self.qp_destruction_proof.get() {
+            return Ok(proof.clone());
         }
         match self.poster.destroy_qp() {
-            Ok(true) => {
-                self.mark_qp_destroyed();
-                Ok(true)
-            }
+            Ok(true) => Ok(self.mint_qp_destruction_proof()),
             Ok(false) => {
-                if self.qp_destruction_boundary.load(Ordering::Acquire) {
-                    Ok(false)
+                if let Some(proof) = self.qp_destruction_proof.get() {
+                    Ok(proof.clone())
                 } else {
                     Err(Error::InvalidConfig(
                         "QP ownership disappeared before its destruction boundary was recorded"
@@ -535,8 +547,8 @@ impl ConnectionState {
                 }
             }
             Err(error) => {
-                if self.qp_destruction_boundary.load(Ordering::Acquire) {
-                    Ok(false)
+                if let Some(proof) = self.qp_destruction_proof.get() {
+                    Ok(proof.clone())
                 } else {
                     Err(error)
                 }
@@ -565,7 +577,7 @@ impl ConnectionState {
         Some((outstanding, outstanding))
     }
 
-    pub(super) fn publish_quarantine(&self, outstanding: usize) {
+    pub(super) fn publish_quarantine(&self, outstanding: usize) -> Option<PendingIoEvent> {
         let error = Error::ConnectionQuarantined {
             outstanding_operations: outstanding,
             cq_debt: outstanding,
@@ -575,17 +587,15 @@ impl ConnectionState {
             *outcome = Some(MemoizedTerminalResult::from_error(error.clone()));
         }
         drop(outcome);
-        if let Some(sink) = self.terminal_sink() {
-            sink.terminalize(error);
-        }
         self.close_notify.notify_waiters();
+        self.pending_io_event(IoTerminalEvent::Terminal(error))
     }
 
     pub(super) fn publish_destroy_quarantine(
         &self,
         error: &Error,
         before_publish: impl FnOnce(),
-    ) -> bool {
+    ) -> (bool, Option<PendingIoEvent>) {
         self.retirement_quarantined.store(true, Ordering::Release);
         let mut outcome = lock_unpoison(&self.close_outcome);
         let newly_published = !outcome
@@ -598,14 +608,14 @@ impl ConnectionState {
             };
             *outcome = Some(MemoizedTerminalResult::from_error(published.clone()));
             drop(outcome);
-            if let Some(sink) = self.terminal_sink() {
-                sink.terminalize(published);
-            }
+            let event = self.pending_io_event(IoTerminalEvent::Terminal(published));
+            self.close_notify.notify_waiters();
+            return (true, event);
         } else {
             drop(outcome);
         }
         self.close_notify.notify_waiters();
-        newly_published
+        (newly_published, None)
     }
 
     pub(super) fn recover_quarantine(&self) -> bool {
@@ -616,20 +626,18 @@ impl ConnectionState {
         self.accepted_count() != 0 && !self.quarantined.swap(true, Ordering::AcqRel)
     }
 
-    pub(super) fn finish_retirement(&self) {
+    pub(super) fn finish_retirement(&self) -> Option<PendingIoEvent> {
         let mut outcome = lock_unpoison(&self.close_outcome);
         if outcome.is_none() {
             *outcome = Some(MemoizedTerminalResult::success());
         }
         drop(outcome);
         self.retired.store(true, Ordering::Release);
-        if let Some(sink) = self.terminal_sink() {
-            sink.closed(Ok(()));
-        }
         self.close_notify.notify_waiters();
+        self.pending_io_event(IoTerminalEvent::Closed(Ok(())))
     }
 
-    pub(super) fn fail_retirement(&self, error: Error) {
+    pub(super) fn fail_retirement(&self, error: Error) -> Option<PendingIoEvent> {
         self.stop_posting();
         self.release_admission();
         let mut outcome = lock_unpoison(&self.close_outcome);
@@ -641,13 +649,11 @@ impl ConnectionState {
         }
         drop(outcome);
         self.retired.store(true, Ordering::Release);
-        if let Some(sink) = self.terminal_sink() {
-            sink.closed(Err(error));
-        }
         self.close_notify.notify_waiters();
+        self.pending_io_event(IoTerminalEvent::Closed(Err(error)))
     }
 
-    fn close_outcome(&self) -> Option<MemoizedTerminalResult> {
+    pub(super) fn close_outcome(&self) -> Option<MemoizedTerminalResult> {
         let outcome = lock_unpoison(&self.close_outcome).clone();
         match outcome {
             Some(ref value) if value.is_connection_quarantined() => outcome,
@@ -720,16 +726,30 @@ impl ConnectionState {
 
     pub(super) fn recover_reservation_quarantine(&self) {
         if let Some(reservation) = lock_unpoison(&self.admission).as_mut() {
-            reservation.recover_quarantine(!self.qp_destruction_boundary.load(Ordering::Acquire));
+            reservation.recover_quarantine(self.qp_destruction_proof.get().is_none());
         }
     }
 
-    pub(super) fn mark_qp_destroyed(&self) {
-        if !self.qp_destruction_boundary.swap(true, Ordering::AcqRel)
+    fn mint_qp_destruction_proof(&self) -> QpDestructionProof {
+        let proof = QpDestructionProof {
+            connection: self.token,
+            qp_num: self.qp_num,
+            _private: (),
+        };
+        if self.qp_destruction_proof.set(proof.clone()).is_ok()
             && let Some(reservation) = lock_unpoison(&self.admission).as_mut()
         {
             reservation.mark_qp_destroyed();
         }
+        self.qp_destruction_proof
+            .get()
+            .expect("QP destruction proof was just initialized")
+            .clone()
+    }
+
+    #[cfg(test)]
+    pub(super) fn mint_qp_destruction_proof_for_test(&self) -> QpDestructionProof {
+        self.mint_qp_destruction_proof()
     }
 
     pub(super) fn cm_route(&self) -> Option<ConnectionCmRoute> {
@@ -1671,9 +1691,9 @@ mod qp {
 
 #[cfg(test)]
 mod tests {
+    use super::super::io::{IoEvent, event_port};
     use super::*;
     use crate::wr::{RecvWr, SendWr, WrOpcode};
-    use std::sync::Weak;
 
     struct TestPoster;
 
@@ -1707,38 +1727,8 @@ mod tests {
         }
     }
 
-    struct LockCheckingTerminalSink {
-        connection: Weak<ConnectionState>,
-        calls: AtomicUsize,
-    }
-
-    impl LockCheckingTerminalSink {
-        fn check_sink_unlocked(&self) {
-            let connection = self.connection.upgrade().expect("connection state");
-            assert!(
-                connection.terminal_sink.try_lock().is_ok(),
-                "ConnectionTerminalSink callback ran while terminal_sink was locked"
-            );
-            self.calls.fetch_add(1, Ordering::AcqRel);
-        }
-    }
-
-    impl ConnectionTerminalSink for LockCheckingTerminalSink {
-        fn disconnected(&self) {
-            self.check_sink_unlocked();
-        }
-
-        fn terminalize(&self, _error: Error) {
-            self.check_sink_unlocked();
-        }
-
-        fn closed(&self, _result: Result<()>) {
-            self.check_sink_unlocked();
-        }
-    }
-
     #[test]
-    fn terminal_sink_mutex_is_released_before_every_callback() {
+    fn terminal_events_are_pending_until_the_connection_lock_is_released() {
         let connection = Arc::new(ConnectionState::new(
             ConnectionToken {
                 slot: 0,
@@ -1751,18 +1741,28 @@ mod tests {
             None,
             None,
         ));
-        let sink = Arc::new(LockCheckingTerminalSink {
-            connection: Arc::downgrade(&connection),
-            calls: AtomicUsize::new(0),
-        });
-        connection
-            .attach_terminal_sink(Arc::clone(&sink) as Arc<dyn ConnectionTerminalSink>)
-            .unwrap();
+        let (sender, receiver) = event_port();
+        assert!(
+            connection
+                .install_io_event_sender(sender)
+                .unwrap()
+                .is_none()
+        );
 
-        connection.mark_disconnected();
-        connection.mark_cm_failure(Error::DriverShutdown);
-        connection.finish_retirement();
-        assert_eq!(sink.calls.load(Ordering::Acquire), 3);
+        for pending in [
+            connection.mark_disconnected(),
+            connection.mark_cm_failure(Error::DriverShutdown),
+            connection.finish_retirement(),
+        ] {
+            let pending = pending.expect("attached event port");
+            assert!(!receiver.has_events());
+            assert!(
+                connection.io_events.try_lock().is_ok(),
+                "terminal event was prepared while the sender lock remained held"
+            );
+            pending.deliver();
+            assert!(matches!(receiver.pop(), Some(IoEvent::Terminal(_))));
+        }
     }
 
     #[test]
@@ -1809,7 +1809,7 @@ mod tests {
     }
 
     #[test]
-    fn destroy_quarantine_publishes_callback_and_outcome_once() {
+    fn destroy_quarantine_publishes_event_and_outcome_once() {
         let connection = ConnectionState::new(
             ConnectionToken {
                 slot: 0,
@@ -1824,18 +1824,26 @@ mod tests {
         );
         let publications = AtomicUsize::new(0);
 
-        assert!(connection.publish_destroy_quarantine(
-            &Error::InvalidConfig("first destroy failure".into()),
-            || {
-                publications.fetch_add(1, Ordering::Relaxed);
-            },
-        ));
-        assert!(!connection.publish_destroy_quarantine(
-            &Error::InvalidConfig("repeated destroy failure".into()),
-            || {
-                publications.fetch_add(1, Ordering::Relaxed);
-            },
-        ));
+        assert!(
+            connection
+                .publish_destroy_quarantine(
+                    &Error::InvalidConfig("first destroy failure".into()),
+                    || {
+                        publications.fetch_add(1, Ordering::Relaxed);
+                    },
+                )
+                .0
+        );
+        assert!(
+            !connection
+                .publish_destroy_quarantine(
+                    &Error::InvalidConfig("repeated destroy failure".into()),
+                    || {
+                        publications.fetch_add(1, Ordering::Relaxed);
+                    },
+                )
+                .0
+        );
 
         assert_eq!(publications.load(Ordering::Relaxed), 1);
         assert!(matches!(

@@ -628,6 +628,7 @@ fn test_no_hidden_spawn_in_v2() {
         v2_dir.join("message_transport.rs"),
         v2_dir.join("engine").join("mod.rs"),
         v2_dir.join("engine").join("driver.rs"),
+        v2_dir.join("engine").join("io.rs"),
     ] {
         assert!(
             files.binary_search(&required).is_ok(),
@@ -651,4 +652,73 @@ fn test_no_hidden_spawn_in_v2() {
         "found hidden work creation in v2 production code:\n{}",
         violations.join("\n")
     );
+}
+
+#[test]
+fn test_v2_io_boundary_dependency_direction_and_visibility() {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let workspace_root = Path::new(manifest_dir).parent().expect("workspace root");
+    let v2_dir = workspace_root.join("rdma-io").join("src").join("v2");
+    let message_path = v2_dir.join("message_transport.rs");
+    let io_path = v2_dir.join("engine").join("io.rs");
+    let v2_mod_path = v2_dir.join("mod.rs");
+
+    let message = fs::read_to_string(&message_path).expect("read message transport source");
+    for forbidden in [
+        "EngineShared",
+        "ConnectionState",
+        "ConnectionTerminalSink",
+        "DetachedCallbackAfterUnlock",
+        "DetachedOperationCompletion",
+        "ConnectionRegistry",
+        "OperationRegistry",
+        "PagedRegistry",
+        "ConnectionToken",
+        "OperationToken",
+        "from_state",
+        "attach_terminal_sink",
+        "post_detached_",
+    ] {
+        assert!(
+            !message.contains(forbidden),
+            "{} must not depend on prohibited engine internal `{forbidden}`",
+            message_path.display()
+        );
+    }
+
+    let io_source = fs::read_to_string(&io_path).expect("read engine I/O boundary source");
+    for forbidden in [
+        "super::cm",
+        "super::listener",
+        "engine::cm",
+        "engine::listener",
+        "message_transport",
+    ] {
+        assert!(
+            !io_source.contains(forbidden),
+            "{} must not depend on `{forbidden}`",
+            io_path.display()
+        );
+    }
+
+    let v2_mod = fs::read_to_string(&v2_mod_path).expect("read public v2 module source");
+    let public_reexports = v2_mod
+        .lines()
+        .filter(|line| line.trim_start().starts_with("pub use "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for internal in [
+        "IoConnection",
+        "IoEvent",
+        "IoEventReceiver",
+        "IoOperationContext",
+        "IoRecvRequest",
+        "IoSendRequest",
+        "IoSubmissionDisposition",
+    ] {
+        assert!(
+            !public_reexports.contains(internal),
+            "crate-private I/O boundary type `{internal}` was publicly re-exported"
+        );
+    }
 }

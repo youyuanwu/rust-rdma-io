@@ -9,7 +9,11 @@ use std::task::{Context, Poll};
 use futures_util::task::AtomicWaker;
 
 use super::EngineShared;
-use super::connection::{ConnectionState, Direction, OperationKind, RdmaConnection};
+use super::connection::{ConnectionState, Direction, OperationKind, QpDestructionProof};
+use super::io::{
+    IoEventDestination, IoEventSender, IoOperationContext, IoOperationIdentity, IoRecvRequest,
+    IoSendRequest, IoSubmissionDisposition, PendingIoEvent,
+};
 use super::lifecycle::MemoizedTerminalResult;
 use super::registry::{
     ConnectionToken, Lookup, OperationToken, PagedRegistry, lock_unpoison, read_unpoison,
@@ -57,81 +61,79 @@ struct InternalBatchEntry {
     sge: Sge,
 }
 
-type InternalPostInput = (Mr, Option<(usize, usize)>, DetachedOperationCallback);
+type InternalPostInput = (Mr, Option<(usize, usize)>, IoOperationContext);
 
-impl RdmaConnection {
-    pub(crate) fn post_detached_recv_batch(
-        &self,
-        entries: Vec<(Mr, DetachedOperationCallback)>,
-    ) -> Result<usize> {
-        post_detached_batch(
-            &self.shared,
-            &self.state,
-            OperationKind::Recv,
-            entries
-                .into_iter()
-                .map(|(mr, callback)| (mr, None, callback))
-                .collect(),
-        )
-        .map_err(DetachedPostError::into_error)
-    }
-
-    pub(crate) fn post_detached_recv(
-        &self,
-        mr: Mr,
-        callback: DetachedOperationCallback,
-    ) -> std::result::Result<(), DetachedPostError> {
-        post_detached_batch(
-            &self.shared,
-            &self.state,
-            OperationKind::Recv,
-            vec![(mr, None, callback)],
-        )
-        .map(|_| ())
-    }
-
-    pub(crate) fn post_detached_send(
-        &self,
-        mr: Mr,
-        len: usize,
-        callback: DetachedOperationCallback,
-    ) -> std::result::Result<(), DetachedPostError> {
-        post_detached_batch(
-            &self.shared,
-            &self.state,
-            OperationKind::Send,
-            vec![(mr, Some((0, len)), callback)],
-        )
-        .map(|_| ())
-    }
-}
-
-fn post_detached_batch(
+pub(super) fn post_io_recv_batch(
     shared: &Arc<EngineShared>,
     connection: &Arc<ConnectionState>,
+    events: &IoEventSender,
+    requests: Vec<IoRecvRequest>,
+) -> IoSubmissionDisposition {
+    post_io_batch(
+        shared,
+        connection,
+        events,
+        OperationKind::Recv,
+        requests
+            .into_iter()
+            .map(|request| {
+                let (mr, context) = request.into_parts();
+                (mr, None, context)
+            })
+            .collect(),
+    )
+}
+
+pub(super) fn post_io_send(
+    shared: &Arc<EngineShared>,
+    connection: &Arc<ConnectionState>,
+    events: &IoEventSender,
+    request: IoSendRequest,
+) -> IoSubmissionDisposition {
+    let (mr, len, context) = request.into_parts();
+    post_io_batch(
+        shared,
+        connection,
+        events,
+        OperationKind::Send,
+        vec![(mr, Some((0, len)), context)],
+    )
+}
+
+fn post_io_batch(
+    shared: &Arc<EngineShared>,
+    connection: &Arc<ConnectionState>,
+    events: &IoEventSender,
     kind: OperationKind,
     entries: Vec<InternalPostInput>,
-) -> std::result::Result<usize, DetachedPostError> {
+) -> IoSubmissionDisposition {
     if entries.is_empty() {
-        return Err(DetachedPostError::unaccepted(Error::InvalidConfig(
-            "detached operation batch must not be empty".into(),
-        )));
+        return IoSubmissionDisposition::FullyUnaccepted {
+            proven_unaccepted: 0,
+            error: Error::InvalidConfig("I/O operation batch must not be empty".into()),
+        };
     }
     let count = entries.len();
     let admission = read_unpoison(&shared.admission);
     if let Some(error) = shared.admission_error() {
-        let after_unlock = detach_unreserved_entries(entries, error.clone());
+        let after_unlock = detach_unreserved_entries(events, entries, error.clone());
         drop(admission);
-        invoke_after_unlock(after_unlock);
-        return Err(DetachedPostError::unaccepted(error));
+        after_unlock.publish();
+        return IoSubmissionDisposition::FullyUnaccepted {
+            proven_unaccepted: count,
+            error,
+        };
     }
     let posting = match connection.begin_posting() {
         Ok(posting) => posting,
         Err(error) => {
-            let after_unlock = detach_unreserved_entries(entries, error.clone());
+            let after_unlock = detach_unreserved_entries(events, entries, error.clone());
             drop(admission);
-            invoke_after_unlock(after_unlock);
-            return Err(DetachedPostError::unaccepted(error));
+            after_unlock.publish();
+            return IoSubmissionDisposition::FullyUnaccepted {
+                proven_unaccepted: count,
+                error,
+            };
         }
     };
     let direction = kind.direction();
@@ -139,17 +141,20 @@ fn post_detached_batch(
         OperationKind::Recv => WcOpcode::Recv,
         OperationKind::Send => WcOpcode::Send,
         OperationKind::Write | OperationKind::Read => {
-            let error = Error::InvalidConfig("detached batches support only SEND and RECV".into());
-            let after_unlock = detach_unreserved_entries(entries, error.clone());
+            let error = Error::InvalidConfig("I/O batches support only SEND and RECV".into());
+            let after_unlock = detach_unreserved_entries(events, entries, error.clone());
             drop(posting);
             drop(admission);
-            invoke_after_unlock(after_unlock);
-            return Err(DetachedPostError::unaccepted(error));
+            after_unlock.publish();
+            return IoSubmissionDisposition::FullyUnaccepted {
+                proven_unaccepted: count,
+                error,
+            };
         }
     };
     let mut reserved = Vec::with_capacity(count);
     let mut entries = entries.into_iter();
-    while let Some((mr, range, callback)) = entries.next() {
+    while let Some((mr, range, context)) = entries.next() {
         let validated = match ValidatedOperation::new(kind, &mr, None, range) {
             Ok(validated) => validated,
             Err(error) => {
@@ -160,48 +165,54 @@ fn post_detached_batch(
                     reserved,
                     error.clone(),
                 );
-                after_unlock.push((
-                    callback,
-                    DetachedOperationCompletion::Unaccepted {
-                        error: error.clone(),
+                after_unlock.events.push(
+                    IoEventDestination::new(events.clone(), context).unaccepted(
+                        None,
+                        error.clone(),
                         mr,
-                    },
-                ));
-                after_unlock.extend(detach_unreserved_entries(entries, error.clone()));
+                    ),
+                );
+                after_unlock.extend(detach_unreserved_entries(events, entries, error.clone()));
                 drop(posting);
                 drop(admission);
-                invoke_after_unlock(after_unlock);
-                return Err(DetachedPostError::unaccepted(error));
+                after_unlock.publish();
+                return IoSubmissionDisposition::FullyUnaccepted {
+                    proven_unaccepted: count,
+                    error,
+                };
             }
         };
         if let Err(error) = connection.reserve_local(direction) {
             let mut after_unlock =
                 rollback_internal_entries(shared, connection, direction, reserved, error.clone());
-            after_unlock.push((
-                callback,
-                DetachedOperationCompletion::Unaccepted {
-                    error: error.clone(),
+            after_unlock
+                .events
+                .push(IoEventDestination::new(events.clone(), context).unaccepted(
+                    None,
+                    error.clone(),
                     mr,
-                },
-            ));
-            after_unlock.extend(detach_unreserved_entries(entries, error.clone()));
+                ));
+            after_unlock.extend(detach_unreserved_entries(events, entries, error.clone()));
             drop(posting);
             drop(admission);
-            invoke_after_unlock(after_unlock);
-            return Err(DetachedPostError::unaccepted(error));
+            after_unlock.publish();
+            return IoSubmissionDisposition::FullyUnaccepted {
+                proven_unaccepted: count,
+                error,
+            };
         }
         let mr_len = mr.len();
         let mut mr = Some(mr);
-        let mut callback = Some(callback);
+        let mut destination = Some(IoEventDestination::new(events.clone(), context));
         let (token, state) = match shared.operations.allocate(|token| {
-            Arc::new(OperationState::new_with_callback(
+            Arc::new(OperationState::new_with_event(
                 token,
                 Arc::clone(connection),
                 direction,
                 expected_opcode,
                 mr.take(),
                 mr_len,
-                callback.take(),
+                destination.take(),
             ))
         }) {
             Ok(allocated) => allocated,
@@ -209,10 +220,10 @@ fn post_detached_batch(
                 connection.release_local(direction);
                 let mr = mr
                     .take()
-                    .expect("operation allocation failure retains detached MR");
-                let callback = callback
+                    .expect("operation allocation failure retains I/O MR");
+                let destination = destination
                     .take()
-                    .expect("operation allocation failure retains detached callback");
+                    .expect("operation allocation failure retains I/O destination");
                 let mut after_unlock = rollback_internal_entries(
                     shared,
                     connection,
@@ -220,33 +231,44 @@ fn post_detached_batch(
                     reserved,
                     error.clone(),
                 );
-                after_unlock.push((
-                    callback,
-                    DetachedOperationCompletion::Unaccepted {
-                        error: error.clone(),
-                        mr,
-                    },
-                ));
-                after_unlock.extend(detach_unreserved_entries(entries, error.clone()));
+                after_unlock
+                    .events
+                    .push(destination.unaccepted(None, error.clone(), mr));
+                after_unlock.extend(detach_unreserved_entries(events, entries, error.clone()));
                 drop(posting);
                 drop(admission);
-                invoke_after_unlock(after_unlock);
-                return Err(DetachedPostError::unaccepted(error));
+                after_unlock.publish();
+                return IoSubmissionDisposition::FullyUnaccepted {
+                    proven_unaccepted: count,
+                    error,
+                };
             }
         };
         if !shared.cq_credits.reserve() {
-            let released = shared.operations.release(token, false).unwrap_or(state);
-            connection.release_local(direction);
             let error = Error::CapacityExhausted;
-            let completion = released.take_unaccepted(error.clone());
+            let release = state
+                .take_unaccepted(error.clone())
+                .expect("an operation rejected before posting has no completion");
+            let registered = shared
+                .operations
+                .release(token, false)
+                .expect("unposted operation remains registered");
+            debug_assert!(Arc::ptr_eq(&registered, &state));
+            connection.release_local(direction);
             let mut after_unlock =
                 rollback_internal_entries(shared, connection, direction, reserved, error.clone());
-            after_unlock.extend(completion);
-            after_unlock.extend(detach_unreserved_entries(entries, error.clone()));
+            if let Some(event) = release.event {
+                after_unlock.events.push(event);
+            }
+            drop(release.mr);
+            after_unlock.extend(detach_unreserved_entries(events, entries, error.clone()));
             drop(posting);
             drop(admission);
-            invoke_after_unlock(after_unlock);
-            return Err(DetachedPostError::unaccepted(error));
+            after_unlock.publish();
+            return IoSubmissionDisposition::FullyUnaccepted {
+                proven_unaccepted: count,
+                error,
+            };
         }
         reserved.push(InternalBatchEntry {
             token,
@@ -274,8 +296,11 @@ fn post_detached_batch(
                     );
                     drop(posting);
                     drop(admission);
-                    invoke_after_unlock(after_unlock);
-                    return Err(DetachedPostError::unaccepted(error));
+                    after_unlock.publish();
+                    return IoSubmissionDisposition::FullyUnaccepted {
+                        proven_unaccepted: count,
+                        error,
+                    };
                 }
             }
         }
@@ -301,8 +326,11 @@ fn post_detached_batch(
                     );
                     drop(posting);
                     drop(admission);
-                    invoke_after_unlock(after_unlock);
-                    return Err(DetachedPostError::unaccepted(error));
+                    after_unlock.publish();
+                    return IoSubmissionDisposition::FullyUnaccepted {
+                        proven_unaccepted: count,
+                        error,
+                    };
                 }
             }
         }
@@ -322,8 +350,11 @@ fn post_detached_batch(
                 rollback_internal_entries(shared, connection, direction, entries, error.clone());
             drop(posting);
             drop(admission);
-            invoke_after_unlock(after_unlock);
-            return Err(DetachedPostError::unaccepted(error));
+            after_unlock.publish();
+            return IoSubmissionDisposition::FullyUnaccepted {
+                proven_unaccepted: count,
+                error,
+            };
         }
     };
     let transfer = ownership.consume(outcome);
@@ -332,8 +363,8 @@ fn post_detached_batch(
             let after_unlock = commit_internal_entries(shared, accepted);
             drop(posting);
             drop(admission);
-            invoke_after_unlock(after_unlock);
-            Ok(count)
+            after_unlock.publish();
+            IoSubmissionDisposition::AllAccepted { accepted: count }
         }
         BatchOwnershipTransfer::Partial {
             mut accepted,
@@ -341,37 +372,76 @@ fn post_detached_batch(
             source,
         } => {
             let error = Error::PostFailed(clone_io_error(&source));
-            if unaccepted
-                .iter()
-                .any(|entry| entry.state.has_early_completion())
-            {
-                accepted.extend(unaccepted);
-                let after_unlock = commit_internal_entries(shared, accepted);
-                drop(posting);
-                drop(admission);
-                invoke_after_unlock(after_unlock);
-                Err(DetachedPostError::retained(Error::PostFailed(source)))
-            } else {
-                let potentially_accepted = !accepted.is_empty();
-                let accepted_after_unlock = commit_internal_entries(shared, accepted);
-                let mut after_unlock =
-                    rollback_internal_entries(shared, connection, direction, unaccepted, error);
-                after_unlock.extend(accepted_after_unlock);
-                drop(posting);
-                drop(admission);
-                invoke_after_unlock(after_unlock);
-                Err(DetachedPostError {
-                    error: Error::PostFailed(source),
-                    potentially_accepted,
-                })
+            let accepted_count = accepted.len();
+            let unaccepted_count = unaccepted.len();
+            match release_proven_unaccepted_entries(
+                shared, connection, direction, unaccepted, error,
+            ) {
+                InternalRelease::Released(mut after_unlock) => {
+                    after_unlock.extend(commit_internal_entries(shared, accepted));
+                    drop(posting);
+                    drop(admission);
+                    after_unlock.publish();
+                    let error = Error::PostFailed(source);
+                    if accepted_count == 0 {
+                        IoSubmissionDisposition::FullyUnaccepted {
+                            proven_unaccepted: unaccepted_count,
+                            error,
+                        }
+                    } else {
+                        IoSubmissionDisposition::ExactPrefix {
+                            accepted: accepted_count,
+                            proven_unaccepted: unaccepted_count,
+                            error,
+                        }
+                    }
+                }
+                InternalRelease::Retained(mut unaccepted) => {
+                    accepted.append(&mut unaccepted);
+                    let after_unlock = commit_internal_entries(shared, accepted);
+                    drop(posting);
+                    drop(admission);
+                    after_unlock.publish();
+                    IoSubmissionDisposition::RetainedAfterEarlyCompletion {
+                        retained: count,
+                        error: Error::PostFailed(source),
+                    }
+                }
             }
         }
         BatchOwnershipTransfer::Ambiguous { retained, source } => {
+            let retained_count = retained.len();
             let after_unlock = commit_internal_entries(shared, retained);
             drop(posting);
             drop(admission);
-            invoke_after_unlock(after_unlock);
-            Err(DetachedPostError::retained(Error::PostFailed(source)))
+            after_unlock.publish();
+            IoSubmissionDisposition::RetainedAmbiguous {
+                retained: retained_count,
+                error: Error::PostFailed(source),
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct AfterEngineUnlock {
+    events: Vec<PendingIoEvent>,
+    operations_to_wake: Vec<Arc<OperationState>>,
+}
+
+impl AfterEngineUnlock {
+    fn extend(&mut self, mut other: Self) {
+        self.events.append(&mut other.events);
+        self.operations_to_wake
+            .append(&mut other.operations_to_wake);
+    }
+
+    fn publish(self) {
+        for event in self.events {
+            event.deliver();
+        }
+        for operation in self.operations_to_wake {
+            operation.wake();
         }
     }
 }
@@ -384,7 +454,7 @@ enum InternalPreparedBatch {
 fn commit_internal_entries(
     shared: &EngineShared,
     entries: Vec<InternalBatchEntry>,
-) -> Vec<DetachedCompletion> {
+) -> AfterEngineUnlock {
     shared
         .accepted_operations
         .fetch_add(entries.len(), Ordering::AcqRel);
@@ -395,16 +465,11 @@ fn commit_internal_entries(
         }
     }
     shared.work_signal.publish(super::driver::CQ_RECHECK_WORK);
-    early
-        .into_iter()
-        .filter_map(|(state, completion)| shared.finish_operation(state, completion))
-        .collect()
-}
-
-fn invoke_after_unlock(completions: Vec<DetachedCompletion>) {
-    for completion in completions {
-        invoke_detached_completion(Some(completion));
+    let mut after_unlock = AfterEngineUnlock::default();
+    for (state, completion) in early {
+        after_unlock.extend(shared.finish_operation(state, completion));
     }
+    after_unlock
 }
 
 fn rollback_internal_entries(
@@ -413,53 +478,86 @@ fn rollback_internal_entries(
     direction: Direction,
     entries: Vec<InternalBatchEntry>,
     error: Error,
-) -> Vec<DetachedCompletion> {
-    let mut completions = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let state = shared
-            .operations
-            .release(entry.token, false)
-            .unwrap_or(entry.state);
-        shared.cq_credits.release();
-        connection.release_local(direction);
-        if let Some(completion) = state.take_unaccepted(error.clone()) {
-            completions.push(completion);
+) -> AfterEngineUnlock {
+    match release_proven_unaccepted_entries(shared, connection, direction, entries, error) {
+        InternalRelease::Released(after_unlock) => after_unlock,
+        InternalRelease::Retained(entries) => {
+            debug_assert!(
+                entries.is_empty(),
+                "an operation known not to have reached the provider acquired a completion"
+            );
+            commit_internal_entries(shared, entries)
         }
     }
-    completions
+}
+
+enum InternalRelease {
+    Released(AfterEngineUnlock),
+    Retained(Vec<InternalBatchEntry>),
+}
+
+fn release_proven_unaccepted_entries(
+    shared: &EngineShared,
+    connection: &ConnectionState,
+    direction: Direction,
+    entries: Vec<InternalBatchEntry>,
+    error: Error,
+) -> InternalRelease {
+    let releases = {
+        let mut inners = entries
+            .iter()
+            .map(|entry| lock_unpoison(&entry.state.inner))
+            .collect::<Vec<_>>();
+        if inners
+            .iter()
+            .any(|inner| !OperationState::can_release_unaccepted(inner))
+        {
+            None
+        } else {
+            Some(
+                entries
+                    .iter()
+                    .zip(inners.iter_mut())
+                    .map(|(entry, inner)| entry.state.take_unaccepted_locked(inner, error.clone()))
+                    .collect::<Vec<_>>(),
+            )
+        }
+    };
+    let Some(releases) = releases else {
+        return InternalRelease::Retained(entries);
+    };
+
+    let mut after_unlock = AfterEngineUnlock::default();
+    for (entry, release) in entries.into_iter().zip(releases) {
+        let registered = shared
+            .operations
+            .release(entry.token, false)
+            .expect("proven-unaccepted operation remains registered");
+        debug_assert!(Arc::ptr_eq(&registered, &entry.state));
+        shared.cq_credits.release();
+        connection.release_local(direction);
+        if let Some(event) = release.event {
+            after_unlock.events.push(event);
+        }
+        drop(release.mr);
+    }
+    InternalRelease::Released(after_unlock)
 }
 
 fn detach_unreserved_entries(
+    events: &IoEventSender,
     entries: impl IntoIterator<Item = InternalPostInput>,
     error: Error,
-) -> Vec<DetachedCompletion> {
-    entries
+) -> AfterEngineUnlock {
+    let events = entries
         .into_iter()
-        .map(|(mr, _, callback)| {
-            (
-                callback,
-                DetachedOperationCompletion::Unaccepted {
-                    error: error.clone(),
-                    mr,
-                },
-            )
+        .map(|(mr, _, context)| {
+            IoEventDestination::new(events.clone(), context).unaccepted(None, error.clone(), mr)
         })
-        .collect()
-}
-
-fn invoke_detached_completion(completion: Option<DetachedCompletion>) {
-    if let Some(after_unlock) = prepare_detached_completion(completion) {
-        after_unlock();
-    }
-}
-
-fn prepare_detached_completion(
-    completion: Option<DetachedCompletion>,
-) -> Option<DetachedCallbackAfterUnlock> {
-    if let Some((callback, completion)) = completion {
-        callback(completion)
-    } else {
-        None
+        .collect();
+    AfterEngineUnlock {
+        events,
+        operations_to_wake: Vec::new(),
     }
 }
 
@@ -680,11 +778,19 @@ pub(super) struct OperationState {
 struct OperationInner {
     lifecycle: OperationLifecycle,
     mr: Option<Mr>,
-    early_completion: Option<WorkCompletion>,
+    completion: CompletionOwnership,
     output: Option<(Result<Completion>, Option<Mr>)>,
     detached: bool,
     reclamation_pending: bool,
-    callback: Option<DetachedOperationCallback>,
+    event_destination: Option<IoEventDestination>,
+}
+
+enum CompletionOwnership {
+    None,
+    // A validated CQE is owned by the connection dispatch queue.
+    Queued,
+    // Dispatch consumed that CQE before post reconciliation committed the WR.
+    Early(WorkCompletion),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -715,7 +821,7 @@ impl OperationState {
         mr: Option<Mr>,
         mr_len: usize,
     ) -> Self {
-        Self::new_with_callback(
+        Self::new_with_event(
             token,
             connection,
             direction,
@@ -726,16 +832,16 @@ impl OperationState {
         )
     }
 
-    fn new_with_callback(
+    fn new_with_event(
         token: OperationToken,
         connection: Arc<ConnectionState>,
         direction: Direction,
         expected_opcode: WcOpcode,
         mr: Option<Mr>,
         mr_len: usize,
-        callback: Option<DetachedOperationCallback>,
+        event_destination: Option<IoEventDestination>,
     ) -> Self {
-        let detached = callback.is_some();
+        let detached = event_destination.is_some();
         Self {
             token,
             connection,
@@ -745,11 +851,11 @@ impl OperationState {
             inner: Mutex::new(OperationInner {
                 lifecycle: OperationLifecycle::Posting,
                 mr,
-                early_completion: None,
+                completion: CompletionOwnership::None,
                 output: None,
                 detached,
                 reclamation_pending: false,
-                callback,
+                event_destination,
             }),
             waker: AtomicWaker::new(),
             cancelled: AtomicBool::new(false),
@@ -760,23 +866,51 @@ impl OperationState {
     fn commit_accepted(&self) -> Option<WorkCompletion> {
         let mut inner = lock_unpoison(&self.inner);
         self.connection.add_accepted(self.token);
-        if inner.detached {
-            inner.lifecycle = OperationLifecycle::Cancelled;
+        let accepted_lifecycle = if inner.detached {
+            OperationLifecycle::Cancelled
         } else {
-            inner.lifecycle = OperationLifecycle::InFlight;
+            OperationLifecycle::InFlight
+        };
+        match std::mem::replace(&mut inner.completion, CompletionOwnership::None) {
+            CompletionOwnership::None => {
+                inner.lifecycle = accepted_lifecycle;
+                None
+            }
+            CompletionOwnership::Queued => {
+                inner.completion = CompletionOwnership::Queued;
+                inner.lifecycle = accepted_lifecycle;
+                None
+            }
+            CompletionOwnership::Early(completion) => {
+                inner.lifecycle = OperationLifecycle::Completing;
+                Some(completion)
+            }
         }
-        inner.early_completion.take()
+    }
+
+    fn mark_completion_queued(&self) -> bool {
+        let mut inner = lock_unpoison(&self.inner);
+        if matches!(
+            inner.lifecycle,
+            OperationLifecycle::Completing | OperationLifecycle::Released
+        ) || !matches!(inner.completion, CompletionOwnership::None)
+        {
+            return false;
+        }
+        inner.completion = CompletionOwnership::Queued;
+        true
     }
 
     fn record_completion(&self, completion: WorkCompletion) -> CompletionDisposition {
         let mut inner = lock_unpoison(&self.inner);
+        if !matches!(inner.completion, CompletionOwnership::Queued) {
+            return CompletionDisposition::Duplicate;
+        }
+        inner.completion = CompletionOwnership::None;
         match inner.lifecycle {
             OperationLifecycle::Posting => {
-                if inner.early_completion.replace(completion).is_some() {
-                    CompletionDisposition::Duplicate
-                } else {
-                    CompletionDisposition::Deferred
-                }
+                inner.completion = CompletionOwnership::Early(completion);
+                CompletionDisposition::Deferred
             }
             OperationLifecycle::InFlight
             | OperationLifecycle::Cancelled
@@ -881,17 +1015,15 @@ impl OperationState {
         let mut mr = inner.mr.take();
         let typed = Completion::from_raw(completion);
         let result = typed.result().map(|()| typed);
-        let callback = inner.callback.take().map(|callback| {
-            let callback_mr = mr.take();
-            (
-                callback,
-                DetachedOperationCompletion::Completed {
-                    result: result.clone(),
-                    mr: callback_mr,
-                },
+        let event = inner.event_destination.take().map(|destination| {
+            let event_mr = mr.take();
+            destination.complete(
+                IoOperationIdentity::from_token(self.token),
+                result.clone(),
+                event_mr,
             )
         });
-        let detached_mr = if callback.is_some() {
+        let detached_mr = if event.is_some() {
             None
         } else if inner.detached || inner.output.is_some() {
             mr
@@ -902,11 +1034,10 @@ impl OperationState {
         inner.lifecycle = OperationLifecycle::Released;
         drop(inner);
         drop(detached_mr);
-        self.waker.wake();
         FinishState {
             was_reclaiming,
             was_quarantined,
-            callback,
+            event,
         }
     }
 
@@ -916,27 +1047,24 @@ impl OperationState {
         inner.reclamation_pending = false;
         let was_quarantined = self.quarantined.swap(false, Ordering::AcqRel);
         let mut mr = inner.mr.take();
-        let callback = inner.callback.take().map(|callback| {
-            let callback_mr = mr.take();
-            (
-                callback,
-                DetachedOperationCompletion::Completed {
-                    result: Err(error.clone()),
-                    mr: callback_mr,
-                },
+        let event = inner.event_destination.take().map(|destination| {
+            let event_mr = mr.take();
+            destination.complete(
+                IoOperationIdentity::from_token(self.token),
+                Err(error.clone()),
+                event_mr,
             )
         });
-        if callback.is_none() && !inner.detached && inner.output.is_none() {
+        if event.is_none() && !inner.detached && inner.output.is_none() {
             inner.output = Some((Err(error), None));
         }
         inner.lifecycle = OperationLifecycle::Released;
         drop(inner);
         drop(mr);
-        self.waker.wake();
         FinishState {
             was_reclaiming,
             was_quarantined,
-            callback,
+            event,
         }
     }
 
@@ -944,26 +1072,54 @@ impl OperationState {
         lock_unpoison(&self.inner).mr.take()
     }
 
-    fn take_unaccepted(&self, error: Error) -> Option<DetachedCompletion> {
+    fn take_unaccepted(&self, error: Error) -> Option<UnacceptedRelease> {
         let mut inner = lock_unpoison(&self.inner);
+        if !Self::can_release_unaccepted(&inner) {
+            return None;
+        }
+        Some(self.take_unaccepted_locked(&mut inner, error))
+    }
+
+    fn can_release_unaccepted(inner: &OperationInner) -> bool {
+        inner.lifecycle == OperationLifecycle::Posting
+            && matches!(inner.completion, CompletionOwnership::None)
+    }
+
+    fn take_unaccepted_locked(
+        &self,
+        inner: &mut OperationInner,
+        error: Error,
+    ) -> UnacceptedRelease {
+        debug_assert!(Self::can_release_unaccepted(inner));
         inner.lifecycle = OperationLifecycle::Released;
-        let callback = inner.callback.take()?;
-        let mr = inner
-            .mr
-            .take()
-            .expect("unaccepted detached operation retains its MR");
-        Some((
-            callback,
-            DetachedOperationCompletion::Unaccepted { error, mr },
-        ))
+        let mut mr = inner.mr.take();
+        let event = inner.event_destination.take().map(|destination| {
+            destination.unaccepted(
+                Some(IoOperationIdentity::from_token(self.token)),
+                error,
+                mr.take().expect("unaccepted I/O operation retains its MR"),
+            )
+        });
+        UnacceptedRelease { event, mr }
+    }
+
+    #[cfg(test)]
+    fn can_release_unaccepted_for_test(&self) -> bool {
+        let inner = lock_unpoison(&self.inner);
+        Self::can_release_unaccepted(&inner)
+    }
+
+    #[cfg(test)]
+    fn completion_ownership_for_test(&self) -> &'static str {
+        match lock_unpoison(&self.inner).completion {
+            CompletionOwnership::None => "none",
+            CompletionOwnership::Queued => "queued",
+            CompletionOwnership::Early(_) => "early",
+        }
     }
 
     fn take_output(&self) -> Option<(Result<Completion>, Option<Mr>)> {
         lock_unpoison(&self.inner).output.take()
-    }
-
-    fn has_early_completion(&self) -> bool {
-        lock_unpoison(&self.inner).early_completion.is_some()
     }
 
     fn detach_with_post_error(&self, shared: &EngineShared) {
@@ -1025,62 +1181,15 @@ enum CompletionDisposition {
     Duplicate,
 }
 
+struct UnacceptedRelease {
+    event: Option<PendingIoEvent>,
+    mr: Option<Mr>,
+}
+
 struct FinishState {
     was_reclaiming: bool,
     was_quarantined: bool,
-    callback: Option<DetachedCompletion>,
-}
-
-type DetachedCompletion = (DetachedOperationCallback, DetachedOperationCompletion);
-
-pub(crate) enum DetachedOperationCompletion {
-    Unaccepted {
-        error: Error,
-        mr: Mr,
-    },
-    Completed {
-        result: Result<Completion>,
-        mr: Option<Mr>,
-    },
-}
-
-pub(crate) type DetachedOperationCallback = Box<
-    dyn FnOnce(DetachedOperationCompletion) -> Option<DetachedCallbackAfterUnlock> + Send + 'static,
->;
-
-pub(crate) type DetachedCallbackAfterUnlock = Box<dyn FnOnce() + Send + 'static>;
-
-pub(crate) struct DetachedPostError {
-    error: Error,
-    potentially_accepted: bool,
-}
-
-impl DetachedPostError {
-    fn unaccepted(error: Error) -> Self {
-        Self {
-            error,
-            potentially_accepted: false,
-        }
-    }
-
-    fn retained(error: Error) -> Self {
-        Self {
-            error,
-            potentially_accepted: true,
-        }
-    }
-
-    pub(crate) fn potentially_accepted(&self) -> bool {
-        self.potentially_accepted
-    }
-
-    pub(crate) fn error(&self) -> &Error {
-        &self.error
-    }
-
-    fn into_error(self) -> Error {
-        self.error
-    }
+    event: Option<PendingIoEvent>,
 }
 
 pub(super) struct QuarantineTransition {
@@ -1225,7 +1334,9 @@ fn start_operation(
             shared.work_signal.publish(super::driver::CQ_RECHECK_WORK);
             drop(admission);
             if let Some(completion) = early {
-                invoke_detached_completion(shared.finish_operation(Arc::clone(&state), completion));
+                shared
+                    .finish_operation(Arc::clone(&state), completion)
+                    .publish();
             }
             StartResult::InFlight(state)
         }
@@ -1234,22 +1345,29 @@ fn start_operation(
             first_unaccepted,
             source,
         } if accepted == 0 && first_unaccepted == 0 => {
-            let early = {
-                let mut inner = lock_unpoison(&state.inner);
-                inner.early_completion.take()
-            };
-            if let Some(completion) = early {
-                shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
-                state.commit_accepted();
-                shared.work_signal.publish(super::driver::CQ_RECHECK_WORK);
-                drop(admission);
-                invoke_detached_completion(shared.finish_operation(Arc::clone(&state), completion));
-                StartResult::InFlight(state)
-            } else {
-                let state = shared.operations.release(token, false).unwrap_or(state);
+            let error = Error::PostFailed(source);
+            if let Some(release) = state.take_unaccepted(error.clone()) {
+                let registered = shared
+                    .operations
+                    .release(token, false)
+                    .expect("proven-unaccepted operation remains registered");
+                debug_assert!(Arc::ptr_eq(&registered, &state));
                 shared.cq_credits.release();
                 connection.release_local(direction);
-                StartResult::Immediate((Err(Error::PostFailed(source)), state.take_mr()))
+                debug_assert!(release.event.is_none());
+                drop(release.event);
+                StartResult::Immediate((Err(error), release.mr))
+            } else {
+                shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
+                let early = state.commit_accepted();
+                shared.work_signal.publish(super::driver::CQ_RECHECK_WORK);
+                drop(admission);
+                if let Some(completion) = early {
+                    shared
+                        .finish_operation(Arc::clone(&state), completion)
+                        .publish();
+                }
+                StartResult::InFlight(state)
             }
         }
         BatchPostOutcome::PrefixAccepted { source, .. }
@@ -1259,7 +1377,9 @@ fn start_operation(
             shared.work_signal.publish(super::driver::CQ_RECHECK_WORK);
             drop(admission);
             if let Some(completion) = early {
-                invoke_detached_completion(shared.finish_operation(Arc::clone(&state), completion));
+                shared
+                    .finish_operation(Arc::clone(&state), completion)
+                    .publish();
                 StartResult::InFlight(state)
             } else {
                 state.detach_with_post_error(shared);
@@ -1421,6 +1541,10 @@ impl EngineShared {
             self.reject_cqe(CqeReject::UnexpectedOpcode);
             return None;
         }
+        if !operation.mark_completion_queued() {
+            self.reject_cqe(CqeReject::Duplicate);
+            return None;
+        }
         connection.enqueue_completion(completion);
         Some(connection.token)
     }
@@ -1446,33 +1570,33 @@ impl EngineShared {
         (processed, connection.has_completion_work())
     }
 
-    fn dispatch_queued_completion(&self, completion: WorkCompletion) -> Option<DetachedCompletion> {
+    fn dispatch_queued_completion(&self, completion: WorkCompletion) -> AfterEngineUnlock {
         let token = OperationToken::decode(completion.wr_id());
         let operation = match self.operations.lookup(token) {
             Lookup::Occupied(operation) => operation,
             Lookup::Duplicate => {
                 self.reject_cqe(CqeReject::Duplicate);
-                return None;
+                return AfterEngineUnlock::default();
             }
             Lookup::Stale => {
                 self.reject_cqe(CqeReject::StaleOperation);
-                return None;
+                return AfterEngineUnlock::default();
             }
             Lookup::Retired => {
                 self.reject_cqe(CqeReject::RetiredOperation);
-                return None;
+                return AfterEngineUnlock::default();
             }
             Lookup::Unknown => {
                 self.reject_cqe(CqeReject::Unknown);
-                return None;
+                return AfterEngineUnlock::default();
             }
         };
         match operation.record_completion(completion) {
-            CompletionDisposition::Deferred => None,
+            CompletionDisposition::Deferred => AfterEngineUnlock::default(),
             CompletionDisposition::Complete => self.finish_operation(operation, completion),
             CompletionDisposition::Duplicate => {
                 self.reject_cqe(CqeReject::Duplicate);
-                None
+                AfterEngineUnlock::default()
             }
         }
     }
@@ -1481,10 +1605,10 @@ impl EngineShared {
         &self,
         operation: Arc<OperationState>,
         completion: WorkCompletion,
-    ) -> Option<DetachedCompletion> {
+    ) -> AfterEngineUnlock {
         if self.operations.release(operation.token, true).is_none() {
             self.reject_cqe(CqeReject::Duplicate);
-            return None;
+            return AfterEngineUnlock::default();
         }
         let removed = operation.connection.remove_accepted(operation.token);
         operation.connection.release_local(operation.direction);
@@ -1506,7 +1630,7 @@ impl EngineShared {
                 .fetch_sub(operation.mr_len, Ordering::AcqRel);
             self.clear_operation_quarantine(&operation);
         }
-        let callback = finished.callback;
+        let event = finished.event;
         if removed
             && operation.connection.close_started()
             && operation.connection.accepted_count() == 0
@@ -1515,14 +1639,26 @@ impl EngineShared {
             self.record_connection_drained(&operation.connection);
             self.schedule_connection_retirement(&operation.connection);
         }
-        callback
+        AfterEngineUnlock {
+            events: event.into_iter().collect(),
+            operations_to_wake: vec![operation],
+        }
     }
 
     pub(super) fn reclaim_after_qp_destroy(
         &self,
+        proof: &QpDestructionProof,
         connection: &ConnectionState,
         token: OperationToken,
     ) -> bool {
+        if !proof.proves(connection) {
+            tracing::warn!(
+                connection = connection.token.encode(),
+                operation = token.encode(),
+                "operation reclaim rejected a mismatched QP destruction proof"
+            );
+            return false;
+        }
         let Lookup::Occupied(operation) = self.operations.lookup(token) else {
             tracing::warn!(
                 connection = connection.token.encode(),
@@ -1576,19 +1712,23 @@ impl EngineShared {
                 .fetch_sub(operation.mr_len, Ordering::AcqRel);
             self.clear_operation_quarantine(&operation);
         }
-        invoke_detached_completion(finished.callback);
+        AfterEngineUnlock {
+            events: finished.event.into_iter().collect(),
+            operations_to_wake: vec![operation],
+        }
+        .publish();
         true
     }
 
     fn dispatch_connection_completion(&self, completion: WorkCompletion) {
         // CQ routing and terminal publication share the admission barrier.
-        // The lock covers only one completion and is released before a
-        // detached callback can wake/re-enter message posting or close.
-        let callback = {
+        // The lock covers only one completion and is released before an event
+        // enqueue or operation wake can re-enter posting or close.
+        let after_unlock = {
             let _admission = read_unpoison(&self.admission);
             self.dispatch_queued_completion(completion)
         };
-        invoke_detached_completion(callback);
+        after_unlock.publish();
     }
 
     fn dispatch_queued_completions(&self, connection: &ConnectionState, budget: usize) -> bool {
@@ -1777,6 +1917,7 @@ mod tests {
         assert_eq!(operation.lifecycle(), OperationLifecycle::Posting);
 
         let completion = wc(token, 6, IBV_WC_SEND);
+        assert!(operation.mark_completion_queued());
         assert!(matches!(
             operation.record_completion(completion),
             CompletionDisposition::Deferred
@@ -1784,8 +1925,10 @@ mod tests {
         assert_eq!(operation.lifecycle(), OperationLifecycle::Posting);
         let early = operation.commit_accepted().expect("early completion");
         shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
-        assert_eq!(operation.lifecycle(), OperationLifecycle::InFlight);
-        invoke_detached_completion(shared.finish_operation(Arc::clone(&operation), early));
+        assert_eq!(operation.lifecycle(), OperationLifecycle::Completing);
+        shared
+            .finish_operation(Arc::clone(&operation), early)
+            .publish();
         assert_eq!(operation.lifecycle(), OperationLifecycle::Released);
 
         let token = install_accepted(&shared, &connection.state, WcOpcode::Send);
@@ -1800,101 +1943,144 @@ mod tests {
         shared.handle_reclamation_deadline(token);
         assert_eq!(operation.lifecycle(), OperationLifecycle::Quarantined);
         let completion = wc(token, 6, IBV_WC_SEND);
+        assert!(operation.mark_completion_queued());
         assert!(matches!(
             operation.record_completion(completion),
             CompletionDisposition::Complete
         ));
         assert_eq!(operation.lifecycle(), OperationLifecycle::Completing);
-        invoke_detached_completion(shared.finish_operation(Arc::clone(&operation), completion));
+        shared
+            .finish_operation(Arc::clone(&operation), completion)
+            .publish();
         assert_eq!(operation.lifecycle(), OperationLifecycle::Released);
     }
 
     #[test]
-    fn detached_completion_callback_runs_after_admission_guard_is_released() {
+    fn io_completion_wakes_after_admission_guard_is_released() {
+        use std::task::{Wake, Waker};
+
+        struct AdmissionCheckingWake {
+            shared: Arc<EngineShared>,
+            observed: AtomicBool,
+        }
+
+        impl Wake for AdmissionCheckingWake {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                assert!(
+                    self.shared.admission.try_write().is_ok(),
+                    "I/O event wake ran while admission remained locked"
+                );
+                self.observed.store(true, Ordering::Release);
+            }
+        }
+
         let shared = synthetic_engine(8);
         let connection = synthetic_connection_on(&shared, 21);
         connection.state.reserve_local(Direction::Send).unwrap();
         assert!(shared.cq_credits.reserve());
-        let observed = Arc::new(AtomicBool::new(false));
-        let callback_observed = Arc::clone(&observed);
-        let callback_shared = Arc::downgrade(&shared);
+        let (sender, receiver) = super::super::io::event_port();
+        let wake = Arc::new(AdmissionCheckingWake {
+            shared: Arc::clone(&shared),
+            observed: AtomicBool::new(false),
+        });
+        receiver.register(&Waker::from(Arc::clone(&wake)));
         let (token, operation) = shared
             .operations
             .allocate(|token| {
-                Arc::new(OperationState::new_with_callback(
+                Arc::new(OperationState::new_with_event(
                     token,
                     Arc::clone(&connection.state),
                     Direction::Send,
                     WcOpcode::Send,
                     None,
                     1,
-                    Some(Box::new(move |_completion| {
-                        let shared = callback_shared.upgrade().expect("engine shared state");
-                        assert!(
-                            shared.admission.try_write().is_ok(),
-                            "detached callback ran while admission remained locked"
-                        );
-                        callback_observed.store(true, Ordering::Release);
-                        None
-                    })),
+                    Some(IoEventDestination::new(sender, IoOperationContext::new(()))),
                 ))
             })
             .unwrap();
         connection.state.add_accepted(token);
         operation.commit_accepted();
         shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
-        connection
-            .state
-            .enqueue_completion(wc(token, connection.identity().qp_num(), IBV_WC_SEND));
+        assert_eq!(
+            shared.enqueue_completion(wc(token, connection.identity().qp_num(), IBV_WC_SEND,)),
+            Some(connection.state.token)
+        );
 
         assert_eq!(
             shared.dispatch_connection_completions(connection.state.token, 1),
             (1, false)
         );
-        assert!(observed.load(Ordering::Acquire));
+        assert!(wake.observed.load(Ordering::Acquire));
+        assert!(matches!(
+            receiver.pop(),
+            Some(super::super::io::IoEvent::Completion(_))
+        ));
     }
 
     #[test]
-    fn qp_destroy_callback_uses_the_contextual_connection_close_error() {
+    fn qp_destroy_event_uses_the_contextual_connection_close_error() {
         let shared = synthetic_engine(8);
         let connection = synthetic_connection_on(&shared, 18);
         connection.state.reserve_local(Direction::Send).unwrap();
         assert!(shared.cq_credits.reserve());
-        let observed = Arc::new(Mutex::new(None));
-        let callback_observed = Arc::clone(&observed);
+        let (sender, receiver) = super::super::io::event_port();
         let (token, operation) = shared
             .operations
             .allocate(|token| {
-                Arc::new(OperationState::new_with_callback(
+                Arc::new(OperationState::new_with_event(
                     token,
                     Arc::clone(&connection.state),
                     Direction::Send,
                     WcOpcode::Send,
                     None,
                     1,
-                    Some(Box::new(move |completion| {
-                        let DetachedOperationCompletion::Completed { result, .. } = completion
-                        else {
-                            panic!("accepted operation cannot become unaccepted")
-                        };
-                        *lock_unpoison(&callback_observed) = result.err();
-                        None
-                    })),
+                    Some(IoEventDestination::new(sender, IoOperationContext::new(()))),
                 ))
             })
             .unwrap();
         operation.commit_accepted();
         shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
-        connection
+        let terminal = connection
             .state
             .mark_cm_failure(Error::ProtocolViolation("contextual close failure".into()));
-        connection.state.mark_qp_destroyed();
+        drop(terminal);
+        let proof = connection.state.mint_qp_destruction_proof_for_test();
 
-        assert!(shared.reclaim_after_qp_destroy(&connection.state, token));
+        assert!(shared.reclaim_after_qp_destroy(&proof, &connection.state, token));
+        let Some(super::super::io::IoEvent::Completion(completion)) = receiver.pop() else {
+            panic!("QP destruction must publish an owned completion event")
+        };
+        let (_, _, result, _, unaccepted) = completion.into_parts();
+        assert!(!unaccepted);
         assert!(matches!(
-            lock_unpoison(&observed).as_ref(),
-            Some(Error::ProtocolViolation(message)) if message == "contextual close failure"
+            result,
+            Err(Error::ProtocolViolation(message)) if message == "contextual close failure"
         ));
+    }
+
+    #[test]
+    fn unresolved_reclamation_requires_the_exact_connection_destruction_proof() {
+        let shared = synthetic_engine(8);
+        let owner = synthetic_connection_on(&shared, 22);
+        let other = synthetic_connection_on(&shared, 23);
+        let token = install_accepted(&shared, &owner.state, WcOpcode::Send);
+        let wrong_proof = other.state.mint_qp_destruction_proof_for_test();
+
+        assert!(!shared.reclaim_after_qp_destroy(&wrong_proof, &owner.state, token));
+        assert_eq!(owner.state.accepted_count(), 1);
+        assert!(matches!(
+            shared.operations.lookup(token),
+            Lookup::Occupied(_)
+        ));
+
+        let proof = owner.state.mint_qp_destruction_proof_for_test();
+        assert!(shared.reclaim_after_qp_destroy(&proof, &owner.state, token));
+        assert_eq!(owner.state.accepted_count(), 0);
+        assert_eq!(shared.operations.live(), 0);
     }
 
     #[test]
@@ -1913,7 +2099,7 @@ mod tests {
             (IBV_WC_FATAL_ERR, WcStatus::FatalErr),
             (u32::MAX, WcStatus::Unknown(u32::MAX)),
         ] {
-            let (fatal, observed) =
+            let (fatal, events) =
                 install_accepted_with_result(&shared, &first.state, WcOpcode::Send);
             let mut fatal_wc = wc(fatal, 7, IBV_WC_SEND);
             fatal_wc.inner.status = raw_status;
@@ -1922,10 +2108,16 @@ mod tests {
                 shared.dispatch_connection_completions(first.state.token, 1),
                 (1, false)
             );
+            let Some(super::super::io::IoEvent::Completion(completion)) = events.pop() else {
+                panic!("fatal completion event")
+            };
+            let (_, _, result, mr, unaccepted) = completion.into_parts();
+            assert!(mr.is_none());
+            assert!(!unaccepted);
             assert!(matches!(
-                lock_unpoison(&observed).as_ref(),
-                Some(Err(Error::CompletionError { status, vendor_err: 0 }))
-                    if *status == expected_status
+                result,
+                Err(Error::CompletionError { status, vendor_err: 0 })
+                    if status == expected_status
             ));
         }
         assert_eq!(shared.rejected_cqes.load(Ordering::Acquire), 0);
@@ -2031,6 +2223,32 @@ mod tests {
         let rejection_reasons = lock_unpoison(&shared.rejected_cqe_reasons);
         assert!(rejection_reasons.contains(&CqeReject::StaleOperation));
         assert!(rejection_reasons.contains(&CqeReject::RetiredOperation));
+    }
+
+    #[test]
+    fn queued_completion_marker_rejects_duplicates_before_dispatch() {
+        let shared = synthetic_engine(8);
+        let connection = synthetic_connection_on(&shared, 16);
+        let token = install_accepted(&shared, &connection.state, WcOpcode::Send);
+        let completion = wc(token, 16, IBV_WC_SEND);
+
+        assert_eq!(
+            shared.enqueue_completion(completion),
+            Some(connection.state.token)
+        );
+        assert!(shared.enqueue_completion(completion).is_none());
+        assert_eq!(shared.rejected_cqes.load(Ordering::Acquire), 1);
+        assert_eq!(
+            lock_unpoison(&shared.rejected_cqe_reasons).as_slice(),
+            &[CqeReject::Duplicate]
+        );
+        assert_eq!(
+            shared.dispatch_connection_completions(connection.state.token, 2),
+            (1, false)
+        );
+        assert_eq!(shared.operations.live(), 0);
+        assert_eq!(shared.accepted_operations.load(Ordering::Acquire), 0);
+        assert_eq!(shared.cq_credits.free(), 8);
     }
 
     #[test]
@@ -2286,41 +2504,42 @@ mod tests {
     }
 
     #[test]
-    fn empty_and_zero_accepted_detached_batches_reject_and_roll_back_every_reservation() {
+    fn empty_and_zero_accepted_io_batches_reject_and_roll_back_every_reservation() {
         let Some((engine, driver)) = production_engine(2, 4, 4) else {
             return;
         };
         let shared = Arc::clone(&engine.shared);
         let poster = Arc::new(ScriptedPoster::new(&shared, 51, ScriptedPost::Unaccepted));
         let connection = scripted_connection(&shared, Arc::clone(&poster), 1, 2);
+        let (io, events) =
+            super::super::io::IoConnection::new(Arc::clone(&shared), Arc::clone(&connection.state))
+                .unwrap();
 
         assert!(matches!(
-            connection.post_detached_recv_batch(Vec::new()),
-            Err(Error::InvalidConfig(_))
+            io.post_recv_batch(Vec::new()),
+            IoSubmissionDisposition::FullyUnaccepted {
+                proven_unaccepted: 0,
+                error: Error::InvalidConfig(_)
+            }
         ));
         assert_eq!(poster.calls(), 0);
         assert_eq!(shared.operations.live(), 0);
         assert_eq!(shared.cq_credits.free(), 4);
 
         let recorder = DestructionRecorder::arm(8);
-        let callback_calls = Arc::new(AtomicUsize::new(0));
         let mut entries = Vec::new();
         for _ in 0..2 {
             let mr = shared.register_memory(64, AccessIntent::LocalOnly).unwrap();
-            let callback_calls = Arc::clone(&callback_calls);
-            entries.push((
-                mr,
-                Box::new(move |_completion| {
-                    callback_calls.fetch_add(1, Ordering::AcqRel);
-                    None
-                }) as DetachedOperationCallback,
-            ));
+            entries.push(IoRecvRequest::new(mr, IoOperationContext::new(())));
         }
         assert!(matches!(
-            connection.post_detached_recv_batch(entries),
-            Err(Error::PostFailed(_))
+            io.post_recv_batch(entries),
+            IoSubmissionDisposition::FullyUnaccepted {
+                proven_unaccepted: 2,
+                error: Error::PostFailed(_)
+            }
         ));
-        assert_eq!(callback_calls.load(Ordering::Acquire), 2);
+        assert_eq!(events.queued_len(), 2);
         assert_eq!(poster.calls(), 1);
         assert_eq!(shared.operations.live(), 0);
         assert_eq!(shared.cq_credits.free(), 4);
@@ -2329,6 +2548,7 @@ mod tests {
         connection.state.reserve_local(Direction::Recv).unwrap();
         connection.state.release_local(Direction::Recv);
         connection.state.release_local(Direction::Recv);
+        drop(events.drain());
         assert_eq!(
             recorder
                 .snapshot()
@@ -2342,6 +2562,282 @@ mod tests {
         drop(driver);
         drop(engine);
         drop(recorder);
+    }
+
+    #[test]
+    fn exact_prefix_returns_only_the_proven_unaccepted_suffix() {
+        let Some((engine, driver)) = production_engine(2, 8, 8) else {
+            return;
+        };
+        let shared = Arc::clone(&engine.shared);
+        let poster = Arc::new(ScriptedPoster::new(
+            &shared,
+            53,
+            ScriptedPost::PrefixAccepted(1),
+        ));
+        let connection = scripted_connection(&shared, Arc::clone(&poster), 1, 3);
+        let (io, events) =
+            super::super::io::IoConnection::new(Arc::clone(&shared), Arc::clone(&connection.state))
+                .unwrap();
+        let requests = (0usize..3)
+            .map(|context| {
+                IoRecvRequest::new(
+                    io.register_memory(64, AccessIntent::LocalOnly).unwrap(),
+                    IoOperationContext::new(context),
+                )
+            })
+            .collect();
+
+        assert!(matches!(
+            io.post_recv_batch(requests),
+            IoSubmissionDisposition::ExactPrefix {
+                accepted: 1,
+                proven_unaccepted: 2,
+                error: Error::PostFailed(_)
+            }
+        ));
+        let mut rejected = Vec::new();
+        for _ in 0..2 {
+            let Some(super::super::io::IoEvent::Completion(completion)) = events.pop() else {
+                panic!("proven-unaccepted suffix event")
+            };
+            let (_, context, result, mr, unaccepted) = completion.into_parts();
+            rejected.push(context.downcast::<usize>().ok().unwrap());
+            assert!(matches!(result, Err(Error::PostFailed(_))));
+            assert!(mr.is_some());
+            assert!(unaccepted);
+        }
+        rejected.sort_unstable();
+        assert_eq!(rejected, vec![1, 2]);
+        assert_eq!(connection.state.accepted_count(), 1);
+        complete(&shared, &connection.state, poster.tokens()[0], IBV_WC_RECV);
+        assert!(matches!(
+            events.pop(),
+            Some(super::super::io::IoEvent::Completion(_))
+        ));
+        assert_eq!(shared.operations.live(), 0);
+        assert_eq!(shared.cq_credits.free(), 8);
+        drop(connection);
+        drop(driver);
+        drop(engine);
+    }
+
+    #[test]
+    fn exact_prefix_with_early_suffix_cqe_retains_the_entire_batch() {
+        let Some((engine, driver)) = production_engine(2, 8, 8) else {
+            return;
+        };
+        let shared = Arc::clone(&engine.shared);
+        let poster = Arc::new(ScriptedPoster::new(
+            &shared,
+            54,
+            ScriptedPost::PrefixWithSuffixCompletion {
+                accepted: 1,
+                completed_suffix: 1,
+            },
+        ));
+        let connection = scripted_connection(&shared, Arc::clone(&poster), 1, 3);
+        let (io, events) =
+            super::super::io::IoConnection::new(Arc::clone(&shared), Arc::clone(&connection.state))
+                .unwrap();
+        let requests = (0usize..3)
+            .map(|context| {
+                IoRecvRequest::new(
+                    io.register_memory(64, AccessIntent::LocalOnly).unwrap(),
+                    IoOperationContext::new(context),
+                )
+            })
+            .collect();
+
+        assert!(matches!(
+            io.post_recv_batch(requests),
+            IoSubmissionDisposition::RetainedAfterEarlyCompletion {
+                retained: 3,
+                error: Error::PostFailed(_)
+            }
+        ));
+        let Some(super::super::io::IoEvent::Completion(completion)) = events.pop() else {
+            panic!("early suffix completion event")
+        };
+        let (_, context, result, mr, unaccepted) = completion.into_parts();
+        assert_eq!(context.downcast::<usize>().ok().unwrap(), 1);
+        assert!(result.is_ok());
+        assert!(mr.is_some());
+        assert!(!unaccepted);
+        assert!(!events.has_events());
+        assert_eq!(connection.state.accepted_count(), 2);
+        assert_eq!(shared.operations.live(), 2);
+
+        let tokens = poster.tokens();
+        complete(&shared, &connection.state, tokens[0], IBV_WC_RECV);
+        complete(&shared, &connection.state, tokens[2], IBV_WC_RECV);
+        assert_eq!(events.drain().len(), 2);
+        assert_eq!(connection.state.accepted_count(), 0);
+        assert_eq!(shared.operations.live(), 0);
+        assert_eq!(shared.cq_credits.free(), 8);
+        drop(connection);
+        drop(driver);
+        drop(engine);
+    }
+
+    #[test]
+    fn exact_prefix_with_queued_suffix_cqe_retains_the_entire_batch_until_dispatch() {
+        let Some((engine, driver)) = production_engine(2, 8, 8) else {
+            return;
+        };
+        let shared = Arc::clone(&engine.shared);
+        let poster = Arc::new(ScriptedPoster::new(
+            &shared,
+            55,
+            ScriptedPost::PrefixWithQueuedSuffixCompletion {
+                accepted: 1,
+                completed_suffix: 2,
+            },
+        ));
+        let connection = scripted_connection(&shared, Arc::clone(&poster), 1, 3);
+        let (io, events) =
+            super::super::io::IoConnection::new(Arc::clone(&shared), Arc::clone(&connection.state))
+                .unwrap();
+        let requests = (0usize..3)
+            .map(|context| {
+                IoRecvRequest::new(
+                    io.register_memory(64, AccessIntent::LocalOnly).unwrap(),
+                    IoOperationContext::new(context),
+                )
+            })
+            .collect();
+
+        assert!(matches!(
+            io.post_recv_batch(requests),
+            IoSubmissionDisposition::RetainedAfterEarlyCompletion {
+                retained: 3,
+                error: Error::PostFailed(_)
+            }
+        ));
+        assert!(!events.has_events());
+        assert_eq!(connection.state.accepted_count(), 3);
+        assert_eq!(shared.operations.live(), 3);
+        assert_eq!(shared.cq_credits.free(), 5);
+
+        assert_eq!(
+            shared.dispatch_connection_completions(connection.state.token, 1),
+            (1, false)
+        );
+        let Some(super::super::io::IoEvent::Completion(completion)) = events.pop() else {
+            panic!("queued suffix completion event")
+        };
+        let (_, context, result, mr, unaccepted) = completion.into_parts();
+        assert_eq!(context.downcast::<usize>().ok().unwrap(), 2);
+        assert!(result.is_ok());
+        assert!(mr.is_some());
+        assert!(!unaccepted);
+        assert_eq!(connection.state.accepted_count(), 2);
+        assert_eq!(shared.operations.live(), 2);
+
+        let tokens = poster.tokens();
+        complete(&shared, &connection.state, tokens[0], IBV_WC_RECV);
+        complete(&shared, &connection.state, tokens[1], IBV_WC_RECV);
+        assert_eq!(events.drain().len(), 2);
+        assert_eq!(connection.state.accepted_count(), 0);
+        assert_eq!(shared.operations.live(), 0);
+        assert_eq!(shared.cq_credits.free(), 8);
+        drop(connection);
+        drop(driver);
+        drop(engine);
+    }
+
+    #[test]
+    fn dispatch_between_releasability_observation_and_release_retains_the_whole_suffix() {
+        let shared = synthetic_engine(8);
+        let connection = synthetic_connection_on(&shared, 56);
+        let mut entries = Vec::new();
+        for _ in 0..2 {
+            connection.state.reserve_local(Direction::Recv).unwrap();
+            assert!(shared.cq_credits.reserve());
+            let (token, state) = shared
+                .operations
+                .allocate(|token| {
+                    Arc::new(OperationState::new(
+                        token,
+                        Arc::clone(&connection.state),
+                        Direction::Recv,
+                        WcOpcode::Recv,
+                        None,
+                        1,
+                    ))
+                })
+                .unwrap();
+            entries.push(InternalBatchEntry {
+                token,
+                state,
+                sge: Sge::new(0, 0, 0),
+            });
+        }
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.state.can_release_unaccepted_for_test())
+        );
+
+        let raced = entries[1].token;
+        assert_eq!(
+            shared.enqueue_completion(wc(raced, 56, IBV_WC_RECV)),
+            Some(connection.state.token)
+        );
+        assert_eq!(entries[1].state.completion_ownership_for_test(), "queued");
+        assert_eq!(
+            shared.dispatch_connection_completions(connection.state.token, 1),
+            (1, false)
+        );
+        assert_eq!(entries[1].state.completion_ownership_for_test(), "early");
+
+        let entries = match release_proven_unaccepted_entries(
+            &shared,
+            &connection.state,
+            Direction::Recv,
+            entries,
+            Error::PostFailed(std::io::Error::from_raw_os_error(libc::ENOMEM)),
+        ) {
+            InternalRelease::Retained(entries) => entries,
+            InternalRelease::Released(_) => {
+                panic!("a recorded suffix CQE must prevent every suffix release")
+            }
+        };
+        assert_eq!(shared.operations.live(), 2);
+        assert_eq!(shared.accepted_operations.load(Ordering::Acquire), 0);
+        assert_eq!(shared.cq_credits.free(), 6);
+        connection.state.reserve_local(Direction::Recv).unwrap();
+        connection.state.reserve_local(Direction::Recv).unwrap();
+        assert!(matches!(
+            connection.state.reserve_local(Direction::Recv),
+            Err(Error::CapacityExhausted)
+        ));
+        connection.state.release_local(Direction::Recv);
+        connection.state.release_local(Direction::Recv);
+
+        commit_internal_entries(&shared, entries).publish();
+        assert_eq!(shared.operations.live(), 1);
+        assert_eq!(shared.accepted_operations.load(Ordering::Acquire), 1);
+        assert_eq!(connection.state.accepted_count(), 1);
+        assert_eq!(shared.cq_credits.free(), 7);
+
+        let remaining = connection.state.accepted_tokens();
+        assert_eq!(remaining.len(), 1);
+        complete(&shared, &connection.state, remaining[0], IBV_WC_RECV);
+        assert_eq!(shared.operations.live(), 0);
+        assert_eq!(shared.accepted_operations.load(Ordering::Acquire), 0);
+        assert_eq!(connection.state.accepted_count(), 0);
+        assert_eq!(shared.cq_credits.free(), 8);
+        for _ in 0..4 {
+            connection.state.reserve_local(Direction::Recv).unwrap();
+        }
+        assert!(matches!(
+            connection.state.reserve_local(Direction::Recv),
+            Err(Error::CapacityExhausted)
+        ));
+        for _ in 0..4 {
+            connection.state.release_local(Direction::Recv);
+        }
     }
 
     #[test]
@@ -2416,7 +2912,27 @@ mod tests {
     }
 
     #[test]
-    fn detached_early_completion_callback_runs_after_post_guards_are_released() {
+    fn io_early_completion_event_is_published_after_post_guards_are_released() {
+        use std::task::{Wake, Waker};
+
+        struct PostGuardCheckingWake {
+            shared: Arc<EngineShared>,
+            connection: Arc<ConnectionState>,
+            observed: AtomicBool,
+        }
+
+        impl Wake for PostGuardCheckingWake {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                assert!(self.shared.admission.try_write().is_ok());
+                assert!(self.connection.begin_posting().is_ok());
+                self.observed.store(true, Ordering::Release);
+            }
+        }
+
         let Some((engine, driver)) = production_engine(2, 4, 4) else {
             return;
         };
@@ -2427,31 +2943,29 @@ mod tests {
             ScriptedPost::DispatchDuringPost,
         ));
         let connection = scripted_connection(&shared, Arc::clone(&poster), 1, 1);
-        let observed = Arc::new(AtomicBool::new(false));
-        let callback_observed = Arc::clone(&observed);
-        let callback_shared = Arc::downgrade(&shared);
-        let posted = connection.post_detached_send(
-            shared.register_memory(64, AccessIntent::LocalOnly).unwrap(),
+        let (io, events) =
+            super::super::io::IoConnection::new(Arc::clone(&shared), Arc::clone(&connection.state))
+                .unwrap();
+        let wake = Arc::new(PostGuardCheckingWake {
+            shared: Arc::clone(&shared),
+            connection: Arc::clone(&connection.state),
+            observed: AtomicBool::new(false),
+        });
+        events.register(&Waker::from(Arc::clone(&wake)));
+        let posted = io.post_send(IoSendRequest::new(
+            io.register_memory(64, AccessIntent::LocalOnly).unwrap(),
             1,
-            Box::new(move |completion| {
-                assert!(matches!(
-                    completion,
-                    DetachedOperationCompletion::Completed {
-                        result: Ok(_),
-                        mr: Some(_)
-                    }
-                ));
-                let shared = callback_shared.upgrade().expect("engine shared state");
-                assert!(
-                    shared.admission.try_write().is_ok(),
-                    "early completion callback ran while admission remained locked"
-                );
-                callback_observed.store(true, Ordering::Release);
-                None
-            }),
-        );
-        assert!(posted.is_ok(), "detached early-completion post failed");
-        assert!(observed.load(Ordering::Acquire));
+            IoOperationContext::new(()),
+        ));
+        assert!(posted.all_accepted(), "I/O early-completion post failed");
+        assert!(wake.observed.load(Ordering::Acquire));
+        let Some(super::super::io::IoEvent::Completion(completion)) = events.pop() else {
+            panic!("early completion event")
+        };
+        let (_, _, result, mr, unaccepted) = completion.into_parts();
+        assert!(result.is_ok());
+        assert!(mr.is_some());
+        assert!(!unaccepted);
         assert_eq!(shared.operations.live(), 0);
         assert_eq!(shared.accepted_operations.load(Ordering::Acquire), 0);
         assert_eq!(shared.cq_credits.free(), 4);
@@ -2461,50 +2975,62 @@ mod tests {
     }
 
     #[test]
-    fn detached_unaccepted_callback_runs_after_post_guards_are_released() {
+    fn io_unaccepted_event_is_published_after_post_guards_are_released() {
+        use std::task::{Wake, Waker};
+
+        struct PostGuardCheckingWake {
+            shared: Arc<EngineShared>,
+            connection: Arc<ConnectionState>,
+            observed: AtomicBool,
+        }
+
+        impl Wake for PostGuardCheckingWake {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                assert!(self.shared.admission.try_write().is_ok());
+                assert!(self.connection.begin_posting().is_ok());
+                self.observed.store(true, Ordering::Release);
+            }
+        }
+
         let Some((engine, driver)) = production_engine(2, 4, 4) else {
             return;
         };
         let shared = Arc::clone(&engine.shared);
         let poster = Arc::new(ScriptedPoster::new(&shared, 52, ScriptedPost::Unaccepted));
         let connection = scripted_connection(&shared, Arc::clone(&poster), 1, 1);
-        let observed = Arc::new(AtomicBool::new(false));
-        let callback_observed = Arc::clone(&observed);
-        let callback_shared = Arc::downgrade(&shared);
-        let callback_connection = Arc::downgrade(&connection.state);
-        let posted = connection.post_detached_send(
-            shared.register_memory(64, AccessIntent::LocalOnly).unwrap(),
+        let (io, events) =
+            super::super::io::IoConnection::new(Arc::clone(&shared), Arc::clone(&connection.state))
+                .unwrap();
+        let wake = Arc::new(PostGuardCheckingWake {
+            shared: Arc::clone(&shared),
+            connection: Arc::clone(&connection.state),
+            observed: AtomicBool::new(false),
+        });
+        events.register(&Waker::from(Arc::clone(&wake)));
+        let posted = io.post_send(IoSendRequest::new(
+            io.register_memory(64, AccessIntent::LocalOnly).unwrap(),
             1,
-            Box::new(move |completion| {
-                assert!(matches!(
-                    completion,
-                    DetachedOperationCompletion::Unaccepted {
-                        error: Error::PostFailed(_),
-                        ..
-                    }
-                ));
-                let shared = callback_shared.upgrade().expect("engine shared state");
-                assert!(
-                    shared.admission.try_write().is_ok(),
-                    "unaccepted callback ran while admission remained locked"
-                );
-                let connection = callback_connection.upgrade().expect("connection state");
-                assert!(
-                    connection.begin_posting().is_ok(),
-                    "unaccepted callback ran while the posting gate remained locked"
-                );
-                callback_observed.store(true, Ordering::Release);
-                None
-            }),
-        );
+            IoOperationContext::new(()),
+        ));
         assert!(matches!(
             posted,
-            Err(DetachedPostError {
-                potentially_accepted: false,
-                ..
-            })
+            IoSubmissionDisposition::FullyUnaccepted {
+                proven_unaccepted: 1,
+                error: Error::PostFailed(_)
+            }
         ));
-        assert!(observed.load(Ordering::Acquire));
+        assert!(wake.observed.load(Ordering::Acquire));
+        let Some(super::super::io::IoEvent::Completion(completion)) = events.pop() else {
+            panic!("unaccepted event")
+        };
+        let (_, _, result, mr, unaccepted) = completion.into_parts();
+        assert!(matches!(result, Err(Error::PostFailed(_))));
+        assert!(mr.is_some());
+        assert!(unaccepted);
         assert_eq!(shared.operations.live(), 0);
         assert_eq!(shared.accepted_operations.load(Ordering::Acquire), 0);
         assert_eq!(shared.cq_credits.free(), 4);
@@ -2729,7 +3255,7 @@ mod tests {
         assert_eq!(
             reentrant.lock_failures.load(Ordering::Acquire),
             0,
-            "terminal wake callbacks must run after admission and terminal guards drop"
+            "terminal wakes must run after admission and terminal guards drop"
         );
         assert!(matches!(
             shutdown.as_mut().poll(&mut cx),
@@ -2800,6 +3326,15 @@ mod tests {
         Unaccepted,
         Ambiguous,
         DispatchDuringPost,
+        PrefixAccepted(usize),
+        PrefixWithQueuedSuffixCompletion {
+            accepted: usize,
+            completed_suffix: usize,
+        },
+        PrefixWithSuffixCompletion {
+            accepted: usize,
+            completed_suffix: usize,
+        },
     }
 
     struct ScriptedPoster {
@@ -2823,9 +3358,9 @@ mod tests {
             }
         }
 
-        fn post(&self, token: OperationToken, opcode: u32) -> BatchPostOutcome {
+        fn post(&self, tokens: Vec<OperationToken>, opcode: u32) -> BatchPostOutcome {
             self.calls.fetch_add(1, Ordering::AcqRel);
-            lock_unpoison(&self.tokens).push(token);
+            lock_unpoison(&self.tokens).extend(tokens.iter().copied());
             match self.outcome {
                 ScriptedPost::Accepted => BatchPostOutcome::AllAccepted,
                 ScriptedPost::Unaccepted => BatchPostOutcome::PrefixAccepted {
@@ -2837,6 +3372,7 @@ mod tests {
                     source: std::io::Error::from_raw_os_error(libc::EIO),
                 },
                 ScriptedPost::DispatchDuringPost => {
+                    let token = tokens[0];
                     let shared = self.shared.upgrade().expect("engine shared state");
                     assert_eq!(
                         shared.enqueue_completion(wc(token, self.qp_num, opcode)),
@@ -2851,6 +3387,53 @@ mod tests {
                         (1, false)
                     );
                     BatchPostOutcome::AllAccepted
+                }
+                ScriptedPost::PrefixAccepted(accepted) => BatchPostOutcome::PrefixAccepted {
+                    accepted,
+                    first_unaccepted: accepted,
+                    source: std::io::Error::from_raw_os_error(libc::ENOMEM),
+                },
+                ScriptedPost::PrefixWithQueuedSuffixCompletion {
+                    accepted,
+                    completed_suffix,
+                } => {
+                    assert!(completed_suffix >= accepted);
+                    let token = tokens[completed_suffix];
+                    let shared = self.shared.upgrade().expect("engine shared state");
+                    assert_eq!(
+                        shared.enqueue_completion(wc(token, self.qp_num, opcode)),
+                        shared.connections.lookup_qp(self.qp_num)
+                    );
+                    BatchPostOutcome::PrefixAccepted {
+                        accepted,
+                        first_unaccepted: accepted,
+                        source: std::io::Error::from_raw_os_error(libc::ENOMEM),
+                    }
+                }
+                ScriptedPost::PrefixWithSuffixCompletion {
+                    accepted,
+                    completed_suffix,
+                } => {
+                    assert!(completed_suffix >= accepted);
+                    let token = tokens[completed_suffix];
+                    let shared = self.shared.upgrade().expect("engine shared state");
+                    assert_eq!(
+                        shared.enqueue_completion(wc(token, self.qp_num, opcode)),
+                        shared.connections.lookup_qp(self.qp_num)
+                    );
+                    let connection = shared
+                        .connections
+                        .lookup_qp(self.qp_num)
+                        .expect("connection token");
+                    assert_eq!(
+                        shared.dispatch_connection_completions(connection, 1),
+                        (1, false)
+                    );
+                    BatchPostOutcome::PrefixAccepted {
+                        accepted,
+                        first_unaccepted: accepted,
+                        source: std::io::Error::from_raw_os_error(libc::ENOMEM),
+                    }
                 }
             }
         }
@@ -2878,11 +3461,21 @@ mod tests {
         }
 
         fn post_send(&self, batch: &mut PreparedSendBatch) -> Result<BatchPostOutcome> {
-            Ok(self.post(OperationToken::decode(batch.wr_id_for_test(0)), IBV_WC_SEND))
+            Ok(self.post(
+                (0..batch.len())
+                    .map(|index| OperationToken::decode(batch.wr_id_for_test(index)))
+                    .collect(),
+                IBV_WC_SEND,
+            ))
         }
 
         fn post_recv(&self, batch: &mut PreparedRecvBatch) -> Result<BatchPostOutcome> {
-            Ok(self.post(OperationToken::decode(batch.wr_id_for_test(0)), IBV_WC_RECV))
+            Ok(self.post(
+                (0..batch.len())
+                    .map(|index| OperationToken::decode(batch.wr_id_for_test(index)))
+                    .collect(),
+                IBV_WC_RECV,
+            ))
         }
 
         fn to_error(&self) -> Result<()> {
@@ -3056,40 +3649,31 @@ mod tests {
         shared: &Arc<EngineShared>,
         connection: &Arc<ConnectionState>,
         opcode: WcOpcode,
-    ) -> (OperationToken, Arc<Mutex<Option<Result<Completion>>>>) {
+    ) -> (OperationToken, super::super::io::IoEventReceiver) {
         let direction = match opcode {
             WcOpcode::Recv => Direction::Recv,
             _ => Direction::Send,
         };
         connection.reserve_local(direction).unwrap();
         assert!(shared.cq_credits.reserve());
-        let observed = Arc::new(Mutex::new(None));
-        let callback_observed = Arc::clone(&observed);
+        let (sender, events) = super::super::io::event_port();
         let (token, operation) = shared
             .operations
             .allocate(|token| {
-                Arc::new(OperationState::new_with_callback(
+                Arc::new(OperationState::new_with_event(
                     token,
                     Arc::clone(connection),
                     direction,
                     opcode,
                     None,
                     1,
-                    Some(Box::new(move |completion| {
-                        let DetachedOperationCompletion::Completed { result, mr } = completion
-                        else {
-                            panic!("accepted completion cannot become unaccepted")
-                        };
-                        assert!(mr.is_none());
-                        *lock_unpoison(&callback_observed) = Some(result);
-                        None
-                    })),
+                    Some(IoEventDestination::new(sender, IoOperationContext::new(()))),
                 ))
             })
             .unwrap();
         operation.commit_accepted();
         shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
-        (token, observed)
+        (token, events)
     }
 
     fn wc(token: OperationToken, qp_num: u32, opcode: u32) -> WorkCompletion {

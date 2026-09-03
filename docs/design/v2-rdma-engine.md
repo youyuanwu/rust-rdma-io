@@ -15,7 +15,7 @@ application
   ├─ one RdmaEngineDriver task
   │    ├─ shared Context / PD / CQ / completion channel
   │    ├─ CM channel and generational route registries
-  │    ├─ exact CQE validation and callback dispatch
+  │    ├─ exact CQE validation and owned event dispatch
   │    └─ safe QP / CmId teardown and quarantine
   │
   └─ one MessageTransportDriver task per message connection
@@ -93,12 +93,12 @@ One engine owns:
 - one CQ completion channel in readiness mode, or none in polling mode;
 - connection, operation, and CM-route registries;
 - aggregate connection, operation, and CQ-credit admission;
-- exact CQE validation and completion callback dispatch;
+- exact CQE validation and owned completion-event dispatch;
 - connection drain, QP destruction, CmId destruction, and fail-closed
   quarantine.
 
 The engine has a per-connection completion-dispatch queue so one connection
-cannot monopolize callback delivery. That queue contains validated low-level
+cannot monopolize event delivery. That queue contains validated low-level
 completions only. It is not a message scheduler and does not parse frames,
 manage message credits or pools, repost message receives, or own HELLO
 deadlines.
@@ -132,6 +132,74 @@ Message setup allocates and posts every configured receive before
 
 HELLO reuses a control receive; there is no additional receive.
 
+## ADR: Crate-Private I/O Boundary
+
+**Status:** accepted for the first issue #43 extraction milestone.
+
+The destination architecture has three ownership layers:
+
+1. **I/O core:** submission admission, provider posting, operation identity,
+   exact CQE validation, accepted-set accounting, completion ownership, and
+   post-QP-destruction reclamation.
+2. **CM/session:** connect, accept, disconnect, route ownership, drain,
+   retirement, QP-before-CmId ordering, and connection quarantine.
+3. **Protocol:** HELLO, DATA, CREDIT, pools, receive reposting, message
+   fairness, and frontend outcomes.
+
+This milestone establishes the dependency boundary between protocol policy and
+low-level I/O. It does not yet move the I/O core or CM/session state machines
+into final standalone module hierarchies. The existing engine driver still
+composes CQ, CM, reclamation, retirement, and shutdown progress.
+
+The protocol receives one opaque connection capability before provider
+establishment. It uses that capability to register message memory, prepost
+receives, submit later SEND/RECV requests, request close, and await connection
+close. It cannot access engine shared state, connection state, registries,
+generational tokens, scheduler work bits, CM routes, or reconstruction
+helpers.
+
+Each submitted request transfers its MR and an opaque, protocol-owned context
+to the I/O core. The post-reconciliation disposition reports one of these
+ownership results:
+
+- every request accepted;
+- an exact accepted prefix plus a provider-proven unaccepted suffix;
+- every request provider-proven unaccepted;
+- the complete batch retained because provider acceptance is ambiguous; or
+- the complete batch retained because an exact-prefix result raced with an
+  already-observed CQE in the nominally unaccepted suffix.
+
+The final case is intentionally fail-closed: an early suffix CQE proves that
+the raw prefix classification no longer describes the ownership visible to
+the operation ledger, so no suffix MR is returned as unaccepted.
+
+One connection-scoped event port carries owned completion and terminal events.
+Operation state stores only the opaque context and event destination—never a
+protocol closure. Producers finish admission, posting, registry, accepted-set,
+and lifecycle mutations before enqueueing an event or waking the protocol
+driver. The port releases its queue mutex before wakeup. The message driver
+pops both local protocol work and I/O events before processing them, alternates
+the two sources, and uses check-register-recheck suspension for both wakers.
+
+Unresolved accepted operations may be reclaimed only with an engine-private
+QP-destruction proof. The proof has no public or protocol-visible constructor;
+the connection owner creates it only after result-aware synchronous QP
+destruction succeeds while the owning CmId is still alive. Drain consumes the
+proof for operation reclamation. Zero-debt CM retirement and bounded driver
+drop establish and discard the same proof without moving CM ownership.
+
+Operation quarantine retains one operation's MR, registration, accepted-set
+membership, and CQ debt. Connection quarantine retains the complete QP, CmId,
+route, generation, admission, and unresolved operation bundle when no positive
+release boundary can be proven. Protocol failure can request close, but it
+cannot release or quarantine provider-visible ownership itself.
+
+The crate-private boundary is deliberately concrete and unstable. It is not
+re-exported from `rdma_io::v2`. Structural tests reject protocol references to
+engine shared/connection state, registries, callback-era types, reconstruction
+helpers, and detached-post methods; they also reject dependencies from the
+boundary module to CM, listener, or message-policy modules.
+
 ## Completion-to-Message Handoff
 
 The engine remains the only component allowed to validate and consume CQEs.
@@ -139,20 +207,20 @@ A completion must match the current operation generation, connection
 generation, owning connection, provider-reported `qp_num`, and expected opcode
 where the status is successful.
 
-After validation, the engine removes operation ownership and detaches its
-callback. The callback runs only after registry and admission locks needed by
-new posting have been released. A message callback transfers its owned
-completion and MR into the connection-local message event queue and wakes that
-connection's message driver.
+After validation, the engine removes operation ownership and creates an owned
+completion event containing the opaque request context, completion result, and
+releasable MR. Registry and admission guards are released before the event is
+enqueued on the connection's I/O port and before the message driver is woken.
 
 The driver then parses the frame or advances the corresponding send/repost
-state. Neither the frontend nor the engine callback directly mutates
-driver-owned protocol state.
+state. Neither the frontend nor the engine directly mutates driver-owned
+protocol state.
 
 Suspension uses check-register-recheck behavior: the driver checks for work,
-registers its waker, and checks again before returning `Pending`. This prevents
-an event, terminal notification, frontend close, or timeout from being lost
-between an empty-queue observation and suspension.
+registers both its local-work and I/O-port wakers, and checks again before
+returning `Pending`. This prevents an event, terminal notification, frontend
+close, or timeout from being lost between an empty-queue observation and
+suspension. Events are removed from their queue before protocol processing.
 
 ## Wire Protocol, Credits, and Fairness
 
@@ -202,6 +270,11 @@ proves a suffix unaccepted. A null, foreign, misaligned, or otherwise invalid
 pointer leaves the complete batch acceptance-ambiguous, so all entries are
 retained.
 
+An exact prefix is also promoted to complete retained ownership if any CQE was
+already observed for its nominally unaccepted suffix before the post call
+returned. The provider classification remains the starting point; the
+operation ledger's observed completion is the stronger ownership fact.
+
 Providers differ in whether and when they emit flush CQEs. Teardown consumes
 the exact flush CQEs that arrive, but never assumes that every accepted WR
 will produce one.
@@ -221,6 +294,8 @@ All shutdown orderings converge on engine-owned hardware teardown:
 The engine stops posting, transitions the local QP to ERR, and drains exact
 CQEs. If accepted WRs remain at the drain deadline, it attempts synchronous
 destruction of that exact QP before releasing any associated operation or MR.
+Successful destruction creates the internal proof required by every unresolved
+operation reclamation.
 
 For a clean zero-debt retirement, successful QP destruction is also
 established before the connection's CM route is retired. The owning CmId is
@@ -306,9 +381,9 @@ just validate-v2-engine
 ```
 
 It runs warning-denied feature builds, all-target workspace builds, formatting,
-strict Clippy, rustdoc, doctests, the recursive no-hidden-spawn guard, an
-isolated production build without `test-hooks`, and serialized integration
-suites on both RXE and SIW.
+strict Clippy, rustdoc, doctests, recursive hidden-work and internal-boundary
+guards, an isolated production build without `test-hooks`, and serialized
+integration suites on both RXE and SIW.
 
 The provider-only matrix is:
 
