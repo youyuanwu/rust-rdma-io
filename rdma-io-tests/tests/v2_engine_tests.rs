@@ -5,12 +5,13 @@ use std::task::Poll;
 use std::time::Duration;
 
 use futures_util::future::join_all;
-use rdma_io::v2::test_support::TestSteadyFrame;
+use rdma_io::v2::test_support::TestCqeRejection;
 use rdma_io::v2::{
     AccessIntent, CompletionMode, Error, MessageTransport, MessageTransportBuilder, RdmaConnection,
     RdmaEngine, RdmaEngineBuilder, RdmaListenerConfig,
 };
 use rdma_io::wc::WcOpcode;
+use rdma_io_tests::engine_test_helpers::{peer_credit_frame, send_peer_frame};
 use rdma_io_tests::test_helpers::{connect_addr_for, has_software_rdma};
 
 fn software_device_name() -> Option<String> {
@@ -58,7 +59,13 @@ async fn establish_message_pair(
     engine: &RdmaEngine,
     listener: &rdma_io::v2::RdmaListener,
     address: std::net::SocketAddr,
-) -> (Arc<MessageTransport>, Arc<MessageTransport>) {
+) -> (
+    (Arc<MessageTransport>, Arc<MessageTransport>),
+    (
+        tokio::task::JoinHandle<rdma_io::v2::Result<()>>,
+        tokio::task::JoinHandle<rdma_io::v2::Result<()>>,
+    ),
+) {
     let (server, client) = tokio::time::timeout(Duration::from_secs(15), async {
         tokio::join!(
             message_builder().accept_on(listener),
@@ -67,12 +74,16 @@ async fn establish_message_pair(
     })
     .await
     .expect("message establishment timed out");
-    let server = Arc::new(server.unwrap());
-    let client = Arc::new(client.unwrap());
+    let (server, server_driver) = server.unwrap();
+    let (client, client_driver) = client.unwrap();
+    let server_driver = tokio::spawn(server_driver);
+    let client_driver = tokio::spawn(client_driver);
+    let server = Arc::new(server);
+    let client = Arc::new(client);
     let (server_ready, client_ready) = tokio::join!(server.ready(), client.ready());
     server_ready.unwrap();
     client_ready.unwrap();
-    (server, client)
+    ((server, client), (server_driver, client_driver))
 }
 
 async fn bidirectional_low_level(server: &RdmaConnection, client: &RdmaConnection) {
@@ -237,7 +248,7 @@ async fn run_mode(mode: CompletionMode) {
             .cq_completion_budget(7)
             .cm_event_budget(7)
             .reclamation_budget(7)
-            .ready_connection_quantum(1)
+            .completion_dispatch_budget(1)
             .connection_drain_deadline(Duration::from_secs(5))
             .shutdown_deadline(Duration::from_secs(10))
             .build()
@@ -254,8 +265,11 @@ async fn run_mode(mode: CompletionMode) {
     let address = connect_addr_for(Some(listener.local_addr().unwrap()));
 
     let mut pairs = Vec::new();
+    let mut message_drivers = Vec::new();
     for _ in 0..8 {
-        pairs.push(establish_message_pair(&engine, &listener, address).await);
+        let (pair, drivers) = establish_message_pair(&engine, &listener, address).await;
+        pairs.push(pair);
+        message_drivers.push(drivers);
     }
     let (low_server, low_client) = tokio::time::timeout(Duration::from_secs(15), async {
         tokio::join!(listener.accept(), engine.connect(address))
@@ -266,23 +280,25 @@ async fn run_mode(mode: CompletionMode) {
     let low_client = low_client.unwrap();
 
     let shared = engine.diagnostics();
-    assert_eq!(shared.live_connection_reservations, 18);
-    assert_eq!(shared.establishing_connection_reservations, 0);
-    assert_eq!(shared.established_connection_reservations, 18);
-    assert_eq!(shared.connections().len(), 18);
-    assert_eq!(shared.connections_admitted, 18);
-    assert_eq!(shared.connections_opened, 18);
-    assert_eq!(shared.inbound_requests_accepted, 9);
-    assert_eq!(shared.shared_contexts, 1);
-    assert_eq!(shared.shared_protection_domains, 1);
-    assert_eq!(shared.shared_completion_queues, 1);
-    assert_eq!(shared.shared_cm_event_channels, 1);
-    assert_eq!(shared.shared_cm_event_fds, 1);
-    assert_eq!(shared.explicit_engine_drivers, 1);
-    assert_eq!(shared.library_owned_tasks, 0);
-    assert_eq!(
-        shared.shared_cq_notification_fds,
-        usize::from(mode == CompletionMode::Readiness)
+    assert_eq!(shared.live_connections, 18);
+    let shared_resources = resources.shared_resource_identity().unwrap();
+    assert!(
+        shared_resources
+            == engine
+                .test_resources()
+                .unwrap()
+                .shared_resource_identity()
+                .unwrap()
+    );
+    assert!(
+        resources
+            .connection_uses_shared_resources(&low_server)
+            .unwrap()
+    );
+    assert!(
+        resources
+            .connection_uses_shared_resources(&low_client)
+            .unwrap()
     );
 
     bidirectional_low_level(&low_server, &low_client).await;
@@ -312,7 +328,8 @@ async fn run_mode(mode: CompletionMode) {
     ));
     assert_clean(pairs[3].0.close().await);
 
-    let _ = pairs[4].1.test_send_frame(TestSteadyFrame::Credit(0)).await;
+    let malformed_peer = pairs[4].1.test_connection().unwrap();
+    let _ = send_peer_frame(&malformed_peer, &peer_credit_frame(0)).await;
     assert!(matches!(
         pairs[4].0.recv().await,
         Err(Error::ProtocolViolation(message)) if message.contains("zero credits")
@@ -337,7 +354,8 @@ async fn run_mode(mode: CompletionMode) {
     };
     held.wait_observed().await.unwrap();
     let identity = held.completion().unwrap();
-    let before = engine.diagnostics();
+    let rejected_before = resources.instrumentation().unwrap().cqes_rejected;
+    let rejection_classes_before = resources.cqe_rejections().unwrap().len();
     resources
         .inject_completion(
             identity.wr_id().wrapping_add(1_u64 << 32),
@@ -354,16 +372,18 @@ async fn run_mode(mode: CompletionMode) {
     resources
         .inject_completion(identity.wr_id(), identity.qp_num(), WcOpcode::Recv)
         .unwrap();
-    let rejected = engine.diagnostics();
     assert_eq!(
-        rejected.stale_operation_cqes,
-        before.stale_operation_cqes + 1
+        resources.instrumentation().unwrap().cqes_rejected,
+        rejected_before + 4
     );
-    assert_eq!(rejected.unknown_cqes, before.unknown_cqes + 1);
-    assert_eq!(rejected.wrong_qp_num_cqes, before.wrong_qp_num_cqes + 1);
     assert_eq!(
-        rejected.unexpected_opcode_cqes,
-        before.unexpected_opcode_cqes + 1
+        &resources.cqe_rejections().unwrap()[rejection_classes_before..],
+        &[
+            TestCqeRejection::StaleOperation,
+            TestCqeRejection::Unknown,
+            TestCqeRejection::WrongQpNum,
+            TestCqeRejection::UnexpectedOpcode,
+        ]
     );
     held.release().unwrap();
     stale_sender.await.unwrap().unwrap();
@@ -374,8 +394,12 @@ async fn run_mode(mode: CompletionMode) {
         .inject_completion(identity.wr_id(), identity.qp_num(), identity.opcode())
         .unwrap();
     assert_eq!(
-        engine.diagnostics().duplicate_cqes,
-        rejected.duplicate_cqes + 1
+        resources.instrumentation().unwrap().cqes_rejected,
+        rejected_before + 5
+    );
+    assert_eq!(
+        resources.cqe_rejections().unwrap().last(),
+        Some(&TestCqeRejection::Duplicate)
     );
 
     for index in [5_usize, 6, 7] {
@@ -383,19 +407,6 @@ async fn run_mode(mode: CompletionMode) {
         let message = pairs[index].0.recv().await.unwrap();
         assert_eq!(&*message, &[index as u8]);
         drop(message);
-    }
-
-    let instrumentation = resources.instrumentation().unwrap();
-    assert!(instrumentation.connection_selections > 0);
-    assert!(instrumentation.connection_quantum_work > 0);
-    assert!(instrumentation.maximum_connection_quantum_work <= 1);
-    assert!(instrumentation.idle_connection_visits < instrumentation.connection_selections);
-    assert!(instrumentation.operations_posted > 0);
-    assert!(instrumentation.cqes_routed > 0);
-    assert!(instrumentation.cqes_rejected >= 5);
-    assert!(instrumentation.driver_wakeups > 0);
-    if mode == CompletionMode::Polling {
-        assert!(instrumentation.driver_yields > 0);
     }
 
     for (index, (server, client)) in pairs.iter().enumerate() {
@@ -408,20 +419,30 @@ async fn run_mode(mode: CompletionMode) {
             assert_clean(client_close);
         }
     }
+    for (server_driver, client_driver) in message_drivers {
+        let (server_result, client_result) = tokio::join!(server_driver, client_driver);
+        let server_result = server_result.expect("server message driver task panicked");
+        let client_result = client_result.expect("client message driver task panicked");
+        for result in [server_result, client_result] {
+            assert!(
+                matches!(
+                    result,
+                    Ok(()) | Err(Error::TransportClosed) | Err(Error::ProtocolViolation(_))
+                ),
+                "unexpected message-driver terminal result: {result:?}"
+            );
+        }
+    }
     listener.close().await.unwrap();
     engine.shutdown().await.unwrap();
     driver.await.unwrap().unwrap();
 
     let terminal = engine.diagnostics();
-    assert_eq!(terminal.live_connection_reservations, 0);
+    assert_eq!(terminal.live_connections, 0);
     assert_eq!(terminal.registered_operations, 0);
-    assert_eq!(terminal.free_cq_credits, 2_048);
-    assert_eq!(terminal.quarantined_bundles, 0);
+    assert_eq!(terminal.available_cq_credits, 2_048);
+    assert_eq!(terminal.quarantined_connections, 0);
     assert_eq!(terminal.retained_cq_credits, 0);
-    assert_eq!(terminal.connections_closed, 18);
-    assert_eq!(terminal.qp_destroys, 18);
-    assert_eq!(terminal.retired_connection_slots, 0);
-    assert_eq!(terminal.retired_operation_slots, 0);
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 8))]

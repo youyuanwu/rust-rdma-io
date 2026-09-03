@@ -2,8 +2,9 @@
 //!
 //! With the `tokio` feature, [`RdmaEngineBuilder::build`] returns
 //! ([`RdmaEngine`], [`RdmaEngineDriver`]). The handle submits connection,
-//! listener, operation, message, and lifecycle work; the driver is the sole
-//! CQ/CM consumer. This resembles the ownership split of an io_uring instance
+//! listener, operation, and lifecycle work; the driver is the sole CQ/CM
+//! consumer. Message protocol work has a separate per-connection driver. This
+//! resembles the ownership split of an io_uring instance
 //! or IOCP completion port, although the implementation uses libibverbs and
 //! librdmacm directly.
 //!
@@ -28,10 +29,11 @@
 //! feature flags documented below.
 //!
 //! The library creates no task or thread. Applications must spawn or directly
-//! poll the one driver future, and no engine work progresses otherwise.
-//! Message transport adds zero tasks: receive completions, reposts, DATA,
-//! CREDIT, HELLO, disconnect handling, and reclamation all run as bounded
-//! engine-driver work.
+//! poll the engine driver, and must also poll the [`MessageTransportDriver`]
+//! returned for every message connection. CQ/CM routing, exact completion
+//! dispatch, reclamation, and safe teardown remain engine work. HELLO, DATA,
+//! CREDIT, receive reposting, fairness, and message lifecycle are bounded
+//! connection-driver work.
 //!
 //! ```no_run
 //! # use rdma_io::v2::*;
@@ -54,8 +56,7 @@
 //! The retained independent resource surface includes [`Context`], [`Pd`],
 //! [`Cq`], [`Mr`], [`Qp`], the four named [`Qp::post_send`],
 //! [`Qp::post_recv`], [`Qp::post_write`], and [`Qp::post_read`] operations,
-//! [`Completions`], and [`CqPoller`]. V1 APIs are separate and unchanged;
-//! existing v2 endpoint compatibility is not provided.
+//! [`Completions`], and [`CqPoller`]. V1 APIs are separate and unchanged.
 //!
 //! # Feature Flags
 //!
@@ -108,14 +109,15 @@ pub use crate::async_cq::CqNotifier;
 
 #[cfg(feature = "tokio")]
 pub use engine::{
-    CompletionMode, RdmaConnection, RdmaConnectionConfig, RdmaConnectionDiagnostics,
-    RdmaConnectionIdentity, RdmaEngine, RdmaEngineBuilder, RdmaEngineDiagnostics, RdmaEngineDriver,
-    RdmaEngineLifecycle, RdmaEngineTerminalError, RdmaListener, RdmaListenerConfig,
-    RdmaListenerDiagnostics, RdmaOperation,
+    CompletionMode, RdmaConnection, RdmaConnectionConfig, RdmaConnectionIdentity, RdmaEngine,
+    RdmaEngineBuilder, RdmaEngineDiagnostics, RdmaEngineDriver, RdmaEngineLifecycle,
+    RdmaEngineTerminalError, RdmaListener, RdmaListenerConfig, RdmaOperation,
 };
 
 #[cfg(feature = "tokio")]
-pub use message_transport::{MessageTransport, MessageTransportBuilder, ReceivedMessage};
+pub use message_transport::{
+    MessageTransport, MessageTransportBuilder, MessageTransportDriver, ReceivedMessage,
+};
 
 #[cfg(feature = "tokio")]
 pub use tokio_support::TokioCompletions;

@@ -166,7 +166,9 @@ let (engine, driver) = RdmaEngineBuilder::new("rxe0")
 One engine owns one anchored context facade, PD, CQ, and CM event channel.
 Readiness adds one CQ completion channel/fd; polling adds none. There is exactly
 one explicit engine driver and zero library-owned tasks or threads, regardless
-of connection count. Low-level `connect`/`connect_with_config` and listener
+of connection count. Each message connection additionally returns one
+application-owned message driver; low-level connections add no driver.
+Low-level `connect`/`connect_with_config` and listener
 `accept`/`accept_with_config` post zero initial receives.
 
 Dropping the last `RdmaEngine` clone requests shutdown; connections, listeners,
@@ -199,8 +201,8 @@ exposes no raw pointer/fd/resource consumer, and is not a V1 API.
 The v2 message transport provides a builder-driven, message-oriented Send/Recv
 transport on top of an `RdmaEngine`, with pre-registered buffer pools, message
 boundaries, credit-based flow control, deterministic disconnect handling, and
-cancellation-safe operations. Message progress adds no task beyond the owning
-engine driver:
+cancellation-safe operations. Setup returns a non-cloneable frontend and one
+explicit per-connection message driver:
 
 ```rust
 use rdma_io::v2::*;
@@ -216,19 +218,22 @@ let listener = server_engine
         RdmaListenerConfig::default(),
     )
     .await?;
-let server = MessageTransportBuilder::new()
-    .recv_buffers(32)
-    .send_buffers(16)
-    .buffer_size(64 * 1024)
-    .accept_on(&listener)
-    .await?;
-
-let client = MessageTransportBuilder::new()
-    .recv_buffers(32)
-    .send_buffers(16)
-    .buffer_size(64 * 1024)
-    .connect_on(&client_engine, "10.0.0.1:7471".parse().unwrap())
-    .await?;
+let (server, client) = tokio::join!(
+    MessageTransportBuilder::new()
+        .recv_buffers(32)
+        .send_buffers(16)
+        .buffer_size(64 * 1024)
+        .accept_on(&listener),
+    MessageTransportBuilder::new()
+        .recv_buffers(32)
+        .send_buffers(16)
+        .buffer_size(64 * 1024)
+        .connect_on(&client_engine, "10.0.0.1:7471".parse().unwrap()),
+);
+let (server, server_message_driver) = server?;
+let (client, client_message_driver) = client?;
+let server_message_task = tokio::spawn(server_message_driver);
+let client_message_task = tokio::spawn(client_message_driver);
 
 // Wait for readiness (HELLO handshake), then send/recv
 client.ready().await?;
@@ -238,6 +243,8 @@ assert_eq!(msg.as_ref(), b"hello rdma transport");
 
 client.close().await?;
 server.close().await?;
+client_message_task.await.expect("message driver panicked")?;
+server_message_task.await.expect("message driver panicked")?;
 listener.close().await?;
 client_engine.shutdown().await?;
 server_engine.shutdown().await?;
@@ -247,9 +254,10 @@ server_task.await.expect("driver panicked")?;
 
 Key design properties:
 
-- **Explicit driver spawning**: No hidden `tokio::spawn`; one engine driver
-  composes shared CQ/CM driving, message protocol progress, receive reposting,
-  disconnect handling, and reclamation. There is no receive-pump task.
+- **Explicit progress owners**: No hidden `tokio::spawn`; applications run one
+  engine driver plus one message driver per message connection. The engine
+  owns shared CQ/CM progress and safe teardown; each message driver owns HELLO,
+  DATA, CREDIT, receive reposting, fairness, and message lifecycle.
 - **Wire protocol**: DATA, CREDIT, and HELLO use an internal 12-byte
   magic/version/type/length header. Wire behavior is stable through
   `MessageTransport`; codec helpers are not public API.
@@ -258,25 +266,29 @@ Key design properties:
   frames when `ReceivedMessage` is dropped. RNR retry is a safety net, not
   the primary flow-control mechanism. Holding messages intentionally withholds
   receive buffers and can stall the peer when all negotiated credits are held.
-- **Readiness handshake**: Engine progress performs HELLO negotiation;
-  `ready().await` completes when both peers have exchanged capabilities.
+- **Readiness handshake**: The connection's message driver performs HELLO
+  negotiation; `ready().await` completes when both peers have exchanged
+  capabilities. A never-polled message driver provides no protocol progress
+  or HELLO-timeout guarantee.
 - **Deterministic lifecycle**: Driver failure wakes frontend waiters, while
   `close().await` returns the contextual connection result. There is no public
   error accessor; observe `ready`/`send`/`recv`/`close` errors and
   `RdmaEngine::diagnostics()`.
 - **Pre-posted receives**: All receive buffers (data + control headroom) are
-  posted before the CM handshake completes
+  posted before the CM handshake completes.
 - **Bounded backpressure**: Both send buffer pool and credit semaphore limit
-  concurrent sends; additional senders wait asynchronously
+  concurrent sends; additional senders wait asynchronously.
 - **`send().await` = local completion**: The send CQE confirms local
-  completion, not remote consumption
+  completion, not remote consumption.
 - **Cancellation safe**: If cancelled before WR posting, the credit permit is
-  returned automatically. If cancelled after posting, the MR returns via the
-  reclaim queue. Dropping `recv()` leaves the message for the next caller.
+  returned automatically. If cancelled after posting, the engine retains the
+  MR until its exact CQE arrives or the owning QP is successfully destroyed
+  synchronously while its CmId remains alive. Dropping `recv()` leaves the
+  message for the next caller.
 - **Shared engine resources**: Connections use the engine's one context,
-  protection domain, CQ, notification resource, and CM event channel
+  protection domain, CQ, notification resource, and CM event channel.
 - **Completion modes**: `Readiness` (fd/channel-based, lower CPU) or
-  `Polling` (direct CQ poll, lower latency)
+  `Polling` (direct CQ poll, lower latency).
 - **Exact default capacity**: 19 send WRs and 34 receive WRs per connection;
   message setup pre-posts exactly 34 receives. At 256 default connections,
   `256 × 53 = 13,568`, leaving `2,816` positions in the default 16,384-entry
@@ -304,8 +316,6 @@ The following are explicitly out of scope for the v2 message transport:
 - Ring transports, atomics, inline data, multi-SGE operations
 - Dynamic buffer pool resizing
 - UD (Unreliable Datagram) queue pair support
-- Compatibility adapters for the removed endpoint-owned v2 surface. V1 remains
-  unchanged.
 
 See [V2 Runtime RDMA Engine](docs/design/v2-rdma-engine.md) for the complete
 public API, resource counts, listener ordering, wakeup proof, routing,

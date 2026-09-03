@@ -555,14 +555,15 @@ pub mod test_helpers {
 pub mod engine_test_helpers {
     use std::error::Error as StdError;
     use std::fmt;
+    use std::ops::Deref;
     use std::time::Duration;
 
     use rdma_io::async_cm::{AsyncCmId, AsyncCmListener};
     use rdma_io::cm::ConnParam;
     use rdma_io::v2::test_support::{TestEngineInstrumentation, TestEngineQp, TestEngineResources};
     use rdma_io::v2::{
-        Error, MessageTransport, MessageTransportBuilder, RdmaEngine, RdmaListener,
-        RdmaListenerConfig, Result,
+        AccessIntent, Error, MessageTransport, MessageTransportBuilder, MessageTransportDriver,
+        RdmaConnection, RdmaEngine, RdmaListener, RdmaListenerConfig, Result,
     };
 
     use crate::test_helpers::{
@@ -576,6 +577,52 @@ pub mod engine_test_helpers {
     const V2_SETUP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
     const V2_SETUP_CLEANUP_MIN_BACKOFF: Duration = Duration::from_millis(1);
     const V2_SETUP_CLEANUP_MAX_BACKOFF: Duration = Duration::from_millis(10);
+    const MESSAGE_MAGIC: u32 = 0x5244_4d41;
+    const MESSAGE_VERSION: u8 = 1;
+    const MESSAGE_HEADER_SIZE: usize = 12;
+    const MESSAGE_FRAME_DATA: u8 = 0;
+    const MESSAGE_FRAME_CREDIT: u8 = 1;
+    const MESSAGE_FRAME_HELLO: u8 = 2;
+
+    fn peer_message_frame(frame_type: u8, payload: &[u8]) -> Vec<u8> {
+        let mut frame = vec![0; MESSAGE_HEADER_SIZE + payload.len()];
+        frame[0..4].copy_from_slice(&MESSAGE_MAGIC.to_le_bytes());
+        frame[4] = MESSAGE_VERSION;
+        frame[5] = frame_type;
+        frame[8..12].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame[MESSAGE_HEADER_SIZE..].copy_from_slice(payload);
+        frame
+    }
+
+    /// Encode a HELLO as an independent wire peer rather than mutating the
+    /// message transport's production framing path.
+    pub fn peer_hello_frame(data_recv_capacity: u32, max_message_size: u32) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(12);
+        payload.extend_from_slice(&data_recv_capacity.to_le_bytes());
+        payload.extend_from_slice(&max_message_size.to_le_bytes());
+        payload.extend_from_slice(&(MESSAGE_VERSION as u32).to_le_bytes());
+        peer_message_frame(MESSAGE_FRAME_HELLO, &payload)
+    }
+
+    /// Encode a CREDIT frame as an independent wire peer.
+    pub fn peer_credit_frame(credits: u32) -> Vec<u8> {
+        peer_message_frame(MESSAGE_FRAME_CREDIT, &credits.to_le_bytes())
+    }
+
+    /// Encode a DATA frame as an independent wire peer.
+    pub fn peer_data_frame(payload: &[u8]) -> Vec<u8> {
+        peer_message_frame(MESSAGE_FRAME_DATA, payload)
+    }
+
+    /// Send one independently encoded message-protocol frame through the
+    /// low-level connection underlying a test peer.
+    pub async fn send_peer_frame(connection: &RdmaConnection, frame: &[u8]) -> Result<()> {
+        let mut mr = connection.register_memory(frame.len(), AccessIntent::LocalOnly)?;
+        mr.as_mut_slice().copy_from_slice(frame);
+        let (result, mr) = connection.send(mr, None).await;
+        drop(mr);
+        result.map(|_| ())
+    }
 
     #[derive(Debug)]
     struct ExhaustedV2SetupRetries {
@@ -610,171 +657,158 @@ pub mod engine_test_helpers {
         pub client: EngineTestEndpoint,
     }
 
+    /// Test-owned message frontend plus its explicitly spawned driver task.
+    pub struct DrivenMessageTransport {
+        transport: Option<MessageTransport>,
+        driver: Option<tokio::task::JoinHandle<Result<()>>>,
+    }
+
+    impl DrivenMessageTransport {
+        pub fn new(transport: MessageTransport, driver: MessageTransportDriver) -> Self {
+            Self {
+                transport: Some(transport),
+                driver: Some(tokio::spawn(driver)),
+            }
+        }
+
+        pub async fn shutdown(mut self) -> Result<()> {
+            let result = self
+                .transport
+                .as_ref()
+                .expect("driven transport is present")
+                .close()
+                .await;
+            drop(self.transport.take());
+            let driver_result = match self.driver.take() {
+                Some(driver) => driver.await.expect("message driver task panicked"),
+                None => Ok(()),
+            };
+            match result {
+                Err(error) => Err(error),
+                Ok(()) => driver_result,
+            }
+        }
+
+        pub async fn abort_driver(&mut self) {
+            if let Some(driver) = self.driver.take() {
+                driver.abort();
+                assert!(driver.await.unwrap_err().is_cancelled());
+            }
+        }
+
+        pub async fn drop_frontend_and_wait(mut self) -> Result<()> {
+            drop(self.transport.take());
+            self.driver
+                .take()
+                .expect("message driver task is present")
+                .await
+                .expect("message driver task panicked")
+        }
+
+        pub async fn wait_for_driver(mut self) -> Result<()> {
+            let result = self
+                .driver
+                .take()
+                .expect("message driver task is present")
+                .await
+                .expect("message driver task panicked");
+            drop(self.transport.take());
+            result
+        }
+    }
+
+    impl Deref for DrivenMessageTransport {
+        type Target = MessageTransport;
+
+        fn deref(&self) -> &Self::Target {
+            self.transport
+                .as_ref()
+                .expect("driven transport is present")
+        }
+    }
+
+    impl Drop for DrivenMessageTransport {
+        fn drop(&mut self) {
+            if let Some(driver) = self.driver.take() {
+                driver.abort();
+            }
+        }
+    }
+
     #[derive(Clone, Debug, PartialEq, Eq)]
-    struct EngineCleanupBaseline {
-        live_connection_reservations: usize,
-        establishing_connection_reservations: usize,
-        established_connection_reservations: usize,
-        draining_connection_reservations: usize,
-        registered_live_qps: usize,
-        free_connection_slots: usize,
+    struct SafetyBaseline {
+        live_connections: usize,
         registered_operations: usize,
-        free_operation_slots: usize,
-        accepted_outstanding_operations: usize,
-        free_cq_credits: usize,
+        accepted_operations: usize,
+        available_cq_credits: usize,
         retained_cq_credits: usize,
         pending_reclamations: usize,
         quarantined_operations: usize,
         quarantined_mrs: usize,
         quarantined_bytes: usize,
-        quarantined_bundles: usize,
-        ready_queue_depth: usize,
-        listener_count: usize,
-        queued_inbound_requests: usize,
-        pending_accepts: usize,
-        selected_accepts: usize,
-        connection_details: usize,
-        listener_details: usize,
+        quarantined_connections: usize,
         cm_pending_routes: usize,
         cm_retained_owners: usize,
-        inbound_requests_rejected: u64,
-        inbound_rejected_backlog_full: u64,
-        inbound_rejected_connection_capacity: u64,
-        inbound_rejected_admission_closed: u64,
-        inbound_rejected_listener_closed: u64,
-        inbound_rejected_context_mismatch: u64,
-        inbound_rejected_setup_failure: u64,
+        cqes_rejected: u64,
         cm_events_rejected: u64,
-        stale_cm_events: u64,
-        duplicate_cm_events: u64,
-        unknown_cm_events: u64,
-        wrong_id_cm_events: u64,
-        unexpected_cm_events: u64,
     }
 
-    impl EngineCleanupBaseline {
+    impl SafetyBaseline {
         fn capture(engine: &RdmaEngine, instrumentation: TestEngineInstrumentation) -> Self {
             let diagnostics = engine.diagnostics();
             Self {
-                live_connection_reservations: diagnostics.live_connection_reservations,
-                establishing_connection_reservations: diagnostics
-                    .establishing_connection_reservations,
-                established_connection_reservations: diagnostics
-                    .established_connection_reservations,
-                draining_connection_reservations: diagnostics.draining_connection_reservations,
-                registered_live_qps: diagnostics.registered_live_qps,
-                free_connection_slots: diagnostics.free_connection_slots,
+                live_connections: diagnostics.live_connections,
                 registered_operations: diagnostics.registered_operations,
-                free_operation_slots: diagnostics.free_operation_slots,
-                accepted_outstanding_operations: diagnostics.accepted_outstanding_operations,
-                free_cq_credits: diagnostics.free_cq_credits,
+                accepted_operations: diagnostics.accepted_operations,
+                available_cq_credits: diagnostics.available_cq_credits,
                 retained_cq_credits: diagnostics.retained_cq_credits,
                 pending_reclamations: diagnostics.pending_reclamations,
                 quarantined_operations: diagnostics.quarantined_operations,
                 quarantined_mrs: diagnostics.quarantined_mrs,
                 quarantined_bytes: diagnostics.quarantined_bytes,
-                quarantined_bundles: diagnostics.quarantined_bundles,
-                ready_queue_depth: diagnostics.ready_queue_depth,
-                listener_count: diagnostics.listener_count,
-                queued_inbound_requests: diagnostics.queued_inbound_requests,
-                pending_accepts: diagnostics.pending_accepts,
-                selected_accepts: diagnostics.selected_accepts,
-                connection_details: diagnostics.connections().len(),
-                listener_details: diagnostics.listeners().len(),
+                quarantined_connections: diagnostics.quarantined_connections,
                 cm_pending_routes: instrumentation.cm_pending_routes,
                 cm_retained_owners: instrumentation.cm_retained_owners,
-                inbound_requests_rejected: diagnostics.inbound_requests_rejected,
-                inbound_rejected_backlog_full: diagnostics.inbound_rejected_backlog_full,
-                inbound_rejected_connection_capacity: diagnostics
-                    .inbound_rejected_connection_capacity,
-                inbound_rejected_admission_closed: diagnostics.inbound_rejected_admission_closed,
-                inbound_rejected_listener_closed: diagnostics.inbound_rejected_listener_closed,
-                inbound_rejected_context_mismatch: diagnostics.inbound_rejected_context_mismatch,
-                inbound_rejected_setup_failure: diagnostics.inbound_rejected_setup_failure,
-                cm_events_rejected: diagnostics.cm_events_rejected,
-                stale_cm_events: diagnostics.stale_cm_events,
-                duplicate_cm_events: diagnostics.duplicate_cm_events,
-                unknown_cm_events: diagnostics.unknown_cm_events,
-                wrong_id_cm_events: diagnostics.wrong_id_cm_events,
-                unexpected_cm_events: diagnostics.unexpected_cm_events,
+                cqes_rejected: instrumentation.cqes_rejected,
+                cm_events_rejected: instrumentation.cm_events_rejected,
             }
         }
 
-        fn cleanup_gauges_match(&self, expected: &Self) -> bool {
-            self.live_connection_reservations == expected.live_connection_reservations
-                && self.establishing_connection_reservations
-                    == expected.establishing_connection_reservations
-                && self.established_connection_reservations
-                    == expected.established_connection_reservations
-                && self.draining_connection_reservations
-                    == expected.draining_connection_reservations
-                && self.registered_live_qps == expected.registered_live_qps
-                && self.free_connection_slots == expected.free_connection_slots
+        fn matches(&self, expected: &Self) -> bool {
+            self.live_connections == expected.live_connections
                 && self.registered_operations == expected.registered_operations
-                && self.free_operation_slots == expected.free_operation_slots
-                && self.accepted_outstanding_operations == expected.accepted_outstanding_operations
-                && self.free_cq_credits == expected.free_cq_credits
+                && self.accepted_operations == expected.accepted_operations
+                && self.available_cq_credits == expected.available_cq_credits
                 && self.retained_cq_credits == expected.retained_cq_credits
                 && self.pending_reclamations == expected.pending_reclamations
                 && self.quarantined_operations == expected.quarantined_operations
                 && self.quarantined_mrs == expected.quarantined_mrs
                 && self.quarantined_bytes == expected.quarantined_bytes
-                && self.quarantined_bundles == expected.quarantined_bundles
-                && self.ready_queue_depth == expected.ready_queue_depth
-                && self.listener_count == expected.listener_count
-                && self.queued_inbound_requests == expected.queued_inbound_requests
-                && self.pending_accepts == expected.pending_accepts
-                && self.selected_accepts == expected.selected_accepts
-                && self.connection_details == expected.connection_details
-                && self.listener_details == expected.listener_details
+                && self.quarantined_connections == expected.quarantined_connections
                 && self.cm_pending_routes == expected.cm_pending_routes
                 && self.cm_retained_owners == expected.cm_retained_owners
-        }
-
-        fn reject_event_counters_match(&self, expected: &Self) -> bool {
-            self.inbound_requests_rejected == expected.inbound_requests_rejected
-                && self.inbound_rejected_backlog_full == expected.inbound_rejected_backlog_full
-                && self.inbound_rejected_connection_capacity
-                    == expected.inbound_rejected_connection_capacity
-                && self.inbound_rejected_admission_closed
-                    == expected.inbound_rejected_admission_closed
-                && self.inbound_rejected_listener_closed
-                    == expected.inbound_rejected_listener_closed
-                && self.inbound_rejected_context_mismatch
-                    == expected.inbound_rejected_context_mismatch
-                && self.inbound_rejected_setup_failure == expected.inbound_rejected_setup_failure
+                && self.cqes_rejected == expected.cqes_rejected
                 && self.cm_events_rejected == expected.cm_events_rejected
-                && self.stale_cm_events == expected.stale_cm_events
-                && self.duplicate_cm_events == expected.duplicate_cm_events
-                && self.unknown_cm_events == expected.unknown_cm_events
-                && self.wrong_id_cm_events == expected.wrong_id_cm_events
-                && self.unexpected_cm_events == expected.unexpected_cm_events
         }
     }
 
     async fn wait_for_engine_cleanup(
         server_engine: &RdmaEngine,
         server_resources: &TestEngineResources,
-        server_baseline: &EngineCleanupBaseline,
+        server_baseline: &SafetyBaseline,
         client_engine: &RdmaEngine,
         client_resources: &TestEngineResources,
-        client_baseline: &EngineCleanupBaseline,
+        client_baseline: &SafetyBaseline,
         failure_context: &str,
-    ) -> (EngineCleanupBaseline, EngineCleanupBaseline) {
+    ) -> (SafetyBaseline, SafetyBaseline) {
         let deadline = std::time::Instant::now() + V2_SETUP_CLEANUP_TIMEOUT;
         let mut backoff = V2_SETUP_CLEANUP_MIN_BACKOFF;
         loop {
-            let server = EngineCleanupBaseline::capture(
-                server_engine,
-                server_resources.instrumentation().unwrap(),
-            );
-            let client = EngineCleanupBaseline::capture(
-                client_engine,
-                client_resources.instrumentation().unwrap(),
-            );
-            if server.cleanup_gauges_match(server_baseline)
-                && client.cleanup_gauges_match(client_baseline)
-            {
+            let server =
+                SafetyBaseline::capture(server_engine, server_resources.instrumentation().unwrap());
+            let client =
+                SafetyBaseline::capture(client_engine, client_resources.instrumentation().unwrap());
+            if server.matches(server_baseline) && client.matches(client_baseline) {
                 return (server, client);
             }
             let now = std::time::Instant::now();
@@ -792,31 +826,28 @@ pub mod engine_test_helpers {
 
     async fn close_message_attempt(
         listener: Option<RdmaListener>,
-        server: Option<MessageTransport>,
-        client: Option<MessageTransport>,
+        server: Option<DrivenMessageTransport>,
+        client: Option<DrivenMessageTransport>,
     ) {
-        tokio::time::timeout(Duration::from_secs(15), async {
-            match (&server, &client) {
+        tokio::time::timeout(Duration::from_secs(15), async move {
+            match (server, client) {
                 (Some(server), Some(client)) => {
-                    let _ = tokio::join!(server.close(), client.close());
+                    let _ = tokio::join!(server.shutdown(), client.shutdown());
                 }
                 (Some(server), None) => {
-                    let _ = server.close().await;
+                    let _ = server.shutdown().await;
                 }
                 (None, Some(client)) => {
-                    let _ = client.close().await;
+                    let _ = client.shutdown().await;
                 }
                 (None, None) => {}
             }
-            if let Some(listener) = &listener {
+            if let Some(listener) = listener {
                 let _ = listener.close().await;
             }
         })
         .await
         .expect("V2 engine retry attempt cleanup timed out");
-        drop(server);
-        drop(client);
-        drop(listener);
     }
 
     pub(crate) fn retry_exhausted(last_transient: Error) -> Error {
@@ -834,13 +865,15 @@ pub mod engine_test_helpers {
     }
 
     fn attempt_has_no_engine_rejects(
-        server: &EngineCleanupBaseline,
-        server_baseline: &EngineCleanupBaseline,
-        client: &EngineCleanupBaseline,
-        client_baseline: &EngineCleanupBaseline,
+        server: &SafetyBaseline,
+        server_baseline: &SafetyBaseline,
+        client: &SafetyBaseline,
+        client_baseline: &SafetyBaseline,
     ) -> bool {
-        server.reject_event_counters_match(server_baseline)
-            && client.reject_event_counters_match(client_baseline)
+        server.cqes_rejected == server_baseline.cqes_rejected
+            && client.cqes_rejected == client_baseline.cqes_rejected
+            && server.cm_events_rejected == server_baseline.cm_events_rejected
+            && client.cm_events_rejected == client_baseline.cm_events_rejected
     }
 
     /// Establish a ready message pair, retrying only known transient
@@ -856,7 +889,7 @@ pub mod engine_test_helpers {
         server_engine: &RdmaEngine,
         client_engine: &RdmaEngine,
         make_builder: F,
-    ) -> Result<(RdmaListener, MessageTransport, MessageTransport)>
+    ) -> Result<(RdmaListener, DrivenMessageTransport, DrivenMessageTransport)>
     where
         F: FnMut() -> MessageTransportBuilder,
     {
@@ -876,7 +909,7 @@ pub mod engine_test_helpers {
         client_engine: &RdmaEngine,
         make_builder: F,
         before_connect_accept: C,
-    ) -> Result<(RdmaListener, MessageTransport, MessageTransport)>
+    ) -> Result<(RdmaListener, DrivenMessageTransport, DrivenMessageTransport)>
     where
         F: FnMut() -> MessageTransportBuilder,
         C: FnMut(u64) -> Result<()>,
@@ -899,7 +932,7 @@ pub mod engine_test_helpers {
         mut make_builder: F,
         mut before_connect_accept: C,
         mut before_ready: R,
-    ) -> Result<(RdmaListener, MessageTransport, MessageTransport)>
+    ) -> Result<(RdmaListener, DrivenMessageTransport, DrivenMessageTransport)>
     where
         F: FnMut() -> MessageTransportBuilder,
         C: FnMut(u64) -> Result<()>,
@@ -907,23 +940,19 @@ pub mod engine_test_helpers {
     {
         let server_resources = server_engine.test_resources().unwrap();
         let client_resources = client_engine.test_resources().unwrap();
-        let total_server_baseline = EngineCleanupBaseline::capture(
-            server_engine,
-            server_resources.instrumentation().unwrap(),
-        );
-        let total_client_baseline = EngineCleanupBaseline::capture(
-            client_engine,
-            client_resources.instrumentation().unwrap(),
-        );
+        let total_server_baseline =
+            SafetyBaseline::capture(server_engine, server_resources.instrumentation().unwrap());
+        let total_client_baseline =
+            SafetyBaseline::capture(client_engine, client_resources.instrumentation().unwrap());
         let mut attempt_history = Vec::new();
 
         let establish = async {
             for attempt in 0..TRANSIENT_CM_HANDSHAKE_ATTEMPTS {
-                let server_baseline = EngineCleanupBaseline::capture(
+                let server_baseline = SafetyBaseline::capture(
                     server_engine,
                     server_resources.instrumentation().unwrap(),
                 );
-                let client_baseline = EngineCleanupBaseline::capture(
+                let client_baseline = SafetyBaseline::capture(
                     client_engine,
                     client_resources.instrumentation().unwrap(),
                 );
@@ -1056,14 +1085,18 @@ pub mod engine_test_helpers {
                     Ok((server, client)) => {
                         let mut errors = Vec::new();
                         let server = match server {
-                            Ok(server) => Some(server),
+                            Ok((transport, driver)) => {
+                                Some(DrivenMessageTransport::new(transport, driver))
+                            }
                             Err(error) => {
                                 errors.push(error);
                                 None
                             }
                         };
                         let client = match client {
-                            Ok(client) => Some(client),
+                            Ok((transport, driver)) => {
+                                Some(DrivenMessageTransport::new(transport, driver))
+                            }
                             Err(error) => {
                                 errors.push(error);
                                 None
@@ -1159,11 +1192,11 @@ pub mod engine_test_helpers {
                             .collect::<Vec<_>>();
                         let context = format!("message readiness failed: {ready_errors:?}");
                         attempt_history.push(format!("attempt {attempt}: {context}"));
-                        let server_at_failure = EngineCleanupBaseline::capture(
+                        let server_at_failure = SafetyBaseline::capture(
                             server_engine,
                             server_resources.instrumentation().unwrap(),
                         );
-                        let client_at_failure = EngineCleanupBaseline::capture(
+                        let client_at_failure = SafetyBaseline::capture(
                             client_engine,
                             client_resources.instrumentation().unwrap(),
                         );

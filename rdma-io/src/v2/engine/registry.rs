@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::connection::ConnectionState;
@@ -18,8 +18,8 @@ pub(super) struct ConnectionToken {
 }
 
 impl ConnectionToken {
-    pub(super) const fn ready(self) -> super::scheduler::ReadyConnection {
-        super::scheduler::ReadyConnection {
+    pub(super) const fn completion_ready(self) -> super::scheduler::CompletionReadyConnection {
+        super::scheduler::CompletionReadyConnection {
             slot: self.slot,
             generation: self.generation,
         }
@@ -103,9 +103,6 @@ pub(super) struct PagedRegistry<K, T> {
     capacity: usize,
     inner: Mutex<RegistryInner<T>>,
     live: AtomicUsize,
-    retired: AtomicUsize,
-    allocated_pages: AtomicUsize,
-    probes: AtomicU64,
     #[cfg(test)]
     fail_next_page_allocation: AtomicBool,
     _token: std::marker::PhantomData<fn() -> K>,
@@ -158,9 +155,6 @@ impl<K: RegistryToken, T> PagedRegistry<K, T> {
                 next_unused: 0,
             }),
             live: AtomicUsize::new(0),
-            retired: AtomicUsize::new(0),
-            allocated_pages: AtomicUsize::new(0),
-            probes: AtomicU64::new(0),
             #[cfg(test)]
             fail_next_page_allocation: AtomicBool::new(false),
             _token: std::marker::PhantomData,
@@ -217,7 +211,6 @@ impl<K: RegistryToken, T> PagedRegistry<K, T> {
     where
         T: Clone,
     {
-        self.probes.fetch_add(1, Ordering::Relaxed);
         let inner = lock_unpoison(&self.inner);
         let Some(entry) = self.slot_ref(&inner, token.slot()) else {
             return Lookup::Unknown;
@@ -253,7 +246,6 @@ impl<K: RegistryToken, T> PagedRegistry<K, T> {
         }
         if entry.generation == u32::MAX {
             entry.state = SlotState::Retired;
-            self.retired.fetch_add(1, Ordering::AcqRel);
         } else {
             entry.generation += 1;
             inner.recycled.push(token.slot());
@@ -266,10 +258,19 @@ impl<K: RegistryToken, T> PagedRegistry<K, T> {
         self.live.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     pub(super) fn retired(&self) -> usize {
-        self.retired.load(Ordering::Acquire)
+        let inner = lock_unpoison(&self.inner);
+        inner
+            .pages
+            .iter()
+            .filter_map(Option::as_ref)
+            .flat_map(|page| page.iter())
+            .filter(|entry| matches!(entry.state, SlotState::Retired))
+            .count()
     }
 
+    #[cfg(test)]
     pub(super) fn free(&self) -> usize {
         self.capacity
             .saturating_sub(self.live())
@@ -278,12 +279,11 @@ impl<K: RegistryToken, T> PagedRegistry<K, T> {
 
     #[cfg(test)]
     fn allocated_pages(&self) -> usize {
-        self.allocated_pages.load(Ordering::Acquire)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn probes(&self) -> u64 {
-        self.probes.load(Ordering::Acquire)
+        lock_unpoison(&self.inner)
+            .pages
+            .iter()
+            .filter(|page| page.is_some())
+            .count()
     }
 
     #[cfg(test)]
@@ -322,7 +322,7 @@ impl<K: RegistryToken, T> PagedRegistry<K, T> {
     }
 
     #[cfg(test)]
-    fn force_generation_for_test(&self, token: K, generation: u32) -> K {
+    pub(super) fn force_generation_for_test(&self, token: K, generation: u32) -> K {
         let mut inner = lock_unpoison(&self.inner);
         let entry = self.slot_mut(&mut inner, token.slot(), false).unwrap();
         assert_eq!(entry.generation, token.generation());
@@ -365,7 +365,6 @@ impl<K: RegistryToken, T> PagedRegistry<K, T> {
                 .map_err(|_| Error::InvalidConfig("registry page allocation failed".into()))?;
             page.resize_with(PAGE_SIZE, RegistrySlot::vacant);
             inner.pages[page_index] = Some(page.into_boxed_slice());
-            self.allocated_pages.fetch_add(1, Ordering::AcqRel);
         }
         let page = inner.pages[page_index].as_mut().ok_or_else(|| {
             Error::InvalidConfig("registry page was not allocated after reservation".into())
@@ -461,21 +460,13 @@ impl ConnectionRegistry {
         self.slots.live()
     }
 
-    pub(super) fn retired(&self) -> usize {
-        self.slots.retired()
-    }
-
+    #[cfg(test)]
     pub(super) fn free(&self) -> usize {
         self.slots.free()
     }
 
     pub(super) fn occupied(&self) -> Vec<Arc<ConnectionState>> {
         self.slots.occupied_cloned()
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn probes(&self) -> u64 {
-        self.slots.probes()
     }
 
     #[cfg(test)]
@@ -552,7 +543,6 @@ mod tests {
                 estimated_heap_bytes < 256 * 1024,
                 "representative million-slot registry allocated {estimated_heap_bytes} bytes"
             );
-            assert_eq!(registry.probes(), tokens.len() as u64);
         }
     }
 
@@ -608,6 +598,15 @@ mod tests {
         assert!(matches!(
             registry.allocate_with(|_| 2),
             Err(Error::CapacityExhausted)
+        ));
+
+        let retired_lookup = TestRegistry::new(1).unwrap();
+        let (token, _) = retired_lookup.allocate_with(|_| 2).unwrap();
+        let exhausted = retired_lookup.force_generation_for_test(token, u32::MAX);
+        assert_eq!(retired_lookup.release(exhausted, false), Some(2));
+        assert!(matches!(
+            retired_lookup.lookup_cloned(exhausted),
+            Lookup::Retired
         ));
     }
 

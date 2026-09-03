@@ -3,68 +3,23 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use futures_util::task::AtomicWaker;
 use tokio::sync::Notify;
 
 use super::connection::{ConnectionReservation, SharedCmId};
-use super::diagnostics::RdmaListenerDiagnostics;
 use super::lifecycle::{MemoizedTerminalResult, TakeOnceResult};
 use super::registry::{lock_unpoison, read_unpoison};
-use super::{EngineShared, PreEstablishSetup, RdmaConnection, RdmaConnectionConfig, SetupSummary};
+use super::{ConnectionSetup, EngineShared, RdmaConnection, RdmaConnectionConfig, SetupSummary};
 use crate::v2::error::{Error, Result};
 
 pub(crate) const DEFAULT_LISTENER_BACKLOG: usize = 128;
 const MAX_LISTENER_BACKLOG: usize = 4_096;
 pub(super) const KERNEL_LISTEN_BACKLOG_REQUEST: i32 = i32::MAX;
-
-#[derive(Default)]
-pub(super) struct ListenerDiagnosticTotals {
-    listeners: AtomicUsize,
-    queued_children: AtomicUsize,
-    pending_accepts: AtomicUsize,
-    selected_accepts: AtomicUsize,
-}
-
-impl ListenerDiagnosticTotals {
-    pub(super) fn listener_added(&self) {
-        self.listeners.fetch_add(1, Ordering::AcqRel);
-    }
-
-    pub(super) fn listener_removed(&self) {
-        let previous = self.listeners.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "removed listener must be counted");
-    }
-
-    pub(super) fn snapshot(&self) -> (usize, usize, usize, usize) {
-        (
-            self.listeners.load(Ordering::Acquire),
-            self.queued_children.load(Ordering::Acquire),
-            self.pending_accepts.load(Ordering::Acquire),
-            self.selected_accepts.load(Ordering::Acquire),
-        )
-    }
-
-    fn update_queue_counts(&self, old: (usize, usize, usize), new: (usize, usize, usize)) {
-        update_gauge(&self.queued_children, old.0, new.0);
-        update_gauge(&self.pending_accepts, old.1, new.1);
-        update_gauge(&self.selected_accepts, old.2, new.2);
-    }
-}
-
-fn update_gauge(gauge: &AtomicUsize, old: usize, new: usize) {
-    if new >= old {
-        gauge.fetch_add(new - old, Ordering::AcqRel);
-    } else {
-        let previous = gauge.fetch_sub(old - new, Ordering::AcqRel);
-        debug_assert!(previous >= old - new, "listener gauge underflow");
-    }
-}
 
 /// Configuration for one engine-owned listener.
 ///
@@ -157,7 +112,7 @@ impl RdmaListener {
             Arc::clone(&self.shared),
             Arc::clone(&self.state),
             RdmaConnectionConfig::default(),
-            Box::new(EmptyPreEstablishSetup),
+            empty_connection_setup(),
         )
         .await
     }
@@ -172,7 +127,7 @@ impl RdmaListener {
             Arc::clone(&self.shared),
             Arc::clone(&self.state),
             config,
-            Box::new(EmptyPreEstablishSetup),
+            empty_connection_setup(),
         )
         .await
     }
@@ -180,7 +135,7 @@ impl RdmaListener {
     pub(crate) async fn accept_with_setup(
         &self,
         config: RdmaConnectionConfig,
-        setup: Box<dyn PreEstablishSetup>,
+        setup: ConnectionSetup,
     ) -> Result<RdmaConnection> {
         accept_with_setup(
             Arc::clone(&self.shared),
@@ -218,21 +173,6 @@ impl RdmaListener {
             }
             notified.await;
         }
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[doc(hidden)]
-    pub async fn accept_with_test_setup_failure(
-        &self,
-        message: impl Into<String>,
-    ) -> Result<RdmaConnection> {
-        accept_with_setup(
-            Arc::clone(&self.shared),
-            Arc::clone(&self.state),
-            RdmaConnectionConfig::default(),
-            Box::new(FailingPreEstablishSetup(message.into())),
-        )
-        .await
     }
 }
 
@@ -272,7 +212,7 @@ pub(super) async fn accept_with_setup(
     shared: Arc<EngineShared>,
     listener: Arc<ListenerState>,
     config: RdmaConnectionConfig,
-    setup: Box<dyn PreEstablishSetup>,
+    setup: ConnectionSetup,
 ) -> Result<RdmaConnection> {
     config.validate(&shared.config, shared.provider.as_ref())?;
     let admission = read_unpoison(&shared.admission);
@@ -293,32 +233,18 @@ pub(super) async fn accept_with_setup(
     .await
 }
 
-pub(super) struct EmptyPreEstablishSetup;
-
-impl PreEstablishSetup for EmptyPreEstablishSetup {
-    fn run(self: Box<Self>, _connection: &RdmaConnection) -> Result<SetupSummary> {
-        Ok(SetupSummary { posted_wrs: 0 })
-    }
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-struct FailingPreEstablishSetup(String);
-
-#[cfg(any(test, feature = "test-hooks"))]
-impl PreEstablishSetup for FailingPreEstablishSetup {
-    fn run(self: Box<Self>, _connection: &RdmaConnection) -> Result<SetupSummary> {
-        Err(Error::InvalidConfig(self.0))
-    }
+pub(super) fn empty_connection_setup() -> ConnectionSetup {
+    Box::new(|_connection| Ok(SetupSummary { posted_wrs: 0 }))
 }
 
 pub(super) fn run_setup_before_establish(
-    setup: Box<dyn PreEstablishSetup>,
+    setup: ConnectionSetup,
     connection: &RdmaConnection,
     before_establish: impl FnOnce() -> Result<()>,
     establish: impl FnOnce() -> Result<()>,
 ) -> Result<SetupSummary> {
     let accepted_before = connection.state.accepted_count();
-    let summary = setup.run(connection)?;
+    let summary = setup(connection)?;
     let accepted_after = connection.state.accepted_count();
     let posted_wrs = accepted_after.checked_sub(accepted_before).ok_or_else(|| {
         Error::InvalidConfig("pre-establishment setup reduced the accepted WR set".into())
@@ -336,20 +262,18 @@ pub(super) fn run_setup_before_establish(
 
 pub(super) struct AcceptIntent {
     config: RdmaConnectionConfig,
-    setup: Option<Box<dyn PreEstablishSetup>>,
+    setup: Option<ConnectionSetup>,
 }
 
 impl AcceptIntent {
-    fn new(config: RdmaConnectionConfig, setup: Box<dyn PreEstablishSetup>) -> Self {
+    fn new(config: RdmaConnectionConfig, setup: ConnectionSetup) -> Self {
         Self {
             config,
             setup: Some(setup),
         }
     }
 
-    pub(super) fn into_parts(
-        mut self,
-    ) -> Result<(RdmaConnectionConfig, Box<dyn PreEstablishSetup>)> {
+    pub(super) fn into_parts(mut self) -> Result<(RdmaConnectionConfig, ConnectionSetup)> {
         let setup = self.setup.take().ok_or_else(|| {
             Error::InvalidConfig("accept setup was consumed more than once".into())
         })?;
@@ -489,7 +413,6 @@ pub(super) struct AcceptRequest {
     intent: Mutex<Option<AcceptIntent>>,
     result: Mutex<TakeOnceResult<RdmaConnection>>,
     cancelled: AtomicBool,
-    cancellation_counted: AtomicBool,
     delivered: AtomicBool,
     route_token: AtomicU64,
     waker: AtomicWaker,
@@ -501,7 +424,6 @@ impl AcceptRequest {
             intent: Mutex::new(Some(intent)),
             result: Mutex::new(TakeOnceResult::Pending),
             cancelled: AtomicBool::new(false),
-            cancellation_counted: AtomicBool::new(false),
             delivered: AtomicBool::new(false),
             route_token: AtomicU64::new(0),
             waker: AtomicWaker::new(),
@@ -512,7 +434,7 @@ impl AcceptRequest {
     pub(super) fn test_only() -> Arc<Self> {
         Arc::new(Self::new(AcceptIntent::new(
             RdmaConnectionConfig::default(),
-            Box::new(EmptyPreEstablishSetup),
+            empty_connection_setup(),
         )))
     }
 
@@ -522,10 +444,6 @@ impl AcceptRequest {
 
     pub(super) fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
-    }
-
-    pub(super) fn mark_cancellation_counted(&self) -> bool {
-        !self.cancellation_counted.swap(true, Ordering::AcqRel)
     }
 
     pub(super) fn set_route_token(&self, token: u64) {
@@ -669,10 +587,6 @@ pub(super) struct ListenerState {
     pub(super) backlog: usize,
     pub(super) cm_id: Mutex<Option<SharedCmId>>,
     queues: Mutex<ListenerQueues>,
-    diagnostic_totals: Arc<ListenerDiagnosticTotals>,
-    queued_children: AtomicUsize,
-    pending_accepts: AtomicUsize,
-    selected_accepts: AtomicUsize,
     closing: AtomicBool,
     finalization_started: AtomicBool,
     failure: Mutex<Option<Error>>,
@@ -688,7 +602,6 @@ impl ListenerState {
         local_addr: SocketAddr,
         config: RdmaListenerConfig,
         cm_id: SharedCmId,
-        diagnostic_totals: Arc<ListenerDiagnosticTotals>,
     ) -> Self {
         Self {
             token,
@@ -696,10 +609,6 @@ impl ListenerState {
             backlog: config.backlog,
             cm_id: Mutex::new(Some(cm_id)),
             queues: Mutex::new(ListenerQueues::default()),
-            diagnostic_totals,
-            queued_children: AtomicUsize::new(0),
-            pending_accepts: AtomicUsize::new(0),
-            selected_accepts: AtomicUsize::new(0),
             closing: AtomicBool::new(false),
             finalization_started: AtomicBool::new(false),
             failure: Mutex::new(None),
@@ -718,10 +627,6 @@ impl ListenerState {
             backlog,
             cm_id: Mutex::new(None),
             queues: Mutex::new(ListenerQueues::default()),
-            diagnostic_totals: Arc::new(ListenerDiagnosticTotals::default()),
-            queued_children: AtomicUsize::new(0),
-            pending_accepts: AtomicUsize::new(0),
-            selected_accepts: AtomicUsize::new(0),
             closing: AtomicBool::new(false),
             finalization_started: AtomicBool::new(false),
             failure: Mutex::new(None),
@@ -732,21 +637,8 @@ impl ListenerState {
         })
     }
 
-    fn lock_queues(&self) -> ListenerQueueGuard<'_> {
-        let guard = lock_unpoison(&self.queues);
-        let before = queue_counts(&guard);
-        ListenerQueueGuard {
-            listener: self,
-            guard,
-            before,
-        }
-    }
-
-    fn publish_queue_counts(&self, before: (usize, usize, usize), after: (usize, usize, usize)) {
-        self.queued_children.store(after.0, Ordering::Release);
-        self.pending_accepts.store(after.1, Ordering::Release);
-        self.selected_accepts.store(after.2, Ordering::Release);
-        self.diagnostic_totals.update_queue_counts(before, after);
+    fn lock_queues(&self) -> std::sync::MutexGuard<'_, ListenerQueues> {
+        lock_unpoison(&self.queues)
     }
 
     pub(super) fn register_waiter(&self, request: Arc<AcceptRequest>) -> Result<()> {
@@ -1073,60 +965,6 @@ impl ListenerState {
             .clone()
             .map(MemoizedTerminalResult::into_result)
     }
-
-    pub(super) fn queue_counts(&self) -> (usize, usize, usize) {
-        (
-            self.queued_children.load(Ordering::Acquire),
-            self.pending_accepts.load(Ordering::Acquire),
-            self.selected_accepts.load(Ordering::Acquire),
-        )
-    }
-
-    pub(super) fn diagnostics(&self) -> RdmaListenerDiagnostics {
-        let (queued_inbound_requests, pending_accepts, selected_accepts) = self.queue_counts();
-        RdmaListenerDiagnostics {
-            token: self.token,
-            local_addr: self.local_addr,
-            queued_inbound_requests,
-            pending_accepts,
-            selected_accepts,
-        }
-    }
-}
-
-struct ListenerQueueGuard<'a> {
-    listener: &'a ListenerState,
-    guard: MutexGuard<'a, ListenerQueues>,
-    before: (usize, usize, usize),
-}
-
-impl Deref for ListenerQueueGuard<'_> {
-    type Target = ListenerQueues;
-
-    fn deref(&self) -> &Self::Target {
-        &self.guard
-    }
-}
-
-impl DerefMut for ListenerQueueGuard<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.guard
-    }
-}
-
-impl Drop for ListenerQueueGuard<'_> {
-    fn drop(&mut self) {
-        self.listener
-            .publish_queue_counts(self.before, queue_counts(&self.guard));
-    }
-}
-
-fn queue_counts(queues: &ListenerQueues) -> (usize, usize, usize) {
-    (
-        queues.children.len(),
-        queues.waiters.len(),
-        usize::from(queues.selected.is_some()),
-    )
 }
 
 fn select_pair(queues: &mut ListenerQueues) {
@@ -1212,7 +1050,7 @@ mod tests {
     fn request() -> Arc<AcceptRequest> {
         Arc::new(AcceptRequest::new(AcceptIntent::new(
             RdmaConnectionConfig::default(),
-            Box::new(EmptyPreEstablishSetup),
+            empty_connection_setup(),
         )))
     }
 
@@ -1307,10 +1145,10 @@ mod tests {
         ));
         request.set_route_token(42);
         listener.route_selected(&request, 42).unwrap();
-        assert_eq!(listener.queue_counts().2, 1);
+        assert!(lock_unpoison(&listener.queues).selected.is_some());
 
         engine.shared.cm.mark_accept_delivered(&listener, &request);
-        assert_eq!(listener.queue_counts().2, 0);
+        assert!(lock_unpoison(&listener.queues).selected.is_none());
 
         drop(engine);
         drop(driver);
@@ -1368,16 +1206,16 @@ mod tests {
                 Some((_, InboundRejectReason::BacklogFull))
             ));
         }
-        assert_eq!(first.queue_counts(), (2, 0, 0));
-        assert_eq!(second.queue_counts(), (2, 0, 0));
-
         let first_waiter = request();
         first.register_waiter(Arc::clone(&first_waiter)).unwrap();
         assert!(matches!(
             first.next_action(),
             ListenerAction::ProcessSelected { .. }
         ));
-        assert_eq!(second.queue_counts(), (2, 0, 0));
+        assert!(matches!(
+            second.admit_child(IncomingChild::test_only()).rejected,
+            Some((_, InboundRejectReason::BacklogFull))
+        ));
     }
 
     #[test]

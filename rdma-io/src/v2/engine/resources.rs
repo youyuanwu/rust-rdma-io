@@ -54,19 +54,6 @@ pub(super) struct TestResourceRefs {
     pub(super) context: Context,
 }
 
-#[derive(Clone, Copy)]
-pub(super) struct ResourceSummary {
-    pub(super) contexts: usize,
-    pub(super) protection_domains: usize,
-    pub(super) completion_queues: usize,
-    pub(super) completion_channels: usize,
-    pub(super) cq_notification_fds: usize,
-    pub(super) cm_event_channels: usize,
-    pub(super) cm_event_fds: usize,
-    pub(super) explicit_drivers: usize,
-    pub(super) library_owned_tasks: usize,
-}
-
 impl EngineResources {
     pub(super) fn build(config: &EngineConfig) -> Result<(Self, ProviderLimits)> {
         let device_list = RdmaCmDeviceList::new().map_err(Error::from_v1)?;
@@ -128,23 +115,6 @@ impl EngineResources {
             },
             provider,
         ))
-    }
-
-    pub(super) fn summary(&self) -> ResourceSummary {
-        ResourceSummary {
-            contexts: usize::from(!self.context.raw_context().as_raw().is_null()),
-            protection_domains: usize::from(!self.pd.raw_pd().as_raw().is_null()),
-            completion_queues: usize::from(!self.cq.raw_cq().as_raw().is_null()),
-            completion_channels: usize::from(self.cq.has_channel()),
-            cq_notification_fds: usize::from(self.cq.fd().is_some()),
-            cm_event_channels: usize::from(!self.cm_event_channel.as_raw().is_null()),
-            cm_event_fds: usize::from(self.cm_event_channel.fd() >= 0),
-            // These are declarative construction invariants rather than
-            // runtime-observed task counts. `build()` returns one driver, and
-            // v2_no_hidden_spawn independently rejects internal task creation.
-            explicit_drivers: 1,
-            library_owned_tasks: 0,
-        }
     }
 
     pub(super) fn connection_resource_refs(&self) -> EngineResourceRefs {

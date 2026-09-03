@@ -14,7 +14,6 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
-use std::time::Instant;
 
 use futures_util::task::AtomicWaker;
 use rdma_io_sys::rdmacm::rdma_cm_id;
@@ -26,22 +25,38 @@ use super::connection::{
     SharedCmId, VerbsConnectionResources, WorkRequestPoster, install_reserved_connection,
     reserve_connection,
 };
-use super::diagnostics::CmEventReject;
-use super::diagnostics::RdmaListenerDiagnostics;
 use super::lifecycle::{MemoizedTerminalResult, TakeOnceResult};
 use super::listener::{
-    AcceptRequest, EmptyPreEstablishSetup, InboundRejectReason, IncomingChild,
-    KERNEL_LISTEN_BACKLOG_REQUEST, ListenRequest, ListenerAction, ListenerDiagnosticTotals,
-    ListenerState, RdmaListener, run_setup_before_establish,
+    AcceptRequest, InboundRejectReason, IncomingChild, KERNEL_LISTEN_BACKLOG_REQUEST,
+    ListenRequest, ListenerAction, ListenerState, RdmaListener, empty_connection_setup,
+    run_setup_before_establish,
 };
 use super::registry::{ConnectionToken, Lookup, PagedRegistry, RegistryToken, lock_unpoison};
 use super::resources::EngineResources;
-use super::{EngineShared, PreEstablishSetup, RdmaConnection, RdmaConnectionConfig};
+use super::{ConnectionSetup, EngineShared, RdmaConnection, RdmaConnectionConfig};
 use crate::cm::{CmEventType, CmId, PortSpace};
 use crate::v2::error::{Error, Result};
 use crate::v2::qp::QpBuilder;
 
 pub(super) const CM_WORK: usize = 1 << 3;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CmEventReject {
+    Stale,
+    Duplicate,
+    Unknown,
+    WrongId,
+    Unexpected,
+}
+
+fn record_cm_reject(shared: &EngineShared, reject: CmEventReject) {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if !matches!(reject, CmEventReject::Duplicate) {
+        shared.rejected_cm_events.fetch_add(1, Ordering::Relaxed);
+    }
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    let _ = (shared, reject);
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct CmRouteToken {
@@ -93,7 +108,6 @@ pub(super) struct CmState {
     listener_work: Mutex<VecDeque<Arc<ListenerState>>>,
     listeners: Mutex<HashMap<u64, Arc<ListenerState>>>,
     listener_ids: Mutex<HashMap<usize, u64>>,
-    listener_diagnostics: Arc<ListenerDiagnosticTotals>,
     next_listener_token: AtomicU64,
     retirements: Mutex<VecDeque<ConnectionToken>>,
     cm_destructions: Mutex<VecDeque<PendingCmDestruction>>,
@@ -113,7 +127,6 @@ impl CmState {
             listener_work: Mutex::new(VecDeque::new()),
             listeners: Mutex::new(HashMap::new()),
             listener_ids: Mutex::new(HashMap::new()),
-            listener_diagnostics: Arc::new(ListenerDiagnosticTotals::default()),
             next_listener_token: AtomicU64::new(1),
             retirements: Mutex::new(VecDeque::new()),
             cm_destructions: Mutex::new(VecDeque::new()),
@@ -221,7 +234,6 @@ impl CmState {
         };
         listener_entry.insert(listener);
         identity_entry.insert(token);
-        self.listener_diagnostics.listener_added();
         true
     }
 
@@ -364,11 +376,7 @@ impl CmState {
         let route = match route {
             Ok(route) => route,
             Err(reject) => {
-                shared
-                    .diagnostic_counters
-                    .cm_events_processed
-                    .fetch_add(1, Ordering::Relaxed);
-                shared.diagnostic_counters.reject_cm_event(reject);
+                record_cm_reject(shared, reject);
                 if snapshot.event_type == CmEventType::ConnectRequest {
                     self.reject_raw_child(
                         shared,
@@ -396,19 +404,10 @@ impl CmState {
             }
         };
         match disposition {
-            EventDisposition::Handled => {
-                shared
-                    .diagnostic_counters
-                    .cm_events_processed
-                    .fetch_add(1, Ordering::Relaxed);
-            }
+            EventDisposition::Handled => {}
             EventDisposition::IgnoredAfterShutdown => {}
             EventDisposition::Rejected(reject) => {
-                shared
-                    .diagnostic_counters
-                    .cm_events_processed
-                    .fetch_add(1, Ordering::Relaxed);
-                shared.diagnostic_counters.reject_cm_event(reject);
+                record_cm_reject(shared, reject);
             }
         }
         Ok(true)
@@ -489,24 +488,31 @@ impl CmState {
         routed_owners.max(setup_rollback_quarantines)
     }
 
-    pub(super) fn oldest_setup_rollback_quarantine(&self) -> Option<Instant> {
-        lock_unpoison(&self.setup_rollback_quarantines)
-            .iter()
-            .map(|retained| retained.started)
-            .min()
-    }
-
-    pub(super) fn listener_counts(&self) -> (usize, usize, usize, usize) {
-        self.listener_diagnostics.snapshot()
-    }
-
-    pub(super) fn listener_diagnostics(&self) -> Vec<RdmaListenerDiagnostics> {
-        let mut listeners = lock_unpoison(&self.listeners)
-            .values()
-            .map(|listener| listener.diagnostics())
-            .collect::<Vec<_>>();
-        listeners.sort_by_key(|listener| listener.token);
-        listeners
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(super) fn connection_route_is_live(
+        &self,
+        route: ConnectionCmRoute,
+        connection: ConnectionToken,
+    ) -> bool {
+        let token = match route {
+            ConnectionCmRoute::Outbound(encoded) | ConnectionCmRoute::Inbound(encoded) => {
+                CmRouteToken::decode(encoded)
+            }
+        };
+        match route {
+            ConnectionCmRoute::Outbound(_) => {
+                let Lookup::Occupied(route) = self.routes.lookup_cloned(token) else {
+                    return false;
+                };
+                lock_unpoison(&route.state).references_connection(connection)
+            }
+            ConnectionCmRoute::Inbound(_) => {
+                let Lookup::Occupied(route) = self.inbound_routes.lookup_cloned(token) else {
+                    return false;
+                };
+                lock_unpoison(&route.state).references_connection(connection)
+            }
+        }
     }
 
     pub(super) fn service_cm_destructions(
@@ -651,7 +657,6 @@ impl CmState {
             (destroy_result, finalize_result) => {
                 let error = connection_destruction_error(destroy_result, finalize_result);
                 let message = error_detail(&error);
-                shared.record_connection_retirement_failure(&connection);
                 connection.fail_retirement(error.clone());
                 self.fail_inbound_retirement(completion, message);
                 Err(error)
@@ -770,7 +775,6 @@ impl CmState {
             local_addr,
             request.config.clone(),
             cm_id,
-            Arc::clone(&self.listener_diagnostics),
         ));
         if !self.insert_listener_identity(token, raw_id, Arc::clone(&state)) {
             let cm_id = state
@@ -782,10 +786,6 @@ impl CmState {
             )));
             return Ok(());
         }
-        shared
-            .diagnostic_counters
-            .listeners_created
-            .fetch_add(1, Ordering::Relaxed);
         if request.is_cancelled() {
             state.request_close(shared);
             request.complete(Err(Error::DriverShutdown));
@@ -806,12 +806,6 @@ impl CmState {
     ) -> Result<()> {
         match listener.next_action() {
             ListenerAction::CancelledBeforeSelection(request) => {
-                if request.mark_cancellation_counted() {
-                    shared
-                        .diagnostic_counters
-                        .accept_cancellations_before_selection
-                        .fetch_add(1, Ordering::Relaxed);
-                }
                 request.complete(Err(Error::DriverShutdown));
             }
             ListenerAction::FailUnselected(request) => {
@@ -833,12 +827,7 @@ impl CmState {
                 listener.finish_selected_request(&request);
             }
             ListenerAction::CancelAfterAccept { request, route } => {
-                if request.is_cancelled() && request.mark_cancellation_counted() {
-                    shared
-                        .diagnostic_counters
-                        .accept_cancellations_after_selection
-                        .fetch_add(1, Ordering::Relaxed);
-                }
+                let _ = request;
                 self.cancel_inbound_route(shared, route)?;
             }
             ListenerAction::FinalizeClose => {
@@ -895,12 +884,6 @@ impl CmState {
         let admitted = listener.admit_child(IncomingChild::new(child_id, reservation));
         drop(admission);
         for request in admitted.cancelled {
-            if request.mark_cancellation_counted() {
-                shared
-                    .diagnostic_counters
-                    .accept_cancellations_before_selection
-                    .fetch_add(1, Ordering::Relaxed);
-            }
             request.complete(Err(Error::DriverShutdown));
         }
         if let Some((child, reason)) = admitted.rejected {
@@ -946,12 +929,6 @@ impl CmState {
             || listener.is_closing()
             || shared.shutdown_requested.load(Ordering::Acquire)
         {
-            if request.is_cancelled() && request.mark_cancellation_counted() {
-                shared
-                    .diagnostic_counters
-                    .accept_cancellations_after_selection
-                    .fetch_add(1, Ordering::Relaxed);
-            }
             let error = if listener.is_closing() {
                 listener.close_error()
             } else {
@@ -1034,10 +1011,7 @@ impl CmState {
             Err(failure) => {
                 let (error, failed_resources) = failure.into_parts();
                 match verbs.destroy_connection(true) {
-                    Ok((cm_id, qp_destroyed)) => {
-                        if qp_destroyed {
-                            shared.record_qp_destroy();
-                        }
+                    Ok((cm_id, _qp_destroyed)) => {
                         self.release_failed_install(shared, failed_resources)?;
                         if let Some(cm_id) = cm_id {
                             self.reject_unreserved_child(
@@ -1111,7 +1085,6 @@ impl CmState {
         error: Error,
     ) -> Result<()> {
         let connection_state = Arc::clone(&connection.state);
-        let teardown = matches!(error, Error::DriverShutdown | Error::TransportClosed);
         let reject = match &error {
             Error::DriverShutdown if !request.is_cancelled() => {
                 InboundRejectReason::AdmissionClosed
@@ -1119,19 +1092,6 @@ impl CmState {
             Error::DriverShutdown | Error::TransportClosed => InboundRejectReason::ListenerClosed,
             _ => InboundRejectReason::SetupFailure,
         };
-        if request.is_cancelled() {
-            if request.mark_cancellation_counted() {
-                shared
-                    .diagnostic_counters
-                    .accept_cancellations_after_selection
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-        } else if !teardown {
-            shared
-                .diagnostic_counters
-                .accept_setup_failures
-                .fetch_add(1, Ordering::Relaxed);
-        }
         route.set_state(InboundState::Closing {
             connection: EstablishedConnectionRoute::new(&connection_state),
             request: Some(request),
@@ -1167,11 +1127,10 @@ impl CmState {
 
     fn reject_unreserved_child(
         &self,
-        shared: &Arc<EngineShared>,
+        _shared: &Arc<EngineShared>,
         cm_id: SharedCmId,
         reason: InboundRejectReason,
     ) -> Result<()> {
-        self.record_inbound_reject(shared, reason);
         cm_id.reject(&[]).map_err(|error| {
             contextual_cm_error(
                 format!("reject inbound child ({reason:?})"),
@@ -1184,10 +1143,9 @@ impl CmState {
 
     fn reject_retained_inbound_child(
         &self,
-        shared: &EngineShared,
+        _shared: &EngineShared,
         verbs: &VerbsConnectionResources,
     ) {
-        self.record_inbound_reject(shared, InboundRejectReason::SetupFailure);
         if let Err(error) = verbs.reject() {
             tracing::warn!(
                 %error,
@@ -1206,36 +1164,6 @@ impl CmState {
         let result = self.reject_unreserved_child(shared, cm_id, reason);
         drop(reservation);
         result
-    }
-
-    fn record_inbound_reject(&self, shared: &EngineShared, reason: InboundRejectReason) {
-        shared
-            .diagnostic_counters
-            .inbound_requests_rejected
-            .fetch_add(1, Ordering::Relaxed);
-        let counter = match reason {
-            InboundRejectReason::BacklogFull => {
-                &shared.diagnostic_counters.inbound_rejected_backlog_full
-            }
-            InboundRejectReason::ConnectionCapacity => {
-                &shared
-                    .diagnostic_counters
-                    .inbound_rejected_connection_capacity
-            }
-            InboundRejectReason::AdmissionClosed => {
-                &shared.diagnostic_counters.inbound_rejected_admission_closed
-            }
-            InboundRejectReason::ListenerClosed => {
-                &shared.diagnostic_counters.inbound_rejected_listener_closed
-            }
-            InboundRejectReason::ContextMismatch => {
-                &shared.diagnostic_counters.inbound_rejected_context_mismatch
-            }
-            InboundRejectReason::SetupFailure => {
-                &shared.diagnostic_counters.inbound_rejected_setup_failure
-            }
-        };
-        counter.fetch_add(1, Ordering::Relaxed);
     }
 
     fn cancel_inbound_route(&self, shared: &Arc<EngineShared>, encoded: u64) -> Result<()> {
@@ -1329,7 +1257,6 @@ impl CmState {
             .is_some_and(|current| Arc::ptr_eq(current, listener));
         if owned {
             listeners.remove(&listener.token);
-            self.listener_diagnostics.listener_removed();
             if listener_ids.get(&raw_id) == Some(&listener.token) {
                 listener_ids.remove(&raw_id);
             }
@@ -1515,6 +1442,21 @@ impl CmState {
         if !connection.try_begin_retirement() {
             return Ok(());
         }
+        let lifecycle = connection.lock_lifecycle();
+        let qp_boundary = connection.establish_qp_destruction_boundary(&lifecycle);
+        drop(lifecycle);
+        if let Err(error) = qp_boundary {
+            tracing::warn!(
+                slot = connection.token.slot,
+                generation = connection.token.generation,
+                qp_num = connection.qp_num(),
+                %error,
+                "connection QP destroy failed; retaining CM route and ownership bundle"
+            );
+            shared.track_connection_quarantine(connection.token);
+            connection.publish_destroy_quarantine(&error, || {});
+            return Ok(());
+        }
         let retirement = match connection.cm_route() {
             Some(ConnectionCmRoute::Outbound(encoded)) => {
                 self.retire_outbound_connection_route(encoded, &connection)?
@@ -1543,27 +1485,17 @@ impl CmState {
                     generation = connection.token.generation,
                     qp_num = connection.qp_num(),
                     %error,
-                    "connection QP destroy failed; retaining terminal quarantine"
+                    "connection resource finalization failed; retaining terminal quarantine"
                 );
-                let first_connection_quarantine =
-                    shared.track_connection_quarantine(connection.token);
-                shared.record_connection_retirement_failure(&connection);
-                connection.publish_destroy_quarantine(&error, || {
-                    Self::record_connection_destroy_quarantine_outcome(
-                        shared,
-                        first_connection_quarantine,
-                    );
-                });
+                shared.track_connection_quarantine(connection.token);
+                connection.publish_destroy_quarantine(&error, || {});
                 self.finish_inbound_retirement(completion);
                 return Ok(());
             }
         };
-        if qp_destroyed {
-            shared.record_qp_destroy();
-        }
+        let _ = qp_destroyed;
         if let Some(cm_id) = cm_id {
-            if let Some(reason) = reject {
-                self.record_inbound_reject(shared, reason);
+            if reject.is_some() {
                 cm_id.reject(&[]).map_err(|error| {
                     contextual_cm_error(
                         "reject selected inbound child after setup rollback",
@@ -1621,48 +1553,21 @@ impl CmState {
                 poster,
                 mut reservation,
             } => {
-                let first_connection_quarantine = reservation.retain_setup_quarantine();
-                Self::record_connection_destroy_quarantine_outcome(
-                    shared,
-                    first_connection_quarantine,
-                );
+                reservation.retain_setup_quarantine();
                 lock_unpoison(&self.setup_rollback_quarantines).push(RetainedSetupRollback {
                     _poster: poster,
                     _reservation: reservation,
-                    started: Instant::now(),
                 });
                 None
             }
             FailedConnectionInstallResources::Registered(connection) => {
                 connection.begin_close();
                 let _ = connection.try_begin_retirement();
-                let first_connection_quarantine =
-                    shared.track_connection_quarantine(connection.token);
-                connection.publish_destroy_quarantine(destroy_error, || {
-                    Self::record_connection_destroy_quarantine_outcome(
-                        shared,
-                        first_connection_quarantine,
-                    );
-                });
+                shared.track_connection_quarantine(connection.token);
+                connection.publish_destroy_quarantine(destroy_error, || {});
                 Some(EstablishedConnectionRoute::new(&connection))
             }
         }
-    }
-
-    fn record_connection_destroy_quarantine_outcome(
-        shared: &EngineShared,
-        first_connection_quarantine: bool,
-    ) {
-        if first_connection_quarantine {
-            shared
-                .diagnostic_counters
-                .connections_quarantined
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        shared
-            .diagnostic_counters
-            .connection_quarantine_outcomes
-            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_setup_rollback_quarantine(destroy_error: &Error) {
@@ -1788,7 +1693,7 @@ impl CmState {
 
     fn retire_inbound_connection_route(
         &self,
-        shared: &EngineShared,
+        _shared: &EngineShared,
         encoded: u64,
         connection: &Arc<ConnectionState>,
     ) -> Result<RouteRetirement> {
@@ -1805,12 +1710,6 @@ impl CmState {
         let state = route.take_state_if(|state| state.references_connection(connection.token));
         match state {
             Some(InboundState::EstablishedAwaitingDelivery { request, .. }) => {
-                if request.is_cancelled() && request.mark_cancellation_counted() {
-                    shared
-                        .diagnostic_counters
-                        .accept_cancellations_after_selection
-                        .fetch_add(1, Ordering::Relaxed);
-                }
                 let delivered = request.fail_undelivered(Error::DriverShutdown);
                 if delivered
                     && let Some(listener) = route.listener.upgrade()
@@ -1844,15 +1743,6 @@ impl CmState {
                 reject,
                 ..
             }) => {
-                if let Some(request) = request.as_ref()
-                    && request.is_cancelled()
-                    && request.mark_cancellation_counted()
-                {
-                    shared
-                        .diagnostic_counters
-                        .accept_cancellations_after_selection
-                        .fetch_add(1, Ordering::Relaxed);
-                }
                 self.inbound_routes.release(token, true);
                 Ok(RouteRetirement::Complete {
                     completion: Some(InboundRetirementCompletion {
@@ -2043,14 +1933,6 @@ impl CmState {
                     request: Arc::clone(&request),
                     connection: connection_route,
                 });
-                shared
-                    .diagnostic_counters
-                    .connections_opened
-                    .fetch_add(1, Ordering::Relaxed);
-                shared
-                    .diagnostic_counters
-                    .inbound_requests_accepted
-                    .fetch_add(1, Ordering::Relaxed);
                 request.complete_success(connection);
                 Ok(EventDisposition::Handled)
             }
@@ -2357,10 +2239,7 @@ impl CmState {
             Err(failure) => {
                 let (error, failed_resources) = failure.into_parts();
                 match verbs.destroy_connection(true) {
-                    Ok((cm_id, qp_destroyed)) => {
-                        if qp_destroyed {
-                            shared.record_qp_destroy();
-                        }
+                    Ok((cm_id, _qp_destroyed)) => {
                         self.release_failed_install(shared, failed_resources)?;
                         if let Some(cm_id) = cm_id {
                             self.defer_cm_id(cm_id);
@@ -2493,10 +2372,6 @@ impl CmState {
             request,
             connection: EstablishedConnectionRoute::new(&connection.state),
         });
-        shared
-            .diagnostic_counters
-            .connections_opened
-            .fetch_add(1, Ordering::Relaxed);
         waiter.complete(Ok(connection));
         Ok(EventDisposition::Handled)
     }
@@ -2616,7 +2491,6 @@ impl CmState {
                 request,
                 connection,
             } => {
-                request.record_failure(shared);
                 let Some(connection_state) = connection.upgrade() else {
                     self.retire_route(route, true);
                     return Ok(EventDisposition::Handled);
@@ -2640,10 +2514,6 @@ impl CmState {
             }
             OutboundState::Established { connection }
             | OutboundState::Disconnected { connection } => {
-                shared
-                    .diagnostic_counters
-                    .connections_failed
-                    .fetch_add(1, Ordering::Relaxed);
                 let Some(connection_state) = connection.upgrade() else {
                     self.retire_route(route, true);
                     return Ok(EventDisposition::Handled);
@@ -2742,14 +2612,14 @@ pub(super) async fn connect(
     address: SocketAddr,
     config: RdmaConnectionConfig,
 ) -> Result<RdmaConnection> {
-    connect_with_setup(shared, address, config, Box::new(EmptyPreEstablishSetup)).await
+    connect_with_setup(shared, address, config, empty_connection_setup()).await
 }
 
 pub(super) async fn connect_with_setup(
     shared: Arc<EngineShared>,
     address: SocketAddr,
     config: RdmaConnectionConfig,
-    setup: Box<dyn PreEstablishSetup>,
+    setup: ConnectionSetup,
 ) -> Result<RdmaConnection> {
     config.validate(&shared.config, shared.provider.as_ref())?;
     let (admission, reservation) = reserve_connection(&shared)?;
@@ -2904,7 +2774,6 @@ enum PendingCmDestruction {
 struct RetainedSetupRollback {
     _poster: Arc<dyn WorkRequestPoster>,
     _reservation: ConnectionReservation,
-    started: Instant,
 }
 
 #[cfg(test)]
@@ -3259,12 +3128,11 @@ impl OutboundState {
 struct OutboundRequest {
     address: SocketAddr,
     config: RdmaConnectionConfig,
-    setup: Mutex<Option<Box<dyn PreEstablishSetup>>>,
+    setup: Mutex<Option<ConnectionSetup>>,
     reservation: Mutex<Option<ConnectionReservation>>,
     result: Mutex<TakeOnceResult<RdmaConnection>>,
     cancelled: AtomicBool,
     cancellation_enqueued: AtomicBool,
-    failure_counted: AtomicBool,
     delivered: AtomicBool,
     route_token: AtomicU64,
     waker: AtomicWaker,
@@ -3274,7 +3142,7 @@ impl OutboundRequest {
     fn new(
         address: SocketAddr,
         config: RdmaConnectionConfig,
-        setup: Box<dyn PreEstablishSetup>,
+        setup: ConnectionSetup,
         reservation: ConnectionReservation,
     ) -> Self {
         Self {
@@ -3285,14 +3153,13 @@ impl OutboundRequest {
             result: Mutex::new(TakeOnceResult::Pending),
             cancelled: AtomicBool::new(false),
             cancellation_enqueued: AtomicBool::new(false),
-            failure_counted: AtomicBool::new(false),
             delivered: AtomicBool::new(false),
             route_token: AtomicU64::new(0),
             waker: AtomicWaker::new(),
         }
     }
 
-    fn take_setup(&self) -> Option<Box<dyn PreEstablishSetup>> {
+    fn take_setup(&self) -> Option<ConnectionSetup> {
         lock_unpoison(&self.setup).take()
     }
 
@@ -3309,22 +3176,12 @@ impl OutboundRequest {
         }
     }
 
-    fn complete_failure(&self, shared: &EngineShared, error: Error) {
+    fn complete_failure(&self, _shared: &EngineShared, error: Error) {
         let mut current = lock_unpoison(&self.result);
         if matches!(&*current, TakeOnceResult::Pending) {
-            self.record_failure(shared);
             *current = TakeOnceResult::Ready(Err(error));
             drop(current);
             self.waker.wake();
-        }
-    }
-
-    fn record_failure(&self, shared: &EngineShared) {
-        if !self.failure_counted.swap(true, Ordering::AcqRel) {
-            shared
-                .diagnostic_counters
-                .connections_failed
-                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -3492,7 +3349,7 @@ mod tests {
     }
 
     #[test]
-    fn diagnostics_and_cm_service_complete_under_lock_order_stress() {
+    fn route_queries_and_cm_service_complete_under_lock_order_stress() {
         let (engine, driver) =
             super::super::test_engine_pair(super::super::CompletionMode::Polling);
         let shared = Arc::clone(&engine.shared);
@@ -3537,7 +3394,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_setup_rollback_route_is_counted_once_and_contributes_age() {
+    fn retained_setup_rollback_route_is_counted_once() {
         let cm = CmState::new(1).unwrap();
         let request = Arc::new(test_request());
         cm.routes
@@ -3546,15 +3403,12 @@ mod tests {
         let pool = ConnectionAdmissionPool::new(1);
         let mut reservation = pool.try_acquire().unwrap();
         assert!(reservation.retain_setup_quarantine());
-        let started = Instant::now();
         lock_unpoison(&cm.setup_rollback_quarantines).push(RetainedSetupRollback {
             _poster: Arc::new(NoopPoster(7)),
             _reservation: reservation,
-            started,
         });
 
         assert_eq!(cm.retained_owner_count(), 1);
-        assert_eq!(cm.oldest_setup_rollback_quarantine(), Some(started));
     }
 
     #[test]
@@ -3843,10 +3697,7 @@ mod tests {
         .unwrap();
         let order = Arc::new(Mutex::new(Vec::new()));
         let summary = run_setup_before_establish(
-            Box::new(RecordingSetup {
-                order: Arc::clone(&order),
-                result: Ok(SetupSummary { posted_wrs: 0 }),
-            }),
+            recording_setup(Arc::clone(&order), Ok(SetupSummary { posted_wrs: 0 })),
             &connection,
             || {
                 lock_unpoison(&order).push("pre-connect");
@@ -3866,10 +3717,10 @@ mod tests {
 
         lock_unpoison(&order).clear();
         let error = run_setup_before_establish(
-            Box::new(RecordingSetup {
-                order: Arc::clone(&order),
-                result: Err(Error::InvalidConfig("setup failed".into())),
-            }),
+            recording_setup(
+                Arc::clone(&order),
+                Err(Error::InvalidConfig("setup failed".into())),
+            ),
             &connection,
             || {
                 lock_unpoison(&order).push("pre-connect");
@@ -3886,10 +3737,7 @@ mod tests {
 
         lock_unpoison(&order).clear();
         let error = run_setup_before_establish(
-            Box::new(RecordingSetup {
-                order: Arc::clone(&order),
-                result: Ok(SetupSummary { posted_wrs: 1 }),
-            }),
+            recording_setup(Arc::clone(&order), Ok(SetupSummary { posted_wrs: 1 })),
             &connection,
             || {
                 lock_unpoison(&order).push("pre-connect");
@@ -4043,6 +3891,9 @@ mod tests {
         )
         .unwrap();
         drop(admission);
+        // This scheduler-only fixture has no real QP, so record its synthetic
+        // destruction boundary before exercising route-state retry behavior.
+        connection.state.mark_qp_destroyed();
 
         engine.shared.cm.enqueue_retirement(connection.state.token);
         let processed = engine
@@ -4127,7 +3978,6 @@ mod tests {
                 .to_string()
                 .contains("lost connection state before accept retirement")
         );
-        assert_eq!(listener.queue_counts().2, 0);
         assert!(matches!(
             engine.shared.cm.inbound_routes.lookup_cloned(route_token),
             Lookup::Duplicate
@@ -4356,7 +4206,6 @@ mod tests {
             panic!("inbound accept must fail before propagation");
         };
         assert!(request_error.to_string().contains(expected));
-        assert_eq!(listener.queue_counts().2, 0);
         let mut close = Box::pin(connection.close());
         let mut cx = Context::from_waker(std::task::Waker::noop());
         let Poll::Ready(Err(close_error)) = close.as_mut().poll(&mut cx) else {
@@ -4387,7 +4236,7 @@ mod tests {
     }
 
     #[test]
-    fn request_failures_are_counted_once_but_shutdown_cancellation_is_not() {
+    fn request_failure_and_shutdown_cancellation_keep_first_outcome() {
         let (engine, driver) =
             super::super::test_engine_pair(super::super::CompletionMode::Polling);
         let failed = test_request();
@@ -4403,29 +4252,18 @@ mod tests {
             Error::InvalidConfig("late failure after shutdown".into()),
         );
 
-        assert_eq!(
-            engine
-                .shared
-                .diagnostic_counters
-                .connections_failed
-                .load(Ordering::Acquire),
-            1
-        );
-
         drop(engine);
         drop(driver);
     }
 
-    struct RecordingSetup {
+    fn recording_setup(
         order: Arc<Mutex<Vec<&'static str>>>,
         result: Result<SetupSummary>,
-    }
-
-    impl PreEstablishSetup for RecordingSetup {
-        fn run(self: Box<Self>, _connection: &RdmaConnection) -> Result<SetupSummary> {
-            lock_unpoison(&self.order).push("setup");
-            self.result
-        }
+    ) -> ConnectionSetup {
+        Box::new(move |_connection| {
+            lock_unpoison(&order).push("setup");
+            result
+        })
     }
 
     struct NoopPoster(u32);
@@ -4466,7 +4304,7 @@ mod tests {
         OutboundRequest::new(
             "127.0.0.1:1".parse().unwrap(),
             RdmaConnectionConfig::default(),
-            Box::new(EmptyPreEstablishSetup),
+            empty_connection_setup(),
             pool.try_acquire().unwrap(),
         )
     }

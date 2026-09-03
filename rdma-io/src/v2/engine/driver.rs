@@ -31,14 +31,13 @@ use crate::v2::error::{Error, Result};
 
 pub(super) const TERMINAL_WORK: usize = 1 << 0;
 pub(super) const RECLAMATION_WORK: usize = 1 << 1;
-pub(super) const READY_CONNECTION_WORK: usize = 1 << 2;
+pub(super) const COMPLETION_DISPATCH_WORK: usize = 1 << 2;
 pub(super) const CQ_RECHECK_WORK: usize = 1 << 4;
 const WORK_CLASS_COUNT: usize = 5;
 
 pub(super) struct WorkSignal {
     pending: std::sync::atomic::AtomicUsize,
     epoch: std::sync::atomic::AtomicU64,
-    wakeups: std::sync::atomic::AtomicU64,
     waker: futures_util::task::AtomicWaker,
 }
 
@@ -47,7 +46,6 @@ impl WorkSignal {
         Self {
             pending: std::sync::atomic::AtomicUsize::new(0),
             epoch: std::sync::atomic::AtomicU64::new(0),
-            wakeups: std::sync::atomic::AtomicU64::new(0),
             waker: futures_util::task::AtomicWaker::new(),
         }
     }
@@ -56,8 +54,6 @@ impl WorkSignal {
         self.pending
             .fetch_or(work, std::sync::atomic::Ordering::Release);
         self.epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        self.wakeups
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.waker.wake();
     }
 
@@ -67,10 +63,6 @@ impl WorkSignal {
 
     fn epoch(&self) -> u64 {
         self.epoch.load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    pub(super) fn wakeups(&self) -> u64 {
-        self.wakeups.load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn register_and_recheck(&self, waker: &std::task::Waker, observed_epoch: u64) -> usize {
@@ -140,8 +132,9 @@ impl RdmaEngineDriver {
         if published & RECLAMATION_WORK != 0 {
             self.scheduler.mark_class_ready(WorkClass::Reclamation);
         }
-        if published & READY_CONNECTION_WORK != 0 {
-            self.scheduler.mark_class_ready(WorkClass::ReadyConnection);
+        if published & COMPLETION_DISPATCH_WORK != 0 {
+            self.scheduler
+                .mark_class_ready(WorkClass::CompletionDispatch);
         }
         if published & super::cm::CM_WORK != 0 {
             self.scheduler.mark_class_ready(WorkClass::Cm);
@@ -232,10 +225,9 @@ impl RdmaEngineDriver {
         #[cfg(any(test, feature = "test-hooks"))]
         if let Some(completion) = self.shared.test_driver.take_released_connection_cqe() {
             if let Some(connection) = self.shared.enqueue_completion(completion) {
-                self.scheduler.enqueue_connection(connection.ready());
+                self.scheduler
+                    .enqueue_connection(connection.completion_ready());
             }
-            self.shared
-                .update_ready_queue_depth(self.scheduler.ready_connection_count());
             self.scheduler.mark_class_ready(WorkClass::Cq);
             return Ok(true);
         }
@@ -281,10 +273,6 @@ impl RdmaEngineDriver {
         if count == 0 {
             return Ok(false);
         }
-        self.shared
-            .diagnostic_counters
-            .cqes_polled
-            .fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
         for completion in self.cq_buffer[..count].iter().copied() {
             let completion = completion.into_raw();
             #[cfg(any(test, feature = "test-hooks"))]
@@ -292,15 +280,14 @@ impl RdmaEngineDriver {
                 continue;
             }
             if let Some(connection) = self.shared.enqueue_completion(completion) {
-                self.scheduler.enqueue_connection(connection.ready());
+                self.scheduler
+                    .enqueue_connection(connection.completion_ready());
             }
             #[cfg(any(test, feature = "test-hooks"))]
             self.shared.test_driver.dispatch(completion);
             #[cfg(not(any(test, feature = "test-hooks")))]
             let _ = completion;
         }
-        self.shared
-            .update_ready_queue_depth(self.scheduler.ready_connection_count());
         self.scheduler.mark_class_ready(WorkClass::Cq);
         Ok(true)
     }
@@ -409,12 +396,6 @@ impl RdmaEngineDriver {
                 );
                 Ok(())
             }
-            DeadlineKind::MessageHello => {
-                self.shared.handle_message_hello_deadline(
-                    super::registry::ConnectionToken::decode(deadline.token),
-                );
-                Ok(())
-            }
         }
     }
 
@@ -436,42 +417,32 @@ impl RdmaEngineDriver {
         true
     }
 
-    fn service_ready_connection(&mut self) -> bool {
-        #[cfg(any(test, feature = "test-hooks"))]
-        if self.shared.test_driver.ready_work_paused() {
-            return false;
-        }
-        if let Some(connection) = self.shared.take_published_connection() {
-            self.scheduler.enqueue_connection(connection.ready());
+    fn service_completion_dispatch(&mut self) -> bool {
+        if let Some(connection) = self.shared.take_published_completion() {
+            self.scheduler
+                .enqueue_connection(connection.completion_ready());
         }
         let Some(connection) = self.scheduler.pop_connection() else {
-            #[cfg(any(test, feature = "test-hooks"))]
-            self.shared.test_driver.record_idle_connection_visit();
-            self.shared.update_ready_queue_depth(0);
             return false;
         };
-        let (_processed, remains_ready) = self.shared.process_connection_ready(
+        let (_, remains_ready) = self.shared.dispatch_connection_completions(
             super::registry::ConnectionToken {
                 slot: connection.slot,
                 generation: connection.generation,
             },
-            self.shared.config.ready_connection_quantum,
+            self.shared.config.completion_dispatch_budget,
         );
-        #[cfg(any(test, feature = "test-hooks"))]
-        self.shared
-            .test_driver
-            .record_connection_selection(_processed);
         if remains_ready {
             self.scheduler.requeue_connection(connection);
         }
-        if self.scheduler.ready_connection_count() > 0 {
-            self.scheduler.mark_class_ready(WorkClass::ReadyConnection);
+        if self.scheduler.completion_connection_count() > 0 {
+            self.scheduler
+                .mark_class_ready(WorkClass::CompletionDispatch);
         }
-        if self.shared.has_published_connections() {
-            self.scheduler.mark_class_ready(WorkClass::ReadyConnection);
+        if self.shared.has_published_completions() {
+            self.scheduler
+                .mark_class_ready(WorkClass::CompletionDispatch);
         }
-        self.shared
-            .update_ready_queue_depth(self.scheduler.ready_connection_count());
         true
     }
 }
@@ -486,7 +457,7 @@ impl Future for RdmaEngineDriver {
         }
 
         if !self.runtime_checked {
-            if let Err(error) = preflight_driver_runtime() {
+            if let Err(error) = preflight_driver_runtime("RdmaEngineDriver") {
                 return self.fail(error);
             }
             self.runtime_checked = true;
@@ -516,8 +487,6 @@ impl Future for RdmaEngineDriver {
             let Some(class) = self.scheduler.next_class() else {
                 break;
             };
-            #[cfg(any(test, feature = "test-hooks"))]
-            self.shared.test_driver.record_class_selection(class);
             let result = match class {
                 WorkClass::Terminal => match self.service_terminal() {
                     Ok(true) => break,
@@ -527,7 +496,7 @@ impl Future for RdmaEngineDriver {
                 WorkClass::Cm => self.service_cm(cx),
                 WorkClass::Cq => self.service_cq(cx),
                 WorkClass::Reclamation => self.service_reclamation(),
-                WorkClass::ReadyConnection => Ok(self.service_ready_connection()),
+                WorkClass::CompletionDispatch => Ok(self.service_completion_dispatch()),
             };
             let progressed = match result {
                 Ok(progressed) => progressed,
@@ -574,10 +543,13 @@ impl Future for RdmaEngineDriver {
                 }
             }
             CompletionMode::Polling => {
-                self.shared
-                    .driver_yields
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                cx.waker().wake_by_ref();
+                // Tokio's yield future defers this task to the back of the
+                // scheduler queue. A direct self-wake can monopolize a worker
+                // and starve the explicit per-connection message drivers.
+                let mut yield_now = std::pin::pin!(tokio::task::yield_now());
+                if yield_now.as_mut().poll(cx).is_ready() {
+                    cx.waker().wake_by_ref();
+                }
             }
         }
         Poll::Pending
@@ -601,10 +573,6 @@ impl Drop for RdmaEngineDriver {
             let error = if outstanding == 0 && cm_owners == 0 {
                 Error::DriverShutdown
             } else {
-                self.shared
-                    .diagnostic_counters
-                    .engine_wedges
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Error::EngineWedged {
                     retained_bundles: self.shared.retained_bundle_count().max(1),
                     outstanding_operations: outstanding,
@@ -619,12 +587,11 @@ impl Drop for RdmaEngineDriver {
     }
 }
 
-fn preflight_driver_runtime() -> Result<()> {
+pub(crate) fn preflight_driver_runtime(driver_name: &str) -> Result<()> {
     if tokio::runtime::Handle::try_current().is_err() {
-        return Err(Error::InvalidConfig(
-            "RdmaEngineDriver must be polled inside an active Tokio runtime with time enabled"
-                .into(),
-        ));
+        return Err(Error::InvalidConfig(format!(
+            "{driver_name} must be polled inside an active Tokio runtime with time enabled"
+        )));
     }
     #[cfg(panic = "unwind")]
     {
@@ -633,9 +600,9 @@ fn preflight_driver_runtime() -> Result<()> {
                 drop(sleep);
                 Ok(())
             }
-            RuntimeProbe::Panicked => Err(Error::InvalidConfig(
-                "RdmaEngineDriver requires Tokio time to be enabled".into(),
-            )),
+            RuntimeProbe::Panicked => Err(Error::InvalidConfig(format!(
+                "{driver_name} requires Tokio time to be enabled"
+            ))),
         }
     }
     #[cfg(not(panic = "unwind"))]
@@ -660,18 +627,21 @@ pub(super) mod test_api {
 
     use crate::async_cm::AsyncCmId;
     use crate::cm::CmId;
-    use crate::v2::engine::connection::{
-        VerbsConnectionResources, WorkRequestPoster, install_connection,
-    };
+    #[cfg(test)]
+    use crate::v2::engine::connection::WorkRequestPoster;
+    use crate::v2::engine::connection::{VerbsConnectionResources, install_connection};
     use crate::v2::engine::resources::TestResourceRefs;
+    #[cfg(test)]
     use crate::v2::qp::{BatchPostOutcome, QpCapabilities};
     use crate::v2::{
         AccessIntent, Completion, Mr, Qp, QpBuilder, RdmaConnection, RdmaConnectionConfig,
     };
     use crate::wc::{WcOpcode, WcStatus, WorkCompletion};
+    #[cfg(test)]
     use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
 
-    use super::{EngineShared, Error, READY_CONNECTION_WORK, Result, TERMINAL_WORK};
+    use super::{COMPLETION_DISPATCH_WORK, EngineShared, Error, Result, TERMINAL_WORK};
+    use crate::v2::engine::operation::CqeReject;
     use crate::v2::engine::registry::{Lookup, OperationToken};
 
     /// Test-only connection identity used by the Phase 2 routing gate.
@@ -689,6 +659,34 @@ pub(super) mod test_api {
         pub expected_opcode: WcOpcode,
     }
 
+    /// Exact class of a CQE rejected before it could mutate live ownership.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum TestCqeRejection {
+        StaleConnection,
+        StaleOperation,
+        RetiredOperation,
+        Unknown,
+        Duplicate,
+        WrongConnection,
+        WrongQpNum,
+        UnexpectedOpcode,
+    }
+
+    impl From<CqeReject> for TestCqeRejection {
+        fn from(value: CqeReject) -> Self {
+            match value {
+                CqeReject::StaleConnection => Self::StaleConnection,
+                CqeReject::StaleOperation => Self::StaleOperation,
+                CqeReject::RetiredOperation => Self::RetiredOperation,
+                CqeReject::Unknown => Self::Unknown,
+                CqeReject::Duplicate => Self::Duplicate,
+                CqeReject::WrongConnection => Self::WrongConnection,
+                CqeReject::WrongQpNum => Self::WrongQpNum,
+                CqeReject::UnexpectedOpcode => Self::UnexpectedOpcode,
+            }
+        }
+    }
+
     impl TestAcceptedOperation {
         pub fn new(wr_id: u64, expected_opcode: WcOpcode) -> Self {
             Self {
@@ -698,26 +696,17 @@ pub(super) mod test_api {
         }
     }
 
-    /// Bounded-work and direct-routing instrumentation for integration tests.
+    /// Minimal routing and CM-ownership observation for safety tests.
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct TestEngineInstrumentation {
-        /// Terminal, CM, CQ, reclamation, and ready-connection selections.
-        pub work_class_selections: [u64; 5],
-        pub connection_selections: u64,
-        pub connection_quantum_work: u64,
-        pub maximum_connection_quantum_work: u64,
-        pub idle_connection_visits: u64,
-        pub connection_registry_probes: u64,
-        pub operation_registry_probes: u64,
         /// CM requests and routes that still require driver progress.
         pub cm_pending_routes: usize,
         /// CM routes, listeners, or deferred destructions retaining ownership.
         pub cm_retained_owners: usize,
-        pub operations_posted: u64,
-        pub cqes_routed: u64,
+        /// CQEs rejected before they could affect a live operation.
         pub cqes_rejected: u64,
-        pub driver_wakeups: u64,
-        pub driver_yields: u64,
+        /// CM events rejected before they could mutate a live route.
+        pub cm_events_rejected: u64,
     }
 
     /// Safe test-only lease for shared resources and bounded driver fixtures.
@@ -734,6 +723,16 @@ pub(super) mod test_api {
     /// Opaque equality-only identity for the engine's anchored context.
     pub struct TestContextIdentity {
         raw_context: usize,
+    }
+
+    /// Test-only identity of one engine's shared RDMA resource set.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub struct TestSharedResourceIdentity {
+        context: usize,
+        protection_domain: usize,
+        completion_queue: usize,
+        cm_event_channel: usize,
+        completion_channel: Option<usize>,
     }
 
     /// Read-only provider-capability projection for validation fixtures.
@@ -762,14 +761,6 @@ pub(super) mod test_api {
         shared: Weak<EngineShared>,
         connection: super::super::registry::ConnectionToken,
         qp_num: u32,
-        active: bool,
-    }
-
-    /// Controller that withholds connection-local ready work while CQ and CM
-    /// progress remain active.
-    #[doc(hidden)]
-    pub struct TestReadyWorkControl {
-        shared: Weak<EngineShared>,
         active: bool,
     }
 
@@ -811,10 +802,12 @@ pub(super) mod test_api {
         qp: Qp,
     }
 
+    #[cfg(test)]
     struct TestIdlePoster {
         qp_num: u32,
     }
 
+    #[cfg(test)]
     impl WorkRequestPoster for TestIdlePoster {
         fn qp_num(&self) -> u32 {
             self.qp_num
@@ -897,6 +890,65 @@ pub(super) mod test_api {
             Ok(TestContextIdentity {
                 raw_context: self.resources.context.raw_context().as_raw() as usize,
             })
+        }
+
+        /// Return identities for the one shared Context/PD/CQ/CM resource set.
+        pub fn shared_resource_identity(&self) -> Result<TestSharedResourceIdentity> {
+            self.ensure_active()?;
+            Ok(TestSharedResourceIdentity {
+                context: self.resources.context.raw_context().as_raw() as usize,
+                protection_domain: self.resources.pd.raw_pd().as_raw() as usize,
+                completion_queue: self.resources.cq.raw_cq().as_raw() as usize,
+                cm_event_channel: self.resources.cm_event_channel.as_raw() as usize,
+                completion_channel: self
+                    .resources
+                    .cq
+                    .completion_channel()
+                    .map(|channel| channel.as_raw() as usize),
+            })
+        }
+
+        /// Verify that a connection posts through this engine's shared PD/CQ.
+        pub fn connection_uses_shared_resources(
+            &self,
+            connection: &RdmaConnection,
+        ) -> Result<bool> {
+            let shared = self.ensure_active()?;
+            if !Arc::ptr_eq(&shared, &connection.shared) {
+                return Ok(false);
+            }
+            Ok(connection
+                .state
+                .poster
+                .uses_resources(&self.resources.pd, &self.resources.cq))
+        }
+
+        /// Verify that the connection's exact generational CM route is live.
+        pub fn connection_route_is_live(&self, connection: &RdmaConnection) -> Result<bool> {
+            let shared = self.ensure_active()?;
+            if !Arc::ptr_eq(&shared, &connection.shared) {
+                return Ok(false);
+            }
+            let route = connection
+                .state
+                .cm_route()
+                .ok_or_else(|| Error::InvalidConfig("connection has no CM route".into()))?;
+            Ok(shared
+                .cm
+                .connection_route_is_live(route, connection.state.token))
+        }
+
+        /// Snapshot the exact rejection classes observed by CQE routing.
+        pub fn cqe_rejections(&self) -> Result<Vec<TestCqeRejection>> {
+            let shared = self.ensure_active()?;
+            Ok(shared
+                .rejected_cqe_reasons
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .copied()
+                .map(TestCqeRejection::from)
+                .collect())
         }
 
         /// Register owned test memory through the engine's shared PD.
@@ -1152,44 +1204,10 @@ pub(super) mod test_api {
             Ok((token.slot, token.generation))
         }
 
-        /// Pause connection-local ready work without pausing shared CQ or CM work.
-        pub fn pause_ready_work(&self) -> Result<TestReadyWorkControl> {
-            let shared = self.ensure_active()?;
-            shared.test_driver.pause_ready_work()?;
-            Ok(TestReadyWorkControl {
-                shared: Arc::downgrade(&shared),
-                active: true,
-            })
-        }
-
-        /// Snapshot bounded-work and direct-routing instrumentation.
-        ///
-        /// Unlike mutation fixtures, this read-only snapshot remains available
-        /// after driver termination so tests can verify the frozen terminal
-        /// route ledger.
+        /// Snapshot minimal CM ownership and rejected-CQE observations.
         pub fn instrumentation(&self) -> Result<TestEngineInstrumentation> {
             let shared = self.shared.upgrade().ok_or(Error::DriverShutdown)?;
             Ok(shared.test_driver.instrumentation(&shared))
-        }
-
-        /// Install registry-level idle fixtures without allocating provider QPs.
-        pub fn install_idle_connections(&self, count: usize) -> Result<Vec<RdmaConnection>> {
-            let shared = self.ensure_active()?;
-            let mut connections = Vec::new();
-            connections
-                .try_reserve_exact(count)
-                .map_err(|_| Error::CapacityExhausted)?;
-            for _ in 0..count {
-                let qp_num = shared.test_driver.next_idle_qp()?;
-                connections.push(install_connection(
-                    &shared,
-                    Arc::new(TestIdlePoster { qp_num }),
-                    RdmaConnectionConfig::default(),
-                    None,
-                    None,
-                )?);
-            }
-            Ok(connections)
         }
 
         /// Inject a synthetic CQE through the production exact router.
@@ -1203,7 +1221,7 @@ pub(super) mod test_api {
             if let Some(token) = shared.enqueue_completion(completion)
                 && let Lookup::Occupied(connection) = shared.connections.lookup(token)
             {
-                shared.publish_connection_ready(&connection);
+                shared.publish_completion(&connection);
             }
             Ok(())
         }
@@ -1301,29 +1319,6 @@ pub(super) mod test_api {
             }
             if let Some(shared) = self.shared.upgrade() {
                 shared.test_driver.stop_admission_control(self.point);
-            }
-            self.active = false;
-        }
-    }
-
-    impl TestReadyWorkControl {
-        pub fn release(mut self) {
-            if let Some(shared) = self.shared.upgrade() {
-                shared.test_driver.resume_ready_work();
-                shared.work_signal.publish(READY_CONNECTION_WORK);
-            }
-            self.active = false;
-        }
-    }
-
-    impl Drop for TestReadyWorkControl {
-        fn drop(&mut self) {
-            if !self.active {
-                return;
-            }
-            if let Some(shared) = self.shared.upgrade() {
-                shared.test_driver.resume_ready_work();
-                shared.work_signal.publish(READY_CONNECTION_WORK);
             }
             self.active = false;
         }
@@ -1606,6 +1601,7 @@ pub(super) mod test_api {
     pub(in crate::v2::engine) struct TestDriverState {
         routes: Mutex<HashMap<u32, Arc<TestRouteState>>>,
         next_slot: AtomicU32,
+        #[cfg(test)]
         next_idle_qp: AtomicU32,
         cq_arms: AtomicU64,
         cq_arm_controller_active: AtomicBool,
@@ -1620,12 +1616,6 @@ pub(super) mod test_api {
         connection_cqe_notify: Notify,
         injected_failure: Mutex<Option<Error>>,
         setup_rollback_failure: Mutex<Option<SetupRollbackFailure>>,
-        ready_work_paused: AtomicBool,
-        work_class_selections: [AtomicU64; 5],
-        connection_selections: AtomicU64,
-        connection_quantum_work: AtomicU64,
-        maximum_connection_quantum_work: AtomicU64,
-        idle_connection_visits: AtomicU64,
     }
 
     struct ConnectionCqeSuppressionState {
@@ -1647,6 +1637,7 @@ pub(super) mod test_api {
             Self {
                 routes: Mutex::new(HashMap::new()),
                 next_slot: AtomicU32::new(0),
+                #[cfg(test)]
                 next_idle_qp: AtomicU32::new(0x7000_0000),
                 cq_arms: AtomicU64::new(0),
                 cq_arm_controller_active: AtomicBool::new(false),
@@ -1664,31 +1655,10 @@ pub(super) mod test_api {
                 connection_cqe_notify: Notify::new(),
                 injected_failure: Mutex::new(None),
                 setup_rollback_failure: Mutex::new(None),
-                ready_work_paused: AtomicBool::new(false),
-                work_class_selections: std::array::from_fn(|_| AtomicU64::new(0)),
-                connection_selections: AtomicU64::new(0),
-                connection_quantum_work: AtomicU64::new(0),
-                maximum_connection_quantum_work: AtomicU64::new(0),
-                idle_connection_visits: AtomicU64::new(0),
             }
         }
 
-        pub(super) fn record_class_selection(&self, class: super::WorkClass) {
-            self.work_class_selections[class.index()].fetch_add(1, Ordering::Relaxed);
-        }
-
-        pub(super) fn record_idle_connection_visit(&self) {
-            self.idle_connection_visits.fetch_add(1, Ordering::Relaxed);
-        }
-
-        pub(super) fn record_connection_selection(&self, work: usize) {
-            self.connection_selections.fetch_add(1, Ordering::Relaxed);
-            self.connection_quantum_work
-                .fetch_add(work as u64, Ordering::Relaxed);
-            self.maximum_connection_quantum_work
-                .fetch_max(work as u64, Ordering::Relaxed);
-        }
-
+        #[cfg(test)]
         fn next_idle_qp(&self) -> Result<u32> {
             self.next_idle_qp
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -1697,49 +1667,36 @@ pub(super) mod test_api {
                 .map_err(|_| Error::CapacityExhausted)
         }
 
+        #[cfg(test)]
+        pub(in crate::v2::engine) fn install_idle_connections(
+            &self,
+            shared: &Arc<EngineShared>,
+            count: usize,
+        ) -> Result<Vec<RdmaConnection>> {
+            let mut connections = Vec::new();
+            connections
+                .try_reserve_exact(count)
+                .map_err(|_| Error::CapacityExhausted)?;
+            for _ in 0..count {
+                let qp_num = self.next_idle_qp()?;
+                connections.push(install_connection(
+                    shared,
+                    Arc::new(TestIdlePoster { qp_num }),
+                    RdmaConnectionConfig::default(),
+                    None,
+                    None,
+                )?);
+            }
+            Ok(connections)
+        }
+
         fn instrumentation(&self, shared: &EngineShared) -> TestEngineInstrumentation {
-            let counters = &shared.diagnostic_counters;
             TestEngineInstrumentation {
-                work_class_selections: std::array::from_fn(|index| {
-                    self.work_class_selections[index].load(Ordering::Acquire)
-                }),
-                connection_selections: self.connection_selections.load(Ordering::Acquire),
-                connection_quantum_work: self.connection_quantum_work.load(Ordering::Acquire),
-                maximum_connection_quantum_work: self
-                    .maximum_connection_quantum_work
-                    .load(Ordering::Acquire),
-                idle_connection_visits: self.idle_connection_visits.load(Ordering::Acquire),
-                connection_registry_probes: shared.connections.probes(),
-                operation_registry_probes: shared.operations.probes(),
                 cm_pending_routes: shared.cm.pending_route_count(),
                 cm_retained_owners: shared.cm.retained_owner_count(),
-                operations_posted: counters.operations_posted.load(Ordering::Acquire),
-                cqes_routed: counters.cqes_routed.load(Ordering::Acquire),
-                cqes_rejected: counters.stale_connection_cqes.load(Ordering::Acquire)
-                    + counters.stale_operation_cqes.load(Ordering::Acquire)
-                    + counters.unknown_cqes.load(Ordering::Acquire)
-                    + counters.duplicate_cqes.load(Ordering::Acquire)
-                    + counters.wrong_connection_cqes.load(Ordering::Acquire)
-                    + counters.wrong_qp_num_cqes.load(Ordering::Acquire)
-                    + counters.unexpected_opcode_cqes.load(Ordering::Acquire),
-                driver_wakeups: shared.work_signal.wakeups(),
-                driver_yields: shared.driver_yields.load(Ordering::Acquire),
+                cqes_rejected: shared.rejected_cqes.load(Ordering::Acquire),
+                cm_events_rejected: shared.rejected_cm_events.load(Ordering::Acquire),
             }
-        }
-
-        fn pause_ready_work(&self) -> Result<()> {
-            self.ready_work_paused
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .map_err(|_| Error::InvalidConfig("ready work is already paused".into()))?;
-            Ok(())
-        }
-
-        fn resume_ready_work(&self) {
-            self.ready_work_paused.store(false, Ordering::Release);
-        }
-
-        pub(super) fn ready_work_paused(&self) -> bool {
-            self.ready_work_paused.load(Ordering::Acquire)
         }
 
         fn inject_failure(&self, error: Error) -> Result<()> {
@@ -2152,7 +2109,7 @@ pub(super) mod test_api {
             }
             routes.insert(qp_num, Arc::clone(&route));
             drop(routes);
-            shared.work_signal.publish(READY_CONNECTION_WORK);
+            shared.work_signal.publish(COMPLETION_DISPATCH_WORK);
             Ok(TestRouteHandle {
                 shared: Arc::downgrade(shared),
                 route,
@@ -2184,11 +2141,6 @@ pub(super) mod test_api {
             {
                 routes.remove(&qp_num);
             }
-        }
-
-        pub(in crate::v2::engine) fn accepted_outstanding(&self) -> usize {
-            let routes = self.routes.lock().expect("test route table poisoned");
-            routes.values().map(|route| route.remaining()).sum()
         }
 
         pub(super) fn record_cq_arm(&self, generation: u64) -> bool {
@@ -2425,8 +2377,9 @@ pub(super) mod test_api {
 #[cfg(any(test, feature = "test-hooks"))]
 pub use test_api::{
     TestAcceptedOperation, TestAdmissionBarrier, TestConnectionCqeSuppression, TestContextIdentity,
-    TestCqArmWindowControl, TestCqeSuppression, TestEngineInstrumentation, TestEngineQp,
-    TestEngineResources, TestProviderLimits, TestReadyWorkControl, TestRouteHandle,
+    TestCqArmWindowControl, TestCqeRejection, TestCqeSuppression, TestEngineInstrumentation,
+    TestEngineQp, TestEngineResources, TestProviderLimits, TestRouteHandle,
+    TestSharedResourceIdentity,
 };
 
 #[cfg(test)]
@@ -2521,11 +2474,11 @@ mod tests {
         let signal = WorkSignal::new();
         assert_eq!(signal.take(), 0);
         let observed = signal.epoch();
-        signal.publish(READY_CONNECTION_WORK);
+        signal.publish(COMPLETION_DISPATCH_WORK);
         let counter = CountingWaker::new();
         assert_eq!(
             signal.register_and_recheck(&counter.waker(), observed),
-            READY_CONNECTION_WORK
+            COMPLETION_DISPATCH_WORK
         );
         assert_eq!(counter.count(), 1);
     }
@@ -2535,7 +2488,7 @@ mod tests {
         let signal = Arc::new(WorkSignal::new());
         std::thread::scope(|scope| {
             let mut producers = Vec::new();
-            for bit in [TERMINAL_WORK, RECLAMATION_WORK, READY_CONNECTION_WORK] {
+            for bit in [TERMINAL_WORK, RECLAMATION_WORK, COMPLETION_DISPATCH_WORK] {
                 let signal = Arc::clone(&signal);
                 producers.push(scope.spawn(move || {
                     for _ in 0..32 {
@@ -2549,7 +2502,7 @@ mod tests {
         });
         assert_eq!(
             signal.take(),
-            TERMINAL_WORK | RECLAMATION_WORK | READY_CONNECTION_WORK
+            TERMINAL_WORK | RECLAMATION_WORK | COMPLETION_DISPATCH_WORK
         );
     }
 
@@ -2646,17 +2599,12 @@ mod tests {
                 assert!(driver.service_reclamation().unwrap());
                 assert_eq!(
                     driver.scheduler.next_class(),
-                    Some(WorkClass::ReadyConnection)
+                    Some(WorkClass::CompletionDispatch)
                 );
-                assert!(driver.service_ready_connection());
+                assert!(driver.service_completion_dispatch());
 
                 let diagnostics = engine.diagnostics();
-                assert_eq!(diagnostics.operations_completed, 1);
-                assert_eq!(diagnostics.operations_released_after_qp_destroy, 0);
-                assert_eq!(diagnostics.cqes_routed, 1);
-                assert_eq!(diagnostics.stale_operation_cqes, 0);
-                assert_eq!(diagnostics.qp_destroys, 0);
-                assert_eq!(diagnostics.accepted_outstanding_operations, 0);
+                assert_eq!(diagnostics.accepted_operations, 0);
                 assert_eq!(diagnostics.registered_operations, 0);
                 assert_eq!(poster.destroys.load(Ordering::Acquire), 0);
 
@@ -2808,7 +2756,31 @@ mod tests {
         let mut cx = TaskContext::from_waker(&waker);
         assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
         assert_eq!(counter.count(), 0);
-        assert_eq!(driver.scheduler.ready_connection_count(), 0);
+        assert_eq!(driver.scheduler.completion_connection_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn idle_connections_publish_no_completion_dispatch_work() {
+        for count in [1, 1_024] {
+            let mut config = super::super::config::EngineConfig::new("test0".into());
+            config.completion_mode = CompletionMode::Readiness;
+            config.max_live_connections = count;
+            let shared = Arc::new(EngineShared::new(config, None, None).unwrap());
+            let connections = shared
+                .test_driver
+                .install_idle_connections(&shared, count)
+                .unwrap();
+            let mut driver = super::super::RdmaEngineDriver::new(Arc::clone(&shared), None);
+            let waker = futures_util::task::noop_waker();
+            let mut cx = TaskContext::from_waker(&waker);
+
+            assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
+            assert_eq!(driver.scheduler.completion_connection_count(), 0);
+            assert!(!shared.has_published_completions());
+
+            drop(connections);
+            drop(driver);
+        }
     }
 
     #[tokio::test]
@@ -2816,14 +2788,12 @@ mod tests {
         let (_engine, mut driver) = test_engine_pair(CompletionMode::Polling);
         let counter = CountingWaker::new();
         let waker = counter.waker();
-        let mut cx = TaskContext::from_waker(&waker);
-        assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
+        {
+            let mut cx = TaskContext::from_waker(&waker);
+            assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
+        }
+        tokio::task::yield_now().await;
         assert_eq!(counter.count(), 1);
-        assert_eq!(
-            driver.shared.driver_yields.load(Ordering::Acquire),
-            1,
-            "one empty polling iteration records one cooperative yield"
-        );
     }
 
     #[tokio::test]

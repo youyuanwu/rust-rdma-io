@@ -1,7 +1,5 @@
 //! Central engine lifecycle deadlines and terminal wedge calculation.
 
-use std::sync::atomic::Ordering;
-
 use super::{EngineShared, RdmaEngineTerminalError};
 use crate::v2::error::{Error, Result};
 
@@ -79,9 +77,6 @@ impl EngineShared {
         if retained_bundles == 0 && outstanding_operations == 0 && pending_routes == 0 {
             return None;
         }
-        self.diagnostic_counters
-            .engine_wedges
-            .fetch_add(1, Ordering::Relaxed);
         // Pending CM work can wedge shutdown without owning a retained bundle.
         Some(Error::EngineWedged {
             retained_bundles,
@@ -94,18 +89,13 @@ impl EngineShared {
         for connection in self.connections.occupied() {
             let _lifecycle = connection.lock_lifecycle();
             connection.stop_posting();
-            if let Ok(true) = connection.transition_to_error_once() {
-                self.diagnostic_counters
-                    .qp_error_transitions
-                    .fetch_add(1, Ordering::Relaxed);
-            }
+            let _ = connection.transition_to_error_once();
             if connection.accepted_count() == 0
                 && !connection.is_retired()
                 && !connection.retirement_is_quarantined()
             {
                 match connection.establish_qp_destruction_boundary(&_lifecycle) {
-                    Ok(true) => self.record_qp_destroy(),
-                    Ok(false) => {}
+                    Ok(_) => {}
                     Err(error) => {
                         tracing::warn!(
                             qp_num = connection.qp_num(),
@@ -226,7 +216,6 @@ mod tests {
         engine.shared.synchronously_prepare_driver_drop();
 
         assert_eq!(poster.destroys.load(Ordering::Acquire), 1);
-        assert_eq!(engine.diagnostics().qp_destroys, 1);
         engine.shared.finish(MemoizedTerminalResult::success());
         drop(driver);
     }
@@ -257,7 +246,6 @@ mod tests {
         engine.shared.synchronously_prepare_driver_drop();
 
         assert_eq!(poster.destroys.load(Ordering::Acquire), 0);
-        assert_eq!(engine.diagnostics().qp_destroys, 0);
         engine.shared.finish(MemoizedTerminalResult::success());
         drop(driver);
     }

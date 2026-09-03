@@ -1,5 +1,7 @@
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -19,6 +21,23 @@ fn software_device_name() -> Option<String> {
 
 fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
     let waker = futures_util::task::noop_waker();
+    let mut context = Context::from_waker(&waker);
+    future.poll(&mut context)
+}
+
+struct WakeCounter(AtomicUsize);
+
+impl futures_util::task::ArcWake for WakeCounter {
+    fn wake_by_ref(arc_self: &Arc<Self>) {
+        arc_self.0.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+fn poll_with_wake_counter<F: Future>(
+    future: Pin<&mut F>,
+    wake: &Arc<WakeCounter>,
+) -> Poll<F::Output> {
+    let waker = futures_util::task::waker(Arc::clone(wake));
     let mut context = Context::from_waker(&waker);
     future.poll(&mut context)
 }
@@ -70,7 +89,14 @@ async fn accept_pair(
     };
     tokio::time::timeout(Duration::from_secs(15), async {
         let (server, client) = tokio::join!(accept, connect);
-        (server.unwrap(), client.unwrap())
+        (
+            server.unwrap_or_else(|error| {
+                panic!("listener accept failed (configured={configured}): {error}")
+            }),
+            client.unwrap_or_else(|error| {
+                panic!("listener connect failed (configured={configured}): {error}")
+            }),
+        )
     })
     .await
     .expect("engine listener establishment timed out")
@@ -105,8 +131,6 @@ async fn run_basic_listener(mode: CompletionMode) {
         )
         .await;
     assert!(matches!(invalid, Err(Error::InvalidConfig(_))));
-    assert_eq!(server_engine.diagnostics().listener_count, 0);
-    assert_eq!(server_engine.diagnostics().listeners_created, 0);
 
     let listener = server_engine
         .listen(
@@ -115,33 +139,11 @@ async fn run_basic_listener(mode: CompletionMode) {
         )
         .await
         .unwrap();
-    let failing_address = connect_addr_for(Some(listener.local_addr().unwrap()));
-    let (failed_accept, failed_connect) = tokio::join!(
-        listener.accept_with_test_setup_failure("injected setup failure"),
-        client_engine.connect(failing_address)
-    );
-    assert!(matches!(failed_accept, Err(Error::InvalidConfig(_))));
-    assert!(failed_connect.is_err());
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let diagnostics = server_engine.diagnostics();
-            if diagnostics.accept_setup_failures == 1
-                && diagnostics.inbound_rejected_setup_failure == 1
-                && diagnostics.live_connection_reservations == 0
-                && diagnostics.selected_accepts == 0
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("selected setup failure did not reject and retire exactly once");
     let (server_default, client_default) = accept_pair(&listener, &client_engine, false).await;
     let (server_configured, client_configured) = accept_pair(&listener, &client_engine, true).await;
     let post_accept = server_engine.diagnostics();
-    assert_eq!(post_accept.operations_offered, 0);
-    assert_eq!(post_accept.accepted_outstanding_operations, 0);
+    assert_eq!(post_accept.registered_operations, 0);
+    assert_eq!(post_accept.accepted_operations, 0);
 
     exchange(&server_default, &client_default, 7).await;
     exchange(&server_configured, &client_configured, 9).await;
@@ -152,45 +154,38 @@ async fn run_basic_listener(mode: CompletionMode) {
         queued_connects.spawn(async move { engine.connect(address).await });
     }
     tokio::time::timeout(Duration::from_secs(15), async {
-        while server_engine.diagnostics().queued_inbound_requests != 2 {
+        while server_engine.diagnostics().live_connections != 4 {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("listener userspace backlog did not fill");
+    .unwrap_or_else(|_| {
+        panic!(
+            "listener backlog children did not become live: {:?}",
+            server_engine.diagnostics()
+        )
+    });
     let overflow_engine = client_engine.clone();
-    queued_connects.spawn(async move { overflow_engine.connect(address).await });
-    tokio::time::timeout(Duration::from_secs(15), async {
-        while server_engine.diagnostics().inbound_rejected_backlog_full != 1 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("listener userspace backlog did not reject overflow");
+    let overflow = tokio::spawn(async move { overflow_engine.connect(address).await });
+    let overflow = tokio::time::timeout(Duration::from_secs(15), overflow)
+        .await
+        .expect("listener backlog did not reject overflow")
+        .unwrap();
+    assert!(overflow.is_err());
     let (queued_server_a, queued_server_b) = tokio::join!(listener.accept(), listener.accept());
     let queued_servers = [queued_server_a.unwrap(), queued_server_b.unwrap()];
     let mut queued_clients = Vec::new();
-    let mut backlog_rejections = 0;
     while let Some(result) = queued_connects.join_next().await {
         match result.unwrap() {
             Ok(connection) => queued_clients.push(connection),
-            Err(_) => backlog_rejections += 1,
+            Err(error) => panic!("queued client unexpectedly failed: {error}"),
         }
     }
     assert_eq!(queued_clients.len(), 2);
-    assert_eq!(backlog_rejections, 1);
 
     let (server_after_reject, client_after_reject) =
         accept_pair(&listener, &client_engine, false).await;
     exchange(&server_after_reject, &client_after_reject, 11).await;
-
-    let diagnostics = server_engine.diagnostics();
-    assert_eq!(diagnostics.listener_count, 1);
-    assert_eq!(diagnostics.inbound_requests_accepted, 5);
-    assert_eq!(diagnostics.shared_cm_event_channels, 1);
-    assert_eq!(diagnostics.queued_inbound_requests, 0);
-    assert_eq!(diagnostics.pending_accepts, 0);
-    assert_eq!(diagnostics.selected_accepts, 0);
 
     for connection in [&server_default, &server_configured] {
         connection.close().await.unwrap();
@@ -259,10 +254,7 @@ async fn run_two_listener_backlog_and_capacity(mode: CompletionMode) {
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             let diagnostics = server_engine.diagnostics();
-            if diagnostics.listener_count == 2
-                && diagnostics.queued_inbound_requests == 4
-                && diagnostics.live_connection_reservations == 4
-            {
+            if diagnostics.live_connections == 4 {
                 break;
             }
             tokio::task::yield_now().await;
@@ -276,32 +268,18 @@ async fn run_two_listener_backlog_and_capacity(mode: CompletionMode) {
         )
     });
     let engine = client_engine.clone();
-    connects.spawn(async move { engine.connect(first_addr).await });
-    tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            if server_engine
-                .diagnostics()
-                .inbound_rejected_connection_capacity
-                == 1
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| {
-        panic!(
-            "aggregate connection capacity did not reject the fifth child: {:?}",
-            server_engine.diagnostics()
-        )
-    });
+    let overflow = tokio::spawn(async move { engine.connect(first_addr).await });
+    let overflow = tokio::time::timeout(Duration::from_secs(15), overflow)
+        .await
+        .expect("aggregate connection capacity did not reject the fifth child")
+        .unwrap();
+    assert!(overflow.is_err());
     match server_engine.connect(first_addr).await {
         Err(Error::CapacityExhausted) => {}
         Err(error) => panic!("unexpected outbound capacity error: {error}"),
         Ok(_) => panic!("outbound request oversubscribed listener-held capacity"),
     }
-    assert_eq!(server_engine.diagnostics().live_connection_reservations, 4);
+    assert_eq!(server_engine.diagnostics().live_connections, 4);
 
     let accepted = tokio::time::timeout(Duration::from_secs(15), async {
         tokio::join!(
@@ -321,22 +299,13 @@ async fn run_two_listener_backlog_and_capacity(mode: CompletionMode) {
     ];
 
     let mut clients = Vec::new();
-    let mut rejected = 0;
     while let Some(result) = connects.join_next().await {
         match result.unwrap() {
             Ok(connection) => clients.push(connection),
-            Err(error) => {
-                rejected += 1;
-                assert!(
-                    matches!(error, Error::Verbs(_) | Error::DriverShutdown),
-                    "unexpected rejected-client error: {error}"
-                );
-            }
+            Err(error) => panic!("unexpected queued-client error: {error}"),
         }
     }
     assert_eq!(clients.len(), 4);
-    assert_eq!(rejected, 1);
-    assert_eq!(server_engine.diagnostics().inbound_requests_accepted, 4);
 
     for connection in &servers {
         connection.close().await.unwrap();
@@ -380,66 +349,35 @@ async fn run_accept_cancellation_and_live_shutdown(mode: CompletionMode) {
         )
         .await
         .unwrap();
-    let cancelled_listener = listener.clone();
-    let cancelled = tokio::spawn(async move { cancelled_listener.accept().await });
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while server_engine.diagnostics().pending_accepts != 1 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("accept waiter was not registered");
-    cancelled.abort();
-    match cancelled.await {
-        Err(error) => assert!(error.is_cancelled()),
-        Ok(_) => panic!("accept task completed before cancellation"),
-    }
-
+    let mut cancelled = Box::pin(listener.accept());
+    assert!(poll_once(cancelled.as_mut()).is_pending());
+    drop(cancelled);
     let address = connect_addr_for(Some(listener.local_addr().unwrap()));
-    let connect_engine = client_engine.clone();
-    let connect = tokio::spawn(async move { connect_engine.connect(address).await });
-    tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            let diagnostics = server_engine.diagnostics();
-            if diagnostics.accept_cancellations_before_selection == 1
-                && diagnostics.queued_inbound_requests == 1
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("cancelled accept was not removed before child selection");
-    let server_connection = listener.accept().await.unwrap();
-    let client_connection = connect.await.unwrap().unwrap();
+    let (server_connection, client_connection) =
+        tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::join!(listener.accept(), client_engine.connect(address))
+        })
+        .await
+        .expect("replacement accept did not receive the next child");
+    let server_connection = server_connection.unwrap();
+    let client_connection = client_connection.unwrap();
 
     let mut cancelled_after_accept = Box::pin(listener.accept());
-    assert!(poll_once(cancelled_after_accept.as_mut()).is_pending());
+    let selected_wake = Arc::new(WakeCounter(AtomicUsize::new(0)));
+    assert!(poll_with_wake_counter(cancelled_after_accept.as_mut(), &selected_wake).is_pending());
     let second_address = connect_addr_for(Some(listener.local_addr().unwrap()));
     let second_engine = client_engine.clone();
     let second_connect = tokio::spawn(async move { second_engine.connect(second_address).await });
     tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            let diagnostics = server_engine.diagnostics();
-            if diagnostics.inbound_requests_accepted == 2 && diagnostics.selected_accepts == 1 {
-                break;
-            }
+        while selected_wake.0.load(Ordering::Acquire) == 0 {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("selected accept did not reach undelivered ESTABLISHED");
+    .expect("selected accept result was not published");
     drop(cancelled_after_accept);
     tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            let diagnostics = server_engine.diagnostics();
-            if diagnostics.accept_cancellations_after_selection == 1
-                && diagnostics.selected_accepts == 0
-                && diagnostics.live_connection_reservations == 1
-            {
-                break;
-            }
+        while server_engine.diagnostics().live_connections != 1 {
             tokio::task::yield_now().await;
         }
     })
@@ -457,7 +395,7 @@ async fn run_accept_cancellation_and_live_shutdown(mode: CompletionMode) {
         .ok();
     drop(second_client);
     tokio::time::timeout(Duration::from_secs(10), async {
-        while client_engine.diagnostics().live_connection_reservations != 1 {
+        while client_engine.diagnostics().live_connections != 1 {
             tokio::task::yield_now().await;
         }
     })
@@ -465,28 +403,17 @@ async fn run_accept_cancellation_and_live_shutdown(mode: CompletionMode) {
     .expect("cancelled accept client connection did not retire");
 
     let mut selected_during_close = Box::pin(listener.accept());
-    assert!(poll_once(selected_during_close.as_mut()).is_pending());
-    let pending_listener = listener.clone();
-    let pending_accept = tokio::spawn(async move { pending_listener.accept().await });
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while server_engine.diagnostics().pending_accepts != 2 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("listener-close waiters were not registered");
+    let close_selection_wake = Arc::new(WakeCounter(AtomicUsize::new(0)));
+    assert!(
+        poll_with_wake_counter(selected_during_close.as_mut(), &close_selection_wake).is_pending()
+    );
+    let mut pending_accept = Box::pin(listener.accept());
+    assert!(poll_once(pending_accept.as_mut()).is_pending());
     let close_address = connect_addr_for(Some(listener.local_addr().unwrap()));
     let close_engine = client_engine.clone();
     let close_connect = tokio::spawn(async move { close_engine.connect(close_address).await });
     tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            let diagnostics = server_engine.diagnostics();
-            if diagnostics.inbound_requests_accepted == 3
-                && diagnostics.selected_accepts == 1
-                && diagnostics.pending_accepts == 1
-            {
-                break;
-            }
+        while close_selection_wake.0.load(Ordering::Acquire) == 0 {
             tokio::task::yield_now().await;
         }
     })
@@ -502,7 +429,7 @@ async fn run_accept_cancellation_and_live_shutdown(mode: CompletionMode) {
     close_listener.await.unwrap();
     let selected_result = selected_during_close.await;
     assert!(matches!(selected_result, Err(Error::TransportClosed)));
-    match pending_accept.await.unwrap() {
+    match pending_accept.await {
         Err(Error::TransportClosed) => {}
         Err(error) => panic!("unexpected listener-close accept error: {error}"),
         Ok(_) => panic!("listener close completed a pending accept successfully"),
@@ -521,7 +448,7 @@ async fn run_accept_cancellation_and_live_shutdown(mode: CompletionMode) {
         recv_connection.recv(mr, None).await
     });
     tokio::time::timeout(Duration::from_secs(5), async {
-        while server_engine.diagnostics().accepted_outstanding_operations != 1 {
+        while server_engine.diagnostics().accepted_operations != 1 {
             tokio::task::yield_now().await;
         }
     })
@@ -537,8 +464,8 @@ async fn run_accept_cancellation_and_live_shutdown(mode: CompletionMode) {
     assert!(returned.is_some());
     server_task.await.unwrap().unwrap();
     client_task.await.unwrap().unwrap();
-    assert_eq!(server_engine.diagnostics().live_connection_reservations, 0);
-    assert_eq!(client_engine.diagnostics().live_connection_reservations, 0);
+    assert_eq!(server_engine.diagnostics().live_connections, 0);
+    assert_eq!(client_engine.diagnostics().live_connections, 0);
     drop(server_connection);
     drop(client_connection);
     drop(close_client);

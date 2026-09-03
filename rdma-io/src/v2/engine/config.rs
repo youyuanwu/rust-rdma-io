@@ -13,9 +13,6 @@ pub(crate) const DEFAULT_WORK_BUDGET: usize = 32;
 pub(crate) const DEFAULT_MISSING_CQE_DEADLINE: Duration = Duration::from_secs(30);
 pub(crate) const DEFAULT_CONNECTION_DRAIN_DEADLINE: Duration = Duration::from_secs(5);
 pub(crate) const DEFAULT_ENGINE_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(30);
-pub(crate) const DEFAULT_MESSAGE_HELLO_DEADLINE: Duration = Duration::from_secs(10);
-pub(crate) const MIN_MESSAGE_HELLO_DEADLINE: Duration = Duration::from_millis(1);
-pub(crate) const MAX_MESSAGE_HELLO_DEADLINE: Duration = Duration::from_secs(5 * 60);
 
 const MAX_LIVE_CONNECTIONS: usize = 1_048_576;
 const MAX_INFLIGHT_OPERATIONS: usize = 16_777_216;
@@ -193,11 +190,10 @@ pub(crate) struct EngineConfig {
     pub(crate) cq_completion_budget: usize,
     pub(crate) cm_event_budget: usize,
     pub(crate) reclamation_budget: usize,
-    pub(crate) ready_connection_quantum: usize,
+    pub(crate) completion_dispatch_budget: usize,
     pub(crate) missing_cqe_deadline: Duration,
     pub(crate) connection_drain_deadline: Duration,
     pub(crate) shutdown_deadline: Duration,
-    pub(crate) hello_deadline: Duration,
 }
 
 impl EngineConfig {
@@ -211,11 +207,10 @@ impl EngineConfig {
             cq_completion_budget: DEFAULT_WORK_BUDGET,
             cm_event_budget: DEFAULT_WORK_BUDGET,
             reclamation_budget: DEFAULT_WORK_BUDGET,
-            ready_connection_quantum: DEFAULT_WORK_BUDGET,
+            completion_dispatch_budget: DEFAULT_WORK_BUDGET,
             missing_cqe_deadline: DEFAULT_MISSING_CQE_DEADLINE,
             connection_drain_deadline: DEFAULT_CONNECTION_DRAIN_DEADLINE,
             shutdown_deadline: DEFAULT_ENGINE_SHUTDOWN_DEADLINE,
-            hello_deadline: DEFAULT_MESSAGE_HELLO_DEADLINE,
         }
     }
 
@@ -250,8 +245,8 @@ impl EngineConfig {
             MAX_WORK_BUDGET,
         )?;
         validate_range(
-            "ready-connection quantum",
-            self.ready_connection_quantum,
+            "completion dispatch budget",
+            self.completion_dispatch_budget,
             1,
             MAX_WORK_BUDGET,
         )?;
@@ -273,13 +268,6 @@ impl EngineConfig {
             Duration::from_millis(1),
             Duration::from_secs(10 * 60),
         )?;
-        validate_duration(
-            "message HELLO deadline",
-            self.hello_deadline,
-            MIN_MESSAGE_HELLO_DEADLINE,
-            MAX_MESSAGE_HELLO_DEADLINE,
-        )?;
-
         if self.max_inflight_operations > self.cq_capacity {
             return Err(invalid(format!(
                 "maximum in-flight operations ({}) exceeds CQ capacity ({})",
@@ -512,7 +500,7 @@ mod tests {
         minimum.cq_completion_budget = 1;
         minimum.cm_event_budget = 1;
         minimum.reclamation_budget = 1;
-        minimum.ready_connection_quantum = 1;
+        minimum.completion_dispatch_budget = 1;
         minimum.validate_without_provider().unwrap();
 
         let mut maximum = EngineConfig::new("rxe0".into());
@@ -522,13 +510,13 @@ mod tests {
         maximum.cq_completion_budget = 4_096;
         maximum.cm_event_budget = 4_096;
         maximum.reclamation_budget = 4_096;
-        maximum.ready_connection_quantum = 4_096;
+        maximum.completion_dispatch_budget = 4_096;
         maximum.validate_without_provider().unwrap();
 
         for mutate in [
             |config: &mut EngineConfig| config.cm_event_budget = 0,
             |config: &mut EngineConfig| config.reclamation_budget = 0,
-            |config: &mut EngineConfig| config.ready_connection_quantum = 0,
+            |config: &mut EngineConfig| config.completion_dispatch_budget = 0,
         ] {
             let mut config = EngineConfig::new("rxe0".into());
             mutate(&mut config);
