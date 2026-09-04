@@ -467,6 +467,8 @@ struct QuarantineState {
 }
 
 impl Deref for EngineShared {
+    // Phase 1 migration scaffold: remove when operation methods move onto
+    // `IoCore` in Phase 2.
     type Target = IoCore;
 
     fn deref(&self) -> &Self::Target {

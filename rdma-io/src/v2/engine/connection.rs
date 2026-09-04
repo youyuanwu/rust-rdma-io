@@ -341,7 +341,7 @@ impl ConnectionState {
     }
 
     pub(super) fn qp_num(&self) -> u32 {
-        self.io.identity().qp_num
+        self.qp_num
     }
 
     pub(super) fn reserve_local(&self, direction: Direction) -> Result<()> {
@@ -1834,6 +1834,40 @@ mod tests {
         assert!(destroyed.proves_identity(token, 1));
         assert!(!destroyed.proves_identity(wrong_generation, 1));
         assert!(!destroyed.proves_identity(token, 2));
+
+        registry.set_qp_mapping_for_test(1, token);
+        let retained = registry
+            .release(token, 1)
+            .expect("the exact live generation remains registered");
+        assert!(
+            registry.prove_live_io(token, 1).is_none(),
+            "a released generation cannot mint a live I/O proof"
+        );
+
+        let replacement = registry.register(1, |replacement| {
+            Arc::new(ConnectionState::new(
+                replacement,
+                Arc::new(TestPoster),
+                RdmaConnectionConfig::default(),
+                None,
+                None,
+                None,
+                None,
+            ))
+        });
+        let (replacement, _) = match replacement {
+            Ok(registered) => registered,
+            Err(failure) => panic!("replacement registration failed: {}", failure.error),
+        };
+        assert_eq!(replacement.slot, token.slot);
+        assert_ne!(replacement.generation, token.generation);
+        assert!(registry.prove_live_io(token, 1).is_none());
+        assert!(
+            registry
+                .prove_live_io(replacement, 1)
+                .is_some_and(|proof| proof.proves(replacement, 1))
+        );
+        drop(retained);
     }
 
     #[test]
