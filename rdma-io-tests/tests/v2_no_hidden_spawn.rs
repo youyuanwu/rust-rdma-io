@@ -628,6 +628,7 @@ fn test_no_hidden_spawn_in_v2() {
         v2_dir.join("message_transport.rs"),
         v2_dir.join("engine").join("mod.rs"),
         v2_dir.join("engine").join("driver.rs"),
+        v2_dir.join("engine").join("io_core").join("mod.rs"),
         v2_dir.join("engine").join("io.rs"),
     ] {
         assert!(

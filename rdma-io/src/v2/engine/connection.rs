@@ -4,12 +4,13 @@ use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, Weak};
 
 use tokio::sync::Notify;
 
 use self::qp::QpCapabilitiesExt;
 use super::io::{IoEventSender, IoTerminalEvent, PendingIoEvent};
+use super::io_core::{EstablishedIoConnection, EstablishedIoIdentity, IoPostAuthority};
 use super::lifecycle::MemoizedTerminalResult;
 use super::operation::RdmaOperation;
 use super::registry::{
@@ -73,8 +74,8 @@ pub(super) struct QpDestructionProof {
 }
 
 impl QpDestructionProof {
-    pub(super) fn proves(&self, connection: &ConnectionState) -> bool {
-        self.connection == connection.token && self.qp_num == connection.qp_num
+    pub(super) fn proves_identity(&self, connection: ConnectionToken, qp_num: u32) -> bool {
+        self.connection == connection && self.qp_num == qp_num
     }
 }
 
@@ -235,6 +236,7 @@ pub(super) struct ConnectionState {
     qp_num: u32,
     config: RdmaConnectionConfig,
     pub(super) poster: Arc<dyn WorkRequestPoster>,
+    pub(super) io: Arc<EstablishedIoConnection>,
     local_addr: Option<SocketAddr>,
     peer_addr: Option<SocketAddr>,
     posting_open: AtomicBool,
@@ -281,11 +283,22 @@ impl ConnectionState {
         if let Some(reservation) = admission.as_mut() {
             reservation.mark_registered();
         }
+        let qp_num = poster.qp_num();
+        let io_poster: Arc<dyn IoPostAuthority> =
+            Arc::new(SessionIoPostAuthority::new(&poster, qp_num));
+        let io = EstablishedIoConnection::new(
+            EstablishedIoIdentity {
+                connection: token,
+                qp_num,
+            },
+            io_poster,
+        );
         Self {
             token,
-            qp_num: poster.qp_num(),
+            qp_num,
             config,
             poster,
+            io,
             local_addr,
             peer_addr,
             posting_open: AtomicBool::new(true),
@@ -317,15 +330,18 @@ impl ConnectionState {
     }
 
     pub(super) fn identity(&self) -> RdmaConnectionIdentity {
+        let io = self.io.identity();
+        debug_assert_eq!(io.connection, self.token);
+        debug_assert_eq!(io.qp_num, self.qp_num);
         RdmaConnectionIdentity {
-            slot: self.token.slot,
-            generation: self.token.generation,
-            qp_num: self.qp_num,
+            slot: io.connection.slot,
+            generation: io.connection.generation,
+            qp_num: io.qp_num,
         }
     }
 
     pub(super) fn qp_num(&self) -> u32 {
-        self.qp_num
+        self.io.identity().qp_num
     }
 
     pub(super) fn reserve_local(&self, direction: Direction) -> Result<()> {
@@ -1162,6 +1178,7 @@ pub(crate) trait WorkRequestPoster: Send + Sync {
             },
         ))
     }
+
     #[cfg(any(test, feature = "test-hooks"))]
     fn disconnect(&self) -> Result<()>;
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1173,6 +1190,38 @@ pub(crate) trait WorkRequestPoster: Send + Sync {
     #[cfg(any(test, feature = "test-hooks"))]
     fn uses_resources(&self, _pd: &crate::v2::Pd, _cq: &crate::v2::Cq) -> bool {
         false
+    }
+}
+
+struct SessionIoPostAuthority {
+    owner: Weak<dyn WorkRequestPoster>,
+    qp_num: u32,
+}
+
+impl SessionIoPostAuthority {
+    fn new(owner: &Arc<dyn WorkRequestPoster>, qp_num: u32) -> Self {
+        Self {
+            owner: Arc::downgrade(owner),
+            qp_num,
+        }
+    }
+
+    fn owner(&self) -> Result<Arc<dyn WorkRequestPoster>> {
+        self.owner.upgrade().ok_or(Error::TransportClosed)
+    }
+}
+
+impl IoPostAuthority for SessionIoPostAuthority {
+    fn qp_num(&self) -> u32 {
+        self.qp_num
+    }
+
+    fn post_send(&self, batch: &mut PreparedSendBatch) -> Result<BatchPostOutcome> {
+        self.owner()?.post_send(batch)
+    }
+
+    fn post_recv(&self, batch: &mut PreparedRecvBatch) -> Result<BatchPostOutcome> {
+        self.owner()?.post_recv(batch)
     }
 }
 
@@ -1692,6 +1741,7 @@ mod qp {
 #[cfg(test)]
 mod tests {
     use super::super::io::{IoEvent, event_port};
+    use super::super::registry::ConnectionRegistry;
     use super::*;
     use crate::wr::{RecvWr, SendWr, WrOpcode};
 
@@ -1725,6 +1775,65 @@ mod tests {
         fn disconnect(&self) -> Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn io_post_authority_is_posting_only_and_does_not_retain_the_owner() {
+        let owner: Arc<dyn WorkRequestPoster> = Arc::new(TestPoster);
+        assert_eq!(Arc::strong_count(&owner), 1);
+        let authority = SessionIoPostAuthority::new(&owner, owner.qp_num());
+        assert_eq!(authority.qp_num(), 1);
+        assert_eq!(
+            Arc::strong_count(&owner),
+            1,
+            "posting authority must retain only a weak owner reference"
+        );
+
+        drop(owner);
+        assert!(matches!(authority.owner(), Err(Error::TransportClosed)));
+    }
+
+    #[test]
+    fn live_io_and_qp_destruction_proofs_require_exact_identity() {
+        let registry = ConnectionRegistry::new(1).unwrap();
+        let registration = registry.register(1, |token| {
+            Arc::new(ConnectionState::new(
+                token,
+                Arc::new(TestPoster),
+                RdmaConnectionConfig::default(),
+                None,
+                None,
+                None,
+                None,
+            ))
+        });
+        let (token, connection) = match registration {
+            Ok(registered) => registered,
+            Err(failure) => panic!("connection registration failed: {}", failure.error),
+        };
+
+        let live = registry.prove_live_io(token, 1).expect("exact live proof");
+        assert!(live.proves(token, 1));
+        assert!(registry.prove_live_io(token, 2).is_none());
+        assert_eq!(
+            connection.io.identity(),
+            EstablishedIoIdentity {
+                connection: token,
+                qp_num: 1,
+            }
+        );
+
+        let wrong_generation = ConnectionToken {
+            slot: token.slot,
+            generation: token.generation + 1,
+        };
+        registry.set_qp_mapping_for_test(1, wrong_generation);
+        assert!(registry.prove_live_io(token, 1).is_none());
+
+        let destroyed = connection.mint_qp_destruction_proof_for_test();
+        assert!(destroyed.proves_identity(token, 1));
+        assert!(!destroyed.proves_identity(wrong_generation, 1));
+        assert!(!destroyed.proves_identity(token, 2));
     }
 
     #[test]

@@ -35,6 +35,7 @@ mod diagnostics;
 mod drain;
 mod driver;
 pub(crate) mod io;
+mod io_core;
 mod lifecycle;
 mod listener;
 mod operation;
@@ -46,6 +47,7 @@ mod scheduler;
 mod api_tests;
 
 use std::collections::{HashMap, VecDeque};
+use std::ops::Deref;
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
@@ -68,10 +70,10 @@ pub use driver::{
     TestEngineQp, TestEngineResources, TestProviderLimits, TestRouteHandle,
     TestSharedResourceIdentity,
 };
+use io_core::IoCore;
 use lifecycle::MemoizedTerminalResult;
 pub use listener::{RdmaListener, RdmaListenerConfig};
 pub use operation::RdmaOperation;
-use operation::{CqCreditPool, OperationRegistry};
 use registry::{ConnectionRegistry, OperationToken, lock_unpoison, write_unpoison};
 use resources::{EngineResourceRefs, EngineResources};
 use scheduler::WorkScheduler;
@@ -417,21 +419,12 @@ struct EngineShared {
     provider: Option<config::ProviderLimits>,
     connection_admission: Arc<ConnectionAdmissionPool>,
     connections: ConnectionRegistry,
-    operations: OperationRegistry,
+    // Temporary `Deref<Target = IoCore>` migration scaffolding keeps the
+    // established operation paths compiling while ownership moves first.
+    io_core: Arc<IoCore>,
     cm: cm::CmState,
-    cq_credits: CqCreditPool,
-    #[cfg(any(test, feature = "test-hooks"))]
-    rejected_cqes: AtomicU64,
-    #[cfg(any(test, feature = "test-hooks"))]
-    rejected_cqe_reasons: Mutex<Vec<operation::CqeReject>>,
     #[cfg(any(test, feature = "test-hooks"))]
     rejected_cm_events: AtomicU64,
-    accepted_operations: AtomicUsize,
-    pending_reclamations: AtomicUsize,
-    quarantined_operations: AtomicUsize,
-    quarantined_mrs: AtomicUsize,
-    quarantined_bytes: AtomicUsize,
-    published_completion_connections: Mutex<VecDeque<registry::ConnectionToken>>,
     deadline_requests: Mutex<VecDeque<DeadlineRequest>>,
     admission: RwLock<()>,
     lifecycle: AtomicU8,
@@ -473,6 +466,14 @@ struct QuarantineState {
     connection_entries: HashMap<registry::ConnectionToken, usize>,
 }
 
+impl Deref for EngineShared {
+    type Target = IoCore;
+
+    fn deref(&self) -> &Self::Target {
+        &self.io_core
+    }
+}
+
 impl EngineShared {
     fn new(
         config: EngineConfig,
@@ -480,8 +481,7 @@ impl EngineShared {
         resource_refs: Option<EngineResourceRefs>,
     ) -> Result<Self> {
         let connections = ConnectionRegistry::new(config.max_live_connections)?;
-        let operations = OperationRegistry::new(config.max_inflight_operations)?;
-        let cq_credits = CqCreditPool::new(config.cq_capacity);
+        let io_core = IoCore::new(config.max_inflight_operations, config.cq_capacity)?;
         let connection_admission = ConnectionAdmissionPool::new(config.max_live_connections);
         let cm = cm::CmState::new(config.max_live_connections)?;
         Ok(Self {
@@ -489,21 +489,10 @@ impl EngineShared {
             provider,
             connection_admission,
             connections,
-            operations,
+            io_core,
             cm,
-            cq_credits,
-            #[cfg(any(test, feature = "test-hooks"))]
-            rejected_cqes: AtomicU64::new(0),
-            #[cfg(any(test, feature = "test-hooks"))]
-            rejected_cqe_reasons: Mutex::new(Vec::new()),
             #[cfg(any(test, feature = "test-hooks"))]
             rejected_cm_events: AtomicU64::new(0),
-            accepted_operations: AtomicUsize::new(0),
-            pending_reclamations: AtomicUsize::new(0),
-            quarantined_operations: AtomicUsize::new(0),
-            quarantined_mrs: AtomicUsize::new(0),
-            quarantined_bytes: AtomicUsize::new(0),
-            published_completion_connections: Mutex::new(VecDeque::new()),
             deadline_requests: Mutex::new(VecDeque::new()),
             admission: RwLock::new(()),
             lifecycle: AtomicU8::new(lifecycle_to_u8(RdmaEngineLifecycle::Created)),
@@ -538,6 +527,7 @@ impl EngineShared {
                 self.config.shutdown_deadline,
             );
         }
+
         self.work_signal.publish(driver::TERMINAL_WORK);
     }
 

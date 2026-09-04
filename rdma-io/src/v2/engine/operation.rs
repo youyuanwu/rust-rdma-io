@@ -340,8 +340,8 @@ fn post_io_batch(
         PreparedBatchOwnership::new(reserved).expect("non-empty detached batch ownership");
     let mut requests = requests;
     let outcome = match match &mut requests {
-        InternalPreparedBatch::Recv(batch) => connection.poster.post_recv(batch),
-        InternalPreparedBatch::Send(batch) => connection.poster.post_send(batch),
+        InternalPreparedBatch::Recv(batch) => connection.io.post_recv(batch),
+        InternalPreparedBatch::Send(batch) => connection.io.post_send(batch),
     } {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -1463,7 +1463,7 @@ impl ValidatedOperation {
                 let mut batch =
                     PreparedRecvBatch::new(vec![RecvWr::new(token.encode()).sg(self.sge)])
                         .map_err(Error::from_v1)?;
-                connection.poster.post_recv(&mut batch)
+                connection.io.post_recv(&mut batch)
             }
             OperationKind::Send | OperationKind::Write | OperationKind::Read => {
                 let opcode = match self.kind {
@@ -1483,7 +1483,7 @@ impl ValidatedOperation {
                     wr = wr.rdma(remote.addr, remote.rkey);
                 }
                 let mut batch = PreparedSendBatch::new(vec![wr]).map_err(Error::from_v1)?;
-                connection.poster.post_send(&mut batch)
+                connection.io.post_send(&mut batch)
             }
         }
     }
@@ -1533,10 +1533,17 @@ impl EngineShared {
             self.reject_cqe(CqeReject::WrongQpNum);
             return None;
         }
-        if self.connections.lookup_qp(completion.qp_num()) != Some(operation.connection.token) {
-            self.reject_cqe(CqeReject::WrongConnection);
-            return None;
-        }
+        let live = match self
+            .connections
+            .prove_live_io(operation.connection.token, completion.qp_num())
+        {
+            Some(proof) => proof,
+            None => {
+                self.reject_cqe(CqeReject::WrongConnection);
+                return None;
+            }
+        };
+        debug_assert!(live.proves(operation.connection.token, completion.qp_num()));
         if completion.is_success() && completion.opcode() != operation.expected_opcode {
             self.reject_cqe(CqeReject::UnexpectedOpcode);
             return None;
@@ -1651,7 +1658,7 @@ impl EngineShared {
         connection: &ConnectionState,
         token: OperationToken,
     ) -> bool {
-        if !proof.proves(connection) {
+        if !proof.proves_identity(connection.token, connection.qp_num()) {
             tracing::warn!(
                 connection = connection.token.encode(),
                 operation = token.encode(),
