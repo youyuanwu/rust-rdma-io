@@ -1839,10 +1839,12 @@ mod tests {
         let retained = registry
             .release(token, 1)
             .expect("the exact live generation remains registered");
+        registry.set_qp_mapping_for_test(1, token);
         assert!(
             registry.prove_live_io(token, 1).is_none(),
-            "a released generation cannot mint a live I/O proof"
+            "a released generation cannot mint a live I/O proof even when its QP mapping remains"
         );
+        assert!(registry.detach_qp_index(token, 1));
 
         let replacement = registry.register(1, |replacement| {
             Arc::new(ConnectionState::new(
