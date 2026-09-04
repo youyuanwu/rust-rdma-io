@@ -1894,11 +1894,11 @@ impl IoCore {
     }
 
     fn dispatch_connection_completion(&self, completion: WorkCompletion) -> IoCoreEffects {
-        let effects = {
-            let _admission = self.admission();
-            self.dispatch_queued_completion(completion)
-        };
-        effects
+        // CQ routing and terminal publication share the admission barrier.
+        // The guard covers one completion and drops before the caller applies
+        // session effects or publishes events and operation wakes.
+        let _admission = self.admission();
+        self.dispatch_queued_completion(completion)
     }
 
     fn dispatch_queued_completions(
