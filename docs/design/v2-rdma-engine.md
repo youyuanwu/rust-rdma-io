@@ -132,9 +132,11 @@ Message setup allocates and posts every configured receive before
 
 HELLO reuses a control receive; there is no additional receive.
 
-## ADR: Crate-Private I/O Boundary
+## ADR: Crate-Private I/O and `IoCore` Boundaries
 
-**Status:** accepted for the first issue #43 extraction milestone.
+**Status:** accepted. The protocol/I/O seam and the low-level `IoCore`
+extraction are implemented; the later CM/session extraction remains open under
+issue #43.
 
 The destination architecture has three ownership layers:
 
@@ -146,10 +148,35 @@ The destination architecture has three ownership layers:
 3. **Protocol:** HELLO, DATA, CREDIT, pools, receive reposting, message
    fairness, and frontend outcomes.
 
-This milestone establishes the dependency boundary between protocol policy and
-low-level I/O. It does not yet move the I/O core or CM/session state machines
-into final standalone module hierarchies. The existing engine driver still
-composes CQ, CM, reclamation, retirement, and shutdown progress.
+The first milestone established the dependency boundary between protocol
+policy and low-level I/O. The next milestone physically moved the operation
+runtime into `engine/io_core`: operation generations and registry entries,
+global CQ and connection-local SEND/RECV admission, accepted-operation
+ledgers, posting reconciliation, copied and early completions, exact
+completion dispatch, cancellation, reclamation deadlines, and
+operation-quarantine resources now have one owner.
+
+`EngineShared` composes that core. It retains engine-wide admission policy, the
+live connection/QP registry used to prove CQE routing, CM state, combined
+connection-admission quarantine accounting, connection retirement, root
+resources, and shutdown. CM routes, listeners, establishment state machines,
+QP creation, and the owning QP/CmId bundle have not moved into a standalone
+session hierarchy.
+
+An established I/O capability carries immutable connection/QP identity, local
+posting limits, operation ledgers, and a posting-only authority. The authority
+uses a weak reference to the session-owned QP resource, so the core cannot keep
+the QP/CmId bundle alive or invoke QP ERR, destruction, disconnect, route
+retirement, or CmId extraction. `ConnectionState` remains the sole strong
+owner and mints QP-destruction proof only after synchronous destruction
+succeeds.
+
+For a copied CQE, the core first resolves the exact operation generation. The
+engine then proves that the session registry still contains the operation's
+connection generation and exact `qp_num`; the core consumes that unforgeable
+live-identity proof before checking opcode and duplicate state. CQ polling,
+proof creation/consumption, and connection retirement remain serial services
+of the one explicit engine driver.
 
 The protocol receives one opaque connection capability before provider
 establishment. It uses that capability to register message memory, prepost
@@ -175,11 +202,13 @@ the operation ledger, so no suffix MR is returned as unaccepted.
 
 One connection-scoped event port carries owned completion and terminal events.
 Operation state stores only the opaque context and event destination—never a
-protocol closure. Producers finish admission, posting, registry, accepted-set,
-and lifecycle mutations before enqueueing an event or waking the protocol
-driver. The port releases its queue mutex before wakeup. The message driver
-pops both local protocol work and I/O events before processing them, alternates
-the two sources, and uses check-register-recheck suspension for both wakers.
+protocol closure. Core mutations return owned effects for event delivery,
+operation wakes, accepted-zero transitions, and operation-quarantine
+transitions. `EngineShared` applies the session-owned effects only after core
+and admission guards are released, then publishes events and wakes. The port
+releases its queue mutex before wakeup. The message driver pops both local
+protocol work and I/O events before processing them, alternates the two
+sources, and uses check-register-recheck suspension for both wakers.
 
 Unresolved accepted operations may be reclaimed only with an engine-private
 QP-destruction proof. The proof has no public or protocol-visible constructor;
@@ -189,28 +218,37 @@ proof for operation reclamation. Zero-debt CM retirement and bounded driver
 drop establish and discard the same proof without moving CM ownership.
 
 Operation quarantine retains one operation's MR, registration, accepted-set
-membership, and CQ debt. Connection quarantine retains the complete QP, CmId,
-route, generation, admission, and unresolved operation bundle when no positive
-release boundary can be proven. Protocol failure can request close, but it
-cannot release or quarantine provider-visible ownership itself.
+membership, and CQ debt inside `IoCore`. The engine keeps a combined
+per-connection index of operation and connection quarantine keys because that
+index controls the session-owned connection admission reservation. The first
+key retains admission and only the last clear recovers it. Connection
+quarantine retains the complete QP, CmId, route, generation, admission, and
+unresolved operation bundle when no positive release boundary can be proven.
+Protocol failure can request close, but it cannot release or quarantine
+provider-visible ownership itself.
 
-The crate-private boundary is deliberately concrete and unstable. It is not
-re-exported from `rdma_io::v2`. Structural tests reject protocol references to
-engine shared/connection state, registries, callback-era types, reconstruction
-helpers, and detached-post methods; they also reject dependencies from the
-boundary module to CM, listener, or message-policy modules.
+The crate-private boundaries are deliberately concrete and unstable. They are
+not re-exported from `rdma_io::v2`. Structural tests reject protocol references
+to engine shared/connection state, registries, callback-era types,
+reconstruction helpers, and detached-post methods. An AST-level dependency
+guard also rejects production `IoCore` references to `EngineShared`,
+`ConnectionState`, the session resource owner, CM/listener state, or message
+policy while allowing only the narrow identity, proof, event, and posting
+interfaces.
 
 ## Completion-to-Message Handoff
 
-The engine remains the only component allowed to validate and consume CQEs.
-A completion must match the current operation generation, connection
-generation, owning connection, provider-reported `qp_num`, and expected opcode
-where the status is successful.
+The engine driver remains the only hardware-CQ poller; `IoCore` is the only
+component allowed to validate and consume operation CQEs. A completion must
+match the current operation generation, session-proven connection generation,
+owning connection, provider-reported `qp_num`, and expected opcode where the
+status is successful.
 
-After validation, the engine removes operation ownership and creates an owned
+After validation, the core removes operation ownership and creates an owned
 completion event containing the opaque request context, completion result, and
-releasable MR. Registry and admission guards are released before the event is
-enqueued on the connection's I/O port and before the message driver is woken.
+releasable MR. Registry, admission, posting, and operation-ledger guards are
+released before the event is enqueued on the connection's I/O port and before
+the message driver is woken.
 
 The driver then parses the frame or advances the corresponding send/repost
 state. Neither the frontend nor the engine directly mutates driver-owned
