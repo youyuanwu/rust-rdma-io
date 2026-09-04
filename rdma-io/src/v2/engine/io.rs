@@ -10,7 +10,7 @@ use futures_util::task::AtomicWaker;
 
 use super::EngineShared;
 use super::connection::ConnectionState;
-use super::operation;
+use super::io_core;
 use super::registry::{OperationToken, lock_unpoison};
 use crate::v2::error::{Error, Result};
 use crate::v2::mr::{AccessIntent, Mr};
@@ -49,15 +49,30 @@ impl IoConnection {
     }
 
     pub(crate) fn post_recv_batch(&self, requests: Vec<IoRecvRequest>) -> IoSubmissionDisposition {
-        operation::post_io_recv_batch(&self.shared, &self.connection, &self.events, requests)
+        io_core::post_io_recv_batch(
+            &self.shared.io_core,
+            &self.connection.io,
+            &self.events,
+            requests,
+        )
     }
 
     pub(crate) fn post_recv(&self, request: IoRecvRequest) -> IoSubmissionDisposition {
-        operation::post_io_recv_batch(&self.shared, &self.connection, &self.events, vec![request])
+        io_core::post_io_recv_batch(
+            &self.shared.io_core,
+            &self.connection.io,
+            &self.events,
+            vec![request],
+        )
     }
 
     pub(crate) fn post_send(&self, request: IoSendRequest) -> IoSubmissionDisposition {
-        operation::post_io_send(&self.shared, &self.connection, &self.events, request)
+        io_core::post_io_send(
+            &self.shared.io_core,
+            &self.connection.io,
+            &self.events,
+            request,
+        )
     }
 
     pub(crate) fn request_close(&self) {

@@ -17,7 +17,7 @@ impl EngineShared {
         let admission = read_unpoison(&self.admission);
         let lifecycle = connection.lock_lifecycle();
         let first = connection.begin_close();
-        let mut operations_to_wake = Vec::new();
+        let mut close_effects = None;
         if first {
             match connection.transition_to_error_once() {
                 Ok(_) => {}
@@ -38,19 +38,17 @@ impl EngineShared {
             let engine_is_terminating = self.shutdown_requested.load(Ordering::Acquire);
             if !engine_is_terminating {
                 let error = connection.operation_close_error();
-                for token in connection.accepted_tokens() {
-                    if let Lookup::Occupied(operation) = self.operations.lookup(token)
-                        && operation.fail_observer_for_close(error.clone())
-                    {
-                        operations_to_wake.push(operation);
-                    }
-                }
+                let report = connection.io_drain_report();
+                close_effects = Some(
+                    self.io_core
+                        .fail_observers_for_close(&report.accepted_tokens, error),
+                );
             }
         }
         drop(lifecycle);
         drop(admission);
-        for operation in operations_to_wake {
-            operation.wake();
+        if let Some(effects) = close_effects {
+            effects.publish();
         }
         if first {
             self.schedule_connection_drain(connection.token);
@@ -99,7 +97,7 @@ impl EngineShared {
         };
         // CQEs already copied out of the hardware CQ must take the ordinary
         // quantum-bounded ready path before a destructive fallback can run.
-        if connection.has_completion_work() {
+        if connection.has_copied_completions() {
             self.publish_completion(&connection);
             self.schedule_deadline(
                 DeadlineKind::ConnectionDrain,
@@ -111,7 +109,7 @@ impl EngineShared {
         let forced_tokens = {
             let _admission = read_unpoison(&self.admission);
             let lifecycle = connection.lock_lifecycle();
-            let tokens = connection.accepted_tokens();
+            let tokens = connection.io_drain_report().accepted_tokens;
             if tokens.is_empty() {
                 None
             } else {
@@ -142,12 +140,14 @@ impl EngineShared {
                 return;
             }
         }
-        if let Some((outstanding, _cq_debt)) = connection.begin_quarantine() {
+        if let Some(report) = connection.begin_quarantine() {
             self.track_connection_quarantine(connection.token);
             for operation in connection.accepted_tokens() {
                 self.quarantine_operation(operation);
             }
-            if let Some(event) = connection.publish_quarantine(outstanding) {
+            if let Some(event) =
+                connection.publish_quarantine(report.outstanding_operations, report.cq_debt)
+            {
                 event.deliver();
             }
         }
@@ -188,7 +188,7 @@ mod tests {
     use std::time::Duration;
 
     use super::super::connection::{WorkRequestPoster, install_connection};
-    use super::super::operation::install_accepted_operation_for_driver_test;
+    use super::super::io_core::install_accepted_operation_for_driver_test;
     use super::super::registry::OperationToken;
     use super::super::{CompletionMode, RdmaConnectionConfig, test_engine_pair};
     use crate::v2::error::{Error, Result};

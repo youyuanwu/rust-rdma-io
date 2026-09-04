@@ -120,6 +120,7 @@ impl RdmaEngineDriver {
             cq_buffer: vec![Completion::default(); cq_budget].into_boxed_slice(),
             deadline_sleep: None,
             deadline_at: None,
+            deadline_io_turn: true,
             runtime_checked: false,
         }
     }
@@ -178,12 +179,7 @@ impl RdmaEngineDriver {
             return Ok(false);
         }
 
-        if self
-            .shared
-            .accepted_operations
-            .load(std::sync::atomic::Ordering::Acquire)
-            != 0
-        {
+        if self.shared.io_core.accepted_count() != 0 {
             return Ok(false);
         }
 
@@ -193,11 +189,7 @@ impl RdmaEngineDriver {
                 if !self.shared.cm.try_process_event(&self.shared, resources)? {
                     if self.shared.cm.pending_route_count() != 0
                         || self.shared.connections.live() != 0
-                        || self
-                            .shared
-                            .accepted_operations
-                            .load(std::sync::atomic::Ordering::Acquire)
-                            != 0
+                        || self.shared.io_core.accepted_count() != 0
                     {
                         self.scheduler.mark_class_ready(WorkClass::Cm);
                         return Ok(false);
@@ -342,7 +334,38 @@ impl RdmaEngineDriver {
 
     fn service_reclamation(&mut self) -> Result<bool> {
         let budget = self.shared.config.reclamation_budget;
-        let requests = self.shared.take_deadline_requests(budget);
+        let first_quota = budget.div_ceil(2);
+        let second_quota = budget / 2;
+        let mut requests = if self.deadline_io_turn {
+            self.shared.io_core.take_reclamation_requests(first_quota)
+        } else {
+            self.shared.take_deadline_requests(first_quota)
+        };
+        let second = if self.deadline_io_turn {
+            self.shared.take_deadline_requests(second_quota)
+        } else {
+            self.shared.io_core.take_reclamation_requests(second_quota)
+        };
+        requests.extend(second);
+        if requests.len() < budget {
+            let remaining = budget - requests.len();
+            let refill = if self.deadline_io_turn {
+                self.shared.io_core.take_reclamation_requests(remaining)
+            } else {
+                self.shared.take_deadline_requests(remaining)
+            };
+            requests.extend(refill);
+        }
+        if requests.len() < budget {
+            let remaining = budget - requests.len();
+            let refill = if self.deadline_io_turn {
+                self.shared.take_deadline_requests(remaining)
+            } else {
+                self.shared.io_core.take_reclamation_requests(remaining)
+            };
+            requests.extend(refill);
+        }
+        self.deadline_io_turn = !self.deadline_io_turn;
         for request in requests.iter().copied() {
             if !self
                 .scheduler
@@ -361,6 +384,7 @@ impl RdmaEngineDriver {
             self.process_deadline(deadline)?;
         }
         if self.shared.has_deadline_requests()
+            || self.shared.io_core.has_reclamation_requests()
             || self
                 .scheduler
                 .deadlines()
@@ -560,10 +584,7 @@ impl Drop for RdmaEngineDriver {
         if self.shared.outcome().is_none() {
             self.shared.mark_shutdown_requested();
             self.shared.synchronously_prepare_driver_drop();
-            let outstanding = self
-                .shared
-                .accepted_operations
-                .load(std::sync::atomic::Ordering::Acquire);
+            let outstanding = self.shared.io_core.accepted_count();
             let cm_owners = self
                 .shared
                 .cm
@@ -613,7 +634,7 @@ pub(super) mod test_api {
     use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
 
     use super::{COMPLETION_DISPATCH_WORK, EngineShared, Error, Result, TERMINAL_WORK};
-    use crate::v2::engine::operation::CqeReject;
+    use crate::v2::engine::io_core::CqeReject;
     use crate::v2::engine::registry::{Lookup, OperationToken};
 
     /// Test-only connection identity used by the Phase 2 routing gate.
@@ -914,9 +935,8 @@ pub(super) mod test_api {
         pub fn cqe_rejections(&self) -> Result<Vec<TestCqeRejection>> {
             let shared = self.ensure_active()?;
             Ok(shared
-                .rejected_cqe_reasons
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .io_core
+                .rejected_cqe_reasons()
                 .iter()
                 .copied()
                 .map(TestCqeRejection::from)
@@ -1666,7 +1686,7 @@ pub(super) mod test_api {
             TestEngineInstrumentation {
                 cm_pending_routes: shared.cm.pending_route_count(),
                 cm_retained_owners: shared.cm.retained_owner_count(),
-                cqes_rejected: shared.rejected_cqes.load(Ordering::Acquire),
+                cqes_rejected: shared.io_core.rejected_cqe_count(),
                 cm_events_rejected: shared.rejected_cm_events.load(Ordering::Acquire),
             }
         }
@@ -2365,10 +2385,10 @@ mod tests {
 
     use super::*;
     use crate::v2::engine::connection::{WorkRequestPoster, install_connection};
-    use crate::v2::engine::listener::ListenerState;
-    use crate::v2::engine::operation::{
+    use crate::v2::engine::io_core::{
         completion_for_driver_test, install_accepted_operation_for_driver_test,
     };
+    use crate::v2::engine::listener::ListenerState;
     use crate::v2::engine::{
         RdmaConnectionConfig, RdmaEngineLifecycle, RdmaEngineTerminalError, RdmaListener,
         test_engine_pair,

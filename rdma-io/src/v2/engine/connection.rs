@@ -1,26 +1,29 @@
 //! Engine-owned low-level connection frontend.
 
-use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::ops::Deref;
+use std::sync::RwLockReadGuard;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
 use tokio::sync::Notify;
 
 use self::qp::QpCapabilitiesExt;
 use super::io::{IoEventSender, IoTerminalEvent, PendingIoEvent};
-use super::lifecycle::MemoizedTerminalResult;
-use super::operation::RdmaOperation;
-use super::registry::{
-    ConnectionToken, OperationToken, lock_unpoison, read_unpoison, write_unpoison,
+#[cfg(test)]
+use super::io_core::Direction;
+use super::io_core::RdmaOperation;
+use super::io_core::{
+    EstablishedIoConnection, EstablishedIoIdentity, IoDrainReport, IoPostAuthority,
+    IoQuarantineReport, OperationKind,
 };
+use super::lifecycle::MemoizedTerminalResult;
+use super::registry::{ConnectionToken, OperationToken, lock_unpoison, read_unpoison};
 use super::{EngineShared, RdmaConnectionConfig};
 use crate::cm::{CmId, ConnParam, EventChannel};
 use crate::v2::error::{Error, Result};
 use crate::v2::mr::{AccessIntent, Mr, RemoteMr};
 use crate::v2::qp::{BatchPostOutcome, Qp, QpCapabilities};
-use crate::wc::WorkCompletion;
 use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
 
 /// Non-owning connection identity suitable for diagnostics and correlation.
@@ -73,8 +76,8 @@ pub(super) struct QpDestructionProof {
 }
 
 impl QpDestructionProof {
-    pub(super) fn proves(&self, connection: &ConnectionState) -> bool {
-        self.connection == connection.token && self.qp_num == connection.qp_num
+    pub(super) fn proves_identity(&self, connection: ConnectionToken, qp_num: u32) -> bool {
+        self.connection == connection && self.qp_num == qp_num
     }
 }
 
@@ -113,8 +116,8 @@ impl RdmaConnection {
     /// future returns `(Result<Completion>, Option<Mr>)`.
     pub fn send(&self, mr: Mr, range: Option<(usize, usize)>) -> RdmaOperation {
         RdmaOperation::new(
-            Arc::clone(&self.shared),
-            Arc::clone(&self.state),
+            Arc::clone(&self.shared.io_core),
+            Arc::clone(&self.state.io),
             OperationKind::Send,
             mr,
             None,
@@ -125,8 +128,8 @@ impl RdmaConnection {
     /// Create a two-sided RECV operation submitted on first poll.
     pub fn recv(&self, mr: Mr, range: Option<(usize, usize)>) -> RdmaOperation {
         RdmaOperation::new(
-            Arc::clone(&self.shared),
-            Arc::clone(&self.state),
+            Arc::clone(&self.shared.io_core),
+            Arc::clone(&self.state.io),
             OperationKind::Recv,
             mr,
             None,
@@ -137,8 +140,8 @@ impl RdmaConnection {
     /// Create an RDMA WRITE operation submitted on first poll.
     pub fn write(&self, mr: Mr, remote: RemoteMr, range: Option<(usize, usize)>) -> RdmaOperation {
         RdmaOperation::new(
-            Arc::clone(&self.shared),
-            Arc::clone(&self.state),
+            Arc::clone(&self.shared.io_core),
+            Arc::clone(&self.state.io),
             OperationKind::Write,
             mr,
             Some(remote),
@@ -149,8 +152,8 @@ impl RdmaConnection {
     /// Create an RDMA READ operation submitted on first poll.
     pub fn read(&self, mr: Mr, remote: RemoteMr, range: Option<(usize, usize)>) -> RdmaOperation {
         RdmaOperation::new(
-            Arc::clone(&self.shared),
-            Arc::clone(&self.state),
+            Arc::clone(&self.shared.io_core),
+            Arc::clone(&self.state.io),
             OperationKind::Read,
             mr,
             Some(remote),
@@ -233,25 +236,16 @@ impl Drop for RdmaConnection {
 pub(super) struct ConnectionState {
     pub(super) token: ConnectionToken,
     qp_num: u32,
-    config: RdmaConnectionConfig,
     pub(super) poster: Arc<dyn WorkRequestPoster>,
+    pub(super) io: Arc<EstablishedIoConnection>,
     local_addr: Option<SocketAddr>,
     peer_addr: Option<SocketAddr>,
-    posting_open: AtomicBool,
     // Nested lifecycle synchronization always follows:
     // EngineShared::admission -> lifecycle_gate -> posting_gate.
-    // io_events is held only long enough to clone/install its sender and is
-    // never held while enqueuing or waking a protocol consumer.
-    posting_gate: RwLock<()>,
     lifecycle_gate: Mutex<()>,
-    local_credits: Mutex<LocalCredits>,
-    accepted: Mutex<HashSet<AcceptedWrIdentity>>,
-    completions: Mutex<VecDeque<WorkCompletion>>,
-    io_events: Mutex<Option<IoEventSender>>,
-    completion_published: AtomicBool,
     close_started: AtomicBool,
     close_outcome: Mutex<Option<MemoizedTerminalResult>>,
-    pub(super) close_notify: Notify,
+    pub(super) close_notify: Arc<Notify>,
     quarantined: AtomicBool,
     error_transition_started: AtomicBool,
     error_transition_complete: AtomicBool,
@@ -281,24 +275,31 @@ impl ConnectionState {
         if let Some(reservation) = admission.as_mut() {
             reservation.mark_registered();
         }
+        let qp_num = poster.qp_num();
+        let close_notify = Arc::new(Notify::new());
+        let io_poster: Arc<dyn IoPostAuthority> =
+            Arc::new(SessionIoPostAuthority::new(&poster, qp_num));
+        let io = EstablishedIoConnection::new(
+            EstablishedIoIdentity {
+                connection: token,
+                qp_num,
+            },
+            io_poster,
+            config.max_send_wr,
+            config.max_recv_wr,
+            Arc::clone(&close_notify),
+        );
         Self {
             token,
-            qp_num: poster.qp_num(),
-            config,
+            qp_num,
             poster,
+            io,
             local_addr,
             peer_addr,
-            posting_open: AtomicBool::new(true),
-            posting_gate: RwLock::new(()),
             lifecycle_gate: Mutex::new(()),
-            local_credits: Mutex::new(LocalCredits::default()),
-            accepted: Mutex::new(HashSet::new()),
-            completions: Mutex::new(VecDeque::new()),
-            io_events: Mutex::new(None),
-            completion_published: AtomicBool::new(false),
             close_started: AtomicBool::new(false),
             close_outcome: Mutex::new(None),
-            close_notify: Notify::new(),
+            close_notify,
             quarantined: AtomicBool::new(false),
             error_transition_started: AtomicBool::new(false),
             error_transition_complete: AtomicBool::new(false),
@@ -317,10 +318,13 @@ impl ConnectionState {
     }
 
     pub(super) fn identity(&self) -> RdmaConnectionIdentity {
+        let io = self.io.identity();
+        debug_assert_eq!(io.connection, self.token);
+        debug_assert_eq!(io.qp_num, self.qp_num);
         RdmaConnectionIdentity {
-            slot: self.token.slot,
-            generation: self.token.generation,
-            qp_num: self.qp_num,
+            slot: io.connection.slot,
+            generation: io.connection.generation,
+            qp_num: io.qp_num,
         }
     }
 
@@ -328,96 +332,48 @@ impl ConnectionState {
         self.qp_num
     }
 
+    #[cfg(test)]
     pub(super) fn reserve_local(&self, direction: Direction) -> Result<()> {
-        if !self.posting_open.load(Ordering::Acquire) {
-            return Err(Error::TransportClosed);
-        }
-        let mut credits = lock_unpoison(&self.local_credits);
-        let (used, maximum) = match direction {
-            Direction::Send => (&mut credits.send, self.config.max_send_wr),
-            Direction::Recv => (&mut credits.recv, self.config.max_recv_wr),
-        };
-        if *used >= maximum {
-            return Err(Error::CapacityExhausted);
-        }
-        *used += 1;
-        Ok(())
+        self.io.reserve_local(direction)
     }
 
+    #[cfg(test)]
     pub(super) fn begin_posting(&self) -> Result<RwLockReadGuard<'_, ()>> {
-        let guard = read_unpoison(&self.posting_gate);
-        if !self.posting_open.load(Ordering::Acquire) {
-            return Err(Error::TransportClosed);
-        }
-        Ok(guard)
+        self.io.begin_posting()
     }
 
+    #[cfg(test)]
     pub(super) fn release_local(&self, direction: Direction) {
-        let mut credits = lock_unpoison(&self.local_credits);
-        let used = match direction {
-            Direction::Send => &mut credits.send,
-            Direction::Recv => &mut credits.recv,
-        };
-        *used = used.saturating_sub(1);
+        self.io.release_local(direction);
     }
 
+    #[cfg(test)]
     pub(super) fn add_accepted(&self, token: OperationToken) {
-        lock_unpoison(&self.accepted).insert(AcceptedWrIdentity {
-            connection: self.token,
-            qp_num: self.qp_num,
-            operation: token,
-        });
+        self.io.add_accepted(token);
     }
 
+    #[cfg(test)]
     pub(super) fn remove_accepted(&self, token: OperationToken) -> bool {
-        let removed = lock_unpoison(&self.accepted).remove(&AcceptedWrIdentity {
-            connection: self.token,
-            qp_num: self.qp_num,
-            operation: token,
-        });
-        if removed {
-            self.close_notify.notify_waiters();
-        }
-        removed
+        self.io.remove_accepted(token)
     }
 
     pub(super) fn accepted_tokens(&self) -> Vec<OperationToken> {
-        lock_unpoison(&self.accepted)
-            .iter()
-            .map(|identity| identity.operation)
-            .collect()
+        self.io.accepted_tokens()
     }
 
     pub(super) fn accepted_count(&self) -> usize {
-        lock_unpoison(&self.accepted).len()
+        self.io.accepted_count()
     }
 
-    pub(super) fn enqueue_completion(&self, completion: WorkCompletion) {
-        lock_unpoison(&self.completions).push_back(completion);
-    }
-
-    pub(super) fn pop_completion(&self) -> Option<WorkCompletion> {
-        lock_unpoison(&self.completions).pop_front()
-    }
-
-    pub(super) fn has_completion_work(&self) -> bool {
-        !lock_unpoison(&self.completions).is_empty()
+    pub(super) fn has_copied_completions(&self) -> bool {
+        self.io.has_completion_work()
     }
 
     pub(super) fn install_io_event_sender(
         &self,
         sender: IoEventSender,
     ) -> Result<Option<PendingIoEvent>> {
-        let mut current = lock_unpoison(&self.io_events);
-        if current.is_some() {
-            return Err(Error::InvalidConfig(
-                "connection already has an attached I/O event port".into(),
-            ));
-        }
-        *current = Some(sender);
-        let already_terminal = !self.posting_open.load(Ordering::Acquire);
-        drop(current);
-        if !already_terminal {
+        if !self.io.install_io_event_sender(sender)? {
             return Ok(None);
         }
         let error = self.operation_close_error();
@@ -431,21 +387,15 @@ impl ConnectionState {
     }
 
     fn pending_io_event(&self, event: IoTerminalEvent) -> Option<PendingIoEvent> {
-        let sender = lock_unpoison(&self.io_events).clone();
-        sender.map(|sender| sender.terminal(event))
-    }
-
-    pub(super) fn mark_completion_published(&self) -> bool {
-        !self.completion_published.swap(true, Ordering::AcqRel)
-    }
-
-    pub(super) fn clear_completion_published(&self) {
-        self.completion_published.store(false, Ordering::Release);
+        self.io.pending_io_event(event)
     }
 
     pub(super) fn stop_posting(&self) {
-        let _posting = write_unpoison(&self.posting_gate);
-        self.posting_open.store(false, Ordering::Release);
+        self.io.close_posting();
+    }
+
+    pub(super) fn io_drain_report(&self) -> IoDrainReport {
+        self.io.drain_report()
     }
 
     pub(super) fn lock_lifecycle(&self) -> MutexGuard<'_, ()> {
@@ -565,22 +515,18 @@ impl ConnectionState {
         self.close_notify.notify_waiters();
     }
 
-    pub(super) fn begin_quarantine(&self) -> Option<(usize, usize)> {
-        let accepted = lock_unpoison(&self.accepted);
-        let outstanding = accepted.len();
-        if outstanding == 0 {
-            return None;
-        }
-        if self.quarantined.swap(true, Ordering::AcqRel) {
-            return None;
-        }
-        Some((outstanding, outstanding))
+    pub(super) fn begin_quarantine(&self) -> Option<IoQuarantineReport> {
+        self.io.begin_connection_quarantine(&self.quarantined)
     }
 
-    pub(super) fn publish_quarantine(&self, outstanding: usize) -> Option<PendingIoEvent> {
+    pub(super) fn publish_quarantine(
+        &self,
+        outstanding_operations: usize,
+        cq_debt: usize,
+    ) -> Option<PendingIoEvent> {
         let error = Error::ConnectionQuarantined {
-            outstanding_operations: outstanding,
-            cq_debt: outstanding,
+            outstanding_operations,
+            cq_debt,
         };
         let mut outcome = lock_unpoison(&self.close_outcome);
         if outcome.is_none() {
@@ -768,13 +714,6 @@ impl ConnectionState {
             "setup rollback retains at most one test MR"
         );
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(super) struct AcceptedWrIdentity {
-    pub(super) connection: ConnectionToken,
-    pub(super) qp_num: u32,
-    pub(super) operation: OperationToken,
 }
 
 pub(super) struct ConnectionAdmissionPool {
@@ -1108,39 +1047,10 @@ impl ConnectionReservation {
     }
 }
 
-#[derive(Default)]
-struct LocalCredits {
-    send: usize,
-    recv: usize,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Direction {
-    Send,
-    Recv,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum OperationKind {
-    Send,
-    Recv,
-    Write,
-    Read,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ConnectionCmRoute {
     Outbound(u64),
     Inbound(u64),
-}
-
-impl OperationKind {
-    pub(super) const fn direction(self) -> Direction {
-        match self {
-            Self::Recv => Direction::Recv,
-            Self::Send | Self::Write | Self::Read => Direction::Send,
-        }
-    }
 }
 
 pub(crate) trait WorkRequestPoster: Send + Sync {
@@ -1162,6 +1072,7 @@ pub(crate) trait WorkRequestPoster: Send + Sync {
             },
         ))
     }
+
     #[cfg(any(test, feature = "test-hooks"))]
     fn disconnect(&self) -> Result<()>;
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1173,6 +1084,38 @@ pub(crate) trait WorkRequestPoster: Send + Sync {
     #[cfg(any(test, feature = "test-hooks"))]
     fn uses_resources(&self, _pd: &crate::v2::Pd, _cq: &crate::v2::Cq) -> bool {
         false
+    }
+}
+
+struct SessionIoPostAuthority {
+    owner: Weak<dyn WorkRequestPoster>,
+    qp_num: u32,
+}
+
+impl SessionIoPostAuthority {
+    fn new(owner: &Arc<dyn WorkRequestPoster>, qp_num: u32) -> Self {
+        Self {
+            owner: Arc::downgrade(owner),
+            qp_num,
+        }
+    }
+
+    fn owner(&self) -> Result<Arc<dyn WorkRequestPoster>> {
+        self.owner.upgrade().ok_or(Error::TransportClosed)
+    }
+}
+
+impl IoPostAuthority for SessionIoPostAuthority {
+    fn qp_num(&self) -> u32 {
+        self.qp_num
+    }
+
+    fn post_send(&self, batch: &mut PreparedSendBatch) -> Result<BatchPostOutcome> {
+        self.owner()?.post_send(batch)
+    }
+
+    fn post_recv(&self, batch: &mut PreparedRecvBatch) -> Result<BatchPostOutcome> {
+        self.owner()?.post_recv(batch)
     }
 }
 
@@ -1692,6 +1635,7 @@ mod qp {
 #[cfg(test)]
 mod tests {
     use super::super::io::{IoEvent, event_port};
+    use super::super::registry::ConnectionRegistry;
     use super::*;
     use crate::wr::{RecvWr, SendWr, WrOpcode};
 
@@ -1728,6 +1672,101 @@ mod tests {
     }
 
     #[test]
+    fn io_post_authority_is_posting_only_and_does_not_retain_the_owner() {
+        let owner: Arc<dyn WorkRequestPoster> = Arc::new(TestPoster);
+        assert_eq!(Arc::strong_count(&owner), 1);
+        let authority = SessionIoPostAuthority::new(&owner, owner.qp_num());
+        assert_eq!(authority.qp_num(), 1);
+        assert_eq!(
+            Arc::strong_count(&owner),
+            1,
+            "posting authority must retain only a weak owner reference"
+        );
+
+        drop(owner);
+        assert!(matches!(authority.owner(), Err(Error::TransportClosed)));
+    }
+
+    #[test]
+    fn live_io_and_qp_destruction_proofs_require_exact_identity() {
+        let registry = ConnectionRegistry::new(1).unwrap();
+        let registration = registry.register(1, |token| {
+            Arc::new(ConnectionState::new(
+                token,
+                Arc::new(TestPoster),
+                RdmaConnectionConfig::default(),
+                None,
+                None,
+                None,
+                None,
+            ))
+        });
+        let (token, connection) = match registration {
+            Ok(registered) => registered,
+            Err(failure) => panic!("connection registration failed: {}", failure.error),
+        };
+
+        let live = registry.prove_live_io(token, 1).expect("exact live proof");
+        assert!(live.proves(token, 1));
+        assert!(registry.prove_live_io(token, 2).is_none());
+        assert_eq!(
+            connection.io.identity(),
+            EstablishedIoIdentity {
+                connection: token,
+                qp_num: 1,
+            }
+        );
+
+        let wrong_generation = ConnectionToken {
+            slot: token.slot,
+            generation: token.generation + 1,
+        };
+        registry.set_qp_mapping_for_test(1, wrong_generation);
+        assert!(registry.prove_live_io(token, 1).is_none());
+
+        let destroyed = connection.mint_qp_destruction_proof_for_test();
+        assert!(destroyed.proves_identity(token, 1));
+        assert!(!destroyed.proves_identity(wrong_generation, 1));
+        assert!(!destroyed.proves_identity(token, 2));
+
+        registry.set_qp_mapping_for_test(1, token);
+        let retained = registry
+            .release(token, 1)
+            .expect("the exact live generation remains registered");
+        registry.set_qp_mapping_for_test(1, token);
+        assert!(
+            registry.prove_live_io(token, 1).is_none(),
+            "a released generation cannot mint a live I/O proof even when its QP mapping remains"
+        );
+        assert!(registry.detach_qp_index(token, 1));
+
+        let replacement = registry.register(1, |replacement| {
+            Arc::new(ConnectionState::new(
+                replacement,
+                Arc::new(TestPoster),
+                RdmaConnectionConfig::default(),
+                None,
+                None,
+                None,
+                None,
+            ))
+        });
+        let (replacement, _) = match replacement {
+            Ok(registered) => registered,
+            Err(failure) => panic!("replacement registration failed: {}", failure.error),
+        };
+        assert_eq!(replacement.slot, token.slot);
+        assert_ne!(replacement.generation, token.generation);
+        assert!(registry.prove_live_io(token, 1).is_none());
+        assert!(
+            registry
+                .prove_live_io(replacement, 1)
+                .is_some_and(|proof| proof.proves(replacement, 1))
+        );
+        drop(retained);
+    }
+
+    #[test]
     fn terminal_events_are_pending_until_the_connection_lock_is_released() {
         let connection = Arc::new(ConnectionState::new(
             ConnectionToken {
@@ -1757,7 +1796,7 @@ mod tests {
             let pending = pending.expect("attached event port");
             assert!(!receiver.has_events());
             assert!(
-                connection.io_events.try_lock().is_ok(),
+                connection.io.io_event_lock_available(),
                 "terminal event was prepared while the sender lock remained held"
             );
             pending.deliver();

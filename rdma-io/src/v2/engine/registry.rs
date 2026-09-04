@@ -17,6 +17,23 @@ pub(super) struct ConnectionToken {
     pub(super) generation: u32,
 }
 
+/// Proof that the session registry currently owns an exact connection/QP pair.
+///
+/// Only `ConnectionRegistry` can construct this value. The I/O core consumes
+/// it while validating a copied CQE; it carries no connection resources.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct LiveIoConnectionProof {
+    connection: ConnectionToken,
+    qp_num: u32,
+    _private: (),
+}
+
+impl LiveIoConnectionProof {
+    pub(super) fn proves(self, connection: ConnectionToken, qp_num: u32) -> bool {
+        self.connection == connection && self.qp_num == qp_num
+    }
+}
+
 impl ConnectionToken {
     pub(super) const fn completion_ready(self) -> super::scheduler::CompletionReadyConnection {
         super::scheduler::CompletionReadyConnection {
@@ -431,6 +448,23 @@ impl ConnectionRegistry {
 
     pub(super) fn lookup_qp(&self, qp_num: u32) -> Option<ConnectionToken> {
         lock_unpoison(&self.qp_index).get(&qp_num).copied()
+    }
+
+    pub(super) fn prove_live_io(
+        &self,
+        connection: ConnectionToken,
+        qp_num: u32,
+    ) -> Option<LiveIoConnectionProof> {
+        if !matches!(self.lookup(connection), Lookup::Occupied(_))
+            || self.lookup_qp(qp_num) != Some(connection)
+        {
+            return None;
+        }
+        Some(LiveIoConnectionProof {
+            connection,
+            qp_num,
+            _private: (),
+        })
     }
 
     pub(super) fn release(
