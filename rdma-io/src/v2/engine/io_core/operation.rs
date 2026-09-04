@@ -1465,12 +1465,7 @@ impl ValidatedOperation {
             .addr()
             .checked_add(offset as u64)
             .ok_or_else(|| Error::InvalidConfig("local SGE address overflow".into()))?;
-        let expected_opcode = match kind {
-            OperationKind::Send => WcOpcode::Send,
-            OperationKind::Recv => WcOpcode::Recv,
-            OperationKind::Write => WcOpcode::RdmaWrite,
-            OperationKind::Read => WcOpcode::RdmaRead,
-        };
+        let expected_opcode = kind.expected_completion_opcode();
         match kind {
             OperationKind::Write | OperationKind::Read => {
                 let remote = remote.ok_or_else(|| {
@@ -1515,16 +1510,9 @@ impl ValidatedOperation {
                 connection.post_recv(&mut batch)
             }
             OperationKind::Send | OperationKind::Write | OperationKind::Read => {
-                let opcode = match self.kind {
-                    OperationKind::Send => WrOpcode::Send,
-                    OperationKind::Write => WrOpcode::RdmaWrite,
-                    OperationKind::Read => WrOpcode::RdmaRead,
-                    OperationKind::Recv => {
-                        return Err(Error::InvalidConfig(
-                            "RECV cannot be encoded as a SEND work request".into(),
-                        ));
-                    }
-                };
+                let opcode = self.kind.send_wr_opcode().ok_or_else(|| {
+                    Error::InvalidConfig("RECV cannot be encoded as a SEND work request".into())
+                })?;
                 let mut wr = SendWr::new(token.encode(), opcode)
                     .sg(self.sge)
                     .flags(SendFlags::SIGNALED);
@@ -1534,6 +1522,26 @@ impl ValidatedOperation {
                 let mut batch = PreparedSendBatch::new(vec![wr]).map_err(Error::from_v1)?;
                 connection.post_send(&mut batch)
             }
+        }
+    }
+}
+
+impl OperationKind {
+    const fn expected_completion_opcode(self) -> WcOpcode {
+        match self {
+            Self::Send => WcOpcode::Send,
+            Self::Recv => WcOpcode::Recv,
+            Self::Write => WcOpcode::RdmaWrite,
+            Self::Read => WcOpcode::RdmaRead,
+        }
+    }
+
+    const fn send_wr_opcode(self) -> Option<WrOpcode> {
+        match self {
+            Self::Send => Some(WrOpcode::Send),
+            Self::Write => Some(WrOpcode::RdmaWrite),
+            Self::Read => Some(WrOpcode::RdmaRead),
+            Self::Recv => None,
         }
     }
 }
@@ -2024,6 +2032,36 @@ mod tests {
     use rdma_io_sys::ibverbs::{IBV_WC_FATAL_ERR, IBV_WC_RECV, IBV_WC_SEND, IBV_WC_SUCCESS};
     use std::sync::Barrier;
     use std::sync::Weak;
+
+    #[test]
+    fn all_operation_kinds_preserve_direction_and_opcode_mapping() {
+        let mappings = [
+            (
+                OperationKind::Send,
+                Direction::Send,
+                WcOpcode::Send,
+                Some(WrOpcode::Send),
+            ),
+            (OperationKind::Recv, Direction::Recv, WcOpcode::Recv, None),
+            (
+                OperationKind::Write,
+                Direction::Send,
+                WcOpcode::RdmaWrite,
+                Some(WrOpcode::RdmaWrite),
+            ),
+            (
+                OperationKind::Read,
+                Direction::Send,
+                WcOpcode::RdmaRead,
+                Some(WrOpcode::RdmaRead),
+            ),
+        ];
+        for (kind, direction, completion, send_wr) in mappings {
+            assert_eq!(kind.direction(), direction);
+            assert_eq!(kind.expected_completion_opcode(), completion);
+            assert_eq!(kind.send_wr_opcode(), send_wr);
+        }
+    }
 
     #[test]
     fn credit_pool_never_oversubscribes_or_reuses_retained_debt() {
