@@ -53,7 +53,7 @@ impl EngineShared {
         if first {
             self.schedule_connection_drain(connection.token);
         }
-        if connection.io_drain_report().accepted_count == 0 {
+        if connection.accepted_count() == 0 {
             self.record_connection_drained(connection);
             self.schedule_connection_retirement(connection);
         }
@@ -97,7 +97,7 @@ impl EngineShared {
         };
         // CQEs already copied out of the hardware CQ must take the ordinary
         // quantum-bounded ready path before a destructive fallback can run.
-        if connection.io_drain_report().has_copied_completions {
+        if connection.has_copied_completions() {
             self.publish_completion(&connection);
             self.schedule_deadline(
                 DeadlineKind::ConnectionDrain,
@@ -109,9 +109,7 @@ impl EngineShared {
         let forced_tokens = {
             let _admission = read_unpoison(&self.admission);
             let lifecycle = connection.lock_lifecycle();
-            let report = connection.io_drain_report();
-            debug_assert_eq!(report.accepted_count, report.cq_debt);
-            let tokens = report.accepted_tokens;
+            let tokens = connection.io_drain_report().accepted_tokens;
             if tokens.is_empty() {
                 None
             } else {
@@ -142,16 +140,18 @@ impl EngineShared {
                 return;
             }
         }
-        if let Some((outstanding, _cq_debt)) = connection.begin_quarantine() {
+        if let Some(report) = connection.begin_quarantine() {
             self.track_connection_quarantine(connection.token);
             for operation in connection.accepted_tokens() {
                 self.quarantine_operation(operation);
             }
-            if let Some(event) = connection.publish_quarantine(outstanding) {
+            if let Some(event) =
+                connection.publish_quarantine(report.outstanding_operations, report.cq_debt)
+            {
                 event.deliver();
             }
         }
-        if connection.close_started() && connection.io_drain_report().accepted_count == 0 {
+        if connection.close_started() && connection.accepted_count() == 0 {
             self.recover_connection_quarantine(&connection);
             self.record_connection_drained(&connection);
             self.schedule_connection_retirement(&connection);

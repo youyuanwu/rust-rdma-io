@@ -420,7 +420,9 @@ struct EngineShared {
     provider: Option<config::ProviderLimits>,
     connection_admission: Arc<ConnectionAdmissionPool>,
     connections: ConnectionRegistry,
-    // The core drops before root CQ/PD/CM resources retained at the end.
+    // This engine-owned core retain drops before the root resources below.
+    // Operation futures may extend the Arc, but each MR anchors its PD and an
+    // engine with accepted work is retained fail-closed.
     io_core: Arc<IoCore>,
     cm: cm::CmState,
     #[cfg(any(test, feature = "test-hooks"))]

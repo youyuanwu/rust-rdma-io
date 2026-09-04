@@ -356,6 +356,15 @@ impl RdmaEngineDriver {
             };
             requests.extend(refill);
         }
+        if requests.len() < budget {
+            let remaining = budget - requests.len();
+            let refill = if self.deadline_io_turn {
+                self.shared.take_deadline_requests(remaining)
+            } else {
+                self.shared.io_core.take_reclamation_requests(remaining)
+            };
+            requests.extend(refill);
+        }
         self.deadline_io_turn = !self.deadline_io_turn;
         for request in requests.iter().copied() {
             if !self

@@ -1592,11 +1592,11 @@ impl IoCoreEffects {
     }
 
     pub(in crate::v2::engine) fn publish(self) {
-        debug_assert!(
+        assert!(
             self.quarantine.is_empty(),
             "engine must apply operation quarantine effects before publication"
         );
-        debug_assert!(
+        assert!(
             self.drained.is_empty(),
             "engine must apply accepted-zero effects before publication"
         );

@@ -83,8 +83,11 @@ pub(super) struct EstablishedIoConnection {
 /// Atomic operation/drain view consumed by session close policy.
 pub(super) struct IoDrainReport {
     pub(super) accepted_tokens: Vec<OperationToken>,
-    pub(super) accepted_count: usize,
-    pub(super) has_copied_completions: bool,
+}
+
+/// Atomic connection-quarantine accounting reported to session policy.
+pub(super) struct IoQuarantineReport {
+    pub(super) outstanding_operations: usize,
     pub(super) cq_debt: usize,
 }
 
@@ -195,30 +198,26 @@ impl EstablishedIoConnection {
 
     pub(super) fn drain_report(&self) -> IoDrainReport {
         let accepted = lock_unpoison(&self.accepted);
-        let completions = lock_unpoison(&self.completions);
         let accepted_tokens = accepted
             .iter()
             .map(|identity| identity.operation)
             .collect::<Vec<_>>();
-        let accepted_count = accepted_tokens.len();
-        IoDrainReport {
-            accepted_tokens,
-            accepted_count,
-            has_copied_completions: !completions.is_empty(),
-            cq_debt: accepted_count,
-        }
+        IoDrainReport { accepted_tokens }
     }
 
     pub(super) fn begin_connection_quarantine(
         &self,
         quarantined: &AtomicBool,
-    ) -> Option<(usize, usize)> {
+    ) -> Option<IoQuarantineReport> {
         let accepted = lock_unpoison(&self.accepted);
         let outstanding = accepted.len();
         if outstanding == 0 || quarantined.swap(true, Ordering::AcqRel) {
             return None;
         }
-        Some((outstanding, outstanding))
+        Some(IoQuarantineReport {
+            outstanding_operations: outstanding,
+            cq_debt: outstanding,
+        })
     }
 
     pub(super) fn enqueue_completion(&self, completion: WorkCompletion) {

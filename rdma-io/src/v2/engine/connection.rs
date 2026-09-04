@@ -14,7 +14,8 @@ use super::io::{IoEventSender, IoTerminalEvent, PendingIoEvent};
 use super::io_core::Direction;
 use super::io_core::RdmaOperation;
 use super::io_core::{
-    EstablishedIoConnection, EstablishedIoIdentity, IoDrainReport, IoPostAuthority, OperationKind,
+    EstablishedIoConnection, EstablishedIoIdentity, IoDrainReport, IoPostAuthority,
+    IoQuarantineReport, OperationKind,
 };
 use super::lifecycle::MemoizedTerminalResult;
 use super::registry::{ConnectionToken, OperationToken, lock_unpoison, read_unpoison};
@@ -364,6 +365,10 @@ impl ConnectionState {
         self.io.accepted_count()
     }
 
+    pub(super) fn has_copied_completions(&self) -> bool {
+        self.io.has_completion_work()
+    }
+
     pub(super) fn install_io_event_sender(
         &self,
         sender: IoEventSender,
@@ -510,14 +515,18 @@ impl ConnectionState {
         self.close_notify.notify_waiters();
     }
 
-    pub(super) fn begin_quarantine(&self) -> Option<(usize, usize)> {
+    pub(super) fn begin_quarantine(&self) -> Option<IoQuarantineReport> {
         self.io.begin_connection_quarantine(&self.quarantined)
     }
 
-    pub(super) fn publish_quarantine(&self, outstanding: usize) -> Option<PendingIoEvent> {
+    pub(super) fn publish_quarantine(
+        &self,
+        outstanding_operations: usize,
+        cq_debt: usize,
+    ) -> Option<PendingIoEvent> {
         let error = Error::ConnectionQuarantined {
-            outstanding_operations: outstanding,
-            cq_debt: outstanding,
+            outstanding_operations,
+            cq_debt,
         };
         let mut outcome = lock_unpoison(&self.close_outcome);
         if outcome.is_none() {
