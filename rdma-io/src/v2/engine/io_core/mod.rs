@@ -80,6 +80,14 @@ pub(super) struct EstablishedIoConnection {
     drain_notify: Arc<tokio::sync::Notify>,
 }
 
+/// Atomic operation/drain view consumed by session close policy.
+pub(super) struct IoDrainReport {
+    pub(super) accepted_tokens: Vec<OperationToken>,
+    pub(super) accepted_count: usize,
+    pub(super) has_copied_completions: bool,
+    pub(super) cq_debt: usize,
+}
+
 impl EstablishedIoConnection {
     pub(super) fn new(
         identity: EstablishedIoIdentity,
@@ -181,13 +189,42 @@ impl EstablishedIoConnection {
         lock_unpoison(&self.accepted).len()
     }
 
-    pub(super) fn begin_connection_quarantine(&self, quarantined: &AtomicBool) -> Option<usize> {
+    pub(super) fn is_posting_open(&self) -> bool {
+        self.posting_open.load(Ordering::Acquire)
+    }
+
+    pub(super) fn drain_report(&self) -> IoDrainReport {
         let accepted = lock_unpoison(&self.accepted);
+        let completions = lock_unpoison(&self.completions);
+        let accepted_tokens = accepted
+            .iter()
+            .map(|identity| identity.operation)
+            .collect::<Vec<_>>();
+        let accepted_count = accepted_tokens.len();
+        IoDrainReport {
+            accepted_tokens,
+            accepted_count,
+            has_copied_completions: !completions.is_empty(),
+            cq_debt: accepted_count,
+        }
+    }
+
+    pub(super) fn begin_connection_quarantine(
+        &self,
+        quarantined: &AtomicBool,
+    ) -> Option<IoDrainReport> {
+        let accepted = lock_unpoison(&self.accepted);
+        let completions = lock_unpoison(&self.completions);
         let outstanding = accepted.len();
         if outstanding == 0 || quarantined.swap(true, Ordering::AcqRel) {
             return None;
         }
-        Some(outstanding)
+        Some(IoDrainReport {
+            accepted_tokens: accepted.iter().map(|identity| identity.operation).collect(),
+            accepted_count: outstanding,
+            has_copied_completions: !completions.is_empty(),
+            cq_debt: outstanding,
+        })
     }
 
     pub(super) fn enqueue_completion(&self, completion: WorkCompletion) {
@@ -228,7 +265,7 @@ impl EstablishedIoConnection {
         self.completion_published.store(false, Ordering::Release);
     }
 
-    pub(super) fn stop_posting(&self) {
+    pub(super) fn close_posting(&self) {
         let _posting = write_unpoison(&self.posting_gate);
         self.posting_open.store(false, Ordering::Release);
     }
@@ -350,9 +387,9 @@ impl IoCore {
         lock_unpoison(&self.admission_error).clone()
     }
 
-    pub(super) fn close_admission(&self, error: Error) {
+    pub(super) fn close_admission(&self, error: Option<Error>) {
         self.shutdown_requested.store(true, Ordering::Release);
-        *lock_unpoison(&self.admission_error) = Some(error);
+        *lock_unpoison(&self.admission_error) = error;
     }
 
     fn publish_cq_recheck(&self) {
@@ -504,7 +541,7 @@ mod tests {
 
         assert!(connection.remove_accepted(operation));
         connection.release_local(Direction::Recv);
-        connection.stop_posting();
+        connection.close_posting();
         assert!(matches!(
             connection.begin_posting(),
             Err(Error::TransportClosed)

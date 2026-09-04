@@ -38,9 +38,10 @@ impl EngineShared {
             let engine_is_terminating = self.shutdown_requested.load(Ordering::Acquire);
             if !engine_is_terminating {
                 let error = connection.operation_close_error();
+                let report = connection.io_drain_report();
                 close_effects = Some(
                     self.io_core
-                        .fail_observers_for_close(&connection.accepted_tokens(), error),
+                        .fail_observers_for_close(&report.accepted_tokens, error),
                 );
             }
         }
@@ -52,7 +53,7 @@ impl EngineShared {
         if first {
             self.schedule_connection_drain(connection.token);
         }
-        if connection.accepted_count() == 0 {
+        if connection.io_drain_report().accepted_count == 0 {
             self.record_connection_drained(connection);
             self.schedule_connection_retirement(connection);
         }
@@ -96,7 +97,7 @@ impl EngineShared {
         };
         // CQEs already copied out of the hardware CQ must take the ordinary
         // quantum-bounded ready path before a destructive fallback can run.
-        if connection.has_completion_work() {
+        if connection.io_drain_report().has_copied_completions {
             self.publish_completion(&connection);
             self.schedule_deadline(
                 DeadlineKind::ConnectionDrain,
@@ -108,7 +109,7 @@ impl EngineShared {
         let forced_tokens = {
             let _admission = read_unpoison(&self.admission);
             let lifecycle = connection.lock_lifecycle();
-            let tokens = connection.accepted_tokens();
+            let tokens = connection.io_drain_report().accepted_tokens;
             if tokens.is_empty() {
                 None
             } else {
@@ -148,7 +149,7 @@ impl EngineShared {
                 event.deliver();
             }
         }
-        if connection.close_started() && connection.accepted_count() == 0 {
+        if connection.close_started() && connection.io_drain_report().accepted_count == 0 {
             self.recover_connection_quarantine(&connection);
             self.record_connection_drained(&connection);
             self.schedule_connection_retirement(&connection);

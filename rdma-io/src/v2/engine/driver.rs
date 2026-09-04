@@ -350,9 +350,9 @@ impl RdmaEngineDriver {
         if requests.len() < budget {
             let remaining = budget - requests.len();
             let refill = if self.deadline_io_turn {
-                self.shared.take_deadline_requests(remaining)
-            } else {
                 self.shared.io_core.take_reclamation_requests(remaining)
+            } else {
+                self.shared.take_deadline_requests(remaining)
             };
             requests.extend(refill);
         }

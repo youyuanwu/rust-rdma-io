@@ -14,7 +14,7 @@ use super::io::{IoEventSender, IoTerminalEvent, PendingIoEvent};
 use super::io_core::Direction;
 use super::io_core::RdmaOperation;
 use super::io_core::{
-    EstablishedIoConnection, EstablishedIoIdentity, IoPostAuthority, OperationKind,
+    EstablishedIoConnection, EstablishedIoIdentity, IoDrainReport, IoPostAuthority, OperationKind,
 };
 use super::lifecycle::MemoizedTerminalResult;
 use super::registry::{ConnectionToken, OperationToken, lock_unpoison, read_unpoison};
@@ -364,10 +364,6 @@ impl ConnectionState {
         self.io.accepted_count()
     }
 
-    pub(super) fn has_completion_work(&self) -> bool {
-        self.io.has_completion_work()
-    }
-
     pub(super) fn install_io_event_sender(
         &self,
         sender: IoEventSender,
@@ -390,7 +386,11 @@ impl ConnectionState {
     }
 
     pub(super) fn stop_posting(&self) {
-        self.io.stop_posting();
+        self.io.close_posting();
+    }
+
+    pub(super) fn io_drain_report(&self) -> IoDrainReport {
+        self.io.drain_report()
     }
 
     pub(super) fn lock_lifecycle(&self) -> MutexGuard<'_, ()> {
@@ -511,8 +511,8 @@ impl ConnectionState {
     }
 
     pub(super) fn begin_quarantine(&self) -> Option<(usize, usize)> {
-        let outstanding = self.io.begin_connection_quarantine(&self.quarantined)?;
-        Some((outstanding, outstanding))
+        let report = self.io.begin_connection_quarantine(&self.quarantined)?;
+        Some((report.accepted_count, report.cq_debt))
     }
 
     pub(super) fn publish_quarantine(&self, outstanding: usize) -> Option<PendingIoEvent> {

@@ -807,6 +807,8 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         "EngineShared",
         "ConnectionState",
         "WorkRequestPoster",
+        "cm",
+        "listener",
         "CmState",
         "ListenerState",
         "MessageTransportDriver",
@@ -836,7 +838,11 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         "cq_credits:",
         "accepted_operations:",
         "pending_reclamations:",
+        "rejected_cqes:",
+        "rejected_cqe_reasons:",
         "quarantined_operations:",
+        "quarantined_mrs:",
+        "quarantined_bytes:",
         "published_completion_connections:",
     ] {
         assert!(

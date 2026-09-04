@@ -585,7 +585,7 @@ impl EngineShared {
         if self.shutdown_requested.swap(true, Ordering::AcqRel) {
             return false;
         }
-        self.io_core.close_admission(Error::DriverShutdown);
+        self.io_core.close_admission(Some(Error::DriverShutdown));
         self.transition_shutdown_requested();
         true
     }
@@ -595,15 +595,14 @@ impl EngineShared {
             !outcome.is_connection_quarantined(),
             "ConnectionQuarantined is connection-local; no connection quarantine can terminate the engine driver"
         );
-        let (io_effects, connections_to_wake) = {
+        let (mut io_effects, connections_to_wake) = {
             let _admission = write_unpoison(&self.admission);
             let mut terminal = lock_unpoison(&self.terminal);
             if terminal.is_some() {
                 return;
             }
             self.shutdown_requested.store(true, Ordering::Release);
-            self.io_core
-                .close_admission(outcome.error().unwrap_or(Error::DriverShutdown));
+            self.io_core.close_admission(outcome.error());
             self.transition_shutdown_requested();
             let lifecycle = if outcome.is_success() {
                 RdmaEngineLifecycle::Terminated
@@ -620,7 +619,7 @@ impl EngineShared {
             (io_effects, connections_to_wake)
         };
 
-        self.apply_io_effects(&io_effects);
+        self.apply_io_effects(&mut io_effects);
         self.cm.terminalize(&outcome);
         for connection in &connections_to_wake {
             if outcome.is_error() && connection.retain_bundle_for_engine_failure() {
@@ -871,8 +870,8 @@ impl EngineShared {
         !lock_unpoison(&self.deadline_requests).is_empty()
     }
 
-    fn apply_io_effects(&self, effects: &io_core::IoCoreEffects) {
-        for effect in effects.quarantine().iter().copied() {
+    fn apply_io_effects(&self, effects: &mut io_core::IoCoreEffects) {
+        for effect in effects.take_quarantine() {
             match effect {
                 io_core::OperationQuarantineEffect::Added {
                     operation,
@@ -888,7 +887,7 @@ impl EngineShared {
                 }
             }
         }
-        for token in effects.drained().iter().copied() {
+        for token in effects.take_drained() {
             let registry::Lookup::Occupied(connection) = self.connections.lookup(token) else {
                 continue;
             };
@@ -930,10 +929,10 @@ impl EngineShared {
             registry::Lookup::Occupied(connection) => connection,
             _ => return (0, false),
         };
-        let (processed, remains_ready, effects) = self
+        let (processed, remains_ready, mut effects) = self
             .io_core
             .dispatch_connection_completions(&connection.io, quantum);
-        self.apply_io_effects(&effects);
+        self.apply_io_effects(&mut effects);
         effects.publish();
         (processed, remains_ready)
     }
@@ -944,13 +943,13 @@ impl EngineShared {
         connection: &connection::ConnectionState,
         token: registry::OperationToken,
     ) -> bool {
-        let (reclaimed, effects) = self.io_core.reclaim_after_qp_destroy(
+        let (reclaimed, mut effects) = self.io_core.reclaim_after_qp_destroy(
             proof,
             &connection.io,
             connection.operation_close_error(),
             token,
         );
-        self.apply_io_effects(&effects);
+        self.apply_io_effects(&mut effects);
         effects.publish();
         reclaimed
     }
@@ -959,23 +958,23 @@ impl EngineShared {
         &self,
         connection: &connection::ConnectionState,
     ) -> bool {
-        let (remains_ready, effects) = self
+        let (remains_ready, mut effects) = self
             .io_core
             .reject_queued_completions_after_qp_destroy(&connection.io);
-        self.apply_io_effects(&effects);
+        self.apply_io_effects(&mut effects);
         effects.publish();
         remains_ready
     }
 
     pub(super) fn handle_reclamation_deadline(&self, token: registry::OperationToken) {
-        let effects = self.io_core.handle_reclamation_deadline(token);
-        self.apply_io_effects(&effects);
+        let mut effects = self.io_core.handle_reclamation_deadline(token);
+        self.apply_io_effects(&mut effects);
         effects.publish();
     }
 
     pub(super) fn quarantine_operation(&self, token: registry::OperationToken) {
-        let effects = self.io_core.quarantine_operation(token);
-        self.apply_io_effects(&effects);
+        let mut effects = self.io_core.quarantine_operation(token);
+        self.apply_io_effects(&mut effects);
         effects.publish();
     }
 }

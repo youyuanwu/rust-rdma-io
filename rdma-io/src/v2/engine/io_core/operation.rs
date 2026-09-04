@@ -1574,15 +1574,23 @@ impl IoCoreEffects {
         self.drained.append(&mut other.drained);
     }
 
-    pub(in crate::v2::engine) fn quarantine(&self) -> &[OperationQuarantineEffect] {
-        &self.quarantine
+    pub(in crate::v2::engine) fn take_quarantine(&mut self) -> Vec<OperationQuarantineEffect> {
+        std::mem::take(&mut self.quarantine)
     }
 
-    pub(in crate::v2::engine) fn drained(&self) -> &[ConnectionToken] {
-        &self.drained
+    pub(in crate::v2::engine) fn take_drained(&mut self) -> Vec<ConnectionToken> {
+        std::mem::take(&mut self.drained)
     }
 
     pub(in crate::v2::engine) fn publish(self) {
+        debug_assert!(
+            self.quarantine.is_empty(),
+            "engine must apply operation quarantine effects before publication"
+        );
+        debug_assert!(
+            self.drained.is_empty(),
+            "engine must apply accepted-zero effects before publication"
+        );
         self.after_unlock.publish();
     }
 }
@@ -1795,7 +1803,10 @@ impl IoCore {
                 connection: operation.connection_token(),
             });
         }
-        if removed && operation.connection.accepted_count() == 0 {
+        if removed
+            && !operation.connection.is_posting_open()
+            && operation.connection.accepted_count() == 0
+        {
             effects.drained.push(operation.connection_token());
         }
         effects
@@ -2098,9 +2109,11 @@ mod tests {
         let early = operation.commit_accepted().expect("early completion");
         shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
         assert_eq!(operation.lifecycle(), OperationLifecycle::Completing);
-        shared
-            .finish_operation(Arc::clone(&operation), early)
-            .publish();
+        let mut effects = shared
+            .io_core
+            .finish_operation(Arc::clone(&operation), early);
+        shared.apply_io_effects(&mut effects);
+        effects.publish();
         assert_eq!(operation.lifecycle(), OperationLifecycle::Released);
 
         let token = install_accepted(&shared, &connection.state, WcOpcode::Send);
@@ -2121,9 +2134,11 @@ mod tests {
             CompletionDisposition::Complete
         ));
         assert_eq!(operation.lifecycle(), OperationLifecycle::Completing);
-        shared
-            .finish_operation(Arc::clone(&operation), completion)
-            .publish();
+        let mut effects = shared
+            .io_core
+            .finish_operation(Arc::clone(&operation), completion);
+        shared.apply_io_effects(&mut effects);
+        effects.publish();
         assert_eq!(operation.lifecycle(), OperationLifecycle::Released);
     }
 
