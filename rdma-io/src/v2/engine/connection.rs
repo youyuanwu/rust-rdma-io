@@ -511,8 +511,7 @@ impl ConnectionState {
     }
 
     pub(super) fn begin_quarantine(&self) -> Option<(usize, usize)> {
-        let report = self.io.begin_connection_quarantine(&self.quarantined)?;
-        Some((report.accepted_count, report.cq_debt))
+        self.io.begin_connection_quarantine(&self.quarantined)
     }
 
     pub(super) fn publish_quarantine(&self, outstanding: usize) -> Option<PendingIoEvent> {

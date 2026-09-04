@@ -466,6 +466,7 @@ fn commit_internal_entries(shared: &IoCore, entries: Vec<InternalBatchEntry>) ->
     for (state, completion) in early {
         let effects = shared.finish_operation(state, completion);
         debug_assert!(effects.quarantine.is_empty());
+        debug_assert!(effects.drained.is_empty());
         after_unlock.extend(effects.after_unlock);
     }
     after_unlock

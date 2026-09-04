@@ -212,19 +212,13 @@ impl EstablishedIoConnection {
     pub(super) fn begin_connection_quarantine(
         &self,
         quarantined: &AtomicBool,
-    ) -> Option<IoDrainReport> {
+    ) -> Option<(usize, usize)> {
         let accepted = lock_unpoison(&self.accepted);
-        let completions = lock_unpoison(&self.completions);
         let outstanding = accepted.len();
         if outstanding == 0 || quarantined.swap(true, Ordering::AcqRel) {
             return None;
         }
-        Some(IoDrainReport {
-            accepted_tokens: accepted.iter().map(|identity| identity.operation).collect(),
-            accepted_count: outstanding,
-            has_copied_completions: !completions.is_empty(),
-            cq_debt: outstanding,
-        })
+        Some((outstanding, outstanding))
     }
 
     pub(super) fn enqueue_completion(&self, completion: WorkCompletion) {

@@ -109,7 +109,9 @@ impl EngineShared {
         let forced_tokens = {
             let _admission = read_unpoison(&self.admission);
             let lifecycle = connection.lock_lifecycle();
-            let tokens = connection.io_drain_report().accepted_tokens;
+            let report = connection.io_drain_report();
+            debug_assert_eq!(report.accepted_count, report.cq_debt);
+            let tokens = report.accepted_tokens;
             if tokens.is_empty() {
                 None
             } else {
