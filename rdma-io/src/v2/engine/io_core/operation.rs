@@ -8,16 +8,16 @@ use std::task::{Context, Poll};
 
 use futures_util::task::AtomicWaker;
 
-use super::EngineShared;
-use super::connection::{ConnectionState, Direction, OperationKind, QpDestructionProof};
-use super::io::{
+use super::super::connection::QpDestructionProof;
+use super::super::io::{
     IoEventDestination, IoEventSender, IoOperationContext, IoOperationIdentity, IoRecvRequest,
     IoSendRequest, IoSubmissionDisposition, PendingIoEvent,
 };
-use super::lifecycle::MemoizedTerminalResult;
-use super::registry::{
-    ConnectionToken, Lookup, OperationToken, PagedRegistry, lock_unpoison, read_unpoison,
+use super::super::lifecycle::MemoizedTerminalResult;
+use super::super::registry::{
+    ConnectionToken, Lookup, OperationToken, PagedRegistry, lock_unpoison,
 };
+use super::{Direction, EstablishedIoConnection, IoCore, OperationKind};
 use crate::v2::error::{Error, Result};
 use crate::v2::mr::{Mr, RemoteMr};
 use crate::v2::op::Completion;
@@ -26,7 +26,7 @@ use crate::wc::{WcOpcode, WorkCompletion};
 use crate::wr::{PreparedRecvBatch, PreparedSendBatch, RecvWr, SendFlags, SendWr, Sge, WrOpcode};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum CqeReject {
+pub(in crate::v2::engine) enum CqeReject {
     StaleConnection,
     StaleOperation,
     RetiredOperation,
@@ -63,9 +63,9 @@ struct InternalBatchEntry {
 
 type InternalPostInput = (Mr, Option<(usize, usize)>, IoOperationContext);
 
-pub(super) fn post_io_recv_batch(
-    shared: &Arc<EngineShared>,
-    connection: &Arc<ConnectionState>,
+pub(in crate::v2::engine) fn post_io_recv_batch(
+    shared: &IoCore,
+    connection: &Arc<EstablishedIoConnection>,
     events: &IoEventSender,
     requests: Vec<IoRecvRequest>,
 ) -> IoSubmissionDisposition {
@@ -84,9 +84,9 @@ pub(super) fn post_io_recv_batch(
     )
 }
 
-pub(super) fn post_io_send(
-    shared: &Arc<EngineShared>,
-    connection: &Arc<ConnectionState>,
+pub(in crate::v2::engine) fn post_io_send(
+    shared: &IoCore,
+    connection: &Arc<EstablishedIoConnection>,
     events: &IoEventSender,
     request: IoSendRequest,
 ) -> IoSubmissionDisposition {
@@ -101,8 +101,8 @@ pub(super) fn post_io_send(
 }
 
 fn post_io_batch(
-    shared: &Arc<EngineShared>,
-    connection: &Arc<ConnectionState>,
+    shared: &IoCore,
+    connection: &Arc<EstablishedIoConnection>,
     events: &IoEventSender,
     kind: OperationKind,
     entries: Vec<InternalPostInput>,
@@ -114,7 +114,7 @@ fn post_io_batch(
         };
     }
     let count = entries.len();
-    let admission = read_unpoison(&shared.admission);
+    let admission = shared.admission();
     if let Some(error) = shared.admission_error() {
         let after_unlock = detach_unreserved_entries(events, entries, error.clone());
         drop(admission);
@@ -340,8 +340,8 @@ fn post_io_batch(
         PreparedBatchOwnership::new(reserved).expect("non-empty detached batch ownership");
     let mut requests = requests;
     let outcome = match match &mut requests {
-        InternalPreparedBatch::Recv(batch) => connection.io.post_recv(batch),
-        InternalPreparedBatch::Send(batch) => connection.io.post_send(batch),
+        InternalPreparedBatch::Recv(batch) => connection.post_recv(batch),
+        InternalPreparedBatch::Send(batch) => connection.post_send(batch),
     } {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -451,10 +451,7 @@ enum InternalPreparedBatch {
     Send(PreparedSendBatch),
 }
 
-fn commit_internal_entries(
-    shared: &EngineShared,
-    entries: Vec<InternalBatchEntry>,
-) -> AfterEngineUnlock {
+fn commit_internal_entries(shared: &IoCore, entries: Vec<InternalBatchEntry>) -> AfterEngineUnlock {
     shared
         .accepted_operations
         .fetch_add(entries.len(), Ordering::AcqRel);
@@ -464,17 +461,19 @@ fn commit_internal_entries(
             early.push((entry.state, completion));
         }
     }
-    shared.work_signal.publish(super::driver::CQ_RECHECK_WORK);
+    shared.publish_cq_recheck();
     let mut after_unlock = AfterEngineUnlock::default();
     for (state, completion) in early {
-        after_unlock.extend(shared.finish_operation(state, completion));
+        let effects = shared.finish_operation(state, completion);
+        debug_assert!(effects.quarantine.is_empty());
+        after_unlock.extend(effects.after_unlock);
     }
     after_unlock
 }
 
 fn rollback_internal_entries(
-    shared: &EngineShared,
-    connection: &ConnectionState,
+    shared: &IoCore,
+    connection: &impl EstablishedIoRef,
     direction: Direction,
     entries: Vec<InternalBatchEntry>,
     error: Error,
@@ -496,9 +495,32 @@ enum InternalRelease {
     Retained(Vec<InternalBatchEntry>),
 }
 
+trait EstablishedIoRef {
+    fn established_io(&self) -> &EstablishedIoConnection;
+}
+
+impl EstablishedIoRef for EstablishedIoConnection {
+    fn established_io(&self) -> &EstablishedIoConnection {
+        self
+    }
+}
+
+impl EstablishedIoRef for Arc<EstablishedIoConnection> {
+    fn established_io(&self) -> &EstablishedIoConnection {
+        self
+    }
+}
+
+#[cfg(test)]
+impl EstablishedIoRef for Arc<super::super::connection::ConnectionState> {
+    fn established_io(&self) -> &EstablishedIoConnection {
+        &self.io
+    }
+}
+
 fn release_proven_unaccepted_entries(
-    shared: &EngineShared,
-    connection: &ConnectionState,
+    shared: &IoCore,
+    connection: &impl EstablishedIoRef,
     direction: Direction,
     entries: Vec<InternalBatchEntry>,
     error: Error,
@@ -535,7 +557,7 @@ fn release_proven_unaccepted_entries(
             .expect("proven-unaccepted operation remains registered");
         debug_assert!(Arc::ptr_eq(&registered, &entry.state));
         shared.cq_credits.release();
-        connection.release_local(direction);
+        connection.established_io().release_local(direction);
         if let Some(event) = release.event {
             after_unlock.events.push(event);
         }
@@ -570,15 +592,15 @@ fn clone_io_error(error: &std::io::Error) -> std::io::Error {
 
 enum FutureState {
     PrePost {
-        shared: Arc<EngineShared>,
-        connection: Arc<ConnectionState>,
+        shared: Arc<IoCore>,
+        connection: Arc<EstablishedIoConnection>,
         kind: OperationKind,
         mr: Option<Mr>,
         remote: Option<RemoteMr>,
         range: Option<(usize, usize)>,
     },
     InFlight {
-        shared: Arc<EngineShared>,
+        shared: Arc<IoCore>,
         operation: Arc<OperationState>,
     },
     Immediate(Option<(Result<Completion>, Option<Mr>)>),
@@ -588,9 +610,9 @@ enum FutureState {
 impl Unpin for RdmaOperation {}
 
 impl RdmaOperation {
-    pub(super) fn new(
-        shared: Arc<EngineShared>,
-        connection: Arc<ConnectionState>,
+    pub(in crate::v2::engine) fn new(
+        shared: Arc<IoCore>,
+        connection: Arc<EstablishedIoConnection>,
         kind: OperationKind,
         mr: Mr,
         remote: Option<RemoteMr>,
@@ -671,12 +693,12 @@ impl Drop for RdmaOperation {
     }
 }
 
-pub(super) struct OperationRegistry {
+pub(in crate::v2::engine) struct OperationRegistry {
     slots: PagedRegistry<OperationToken, Arc<OperationState>>,
 }
 
 impl OperationRegistry {
-    pub(super) fn new(capacity: usize) -> Result<Self> {
+    pub(in crate::v2::engine) fn new(capacity: usize) -> Result<Self> {
         Ok(Self {
             slots: PagedRegistry::new(capacity)?,
         })
@@ -689,7 +711,10 @@ impl OperationRegistry {
         self.slots.allocate_with(make)
     }
 
-    pub(super) fn lookup(&self, token: OperationToken) -> Lookup<Arc<OperationState>> {
+    pub(in crate::v2::engine) fn lookup(
+        &self,
+        token: OperationToken,
+    ) -> Lookup<Arc<OperationState>> {
         self.slots.lookup_cloned(token)
     }
 
@@ -697,23 +722,23 @@ impl OperationRegistry {
         self.slots.release(token, completed)
     }
 
-    pub(super) fn live(&self) -> usize {
+    pub(in crate::v2::engine) fn live(&self) -> usize {
         self.slots.live()
     }
 
-    pub(super) fn occupied(&self) -> Vec<Arc<OperationState>> {
+    pub(in crate::v2::engine) fn occupied(&self) -> Vec<Arc<OperationState>> {
         self.slots.occupied_cloned()
     }
 }
 
-pub(super) struct CqCreditPool {
+pub(in crate::v2::engine) struct CqCreditPool {
     capacity: usize,
     used: AtomicUsize,
     retained: AtomicUsize,
 }
 
 impl CqCreditPool {
-    pub(super) fn new(capacity: usize) -> Self {
+    pub(in crate::v2::engine) fn new(capacity: usize) -> Self {
         Self {
             capacity,
             used: AtomicUsize::new(0),
@@ -744,7 +769,7 @@ impl CqCreditPool {
         debug_assert!(previous > 0, "CQ admission release must have a reservation");
     }
 
-    pub(super) fn retain(&self) {
+    pub(in crate::v2::engine) fn retain(&self) {
         self.retained.fetch_add(1, Ordering::AcqRel);
     }
 
@@ -753,22 +778,22 @@ impl CqCreditPool {
         debug_assert!(previous > 0, "retained CQ credit must exist");
     }
 
-    pub(super) fn free(&self) -> usize {
+    pub(in crate::v2::engine) fn free(&self) -> usize {
         self.capacity
             .saturating_sub(self.used.load(Ordering::Acquire))
     }
 
-    pub(super) fn retained(&self) -> usize {
+    pub(in crate::v2::engine) fn retained(&self) -> usize {
         self.retained.load(Ordering::Acquire)
     }
 }
 
-pub(super) struct OperationState {
+pub(in crate::v2::engine) struct OperationState {
     token: OperationToken,
-    connection: Arc<ConnectionState>,
+    connection: Arc<EstablishedIoConnection>,
     direction: Direction,
     expected_opcode: WcOpcode,
-    pub(super) mr_len: usize,
+    pub(in crate::v2::engine) mr_len: usize,
     inner: Mutex<OperationInner>,
     waker: AtomicWaker,
     cancelled: AtomicBool,
@@ -804,18 +829,35 @@ enum OperationLifecycle {
     Released,
 }
 
+trait IntoEstablishedIoConnection {
+    fn into_established_io(self) -> Arc<EstablishedIoConnection>;
+}
+
+impl IntoEstablishedIoConnection for Arc<EstablishedIoConnection> {
+    fn into_established_io(self) -> Arc<EstablishedIoConnection> {
+        self
+    }
+}
+
+#[cfg(test)]
+impl IntoEstablishedIoConnection for Arc<super::super::connection::ConnectionState> {
+    fn into_established_io(self) -> Arc<EstablishedIoConnection> {
+        Arc::clone(&self.io)
+    }
+}
+
 impl OperationState {
-    pub(super) fn token(&self) -> OperationToken {
+    pub(in crate::v2::engine) fn token(&self) -> OperationToken {
         self.token
     }
 
-    pub(super) fn connection_token(&self) -> ConnectionToken {
-        self.connection.token
+    pub(in crate::v2::engine) fn connection_token(&self) -> ConnectionToken {
+        self.connection.identity().connection
     }
 
     fn new(
         token: OperationToken,
-        connection: Arc<ConnectionState>,
+        connection: impl IntoEstablishedIoConnection,
         direction: Direction,
         expected_opcode: WcOpcode,
         mr: Option<Mr>,
@@ -834,7 +876,7 @@ impl OperationState {
 
     fn new_with_event(
         token: OperationToken,
-        connection: Arc<ConnectionState>,
+        connection: impl IntoEstablishedIoConnection,
         direction: Direction,
         expected_opcode: WcOpcode,
         mr: Option<Mr>,
@@ -842,6 +884,7 @@ impl OperationState {
         event_destination: Option<IoEventDestination>,
     ) -> Self {
         let detached = event_destination.is_some();
+        let connection = connection.into_established_io();
         Self {
             token,
             connection,
@@ -925,7 +968,7 @@ impl OperationState {
         }
     }
 
-    fn cancel(&self, shared: &EngineShared) -> bool {
+    fn cancel(&self, shared: &IoCore) -> bool {
         if self.cancelled.swap(true, Ordering::AcqRel) {
             return false;
         }
@@ -967,7 +1010,7 @@ impl OperationState {
         }
     }
 
-    pub(super) fn mark_quarantined(&self) -> QuarantineTransition {
+    pub(in crate::v2::engine) fn mark_quarantined(&self) -> QuarantineTransition {
         let mut inner = lock_unpoison(&self.inner);
         let was_reclaiming = inner.reclamation_pending;
         match inner.lifecycle {
@@ -988,7 +1031,7 @@ impl OperationState {
         }
     }
 
-    pub(super) fn fail_observer_for_close(&self, error: Error) -> bool {
+    pub(in crate::v2::engine) fn fail_observer_for_close(&self, error: Error) -> bool {
         let mut inner = lock_unpoison(&self.inner);
         if !inner.detached
             && inner.output.is_none()
@@ -1122,7 +1165,7 @@ impl OperationState {
         lock_unpoison(&self.inner).output.take()
     }
 
-    fn detach_with_post_error(&self, shared: &EngineShared) {
+    fn detach_with_post_error(&self, shared: &IoCore) {
         let mut inner = lock_unpoison(&self.inner);
         inner.detached = true;
         inner.lifecycle = OperationLifecycle::Cancelled;
@@ -1131,7 +1174,10 @@ impl OperationState {
         self.cancelled.store(true, Ordering::Release);
     }
 
-    pub(super) fn finalize_terminal(&self, outcome: &MemoizedTerminalResult) -> TerminalizeState {
+    pub(in crate::v2::engine) fn finalize_terminal(
+        &self,
+        outcome: &MemoizedTerminalResult,
+    ) -> TerminalizeState {
         let mut inner = lock_unpoison(&self.inner);
         let was_reclaiming = inner.reclamation_pending;
         let newly_quarantined = match inner.lifecycle {
@@ -1165,7 +1211,7 @@ impl OperationState {
         }
     }
 
-    pub(super) fn wake(&self) {
+    pub(in crate::v2::engine) fn wake(&self) {
         self.waker.wake();
     }
 
@@ -1192,15 +1238,15 @@ struct FinishState {
     event: Option<PendingIoEvent>,
 }
 
-pub(super) struct QuarantineTransition {
-    pub(super) newly_quarantined: bool,
-    pub(super) was_reclaiming: bool,
+pub(in crate::v2::engine) struct QuarantineTransition {
+    pub(in crate::v2::engine) newly_quarantined: bool,
+    pub(in crate::v2::engine) was_reclaiming: bool,
 }
 
-pub(super) struct TerminalizeState {
-    pub(super) was_reclaiming: bool,
-    pub(super) newly_quarantined: bool,
-    pub(super) should_wake: bool,
+pub(in crate::v2::engine) struct TerminalizeState {
+    pub(in crate::v2::engine) was_reclaiming: bool,
+    pub(in crate::v2::engine) newly_quarantined: bool,
+    pub(in crate::v2::engine) should_wake: bool,
 }
 
 enum StartResult {
@@ -1265,8 +1311,8 @@ impl<T> PreparedBatchOwnership<T> {
 }
 
 fn start_operation(
-    shared: &Arc<EngineShared>,
-    connection: &Arc<ConnectionState>,
+    shared: &IoCore,
+    connection: &Arc<EstablishedIoConnection>,
     kind: OperationKind,
     mr: Mr,
     remote: Option<RemoteMr>,
@@ -1276,14 +1322,12 @@ fn start_operation(
         Ok(validated) => validated,
         Err(error) => return StartResult::Immediate((Err(error), Some(mr))),
     };
-    let admission = read_unpoison(&shared.admission);
+    let admission = shared.admission();
     if let Some(error) = shared.admission_error() {
         return StartResult::Immediate((Err(error), Some(mr)));
     }
     #[cfg(any(test, feature = "test-hooks"))]
-    shared
-        .test_driver
-        .pause_admission(super::driver::test_api::AdmissionPausePoint::OperationBeforeRegister);
+    shared.pause_operation_before_register();
     let _posting = match connection.begin_posting() {
         Ok(posting) => posting,
         Err(error) => return StartResult::Immediate((Err(error), Some(mr))),
@@ -1331,7 +1375,7 @@ fn start_operation(
         BatchPostOutcome::AllAccepted => {
             shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
             let early = state.commit_accepted();
-            shared.work_signal.publish(super::driver::CQ_RECHECK_WORK);
+            shared.publish_cq_recheck();
             drop(admission);
             if let Some(completion) = early {
                 shared
@@ -1360,7 +1404,7 @@ fn start_operation(
             } else {
                 shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
                 let early = state.commit_accepted();
-                shared.work_signal.publish(super::driver::CQ_RECHECK_WORK);
+                shared.publish_cq_recheck();
                 drop(admission);
                 if let Some(completion) = early {
                     shared
@@ -1374,7 +1418,7 @@ fn start_operation(
         | BatchPostOutcome::Ambiguous { source } => {
             shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
             let early = state.commit_accepted();
-            shared.work_signal.publish(super::driver::CQ_RECHECK_WORK);
+            shared.publish_cq_recheck();
             drop(admission);
             if let Some(completion) = early {
                 shared
@@ -1457,13 +1501,17 @@ impl ValidatedOperation {
         })
     }
 
-    fn post(self, connection: &ConnectionState, token: OperationToken) -> Result<BatchPostOutcome> {
+    fn post(
+        self,
+        connection: &EstablishedIoConnection,
+        token: OperationToken,
+    ) -> Result<BatchPostOutcome> {
         match self.kind {
             OperationKind::Recv => {
                 let mut batch =
                     PreparedRecvBatch::new(vec![RecvWr::new(token.encode()).sg(self.sge)])
                         .map_err(Error::from_v1)?;
-                connection.io.post_recv(&mut batch)
+                connection.post_recv(&mut batch)
             }
             OperationKind::Send | OperationKind::Write | OperationKind::Read => {
                 let opcode = match self.kind {
@@ -1483,14 +1531,115 @@ impl ValidatedOperation {
                     wr = wr.rdma(remote.addr, remote.rkey);
                 }
                 let mut batch = PreparedSendBatch::new(vec![wr]).map_err(Error::from_v1)?;
-                connection.io.post_send(&mut batch)
+                connection.post_send(&mut batch)
             }
         }
     }
 }
 
-impl EngineShared {
-    fn reject_cqe(&self, reason: CqeReject) {
+pub(in crate::v2::engine) struct PendingCompletion {
+    completion: WorkCompletion,
+    operation: Arc<OperationState>,
+}
+
+impl PendingCompletion {
+    pub(in crate::v2::engine) fn identity(&self) -> super::EstablishedIoIdentity {
+        self.operation.connection.identity()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::v2::engine) enum OperationQuarantineEffect {
+    Added {
+        operation: OperationToken,
+        connection: ConnectionToken,
+    },
+    Cleared {
+        operation: OperationToken,
+        connection: ConnectionToken,
+    },
+}
+
+#[derive(Default)]
+pub(in crate::v2::engine) struct IoCoreEffects {
+    after_unlock: AfterEngineUnlock,
+    quarantine: Vec<OperationQuarantineEffect>,
+    drained: Vec<ConnectionToken>,
+}
+
+impl IoCoreEffects {
+    fn extend(&mut self, mut other: Self) {
+        self.after_unlock.extend(other.after_unlock);
+        self.quarantine.append(&mut other.quarantine);
+        self.drained.append(&mut other.drained);
+    }
+
+    pub(in crate::v2::engine) fn quarantine(&self) -> &[OperationQuarantineEffect] {
+        &self.quarantine
+    }
+
+    pub(in crate::v2::engine) fn drained(&self) -> &[ConnectionToken] {
+        &self.drained
+    }
+
+    pub(in crate::v2::engine) fn publish(self) {
+        self.after_unlock.publish();
+    }
+}
+
+impl IoCore {
+    pub(in crate::v2::engine) fn fail_observers_for_close(
+        &self,
+        tokens: &[OperationToken],
+        error: Error,
+    ) -> IoCoreEffects {
+        let mut effects = IoCoreEffects::default();
+        for token in tokens.iter().copied() {
+            if let Lookup::Occupied(operation) = self.operations.lookup(token)
+                && operation.fail_observer_for_close(error.clone())
+            {
+                effects.after_unlock.operations_to_wake.push(operation);
+            }
+        }
+        effects
+    }
+
+    pub(in crate::v2::engine) fn terminalize_operations(
+        &self,
+        outcome: &MemoizedTerminalResult,
+    ) -> IoCoreEffects {
+        let mut effects = IoCoreEffects::default();
+        if !outcome.is_error() {
+            return effects;
+        }
+        for operation in self.operations.occupied() {
+            let terminalized = operation.finalize_terminal(outcome);
+            debug_assert!(
+                !terminalized.was_reclaiming || terminalized.newly_quarantined,
+                "terminal reclamation must transfer its retained MR and CQ debt to quarantine"
+            );
+            if terminalized.was_reclaiming {
+                self.pending_reclamations.fetch_sub(1, Ordering::AcqRel);
+            }
+            if terminalized.newly_quarantined {
+                self.quarantined_operations.fetch_add(1, Ordering::AcqRel);
+                self.quarantined_mrs.fetch_add(1, Ordering::AcqRel);
+                self.quarantined_bytes
+                    .fetch_add(operation.mr_len, Ordering::AcqRel);
+                self.cq_credits.retain();
+                effects.quarantine.push(OperationQuarantineEffect::Added {
+                    operation: operation.token(),
+                    connection: operation.connection_token(),
+                });
+            }
+            if terminalized.should_wake {
+                effects.after_unlock.operations_to_wake.push(operation);
+            }
+        }
+        effects
+    }
+
+    pub(in crate::v2::engine) fn reject_cqe(&self, reason: CqeReject) {
         #[cfg(any(test, feature = "test-hooks"))]
         {
             self.rejected_cqes.fetch_add(1, Ordering::Relaxed);
@@ -1500,8 +1649,10 @@ impl EngineShared {
         let _ = reason;
     }
 
-    pub(super) fn enqueue_completion(&self, completion: WorkCompletion) -> Option<ConnectionToken> {
-        let _admission = read_unpoison(&self.admission);
+    pub(in crate::v2::engine) fn prepare_completion(
+        &self,
+        completion: WorkCompletion,
+    ) -> Option<PendingCompletion> {
         let token = OperationToken::decode(completion.wr_id());
         let operation = match self.operations.lookup(token) {
             Lookup::Occupied(operation) => operation,
@@ -1522,88 +1673,87 @@ impl EngineShared {
                 return None;
             }
         };
-        let connection = match self.connections.lookup(operation.connection.token) {
-            Lookup::Occupied(connection) => connection,
-            _ => {
-                self.reject_cqe(CqeReject::StaleConnection);
-                return None;
-            }
-        };
-        if completion.qp_num() != operation.connection.qp_num() {
+        Some(PendingCompletion {
+            completion,
+            operation,
+        })
+    }
+
+    pub(in crate::v2::engine) fn enqueue_prepared_completion(
+        &self,
+        pending: PendingCompletion,
+        live: Option<super::super::registry::LiveIoConnectionProof>,
+        connection: &Arc<EstablishedIoConnection>,
+    ) -> Option<ConnectionToken> {
+        let identity = pending.operation.connection.identity();
+        if pending.completion.qp_num() != identity.qp_num {
             self.reject_cqe(CqeReject::WrongQpNum);
             return None;
         }
-        let live = match self
-            .connections
-            .prove_live_io(operation.connection.token, completion.qp_num())
+        if !live.is_some_and(|proof| proof.proves(identity.connection, identity.qp_num))
+            || connection.identity() != identity
         {
-            Some(proof) => proof,
-            None => {
-                self.reject_cqe(CqeReject::WrongConnection);
-                return None;
-            }
-        };
-        debug_assert!(live.proves(operation.connection.token, completion.qp_num()));
-        if completion.is_success() && completion.opcode() != operation.expected_opcode {
+            self.reject_cqe(CqeReject::WrongConnection);
+            return None;
+        }
+        if pending.completion.is_success()
+            && pending.completion.opcode() != pending.operation.expected_opcode
+        {
             self.reject_cqe(CqeReject::UnexpectedOpcode);
             return None;
         }
-        if !operation.mark_completion_queued() {
+        if !pending.operation.mark_completion_queued() {
             self.reject_cqe(CqeReject::Duplicate);
             return None;
         }
-        connection.enqueue_completion(completion);
-        Some(connection.token)
+        connection.enqueue_completion(pending.completion);
+        Some(identity.connection)
     }
 
-    pub(super) fn dispatch_connection_completions(
+    pub(in crate::v2::engine) fn dispatch_connection_completions(
         &self,
-        token: ConnectionToken,
+        connection: &EstablishedIoConnection,
         quantum: usize,
-    ) -> (usize, bool) {
-        let connection = match self.connections.lookup(token) {
-            Lookup::Occupied(connection) => connection,
-            _ => return (0, false),
-        };
+    ) -> (usize, bool, IoCoreEffects) {
         let mut processed = 0;
+        let mut effects = IoCoreEffects::default();
         while processed < quantum {
-            if let Some(completion) = connection.pop_completion() {
-                self.dispatch_connection_completion(completion);
-                processed += 1;
-                continue;
-            }
-            break;
+            let Some(completion) = connection.pop_completion() else {
+                break;
+            };
+            effects.extend(self.dispatch_connection_completion(completion));
+            processed += 1;
         }
-        (processed, connection.has_completion_work())
+        (processed, connection.has_completion_work(), effects)
     }
 
-    fn dispatch_queued_completion(&self, completion: WorkCompletion) -> AfterEngineUnlock {
+    fn dispatch_queued_completion(&self, completion: WorkCompletion) -> IoCoreEffects {
         let token = OperationToken::decode(completion.wr_id());
         let operation = match self.operations.lookup(token) {
             Lookup::Occupied(operation) => operation,
             Lookup::Duplicate => {
                 self.reject_cqe(CqeReject::Duplicate);
-                return AfterEngineUnlock::default();
+                return IoCoreEffects::default();
             }
             Lookup::Stale => {
                 self.reject_cqe(CqeReject::StaleOperation);
-                return AfterEngineUnlock::default();
+                return IoCoreEffects::default();
             }
             Lookup::Retired => {
                 self.reject_cqe(CqeReject::RetiredOperation);
-                return AfterEngineUnlock::default();
+                return IoCoreEffects::default();
             }
             Lookup::Unknown => {
                 self.reject_cqe(CqeReject::Unknown);
-                return AfterEngineUnlock::default();
+                return IoCoreEffects::default();
             }
         };
         match operation.record_completion(completion) {
-            CompletionDisposition::Deferred => AfterEngineUnlock::default(),
+            CompletionDisposition::Deferred => IoCoreEffects::default(),
             CompletionDisposition::Complete => self.finish_operation(operation, completion),
             CompletionDisposition::Duplicate => {
                 self.reject_cqe(CqeReject::Duplicate);
-                AfterEngineUnlock::default()
+                IoCoreEffects::default()
             }
         }
     }
@@ -1612,169 +1762,178 @@ impl EngineShared {
         &self,
         operation: Arc<OperationState>,
         completion: WorkCompletion,
-    ) -> AfterEngineUnlock {
+    ) -> IoCoreEffects {
         if self.operations.release(operation.token, true).is_none() {
             self.reject_cqe(CqeReject::Duplicate);
-            return AfterEngineUnlock::default();
+            return IoCoreEffects::default();
         }
         let removed = operation.connection.remove_accepted(operation.token);
         operation.connection.release_local(operation.direction);
         self.cq_credits.release();
         let previous = self.accepted_operations.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0, "accepted operation count must be positive");
-        if previous == 1 && self.shutdown_requested.load(Ordering::Acquire) {
-            self.work_signal.publish(super::driver::TERMINAL_WORK);
-        }
+        self.publish_terminal_if_drained(previous);
         let finished = operation.finish_completion(completion);
         if finished.was_reclaiming {
             self.pending_reclamations.fetch_sub(1, Ordering::AcqRel);
         }
+        let mut effects = IoCoreEffects {
+            after_unlock: AfterEngineUnlock {
+                events: finished.event.into_iter().collect(),
+                operations_to_wake: vec![Arc::clone(&operation)],
+            },
+            ..IoCoreEffects::default()
+        };
         if finished.was_quarantined {
             self.cq_credits.release_retained();
             self.quarantined_operations.fetch_sub(1, Ordering::AcqRel);
             self.quarantined_mrs.fetch_sub(1, Ordering::AcqRel);
             self.quarantined_bytes
                 .fetch_sub(operation.mr_len, Ordering::AcqRel);
-            self.clear_operation_quarantine(&operation);
+            effects.quarantine.push(OperationQuarantineEffect::Cleared {
+                operation: operation.token,
+                connection: operation.connection_token(),
+            });
         }
-        let event = finished.event;
-        if removed
-            && operation.connection.close_started()
-            && operation.connection.accepted_count() == 0
-        {
-            self.recover_connection_quarantine(&operation.connection);
-            self.record_connection_drained(&operation.connection);
-            self.schedule_connection_retirement(&operation.connection);
+        if removed && operation.connection.accepted_count() == 0 {
+            effects.drained.push(operation.connection_token());
         }
-        AfterEngineUnlock {
-            events: event.into_iter().collect(),
-            operations_to_wake: vec![operation],
-        }
+        effects
     }
 
-    pub(super) fn reclaim_after_qp_destroy(
+    pub(in crate::v2::engine) fn reclaim_after_qp_destroy(
         &self,
         proof: &QpDestructionProof,
-        connection: &ConnectionState,
+        connection: &EstablishedIoConnection,
+        close_error: Error,
         token: OperationToken,
-    ) -> bool {
-        if !proof.proves_identity(connection.token, connection.qp_num()) {
+    ) -> (bool, IoCoreEffects) {
+        let identity = connection.identity();
+        if !proof.proves_identity(identity.connection, identity.qp_num) {
             tracing::warn!(
-                connection = connection.token.encode(),
+                connection = identity.connection.encode(),
                 operation = token.encode(),
                 "operation reclaim rejected a mismatched QP destruction proof"
             );
-            return false;
+            return (false, IoCoreEffects::default());
         }
         let Lookup::Occupied(operation) = self.operations.lookup(token) else {
             tracing::warn!(
-                connection = connection.token.encode(),
+                connection = identity.connection.encode(),
                 operation = token.encode(),
                 "QP destruction left an accepted token without an operation registration"
             );
-            return false;
+            return (false, IoCoreEffects::default());
         };
-        if operation.connection_token() != connection.token {
+        if operation.connection_token() != identity.connection {
             tracing::warn!(
-                connection = connection.token.encode(),
+                connection = identity.connection.encode(),
                 operation = token.encode(),
                 owner = operation.connection_token().encode(),
                 "QP destruction found an accepted token owned by another connection"
             );
-            return false;
+            return (false, IoCoreEffects::default());
         }
         if !connection.remove_accepted(token) {
             tracing::warn!(
-                connection = connection.token.encode(),
+                connection = identity.connection.encode(),
                 operation = token.encode(),
                 "QP destruction reclaim lost accepted-set membership"
             );
-            return false;
+            return (false, IoCoreEffects::default());
         }
         if self.operations.release(token, false).is_none() {
             connection.add_accepted(token);
             tracing::warn!(
-                connection = connection.token.encode(),
+                connection = identity.connection.encode(),
                 operation = token.encode(),
                 "QP destruction reclaim could not retire the operation registration"
             );
-            return false;
+            return (false, IoCoreEffects::default());
         }
         connection.release_local(operation.direction);
         self.cq_credits.release();
         let previous = self.accepted_operations.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0, "accepted operation count must be positive");
-        if previous == 1 && self.shutdown_requested.load(Ordering::Acquire) {
-            self.work_signal.publish(super::driver::TERMINAL_WORK);
-        }
-        let finished = operation.finish_after_qp_destroy(connection.operation_close_error());
+        self.publish_terminal_if_drained(previous);
+        let finished = operation.finish_after_qp_destroy(close_error);
         if finished.was_reclaiming {
             self.pending_reclamations.fetch_sub(1, Ordering::AcqRel);
         }
+        let mut effects = IoCoreEffects {
+            after_unlock: AfterEngineUnlock {
+                events: finished.event.into_iter().collect(),
+                operations_to_wake: vec![Arc::clone(&operation)],
+            },
+            ..IoCoreEffects::default()
+        };
         if finished.was_quarantined {
             self.cq_credits.release_retained();
             self.quarantined_operations.fetch_sub(1, Ordering::AcqRel);
             self.quarantined_mrs.fetch_sub(1, Ordering::AcqRel);
             self.quarantined_bytes
                 .fetch_sub(operation.mr_len, Ordering::AcqRel);
-            self.clear_operation_quarantine(&operation);
+            effects.quarantine.push(OperationQuarantineEffect::Cleared {
+                operation: operation.token,
+                connection: operation.connection_token(),
+            });
         }
-        AfterEngineUnlock {
-            events: finished.event.into_iter().collect(),
-            operations_to_wake: vec![operation],
-        }
-        .publish();
-        true
+        (true, effects)
     }
 
-    fn dispatch_connection_completion(&self, completion: WorkCompletion) {
-        // CQ routing and terminal publication share the admission barrier.
-        // The lock covers only one completion and is released before an event
-        // enqueue or operation wake can re-enter posting or close.
-        let after_unlock = {
-            let _admission = read_unpoison(&self.admission);
+    fn dispatch_connection_completion(&self, completion: WorkCompletion) -> IoCoreEffects {
+        let effects = {
+            let _admission = self.admission();
             self.dispatch_queued_completion(completion)
         };
-        after_unlock.publish();
+        effects
     }
 
-    fn dispatch_queued_completions(&self, connection: &ConnectionState, budget: usize) -> bool {
+    fn dispatch_queued_completions(
+        &self,
+        connection: &EstablishedIoConnection,
+        budget: usize,
+    ) -> (bool, IoCoreEffects) {
+        let mut effects = IoCoreEffects::default();
         for _ in 0..budget {
             let Some(completion) = connection.pop_completion() else {
-                return false;
+                return (false, effects);
             };
-            self.dispatch_connection_completion(completion);
+            effects.extend(self.dispatch_connection_completion(completion));
         }
-        connection.has_completion_work()
+        (connection.has_completion_work(), effects)
     }
 
-    pub(super) fn reject_queued_completions_after_qp_destroy(
+    pub(in crate::v2::engine) fn reject_queued_completions_after_qp_destroy(
         &self,
-        connection: &ConnectionState,
-    ) -> bool {
-        // The sole driver invokes this after the destruction boundary. CQEs
-        // queued before the boundary were already dispatched normally; only
-        // completions arriving after that boundary are rejected as stale.
-        self.dispatch_queued_completions(connection, self.config.completion_dispatch_budget)
+        connection: &EstablishedIoConnection,
+    ) -> (bool, IoCoreEffects) {
+        self.dispatch_queued_completions(connection, self.completion_dispatch_budget)
     }
 
-    pub(super) fn begin_reclamation(&self, token: OperationToken) {
+    pub(in crate::v2::engine) fn begin_reclamation(&self, token: OperationToken) {
         if let Lookup::Occupied(operation) = self.operations.lookup(token) {
             operation.mark_reclaiming();
         }
     }
 
-    pub(super) fn handle_reclamation_deadline(&self, token: OperationToken) {
-        self.quarantine_operation(token);
+    pub(in crate::v2::engine) fn handle_reclamation_deadline(
+        &self,
+        token: OperationToken,
+    ) -> IoCoreEffects {
+        self.quarantine_operation(token)
     }
 
-    pub(super) fn quarantine_operation(&self, token: OperationToken) -> bool {
+    pub(in crate::v2::engine) fn quarantine_operation(
+        &self,
+        token: OperationToken,
+    ) -> IoCoreEffects {
         let Lookup::Occupied(operation) = self.operations.lookup(token) else {
-            return false;
+            return IoCoreEffects::default();
         };
         let transition = operation.mark_quarantined();
         if !transition.newly_quarantined {
-            return false;
+            return IoCoreEffects::default();
         }
         if transition.was_reclaiming {
             self.pending_reclamations.fetch_sub(1, Ordering::AcqRel);
@@ -1784,15 +1943,20 @@ impl EngineShared {
         self.quarantined_bytes
             .fetch_add(operation.mr_len, Ordering::AcqRel);
         self.cq_credits.retain();
-        self.track_operation_quarantine(&operation);
-        true
+        IoCoreEffects {
+            quarantine: vec![OperationQuarantineEffect::Added {
+                operation: operation.token(),
+                connection: operation.connection_token(),
+            }],
+            ..IoCoreEffects::default()
+        }
     }
 }
 
 #[cfg(test)]
-pub(super) fn install_accepted_operation_for_driver_test(
-    shared: &Arc<EngineShared>,
-    connection: &Arc<ConnectionState>,
+pub(in crate::v2::engine) fn install_accepted_operation_for_driver_test(
+    shared: &Arc<super::super::EngineShared>,
+    connection: &Arc<super::super::connection::ConnectionState>,
     opcode: WcOpcode,
 ) -> OperationToken {
     let direction = if opcode == WcOpcode::Recv {
@@ -1821,7 +1985,7 @@ pub(super) fn install_accepted_operation_for_driver_test(
 }
 
 #[cfg(test)]
-pub(super) fn completion_for_driver_test(
+pub(in crate::v2::engine) fn completion_for_driver_test(
     token: OperationToken,
     qp_num: u32,
     opcode: u32,
@@ -1843,6 +2007,7 @@ mod tests {
     use crate::v2::engine::config::EngineConfig;
     use crate::v2::engine::connection::{WorkRequestPoster, install_connection};
     use crate::v2::engine::lifecycle::MemoizedTerminalResult;
+    use crate::v2::engine::{EngineShared, connection::ConnectionState};
     use crate::wc::WcStatus;
     use rdma_io_sys::ibverbs::{IBV_WC_FATAL_ERR, IBV_WC_RECV, IBV_WC_SEND, IBV_WC_SUCCESS};
     use std::sync::Barrier;

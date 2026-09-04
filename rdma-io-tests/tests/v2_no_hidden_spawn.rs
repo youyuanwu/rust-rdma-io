@@ -46,6 +46,7 @@ fn collect_rs_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
             format!("scan root must be a real directory: {}", dir.display()),
         ));
     }
+
     let mut files = Vec::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
@@ -65,6 +66,81 @@ fn collect_rs_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
     }
     files.sort();
     Ok(files)
+}
+
+struct ForbiddenDependencyVisitor<'a> {
+    forbidden: &'a HashSet<&'a str>,
+    violations: Vec<String>,
+}
+
+impl<'ast> Visit<'ast> for ForbiddenDependencyVisitor<'_> {
+    fn visit_item(&mut self, item: &'ast Item) {
+        if !is_test_only(item_attrs(item)) {
+            visit::visit_item(self, item);
+        }
+    }
+
+    fn visit_impl_item(&mut self, item: &'ast ImplItem) {
+        if !is_test_only(impl_item_attrs(item)) {
+            visit::visit_impl_item(self, item);
+        }
+    }
+
+    fn visit_trait_item(&mut self, item: &'ast TraitItem) {
+        if !is_test_only(trait_item_attrs(item)) {
+            visit::visit_trait_item(self, item);
+        }
+    }
+
+    fn visit_foreign_item(&mut self, item: &'ast ForeignItem) {
+        if !is_test_only(foreign_item_attrs(item)) {
+            visit::visit_foreign_item(self, item);
+        }
+    }
+
+    fn visit_path(&mut self, path: &'ast syn::Path) {
+        for segment in &path.segments {
+            let identifier = segment.ident.to_string();
+            if self.forbidden.contains(identifier.as_str()) {
+                self.violations
+                    .push(format!("{identifier}:{}", path.span().start().line));
+            }
+        }
+        visit::visit_path(self, path);
+    }
+
+    fn visit_use_tree(&mut self, tree: &'ast UseTree) {
+        let identifier = match tree {
+            UseTree::Path(path) => Some(&path.ident),
+            UseTree::Name(name) => Some(&name.ident),
+            UseTree::Rename(rename) => Some(&rename.ident),
+            UseTree::Glob(_) | UseTree::Group(_) => None,
+        };
+        if let Some(identifier) = identifier {
+            let identifier = identifier.to_string();
+            if self.forbidden.contains(identifier.as_str()) {
+                self.violations
+                    .push(format!("{identifier}:{}", tree.span().start().line));
+            }
+        }
+        visit::visit_use_tree(self, tree);
+    }
+}
+
+fn find_forbidden_production_dependencies(
+    source: &str,
+    forbidden: &[&str],
+) -> Result<Vec<String>, syn::Error> {
+    let syntax = syn::parse_file(source)?;
+    let forbidden = forbidden.iter().copied().collect::<HashSet<_>>();
+    let mut visitor = ForbiddenDependencyVisitor {
+        forbidden: &forbidden,
+        violations: Vec::new(),
+    };
+    visitor.visit_file(&syntax);
+    visitor.violations.sort();
+    visitor.violations.dedup();
+    Ok(visitor.violations)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -607,6 +683,41 @@ fn expression_block() {
 }
 
 #[test]
+fn dependency_detector_ignores_test_only_items_but_fails_closed_for_production() {
+    let source = r#"
+        use crate::EngineShared;
+
+        #[cfg(test)]
+        use crate::ConnectionState;
+
+        fn production(value: crate::WorkRequestPoster) {
+            let _ = value;
+        }
+    "#;
+    let violations = find_forbidden_production_dependencies(
+        source,
+        &["EngineShared", "ConnectionState", "WorkRequestPoster"],
+    )
+    .unwrap();
+    assert_eq!(violations.len(), 2, "{violations:#?}");
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.starts_with("EngineShared:"))
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.starts_with("WorkRequestPoster:"))
+    );
+    assert!(
+        !violations
+            .iter()
+            .any(|violation| violation.starts_with("ConnectionState:"))
+    );
+}
+
+#[test]
 fn test_no_hidden_spawn_in_v2() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let workspace_root = Path::new(manifest_dir).parent().expect("workspace root");
@@ -629,6 +740,7 @@ fn test_no_hidden_spawn_in_v2() {
         v2_dir.join("engine").join("mod.rs"),
         v2_dir.join("engine").join("driver.rs"),
         v2_dir.join("engine").join("io_core").join("mod.rs"),
+        v2_dir.join("engine").join("io_core").join("operation.rs"),
         v2_dir.join("engine").join("io.rs"),
     ] {
         assert!(
@@ -662,6 +774,10 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     let v2_dir = workspace_root.join("rdma-io").join("src").join("v2");
     let message_path = v2_dir.join("message_transport.rs");
     let io_path = v2_dir.join("engine").join("io.rs");
+    let io_core_mod_path = v2_dir.join("engine").join("io_core").join("mod.rs");
+    let io_core_operation_path = v2_dir.join("engine").join("io_core").join("operation.rs");
+    let engine_mod_path = v2_dir.join("engine").join("mod.rs");
+    let connection_path = v2_dir.join("engine").join("connection.rs");
     let v2_mod_path = v2_dir.join("mod.rs");
 
     let message = fs::read_to_string(&message_path).expect("read message transport source");
@@ -686,6 +802,57 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
             message_path.display()
         );
     }
+
+    let forbidden_core_dependencies = [
+        "EngineShared",
+        "ConnectionState",
+        "WorkRequestPoster",
+        "CmState",
+        "ListenerState",
+        "MessageTransportDriver",
+        "message_transport",
+    ];
+    for path in [&io_core_mod_path, &io_core_operation_path] {
+        let source = fs::read_to_string(path).expect("read I/O core source");
+        let violations =
+            find_forbidden_production_dependencies(&source, &forbidden_core_dependencies)
+                .expect("parse I/O core source");
+        assert!(
+            violations.is_empty(),
+            "{} has forbidden production dependencies: {}",
+            path.display(),
+            violations.join(", ")
+        );
+    }
+
+    let engine_mod = fs::read_to_string(&engine_mod_path).expect("read engine module source");
+    let engine_shared = engine_mod
+        .split("struct EngineShared {")
+        .nth(1)
+        .and_then(|tail| tail.split("\n}").next())
+        .expect("locate EngineShared fields");
+    for extracted in [
+        "operations:",
+        "cq_credits:",
+        "accepted_operations:",
+        "pending_reclamations:",
+        "quarantined_operations:",
+        "published_completion_connections:",
+    ] {
+        assert!(
+            !engine_shared.contains(extracted),
+            "{} must compose IoCore instead of declaring `{extracted}`",
+            engine_mod_path.display()
+        );
+    }
+    assert!(engine_shared.contains("io_core: Arc<IoCore>"));
+    assert!(engine_mod.contains("pub use io_core::RdmaOperation;"));
+
+    let connection_source = fs::read_to_string(&connection_path).expect("read connection source");
+    assert!(
+        connection_source.contains("owner: Weak<dyn WorkRequestPoster>"),
+        "session posting adapter must not strongly retain the QP/CmId owner"
+    );
 
     let io_source = fs::read_to_string(&io_path).expect("read engine I/O boundary source");
     for forbidden in [

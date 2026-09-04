@@ -17,7 +17,7 @@ impl EngineShared {
         let admission = read_unpoison(&self.admission);
         let lifecycle = connection.lock_lifecycle();
         let first = connection.begin_close();
-        let mut operations_to_wake = Vec::new();
+        let mut close_effects = None;
         if first {
             match connection.transition_to_error_once() {
                 Ok(_) => {}
@@ -38,19 +38,16 @@ impl EngineShared {
             let engine_is_terminating = self.shutdown_requested.load(Ordering::Acquire);
             if !engine_is_terminating {
                 let error = connection.operation_close_error();
-                for token in connection.accepted_tokens() {
-                    if let Lookup::Occupied(operation) = self.operations.lookup(token)
-                        && operation.fail_observer_for_close(error.clone())
-                    {
-                        operations_to_wake.push(operation);
-                    }
-                }
+                close_effects = Some(
+                    self.io_core
+                        .fail_observers_for_close(&connection.accepted_tokens(), error),
+                );
             }
         }
         drop(lifecycle);
         drop(admission);
-        for operation in operations_to_wake {
-            operation.wake();
+        if let Some(effects) = close_effects {
+            effects.publish();
         }
         if first {
             self.schedule_connection_drain(connection.token);
@@ -188,7 +185,7 @@ mod tests {
     use std::time::Duration;
 
     use super::super::connection::{WorkRequestPoster, install_connection};
-    use super::super::operation::install_accepted_operation_for_driver_test;
+    use super::super::io_core::install_accepted_operation_for_driver_test;
     use super::super::registry::OperationToken;
     use super::super::{CompletionMode, RdmaConnectionConfig, test_engine_pair};
     use crate::v2::error::{Error, Result};

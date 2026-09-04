@@ -38,7 +38,6 @@ pub(crate) mod io;
 mod io_core;
 mod lifecycle;
 mod listener;
-mod operation;
 mod registry;
 mod resources;
 mod scheduler;
@@ -47,6 +46,7 @@ mod scheduler;
 mod api_tests;
 
 use std::collections::{HashMap, VecDeque};
+#[cfg(test)]
 use std::ops::Deref;
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::atomic::AtomicU64;
@@ -70,11 +70,11 @@ pub use driver::{
     TestEngineQp, TestEngineResources, TestProviderLimits, TestRouteHandle,
     TestSharedResourceIdentity,
 };
-use io_core::IoCore;
+pub use io_core::RdmaOperation;
+use io_core::{IoCore, IoDriverSignal};
 use lifecycle::MemoizedTerminalResult;
 pub use listener::{RdmaListener, RdmaListenerConfig};
-pub use operation::RdmaOperation;
-use registry::{ConnectionRegistry, OperationToken, lock_unpoison, write_unpoison};
+use registry::{ConnectionRegistry, lock_unpoison, read_unpoison, write_unpoison};
 use resources::{EngineResourceRefs, EngineResources};
 use scheduler::WorkScheduler;
 use scheduler::{DeadlineKind, DeadlineRequest};
@@ -411,6 +411,7 @@ pub struct RdmaEngineDriver {
     cq_buffer: Box<[super::Completion]>,
     deadline_sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
     deadline_at: Option<tokio::time::Instant>,
+    deadline_io_turn: bool,
     runtime_checked: bool,
 }
 
@@ -419,21 +420,20 @@ struct EngineShared {
     provider: Option<config::ProviderLimits>,
     connection_admission: Arc<ConnectionAdmissionPool>,
     connections: ConnectionRegistry,
-    // Temporary `Deref<Target = IoCore>` migration scaffolding keeps the
-    // established operation paths compiling while ownership moves first.
+    // The core drops before root CQ/PD/CM resources retained at the end.
     io_core: Arc<IoCore>,
     cm: cm::CmState,
     #[cfg(any(test, feature = "test-hooks"))]
     rejected_cm_events: AtomicU64,
     deadline_requests: Mutex<VecDeque<DeadlineRequest>>,
-    admission: RwLock<()>,
+    admission: Arc<RwLock<()>>,
     lifecycle: AtomicU8,
     shutdown_requested: AtomicBool,
     shutdown_deadline_scheduled: AtomicBool,
     shutdown_connection_close_started: AtomicBool,
     failure_retained: AtomicBool,
     frontend_count: AtomicUsize,
-    work_signal: WorkSignal,
+    work_signal: Arc<WorkSignal>,
     // Notify stores only live Notified futures and wakes every concurrent
     // shutdown waiter without retaining registrations from dropped futures.
     terminal_notify: Notify,
@@ -442,7 +442,7 @@ struct EngineShared {
     #[cfg(any(test, feature = "test-hooks"))]
     test_resources: Option<resources::TestResourceRefs>,
     #[cfg(any(test, feature = "test-hooks"))]
-    test_driver: driver::test_api::TestDriverState,
+    test_driver: Arc<driver::test_api::TestDriverState>,
     // Rust drops fields in declaration order. Keep this root retain after every
     // registry/test owner so quarantined QP/CM/MR descendants are released
     // before the shared CQ, PD, CM event channel, and context can disappear.
@@ -466,9 +466,40 @@ struct QuarantineState {
     connection_entries: HashMap<registry::ConnectionToken, usize>,
 }
 
+struct EngineIoDriverSignal {
+    work_signal: Arc<WorkSignal>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    test_driver: Arc<driver::test_api::TestDriverState>,
+}
+
+impl IoDriverSignal for EngineIoDriverSignal {
+    fn publish_cq_recheck(&self) {
+        self.work_signal.publish(driver::CQ_RECHECK_WORK);
+    }
+
+    fn publish_completion_dispatch(&self) {
+        self.work_signal.publish(driver::COMPLETION_DISPATCH_WORK);
+    }
+
+    fn publish_reclamation(&self) {
+        self.work_signal.publish(driver::RECLAMATION_WORK);
+    }
+
+    fn publish_terminal(&self) {
+        self.work_signal.publish(driver::TERMINAL_WORK);
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn pause_operation_before_register(&self) {
+        self.test_driver
+            .pause_admission(driver::test_api::AdmissionPausePoint::OperationBeforeRegister);
+    }
+}
+
+#[cfg(test)]
 impl Deref for EngineShared {
-    // Phase 1 migration scaffold: remove when operation methods move onto
-    // `IoCore` in Phase 2.
+    // Unit tests inspect exact core accounting without exposing test-only
+    // accessors in production builds.
     type Target = IoCore;
 
     fn deref(&self) -> &Self::Target {
@@ -483,7 +514,23 @@ impl EngineShared {
         resource_refs: Option<EngineResourceRefs>,
     ) -> Result<Self> {
         let connections = ConnectionRegistry::new(config.max_live_connections)?;
-        let io_core = IoCore::new(config.max_inflight_operations, config.cq_capacity)?;
+        let admission = Arc::new(RwLock::new(()));
+        let work_signal = Arc::new(WorkSignal::new());
+        #[cfg(any(test, feature = "test-hooks"))]
+        let test_driver = Arc::new(driver::test_api::TestDriverState::new());
+        let io_driver_signal: Arc<dyn IoDriverSignal> = Arc::new(EngineIoDriverSignal {
+            work_signal: Arc::clone(&work_signal),
+            #[cfg(any(test, feature = "test-hooks"))]
+            test_driver: Arc::clone(&test_driver),
+        });
+        let io_core = IoCore::new(
+            config.max_inflight_operations,
+            config.cq_capacity,
+            config.missing_cqe_deadline,
+            config.completion_dispatch_budget,
+            Arc::clone(&admission),
+            io_driver_signal,
+        )?;
         let connection_admission = ConnectionAdmissionPool::new(config.max_live_connections);
         let cm = cm::CmState::new(config.max_live_connections)?;
         Ok(Self {
@@ -496,21 +543,21 @@ impl EngineShared {
             #[cfg(any(test, feature = "test-hooks"))]
             rejected_cm_events: AtomicU64::new(0),
             deadline_requests: Mutex::new(VecDeque::new()),
-            admission: RwLock::new(()),
+            admission,
             lifecycle: AtomicU8::new(lifecycle_to_u8(RdmaEngineLifecycle::Created)),
             shutdown_requested: AtomicBool::new(false),
             shutdown_deadline_scheduled: AtomicBool::new(false),
             shutdown_connection_close_started: AtomicBool::new(false),
             failure_retained: AtomicBool::new(false),
             frontend_count: AtomicUsize::new(1),
-            work_signal: WorkSignal::new(),
+            work_signal,
             terminal_notify: Notify::new(),
             terminal: Mutex::new(None),
             quarantines: Mutex::new(QuarantineState::default()),
             #[cfg(any(test, feature = "test-hooks"))]
             test_resources: None,
             #[cfg(any(test, feature = "test-hooks"))]
-            test_driver: driver::test_api::TestDriverState::new(),
+            test_driver,
             resource_refs,
         })
     }
@@ -538,6 +585,7 @@ impl EngineShared {
         if self.shutdown_requested.swap(true, Ordering::AcqRel) {
             return false;
         }
+        self.io_core.close_admission(Error::DriverShutdown);
         self.transition_shutdown_requested();
         true
     }
@@ -547,13 +595,15 @@ impl EngineShared {
             !outcome.is_connection_quarantined(),
             "ConnectionQuarantined is connection-local; no connection quarantine can terminate the engine driver"
         );
-        let (operations_to_wake, connections_to_wake) = {
+        let (io_effects, connections_to_wake) = {
             let _admission = write_unpoison(&self.admission);
             let mut terminal = lock_unpoison(&self.terminal);
             if terminal.is_some() {
                 return;
             }
             self.shutdown_requested.store(true, Ordering::Release);
+            self.io_core
+                .close_admission(outcome.error().unwrap_or(Error::DriverShutdown));
             self.transition_shutdown_requested();
             let lifecycle = if outcome.is_success() {
                 RdmaEngineLifecycle::Terminated
@@ -563,36 +613,14 @@ impl EngineShared {
             *terminal = Some(outcome.clone());
             self.transition_terminal(lifecycle);
 
-            let mut operations_to_wake = Vec::new();
-            if outcome.is_error() {
-                for operation in self.operations.occupied() {
-                    let terminalized = operation.finalize_terminal(&outcome);
-                    debug_assert!(
-                        !terminalized.was_reclaiming || terminalized.newly_quarantined,
-                        "terminal reclamation must transfer its retained MR and CQ debt to quarantine"
-                    );
-                    if terminalized.was_reclaiming {
-                        self.pending_reclamations.fetch_sub(1, Ordering::AcqRel);
-                    }
-                    if terminalized.newly_quarantined {
-                        self.quarantined_operations.fetch_add(1, Ordering::AcqRel);
-                        self.quarantined_mrs.fetch_add(1, Ordering::AcqRel);
-                        self.quarantined_bytes
-                            .fetch_add(operation.mr_len, Ordering::AcqRel);
-                        self.cq_credits.retain();
-                        self.track_operation_quarantine(&operation);
-                    }
-                    if terminalized.should_wake {
-                        operations_to_wake.push(operation);
-                    }
-                }
-            }
+            let io_effects = self.io_core.terminalize_operations(&outcome);
 
             let connections_to_wake = self.connections.occupied();
             drop(terminal);
-            (operations_to_wake, connections_to_wake)
+            (io_effects, connections_to_wake)
         };
 
+        self.apply_io_effects(&io_effects);
         self.cm.terminalize(&outcome);
         for connection in &connections_to_wake {
             if outcome.is_error() && connection.retain_bundle_for_engine_failure() {
@@ -602,9 +630,7 @@ impl EngineShared {
                 event.deliver();
             }
         }
-        for operation in operations_to_wake {
-            operation.wake();
-        }
+        io_effects.publish();
         for connection in connections_to_wake {
             connection.wake_close();
         }
@@ -691,7 +717,7 @@ impl EngineShared {
     }
 
     fn unsafe_outstanding_operations(&self) -> usize {
-        self.accepted_operations.load(Ordering::Acquire)
+        self.io_core.accepted_count()
     }
 
     fn retain_after_failure(shared: &Arc<Self>) {
@@ -715,12 +741,14 @@ impl EngineShared {
         )
     }
 
-    fn track_operation_quarantine(&self, operation: &operation::OperationState) -> bool {
+    fn track_operation_quarantine(
+        &self,
+        operation: registry::OperationToken,
+        connection: registry::ConnectionToken,
+    ) -> bool {
         self.track_quarantine(
-            QuarantineKey::Operation(operation.token()),
-            QuarantineEntry {
-                connection: operation.connection_token(),
-            },
+            QuarantineKey::Operation(operation),
+            QuarantineEntry { connection },
         )
     }
 
@@ -753,11 +781,12 @@ impl EngineShared {
         self.clear_quarantine(QuarantineKey::Connection(token), token)
     }
 
-    fn clear_operation_quarantine(&self, operation: &operation::OperationState) -> bool {
-        self.clear_quarantine(
-            QuarantineKey::Operation(operation.token()),
-            operation.connection_token(),
-        )
+    fn clear_operation_quarantine(
+        &self,
+        operation: registry::OperationToken,
+        connection: registry::ConnectionToken,
+    ) -> bool {
+        self.clear_quarantine(QuarantineKey::Operation(operation), connection)
     }
 
     fn clear_quarantine(&self, key: QuarantineKey, connection: registry::ConnectionToken) -> bool {
@@ -784,18 +813,19 @@ impl EngineShared {
 
     fn diagnostics(&self) -> RdmaEngineDiagnostics {
         let connection_counts = self.connection_admission.snapshot();
+        let io = self.io_core.diagnostics();
         RdmaEngineDiagnostics {
             lifecycle: self.lifecycle(),
             terminal_error: self.outcome().and_then(|outcome| outcome.summary()),
             live_connections: connection_counts.live,
-            registered_operations: self.operations.live(),
-            accepted_operations: self.accepted_operations.load(Ordering::Acquire),
-            pending_reclamations: self.pending_reclamations.load(Ordering::Acquire),
-            available_cq_credits: self.cq_credits.free(),
-            retained_cq_credits: self.cq_credits.retained(),
-            quarantined_operations: self.quarantined_operations.load(Ordering::Acquire),
-            quarantined_mrs: self.quarantined_mrs.load(Ordering::Acquire),
-            quarantined_bytes: self.quarantined_bytes.load(Ordering::Acquire),
+            registered_operations: io.registered_operations,
+            accepted_operations: io.accepted_operations,
+            pending_reclamations: io.pending_reclamations,
+            available_cq_credits: io.available_cq_credits,
+            retained_cq_credits: io.retained_cq_credits,
+            quarantined_operations: io.quarantined_operations,
+            quarantined_mrs: io.quarantined_mrs,
+            quarantined_bytes: io.quarantined_bytes,
             quarantined_connections: connection_counts.quarantined_bundles,
         }
     }
@@ -813,31 +843,15 @@ impl EngineShared {
     }
 
     pub(crate) fn publish_completion(&self, connection: &Arc<connection::ConnectionState>) {
-        if connection.mark_completion_published() {
-            lock_unpoison(&self.published_completion_connections).push_back(connection.token);
-        }
-        self.work_signal.publish(driver::COMPLETION_DISPATCH_WORK);
+        self.io_core.publish_connection(&connection.io);
     }
 
     fn take_published_completion(&self) -> Option<registry::ConnectionToken> {
-        let connection = lock_unpoison(&self.published_completion_connections).pop_front()?;
-        if let registry::Lookup::Occupied(state) = self.connections.lookup(connection) {
-            state.clear_completion_published();
-        }
-        Some(connection)
+        self.io_core.take_published_connection()
     }
 
     fn has_published_completions(&self) -> bool {
-        !lock_unpoison(&self.published_completion_connections).is_empty()
-    }
-
-    fn schedule_reclamation(&self, token: OperationToken) {
-        self.begin_reclamation(token);
-        self.schedule_deadline(
-            DeadlineKind::Reclamation,
-            token.encode(),
-            self.config.missing_cqe_deadline,
-        );
+        self.io_core.has_published_connections()
     }
 
     fn schedule_deadline(&self, kind: DeadlineKind, token: u64, after: Duration) {
@@ -855,6 +869,114 @@ impl EngineShared {
 
     fn has_deadline_requests(&self) -> bool {
         !lock_unpoison(&self.deadline_requests).is_empty()
+    }
+
+    fn apply_io_effects(&self, effects: &io_core::IoCoreEffects) {
+        for effect in effects.quarantine().iter().copied() {
+            match effect {
+                io_core::OperationQuarantineEffect::Added {
+                    operation,
+                    connection,
+                } => {
+                    self.track_operation_quarantine(operation, connection);
+                }
+                io_core::OperationQuarantineEffect::Cleared {
+                    operation,
+                    connection,
+                } => {
+                    self.clear_operation_quarantine(operation, connection);
+                }
+            }
+        }
+        for token in effects.drained().iter().copied() {
+            let registry::Lookup::Occupied(connection) = self.connections.lookup(token) else {
+                continue;
+            };
+            if connection.close_started() && connection.accepted_count() == 0 {
+                self.recover_connection_quarantine(&connection);
+                self.record_connection_drained(&connection);
+                self.schedule_connection_retirement(&connection);
+            }
+        }
+    }
+
+    pub(super) fn enqueue_completion(
+        &self,
+        completion: crate::wc::WorkCompletion,
+    ) -> Option<registry::ConnectionToken> {
+        let _admission = read_unpoison(&self.admission);
+        let pending = self.io_core.prepare_completion(completion)?;
+        let identity = pending.identity();
+        let connection = match self.connections.lookup(identity.connection) {
+            registry::Lookup::Occupied(connection) => connection,
+            _ => {
+                self.io_core.reject_cqe(io_core::CqeReject::StaleConnection);
+                return None;
+            }
+        };
+        let live = self
+            .connections
+            .prove_live_io(identity.connection, identity.qp_num);
+        self.io_core
+            .enqueue_prepared_completion(pending, live, &connection.io)
+    }
+
+    pub(super) fn dispatch_connection_completions(
+        &self,
+        token: registry::ConnectionToken,
+        quantum: usize,
+    ) -> (usize, bool) {
+        let connection = match self.connections.lookup(token) {
+            registry::Lookup::Occupied(connection) => connection,
+            _ => return (0, false),
+        };
+        let (processed, remains_ready, effects) = self
+            .io_core
+            .dispatch_connection_completions(&connection.io, quantum);
+        self.apply_io_effects(&effects);
+        effects.publish();
+        (processed, remains_ready)
+    }
+
+    pub(super) fn reclaim_after_qp_destroy(
+        &self,
+        proof: &connection::QpDestructionProof,
+        connection: &connection::ConnectionState,
+        token: registry::OperationToken,
+    ) -> bool {
+        let (reclaimed, effects) = self.io_core.reclaim_after_qp_destroy(
+            proof,
+            &connection.io,
+            connection.operation_close_error(),
+            token,
+        );
+        self.apply_io_effects(&effects);
+        effects.publish();
+        reclaimed
+    }
+
+    pub(super) fn reject_queued_completions_after_qp_destroy(
+        &self,
+        connection: &connection::ConnectionState,
+    ) -> bool {
+        let (remains_ready, effects) = self
+            .io_core
+            .reject_queued_completions_after_qp_destroy(&connection.io);
+        self.apply_io_effects(&effects);
+        effects.publish();
+        remains_ready
+    }
+
+    pub(super) fn handle_reclamation_deadline(&self, token: registry::OperationToken) {
+        let effects = self.io_core.handle_reclamation_deadline(token);
+        self.apply_io_effects(&effects);
+        effects.publish();
+    }
+
+    pub(super) fn quarantine_operation(&self, token: registry::OperationToken) {
+        let effects = self.io_core.quarantine_operation(token);
+        self.apply_io_effects(&effects);
+        effects.publish();
     }
 }
 
