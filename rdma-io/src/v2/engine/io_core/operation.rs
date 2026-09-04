@@ -465,8 +465,14 @@ fn commit_internal_entries(shared: &IoCore, entries: Vec<InternalBatchEntry>) ->
     let mut after_unlock = AfterEngineUnlock::default();
     for (state, completion) in early {
         let effects = shared.finish_operation(state, completion);
-        debug_assert!(effects.quarantine.is_empty());
-        debug_assert!(effects.drained.is_empty());
+        assert!(
+            effects.quarantine.is_empty(),
+            "post reconciliation cannot produce quarantine effects"
+        );
+        assert!(
+            effects.drained.is_empty(),
+            "post reconciliation cannot produce accepted-zero effects"
+        );
         after_unlock.extend(effects.after_unlock);
     }
     after_unlock
