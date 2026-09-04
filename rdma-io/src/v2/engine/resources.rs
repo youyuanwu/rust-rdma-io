@@ -11,7 +11,7 @@ use super::super::error::{Error, Result};
 use super::super::pd::Pd;
 use super::config::{CompletionMode, EngineConfig, ProviderLimits};
 #[cfg(panic = "unwind")]
-use super::{RuntimeProbe, probe_runtime};
+use crate::v2::runtime::{RuntimeProbe, probe_runtime};
 
 pub(super) struct EngineResources {
     // Rust drops fields in declaration order. Keep both Tokio adapters before

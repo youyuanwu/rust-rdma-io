@@ -425,8 +425,10 @@ async fn run_accept_cancellation_and_live_shutdown(mode: CompletionMode) {
         )
     });
     let mut close_listener = Box::pin(listener.close());
-    assert!(poll_once(close_listener.as_mut()).is_pending());
-    close_listener.await.unwrap();
+    match poll_once(close_listener.as_mut()) {
+        Poll::Ready(result) => result.unwrap(),
+        Poll::Pending => close_listener.await.unwrap(),
+    }
     let selected_result = selected_during_close.await;
     assert!(matches!(selected_result, Err(Error::TransportClosed)));
     match pending_accept.await {

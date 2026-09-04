@@ -34,6 +34,7 @@ mod connection;
 mod diagnostics;
 mod drain;
 mod driver;
+pub(crate) mod io;
 mod lifecycle;
 mod listener;
 mod operation;
@@ -45,8 +46,6 @@ mod scheduler;
 mod api_tests;
 
 use std::collections::{HashMap, VecDeque};
-#[cfg(panic = "unwind")]
-use std::panic::{AssertUnwindSafe, catch_unwind};
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
@@ -58,11 +57,9 @@ use tokio::sync::Notify;
 use config::EngineConfig;
 pub use config::{CompletionMode, RdmaConnectionConfig};
 use connection::ConnectionAdmissionPool;
-pub(crate) use connection::ConnectionState;
 pub use connection::{RdmaConnection, RdmaConnectionIdentity};
 pub use diagnostics::{RdmaEngineDiagnostics, RdmaEngineLifecycle, RdmaEngineTerminalError};
 use driver::WorkSignal;
-pub(crate) use driver::preflight_driver_runtime;
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
 pub use driver::{
@@ -74,10 +71,7 @@ pub use driver::{
 use lifecycle::MemoizedTerminalResult;
 pub use listener::{RdmaListener, RdmaListenerConfig};
 pub use operation::RdmaOperation;
-#[cfg(test)]
-pub(crate) use operation::{BatchOwnershipTransfer, PreparedBatchOwnership};
 use operation::{CqCreditPool, OperationRegistry};
-pub(crate) use operation::{DetachedCallbackAfterUnlock, DetachedOperationCompletion};
 use registry::{ConnectionRegistry, OperationToken, lock_unpoison, write_unpoison};
 use resources::{EngineResourceRefs, EngineResources};
 use scheduler::WorkScheduler;
@@ -85,17 +79,12 @@ use scheduler::{DeadlineKind, DeadlineRequest};
 
 use super::error::{Error, Result};
 
-pub(crate) type ConnectionSetup = Box<dyn FnOnce(&RdmaConnection) -> Result<SetupSummary> + Send>;
-
-pub(crate) trait ConnectionTerminalSink: Send + Sync {
-    fn disconnected(&self);
-    fn terminalize(&self, error: Error);
-    fn closed(&self, result: Result<()>);
-}
+type ConnectionSetup =
+    Box<dyn FnOnce(io::IoConnection, io::IoEventReceiver) -> Result<usize> + Send>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct SetupSummary {
-    pub(crate) posted_wrs: usize,
+struct SetupSummary {
+    posted_wrs: usize,
 }
 
 /// Builder for one device-bound, explicitly driven RDMA engine.
@@ -258,7 +247,7 @@ impl RdmaEngineBuilder {
 /// new submissions are finished, and prefer [`RdmaEngine::shutdown`] when the
 /// terminal result must be observed.
 pub struct RdmaEngine {
-    pub(crate) shared: Arc<EngineShared>,
+    shared: Arc<EngineShared>,
 }
 
 impl Clone for RdmaEngine {
@@ -326,13 +315,16 @@ impl RdmaEngine {
         cm::connect(Arc::clone(&self.shared), address, config).await
     }
 
-    pub(crate) async fn connect_with_setup(
+    pub(crate) async fn connect_with_io_setup<F>(
         &self,
         address: std::net::SocketAddr,
         config: RdmaConnectionConfig,
-        setup: ConnectionSetup,
-    ) -> Result<RdmaConnection> {
-        cm::connect_with_setup(Arc::clone(&self.shared), address, config, setup).await
+        setup: F,
+    ) -> Result<RdmaConnection>
+    where
+        F: FnOnce(io::IoConnection, io::IoEventReceiver) -> Result<usize> + Send + 'static,
+    {
+        cm::connect_with_setup(Arc::clone(&self.shared), address, config, Box::new(setup)).await
     }
 
     pub(crate) fn validate_message_connection_config(
@@ -420,7 +412,7 @@ pub struct RdmaEngineDriver {
     runtime_checked: bool,
 }
 
-pub(crate) struct EngineShared {
+struct EngineShared {
     config: EngineConfig,
     provider: Option<config::ProviderLimits>,
     connection_admission: Arc<ConnectionAdmissionPool>,
@@ -614,7 +606,9 @@ impl EngineShared {
             if outcome.is_error() && connection.retain_bundle_for_engine_failure() {
                 self.track_connection_quarantine(connection.token);
             }
-            connection.finalize_engine(&outcome);
+            if let Some(event) = connection.finalize_engine(&outcome) {
+                event.deliver();
+            }
         }
         for operation in operations_to_wake {
             operation.wake();
@@ -879,48 +873,6 @@ fn preflight_tokio_io() -> Result<()> {
         ));
     }
     Ok(())
-}
-
-#[cfg(panic = "unwind")]
-pub(super) enum RuntimeProbe<T> {
-    Completed(T),
-    Panicked,
-}
-
-#[cfg(panic = "unwind")]
-pub(super) fn probe_runtime<T>(probe: impl FnOnce() -> T) -> RuntimeProbe<T> {
-    // Tokio exposes no capability query for optional I/O/time drivers. Serialize
-    // the constructor probe and suppress only its current-thread panic; panics
-    // from every other thread still reach the application's installed hook.
-    static PROBE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    let _probe = PROBE_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    let thread = std::thread::current().id();
-    type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static>;
-    let previous: Arc<Mutex<Option<PanicHook>>> =
-        Arc::new(Mutex::new(Some(std::panic::take_hook())));
-    let fallback = Arc::clone(&previous);
-    std::panic::set_hook(Box::new(move |info| {
-        if std::thread::current().id() != thread {
-            let hook = fallback.lock().unwrap_or_else(|error| error.into_inner());
-            if let Some(hook) = hook.as_ref() {
-                hook(info);
-            }
-        }
-    }));
-    let result = catch_unwind(AssertUnwindSafe(probe));
-    let previous = previous
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .take()
-        .expect("runtime probe panic hook");
-    std::panic::set_hook(previous);
-    match result {
-        Ok(value) => RuntimeProbe::Completed(value),
-        Err(_) => RuntimeProbe::Panicked,
-    }
 }
 
 fn failed_engine_quarantine() -> &'static Mutex<Vec<Arc<EngineShared>>> {

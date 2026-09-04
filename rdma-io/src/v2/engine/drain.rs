@@ -22,10 +22,13 @@ impl EngineShared {
             match connection.transition_to_error_once() {
                 Ok(_) => {}
                 Err(error) => {
-                    connection.mark_cm_failure(error.clone());
+                    let event = connection.mark_cm_failure(error.clone());
                     connection.rollback_draining_count();
                     drop(lifecycle);
                     drop(admission);
+                    if let Some(event) = event {
+                        event.deliver();
+                    }
                     self.finish(MemoizedTerminalResult::from_error(error));
                     return;
                 }
@@ -113,7 +116,7 @@ impl EngineShared {
                 None
             } else {
                 match connection.establish_qp_destruction_boundary(&lifecycle) {
-                    Ok(_) => Some(tokens),
+                    Ok(proof) => Some((tokens, proof)),
                     Err(error) => {
                         tracing::warn!(
                             qp_num = connection.qp_num(),
@@ -125,9 +128,9 @@ impl EngineShared {
                 }
             }
         };
-        if let Some(tokens) = forced_tokens {
+        if let Some((tokens, proof)) = forced_tokens {
             for operation in tokens {
-                let _ = self.reclaim_after_qp_destroy(&connection, operation);
+                let _ = self.reclaim_after_qp_destroy(&proof, &connection, operation);
             }
             if self.reject_queued_completions_after_qp_destroy(&connection) {
                 self.publish_completion(&connection);
@@ -144,7 +147,9 @@ impl EngineShared {
             for operation in connection.accepted_tokens() {
                 self.quarantine_operation(operation);
             }
-            connection.publish_quarantine(outstanding);
+            if let Some(event) = connection.publish_quarantine(outstanding) {
+                event.deliver();
+            }
         }
         if connection.close_started() && connection.accepted_count() == 0 {
             self.recover_connection_quarantine(&connection);

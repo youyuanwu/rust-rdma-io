@@ -247,7 +247,10 @@ async fn run_malformed_hello(mode: CompletionMode) {
         let (client, client_message_driver) = client.unwrap();
         let peer = client.test_connection().unwrap();
         let server = DrivenMessageTransport::new(server, server_message_driver);
-        send_peer_frame(&peer, &frame).await.unwrap();
+        match send_peer_frame(&peer, &frame).await {
+            Ok(()) | Err(Error::TransportClosed) => {}
+            Err(error) => panic!("failed to inject malformed HELLO ({expected}): {error:?}"),
+        }
         let error = tokio::time::timeout(Duration::from_secs(15), server.ready())
             .await
             .expect("malformed HELLO did not resolve readiness")

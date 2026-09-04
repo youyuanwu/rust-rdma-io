@@ -12,6 +12,7 @@ use futures_util::task::AtomicWaker;
 use tokio::sync::Notify;
 
 use super::connection::{ConnectionReservation, SharedCmId};
+use super::io::{IoConnection, IoEventReceiver};
 use super::lifecycle::{MemoizedTerminalResult, TakeOnceResult};
 use super::registry::{lock_unpoison, read_unpoison};
 use super::{ConnectionSetup, EngineShared, RdmaConnection, RdmaConnectionConfig, SetupSummary};
@@ -132,16 +133,19 @@ impl RdmaListener {
         .await
     }
 
-    pub(crate) async fn accept_with_setup(
+    pub(crate) async fn accept_with_io_setup<F>(
         &self,
         config: RdmaConnectionConfig,
-        setup: ConnectionSetup,
-    ) -> Result<RdmaConnection> {
+        setup: F,
+    ) -> Result<RdmaConnection>
+    where
+        F: FnOnce(IoConnection, IoEventReceiver) -> Result<usize> + Send + 'static,
+    {
         accept_with_setup(
             Arc::clone(&self.shared),
             Arc::clone(&self.state),
             config,
-            setup,
+            Box::new(setup),
         )
         .await
     }
@@ -234,7 +238,7 @@ pub(super) async fn accept_with_setup(
 }
 
 pub(super) fn empty_connection_setup() -> ConnectionSetup {
-    Box::new(|_connection| Ok(SetupSummary { posted_wrs: 0 }))
+    Box::new(|_connection, _events| Ok(0))
 }
 
 pub(super) fn run_setup_before_establish(
@@ -244,7 +248,13 @@ pub(super) fn run_setup_before_establish(
     establish: impl FnOnce() -> Result<()>,
 ) -> Result<SetupSummary> {
     let accepted_before = connection.state.accepted_count();
-    let summary = setup(connection)?;
+    let (io, events) = IoConnection::new(
+        Arc::clone(&connection.shared),
+        Arc::clone(&connection.state),
+    )?;
+    let summary = SetupSummary {
+        posted_wrs: setup(io, events)?,
+    };
     let accepted_after = connection.state.accepted_count();
     let posted_wrs = accepted_after.checked_sub(accepted_before).ok_or_else(|| {
         Error::InvalidConfig("pre-establishment setup reduced the accepted WR set".into())

@@ -18,8 +18,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 
-#[cfg(panic = "unwind")]
-use super::RuntimeProbe;
 use super::config::CompletionMode;
 use super::lifecycle::MemoizedTerminalResult;
 use super::resources::EngineResources;
@@ -28,6 +26,7 @@ use super::{EngineShared, RdmaEngineDriver};
 use crate::v2::Completion;
 use crate::v2::completion::CqReadiness;
 use crate::v2::error::{Error, Result};
+use crate::v2::runtime::preflight_driver_runtime;
 
 pub(super) const TERMINAL_WORK: usize = 1 << 0;
 pub(super) const RECLAMATION_WORK: usize = 1 << 1;
@@ -584,33 +583,6 @@ impl Drop for RdmaEngineDriver {
             EngineShared::retain_after_failure(&self.shared);
         }
         self.release_resources();
-    }
-}
-
-pub(crate) fn preflight_driver_runtime(driver_name: &str) -> Result<()> {
-    if tokio::runtime::Handle::try_current().is_err() {
-        return Err(Error::InvalidConfig(format!(
-            "{driver_name} must be polled inside an active Tokio runtime with time enabled"
-        )));
-    }
-    #[cfg(panic = "unwind")]
-    {
-        match super::probe_runtime(|| tokio::time::sleep(std::time::Duration::ZERO)) {
-            RuntimeProbe::Completed(sleep) => {
-                drop(sleep);
-                Ok(())
-            }
-            RuntimeProbe::Panicked => Err(Error::InvalidConfig(format!(
-                "{driver_name} requires Tokio time to be enabled"
-            ))),
-        }
-    }
-    #[cfg(not(panic = "unwind"))]
-    {
-        // Tokio exposes no non-panicking query for its optional time driver.
-        // Do not panic-probe under abort: polling can progress without a timer
-        // until the application requests an operation that arms a deadline.
-        Ok(())
     }
 }
 
