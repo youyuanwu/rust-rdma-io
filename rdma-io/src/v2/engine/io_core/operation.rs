@@ -3,7 +3,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 
 use futures_util::task::AtomicWaker;
@@ -1556,6 +1556,42 @@ pub(in crate::v2::engine) struct PendingCompletion {
     operation: Arc<OperationState>,
 }
 
+/// Non-forgeable port for proof-gated reclamation.
+///
+/// `IoCore::new` creates exactly one value and transfers it to the session
+/// owner. The core has no dependency on the session proof or resource types.
+pub(in crate::v2::engine) struct QpReclaimCapability {
+    core: Weak<IoCore>,
+}
+
+impl QpReclaimCapability {
+    pub(super) fn new(core: &Arc<IoCore>) -> Self {
+        Self {
+            core: Arc::downgrade(core),
+        }
+    }
+
+    pub(in crate::v2::engine) fn reclaim(
+        &self,
+        destroyed_connection: ConnectionToken,
+        destroyed_qp_num: u32,
+        connection: &EstablishedIoConnection,
+        close_error: Error,
+        token: OperationToken,
+    ) -> (bool, IoCoreEffects) {
+        let Some(core) = self.core.upgrade() else {
+            return (false, IoCoreEffects::default());
+        };
+        core.reclaim_after_qp_destroy(
+            destroyed_connection,
+            destroyed_qp_num,
+            connection,
+            close_error,
+            token,
+        )
+    }
+}
+
 impl PendingCompletion {
     pub(in crate::v2::engine) fn identity(&self) -> super::EstablishedIoIdentity {
         self.operation.connection.identity()
@@ -1826,7 +1862,7 @@ impl IoCore {
         effects
     }
 
-    pub(in crate::v2::engine) fn reclaim_after_qp_destroy(
+    fn reclaim_after_qp_destroy(
         &self,
         destroyed_connection: ConnectionToken,
         destroyed_qp_num: u32,

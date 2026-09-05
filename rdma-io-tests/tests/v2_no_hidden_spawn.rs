@@ -10,8 +10,8 @@ use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{
-    Attribute, Expr, ExprBlock, ExprMethodCall, ExprPath, ForeignItem, ImplItem, Item, Local,
-    Macro, Meta, Pat, Token, TraitItem, Type, UseTree,
+    Attribute, Expr, ExprBlock, ExprCall, ExprMethodCall, ExprPath, ForeignItem, ImplItem, Item,
+    Local, Macro, Meta, Pat, Token, TraitItem, Type, UseTree,
 };
 
 const SPAWN_NAMES: &[&str] = &[
@@ -168,6 +168,19 @@ impl<'ast> Visit<'ast> for LifecycleCallVisitor<'_> {
                 .push(format!("{method}:{}", call.span().start().line));
         }
         visit::visit_expr_method_call(self, call);
+    }
+
+    fn visit_expr_call(&mut self, call: &'ast ExprCall) {
+        if let Expr::Path(path) = call.func.as_ref()
+            && let Some(segment) = path.path.segments.last()
+        {
+            let method = segment.ident.to_string();
+            if self.methods.contains(method.as_str()) {
+                self.violations
+                    .push(format!("{method}:{}", call.span().start().line));
+            }
+        }
+        visit::visit_expr_call(self, call);
     }
 }
 
@@ -810,6 +823,38 @@ fn dependency_detector_ignores_test_only_items_but_fails_closed_for_production()
 }
 
 #[test]
+fn lifecycle_detector_rejects_method_and_ufcs_calls() {
+    let source = r#"
+        fn production(poster: &Poster) {
+            poster.to_error();
+            WorkRequestPoster::destroy_qp(poster);
+            <Poster as WorkRequestPoster>::destroy_connection(poster, true);
+        }
+
+        #[cfg(test)]
+        fn test_only(poster: &Poster) {
+            WorkRequestPoster::destroy_qp(poster);
+        }
+    "#;
+    let mut violations =
+        find_production_lifecycle_calls(source, &["to_error", "destroy_qp", "destroy_connection"])
+            .unwrap();
+    violations.sort();
+    assert_eq!(violations.len(), 3, "{violations:#?}");
+    assert!(violations.iter().any(|item| item.starts_with("to_error:")));
+    assert!(
+        violations
+            .iter()
+            .any(|item| item.starts_with("destroy_qp:"))
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|item| item.starts_with("destroy_connection:"))
+    );
+}
+
+#[test]
 fn test_no_hidden_spawn_in_v2() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let workspace_root = Path::new(manifest_dir).parent().expect("workspace root");
@@ -1188,12 +1233,33 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
             && !cm_source.contains(".destroy_connection(true)"),
         "test hooks and setup rollback must route provider-visible lifecycle work through SessionManager"
     );
+    let io_core_operation_source =
+        fs::read_to_string(&io_core_operation_path).expect("read I/O operation source");
     assert!(
-        !fs::read_to_string(&io_core_operation_path)
-            .expect("read I/O operation source")
-            .contains("QpDestructionProof"),
+        !io_core_operation_source.contains("QpDestructionProof"),
         "production I/O core must not depend on the session destruction proof type"
     );
+    assert!(
+        io_core_operation_source.contains("struct QpReclaimCapability")
+            && io_core_operation_source.contains("pub(super) fn new(core: &Arc<IoCore>)")
+            && io_core_operation_source.contains("\n    fn reclaim_after_qp_destroy(")
+            && !io_core_operation_source
+                .contains("pub(in crate::v2::engine) fn reclaim_after_qp_destroy(")
+            && session_source.contains("qp_reclaim: QpReclaimCapability")
+            && session_source.contains("self.qp_reclaim.reclaim("),
+        "IoCore reclamation must be private behind the one non-forgeable SessionManager capability"
+    );
+    for path in collect_rs_files(&engine_dir).expect("enumerate reclaim call sites") {
+        if path == io_core_operation_path || path == session_path {
+            continue;
+        }
+        let source = fs::read_to_string(&path).expect("read engine source");
+        assert!(
+            !source.contains(".io_core.reclaim_after_qp_destroy("),
+            "{} bypasses the proof-gated QP reclaim capability",
+            path.display()
+        );
+    }
 
     let io_source = fs::read_to_string(&io_path).expect("read engine I/O boundary source");
     let io_connection = io_source

@@ -26,8 +26,8 @@ use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
 pub(super) use operation::CqeReject;
 pub use operation::RdmaOperation;
 pub(super) use operation::{
-    CqCreditPool, IoCoreEffects, OperationQuarantineEffect, OperationRegistry, post_io_recv_batch,
-    post_io_send,
+    CqCreditPool, IoCoreEffects, OperationQuarantineEffect, OperationRegistry, QpReclaimCapability,
+    post_io_recv_batch, post_io_send,
 };
 #[cfg(test)]
 pub(super) use operation::{
@@ -348,8 +348,8 @@ impl IoCore {
         completion_dispatch_budget: usize,
         admission: Arc<RwLock<()>>,
         driver_signal: Arc<dyn IoDriverSignal>,
-    ) -> Result<Arc<Self>> {
-        Ok(Arc::new(Self {
+    ) -> Result<(Arc<Self>, QpReclaimCapability)> {
+        let core = Arc::new(Self {
             operations: OperationRegistry::new(max_inflight_operations)?,
             cq_credits: CqCreditPool::new(cq_capacity),
             #[cfg(any(test, feature = "test-hooks"))]
@@ -369,7 +369,9 @@ impl IoCore {
             missing_cqe_deadline,
             completion_dispatch_budget,
             reclamation_requests: Mutex::new(VecDeque::new()),
-        }))
+        });
+        let reclaim = QpReclaimCapability::new(&core);
+        Ok((core, reclaim))
     }
 
     pub(super) fn admission(&self) -> RwLockReadGuard<'_, ()> {

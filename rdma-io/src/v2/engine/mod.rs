@@ -504,7 +504,7 @@ impl EngineShared {
             #[cfg(any(test, feature = "test-hooks"))]
             test_driver: Arc::clone(&test_driver),
         });
-        let io_core = IoCore::new(
+        let (io_core, qp_reclaim) = IoCore::new(
             config.max_inflight_operations,
             config.cq_capacity,
             config.missing_cqe_deadline,
@@ -516,6 +516,7 @@ impl EngineShared {
             config.max_live_connections,
             Arc::clone(&admission),
             Arc::clone(&io_core),
+            qp_reclaim,
         )?);
         Ok(Self {
             config,

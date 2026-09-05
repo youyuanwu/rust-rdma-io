@@ -20,7 +20,7 @@ use super::connection::{
     ConnectionAdmissionPool, ConnectionState, QpDestroyStatus, SharedCmId, VerbsConnectionResources,
 };
 use super::driver::WorkSignal;
-use super::io_core::{IoCore, IoCoreEffects, OperationQuarantineEffect};
+use super::io_core::{IoCore, IoCoreEffects, OperationQuarantineEffect, QpReclaimCapability};
 use super::listener::ListenerState;
 use super::registry::{ConnectionRegistry, ConnectionToken, Lookup, OperationToken, lock_unpoison};
 use super::scheduler::{DeadlineKind, DeadlineRequest};
@@ -298,6 +298,7 @@ pub(super) struct SessionManager {
     quarantines: Mutex<QuarantineState>,
     engine: OnceLock<Weak<EngineShared>>,
     lifecycle_authority: SessionLifecycleAuthority,
+    qp_reclaim: QpReclaimCapability,
     #[allow(
         dead_code,
         reason = "retained for session-owned close/reclaim service and test accounting adapters"
@@ -310,6 +311,7 @@ impl SessionManager {
         max_live_connections: usize,
         admission: Arc<RwLock<()>>,
         io_core: Arc<IoCore>,
+        qp_reclaim: QpReclaimCapability,
     ) -> Result<Self> {
         Ok(Self {
             connection_admission: ConnectionAdmissionPool::new(max_live_connections),
@@ -323,6 +325,7 @@ impl SessionManager {
             quarantines: Mutex::new(QuarantineState::default()),
             engine: OnceLock::new(),
             lifecycle_authority: SessionLifecycleAuthority { _private: () },
+            qp_reclaim,
             io_core,
         })
     }
@@ -663,7 +666,7 @@ impl SessionManager {
         connection: &ConnectionState,
         token: OperationToken,
     ) -> bool {
-        let (reclaimed, mut effects) = self.io_core.reclaim_after_qp_destroy(
+        let (reclaimed, mut effects) = self.qp_reclaim.reclaim(
             proven_connection,
             proven_qp_num,
             &connection.io,
