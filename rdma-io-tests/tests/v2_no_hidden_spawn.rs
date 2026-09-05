@@ -1110,6 +1110,7 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let workspace_root = Path::new(manifest_dir).parent().expect("workspace root");
     let v2_dir = workspace_root.join("rdma-io").join("src").join("v2");
+    let completion_path = v2_dir.join("completion.rs");
     let message_path = v2_dir.join("message_transport.rs");
     let io_path = v2_dir.join("engine").join("io.rs");
     let io_core_mod_path = v2_dir.join("engine").join("io_core").join("mod.rs");
@@ -1126,6 +1127,13 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     let v2_mod_path = v2_dir.join("mod.rs");
 
     let message = fs::read_to_string(&message_path).expect("read message transport source");
+    let completion_source = fs::read_to_string(&completion_path).expect("read CQ readiness source");
+    assert!(
+        completion_source.contains("drain_and_ack_channel_events(cq, buf.len().max(1))")
+            && completion_source.contains("while (count as usize) < budget"),
+        "{} must bound CQ notification draining by the owner turn buffer",
+        completion_path.display()
+    );
     for forbidden in [
         "EngineShared",
         "ConnectionState",
@@ -1187,8 +1195,11 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         "pending_cm_route_count",
         "live_connection_count",
         "accepted_operations",
+        "accepted_count",
+        "retained_bundle_count",
         "begin_all_connection_close",
         "begin_cm_shutdown",
+        "synchronously_prepare_driver_drop",
         ".finish(",
     ];
 
@@ -1443,6 +1454,11 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         production_driver,
         FINAL_DRIVER_FORBIDDEN_SESSION_KNOWLEDGE,
     );
+    assert_final_driver_boundary(
+        &driver_path,
+        production_driver,
+        FINAL_DRIVER_FORBIDDEN_TERMINAL_KNOWLEDGE,
+    );
     assert!(
         production_driver.contains("io_progress")
             && production_driver.contains("session_progress")
@@ -1468,6 +1484,19 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
             session_progress_path.display()
         );
     }
+    assert!(
+        !session_progress_source.contains("shared.io_core"),
+        "{} must report only session-owned terminal readiness",
+        session_progress_path.display()
+    );
+    let io_progress_source =
+        fs::read_to_string(&io_core_progress_path).expect("read I/O progress source");
+    assert!(
+        io_progress_source.contains("terminalize_operations_bounded")
+            && io_progress_source.contains("ProgressTerminal::Ready"),
+        "{} must report bounded I/O terminal readiness",
+        io_core_progress_path.display()
+    );
     assert!(
         cm_source.contains("impl SessionManager")
             && cm_source.contains("fn retire_registered_connection("),

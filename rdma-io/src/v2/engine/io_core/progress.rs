@@ -11,7 +11,7 @@ use super::{IoCore, IoDeadlineRequest, IoSessionBridge};
 use crate::v2::Completion;
 use crate::v2::completion::CqReadiness;
 use crate::v2::engine::config::CompletionMode;
-use crate::v2::engine::progress::{ProgressReport, ReadinessRegistration};
+use crate::v2::engine::progress::{ProgressReport, ProgressTerminal, ReadinessRegistration};
 use crate::v2::engine::registry::{ConnectionToken, OperationToken};
 use crate::v2::engine::resources::IoProgressResources;
 use crate::v2::error::{Error, Result};
@@ -82,6 +82,10 @@ pub(in crate::v2::engine) struct IoProgress {
     reclamation_turn_starts_with_request: bool,
     completion_dispatch_budget: usize,
     reclamation_budget: usize,
+    terminal_cursor: usize,
+    terminal_complete: bool,
+    #[cfg(test)]
+    turns: usize,
     #[cfg(any(test, feature = "test-hooks"))]
     test_driver: Arc<crate::v2::engine::driver::test_api::TestDriverState>,
 }
@@ -107,6 +111,10 @@ impl IoProgress {
             reclamation_turn_starts_with_request: true,
             completion_dispatch_budget,
             reclamation_budget,
+            terminal_cursor: 0,
+            terminal_complete: false,
+            #[cfg(test)]
+            turns: 0,
             #[cfg(any(test, feature = "test-hooks"))]
             test_driver,
         }
@@ -117,18 +125,49 @@ impl IoProgress {
         mode: CompletionMode,
         cx: &mut TaskContext<'_>,
     ) -> Result<ProgressReport> {
+        #[cfg(test)]
+        {
+            self.turns = self.turns.saturating_add(1);
+        }
+        if let Some(outcome) = self.core.terminal_failure() {
+            let budget = self
+                .cq_buffer
+                .len()
+                .saturating_add(self.completion_dispatch_budget)
+                .saturating_add(self.reclamation_budget);
+            let (effects, next, complete, scanned) =
+                self.core
+                    .terminalize_operations_bounded(&outcome, self.terminal_cursor, budget);
+            self.terminal_cursor = next;
+            self.terminal_complete = complete;
+            self.bridge()?.apply_terminal_effects(effects);
+            let mut report = ProgressReport::running(
+                scanned,
+                !complete,
+                None,
+                ReadinessRegistration::NotRequired,
+            );
+            if complete {
+                report.terminal = ProgressTerminal::Ready;
+            }
+            return Ok(report);
+        }
         let (cq_units, readiness, cq_repoll) = self.service_cq(mode, cx)?;
         let (reclamation_units, reclamation_ready) = self.service_reclamation()?;
         let (dispatch_units, dispatch_ready) = self.service_completion_dispatch()?;
         let units_consumed = cq_units
             .saturating_add(reclamation_units)
             .saturating_add(dispatch_units);
-        Ok(ProgressReport::running(
+        let mut report = ProgressReport::running(
             units_consumed,
             cq_repoll || reclamation_ready || dispatch_ready,
             self.deadlines.next(),
             readiness,
-        ))
+        );
+        if self.can_finish() {
+            report.terminal = ProgressTerminal::Ready;
+        }
+        Ok(report)
     }
 
     pub(in crate::v2::engine) fn release_resources(&mut self) {
@@ -142,6 +181,13 @@ impl IoProgress {
         self.deadlines.next()
     }
 
+    pub(in crate::v2::engine) fn can_finish(&self) -> bool {
+        if self.core.terminal_failure().is_some() {
+            return self.terminal_complete;
+        }
+        self.core.shutdown_requested() && self.core.accepted_count() == 0
+    }
+
     #[cfg(test)]
     pub(in crate::v2::engine) fn completion_connection_count(&self) -> usize {
         self.completion_connections.len()
@@ -150,6 +196,11 @@ impl IoProgress {
     #[cfg(test)]
     fn cq_buffer_capacity(&self) -> usize {
         self.cq_buffer.len()
+    }
+
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn turn_count(&self) -> usize {
+        self.turns
     }
 
     fn bridge(&self) -> Result<Arc<dyn IoSessionBridge>> {
@@ -205,6 +256,9 @@ impl IoProgress {
                 );
                 match polled {
                     Poll::Ready(result) => (result?, ReadinessRegistration::Incomplete),
+                    Poll::Pending if self.cq_readiness.requires_repoll() => {
+                        (0, ReadinessRegistration::Incomplete)
+                    }
                     Poll::Pending => (0, ReadinessRegistration::RegisteredAndRechecked),
                 }
             }
@@ -390,6 +444,8 @@ mod tests {
         fn handle_reclamation_deadline(&self, token: OperationToken) {
             lock_unpoison(&self.reclaimed).push(token);
         }
+
+        fn apply_terminal_effects(&self, _effects: super::super::IoCoreEffects) {}
     }
 
     fn progress(reclamation_budget: usize) -> (IoProgress, Arc<IoCore>, Arc<RecordingBridge>) {

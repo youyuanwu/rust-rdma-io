@@ -7,7 +7,7 @@
 //! librdmacm/verbs call runs.
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -40,8 +40,6 @@ use super::listener::{
 use crate::cm::{CmEventType, CmId, PortSpace};
 use crate::v2::error::{Error, Result};
 use crate::v2::qp::QpBuilder;
-
-pub(in crate::v2::engine) const CM_WORK: usize = 1 << 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CmEventReject {
@@ -128,6 +126,9 @@ pub(in crate::v2::engine) struct CmShutdownCursor {
     listener_token: u64,
     routes_complete: bool,
     listeners_complete: bool,
+    destruction_listeners_remaining: Option<usize>,
+    destruction_listeners_complete: bool,
+    terminalized_listeners: HashSet<usize>,
 }
 
 impl Default for CmShutdownCursor {
@@ -138,6 +139,9 @@ impl Default for CmShutdownCursor {
             listener_token: 1,
             routes_complete: false,
             listeners_complete: false,
+            destruction_listeners_remaining: None,
+            destruction_listeners_complete: false,
+            terminalized_listeners: HashSet::new(),
         }
     }
 }
@@ -489,14 +493,18 @@ impl CmState {
         &self,
         shared: &Arc<EngineShared>,
         outcome: &MemoizedTerminalResult,
+        terminalize_listeners: bool,
         cursor: &mut CmShutdownCursor,
         budget: usize,
     ) -> usize {
         let mut processed = 0;
+        if !terminalize_listeners {
+            cursor.destruction_listeners_complete = true;
+        }
         while processed < budget {
             let mut selected = false;
-            for offset in 0..4 {
-                let class = (cursor.next_class + offset) % 4;
+            for offset in 0..5 {
+                let class = (cursor.next_class + offset) % 5;
                 match class {
                     0 => {
                         let request = { lock_unpoison(&self.pending).pop_front() };
@@ -538,12 +546,49 @@ impl CmState {
                         cursor.listener_token = cursor.listener_token.saturating_add(1);
                         let listener = { lock_unpoison(&self.listeners).get(&token).cloned() };
                         if let Some(listener) = listener {
-                            listener.request_close(shared);
+                            if terminalize_listeners {
+                                let identity = Arc::as_ptr(&listener) as usize;
+                                if cursor.terminalized_listeners.insert(identity) {
+                                    listener.terminalize(outcome);
+                                }
+                            } else {
+                                listener.request_close(shared);
+                            }
+                        }
+                    }
+                    4 if terminalize_listeners && !cursor.destruction_listeners_complete => {
+                        let remaining = cursor
+                            .destruction_listeners_remaining
+                            .get_or_insert_with(|| lock_unpoison(&self.cm_destructions).len());
+                        if *remaining == 0 {
+                            cursor.destruction_listeners_complete = true;
+                            continue;
+                        }
+                        let listener = {
+                            let mut destructions = lock_unpoison(&self.cm_destructions);
+                            let Some(pending) = destructions.pop_front() else {
+                                cursor.destruction_listeners_complete = true;
+                                *remaining = 0;
+                                continue;
+                            };
+                            let listener = pending.listener().cloned();
+                            destructions.push_back(pending);
+                            listener
+                        };
+                        *remaining -= 1;
+                        if *remaining == 0 {
+                            cursor.destruction_listeners_complete = true;
+                        }
+                        if let Some(listener) = listener {
+                            let identity = Arc::as_ptr(&listener) as usize;
+                            if cursor.terminalized_listeners.insert(identity) {
+                                listener.terminalize(outcome);
+                            }
                         }
                     }
                     _ => continue,
                 }
-                cursor.next_class = (class + 1) % 4;
+                cursor.next_class = (class + 1) % 5;
                 processed += 1;
                 selected = true;
                 break;
@@ -561,6 +606,7 @@ impl CmState {
     ) -> bool {
         cursor.routes_complete
             && cursor.listeners_complete
+            && cursor.destruction_listeners_complete
             && lock_unpoison(&self.pending).is_empty()
             && lock_unpoison(&self.pending_listens).is_empty()
     }
@@ -2880,7 +2926,9 @@ pub(in crate::v2::engine) async fn connect_with_setup(
         .pause_admission(super::super::driver::test_api::AdmissionPausePoint::ConnectBeforeEnqueue);
     shared.session.cm.enqueue(Arc::clone(&request));
     drop(admission);
-    shared.work_signal.publish(CM_WORK);
+    shared
+        .work_signal
+        .publish(super::super::driver::SESSION_WORK);
     let waiter = ConnectWaiter {
         manager: Arc::downgrade(&shared.session),
         request: Arc::downgrade(&request),
@@ -3545,7 +3593,9 @@ impl Drop for ConnectWaiter {
             };
             manager.cm.enqueue_cancellation(request);
             if let Some(engine) = manager.engine() {
-                engine.work_signal.publish(CM_WORK);
+                engine
+                    .work_signal
+                    .publish(super::super::driver::SESSION_WORK);
             }
         }
     }

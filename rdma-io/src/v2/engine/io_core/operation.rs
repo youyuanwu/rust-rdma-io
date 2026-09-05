@@ -735,6 +735,14 @@ impl OperationRegistry {
     pub(in crate::v2::engine) fn occupied(&self) -> Vec<Arc<OperationState>> {
         self.slots.occupied_cloned()
     }
+
+    fn scan_occupied(
+        &self,
+        start: usize,
+        budget: usize,
+    ) -> (Vec<Arc<OperationState>>, usize, bool, usize) {
+        self.slots.scan_occupied_cloned(start, budget)
+    }
 }
 
 pub(in crate::v2::engine) struct CqCreditPool {
@@ -1695,6 +1703,44 @@ impl IoCore {
             }
         }
         effects
+    }
+
+    pub(in crate::v2::engine) fn terminalize_operations_bounded(
+        &self,
+        outcome: &MemoizedTerminalResult,
+        cursor: usize,
+        budget: usize,
+    ) -> (IoCoreEffects, usize, bool, usize) {
+        let mut effects = IoCoreEffects::default();
+        if !outcome.is_error() {
+            return (effects, cursor, true, 0);
+        }
+        let (operations, next, complete, scanned) = self.operations.scan_occupied(cursor, budget);
+        for operation in operations {
+            let terminalized = operation.finalize_terminal(outcome);
+            debug_assert!(
+                !terminalized.was_reclaiming || terminalized.newly_quarantined,
+                "terminal reclamation must transfer its retained MR and CQ debt to quarantine"
+            );
+            if terminalized.was_reclaiming {
+                self.pending_reclamations.fetch_sub(1, Ordering::AcqRel);
+            }
+            if terminalized.newly_quarantined {
+                self.quarantined_operations.fetch_add(1, Ordering::AcqRel);
+                self.quarantined_mrs.fetch_add(1, Ordering::AcqRel);
+                self.quarantined_bytes
+                    .fetch_add(operation.mr_len, Ordering::AcqRel);
+                self.cq_credits.retain();
+                effects.quarantine.push(OperationQuarantineEffect::Added {
+                    operation: operation.token(),
+                    connection: operation.connection_token(),
+                });
+            }
+            if terminalized.should_wake {
+                effects.after_unlock.operations_to_wake.push(operation);
+            }
+        }
+        (effects, next, complete, scanned)
     }
 
     pub(in crate::v2::engine) fn reject_cqe(&self, reason: CqeReject) {

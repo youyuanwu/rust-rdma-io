@@ -69,7 +69,7 @@ use lifecycle::MemoizedTerminalResult;
 use registry::{lock_unpoison, write_unpoison};
 use resources::{EngineResourceRefs, EngineResources};
 use scheduler::DeadlineKind;
-use scheduler::WorkScheduler;
+use scheduler::OwnerScheduler;
 pub use session::connection::{RdmaConnection, RdmaConnectionIdentity};
 pub use session::listener::{RdmaListener, RdmaListenerConfig};
 use session::{SessionManager, SessionProgress};
@@ -409,7 +409,7 @@ pub struct RdmaEngineDriver {
     shared: Arc<EngineShared>,
     io_progress: IoProgress,
     session_progress: SessionProgress,
-    scheduler: WorkScheduler,
+    scheduler: OwnerScheduler,
     deadline_sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
     deadline_at: Option<tokio::time::Instant>,
     runtime_checked: bool,
@@ -433,6 +433,7 @@ struct EngineShared {
     // shutdown waiter without retaining registrations from dropped futures.
     terminal_notify: Notify,
     terminal: Mutex<Option<MemoizedTerminalResult>>,
+    pending_terminal: Mutex<Option<MemoizedTerminalResult>>,
     #[cfg(any(test, feature = "test-hooks"))]
     test_resources: Option<resources::TestResourceRefs>,
     #[cfg(any(test, feature = "test-hooks"))]
@@ -451,15 +452,15 @@ struct EngineIoDriverSignal {
 
 impl IoDriverSignal for EngineIoDriverSignal {
     fn publish_cq_recheck(&self) {
-        self.work_signal.publish(driver::CQ_RECHECK_WORK);
+        self.work_signal.publish(driver::IO_WORK);
     }
 
     fn publish_completion_dispatch(&self) {
-        self.work_signal.publish(driver::COMPLETION_DISPATCH_WORK);
+        self.work_signal.publish(driver::IO_WORK);
     }
 
     fn publish_reclamation(&self) {
-        self.work_signal.publish(driver::IO_RECLAMATION_WORK);
+        self.work_signal.publish(driver::IO_WORK);
     }
 
     fn publish_terminal(&self) {
@@ -535,6 +536,7 @@ impl EngineShared {
             work_signal,
             terminal_notify: Notify::new(),
             terminal: Mutex::new(None),
+            pending_terminal: Mutex::new(None),
             #[cfg(any(test, feature = "test-hooks"))]
             test_resources: None,
             #[cfg(any(test, feature = "test-hooks"))]
@@ -618,6 +620,85 @@ impl EngineShared {
             connection.wake_close();
         }
         self.terminal_notify.notify_waiters();
+    }
+
+    fn progress_driver_terminal(
+        self: &Arc<Self>,
+        io_progress: &IoProgress,
+        session_progress: &SessionProgress,
+    ) -> bool {
+        if !self.shutdown_requested.load(Ordering::Acquire)
+            || !io_progress.can_finish()
+            || !session_progress.can_finish()
+        {
+            return false;
+        }
+        let pending = lock_unpoison(&self.pending_terminal).clone();
+        if let Some(outcome) = pending {
+            self.finish_after_owner_cleanup(outcome);
+            Self::retain_after_failure(self);
+        } else {
+            self.finish_after_owner_cleanup(MemoizedTerminalResult::success());
+        }
+        true
+    }
+
+    fn begin_driver_failure(&self, error: Error) {
+        let outcome = MemoizedTerminalResult::from_error(error);
+        let mut pending = lock_unpoison(&self.pending_terminal);
+        if pending.is_none() {
+            *pending = Some(outcome.clone());
+            self.mark_shutdown_requested();
+            self.io_core.close_admission(outcome.error());
+            self.io_core.begin_terminal_failure(outcome);
+        }
+        drop(pending);
+        self.work_signal
+            .publish(driver::IO_WORK | driver::SESSION_WORK | driver::TERMINAL_WORK);
+    }
+
+    fn pending_terminal_outcome(&self) -> Option<MemoizedTerminalResult> {
+        lock_unpoison(&self.pending_terminal).clone()
+    }
+
+    fn finish_after_owner_cleanup(&self, outcome: MemoizedTerminalResult) {
+        let mut terminal = lock_unpoison(&self.terminal);
+        if terminal.is_some() {
+            return;
+        }
+        let lifecycle = if outcome.is_success() {
+            RdmaEngineLifecycle::Terminated
+        } else {
+            RdmaEngineLifecycle::Failed
+        };
+        *terminal = Some(outcome);
+        self.transition_terminal(lifecycle);
+        drop(terminal);
+        self.terminal_notify.notify_waiters();
+    }
+
+    fn handle_driver_drop(self: &Arc<Self>) {
+        if self.outcome().is_some() {
+            return;
+        }
+        self.mark_shutdown_requested();
+        self.session.synchronously_prepare_driver_drop();
+        let outstanding = self.io_core.accepted_count();
+        let cm_owners = self
+            .session
+            .retained_cm_owner_count()
+            .max(self.session.live_connection_count());
+        let error = if outstanding == 0 && cm_owners == 0 {
+            Error::DriverShutdown
+        } else {
+            Error::EngineWedged {
+                retained_bundles: self.retained_bundle_count().max(1),
+                outstanding_operations: outstanding,
+                cq_debt: outstanding,
+            }
+        };
+        self.finish(MemoizedTerminalResult::from_error(error));
+        Self::retain_after_failure(self);
     }
 
     fn outcome(&self) -> Option<MemoizedTerminalResult> {

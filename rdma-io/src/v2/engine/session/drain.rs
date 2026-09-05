@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use super::super::EngineShared;
-use super::super::lifecycle::MemoizedTerminalResult;
 use super::super::registry::{ConnectionToken, Lookup, read_unpoison};
 use super::super::scheduler::DeadlineKind;
 use super::SessionManager;
@@ -34,13 +33,11 @@ impl SessionManager {
                     if let Some(event) = event {
                         event.deliver();
                     }
-                    shared.finish(MemoizedTerminalResult::from_error(error));
+                    shared.begin_driver_failure(error);
                     return;
                 }
             }
-            shared
-                .work_signal
-                .publish(super::super::driver::CQ_RECHECK_WORK);
+            shared.work_signal.publish(super::super::driver::IO_WORK);
 
             let engine_is_terminating = shared.shutdown_requested.load(Ordering::Acquire);
             if !engine_is_terminating {
@@ -92,7 +89,9 @@ impl SessionManager {
             return;
         }
         self.cm.enqueue_retirement(connection.token);
-        shared.work_signal.publish(super::cm::CM_WORK);
+        shared
+            .work_signal
+            .publish(super::super::driver::SESSION_WORK);
     }
 
     fn schedule_connection_drain(&self, shared: &EngineShared, token: ConnectionToken) {
@@ -239,7 +238,9 @@ mod tests {
 
     use super::super::super::io_core::install_accepted_operation_for_driver_test;
     use super::super::super::registry::OperationToken;
-    use super::super::super::{CompletionMode, RdmaConnectionConfig, test_engine_pair};
+    use super::super::super::{
+        CompletionMode, RdmaConnectionConfig, RdmaEngineLifecycle, test_engine_pair,
+    };
     use super::super::connection::{WorkRequestPoster, install_connection};
     use crate::v2::error::{Error, Result};
     use crate::v2::qp::{BatchPostOutcome, QpCapabilities};
@@ -329,7 +330,7 @@ mod tests {
 
     #[test]
     fn failed_error_transition_rolls_back_the_draining_gauge() {
-        let (engine, driver) = test_engine_pair(CompletionMode::Polling);
+        let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
         let poster = TestPoster::failing(19);
         let connection = install_connection(
             &engine.shared,
@@ -340,11 +341,24 @@ mod tests {
         )
         .unwrap();
         let mut close = Box::pin(connection.close());
-        assert!(matches!(
-            poll_once(close.as_mut()),
-            Poll::Ready(Err(Error::Verbs(_)))
-        ));
+        assert!(poll_once(close.as_mut()).is_pending());
         assert_eq!(engine.shared.connection_admission.snapshot().draining, 0);
+
+        let driver_error = loop {
+            match poll_once(Pin::new(&mut driver)) {
+                Poll::Ready(Err(error)) => break error,
+                Poll::Ready(Ok(())) => panic!("QP transition failure completed successfully"),
+                Poll::Pending => {}
+            }
+        };
+        let Poll::Ready(Err(close_error)) = poll_once(close.as_mut()) else {
+            panic!("bounded terminal cleanup did not wake the connection close");
+        };
+        assert!(matches!(driver_error, Error::Verbs(_)));
+        assert_eq!(close_error.to_string(), driver_error.to_string());
+        assert_eq!(engine.shared.connection_admission.snapshot().draining, 0);
+        assert_eq!(engine.diagnostics().live_connections, 1);
+        assert_eq!(engine.diagnostics().lifecycle, RdmaEngineLifecycle::Failed);
         drop(driver);
     }
 

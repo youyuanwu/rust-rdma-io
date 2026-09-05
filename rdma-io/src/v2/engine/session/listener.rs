@@ -189,7 +189,9 @@ pub(in crate::v2::engine) async fn listen(
     let request = Arc::new(ListenRequest::new(address, config));
     shared.session.cm.enqueue_listen(Arc::clone(&request));
     drop(admission);
-    shared.work_signal.publish(super::cm::CM_WORK);
+    shared
+        .work_signal
+        .publish(super::super::driver::SESSION_WORK);
     let waiter = ListenWaiter {
         manager: Arc::downgrade(&shared.session),
         request: Arc::downgrade(&request),
@@ -216,7 +218,9 @@ pub(in crate::v2::engine) async fn accept_with_setup(
     listener.register_waiter(Arc::clone(&request))?;
     drop(admission);
     shared.session.cm.enqueue_listener_work(&listener);
-    shared.work_signal.publish(super::cm::CM_WORK);
+    shared
+        .work_signal
+        .publish(super::super::driver::SESSION_WORK);
     let waiter = AcceptWaiter {
         manager: Arc::downgrade(&shared.session),
         listener: Arc::downgrade(&listener),
@@ -426,7 +430,9 @@ impl Drop for ListenWaiter {
             return;
         }
         if let Some(engine) = self.manager.upgrade().and_then(|manager| manager.engine()) {
-            engine.work_signal.publish(super::cm::CM_WORK);
+            engine
+                .work_signal
+                .publish(super::super::driver::SESSION_WORK);
         }
     }
 }
@@ -616,7 +622,9 @@ impl AcceptWaiter {
         };
         manager.cm.mark_accept_delivered(&listener, &request);
         if let Some(engine) = manager.engine() {
-            engine.work_signal.publish(super::cm::CM_WORK);
+            engine
+                .work_signal
+                .publish(super::super::driver::SESSION_WORK);
         }
     }
 }
@@ -638,7 +646,9 @@ impl Drop for AcceptWaiter {
         }
         manager.cm.enqueue_listener_work(&listener);
         if let Some(engine) = manager.engine() {
-            engine.work_signal.publish(super::cm::CM_WORK);
+            engine
+                .work_signal
+                .publish(super::super::driver::SESSION_WORK);
         }
     }
 }
@@ -905,7 +915,9 @@ impl ListenerState {
     pub(in crate::v2::engine) fn request_close(self: &Arc<Self>, shared: &Arc<EngineShared>) {
         if !self.closing.swap(true, Ordering::AcqRel) {
             shared.session.cm.enqueue_listener_work(self);
-            shared.work_signal.publish(super::cm::CM_WORK);
+            shared
+                .work_signal
+                .publish(super::super::driver::SESSION_WORK);
         }
     }
 

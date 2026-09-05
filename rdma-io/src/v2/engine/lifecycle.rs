@@ -1,5 +1,6 @@
 //! Central engine lifecycle deadlines and terminal wedge calculation.
 
+use super::session::SessionManager;
 use super::{EngineShared, RdmaEngineTerminalError};
 use crate::v2::error::{Error, Result};
 
@@ -84,17 +85,19 @@ impl EngineShared {
             cq_debt: outstanding_operations,
         })
     }
+}
 
+impl SessionManager {
     pub(super) fn synchronously_prepare_driver_drop(&self) {
-        for connection in self.session.connections.occupied() {
+        for connection in self.connections.occupied() {
             let _lifecycle = connection.lock_lifecycle();
             connection.stop_posting();
-            let _ = self.session.transition_connection_to_error(&connection);
+            let _ = self.transition_connection_to_error(&connection);
             if connection.accepted_count() == 0
                 && !connection.is_retired()
                 && !connection.retirement_is_quarantined()
             {
-                match self.session.ensure_qp_destroyed(&connection, &_lifecycle) {
+                match self.ensure_qp_destroyed(&connection, &_lifecycle) {
                     Ok(()) => {}
                     Err(error) => {
                         tracing::warn!(
@@ -305,8 +308,15 @@ mod tests {
         );
 
         tokio::time::advance(Duration::from_millis(1)).await;
+        let mut driver_result = Poll::Pending;
+        for _ in 0..8 {
+            driver_result = poll_once(Pin::new(&mut driver));
+            if driver_result.is_ready() {
+                break;
+            }
+        }
         assert!(matches!(
-            poll_once(Pin::new(&mut driver)),
+            driver_result,
             Poll::Ready(Err(Error::EngineWedged {
                 retained_bundles: 1,
                 outstanding_operations: 1,

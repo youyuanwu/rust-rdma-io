@@ -27,7 +27,10 @@ pub(in crate::v2::engine) struct SessionProgress {
     shutdown_connection_slot: usize,
     shutdown_connections_complete: bool,
     shutdown_next_source: bool,
+    failure_scan_started: bool,
     terminal_completion_ready: bool,
+    #[cfg(test)]
+    turns: usize,
     cm_budget: usize,
     reclamation_budget: usize,
 }
@@ -50,7 +53,10 @@ impl SessionProgress {
             shutdown_connection_slot: 0,
             shutdown_connections_complete: false,
             shutdown_next_source: true,
+            failure_scan_started: false,
             terminal_completion_ready: false,
+            #[cfg(test)]
+            turns: 0,
             cm_budget,
             reclamation_budget,
         }
@@ -61,24 +67,37 @@ impl SessionProgress {
         mode: CompletionMode,
         cx: &mut TaskContext<'_>,
     ) -> Result<ProgressReport> {
+        #[cfg(test)]
+        {
+            self.turns = self.turns.saturating_add(1);
+        }
         let Some(shared) = self.manager.engine() else {
             return Err(Error::DriverShutdown);
         };
         let shutting_down = shared
             .shutdown_requested
             .load(std::sync::atomic::Ordering::Acquire);
+        let terminal_failure = shared.pending_terminal_outcome().is_some();
         if shutting_down {
             self.terminal_completion_ready = false;
             self.ensure_shutdown_started();
         }
+        if terminal_failure {
+            self.prepare_failure_scan();
+        }
         let (cm_units, readiness, cm_ready, observed_would_block) =
-            self.service_cm(mode, cx, &shared, shutting_down)?;
-        let (deadline_units, deadline_ready, deadline_terminal) =
-            self.service_deadlines(&shared)?;
-        if shutting_down
+            self.service_cm(mode, cx, &shared, shutting_down, terminal_failure)?;
+        let (deadline_units, deadline_ready, deadline_terminal) = if terminal_failure {
+            (0, false, false)
+        } else {
+            self.service_deadlines(&shared)?
+        };
+        if terminal_failure && self.shutdown_issuance_complete() {
+            self.terminal_completion_ready = true;
+        } else if shutting_down
             && observed_would_block
             && self.shutdown_issuance_complete()
-            && self.terminal_state_drained(&shared)
+            && self.terminal_state_drained()
         {
             #[cfg(any(test, feature = "test-hooks"))]
             if let Some(resources) = self.resources.as_ref() {
@@ -105,12 +124,13 @@ impl SessionProgress {
     }
 
     pub(in crate::v2::engine) fn can_finish(&self) -> bool {
-        self.terminal_completion_ready
-            && self.shutdown_issuance_complete()
-            && self
-                .manager
-                .engine()
-                .is_some_and(|shared| self.terminal_state_drained(&shared))
+        if !self.terminal_completion_ready || !self.shutdown_issuance_complete() {
+            return false;
+        }
+        let Some(shared) = self.manager.engine() else {
+            return false;
+        };
+        shared.pending_terminal_outcome().is_some() || self.terminal_state_drained()
     }
 
     pub(in crate::v2::engine) fn release_resources(&mut self) {
@@ -129,15 +149,32 @@ impl SessionProgress {
         self.reclamation_turn_starts_with_request
     }
 
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn turn_count(&self) -> usize {
+        self.turns
+    }
+
     fn ensure_shutdown_started(&mut self) {
         if self.shutdown_started {
             return;
         }
+
         self.shutdown_started = true;
         self.manager.cm.start_bounded_shutdown();
         self.manager
             .shutdown_connection_close_started
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn prepare_failure_scan(&mut self) {
+        if self.failure_scan_started {
+            return;
+        }
+        self.failure_scan_started = true;
+        self.shutdown_cm = CmShutdownCursor::default();
+        self.shutdown_connection_slot = 0;
+        self.shutdown_connections_complete = false;
+        self.shutdown_next_source = true;
     }
 
     fn shutdown_issuance_complete(&self) -> bool {
@@ -146,15 +183,17 @@ impl SessionProgress {
             && self.manager.cm.bounded_shutdown_complete(&self.shutdown_cm)
     }
 
-    fn terminal_state_drained(&self, shared: &Arc<crate::v2::engine::EngineShared>) -> bool {
+    fn terminal_state_drained(&self) -> bool {
         !self.manager.has_cm_work()
             && self.manager.retained_cm_owner_count() == 0
             && self.manager.live_connection_count() == 0
-            && shared.io_core.accepted_count() == 0
     }
 
     fn service_shutdown_unit(&mut self, shared: &Arc<crate::v2::engine::EngineShared>) -> usize {
-        let outcome = MemoizedTerminalResult::from_error(Error::DriverShutdown);
+        let terminal = shared.pending_terminal_outcome();
+        let outcome = terminal
+            .clone()
+            .unwrap_or_else(|| MemoizedTerminalResult::from_error(Error::DriverShutdown));
         for _ in 0..2 {
             let cm_first = self.shutdown_next_source;
             self.shutdown_next_source = !self.shutdown_next_source;
@@ -162,6 +201,7 @@ impl SessionProgress {
                 let processed = self.manager.cm.service_bounded_shutdown(
                     shared,
                     &outcome,
+                    terminal.is_some(),
                     &mut self.shutdown_cm,
                     1,
                 );
@@ -177,6 +217,18 @@ impl SessionProgress {
                 self.shutdown_connections_complete = complete;
                 for connection in connections {
                     self.manager.begin_connection_close(shared, &connection);
+                    if let Some(outcome) = terminal.as_ref() {
+                        if connection.retain_bundle_for_engine_failure() {
+                            self.manager.track_connection_quarantine(connection.token);
+                        }
+                        if let Some(event) = self
+                            .manager
+                            .finalize_connection_engine(&connection, outcome)
+                        {
+                            event.deliver();
+                        }
+                        connection.wake_close();
+                    }
                 }
                 if scanned != 0 {
                     return scanned;
@@ -192,6 +244,7 @@ impl SessionProgress {
         cx: &mut TaskContext<'_>,
         shared: &Arc<crate::v2::engine::EngineShared>,
         shutting_down: bool,
+        terminal_failure: bool,
     ) -> Result<(usize, ReadinessRegistration, bool, bool)> {
         let mut processed = 0;
         let mut readiness = if mode == CompletionMode::Readiness && self.resources.is_some() {
@@ -205,6 +258,9 @@ impl SessionProgress {
             let mut selected = false;
             for offset in 0..4 {
                 let source = (self.cm_next_source + offset) % 4;
+                if terminal_failure && source != 3 {
+                    continue;
+                }
                 let units = match source {
                     0 => self.manager.service_cm_software(
                         shared,
@@ -294,9 +350,13 @@ impl SessionProgress {
             }
         }
 
-        let immediate = processed >= self.cm_budget
-            || self.manager.has_cm_work()
-            || (shutting_down && !self.shutdown_issuance_complete());
+        let immediate = if terminal_failure {
+            !self.shutdown_issuance_complete()
+        } else {
+            processed >= self.cm_budget
+                || self.manager.has_cm_work()
+                || (shutting_down && !self.shutdown_issuance_complete())
+        };
         Ok((processed, readiness, immediate, observed_would_block))
     }
 
@@ -558,6 +618,114 @@ mod tests {
         assert!(driver.session_progress.can_finish());
 
         engine.shared.finish(MemoizedTerminalResult::success());
+        drop(driver);
+    }
+
+    #[tokio::test]
+    async fn failure_terminalizes_connections_across_bounded_turns() {
+        let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
+        let connections = engine
+            .shared
+            .test_driver
+            .install_idle_connections(&engine.shared, 64)
+            .unwrap();
+        engine
+            .shared
+            .begin_driver_failure(Error::InvalidConfig("bounded failure".into()));
+        let waker = Waker::noop();
+        let mut cx = TaskContext::from_waker(waker);
+
+        let first = driver
+            .session_progress
+            .turn(CompletionMode::Polling, &mut cx)
+            .unwrap();
+        let terminalized = connections
+            .iter()
+            .filter(|connection| connection.state.close_state().raw_outcome().is_some())
+            .count();
+        assert!(terminalized > 0 && terminalized < connections.len());
+        assert!(first.units_consumed <= 32);
+        assert!(first.immediate_work);
+
+        let mut ready = matches!(first.terminal, ProgressTerminal::Ready);
+        for _ in 0..8 {
+            if ready {
+                break;
+            }
+            let report = driver
+                .session_progress
+                .turn(CompletionMode::Polling, &mut cx)
+                .unwrap();
+            assert!(report.units_consumed <= 32);
+            ready = matches!(report.terminal, ProgressTerminal::Ready);
+        }
+        assert!(ready);
+        assert!(
+            connections.iter().all(|connection| connection
+                .state
+                .close_state()
+                .raw_outcome()
+                .is_some())
+        );
+
+        engine
+            .shared
+            .finish_after_owner_cleanup(MemoizedTerminalResult::from_error(Error::InvalidConfig(
+                "bounded failure".into(),
+            )));
+        drop(connections);
+        drop(driver);
+    }
+
+    #[tokio::test]
+    async fn failure_restarts_terminal_scan_after_partial_graceful_shutdown() {
+        let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
+        let connections = engine
+            .shared
+            .test_driver
+            .install_idle_connections(&engine.shared, 64)
+            .unwrap();
+        engine.shared.request_shutdown();
+        let waker = Waker::noop();
+        let mut cx = TaskContext::from_waker(waker);
+
+        let graceful = driver
+            .session_progress
+            .turn(CompletionMode::Polling, &mut cx)
+            .unwrap();
+        assert!(graceful.immediate_work);
+        assert!(driver.session_progress.shutdown_connection_slot > 0);
+
+        engine
+            .shared
+            .begin_driver_failure(Error::InvalidConfig("late failure".into()));
+        let mut ready = false;
+        for _ in 0..12 {
+            let report = driver
+                .session_progress
+                .turn(CompletionMode::Polling, &mut cx)
+                .unwrap();
+            if matches!(report.terminal, ProgressTerminal::Ready) {
+                ready = true;
+                break;
+            }
+        }
+        assert!(ready);
+        assert!(driver.session_progress.failure_scan_started);
+        assert!(
+            connections.iter().all(|connection| connection
+                .state
+                .close_state()
+                .raw_outcome()
+                .is_some())
+        );
+
+        engine
+            .shared
+            .finish_after_owner_cleanup(MemoizedTerminalResult::from_error(Error::InvalidConfig(
+                "late failure".into(),
+            )));
+        drop(connections);
         drop(driver);
     }
 }

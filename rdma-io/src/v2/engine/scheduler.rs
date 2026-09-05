@@ -10,23 +10,14 @@ use tokio::time::Instant;
 
 use super::progress::OwnerClass;
 
-const WORK_CLASS_COUNT: usize = 3;
 const OWNER_CLASS_COUNT: usize = 3;
 
 /// Deduplicated fair rotation over progress owners.
-#[allow(
-    dead_code,
-    reason = "introduced before driver migration in later phases"
-)]
 pub(super) struct OwnerScheduler {
     classes: VecDeque<OwnerClass>,
     queued: [bool; OWNER_CLASS_COUNT],
 }
 
-#[allow(
-    dead_code,
-    reason = "introduced before driver migration in later phases"
-)]
 impl OwnerScheduler {
     pub(super) fn new() -> Self {
         Self {
@@ -50,55 +41,6 @@ impl OwnerScheduler {
     }
 
     pub(super) fn ready_count(&self) -> usize {
-        self.classes.len()
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum WorkClass {
-    Terminal,
-    Io,
-    Session,
-}
-
-impl WorkClass {
-    pub(super) const fn index(self) -> usize {
-        match self {
-            Self::Terminal => 0,
-            Self::Io => 1,
-            Self::Session => 2,
-        }
-    }
-}
-
-pub(super) struct WorkScheduler {
-    classes: VecDeque<WorkClass>,
-    class_queued: [bool; WORK_CLASS_COUNT],
-}
-
-impl WorkScheduler {
-    pub(super) fn new() -> Self {
-        Self {
-            classes: VecDeque::with_capacity(WORK_CLASS_COUNT),
-            class_queued: [false; WORK_CLASS_COUNT],
-        }
-    }
-
-    pub(super) fn mark_class_ready(&mut self, class: WorkClass) {
-        let queued = &mut self.class_queued[class.index()];
-        if !*queued {
-            *queued = true;
-            self.classes.push_back(class);
-        }
-    }
-
-    pub(super) fn next_class(&mut self) -> Option<WorkClass> {
-        let class = self.classes.pop_front()?;
-        self.class_queued[class.index()] = false;
-        Some(class)
-    }
-
-    pub(super) fn ready_class_count(&self) -> usize {
         self.classes.len()
     }
 }
@@ -214,28 +156,25 @@ mod tests {
     }
 
     #[test]
-    fn work_classes_rotate_without_starvation() {
-        let mut scheduler = WorkScheduler::new();
-        for class in [WorkClass::Terminal, WorkClass::Io, WorkClass::Session] {
-            scheduler.mark_class_ready(class);
+    fn ready_at_entry_bounds_one_turn_per_owner() {
+        let mut scheduler = OwnerScheduler::new();
+        for class in [OwnerClass::Io, OwnerClass::Session, OwnerClass::Terminal] {
+            scheduler.mark_ready(class);
+        }
+        let pass_budget = scheduler.ready_count();
+        let mut serviced = Vec::new();
+        for _ in 0..pass_budget {
+            let class = scheduler.next().unwrap();
+            serviced.push(class);
+            scheduler.mark_ready(class);
         }
 
-        let first_round: Vec<_> = (0..WORK_CLASS_COUNT)
-            .map(|_| {
-                let class = scheduler.next_class().unwrap();
-                scheduler.mark_class_ready(class);
-                class
-            })
-            .collect();
         assert_eq!(
-            first_round,
-            [WorkClass::Terminal, WorkClass::Io, WorkClass::Session,]
+            serviced,
+            [OwnerClass::Io, OwnerClass::Session, OwnerClass::Terminal]
         );
-        assert_eq!(
-            scheduler.next_class(),
-            Some(WorkClass::Terminal),
-            "the first class rotates to the tail"
-        );
+        assert_eq!(scheduler.ready_count(), OWNER_CLASS_COUNT);
+        assert_eq!(scheduler.next(), Some(OwnerClass::Io));
     }
 
     #[test]

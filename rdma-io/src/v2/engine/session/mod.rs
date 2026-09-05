@@ -477,7 +477,7 @@ impl SessionManager {
         let now = tokio::time::Instant::now();
         let at = now.checked_add(after).unwrap_or(now);
         lock_unpoison(&self.deadline_requests).push_back(DeadlineRequest { at, kind, token });
-        work_signal.publish(super::driver::SESSION_RECLAMATION_WORK);
+        work_signal.publish(super::driver::SESSION_WORK);
     }
 
     pub(super) fn take_deadline_requests(&self, budget: usize) -> Vec<DeadlineRequest> {
@@ -753,6 +753,14 @@ impl IoSessionBridge for SessionManager {
             return;
         };
         self.handle_reclamation_deadline(&shared, token);
+    }
+
+    fn apply_terminal_effects(&self, mut effects: IoCoreEffects) {
+        let Some(shared) = self.engine() else {
+            return;
+        };
+        self.apply_io_effects(&shared, &mut effects);
+        effects.publish();
     }
 }
 

@@ -73,6 +73,8 @@ pub(super) trait IoSessionBridge: Send + Sync {
     ) -> (usize, bool);
 
     fn handle_reclamation_deadline(&self, token: OperationToken);
+
+    fn apply_terminal_effects(&self, effects: IoCoreEffects);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -354,6 +356,7 @@ pub(super) struct IoCore {
     completion_dispatch_budget: usize,
     reclamation_requests: Mutex<VecDeque<IoDeadlineRequest>>,
     session_bridge: OnceLock<Weak<dyn IoSessionBridge>>,
+    terminal_failure: Mutex<Option<super::lifecycle::MemoizedTerminalResult>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -398,6 +401,7 @@ impl IoCore {
             completion_dispatch_budget,
             reclamation_requests: Mutex::new(VecDeque::new()),
             session_bridge: OnceLock::new(),
+            terminal_failure: Mutex::new(None),
         });
         let reclaim = QpReclaimCapability::new(&core);
         Ok((core, reclaim))
@@ -486,6 +490,21 @@ impl IoCore {
 
     pub(super) fn accepted_count(&self) -> usize {
         self.accepted_operations.load(Ordering::Acquire)
+    }
+
+    pub(super) fn shutdown_requested(&self) -> bool {
+        self.shutdown_requested.load(Ordering::Acquire)
+    }
+
+    pub(super) fn begin_terminal_failure(&self, outcome: super::lifecycle::MemoizedTerminalResult) {
+        let mut terminal = lock_unpoison(&self.terminal_failure);
+        if terminal.is_none() {
+            *terminal = Some(outcome);
+        }
+    }
+
+    pub(super) fn terminal_failure(&self) -> Option<super::lifecycle::MemoizedTerminalResult> {
+        lock_unpoison(&self.terminal_failure).clone()
     }
 
     pub(super) fn publish_connection(&self, connection: &Arc<EstablishedIoConnection>) {
