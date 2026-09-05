@@ -299,9 +299,17 @@ impl IoProgress {
         let mut prefer_request = starts_with_request;
         while consumed < self.reclamation_budget {
             let handled = if prefer_request {
-                self.ingest_one_request()? || self.process_one_deadline(now, bridge.as_ref())
+                if self.ingest_one_request()? {
+                    true
+                } else {
+                    self.process_one_deadline(now, bridge.as_ref())
+                }
             } else {
-                self.process_one_deadline(now, bridge.as_ref()) || self.ingest_one_request()?
+                if self.process_one_deadline(now, bridge.as_ref()) {
+                    true
+                } else {
+                    self.ingest_one_request()?
+                }
             };
             if !handled {
                 break;

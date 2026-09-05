@@ -1,4 +1,4 @@
-//! Sole engine-progress future and wakeup protocol.
+//! Sole engine-progress future and thin bounded scheduler.
 //!
 //! Software producers publish queue state before setting a pending class bit
 //! and incrementing an epoch, then wake the registered `AtomicWaker`. Before
@@ -6,12 +6,13 @@
 //! pending bits and epoch. Therefore a publish before registration is found by
 //! the recheck, while a publish after registration performs the wake.
 //!
-//! Readiness CQ progress polls before arming, arms once, immediately polls
-//! again, waits for the shared fd only after both polls are empty, then drains
-//! and acknowledges every channel event before repeating. This closes both CQ
-//! edge races without a periodic timer. Polling mode performs one bounded CQ
-//! attempt per driver poll and returns `Pending` after scheduling a cooperative
-//! wake; neither mode scans idle connection registrations.
+//! Each poll fairly visits ready-at-entry I/O, session, and terminal owners at
+//! most once. The owners hide CQ/CM readiness, completion routing, deadline
+//! kinds, teardown, and terminalization details behind bounded progress
+//! reports. Because readiness wakes do not identify their source, every poll
+//! probes both owners once; idle owners register and recheck readiness without
+//! creating a self-wake loop. Polling mode yields cooperatively after the
+//! bounded pass.
 
 use std::future::Future;
 use std::pin::Pin;

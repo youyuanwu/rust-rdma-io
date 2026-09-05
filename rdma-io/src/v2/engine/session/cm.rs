@@ -117,6 +117,7 @@ pub(in crate::v2::engine) struct CmState {
     cm_destructions: Mutex<VecDeque<PendingCmDestruction>>,
     setup_rollback_quarantines: Mutex<Vec<RetainedSetupRollback>>,
     software_next_class: AtomicUsize,
+    outbound_setup_active: AtomicBool,
     shutting_down: AtomicBool,
 }
 
@@ -163,6 +164,7 @@ impl CmState {
             cm_destructions: Mutex::new(VecDeque::new()),
             setup_rollback_quarantines: Mutex::new(Vec::new()),
             software_next_class: AtomicUsize::new(0),
+            outbound_setup_active: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
         })
     }
@@ -339,12 +341,20 @@ impl CmState {
                 2 => {
                     let request = { lock_unpoison(&self.pending).pop_front() };
                     if let Some(request) = request {
-                        let resources = resources.ok_or_else(|| {
-                            Error::InvalidConfig(
+                        if self.outbound_setup_active.swap(true, Ordering::AcqRel) {
+                            lock_unpoison(&self.pending).push_front(request);
+                            remaining[2] = 0;
+                            continue;
+                        }
+                        let Some(resources) = resources else {
+                            self.outbound_setup_active.store(false, Ordering::Release);
+                            return Err(Error::InvalidConfig(
                                 "CM pending work requires live engine resources".into(),
-                            )
-                        })?;
-                        self.start_outbound(shared, resources, request)?;
+                            ));
+                        };
+                        if !self.start_outbound(shared, resources, request)? {
+                            self.outbound_setup_active.store(false, Ordering::Release);
+                        }
                         processed += 1;
                     }
                 }
@@ -1450,13 +1460,13 @@ impl CmState {
         shared: &Arc<EngineShared>,
         resources: &EngineResources,
         request: Arc<OutboundRequest>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if request.observer.cancelled.load(Ordering::Acquire)
             || self.shutting_down.load(Ordering::Acquire)
         {
             request.take_reservation();
             request.complete(Err(Error::DriverShutdown));
-            return Ok(());
+            return Ok(false);
         }
         let reservation = request.take_reservation().ok_or_else(|| {
             Error::InvalidConfig("outbound request lost its connection reservation".into())
@@ -1469,7 +1479,7 @@ impl CmState {
             Err(error) => {
                 drop(reservation);
                 request.complete_failure(shared, error);
-                return Ok(());
+                return Ok(false);
             }
         };
         request.route_token.store(token.encode(), Ordering::Release);
@@ -1484,7 +1494,7 @@ impl CmState {
                 self.routes.release(token, false);
                 drop(reservation);
                 request.complete_failure(shared, Error::from_v1(error));
-                return Ok(());
+                return Ok(false);
             }
         };
         let Some(context_token) = cm_id.context_token() else {
@@ -1495,7 +1505,7 @@ impl CmState {
                 shared,
                 Error::InvalidConfig("engine CM ID lost its route context token".into()),
             );
-            return Ok(());
+            return Ok(false);
         };
         let context_route = CmRouteToken::decode(context_token);
         if context_route != token {
@@ -1506,7 +1516,7 @@ impl CmState {
                 shared,
                 Error::InvalidConfig("engine CM context token did not match its route".into()),
             );
-            return Ok(());
+            return Ok(false);
         }
         let context_key = cm_id.context_key();
         route.set_identity(cm_id.as_raw() as usize, context_key);
@@ -1525,7 +1535,7 @@ impl CmState {
                 shared,
                 Error::InvalidConfig("duplicate CM context identity".into()),
             );
-            return Ok(());
+            return Ok(false);
         }
 
         let resolve = cm_id.resolve_addr(None, &request.address, 2_000);
@@ -1540,9 +1550,10 @@ impl CmState {
                 self.retire_route(&route, false);
                 drop(reservation);
                 request.complete_failure(shared, Error::from_v1(error));
+                return Ok(false);
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     fn process_cancellation(
@@ -1957,23 +1968,38 @@ impl CmState {
         route: &Arc<OutboundRoute>,
         snapshot: CmEventSnapshot,
     ) -> Result<EventDisposition> {
-        if is_failure_event(snapshot.event_type) || snapshot.status != 0 {
-            return self.handle_failure_event(shared, route, snapshot);
-        }
-        match snapshot.event_type {
-            CmEventType::AddrResolved => self.handle_addr_resolved(shared, resources, route),
-            CmEventType::RouteResolved => self.handle_route_resolved(shared, resources, route),
-            CmEventType::Established => self.handle_established(shared, route),
-            CmEventType::Disconnected => self.handle_disconnected(shared, route),
-            CmEventType::TimewaitExit => {
-                if route.is_disconnected() {
-                    Ok(EventDisposition::Handled)
-                } else {
-                    Ok(EventDisposition::Rejected(CmEventReject::Unexpected))
+        let disposition = if is_failure_event(snapshot.event_type) || snapshot.status != 0 {
+            self.handle_failure_event(shared, route, snapshot)?
+        } else {
+            match snapshot.event_type {
+                CmEventType::AddrResolved => self.handle_addr_resolved(shared, resources, route),
+                CmEventType::RouteResolved => self.handle_route_resolved(shared, resources, route),
+                CmEventType::Established => self.handle_established(shared, route),
+                CmEventType::Disconnected => self.handle_disconnected(shared, route),
+                CmEventType::TimewaitExit => {
+                    if route.is_disconnected() {
+                        Ok(EventDisposition::Handled)
+                    } else {
+                        Ok(EventDisposition::Rejected(CmEventReject::Unexpected))
+                    }
                 }
-            }
-            _ => Ok(EventDisposition::Rejected(CmEventReject::Unexpected)),
+                _ => Ok(EventDisposition::Rejected(CmEventReject::Unexpected)),
+            }?
+        };
+        let route_retired = !matches!(self.routes.lookup_cloned(route.token), Lookup::Occupied(_));
+        if is_failure_event(snapshot.event_type)
+            || snapshot.status != 0
+            || snapshot.event_type == CmEventType::RouteResolved
+            || snapshot.event_type == CmEventType::Established
+            || route_retired
+            || !route.is_establishing()
+        {
+            self.outbound_setup_active.store(false, Ordering::Release);
+            shared
+                .work_signal
+                .publish(super::super::driver::SESSION_WORK);
         }
+        Ok(disposition)
     }
 
     fn handle_inbound_event(

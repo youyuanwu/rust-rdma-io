@@ -5,10 +5,12 @@
 //! notification resources. Readiness owns one completion channel/fd; polling
 //! owns none. Every connection shares those objects.
 //!
-//! The driver routes a CQE only when the current connection generation,
-//! operation generation, operation owner, and provider-reported `qp_num` all
-//! agree. It is also the sole CM event consumer. Cancellation, close, shutdown,
-//! and driver loss retain accepted or acceptance-ambiguous MRs until an exact
+//! The driver is a thin scheduler over bounded I/O, session, and terminal
+//! turns. The I/O owner polls the shared CQ and validates a CQE only when the
+//! current connection generation, operation generation, operation owner, and
+//! provider-reported `qp_num` all agree. The session owner consumes CM events
+//! and controls connection lifecycle. Cancellation, close, shutdown, and
+//! driver loss retain accepted or acceptance-ambiguous MRs until an exact
 //! completion, provider-proven rejection, or successful synchronous
 //! destruction of the owning QP establishes a positive safety boundary.
 //!
@@ -247,9 +249,10 @@ impl RdmaEngineBuilder {
 
 /// Cloneable frontend for one explicitly driven engine instance.
 ///
-/// Cloning this value never starts work. All CQ, CM, reclamation, and
-/// per-connection completion dispatch remains owned by the paired
-/// [`RdmaEngineDriver`]. Message protocol progress belongs to each returned
+/// Cloning this value never starts work. The paired [`RdmaEngineDriver`]
+/// schedules bounded turns while the I/O core owns CQ/completion/reclamation
+/// policy and the session subsystem owns CM and connection lifecycle policy.
+/// Message protocol progress belongs to each returned
 /// [`crate::v2::MessageTransportDriver`].
 /// The handle is `Clone + Send + Sync + 'static`.
 ///
@@ -301,7 +304,8 @@ impl RdmaEngine {
     }
 
     /// Establish an outbound low-level connection with the default QP/CM
-    /// configuration. The engine driver owns every CM and CQ progress step.
+    /// configuration. The engine driver schedules every bounded CM and CQ
+    /// progress turn through its owning layer.
     ///
     /// Low-level establishment posts zero initial receives. With the default
     /// infinite RNR retry, a peer's early send can wait until the application
@@ -385,12 +389,13 @@ impl Drop for RdmaEngine {
 
 /// Sole progress future for an [`RdmaEngine`].
 ///
-/// The driver performs bounded rotating service across terminal/control, CM,
-/// CQ, reclamation/deadline, and per-connection completion dispatch. Message
-/// protocol work belongs to [`crate::v2::MessageTransportDriver`]. Readiness
-/// mode sleeps
-/// only on registered event sources and published software work; polling mode
-/// performs one bounded nonblocking iteration followed by a cooperative yield.
+/// The driver fairly rotates across three opaque bounded owners: I/O, session,
+/// and terminal composition. CQ polling, completion dispatch, and operation
+/// deadlines remain behind the I/O owner; CM progress, lifecycle deadlines,
+/// and teardown remain behind the session owner. Message protocol work belongs
+/// to [`crate::v2::MessageTransportDriver`]. Readiness mode sleeps only on
+/// registered event sources and published software work; polling mode performs
+/// one bounded nonblocking iteration followed by a cooperative yield.
 /// Dropping the driver publishes a terminal failure and wakes observed waiters.
 /// Drop performs one bounded pass over registered connections, with at most
 /// one QP ERR transition and one zero-outstanding QP destroy attempt per

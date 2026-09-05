@@ -372,11 +372,17 @@ impl SessionProgress {
         let mut terminal_ready = false;
         while consumed < self.reclamation_budget {
             let handled = if prefer_request {
-                self.ingest_one_deadline()?
-                    || self.process_one_deadline(now, shared, &mut terminal_ready)?
+                if self.ingest_one_deadline()? {
+                    true
+                } else {
+                    self.process_one_deadline(now, shared, &mut terminal_ready)?
+                }
             } else {
-                self.process_one_deadline(now, shared, &mut terminal_ready)?
-                    || self.ingest_one_deadline()?
+                if self.process_one_deadline(now, shared, &mut terminal_ready)? {
+                    true
+                } else {
+                    self.ingest_one_deadline()?
+                }
             };
             if !handled {
                 break;

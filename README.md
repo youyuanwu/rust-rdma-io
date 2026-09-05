@@ -122,8 +122,9 @@ let client = GreeterClient::new(channel);
 The `v2` module provides one explicitly driven engine for many low-level and
 message connections. Its ownership model resembles one io_uring instance or
 IOCP completion port: frontend handles submit work, while one application-owned
-driver is the sole CQ/CM consumer and routes completions by connection
-generation, operation generation, and exact `qp_num`.
+driver schedules the sole I/O and session consumers. The I/O owner routes
+completions by connection generation, operation generation, and exact
+`qp_num`.
 
 ```rust
 use rdma_io::v2::*;
@@ -166,10 +167,17 @@ let (engine, driver) = RdmaEngineBuilder::new("rxe0")
 One engine owns one anchored context facade, PD, CQ, and CM event channel.
 Readiness adds one CQ completion channel/fd; polling adds none. There is exactly
 one explicit engine driver and zero library-owned tasks or threads, regardless
-of connection count. Each message connection additionally returns one
-application-owned message driver; low-level connections add no driver.
+of connection count. The engine driver is a thin fair scheduler over bounded
+I/O, session, and terminal turns; the owning layers retain CQ/completion and
+CM/connection-lifecycle policy. Each message connection additionally returns
+one application-owned message driver; low-level connections add no driver.
 Low-level `connect`/`connect_with_config` and listener
 `accept`/`accept_with_config` post zero initial receives.
+
+The former aggregate `reclamation_budget` builder option is replaced by
+`io_reclamation_budget` and `session_reclamation_budget` (both default to 16).
+Split an existing aggregate budget between them; an old value of 1 has no
+exact equivalent because both owner turns require a nonzero budget.
 
 Dropping the last `RdmaEngine` clone requests shutdown; connections, listeners,
 and message transports retain safety state but do not keep an engine frontend
