@@ -185,13 +185,15 @@ pub(super) async fn listen(
     shared.session.cm.enqueue_listen(Arc::clone(&request));
     drop(admission);
     shared.work_signal.publish(super::cm::CM_WORK);
-    ListenWaiter {
+    let waiter = ListenWaiter {
         manager: Arc::downgrade(&shared.session),
         request: Arc::downgrade(&request),
         observer: Arc::clone(&request.observer),
         finished: false,
-    }
-    .await
+    };
+    drop(request);
+    drop(shared);
+    waiter.await
 }
 
 pub(super) async fn accept_with_setup(
@@ -210,14 +212,17 @@ pub(super) async fn accept_with_setup(
     drop(admission);
     shared.session.cm.enqueue_listener_work(&listener);
     shared.work_signal.publish(super::cm::CM_WORK);
-    AcceptWaiter {
+    let waiter = AcceptWaiter {
         manager: Arc::downgrade(&shared.session),
         listener: Arc::downgrade(&listener),
         request: Arc::downgrade(&request),
         observer: Arc::clone(&request.observer),
         finished: false,
-    }
-    .await
+    };
+    drop(request);
+    drop(listener);
+    drop(shared);
+    waiter.await
 }
 
 pub(super) fn empty_connection_setup() -> ConnectionSetup {
@@ -1103,6 +1108,49 @@ mod tests {
             accept_observer.take_result(),
             Some(Err(Error::DriverShutdown))
         ));
+    }
+
+    #[test]
+    fn pending_listen_and_accept_futures_release_strong_session_owners() {
+        let (engine, _driver) =
+            super::super::test_engine_pair(super::super::CompletionMode::Polling);
+        let baseline_engine_owners = Arc::strong_count(&engine.shared);
+        let mut listen_future = Box::pin(listen(
+            Arc::clone(&engine.shared),
+            "127.0.0.1:0".parse().unwrap(),
+            RdmaListenerConfig::default(),
+        ));
+        let waker = futures_util::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
+        assert!(listen_future.as_mut().poll(&mut context).is_pending());
+        assert_eq!(
+            Arc::strong_count(&engine.shared),
+            baseline_engine_owners,
+            "suspended listen future must retain only weak session routing"
+        );
+
+        let listener = ListenerState::test_only(4);
+        let baseline_listener_owners = Arc::strong_count(&listener);
+        let mut accept_future = Box::pin(accept_with_setup(
+            Arc::clone(&engine.shared),
+            Arc::clone(&listener),
+            RdmaConnectionConfig::default(),
+            empty_connection_setup(),
+        ));
+        assert!(accept_future.as_mut().poll(&mut context).is_pending());
+        assert_eq!(Arc::strong_count(&engine.shared), baseline_engine_owners);
+        assert_eq!(
+            Arc::strong_count(&listener),
+            baseline_listener_owners + 1,
+            "only SessionManager's published listener-work queue may add a ListenerState retain"
+        );
+        let queues = lock_unpoison(&listener.queues);
+        assert_eq!(queues.waiters.len(), 1);
+        assert_eq!(
+            Arc::strong_count(&queues.waiters[0]),
+            1,
+            "only SessionManager listener queues may strongly retain the accept record"
+        );
     }
 
     fn request() -> Arc<AcceptRequest> {

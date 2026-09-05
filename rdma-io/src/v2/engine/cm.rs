@@ -2775,13 +2775,15 @@ pub(super) async fn connect_with_setup(
     shared.session.cm.enqueue(Arc::clone(&request));
     drop(admission);
     shared.work_signal.publish(CM_WORK);
-    ConnectWaiter {
+    let waiter = ConnectWaiter {
         manager: Arc::downgrade(&shared.session),
         request: Arc::downgrade(&request),
         observer: Arc::clone(&request.observer),
         finished: false,
-    }
-    .await
+    };
+    drop(request);
+    drop(shared);
+    waiter.await
 }
 
 fn build_qp(
@@ -3467,6 +3469,39 @@ mod tests {
             observer.take_result(),
             Some(Err(Error::DriverShutdown))
         ));
+    }
+
+    #[test]
+    fn pending_connect_future_releases_engine_and_manager_record_owners() {
+        let (engine, _driver) =
+            super::super::test_engine_pair(super::super::CompletionMode::Polling);
+        let baseline_engine_owners = Arc::strong_count(&engine.shared);
+        let mut connect = Box::pin(connect_with_setup(
+            Arc::clone(&engine.shared),
+            "127.0.0.1:7471".parse().unwrap(),
+            RdmaConnectionConfig::default(),
+            empty_connection_setup(),
+        ));
+        assert_eq!(
+            Arc::strong_count(&engine.shared),
+            baseline_engine_owners + 1
+        );
+
+        let waker = futures_util::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
+        assert!(connect.as_mut().poll(&mut context).is_pending());
+        assert_eq!(
+            Arc::strong_count(&engine.shared),
+            baseline_engine_owners,
+            "suspended connect future must retain only a weak SessionManager route"
+        );
+        let pending = lock_unpoison(&engine.shared.session.cm.pending);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            Arc::strong_count(&pending[0]),
+            1,
+            "only SessionManager CM state may strongly retain the outbound record"
+        );
     }
 
     #[test]
