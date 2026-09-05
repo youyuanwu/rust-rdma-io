@@ -253,7 +253,6 @@ pub(super) struct ConnectionState {
     retirement_started: AtomicBool,
     retirement_quarantined: AtomicBool,
     drained_recorded: AtomicBool,
-    retired: AtomicBool,
     admission: Mutex<Option<ConnectionReservation>>,
     cm_route: Option<ConnectionCmRoute>,
     #[cfg(any(test, feature = "test-hooks"))]
@@ -307,7 +306,6 @@ impl ConnectionState {
             retirement_started: AtomicBool::new(false),
             retirement_quarantined: AtomicBool::new(false),
             drained_recorded: AtomicBool::new(false),
-            retired: AtomicBool::new(false),
             admission: Mutex::new(admission),
             cm_route,
             #[cfg(any(test, feature = "test-hooks"))]
@@ -581,7 +579,7 @@ impl ConnectionState {
             *outcome = Some(MemoizedTerminalResult::success());
         }
         drop(outcome);
-        self.retired.store(true, Ordering::Release);
+        self.close.mark_retired();
         self.close.notify_waiters();
         self.pending_io_event(IoTerminalEvent::Closed(Ok(())))
     }
@@ -597,22 +595,18 @@ impl ConnectionState {
             *outcome = Some(MemoizedTerminalResult::from_error(error.clone()));
         }
         drop(outcome);
-        self.retired.store(true, Ordering::Release);
+        self.close.mark_retired();
         self.close.notify_waiters();
         self.pending_io_event(IoTerminalEvent::Closed(Err(error)))
     }
 
     pub(super) fn close_outcome(&self) -> Option<MemoizedTerminalResult> {
-        let outcome = lock_unpoison(&self.close.outcome).clone();
-        match outcome {
-            Some(ref value) if value.is_connection_quarantined() => outcome,
-            Some(_) if self.is_retired() => outcome,
-            _ => None,
-        }
+        self.close.outcome()
     }
 
     pub(super) fn operation_close_error(&self) -> Error {
-        lock_unpoison(&self.close.outcome)
+        self.close
+            .raw_outcome()
             .as_ref()
             .and_then(MemoizedTerminalResult::error)
             .unwrap_or(Error::TransportClosed)
@@ -654,7 +648,7 @@ impl ConnectionState {
     }
 
     pub(super) fn is_retired(&self) -> bool {
-        self.retired.load(Ordering::Acquire)
+        self.close.is_retired()
     }
 
     pub(super) fn mark_drained_once(&self) -> bool {

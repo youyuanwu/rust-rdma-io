@@ -25,6 +25,7 @@ use super::{EngineShared, Result};
 pub(super) struct SessionCloseState {
     pub(super) outcome: Mutex<Option<super::lifecycle::MemoizedTerminalResult>>,
     pub(super) notify: Arc<tokio::sync::Notify>,
+    retired: AtomicBool,
 }
 
 impl SessionCloseState {
@@ -32,6 +33,7 @@ impl SessionCloseState {
         Arc::new(Self {
             outcome: Mutex::new(None),
             notify: Arc::new(tokio::sync::Notify::new()),
+            retired: AtomicBool::new(false),
         })
     }
 
@@ -40,7 +42,25 @@ impl SessionCloseState {
     }
 
     pub(super) fn outcome(&self) -> Option<super::lifecycle::MemoizedTerminalResult> {
+        let outcome = self.raw_outcome();
+        match outcome {
+            Some(ref value) if value.is_connection_quarantined() => outcome,
+            Some(_) if self.is_retired() => outcome,
+            _ => None,
+        }
+    }
+
+    pub(super) fn raw_outcome(&self) -> Option<super::lifecycle::MemoizedTerminalResult> {
         lock_unpoison(&self.outcome).clone()
+    }
+
+    pub(super) fn mark_retired(&self) {
+        self.retired
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(super) fn is_retired(&self) -> bool {
+        self.retired.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub(super) fn notify_waiters(&self) {
@@ -339,7 +359,7 @@ mod tests {
     use super::super::connection::{WorkRequestPoster, install_connection};
     use super::super::scheduler::DeadlineKind;
     use super::super::{CompletionMode, RdmaConnectionConfig, test_engine_pair};
-    use crate::v2::error::Result;
+    use crate::v2::error::{Error, Result};
     use crate::v2::qp::{BatchPostOutcome, QpCapabilities};
     use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
 
@@ -426,5 +446,33 @@ mod tests {
         capability.request_close();
         assert!(connection.state.close_started());
         assert!(connection.state.error_transition_complete());
+    }
+
+    #[test]
+    fn session_connection_close_observer_waits_for_retirement_after_cm_failure() {
+        let (engine, _driver) = test_engine_pair(CompletionMode::Polling);
+        let connection = install_connection(
+            &engine.shared,
+            Arc::new(TestPoster { qp_num: 18 }),
+            RdmaConnectionConfig::default(),
+            None,
+            None,
+        )
+        .expect("install synthetic connection");
+        let capability = engine
+            .shared
+            .session
+            .connection_capability(&connection.state);
+
+        let _pending = connection.state.mark_cm_failure(Error::TransportClosed);
+        assert!(
+            capability.close.outcome().is_none(),
+            "ordinary close errors remain hidden until QP/CmId retirement"
+        );
+        let _pending = connection.state.finish_retirement();
+        assert!(matches!(
+            capability.close.outcome().unwrap().into_result(),
+            Err(Error::TransportClosed)
+        ));
     }
 }
