@@ -819,6 +819,43 @@ fn test_no_hidden_spawn_in_v2() {
 }
 
 #[test]
+fn provider_validation_propagates_the_cargo_job_limit() {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let workspace_root = Path::new(manifest_dir).parent().expect("workspace root");
+    let script_path = workspace_root
+        .join("scripts")
+        .join("validate-v2-engine-providers.sh");
+    let script = fs::read_to_string(&script_path).expect("read provider validation script");
+    let cargo_commands = script
+        .lines()
+        .filter(|line| {
+            line.contains("\"$CARGO\" test")
+                || line.contains("\"$CARGO\" build")
+                || line.contains("\"$CARGO\" check")
+        })
+        .count();
+    let propagated_limits = script
+        .matches("CARGO_BUILD_JOBS=\"$CARGO_BUILD_JOBS\"")
+        .count();
+
+    assert!(
+        cargo_commands > 0,
+        "provider script contains no Cargo commands"
+    );
+    assert_eq!(
+        propagated_limits,
+        cargo_commands,
+        "{} must explicitly propagate CARGO_BUILD_JOBS to every Cargo command",
+        script_path.display()
+    );
+    assert!(
+        script.contains("CARGO_BUILD_JOBS=\"${CARGO_BUILD_JOBS:-2}\""),
+        "{} must default provider validation to two Cargo jobs",
+        script_path.display()
+    );
+}
+
+#[test]
 fn test_v2_io_boundary_dependency_direction_and_visibility() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let workspace_root = Path::new(manifest_dir).parent().expect("workspace root");

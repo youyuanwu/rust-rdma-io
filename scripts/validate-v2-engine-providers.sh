@@ -10,6 +10,7 @@ restoration_status=0
 RUN_FULL_WORKSPACE=0
 ENGINE_CONFORMANCE=0
 FULL_VALIDATION=0
+CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 
 if [[ -z "${CARGO:-}" ]]; then
     if command -v cargo >/dev/null 2>&1; then
@@ -129,12 +130,14 @@ run_selected_test() {
         sudo -u "$SUDO_USER" env \
             HOME="$user_home" \
             PATH="$TOOLCHAIN_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
             RDMA_REQUIRE_PROVIDER=1 \
             RUST_TEST_THREADS=1 \
             "$CARGO" test -p rdma-io-tests --test "$target" -- --nocapture
     else
         env \
             PATH="$TOOLCHAIN_BIN:$PATH" \
+            CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
             RDMA_REQUIRE_PROVIDER=1 \
             RUST_TEST_THREADS=1 \
             "$CARGO" test -p rdma-io-tests --test "$target" -- --nocapture
@@ -202,10 +205,12 @@ run_production_build() {
         sudo -u "$SUDO_USER" env \
             HOME="$user_home" \
             PATH="$TOOLCHAIN_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
             "$CARGO" build -p rdma-io --release --no-default-features --features tokio
     else
         env \
             PATH="$TOOLCHAIN_BIN:$PATH" \
+            CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
             "$CARGO" build -p rdma-io --release --no-default-features --features tokio
     fi
 }
@@ -217,12 +222,14 @@ run_full_workspace() {
         sudo -u "$SUDO_USER" env \
             HOME="$user_home" \
             PATH="$TOOLCHAIN_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
             RDMA_REQUIRE_PROVIDER=1 \
             RUST_TEST_THREADS=1 \
             "$CARGO" test --workspace --all-features
     else
         env \
             PATH="$TOOLCHAIN_BIN:$PATH" \
+            CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
             RDMA_REQUIRE_PROVIDER=1 \
             RUST_TEST_THREADS=1 \
             "$CARGO" test --workspace --all-features
@@ -236,25 +243,30 @@ run_static_preflight() {
         sudo -u "$SUDO_USER" env \
             HOME="$user_home" \
             PATH="$TOOLCHAIN_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
             RUSTFLAGS="-D warnings" \
             "$CARGO" check -p rdma-io --no-default-features || return $?
         sudo -u "$SUDO_USER" env \
             HOME="$user_home" \
             PATH="$TOOLCHAIN_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
             RUSTFLAGS="-D warnings" \
             "$CARGO" check -p rdma-io --no-default-features --features tokio || return $?
         sudo -u "$SUDO_USER" env \
             HOME="$user_home" \
             PATH="$TOOLCHAIN_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
             CARGO="$CARGO" \
             "$CARGO" test -p rdma-io-tests \
                 --test v2_no_hidden_spawn || return $?
     else
-        env PATH="$TOOLCHAIN_BIN:$PATH" RUSTFLAGS="-D warnings" \
+        env PATH="$TOOLCHAIN_BIN:$PATH" CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
+            RUSTFLAGS="-D warnings" \
             "$CARGO" check -p rdma-io --no-default-features || return $?
-        env PATH="$TOOLCHAIN_BIN:$PATH" RUSTFLAGS="-D warnings" \
+        env PATH="$TOOLCHAIN_BIN:$PATH" CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
+            RUSTFLAGS="-D warnings" \
             "$CARGO" check -p rdma-io --no-default-features --features tokio || return $?
-        env PATH="$TOOLCHAIN_BIN:$PATH" CARGO="$CARGO" \
+        env PATH="$TOOLCHAIN_BIN:$PATH" CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" CARGO="$CARGO" \
             "$CARGO" test -p rdma-io-tests \
                 --test v2_no_hidden_spawn || return $?
     fi
