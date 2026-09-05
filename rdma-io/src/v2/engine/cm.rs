@@ -33,7 +33,7 @@ use super::listener::{
 };
 use super::registry::{ConnectionToken, Lookup, PagedRegistry, RegistryToken, lock_unpoison};
 use super::resources::EngineResources;
-use super::{ConnectionSetup, EngineShared, RdmaConnection, RdmaConnectionConfig};
+use super::{ConnectionSetup, EngineShared, RdmaConnection, RdmaConnectionConfig, SessionManager};
 use crate::cm::{CmEventType, CmId, PortSpace};
 use crate::v2::error::{Error, Result};
 use crate::v2::qp::QpBuilder;
@@ -303,7 +303,7 @@ impl CmState {
                 1 => {
                     let token = { lock_unpoison(&self.retirements).pop_front() };
                     if let Some(token) = token {
-                        self.retire_registered_connection(shared, token)?;
+                        shared.session.retire_registered_connection(shared, token)?;
                         processed += 1;
                     }
                 }
@@ -1108,7 +1108,9 @@ impl CmState {
             .begin_connection_close(shared, &connection_state);
         drop(connection);
         if connection_state.accepted_count() == 0 {
-            self.retire_registered_connection(shared, connection_state.token)?;
+            shared
+                .session
+                .retire_registered_connection(shared, connection_state.token)?;
         }
         Ok(())
     }
@@ -1213,7 +1215,9 @@ impl CmState {
                     .begin_connection_close(shared, &connection_state);
                 drop(connection);
                 if connection_state.accepted_count() == 0 {
-                    self.retire_registered_connection(shared, connection_state.token)?;
+                    shared
+                        .session
+                        .retire_registered_connection(shared, connection_state.token)?;
                 }
             }
             InboundState::EstablishedAwaitingDelivery {
@@ -1247,7 +1251,9 @@ impl CmState {
                     .session
                     .begin_connection_close(shared, &connection_state);
                 if connection_state.accepted_count() == 0 {
-                    self.retire_registered_connection(shared, connection_state.token)?;
+                    shared
+                        .session
+                        .retire_registered_connection(shared, connection_state.token)?;
                 }
             }
             _ => unreachable!("inbound cancellation state was pre-filtered"),
@@ -1430,108 +1436,11 @@ impl CmState {
             .begin_connection_close(shared, &connection_state);
         drop(request.take_result());
         if connection_state.accepted_count() == 0 {
-            self.retire_registered_connection(shared, connection_state.token)?;
+            shared
+                .session
+                .retire_registered_connection(shared, connection_state.token)?;
         }
         drop(route_request);
-        Ok(())
-    }
-
-    fn retire_registered_connection(
-        &self,
-        shared: &EngineShared,
-        token: ConnectionToken,
-    ) -> Result<()> {
-        let Lookup::Occupied(connection) = shared.session.connections.lookup(token) else {
-            return Ok(());
-        };
-        if connection.accepted_count() != 0 {
-            return Ok(());
-        }
-        if !connection.error_transition_complete() {
-            self.enqueue_retirement(token);
-            return Ok(());
-        }
-        if !connection.try_begin_retirement() {
-            return Ok(());
-        }
-        let lifecycle = connection.lock_lifecycle();
-        let qp_boundary = connection.establish_qp_destruction_boundary(&lifecycle);
-        drop(lifecycle);
-        let _qp_destruction_proof = match qp_boundary {
-            Ok(proof) => proof,
-            Err(error) => {
-                tracing::warn!(
-                    slot = connection.token.slot,
-                    generation = connection.token.generation,
-                    qp_num = connection.qp_num(),
-                    %error,
-                    "connection QP destroy failed; retaining CM route and ownership bundle"
-                );
-                shared.session.track_connection_quarantine(connection.token);
-                let (_, event) = connection.publish_destroy_quarantine(&error, || {});
-                if let Some(event) = event {
-                    event.deliver();
-                }
-                return Ok(());
-            }
-        };
-        let retirement = match connection.cm_route() {
-            Some(ConnectionCmRoute::Outbound(encoded)) => {
-                self.retire_outbound_connection_route(encoded, &connection)?
-            }
-            Some(ConnectionCmRoute::Inbound(encoded)) => {
-                self.retire_inbound_connection_route(shared, encoded, &connection)?
-            }
-            None => RouteRetirement::Complete {
-                completion: None,
-                reject: None,
-            },
-        };
-        let RouteRetirement::Complete { completion, reject } = retirement else {
-            connection.retry_retirement();
-            self.enqueue_retirement(token);
-            return Ok(());
-        };
-        let lifecycle = connection.lock_lifecycle();
-        let resources = connection.destroy_connection_resources(&lifecycle);
-        drop(lifecycle);
-        let (cm_id, _qp_destruction_proof) = match resources {
-            Ok(resources) => resources,
-            Err(error) => {
-                tracing::warn!(
-                    slot = connection.token.slot,
-                    generation = connection.token.generation,
-                    qp_num = connection.qp_num(),
-                    %error,
-                    "connection resource finalization failed; retaining terminal quarantine"
-                );
-                shared.session.track_connection_quarantine(connection.token);
-                let (_, event) = connection.publish_destroy_quarantine(&error, || {});
-                if let Some(event) = event {
-                    event.deliver();
-                }
-                self.finish_inbound_retirement(completion);
-                return Ok(());
-            }
-        };
-        if let Some(cm_id) = cm_id {
-            if reject.is_some() {
-                cm_id.reject(&[]).map_err(|error| {
-                    contextual_cm_error(
-                        "reject selected inbound child after setup rollback",
-                        Error::from_v1(error),
-                    )
-                })?;
-            }
-            lock_unpoison(&self.cm_destructions).push_back(PendingCmDestruction::Connection {
-                cm_id,
-                connection,
-                completion,
-            });
-            return Ok(());
-        }
-        self.finalize_connection_retirement(shared, connection)?;
-        self.finish_inbound_retirement(completion);
         Ok(())
     }
 
@@ -1952,7 +1861,9 @@ impl CmState {
                         .begin_connection_close(shared, &connection_state);
                     drop(connection);
                     if connection_state.accepted_count() == 0 {
-                        self.retire_registered_connection(shared, connection_state.token)?;
+                        shared
+                            .session
+                            .retire_registered_connection(shared, connection_state.token)?;
                     }
                     return Ok(EventDisposition::Handled);
                 }
@@ -2058,7 +1969,9 @@ impl CmState {
             .session
             .begin_connection_close(shared, &connection_state);
         if connection_state.accepted_count() == 0 {
-            self.retire_registered_connection(shared, connection_state.token)?;
+            shared
+                .session
+                .retire_registered_connection(shared, connection_state.token)?;
         }
         Ok(EventDisposition::Handled)
     }
@@ -2100,7 +2013,9 @@ impl CmState {
                     .begin_connection_close(shared, &connection_state);
                 drop(connection);
                 if connection_state.accepted_count() == 0 {
-                    self.retire_registered_connection(shared, connection_state.token)?;
+                    shared
+                        .session
+                        .retire_registered_connection(shared, connection_state.token)?;
                 }
             }
             InboundState::EstablishedAwaitingDelivery {
@@ -2141,7 +2056,9 @@ impl CmState {
                     .session
                     .begin_connection_close(shared, &connection_state);
                 if connection_state.accepted_count() == 0 {
-                    self.retire_registered_connection(shared, connection_state.token)?;
+                    shared
+                        .session
+                        .retire_registered_connection(shared, connection_state.token)?;
                 }
             }
             InboundState::Established { connection } => {
@@ -2165,7 +2082,9 @@ impl CmState {
                     .session
                     .begin_connection_close(shared, &connection_state);
                 if connection_state.accepted_count() == 0 {
-                    self.retire_registered_connection(shared, connection_state.token)?;
+                    shared
+                        .session
+                        .retire_registered_connection(shared, connection_state.token)?;
                 }
             }
             state @ InboundState::Closing { .. } => {
@@ -2384,7 +2303,9 @@ impl CmState {
             .begin_connection_close(shared, &connection_state);
         drop(connection);
         if connection_state.accepted_count() == 0 {
-            self.retire_registered_connection(shared, connection_state.token)?;
+            shared
+                .session
+                .retire_registered_connection(shared, connection_state.token)?;
         }
         if matches!(&error, Error::DriverShutdown) {
             request.complete(Err(error));
@@ -2477,7 +2398,9 @@ impl CmState {
             .session
             .begin_connection_close(shared, &connection_state);
         if connection_state.accepted_count() == 0 {
-            self.retire_registered_connection(shared, connection_state.token)?;
+            shared
+                .session
+                .retire_registered_connection(shared, connection_state.token)?;
         }
         Ok(EventDisposition::Handled)
     }
@@ -2569,7 +2492,9 @@ impl CmState {
                     .session
                     .begin_connection_close(shared, &connection_state);
                 if connection_state.accepted_count() == 0 {
-                    self.retire_registered_connection(shared, connection_state.token)?;
+                    shared
+                        .session
+                        .retire_registered_connection(shared, connection_state.token)?;
                 }
             }
             OutboundState::Established { connection }
@@ -2590,7 +2515,9 @@ impl CmState {
                     .session
                     .begin_connection_close(shared, &connection_state);
                 if connection_state.accepted_count() == 0 {
-                    self.retire_registered_connection(shared, connection_state.token)?;
+                    shared
+                        .session
+                        .retire_registered_connection(shared, connection_state.token)?;
                 }
             }
             OutboundState::FailedAwaitingDelivery {
@@ -2669,6 +2596,159 @@ impl CmState {
             routes.remove(&context_key);
         }
         owned
+    }
+}
+
+impl SessionManager {
+    pub(super) fn begin_cm_shutdown(
+        &self,
+        shared: &Arc<EngineShared>,
+        outcome: &MemoizedTerminalResult,
+    ) {
+        self.cm.begin_shutdown(shared, outcome);
+    }
+
+    pub(super) fn terminalize_cm(&self, outcome: &MemoizedTerminalResult) {
+        self.cm.terminalize(outcome);
+    }
+
+    pub(super) fn pending_cm_route_count(&self) -> usize {
+        self.cm.pending_route_count()
+    }
+
+    pub(super) fn retained_cm_owner_count(&self) -> usize {
+        self.cm.retained_owner_count()
+    }
+
+    pub(super) fn has_cm_work(&self) -> bool {
+        self.cm.has_software_work()
+    }
+
+    pub(super) fn service_cm_software(
+        &self,
+        shared: &Arc<EngineShared>,
+        resources: Option<&EngineResources>,
+        budget: usize,
+    ) -> Result<usize> {
+        self.cm.service_software(shared, resources, budget)
+    }
+
+    pub(super) fn try_process_cm_event(
+        &self,
+        shared: &Arc<EngineShared>,
+        resources: &EngineResources,
+    ) -> Result<bool> {
+        self.cm.try_process_event(shared, resources)
+    }
+
+    pub(super) fn service_deferred_cm_destructions(
+        &self,
+        shared: &Arc<EngineShared>,
+        budget: usize,
+        try_process_event: impl FnMut() -> Result<bool>,
+    ) -> Result<usize> {
+        self.cm
+            .service_cm_destructions(shared, budget, try_process_event)
+    }
+
+    pub(super) fn retire_registered_connection(
+        &self,
+        shared: &EngineShared,
+        token: ConnectionToken,
+    ) -> Result<()> {
+        let cm = &self.cm;
+        let Lookup::Occupied(connection) = self.connections.lookup(token) else {
+            return Ok(());
+        };
+        if connection.accepted_count() != 0 {
+            return Ok(());
+        }
+        if !connection.error_transition_complete() {
+            cm.enqueue_retirement(token);
+            return Ok(());
+        }
+        if !connection.try_begin_retirement() {
+            return Ok(());
+        }
+        let lifecycle = connection.lock_lifecycle();
+        let qp_boundary = connection.establish_qp_destruction_boundary(&lifecycle);
+        drop(lifecycle);
+        let _qp_destruction_proof = match qp_boundary {
+            Ok(proof) => proof,
+            Err(error) => {
+                tracing::warn!(
+                    slot = connection.token.slot,
+                    generation = connection.token.generation,
+                    qp_num = connection.qp_num(),
+                    %error,
+                    "connection QP destroy failed; retaining CM route and ownership bundle"
+                );
+                self.track_connection_quarantine(connection.token);
+                let (_, event) = connection.publish_destroy_quarantine(&error, || {});
+                if let Some(event) = event {
+                    event.deliver();
+                }
+                return Ok(());
+            }
+        };
+        let retirement = match connection.cm_route() {
+            Some(ConnectionCmRoute::Outbound(encoded)) => {
+                cm.retire_outbound_connection_route(encoded, &connection)?
+            }
+            Some(ConnectionCmRoute::Inbound(encoded)) => {
+                cm.retire_inbound_connection_route(shared, encoded, &connection)?
+            }
+            None => RouteRetirement::Complete {
+                completion: None,
+                reject: None,
+            },
+        };
+        let RouteRetirement::Complete { completion, reject } = retirement else {
+            connection.retry_retirement();
+            cm.enqueue_retirement(token);
+            return Ok(());
+        };
+        let lifecycle = connection.lock_lifecycle();
+        let resources = connection.destroy_connection_resources(&lifecycle);
+        drop(lifecycle);
+        let (cm_id, _qp_destruction_proof) = match resources {
+            Ok(resources) => resources,
+            Err(error) => {
+                tracing::warn!(
+                    slot = connection.token.slot,
+                    generation = connection.token.generation,
+                    qp_num = connection.qp_num(),
+                    %error,
+                    "connection resource finalization failed; retaining terminal quarantine"
+                );
+                self.track_connection_quarantine(connection.token);
+                let (_, event) = connection.publish_destroy_quarantine(&error, || {});
+                if let Some(event) = event {
+                    event.deliver();
+                }
+                cm.finish_inbound_retirement(completion);
+                return Ok(());
+            }
+        };
+        if let Some(cm_id) = cm_id {
+            if reject.is_some() {
+                cm_id.reject(&[]).map_err(|error| {
+                    contextual_cm_error(
+                        "reject selected inbound child after setup rollback",
+                        Error::from_v1(error),
+                    )
+                })?;
+            }
+            lock_unpoison(&cm.cm_destructions).push_back(PendingCmDestruction::Connection {
+                cm_id,
+                connection,
+                completion,
+            });
+            return Ok(());
+        }
+        cm.finalize_connection_retirement(shared, connection)?;
+        cm.finish_inbound_retirement(completion);
+        Ok(())
     }
 }
 

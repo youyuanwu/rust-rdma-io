@@ -291,6 +291,10 @@ impl SessionManager {
             .unwrap_or_else(|_| panic!("SessionManager is bound to exactly one EngineShared"));
     }
 
+    pub(super) fn live_connection_count(&self) -> usize {
+        self.connections.live()
+    }
+
     pub(super) fn engine(&self) -> Option<Arc<EngineShared>> {
         self.engine.get().and_then(Weak::upgrade)
     }

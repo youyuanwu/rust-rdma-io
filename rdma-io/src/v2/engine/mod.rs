@@ -596,7 +596,7 @@ impl EngineShared {
         };
 
         self.session.apply_io_effects(self, &mut io_effects);
-        self.session.cm.terminalize(&outcome);
+        self.session.terminalize_cm(&outcome);
         for connection in &connections_to_wake {
             if outcome.is_error() && connection.retain_bundle_for_engine_failure() {
                 self.session.track_connection_quarantine(connection.token);
@@ -689,8 +689,7 @@ impl EngineShared {
 
     fn retained_bundle_count(&self) -> usize {
         self.session
-            .connections
-            .live()
+            .live_connection_count()
             .max(self.session.cm.retained_owner_count())
     }
 
@@ -700,7 +699,7 @@ impl EngineShared {
 
     fn retain_after_failure(shared: &Arc<Self>) {
         if (shared.unsafe_outstanding_operations() == 0
-            && shared.session.connections.live() == 0
+            && shared.session.live_connection_count() == 0
             && shared.session.cm.retained_owner_count() == 0)
             || shared.failure_retained.swap(true, Ordering::AcqRel)
         {

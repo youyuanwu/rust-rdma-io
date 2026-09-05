@@ -1016,9 +1016,18 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     assert!(
         driver_source.contains(".session")
             && driver_source.contains(".io_core")
+            && driver_source.contains("service_cm_software(")
+            && driver_source.contains("try_process_cm_event(")
+            && driver_source.contains("service_deferred_cm_destructions(")
+            && !driver_source.contains("session.cm")
             && !driver_source.contains("tokio::spawn("),
         "{} must explicitly compose SessionManager and IoCore without spawning",
         driver_path.display()
+    );
+    assert!(
+        cm_source.contains("impl SessionManager")
+            && cm_source.contains("fn retire_registered_connection("),
+        "connection retirement policy must be implemented on SessionManager"
     );
 
     let io_source = fs::read_to_string(&io_path).expect("read engine I/O boundary source");

@@ -167,15 +167,15 @@ impl RdmaEngineDriver {
         {
             return Ok(false);
         }
-        self.shared.session.cm.begin_shutdown(
+        self.shared.session.begin_cm_shutdown(
             &self.shared,
             &MemoizedTerminalResult::from_error(Error::DriverShutdown),
         );
         self.shared.session.begin_all_connection_close(&self.shared);
-        if self.shared.session.cm.pending_route_count() != 0 {
+        if self.shared.session.pending_cm_route_count() != 0 {
             return Ok(false);
         }
-        if self.shared.session.connections.live() != 0 {
+        if self.shared.session.live_connection_count() != 0 {
             return Ok(false);
         }
 
@@ -189,11 +189,10 @@ impl RdmaEngineDriver {
                 if !self
                     .shared
                     .session
-                    .cm
-                    .try_process_event(&self.shared, resources)?
+                    .try_process_cm_event(&self.shared, resources)?
                 {
-                    if self.shared.session.cm.pending_route_count() != 0
-                        || self.shared.session.connections.live() != 0
+                    if self.shared.session.pending_cm_route_count() != 0
+                        || self.shared.session.live_connection_count() != 0
                         || self.shared.io_core.accepted_count() != 0
                     {
                         self.scheduler.mark_class_ready(WorkClass::Cm);
@@ -293,9 +292,9 @@ impl RdmaEngineDriver {
             return Ok(false);
         };
         let budget = self.shared.config.cm_event_budget;
-        let cm = &self.shared.session.cm;
-        let mut processed = cm.service_software(&self.shared, Some(resources), budget)?;
-        while processed < budget && cm.try_process_event(&self.shared, resources)? {
+        let session = &self.shared.session;
+        let mut processed = session.service_cm_software(&self.shared, Some(resources), budget)?;
+        while processed < budget && session.try_process_cm_event(&self.shared, resources)? {
             processed += 1;
         }
 
@@ -316,7 +315,7 @@ impl RdmaEngineDriver {
                             Poll::Pending => Poll::Pending,
                         },
                         |guard| guard.clear_ready(),
-                        || cm.try_process_event(&self.shared, resources),
+                        || session.try_process_cm_event(&self.shared, resources),
                     ) {
                         Poll::Ready(result) => result?,
                         Poll::Pending => 0,
@@ -326,12 +325,13 @@ impl RdmaEngineDriver {
             CompletionMode::Polling => 0,
         };
         processed += readiness_processed;
-        processed +=
-            cm.service_cm_destructions(&self.shared, budget.saturating_sub(processed), || {
-                cm.try_process_event(&self.shared, resources)
-            })?;
+        processed += session.service_deferred_cm_destructions(
+            &self.shared,
+            budget.saturating_sub(processed),
+            || session.try_process_cm_event(&self.shared, resources),
+        )?;
 
-        if processed >= budget || cm.has_software_work() {
+        if processed >= budget || session.has_cm_work() {
             self.scheduler.mark_class_ready(WorkClass::Cm);
         }
         Ok(processed > 0)
@@ -595,9 +595,8 @@ impl Drop for RdmaEngineDriver {
             let cm_owners = self
                 .shared
                 .session
-                .cm
-                .retained_owner_count()
-                .max(self.shared.session.connections.live());
+                .retained_cm_owner_count()
+                .max(self.shared.session.live_connection_count());
             let error = if outstanding == 0 && cm_owners == 0 {
                 Error::DriverShutdown
             } else {
@@ -1689,8 +1688,8 @@ pub(super) mod test_api {
 
         fn instrumentation(&self, shared: &EngineShared) -> TestEngineInstrumentation {
             TestEngineInstrumentation {
-                cm_pending_routes: shared.session.cm.pending_route_count(),
-                cm_retained_owners: shared.session.cm.retained_owner_count(),
+                cm_pending_routes: shared.session.pending_cm_route_count(),
+                cm_retained_owners: shared.session.retained_cm_owner_count(),
                 cqes_rejected: shared.io_core.rejected_cqe_count(),
                 cm_events_rejected: shared.session.rejected_cm_events.load(Ordering::Acquire),
             }
