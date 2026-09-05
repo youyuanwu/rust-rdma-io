@@ -41,15 +41,13 @@ mod listener;
 mod registry;
 mod resources;
 mod scheduler;
+mod session;
 
 #[cfg(test)]
 mod api_tests;
 
-use std::collections::{HashMap, VecDeque};
 #[cfg(test)]
 use std::ops::Deref;
-#[cfg(any(test, feature = "test-hooks"))]
-use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
@@ -58,7 +56,6 @@ use tokio::sync::Notify;
 
 use config::EngineConfig;
 pub use config::{CompletionMode, RdmaConnectionConfig};
-use connection::ConnectionAdmissionPool;
 pub use connection::{RdmaConnection, RdmaConnectionIdentity};
 pub use diagnostics::{RdmaEngineDiagnostics, RdmaEngineLifecycle, RdmaEngineTerminalError};
 use driver::WorkSignal;
@@ -74,10 +71,11 @@ pub use io_core::RdmaOperation;
 use io_core::{IoCore, IoDriverSignal};
 use lifecycle::MemoizedTerminalResult;
 pub use listener::{RdmaListener, RdmaListenerConfig};
-use registry::{ConnectionRegistry, lock_unpoison, read_unpoison, write_unpoison};
+use registry::{lock_unpoison, write_unpoison};
 use resources::{EngineResourceRefs, EngineResources};
+use scheduler::DeadlineKind;
 use scheduler::WorkScheduler;
-use scheduler::{DeadlineKind, DeadlineRequest};
+use session::SessionManager;
 
 use super::error::{Error, Result};
 
@@ -225,7 +223,7 @@ impl RdmaEngineBuilder {
             shared.test_resources = Some(resources.test_resource_refs());
             shared
         };
-        let shared = Arc::new(shared);
+        let shared = shared.into_shared();
         let engine = RdmaEngine {
             shared: Arc::clone(&shared),
         };
@@ -418,21 +416,14 @@ pub struct RdmaEngineDriver {
 struct EngineShared {
     config: EngineConfig,
     provider: Option<config::ProviderLimits>,
-    connection_admission: Arc<ConnectionAdmissionPool>,
-    connections: ConnectionRegistry,
     // This engine-owned core retain drops before the root resources below.
     // Operation futures may extend the Arc, but each MR anchors its PD and an
     // engine with accepted work is retained fail-closed.
     io_core: Arc<IoCore>,
-    cm: cm::CmState,
-    #[cfg(any(test, feature = "test-hooks"))]
-    rejected_cm_events: AtomicU64,
-    deadline_requests: Mutex<VecDeque<DeadlineRequest>>,
-    admission: Arc<RwLock<()>>,
+    session: Arc<SessionManager>,
     lifecycle: AtomicU8,
     shutdown_requested: AtomicBool,
     shutdown_deadline_scheduled: AtomicBool,
-    shutdown_connection_close_started: AtomicBool,
     failure_retained: AtomicBool,
     frontend_count: AtomicUsize,
     work_signal: Arc<WorkSignal>,
@@ -440,7 +431,6 @@ struct EngineShared {
     // shutdown waiter without retaining registrations from dropped futures.
     terminal_notify: Notify,
     terminal: Mutex<Option<MemoizedTerminalResult>>,
-    quarantines: Mutex<QuarantineState>,
     #[cfg(any(test, feature = "test-hooks"))]
     test_resources: Option<resources::TestResourceRefs>,
     #[cfg(any(test, feature = "test-hooks"))]
@@ -449,23 +439,6 @@ struct EngineShared {
     // registry/test owner so quarantined QP/CM/MR descendants are released
     // before the shared CQ, PD, CM event channel, and context can disappear.
     resource_refs: Option<EngineResourceRefs>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum QuarantineKey {
-    Connection(registry::ConnectionToken),
-    Operation(registry::OperationToken),
-}
-
-#[derive(Clone, Copy)]
-struct QuarantineEntry {
-    connection: registry::ConnectionToken,
-}
-
-#[derive(Default)]
-struct QuarantineState {
-    entries: HashMap<QuarantineKey, QuarantineEntry>,
-    connection_entries: HashMap<registry::ConnectionToken, usize>,
 }
 
 struct EngineIoDriverSignal {
@@ -500,22 +473,28 @@ impl IoDriverSignal for EngineIoDriverSignal {
 
 #[cfg(test)]
 impl Deref for EngineShared {
-    // Unit tests inspect exact core accounting without exposing test-only
-    // accessors in production builds.
-    type Target = IoCore;
+    // Session state is physically owned by SessionManager. Existing internal
+    // modules are migrated receiver-by-receiver without re-exposing those
+    // fields on the composition root.
+    type Target = SessionManager;
 
     fn deref(&self) -> &Self::Target {
-        &self.io_core
+        &self.session
     }
 }
 
 impl EngineShared {
+    fn into_shared(self) -> Arc<Self> {
+        let shared = Arc::new(self);
+        shared.session.bind_engine(&shared);
+        shared
+    }
+
     fn new(
         config: EngineConfig,
         provider: Option<config::ProviderLimits>,
         resource_refs: Option<EngineResourceRefs>,
     ) -> Result<Self> {
-        let connections = ConnectionRegistry::new(config.max_live_connections)?;
         let admission = Arc::new(RwLock::new(()));
         let work_signal = Arc::new(WorkSignal::new());
         #[cfg(any(test, feature = "test-hooks"))]
@@ -525,7 +504,7 @@ impl EngineShared {
             #[cfg(any(test, feature = "test-hooks"))]
             test_driver: Arc::clone(&test_driver),
         });
-        let io_core = IoCore::new(
+        let (io_core, qp_reclaim) = IoCore::new(
             config.max_inflight_operations,
             config.cq_capacity,
             config.missing_cqe_deadline,
@@ -533,29 +512,25 @@ impl EngineShared {
             Arc::clone(&admission),
             io_driver_signal,
         )?;
-        let connection_admission = ConnectionAdmissionPool::new(config.max_live_connections);
-        let cm = cm::CmState::new(config.max_live_connections)?;
+        let session = Arc::new(SessionManager::new(
+            config.max_live_connections,
+            Arc::clone(&admission),
+            Arc::clone(&io_core),
+            qp_reclaim,
+        )?);
         Ok(Self {
             config,
             provider,
-            connection_admission,
-            connections,
             io_core,
-            cm,
-            #[cfg(any(test, feature = "test-hooks"))]
-            rejected_cm_events: AtomicU64::new(0),
-            deadline_requests: Mutex::new(VecDeque::new()),
-            admission,
+            session,
             lifecycle: AtomicU8::new(lifecycle_to_u8(RdmaEngineLifecycle::Created)),
             shutdown_requested: AtomicBool::new(false),
             shutdown_deadline_scheduled: AtomicBool::new(false),
-            shutdown_connection_close_started: AtomicBool::new(false),
             failure_retained: AtomicBool::new(false),
             frontend_count: AtomicUsize::new(1),
             work_signal,
             terminal_notify: Notify::new(),
             terminal: Mutex::new(None),
-            quarantines: Mutex::new(QuarantineState::default()),
             #[cfg(any(test, feature = "test-hooks"))]
             test_resources: None,
             #[cfg(any(test, feature = "test-hooks"))]
@@ -583,7 +558,7 @@ impl EngineShared {
     }
 
     fn mark_shutdown_requested(&self) -> bool {
-        let _admission = write_unpoison(&self.admission);
+        let _admission = write_unpoison(&self.session.admission);
         if self.shutdown_requested.swap(true, Ordering::AcqRel) {
             return false;
         }
@@ -598,7 +573,7 @@ impl EngineShared {
             "ConnectionQuarantined is connection-local; no connection quarantine can terminate the engine driver"
         );
         let (mut io_effects, connections_to_wake) = {
-            let _admission = write_unpoison(&self.admission);
+            let _admission = write_unpoison(&self.session.admission);
             let mut terminal = lock_unpoison(&self.terminal);
             if terminal.is_some() {
                 return;
@@ -616,18 +591,21 @@ impl EngineShared {
 
             let io_effects = self.io_core.terminalize_operations(&outcome);
 
-            let connections_to_wake = self.connections.occupied();
+            let connections_to_wake = self.session.connections.occupied();
             drop(terminal);
             (io_effects, connections_to_wake)
         };
 
-        self.apply_io_effects(&mut io_effects);
-        self.cm.terminalize(&outcome);
+        self.session.apply_io_effects(self, &mut io_effects);
+        self.session.terminalize_cm(&outcome);
         for connection in &connections_to_wake {
             if outcome.is_error() && connection.retain_bundle_for_engine_failure() {
-                self.track_connection_quarantine(connection.token);
+                self.session.track_connection_quarantine(connection.token);
             }
-            if let Some(event) = connection.finalize_engine(&outcome) {
+            if let Some(event) = self
+                .session
+                .finalize_connection_engine(connection, &outcome)
+            {
                 event.deliver();
             }
         }
@@ -714,7 +692,9 @@ impl EngineShared {
     }
 
     fn retained_bundle_count(&self) -> usize {
-        self.connections.live().max(self.cm.retained_owner_count())
+        self.session
+            .live_connection_count()
+            .max(self.session.cm.retained_owner_count())
     }
 
     fn unsafe_outstanding_operations(&self) -> usize {
@@ -723,8 +703,8 @@ impl EngineShared {
 
     fn retain_after_failure(shared: &Arc<Self>) {
         if (shared.unsafe_outstanding_operations() == 0
-            && shared.connections.live() == 0
-            && shared.cm.retained_owner_count() == 0)
+            && shared.session.live_connection_count() == 0
+            && shared.session.cm.retained_owner_count() == 0)
             || shared.failure_retained.swap(true, Ordering::AcqRel)
         {
             return;
@@ -735,85 +715,8 @@ impl EngineShared {
             .push(Arc::clone(shared));
     }
 
-    fn track_connection_quarantine(&self, token: registry::ConnectionToken) -> bool {
-        self.track_quarantine(
-            QuarantineKey::Connection(token),
-            QuarantineEntry { connection: token },
-        )
-    }
-
-    fn track_operation_quarantine(
-        &self,
-        operation: registry::OperationToken,
-        connection: registry::ConnectionToken,
-    ) -> bool {
-        self.track_quarantine(
-            QuarantineKey::Operation(operation),
-            QuarantineEntry { connection },
-        )
-    }
-
-    fn track_quarantine(&self, key: QuarantineKey, entry: QuarantineEntry) -> bool {
-        let mut quarantines = lock_unpoison(&self.quarantines);
-        if quarantines.entries.contains_key(&key) {
-            return false;
-        }
-        quarantines.entries.insert(key, entry);
-        let connection_entries = quarantines
-            .connection_entries
-            .entry(entry.connection)
-            .or_insert(0);
-        let first_for_connection = *connection_entries == 0;
-        *connection_entries += 1;
-        if first_for_connection
-            && let registry::Lookup::Occupied(connection) =
-                self.connections.lookup(entry.connection)
-        {
-            connection.mark_reservation_quarantined();
-        }
-        first_for_connection
-    }
-
-    fn clear_connection_quarantine(&self, token: registry::ConnectionToken) -> bool {
-        self.clear_quarantine(QuarantineKey::Connection(token), token)
-    }
-
-    fn recover_connection_quarantine_entry(&self, token: registry::ConnectionToken) -> bool {
-        self.clear_quarantine(QuarantineKey::Connection(token), token)
-    }
-
-    fn clear_operation_quarantine(
-        &self,
-        operation: registry::OperationToken,
-        connection: registry::ConnectionToken,
-    ) -> bool {
-        self.clear_quarantine(QuarantineKey::Operation(operation), connection)
-    }
-
-    fn clear_quarantine(&self, key: QuarantineKey, connection: registry::ConnectionToken) -> bool {
-        let mut quarantines = lock_unpoison(&self.quarantines);
-        if quarantines.entries.remove(&key).is_none() {
-            return false;
-        }
-        let Some(connection_entries) = quarantines.connection_entries.get_mut(&connection) else {
-            debug_assert!(false, "quarantine entry must have a connection count");
-            return false;
-        };
-        *connection_entries -= 1;
-        if *connection_entries != 0 {
-            return false;
-        }
-        if let registry::Lookup::Occupied(connection) = self.connections.lookup(connection) {
-            connection.recover_reservation_quarantine();
-        } else {
-            self.connection_admission.clear_retained_quarantine();
-        }
-        quarantines.connection_entries.remove(&connection);
-        true
-    }
-
     fn diagnostics(&self) -> RdmaEngineDiagnostics {
-        let connection_counts = self.connection_admission.snapshot();
+        let connection_counts = self.session.connection_admission.snapshot();
         let io = self.io_core.diagnostics();
         RdmaEngineDiagnostics {
             lifecycle: self.lifecycle(),
@@ -831,6 +734,7 @@ impl EngineShared {
         }
     }
 
+    #[cfg(test)]
     fn register_memory(&self, len: usize, access: super::AccessIntent) -> Result<super::Mr> {
         if len == 0 || u32::try_from(len).is_err() {
             return Err(Error::InvalidConfig(
@@ -843,141 +747,53 @@ impl EngineShared {
         resources.pd.reg_mr(len, access)
     }
 
-    pub(crate) fn publish_completion(&self, connection: &Arc<connection::ConnectionState>) {
-        self.io_core.publish_connection(&connection.io);
-    }
-
-    fn take_published_completion(&self) -> Option<registry::ConnectionToken> {
-        self.io_core.take_published_connection()
-    }
-
+    #[cfg(test)]
     fn has_published_completions(&self) -> bool {
         self.io_core.has_published_connections()
     }
 
     fn schedule_deadline(&self, kind: DeadlineKind, token: u64, after: Duration) {
-        let now = tokio::time::Instant::now();
-        let at = now.checked_add(after).unwrap_or(now);
-        lock_unpoison(&self.deadline_requests).push_back(DeadlineRequest { at, kind, token });
-        self.work_signal.publish(driver::RECLAMATION_WORK);
+        self.session
+            .schedule_deadline(&self.work_signal, kind, token, after);
     }
 
-    fn take_deadline_requests(&self, budget: usize) -> Vec<DeadlineRequest> {
-        let mut requests = lock_unpoison(&self.deadline_requests);
-        let count = requests.len().min(budget);
-        requests.drain(..count).collect()
-    }
-
-    fn has_deadline_requests(&self) -> bool {
-        !lock_unpoison(&self.deadline_requests).is_empty()
-    }
-
+    #[cfg(test)]
     fn apply_io_effects(&self, effects: &mut io_core::IoCoreEffects) {
-        for effect in effects.take_quarantine() {
-            match effect {
-                io_core::OperationQuarantineEffect::Added {
-                    operation,
-                    connection,
-                } => {
-                    self.track_operation_quarantine(operation, connection);
-                }
-                io_core::OperationQuarantineEffect::Cleared {
-                    operation,
-                    connection,
-                } => {
-                    self.clear_operation_quarantine(operation, connection);
-                }
-            }
-        }
-        for token in effects.take_drained() {
-            let registry::Lookup::Occupied(connection) = self.connections.lookup(token) else {
-                continue;
-            };
-            if connection.close_started() && connection.accepted_count() == 0 {
-                self.recover_connection_quarantine(&connection);
-                self.record_connection_drained(&connection);
-                self.schedule_connection_retirement(&connection);
-            }
-        }
+        self.session.apply_io_effects(self, effects);
     }
 
+    #[cfg(test)]
     pub(super) fn enqueue_completion(
         &self,
         completion: crate::wc::WorkCompletion,
     ) -> Option<registry::ConnectionToken> {
-        let _admission = read_unpoison(&self.admission);
-        let pending = self.io_core.prepare_completion(completion)?;
-        let identity = pending.identity();
-        let connection = match self.connections.lookup(identity.connection) {
-            registry::Lookup::Occupied(connection) => connection,
-            _ => {
-                self.io_core.reject_cqe(io_core::CqeReject::StaleConnection);
-                return None;
-            }
-        };
-        let live = self
-            .connections
-            .prove_live_io(identity.connection, identity.qp_num);
-        self.io_core
-            .enqueue_prepared_completion(pending, live, &connection.io)
+        self.session.enqueue_completion(completion)
     }
 
+    #[cfg(test)]
     pub(super) fn dispatch_connection_completions(
         &self,
         token: registry::ConnectionToken,
         quantum: usize,
     ) -> (usize, bool) {
-        let connection = match self.connections.lookup(token) {
-            registry::Lookup::Occupied(connection) => connection,
-            _ => return (0, false),
-        };
-        let (processed, remains_ready, mut effects) = self
-            .io_core
-            .dispatch_connection_completions(&connection.io, quantum);
-        self.apply_io_effects(&mut effects);
-        effects.publish();
-        (processed, remains_ready)
+        self.session
+            .dispatch_connection_completions(self, token, quantum)
     }
 
+    #[cfg(test)]
     pub(super) fn reclaim_after_qp_destroy(
         &self,
-        proof: &connection::QpDestructionProof,
+        proof: &session::QpDestructionProof,
         connection: &connection::ConnectionState,
         token: registry::OperationToken,
     ) -> bool {
-        let (reclaimed, mut effects) = self.io_core.reclaim_after_qp_destroy(
-            proof,
-            &connection.io,
-            connection.operation_close_error(),
-            token,
-        );
-        self.apply_io_effects(&mut effects);
-        effects.publish();
-        reclaimed
+        self.session
+            .reclaim_after_qp_destroy_for_test(self, proof, connection, token)
     }
 
-    pub(super) fn reject_queued_completions_after_qp_destroy(
-        &self,
-        connection: &connection::ConnectionState,
-    ) -> bool {
-        let (remains_ready, mut effects) = self
-            .io_core
-            .reject_queued_completions_after_qp_destroy(&connection.io);
-        self.apply_io_effects(&mut effects);
-        effects.publish();
-        remains_ready
-    }
-
+    #[cfg(test)]
     pub(super) fn handle_reclamation_deadline(&self, token: registry::OperationToken) {
-        let mut effects = self.io_core.handle_reclamation_deadline(token);
-        self.apply_io_effects(&mut effects);
-        effects.publish();
-    }
-
-    pub(super) fn quarantine_operation(&self, token: registry::OperationToken) {
-        let mut effects = self.io_core.quarantine_operation(token);
-        self.apply_io_effects(&mut effects);
-        effects.publish();
+        self.session.handle_reclamation_deadline(self, token);
     }
 }
 
@@ -1021,7 +837,7 @@ const fn lifecycle_from_u8(value: u8) -> RdmaEngineLifecycle {
 pub(crate) fn test_engine_pair(mode: CompletionMode) -> (RdmaEngine, RdmaEngineDriver) {
     let mut config = EngineConfig::new("test0".into());
     config.completion_mode = mode;
-    let shared = Arc::new(EngineShared::new(config, None, None).unwrap());
+    let shared = EngineShared::new(config, None, None).unwrap().into_shared();
     (
         RdmaEngine {
             shared: Arc::clone(&shared),

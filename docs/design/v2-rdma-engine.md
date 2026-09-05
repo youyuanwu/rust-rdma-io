@@ -6,17 +6,18 @@ V2 separates shared RDMA runtime mechanics from per-connection message
 protocol policy.
 
 An `RdmaEngine` owns one device-scoped resource set and one explicit
-`RdmaEngineDriver`. Low-level connections use that shared engine directly.
+`RdmaEngineDriver`. Its internal composition root combines a low-level
+`IoCore` with a `SessionManager`; low-level connection and listener frontends
+hold narrow, resource-free capabilities rather than the shared engine state.
 Each engine-bound message connection additionally returns one non-cloneable
 `MessageTransport` frontend and one explicit `MessageTransportDriver`.
 
 ```text
 application
   ├─ one RdmaEngineDriver task
-  │    ├─ shared Context / PD / CQ / completion channel
-  │    ├─ CM channel and generational route registries
-  │    ├─ exact CQE validation and owned event dispatch
-  │    └─ safe QP / CmId teardown and quarantine
+  │    ├─ engine root: Context / PD / CQ / CM channel
+  │    ├─ IoCore: posting / CQE validation / operation ownership
+  │    └─ SessionManager: CM routes / connections / teardown / quarantine
   │
   └─ one MessageTransportDriver task per message connection
        ├─ HELLO negotiation and timeout
@@ -82,7 +83,7 @@ active Tokio runtime; Tokio time must be enabled before a deadline is armed.
 
 ## Layer Responsibilities
 
-### Shared engine layer
+### Engine composition root
 
 One engine owns:
 
@@ -91,11 +92,30 @@ One engine owns:
 - one shared send/receive `Cq`;
 - one CM event channel;
 - one CQ completion channel in readiness mode, or none in polling mode;
-- connection, operation, and CM-route registries;
-- aggregate connection, operation, and CQ-credit admission;
-- exact CQE validation and owned completion-event dispatch;
-- connection drain, QP destruction, CmId destruction, and fail-closed
-  quarantine.
+- one `IoCore`; and
+- one `SessionManager`.
+
+The root owns engine-wide lifecycle, terminal state, work signaling, and the
+canonical lifetime of device-scoped resources. It does not directly own
+connection registries, CM state, session deadlines, or connection quarantine.
+
+### I/O core
+
+`IoCore` owns operation generations and registrations, CQ admission, provider
+posting reconciliation, exact CQE validation, copied and early completions,
+cancellation and missing-CQE state, operation-level quarantine, and detached
+completion effects. It has no production dependency on the engine composition
+root, connection state, CM/listener state, session resource owners, or message
+protocol policy.
+
+### Session manager
+
+`SessionManager` owns connection admission and the generational connection
+registry, `CmState` and all routes, connect/listen/accept manager records,
+listener and established-connection state, QP/CmId-owning bundles, lifecycle
+deadlines, close/drain/disconnect/retirement policy, and connection-level
+quarantine. It interprets the I/O effects that change session lifecycle before
+detached events or wakers are published.
 
 The engine has a per-connection completion-dispatch queue so one connection
 cannot monopolize event delivery. That queue contains validated low-level
@@ -132,109 +152,88 @@ Message setup allocates and posts every configured receive before
 
 HELLO reuses a control receive; there is no additional receive.
 
-## ADR: Crate-Private I/O and `IoCore` Boundaries
+## ADR: Crate-Private I/O and Session Ownership Boundaries
 
-**Status:** accepted. The protocol/I/O seam and the low-level `IoCore`
-extraction are implemented; the later CM/session extraction remains open under
-issue #43.
+**Status:** accepted. The protocol/I/O seam, low-level `IoCore`, and
+`SessionManager` ownership boundary are implemented. Physical relocation of
+`cm.rs`, `listener.rs`, `connection.rs`, and `drain.rs`, broader protocol
+cleanup, and final issue #43 cleanup remain deferred.
 
-The destination architecture has three ownership layers:
+The architecture has three ownership layers:
 
 1. **I/O core:** submission admission, provider posting, operation identity,
    exact CQE validation, accepted-set accounting, completion ownership, and
-   post-QP-destruction reclamation.
-2. **CM/session:** connect, accept, disconnect, route ownership, drain,
-   retirement, QP-before-CmId ordering, and connection quarantine.
+   operation-level quarantine.
+2. **Session manager:** connect/listen/accept state, CM routes, connection and
+   QP/CmId ownership, drain/disconnect/retirement, lifecycle authority, and
+   connection-level quarantine.
 3. **Protocol:** HELLO, DATA, CREDIT, pools, receive reposting, message
    fairness, and frontend outcomes.
 
-The first milestone established the dependency boundary between protocol
-policy and low-level I/O. The next milestone physically moved the operation
-runtime into `engine/io_core`: operation generations and registry entries,
-global CQ and connection-local SEND/RECV admission, accepted-operation
-ledgers, posting reconciliation, copied and early completions, exact
-completion dispatch, cancellation, reclamation deadlines, and
-operation-quarantine resources now have one owner.
-
-`EngineShared` composes that core. It retains engine-wide admission policy, the
-live connection/QP registry used to prove CQE routing, CM state, combined
-connection-admission quarantine accounting, connection retirement, root
-resources, and shutdown. CM routes, listeners, establishment state machines,
-QP creation, and the owning QP/CmId bundle have not moved into a standalone
-session hierarchy.
+`EngineShared` is the composition root. It directly retains the device-scoped
+resources, engine lifecycle, work signal, `Arc<IoCore>`, and
+`Arc<SessionManager>`. Session collections and quarantine maps are fields of
+`SessionManager`, not parallel fields on the root. The one
+`RdmaEngineDriver` preserves the existing rotating work classes and budgets:
+it polls the shared CQ through `IoCore` and invokes bounded CM, deadline,
+completion-dispatch, retirement, and shutdown services through
+`SessionManager`. Neither component creates a task or thread.
 
 An established I/O capability carries immutable connection/QP identity, local
-posting limits, operation ledgers, and a posting-only authority. The authority
-uses a weak reference to the session-owned QP resource, so the core cannot keep
-the QP/CmId bundle alive or invoke QP ERR, destruction, disconnect, route
-retirement, or CmId extraction. `ConnectionState` remains the sole strong
-owner and mints QP-destruction proof only after synchronous destruction
-succeeds.
+posting limits, operation ledgers, and a posting-only authority. That authority
+uses a weak reference to the SessionManager-owned QP resource. Production
+`RdmaConnection`, `RdmaListener`, and protocol `IoConnection` values retain
+direct I/O/immutable state plus weak opaque session capabilities and
+resource-free observers; they do not strongly retain or keep alive the shared
+engine, `ConnectionState`, `ListenerState`, QP, or CmId. Suspended
+connect/listen/accept futures likewise drop strong manager records before
+awaiting.
 
-For a copied CQE, the core first resolves the exact operation generation. The
-engine then proves that the session registry still contains the operation's
-connection generation and exact `qp_num`; the core consumes that unforgeable
-live-identity proof before checking opcode and duplicate state. CQ polling,
-proof creation/consumption, and connection retirement remain serial services
-of the one explicit engine driver.
+Only `SessionManager` owns `SessionLifecycleAuthority`. QP ERR transition,
+result-aware destruction, and final resource extraction require a reference to
+that private authority. A successful synchronous QP destruction while the
+CmId remains owned can mint one exact connection/`qp_num` proof. The proof is
+private, non-copyable, non-cloneable, consumed by value for one reclaim
+transaction, and cannot be replayed. Zero-debt retirement records destroyed
+state without manufacturing a reclaim proof.
 
-The protocol receives one opaque connection capability before provider
-establishment. It uses that capability to register message memory, prepost
-receives, submit later SEND/RECV requests, request close, and await connection
-close. It cannot access engine shared state, connection state, registries,
-generational tokens, scheduler work bits, CM routes, or reconstruction
-helpers.
+`IoCore` does not import the proof or any session owner. During the consuming
+transaction, `SessionManager` passes the already-proven exact connection and
+QP identities to the narrow reclaim operation. `IoCore` still verifies the
+established I/O identity, exact operation generation and owner, accepted-set
+membership, registration, local/CQ credit, and MR before releasing anything.
+An anomalous token remains retained rather than making the proof reusable.
 
-Each submitted request transfers its MR and an opaque, protocol-owned context
-to the I/O core. The post-reconciliation disposition reports one of these
-ownership results:
-
-- every request accepted;
-- an exact accepted prefix plus a provider-proven unaccepted suffix;
-- every request provider-proven unaccepted;
-- the complete batch retained because provider acceptance is ambiguous; or
-- the complete batch retained because an exact-prefix result raced with an
-  already-observed CQE in the nominally unaccepted suffix.
-
-The final case is intentionally fail-closed: an early suffix CQE proves that
-the raw prefix classification no longer describes the ownership visible to
-the operation ledger, so no suffix MR is returned as unaccepted.
+For a copied CQE, `IoCore` first resolves the exact operation generation.
+`SessionManager` then proves that its registry still contains the operation's
+connection generation and exact `qp_num`; the core checks opcode and duplicate
+state before consuming ownership. Provider posting retains its existing
+outcomes: accepted, exact accepted prefix plus proven-unaccepted suffix,
+proven-unaccepted, or complete-batch retention for ambiguity or an observed
+early suffix CQE.
 
 One connection-scoped event port carries owned completion and terminal events.
-Operation state stores only the opaque context and event destination—never a
-protocol closure. Core mutations return owned effects for event delivery,
-operation wakes, accepted-zero transitions, and operation-quarantine
-transitions. `EngineShared` applies the session-owned effects only after core
-and admission guards are released, then publishes events and wakes. The port
-releases its queue mutex before wakeup. The message driver pops both local
-protocol work and I/O events before processing them, alternates the two
-sources, and uses check-register-recheck suspension for both wakers.
-
-Unresolved accepted operations may be reclaimed only with an engine-private
-QP-destruction proof. The proof has no public or protocol-visible constructor;
-the connection owner creates it only after result-aware synchronous QP
-destruction succeeds while the owning CmId is still alive. Drain consumes the
-proof for operation reclamation. Zero-debt CM retirement and bounded driver
-drop establish and discard the same proof without moving CM ownership.
+Core mutations return owned effects for event delivery, operation wakes,
+accepted-zero transitions, and operation-quarantine transitions.
+`SessionManager` applies the session-facing quarantine and drained effects
+before detached publication. The port releases its queue mutex before wakeup,
+and the message driver preserves check-register-recheck suspension.
 
 Operation quarantine retains one operation's MR, registration, accepted-set
-membership, and CQ debt inside `IoCore`. The engine keeps a combined
-per-connection index of operation and connection quarantine keys because that
-index controls the session-owned connection admission reservation. The first
-key retains admission and only the last clear recovers it. Connection
-quarantine retains the complete QP, CmId, route, generation, admission, and
-unresolved operation bundle when no positive release boundary can be proven.
-Protocol failure can request close, but it cannot release or quarantine
-provider-visible ownership itself.
+membership, and CQ debt inside `IoCore`. `SessionManager` owns the combined
+per-connection index that retains connection admission on the first operation
+or connection quarantine key and recovers it only after the last clear.
+Connection quarantine retains the QP/CmId-owning state, route, generation,
+admission, and unresolved operations when no positive release boundary can be
+proven. Protocol code can request close but cannot transition, release, prove,
+or quarantine provider-visible ownership.
 
-The crate-private boundaries are deliberately concrete and unstable. They are
-not re-exported from `rdma_io::v2`. Structural tests reject protocol references
-to engine shared/connection state, registries, callback-era types,
-reconstruction helpers, and detached-post methods. An AST-level dependency
-guard also rejects production `IoCore` references to `EngineShared`,
-`ConnectionState`, the session resource owner, CM/listener state, or message
-policy while allowing only the narrow identity, proof, event, and posting
-interfaces.
+These boundaries are crate-private and deliberately unstable; public v2 and v1
+APIs are unchanged. AST guards reject hidden work, production `IoCore`
+dependencies on root/session/connection/CM/listener/protocol types, strong
+session-resource retention by frontends and waiters, lifecycle operations
+without the private authority, public re-exports of internal capabilities, and
+physical relocation of the four deferred modules.
 
 ## Completion-to-Message Handoff
 
@@ -329,11 +328,12 @@ All shutdown orderings converge on engine-owned hardware teardown:
   unavailability to each message driver, and safely drains or quarantines
   every connection.
 
-The engine stops posting, transitions the local QP to ERR, and drains exact
-CQEs. If accepted WRs remain at the drain deadline, it attempts synchronous
-destruction of that exact QP before releasing any associated operation or MR.
-Successful destruction creates the internal proof required by every unresolved
-operation reclamation.
+The SessionManager stops posting, uses its private lifecycle authority to
+transition the local QP to ERR, and lets `IoCore` drain exact CQEs. If accepted
+WRs remain at the drain deadline, it attempts synchronous destruction of that
+exact QP before releasing any associated operation or MR. Successful
+destruction creates one internal proof consumed by the exact unresolved
+operation-reclamation transaction.
 
 For a clean zero-debt retirement, successful QP destruction is also
 established before the connection's CM route is retired. The owning CmId is
@@ -426,11 +426,12 @@ integration suites on both RXE and SIW.
 The provider-only matrix is:
 
 ```sh
-sudo -E env CARGO="$(command -v cargo)" \
+sudo -E env CARGO_BUILD_JOBS=2 CARGO="$(command -v cargo)" \
   ./scripts/validate-v2-engine-providers.sh
 ```
 
-The script positively identifies each provider, sets
+The script positively identifies each provider, propagates
+`CARGO_BUILD_JOBS` through nested user switching, sets
 `RDMA_REQUIRE_PROVIDER=1`, runs routing, readiness-race, lifecycle, listener,
 message setup/behavior/retry, diagnostics, multi-connection, full-workspace,
 and v1 safe-resource suites, then restores RXE. A self-skipped provider suite

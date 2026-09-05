@@ -3,12 +3,11 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 
 use futures_util::task::AtomicWaker;
 
-use super::super::connection::QpDestructionProof;
 use super::super::io::{
     IoEventDestination, IoEventSender, IoOperationContext, IoOperationIdentity, IoRecvRequest,
     IoSendRequest, IoSubmissionDisposition, PendingIoEvent,
@@ -1557,6 +1556,42 @@ pub(in crate::v2::engine) struct PendingCompletion {
     operation: Arc<OperationState>,
 }
 
+/// Non-forgeable port for proof-gated reclamation.
+///
+/// `IoCore::new` creates exactly one value and transfers it to the session
+/// owner. The core has no dependency on the session proof or resource types.
+pub(in crate::v2::engine) struct QpReclaimCapability {
+    core: Weak<IoCore>,
+}
+
+impl QpReclaimCapability {
+    pub(super) fn new(core: &Arc<IoCore>) -> Self {
+        Self {
+            core: Arc::downgrade(core),
+        }
+    }
+
+    pub(in crate::v2::engine) fn reclaim(
+        &self,
+        destroyed_connection: ConnectionToken,
+        destroyed_qp_num: u32,
+        connection: &EstablishedIoConnection,
+        close_error: Error,
+        token: OperationToken,
+    ) -> (bool, IoCoreEffects) {
+        let Some(core) = self.core.upgrade() else {
+            return (false, IoCoreEffects::default());
+        };
+        core.reclaim_after_qp_destroy(
+            destroyed_connection,
+            destroyed_qp_num,
+            connection,
+            close_error,
+            token,
+        )
+    }
+}
+
 impl PendingCompletion {
     pub(in crate::v2::engine) fn identity(&self) -> super::EstablishedIoIdentity {
         self.operation.connection.identity()
@@ -1827,15 +1862,16 @@ impl IoCore {
         effects
     }
 
-    pub(in crate::v2::engine) fn reclaim_after_qp_destroy(
+    fn reclaim_after_qp_destroy(
         &self,
-        proof: &QpDestructionProof,
+        destroyed_connection: ConnectionToken,
+        destroyed_qp_num: u32,
         connection: &EstablishedIoConnection,
         close_error: Error,
         token: OperationToken,
     ) -> (bool, IoCoreEffects) {
         let identity = connection.identity();
-        if !proof.proves_identity(identity.connection, identity.qp_num) {
+        if destroyed_connection != identity.connection || destroyed_qp_num != identity.qp_num {
             tracing::warn!(
                 connection = identity.connection.encode(),
                 operation = token.encode(),
@@ -2280,7 +2316,9 @@ mod tests {
             .state
             .mark_cm_failure(Error::ProtocolViolation("contextual close failure".into()));
         drop(terminal);
-        let proof = connection.state.mint_qp_destruction_proof_for_test();
+        let proof = shared
+            .session
+            .mint_qp_destruction_proof_for_test(&connection.state);
 
         assert!(shared.reclaim_after_qp_destroy(&proof, &connection.state, token));
         let Some(super::super::io::IoEvent::Completion(completion)) = receiver.pop() else {
@@ -2300,7 +2338,9 @@ mod tests {
         let owner = synthetic_connection_on(&shared, 22);
         let other = synthetic_connection_on(&shared, 23);
         let token = install_accepted(&shared, &owner.state, WcOpcode::Send);
-        let wrong_proof = other.state.mint_qp_destruction_proof_for_test();
+        let wrong_proof = shared
+            .session
+            .mint_qp_destruction_proof_for_test(&other.state);
 
         assert!(!shared.reclaim_after_qp_destroy(&wrong_proof, &owner.state, token));
         assert_eq!(owner.state.accepted_count(), 1);
@@ -2309,7 +2349,9 @@ mod tests {
             Lookup::Occupied(_)
         ));
 
-        let proof = owner.state.mint_qp_destruction_proof_for_test();
+        let proof = shared
+            .session
+            .mint_qp_destruction_proof_for_test(&owner.state);
         assert!(shared.reclaim_after_qp_destroy(&proof, &owner.state, token));
         assert_eq!(owner.state.accepted_count(), 0);
         assert_eq!(shared.operations.live(), 0);
@@ -3819,7 +3861,7 @@ mod tests {
         config.max_live_connections = capacity;
         config.max_inflight_operations = capacity;
         config.cq_capacity = capacity;
-        Arc::new(EngineShared::new(config, None, None).unwrap())
+        EngineShared::new(config, None, None).unwrap().into_shared()
     }
 
     fn synthetic_connection_on(

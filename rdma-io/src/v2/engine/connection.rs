@@ -6,10 +6,8 @@ use std::sync::RwLockReadGuard;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
-use tokio::sync::Notify;
-
 use self::qp::QpCapabilitiesExt;
-use super::io::{IoEventSender, IoTerminalEvent, PendingIoEvent};
+use super::io::{IoEventSender, IoTerminalEvent, MemoryRegistrar, PendingIoEvent};
 #[cfg(test)]
 use super::io_core::Direction;
 use super::io_core::RdmaOperation;
@@ -19,6 +17,7 @@ use super::io_core::{
 };
 use super::lifecycle::MemoizedTerminalResult;
 use super::registry::{ConnectionToken, OperationToken, lock_unpoison, read_unpoison};
+use super::session::{SessionCloseState, SessionConnection, SessionLifecycleAuthority};
 use super::{EngineShared, RdmaConnectionConfig};
 use crate::cm::{CmId, ConnParam, EventChannel};
 use crate::v2::error::{Error, Result};
@@ -68,35 +67,46 @@ impl RdmaConnectionIdentity {
     }
 }
 
-#[derive(Clone)]
-pub(super) struct QpDestructionProof {
-    connection: ConnectionToken,
-    qp_num: u32,
-    _private: (),
-}
-
-impl QpDestructionProof {
-    pub(super) fn proves_identity(&self, connection: ConnectionToken, qp_num: u32) -> bool {
-        self.connection == connection && self.qp_num == qp_num
-    }
-}
-
 /// Engine-owned low-level RDMA connection.
 ///
 /// The connection exposes owned operation futures but no raw PD, QP, CQ, CM,
 /// or independently pollable completion-driver handle. Establishment posts
 /// zero initial receives.
 pub struct RdmaConnection {
+    #[cfg(test)]
     pub(super) shared: Arc<EngineShared>,
+    #[cfg(test)]
     pub(super) state: Arc<ConnectionState>,
+    #[cfg(not(test))]
+    state: Weak<ConnectionState>,
+    pub(super) io_core: Arc<super::io_core::IoCore>,
+    pub(super) io: Arc<EstablishedIoConnection>,
+    pub(super) memory: MemoryRegistrar,
+    pub(super) session: SessionConnection,
+    local_addr: Option<SocketAddr>,
+    peer_addr: Option<SocketAddr>,
+    identity: RdmaConnectionIdentity,
 }
 
 impl Clone for RdmaConnection {
     fn clone(&self) -> Self {
-        self.state.frontend_count.fetch_add(1, Ordering::Relaxed);
+        if let Some(state) = self.session_state() {
+            state.frontend_count.fetch_add(1, Ordering::Relaxed);
+        }
         Self {
+            #[cfg(test)]
             shared: Arc::clone(&self.shared),
+            #[cfg(test)]
             state: Arc::clone(&self.state),
+            #[cfg(not(test))]
+            state: self.state.clone(),
+            io_core: Arc::clone(&self.io_core),
+            io: Arc::clone(&self.io),
+            memory: self.memory.clone(),
+            session: self.session.clone(),
+            local_addr: self.local_addr,
+            peer_addr: self.peer_addr,
+            identity: self.identity,
         }
     }
 }
@@ -107,7 +117,7 @@ impl RdmaConnection {
     /// The returned MR remains owned by the caller until it is submitted in an
     /// [`RdmaOperation`]. Length must be nonzero and fit the provider ABI.
     pub fn register_memory(&self, len: usize, access: AccessIntent) -> Result<Mr> {
-        self.shared.register_memory(len, access)
+        self.memory.register(len, access)
     }
 
     /// Create a two-sided SEND operation submitted on first poll.
@@ -116,8 +126,8 @@ impl RdmaConnection {
     /// future returns `(Result<Completion>, Option<Mr>)`.
     pub fn send(&self, mr: Mr, range: Option<(usize, usize)>) -> RdmaOperation {
         RdmaOperation::new(
-            Arc::clone(&self.shared.io_core),
-            Arc::clone(&self.state.io),
+            Arc::clone(&self.io_core),
+            Arc::clone(&self.io),
             OperationKind::Send,
             mr,
             None,
@@ -128,8 +138,8 @@ impl RdmaConnection {
     /// Create a two-sided RECV operation submitted on first poll.
     pub fn recv(&self, mr: Mr, range: Option<(usize, usize)>) -> RdmaOperation {
         RdmaOperation::new(
-            Arc::clone(&self.shared.io_core),
-            Arc::clone(&self.state.io),
+            Arc::clone(&self.io_core),
+            Arc::clone(&self.io),
             OperationKind::Recv,
             mr,
             None,
@@ -140,8 +150,8 @@ impl RdmaConnection {
     /// Create an RDMA WRITE operation submitted on first poll.
     pub fn write(&self, mr: Mr, remote: RemoteMr, range: Option<(usize, usize)>) -> RdmaOperation {
         RdmaOperation::new(
-            Arc::clone(&self.shared.io_core),
-            Arc::clone(&self.state.io),
+            Arc::clone(&self.io_core),
+            Arc::clone(&self.io),
             OperationKind::Write,
             mr,
             Some(remote),
@@ -152,8 +162,8 @@ impl RdmaConnection {
     /// Create an RDMA READ operation submitted on first poll.
     pub fn read(&self, mr: Mr, remote: RemoteMr, range: Option<(usize, usize)>) -> RdmaOperation {
         RdmaOperation::new(
-            Arc::clone(&self.shared.io_core),
-            Arc::clone(&self.state.io),
+            Arc::clone(&self.io_core),
+            Arc::clone(&self.io),
             OperationKind::Read,
             mr,
             Some(remote),
@@ -163,21 +173,19 @@ impl RdmaConnection {
 
     /// Return the local socket address reported by RDMA-CM.
     pub fn local_addr(&self) -> Result<SocketAddr> {
-        self.state
-            .local_addr
+        self.local_addr
             .ok_or_else(|| Error::InvalidConfig("connection local address is unavailable".into()))
     }
 
     /// Return the peer socket address reported by RDMA-CM.
     pub fn peer_addr(&self) -> Result<SocketAddr> {
-        self.state
-            .peer_addr
+        self.peer_addr
             .ok_or_else(|| Error::InvalidConfig("connection peer address is unavailable".into()))
     }
 
     /// Return the opaque current connection identity and exact `qp_num`.
     pub fn identity(&self) -> RdmaConnectionIdentity {
-        self.state.identity()
+        self.identity
     }
 
     /// Stop new posting and wait for the exact accepted set to drain safely.
@@ -192,24 +200,12 @@ impl RdmaConnection {
     /// destruction boundary or another retirement wedge. Peer disconnect uses
     /// the same local QP-to-ERR and safe-destruction path.
     pub async fn close(&self) -> Result<()> {
-        self.shared.begin_connection_close(&self.state);
-        loop {
-            let notified = self.state.close_notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if let Some(outcome) = self.state.close_outcome() {
-                return outcome.into_result();
-            }
-            if let Some(outcome) = self.shared.outcome() {
-                return outcome.into_result();
-            }
-            notified.await;
-        }
+        self.session.close().await
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn transition_to_error_for_test(&self) -> Result<()> {
-        self.state.poster.to_error()
+        self.session.transition_to_error_for_test()
     }
 
     #[cfg(test)]
@@ -225,10 +221,67 @@ impl RdmaConnection {
 
 impl Drop for RdmaConnection {
     fn drop(&mut self) {
-        let previous = self.state.frontend_count.fetch_sub(1, Ordering::AcqRel);
+        let Some(state) = self.session_state() else {
+            return;
+        };
+        let previous = state.frontend_count.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0, "connection frontend count must be positive");
-        if previous == 1 && !self.state.is_retired() {
-            self.shared.begin_connection_close(&self.state);
+        if previous == 1 && !state.is_retired() {
+            self.session.request_close();
+        }
+    }
+}
+
+impl RdmaConnection {
+    pub(super) fn session_state(&self) -> Option<Arc<ConnectionState>> {
+        #[cfg(test)]
+        {
+            Some(Arc::clone(&self.state))
+        }
+        #[cfg(not(test))]
+        {
+            self.state.upgrade()
+        }
+    }
+
+    pub(super) fn require_session_state(&self) -> Result<Arc<ConnectionState>> {
+        self.session_state().ok_or_else(|| {
+            Error::InvalidConfig(
+                "session-owned connection record disappeared before route retirement".into(),
+            )
+        })
+    }
+
+    pub(super) fn session_token(&self) -> ConnectionToken {
+        ConnectionToken {
+            slot: self.identity.slot,
+            generation: self.identity.generation,
+        }
+    }
+
+    fn from_registered(
+        shared: &Arc<EngineShared>,
+        state: Arc<ConnectionState>,
+        session: SessionConnection,
+    ) -> Self {
+        let identity = state.identity();
+        let local_addr = state.local_addr;
+        let peer_addr = state.peer_addr;
+        let io = Arc::clone(&state.io);
+        Self {
+            #[cfg(test)]
+            shared: Arc::clone(shared),
+            #[cfg(test)]
+            state: Arc::clone(&state),
+            #[cfg(not(test))]
+            state: Arc::downgrade(&state),
+            io_core: Arc::clone(&shared.io_core),
+            io,
+            memory: MemoryRegistrar::from_engine(shared),
+            session,
+            local_addr,
+            peer_addr,
+            identity,
         }
     }
 }
@@ -244,22 +297,25 @@ pub(super) struct ConnectionState {
     // EngineShared::admission -> lifecycle_gate -> posting_gate.
     lifecycle_gate: Mutex<()>,
     close_started: AtomicBool,
-    close_outcome: Mutex<Option<MemoizedTerminalResult>>,
-    pub(super) close_notify: Arc<Notify>,
+    close: Arc<SessionCloseState>,
     quarantined: AtomicBool,
     error_transition_started: AtomicBool,
     error_transition_complete: AtomicBool,
-    qp_destruction_proof: OnceLock<QpDestructionProof>,
+    qp_destroyed: AtomicBool,
     frontend_count: AtomicUsize,
     retirement_requested: AtomicBool,
     retirement_started: AtomicBool,
     retirement_quarantined: AtomicBool,
     drained_recorded: AtomicBool,
-    retired: AtomicBool,
     admission: Mutex<Option<ConnectionReservation>>,
     cm_route: Option<ConnectionCmRoute>,
     #[cfg(any(test, feature = "test-hooks"))]
     retained_setup_rollback_mr: Mutex<Option<Mr>>,
+}
+
+pub(super) enum QpDestroyStatus {
+    DestroyedNow,
+    AlreadyDestroyed,
 }
 
 impl ConnectionState {
@@ -276,7 +332,8 @@ impl ConnectionState {
             reservation.mark_registered();
         }
         let qp_num = poster.qp_num();
-        let close_notify = Arc::new(Notify::new());
+        let close = SessionCloseState::new();
+        let close_notify = close.notify();
         let io_poster: Arc<dyn IoPostAuthority> =
             Arc::new(SessionIoPostAuthority::new(&poster, qp_num));
         let io = EstablishedIoConnection::new(
@@ -298,18 +355,16 @@ impl ConnectionState {
             peer_addr,
             lifecycle_gate: Mutex::new(()),
             close_started: AtomicBool::new(false),
-            close_outcome: Mutex::new(None),
-            close_notify,
+            close,
             quarantined: AtomicBool::new(false),
             error_transition_started: AtomicBool::new(false),
             error_transition_complete: AtomicBool::new(false),
-            qp_destruction_proof: OnceLock::new(),
+            qp_destroyed: AtomicBool::new(false),
             frontend_count: AtomicUsize::new(1),
             retirement_requested: AtomicBool::new(false),
             retirement_started: AtomicBool::new(false),
             retirement_quarantined: AtomicBool::new(false),
             drained_recorded: AtomicBool::new(false),
-            retired: AtomicBool::new(false),
             admission: Mutex::new(admission),
             cm_route,
             #[cfg(any(test, feature = "test-hooks"))]
@@ -376,6 +431,7 @@ impl ConnectionState {
         if !self.io.install_io_event_sender(sender)? {
             return Ok(None);
         }
+
         let error = self.operation_close_error();
         Ok(
             self.pending_io_event(if matches!(error, Error::TransportClosed) {
@@ -384,6 +440,10 @@ impl ConnectionState {
                 IoTerminalEvent::Terminal(error)
             }),
         )
+    }
+
+    pub(super) fn close_state(&self) -> Arc<SessionCloseState> {
+        Arc::clone(&self.close)
     }
 
     fn pending_io_event(&self, event: IoTerminalEvent) -> Option<PendingIoEvent> {
@@ -404,12 +464,13 @@ impl ConnectionState {
 
     pub(super) fn finalize_engine(
         &self,
+        authority: &SessionLifecycleAuthority,
         outcome: &MemoizedTerminalResult,
     ) -> Option<PendingIoEvent> {
         self.stop_posting();
-        let _ = self.transition_to_error_once();
+        let _ = self.transition_to_error_once(authority);
         if let Some(error) = outcome.error() {
-            let mut close_outcome = lock_unpoison(&self.close_outcome);
+            let mut close_outcome = lock_unpoison(&self.close.outcome);
             if close_outcome.is_none() {
                 *close_outcome = Some(MemoizedTerminalResult::from_error(error.clone()));
             }
@@ -426,16 +487,19 @@ impl ConnectionState {
 
     pub(super) fn mark_cm_failure(&self, error: Error) -> Option<PendingIoEvent> {
         self.stop_posting();
-        let mut outcome = lock_unpoison(&self.close_outcome);
+        let mut outcome = lock_unpoison(&self.close.outcome);
         if outcome.is_none() {
             *outcome = Some(MemoizedTerminalResult::from_error(error.clone()));
         }
         drop(outcome);
-        self.close_notify.notify_waiters();
+        self.close.notify_waiters();
         self.pending_io_event(IoTerminalEvent::Terminal(error))
     }
 
-    pub(super) fn transition_to_error_once(&self) -> Result<bool> {
+    pub(super) fn transition_to_error_once(
+        &self,
+        _authority: &SessionLifecycleAuthority,
+    ) -> Result<bool> {
         if self.error_transition_started.swap(true, Ordering::AcqRel) {
             return Ok(false);
         }
@@ -451,8 +515,9 @@ impl ConnectionState {
 
     pub(super) fn destroy_connection_resources(
         &self,
+        _authority: &SessionLifecycleAuthority,
         _lifecycle: &MutexGuard<'_, ()>,
-    ) -> Result<(Option<SharedCmId>, QpDestructionProof)> {
+    ) -> Result<Option<SharedCmId>> {
         let outstanding_operations = self.accepted_count();
         if outstanding_operations != 0 {
             return Err(Error::EngineWedged {
@@ -462,33 +527,39 @@ impl ConnectionState {
             });
         }
         self.stop_posting();
-        let destroy_qp = self.qp_destruction_proof.get().is_none();
+        let destroy_qp = !self.qp_destroyed.load(Ordering::Acquire);
         let (cm_id, qp_destroyed) = self.poster.destroy_connection(destroy_qp)?;
-        let proof = if qp_destroyed {
-            self.mint_qp_destruction_proof()
-        } else {
-            self.qp_destruction_proof.get().cloned().ok_or_else(|| {
-                Error::InvalidConfig(
-                    "connection resources lost QP ownership without a destruction proof".into(),
-                )
-            })?
-        };
-        Ok((cm_id, proof))
+        if qp_destroyed {
+            self.record_qp_destroyed();
+        }
+        if !self.qp_destroyed.load(Ordering::Acquire) {
+            return Err(Error::InvalidConfig(
+                "connection resources lost QP ownership without a destruction boundary".into(),
+            ));
+        }
+        Ok(cm_id)
     }
 
-    pub(super) fn establish_qp_destruction_boundary(
+    pub(super) fn destroy_qp_for_session(
         &self,
+        _authority: &SessionLifecycleAuthority,
         _lifecycle: &MutexGuard<'_, ()>,
-    ) -> Result<QpDestructionProof> {
+    ) -> Result<QpDestroyStatus> {
         self.stop_posting();
-        if let Some(proof) = self.qp_destruction_proof.get() {
-            return Ok(proof.clone());
+        if self.qp_destroyed.load(Ordering::Acquire) {
+            return Ok(QpDestroyStatus::AlreadyDestroyed);
         }
         match self.poster.destroy_qp() {
-            Ok(true) => Ok(self.mint_qp_destruction_proof()),
+            Ok(true) => {
+                if self.record_qp_destroyed() {
+                    Ok(QpDestroyStatus::DestroyedNow)
+                } else {
+                    Ok(QpDestroyStatus::AlreadyDestroyed)
+                }
+            }
             Ok(false) => {
-                if let Some(proof) = self.qp_destruction_proof.get() {
-                    Ok(proof.clone())
+                if self.qp_destroyed.load(Ordering::Acquire) {
+                    Ok(QpDestroyStatus::AlreadyDestroyed)
                 } else {
                     Err(Error::InvalidConfig(
                         "QP ownership disappeared before its destruction boundary was recorded"
@@ -496,13 +567,10 @@ impl ConnectionState {
                     ))
                 }
             }
-            Err(error) => {
-                if let Some(proof) = self.qp_destruction_proof.get() {
-                    Ok(proof.clone())
-                } else {
-                    Err(error)
-                }
+            Err(_) if self.qp_destroyed.load(Ordering::Acquire) => {
+                Ok(QpDestroyStatus::AlreadyDestroyed)
             }
+            Err(error) => Err(error),
         }
     }
 
@@ -512,7 +580,7 @@ impl ConnectionState {
     }
 
     pub(super) fn wake_close(&self) {
-        self.close_notify.notify_waiters();
+        self.close.notify_waiters();
     }
 
     pub(super) fn begin_quarantine(&self) -> Option<IoQuarantineReport> {
@@ -528,12 +596,12 @@ impl ConnectionState {
             outstanding_operations,
             cq_debt,
         };
-        let mut outcome = lock_unpoison(&self.close_outcome);
+        let mut outcome = lock_unpoison(&self.close.outcome);
         if outcome.is_none() {
             *outcome = Some(MemoizedTerminalResult::from_error(error.clone()));
         }
         drop(outcome);
-        self.close_notify.notify_waiters();
+        self.close.notify_waiters();
         self.pending_io_event(IoTerminalEvent::Terminal(error))
     }
 
@@ -543,7 +611,7 @@ impl ConnectionState {
         before_publish: impl FnOnce(),
     ) -> (bool, Option<PendingIoEvent>) {
         self.retirement_quarantined.store(true, Ordering::Release);
-        let mut outcome = lock_unpoison(&self.close_outcome);
+        let mut outcome = lock_unpoison(&self.close.outcome);
         let newly_published = !outcome
             .as_ref()
             .is_some_and(MemoizedTerminalResult::is_connection_quarantined);
@@ -555,12 +623,12 @@ impl ConnectionState {
             *outcome = Some(MemoizedTerminalResult::from_error(published.clone()));
             drop(outcome);
             let event = self.pending_io_event(IoTerminalEvent::Terminal(published));
-            self.close_notify.notify_waiters();
+            self.close.notify_waiters();
             return (true, event);
         } else {
             drop(outcome);
         }
-        self.close_notify.notify_waiters();
+        self.close.notify_waiters();
         (newly_published, None)
     }
 
@@ -573,20 +641,20 @@ impl ConnectionState {
     }
 
     pub(super) fn finish_retirement(&self) -> Option<PendingIoEvent> {
-        let mut outcome = lock_unpoison(&self.close_outcome);
+        let mut outcome = lock_unpoison(&self.close.outcome);
         if outcome.is_none() {
             *outcome = Some(MemoizedTerminalResult::success());
         }
         drop(outcome);
-        self.retired.store(true, Ordering::Release);
-        self.close_notify.notify_waiters();
+        self.close.mark_retired();
+        self.close.notify_waiters();
         self.pending_io_event(IoTerminalEvent::Closed(Ok(())))
     }
 
     pub(super) fn fail_retirement(&self, error: Error) -> Option<PendingIoEvent> {
         self.stop_posting();
         self.release_admission();
-        let mut outcome = lock_unpoison(&self.close_outcome);
+        let mut outcome = lock_unpoison(&self.close.outcome);
         if !outcome
             .as_ref()
             .is_some_and(MemoizedTerminalResult::is_connection_quarantined)
@@ -594,22 +662,19 @@ impl ConnectionState {
             *outcome = Some(MemoizedTerminalResult::from_error(error.clone()));
         }
         drop(outcome);
-        self.retired.store(true, Ordering::Release);
-        self.close_notify.notify_waiters();
+        self.close.mark_retired();
+        self.close.notify_waiters();
         self.pending_io_event(IoTerminalEvent::Closed(Err(error)))
     }
 
+    #[cfg(test)]
     pub(super) fn close_outcome(&self) -> Option<MemoizedTerminalResult> {
-        let outcome = lock_unpoison(&self.close_outcome).clone();
-        match outcome {
-            Some(ref value) if value.is_connection_quarantined() => outcome,
-            Some(_) if self.is_retired() => outcome,
-            _ => None,
-        }
+        self.close.outcome()
     }
 
     pub(super) fn operation_close_error(&self) -> Error {
-        lock_unpoison(&self.close_outcome)
+        self.close
+            .raw_outcome()
             .as_ref()
             .and_then(MemoizedTerminalResult::error)
             .unwrap_or(Error::TransportClosed)
@@ -651,7 +716,7 @@ impl ConnectionState {
     }
 
     pub(super) fn is_retired(&self) -> bool {
-        self.retired.load(Ordering::Acquire)
+        self.close.is_retired()
     }
 
     pub(super) fn mark_drained_once(&self) -> bool {
@@ -672,30 +737,21 @@ impl ConnectionState {
 
     pub(super) fn recover_reservation_quarantine(&self) {
         if let Some(reservation) = lock_unpoison(&self.admission).as_mut() {
-            reservation.recover_quarantine(self.qp_destruction_proof.get().is_none());
+            reservation.recover_quarantine(!self.qp_destroyed.load(Ordering::Acquire));
         }
     }
 
-    fn mint_qp_destruction_proof(&self) -> QpDestructionProof {
-        let proof = QpDestructionProof {
-            connection: self.token,
-            qp_num: self.qp_num,
-            _private: (),
-        };
-        if self.qp_destruction_proof.set(proof.clone()).is_ok()
-            && let Some(reservation) = lock_unpoison(&self.admission).as_mut()
-        {
+    fn record_qp_destroyed(&self) -> bool {
+        let first = !self.qp_destroyed.swap(true, Ordering::AcqRel);
+        if first && let Some(reservation) = lock_unpoison(&self.admission).as_mut() {
             reservation.mark_qp_destroyed();
         }
-        self.qp_destruction_proof
-            .get()
-            .expect("QP destruction proof was just initialized")
-            .clone()
+        first
     }
 
     #[cfg(test)]
-    pub(super) fn mint_qp_destruction_proof_for_test(&self) -> QpDestructionProof {
-        self.mint_qp_destruction_proof()
+    pub(super) fn record_qp_destroyed_for_test(&self) {
+        self.record_qp_destroyed();
     }
 
     pub(super) fn cm_route(&self) -> Option<ConnectionCmRoute> {
@@ -1223,6 +1279,13 @@ impl VerbsConnectionResources {
         }
     }
 
+    pub(super) fn destroy_unregistered_for_session(
+        &self,
+        _authority: &SessionLifecycleAuthority,
+    ) -> Result<(Option<SharedCmId>, bool)> {
+        <Self as WorkRequestPoster>::destroy_connection(self, true)
+    }
+
     pub(super) fn connect(&self, param: &ConnParam) -> Result<()> {
         let cm_owner = lock_unpoison(&self.cm_owner);
         match cm_owner.as_ref() {
@@ -1434,7 +1497,10 @@ pub(crate) fn install_connection(
         Err(failure) => {
             let (error, resources) = failure.into_parts();
             if let FailedConnectionInstallResources::Registered(connection) = resources {
-                let _ = shared.connections.release_unindexed(connection.token);
+                let _ = shared
+                    .session
+                    .connections
+                    .release_unindexed(connection.token);
                 connection.release_admission();
             }
             Err(error)
@@ -1445,11 +1511,12 @@ pub(crate) fn install_connection(
 pub(super) fn reserve_connection(
     shared: &Arc<EngineShared>,
 ) -> Result<(RwLockReadGuard<'_, ()>, ConnectionReservation)> {
-    let admission = read_unpoison(&shared.admission);
+    let admission = read_unpoison(&shared.session.admission);
     if let Some(error) = shared.admission_error() {
         return Err(error);
     }
     let reservation = shared
+        .session
         .connection_admission
         .try_acquire()
         .ok_or(Error::CapacityExhausted)?;
@@ -1484,7 +1551,7 @@ pub(super) fn install_reserved_connection(
     let qp_num = poster.qp_num();
     let pending = Arc::new(Mutex::new(Some((poster, reservation))));
     let make_pending = Arc::clone(&pending);
-    let registration = shared.connections.register(qp_num, move |token| {
+    let registration = shared.session.connections.register(qp_num, move |token| {
         let (poster, reservation) = lock_unpoison(&make_pending)
             .take()
             .expect("connection registration factory runs exactly once");
@@ -1522,7 +1589,7 @@ pub(super) fn install_reserved_connection(
     #[cfg(any(test, feature = "test-hooks"))]
     if let Some(failure) = shared.test_driver.take_setup_rollback_failure() {
         state.retain_setup_rollback_mr(failure.retained_mr);
-        if !shared.connections.detach_qp_index(token, qp_num) {
+        if !shared.session.connections.detach_qp_index(token, qp_num) {
             return Err(ConnectionInstallFailure {
                 error: Error::InvalidConfig(
                     "setup rollback injection lost its QP registration".into(),
@@ -1541,10 +1608,8 @@ pub(super) fn install_reserved_connection(
             resources: FailedConnectionInstallResources::Registered(state),
         });
     }
-    Ok(RdmaConnection {
-        shared: Arc::clone(shared),
-        state,
-    })
+    let session = shared.session.connection_capability(&state);
+    Ok(RdmaConnection::from_registered(shared, state, session))
 }
 
 pub(super) struct ConnectionInstallFailure {
@@ -1688,7 +1753,7 @@ mod tests {
     }
 
     #[test]
-    fn live_io_and_qp_destruction_proofs_require_exact_identity() {
+    fn live_io_proofs_require_exact_identity() {
         let registry = ConnectionRegistry::new(1).unwrap();
         let registration = registry.register(1, |token| {
             Arc::new(ConnectionState::new(
@@ -1723,11 +1788,6 @@ mod tests {
         };
         registry.set_qp_mapping_for_test(1, wrong_generation);
         assert!(registry.prove_live_io(token, 1).is_none());
-
-        let destroyed = connection.mint_qp_destruction_proof_for_test();
-        assert!(destroyed.proves_identity(token, 1));
-        assert!(!destroyed.proves_identity(wrong_generation, 1));
-        assert!(!destroyed.proves_identity(token, 2));
 
         registry.set_qp_mapping_for_test(1, token);
         let retained = registry
@@ -2068,7 +2128,8 @@ mod tests {
         });
 
         let lifecycle = connection.lock_lifecycle();
-        let error = match connection.destroy_connection_resources(&lifecycle) {
+        let authority = SessionLifecycleAuthority::for_test();
+        let error = match connection.destroy_connection_resources(&authority, &lifecycle) {
             Ok(_) => panic!("accepted work must prevent connection destruction"),
             Err(error) => error,
         };
