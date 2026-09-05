@@ -86,15 +86,24 @@ pub(super) enum EffectsPublication {
     reason = "introduced before owner turns migrate in later phases"
 )]
 impl ProgressReport {
-    pub(super) fn idle(next_deadline: Option<Instant>, readiness: ReadinessRegistration) -> Self {
+    pub(super) fn running(
+        units_consumed: usize,
+        immediate_work: bool,
+        next_deadline: Option<Instant>,
+        readiness: ReadinessRegistration,
+    ) -> Self {
         Self {
-            units_consumed: 0,
-            immediate_work: false,
+            units_consumed,
+            immediate_work,
             next_deadline,
             readiness,
             terminal: ProgressTerminal::Running,
             effects: EffectsPublication::Complete,
         }
+    }
+
+    pub(super) fn idle(next_deadline: Option<Instant>, readiness: ReadinessRegistration) -> Self {
+        Self::running(0, false, next_deadline, readiness)
     }
 
     pub(super) fn requires_repoll(&self) -> bool {

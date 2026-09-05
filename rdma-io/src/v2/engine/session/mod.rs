@@ -475,7 +475,7 @@ impl SessionManager {
         let now = tokio::time::Instant::now();
         let at = now.checked_add(after).unwrap_or(now);
         lock_unpoison(&self.deadline_requests).push_back(DeadlineRequest { at, kind, token });
-        work_signal.publish(super::driver::RECLAMATION_WORK);
+        work_signal.publish(super::driver::SESSION_RECLAMATION_WORK);
     }
 
     pub(super) fn take_deadline_requests(&self, budget: usize) -> Vec<DeadlineRequest> {

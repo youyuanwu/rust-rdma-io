@@ -1,6 +1,7 @@
 //! Low-level operation/completion state composed by the v2 engine.
 
 mod operation;
+mod progress;
 
 use std::collections::{HashSet, VecDeque};
 #[cfg(any(test, feature = "test-hooks"))]
@@ -13,7 +14,6 @@ use super::io::{IoEventSender, IoTerminalEvent, PendingIoEvent};
 use super::registry::{
     ConnectionToken, OperationToken, lock_unpoison, read_unpoison, write_unpoison,
 };
-use super::scheduler::{DeadlineKind, DeadlineRequest};
 #[cfg(test)]
 use super::{
     CompletionMode, RdmaConnectionConfig, RdmaEngine, RdmaEngineBuilder, RdmaEngineDriver,
@@ -33,6 +33,7 @@ pub(super) use operation::{
 pub(super) use operation::{
     completion_for_driver_test, install_accepted_operation_for_driver_test,
 };
+pub(super) use progress::IoProgress;
 
 /// Posting-only QP authority supplied by the session layer.
 ///
@@ -72,6 +73,12 @@ pub(super) trait IoSessionBridge: Send + Sync {
     ) -> (usize, bool);
 
     fn handle_reclamation_deadline(&self, token: OperationToken);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct IoDeadlineRequest {
+    pub(super) at: tokio::time::Instant,
+    pub(super) token: OperationToken,
 }
 
 /// Immutable session identity accepted by the operation/completion core.
@@ -345,7 +352,7 @@ pub(super) struct IoCore {
     driver_signal: Arc<dyn IoDriverSignal>,
     missing_cqe_deadline: Duration,
     completion_dispatch_budget: usize,
-    reclamation_requests: Mutex<VecDeque<DeadlineRequest>>,
+    reclamation_requests: Mutex<VecDeque<IoDeadlineRequest>>,
     session_bridge: OnceLock<Weak<dyn IoSessionBridge>>,
 }
 
@@ -450,15 +457,11 @@ impl IoCore {
         self.begin_reclamation(token);
         let now = tokio::time::Instant::now();
         let at = now.checked_add(self.missing_cqe_deadline).unwrap_or(now);
-        lock_unpoison(&self.reclamation_requests).push_back(DeadlineRequest {
-            at,
-            kind: DeadlineKind::Reclamation,
-            token: token.encode(),
-        });
+        lock_unpoison(&self.reclamation_requests).push_back(IoDeadlineRequest { at, token });
         self.publish_reclamation();
     }
 
-    pub(super) fn take_reclamation_requests(&self, budget: usize) -> Vec<DeadlineRequest> {
+    pub(super) fn take_reclamation_requests(&self, budget: usize) -> Vec<IoDeadlineRequest> {
         let mut requests = lock_unpoison(&self.reclamation_requests);
         let count = requests.len().min(budget);
         requests.drain(..count).collect()

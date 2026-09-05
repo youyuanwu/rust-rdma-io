@@ -19,20 +19,21 @@ use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 
 use super::config::CompletionMode;
+use super::io_core::IoProgress;
 use super::lifecycle::MemoizedTerminalResult;
+use super::progress::ProgressTerminal;
 use super::resources::EngineResources;
 use super::scheduler::{Deadline, DeadlineKind, WorkClass, WorkScheduler};
 use super::{EngineShared, RdmaEngineDriver};
-use crate::v2::Completion;
-use crate::v2::completion::CqReadiness;
 use crate::v2::error::{Error, Result};
 use crate::v2::runtime::preflight_driver_runtime;
 
 pub(super) const TERMINAL_WORK: usize = 1 << 0;
-pub(super) const RECLAMATION_WORK: usize = 1 << 1;
+pub(super) const IO_RECLAMATION_WORK: usize = 1 << 1;
 pub(super) const COMPLETION_DISPATCH_WORK: usize = 1 << 2;
 pub(super) const CQ_RECHECK_WORK: usize = 1 << 4;
-const WORK_CLASS_COUNT: usize = 5;
+pub(super) const SESSION_RECLAMATION_WORK: usize = 1 << 5;
+const WORK_CLASS_COUNT: usize = 4;
 
 pub(super) struct WorkSignal {
     pending: std::sync::atomic::AtomicUsize,
@@ -110,17 +111,26 @@ fn poll_readiness_events<G>(
 }
 
 impl RdmaEngineDriver {
-    pub(super) fn new(shared: Arc<EngineShared>, resources: Option<EngineResources>) -> Self {
-        let cq_budget = shared.config.cq_completion_budget;
+    pub(super) fn new(shared: Arc<EngineShared>, mut resources: Option<EngineResources>) -> Self {
+        let io_resources = resources
+            .as_mut()
+            .map(EngineResources::take_io_progress_resources);
+        let io_progress = IoProgress::new(
+            Arc::clone(&shared.io_core),
+            io_resources,
+            shared.config.cq_completion_budget,
+            shared.config.completion_dispatch_budget,
+            shared.config.io_reclamation_budget,
+            #[cfg(any(test, feature = "test-hooks"))]
+            Arc::clone(&shared.test_driver),
+        );
         Self {
             shared,
+            io_progress,
             resources,
             scheduler: WorkScheduler::new(),
-            cq_readiness: CqReadiness::default(),
-            cq_buffer: vec![Completion::default(); cq_budget].into_boxed_slice(),
             deadline_sleep: None,
             deadline_at: None,
-            deadline_io_turn: true,
             runtime_checked: false,
         }
     }
@@ -129,18 +139,15 @@ impl RdmaEngineDriver {
         if published & TERMINAL_WORK != 0 {
             self.scheduler.mark_class_ready(WorkClass::Terminal);
         }
-        if published & RECLAMATION_WORK != 0 {
-            self.scheduler.mark_class_ready(WorkClass::Reclamation);
+        if published & (IO_RECLAMATION_WORK | COMPLETION_DISPATCH_WORK | CQ_RECHECK_WORK) != 0 {
+            self.scheduler.mark_class_ready(WorkClass::Io);
         }
-        if published & COMPLETION_DISPATCH_WORK != 0 {
+        if published & SESSION_RECLAMATION_WORK != 0 {
             self.scheduler
-                .mark_class_ready(WorkClass::CompletionDispatch);
+                .mark_class_ready(WorkClass::SessionReclamation);
         }
         if published & super::session::cm::CM_WORK != 0 {
             self.scheduler.mark_class_ready(WorkClass::Cm);
-        }
-        if published & CQ_RECHECK_WORK != 0 {
-            self.scheduler.mark_class_ready(WorkClass::Cq);
         }
     }
 
@@ -153,6 +160,7 @@ impl RdmaEngineDriver {
     }
 
     fn release_resources(&mut self) {
+        self.io_progress.release_resources();
         if let Some(resources) = self.resources.as_mut() {
             resources.drop_readiness_adapters();
         }
@@ -216,75 +224,19 @@ impl RdmaEngineDriver {
         Ok(true)
     }
 
-    fn service_cq(&mut self, cx: &mut TaskContext<'_>) -> Result<bool> {
-        #[cfg(any(test, feature = "test-hooks"))]
-        if let Some(completion) = self.shared.test_driver.take_released_connection_cqe() {
-            if let Some(connection) = self.shared.session.enqueue_completion(completion) {
-                self.scheduler
-                    .enqueue_connection(connection.completion_ready());
-            }
-            self.scheduler.mark_class_ready(WorkClass::Cq);
-            return Ok(true);
+    fn service_io(&mut self, cx: &mut TaskContext<'_>) -> Result<bool> {
+        let report = self
+            .io_progress
+            .turn(self.shared.config.completion_mode, cx)?;
+        if report.requires_repoll() {
+            self.scheduler.mark_class_ready(WorkClass::Io);
         }
-
-        let Some(resources) = self.resources.as_ref() else {
-            return Ok(false);
-        };
-        let count = match self.shared.config.completion_mode {
-            CompletionMode::Readiness => {
-                let async_fd = resources.cq_async_fd.as_ref().ok_or_else(|| {
-                    Error::InvalidConfig("readiness engine has no CQ AsyncFd".into())
-                })?;
-                #[cfg(any(test, feature = "test-hooks"))]
-                let polled = {
-                    let before = Arc::clone(&self.shared);
-                    let after = Arc::clone(&self.shared);
-                    self.cq_readiness.poll_with_async_fd_and_hooks(
-                        &resources.cq,
-                        async_fd,
-                        cx,
-                        &mut self.cq_buffer,
-                        move |generation| before.test_driver.record_cq_pre_arm(generation),
-                        move |generation| after.test_driver.record_cq_arm(generation),
-                    )
-                };
-                #[cfg(not(any(test, feature = "test-hooks")))]
-                let polled = self.cq_readiness.poll_with_async_fd_and_hooks(
-                    &resources.cq,
-                    async_fd,
-                    cx,
-                    &mut self.cq_buffer,
-                    |_| false,
-                    |_| false,
-                );
-                match polled {
-                    Poll::Ready(result) => result?,
-                    Poll::Pending => return Ok(false),
-                }
-            }
-            CompletionMode::Polling => resources.cq.poll(&mut self.cq_buffer)?,
-        };
-
-        if count == 0 {
-            return Ok(false);
+        match report.terminal {
+            ProgressTerminal::Running => {}
+            ProgressTerminal::Ready => self.scheduler.mark_class_ready(WorkClass::Terminal),
+            ProgressTerminal::Failed(error) => return Err(error),
         }
-        for completion in self.cq_buffer[..count].iter().copied() {
-            let completion = completion.into_raw();
-            #[cfg(any(test, feature = "test-hooks"))]
-            if self.shared.test_driver.suppress_connection_cqe(completion) {
-                continue;
-            }
-            if let Some(connection) = self.shared.session.enqueue_completion(completion) {
-                self.scheduler
-                    .enqueue_connection(connection.completion_ready());
-            }
-            #[cfg(any(test, feature = "test-hooks"))]
-            self.shared.test_driver.dispatch(completion);
-            #[cfg(not(any(test, feature = "test-hooks")))]
-            let _ = completion;
-        }
-        self.scheduler.mark_class_ready(WorkClass::Cq);
-        Ok(true)
+        Ok(report.units_consumed > 0)
     }
 
     fn service_cm(&mut self, cx: &mut TaskContext<'_>) -> Result<bool> {
@@ -338,43 +290,8 @@ impl RdmaEngineDriver {
     }
 
     fn service_reclamation(&mut self) -> Result<bool> {
-        let budget = self
-            .shared
-            .config
-            .io_reclamation_budget
-            .saturating_add(self.shared.config.session_reclamation_budget);
-        let first_quota = budget.div_ceil(2);
-        let second_quota = budget / 2;
-        let mut requests = if self.deadline_io_turn {
-            self.shared.io_core.take_reclamation_requests(first_quota)
-        } else {
-            self.shared.session.take_deadline_requests(first_quota)
-        };
-        let second = if self.deadline_io_turn {
-            self.shared.session.take_deadline_requests(second_quota)
-        } else {
-            self.shared.io_core.take_reclamation_requests(second_quota)
-        };
-        requests.extend(second);
-        if requests.len() < budget {
-            let remaining = budget - requests.len();
-            let refill = if self.deadline_io_turn {
-                self.shared.io_core.take_reclamation_requests(remaining)
-            } else {
-                self.shared.session.take_deadline_requests(remaining)
-            };
-            requests.extend(refill);
-        }
-        if requests.len() < budget {
-            let remaining = budget - requests.len();
-            let refill = if self.deadline_io_turn {
-                self.shared.session.take_deadline_requests(remaining)
-            } else {
-                self.shared.io_core.take_reclamation_requests(remaining)
-            };
-            requests.extend(refill);
-        }
-        self.deadline_io_turn = !self.deadline_io_turn;
+        let budget = self.shared.config.session_reclamation_budget;
+        let requests = self.shared.session.take_deadline_requests(budget);
         for request in requests.iter().copied() {
             if !self
                 .scheduler
@@ -393,14 +310,14 @@ impl RdmaEngineDriver {
             self.process_deadline(deadline)?;
         }
         if self.shared.session.has_deadline_requests()
-            || self.shared.io_core.has_reclamation_requests()
             || self
                 .scheduler
                 .deadlines()
                 .next()
                 .is_some_and(|at| at <= now)
         {
-            self.scheduler.mark_class_ready(WorkClass::Reclamation);
+            self.scheduler
+                .mark_class_ready(WorkClass::SessionReclamation);
         }
         Ok(!due.is_empty() || !requests.is_empty())
     }
@@ -415,13 +332,6 @@ impl RdmaEngineDriver {
                     Ok(())
                 }
             }
-            DeadlineKind::Reclamation => {
-                self.shared.session.handle_reclamation_deadline(
-                    &self.shared,
-                    super::registry::OperationToken::decode(deadline.token),
-                );
-                Ok(())
-            }
             DeadlineKind::ConnectionDrain => {
                 self.shared.session.handle_connection_drain_deadline(
                     &self.shared,
@@ -433,7 +343,15 @@ impl RdmaEngineDriver {
     }
 
     fn poll_deadline_timer(&mut self, cx: &mut TaskContext<'_>) -> bool {
-        let next = self.scheduler.next_deadline();
+        let next = match (
+            self.scheduler.next_deadline(),
+            self.io_progress.next_deadline(),
+        ) {
+            (Some(session), Some(io)) => Some(session.min(io)),
+            (Some(session), None) => Some(session),
+            (None, Some(io)) => Some(io),
+            (None, None) => None,
+        };
         if self.deadline_at != next {
             self.deadline_sleep = next.map(|at| Box::pin(tokio::time::sleep_until(at)));
             self.deadline_at = next;
@@ -446,37 +364,9 @@ impl RdmaEngineDriver {
         }
         self.deadline_sleep = None;
         self.deadline_at = None;
-        self.scheduler.mark_class_ready(WorkClass::Reclamation);
-        true
-    }
-
-    fn service_completion_dispatch(&mut self) -> bool {
-        if let Some(connection) = self.shared.io_core.take_published_connection() {
-            self.scheduler
-                .enqueue_connection(connection.completion_ready());
-        }
-        let Some(connection) = self.scheduler.pop_connection() else {
-            return false;
-        };
-        let (_, remains_ready) = self.shared.session.dispatch_connection_completions(
-            &self.shared,
-            super::registry::ConnectionToken {
-                slot: connection.slot,
-                generation: connection.generation,
-            },
-            self.shared.config.completion_dispatch_budget,
-        );
-        if remains_ready {
-            self.scheduler.requeue_connection(connection);
-        }
-        if self.scheduler.completion_connection_count() > 0 {
-            self.scheduler
-                .mark_class_ready(WorkClass::CompletionDispatch);
-        }
-        if self.shared.io_core.has_published_connections() {
-            self.scheduler
-                .mark_class_ready(WorkClass::CompletionDispatch);
-        }
+        self.scheduler.mark_class_ready(WorkClass::Io);
+        self.scheduler
+            .mark_class_ready(WorkClass::SessionReclamation);
         true
     }
 }
@@ -514,7 +404,7 @@ impl Future for RdmaEngineDriver {
             self.scheduler.mark_class_ready(WorkClass::Terminal);
         }
         self.scheduler.mark_class_ready(WorkClass::Cm);
-        self.scheduler.mark_class_ready(WorkClass::Cq);
+        self.scheduler.mark_class_ready(WorkClass::Io);
 
         let class_budget = self.scheduler.ready_class_count().min(WORK_CLASS_COUNT);
         for _ in 0..class_budget {
@@ -528,9 +418,8 @@ impl Future for RdmaEngineDriver {
                     Err(error) => Err(error),
                 },
                 WorkClass::Cm => self.service_cm(cx),
-                WorkClass::Cq => self.service_cq(cx),
-                WorkClass::Reclamation => self.service_reclamation(),
-                WorkClass::CompletionDispatch => Ok(self.service_completion_dispatch()),
+                WorkClass::Io => self.service_io(cx),
+                WorkClass::SessionReclamation => self.service_reclamation(),
             };
             let progressed = match result {
                 Ok(progressed) => progressed,
@@ -1775,7 +1664,10 @@ pub(super) mod test_api {
             Ok(())
         }
 
-        pub(super) fn suppress_connection_cqe(&self, completion: WorkCompletion) -> bool {
+        pub(in crate::v2::engine) fn suppress_connection_cqe(
+            &self,
+            completion: WorkCompletion,
+        ) -> bool {
             let mut guard = self
                 .connection_cqe_suppression
                 .lock()
@@ -1886,7 +1778,7 @@ pub(super) mod test_api {
             }
         }
 
-        pub(super) fn take_released_connection_cqe(&self) -> Option<WorkCompletion> {
+        pub(in crate::v2::engine) fn take_released_connection_cqe(&self) -> Option<WorkCompletion> {
             self.released_connection_cqes
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -2117,7 +2009,7 @@ pub(super) mod test_api {
             })
         }
 
-        pub(super) fn dispatch(&self, completion: WorkCompletion) {
+        pub(in crate::v2::engine) fn dispatch(&self, completion: WorkCompletion) {
             let route = self
                 .routes
                 .lock()
@@ -2143,7 +2035,7 @@ pub(super) mod test_api {
             }
         }
 
-        pub(super) fn record_cq_arm(&self, generation: u64) -> bool {
+        pub(in crate::v2::engine) fn record_cq_arm(&self, generation: u64) -> bool {
             let previous = self.cq_arms.swap(generation, Ordering::AcqRel);
             debug_assert!(generation > previous, "CQ arm generations must increase");
             self.cq_arm_notify.notify_waiters();
@@ -2162,7 +2054,7 @@ pub(super) mod test_api {
             true
         }
 
-        pub(super) fn record_cq_pre_arm(&self, generation: u64) -> bool {
+        pub(in crate::v2::engine) fn record_cq_pre_arm(&self, generation: u64) -> bool {
             if !self.cq_pre_arm_controlled.swap(false, Ordering::AcqRel) {
                 return false;
             }
@@ -2459,13 +2351,13 @@ mod tests {
         std::thread::scope(|scope| {
             let signal = Arc::clone(&signal);
             scope
-                .spawn(move || signal.publish(RECLAMATION_WORK))
+                .spawn(move || signal.publish(IO_RECLAMATION_WORK))
                 .join()
                 .unwrap();
         });
         let counter = CountingWaker::new();
         let pending = signal.register_and_recheck(&counter.waker(), observed);
-        assert_eq!(pending, RECLAMATION_WORK);
+        assert_eq!(pending, IO_RECLAMATION_WORK);
         assert_eq!(counter.count(), 1);
     }
 
@@ -2488,7 +2380,7 @@ mod tests {
         let signal = Arc::new(WorkSignal::new());
         std::thread::scope(|scope| {
             let mut producers = Vec::new();
-            for bit in [TERMINAL_WORK, RECLAMATION_WORK, COMPLETION_DISPATCH_WORK] {
+            for bit in [TERMINAL_WORK, IO_RECLAMATION_WORK, COMPLETION_DISPATCH_WORK] {
                 let signal = Arc::clone(&signal);
                 producers.push(scope.spawn(move || {
                     for _ in 0..32 {
@@ -2502,7 +2394,7 @@ mod tests {
         });
         assert_eq!(
             signal.take(),
-            TERMINAL_WORK | RECLAMATION_WORK | COMPLETION_DISPATCH_WORK
+            TERMINAL_WORK | IO_RECLAMATION_WORK | COMPLETION_DISPATCH_WORK
         );
     }
 
@@ -2592,20 +2484,20 @@ mod tests {
                     DeadlineKind::ConnectionDrain,
                     connection.state.token.encode(),
                 ));
-                driver.scheduler.mark_class_ready(WorkClass::Cq);
-                driver.scheduler.mark_class_ready(WorkClass::Reclamation);
+                driver.scheduler.mark_class_ready(WorkClass::Io);
+                driver
+                    .scheduler
+                    .mark_class_ready(WorkClass::SessionReclamation);
                 let waker = Waker::noop();
                 let mut cx = TaskContext::from_waker(waker);
 
-                assert_eq!(driver.scheduler.next_class(), Some(WorkClass::Cq));
-                assert!(driver.service_cq(&mut cx).unwrap());
-                assert_eq!(driver.scheduler.next_class(), Some(WorkClass::Reclamation));
-                assert!(driver.service_reclamation().unwrap());
+                assert_eq!(driver.scheduler.next_class(), Some(WorkClass::Io));
+                assert!(driver.service_io(&mut cx).unwrap());
                 assert_eq!(
                     driver.scheduler.next_class(),
-                    Some(WorkClass::CompletionDispatch)
+                    Some(WorkClass::SessionReclamation)
                 );
-                assert!(driver.service_completion_dispatch());
+                assert!(driver.service_reclamation().unwrap());
 
                 let diagnostics = engine.diagnostics();
                 assert_eq!(diagnostics.accepted_operations, 0);
@@ -2734,11 +2626,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn deadline_timer_wakes_driver_and_processes_due_work() {
         let (_engine, mut driver) = test_engine_pair(CompletionMode::Readiness);
-        assert!(driver.scheduler.deadlines().push(
+        driver.io_progress.schedule_deadline_for_test(
             tokio::time::Instant::now() + Duration::from_secs(5),
-            DeadlineKind::Reclamation,
-            7,
-        ));
+            super::super::registry::OperationToken::decode(7),
+        );
         let counter = CountingWaker::new();
         let waker = counter.waker();
         let mut cx = TaskContext::from_waker(&waker);
@@ -2760,7 +2651,7 @@ mod tests {
         let mut cx = TaskContext::from_waker(&waker);
         assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
         assert_eq!(counter.count(), 0);
-        assert_eq!(driver.scheduler.completion_connection_count(), 0);
+        assert_eq!(driver.io_progress.completion_connection_count(), 0);
     }
 
     #[tokio::test]
@@ -2779,7 +2670,7 @@ mod tests {
             let mut cx = TaskContext::from_waker(&waker);
 
             assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
-            assert_eq!(driver.scheduler.completion_connection_count(), 0);
+            assert_eq!(driver.io_progress.completion_connection_count(), 0);
             assert!(!shared.has_published_completions());
 
             drop(connections);

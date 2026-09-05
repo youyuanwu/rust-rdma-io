@@ -44,13 +44,6 @@ impl LiveIoConnectionProof {
 }
 
 impl ConnectionToken {
-    pub(super) const fn completion_ready(self) -> super::scheduler::CompletionReadyConnection {
-        super::scheduler::CompletionReadyConnection {
-            slot: self.slot,
-            generation: self.generation,
-        }
-    }
-
     pub(super) const fn encode(self) -> u64 {
         ((self.generation as u64) << 32) | self.slot as u64
     }

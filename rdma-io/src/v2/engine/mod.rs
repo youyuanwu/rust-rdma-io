@@ -64,7 +64,7 @@ pub use driver::{
     TestSharedResourceIdentity,
 };
 pub use io_core::RdmaOperation;
-use io_core::{IoCore, IoDriverSignal, IoSessionBridge};
+use io_core::{IoCore, IoDriverSignal, IoProgress, IoSessionBridge};
 use lifecycle::MemoizedTerminalResult;
 use registry::{lock_unpoison, write_unpoison};
 use resources::{EngineResourceRefs, EngineResources};
@@ -407,13 +407,11 @@ impl Drop for RdmaEngine {
 /// per successful build, and the engine creates zero internal tasks.
 pub struct RdmaEngineDriver {
     shared: Arc<EngineShared>,
+    io_progress: IoProgress,
     resources: Option<EngineResources>,
     scheduler: WorkScheduler,
-    cq_readiness: crate::v2::completion::CqReadiness,
-    cq_buffer: Box<[super::Completion]>,
     deadline_sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
     deadline_at: Option<tokio::time::Instant>,
-    deadline_io_turn: bool,
     runtime_checked: bool,
 }
 
@@ -461,7 +459,7 @@ impl IoDriverSignal for EngineIoDriverSignal {
     }
 
     fn publish_reclamation(&self) {
-        self.work_signal.publish(driver::RECLAMATION_WORK);
+        self.work_signal.publish(driver::IO_RECLAMATION_WORK);
     }
 
     fn publish_terminal(&self) {

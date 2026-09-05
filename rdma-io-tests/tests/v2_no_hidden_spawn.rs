@@ -1114,6 +1114,7 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     let io_path = v2_dir.join("engine").join("io.rs");
     let io_core_mod_path = v2_dir.join("engine").join("io_core").join("mod.rs");
     let io_core_operation_path = v2_dir.join("engine").join("io_core").join("operation.rs");
+    let io_core_progress_path = v2_dir.join("engine").join("io_core").join("progress.rs");
     let engine_mod_path = v2_dir.join("engine").join("mod.rs");
     let progress_path = v2_dir.join("engine").join("progress.rs");
     let connection_path = v2_dir.join("engine").join("session").join("connection.rs");
@@ -1153,6 +1154,8 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     const FINAL_DRIVER_FORBIDDEN_IO_KNOWLEDGE: &[&str] = &[
         "CqReadiness",
         "cq_buffer",
+        "resources.cq",
+        "cq_async_fd",
         "take_published_connection",
         "CompletionReadyConnection",
         "DeadlineKind::Reclamation",
@@ -1209,7 +1212,11 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         "SessionLifecycleAuthority",
         "QpDestructionProof",
     ];
-    for path in [&io_core_mod_path, &io_core_operation_path] {
+    for path in [
+        &io_core_mod_path,
+        &io_core_operation_path,
+        &io_core_progress_path,
+    ] {
         let source = fs::read_to_string(path).expect("read I/O core source");
         let violations =
             find_forbidden_production_dependencies(&source, &forbidden_core_dependencies)
@@ -1409,6 +1416,17 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         drain_path.display()
     );
     let driver_source = fs::read_to_string(&driver_path).expect("read engine driver source");
+    let production_driver = driver_source
+        .split(
+            "#[cfg(any(test, feature = \"test-hooks\"))]\n#[doc(hidden)]\npub(super) mod test_api",
+        )
+        .next()
+        .expect("locate production driver prefix");
+    assert_final_driver_boundary(
+        &driver_path,
+        production_driver,
+        FINAL_DRIVER_FORBIDDEN_IO_KNOWLEDGE,
+    );
     assert!(
         driver_source.contains(".session")
             && driver_source.contains(".io_core")

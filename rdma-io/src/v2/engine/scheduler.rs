@@ -1,17 +1,16 @@
-//! Bounded engine work-class, completion-dispatch, and deadline scheduling.
+//! Bounded engine work-class and session-deadline scheduling.
 //!
-//! Each work class and connection can occupy its queue at most once. A class
-//! that remains ready is appended at the tail, and a continuously ready
-//! connection is likewise requeued only after one configured quantum.
+//! Each work class can occupy its queue at most once. A class that remains
+//! ready is appended at the tail.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, VecDeque};
 
 use tokio::time::Instant;
 
 use super::progress::OwnerClass;
 
-const WORK_CLASS_COUNT: usize = 5;
+const WORK_CLASS_COUNT: usize = 4;
 const OWNER_CLASS_COUNT: usize = 3;
 
 /// Deduplicated fair rotation over progress owners.
@@ -59,9 +58,8 @@ impl OwnerScheduler {
 pub(super) enum WorkClass {
     Terminal,
     Cm,
-    Cq,
-    Reclamation,
-    CompletionDispatch,
+    Io,
+    SessionReclamation,
 }
 
 impl WorkClass {
@@ -69,9 +67,8 @@ impl WorkClass {
         match self {
             Self::Terminal => 0,
             Self::Cm => 1,
-            Self::Cq => 2,
-            Self::Reclamation => 3,
-            Self::CompletionDispatch => 4,
+            Self::Io => 2,
+            Self::SessionReclamation => 3,
         }
     }
 }
@@ -79,7 +76,6 @@ impl WorkClass {
 pub(super) struct WorkScheduler {
     classes: VecDeque<WorkClass>,
     class_queued: [bool; WORK_CLASS_COUNT],
-    completion_connections: CompletionConnections,
     deadlines: DeadlineQueue,
 }
 
@@ -88,7 +84,6 @@ impl WorkScheduler {
         Self {
             classes: VecDeque::with_capacity(WORK_CLASS_COUNT),
             class_queued: [false; WORK_CLASS_COUNT],
-            completion_connections: CompletionConnections::default(),
             deadlines: DeadlineQueue::default(),
         }
     }
@@ -111,25 +106,6 @@ impl WorkScheduler {
         self.classes.len()
     }
 
-    pub(super) fn enqueue_connection(&mut self, connection: CompletionReadyConnection) {
-        if self.completion_connections.enqueue(connection) {
-            self.mark_class_ready(WorkClass::CompletionDispatch);
-        }
-    }
-
-    pub(super) fn pop_connection(&mut self) -> Option<CompletionReadyConnection> {
-        self.completion_connections.pop()
-    }
-
-    pub(super) fn requeue_connection(&mut self, connection: CompletionReadyConnection) {
-        self.completion_connections.enqueue(connection);
-        self.mark_class_ready(WorkClass::CompletionDispatch);
-    }
-
-    pub(super) fn completion_connection_count(&self) -> usize {
-        self.completion_connections.len()
-    }
-
     pub(super) fn deadlines(&mut self) -> &mut DeadlineQueue {
         &mut self.deadlines
     }
@@ -139,41 +115,8 @@ impl WorkScheduler {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(super) struct CompletionReadyConnection {
-    pub(super) slot: u32,
-    pub(super) generation: u32,
-}
-
-#[derive(Default)]
-struct CompletionConnections {
-    queue: VecDeque<CompletionReadyConnection>,
-    queued: HashSet<CompletionReadyConnection>,
-}
-
-impl CompletionConnections {
-    fn enqueue(&mut self, connection: CompletionReadyConnection) -> bool {
-        if !self.queued.insert(connection) {
-            return false;
-        }
-        self.queue.push_back(connection);
-        true
-    }
-
-    fn pop(&mut self) -> Option<CompletionReadyConnection> {
-        let connection = self.queue.pop_front()?;
-        self.queued.remove(&connection);
-        Some(connection)
-    }
-
-    fn len(&self) -> usize {
-        self.queue.len()
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum DeadlineKind {
-    Reclamation,
     ConnectionDrain,
     EngineShutdown,
 }
@@ -265,13 +208,6 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    fn connection(slot: u32) -> CompletionReadyConnection {
-        CompletionReadyConnection {
-            slot,
-            generation: 1,
-        }
-    }
-
     #[test]
     fn owner_classes_deduplicate_and_rotate() {
         let mut scheduler = OwnerScheduler::new();
@@ -295,9 +231,8 @@ mod tests {
         for class in [
             WorkClass::Terminal,
             WorkClass::Cm,
-            WorkClass::Cq,
-            WorkClass::Reclamation,
-            WorkClass::CompletionDispatch,
+            WorkClass::Io,
+            WorkClass::SessionReclamation,
         ] {
             scheduler.mark_class_ready(class);
         }
@@ -314,9 +249,8 @@ mod tests {
             [
                 WorkClass::Terminal,
                 WorkClass::Cm,
-                WorkClass::Cq,
-                WorkClass::Reclamation,
-                WorkClass::CompletionDispatch,
+                WorkClass::Io,
+                WorkClass::SessionReclamation,
             ]
         );
         assert_eq!(
@@ -324,33 +258,6 @@ mod tests {
             Some(WorkClass::Terminal),
             "the first class rotates to the tail"
         );
-    }
-
-    #[test]
-    fn duplicate_completion_connections_are_suppressed() {
-        let mut scheduler = WorkScheduler::new();
-        scheduler.enqueue_connection(connection(7));
-        scheduler.enqueue_connection(connection(7));
-        assert_eq!(scheduler.completion_connection_count(), 1);
-        assert_eq!(scheduler.pop_connection(), Some(connection(7)));
-        assert_eq!(scheduler.pop_connection(), None);
-    }
-
-    #[test]
-    fn continuously_ready_completion_connections_rotate() {
-        let mut scheduler = WorkScheduler::new();
-        for slot in 0..8 {
-            scheduler.enqueue_connection(connection(slot));
-        }
-
-        let mut first_round = Vec::new();
-        for _ in 0..8 {
-            let selected = scheduler.pop_connection().unwrap();
-            first_round.push(selected.slot);
-            scheduler.requeue_connection(selected);
-        }
-        assert_eq!(first_round, (0..8).collect::<Vec<_>>());
-        assert_eq!(scheduler.pop_connection(), Some(connection(0)));
     }
 
     #[test]
@@ -362,7 +269,7 @@ mod tests {
             DeadlineKind::EngineShutdown,
             2,
         ));
-        assert!(deadlines.push(now, DeadlineKind::Reclamation, 0));
+        assert!(deadlines.push(now, DeadlineKind::ConnectionDrain, 0));
         assert!(deadlines.push(
             now + Duration::from_secs(1),
             DeadlineKind::ConnectionDrain,

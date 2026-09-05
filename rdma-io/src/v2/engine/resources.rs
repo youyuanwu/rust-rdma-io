@@ -14,14 +14,22 @@ use super::config::{CompletionMode, EngineConfig, ProviderLimits};
 use crate::v2::runtime::{RuntimeProbe, probe_runtime};
 
 pub(super) struct EngineResources {
-    // Rust drops fields in declaration order. Keep both Tokio adapters before
-    // the CQ/channel owners whose raw descriptors they register.
-    pub(super) cq_async_fd: Option<AsyncFd<RawFd>>,
+    // I/O progress is extracted into the driver before polling begins.
+    io_progress: Option<IoProgressResources>,
+    // Rust drops fields in declaration order. Keep the Tokio adapter before
+    // the CM channel owner whose raw descriptor it registers.
     pub(super) cm_async_fd: Option<AsyncFd<RawFd>>,
     pub(super) cq: Arc<Cq>,
     pub(super) pd: Pd,
     pub(super) cm_event_channel: Arc<EventChannel>,
     pub(super) context: Context,
+}
+
+/// CQ resources owned by the bounded I/O progress component.
+pub(super) struct IoProgressResources {
+    // Keep the Tokio adapter before the CQ owner whose descriptor it registers.
+    pub(super) cq_async_fd: Option<AsyncFd<RawFd>>,
+    pub(super) cq: Arc<Cq>,
 }
 
 #[derive(Clone)]
@@ -106,7 +114,10 @@ impl EngineResources {
 
         Ok((
             Self {
-                cq_async_fd,
+                io_progress: Some(IoProgressResources {
+                    cq_async_fd,
+                    cq: Arc::clone(&cq),
+                }),
                 cm_async_fd,
                 cq,
                 pd,
@@ -126,15 +137,13 @@ impl EngineResources {
         }
     }
 
+    pub(super) fn take_io_progress_resources(&mut self) -> IoProgressResources {
+        self.io_progress
+            .take()
+            .expect("I/O progress resources are taken exactly once")
+    }
+
     pub(super) fn drop_readiness_adapters(&mut self) {
-        #[cfg(any(test, feature = "test-hooks"))]
-        if let Some(adapter) = self.cq_async_fd.as_ref() {
-            crate::test_support::destruction::record(
-                crate::test_support::destruction::DestructionKind::CqReadinessAdapter,
-                *adapter.get_ref() as usize,
-            );
-        }
-        self.cq_async_fd.take();
         #[cfg(any(test, feature = "test-hooks"))]
         if let Some(adapter) = self.cm_async_fd.as_ref() {
             crate::test_support::destruction::record(
@@ -153,6 +162,19 @@ impl EngineResources {
             cm_event_channel: Arc::clone(&self.cm_event_channel),
             context: self.context.clone(),
         }
+    }
+}
+
+impl IoProgressResources {
+    pub(super) fn drop_readiness_adapter(&mut self) {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(adapter) = self.cq_async_fd.as_ref() {
+            crate::test_support::destruction::record(
+                crate::test_support::destruction::DestructionKind::CqReadinessAdapter,
+                *adapter.get_ref() as usize,
+            );
+        }
+        self.cq_async_fd.take();
     }
 }
 
