@@ -27,7 +27,10 @@ pub(super) struct LiveIoConnectionProof {
 }
 
 impl LiveIoConnectionProof {
-    pub(in crate::v2::engine) const fn new(connection: ConnectionToken, qp_num: u32) -> Self {
+    pub(in crate::v2::engine) const fn issue_live_io_proof(
+        connection: ConnectionToken,
+        qp_num: u32,
+    ) -> Self {
         Self {
             connection,
             qp_num,

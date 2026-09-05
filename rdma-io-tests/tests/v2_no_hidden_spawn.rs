@@ -143,6 +143,56 @@ fn find_forbidden_production_dependencies(
     Ok(visitor.violations)
 }
 
+struct LiveIoProofIssuanceVisitor {
+    locations: Vec<usize>,
+}
+
+impl<'ast> Visit<'ast> for LiveIoProofIssuanceVisitor {
+    fn visit_item(&mut self, item: &'ast Item) {
+        if !is_test_only(item_attrs(item)) {
+            visit::visit_item(self, item);
+        }
+    }
+
+    fn visit_impl_item(&mut self, item: &'ast ImplItem) {
+        if !is_test_only(impl_item_attrs(item)) {
+            visit::visit_impl_item(self, item);
+        }
+    }
+
+    fn visit_trait_item(&mut self, item: &'ast TraitItem) {
+        if !is_test_only(trait_item_attrs(item)) {
+            visit::visit_trait_item(self, item);
+        }
+    }
+
+    fn visit_foreign_item(&mut self, item: &'ast ForeignItem) {
+        if !is_test_only(foreign_item_attrs(item)) {
+            visit::visit_foreign_item(self, item);
+        }
+    }
+
+    fn visit_path(&mut self, path: &'ast syn::Path) {
+        if path
+            .segments
+            .iter()
+            .any(|segment| segment.ident == "issue_live_io_proof")
+        {
+            self.locations.push(path.span().start().line);
+        }
+        visit::visit_path(self, path);
+    }
+}
+
+fn find_live_io_proof_issuance(source: &str) -> Result<Vec<usize>, syn::Error> {
+    let syntax = syn::parse_file(source)?;
+    let mut visitor = LiveIoProofIssuanceVisitor {
+        locations: Vec::new(),
+    };
+    visitor.visit_file(&syntax);
+    Ok(visitor.locations)
+}
+
 struct LifecycleCallVisitor<'a> {
     methods: &'a HashSet<&'a str>,
     violations: Vec<String>,
@@ -1004,6 +1054,54 @@ fn provider_validation_propagates_the_cargo_job_limit() {
         script.contains("CARGO_BUILD_JOBS=\"${CARGO_BUILD_JOBS:-2}\""),
         "{} must default provider validation to two Cargo jobs",
         script_path.display()
+    );
+}
+
+#[test]
+fn test_live_io_proof_issuance_is_confined_to_session_registry() {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let workspace_root = Path::new(manifest_dir).parent().expect("workspace root");
+    let engine_dir = workspace_root
+        .join("rdma-io")
+        .join("src")
+        .join("v2")
+        .join("engine");
+    let issuer_path = engine_dir.join("session").join("registry.rs");
+
+    for path in collect_rs_files(&engine_dir).expect("enumerate live-I/O proof issuance sites") {
+        let source = fs::read_to_string(&path).expect("read engine source");
+        let locations =
+            find_live_io_proof_issuance(&source).expect("parse live-I/O proof issuance source");
+        if path == issuer_path {
+            assert_eq!(
+                locations.len(),
+                1,
+                "{} must contain the sole live-I/O proof issuance site",
+                path.display()
+            );
+        } else {
+            assert!(
+                locations.is_empty(),
+                "{} must not issue LiveIoConnectionProof values at lines {locations:?}",
+                path.display()
+            );
+        }
+    }
+
+    let controlled_source = r#"
+        fn forbidden_production_issuance() {
+            let _ = LiveIoConnectionProof::issue_live_io_proof(connection, qp_num);
+        }
+
+        #[cfg(test)]
+        fn allowed_test_fixture() {
+            let _ = LiveIoConnectionProof::issue_live_io_proof(connection, qp_num);
+        }
+    "#;
+    assert_eq!(
+        find_live_io_proof_issuance(controlled_source).expect("parse controlled source"),
+        vec![3],
+        "the structural guard must reject production issuance while ignoring test-only fixtures"
     );
 }
 

@@ -85,7 +85,9 @@ impl ConnectionRegistry {
         {
             return None;
         }
-        Some(LiveIoConnectionProof::new(connection, qp_num))
+        Some(LiveIoConnectionProof::issue_live_io_proof(
+            connection, qp_num,
+        ))
     }
 
     pub(in crate::v2::engine) fn release(
