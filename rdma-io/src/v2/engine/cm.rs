@@ -1014,7 +1014,7 @@ impl CmState {
             Ok(connection) => connection,
             Err(failure) => {
                 let (error, failed_resources) = failure.into_parts();
-                match verbs.destroy_connection(true) {
+                match shared.session.destroy_unregistered_connection(&verbs) {
                     Ok((cm_id, _qp_destroyed)) => {
                         self.release_failed_install(shared, failed_resources)?;
                         if let Some(cm_id) = cm_id {
@@ -2208,7 +2208,7 @@ impl CmState {
             Ok(connection) => connection,
             Err(failure) => {
                 let (error, failed_resources) = failure.into_parts();
-                match verbs.destroy_connection(true) {
+                match shared.session.destroy_unregistered_connection(&verbs) {
                     Ok((cm_id, _qp_destroyed)) => {
                         self.release_failed_install(shared, failed_resources)?;
                         if let Some(cm_id) = cm_id {

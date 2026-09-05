@@ -16,7 +16,9 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::Duration;
 
 use super::cm::CmState;
-use super::connection::{ConnectionAdmissionPool, ConnectionState, QpDestroyStatus, SharedCmId};
+use super::connection::{
+    ConnectionAdmissionPool, ConnectionState, QpDestroyStatus, SharedCmId, VerbsConnectionResources,
+};
 use super::driver::WorkSignal;
 use super::io_core::{IoCore, IoCoreEffects, OperationQuarantineEffect};
 use super::listener::ListenerState;
@@ -47,6 +49,7 @@ pub(super) struct QpDestructionProof {
 /// Resource-free close observation shared with connection frontends.
 pub(super) struct SessionCloseState {
     pub(super) outcome: Mutex<Option<super::lifecycle::MemoizedTerminalResult>>,
+    engine_terminal: Mutex<Option<super::lifecycle::MemoizedTerminalResult>>,
     pub(super) notify: Arc<tokio::sync::Notify>,
     retired: AtomicBool,
 }
@@ -55,6 +58,7 @@ impl SessionCloseState {
     pub(super) fn new() -> Arc<Self> {
         Arc::new(Self {
             outcome: Mutex::new(None),
+            engine_terminal: Mutex::new(None),
             notify: Arc::new(tokio::sync::Notify::new()),
             retired: AtomicBool::new(false),
         })
@@ -69,7 +73,7 @@ impl SessionCloseState {
         match outcome {
             Some(ref value) if value.is_connection_quarantined() => outcome,
             Some(_) if self.is_retired() => outcome,
-            _ => None,
+            _ => lock_unpoison(&self.engine_terminal).clone(),
         }
     }
 
@@ -80,6 +84,16 @@ impl SessionCloseState {
     pub(super) fn mark_retired(&self) {
         self.retired
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(super) fn record_engine_terminal(
+        &self,
+        outcome: &super::lifecycle::MemoizedTerminalResult,
+    ) {
+        let mut terminal = lock_unpoison(&self.engine_terminal);
+        if terminal.is_none() {
+            *terminal = Some(outcome.clone());
+        }
     }
 
     pub(super) fn is_retired(&self) -> bool {
@@ -232,6 +246,7 @@ impl SessionConnection {
             if let Some(outcome) = self.close.outcome() {
                 return outcome.into_result();
             }
+
             if let Some(manager) = self.manager.upgrade()
                 && let Some(outcome) = manager.engine_outcome()
             {
@@ -239,6 +254,12 @@ impl SessionConnection {
             }
             notified.await;
         }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(super) fn transition_to_error_for_test(&self) -> Result<()> {
+        let manager = self.manager.upgrade().ok_or(Error::DriverShutdown)?;
+        manager.transition_connection_to_error_token(self.token)
     }
 }
 
@@ -387,11 +408,20 @@ impl SessionManager {
         connection.transition_to_error_once(&self.lifecycle_authority)
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn transition_connection_to_error_token(&self, token: ConnectionToken) -> Result<()> {
+        let Lookup::Occupied(connection) = self.connections.lookup(token) else {
+            return Err(Error::TransportClosed);
+        };
+        self.transition_connection_to_error(&connection).map(|_| ())
+    }
+
     pub(super) fn finalize_connection_engine(
         &self,
         connection: &ConnectionState,
         outcome: &super::lifecycle::MemoizedTerminalResult,
     ) -> Option<super::io::PendingIoEvent> {
+        connection.close_state().record_engine_terminal(outcome);
         connection.finalize_engine(&self.lifecycle_authority, outcome)
     }
 
@@ -401,6 +431,13 @@ impl SessionManager {
         lifecycle: &std::sync::MutexGuard<'_, ()>,
     ) -> Result<Option<SharedCmId>> {
         connection.destroy_connection_resources(&self.lifecycle_authority, lifecycle)
+    }
+
+    pub(super) fn destroy_unregistered_connection(
+        &self,
+        connection: &VerbsConnectionResources,
+    ) -> Result<(Option<SharedCmId>, bool)> {
+        connection.destroy_unregistered_for_session(&self.lifecycle_authority)
     }
 
     #[cfg(test)]
@@ -694,13 +731,15 @@ impl Deref for SessionManager {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Weak};
     use std::time::Duration;
 
     use super::super::connection::{WorkRequestPoster, install_connection};
     use super::super::listener::{ListenerState, RdmaListener};
+    use super::super::registry::{ConnectionToken, lock_unpoison};
     use super::super::scheduler::DeadlineKind;
     use super::super::{CompletionMode, RdmaConnectionConfig, test_engine_pair};
+    use super::{SessionCloseState, SessionConnection};
     use crate::v2::error::{Error, Result};
     use crate::v2::qp::{BatchPostOutcome, QpCapabilities};
     use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
@@ -815,6 +854,30 @@ mod tests {
         assert!(matches!(
             capability.close.outcome().unwrap().into_result(),
             Err(Error::TransportClosed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn session_connection_close_observes_engine_terminal_without_manager_owner() {
+        let close = SessionCloseState::new();
+        *lock_unpoison(&close.outcome) = Some(
+            super::super::lifecycle::MemoizedTerminalResult::from_error(Error::TransportClosed),
+        );
+        close.record_engine_terminal(
+            &super::super::lifecycle::MemoizedTerminalResult::from_error(Error::DriverShutdown),
+        );
+        let capability = SessionConnection {
+            manager: Weak::new(),
+            token: ConnectionToken {
+                slot: 0,
+                generation: 1,
+            },
+            close,
+        };
+
+        assert!(matches!(
+            capability.close().await,
+            Err(Error::DriverShutdown)
         ));
     }
 

@@ -205,7 +205,7 @@ impl RdmaConnection {
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn transition_to_error_for_test(&self) -> Result<()> {
-        self.require_session_state()?.poster.to_error()
+        self.session.transition_to_error_for_test()
     }
 
     #[cfg(test)]
@@ -1277,6 +1277,13 @@ impl VerbsConnectionResources {
             capabilities,
             cm_owner: Mutex::new(Some(ConnectionCmOwner::Shared { cm_id })),
         }
+    }
+
+    pub(super) fn destroy_unregistered_for_session(
+        &self,
+        _authority: &SessionLifecycleAuthority,
+    ) -> Result<(Option<SharedCmId>, bool)> {
+        <Self as WorkRequestPoster>::destroy_connection(self, true)
     }
 
     pub(super) fn connect(&self, param: &ConnParam) -> Result<()> {

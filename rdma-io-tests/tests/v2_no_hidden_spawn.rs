@@ -143,6 +143,48 @@ fn find_forbidden_production_dependencies(
     Ok(visitor.violations)
 }
 
+struct LifecycleCallVisitor<'a> {
+    methods: &'a HashSet<&'a str>,
+    violations: Vec<String>,
+}
+
+impl<'ast> Visit<'ast> for LifecycleCallVisitor<'_> {
+    fn visit_item(&mut self, item: &'ast Item) {
+        if !is_test_only(item_attrs(item)) {
+            visit::visit_item(self, item);
+        }
+    }
+
+    fn visit_impl_item(&mut self, item: &'ast ImplItem) {
+        if !is_test_only(impl_item_attrs(item)) {
+            visit::visit_impl_item(self, item);
+        }
+    }
+
+    fn visit_expr_method_call(&mut self, call: &'ast ExprMethodCall) {
+        let method = call.method.to_string();
+        if self.methods.contains(method.as_str()) {
+            self.violations
+                .push(format!("{method}:{}", call.span().start().line));
+        }
+        visit::visit_expr_method_call(self, call);
+    }
+}
+
+fn find_production_lifecycle_calls(
+    source: &str,
+    methods: &[&str],
+) -> Result<Vec<String>, syn::Error> {
+    let syntax = syn::parse_file(source)?;
+    let methods = methods.iter().copied().collect::<HashSet<_>>();
+    let mut visitor = LifecycleCallVisitor {
+        methods: &methods,
+        violations: Vec::new(),
+    };
+    visitor.visit_file(&syntax);
+    Ok(visitor.violations)
+}
+
 fn find_strong_owner_fields(
     source: &str,
     struct_name: &str,
@@ -1120,6 +1162,31 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
             "fn transition_to_error_once(\n        &self,\n        _authority: &SessionLifecycleAuthority,"
         ),
         "QP destroy and error transition must require SessionManager lifecycle authority"
+    );
+    let engine_dir = v2_dir.join("engine");
+    for path in collect_rs_files(&engine_dir).expect("enumerate engine sources") {
+        if path == connection_path {
+            continue;
+        }
+        let source = fs::read_to_string(&path).expect("read engine source");
+        let calls = find_production_lifecycle_calls(
+            &source,
+            &["to_error", "destroy_qp", "destroy_connection"],
+        )
+        .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
+        assert!(
+            calls.is_empty(),
+            "{} bypasses SessionManager lifecycle authority: {}",
+            path.display(),
+            calls.join(", ")
+        );
+    }
+    assert!(
+        connection_source.contains(
+            "transition_to_error_for_test(&self) -> Result<()> {\n        self.session.transition_to_error_for_test()"
+        ) && cm_source.matches("destroy_unregistered_connection(&verbs)").count() == 2
+            && !cm_source.contains(".destroy_connection(true)"),
+        "test hooks and setup rollback must route provider-visible lifecycle work through SessionManager"
     );
     assert!(
         !fs::read_to_string(&io_core_operation_path)
