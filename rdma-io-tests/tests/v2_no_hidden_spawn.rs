@@ -146,6 +146,7 @@ fn find_forbidden_production_dependencies(
 struct LifecycleCallVisitor<'a> {
     methods: &'a HashSet<&'a str>,
     violations: Vec<String>,
+    functions: Vec<String>,
 }
 
 impl<'ast> Visit<'ast> for LifecycleCallVisitor<'_> {
@@ -164,8 +165,11 @@ impl<'ast> Visit<'ast> for LifecycleCallVisitor<'_> {
     fn visit_expr_method_call(&mut self, call: &'ast ExprMethodCall) {
         let method = call.method.to_string();
         if self.methods.contains(method.as_str()) {
-            self.violations
-                .push(format!("{method}:{}", call.span().start().line));
+            self.violations.push(format!(
+                "{method}:{}:{}",
+                self.functions.last().map_or("<unknown>", String::as_str),
+                call.span().start().line
+            ));
         }
         visit::visit_expr_method_call(self, call);
     }
@@ -176,11 +180,41 @@ impl<'ast> Visit<'ast> for LifecycleCallVisitor<'_> {
         {
             let method = segment.ident.to_string();
             if self.methods.contains(method.as_str()) {
-                self.violations
-                    .push(format!("{method}:{}", call.span().start().line));
+                self.violations.push(format!(
+                    "{method}:{}:{}",
+                    self.functions.last().map_or("<unknown>", String::as_str),
+                    call.span().start().line
+                ));
             }
         }
         visit::visit_expr_call(self, call);
+    }
+
+    fn visit_item_fn(&mut self, function: &'ast syn::ItemFn) {
+        if is_test_only(&function.attrs) {
+            return;
+        }
+        self.functions.push(function.sig.ident.to_string());
+        visit::visit_item_fn(self, function);
+        self.functions.pop();
+    }
+
+    fn visit_impl_item_fn(&mut self, function: &'ast syn::ImplItemFn) {
+        if is_test_only(&function.attrs) {
+            return;
+        }
+        self.functions.push(function.sig.ident.to_string());
+        visit::visit_impl_item_fn(self, function);
+        self.functions.pop();
+    }
+
+    fn visit_trait_item_fn(&mut self, function: &'ast syn::TraitItemFn) {
+        if is_test_only(&function.attrs) {
+            return;
+        }
+        self.functions.push(function.sig.ident.to_string());
+        visit::visit_trait_item_fn(self, function);
+        self.functions.pop();
     }
 }
 
@@ -193,6 +227,7 @@ fn find_production_lifecycle_calls(
     let mut visitor = LifecycleCallVisitor {
         methods: &methods,
         violations: Vec::new(),
+        functions: Vec::new(),
     };
     visitor.visit_file(&syntax);
     Ok(visitor.violations)
@@ -1210,15 +1245,26 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     );
     let engine_dir = v2_dir.join("engine");
     for path in collect_rs_files(&engine_dir).expect("enumerate engine sources") {
-        if path == connection_path {
-            continue;
-        }
         let source = fs::read_to_string(&path).expect("read engine source");
-        let calls = find_production_lifecycle_calls(
+        let mut calls = find_production_lifecycle_calls(
             &source,
             &["to_error", "destroy_qp", "destroy_connection"],
         )
         .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
+        if path == connection_path {
+            let authorized_adapters = [
+                "transition_to_error_once",
+                "destroy_connection_resources",
+                "destroy_qp_for_session",
+                "destroy_unregistered_for_session",
+                "to_error",
+                "destroy_connection",
+            ];
+            calls.retain(|call| {
+                let function = call.split(':').nth(1).unwrap_or("<unknown>");
+                !authorized_adapters.contains(&function)
+            });
+        }
         assert!(
             calls.is_empty(),
             "{} bypasses SessionManager lifecycle authority: {}",
@@ -1233,6 +1279,22 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
             && !cm_source.contains(".destroy_connection(true)"),
         "test hooks and setup rollback must route provider-visible lifecycle work through SessionManager"
     );
+    for authorized in [
+        "transition_to_error_once",
+        "destroy_connection_resources",
+        "destroy_qp_for_session",
+        "destroy_unregistered_for_session",
+    ] {
+        let signature = format!("fn {authorized}(");
+        let start = connection_source
+            .find(&signature)
+            .unwrap_or_else(|| panic!("locate authorized lifecycle adapter {authorized}"));
+        let declaration = &connection_source[start..connection_source.len().min(start + 260)];
+        assert!(
+            declaration.contains("SessionLifecycleAuthority"),
+            "authorized lifecycle adapter `{authorized}` must require SessionLifecycleAuthority"
+        );
+    }
     let io_core_operation_source =
         fs::read_to_string(&io_core_operation_path).expect("read I/O operation source");
     assert!(
