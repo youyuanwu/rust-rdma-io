@@ -826,28 +826,42 @@ fn provider_validation_propagates_the_cargo_job_limit() {
         .join("scripts")
         .join("validate-v2-engine-providers.sh");
     let script = fs::read_to_string(&script_path).expect("read provider validation script");
-    let cargo_commands = script
-        .lines()
-        .filter(|line| {
-            line.contains("\"$CARGO\" test")
-                || line.contains("\"$CARGO\" build")
-                || line.contains("\"$CARGO\" check")
+    let mut logical_commands = Vec::new();
+    let mut current = String::new();
+    for line in script.lines() {
+        let trimmed = line.trim();
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(trimmed.trim_end_matches('\\').trim_end());
+        if !trimmed.ends_with('\\') {
+            logical_commands.push(std::mem::take(&mut current));
+        }
+    }
+    assert!(
+        current.is_empty(),
+        "provider script ends in a continued command"
+    );
+    let cargo_commands = logical_commands
+        .iter()
+        .filter(|command| {
+            command.contains("\"$CARGO\" test")
+                || command.contains("\"$CARGO\" build")
+                || command.contains("\"$CARGO\" check")
         })
-        .count();
-    let propagated_limits = script
-        .matches("CARGO_BUILD_JOBS=\"$CARGO_BUILD_JOBS\"")
-        .count();
+        .collect::<Vec<_>>();
 
     assert!(
-        cargo_commands > 0,
+        !cargo_commands.is_empty(),
         "provider script contains no Cargo commands"
     );
-    assert_eq!(
-        propagated_limits,
-        cargo_commands,
-        "{} must explicitly propagate CARGO_BUILD_JOBS to every Cargo command",
-        script_path.display()
-    );
+    for command in cargo_commands {
+        assert!(
+            command.contains("CARGO_BUILD_JOBS=\"$CARGO_BUILD_JOBS\""),
+            "{} Cargo command omits CARGO_BUILD_JOBS propagation: {command}",
+            script_path.display()
+        );
+    }
     assert!(
         script.contains("CARGO_BUILD_JOBS=\"${CARGO_BUILD_JOBS:-2}\""),
         "{} must default provider validation to two Cargo jobs",

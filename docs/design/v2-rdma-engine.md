@@ -184,9 +184,10 @@ posting limits, operation ledgers, and a posting-only authority. That authority
 uses a weak reference to the SessionManager-owned QP resource. Production
 `RdmaConnection`, `RdmaListener`, and protocol `IoConnection` values retain
 direct I/O/immutable state plus weak opaque session capabilities and
-resource-free observers; they do not retain the shared engine,
-`ConnectionState`, `ListenerState`, QP, or CmId. Suspended connect/listen/accept
-futures likewise drop strong manager records before awaiting.
+resource-free observers; they do not strongly retain or keep alive the shared
+engine, `ConnectionState`, `ListenerState`, QP, or CmId. Suspended
+connect/listen/accept futures likewise drop strong manager records before
+awaiting.
 
 Only `SessionManager` owns `SessionLifecycleAuthority`. QP ERR transition,
 result-aware destruction, and final resource extraction require a reference to
