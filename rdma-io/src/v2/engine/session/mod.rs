@@ -28,7 +28,9 @@ use self::connection::{
 use self::listener::ListenerState;
 use self::registry::ConnectionRegistry;
 use super::driver::WorkSignal;
-use super::io_core::{IoCore, IoCoreEffects, OperationQuarantineEffect, QpReclaimCapability};
+use super::io_core::{
+    IoCore, IoCoreEffects, IoSessionBridge, OperationQuarantineEffect, QpReclaimCapability,
+};
 use super::registry::{ConnectionToken, Lookup, OperationToken, lock_unpoison};
 use super::scheduler::{DeadlineKind, DeadlineRequest};
 use super::{EngineShared, Result};
@@ -725,6 +727,30 @@ impl SessionManager {
         let mut effects = self.io_core.quarantine_operation(token);
         self.apply_io_effects(shared, &mut effects);
         effects.publish();
+    }
+}
+
+impl IoSessionBridge for SessionManager {
+    fn route_completion(&self, completion: crate::wc::WorkCompletion) -> Option<ConnectionToken> {
+        self.enqueue_completion(completion)
+    }
+
+    fn dispatch_connection_completions(
+        &self,
+        connection: ConnectionToken,
+        quantum: usize,
+    ) -> (usize, bool) {
+        let Some(shared) = self.engine() else {
+            return (0, false);
+        };
+        self.dispatch_connection_completions(&shared, connection, quantum)
+    }
+
+    fn handle_reclamation_deadline(&self, token: OperationToken) {
+        let Some(shared) = self.engine() else {
+            return;
+        };
+        self.handle_reclamation_deadline(&shared, token);
     }
 }
 

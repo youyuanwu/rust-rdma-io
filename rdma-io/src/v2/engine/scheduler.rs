@@ -9,7 +9,51 @@ use std::collections::{BinaryHeap, HashSet, VecDeque};
 
 use tokio::time::Instant;
 
+use super::progress::OwnerClass;
+
 const WORK_CLASS_COUNT: usize = 5;
+const OWNER_CLASS_COUNT: usize = 3;
+
+/// Deduplicated fair rotation over progress owners.
+#[allow(
+    dead_code,
+    reason = "introduced before driver migration in later phases"
+)]
+pub(super) struct OwnerScheduler {
+    classes: VecDeque<OwnerClass>,
+    queued: [bool; OWNER_CLASS_COUNT],
+}
+
+#[allow(
+    dead_code,
+    reason = "introduced before driver migration in later phases"
+)]
+impl OwnerScheduler {
+    pub(super) fn new() -> Self {
+        Self {
+            classes: VecDeque::with_capacity(OWNER_CLASS_COUNT),
+            queued: [false; OWNER_CLASS_COUNT],
+        }
+    }
+
+    pub(super) fn mark_ready(&mut self, class: OwnerClass) {
+        let queued = &mut self.queued[class.index()];
+        if !*queued {
+            *queued = true;
+            self.classes.push_back(class);
+        }
+    }
+
+    pub(super) fn next(&mut self) -> Option<OwnerClass> {
+        let class = self.classes.pop_front()?;
+        self.queued[class.index()] = false;
+        Some(class)
+    }
+
+    pub(super) fn ready_count(&self) -> usize {
+        self.classes.len()
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum WorkClass {
@@ -226,6 +270,23 @@ mod tests {
             slot,
             generation: 1,
         }
+    }
+
+    #[test]
+    fn owner_classes_deduplicate_and_rotate() {
+        let mut scheduler = OwnerScheduler::new();
+        scheduler.mark_ready(OwnerClass::Io);
+        scheduler.mark_ready(OwnerClass::Session);
+        scheduler.mark_ready(OwnerClass::Io);
+        scheduler.mark_ready(OwnerClass::Terminal);
+
+        assert_eq!(scheduler.ready_count(), OWNER_CLASS_COUNT);
+        assert_eq!(scheduler.next(), Some(OwnerClass::Io));
+        scheduler.mark_ready(OwnerClass::Io);
+        assert_eq!(scheduler.next(), Some(OwnerClass::Session));
+        assert_eq!(scheduler.next(), Some(OwnerClass::Terminal));
+        assert_eq!(scheduler.next(), Some(OwnerClass::Io));
+        assert_eq!(scheduler.next(), None);
     }
 
     #[test]

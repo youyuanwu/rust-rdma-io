@@ -1115,6 +1115,7 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     let io_core_mod_path = v2_dir.join("engine").join("io_core").join("mod.rs");
     let io_core_operation_path = v2_dir.join("engine").join("io_core").join("operation.rs");
     let engine_mod_path = v2_dir.join("engine").join("mod.rs");
+    let progress_path = v2_dir.join("engine").join("progress.rs");
     let connection_path = v2_dir.join("engine").join("session").join("connection.rs");
     let listener_path = v2_dir.join("engine").join("session").join("listener.rs");
     let driver_path = v2_dir.join("engine").join("driver.rs");
@@ -1142,6 +1143,53 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
             !message.contains(forbidden),
             "{} must not depend on prohibited engine internal `{forbidden}`",
             message_path.display()
+        );
+    }
+
+    // Activated incrementally as the owner-local progress migrations remove each
+    // dependency from the driver. Keeping the final assertion vocabulary together
+    // prevents later phases from weakening the intended boundary.
+    #[allow(dead_code)]
+    const FINAL_DRIVER_FORBIDDEN_IO_KNOWLEDGE: &[&str] = &[
+        "CqReadiness",
+        "cq_buffer",
+        "take_published_connection",
+        "CompletionReadyConnection",
+        "DeadlineKind::Reclamation",
+    ];
+
+    #[allow(dead_code)]
+    const FINAL_DRIVER_FORBIDDEN_SESSION_KNOWLEDGE: &[&str] = &[
+        "try_process_cm_event",
+        "service_cm_software",
+        "service_deferred_cm_destructions",
+        "handle_connection_drain_deadline",
+        "DeadlineKind::ConnectionDrain",
+        "DeadlineKind::EngineShutdown",
+    ];
+
+    #[allow(dead_code)]
+    const FINAL_DRIVER_FORBIDDEN_TERMINAL_KNOWLEDGE: &[&str] = &[
+        "pending_cm_route_count",
+        "live_connection_count",
+        "accepted_operations",
+        "begin_all_connection_close",
+        "begin_cm_shutdown",
+        ".finish(",
+    ];
+
+    #[allow(dead_code)]
+    fn assert_final_driver_boundary(path: &Path, source: &str, forbidden: &[&str]) {
+        let violations = forbidden
+            .iter()
+            .copied()
+            .filter(|needle| source.contains(needle))
+            .collect::<Vec<_>>();
+        assert!(
+            violations.is_empty(),
+            "{} retains layer-owned driver knowledge: {}",
+            path.display(),
+            violations.join(", ")
         );
     }
 
@@ -1175,6 +1223,47 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     }
 
     let engine_mod = fs::read_to_string(&engine_mod_path).expect("read engine module source");
+    let progress_source =
+        fs::read_to_string(&progress_path).expect("read owner-neutral progress source");
+    for forbidden in [
+        "ConnectionToken",
+        "OperationToken",
+        "ConnectionState",
+        "SessionManager",
+        "CmId",
+        "WorkCompletion",
+        "DeadlineKind",
+        "IoCoreEffects",
+        "IoEvent",
+    ] {
+        assert!(
+            !progress_source.contains(forbidden),
+            "{} must not expose layer-private `{forbidden}`",
+            progress_path.display()
+        );
+    }
+    for required in [
+        "units_consumed",
+        "immediate_work",
+        "next_deadline",
+        "readiness",
+        "terminal",
+        "effects",
+    ] {
+        assert!(
+            progress_source.contains(required),
+            "{} must report `{required}`",
+            progress_path.display()
+        );
+    }
+    let io_core_source =
+        fs::read_to_string(&io_core_mod_path).expect("read I/O core module source");
+    assert!(
+        io_core_source.contains("trait IoSessionBridge")
+            && io_core_source.contains("session_bridge: OnceLock<Weak<dyn IoSessionBridge>>"),
+        "{} must retain only one bind-once weak session capability",
+        io_core_mod_path.display()
+    );
     let engine_shared = engine_mod
         .split("struct EngineShared {")
         .nth(1)
@@ -1519,6 +1608,8 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         "SessionManager",
         "SessionLifecycleAuthority",
         "QpDestructionProof",
+        "ProgressReport",
+        "IoSessionBridge",
     ] {
         assert!(
             !public_reexports.contains(internal),

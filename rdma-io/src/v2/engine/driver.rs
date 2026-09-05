@@ -338,7 +338,11 @@ impl RdmaEngineDriver {
     }
 
     fn service_reclamation(&mut self) -> Result<bool> {
-        let budget = self.shared.config.reclamation_budget;
+        let budget = self
+            .shared
+            .config
+            .io_reclamation_budget
+            .saturating_add(self.shared.config.session_reclamation_budget);
         let first_quota = budget.div_ceil(2);
         let second_quota = budget / 2;
         let mut requests = if self.deadline_io_turn {

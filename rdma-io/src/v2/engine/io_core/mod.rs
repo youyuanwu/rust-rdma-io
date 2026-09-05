@@ -6,7 +6,7 @@ use std::collections::{HashSet, VecDeque};
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, Weak};
 use std::time::Duration;
 
 use super::io::{IoEventSender, IoTerminalEvent, PendingIoEvent};
@@ -52,6 +52,26 @@ pub(super) trait IoDriverSignal: Send + Sync {
     fn publish_terminal(&self);
     #[cfg(any(test, feature = "test-hooks"))]
     fn pause_operation_before_register(&self);
+}
+
+/// Narrow session capability needed by owner-local I/O progress.
+///
+/// The I/O side never receives a concrete session manager, registry, lifecycle
+/// authority, or resource bundle through this boundary.
+#[allow(
+    dead_code,
+    reason = "bound before I/O progress migrates in the next phase"
+)]
+pub(super) trait IoSessionBridge: Send + Sync {
+    fn route_completion(&self, completion: WorkCompletion) -> Option<ConnectionToken>;
+
+    fn dispatch_connection_completions(
+        &self,
+        connection: ConnectionToken,
+        quantum: usize,
+    ) -> (usize, bool);
+
+    fn handle_reclamation_deadline(&self, token: OperationToken);
 }
 
 /// Immutable session identity accepted by the operation/completion core.
@@ -326,6 +346,7 @@ pub(super) struct IoCore {
     missing_cqe_deadline: Duration,
     completion_dispatch_budget: usize,
     reclamation_requests: Mutex<VecDeque<DeadlineRequest>>,
+    session_bridge: OnceLock<Weak<dyn IoSessionBridge>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -369,9 +390,24 @@ impl IoCore {
             missing_cqe_deadline,
             completion_dispatch_budget,
             reclamation_requests: Mutex::new(VecDeque::new()),
+            session_bridge: OnceLock::new(),
         });
         let reclaim = QpReclaimCapability::new(&core);
         Ok((core, reclaim))
+    }
+
+    pub(super) fn bind_session_bridge(&self, bridge: &Arc<dyn IoSessionBridge>) {
+        self.session_bridge
+            .set(Arc::downgrade(bridge))
+            .unwrap_or_else(|_| panic!("IoCore is bound to exactly one IoSessionBridge"));
+    }
+
+    #[allow(
+        dead_code,
+        reason = "used when I/O progress migrates in the next phase"
+    )]
+    pub(super) fn session_bridge(&self) -> Option<Arc<dyn IoSessionBridge>> {
+        self.session_bridge.get().and_then(Weak::upgrade)
     }
 
     pub(super) fn admission(&self) -> RwLockReadGuard<'_, ()> {

@@ -34,6 +34,7 @@ mod driver;
 pub(crate) mod io;
 mod io_core;
 mod lifecycle;
+mod progress;
 mod registry;
 mod resources;
 mod scheduler;
@@ -63,7 +64,7 @@ pub use driver::{
     TestSharedResourceIdentity,
 };
 pub use io_core::RdmaOperation;
-use io_core::{IoCore, IoDriverSignal};
+use io_core::{IoCore, IoDriverSignal, IoSessionBridge};
 use lifecycle::MemoizedTerminalResult;
 use registry::{lock_unpoison, write_unpoison};
 use resources::{EngineResourceRefs, EngineResources};
@@ -168,9 +169,15 @@ impl RdmaEngineBuilder {
         self
     }
 
-    /// Set reclamation/deadline actions per service turn in `1..=4096`.
-    pub fn reclamation_budget(mut self, value: usize) -> Self {
-        self.config.reclamation_budget = value;
+    /// Set I/O reclamation/deadline actions per I/O service turn in `1..=4096`.
+    pub fn io_reclamation_budget(mut self, value: usize) -> Self {
+        self.config.io_reclamation_budget = value;
+        self
+    }
+
+    /// Set session reclamation/deadline actions per session turn in `1..=4096`.
+    pub fn session_reclamation_budget(mut self, value: usize) -> Self {
+        self.config.session_reclamation_budget = value;
         self
     }
 
@@ -484,6 +491,8 @@ impl EngineShared {
     fn into_shared(self) -> Arc<Self> {
         let shared = Arc::new(self);
         shared.session.bind_engine(&shared);
+        let session_bridge: Arc<dyn IoSessionBridge> = shared.session.clone();
+        shared.io_core.bind_session_bridge(&session_bridge);
         shared
     }
 

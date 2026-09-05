@@ -71,6 +71,16 @@ fn readiness_build_outside_tokio_is_contextual() {
     assert!(error.to_string().contains("Tokio"));
 }
 
+#[test]
+fn reclamation_budgets_are_owner_local() {
+    let builder = RdmaEngineBuilder::new("rxe0")
+        .io_reclamation_budget(7)
+        .session_reclamation_budget(9);
+
+    assert_eq!(builder.config.io_reclamation_budget, 7);
+    assert_eq!(builder.config.session_reclamation_budget, 9);
+}
+
 #[tokio::test]
 async fn driver_is_directly_spawnable_and_shutdown_is_idempotent() {
     let (engine, driver) = test_engine_pair(CompletionMode::Readiness);
