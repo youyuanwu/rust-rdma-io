@@ -143,6 +143,56 @@ fn find_forbidden_production_dependencies(
     Ok(visitor.violations)
 }
 
+struct LiveIoProofIssuanceVisitor {
+    locations: Vec<usize>,
+}
+
+impl<'ast> Visit<'ast> for LiveIoProofIssuanceVisitor {
+    fn visit_item(&mut self, item: &'ast Item) {
+        if !is_test_only(item_attrs(item)) {
+            visit::visit_item(self, item);
+        }
+    }
+
+    fn visit_impl_item(&mut self, item: &'ast ImplItem) {
+        if !is_test_only(impl_item_attrs(item)) {
+            visit::visit_impl_item(self, item);
+        }
+    }
+
+    fn visit_trait_item(&mut self, item: &'ast TraitItem) {
+        if !is_test_only(trait_item_attrs(item)) {
+            visit::visit_trait_item(self, item);
+        }
+    }
+
+    fn visit_foreign_item(&mut self, item: &'ast ForeignItem) {
+        if !is_test_only(foreign_item_attrs(item)) {
+            visit::visit_foreign_item(self, item);
+        }
+    }
+
+    fn visit_path(&mut self, path: &'ast syn::Path) {
+        if path
+            .segments
+            .iter()
+            .any(|segment| segment.ident == "issue_live_io_proof")
+        {
+            self.locations.push(path.span().start().line);
+        }
+        visit::visit_path(self, path);
+    }
+}
+
+fn find_live_io_proof_issuance(source: &str) -> Result<Vec<usize>, syn::Error> {
+    let syntax = syn::parse_file(source)?;
+    let mut visitor = LiveIoProofIssuanceVisitor {
+        locations: Vec::new(),
+    };
+    visitor.visit_file(&syntax);
+    Ok(visitor.locations)
+}
+
 struct LifecycleCallVisitor<'a> {
     methods: &'a HashSet<&'a str>,
     violations: Vec<String>,
@@ -826,6 +876,7 @@ fn expression_block() {
 fn dependency_detector_ignores_test_only_items_but_fails_closed_for_production() {
     let source = r#"
         use crate::EngineShared;
+        use crate::v2::engine::session::SessionManager;
 
         #[cfg(test)]
         use crate::ConnectionState;
@@ -836,10 +887,15 @@ fn dependency_detector_ignores_test_only_items_but_fails_closed_for_production()
     "#;
     let violations = find_forbidden_production_dependencies(
         source,
-        &["EngineShared", "ConnectionState", "WorkRequestPoster"],
+        &[
+            "EngineShared",
+            "ConnectionState",
+            "WorkRequestPoster",
+            "SessionManager",
+        ],
     )
     .unwrap();
-    assert_eq!(violations.len(), 2, "{violations:#?}");
+    assert_eq!(violations.len(), 3, "{violations:#?}");
     assert!(
         violations
             .iter()
@@ -849,6 +905,11 @@ fn dependency_detector_ignores_test_only_items_but_fails_closed_for_production()
         violations
             .iter()
             .any(|violation| violation.starts_with("WorkRequestPoster:"))
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.starts_with("SessionManager:"))
     );
     assert!(
         !violations
@@ -911,7 +972,12 @@ fn test_no_hidden_spawn_in_v2() {
         v2_dir.join("message_transport.rs"),
         v2_dir.join("engine").join("mod.rs"),
         v2_dir.join("engine").join("driver.rs"),
-        v2_dir.join("engine").join("session.rs"),
+        v2_dir.join("engine").join("session").join("mod.rs"),
+        v2_dir.join("engine").join("session").join("cm.rs"),
+        v2_dir.join("engine").join("session").join("connection.rs"),
+        v2_dir.join("engine").join("session").join("drain.rs"),
+        v2_dir.join("engine").join("session").join("listener.rs"),
+        v2_dir.join("engine").join("session").join("registry.rs"),
         v2_dir.join("engine").join("io_core").join("mod.rs"),
         v2_dir.join("engine").join("io_core").join("operation.rs"),
         v2_dir.join("engine").join("io.rs"),
@@ -992,6 +1058,54 @@ fn provider_validation_propagates_the_cargo_job_limit() {
 }
 
 #[test]
+fn test_live_io_proof_issuance_is_confined_to_session_registry() {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let workspace_root = Path::new(manifest_dir).parent().expect("workspace root");
+    let engine_dir = workspace_root
+        .join("rdma-io")
+        .join("src")
+        .join("v2")
+        .join("engine");
+    let issuer_path = engine_dir.join("session").join("registry.rs");
+
+    for path in collect_rs_files(&engine_dir).expect("enumerate live-I/O proof issuance sites") {
+        let source = fs::read_to_string(&path).expect("read engine source");
+        let locations =
+            find_live_io_proof_issuance(&source).expect("parse live-I/O proof issuance source");
+        if path == issuer_path {
+            assert_eq!(
+                locations.len(),
+                1,
+                "{} must contain the sole live-I/O proof issuance site",
+                path.display()
+            );
+        } else {
+            assert!(
+                locations.is_empty(),
+                "{} must not issue LiveIoConnectionProof values at lines {locations:?}",
+                path.display()
+            );
+        }
+    }
+
+    let controlled_source = r#"
+        fn forbidden_production_issuance() {
+            let _ = LiveIoConnectionProof::issue_live_io_proof(connection, qp_num);
+        }
+
+        #[cfg(test)]
+        fn allowed_test_fixture() {
+            let _ = LiveIoConnectionProof::issue_live_io_proof(connection, qp_num);
+        }
+    "#;
+    assert_eq!(
+        find_live_io_proof_issuance(controlled_source).expect("parse controlled source"),
+        vec![3],
+        "the structural guard must reject production issuance while ignoring test-only fixtures"
+    );
+}
+
+#[test]
 fn test_v2_io_boundary_dependency_direction_and_visibility() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let workspace_root = Path::new(manifest_dir).parent().expect("workspace root");
@@ -1001,11 +1115,11 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     let io_core_mod_path = v2_dir.join("engine").join("io_core").join("mod.rs");
     let io_core_operation_path = v2_dir.join("engine").join("io_core").join("operation.rs");
     let engine_mod_path = v2_dir.join("engine").join("mod.rs");
-    let connection_path = v2_dir.join("engine").join("connection.rs");
-    let listener_path = v2_dir.join("engine").join("listener.rs");
+    let connection_path = v2_dir.join("engine").join("session").join("connection.rs");
+    let listener_path = v2_dir.join("engine").join("session").join("listener.rs");
     let driver_path = v2_dir.join("engine").join("driver.rs");
-    let drain_path = v2_dir.join("engine").join("drain.rs");
-    let session_path = v2_dir.join("engine").join("session.rs");
+    let drain_path = v2_dir.join("engine").join("session").join("drain.rs");
+    let session_path = v2_dir.join("engine").join("session").join("mod.rs");
     let v2_mod_path = v2_dir.join("mod.rs");
 
     let message = fs::read_to_string(&message_path).expect("read message transport source");
@@ -1179,8 +1293,8 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
             violations.join(", ")
         );
     }
-    let cm_source =
-        fs::read_to_string(v2_dir.join("engine").join("cm.rs")).expect("read CM source");
+    let cm_source = fs::read_to_string(v2_dir.join("engine").join("session").join("cm.rs"))
+        .expect("read CM source");
     let connect_waiter_violations = find_strong_owner_fields(
         &cm_source,
         "ConnectWaiter",
@@ -1356,18 +1470,33 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         );
     }
 
-    for fixed_path in ["cm.rs", "listener.rs", "connection.rs", "drain.rs"] {
+    for relocated in [
+        "mod.rs",
+        "cm.rs",
+        "connection.rs",
+        "drain.rs",
+        "listener.rs",
+        "registry.rs",
+    ] {
         assert!(
-            v2_dir.join("engine").join(fixed_path).is_file(),
-            "session milestone must keep engine/{fixed_path} at its current path"
-        );
-        assert!(
-            !v2_dir
+            v2_dir
                 .join("engine")
                 .join("session")
-                .join(fixed_path)
-                .exists(),
-            "session milestone must defer physical relocation of {fixed_path}"
+                .join(relocated)
+                .is_file(),
+            "session relocation requires engine/session/{relocated}"
+        );
+    }
+    for obsolete in [
+        "session.rs",
+        "cm.rs",
+        "connection.rs",
+        "drain.rs",
+        "listener.rs",
+    ] {
+        assert!(
+            !v2_dir.join("engine").join(obsolete).exists(),
+            "session relocation must remove obsolete engine/{obsolete}"
         );
     }
 

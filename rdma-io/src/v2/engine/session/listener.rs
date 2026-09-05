@@ -8,24 +8,26 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 
+use super::super::io::{IoConnection, IoEventReceiver};
+use super::super::lifecycle::{MemoizedTerminalResult, TakeOnceResult};
+use super::super::registry::{lock_unpoison, read_unpoison};
+use super::super::{
+    ConnectionSetup, EngineShared, RdmaConnection, RdmaConnectionConfig, SetupSummary,
+};
 use super::connection::{ConnectionReservation, SharedCmId};
-use super::io::{IoConnection, IoEventReceiver};
-use super::lifecycle::{MemoizedTerminalResult, TakeOnceResult};
-use super::registry::{lock_unpoison, read_unpoison};
-use super::session::{SessionListener, SessionListenerCloseState};
-use super::{ConnectionSetup, EngineShared, RdmaConnection, RdmaConnectionConfig, SetupSummary};
+use super::{SessionListener, SessionListenerCloseState};
 use crate::v2::error::{Error, Result};
 use futures_util::task::AtomicWaker;
 
 pub(crate) const DEFAULT_LISTENER_BACKLOG: usize = 128;
 const MAX_LISTENER_BACKLOG: usize = 4_096;
-pub(super) const KERNEL_LISTEN_BACKLOG_REQUEST: i32 = i32::MAX;
+pub(in crate::v2::engine) const KERNEL_LISTEN_BACKLOG_REQUEST: i32 = i32::MAX;
 
 /// Configuration for one engine-owned listener.
 ///
 /// The configurable backlog is a userspace queue limit, not the kernel
 /// `rdma_listen` backlog. It must be in `1..=4096` when
-/// [`RdmaEngine::listen`](super::RdmaEngine::listen) is called. The engine
+/// [`RdmaEngine::listen`](super::super::RdmaEngine::listen) is called. The engine
 /// independently requests `i32::MAX` from `rdma_listen`; a provider or kernel
 /// may clamp that request, or may refuse it before any child reaches the
 /// userspace queue.
@@ -60,7 +62,7 @@ impl RdmaListenerConfig {
         self.backlog
     }
 
-    pub(super) fn validate(&self) -> Result<()> {
+    pub(in crate::v2::engine) fn validate(&self) -> Result<()> {
         if !(1..=MAX_LISTENER_BACKLOG).contains(&self.backlog) {
             return Err(Error::InvalidConfig(format!(
                 "listener backlog {} is outside 1..={MAX_LISTENER_BACKLOG}",
@@ -156,7 +158,10 @@ impl RdmaListener {
         self.session.close().await
     }
 
-    pub(super) fn from_state(shared: &Arc<EngineShared>, state: Arc<ListenerState>) -> Self {
+    pub(in crate::v2::engine) fn from_state(
+        shared: &Arc<EngineShared>,
+        state: Arc<ListenerState>,
+    ) -> Self {
         Self {
             session: shared.session.listener_capability(&state),
         }
@@ -171,7 +176,7 @@ impl Drop for RdmaListener {
     }
 }
 
-pub(super) async fn listen(
+pub(in crate::v2::engine) async fn listen(
     shared: Arc<EngineShared>,
     address: SocketAddr,
     config: RdmaListenerConfig,
@@ -196,7 +201,7 @@ pub(super) async fn listen(
     waiter.await
 }
 
-pub(super) async fn accept_with_setup(
+pub(in crate::v2::engine) async fn accept_with_setup(
     shared: Arc<EngineShared>,
     listener: Arc<ListenerState>,
     config: RdmaConnectionConfig,
@@ -225,11 +230,11 @@ pub(super) async fn accept_with_setup(
     waiter.await
 }
 
-pub(super) fn empty_connection_setup() -> ConnectionSetup {
+pub(in crate::v2::engine) fn empty_connection_setup() -> ConnectionSetup {
     Box::new(|_connection, _events| Ok(0))
 }
 
-pub(super) fn run_setup_before_establish(
+pub(in crate::v2::engine) fn run_setup_before_establish(
     setup: ConnectionSetup,
     connection: &RdmaConnection,
     before_establish: impl FnOnce() -> Result<()>,
@@ -256,7 +261,7 @@ pub(super) fn run_setup_before_establish(
     Ok(summary)
 }
 
-pub(super) struct AcceptIntent {
+pub(in crate::v2::engine) struct AcceptIntent {
     config: RdmaConnectionConfig,
     setup: Option<ConnectionSetup>,
 }
@@ -269,7 +274,9 @@ impl AcceptIntent {
         }
     }
 
-    pub(super) fn into_parts(mut self) -> Result<(RdmaConnectionConfig, ConnectionSetup)> {
+    pub(in crate::v2::engine) fn into_parts(
+        mut self,
+    ) -> Result<(RdmaConnectionConfig, ConnectionSetup)> {
         let setup = self.setup.take().ok_or_else(|| {
             Error::InvalidConfig("accept setup was consumed more than once".into())
         })?;
@@ -277,20 +284,25 @@ impl AcceptIntent {
     }
 }
 
-pub(super) struct IncomingChild {
-    pub(super) cm_id: Option<SharedCmId>,
-    pub(super) reservation: Option<ConnectionReservation>,
+pub(in crate::v2::engine) struct IncomingChild {
+    pub(in crate::v2::engine) cm_id: Option<SharedCmId>,
+    pub(in crate::v2::engine) reservation: Option<ConnectionReservation>,
 }
 
 impl IncomingChild {
-    pub(super) fn new(cm_id: SharedCmId, reservation: ConnectionReservation) -> Self {
+    pub(in crate::v2::engine) fn new(
+        cm_id: SharedCmId,
+        reservation: ConnectionReservation,
+    ) -> Self {
         Self {
             cm_id: Some(cm_id),
             reservation: Some(reservation),
         }
     }
 
-    pub(super) fn into_resources(mut self) -> Result<(SharedCmId, ConnectionReservation)> {
+    pub(in crate::v2::engine) fn into_resources(
+        mut self,
+    ) -> Result<(SharedCmId, ConnectionReservation)> {
         let cm_id = self
             .cm_id
             .take()
@@ -302,7 +314,7 @@ impl IncomingChild {
     }
 
     #[cfg(test)]
-    pub(super) fn test_only() -> Self {
+    pub(in crate::v2::engine) fn test_only() -> Self {
         Self {
             cm_id: None,
             reservation: None,
@@ -310,9 +322,9 @@ impl IncomingChild {
     }
 }
 
-pub(super) struct ListenRequest {
-    pub(super) address: SocketAddr,
-    pub(super) config: RdmaListenerConfig,
+pub(in crate::v2::engine) struct ListenRequest {
+    pub(in crate::v2::engine) address: SocketAddr,
+    pub(in crate::v2::engine) config: RdmaListenerConfig,
     observer: Arc<ListenRequestObserver>,
 }
 
@@ -335,11 +347,11 @@ impl ListenRequest {
         }
     }
 
-    pub(super) fn is_cancelled(&self) -> bool {
+    pub(in crate::v2::engine) fn is_cancelled(&self) -> bool {
         self.observer.cancelled.load(Ordering::Acquire)
     }
 
-    pub(super) fn complete(&self, result: Result<RdmaListener>) {
+    pub(in crate::v2::engine) fn complete(&self, result: Result<RdmaListener>) {
         let mut current = lock_unpoison(&self.observer.result);
         if matches!(&*current, TakeOnceResult::Pending) {
             *current = TakeOnceResult::Ready(result);
@@ -419,7 +431,7 @@ impl Drop for ListenWaiter {
     }
 }
 
-pub(super) struct AcceptRequest {
+pub(in crate::v2::engine) struct AcceptRequest {
     intent: Mutex<Option<AcceptIntent>>,
     observer: Arc<AcceptRequestObserver>,
     route_token: AtomicU64,
@@ -447,34 +459,34 @@ impl AcceptRequest {
     }
 
     #[cfg(test)]
-    pub(super) fn test_only() -> Arc<Self> {
+    pub(in crate::v2::engine) fn test_only() -> Arc<Self> {
         Arc::new(Self::new(AcceptIntent::new(
             RdmaConnectionConfig::default(),
             empty_connection_setup(),
         )))
     }
 
-    pub(super) fn take_intent(&self) -> Option<AcceptIntent> {
+    pub(in crate::v2::engine) fn take_intent(&self) -> Option<AcceptIntent> {
         lock_unpoison(&self.intent).take()
     }
 
-    pub(super) fn is_cancelled(&self) -> bool {
+    pub(in crate::v2::engine) fn is_cancelled(&self) -> bool {
         self.observer.cancelled.load(Ordering::Acquire)
     }
 
-    pub(super) fn set_route_token(&self, token: u64) {
+    pub(in crate::v2::engine) fn set_route_token(&self, token: u64) {
         self.route_token.store(token, Ordering::Release);
     }
 
-    pub(super) fn route_token(&self) -> u64 {
+    pub(in crate::v2::engine) fn route_token(&self) -> u64 {
         self.route_token.load(Ordering::Acquire)
     }
 
-    pub(super) fn is_delivered(&self) -> bool {
+    pub(in crate::v2::engine) fn is_delivered(&self) -> bool {
         self.observer.delivered.load(Ordering::Acquire)
     }
 
-    pub(super) fn complete(&self, result: Result<RdmaConnection>) {
+    pub(in crate::v2::engine) fn complete(&self, result: Result<RdmaConnection>) {
         let mut current = lock_unpoison(&self.observer.result);
         if matches!(&*current, TakeOnceResult::Pending) {
             *current = TakeOnceResult::Ready(result);
@@ -483,7 +495,7 @@ impl AcceptRequest {
         }
     }
 
-    pub(super) fn complete_success(&self, connection: RdmaConnection) {
+    pub(in crate::v2::engine) fn complete_success(&self, connection: RdmaConnection) {
         let mut current = lock_unpoison(&self.observer.result);
         if self.observer.cancelled.load(Ordering::Acquire)
             || !matches!(&*current, TakeOnceResult::Pending)
@@ -497,7 +509,7 @@ impl AcceptRequest {
         self.observer.waker.wake();
     }
 
-    pub(super) fn fail_undelivered(&self, error: Error) -> bool {
+    pub(in crate::v2::engine) fn fail_undelivered(&self, error: Error) -> bool {
         let mut current = lock_unpoison(&self.observer.result);
         let replacement = match std::mem::replace(&mut *current, TakeOnceResult::Taken) {
             TakeOnceResult::Pending | TakeOnceResult::Ready(Ok(_)) => {
@@ -518,7 +530,7 @@ impl AcceptRequest {
     }
 
     #[cfg(test)]
-    pub(super) fn take_result_for_test(&self) -> Option<Result<RdmaConnection>> {
+    pub(in crate::v2::engine) fn take_result_for_test(&self) -> Option<Result<RdmaConnection>> {
         self.observer.take_result()
     }
 }
@@ -631,11 +643,11 @@ impl Drop for AcceptWaiter {
     }
 }
 
-pub(super) struct ListenerState {
-    pub(super) token: u64,
-    pub(super) local_addr: SocketAddr,
-    pub(super) backlog: usize,
-    pub(super) cm_id: Mutex<Option<SharedCmId>>,
+pub(in crate::v2::engine) struct ListenerState {
+    pub(in crate::v2::engine) token: u64,
+    pub(in crate::v2::engine) local_addr: SocketAddr,
+    pub(in crate::v2::engine) backlog: usize,
+    pub(in crate::v2::engine) cm_id: Mutex<Option<SharedCmId>>,
     queues: Mutex<ListenerQueues>,
     closing: AtomicBool,
     finalization_started: AtomicBool,
@@ -645,7 +657,7 @@ pub(super) struct ListenerState {
 }
 
 impl ListenerState {
-    pub(super) fn new(
+    pub(in crate::v2::engine) fn new(
         token: u64,
         local_addr: SocketAddr,
         config: RdmaListenerConfig,
@@ -666,7 +678,7 @@ impl ListenerState {
     }
 
     #[cfg(test)]
-    pub(super) fn test_only(backlog: usize) -> Arc<Self> {
+    pub(in crate::v2::engine) fn test_only(backlog: usize) -> Arc<Self> {
         Arc::new(Self {
             token: 1,
             local_addr: "127.0.0.1:1".parse().unwrap(),
@@ -685,7 +697,7 @@ impl ListenerState {
         lock_unpoison(&self.queues)
     }
 
-    pub(super) fn register_waiter(&self, request: Arc<AcceptRequest>) -> Result<()> {
+    pub(in crate::v2::engine) fn register_waiter(&self, request: Arc<AcceptRequest>) -> Result<()> {
         if self.closing.load(Ordering::Acquire) {
             return Err(self.close_error());
         }
@@ -698,7 +710,7 @@ impl ListenerState {
         Ok(())
     }
 
-    pub(super) fn admit_child(&self, child: IncomingChild) -> ChildAdmission {
+    pub(in crate::v2::engine) fn admit_child(&self, child: IncomingChild) -> ChildAdmission {
         let mut queues = self.lock_queues();
         let mut cancelled = Vec::new();
         while queues
@@ -737,7 +749,7 @@ impl ListenerState {
         }
     }
 
-    pub(super) fn next_action(&self) -> ListenerAction {
+    pub(in crate::v2::engine) fn next_action(&self) -> ListenerAction {
         let mut queues = self.lock_queues();
         if let Some(position) = queues
             .waiters
@@ -824,7 +836,11 @@ impl ListenerState {
         }
     }
 
-    pub(super) fn route_selected(&self, request: &Arc<AcceptRequest>, route: u64) -> Result<()> {
+    pub(in crate::v2::engine) fn route_selected(
+        &self,
+        request: &Arc<AcceptRequest>,
+        route: u64,
+    ) -> Result<()> {
         let mut queues = self.lock_queues();
         match queues.selected.take() {
             Some(SelectedAccept::Processing { request: current })
@@ -849,7 +865,10 @@ impl ListenerState {
         }
     }
 
-    pub(super) fn finish_selected_request(&self, request: &Arc<AcceptRequest>) -> bool {
+    pub(in crate::v2::engine) fn finish_selected_request(
+        &self,
+        request: &Arc<AcceptRequest>,
+    ) -> bool {
         let mut queues = self.lock_queues();
         let matches = match queues.selected.as_ref() {
             Some(SelectedAccept::Processing { request: current })
@@ -868,7 +887,7 @@ impl ListenerState {
         matches
     }
 
-    pub(super) fn finish_selected_route(&self, route: u64) -> bool {
+    pub(in crate::v2::engine) fn finish_selected_route(&self, route: u64) -> bool {
         let mut queues = self.lock_queues();
         let matches = matches!(
             queues.selected.as_ref(),
@@ -883,14 +902,14 @@ impl ListenerState {
         matches
     }
 
-    pub(super) fn request_close(self: &Arc<Self>, shared: &Arc<EngineShared>) {
+    pub(in crate::v2::engine) fn request_close(self: &Arc<Self>, shared: &Arc<EngineShared>) {
         if !self.closing.swap(true, Ordering::AcqRel) {
             shared.session.cm.enqueue_listener_work(self);
             shared.work_signal.publish(super::cm::CM_WORK);
         }
     }
 
-    pub(super) fn fail(self: &Arc<Self>, shared: &Arc<EngineShared>, error: Error) {
+    pub(in crate::v2::engine) fn fail(self: &Arc<Self>, shared: &Arc<EngineShared>, error: Error) {
         let mut failure = lock_unpoison(&self.failure);
         if failure.is_none() {
             *failure = Some(error);
@@ -899,25 +918,25 @@ impl ListenerState {
         self.request_close(shared);
     }
 
-    pub(super) fn close_error(&self) -> Error {
+    pub(in crate::v2::engine) fn close_error(&self) -> Error {
         lock_unpoison(&self.failure)
             .clone()
             .unwrap_or(Error::TransportClosed)
     }
 
-    pub(super) fn is_closing(&self) -> bool {
+    pub(in crate::v2::engine) fn is_closing(&self) -> bool {
         self.closing.load(Ordering::Acquire)
     }
 
-    pub(super) fn begin_work(&self) {
+    pub(in crate::v2::engine) fn begin_work(&self) {
         self.work_enqueued.store(false, Ordering::Release);
     }
 
-    pub(super) fn try_enqueue_work(&self) -> bool {
+    pub(in crate::v2::engine) fn try_enqueue_work(&self) -> bool {
         !self.work_enqueued.swap(true, Ordering::AcqRel)
     }
 
-    pub(super) fn has_work(&self) -> bool {
+    pub(in crate::v2::engine) fn has_work(&self) -> bool {
         let queues = self.lock_queues();
         if self.closing.load(Ordering::Acquire) {
             return !queues.waiters.is_empty()
@@ -948,11 +967,11 @@ impl ListenerState {
                 && !queues.children.is_empty())
     }
 
-    pub(super) fn take_cm_id(&self) -> Option<SharedCmId> {
+    pub(in crate::v2::engine) fn take_cm_id(&self) -> Option<SharedCmId> {
         lock_unpoison(&self.cm_id).take()
     }
 
-    pub(super) fn finish_close(&self, error: Option<Error>) {
+    pub(in crate::v2::engine) fn finish_close(&self, error: Option<Error>) {
         let failure = error.or_else(|| lock_unpoison(&self.failure).clone());
         self.close.store_if_empty(match failure {
             Some(error) => MemoizedTerminalResult::from_error(error),
@@ -961,7 +980,7 @@ impl ListenerState {
         self.close.notify_waiters();
     }
 
-    pub(super) fn terminalize(&self, outcome: &MemoizedTerminalResult) {
+    pub(in crate::v2::engine) fn terminalize(&self, outcome: &MemoizedTerminalResult) {
         self.closing.store(true, Ordering::Release);
         {
             self.close.store_if_empty(outcome.clone());
@@ -997,7 +1016,7 @@ impl ListenerState {
         self.close.notify_waiters();
     }
 
-    pub(super) fn close_state(&self) -> Arc<SessionListenerCloseState> {
+    pub(in crate::v2::engine) fn close_state(&self) -> Arc<SessionListenerCloseState> {
         Arc::clone(&self.close)
     }
 }
@@ -1042,12 +1061,12 @@ enum SelectedAccept {
     },
 }
 
-pub(super) struct ChildAdmission {
-    pub(super) cancelled: Vec<Arc<AcceptRequest>>,
-    pub(super) rejected: Option<(IncomingChild, InboundRejectReason)>,
+pub(in crate::v2::engine) struct ChildAdmission {
+    pub(in crate::v2::engine) cancelled: Vec<Arc<AcceptRequest>>,
+    pub(in crate::v2::engine) rejected: Option<(IncomingChild, InboundRejectReason)>,
 }
 
-pub(super) enum ListenerAction {
+pub(in crate::v2::engine) enum ListenerAction {
     CancelledBeforeSelection(Arc<AcceptRequest>),
     FailUnselected(Arc<AcceptRequest>),
     RejectChild(IncomingChild, InboundRejectReason),
@@ -1069,7 +1088,7 @@ pub(super) enum ListenerAction {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum InboundRejectReason {
+pub(in crate::v2::engine) enum InboundRejectReason {
     BacklogFull,
     ConnectionCapacity,
     AdmissionClosed,
@@ -1113,7 +1132,7 @@ mod tests {
     #[test]
     fn pending_listen_and_accept_futures_release_strong_session_owners() {
         let (engine, _driver) =
-            super::super::test_engine_pair(super::super::CompletionMode::Polling);
+            super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
         let baseline_engine_owners = Arc::strong_count(&engine.shared);
         let mut listen_future = Box::pin(listen(
             Arc::clone(&engine.shared),
@@ -1235,7 +1254,7 @@ mod tests {
     #[test]
     fn delivered_accept_defensively_releases_selection_after_route_retirement() {
         let (engine, driver) =
-            super::super::test_engine_pair(super::super::CompletionMode::Polling);
+            super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
         let listener = ListenerState::test_only(1);
         let request = request();
         listener.register_waiter(Arc::clone(&request)).unwrap();

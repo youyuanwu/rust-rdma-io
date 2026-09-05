@@ -28,16 +28,12 @@
 //! See the crate repository's `docs/design/v2-rdma-engine.md` for the complete
 //! architecture, configuration table, wakeup proof, and provider procedure.
 
-mod cm;
 mod config;
-mod connection;
 mod diagnostics;
-mod drain;
 mod driver;
 pub(crate) mod io;
 mod io_core;
 mod lifecycle;
-mod listener;
 mod registry;
 mod resources;
 mod scheduler;
@@ -56,7 +52,6 @@ use tokio::sync::Notify;
 
 use config::EngineConfig;
 pub use config::{CompletionMode, RdmaConnectionConfig};
-pub use connection::{RdmaConnection, RdmaConnectionIdentity};
 pub use diagnostics::{RdmaEngineDiagnostics, RdmaEngineLifecycle, RdmaEngineTerminalError};
 use driver::WorkSignal;
 #[cfg(any(test, feature = "test-hooks"))]
@@ -70,12 +65,13 @@ pub use driver::{
 pub use io_core::RdmaOperation;
 use io_core::{IoCore, IoDriverSignal};
 use lifecycle::MemoizedTerminalResult;
-pub use listener::{RdmaListener, RdmaListenerConfig};
 use registry::{lock_unpoison, write_unpoison};
 use resources::{EngineResourceRefs, EngineResources};
 use scheduler::DeadlineKind;
 use scheduler::WorkScheduler;
 use session::SessionManager;
+pub use session::connection::{RdmaConnection, RdmaConnectionIdentity};
+pub use session::listener::{RdmaListener, RdmaListenerConfig};
 
 use super::error::{Error, Result};
 
@@ -294,7 +290,7 @@ impl RdmaEngine {
     /// infinite RNR retry, a peer's early send can wait until the application
     /// posts a receive.
     pub async fn connect(&self, address: std::net::SocketAddr) -> Result<RdmaConnection> {
-        cm::connect(
+        session::cm::connect(
             Arc::clone(&self.shared),
             address,
             RdmaConnectionConfig::default(),
@@ -312,7 +308,7 @@ impl RdmaEngine {
         address: std::net::SocketAddr,
         config: RdmaConnectionConfig,
     ) -> Result<RdmaConnection> {
-        cm::connect(Arc::clone(&self.shared), address, config).await
+        session::cm::connect(Arc::clone(&self.shared), address, config).await
     }
 
     pub(crate) async fn connect_with_io_setup<F>(
@@ -324,7 +320,8 @@ impl RdmaEngine {
     where
         F: FnOnce(io::IoConnection, io::IoEventReceiver) -> Result<usize> + Send + 'static,
     {
-        cm::connect_with_setup(Arc::clone(&self.shared), address, config, Box::new(setup)).await
+        session::cm::connect_with_setup(Arc::clone(&self.shared), address, config, Box::new(setup))
+            .await
     }
 
     pub(crate) fn validate_message_connection_config(
@@ -347,7 +344,7 @@ impl RdmaEngine {
         address: std::net::SocketAddr,
         config: RdmaListenerConfig,
     ) -> Result<RdmaListener> {
-        listener::listen(Arc::clone(&self.shared), address, config).await
+        session::listener::listen(Arc::clone(&self.shared), address, config).await
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -784,7 +781,7 @@ impl EngineShared {
     pub(super) fn reclaim_after_qp_destroy(
         &self,
         proof: &session::QpDestructionProof,
-        connection: &connection::ConnectionState,
+        connection: &session::connection::ConnectionState,
         token: registry::OperationToken,
     ) -> bool {
         self.session

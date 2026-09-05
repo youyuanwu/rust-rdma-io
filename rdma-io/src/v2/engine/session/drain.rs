@@ -3,11 +3,12 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use super::super::EngineShared;
+use super::super::lifecycle::MemoizedTerminalResult;
+use super::super::registry::{ConnectionToken, Lookup, read_unpoison};
+use super::super::scheduler::DeadlineKind;
+use super::SessionManager;
 use super::connection::ConnectionState;
-use super::lifecycle::MemoizedTerminalResult;
-use super::registry::{ConnectionToken, Lookup, read_unpoison};
-use super::scheduler::DeadlineKind;
-use super::{EngineShared, SessionManager};
 
 impl SessionManager {
     pub(crate) fn begin_connection_close(
@@ -37,7 +38,9 @@ impl SessionManager {
                     return;
                 }
             }
-            shared.work_signal.publish(super::driver::CQ_RECHECK_WORK);
+            shared
+                .work_signal
+                .publish(super::super::driver::CQ_RECHECK_WORK);
 
             let engine_is_terminating = shared.shutdown_requested.load(Ordering::Acquire);
             if !engine_is_terminating {
@@ -63,7 +66,7 @@ impl SessionManager {
         }
     }
 
-    pub(super) fn begin_all_connection_close(&self, shared: &EngineShared) {
+    pub(in crate::v2::engine) fn begin_all_connection_close(&self, shared: &EngineShared) {
         if self
             .shutdown_connection_close_started
             .swap(true, Ordering::AcqRel)
@@ -75,7 +78,7 @@ impl SessionManager {
         }
     }
 
-    pub(super) fn schedule_connection_retirement(
+    pub(in crate::v2::engine) fn schedule_connection_retirement(
         &self,
         shared: &EngineShared,
         connection: &ConnectionState,
@@ -100,7 +103,7 @@ impl SessionManager {
         );
     }
 
-    pub(super) fn handle_connection_drain_deadline(
+    pub(in crate::v2::engine) fn handle_connection_drain_deadline(
         &self,
         shared: &EngineShared,
         token: ConnectionToken,
@@ -171,18 +174,21 @@ impl SessionManager {
         }
     }
 
-    pub(super) fn recover_connection_quarantine(&self, connection: &ConnectionState) {
+    pub(in crate::v2::engine) fn recover_connection_quarantine(
+        &self,
+        connection: &ConnectionState,
+    ) {
         if !connection.recover_quarantine() {
             return;
         }
         self.recover_connection_quarantine_entry(connection.token);
     }
 
-    pub(super) fn record_connection_drained(&self, connection: &ConnectionState) {
+    pub(in crate::v2::engine) fn record_connection_drained(&self, connection: &ConnectionState) {
         connection.mark_drained_once();
     }
 
-    pub(super) fn record_connection_retired(&self, connection: &ConnectionState) {
+    pub(in crate::v2::engine) fn record_connection_retired(&self, connection: &ConnectionState) {
         // Successful retirement may clear the connection-level marker after
         // exact accepted-WR accounting reached zero. Any operation-level
         // quarantine entry remains tracked, so a mismatched retirement cannot
@@ -193,24 +199,30 @@ impl SessionManager {
 
 #[cfg(test)]
 impl EngineShared {
-    pub(super) fn begin_all_connection_close(&self) {
+    pub(in crate::v2::engine) fn begin_all_connection_close(&self) {
         self.session.begin_all_connection_close(self);
     }
 
-    pub(super) fn schedule_connection_retirement(&self, connection: &ConnectionState) {
+    pub(in crate::v2::engine) fn schedule_connection_retirement(
+        &self,
+        connection: &ConnectionState,
+    ) {
         self.session
             .schedule_connection_retirement(self, connection);
     }
 
-    pub(super) fn handle_connection_drain_deadline(&self, token: ConnectionToken) {
+    pub(in crate::v2::engine) fn handle_connection_drain_deadline(&self, token: ConnectionToken) {
         self.session.handle_connection_drain_deadline(self, token);
     }
 
-    pub(super) fn recover_connection_quarantine(&self, connection: &ConnectionState) {
+    pub(in crate::v2::engine) fn recover_connection_quarantine(
+        &self,
+        connection: &ConnectionState,
+    ) {
         self.session.recover_connection_quarantine(connection);
     }
 
-    pub(super) fn record_connection_drained(&self, connection: &ConnectionState) {
+    pub(in crate::v2::engine) fn record_connection_drained(&self, connection: &ConnectionState) {
         self.session.record_connection_drained(connection);
     }
 }
@@ -224,10 +236,10 @@ mod tests {
     use std::task::{Context, Poll};
     use std::time::Duration;
 
+    use super::super::super::io_core::install_accepted_operation_for_driver_test;
+    use super::super::super::registry::OperationToken;
+    use super::super::super::{CompletionMode, RdmaConnectionConfig, test_engine_pair};
     use super::super::connection::{WorkRequestPoster, install_connection};
-    use super::super::io_core::install_accepted_operation_for_driver_test;
-    use super::super::registry::OperationToken;
-    use super::super::{CompletionMode, RdmaConnectionConfig, test_engine_pair};
     use crate::v2::error::{Error, Result};
     use crate::v2::qp::{BatchPostOutcome, QpCapabilities};
     use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
@@ -342,10 +354,10 @@ mod tests {
     }
 
     fn install_accepted_connection(
-        engine: &super::super::RdmaEngine,
+        engine: &super::super::super::RdmaEngine,
         qp_num: u32,
     ) -> (
-        super::super::RdmaConnection,
+        super::super::super::RdmaConnection,
         Arc<TestPoster>,
         OperationToken,
     ) {

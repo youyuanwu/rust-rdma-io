@@ -19,26 +19,29 @@ use futures_util::task::AtomicWaker;
 use rdma_io_sys::rdmacm::rdma_cm_id;
 
 #[cfg(test)]
-use super::SetupSummary;
+use super::super::SetupSummary;
+use super::super::lifecycle::{MemoizedTerminalResult, TakeOnceResult};
+use super::super::registry::{
+    ConnectionToken, Lookup, PagedRegistry, RegistryToken, lock_unpoison,
+};
+use super::super::resources::EngineResources;
+use super::super::{ConnectionSetup, EngineShared, RdmaConnection, RdmaConnectionConfig};
+use super::SessionManager;
 use super::connection::{
     ConnectionCmRoute, ConnectionReservation, ConnectionState, FailedConnectionInstallResources,
     SharedCmId, VerbsConnectionResources, WorkRequestPoster, install_reserved_connection,
     reserve_connection,
 };
-use super::lifecycle::{MemoizedTerminalResult, TakeOnceResult};
 use super::listener::{
     AcceptRequest, InboundRejectReason, IncomingChild, KERNEL_LISTEN_BACKLOG_REQUEST,
     ListenRequest, ListenerAction, ListenerState, RdmaListener, empty_connection_setup,
     run_setup_before_establish,
 };
-use super::registry::{ConnectionToken, Lookup, PagedRegistry, RegistryToken, lock_unpoison};
-use super::resources::EngineResources;
-use super::{ConnectionSetup, EngineShared, RdmaConnection, RdmaConnectionConfig, SessionManager};
 use crate::cm::{CmEventType, CmId, PortSpace};
 use crate::v2::error::{Error, Result};
 use crate::v2::qp::QpBuilder;
 
-pub(super) const CM_WORK: usize = 1 << 3;
+pub(in crate::v2::engine) const CM_WORK: usize = 1 << 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CmEventReject {
@@ -101,7 +104,7 @@ enum ContextRoute {
     Listener { token: u64, raw_id: usize },
 }
 
-pub(super) struct CmState {
+pub(in crate::v2::engine) struct CmState {
     routes: PagedRegistry<CmRouteToken, Arc<OutboundRoute>>,
     inbound_routes: PagedRegistry<CmRouteToken, Arc<InboundRoute>>,
     context_routes: Mutex<HashMap<usize, ContextRoute>>,
@@ -119,7 +122,7 @@ pub(super) struct CmState {
 }
 
 impl CmState {
-    pub(super) fn new(capacity: usize) -> Result<Self> {
+    pub(in crate::v2::engine) fn new(capacity: usize) -> Result<Self> {
         Ok(Self {
             routes: PagedRegistry::new(capacity)?,
             inbound_routes: PagedRegistry::new(capacity)?,
@@ -142,11 +145,11 @@ impl CmState {
         lock_unpoison(&self.pending).push_back(request);
     }
 
-    pub(super) fn enqueue_listen(&self, request: Arc<ListenRequest>) {
+    pub(in crate::v2::engine) fn enqueue_listen(&self, request: Arc<ListenRequest>) {
         lock_unpoison(&self.pending_listens).push_back(request);
     }
 
-    pub(super) fn enqueue_listener_work(&self, listener: &Arc<ListenerState>) {
+    pub(in crate::v2::engine) fn enqueue_listener_work(&self, listener: &Arc<ListenerState>) {
         if listener.try_enqueue_work() {
             lock_unpoison(&self.listener_work).push_back(Arc::clone(listener));
         }
@@ -157,7 +160,7 @@ impl CmState {
     }
 
     #[cfg(test)]
-    pub(super) fn defer_test_listener_destruction(
+    pub(in crate::v2::engine) fn defer_test_listener_destruction(
         &self,
         listener: Arc<ListenerState>,
         destroy_count: Arc<AtomicUsize>,
@@ -177,7 +180,7 @@ impl CmState {
         }
     }
 
-    pub(super) fn enqueue_retirement(&self, token: ConnectionToken) {
+    pub(in crate::v2::engine) fn enqueue_retirement(&self, token: ConnectionToken) {
         lock_unpoison(&self.retirements).push_back(token);
     }
 
@@ -191,7 +194,7 @@ impl CmState {
         }
     }
 
-    pub(super) fn mark_accept_delivered(
+    pub(in crate::v2::engine) fn mark_accept_delivered(
         &self,
         listener: &Arc<ListenerState>,
         request: &Arc<AcceptRequest>,
@@ -240,7 +243,7 @@ impl CmState {
         true
     }
 
-    pub(super) fn has_software_work(&self) -> bool {
+    pub(in crate::v2::engine) fn has_software_work(&self) -> bool {
         let pending = !lock_unpoison(&self.pending).is_empty();
         let pending_listens = !lock_unpoison(&self.pending_listens).is_empty();
         let cancellations = !lock_unpoison(&self.cancellations).is_empty();
@@ -255,7 +258,7 @@ impl CmState {
             || cm_destructions
     }
 
-    pub(super) fn service_software(
+    pub(in crate::v2::engine) fn service_software(
         &self,
         shared: &Arc<EngineShared>,
         resources: Option<&EngineResources>,
@@ -353,7 +356,7 @@ impl CmState {
         Ok(processed)
     }
 
-    pub(super) fn try_process_event(
+    pub(in crate::v2::engine) fn try_process_event(
         &self,
         shared: &Arc<EngineShared>,
         resources: &EngineResources,
@@ -416,7 +419,7 @@ impl CmState {
         Ok(true)
     }
 
-    pub(super) fn begin_shutdown(
+    pub(in crate::v2::engine) fn begin_shutdown(
         &self,
         shared: &Arc<EngineShared>,
         outcome: &MemoizedTerminalResult,
@@ -452,7 +455,7 @@ impl CmState {
         }
     }
 
-    pub(super) fn pending_route_count(&self) -> usize {
+    pub(in crate::v2::engine) fn pending_route_count(&self) -> usize {
         let establishing = self
             .routes
             .occupied_cloned()
@@ -478,7 +481,7 @@ impl CmState {
             + listeners
     }
 
-    pub(super) fn retained_owner_count(&self) -> usize {
+    pub(in crate::v2::engine) fn retained_owner_count(&self) -> usize {
         let routes = self.routes.live();
         let inbound_routes = self.inbound_routes.live();
         let listeners = lock_unpoison(&self.listeners).len();
@@ -492,7 +495,7 @@ impl CmState {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn connection_route_is_live(
+    pub(in crate::v2::engine) fn connection_route_is_live(
         &self,
         route: ConnectionCmRoute,
         connection: ConnectionToken,
@@ -518,7 +521,7 @@ impl CmState {
         }
     }
 
-    pub(super) fn service_cm_destructions(
+    pub(in crate::v2::engine) fn service_cm_destructions(
         &self,
         shared: &Arc<EngineShared>,
         budget: usize,
@@ -671,7 +674,7 @@ impl CmState {
         }
     }
 
-    pub(super) fn terminalize(&self, outcome: &MemoizedTerminalResult) {
+    pub(in crate::v2::engine) fn terminalize(&self, outcome: &MemoizedTerminalResult) {
         if outcome.is_success() {
             return;
         }
@@ -2602,7 +2605,7 @@ impl CmState {
 }
 
 impl SessionManager {
-    pub(super) fn begin_cm_shutdown(
+    pub(in crate::v2::engine) fn begin_cm_shutdown(
         &self,
         shared: &Arc<EngineShared>,
         outcome: &MemoizedTerminalResult,
@@ -2610,23 +2613,23 @@ impl SessionManager {
         self.cm.begin_shutdown(shared, outcome);
     }
 
-    pub(super) fn terminalize_cm(&self, outcome: &MemoizedTerminalResult) {
+    pub(in crate::v2::engine) fn terminalize_cm(&self, outcome: &MemoizedTerminalResult) {
         self.cm.terminalize(outcome);
     }
 
-    pub(super) fn pending_cm_route_count(&self) -> usize {
+    pub(in crate::v2::engine) fn pending_cm_route_count(&self) -> usize {
         self.cm.pending_route_count()
     }
 
-    pub(super) fn retained_cm_owner_count(&self) -> usize {
+    pub(in crate::v2::engine) fn retained_cm_owner_count(&self) -> usize {
         self.cm.retained_owner_count()
     }
 
-    pub(super) fn has_cm_work(&self) -> bool {
+    pub(in crate::v2::engine) fn has_cm_work(&self) -> bool {
         self.cm.has_software_work()
     }
 
-    pub(super) fn service_cm_software(
+    pub(in crate::v2::engine) fn service_cm_software(
         &self,
         shared: &Arc<EngineShared>,
         resources: Option<&EngineResources>,
@@ -2635,7 +2638,7 @@ impl SessionManager {
         self.cm.service_software(shared, resources, budget)
     }
 
-    pub(super) fn try_process_cm_event(
+    pub(in crate::v2::engine) fn try_process_cm_event(
         &self,
         shared: &Arc<EngineShared>,
         resources: &EngineResources,
@@ -2643,7 +2646,7 @@ impl SessionManager {
         self.cm.try_process_event(shared, resources)
     }
 
-    pub(super) fn service_deferred_cm_destructions(
+    pub(in crate::v2::engine) fn service_deferred_cm_destructions(
         &self,
         shared: &Arc<EngineShared>,
         budget: usize,
@@ -2653,7 +2656,7 @@ impl SessionManager {
             .service_cm_destructions(shared, budget, try_process_event)
     }
 
-    pub(super) fn retire_registered_connection(
+    pub(in crate::v2::engine) fn retire_registered_connection(
         &self,
         shared: &EngineShared,
         token: ConnectionToken,
@@ -2751,7 +2754,7 @@ impl SessionManager {
     }
 }
 
-pub(super) async fn connect(
+pub(in crate::v2::engine) async fn connect(
     shared: Arc<EngineShared>,
     address: SocketAddr,
     config: RdmaConnectionConfig,
@@ -2759,7 +2762,7 @@ pub(super) async fn connect(
     connect_with_setup(shared, address, config, empty_connection_setup()).await
 }
 
-pub(super) async fn connect_with_setup(
+pub(in crate::v2::engine) async fn connect_with_setup(
     shared: Arc<EngineShared>,
     address: SocketAddr,
     config: RdmaConnectionConfig,
@@ -2771,7 +2774,7 @@ pub(super) async fn connect_with_setup(
     #[cfg(any(test, feature = "test-hooks"))]
     shared
         .test_driver
-        .pause_admission(super::driver::test_api::AdmissionPausePoint::ConnectBeforeEnqueue);
+        .pause_admission(super::super::driver::test_api::AdmissionPausePoint::ConnectBeforeEnqueue);
     shared.session.cm.enqueue(Arc::clone(&request));
     drop(admission);
     shared.work_signal.publish(CM_WORK);
@@ -3448,7 +3451,7 @@ impl Drop for ConnectWaiter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2::engine::connection::{
+    use crate::v2::engine::session::connection::{
         ConnectionAdmissionPool, WorkRequestPoster, install_connection,
     };
     use crate::v2::qp::{BatchPostOutcome, QpCapabilities};
@@ -3474,7 +3477,7 @@ mod tests {
     #[test]
     fn pending_connect_future_releases_engine_and_manager_record_owners() {
         let (engine, _driver) =
-            super::super::test_engine_pair(super::super::CompletionMode::Polling);
+            super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
         let baseline_engine_owners = Arc::strong_count(&engine.shared);
         let mut connect = Box::pin(connect_with_setup(
             Arc::clone(&engine.shared),
@@ -3578,7 +3581,7 @@ mod tests {
     #[test]
     fn route_queries_and_cm_service_complete_under_lock_order_stress() {
         let (engine, driver) =
-            super::super::test_engine_pair(super::super::CompletionMode::Polling);
+            super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
         let shared = Arc::clone(&engine.shared);
         let start = Arc::new(Barrier::new(3));
 
@@ -3770,7 +3773,7 @@ mod tests {
     #[test]
     fn unowned_child_context_never_removes_listener_event_route() {
         let (engine, driver) =
-            super::super::test_engine_pair(super::super::CompletionMode::Polling);
+            super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
         let listener = ListenerState::test_only(2);
         let listener_token = 17;
         lock_unpoison(&engine.shared.cm.listeners).insert(listener_token, Arc::clone(&listener));
@@ -3911,7 +3914,7 @@ mod tests {
     #[test]
     fn pre_establish_setup_completes_before_connect_and_failure_skips_connect() {
         let (engine, driver) =
-            super::super::test_engine_pair(super::super::CompletionMode::Polling);
+            super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
         let connection = install_connection(
             &engine.shared,
             Arc::new(NoopPoster(7)),
@@ -4007,7 +4010,7 @@ mod tests {
     #[test]
     fn delivery_replaces_the_frontend_with_weak_generational_route_state() {
         let (engine, driver) =
-            super::super::test_engine_pair(super::super::CompletionMode::Polling);
+            super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
         let connection = install_connection(
             &engine.shared,
             Arc::new(NoopPoster(11)),
@@ -4066,7 +4069,7 @@ mod tests {
     #[test]
     fn shutdown_replaces_an_undelivered_success_and_enqueues_route_cleanup() {
         let (engine, driver) =
-            super::super::test_engine_pair(super::super::CompletionMode::Polling);
+            super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
         let connection = install_connection(
             &engine.shared,
             Arc::new(NoopPoster(12)),
@@ -4120,7 +4123,7 @@ mod tests {
     #[test]
     fn transitioning_route_requeues_retirement_once_per_service_pass() {
         let (engine, driver) =
-            super::super::test_engine_pair(super::super::CompletionMode::Polling);
+            super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
         let request = Arc::new(test_request());
         let (route_token, route) = engine
             .shared
@@ -4194,7 +4197,7 @@ mod tests {
     #[test]
     fn inbound_disconnect_without_connection_state_fails_and_retires_selected_accept() {
         let (engine, driver) =
-            super::super::test_engine_pair(super::super::CompletionMode::Polling);
+            super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
         let listener = ListenerState::test_only(1);
         let (route_token, route) = engine
             .shared
@@ -4250,7 +4253,7 @@ mod tests {
     #[test]
     fn listener_destroy_error_completes_close_once_before_propagation() {
         let (engine, driver) =
-            super::super::test_engine_pair(super::super::CompletionMode::Polling);
+            super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
         let listener_state = ListenerState::test_only(1);
         let listener = RdmaListener::from_state(&engine.shared, Arc::clone(&listener_state));
         let mut close = Box::pin(listener.close());
@@ -4318,7 +4321,7 @@ mod tests {
     #[test]
     fn cm_destroy_barrier_is_budgeted_across_service_passes() {
         let (engine, driver) =
-            super::super::test_engine_pair(super::super::CompletionMode::Polling);
+            super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
         let listener_state = ListenerState::test_only(1);
         let listener = RdmaListener::from_state(&engine.shared, Arc::clone(&listener_state));
         let late_listener_state = Arc::clone(&listener_state);
@@ -4417,7 +4420,7 @@ mod tests {
         registry_retained: bool,
     ) {
         let (engine, driver) =
-            super::super::test_engine_pair(super::super::CompletionMode::Polling);
+            super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
         let connection = install_connection(
             &engine.shared,
             Arc::new(NoopPoster(32)),
@@ -4492,7 +4495,7 @@ mod tests {
     #[test]
     fn request_failure_and_shutdown_cancellation_keep_first_outcome() {
         let (engine, driver) =
-            super::super::test_engine_pair(super::super::CompletionMode::Polling);
+            super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
         let failed = test_request();
         failed.complete_failure(&engine.shared, Error::InvalidConfig("first failure".into()));
         failed.complete_failure(

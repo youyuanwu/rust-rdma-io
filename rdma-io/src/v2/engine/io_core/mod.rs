@@ -17,7 +17,7 @@ use super::scheduler::{DeadlineKind, DeadlineRequest};
 #[cfg(test)]
 use super::{
     CompletionMode, RdmaConnectionConfig, RdmaEngine, RdmaEngineBuilder, RdmaEngineDriver,
-    RdmaEngineLifecycle, connection, io,
+    RdmaEngineLifecycle, io,
 };
 use crate::v2::error::{Error, Result};
 use crate::v2::qp::BatchPostOutcome;

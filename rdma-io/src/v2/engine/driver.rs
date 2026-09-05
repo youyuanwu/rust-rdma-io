@@ -136,7 +136,7 @@ impl RdmaEngineDriver {
             self.scheduler
                 .mark_class_ready(WorkClass::CompletionDispatch);
         }
-        if published & super::cm::CM_WORK != 0 {
+        if published & super::session::cm::CM_WORK != 0 {
             self.scheduler.mark_class_ready(WorkClass::Cm);
         }
         if published & CQ_RECHECK_WORK != 0 {
@@ -627,12 +627,12 @@ pub(super) mod test_api {
 
     use crate::async_cm::AsyncCmId;
     use crate::cm::CmId;
+    use crate::v2::engine::resources::TestResourceRefs;
     #[cfg(test)]
-    use crate::v2::engine::connection::WorkRequestPoster;
-    use crate::v2::engine::connection::{
+    use crate::v2::engine::session::connection::WorkRequestPoster;
+    use crate::v2::engine::session::connection::{
         ConnectionState, VerbsConnectionResources, install_connection,
     };
-    use crate::v2::engine::resources::TestResourceRefs;
     #[cfg(test)]
     use crate::v2::qp::{BatchPostOutcome, QpCapabilities};
     use crate::v2::{
@@ -2388,11 +2388,11 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::v2::engine::connection::{WorkRequestPoster, install_connection};
     use crate::v2::engine::io_core::{
         completion_for_driver_test, install_accepted_operation_for_driver_test,
     };
-    use crate::v2::engine::listener::ListenerState;
+    use crate::v2::engine::session::connection::{WorkRequestPoster, install_connection};
+    use crate::v2::engine::session::listener::ListenerState;
     use crate::v2::engine::{
         RdmaConnectionConfig, RdmaEngineLifecycle, RdmaEngineTerminalError, RdmaListener,
         test_engine_pair,
