@@ -154,10 +154,10 @@ HELLO reuses a control receive; there is no additional receive.
 
 ## ADR: Crate-Private I/O and Session Ownership Boundaries
 
-**Status:** accepted. The protocol/I/O seam, low-level `IoCore`, and
-`SessionManager` ownership boundary are implemented. Physical relocation of
-`cm.rs`, `listener.rs`, `connection.rs`, and `drain.rs`, broader protocol
-cleanup, and final issue #43 cleanup remain deferred.
+**Status:** accepted. The protocol/I/O seam, low-level `IoCore`,
+`SessionManager` ownership boundary, and physical session-module hierarchy are
+implemented. Broader protocol cleanup and final issue #43 cleanup remain
+deferred.
 
 The architecture has three ownership layers:
 
@@ -178,6 +178,16 @@ resources, engine lifecycle, work signal, `Arc<IoCore>`, and
 it polls the shared CQ through `IoCore` and invokes bounded CM, deadline,
 completion-dispatch, retirement, and shutdown services through
 `SessionManager`. Neither component creates a task or thread.
+
+The source hierarchy mirrors that ownership. `engine/session/mod.rs` defines
+the manager and its lifecycle capabilities, while `session/cm.rs`,
+`session/listener.rs`, `session/connection.rs`, `session/drain.rs`, and
+`session/registry.rs` contain session-owned state and policy. The remaining
+`engine/registry.rs` is not a connection owner: it provides opaque connection
+and operation identities, exact live-I/O proofs, generic non-wrapping
+generational registry storage, and lock helpers shared with `IoCore`. Public
+connection and listener types continue to be re-exported by the engine facade,
+so this physical relocation does not change public paths.
 
 An established I/O capability carries immutable connection/QP identity, local
 posting limits, operation ledgers, and a posting-only authority. That authority
@@ -233,7 +243,7 @@ APIs are unchanged. AST guards reject hidden work, production `IoCore`
 dependencies on root/session/connection/CM/listener/protocol types, strong
 session-resource retention by frontends and waiters, lifecycle operations
 without the private authority, public re-exports of internal capabilities, and
-physical relocation of the four deferred modules.
+obsolete top-level session-module paths.
 
 ## Completion-to-Message Handoff
 
