@@ -328,6 +328,26 @@ impl<K: RegistryToken, T> PagedRegistry<K, T> {
             .collect()
     }
 
+    pub(super) fn scan_occupied_cloned(
+        &self,
+        start: usize,
+        budget: usize,
+    ) -> (Vec<T>, usize, bool, usize)
+    where
+        T: Clone,
+    {
+        let inner = lock_unpoison(&self.inner);
+        let end = (start.saturating_add(budget)).min(inner.next_unused as usize);
+        let values = (start..end)
+            .filter_map(|slot| self.slot_ref(&inner, slot as u32))
+            .filter_map(|entry| match &entry.state {
+                SlotState::Occupied(value) => Some(value.clone()),
+                SlotState::Vacant | SlotState::Retired => None,
+            })
+            .collect();
+        (values, end, end >= inner.next_unused as usize, end - start)
+    }
+
     #[cfg(test)]
     fn insert_at_for_test(&self, slot: u32, value: T) -> K {
         assert!((slot as usize) < self.capacity);

@@ -1122,6 +1122,7 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     let driver_path = v2_dir.join("engine").join("driver.rs");
     let drain_path = v2_dir.join("engine").join("session").join("drain.rs");
     let session_path = v2_dir.join("engine").join("session").join("mod.rs");
+    let session_progress_path = v2_dir.join("engine").join("session").join("progress.rs");
     let v2_mod_path = v2_dir.join("mod.rs");
 
     let message = fs::read_to_string(&message_path).expect("read message transport source");
@@ -1163,10 +1164,20 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
 
     #[allow(dead_code)]
     const FINAL_DRIVER_FORBIDDEN_SESSION_KNOWLEDGE: &[&str] = &[
+        "cm_async_fd",
+        "cm_event_channel",
+        "resources.cm",
         "try_process_cm_event",
         "service_cm_software",
         "service_deferred_cm_destructions",
         "handle_connection_drain_deadline",
+        ".connections",
+        ".listeners",
+        "begin_connection_close",
+        "begin_cm_shutdown",
+        "begin_all_connection_close",
+        "destroy_qp",
+        "retire_registered_connection",
         "DeadlineKind::ConnectionDrain",
         "DeadlineKind::EngineShutdown",
     ];
@@ -1427,17 +1438,36 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         production_driver,
         FINAL_DRIVER_FORBIDDEN_IO_KNOWLEDGE,
     );
+    assert_final_driver_boundary(
+        &driver_path,
+        production_driver,
+        FINAL_DRIVER_FORBIDDEN_SESSION_KNOWLEDGE,
+    );
     assert!(
-        driver_source.contains(".session")
-            && driver_source.contains(".io_core")
-            && driver_source.contains("service_cm_software(")
-            && driver_source.contains("try_process_cm_event(")
-            && driver_source.contains("service_deferred_cm_destructions(")
-            && !driver_source.contains("session.cm")
+        production_driver.contains("io_progress")
+            && production_driver.contains("session_progress")
+            && !production_driver.contains("session.cm")
             && !driver_source.contains("tokio::spawn("),
-        "{} must explicitly compose SessionManager and IoCore without spawning",
+        "{} must schedule owner-local progress without spawning",
         driver_path.display()
     );
+    let session_progress_source =
+        fs::read_to_string(&session_progress_path).expect("read session progress source");
+    for required in [
+        "SessionProgressResources",
+        "poll_readiness_events",
+        "service_cm_software",
+        "service_deferred_cm_destructions",
+        "handle_connection_drain_deadline",
+        "service_bounded_shutdown",
+        "terminal_completion_ready",
+    ] {
+        assert!(
+            session_progress_source.contains(required),
+            "{} must own `{required}`",
+            session_progress_path.display()
+        );
+    }
     assert!(
         cm_source.contains("impl SessionManager")
             && cm_source.contains("fn retire_registered_connection("),
@@ -1626,6 +1656,7 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         "SessionManager",
         "SessionLifecycleAuthority",
         "QpDestructionProof",
+        "SessionProgress",
         "ProgressReport",
         "IoSessionBridge",
     ] {

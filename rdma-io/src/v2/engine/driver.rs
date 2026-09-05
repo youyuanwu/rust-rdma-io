@@ -23,7 +23,8 @@ use super::io_core::IoProgress;
 use super::lifecycle::MemoizedTerminalResult;
 use super::progress::ProgressTerminal;
 use super::resources::EngineResources;
-use super::scheduler::{Deadline, DeadlineKind, WorkClass, WorkScheduler};
+use super::scheduler::{WorkClass, WorkScheduler};
+use super::session::SessionProgress;
 use super::{EngineShared, RdmaEngineDriver};
 use crate::v2::error::{Error, Result};
 use crate::v2::runtime::preflight_driver_runtime;
@@ -33,7 +34,7 @@ pub(super) const IO_RECLAMATION_WORK: usize = 1 << 1;
 pub(super) const COMPLETION_DISPATCH_WORK: usize = 1 << 2;
 pub(super) const CQ_RECHECK_WORK: usize = 1 << 4;
 pub(super) const SESSION_RECLAMATION_WORK: usize = 1 << 5;
-const WORK_CLASS_COUNT: usize = 4;
+const WORK_CLASS_COUNT: usize = 3;
 
 pub(super) struct WorkSignal {
     pending: std::sync::atomic::AtomicUsize,
@@ -75,46 +76,15 @@ impl WorkSignal {
     }
 }
 
-fn poll_readiness_events<G>(
-    cx: &mut TaskContext<'_>,
-    budget: usize,
-    mut poll_read_ready: impl FnMut(&mut TaskContext<'_>) -> Poll<Result<G>>,
-    mut clear_ready: impl FnMut(&mut G),
-    mut try_one: impl FnMut() -> Result<bool>,
-) -> Poll<Result<usize>> {
-    debug_assert!(budget > 0);
-    let mut processed = 0;
-    loop {
-        let mut guard = match poll_read_ready(cx) {
-            Poll::Ready(Ok(guard)) => guard,
-            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-            Poll::Pending if processed == 0 => return Poll::Pending,
-            Poll::Pending => return Poll::Ready(Ok(processed)),
-        };
-        loop {
-            if processed == budget {
-                return Poll::Ready(Ok(processed));
-            }
-            match try_one() {
-                Ok(true) => processed += 1,
-                Ok(false) => {
-                    clear_ready(&mut guard);
-                    break;
-                }
-                Err(error) => return Poll::Ready(Err(error)),
-            }
-        }
-        // Clearing an AsyncFd readiness tick can race a new edge. Re-polling
-        // here either observes it immediately or registers the task waker
-        // before this driver poll is allowed to return Pending.
-    }
-}
-
 impl RdmaEngineDriver {
-    pub(super) fn new(shared: Arc<EngineShared>, mut resources: Option<EngineResources>) -> Self {
-        let io_resources = resources
-            .as_mut()
-            .map(EngineResources::take_io_progress_resources);
+    pub(super) fn new(shared: Arc<EngineShared>, resources: Option<EngineResources>) -> Self {
+        let (io_resources, session_resources) = match resources {
+            Some(mut resources) => {
+                let io = resources.take_io_progress_resources();
+                (Some(io), Some(resources.into_session_progress()))
+            }
+            None => (None, None),
+        };
         let io_progress = IoProgress::new(
             Arc::clone(&shared.io_core),
             io_resources,
@@ -124,10 +94,16 @@ impl RdmaEngineDriver {
             #[cfg(any(test, feature = "test-hooks"))]
             Arc::clone(&shared.test_driver),
         );
+        let session_progress = SessionProgress::new(
+            Arc::clone(&shared.session),
+            session_resources,
+            shared.config.cm_event_budget,
+            shared.config.session_reclamation_budget,
+        );
         Self {
             shared,
             io_progress,
-            resources,
+            session_progress,
             scheduler: WorkScheduler::new(),
             deadline_sleep: None,
             deadline_at: None,
@@ -142,12 +118,8 @@ impl RdmaEngineDriver {
         if published & (IO_RECLAMATION_WORK | COMPLETION_DISPATCH_WORK | CQ_RECHECK_WORK) != 0 {
             self.scheduler.mark_class_ready(WorkClass::Io);
         }
-        if published & SESSION_RECLAMATION_WORK != 0 {
-            self.scheduler
-                .mark_class_ready(WorkClass::SessionReclamation);
-        }
-        if published & super::session::cm::CM_WORK != 0 {
-            self.scheduler.mark_class_ready(WorkClass::Cm);
+        if published & (SESSION_RECLAMATION_WORK | super::session::cm::CM_WORK) != 0 {
+            self.scheduler.mark_class_ready(WorkClass::Session);
         }
     }
 
@@ -161,10 +133,7 @@ impl RdmaEngineDriver {
 
     fn release_resources(&mut self) {
         self.io_progress.release_resources();
-        if let Some(resources) = self.resources.as_mut() {
-            resources.drop_readiness_adapters();
-        }
-        self.resources.take();
+        self.session_progress.release_resources();
     }
 
     fn service_terminal(&mut self) -> Result<bool> {
@@ -175,51 +144,9 @@ impl RdmaEngineDriver {
         {
             return Ok(false);
         }
-        self.shared.session.begin_cm_shutdown(
-            &self.shared,
-            &MemoizedTerminalResult::from_error(Error::DriverShutdown),
-        );
-        self.shared.session.begin_all_connection_close(&self.shared);
-        if self.shared.session.pending_cm_route_count() != 0 {
+        if !self.session_progress.can_finish() {
             return Ok(false);
         }
-        if self.shared.session.live_connection_count() != 0 {
-            return Ok(false);
-        }
-
-        if self.shared.io_core.accepted_count() != 0 {
-            return Ok(false);
-        }
-
-        if let Some(resources) = self.resources.as_ref() {
-            let mut processed = 0;
-            while processed < self.shared.config.cm_event_budget {
-                if !self
-                    .shared
-                    .session
-                    .try_process_cm_event(&self.shared, resources)?
-                {
-                    if self.shared.session.pending_cm_route_count() != 0
-                        || self.shared.session.live_connection_count() != 0
-                        || self.shared.io_core.accepted_count() != 0
-                    {
-                        self.scheduler.mark_class_ready(WorkClass::Cm);
-                        return Ok(false);
-                    }
-                    #[cfg(any(test, feature = "test-hooks"))]
-                    crate::test_support::destruction::record(
-                        crate::test_support::destruction::DestructionKind::CmFinalDrainToWouldBlock,
-                        resources.cm_event_channel.as_raw() as usize,
-                    );
-                    self.shared.finish(MemoizedTerminalResult::success());
-                    return Ok(true);
-                }
-                processed += 1;
-            }
-            self.scheduler.mark_class_ready(WorkClass::Cm);
-            return Ok(false);
-        }
-
         self.shared.finish(MemoizedTerminalResult::success());
         Ok(true)
     }
@@ -239,117 +166,29 @@ impl RdmaEngineDriver {
         Ok(report.units_consumed > 0)
     }
 
-    fn service_cm(&mut self, cx: &mut TaskContext<'_>) -> Result<bool> {
-        let Some(resources) = self.resources.as_ref() else {
-            return Ok(false);
-        };
-        let budget = self.shared.config.cm_event_budget;
-        let session = &self.shared.session;
-        let mut processed = session.service_cm_software(&self.shared, Some(resources), budget)?;
-        while processed < budget && session.try_process_cm_event(&self.shared, resources)? {
-            processed += 1;
+    fn service_session(&mut self, cx: &mut TaskContext<'_>) -> Result<bool> {
+        let report = self
+            .session_progress
+            .turn(self.shared.config.completion_mode, cx)?;
+        if report.requires_repoll() {
+            self.scheduler.mark_class_ready(WorkClass::Session);
         }
-
-        let readiness_processed = match self.shared.config.completion_mode {
-            CompletionMode::Readiness => {
-                if processed == budget {
-                    0
-                } else {
-                    let async_fd = resources.cm_async_fd.as_ref().ok_or_else(|| {
-                        Error::InvalidConfig("readiness engine has no CM AsyncFd".into())
-                    })?;
-                    match poll_readiness_events(
-                        cx,
-                        budget - processed,
-                        |cx| match async_fd.poll_read_ready(cx) {
-                            Poll::Ready(Ok(guard)) => Poll::Ready(Ok(guard)),
-                            Poll::Ready(Err(error)) => Poll::Ready(Err(Error::Verbs(error))),
-                            Poll::Pending => Poll::Pending,
-                        },
-                        |guard| guard.clear_ready(),
-                        || session.try_process_cm_event(&self.shared, resources),
-                    ) {
-                        Poll::Ready(result) => result?,
-                        Poll::Pending => 0,
-                    }
-                }
-            }
-            CompletionMode::Polling => 0,
-        };
-        processed += readiness_processed;
-        processed += session.service_deferred_cm_destructions(
-            &self.shared,
-            budget.saturating_sub(processed),
-            || session.try_process_cm_event(&self.shared, resources),
-        )?;
-
-        if processed >= budget || session.has_cm_work() {
-            self.scheduler.mark_class_ready(WorkClass::Cm);
+        match report.terminal {
+            ProgressTerminal::Running => {}
+            ProgressTerminal::Ready => self.scheduler.mark_class_ready(WorkClass::Terminal),
+            ProgressTerminal::Failed(error) => return Err(error),
         }
-        Ok(processed > 0)
-    }
-
-    fn service_reclamation(&mut self) -> Result<bool> {
-        let budget = self.shared.config.session_reclamation_budget;
-        let requests = self.shared.session.take_deadline_requests(budget);
-        for request in requests.iter().copied() {
-            if !self
-                .scheduler
-                .deadlines()
-                .push(request.at, request.kind, request.token)
-            {
-                return Err(Error::InvalidConfig(
-                    "deadline insertion sequence exhausted".into(),
-                ));
-            }
-        }
-        let now = tokio::time::Instant::now();
-        let remaining = budget.saturating_sub(requests.len());
-        let due = self.scheduler.deadlines().pop_due(now, remaining);
-        for deadline in due.iter().copied() {
-            self.process_deadline(deadline)?;
-        }
-        if self.shared.session.has_deadline_requests()
-            || self
-                .scheduler
-                .deadlines()
-                .next()
-                .is_some_and(|at| at <= now)
-        {
-            self.scheduler
-                .mark_class_ready(WorkClass::SessionReclamation);
-        }
-        Ok(!due.is_empty() || !requests.is_empty())
-    }
-
-    fn process_deadline(&mut self, deadline: Deadline) -> Result<()> {
-        match deadline.kind {
-            DeadlineKind::EngineShutdown => {
-                if let Some(failure) = self.shared.shutdown_deadline_failure() {
-                    Err(failure)
-                } else {
-                    self.scheduler.mark_class_ready(WorkClass::Terminal);
-                    Ok(())
-                }
-            }
-            DeadlineKind::ConnectionDrain => {
-                self.shared.session.handle_connection_drain_deadline(
-                    &self.shared,
-                    super::registry::ConnectionToken::decode(deadline.token),
-                );
-                Ok(())
-            }
-        }
+        Ok(report.units_consumed > 0)
     }
 
     fn poll_deadline_timer(&mut self, cx: &mut TaskContext<'_>) -> bool {
         let next = match (
-            self.scheduler.next_deadline(),
             self.io_progress.next_deadline(),
+            self.session_progress.next_deadline(),
         ) {
-            (Some(session), Some(io)) => Some(session.min(io)),
-            (Some(session), None) => Some(session),
-            (None, Some(io)) => Some(io),
+            (Some(io), Some(session)) => Some(io.min(session)),
+            (Some(io), None) => Some(io),
+            (None, Some(session)) => Some(session),
             (None, None) => None,
         };
         if self.deadline_at != next {
@@ -365,8 +204,7 @@ impl RdmaEngineDriver {
         self.deadline_sleep = None;
         self.deadline_at = None;
         self.scheduler.mark_class_ready(WorkClass::Io);
-        self.scheduler
-            .mark_class_ready(WorkClass::SessionReclamation);
+        self.scheduler.mark_class_ready(WorkClass::Session);
         true
     }
 }
@@ -403,8 +241,8 @@ impl Future for RdmaEngineDriver {
         {
             self.scheduler.mark_class_ready(WorkClass::Terminal);
         }
-        self.scheduler.mark_class_ready(WorkClass::Cm);
         self.scheduler.mark_class_ready(WorkClass::Io);
+        self.scheduler.mark_class_ready(WorkClass::Session);
 
         let class_budget = self.scheduler.ready_class_count().min(WORK_CLASS_COUNT);
         for _ in 0..class_budget {
@@ -417,9 +255,8 @@ impl Future for RdmaEngineDriver {
                     Ok(false) => Ok(false),
                     Err(error) => Err(error),
                 },
-                WorkClass::Cm => self.service_cm(cx),
                 WorkClass::Io => self.service_io(cx),
-                WorkClass::SessionReclamation => self.service_reclamation(),
+                WorkClass::Session => self.service_session(cx),
             };
             let progressed = match result {
                 Ok(progressed) => progressed,
@@ -428,7 +265,7 @@ impl Future for RdmaEngineDriver {
             // CM progress can remove the final shutdown owner after the
             // Terminal class already ran in this poll.
             if progressed
-                && class == WorkClass::Cm
+                && class == WorkClass::Session
                 && self
                     .shared
                     .shutdown_requested
@@ -2276,8 +2113,6 @@ pub use test_api::{
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-    use std::rc::Rc;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{RawWaker, RawWakerVTable, Waker};
@@ -2479,105 +2314,35 @@ mod tests {
                 engine.shared.test_driver.queue_released_connection_cqe(
                     completion_for_driver_test(operation, poster.qp_num, opcode, status),
                 );
-                assert!(driver.scheduler.deadlines().push(
-                    tokio::time::Instant::now(),
-                    DeadlineKind::ConnectionDrain,
+                engine.shared.session.schedule_deadline(
+                    &engine.shared.work_signal,
+                    super::super::scheduler::DeadlineKind::ConnectionDrain,
                     connection.state.token.encode(),
-                ));
+                    Duration::ZERO,
+                );
                 driver.scheduler.mark_class_ready(WorkClass::Io);
-                driver
-                    .scheduler
-                    .mark_class_ready(WorkClass::SessionReclamation);
+                driver.scheduler.mark_class_ready(WorkClass::Session);
                 let waker = Waker::noop();
                 let mut cx = TaskContext::from_waker(waker);
 
                 assert_eq!(driver.scheduler.next_class(), Some(WorkClass::Io));
                 assert!(driver.service_io(&mut cx).unwrap());
-                assert_eq!(
-                    driver.scheduler.next_class(),
-                    Some(WorkClass::SessionReclamation)
-                );
-                assert!(driver.service_reclamation().unwrap());
+                assert_eq!(driver.scheduler.next_class(), Some(WorkClass::Session));
+                assert!(driver.service_session(&mut cx).unwrap());
 
                 let diagnostics = engine.diagnostics();
                 assert_eq!(diagnostics.accepted_operations, 0);
                 assert_eq!(diagnostics.registered_operations, 0);
-                assert_eq!(poster.destroys.load(Ordering::Acquire), 0);
+                assert_eq!(
+                    poster.destroys.load(Ordering::Acquire),
+                    1,
+                    "exact completion permits normal session-owned retirement without fallback"
+                );
 
                 engine.shared.finish(MemoizedTerminalResult::success());
                 drop(driver);
             }
         }
-    }
-
-    #[test]
-    fn cm_event_arriving_during_clear_is_drained_after_reregister() {
-        #[derive(Default)]
-        struct FakeReadiness {
-            ready: bool,
-            event_available: bool,
-            polls: usize,
-            clears: usize,
-        }
-
-        let state = Rc::new(RefCell::new(FakeReadiness {
-            ready: true,
-            ..FakeReadiness::default()
-        }));
-        let waker = Waker::noop();
-        let mut cx = TaskContext::from_waker(waker);
-        let result = poll_readiness_events(
-            &mut cx,
-            8,
-            {
-                let state = Rc::clone(&state);
-                move |_| {
-                    let mut state = state.borrow_mut();
-                    state.polls += 1;
-                    if state.ready {
-                        Poll::Ready(Ok(()))
-                    } else {
-                        Poll::Pending
-                    }
-                }
-            },
-            {
-                let state = Rc::clone(&state);
-                move |_| {
-                    let mut state = state.borrow_mut();
-                    state.clears += 1;
-                    if state.clears == 1 {
-                        // Exact regression: a new event edge appears after the
-                        // empty read but while the stale readiness is cleared.
-                        state.event_available = true;
-                        state.ready = true;
-                    } else {
-                        state.ready = false;
-                    }
-                }
-            },
-            {
-                let state = Rc::clone(&state);
-                move || {
-                    let mut state = state.borrow_mut();
-                    if state.event_available {
-                        state.event_available = false;
-                        Ok(true)
-                    } else {
-                        Ok(false)
-                    }
-                }
-            },
-        );
-
-        assert!(matches!(result, Poll::Ready(Ok(1))));
-        let state = state.borrow();
-        assert_eq!(
-            state.polls, 3,
-            "clear must be followed by a readiness re-poll"
-        );
-        assert_eq!(state.clears, 2);
-        assert!(!state.event_available);
     }
 
     #[test]

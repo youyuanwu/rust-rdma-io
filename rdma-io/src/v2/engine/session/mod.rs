@@ -20,12 +20,14 @@ pub(super) mod cm;
 pub(super) mod connection;
 mod drain;
 pub(super) mod listener;
+mod progress;
 mod registry;
 
 use self::connection::{
     ConnectionAdmissionPool, ConnectionState, QpDestroyStatus, SharedCmId, VerbsConnectionResources,
 };
 use self::listener::ListenerState;
+pub(super) use self::progress::SessionProgress;
 use self::registry::ConnectionRegistry;
 use super::driver::WorkSignal;
 use super::io_core::{

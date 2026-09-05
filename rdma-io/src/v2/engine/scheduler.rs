@@ -10,7 +10,7 @@ use tokio::time::Instant;
 
 use super::progress::OwnerClass;
 
-const WORK_CLASS_COUNT: usize = 4;
+const WORK_CLASS_COUNT: usize = 3;
 const OWNER_CLASS_COUNT: usize = 3;
 
 /// Deduplicated fair rotation over progress owners.
@@ -57,18 +57,16 @@ impl OwnerScheduler {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum WorkClass {
     Terminal,
-    Cm,
     Io,
-    SessionReclamation,
+    Session,
 }
 
 impl WorkClass {
     pub(super) const fn index(self) -> usize {
         match self {
             Self::Terminal => 0,
-            Self::Cm => 1,
-            Self::Io => 2,
-            Self::SessionReclamation => 3,
+            Self::Io => 1,
+            Self::Session => 2,
         }
     }
 }
@@ -76,7 +74,6 @@ impl WorkClass {
 pub(super) struct WorkScheduler {
     classes: VecDeque<WorkClass>,
     class_queued: [bool; WORK_CLASS_COUNT],
-    deadlines: DeadlineQueue,
 }
 
 impl WorkScheduler {
@@ -84,7 +81,6 @@ impl WorkScheduler {
         Self {
             classes: VecDeque::with_capacity(WORK_CLASS_COUNT),
             class_queued: [false; WORK_CLASS_COUNT],
-            deadlines: DeadlineQueue::default(),
         }
     }
 
@@ -104,14 +100,6 @@ impl WorkScheduler {
 
     pub(super) fn ready_class_count(&self) -> usize {
         self.classes.len()
-    }
-
-    pub(super) fn deadlines(&mut self) -> &mut DeadlineQueue {
-        &mut self.deadlines
-    }
-
-    pub(super) fn next_deadline(&self) -> Option<Instant> {
-        self.deadlines.next()
     }
 }
 
@@ -228,12 +216,7 @@ mod tests {
     #[test]
     fn work_classes_rotate_without_starvation() {
         let mut scheduler = WorkScheduler::new();
-        for class in [
-            WorkClass::Terminal,
-            WorkClass::Cm,
-            WorkClass::Io,
-            WorkClass::SessionReclamation,
-        ] {
+        for class in [WorkClass::Terminal, WorkClass::Io, WorkClass::Session] {
             scheduler.mark_class_ready(class);
         }
 
@@ -246,12 +229,7 @@ mod tests {
             .collect();
         assert_eq!(
             first_round,
-            [
-                WorkClass::Terminal,
-                WorkClass::Cm,
-                WorkClass::Io,
-                WorkClass::SessionReclamation,
-            ]
+            [WorkClass::Terminal, WorkClass::Io, WorkClass::Session,]
         );
         assert_eq!(
             scheduler.next_class(),

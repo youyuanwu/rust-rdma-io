@@ -118,7 +118,28 @@ pub(in crate::v2::engine) struct CmState {
     retirements: Mutex<VecDeque<ConnectionToken>>,
     cm_destructions: Mutex<VecDeque<PendingCmDestruction>>,
     setup_rollback_quarantines: Mutex<Vec<RetainedSetupRollback>>,
+    software_next_class: AtomicUsize,
     shutting_down: AtomicBool,
+}
+
+pub(in crate::v2::engine) struct CmShutdownCursor {
+    next_class: usize,
+    route_slot: usize,
+    listener_token: u64,
+    routes_complete: bool,
+    listeners_complete: bool,
+}
+
+impl Default for CmShutdownCursor {
+    fn default() -> Self {
+        Self {
+            next_class: 0,
+            route_slot: 0,
+            listener_token: 1,
+            routes_complete: false,
+            listeners_complete: false,
+        }
+    }
 }
 
 impl CmState {
@@ -137,6 +158,7 @@ impl CmState {
             retirements: Mutex::new(VecDeque::new()),
             cm_destructions: Mutex::new(VecDeque::new()),
             setup_rollback_quarantines: Mutex::new(Vec::new()),
+            software_next_class: AtomicUsize::new(0),
             shutting_down: AtomicBool::new(false),
         })
     }
@@ -279,7 +301,7 @@ impl CmState {
             pending_listens,
             listener_work,
         ];
-        let mut next_class = 0;
+        let mut next_class = self.software_next_class.load(Ordering::Acquire) % remaining.len();
         let mut processed = 0;
         while processed < budget && remaining.iter().any(|count| *count != 0) {
             let mut selected = None;
@@ -353,6 +375,8 @@ impl CmState {
                 _ => unreachable!("software work has five classes"),
             }
         }
+        self.software_next_class
+            .store(next_class, Ordering::Release);
         Ok(processed)
     }
 
@@ -419,6 +443,7 @@ impl CmState {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub(in crate::v2::engine) fn begin_shutdown(
         &self,
         shared: &Arc<EngineShared>,
@@ -427,6 +452,7 @@ impl CmState {
         if self.shutting_down.swap(true, Ordering::AcqRel) {
             return;
         }
+
         if outcome.is_success() {
             return;
         }
@@ -453,6 +479,90 @@ impl CmState {
         for listener in listeners {
             listener.request_close(shared);
         }
+    }
+
+    pub(in crate::v2::engine) fn start_bounded_shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+    }
+
+    pub(in crate::v2::engine) fn service_bounded_shutdown(
+        &self,
+        shared: &Arc<EngineShared>,
+        outcome: &MemoizedTerminalResult,
+        cursor: &mut CmShutdownCursor,
+        budget: usize,
+    ) -> usize {
+        let mut processed = 0;
+        while processed < budget {
+            let mut selected = false;
+            for offset in 0..4 {
+                let class = (cursor.next_class + offset) % 4;
+                match class {
+                    0 => {
+                        let request = { lock_unpoison(&self.pending).pop_front() };
+                        let Some(request) = request else {
+                            continue;
+                        };
+                        request.cancel(terminal_error(outcome));
+                        drop(request.take_reservation());
+                    }
+                    1 if !cursor.routes_complete => {
+                        let (routes, next, complete, scanned) =
+                            self.routes.scan_occupied_cloned(cursor.route_slot, 1);
+                        cursor.route_slot = next;
+                        cursor.routes_complete = complete;
+                        if scanned == 0 {
+                            continue;
+                        }
+                        for route in routes {
+                            if let Some(request) = route.request() {
+                                request.cancel(terminal_error(outcome));
+                                self.enqueue_cancellation(request);
+                            }
+                        }
+                    }
+                    2 => {
+                        let request = { lock_unpoison(&self.pending_listens).pop_front() };
+                        let Some(request) = request else {
+                            continue;
+                        };
+                        request.complete(Err(terminal_error(outcome)));
+                    }
+                    3 if !cursor.listeners_complete => {
+                        let upper = self.next_listener_token.load(Ordering::Acquire);
+                        if cursor.listener_token >= upper {
+                            cursor.listeners_complete = true;
+                            continue;
+                        }
+                        let token = cursor.listener_token;
+                        cursor.listener_token = cursor.listener_token.saturating_add(1);
+                        let listener = { lock_unpoison(&self.listeners).get(&token).cloned() };
+                        if let Some(listener) = listener {
+                            listener.request_close(shared);
+                        }
+                    }
+                    _ => continue,
+                }
+                cursor.next_class = (class + 1) % 4;
+                processed += 1;
+                selected = true;
+                break;
+            }
+            if !selected {
+                break;
+            }
+        }
+        processed
+    }
+
+    pub(in crate::v2::engine) fn bounded_shutdown_complete(
+        &self,
+        cursor: &CmShutdownCursor,
+    ) -> bool {
+        cursor.routes_complete
+            && cursor.listeners_complete
+            && lock_unpoison(&self.pending).is_empty()
+            && lock_unpoison(&self.pending_listens).is_empty()
     }
 
     pub(in crate::v2::engine) fn pending_route_count(&self) -> usize {
@@ -2605,18 +2715,11 @@ impl CmState {
 }
 
 impl SessionManager {
-    pub(in crate::v2::engine) fn begin_cm_shutdown(
-        &self,
-        shared: &Arc<EngineShared>,
-        outcome: &MemoizedTerminalResult,
-    ) {
-        self.cm.begin_shutdown(shared, outcome);
-    }
-
     pub(in crate::v2::engine) fn terminalize_cm(&self, outcome: &MemoizedTerminalResult) {
         self.cm.terminalize(outcome);
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(in crate::v2::engine) fn pending_cm_route_count(&self) -> usize {
         self.cm.pending_route_count()
     }

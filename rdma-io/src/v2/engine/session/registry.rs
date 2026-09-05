@@ -130,6 +130,14 @@ impl ConnectionRegistry {
         self.slots.occupied_cloned()
     }
 
+    pub(in crate::v2::engine) fn scan_occupied(
+        &self,
+        start: usize,
+        budget: usize,
+    ) -> (Vec<Arc<ConnectionState>>, usize, bool, usize) {
+        self.slots.scan_occupied_cloned(start, budget)
+    }
+
     #[cfg(test)]
     pub(in crate::v2::engine) fn set_qp_mapping_for_test(
         &self,

@@ -32,6 +32,11 @@ pub(super) struct IoProgressResources {
     pub(super) cq: Arc<Cq>,
 }
 
+/// CM and root resources owned by the bounded session progress component.
+pub(super) struct SessionProgressResources {
+    engine: EngineResources,
+}
+
 #[derive(Clone)]
 pub(super) struct EngineResourceRefs {
     #[allow(dead_code, reason = "retains the shared CQ for connection descendants")]
@@ -143,6 +148,14 @@ impl EngineResources {
             .expect("I/O progress resources are taken exactly once")
     }
 
+    pub(super) fn into_session_progress(self) -> SessionProgressResources {
+        assert!(
+            self.io_progress.is_none(),
+            "I/O progress resources must be extracted before session ownership transfer"
+        );
+        SessionProgressResources { engine: self }
+    }
+
     pub(super) fn drop_readiness_adapters(&mut self) {
         #[cfg(any(test, feature = "test-hooks"))]
         if let Some(adapter) = self.cm_async_fd.as_ref() {
@@ -175,6 +188,16 @@ impl IoProgressResources {
             );
         }
         self.cq_async_fd.take();
+    }
+}
+
+impl SessionProgressResources {
+    pub(super) fn engine(&self) -> &EngineResources {
+        &self.engine
+    }
+
+    pub(super) fn drop_readiness_adapter(&mut self) {
+        self.engine.drop_readiness_adapters();
     }
 }
 

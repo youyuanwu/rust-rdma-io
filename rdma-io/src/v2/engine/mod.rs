@@ -70,9 +70,9 @@ use registry::{lock_unpoison, write_unpoison};
 use resources::{EngineResourceRefs, EngineResources};
 use scheduler::DeadlineKind;
 use scheduler::WorkScheduler;
-use session::SessionManager;
 pub use session::connection::{RdmaConnection, RdmaConnectionIdentity};
 pub use session::listener::{RdmaListener, RdmaListenerConfig};
+use session::{SessionManager, SessionProgress};
 
 use super::error::{Error, Result};
 
@@ -408,7 +408,7 @@ impl Drop for RdmaEngine {
 pub struct RdmaEngineDriver {
     shared: Arc<EngineShared>,
     io_progress: IoProgress,
-    resources: Option<EngineResources>,
+    session_progress: SessionProgress,
     scheduler: WorkScheduler,
     deadline_sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
     deadline_at: Option<tokio::time::Instant>,

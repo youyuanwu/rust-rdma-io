@@ -66,6 +66,7 @@ impl SessionManager {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::v2::engine) fn begin_all_connection_close(&self, shared: &EngineShared) {
         if self
             .shutdown_connection_close_started
