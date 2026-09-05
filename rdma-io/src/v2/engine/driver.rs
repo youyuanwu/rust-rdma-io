@@ -136,7 +136,7 @@ impl RdmaEngineDriver {
             self.scheduler
                 .mark_class_ready(WorkClass::CompletionDispatch);
         }
-        if published & super::cm::CM_WORK != 0 {
+        if published & super::session::cm::CM_WORK != 0 {
             self.scheduler.mark_class_ready(WorkClass::Cm);
         }
         if published & CQ_RECHECK_WORK != 0 {
@@ -2391,8 +2391,8 @@ mod tests {
     use crate::v2::engine::io_core::{
         completion_for_driver_test, install_accepted_operation_for_driver_test,
     };
-    use crate::v2::engine::listener::ListenerState;
     use crate::v2::engine::session::connection::{WorkRequestPoster, install_connection};
+    use crate::v2::engine::session::listener::ListenerState;
     use crate::v2::engine::{
         RdmaConnectionConfig, RdmaEngineLifecycle, RdmaEngineTerminalError, RdmaListener,
         test_engine_pair,

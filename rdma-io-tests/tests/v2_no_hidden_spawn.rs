@@ -826,6 +826,7 @@ fn expression_block() {
 fn dependency_detector_ignores_test_only_items_but_fails_closed_for_production() {
     let source = r#"
         use crate::EngineShared;
+        use crate::v2::engine::session::SessionManager;
 
         #[cfg(test)]
         use crate::ConnectionState;
@@ -836,10 +837,15 @@ fn dependency_detector_ignores_test_only_items_but_fails_closed_for_production()
     "#;
     let violations = find_forbidden_production_dependencies(
         source,
-        &["EngineShared", "ConnectionState", "WorkRequestPoster"],
+        &[
+            "EngineShared",
+            "ConnectionState",
+            "WorkRequestPoster",
+            "SessionManager",
+        ],
     )
     .unwrap();
-    assert_eq!(violations.len(), 2, "{violations:#?}");
+    assert_eq!(violations.len(), 3, "{violations:#?}");
     assert!(
         violations
             .iter()
@@ -849,6 +855,11 @@ fn dependency_detector_ignores_test_only_items_but_fails_closed_for_production()
         violations
             .iter()
             .any(|violation| violation.starts_with("WorkRequestPoster:"))
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.starts_with("SessionManager:"))
     );
     assert!(
         !violations
@@ -912,7 +923,10 @@ fn test_no_hidden_spawn_in_v2() {
         v2_dir.join("engine").join("mod.rs"),
         v2_dir.join("engine").join("driver.rs"),
         v2_dir.join("engine").join("session").join("mod.rs"),
+        v2_dir.join("engine").join("session").join("cm.rs"),
         v2_dir.join("engine").join("session").join("connection.rs"),
+        v2_dir.join("engine").join("session").join("drain.rs"),
+        v2_dir.join("engine").join("session").join("listener.rs"),
         v2_dir.join("engine").join("session").join("registry.rs"),
         v2_dir.join("engine").join("io_core").join("mod.rs"),
         v2_dir.join("engine").join("io_core").join("operation.rs"),
@@ -1004,9 +1018,9 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     let io_core_operation_path = v2_dir.join("engine").join("io_core").join("operation.rs");
     let engine_mod_path = v2_dir.join("engine").join("mod.rs");
     let connection_path = v2_dir.join("engine").join("session").join("connection.rs");
-    let listener_path = v2_dir.join("engine").join("listener.rs");
+    let listener_path = v2_dir.join("engine").join("session").join("listener.rs");
     let driver_path = v2_dir.join("engine").join("driver.rs");
-    let drain_path = v2_dir.join("engine").join("drain.rs");
+    let drain_path = v2_dir.join("engine").join("session").join("drain.rs");
     let session_path = v2_dir.join("engine").join("session").join("mod.rs");
     let v2_mod_path = v2_dir.join("mod.rs");
 
@@ -1181,8 +1195,8 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
             violations.join(", ")
         );
     }
-    let cm_source =
-        fs::read_to_string(v2_dir.join("engine").join("cm.rs")).expect("read CM source");
+    let cm_source = fs::read_to_string(v2_dir.join("engine").join("session").join("cm.rs"))
+        .expect("read CM source");
     let connect_waiter_violations = find_strong_owner_fields(
         &cm_source,
         "ConnectWaiter",
@@ -1358,34 +1372,33 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         );
     }
 
-    for fixed_path in ["cm.rs", "listener.rs", "drain.rs"] {
-        assert!(
-            v2_dir.join("engine").join(fixed_path).is_file(),
-            "phase-one relocation must keep engine/{fixed_path} at its transitional path"
-        );
-        assert!(
-            !v2_dir
-                .join("engine")
-                .join("session")
-                .join(fixed_path)
-                .exists(),
-            "phase-one relocation must defer moving {fixed_path}"
-        );
-    }
-    for relocated in ["mod.rs", "connection.rs", "registry.rs"] {
+    for relocated in [
+        "mod.rs",
+        "cm.rs",
+        "connection.rs",
+        "drain.rs",
+        "listener.rs",
+        "registry.rs",
+    ] {
         assert!(
             v2_dir
                 .join("engine")
                 .join("session")
                 .join(relocated)
                 .is_file(),
-            "phase-one relocation requires engine/session/{relocated}"
+            "session relocation requires engine/session/{relocated}"
         );
     }
-    for obsolete in ["session.rs", "connection.rs"] {
+    for obsolete in [
+        "session.rs",
+        "cm.rs",
+        "connection.rs",
+        "drain.rs",
+        "listener.rs",
+    ] {
         assert!(
             !v2_dir.join("engine").join(obsolete).exists(),
-            "phase-one relocation must remove obsolete engine/{obsolete}"
+            "session relocation must remove obsolete engine/{obsolete}"
         );
     }
 
