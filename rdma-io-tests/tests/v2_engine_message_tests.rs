@@ -558,8 +558,22 @@ async fn run_engine_first_terminalizes_message_driver(mode: CompletionMode) {
     let (listener, server, client) =
         establish_on(&server_engine, &client_engine, MessageConfig::default()).await;
 
+    let mut pending_recv = Box::pin(client.recv());
+    poll_fn(|cx| {
+        assert!(pending_recv.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
     client_engine_driver.abort();
     assert!(client_engine_driver.await.unwrap_err().is_cancelled());
+    let frontend_error = tokio::time::timeout(Duration::from_secs(10), pending_recv)
+        .await
+        .expect("engine loss did not wake the pending frontend receive")
+        .unwrap_err();
+    assert!(matches!(
+        frontend_error,
+        Error::DriverShutdown | Error::EngineWedged { .. }
+    ));
     let result = tokio::time::timeout(Duration::from_secs(10), client.wait_for_driver())
         .await
         .expect("engine loss did not terminalize the message driver")

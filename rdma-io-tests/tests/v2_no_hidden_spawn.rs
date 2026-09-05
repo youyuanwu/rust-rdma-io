@@ -1252,6 +1252,13 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     }
 
     let engine_mod = fs::read_to_string(&engine_mod_path).expect("read engine module source");
+    assert!(
+        engine_mod.contains("pub fn io_reclamation_budget(")
+            && engine_mod.contains("pub fn session_reclamation_budget(")
+            && !engine_mod.contains("pub fn reclamation_budget("),
+        "{} must expose owner-local reclamation controls without a compatibility alias",
+        engine_mod_path.display()
+    );
     let progress_source =
         fs::read_to_string(&progress_path).expect("read owner-neutral progress source");
     for forbidden in [

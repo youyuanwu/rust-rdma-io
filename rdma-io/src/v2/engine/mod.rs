@@ -170,12 +170,22 @@ impl RdmaEngineBuilder {
     }
 
     /// Set I/O reclamation/deadline actions per I/O service turn in `1..=4096`.
+    ///
+    /// This and [`Self::session_reclamation_budget`] replace the former
+    /// aggregate v2 `reclamation_budget`. To preserve an old aggregate value
+    /// `N`, divide it between the two owner-local controls. Odd values may use
+    /// either floor/ceiling assignment. The old value `1` has no exact
+    /// equivalent because both owners require a nonzero bounded turn; the
+    /// minimum replacement is `(1, 1)`.
     pub fn io_reclamation_budget(mut self, value: usize) -> Self {
         self.config.io_reclamation_budget = value;
         self
     }
 
     /// Set session reclamation/deadline actions per session turn in `1..=4096`.
+    ///
+    /// See [`Self::io_reclamation_budget`] for migration from the removed
+    /// aggregate `reclamation_budget` control.
     pub fn session_reclamation_budget(mut self, value: usize) -> Self {
         self.config.session_reclamation_budget = value;
         self
