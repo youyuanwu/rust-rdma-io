@@ -187,7 +187,8 @@ pub(super) async fn listen(
     shared.work_signal.publish(super::cm::CM_WORK);
     ListenWaiter {
         manager: Arc::downgrade(&shared.session),
-        request,
+        request: Arc::downgrade(&request),
+        observer: Arc::clone(&request.observer),
         finished: false,
     }
     .await
@@ -212,7 +213,8 @@ pub(super) async fn accept_with_setup(
     AcceptWaiter {
         manager: Arc::downgrade(&shared.session),
         listener: Arc::downgrade(&listener),
-        request,
+        request: Arc::downgrade(&request),
+        observer: Arc::clone(&request.observer),
         finished: false,
     }
     .await
@@ -306,6 +308,10 @@ impl IncomingChild {
 pub(super) struct ListenRequest {
     pub(super) address: SocketAddr,
     pub(super) config: RdmaListenerConfig,
+    observer: Arc<ListenRequestObserver>,
+}
+
+struct ListenRequestObserver {
     result: Mutex<TakeOnceResult<RdmaListener>>,
     cancelled: AtomicBool,
     waker: AtomicWaker,
@@ -316,25 +322,29 @@ impl ListenRequest {
         Self {
             address,
             config,
-            result: Mutex::new(TakeOnceResult::Pending),
-            cancelled: AtomicBool::new(false),
-            waker: AtomicWaker::new(),
+            observer: Arc::new(ListenRequestObserver {
+                result: Mutex::new(TakeOnceResult::Pending),
+                cancelled: AtomicBool::new(false),
+                waker: AtomicWaker::new(),
+            }),
         }
     }
 
     pub(super) fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
+        self.observer.cancelled.load(Ordering::Acquire)
     }
 
     pub(super) fn complete(&self, result: Result<RdmaListener>) {
-        let mut current = lock_unpoison(&self.result);
+        let mut current = lock_unpoison(&self.observer.result);
         if matches!(&*current, TakeOnceResult::Pending) {
             *current = TakeOnceResult::Ready(result);
             drop(current);
-            self.waker.wake();
+            self.observer.waker.wake();
         }
     }
+}
 
+impl ListenRequestObserver {
     fn take_result(&self) -> Option<Result<RdmaListener>> {
         let mut current = lock_unpoison(&self.result);
         match std::mem::replace(&mut *current, TakeOnceResult::Taken) {
@@ -367,7 +377,8 @@ impl ListenRequest {
 
 struct ListenWaiter {
     manager: Weak<super::SessionManager>,
-    request: Arc<ListenRequest>,
+    request: Weak<ListenRequest>,
+    observer: Arc<ListenRequestObserver>,
     finished: bool,
 }
 
@@ -375,12 +386,12 @@ impl Future for ListenWaiter {
     type Output = Result<RdmaListener>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if let Some(result) = self.request.take_result() {
+        if let Some(result) = self.observer.take_result() {
             self.finished = true;
             return Poll::Ready(result);
         }
-        self.request.waker.register(cx.waker());
-        if let Some(result) = self.request.take_result() {
+        self.observer.waker.register(cx.waker());
+        if let Some(result) = self.observer.take_result() {
             self.finished = true;
             return Poll::Ready(result);
         }
@@ -393,7 +404,10 @@ impl Drop for ListenWaiter {
         if self.finished {
             return;
         }
-        self.request.cancel();
+        self.observer.cancel();
+        if self.request.upgrade().is_none() {
+            return;
+        }
         if let Some(engine) = self.manager.upgrade().and_then(|manager| manager.engine()) {
             engine.work_signal.publish(super::cm::CM_WORK);
         }
@@ -402,10 +416,14 @@ impl Drop for ListenWaiter {
 
 pub(super) struct AcceptRequest {
     intent: Mutex<Option<AcceptIntent>>,
+    observer: Arc<AcceptRequestObserver>,
+    route_token: AtomicU64,
+}
+
+struct AcceptRequestObserver {
     result: Mutex<TakeOnceResult<RdmaConnection>>,
     cancelled: AtomicBool,
     delivered: AtomicBool,
-    route_token: AtomicU64,
     waker: AtomicWaker,
 }
 
@@ -413,11 +431,13 @@ impl AcceptRequest {
     fn new(intent: AcceptIntent) -> Self {
         Self {
             intent: Mutex::new(Some(intent)),
-            result: Mutex::new(TakeOnceResult::Pending),
-            cancelled: AtomicBool::new(false),
-            delivered: AtomicBool::new(false),
+            observer: Arc::new(AcceptRequestObserver {
+                result: Mutex::new(TakeOnceResult::Pending),
+                cancelled: AtomicBool::new(false),
+                delivered: AtomicBool::new(false),
+                waker: AtomicWaker::new(),
+            }),
             route_token: AtomicU64::new(0),
-            waker: AtomicWaker::new(),
         }
     }
 
@@ -434,7 +454,7 @@ impl AcceptRequest {
     }
 
     pub(super) fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
+        self.observer.cancelled.load(Ordering::Acquire)
     }
 
     pub(super) fn set_route_token(&self, token: u64) {
@@ -446,32 +466,34 @@ impl AcceptRequest {
     }
 
     pub(super) fn is_delivered(&self) -> bool {
-        self.delivered.load(Ordering::Acquire)
+        self.observer.delivered.load(Ordering::Acquire)
     }
 
     pub(super) fn complete(&self, result: Result<RdmaConnection>) {
-        let mut current = lock_unpoison(&self.result);
+        let mut current = lock_unpoison(&self.observer.result);
         if matches!(&*current, TakeOnceResult::Pending) {
             *current = TakeOnceResult::Ready(result);
             drop(current);
-            self.waker.wake();
+            self.observer.waker.wake();
         }
     }
 
     pub(super) fn complete_success(&self, connection: RdmaConnection) {
-        let mut current = lock_unpoison(&self.result);
-        if self.cancelled.load(Ordering::Acquire) || !matches!(&*current, TakeOnceResult::Pending) {
+        let mut current = lock_unpoison(&self.observer.result);
+        if self.observer.cancelled.load(Ordering::Acquire)
+            || !matches!(&*current, TakeOnceResult::Pending)
+        {
             drop(current);
             drop(connection);
             return;
         }
         *current = TakeOnceResult::Ready(Ok(connection));
         drop(current);
-        self.waker.wake();
+        self.observer.waker.wake();
     }
 
     pub(super) fn fail_undelivered(&self, error: Error) -> bool {
-        let mut current = lock_unpoison(&self.result);
+        let mut current = lock_unpoison(&self.observer.result);
         let replacement = match std::mem::replace(&mut *current, TakeOnceResult::Taken) {
             TakeOnceResult::Pending | TakeOnceResult::Ready(Ok(_)) => {
                 TakeOnceResult::Ready(Err(error))
@@ -481,10 +503,22 @@ impl AcceptRequest {
         };
         *current = replacement;
         drop(current);
-        self.waker.wake();
+        self.observer.waker.wake();
         self.is_delivered()
     }
 
+    #[cfg(test)]
+    fn cancel(&self) {
+        self.observer.cancel();
+    }
+
+    #[cfg(test)]
+    pub(super) fn take_result_for_test(&self) -> Option<Result<RdmaConnection>> {
+        self.observer.take_result()
+    }
+}
+
+impl AcceptRequestObserver {
     fn take_result(&self) -> Option<Result<RdmaConnection>> {
         let mut current = lock_unpoison(&self.result);
         match std::mem::replace(&mut *current, TakeOnceResult::Taken) {
@@ -500,11 +534,6 @@ impl AcceptRequest {
             }
             TakeOnceResult::Taken => None,
         }
-    }
-
-    #[cfg(test)]
-    pub(super) fn take_result_for_test(&self) -> Option<Result<RdmaConnection>> {
-        self.take_result()
     }
 
     fn cancel(&self) {
@@ -528,7 +557,8 @@ impl AcceptRequest {
 struct AcceptWaiter {
     manager: Weak<super::SessionManager>,
     listener: Weak<ListenerState>,
-    request: Arc<AcceptRequest>,
+    request: Weak<AcceptRequest>,
+    observer: Arc<AcceptRequestObserver>,
     finished: bool,
 }
 
@@ -536,15 +566,15 @@ impl Future for AcceptWaiter {
     type Output = Result<RdmaConnection>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if let Some(result) = self.request.take_result() {
+        if let Some(result) = self.observer.take_result() {
             if result.is_ok() {
                 self.mark_delivered();
             }
             self.finished = true;
             return Poll::Ready(result);
         }
-        self.request.waker.register(cx.waker());
-        if let Some(result) = self.request.take_result() {
+        self.observer.waker.register(cx.waker());
+        if let Some(result) = self.observer.take_result() {
             if result.is_ok() {
                 self.mark_delivered();
             }
@@ -564,7 +594,10 @@ impl AcceptWaiter {
         let Some(listener) = self.listener.upgrade() else {
             return;
         };
-        manager.cm.mark_accept_delivered(&listener, &self.request);
+        let Some(request) = self.request.upgrade() else {
+            return;
+        };
+        manager.cm.mark_accept_delivered(&listener, &request);
         if let Some(engine) = manager.engine() {
             engine.work_signal.publish(super::cm::CM_WORK);
         }
@@ -576,13 +609,16 @@ impl Drop for AcceptWaiter {
         if self.finished {
             return;
         }
-        self.request.cancel();
+        self.observer.cancel();
         let Some(manager) = self.manager.upgrade() else {
             return;
         };
         let Some(listener) = self.listener.upgrade() else {
             return;
         };
+        if self.request.upgrade().is_none() {
+            return;
+        }
         manager.cm.enqueue_listener_work(&listener);
         if let Some(engine) = manager.engine() {
             engine.work_signal.publish(super::cm::CM_WORK);
@@ -1040,6 +1076,34 @@ pub(super) enum InboundRejectReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn waiter_observers_do_not_retain_listen_or_accept_records() {
+        let listen = Arc::new(ListenRequest::new(
+            "127.0.0.1:1".parse().unwrap(),
+            RdmaListenerConfig::default(),
+        ));
+        let listen_record = Arc::downgrade(&listen);
+        let listen_observer = Arc::clone(&listen.observer);
+        listen.complete(Err(Error::DriverShutdown));
+        drop(listen);
+        assert!(listen_record.upgrade().is_none());
+        assert!(matches!(
+            listen_observer.take_result(),
+            Some(Err(Error::DriverShutdown))
+        ));
+
+        let accept = AcceptRequest::test_only();
+        let accept_record = Arc::downgrade(&accept);
+        let accept_observer = Arc::clone(&accept.observer);
+        accept.complete(Err(Error::DriverShutdown));
+        drop(accept);
+        assert!(accept_record.upgrade().is_none());
+        assert!(matches!(
+            accept_observer.take_result(),
+            Some(Err(Error::DriverShutdown))
+        ));
+    }
 
     fn request() -> Arc<AcceptRequest> {
         Arc::new(AcceptRequest::new(AcceptIntent::new(

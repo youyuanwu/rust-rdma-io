@@ -23,7 +23,7 @@ impl SessionManager {
         let first = connection.begin_close();
         let mut close_effects = None;
         if first {
-            match connection.transition_to_error_once() {
+            match self.transition_connection_to_error(connection) {
                 Ok(_) => {}
                 Err(error) => {
                     let event = connection.mark_cm_failure(error.clone());
@@ -127,7 +127,7 @@ impl SessionManager {
             if tokens.is_empty() {
                 None
             } else {
-                match connection.establish_qp_destruction_boundary(&lifecycle) {
+                match self.establish_qp_destruction_proof(&connection, &lifecycle) {
                     Ok(proof) => Some((tokens, proof)),
                     Err(error) => {
                         tracing::warn!(
@@ -141,9 +141,7 @@ impl SessionManager {
             }
         };
         if let Some((tokens, proof)) = forced_tokens {
-            for operation in tokens {
-                let _ = self.reclaim_after_qp_destroy(shared, &proof, &connection, operation);
-            }
+            self.reclaim_after_qp_destroy(shared, proof, &connection, tokens);
             if self.reject_queued_completions_after_qp_destroy(shared, &connection) {
                 self.io_core.publish_connection(&connection.io);
                 self.schedule_deadline(
@@ -527,7 +525,11 @@ mod tests {
             .accepted_operations
             .fetch_add(1, Ordering::AcqRel);
         connection.state.begin_close();
-        connection.state.transition_to_error_once().unwrap();
+        engine
+            .shared
+            .session
+            .transition_connection_to_error(&connection.state)
+            .unwrap();
 
         engine
             .shared

@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::Duration;
 
 use super::cm::CmState;
-use super::connection::{ConnectionAdmissionPool, ConnectionState};
+use super::connection::{ConnectionAdmissionPool, ConnectionState, QpDestroyStatus, SharedCmId};
 use super::driver::WorkSignal;
 use super::io_core::{IoCore, IoCoreEffects, OperationQuarantineEffect};
 use super::listener::ListenerState;
@@ -24,6 +24,25 @@ use super::registry::{ConnectionRegistry, ConnectionToken, Lookup, OperationToke
 use super::scheduler::{DeadlineKind, DeadlineRequest};
 use super::{EngineShared, Result};
 use crate::v2::error::Error;
+
+/// Non-forgeable authority for connection and QP lifecycle transitions.
+pub(super) struct SessionLifecycleAuthority {
+    _private: (),
+}
+
+#[cfg(test)]
+impl SessionLifecycleAuthority {
+    pub(super) fn for_test() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// Exact, non-cloneable proof minted after one successful synchronous QP destroy.
+pub(super) struct QpDestructionProof {
+    connection: ConnectionToken,
+    qp_num: u32,
+    _authority: (),
+}
 
 /// Resource-free close observation shared with connection frontends.
 pub(super) struct SessionCloseState {
@@ -257,6 +276,7 @@ pub(super) struct SessionManager {
     pub(super) shutdown_connection_close_started: AtomicBool,
     quarantines: Mutex<QuarantineState>,
     engine: OnceLock<Weak<EngineShared>>,
+    lifecycle_authority: SessionLifecycleAuthority,
     #[allow(
         dead_code,
         reason = "retained for session-owned close/reclaim service and test accounting adapters"
@@ -281,6 +301,7 @@ impl SessionManager {
             shutdown_connection_close_started: AtomicBool::new(false),
             quarantines: Mutex::new(QuarantineState::default()),
             engine: OnceLock::new(),
+            lifecycle_authority: SessionLifecycleAuthority { _private: () },
             io_core,
         })
     }
@@ -329,6 +350,69 @@ impl SessionManager {
             listener: Arc::downgrade(listener),
             close: listener.close_state(),
             local_addr: listener.local_addr,
+        }
+    }
+
+    pub(super) fn establish_qp_destruction_proof(
+        &self,
+        connection: &ConnectionState,
+        lifecycle: &std::sync::MutexGuard<'_, ()>,
+    ) -> Result<QpDestructionProof> {
+        match connection.destroy_qp_for_session(&self.lifecycle_authority, lifecycle)? {
+            QpDestroyStatus::DestroyedNow => Ok(QpDestructionProof {
+                connection: connection.token,
+                qp_num: connection.qp_num(),
+                _authority: (),
+            }),
+            QpDestroyStatus::AlreadyDestroyed => Err(Error::InvalidConfig(
+                "QP destruction proof was already minted and cannot be replayed".into(),
+            )),
+        }
+    }
+
+    pub(super) fn ensure_qp_destroyed(
+        &self,
+        connection: &ConnectionState,
+        lifecycle: &std::sync::MutexGuard<'_, ()>,
+    ) -> Result<()> {
+        match connection.destroy_qp_for_session(&self.lifecycle_authority, lifecycle)? {
+            QpDestroyStatus::DestroyedNow | QpDestroyStatus::AlreadyDestroyed => Ok(()),
+        }
+    }
+
+    pub(super) fn transition_connection_to_error(
+        &self,
+        connection: &ConnectionState,
+    ) -> Result<bool> {
+        connection.transition_to_error_once(&self.lifecycle_authority)
+    }
+
+    pub(super) fn finalize_connection_engine(
+        &self,
+        connection: &ConnectionState,
+        outcome: &super::lifecycle::MemoizedTerminalResult,
+    ) -> Option<super::io::PendingIoEvent> {
+        connection.finalize_engine(&self.lifecycle_authority, outcome)
+    }
+
+    pub(super) fn destroy_connection_resources(
+        &self,
+        connection: &ConnectionState,
+        lifecycle: &std::sync::MutexGuard<'_, ()>,
+    ) -> Result<Option<SharedCmId>> {
+        connection.destroy_connection_resources(&self.lifecycle_authority, lifecycle)
+    }
+
+    #[cfg(test)]
+    pub(super) fn mint_qp_destruction_proof_for_test(
+        &self,
+        connection: &ConnectionState,
+    ) -> QpDestructionProof {
+        connection.record_qp_destroyed_for_test();
+        QpDestructionProof {
+            connection: connection.token,
+            qp_num: connection.qp_num(),
+            _authority: (),
         }
     }
 
@@ -504,12 +588,47 @@ impl SessionManager {
     pub(super) fn reclaim_after_qp_destroy(
         &self,
         shared: &EngineShared,
-        proof: &super::connection::QpDestructionProof,
+        proof: QpDestructionProof,
+        connection: &ConnectionState,
+        tokens: Vec<OperationToken>,
+    ) -> usize {
+        let QpDestructionProof {
+            connection: proven_connection,
+            qp_num: proven_qp_num,
+            _authority: (),
+        } = proof;
+        if proven_connection != connection.token || proven_qp_num != connection.qp_num() {
+            tracing::warn!(
+                connection = connection.token.encode(),
+                "operation reclaim rejected a mismatched QP destruction proof"
+            );
+            return 0;
+        }
+        tokens
+            .into_iter()
+            .filter(|token| {
+                self.reclaim_after_proven_qp_destroy(
+                    shared,
+                    proven_connection,
+                    proven_qp_num,
+                    connection,
+                    *token,
+                )
+            })
+            .count()
+    }
+
+    fn reclaim_after_proven_qp_destroy(
+        &self,
+        shared: &EngineShared,
+        proven_connection: ConnectionToken,
+        proven_qp_num: u32,
         connection: &ConnectionState,
         token: OperationToken,
     ) -> bool {
         let (reclaimed, mut effects) = self.io_core.reclaim_after_qp_destroy(
-            proof,
+            proven_connection,
+            proven_qp_num,
             &connection.io,
             connection.operation_close_error(),
             token,
@@ -517,6 +636,23 @@ impl SessionManager {
         self.apply_io_effects(shared, &mut effects);
         effects.publish();
         reclaimed
+    }
+
+    #[cfg(test)]
+    pub(super) fn reclaim_after_qp_destroy_for_test(
+        &self,
+        shared: &EngineShared,
+        proof: &QpDestructionProof,
+        connection: &ConnectionState,
+        token: OperationToken,
+    ) -> bool {
+        self.reclaim_after_proven_qp_destroy(
+            shared,
+            proof.connection,
+            proof.qp_num,
+            connection,
+            token,
+        )
     }
 
     pub(super) fn reject_queued_completions_after_qp_destroy(
@@ -703,6 +839,45 @@ mod tests {
             Arc::strong_count(&state),
             before + 1,
             "last-frontend close transfers the only added retain to SessionManager CM work"
+        );
+    }
+
+    #[test]
+    fn session_lifecycle_authority_mints_one_exact_qp_proof() {
+        let (engine, _driver) = test_engine_pair(CompletionMode::Polling);
+        let connection = install_connection(
+            &engine.shared,
+            Arc::new(TestPoster { qp_num: 19 }),
+            RdmaConnectionConfig::default(),
+            None,
+            None,
+        )
+        .expect("install synthetic connection");
+        let lifecycle = connection.state.lock_lifecycle();
+        let proof = engine
+            .shared
+            .session
+            .establish_qp_destruction_proof(&connection.state, &lifecycle)
+            .expect("first successful destroy mints proof");
+        assert_eq!(proof.connection, connection.state.token);
+        assert_eq!(proof.qp_num, connection.state.qp_num());
+        assert!(matches!(
+            engine
+                .shared
+                .session
+                .establish_qp_destruction_proof(&connection.state, &lifecycle),
+            Err(Error::InvalidConfig(message)) if message.contains("cannot be replayed")
+        ));
+        drop(lifecycle);
+
+        assert_eq!(
+            engine.shared.session.reclaim_after_qp_destroy(
+                &engine.shared,
+                proof,
+                &connection.state,
+                Vec::new(),
+            ),
+            0
         );
     }
 }

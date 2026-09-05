@@ -8,7 +8,6 @@ use std::task::{Context, Poll};
 
 use futures_util::task::AtomicWaker;
 
-use super::super::connection::QpDestructionProof;
 use super::super::io::{
     IoEventDestination, IoEventSender, IoOperationContext, IoOperationIdentity, IoRecvRequest,
     IoSendRequest, IoSubmissionDisposition, PendingIoEvent,
@@ -1829,13 +1828,14 @@ impl IoCore {
 
     pub(in crate::v2::engine) fn reclaim_after_qp_destroy(
         &self,
-        proof: &QpDestructionProof,
+        destroyed_connection: ConnectionToken,
+        destroyed_qp_num: u32,
         connection: &EstablishedIoConnection,
         close_error: Error,
         token: OperationToken,
     ) -> (bool, IoCoreEffects) {
         let identity = connection.identity();
-        if !proof.proves_identity(identity.connection, identity.qp_num) {
+        if destroyed_connection != identity.connection || destroyed_qp_num != identity.qp_num {
             tracing::warn!(
                 connection = identity.connection.encode(),
                 operation = token.encode(),
@@ -2280,7 +2280,9 @@ mod tests {
             .state
             .mark_cm_failure(Error::ProtocolViolation("contextual close failure".into()));
         drop(terminal);
-        let proof = connection.state.mint_qp_destruction_proof_for_test();
+        let proof = shared
+            .session
+            .mint_qp_destruction_proof_for_test(&connection.state);
 
         assert!(shared.reclaim_after_qp_destroy(&proof, &connection.state, token));
         let Some(super::super::io::IoEvent::Completion(completion)) = receiver.pop() else {
@@ -2300,7 +2302,9 @@ mod tests {
         let owner = synthetic_connection_on(&shared, 22);
         let other = synthetic_connection_on(&shared, 23);
         let token = install_accepted(&shared, &owner.state, WcOpcode::Send);
-        let wrong_proof = other.state.mint_qp_destruction_proof_for_test();
+        let wrong_proof = shared
+            .session
+            .mint_qp_destruction_proof_for_test(&other.state);
 
         assert!(!shared.reclaim_after_qp_destroy(&wrong_proof, &owner.state, token));
         assert_eq!(owner.state.accepted_count(), 1);
@@ -2309,7 +2313,9 @@ mod tests {
             Lookup::Occupied(_)
         ));
 
-        let proof = owner.state.mint_qp_destruction_proof_for_test();
+        let proof = shared
+            .session
+            .mint_qp_destruction_proof_for_test(&owner.state);
         assert!(shared.reclaim_after_qp_destroy(&proof, &owner.state, token));
         assert_eq!(owner.state.accepted_count(), 0);
         assert_eq!(shared.operations.live(), 0);

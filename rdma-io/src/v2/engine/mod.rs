@@ -601,7 +601,10 @@ impl EngineShared {
             if outcome.is_error() && connection.retain_bundle_for_engine_failure() {
                 self.session.track_connection_quarantine(connection.token);
             }
-            if let Some(event) = connection.finalize_engine(&outcome) {
+            if let Some(event) = self
+                .session
+                .finalize_connection_engine(connection, &outcome)
+            {
                 event.deliver();
             }
         }
@@ -779,12 +782,12 @@ impl EngineShared {
     #[cfg(test)]
     pub(super) fn reclaim_after_qp_destroy(
         &self,
-        proof: &connection::QpDestructionProof,
+        proof: &session::QpDestructionProof,
         connection: &connection::ConnectionState,
         token: registry::OperationToken,
     ) -> bool {
         self.session
-            .reclaim_after_qp_destroy(self, proof, connection, token)
+            .reclaim_after_qp_destroy_for_test(self, proof, connection, token)
     }
 
     #[cfg(test)]

@@ -2575,7 +2575,11 @@ mod tests {
                     expected,
                 );
                 connection.state.begin_close();
-                connection.state.transition_to_error_once().unwrap();
+                engine
+                    .shared
+                    .session
+                    .transition_connection_to_error(&connection.state)
+                    .unwrap();
                 engine.shared.test_driver.queue_released_connection_cqe(
                     completion_for_driver_test(operation, poster.qp_num, opcode, status),
                 );

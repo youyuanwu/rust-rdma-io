@@ -17,7 +17,7 @@ use super::io_core::{
 };
 use super::lifecycle::MemoizedTerminalResult;
 use super::registry::{ConnectionToken, OperationToken, lock_unpoison, read_unpoison};
-use super::session::{SessionCloseState, SessionConnection};
+use super::session::{SessionCloseState, SessionConnection, SessionLifecycleAuthority};
 use super::{EngineShared, RdmaConnectionConfig};
 use crate::cm::{CmId, ConnParam, EventChannel};
 use crate::v2::error::{Error, Result};
@@ -64,19 +64,6 @@ impl RdmaConnectionIdentity {
     #[cfg(any(test, feature = "test-hooks"))]
     pub(super) fn registration_generation(&self) -> u32 {
         self.generation
-    }
-}
-
-#[derive(Clone)]
-pub(super) struct QpDestructionProof {
-    connection: ConnectionToken,
-    qp_num: u32,
-    _private: (),
-}
-
-impl QpDestructionProof {
-    pub(super) fn proves_identity(&self, connection: ConnectionToken, qp_num: u32) -> bool {
-        self.connection == connection && self.qp_num == qp_num
     }
 }
 
@@ -314,7 +301,7 @@ pub(super) struct ConnectionState {
     quarantined: AtomicBool,
     error_transition_started: AtomicBool,
     error_transition_complete: AtomicBool,
-    qp_destruction_proof: OnceLock<QpDestructionProof>,
+    qp_destroyed: AtomicBool,
     frontend_count: AtomicUsize,
     retirement_requested: AtomicBool,
     retirement_started: AtomicBool,
@@ -324,6 +311,11 @@ pub(super) struct ConnectionState {
     cm_route: Option<ConnectionCmRoute>,
     #[cfg(any(test, feature = "test-hooks"))]
     retained_setup_rollback_mr: Mutex<Option<Mr>>,
+}
+
+pub(super) enum QpDestroyStatus {
+    DestroyedNow,
+    AlreadyDestroyed,
 }
 
 impl ConnectionState {
@@ -367,7 +359,7 @@ impl ConnectionState {
             quarantined: AtomicBool::new(false),
             error_transition_started: AtomicBool::new(false),
             error_transition_complete: AtomicBool::new(false),
-            qp_destruction_proof: OnceLock::new(),
+            qp_destroyed: AtomicBool::new(false),
             frontend_count: AtomicUsize::new(1),
             retirement_requested: AtomicBool::new(false),
             retirement_started: AtomicBool::new(false),
@@ -472,10 +464,11 @@ impl ConnectionState {
 
     pub(super) fn finalize_engine(
         &self,
+        authority: &SessionLifecycleAuthority,
         outcome: &MemoizedTerminalResult,
     ) -> Option<PendingIoEvent> {
         self.stop_posting();
-        let _ = self.transition_to_error_once();
+        let _ = self.transition_to_error_once(authority);
         if let Some(error) = outcome.error() {
             let mut close_outcome = lock_unpoison(&self.close.outcome);
             if close_outcome.is_none() {
@@ -503,7 +496,10 @@ impl ConnectionState {
         self.pending_io_event(IoTerminalEvent::Terminal(error))
     }
 
-    pub(super) fn transition_to_error_once(&self) -> Result<bool> {
+    pub(super) fn transition_to_error_once(
+        &self,
+        _authority: &SessionLifecycleAuthority,
+    ) -> Result<bool> {
         if self.error_transition_started.swap(true, Ordering::AcqRel) {
             return Ok(false);
         }
@@ -519,8 +515,9 @@ impl ConnectionState {
 
     pub(super) fn destroy_connection_resources(
         &self,
+        _authority: &SessionLifecycleAuthority,
         _lifecycle: &MutexGuard<'_, ()>,
-    ) -> Result<(Option<SharedCmId>, QpDestructionProof)> {
+    ) -> Result<Option<SharedCmId>> {
         let outstanding_operations = self.accepted_count();
         if outstanding_operations != 0 {
             return Err(Error::EngineWedged {
@@ -530,33 +527,39 @@ impl ConnectionState {
             });
         }
         self.stop_posting();
-        let destroy_qp = self.qp_destruction_proof.get().is_none();
+        let destroy_qp = !self.qp_destroyed.load(Ordering::Acquire);
         let (cm_id, qp_destroyed) = self.poster.destroy_connection(destroy_qp)?;
-        let proof = if qp_destroyed {
-            self.mint_qp_destruction_proof()
-        } else {
-            self.qp_destruction_proof.get().cloned().ok_or_else(|| {
-                Error::InvalidConfig(
-                    "connection resources lost QP ownership without a destruction proof".into(),
-                )
-            })?
-        };
-        Ok((cm_id, proof))
+        if qp_destroyed {
+            self.record_qp_destroyed();
+        }
+        if !self.qp_destroyed.load(Ordering::Acquire) {
+            return Err(Error::InvalidConfig(
+                "connection resources lost QP ownership without a destruction boundary".into(),
+            ));
+        }
+        Ok(cm_id)
     }
 
-    pub(super) fn establish_qp_destruction_boundary(
+    pub(super) fn destroy_qp_for_session(
         &self,
+        _authority: &SessionLifecycleAuthority,
         _lifecycle: &MutexGuard<'_, ()>,
-    ) -> Result<QpDestructionProof> {
+    ) -> Result<QpDestroyStatus> {
         self.stop_posting();
-        if let Some(proof) = self.qp_destruction_proof.get() {
-            return Ok(proof.clone());
+        if self.qp_destroyed.load(Ordering::Acquire) {
+            return Ok(QpDestroyStatus::AlreadyDestroyed);
         }
         match self.poster.destroy_qp() {
-            Ok(true) => Ok(self.mint_qp_destruction_proof()),
+            Ok(true) => {
+                if self.record_qp_destroyed() {
+                    Ok(QpDestroyStatus::DestroyedNow)
+                } else {
+                    Ok(QpDestroyStatus::AlreadyDestroyed)
+                }
+            }
             Ok(false) => {
-                if let Some(proof) = self.qp_destruction_proof.get() {
-                    Ok(proof.clone())
+                if self.qp_destroyed.load(Ordering::Acquire) {
+                    Ok(QpDestroyStatus::AlreadyDestroyed)
                 } else {
                     Err(Error::InvalidConfig(
                         "QP ownership disappeared before its destruction boundary was recorded"
@@ -564,13 +567,10 @@ impl ConnectionState {
                     ))
                 }
             }
-            Err(error) => {
-                if let Some(proof) = self.qp_destruction_proof.get() {
-                    Ok(proof.clone())
-                } else {
-                    Err(error)
-                }
+            Err(_) if self.qp_destroyed.load(Ordering::Acquire) => {
+                Ok(QpDestroyStatus::AlreadyDestroyed)
             }
+            Err(error) => Err(error),
         }
     }
 
@@ -737,30 +737,21 @@ impl ConnectionState {
 
     pub(super) fn recover_reservation_quarantine(&self) {
         if let Some(reservation) = lock_unpoison(&self.admission).as_mut() {
-            reservation.recover_quarantine(self.qp_destruction_proof.get().is_none());
+            reservation.recover_quarantine(!self.qp_destroyed.load(Ordering::Acquire));
         }
     }
 
-    fn mint_qp_destruction_proof(&self) -> QpDestructionProof {
-        let proof = QpDestructionProof {
-            connection: self.token,
-            qp_num: self.qp_num,
-            _private: (),
-        };
-        if self.qp_destruction_proof.set(proof.clone()).is_ok()
-            && let Some(reservation) = lock_unpoison(&self.admission).as_mut()
-        {
+    fn record_qp_destroyed(&self) -> bool {
+        let first = !self.qp_destroyed.swap(true, Ordering::AcqRel);
+        if first && let Some(reservation) = lock_unpoison(&self.admission).as_mut() {
             reservation.mark_qp_destroyed();
         }
-        self.qp_destruction_proof
-            .get()
-            .expect("QP destruction proof was just initialized")
-            .clone()
+        first
     }
 
     #[cfg(test)]
-    pub(super) fn mint_qp_destruction_proof_for_test(&self) -> QpDestructionProof {
-        self.mint_qp_destruction_proof()
+    pub(super) fn record_qp_destroyed_for_test(&self) {
+        self.record_qp_destroyed();
     }
 
     pub(super) fn cm_route(&self) -> Option<ConnectionCmRoute> {
@@ -1755,7 +1746,7 @@ mod tests {
     }
 
     #[test]
-    fn live_io_and_qp_destruction_proofs_require_exact_identity() {
+    fn live_io_proofs_require_exact_identity() {
         let registry = ConnectionRegistry::new(1).unwrap();
         let registration = registry.register(1, |token| {
             Arc::new(ConnectionState::new(
@@ -1790,11 +1781,6 @@ mod tests {
         };
         registry.set_qp_mapping_for_test(1, wrong_generation);
         assert!(registry.prove_live_io(token, 1).is_none());
-
-        let destroyed = connection.mint_qp_destruction_proof_for_test();
-        assert!(destroyed.proves_identity(token, 1));
-        assert!(!destroyed.proves_identity(wrong_generation, 1));
-        assert!(!destroyed.proves_identity(token, 2));
 
         registry.set_qp_mapping_for_test(1, token);
         let retained = registry
@@ -2135,7 +2121,8 @@ mod tests {
         });
 
         let lifecycle = connection.lock_lifecycle();
-        let error = match connection.destroy_connection_resources(&lifecycle) {
+        let authority = SessionLifecycleAuthority::for_test();
+        let error = match connection.destroy_connection_resources(&authority, &lifecycle) {
             Ok(_) => panic!("accepted work must prevent connection destruction"),
             Err(error) => error,
         };

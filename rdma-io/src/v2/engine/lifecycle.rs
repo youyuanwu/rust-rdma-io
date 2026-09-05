@@ -89,13 +89,13 @@ impl EngineShared {
         for connection in self.session.connections.occupied() {
             let _lifecycle = connection.lock_lifecycle();
             connection.stop_posting();
-            let _ = connection.transition_to_error_once();
+            let _ = self.session.transition_connection_to_error(&connection);
             if connection.accepted_count() == 0
                 && !connection.is_retired()
                 && !connection.retirement_is_quarantined()
             {
-                match connection.establish_qp_destruction_boundary(&_lifecycle) {
-                    Ok(_proof) => {}
+                match self.session.ensure_qp_destroyed(&connection, &_lifecycle) {
+                    Ok(()) => {}
                     Err(error) => {
                         tracing::warn!(
                             qp_num = connection.qp_num(),

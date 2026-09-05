@@ -871,6 +871,8 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         "SessionManager",
         "SessionConnection",
         "SessionListener",
+        "SessionLifecycleAuthority",
+        "QpDestructionProof",
     ];
     for path in [&io_core_mod_path, &io_core_operation_path] {
         let source = fs::read_to_string(path).expect("read I/O core source");
@@ -975,13 +977,26 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         connection_path.display(),
         connection_owner_violations.join(", ")
     );
+    assert!(
+        connection_source.contains(
+            "pub async fn close(&self) -> Result<()> {\n        self.session.close().await"
+        ) && connection_source.contains("self.session.request_close();"),
+        "{} public close and last-frontend close must use the opaque session capability",
+        connection_path.display()
+    );
 
     let listener_source = fs::read_to_string(&listener_path).expect("read listener source");
     for waiter in ["RdmaListener", "ListenWaiter", "AcceptWaiter"] {
         let violations = find_strong_owner_fields(
             &listener_source,
             waiter,
-            &["EngineShared", "ListenerState", "SessionManager"],
+            &[
+                "EngineShared",
+                "ListenerState",
+                "SessionManager",
+                "ListenRequest",
+                "AcceptRequest",
+            ],
         )
         .unwrap_or_else(|error| panic!("parse {waiter} ownership fields: {error}"));
         assert!(
@@ -996,7 +1011,12 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     let connect_waiter_violations = find_strong_owner_fields(
         &cm_source,
         "ConnectWaiter",
-        &["EngineShared", "ConnectionState", "SessionManager"],
+        &[
+            "EngineShared",
+            "ConnectionState",
+            "SessionManager",
+            "OutboundRequest",
+        ],
     )
     .expect("parse ConnectWaiter ownership fields");
     assert!(
@@ -1028,6 +1048,33 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         cm_source.contains("impl SessionManager")
             && cm_source.contains("fn retire_registered_connection("),
         "connection retirement policy must be implemented on SessionManager"
+    );
+    assert!(
+        session_source.contains("struct SessionLifecycleAuthority")
+            && session_source.contains("lifecycle_authority: SessionLifecycleAuthority")
+            && session_source.contains("struct QpDestructionProof")
+            && !session_source.contains("derive(Clone)]\npub(super) struct QpDestructionProof")
+            && !session_source.contains("derive(Copy)]\npub(super) struct QpDestructionProof"),
+        "SessionManager must own non-cloneable lifecycle authority and QP proof"
+    );
+    assert_eq!(
+        session_source.matches("QpDestructionProof {").count(),
+        5,
+        "QP proof occurrences are limited to its definition, mint methods, constructors, and one consuming destructure"
+    );
+    assert!(
+        connection_source.contains(
+            "fn destroy_qp_for_session(\n        &self,\n        _authority: &SessionLifecycleAuthority,"
+        ) && connection_source.contains(
+            "fn transition_to_error_once(\n        &self,\n        _authority: &SessionLifecycleAuthority,"
+        ),
+        "QP destroy and error transition must require SessionManager lifecycle authority"
+    );
+    assert!(
+        !fs::read_to_string(&io_core_operation_path)
+            .expect("read I/O operation source")
+            .contains("QpDestructionProof"),
+        "production I/O core must not depend on the session destruction proof type"
     );
 
     let io_source = fs::read_to_string(&io_path).expect("read engine I/O boundary source");
@@ -1093,7 +1140,10 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         "IoSendRequest",
         "IoSubmissionDisposition",
         "SessionConnection",
+        "SessionListener",
         "SessionManager",
+        "SessionLifecycleAuthority",
+        "QpDestructionProof",
     ] {
         assert!(
             !public_reexports.contains(internal),
