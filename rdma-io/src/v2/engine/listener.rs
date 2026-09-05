@@ -4,19 +4,18 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
-
-use futures_util::task::AtomicWaker;
-use tokio::sync::Notify;
 
 use super::connection::{ConnectionReservation, SharedCmId};
 use super::io::{IoConnection, IoEventReceiver};
 use super::lifecycle::{MemoizedTerminalResult, TakeOnceResult};
 use super::registry::{lock_unpoison, read_unpoison};
+use super::session::{SessionListener, SessionListenerCloseState};
 use super::{ConnectionSetup, EngineShared, RdmaConnection, RdmaConnectionConfig, SetupSummary};
 use crate::v2::error::{Error, Result};
+use futures_util::task::AtomicWaker;
 
 pub(crate) const DEFAULT_LISTENER_BACKLOG: usize = 128;
 const MAX_LISTENER_BACKLOG: usize = 4_096;
@@ -82,16 +81,14 @@ impl RdmaListenerConfig {
 /// one selected/setup pair at a time. Cancellation after selection owns that
 /// child through rejection or close, so a later waiter cannot overtake it.
 pub struct RdmaListener {
-    pub(super) shared: Arc<EngineShared>,
-    pub(super) state: Arc<ListenerState>,
+    session: SessionListener,
 }
 
 impl Clone for RdmaListener {
     fn clone(&self) -> Self {
-        self.state.frontend_count.fetch_add(1, Ordering::Relaxed);
+        self.session.retain_frontend();
         Self {
-            shared: Arc::clone(&self.shared),
-            state: Arc::clone(&self.state),
+            session: self.session.clone(),
         }
     }
 }
@@ -99,7 +96,7 @@ impl Clone for RdmaListener {
 impl RdmaListener {
     /// Return the address assigned to this listener.
     pub fn local_addr(&self) -> Result<SocketAddr> {
-        Ok(self.state.local_addr)
+        Ok(self.session.local_addr())
     }
 
     /// Accept the next inbound connection with the default connection configuration.
@@ -109,9 +106,10 @@ impl RdmaListener {
     /// error, or with the engine-wide terminal error if the driver has failed.
     /// Low-level setup posts zero initial receives.
     pub async fn accept(&self) -> Result<RdmaConnection> {
+        let (shared, state) = self.session.owners()?;
         accept_with_setup(
-            Arc::clone(&self.shared),
-            Arc::clone(&self.state),
+            shared,
+            state,
             RdmaConnectionConfig::default(),
             empty_connection_setup(),
         )
@@ -124,13 +122,8 @@ impl RdmaListener {
     /// Cancellation and listener-close behavior are the same as [`Self::accept`].
     /// No value is silently clamped, and low-level setup posts zero receives.
     pub async fn accept_with_config(&self, config: RdmaConnectionConfig) -> Result<RdmaConnection> {
-        accept_with_setup(
-            Arc::clone(&self.shared),
-            Arc::clone(&self.state),
-            config,
-            empty_connection_setup(),
-        )
-        .await
+        let (shared, state) = self.session.owners()?;
+        accept_with_setup(shared, state, config, empty_connection_setup()).await
     }
 
     pub(crate) async fn accept_with_io_setup<F>(
@@ -141,20 +134,16 @@ impl RdmaListener {
     where
         F: FnOnce(IoConnection, IoEventReceiver) -> Result<usize> + Send + 'static,
     {
-        accept_with_setup(
-            Arc::clone(&self.shared),
-            Arc::clone(&self.state),
-            config,
-            Box::new(setup),
-        )
-        .await
+        let (shared, state) = self.session.owners()?;
+        accept_with_setup(shared, state, config, Box::new(setup)).await
     }
 
     pub(crate) fn validate_message_connection_config(
         &self,
         config: &RdmaConnectionConfig,
     ) -> Result<()> {
-        config.validate(&self.shared.config, self.shared.provider.as_ref())
+        let (shared, _) = self.session.owners()?;
+        config.validate(&shared.config, shared.provider.as_ref())
     }
 
     /// Close the listener and wait for CM destruction or engine termination.
@@ -164,28 +153,20 @@ impl RdmaListener {
     /// engine-wide terminal error and the ID remains quarantined with the failed
     /// engine rather than being destroyed without CM progress.
     pub async fn close(&self) -> Result<()> {
-        self.state.request_close(&self.shared);
-        loop {
-            let notified = self.state.close_notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if let Some(result) = self.state.close_result() {
-                return result;
-            }
-            if let Some(outcome) = self.shared.outcome() {
-                return outcome.into_result();
-            }
-            notified.await;
+        self.session.close().await
+    }
+
+    pub(super) fn from_state(shared: &Arc<EngineShared>, state: Arc<ListenerState>) -> Self {
+        Self {
+            session: shared.session.listener_capability(&state),
         }
     }
 }
 
 impl Drop for RdmaListener {
     fn drop(&mut self) {
-        let previous = self.state.frontend_count.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "listener frontend count must be positive");
-        if previous == 1 {
-            self.state.request_close(&self.shared);
+        if self.session.release_frontend() {
+            self.session.request_close();
         }
     }
 }
@@ -196,16 +177,16 @@ pub(super) async fn listen(
     config: RdmaListenerConfig,
 ) -> Result<RdmaListener> {
     config.validate()?;
-    let admission = read_unpoison(&shared.admission);
+    let admission = read_unpoison(&shared.session.admission);
     if let Some(error) = shared.admission_error() {
         return Err(error);
     }
     let request = Arc::new(ListenRequest::new(address, config));
-    shared.cm.enqueue_listen(Arc::clone(&request));
+    shared.session.cm.enqueue_listen(Arc::clone(&request));
     drop(admission);
     shared.work_signal.publish(super::cm::CM_WORK);
     ListenWaiter {
-        shared,
+        manager: Arc::downgrade(&shared.session),
         request,
         finished: false,
     }
@@ -219,18 +200,18 @@ pub(super) async fn accept_with_setup(
     setup: ConnectionSetup,
 ) -> Result<RdmaConnection> {
     config.validate(&shared.config, shared.provider.as_ref())?;
-    let admission = read_unpoison(&shared.admission);
+    let admission = read_unpoison(&shared.session.admission);
     if let Some(error) = shared.admission_error() {
         return Err(error);
     }
     let request = Arc::new(AcceptRequest::new(AcceptIntent::new(config, setup)));
     listener.register_waiter(Arc::clone(&request))?;
     drop(admission);
-    shared.cm.enqueue_listener_work(&listener);
+    shared.session.cm.enqueue_listener_work(&listener);
     shared.work_signal.publish(super::cm::CM_WORK);
     AcceptWaiter {
-        shared,
-        listener,
+        manager: Arc::downgrade(&shared.session),
+        listener: Arc::downgrade(&listener),
         request,
         finished: false,
     }
@@ -247,15 +228,13 @@ pub(super) fn run_setup_before_establish(
     before_establish: impl FnOnce() -> Result<()>,
     establish: impl FnOnce() -> Result<()>,
 ) -> Result<SetupSummary> {
-    let accepted_before = connection.state.accepted_count();
-    let (io, events) = IoConnection::new(
-        Arc::clone(&connection.shared),
-        Arc::clone(&connection.state),
-    )?;
+    let connection_state = connection.require_session_state()?;
+    let accepted_before = connection_state.accepted_count();
+    let (io, events) = IoConnection::from_connection(connection)?;
     let summary = SetupSummary {
         posted_wrs: setup(io, events)?,
     };
-    let accepted_after = connection.state.accepted_count();
+    let accepted_after = connection_state.accepted_count();
     let posted_wrs = accepted_after.checked_sub(accepted_before).ok_or_else(|| {
         Error::InvalidConfig("pre-establishment setup reduced the accepted WR set".into())
     })?;
@@ -387,7 +366,7 @@ impl ListenRequest {
 }
 
 struct ListenWaiter {
-    shared: Arc<EngineShared>,
+    manager: Weak<super::SessionManager>,
     request: Arc<ListenRequest>,
     finished: bool,
 }
@@ -415,7 +394,9 @@ impl Drop for ListenWaiter {
             return;
         }
         self.request.cancel();
-        self.shared.work_signal.publish(super::cm::CM_WORK);
+        if let Some(engine) = self.manager.upgrade().and_then(|manager| manager.engine()) {
+            engine.work_signal.publish(super::cm::CM_WORK);
+        }
     }
 }
 
@@ -545,8 +526,8 @@ impl AcceptRequest {
 }
 
 struct AcceptWaiter {
-    shared: Arc<EngineShared>,
-    listener: Arc<ListenerState>,
+    manager: Weak<super::SessionManager>,
+    listener: Weak<ListenerState>,
     request: Arc<AcceptRequest>,
     finished: bool,
 }
@@ -557,10 +538,7 @@ impl Future for AcceptWaiter {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if let Some(result) = self.request.take_result() {
             if result.is_ok() {
-                self.shared
-                    .cm
-                    .mark_accept_delivered(&self.listener, &self.request);
-                self.shared.work_signal.publish(super::cm::CM_WORK);
+                self.mark_delivered();
             }
             self.finished = true;
             return Poll::Ready(result);
@@ -568,15 +546,28 @@ impl Future for AcceptWaiter {
         self.request.waker.register(cx.waker());
         if let Some(result) = self.request.take_result() {
             if result.is_ok() {
-                self.shared
-                    .cm
-                    .mark_accept_delivered(&self.listener, &self.request);
-                self.shared.work_signal.publish(super::cm::CM_WORK);
+                self.mark_delivered();
             }
+
             self.finished = true;
             return Poll::Ready(result);
         }
         Poll::Pending
+    }
+}
+
+impl AcceptWaiter {
+    fn mark_delivered(&self) {
+        let Some(manager) = self.manager.upgrade() else {
+            return;
+        };
+        let Some(listener) = self.listener.upgrade() else {
+            return;
+        };
+        manager.cm.mark_accept_delivered(&listener, &self.request);
+        if let Some(engine) = manager.engine() {
+            engine.work_signal.publish(super::cm::CM_WORK);
+        }
     }
 }
 
@@ -586,8 +577,16 @@ impl Drop for AcceptWaiter {
             return;
         }
         self.request.cancel();
-        self.shared.cm.enqueue_listener_work(&self.listener);
-        self.shared.work_signal.publish(super::cm::CM_WORK);
+        let Some(manager) = self.manager.upgrade() else {
+            return;
+        };
+        let Some(listener) = self.listener.upgrade() else {
+            return;
+        };
+        manager.cm.enqueue_listener_work(&listener);
+        if let Some(engine) = manager.engine() {
+            engine.work_signal.publish(super::cm::CM_WORK);
+        }
     }
 }
 
@@ -600,9 +599,7 @@ pub(super) struct ListenerState {
     closing: AtomicBool,
     finalization_started: AtomicBool,
     failure: Mutex<Option<Error>>,
-    close_outcome: Mutex<Option<MemoizedTerminalResult>>,
-    pub(super) close_notify: Notify,
-    pub(super) frontend_count: AtomicUsize,
+    close: Arc<SessionListenerCloseState>,
     work_enqueued: AtomicBool,
 }
 
@@ -622,9 +619,7 @@ impl ListenerState {
             closing: AtomicBool::new(false),
             finalization_started: AtomicBool::new(false),
             failure: Mutex::new(None),
-            close_outcome: Mutex::new(None),
-            close_notify: Notify::new(),
-            frontend_count: AtomicUsize::new(1),
+            close: SessionListenerCloseState::new(),
             work_enqueued: AtomicBool::new(false),
         }
     }
@@ -640,9 +635,7 @@ impl ListenerState {
             closing: AtomicBool::new(false),
             finalization_started: AtomicBool::new(false),
             failure: Mutex::new(None),
-            close_outcome: Mutex::new(None),
-            close_notify: Notify::new(),
-            frontend_count: AtomicUsize::new(1),
+            close: SessionListenerCloseState::new(),
             work_enqueued: AtomicBool::new(false),
         })
     }
@@ -851,7 +844,7 @@ impl ListenerState {
 
     pub(super) fn request_close(self: &Arc<Self>, shared: &Arc<EngineShared>) {
         if !self.closing.swap(true, Ordering::AcqRel) {
-            shared.cm.enqueue_listener_work(self);
+            shared.session.cm.enqueue_listener_work(self);
             shared.work_signal.publish(super::cm::CM_WORK);
         }
     }
@@ -919,25 +912,18 @@ impl ListenerState {
     }
 
     pub(super) fn finish_close(&self, error: Option<Error>) {
-        let mut outcome = lock_unpoison(&self.close_outcome);
-        if outcome.is_none() {
-            let failure = error.or_else(|| lock_unpoison(&self.failure).clone());
-            *outcome = Some(match failure {
-                Some(error) => MemoizedTerminalResult::from_error(error),
-                None => MemoizedTerminalResult::success(),
-            });
-        }
-        drop(outcome);
-        self.close_notify.notify_waiters();
+        let failure = error.or_else(|| lock_unpoison(&self.failure).clone());
+        self.close.store_if_empty(match failure {
+            Some(error) => MemoizedTerminalResult::from_error(error),
+            None => MemoizedTerminalResult::success(),
+        });
+        self.close.notify_waiters();
     }
 
     pub(super) fn terminalize(&self, outcome: &MemoizedTerminalResult) {
         self.closing.store(true, Ordering::Release);
         {
-            let mut close_outcome = lock_unpoison(&self.close_outcome);
-            if close_outcome.is_none() {
-                *close_outcome = Some(outcome.clone());
-            }
+            self.close.store_if_empty(outcome.clone());
         }
         let mut queues = self.lock_queues();
         let mut requests: Vec<_> = queues
@@ -967,13 +953,11 @@ impl ListenerState {
                 request.complete(Err(error));
             }
         }
-        self.close_notify.notify_waiters();
+        self.close.notify_waiters();
     }
 
-    fn close_result(&self) -> Option<Result<()>> {
-        lock_unpoison(&self.close_outcome)
-            .clone()
-            .map(MemoizedTerminalResult::into_result)
+    pub(super) fn close_state(&self) -> Arc<SessionListenerCloseState> {
+        Arc::clone(&self.close)
     }
 }
 

@@ -143,6 +143,56 @@ fn find_forbidden_production_dependencies(
     Ok(visitor.violations)
 }
 
+fn find_strong_owner_fields(
+    source: &str,
+    struct_name: &str,
+    forbidden_owners: &[&str],
+) -> Result<Vec<String>, syn::Error> {
+    let syntax = syn::parse_file(source)?;
+    let forbidden = forbidden_owners.iter().copied().collect::<HashSet<_>>();
+    let item = syntax
+        .items
+        .iter()
+        .find_map(|item| match item {
+            Item::Struct(item) if item.ident == struct_name => Some(item),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("locate struct {struct_name}"));
+    let mut violations = Vec::new();
+    for field in &item.fields {
+        if is_test_only(&field.attrs) {
+            continue;
+        }
+        let mut visitor = ForbiddenDependencyVisitor {
+            forbidden: &forbidden,
+            violations: Vec::new(),
+        };
+        visitor.visit_type(&field.ty);
+        if visitor.violations.is_empty() {
+            continue;
+        }
+        let outer = match &field.ty {
+            Type::Path(path) => path
+                .path
+                .segments
+                .last()
+                .map(|segment| segment.ident.to_string()),
+            _ => None,
+        };
+        if outer.as_deref() != Some("Weak") {
+            violations.push(format!(
+                "{}: {}",
+                field
+                    .ident
+                    .as_ref()
+                    .map_or_else(|| "<unnamed>".into(), ToString::to_string),
+                visitor.violations.join(", ")
+            ));
+        }
+    }
+    Ok(violations)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CfgValue {
     False,
@@ -779,6 +829,9 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     let io_core_operation_path = v2_dir.join("engine").join("io_core").join("operation.rs");
     let engine_mod_path = v2_dir.join("engine").join("mod.rs");
     let connection_path = v2_dir.join("engine").join("connection.rs");
+    let listener_path = v2_dir.join("engine").join("listener.rs");
+    let driver_path = v2_dir.join("engine").join("driver.rs");
+    let drain_path = v2_dir.join("engine").join("drain.rs");
     let session_path = v2_dir.join("engine").join("session.rs");
     let v2_mod_path = v2_dir.join("mod.rs");
 
@@ -815,6 +868,9 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         "ListenerState",
         "MessageTransportDriver",
         "message_transport",
+        "SessionManager",
+        "SessionConnection",
+        "SessionListener",
     ];
     for path in [&io_core_mod_path, &io_core_operation_path] {
         let source = fs::read_to_string(path).expect("read I/O core source");
@@ -906,6 +962,63 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     assert!(
         connection_source.contains("owner: Weak<dyn WorkRequestPoster>"),
         "session posting adapter must not strongly retain the QP/CmId owner"
+    );
+    let connection_owner_violations = find_strong_owner_fields(
+        &connection_source,
+        "RdmaConnection",
+        &["EngineShared", "ConnectionState", "SessionManager"],
+    )
+    .expect("parse RdmaConnection ownership fields");
+    assert!(
+        connection_owner_violations.is_empty(),
+        "{} production frontend strongly owns session internals: {}",
+        connection_path.display(),
+        connection_owner_violations.join(", ")
+    );
+
+    let listener_source = fs::read_to_string(&listener_path).expect("read listener source");
+    for waiter in ["RdmaListener", "ListenWaiter", "AcceptWaiter"] {
+        let violations = find_strong_owner_fields(
+            &listener_source,
+            waiter,
+            &["EngineShared", "ListenerState", "SessionManager"],
+        )
+        .unwrap_or_else(|error| panic!("parse {waiter} ownership fields: {error}"));
+        assert!(
+            violations.is_empty(),
+            "{} `{waiter}` strongly owns session internals: {}",
+            listener_path.display(),
+            violations.join(", ")
+        );
+    }
+    let cm_source =
+        fs::read_to_string(v2_dir.join("engine").join("cm.rs")).expect("read CM source");
+    let connect_waiter_violations = find_strong_owner_fields(
+        &cm_source,
+        "ConnectWaiter",
+        &["EngineShared", "ConnectionState", "SessionManager"],
+    )
+    .expect("parse ConnectWaiter ownership fields");
+    assert!(
+        connect_waiter_violations.is_empty(),
+        "ConnectWaiter strongly owns session internals: {}",
+        connect_waiter_violations.join(", ")
+    );
+
+    let drain_source = fs::read_to_string(&drain_path).expect("read drain source");
+    assert!(
+        drain_source.contains("impl SessionManager")
+            && drain_source.contains("#[cfg(test)]\nimpl EngineShared"),
+        "{} production close/drain/retirement policy must be implemented on SessionManager",
+        drain_path.display()
+    );
+    let driver_source = fs::read_to_string(&driver_path).expect("read engine driver source");
+    assert!(
+        driver_source.contains(".session")
+            && driver_source.contains(".io_core")
+            && !driver_source.contains("tokio::spawn("),
+        "{} must explicitly compose SessionManager and IoCore without spawning",
+        driver_path.display()
     );
 
     let io_source = fs::read_to_string(&io_path).expect("read engine I/O boundary source");

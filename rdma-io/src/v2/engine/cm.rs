@@ -52,7 +52,10 @@ enum CmEventReject {
 fn record_cm_reject(shared: &EngineShared, reject: CmEventReject) {
     #[cfg(any(test, feature = "test-hooks"))]
     if !matches!(reject, CmEventReject::Duplicate) {
-        shared.rejected_cm_events.fetch_add(1, Ordering::Relaxed);
+        shared
+            .session
+            .rejected_cm_events
+            .fetch_add(1, Ordering::Relaxed);
     }
     #[cfg(not(any(test, feature = "test-hooks")))]
     let _ = (shared, reject);
@@ -649,7 +652,7 @@ impl CmState {
     ) -> Result<()> {
         match (destroy_result, finalize_result) {
             (Ok(()), Ok(())) => {
-                shared.record_connection_retired(&connection);
+                shared.session.record_connection_retired(&connection);
                 if let Some(event) = connection.finish_retirement() {
                     event.deliver();
                 }
@@ -794,10 +797,7 @@ impl CmState {
             state.request_close(shared);
             request.complete(Err(Error::DriverShutdown));
         } else {
-            request.complete(Ok(RdmaListener {
-                shared: Arc::clone(shared),
-                state,
-            }));
+            request.complete(Ok(RdmaListener::from_state(shared, state)));
         }
         Ok(())
     }
@@ -1088,7 +1088,7 @@ impl CmState {
         connection: RdmaConnection,
         error: Error,
     ) -> Result<()> {
-        let connection_state = Arc::clone(&connection.state);
+        let connection_state = connection.require_session_state()?;
         let reject = match &error {
             Error::DriverShutdown if !request.is_cancelled() => {
                 InboundRejectReason::AdmissionClosed
@@ -1103,7 +1103,9 @@ impl CmState {
             selected: true,
             reject: Some(reject),
         });
-        shared.begin_connection_close(&connection_state);
+        shared
+            .session
+            .begin_connection_close(shared, &connection_state);
         drop(connection);
         if connection_state.accepted_count() == 0 {
             self.retire_registered_connection(shared, connection_state.token)?;
@@ -1197,7 +1199,7 @@ impl CmState {
                 request,
                 connection,
             } => {
-                let connection_state = Arc::clone(&connection.state);
+                let connection_state = connection.require_session_state()?;
                 let error = cancellation_error();
                 route.set_state(InboundState::Closing {
                     connection: EstablishedConnectionRoute::new(&connection_state),
@@ -1206,7 +1208,9 @@ impl CmState {
                     selected: true,
                     reject: None,
                 });
-                shared.begin_connection_close(&connection_state);
+                shared
+                    .session
+                    .begin_connection_close(shared, &connection_state);
                 drop(connection);
                 if connection_state.accepted_count() == 0 {
                     self.retire_registered_connection(shared, connection_state.token)?;
@@ -1239,7 +1243,9 @@ impl CmState {
                     selected: true,
                     reject: None,
                 });
-                shared.begin_connection_close(&connection_state);
+                shared
+                    .session
+                    .begin_connection_close(shared, &connection_state);
                 if connection_state.accepted_count() == 0 {
                     self.retire_registered_connection(shared, connection_state.token)?;
                 }
@@ -1419,7 +1425,9 @@ impl CmState {
         route.set_state(OutboundState::Closing {
             connection: connection.clone(),
         });
-        shared.begin_connection_close(&connection_state);
+        shared
+            .session
+            .begin_connection_close(shared, &connection_state);
         drop(request.take_result());
         if connection_state.accepted_count() == 0 {
             self.retire_registered_connection(shared, connection_state.token)?;
@@ -1433,7 +1441,7 @@ impl CmState {
         shared: &EngineShared,
         token: ConnectionToken,
     ) -> Result<()> {
-        let Lookup::Occupied(connection) = shared.connections.lookup(token) else {
+        let Lookup::Occupied(connection) = shared.session.connections.lookup(token) else {
             return Ok(());
         };
         if connection.accepted_count() != 0 {
@@ -1459,7 +1467,7 @@ impl CmState {
                     %error,
                     "connection QP destroy failed; retaining CM route and ownership bundle"
                 );
-                shared.track_connection_quarantine(connection.token);
+                shared.session.track_connection_quarantine(connection.token);
                 let (_, event) = connection.publish_destroy_quarantine(&error, || {});
                 if let Some(event) = event {
                     event.deliver();
@@ -1497,7 +1505,7 @@ impl CmState {
                     %error,
                     "connection resource finalization failed; retaining terminal quarantine"
                 );
-                shared.track_connection_quarantine(connection.token);
+                shared.session.track_connection_quarantine(connection.token);
                 let (_, event) = connection.publish_destroy_quarantine(&error, || {});
                 if let Some(event) = event {
                     event.deliver();
@@ -1536,6 +1544,7 @@ impl CmState {
             FailedConnectionInstallResources::Unregistered { .. } => Ok(()),
             FailedConnectionInstallResources::Registered(connection) => {
                 let released = shared
+                    .session
                     .connections
                     .release_unindexed(connection.token)
                     .ok_or_else(|| {
@@ -1575,7 +1584,7 @@ impl CmState {
             FailedConnectionInstallResources::Registered(connection) => {
                 connection.begin_close();
                 let _ = connection.try_begin_retirement();
-                shared.track_connection_quarantine(connection.token);
+                shared.session.track_connection_quarantine(connection.token);
                 let (_, event) = connection.publish_destroy_quarantine(destroy_error, || {});
                 if let Some(event) = event {
                     event.deliver();
@@ -1598,7 +1607,7 @@ impl CmState {
         connection: Arc<ConnectionState>,
     ) -> Result<()> {
         self.release_connection_retirement(shared, &connection)?;
-        shared.record_connection_retired(&connection);
+        shared.session.record_connection_retired(&connection);
         if let Some(event) = connection.finish_retirement() {
             event.deliver();
         }
@@ -1611,6 +1620,7 @@ impl CmState {
         connection: &Arc<ConnectionState>,
     ) -> Result<()> {
         let released = shared
+            .session
             .connections
             .release(connection.token, connection.qp_num())
             .ok_or_else(|| {
@@ -1922,7 +1932,7 @@ impl CmState {
                         .is_none_or(|listener| listener.is_closing())
                     || shared.shutdown_requested.load(Ordering::Acquire)
                 {
-                    let connection_state = Arc::clone(&connection.state);
+                    let connection_state = connection.require_session_state()?;
                     let completion = if request.is_cancelled() {
                         None
                     } else if let Some(listener) = listener.as_ref() {
@@ -1937,7 +1947,9 @@ impl CmState {
                         selected: true,
                         reject: None,
                     });
-                    shared.begin_connection_close(&connection_state);
+                    shared
+                        .session
+                        .begin_connection_close(shared, &connection_state);
                     drop(connection);
                     if connection_state.accepted_count() == 0 {
                         self.retire_registered_connection(shared, connection_state.token)?;
@@ -1945,7 +1957,8 @@ impl CmState {
                     return Ok(EventDisposition::Handled);
                 }
 
-                let connection_route = EstablishedConnectionRoute::new(&connection.state);
+                let connection_state = connection.require_session_state()?;
+                let connection_route = EstablishedConnectionRoute::new(&connection_state);
                 route.set_state(InboundState::EstablishedAwaitingDelivery {
                     request: Arc::clone(&request),
                     connection: connection_route,
@@ -1980,7 +1993,7 @@ impl CmState {
                 request,
                 connection,
             } => (
-                EstablishedConnectionRoute::new(&connection.state),
+                EstablishedConnectionRoute::new(&connection.require_session_state()?),
                 Some(request),
                 true,
             ),
@@ -2041,7 +2054,9 @@ impl CmState {
                 self.enqueue_listener_work(&listener);
             }
         }
-        shared.begin_connection_close(&connection_state);
+        shared
+            .session
+            .begin_connection_close(shared, &connection_state);
         if connection_state.accepted_count() == 0 {
             self.retire_registered_connection(shared, connection_state.token)?;
         }
@@ -2067,7 +2082,7 @@ impl CmState {
                 request,
                 connection,
             } => {
-                let connection_state = Arc::clone(&connection.state);
+                let connection_state = connection.require_session_state()?;
                 if let Some(event) = connection_state
                     .mark_cm_failure(Error::Verbs(std::io::Error::other(message.clone())))
                 {
@@ -2080,7 +2095,9 @@ impl CmState {
                     selected: true,
                     reject: None,
                 });
-                shared.begin_connection_close(&connection_state);
+                shared
+                    .session
+                    .begin_connection_close(shared, &connection_state);
                 drop(connection);
                 if connection_state.accepted_count() == 0 {
                     self.retire_registered_connection(shared, connection_state.token)?;
@@ -2120,7 +2137,9 @@ impl CmState {
                         self.enqueue_listener_work(&listener);
                     }
                 }
-                shared.begin_connection_close(&connection_state);
+                shared
+                    .session
+                    .begin_connection_close(shared, &connection_state);
                 if connection_state.accepted_count() == 0 {
                     self.retire_registered_connection(shared, connection_state.token)?;
                 }
@@ -2142,7 +2161,9 @@ impl CmState {
                     selected: false,
                     reject: None,
                 });
-                shared.begin_connection_close(&connection_state);
+                shared
+                    .session
+                    .begin_connection_close(shared, &connection_state);
                 if connection_state.accepted_count() == 0 {
                     self.retire_registered_connection(shared, connection_state.token)?;
                 }
@@ -2354,11 +2375,13 @@ impl CmState {
         connection: RdmaConnection,
         error: Error,
     ) -> Result<()> {
-        let connection_state = Arc::clone(&connection.state);
+        let connection_state = connection.require_session_state()?;
         route.set_state(OutboundState::Closing {
             connection: EstablishedConnectionRoute::new(&connection_state),
         });
-        shared.begin_connection_close(&connection_state);
+        shared
+            .session
+            .begin_connection_close(shared, &connection_state);
         drop(connection);
         if connection_state.accepted_count() == 0 {
             self.retire_registered_connection(shared, connection_state.token)?;
@@ -2398,7 +2421,7 @@ impl CmState {
         let waiter = Arc::clone(&request);
         route.set_state(OutboundState::EstablishedAwaitingDelivery {
             request,
-            connection: EstablishedConnectionRoute::new(&connection.state),
+            connection: EstablishedConnectionRoute::new(&connection.require_session_state()?),
         });
         waiter.complete(Ok(connection));
         Ok(EventDisposition::Handled)
@@ -2450,7 +2473,9 @@ impl CmState {
                 connection: connection.clone(),
             });
         }
-        shared.begin_connection_close(&connection_state);
+        shared
+            .session
+            .begin_connection_close(shared, &connection_state);
         if connection_state.accepted_count() == 0 {
             self.retire_registered_connection(shared, connection_state.token)?;
         }
@@ -2540,7 +2565,9 @@ impl CmState {
                         connection: connection.clone(),
                     });
                 }
-                shared.begin_connection_close(&connection_state);
+                shared
+                    .session
+                    .begin_connection_close(shared, &connection_state);
                 if connection_state.accepted_count() == 0 {
                     self.retire_registered_connection(shared, connection_state.token)?;
                 }
@@ -2559,7 +2586,9 @@ impl CmState {
                 route.set_state(OutboundState::Failed {
                     connection: connection.clone(),
                 });
-                shared.begin_connection_close(&connection_state);
+                shared
+                    .session
+                    .begin_connection_close(shared, &connection_state);
                 if connection_state.accepted_count() == 0 {
                     self.retire_registered_connection(shared, connection_state.token)?;
                 }
@@ -2664,11 +2693,11 @@ pub(super) async fn connect_with_setup(
     shared
         .test_driver
         .pause_admission(super::driver::test_api::AdmissionPausePoint::ConnectBeforeEnqueue);
-    shared.cm.enqueue(Arc::clone(&request));
+    shared.session.cm.enqueue(Arc::clone(&request));
     drop(admission);
     shared.work_signal.publish(CM_WORK);
     ConnectWaiter {
-        shared,
+        manager: Arc::downgrade(&shared.session),
         request,
         finished: false,
     }
@@ -2945,7 +2974,7 @@ enum InboundState {
 impl InboundState {
     fn references_connection(&self, token: ConnectionToken) -> bool {
         match self {
-            Self::AwaitEstablished { connection, .. } => connection.state.token == token,
+            Self::AwaitEstablished { connection, .. } => connection.session_token() == token,
             Self::EstablishedAwaitingDelivery { connection, .. }
             | Self::Established { connection }
             | Self::Closing { connection, .. } => connection.token == token,
@@ -3145,7 +3174,7 @@ enum OutboundState {
 impl OutboundState {
     fn references_connection(&self, token: ConnectionToken) -> bool {
         match self {
-            Self::AwaitEstablished { connection, .. } => connection.state.token == token,
+            Self::AwaitEstablished { connection, .. } => connection.session_token() == token,
             Self::EstablishedAwaitingDelivery { connection, .. }
             | Self::Established { connection }
             | Self::DisconnectedAwaitingDelivery { connection, .. }
@@ -3259,7 +3288,7 @@ impl OutboundRequest {
 }
 
 struct ConnectWaiter {
-    shared: Arc<EngineShared>,
+    manager: Weak<super::SessionManager>,
     request: Arc<OutboundRequest>,
     finished: bool,
 }
@@ -3271,7 +3300,9 @@ impl Future for ConnectWaiter {
         if let Some(result) = self.request.take_result() {
             if result.is_ok() {
                 self.request.delivered.store(true, Ordering::Release);
-                self.shared.cm.mark_request_delivered(&self.request);
+                if let Some(manager) = self.manager.upgrade() {
+                    manager.cm.mark_request_delivered(&self.request);
+                }
             }
             self.finished = true;
             return Poll::Ready(result);
@@ -3280,7 +3311,9 @@ impl Future for ConnectWaiter {
         if let Some(result) = self.request.take_result() {
             if result.is_ok() {
                 self.request.delivered.store(true, Ordering::Release);
-                self.shared.cm.mark_request_delivered(&self.request);
+                if let Some(manager) = self.manager.upgrade() {
+                    manager.cm.mark_request_delivered(&self.request);
+                }
             }
             self.finished = true;
             return Poll::Ready(result);
@@ -3295,10 +3328,12 @@ impl Drop for ConnectWaiter {
             return;
         }
         self.request.cancel(Error::DriverShutdown);
-        self.shared
-            .cm
-            .enqueue_cancellation(Arc::clone(&self.request));
-        self.shared.work_signal.publish(CM_WORK);
+        if let Some(manager) = self.manager.upgrade() {
+            manager.cm.enqueue_cancellation(Arc::clone(&self.request));
+            if let Some(engine) = manager.engine() {
+                engine.work_signal.publish(CM_WORK);
+            }
+        }
     }
 }
 
@@ -3840,7 +3875,7 @@ mod tests {
         });
         request.complete(Ok(connection));
         let mut waiter = Box::pin(ConnectWaiter {
-            shared: Arc::clone(&engine.shared),
+            manager: Arc::downgrade(&engine.shared.session),
             request,
             finished: false,
         });
@@ -4051,10 +4086,7 @@ mod tests {
         let (engine, driver) =
             super::super::test_engine_pair(super::super::CompletionMode::Polling);
         let listener_state = ListenerState::test_only(1);
-        let listener = RdmaListener {
-            shared: Arc::clone(&engine.shared),
-            state: Arc::clone(&listener_state),
-        };
+        let listener = RdmaListener::from_state(&engine.shared, Arc::clone(&listener_state));
         let mut close = Box::pin(listener.close());
         let mut cx = Context::from_waker(std::task::Waker::noop());
         assert!(close.as_mut().poll(&mut cx).is_pending());
@@ -4122,10 +4154,8 @@ mod tests {
         let (engine, driver) =
             super::super::test_engine_pair(super::super::CompletionMode::Polling);
         let listener_state = ListenerState::test_only(1);
-        let listener = RdmaListener {
-            shared: Arc::clone(&engine.shared),
-            state: Arc::clone(&listener_state),
-        };
+        let listener = RdmaListener::from_state(&engine.shared, Arc::clone(&listener_state));
+        let late_listener_state = Arc::clone(&listener_state);
         let mut close = Box::pin(listener.close());
         let mut cx = Context::from_waker(std::task::Waker::noop());
         assert!(close.as_mut().poll(&mut cx).is_pending());
@@ -4174,8 +4204,7 @@ mod tests {
         assert_eq!(destroy_count.load(Ordering::Acquire), 1);
         assert!(lock_unpoison(&engine.shared.cm.cm_destructions).is_empty());
         assert!(matches!(close.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
-        listener
-            .state
+        late_listener_state
             .finish_close(Some(Error::InvalidConfig("late duplicate finish".into())));
         let mut repeated_close = Box::pin(listener.close());
         assert!(matches!(

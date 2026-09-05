@@ -9,7 +9,9 @@
 use std::collections::{HashMap, VecDeque};
 #[cfg(test)]
 use std::ops::Deref;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+#[cfg(any(test, feature = "test-hooks"))]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::Duration;
 
@@ -17,9 +19,11 @@ use super::cm::CmState;
 use super::connection::{ConnectionAdmissionPool, ConnectionState};
 use super::driver::WorkSignal;
 use super::io_core::{IoCore, IoCoreEffects, OperationQuarantineEffect};
+use super::listener::ListenerState;
 use super::registry::{ConnectionRegistry, ConnectionToken, Lookup, OperationToken, lock_unpoison};
 use super::scheduler::{DeadlineKind, DeadlineRequest};
 use super::{EngineShared, Result};
+use crate::v2::error::Error;
 
 /// Resource-free close observation shared with connection frontends.
 pub(super) struct SessionCloseState {
@@ -76,6 +80,108 @@ pub(crate) struct SessionConnection {
     manager: Weak<SessionManager>,
     token: ConnectionToken,
     close: Arc<SessionCloseState>,
+}
+
+/// Resource-free close observation for an engine-owned listener.
+pub(super) struct SessionListenerCloseState {
+    outcome: Mutex<Option<super::lifecycle::MemoizedTerminalResult>>,
+    notify: tokio::sync::Notify,
+    frontend_count: AtomicUsize,
+}
+
+impl SessionListenerCloseState {
+    pub(super) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            outcome: Mutex::new(None),
+            notify: tokio::sync::Notify::new(),
+            frontend_count: AtomicUsize::new(1),
+        })
+    }
+
+    pub(super) fn outcome(&self) -> Option<super::lifecycle::MemoizedTerminalResult> {
+        lock_unpoison(&self.outcome).clone()
+    }
+
+    pub(super) fn store_if_empty(&self, outcome: super::lifecycle::MemoizedTerminalResult) {
+        let mut current = lock_unpoison(&self.outcome);
+        if current.is_none() {
+            *current = Some(outcome);
+        }
+    }
+
+    pub(super) fn retain_frontend(&self) {
+        self.frontend_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn release_frontend(&self) -> bool {
+        let previous = self.frontend_count.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "listener frontend count must be positive");
+        previous == 1
+    }
+
+    pub(super) fn notify_waiters(&self) {
+        self.notify.notify_waiters();
+    }
+}
+
+/// Opaque request/observation capability for a SessionManager-owned listener.
+#[derive(Clone)]
+pub(super) struct SessionListener {
+    manager: Weak<SessionManager>,
+    listener: Weak<ListenerState>,
+    close: Arc<SessionListenerCloseState>,
+    local_addr: std::net::SocketAddr,
+}
+
+impl SessionListener {
+    pub(super) fn local_addr(&self) -> std::net::SocketAddr {
+        self.local_addr
+    }
+
+    pub(super) fn retain_frontend(&self) {
+        self.close.retain_frontend();
+    }
+
+    pub(super) fn release_frontend(&self) -> bool {
+        self.close.release_frontend()
+    }
+
+    pub(super) fn owners(&self) -> Result<(Arc<EngineShared>, Arc<ListenerState>)> {
+        let manager = self.manager.upgrade().ok_or(Error::DriverShutdown)?;
+        let engine = manager.engine().ok_or(Error::DriverShutdown)?;
+        let listener = self.listener.upgrade().ok_or_else(|| {
+            self.close
+                .outcome()
+                .and_then(|outcome| outcome.into_result().err())
+                .unwrap_or(Error::TransportClosed)
+        })?;
+        Ok((engine, listener))
+    }
+
+    pub(super) fn request_close(&self) {
+        let Ok((engine, listener)) = self.owners() else {
+            return;
+        };
+        listener.request_close(&engine);
+    }
+
+    pub(super) async fn close(&self) -> Result<()> {
+        self.request_close();
+        loop {
+            let notified = self.close.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(outcome) = self.close.outcome() {
+                return outcome.into_result();
+            }
+            if let Some(manager) = self.manager.upgrade()
+                && let Some(outcome) = manager.engine_outcome()
+            {
+                return outcome.into_result();
+            }
+            notified.await;
+        }
+    }
 }
 
 impl SessionConnection {
@@ -155,7 +261,7 @@ pub(super) struct SessionManager {
         dead_code,
         reason = "retained for session-owned close/reclaim service and test accounting adapters"
     )]
-    io_core: Arc<IoCore>,
+    pub(super) io_core: Arc<IoCore>,
 }
 
 impl SessionManager {
@@ -185,7 +291,7 @@ impl SessionManager {
             .unwrap_or_else(|_| panic!("SessionManager is bound to exactly one EngineShared"));
     }
 
-    fn engine(&self) -> Option<Arc<EngineShared>> {
+    pub(super) fn engine(&self) -> Option<Arc<EngineShared>> {
         self.engine.get().and_then(Weak::upgrade)
     }
 
@@ -200,7 +306,7 @@ impl SessionManager {
         let Lookup::Occupied(connection) = self.connections.lookup(token) else {
             return;
         };
-        engine.begin_connection_close(&connection);
+        self.begin_connection_close(&engine, &connection);
     }
 
     pub(super) fn connection_capability(
@@ -208,6 +314,18 @@ impl SessionManager {
         connection: &ConnectionState,
     ) -> SessionConnection {
         SessionConnection::new(self, connection.token, connection.close_state())
+    }
+
+    pub(super) fn listener_capability(
+        self: &Arc<Self>,
+        listener: &Arc<ListenerState>,
+    ) -> SessionListener {
+        SessionListener {
+            manager: Arc::downgrade(self),
+            listener: Arc::downgrade(listener),
+            close: listener.close_state(),
+            local_addr: listener.local_addr,
+        }
     }
 
     pub(super) fn schedule_deadline(
@@ -332,11 +450,94 @@ impl SessionManager {
                 continue;
             };
             if connection.close_started() && connection.accepted_count() == 0 {
-                shared.recover_connection_quarantine(&connection);
-                shared.record_connection_drained(&connection);
-                shared.schedule_connection_retirement(&connection);
+                self.recover_connection_quarantine(&connection);
+                self.record_connection_drained(&connection);
+                self.schedule_connection_retirement(shared, &connection);
             }
         }
+    }
+
+    pub(super) fn enqueue_completion(
+        &self,
+        completion: crate::wc::WorkCompletion,
+    ) -> Option<ConnectionToken> {
+        let _admission = super::registry::read_unpoison(&self.admission);
+        let pending = self.io_core.prepare_completion(completion)?;
+        let identity = pending.identity();
+        let connection = match self.connections.lookup(identity.connection) {
+            Lookup::Occupied(connection) => connection,
+            _ => {
+                self.io_core
+                    .reject_cqe(super::io_core::CqeReject::StaleConnection);
+                return None;
+            }
+        };
+        let live = self
+            .connections
+            .prove_live_io(identity.connection, identity.qp_num);
+        self.io_core
+            .enqueue_prepared_completion(pending, live, &connection.io)
+    }
+
+    pub(super) fn dispatch_connection_completions(
+        &self,
+        shared: &EngineShared,
+        token: ConnectionToken,
+        quantum: usize,
+    ) -> (usize, bool) {
+        let connection = match self.connections.lookup(token) {
+            Lookup::Occupied(connection) => connection,
+            _ => return (0, false),
+        };
+        let (processed, remains_ready, mut effects) = self
+            .io_core
+            .dispatch_connection_completions(&connection.io, quantum);
+        self.apply_io_effects(shared, &mut effects);
+        effects.publish();
+        (processed, remains_ready)
+    }
+
+    pub(super) fn reclaim_after_qp_destroy(
+        &self,
+        shared: &EngineShared,
+        proof: &super::connection::QpDestructionProof,
+        connection: &ConnectionState,
+        token: OperationToken,
+    ) -> bool {
+        let (reclaimed, mut effects) = self.io_core.reclaim_after_qp_destroy(
+            proof,
+            &connection.io,
+            connection.operation_close_error(),
+            token,
+        );
+        self.apply_io_effects(shared, &mut effects);
+        effects.publish();
+        reclaimed
+    }
+
+    pub(super) fn reject_queued_completions_after_qp_destroy(
+        &self,
+        shared: &EngineShared,
+        connection: &ConnectionState,
+    ) -> bool {
+        let (remains_ready, mut effects) = self
+            .io_core
+            .reject_queued_completions_after_qp_destroy(&connection.io);
+        self.apply_io_effects(shared, &mut effects);
+        effects.publish();
+        remains_ready
+    }
+
+    pub(super) fn handle_reclamation_deadline(&self, shared: &EngineShared, token: OperationToken) {
+        let mut effects = self.io_core.handle_reclamation_deadline(token);
+        self.apply_io_effects(shared, &mut effects);
+        effects.publish();
+    }
+
+    pub(super) fn quarantine_operation(&self, shared: &EngineShared, token: OperationToken) {
+        let mut effects = self.io_core.quarantine_operation(token);
+        self.apply_io_effects(shared, &mut effects);
+        effects.publish();
     }
 }
 
@@ -357,6 +558,7 @@ mod tests {
     use std::time::Duration;
 
     use super::super::connection::{WorkRequestPoster, install_connection};
+    use super::super::listener::{ListenerState, RdmaListener};
     use super::super::scheduler::DeadlineKind;
     use super::super::{CompletionMode, RdmaConnectionConfig, test_engine_pair};
     use crate::v2::error::{Error, Result};
@@ -474,5 +676,29 @@ mod tests {
             capability.close.outcome().unwrap().into_result(),
             Err(Error::TransportClosed)
         ));
+    }
+
+    #[test]
+    fn session_listener_capability_is_resource_free() {
+        let (engine, _driver) = test_engine_pair(CompletionMode::Polling);
+        let state = ListenerState::test_only(4);
+        let before = Arc::strong_count(&state);
+        let listener = RdmaListener::from_state(&engine.shared, Arc::clone(&state));
+
+        assert_eq!(listener.local_addr().unwrap(), state.local_addr);
+        assert_eq!(
+            Arc::strong_count(&state),
+            before,
+            "listener capability must not retain ListenerState or its CmId"
+        );
+        let clone = listener.clone();
+        assert_eq!(Arc::strong_count(&state), before);
+        drop(clone);
+        drop(listener);
+        assert_eq!(
+            Arc::strong_count(&state),
+            before + 1,
+            "last-frontend close transfers the only added retain to SessionManager CM work"
+        );
     }
 }

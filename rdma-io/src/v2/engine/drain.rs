@@ -3,14 +3,18 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use super::EngineShared;
 use super::connection::ConnectionState;
 use super::lifecycle::MemoizedTerminalResult;
 use super::registry::{ConnectionToken, Lookup, read_unpoison};
 use super::scheduler::DeadlineKind;
+use super::{EngineShared, SessionManager};
 
-impl EngineShared {
-    pub(crate) fn begin_connection_close(&self, connection: &Arc<ConnectionState>) {
+impl SessionManager {
+    pub(crate) fn begin_connection_close(
+        &self,
+        shared: &EngineShared,
+        connection: &Arc<ConnectionState>,
+    ) {
         if connection.is_retired() {
             return;
         }
@@ -29,13 +33,13 @@ impl EngineShared {
                     if let Some(event) = event {
                         event.deliver();
                     }
-                    self.finish(MemoizedTerminalResult::from_error(error));
+                    shared.finish(MemoizedTerminalResult::from_error(error));
                     return;
                 }
             }
-            self.work_signal.publish(super::driver::CQ_RECHECK_WORK);
+            shared.work_signal.publish(super::driver::CQ_RECHECK_WORK);
 
-            let engine_is_terminating = self.shutdown_requested.load(Ordering::Acquire);
+            let engine_is_terminating = shared.shutdown_requested.load(Ordering::Acquire);
             if !engine_is_terminating {
                 let error = connection.operation_close_error();
                 let report = connection.io_drain_report();
@@ -51,15 +55,15 @@ impl EngineShared {
             effects.publish();
         }
         if first {
-            self.schedule_connection_drain(connection.token);
+            self.schedule_connection_drain(shared, connection.token);
         }
         if connection.accepted_count() == 0 {
             self.record_connection_drained(connection);
-            self.schedule_connection_retirement(connection);
+            self.schedule_connection_retirement(shared, connection);
         }
     }
 
-    pub(super) fn begin_all_connection_close(&self) {
+    pub(super) fn begin_all_connection_close(&self, shared: &EngineShared) {
         if self
             .shutdown_connection_close_started
             .swap(true, Ordering::AcqRel)
@@ -67,11 +71,15 @@ impl EngineShared {
             return;
         }
         for connection in self.connections.occupied() {
-            self.begin_connection_close(&connection);
+            self.begin_connection_close(shared, &connection);
         }
     }
 
-    pub(super) fn schedule_connection_retirement(&self, connection: &ConnectionState) {
+    pub(super) fn schedule_connection_retirement(
+        &self,
+        shared: &EngineShared,
+        connection: &ConnectionState,
+    ) {
         if connection.is_retired()
             || connection.retirement_is_quarantined()
             || (connection.close_started() && !connection.error_transition_complete())
@@ -80,26 +88,32 @@ impl EngineShared {
             return;
         }
         self.cm.enqueue_retirement(connection.token);
-        self.work_signal.publish(super::cm::CM_WORK);
+        shared.work_signal.publish(super::cm::CM_WORK);
     }
 
-    fn schedule_connection_drain(&self, token: ConnectionToken) {
+    fn schedule_connection_drain(&self, shared: &EngineShared, token: ConnectionToken) {
         self.schedule_deadline(
+            &shared.work_signal,
             DeadlineKind::ConnectionDrain,
             token.encode(),
-            self.config.connection_drain_deadline,
+            shared.config.connection_drain_deadline,
         );
     }
 
-    pub(super) fn handle_connection_drain_deadline(&self, token: ConnectionToken) {
+    pub(super) fn handle_connection_drain_deadline(
+        &self,
+        shared: &EngineShared,
+        token: ConnectionToken,
+    ) {
         let Lookup::Occupied(connection) = self.connections.lookup(token) else {
             return;
         };
         // CQEs already copied out of the hardware CQ must take the ordinary
         // quantum-bounded ready path before a destructive fallback can run.
         if connection.has_copied_completions() {
-            self.publish_completion(&connection);
+            self.io_core.publish_connection(&connection.io);
             self.schedule_deadline(
+                &shared.work_signal,
                 DeadlineKind::ConnectionDrain,
                 token.encode(),
                 std::time::Duration::ZERO,
@@ -128,11 +142,12 @@ impl EngineShared {
         };
         if let Some((tokens, proof)) = forced_tokens {
             for operation in tokens {
-                let _ = self.reclaim_after_qp_destroy(&proof, &connection, operation);
+                let _ = self.reclaim_after_qp_destroy(shared, &proof, &connection, operation);
             }
-            if self.reject_queued_completions_after_qp_destroy(&connection) {
-                self.publish_completion(&connection);
+            if self.reject_queued_completions_after_qp_destroy(shared, &connection) {
+                self.io_core.publish_connection(&connection.io);
                 self.schedule_deadline(
+                    &shared.work_signal,
                     DeadlineKind::ConnectionDrain,
                     token.encode(),
                     std::time::Duration::ZERO,
@@ -143,7 +158,7 @@ impl EngineShared {
         if let Some(report) = connection.begin_quarantine() {
             self.track_connection_quarantine(connection.token);
             for operation in connection.accepted_tokens() {
-                self.quarantine_operation(operation);
+                self.quarantine_operation(shared, operation);
             }
             if let Some(event) =
                 connection.publish_quarantine(report.outstanding_operations, report.cq_debt)
@@ -154,7 +169,7 @@ impl EngineShared {
         if connection.close_started() && connection.accepted_count() == 0 {
             self.recover_connection_quarantine(&connection);
             self.record_connection_drained(&connection);
-            self.schedule_connection_retirement(&connection);
+            self.schedule_connection_retirement(shared, &connection);
         }
     }
 
@@ -175,6 +190,30 @@ impl EngineShared {
         // quarantine entry remains tracked, so a mismatched retirement cannot
         // make retained debt appear recovered.
         let _ = self.clear_connection_quarantine(connection.token);
+    }
+}
+
+#[cfg(test)]
+impl EngineShared {
+    pub(super) fn begin_all_connection_close(&self) {
+        self.session.begin_all_connection_close(self);
+    }
+
+    pub(super) fn schedule_connection_retirement(&self, connection: &ConnectionState) {
+        self.session
+            .schedule_connection_retirement(self, connection);
+    }
+
+    pub(super) fn handle_connection_drain_deadline(&self, token: ConnectionToken) {
+        self.session.handle_connection_drain_deadline(self, token);
+    }
+
+    pub(super) fn recover_connection_quarantine(&self, connection: &ConnectionState) {
+        self.session.recover_connection_quarantine(connection);
+    }
+
+    pub(super) fn record_connection_drained(&self, connection: &ConnectionState) {
+        self.session.record_connection_drained(connection);
     }
 }
 

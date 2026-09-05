@@ -167,15 +167,15 @@ impl RdmaEngineDriver {
         {
             return Ok(false);
         }
-        self.shared.cm.begin_shutdown(
+        self.shared.session.cm.begin_shutdown(
             &self.shared,
             &MemoizedTerminalResult::from_error(Error::DriverShutdown),
         );
-        self.shared.begin_all_connection_close();
-        if self.shared.cm.pending_route_count() != 0 {
+        self.shared.session.begin_all_connection_close(&self.shared);
+        if self.shared.session.cm.pending_route_count() != 0 {
             return Ok(false);
         }
-        if self.shared.connections.live() != 0 {
+        if self.shared.session.connections.live() != 0 {
             return Ok(false);
         }
 
@@ -186,9 +186,14 @@ impl RdmaEngineDriver {
         if let Some(resources) = self.resources.as_ref() {
             let mut processed = 0;
             while processed < self.shared.config.cm_event_budget {
-                if !self.shared.cm.try_process_event(&self.shared, resources)? {
-                    if self.shared.cm.pending_route_count() != 0
-                        || self.shared.connections.live() != 0
+                if !self
+                    .shared
+                    .session
+                    .cm
+                    .try_process_event(&self.shared, resources)?
+                {
+                    if self.shared.session.cm.pending_route_count() != 0
+                        || self.shared.session.connections.live() != 0
                         || self.shared.io_core.accepted_count() != 0
                     {
                         self.scheduler.mark_class_ready(WorkClass::Cm);
@@ -215,7 +220,7 @@ impl RdmaEngineDriver {
     fn service_cq(&mut self, cx: &mut TaskContext<'_>) -> Result<bool> {
         #[cfg(any(test, feature = "test-hooks"))]
         if let Some(completion) = self.shared.test_driver.take_released_connection_cqe() {
-            if let Some(connection) = self.shared.enqueue_completion(completion) {
+            if let Some(connection) = self.shared.session.enqueue_completion(completion) {
                 self.scheduler
                     .enqueue_connection(connection.completion_ready());
             }
@@ -270,7 +275,7 @@ impl RdmaEngineDriver {
             if self.shared.test_driver.suppress_connection_cqe(completion) {
                 continue;
             }
-            if let Some(connection) = self.shared.enqueue_completion(completion) {
+            if let Some(connection) = self.shared.session.enqueue_completion(completion) {
                 self.scheduler
                     .enqueue_connection(connection.completion_ready());
             }
@@ -288,9 +293,9 @@ impl RdmaEngineDriver {
             return Ok(false);
         };
         let budget = self.shared.config.cm_event_budget;
-        let cm = &self.shared.cm;
+        let cm = &self.shared.session.cm;
         let mut processed = cm.service_software(&self.shared, Some(resources), budget)?;
-        while processed < budget && self.shared.cm.try_process_event(&self.shared, resources)? {
+        while processed < budget && cm.try_process_event(&self.shared, resources)? {
             processed += 1;
         }
 
@@ -311,7 +316,7 @@ impl RdmaEngineDriver {
                             Poll::Pending => Poll::Pending,
                         },
                         |guard| guard.clear_ready(),
-                        || self.shared.cm.try_process_event(&self.shared, resources),
+                        || cm.try_process_event(&self.shared, resources),
                     ) {
                         Poll::Ready(result) => result?,
                         Poll::Pending => 0,
@@ -326,7 +331,7 @@ impl RdmaEngineDriver {
                 cm.try_process_event(&self.shared, resources)
             })?;
 
-        if processed >= budget || self.shared.cm.has_software_work() {
+        if processed >= budget || cm.has_software_work() {
             self.scheduler.mark_class_ready(WorkClass::Cm);
         }
         Ok(processed > 0)
@@ -339,10 +344,10 @@ impl RdmaEngineDriver {
         let mut requests = if self.deadline_io_turn {
             self.shared.io_core.take_reclamation_requests(first_quota)
         } else {
-            self.shared.take_deadline_requests(first_quota)
+            self.shared.session.take_deadline_requests(first_quota)
         };
         let second = if self.deadline_io_turn {
-            self.shared.take_deadline_requests(second_quota)
+            self.shared.session.take_deadline_requests(second_quota)
         } else {
             self.shared.io_core.take_reclamation_requests(second_quota)
         };
@@ -352,14 +357,14 @@ impl RdmaEngineDriver {
             let refill = if self.deadline_io_turn {
                 self.shared.io_core.take_reclamation_requests(remaining)
             } else {
-                self.shared.take_deadline_requests(remaining)
+                self.shared.session.take_deadline_requests(remaining)
             };
             requests.extend(refill);
         }
         if requests.len() < budget {
             let remaining = budget - requests.len();
             let refill = if self.deadline_io_turn {
-                self.shared.take_deadline_requests(remaining)
+                self.shared.session.take_deadline_requests(remaining)
             } else {
                 self.shared.io_core.take_reclamation_requests(remaining)
             };
@@ -383,7 +388,7 @@ impl RdmaEngineDriver {
         for deadline in due.iter().copied() {
             self.process_deadline(deadline)?;
         }
-        if self.shared.has_deadline_requests()
+        if self.shared.session.has_deadline_requests()
             || self.shared.io_core.has_reclamation_requests()
             || self
                 .scheduler
@@ -407,14 +412,15 @@ impl RdmaEngineDriver {
                 }
             }
             DeadlineKind::Reclamation => {
-                self.shared
-                    .handle_reclamation_deadline(super::registry::OperationToken::decode(
-                        deadline.token,
-                    ));
+                self.shared.session.handle_reclamation_deadline(
+                    &self.shared,
+                    super::registry::OperationToken::decode(deadline.token),
+                );
                 Ok(())
             }
             DeadlineKind::ConnectionDrain => {
-                self.shared.handle_connection_drain_deadline(
+                self.shared.session.handle_connection_drain_deadline(
+                    &self.shared,
                     super::registry::ConnectionToken::decode(deadline.token),
                 );
                 Ok(())
@@ -441,14 +447,15 @@ impl RdmaEngineDriver {
     }
 
     fn service_completion_dispatch(&mut self) -> bool {
-        if let Some(connection) = self.shared.take_published_completion() {
+        if let Some(connection) = self.shared.io_core.take_published_connection() {
             self.scheduler
                 .enqueue_connection(connection.completion_ready());
         }
         let Some(connection) = self.scheduler.pop_connection() else {
             return false;
         };
-        let (_, remains_ready) = self.shared.dispatch_connection_completions(
+        let (_, remains_ready) = self.shared.session.dispatch_connection_completions(
+            &self.shared,
             super::registry::ConnectionToken {
                 slot: connection.slot,
                 generation: connection.generation,
@@ -462,7 +469,7 @@ impl RdmaEngineDriver {
             self.scheduler
                 .mark_class_ready(WorkClass::CompletionDispatch);
         }
-        if self.shared.has_published_completions() {
+        if self.shared.io_core.has_published_connections() {
             self.scheduler
                 .mark_class_ready(WorkClass::CompletionDispatch);
         }
@@ -587,9 +594,10 @@ impl Drop for RdmaEngineDriver {
             let outstanding = self.shared.io_core.accepted_count();
             let cm_owners = self
                 .shared
+                .session
                 .cm
                 .retained_owner_count()
-                .max(self.shared.connections.live());
+                .max(self.shared.session.connections.live());
             let error = if outstanding == 0 && cm_owners == 0 {
                 Error::DriverShutdown
             } else {
@@ -622,7 +630,9 @@ pub(super) mod test_api {
     use crate::cm::CmId;
     #[cfg(test)]
     use crate::v2::engine::connection::WorkRequestPoster;
-    use crate::v2::engine::connection::{VerbsConnectionResources, install_connection};
+    use crate::v2::engine::connection::{
+        ConnectionState, VerbsConnectionResources, install_connection,
+    };
     use crate::v2::engine::resources::TestResourceRefs;
     #[cfg(test)]
     use crate::v2::qp::{BatchPostOutcome, QpCapabilities};
@@ -844,6 +854,24 @@ pub(super) mod test_api {
     }
 
     impl TestEngineResources {
+        fn require_owned_connection(
+            &self,
+            shared: &Arc<EngineShared>,
+            connection: &RdmaConnection,
+        ) -> Result<Arc<ConnectionState>> {
+            let state = connection.require_session_state()?;
+            match shared
+                .session
+                .connections
+                .lookup(connection.session_token())
+            {
+                Lookup::Occupied(owner) if Arc::ptr_eq(&owner, &state) => Ok(state),
+                _ => Err(Error::InvalidConfig(
+                    "connection belongs to another engine".into(),
+                )),
+            }
+        }
+
         pub(in crate::v2::engine) fn new(
             shared: &Arc<EngineShared>,
             resources: TestResourceRefs,
@@ -907,11 +935,11 @@ pub(super) mod test_api {
             connection: &RdmaConnection,
         ) -> Result<bool> {
             let shared = self.ensure_active()?;
-            if !Arc::ptr_eq(&shared, &connection.shared) {
-                return Ok(false);
-            }
-            Ok(connection
-                .state
+            let state = match self.require_owned_connection(&shared, connection) {
+                Ok(state) => state,
+                Err(_) => return Ok(false),
+            };
+            Ok(state
                 .poster
                 .uses_resources(&self.resources.pd, &self.resources.cq))
         }
@@ -919,16 +947,17 @@ pub(super) mod test_api {
         /// Verify that the connection's exact generational CM route is live.
         pub fn connection_route_is_live(&self, connection: &RdmaConnection) -> Result<bool> {
             let shared = self.ensure_active()?;
-            if !Arc::ptr_eq(&shared, &connection.shared) {
-                return Ok(false);
-            }
-            let route = connection
-                .state
+            let state = match self.require_owned_connection(&shared, connection) {
+                Ok(state) => state,
+                Err(_) => return Ok(false),
+            };
+            let route = state
                 .cm_route()
                 .ok_or_else(|| Error::InvalidConfig("connection has no CM route".into()))?;
             Ok(shared
+                .session
                 .cm
-                .connection_route_is_live(route, connection.state.token))
+                .connection_route_is_live(route, state.token))
         }
 
         /// Snapshot the exact rejection classes observed by CQE routing.
@@ -1010,34 +1039,23 @@ pub(super) mod test_api {
         /// Explicitly transition an installed Phase 3 connection to QP ERR.
         pub fn transition_connection_to_error(&self, connection: &RdmaConnection) -> Result<()> {
             let shared = self.ensure_not_terminal()?;
-            if !Arc::ptr_eq(&shared, &connection.shared) {
-                return Err(Error::InvalidConfig(
-                    "connection belongs to another engine".into(),
-                ));
-            }
+            self.require_owned_connection(&shared, connection)?;
             connection.transition_to_error_for_test()
         }
 
         /// Request an RDMA-CM disconnect for an outbound engine connection.
         pub fn disconnect_connection(&self, connection: &RdmaConnection) -> Result<()> {
             let shared = self.ensure_active()?;
-            if !Arc::ptr_eq(&shared, &connection.shared) {
-                return Err(Error::InvalidConfig(
-                    "connection belongs to another engine".into(),
-                ));
-            }
-            connection.state.disconnect_for_test()
+            self.require_owned_connection(&shared, connection)?
+                .disconnect_for_test()
         }
 
         /// Make the next result-aware destruction of this connection's QP fail.
         pub fn fail_next_connection_qp_destroy(&self, connection: &RdmaConnection) -> Result<()> {
             let shared = self.ensure_active()?;
-            if !Arc::ptr_eq(&shared, &connection.shared) {
-                return Err(Error::InvalidConfig(
-                    "connection belongs to another engine".into(),
-                ));
-            }
-            connection.state.poster.fail_next_qp_destroy()
+            self.require_owned_connection(&shared, connection)?
+                .poster
+                .fail_next_qp_destroy()
         }
 
         /// Fail the next newly created connection installation and its QP rollback.
@@ -1139,20 +1157,16 @@ pub(super) mod test_api {
             require_flush: bool,
         ) -> Result<TestConnectionCqeSuppression> {
             let shared = self.ensure_active()?;
-            if !Arc::ptr_eq(&shared, &connection.shared) {
-                return Err(Error::InvalidConfig(
-                    "connection belongs to another engine".into(),
-                ));
-            }
+            let state = self.require_owned_connection(&shared, connection)?;
             shared.test_driver.start_connection_cqe_suppression(
-                connection.state.token,
+                state.token,
                 connection.identity().qp_num(),
                 expected_opcode,
                 require_flush,
             )?;
             Ok(TestConnectionCqeSuppression {
                 shared: Arc::downgrade(&shared),
-                connection: connection.state.token,
+                connection: state.token,
                 qp_num: connection.identity().qp_num(),
                 active: true,
             })
@@ -1161,13 +1175,8 @@ pub(super) mod test_api {
         /// Return the exact accepted WR IDs currently owned by `connection`.
         pub fn accepted_operation_wr_ids(&self, connection: &RdmaConnection) -> Result<Vec<u64>> {
             let shared = self.ensure_active()?;
-            if !Arc::ptr_eq(&shared, &connection.shared) {
-                return Err(Error::InvalidConfig(
-                    "connection belongs to another engine".into(),
-                ));
-            }
-            Ok(connection
-                .state
+            let state = self.require_owned_connection(&shared, connection)?;
+            Ok(state
                 .accepted_tokens()
                 .into_iter()
                 .map(OperationToken::encode)
@@ -1180,11 +1189,7 @@ pub(super) mod test_api {
             connection: &RdmaConnection,
         ) -> Result<(u32, u32)> {
             let shared = self.ensure_active()?;
-            if !Arc::ptr_eq(&shared, &connection.shared) {
-                return Err(Error::InvalidConfig(
-                    "connection belongs to another engine".into(),
-                ));
-            }
+            self.require_owned_connection(&shared, connection)?;
             let identity = connection.identity();
             Ok((identity.registry_slot(), identity.registration_generation()))
         }
@@ -1210,10 +1215,10 @@ pub(super) mod test_api {
             completion.inner.qp_num = qp_num;
             completion.inner.status = rdma_io_sys::ibverbs::IBV_WC_SUCCESS;
             completion.inner.opcode = raw_wc_opcode(opcode)?;
-            if let Some(token) = shared.enqueue_completion(completion)
-                && let Lookup::Occupied(connection) = shared.connections.lookup(token)
+            if let Some(token) = shared.session.enqueue_completion(completion)
+                && let Lookup::Occupied(connection) = shared.session.connections.lookup(token)
             {
-                shared.publish_completion(&connection);
+                shared.io_core.publish_connection(&connection.io);
             }
             Ok(())
         }
@@ -1684,10 +1689,10 @@ pub(super) mod test_api {
 
         fn instrumentation(&self, shared: &EngineShared) -> TestEngineInstrumentation {
             TestEngineInstrumentation {
-                cm_pending_routes: shared.cm.pending_route_count(),
-                cm_retained_owners: shared.cm.retained_owner_count(),
+                cm_pending_routes: shared.session.cm.pending_route_count(),
+                cm_retained_owners: shared.session.cm.retained_owner_count(),
                 cqes_rejected: shared.io_core.rejected_cqe_count(),
-                cm_events_rejected: shared.rejected_cm_events.load(Ordering::Acquire),
+                cm_events_rejected: shared.session.rejected_cm_events.load(Ordering::Acquire),
             }
         }
 
@@ -2815,10 +2820,7 @@ mod tests {
             .cm
             .defer_test_listener_destruction(Arc::clone(&state), Arc::clone(&destroy_count));
         (
-            RdmaListener {
-                shared: Arc::clone(&engine.shared),
-                state,
-            },
+            RdmaListener::from_state(&engine.shared, state),
             destroy_count,
         )
     }

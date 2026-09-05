@@ -73,7 +73,7 @@ impl EngineShared {
         }
         let retained_bundles = self.retained_bundle_count();
         let outstanding_operations = self.unsafe_outstanding_operations();
-        let pending_routes = self.cm.pending_route_count();
+        let pending_routes = self.session.cm.pending_route_count();
         if retained_bundles == 0 && outstanding_operations == 0 && pending_routes == 0 {
             return None;
         }
@@ -86,7 +86,7 @@ impl EngineShared {
     }
 
     pub(super) fn synchronously_prepare_driver_drop(&self) {
-        for connection in self.connections.occupied() {
+        for connection in self.session.connections.occupied() {
             let _lifecycle = connection.lock_lifecycle();
             connection.stop_posting();
             let _ = connection.transition_to_error_once();

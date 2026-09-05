@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
 use self::qp::QpCapabilitiesExt;
-use super::io::{IoEventSender, IoTerminalEvent, PendingIoEvent};
+use super::io::{IoEventSender, IoTerminalEvent, MemoryRegistrar, PendingIoEvent};
 #[cfg(test)]
 use super::io_core::Direction;
 use super::io_core::RdmaOperation;
@@ -17,7 +17,7 @@ use super::io_core::{
 };
 use super::lifecycle::MemoizedTerminalResult;
 use super::registry::{ConnectionToken, OperationToken, lock_unpoison, read_unpoison};
-use super::session::SessionCloseState;
+use super::session::{SessionCloseState, SessionConnection};
 use super::{EngineShared, RdmaConnectionConfig};
 use crate::cm::{CmId, ConnParam, EventChannel};
 use crate::v2::error::{Error, Result};
@@ -86,16 +86,40 @@ impl QpDestructionProof {
 /// or independently pollable completion-driver handle. Establishment posts
 /// zero initial receives.
 pub struct RdmaConnection {
+    #[cfg(test)]
     pub(super) shared: Arc<EngineShared>,
+    #[cfg(test)]
     pub(super) state: Arc<ConnectionState>,
+    #[cfg(not(test))]
+    state: Weak<ConnectionState>,
+    pub(super) io_core: Arc<super::io_core::IoCore>,
+    pub(super) io: Arc<EstablishedIoConnection>,
+    pub(super) memory: MemoryRegistrar,
+    pub(super) session: SessionConnection,
+    local_addr: Option<SocketAddr>,
+    peer_addr: Option<SocketAddr>,
+    identity: RdmaConnectionIdentity,
 }
 
 impl Clone for RdmaConnection {
     fn clone(&self) -> Self {
-        self.state.frontend_count.fetch_add(1, Ordering::Relaxed);
+        if let Some(state) = self.session_state() {
+            state.frontend_count.fetch_add(1, Ordering::Relaxed);
+        }
         Self {
+            #[cfg(test)]
             shared: Arc::clone(&self.shared),
+            #[cfg(test)]
             state: Arc::clone(&self.state),
+            #[cfg(not(test))]
+            state: self.state.clone(),
+            io_core: Arc::clone(&self.io_core),
+            io: Arc::clone(&self.io),
+            memory: self.memory.clone(),
+            session: self.session.clone(),
+            local_addr: self.local_addr,
+            peer_addr: self.peer_addr,
+            identity: self.identity,
         }
     }
 }
@@ -106,7 +130,7 @@ impl RdmaConnection {
     /// The returned MR remains owned by the caller until it is submitted in an
     /// [`RdmaOperation`]. Length must be nonzero and fit the provider ABI.
     pub fn register_memory(&self, len: usize, access: AccessIntent) -> Result<Mr> {
-        self.shared.register_memory(len, access)
+        self.memory.register(len, access)
     }
 
     /// Create a two-sided SEND operation submitted on first poll.
@@ -115,8 +139,8 @@ impl RdmaConnection {
     /// future returns `(Result<Completion>, Option<Mr>)`.
     pub fn send(&self, mr: Mr, range: Option<(usize, usize)>) -> RdmaOperation {
         RdmaOperation::new(
-            Arc::clone(&self.shared.io_core),
-            Arc::clone(&self.state.io),
+            Arc::clone(&self.io_core),
+            Arc::clone(&self.io),
             OperationKind::Send,
             mr,
             None,
@@ -127,8 +151,8 @@ impl RdmaConnection {
     /// Create a two-sided RECV operation submitted on first poll.
     pub fn recv(&self, mr: Mr, range: Option<(usize, usize)>) -> RdmaOperation {
         RdmaOperation::new(
-            Arc::clone(&self.shared.io_core),
-            Arc::clone(&self.state.io),
+            Arc::clone(&self.io_core),
+            Arc::clone(&self.io),
             OperationKind::Recv,
             mr,
             None,
@@ -139,8 +163,8 @@ impl RdmaConnection {
     /// Create an RDMA WRITE operation submitted on first poll.
     pub fn write(&self, mr: Mr, remote: RemoteMr, range: Option<(usize, usize)>) -> RdmaOperation {
         RdmaOperation::new(
-            Arc::clone(&self.shared.io_core),
-            Arc::clone(&self.state.io),
+            Arc::clone(&self.io_core),
+            Arc::clone(&self.io),
             OperationKind::Write,
             mr,
             Some(remote),
@@ -151,8 +175,8 @@ impl RdmaConnection {
     /// Create an RDMA READ operation submitted on first poll.
     pub fn read(&self, mr: Mr, remote: RemoteMr, range: Option<(usize, usize)>) -> RdmaOperation {
         RdmaOperation::new(
-            Arc::clone(&self.shared.io_core),
-            Arc::clone(&self.state.io),
+            Arc::clone(&self.io_core),
+            Arc::clone(&self.io),
             OperationKind::Read,
             mr,
             Some(remote),
@@ -162,21 +186,19 @@ impl RdmaConnection {
 
     /// Return the local socket address reported by RDMA-CM.
     pub fn local_addr(&self) -> Result<SocketAddr> {
-        self.state
-            .local_addr
+        self.local_addr
             .ok_or_else(|| Error::InvalidConfig("connection local address is unavailable".into()))
     }
 
     /// Return the peer socket address reported by RDMA-CM.
     pub fn peer_addr(&self) -> Result<SocketAddr> {
-        self.state
-            .peer_addr
+        self.peer_addr
             .ok_or_else(|| Error::InvalidConfig("connection peer address is unavailable".into()))
     }
 
     /// Return the opaque current connection identity and exact `qp_num`.
     pub fn identity(&self) -> RdmaConnectionIdentity {
-        self.state.identity()
+        self.identity
     }
 
     /// Stop new posting and wait for the exact accepted set to drain safely.
@@ -191,24 +213,12 @@ impl RdmaConnection {
     /// destruction boundary or another retirement wedge. Peer disconnect uses
     /// the same local QP-to-ERR and safe-destruction path.
     pub async fn close(&self) -> Result<()> {
-        self.shared.begin_connection_close(&self.state);
-        loop {
-            let notified = self.state.close.notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if let Some(outcome) = self.state.close_outcome() {
-                return outcome.into_result();
-            }
-            if let Some(outcome) = self.shared.outcome() {
-                return outcome.into_result();
-            }
-            notified.await;
-        }
+        self.session.close().await
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn transition_to_error_for_test(&self) -> Result<()> {
-        self.state.poster.to_error()
+        self.require_session_state()?.poster.to_error()
     }
 
     #[cfg(test)]
@@ -224,10 +234,67 @@ impl RdmaConnection {
 
 impl Drop for RdmaConnection {
     fn drop(&mut self) {
-        let previous = self.state.frontend_count.fetch_sub(1, Ordering::AcqRel);
+        let Some(state) = self.session_state() else {
+            return;
+        };
+        let previous = state.frontend_count.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0, "connection frontend count must be positive");
-        if previous == 1 && !self.state.is_retired() {
-            self.shared.begin_connection_close(&self.state);
+        if previous == 1 && !state.is_retired() {
+            self.session.request_close();
+        }
+    }
+}
+
+impl RdmaConnection {
+    pub(super) fn session_state(&self) -> Option<Arc<ConnectionState>> {
+        #[cfg(test)]
+        {
+            Some(Arc::clone(&self.state))
+        }
+        #[cfg(not(test))]
+        {
+            self.state.upgrade()
+        }
+    }
+
+    pub(super) fn require_session_state(&self) -> Result<Arc<ConnectionState>> {
+        self.session_state().ok_or_else(|| {
+            Error::InvalidConfig(
+                "session-owned connection record disappeared before route retirement".into(),
+            )
+        })
+    }
+
+    pub(super) fn session_token(&self) -> ConnectionToken {
+        ConnectionToken {
+            slot: self.identity.slot,
+            generation: self.identity.generation,
+        }
+    }
+
+    fn from_registered(
+        shared: &Arc<EngineShared>,
+        state: Arc<ConnectionState>,
+        session: SessionConnection,
+    ) -> Self {
+        let identity = state.identity();
+        let local_addr = state.local_addr;
+        let peer_addr = state.peer_addr;
+        let io = Arc::clone(&state.io);
+        Self {
+            #[cfg(test)]
+            shared: Arc::clone(shared),
+            #[cfg(test)]
+            state: Arc::clone(&state),
+            #[cfg(not(test))]
+            state: Arc::downgrade(&state),
+            io_core: Arc::clone(&shared.io_core),
+            io,
+            memory: MemoryRegistrar::from_engine(shared),
+            session,
+            local_addr,
+            peer_addr,
+            identity,
         }
     }
 }
@@ -600,6 +667,7 @@ impl ConnectionState {
         self.pending_io_event(IoTerminalEvent::Closed(Err(error)))
     }
 
+    #[cfg(test)]
     pub(super) fn close_outcome(&self) -> Option<MemoizedTerminalResult> {
         self.close.outcome()
     }
@@ -1431,7 +1499,10 @@ pub(crate) fn install_connection(
         Err(failure) => {
             let (error, resources) = failure.into_parts();
             if let FailedConnectionInstallResources::Registered(connection) = resources {
-                let _ = shared.connections.release_unindexed(connection.token);
+                let _ = shared
+                    .session
+                    .connections
+                    .release_unindexed(connection.token);
                 connection.release_admission();
             }
             Err(error)
@@ -1442,11 +1513,12 @@ pub(crate) fn install_connection(
 pub(super) fn reserve_connection(
     shared: &Arc<EngineShared>,
 ) -> Result<(RwLockReadGuard<'_, ()>, ConnectionReservation)> {
-    let admission = read_unpoison(&shared.admission);
+    let admission = read_unpoison(&shared.session.admission);
     if let Some(error) = shared.admission_error() {
         return Err(error);
     }
     let reservation = shared
+        .session
         .connection_admission
         .try_acquire()
         .ok_or(Error::CapacityExhausted)?;
@@ -1481,7 +1553,7 @@ pub(super) fn install_reserved_connection(
     let qp_num = poster.qp_num();
     let pending = Arc::new(Mutex::new(Some((poster, reservation))));
     let make_pending = Arc::clone(&pending);
-    let registration = shared.connections.register(qp_num, move |token| {
+    let registration = shared.session.connections.register(qp_num, move |token| {
         let (poster, reservation) = lock_unpoison(&make_pending)
             .take()
             .expect("connection registration factory runs exactly once");
@@ -1519,7 +1591,7 @@ pub(super) fn install_reserved_connection(
     #[cfg(any(test, feature = "test-hooks"))]
     if let Some(failure) = shared.test_driver.take_setup_rollback_failure() {
         state.retain_setup_rollback_mr(failure.retained_mr);
-        if !shared.connections.detach_qp_index(token, qp_num) {
+        if !shared.session.connections.detach_qp_index(token, qp_num) {
             return Err(ConnectionInstallFailure {
                 error: Error::InvalidConfig(
                     "setup rollback injection lost its QP registration".into(),
@@ -1538,10 +1610,8 @@ pub(super) fn install_reserved_connection(
             resources: FailedConnectionInstallResources::Registered(state),
         });
     }
-    Ok(RdmaConnection {
-        shared: Arc::clone(shared),
-        state,
-    })
+    let session = shared.session.connection_capability(&state);
+    Ok(RdmaConnection::from_registered(shared, state, session))
 }
 
 pub(super) struct ConnectionInstallFailure {

@@ -9,7 +9,9 @@ use std::task::Waker;
 use futures_util::task::AtomicWaker;
 
 use super::EngineShared;
+#[cfg(test)]
 use super::connection::ConnectionState;
+use super::connection::RdmaConnection;
 use super::io_core::{self, EstablishedIoConnection, IoCore};
 use super::registry::{OperationToken, lock_unpoison};
 use super::session::SessionConnection;
@@ -17,43 +19,22 @@ use crate::v2::error::{Error, Result};
 use crate::v2::mr::{AccessIntent, Mr};
 use crate::v2::op::Completion;
 
-/// Opaque authority for protocol I/O on one engine-owned connection.
 #[derive(Clone)]
-pub(crate) struct IoConnection {
-    io_core: Arc<IoCore>,
-    io: Arc<EstablishedIoConnection>,
+pub(super) struct MemoryRegistrar {
     pd: Option<crate::v2::Pd>,
-    session: SessionConnection,
-    events: IoEventSender,
 }
 
-impl IoConnection {
-    pub(super) fn new(
-        shared: Arc<EngineShared>,
-        connection: Arc<ConnectionState>,
-    ) -> Result<(Self, IoEventReceiver)> {
-        let (events, receiver) = event_port();
-        let pending = connection.install_io_event_sender(events.clone())?;
-        if let Some(pending) = pending {
-            pending.deliver();
+impl MemoryRegistrar {
+    pub(super) fn from_engine(shared: &EngineShared) -> Self {
+        Self {
+            pd: shared
+                .resource_refs
+                .as_ref()
+                .map(|resources| resources.pd.clone()),
         }
-        let pd = shared
-            .resource_refs
-            .as_ref()
-            .map(|resources| resources.pd.clone());
-        Ok((
-            Self {
-                io_core: Arc::clone(&shared.io_core),
-                io: Arc::clone(&connection.io),
-                pd,
-                session: shared.session.connection_capability(&connection),
-                events,
-            },
-            receiver,
-        ))
     }
 
-    pub(crate) fn register_memory(&self, len: usize, access: AccessIntent) -> Result<Mr> {
+    pub(super) fn register(&self, len: usize, access: AccessIntent) -> Result<Mr> {
         if len == 0 || u32::try_from(len).is_err() {
             return Err(Error::InvalidConfig(
                 "engine MR length must be in 1..=u32::MAX".into(),
@@ -63,6 +44,44 @@ impl IoConnection {
             Error::InvalidConfig("engine shared protection domain is unavailable".into())
         })?;
         pd.reg_mr(len, access)
+    }
+}
+
+/// Opaque authority for protocol I/O on one engine-owned connection.
+#[derive(Clone)]
+pub(crate) struct IoConnection {
+    io_core: Arc<IoCore>,
+    io: Arc<EstablishedIoConnection>,
+    memory: MemoryRegistrar,
+    session: SessionConnection,
+    events: IoEventSender,
+}
+
+impl IoConnection {
+    #[cfg(test)]
+    pub(super) fn new(
+        shared: Arc<EngineShared>,
+        connection: Arc<ConnectionState>,
+    ) -> Result<(Self, IoEventReceiver)> {
+        let (events, receiver) = event_port();
+        let pending = connection.install_io_event_sender(events.clone())?;
+        if let Some(pending) = pending {
+            pending.deliver();
+        }
+        Ok((
+            Self {
+                io_core: Arc::clone(&shared.io_core),
+                io: Arc::clone(&connection.io),
+                memory: MemoryRegistrar::from_engine(&shared),
+                session: shared.session.connection_capability(&connection),
+                events,
+            },
+            receiver,
+        ))
+    }
+
+    pub(crate) fn register_memory(&self, len: usize, access: AccessIntent) -> Result<Mr> {
+        self.memory.register(len, access)
     }
 
     pub(crate) fn post_recv_batch(&self, requests: Vec<IoRecvRequest>) -> IoSubmissionDisposition {
@@ -83,6 +102,25 @@ impl IoConnection {
 
     pub(crate) async fn close(&self) -> Result<()> {
         self.session.close().await
+    }
+
+    pub(super) fn from_connection(connection: &RdmaConnection) -> Result<(Self, IoEventReceiver)> {
+        let (events, receiver) = event_port();
+        let state = connection.session_state().ok_or(Error::TransportClosed)?;
+        let pending = state.install_io_event_sender(events.clone())?;
+        if let Some(pending) = pending {
+            pending.deliver();
+        }
+        Ok((
+            Self {
+                io_core: Arc::clone(&connection.io_core),
+                io: Arc::clone(&connection.io),
+                memory: connection.memory.clone(),
+                session: connection.session.clone(),
+                events,
+            },
+            receiver,
+        ))
     }
 }
 
@@ -154,7 +192,7 @@ impl IoConnection {
             Self {
                 io_core: Arc::clone(&shared.io_core),
                 io: Arc::clone(&connection.io),
-                pd: None,
+                memory: MemoryRegistrar { pd: None },
                 session: shared.session.connection_capability(&connection),
                 events: sender,
             },
