@@ -8,10 +8,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 
-use super::connection::{ConnectionReservation, SharedCmId};
 use super::io::{IoConnection, IoEventReceiver};
 use super::lifecycle::{MemoizedTerminalResult, TakeOnceResult};
 use super::registry::{lock_unpoison, read_unpoison};
+use super::session::connection::{ConnectionReservation, SharedCmId};
 use super::session::{SessionListener, SessionListenerCloseState};
 use super::{ConnectionSetup, EngineShared, RdmaConnection, RdmaConnectionConfig, SetupSummary};
 use crate::v2::error::{Error, Result};

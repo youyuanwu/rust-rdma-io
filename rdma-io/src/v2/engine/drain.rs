@@ -3,10 +3,10 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use super::connection::ConnectionState;
 use super::lifecycle::MemoizedTerminalResult;
 use super::registry::{ConnectionToken, Lookup, read_unpoison};
 use super::scheduler::DeadlineKind;
+use super::session::connection::ConnectionState;
 use super::{EngineShared, SessionManager};
 
 impl SessionManager {
@@ -224,9 +224,9 @@ mod tests {
     use std::task::{Context, Poll};
     use std::time::Duration;
 
-    use super::super::connection::{WorkRequestPoster, install_connection};
     use super::super::io_core::install_accepted_operation_for_driver_test;
     use super::super::registry::OperationToken;
+    use super::super::session::connection::{WorkRequestPoster, install_connection};
     use super::super::{CompletionMode, RdmaConnectionConfig, test_engine_pair};
     use crate::v2::error::{Error, Result};
     use crate::v2::qp::{BatchPostOutcome, QpCapabilities};

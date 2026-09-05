@@ -7,18 +7,18 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
 use self::qp::QpCapabilitiesExt;
-use super::io::{IoEventSender, IoTerminalEvent, MemoryRegistrar, PendingIoEvent};
+use super::super::io::{IoEventSender, IoTerminalEvent, MemoryRegistrar, PendingIoEvent};
 #[cfg(test)]
-use super::io_core::Direction;
-use super::io_core::RdmaOperation;
-use super::io_core::{
+use super::super::io_core::Direction;
+use super::super::io_core::RdmaOperation;
+use super::super::io_core::{
     EstablishedIoConnection, EstablishedIoIdentity, IoDrainReport, IoPostAuthority,
     IoQuarantineReport, OperationKind,
 };
-use super::lifecycle::MemoizedTerminalResult;
-use super::registry::{ConnectionToken, OperationToken, lock_unpoison, read_unpoison};
-use super::session::{SessionCloseState, SessionConnection, SessionLifecycleAuthority};
-use super::{EngineShared, RdmaConnectionConfig};
+use super::super::lifecycle::MemoizedTerminalResult;
+use super::super::registry::{ConnectionToken, OperationToken, lock_unpoison, read_unpoison};
+use super::super::{EngineShared, RdmaConnectionConfig};
+use super::{SessionCloseState, SessionConnection, SessionLifecycleAuthority};
 use crate::cm::{CmId, ConnParam, EventChannel};
 use crate::v2::error::{Error, Result};
 use crate::v2::mr::{AccessIntent, Mr, RemoteMr};
@@ -57,12 +57,12 @@ impl RdmaConnectionIdentity {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn registry_slot(&self) -> u32 {
+    pub(in crate::v2::engine) fn registry_slot(&self) -> u32 {
         self.slot
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn registration_generation(&self) -> u32 {
+    pub(in crate::v2::engine) fn registration_generation(&self) -> u32 {
         self.generation
     }
 }
@@ -74,15 +74,15 @@ impl RdmaConnectionIdentity {
 /// zero initial receives.
 pub struct RdmaConnection {
     #[cfg(test)]
-    pub(super) shared: Arc<EngineShared>,
+    pub(in crate::v2::engine) shared: Arc<EngineShared>,
     #[cfg(test)]
-    pub(super) state: Arc<ConnectionState>,
+    pub(in crate::v2::engine) state: Arc<ConnectionState>,
     #[cfg(not(test))]
     state: Weak<ConnectionState>,
-    pub(super) io_core: Arc<super::io_core::IoCore>,
-    pub(super) io: Arc<EstablishedIoConnection>,
-    pub(super) memory: MemoryRegistrar,
-    pub(super) session: SessionConnection,
+    pub(in crate::v2::engine) io_core: Arc<super::super::io_core::IoCore>,
+    pub(in crate::v2::engine) io: Arc<EstablishedIoConnection>,
+    pub(in crate::v2::engine) memory: MemoryRegistrar,
+    pub(in crate::v2::engine) session: SessionConnection,
     local_addr: Option<SocketAddr>,
     peer_addr: Option<SocketAddr>,
     identity: RdmaConnectionIdentity,
@@ -209,7 +209,7 @@ impl RdmaConnection {
     }
 
     #[cfg(test)]
-    pub(super) fn into_state_without_close_for_test(self) -> Arc<ConnectionState> {
+    pub(in crate::v2::engine) fn into_state_without_close_for_test(self) -> Arc<ConnectionState> {
         let state = Arc::clone(&self.state);
         state.frontend_count.fetch_add(1, Ordering::Relaxed);
         drop(self);
@@ -233,7 +233,7 @@ impl Drop for RdmaConnection {
 }
 
 impl RdmaConnection {
-    pub(super) fn session_state(&self) -> Option<Arc<ConnectionState>> {
+    pub(in crate::v2::engine) fn session_state(&self) -> Option<Arc<ConnectionState>> {
         #[cfg(test)]
         {
             Some(Arc::clone(&self.state))
@@ -244,7 +244,7 @@ impl RdmaConnection {
         }
     }
 
-    pub(super) fn require_session_state(&self) -> Result<Arc<ConnectionState>> {
+    pub(in crate::v2::engine) fn require_session_state(&self) -> Result<Arc<ConnectionState>> {
         self.session_state().ok_or_else(|| {
             Error::InvalidConfig(
                 "session-owned connection record disappeared before route retirement".into(),
@@ -252,7 +252,7 @@ impl RdmaConnection {
         })
     }
 
-    pub(super) fn session_token(&self) -> ConnectionToken {
+    pub(in crate::v2::engine) fn session_token(&self) -> ConnectionToken {
         ConnectionToken {
             slot: self.identity.slot,
             generation: self.identity.generation,
@@ -286,11 +286,11 @@ impl RdmaConnection {
     }
 }
 
-pub(super) struct ConnectionState {
-    pub(super) token: ConnectionToken,
+pub(in crate::v2::engine) struct ConnectionState {
+    pub(in crate::v2::engine) token: ConnectionToken,
     qp_num: u32,
-    pub(super) poster: Arc<dyn WorkRequestPoster>,
-    pub(super) io: Arc<EstablishedIoConnection>,
+    pub(in crate::v2::engine) poster: Arc<dyn WorkRequestPoster>,
+    pub(in crate::v2::engine) io: Arc<EstablishedIoConnection>,
     local_addr: Option<SocketAddr>,
     peer_addr: Option<SocketAddr>,
     // Nested lifecycle synchronization always follows:
@@ -313,13 +313,13 @@ pub(super) struct ConnectionState {
     retained_setup_rollback_mr: Mutex<Option<Mr>>,
 }
 
-pub(super) enum QpDestroyStatus {
+pub(in crate::v2::engine) enum QpDestroyStatus {
     DestroyedNow,
     AlreadyDestroyed,
 }
 
 impl ConnectionState {
-    pub(super) fn new(
+    pub(in crate::v2::engine) fn new(
         token: ConnectionToken,
         poster: Arc<dyn WorkRequestPoster>,
         config: RdmaConnectionConfig,
@@ -372,7 +372,7 @@ impl ConnectionState {
         }
     }
 
-    pub(super) fn identity(&self) -> RdmaConnectionIdentity {
+    pub(in crate::v2::engine) fn identity(&self) -> RdmaConnectionIdentity {
         let io = self.io.identity();
         debug_assert_eq!(io.connection, self.token);
         debug_assert_eq!(io.qp_num, self.qp_num);
@@ -383,48 +383,48 @@ impl ConnectionState {
         }
     }
 
-    pub(super) fn qp_num(&self) -> u32 {
+    pub(in crate::v2::engine) fn qp_num(&self) -> u32 {
         self.qp_num
     }
 
     #[cfg(test)]
-    pub(super) fn reserve_local(&self, direction: Direction) -> Result<()> {
+    pub(in crate::v2::engine) fn reserve_local(&self, direction: Direction) -> Result<()> {
         self.io.reserve_local(direction)
     }
 
     #[cfg(test)]
-    pub(super) fn begin_posting(&self) -> Result<RwLockReadGuard<'_, ()>> {
+    pub(in crate::v2::engine) fn begin_posting(&self) -> Result<RwLockReadGuard<'_, ()>> {
         self.io.begin_posting()
     }
 
     #[cfg(test)]
-    pub(super) fn release_local(&self, direction: Direction) {
+    pub(in crate::v2::engine) fn release_local(&self, direction: Direction) {
         self.io.release_local(direction);
     }
 
     #[cfg(test)]
-    pub(super) fn add_accepted(&self, token: OperationToken) {
+    pub(in crate::v2::engine) fn add_accepted(&self, token: OperationToken) {
         self.io.add_accepted(token);
     }
 
     #[cfg(test)]
-    pub(super) fn remove_accepted(&self, token: OperationToken) -> bool {
+    pub(in crate::v2::engine) fn remove_accepted(&self, token: OperationToken) -> bool {
         self.io.remove_accepted(token)
     }
 
-    pub(super) fn accepted_tokens(&self) -> Vec<OperationToken> {
+    pub(in crate::v2::engine) fn accepted_tokens(&self) -> Vec<OperationToken> {
         self.io.accepted_tokens()
     }
 
-    pub(super) fn accepted_count(&self) -> usize {
+    pub(in crate::v2::engine) fn accepted_count(&self) -> usize {
         self.io.accepted_count()
     }
 
-    pub(super) fn has_copied_completions(&self) -> bool {
+    pub(in crate::v2::engine) fn has_copied_completions(&self) -> bool {
         self.io.has_completion_work()
     }
 
-    pub(super) fn install_io_event_sender(
+    pub(in crate::v2::engine) fn install_io_event_sender(
         &self,
         sender: IoEventSender,
     ) -> Result<Option<PendingIoEvent>> {
@@ -442,7 +442,7 @@ impl ConnectionState {
         )
     }
 
-    pub(super) fn close_state(&self) -> Arc<SessionCloseState> {
+    pub(in crate::v2::engine) fn close_state(&self) -> Arc<SessionCloseState> {
         Arc::clone(&self.close)
     }
 
@@ -450,19 +450,19 @@ impl ConnectionState {
         self.io.pending_io_event(event)
     }
 
-    pub(super) fn stop_posting(&self) {
+    pub(in crate::v2::engine) fn stop_posting(&self) {
         self.io.close_posting();
     }
 
-    pub(super) fn io_drain_report(&self) -> IoDrainReport {
+    pub(in crate::v2::engine) fn io_drain_report(&self) -> IoDrainReport {
         self.io.drain_report()
     }
 
-    pub(super) fn lock_lifecycle(&self) -> MutexGuard<'_, ()> {
+    pub(in crate::v2::engine) fn lock_lifecycle(&self) -> MutexGuard<'_, ()> {
         lock_unpoison(&self.lifecycle_gate)
     }
 
-    pub(super) fn finalize_engine(
+    pub(in crate::v2::engine) fn finalize_engine(
         &self,
         authority: &SessionLifecycleAuthority,
         outcome: &MemoizedTerminalResult,
@@ -480,12 +480,12 @@ impl ConnectionState {
         None
     }
 
-    pub(super) fn mark_disconnected(&self) -> Option<PendingIoEvent> {
+    pub(in crate::v2::engine) fn mark_disconnected(&self) -> Option<PendingIoEvent> {
         self.stop_posting();
         self.pending_io_event(IoTerminalEvent::Disconnected)
     }
 
-    pub(super) fn mark_cm_failure(&self, error: Error) -> Option<PendingIoEvent> {
+    pub(in crate::v2::engine) fn mark_cm_failure(&self, error: Error) -> Option<PendingIoEvent> {
         self.stop_posting();
         let mut outcome = lock_unpoison(&self.close.outcome);
         if outcome.is_none() {
@@ -496,7 +496,7 @@ impl ConnectionState {
         self.pending_io_event(IoTerminalEvent::Terminal(error))
     }
 
-    pub(super) fn transition_to_error_once(
+    pub(in crate::v2::engine) fn transition_to_error_once(
         &self,
         _authority: &SessionLifecycleAuthority,
     ) -> Result<bool> {
@@ -509,11 +509,11 @@ impl ConnectionState {
         Ok(true)
     }
 
-    pub(super) fn error_transition_complete(&self) -> bool {
+    pub(in crate::v2::engine) fn error_transition_complete(&self) -> bool {
         self.error_transition_complete.load(Ordering::Acquire)
     }
 
-    pub(super) fn destroy_connection_resources(
+    pub(in crate::v2::engine) fn destroy_connection_resources(
         &self,
         _authority: &SessionLifecycleAuthority,
         _lifecycle: &MutexGuard<'_, ()>,
@@ -540,7 +540,7 @@ impl ConnectionState {
         Ok(cm_id)
     }
 
-    pub(super) fn destroy_qp_for_session(
+    pub(in crate::v2::engine) fn destroy_qp_for_session(
         &self,
         _authority: &SessionLifecycleAuthority,
         _lifecycle: &MutexGuard<'_, ()>,
@@ -575,19 +575,19 @@ impl ConnectionState {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn disconnect_for_test(&self) -> Result<()> {
+    pub(in crate::v2::engine) fn disconnect_for_test(&self) -> Result<()> {
         self.poster.disconnect()
     }
 
-    pub(super) fn wake_close(&self) {
+    pub(in crate::v2::engine) fn wake_close(&self) {
         self.close.notify_waiters();
     }
 
-    pub(super) fn begin_quarantine(&self) -> Option<IoQuarantineReport> {
+    pub(in crate::v2::engine) fn begin_quarantine(&self) -> Option<IoQuarantineReport> {
         self.io.begin_connection_quarantine(&self.quarantined)
     }
 
-    pub(super) fn publish_quarantine(
+    pub(in crate::v2::engine) fn publish_quarantine(
         &self,
         outstanding_operations: usize,
         cq_debt: usize,
@@ -605,7 +605,7 @@ impl ConnectionState {
         self.pending_io_event(IoTerminalEvent::Terminal(error))
     }
 
-    pub(super) fn publish_destroy_quarantine(
+    pub(in crate::v2::engine) fn publish_destroy_quarantine(
         &self,
         error: &Error,
         before_publish: impl FnOnce(),
@@ -632,15 +632,15 @@ impl ConnectionState {
         (newly_published, None)
     }
 
-    pub(super) fn recover_quarantine(&self) -> bool {
+    pub(in crate::v2::engine) fn recover_quarantine(&self) -> bool {
         self.quarantined.swap(false, Ordering::AcqRel)
     }
 
-    pub(super) fn retain_bundle_for_engine_failure(&self) -> bool {
+    pub(in crate::v2::engine) fn retain_bundle_for_engine_failure(&self) -> bool {
         self.accepted_count() != 0 && !self.quarantined.swap(true, Ordering::AcqRel)
     }
 
-    pub(super) fn finish_retirement(&self) -> Option<PendingIoEvent> {
+    pub(in crate::v2::engine) fn finish_retirement(&self) -> Option<PendingIoEvent> {
         let mut outcome = lock_unpoison(&self.close.outcome);
         if outcome.is_none() {
             *outcome = Some(MemoizedTerminalResult::success());
@@ -651,7 +651,7 @@ impl ConnectionState {
         self.pending_io_event(IoTerminalEvent::Closed(Ok(())))
     }
 
-    pub(super) fn fail_retirement(&self, error: Error) -> Option<PendingIoEvent> {
+    pub(in crate::v2::engine) fn fail_retirement(&self, error: Error) -> Option<PendingIoEvent> {
         self.stop_posting();
         self.release_admission();
         let mut outcome = lock_unpoison(&self.close.outcome);
@@ -668,11 +668,11 @@ impl ConnectionState {
     }
 
     #[cfg(test)]
-    pub(super) fn close_outcome(&self) -> Option<MemoizedTerminalResult> {
+    pub(in crate::v2::engine) fn close_outcome(&self) -> Option<MemoizedTerminalResult> {
         self.close.outcome()
     }
 
-    pub(super) fn operation_close_error(&self) -> Error {
+    pub(in crate::v2::engine) fn operation_close_error(&self) -> Error {
         self.close
             .raw_outcome()
             .as_ref()
@@ -680,11 +680,11 @@ impl ConnectionState {
             .unwrap_or(Error::TransportClosed)
     }
 
-    pub(super) fn close_started(&self) -> bool {
+    pub(in crate::v2::engine) fn close_started(&self) -> bool {
         self.close_started.load(Ordering::Acquire)
     }
 
-    pub(super) fn begin_close(&self) -> bool {
+    pub(in crate::v2::engine) fn begin_close(&self) -> bool {
         self.stop_posting();
         let first = !self.close_started.swap(true, Ordering::AcqRel);
         if first && let Some(reservation) = lock_unpoison(&self.admission).as_mut() {
@@ -693,49 +693,49 @@ impl ConnectionState {
         first
     }
 
-    pub(super) fn try_request_retirement(&self) -> bool {
+    pub(in crate::v2::engine) fn try_request_retirement(&self) -> bool {
         !self.retirement_requested.swap(true, Ordering::AcqRel)
     }
 
-    pub(super) fn try_begin_retirement(&self) -> bool {
+    pub(in crate::v2::engine) fn try_begin_retirement(&self) -> bool {
         if self.retirement_quarantined.load(Ordering::Acquire) {
             return false;
         }
         !self.retirement_started.swap(true, Ordering::AcqRel)
     }
 
-    pub(super) fn retry_retirement(&self) {
+    pub(in crate::v2::engine) fn retry_retirement(&self) {
         if self.retirement_quarantined.load(Ordering::Acquire) {
             return;
         }
         self.retirement_started.store(false, Ordering::Release);
     }
 
-    pub(super) fn retirement_is_quarantined(&self) -> bool {
+    pub(in crate::v2::engine) fn retirement_is_quarantined(&self) -> bool {
         self.retirement_quarantined.load(Ordering::Acquire)
     }
 
-    pub(super) fn is_retired(&self) -> bool {
+    pub(in crate::v2::engine) fn is_retired(&self) -> bool {
         self.close.is_retired()
     }
 
-    pub(super) fn mark_drained_once(&self) -> bool {
+    pub(in crate::v2::engine) fn mark_drained_once(&self) -> bool {
         !self.drained_recorded.swap(true, Ordering::AcqRel)
     }
 
-    pub(super) fn rollback_draining_count(&self) {
+    pub(in crate::v2::engine) fn rollback_draining_count(&self) {
         if let Some(reservation) = lock_unpoison(&self.admission).as_mut() {
             reservation.rollback_draining();
         }
     }
 
-    pub(super) fn mark_reservation_quarantined(&self) {
+    pub(in crate::v2::engine) fn mark_reservation_quarantined(&self) {
         if let Some(reservation) = lock_unpoison(&self.admission).as_mut() {
             reservation.mark_quarantined();
         }
     }
 
-    pub(super) fn recover_reservation_quarantine(&self) {
+    pub(in crate::v2::engine) fn recover_reservation_quarantine(&self) {
         if let Some(reservation) = lock_unpoison(&self.admission).as_mut() {
             reservation.recover_quarantine(!self.qp_destroyed.load(Ordering::Acquire));
         }
@@ -750,20 +750,20 @@ impl ConnectionState {
     }
 
     #[cfg(test)]
-    pub(super) fn record_qp_destroyed_for_test(&self) {
+    pub(in crate::v2::engine) fn record_qp_destroyed_for_test(&self) {
         self.record_qp_destroyed();
     }
 
-    pub(super) fn cm_route(&self) -> Option<ConnectionCmRoute> {
+    pub(in crate::v2::engine) fn cm_route(&self) -> Option<ConnectionCmRoute> {
         self.cm_route
     }
 
-    pub(super) fn release_admission(&self) {
+    pub(in crate::v2::engine) fn release_admission(&self) {
         drop(lock_unpoison(&self.admission).take());
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn retain_setup_rollback_mr(&self, mr: Mr) {
+    pub(in crate::v2::engine) fn retain_setup_rollback_mr(&self, mr: Mr) {
         let previous = lock_unpoison(&self.retained_setup_rollback_mr).replace(mr);
         assert!(
             previous.is_none(),
@@ -772,20 +772,20 @@ impl ConnectionState {
     }
 }
 
-pub(super) struct ConnectionAdmissionPool {
+pub(in crate::v2::engine) struct ConnectionAdmissionPool {
     capacity: usize,
     counts: Arc<ConnectionStateCounts>,
 }
 
 impl ConnectionAdmissionPool {
-    pub(super) fn new(capacity: usize) -> Arc<Self> {
+    pub(in crate::v2::engine) fn new(capacity: usize) -> Arc<Self> {
         Arc::new(Self {
             capacity,
             counts: Arc::new(ConnectionStateCounts::default()),
         })
     }
 
-    pub(super) fn try_acquire(self: &Arc<Self>) -> Option<ConnectionReservation> {
+    pub(in crate::v2::engine) fn try_acquire(self: &Arc<Self>) -> Option<ConnectionReservation> {
         if !self.counts.try_acquire(self.capacity) {
             return None;
         }
@@ -796,16 +796,16 @@ impl ConnectionAdmissionPool {
         })
     }
 
-    pub(super) fn snapshot(&self) -> ConnectionStateCountSnapshot {
+    pub(in crate::v2::engine) fn snapshot(&self) -> ConnectionStateCountSnapshot {
         self.counts.snapshot()
     }
 
-    pub(super) fn clear_retained_quarantine(&self) {
+    pub(in crate::v2::engine) fn clear_retained_quarantine(&self) {
         self.counts.release_retained_quarantine();
     }
 }
 
-pub(super) struct ConnectionReservation {
+pub(in crate::v2::engine) struct ConnectionReservation {
     counts: Arc<ConnectionStateCounts>,
     state: ReservationState,
     qp_counted: bool,
@@ -822,13 +822,13 @@ enum ReservationState {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) struct ConnectionStateCountSnapshot {
-    pub(super) live: usize,
-    pub(super) establishing: usize,
-    pub(super) established: usize,
-    pub(super) draining: usize,
-    pub(super) registered_live_qps: usize,
-    pub(super) quarantined_bundles: usize,
+pub(in crate::v2::engine) struct ConnectionStateCountSnapshot {
+    pub(in crate::v2::engine) live: usize,
+    pub(in crate::v2::engine) establishing: usize,
+    pub(in crate::v2::engine) established: usize,
+    pub(in crate::v2::engine) draining: usize,
+    pub(in crate::v2::engine) registered_live_qps: usize,
+    pub(in crate::v2::engine) quarantined_bundles: usize,
 }
 
 #[derive(Default)]
@@ -1091,7 +1091,7 @@ impl Drop for ConnectionReservation {
 }
 
 impl ConnectionReservation {
-    pub(super) fn retain_setup_quarantine(&mut self) -> bool {
+    pub(in crate::v2::engine) fn retain_setup_quarantine(&mut self) -> bool {
         let newly_quarantined = !matches!(
             self.state,
             ReservationState::QuarantinedEstablishing
@@ -1104,7 +1104,7 @@ impl ConnectionReservation {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ConnectionCmRoute {
+pub(in crate::v2::engine) enum ConnectionCmRoute {
     Outbound(u64),
     Inbound(u64),
 }
@@ -1175,27 +1175,27 @@ impl IoPostAuthority for SessionIoPostAuthority {
     }
 }
 
-pub(super) struct VerbsConnectionResources {
+pub(in crate::v2::engine) struct VerbsConnectionResources {
     qp: Mutex<Option<Qp>>,
     qp_num: u32,
     capabilities: QpCapabilities,
     cm_owner: Mutex<Option<ConnectionCmOwner>>,
 }
 
-pub(super) struct SharedCmId {
+pub(in crate::v2::engine) struct SharedCmId {
     cm_id: Option<CmId>,
     channel: Option<Arc<EventChannel>>,
 }
 
 impl SharedCmId {
-    pub(super) fn new(cm_id: CmId, channel: Arc<EventChannel>) -> Self {
+    pub(in crate::v2::engine) fn new(cm_id: CmId, channel: Arc<EventChannel>) -> Self {
         Self {
             cm_id: Some(cm_id),
             channel: Some(channel),
         }
     }
 
-    pub(super) fn destroy(mut self) -> Result<()> {
+    pub(in crate::v2::engine) fn destroy(mut self) -> Result<()> {
         let cm_id = self
             .cm_id
             .take()
@@ -1205,7 +1205,7 @@ impl SharedCmId {
         result
     }
 
-    pub(super) fn install_context_token(&mut self, route: u64) -> Result<()> {
+    pub(in crate::v2::engine) fn install_context_token(&mut self, route: u64) -> Result<()> {
         self.cm_id
             .as_mut()
             .expect("shared CM ID remains live until driver destruction")
@@ -1257,7 +1257,7 @@ fn fallback_cm_quarantine() -> &'static Mutex<Vec<RetainedCmId>> {
 
 impl VerbsConnectionResources {
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn new(qp: Qp, cm_owner: crate::async_cm::AsyncCmId) -> Self {
+    pub(in crate::v2::engine) fn new(qp: Qp, cm_owner: crate::async_cm::AsyncCmId) -> Self {
         let qp_num = qp.qp_num();
         let capabilities = qp.capabilities();
         Self {
@@ -1268,7 +1268,7 @@ impl VerbsConnectionResources {
         }
     }
 
-    pub(super) fn new_shared(qp: Qp, cm_id: SharedCmId) -> Self {
+    pub(in crate::v2::engine) fn new_shared(qp: Qp, cm_id: SharedCmId) -> Self {
         let qp_num = qp.qp_num();
         let capabilities = qp.capabilities();
         Self {
@@ -1279,14 +1279,14 @@ impl VerbsConnectionResources {
         }
     }
 
-    pub(super) fn destroy_unregistered_for_session(
+    pub(in crate::v2::engine) fn destroy_unregistered_for_session(
         &self,
         _authority: &SessionLifecycleAuthority,
     ) -> Result<(Option<SharedCmId>, bool)> {
         <Self as WorkRequestPoster>::destroy_connection(self, true)
     }
 
-    pub(super) fn connect(&self, param: &ConnParam) -> Result<()> {
+    pub(in crate::v2::engine) fn connect(&self, param: &ConnParam) -> Result<()> {
         let cm_owner = lock_unpoison(&self.cm_owner);
         match cm_owner.as_ref() {
             Some(ConnectionCmOwner::Shared { cm_id, .. }) => {
@@ -1300,7 +1300,7 @@ impl VerbsConnectionResources {
         }
     }
 
-    pub(super) fn reject(&self) -> Result<()> {
+    pub(in crate::v2::engine) fn reject(&self) -> Result<()> {
         let cm_owner = lock_unpoison(&self.cm_owner);
         match cm_owner.as_ref() {
             Some(ConnectionCmOwner::Shared { cm_id, .. }) => {
@@ -1314,7 +1314,7 @@ impl VerbsConnectionResources {
         }
     }
 
-    pub(super) fn accept(&self, param: &ConnParam) -> Result<()> {
+    pub(in crate::v2::engine) fn accept(&self, param: &ConnParam) -> Result<()> {
         let cm_owner = lock_unpoison(&self.cm_owner);
         match cm_owner.as_ref() {
             Some(ConnectionCmOwner::Shared { cm_id, .. }) => {
@@ -1508,7 +1508,7 @@ pub(crate) fn install_connection(
     }
 }
 
-pub(super) fn reserve_connection(
+pub(in crate::v2::engine) fn reserve_connection(
     shared: &Arc<EngineShared>,
 ) -> Result<(RwLockReadGuard<'_, ()>, ConnectionReservation)> {
     let admission = read_unpoison(&shared.session.admission);
@@ -1523,7 +1523,7 @@ pub(super) fn reserve_connection(
     Ok((admission, reservation))
 }
 
-pub(super) fn install_reserved_connection(
+pub(in crate::v2::engine) fn install_reserved_connection(
     shared: &Arc<EngineShared>,
     poster: Arc<dyn WorkRequestPoster>,
     config: RdmaConnectionConfig,
@@ -1612,7 +1612,7 @@ pub(super) fn install_reserved_connection(
     Ok(RdmaConnection::from_registered(shared, state, session))
 }
 
-pub(super) struct ConnectionInstallFailure {
+pub(in crate::v2::engine) struct ConnectionInstallFailure {
     error: Error,
     resources: FailedConnectionInstallResources,
 }
@@ -1626,7 +1626,7 @@ impl std::fmt::Debug for ConnectionInstallFailure {
     }
 }
 
-pub(super) enum FailedConnectionInstallResources {
+pub(in crate::v2::engine) enum FailedConnectionInstallResources {
     Unregistered {
         poster: Arc<dyn WorkRequestPoster>,
         reservation: ConnectionReservation,
@@ -1649,7 +1649,7 @@ impl ConnectionInstallFailure {
         }
     }
 
-    pub(super) fn into_parts(self) -> (Error, FailedConnectionInstallResources) {
+    pub(in crate::v2::engine) fn into_parts(self) -> (Error, FailedConnectionInstallResources) {
         (self.error, self.resources)
     }
 }
@@ -1657,7 +1657,7 @@ impl ConnectionInstallFailure {
 mod qp {
     use super::*;
 
-    pub(super) trait QpCapabilitiesExt {
+    pub(in crate::v2::engine) trait QpCapabilitiesExt {
         fn require(&self, config: &RdmaConnectionConfig) -> Result<()>;
     }
 
@@ -1699,7 +1699,7 @@ mod qp {
 
 #[cfg(test)]
 mod tests {
-    use super::super::io::{IoEvent, event_port};
+    use super::super::super::io::{IoEvent, event_port};
     use super::super::registry::ConnectionRegistry;
     use super::*;
     use crate::wr::{RecvWr, SendWr, WrOpcode};

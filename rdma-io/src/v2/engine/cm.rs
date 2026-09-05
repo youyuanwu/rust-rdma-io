@@ -20,11 +20,6 @@ use rdma_io_sys::rdmacm::rdma_cm_id;
 
 #[cfg(test)]
 use super::SetupSummary;
-use super::connection::{
-    ConnectionCmRoute, ConnectionReservation, ConnectionState, FailedConnectionInstallResources,
-    SharedCmId, VerbsConnectionResources, WorkRequestPoster, install_reserved_connection,
-    reserve_connection,
-};
 use super::lifecycle::{MemoizedTerminalResult, TakeOnceResult};
 use super::listener::{
     AcceptRequest, InboundRejectReason, IncomingChild, KERNEL_LISTEN_BACKLOG_REQUEST,
@@ -33,6 +28,11 @@ use super::listener::{
 };
 use super::registry::{ConnectionToken, Lookup, PagedRegistry, RegistryToken, lock_unpoison};
 use super::resources::EngineResources;
+use super::session::connection::{
+    ConnectionCmRoute, ConnectionReservation, ConnectionState, FailedConnectionInstallResources,
+    SharedCmId, VerbsConnectionResources, WorkRequestPoster, install_reserved_connection,
+    reserve_connection,
+};
 use super::{ConnectionSetup, EngineShared, RdmaConnection, RdmaConnectionConfig, SessionManager};
 use crate::cm::{CmEventType, CmId, PortSpace};
 use crate::v2::error::{Error, Result};
@@ -3448,7 +3448,7 @@ impl Drop for ConnectWaiter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2::engine::connection::{
+    use crate::v2::engine::session::connection::{
         ConnectionAdmissionPool, WorkRequestPoster, install_connection,
     };
     use crate::v2::qp::{BatchPostOutcome, QpCapabilities};
@@ -4554,7 +4554,7 @@ mod tests {
     }
 
     fn test_request() -> OutboundRequest {
-        let pool = super::super::connection::ConnectionAdmissionPool::new(1);
+        let pool = super::super::session::connection::ConnectionAdmissionPool::new(1);
         OutboundRequest::new(
             "127.0.0.1:1".parse().unwrap(),
             RdmaConnectionConfig::default(),

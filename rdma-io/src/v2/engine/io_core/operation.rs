@@ -518,7 +518,7 @@ impl EstablishedIoRef for Arc<EstablishedIoConnection> {
 }
 
 #[cfg(test)]
-impl EstablishedIoRef for Arc<super::super::connection::ConnectionState> {
+impl EstablishedIoRef for Arc<super::super::session::connection::ConnectionState> {
     fn established_io(&self) -> &EstablishedIoConnection {
         &self.io
     }
@@ -846,7 +846,7 @@ impl IntoEstablishedIoConnection for Arc<EstablishedIoConnection> {
 }
 
 #[cfg(test)]
-impl IntoEstablishedIoConnection for Arc<super::super::connection::ConnectionState> {
+impl IntoEstablishedIoConnection for Arc<super::super::session::connection::ConnectionState> {
     fn into_established_io(self) -> Arc<EstablishedIoConnection> {
         Arc::clone(&self.io)
     }
@@ -2018,7 +2018,7 @@ impl IoCore {
 #[cfg(test)]
 pub(in crate::v2::engine) fn install_accepted_operation_for_driver_test(
     shared: &Arc<super::super::EngineShared>,
-    connection: &Arc<super::super::connection::ConnectionState>,
+    connection: &Arc<super::super::session::connection::ConnectionState>,
     opcode: WcOpcode,
 ) -> OperationToken {
     let direction = if opcode == WcOpcode::Recv {
@@ -2067,9 +2067,9 @@ mod tests {
     use crate::test_support::destruction::{DestructionKind, DestructionRecorder};
     use crate::v2::AccessIntent;
     use crate::v2::engine::config::EngineConfig;
-    use crate::v2::engine::connection::{WorkRequestPoster, install_connection};
     use crate::v2::engine::lifecycle::MemoizedTerminalResult;
-    use crate::v2::engine::{EngineShared, connection::ConnectionState};
+    use crate::v2::engine::session::connection::{WorkRequestPoster, install_connection};
+    use crate::v2::engine::{EngineShared, session::connection::ConnectionState};
     use crate::wc::WcStatus;
     use rdma_io_sys::ibverbs::{IBV_WC_FATAL_ERR, IBV_WC_RECV, IBV_WC_SEND, IBV_WC_SUCCESS};
     use std::sync::Barrier;
@@ -3794,7 +3794,7 @@ mod tests {
         poster: Arc<ScriptedPoster>,
         send_wr: usize,
         recv_wr: usize,
-    ) -> super::super::connection::RdmaConnection {
+    ) -> crate::v2::engine::session::connection::RdmaConnection {
         install_connection(
             shared,
             poster,
@@ -3867,7 +3867,7 @@ mod tests {
     fn synthetic_connection_on(
         shared: &Arc<EngineShared>,
         qp_num: u32,
-    ) -> super::super::connection::RdmaConnection {
+    ) -> crate::v2::engine::session::connection::RdmaConnection {
         install_connection(
             shared,
             Arc::new(NoopPoster(qp_num)),

@@ -122,8 +122,8 @@ mod tests {
         DEFAULT_CONNECTION_DRAIN_DEADLINE, DEFAULT_ENGINE_SHUTDOWN_DEADLINE,
         DEFAULT_MISSING_CQE_DEADLINE, EngineConfig,
     };
-    use super::super::connection::{WorkRequestPoster, install_connection};
     use super::super::registry::OperationToken;
+    use super::super::session::connection::{WorkRequestPoster, install_connection};
     use super::super::{CompletionMode, RdmaConnectionConfig, test_engine_pair};
     use super::MemoizedTerminalResult;
     use crate::v2::error::{Error, Result};

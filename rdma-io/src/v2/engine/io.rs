@@ -9,12 +9,12 @@ use std::task::Waker;
 use futures_util::task::AtomicWaker;
 
 use super::EngineShared;
-#[cfg(test)]
-use super::connection::ConnectionState;
-use super::connection::RdmaConnection;
 use super::io_core::{self, EstablishedIoConnection, IoCore};
 use super::registry::{OperationToken, lock_unpoison};
 use super::session::SessionConnection;
+#[cfg(test)]
+use super::session::connection::ConnectionState;
+use super::session::connection::RdmaConnection;
 use crate::v2::error::{Error, Result};
 use crate::v2::mr::{AccessIntent, Mr};
 use crate::v2::op::Completion;
@@ -128,8 +128,8 @@ impl IoConnection {
 impl IoConnection {
     pub(crate) fn with_delayed_close_event_for_test() -> (Self, IoEventReceiver, impl FnOnce()) {
         use super::config::{EngineConfig, RdmaConnectionConfig};
-        use super::connection::WorkRequestPoster;
         use super::registry::ConnectionToken;
+        use super::session::connection::WorkRequestPoster;
         use crate::v2::qp::{BatchPostOutcome, QpCapabilities};
         use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
 

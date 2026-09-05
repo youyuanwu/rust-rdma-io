@@ -16,13 +16,17 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::Duration;
 
 use super::cm::CmState;
-use super::connection::{
+pub(super) mod connection;
+mod registry;
+
+use self::connection::{
     ConnectionAdmissionPool, ConnectionState, QpDestroyStatus, SharedCmId, VerbsConnectionResources,
 };
+use self::registry::ConnectionRegistry;
 use super::driver::WorkSignal;
 use super::io_core::{IoCore, IoCoreEffects, OperationQuarantineEffect, QpReclaimCapability};
 use super::listener::ListenerState;
-use super::registry::{ConnectionRegistry, ConnectionToken, Lookup, OperationToken, lock_unpoison};
+use super::registry::{ConnectionToken, Lookup, OperationToken, lock_unpoison};
 use super::scheduler::{DeadlineKind, DeadlineRequest};
 use super::{EngineShared, Result};
 use crate::v2::error::Error;
@@ -737,11 +741,11 @@ mod tests {
     use std::sync::{Arc, Weak};
     use std::time::Duration;
 
-    use super::super::connection::{WorkRequestPoster, install_connection};
     use super::super::listener::{ListenerState, RdmaListener};
     use super::super::registry::{ConnectionToken, lock_unpoison};
     use super::super::scheduler::DeadlineKind;
     use super::super::{CompletionMode, RdmaConnectionConfig, test_engine_pair};
+    use super::connection::{WorkRequestPoster, install_connection};
     use super::{SessionCloseState, SessionConnection};
     use crate::v2::error::{Error, Result};
     use crate::v2::qp::{BatchPostOutcome, QpCapabilities};

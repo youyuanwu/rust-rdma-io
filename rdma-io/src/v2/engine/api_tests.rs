@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context as TaskContext, Poll, RawWaker, RawWakerVTable, Waker};
 
 use super::*;
-use crate::v2::engine::connection::{WorkRequestPoster, install_connection};
+use crate::v2::engine::session::connection::{WorkRequestPoster, install_connection};
 use crate::v2::qp::{BatchPostOutcome, QpCapabilities};
 use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
 

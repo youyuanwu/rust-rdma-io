@@ -30,7 +30,6 @@
 
 mod cm;
 mod config;
-mod connection;
 mod diagnostics;
 mod drain;
 mod driver;
@@ -56,7 +55,6 @@ use tokio::sync::Notify;
 
 use config::EngineConfig;
 pub use config::{CompletionMode, RdmaConnectionConfig};
-pub use connection::{RdmaConnection, RdmaConnectionIdentity};
 pub use diagnostics::{RdmaEngineDiagnostics, RdmaEngineLifecycle, RdmaEngineTerminalError};
 use driver::WorkSignal;
 #[cfg(any(test, feature = "test-hooks"))]
@@ -76,6 +74,7 @@ use resources::{EngineResourceRefs, EngineResources};
 use scheduler::DeadlineKind;
 use scheduler::WorkScheduler;
 use session::SessionManager;
+pub use session::connection::{RdmaConnection, RdmaConnectionIdentity};
 
 use super::error::{Error, Result};
 
@@ -784,7 +783,7 @@ impl EngineShared {
     pub(super) fn reclaim_after_qp_destroy(
         &self,
         proof: &session::QpDestructionProof,
-        connection: &connection::ConnectionState,
+        connection: &session::connection::ConnectionState,
         token: registry::OperationToken,
     ) -> bool {
         self.session

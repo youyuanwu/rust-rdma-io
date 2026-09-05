@@ -911,7 +911,9 @@ fn test_no_hidden_spawn_in_v2() {
         v2_dir.join("message_transport.rs"),
         v2_dir.join("engine").join("mod.rs"),
         v2_dir.join("engine").join("driver.rs"),
-        v2_dir.join("engine").join("session.rs"),
+        v2_dir.join("engine").join("session").join("mod.rs"),
+        v2_dir.join("engine").join("session").join("connection.rs"),
+        v2_dir.join("engine").join("session").join("registry.rs"),
         v2_dir.join("engine").join("io_core").join("mod.rs"),
         v2_dir.join("engine").join("io_core").join("operation.rs"),
         v2_dir.join("engine").join("io.rs"),
@@ -1001,11 +1003,11 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     let io_core_mod_path = v2_dir.join("engine").join("io_core").join("mod.rs");
     let io_core_operation_path = v2_dir.join("engine").join("io_core").join("operation.rs");
     let engine_mod_path = v2_dir.join("engine").join("mod.rs");
-    let connection_path = v2_dir.join("engine").join("connection.rs");
+    let connection_path = v2_dir.join("engine").join("session").join("connection.rs");
     let listener_path = v2_dir.join("engine").join("listener.rs");
     let driver_path = v2_dir.join("engine").join("driver.rs");
     let drain_path = v2_dir.join("engine").join("drain.rs");
-    let session_path = v2_dir.join("engine").join("session.rs");
+    let session_path = v2_dir.join("engine").join("session").join("mod.rs");
     let v2_mod_path = v2_dir.join("mod.rs");
 
     let message = fs::read_to_string(&message_path).expect("read message transport source");
@@ -1356,10 +1358,10 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         );
     }
 
-    for fixed_path in ["cm.rs", "listener.rs", "connection.rs", "drain.rs"] {
+    for fixed_path in ["cm.rs", "listener.rs", "drain.rs"] {
         assert!(
             v2_dir.join("engine").join(fixed_path).is_file(),
-            "session milestone must keep engine/{fixed_path} at its current path"
+            "phase-one relocation must keep engine/{fixed_path} at its transitional path"
         );
         assert!(
             !v2_dir
@@ -1367,7 +1369,23 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
                 .join("session")
                 .join(fixed_path)
                 .exists(),
-            "session milestone must defer physical relocation of {fixed_path}"
+            "phase-one relocation must defer moving {fixed_path}"
+        );
+    }
+    for relocated in ["mod.rs", "connection.rs", "registry.rs"] {
+        assert!(
+            v2_dir
+                .join("engine")
+                .join("session")
+                .join(relocated)
+                .is_file(),
+            "phase-one relocation requires engine/session/{relocated}"
+        );
+    }
+    for obsolete in ["session.rs", "connection.rs"] {
+        assert!(
+            !v2_dir.join("engine").join(obsolete).exists(),
+            "phase-one relocation must remove obsolete engine/{obsolete}"
         );
     }
 
