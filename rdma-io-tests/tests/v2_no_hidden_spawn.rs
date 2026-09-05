@@ -739,6 +739,7 @@ fn test_no_hidden_spawn_in_v2() {
         v2_dir.join("message_transport.rs"),
         v2_dir.join("engine").join("mod.rs"),
         v2_dir.join("engine").join("driver.rs"),
+        v2_dir.join("engine").join("session.rs"),
         v2_dir.join("engine").join("io_core").join("mod.rs"),
         v2_dir.join("engine").join("io_core").join("operation.rs"),
         v2_dir.join("engine").join("io.rs"),
@@ -778,6 +779,7 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     let io_core_operation_path = v2_dir.join("engine").join("io_core").join("operation.rs");
     let engine_mod_path = v2_dir.join("engine").join("mod.rs");
     let connection_path = v2_dir.join("engine").join("connection.rs");
+    let session_path = v2_dir.join("engine").join("session.rs");
     let v2_mod_path = v2_dir.join("mod.rs");
 
     let message = fs::read_to_string(&message_path).expect("read message transport source");
@@ -852,7 +854,53 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         );
     }
     assert!(engine_shared.contains("io_core: Arc<IoCore>"));
+    assert!(engine_shared.contains("session: Arc<SessionManager>"));
+    for session_owned in [
+        "connection_admission:",
+        "connections:",
+        "cm:",
+        "rejected_cm_events:",
+        "deadline_requests:",
+        "admission:",
+        "shutdown_connection_close_started:",
+        "quarantines:",
+    ] {
+        assert!(
+            !engine_shared.contains(session_owned),
+            "{} must compose SessionManager instead of declaring `{session_owned}`",
+            engine_mod_path.display()
+        );
+    }
     assert!(engine_mod.contains("pub use io_core::RdmaOperation;"));
+
+    let session_source = fs::read_to_string(&session_path).expect("read session manager source");
+    let session_manager = session_source
+        .split("pub(super) struct SessionManager {")
+        .nth(1)
+        .and_then(|tail| tail.split("\n}").next())
+        .expect("locate SessionManager fields");
+    for owned in [
+        "connection_admission:",
+        "connections:",
+        "cm:",
+        "deadline_requests:",
+        "admission:",
+        "shutdown_connection_close_started:",
+        "quarantines:",
+    ] {
+        assert!(
+            session_manager.contains(owned),
+            "{} must own `{owned}`",
+            session_path.display()
+        );
+    }
+    assert!(
+        session_source.contains("pub(crate) struct SessionConnection")
+            && session_source.contains("manager: Weak<SessionManager>")
+            && session_source.contains("fn request_connection_close("),
+        "{} must define an opaque request-only close capability interpreted by SessionManager",
+        session_path.display()
+    );
 
     let connection_source = fs::read_to_string(&connection_path).expect("read connection source");
     assert!(
@@ -861,6 +909,24 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     );
 
     let io_source = fs::read_to_string(&io_path).expect("read engine I/O boundary source");
+    let io_connection = io_source
+        .split("pub(crate) struct IoConnection {")
+        .nth(1)
+        .and_then(|tail| tail.split("\n}").next())
+        .expect("locate IoConnection fields");
+    assert!(
+        !io_connection.contains("EngineShared")
+            && !io_connection.contains("ConnectionState")
+            && io_connection.contains("session: SessionConnection"),
+        "{} must retain only the opaque session request capability, not engine/session owners",
+        io_path.display()
+    );
+    assert!(
+        io_source.contains("self.session.request_close()")
+            && io_source.contains("self.session.close().await"),
+        "{} close paths must use the opaque session request capability",
+        io_path.display()
+    );
     for forbidden in [
         "super::cm",
         "super::listener",
@@ -872,6 +938,21 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
             !io_source.contains(forbidden),
             "{} must not depend on `{forbidden}`",
             io_path.display()
+        );
+    }
+
+    for fixed_path in ["cm.rs", "listener.rs", "connection.rs", "drain.rs"] {
+        assert!(
+            v2_dir.join("engine").join(fixed_path).is_file(),
+            "session milestone must keep engine/{fixed_path} at its current path"
+        );
+        assert!(
+            !v2_dir
+                .join("engine")
+                .join("session")
+                .join(fixed_path)
+                .exists(),
+            "session milestone must defer physical relocation of {fixed_path}"
         );
     }
 
@@ -889,6 +970,8 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         "IoRecvRequest",
         "IoSendRequest",
         "IoSubmissionDisposition",
+        "SessionConnection",
+        "SessionManager",
     ] {
         assert!(
             !public_reexports.contains(internal),

@@ -2757,7 +2757,7 @@ mod tests {
             let mut config = super::super::config::EngineConfig::new("test0".into());
             config.completion_mode = CompletionMode::Readiness;
             config.max_live_connections = count;
-            let shared = Arc::new(EngineShared::new(config, None, None).unwrap());
+            let shared = EngineShared::new(config, None, None).unwrap().into_shared();
             let connections = shared
                 .test_driver
                 .install_idle_connections(&shared, count)

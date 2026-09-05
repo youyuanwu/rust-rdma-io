@@ -10,8 +10,9 @@ use futures_util::task::AtomicWaker;
 
 use super::EngineShared;
 use super::connection::ConnectionState;
-use super::io_core;
+use super::io_core::{self, EstablishedIoConnection, IoCore};
 use super::registry::{OperationToken, lock_unpoison};
+use super::session::SessionConnection;
 use crate::v2::error::{Error, Result};
 use crate::v2::mr::{AccessIntent, Mr};
 use crate::v2::op::Completion;
@@ -19,8 +20,10 @@ use crate::v2::op::Completion;
 /// Opaque authority for protocol I/O on one engine-owned connection.
 #[derive(Clone)]
 pub(crate) struct IoConnection {
-    shared: Arc<EngineShared>,
-    connection: Arc<ConnectionState>,
+    io_core: Arc<IoCore>,
+    io: Arc<EstablishedIoConnection>,
+    pd: Option<crate::v2::Pd>,
+    session: SessionConnection,
     events: IoEventSender,
 }
 
@@ -34,10 +37,16 @@ impl IoConnection {
         if let Some(pending) = pending {
             pending.deliver();
         }
+        let pd = shared
+            .resource_refs
+            .as_ref()
+            .map(|resources| resources.pd.clone());
         Ok((
             Self {
-                shared,
-                connection,
+                io_core: Arc::clone(&shared.io_core),
+                io: Arc::clone(&connection.io),
+                pd,
+                session: shared.session.connection_capability(&connection),
                 events,
             },
             receiver,
@@ -45,54 +54,35 @@ impl IoConnection {
     }
 
     pub(crate) fn register_memory(&self, len: usize, access: AccessIntent) -> Result<Mr> {
-        self.shared.register_memory(len, access)
+        if len == 0 || u32::try_from(len).is_err() {
+            return Err(Error::InvalidConfig(
+                "engine MR length must be in 1..=u32::MAX".into(),
+            ));
+        }
+        let pd = self.pd.as_ref().ok_or_else(|| {
+            Error::InvalidConfig("engine shared protection domain is unavailable".into())
+        })?;
+        pd.reg_mr(len, access)
     }
 
     pub(crate) fn post_recv_batch(&self, requests: Vec<IoRecvRequest>) -> IoSubmissionDisposition {
-        io_core::post_io_recv_batch(
-            &self.shared.io_core,
-            &self.connection.io,
-            &self.events,
-            requests,
-        )
+        io_core::post_io_recv_batch(&self.io_core, &self.io, &self.events, requests)
     }
 
     pub(crate) fn post_recv(&self, request: IoRecvRequest) -> IoSubmissionDisposition {
-        io_core::post_io_recv_batch(
-            &self.shared.io_core,
-            &self.connection.io,
-            &self.events,
-            vec![request],
-        )
+        io_core::post_io_recv_batch(&self.io_core, &self.io, &self.events, vec![request])
     }
 
     pub(crate) fn post_send(&self, request: IoSendRequest) -> IoSubmissionDisposition {
-        io_core::post_io_send(
-            &self.shared.io_core,
-            &self.connection.io,
-            &self.events,
-            request,
-        )
+        io_core::post_io_send(&self.io_core, &self.io, &self.events, request)
     }
 
     pub(crate) fn request_close(&self) {
-        self.shared.begin_connection_close(&self.connection);
+        self.session.request_close();
     }
 
     pub(crate) async fn close(&self) -> Result<()> {
-        self.request_close();
-        loop {
-            let notified = self.connection.close_notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if let Some(outcome) = self.connection.close_outcome() {
-                return outcome.into_result();
-            }
-            if let Some(outcome) = self.shared.outcome() {
-                return outcome.into_result();
-            }
-            notified.await;
-        }
+        self.session.close().await
     }
 }
 
@@ -137,10 +127,9 @@ impl IoConnection {
             }
         }
 
-        let shared = Arc::new(
-            EngineShared::new(EngineConfig::new("test0".into()), None, None)
-                .expect("test engine state"),
-        );
+        let shared = EngineShared::new(EngineConfig::new("test0".into()), None, None)
+            .expect("test engine state")
+            .into_shared();
         let connection = Arc::new(ConnectionState::new(
             ConnectionToken {
                 slot: 0,
@@ -163,8 +152,10 @@ impl IoConnection {
         let delayed = sender.terminal(IoTerminalEvent::Closed(Ok(())));
         (
             Self {
-                shared,
-                connection,
+                io_core: Arc::clone(&shared.io_core),
+                io: Arc::clone(&connection.io),
+                pd: None,
+                session: shared.session.connection_capability(&connection),
                 events: sender,
             },
             receiver,

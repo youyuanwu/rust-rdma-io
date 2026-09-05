@@ -3819,7 +3819,7 @@ mod tests {
         config.max_live_connections = capacity;
         config.max_inflight_operations = capacity;
         config.cq_capacity = capacity;
-        Arc::new(EngineShared::new(config, None, None).unwrap())
+        EngineShared::new(config, None, None).unwrap().into_shared()
     }
 
     fn synthetic_connection_on(

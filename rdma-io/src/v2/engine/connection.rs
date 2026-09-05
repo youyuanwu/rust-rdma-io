@@ -6,8 +6,6 @@ use std::sync::RwLockReadGuard;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
-use tokio::sync::Notify;
-
 use self::qp::QpCapabilitiesExt;
 use super::io::{IoEventSender, IoTerminalEvent, PendingIoEvent};
 #[cfg(test)]
@@ -19,6 +17,7 @@ use super::io_core::{
 };
 use super::lifecycle::MemoizedTerminalResult;
 use super::registry::{ConnectionToken, OperationToken, lock_unpoison, read_unpoison};
+use super::session::SessionCloseState;
 use super::{EngineShared, RdmaConnectionConfig};
 use crate::cm::{CmId, ConnParam, EventChannel};
 use crate::v2::error::{Error, Result};
@@ -194,7 +193,7 @@ impl RdmaConnection {
     pub async fn close(&self) -> Result<()> {
         self.shared.begin_connection_close(&self.state);
         loop {
-            let notified = self.state.close_notify.notified();
+            let notified = self.state.close.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             if let Some(outcome) = self.state.close_outcome() {
@@ -244,8 +243,7 @@ pub(super) struct ConnectionState {
     // EngineShared::admission -> lifecycle_gate -> posting_gate.
     lifecycle_gate: Mutex<()>,
     close_started: AtomicBool,
-    close_outcome: Mutex<Option<MemoizedTerminalResult>>,
-    pub(super) close_notify: Arc<Notify>,
+    close: Arc<SessionCloseState>,
     quarantined: AtomicBool,
     error_transition_started: AtomicBool,
     error_transition_complete: AtomicBool,
@@ -276,7 +274,8 @@ impl ConnectionState {
             reservation.mark_registered();
         }
         let qp_num = poster.qp_num();
-        let close_notify = Arc::new(Notify::new());
+        let close = SessionCloseState::new();
+        let close_notify = close.notify();
         let io_poster: Arc<dyn IoPostAuthority> =
             Arc::new(SessionIoPostAuthority::new(&poster, qp_num));
         let io = EstablishedIoConnection::new(
@@ -298,8 +297,7 @@ impl ConnectionState {
             peer_addr,
             lifecycle_gate: Mutex::new(()),
             close_started: AtomicBool::new(false),
-            close_outcome: Mutex::new(None),
-            close_notify,
+            close,
             quarantined: AtomicBool::new(false),
             error_transition_started: AtomicBool::new(false),
             error_transition_complete: AtomicBool::new(false),
@@ -376,6 +374,7 @@ impl ConnectionState {
         if !self.io.install_io_event_sender(sender)? {
             return Ok(None);
         }
+
         let error = self.operation_close_error();
         Ok(
             self.pending_io_event(if matches!(error, Error::TransportClosed) {
@@ -384,6 +383,10 @@ impl ConnectionState {
                 IoTerminalEvent::Terminal(error)
             }),
         )
+    }
+
+    pub(super) fn close_state(&self) -> Arc<SessionCloseState> {
+        Arc::clone(&self.close)
     }
 
     fn pending_io_event(&self, event: IoTerminalEvent) -> Option<PendingIoEvent> {
@@ -409,7 +412,7 @@ impl ConnectionState {
         self.stop_posting();
         let _ = self.transition_to_error_once();
         if let Some(error) = outcome.error() {
-            let mut close_outcome = lock_unpoison(&self.close_outcome);
+            let mut close_outcome = lock_unpoison(&self.close.outcome);
             if close_outcome.is_none() {
                 *close_outcome = Some(MemoizedTerminalResult::from_error(error.clone()));
             }
@@ -426,12 +429,12 @@ impl ConnectionState {
 
     pub(super) fn mark_cm_failure(&self, error: Error) -> Option<PendingIoEvent> {
         self.stop_posting();
-        let mut outcome = lock_unpoison(&self.close_outcome);
+        let mut outcome = lock_unpoison(&self.close.outcome);
         if outcome.is_none() {
             *outcome = Some(MemoizedTerminalResult::from_error(error.clone()));
         }
         drop(outcome);
-        self.close_notify.notify_waiters();
+        self.close.notify_waiters();
         self.pending_io_event(IoTerminalEvent::Terminal(error))
     }
 
@@ -512,7 +515,7 @@ impl ConnectionState {
     }
 
     pub(super) fn wake_close(&self) {
-        self.close_notify.notify_waiters();
+        self.close.notify_waiters();
     }
 
     pub(super) fn begin_quarantine(&self) -> Option<IoQuarantineReport> {
@@ -528,12 +531,12 @@ impl ConnectionState {
             outstanding_operations,
             cq_debt,
         };
-        let mut outcome = lock_unpoison(&self.close_outcome);
+        let mut outcome = lock_unpoison(&self.close.outcome);
         if outcome.is_none() {
             *outcome = Some(MemoizedTerminalResult::from_error(error.clone()));
         }
         drop(outcome);
-        self.close_notify.notify_waiters();
+        self.close.notify_waiters();
         self.pending_io_event(IoTerminalEvent::Terminal(error))
     }
 
@@ -543,7 +546,7 @@ impl ConnectionState {
         before_publish: impl FnOnce(),
     ) -> (bool, Option<PendingIoEvent>) {
         self.retirement_quarantined.store(true, Ordering::Release);
-        let mut outcome = lock_unpoison(&self.close_outcome);
+        let mut outcome = lock_unpoison(&self.close.outcome);
         let newly_published = !outcome
             .as_ref()
             .is_some_and(MemoizedTerminalResult::is_connection_quarantined);
@@ -555,12 +558,12 @@ impl ConnectionState {
             *outcome = Some(MemoizedTerminalResult::from_error(published.clone()));
             drop(outcome);
             let event = self.pending_io_event(IoTerminalEvent::Terminal(published));
-            self.close_notify.notify_waiters();
+            self.close.notify_waiters();
             return (true, event);
         } else {
             drop(outcome);
         }
-        self.close_notify.notify_waiters();
+        self.close.notify_waiters();
         (newly_published, None)
     }
 
@@ -573,20 +576,20 @@ impl ConnectionState {
     }
 
     pub(super) fn finish_retirement(&self) -> Option<PendingIoEvent> {
-        let mut outcome = lock_unpoison(&self.close_outcome);
+        let mut outcome = lock_unpoison(&self.close.outcome);
         if outcome.is_none() {
             *outcome = Some(MemoizedTerminalResult::success());
         }
         drop(outcome);
         self.retired.store(true, Ordering::Release);
-        self.close_notify.notify_waiters();
+        self.close.notify_waiters();
         self.pending_io_event(IoTerminalEvent::Closed(Ok(())))
     }
 
     pub(super) fn fail_retirement(&self, error: Error) -> Option<PendingIoEvent> {
         self.stop_posting();
         self.release_admission();
-        let mut outcome = lock_unpoison(&self.close_outcome);
+        let mut outcome = lock_unpoison(&self.close.outcome);
         if !outcome
             .as_ref()
             .is_some_and(MemoizedTerminalResult::is_connection_quarantined)
@@ -595,12 +598,12 @@ impl ConnectionState {
         }
         drop(outcome);
         self.retired.store(true, Ordering::Release);
-        self.close_notify.notify_waiters();
+        self.close.notify_waiters();
         self.pending_io_event(IoTerminalEvent::Closed(Err(error)))
     }
 
     pub(super) fn close_outcome(&self) -> Option<MemoizedTerminalResult> {
-        let outcome = lock_unpoison(&self.close_outcome).clone();
+        let outcome = lock_unpoison(&self.close.outcome).clone();
         match outcome {
             Some(ref value) if value.is_connection_quarantined() => outcome,
             Some(_) if self.is_retired() => outcome,
@@ -609,7 +612,7 @@ impl ConnectionState {
     }
 
     pub(super) fn operation_close_error(&self) -> Error {
-        lock_unpoison(&self.close_outcome)
+        lock_unpoison(&self.close.outcome)
             .as_ref()
             .and_then(MemoizedTerminalResult::error)
             .unwrap_or(Error::TransportClosed)
