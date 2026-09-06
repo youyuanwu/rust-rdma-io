@@ -193,9 +193,13 @@ The runtime has five distinct roles:
 resources, engine lifecycle, work signal, `Arc<IoCore>`, and
 `Arc<SessionManager>`. Session collections and quarantine maps are fields of
 `SessionManager`, not parallel fields on the root. The session manager holds
-only a weak trait-object runtime capability back toward engine-wide state, so
-session modules cannot access the concrete root or use it as an I/O-owner
-shortcut. `IoProgress` owns CQ readiness, the CQ buffer, completion-ready
+only a weak trait-object runtime capability back toward engine-wide state and
+a copied `SessionConfig` containing live-connection capacity, the two
+connection-validation capacities, and the connection-drain deadline.
+I/O scheduling, completion policy, and engine shutdown policy remain solely in
+`EngineConfig` and are not retained by the session owner. Session modules
+cannot access the concrete root or use it as an I/O-owner shortcut.
+`IoProgress` owns CQ readiness, the CQ buffer, completion-ready
 rotation, operation deadlines, and bounded I/O terminalization.
 `SessionProgress` owns CM readiness, fair CM source selection,
 connection/lifecycle deadlines, bounded shutdown scans, final CM draining, and
@@ -288,8 +292,11 @@ without the private authority, public re-exports of internal capabilities, and
 obsolete top-level session-module paths. The guards also parse every session
 source, including test-only items and renamed imports, to reject direct
 `EngineShared` dependencies; reject broad root/session `Deref` adapters and
-obsolete root forwarding methods; and require owner-focused I/O test
-construction.
+obsolete or newly renamed root-to-owner forwarding methods; constrain the
+session runtime method/type surface and `SessionConfig` fields; and require
+I/O tests to use explicit `IoCore`/`SessionManager` fixture parts with only an
+opaque runtime retain. Concrete roots remain available only to identified
+composition, terminal, and driver-progress tests.
 
 ## Completion-to-Message Handoff
 

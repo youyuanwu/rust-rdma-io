@@ -2063,7 +2063,7 @@ impl IoCore {
 
 #[cfg(test)]
 pub(in crate::v2::engine) fn install_accepted_operation_for_driver_test(
-    shared: &Arc<super::super::EngineShared>,
+    io_core: &IoCore,
     connection: &Arc<super::super::session::connection::ConnectionState>,
     opcode: WcOpcode,
 ) -> OperationToken {
@@ -2073,9 +2073,8 @@ pub(in crate::v2::engine) fn install_accepted_operation_for_driver_test(
         Direction::Send
     };
     connection.reserve_local(direction).unwrap();
-    assert!(shared.io_core.cq_credits.reserve());
-    let (token, operation) = shared
-        .io_core
+    assert!(io_core.cq_credits.reserve());
+    let (token, operation) = io_core
         .operations
         .allocate(|token| {
             Arc::new(OperationState::new(
@@ -2089,10 +2088,7 @@ pub(in crate::v2::engine) fn install_accepted_operation_for_driver_test(
         })
         .unwrap();
     operation.commit_accepted();
-    shared
-        .io_core
-        .accepted_operations
-        .fetch_add(1, Ordering::AcqRel);
+    io_core.accepted_operations.fetch_add(1, Ordering::AcqRel);
     token
 }
 
@@ -2119,11 +2115,12 @@ mod tests {
     use crate::v2::engine::config::EngineConfig;
     use crate::v2::engine::lifecycle::MemoizedTerminalResult;
     use crate::v2::engine::session::connection::{WorkRequestPoster, install_connection};
-    use crate::v2::engine::{EngineShared, session::connection::ConnectionState};
+    use crate::v2::engine::session::{SessionManager, connection::ConnectionState};
+    use crate::v2::engine::{EngineShared, SessionEngineRuntime};
     use crate::wc::WcStatus;
     use rdma_io_sys::ibverbs::{IBV_WC_FATAL_ERR, IBV_WC_RECV, IBV_WC_SEND, IBV_WC_SUCCESS};
-    use std::sync::Barrier;
     use std::sync::Weak;
+    use std::sync::{Barrier, RwLock};
 
     #[test]
     fn all_operation_kinds_preserve_direction_and_opcode_mapping() {
@@ -2282,7 +2279,7 @@ mod tests {
         use std::task::{Wake, Waker};
 
         struct AdmissionCheckingWake {
-            shared: Arc<EngineShared>,
+            admission: Arc<RwLock<()>>,
             observed: AtomicBool,
         }
 
@@ -2293,7 +2290,7 @@ mod tests {
 
             fn wake_by_ref(self: &Arc<Self>) {
                 assert!(
-                    self.shared.session.admission.try_write().is_ok(),
+                    self.admission.try_write().is_ok(),
                     "I/O event wake ran while admission remained locked"
                 );
                 self.observed.store(true, Ordering::Release);
@@ -2306,7 +2303,7 @@ mod tests {
         assert!(shared.io_core.cq_credits.reserve());
         let (sender, receiver) = super::super::io::event_port();
         let wake = Arc::new(AdmissionCheckingWake {
-            shared: Arc::clone(&shared),
+            admission: Arc::clone(&shared.session.admission),
             observed: AtomicBool::new(false),
         });
         receiver.register(&Waker::from(Arc::clone(&wake)));
@@ -2720,12 +2717,15 @@ mod tests {
 
     #[test]
     fn validation_failure_is_a_zero_call_full_rollback() {
-        let Some((engine, driver)) = production_engine(2, 4, 4) else {
+        let Some((engine, driver, shared)) = production_engine(2, 4, 4) else {
             return;
         };
-        let shared = Arc::clone(&engine.shared);
-        let poster = Arc::new(ScriptedPoster::new(&shared, 41, ScriptedPost::Accepted));
-        let connection = scripted_connection(&shared, Arc::clone(&poster), 2, 2);
+        let poster = Arc::new(ScriptedPoster::new(
+            &shared.session,
+            41,
+            ScriptedPost::Accepted,
+        ));
+        let connection = scripted_connection(&shared.session, Arc::clone(&poster), 2, 2);
         let mr = connection
             .register_memory(64, AccessIntent::LocalOnly)
             .unwrap();
@@ -2743,7 +2743,7 @@ mod tests {
         let mut operation = connection.send(returned.unwrap(), None);
         assert!(poll_once(&mut operation).is_pending());
         let token = poster.tokens()[0];
-        complete(&shared, &connection.state, token, IBV_WC_SEND);
+        complete(&shared.session, &connection.state, token, IBV_WC_SEND);
         drop(operation);
         drop(connection);
         drop(driver);
@@ -2752,12 +2752,15 @@ mod tests {
 
     #[test]
     fn cancellation_before_first_poll_posts_nothing_and_releases_unregistered_mr() {
-        let Some((engine, driver)) = production_engine(2, 4, 4) else {
+        let Some((engine, driver, shared)) = production_engine(2, 4, 4) else {
             return;
         };
-        let shared = Arc::clone(&engine.shared);
-        let poster = Arc::new(ScriptedPoster::new(&shared, 50, ScriptedPost::Accepted));
-        let connection = scripted_connection(&shared, Arc::clone(&poster), 1, 1);
+        let poster = Arc::new(ScriptedPoster::new(
+            &shared.session,
+            50,
+            ScriptedPost::Accepted,
+        ));
+        let connection = scripted_connection(&shared.session, Arc::clone(&poster), 1, 1);
         let recorder = DestructionRecorder::arm(4);
         let operation = connection.send(
             connection
@@ -2785,12 +2788,15 @@ mod tests {
 
     #[test]
     fn local_direction_exhaustion_posts_nothing_and_preserves_global_capacity() {
-        let Some((engine, driver)) = production_engine(2, 4, 4) else {
+        let Some((engine, driver, shared)) = production_engine(2, 4, 4) else {
             return;
         };
-        let shared = Arc::clone(&engine.shared);
-        let poster = Arc::new(ScriptedPoster::new(&shared, 42, ScriptedPost::Accepted));
-        let connection = scripted_connection(&shared, Arc::clone(&poster), 1, 1);
+        let poster = Arc::new(ScriptedPoster::new(
+            &shared.session,
+            42,
+            ScriptedPost::Accepted,
+        ));
+        let connection = scripted_connection(&shared.session, Arc::clone(&poster), 1, 1);
         let first_mr = connection
             .register_memory(64, AccessIntent::LocalOnly)
             .unwrap();
@@ -2810,7 +2816,12 @@ mod tests {
         assert_eq!(shared.io_core.cq_credits.free(), 3);
         assert_eq!(connection.state.accepted_count(), 1);
 
-        complete(&shared, &connection.state, poster.tokens()[0], IBV_WC_SEND);
+        complete(
+            &shared.session,
+            &connection.state,
+            poster.tokens()[0],
+            IBV_WC_SEND,
+        );
         drop(first);
         drop(returned);
         drop(connection);
@@ -2820,14 +2831,21 @@ mod tests {
 
     #[test]
     fn operation_global_exhaustion_precedes_and_preserves_the_cq_invariant() {
-        let Some((engine, driver)) = production_engine(3, 2, 2) else {
+        let Some((engine, driver, shared)) = production_engine(3, 2, 2) else {
             return;
         };
-        let shared = Arc::clone(&engine.shared);
-        let first_poster = Arc::new(ScriptedPoster::new(&shared, 43, ScriptedPost::Accepted));
-        let second_poster = Arc::new(ScriptedPoster::new(&shared, 44, ScriptedPost::Accepted));
-        let first = scripted_connection(&shared, Arc::clone(&first_poster), 1, 1);
-        let second = scripted_connection(&shared, Arc::clone(&second_poster), 1, 1);
+        let first_poster = Arc::new(ScriptedPoster::new(
+            &shared.session,
+            43,
+            ScriptedPost::Accepted,
+        ));
+        let second_poster = Arc::new(ScriptedPoster::new(
+            &shared.session,
+            44,
+            ScriptedPost::Accepted,
+        ));
+        let first = scripted_connection(&shared.session, Arc::clone(&first_poster), 1, 1);
+        let second = scripted_connection(&shared.session, Arc::clone(&second_poster), 1, 1);
 
         let mut send = first.send(
             first.register_memory(64, AccessIntent::LocalOnly).unwrap(),
@@ -2858,8 +2876,8 @@ mod tests {
         second.state.release_local(Direction::Send);
 
         let tokens = first_poster.tokens();
-        complete(&shared, &first.state, tokens[0], IBV_WC_SEND);
-        complete(&shared, &first.state, tokens[1], IBV_WC_RECV);
+        complete(&shared.session, &first.state, tokens[0], IBV_WC_SEND);
+        complete(&shared.session, &first.state, tokens[1], IBV_WC_RECV);
         drop(send);
         drop(recv);
         drop(returned);
@@ -2871,12 +2889,15 @@ mod tests {
 
     #[test]
     fn wholly_unaccepted_post_restores_mr_slot_local_and_cq_reservations() {
-        let Some((engine, driver)) = production_engine(2, 4, 4) else {
+        let Some((engine, driver, shared)) = production_engine(2, 4, 4) else {
             return;
         };
-        let shared = Arc::clone(&engine.shared);
-        let poster = Arc::new(ScriptedPoster::new(&shared, 45, ScriptedPost::Unaccepted));
-        let connection = scripted_connection(&shared, Arc::clone(&poster), 1, 1);
+        let poster = Arc::new(ScriptedPoster::new(
+            &shared.session,
+            45,
+            ScriptedPost::Unaccepted,
+        ));
+        let connection = scripted_connection(&shared.session, Arc::clone(&poster), 1, 1);
         let mut operation = connection.send(
             connection
                 .register_memory(64, AccessIntent::LocalOnly)
@@ -2905,12 +2926,15 @@ mod tests {
 
     #[test]
     fn empty_and_zero_accepted_io_batches_reject_and_roll_back_every_reservation() {
-        let Some((engine, driver)) = production_engine(2, 4, 4) else {
+        let Some((engine, driver, shared)) = production_engine(2, 4, 4) else {
             return;
         };
-        let shared = Arc::clone(&engine.shared);
-        let poster = Arc::new(ScriptedPoster::new(&shared, 51, ScriptedPost::Unaccepted));
-        let connection = scripted_connection(&shared, Arc::clone(&poster), 1, 2);
+        let poster = Arc::new(ScriptedPoster::new(
+            &shared.session,
+            51,
+            ScriptedPost::Unaccepted,
+        ));
+        let connection = scripted_connection(&shared.session, Arc::clone(&poster), 1, 2);
         let (io, events) =
             super::super::io::IoConnection::new(&shared.session, Arc::clone(&connection.state))
                 .unwrap();
@@ -2968,16 +2992,15 @@ mod tests {
 
     #[test]
     fn exact_prefix_returns_only_the_proven_unaccepted_suffix() {
-        let Some((engine, driver)) = production_engine(2, 8, 8) else {
+        let Some((engine, driver, shared)) = production_engine(2, 8, 8) else {
             return;
         };
-        let shared = Arc::clone(&engine.shared);
         let poster = Arc::new(ScriptedPoster::new(
-            &shared,
+            &shared.session,
             53,
             ScriptedPost::PrefixAccepted(1),
         ));
-        let connection = scripted_connection(&shared, Arc::clone(&poster), 1, 3);
+        let connection = scripted_connection(&shared.session, Arc::clone(&poster), 1, 3);
         let (io, events) =
             super::super::io::IoConnection::new(&shared.session, Arc::clone(&connection.state))
                 .unwrap();
@@ -3012,7 +3035,12 @@ mod tests {
         rejected.sort_unstable();
         assert_eq!(rejected, vec![1, 2]);
         assert_eq!(connection.state.accepted_count(), 1);
-        complete(&shared, &connection.state, poster.tokens()[0], IBV_WC_RECV);
+        complete(
+            &shared.session,
+            &connection.state,
+            poster.tokens()[0],
+            IBV_WC_RECV,
+        );
         assert!(matches!(
             events.pop(),
             Some(super::super::io::IoEvent::Completion(_))
@@ -3026,19 +3054,18 @@ mod tests {
 
     #[test]
     fn exact_prefix_with_early_suffix_cqe_retains_the_entire_batch() {
-        let Some((engine, driver)) = production_engine(2, 8, 8) else {
+        let Some((engine, driver, shared)) = production_engine(2, 8, 8) else {
             return;
         };
-        let shared = Arc::clone(&engine.shared);
         let poster = Arc::new(ScriptedPoster::new(
-            &shared,
+            &shared.session,
             54,
             ScriptedPost::PrefixWithSuffixCompletion {
                 accepted: 1,
                 completed_suffix: 1,
             },
         ));
-        let connection = scripted_connection(&shared, Arc::clone(&poster), 1, 3);
+        let connection = scripted_connection(&shared.session, Arc::clone(&poster), 1, 3);
         let (io, events) =
             super::super::io::IoConnection::new(&shared.session, Arc::clone(&connection.state))
                 .unwrap();
@@ -3071,8 +3098,8 @@ mod tests {
         assert_eq!(shared.io_core.operations.live(), 2);
 
         let tokens = poster.tokens();
-        complete(&shared, &connection.state, tokens[0], IBV_WC_RECV);
-        complete(&shared, &connection.state, tokens[2], IBV_WC_RECV);
+        complete(&shared.session, &connection.state, tokens[0], IBV_WC_RECV);
+        complete(&shared.session, &connection.state, tokens[2], IBV_WC_RECV);
         assert_eq!(events.drain().len(), 2);
         assert_eq!(connection.state.accepted_count(), 0);
         assert_eq!(shared.io_core.operations.live(), 0);
@@ -3084,19 +3111,18 @@ mod tests {
 
     #[test]
     fn exact_prefix_with_queued_suffix_cqe_retains_the_entire_batch_until_dispatch() {
-        let Some((engine, driver)) = production_engine(2, 8, 8) else {
+        let Some((engine, driver, shared)) = production_engine(2, 8, 8) else {
             return;
         };
-        let shared = Arc::clone(&engine.shared);
         let poster = Arc::new(ScriptedPoster::new(
-            &shared,
+            &shared.session,
             55,
             ScriptedPost::PrefixWithQueuedSuffixCompletion {
                 accepted: 1,
                 completed_suffix: 2,
             },
         ));
-        let connection = scripted_connection(&shared, Arc::clone(&poster), 1, 3);
+        let connection = scripted_connection(&shared.session, Arc::clone(&poster), 1, 3);
         let (io, events) =
             super::super::io::IoConnection::new(&shared.session, Arc::clone(&connection.state))
                 .unwrap();
@@ -3139,8 +3165,8 @@ mod tests {
         assert_eq!(shared.io_core.operations.live(), 2);
 
         let tokens = poster.tokens();
-        complete(&shared, &connection.state, tokens[0], IBV_WC_RECV);
-        complete(&shared, &connection.state, tokens[1], IBV_WC_RECV);
+        complete(&shared.session, &connection.state, tokens[0], IBV_WC_RECV);
+        complete(&shared.session, &connection.state, tokens[1], IBV_WC_RECV);
         assert_eq!(events.drain().len(), 2);
         assert_eq!(connection.state.accepted_count(), 0);
         assert_eq!(shared.io_core.operations.live(), 0);
@@ -3238,7 +3264,12 @@ mod tests {
 
         let remaining = connection.state.accepted_tokens();
         assert_eq!(remaining.len(), 1);
-        complete(&shared, &connection.state, remaining[0], IBV_WC_RECV);
+        complete(
+            &shared.session,
+            &connection.state,
+            remaining[0],
+            IBV_WC_RECV,
+        );
         assert_eq!(shared.io_core.operations.live(), 0);
         assert_eq!(
             shared.io_core.accepted_operations.load(Ordering::Acquire),
@@ -3260,12 +3291,15 @@ mod tests {
 
     #[test]
     fn ambiguous_acceptance_retains_mr_identity_slot_and_cq_until_exact_dispatch() {
-        let Some((engine, driver)) = production_engine(2, 4, 4) else {
+        let Some((engine, driver, shared)) = production_engine(2, 4, 4) else {
             return;
         };
-        let shared = Arc::clone(&engine.shared);
-        let poster = Arc::new(ScriptedPoster::new(&shared, 46, ScriptedPost::Ambiguous));
-        let connection = scripted_connection(&shared, Arc::clone(&poster), 1, 1);
+        let poster = Arc::new(ScriptedPoster::new(
+            &shared.session,
+            46,
+            ScriptedPost::Ambiguous,
+        ));
+        let connection = scripted_connection(&shared.session, Arc::clone(&poster), 1, 1);
         let mr = connection
             .register_memory(64, AccessIntent::LocalOnly)
             .unwrap();
@@ -3288,7 +3322,12 @@ mod tests {
         );
         assert_eq!(connection.state.accepted_count(), 1);
         assert!(recorder.snapshot().is_empty());
-        complete(&shared, &connection.state, poster.tokens()[0], IBV_WC_SEND);
+        complete(
+            &shared.session,
+            &connection.state,
+            poster.tokens()[0],
+            IBV_WC_SEND,
+        );
         assert_eq!(shared.io_core.operations.live(), 0);
         assert_eq!(shared.io_core.cq_credits.free(), 4);
         assert_eq!(
@@ -3312,16 +3351,15 @@ mod tests {
 
     #[test]
     fn completion_dispatched_during_post_commits_and_releases_exactly_once() {
-        let Some((engine, driver)) = production_engine(2, 4, 4) else {
+        let Some((engine, driver, shared)) = production_engine(2, 4, 4) else {
             return;
         };
-        let shared = Arc::clone(&engine.shared);
         let poster = Arc::new(ScriptedPoster::new(
-            &shared,
+            &shared.session,
             47,
             ScriptedPost::DispatchDuringPost,
         ));
-        let connection = scripted_connection(&shared, Arc::clone(&poster), 1, 1);
+        let connection = scripted_connection(&shared.session, Arc::clone(&poster), 1, 1);
         let mut operation = connection.send(
             connection
                 .register_memory(64, AccessIntent::LocalOnly)
@@ -3350,7 +3388,7 @@ mod tests {
         use std::task::{Wake, Waker};
 
         struct PostGuardCheckingWake {
-            shared: Arc<EngineShared>,
+            admission: Arc<RwLock<()>>,
             connection: Arc<ConnectionState>,
             observed: AtomicBool,
         }
@@ -3361,27 +3399,26 @@ mod tests {
             }
 
             fn wake_by_ref(self: &Arc<Self>) {
-                assert!(self.shared.session.admission.try_write().is_ok());
+                assert!(self.admission.try_write().is_ok());
                 assert!(self.connection.begin_posting().is_ok());
                 self.observed.store(true, Ordering::Release);
             }
         }
 
-        let Some((engine, driver)) = production_engine(2, 4, 4) else {
+        let Some((engine, driver, shared)) = production_engine(2, 4, 4) else {
             return;
         };
-        let shared = Arc::clone(&engine.shared);
         let poster = Arc::new(ScriptedPoster::new(
-            &shared,
+            &shared.session,
             49,
             ScriptedPost::DispatchDuringPost,
         ));
-        let connection = scripted_connection(&shared, Arc::clone(&poster), 1, 1);
+        let connection = scripted_connection(&shared.session, Arc::clone(&poster), 1, 1);
         let (io, events) =
             super::super::io::IoConnection::new(&shared.session, Arc::clone(&connection.state))
                 .unwrap();
         let wake = Arc::new(PostGuardCheckingWake {
-            shared: Arc::clone(&shared),
+            admission: Arc::clone(&shared.session.admission),
             connection: Arc::clone(&connection.state),
             observed: AtomicBool::new(false),
         });
@@ -3416,7 +3453,7 @@ mod tests {
         use std::task::{Wake, Waker};
 
         struct PostGuardCheckingWake {
-            shared: Arc<EngineShared>,
+            admission: Arc<RwLock<()>>,
             connection: Arc<ConnectionState>,
             observed: AtomicBool,
         }
@@ -3427,23 +3464,26 @@ mod tests {
             }
 
             fn wake_by_ref(self: &Arc<Self>) {
-                assert!(self.shared.session.admission.try_write().is_ok());
+                assert!(self.admission.try_write().is_ok());
                 assert!(self.connection.begin_posting().is_ok());
                 self.observed.store(true, Ordering::Release);
             }
         }
 
-        let Some((engine, driver)) = production_engine(2, 4, 4) else {
+        let Some((engine, driver, shared)) = production_engine(2, 4, 4) else {
             return;
         };
-        let shared = Arc::clone(&engine.shared);
-        let poster = Arc::new(ScriptedPoster::new(&shared, 52, ScriptedPost::Unaccepted));
-        let connection = scripted_connection(&shared, Arc::clone(&poster), 1, 1);
+        let poster = Arc::new(ScriptedPoster::new(
+            &shared.session,
+            52,
+            ScriptedPost::Unaccepted,
+        ));
+        let connection = scripted_connection(&shared.session, Arc::clone(&poster), 1, 1);
         let (io, events) =
             super::super::io::IoConnection::new(&shared.session, Arc::clone(&connection.state))
                 .unwrap();
         let wake = Arc::new(PostGuardCheckingWake {
-            shared: Arc::clone(&shared),
+            admission: Arc::clone(&shared.session.admission),
             connection: Arc::clone(&connection.state),
             observed: AtomicBool::new(false),
         });
@@ -3481,12 +3521,15 @@ mod tests {
 
     #[test]
     fn cancellation_and_dispatch_race_releases_each_mr_and_reservation_once() {
-        let Some((engine, driver)) = production_engine(2, 4, 4) else {
+        let Some((engine, driver, shared)) = production_engine(2, 4, 4) else {
             return;
         };
-        let shared = Arc::clone(&engine.shared);
-        let poster = Arc::new(ScriptedPoster::new(&shared, 48, ScriptedPost::Accepted));
-        let connection = scripted_connection(&shared, Arc::clone(&poster), 1, 1);
+        let poster = Arc::new(ScriptedPoster::new(
+            &shared.session,
+            48,
+            ScriptedPost::Accepted,
+        ));
+        let connection = scripted_connection(&shared.session, Arc::clone(&poster), 1, 1);
         let recorder = DestructionRecorder::arm(64);
 
         for iteration in 0..32 {
@@ -3506,11 +3549,11 @@ mod tests {
                     drop(operation);
                 });
                 let dispatch_barrier = Arc::clone(&barrier);
-                let shared = Arc::clone(&shared);
+                let session = Arc::clone(&shared.session);
                 let connection = Arc::clone(&connection.state);
                 scope.spawn(move || {
                     dispatch_barrier.wait();
-                    complete(&shared, &connection, token, IBV_WC_SEND);
+                    complete(&session, &connection, token, IBV_WC_SEND);
                 });
                 barrier.wait();
             });
@@ -3550,12 +3593,15 @@ mod tests {
             }
         }
 
-        let Some((engine, driver)) = production_engine(2, 4, 4) else {
+        let Some((engine, driver, shared)) = production_engine(2, 4, 4) else {
             return;
         };
-        let shared = Arc::clone(&engine.shared);
-        let poster = Arc::new(ScriptedPoster::new(&shared, 49, ScriptedPost::Accepted));
-        let connection = scripted_connection(&shared, Arc::clone(&poster), 1, 1);
+        let poster = Arc::new(ScriptedPoster::new(
+            &shared.session,
+            49,
+            ScriptedPost::Accepted,
+        ));
+        let connection = scripted_connection(&shared.session, Arc::clone(&poster), 1, 1);
         let send_mr = connection
             .register_memory(64, AccessIntent::LocalOnly)
             .unwrap();
@@ -3674,9 +3720,14 @@ mod tests {
             }
         }
 
-        let shared = synthetic_engine(8);
-        let connection = synthetic_connection_on(&shared, 50);
-        let token = install_accepted(&shared, &connection.state, WcOpcode::Send);
+        let shared = synthetic_engine_root(8);
+        let owners = OperationOwners {
+            io_core: Arc::clone(&shared.io_core),
+            session: Arc::clone(&shared.session),
+            _runtime: shared.clone(),
+        };
+        let connection = synthetic_connection_on(&owners, 50);
+        let token = install_accepted(&owners, &connection.state, WcOpcode::Send);
         let Lookup::Occupied(operation) = shared.io_core.operations.lookup(token) else {
             panic!("accepted operation")
         };
@@ -3737,9 +3788,14 @@ mod tests {
         use std::task::Context;
         use std::time::Duration;
 
-        let shared = synthetic_engine(8);
-        let connection = synthetic_connection_on(&shared, 27);
-        let token = install_accepted(&shared, &connection.state, WcOpcode::Recv);
+        let shared = synthetic_engine_root(8);
+        let owners = OperationOwners {
+            io_core: Arc::clone(&shared.io_core),
+            session: Arc::clone(&shared.session),
+            _runtime: shared.clone(),
+        };
+        let connection = synthetic_connection_on(&owners, 27);
+        let token = install_accepted(&owners, &connection.state, WcOpcode::Recv);
         let Lookup::Occupied(operation) = shared.io_core.operations.lookup(token) else {
             panic!("accepted operation")
         };
@@ -3818,7 +3874,7 @@ mod tests {
     }
 
     struct ScriptedPoster {
-        shared: Weak<EngineShared>,
+        session: Weak<SessionManager>,
         qp_num: u32,
         outcome: ScriptedPost,
         calls: AtomicUsize,
@@ -3827,9 +3883,9 @@ mod tests {
     }
 
     impl ScriptedPoster {
-        fn new(shared: &Arc<EngineShared>, qp_num: u32, outcome: ScriptedPost) -> Self {
+        fn new(session: &Arc<SessionManager>, qp_num: u32, outcome: ScriptedPost) -> Self {
             Self {
-                shared: Arc::downgrade(shared),
+                session: Arc::downgrade(session),
                 qp_num,
                 outcome,
                 calls: AtomicUsize::new(0),
@@ -3853,22 +3909,17 @@ mod tests {
                 },
                 ScriptedPost::DispatchDuringPost => {
                     let token = tokens[0];
-                    let shared = self.shared.upgrade().expect("engine shared state");
+                    let session = self.session.upgrade().expect("session owner");
                     assert_eq!(
-                        shared
-                            .session
-                            .enqueue_completion(wc(token, self.qp_num, opcode)),
-                        shared.session.connections.lookup_qp(self.qp_num)
+                        session.enqueue_completion(wc(token, self.qp_num, opcode)),
+                        session.connections.lookup_qp(self.qp_num)
                     );
-                    let connection = shared
-                        .session
+                    let connection = session
                         .connections
                         .lookup_qp(self.qp_num)
                         .expect("connection token");
                     assert_eq!(
-                        shared
-                            .session
-                            .dispatch_connection_completions(connection, 1),
+                        session.dispatch_connection_completions(connection, 1),
                         (1, false)
                     );
                     BatchPostOutcome::AllAccepted
@@ -3884,12 +3935,10 @@ mod tests {
                 } => {
                     assert!(completed_suffix >= accepted);
                     let token = tokens[completed_suffix];
-                    let shared = self.shared.upgrade().expect("engine shared state");
+                    let session = self.session.upgrade().expect("session owner");
                     assert_eq!(
-                        shared
-                            .session
-                            .enqueue_completion(wc(token, self.qp_num, opcode)),
-                        shared.session.connections.lookup_qp(self.qp_num)
+                        session.enqueue_completion(wc(token, self.qp_num, opcode)),
+                        session.connections.lookup_qp(self.qp_num)
                     );
                     BatchPostOutcome::PrefixAccepted {
                         accepted,
@@ -3903,22 +3952,17 @@ mod tests {
                 } => {
                     assert!(completed_suffix >= accepted);
                     let token = tokens[completed_suffix];
-                    let shared = self.shared.upgrade().expect("engine shared state");
+                    let session = self.session.upgrade().expect("session owner");
                     assert_eq!(
-                        shared
-                            .session
-                            .enqueue_completion(wc(token, self.qp_num, opcode)),
-                        shared.session.connections.lookup_qp(self.qp_num)
+                        session.enqueue_completion(wc(token, self.qp_num, opcode)),
+                        session.connections.lookup_qp(self.qp_num)
                     );
-                    let connection = shared
-                        .session
+                    let connection = session
                         .connections
                         .lookup_qp(self.qp_num)
                         .expect("connection token");
                     assert_eq!(
-                        shared
-                            .session
-                            .dispatch_connection_completions(connection, 1),
+                        session.dispatch_connection_completions(connection, 1),
                         (1, false)
                     );
                     BatchPostOutcome::PrefixAccepted {
@@ -3989,32 +4033,40 @@ mod tests {
         connections: usize,
         operations: usize,
         cq_capacity: usize,
-    ) -> Option<(super::super::RdmaEngine, super::super::RdmaEngineDriver)> {
+    ) -> Option<(
+        super::super::RdmaEngine,
+        super::super::RdmaEngineDriver,
+        OperationOwners,
+    )> {
         let devices = crate::cm::RdmaCmDeviceList::new().ok()?;
         let device = devices
             .device_names()
             .into_iter()
             .find(|name| name.starts_with("rxe") || name.starts_with("siw"))?;
         drop(devices);
-        Some(
-            super::super::RdmaEngineBuilder::new(device)
-                .completion_mode(super::super::CompletionMode::Polling)
-                .maximum_live_connections(connections)
-                .maximum_inflight_operations(operations)
-                .cq_capacity(cq_capacity)
-                .build()
-                .expect("software-provider engine"),
-        )
+        let (engine, driver) = super::super::RdmaEngineBuilder::new(device)
+            .completion_mode(super::super::CompletionMode::Polling)
+            .maximum_live_connections(connections)
+            .maximum_inflight_operations(operations)
+            .cq_capacity(cq_capacity)
+            .build()
+            .expect("software-provider engine");
+        let owners = OperationOwners {
+            io_core: Arc::clone(&engine.shared.io_core),
+            session: Arc::clone(&engine.shared.session),
+            _runtime: engine.shared.clone(),
+        };
+        Some((engine, driver, owners))
     }
 
     fn scripted_connection(
-        shared: &Arc<EngineShared>,
+        session: &Arc<SessionManager>,
         poster: Arc<ScriptedPoster>,
         send_wr: usize,
         recv_wr: usize,
     ) -> crate::v2::engine::session::connection::RdmaConnection {
         install_connection(
-            &shared.session,
+            session,
             poster,
             super::super::RdmaConnectionConfig::default()
                 .max_send_wr(send_wr)
@@ -4032,21 +4084,17 @@ mod tests {
     }
 
     fn complete(
-        shared: &EngineShared,
+        session: &SessionManager,
         connection: &ConnectionState,
         token: OperationToken,
         opcode: u32,
     ) {
         assert_eq!(
-            shared
-                .session
-                .enqueue_completion(wc(token, connection.qp_num(), opcode)),
+            session.enqueue_completion(wc(token, connection.qp_num(), opcode)),
             Some(connection.token)
         );
         assert_eq!(
-            shared
-                .session
-                .dispatch_connection_completions(connection.token, 1),
+            session.dispatch_connection_completions(connection.token, 1),
             (1, false)
         );
     }
@@ -4078,7 +4126,13 @@ mod tests {
         }
     }
 
-    fn synthetic_engine(capacity: usize) -> Arc<EngineShared> {
+    struct OperationOwners {
+        io_core: Arc<IoCore>,
+        session: Arc<SessionManager>,
+        _runtime: Arc<dyn SessionEngineRuntime>,
+    }
+
+    fn synthetic_engine_root(capacity: usize) -> Arc<EngineShared> {
         let mut config = EngineConfig::new("test0".into());
         config.max_live_connections = capacity;
         config.max_inflight_operations = capacity;
@@ -4086,12 +4140,21 @@ mod tests {
         EngineShared::new(config, None, None).unwrap().into_shared()
     }
 
+    fn synthetic_engine(capacity: usize) -> OperationOwners {
+        let engine = synthetic_engine_root(capacity);
+        OperationOwners {
+            io_core: Arc::clone(&engine.io_core),
+            session: Arc::clone(&engine.session),
+            _runtime: engine,
+        }
+    }
+
     fn synthetic_connection_on(
-        shared: &Arc<EngineShared>,
+        owners: &OperationOwners,
         qp_num: u32,
     ) -> crate::v2::engine::session::connection::RdmaConnection {
         install_connection(
-            &shared.session,
+            &owners.session,
             Arc::new(NoopPoster(qp_num)),
             super::super::RdmaConnectionConfig::default()
                 .max_send_wr(4)
@@ -4107,7 +4170,7 @@ mod tests {
     }
 
     fn install_accepted(
-        shared: &Arc<EngineShared>,
+        owners: &OperationOwners,
         connection: &Arc<ConnectionState>,
         opcode: WcOpcode,
     ) -> OperationToken {
@@ -4119,8 +4182,8 @@ mod tests {
                 })
                 .is_ok()
         );
-        assert!(shared.io_core.cq_credits.reserve());
-        let (token, operation) = shared
+        assert!(owners.io_core.cq_credits.reserve());
+        let (token, operation) = owners
             .io_core
             .operations
             .allocate(|token| {
@@ -4138,7 +4201,7 @@ mod tests {
             })
             .unwrap();
         operation.commit_accepted();
-        shared
+        owners
             .io_core
             .accepted_operations
             .fetch_add(1, Ordering::AcqRel);
@@ -4146,7 +4209,7 @@ mod tests {
     }
 
     fn install_accepted_with_result(
-        shared: &Arc<EngineShared>,
+        owners: &OperationOwners,
         connection: &Arc<ConnectionState>,
         opcode: WcOpcode,
     ) -> (OperationToken, super::super::io::IoEventReceiver) {
@@ -4155,9 +4218,9 @@ mod tests {
             _ => Direction::Send,
         };
         connection.reserve_local(direction).unwrap();
-        assert!(shared.io_core.cq_credits.reserve());
+        assert!(owners.io_core.cq_credits.reserve());
         let (sender, events) = super::super::io::event_port();
-        let (token, operation) = shared
+        let (token, operation) = owners
             .io_core
             .operations
             .allocate(|token| {
@@ -4173,7 +4236,7 @@ mod tests {
             })
             .unwrap();
         operation.commit_accepted();
-        shared
+        owners
             .io_core
             .accepted_operations
             .fetch_add(1, Ordering::AcqRel);

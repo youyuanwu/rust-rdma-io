@@ -479,7 +479,7 @@ mod tests {
         )
         .unwrap();
         install_accepted_operation_for_driver_test(
-            &engine.shared,
+            &engine.shared.io_core,
             &connection.state,
             crate::wc::WcOpcode::Recv,
         );
@@ -522,7 +522,11 @@ mod tests {
         )
         .unwrap();
         for opcode in [crate::wc::WcOpcode::Send, crate::wc::WcOpcode::Recv] {
-            install_accepted_operation_for_driver_test(&engine.shared, &connection.state, opcode);
+            install_accepted_operation_for_driver_test(
+                &engine.shared.io_core,
+                &connection.state,
+                opcode,
+            );
         }
         let anomalous = OperationToken {
             slot: u32::MAX,

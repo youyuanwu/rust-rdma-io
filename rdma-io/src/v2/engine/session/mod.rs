@@ -29,7 +29,7 @@ pub(super) use self::progress::SessionProgress;
 use self::registry::ConnectionRegistry;
 #[cfg(any(test, feature = "test-hooks"))]
 use super::SessionTestInstrumentation;
-use super::config::{EngineConfig, ProviderLimits, RdmaConnectionConfig};
+use super::config::{ProviderLimits, RdmaConnectionConfig, SessionConfig};
 use super::io::MemoryRegistrar;
 use super::io_core::{
     IoCore, IoCoreEffects, IoSessionBridge, OperationQuarantineEffect, QpReclaimCapability,
@@ -312,8 +312,8 @@ pub(super) struct SessionManager {
     // The session owner can reach only the engine-wide operations exposed by
     // SessionEngineRuntime; it cannot recover the concrete composition root.
     engine: OnceLock<Weak<dyn SessionEngineRuntime>>,
-    // Immutable construction inputs are copied into their consuming owner.
-    config: EngineConfig,
+    // Only session-owned immutable policy is copied into this owner.
+    config: SessionConfig,
     provider: Option<ProviderLimits>,
     memory: MemoryRegistrar,
     #[cfg(any(test, feature = "test-hooks"))]
@@ -325,7 +325,7 @@ pub(super) struct SessionManager {
 
 impl SessionManager {
     pub(super) fn new(
-        config: EngineConfig,
+        config: SessionConfig,
         provider: Option<ProviderLimits>,
         admission: Arc<RwLock<()>>,
         io_core: Arc<IoCore>,

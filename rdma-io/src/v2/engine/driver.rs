@@ -2228,7 +2228,7 @@ mod tests {
             )
             .unwrap();
             install_accepted_operation_for_driver_test(
-                &engine.shared,
+                &engine.shared.io_core,
                 &connection.state,
                 crate::wc::WcOpcode::Send,
             );
@@ -2388,7 +2388,7 @@ mod tests {
                     crate::wc::WcOpcode::Send
                 };
                 let operation = install_accepted_operation_for_driver_test(
-                    &engine.shared,
+                    &engine.shared.io_core,
                     &connection.state,
                     expected,
                 );

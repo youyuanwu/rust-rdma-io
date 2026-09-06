@@ -605,7 +605,7 @@ impl EngineShared {
             io_driver_signal,
         )?;
         let session = Arc::new(SessionManager::new(
-            config.clone(),
+            config::SessionConfig::from(&config),
             provider,
             Arc::clone(&admission),
             Arc::clone(&io_core),
