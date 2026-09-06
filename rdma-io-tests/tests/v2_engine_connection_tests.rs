@@ -171,11 +171,20 @@ async fn run_mode(mode: CompletionMode) {
     assert_eq!(diagnostics.accepted_operations, 0);
 
     resources.disconnect_connection(&default_server).unwrap();
+    wait_until(
+        Duration::from_secs(5),
+        "peer disconnect route was not retired",
+        || !resources.connection_route_is_live(&default_client).unwrap(),
+    )
+    .await;
     let disconnected_mr = default_client
         .register_memory(64, AccessIntent::LocalOnly)
         .unwrap();
     let (disconnected, returned) = default_client.send(disconnected_mr, None).await;
-    assert!(matches!(disconnected, Err(Error::TransportClosed)));
+    assert!(
+        matches!(disconnected, Err(Error::TransportClosed)),
+        "post-disconnect send returned {disconnected:?}"
+    );
     drop(returned);
     default_server.close().await.unwrap();
     default_client.close().await.unwrap();
