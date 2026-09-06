@@ -289,14 +289,21 @@ I/O and session controls. AST guards reject hidden work, production `IoCore`
 dependencies on root/session/connection/CM/listener/protocol types, strong
 session-resource retention by frontends and waiters, lifecycle operations
 without the private authority, public re-exports of internal capabilities, and
-obsolete top-level session-module paths. The guards also parse every session
-source, including test-only items and renamed imports, to reject direct
-`EngineShared` dependencies; reject broad root/session `Deref` adapters and
-obsolete or newly renamed root-to-owner forwarding methods; constrain the
-session runtime method/type surface and `SessionConfig` fields; and require
-I/O tests to use explicit `IoCore`/`SessionManager` fixture parts with only an
-opaque runtime retain. Concrete roots remain available only to identified
-composition, terminal, and driver-progress tests.
+obsolete top-level session-module paths. The guards also parse the current
+listed session sources, including test-only items and renamed imports, to
+reject direct `EngineShared` dependencies; recursively reject broad
+root/session `Deref` adapters and obsolete or newly renamed root-to-owner
+forwarding methods; constrain the session runtime method/type surface and
+`SessionConfig` fields; and require tests under `engine/io_core/` to use
+explicit `IoCore`/`SessionManager` fixture parts with only an opaque runtime
+retain.
+
+This enforcement is intentionally narrower than a whole-engine module-graph
+proof. New session submodules are not discovered automatically, concrete-root
+fixture classification does not scan every engine test module, and aliases
+are resolved within each parsed file rather than across files. The current
+audited source satisfies the boundary, but these structural-enforcement gaps
+remain an accepted review limitation rather than being represented as fixed.
 
 ## Completion-to-Message Handoff
 
