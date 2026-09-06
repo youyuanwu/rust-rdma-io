@@ -2443,6 +2443,8 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         fs::read_to_string(&scheduler_path).expect("read owner scheduler source");
     assert!(
         scheduler_source.contains("const OWNER_CLASS_COUNT: usize = 2")
+            && scheduler_source.contains("first_starts_next_pass")
+            && scheduler_source.contains("fn begin_pass(")
             && !scheduler_source.contains("OwnerClass::Terminal"),
         "{} must rotate exactly the I/O and session owners",
         scheduler_path.display()

@@ -5,8 +5,9 @@
 //! notification resources. Readiness owns one completion channel/fd; polling
 //! owns none. Every connection shares those objects.
 //!
-//! The driver is a thin scheduler over bounded I/O, session, and terminal
-//! turns. The I/O owner polls the shared CQ and validates a CQE only when the
+//! The driver is a thin scheduler over bounded I/O and session owner turns,
+//! followed by one terminal-eligibility epilogue. The I/O owner polls the
+//! shared CQ and validates a CQE only when the
 //! current connection generation, operation generation, operation owner, and
 //! provider-reported `qp_num` all agree. The session owner consumes CM events
 //! and controls connection lifecycle. Cancellation, close, shutdown, and

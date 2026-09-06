@@ -16,6 +16,7 @@ const OWNER_CLASS_COUNT: usize = 2;
 pub(super) struct OwnerScheduler {
     classes: VecDeque<OwnerClass>,
     queued: [bool; OWNER_CLASS_COUNT],
+    first_starts_next_pass: OwnerClass,
 }
 
 impl OwnerScheduler {
@@ -23,6 +24,7 @@ impl OwnerScheduler {
         Self {
             classes: VecDeque::with_capacity(OWNER_CLASS_COUNT),
             queued: [false; OWNER_CLASS_COUNT],
+            first_starts_next_pass: OwnerClass::Io,
         }
     }
 
@@ -38,6 +40,26 @@ impl OwnerScheduler {
         let class = self.classes.pop_front()?;
         self.queued[class.index()] = false;
         Some(class)
+    }
+
+    pub(super) fn begin_pass(&mut self) -> usize {
+        self.mark_ready(OwnerClass::Io);
+        self.mark_ready(OwnerClass::Session);
+
+        let first = self.first_starts_next_pass;
+        self.first_starts_next_pass = match first {
+            OwnerClass::Io => OwnerClass::Session,
+            OwnerClass::Session => OwnerClass::Io,
+        };
+        if self.classes.front() != Some(&first) {
+            let first_index = self
+                .classes
+                .iter()
+                .position(|class| *class == first)
+                .expect("both owners are queued at pass start");
+            self.classes.rotate_left(first_index);
+        }
+        self.ready_count()
     }
 
     pub(super) fn ready_count(&self) -> usize {
@@ -198,22 +220,30 @@ mod tests {
     }
 
     #[test]
-    fn ready_at_entry_bounds_one_turn_per_owner() {
+    fn ready_at_entry_bounds_one_turn_per_owner_and_rotates_pass_start() {
         let mut scheduler = OwnerScheduler::new();
-        for class in [OwnerClass::Io, OwnerClass::Session] {
-            scheduler.mark_ready(class);
-        }
-        let pass_budget = scheduler.ready_count();
-        let mut serviced = Vec::new();
-        for _ in 0..pass_budget {
-            let class = scheduler.next().unwrap();
-            serviced.push(class);
-            scheduler.mark_ready(class);
+        let mut passes = Vec::new();
+
+        for _ in 0..3 {
+            let pass_budget = scheduler.begin_pass();
+            let mut serviced = Vec::new();
+            for _ in 0..pass_budget {
+                let class = scheduler.next().unwrap();
+                serviced.push(class);
+                scheduler.mark_ready(class);
+            }
+            passes.push(serviced);
         }
 
-        assert_eq!(serviced, [OwnerClass::Io, OwnerClass::Session]);
         assert_eq!(scheduler.ready_count(), OWNER_CLASS_COUNT);
-        assert_eq!(scheduler.next(), Some(OwnerClass::Io));
+        assert_eq!(
+            passes,
+            [
+                vec![OwnerClass::Io, OwnerClass::Session],
+                vec![OwnerClass::Session, OwnerClass::Io],
+                vec![OwnerClass::Io, OwnerClass::Session],
+            ]
+        );
     }
 
     #[test]

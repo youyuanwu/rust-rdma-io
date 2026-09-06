@@ -197,8 +197,7 @@ impl RdmaEngineDriver {
     }
 
     fn poll_once(&mut self, cx: &mut TaskContext<'_>) -> Result<()> {
-        self.probe_owners();
-        let owner_budget = self.scheduler.ready_count();
+        let owner_budget = self.scheduler.begin_pass();
         for _ in 0..owner_budget {
             let Some(owner) = self.scheduler.next() else {
                 break;
@@ -2614,6 +2613,68 @@ mod tests {
         ));
         engine.shared.transition_running();
         assert_eq!(engine.shared.lifecycle(), RdmaEngineLifecycle::Terminated);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn final_accepted_operation_drain_wakes_and_reconsiders_terminal() {
+        let (engine, mut driver) = test_engine_pair(CompletionMode::Readiness);
+        let poster = Arc::new(DrainInterleavingPoster {
+            qp_num: 73,
+            destroys: AtomicUsize::new(0),
+        });
+        let connection = install_connection(
+            &engine.shared.session,
+            Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
+            RdmaConnectionConfig::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let operation = install_accepted_operation_for_driver_test(
+            &engine.shared.io_core,
+            &connection.state,
+            crate::wc::WcOpcode::Send,
+        );
+        let counter = CountingWaker::new();
+        let waker = counter.waker();
+        let mut cx = TaskContext::from_waker(&waker);
+
+        assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
+        engine.shared.request_shutdown();
+        assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
+        assert_eq!(engine.diagnostics().accepted_operations, 1);
+
+        let wakes_before_drain = counter.count();
+        engine
+            .shared
+            .test_driver
+            .queue_released_connection_cqe(completion_for_driver_test(
+                operation,
+                poster.qp_num,
+                rdma_io_sys::ibverbs::IBV_WC_SEND,
+                rdma_io_sys::ibverbs::IBV_WC_SUCCESS,
+            ));
+
+        let mut result = Pin::new(&mut driver).poll(&mut cx);
+        assert!(
+            counter.count() > wakes_before_drain,
+            "the final accepted-operation drain must wake the registered driver"
+        );
+        assert_eq!(engine.diagnostics().accepted_operations, 0);
+        for _ in 0..8 {
+            if result.is_ready() {
+                break;
+            }
+            result = Pin::new(&mut driver).poll(&mut cx);
+        }
+
+        assert!(matches!(result, Poll::Ready(Ok(()))));
+        assert_eq!(engine.diagnostics().live_connections, 0);
+        assert_eq!(
+            poster.destroys.load(Ordering::Acquire),
+            1,
+            "session retirement must retain QP destruction authority"
+        );
     }
 
     #[tokio::test]
