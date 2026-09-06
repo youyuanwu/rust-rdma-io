@@ -185,7 +185,7 @@ fn shutdown_initiates_each_preexisting_connection_close_once() {
             error_transitions: AtomicUsize::new(0),
         });
         let connection = install_connection(
-            &engine.shared,
+            &engine.shared.session,
             Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
             RdmaConnectionConfig::default(),
             None,
@@ -197,12 +197,13 @@ fn shutdown_initiates_each_preexisting_connection_close_once() {
     }
 
     engine.shared.request_shutdown();
-    engine.shared.begin_all_connection_close();
-    engine.shared.begin_all_connection_close();
+    engine.shared.session.begin_all_connection_close();
+    engine.shared.session.begin_all_connection_close();
 
     assert!(
         engine
             .shared
+            .session
             .shutdown_connection_close_started
             .load(Ordering::Acquire)
     );

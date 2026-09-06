@@ -7,8 +7,6 @@
 //! here before their detached events and wakers are published.
 
 use std::collections::{HashMap, VecDeque};
-#[cfg(test)]
-use std::ops::Deref;
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -29,13 +27,16 @@ use self::connection::{
 use self::listener::ListenerState;
 pub(super) use self::progress::SessionProgress;
 use self::registry::ConnectionRegistry;
-use super::driver::WorkSignal;
+#[cfg(any(test, feature = "test-hooks"))]
+use super::SessionTestInstrumentation;
+use super::config::{ProviderLimits, RdmaConnectionConfig, SessionConfig};
+use super::io::MemoryRegistrar;
 use super::io_core::{
     IoCore, IoCoreEffects, IoSessionBridge, OperationQuarantineEffect, QpReclaimCapability,
 };
 use super::registry::{ConnectionToken, Lookup, OperationToken, lock_unpoison};
 use super::scheduler::{DeadlineKind, DeadlineRequest};
-use super::{EngineShared, Result};
+use super::{Result, SessionEngineRuntime};
 use crate::v2::error::Error;
 
 /// Non-forgeable authority for connection and QP lifecycle transitions.
@@ -190,23 +191,22 @@ impl SessionListener {
         self.close.release_frontend()
     }
 
-    pub(super) fn owners(&self) -> Result<(Arc<EngineShared>, Arc<ListenerState>)> {
+    pub(super) fn owners(&self) -> Result<(Arc<SessionManager>, Arc<ListenerState>)> {
         let manager = self.manager.upgrade().ok_or(Error::DriverShutdown)?;
-        let engine = manager.engine().ok_or(Error::DriverShutdown)?;
         let listener = self.listener.upgrade().ok_or_else(|| {
             self.close
                 .outcome()
                 .and_then(|outcome| outcome.into_result().err())
                 .unwrap_or(Error::TransportClosed)
         })?;
-        Ok((engine, listener))
+        Ok((manager, listener))
     }
 
     pub(super) fn request_close(&self) {
-        let Ok((engine, listener)) = self.owners() else {
+        let Ok((manager, listener)) = self.owners() else {
             return;
         };
-        listener.request_close(&engine);
+        listener.request_close(&manager);
     }
 
     pub(super) async fn close(&self) -> Result<()> {
@@ -230,12 +230,12 @@ impl SessionListener {
 
 impl SessionConnection {
     pub(super) fn new(
-        manager: &Arc<SessionManager>,
+        manager: Weak<SessionManager>,
         token: ConnectionToken,
         close: Arc<SessionCloseState>,
     ) -> Self {
         Self {
-            manager: Arc::downgrade(manager),
+            manager,
             token,
             close,
         }
@@ -307,23 +307,33 @@ pub(super) struct SessionManager {
     pub(super) admission: Arc<RwLock<()>>,
     pub(super) shutdown_connection_close_started: AtomicBool,
     quarantines: Mutex<QuarantineState>,
-    engine: OnceLock<Weak<EngineShared>>,
+    // Frontend capabilities retain only this weak self-reference.
+    self_ref: OnceLock<Weak<SessionManager>>,
+    // The session owner can reach only the engine-wide operations exposed by
+    // SessionEngineRuntime; it cannot recover the concrete composition root.
+    engine: OnceLock<Weak<dyn SessionEngineRuntime>>,
+    // Only session-owned immutable policy is copied into this owner.
+    config: SessionConfig,
+    provider: Option<ProviderLimits>,
+    memory: MemoryRegistrar,
+    #[cfg(any(test, feature = "test-hooks"))]
+    test_instrumentation: SessionTestInstrumentation,
     lifecycle_authority: SessionLifecycleAuthority,
     qp_reclaim: QpReclaimCapability,
-    #[allow(
-        dead_code,
-        reason = "retained for session-owned close/reclaim service and test accounting adapters"
-    )]
     pub(super) io_core: Arc<IoCore>,
 }
 
 impl SessionManager {
     pub(super) fn new(
-        max_live_connections: usize,
+        config: SessionConfig,
+        provider: Option<ProviderLimits>,
         admission: Arc<RwLock<()>>,
         io_core: Arc<IoCore>,
+        memory: MemoryRegistrar,
         qp_reclaim: QpReclaimCapability,
+        #[cfg(any(test, feature = "test-hooks"))] test_instrumentation: SessionTestInstrumentation,
     ) -> Result<Self> {
+        let max_live_connections = config.max_live_connections;
         Ok(Self {
             connection_admission: ConnectionAdmissionPool::new(max_live_connections),
             connections: ConnectionRegistry::new(max_live_connections)?,
@@ -334,54 +344,133 @@ impl SessionManager {
             admission,
             shutdown_connection_close_started: AtomicBool::new(false),
             quarantines: Mutex::new(QuarantineState::default()),
+            self_ref: OnceLock::new(),
             engine: OnceLock::new(),
+            config,
+            provider,
+            memory,
+            #[cfg(any(test, feature = "test-hooks"))]
+            test_instrumentation,
             lifecycle_authority: SessionLifecycleAuthority { _private: () },
             qp_reclaim,
             io_core,
         })
     }
 
-    pub(super) fn bind_engine(&self, engine: &Arc<EngineShared>) {
-        self.engine
-            .set(Arc::downgrade(engine))
-            .unwrap_or_else(|_| panic!("SessionManager is bound to exactly one EngineShared"));
+    pub(super) fn bind_self(self: &Arc<Self>) {
+        self.self_ref
+            .set(Arc::downgrade(self))
+            .unwrap_or_else(|_| panic!("SessionManager self reference is bound exactly once"));
+    }
+
+    pub(super) fn bind_engine(&self, engine: &Arc<dyn SessionEngineRuntime>) {
+        if self.engine.set(Arc::downgrade(engine)).is_err() {
+            panic!("SessionManager is bound to exactly one engine runtime");
+        }
     }
 
     pub(super) fn live_connection_count(&self) -> usize {
         self.connections.live()
     }
 
-    pub(super) fn engine(&self) -> Option<Arc<EngineShared>> {
+    pub(super) fn engine_runtime(&self) -> Option<Arc<dyn SessionEngineRuntime>> {
         self.engine.get().and_then(Weak::upgrade)
     }
 
     fn engine_outcome(&self) -> Option<super::lifecycle::MemoizedTerminalResult> {
-        self.engine().and_then(|engine| engine.outcome())
+        self.engine_runtime().and_then(|engine| engine.outcome())
+    }
+
+    pub(super) fn admission_error(&self) -> Option<Error> {
+        match self.engine_runtime() {
+            Some(engine) => engine.admission_error(),
+            None => Some(Error::DriverShutdown),
+        }
+    }
+
+    pub(super) fn shutdown_requested(&self) -> bool {
+        self.engine_runtime()
+            .is_none_or(|engine| engine.shutdown_requested())
+    }
+
+    pub(super) fn pending_terminal_outcome(
+        &self,
+    ) -> Option<super::lifecycle::MemoizedTerminalResult> {
+        self.engine_runtime()
+            .and_then(|engine| engine.pending_terminal_outcome())
+    }
+
+    pub(super) fn begin_driver_failure(&self, error: Error) {
+        if let Some(engine) = self.engine_runtime() {
+            engine.begin_driver_failure(error);
+        }
+    }
+
+    pub(super) fn shutdown_deadline_failure(&self) -> Option<Error> {
+        self.engine_runtime()
+            .and_then(|engine| engine.shutdown_deadline_failure())
+    }
+
+    pub(super) fn publish_io_work(&self) {
+        if let Some(engine) = self.engine_runtime() {
+            engine.publish_io_work();
+        }
+    }
+
+    pub(super) fn publish_session_work(&self) {
+        if let Some(engine) = self.engine_runtime() {
+            engine.publish_session_work();
+        }
+    }
+
+    pub(super) fn validate_connection_config(&self, config: &RdmaConnectionConfig) -> Result<()> {
+        config.validate(&self.config, self.provider.as_ref())
+    }
+
+    pub(super) fn memory_registrar(&self) -> MemoryRegistrar {
+        self.memory.clone()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(super) fn provider_limits(&self) -> Option<ProviderLimits> {
+        self.provider
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(super) fn take_setup_rollback_failure(
+        &self,
+    ) -> Option<super::driver::test_api::SetupRollbackFailure> {
+        self.test_instrumentation.take_setup_rollback_failure()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(super) fn pause_connect_before_enqueue(&self) {
+        self.test_instrumentation.pause_connect_before_enqueue();
     }
 
     fn request_connection_close(&self, token: ConnectionToken) {
-        let Some(engine) = self.engine() else {
-            return;
-        };
         let Lookup::Occupied(connection) = self.connections.lookup(token) else {
             return;
         };
-        self.begin_connection_close(&engine, &connection);
+        self.begin_connection_close(&connection);
     }
 
-    pub(super) fn connection_capability(
-        self: &Arc<Self>,
-        connection: &ConnectionState,
-    ) -> SessionConnection {
-        SessionConnection::new(self, connection.token, connection.close_state())
+    pub(super) fn connection_capability(&self, connection: &ConnectionState) -> SessionConnection {
+        let manager = self
+            .self_ref
+            .get()
+            .expect("SessionManager self reference is bound before use")
+            .clone();
+        SessionConnection::new(manager, connection.token, connection.close_state())
     }
 
-    pub(super) fn listener_capability(
-        self: &Arc<Self>,
-        listener: &Arc<ListenerState>,
-    ) -> SessionListener {
+    pub(super) fn listener_capability(&self, listener: &Arc<ListenerState>) -> SessionListener {
         SessionListener {
-            manager: Arc::downgrade(self),
+            manager: self
+                .self_ref
+                .get()
+                .expect("SessionManager self reference is bound before use")
+                .clone(),
             listener: Arc::downgrade(listener),
             close: listener.close_state(),
             local_addr: listener.local_addr,
@@ -467,17 +556,11 @@ impl SessionManager {
         }
     }
 
-    pub(super) fn schedule_deadline(
-        &self,
-        work_signal: &WorkSignal,
-        kind: DeadlineKind,
-        token: u64,
-        after: Duration,
-    ) {
+    pub(super) fn schedule_deadline(&self, kind: DeadlineKind, token: u64, after: Duration) {
         let now = tokio::time::Instant::now();
         let at = now.checked_add(after).unwrap_or(now);
         lock_unpoison(&self.deadline_requests).push_back(DeadlineRequest { at, kind, token });
-        work_signal.publish(super::driver::SESSION_WORK);
+        self.publish_session_work();
     }
 
     pub(super) fn take_deadline_requests(&self, budget: usize) -> Vec<DeadlineRequest> {
@@ -567,7 +650,7 @@ impl SessionManager {
     }
 
     /// Consume session-facing I/O effects before detached publication.
-    pub(super) fn apply_io_effects(&self, shared: &EngineShared, effects: &mut IoCoreEffects) {
+    pub(super) fn apply_io_effects(&self, effects: &mut IoCoreEffects) {
         for effect in effects.take_quarantine() {
             match effect {
                 OperationQuarantineEffect::Added {
@@ -591,7 +674,7 @@ impl SessionManager {
             if connection.close_started() && connection.accepted_count() == 0 {
                 self.recover_connection_quarantine(&connection);
                 self.record_connection_drained(&connection);
-                self.schedule_connection_retirement(shared, &connection);
+                self.schedule_connection_retirement(&connection);
             }
         }
     }
@@ -620,7 +703,6 @@ impl SessionManager {
 
     pub(super) fn dispatch_connection_completions(
         &self,
-        shared: &EngineShared,
         token: ConnectionToken,
         quantum: usize,
     ) -> (usize, bool) {
@@ -631,14 +713,13 @@ impl SessionManager {
         let (processed, remains_ready, mut effects) = self
             .io_core
             .dispatch_connection_completions(&connection.io, quantum);
-        self.apply_io_effects(shared, &mut effects);
+        self.apply_io_effects(&mut effects);
         effects.publish();
         (processed, remains_ready)
     }
 
     pub(super) fn reclaim_after_qp_destroy(
         &self,
-        shared: &EngineShared,
         proof: QpDestructionProof,
         connection: &ConnectionState,
         tokens: Vec<OperationToken>,
@@ -659,7 +740,6 @@ impl SessionManager {
             .into_iter()
             .filter(|token| {
                 self.reclaim_after_proven_qp_destroy(
-                    shared,
                     proven_connection,
                     proven_qp_num,
                     connection,
@@ -671,7 +751,6 @@ impl SessionManager {
 
     fn reclaim_after_proven_qp_destroy(
         &self,
-        shared: &EngineShared,
         proven_connection: ConnectionToken,
         proven_qp_num: u32,
         connection: &ConnectionState,
@@ -684,7 +763,7 @@ impl SessionManager {
             connection.operation_close_error(),
             token,
         );
-        self.apply_io_effects(shared, &mut effects);
+        self.apply_io_effects(&mut effects);
         effects.publish();
         reclaimed
     }
@@ -692,42 +771,34 @@ impl SessionManager {
     #[cfg(test)]
     pub(super) fn reclaim_after_qp_destroy_for_test(
         &self,
-        shared: &EngineShared,
         proof: &QpDestructionProof,
         connection: &ConnectionState,
         token: OperationToken,
     ) -> bool {
-        self.reclaim_after_proven_qp_destroy(
-            shared,
-            proof.connection,
-            proof.qp_num,
-            connection,
-            token,
-        )
+        self.reclaim_after_proven_qp_destroy(proof.connection, proof.qp_num, connection, token)
     }
 
     pub(super) fn reject_queued_completions_after_qp_destroy(
         &self,
-        shared: &EngineShared,
         connection: &ConnectionState,
     ) -> bool {
         let (remains_ready, mut effects) = self
             .io_core
             .reject_queued_completions_after_qp_destroy(&connection.io);
-        self.apply_io_effects(shared, &mut effects);
+        self.apply_io_effects(&mut effects);
         effects.publish();
         remains_ready
     }
 
-    pub(super) fn handle_reclamation_deadline(&self, shared: &EngineShared, token: OperationToken) {
+    pub(super) fn handle_reclamation_deadline(&self, token: OperationToken) {
         let mut effects = self.io_core.handle_reclamation_deadline(token);
-        self.apply_io_effects(shared, &mut effects);
+        self.apply_io_effects(&mut effects);
         effects.publish();
     }
 
-    pub(super) fn quarantine_operation(&self, shared: &EngineShared, token: OperationToken) {
+    pub(super) fn quarantine_operation(&self, token: OperationToken) {
         let mut effects = self.io_core.quarantine_operation(token);
-        self.apply_io_effects(shared, &mut effects);
+        self.apply_io_effects(&mut effects);
         effects.publish();
     }
 }
@@ -742,36 +813,16 @@ impl IoSessionBridge for SessionManager {
         connection: ConnectionToken,
         quantum: usize,
     ) -> (usize, bool) {
-        let Some(shared) = self.engine() else {
-            return (0, false);
-        };
-        self.dispatch_connection_completions(&shared, connection, quantum)
+        self.dispatch_connection_completions(connection, quantum)
     }
 
     fn handle_reclamation_deadline(&self, token: OperationToken) {
-        let Some(shared) = self.engine() else {
-            return;
-        };
-        self.handle_reclamation_deadline(&shared, token);
+        self.handle_reclamation_deadline(token);
     }
 
     fn apply_terminal_effects(&self, mut effects: IoCoreEffects) {
-        let Some(shared) = self.engine() else {
-            return;
-        };
-        self.apply_io_effects(&shared, &mut effects);
+        self.apply_io_effects(&mut effects);
         effects.publish();
-    }
-}
-
-#[cfg(test)]
-impl Deref for SessionManager {
-    // Existing colocated unit tests exercise exact I/O accounting through
-    // their synthetic engine. This adapter is absent from production builds.
-    type Target = IoCore;
-
-    fn deref(&self) -> &Self::Target {
-        &self.io_core
     }
 }
 
@@ -834,12 +885,7 @@ mod tests {
         assert_eq!(manager.cm.pending_route_count(), 0);
         assert!(!manager.has_deadline_requests());
 
-        manager.schedule_deadline(
-            &engine.shared.work_signal,
-            DeadlineKind::ConnectionDrain,
-            7,
-            Duration::ZERO,
-        );
+        manager.schedule_deadline(DeadlineKind::ConnectionDrain, 7, Duration::ZERO);
         assert!(manager.has_deadline_requests());
         let requests = manager.take_deadline_requests(1);
         assert_eq!(requests.len(), 1);
@@ -852,7 +898,7 @@ mod tests {
     fn session_connection_capability_is_resource_free_and_routes_close() {
         let (engine, _driver) = test_engine_pair(CompletionMode::Polling);
         let connection = install_connection(
-            &engine.shared,
+            &engine.shared.session,
             Arc::new(TestPoster { qp_num: 17 }),
             RdmaConnectionConfig::default(),
             None,
@@ -879,7 +925,7 @@ mod tests {
     fn session_connection_close_observer_waits_for_retirement_after_cm_failure() {
         let (engine, _driver) = test_engine_pair(CompletionMode::Polling);
         let connection = install_connection(
-            &engine.shared,
+            &engine.shared.session,
             Arc::new(TestPoster { qp_num: 18 }),
             RdmaConnectionConfig::default(),
             None,
@@ -932,7 +978,7 @@ mod tests {
         let (engine, _driver) = test_engine_pair(CompletionMode::Polling);
         let state = ListenerState::test_only(4);
         let before = Arc::strong_count(&state);
-        let listener = RdmaListener::from_state(&engine.shared, Arc::clone(&state));
+        let listener = RdmaListener::from_state(&engine.shared.session, Arc::clone(&state));
 
         assert_eq!(listener.local_addr().unwrap(), state.local_addr);
         assert_eq!(
@@ -955,7 +1001,7 @@ mod tests {
     fn session_lifecycle_authority_mints_one_exact_qp_proof() {
         let (engine, _driver) = test_engine_pair(CompletionMode::Polling);
         let connection = install_connection(
-            &engine.shared,
+            &engine.shared.session,
             Arc::new(TestPoster { qp_num: 19 }),
             RdmaConnectionConfig::default(),
             None,
@@ -980,12 +1026,10 @@ mod tests {
         drop(lifecycle);
 
         assert_eq!(
-            engine.shared.session.reclaim_after_qp_destroy(
-                &engine.shared,
-                proof,
-                &connection.state,
-                Vec::new(),
-            ),
+            engine
+                .shared
+                .session
+                .reclaim_after_qp_destroy(proof, &connection.state, Vec::new(),),
             0
         );
     }

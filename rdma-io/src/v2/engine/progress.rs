@@ -9,10 +9,6 @@ use tokio::time::Instant;
 use super::Error;
 
 /// Opaque owner identity used for fair scheduler rotation.
-#[allow(
-    dead_code,
-    reason = "introduced before driver migration in later phases"
-)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum OwnerClass {
     Io,
@@ -20,10 +16,6 @@ pub(super) enum OwnerClass {
     Terminal,
 }
 
-#[allow(
-    dead_code,
-    reason = "introduced before driver migration in later phases"
-)]
 impl OwnerClass {
     pub(super) const fn index(self) -> usize {
         match self {
@@ -35,24 +27,24 @@ impl OwnerClass {
 }
 
 /// Result of one finite owner-defined progress turn.
-#[allow(
-    dead_code,
-    reason = "introduced before owner turns migrate in later phases"
-)]
 pub(super) struct ProgressReport {
     pub(super) units_consumed: usize,
     pub(super) immediate_work: bool,
+    #[allow(
+        dead_code,
+        reason = "owner report records the deadline even though the driver currently reads owner queues directly"
+    )]
     pub(super) next_deadline: Option<Instant>,
     pub(super) readiness: ReadinessRegistration,
     pub(super) terminal: ProgressTerminal,
+    #[allow(
+        dead_code,
+        reason = "owner report carries post-guard publication proof for tests and future consumers"
+    )]
     pub(super) effects: EffectsPublication,
 }
 
 /// Whether an owner completed its external-readiness protocol before suspend.
-#[allow(
-    dead_code,
-    reason = "introduced before owner turns migrate in later phases"
-)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ReadinessRegistration {
     NotRequired,
@@ -61,30 +53,22 @@ pub(super) enum ReadinessRegistration {
 }
 
 /// Owner-local terminal information visible to the composition root.
-#[allow(
-    dead_code,
-    reason = "introduced before owner turns migrate in later phases"
-)]
 pub(super) enum ProgressTerminal {
     Running,
     Ready,
+    #[allow(
+        dead_code,
+        reason = "the shared owner contract supports typed failure while current turns return Result"
+    )]
     Failed(Error),
 }
 
 /// Proof that user-visible effects from a turn were published after unlock.
-#[allow(
-    dead_code,
-    reason = "introduced before owner turns migrate in later phases"
-)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum EffectsPublication {
     Complete,
 }
 
-#[allow(
-    dead_code,
-    reason = "introduced before owner turns migrate in later phases"
-)]
 impl ProgressReport {
     pub(super) fn running(
         units_consumed: usize,
@@ -102,6 +86,7 @@ impl ProgressReport {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn idle(next_deadline: Option<Instant>, readiness: ReadinessRegistration) -> Self {
         Self::running(0, false, next_deadline, readiness)
     }

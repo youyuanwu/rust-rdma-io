@@ -11,11 +11,9 @@ use std::task::{Context, Poll};
 use super::super::io::{IoConnection, IoEventReceiver};
 use super::super::lifecycle::{MemoizedTerminalResult, TakeOnceResult};
 use super::super::registry::{lock_unpoison, read_unpoison};
-use super::super::{
-    ConnectionSetup, EngineShared, RdmaConnection, RdmaConnectionConfig, SetupSummary,
-};
+use super::super::{ConnectionSetup, RdmaConnection, RdmaConnectionConfig, SetupSummary};
 use super::connection::{ConnectionReservation, SharedCmId};
-use super::{SessionListener, SessionListenerCloseState};
+use super::{SessionListener, SessionListenerCloseState, SessionManager};
 use crate::v2::error::{Error, Result};
 use futures_util::task::AtomicWaker;
 
@@ -108,9 +106,9 @@ impl RdmaListener {
     /// error, or with the engine-wide terminal error if the driver has failed.
     /// Low-level setup posts zero initial receives.
     pub async fn accept(&self) -> Result<RdmaConnection> {
-        let (shared, state) = self.session.owners()?;
+        let (manager, state) = self.session.owners()?;
         accept_with_setup(
-            shared,
+            manager,
             state,
             RdmaConnectionConfig::default(),
             empty_connection_setup(),
@@ -124,8 +122,8 @@ impl RdmaListener {
     /// Cancellation and listener-close behavior are the same as [`Self::accept`].
     /// No value is silently clamped, and low-level setup posts zero receives.
     pub async fn accept_with_config(&self, config: RdmaConnectionConfig) -> Result<RdmaConnection> {
-        let (shared, state) = self.session.owners()?;
-        accept_with_setup(shared, state, config, empty_connection_setup()).await
+        let (manager, state) = self.session.owners()?;
+        accept_with_setup(manager, state, config, empty_connection_setup()).await
     }
 
     pub(crate) async fn accept_with_io_setup<F>(
@@ -136,16 +134,16 @@ impl RdmaListener {
     where
         F: FnOnce(IoConnection, IoEventReceiver) -> Result<usize> + Send + 'static,
     {
-        let (shared, state) = self.session.owners()?;
-        accept_with_setup(shared, state, config, Box::new(setup)).await
+        let (manager, state) = self.session.owners()?;
+        accept_with_setup(manager, state, config, Box::new(setup)).await
     }
 
     pub(crate) fn validate_message_connection_config(
         &self,
         config: &RdmaConnectionConfig,
     ) -> Result<()> {
-        let (shared, _) = self.session.owners()?;
-        config.validate(&shared.config, shared.provider.as_ref())
+        let (manager, _) = self.session.owners()?;
+        manager.validate_connection_config(config)
     }
 
     /// Close the listener and wait for CM destruction or engine termination.
@@ -159,11 +157,11 @@ impl RdmaListener {
     }
 
     pub(in crate::v2::engine) fn from_state(
-        shared: &Arc<EngineShared>,
+        manager: &SessionManager,
         state: Arc<ListenerState>,
     ) -> Self {
         Self {
-            session: shared.session.listener_capability(&state),
+            session: manager.listener_capability(&state),
         }
     }
 }
@@ -177,52 +175,48 @@ impl Drop for RdmaListener {
 }
 
 pub(in crate::v2::engine) async fn listen(
-    shared: Arc<EngineShared>,
+    manager: Arc<SessionManager>,
     address: SocketAddr,
     config: RdmaListenerConfig,
 ) -> Result<RdmaListener> {
     config.validate()?;
-    let admission = read_unpoison(&shared.session.admission);
-    if let Some(error) = shared.admission_error() {
+    let admission = read_unpoison(&manager.admission);
+    if let Some(error) = manager.admission_error() {
         return Err(error);
     }
     let request = Arc::new(ListenRequest::new(address, config));
-    shared.session.cm.enqueue_listen(Arc::clone(&request));
+    manager.cm.enqueue_listen(Arc::clone(&request));
     drop(admission);
-    shared
-        .work_signal
-        .publish(super::super::driver::SESSION_WORK);
+    manager.publish_session_work();
     let waiter = ListenWaiter {
-        manager: Arc::downgrade(&shared.session),
+        manager: Arc::downgrade(&manager),
         request: Arc::downgrade(&request),
         observer: Arc::clone(&request.observer),
         finished: false,
     };
     drop(request);
-    drop(shared);
+    drop(manager);
     waiter.await
 }
 
 pub(in crate::v2::engine) async fn accept_with_setup(
-    shared: Arc<EngineShared>,
+    manager: Arc<SessionManager>,
     listener: Arc<ListenerState>,
     config: RdmaConnectionConfig,
     setup: ConnectionSetup,
 ) -> Result<RdmaConnection> {
-    config.validate(&shared.config, shared.provider.as_ref())?;
-    let admission = read_unpoison(&shared.session.admission);
-    if let Some(error) = shared.admission_error() {
+    manager.validate_connection_config(&config)?;
+    let admission = read_unpoison(&manager.admission);
+    if let Some(error) = manager.admission_error() {
         return Err(error);
     }
     let request = Arc::new(AcceptRequest::new(AcceptIntent::new(config, setup)));
     listener.register_waiter(Arc::clone(&request))?;
     drop(admission);
-    shared.session.cm.enqueue_listener_work(&listener);
-    shared
-        .work_signal
-        .publish(super::super::driver::SESSION_WORK);
+    manager.cm.enqueue_listener_work(&listener);
+    manager.publish_session_work();
     let waiter = AcceptWaiter {
-        manager: Arc::downgrade(&shared.session),
+        manager: Arc::downgrade(&manager),
         listener: Arc::downgrade(&listener),
         request: Arc::downgrade(&request),
         observer: Arc::clone(&request.observer),
@@ -230,7 +224,7 @@ pub(in crate::v2::engine) async fn accept_with_setup(
     };
     drop(request);
     drop(listener);
-    drop(shared);
+    drop(manager);
     waiter.await
 }
 
@@ -429,10 +423,8 @@ impl Drop for ListenWaiter {
         if self.request.upgrade().is_none() {
             return;
         }
-        if let Some(engine) = self.manager.upgrade().and_then(|manager| manager.engine()) {
-            engine
-                .work_signal
-                .publish(super::super::driver::SESSION_WORK);
+        if let Some(manager) = self.manager.upgrade() {
+            manager.publish_session_work();
         }
     }
 }
@@ -621,11 +613,7 @@ impl AcceptWaiter {
             return;
         };
         manager.cm.mark_accept_delivered(&listener, &request);
-        if let Some(engine) = manager.engine() {
-            engine
-                .work_signal
-                .publish(super::super::driver::SESSION_WORK);
-        }
+        manager.publish_session_work();
     }
 }
 
@@ -645,11 +633,7 @@ impl Drop for AcceptWaiter {
             return;
         }
         manager.cm.enqueue_listener_work(&listener);
-        if let Some(engine) = manager.engine() {
-            engine
-                .work_signal
-                .publish(super::super::driver::SESSION_WORK);
-        }
+        manager.publish_session_work();
     }
 }
 
@@ -912,22 +896,20 @@ impl ListenerState {
         matches
     }
 
-    pub(in crate::v2::engine) fn request_close(self: &Arc<Self>, shared: &Arc<EngineShared>) {
+    pub(in crate::v2::engine) fn request_close(self: &Arc<Self>, manager: &SessionManager) {
         if !self.closing.swap(true, Ordering::AcqRel) {
-            shared.session.cm.enqueue_listener_work(self);
-            shared
-                .work_signal
-                .publish(super::super::driver::SESSION_WORK);
+            manager.cm.enqueue_listener_work(self);
+            manager.publish_session_work();
         }
     }
 
-    pub(in crate::v2::engine) fn fail(self: &Arc<Self>, shared: &Arc<EngineShared>, error: Error) {
+    pub(in crate::v2::engine) fn fail(self: &Arc<Self>, manager: &SessionManager, error: Error) {
         let mut failure = lock_unpoison(&self.failure);
         if failure.is_none() {
             *failure = Some(error);
         }
         drop(failure);
-        self.request_close(shared);
+        self.request_close(manager);
     }
 
     pub(in crate::v2::engine) fn close_error(&self) -> Error {
@@ -1147,7 +1129,7 @@ mod tests {
             super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
         let baseline_engine_owners = Arc::strong_count(&engine.shared);
         let mut listen_future = Box::pin(listen(
-            Arc::clone(&engine.shared),
+            Arc::clone(&engine.shared.session),
             "127.0.0.1:0".parse().unwrap(),
             RdmaListenerConfig::default(),
         ));
@@ -1163,7 +1145,7 @@ mod tests {
         let listener = ListenerState::test_only(4);
         let baseline_listener_owners = Arc::strong_count(&listener);
         let mut accept_future = Box::pin(accept_with_setup(
-            Arc::clone(&engine.shared),
+            Arc::clone(&engine.shared.session),
             Arc::clone(&listener),
             RdmaConnectionConfig::default(),
             empty_connection_setup(),
@@ -1284,7 +1266,11 @@ mod tests {
         listener.route_selected(&request, 42).unwrap();
         assert!(lock_unpoison(&listener.queues).selected.is_some());
 
-        engine.shared.cm.mark_accept_delivered(&listener, &request);
+        engine
+            .shared
+            .session
+            .cm
+            .mark_accept_delivered(&listener, &request);
         assert!(lock_unpoison(&listener.queues).selected.is_none());
 
         drop(engine);

@@ -85,6 +85,11 @@ impl WorkSignal {
         }
         pending
     }
+
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn register_waker_for_test(&self, waker: &std::task::Waker) {
+        self.waker.register(waker);
+    }
 }
 
 impl RdmaEngineDriver {
@@ -610,7 +615,7 @@ pub(super) mod test_api {
         /// Return copied numeric provider limits without exposing validation internals.
         pub fn provider_limits(&self) -> Result<TestProviderLimits> {
             let shared = self.ensure_active()?;
-            let limits = shared.provider.ok_or_else(|| {
+            let limits = shared.session.provider_limits().ok_or_else(|| {
                 Error::InvalidConfig("engine has no provider limits snapshot".into())
             })?;
             Ok(TestProviderLimits {
@@ -746,7 +751,7 @@ pub(super) mod test_api {
             let local_addr = cm.cm_id().local_addr();
             let peer_addr = cm.cm_id().peer_addr();
             install_connection(
-                &shared,
+                &shared.session,
                 Arc::new(VerbsConnectionResources::new(qp.qp, cm)),
                 config,
                 local_addr,
@@ -1395,7 +1400,7 @@ pub(super) mod test_api {
             for _ in 0..count {
                 let qp_num = self.next_idle_qp()?;
                 connections.push(install_connection(
-                    shared,
+                    &shared.session,
                     Arc::new(TestIdlePoster { qp_num }),
                     RdmaConnectionConfig::default(),
                     None,
@@ -2220,7 +2225,7 @@ mod tests {
                 destroys: AtomicUsize::new(0),
             });
             let connection = install_connection(
-                &engine.shared,
+                &engine.shared.session,
                 poster as Arc<dyn WorkRequestPoster>,
                 RdmaConnectionConfig::default(),
                 None,
@@ -2228,7 +2233,7 @@ mod tests {
             )
             .unwrap();
             install_accepted_operation_for_driver_test(
-                &engine.shared,
+                &engine.shared.io_core,
                 &connection.state,
                 crate::wc::WcOpcode::Send,
             );
@@ -2375,7 +2380,7 @@ mod tests {
                     destroys: AtomicUsize::new(0),
                 });
                 let connection = install_connection(
-                    &engine.shared,
+                    &engine.shared.session,
                     Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
                     RdmaConnectionConfig::default(),
                     None,
@@ -2388,7 +2393,7 @@ mod tests {
                     crate::wc::WcOpcode::Send
                 };
                 let operation = install_accepted_operation_for_driver_test(
-                    &engine.shared,
+                    &engine.shared.io_core,
                     &connection.state,
                     expected,
                 );
@@ -2402,7 +2407,6 @@ mod tests {
                     completion_for_driver_test(operation, poster.qp_num, opcode, status),
                 );
                 engine.shared.session.schedule_deadline(
-                    &engine.shared.work_signal,
                     super::super::scheduler::DeadlineKind::ConnectionDrain,
                     connection.state.token.encode(),
                     Duration::ZERO,
@@ -2533,7 +2537,7 @@ mod tests {
 
             assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
             assert_eq!(driver.io_progress.completion_connection_count(), 0);
-            assert!(!shared.has_published_completions());
+            assert!(!shared.io_core.has_published_connections());
 
             drop(connections);
             drop(driver);
@@ -2577,10 +2581,11 @@ mod tests {
         let destroy_count = Arc::new(AtomicUsize::new(0));
         engine
             .shared
+            .session
             .cm
             .defer_test_listener_destruction(Arc::clone(&state), Arc::clone(&destroy_count));
         (
-            RdmaListener::from_state(&engine.shared, state),
+            RdmaListener::from_state(&engine.shared.session, state),
             destroy_count,
         )
     }
@@ -2616,7 +2621,7 @@ mod tests {
         assert_terminal_close(&mut close, &mut cx, &terminal);
         assert_eq!(counter.count(), 1);
         assert_eq!(destroy_count.load(Ordering::Acquire), 0);
-        assert_eq!(engine.shared.cm.retained_owner_count(), 1);
+        assert_eq!(engine.shared.session.cm.retained_owner_count(), 1);
     }
 
     #[test]
@@ -2654,7 +2659,7 @@ mod tests {
         assert_terminal_close(&mut close, &mut cx, &terminal);
         assert_eq!(counter.count(), 1);
         assert_eq!(destroy_count.load(Ordering::Acquire), 0);
-        assert_eq!(engine.shared.cm.retained_owner_count(), 1);
+        assert_eq!(engine.shared.session.cm.retained_owner_count(), 1);
 
         drop(driver);
         assert_eq!(counter.count(), 1, "driver drop must not finish twice");

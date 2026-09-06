@@ -45,8 +45,6 @@ mod session;
 #[cfg(test)]
 mod api_tests;
 
-#[cfg(test)]
-use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
@@ -312,7 +310,7 @@ impl RdmaEngine {
     /// posts a receive.
     pub async fn connect(&self, address: std::net::SocketAddr) -> Result<RdmaConnection> {
         session::cm::connect(
-            Arc::clone(&self.shared),
+            Arc::clone(&self.shared.session),
             address,
             RdmaConnectionConfig::default(),
         )
@@ -329,7 +327,7 @@ impl RdmaEngine {
         address: std::net::SocketAddr,
         config: RdmaConnectionConfig,
     ) -> Result<RdmaConnection> {
-        session::cm::connect(Arc::clone(&self.shared), address, config).await
+        session::cm::connect(Arc::clone(&self.shared.session), address, config).await
     }
 
     pub(crate) async fn connect_with_io_setup<F>(
@@ -341,15 +339,20 @@ impl RdmaEngine {
     where
         F: FnOnce(io::IoConnection, io::IoEventReceiver) -> Result<usize> + Send + 'static,
     {
-        session::cm::connect_with_setup(Arc::clone(&self.shared), address, config, Box::new(setup))
-            .await
+        session::cm::connect_with_setup(
+            Arc::clone(&self.shared.session),
+            address,
+            config,
+            Box::new(setup),
+        )
+        .await
     }
 
     pub(crate) fn validate_message_connection_config(
         &self,
         config: &RdmaConnectionConfig,
     ) -> Result<()> {
-        config.validate(&self.shared.config, self.shared.provider.as_ref())
+        self.shared.session.validate_connection_config(config)
     }
 
     /// Bind an engine-owned listener on the shared CM event channel.
@@ -365,7 +368,7 @@ impl RdmaEngine {
         address: std::net::SocketAddr,
         config: RdmaListenerConfig,
     ) -> Result<RdmaListener> {
-        session::listener::listen(Arc::clone(&self.shared), address, config).await
+        session::listener::listen(Arc::clone(&self.shared.session), address, config).await
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -432,7 +435,6 @@ pub struct RdmaEngineDriver {
 
 struct EngineShared {
     config: EngineConfig,
-    provider: Option<config::ProviderLimits>,
     // This engine-owned core retain drops before the root resources below.
     // Operation futures may extend the Arc, but each MR anchors its PD and an
     // engine with accepted work is retained fail-closed.
@@ -456,7 +458,86 @@ struct EngineShared {
     // Rust drops fields in declaration order. Keep this root retain after every
     // registry/test owner so quarantined QP/CM/MR descendants are released
     // before the shared CQ, PD, CM event channel, and context can disappear.
+    #[allow(
+        dead_code,
+        reason = "retains canonical device resources through root teardown ordering"
+    )]
     resource_refs: Option<EngineResourceRefs>,
+}
+
+/// Weak, owner-neutral access from session progress to engine-wide runtime state.
+///
+/// The capability deliberately excludes I/O registries, session registries,
+/// provider resources, and lifecycle authority. `SessionManager` can observe
+/// or publish global composition state without recovering `EngineShared`.
+trait SessionEngineRuntime: Send + Sync {
+    fn admission_error(&self) -> Option<Error>;
+
+    fn outcome(&self) -> Option<MemoizedTerminalResult>;
+
+    fn shutdown_requested(&self) -> bool;
+
+    fn pending_terminal_outcome(&self) -> Option<MemoizedTerminalResult>;
+
+    fn begin_driver_failure(&self, error: Error);
+
+    fn shutdown_deadline_failure(&self) -> Option<Error>;
+
+    fn publish_io_work(&self);
+
+    fn publish_session_work(&self);
+}
+
+impl SessionEngineRuntime for EngineShared {
+    fn admission_error(&self) -> Option<Error> {
+        EngineShared::admission_error(self)
+    }
+
+    fn outcome(&self) -> Option<MemoizedTerminalResult> {
+        EngineShared::outcome(self)
+    }
+
+    fn shutdown_requested(&self) -> bool {
+        self.shutdown_requested.load(Ordering::Acquire)
+    }
+
+    fn pending_terminal_outcome(&self) -> Option<MemoizedTerminalResult> {
+        EngineShared::pending_terminal_outcome(self)
+    }
+
+    fn begin_driver_failure(&self, error: Error) {
+        EngineShared::begin_driver_failure(self, error);
+    }
+
+    fn shutdown_deadline_failure(&self) -> Option<Error> {
+        EngineShared::shutdown_deadline_failure(self)
+    }
+
+    fn publish_io_work(&self) {
+        self.work_signal.publish(driver::IO_WORK);
+    }
+
+    fn publish_session_work(&self) {
+        self.work_signal.publish(driver::SESSION_WORK);
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Clone)]
+struct SessionTestInstrumentation {
+    driver: Arc<driver::test_api::TestDriverState>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl SessionTestInstrumentation {
+    fn pause_connect_before_enqueue(&self) {
+        self.driver
+            .pause_admission(driver::test_api::AdmissionPausePoint::ConnectBeforeEnqueue);
+    }
+
+    fn take_setup_rollback_failure(&self) -> Option<driver::test_api::SetupRollbackFailure> {
+        self.driver.take_setup_rollback_failure()
+    }
 }
 
 struct EngineIoDriverSignal {
@@ -489,22 +570,12 @@ impl IoDriverSignal for EngineIoDriverSignal {
     }
 }
 
-#[cfg(test)]
-impl Deref for EngineShared {
-    // Session state is physically owned by SessionManager. Existing internal
-    // modules are migrated receiver-by-receiver without re-exposing those
-    // fields on the composition root.
-    type Target = SessionManager;
-
-    fn deref(&self) -> &Self::Target {
-        &self.session
-    }
-}
-
 impl EngineShared {
     fn into_shared(self) -> Arc<Self> {
         let shared = Arc::new(self);
-        shared.session.bind_engine(&shared);
+        shared.session.bind_self();
+        let session_runtime: Arc<dyn SessionEngineRuntime> = shared.clone();
+        shared.session.bind_engine(&session_runtime);
         let session_bridge: Arc<dyn IoSessionBridge> = shared.session.clone();
         shared.io_core.bind_session_bridge(&session_bridge);
         shared
@@ -517,6 +588,7 @@ impl EngineShared {
     ) -> Result<Self> {
         let admission = Arc::new(RwLock::new(()));
         let work_signal = Arc::new(WorkSignal::new());
+        let memory = io::MemoryRegistrar::from_resources(resource_refs.as_ref());
         #[cfg(any(test, feature = "test-hooks"))]
         let test_driver = Arc::new(driver::test_api::TestDriverState::new());
         let io_driver_signal: Arc<dyn IoDriverSignal> = Arc::new(EngineIoDriverSignal {
@@ -533,14 +605,19 @@ impl EngineShared {
             io_driver_signal,
         )?;
         let session = Arc::new(SessionManager::new(
-            config.max_live_connections,
+            config::SessionConfig::from(&config),
+            provider,
             Arc::clone(&admission),
             Arc::clone(&io_core),
+            memory,
             qp_reclaim,
+            #[cfg(any(test, feature = "test-hooks"))]
+            SessionTestInstrumentation {
+                driver: Arc::clone(&test_driver),
+            },
         )?);
         Ok(Self {
             config,
-            provider,
             io_core,
             session,
             lifecycle: AtomicU8::new(lifecycle_to_u8(RdmaEngineLifecycle::Created)),
@@ -568,7 +645,7 @@ impl EngineShared {
             .shutdown_deadline_scheduled
             .swap(true, Ordering::AcqRel)
         {
-            self.schedule_deadline(
+            self.session.schedule_deadline(
                 DeadlineKind::EngineShutdown,
                 0,
                 self.config.shutdown_deadline,
@@ -617,7 +694,7 @@ impl EngineShared {
             (io_effects, connections_to_wake)
         };
 
-        self.session.apply_io_effects(self, &mut io_effects);
+        self.session.apply_io_effects(&mut io_effects);
         self.session.terminalize_cm(&outcome);
         for connection in &connections_to_wake {
             if outcome.is_error() && connection.retain_bundle_for_engine_failure() {
@@ -832,68 +909,6 @@ impl EngineShared {
             quarantined_bytes: io.quarantined_bytes,
             quarantined_connections: connection_counts.quarantined_bundles,
         }
-    }
-
-    #[cfg(test)]
-    fn register_memory(&self, len: usize, access: super::AccessIntent) -> Result<super::Mr> {
-        if len == 0 || u32::try_from(len).is_err() {
-            return Err(Error::InvalidConfig(
-                "engine MR length must be in 1..=u32::MAX".into(),
-            ));
-        }
-        let resources = self.resource_refs.as_ref().ok_or_else(|| {
-            Error::InvalidConfig("engine shared protection domain is unavailable".into())
-        })?;
-        resources.pd.reg_mr(len, access)
-    }
-
-    #[cfg(test)]
-    fn has_published_completions(&self) -> bool {
-        self.io_core.has_published_connections()
-    }
-
-    fn schedule_deadline(&self, kind: DeadlineKind, token: u64, after: Duration) {
-        self.session
-            .schedule_deadline(&self.work_signal, kind, token, after);
-    }
-
-    #[cfg(test)]
-    fn apply_io_effects(&self, effects: &mut io_core::IoCoreEffects) {
-        self.session.apply_io_effects(self, effects);
-    }
-
-    #[cfg(test)]
-    pub(super) fn enqueue_completion(
-        &self,
-        completion: crate::wc::WorkCompletion,
-    ) -> Option<registry::ConnectionToken> {
-        self.session.enqueue_completion(completion)
-    }
-
-    #[cfg(test)]
-    pub(super) fn dispatch_connection_completions(
-        &self,
-        token: registry::ConnectionToken,
-        quantum: usize,
-    ) -> (usize, bool) {
-        self.session
-            .dispatch_connection_completions(self, token, quantum)
-    }
-
-    #[cfg(test)]
-    pub(super) fn reclaim_after_qp_destroy(
-        &self,
-        proof: &session::QpDestructionProof,
-        connection: &session::connection::ConnectionState,
-        token: registry::OperationToken,
-    ) -> bool {
-        self.session
-            .reclaim_after_qp_destroy_for_test(self, proof, connection, token)
-    }
-
-    #[cfg(test)]
-    pub(super) fn handle_reclamation_deadline(&self, token: registry::OperationToken) {
-        self.session.handle_reclamation_deadline(self, token);
     }
 }
 

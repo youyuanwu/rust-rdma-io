@@ -8,9 +8,11 @@ use std::task::Waker;
 
 use futures_util::task::AtomicWaker;
 
+#[cfg(test)]
 use super::EngineShared;
 use super::io_core::{self, EstablishedIoConnection, IoCore};
 use super::registry::{OperationToken, lock_unpoison};
+use super::resources::EngineResourceRefs;
 use super::session::SessionConnection;
 #[cfg(test)]
 use super::session::connection::ConnectionState;
@@ -25,12 +27,9 @@ pub(super) struct MemoryRegistrar {
 }
 
 impl MemoryRegistrar {
-    pub(super) fn from_engine(shared: &EngineShared) -> Self {
+    pub(super) fn from_resources(resources: Option<&EngineResourceRefs>) -> Self {
         Self {
-            pd: shared
-                .resource_refs
-                .as_ref()
-                .map(|resources| resources.pd.clone()),
+            pd: resources.map(|resources| resources.pd.clone()),
         }
     }
 
@@ -60,7 +59,7 @@ pub(crate) struct IoConnection {
 impl IoConnection {
     #[cfg(test)]
     pub(super) fn new(
-        shared: Arc<EngineShared>,
+        manager: &super::session::SessionManager,
         connection: Arc<ConnectionState>,
     ) -> Result<(Self, IoEventReceiver)> {
         let (events, receiver) = event_port();
@@ -70,10 +69,10 @@ impl IoConnection {
         }
         Ok((
             Self {
-                io_core: Arc::clone(&shared.io_core),
+                io_core: Arc::clone(&manager.io_core),
                 io: Arc::clone(&connection.io),
-                memory: MemoryRegistrar::from_engine(&shared),
-                session: shared.session.connection_capability(&connection),
+                memory: manager.memory_registrar(),
+                session: manager.connection_capability(&connection),
                 events,
             },
             receiver,

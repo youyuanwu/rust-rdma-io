@@ -1,20 +1,16 @@
 //! Exact accepted-WR connection drain and quarantine lifecycle.
 
 use std::sync::Arc;
+#[cfg(test)]
 use std::sync::atomic::Ordering;
 
-use super::super::EngineShared;
 use super::super::registry::{ConnectionToken, Lookup, read_unpoison};
 use super::super::scheduler::DeadlineKind;
 use super::SessionManager;
 use super::connection::ConnectionState;
 
 impl SessionManager {
-    pub(crate) fn begin_connection_close(
-        &self,
-        shared: &EngineShared,
-        connection: &Arc<ConnectionState>,
-    ) {
+    pub(crate) fn begin_connection_close(&self, connection: &Arc<ConnectionState>) {
         if connection.is_retired() {
             return;
         }
@@ -22,24 +18,26 @@ impl SessionManager {
         let lifecycle = connection.lock_lifecycle();
         let first = connection.begin_close();
         let mut close_effects = None;
+        let mut publish_io_work = false;
         if first {
             match self.transition_connection_to_error(connection) {
                 Ok(_) => {}
                 Err(error) => {
-                    let event = connection.mark_cm_failure(error.clone());
+                    let event = connection.record_cm_failure(error.clone());
                     connection.rollback_draining_count();
                     drop(lifecycle);
                     drop(admission);
                     if let Some(event) = event {
                         event.deliver();
                     }
-                    shared.begin_driver_failure(error);
+                    connection.wake_close();
+                    self.begin_driver_failure(error);
                     return;
                 }
             }
-            shared.work_signal.publish(super::super::driver::IO_WORK);
+            publish_io_work = true;
 
-            let engine_is_terminating = shared.shutdown_requested.load(Ordering::Acquire);
+            let engine_is_terminating = self.shutdown_requested();
             if !engine_is_terminating {
                 let error = connection.operation_close_error();
                 let report = connection.io_drain_report();
@@ -51,20 +49,23 @@ impl SessionManager {
         }
         drop(lifecycle);
         drop(admission);
+        if publish_io_work {
+            self.publish_io_work();
+        }
         if let Some(effects) = close_effects {
             effects.publish();
         }
         if first {
-            self.schedule_connection_drain(shared, connection.token);
+            self.schedule_connection_drain(connection.token);
         }
         if connection.accepted_count() == 0 {
             self.record_connection_drained(connection);
-            self.schedule_connection_retirement(shared, connection);
+            self.schedule_connection_retirement(connection);
         }
     }
 
     #[cfg(test)]
-    pub(in crate::v2::engine) fn begin_all_connection_close(&self, shared: &EngineShared) {
+    pub(in crate::v2::engine) fn begin_all_connection_close(&self) {
         if self
             .shutdown_connection_close_started
             .swap(true, Ordering::AcqRel)
@@ -72,13 +73,12 @@ impl SessionManager {
             return;
         }
         for connection in self.connections.occupied() {
-            self.begin_connection_close(shared, &connection);
+            self.begin_connection_close(&connection);
         }
     }
 
     pub(in crate::v2::engine) fn schedule_connection_retirement(
         &self,
-        shared: &EngineShared,
         connection: &ConnectionState,
     ) {
         if connection.is_retired()
@@ -89,25 +89,18 @@ impl SessionManager {
             return;
         }
         self.cm.enqueue_retirement(connection.token);
-        shared
-            .work_signal
-            .publish(super::super::driver::SESSION_WORK);
+        self.publish_session_work();
     }
 
-    fn schedule_connection_drain(&self, shared: &EngineShared, token: ConnectionToken) {
+    fn schedule_connection_drain(&self, token: ConnectionToken) {
         self.schedule_deadline(
-            &shared.work_signal,
             DeadlineKind::ConnectionDrain,
             token.encode(),
-            shared.config.connection_drain_deadline,
+            self.config.connection_drain_deadline,
         );
     }
 
-    pub(in crate::v2::engine) fn handle_connection_drain_deadline(
-        &self,
-        shared: &EngineShared,
-        token: ConnectionToken,
-    ) {
+    pub(in crate::v2::engine) fn handle_connection_drain_deadline(&self, token: ConnectionToken) {
         let Lookup::Occupied(connection) = self.connections.lookup(token) else {
             return;
         };
@@ -116,7 +109,6 @@ impl SessionManager {
         if connection.has_copied_completions() {
             self.io_core.publish_connection(&connection.io);
             self.schedule_deadline(
-                &shared.work_signal,
                 DeadlineKind::ConnectionDrain,
                 token.encode(),
                 std::time::Duration::ZERO,
@@ -144,11 +136,10 @@ impl SessionManager {
             }
         };
         if let Some((tokens, proof)) = forced_tokens {
-            self.reclaim_after_qp_destroy(shared, proof, &connection, tokens);
-            if self.reject_queued_completions_after_qp_destroy(shared, &connection) {
+            self.reclaim_after_qp_destroy(proof, &connection, tokens);
+            if self.reject_queued_completions_after_qp_destroy(&connection) {
                 self.io_core.publish_connection(&connection.io);
                 self.schedule_deadline(
-                    &shared.work_signal,
                     DeadlineKind::ConnectionDrain,
                     token.encode(),
                     std::time::Duration::ZERO,
@@ -159,7 +150,7 @@ impl SessionManager {
         if let Some(report) = connection.begin_quarantine() {
             self.track_connection_quarantine(connection.token);
             for operation in connection.accepted_tokens() {
-                self.quarantine_operation(shared, operation);
+                self.quarantine_operation(operation);
             }
             if let Some(event) =
                 connection.publish_quarantine(report.outstanding_operations, report.cq_debt)
@@ -170,7 +161,7 @@ impl SessionManager {
         if connection.close_started() && connection.accepted_count() == 0 {
             self.recover_connection_quarantine(&connection);
             self.record_connection_drained(&connection);
-            self.schedule_connection_retirement(shared, &connection);
+            self.schedule_connection_retirement(&connection);
         }
     }
 
@@ -198,36 +189,6 @@ impl SessionManager {
 }
 
 #[cfg(test)]
-impl EngineShared {
-    pub(in crate::v2::engine) fn begin_all_connection_close(&self) {
-        self.session.begin_all_connection_close(self);
-    }
-
-    pub(in crate::v2::engine) fn schedule_connection_retirement(
-        &self,
-        connection: &ConnectionState,
-    ) {
-        self.session
-            .schedule_connection_retirement(self, connection);
-    }
-
-    pub(in crate::v2::engine) fn handle_connection_drain_deadline(&self, token: ConnectionToken) {
-        self.session.handle_connection_drain_deadline(self, token);
-    }
-
-    pub(in crate::v2::engine) fn recover_connection_quarantine(
-        &self,
-        connection: &ConnectionState,
-    ) {
-        self.session.recover_connection_quarantine(connection);
-    }
-
-    pub(in crate::v2::engine) fn record_connection_drained(&self, connection: &ConnectionState) {
-        self.session.record_connection_drained(connection);
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use std::future::Future;
     use std::pin::Pin;
@@ -245,6 +206,25 @@ mod tests {
     use crate::v2::error::{Error, Result};
     use crate::v2::qp::{BatchPostOutcome, QpCapabilities};
     use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
+    use futures_util::task::{ArcWake, waker};
+
+    struct GuardCheckingWaker {
+        session: Arc<super::super::SessionManager>,
+        connection: Arc<super::super::connection::ConnectionState>,
+        wakes: AtomicUsize,
+        lock_failures: AtomicUsize,
+    }
+
+    impl ArcWake for GuardCheckingWaker {
+        fn wake_by_ref(arc_self: &Arc<Self>) {
+            arc_self.wakes.fetch_add(1, Ordering::AcqRel);
+            let admission_unlocked = arc_self.session.admission.try_write().is_ok();
+            let lifecycle_unlocked = arc_self.connection.lifecycle_unlocked_for_test();
+            if !(admission_unlocked && lifecycle_unlocked) {
+                arc_self.lock_failures.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    }
 
     struct TestPoster {
         qp_num: u32,
@@ -333,7 +313,7 @@ mod tests {
         let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
         let poster = TestPoster::failing(19);
         let connection = install_connection(
-            &engine.shared,
+            &engine.shared.session,
             poster,
             RdmaConnectionConfig::default(),
             None,
@@ -342,7 +322,15 @@ mod tests {
         .unwrap();
         let mut close = Box::pin(connection.close());
         assert!(poll_once(close.as_mut()).is_pending());
-        assert_eq!(engine.shared.connection_admission.snapshot().draining, 0);
+        assert_eq!(
+            engine
+                .shared
+                .session
+                .connection_admission
+                .snapshot()
+                .draining,
+            0
+        );
 
         let driver_error = loop {
             match poll_once(Pin::new(&mut driver)) {
@@ -356,16 +344,125 @@ mod tests {
         };
         assert!(matches!(driver_error, Error::Verbs(_)));
         assert_eq!(close_error.to_string(), driver_error.to_string());
-        assert_eq!(engine.shared.connection_admission.snapshot().draining, 0);
+        assert_eq!(
+            engine
+                .shared
+                .session
+                .connection_admission
+                .snapshot()
+                .draining,
+            0
+        );
         assert_eq!(engine.diagnostics().live_connections, 1);
         assert_eq!(engine.diagnostics().lifecycle, RdmaEngineLifecycle::Failed);
         drop(driver);
+    }
+
+    #[test]
+    fn failed_error_transition_wakes_close_waiter_after_guards_drop() {
+        let (engine, _driver) = test_engine_pair(CompletionMode::Polling);
+        let connection = install_connection(
+            &engine.shared.session,
+            TestPoster::failing(21),
+            RdmaConnectionConfig::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let reentrant = Arc::new(GuardCheckingWaker {
+            session: Arc::clone(&engine.shared.session),
+            connection: Arc::clone(&connection.state),
+            wakes: AtomicUsize::new(0),
+            lock_failures: AtomicUsize::new(0),
+        });
+        let task_waker = waker(Arc::clone(&reentrant));
+        let notify = connection.state.close_state().notify();
+        let mut notified = Box::pin(notify.notified());
+        assert!(
+            notified
+                .as_mut()
+                .poll(&mut Context::from_waker(&task_waker))
+                .is_pending()
+        );
+
+        engine
+            .shared
+            .session
+            .begin_connection_close(&connection.state);
+
+        assert!(
+            reentrant.wakes.load(Ordering::Acquire) >= 1,
+            "failed transition must wake the registered close waiter"
+        );
+        assert_eq!(
+            reentrant.lock_failures.load(Ordering::Acquire),
+            0,
+            "transition-failure wake must run after admission and lifecycle guards drop"
+        );
+        assert_eq!(
+            engine
+                .shared
+                .session
+                .connection_admission
+                .snapshot()
+                .draining,
+            0,
+            "failed transition must still roll back the draining gauge"
+        );
+        assert!(matches!(
+            connection
+                .state
+                .close_state()
+                .raw_outcome()
+                .unwrap()
+                .into_result(),
+            Err(Error::Verbs(_))
+        ));
     }
 
     fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
         let waker = futures_util::task::noop_waker();
         let mut context = Context::from_waker(&waker);
         future.poll(&mut context)
+    }
+
+    #[test]
+    fn connection_close_wakes_driver_after_admission_and_lifecycle_guards_drop() {
+        let (engine, _driver) = test_engine_pair(CompletionMode::Readiness);
+        let connection = install_connection(
+            &engine.shared.session,
+            TestPoster::new(20),
+            RdmaConnectionConfig::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let reentrant = Arc::new(GuardCheckingWaker {
+            session: Arc::clone(&engine.shared.session),
+            connection: Arc::clone(&connection.state),
+            wakes: AtomicUsize::new(0),
+            lock_failures: AtomicUsize::new(0),
+        });
+        let task_waker = waker(Arc::clone(&reentrant));
+        engine
+            .shared
+            .work_signal
+            .register_waker_for_test(&task_waker);
+
+        engine
+            .shared
+            .session
+            .begin_connection_close(&connection.state);
+
+        assert!(
+            reentrant.wakes.load(Ordering::Acquire) >= 1,
+            "connection close must publish I/O work to the registered driver waker"
+        );
+        assert_eq!(
+            reentrant.lock_failures.load(Ordering::Acquire),
+            0,
+            "connection-close publication must run after admission and lifecycle guards drop"
+        );
     }
 
     fn install_accepted_connection(
@@ -379,7 +476,7 @@ mod tests {
         let poster = TestPoster::new(qp_num);
         let poster_dyn: Arc<dyn WorkRequestPoster> = poster.clone();
         let connection = install_connection(
-            &engine.shared,
+            &engine.shared.session,
             poster_dyn,
             RdmaConnectionConfig::default(),
             None,
@@ -393,6 +490,7 @@ mod tests {
         connection.state.add_accepted(token);
         engine
             .shared
+            .io_core
             .accepted_operations
             .fetch_add(1, Ordering::AcqRel);
         (connection, poster, token)
@@ -426,6 +524,7 @@ mod tests {
         assert_eq!(
             engine
                 .shared
+                .session
                 .connection_admission
                 .snapshot()
                 .registered_live_qps,
@@ -440,27 +539,35 @@ mod tests {
         assert!(connection.state.remove_accepted(token));
         engine
             .shared
+            .io_core
             .accepted_operations
             .fetch_sub(1, Ordering::AcqRel);
         engine
             .shared
+            .session
             .recover_connection_quarantine(&connection.state);
         assert_eq!(
             engine
                 .shared
+                .session
                 .connection_admission
                 .snapshot()
                 .registered_live_qps,
             0
         );
-        engine.shared.record_connection_drained(&connection.state);
         engine
             .shared
+            .session
+            .record_connection_drained(&connection.state);
+        engine
+            .shared
+            .session
             .schedule_connection_retirement(&connection.state);
         engine
             .shared
+            .session
             .cm
-            .service_software(&engine.shared, None, 32)
+            .service_software(&engine.shared.session, None, 32)
             .unwrap();
         assert_eq!(poster.destroys.load(Ordering::Acquire), 1);
 
@@ -489,7 +596,7 @@ mod tests {
         let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
         let poster = TestPoster::destroy_failing(23);
         let connection = install_connection(
-            &engine.shared,
+            &engine.shared.session,
             Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
             RdmaConnectionConfig::default(),
             None,
@@ -497,7 +604,7 @@ mod tests {
         )
         .unwrap();
         install_accepted_operation_for_driver_test(
-            &engine.shared,
+            &engine.shared.io_core,
             &connection.state,
             crate::wc::WcOpcode::Recv,
         );
@@ -532,7 +639,7 @@ mod tests {
         let (engine, _driver) = test_engine_pair(CompletionMode::Polling);
         let poster = TestPoster::new(24);
         let connection = install_connection(
-            &engine.shared,
+            &engine.shared.session,
             Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
             RdmaConnectionConfig::default(),
             None,
@@ -540,7 +647,11 @@ mod tests {
         )
         .unwrap();
         for opcode in [crate::wc::WcOpcode::Send, crate::wc::WcOpcode::Recv] {
-            install_accepted_operation_for_driver_test(&engine.shared, &connection.state, opcode);
+            install_accepted_operation_for_driver_test(
+                &engine.shared.io_core,
+                &connection.state,
+                opcode,
+            );
         }
         let anomalous = OperationToken {
             slot: u32::MAX,
@@ -549,6 +660,7 @@ mod tests {
         connection.state.add_accepted(anomalous);
         engine
             .shared
+            .io_core
             .accepted_operations
             .fetch_add(1, Ordering::AcqRel);
         connection.state.begin_close();
@@ -560,6 +672,7 @@ mod tests {
 
         engine
             .shared
+            .session
             .handle_connection_drain_deadline(connection.state.token);
 
         let diagnostics = engine.diagnostics();

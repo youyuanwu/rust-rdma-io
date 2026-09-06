@@ -59,10 +59,6 @@ pub(super) trait IoDriverSignal: Send + Sync {
 ///
 /// The I/O side never receives a concrete session manager, registry, lifecycle
 /// authority, or resource bundle through this boundary.
-#[allow(
-    dead_code,
-    reason = "bound before I/O progress migrates in the next phase"
-)]
 pub(super) trait IoSessionBridge: Send + Sync {
     fn route_completion(&self, completion: WorkCompletion) -> Option<ConnectionToken>;
 
@@ -413,10 +409,6 @@ impl IoCore {
             .unwrap_or_else(|_| panic!("IoCore is bound to exactly one IoSessionBridge"));
     }
 
-    #[allow(
-        dead_code,
-        reason = "used when I/O progress migrates in the next phase"
-    )]
     pub(super) fn session_bridge(&self) -> Option<Arc<dyn IoSessionBridge>> {
         self.session_bridge.get().and_then(Weak::upgrade)
     }

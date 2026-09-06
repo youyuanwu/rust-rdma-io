@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
 use self::qp::QpCapabilitiesExt;
+use super::super::RdmaConnectionConfig;
 use super::super::io::{IoEventSender, IoTerminalEvent, MemoryRegistrar, PendingIoEvent};
 #[cfg(test)]
 use super::super::io_core::Direction;
@@ -17,8 +18,7 @@ use super::super::io_core::{
 };
 use super::super::lifecycle::MemoizedTerminalResult;
 use super::super::registry::{ConnectionToken, OperationToken, lock_unpoison, read_unpoison};
-use super::super::{EngineShared, RdmaConnectionConfig};
-use super::{SessionCloseState, SessionConnection, SessionLifecycleAuthority};
+use super::{SessionCloseState, SessionConnection, SessionLifecycleAuthority, SessionManager};
 use crate::cm::{CmId, ConnParam, EventChannel};
 use crate::v2::error::{Error, Result};
 use crate::v2::mr::{AccessIntent, Mr, RemoteMr};
@@ -74,8 +74,6 @@ impl RdmaConnectionIdentity {
 /// zero initial receives.
 pub struct RdmaConnection {
     #[cfg(test)]
-    pub(in crate::v2::engine) shared: Arc<EngineShared>,
-    #[cfg(test)]
     pub(in crate::v2::engine) state: Arc<ConnectionState>,
     #[cfg(not(test))]
     state: Weak<ConnectionState>,
@@ -94,8 +92,6 @@ impl Clone for RdmaConnection {
             state.frontend_count.fetch_add(1, Ordering::Relaxed);
         }
         Self {
-            #[cfg(test)]
-            shared: Arc::clone(&self.shared),
             #[cfg(test)]
             state: Arc::clone(&self.state),
             #[cfg(not(test))]
@@ -260,7 +256,7 @@ impl RdmaConnection {
     }
 
     fn from_registered(
-        shared: &Arc<EngineShared>,
+        manager: &SessionManager,
         state: Arc<ConnectionState>,
         session: SessionConnection,
     ) -> Self {
@@ -270,14 +266,12 @@ impl RdmaConnection {
         let io = Arc::clone(&state.io);
         Self {
             #[cfg(test)]
-            shared: Arc::clone(shared),
-            #[cfg(test)]
             state: Arc::clone(&state),
             #[cfg(not(test))]
             state: Arc::downgrade(&state),
-            io_core: Arc::clone(&shared.io_core),
+            io_core: Arc::clone(&manager.io_core),
             io,
-            memory: MemoryRegistrar::from_engine(shared),
+            memory: manager.memory_registrar(),
             session,
             local_addr,
             peer_addr,
@@ -294,7 +288,7 @@ pub(in crate::v2::engine) struct ConnectionState {
     local_addr: Option<SocketAddr>,
     peer_addr: Option<SocketAddr>,
     // Nested lifecycle synchronization always follows:
-    // EngineShared::admission -> lifecycle_gate -> posting_gate.
+    // SessionManager::admission -> lifecycle_gate -> posting_gate.
     lifecycle_gate: Mutex<()>,
     close_started: AtomicBool,
     close: Arc<SessionCloseState>,
@@ -462,6 +456,11 @@ impl ConnectionState {
         lock_unpoison(&self.lifecycle_gate)
     }
 
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn lifecycle_unlocked_for_test(&self) -> bool {
+        self.lifecycle_gate.try_lock().is_ok()
+    }
+
     pub(in crate::v2::engine) fn finalize_engine(
         &self,
         authority: &SessionLifecycleAuthority,
@@ -485,15 +484,20 @@ impl ConnectionState {
         self.pending_io_event(IoTerminalEvent::Disconnected)
     }
 
-    pub(in crate::v2::engine) fn mark_cm_failure(&self, error: Error) -> Option<PendingIoEvent> {
+    pub(in crate::v2::engine) fn record_cm_failure(&self, error: Error) -> Option<PendingIoEvent> {
         self.stop_posting();
         let mut outcome = lock_unpoison(&self.close.outcome);
         if outcome.is_none() {
             *outcome = Some(MemoizedTerminalResult::from_error(error.clone()));
         }
         drop(outcome);
-        self.close.notify_waiters();
         self.pending_io_event(IoTerminalEvent::Terminal(error))
+    }
+
+    pub(in crate::v2::engine) fn mark_cm_failure(&self, error: Error) -> Option<PendingIoEvent> {
+        let event = self.record_cm_failure(error);
+        self.wake_close();
+        event
     }
 
     pub(in crate::v2::engine) fn transition_to_error_once(
@@ -1474,16 +1478,16 @@ impl WorkRequestPoster for VerbsConnectionResources {
     reason = "used by the test-only external-CM connection installer"
 )]
 pub(crate) fn install_connection(
-    shared: &Arc<EngineShared>,
+    manager: &SessionManager,
     poster: Arc<dyn WorkRequestPoster>,
     config: RdmaConnectionConfig,
     local_addr: Option<SocketAddr>,
     peer_addr: Option<SocketAddr>,
 ) -> Result<RdmaConnection> {
-    config.validate(&shared.config, shared.provider.as_ref())?;
-    let (admission, reservation) = reserve_connection(shared)?;
+    manager.validate_connection_config(&config)?;
+    let (admission, reservation) = reserve_connection(manager)?;
     let connection = install_reserved_connection(
-        shared,
+        manager,
         poster,
         config,
         local_addr,
@@ -1497,10 +1501,7 @@ pub(crate) fn install_connection(
         Err(failure) => {
             let (error, resources) = failure.into_parts();
             if let FailedConnectionInstallResources::Registered(connection) = resources {
-                let _ = shared
-                    .session
-                    .connections
-                    .release_unindexed(connection.token);
+                let _ = manager.connections.release_unindexed(connection.token);
                 connection.release_admission();
             }
             Err(error)
@@ -1509,14 +1510,13 @@ pub(crate) fn install_connection(
 }
 
 pub(in crate::v2::engine) fn reserve_connection(
-    shared: &Arc<EngineShared>,
+    manager: &SessionManager,
 ) -> Result<(RwLockReadGuard<'_, ()>, ConnectionReservation)> {
-    let admission = read_unpoison(&shared.session.admission);
-    if let Some(error) = shared.admission_error() {
+    let admission = read_unpoison(&manager.admission);
+    if let Some(error) = manager.admission_error() {
         return Err(error);
     }
-    let reservation = shared
-        .session
+    let reservation = manager
         .connection_admission
         .try_acquire()
         .ok_or(Error::CapacityExhausted)?;
@@ -1524,7 +1524,7 @@ pub(in crate::v2::engine) fn reserve_connection(
 }
 
 pub(in crate::v2::engine) fn install_reserved_connection(
-    shared: &Arc<EngineShared>,
+    manager: &SessionManager,
     poster: Arc<dyn WorkRequestPoster>,
     config: RdmaConnectionConfig,
     local_addr: Option<SocketAddr>,
@@ -1532,7 +1532,7 @@ pub(in crate::v2::engine) fn install_reserved_connection(
     reservation: ConnectionReservation,
     cm_route: Option<ConnectionCmRoute>,
 ) -> std::result::Result<RdmaConnection, ConnectionInstallFailure> {
-    if let Err(error) = config.validate(&shared.config, shared.provider.as_ref()) {
+    if let Err(error) = manager.validate_connection_config(&config) {
         return Err(ConnectionInstallFailure::unregistered(
             error,
             poster,
@@ -1551,7 +1551,7 @@ pub(in crate::v2::engine) fn install_reserved_connection(
     let qp_num = poster.qp_num();
     let pending = Arc::new(Mutex::new(Some((poster, reservation))));
     let make_pending = Arc::clone(&pending);
-    let registration = shared.session.connections.register(qp_num, move |token| {
+    let registration = manager.connections.register(qp_num, move |token| {
         let (poster, reservation) = lock_unpoison(&make_pending)
             .take()
             .expect("connection registration factory runs exactly once");
@@ -1587,9 +1587,9 @@ pub(in crate::v2::engine) fn install_reserved_connection(
     #[cfg(not(any(test, feature = "test-hooks")))]
     let _ = token;
     #[cfg(any(test, feature = "test-hooks"))]
-    if let Some(failure) = shared.test_driver.take_setup_rollback_failure() {
+    if let Some(failure) = manager.take_setup_rollback_failure() {
         state.retain_setup_rollback_mr(failure.retained_mr);
-        if !shared.session.connections.detach_qp_index(token, qp_num) {
+        if !manager.connections.detach_qp_index(token, qp_num) {
             return Err(ConnectionInstallFailure {
                 error: Error::InvalidConfig(
                     "setup rollback injection lost its QP registration".into(),
@@ -1608,8 +1608,8 @@ pub(in crate::v2::engine) fn install_reserved_connection(
             resources: FailedConnectionInstallResources::Registered(state),
         });
     }
-    let session = shared.session.connection_capability(&state);
-    Ok(RdmaConnection::from_registered(shared, state, session))
+    let session = manager.connection_capability(&state);
+    Ok(RdmaConnection::from_registered(manager, state, session))
 }
 
 pub(in crate::v2::engine) struct ConnectionInstallFailure {

@@ -128,9 +128,9 @@ impl RdmaConnectionConfig {
         })
     }
 
-    pub(crate) fn validate(
+    pub(super) fn validate(
         &self,
-        engine: &EngineConfig,
+        session: &SessionConfig,
         provider: Option<&ProviderLimits>,
     ) -> Result<()> {
         validate_range("maximum send WRs", self.max_send_wr, 1, 1_048_576)?;
@@ -161,16 +161,16 @@ impl RdmaConnectionConfig {
             .max_send_wr
             .checked_add(self.max_recv_wr)
             .ok_or_else(|| invalid("connection send-plus-receive capacity overflow"))?;
-        if qp_positions > engine.max_inflight_operations {
+        if qp_positions > session.max_inflight_operations {
             return Err(invalid(format!(
                 "connection send-plus-receive capacity ({qp_positions}) exceeds engine in-flight capacity ({})",
-                engine.max_inflight_operations
+                session.max_inflight_operations
             )));
         }
-        if qp_positions > engine.cq_capacity {
+        if qp_positions > session.cq_capacity {
             return Err(invalid(format!(
                 "connection send-plus-receive capacity ({qp_positions}) exceeds engine CQ capacity ({})",
-                engine.cq_capacity
+                session.cq_capacity
             )));
         }
 
@@ -196,6 +196,30 @@ pub(crate) struct EngineConfig {
     pub(crate) missing_cqe_deadline: Duration,
     pub(crate) connection_drain_deadline: Duration,
     pub(crate) shutdown_deadline: Duration,
+}
+
+/// Immutable construction input owned by the session layer.
+///
+/// This deliberately contains only session capacity, connection-validation,
+/// and connection-drain policy. I/O scheduling and engine shutdown policy
+/// remain inaccessible from [`SessionManager`](super::session::SessionManager).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SessionConfig {
+    pub(super) max_live_connections: usize,
+    max_inflight_operations: usize,
+    cq_capacity: usize,
+    pub(super) connection_drain_deadline: Duration,
+}
+
+impl From<&EngineConfig> for SessionConfig {
+    fn from(config: &EngineConfig) -> Self {
+        Self {
+            max_live_connections: config.max_live_connections,
+            max_inflight_operations: config.max_inflight_operations,
+            cq_capacity: config.cq_capacity,
+            connection_drain_deadline: config.connection_drain_deadline,
+        }
+    }
 }
 
 impl EngineConfig {
@@ -562,45 +586,47 @@ mod tests {
     #[test]
     fn validates_connection_bounds_and_provider_limits() {
         let engine = EngineConfig::new("rxe0".into());
+        let session = SessionConfig::from(&engine);
         let provider = default_provider();
         RdmaConnectionConfig::default()
-            .validate(&engine, Some(&provider))
+            .validate(&session, Some(&provider))
             .unwrap();
 
         assert!(
             RdmaConnectionConfig::default()
                 .max_send_wr(0)
-                .validate(&engine, Some(&provider))
+                .validate(&session, Some(&provider))
                 .is_err()
         );
         assert!(
             RdmaConnectionConfig::default()
                 .max_recv_wr(1_048_577)
-                .validate(&engine, Some(&provider))
+                .validate(&session, Some(&provider))
                 .is_err()
         );
         assert!(
             RdmaConnectionConfig::default()
                 .max_send_sge(33)
-                .validate(&engine, Some(&provider))
+                .validate(&session, Some(&provider))
                 .is_err()
         );
         assert!(
             RdmaConnectionConfig::default()
                 .responder_resources(129)
-                .validate(&engine, Some(&provider))
+                .validate(&session, Some(&provider))
                 .is_err()
         );
         assert!(
             RdmaConnectionConfig::default()
                 .retry_count(8)
-                .validate(&engine, Some(&provider))
+                .validate(&session, Some(&provider))
                 .is_err()
         );
 
         let mut minimum_engine = EngineConfig::new("rxe0".into());
         minimum_engine.max_inflight_operations = 2;
         minimum_engine.cq_capacity = 2;
+        let minimum_session = SessionConfig::from(&minimum_engine);
         RdmaConnectionConfig::default()
             .max_send_wr(1)
             .max_recv_wr(1)
@@ -610,7 +636,7 @@ mod tests {
             .initiator_depth(0)
             .retry_count(0)
             .rnr_retry_count(0)
-            .validate(&minimum_engine, Some(&provider))
+            .validate(&minimum_session, Some(&provider))
             .unwrap();
 
         let maximum = RdmaConnectionConfig::default()
@@ -625,14 +651,16 @@ mod tests {
         let mut maximum_engine = EngineConfig::new("layout-only".into());
         maximum_engine.max_inflight_operations = 16_777_216;
         maximum_engine.cq_capacity = 16_777_216;
-        maximum.validate(&maximum_engine, None).unwrap();
+        maximum
+            .validate(&SessionConfig::from(&maximum_engine), None)
+            .unwrap();
 
         for invalid in [
             RdmaConnectionConfig::default().max_recv_sge(0),
             RdmaConnectionConfig::default().initiator_depth(256),
             RdmaConnectionConfig::default().rnr_retry_count(8),
         ] {
-            assert!(invalid.validate(&engine, Some(&provider)).is_err());
+            assert!(invalid.validate(&session, Some(&provider)).is_err());
         }
     }
 

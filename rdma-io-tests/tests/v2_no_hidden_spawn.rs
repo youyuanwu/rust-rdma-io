@@ -10,8 +10,8 @@ use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{
-    Attribute, Expr, ExprBlock, ExprCall, ExprMethodCall, ExprPath, ForeignItem, ImplItem, Item,
-    Local, Macro, Meta, Pat, Token, TraitItem, Type, UseTree,
+    Attribute, Expr, ExprBlock, ExprCall, ExprField, ExprMethodCall, ExprPath, ForeignItem,
+    ImplItem, Item, Local, Macro, Meta, Pat, Token, TraitItem, Type, UseTree,
 };
 
 const SPAWN_NAMES: &[&str] = &[
@@ -141,6 +141,516 @@ fn find_forbidden_production_dependencies(
     visitor.violations.sort();
     visitor.violations.dedup();
     Ok(visitor.violations)
+}
+
+struct AnyDependencyVisitor<'a> {
+    forbidden: &'a HashSet<String>,
+    violations: Vec<String>,
+}
+
+impl<'ast> Visit<'ast> for AnyDependencyVisitor<'_> {
+    fn visit_path(&mut self, path: &'ast syn::Path) {
+        for segment in &path.segments {
+            let identifier = segment.ident.to_string();
+            if self.forbidden.contains(identifier.as_str()) {
+                self.violations
+                    .push(format!("{identifier}:{}", path.span().start().line));
+            }
+        }
+        visit::visit_path(self, path);
+    }
+
+    fn visit_use_tree(&mut self, tree: &'ast UseTree) {
+        let identifier = match tree {
+            UseTree::Path(path) => Some(&path.ident),
+            UseTree::Name(name) => Some(&name.ident),
+            UseTree::Rename(rename) => Some(&rename.ident),
+            UseTree::Glob(_) | UseTree::Group(_) => None,
+        };
+        if let Some(identifier) = identifier {
+            let identifier = identifier.to_string();
+            if self.forbidden.contains(identifier.as_str()) {
+                self.violations
+                    .push(format!("{identifier}:{}", tree.span().start().line));
+            }
+        }
+        visit::visit_use_tree(self, tree);
+    }
+}
+
+fn find_forbidden_dependencies_including_tests(
+    source: &str,
+    forbidden: &[&str],
+) -> Result<Vec<String>, syn::Error> {
+    let syntax = syn::parse_file(source)?;
+    let forbidden = identifiers_and_aliases(&syntax, forbidden);
+    let mut visitor = AnyDependencyVisitor {
+        forbidden: &forbidden,
+        violations: Vec::new(),
+    };
+    visitor.visit_file(&syntax);
+    visitor.violations.sort();
+    visitor.violations.dedup();
+    Ok(visitor.violations)
+}
+
+fn find_inherent_methods(
+    source: &str,
+    owner: &str,
+    forbidden_methods: &[&str],
+) -> Result<Vec<String>, syn::Error> {
+    fn inspect_items(
+        items: &[Item],
+        module_path: &mut Vec<String>,
+        owners: &HashSet<String>,
+        forbidden: &HashSet<&str>,
+        violations: &mut Vec<String>,
+    ) {
+        for item in items {
+            match item {
+                Item::Impl(item)
+                    if item.trait_.is_none()
+                        && type_path_last(&item.self_ty)
+                            .is_some_and(|name| owners.contains(&name)) =>
+                {
+                    for implementation_item in &item.items {
+                        if let ImplItem::Fn(function) = implementation_item {
+                            let name = function.sig.ident.to_string();
+                            if forbidden.contains(name.as_str()) {
+                                violations.push(format!(
+                                    "{}:{}",
+                                    qualified_name(module_path, &name),
+                                    function.sig.ident.span().start().line
+                                ));
+                            }
+                        }
+                    }
+                }
+                Item::Mod(module) => {
+                    if let Some((_, items)) = &module.content {
+                        module_path.push(module.ident.to_string());
+                        inspect_items(items, module_path, owners, forbidden, violations);
+                        module_path.pop();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let syntax = syn::parse_file(source)?;
+    let forbidden = forbidden_methods.iter().copied().collect::<HashSet<_>>();
+    let owners = identifiers_and_aliases(&syntax, &[owner]);
+    let mut violations = Vec::new();
+    inspect_items(
+        &syntax.items,
+        &mut Vec::new(),
+        &owners,
+        &forbidden,
+        &mut violations,
+    );
+    Ok(violations)
+}
+
+struct SelfFieldAccessVisitor<'a> {
+    fields: &'a HashSet<&'a str>,
+    found: bool,
+}
+
+impl Visit<'_> for SelfFieldAccessVisitor<'_> {
+    fn visit_expr_field(&mut self, field: &ExprField) {
+        let member = match &field.member {
+            syn::Member::Named(member) => member.to_string(),
+            syn::Member::Unnamed(_) => String::new(),
+        };
+        if self.fields.contains(member.as_str()) && expression_is_rooted_at_self(&field.base) {
+            self.found = true;
+        }
+        visit::visit_expr_field(self, field);
+    }
+}
+
+fn expression_is_rooted_at_self(expression: &Expr) -> bool {
+    match expression {
+        Expr::Path(path) => path.path.is_ident("self"),
+        Expr::Field(field) => expression_is_rooted_at_self(&field.base),
+        Expr::Paren(paren) => expression_is_rooted_at_self(&paren.expr),
+        Expr::Reference(reference) => expression_is_rooted_at_self(&reference.expr),
+        _ => false,
+    }
+}
+
+fn find_inherent_methods_accessing_fields(
+    source: &str,
+    owner: &str,
+    fields: &[&str],
+) -> Result<Vec<String>, syn::Error> {
+    fn inspect_items(
+        items: &[Item],
+        module_path: &mut Vec<String>,
+        owners: &HashSet<String>,
+        fields: &HashSet<&str>,
+        methods: &mut Vec<String>,
+    ) {
+        for item in items {
+            match item {
+                Item::Impl(item)
+                    if item.trait_.is_none()
+                        && type_path_last(&item.self_ty)
+                            .is_some_and(|name| owners.contains(&name)) =>
+                {
+                    for implementation_item in &item.items {
+                        let ImplItem::Fn(function) = implementation_item else {
+                            continue;
+                        };
+                        let mut visitor = SelfFieldAccessVisitor {
+                            fields,
+                            found: false,
+                        };
+                        visitor.visit_block(&function.block);
+                        if visitor.found {
+                            methods
+                                .push(qualified_name(module_path, &function.sig.ident.to_string()));
+                        }
+                    }
+                }
+                Item::Mod(module) => {
+                    if let Some((_, items)) = &module.content {
+                        module_path.push(module.ident.to_string());
+                        inspect_items(items, module_path, owners, fields, methods);
+                        module_path.pop();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let syntax = syn::parse_file(source)?;
+    let owners = identifiers_and_aliases(&syntax, &[owner]);
+    let fields = fields.iter().copied().collect::<HashSet<_>>();
+    let mut methods = Vec::new();
+    inspect_items(
+        &syntax.items,
+        &mut Vec::new(),
+        &owners,
+        &fields,
+        &mut methods,
+    );
+    methods.sort();
+    methods.dedup();
+    Ok(methods)
+}
+
+fn find_functions_using_dependencies(
+    source: &str,
+    forbidden: &[&str],
+) -> Result<Vec<String>, syn::Error> {
+    fn inspect_items(
+        items: &[Item],
+        module_path: &mut Vec<String>,
+        forbidden: &HashSet<String>,
+        violations: &mut Vec<String>,
+    ) {
+        for item in items {
+            match item {
+                Item::Fn(function) => {
+                    let mut visitor = AnyDependencyVisitor {
+                        forbidden,
+                        violations: Vec::new(),
+                    };
+                    visitor.visit_signature(&function.sig);
+                    visitor.visit_block(&function.block);
+                    if !visitor.violations.is_empty() {
+                        violations
+                            .push(qualified_name(module_path, &function.sig.ident.to_string()));
+                    }
+                }
+                Item::Impl(implementation) => {
+                    let owner = type_path_last(&implementation.self_ty)
+                        .unwrap_or_else(|| "<impl>".to_owned());
+                    for item in &implementation.items {
+                        let ImplItem::Fn(function) = item else {
+                            continue;
+                        };
+                        let mut visitor = AnyDependencyVisitor {
+                            forbidden,
+                            violations: Vec::new(),
+                        };
+                        visitor.visit_signature(&function.sig);
+                        visitor.visit_block(&function.block);
+                        if !visitor.violations.is_empty() {
+                            let method = format!("{owner}::{}", function.sig.ident);
+                            violations.push(qualified_name(module_path, &method));
+                        }
+                    }
+                }
+                Item::Mod(module) => {
+                    if let Some((_, items)) = &module.content {
+                        module_path.push(module.ident.to_string());
+                        inspect_items(items, module_path, forbidden, violations);
+                        module_path.pop();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let syntax = syn::parse_file(source)?;
+    let forbidden = identifiers_and_aliases(&syntax, forbidden);
+    let mut violations = Vec::new();
+    inspect_items(&syntax.items, &mut Vec::new(), &forbidden, &mut violations);
+    violations.sort();
+    violations.dedup();
+    Ok(violations)
+}
+
+fn find_structs_using_dependencies(
+    source: &str,
+    forbidden: &[&str],
+) -> Result<Vec<String>, syn::Error> {
+    fn inspect_items(
+        items: &[Item],
+        module_path: &mut Vec<String>,
+        forbidden: &HashSet<String>,
+        violations: &mut Vec<String>,
+    ) {
+        for item in items {
+            match item {
+                Item::Struct(structure) => {
+                    let mut visitor = AnyDependencyVisitor {
+                        forbidden,
+                        violations: Vec::new(),
+                    };
+                    for field in &structure.fields {
+                        visitor.visit_field(field);
+                    }
+                    if !visitor.violations.is_empty() {
+                        violations.push(qualified_name(module_path, &structure.ident.to_string()));
+                    }
+                }
+                Item::Mod(module) => {
+                    if let Some((_, items)) = &module.content {
+                        module_path.push(module.ident.to_string());
+                        inspect_items(items, module_path, forbidden, violations);
+                        module_path.pop();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let syntax = syn::parse_file(source)?;
+    let forbidden = identifiers_and_aliases(&syntax, forbidden);
+    let mut violations = Vec::new();
+    inspect_items(&syntax.items, &mut Vec::new(), &forbidden, &mut violations);
+    violations.sort();
+    violations.dedup();
+    Ok(violations)
+}
+
+fn trait_method_names(source: &str, trait_name: &str) -> Result<Vec<String>, syn::Error> {
+    let syntax = syn::parse_file(source)?;
+    let mut methods = syntax
+        .items
+        .into_iter()
+        .find_map(|item| {
+            let Item::Trait(item) = item else {
+                return None;
+            };
+            (item.ident == trait_name).then(|| {
+                item.items
+                    .into_iter()
+                    .filter_map(|item| match item {
+                        TraitItem::Fn(function) => Some(function.sig.ident.to_string()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+        .unwrap_or_default();
+    methods.sort();
+    Ok(methods)
+}
+
+fn named_struct_fields(source: &str, struct_name: &str) -> Result<Vec<String>, syn::Error> {
+    let syntax = syn::parse_file(source)?;
+    let mut fields = syntax
+        .items
+        .into_iter()
+        .find_map(|item| {
+            let Item::Struct(item) = item else {
+                return None;
+            };
+            (item.ident == struct_name).then(|| {
+                item.fields
+                    .into_iter()
+                    .filter_map(|field| field.ident.map(|ident| ident.to_string()))
+                    .collect::<Vec<_>>()
+            })
+        })
+        .unwrap_or_default();
+    fields.sort();
+    Ok(fields)
+}
+
+fn find_trait_dependencies(
+    source: &str,
+    trait_name: &str,
+    forbidden: &[&str],
+) -> Result<Vec<String>, syn::Error> {
+    let syntax = syn::parse_file(source)?;
+    let forbidden = identifiers_and_aliases(&syntax, forbidden);
+    let mut violations = Vec::new();
+    for item in &syntax.items {
+        let Item::Trait(item) = item else {
+            continue;
+        };
+        if item.ident != trait_name {
+            continue;
+        }
+        let mut visitor = AnyDependencyVisitor {
+            forbidden: &forbidden,
+            violations: Vec::new(),
+        };
+        visitor.visit_item_trait(item);
+        violations.extend(visitor.violations);
+    }
+    violations.sort();
+    violations.dedup();
+    Ok(violations)
+}
+
+fn has_trait_impl(source: &str, owner: &str, trait_name: &str) -> Result<bool, syn::Error> {
+    fn inspect_items(items: &[Item], owners: &HashSet<String>, traits: &HashSet<String>) -> bool {
+        items.iter().any(|item| match item {
+            Item::Impl(item) => {
+                type_path_last(&item.self_ty).is_some_and(|name| owners.contains(&name))
+                    && item
+                        .trait_
+                        .as_ref()
+                        .and_then(|(path, _)| path.segments.last())
+                        .is_some_and(|segment| traits.contains(&segment.ident.to_string()))
+            }
+            Item::Mod(module) => module
+                .content
+                .as_ref()
+                .is_some_and(|(_, items)| inspect_items(items, owners, traits)),
+            _ => false,
+        })
+    }
+
+    let syntax = syn::parse_file(source)?;
+    let owners = identifiers_and_aliases(&syntax, &[owner]);
+    let traits = identifiers_and_aliases(&syntax, &[trait_name]);
+    Ok(inspect_items(&syntax.items, &owners, &traits))
+}
+
+fn find_method_parameter_dependencies(
+    source: &str,
+    owner: &str,
+    method: &str,
+    forbidden: &[&str],
+) -> Result<Vec<String>, syn::Error> {
+    let syntax = syn::parse_file(source)?;
+    let forbidden = identifiers_and_aliases(&syntax, forbidden);
+    let owners = identifiers_and_aliases(&syntax, &[owner]);
+    let mut violations = Vec::new();
+    for item in syntax.items {
+        let Item::Impl(item) = item else {
+            continue;
+        };
+        if !type_path_last(&item.self_ty).is_some_and(|name| owners.contains(&name)) {
+            continue;
+        }
+        for implementation_item in item.items {
+            let ImplItem::Fn(function) = implementation_item else {
+                continue;
+            };
+            if function.sig.ident != method {
+                continue;
+            }
+            let mut visitor = AnyDependencyVisitor {
+                forbidden: &forbidden,
+                violations: Vec::new(),
+            };
+            for input in &function.sig.inputs {
+                visitor.visit_fn_arg(input);
+            }
+            violations.extend(visitor.violations);
+        }
+    }
+    Ok(violations)
+}
+
+fn type_path_last(ty: &Type) -> Option<String> {
+    match ty {
+        Type::Path(path) => path
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string()),
+        _ => None,
+    }
+}
+
+fn qualified_name(module_path: &[String], name: &str) -> String {
+    if module_path.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{}::{name}", module_path.join("::"))
+    }
+}
+
+fn identifiers_and_aliases(syntax: &syn::File, identifiers: &[&str]) -> HashSet<String> {
+    fn collect_aliases(items: &[Item], names: &mut HashSet<String>) -> bool {
+        let mut changed = false;
+        for item in items {
+            match item {
+                Item::Use(item) => {
+                    let before = names.len();
+                    collect_use_aliases(&item.tree, names);
+                    changed |= names.len() != before;
+                }
+                Item::Type(alias)
+                    if type_path_last(&alias.ty).is_some_and(|name| names.contains(&name)) =>
+                {
+                    changed |= names.insert(alias.ident.to_string());
+                }
+                Item::Mod(module) => {
+                    if let Some((_, items)) = &module.content {
+                        changed |= collect_aliases(items, names);
+                    }
+                }
+                _ => {}
+            }
+        }
+        changed
+    }
+
+    let mut names = identifiers
+        .iter()
+        .map(|identifier| (*identifier).to_owned())
+        .collect::<HashSet<_>>();
+    while collect_aliases(&syntax.items, &mut names) {}
+    names
+}
+
+fn collect_use_aliases(tree: &UseTree, names: &mut HashSet<String>) {
+    match tree {
+        UseTree::Path(path) => collect_use_aliases(&path.tree, names),
+        UseTree::Rename(rename) if names.contains(&rename.ident.to_string()) => {
+            names.insert(rename.rename.to_string());
+        }
+        UseTree::Group(group) => {
+            for item in &group.items {
+                collect_use_aliases(item, names);
+            }
+        }
+        UseTree::Name(_) | UseTree::Rename(_) | UseTree::Glob(_) => {}
+    }
 }
 
 struct LiveIoProofIssuanceVisitor {
@@ -875,14 +1385,14 @@ fn expression_block() {
 #[test]
 fn dependency_detector_ignores_test_only_items_but_fails_closed_for_production() {
     let source = r#"
-        use crate::EngineShared;
+        use crate::EngineShared as RootAlias;
         use crate::v2::engine::session::SessionManager;
 
         #[cfg(test)]
         use crate::ConnectionState;
 
-        fn production(value: crate::WorkRequestPoster) {
-            let _ = value;
+        fn production(root: RootAlias, value: crate::WorkRequestPoster) {
+            let _ = (root, value);
         }
     "#;
     let violations = find_forbidden_production_dependencies(
@@ -915,6 +1425,187 @@ fn dependency_detector_ignores_test_only_items_but_fails_closed_for_production()
         !violations
             .iter()
             .any(|violation| violation.starts_with("ConnectionState:"))
+    );
+}
+
+#[test]
+fn owner_boundary_detectors_reject_test_only_aliases_and_renamed_adapters() {
+    let aliased_root = r#"
+        #[cfg(test)]
+        use crate::EngineShared as RootAlias;
+
+        #[cfg(test)]
+        struct Fixture {
+            root: std::sync::Arc<RootAlias>,
+        }
+    "#;
+    assert!(
+        !find_forbidden_dependencies_including_tests(aliased_root, &["EngineShared"])
+            .unwrap()
+            .is_empty(),
+        "test-only root aliases must remain visible to the ownership guard"
+    );
+
+    let aliased_deref = r#"
+        use std::ops::Deref as BroadAccess;
+        struct EngineShared;
+        struct SessionManager;
+        impl BroadAccess for EngineShared {
+            type Target = SessionManager;
+            fn deref(&self) -> &Self::Target { unimplemented!() }
+        }
+    "#;
+    assert!(
+        has_trait_impl(aliased_deref, "EngineShared", "Deref").unwrap(),
+        "renaming Deref must not evade the broad-adapter guard"
+    );
+
+    let aliased_owner = r#"
+        struct EngineShared;
+        type RootAlias = EngineShared;
+        impl RootAlias {
+            fn enqueue_completion(&self) {}
+        }
+    "#;
+    assert_eq!(
+        find_inherent_methods(aliased_owner, "EngineShared", &["enqueue_completion"]).unwrap(),
+        vec!["enqueue_completion:5"]
+    );
+
+    let aliased_parameter = r#"
+        struct EngineShared;
+        type RootAlias = EngineShared;
+        struct IoConnection;
+        impl IoConnection {
+            fn new(root: std::sync::Arc<RootAlias>) { let _ = root; }
+        }
+    "#;
+    assert!(
+        !find_method_parameter_dependencies(
+            aliased_parameter,
+            "IoConnection",
+            "new",
+            &["EngineShared"],
+        )
+        .unwrap()
+        .is_empty(),
+        "renaming EngineShared must not restore a full-root I/O fixture"
+    );
+
+    let renamed_forwarder = r#"
+        struct EngineShared { io_core: IoCore }
+        struct IoCore;
+        impl IoCore { fn arbitrary_name(&self) {} }
+        impl EngineShared {
+            fn newly_named_adapter(&self) { self.io_core.arbitrary_name(); }
+        }
+    "#;
+    assert_eq!(
+        find_inherent_methods_accessing_fields(
+            renamed_forwarder,
+            "EngineShared",
+            &["io_core", "session"],
+        )
+        .unwrap(),
+        vec!["newly_named_adapter"],
+        "a renamed root-to-owner forwarder must be detected by field access, not method name"
+    );
+
+    let root_test_fixture = r#"
+        use crate::EngineShared as RootAlias;
+        #[test]
+        fn root_spanning_fixture() {
+            let _: std::sync::Arc<RootAlias> = todo!();
+        }
+        fn owner_focused_fixture(io_core: IoCore, session: SessionManager) {
+            let _ = (io_core, session);
+        }
+    "#;
+    assert_eq!(
+        find_functions_using_dependencies(root_test_fixture, &["EngineShared"]).unwrap(),
+        vec!["root_spanning_fixture"],
+        "aliased concrete roots in test functions must be detected without rejecting owner parts"
+    );
+    let nested_root_wrapper = r#"
+        struct EngineShared;
+        mod tests {
+            type HiddenRoot = super::EngineShared;
+            struct WrappedFixture {
+                root: std::sync::Arc<HiddenRoot>,
+            }
+        }
+    "#;
+    assert_eq!(
+        find_structs_using_dependencies(nested_root_wrapper, &["EngineShared"]).unwrap(),
+        vec!["tests::WrappedFixture"],
+        "nested aliases and module-level root wrappers must not evade the fixture guard"
+    );
+
+    let nested_adapters = r#"
+        struct IoCore;
+        struct SessionManager;
+        struct EngineShared { io_core: IoCore }
+        mod tests {
+            use std::ops::Deref as BroadAccess;
+            type RootAlias = super::EngineShared;
+            impl RootAlias {
+                fn enqueue_completion(&self) { self.io_core.submit(); }
+            }
+            impl BroadAccess for RootAlias {
+                type Target = super::SessionManager;
+                fn deref(&self) -> &Self::Target { unimplemented!() }
+            }
+        }
+    "#;
+    assert!(
+        find_inherent_methods(nested_adapters, "EngineShared", &["enqueue_completion"])
+            .unwrap()
+            .iter()
+            .any(|method| method.starts_with("tests::enqueue_completion:")),
+        "nested EngineShared implementations must not evade the obsolete-forwarder guard"
+    );
+    assert_eq!(
+        find_inherent_methods_accessing_fields(
+            nested_adapters,
+            "EngineShared",
+            &["io_core", "session"],
+        )
+        .unwrap(),
+        vec!["tests::enqueue_completion"],
+        "nested EngineShared implementations must not evade the owner-forwarder guard"
+    );
+    assert!(
+        has_trait_impl(nested_adapters, "EngineShared", "Deref").unwrap(),
+        "nested and renamed Deref implementations must not evade the broad-adapter guard"
+    );
+
+    assert_eq!(
+        trait_method_names(
+            "trait Runtime { fn publish(&self); fn fail(&self, error: Error); }",
+            "Runtime",
+        )
+        .unwrap(),
+        ["fail", "publish"],
+        "runtime capability method changes must be structurally visible"
+    );
+    assert!(
+        !find_trait_dependencies(
+            "type BroadConfig = EngineConfig; trait Runtime { fn config(&self) -> BroadConfig; }",
+            "Runtime",
+            &["EngineConfig"],
+        )
+        .unwrap()
+        .is_empty(),
+        "aliased broad configuration in a runtime capability must be detected"
+    );
+    assert_eq!(
+        named_struct_fields(
+            "struct SessionConfig { drain: Duration, capacity: usize }",
+            "SessionConfig",
+        )
+        .unwrap(),
+        ["capacity", "drain"],
+        "session configuration breadth must be structurally visible"
     );
 }
 
@@ -1110,20 +1801,25 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let workspace_root = Path::new(manifest_dir).parent().expect("workspace root");
     let v2_dir = workspace_root.join("rdma-io").join("src").join("v2");
+    let engine_dir = v2_dir.join("engine");
     let completion_path = v2_dir.join("completion.rs");
     let message_path = v2_dir.join("message_transport.rs");
     let io_path = v2_dir.join("engine").join("io.rs");
-    let io_core_mod_path = v2_dir.join("engine").join("io_core").join("mod.rs");
+    let io_core_dir = v2_dir.join("engine").join("io_core");
+    let io_core_mod_path = io_core_dir.join("mod.rs");
     let io_core_operation_path = v2_dir.join("engine").join("io_core").join("operation.rs");
     let io_core_progress_path = v2_dir.join("engine").join("io_core").join("progress.rs");
     let engine_mod_path = v2_dir.join("engine").join("mod.rs");
+    let config_path = v2_dir.join("engine").join("config.rs");
     let progress_path = v2_dir.join("engine").join("progress.rs");
     let connection_path = v2_dir.join("engine").join("session").join("connection.rs");
+    let cm_path = v2_dir.join("engine").join("session").join("cm.rs");
     let listener_path = v2_dir.join("engine").join("session").join("listener.rs");
     let driver_path = v2_dir.join("engine").join("driver.rs");
     let drain_path = v2_dir.join("engine").join("session").join("drain.rs");
     let session_path = v2_dir.join("engine").join("session").join("mod.rs");
     let session_progress_path = v2_dir.join("engine").join("session").join("progress.rs");
+    let session_registry_path = v2_dir.join("engine").join("session").join("registry.rs");
     let v2_mod_path = v2_dir.join("mod.rs");
 
     let message = fs::read_to_string(&message_path).expect("read message transport source");
@@ -1234,12 +1930,8 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         "SessionLifecycleAuthority",
         "QpDestructionProof",
     ];
-    for path in [
-        &io_core_mod_path,
-        &io_core_operation_path,
-        &io_core_progress_path,
-    ] {
-        let source = fs::read_to_string(path).expect("read I/O core source");
+    for path in collect_rs_files(&io_core_dir).expect("enumerate I/O core source") {
+        let source = fs::read_to_string(&path).expect("read I/O core source");
         let violations =
             find_forbidden_production_dependencies(&source, &forbidden_core_dependencies)
                 .expect("parse I/O core source");
@@ -1344,6 +2036,73 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     assert!(engine_mod.contains("pub use io_core::RdmaOperation;"));
 
     let session_source = fs::read_to_string(&session_path).expect("read session manager source");
+    for path in [
+        &session_path,
+        &cm_path,
+        &connection_path,
+        &listener_path,
+        &drain_path,
+        &session_progress_path,
+        &session_registry_path,
+    ] {
+        let source = fs::read_to_string(path).expect("read session owner source");
+        let violations = find_forbidden_production_dependencies(&source, &["EngineShared"])
+            .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
+        assert!(
+            violations.is_empty(),
+            "{} bypasses the narrow session runtime capability: {}",
+            path.display(),
+            violations.join(", ")
+        );
+        let all_code_violations =
+            find_forbidden_dependencies_including_tests(&source, &["EngineShared"])
+                .unwrap_or_else(|error| panic!("parse all code in {}: {error}", path.display()));
+        assert!(
+            all_code_violations.is_empty(),
+            "{} restores a direct or aliased test root dependency: {}",
+            path.display(),
+            all_code_violations.join(", ")
+        );
+    }
+    assert!(
+        engine_mod.contains("trait SessionEngineRuntime: Send + Sync")
+            && session_source.contains("engine: OnceLock<Weak<dyn SessionEngineRuntime>>"),
+        "session-to-engine access must use one bind-once weak object-safe capability"
+    );
+    assert_eq!(
+        trait_method_names(&engine_mod, "SessionEngineRuntime")
+            .expect("parse SessionEngineRuntime methods"),
+        [
+            "admission_error",
+            "begin_driver_failure",
+            "outcome",
+            "pending_terminal_outcome",
+            "publish_io_work",
+            "publish_session_work",
+            "shutdown_deadline_failure",
+            "shutdown_requested",
+        ],
+        "SessionEngineRuntime must expose only the reviewed global runtime operations"
+    );
+    let runtime_dependency_violations = find_trait_dependencies(
+        &engine_mod,
+        "SessionEngineRuntime",
+        &[
+            "EngineConfig",
+            "SessionConfig",
+            "ProviderLimits",
+            "IoCore",
+            "SessionManager",
+            "ConnectionRegistry",
+            "OperationRegistry",
+        ],
+    )
+    .expect("parse SessionEngineRuntime dependency surface");
+    assert!(
+        runtime_dependency_violations.is_empty(),
+        "SessionEngineRuntime exposes owner configuration or registries: {}",
+        runtime_dependency_violations.join(", ")
+    );
     let session_manager = session_source
         .split("pub(super) struct SessionManager {")
         .nth(1)
@@ -1364,6 +2123,30 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
             session_path.display()
         );
     }
+    assert!(
+        session_manager.contains("config: SessionConfig")
+            && !session_manager.contains("config: EngineConfig"),
+        "{} must retain only the narrow immutable SessionConfig",
+        session_path.display()
+    );
+    assert!(
+        find_forbidden_dependencies_including_tests(&session_source, &["EngineConfig"])
+            .expect("parse session configuration dependencies")
+            .is_empty(),
+        "{} must not regain the complete EngineConfig",
+        session_path.display()
+    );
+    let config_source = fs::read_to_string(&config_path).expect("read engine configuration");
+    assert_eq!(
+        named_struct_fields(&config_source, "SessionConfig").expect("parse SessionConfig fields"),
+        [
+            "connection_drain_deadline",
+            "cq_capacity",
+            "max_inflight_operations",
+            "max_live_connections",
+        ],
+        "SessionConfig must remain limited to session capacity, validation, and drain policy"
+    );
     assert!(
         session_source.contains("pub(crate) struct SessionConnection")
             && session_source.contains("manager: Weak<SessionManager>")
@@ -1418,8 +2201,7 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
             violations.join(", ")
         );
     }
-    let cm_source = fs::read_to_string(v2_dir.join("engine").join("session").join("cm.rs"))
-        .expect("read CM source");
+    let cm_source = fs::read_to_string(&cm_path).expect("read CM source");
     let connect_waiter_violations = find_strong_owner_fields(
         &cm_source,
         "ConnectWaiter",
@@ -1439,11 +2221,166 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
 
     let drain_source = fs::read_to_string(&drain_path).expect("read drain source");
     assert!(
-        drain_source.contains("impl SessionManager")
-            && drain_source.contains("#[cfg(test)]\nimpl EngineShared"),
-        "{} production close/drain/retirement policy must be implemented on SessionManager",
+        drain_source.contains("impl SessionManager") && !drain_source.contains("impl EngineShared"),
+        "{} close/drain/retirement policy and test access must remain on SessionManager",
         drain_path.display()
     );
+    let mut broad_adapter_violations = Vec::new();
+    for path in collect_rs_files(&engine_dir).expect("enumerate root/session Deref adapters") {
+        let source = fs::read_to_string(&path).expect("read engine source");
+        for owner in ["EngineShared", "SessionManager"] {
+            if has_trait_impl(&source, owner, "Deref").unwrap_or_else(|error| {
+                panic!("parse {} {owner} Deref impls: {error}", path.display())
+            }) {
+                broad_adapter_violations.push(format!("{}::{owner}", path.display()));
+            }
+        }
+    }
+    assert!(
+        broad_adapter_violations.is_empty(),
+        "tests must not restore broad root/session Deref adapters: {}",
+        broad_adapter_violations.join(", ")
+    );
+    assert!(
+        find_forbidden_dependencies_including_tests(&connection_source, &["EngineShared"])
+            .expect("parse connection test ownership")
+            .is_empty(),
+        "RdmaConnection must not restore direct or aliased EngineShared ownership"
+    );
+    let allowed_root_functions = [
+        "io.rs::IoConnection::with_delayed_close_event_for_test",
+        "io_core/operation.rs::tests::synthetic_engine_root",
+        "io_core/operation.rs::tests::terminal_wakers_can_reenter_after_terminal_guards_drop",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<HashSet<_>>();
+    let mut concrete_root_functions = HashSet::new();
+    let mut root_fixture_paths =
+        collect_rs_files(&io_core_dir).expect("enumerate I/O core test fixtures");
+    root_fixture_paths.push(io_path.clone());
+    for path in root_fixture_paths {
+        let source = fs::read_to_string(&path).expect("read I/O test fixture source");
+        let relative = path
+            .strip_prefix(&engine_dir)
+            .expect("I/O fixture source beneath engine directory")
+            .to_string_lossy();
+        concrete_root_functions.extend(
+            find_functions_using_dependencies(&source, &["EngineShared"])
+                .unwrap_or_else(|error| {
+                    panic!("parse {} root dependencies: {error}", path.display())
+                })
+                .into_iter()
+                .map(|function| format!("{relative}::{function}")),
+        );
+        let concrete_root_structs = find_structs_using_dependencies(&source, &["EngineShared"])
+            .unwrap_or_else(|error| {
+                panic!("parse {} root-bearing structs: {error}", path.display())
+            });
+        assert!(
+            concrete_root_structs.is_empty(),
+            "{} retains a concrete-root fixture wrapper: {}",
+            path.display(),
+            concrete_root_structs.join(", ")
+        );
+    }
+    let mut forbidden_root_functions = concrete_root_functions
+        .difference(&allowed_root_functions)
+        .cloned()
+        .collect::<Vec<_>>();
+    forbidden_root_functions.sort();
+    assert!(
+        forbidden_root_functions.is_empty(),
+        "I/O sources retain the concrete composition root outside reviewed fixtures: {}",
+        forbidden_root_functions.join(", ")
+    );
+    let mut missing_root_functions = allowed_root_functions
+        .difference(&concrete_root_functions)
+        .cloned()
+        .collect::<Vec<_>>();
+    missing_root_functions.sort();
+    assert!(
+        missing_root_functions.is_empty(),
+        "reviewed I/O root-fixture allowlist is stale: {}",
+        missing_root_functions.join(", ")
+    );
+    let io_operation_source =
+        fs::read_to_string(&io_core_operation_path).expect("read I/O operation source");
+    assert!(
+        io_operation_source.contains("struct OperationOwners")
+            && io_operation_source.contains("io_core: Arc<IoCore>")
+            && io_operation_source.contains("session: Arc<SessionManager>")
+            && io_operation_source.contains("_runtime: Arc<dyn SessionEngineRuntime>"),
+        "{} must expose explicit owner-focused fixture parts with only an opaque runtime retain",
+        io_core_operation_path.display()
+    );
+    let allowed_root_owner_methods = [
+        "begin_driver_failure",
+        "diagnostics",
+        "finish",
+        "handle_driver_drop",
+        "mark_shutdown_requested",
+        "request_shutdown",
+        "retained_bundle_count",
+        "shutdown_deadline_failure",
+        "unsafe_outstanding_operations",
+    ];
+    let mut unexpected_root_owner_methods = Vec::new();
+    for path in collect_rs_files(&engine_dir).expect("enumerate EngineShared implementations") {
+        let source = fs::read_to_string(&path).expect("read EngineShared implementation");
+        unexpected_root_owner_methods.extend(
+            find_inherent_methods_accessing_fields(
+                &source,
+                "EngineShared",
+                &["io_core", "session"],
+            )
+            .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()))
+            .into_iter()
+            .filter(|method| !allowed_root_owner_methods.contains(&method.as_str()))
+            .map(|method| format!("{}::{method}", path.display())),
+        );
+    }
+    assert!(
+        unexpected_root_owner_methods.is_empty(),
+        "EngineShared gained an unreviewed owner forwarder: {}",
+        unexpected_root_owner_methods.join(", ")
+    );
+    let obsolete_forwarders = [
+        "register_memory",
+        "has_published_completions",
+        "fn apply_io_effects(",
+        "fn enqueue_completion(",
+        "fn dispatch_connection_completions(",
+        "fn reclaim_after_qp_destroy(",
+        "fn handle_reclamation_deadline(",
+    ];
+    let obsolete_method_names = obsolete_forwarders.map(|name| {
+        name.strip_prefix("fn ")
+            .and_then(|name| name.strip_suffix('('))
+            .unwrap_or(name)
+    });
+    let mut root_forwarder_violations = Vec::new();
+    for path in collect_rs_files(&engine_dir).expect("enumerate root forwarders") {
+        let source = fs::read_to_string(&path).expect("read engine source");
+        root_forwarder_violations.extend(
+            find_inherent_methods(&source, "EngineShared", &obsolete_method_names)
+                .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()))
+                .into_iter()
+                .map(|violation| format!("{}:{violation}", path.display())),
+        );
+    }
+    assert!(
+        root_forwarder_violations.is_empty(),
+        "obsolete root forwarders were restored: {}",
+        root_forwarder_violations.join(", ")
+    );
+    for obsolete_forwarder in obsolete_forwarders {
+        assert!(
+            !engine_mod.contains(obsolete_forwarder),
+            "{} must not restore obsolete root forwarder `{obsolete_forwarder}`",
+            engine_mod_path.display()
+        );
+    }
     let driver_source = fs::read_to_string(&driver_path).expect("read engine driver source");
     let production_driver = driver_source
         .split(
@@ -1530,7 +2467,6 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         ),
         "QP destroy and error transition must require SessionManager lifecycle authority"
     );
-    let engine_dir = v2_dir.join("engine");
     for path in collect_rs_files(&engine_dir).expect("enumerate engine sources") {
         let source = fs::read_to_string(&path).expect("read engine source");
         let mut calls = find_production_lifecycle_calls(
@@ -1611,6 +2547,12 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     }
 
     let io_source = fs::read_to_string(&io_path).expect("read engine I/O boundary source");
+    assert!(
+        find_method_parameter_dependencies(&io_source, "IoConnection", "new", &["EngineShared"])
+            .expect("parse IoConnection test constructor")
+            .is_empty(),
+        "IoConnection test construction must use owner-focused capabilities, not EngineShared"
+    );
     let io_connection = io_source
         .split("pub(crate) struct IoConnection {")
         .nth(1)
