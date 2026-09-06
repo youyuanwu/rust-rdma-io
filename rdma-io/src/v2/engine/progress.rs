@@ -9,7 +9,6 @@
 pub(super) enum OwnerClass {
     Io,
     Session,
-    Terminal,
 }
 
 impl OwnerClass {
@@ -17,7 +16,6 @@ impl OwnerClass {
         match self {
             Self::Io => 0,
             Self::Session => 1,
-            Self::Terminal => 2,
         }
     }
 }

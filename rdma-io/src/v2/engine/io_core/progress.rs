@@ -365,7 +365,6 @@ mod tests {
         fn publish_cq_recheck(&self) {}
         fn publish_completion_dispatch(&self) {}
         fn publish_reclamation(&self) {}
-        fn publish_terminal(&self) {}
         fn pause_operation_before_register(&self) {}
     }
 

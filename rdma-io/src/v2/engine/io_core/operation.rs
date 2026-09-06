@@ -1876,7 +1876,7 @@ impl IoCore {
         self.cq_credits.release();
         let previous = self.accepted_operations.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0, "accepted operation count must be positive");
-        self.publish_terminal_if_drained(previous);
+        self.publish_io_if_drained(previous);
         let finished = operation.finish_completion(completion);
         if finished.was_reclaiming {
             self.pending_reclamations.fetch_sub(1, Ordering::AcqRel);
@@ -1963,7 +1963,7 @@ impl IoCore {
         self.cq_credits.release();
         let previous = self.accepted_operations.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0, "accepted operation count must be positive");
-        self.publish_terminal_if_drained(previous);
+        self.publish_io_if_drained(previous);
         let finished = operation.finish_after_qp_destroy(close_error);
         if finished.was_reclaiming {
             self.pending_reclamations.fetch_sub(1, Ordering::AcqRel);

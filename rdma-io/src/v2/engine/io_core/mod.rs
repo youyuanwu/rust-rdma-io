@@ -51,7 +51,6 @@ pub(super) trait IoDriverSignal: Send + Sync {
     fn publish_cq_recheck(&self);
     fn publish_completion_dispatch(&self);
     fn publish_reclamation(&self);
-    fn publish_terminal(&self);
     #[cfg(any(test, feature = "test-hooks"))]
     fn pause_operation_before_register(&self);
 }
@@ -427,9 +426,9 @@ impl IoCore {
         self.driver_signal.publish_reclamation();
     }
 
-    fn publish_terminal_if_drained(&self, previous: usize) {
+    fn publish_io_if_drained(&self, previous: usize) {
         if previous == 1 && self.shutdown_requested.load(Ordering::Acquire) {
-            self.driver_signal.publish_terminal();
+            self.driver_signal.publish_completion_dispatch();
         }
     }
 
@@ -518,9 +517,31 @@ impl IoCore {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
     use super::*;
 
     struct TestPostAuthority;
+
+    struct RecordingSignal {
+        io_publications: AtomicUsize,
+    }
+
+    impl IoDriverSignal for RecordingSignal {
+        fn publish_cq_recheck(&self) {
+            self.io_publications.fetch_add(1, Ordering::AcqRel);
+        }
+
+        fn publish_completion_dispatch(&self) {
+            self.io_publications.fetch_add(1, Ordering::AcqRel);
+        }
+
+        fn publish_reclamation(&self) {
+            self.io_publications.fetch_add(1, Ordering::AcqRel);
+        }
+
+        fn pause_operation_before_register(&self) {}
+    }
 
     impl IoPostAuthority for TestPostAuthority {
         fn qp_num(&self) -> u32 {
@@ -584,5 +605,26 @@ mod tests {
             connection.reserve_local(Direction::Recv),
             Err(Error::TransportClosed)
         ));
+    }
+
+    #[test]
+    fn final_accepted_drain_publishes_io_owner_reconsideration() {
+        let signal = Arc::new(RecordingSignal {
+            io_publications: AtomicUsize::new(0),
+        });
+        let (core, _) = IoCore::new(
+            1,
+            1,
+            Duration::ZERO,
+            1,
+            Arc::new(RwLock::new(())),
+            Arc::clone(&signal) as Arc<dyn IoDriverSignal>,
+        )
+        .unwrap();
+        core.close_admission(Some(Error::DriverShutdown));
+
+        core.publish_io_if_drained(1);
+
+        assert_eq!(signal.io_publications.load(Ordering::Acquire), 1);
     }
 }

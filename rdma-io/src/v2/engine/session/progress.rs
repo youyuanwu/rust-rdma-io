@@ -705,7 +705,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idle_shutdown_reports_terminal_only_from_the_bounded_turn() {
+    async fn idle_shutdown_becomes_finishable_only_from_the_bounded_turn() {
         let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
         engine.shared.request_shutdown();
         let waker = Waker::noop();

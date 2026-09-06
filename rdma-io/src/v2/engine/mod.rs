@@ -559,10 +559,6 @@ impl IoDriverSignal for EngineIoDriverSignal {
         self.work_signal.publish(driver::IO_WORK);
     }
 
-    fn publish_terminal(&self) {
-        self.work_signal.publish(driver::TERMINAL_WORK);
-    }
-
     #[cfg(any(test, feature = "test-hooks"))]
     fn pause_operation_before_register(&self) {
         self.test_driver
@@ -650,7 +646,8 @@ impl EngineShared {
             );
         }
 
-        self.work_signal.publish(driver::TERMINAL_WORK);
+        self.work_signal
+            .publish(driver::IO_WORK | driver::SESSION_WORK);
     }
 
     fn mark_shutdown_requested(&self) -> bool {
@@ -744,7 +741,7 @@ impl EngineShared {
         }
         drop(pending);
         self.work_signal
-            .publish(driver::IO_WORK | driver::SESSION_WORK | driver::TERMINAL_WORK);
+            .publish(driver::IO_WORK | driver::SESSION_WORK);
     }
 
     fn pending_terminal_outcome(&self) -> Option<MemoizedTerminalResult> {

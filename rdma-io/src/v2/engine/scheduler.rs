@@ -10,7 +10,7 @@ use tokio::time::Instant;
 
 use super::progress::OwnerClass;
 
-const OWNER_CLASS_COUNT: usize = 3;
+const OWNER_CLASS_COUNT: usize = 2;
 
 /// Deduplicated fair rotation over progress owners.
 pub(super) struct OwnerScheduler {
@@ -188,13 +188,11 @@ mod tests {
         scheduler.mark_ready(OwnerClass::Io);
         scheduler.mark_ready(OwnerClass::Session);
         scheduler.mark_ready(OwnerClass::Io);
-        scheduler.mark_ready(OwnerClass::Terminal);
 
         assert_eq!(scheduler.ready_count(), OWNER_CLASS_COUNT);
         assert_eq!(scheduler.next(), Some(OwnerClass::Io));
         scheduler.mark_ready(OwnerClass::Io);
         assert_eq!(scheduler.next(), Some(OwnerClass::Session));
-        assert_eq!(scheduler.next(), Some(OwnerClass::Terminal));
         assert_eq!(scheduler.next(), Some(OwnerClass::Io));
         assert_eq!(scheduler.next(), None);
     }
@@ -202,7 +200,7 @@ mod tests {
     #[test]
     fn ready_at_entry_bounds_one_turn_per_owner() {
         let mut scheduler = OwnerScheduler::new();
-        for class in [OwnerClass::Io, OwnerClass::Session, OwnerClass::Terminal] {
+        for class in [OwnerClass::Io, OwnerClass::Session] {
             scheduler.mark_ready(class);
         }
         let pass_budget = scheduler.ready_count();
@@ -213,10 +211,7 @@ mod tests {
             scheduler.mark_ready(class);
         }
 
-        assert_eq!(
-            serviced,
-            [OwnerClass::Io, OwnerClass::Session, OwnerClass::Terminal]
-        );
+        assert_eq!(serviced, [OwnerClass::Io, OwnerClass::Session]);
         assert_eq!(scheduler.ready_count(), OWNER_CLASS_COUNT);
         assert_eq!(scheduler.next(), Some(OwnerClass::Io));
     }

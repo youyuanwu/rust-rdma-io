@@ -1812,6 +1812,7 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     let engine_mod_path = v2_dir.join("engine").join("mod.rs");
     let config_path = v2_dir.join("engine").join("config.rs");
     let progress_path = v2_dir.join("engine").join("progress.rs");
+    let scheduler_path = v2_dir.join("engine").join("scheduler.rs");
     let connection_path = v2_dir.join("engine").join("session").join("connection.rs");
     let cm_path = v2_dir.join("engine").join("session").join("cm.rs");
     let listener_path = v2_dir.join("engine").join("session").join("listener.rs");
@@ -2426,10 +2427,33 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     assert!(
         production_driver.contains("io_progress")
             && production_driver.contains("session_progress")
+            && production_driver.contains("fn poll_once(")
+            && production_driver.contains("progress_driver_terminal(")
             && !production_driver.contains("session.cm")
+            && !production_driver.contains("TERMINAL_WORK")
+            && !production_driver.contains("OwnerClass::Terminal")
+            && !production_driver.contains("service_terminal")
             && !driver_source.contains("tokio::spawn("),
-        "{} must schedule owner-local progress without spawning",
+        "{} must implement the bounded two-owner turn and terminal epilogue without spawning",
         driver_path.display()
+    );
+    let scheduler_source =
+        fs::read_to_string(&scheduler_path).expect("read owner scheduler source");
+    assert!(
+        scheduler_source.contains("const OWNER_CLASS_COUNT: usize = 2")
+            && !scheduler_source.contains("OwnerClass::Terminal"),
+        "{} must rotate exactly the I/O and session owners",
+        scheduler_path.display()
+    );
+    assert!(
+        !progress_source.contains("Terminal"),
+        "{} must not define a terminal scheduler owner",
+        progress_path.display()
+    );
+    assert!(
+        !io_core_source.contains("publish_terminal"),
+        "{} must publish final-drain reconsideration through I/O work",
+        io_core_mod_path.display()
     );
     let session_progress_source =
         fs::read_to_string(&session_progress_path).expect("read session progress source");
