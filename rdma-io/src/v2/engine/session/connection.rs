@@ -288,7 +288,7 @@ pub(in crate::v2::engine) struct ConnectionState {
     local_addr: Option<SocketAddr>,
     peer_addr: Option<SocketAddr>,
     // Nested lifecycle synchronization always follows:
-    // EngineShared::admission -> lifecycle_gate -> posting_gate.
+    // SessionManager::admission -> lifecycle_gate -> posting_gate.
     lifecycle_gate: Mutex<()>,
     close_started: AtomicBool,
     close: Arc<SessionCloseState>,

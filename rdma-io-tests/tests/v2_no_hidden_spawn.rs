@@ -875,14 +875,14 @@ fn expression_block() {
 #[test]
 fn dependency_detector_ignores_test_only_items_but_fails_closed_for_production() {
     let source = r#"
-        use crate::EngineShared;
+        use crate::EngineShared as RootAlias;
         use crate::v2::engine::session::SessionManager;
 
         #[cfg(test)]
         use crate::ConnectionState;
 
-        fn production(value: crate::WorkRequestPoster) {
-            let _ = value;
+        fn production(root: RootAlias, value: crate::WorkRequestPoster) {
+            let _ = (root, value);
         }
     "#;
     let violations = find_forbidden_production_dependencies(
@@ -1344,6 +1344,28 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     assert!(engine_mod.contains("pub use io_core::RdmaOperation;"));
 
     let session_source = fs::read_to_string(&session_path).expect("read session manager source");
+    for path in [
+        &session_path,
+        &connection_path,
+        &listener_path,
+        &drain_path,
+        &session_progress_path,
+    ] {
+        let source = fs::read_to_string(path).expect("read session owner source");
+        let violations = find_forbidden_production_dependencies(&source, &["EngineShared"])
+            .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
+        assert!(
+            violations.is_empty(),
+            "{} bypasses the narrow session runtime capability: {}",
+            path.display(),
+            violations.join(", ")
+        );
+    }
+    assert!(
+        engine_mod.contains("trait SessionEngineRuntime: Send + Sync")
+            && session_source.contains("engine: OnceLock<Weak<dyn SessionEngineRuntime>>"),
+        "session-to-engine access must use one bind-once weak object-safe capability"
+    );
     let session_manager = session_source
         .split("pub(super) struct SessionManager {")
         .nth(1)
@@ -1439,11 +1461,29 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
 
     let drain_source = fs::read_to_string(&drain_path).expect("read drain source");
     assert!(
-        drain_source.contains("impl SessionManager")
-            && drain_source.contains("#[cfg(test)]\nimpl EngineShared"),
-        "{} production close/drain/retirement policy must be implemented on SessionManager",
+        drain_source.contains("impl SessionManager") && !drain_source.contains("impl EngineShared"),
+        "{} close/drain/retirement policy and test access must remain on SessionManager",
         drain_path.display()
     );
+    assert!(
+        !engine_mod.contains("impl Deref for EngineShared")
+            && !session_source.contains("impl Deref for SessionManager")
+            && !connection_source.contains("shared: Arc<EngineShared>"),
+        "tests must not restore broad root/session dereference or strong root ownership"
+    );
+    for obsolete_forwarder in [
+        "fn apply_io_effects(",
+        "fn enqueue_completion(",
+        "fn dispatch_connection_completions(",
+        "fn reclaim_after_qp_destroy(",
+        "fn handle_reclamation_deadline(",
+    ] {
+        assert!(
+            !engine_mod.contains(obsolete_forwarder),
+            "{} must not restore obsolete root forwarder `{obsolete_forwarder}`",
+            engine_mod_path.display()
+        );
+    }
     let driver_source = fs::read_to_string(&driver_path).expect("read engine driver source");
     let production_driver = driver_source
         .split(

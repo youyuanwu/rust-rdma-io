@@ -33,11 +33,6 @@ impl MemoryRegistrar {
         }
     }
 
-    #[cfg(test)]
-    pub(super) fn from_engine(shared: &EngineShared) -> Self {
-        Self::from_resources(shared.resource_refs.as_ref())
-    }
-
     pub(super) fn register(&self, len: usize, access: AccessIntent) -> Result<Mr> {
         if len == 0 || u32::try_from(len).is_err() {
             return Err(Error::InvalidConfig(
@@ -64,7 +59,7 @@ pub(crate) struct IoConnection {
 impl IoConnection {
     #[cfg(test)]
     pub(super) fn new(
-        shared: Arc<EngineShared>,
+        manager: &super::session::SessionManager,
         connection: Arc<ConnectionState>,
     ) -> Result<(Self, IoEventReceiver)> {
         let (events, receiver) = event_port();
@@ -74,10 +69,10 @@ impl IoConnection {
         }
         Ok((
             Self {
-                io_core: Arc::clone(&shared.io_core),
+                io_core: Arc::clone(&manager.io_core),
                 io: Arc::clone(&connection.io),
-                memory: MemoryRegistrar::from_engine(&shared),
-                session: shared.session.connection_capability(&connection),
+                memory: manager.memory_registrar(),
+                session: manager.connection_capability(&connection),
                 events,
             },
             receiver,

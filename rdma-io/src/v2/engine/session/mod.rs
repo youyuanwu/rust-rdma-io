@@ -7,8 +7,6 @@
 //! here before their detached events and wakers are published.
 
 use std::collections::{HashMap, VecDeque};
-#[cfg(test)]
-use std::ops::Deref;
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -820,17 +818,6 @@ impl IoSessionBridge for SessionManager {
 }
 
 #[cfg(test)]
-impl Deref for SessionManager {
-    // Existing colocated unit tests exercise exact I/O accounting through
-    // their synthetic engine. This adapter is absent from production builds.
-    type Target = IoCore;
-
-    fn deref(&self) -> &Self::Target {
-        &self.io_core
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use std::sync::{Arc, Weak};
     use std::time::Duration;
@@ -902,7 +889,7 @@ mod tests {
     fn session_connection_capability_is_resource_free_and_routes_close() {
         let (engine, _driver) = test_engine_pair(CompletionMode::Polling);
         let connection = install_connection(
-            &engine.shared,
+            &engine.shared.session,
             Arc::new(TestPoster { qp_num: 17 }),
             RdmaConnectionConfig::default(),
             None,
@@ -929,7 +916,7 @@ mod tests {
     fn session_connection_close_observer_waits_for_retirement_after_cm_failure() {
         let (engine, _driver) = test_engine_pair(CompletionMode::Polling);
         let connection = install_connection(
-            &engine.shared,
+            &engine.shared.session,
             Arc::new(TestPoster { qp_num: 18 }),
             RdmaConnectionConfig::default(),
             None,
@@ -982,7 +969,7 @@ mod tests {
         let (engine, _driver) = test_engine_pair(CompletionMode::Polling);
         let state = ListenerState::test_only(4);
         let before = Arc::strong_count(&state);
-        let listener = RdmaListener::from_state(&engine.shared, Arc::clone(&state));
+        let listener = RdmaListener::from_state(&engine.shared.session, Arc::clone(&state));
 
         assert_eq!(listener.local_addr().unwrap(), state.local_addr);
         assert_eq!(
@@ -1005,7 +992,7 @@ mod tests {
     fn session_lifecycle_authority_mints_one_exact_qp_proof() {
         let (engine, _driver) = test_engine_pair(CompletionMode::Polling);
         let connection = install_connection(
-            &engine.shared,
+            &engine.shared.session,
             Arc::new(TestPoster { qp_num: 19 }),
             RdmaConnectionConfig::default(),
             None,

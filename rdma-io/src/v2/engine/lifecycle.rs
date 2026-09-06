@@ -207,7 +207,7 @@ mod tests {
             destroys: AtomicUsize::new(0),
         });
         install_connection(
-            &engine.shared,
+            &engine.shared.session,
             Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
             RdmaConnectionConfig::default(),
             None,
@@ -215,8 +215,8 @@ mod tests {
         )
         .unwrap();
 
-        engine.shared.synchronously_prepare_driver_drop();
-        engine.shared.synchronously_prepare_driver_drop();
+        engine.shared.session.synchronously_prepare_driver_drop();
+        engine.shared.session.synchronously_prepare_driver_drop();
 
         assert_eq!(poster.destroys.load(Ordering::Acquire), 1);
         engine.shared.finish(MemoizedTerminalResult::success());
@@ -231,7 +231,7 @@ mod tests {
             destroys: AtomicUsize::new(0),
         });
         let connection = install_connection(
-            &engine.shared,
+            &engine.shared.session,
             Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
             RdmaConnectionConfig::default(),
             None,
@@ -248,8 +248,8 @@ mod tests {
             event.deliver();
         }
 
-        engine.shared.synchronously_prepare_driver_drop();
-        engine.shared.synchronously_prepare_driver_drop();
+        engine.shared.session.synchronously_prepare_driver_drop();
+        engine.shared.session.synchronously_prepare_driver_drop();
 
         assert_eq!(poster.destroys.load(Ordering::Acquire), 0);
         engine.shared.finish(MemoizedTerminalResult::success());
@@ -277,7 +277,7 @@ mod tests {
         });
         let poster_dyn: Arc<dyn WorkRequestPoster> = poster.clone();
         let connection = install_connection(
-            &engine.shared,
+            &engine.shared.session,
             poster_dyn,
             RdmaConnectionConfig::default(),
             None,
@@ -291,6 +291,7 @@ mod tests {
         connection.state.add_accepted(token);
         engine
             .shared
+            .io_core
             .accepted_operations
             .fetch_add(1, Ordering::AcqRel);
 

@@ -1266,7 +1266,11 @@ mod tests {
         listener.route_selected(&request, 42).unwrap();
         assert!(lock_unpoison(&listener.queues).selected.is_some());
 
-        engine.shared.cm.mark_accept_delivered(&listener, &request);
+        engine
+            .shared
+            .session
+            .cm
+            .mark_accept_delivered(&listener, &request);
         assert!(lock_unpoison(&listener.queues).selected.is_none());
 
         drop(engine);

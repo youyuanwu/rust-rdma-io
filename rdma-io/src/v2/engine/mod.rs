@@ -45,8 +45,6 @@ mod session;
 #[cfg(test)]
 mod api_tests;
 
-#[cfg(test)]
-use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
@@ -570,18 +568,6 @@ impl IoDriverSignal for EngineIoDriverSignal {
     }
 }
 
-#[cfg(test)]
-impl Deref for EngineShared {
-    // Session state is physically owned by SessionManager. Existing internal
-    // modules are migrated receiver-by-receiver without re-exposing those
-    // fields on the composition root.
-    type Target = SessionManager;
-
-    fn deref(&self) -> &Self::Target {
-        &self.session
-    }
-}
-
 impl EngineShared {
     fn into_shared(self) -> Arc<Self> {
         let shared = Arc::new(self);
@@ -922,62 +908,6 @@ impl EngineShared {
             quarantined_bytes: io.quarantined_bytes,
             quarantined_connections: connection_counts.quarantined_bundles,
         }
-    }
-
-    #[cfg(test)]
-    fn register_memory(&self, len: usize, access: super::AccessIntent) -> Result<super::Mr> {
-        if len == 0 || u32::try_from(len).is_err() {
-            return Err(Error::InvalidConfig(
-                "engine MR length must be in 1..=u32::MAX".into(),
-            ));
-        }
-        let resources = self.resource_refs.as_ref().ok_or_else(|| {
-            Error::InvalidConfig("engine shared protection domain is unavailable".into())
-        })?;
-        resources.pd.reg_mr(len, access)
-    }
-
-    #[cfg(test)]
-    fn has_published_completions(&self) -> bool {
-        self.io_core.has_published_connections()
-    }
-
-    #[cfg(test)]
-    fn apply_io_effects(&self, effects: &mut io_core::IoCoreEffects) {
-        self.session.apply_io_effects(effects);
-    }
-
-    #[cfg(test)]
-    pub(super) fn enqueue_completion(
-        &self,
-        completion: crate::wc::WorkCompletion,
-    ) -> Option<registry::ConnectionToken> {
-        self.session.enqueue_completion(completion)
-    }
-
-    #[cfg(test)]
-    pub(super) fn dispatch_connection_completions(
-        &self,
-        token: registry::ConnectionToken,
-        quantum: usize,
-    ) -> (usize, bool) {
-        self.session.dispatch_connection_completions(token, quantum)
-    }
-
-    #[cfg(test)]
-    pub(super) fn reclaim_after_qp_destroy(
-        &self,
-        proof: &session::QpDestructionProof,
-        connection: &session::connection::ConnectionState,
-        token: registry::OperationToken,
-    ) -> bool {
-        self.session
-            .reclaim_after_qp_destroy_for_test(proof, connection, token)
-    }
-
-    #[cfg(test)]
-    pub(super) fn handle_reclamation_deadline(&self, token: registry::OperationToken) {
-        self.session.handle_reclamation_deadline(token);
     }
 }
 

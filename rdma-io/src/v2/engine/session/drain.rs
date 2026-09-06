@@ -4,8 +4,6 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 
-#[cfg(test)]
-use super::super::EngineShared;
 use super::super::registry::{ConnectionToken, Lookup, read_unpoison};
 use super::super::scheduler::DeadlineKind;
 use super::SessionManager;
@@ -186,35 +184,6 @@ impl SessionManager {
 }
 
 #[cfg(test)]
-impl EngineShared {
-    pub(in crate::v2::engine) fn begin_all_connection_close(&self) {
-        self.session.begin_all_connection_close();
-    }
-
-    pub(in crate::v2::engine) fn schedule_connection_retirement(
-        &self,
-        connection: &ConnectionState,
-    ) {
-        self.session.schedule_connection_retirement(connection);
-    }
-
-    pub(in crate::v2::engine) fn handle_connection_drain_deadline(&self, token: ConnectionToken) {
-        self.session.handle_connection_drain_deadline(token);
-    }
-
-    pub(in crate::v2::engine) fn recover_connection_quarantine(
-        &self,
-        connection: &ConnectionState,
-    ) {
-        self.session.recover_connection_quarantine(connection);
-    }
-
-    pub(in crate::v2::engine) fn record_connection_drained(&self, connection: &ConnectionState) {
-        self.session.record_connection_drained(connection);
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use std::future::Future;
     use std::pin::Pin;
@@ -320,7 +289,7 @@ mod tests {
         let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
         let poster = TestPoster::failing(19);
         let connection = install_connection(
-            &engine.shared,
+            &engine.shared.session,
             poster,
             RdmaConnectionConfig::default(),
             None,
@@ -329,7 +298,15 @@ mod tests {
         .unwrap();
         let mut close = Box::pin(connection.close());
         assert!(poll_once(close.as_mut()).is_pending());
-        assert_eq!(engine.shared.connection_admission.snapshot().draining, 0);
+        assert_eq!(
+            engine
+                .shared
+                .session
+                .connection_admission
+                .snapshot()
+                .draining,
+            0
+        );
 
         let driver_error = loop {
             match poll_once(Pin::new(&mut driver)) {
@@ -343,7 +320,15 @@ mod tests {
         };
         assert!(matches!(driver_error, Error::Verbs(_)));
         assert_eq!(close_error.to_string(), driver_error.to_string());
-        assert_eq!(engine.shared.connection_admission.snapshot().draining, 0);
+        assert_eq!(
+            engine
+                .shared
+                .session
+                .connection_admission
+                .snapshot()
+                .draining,
+            0
+        );
         assert_eq!(engine.diagnostics().live_connections, 1);
         assert_eq!(engine.diagnostics().lifecycle, RdmaEngineLifecycle::Failed);
         drop(driver);
@@ -366,7 +351,7 @@ mod tests {
         let poster = TestPoster::new(qp_num);
         let poster_dyn: Arc<dyn WorkRequestPoster> = poster.clone();
         let connection = install_connection(
-            &engine.shared,
+            &engine.shared.session,
             poster_dyn,
             RdmaConnectionConfig::default(),
             None,
@@ -380,6 +365,7 @@ mod tests {
         connection.state.add_accepted(token);
         engine
             .shared
+            .io_core
             .accepted_operations
             .fetch_add(1, Ordering::AcqRel);
         (connection, poster, token)
@@ -413,6 +399,7 @@ mod tests {
         assert_eq!(
             engine
                 .shared
+                .session
                 .connection_admission
                 .snapshot()
                 .registered_live_qps,
@@ -427,27 +414,35 @@ mod tests {
         assert!(connection.state.remove_accepted(token));
         engine
             .shared
+            .io_core
             .accepted_operations
             .fetch_sub(1, Ordering::AcqRel);
         engine
             .shared
+            .session
             .recover_connection_quarantine(&connection.state);
         assert_eq!(
             engine
                 .shared
+                .session
                 .connection_admission
                 .snapshot()
                 .registered_live_qps,
             0
         );
-        engine.shared.record_connection_drained(&connection.state);
         engine
             .shared
+            .session
+            .record_connection_drained(&connection.state);
+        engine
+            .shared
+            .session
             .schedule_connection_retirement(&connection.state);
         engine
             .shared
+            .session
             .cm
-            .service_software(&engine.shared, None, 32)
+            .service_software(&engine.shared.session, None, 32)
             .unwrap();
         assert_eq!(poster.destroys.load(Ordering::Acquire), 1);
 
@@ -476,7 +471,7 @@ mod tests {
         let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
         let poster = TestPoster::destroy_failing(23);
         let connection = install_connection(
-            &engine.shared,
+            &engine.shared.session,
             Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
             RdmaConnectionConfig::default(),
             None,
@@ -519,7 +514,7 @@ mod tests {
         let (engine, _driver) = test_engine_pair(CompletionMode::Polling);
         let poster = TestPoster::new(24);
         let connection = install_connection(
-            &engine.shared,
+            &engine.shared.session,
             Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
             RdmaConnectionConfig::default(),
             None,
@@ -536,6 +531,7 @@ mod tests {
         connection.state.add_accepted(anomalous);
         engine
             .shared
+            .io_core
             .accepted_operations
             .fetch_add(1, Ordering::AcqRel);
         connection.state.begin_close();
@@ -547,6 +543,7 @@ mod tests {
 
         engine
             .shared
+            .session
             .handle_connection_drain_deadline(connection.state.token);
 
         let diagnostics = engine.diagnostics();

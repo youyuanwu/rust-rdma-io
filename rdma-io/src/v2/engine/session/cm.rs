@@ -3657,7 +3657,7 @@ mod tests {
     fn route_queries_and_cm_service_complete_under_lock_order_stress() {
         let (engine, driver) =
             super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
-        let shared = Arc::clone(&engine.shared);
+        let shared = Arc::clone(&engine.shared.session);
         let start = Arc::new(Barrier::new(3));
 
         let diagnostics_shared = Arc::clone(&shared);
@@ -3851,8 +3851,9 @@ mod tests {
             super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
         let listener = ListenerState::test_only(2);
         let listener_token = 17;
-        lock_unpoison(&engine.shared.cm.listeners).insert(listener_token, Arc::clone(&listener));
-        lock_unpoison(&engine.shared.cm.context_routes).insert(
+        lock_unpoison(&engine.shared.session.cm.listeners)
+            .insert(listener_token, Arc::clone(&listener));
+        lock_unpoison(&engine.shared.session.cm.context_routes).insert(
             0x5000,
             ContextRoute::Listener {
                 token: listener_token,
@@ -3863,11 +3864,12 @@ mod tests {
         assert!(
             !engine
                 .shared
+                .session
                 .cm
                 .remove_context_route_if_owned(0x5000, 0x4001, None)
         );
         assert!(matches!(
-            lock_unpoison(&engine.shared.cm.context_routes)
+            lock_unpoison(&engine.shared.session.cm.context_routes)
                 .get(&0x5000)
                 .copied(),
             Some(ContextRoute::Listener {
@@ -3883,16 +3885,22 @@ mod tests {
             listen_id: 0,
             context_key: 0x5000,
         };
-        let routed = engine.shared.cm.lookup_dispatch_route(snapshot).unwrap();
+        let routed = engine
+            .shared
+            .session
+            .cm
+            .lookup_dispatch_route(snapshot)
+            .unwrap();
         let CmDispatchRoute::Listener(routed_listener) = routed else {
             panic!("listener context route changed after unowned child rejection");
         };
         assert!(Arc::ptr_eq(&routed_listener, &listener));
         assert!(matches!(
-            engine
-                .shared
-                .cm
-                .handle_listener_event(&engine.shared, &listener, snapshot),
+            engine.shared.session.cm.handle_listener_event(
+                &engine.shared.session,
+                &listener,
+                snapshot
+            ),
             Ok(EventDisposition::Handled)
         ));
         assert!(listener.is_closing());
@@ -3903,10 +3911,11 @@ mod tests {
             ..snapshot
         };
         assert!(matches!(
-            engine
-                .shared
-                .cm
-                .handle_listener_event(&engine.shared, &listener, removed),
+            engine.shared.session.cm.handle_listener_event(
+                &engine.shared.session,
+                &listener,
+                removed
+            ),
             Err(Error::Verbs(_))
         ));
 
@@ -3915,12 +3924,12 @@ mod tests {
             generation: 2,
         }
         .encode();
-        assert!(!engine.shared.cm.remove_context_route_if_owned(
+        assert!(!engine.shared.session.cm.remove_context_route_if_owned(
             0x5000,
             0x4000,
             Some(wrong_generation)
         ));
-        assert!(engine.shared.cm.remove_context_route_if_owned(
+        assert!(engine.shared.session.cm.remove_context_route_if_owned(
             0x5000,
             0x4000,
             Some(listener_token)
@@ -3991,7 +4000,7 @@ mod tests {
         let (engine, driver) =
             super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
         let connection = install_connection(
-            &engine.shared,
+            &engine.shared.session,
             Arc::new(NoopPoster(7)),
             RdmaConnectionConfig::default()
                 .max_send_wr(1)
@@ -4021,7 +4030,7 @@ mod tests {
         );
 
         let failed_connection = install_connection(
-            &engine.shared,
+            &engine.shared.session,
             Arc::new(NoopPoster(8)),
             RdmaConnectionConfig::default()
                 .max_send_wr(1)
@@ -4051,7 +4060,7 @@ mod tests {
         assert_eq!(&*lock_unpoison(&order), &["setup"]);
 
         let mismatched_connection = install_connection(
-            &engine.shared,
+            &engine.shared.session,
             Arc::new(NoopPoster(9)),
             RdmaConnectionConfig::default()
                 .max_send_wr(1)
@@ -4087,7 +4096,7 @@ mod tests {
         let (engine, driver) =
             super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
         let connection = install_connection(
-            &engine.shared,
+            &engine.shared.session,
             Arc::new(NoopPoster(11)),
             RdmaConnectionConfig::default()
                 .max_send_wr(1)
@@ -4099,6 +4108,7 @@ mod tests {
         let request = Arc::new(test_request());
         let (_, route) = engine
             .shared
+            .session
             .cm
             .routes
             .allocate_with(|token| Arc::new(OutboundRoute::new(token, Arc::clone(&request))))
@@ -4135,7 +4145,7 @@ mod tests {
             "neither the route nor the test connection frontend retains the engine root"
         );
 
-        engine.shared.cm.retire_route(&route, true);
+        engine.shared.session.cm.retire_route(&route, true);
         drop(connection);
         drop(engine);
         drop(driver);
@@ -4146,7 +4156,7 @@ mod tests {
         let (engine, driver) =
             super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
         let connection = install_connection(
-            &engine.shared,
+            &engine.shared.session,
             Arc::new(NoopPoster(12)),
             RdmaConnectionConfig::default()
                 .max_send_wr(1)
@@ -4158,6 +4168,7 @@ mod tests {
         let request = Arc::new(test_request());
         let (_, route) = engine
             .shared
+            .session
             .cm
             .routes
             .allocate_with(|token| Arc::new(OutboundRoute::new(token, Arc::clone(&request))))
@@ -4168,8 +4179,8 @@ mod tests {
         });
         request.complete(Ok(connection));
 
-        engine.shared.cm.begin_shutdown(
-            &engine.shared,
+        engine.shared.session.cm.begin_shutdown(
+            &engine.shared.session,
             &MemoizedTerminalResult::from_error(Error::DriverShutdown),
         );
 
@@ -4177,19 +4188,24 @@ mod tests {
             request.take_result(),
             Some(Err(Error::DriverShutdown))
         ));
-        assert_eq!(lock_unpoison(&engine.shared.cm.cancellations).len(), 1);
+        assert_eq!(
+            lock_unpoison(&engine.shared.session.cm.cancellations).len(),
+            1
+        );
 
         let processed = engine
             .shared
+            .session
             .cm
-            .service_software(&engine.shared, None, 1)
+            .service_software(&engine.shared.session, None, 1)
             .unwrap();
         assert_eq!(processed, 1);
-        assert!(lock_unpoison(&engine.shared.cm.cancellations).is_empty());
+        assert!(lock_unpoison(&engine.shared.session.cm.cancellations).is_empty());
         let _ = engine
             .shared
+            .session
             .cm
-            .service_software(&engine.shared, None, 1)
+            .service_software(&engine.shared.session, None, 1)
             .unwrap();
         drop(engine);
         drop(driver);
@@ -4202,13 +4218,14 @@ mod tests {
         let request = Arc::new(test_request());
         let (route_token, route) = engine
             .shared
+            .session
             .cm
             .routes
             .allocate_with(|token| Arc::new(OutboundRoute::new(token, Arc::clone(&request))))
             .unwrap();
-        let (admission, reservation) = reserve_connection(&engine.shared).unwrap();
+        let (admission, reservation) = reserve_connection(&engine.shared.session).unwrap();
         let connection = install_reserved_connection(
-            &engine.shared,
+            &engine.shared.session,
             Arc::new(NoopPoster(13)),
             RdmaConnectionConfig::default()
                 .max_send_wr(1)
@@ -4227,17 +4244,25 @@ mod tests {
             .session
             .mint_qp_destruction_proof_for_test(&connection.state);
 
-        engine.shared.cm.enqueue_retirement(connection.state.token);
+        engine
+            .shared
+            .session
+            .cm
+            .enqueue_retirement(connection.state.token);
         let processed = engine
             .shared
+            .session
             .cm
-            .service_software(&engine.shared, None, 32)
+            .service_software(&engine.shared.session, None, 32)
             .unwrap();
         assert_eq!(
             processed, 1,
             "a requeued retirement may run only once per service pass"
         );
-        assert_eq!(lock_unpoison(&engine.shared.cm.retirements).len(), 1);
+        assert_eq!(
+            lock_unpoison(&engine.shared.session.cm.retirements).len(),
+            1
+        );
         assert!(!connection.state.is_retired());
 
         route.set_state(OutboundState::Closing {
@@ -4252,14 +4277,19 @@ mod tests {
         );
         let processed = engine
             .shared
+            .session
             .cm
-            .service_software(&engine.shared, None, 32)
+            .service_software(&engine.shared.session, None, 32)
             .unwrap();
         assert_eq!(processed, 1);
-        assert!(lock_unpoison(&engine.shared.cm.retirements).is_empty());
+        assert!(lock_unpoison(&engine.shared.session.cm.retirements).is_empty());
         assert!(connection.state.is_retired());
         assert!(matches!(
-            engine.shared.connections.lookup(connection.state.token),
+            engine
+                .shared
+                .session
+                .connections
+                .lookup(connection.state.token),
             Lookup::Duplicate
         ));
 
@@ -4276,6 +4306,7 @@ mod tests {
         let listener = ListenerState::test_only(1);
         let (route_token, route) = engine
             .shared
+            .session
             .cm
             .inbound_routes
             .allocate_with(|token| Arc::new(InboundRoute::new(token, Arc::downgrade(&listener))))
@@ -4304,8 +4335,9 @@ mod tests {
         assert!(matches!(
             engine
                 .shared
+                .session
                 .cm
-                .handle_inbound_disconnected(&engine.shared, &route),
+                .handle_inbound_disconnected(&engine.shared.session, &route),
             Ok(EventDisposition::Handled)
         ));
         let Some(Err(error)) = request.take_result_for_test() else {
@@ -4317,7 +4349,12 @@ mod tests {
                 .contains("lost connection state before accept retirement")
         );
         assert!(matches!(
-            engine.shared.cm.inbound_routes.lookup_cloned(route_token),
+            engine
+                .shared
+                .session
+                .cm
+                .inbound_routes
+                .lookup_cloned(route_token),
             Lookup::Duplicate
         ));
 
@@ -4330,25 +4367,29 @@ mod tests {
         let (engine, driver) =
             super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
         let listener_state = ListenerState::test_only(1);
-        let listener = RdmaListener::from_state(&engine.shared, Arc::clone(&listener_state));
+        let listener =
+            RdmaListener::from_state(&engine.shared.session, Arc::clone(&listener_state));
         let mut close = Box::pin(listener.close());
         let mut cx = Context::from_waker(std::task::Waker::noop());
         assert!(close.as_mut().poll(&mut cx).is_pending());
         let destroy_count = Arc::new(AtomicUsize::new(0));
-        lock_unpoison(&engine.shared.cm.cm_destructions).push_back(PendingCmDestruction::Test {
-            destroy_count: Arc::clone(&destroy_count),
-            target: TestCmDestruction::Listener {
-                listener: listener_state,
-                destroy_error: Some(
-                    "destroy listener CM ID for 127.0.0.1:1: injected failure".into(),
-                ),
+        lock_unpoison(&engine.shared.session.cm.cm_destructions).push_back(
+            PendingCmDestruction::Test {
+                destroy_count: Arc::clone(&destroy_count),
+                target: TestCmDestruction::Listener {
+                    listener: listener_state,
+                    destroy_error: Some(
+                        "destroy listener CM ID for 127.0.0.1:1: injected failure".into(),
+                    ),
+                },
             },
-        });
+        );
 
         let error = engine
             .shared
+            .session
             .cm
-            .service_cm_destructions(&engine.shared, 1, || Ok(false))
+            .service_cm_destructions(&engine.shared.session, 1, || Ok(false))
             .unwrap_err();
         assert!(error.to_string().contains("injected failure"));
         let Poll::Ready(Err(close_error)) = close.as_mut().poll(&mut cx) else {
@@ -4356,12 +4397,13 @@ mod tests {
         };
         assert_eq!(close_error.to_string(), error.to_string());
         assert_eq!(destroy_count.load(Ordering::Acquire), 1);
-        assert!(lock_unpoison(&engine.shared.cm.cm_destructions).is_empty());
+        assert!(lock_unpoison(&engine.shared.session.cm.cm_destructions).is_empty());
         assert_eq!(
             engine
                 .shared
+                .session
                 .cm
-                .service_cm_destructions(&engine.shared, 1, || Ok(false))
+                .service_cm_destructions(&engine.shared.session, 1, || Ok(false))
                 .unwrap(),
             0
         );
@@ -4398,19 +4440,22 @@ mod tests {
         let (engine, driver) =
             super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
         let listener_state = ListenerState::test_only(1);
-        let listener = RdmaListener::from_state(&engine.shared, Arc::clone(&listener_state));
+        let listener =
+            RdmaListener::from_state(&engine.shared.session, Arc::clone(&listener_state));
         let late_listener_state = Arc::clone(&listener_state);
         let mut close = Box::pin(listener.close());
         let mut cx = Context::from_waker(std::task::Waker::noop());
         assert!(close.as_mut().poll(&mut cx).is_pending());
         let destroy_count = Arc::new(AtomicUsize::new(0));
-        lock_unpoison(&engine.shared.cm.cm_destructions).push_back(PendingCmDestruction::Test {
-            destroy_count: Arc::clone(&destroy_count),
-            target: TestCmDestruction::Listener {
-                listener: listener_state,
-                destroy_error: None,
+        lock_unpoison(&engine.shared.session.cm.cm_destructions).push_back(
+            PendingCmDestruction::Test {
+                destroy_count: Arc::clone(&destroy_count),
+                target: TestCmDestruction::Listener {
+                    listener: listener_state,
+                    destroy_error: None,
+                },
             },
-        });
+        );
         let mut pending = VecDeque::from(["target", "peer"]);
         let mut routed = Vec::new();
         let mut probes = 0;
@@ -4418,8 +4463,9 @@ mod tests {
         for expected in ["target", "peer"] {
             let processed = engine
                 .shared
+                .session
                 .cm
-                .service_cm_destructions(&engine.shared, 1, || {
+                .service_cm_destructions(&engine.shared.session, 1, || {
                     probes += 1;
                     let Some(event) = pending.pop_front() else {
                         return Ok(false);
@@ -4431,12 +4477,16 @@ mod tests {
             assert_eq!(processed, 1);
             assert_eq!(routed.last().copied(), Some(expected));
             assert_eq!(destroy_count.load(Ordering::Acquire), 0);
-            assert_eq!(lock_unpoison(&engine.shared.cm.cm_destructions).len(), 1);
+            assert_eq!(
+                lock_unpoison(&engine.shared.session.cm.cm_destructions).len(),
+                1
+            );
         }
         let processed = engine
             .shared
+            .session
             .cm
-            .service_cm_destructions(&engine.shared, 1, || {
+            .service_cm_destructions(&engine.shared.session, 1, || {
                 probes += 1;
                 Ok(false)
             })
@@ -4446,7 +4496,7 @@ mod tests {
         assert_eq!(routed, ["target", "peer"]);
         assert!(pending.is_empty());
         assert_eq!(destroy_count.load(Ordering::Acquire), 1);
-        assert!(lock_unpoison(&engine.shared.cm.cm_destructions).is_empty());
+        assert!(lock_unpoison(&engine.shared.session.cm.cm_destructions).is_empty());
         assert!(matches!(close.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
         late_listener_state
             .finish_close(Some(Error::InvalidConfig("late duplicate finish".into())));
@@ -4458,8 +4508,9 @@ mod tests {
         assert_eq!(
             engine
                 .shared
+                .session
                 .cm
-                .service_cm_destructions(&engine.shared, 1, || Ok(false))
+                .service_cm_destructions(&engine.shared.session, 1, || Ok(false))
                 .unwrap(),
             0
         );
@@ -4497,7 +4548,7 @@ mod tests {
         let (engine, driver) =
             super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
         let connection = install_connection(
-            &engine.shared,
+            &engine.shared.session,
             Arc::new(NoopPoster(32)),
             RdmaConnectionConfig::default()
                 .max_send_wr(1)
@@ -4517,20 +4568,23 @@ mod tests {
             selected: true,
         };
         let destroy_count = Arc::new(AtomicUsize::new(0));
-        lock_unpoison(&engine.shared.cm.cm_destructions).push_back(PendingCmDestruction::Test {
-            destroy_count: Arc::clone(&destroy_count),
-            target: TestCmDestruction::Connection {
-                connection: Arc::clone(&connection.state),
-                completion: Some(completion),
-                destroy_error: destroy_error.map(str::to_owned),
-                finalize_error: finalize_error.map(str::to_owned),
+        lock_unpoison(&engine.shared.session.cm.cm_destructions).push_back(
+            PendingCmDestruction::Test {
+                destroy_count: Arc::clone(&destroy_count),
+                target: TestCmDestruction::Connection {
+                    connection: Arc::clone(&connection.state),
+                    completion: Some(completion),
+                    destroy_error: destroy_error.map(str::to_owned),
+                    finalize_error: finalize_error.map(str::to_owned),
+                },
             },
-        });
+        );
 
         let error = engine
             .shared
+            .session
             .cm
-            .service_cm_destructions(&engine.shared, 1, || Ok(false))
+            .service_cm_destructions(&engine.shared.session, 1, || Ok(false))
             .unwrap_err();
         assert!(error.to_string().contains(expected));
         assert!(connection.state.is_retired());
@@ -4545,12 +4599,13 @@ mod tests {
         };
         assert!(close_error.to_string().contains(expected));
         assert_eq!(destroy_count.load(Ordering::Acquire), 1);
-        assert!(lock_unpoison(&engine.shared.cm.cm_destructions).is_empty());
+        assert!(lock_unpoison(&engine.shared.session.cm.cm_destructions).is_empty());
         assert_eq!(
             engine
                 .shared
+                .session
                 .cm
-                .service_cm_destructions(&engine.shared, 1, || Ok(false))
+                .service_cm_destructions(&engine.shared.session, 1, || Ok(false))
                 .unwrap(),
             0
         );
@@ -4558,6 +4613,7 @@ mod tests {
 
         let retained = engine
             .shared
+            .session
             .connections
             .release(connection.state.token, connection.state.qp_num());
         assert_eq!(retained.is_some(), registry_retained);

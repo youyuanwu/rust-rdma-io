@@ -2073,8 +2073,9 @@ pub(in crate::v2::engine) fn install_accepted_operation_for_driver_test(
         Direction::Send
     };
     connection.reserve_local(direction).unwrap();
-    assert!(shared.cq_credits.reserve());
+    assert!(shared.io_core.cq_credits.reserve());
     let (token, operation) = shared
+        .io_core
         .operations
         .allocate(|token| {
             Arc::new(OperationState::new(
@@ -2088,7 +2089,10 @@ pub(in crate::v2::engine) fn install_accepted_operation_for_driver_test(
         })
         .unwrap();
     operation.commit_accepted();
-    shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
+    shared
+        .io_core
+        .accepted_operations
+        .fetch_add(1, Ordering::AcqRel);
     token
 }
 
@@ -2210,8 +2214,9 @@ mod tests {
         let shared = synthetic_engine(8);
         let connection = synthetic_connection_on(&shared, 6);
         connection.state.reserve_local(Direction::Send).unwrap();
-        assert!(shared.cq_credits.reserve());
+        assert!(shared.io_core.cq_credits.reserve());
         let (token, operation) = shared
+            .io_core
             .operations
             .allocate(|token| {
                 Arc::new(OperationState::new(
@@ -2234,25 +2239,28 @@ mod tests {
         ));
         assert_eq!(operation.lifecycle(), OperationLifecycle::Posting);
         let early = operation.commit_accepted().expect("early completion");
-        shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
+        shared
+            .io_core
+            .accepted_operations
+            .fetch_add(1, Ordering::AcqRel);
         assert_eq!(operation.lifecycle(), OperationLifecycle::Completing);
         let mut effects = shared
             .io_core
             .finish_operation(Arc::clone(&operation), early);
-        shared.apply_io_effects(&mut effects);
+        shared.session.apply_io_effects(&mut effects);
         effects.publish();
         assert_eq!(operation.lifecycle(), OperationLifecycle::Released);
 
         let token = install_accepted(&shared, &connection.state, WcOpcode::Send);
-        let Lookup::Occupied(operation) = shared.operations.lookup(token) else {
+        let Lookup::Occupied(operation) = shared.io_core.operations.lookup(token) else {
             panic!("accepted operation")
         };
         assert_eq!(operation.lifecycle(), OperationLifecycle::InFlight);
-        assert!(operation.cancel(&shared));
+        assert!(operation.cancel(&shared.io_core));
         assert_eq!(operation.lifecycle(), OperationLifecycle::Cancelled);
-        shared.begin_reclamation(token);
+        shared.io_core.begin_reclamation(token);
         assert_eq!(operation.lifecycle(), OperationLifecycle::Reclaiming);
-        shared.handle_reclamation_deadline(token);
+        shared.session.handle_reclamation_deadline(token);
         assert_eq!(operation.lifecycle(), OperationLifecycle::Quarantined);
         let completion = wc(token, 6, IBV_WC_SEND);
         assert!(operation.mark_completion_queued());
@@ -2264,7 +2272,7 @@ mod tests {
         let mut effects = shared
             .io_core
             .finish_operation(Arc::clone(&operation), completion);
-        shared.apply_io_effects(&mut effects);
+        shared.session.apply_io_effects(&mut effects);
         effects.publish();
         assert_eq!(operation.lifecycle(), OperationLifecycle::Released);
     }
@@ -2285,7 +2293,7 @@ mod tests {
 
             fn wake_by_ref(self: &Arc<Self>) {
                 assert!(
-                    self.shared.admission.try_write().is_ok(),
+                    self.shared.session.admission.try_write().is_ok(),
                     "I/O event wake ran while admission remained locked"
                 );
                 self.observed.store(true, Ordering::Release);
@@ -2295,7 +2303,7 @@ mod tests {
         let shared = synthetic_engine(8);
         let connection = synthetic_connection_on(&shared, 21);
         connection.state.reserve_local(Direction::Send).unwrap();
-        assert!(shared.cq_credits.reserve());
+        assert!(shared.io_core.cq_credits.reserve());
         let (sender, receiver) = super::super::io::event_port();
         let wake = Arc::new(AdmissionCheckingWake {
             shared: Arc::clone(&shared),
@@ -2303,6 +2311,7 @@ mod tests {
         });
         receiver.register(&Waker::from(Arc::clone(&wake)));
         let (token, operation) = shared
+            .io_core
             .operations
             .allocate(|token| {
                 Arc::new(OperationState::new_with_event(
@@ -2318,14 +2327,23 @@ mod tests {
             .unwrap();
         connection.state.add_accepted(token);
         operation.commit_accepted();
-        shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
+        shared
+            .io_core
+            .accepted_operations
+            .fetch_add(1, Ordering::AcqRel);
         assert_eq!(
-            shared.enqueue_completion(wc(token, connection.identity().qp_num(), IBV_WC_SEND,)),
+            shared.session.enqueue_completion(wc(
+                token,
+                connection.identity().qp_num(),
+                IBV_WC_SEND,
+            )),
             Some(connection.state.token)
         );
 
         assert_eq!(
-            shared.dispatch_connection_completions(connection.state.token, 1),
+            shared
+                .session
+                .dispatch_connection_completions(connection.state.token, 1),
             (1, false)
         );
         assert!(wake.observed.load(Ordering::Acquire));
@@ -2340,9 +2358,10 @@ mod tests {
         let shared = synthetic_engine(8);
         let connection = synthetic_connection_on(&shared, 18);
         connection.state.reserve_local(Direction::Send).unwrap();
-        assert!(shared.cq_credits.reserve());
+        assert!(shared.io_core.cq_credits.reserve());
         let (sender, receiver) = super::super::io::event_port();
         let (token, operation) = shared
+            .io_core
             .operations
             .allocate(|token| {
                 Arc::new(OperationState::new_with_event(
@@ -2357,7 +2376,10 @@ mod tests {
             })
             .unwrap();
         operation.commit_accepted();
-        shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
+        shared
+            .io_core
+            .accepted_operations
+            .fetch_add(1, Ordering::AcqRel);
         let terminal = connection
             .state
             .mark_cm_failure(Error::ProtocolViolation("contextual close failure".into()));
@@ -2366,7 +2388,11 @@ mod tests {
             .session
             .mint_qp_destruction_proof_for_test(&connection.state);
 
-        assert!(shared.reclaim_after_qp_destroy(&proof, &connection.state, token));
+        assert!(
+            shared
+                .session
+                .reclaim_after_qp_destroy_for_test(&proof, &connection.state, token)
+        );
         let Some(super::super::io::IoEvent::Completion(completion)) = receiver.pop() else {
             panic!("QP destruction must publish an owned completion event")
         };
@@ -2388,19 +2414,27 @@ mod tests {
             .session
             .mint_qp_destruction_proof_for_test(&other.state);
 
-        assert!(!shared.reclaim_after_qp_destroy(&wrong_proof, &owner.state, token));
+        assert!(!shared.session.reclaim_after_qp_destroy_for_test(
+            &wrong_proof,
+            &owner.state,
+            token
+        ));
         assert_eq!(owner.state.accepted_count(), 1);
         assert!(matches!(
-            shared.operations.lookup(token),
+            shared.io_core.operations.lookup(token),
             Lookup::Occupied(_)
         ));
 
         let proof = shared
             .session
             .mint_qp_destruction_proof_for_test(&owner.state);
-        assert!(shared.reclaim_after_qp_destroy(&proof, &owner.state, token));
+        assert!(
+            shared
+                .session
+                .reclaim_after_qp_destroy_for_test(&proof, &owner.state, token)
+        );
         assert_eq!(owner.state.accepted_count(), 0);
-        assert_eq!(shared.operations.live(), 0);
+        assert_eq!(shared.io_core.operations.live(), 0);
     }
 
     #[test]
@@ -2409,9 +2443,14 @@ mod tests {
         let first = synthetic_connection_on(&shared, 7);
         let exact = install_accepted(&shared, &first.state, WcOpcode::Send);
         let exact_wc = wc(exact, 7, IBV_WC_SEND);
-        assert_eq!(shared.enqueue_completion(exact_wc), Some(first.state.token));
         assert_eq!(
-            shared.dispatch_connection_completions(first.state.token, 1),
+            shared.session.enqueue_completion(exact_wc),
+            Some(first.state.token)
+        );
+        assert_eq!(
+            shared
+                .session
+                .dispatch_connection_completions(first.state.token, 1),
             (1, false)
         );
 
@@ -2423,9 +2462,14 @@ mod tests {
                 install_accepted_with_result(&shared, &first.state, WcOpcode::Send);
             let mut fatal_wc = wc(fatal, 7, IBV_WC_SEND);
             fatal_wc.inner.status = raw_status;
-            assert_eq!(shared.enqueue_completion(fatal_wc), Some(first.state.token));
             assert_eq!(
-                shared.dispatch_connection_completions(first.state.token, 1),
+                shared.session.enqueue_completion(fatal_wc),
+                Some(first.state.token)
+            );
+            assert_eq!(
+                shared
+                    .session
+                    .dispatch_connection_completions(first.state.token, 1),
                 (1, false)
             );
             let Some(super::super::io::IoEvent::Completion(completion)) = events.pop() else {
@@ -2440,10 +2484,10 @@ mod tests {
                     if status == expected_status
             ));
         }
-        assert_eq!(shared.rejected_cqes.load(Ordering::Acquire), 0);
+        assert_eq!(shared.io_core.rejected_cqes.load(Ordering::Acquire), 0);
 
-        assert!(shared.enqueue_completion(exact_wc).is_none());
-        assert_eq!(shared.rejected_cqes.load(Ordering::Acquire), 1);
+        assert!(shared.session.enqueue_completion(exact_wc).is_none());
+        assert_eq!(shared.io_core.rejected_cqes.load(Ordering::Acquire), 1);
 
         let unknown = OperationToken {
             slot: 99,
@@ -2451,6 +2495,7 @@ mod tests {
         };
         assert!(
             shared
+                .session
                 .enqueue_completion(wc(unknown, 7, IBV_WC_SEND))
                 .is_none()
         );
@@ -2458,6 +2503,7 @@ mod tests {
         let wrong_qp = install_accepted(&shared, &first.state, WcOpcode::Send);
         assert!(
             shared
+                .session
                 .enqueue_completion(wc(wrong_qp, 8, IBV_WC_SEND))
                 .is_none()
         );
@@ -2465,11 +2511,13 @@ mod tests {
         let wrong_opcode = install_accepted(&shared, &first.state, WcOpcode::Send);
         assert!(
             shared
+                .session
                 .enqueue_completion(wc(wrong_opcode, 7, IBV_WC_RECV))
                 .is_none()
         );
 
         let (stale, _) = shared
+            .io_core
             .operations
             .allocate(|token| {
                 Arc::new(OperationState::new(
@@ -2482,14 +2530,16 @@ mod tests {
                 ))
             })
             .unwrap();
-        shared.operations.release(stale, false).unwrap();
+        shared.io_core.operations.release(stale, false).unwrap();
         assert!(
             shared
+                .session
                 .enqueue_completion(wc(stale, 7, IBV_WC_SEND))
                 .is_none()
         );
 
         let (retired, _) = shared
+            .io_core
             .operations
             .allocate(|token| {
                 Arc::new(OperationState::new(
@@ -2503,44 +2553,53 @@ mod tests {
             })
             .unwrap();
         let retired = shared
+            .io_core
             .operations
             .slots
             .force_generation_for_test(retired, u32::MAX);
-        shared.operations.release(retired, false).unwrap();
-        assert!(matches!(shared.operations.lookup(retired), Lookup::Retired));
+        shared.io_core.operations.release(retired, false).unwrap();
+        assert!(matches!(
+            shared.io_core.operations.lookup(retired),
+            Lookup::Retired
+        ));
         assert!(
             shared
+                .session
                 .enqueue_completion(wc(retired, 7, IBV_WC_SEND))
                 .is_none()
         );
         assert_eq!(
-            lock_unpoison(&shared.rejected_cqe_reasons).last(),
+            lock_unpoison(&shared.io_core.rejected_cqe_reasons).last(),
             Some(&CqeReject::RetiredOperation)
         );
 
         let second = synthetic_connection_on(&shared, 8);
         let wrong_connection = install_accepted(&shared, &first.state, WcOpcode::Send);
         shared
+            .session
             .connections
             .set_qp_mapping_for_test(7, second.state.token);
         assert!(
             shared
+                .session
                 .enqueue_completion(wc(wrong_connection, 7, IBV_WC_SEND))
                 .is_none()
         );
 
         let stale_connection = install_accepted(&shared, &second.state, WcOpcode::Send);
         shared
+            .session
             .connections
             .release(second.state.token, second.state.qp_num());
         assert!(
             shared
+                .session
                 .enqueue_completion(wc(stale_connection, 8, IBV_WC_SEND))
                 .is_none()
         );
 
-        assert_eq!(shared.rejected_cqes.load(Ordering::Acquire), 8);
-        let rejection_reasons = lock_unpoison(&shared.rejected_cqe_reasons);
+        assert_eq!(shared.io_core.rejected_cqes.load(Ordering::Acquire), 8);
+        let rejection_reasons = lock_unpoison(&shared.io_core.rejected_cqe_reasons);
         assert!(rejection_reasons.contains(&CqeReject::StaleOperation));
         assert!(rejection_reasons.contains(&CqeReject::RetiredOperation));
     }
@@ -2553,22 +2612,27 @@ mod tests {
         let completion = wc(token, 16, IBV_WC_SEND);
 
         assert_eq!(
-            shared.enqueue_completion(completion),
+            shared.session.enqueue_completion(completion),
             Some(connection.state.token)
         );
-        assert!(shared.enqueue_completion(completion).is_none());
-        assert_eq!(shared.rejected_cqes.load(Ordering::Acquire), 1);
+        assert!(shared.session.enqueue_completion(completion).is_none());
+        assert_eq!(shared.io_core.rejected_cqes.load(Ordering::Acquire), 1);
         assert_eq!(
-            lock_unpoison(&shared.rejected_cqe_reasons).as_slice(),
+            lock_unpoison(&shared.io_core.rejected_cqe_reasons).as_slice(),
             &[CqeReject::Duplicate]
         );
         assert_eq!(
-            shared.dispatch_connection_completions(connection.state.token, 2),
+            shared
+                .session
+                .dispatch_connection_completions(connection.state.token, 2),
             (1, false)
         );
-        assert_eq!(shared.operations.live(), 0);
-        assert_eq!(shared.accepted_operations.load(Ordering::Acquire), 0);
-        assert_eq!(shared.cq_credits.free(), 8);
+        assert_eq!(shared.io_core.operations.live(), 0);
+        assert_eq!(
+            shared.io_core.accepted_operations.load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(shared.io_core.cq_credits.free(), 8);
     }
 
     #[test]
@@ -2576,7 +2640,7 @@ mod tests {
         let shared = synthetic_engine(8);
         let first = synthetic_connection_on(&shared, 9);
         let duplicate = install_connection(
-            &shared,
+            &shared.session,
             Arc::new(NoopPoster(9)),
             super::super::RdmaConnectionConfig::default()
                 .max_send_wr(1)
@@ -2585,10 +2649,10 @@ mod tests {
             None,
         );
         assert!(matches!(duplicate, Err(Error::InvalidConfig(_))));
-        assert_eq!(shared.connections.live(), 1);
-        assert_eq!(shared.connections.free(), 7);
+        assert_eq!(shared.session.connections.live(), 1);
+        assert_eq!(shared.session.connections.free(), 7);
         assert_eq!(
-            shared.connections.lookup_qp(9),
+            shared.session.connections.lookup_qp(9),
             Some(first.state.token),
             "the original exact qp_num mapping must remain installed"
         );
@@ -2601,16 +2665,22 @@ mod tests {
         for _ in 0..3 {
             let token = install_accepted(&shared, &connection.state, WcOpcode::Recv);
             assert_eq!(
-                shared.enqueue_completion(wc(token, 17, IBV_WC_RECV)),
+                shared
+                    .session
+                    .enqueue_completion(wc(token, 17, IBV_WC_RECV)),
                 Some(connection.state.token)
             );
         }
         assert_eq!(
-            shared.dispatch_connection_completions(connection.state.token, 2),
+            shared
+                .session
+                .dispatch_connection_completions(connection.state.token, 2),
             (2, true)
         );
         assert_eq!(
-            shared.dispatch_connection_completions(connection.state.token, 2),
+            shared
+                .session
+                .dispatch_connection_completions(connection.state.token, 2),
             (1, false)
         );
     }
@@ -2656,7 +2726,9 @@ mod tests {
         let shared = Arc::clone(&engine.shared);
         let poster = Arc::new(ScriptedPoster::new(&shared, 41, ScriptedPost::Accepted));
         let connection = scripted_connection(&shared, Arc::clone(&poster), 2, 2);
-        let mr = shared.register_memory(64, AccessIntent::LocalOnly).unwrap();
+        let mr = connection
+            .register_memory(64, AccessIntent::LocalOnly)
+            .unwrap();
         let mut operation = connection.send(mr, Some((63, 2)));
         let Poll::Ready((result, returned)) = poll_once(&mut operation) else {
             panic!("invalid range must fail synchronously")
@@ -2664,8 +2736,8 @@ mod tests {
         assert!(matches!(result, Err(Error::InvalidConfig(_))));
         assert!(returned.is_some());
         assert_eq!(poster.calls(), 0);
-        assert_eq!(shared.operations.live(), 0);
-        assert_eq!(shared.cq_credits.free(), 4);
+        assert_eq!(shared.io_core.operations.live(), 0);
+        assert_eq!(shared.io_core.cq_credits.free(), 4);
         assert_eq!(connection.state.accepted_count(), 0);
 
         let mut operation = connection.send(returned.unwrap(), None);
@@ -2688,13 +2760,15 @@ mod tests {
         let connection = scripted_connection(&shared, Arc::clone(&poster), 1, 1);
         let recorder = DestructionRecorder::arm(4);
         let operation = connection.send(
-            shared.register_memory(64, AccessIntent::LocalOnly).unwrap(),
+            connection
+                .register_memory(64, AccessIntent::LocalOnly)
+                .unwrap(),
             None,
         );
         drop(operation);
         assert_eq!(poster.calls(), 0);
-        assert_eq!(shared.operations.live(), 0);
-        assert_eq!(shared.cq_credits.free(), 4);
+        assert_eq!(shared.io_core.operations.live(), 0);
+        assert_eq!(shared.io_core.cq_credits.free(), 4);
         assert_eq!(
             recorder
                 .snapshot()
@@ -2717,8 +2791,12 @@ mod tests {
         let shared = Arc::clone(&engine.shared);
         let poster = Arc::new(ScriptedPoster::new(&shared, 42, ScriptedPost::Accepted));
         let connection = scripted_connection(&shared, Arc::clone(&poster), 1, 1);
-        let first_mr = shared.register_memory(64, AccessIntent::LocalOnly).unwrap();
-        let second_mr = shared.register_memory(64, AccessIntent::LocalOnly).unwrap();
+        let first_mr = connection
+            .register_memory(64, AccessIntent::LocalOnly)
+            .unwrap();
+        let second_mr = connection
+            .register_memory(64, AccessIntent::LocalOnly)
+            .unwrap();
         let mut first = connection.send(first_mr, None);
         assert!(poll_once(&mut first).is_pending());
         let mut second = connection.send(second_mr, None);
@@ -2728,8 +2806,8 @@ mod tests {
         assert!(matches!(result, Err(Error::CapacityExhausted)));
         assert!(returned.is_some());
         assert_eq!(poster.calls(), 1);
-        assert_eq!(shared.operations.live(), 1);
-        assert_eq!(shared.cq_credits.free(), 3);
+        assert_eq!(shared.io_core.operations.live(), 1);
+        assert_eq!(shared.io_core.cq_credits.free(), 3);
         assert_eq!(connection.state.accepted_count(), 1);
 
         complete(&shared, &connection.state, poster.tokens()[0], IBV_WC_SEND);
@@ -2752,17 +2830,17 @@ mod tests {
         let second = scripted_connection(&shared, Arc::clone(&second_poster), 1, 1);
 
         let mut send = first.send(
-            shared.register_memory(64, AccessIntent::LocalOnly).unwrap(),
+            first.register_memory(64, AccessIntent::LocalOnly).unwrap(),
             None,
         );
         let mut recv = first.recv(
-            shared.register_memory(64, AccessIntent::LocalOnly).unwrap(),
+            first.register_memory(64, AccessIntent::LocalOnly).unwrap(),
             None,
         );
         assert!(poll_once(&mut send).is_pending());
         assert!(poll_once(&mut recv).is_pending());
         let mut rejected = second.send(
-            shared.register_memory(64, AccessIntent::LocalOnly).unwrap(),
+            second.register_memory(64, AccessIntent::LocalOnly).unwrap(),
             None,
         );
         let Poll::Ready((result, returned)) = poll_once(&mut rejected) else {
@@ -2771,8 +2849,8 @@ mod tests {
         assert!(matches!(result, Err(Error::CapacityExhausted)));
         assert!(returned.is_some());
         assert_eq!(second_poster.calls(), 0);
-        assert_eq!(shared.operations.live(), 2);
-        assert_eq!(shared.cq_credits.free(), 0);
+        assert_eq!(shared.io_core.operations.live(), 2);
+        assert_eq!(shared.io_core.cq_credits.free(), 0);
         second
             .state
             .reserve_local(Direction::Send)
@@ -2800,7 +2878,9 @@ mod tests {
         let poster = Arc::new(ScriptedPoster::new(&shared, 45, ScriptedPost::Unaccepted));
         let connection = scripted_connection(&shared, Arc::clone(&poster), 1, 1);
         let mut operation = connection.send(
-            shared.register_memory(64, AccessIntent::LocalOnly).unwrap(),
+            connection
+                .register_memory(64, AccessIntent::LocalOnly)
+                .unwrap(),
             None,
         );
         let Poll::Ready((result, returned)) = poll_once(&mut operation) else {
@@ -2809,8 +2889,8 @@ mod tests {
         assert!(matches!(result, Err(Error::PostFailed(_))));
         assert!(returned.is_some());
         assert_eq!(poster.calls(), 1);
-        assert_eq!(shared.operations.live(), 0);
-        assert_eq!(shared.cq_credits.free(), 4);
+        assert_eq!(shared.io_core.operations.live(), 0);
+        assert_eq!(shared.io_core.cq_credits.free(), 4);
         assert_eq!(connection.state.accepted_count(), 0);
         connection
             .state
@@ -2832,7 +2912,7 @@ mod tests {
         let poster = Arc::new(ScriptedPoster::new(&shared, 51, ScriptedPost::Unaccepted));
         let connection = scripted_connection(&shared, Arc::clone(&poster), 1, 2);
         let (io, events) =
-            super::super::io::IoConnection::new(Arc::clone(&shared), Arc::clone(&connection.state))
+            super::super::io::IoConnection::new(&shared.session, Arc::clone(&connection.state))
                 .unwrap();
 
         assert!(matches!(
@@ -2843,13 +2923,15 @@ mod tests {
             }
         ));
         assert_eq!(poster.calls(), 0);
-        assert_eq!(shared.operations.live(), 0);
-        assert_eq!(shared.cq_credits.free(), 4);
+        assert_eq!(shared.io_core.operations.live(), 0);
+        assert_eq!(shared.io_core.cq_credits.free(), 4);
 
         let recorder = DestructionRecorder::arm(8);
         let mut entries = Vec::new();
         for _ in 0..2 {
-            let mr = shared.register_memory(64, AccessIntent::LocalOnly).unwrap();
+            let mr = connection
+                .register_memory(64, AccessIntent::LocalOnly)
+                .unwrap();
             entries.push(IoRecvRequest::new(mr, IoOperationContext::new(())));
         }
         assert!(matches!(
@@ -2861,8 +2943,8 @@ mod tests {
         ));
         assert_eq!(events.queued_len(), 2);
         assert_eq!(poster.calls(), 1);
-        assert_eq!(shared.operations.live(), 0);
-        assert_eq!(shared.cq_credits.free(), 4);
+        assert_eq!(shared.io_core.operations.live(), 0);
+        assert_eq!(shared.io_core.cq_credits.free(), 4);
         assert_eq!(connection.state.accepted_count(), 0);
         connection.state.reserve_local(Direction::Recv).unwrap();
         connection.state.reserve_local(Direction::Recv).unwrap();
@@ -2897,7 +2979,7 @@ mod tests {
         ));
         let connection = scripted_connection(&shared, Arc::clone(&poster), 1, 3);
         let (io, events) =
-            super::super::io::IoConnection::new(Arc::clone(&shared), Arc::clone(&connection.state))
+            super::super::io::IoConnection::new(&shared.session, Arc::clone(&connection.state))
                 .unwrap();
         let requests = (0usize..3)
             .map(|context| {
@@ -2935,8 +3017,8 @@ mod tests {
             events.pop(),
             Some(super::super::io::IoEvent::Completion(_))
         ));
-        assert_eq!(shared.operations.live(), 0);
-        assert_eq!(shared.cq_credits.free(), 8);
+        assert_eq!(shared.io_core.operations.live(), 0);
+        assert_eq!(shared.io_core.cq_credits.free(), 8);
         drop(connection);
         drop(driver);
         drop(engine);
@@ -2958,7 +3040,7 @@ mod tests {
         ));
         let connection = scripted_connection(&shared, Arc::clone(&poster), 1, 3);
         let (io, events) =
-            super::super::io::IoConnection::new(Arc::clone(&shared), Arc::clone(&connection.state))
+            super::super::io::IoConnection::new(&shared.session, Arc::clone(&connection.state))
                 .unwrap();
         let requests = (0usize..3)
             .map(|context| {
@@ -2986,15 +3068,15 @@ mod tests {
         assert!(!unaccepted);
         assert!(!events.has_events());
         assert_eq!(connection.state.accepted_count(), 2);
-        assert_eq!(shared.operations.live(), 2);
+        assert_eq!(shared.io_core.operations.live(), 2);
 
         let tokens = poster.tokens();
         complete(&shared, &connection.state, tokens[0], IBV_WC_RECV);
         complete(&shared, &connection.state, tokens[2], IBV_WC_RECV);
         assert_eq!(events.drain().len(), 2);
         assert_eq!(connection.state.accepted_count(), 0);
-        assert_eq!(shared.operations.live(), 0);
-        assert_eq!(shared.cq_credits.free(), 8);
+        assert_eq!(shared.io_core.operations.live(), 0);
+        assert_eq!(shared.io_core.cq_credits.free(), 8);
         drop(connection);
         drop(driver);
         drop(engine);
@@ -3016,7 +3098,7 @@ mod tests {
         ));
         let connection = scripted_connection(&shared, Arc::clone(&poster), 1, 3);
         let (io, events) =
-            super::super::io::IoConnection::new(Arc::clone(&shared), Arc::clone(&connection.state))
+            super::super::io::IoConnection::new(&shared.session, Arc::clone(&connection.state))
                 .unwrap();
         let requests = (0usize..3)
             .map(|context| {
@@ -3036,11 +3118,13 @@ mod tests {
         ));
         assert!(!events.has_events());
         assert_eq!(connection.state.accepted_count(), 3);
-        assert_eq!(shared.operations.live(), 3);
-        assert_eq!(shared.cq_credits.free(), 5);
+        assert_eq!(shared.io_core.operations.live(), 3);
+        assert_eq!(shared.io_core.cq_credits.free(), 5);
 
         assert_eq!(
-            shared.dispatch_connection_completions(connection.state.token, 1),
+            shared
+                .session
+                .dispatch_connection_completions(connection.state.token, 1),
             (1, false)
         );
         let Some(super::super::io::IoEvent::Completion(completion)) = events.pop() else {
@@ -3052,15 +3136,15 @@ mod tests {
         assert!(mr.is_some());
         assert!(!unaccepted);
         assert_eq!(connection.state.accepted_count(), 2);
-        assert_eq!(shared.operations.live(), 2);
+        assert_eq!(shared.io_core.operations.live(), 2);
 
         let tokens = poster.tokens();
         complete(&shared, &connection.state, tokens[0], IBV_WC_RECV);
         complete(&shared, &connection.state, tokens[1], IBV_WC_RECV);
         assert_eq!(events.drain().len(), 2);
         assert_eq!(connection.state.accepted_count(), 0);
-        assert_eq!(shared.operations.live(), 0);
-        assert_eq!(shared.cq_credits.free(), 8);
+        assert_eq!(shared.io_core.operations.live(), 0);
+        assert_eq!(shared.io_core.cq_credits.free(), 8);
         drop(connection);
         drop(driver);
         drop(engine);
@@ -3073,8 +3157,9 @@ mod tests {
         let mut entries = Vec::new();
         for _ in 0..2 {
             connection.state.reserve_local(Direction::Recv).unwrap();
-            assert!(shared.cq_credits.reserve());
+            assert!(shared.io_core.cq_credits.reserve());
             let (token, state) = shared
+                .io_core
                 .operations
                 .allocate(|token| {
                     Arc::new(OperationState::new(
@@ -3101,18 +3186,22 @@ mod tests {
 
         let raced = entries[1].token;
         assert_eq!(
-            shared.enqueue_completion(wc(raced, 56, IBV_WC_RECV)),
+            shared
+                .session
+                .enqueue_completion(wc(raced, 56, IBV_WC_RECV)),
             Some(connection.state.token)
         );
         assert_eq!(entries[1].state.completion_ownership_for_test(), "queued");
         assert_eq!(
-            shared.dispatch_connection_completions(connection.state.token, 1),
+            shared
+                .session
+                .dispatch_connection_completions(connection.state.token, 1),
             (1, false)
         );
         assert_eq!(entries[1].state.completion_ownership_for_test(), "early");
 
         let entries = match release_proven_unaccepted_entries(
-            &shared,
+            &shared.io_core,
             &connection.state,
             Direction::Recv,
             entries,
@@ -3123,9 +3212,12 @@ mod tests {
                 panic!("a recorded suffix CQE must prevent every suffix release")
             }
         };
-        assert_eq!(shared.operations.live(), 2);
-        assert_eq!(shared.accepted_operations.load(Ordering::Acquire), 0);
-        assert_eq!(shared.cq_credits.free(), 6);
+        assert_eq!(shared.io_core.operations.live(), 2);
+        assert_eq!(
+            shared.io_core.accepted_operations.load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(shared.io_core.cq_credits.free(), 6);
         connection.state.reserve_local(Direction::Recv).unwrap();
         connection.state.reserve_local(Direction::Recv).unwrap();
         assert!(matches!(
@@ -3135,19 +3227,25 @@ mod tests {
         connection.state.release_local(Direction::Recv);
         connection.state.release_local(Direction::Recv);
 
-        commit_internal_entries(&shared, entries).publish();
-        assert_eq!(shared.operations.live(), 1);
-        assert_eq!(shared.accepted_operations.load(Ordering::Acquire), 1);
+        commit_internal_entries(&shared.io_core, entries).publish();
+        assert_eq!(shared.io_core.operations.live(), 1);
+        assert_eq!(
+            shared.io_core.accepted_operations.load(Ordering::Acquire),
+            1
+        );
         assert_eq!(connection.state.accepted_count(), 1);
-        assert_eq!(shared.cq_credits.free(), 7);
+        assert_eq!(shared.io_core.cq_credits.free(), 7);
 
         let remaining = connection.state.accepted_tokens();
         assert_eq!(remaining.len(), 1);
         complete(&shared, &connection.state, remaining[0], IBV_WC_RECV);
-        assert_eq!(shared.operations.live(), 0);
-        assert_eq!(shared.accepted_operations.load(Ordering::Acquire), 0);
+        assert_eq!(shared.io_core.operations.live(), 0);
+        assert_eq!(
+            shared.io_core.accepted_operations.load(Ordering::Acquire),
+            0
+        );
         assert_eq!(connection.state.accepted_count(), 0);
-        assert_eq!(shared.cq_credits.free(), 8);
+        assert_eq!(shared.io_core.cq_credits.free(), 8);
         for _ in 0..4 {
             connection.state.reserve_local(Direction::Recv).unwrap();
         }
@@ -3168,7 +3266,9 @@ mod tests {
         let shared = Arc::clone(&engine.shared);
         let poster = Arc::new(ScriptedPoster::new(&shared, 46, ScriptedPost::Ambiguous));
         let connection = scripted_connection(&shared, Arc::clone(&poster), 1, 1);
-        let mr = shared.register_memory(64, AccessIntent::LocalOnly).unwrap();
+        let mr = connection
+            .register_memory(64, AccessIntent::LocalOnly)
+            .unwrap();
         let recorder = DestructionRecorder::arm(8);
         let mut operation = connection.send(mr, None);
         let Poll::Ready((result, returned)) = poll_once(&mut operation) else {
@@ -3176,16 +3276,25 @@ mod tests {
         };
         assert!(matches!(result, Err(Error::PostFailed(_))));
         assert!(returned.is_none());
-        assert_eq!(shared.operations.live(), 1);
-        assert_eq!(shared.cq_credits.free(), 3);
-        assert_eq!(shared.accepted_operations.load(Ordering::Acquire), 1);
-        assert_eq!(shared.pending_reclamations.load(Ordering::Acquire), 1);
+        assert_eq!(shared.io_core.operations.live(), 1);
+        assert_eq!(shared.io_core.cq_credits.free(), 3);
+        assert_eq!(
+            shared.io_core.accepted_operations.load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(
+            shared.io_core.pending_reclamations.load(Ordering::Acquire),
+            1
+        );
         assert_eq!(connection.state.accepted_count(), 1);
         assert!(recorder.snapshot().is_empty());
         complete(&shared, &connection.state, poster.tokens()[0], IBV_WC_SEND);
-        assert_eq!(shared.operations.live(), 0);
-        assert_eq!(shared.cq_credits.free(), 4);
-        assert_eq!(shared.pending_reclamations.load(Ordering::Acquire), 0);
+        assert_eq!(shared.io_core.operations.live(), 0);
+        assert_eq!(shared.io_core.cq_credits.free(), 4);
+        assert_eq!(
+            shared.io_core.pending_reclamations.load(Ordering::Acquire),
+            0
+        );
         assert_eq!(
             recorder
                 .snapshot()
@@ -3214,7 +3323,9 @@ mod tests {
         ));
         let connection = scripted_connection(&shared, Arc::clone(&poster), 1, 1);
         let mut operation = connection.send(
-            shared.register_memory(64, AccessIntent::LocalOnly).unwrap(),
+            connection
+                .register_memory(64, AccessIntent::LocalOnly)
+                .unwrap(),
             None,
         );
         let Poll::Ready((result, returned)) = poll_once(&mut operation) else {
@@ -3222,9 +3333,12 @@ mod tests {
         };
         result.unwrap();
         assert!(returned.is_some());
-        assert_eq!(shared.operations.live(), 0);
-        assert_eq!(shared.accepted_operations.load(Ordering::Acquire), 0);
-        assert_eq!(shared.cq_credits.free(), 4);
+        assert_eq!(shared.io_core.operations.live(), 0);
+        assert_eq!(
+            shared.io_core.accepted_operations.load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(shared.io_core.cq_credits.free(), 4);
         drop(returned);
         drop(connection);
         drop(driver);
@@ -3247,7 +3361,7 @@ mod tests {
             }
 
             fn wake_by_ref(self: &Arc<Self>) {
-                assert!(self.shared.admission.try_write().is_ok());
+                assert!(self.shared.session.admission.try_write().is_ok());
                 assert!(self.connection.begin_posting().is_ok());
                 self.observed.store(true, Ordering::Release);
             }
@@ -3264,7 +3378,7 @@ mod tests {
         ));
         let connection = scripted_connection(&shared, Arc::clone(&poster), 1, 1);
         let (io, events) =
-            super::super::io::IoConnection::new(Arc::clone(&shared), Arc::clone(&connection.state))
+            super::super::io::IoConnection::new(&shared.session, Arc::clone(&connection.state))
                 .unwrap();
         let wake = Arc::new(PostGuardCheckingWake {
             shared: Arc::clone(&shared),
@@ -3286,9 +3400,12 @@ mod tests {
         assert!(result.is_ok());
         assert!(mr.is_some());
         assert!(!unaccepted);
-        assert_eq!(shared.operations.live(), 0);
-        assert_eq!(shared.accepted_operations.load(Ordering::Acquire), 0);
-        assert_eq!(shared.cq_credits.free(), 4);
+        assert_eq!(shared.io_core.operations.live(), 0);
+        assert_eq!(
+            shared.io_core.accepted_operations.load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(shared.io_core.cq_credits.free(), 4);
         drop(connection);
         drop(driver);
         drop(engine);
@@ -3310,7 +3427,7 @@ mod tests {
             }
 
             fn wake_by_ref(self: &Arc<Self>) {
-                assert!(self.shared.admission.try_write().is_ok());
+                assert!(self.shared.session.admission.try_write().is_ok());
                 assert!(self.connection.begin_posting().is_ok());
                 self.observed.store(true, Ordering::Release);
             }
@@ -3323,7 +3440,7 @@ mod tests {
         let poster = Arc::new(ScriptedPoster::new(&shared, 52, ScriptedPost::Unaccepted));
         let connection = scripted_connection(&shared, Arc::clone(&poster), 1, 1);
         let (io, events) =
-            super::super::io::IoConnection::new(Arc::clone(&shared), Arc::clone(&connection.state))
+            super::super::io::IoConnection::new(&shared.session, Arc::clone(&connection.state))
                 .unwrap();
         let wake = Arc::new(PostGuardCheckingWake {
             shared: Arc::clone(&shared),
@@ -3351,9 +3468,12 @@ mod tests {
         assert!(matches!(result, Err(Error::PostFailed(_))));
         assert!(mr.is_some());
         assert!(unaccepted);
-        assert_eq!(shared.operations.live(), 0);
-        assert_eq!(shared.accepted_operations.load(Ordering::Acquire), 0);
-        assert_eq!(shared.cq_credits.free(), 4);
+        assert_eq!(shared.io_core.operations.live(), 0);
+        assert_eq!(
+            shared.io_core.accepted_operations.load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(shared.io_core.cq_credits.free(), 4);
         drop(connection);
         drop(driver);
         drop(engine);
@@ -3371,7 +3491,9 @@ mod tests {
 
         for iteration in 0..32 {
             let mut operation = connection.send(
-                shared.register_memory(64, AccessIntent::LocalOnly).unwrap(),
+                connection
+                    .register_memory(64, AccessIntent::LocalOnly)
+                    .unwrap(),
                 None,
             );
             assert!(poll_once(&mut operation).is_pending());
@@ -3392,10 +3514,16 @@ mod tests {
                 });
                 barrier.wait();
             });
-            assert_eq!(shared.operations.live(), 0);
-            assert_eq!(shared.accepted_operations.load(Ordering::Acquire), 0);
-            assert_eq!(shared.pending_reclamations.load(Ordering::Acquire), 0);
-            assert_eq!(shared.cq_credits.free(), 4);
+            assert_eq!(shared.io_core.operations.live(), 0);
+            assert_eq!(
+                shared.io_core.accepted_operations.load(Ordering::Acquire),
+                0
+            );
+            assert_eq!(
+                shared.io_core.pending_reclamations.load(Ordering::Acquire),
+                0
+            );
+            assert_eq!(shared.io_core.cq_credits.free(), 4);
         }
         assert_eq!(
             recorder
@@ -3428,9 +3556,15 @@ mod tests {
         let shared = Arc::clone(&engine.shared);
         let poster = Arc::new(ScriptedPoster::new(&shared, 49, ScriptedPost::Accepted));
         let connection = scripted_connection(&shared, Arc::clone(&poster), 1, 1);
-        let send_mr = shared.register_memory(64, AccessIntent::LocalOnly).unwrap();
-        let recv_mr = shared.register_memory(64, AccessIntent::LocalOnly).unwrap();
-        let rejected_mr = shared.register_memory(64, AccessIntent::LocalOnly).unwrap();
+        let send_mr = connection
+            .register_memory(64, AccessIntent::LocalOnly)
+            .unwrap();
+        let recv_mr = connection
+            .register_memory(64, AccessIntent::LocalOnly)
+            .unwrap();
+        let rejected_mr = connection
+            .register_memory(64, AccessIntent::LocalOnly)
+            .unwrap();
         let recorder = DestructionRecorder::arm(16);
         let counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
         let waker = waker(Arc::clone(&counter));
@@ -3530,7 +3664,7 @@ mod tests {
         impl ArcWake for ReentrantWaker {
             fn wake_by_ref(arc_self: &Arc<Self>) {
                 arc_self.wakes.fetch_add(1, Ordering::AcqRel);
-                let admission_unlocked = arc_self.shared.admission.try_write().is_ok();
+                let admission_unlocked = arc_self.shared.session.admission.try_write().is_ok();
                 let terminal_unlocked = arc_self.shared.terminal.try_lock().is_ok();
                 if admission_unlocked && terminal_unlocked {
                     let _ = arc_self.shared.diagnostics();
@@ -3543,7 +3677,7 @@ mod tests {
         let shared = synthetic_engine(8);
         let connection = synthetic_connection_on(&shared, 50);
         let token = install_accepted(&shared, &connection.state, WcOpcode::Send);
-        let Lookup::Occupied(operation) = shared.operations.lookup(token) else {
+        let Lookup::Occupied(operation) = shared.io_core.operations.lookup(token) else {
             panic!("accepted operation")
         };
         let reentrant = Arc::new(ReentrantWaker {
@@ -3585,9 +3719,15 @@ mod tests {
             close.as_mut().poll(&mut cx),
             Poll::Ready(Err(Error::EngineWedged { .. }))
         ));
-        assert_eq!(shared.quarantined_operations.load(Ordering::Acquire), 1);
-        assert_eq!(shared.quarantined_mrs.load(Ordering::Acquire), 1);
-        assert_eq!(shared.cq_credits.retained(), 1);
+        assert_eq!(
+            shared
+                .io_core
+                .quarantined_operations
+                .load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(shared.io_core.quarantined_mrs.load(Ordering::Acquire), 1);
+        assert_eq!(shared.io_core.cq_credits.retained(), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -3600,11 +3740,11 @@ mod tests {
         let shared = synthetic_engine(8);
         let connection = synthetic_connection_on(&shared, 27);
         let token = install_accepted(&shared, &connection.state, WcOpcode::Recv);
-        let Lookup::Occupied(operation) = shared.operations.lookup(token) else {
+        let Lookup::Occupied(operation) = shared.io_core.operations.lookup(token) else {
             panic!("accepted operation")
         };
-        assert!(operation.cancel(&shared));
-        shared.schedule_reclamation(token);
+        assert!(operation.cancel(&shared.io_core));
+        shared.io_core.schedule_reclamation(token);
 
         let mut driver = super::super::RdmaEngineDriver::new(Arc::clone(&shared), None);
         let waker = futures_util::task::noop_waker();
@@ -3614,30 +3754,50 @@ mod tests {
         assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
         assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
 
-        assert_eq!(shared.operations.live(), 1);
-        assert_eq!(shared.cq_credits.free(), 7);
-        assert_eq!(shared.cq_credits.retained(), 1);
-        assert_eq!(shared.pending_reclamations.load(Ordering::Acquire), 0);
-        assert_eq!(shared.quarantined_operations.load(Ordering::Acquire), 1);
-        assert_eq!(shared.quarantined_mrs.load(Ordering::Acquire), 1);
-        assert_eq!(shared.quarantined_bytes.load(Ordering::Acquire), 1);
+        assert_eq!(shared.io_core.operations.live(), 1);
+        assert_eq!(shared.io_core.cq_credits.free(), 7);
+        assert_eq!(shared.io_core.cq_credits.retained(), 1);
+        assert_eq!(
+            shared.io_core.pending_reclamations.load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            shared
+                .io_core
+                .quarantined_operations
+                .load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(shared.io_core.quarantined_mrs.load(Ordering::Acquire), 1);
+        assert_eq!(shared.io_core.quarantined_bytes.load(Ordering::Acquire), 1);
 
         let completion = wc(token, 27, IBV_WC_RECV);
         assert_eq!(
-            shared.enqueue_completion(completion),
+            shared.session.enqueue_completion(completion),
             Some(connection.state.token)
         );
         assert_eq!(
-            shared.dispatch_connection_completions(connection.state.token, 1),
+            shared
+                .session
+                .dispatch_connection_completions(connection.state.token, 1),
             (1, false)
         );
-        assert_eq!(shared.operations.live(), 0);
-        assert_eq!(shared.cq_credits.free(), 8);
-        assert_eq!(shared.cq_credits.retained(), 0);
-        assert_eq!(shared.pending_reclamations.load(Ordering::Acquire), 0);
-        assert_eq!(shared.quarantined_operations.load(Ordering::Acquire), 0);
-        assert_eq!(shared.quarantined_mrs.load(Ordering::Acquire), 0);
-        assert_eq!(shared.quarantined_bytes.load(Ordering::Acquire), 0);
+        assert_eq!(shared.io_core.operations.live(), 0);
+        assert_eq!(shared.io_core.cq_credits.free(), 8);
+        assert_eq!(shared.io_core.cq_credits.retained(), 0);
+        assert_eq!(
+            shared.io_core.pending_reclamations.load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            shared
+                .io_core
+                .quarantined_operations
+                .load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(shared.io_core.quarantined_mrs.load(Ordering::Acquire), 0);
+        assert_eq!(shared.io_core.quarantined_bytes.load(Ordering::Acquire), 0);
     }
 
     #[derive(Clone, Copy)]
@@ -3695,15 +3855,20 @@ mod tests {
                     let token = tokens[0];
                     let shared = self.shared.upgrade().expect("engine shared state");
                     assert_eq!(
-                        shared.enqueue_completion(wc(token, self.qp_num, opcode)),
-                        shared.connections.lookup_qp(self.qp_num)
+                        shared
+                            .session
+                            .enqueue_completion(wc(token, self.qp_num, opcode)),
+                        shared.session.connections.lookup_qp(self.qp_num)
                     );
                     let connection = shared
+                        .session
                         .connections
                         .lookup_qp(self.qp_num)
                         .expect("connection token");
                     assert_eq!(
-                        shared.dispatch_connection_completions(connection, 1),
+                        shared
+                            .session
+                            .dispatch_connection_completions(connection, 1),
                         (1, false)
                     );
                     BatchPostOutcome::AllAccepted
@@ -3721,8 +3886,10 @@ mod tests {
                     let token = tokens[completed_suffix];
                     let shared = self.shared.upgrade().expect("engine shared state");
                     assert_eq!(
-                        shared.enqueue_completion(wc(token, self.qp_num, opcode)),
-                        shared.connections.lookup_qp(self.qp_num)
+                        shared
+                            .session
+                            .enqueue_completion(wc(token, self.qp_num, opcode)),
+                        shared.session.connections.lookup_qp(self.qp_num)
                     );
                     BatchPostOutcome::PrefixAccepted {
                         accepted,
@@ -3738,15 +3905,20 @@ mod tests {
                     let token = tokens[completed_suffix];
                     let shared = self.shared.upgrade().expect("engine shared state");
                     assert_eq!(
-                        shared.enqueue_completion(wc(token, self.qp_num, opcode)),
-                        shared.connections.lookup_qp(self.qp_num)
+                        shared
+                            .session
+                            .enqueue_completion(wc(token, self.qp_num, opcode)),
+                        shared.session.connections.lookup_qp(self.qp_num)
                     );
                     let connection = shared
+                        .session
                         .connections
                         .lookup_qp(self.qp_num)
                         .expect("connection token");
                     assert_eq!(
-                        shared.dispatch_connection_completions(connection, 1),
+                        shared
+                            .session
+                            .dispatch_connection_completions(connection, 1),
                         (1, false)
                     );
                     BatchPostOutcome::PrefixAccepted {
@@ -3842,7 +4014,7 @@ mod tests {
         recv_wr: usize,
     ) -> crate::v2::engine::session::connection::RdmaConnection {
         install_connection(
-            shared,
+            &shared.session,
             poster,
             super::super::RdmaConnectionConfig::default()
                 .max_send_wr(send_wr)
@@ -3866,11 +4038,15 @@ mod tests {
         opcode: u32,
     ) {
         assert_eq!(
-            shared.enqueue_completion(wc(token, connection.qp_num(), opcode)),
+            shared
+                .session
+                .enqueue_completion(wc(token, connection.qp_num(), opcode)),
             Some(connection.token)
         );
         assert_eq!(
-            shared.dispatch_connection_completions(connection.token, 1),
+            shared
+                .session
+                .dispatch_connection_completions(connection.token, 1),
             (1, false)
         );
     }
@@ -3915,7 +4091,7 @@ mod tests {
         qp_num: u32,
     ) -> crate::v2::engine::session::connection::RdmaConnection {
         install_connection(
-            shared,
+            &shared.session,
             Arc::new(NoopPoster(qp_num)),
             super::super::RdmaConnectionConfig::default()
                 .max_send_wr(4)
@@ -3943,8 +4119,9 @@ mod tests {
                 })
                 .is_ok()
         );
-        assert!(shared.cq_credits.reserve());
+        assert!(shared.io_core.cq_credits.reserve());
         let (token, operation) = shared
+            .io_core
             .operations
             .allocate(|token| {
                 Arc::new(OperationState::new(
@@ -3961,7 +4138,10 @@ mod tests {
             })
             .unwrap();
         operation.commit_accepted();
-        shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
+        shared
+            .io_core
+            .accepted_operations
+            .fetch_add(1, Ordering::AcqRel);
         token
     }
 
@@ -3975,9 +4155,10 @@ mod tests {
             _ => Direction::Send,
         };
         connection.reserve_local(direction).unwrap();
-        assert!(shared.cq_credits.reserve());
+        assert!(shared.io_core.cq_credits.reserve());
         let (sender, events) = super::super::io::event_port();
         let (token, operation) = shared
+            .io_core
             .operations
             .allocate(|token| {
                 Arc::new(OperationState::new_with_event(
@@ -3992,7 +4173,10 @@ mod tests {
             })
             .unwrap();
         operation.commit_accepted();
-        shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
+        shared
+            .io_core
+            .accepted_operations
+            .fetch_add(1, Ordering::AcqRel);
         (token, events)
     }
 
