@@ -392,13 +392,15 @@ impl Drop for RdmaEngine {
 
 /// Sole progress future for an [`RdmaEngine`].
 ///
-/// The driver fairly rotates across three opaque bounded owners: I/O, session,
-/// and terminal composition. CQ polling, completion dispatch, and operation
-/// deadlines remain behind the I/O owner; CM progress, lifecycle deadlines,
-/// and teardown remain behind the session owner. Message protocol work belongs
-/// to [`crate::v2::MessageTransportDriver`]. Readiness mode sleeps only on
-/// registered event sources and published software work; polling mode performs
-/// one bounded nonblocking iteration followed by a cooperative yield.
+/// The driver fairly rotates across two opaque bounded owners: I/O and session.
+/// Every external poll probes both, services each ready-at-entry owner at most
+/// once, and then composes terminal eligibility. CQ polling, completion
+/// dispatch, and operation deadlines remain behind the I/O owner; CM progress,
+/// lifecycle deadlines, and teardown remain behind the session owner. Message
+/// protocol work belongs to [`crate::v2::MessageTransportDriver`]. Readiness
+/// mode sleeps only after registering and rechecking event sources and
+/// published software work; polling mode performs one bounded nonblocking
+/// iteration followed by a cooperative yield.
 /// Dropping the driver publishes a terminal failure and wakes observed waiters.
 /// Drop performs one bounded pass over registered connections, with at most
 /// one QP ERR transition and one zero-outstanding QP destroy attempt per

@@ -235,8 +235,10 @@ mod tests {
     #[test]
     fn deadline_sequence_exhaustion_is_checked_without_inserting() {
         let now = Instant::now();
-        let mut deadlines = DeadlineQueue::default();
-        deadlines.next_sequence = u64::MAX;
+        let mut deadlines = DeadlineQueue {
+            next_sequence: u64::MAX,
+            ..DeadlineQueue::default()
+        };
 
         assert_eq!(
             deadlines.push(now, "overflow"),
