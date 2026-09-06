@@ -9,9 +9,7 @@ use super::SessionManager;
 use super::cm::CmShutdownCursor;
 use crate::v2::engine::config::CompletionMode;
 use crate::v2::engine::lifecycle::MemoizedTerminalResult;
-use crate::v2::engine::progress::{
-    EffectsPublication, ProgressReport, ProgressTerminal, ReadinessRegistration,
-};
+use crate::v2::engine::progress::{ProgressReport, ReadinessRegistration};
 use crate::v2::engine::resources::SessionProgressResources;
 use crate::v2::engine::scheduler::{Deadline, DeadlineKind, DeadlineQueue};
 use crate::v2::error::{Error, Result};
@@ -85,7 +83,7 @@ impl SessionProgress {
         }
         let (cm_units, readiness, cm_ready, observed_would_block) =
             self.service_cm(mode, cx, shutting_down, terminal_failure)?;
-        let (deadline_units, deadline_ready, deadline_terminal) = if terminal_failure {
+        let (deadline_units, deadline_ready, _deadline_terminal) = if terminal_failure {
             (0, false, false)
         } else {
             self.service_deadlines()?
@@ -106,19 +104,11 @@ impl SessionProgress {
             }
             self.terminal_completion_ready = true;
         }
-        let terminal = if deadline_terminal || self.terminal_completion_ready {
-            ProgressTerminal::Ready
-        } else {
-            ProgressTerminal::Running
-        };
-        Ok(ProgressReport {
-            units_consumed: cm_units.saturating_add(deadline_units),
-            immediate_work: cm_ready || deadline_ready,
-            next_deadline: self.deadlines.next(),
+        Ok(ProgressReport::running(
+            cm_units.saturating_add(deadline_units),
+            cm_ready || deadline_ready,
             readiness,
-            terminal,
-            effects: EffectsPublication::Complete,
-        })
+        ))
     }
 
     pub(in crate::v2::engine) fn can_finish(&self) -> bool {
@@ -580,7 +570,7 @@ mod tests {
         assert!(closed > 0 && closed < connections.len());
         assert!(first.units_consumed <= 48);
         assert!(first.immediate_work);
-        assert!(!matches!(first.terminal, ProgressTerminal::Ready));
+        assert!(!driver.session_progress.can_finish());
 
         drop(connections);
         drop(driver);
@@ -600,7 +590,7 @@ mod tests {
                 .turn(CompletionMode::Polling, &mut cx)
                 .unwrap();
             assert!(report.units_consumed <= 48);
-            if matches!(report.terminal, ProgressTerminal::Ready) {
+            if driver.session_progress.can_finish() {
                 ready = true;
                 break;
             }
@@ -638,7 +628,7 @@ mod tests {
         assert!(first.units_consumed <= 32);
         assert!(first.immediate_work);
 
-        let mut ready = matches!(first.terminal, ProgressTerminal::Ready);
+        let mut ready = driver.session_progress.can_finish();
         for _ in 0..8 {
             if ready {
                 break;
@@ -648,7 +638,7 @@ mod tests {
                 .turn(CompletionMode::Polling, &mut cx)
                 .unwrap();
             assert!(report.units_consumed <= 32);
-            ready = matches!(report.terminal, ProgressTerminal::Ready);
+            ready = driver.session_progress.can_finish();
         }
         assert!(ready);
         assert!(
@@ -692,11 +682,11 @@ mod tests {
             .begin_driver_failure(Error::InvalidConfig("late failure".into()));
         let mut ready = false;
         for _ in 0..12 {
-            let report = driver
+            driver
                 .session_progress
                 .turn(CompletionMode::Polling, &mut cx)
                 .unwrap();
-            if matches!(report.terminal, ProgressTerminal::Ready) {
+            if driver.session_progress.can_finish() {
                 ready = true;
                 break;
             }

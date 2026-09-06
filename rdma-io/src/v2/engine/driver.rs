@@ -20,10 +20,10 @@ use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 
 use super::config::CompletionMode;
-use super::io_core::IoProgress;
+use super::io_core::{IoProgress, IoSessionBridge};
 #[cfg(test)]
 use super::lifecycle::MemoizedTerminalResult;
-use super::progress::{OwnerClass, ProgressTerminal};
+use super::progress::OwnerClass;
 use super::resources::EngineResources;
 use super::scheduler::OwnerScheduler;
 use super::session::SessionProgress;
@@ -101,8 +101,10 @@ impl RdmaEngineDriver {
             }
             None => (None, None),
         };
+        let bridge: Arc<dyn IoSessionBridge> = shared.session.clone();
         let io_progress = IoProgress::new(
             Arc::clone(&shared.io_core),
+            bridge,
             io_resources,
             shared.config.cq_completion_budget,
             shared.config.completion_dispatch_budget,
@@ -172,10 +174,8 @@ impl RdmaEngineDriver {
         if report.requires_repoll() {
             self.scheduler.mark_ready(OwnerClass::Io);
         }
-        match report.terminal {
-            ProgressTerminal::Running => {}
-            ProgressTerminal::Ready => self.scheduler.mark_ready(OwnerClass::Terminal),
-            ProgressTerminal::Failed(error) => return Err(error),
+        if self.io_progress.can_finish() {
+            self.scheduler.mark_ready(OwnerClass::Terminal);
         }
         Ok(report.units_consumed > 0)
     }
@@ -187,10 +187,8 @@ impl RdmaEngineDriver {
         if report.requires_repoll() {
             self.scheduler.mark_ready(OwnerClass::Session);
         }
-        match report.terminal {
-            ProgressTerminal::Running => {}
-            ProgressTerminal::Ready => self.scheduler.mark_ready(OwnerClass::Terminal),
-            ProgressTerminal::Failed(error) => return Err(error),
+        if self.session_progress.can_finish() {
+            self.scheduler.mark_ready(OwnerClass::Terminal);
         }
         Ok(report.units_consumed > 0)
     }

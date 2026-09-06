@@ -11,7 +11,7 @@ use super::{IoCore, IoDeadlineRequest, IoSessionBridge};
 use crate::v2::Completion;
 use crate::v2::completion::CqReadiness;
 use crate::v2::engine::config::CompletionMode;
-use crate::v2::engine::progress::{ProgressReport, ProgressTerminal, ReadinessRegistration};
+use crate::v2::engine::progress::{ProgressReport, ReadinessRegistration};
 use crate::v2::engine::registry::{ConnectionToken, OperationToken};
 use crate::v2::engine::resources::IoProgressResources;
 use crate::v2::error::{Error, Result};
@@ -74,6 +74,7 @@ impl IoDeadlineQueue {
 /// I/O-owned progress state. It has no concrete dependency on session state.
 pub(in crate::v2::engine) struct IoProgress {
     core: Arc<IoCore>,
+    bridge: Arc<dyn IoSessionBridge>,
     resources: Option<IoProgressResources>,
     cq_readiness: CqReadiness,
     cq_buffer: Box<[Completion]>,
@@ -93,6 +94,7 @@ pub(in crate::v2::engine) struct IoProgress {
 impl IoProgress {
     pub(in crate::v2::engine) fn new(
         core: Arc<IoCore>,
+        bridge: Arc<dyn IoSessionBridge>,
         resources: Option<IoProgressResources>,
         cq_budget: usize,
         completion_dispatch_budget: usize,
@@ -103,6 +105,7 @@ impl IoProgress {
     ) -> Self {
         Self {
             core,
+            bridge,
             resources,
             cq_readiness: CqReadiness::default(),
             cq_buffer: vec![Completion::default(); cq_budget].into_boxed_slice(),
@@ -140,17 +143,12 @@ impl IoProgress {
                     .terminalize_operations_bounded(&outcome, self.terminal_cursor, budget);
             self.terminal_cursor = next;
             self.terminal_complete = complete;
-            self.bridge()?.apply_terminal_effects(effects);
-            let mut report = ProgressReport::running(
+            self.bridge.apply_terminal_effects(effects);
+            return Ok(ProgressReport::running(
                 scanned,
                 !complete,
-                None,
                 ReadinessRegistration::NotRequired,
-            );
-            if complete {
-                report.terminal = ProgressTerminal::Ready;
-            }
-            return Ok(report);
+            ));
         }
         let (cq_units, readiness, cq_repoll) = self.service_cq(mode, cx)?;
         let (reclamation_units, reclamation_ready) = self.service_reclamation()?;
@@ -158,16 +156,11 @@ impl IoProgress {
         let units_consumed = cq_units
             .saturating_add(reclamation_units)
             .saturating_add(dispatch_units);
-        let mut report = ProgressReport::running(
+        Ok(ProgressReport::running(
             units_consumed,
             cq_repoll || reclamation_ready || dispatch_ready,
-            self.deadlines.next(),
             readiness,
-        );
-        if self.can_finish() {
-            report.terminal = ProgressTerminal::Ready;
-        }
-        Ok(report)
+        ))
     }
 
     pub(in crate::v2::engine) fn release_resources(&mut self) {
@@ -203,8 +196,8 @@ impl IoProgress {
         self.turns
     }
 
-    fn bridge(&self) -> Result<Arc<dyn IoSessionBridge>> {
-        self.core.session_bridge().ok_or(Error::DriverShutdown)
+    fn bridge(&self) -> Arc<dyn IoSessionBridge> {
+        Arc::clone(&self.bridge)
     }
 
     fn enqueue_connection(&mut self, connection: ConnectionToken) {
@@ -218,7 +211,7 @@ impl IoProgress {
     ) -> Result<(usize, ReadinessRegistration, bool)> {
         #[cfg(any(test, feature = "test-hooks"))]
         if let Some(completion) = self.test_driver.take_released_connection_cqe() {
-            if let Some(connection) = self.bridge()?.route_completion(completion) {
+            if let Some(connection) = self.bridge.route_completion(completion) {
                 self.enqueue_connection(connection);
             }
             return Ok((1, ReadinessRegistration::Incomplete, true));
@@ -271,7 +264,7 @@ impl IoProgress {
         if count == 0 {
             return Ok((0, readiness, false));
         }
-        let bridge = self.bridge()?;
+        let bridge = self.bridge();
         let completions = self.cq_buffer[..count].to_vec();
         for completion in completions {
             let completion = completion.into_raw();
@@ -291,7 +284,7 @@ impl IoProgress {
     }
 
     fn service_reclamation(&mut self) -> Result<(usize, bool)> {
-        let bridge = self.bridge()?;
+        let bridge = self.bridge();
         let now = Instant::now();
         let mut consumed = 0;
         let starts_with_request = self.reclamation_turn_starts_with_request;
@@ -346,7 +339,7 @@ impl IoProgress {
             return Ok((0, self.core.has_published_connections()));
         };
         let (processed, remains_ready) = self
-            .bridge()?
+            .bridge
             .dispatch_connection_completions(connection, self.completion_dispatch_budget);
         if remains_ready {
             self.enqueue_connection(connection);
@@ -407,9 +400,13 @@ mod tests {
 
     use super::*;
     use crate::v2::engine::driver::test_api::TestDriverState;
-    use crate::v2::engine::io_core::IoDriverSignal;
-    use crate::v2::engine::progress::{EffectsPublication, ProgressTerminal};
+    use crate::v2::engine::io_core::{
+        EstablishedIoConnection, EstablishedIoIdentity, IoDriverSignal, IoPostAuthority,
+        operation_future_for_io_lifetime_test,
+    };
     use crate::v2::engine::registry::lock_unpoison;
+    use crate::v2::qp::BatchPostOutcome;
+    use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
 
     struct NoopSignal;
 
@@ -419,6 +416,22 @@ mod tests {
         fn publish_reclamation(&self) {}
         fn publish_terminal(&self) {}
         fn pause_operation_before_register(&self) {}
+    }
+
+    struct NoopPoster;
+
+    impl IoPostAuthority for NoopPoster {
+        fn qp_num(&self) -> u32 {
+            7
+        }
+
+        fn post_send(&self, _batch: &mut PreparedSendBatch) -> Result<BatchPostOutcome> {
+            unreachable!("lifetime-only operation is already in flight")
+        }
+
+        fn post_recv(&self, _batch: &mut PreparedRecvBatch) -> Result<BatchPostOutcome> {
+            unreachable!("lifetime-only operation is already in flight")
+        }
     }
 
     #[derive(Default)]
@@ -469,9 +482,9 @@ mod tests {
         .unwrap();
         let bridge = Arc::new(RecordingBridge::default());
         let bridge_dyn: Arc<dyn IoSessionBridge> = bridge.clone();
-        core.bind_session_bridge(&bridge_dyn);
         let progress = IoProgress::new(
             Arc::clone(&core),
+            bridge_dyn,
             None,
             4,
             3,
@@ -500,6 +513,33 @@ mod tests {
         connections.enqueue(first);
         assert_eq!(connections.pop(), Some(connection(2)));
         assert_eq!(connections.pop(), Some(connection(1)));
+    }
+
+    #[test]
+    fn operation_future_outlives_progress_without_retaining_session_bridge() {
+        let (progress, core, bridge) = progress(1);
+        let bridge_weak = Arc::downgrade(&bridge);
+        let connection = EstablishedIoConnection::new(
+            EstablishedIoIdentity {
+                connection: connection(7),
+                qp_num: 7,
+            },
+            Arc::new(NoopPoster),
+            1,
+            1,
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        let operation = operation_future_for_io_lifetime_test(&core, &connection);
+
+        drop(connection);
+        drop(bridge);
+        drop(progress);
+
+        assert!(
+            bridge_weak.upgrade().is_none(),
+            "an operation future must not retain the session progress bridge"
+        );
+        drop(operation);
     }
 
     #[test]
@@ -554,8 +594,6 @@ mod tests {
         assert_eq!(report.units_consumed, 3);
         assert!(report.immediate_work);
         assert_eq!(report.readiness, ReadinessRegistration::NotRequired);
-        assert!(matches!(report.terminal, ProgressTerminal::Running));
-        assert_eq!(report.effects, EffectsPublication::Complete);
     }
 
     #[test]

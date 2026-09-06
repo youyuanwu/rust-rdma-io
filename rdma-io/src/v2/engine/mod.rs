@@ -64,7 +64,7 @@ pub use driver::{
     TestSharedResourceIdentity,
 };
 pub use io_core::RdmaOperation;
-use io_core::{IoCore, IoDriverSignal, IoProgress, IoSessionBridge};
+use io_core::{IoCore, IoDriverSignal, IoProgress};
 use lifecycle::MemoizedTerminalResult;
 use registry::{lock_unpoison, write_unpoison};
 use resources::{EngineResourceRefs, EngineResources};
@@ -576,8 +576,6 @@ impl EngineShared {
         shared.session.bind_self();
         let session_runtime: Arc<dyn SessionEngineRuntime> = shared.clone();
         shared.session.bind_engine(&session_runtime);
-        let session_bridge: Arc<dyn IoSessionBridge> = shared.session.clone();
-        shared.io_core.bind_session_bridge(&session_bridge);
         shared
     }
 

@@ -2093,6 +2093,36 @@ pub(in crate::v2::engine) fn install_accepted_operation_for_driver_test(
 }
 
 #[cfg(test)]
+pub(in crate::v2::engine) fn operation_future_for_io_lifetime_test(
+    io_core: &Arc<IoCore>,
+    connection: &Arc<EstablishedIoConnection>,
+) -> RdmaOperation {
+    connection.reserve_local(Direction::Send).unwrap();
+    assert!(io_core.cq_credits.reserve());
+    let (_, operation) = io_core
+        .operations
+        .allocate(|token| {
+            Arc::new(OperationState::new(
+                token,
+                Arc::clone(connection),
+                Direction::Send,
+                WcOpcode::Send,
+                None,
+                1,
+            ))
+        })
+        .unwrap();
+    operation.commit_accepted();
+    io_core.accepted_operations.fetch_add(1, Ordering::AcqRel);
+    RdmaOperation {
+        state: FutureState::InFlight {
+            shared: Arc::clone(io_core),
+            operation,
+        },
+    }
+}
+
+#[cfg(test)]
 pub(in crate::v2::engine) fn completion_for_driver_test(
     token: OperationToken,
     qp_num: u32,

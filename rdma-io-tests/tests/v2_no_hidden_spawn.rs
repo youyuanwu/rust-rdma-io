@@ -1970,17 +1970,22 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
             progress_path.display()
         );
     }
-    for required in [
-        "units_consumed",
-        "immediate_work",
-        "next_deadline",
-        "readiness",
-        "terminal",
-        "effects",
-    ] {
+    for required in ["units_consumed", "immediate_work", "readiness"] {
         assert!(
             progress_source.contains(required),
             "{} must report `{required}`",
+            progress_path.display()
+        );
+    }
+    for forbidden in [
+        "next_deadline",
+        "ProgressTerminal",
+        "EffectsPublication",
+        "effects:",
+    ] {
+        assert!(
+            !progress_source.contains(forbidden),
+            "{} must not retain redundant progress-report state `{forbidden}`",
             progress_path.display()
         );
     }
@@ -1988,9 +1993,24 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         fs::read_to_string(&io_core_mod_path).expect("read I/O core module source");
     assert!(
         io_core_source.contains("trait IoSessionBridge")
-            && io_core_source.contains("session_bridge: OnceLock<Weak<dyn IoSessionBridge>>"),
-        "{} must retain only one bind-once weak session capability",
+            && !io_core_source.contains("session_bridge:")
+            && !io_core_source.contains("bind_session_bridge")
+            && !io_core_source.contains("fn session_bridge("),
+        "{} must define the narrow bridge without storing or binding it",
         io_core_mod_path.display()
+    );
+    let io_progress_source =
+        fs::read_to_string(&io_core_progress_path).expect("read I/O progress source");
+    assert!(
+        io_progress_source.contains("bridge: Arc<dyn IoSessionBridge>")
+            && io_progress_source.contains("bridge: Arc<dyn IoSessionBridge>,"),
+        "{} must own the session bridge directly",
+        io_core_progress_path.display()
+    );
+    assert!(
+        !engine_mod.contains("bind_session_bridge"),
+        "{} must not post-bind the I/O/session bridge",
+        engine_mod_path.display()
     );
     let engine_shared = engine_mod
         .split("struct EngineShared {")
@@ -2437,8 +2457,9 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         fs::read_to_string(&io_core_progress_path).expect("read I/O progress source");
     assert!(
         io_progress_source.contains("terminalize_operations_bounded")
-            && io_progress_source.contains("ProgressTerminal::Ready"),
-        "{} must report bounded I/O terminal readiness",
+            && io_progress_source.contains("fn can_finish(&self) -> bool")
+            && io_progress_source.contains("terminal_complete"),
+        "{} must own bounded I/O terminal eligibility",
         io_core_progress_path.display()
     );
     assert!(

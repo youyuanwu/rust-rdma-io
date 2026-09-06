@@ -7,7 +7,7 @@ use std::collections::{HashSet, VecDeque};
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, Weak};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use std::time::Duration;
 
 use super::io::{IoEventSender, IoTerminalEvent, PendingIoEvent};
@@ -32,6 +32,7 @@ pub(super) use operation::{
 #[cfg(test)]
 pub(super) use operation::{
     completion_for_driver_test, install_accepted_operation_for_driver_test,
+    operation_future_for_io_lifetime_test,
 };
 pub(super) use progress::IoProgress;
 
@@ -351,7 +352,6 @@ pub(super) struct IoCore {
     missing_cqe_deadline: Duration,
     completion_dispatch_budget: usize,
     reclamation_requests: Mutex<VecDeque<IoDeadlineRequest>>,
-    session_bridge: OnceLock<Weak<dyn IoSessionBridge>>,
     terminal_failure: Mutex<Option<super::lifecycle::MemoizedTerminalResult>>,
 }
 
@@ -396,21 +396,10 @@ impl IoCore {
             missing_cqe_deadline,
             completion_dispatch_budget,
             reclamation_requests: Mutex::new(VecDeque::new()),
-            session_bridge: OnceLock::new(),
             terminal_failure: Mutex::new(None),
         });
         let reclaim = QpReclaimCapability::new(&core);
         Ok((core, reclaim))
-    }
-
-    pub(super) fn bind_session_bridge(&self, bridge: &Arc<dyn IoSessionBridge>) {
-        self.session_bridge
-            .set(Arc::downgrade(bridge))
-            .unwrap_or_else(|_| panic!("IoCore is bound to exactly one IoSessionBridge"));
-    }
-
-    pub(super) fn session_bridge(&self) -> Option<Arc<dyn IoSessionBridge>> {
-        self.session_bridge.get().and_then(Weak::upgrade)
     }
 
     pub(super) fn admission(&self) -> RwLockReadGuard<'_, ()> {
