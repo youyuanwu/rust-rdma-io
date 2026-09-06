@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use super::super::registry::{ConnectionToken, Lookup, read_unpoison};
-use super::super::scheduler::DeadlineKind;
+use super::DeadlineKind;
 use super::SessionManager;
 use super::connection::ConnectionState;
 

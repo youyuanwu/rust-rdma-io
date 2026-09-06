@@ -5,20 +5,20 @@ use std::task::{Context as TaskContext, Poll};
 
 use tokio::time::Instant;
 
-use super::SessionManager;
 use super::cm::CmShutdownCursor;
+use super::{DeadlineKind, SessionManager};
 use crate::v2::engine::config::CompletionMode;
 use crate::v2::engine::lifecycle::MemoizedTerminalResult;
 use crate::v2::engine::progress::{ProgressReport, ReadinessRegistration};
 use crate::v2::engine::resources::SessionProgressResources;
-use crate::v2::engine::scheduler::{Deadline, DeadlineKind, DeadlineQueue};
+use crate::v2::engine::scheduler::{AlternatingSources, DeadlineQueue, Source};
 use crate::v2::error::{Error, Result};
 
 pub(in crate::v2::engine) struct SessionProgress {
     manager: Arc<SessionManager>,
     resources: Option<SessionProgressResources>,
-    deadlines: DeadlineQueue,
-    reclamation_turn_starts_with_request: bool,
+    deadlines: DeadlineQueue<SessionDeadline>,
+    reclamation_sources: AlternatingSources,
     cm_next_source: usize,
     shutdown_started: bool,
     shutdown_cm: CmShutdownCursor,
@@ -44,7 +44,7 @@ impl SessionProgress {
             manager,
             resources,
             deadlines: DeadlineQueue::default(),
-            reclamation_turn_starts_with_request: true,
+            reclamation_sources: AlternatingSources::default(),
             cm_next_source: 0,
             shutdown_started: false,
             shutdown_cm: CmShutdownCursor::default(),
@@ -134,7 +134,7 @@ impl SessionProgress {
 
     #[cfg(test)]
     fn reclamation_turn_starts_with_request(&self) -> bool {
-        self.reclamation_turn_starts_with_request
+        self.reclamation_sources.first_starts_next_turn()
     }
 
     #[cfg(test)]
@@ -347,29 +347,24 @@ impl SessionProgress {
 
     fn service_deadlines(&mut self) -> Result<(usize, bool)> {
         let now = Instant::now();
-        let starts_with_request = self.reclamation_turn_starts_with_request;
-        self.reclamation_turn_starts_with_request = !starts_with_request;
-        let mut prefer_request = starts_with_request;
+        let mut sources = self.reclamation_sources.begin_turn();
         let mut consumed = 0;
         while consumed < self.reclamation_budget {
-            let handled = if prefer_request {
-                if self.ingest_one_deadline()? {
-                    true
-                } else {
-                    self.process_one_deadline(now)?
+            let mut handled = false;
+            for source in sources.order() {
+                handled = match source {
+                    Source::First => self.ingest_one_deadline()?,
+                    Source::Second => self.process_one_deadline(now)?,
+                };
+                if handled {
+                    break;
                 }
-            } else {
-                if self.process_one_deadline(now)? {
-                    true
-                } else {
-                    self.ingest_one_deadline()?
-                }
-            };
+            }
             if !handled {
                 break;
             }
             consumed += 1;
-            prefer_request = !prefer_request;
+            sources.consumed();
         }
         let immediate = self.manager.has_deadline_requests()
             || self.deadlines.next().is_some_and(|at| at <= now);
@@ -380,20 +375,26 @@ impl SessionProgress {
         let Some(request) = self.manager.take_deadline_requests(1).into_iter().next() else {
             return Ok(false);
         };
-        if !self.deadlines.push(request.at, request.kind, request.token) {
-            return Err(Error::InvalidConfig(
-                "session deadline insertion sequence exhausted".into(),
-            ));
-        }
+        self.deadlines
+            .push(
+                request.at,
+                SessionDeadline {
+                    kind: request.kind,
+                    token: request.token,
+                },
+            )
+            .map_err(|_| {
+                Error::InvalidConfig("session deadline insertion sequence exhausted".into())
+            })?;
         Ok(true)
     }
 
     fn process_one_deadline(&mut self, now: Instant) -> Result<bool> {
-        let Some(deadline) = self.deadlines.pop_due(now, 1).into_iter().next() else {
+        let Some(deadline) = self.deadlines.pop_one_due(now) else {
             return Ok(false);
         };
         match deadline {
-            Deadline {
+            SessionDeadline {
                 kind: DeadlineKind::EngineShutdown,
                 ..
             } => {
@@ -401,7 +402,7 @@ impl SessionProgress {
                     return Err(failure);
                 }
             }
-            Deadline {
+            SessionDeadline {
                 kind: DeadlineKind::ConnectionDrain,
                 token,
                 ..
@@ -411,6 +412,12 @@ impl SessionProgress {
         }
         Ok(true)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SessionDeadline {
+    kind: DeadlineKind,
+    token: u64,
 }
 
 fn poll_readiness_events<G>(
@@ -452,7 +459,6 @@ mod tests {
     use std::task::Waker;
 
     use super::*;
-    use crate::v2::engine::scheduler::DeadlineKind;
     use crate::v2::engine::test_engine_pair;
 
     #[test]
@@ -542,6 +548,130 @@ mod tests {
         assert_eq!(second.units_consumed, 1);
         assert!(progress.reclamation_turn_starts_with_request());
 
+        drop(driver);
+    }
+
+    #[test]
+    fn session_deadline_payloads_preserve_equal_time_order() {
+        let now = Instant::now();
+        let mut deadlines = DeadlineQueue::default();
+        deadlines
+            .push(
+                now,
+                SessionDeadline {
+                    kind: DeadlineKind::ConnectionDrain,
+                    token: 1,
+                },
+            )
+            .unwrap();
+        deadlines
+            .push(
+                now,
+                SessionDeadline {
+                    kind: DeadlineKind::EngineShutdown,
+                    token: 2,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(deadlines.pop_one_due(now).unwrap().token, 1);
+        assert_eq!(deadlines.pop_one_due(now).unwrap().token, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn even_session_deadline_budget_still_flips_next_turn_preference() {
+        let (engine, driver) = test_engine_pair(CompletionMode::Polling);
+        let mut progress = SessionProgress::new(Arc::clone(&engine.shared.session), None, 1, 2);
+        engine.shared.session.schedule_deadline(
+            DeadlineKind::ConnectionDrain,
+            1,
+            std::time::Duration::ZERO,
+        );
+        let waker = Waker::noop();
+        let mut cx = TaskContext::from_waker(waker);
+
+        let report = progress.turn(CompletionMode::Polling, &mut cx).unwrap();
+
+        assert_eq!(report.units_consumed, 2);
+        assert!(!progress.reclamation_turn_starts_with_request());
+        drop(driver);
+    }
+
+    #[test]
+    fn sustained_session_sources_alternate_and_transfer_unused_budget() {
+        let (engine, driver) = test_engine_pair(CompletionMode::Polling);
+        let mut progress = SessionProgress::new(Arc::clone(&engine.shared.session), None, 1, 4);
+        let now = Instant::now();
+        for token in 10..=11 {
+            progress
+                .deadlines
+                .push(
+                    now,
+                    SessionDeadline {
+                        kind: DeadlineKind::ConnectionDrain,
+                        token,
+                    },
+                )
+                .unwrap();
+        }
+        for token in 1..=2 {
+            engine.shared.session.schedule_deadline(
+                DeadlineKind::ConnectionDrain,
+                token,
+                std::time::Duration::ZERO,
+            );
+        }
+
+        let (consumed, immediate) = progress.service_deadlines().unwrap();
+
+        assert_eq!(consumed, 4);
+        assert!(immediate);
+
+        let mut due_only = SessionProgress::new(Arc::clone(&engine.shared.session), None, 1, 3);
+        for token in 20..=22 {
+            due_only
+                .deadlines
+                .push(
+                    now,
+                    SessionDeadline {
+                        kind: DeadlineKind::ConnectionDrain,
+                        token,
+                    },
+                )
+                .unwrap();
+        }
+        let (consumed, immediate) = due_only.service_deadlines().unwrap();
+        assert_eq!(consumed, 3);
+        assert!(!immediate);
+        drop(driver);
+    }
+
+    #[test]
+    fn deadline_sequence_exhaustion_maps_to_session_configuration_error() {
+        let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
+        driver
+            .session_progress
+            .deadlines
+            .exhaust_sequence_for_test();
+        engine.shared.session.schedule_deadline(
+            DeadlineKind::ConnectionDrain,
+            7,
+            std::time::Duration::ZERO,
+        );
+        let waker = Waker::noop();
+        let mut cx = TaskContext::from_waker(waker);
+
+        let error = match driver
+            .session_progress
+            .turn(CompletionMode::Polling, &mut cx)
+        {
+            Ok(_) => panic!("exhausted session deadline sequence must fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(error, Error::InvalidConfig(message) if message.contains("session deadline"))
+        );
         drop(driver);
     }
 

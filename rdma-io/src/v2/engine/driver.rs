@@ -2405,7 +2405,7 @@ mod tests {
                     completion_for_driver_test(operation, poster.qp_num, opcode, status),
                 );
                 engine.shared.session.schedule_deadline(
-                    super::super::scheduler::DeadlineKind::ConnectionDrain,
+                    super::super::session::DeadlineKind::ConnectionDrain,
                     connection.state.token.encode(),
                     Duration::ZERO,
                 );
@@ -2505,6 +2505,63 @@ mod tests {
         assert!(counter.count() > 0, "the Tokio timer must wake the driver");
         assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
         assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_timer_rearms_for_newly_earlier_owner_deadline() {
+        let (_engine, mut driver) = test_engine_pair(CompletionMode::Readiness);
+        let now = tokio::time::Instant::now();
+        let later = now + Duration::from_secs(10);
+        let earlier = now + Duration::from_secs(5);
+        driver
+            .io_progress
+            .schedule_deadline_for_test(later, super::super::registry::OperationToken::decode(1));
+        let waker = Waker::noop();
+        let mut cx = TaskContext::from_waker(waker);
+
+        assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
+        assert_eq!(driver.deadline_at, Some(later));
+
+        driver
+            .io_progress
+            .schedule_deadline_for_test(earlier, super::super::registry::OperationToken::decode(2));
+        assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
+        assert_eq!(driver.deadline_at, Some(earlier));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_timer_clears_removed_owner_deadline() {
+        let (_engine, mut driver) = test_engine_pair(CompletionMode::Readiness);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        driver.io_progress.schedule_deadline_for_test(
+            deadline,
+            super::super::registry::OperationToken::decode(1),
+        );
+        let waker = Waker::noop();
+        let mut cx = TaskContext::from_waker(waker);
+
+        assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
+        assert_eq!(driver.deadline_at, Some(deadline));
+
+        driver.io_progress.clear_deadlines_for_test();
+        assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
+        assert_eq!(driver.deadline_at, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_timer_processes_already_expired_owner_deadline() {
+        let (_engine, mut driver) = test_engine_pair(CompletionMode::Readiness);
+        driver.io_progress.schedule_deadline_for_test(
+            tokio::time::Instant::now(),
+            super::super::registry::OperationToken::decode(1),
+        );
+        let waker = Waker::noop();
+        let mut cx = TaskContext::from_waker(waker);
+
+        assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
+
+        assert_eq!(driver.io_progress.next_deadline(), None);
+        assert_eq!(driver.deadline_at, None);
     }
 
     #[tokio::test]
