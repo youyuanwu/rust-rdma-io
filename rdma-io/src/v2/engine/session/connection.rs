@@ -484,15 +484,20 @@ impl ConnectionState {
         self.pending_io_event(IoTerminalEvent::Disconnected)
     }
 
-    pub(in crate::v2::engine) fn mark_cm_failure(&self, error: Error) -> Option<PendingIoEvent> {
+    pub(in crate::v2::engine) fn record_cm_failure(&self, error: Error) -> Option<PendingIoEvent> {
         self.stop_posting();
         let mut outcome = lock_unpoison(&self.close.outcome);
         if outcome.is_none() {
             *outcome = Some(MemoizedTerminalResult::from_error(error.clone()));
         }
         drop(outcome);
-        self.close.notify_waiters();
         self.pending_io_event(IoTerminalEvent::Terminal(error))
+    }
+
+    pub(in crate::v2::engine) fn mark_cm_failure(&self, error: Error) -> Option<PendingIoEvent> {
+        let event = self.record_cm_failure(error);
+        self.wake_close();
+        event
     }
 
     pub(in crate::v2::engine) fn transition_to_error_once(

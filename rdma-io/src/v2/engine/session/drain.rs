@@ -23,13 +23,14 @@ impl SessionManager {
             match self.transition_connection_to_error(connection) {
                 Ok(_) => {}
                 Err(error) => {
-                    let event = connection.mark_cm_failure(error.clone());
+                    let event = connection.record_cm_failure(error.clone());
                     connection.rollback_draining_count();
                     drop(lifecycle);
                     drop(admission);
                     if let Some(event) = event {
                         event.deliver();
                     }
+                    connection.wake_close();
                     self.begin_driver_failure(error);
                     return;
                 }
@@ -207,6 +208,24 @@ mod tests {
     use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
     use futures_util::task::{ArcWake, waker};
 
+    struct GuardCheckingWaker {
+        session: Arc<super::super::SessionManager>,
+        connection: Arc<super::super::connection::ConnectionState>,
+        wakes: AtomicUsize,
+        lock_failures: AtomicUsize,
+    }
+
+    impl ArcWake for GuardCheckingWaker {
+        fn wake_by_ref(arc_self: &Arc<Self>) {
+            arc_self.wakes.fetch_add(1, Ordering::AcqRel);
+            let admission_unlocked = arc_self.session.admission.try_write().is_ok();
+            let lifecycle_unlocked = arc_self.connection.lifecycle_unlocked_for_test();
+            if !(admission_unlocked && lifecycle_unlocked) {
+                arc_self.lock_failures.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    }
+
     struct TestPoster {
         qp_num: u32,
         error_transitions: AtomicUsize,
@@ -339,6 +358,68 @@ mod tests {
         drop(driver);
     }
 
+    #[test]
+    fn failed_error_transition_wakes_close_waiter_after_guards_drop() {
+        let (engine, _driver) = test_engine_pair(CompletionMode::Polling);
+        let connection = install_connection(
+            &engine.shared.session,
+            TestPoster::failing(21),
+            RdmaConnectionConfig::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let reentrant = Arc::new(GuardCheckingWaker {
+            session: Arc::clone(&engine.shared.session),
+            connection: Arc::clone(&connection.state),
+            wakes: AtomicUsize::new(0),
+            lock_failures: AtomicUsize::new(0),
+        });
+        let task_waker = waker(Arc::clone(&reentrant));
+        let notify = connection.state.close_state().notify();
+        let mut notified = Box::pin(notify.notified());
+        assert!(
+            notified
+                .as_mut()
+                .poll(&mut Context::from_waker(&task_waker))
+                .is_pending()
+        );
+
+        engine
+            .shared
+            .session
+            .begin_connection_close(&connection.state);
+
+        assert!(
+            reentrant.wakes.load(Ordering::Acquire) >= 1,
+            "failed transition must wake the registered close waiter"
+        );
+        assert_eq!(
+            reentrant.lock_failures.load(Ordering::Acquire),
+            0,
+            "transition-failure wake must run after admission and lifecycle guards drop"
+        );
+        assert_eq!(
+            engine
+                .shared
+                .session
+                .connection_admission
+                .snapshot()
+                .draining,
+            0,
+            "failed transition must still roll back the draining gauge"
+        );
+        assert!(matches!(
+            connection
+                .state
+                .close_state()
+                .raw_outcome()
+                .unwrap()
+                .into_result(),
+            Err(Error::Verbs(_))
+        ));
+    }
+
     fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
         let waker = futures_util::task::noop_waker();
         let mut context = Context::from_waker(&waker);
@@ -347,24 +428,6 @@ mod tests {
 
     #[test]
     fn connection_close_wakes_driver_after_admission_and_lifecycle_guards_drop() {
-        struct ReentrantWaker {
-            session: Arc<super::super::SessionManager>,
-            connection: Arc<super::super::connection::ConnectionState>,
-            wakes: AtomicUsize,
-            lock_failures: AtomicUsize,
-        }
-
-        impl ArcWake for ReentrantWaker {
-            fn wake_by_ref(arc_self: &Arc<Self>) {
-                arc_self.wakes.fetch_add(1, Ordering::AcqRel);
-                let admission_unlocked = arc_self.session.admission.try_write().is_ok();
-                let lifecycle_unlocked = arc_self.connection.lifecycle_unlocked_for_test();
-                if !(admission_unlocked && lifecycle_unlocked) {
-                    arc_self.lock_failures.fetch_add(1, Ordering::AcqRel);
-                }
-            }
-        }
-
         let (engine, _driver) = test_engine_pair(CompletionMode::Readiness);
         let connection = install_connection(
             &engine.shared.session,
@@ -374,7 +437,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let reentrant = Arc::new(ReentrantWaker {
+        let reentrant = Arc::new(GuardCheckingWaker {
             session: Arc::clone(&engine.shared.session),
             connection: Arc::clone(&connection.state),
             wakes: AtomicUsize::new(0),
