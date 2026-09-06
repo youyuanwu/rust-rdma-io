@@ -746,7 +746,7 @@ pub(super) mod test_api {
             let local_addr = cm.cm_id().local_addr();
             let peer_addr = cm.cm_id().peer_addr();
             install_connection(
-                &shared,
+                &shared.session,
                 Arc::new(VerbsConnectionResources::new(qp.qp, cm)),
                 config,
                 local_addr,
@@ -2402,7 +2402,6 @@ mod tests {
                     completion_for_driver_test(operation, poster.qp_num, opcode, status),
                 );
                 engine.shared.session.schedule_deadline(
-                    &engine.shared.work_signal,
                     super::super::scheduler::DeadlineKind::ConnectionDrain,
                     connection.state.token.encode(),
                     Duration::ZERO,

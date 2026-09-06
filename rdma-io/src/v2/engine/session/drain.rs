@@ -1,8 +1,10 @@
 //! Exact accepted-WR connection drain and quarantine lifecycle.
 
 use std::sync::Arc;
+#[cfg(test)]
 use std::sync::atomic::Ordering;
 
+#[cfg(test)]
 use super::super::EngineShared;
 use super::super::registry::{ConnectionToken, Lookup, read_unpoison};
 use super::super::scheduler::DeadlineKind;
@@ -10,11 +12,7 @@ use super::SessionManager;
 use super::connection::ConnectionState;
 
 impl SessionManager {
-    pub(crate) fn begin_connection_close(
-        &self,
-        shared: &EngineShared,
-        connection: &Arc<ConnectionState>,
-    ) {
+    pub(crate) fn begin_connection_close(&self, connection: &Arc<ConnectionState>) {
         if connection.is_retired() {
             return;
         }
@@ -33,13 +31,13 @@ impl SessionManager {
                     if let Some(event) = event {
                         event.deliver();
                     }
-                    shared.begin_driver_failure(error);
+                    self.begin_driver_failure(error);
                     return;
                 }
             }
-            shared.work_signal.publish(super::super::driver::IO_WORK);
+            self.publish_io_work();
 
-            let engine_is_terminating = shared.shutdown_requested.load(Ordering::Acquire);
+            let engine_is_terminating = self.shutdown_requested();
             if !engine_is_terminating {
                 let error = connection.operation_close_error();
                 let report = connection.io_drain_report();
@@ -55,16 +53,16 @@ impl SessionManager {
             effects.publish();
         }
         if first {
-            self.schedule_connection_drain(shared, connection.token);
+            self.schedule_connection_drain(connection.token);
         }
         if connection.accepted_count() == 0 {
             self.record_connection_drained(connection);
-            self.schedule_connection_retirement(shared, connection);
+            self.schedule_connection_retirement(connection);
         }
     }
 
     #[cfg(test)]
-    pub(in crate::v2::engine) fn begin_all_connection_close(&self, shared: &EngineShared) {
+    pub(in crate::v2::engine) fn begin_all_connection_close(&self) {
         if self
             .shutdown_connection_close_started
             .swap(true, Ordering::AcqRel)
@@ -72,13 +70,12 @@ impl SessionManager {
             return;
         }
         for connection in self.connections.occupied() {
-            self.begin_connection_close(shared, &connection);
+            self.begin_connection_close(&connection);
         }
     }
 
     pub(in crate::v2::engine) fn schedule_connection_retirement(
         &self,
-        shared: &EngineShared,
         connection: &ConnectionState,
     ) {
         if connection.is_retired()
@@ -89,25 +86,18 @@ impl SessionManager {
             return;
         }
         self.cm.enqueue_retirement(connection.token);
-        shared
-            .work_signal
-            .publish(super::super::driver::SESSION_WORK);
+        self.publish_session_work();
     }
 
-    fn schedule_connection_drain(&self, shared: &EngineShared, token: ConnectionToken) {
+    fn schedule_connection_drain(&self, token: ConnectionToken) {
         self.schedule_deadline(
-            &shared.work_signal,
             DeadlineKind::ConnectionDrain,
             token.encode(),
-            shared.config.connection_drain_deadline,
+            self.config.connection_drain_deadline,
         );
     }
 
-    pub(in crate::v2::engine) fn handle_connection_drain_deadline(
-        &self,
-        shared: &EngineShared,
-        token: ConnectionToken,
-    ) {
+    pub(in crate::v2::engine) fn handle_connection_drain_deadline(&self, token: ConnectionToken) {
         let Lookup::Occupied(connection) = self.connections.lookup(token) else {
             return;
         };
@@ -116,7 +106,6 @@ impl SessionManager {
         if connection.has_copied_completions() {
             self.io_core.publish_connection(&connection.io);
             self.schedule_deadline(
-                &shared.work_signal,
                 DeadlineKind::ConnectionDrain,
                 token.encode(),
                 std::time::Duration::ZERO,
@@ -144,11 +133,10 @@ impl SessionManager {
             }
         };
         if let Some((tokens, proof)) = forced_tokens {
-            self.reclaim_after_qp_destroy(shared, proof, &connection, tokens);
-            if self.reject_queued_completions_after_qp_destroy(shared, &connection) {
+            self.reclaim_after_qp_destroy(proof, &connection, tokens);
+            if self.reject_queued_completions_after_qp_destroy(&connection) {
                 self.io_core.publish_connection(&connection.io);
                 self.schedule_deadline(
-                    &shared.work_signal,
                     DeadlineKind::ConnectionDrain,
                     token.encode(),
                     std::time::Duration::ZERO,
@@ -159,7 +147,7 @@ impl SessionManager {
         if let Some(report) = connection.begin_quarantine() {
             self.track_connection_quarantine(connection.token);
             for operation in connection.accepted_tokens() {
-                self.quarantine_operation(shared, operation);
+                self.quarantine_operation(operation);
             }
             if let Some(event) =
                 connection.publish_quarantine(report.outstanding_operations, report.cq_debt)
@@ -170,7 +158,7 @@ impl SessionManager {
         if connection.close_started() && connection.accepted_count() == 0 {
             self.recover_connection_quarantine(&connection);
             self.record_connection_drained(&connection);
-            self.schedule_connection_retirement(shared, &connection);
+            self.schedule_connection_retirement(&connection);
         }
     }
 
@@ -200,19 +188,18 @@ impl SessionManager {
 #[cfg(test)]
 impl EngineShared {
     pub(in crate::v2::engine) fn begin_all_connection_close(&self) {
-        self.session.begin_all_connection_close(self);
+        self.session.begin_all_connection_close();
     }
 
     pub(in crate::v2::engine) fn schedule_connection_retirement(
         &self,
         connection: &ConnectionState,
     ) {
-        self.session
-            .schedule_connection_retirement(self, connection);
+        self.session.schedule_connection_retirement(connection);
     }
 
     pub(in crate::v2::engine) fn handle_connection_drain_deadline(&self, token: ConnectionToken) {
-        self.session.handle_connection_drain_deadline(self, token);
+        self.session.handle_connection_drain_deadline(token);
     }
 
     pub(in crate::v2::engine) fn recover_connection_quarantine(

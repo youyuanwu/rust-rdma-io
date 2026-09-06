@@ -71,13 +71,11 @@ impl SessionProgress {
         {
             self.turns = self.turns.saturating_add(1);
         }
-        let Some(shared) = self.manager.engine() else {
+        if self.manager.engine_runtime().is_none() {
             return Err(Error::DriverShutdown);
-        };
-        let shutting_down = shared
-            .shutdown_requested
-            .load(std::sync::atomic::Ordering::Acquire);
-        let terminal_failure = shared.pending_terminal_outcome().is_some();
+        }
+        let shutting_down = self.manager.shutdown_requested();
+        let terminal_failure = self.manager.pending_terminal_outcome().is_some();
         if shutting_down {
             self.terminal_completion_ready = false;
             self.ensure_shutdown_started();
@@ -86,11 +84,11 @@ impl SessionProgress {
             self.prepare_failure_scan();
         }
         let (cm_units, readiness, cm_ready, observed_would_block) =
-            self.service_cm(mode, cx, &shared, shutting_down, terminal_failure)?;
+            self.service_cm(mode, cx, shutting_down, terminal_failure)?;
         let (deadline_units, deadline_ready, deadline_terminal) = if terminal_failure {
             (0, false, false)
         } else {
-            self.service_deadlines(&shared)?
+            self.service_deadlines()?
         };
         if terminal_failure && self.shutdown_issuance_complete() {
             self.terminal_completion_ready = true;
@@ -127,10 +125,10 @@ impl SessionProgress {
         if !self.terminal_completion_ready || !self.shutdown_issuance_complete() {
             return false;
         }
-        let Some(shared) = self.manager.engine() else {
+        if self.manager.engine_runtime().is_none() {
             return false;
-        };
-        shared.pending_terminal_outcome().is_some() || self.terminal_state_drained()
+        }
+        self.manager.pending_terminal_outcome().is_some() || self.terminal_state_drained()
     }
 
     pub(in crate::v2::engine) fn release_resources(&mut self) {
@@ -189,8 +187,8 @@ impl SessionProgress {
             && self.manager.live_connection_count() == 0
     }
 
-    fn service_shutdown_unit(&mut self, shared: &Arc<crate::v2::engine::EngineShared>) -> usize {
-        let terminal = shared.pending_terminal_outcome();
+    fn service_shutdown_unit(&mut self) -> usize {
+        let terminal = self.manager.pending_terminal_outcome();
         let outcome = terminal
             .clone()
             .unwrap_or_else(|| MemoizedTerminalResult::from_error(Error::DriverShutdown));
@@ -199,7 +197,7 @@ impl SessionProgress {
             self.shutdown_next_source = !self.shutdown_next_source;
             if cm_first {
                 let processed = self.manager.cm.service_bounded_shutdown(
-                    shared,
+                    &self.manager,
                     &outcome,
                     terminal.is_some(),
                     &mut self.shutdown_cm,
@@ -216,7 +214,7 @@ impl SessionProgress {
                 self.shutdown_connection_slot = next;
                 self.shutdown_connections_complete = complete;
                 for connection in connections {
-                    self.manager.begin_connection_close(shared, &connection);
+                    self.manager.begin_connection_close(&connection);
                     if let Some(outcome) = terminal.as_ref() {
                         if connection.retain_bundle_for_engine_failure() {
                             self.manager.track_connection_quarantine(connection.token);
@@ -242,7 +240,6 @@ impl SessionProgress {
         &mut self,
         mode: CompletionMode,
         cx: &mut TaskContext<'_>,
-        shared: &Arc<crate::v2::engine::EngineShared>,
         shutting_down: bool,
         terminal_failure: bool,
     ) -> Result<(usize, ReadinessRegistration, bool, bool)> {
@@ -263,7 +260,6 @@ impl SessionProgress {
                 }
                 let units = match source {
                     0 => self.manager.service_cm_software(
-                        shared,
                         self.resources
                             .as_ref()
                             .map(SessionProgressResources::engine),
@@ -274,7 +270,7 @@ impl SessionProgress {
                             continue;
                         };
                         let resources = resources.engine();
-                        if self.manager.try_process_cm_event(shared, resources)? {
+                        if self.manager.try_process_cm_event(resources)? {
                             observed_would_block = false;
                             readiness = if mode == CompletionMode::Readiness {
                                 ReadinessRegistration::Incomplete
@@ -302,7 +298,7 @@ impl SessionProgress {
                                         Poll::Pending => Poll::Pending,
                                     },
                                     |guard| guard.clear_ready(),
-                                    || self.manager.try_process_cm_event(shared, resources),
+                                    || self.manager.try_process_cm_event(resources),
                                 ) {
                                     Poll::Ready(result) => {
                                         let units = result?;
@@ -327,13 +323,12 @@ impl SessionProgress {
                             continue;
                         };
                         let resources = resources.engine();
-                        self.manager
-                            .service_deferred_cm_destructions(shared, 1, || {
-                                self.manager.try_process_cm_event(shared, resources)
-                            })?
+                        self.manager.service_deferred_cm_destructions(1, || {
+                            self.manager.try_process_cm_event(resources)
+                        })?
                     }
                     3 if shutting_down && !self.shutdown_issuance_complete() => {
-                        self.service_shutdown_unit(shared)
+                        self.service_shutdown_unit()
                     }
                     _ => 0,
                 };
@@ -360,10 +355,7 @@ impl SessionProgress {
         Ok((processed, readiness, immediate, observed_would_block))
     }
 
-    fn service_deadlines(
-        &mut self,
-        shared: &Arc<crate::v2::engine::EngineShared>,
-    ) -> Result<(usize, bool, bool)> {
+    fn service_deadlines(&mut self) -> Result<(usize, bool, bool)> {
         let now = Instant::now();
         let starts_with_request = self.reclamation_turn_starts_with_request;
         self.reclamation_turn_starts_with_request = !starts_with_request;
@@ -375,10 +367,10 @@ impl SessionProgress {
                 if self.ingest_one_deadline()? {
                     true
                 } else {
-                    self.process_one_deadline(now, shared, &mut terminal_ready)?
+                    self.process_one_deadline(now, &mut terminal_ready)?
                 }
             } else {
-                if self.process_one_deadline(now, shared, &mut terminal_ready)? {
+                if self.process_one_deadline(now, &mut terminal_ready)? {
                     true
                 } else {
                     self.ingest_one_deadline()?
@@ -407,12 +399,7 @@ impl SessionProgress {
         Ok(true)
     }
 
-    fn process_one_deadline(
-        &mut self,
-        now: Instant,
-        shared: &Arc<crate::v2::engine::EngineShared>,
-        terminal_ready: &mut bool,
-    ) -> Result<bool> {
+    fn process_one_deadline(&mut self, now: Instant, terminal_ready: &mut bool) -> Result<bool> {
         let Some(deadline) = self.deadlines.pop_due(now, 1).into_iter().next() else {
             return Ok(false);
         };
@@ -421,7 +408,7 @@ impl SessionProgress {
                 kind: DeadlineKind::EngineShutdown,
                 ..
             } => {
-                if let Some(failure) = shared.shutdown_deadline_failure() {
+                if let Some(failure) = self.manager.shutdown_deadline_failure() {
                     return Err(failure);
                 }
                 *terminal_ready = true;
@@ -431,7 +418,6 @@ impl SessionProgress {
                 token,
                 ..
             } => self.manager.handle_connection_drain_deadline(
-                shared,
                 crate::v2::engine::registry::ConnectionToken::decode(token),
             ),
         }
@@ -551,7 +537,6 @@ mod tests {
         let (engine, driver) = test_engine_pair(CompletionMode::Polling);
         let mut progress = SessionProgress::new(Arc::clone(&engine.shared.session), None, 1, 1);
         engine.shared.session.schedule_deadline(
-            &engine.shared.work_signal,
             DeadlineKind::ConnectionDrain,
             1,
             std::time::Duration::ZERO,

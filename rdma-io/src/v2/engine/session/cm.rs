@@ -25,7 +25,7 @@ use super::super::registry::{
     ConnectionToken, Lookup, PagedRegistry, RegistryToken, lock_unpoison,
 };
 use super::super::resources::EngineResources;
-use super::super::{ConnectionSetup, EngineShared, RdmaConnection, RdmaConnectionConfig};
+use super::super::{ConnectionSetup, RdmaConnection, RdmaConnectionConfig};
 use super::SessionManager;
 use super::connection::{
     ConnectionCmRoute, ConnectionReservation, ConnectionState, FailedConnectionInstallResources,
@@ -50,16 +50,13 @@ enum CmEventReject {
     Unexpected,
 }
 
-fn record_cm_reject(shared: &EngineShared, reject: CmEventReject) {
+fn record_cm_reject(manager: &SessionManager, reject: CmEventReject) {
     #[cfg(any(test, feature = "test-hooks"))]
     if !matches!(reject, CmEventReject::Duplicate) {
-        shared
-            .session
-            .rejected_cm_events
-            .fetch_add(1, Ordering::Relaxed);
+        manager.rejected_cm_events.fetch_add(1, Ordering::Relaxed);
     }
     #[cfg(not(any(test, feature = "test-hooks")))]
-    let _ = (shared, reject);
+    let _ = (manager, reject);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -288,7 +285,7 @@ impl CmState {
 
     pub(in crate::v2::engine) fn service_software(
         &self,
-        shared: &Arc<EngineShared>,
+        shared: &SessionManager,
         resources: Option<&EngineResources>,
         budget: usize,
     ) -> Result<usize> {
@@ -334,7 +331,7 @@ impl CmState {
                 1 => {
                     let token = { lock_unpoison(&self.retirements).pop_front() };
                     if let Some(token) = token {
-                        shared.session.retire_registered_connection(shared, token)?;
+                        shared.retire_registered_connection(token)?;
                         processed += 1;
                     }
                 }
@@ -352,7 +349,7 @@ impl CmState {
                                 "CM pending work requires live engine resources".into(),
                             ));
                         };
-                        if !self.start_outbound(shared, resources, request)? {
+                        if !self.start_outbound(resources, request)? {
                             self.outbound_setup_active.store(false, Ordering::Release);
                         }
                         processed += 1;
@@ -396,7 +393,7 @@ impl CmState {
 
     pub(in crate::v2::engine) fn try_process_event(
         &self,
-        shared: &Arc<EngineShared>,
+        shared: &SessionManager,
         resources: &EngineResources,
     ) -> Result<bool> {
         let event = match resources.cm_event_channel.try_get_event() {
@@ -423,7 +420,6 @@ impl CmState {
                 record_cm_reject(shared, reject);
                 if snapshot.event_type == CmEventType::ConnectRequest {
                     self.reject_raw_child(
-                        shared,
                         resources,
                         snapshot.id,
                         InboundRejectReason::ListenerClosed,
@@ -460,7 +456,7 @@ impl CmState {
     #[cfg(test)]
     pub(in crate::v2::engine) fn begin_shutdown(
         &self,
-        shared: &Arc<EngineShared>,
+        shared: &SessionManager,
         outcome: &MemoizedTerminalResult,
     ) {
         if self.shutting_down.swap(true, Ordering::AcqRel) {
@@ -501,7 +497,7 @@ impl CmState {
 
     pub(in crate::v2::engine) fn service_bounded_shutdown(
         &self,
-        shared: &Arc<EngineShared>,
+        shared: &SessionManager,
         outcome: &MemoizedTerminalResult,
         terminalize_listeners: bool,
         cursor: &mut CmShutdownCursor,
@@ -689,7 +685,7 @@ impl CmState {
 
     pub(in crate::v2::engine) fn service_cm_destructions(
         &self,
-        shared: &Arc<EngineShared>,
+        shared: &SessionManager,
         budget: usize,
         mut try_process_event: impl FnMut() -> Result<bool>,
     ) -> Result<usize> {
@@ -813,7 +809,7 @@ impl CmState {
 
     fn complete_connection_cm_destruction(
         &self,
-        shared: &EngineShared,
+        shared: &SessionManager,
         connection: Arc<ConnectionState>,
         completion: Option<InboundRetirementCompletion>,
         destroy_result: Result<()>,
@@ -821,7 +817,7 @@ impl CmState {
     ) -> Result<()> {
         match (destroy_result, finalize_result) {
             (Ok(()), Ok(())) => {
-                shared.session.record_connection_retired(&connection);
+                shared.record_connection_retired(&connection);
                 if let Some(event) = connection.finish_retirement() {
                     event.deliver();
                 }
@@ -881,13 +877,13 @@ impl CmState {
 
     fn start_listener(
         &self,
-        shared: &Arc<EngineShared>,
+        shared: &SessionManager,
         resources: &EngineResources,
         request: Arc<ListenRequest>,
     ) -> Result<()> {
         if request.is_cancelled()
             || self.shutting_down.load(Ordering::Acquire)
-            || shared.shutdown_requested.load(Ordering::Acquire)
+            || shared.shutdown_requested()
         {
             request.complete(Err(Error::DriverShutdown));
             return Ok(());
@@ -973,7 +969,7 @@ impl CmState {
 
     fn service_listener(
         &self,
-        shared: &Arc<EngineShared>,
+        shared: &SessionManager,
         resources: &EngineResources,
         listener: &Arc<ListenerState>,
     ) -> Result<()> {
@@ -1013,18 +1009,13 @@ impl CmState {
 
     fn handle_connect_request(
         &self,
-        shared: &Arc<EngineShared>,
+        shared: &SessionManager,
         resources: &EngineResources,
         listener: &Arc<ListenerState>,
         snapshot: CmEventSnapshot,
     ) -> Result<EventDisposition> {
         if snapshot.status != 0 || listener.is_closing() {
-            self.reject_raw_child(
-                shared,
-                resources,
-                snapshot.id,
-                InboundRejectReason::ListenerClosed,
-            )?;
+            self.reject_raw_child(resources, snapshot.id, InboundRejectReason::ListenerClosed)?;
             return Ok(EventDisposition::Handled);
         }
         let raw = snapshot.id as *mut rdma_cm_id;
@@ -1038,7 +1029,7 @@ impl CmState {
                 listener = %listener.local_addr,
                 "rejecting inbound child with mismatched verbs context: {error}"
             );
-            self.reject_unreserved_child(shared, child_id, InboundRejectReason::ContextMismatch)?;
+            self.reject_unreserved_child(child_id, InboundRejectReason::ContextMismatch)?;
             return Ok(EventDisposition::Handled);
         }
 
@@ -1050,7 +1041,7 @@ impl CmState {
                 } else {
                     InboundRejectReason::AdmissionClosed
                 };
-                self.reject_unreserved_child(shared, child_id, reason)?;
+                self.reject_unreserved_child(child_id, reason)?;
                 return Ok(EventDisposition::Handled);
             }
         };
@@ -1069,7 +1060,7 @@ impl CmState {
 
     fn handle_listener_event(
         &self,
-        shared: &Arc<EngineShared>,
+        shared: &SessionManager,
         listener: &Arc<ListenerState>,
         snapshot: CmEventSnapshot,
     ) -> Result<EventDisposition> {
@@ -1092,16 +1083,13 @@ impl CmState {
 
     fn process_selected_pair(
         &self,
-        shared: &Arc<EngineShared>,
+        shared: &SessionManager,
         resources: &EngineResources,
         listener: &Arc<ListenerState>,
         request: Arc<AcceptRequest>,
         child: IncomingChild,
     ) -> Result<()> {
-        if request.is_cancelled()
-            || listener.is_closing()
-            || shared.shutdown_requested.load(Ordering::Acquire)
-        {
+        if request.is_cancelled() || listener.is_closing() || shared.shutdown_requested() {
             let error = if listener.is_closing() {
                 listener.close_error()
             } else {
@@ -1128,7 +1116,7 @@ impl CmState {
         request.set_route_token(token.encode());
         if let Err(error) = child_cm_id.install_context_token(token.encode()) {
             self.inbound_routes.release(token, false);
-            self.reject_unreserved_child(shared, child_cm_id, InboundRejectReason::SetupFailure)?;
+            self.reject_unreserved_child(child_cm_id, InboundRejectReason::SetupFailure)?;
             drop(child_reservation);
             request.complete(Err(error));
             listener.finish_selected_request(&request);
@@ -1139,7 +1127,7 @@ impl CmState {
         route.set_identity(raw_id, context_key);
         if !self.insert_context_route(context_key, ContextRoute::Inbound { token, raw_id }) {
             self.inbound_routes.release(token, false);
-            self.reject_unreserved_child(shared, child_cm_id, InboundRejectReason::SetupFailure)?;
+            self.reject_unreserved_child(child_cm_id, InboundRejectReason::SetupFailure)?;
             drop(child_reservation);
             request.complete(Err(Error::InvalidConfig(
                 "duplicate inbound CM context identity".into(),
@@ -1156,11 +1144,7 @@ impl CmState {
             Err(error) => {
                 self.remove_owned_context_route(Some(&child_cm_id));
                 self.inbound_routes.release(token, false);
-                self.reject_unreserved_child(
-                    shared,
-                    child_cm_id,
-                    InboundRejectReason::SetupFailure,
-                )?;
+                self.reject_unreserved_child(child_cm_id, InboundRejectReason::SetupFailure)?;
                 drop(child_reservation);
                 request.complete(Err(contextual_cm_error(
                     format!("build inbound QP for {}", listener.local_addr),
@@ -1183,21 +1167,17 @@ impl CmState {
             Ok(connection) => connection,
             Err(failure) => {
                 let (error, failed_resources) = failure.into_parts();
-                match shared.session.destroy_unregistered_connection(&verbs) {
+                match shared.destroy_unregistered_connection(&verbs) {
                     Ok((cm_id, _qp_destroyed)) => {
                         self.release_failed_install(shared, failed_resources)?;
                         if let Some(cm_id) = cm_id {
-                            self.reject_unreserved_child(
-                                shared,
-                                cm_id,
-                                InboundRejectReason::SetupFailure,
-                            )?;
+                            self.reject_unreserved_child(cm_id, InboundRejectReason::SetupFailure)?;
                         }
                         self.inbound_routes.release(token, false);
                     }
                     Err(destroy_error) => {
                         Self::record_setup_rollback_quarantine(&destroy_error);
-                        self.reject_retained_inbound_child(shared, &verbs);
+                        self.reject_retained_inbound_child(&verbs);
                         let connection =
                             self.retain_failed_install(shared, failed_resources, &destroy_error);
                         route.set_state(InboundState::Quarantined { connection });
@@ -1221,10 +1201,7 @@ impl CmState {
             setup,
             &connection,
             || {
-                if request.is_cancelled()
-                    || listener.is_closing()
-                    || shared.shutdown_requested.load(Ordering::Acquire)
-                {
+                if request.is_cancelled() || listener.is_closing() || shared.shutdown_requested() {
                     Err(if listener.is_closing() {
                         listener.close_error()
                     } else {
@@ -1251,7 +1228,7 @@ impl CmState {
 
     fn fail_selected_connection(
         &self,
-        shared: &Arc<EngineShared>,
+        shared: &SessionManager,
         route: &Arc<InboundRoute>,
         request: Arc<AcceptRequest>,
         connection: RdmaConnection,
@@ -1272,21 +1249,16 @@ impl CmState {
             selected: true,
             reject: Some(reject),
         });
-        shared
-            .session
-            .begin_connection_close(shared, &connection_state);
+        shared.begin_connection_close(&connection_state);
         drop(connection);
         if connection_state.accepted_count() == 0 {
-            shared
-                .session
-                .retire_registered_connection(shared, connection_state.token)?;
+            shared.retire_registered_connection(connection_state.token)?;
         }
         Ok(())
     }
 
     fn reject_raw_child(
         &self,
-        shared: &Arc<EngineShared>,
         resources: &EngineResources,
         raw_id: usize,
         reason: InboundRejectReason,
@@ -1296,7 +1268,6 @@ impl CmState {
         }
         let cm_id = unsafe { CmId::from_raw(raw_id as *mut rdma_cm_id, true) };
         self.reject_unreserved_child(
-            shared,
             SharedCmId::new(cm_id, Arc::clone(&resources.cm_event_channel)),
             reason,
         )
@@ -1304,7 +1275,6 @@ impl CmState {
 
     fn reject_unreserved_child(
         &self,
-        _shared: &Arc<EngineShared>,
         cm_id: SharedCmId,
         reason: InboundRejectReason,
     ) -> Result<()> {
@@ -1318,11 +1288,7 @@ impl CmState {
         Ok(())
     }
 
-    fn reject_retained_inbound_child(
-        &self,
-        _shared: &EngineShared,
-        verbs: &VerbsConnectionResources,
-    ) {
+    fn reject_retained_inbound_child(&self, verbs: &VerbsConnectionResources) {
         if let Err(error) = verbs.reject() {
             tracing::warn!(
                 %error,
@@ -1333,17 +1299,17 @@ impl CmState {
 
     fn reject_child(
         &self,
-        shared: &Arc<EngineShared>,
+        _shared: &SessionManager,
         child: IncomingChild,
         reason: InboundRejectReason,
     ) -> Result<()> {
         let (cm_id, reservation) = child.into_resources()?;
-        let result = self.reject_unreserved_child(shared, cm_id, reason);
+        let result = self.reject_unreserved_child(cm_id, reason);
         drop(reservation);
         result
     }
 
-    fn cancel_inbound_route(&self, shared: &Arc<EngineShared>, encoded: u64) -> Result<()> {
+    fn cancel_inbound_route(&self, shared: &SessionManager, encoded: u64) -> Result<()> {
         let token = CmRouteToken::decode(encoded);
         let Lookup::Occupied(route) = self.inbound_routes.lookup_cloned(token) else {
             return Ok(());
@@ -1379,14 +1345,10 @@ impl CmState {
                     selected: true,
                     reject: None,
                 });
-                shared
-                    .session
-                    .begin_connection_close(shared, &connection_state);
+                shared.begin_connection_close(&connection_state);
                 drop(connection);
                 if connection_state.accepted_count() == 0 {
-                    shared
-                        .session
-                        .retire_registered_connection(shared, connection_state.token)?;
+                    shared.retire_registered_connection(connection_state.token)?;
                 }
             }
             InboundState::EstablishedAwaitingDelivery {
@@ -1416,13 +1378,9 @@ impl CmState {
                     selected: true,
                     reject: None,
                 });
-                shared
-                    .session
-                    .begin_connection_close(shared, &connection_state);
+                shared.begin_connection_close(&connection_state);
                 if connection_state.accepted_count() == 0 {
-                    shared
-                        .session
-                        .retire_registered_connection(shared, connection_state.token)?;
+                    shared.retire_registered_connection(connection_state.token)?;
                 }
             }
             _ => unreachable!("inbound cancellation state was pre-filtered"),
@@ -1457,7 +1415,6 @@ impl CmState {
 
     fn start_outbound(
         &self,
-        shared: &Arc<EngineShared>,
         resources: &EngineResources,
         request: Arc<OutboundRequest>,
     ) -> Result<bool> {
@@ -1478,7 +1435,7 @@ impl CmState {
             Ok(route) => route,
             Err(error) => {
                 drop(reservation);
-                request.complete_failure(shared, error);
+                request.complete_failure(error);
                 return Ok(false);
             }
         };
@@ -1493,7 +1450,7 @@ impl CmState {
             Err(error) => {
                 self.routes.release(token, false);
                 drop(reservation);
-                request.complete_failure(shared, Error::from_v1(error));
+                request.complete_failure(Error::from_v1(error));
                 return Ok(false);
             }
         };
@@ -1501,10 +1458,9 @@ impl CmState {
             self.defer_cm_id(cm_id);
             self.routes.release(token, false);
             drop(reservation);
-            request.complete_failure(
-                shared,
-                Error::InvalidConfig("engine CM ID lost its route context token".into()),
-            );
+            request.complete_failure(Error::InvalidConfig(
+                "engine CM ID lost its route context token".into(),
+            ));
             return Ok(false);
         };
         let context_route = CmRouteToken::decode(context_token);
@@ -1512,10 +1468,9 @@ impl CmState {
             self.defer_cm_id(cm_id);
             self.routes.release(token, false);
             drop(reservation);
-            request.complete_failure(
-                shared,
-                Error::InvalidConfig("engine CM context token did not match its route".into()),
-            );
+            request.complete_failure(Error::InvalidConfig(
+                "engine CM context token did not match its route".into(),
+            ));
             return Ok(false);
         }
         let context_key = cm_id.context_key();
@@ -1531,10 +1486,7 @@ impl CmState {
             self.defer_cm_id(cm_id);
             self.routes.release(token, false);
             drop(reservation);
-            request.complete_failure(
-                shared,
-                Error::InvalidConfig("duplicate CM context identity".into()),
-            );
+            request.complete_failure(Error::InvalidConfig("duplicate CM context identity".into()));
             return Ok(false);
         }
 
@@ -1549,7 +1501,7 @@ impl CmState {
                 self.defer_cm_id(cm_id);
                 self.retire_route(&route, false);
                 drop(reservation);
-                request.complete_failure(shared, Error::from_v1(error));
+                request.complete_failure(Error::from_v1(error));
                 return Ok(false);
             }
         }
@@ -1558,7 +1510,7 @@ impl CmState {
 
     fn process_cancellation(
         &self,
-        shared: &Arc<EngineShared>,
+        shared: &SessionManager,
         request: Arc<OutboundRequest>,
     ) -> Result<()> {
         let encoded = request.route_token.load(Ordering::Acquire);
@@ -1603,14 +1555,10 @@ impl CmState {
         route.set_state(OutboundState::Closing {
             connection: connection.clone(),
         });
-        shared
-            .session
-            .begin_connection_close(shared, &connection_state);
+        shared.begin_connection_close(&connection_state);
         drop(request.take_result());
         if connection_state.accepted_count() == 0 {
-            shared
-                .session
-                .retire_registered_connection(shared, connection_state.token)?;
+            shared.retire_registered_connection(connection_state.token)?;
         }
         drop(route_request);
         Ok(())
@@ -1618,14 +1566,13 @@ impl CmState {
 
     fn release_failed_install(
         &self,
-        shared: &EngineShared,
+        shared: &SessionManager,
         resources: FailedConnectionInstallResources,
     ) -> Result<()> {
         match resources {
             FailedConnectionInstallResources::Unregistered { .. } => Ok(()),
             FailedConnectionInstallResources::Registered(connection) => {
                 let released = shared
-                    .session
                     .connections
                     .release_unindexed(connection.token)
                     .ok_or_else(|| {
@@ -1646,7 +1593,7 @@ impl CmState {
 
     fn retain_failed_install(
         &self,
-        shared: &EngineShared,
+        shared: &SessionManager,
         resources: FailedConnectionInstallResources,
         destroy_error: &Error,
     ) -> Option<EstablishedConnectionRoute> {
@@ -1665,7 +1612,7 @@ impl CmState {
             FailedConnectionInstallResources::Registered(connection) => {
                 connection.begin_close();
                 let _ = connection.try_begin_retirement();
-                shared.session.track_connection_quarantine(connection.token);
+                shared.track_connection_quarantine(connection.token);
                 let (_, event) = connection.publish_destroy_quarantine(destroy_error, || {});
                 if let Some(event) = event {
                     event.deliver();
@@ -1684,11 +1631,11 @@ impl CmState {
 
     fn finalize_connection_retirement(
         &self,
-        shared: &EngineShared,
+        shared: &SessionManager,
         connection: Arc<ConnectionState>,
     ) -> Result<()> {
         self.release_connection_retirement(shared, &connection)?;
-        shared.session.record_connection_retired(&connection);
+        shared.record_connection_retired(&connection);
         if let Some(event) = connection.finish_retirement() {
             event.deliver();
         }
@@ -1697,11 +1644,10 @@ impl CmState {
 
     fn release_connection_retirement(
         &self,
-        shared: &EngineShared,
+        shared: &SessionManager,
         connection: &Arc<ConnectionState>,
     ) -> Result<()> {
         let released = shared
-            .session
             .connections
             .release(connection.token, connection.qp_num())
             .ok_or_else(|| {
@@ -1801,7 +1747,6 @@ impl CmState {
 
     fn retire_inbound_connection_route(
         &self,
-        _shared: &EngineShared,
         encoded: u64,
         connection: &Arc<ConnectionState>,
     ) -> Result<RouteRetirement> {
@@ -1963,7 +1908,7 @@ impl CmState {
 
     fn handle_event(
         &self,
-        shared: &Arc<EngineShared>,
+        shared: &SessionManager,
         resources: &EngineResources,
         route: &Arc<OutboundRoute>,
         snapshot: CmEventSnapshot,
@@ -1995,16 +1940,14 @@ impl CmState {
             || !route.is_establishing()
         {
             self.outbound_setup_active.store(false, Ordering::Release);
-            shared
-                .work_signal
-                .publish(super::super::driver::SESSION_WORK);
+            shared.publish_session_work();
         }
         Ok(disposition)
     }
 
     fn handle_inbound_event(
         &self,
-        shared: &Arc<EngineShared>,
+        shared: &SessionManager,
         route: &Arc<InboundRoute>,
         snapshot: CmEventSnapshot,
     ) -> Result<EventDisposition> {
@@ -2026,7 +1969,7 @@ impl CmState {
                     || listener
                         .as_ref()
                         .is_none_or(|listener| listener.is_closing())
-                    || shared.shutdown_requested.load(Ordering::Acquire)
+                    || shared.shutdown_requested()
                 {
                     let connection_state = connection.require_session_state()?;
                     let completion = if request.is_cancelled() {
@@ -2043,14 +1986,10 @@ impl CmState {
                         selected: true,
                         reject: None,
                     });
-                    shared
-                        .session
-                        .begin_connection_close(shared, &connection_state);
+                    shared.begin_connection_close(&connection_state);
                     drop(connection);
                     if connection_state.accepted_count() == 0 {
-                        shared
-                            .session
-                            .retire_registered_connection(shared, connection_state.token)?;
+                        shared.retire_registered_connection(connection_state.token)?;
                     }
                     return Ok(EventDisposition::Handled);
                 }
@@ -2072,7 +2011,7 @@ impl CmState {
 
     fn handle_inbound_disconnected(
         &self,
-        shared: &Arc<EngineShared>,
+        shared: &SessionManager,
         route: &Arc<InboundRoute>,
     ) -> Result<EventDisposition> {
         let state = route.take_state_if(|state| {
@@ -2152,20 +2091,16 @@ impl CmState {
                 self.enqueue_listener_work(&listener);
             }
         }
-        shared
-            .session
-            .begin_connection_close(shared, &connection_state);
+        shared.begin_connection_close(&connection_state);
         if connection_state.accepted_count() == 0 {
-            shared
-                .session
-                .retire_registered_connection(shared, connection_state.token)?;
+            shared.retire_registered_connection(connection_state.token)?;
         }
         Ok(EventDisposition::Handled)
     }
 
     fn handle_inbound_failure(
         &self,
-        shared: &Arc<EngineShared>,
+        shared: &SessionManager,
         route: &Arc<InboundRoute>,
         snapshot: CmEventSnapshot,
     ) -> Result<EventDisposition> {
@@ -2195,14 +2130,10 @@ impl CmState {
                     selected: true,
                     reject: None,
                 });
-                shared
-                    .session
-                    .begin_connection_close(shared, &connection_state);
+                shared.begin_connection_close(&connection_state);
                 drop(connection);
                 if connection_state.accepted_count() == 0 {
-                    shared
-                        .session
-                        .retire_registered_connection(shared, connection_state.token)?;
+                    shared.retire_registered_connection(connection_state.token)?;
                 }
             }
             InboundState::EstablishedAwaitingDelivery {
@@ -2239,13 +2170,9 @@ impl CmState {
                         self.enqueue_listener_work(&listener);
                     }
                 }
-                shared
-                    .session
-                    .begin_connection_close(shared, &connection_state);
+                shared.begin_connection_close(&connection_state);
                 if connection_state.accepted_count() == 0 {
-                    shared
-                        .session
-                        .retire_registered_connection(shared, connection_state.token)?;
+                    shared.retire_registered_connection(connection_state.token)?;
                 }
             }
             InboundState::Established { connection } => {
@@ -2265,13 +2192,9 @@ impl CmState {
                     selected: false,
                     reject: None,
                 });
-                shared
-                    .session
-                    .begin_connection_close(shared, &connection_state);
+                shared.begin_connection_close(&connection_state);
                 if connection_state.accepted_count() == 0 {
-                    shared
-                        .session
-                        .retire_registered_connection(shared, connection_state.token)?;
+                    shared.retire_registered_connection(connection_state.token)?;
                 }
             }
             state @ InboundState::Closing { .. } => {
@@ -2293,7 +2216,7 @@ impl CmState {
 
     fn handle_addr_resolved(
         &self,
-        shared: &Arc<EngineShared>,
+        shared: &SessionManager,
         resources: &EngineResources,
         route: &Arc<OutboundRoute>,
     ) -> Result<EventDisposition> {
@@ -2305,9 +2228,7 @@ impl CmState {
         else {
             return Ok(EventDisposition::Rejected(CmEventReject::Duplicate));
         };
-        if request.observer.cancelled.load(Ordering::Acquire)
-            || shared.shutdown_requested.load(Ordering::Acquire)
-        {
+        if request.observer.cancelled.load(Ordering::Acquire) || shared.shutdown_requested() {
             self.defer_cm_id(cm_id);
             drop(reservation);
             self.retire_route(route, true);
@@ -2318,7 +2239,7 @@ impl CmState {
             self.defer_cm_id(cm_id);
             drop(reservation);
             self.retire_route(route, true);
-            request.complete_failure(shared, Error::from_v1(error));
+            request.complete_failure(Error::from_v1(error));
             return Ok(EventDisposition::Handled);
         }
         match cm_id.resolve_route(2_000) {
@@ -2331,7 +2252,7 @@ impl CmState {
                 self.defer_cm_id(cm_id);
                 drop(reservation);
                 self.retire_route(route, true);
-                request.complete_failure(shared, Error::from_v1(error));
+                request.complete_failure(Error::from_v1(error));
             }
         }
         Ok(EventDisposition::Handled)
@@ -2339,7 +2260,7 @@ impl CmState {
 
     fn handle_route_resolved(
         &self,
-        shared: &Arc<EngineShared>,
+        shared: &SessionManager,
         resources: &EngineResources,
         route: &Arc<OutboundRoute>,
     ) -> Result<EventDisposition> {
@@ -2351,9 +2272,7 @@ impl CmState {
         else {
             return Ok(EventDisposition::Rejected(CmEventReject::Duplicate));
         };
-        if request.observer.cancelled.load(Ordering::Acquire)
-            || shared.shutdown_requested.load(Ordering::Acquire)
-        {
+        if request.observer.cancelled.load(Ordering::Acquire) || shared.shutdown_requested() {
             self.defer_cm_id(cm_id);
             drop(reservation);
             self.retire_route(route, true);
@@ -2364,7 +2283,7 @@ impl CmState {
             self.defer_cm_id(cm_id);
             drop(reservation);
             self.retire_route(route, true);
-            request.complete_failure(shared, Error::from_v1(error));
+            request.complete_failure(Error::from_v1(error));
             return Ok(EventDisposition::Handled);
         }
 
@@ -2376,7 +2295,7 @@ impl CmState {
                 self.defer_cm_id(cm_id);
                 drop(reservation);
                 self.retire_route(route, true);
-                request.complete_failure(shared, error);
+                request.complete_failure(error);
                 return Ok(EventDisposition::Handled);
             }
         };
@@ -2393,7 +2312,7 @@ impl CmState {
             Ok(connection) => connection,
             Err(failure) => {
                 let (error, failed_resources) = failure.into_parts();
-                match shared.session.destroy_unregistered_connection(&verbs) {
+                match shared.destroy_unregistered_connection(&verbs) {
                     Ok((cm_id, _qp_destroyed)) => {
                         self.release_failed_install(shared, failed_resources)?;
                         if let Some(cm_id) = cm_id {
@@ -2409,7 +2328,7 @@ impl CmState {
                     }
                 }
                 drop(verbs);
-                request.complete_failure(shared, error);
+                request.complete_failure(error);
                 return Ok(EventDisposition::Handled);
             }
         };
@@ -2437,8 +2356,7 @@ impl CmState {
             setup,
             &connection,
             || {
-                if request.observer.cancelled.load(Ordering::Acquire)
-                    || shared.shutdown_requested.load(Ordering::Acquire)
+                if request.observer.cancelled.load(Ordering::Acquire) || shared.shutdown_requested()
                 {
                     Err(Error::DriverShutdown)
                 } else {
@@ -2452,9 +2370,7 @@ impl CmState {
             self.fail_registered_connection(shared, route, request, connection, error)?;
             return Ok(EventDisposition::Handled);
         }
-        if request.observer.cancelled.load(Ordering::Acquire)
-            || shared.shutdown_requested.load(Ordering::Acquire)
-        {
+        if request.observer.cancelled.load(Ordering::Acquire) || shared.shutdown_requested() {
             drop(verbs);
             self.fail_registered_connection(
                 shared,
@@ -2475,7 +2391,7 @@ impl CmState {
 
     fn fail_registered_connection(
         &self,
-        shared: &Arc<EngineShared>,
+        shared: &SessionManager,
         route: &Arc<OutboundRoute>,
         request: Arc<OutboundRequest>,
         connection: RdmaConnection,
@@ -2485,26 +2401,22 @@ impl CmState {
         route.set_state(OutboundState::Closing {
             connection: EstablishedConnectionRoute::new(&connection_state),
         });
-        shared
-            .session
-            .begin_connection_close(shared, &connection_state);
+        shared.begin_connection_close(&connection_state);
         drop(connection);
         if connection_state.accepted_count() == 0 {
-            shared
-                .session
-                .retire_registered_connection(shared, connection_state.token)?;
+            shared.retire_registered_connection(connection_state.token)?;
         }
         if matches!(&error, Error::DriverShutdown) {
             request.complete(Err(error));
         } else {
-            request.complete_failure(shared, error);
+            request.complete_failure(error);
         }
         Ok(())
     }
 
     fn handle_established(
         &self,
-        shared: &Arc<EngineShared>,
+        shared: &SessionManager,
         route: &Arc<OutboundRoute>,
     ) -> Result<EventDisposition> {
         let Some(OutboundState::AwaitEstablished {
@@ -2514,9 +2426,7 @@ impl CmState {
         else {
             return Ok(EventDisposition::Rejected(CmEventReject::Duplicate));
         };
-        if request.observer.cancelled.load(Ordering::Acquire)
-            || shared.shutdown_requested.load(Ordering::Acquire)
-        {
+        if request.observer.cancelled.load(Ordering::Acquire) || shared.shutdown_requested() {
             self.fail_registered_connection(
                 shared,
                 route,
@@ -2537,7 +2447,7 @@ impl CmState {
 
     fn handle_disconnected(
         &self,
-        shared: &Arc<EngineShared>,
+        shared: &SessionManager,
         route: &Arc<OutboundRoute>,
     ) -> Result<EventDisposition> {
         let state = route.take_state_if(|state| {
@@ -2581,20 +2491,16 @@ impl CmState {
                 connection: connection.clone(),
             });
         }
-        shared
-            .session
-            .begin_connection_close(shared, &connection_state);
+        shared.begin_connection_close(&connection_state);
         if connection_state.accepted_count() == 0 {
-            shared
-                .session
-                .retire_registered_connection(shared, connection_state.token)?;
+            shared.retire_registered_connection(connection_state.token)?;
         }
         Ok(EventDisposition::Handled)
     }
 
     fn handle_failure_event(
         &self,
-        shared: &Arc<EngineShared>,
+        shared: &SessionManager,
         route: &Arc<OutboundRoute>,
         snapshot: CmEventSnapshot,
     ) -> Result<EventDisposition> {
@@ -2618,7 +2524,7 @@ impl CmState {
                 reservation,
             } => {
                 let shutdown_won = request.observer.cancelled.load(Ordering::Acquire)
-                    || shared.shutdown_requested.load(Ordering::Acquire);
+                    || shared.shutdown_requested();
                 self.defer_cm_id(cm_id);
                 drop(reservation);
                 self.retire_route(route, true);
@@ -2634,7 +2540,7 @@ impl CmState {
                     request.complete(Err(Error::DriverShutdown));
                     return Ok(EventDisposition::IgnoredAfterShutdown);
                 }
-                request.complete_failure(shared, Error::Verbs(std::io::Error::other(message)));
+                request.complete_failure(Error::Verbs(std::io::Error::other(message)));
             }
             OutboundState::AwaitEstablished {
                 request,
@@ -2675,13 +2581,9 @@ impl CmState {
                         connection: connection.clone(),
                     });
                 }
-                shared
-                    .session
-                    .begin_connection_close(shared, &connection_state);
+                shared.begin_connection_close(&connection_state);
                 if connection_state.accepted_count() == 0 {
-                    shared
-                        .session
-                        .retire_registered_connection(shared, connection_state.token)?;
+                    shared.retire_registered_connection(connection_state.token)?;
                 }
             }
             OutboundState::Established { connection }
@@ -2698,13 +2600,9 @@ impl CmState {
                 route.set_state(OutboundState::Failed {
                     connection: connection.clone(),
                 });
-                shared
-                    .session
-                    .begin_connection_close(shared, &connection_state);
+                shared.begin_connection_close(&connection_state);
                 if connection_state.accepted_count() == 0 {
-                    shared
-                        .session
-                        .retire_registered_connection(shared, connection_state.token)?;
+                    shared.retire_registered_connection(connection_state.token)?;
                 }
             }
             OutboundState::FailedAwaitingDelivery {
@@ -2806,34 +2704,30 @@ impl SessionManager {
 
     pub(in crate::v2::engine) fn service_cm_software(
         &self,
-        shared: &Arc<EngineShared>,
         resources: Option<&EngineResources>,
         budget: usize,
     ) -> Result<usize> {
-        self.cm.service_software(shared, resources, budget)
+        self.cm.service_software(self, resources, budget)
     }
 
     pub(in crate::v2::engine) fn try_process_cm_event(
         &self,
-        shared: &Arc<EngineShared>,
         resources: &EngineResources,
     ) -> Result<bool> {
-        self.cm.try_process_event(shared, resources)
+        self.cm.try_process_event(self, resources)
     }
 
     pub(in crate::v2::engine) fn service_deferred_cm_destructions(
         &self,
-        shared: &Arc<EngineShared>,
         budget: usize,
         try_process_event: impl FnMut() -> Result<bool>,
     ) -> Result<usize> {
         self.cm
-            .service_cm_destructions(shared, budget, try_process_event)
+            .service_cm_destructions(self, budget, try_process_event)
     }
 
     pub(in crate::v2::engine) fn retire_registered_connection(
         &self,
-        shared: &EngineShared,
         token: ConnectionToken,
     ) -> Result<()> {
         let cm = &self.cm;
@@ -2873,7 +2767,7 @@ impl SessionManager {
                 cm.retire_outbound_connection_route(encoded, &connection)?
             }
             Some(ConnectionCmRoute::Inbound(encoded)) => {
-                cm.retire_inbound_connection_route(shared, encoded, &connection)?
+                cm.retire_inbound_connection_route(encoded, &connection)?
             }
             None => RouteRetirement::Complete {
                 completion: None,
@@ -2923,14 +2817,14 @@ impl SessionManager {
             });
             return Ok(());
         }
-        cm.finalize_connection_retirement(shared, connection)?;
+        cm.finalize_connection_retirement(self, connection)?;
         cm.finish_inbound_retirement(completion);
         Ok(())
     }
 }
 
 pub(in crate::v2::engine) async fn connect(
-    shared: Arc<EngineShared>,
+    shared: Arc<SessionManager>,
     address: SocketAddr,
     config: RdmaConnectionConfig,
 ) -> Result<RdmaConnection> {
@@ -2938,25 +2832,21 @@ pub(in crate::v2::engine) async fn connect(
 }
 
 pub(in crate::v2::engine) async fn connect_with_setup(
-    shared: Arc<EngineShared>,
+    shared: Arc<SessionManager>,
     address: SocketAddr,
     config: RdmaConnectionConfig,
     setup: ConnectionSetup,
 ) -> Result<RdmaConnection> {
-    config.validate(&shared.config, shared.provider.as_ref())?;
+    shared.validate_connection_config(&config)?;
     let (admission, reservation) = reserve_connection(&shared)?;
     let request = Arc::new(OutboundRequest::new(address, config, setup, reservation));
     #[cfg(any(test, feature = "test-hooks"))]
-    shared
-        .test_driver
-        .pause_admission(super::super::driver::test_api::AdmissionPausePoint::ConnectBeforeEnqueue);
-    shared.session.cm.enqueue(Arc::clone(&request));
+    shared.pause_connect_before_enqueue();
+    shared.cm.enqueue(Arc::clone(&request));
     drop(admission);
-    shared
-        .work_signal
-        .publish(super::super::driver::SESSION_WORK);
+    shared.publish_session_work();
     let waiter = ConnectWaiter {
-        manager: Arc::downgrade(&shared.session),
+        manager: Arc::downgrade(&shared),
         request: Arc::downgrade(&request),
         observer: Arc::clone(&request.observer),
         finished: false,
@@ -3509,7 +3399,7 @@ impl OutboundRequest {
         }
     }
 
-    fn complete_failure(&self, _shared: &EngineShared, error: Error) {
+    fn complete_failure(&self, error: Error) {
         let mut current = lock_unpoison(&self.observer.result);
         if matches!(&*current, TakeOnceResult::Pending) {
             *current = TakeOnceResult::Ready(Err(error));
@@ -3618,11 +3508,7 @@ impl Drop for ConnectWaiter {
                 return;
             };
             manager.cm.enqueue_cancellation(request);
-            if let Some(engine) = manager.engine() {
-                engine
-                    .work_signal
-                    .publish(super::super::driver::SESSION_WORK);
-            }
+            manager.publish_session_work();
         }
     }
 }
@@ -3658,15 +3544,21 @@ mod tests {
         let (engine, _driver) =
             super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
         let baseline_engine_owners = Arc::strong_count(&engine.shared);
+        let baseline_manager_owners = Arc::strong_count(&engine.shared.session);
         let mut connect = Box::pin(connect_with_setup(
-            Arc::clone(&engine.shared),
+            Arc::clone(&engine.shared.session),
             "127.0.0.1:7471".parse().unwrap(),
             RdmaConnectionConfig::default(),
             empty_connection_setup(),
         ));
         assert_eq!(
             Arc::strong_count(&engine.shared),
-            baseline_engine_owners + 1
+            baseline_engine_owners,
+            "connect setup no longer retains the concrete engine root"
+        );
+        assert_eq!(
+            Arc::strong_count(&engine.shared.session),
+            baseline_manager_owners + 1
         );
 
         let waker = futures_util::task::noop_waker();
@@ -3676,6 +3568,10 @@ mod tests {
             Arc::strong_count(&engine.shared),
             baseline_engine_owners,
             "suspended connect future must retain only a weak SessionManager route"
+        );
+        assert_eq!(
+            Arc::strong_count(&engine.shared.session),
+            baseline_manager_owners
         );
         let pending = lock_unpoison(&engine.shared.session.cm.pending);
         assert_eq!(pending.len(), 1);
@@ -4676,17 +4572,11 @@ mod tests {
         let (engine, driver) =
             super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
         let failed = test_request();
-        failed.complete_failure(&engine.shared, Error::InvalidConfig("first failure".into()));
-        failed.complete_failure(
-            &engine.shared,
-            Error::InvalidConfig("duplicate failure".into()),
-        );
+        failed.complete_failure(Error::InvalidConfig("first failure".into()));
+        failed.complete_failure(Error::InvalidConfig("duplicate failure".into()));
         let cancelled = test_request();
         cancelled.cancel(Error::DriverShutdown);
-        cancelled.complete_failure(
-            &engine.shared,
-            Error::InvalidConfig("late failure after shutdown".into()),
-        );
+        cancelled.complete_failure(Error::InvalidConfig("late failure after shutdown".into()));
 
         drop(engine);
         drop(driver);
