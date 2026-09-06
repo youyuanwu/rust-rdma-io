@@ -83,8 +83,8 @@ impl SessionProgress {
         }
         let (cm_units, readiness, cm_ready, observed_would_block) =
             self.service_cm(mode, cx, shutting_down, terminal_failure)?;
-        let (deadline_units, deadline_ready, _deadline_terminal) = if terminal_failure {
-            (0, false, false)
+        let (deadline_units, deadline_ready) = if terminal_failure {
+            (0, false)
         } else {
             self.service_deadlines()?
         };
@@ -345,22 +345,21 @@ impl SessionProgress {
         Ok((processed, readiness, immediate, observed_would_block))
     }
 
-    fn service_deadlines(&mut self) -> Result<(usize, bool, bool)> {
+    fn service_deadlines(&mut self) -> Result<(usize, bool)> {
         let now = Instant::now();
         let starts_with_request = self.reclamation_turn_starts_with_request;
         self.reclamation_turn_starts_with_request = !starts_with_request;
         let mut prefer_request = starts_with_request;
         let mut consumed = 0;
-        let mut terminal_ready = false;
         while consumed < self.reclamation_budget {
             let handled = if prefer_request {
                 if self.ingest_one_deadline()? {
                     true
                 } else {
-                    self.process_one_deadline(now, &mut terminal_ready)?
+                    self.process_one_deadline(now)?
                 }
             } else {
-                if self.process_one_deadline(now, &mut terminal_ready)? {
+                if self.process_one_deadline(now)? {
                     true
                 } else {
                     self.ingest_one_deadline()?
@@ -374,7 +373,7 @@ impl SessionProgress {
         }
         let immediate = self.manager.has_deadline_requests()
             || self.deadlines.next().is_some_and(|at| at <= now);
-        Ok((consumed, immediate, terminal_ready))
+        Ok((consumed, immediate))
     }
 
     fn ingest_one_deadline(&mut self) -> Result<bool> {
@@ -389,7 +388,7 @@ impl SessionProgress {
         Ok(true)
     }
 
-    fn process_one_deadline(&mut self, now: Instant, terminal_ready: &mut bool) -> Result<bool> {
+    fn process_one_deadline(&mut self, now: Instant) -> Result<bool> {
         let Some(deadline) = self.deadlines.pop_due(now, 1).into_iter().next() else {
             return Ok(false);
         };
@@ -401,7 +400,6 @@ impl SessionProgress {
                 if let Some(failure) = self.manager.shutdown_deadline_failure() {
                     return Err(failure);
                 }
-                *terminal_ready = true;
             }
             Deadline {
                 kind: DeadlineKind::ConnectionDrain,
