@@ -48,7 +48,7 @@ mod api_tests;
 #[cfg(test)]
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use tokio::sync::Notify;
@@ -468,63 +468,57 @@ struct EngineShared {
     resource_refs: Option<EngineResourceRefs>,
 }
 
-#[derive(Clone)]
-struct SessionEngineRuntime {
-    shared: Weak<EngineShared>,
-}
-
-impl SessionEngineRuntime {
-    fn new(shared: &Arc<EngineShared>) -> Self {
-        Self {
-            shared: Arc::downgrade(shared),
-        }
+trait SessionEngineRuntime: Send + Sync {
+    fn admission_error(&self) -> Option<Error> {
+        None
     }
 
+    fn outcome(&self) -> Option<MemoizedTerminalResult>;
+
+    fn shutdown_requested(&self) -> bool;
+
+    fn pending_terminal_outcome(&self) -> Option<MemoizedTerminalResult>;
+
+    fn begin_driver_failure(&self, error: Error);
+
+    fn shutdown_deadline_failure(&self) -> Option<Error>;
+
+    fn publish_io_work(&self);
+
+    fn publish_session_work(&self);
+}
+
+impl SessionEngineRuntime for EngineShared {
     fn admission_error(&self) -> Option<Error> {
-        match self.shared.upgrade() {
-            Some(shared) => shared.admission_error(),
-            None => Some(Error::DriverShutdown),
-        }
+        EngineShared::admission_error(self)
     }
 
     fn outcome(&self) -> Option<MemoizedTerminalResult> {
-        self.shared.upgrade().and_then(|shared| shared.outcome())
+        EngineShared::outcome(self)
     }
 
     fn shutdown_requested(&self) -> bool {
-        self.shared
-            .upgrade()
-            .is_none_or(|shared| shared.shutdown_requested.load(Ordering::Acquire))
+        self.shutdown_requested.load(Ordering::Acquire)
     }
 
     fn pending_terminal_outcome(&self) -> Option<MemoizedTerminalResult> {
-        self.shared
-            .upgrade()
-            .and_then(|shared| shared.pending_terminal_outcome())
+        EngineShared::pending_terminal_outcome(self)
     }
 
     fn begin_driver_failure(&self, error: Error) {
-        if let Some(shared) = self.shared.upgrade() {
-            shared.begin_driver_failure(error);
-        }
+        EngineShared::begin_driver_failure(self, error);
     }
 
     fn shutdown_deadline_failure(&self) -> Option<Error> {
-        self.shared
-            .upgrade()
-            .and_then(|shared| shared.shutdown_deadline_failure())
+        EngineShared::shutdown_deadline_failure(self)
     }
 
     fn publish_io_work(&self) {
-        if let Some(shared) = self.shared.upgrade() {
-            shared.work_signal.publish(driver::IO_WORK);
-        }
+        self.work_signal.publish(driver::IO_WORK);
     }
 
     fn publish_session_work(&self) {
-        if let Some(shared) = self.shared.upgrade() {
-            shared.work_signal.publish(driver::SESSION_WORK);
-        }
+        self.work_signal.publish(driver::SESSION_WORK);
     }
 }
 
@@ -592,9 +586,8 @@ impl EngineShared {
     fn into_shared(self) -> Arc<Self> {
         let shared = Arc::new(self);
         shared.session.bind_self();
-        shared
-            .session
-            .bind_engine(SessionEngineRuntime::new(&shared));
+        let session_runtime: Arc<dyn SessionEngineRuntime> = shared.clone();
+        shared.session.bind_engine(&session_runtime);
         let session_bridge: Arc<dyn IoSessionBridge> = shared.session.clone();
         shared.io_core.bind_session_bridge(&session_bridge);
         shared

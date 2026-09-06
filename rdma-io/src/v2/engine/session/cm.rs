@@ -4131,8 +4131,8 @@ mod tests {
         drop(state);
         assert_eq!(
             Arc::strong_count(&engine.shared),
-            3,
-            "the route must not retain an RdmaConnection frontend"
+            2,
+            "neither the route nor the test connection frontend retains the engine root"
         );
 
         engine.shared.cm.retire_route(&route, true);

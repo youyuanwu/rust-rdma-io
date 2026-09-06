@@ -29,8 +29,6 @@ use self::connection::{
 use self::listener::ListenerState;
 pub(super) use self::progress::SessionProgress;
 use self::registry::ConnectionRegistry;
-#[cfg(test)]
-use super::EngineShared;
 #[cfg(any(test, feature = "test-hooks"))]
 use super::SessionTestInstrumentation;
 use super::config::{EngineConfig, ProviderLimits, RdmaConnectionConfig};
@@ -312,7 +310,7 @@ pub(super) struct SessionManager {
     pub(super) shutdown_connection_close_started: AtomicBool,
     quarantines: Mutex<QuarantineState>,
     self_ref: OnceLock<Weak<SessionManager>>,
-    engine: OnceLock<SessionEngineRuntime>,
+    engine: OnceLock<Weak<dyn SessionEngineRuntime>>,
     config: EngineConfig,
     provider: Option<ProviderLimits>,
     memory: MemoryRegistrar,
@@ -363,46 +361,41 @@ impl SessionManager {
             .unwrap_or_else(|_| panic!("SessionManager self reference is bound exactly once"));
     }
 
-    pub(super) fn bind_engine(&self, engine: SessionEngineRuntime) {
-        self.engine
-            .set(engine)
-            .unwrap_or_else(|_| panic!("SessionManager is bound to exactly one engine runtime"));
+    pub(super) fn bind_engine(&self, engine: &Arc<dyn SessionEngineRuntime>) {
+        if self.engine.set(Arc::downgrade(engine)).is_err() {
+            panic!("SessionManager is bound to exactly one engine runtime");
+        }
     }
 
     pub(super) fn live_connection_count(&self) -> usize {
         self.connections.live()
     }
 
-    pub(super) fn engine_runtime(&self) -> Option<&SessionEngineRuntime> {
-        self.engine.get()
-    }
-
-    #[cfg(test)]
-    pub(super) fn engine_for_test(&self) -> Option<Arc<EngineShared>> {
-        self.engine_runtime()
-            .and_then(|engine| engine.shared.upgrade())
+    pub(super) fn engine_runtime(&self) -> Option<Arc<dyn SessionEngineRuntime>> {
+        self.engine.get().and_then(Weak::upgrade)
     }
 
     fn engine_outcome(&self) -> Option<super::lifecycle::MemoizedTerminalResult> {
-        self.engine_runtime()
-            .and_then(SessionEngineRuntime::outcome)
+        self.engine_runtime().and_then(|engine| engine.outcome())
     }
 
     pub(super) fn admission_error(&self) -> Option<Error> {
-        self.engine_runtime()
-            .and_then(SessionEngineRuntime::admission_error)
+        match self.engine_runtime() {
+            Some(engine) => engine.admission_error(),
+            None => Some(Error::DriverShutdown),
+        }
     }
 
     pub(super) fn shutdown_requested(&self) -> bool {
         self.engine_runtime()
-            .is_none_or(SessionEngineRuntime::shutdown_requested)
+            .is_none_or(|engine| engine.shutdown_requested())
     }
 
     pub(super) fn pending_terminal_outcome(
         &self,
     ) -> Option<super::lifecycle::MemoizedTerminalResult> {
         self.engine_runtime()
-            .and_then(SessionEngineRuntime::pending_terminal_outcome)
+            .and_then(|engine| engine.pending_terminal_outcome())
     }
 
     pub(super) fn begin_driver_failure(&self, error: Error) {
@@ -413,7 +406,7 @@ impl SessionManager {
 
     pub(super) fn shutdown_deadline_failure(&self) -> Option<Error> {
         self.engine_runtime()
-            .and_then(SessionEngineRuntime::shutdown_deadline_failure)
+            .and_then(|engine| engine.shutdown_deadline_failure())
     }
 
     pub(super) fn publish_io_work(&self) {

@@ -7,8 +7,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
 use self::qp::QpCapabilitiesExt;
-#[cfg(test)]
-use super::super::EngineShared;
 use super::super::RdmaConnectionConfig;
 use super::super::io::{IoEventSender, IoTerminalEvent, MemoryRegistrar, PendingIoEvent};
 #[cfg(test)]
@@ -76,8 +74,6 @@ impl RdmaConnectionIdentity {
 /// zero initial receives.
 pub struct RdmaConnection {
     #[cfg(test)]
-    pub(in crate::v2::engine) shared: Arc<EngineShared>,
-    #[cfg(test)]
     pub(in crate::v2::engine) state: Arc<ConnectionState>,
     #[cfg(not(test))]
     state: Weak<ConnectionState>,
@@ -96,8 +92,6 @@ impl Clone for RdmaConnection {
             state.frontend_count.fetch_add(1, Ordering::Relaxed);
         }
         Self {
-            #[cfg(test)]
-            shared: Arc::clone(&self.shared),
             #[cfg(test)]
             state: Arc::clone(&self.state),
             #[cfg(not(test))]
@@ -271,10 +265,6 @@ impl RdmaConnection {
         let peer_addr = state.peer_addr;
         let io = Arc::clone(&state.io);
         Self {
-            #[cfg(test)]
-            shared: manager
-                .engine_for_test()
-                .expect("test connection requires a live engine"),
             #[cfg(test)]
             state: Arc::clone(&state),
             #[cfg(not(test))]
