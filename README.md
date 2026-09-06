@@ -169,8 +169,11 @@ Readiness adds one CQ completion channel/fd; polling adds none. There is exactly
 one explicit engine driver and zero library-owned tasks or threads, regardless
 of connection count. The engine driver is a thin fair scheduler over bounded
 I/O, session, and terminal turns; the owning layers retain CQ/completion and
-CM/connection-lifecycle policy. Each message connection additionally returns
-one application-owned message driver; low-level connections add no driver.
+CM/connection-lifecycle policy. Session code reaches engine-wide shutdown,
+terminal, failure, and work publication only through a weak narrow runtime
+capability; it cannot recover the concrete engine root or another owner's
+registries. Each message connection additionally returns one application-owned
+message driver; low-level connections add no driver.
 Low-level `connect`/`connect_with_config` and listener
 `accept`/`accept_with_config` post zero initial receives.
 

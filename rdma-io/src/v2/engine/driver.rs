@@ -610,7 +610,7 @@ pub(super) mod test_api {
         /// Return copied numeric provider limits without exposing validation internals.
         pub fn provider_limits(&self) -> Result<TestProviderLimits> {
             let shared = self.ensure_active()?;
-            let limits = shared.provider.ok_or_else(|| {
+            let limits = shared.session.provider_limits().ok_or_else(|| {
                 Error::InvalidConfig("engine has no provider limits snapshot".into())
             })?;
             Ok(TestProviderLimits {

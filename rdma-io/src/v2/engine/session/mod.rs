@@ -307,8 +307,12 @@ pub(super) struct SessionManager {
     pub(super) admission: Arc<RwLock<()>>,
     pub(super) shutdown_connection_close_started: AtomicBool,
     quarantines: Mutex<QuarantineState>,
+    // Frontend capabilities retain only this weak self-reference.
     self_ref: OnceLock<Weak<SessionManager>>,
+    // The session owner can reach only the engine-wide operations exposed by
+    // SessionEngineRuntime; it cannot recover the concrete composition root.
     engine: OnceLock<Weak<dyn SessionEngineRuntime>>,
+    // Immutable construction inputs are copied into their consuming owner.
     config: EngineConfig,
     provider: Option<ProviderLimits>,
     memory: MemoryRegistrar,
@@ -425,6 +429,11 @@ impl SessionManager {
 
     pub(super) fn memory_registrar(&self) -> MemoryRegistrar {
         self.memory.clone()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(super) fn provider_limits(&self) -> Option<ProviderLimits> {
+        self.provider
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

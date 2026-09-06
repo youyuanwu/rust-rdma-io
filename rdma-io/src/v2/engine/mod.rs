@@ -435,7 +435,6 @@ pub struct RdmaEngineDriver {
 
 struct EngineShared {
     config: EngineConfig,
-    provider: Option<config::ProviderLimits>,
     // This engine-owned core retain drops before the root resources below.
     // Operation futures may extend the Arc, but each MR anchors its PD and an
     // engine with accepted work is retained fail-closed.
@@ -466,10 +465,13 @@ struct EngineShared {
     resource_refs: Option<EngineResourceRefs>,
 }
 
+/// Weak, owner-neutral access from session progress to engine-wide runtime state.
+///
+/// The capability deliberately excludes I/O registries, session registries,
+/// provider resources, and lifecycle authority. `SessionManager` can observe
+/// or publish global composition state without recovering `EngineShared`.
 trait SessionEngineRuntime: Send + Sync {
-    fn admission_error(&self) -> Option<Error> {
-        None
-    }
+    fn admission_error(&self) -> Option<Error>;
 
     fn outcome(&self) -> Option<MemoizedTerminalResult>;
 
@@ -616,7 +618,6 @@ impl EngineShared {
         )?);
         Ok(Self {
             config,
-            provider,
             io_core,
             session,
             lifecycle: AtomicU8::new(lifecycle_to_u8(RdmaEngineLifecycle::Created)),

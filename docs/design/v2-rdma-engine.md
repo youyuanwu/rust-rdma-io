@@ -98,6 +98,9 @@ One engine owns:
 The root owns engine-wide lifecycle, terminal state, work signaling, and the
 canonical lifetime of device-scoped resources. It does not directly own
 connection registries, CM state, session deadlines, or connection quarantine.
+Driver-owned I/O and session progress values physically retain the live CQ and
+CM readiness resources while they are polled; the root's canonical references
+preserve final device-resource drop ordering.
 
 ### I/O core
 
@@ -116,6 +119,14 @@ listener and established-connection state, QP/CmId-owning bundles, lifecycle
 deadlines, close/drain/disconnect/retirement policy, and connection-level
 quarantine. It interprets the I/O effects that change session lifecycle before
 detached events or wakers are published.
+
+Session code does not receive or recover the concrete composition root.
+Immutable engine and provider validation inputs, the I/O owner retain, and
+memory-registration authority are copied into the manager at construction.
+A bind-once `Weak<dyn SessionEngineRuntime>` capability exposes only admission
+and terminal observation, shutdown state, failure escalation, shutdown-deadline
+composition, and I/O/session work publication. It exposes no I/O or session
+registry, provider resource, QP lifecycle authority, or protocol policy.
 
 The engine has a per-connection completion-dispatch queue so one connection
 cannot monopolize event delivery. That queue contains validated low-level
@@ -154,9 +165,11 @@ HELLO reuses a control receive; there is no additional receive.
 
 ## ADR: Crate-Private I/O and Session Ownership Boundaries
 
-**Status:** implemented. The protocol/I/O seam, low-level `IoCore`,
-`SessionManager` boundary, owner-local progress components, and thin engine
-scheduler complete the issue #43 architecture.
+**Status:** implemented and closure-audited on the v2 feature branch. The
+protocol/I/O seam, low-level `IoCore`, narrow `SessionManager` boundary,
+owner-local progress components, and thin engine scheduler satisfy the issue
+#43 architecture. The issue remains open until its owner explicitly authorizes
+closure.
 
 The runtime has five distinct roles:
 
@@ -179,13 +192,16 @@ The runtime has five distinct roles:
 `EngineShared` is the composition root. It directly retains the device-scoped
 resources, engine lifecycle, work signal, `Arc<IoCore>`, and
 `Arc<SessionManager>`. Session collections and quarantine maps are fields of
-`SessionManager`, not parallel fields on the root. `IoProgress` owns CQ
-readiness, the CQ buffer, completion-ready rotation, operation deadlines, and
-bounded I/O terminalization. `SessionProgress` owns CM readiness, fair CM
-source selection, connection/lifecycle deadlines, bounded shutdown scans,
-final CM draining, and bounded session terminalization. The one
-`RdmaEngineDriver` sees none of those state machines; it only polls and
-requeues the three owner classes. No component creates a task or thread.
+`SessionManager`, not parallel fields on the root. The session manager holds
+only a weak trait-object runtime capability back toward engine-wide state, so
+session modules cannot access the concrete root or use it as an I/O-owner
+shortcut. `IoProgress` owns CQ readiness, the CQ buffer, completion-ready
+rotation, operation deadlines, and bounded I/O terminalization.
+`SessionProgress` owns CM readiness, fair CM source selection,
+connection/lifecycle deadlines, bounded shutdown scans, final CM draining, and
+bounded session terminalization. The one `RdmaEngineDriver` sees none of those
+state machines; it only polls and requeues the three owner classes. No
+component creates a task or thread.
 
 Each owner turn returns a private progress report containing six pieces of
 scheduler information: units consumed, whether immediate work remains, the
@@ -269,7 +285,11 @@ I/O and session controls. AST guards reject hidden work, production `IoCore`
 dependencies on root/session/connection/CM/listener/protocol types, strong
 session-resource retention by frontends and waiters, lifecycle operations
 without the private authority, public re-exports of internal capabilities, and
-obsolete top-level session-module paths.
+obsolete top-level session-module paths. The guards also parse every session
+source, including test-only items and renamed imports, to reject direct
+`EngineShared` dependencies; reject broad root/session `Deref` adapters and
+obsolete root forwarding methods; and require owner-focused I/O test
+construction.
 
 ## Completion-to-Message Handoff
 
@@ -454,12 +474,19 @@ destruction order, exact route retention, and opaque shared-resource identity.
 Malformed protocol tests use an independently encoded test peer rather than a
 production frame-mutation hook.
 
+Colocated unit tests name the owning `io_core` or `session` fixture explicitly.
+They do not use root-to-session-to-I/O `Deref`, root forwarding methods, or a
+strong root field on test connection frontends. A test connection may retain
+its `ConnectionState` directly when a lifecycle or accounting assertion needs
+that session-owned fixture; this retain exposes neither the root nor another
+owner.
+
 ## Validation
 
 The complete local gate is:
 
 ```sh
-just validate-v2-engine
+CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 just validate-v2-engine
 ```
 
 It runs warning-denied feature builds, all-target workspace builds, formatting,
@@ -470,7 +497,8 @@ integration suites on both RXE and SIW.
 The provider-only matrix is:
 
 ```sh
-sudo -E env CARGO_BUILD_JOBS=2 CARGO="$(command -v cargo)" \
+sudo -E env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 \
+  CARGO="$(command -v cargo)" \
   ./scripts/validate-v2-engine-providers.sh
 ```
 
@@ -484,6 +512,29 @@ is not a pass.
 Useful focused modes include `--provider-probe`, `--readiness-race`,
 `--driver-flush-gate`, `--operations`, `--connections`, `--listeners`,
 `--lifecycle`, `--message-setup`, `--message`, and `--engine-conformance`.
+
+## Issue #43 Closure Evidence
+
+The final audit classifies composition-root uses rather than treating symbol
+count as the goal:
+
+| Criterion | As-built evidence |
+|---|---|
+| Lowest I/O layer excludes message, listener, and CM policy | `IoCore` owns posting, exact CQE validation, operation accounting, readiness, and reclamation behind a structural dependency guard. |
+| Message policy excludes engine/session internals | `MessageTransportDriver` uses only `IoConnection`, its event port, and opaque close capability; the structural guard rejects root, registry, and lifecycle internals. |
+| CM/listener/session state is outside the I/O core | `SessionManager` owns CM routes, listeners, connections, lifecycle authority, teardown, deadlines, and connection quarantine under the `engine/session/` hierarchy. |
+| Composition root does not re-own owner policy | `EngineShared` assembles owners and coordinates global lifecycle, signaling, diagnostics, terminal state, and lifetime ordering. Session-to-engine access is the weak narrow runtime capability described above. |
+| Exact routing and fail-closed provider ownership remain intact | Unit and RXE/SIW provider suites cover generation/QP/opcode validation, duplicates, accepted prefixes, proven rejection, acceptance ambiguity, and missing completions. |
+| Positive release and teardown boundaries remain intact | Tests cover proven non-acceptance, exact completion, successful QP-destruction proof, QP-before-route/CmId retirement, and complete-bundle quarantine after failed destruction. |
+| Publication and progress contracts remain explicit | Tests cover post-guard callbacks/wakers, bounded owner turns, fair rotation, terminal composition, and the recursive no-hidden-task/thread guard. |
+| Transitional seams are removed | The aggregate reclamation alias and old source paths remain absent; the final cleanup removes stale migration annotations, root/session test dereference, root forwarding, and full-root I/O fixtures. |
+| V1 remains separate | No v1 source is changed by this cleanup, and the complete provider gate retains the v1 safe-resource suite. |
+| Documentation matches implementation | This document distinguishes policy ownership, physical readiness/resource retention, narrow runtime composition, and bounded test support. |
+
+This matrix records implementation coverage; actual closure remains a human
+issue-management action. The final pull-request report must include the exact
+serialized gate result and any environmental limitation before recommending
+closure.
 
 ## Limitations
 
