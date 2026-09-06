@@ -342,6 +342,44 @@ fn find_functions_using_dependencies(
     Ok(violations)
 }
 
+fn find_structs_using_dependencies(
+    source: &str,
+    forbidden: &[&str],
+) -> Result<Vec<String>, syn::Error> {
+    fn inspect_items(items: &[Item], forbidden: &HashSet<String>, violations: &mut Vec<String>) {
+        for item in items {
+            match item {
+                Item::Struct(structure) => {
+                    let mut visitor = AnyDependencyVisitor {
+                        forbidden,
+                        violations: Vec::new(),
+                    };
+                    for field in &structure.fields {
+                        visitor.visit_field(field);
+                    }
+                    if !visitor.violations.is_empty() {
+                        violations.push(structure.ident.to_string());
+                    }
+                }
+                Item::Mod(module) => {
+                    if let Some((_, items)) = &module.content {
+                        inspect_items(items, forbidden, violations);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let syntax = syn::parse_file(source)?;
+    let forbidden = identifiers_and_aliases(&syntax, forbidden);
+    let mut violations = Vec::new();
+    inspect_items(&syntax.items, &forbidden, &mut violations);
+    violations.sort();
+    violations.dedup();
+    Ok(violations)
+}
+
 fn trait_method_names(source: &str, trait_name: &str) -> Result<Vec<String>, syn::Error> {
     let syntax = syn::parse_file(source)?;
     let mut methods = syntax
@@ -480,29 +518,36 @@ fn type_path_last(ty: &Type) -> Option<String> {
 }
 
 fn identifiers_and_aliases(syntax: &syn::File, identifiers: &[&str]) -> HashSet<String> {
+    fn collect_aliases(items: &[Item], names: &mut HashSet<String>) -> bool {
+        let mut changed = false;
+        for item in items {
+            match item {
+                Item::Use(item) => {
+                    let before = names.len();
+                    collect_use_aliases(&item.tree, names);
+                    changed |= names.len() != before;
+                }
+                Item::Type(alias)
+                    if type_path_last(&alias.ty).is_some_and(|name| names.contains(&name)) =>
+                {
+                    changed |= names.insert(alias.ident.to_string());
+                }
+                Item::Mod(module) => {
+                    if let Some((_, items)) = &module.content {
+                        changed |= collect_aliases(items, names);
+                    }
+                }
+                _ => {}
+            }
+        }
+        changed
+    }
+
     let mut names = identifiers
         .iter()
         .map(|identifier| (*identifier).to_owned())
         .collect::<HashSet<_>>();
-    for item in &syntax.items {
-        if let Item::Use(item) = item {
-            collect_use_aliases(&item.tree, &mut names);
-        }
-    }
-    loop {
-        let mut changed = false;
-        for item in &syntax.items {
-            let Item::Type(alias) = item else {
-                continue;
-            };
-            if type_path_last(&alias.ty).is_some_and(|name| names.contains(&name)) {
-                changed |= names.insert(alias.ident.to_string());
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
+    while collect_aliases(&syntax.items, &mut names) {}
     names
 }
 
@@ -1394,6 +1439,20 @@ fn owner_boundary_detectors_reject_test_only_aliases_and_renamed_adapters() {
         vec!["root_spanning_fixture"],
         "aliased concrete roots in test functions must be detected without rejecting owner parts"
     );
+    let nested_root_wrapper = r#"
+        struct EngineShared;
+        mod tests {
+            type HiddenRoot = super::EngineShared;
+            struct WrappedFixture {
+                root: std::sync::Arc<HiddenRoot>,
+            }
+        }
+    "#;
+    assert_eq!(
+        find_structs_using_dependencies(nested_root_wrapper, &["EngineShared"]).unwrap(),
+        vec!["WrappedFixture"],
+        "nested aliases and module-level root wrappers must not evade the fixture guard"
+    );
 
     assert_eq!(
         trait_method_names(
@@ -2080,6 +2139,15 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
             .collect::<Vec<_>>()
             .join(", ")
     );
+    let concrete_root_structs =
+        find_structs_using_dependencies(&io_operation_source, &["EngineShared"])
+            .expect("parse I/O test root-bearing structs");
+    assert!(
+        concrete_root_structs.is_empty(),
+        "{} retains a module-level concrete-root fixture wrapper: {}",
+        io_core_operation_path.display(),
+        concrete_root_structs.join(", ")
+    );
     assert!(
         io_operation_source.contains("struct OperationOwners")
             && io_operation_source.contains("io_core: Arc<IoCore>")
@@ -2096,17 +2164,24 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         "mark_shutdown_requested",
         "request_shutdown",
         "retained_bundle_count",
+        "shutdown_deadline_failure",
         "unsafe_outstanding_operations",
     ];
-    let unexpected_root_owner_methods = find_inherent_methods_accessing_fields(
-        &engine_mod,
-        "EngineShared",
-        &["io_core", "session"],
-    )
-    .expect("parse EngineShared owner access")
-    .into_iter()
-    .filter(|method| !allowed_root_owner_methods.contains(&method.as_str()))
-    .collect::<Vec<_>>();
+    let mut unexpected_root_owner_methods = Vec::new();
+    for path in collect_rs_files(&engine_dir).expect("enumerate EngineShared implementations") {
+        let source = fs::read_to_string(&path).expect("read EngineShared implementation");
+        unexpected_root_owner_methods.extend(
+            find_inherent_methods_accessing_fields(
+                &source,
+                "EngineShared",
+                &["io_core", "session"],
+            )
+            .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()))
+            .into_iter()
+            .filter(|method| !allowed_root_owner_methods.contains(&method.as_str()))
+            .map(|method| format!("{}::{method}", path.display())),
+        );
+    }
     assert!(
         unexpected_root_owner_methods.is_empty(),
         "EngineShared gained an unreviewed owner forwarder: {}",
