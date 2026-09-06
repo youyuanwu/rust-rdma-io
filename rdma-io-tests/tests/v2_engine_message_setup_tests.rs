@@ -438,6 +438,16 @@ async fn run_driver_withholding(mode: CompletionMode) {
     .expect("message setup did not progress after polling the withheld driver");
     let (server, server_message_driver) = server.unwrap().unwrap();
     let (client, client_message_driver) = client.unwrap().unwrap();
+    assert_eq!(
+        server_engine.diagnostics().live_connections,
+        1,
+        "server session progress must complete while its message driver is withheld"
+    );
+    assert_eq!(
+        client_engine.diagnostics().live_connections,
+        1,
+        "client session progress must complete while its message driver is withheld"
+    );
     assert!(
         tokio::time::timeout(Duration::from_millis(50), async {
             tokio::join!(server.ready(), client.ready())
@@ -446,6 +456,8 @@ async fn run_driver_withholding(mode: CompletionMode) {
         .is_err(),
         "HELLO unexpectedly progressed without polling message drivers"
     );
+    assert_eq!(server_engine.diagnostics().live_connections, 1);
+    assert_eq!(client_engine.diagnostics().live_connections, 1);
     let server = DrivenMessageTransport::new(server, server_message_driver);
     let client = DrivenMessageTransport::new(client, client_message_driver);
     tokio::time::timeout(Duration::from_secs(15), async {

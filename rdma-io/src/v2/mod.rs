@@ -2,11 +2,13 @@
 //!
 //! With the `tokio` feature, [`RdmaEngineBuilder::build`] returns
 //! ([`RdmaEngine`], [`RdmaEngineDriver`]). The handle submits connection,
-//! listener, operation, and lifecycle work; the driver is the sole CQ/CM
-//! consumer. Message protocol work has a separate per-connection driver. This
-//! resembles the ownership split of an io_uring instance
-//! or IOCP completion port, although the implementation uses libibverbs and
-//! librdmacm directly.
+//! listener, operation, and lifecycle work; the driver schedules the sole
+//! CQ/CM consumers. Internally it is a thin scheduler over bounded I/O,
+//! session, and terminal turns; CQ/completion policy belongs to the I/O core
+//! and CM/connection lifecycle policy belongs to the session subsystem. Message
+//! protocol work has a separate per-connection driver. This resembles the
+//! ownership split of an io_uring instance or IOCP completion port, although
+//! the implementation uses libibverbs and librdmacm directly.
 //!
 //! # Use case
 //!
@@ -30,10 +32,10 @@
 //!
 //! The library creates no task or thread. Applications must spawn or directly
 //! poll the engine driver, and must also poll the [`MessageTransportDriver`]
-//! returned for every message connection. CQ/CM routing, exact completion
-//! dispatch, reclamation, and safe teardown remain engine work. HELLO, DATA,
-//! CREDIT, receive reposting, fairness, and message lifecycle are bounded
-//! connection-driver work.
+//! returned for every message connection. The engine can advance shared CQ,
+//! CM, and lifecycle work while a message driver is idle, but HELLO, DATA,
+//! CREDIT, receive reposting, and message lifecycle do not advance until that
+//! message driver is polled.
 //!
 //! ```no_run
 //! # use rdma_io::v2::*;

@@ -7,7 +7,7 @@
 //! librdmacm/verbs call runs.
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -40,8 +40,6 @@ use super::listener::{
 use crate::cm::{CmEventType, CmId, PortSpace};
 use crate::v2::error::{Error, Result};
 use crate::v2::qp::QpBuilder;
-
-pub(in crate::v2::engine) const CM_WORK: usize = 1 << 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CmEventReject {
@@ -118,7 +116,35 @@ pub(in crate::v2::engine) struct CmState {
     retirements: Mutex<VecDeque<ConnectionToken>>,
     cm_destructions: Mutex<VecDeque<PendingCmDestruction>>,
     setup_rollback_quarantines: Mutex<Vec<RetainedSetupRollback>>,
+    software_next_class: AtomicUsize,
+    outbound_setup_active: AtomicBool,
     shutting_down: AtomicBool,
+}
+
+pub(in crate::v2::engine) struct CmShutdownCursor {
+    next_class: usize,
+    route_slot: usize,
+    listener_token: u64,
+    routes_complete: bool,
+    listeners_complete: bool,
+    destruction_listeners_remaining: Option<usize>,
+    destruction_listeners_complete: bool,
+    terminalized_listeners: HashSet<usize>,
+}
+
+impl Default for CmShutdownCursor {
+    fn default() -> Self {
+        Self {
+            next_class: 0,
+            route_slot: 0,
+            listener_token: 1,
+            routes_complete: false,
+            listeners_complete: false,
+            destruction_listeners_remaining: None,
+            destruction_listeners_complete: false,
+            terminalized_listeners: HashSet::new(),
+        }
+    }
 }
 
 impl CmState {
@@ -137,6 +163,8 @@ impl CmState {
             retirements: Mutex::new(VecDeque::new()),
             cm_destructions: Mutex::new(VecDeque::new()),
             setup_rollback_quarantines: Mutex::new(Vec::new()),
+            software_next_class: AtomicUsize::new(0),
+            outbound_setup_active: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
         })
     }
@@ -279,7 +307,7 @@ impl CmState {
             pending_listens,
             listener_work,
         ];
-        let mut next_class = 0;
+        let mut next_class = self.software_next_class.load(Ordering::Acquire) % remaining.len();
         let mut processed = 0;
         while processed < budget && remaining.iter().any(|count| *count != 0) {
             let mut selected = None;
@@ -313,12 +341,20 @@ impl CmState {
                 2 => {
                     let request = { lock_unpoison(&self.pending).pop_front() };
                     if let Some(request) = request {
-                        let resources = resources.ok_or_else(|| {
-                            Error::InvalidConfig(
+                        if self.outbound_setup_active.swap(true, Ordering::AcqRel) {
+                            lock_unpoison(&self.pending).push_front(request);
+                            remaining[2] = 0;
+                            continue;
+                        }
+                        let Some(resources) = resources else {
+                            self.outbound_setup_active.store(false, Ordering::Release);
+                            return Err(Error::InvalidConfig(
                                 "CM pending work requires live engine resources".into(),
-                            )
-                        })?;
-                        self.start_outbound(shared, resources, request)?;
+                            ));
+                        };
+                        if !self.start_outbound(shared, resources, request)? {
+                            self.outbound_setup_active.store(false, Ordering::Release);
+                        }
                         processed += 1;
                     }
                 }
@@ -353,6 +389,8 @@ impl CmState {
                 _ => unreachable!("software work has five classes"),
             }
         }
+        self.software_next_class
+            .store(next_class, Ordering::Release);
         Ok(processed)
     }
 
@@ -419,6 +457,7 @@ impl CmState {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub(in crate::v2::engine) fn begin_shutdown(
         &self,
         shared: &Arc<EngineShared>,
@@ -427,6 +466,7 @@ impl CmState {
         if self.shutting_down.swap(true, Ordering::AcqRel) {
             return;
         }
+
         if outcome.is_success() {
             return;
         }
@@ -453,6 +493,132 @@ impl CmState {
         for listener in listeners {
             listener.request_close(shared);
         }
+    }
+
+    pub(in crate::v2::engine) fn start_bounded_shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+    }
+
+    pub(in crate::v2::engine) fn service_bounded_shutdown(
+        &self,
+        shared: &Arc<EngineShared>,
+        outcome: &MemoizedTerminalResult,
+        terminalize_listeners: bool,
+        cursor: &mut CmShutdownCursor,
+        budget: usize,
+    ) -> usize {
+        let mut processed = 0;
+        if !terminalize_listeners {
+            cursor.destruction_listeners_complete = true;
+        }
+        while processed < budget {
+            let mut selected = false;
+            for offset in 0..5 {
+                let class = (cursor.next_class + offset) % 5;
+                match class {
+                    0 => {
+                        let request = { lock_unpoison(&self.pending).pop_front() };
+                        let Some(request) = request else {
+                            continue;
+                        };
+                        request.cancel(terminal_error(outcome));
+                        drop(request.take_reservation());
+                    }
+                    1 if !cursor.routes_complete => {
+                        let (routes, next, complete, scanned) =
+                            self.routes.scan_occupied_cloned(cursor.route_slot, 1);
+                        cursor.route_slot = next;
+                        cursor.routes_complete = complete;
+                        if scanned == 0 {
+                            continue;
+                        }
+                        for route in routes {
+                            if let Some(request) = route.request() {
+                                request.cancel(terminal_error(outcome));
+                                self.enqueue_cancellation(request);
+                            }
+                        }
+                    }
+                    2 => {
+                        let request = { lock_unpoison(&self.pending_listens).pop_front() };
+                        let Some(request) = request else {
+                            continue;
+                        };
+                        request.complete(Err(terminal_error(outcome)));
+                    }
+                    3 if !cursor.listeners_complete => {
+                        let upper = self.next_listener_token.load(Ordering::Acquire);
+                        if cursor.listener_token >= upper {
+                            cursor.listeners_complete = true;
+                            continue;
+                        }
+                        let token = cursor.listener_token;
+                        cursor.listener_token = cursor.listener_token.saturating_add(1);
+                        let listener = { lock_unpoison(&self.listeners).get(&token).cloned() };
+                        if let Some(listener) = listener {
+                            if terminalize_listeners {
+                                let identity = Arc::as_ptr(&listener) as usize;
+                                if cursor.terminalized_listeners.insert(identity) {
+                                    listener.terminalize(outcome);
+                                }
+                            } else {
+                                listener.request_close(shared);
+                            }
+                        }
+                    }
+                    4 if terminalize_listeners && !cursor.destruction_listeners_complete => {
+                        let remaining = cursor
+                            .destruction_listeners_remaining
+                            .get_or_insert_with(|| lock_unpoison(&self.cm_destructions).len());
+                        if *remaining == 0 {
+                            cursor.destruction_listeners_complete = true;
+                            continue;
+                        }
+                        let listener = {
+                            let mut destructions = lock_unpoison(&self.cm_destructions);
+                            let Some(pending) = destructions.pop_front() else {
+                                cursor.destruction_listeners_complete = true;
+                                *remaining = 0;
+                                continue;
+                            };
+                            let listener = pending.listener().cloned();
+                            destructions.push_back(pending);
+                            listener
+                        };
+                        *remaining -= 1;
+                        if *remaining == 0 {
+                            cursor.destruction_listeners_complete = true;
+                        }
+                        if let Some(listener) = listener {
+                            let identity = Arc::as_ptr(&listener) as usize;
+                            if cursor.terminalized_listeners.insert(identity) {
+                                listener.terminalize(outcome);
+                            }
+                        }
+                    }
+                    _ => continue,
+                }
+                cursor.next_class = (class + 1) % 5;
+                processed += 1;
+                selected = true;
+                break;
+            }
+            if !selected {
+                break;
+            }
+        }
+        processed
+    }
+
+    pub(in crate::v2::engine) fn bounded_shutdown_complete(
+        &self,
+        cursor: &CmShutdownCursor,
+    ) -> bool {
+        cursor.routes_complete
+            && cursor.listeners_complete
+            && cursor.destruction_listeners_complete
+            && lock_unpoison(&self.pending).is_empty()
+            && lock_unpoison(&self.pending_listens).is_empty()
     }
 
     pub(in crate::v2::engine) fn pending_route_count(&self) -> usize {
@@ -1294,13 +1460,13 @@ impl CmState {
         shared: &Arc<EngineShared>,
         resources: &EngineResources,
         request: Arc<OutboundRequest>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if request.observer.cancelled.load(Ordering::Acquire)
             || self.shutting_down.load(Ordering::Acquire)
         {
             request.take_reservation();
             request.complete(Err(Error::DriverShutdown));
-            return Ok(());
+            return Ok(false);
         }
         let reservation = request.take_reservation().ok_or_else(|| {
             Error::InvalidConfig("outbound request lost its connection reservation".into())
@@ -1313,7 +1479,7 @@ impl CmState {
             Err(error) => {
                 drop(reservation);
                 request.complete_failure(shared, error);
-                return Ok(());
+                return Ok(false);
             }
         };
         request.route_token.store(token.encode(), Ordering::Release);
@@ -1328,7 +1494,7 @@ impl CmState {
                 self.routes.release(token, false);
                 drop(reservation);
                 request.complete_failure(shared, Error::from_v1(error));
-                return Ok(());
+                return Ok(false);
             }
         };
         let Some(context_token) = cm_id.context_token() else {
@@ -1339,7 +1505,7 @@ impl CmState {
                 shared,
                 Error::InvalidConfig("engine CM ID lost its route context token".into()),
             );
-            return Ok(());
+            return Ok(false);
         };
         let context_route = CmRouteToken::decode(context_token);
         if context_route != token {
@@ -1350,7 +1516,7 @@ impl CmState {
                 shared,
                 Error::InvalidConfig("engine CM context token did not match its route".into()),
             );
-            return Ok(());
+            return Ok(false);
         }
         let context_key = cm_id.context_key();
         route.set_identity(cm_id.as_raw() as usize, context_key);
@@ -1369,7 +1535,7 @@ impl CmState {
                 shared,
                 Error::InvalidConfig("duplicate CM context identity".into()),
             );
-            return Ok(());
+            return Ok(false);
         }
 
         let resolve = cm_id.resolve_addr(None, &request.address, 2_000);
@@ -1384,9 +1550,10 @@ impl CmState {
                 self.retire_route(&route, false);
                 drop(reservation);
                 request.complete_failure(shared, Error::from_v1(error));
+                return Ok(false);
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     fn process_cancellation(
@@ -1801,23 +1968,38 @@ impl CmState {
         route: &Arc<OutboundRoute>,
         snapshot: CmEventSnapshot,
     ) -> Result<EventDisposition> {
-        if is_failure_event(snapshot.event_type) || snapshot.status != 0 {
-            return self.handle_failure_event(shared, route, snapshot);
-        }
-        match snapshot.event_type {
-            CmEventType::AddrResolved => self.handle_addr_resolved(shared, resources, route),
-            CmEventType::RouteResolved => self.handle_route_resolved(shared, resources, route),
-            CmEventType::Established => self.handle_established(shared, route),
-            CmEventType::Disconnected => self.handle_disconnected(shared, route),
-            CmEventType::TimewaitExit => {
-                if route.is_disconnected() {
-                    Ok(EventDisposition::Handled)
-                } else {
-                    Ok(EventDisposition::Rejected(CmEventReject::Unexpected))
+        let disposition = if is_failure_event(snapshot.event_type) || snapshot.status != 0 {
+            self.handle_failure_event(shared, route, snapshot)?
+        } else {
+            match snapshot.event_type {
+                CmEventType::AddrResolved => self.handle_addr_resolved(shared, resources, route),
+                CmEventType::RouteResolved => self.handle_route_resolved(shared, resources, route),
+                CmEventType::Established => self.handle_established(shared, route),
+                CmEventType::Disconnected => self.handle_disconnected(shared, route),
+                CmEventType::TimewaitExit => {
+                    if route.is_disconnected() {
+                        Ok(EventDisposition::Handled)
+                    } else {
+                        Ok(EventDisposition::Rejected(CmEventReject::Unexpected))
+                    }
                 }
-            }
-            _ => Ok(EventDisposition::Rejected(CmEventReject::Unexpected)),
+                _ => Ok(EventDisposition::Rejected(CmEventReject::Unexpected)),
+            }?
+        };
+        let route_retired = !matches!(self.routes.lookup_cloned(route.token), Lookup::Occupied(_));
+        if is_failure_event(snapshot.event_type)
+            || snapshot.status != 0
+            || snapshot.event_type == CmEventType::RouteResolved
+            || snapshot.event_type == CmEventType::Established
+            || route_retired
+            || !route.is_establishing()
+        {
+            self.outbound_setup_active.store(false, Ordering::Release);
+            shared
+                .work_signal
+                .publish(super::super::driver::SESSION_WORK);
         }
+        Ok(disposition)
     }
 
     fn handle_inbound_event(
@@ -2605,18 +2787,11 @@ impl CmState {
 }
 
 impl SessionManager {
-    pub(in crate::v2::engine) fn begin_cm_shutdown(
-        &self,
-        shared: &Arc<EngineShared>,
-        outcome: &MemoizedTerminalResult,
-    ) {
-        self.cm.begin_shutdown(shared, outcome);
-    }
-
     pub(in crate::v2::engine) fn terminalize_cm(&self, outcome: &MemoizedTerminalResult) {
         self.cm.terminalize(outcome);
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(in crate::v2::engine) fn pending_cm_route_count(&self) -> usize {
         self.cm.pending_route_count()
     }
@@ -2777,7 +2952,9 @@ pub(in crate::v2::engine) async fn connect_with_setup(
         .pause_admission(super::super::driver::test_api::AdmissionPausePoint::ConnectBeforeEnqueue);
     shared.session.cm.enqueue(Arc::clone(&request));
     drop(admission);
-    shared.work_signal.publish(CM_WORK);
+    shared
+        .work_signal
+        .publish(super::super::driver::SESSION_WORK);
     let waiter = ConnectWaiter {
         manager: Arc::downgrade(&shared.session),
         request: Arc::downgrade(&request),
@@ -3442,7 +3619,9 @@ impl Drop for ConnectWaiter {
             };
             manager.cm.enqueue_cancellation(request);
             if let Some(engine) = manager.engine() {
-                engine.work_signal.publish(CM_WORK);
+                engine
+                    .work_signal
+                    .publish(super::super::driver::SESSION_WORK);
             }
         }
     }

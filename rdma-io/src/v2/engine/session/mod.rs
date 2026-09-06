@@ -20,15 +20,19 @@ pub(super) mod cm;
 pub(super) mod connection;
 mod drain;
 pub(super) mod listener;
+mod progress;
 mod registry;
 
 use self::connection::{
     ConnectionAdmissionPool, ConnectionState, QpDestroyStatus, SharedCmId, VerbsConnectionResources,
 };
 use self::listener::ListenerState;
+pub(super) use self::progress::SessionProgress;
 use self::registry::ConnectionRegistry;
 use super::driver::WorkSignal;
-use super::io_core::{IoCore, IoCoreEffects, OperationQuarantineEffect, QpReclaimCapability};
+use super::io_core::{
+    IoCore, IoCoreEffects, IoSessionBridge, OperationQuarantineEffect, QpReclaimCapability,
+};
 use super::registry::{ConnectionToken, Lookup, OperationToken, lock_unpoison};
 use super::scheduler::{DeadlineKind, DeadlineRequest};
 use super::{EngineShared, Result};
@@ -473,7 +477,7 @@ impl SessionManager {
         let now = tokio::time::Instant::now();
         let at = now.checked_add(after).unwrap_or(now);
         lock_unpoison(&self.deadline_requests).push_back(DeadlineRequest { at, kind, token });
-        work_signal.publish(super::driver::RECLAMATION_WORK);
+        work_signal.publish(super::driver::SESSION_WORK);
     }
 
     pub(super) fn take_deadline_requests(&self, budget: usize) -> Vec<DeadlineRequest> {
@@ -724,6 +728,38 @@ impl SessionManager {
     pub(super) fn quarantine_operation(&self, shared: &EngineShared, token: OperationToken) {
         let mut effects = self.io_core.quarantine_operation(token);
         self.apply_io_effects(shared, &mut effects);
+        effects.publish();
+    }
+}
+
+impl IoSessionBridge for SessionManager {
+    fn route_completion(&self, completion: crate::wc::WorkCompletion) -> Option<ConnectionToken> {
+        self.enqueue_completion(completion)
+    }
+
+    fn dispatch_connection_completions(
+        &self,
+        connection: ConnectionToken,
+        quantum: usize,
+    ) -> (usize, bool) {
+        let Some(shared) = self.engine() else {
+            return (0, false);
+        };
+        self.dispatch_connection_completions(&shared, connection, quantum)
+    }
+
+    fn handle_reclamation_deadline(&self, token: OperationToken) {
+        let Some(shared) = self.engine() else {
+            return;
+        };
+        self.handle_reclamation_deadline(&shared, token);
+    }
+
+    fn apply_terminal_effects(&self, mut effects: IoCoreEffects) {
+        let Some(shared) = self.engine() else {
+            return;
+        };
+        self.apply_io_effects(&shared, &mut effects);
         effects.publish();
     }
 }

@@ -5,10 +5,12 @@
 //! notification resources. Readiness owns one completion channel/fd; polling
 //! owns none. Every connection shares those objects.
 //!
-//! The driver routes a CQE only when the current connection generation,
-//! operation generation, operation owner, and provider-reported `qp_num` all
-//! agree. It is also the sole CM event consumer. Cancellation, close, shutdown,
-//! and driver loss retain accepted or acceptance-ambiguous MRs until an exact
+//! The driver is a thin scheduler over bounded I/O, session, and terminal
+//! turns. The I/O owner polls the shared CQ and validates a CQE only when the
+//! current connection generation, operation generation, operation owner, and
+//! provider-reported `qp_num` all agree. The session owner consumes CM events
+//! and controls connection lifecycle. Cancellation, close, shutdown, and
+//! driver loss retain accepted or acceptance-ambiguous MRs until an exact
 //! completion, provider-proven rejection, or successful synchronous
 //! destruction of the owning QP establishes a positive safety boundary.
 //!
@@ -34,6 +36,7 @@ mod driver;
 pub(crate) mod io;
 mod io_core;
 mod lifecycle;
+mod progress;
 mod registry;
 mod resources;
 mod scheduler;
@@ -63,15 +66,15 @@ pub use driver::{
     TestSharedResourceIdentity,
 };
 pub use io_core::RdmaOperation;
-use io_core::{IoCore, IoDriverSignal};
+use io_core::{IoCore, IoDriverSignal, IoProgress, IoSessionBridge};
 use lifecycle::MemoizedTerminalResult;
 use registry::{lock_unpoison, write_unpoison};
 use resources::{EngineResourceRefs, EngineResources};
 use scheduler::DeadlineKind;
-use scheduler::WorkScheduler;
-use session::SessionManager;
+use scheduler::OwnerScheduler;
 pub use session::connection::{RdmaConnection, RdmaConnectionIdentity};
 pub use session::listener::{RdmaListener, RdmaListenerConfig};
+use session::{SessionManager, SessionProgress};
 
 use super::error::{Error, Result};
 
@@ -168,9 +171,25 @@ impl RdmaEngineBuilder {
         self
     }
 
-    /// Set reclamation/deadline actions per service turn in `1..=4096`.
-    pub fn reclamation_budget(mut self, value: usize) -> Self {
-        self.config.reclamation_budget = value;
+    /// Set I/O reclamation/deadline actions per I/O service turn in `1..=4096`.
+    ///
+    /// This and [`Self::session_reclamation_budget`] replace the former
+    /// aggregate v2 `reclamation_budget`. To preserve an old aggregate value
+    /// `N`, divide it between the two owner-local controls. Odd values may use
+    /// either floor/ceiling assignment. The old value `1` has no exact
+    /// equivalent because both owners require a nonzero bounded turn; the
+    /// minimum replacement is `(1, 1)`.
+    pub fn io_reclamation_budget(mut self, value: usize) -> Self {
+        self.config.io_reclamation_budget = value;
+        self
+    }
+
+    /// Set session reclamation/deadline actions per session turn in `1..=4096`.
+    ///
+    /// See [`Self::io_reclamation_budget`] for migration from the removed
+    /// aggregate `reclamation_budget` control.
+    pub fn session_reclamation_budget(mut self, value: usize) -> Self {
+        self.config.session_reclamation_budget = value;
         self
     }
 
@@ -230,9 +249,10 @@ impl RdmaEngineBuilder {
 
 /// Cloneable frontend for one explicitly driven engine instance.
 ///
-/// Cloning this value never starts work. All CQ, CM, reclamation, and
-/// per-connection completion dispatch remains owned by the paired
-/// [`RdmaEngineDriver`]. Message protocol progress belongs to each returned
+/// Cloning this value never starts work. The paired [`RdmaEngineDriver`]
+/// schedules bounded turns while the I/O core owns CQ/completion/reclamation
+/// policy and the session subsystem owns CM and connection lifecycle policy.
+/// Message protocol progress belongs to each returned
 /// [`crate::v2::MessageTransportDriver`].
 /// The handle is `Clone + Send + Sync + 'static`.
 ///
@@ -284,7 +304,8 @@ impl RdmaEngine {
     }
 
     /// Establish an outbound low-level connection with the default QP/CM
-    /// configuration. The engine driver owns every CM and CQ progress step.
+    /// configuration. The engine driver schedules every bounded CM and CQ
+    /// progress turn through its owning layer.
     ///
     /// Low-level establishment posts zero initial receives. With the default
     /// infinite RNR retry, a peer's early send can wait until the application
@@ -368,12 +389,13 @@ impl Drop for RdmaEngine {
 
 /// Sole progress future for an [`RdmaEngine`].
 ///
-/// The driver performs bounded rotating service across terminal/control, CM,
-/// CQ, reclamation/deadline, and per-connection completion dispatch. Message
-/// protocol work belongs to [`crate::v2::MessageTransportDriver`]. Readiness
-/// mode sleeps
-/// only on registered event sources and published software work; polling mode
-/// performs one bounded nonblocking iteration followed by a cooperative yield.
+/// The driver fairly rotates across three opaque bounded owners: I/O, session,
+/// and terminal composition. CQ polling, completion dispatch, and operation
+/// deadlines remain behind the I/O owner; CM progress, lifecycle deadlines,
+/// and teardown remain behind the session owner. Message protocol work belongs
+/// to [`crate::v2::MessageTransportDriver`]. Readiness mode sleeps only on
+/// registered event sources and published software work; polling mode performs
+/// one bounded nonblocking iteration followed by a cooperative yield.
 /// Dropping the driver publishes a terminal failure and wakes observed waiters.
 /// Drop performs one bounded pass over registered connections, with at most
 /// one QP ERR transition and one zero-outstanding QP destroy attempt per
@@ -400,13 +422,11 @@ impl Drop for RdmaEngine {
 /// per successful build, and the engine creates zero internal tasks.
 pub struct RdmaEngineDriver {
     shared: Arc<EngineShared>,
-    resources: Option<EngineResources>,
-    scheduler: WorkScheduler,
-    cq_readiness: crate::v2::completion::CqReadiness,
-    cq_buffer: Box<[super::Completion]>,
+    io_progress: IoProgress,
+    session_progress: SessionProgress,
+    scheduler: OwnerScheduler,
     deadline_sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
     deadline_at: Option<tokio::time::Instant>,
-    deadline_io_turn: bool,
     runtime_checked: bool,
 }
 
@@ -428,6 +448,7 @@ struct EngineShared {
     // shutdown waiter without retaining registrations from dropped futures.
     terminal_notify: Notify,
     terminal: Mutex<Option<MemoizedTerminalResult>>,
+    pending_terminal: Mutex<Option<MemoizedTerminalResult>>,
     #[cfg(any(test, feature = "test-hooks"))]
     test_resources: Option<resources::TestResourceRefs>,
     #[cfg(any(test, feature = "test-hooks"))]
@@ -446,15 +467,15 @@ struct EngineIoDriverSignal {
 
 impl IoDriverSignal for EngineIoDriverSignal {
     fn publish_cq_recheck(&self) {
-        self.work_signal.publish(driver::CQ_RECHECK_WORK);
+        self.work_signal.publish(driver::IO_WORK);
     }
 
     fn publish_completion_dispatch(&self) {
-        self.work_signal.publish(driver::COMPLETION_DISPATCH_WORK);
+        self.work_signal.publish(driver::IO_WORK);
     }
 
     fn publish_reclamation(&self) {
-        self.work_signal.publish(driver::RECLAMATION_WORK);
+        self.work_signal.publish(driver::IO_WORK);
     }
 
     fn publish_terminal(&self) {
@@ -484,6 +505,8 @@ impl EngineShared {
     fn into_shared(self) -> Arc<Self> {
         let shared = Arc::new(self);
         shared.session.bind_engine(&shared);
+        let session_bridge: Arc<dyn IoSessionBridge> = shared.session.clone();
+        shared.io_core.bind_session_bridge(&session_bridge);
         shared
     }
 
@@ -528,6 +551,7 @@ impl EngineShared {
             work_signal,
             terminal_notify: Notify::new(),
             terminal: Mutex::new(None),
+            pending_terminal: Mutex::new(None),
             #[cfg(any(test, feature = "test-hooks"))]
             test_resources: None,
             #[cfg(any(test, feature = "test-hooks"))]
@@ -611,6 +635,85 @@ impl EngineShared {
             connection.wake_close();
         }
         self.terminal_notify.notify_waiters();
+    }
+
+    fn progress_driver_terminal(
+        self: &Arc<Self>,
+        io_progress: &IoProgress,
+        session_progress: &SessionProgress,
+    ) -> bool {
+        if !self.shutdown_requested.load(Ordering::Acquire)
+            || !io_progress.can_finish()
+            || !session_progress.can_finish()
+        {
+            return false;
+        }
+        let pending = lock_unpoison(&self.pending_terminal).clone();
+        if let Some(outcome) = pending {
+            self.finish_after_owner_cleanup(outcome);
+            Self::retain_after_failure(self);
+        } else {
+            self.finish_after_owner_cleanup(MemoizedTerminalResult::success());
+        }
+        true
+    }
+
+    fn begin_driver_failure(&self, error: Error) {
+        let outcome = MemoizedTerminalResult::from_error(error);
+        let mut pending = lock_unpoison(&self.pending_terminal);
+        if pending.is_none() {
+            *pending = Some(outcome.clone());
+            self.mark_shutdown_requested();
+            self.io_core.close_admission(outcome.error());
+            self.io_core.begin_terminal_failure(outcome);
+        }
+        drop(pending);
+        self.work_signal
+            .publish(driver::IO_WORK | driver::SESSION_WORK | driver::TERMINAL_WORK);
+    }
+
+    fn pending_terminal_outcome(&self) -> Option<MemoizedTerminalResult> {
+        lock_unpoison(&self.pending_terminal).clone()
+    }
+
+    fn finish_after_owner_cleanup(&self, outcome: MemoizedTerminalResult) {
+        let mut terminal = lock_unpoison(&self.terminal);
+        if terminal.is_some() {
+            return;
+        }
+        let lifecycle = if outcome.is_success() {
+            RdmaEngineLifecycle::Terminated
+        } else {
+            RdmaEngineLifecycle::Failed
+        };
+        *terminal = Some(outcome);
+        self.transition_terminal(lifecycle);
+        drop(terminal);
+        self.terminal_notify.notify_waiters();
+    }
+
+    fn handle_driver_drop(self: &Arc<Self>) {
+        if self.outcome().is_some() {
+            return;
+        }
+        self.mark_shutdown_requested();
+        self.session.synchronously_prepare_driver_drop();
+        let outstanding = self.io_core.accepted_count();
+        let cm_owners = self
+            .session
+            .retained_cm_owner_count()
+            .max(self.session.live_connection_count());
+        let error = if outstanding == 0 && cm_owners == 0 {
+            Error::DriverShutdown
+        } else {
+            Error::EngineWedged {
+                retained_bundles: self.retained_bundle_count().max(1),
+                outstanding_operations: outstanding,
+                cq_debt: outstanding,
+            }
+        };
+        self.finish(MemoizedTerminalResult::from_error(error));
+        Self::retain_after_failure(self);
     }
 
     fn outcome(&self) -> Option<MemoizedTerminalResult> {

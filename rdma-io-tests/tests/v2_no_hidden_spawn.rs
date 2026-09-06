@@ -1110,19 +1110,30 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let workspace_root = Path::new(manifest_dir).parent().expect("workspace root");
     let v2_dir = workspace_root.join("rdma-io").join("src").join("v2");
+    let completion_path = v2_dir.join("completion.rs");
     let message_path = v2_dir.join("message_transport.rs");
     let io_path = v2_dir.join("engine").join("io.rs");
     let io_core_mod_path = v2_dir.join("engine").join("io_core").join("mod.rs");
     let io_core_operation_path = v2_dir.join("engine").join("io_core").join("operation.rs");
+    let io_core_progress_path = v2_dir.join("engine").join("io_core").join("progress.rs");
     let engine_mod_path = v2_dir.join("engine").join("mod.rs");
+    let progress_path = v2_dir.join("engine").join("progress.rs");
     let connection_path = v2_dir.join("engine").join("session").join("connection.rs");
     let listener_path = v2_dir.join("engine").join("session").join("listener.rs");
     let driver_path = v2_dir.join("engine").join("driver.rs");
     let drain_path = v2_dir.join("engine").join("session").join("drain.rs");
     let session_path = v2_dir.join("engine").join("session").join("mod.rs");
+    let session_progress_path = v2_dir.join("engine").join("session").join("progress.rs");
     let v2_mod_path = v2_dir.join("mod.rs");
 
     let message = fs::read_to_string(&message_path).expect("read message transport source");
+    let completion_source = fs::read_to_string(&completion_path).expect("read CQ readiness source");
+    assert!(
+        completion_source.contains("drain_and_ack_channel_events(cq, buf.len().max(1))")
+            && completion_source.contains("while (count as usize) < budget"),
+        "{} must bound CQ notification draining by the owner turn buffer",
+        completion_path.display()
+    );
     for forbidden in [
         "EngineShared",
         "ConnectionState",
@@ -1145,6 +1156,68 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         );
     }
 
+    // Activated incrementally as the owner-local progress migrations remove each
+    // dependency from the driver. Keeping the final assertion vocabulary together
+    // prevents later phases from weakening the intended boundary.
+    #[allow(dead_code)]
+    const FINAL_DRIVER_FORBIDDEN_IO_KNOWLEDGE: &[&str] = &[
+        "CqReadiness",
+        "cq_buffer",
+        "resources.cq",
+        "cq_async_fd",
+        "take_published_connection",
+        "CompletionReadyConnection",
+        "DeadlineKind::Reclamation",
+    ];
+
+    #[allow(dead_code)]
+    const FINAL_DRIVER_FORBIDDEN_SESSION_KNOWLEDGE: &[&str] = &[
+        "cm_async_fd",
+        "cm_event_channel",
+        "resources.cm",
+        "try_process_cm_event",
+        "service_cm_software",
+        "service_deferred_cm_destructions",
+        "handle_connection_drain_deadline",
+        ".connections",
+        ".listeners",
+        "begin_connection_close",
+        "begin_cm_shutdown",
+        "begin_all_connection_close",
+        "destroy_qp",
+        "retire_registered_connection",
+        "DeadlineKind::ConnectionDrain",
+        "DeadlineKind::EngineShutdown",
+    ];
+
+    #[allow(dead_code)]
+    const FINAL_DRIVER_FORBIDDEN_TERMINAL_KNOWLEDGE: &[&str] = &[
+        "pending_cm_route_count",
+        "live_connection_count",
+        "accepted_operations",
+        "accepted_count",
+        "retained_bundle_count",
+        "begin_all_connection_close",
+        "begin_cm_shutdown",
+        "synchronously_prepare_driver_drop",
+        ".finish(",
+    ];
+
+    #[allow(dead_code)]
+    fn assert_final_driver_boundary(path: &Path, source: &str, forbidden: &[&str]) {
+        let violations = forbidden
+            .iter()
+            .copied()
+            .filter(|needle| source.contains(needle))
+            .collect::<Vec<_>>();
+        assert!(
+            violations.is_empty(),
+            "{} retains layer-owned driver knowledge: {}",
+            path.display(),
+            violations.join(", ")
+        );
+    }
+
     let forbidden_core_dependencies = [
         "EngineShared",
         "ConnectionState",
@@ -1161,7 +1234,11 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         "SessionLifecycleAuthority",
         "QpDestructionProof",
     ];
-    for path in [&io_core_mod_path, &io_core_operation_path] {
+    for path in [
+        &io_core_mod_path,
+        &io_core_operation_path,
+        &io_core_progress_path,
+    ] {
         let source = fs::read_to_string(path).expect("read I/O core source");
         let violations =
             find_forbidden_production_dependencies(&source, &forbidden_core_dependencies)
@@ -1175,6 +1252,54 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     }
 
     let engine_mod = fs::read_to_string(&engine_mod_path).expect("read engine module source");
+    assert!(
+        engine_mod.contains("pub fn io_reclamation_budget(")
+            && engine_mod.contains("pub fn session_reclamation_budget(")
+            && !engine_mod.contains("pub fn reclamation_budget("),
+        "{} must expose owner-local reclamation controls without a compatibility alias",
+        engine_mod_path.display()
+    );
+    let progress_source =
+        fs::read_to_string(&progress_path).expect("read owner-neutral progress source");
+    for forbidden in [
+        "ConnectionToken",
+        "OperationToken",
+        "ConnectionState",
+        "SessionManager",
+        "CmId",
+        "WorkCompletion",
+        "DeadlineKind",
+        "IoCoreEffects",
+        "IoEvent",
+    ] {
+        assert!(
+            !progress_source.contains(forbidden),
+            "{} must not expose layer-private `{forbidden}`",
+            progress_path.display()
+        );
+    }
+    for required in [
+        "units_consumed",
+        "immediate_work",
+        "next_deadline",
+        "readiness",
+        "terminal",
+        "effects",
+    ] {
+        assert!(
+            progress_source.contains(required),
+            "{} must report `{required}`",
+            progress_path.display()
+        );
+    }
+    let io_core_source =
+        fs::read_to_string(&io_core_mod_path).expect("read I/O core module source");
+    assert!(
+        io_core_source.contains("trait IoSessionBridge")
+            && io_core_source.contains("session_bridge: OnceLock<Weak<dyn IoSessionBridge>>"),
+        "{} must retain only one bind-once weak session capability",
+        io_core_mod_path.display()
+    );
     let engine_shared = engine_mod
         .split("struct EngineShared {")
         .nth(1)
@@ -1320,16 +1445,64 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         drain_path.display()
     );
     let driver_source = fs::read_to_string(&driver_path).expect("read engine driver source");
+    let production_driver = driver_source
+        .split(
+            "#[cfg(any(test, feature = \"test-hooks\"))]\n#[doc(hidden)]\npub(super) mod test_api",
+        )
+        .next()
+        .expect("locate production driver prefix");
+    assert_final_driver_boundary(
+        &driver_path,
+        production_driver,
+        FINAL_DRIVER_FORBIDDEN_IO_KNOWLEDGE,
+    );
+    assert_final_driver_boundary(
+        &driver_path,
+        production_driver,
+        FINAL_DRIVER_FORBIDDEN_SESSION_KNOWLEDGE,
+    );
+    assert_final_driver_boundary(
+        &driver_path,
+        production_driver,
+        FINAL_DRIVER_FORBIDDEN_TERMINAL_KNOWLEDGE,
+    );
     assert!(
-        driver_source.contains(".session")
-            && driver_source.contains(".io_core")
-            && driver_source.contains("service_cm_software(")
-            && driver_source.contains("try_process_cm_event(")
-            && driver_source.contains("service_deferred_cm_destructions(")
-            && !driver_source.contains("session.cm")
+        production_driver.contains("io_progress")
+            && production_driver.contains("session_progress")
+            && !production_driver.contains("session.cm")
             && !driver_source.contains("tokio::spawn("),
-        "{} must explicitly compose SessionManager and IoCore without spawning",
+        "{} must schedule owner-local progress without spawning",
         driver_path.display()
+    );
+    let session_progress_source =
+        fs::read_to_string(&session_progress_path).expect("read session progress source");
+    for required in [
+        "SessionProgressResources",
+        "poll_readiness_events",
+        "service_cm_software",
+        "service_deferred_cm_destructions",
+        "handle_connection_drain_deadline",
+        "service_bounded_shutdown",
+        "terminal_completion_ready",
+    ] {
+        assert!(
+            session_progress_source.contains(required),
+            "{} must own `{required}`",
+            session_progress_path.display()
+        );
+    }
+    assert!(
+        !session_progress_source.contains("shared.io_core"),
+        "{} must report only session-owned terminal readiness",
+        session_progress_path.display()
+    );
+    let io_progress_source =
+        fs::read_to_string(&io_core_progress_path).expect("read I/O progress source");
+    assert!(
+        io_progress_source.contains("terminalize_operations_bounded")
+            && io_progress_source.contains("ProgressTerminal::Ready"),
+        "{} must report bounded I/O terminal readiness",
+        io_core_progress_path.display()
     );
     assert!(
         cm_source.contains("impl SessionManager")
@@ -1519,6 +1692,9 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         "SessionManager",
         "SessionLifecycleAuthority",
         "QpDestructionProof",
+        "SessionProgress",
+        "ProgressReport",
+        "IoSessionBridge",
     ] {
         assert!(
             !public_reexports.contains(internal),

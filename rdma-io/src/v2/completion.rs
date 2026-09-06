@@ -53,6 +53,10 @@ pub(crate) struct CqReadiness {
 }
 
 impl CqReadiness {
+    pub(crate) fn requires_repoll(&self) -> bool {
+        self.state == PollState::DrainFd
+    }
+
     pub(crate) fn poll_with_notifier<N: CqNotifier>(
         &mut self,
         cq: &Cq,
@@ -140,8 +144,12 @@ impl CqReadiness {
                     }
                     Poll::Pending => return Poll::Pending,
                 },
-                PollState::DrainFd => match drain_and_ack_channel_events(cq) {
-                    Ok(()) => self.state = PollState::PollBeforeArm,
+                PollState::DrainFd => match drain_and_ack_channel_events(cq, buf.len().max(1)) {
+                    Ok(true) => {
+                        cx.waker().wake_by_ref();
+                        return Poll::Pending;
+                    }
+                    Ok(false) => self.state = PollState::PollBeforeArm,
                     Err(error) => return Poll::Ready(Err(error)),
                 },
             }
@@ -287,14 +295,15 @@ impl<N: CqNotifier> Completions<N> {
 impl<N: CqNotifier> Drop for Completions<N> {
     fn drop(&mut self) {
         if self.cq.has_channel() {
-            let _ = drain_and_ack_channel_events(&self.cq);
+            let _ = drain_and_ack_channel_events(&self.cq, u32::MAX as usize);
         }
     }
 }
 
-fn drain_and_ack_channel_events(cq: &Cq) -> Result<()> {
+fn drain_and_ack_channel_events(cq: &Cq, budget: usize) -> Result<bool> {
     let channel = cq.completion_channel().expect("channel-backed CQ");
     drain_and_ack_events(
+        budget,
         || channel.get_cq_event().map(|_| ()),
         |count| unsafe {
             rdma_io_sys::ibverbs::ibv_ack_cq_events(cq.raw_cq().as_raw(), count);
@@ -303,11 +312,13 @@ fn drain_and_ack_channel_events(cq: &Cq) -> Result<()> {
 }
 
 fn drain_and_ack_events(
+    budget: usize,
     mut get_event: impl FnMut() -> crate::Result<()>,
     mut acknowledge: impl FnMut(u32),
-) -> Result<()> {
+) -> Result<bool> {
+    debug_assert!(budget > 0);
     let mut count = 0u32;
-    loop {
+    while (count as usize) < budget {
         match get_event() {
             Ok(()) => {
                 count = count.saturating_add(1);
@@ -331,7 +342,7 @@ fn drain_and_ack_events(
     if count > 0 {
         acknowledge(count);
     }
-    Ok(())
+    Ok((count as usize) == budget)
 }
 
 #[cfg(test)]
@@ -399,6 +410,7 @@ mod tests {
         let mut calls = 0;
         let mut acknowledged = Vec::new();
         let error = drain_and_ack_events(
+            8,
             || {
                 calls += 1;
                 match calls {
@@ -415,6 +427,26 @@ mod tests {
         assert!(
             matches!(error, Error::Verbs(ref source) if source.to_string().contains("injected"))
         );
+        assert_eq!(acknowledged, [2]);
+    }
+
+    #[test]
+    fn notification_drain_stops_at_its_budget_and_acknowledges_the_prefix() {
+        let mut calls = 0;
+        let mut acknowledged = Vec::new();
+
+        let more = drain_and_ack_events(
+            2,
+            || {
+                calls += 1;
+                Ok(())
+            },
+            |count| acknowledged.push(count),
+        )
+        .unwrap();
+
+        assert!(more);
+        assert_eq!(calls, 2);
         assert_eq!(acknowledged, [2]);
     }
 }

@@ -1,19 +1,19 @@
 //! Low-level operation/completion state composed by the v2 engine.
 
 mod operation;
+mod progress;
 
 use std::collections::{HashSet, VecDeque};
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, Weak};
 use std::time::Duration;
 
 use super::io::{IoEventSender, IoTerminalEvent, PendingIoEvent};
 use super::registry::{
     ConnectionToken, OperationToken, lock_unpoison, read_unpoison, write_unpoison,
 };
-use super::scheduler::{DeadlineKind, DeadlineRequest};
 #[cfg(test)]
 use super::{
     CompletionMode, RdmaConnectionConfig, RdmaEngine, RdmaEngineBuilder, RdmaEngineDriver,
@@ -33,6 +33,7 @@ pub(super) use operation::{
 pub(super) use operation::{
     completion_for_driver_test, install_accepted_operation_for_driver_test,
 };
+pub(super) use progress::IoProgress;
 
 /// Posting-only QP authority supplied by the session layer.
 ///
@@ -52,6 +53,34 @@ pub(super) trait IoDriverSignal: Send + Sync {
     fn publish_terminal(&self);
     #[cfg(any(test, feature = "test-hooks"))]
     fn pause_operation_before_register(&self);
+}
+
+/// Narrow session capability needed by owner-local I/O progress.
+///
+/// The I/O side never receives a concrete session manager, registry, lifecycle
+/// authority, or resource bundle through this boundary.
+#[allow(
+    dead_code,
+    reason = "bound before I/O progress migrates in the next phase"
+)]
+pub(super) trait IoSessionBridge: Send + Sync {
+    fn route_completion(&self, completion: WorkCompletion) -> Option<ConnectionToken>;
+
+    fn dispatch_connection_completions(
+        &self,
+        connection: ConnectionToken,
+        quantum: usize,
+    ) -> (usize, bool);
+
+    fn handle_reclamation_deadline(&self, token: OperationToken);
+
+    fn apply_terminal_effects(&self, effects: IoCoreEffects);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct IoDeadlineRequest {
+    pub(super) at: tokio::time::Instant,
+    pub(super) token: OperationToken,
 }
 
 /// Immutable session identity accepted by the operation/completion core.
@@ -325,7 +354,9 @@ pub(super) struct IoCore {
     driver_signal: Arc<dyn IoDriverSignal>,
     missing_cqe_deadline: Duration,
     completion_dispatch_budget: usize,
-    reclamation_requests: Mutex<VecDeque<DeadlineRequest>>,
+    reclamation_requests: Mutex<VecDeque<IoDeadlineRequest>>,
+    session_bridge: OnceLock<Weak<dyn IoSessionBridge>>,
+    terminal_failure: Mutex<Option<super::lifecycle::MemoizedTerminalResult>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -369,9 +400,25 @@ impl IoCore {
             missing_cqe_deadline,
             completion_dispatch_budget,
             reclamation_requests: Mutex::new(VecDeque::new()),
+            session_bridge: OnceLock::new(),
+            terminal_failure: Mutex::new(None),
         });
         let reclaim = QpReclaimCapability::new(&core);
         Ok((core, reclaim))
+    }
+
+    pub(super) fn bind_session_bridge(&self, bridge: &Arc<dyn IoSessionBridge>) {
+        self.session_bridge
+            .set(Arc::downgrade(bridge))
+            .unwrap_or_else(|_| panic!("IoCore is bound to exactly one IoSessionBridge"));
+    }
+
+    #[allow(
+        dead_code,
+        reason = "used when I/O progress migrates in the next phase"
+    )]
+    pub(super) fn session_bridge(&self) -> Option<Arc<dyn IoSessionBridge>> {
+        self.session_bridge.get().and_then(Weak::upgrade)
     }
 
     pub(super) fn admission(&self) -> RwLockReadGuard<'_, ()> {
@@ -414,15 +461,11 @@ impl IoCore {
         self.begin_reclamation(token);
         let now = tokio::time::Instant::now();
         let at = now.checked_add(self.missing_cqe_deadline).unwrap_or(now);
-        lock_unpoison(&self.reclamation_requests).push_back(DeadlineRequest {
-            at,
-            kind: DeadlineKind::Reclamation,
-            token: token.encode(),
-        });
+        lock_unpoison(&self.reclamation_requests).push_back(IoDeadlineRequest { at, token });
         self.publish_reclamation();
     }
 
-    pub(super) fn take_reclamation_requests(&self, budget: usize) -> Vec<DeadlineRequest> {
+    pub(super) fn take_reclamation_requests(&self, budget: usize) -> Vec<IoDeadlineRequest> {
         let mut requests = lock_unpoison(&self.reclamation_requests);
         let count = requests.len().min(budget);
         requests.drain(..count).collect()
@@ -447,6 +490,21 @@ impl IoCore {
 
     pub(super) fn accepted_count(&self) -> usize {
         self.accepted_operations.load(Ordering::Acquire)
+    }
+
+    pub(super) fn shutdown_requested(&self) -> bool {
+        self.shutdown_requested.load(Ordering::Acquire)
+    }
+
+    pub(super) fn begin_terminal_failure(&self, outcome: super::lifecycle::MemoizedTerminalResult) {
+        let mut terminal = lock_unpoison(&self.terminal_failure);
+        if terminal.is_none() {
+            *terminal = Some(outcome);
+        }
+    }
+
+    pub(super) fn terminal_failure(&self) -> Option<super::lifecycle::MemoizedTerminalResult> {
+        lock_unpoison(&self.terminal_failure).clone()
     }
 
     pub(super) fn publish_connection(&self, connection: &Arc<EstablishedIoConnection>) {

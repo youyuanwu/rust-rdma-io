@@ -1,4 +1,4 @@
-//! Sole engine-progress future and wakeup protocol.
+//! Sole engine-progress future and thin bounded scheduler.
 //!
 //! Software producers publish queue state before setting a pending class bit
 //! and incrementing an epoch, then wake the registered `AtomicWaker`. Before
@@ -6,12 +6,13 @@
 //! pending bits and epoch. Therefore a publish before registration is found by
 //! the recheck, while a publish after registration performs the wake.
 //!
-//! Readiness CQ progress polls before arming, arms once, immediately polls
-//! again, waits for the shared fd only after both polls are empty, then drains
-//! and acknowledges every channel event before repeating. This closes both CQ
-//! edge races without a periodic timer. Polling mode performs one bounded CQ
-//! attempt per driver poll and returns `Pending` after scheduling a cooperative
-//! wake; neither mode scans idle connection registrations.
+//! Each poll fairly visits ready-at-entry I/O, session, and terminal owners at
+//! most once. The owners hide CQ/CM readiness, completion routing, deadline
+//! kinds, teardown, and terminalization details behind bounded progress
+//! reports. Because readiness wakes do not identify their source, every poll
+//! probes both owners once; idle owners register and recheck readiness without
+//! creating a self-wake loop. Polling mode yields cooperatively after the
+//! bounded pass.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -19,20 +20,32 @@ use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 
 use super::config::CompletionMode;
+use super::io_core::IoProgress;
+#[cfg(test)]
 use super::lifecycle::MemoizedTerminalResult;
+use super::progress::{OwnerClass, ProgressTerminal};
 use super::resources::EngineResources;
-use super::scheduler::{Deadline, DeadlineKind, WorkClass, WorkScheduler};
+use super::scheduler::OwnerScheduler;
+use super::session::SessionProgress;
 use super::{EngineShared, RdmaEngineDriver};
-use crate::v2::Completion;
-use crate::v2::completion::CqReadiness;
 use crate::v2::error::{Error, Result};
 use crate::v2::runtime::preflight_driver_runtime;
 
 pub(super) const TERMINAL_WORK: usize = 1 << 0;
-pub(super) const RECLAMATION_WORK: usize = 1 << 1;
-pub(super) const COMPLETION_DISPATCH_WORK: usize = 1 << 2;
-pub(super) const CQ_RECHECK_WORK: usize = 1 << 4;
-const WORK_CLASS_COUNT: usize = 5;
+pub(super) const IO_WORK: usize = 1 << 1;
+pub(super) const SESSION_WORK: usize = 1 << 2;
+
+fn earliest_deadline(
+    io: Option<tokio::time::Instant>,
+    session: Option<tokio::time::Instant>,
+) -> Option<tokio::time::Instant> {
+    match (io, session) {
+        (Some(io), Some(session)) => Some(io.min(session)),
+        (Some(io), None) => Some(io),
+        (None, Some(session)) => Some(session),
+        (None, None) => None,
+    }
+}
 
 pub(super) struct WorkSignal {
     pending: std::sync::atomic::AtomicUsize,
@@ -74,362 +87,114 @@ impl WorkSignal {
     }
 }
 
-fn poll_readiness_events<G>(
-    cx: &mut TaskContext<'_>,
-    budget: usize,
-    mut poll_read_ready: impl FnMut(&mut TaskContext<'_>) -> Poll<Result<G>>,
-    mut clear_ready: impl FnMut(&mut G),
-    mut try_one: impl FnMut() -> Result<bool>,
-) -> Poll<Result<usize>> {
-    debug_assert!(budget > 0);
-    let mut processed = 0;
-    loop {
-        let mut guard = match poll_read_ready(cx) {
-            Poll::Ready(Ok(guard)) => guard,
-            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-            Poll::Pending if processed == 0 => return Poll::Pending,
-            Poll::Pending => return Poll::Ready(Ok(processed)),
-        };
-        loop {
-            if processed == budget {
-                return Poll::Ready(Ok(processed));
-            }
-            match try_one() {
-                Ok(true) => processed += 1,
-                Ok(false) => {
-                    clear_ready(&mut guard);
-                    break;
-                }
-                Err(error) => return Poll::Ready(Err(error)),
-            }
-        }
-        // Clearing an AsyncFd readiness tick can race a new edge. Re-polling
-        // here either observes it immediately or registers the task waker
-        // before this driver poll is allowed to return Pending.
-    }
-}
-
 impl RdmaEngineDriver {
     pub(super) fn new(shared: Arc<EngineShared>, resources: Option<EngineResources>) -> Self {
-        let cq_budget = shared.config.cq_completion_budget;
+        let (io_resources, session_resources) = match resources {
+            Some(mut resources) => {
+                let io = resources.take_io_progress_resources();
+                (Some(io), Some(resources.into_session_progress()))
+            }
+            None => (None, None),
+        };
+        let io_progress = IoProgress::new(
+            Arc::clone(&shared.io_core),
+            io_resources,
+            shared.config.cq_completion_budget,
+            shared.config.completion_dispatch_budget,
+            shared.config.io_reclamation_budget,
+            #[cfg(any(test, feature = "test-hooks"))]
+            Arc::clone(&shared.test_driver),
+        );
+        let session_progress = SessionProgress::new(
+            Arc::clone(&shared.session),
+            session_resources,
+            shared.config.cm_event_budget,
+            shared.config.session_reclamation_budget,
+        );
         Self {
             shared,
-            resources,
-            scheduler: WorkScheduler::new(),
-            cq_readiness: CqReadiness::default(),
-            cq_buffer: vec![Completion::default(); cq_budget].into_boxed_slice(),
+            io_progress,
+            session_progress,
+            scheduler: OwnerScheduler::new(),
             deadline_sleep: None,
             deadline_at: None,
-            deadline_io_turn: true,
             runtime_checked: false,
         }
     }
 
     fn mark_published_work(&mut self, published: usize) {
         if published & TERMINAL_WORK != 0 {
-            self.scheduler.mark_class_ready(WorkClass::Terminal);
+            self.scheduler.mark_ready(OwnerClass::Terminal);
         }
-        if published & RECLAMATION_WORK != 0 {
-            self.scheduler.mark_class_ready(WorkClass::Reclamation);
+
+        if published & IO_WORK != 0 {
+            self.scheduler.mark_ready(OwnerClass::Io);
         }
-        if published & COMPLETION_DISPATCH_WORK != 0 {
-            self.scheduler
-                .mark_class_ready(WorkClass::CompletionDispatch);
-        }
-        if published & super::session::cm::CM_WORK != 0 {
-            self.scheduler.mark_class_ready(WorkClass::Cm);
-        }
-        if published & CQ_RECHECK_WORK != 0 {
-            self.scheduler.mark_class_ready(WorkClass::Cq);
+        if published & SESSION_WORK != 0 {
+            self.scheduler.mark_ready(OwnerClass::Session);
         }
     }
 
-    fn fail(&mut self, error: Error) -> Poll<Result<()>> {
-        let outcome = MemoizedTerminalResult::from_error(error);
-        self.shared.finish(outcome.clone());
-        EngineShared::retain_after_failure(&self.shared);
-        self.release_resources();
-        Poll::Ready(outcome.into_result())
+    fn probe_owners(&mut self) {
+        self.scheduler.mark_ready(OwnerClass::Io);
+        self.scheduler.mark_ready(OwnerClass::Session);
+    }
+
+    fn fail(&mut self, error: Error, cx: &mut TaskContext<'_>) -> Poll<Result<()>> {
+        self.shared.begin_driver_failure(error);
+        self.scheduler.mark_ready(OwnerClass::Io);
+        self.scheduler.mark_ready(OwnerClass::Session);
+        self.scheduler.mark_ready(OwnerClass::Terminal);
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 
     fn release_resources(&mut self) {
-        if let Some(resources) = self.resources.as_mut() {
-            resources.drop_readiness_adapters();
-        }
-        self.resources.take();
+        self.io_progress.release_resources();
+        self.session_progress.release_resources();
     }
 
     fn service_terminal(&mut self) -> Result<bool> {
-        if !self
+        Ok(self
             .shared
-            .shutdown_requested
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return Ok(false);
-        }
-        self.shared.session.begin_cm_shutdown(
-            &self.shared,
-            &MemoizedTerminalResult::from_error(Error::DriverShutdown),
-        );
-        self.shared.session.begin_all_connection_close(&self.shared);
-        if self.shared.session.pending_cm_route_count() != 0 {
-            return Ok(false);
-        }
-        if self.shared.session.live_connection_count() != 0 {
-            return Ok(false);
-        }
-
-        if self.shared.io_core.accepted_count() != 0 {
-            return Ok(false);
-        }
-
-        if let Some(resources) = self.resources.as_ref() {
-            let mut processed = 0;
-            while processed < self.shared.config.cm_event_budget {
-                if !self
-                    .shared
-                    .session
-                    .try_process_cm_event(&self.shared, resources)?
-                {
-                    if self.shared.session.pending_cm_route_count() != 0
-                        || self.shared.session.live_connection_count() != 0
-                        || self.shared.io_core.accepted_count() != 0
-                    {
-                        self.scheduler.mark_class_ready(WorkClass::Cm);
-                        return Ok(false);
-                    }
-                    #[cfg(any(test, feature = "test-hooks"))]
-                    crate::test_support::destruction::record(
-                        crate::test_support::destruction::DestructionKind::CmFinalDrainToWouldBlock,
-                        resources.cm_event_channel.as_raw() as usize,
-                    );
-                    self.shared.finish(MemoizedTerminalResult::success());
-                    return Ok(true);
-                }
-                processed += 1;
-            }
-            self.scheduler.mark_class_ready(WorkClass::Cm);
-            return Ok(false);
-        }
-
-        self.shared.finish(MemoizedTerminalResult::success());
-        Ok(true)
+            .progress_driver_terminal(&self.io_progress, &self.session_progress))
     }
 
-    fn service_cq(&mut self, cx: &mut TaskContext<'_>) -> Result<bool> {
-        #[cfg(any(test, feature = "test-hooks"))]
-        if let Some(completion) = self.shared.test_driver.take_released_connection_cqe() {
-            if let Some(connection) = self.shared.session.enqueue_completion(completion) {
-                self.scheduler
-                    .enqueue_connection(connection.completion_ready());
-            }
-            self.scheduler.mark_class_ready(WorkClass::Cq);
-            return Ok(true);
+    fn service_io(&mut self, cx: &mut TaskContext<'_>) -> Result<bool> {
+        let report = self
+            .io_progress
+            .turn(self.shared.config.completion_mode, cx)?;
+        if report.requires_repoll() {
+            self.scheduler.mark_ready(OwnerClass::Io);
         }
-
-        let Some(resources) = self.resources.as_ref() else {
-            return Ok(false);
-        };
-        let count = match self.shared.config.completion_mode {
-            CompletionMode::Readiness => {
-                let async_fd = resources.cq_async_fd.as_ref().ok_or_else(|| {
-                    Error::InvalidConfig("readiness engine has no CQ AsyncFd".into())
-                })?;
-                #[cfg(any(test, feature = "test-hooks"))]
-                let polled = {
-                    let before = Arc::clone(&self.shared);
-                    let after = Arc::clone(&self.shared);
-                    self.cq_readiness.poll_with_async_fd_and_hooks(
-                        &resources.cq,
-                        async_fd,
-                        cx,
-                        &mut self.cq_buffer,
-                        move |generation| before.test_driver.record_cq_pre_arm(generation),
-                        move |generation| after.test_driver.record_cq_arm(generation),
-                    )
-                };
-                #[cfg(not(any(test, feature = "test-hooks")))]
-                let polled = self.cq_readiness.poll_with_async_fd_and_hooks(
-                    &resources.cq,
-                    async_fd,
-                    cx,
-                    &mut self.cq_buffer,
-                    |_| false,
-                    |_| false,
-                );
-                match polled {
-                    Poll::Ready(result) => result?,
-                    Poll::Pending => return Ok(false),
-                }
-            }
-            CompletionMode::Polling => resources.cq.poll(&mut self.cq_buffer)?,
-        };
-
-        if count == 0 {
-            return Ok(false);
+        match report.terminal {
+            ProgressTerminal::Running => {}
+            ProgressTerminal::Ready => self.scheduler.mark_ready(OwnerClass::Terminal),
+            ProgressTerminal::Failed(error) => return Err(error),
         }
-        for completion in self.cq_buffer[..count].iter().copied() {
-            let completion = completion.into_raw();
-            #[cfg(any(test, feature = "test-hooks"))]
-            if self.shared.test_driver.suppress_connection_cqe(completion) {
-                continue;
-            }
-            if let Some(connection) = self.shared.session.enqueue_completion(completion) {
-                self.scheduler
-                    .enqueue_connection(connection.completion_ready());
-            }
-            #[cfg(any(test, feature = "test-hooks"))]
-            self.shared.test_driver.dispatch(completion);
-            #[cfg(not(any(test, feature = "test-hooks")))]
-            let _ = completion;
-        }
-        self.scheduler.mark_class_ready(WorkClass::Cq);
-        Ok(true)
+        Ok(report.units_consumed > 0)
     }
 
-    fn service_cm(&mut self, cx: &mut TaskContext<'_>) -> Result<bool> {
-        let Some(resources) = self.resources.as_ref() else {
-            return Ok(false);
-        };
-        let budget = self.shared.config.cm_event_budget;
-        let session = &self.shared.session;
-        let mut processed = session.service_cm_software(&self.shared, Some(resources), budget)?;
-        while processed < budget && session.try_process_cm_event(&self.shared, resources)? {
-            processed += 1;
+    fn service_session(&mut self, cx: &mut TaskContext<'_>) -> Result<bool> {
+        let report = self
+            .session_progress
+            .turn(self.shared.config.completion_mode, cx)?;
+        if report.requires_repoll() {
+            self.scheduler.mark_ready(OwnerClass::Session);
         }
-
-        let readiness_processed = match self.shared.config.completion_mode {
-            CompletionMode::Readiness => {
-                if processed == budget {
-                    0
-                } else {
-                    let async_fd = resources.cm_async_fd.as_ref().ok_or_else(|| {
-                        Error::InvalidConfig("readiness engine has no CM AsyncFd".into())
-                    })?;
-                    match poll_readiness_events(
-                        cx,
-                        budget - processed,
-                        |cx| match async_fd.poll_read_ready(cx) {
-                            Poll::Ready(Ok(guard)) => Poll::Ready(Ok(guard)),
-                            Poll::Ready(Err(error)) => Poll::Ready(Err(Error::Verbs(error))),
-                            Poll::Pending => Poll::Pending,
-                        },
-                        |guard| guard.clear_ready(),
-                        || session.try_process_cm_event(&self.shared, resources),
-                    ) {
-                        Poll::Ready(result) => result?,
-                        Poll::Pending => 0,
-                    }
-                }
-            }
-            CompletionMode::Polling => 0,
-        };
-        processed += readiness_processed;
-        processed += session.service_deferred_cm_destructions(
-            &self.shared,
-            budget.saturating_sub(processed),
-            || session.try_process_cm_event(&self.shared, resources),
-        )?;
-
-        if processed >= budget || session.has_cm_work() {
-            self.scheduler.mark_class_ready(WorkClass::Cm);
+        match report.terminal {
+            ProgressTerminal::Running => {}
+            ProgressTerminal::Ready => self.scheduler.mark_ready(OwnerClass::Terminal),
+            ProgressTerminal::Failed(error) => return Err(error),
         }
-        Ok(processed > 0)
-    }
-
-    fn service_reclamation(&mut self) -> Result<bool> {
-        let budget = self.shared.config.reclamation_budget;
-        let first_quota = budget.div_ceil(2);
-        let second_quota = budget / 2;
-        let mut requests = if self.deadline_io_turn {
-            self.shared.io_core.take_reclamation_requests(first_quota)
-        } else {
-            self.shared.session.take_deadline_requests(first_quota)
-        };
-        let second = if self.deadline_io_turn {
-            self.shared.session.take_deadline_requests(second_quota)
-        } else {
-            self.shared.io_core.take_reclamation_requests(second_quota)
-        };
-        requests.extend(second);
-        if requests.len() < budget {
-            let remaining = budget - requests.len();
-            let refill = if self.deadline_io_turn {
-                self.shared.io_core.take_reclamation_requests(remaining)
-            } else {
-                self.shared.session.take_deadline_requests(remaining)
-            };
-            requests.extend(refill);
-        }
-        if requests.len() < budget {
-            let remaining = budget - requests.len();
-            let refill = if self.deadline_io_turn {
-                self.shared.session.take_deadline_requests(remaining)
-            } else {
-                self.shared.io_core.take_reclamation_requests(remaining)
-            };
-            requests.extend(refill);
-        }
-        self.deadline_io_turn = !self.deadline_io_turn;
-        for request in requests.iter().copied() {
-            if !self
-                .scheduler
-                .deadlines()
-                .push(request.at, request.kind, request.token)
-            {
-                return Err(Error::InvalidConfig(
-                    "deadline insertion sequence exhausted".into(),
-                ));
-            }
-        }
-        let now = tokio::time::Instant::now();
-        let remaining = budget.saturating_sub(requests.len());
-        let due = self.scheduler.deadlines().pop_due(now, remaining);
-        for deadline in due.iter().copied() {
-            self.process_deadline(deadline)?;
-        }
-        if self.shared.session.has_deadline_requests()
-            || self.shared.io_core.has_reclamation_requests()
-            || self
-                .scheduler
-                .deadlines()
-                .next()
-                .is_some_and(|at| at <= now)
-        {
-            self.scheduler.mark_class_ready(WorkClass::Reclamation);
-        }
-        Ok(!due.is_empty() || !requests.is_empty())
-    }
-
-    fn process_deadline(&mut self, deadline: Deadline) -> Result<()> {
-        match deadline.kind {
-            DeadlineKind::EngineShutdown => {
-                if let Some(failure) = self.shared.shutdown_deadline_failure() {
-                    Err(failure)
-                } else {
-                    self.scheduler.mark_class_ready(WorkClass::Terminal);
-                    Ok(())
-                }
-            }
-            DeadlineKind::Reclamation => {
-                self.shared.session.handle_reclamation_deadline(
-                    &self.shared,
-                    super::registry::OperationToken::decode(deadline.token),
-                );
-                Ok(())
-            }
-            DeadlineKind::ConnectionDrain => {
-                self.shared.session.handle_connection_drain_deadline(
-                    &self.shared,
-                    super::registry::ConnectionToken::decode(deadline.token),
-                );
-                Ok(())
-            }
-        }
+        Ok(report.units_consumed > 0)
     }
 
     fn poll_deadline_timer(&mut self, cx: &mut TaskContext<'_>) -> bool {
-        let next = self.scheduler.next_deadline();
+        let next = earliest_deadline(
+            self.io_progress.next_deadline(),
+            self.session_progress.next_deadline(),
+        );
         if self.deadline_at != next {
             self.deadline_sleep = next.map(|at| Box::pin(tokio::time::sleep_until(at)));
             self.deadline_at = next;
@@ -442,37 +207,7 @@ impl RdmaEngineDriver {
         }
         self.deadline_sleep = None;
         self.deadline_at = None;
-        self.scheduler.mark_class_ready(WorkClass::Reclamation);
-        true
-    }
-
-    fn service_completion_dispatch(&mut self) -> bool {
-        if let Some(connection) = self.shared.io_core.take_published_connection() {
-            self.scheduler
-                .enqueue_connection(connection.completion_ready());
-        }
-        let Some(connection) = self.scheduler.pop_connection() else {
-            return false;
-        };
-        let (_, remains_ready) = self.shared.session.dispatch_connection_completions(
-            &self.shared,
-            super::registry::ConnectionToken {
-                slot: connection.slot,
-                generation: connection.generation,
-            },
-            self.shared.config.completion_dispatch_budget,
-        );
-        if remains_ready {
-            self.scheduler.requeue_connection(connection);
-        }
-        if self.scheduler.completion_connection_count() > 0 {
-            self.scheduler
-                .mark_class_ready(WorkClass::CompletionDispatch);
-        }
-        if self.shared.io_core.has_published_connections() {
-            self.scheduler
-                .mark_class_ready(WorkClass::CompletionDispatch);
-        }
+        self.probe_owners();
         true
     }
 }
@@ -486,18 +221,23 @@ impl Future for RdmaEngineDriver {
             return Poll::Ready(outcome.into_result());
         }
 
-        if !self.runtime_checked {
+        let terminalizing_failure = self.shared.pending_terminal_outcome().is_some();
+        if !terminalizing_failure && !self.runtime_checked {
             if let Err(error) = preflight_driver_runtime("RdmaEngineDriver") {
-                return self.fail(error);
+                return self.fail(error, cx);
             }
             self.runtime_checked = true;
         }
         #[cfg(any(test, feature = "test-hooks"))]
-        if let Some(error) = self.shared.test_driver.take_injected_failure() {
-            return self.fail(error);
+        if !terminalizing_failure
+            && let Some(error) = self.shared.test_driver.take_injected_failure()
+        {
+            return self.fail(error, cx);
         }
         self.shared.transition_running();
-        self.poll_deadline_timer(cx);
+        if !terminalizing_failure {
+            self.poll_deadline_timer(cx);
+        }
 
         let observed_epoch = self.shared.work_signal.epoch();
         let published = self.shared.work_signal.take();
@@ -507,35 +247,30 @@ impl Future for RdmaEngineDriver {
             .shutdown_requested
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            self.scheduler.mark_class_ready(WorkClass::Terminal);
+            self.scheduler.mark_ready(OwnerClass::Terminal);
         }
-        self.scheduler.mark_class_ready(WorkClass::Cm);
-        self.scheduler.mark_class_ready(WorkClass::Cq);
+        self.probe_owners();
 
-        let class_budget = self.scheduler.ready_class_count().min(WORK_CLASS_COUNT);
+        let class_budget = self.scheduler.ready_count();
         for _ in 0..class_budget {
-            let Some(class) = self.scheduler.next_class() else {
+            let Some(class) = self.scheduler.next() else {
                 break;
             };
             let result = match class {
-                WorkClass::Terminal => match self.service_terminal() {
+                OwnerClass::Terminal => match self.service_terminal() {
                     Ok(true) => break,
                     Ok(false) => Ok(false),
                     Err(error) => Err(error),
                 },
-                WorkClass::Cm => self.service_cm(cx),
-                WorkClass::Cq => self.service_cq(cx),
-                WorkClass::Reclamation => self.service_reclamation(),
-                WorkClass::CompletionDispatch => Ok(self.service_completion_dispatch()),
+                OwnerClass::Io => self.service_io(cx),
+                OwnerClass::Session => self.service_session(cx),
             };
-            let progressed = match result {
-                Ok(progressed) => progressed,
-                Err(error) => return self.fail(error),
-            };
-            // CM progress can remove the final shutdown owner after the
-            // Terminal class already ran in this poll.
-            if progressed
-                && class == WorkClass::Cm
+            if let Err(error) = result {
+                return self.fail(error, cx);
+            }
+            // Either owner can remove the final shutdown blocker after the
+            // terminal class already ran in this poll.
+            if matches!(class, OwnerClass::Io | OwnerClass::Session)
                 && self
                     .shared
                     .shutdown_requested
@@ -544,7 +279,7 @@ impl Future for RdmaEngineDriver {
                 match self.service_terminal() {
                     Ok(true) => break,
                     Ok(false) => {}
-                    Err(error) => return self.fail(error),
+                    Err(error) => return self.fail(error, cx),
                 }
             }
             if self.shared.outcome().is_some() {
@@ -555,6 +290,11 @@ impl Future for RdmaEngineDriver {
         if let Some(outcome) = self.shared.outcome() {
             self.release_resources();
             return Poll::Ready(outcome.into_result());
+        }
+
+        if self.shared.pending_terminal_outcome().is_some() {
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
         }
 
         if self.poll_deadline_timer(cx) {
@@ -568,7 +308,7 @@ impl Future for RdmaEngineDriver {
                     .work_signal
                     .register_and_recheck(cx.waker(), observed_epoch);
                 self.mark_published_work(published);
-                if self.scheduler.ready_class_count() > 0 {
+                if self.scheduler.ready_count() > 0 {
                     cx.waker().wake_by_ref();
                 }
             }
@@ -588,28 +328,7 @@ impl Future for RdmaEngineDriver {
 
 impl Drop for RdmaEngineDriver {
     fn drop(&mut self) {
-        if self.shared.outcome().is_none() {
-            self.shared.mark_shutdown_requested();
-            self.shared.synchronously_prepare_driver_drop();
-            let outstanding = self.shared.io_core.accepted_count();
-            let cm_owners = self
-                .shared
-                .session
-                .retained_cm_owner_count()
-                .max(self.shared.session.live_connection_count());
-            let error = if outstanding == 0 && cm_owners == 0 {
-                Error::DriverShutdown
-            } else {
-                Error::EngineWedged {
-                    retained_bundles: self.shared.retained_bundle_count().max(1),
-                    outstanding_operations: outstanding,
-                    cq_debt: outstanding,
-                }
-            };
-            self.shared
-                .finish(MemoizedTerminalResult::from_error(error));
-            EngineShared::retain_after_failure(&self.shared);
-        }
+        self.shared.handle_driver_drop();
         self.release_resources();
     }
 }
@@ -642,7 +361,7 @@ pub(super) mod test_api {
     #[cfg(test)]
     use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
 
-    use super::{COMPLETION_DISPATCH_WORK, EngineShared, Error, Result, TERMINAL_WORK};
+    use super::{EngineShared, Error, IO_WORK, Result, TERMINAL_WORK};
     use crate::v2::engine::io_core::CqeReject;
     use crate::v2::engine::registry::{Lookup, OperationToken};
 
@@ -1771,7 +1490,10 @@ pub(super) mod test_api {
             Ok(())
         }
 
-        pub(super) fn suppress_connection_cqe(&self, completion: WorkCompletion) -> bool {
+        pub(in crate::v2::engine) fn suppress_connection_cqe(
+            &self,
+            completion: WorkCompletion,
+        ) -> bool {
             let mut guard = self
                 .connection_cqe_suppression
                 .lock()
@@ -1882,7 +1604,7 @@ pub(super) mod test_api {
             }
         }
 
-        pub(super) fn take_released_connection_cqe(&self) -> Option<WorkCompletion> {
+        pub(in crate::v2::engine) fn take_released_connection_cqe(&self) -> Option<WorkCompletion> {
             self.released_connection_cqes
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -2105,7 +1827,7 @@ pub(super) mod test_api {
             }
             routes.insert(qp_num, Arc::clone(&route));
             drop(routes);
-            shared.work_signal.publish(COMPLETION_DISPATCH_WORK);
+            shared.work_signal.publish(IO_WORK);
             Ok(TestRouteHandle {
                 shared: Arc::downgrade(shared),
                 route,
@@ -2113,7 +1835,7 @@ pub(super) mod test_api {
             })
         }
 
-        pub(super) fn dispatch(&self, completion: WorkCompletion) {
+        pub(in crate::v2::engine) fn dispatch(&self, completion: WorkCompletion) {
             let route = self
                 .routes
                 .lock()
@@ -2139,7 +1861,7 @@ pub(super) mod test_api {
             }
         }
 
-        pub(super) fn record_cq_arm(&self, generation: u64) -> bool {
+        pub(in crate::v2::engine) fn record_cq_arm(&self, generation: u64) -> bool {
             let previous = self.cq_arms.swap(generation, Ordering::AcqRel);
             debug_assert!(generation > previous, "CQ arm generations must increase");
             self.cq_arm_notify.notify_waiters();
@@ -2158,7 +1880,7 @@ pub(super) mod test_api {
             true
         }
 
-        pub(super) fn record_cq_pre_arm(&self, generation: u64) -> bool {
+        pub(in crate::v2::engine) fn record_cq_pre_arm(&self, generation: u64) -> bool {
             if !self.cq_pre_arm_controlled.swap(false, Ordering::AcqRel) {
                 return false;
             }
@@ -2380,8 +2102,6 @@ pub use test_api::{
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-    use std::rc::Rc;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{RawWaker, RawWakerVTable, Waker};
@@ -2438,6 +2158,110 @@ mod tests {
     }
 
     #[test]
+    fn earliest_owner_deadline_handles_equal_and_missing_values() {
+        let now = tokio::time::Instant::now();
+        let later = now + Duration::from_secs(1);
+
+        assert_eq!(earliest_deadline(Some(later), Some(now)), Some(now));
+        assert_eq!(earliest_deadline(Some(now), Some(now)), Some(now));
+        assert_eq!(earliest_deadline(Some(now), None), Some(now));
+        assert_eq!(earliest_deadline(None, Some(later)), Some(later));
+        assert_eq!(earliest_deadline(None, None), None);
+    }
+
+    #[test]
+    fn every_poll_probe_covers_both_owners_during_a_software_wake() {
+        let (_engine, mut driver) = test_engine_pair(CompletionMode::Polling);
+        driver.scheduler.mark_ready(OwnerClass::Terminal);
+
+        driver.probe_owners();
+        driver.probe_owners();
+
+        assert_eq!(driver.scheduler.ready_count(), 3);
+        assert_eq!(driver.scheduler.next(), Some(OwnerClass::Terminal));
+        assert_eq!(driver.scheduler.next(), Some(OwnerClass::Io));
+        assert_eq!(driver.scheduler.next(), Some(OwnerClass::Session));
+        drop(driver);
+    }
+
+    #[tokio::test]
+    async fn software_wakes_coalesced_with_either_owner_still_poll_both_once() {
+        let (engine, mut driver) = test_engine_pair(CompletionMode::Readiness);
+        let counter = CountingWaker::new();
+        let waker = counter.waker();
+        let mut cx = TaskContext::from_waker(&waker);
+
+        assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
+        let initial_io = driver.io_progress.turn_count();
+        let initial_session = driver.session_progress.turn_count();
+
+        engine.shared.work_signal.publish(TERMINAL_WORK | IO_WORK);
+        assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
+        assert_eq!(driver.io_progress.turn_count(), initial_io + 1);
+        assert_eq!(driver.session_progress.turn_count(), initial_session + 1);
+
+        engine
+            .shared
+            .work_signal
+            .publish(TERMINAL_WORK | SESSION_WORK);
+        assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
+        assert_eq!(driver.io_progress.turn_count(), initial_io + 2);
+        assert_eq!(driver.session_progress.turn_count(), initial_session + 2);
+        drop(driver);
+    }
+
+    #[test]
+    fn io_failure_cleanup_is_bounded_across_driver_polls() {
+        let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
+        let mut connections = Vec::new();
+        for qp_num in 1..=100 {
+            let poster = Arc::new(DrainInterleavingPoster {
+                qp_num,
+                destroys: AtomicUsize::new(0),
+            });
+            let connection = install_connection(
+                &engine.shared,
+                poster as Arc<dyn WorkRequestPoster>,
+                RdmaConnectionConfig::default(),
+                None,
+                None,
+            )
+            .unwrap();
+            install_accepted_operation_for_driver_test(
+                &engine.shared,
+                &connection.state,
+                crate::wc::WcOpcode::Send,
+            );
+            connections.push(connection);
+        }
+        let waker = Waker::noop();
+        let mut cx = TaskContext::from_waker(waker);
+
+        assert!(
+            driver
+                .fail(
+                    Error::InvalidConfig("bounded I/O terminalization".into()),
+                    &mut cx,
+                )
+                .is_pending()
+        );
+        assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
+        let first = engine.diagnostics().quarantined_operations;
+        assert!(first > 0 && first < 100);
+
+        let mut result = Poll::Pending;
+        for _ in 0..8 {
+            result = Pin::new(&mut driver).poll(&mut cx);
+            if result.is_ready() {
+                break;
+            }
+        }
+        assert!(matches!(result, Poll::Ready(Err(Error::InvalidConfig(_)))));
+        assert_eq!(engine.diagnostics().quarantined_operations, 100);
+        drop(connections);
+    }
+
+    #[test]
     fn wake_before_register_is_seen_by_recheck() {
         let signal = WorkSignal::new();
         signal.publish(TERMINAL_WORK);
@@ -2454,14 +2278,11 @@ mod tests {
         let observed = signal.epoch();
         std::thread::scope(|scope| {
             let signal = Arc::clone(&signal);
-            scope
-                .spawn(move || signal.publish(RECLAMATION_WORK))
-                .join()
-                .unwrap();
+            scope.spawn(move || signal.publish(IO_WORK)).join().unwrap();
         });
         let counter = CountingWaker::new();
         let pending = signal.register_and_recheck(&counter.waker(), observed);
-        assert_eq!(pending, RECLAMATION_WORK);
+        assert_eq!(pending, IO_WORK);
         assert_eq!(counter.count(), 1);
     }
 
@@ -2470,11 +2291,11 @@ mod tests {
         let signal = WorkSignal::new();
         assert_eq!(signal.take(), 0);
         let observed = signal.epoch();
-        signal.publish(COMPLETION_DISPATCH_WORK);
+        signal.publish(IO_WORK);
         let counter = CountingWaker::new();
         assert_eq!(
             signal.register_and_recheck(&counter.waker(), observed),
-            COMPLETION_DISPATCH_WORK
+            IO_WORK
         );
         assert_eq!(counter.count(), 1);
     }
@@ -2484,7 +2305,7 @@ mod tests {
         let signal = Arc::new(WorkSignal::new());
         std::thread::scope(|scope| {
             let mut producers = Vec::new();
-            for bit in [TERMINAL_WORK, RECLAMATION_WORK, COMPLETION_DISPATCH_WORK] {
+            for bit in [TERMINAL_WORK, IO_WORK, SESSION_WORK] {
                 let signal = Arc::clone(&signal);
                 producers.push(scope.spawn(move || {
                     for _ in 0..32 {
@@ -2496,10 +2317,7 @@ mod tests {
                 producer.join().unwrap();
             }
         });
-        assert_eq!(
-            signal.take(),
-            TERMINAL_WORK | RECLAMATION_WORK | COMPLETION_DISPATCH_WORK
-        );
+        assert_eq!(signal.take(), TERMINAL_WORK | IO_WORK | SESSION_WORK);
     }
 
     struct DrainInterleavingPoster {
@@ -2583,30 +2401,30 @@ mod tests {
                 engine.shared.test_driver.queue_released_connection_cqe(
                     completion_for_driver_test(operation, poster.qp_num, opcode, status),
                 );
-                assert!(driver.scheduler.deadlines().push(
-                    tokio::time::Instant::now(),
-                    DeadlineKind::ConnectionDrain,
+                engine.shared.session.schedule_deadline(
+                    &engine.shared.work_signal,
+                    super::super::scheduler::DeadlineKind::ConnectionDrain,
                     connection.state.token.encode(),
-                ));
-                driver.scheduler.mark_class_ready(WorkClass::Cq);
-                driver.scheduler.mark_class_ready(WorkClass::Reclamation);
+                    Duration::ZERO,
+                );
+                driver.scheduler.mark_ready(OwnerClass::Io);
+                driver.scheduler.mark_ready(OwnerClass::Session);
                 let waker = Waker::noop();
                 let mut cx = TaskContext::from_waker(waker);
 
-                assert_eq!(driver.scheduler.next_class(), Some(WorkClass::Cq));
-                assert!(driver.service_cq(&mut cx).unwrap());
-                assert_eq!(driver.scheduler.next_class(), Some(WorkClass::Reclamation));
-                assert!(driver.service_reclamation().unwrap());
-                assert_eq!(
-                    driver.scheduler.next_class(),
-                    Some(WorkClass::CompletionDispatch)
-                );
-                assert!(driver.service_completion_dispatch());
+                assert_eq!(driver.scheduler.next(), Some(OwnerClass::Io));
+                assert!(driver.service_io(&mut cx).unwrap());
+                assert_eq!(driver.scheduler.next(), Some(OwnerClass::Session));
+                assert!(driver.service_session(&mut cx).unwrap());
 
                 let diagnostics = engine.diagnostics();
                 assert_eq!(diagnostics.accepted_operations, 0);
                 assert_eq!(diagnostics.registered_operations, 0);
-                assert_eq!(poster.destroys.load(Ordering::Acquire), 0);
+                assert_eq!(
+                    poster.destroys.load(Ordering::Acquire),
+                    1,
+                    "exact completion permits normal session-owned retirement without fallback"
+                );
 
                 engine.shared.finish(MemoizedTerminalResult::success());
                 drop(driver);
@@ -2615,86 +2433,26 @@ mod tests {
     }
 
     #[test]
-    fn cm_event_arriving_during_clear_is_drained_after_reregister() {
-        #[derive(Default)]
-        struct FakeReadiness {
-            ready: bool,
-            event_available: bool,
-            polls: usize,
-            clears: usize,
-        }
-
-        let state = Rc::new(RefCell::new(FakeReadiness {
-            ready: true,
-            ..FakeReadiness::default()
-        }));
-        let waker = Waker::noop();
-        let mut cx = TaskContext::from_waker(waker);
-        let result = poll_readiness_events(
-            &mut cx,
-            8,
-            {
-                let state = Rc::clone(&state);
-                move |_| {
-                    let mut state = state.borrow_mut();
-                    state.polls += 1;
-                    if state.ready {
-                        Poll::Ready(Ok(()))
-                    } else {
-                        Poll::Pending
-                    }
-                }
-            },
-            {
-                let state = Rc::clone(&state);
-                move |_| {
-                    let mut state = state.borrow_mut();
-                    state.clears += 1;
-                    if state.clears == 1 {
-                        // Exact regression: a new event edge appears after the
-                        // empty read but while the stale readiness is cleared.
-                        state.event_available = true;
-                        state.ready = true;
-                    } else {
-                        state.ready = false;
-                    }
-                }
-            },
-            {
-                let state = Rc::clone(&state);
-                move || {
-                    let mut state = state.borrow_mut();
-                    if state.event_available {
-                        state.event_available = false;
-                        Ok(true)
-                    } else {
-                        Ok(false)
-                    }
-                }
-            },
-        );
-
-        assert!(matches!(result, Poll::Ready(Ok(1))));
-        let state = state.borrow();
-        assert_eq!(
-            state.polls, 3,
-            "clear must be followed by a readiness re-poll"
-        );
-        assert_eq!(state.clears, 2);
-        assert!(!state.event_available);
-    }
-
-    #[test]
     fn driver_poll_outside_tokio_returns_contextual_error_without_panicking() {
         let (_engine, mut driver) = test_engine_pair(CompletionMode::Polling);
         let counter = CountingWaker::new();
         let waker = counter.waker();
         let mut cx = TaskContext::from_waker(&waker);
-        assert!(matches!(
-            Pin::new(&mut driver).poll(&mut cx),
-            Poll::Ready(Err(Error::InvalidConfig(_)))
-        ));
-        assert_eq!(counter.count(), 0);
+        let mut terminal = None;
+        for _ in 0..4 {
+            match Pin::new(&mut driver).poll(&mut cx) {
+                Poll::Ready(result) => {
+                    terminal = Some(result);
+                    break;
+                }
+                Poll::Pending => {}
+            }
+        }
+        assert!(matches!(terminal, Some(Err(Error::InvalidConfig(_)))));
+        assert!(
+            counter.count() > 0,
+            "bounded terminal cleanup must schedule its next turn"
+        );
     }
 
     #[cfg(panic = "unwind")]
@@ -2730,11 +2488,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn deadline_timer_wakes_driver_and_processes_due_work() {
         let (_engine, mut driver) = test_engine_pair(CompletionMode::Readiness);
-        assert!(driver.scheduler.deadlines().push(
+        driver.io_progress.schedule_deadline_for_test(
             tokio::time::Instant::now() + Duration::from_secs(5),
-            DeadlineKind::Reclamation,
-            7,
-        ));
+            super::super::registry::OperationToken::decode(7),
+        );
         let counter = CountingWaker::new();
         let waker = counter.waker();
         let mut cx = TaskContext::from_waker(&waker);
@@ -2756,7 +2513,7 @@ mod tests {
         let mut cx = TaskContext::from_waker(&waker);
         assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
         assert_eq!(counter.count(), 0);
-        assert_eq!(driver.scheduler.completion_connection_count(), 0);
+        assert_eq!(driver.io_progress.completion_connection_count(), 0);
     }
 
     #[tokio::test]
@@ -2775,7 +2532,7 @@ mod tests {
             let mut cx = TaskContext::from_waker(&waker);
 
             assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
-            assert_eq!(driver.scheduler.completion_connection_count(), 0);
+            assert_eq!(driver.io_progress.completion_connection_count(), 0);
             assert!(!shared.has_published_completions());
 
             drop(connections);
@@ -2869,13 +2626,25 @@ mod tests {
         let counter = CountingWaker::new();
         let waker = counter.waker();
         let mut cx = TaskContext::from_waker(&waker);
+        let driver_waker = Waker::noop();
+        let mut driver_cx = TaskContext::from_waker(driver_waker);
         let mut close = Box::pin(listener.close());
 
         assert!(close.as_mut().poll(&mut cx).is_pending());
-        let Poll::Ready(Err(driver_error)) = driver.fail(Error::InvalidConfig(
-            "injected driver progress failure".into(),
-        )) else {
-            panic!("injected driver failure did not terminate the driver");
+        assert!(
+            driver
+                .fail(
+                    Error::InvalidConfig("injected driver progress failure".into()),
+                    &mut driver_cx,
+                )
+                .is_pending()
+        );
+        let driver_error = loop {
+            match Pin::new(&mut driver).poll(&mut driver_cx) {
+                Poll::Ready(Err(error)) => break error,
+                Poll::Ready(Ok(())) => panic!("injected failure completed successfully"),
+                Poll::Pending => {}
+            }
         };
         let terminal = engine
             .diagnostics()

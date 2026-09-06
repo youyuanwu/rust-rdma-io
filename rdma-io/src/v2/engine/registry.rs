@@ -44,13 +44,6 @@ impl LiveIoConnectionProof {
 }
 
 impl ConnectionToken {
-    pub(super) const fn completion_ready(self) -> super::scheduler::CompletionReadyConnection {
-        super::scheduler::CompletionReadyConnection {
-            slot: self.slot,
-            generation: self.generation,
-        }
-    }
-
     pub(super) const fn encode(self) -> u64 {
         ((self.generation as u64) << 32) | self.slot as u64
     }
@@ -333,6 +326,26 @@ impl<K: RegistryToken, T> PagedRegistry<K, T> {
                 SlotState::Vacant | SlotState::Retired => None,
             })
             .collect()
+    }
+
+    pub(super) fn scan_occupied_cloned(
+        &self,
+        start: usize,
+        budget: usize,
+    ) -> (Vec<T>, usize, bool, usize)
+    where
+        T: Clone,
+    {
+        let inner = lock_unpoison(&self.inner);
+        let end = (start.saturating_add(budget)).min(inner.next_unused as usize);
+        let values = (start..end)
+            .filter_map(|slot| self.slot_ref(&inner, slot as u32))
+            .filter_map(|entry| match &entry.state {
+                SlotState::Occupied(value) => Some(value.clone()),
+                SlotState::Vacant | SlotState::Retired => None,
+            })
+            .collect();
+        (values, end, end >= inner.next_unused as usize, end - start)
     }
 
     #[cfg(test)]

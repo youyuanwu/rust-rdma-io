@@ -10,6 +10,7 @@ pub(crate) const DEFAULT_MAX_LIVE_CONNECTIONS: usize = 256;
 pub(crate) const DEFAULT_MAX_INFLIGHT_OPERATIONS: usize = 16_384;
 pub(crate) const DEFAULT_CQ_CAPACITY: usize = 16_384;
 pub(crate) const DEFAULT_WORK_BUDGET: usize = 32;
+pub(crate) const DEFAULT_RECLAMATION_BUDGET: usize = DEFAULT_WORK_BUDGET / 2;
 pub(crate) const DEFAULT_MISSING_CQE_DEADLINE: Duration = Duration::from_secs(30);
 pub(crate) const DEFAULT_CONNECTION_DRAIN_DEADLINE: Duration = Duration::from_secs(5);
 pub(crate) const DEFAULT_ENGINE_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(30);
@@ -189,7 +190,8 @@ pub(crate) struct EngineConfig {
     pub(crate) cq_capacity: usize,
     pub(crate) cq_completion_budget: usize,
     pub(crate) cm_event_budget: usize,
-    pub(crate) reclamation_budget: usize,
+    pub(crate) io_reclamation_budget: usize,
+    pub(crate) session_reclamation_budget: usize,
     pub(crate) completion_dispatch_budget: usize,
     pub(crate) missing_cqe_deadline: Duration,
     pub(crate) connection_drain_deadline: Duration,
@@ -206,7 +208,8 @@ impl EngineConfig {
             cq_capacity: DEFAULT_CQ_CAPACITY,
             cq_completion_budget: DEFAULT_WORK_BUDGET,
             cm_event_budget: DEFAULT_WORK_BUDGET,
-            reclamation_budget: DEFAULT_WORK_BUDGET,
+            io_reclamation_budget: DEFAULT_RECLAMATION_BUDGET,
+            session_reclamation_budget: DEFAULT_RECLAMATION_BUDGET,
             completion_dispatch_budget: DEFAULT_WORK_BUDGET,
             missing_cqe_deadline: DEFAULT_MISSING_CQE_DEADLINE,
             connection_drain_deadline: DEFAULT_CONNECTION_DRAIN_DEADLINE,
@@ -239,8 +242,14 @@ impl EngineConfig {
         )?;
         validate_range("CM event budget", self.cm_event_budget, 1, MAX_WORK_BUDGET)?;
         validate_range(
-            "reclamation budget",
-            self.reclamation_budget,
+            "I/O reclamation budget",
+            self.io_reclamation_budget,
+            1,
+            MAX_WORK_BUDGET,
+        )?;
+        validate_range(
+            "session reclamation budget",
+            self.session_reclamation_budget,
             1,
             MAX_WORK_BUDGET,
         )?;
@@ -460,6 +469,8 @@ mod tests {
         assert_eq!(19 + 34, 53);
         assert_eq!(256 * 53, 13_568);
         assert_eq!(16_384 - 13_568, 2_816);
+        assert_eq!(config.io_reclamation_budget, 16);
+        assert_eq!(config.session_reclamation_budget, 16);
     }
 
     #[test]
@@ -499,7 +510,8 @@ mod tests {
         minimum.cq_capacity = 2;
         minimum.cq_completion_budget = 1;
         minimum.cm_event_budget = 1;
-        minimum.reclamation_budget = 1;
+        minimum.io_reclamation_budget = 1;
+        minimum.session_reclamation_budget = 1;
         minimum.completion_dispatch_budget = 1;
         minimum.validate_without_provider().unwrap();
 
@@ -509,13 +521,15 @@ mod tests {
         maximum.cq_capacity = 16_777_216;
         maximum.cq_completion_budget = 4_096;
         maximum.cm_event_budget = 4_096;
-        maximum.reclamation_budget = 4_096;
+        maximum.io_reclamation_budget = 4_096;
+        maximum.session_reclamation_budget = 4_096;
         maximum.completion_dispatch_budget = 4_096;
         maximum.validate_without_provider().unwrap();
 
         for mutate in [
             |config: &mut EngineConfig| config.cm_event_budget = 0,
-            |config: &mut EngineConfig| config.reclamation_budget = 0,
+            |config: &mut EngineConfig| config.io_reclamation_budget = 0,
+            |config: &mut EngineConfig| config.session_reclamation_budget = 0,
             |config: &mut EngineConfig| config.completion_dispatch_budget = 0,
         ] {
             let mut config = EngineConfig::new("rxe0".into());

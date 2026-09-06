@@ -154,30 +154,55 @@ HELLO reuses a control receive; there is no additional receive.
 
 ## ADR: Crate-Private I/O and Session Ownership Boundaries
 
-**Status:** accepted. The protocol/I/O seam, low-level `IoCore`,
-`SessionManager` ownership boundary, and physical session-module hierarchy are
-implemented. Broader protocol cleanup and final issue #43 cleanup remain
-deferred.
+**Status:** implemented. The protocol/I/O seam, low-level `IoCore`,
+`SessionManager` boundary, owner-local progress components, and thin engine
+scheduler complete the issue #43 architecture.
 
-The architecture has three ownership layers:
+The runtime has five distinct roles:
 
 1. **I/O core:** submission admission, provider posting, operation identity,
-   exact CQE validation, accepted-set accounting, completion ownership, and
-   operation-level quarantine.
+   CQ resource/readiness polling, exact CQE validation, accepted-set
+   accounting, completion scheduling, I/O deadlines, completion ownership,
+   and operation-level quarantine.
 2. **Session manager:** connect/listen/accept state, CM routes, connection and
-   QP/CmId ownership, drain/disconnect/retirement, lifecycle authority, and
-   connection-level quarantine.
-3. **Protocol:** HELLO, DATA, CREDIT, pools, receive reposting, message
+   QP/CmId ownership, CM resource/readiness polling, drain/disconnect/
+   retirement, lifecycle deadlines, lifecycle authority, shutdown
+   coordination, and connection-level quarantine.
+3. **Engine composition root:** global lifecycle and terminal-outcome
+   composition across I/O and session readiness.
+4. **Engine scheduler:** fair rotation over opaque I/O, session, and terminal
+   turns, global software-work register/recheck, earliest-deadline arming, and
+   cooperative polling-mode yielding.
+5. **Protocol:** HELLO, DATA, CREDIT, pools, receive reposting, message
    fairness, and frontend outcomes.
 
 `EngineShared` is the composition root. It directly retains the device-scoped
 resources, engine lifecycle, work signal, `Arc<IoCore>`, and
 `Arc<SessionManager>`. Session collections and quarantine maps are fields of
-`SessionManager`, not parallel fields on the root. The one
-`RdmaEngineDriver` preserves the existing rotating work classes and budgets:
-it polls the shared CQ through `IoCore` and invokes bounded CM, deadline,
-completion-dispatch, retirement, and shutdown services through
-`SessionManager`. Neither component creates a task or thread.
+`SessionManager`, not parallel fields on the root. `IoProgress` owns CQ
+readiness, the CQ buffer, completion-ready rotation, operation deadlines, and
+bounded I/O terminalization. `SessionProgress` owns CM readiness, fair CM
+source selection, connection/lifecycle deadlines, bounded shutdown scans,
+final CM draining, and bounded session terminalization. The one
+`RdmaEngineDriver` sees none of those state machines; it only polls and
+requeues the three owner classes. No component creates a task or thread.
+
+Each owner turn returns a private progress report containing six pieces of
+scheduler information: units consumed, whether immediate work remains, the
+owner's earliest deadline, readiness registration/recheck status, terminal or
+failure status, and confirmation that detached effects have been published
+after protected guards were released. Reports contain no operation,
+connection, listener, route, registry, queue, teardown, or deadline-kind
+identity.
+
+Every driver poll probe-enqueues the I/O and session owners once because an
+`AsyncFd` wake does not identify its source. Software pending bits additionally
+identify the owning class. A ready-at-entry pass visits each deduplicated owner
+at most once; remaining work is appended for a later poll. In readiness mode
+an idle owner registers and rechecks its fd without requesting another poll.
+In polling mode the driver yields cooperatively. The one driver timer is armed
+to the minimum deadline reported by the two owners; equal deadlines are
+serviced by fair owner rotation rather than cross-layer insertion order.
 
 The source hierarchy mirrors that ownership. `engine/session/mod.rs` defines
 the manager and its lifecycle capabilities, while `session/cm.rs`,
@@ -238,8 +263,9 @@ admission, and unresolved operations when no positive release boundary can be
 proven. Protocol code can request close but cannot transition, release, prove,
 or quarantine provider-visible ownership.
 
-These boundaries are crate-private and deliberately unstable; public v2 and v1
-APIs are unchanged. AST guards reject hidden work, production `IoCore`
+These boundaries are crate-private and deliberately unstable. V1 APIs are
+unchanged; v2 replaces the aggregate reclamation-budget control with separate
+I/O and session controls. AST guards reject hidden work, production `IoCore`
 dependencies on root/session/connection/CM/listener/protocol types, strong
 session-resource retention by frontends and waiters, lifecycle operations
 without the private authority, public re-exports of internal capabilities, and
@@ -247,7 +273,7 @@ obsolete top-level session-module paths.
 
 ## Completion-to-Message Handoff
 
-The engine driver remains the only hardware-CQ poller; `IoCore` is the only
+The I/O progress owner is the only hardware-CQ poller; `IoCore` is the only
 component allowed to validate and consume operation CQEs. A completion must
 match the current operation generation, session-proven connection generation,
 owning connection, provider-reported `qp_num`, and expected opcode where the
@@ -375,7 +401,8 @@ unresolved bundles are intentionally retained until process exit.
 | Shared CQ capacity | 16,384 | 2–16,777,216 |
 | CQ completion budget | 32 | 1–4,096 |
 | CM event budget | 32 | 1–4,096 |
-| Reclamation budget | 32 | 1–4,096 |
+| I/O reclamation budget | 16 | 1–4,096 |
+| Session reclamation budget | 16 | 1–4,096 |
 | Completion-dispatch budget | 32 | 1–4,096 |
 | Missing-CQE deadline | 30 s | 1 s–24 h |
 | Connection drain deadline | 5 s | 1 ms–5 min |
@@ -384,6 +411,13 @@ unresolved bundles are intentionally retained until process exit.
 Maximum in-flight operations cannot exceed CQ capacity. Device limits such as
 `max_qp`, `max_qp_wr`, `max_sge`, `max_cqe`, and RDMA atomic depths are checked
 without clamping.
+
+The owner-local reclamation controls replace the former aggregate
+`reclamation_budget`. To preserve an old aggregate value, divide it between
+`io_reclamation_budget` and `session_reclamation_budget`; either owner may
+receive the extra unit for odd values. The old aggregate value `1` has no exact
+equivalent because both owners require a nonzero turn, so the minimum
+replacement is `(1, 1)`. No compatibility alias is provided.
 
 ### Message defaults
 
