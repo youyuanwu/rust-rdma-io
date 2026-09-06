@@ -456,6 +456,11 @@ impl ConnectionState {
         lock_unpoison(&self.lifecycle_gate)
     }
 
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn lifecycle_unlocked_for_test(&self) -> bool {
+        self.lifecycle_gate.try_lock().is_ok()
+    }
+
     pub(in crate::v2::engine) fn finalize_engine(
         &self,
         authority: &SessionLifecycleAuthority,

@@ -85,6 +85,11 @@ impl WorkSignal {
         }
         pending
     }
+
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn register_waker_for_test(&self, waker: &std::task::Waker) {
+        self.waker.register(waker);
+    }
 }
 
 impl RdmaEngineDriver {

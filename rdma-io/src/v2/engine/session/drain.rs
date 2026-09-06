@@ -18,6 +18,7 @@ impl SessionManager {
         let lifecycle = connection.lock_lifecycle();
         let first = connection.begin_close();
         let mut close_effects = None;
+        let mut publish_io_work = false;
         if first {
             match self.transition_connection_to_error(connection) {
                 Ok(_) => {}
@@ -33,7 +34,7 @@ impl SessionManager {
                     return;
                 }
             }
-            self.publish_io_work();
+            publish_io_work = true;
 
             let engine_is_terminating = self.shutdown_requested();
             if !engine_is_terminating {
@@ -47,6 +48,9 @@ impl SessionManager {
         }
         drop(lifecycle);
         drop(admission);
+        if publish_io_work {
+            self.publish_io_work();
+        }
         if let Some(effects) = close_effects {
             effects.publish();
         }
@@ -201,6 +205,7 @@ mod tests {
     use crate::v2::error::{Error, Result};
     use crate::v2::qp::{BatchPostOutcome, QpCapabilities};
     use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
+    use futures_util::task::{ArcWake, waker};
 
     struct TestPoster {
         qp_num: u32,
@@ -338,6 +343,63 @@ mod tests {
         let waker = futures_util::task::noop_waker();
         let mut context = Context::from_waker(&waker);
         future.poll(&mut context)
+    }
+
+    #[test]
+    fn connection_close_wakes_driver_after_admission_and_lifecycle_guards_drop() {
+        struct ReentrantWaker {
+            session: Arc<super::super::SessionManager>,
+            connection: Arc<super::super::connection::ConnectionState>,
+            wakes: AtomicUsize,
+            lock_failures: AtomicUsize,
+        }
+
+        impl ArcWake for ReentrantWaker {
+            fn wake_by_ref(arc_self: &Arc<Self>) {
+                arc_self.wakes.fetch_add(1, Ordering::AcqRel);
+                let admission_unlocked = arc_self.session.admission.try_write().is_ok();
+                let lifecycle_unlocked = arc_self.connection.lifecycle_unlocked_for_test();
+                if !(admission_unlocked && lifecycle_unlocked) {
+                    arc_self.lock_failures.fetch_add(1, Ordering::AcqRel);
+                }
+            }
+        }
+
+        let (engine, _driver) = test_engine_pair(CompletionMode::Readiness);
+        let connection = install_connection(
+            &engine.shared.session,
+            TestPoster::new(20),
+            RdmaConnectionConfig::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let reentrant = Arc::new(ReentrantWaker {
+            session: Arc::clone(&engine.shared.session),
+            connection: Arc::clone(&connection.state),
+            wakes: AtomicUsize::new(0),
+            lock_failures: AtomicUsize::new(0),
+        });
+        let task_waker = waker(Arc::clone(&reentrant));
+        engine
+            .shared
+            .work_signal
+            .register_waker_for_test(&task_waker);
+
+        engine
+            .shared
+            .session
+            .begin_connection_close(&connection.state);
+
+        assert!(
+            reentrant.wakes.load(Ordering::Acquire) >= 1,
+            "connection close must publish I/O work to the registered driver waker"
+        );
+        assert_eq!(
+            reentrant.lock_failures.load(Ordering::Acquire),
+            0,
+            "connection-close publication must run after admission and lifecycle guards drop"
+        );
     }
 
     fn install_accepted_connection(
