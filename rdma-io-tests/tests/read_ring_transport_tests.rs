@@ -406,6 +406,70 @@ async fn read_ring_doorbell_blocked_posts_read_heartbeat() {
     println!("read_ring_doorbell_blocked_posts_read_heartbeat passed!");
 }
 
+/// A wrapped send that has room for its data but not for padding + data must
+/// leave an RDMA-Read head refresh in flight.
+///
+/// This is a distinct backpressure branch from the ordinary byte-full and
+/// doorbell-full paths. Without the Read, the stream parks on an empty send CQ
+/// after all earlier sends have completed, so a later peer head advance cannot
+/// wake it.
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn read_ring_padding_blocked_posts_read_heartbeat() {
+    require_no_iwarp!();
+
+    let config = ReadRingConfig {
+        ring_capacity: 4096,
+        max_message_size: 1500,
+        max_in_flight: Some(8),
+        min_free_threshold: 128,
+        ..ReadRingConfig::default()
+    };
+    let (mut server, mut client) = ring_connected_pair(config).await;
+    let data = vec![0xA5; 1500];
+
+    assert_eq!(client.send_copy(&data).unwrap(), data.len());
+    assert_eq!(client.send_copy(&data).unwrap(), data.len());
+
+    // Reap both writes and the proactive head refresh while the peer head is
+    // still zero, leaving no send-CQ wakeup source.
+    let idle = async {
+        while client.sends_in_flight() > 0 || client.read_in_flight() {
+            poll_fn(|cx| client.poll_send_completion(cx)).await.unwrap();
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), idle)
+        .await
+        .expect("initial sends did not become idle");
+
+    // Advance the remote head by one message, but leave the second message
+    // outstanding. The sender first refreshes its cached head through the
+    // ordinary byte-full branch.
+    let first = recv_one(&mut server).await;
+    let second = recv_one(&mut server).await;
+    server.repost_recv(first.buf_idx).unwrap();
+    assert_eq!(client.send_copy(&data).unwrap(), 0);
+    assert!(
+        client.read_in_flight(),
+        "ordinary head refresh was not posted"
+    );
+    poll_fn(|cx| client.poll_send_completion(cx)).await.unwrap();
+    assert!(
+        !client.read_in_flight(),
+        "ordinary head refresh did not complete"
+    );
+
+    // Local reservation now wraps (1096 bytes of padding). The refreshed
+    // remote free space fits 1500 bytes plus threshold, but not padding + data
+    // plus threshold, selecting the padding-blocked rollback branch.
+    assert_eq!(client.send_copy(&data).unwrap(), 0);
+    assert!(
+        client.read_in_flight(),
+        "padding-blocked send must retain a CQ wakeup source"
+    );
+
+    server.repost_recv(second.buf_idx).unwrap();
+}
+
 /// Regression test for the send-CQ ownership invariant.
 ///
 /// `poll_send_completion` (driven by the `CqPollState` drain-after-arm state

@@ -1439,6 +1439,16 @@ impl Transport for ReadRingInner {
                 } else {
                     local_offset
                 };
+                // This is remote-byte backpressure just like the earlier
+                // `free < data_len + min_free_threshold` branch. No data WR is
+                // posted here, so once prior send completions have been reaped
+                // there is otherwise no CQ event that can wake the blocked
+                // writer after the peer advances its head. Keep one offset Read
+                // in flight so `poll_send_completion` refreshes the cached head
+                // and retries the wrapped send.
+                if !self.read_in_flight {
+                    self.post_offset_read()?;
+                }
                 return Ok(0);
             }
             let pad_remote_offset = self.remote_write_tail;
