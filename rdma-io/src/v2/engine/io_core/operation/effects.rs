@@ -8,6 +8,12 @@ use crate::v2::engine::session::IoEffectsCommitAuthority;
 
 use super::state::OperationState;
 
+/// Detached work that must run after the producing engine guards are dropped.
+///
+/// This is the single publication primitive for the operation subtree: every
+/// effect state below delegates to [`AfterEngineUnlock::publish`], so events
+/// are always delivered before operation wakers are woken. Both payload
+/// vectors stay private so no caller can reorder or replay them.
 #[derive(Default)]
 pub(super) struct AfterEngineUnlock {
     events: Vec<PendingIoEvent>,
@@ -36,6 +42,10 @@ impl AfterEngineUnlock {
             .append(&mut other.operations_to_wake);
     }
 
+    /// Deliver every event, then wake every operation.
+    ///
+    /// Consuming `self` keeps publication single-shot, and the fixed order
+    /// guarantees a woken future observes its completion event.
     pub(super) fn publish(self) {
         for event in self.events {
             event.deliver();
@@ -96,6 +106,10 @@ impl CommittedIoCoreEffects {
 }
 
 impl DetachedIoCoreEffects {
+    /// Wrap detached work produced by an I/O path that has no session effects.
+    ///
+    /// Construction stays inside the operation subtree so this bypass of the
+    /// session commit boundary cannot be reached by an engine sibling.
     pub(super) fn new(after_unlock: AfterEngineUnlock) -> Self {
         Self { after_unlock }
     }
@@ -136,6 +150,12 @@ impl IoCoreEffects {
         std::mem::take(&mut self.drained)
     }
 
+    /// Consume the bundle for direct operation-owned publication.
+    ///
+    /// Only I/O paths that provably produce no session-facing effect may use
+    /// this; the assertions fail closed if quarantine or accepted-zero work
+    /// would otherwise be dropped. Session-facing bundles must instead go
+    /// through [`IoCoreEffects::into_committed`].
     pub(super) fn into_after_unlock(self) -> AfterEngineUnlock {
         assert!(
             self.quarantine.is_empty(),
@@ -148,6 +168,12 @@ impl IoCoreEffects {
         self.after_unlock
     }
 
+    /// Convert to the publishable state once the session owner has applied all
+    /// session-facing effects.
+    ///
+    /// The authority reference is a type-only proof that the caller is the
+    /// session owner, and taking `self` by value prevents the original bundle
+    /// from being republished or re-committed.
     pub(in crate::v2::engine) fn into_committed(
         self,
         _authority: &IoEffectsCommitAuthority,
