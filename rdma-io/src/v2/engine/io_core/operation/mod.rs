@@ -3,7 +3,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, RwLockReadGuard, Weak};
 use std::task::{Context, Poll};
 
 use futures_util::task::AtomicWaker;
@@ -1392,9 +1392,7 @@ fn start_operation(
             shared.publish_cq_recheck();
             if let Some(completion) = early {
                 let after_unlock = shared.finish_early_completion(Arc::clone(&state), completion);
-                drop(posting);
-                drop(admission);
-                after_unlock.publish();
+                publish_after_post_guards(posting, admission, after_unlock);
             }
             StartResult::InFlight(state)
         }
@@ -1422,9 +1420,7 @@ fn start_operation(
                 if let Some(completion) = early {
                     let after_unlock =
                         shared.finish_early_completion(Arc::clone(&state), completion);
-                    drop(posting);
-                    drop(admission);
-                    after_unlock.publish();
+                    publish_after_post_guards(posting, admission, after_unlock);
                 }
                 StartResult::InFlight(state)
             }
@@ -1436,9 +1432,7 @@ fn start_operation(
             shared.publish_cq_recheck();
             if let Some(completion) = early {
                 let after_unlock = shared.finish_early_completion(Arc::clone(&state), completion);
-                drop(posting);
-                drop(admission);
-                after_unlock.publish();
+                publish_after_post_guards(posting, admission, after_unlock);
                 StartResult::InFlight(state)
             } else {
                 state.detach_with_post_error(shared);
@@ -1447,6 +1441,16 @@ fn start_operation(
             }
         }
     }
+}
+
+fn publish_after_post_guards(
+    posting: RwLockReadGuard<'_, ()>,
+    admission: RwLockReadGuard<'_, ()>,
+    after_unlock: AfterEngineUnlock,
+) {
+    drop(posting);
+    drop(admission);
+    after_unlock.publish();
 }
 
 struct ValidatedOperation {

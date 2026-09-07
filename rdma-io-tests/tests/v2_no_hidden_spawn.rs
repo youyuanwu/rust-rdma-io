@@ -1289,6 +1289,64 @@ fn find_production_lifecycle_calls(
     Ok(visitor.violations)
 }
 
+struct ZeroArgumentMethodCallVisitor<'a> {
+    method: &'a str,
+    calls: Vec<String>,
+    functions: Vec<String>,
+}
+
+impl Visit<'_> for ZeroArgumentMethodCallVisitor<'_> {
+    fn visit_expr_method_call(&mut self, call: &ExprMethodCall) {
+        if call.method == self.method && call.args.is_empty() {
+            self.calls.push(format!(
+                "{}:{}",
+                self.functions.last().map_or("<module>", String::as_str),
+                call.span().start().line
+            ));
+        }
+        visit::visit_expr_method_call(self, call);
+    }
+
+    fn visit_item_fn(&mut self, function: &syn::ItemFn) {
+        if is_test_only(&function.attrs) {
+            return;
+        }
+        self.functions.push(function.sig.ident.to_string());
+        visit::visit_item_fn(self, function);
+        self.functions.pop();
+    }
+
+    fn visit_impl_item_fn(&mut self, function: &syn::ImplItemFn) {
+        if is_test_only(&function.attrs) {
+            return;
+        }
+        self.functions.push(function.sig.ident.to_string());
+        visit::visit_impl_item_fn(self, function);
+        self.functions.pop();
+    }
+
+    fn visit_item_mod(&mut self, module: &syn::ItemMod) {
+        if is_test_only(&module.attrs) {
+            return;
+        }
+        visit::visit_item_mod(self, module);
+    }
+}
+
+fn find_production_zero_argument_method_calls(
+    source: &str,
+    method: &str,
+) -> Result<Vec<String>, syn::Error> {
+    let syntax = syn::parse_file(source)?;
+    let mut visitor = ZeroArgumentMethodCallVisitor {
+        method,
+        calls: Vec::new(),
+        functions: Vec::new(),
+    };
+    visitor.visit_file(&syntax);
+    Ok(visitor.calls)
+}
+
 fn find_strong_owner_fields(
     source: &str,
     struct_name: &str,
@@ -2197,6 +2255,15 @@ fn io_effect_publication_detector_rejects_unchecked_routes() {
             .iter()
             .any(|violation| violation.contains("nested::IoCoreEffects::bypass")),
         "a publication bypass in a nested child module must be rejected"
+    );
+    assert_eq!(
+        find_production_zero_argument_method_calls(
+            "mod nested { fn bypass(value: CommittedIoCoreEffects) { value.publish(); } }",
+            "publish",
+        )
+        .unwrap(),
+        ["bypass:1"],
+        "nested committed/detached publication calls must be visible to the route allowlist"
     );
 
     let additional_inherent_method = r#"
@@ -3643,6 +3710,7 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     let mut unchecked_io_effect_publications = Vec::new();
     let mut quarantine_consumer_paths = Vec::new();
     let mut drained_consumer_paths = Vec::new();
+    let mut zero_argument_publish_calls = BTreeMap::<(PathBuf, String), usize>::new();
     for path in collect_rs_files(&engine_dir).expect("enumerate I/O effect publication paths") {
         let source = fs::read_to_string(&path).expect("read engine source");
         if source_is_test_only(&source)
@@ -3695,6 +3763,17 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
                 .into_iter()
                 .map(|call| (path.clone(), call)),
         );
+        for call in find_production_zero_argument_method_calls(&source, "publish")
+            .unwrap_or_else(|error| panic!("parse {} publish calls: {error}", path.display()))
+        {
+            let function = call
+                .split_once(':')
+                .map_or(call.as_str(), |(function, _)| function)
+                .to_owned();
+            *zero_argument_publish_calls
+                .entry((path.clone(), function))
+                .or_default() += 1;
+        }
     }
     assert_eq!(
         io_effects_definition_paths.as_slice(),
@@ -3724,6 +3803,36 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         unchecked_io_effect_publications.is_empty(),
         "IoCoreEffects has an alternate unchecked publication route: {}",
         unchecked_io_effect_publications.join(", ")
+    );
+    assert_eq!(
+        zero_argument_publish_calls,
+        BTreeMap::from([
+            ((engine_mod_path.clone(), "finish".to_owned()), 1),
+            (
+                (io_core_operation_path.clone(), "post_io_batch".to_owned(),),
+                14,
+            ),
+            (
+                (
+                    io_core_operation_path.clone(),
+                    "publish_after_post_guards".to_owned(),
+                ),
+                1,
+            ),
+            ((io_core_operation_path.clone(), "publish".to_owned()), 2),
+            ((session_path.clone(), "commit_io_effects".to_owned(),), 1,),
+            ((drain_path.clone(), "begin_connection_close".to_owned()), 1),
+        ]),
+        "every source-visible zero-argument publish route must remain explicitly classified"
+    );
+    assert_eq!(
+        find_production_lifecycle_calls(&io_core_operation_source, &["publish_after_post_guards"],)
+            .expect("find scalar post-guard publication calls")
+            .into_iter()
+            .filter(|call| call.split(':').nth(1) == Some("start_operation"))
+            .count(),
+        3,
+        "all scalar early-completion branches must publish through the guard-consuming helper"
     );
     assert_eq!(
         after_unlock_accesses,

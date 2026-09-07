@@ -1403,6 +1403,55 @@ fn io_early_completion_event_is_published_after_post_guards_are_released() {
 }
 
 #[test]
+fn scalar_early_publication_helper_releases_post_guards_without_a_provider() {
+    use std::task::{Wake, Waker};
+
+    struct PostGuardCheckingWake {
+        admission: Arc<RwLock<()>>,
+        connection: Arc<ConnectionState>,
+        observed: AtomicBool,
+    }
+
+    impl Wake for PostGuardCheckingWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            assert!(self.admission.try_write().is_ok());
+            assert!(self.connection.io.posting_write_unlocked_for_test());
+            self.observed.store(true, Ordering::Release);
+        }
+    }
+
+    let shared = synthetic_engine(8);
+    let connection = synthetic_connection_on(&shared, 55);
+    let token = install_accepted(&shared, &connection.state, WcOpcode::Send);
+    let Lookup::Occupied(operation) = shared.io_core.operations.lookup(token) else {
+        panic!("accepted operation")
+    };
+    let wake = Arc::new(PostGuardCheckingWake {
+        admission: Arc::clone(&shared.session.admission),
+        connection: Arc::clone(&connection.state),
+        observed: AtomicBool::new(false),
+    });
+    operation.waker.register(&Waker::from(Arc::clone(&wake)));
+
+    let admission = shared.io_core.admission();
+    let posting = connection.state.io.begin_posting().unwrap();
+    publish_after_post_guards(
+        posting,
+        admission,
+        AfterEngineUnlock {
+            events: Vec::new(),
+            operations_to_wake: vec![operation],
+        },
+    );
+
+    assert!(wake.observed.load(Ordering::Acquire));
+}
+
+#[test]
 fn io_unaccepted_event_is_published_after_post_guards_are_released() {
     use std::task::{Wake, Waker};
 
@@ -1820,6 +1869,7 @@ async fn terminal_wakers_can_reenter_after_terminal_guards_drop() {
 
     struct ReentrantWaker {
         shared: Arc<EngineShared>,
+        connection: Arc<ConnectionState>,
         token: OperationToken,
         label: &'static str,
         order: Arc<Mutex<Vec<&'static str>>>,
@@ -1836,7 +1886,18 @@ async fn terminal_wakers_can_reenter_after_terminal_guards_drop() {
                 .shared
                 .session
                 .operation_quarantined_for_test(arc_self.token);
-            if admission_unlocked && terminal_unlocked && quarantine_committed {
+            let operation_terminal = matches!(
+                arc_self.shared.io_core.operations.lookup(arc_self.token),
+                Lookup::Occupied(operation)
+                    if operation.lifecycle() == OperationLifecycle::Quarantined
+            );
+            let connection_terminal = arc_self.connection.close_state().raw_outcome().is_some();
+            if admission_unlocked
+                && terminal_unlocked
+                && quarantine_committed
+                && operation_terminal
+                && connection_terminal
+            {
                 let _ = arc_self.shared.diagnostics();
                 lock_unpoison(&arc_self.order).push(arc_self.label);
             } else {
@@ -1860,6 +1921,7 @@ async fn terminal_wakers_can_reenter_after_terminal_guards_drop() {
     let observer = |label| {
         Arc::new(ReentrantWaker {
             shared: Arc::clone(&shared),
+            connection: Arc::clone(&connection.state),
             token,
             label,
             order: Arc::clone(&order),
