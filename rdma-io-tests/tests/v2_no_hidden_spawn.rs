@@ -423,6 +423,25 @@ struct UncheckedEffectPublicationVisitor<'a> {
 }
 
 impl Visit<'_> for UncheckedEffectPublicationVisitor<'_> {
+    fn visit_pat_struct(&mut self, pattern: &syn::PatStruct) {
+        if pattern
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| self.effects_names.contains(&segment.ident.to_string()))
+        {
+            self.violations.push(format!(
+                "{}:destructure:{}",
+                self.function,
+                pattern.span().start().line
+            ));
+            for field in &pattern.fields {
+                self.aliases.extend(pattern_identifiers(&field.pat));
+            }
+        }
+        visit::visit_pat_struct(self, pattern);
+    }
+
     fn visit_local(&mut self, local: &Local) {
         if pattern_destructures_io_effects(&local.pat, self.effects_names) {
             self.violations.push(format!(
@@ -487,39 +506,28 @@ impl Visit<'_> for UncheckedEffectPublicationVisitor<'_> {
     }
 }
 
-struct IoEffectsPublishBodyVisitor {
-    quarantine_guard_line: Option<usize>,
-    drained_guard_line: Option<usize>,
-    detached_publish_line: Option<usize>,
+fn assert_statement_guards_field(statement: &syn::Stmt, field: &str) -> bool {
+    let syn::Stmt::Macro(statement) = statement else {
+        return false;
+    };
+    if !statement.mac.path.is_ident("assert") {
+        return false;
+    }
+    let tokens = statement.mac.tokens.to_string();
+    tokens.contains(&format!("self . {field} . is_empty ()"))
 }
 
-impl Visit<'_> for IoEffectsPublishBodyVisitor {
-    fn visit_macro(&mut self, item: &Macro) {
-        if item.path.is_ident("assert") {
-            let tokens = item.tokens.to_string();
-            if tokens.contains("self . quarantine . is_empty ()") {
-                self.quarantine_guard_line = Some(item.span().start().line);
-            }
-            if tokens.contains("self . drained . is_empty ()") {
-                self.drained_guard_line = Some(item.span().start().line);
-            }
-        }
-        visit::visit_macro(self, item);
-    }
-
-    fn visit_expr_method_call(&mut self, call: &ExprMethodCall) {
-        if call.method == "publish"
-            && matches!(
-                call.receiver.as_ref(),
-                Expr::Field(field)
-                    if matches!(&field.member, syn::Member::Named(member) if member == "after_unlock")
-                        && expression_is_rooted_at_self(&field.base)
-            )
-        {
-            self.detached_publish_line = Some(call.span().start().line);
-        }
-        visit::visit_expr_method_call(self, call);
-    }
+fn statement_publishes_self_after_unlock(statement: &syn::Stmt) -> bool {
+    let syn::Stmt::Expr(Expr::MethodCall(call), _) = statement else {
+        return false;
+    };
+    call.method == "publish"
+        && matches!(
+            call.receiver.as_ref(),
+            Expr::Field(field)
+                if matches!(&field.member, syn::Member::Named(member) if member == "after_unlock")
+                    && expression_is_rooted_at_self(&field.base)
+        )
 }
 
 fn analyze_io_effects_publication(
@@ -540,6 +548,7 @@ fn analyze_io_effects_publication(
                         function: qualified_name(module_path, &function.sig.ident.to_string()),
                         violations: Vec::new(),
                     };
+                    visitor.visit_signature(&function.sig);
                     visitor.visit_block(&function.block);
                     analysis.violations.extend(visitor.violations);
                 }
@@ -560,26 +569,32 @@ fn analyze_io_effects_publication(
                         };
                         let name = function.sig.ident.to_string();
                         if implementation.trait_.is_none() && name == "publish" {
-                            let mut visitor = IoEffectsPublishBodyVisitor {
-                                quarantine_guard_line: None,
-                                drained_guard_line: None,
-                                detached_publish_line: None,
-                            };
-                            visitor.visit_block(&function.block);
-                            let detached = visitor.detached_publish_line;
+                            let statements = &function.block.stmts;
                             analysis.publish_methods.push((
                                 function.sig.ident.span().start().line,
-                                visitor
-                                    .quarantine_guard_line
-                                    .zip(detached)
-                                    .is_some_and(|(guard, publish)| guard < publish),
-                                visitor
-                                    .drained_guard_line
-                                    .zip(detached)
-                                    .is_some_and(|(guard, publish)| guard < publish),
-                                detached.is_some(),
+                                statements.len() == 3
+                                    && assert_statement_guards_field(&statements[0], "quarantine"),
+                                statements.len() == 3
+                                    && assert_statement_guards_field(&statements[1], "drained"),
+                                statements.len() == 3
+                                    && statement_publishes_self_after_unlock(&statements[2]),
                             ));
                             continue;
+                        }
+                        if implementation.trait_.is_none() && name != "extend" {
+                            let after_unlock_fields = ["after_unlock"].into_iter().collect();
+                            let mut field_visitor = SelfFieldAccessVisitor {
+                                fields: &after_unlock_fields,
+                                found: false,
+                            };
+                            field_visitor.visit_block(&function.block);
+                            if field_visitor.found {
+                                analysis.violations.push(format!(
+                                    "{}:payload-extractor:{}",
+                                    qualified_name(module_path, &name),
+                                    function.sig.ident.span().start().line
+                                ));
+                            }
                         }
                         let mut visitor = UncheckedEffectPublicationVisitor {
                             effects_names,
@@ -587,6 +602,7 @@ fn analyze_io_effects_publication(
                             function: qualified_name(module_path, &name),
                             violations: Vec::new(),
                         };
+                        visitor.visit_signature(&function.sig);
                         visitor.visit_block(&function.block);
                         analysis.violations.extend(visitor.violations);
                     }
@@ -610,6 +626,7 @@ fn analyze_io_effects_publication(
                             ),
                             violations: Vec::new(),
                         };
+                        visitor.visit_signature(&function.sig);
                         visitor.visit_block(&function.block);
                         analysis.violations.extend(visitor.violations);
                     }
@@ -2041,6 +2058,106 @@ fn io_effect_publication_detector_rejects_unchecked_routes() {
             .iter()
             .any(|violation| violation.contains("bypass:ufcs-publish")),
         "UFCS publication through an aliased detached value must be rejected"
+    );
+
+    let conditional_guards = r#"
+        struct IoCoreEffects { after_unlock: AfterEngineUnlock }
+        impl IoCoreEffects {
+            fn publish(self) {
+                if should_check() {
+                    assert!(self.quarantine.is_empty());
+                    assert!(self.drained.is_empty());
+                }
+                self.after_unlock.publish();
+            }
+        }
+    "#;
+    let conditional_analysis = analyze_io_effects_publication(conditional_guards).unwrap();
+    assert!(
+        !conditional_analysis
+            .publish_methods
+            .iter()
+            .any(|(_, quarantine, drained, publish)| *quarantine && *drained && *publish),
+        "conditional guards must not satisfy the publication contract"
+    );
+
+    let multiple_publications = r#"
+        struct IoCoreEffects { after_unlock: AfterEngineUnlock }
+        impl IoCoreEffects {
+            fn publish(self) {
+                self.after_unlock.publish();
+                assert!(self.quarantine.is_empty());
+                assert!(self.drained.is_empty());
+                self.after_unlock.publish();
+            }
+        }
+    "#;
+    let multiple_analysis = analyze_io_effects_publication(multiple_publications).unwrap();
+    assert!(
+        !multiple_analysis
+            .publish_methods
+            .iter()
+            .any(|(_, quarantine, drained, publish)| *quarantine && *drained && *publish),
+        "multiple publication sites must not satisfy the publication contract"
+    );
+
+    let parameter_destructure = r#"
+        struct IoCoreEffects { after_unlock: AfterEngineUnlock }
+        fn bypass(IoCoreEffects { after_unlock }: IoCoreEffects) {
+            after_unlock.publish();
+        }
+    "#;
+    assert!(
+        analyze_io_effects_publication(parameter_destructure)
+            .unwrap()
+            .violations
+            .iter()
+            .any(|violation| violation.contains("bypass:destructure")),
+        "parameter destructuring must be rejected"
+    );
+
+    let match_destructure = r#"
+        struct IoCoreEffects { after_unlock: AfterEngineUnlock }
+        fn bypass(effects: IoCoreEffects) {
+            match effects {
+                IoCoreEffects { after_unlock } => after_unlock.publish(),
+            }
+        }
+    "#;
+    let match_analysis = analyze_io_effects_publication(match_destructure).unwrap();
+    assert!(
+        match_analysis
+            .violations
+            .iter()
+            .any(|violation| violation.contains("bypass:destructure")),
+        "match destructuring must be rejected"
+    );
+    assert!(
+        match_analysis
+            .violations
+            .iter()
+            .any(|violation| violation.contains("bypass:method-publish")),
+        "publication through a match-bound alias must be rejected"
+    );
+
+    let payload_extractor = r#"
+        struct IoCoreEffects { after_unlock: AfterEngineUnlock }
+        impl IoCoreEffects {
+            fn publish(self) {
+                assert!(self.quarantine.is_empty());
+                assert!(self.drained.is_empty());
+                self.after_unlock.publish();
+            }
+            fn into_after_unlock(self) -> AfterEngineUnlock { self.after_unlock }
+        }
+    "#;
+    assert!(
+        analyze_io_effects_publication(payload_extractor)
+            .unwrap()
+            .violations
+            .iter()
+            .any(|violation| violation.contains("into_after_unlock:payload-extractor")),
+        "an additional payload-extractor method must be rejected"
     );
 }
 
