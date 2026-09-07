@@ -1,4 +1,37 @@
 //! Scalar operation future, first-poll submission, and cancellation.
+//!
+//! `RdmaOperation` is the only caller-held handle for a single SEND, RECV,
+//! READ, or WRITE. Its first poll is the sole provider-post boundary for the
+//! scalar path: `start_operation` validates, takes the admission and posting
+//! guards, reserves the local direction, registry slot, and CQ credit, posts
+//! once, and reconciles the outcome before the future can observe anything.
+//! No later poll, and no `Drop`, ever calls the provider.
+//!
+//! `FutureState` stays private so the pre-post, in-flight, and resolved stages
+//! cannot be assembled or skipped from outside. That is why the sibling-test
+//! fixture uses the `cfg(test)` [`RdmaOperation::from_in_flight`] constructor
+//! instead of a struct literal.
+//!
+//! The module observes the same ownership rules as its `batch` sibling:
+//!
+//! - It never sees `OperationInner` or a state guard. Reservation, acceptance,
+//!   proven non-acceptance, detachment, and cancellation are `OperationState`
+//!   methods that return owned records.
+//! - It never reads or builds effect payload fields. Post-lock work is carried
+//!   in `AfterEngineUnlock` and published only by
+//!   [`publish_after_post_guards`], after both guards are dropped.
+//! - It releases provider-visible ownership only on positive proof. A rollback
+//!   before registration returns the MR directly; a proven-unaccepted post
+//!   returns it through `take_unaccepted`; anything ambiguous is committed as
+//!   accepted and left to reclamation.
+//!
+//! `Drop` follows the same split: a future dropped before its first poll owns
+//! an unregistered MR and simply frees it, while a dropped in-flight future
+//! only cancels and schedules reclamation, retaining the MR, registration, and
+//! CQ debt until an exact CQE or QP-destruction proof arrives.
+//!
+//! Submission validation lives in the sibling `validation` module, which is
+//! shared with `batch`; neither submission path depends on the other.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -76,6 +109,11 @@ impl RdmaOperation {
         }
     }
 
+    /// Builds an already-accepted in-flight future for sibling operation tests.
+    ///
+    /// Test fixtures need a future whose `Drop` exercises the in-flight
+    /// cancellation path without a provider. Exposing this constructor keeps
+    /// `state` and `FutureState` private instead of widening them for tests.
     #[cfg(test)]
     pub(super) fn from_in_flight(shared: Arc<IoCore>, operation: Arc<OperationState>) -> Self {
         Self {
@@ -146,11 +184,24 @@ impl Drop for RdmaOperation {
     }
 }
 
+/// Outcome of the single scalar posting attempt.
+///
+/// `InFlight` means the operation is registered and owned by the engine until
+/// an exact CQE or reclamation proof resolves it. `Immediate` means the caller
+/// keeps the result and whatever MR ownership survived the rollback.
 enum StartResult {
     InFlight(Arc<OperationState>),
     Immediate((Result<Completion>, Option<Mr>)),
 }
 
+/// Validates, reserves, posts once, and reconciles what the provider accepted.
+///
+/// Every early return before registration is a zero-call rollback that hands
+/// the MR straight back. After registration, each rollback releases the
+/// registry slot, CQ credit, and local direction it actually took, in the
+/// reverse order they were acquired. The accepted, exact-zero-prefix,
+/// proven-unaccepted, and ambiguous arms then assign one — and only one —
+/// owner to those reservations.
 fn start_operation(
     shared: &IoCore,
     connection: &Arc<EstablishedIoConnection>,
@@ -270,6 +321,11 @@ fn start_operation(
     }
 }
 
+/// Encodes the validated operation as a one-entry RECV or SEND batch and posts.
+///
+/// The work request carries the operation token as its `wr_id`, which is what
+/// later CQE routing matches against, and consumes `validated` by value so no
+/// checked input can be reused after encoding.
 fn post_validated_operation(
     validated: ValidatedOperation,
     connection: &EstablishedIoConnection,
@@ -298,6 +354,13 @@ fn post_validated_operation(
     }
 }
 
+/// Drops both posting guards by value, then publishes the accumulated effects.
+///
+/// Taking the guards by value makes the ordering unforgeable: a caller cannot
+/// publish an early-completion event or waker while still holding the posting
+/// or admission lock. The `pub(super)` scope exists only so the parent module's
+/// `cfg(test)` ordering test can call this boundary directly; no production
+/// code outside this module uses it.
 pub(super) fn publish_after_post_guards(
     posting: RwLockReadGuard<'_, ()>,
     admission: RwLockReadGuard<'_, ()>,
