@@ -910,11 +910,17 @@ mod tests {
             Ok(BatchPostOutcome::AllAccepted)
         }
 
-        fn to_error(&self) -> Result<()> {
+        fn to_error(
+            &self,
+            _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
+        ) -> Result<()> {
             Ok(())
         }
 
-        fn destroy_qp(&self) -> Result<bool> {
+        fn destroy_qp(
+            &self,
+            _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
+        ) -> Result<bool> {
             Ok(true)
         }
 

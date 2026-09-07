@@ -632,7 +632,7 @@ count as the goal:
 | Composition root does not re-own owner policy | `EngineShared` assembles owners and coordinates global lifecycle, signaling, diagnostics, terminal state, and lifetime ordering. Session-to-engine access is the weak narrow runtime capability described above. |
 | Exact routing and fail-closed provider ownership remain intact | Unit and RXE/SIW provider suites cover generation/QP/opcode validation, duplicates, accepted prefixes, proven rejection, acceptance ambiguity, and missing completions. |
 | Positive release and teardown boundaries remain intact | Tests cover proven non-acceptance, exact completion, successful QP-destruction proof, QP-before-route/CmId retirement, and complete-bundle quarantine after failed destruction. |
-| Publication and progress contracts remain explicit | Tests cover post-guard callbacks/wakers, bounded owner turns, fair rotation, terminal composition, and the recursive no-hidden-task/thread guard. |
+| Publication and progress contracts remain explicit | Tests cover post-guard callbacks/wakers, bounded owner turns, fair rotation, and terminal composition; package-local Clippy rejects configured hidden-work APIs in production v2 code. |
 | Transitional seams are removed | The aggregate reclamation alias and old source paths remain absent; the final cleanup removes stale migration annotations, root/session test dereference, root forwarding, and full-root I/O fixtures. |
 | V1 remains separate | No v1 source is changed by this cleanup, and the complete provider gate retains the v1 safe-resource suite. |
 | Documentation matches implementation | This document distinguishes policy ownership, physical readiness/resource retention, narrow runtime composition, and bounded test support. |

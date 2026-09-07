@@ -285,7 +285,7 @@ restore_rxe() {
 
 cd "$ROOT_DIR" || exit 1
 if [[ "$FULL_VALIDATION" -eq 1 ]]; then
-    echo "=== Run build-profile and no-hidden-spawn preflight ==="
+    echo "=== Run build-profile preflight ==="
     run_static_preflight
     static_status=$?
     if [[ "$static_status" -ne 0 ]]; then

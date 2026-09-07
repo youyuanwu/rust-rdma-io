@@ -283,7 +283,7 @@ impl RdmaConnection {
 pub(in crate::v2::engine) struct ConnectionState {
     pub(in crate::v2::engine) token: ConnectionToken,
     qp_num: u32,
-    pub(in crate::v2::engine) poster: Arc<dyn WorkRequestPoster>,
+    poster: Arc<dyn WorkRequestPoster>,
     pub(in crate::v2::engine) io: Arc<EstablishedIoConnection>,
     local_addr: Option<SocketAddr>,
     peer_addr: Option<SocketAddr>,
@@ -456,6 +456,20 @@ impl ConnectionState {
         self.lifecycle_gate.try_lock().is_ok()
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(in crate::v2::engine) fn fail_next_qp_destroy_for_test(&self) -> Result<()> {
+        self.poster.fail_next_qp_destroy()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(in crate::v2::engine) fn uses_resources_for_test(
+        &self,
+        pd: &crate::v2::Pd,
+        cq: &crate::v2::Cq,
+    ) -> bool {
+        self.poster.uses_resources(pd, cq)
+    }
+
     pub(in crate::v2::engine) fn finalize_engine(
         &self,
         authority: &SessionLifecycleAuthority,
@@ -497,12 +511,12 @@ impl ConnectionState {
 
     pub(in crate::v2::engine) fn transition_to_error_once(
         &self,
-        _authority: &SessionLifecycleAuthority,
+        authority: &SessionLifecycleAuthority,
     ) -> Result<bool> {
         if self.error_transition_started.swap(true, Ordering::AcqRel) {
             return Ok(false);
         }
-        self.poster.to_error()?;
+        self.poster.to_error(authority)?;
         self.error_transition_complete
             .store(true, Ordering::Release);
         Ok(true)
@@ -514,7 +528,7 @@ impl ConnectionState {
 
     pub(in crate::v2::engine) fn destroy_connection_resources(
         &self,
-        _authority: &SessionLifecycleAuthority,
+        authority: &SessionLifecycleAuthority,
         _lifecycle: &MutexGuard<'_, ()>,
     ) -> Result<Option<SharedCmId>> {
         let outstanding_operations = self.accepted_count();
@@ -527,7 +541,7 @@ impl ConnectionState {
         }
         self.stop_posting();
         let destroy_qp = !self.qp_destroyed.load(Ordering::Acquire);
-        let (cm_id, qp_destroyed) = self.poster.destroy_connection(destroy_qp)?;
+        let (cm_id, qp_destroyed) = self.poster.destroy_connection(authority, destroy_qp)?;
         if qp_destroyed {
             self.record_qp_destroyed();
         }
@@ -541,14 +555,14 @@ impl ConnectionState {
 
     pub(in crate::v2::engine) fn destroy_qp_for_session(
         &self,
-        _authority: &SessionLifecycleAuthority,
+        authority: &SessionLifecycleAuthority,
         _lifecycle: &MutexGuard<'_, ()>,
     ) -> Result<QpDestroyStatus> {
         self.stop_posting();
         if self.qp_destroyed.load(Ordering::Acquire) {
             return Ok(QpDestroyStatus::AlreadyDestroyed);
         }
-        match self.poster.destroy_qp() {
+        match self.poster.destroy_qp(authority) {
             Ok(true) => {
                 if self.record_qp_destroyed() {
                     Ok(QpDestroyStatus::DestroyedNow)
@@ -1119,15 +1133,19 @@ pub(crate) trait WorkRequestPoster: Send + Sync {
     fn capabilities(&self) -> Option<QpCapabilities>;
     fn post_send(&self, batch: &mut PreparedSendBatch) -> Result<BatchPostOutcome>;
     fn post_recv(&self, batch: &mut PreparedRecvBatch) -> Result<BatchPostOutcome>;
-    fn to_error(&self) -> Result<()>;
+    fn to_error(&self, authority: &SessionLifecycleAuthority) -> Result<()>;
     /// Returns true only when this call successfully takes and destroys the
     /// owned QP. A failure must retain the QP and return its error.
-    fn destroy_qp(&self) -> Result<bool>;
-    fn destroy_connection(&self, destroy_qp: bool) -> Result<(Option<SharedCmId>, bool)> {
+    fn destroy_qp(&self, authority: &SessionLifecycleAuthority) -> Result<bool>;
+    fn destroy_connection(
+        &self,
+        authority: &SessionLifecycleAuthority,
+        destroy_qp: bool,
+    ) -> Result<(Option<SharedCmId>, bool)> {
         Ok((
             None,
             if destroy_qp {
-                self.destroy_qp()?
+                self.destroy_qp(authority)?
             } else {
                 false
             },
@@ -1286,9 +1304,9 @@ impl VerbsConnectionResources {
 
     pub(in crate::v2::engine) fn destroy_unregistered_for_session(
         &self,
-        _authority: &SessionLifecycleAuthority,
+        authority: &SessionLifecycleAuthority,
     ) -> Result<(Option<SharedCmId>, bool)> {
-        <Self as WorkRequestPoster>::destroy_connection(self, true)
+        <Self as WorkRequestPoster>::destroy_connection(self, authority, true)
     }
 
     pub(in crate::v2::engine) fn connect(&self, param: &ConnParam) -> Result<()> {
@@ -1404,7 +1422,7 @@ impl WorkRequestPoster for VerbsConnectionResources {
             .map(|qp| qp.post_recv_batch(batch))
     }
 
-    fn to_error(&self) -> Result<()> {
+    fn to_error(&self, _authority: &SessionLifecycleAuthority) -> Result<()> {
         let qp = lock_unpoison(&self.qp);
         match qp.as_ref() {
             Some(qp) => qp.to_error(),
@@ -1412,7 +1430,7 @@ impl WorkRequestPoster for VerbsConnectionResources {
         }
     }
 
-    fn destroy_qp(&self) -> Result<bool> {
+    fn destroy_qp(&self, _authority: &SessionLifecycleAuthority) -> Result<bool> {
         let mut qp = lock_unpoison(&self.qp);
         let Some(owned) = qp.take() else {
             return Ok(false);
@@ -1426,9 +1444,13 @@ impl WorkRequestPoster for VerbsConnectionResources {
         }
     }
 
-    fn destroy_connection(&self, destroy_qp: bool) -> Result<(Option<SharedCmId>, bool)> {
+    fn destroy_connection(
+        &self,
+        authority: &SessionLifecycleAuthority,
+        destroy_qp: bool,
+    ) -> Result<(Option<SharedCmId>, bool)> {
         let qp_destroyed = if destroy_qp {
-            self.destroy_qp()?
+            self.destroy_qp(authority)?
         } else {
             false
         };

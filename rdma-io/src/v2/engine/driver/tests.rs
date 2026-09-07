@@ -262,11 +262,17 @@ impl WorkRequestPoster for DrainInterleavingPoster {
         unreachable!("interleaving test installs an accepted operation directly")
     }
 
-    fn to_error(&self) -> Result<()> {
+    fn to_error(
+        &self,
+        _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
+    ) -> Result<()> {
         Ok(())
     }
 
-    fn destroy_qp(&self) -> Result<bool> {
+    fn destroy_qp(
+        &self,
+        _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
+    ) -> Result<bool> {
         self.destroys.fetch_add(1, Ordering::AcqRel);
         Ok(true)
     }

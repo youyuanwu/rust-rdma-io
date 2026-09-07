@@ -3,6 +3,7 @@ disallowed-methods = [
     { path = "std::thread::scope", reason = "v2 progress must not create scoped worker threads" },
     { path = "std::thread::Builder::spawn", reason = "v2 progress must be driven by an application-owned future" },
     { path = "std::thread::Builder::spawn_scoped", reason = "v2 progress must not create scoped worker threads" },
+    { path = "std::thread::Scope::spawn", reason = "v2 progress must not create scoped worker threads" },
     { path = "tokio::task::spawn", reason = "return the v2 driver to the application instead" },
     { path = "tokio::task::spawn_blocking", reason = "v2 must not hide blocking work behind a runtime task" },
     { path = "tokio::task::spawn_local", reason = "return the v2 driver to the application instead" },
@@ -17,6 +18,8 @@ disallowed-methods = [
     { path = "tokio::task::JoinSet::spawn_blocking_on", reason = "v2 must not hide blocking work behind a runtime task" },
     { path = "futures_util::task::SpawnExt::spawn", reason = "return the v2 driver to the application instead" },
     { path = "futures_util::task::LocalSpawnExt::spawn_local", reason = "return the v2 driver to the application instead" },
+    { path = "futures_util::task::Spawn::spawn_obj", reason = "return the v2 driver to the application instead" },
+    { path = "futures_util::task::LocalSpawn::spawn_local_obj", reason = "return the v2 driver to the application instead" },
     { path = "libc::pthread_create", reason = "v2 must not create native worker threads" },
 ]
 
