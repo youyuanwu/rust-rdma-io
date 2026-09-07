@@ -1468,6 +1468,7 @@ fn find_effect_ufcs_publications(source: &str) -> Result<Vec<usize>, syn::Error>
     }
 
     let mut effect_types = [
+        "IoCoreEffects",
         "AfterEngineUnlock",
         "DetachedIoCoreEffects",
         "CommittedIoCoreEffects",
@@ -1492,6 +1493,119 @@ fn find_effect_ufcs_publications(source: &str) -> Result<Vec<usize>, syn::Error>
     };
     visitor.visit_file(&syntax);
     Ok(visitor.calls)
+}
+
+struct RestrictedEffectFunctionVisitor {
+    effect_types: HashSet<String>,
+    references: Vec<usize>,
+    self_types: Vec<String>,
+}
+
+impl Visit<'_> for RestrictedEffectFunctionVisitor {
+    fn visit_expr_path(&mut self, expression: &ExprPath) {
+        let method = expression
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string());
+        if matches!(
+            method.as_deref(),
+            Some("publish" | "take_quarantine" | "take_drained" | "into_committed")
+        ) {
+            let owner = expression
+                .qself
+                .as_ref()
+                .and_then(|qself| type_path_last(&qself.ty))
+                .or_else(|| {
+                    let mut segments = expression.path.segments.iter().rev();
+                    segments.next();
+                    segments.next().map(|segment| segment.ident.to_string())
+                })
+                .and_then(|name| {
+                    if name == "Self" {
+                        self.self_types.last().cloned()
+                    } else {
+                        Some(name)
+                    }
+                });
+            let restricted_owner = match method.as_deref() {
+                Some("publish") => owner.as_ref().is_some_and(|name| {
+                    matches!(
+                        name.as_str(),
+                        "AfterEngineUnlock" | "DetachedIoCoreEffects" | "CommittedIoCoreEffects"
+                    ) || self.effect_types.contains(name) && name != "IoCoreEffects"
+                }),
+                Some("take_quarantine" | "take_drained" | "into_committed") => {
+                    owner.as_ref().is_some_and(|name| {
+                        name == "IoCoreEffects" || self.effect_types.contains(name)
+                    })
+                }
+                _ => false,
+            };
+            if restricted_owner {
+                self.references.push(expression.span().start().line);
+            }
+        }
+        visit::visit_expr_path(self, expression);
+    }
+
+    fn visit_item_impl(&mut self, implementation: &syn::ItemImpl) {
+        self.self_types
+            .push(type_path_last(&implementation.self_ty).unwrap_or_else(|| "<impl>".to_owned()));
+        visit::visit_item_impl(self, implementation);
+        self.self_types.pop();
+    }
+}
+
+fn find_restricted_effect_function_references(source: &str) -> Result<Vec<usize>, syn::Error> {
+    let syntax = syn::parse_file(source)?;
+    struct AliasCollector<'a> {
+        names: &'a mut HashSet<String>,
+        changed: bool,
+    }
+
+    impl Visit<'_> for AliasCollector<'_> {
+        fn visit_item_type(&mut self, alias: &syn::ItemType) {
+            if type_path_last(&alias.ty).is_some_and(|name| self.names.contains(&name)) {
+                self.changed |= self.names.insert(alias.ident.to_string());
+            }
+            visit::visit_item_type(self, alias);
+        }
+
+        fn visit_item_use(&mut self, item: &syn::ItemUse) {
+            let before = self.names.len();
+            collect_use_aliases(&item.tree, self.names);
+            self.changed |= self.names.len() != before;
+            visit::visit_item_use(self, item);
+        }
+    }
+
+    let mut effect_types = [
+        "IoCoreEffects",
+        "AfterEngineUnlock",
+        "DetachedIoCoreEffects",
+        "CommittedIoCoreEffects",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<HashSet<_>>();
+    loop {
+        let mut collector = AliasCollector {
+            names: &mut effect_types,
+            changed: false,
+        };
+        collector.visit_file(&syntax);
+        if !collector.changed {
+            break;
+        }
+    }
+    let mut visitor = RestrictedEffectFunctionVisitor {
+        effect_types,
+        references: Vec::new(),
+        self_types: Vec::new(),
+    };
+    visitor.visit_file(&syntax);
+    Ok(visitor.references)
 }
 
 fn find_strong_owner_fields(
@@ -2471,6 +2585,30 @@ fn io_effect_publication_detector_rejects_unchecked_routes() {
         find_effect_ufcs_publications(self_ufcs).unwrap().len(),
         2,
         "Self-qualified UFCS publication must be detected in effect-type implementations"
+    );
+    let function_item_aliases = r#"
+        fn bypass(
+            full: &mut IoCoreEffects,
+            detached: DetachedIoCoreEffects,
+            committed: CommittedIoCoreEffects,
+        ) {
+            let take_quarantine = IoCoreEffects::take_quarantine;
+            let take_drained = IoCoreEffects::take_drained;
+            let publish_detached = DetachedAlias::publish;
+            let publish_committed = CommittedIoCoreEffects::publish;
+            type DetachedAlias = DetachedIoCoreEffects;
+            take_quarantine(full);
+            take_drained(full);
+            publish_detached(detached);
+            publish_committed(committed);
+        }
+    "#;
+    assert_eq!(
+        find_restricted_effect_function_references(function_item_aliases)
+            .unwrap()
+            .len(),
+        4,
+        "restricted effect associated methods must not escape through function-item aliases"
     );
     assert_eq!(
         find_production_zero_argument_method_calls(
@@ -3928,6 +4066,7 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     let mut drained_consumer_paths = Vec::new();
     let mut zero_argument_publish_calls = BTreeMap::<(PathBuf, String), usize>::new();
     let mut effect_ufcs_publish_calls = Vec::new();
+    let mut restricted_effect_function_references = Vec::new();
     for path in collect_rs_files(&engine_dir).expect("enumerate I/O effect publication paths") {
         let source = fs::read_to_string(&path).expect("read engine source");
         if source_is_test_only(&source)
@@ -3995,6 +4134,17 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
             find_effect_ufcs_publications(&source)
                 .unwrap_or_else(|error| {
                     panic!("parse {} effect UFCS publications: {error}", path.display())
+                })
+                .into_iter()
+                .map(|line| (path.clone(), line)),
+        );
+        restricted_effect_function_references.extend(
+            find_restricted_effect_function_references(&source)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "parse {} restricted effect function references: {error}",
+                        path.display()
+                    )
                 })
                 .into_iter()
                 .map(|line| (path.clone(), line)),
@@ -4081,6 +4231,10 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     assert!(
         effect_ufcs_publish_calls.is_empty(),
         "effect publication through UFCS is forbidden outside the method-owned boundaries: {effect_ufcs_publish_calls:#?}"
+    );
+    assert!(
+        restricted_effect_function_references.is_empty(),
+        "effect methods must not escape through UFCS calls or function-item aliases: {restricted_effect_function_references:#?}"
     );
     assert_eq!(
         find_production_lifecycle_calls(&io_core_operation_source, &["publish_after_post_guards"],)
