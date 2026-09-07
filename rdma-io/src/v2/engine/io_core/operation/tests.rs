@@ -1185,6 +1185,10 @@ fn dispatch_between_releasability_observation_and_release_retains_the_whole_suff
     ) {
         InternalRelease::Retained(entries) => entries,
         InternalRelease::Released(after_unlock) => {
+            // Bind and drop the payload rather than ignoring it: this arm is the
+            // only reader of the mirrored `Released` variant, so an `_` pattern
+            // would make the field look dead, and dropping before the panic
+            // keeps the assertion message intact.
             drop(after_unlock);
             panic!("a recorded suffix CQE must prevent every suffix release")
         }

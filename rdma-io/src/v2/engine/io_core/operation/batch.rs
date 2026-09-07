@@ -1,4 +1,25 @@
 //! Protocol-owned SEND/RECV preparation and provider-acceptance reconciliation.
+//!
+//! `post_io_batch` is one transaction: it validates and reserves every entry,
+//! prepares stable work requests, posts once, and then reconciles what the
+//! provider actually accepted. The accepted, exact-prefix, early-CQE,
+//! proven-unaccepted, and ambiguous outcomes stay in that single flow because
+//! each one assigns a different owner to the same reservations; separating them
+//! would let MR, registry, local-direction, and CQ-credit accounting drift.
+//!
+//! The module observes three ownership rules:
+//!
+//! - It never sees `OperationInner` or a state guard. Every transition is a
+//!   method on `OperationState` that returns an owned record.
+//! - It never reads or builds effect payload fields. Post-lock work accumulates
+//!   in `AfterEngineUnlock` and publishes only after the posting and admission
+//!   guards are dropped.
+//! - It releases provider-visible ownership only on positive proof of
+//!   non-acceptance; anything ambiguous — including a suffix that already
+//!   observed a completion — is retained as accepted and left to reclamation.
+//!
+//! Submission validation lives in the sibling `validation` module so the scalar
+//! future shares it without either submission path depending on the other.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -431,6 +452,12 @@ enum InternalRelease {
     Retained(Vec<InternalBatchEntry>),
 }
 
+/// Ownership abstraction over the established I/O connection being posted to.
+///
+/// Production callers always pass the real `EstablishedIoConnection`; the
+/// `cfg(test)` impl lets owner-local fixtures drive rollback and release with a
+/// concrete `ConnectionState` without adding a session dependency to production
+/// operation code.
 trait EstablishedIoRef {
     fn established_io(&self) -> &EstablishedIoConnection;
 }
@@ -508,6 +535,14 @@ fn clone_io_error(error: &std::io::Error) -> std::io::Error {
     }
 }
 
+/// `cfg(test)` mirrors of this module's private reservation vocabulary.
+///
+/// `operation::tests` reaches submission internals through `use super::*`, but
+/// the production entry and release types keep private fields so that no
+/// sibling can assemble or inspect reservations directly. These mirrors carry
+/// the same fields with operation-subtree visibility and delegate straight to
+/// the production functions, so tests exercise the real reconciliation without
+/// widening production visibility.
 #[cfg(test)]
 pub(super) mod test_support {
     use super::*;

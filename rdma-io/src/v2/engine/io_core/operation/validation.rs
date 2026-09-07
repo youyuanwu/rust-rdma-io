@@ -1,4 +1,16 @@
 //! Shared validation and work-request inputs for operation submission.
+//!
+//! `ValidatedOperation` is the single place that turns a caller's MR, optional
+//! remote MR, and byte range into a checked local SGE plus the completion
+//! opcode that exact CQE routing later demands. Both batch submission and the
+//! scalar operation future consume it, so neither re-derives the range, length,
+//! or remote-MR rules and neither has to depend on the other.
+//!
+//! The module is deliberately effect-free: it performs no posting, no
+//! reservation, no registry or CQ-credit accounting, and no event publication,
+//! so a validation failure is always a zero-call rollback for its caller. The
+//! fields stay private behind copy accessors, so a validated value cannot be
+//! edited apart from the checks that produced it.
 
 use crate::v2::error::{Error, Result};
 use crate::v2::mr::{Mr, RemoteMr};
