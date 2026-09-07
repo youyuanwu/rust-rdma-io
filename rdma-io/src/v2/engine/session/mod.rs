@@ -4,7 +4,10 @@
 //! entry, connection admission reservation, lifecycle deadline, and
 //! connection-level quarantine entry. The sibling [`super::io_core::IoCore`]
 //! owns operation/CQE state; effects crossing that boundary are interpreted
-//! here before their detached events and wakers are published.
+//! here through a consuming commit before their detached events and wakers are
+//! published. This ordering covers the runtime's admission, lifecycle,
+//! registry, posting, and operation guards; callers remain responsible for
+//! unrelated locks they hold outside the runtime.
 
 use std::collections::{HashMap, VecDeque};
 #[cfg(any(test, feature = "test-hooks"))]
@@ -699,7 +702,14 @@ impl SessionManager {
         effects.into_committed()
     }
 
-    /// Consume session-facing I/O effects before detached publication.
+    /// Consume an I/O effect bundle, apply all session-facing mutations, and
+    /// only then publish its detached events and operation wakes.
+    ///
+    /// Moving the bundle into this method prevents callers from publishing or
+    /// reusing the original value. I/O producers return only after their
+    /// operation and registry guards are released; direct posting and close
+    /// paths use a separate detached-only type after their guards are dropped.
+    /// This boundary cannot prove that a caller holds no unrelated lock.
     pub(super) fn commit_io_effects(&self, effects: IoCoreEffects) {
         self.apply_io_effects(effects).publish();
     }
@@ -708,6 +718,7 @@ impl SessionManager {
     ///
     /// The returned value contains only detached publication and must be
     /// consumed after CM and connection terminal state has been published.
+    /// Structural checks confine this split to root terminal composition.
     pub(super) fn apply_terminal_io_effects(
         &self,
         effects: IoCoreEffects,

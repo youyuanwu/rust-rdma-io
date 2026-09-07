@@ -345,9 +345,14 @@ early suffix CQE.
 One connection-scoped event port carries owned completion and terminal events.
 Core mutations return owned effects for event delivery, operation wakes,
 accepted-zero transitions, and operation-quarantine transitions.
-`SessionManager` applies the session-facing quarantine and drained effects
-before detached publication. The port releases its queue mutex before wakeup,
-and the message driver preserves check-register-recheck suspension.
+Ordinary paths move the full bundle into `SessionManager::commit_io_effects`;
+the session applies quarantine changes and accepted-zero/drain transitions
+before consuming the detached publication. Root terminal composition uses one
+opaque post-application state so CM and connection terminal state/events remain
+ordered before operation effects, close wakes, and the terminal wake. The
+original full bundle cannot be reused or published after either consuming
+handoff. The port releases its queue mutex before wakeup, and the message
+driver preserves check-register-recheck suspension.
 
 Operation quarantine retains one operation's MR, registration, accepted-set
 membership, and CQ debt inside `IoCore`. `SessionManager` owns the combined
@@ -373,12 +378,14 @@ forwarding methods; constrain the session runtime method/type surface and
 explicit `IoCore`/`SessionManager` fixture parts with only an opaque runtime
 retain.
 
-This enforcement is intentionally narrower than a whole-engine module-graph
-proof. New session submodules are not discovered automatically, concrete-root
-fixture classification does not scan every engine test module, and aliases
-are resolved within each parsed file rather than across files. The current
-audited source satisfies the boundary, but these structural-enforcement gaps
-remain an accepted review limitation rather than being represented as fixed.
+The structural checks recursively discover Rust sources beneath the v2 I/O
+core and session trees. They enforce the consuming session boundary, the
+root-terminal type-state exception, the guarded scalar and batch
+early-completion extraction paths, and an exact allowlist of source-visible
+publication calls, including qualified, aliased, nested, and default
+trait-method forms. The checker intentionally does not inspect effect
+publication introduced only through macro expansion; that accepted limitation
+must not be interpreted as a whole-program lock or publication proof.
 
 ## Completion-to-Message Handoff
 
@@ -392,7 +399,12 @@ After validation, the core removes operation ownership and creates an owned
 completion event containing the opaque request context, completion result, and
 releasable MR. Registry, admission, posting, and operation-ledger guards are
 released before the event is enqueued on the connection's I/O port and before
-the message driver is woken.
+the message driver is woken. Quarantine and accepted-zero/drain effects are
+committed by the session before the event or operation wake is published.
+Detached-only scalar posting first consumes its posting and admission guards;
+connection-close observer publication similarly follows admission and
+lifecycle release. These guarantees cover the runtime guards named here, not
+arbitrary unrelated guards retained by a caller.
 
 The driver then parses the frame or advances the corresponding send/repost
 state. Neither the frontend nor the engine directly mutates driver-owned

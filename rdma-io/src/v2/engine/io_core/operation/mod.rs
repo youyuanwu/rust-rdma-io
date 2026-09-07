@@ -1624,16 +1624,32 @@ pub(in crate::v2::engine) enum OperationQuarantineEffect {
 }
 
 #[derive(Default)]
+/// Effects produced after I/O-owned operation and registry mutation completes.
+///
+/// This full bundle is deliberately not publishable. The session owner must
+/// consume it so quarantine and accepted-zero/drain effects are applied before
+/// its detached events and operation wakes become available.
 pub(in crate::v2::engine) struct IoCoreEffects {
     after_unlock: AfterEngineUnlock,
     quarantine: Vec<OperationQuarantineEffect>,
     drained: Vec<ConnectionToken>,
 }
 
+/// Detached I/O publication after the session owner has committed all
+/// session-facing effects from the original [`IoCoreEffects`].
+///
+/// The root terminal path uses this state to preserve CM/connection
+/// terminalization before operation notifications. It cannot recover or reuse
+/// the original full bundle.
 pub(in crate::v2::engine) struct CommittedIoCoreEffects {
     after_unlock: AfterEngineUnlock,
 }
 
+/// A detached-only result for a path that cannot produce session effects.
+///
+/// This is intentionally separate from [`IoCoreEffects`] and
+/// [`CommittedIoCoreEffects`]. Its only cross-module use is close-observer
+/// notification after admission and lifecycle guards have been released.
 pub(in crate::v2::engine) struct DetachedIoCoreEffects {
     after_unlock: AfterEngineUnlock,
 }
