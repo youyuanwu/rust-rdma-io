@@ -1767,8 +1767,28 @@ fn type_mentions_any(ty: &Type, names: &HashSet<String>) -> bool {
     visitor.found
 }
 
+fn type_contains_projection(ty: &Type) -> bool {
+    struct ProjectionVisitor {
+        found: bool,
+    }
+
+    impl Visit<'_> for ProjectionVisitor {
+        fn visit_type_path(&mut self, path: &syn::TypePath) {
+            if path.qself.is_some() {
+                self.found = true;
+            }
+            visit::visit_type_path(self, path);
+        }
+    }
+
+    let mut visitor = ProjectionVisitor { found: false };
+    visitor.visit_type(ty);
+    visitor.found
+}
+
 fn type_alias_mentions_any(alias: &syn::ItemType, names: &HashSet<String>) -> bool {
     type_mentions_any(&alias.ty, names)
+        || type_contains_projection(&alias.ty)
         || alias.generics.params.iter().any(|parameter| {
             matches!(
                 parameter,
@@ -1776,7 +1796,10 @@ fn type_alias_mentions_any(alias: &syn::ItemType, names: &HashSet<String>) -> bo
                     if parameter
                         .default
                         .as_ref()
-                        .is_some_and(|(_, default)| type_mentions_any(default, names))
+                        .is_some_and(|(_, default)| {
+                            type_mentions_any(default, names)
+                                || type_contains_projection(default)
+                        })
             )
         })
 }
@@ -3378,6 +3401,15 @@ fn io_effect_publication_detector_rejects_unchecked_routes() {
             .len(),
         1,
         "associated-type projections of generic defaults must not hide effect publication"
+    );
+    assert_eq!(
+        find_restricted_effect_function_references(
+            "type Hidden = <Marker as Map>::Out;\nfn bypass(value: Hidden) { let publish = Hidden::publish; publish(value); }",
+        )
+        .unwrap()
+        .len(),
+        1,
+        "aliases of associated-type projections must remain conservatively restricted"
     );
     assert_eq!(
         find_production_zero_argument_method_calls(
