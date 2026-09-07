@@ -182,6 +182,15 @@ impl EstablishedIoConnection {
         self.posting_gate.try_write().is_ok()
     }
 
+    #[cfg(test)]
+    pub(super) fn local_credit_used_for_test(&self, direction: Direction) -> usize {
+        let credits = lock_unpoison(&self.local_credits);
+        match direction {
+            Direction::Send => credits.send,
+            Direction::Recv => credits.recv,
+        }
+    }
+
     pub(super) fn release_local(&self, direction: Direction) {
         let mut credits = lock_unpoison(&self.local_credits);
         let used = match direction {

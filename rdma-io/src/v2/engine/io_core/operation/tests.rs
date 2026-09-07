@@ -169,6 +169,10 @@ fn io_completion_wakes_after_admission_guard_is_released() {
 
     struct AdmissionCheckingWake {
         admission: Arc<RwLock<()>>,
+        io_core: Arc<IoCore>,
+        connection: Arc<ConnectionState>,
+        operation: Arc<OperationState>,
+        token: OperationToken,
         observed: AtomicBool,
     }
 
@@ -182,6 +186,20 @@ fn io_completion_wakes_after_admission_guard_is_released() {
                 self.admission.try_write().is_ok(),
                 "I/O event wake ran while admission remained locked"
             );
+            assert!(!matches!(
+                self.io_core.operations.lookup(self.token),
+                Lookup::Occupied(_)
+            ));
+            assert_eq!(self.io_core.operations.live(), 0);
+            assert_eq!(self.operation.lifecycle(), OperationLifecycle::Released);
+            assert_eq!(self.connection.accepted_count(), 0);
+            assert_eq!(
+                self.connection
+                    .io
+                    .local_credit_used_for_test(Direction::Send),
+                0
+            );
+            assert_eq!(self.io_core.cq_credits.free(), 8);
             self.observed.store(true, Ordering::Release);
         }
     }
@@ -191,11 +209,6 @@ fn io_completion_wakes_after_admission_guard_is_released() {
     connection.state.reserve_local(Direction::Send).unwrap();
     assert!(shared.io_core.cq_credits.reserve());
     let (sender, receiver) = super::super::io::event_port();
-    let wake = Arc::new(AdmissionCheckingWake {
-        admission: Arc::clone(&shared.session.admission),
-        observed: AtomicBool::new(false),
-    });
-    receiver.register(&Waker::from(Arc::clone(&wake)));
     let (token, operation) = shared
         .io_core
         .operations
@@ -211,6 +224,15 @@ fn io_completion_wakes_after_admission_guard_is_released() {
             ))
         })
         .unwrap();
+    let wake = Arc::new(AdmissionCheckingWake {
+        admission: Arc::clone(&shared.session.admission),
+        io_core: Arc::clone(&shared.io_core),
+        connection: Arc::clone(&connection.state),
+        operation: Arc::clone(&operation),
+        token,
+        observed: AtomicBool::new(false),
+    });
+    receiver.register(&Waker::from(Arc::clone(&wake)));
     connection.state.add_accepted(token);
     operation.commit_accepted();
     shared
@@ -259,6 +281,14 @@ fn qp_destroy_event_uses_the_contextual_connection_close_error() {
             assert!(self.connection.lifecycle_unlocked_for_test());
             assert_eq!(self.io_core.operations.live(), 0);
             assert_eq!(self.connection.accepted_count(), 0);
+            assert_eq!(
+                self.connection
+                    .io
+                    .local_credit_used_for_test(Direction::Send),
+                0
+            );
+            assert_eq!(self.io_core.cq_credits.free(), 8);
+            assert_eq!(self.io_core.cq_credits.retained(), 0);
             assert!(!self.session.operation_quarantined_for_test(self.token));
             self.observed.store(true, Ordering::Release);
         }
@@ -1471,25 +1501,32 @@ fn accepted_zero_is_committed_before_completion_event_publication() {
         }
     }
 
-    let Some((engine, driver, shared)) = production_engine(2, 4, 4) else {
-        return;
-    };
-    let poster = Arc::new(ScriptedPoster::new(
-        &shared.session,
-        53,
-        ScriptedPost::Accepted,
-    ));
-    let connection = scripted_connection(&shared.session, Arc::clone(&poster), 1, 1);
-    let (io, events) =
-        super::super::io::IoConnection::new(&shared.session, Arc::clone(&connection.state))
-            .unwrap();
-    let posted = io.post_send(IoSendRequest::new(
-        io.register_memory(64, AccessIntent::LocalOnly).unwrap(),
-        1,
-        IoOperationContext::new(()),
-    ));
-    assert!(posted.all_accepted());
-    let token = lock_unpoison(&poster.tokens)[0];
+    let shared = synthetic_engine(8);
+    let connection = synthetic_connection_on(&shared, 53);
+    connection.state.reserve_local(Direction::Send).unwrap();
+    assert!(shared.io_core.cq_credits.reserve());
+    let (sender, events) = super::super::io::event_port();
+    let (token, operation) = shared
+        .io_core
+        .operations
+        .allocate(|token| {
+            Arc::new(OperationState::new_with_event(
+                token,
+                Arc::clone(&connection.state),
+                Direction::Send,
+                WcOpcode::Send,
+                None,
+                1,
+                Some(IoEventDestination::new(sender, IoOperationContext::new(()))),
+            ))
+        })
+        .unwrap();
+    connection.state.add_accepted(token);
+    operation.commit_accepted();
+    shared
+        .io_core
+        .accepted_operations
+        .fetch_add(1, Ordering::AcqRel);
     shared.session.begin_connection_close(&connection.state);
 
     let wake = Arc::new(DrainCheckingWake {
@@ -1517,9 +1554,6 @@ fn accepted_zero_is_committed_before_completion_event_publication() {
         panic!("completion event")
     };
     assert!(completion.into_parts().2.is_ok());
-    drop(connection);
-    drop(driver);
-    drop(engine);
 }
 
 #[test]
@@ -1546,27 +1580,32 @@ fn quarantine_clear_is_committed_before_completion_event_publication() {
         }
     }
 
-    let Some((engine, driver, shared)) = production_engine(2, 4, 4) else {
-        return;
-    };
-    let poster = Arc::new(ScriptedPoster::new(
-        &shared.session,
-        54,
-        ScriptedPost::Accepted,
-    ));
-    let connection = scripted_connection(&shared.session, Arc::clone(&poster), 1, 1);
-    let (io, events) =
-        super::super::io::IoConnection::new(&shared.session, Arc::clone(&connection.state))
-            .unwrap();
-    assert!(
-        io.post_send(IoSendRequest::new(
-            io.register_memory(64, AccessIntent::LocalOnly).unwrap(),
-            1,
-            IoOperationContext::new(()),
-        ))
-        .all_accepted()
-    );
-    let token = lock_unpoison(&poster.tokens)[0];
+    let shared = synthetic_engine(8);
+    let connection = synthetic_connection_on(&shared, 54);
+    connection.state.reserve_local(Direction::Send).unwrap();
+    assert!(shared.io_core.cq_credits.reserve());
+    let (sender, events) = super::super::io::event_port();
+    let (token, operation) = shared
+        .io_core
+        .operations
+        .allocate(|token| {
+            Arc::new(OperationState::new_with_event(
+                token,
+                Arc::clone(&connection.state),
+                Direction::Send,
+                WcOpcode::Send,
+                None,
+                1,
+                Some(IoEventDestination::new(sender, IoOperationContext::new(()))),
+            ))
+        })
+        .unwrap();
+    connection.state.add_accepted(token);
+    operation.commit_accepted();
+    shared
+        .io_core
+        .accepted_operations
+        .fetch_add(1, Ordering::AcqRel);
     shared.session.quarantine_operation(token);
     assert!(shared.session.operation_quarantined_for_test(token));
 
@@ -1595,9 +1634,6 @@ fn quarantine_clear_is_committed_before_completion_event_publication() {
         panic!("completion event")
     };
     assert!(completion.into_parts().2.is_ok());
-    drop(connection);
-    drop(driver);
-    drop(engine);
 }
 
 #[test]
