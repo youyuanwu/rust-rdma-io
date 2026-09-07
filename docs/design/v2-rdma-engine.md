@@ -303,8 +303,9 @@ and cancellation; `completion.rs` owns exact CQE validation, dispatch, and
 release; and `reclamation.rs` owns terminalization, quarantine, and positive-
 proof cleanup. `test_support.rs` and `tests.rs` are direct `cfg(test)` children.
 The hierarchy reflects current responsibilities rather than imposing a file-
-count rule; `batch` and `future` share only `validation` and never depend on
-one another.
+count rule. `batch` and `future` reach their shared submission vocabulary
+through `validation` instead of through each other, and neither depends on the
+other.
 `engine/session/mod.rs` defines the manager and its lifecycle capabilities.
 The CM and connection owners place production in
 `session/cm/mod.rs` and `session/connection/mod.rs`, with their unit tests in
