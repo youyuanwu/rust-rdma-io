@@ -940,6 +940,124 @@ fn analyze_io_effects_publication(
     Ok(analysis)
 }
 
+fn find_effect_boundary_constant_bypasses(
+    source: &str,
+    known_types: &HashSet<String>,
+) -> Result<Vec<String>, syn::Error> {
+    fn inspect_expression(
+        expression: &Expr,
+        location: String,
+        names: &HashSet<String>,
+        violations: &mut Vec<String>,
+    ) {
+        let mut publication = UncheckedEffectPublicationVisitor {
+            effects_names: names.clone(),
+            aliases: HashSet::new(),
+            function: location.clone(),
+            violations: Vec::new(),
+        };
+        publication.visit_expr(expression);
+        violations.extend(publication.violations);
+
+        let mut field_access = NamedFieldAccessVisitor {
+            field: "after_unlock",
+            lines: Vec::new(),
+        };
+        field_access.visit_expr(expression);
+        violations.extend(
+            field_access
+                .lines
+                .into_iter()
+                .map(|line| format!("{location}:after-unlock-field:{line}")),
+        );
+    }
+
+    fn inspect_items(
+        items: &[Item],
+        module_path: &mut Vec<String>,
+        known_types: &HashSet<String>,
+        violations: &mut Vec<String>,
+    ) {
+        for item in items {
+            if is_test_only(item_attrs(item)) {
+                continue;
+            }
+            match item {
+                Item::Const(constant) => inspect_expression(
+                    &constant.expr,
+                    qualified_name(module_path, &format!("const {}", constant.ident)),
+                    known_types,
+                    violations,
+                ),
+                Item::Static(constant) => inspect_expression(
+                    &constant.expr,
+                    qualified_name(module_path, &format!("static {}", constant.ident)),
+                    known_types,
+                    violations,
+                ),
+                Item::Impl(implementation) => {
+                    let owner = type_path_last(&implementation.self_ty)
+                        .unwrap_or_else(|| "<impl>".to_owned());
+                    let mut names = known_types.clone();
+                    if names.contains(&owner) {
+                        names.insert("Self".to_owned());
+                    }
+                    for implementation_item in &implementation.items {
+                        if let ImplItem::Const(constant) = implementation_item
+                            && !is_test_only(&constant.attrs)
+                        {
+                            inspect_expression(
+                                &constant.expr,
+                                qualified_name(
+                                    module_path,
+                                    &format!("{owner}::const {}", constant.ident),
+                                ),
+                                &names,
+                                violations,
+                            );
+                        }
+                    }
+                }
+                Item::Trait(trait_item) => {
+                    let mut names = known_types.clone();
+                    names.insert("Self".to_owned());
+                    for trait_member in &trait_item.items {
+                        if let TraitItem::Const(constant) = trait_member
+                            && !is_test_only(&constant.attrs)
+                            && let Some((_, expression)) = &constant.default
+                        {
+                            inspect_expression(
+                                expression,
+                                qualified_name(
+                                    module_path,
+                                    &format!("{}::const {}", trait_item.ident, constant.ident),
+                                ),
+                                &names,
+                                violations,
+                            );
+                        }
+                    }
+                }
+                Item::Mod(module) => {
+                    if let Some((_, items)) = &module.content {
+                        module_path.push(module.ident.to_string());
+                        inspect_items(items, module_path, known_types, violations);
+                        module_path.pop();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let syntax = syn::parse_file(source)?;
+    let mut violations = Vec::new();
+    inspect_items(&syntax.items, &mut Vec::new(), known_types, &mut violations);
+    violations.sort();
+    violations.dedup();
+    Ok(violations)
+}
+
 fn find_functions_using_dependencies(
     source: &str,
     forbidden: &[&str],
@@ -3117,6 +3235,42 @@ fn io_effect_publication_detector_rejects_unchecked_routes() {
         2,
         "const and static initializers must be included in publication inventory"
     );
+    let wrapper_const_bypass = r#"
+        struct CommittedIoCoreEffects { after_unlock: AfterEngineUnlock }
+        impl CommittedIoCoreEffects {
+            const BYPASS: fn(Self) -> AfterEngineUnlock = |value| {
+                let Self { after_unlock } = value;
+                after_unlock
+            };
+        }
+        trait Escape {
+            const BYPASS: fn(Self) = |value| {
+                let Self { after_unlock } = value;
+                after_unlock.publish();
+            };
+        }
+    "#;
+    assert!(
+        find_effect_boundary_constant_bypasses(wrapper_const_bypass, &base_effect_boundary_types(),)
+            .unwrap()
+            .len() >= 2,
+        "impl and trait associated constants must not extract effect payloads through Self"
+    );
+    let mut constant_aliases = base_effect_boundary_types();
+    expand_type_aliases(
+        "type Identity<T> = T; type Hidden<T = CommittedIoCoreEffects> = T;",
+        &mut constant_aliases,
+    )
+    .unwrap();
+    assert!(
+        !find_effect_boundary_constant_bypasses(
+            "const BYPASS: fn(Hidden) = |value| { let Hidden { after_unlock } = value; after_unlock.publish(); };",
+            &constant_aliases,
+        )
+        .unwrap()
+        .is_empty(),
+        "generic and cross-file aliases must not hide constant effect extraction"
+    );
     assert_eq!(
         find_production_zero_argument_method_calls(
             "trait Publisher { fn bypass(value: CommittedIoCoreEffects) { value.publish(); } }",
@@ -4605,6 +4759,7 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     let mut post_guard_publish_calls = Vec::new();
     let mut post_guard_function_references = Vec::new();
     let mut post_guard_use_aliases = Vec::new();
+    let mut effect_constant_bypasses = Vec::new();
     for path in effect_source_paths {
         let source = fs::read_to_string(&path).expect("read engine source");
         if source_is_test_only(&source)
@@ -4732,6 +4887,17 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
                 .into_iter()
                 .map(|alias| (path.clone(), alias)),
         );
+        effect_constant_bypasses.extend(
+            find_effect_boundary_constant_bypasses(&source, &global_effect_boundary_types)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "parse {} constant effect boundaries: {error}",
+                        path.display()
+                    )
+                })
+                .into_iter()
+                .map(|violation| (path.clone(), violation)),
+        );
     }
     assert_eq!(
         io_effects_definition_paths.as_slice(),
@@ -4830,6 +4996,10 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     assert!(
         post_guard_use_aliases.is_empty(),
         "the scalar post-guard publication helper must not escape through a use alias: {post_guard_use_aliases:#?}"
+    );
+    assert!(
+        effect_constant_bypasses.is_empty(),
+        "constant/static effect expressions must not extract or publish guarded payloads: {effect_constant_bypasses:#?}"
     );
     assert!(
         post_guard_publish_calls.len() == 3
