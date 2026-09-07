@@ -1698,13 +1698,40 @@ fn test_no_hidden_spawn_in_v2() {
         v2_dir.join("engine").join("driver").join("test_api.rs"),
         v2_dir.join("engine").join("driver").join("tests.rs"),
         v2_dir.join("engine").join("session").join("mod.rs"),
-        v2_dir.join("engine").join("session").join("cm.rs"),
-        v2_dir.join("engine").join("session").join("connection.rs"),
+        v2_dir
+            .join("engine")
+            .join("session")
+            .join("cm")
+            .join("mod.rs"),
+        v2_dir
+            .join("engine")
+            .join("session")
+            .join("cm")
+            .join("tests.rs"),
+        v2_dir
+            .join("engine")
+            .join("session")
+            .join("connection")
+            .join("mod.rs"),
+        v2_dir
+            .join("engine")
+            .join("session")
+            .join("connection")
+            .join("tests.rs"),
         v2_dir.join("engine").join("session").join("drain.rs"),
         v2_dir.join("engine").join("session").join("listener.rs"),
         v2_dir.join("engine").join("session").join("registry.rs"),
         v2_dir.join("engine").join("io_core").join("mod.rs"),
-        v2_dir.join("engine").join("io_core").join("operation.rs"),
+        v2_dir
+            .join("engine")
+            .join("io_core")
+            .join("operation")
+            .join("mod.rs"),
+        v2_dir
+            .join("engine")
+            .join("io_core")
+            .join("operation")
+            .join("tests.rs"),
         v2_dir.join("engine").join("io.rs"),
     ] {
         assert!(
@@ -1851,20 +1878,23 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     let io_path = v2_dir.join("engine").join("io.rs");
     let io_core_dir = v2_dir.join("engine").join("io_core");
     let io_core_mod_path = io_core_dir.join("mod.rs");
-    let io_core_operation_path = v2_dir.join("engine").join("io_core").join("operation.rs");
+    let io_core_operation_dir = io_core_dir.join("operation");
+    let io_core_operation_path = io_core_operation_dir.join("mod.rs");
+    let io_core_operation_tests_path = io_core_operation_dir.join("tests.rs");
     let io_core_progress_path = v2_dir.join("engine").join("io_core").join("progress.rs");
     let engine_mod_path = v2_dir.join("engine").join("mod.rs");
     let config_path = v2_dir.join("engine").join("config.rs");
     let progress_path = v2_dir.join("engine").join("progress.rs");
     let scheduler_path = v2_dir.join("engine").join("scheduler.rs");
-    let connection_path = v2_dir.join("engine").join("session").join("connection.rs");
-    let cm_path = v2_dir.join("engine").join("session").join("cm.rs");
-    let listener_path = v2_dir.join("engine").join("session").join("listener.rs");
+    let session_dir = v2_dir.join("engine").join("session");
+    let connection_path = session_dir.join("connection").join("mod.rs");
+    let connection_tests_path = session_dir.join("connection").join("tests.rs");
+    let cm_path = session_dir.join("cm").join("mod.rs");
+    let listener_path = session_dir.join("listener.rs");
     let driver_path = v2_dir.join("engine").join("driver").join("mod.rs");
-    let drain_path = v2_dir.join("engine").join("session").join("drain.rs");
-    let session_path = v2_dir.join("engine").join("session").join("mod.rs");
-    let session_progress_path = v2_dir.join("engine").join("session").join("progress.rs");
-    let session_registry_path = v2_dir.join("engine").join("session").join("registry.rs");
+    let drain_path = session_dir.join("drain.rs");
+    let session_path = session_dir.join("mod.rs");
+    let session_progress_path = session_dir.join("progress.rs");
     let v2_mod_path = v2_dir.join("mod.rs");
 
     let message = fs::read_to_string(&message_path).expect("read message transport source");
@@ -2106,24 +2136,20 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     assert!(engine_mod.contains("pub use io_core::RdmaOperation;"));
 
     let session_source = fs::read_to_string(&session_path).expect("read session manager source");
-    for path in [
-        &session_path,
-        &cm_path,
-        &connection_path,
-        &listener_path,
-        &drain_path,
-        &session_progress_path,
-        &session_registry_path,
-    ] {
-        let source = fs::read_to_string(path).expect("read session owner source");
-        let violations = find_forbidden_production_dependencies(&source, &["EngineShared"])
-            .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
-        assert!(
-            violations.is_empty(),
-            "{} bypasses the narrow session runtime capability: {}",
-            path.display(),
-            violations.join(", ")
-        );
+    for path in collect_rs_files(&session_dir).expect("recursively enumerate session sources") {
+        let source = fs::read_to_string(&path).expect("read session owner source");
+        if !source_is_test_only(&source)
+            .unwrap_or_else(|error| panic!("parse file-level cfg for {}: {error}", path.display()))
+        {
+            let violations = find_forbidden_production_dependencies(&source, &["EngineShared"])
+                .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
+            assert!(
+                violations.is_empty(),
+                "{} bypasses the narrow session runtime capability: {}",
+                path.display(),
+                violations.join(", ")
+            );
+        }
         let all_code_violations =
             find_forbidden_dependencies_including_tests(&source, &["EngineShared"])
                 .unwrap_or_else(|error| panic!("parse all code in {}: {error}", path.display()));
@@ -2316,16 +2342,18 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         "tests must not restore broad root/session Deref adapters: {}",
         broad_adapter_violations.join(", ")
     );
+    let connection_tests_source =
+        fs::read_to_string(&connection_tests_path).expect("read connection test source");
     assert!(
-        find_forbidden_dependencies_including_tests(&connection_source, &["EngineShared"])
+        find_forbidden_dependencies_including_tests(&connection_tests_source, &["EngineShared"])
             .expect("parse connection test ownership")
             .is_empty(),
         "RdmaConnection must not restore direct or aliased EngineShared ownership"
     );
     let allowed_root_functions = [
         "io.rs::IoConnection::with_delayed_close_event_for_test",
-        "io_core/operation.rs::tests::synthetic_engine_root",
-        "io_core/operation.rs::tests::terminal_wakers_can_reenter_after_terminal_guards_drop",
+        "io_core/operation/tests.rs::synthetic_engine_root",
+        "io_core/operation/tests.rs::terminal_wakers_can_reenter_after_terminal_guards_drop",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -2336,11 +2364,6 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     root_fixture_paths.push(io_path.clone());
     for path in root_fixture_paths {
         let source = fs::read_to_string(&path).expect("read I/O test fixture source");
-        if source_is_test_only(&source)
-            .unwrap_or_else(|error| panic!("parse file-level cfg for {}: {error}", path.display()))
-        {
-            continue;
-        }
         let relative = path
             .strip_prefix(&engine_dir)
             .expect("I/O fixture source beneath engine directory")
@@ -2384,15 +2407,15 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         "reviewed I/O root-fixture allowlist is stale: {}",
         missing_root_functions.join(", ")
     );
-    let io_operation_source =
-        fs::read_to_string(&io_core_operation_path).expect("read I/O operation source");
+    let io_operation_tests_source =
+        fs::read_to_string(&io_core_operation_tests_path).expect("read I/O operation tests");
     assert!(
-        io_operation_source.contains("struct OperationOwners")
-            && io_operation_source.contains("io_core: Arc<IoCore>")
-            && io_operation_source.contains("session: Arc<SessionManager>")
-            && io_operation_source.contains("_runtime: Arc<dyn SessionEngineRuntime>"),
+        io_operation_tests_source.contains("struct OperationOwners")
+            && io_operation_tests_source.contains("io_core: Arc<IoCore>")
+            && io_operation_tests_source.contains("session: Arc<SessionManager>")
+            && io_operation_tests_source.contains("_runtime: Arc<dyn SessionEngineRuntime>"),
         "{} must expose explicit owner-focused fixture parts with only an opaque runtime retain",
-        io_core_operation_path.display()
+        io_core_operation_tests_path.display()
     );
     let allowed_root_owner_methods = [
         "begin_driver_failure",
@@ -2715,6 +2738,100 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     }
     let io_core_operation_source =
         fs::read_to_string(&io_core_operation_path).expect("read I/O operation source");
+    let mut io_effects_impl_paths = Vec::new();
+    let mut io_effects_detached_publish_paths = Vec::new();
+    let mut quarantine_consumer_paths = Vec::new();
+    let mut drained_consumer_paths = Vec::new();
+    for path in collect_rs_files(&engine_dir).expect("enumerate I/O effect publication paths") {
+        let source = fs::read_to_string(&path).expect("read engine source");
+        if source_is_test_only(&source)
+            .unwrap_or_else(|error| panic!("parse file-level cfg for {}: {error}", path.display()))
+        {
+            continue;
+        }
+        io_effects_impl_paths.extend(std::iter::repeat_n(
+            path.clone(),
+            source.matches("impl IoCoreEffects {").count(),
+        ));
+        io_effects_detached_publish_paths.extend(std::iter::repeat_n(
+            path.clone(),
+            source.matches(".after_unlock.publish()").count(),
+        ));
+        quarantine_consumer_paths.extend(std::iter::repeat_n(
+            path.clone(),
+            source.matches(".take_quarantine()").count(),
+        ));
+        drained_consumer_paths.extend(std::iter::repeat_n(
+            path.clone(),
+            source.matches(".take_drained()").count(),
+        ));
+    }
+    assert_eq!(
+        io_effects_impl_paths,
+        [io_core_operation_path.clone()],
+        "IoCoreEffects must have one production implementation"
+    );
+    assert_eq!(
+        io_effects_detached_publish_paths,
+        [io_core_operation_path.clone()],
+        "IoCoreEffects detached publication must have one fail-closed route"
+    );
+    assert_eq!(
+        quarantine_consumer_paths,
+        [session_path.clone()],
+        "operation quarantine effects must be consumed only by SessionManager"
+    );
+    assert_eq!(
+        drained_consumer_paths,
+        [session_path.clone()],
+        "accepted-zero effects must be consumed only by SessionManager"
+    );
+    let io_effects_fields = io_core_operation_source
+        .split("pub(in crate::v2::engine) struct IoCoreEffects {")
+        .nth(1)
+        .and_then(|tail| tail.split("\n}\n\nimpl IoCoreEffects").next())
+        .expect("locate IoCoreEffects fields");
+    for private_field in ["after_unlock:", "quarantine:", "drained:"] {
+        let declaration = io_effects_fields
+            .lines()
+            .find(|line| line.contains(private_field))
+            .unwrap_or_else(|| panic!("locate IoCoreEffects field {private_field}"));
+        assert!(
+            !declaration.trim_start().starts_with("pub"),
+            "IoCoreEffects field `{private_field}` must remain private"
+        );
+    }
+    let io_effects_publish = io_core_operation_source
+        .split("pub(in crate::v2::engine) fn publish(self) {")
+        .nth(1)
+        .and_then(|tail| tail.split("\n    }\n}\n\nimpl IoCore").next())
+        .expect("locate IoCoreEffects::publish");
+    let quarantine_guard = io_effects_publish
+        .find("self.quarantine.is_empty()")
+        .expect("publish must reject unapplied operation quarantine effects");
+    let drained_guard = io_effects_publish
+        .find("self.drained.is_empty()")
+        .expect("publish must reject unapplied accepted-zero effects");
+    let detached_publish = io_effects_publish
+        .find("self.after_unlock.publish()")
+        .expect("publish must retain the detached post-guard publication");
+    assert!(
+        quarantine_guard < detached_publish && drained_guard < detached_publish,
+        "session-facing I/O effects must be rejected before detached publication"
+    );
+    let apply_io_effects = session_source
+        .split("pub(super) fn apply_io_effects(&self, effects: &mut IoCoreEffects) {")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("\n    }\n\n    pub(super) fn enqueue_completion")
+                .next()
+        })
+        .expect("locate SessionManager::apply_io_effects");
+    assert!(
+        apply_io_effects.contains("effects.take_quarantine()")
+            && apply_io_effects.contains("effects.take_drained()"),
+        "SessionManager must consume quarantine and accepted-zero effects before publication"
+    );
     let operation_state = io_core_operation_source
         .split("pub(in crate::v2::engine) struct OperationState {")
         .nth(1)
@@ -2820,14 +2937,7 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         );
     }
 
-    for relocated in [
-        "mod.rs",
-        "cm.rs",
-        "connection.rs",
-        "drain.rs",
-        "listener.rs",
-        "registry.rs",
-    ] {
+    for relocated in ["mod.rs", "drain.rs", "listener.rs", "registry.rs"] {
         assert!(
             v2_dir
                 .join("engine")
@@ -2835,6 +2945,18 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
                 .join(relocated)
                 .is_file(),
             "session relocation requires engine/session/{relocated}"
+        );
+    }
+    for owner in ["cm", "connection"] {
+        for child in ["mod.rs", "tests.rs"] {
+            assert!(
+                session_dir.join(owner).join(child).is_file(),
+                "session owner extraction requires engine/session/{owner}/{child}"
+            );
+        }
+        assert!(
+            !session_dir.join(format!("{owner}.rs")).exists(),
+            "session owner extraction must remove engine/session/{owner}.rs"
         );
     }
     for obsolete in [
