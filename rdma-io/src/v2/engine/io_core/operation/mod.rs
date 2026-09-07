@@ -1,6 +1,7 @@
 //! Owned low-level operation futures, admission, and exact CQE routing.
 
 mod accounting;
+mod effects;
 mod state;
 
 use std::future::Future;
@@ -16,13 +17,12 @@ use std::{
 
 use super::super::io::{
     IoEventDestination, IoEventSender, IoOperationContext, IoRecvRequest, IoSendRequest,
-    IoSubmissionDisposition, PendingIoEvent,
+    IoSubmissionDisposition,
 };
 use super::super::lifecycle::MemoizedTerminalResult;
 #[cfg(any(test, feature = "test-hooks"))]
 use super::super::registry::lock_unpoison;
 use super::super::registry::{ConnectionToken, Lookup, OperationToken};
-use super::super::session::IoEffectsCommitAuthority;
 use super::{Direction, EstablishedIoConnection, IoCore, OperationKind};
 use crate::v2::error::{Error, Result};
 use crate::v2::mr::{Mr, RemoteMr};
@@ -32,6 +32,10 @@ use crate::wc::{WcOpcode, WorkCompletion};
 use crate::wr::{PreparedRecvBatch, PreparedSendBatch, RecvWr, SendFlags, SendWr, Sge, WrOpcode};
 
 pub(super) use accounting::{CqCreditPool, OperationRegistry};
+use effects::{AfterEngineUnlock, DetachedIoCoreEffects};
+pub(in crate::v2::engine) use effects::{
+    CommittedIoCoreEffects, IoCoreEffects, OperationQuarantineEffect,
+};
 #[cfg(test)]
 use state::OperationLifecycle;
 use state::{CompletionDisposition, OperationState};
@@ -176,7 +180,7 @@ fn post_io_batch(
                     reserved,
                     error.clone(),
                 );
-                after_unlock.events.push(
+                after_unlock.push_event(
                     IoEventDestination::new(events.clone(), context).unaccepted(
                         None,
                         error.clone(),
@@ -196,13 +200,11 @@ fn post_io_batch(
         if let Err(error) = connection.reserve_local(direction) {
             let mut after_unlock =
                 rollback_internal_entries(shared, connection, direction, reserved, error.clone());
-            after_unlock
-                .events
-                .push(IoEventDestination::new(events.clone(), context).unaccepted(
-                    None,
-                    error.clone(),
-                    mr,
-                ));
+            after_unlock.push_event(IoEventDestination::new(events.clone(), context).unaccepted(
+                None,
+                error.clone(),
+                mr,
+            ));
             after_unlock.extend(detach_unreserved_entries(events, entries, error.clone()));
             drop(posting);
             drop(admission);
@@ -242,9 +244,7 @@ fn post_io_batch(
                     reserved,
                     error.clone(),
                 );
-                after_unlock
-                    .events
-                    .push(destination.unaccepted(None, error.clone(), mr));
+                after_unlock.push_event(destination.unaccepted(None, error.clone(), mr));
                 after_unlock.extend(detach_unreserved_entries(events, entries, error.clone()));
                 drop(posting);
                 drop(admission);
@@ -269,7 +269,7 @@ fn post_io_batch(
             let mut after_unlock =
                 rollback_internal_entries(shared, connection, direction, reserved, error.clone());
             if let Some(event) = release.event {
-                after_unlock.events.push(event);
+                after_unlock.push_event(event);
             }
             drop(release.mr);
             after_unlock.extend(detach_unreserved_entries(events, entries, error.clone()));
@@ -434,29 +434,6 @@ fn post_io_batch(
     }
 }
 
-#[derive(Default)]
-struct AfterEngineUnlock {
-    events: Vec<PendingIoEvent>,
-    operations_to_wake: Vec<Arc<OperationState>>,
-}
-
-impl AfterEngineUnlock {
-    fn extend(&mut self, mut other: Self) {
-        self.events.append(&mut other.events);
-        self.operations_to_wake
-            .append(&mut other.operations_to_wake);
-    }
-
-    fn publish(self) {
-        for event in self.events {
-            event.deliver();
-        }
-        for operation in self.operations_to_wake {
-            operation.wake();
-        }
-    }
-}
-
 enum InternalPreparedBatch {
     Recv(PreparedRecvBatch),
     Send(PreparedSendBatch),
@@ -476,15 +453,7 @@ fn commit_internal_entries(shared: &IoCore, entries: Vec<InternalBatchEntry>) ->
     let mut after_unlock = AfterEngineUnlock::default();
     for (state, completion) in early {
         let effects = shared.finish_operation(state, completion);
-        assert!(
-            effects.quarantine.is_empty(),
-            "post reconciliation cannot produce quarantine effects"
-        );
-        assert!(
-            effects.drained.is_empty(),
-            "post reconciliation cannot produce accepted-zero effects"
-        );
-        after_unlock.extend(effects.after_unlock);
+        after_unlock.extend(effects.into_after_unlock());
     }
     after_unlock
 }
@@ -562,7 +531,7 @@ fn release_proven_unaccepted_entries(
         shared.cq_credits.release();
         connection.established_io().release_local(direction);
         if let Some(event) = release.event {
-            after_unlock.events.push(event);
+            after_unlock.push_event(event);
         }
         drop(release.mr);
     }
@@ -580,10 +549,7 @@ fn detach_unreserved_entries(
             IoEventDestination::new(events.clone(), context).unaccepted(None, error.clone(), mr)
         })
         .collect();
-    AfterEngineUnlock {
-        events,
-        operations_to_wake: Vec::new(),
-    }
+    AfterEngineUnlock::from_events(events)
 }
 
 fn clone_io_error(error: &std::io::Error) -> std::io::Error {
@@ -1044,98 +1010,6 @@ impl PendingCompletion {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::v2::engine) enum OperationQuarantineEffect {
-    Added {
-        operation: OperationToken,
-        connection: ConnectionToken,
-    },
-    Cleared {
-        operation: OperationToken,
-        connection: ConnectionToken,
-    },
-}
-
-#[derive(Default)]
-/// Effects produced after I/O-owned operation and registry mutation completes.
-///
-/// This full bundle is deliberately not publishable. The session owner must
-/// consume it so quarantine and accepted-zero/drain effects are applied before
-/// its detached events and operation wakes become available.
-pub(in crate::v2::engine) struct IoCoreEffects {
-    after_unlock: AfterEngineUnlock,
-    quarantine: Vec<OperationQuarantineEffect>,
-    drained: Vec<ConnectionToken>,
-}
-
-/// Detached I/O publication after the session owner has committed all
-/// session-facing effects from the original [`IoCoreEffects`].
-///
-/// The root terminal path uses this state to preserve CM/connection
-/// terminalization before operation notifications. It cannot recover or reuse
-/// the original full bundle.
-pub(in crate::v2::engine) struct CommittedIoCoreEffects {
-    after_unlock: AfterEngineUnlock,
-}
-
-/// A detached-only result for a path that cannot produce session effects.
-///
-/// This is intentionally separate from [`IoCoreEffects`] and
-/// [`CommittedIoCoreEffects`]. Its only cross-module use is close-observer
-/// notification after admission and lifecycle guards have been released.
-pub(in crate::v2::engine) struct DetachedIoCoreEffects {
-    after_unlock: AfterEngineUnlock,
-}
-
-impl CommittedIoCoreEffects {
-    pub(in crate::v2::engine) fn publish(self) {
-        self.after_unlock.publish();
-    }
-}
-
-impl DetachedIoCoreEffects {
-    pub(in crate::v2::engine) fn publish(self) {
-        self.after_unlock.publish();
-    }
-}
-
-impl IoCoreEffects {
-    fn extend(&mut self, mut other: Self) {
-        self.after_unlock.extend(other.after_unlock);
-        self.quarantine.append(&mut other.quarantine);
-        self.drained.append(&mut other.drained);
-    }
-
-    pub(in crate::v2::engine) fn take_quarantine(&mut self) -> Vec<OperationQuarantineEffect> {
-        std::mem::take(&mut self.quarantine)
-    }
-
-    pub(in crate::v2::engine) fn take_drained(&mut self) -> Vec<ConnectionToken> {
-        std::mem::take(&mut self.drained)
-    }
-
-    fn into_after_unlock(self) -> AfterEngineUnlock {
-        assert!(
-            self.quarantine.is_empty(),
-            "engine must apply operation quarantine effects before publication"
-        );
-        assert!(
-            self.drained.is_empty(),
-            "engine must apply accepted-zero effects before publication"
-        );
-        self.after_unlock
-    }
-
-    pub(in crate::v2::engine) fn into_committed(
-        self,
-        _authority: &IoEffectsCommitAuthority,
-    ) -> CommittedIoCoreEffects {
-        CommittedIoCoreEffects {
-            after_unlock: self.into_after_unlock(),
-        }
-    }
-}
-
 impl IoCore {
     pub(in crate::v2::engine) fn fail_observers_for_close(
         &self,
@@ -1147,10 +1021,10 @@ impl IoCore {
             if let Lookup::Occupied(operation) = self.operations.lookup(token)
                 && operation.fail_observer_for_close(error.clone())
             {
-                after_unlock.operations_to_wake.push(operation);
+                after_unlock.push_operation_wake(operation);
             }
         }
-        DetachedIoCoreEffects { after_unlock }
+        DetachedIoCoreEffects::new(after_unlock)
     }
 
     pub(in crate::v2::engine) fn terminalize_operations(
@@ -1176,13 +1050,13 @@ impl IoCore {
                 self.quarantined_bytes
                     .fetch_add(operation.mr_len(), Ordering::AcqRel);
                 self.cq_credits.retain();
-                effects.quarantine.push(OperationQuarantineEffect::Added {
+                effects.push_quarantine(OperationQuarantineEffect::Added {
                     operation: operation.token(),
                     connection: operation.connection_token(),
                 });
             }
             if terminalized.should_wake {
-                effects.after_unlock.operations_to_wake.push(operation);
+                effects.push_operation_wake(operation);
             }
         }
         effects
@@ -1214,13 +1088,13 @@ impl IoCore {
                 self.quarantined_bytes
                     .fetch_add(operation.mr_len(), Ordering::AcqRel);
                 self.cq_credits.retain();
-                effects.quarantine.push(OperationQuarantineEffect::Added {
+                effects.push_quarantine(OperationQuarantineEffect::Added {
                     operation: operation.token(),
                     connection: operation.connection_token(),
                 });
             }
             if terminalized.should_wake {
-                effects.after_unlock.operations_to_wake.push(operation);
+                effects.push_operation_wake(operation);
             }
         }
         (effects, next, complete, scanned)
@@ -1364,20 +1238,18 @@ impl IoCore {
         if finished.was_reclaiming {
             self.pending_reclamations.fetch_sub(1, Ordering::AcqRel);
         }
-        let mut effects = IoCoreEffects {
-            after_unlock: AfterEngineUnlock {
-                events: finished.event.into_iter().collect(),
-                operations_to_wake: vec![Arc::clone(&operation)],
-            },
-            ..IoCoreEffects::default()
-        };
+        let mut effects = IoCoreEffects::default();
+        if let Some(event) = finished.event {
+            effects.push_event(event);
+        }
+        effects.push_operation_wake(Arc::clone(&operation));
         if finished.was_quarantined {
             self.cq_credits.release_retained();
             self.quarantined_operations.fetch_sub(1, Ordering::AcqRel);
             self.quarantined_mrs.fetch_sub(1, Ordering::AcqRel);
             self.quarantined_bytes
                 .fetch_sub(operation.mr_len(), Ordering::AcqRel);
-            effects.quarantine.push(OperationQuarantineEffect::Cleared {
+            effects.push_quarantine(OperationQuarantineEffect::Cleared {
                 operation: operation.token(),
                 connection: operation.connection_token(),
             });
@@ -1386,7 +1258,7 @@ impl IoCore {
             && !operation.connection().is_posting_open()
             && operation.connection().accepted_count() == 0
         {
-            effects.drained.push(operation.connection_token());
+            effects.push_drained(operation.connection_token());
         }
         effects
     }
@@ -1460,20 +1332,18 @@ impl IoCore {
         if finished.was_reclaiming {
             self.pending_reclamations.fetch_sub(1, Ordering::AcqRel);
         }
-        let mut effects = IoCoreEffects {
-            after_unlock: AfterEngineUnlock {
-                events: finished.event.into_iter().collect(),
-                operations_to_wake: vec![Arc::clone(&operation)],
-            },
-            ..IoCoreEffects::default()
-        };
+        let mut effects = IoCoreEffects::default();
+        if let Some(event) = finished.event {
+            effects.push_event(event);
+        }
+        effects.push_operation_wake(Arc::clone(&operation));
         if finished.was_quarantined {
             self.cq_credits.release_retained();
             self.quarantined_operations.fetch_sub(1, Ordering::AcqRel);
             self.quarantined_mrs.fetch_sub(1, Ordering::AcqRel);
             self.quarantined_bytes
                 .fetch_sub(operation.mr_len(), Ordering::AcqRel);
-            effects.quarantine.push(OperationQuarantineEffect::Cleared {
+            effects.push_quarantine(OperationQuarantineEffect::Cleared {
                 operation: operation.token(),
                 connection: operation.connection_token(),
             });
@@ -1543,13 +1413,12 @@ impl IoCore {
         self.quarantined_bytes
             .fetch_add(operation.mr_len(), Ordering::AcqRel);
         self.cq_credits.retain();
-        IoCoreEffects {
-            quarantine: vec![OperationQuarantineEffect::Added {
-                operation: operation.token(),
-                connection: operation.connection_token(),
-            }],
-            ..IoCoreEffects::default()
-        }
+        let mut effects = IoCoreEffects::default();
+        effects.push_quarantine(OperationQuarantineEffect::Added {
+            operation: operation.token(),
+            connection: operation.connection_token(),
+        });
+        effects
     }
 }
 

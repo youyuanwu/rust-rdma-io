@@ -1438,14 +1438,9 @@ fn scalar_early_publication_helper_releases_post_guards_without_a_provider() {
 
     let admission = shared.io_core.admission();
     let posting = connection.state.io.begin_posting().unwrap();
-    publish_after_post_guards(
-        posting,
-        admission,
-        AfterEngineUnlock {
-            events: Vec::new(),
-            operations_to_wake: vec![operation],
-        },
-    );
+    let mut after_unlock = AfterEngineUnlock::default();
+    after_unlock.push_operation_wake(operation);
+    publish_after_post_guards(posting, admission, after_unlock);
 
     assert!(wake.observed.load(Ordering::Acquire));
 }
