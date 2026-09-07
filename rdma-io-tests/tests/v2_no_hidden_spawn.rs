@@ -1445,6 +1445,36 @@ fn find_restricted_free_function_references(
     Ok(visitor.references)
 }
 
+fn find_restricted_free_function_use_aliases(
+    source: &str,
+    function: &str,
+) -> Result<Vec<String>, syn::Error> {
+    struct UseAliasCollector<'a> {
+        names: &'a mut HashSet<String>,
+    }
+
+    impl Visit<'_> for UseAliasCollector<'_> {
+        fn visit_item_use(&mut self, item: &syn::ItemUse) {
+            collect_use_aliases(&item.tree, self.names);
+            visit::visit_item_use(self, item);
+        }
+    }
+
+    let syntax = syn::parse_file(source)?;
+    let mut names = HashSet::from([function.to_owned()]);
+    loop {
+        let before = names.len();
+        UseAliasCollector { names: &mut names }.visit_file(&syntax);
+        if names.len() == before {
+            break;
+        }
+    }
+    names.remove(function);
+    let mut aliases = names.into_iter().collect::<Vec<_>>();
+    aliases.sort();
+    Ok(aliases)
+}
+
 fn type_mentions_any(ty: &Type, names: &HashSet<String>) -> bool {
     struct TypeNameVisitor<'a> {
         names: &'a HashSet<String>,
@@ -1471,6 +1501,20 @@ fn type_mentions_any(ty: &Type, names: &HashSet<String>) -> bool {
     };
     visitor.visit_type(ty);
     visitor.found
+}
+
+fn type_alias_mentions_any(alias: &syn::ItemType, names: &HashSet<String>) -> bool {
+    type_mentions_any(&alias.ty, names)
+        || alias.generics.params.iter().any(|parameter| {
+            matches!(
+                parameter,
+                syn::GenericParam::Type(parameter)
+                    if parameter
+                        .default
+                        .as_ref()
+                        .is_some_and(|(_, default)| type_mentions_any(default, names))
+            )
+        })
 }
 
 fn effect_owner_path(
@@ -1550,7 +1594,7 @@ fn find_effect_ufcs_publications(source: &str) -> Result<Vec<usize>, syn::Error>
 
     impl Visit<'_> for AliasCollector<'_> {
         fn visit_item_type(&mut self, alias: &syn::ItemType) {
-            if type_mentions_any(&alias.ty, self.names) {
+            if type_alias_mentions_any(alias, self.names) {
                 self.changed |= self.names.insert(alias.ident.to_string());
             }
             visit::visit_item_type(self, alias);
@@ -1646,7 +1690,7 @@ fn expand_type_aliases(source: &str, names: &mut HashSet<String>) -> Result<bool
 
     impl Visit<'_> for AliasCollector<'_> {
         fn visit_item_type(&mut self, alias: &syn::ItemType) {
-            if type_mentions_any(&alias.ty, self.names) {
+            if type_alias_mentions_any(alias, self.names) {
                 self.changed |= self.names.insert(alias.ident.to_string());
             }
             visit::visit_item_type(self, alias);
@@ -2825,6 +2869,20 @@ fn io_effect_publication_detector_rejects_unchecked_routes() {
         1,
         "generic identity aliases must not hide effect function items"
     );
+    let generic_default_alias = r#"
+        type Hidden<T = CommittedIoCoreEffects> = T;
+        fn bypass(effect: Hidden) {
+            let publish = Hidden::publish;
+            publish(effect);
+        }
+    "#;
+    assert_eq!(
+        find_restricted_effect_function_references(generic_default_alias)
+            .unwrap()
+            .len(),
+        1,
+        "generic defaults must not hide effect function items"
+    );
     assert_eq!(
         find_effect_ufcs_publications("trait Escape { fn bypass(self) { Self::publish(self); } }",)
             .unwrap()
@@ -2850,6 +2908,15 @@ fn io_effect_publication_detector_rejects_unchecked_routes() {
         .unwrap(),
         [2],
         "the post-guard publication helper must not escape through a function-item alias"
+    );
+    assert_eq!(
+        find_restricted_free_function_use_aliases(
+            "fn bypass() { use self::publish_after_post_guards as call; call(); }",
+            "publish_after_post_guards",
+        )
+        .unwrap(),
+        ["call"],
+        "use aliases must not hide the post-guard publication helper"
     );
     let self_destructure = r#"
         struct IoCoreEffects {
@@ -4556,6 +4623,15 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         .expect("find scalar publication helper references")
         .is_empty(),
         "the scalar post-guard publication helper must not escape as a function item"
+    );
+    assert!(
+        find_restricted_free_function_use_aliases(
+            &io_core_operation_source,
+            "publish_after_post_guards",
+        )
+        .expect("find scalar publication helper use aliases")
+        .is_empty(),
+        "the scalar post-guard publication helper must not escape through a use alias"
     );
     assert!(
         post_guard_publish_calls.len() == 3
