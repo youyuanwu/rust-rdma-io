@@ -535,15 +535,12 @@ fn clone_io_error(error: &std::io::Error) -> std::io::Error {
     }
 }
 
-/// `cfg(test)` mirrors of this module's private reservation vocabulary.
-///
-/// `operation::tests` reaches submission internals through `use super::*`, but
-/// the production entry and release types keep private fields so that no
-/// sibling can assemble or inspect reservations directly. These mirrors carry
-/// the same fields with operation-subtree visibility and delegate straight to
-/// the production functions, so tests exercise the real reconciliation without
-/// widening production visibility.
 /// Take-once ownership ledger paired with stable raw batch storage.
+///
+/// Declared ahead of the `cfg(test)` mirrors below because Clippy's
+/// `items_after_test_module` rejects trailing items after a `cfg(test)`
+/// module; Rust item order is semantically inert, so the placement carries no
+/// behavioral meaning.
 pub(super) struct PreparedBatchOwnership<T> {
     entries: Vec<T>,
 }
@@ -599,6 +596,14 @@ impl<T> PreparedBatchOwnership<T> {
     }
 }
 
+/// `cfg(test)` mirrors of this module's private reservation vocabulary.
+///
+/// `operation::tests` reaches submission internals through `use super::*`, but
+/// the production entry and release types keep private fields so that no
+/// sibling can assemble or inspect reservations directly. These mirrors carry
+/// the same fields with operation-subtree visibility and delegate straight to
+/// the production functions, so tests exercise the real reconciliation without
+/// widening production visibility.
 #[cfg(test)]
 pub(super) mod test_support {
     use super::*;
