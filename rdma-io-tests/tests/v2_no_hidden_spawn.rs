@@ -3655,13 +3655,13 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         );
     }
     assert_eq!(
-        io_effects_definition_paths,
-        [io_core_operation_path.clone()],
+        io_effects_definition_paths.as_slice(),
+        std::slice::from_ref(&io_core_operation_path),
         "IoCoreEffects must have one production definition"
     );
     assert_eq!(
-        io_effects_impl_paths,
-        [io_core_operation_path.clone()],
+        io_effects_impl_paths.as_slice(),
+        std::slice::from_ref(&io_core_operation_path),
         "IoCoreEffects must have one production implementation block"
     );
     assert_eq!(
