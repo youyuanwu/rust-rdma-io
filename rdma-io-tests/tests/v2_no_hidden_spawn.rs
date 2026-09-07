@@ -1292,44 +1292,16 @@ fn find_production_lifecycle_calls(
 struct ZeroArgumentMethodCallVisitor<'a> {
     method: &'a str,
     calls: Vec<String>,
-    functions: Vec<String>,
+    function: &'a str,
 }
 
 impl Visit<'_> for ZeroArgumentMethodCallVisitor<'_> {
     fn visit_expr_method_call(&mut self, call: &ExprMethodCall) {
         if call.method == self.method && call.args.is_empty() {
-            self.calls.push(format!(
-                "{}:{}",
-                self.functions.last().map_or("<module>", String::as_str),
-                call.span().start().line
-            ));
+            self.calls
+                .push(format!("{}:{}", self.function, call.span().start().line));
         }
         visit::visit_expr_method_call(self, call);
-    }
-
-    fn visit_item_fn(&mut self, function: &syn::ItemFn) {
-        if is_test_only(&function.attrs) {
-            return;
-        }
-        self.functions.push(function.sig.ident.to_string());
-        visit::visit_item_fn(self, function);
-        self.functions.pop();
-    }
-
-    fn visit_impl_item_fn(&mut self, function: &syn::ImplItemFn) {
-        if is_test_only(&function.attrs) {
-            return;
-        }
-        self.functions.push(function.sig.ident.to_string());
-        visit::visit_impl_item_fn(self, function);
-        self.functions.pop();
-    }
-
-    fn visit_item_mod(&mut self, module: &syn::ItemMod) {
-        if is_test_only(&module.attrs) {
-            return;
-        }
-        visit::visit_item_mod(self, module);
     }
 }
 
@@ -1337,11 +1309,115 @@ fn find_production_zero_argument_method_calls(
     source: &str,
     method: &str,
 ) -> Result<Vec<String>, syn::Error> {
+    fn inspect_items(
+        items: &[Item],
+        module_path: &mut Vec<String>,
+        method: &str,
+        calls: &mut Vec<String>,
+    ) {
+        for item in items {
+            if is_test_only(item_attrs(item)) {
+                continue;
+            }
+            match item {
+                Item::Fn(function) => {
+                    let name = qualified_name(module_path, &function.sig.ident.to_string());
+                    let mut visitor = ZeroArgumentMethodCallVisitor {
+                        method,
+                        calls: Vec::new(),
+                        function: &name,
+                    };
+                    visitor.visit_block(&function.block);
+                    calls.extend(visitor.calls);
+                }
+                Item::Impl(implementation) => {
+                    let owner = type_path_last(&implementation.self_ty)
+                        .unwrap_or_else(|| "<impl>".to_owned());
+                    for implementation_item in &implementation.items {
+                        let ImplItem::Fn(function) = implementation_item else {
+                            continue;
+                        };
+                        if is_test_only(&function.attrs) {
+                            continue;
+                        }
+                        let name = qualified_name(
+                            module_path,
+                            &format!("{owner}::{}", function.sig.ident),
+                        );
+                        let mut visitor = ZeroArgumentMethodCallVisitor {
+                            method,
+                            calls: Vec::new(),
+                            function: &name,
+                        };
+                        visitor.visit_block(&function.block);
+                        calls.extend(visitor.calls);
+                    }
+                }
+                Item::Mod(module) => {
+                    if let Some((_, items)) = &module.content {
+                        module_path.push(module.ident.to_string());
+                        inspect_items(items, module_path, method, calls);
+                        module_path.pop();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     let syntax = syn::parse_file(source)?;
-    let mut visitor = ZeroArgumentMethodCallVisitor {
-        method,
+    let mut calls = Vec::new();
+    inspect_items(&syntax.items, &mut Vec::new(), method, &mut calls);
+    Ok(calls)
+}
+
+struct EffectUfcsPublishVisitor<'a> {
+    effect_types: &'a HashSet<String>,
+    calls: Vec<usize>,
+}
+
+impl Visit<'_> for EffectUfcsPublishVisitor<'_> {
+    fn visit_expr_call(&mut self, call: &ExprCall) {
+        if let Expr::Path(path) = call.func.as_ref()
+            && path
+                .path
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident == "publish")
+        {
+            let receiver_type = path
+                .qself
+                .as_ref()
+                .and_then(|qself| type_path_last(&qself.ty))
+                .or_else(|| {
+                    let mut segments = path.path.segments.iter().rev();
+                    segments.next();
+                    segments.next().map(|segment| segment.ident.to_string())
+                });
+            if receiver_type
+                .as_ref()
+                .is_some_and(|name| self.effect_types.contains(name))
+            {
+                self.calls.push(call.span().start().line);
+            }
+        }
+        visit::visit_expr_call(self, call);
+    }
+}
+
+fn find_effect_ufcs_publications(source: &str) -> Result<Vec<usize>, syn::Error> {
+    let syntax = syn::parse_file(source)?;
+    let effect_types = identifiers_and_aliases(
+        &syntax,
+        &[
+            "AfterEngineUnlock",
+            "DetachedIoCoreEffects",
+            "CommittedIoCoreEffects",
+        ],
+    );
+    let mut visitor = EffectUfcsPublishVisitor {
+        effect_types: &effect_types,
         calls: Vec::new(),
-        functions: Vec::new(),
     };
     visitor.visit_file(&syntax);
     Ok(visitor.calls)
@@ -2262,8 +2338,27 @@ fn io_effect_publication_detector_rejects_unchecked_routes() {
             "publish",
         )
         .unwrap(),
-        ["bypass:1"],
+        ["nested::bypass:1"],
         "nested committed/detached publication calls must be visible to the route allowlist"
+    );
+    let nested_ufcs = r#"
+        type Direct = AfterEngineUnlock;
+        mod nested {
+            fn bypass(
+                direct: Direct,
+                detached: DetachedIoCoreEffects,
+                committed: CommittedIoCoreEffects,
+            ) {
+                Direct::publish(direct);
+                DetachedIoCoreEffects::publish(detached);
+                <CommittedIoCoreEffects>::publish(committed);
+            }
+        }
+    "#;
+    assert_eq!(
+        find_effect_ufcs_publications(nested_ufcs).unwrap().len(),
+        3,
+        "nested UFCS publication must be detected for every effect publication type and alias"
     );
 
     let additional_inherent_method = r#"
@@ -3711,6 +3806,7 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     let mut quarantine_consumer_paths = Vec::new();
     let mut drained_consumer_paths = Vec::new();
     let mut zero_argument_publish_calls = BTreeMap::<(PathBuf, String), usize>::new();
+    let mut effect_ufcs_publish_calls = Vec::new();
     for path in collect_rs_files(&engine_dir).expect("enumerate I/O effect publication paths") {
         let source = fs::read_to_string(&path).expect("read engine source");
         if source_is_test_only(&source)
@@ -3767,13 +3863,21 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
             .unwrap_or_else(|error| panic!("parse {} publish calls: {error}", path.display()))
         {
             let function = call
-                .split_once(':')
+                .rsplit_once(':')
                 .map_or(call.as_str(), |(function, _)| function)
                 .to_owned();
             *zero_argument_publish_calls
                 .entry((path.clone(), function))
                 .or_default() += 1;
         }
+        effect_ufcs_publish_calls.extend(
+            find_effect_ufcs_publications(&source)
+                .unwrap_or_else(|error| {
+                    panic!("parse {} effect UFCS publications: {error}", path.display())
+                })
+                .into_iter()
+                .map(|line| (path.clone(), line)),
+        );
     }
     assert_eq!(
         io_effects_definition_paths.as_slice(),
@@ -3807,7 +3911,10 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     assert_eq!(
         zero_argument_publish_calls,
         BTreeMap::from([
-            ((engine_mod_path.clone(), "finish".to_owned()), 1),
+            (
+                (engine_mod_path.clone(), "EngineShared::finish".to_owned()),
+                1,
+            ),
             (
                 (io_core_operation_path.clone(), "post_io_batch".to_owned(),),
                 14,
@@ -3819,11 +3926,40 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
                 ),
                 1,
             ),
-            ((io_core_operation_path.clone(), "publish".to_owned()), 2),
-            ((session_path.clone(), "commit_io_effects".to_owned(),), 1,),
-            ((drain_path.clone(), "begin_connection_close".to_owned()), 1),
+            (
+                (
+                    io_core_operation_path.clone(),
+                    "CommittedIoCoreEffects::publish".to_owned(),
+                ),
+                1,
+            ),
+            (
+                (
+                    io_core_operation_path.clone(),
+                    "DetachedIoCoreEffects::publish".to_owned(),
+                ),
+                1,
+            ),
+            (
+                (
+                    session_path.clone(),
+                    "SessionManager::commit_io_effects".to_owned(),
+                ),
+                1,
+            ),
+            (
+                (
+                    drain_path.clone(),
+                    "SessionManager::begin_connection_close".to_owned(),
+                ),
+                1,
+            ),
         ]),
         "every source-visible zero-argument publish route must remain explicitly classified"
+    );
+    assert!(
+        effect_ufcs_publish_calls.is_empty(),
+        "effect publication through UFCS is forbidden outside the method-owned boundaries: {effect_ufcs_publish_calls:#?}"
     );
     assert_eq!(
         find_production_lifecycle_calls(&io_core_operation_source, &["publish_after_post_guards"],)
