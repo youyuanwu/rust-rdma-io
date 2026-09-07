@@ -26,9 +26,10 @@ use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
 pub(super) use operation::CqeReject;
 pub use operation::RdmaOperation;
 pub(super) use operation::{
-    CommittedIoCoreEffects, CqCreditPool, IoCoreEffects, OperationQuarantineEffect,
-    OperationRegistry, QpReclaimCapability, post_io_recv_batch, post_io_send,
+    CommittedIoCoreEffects, IoCoreEffects, OperationQuarantineEffect, QpReclaimCapability,
+    post_io_recv_batch, post_io_send,
 };
+use operation::{CqCreditPool, OperationRegistry};
 #[cfg(test)]
 pub(super) use operation::{
     completion_for_driver_test, install_accepted_operation_for_driver_test,
@@ -346,8 +347,8 @@ struct AcceptedWrIdentity {
 
 /// State owned by the low-level operation/completion runtime.
 pub(super) struct IoCore {
-    pub(super) operations: OperationRegistry,
-    pub(super) cq_credits: CqCreditPool,
+    operations: OperationRegistry,
+    cq_credits: CqCreditPool,
     #[cfg(any(test, feature = "test-hooks"))]
     pub(super) rejected_cqes: AtomicU64,
     #[cfg(any(test, feature = "test-hooks"))]

@@ -1,21 +1,27 @@
 //! Owned low-level operation futures, admission, and exact CQE routing.
 
+mod accounting;
+mod state;
+
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLockReadGuard, Weak};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, RwLockReadGuard, Weak};
 use std::task::{Context, Poll};
-
-use futures_util::task::AtomicWaker;
+#[cfg(test)]
+use std::{
+    sync::Mutex,
+    sync::atomic::{AtomicBool, AtomicUsize},
+};
 
 use super::super::io::{
-    IoEventDestination, IoEventSender, IoOperationContext, IoOperationIdentity, IoRecvRequest,
-    IoSendRequest, IoSubmissionDisposition, PendingIoEvent,
+    IoEventDestination, IoEventSender, IoOperationContext, IoRecvRequest, IoSendRequest,
+    IoSubmissionDisposition, PendingIoEvent,
 };
 use super::super::lifecycle::MemoizedTerminalResult;
-use super::super::registry::{
-    ConnectionToken, Lookup, OperationToken, PagedRegistry, lock_unpoison,
-};
+#[cfg(any(test, feature = "test-hooks"))]
+use super::super::registry::lock_unpoison;
+use super::super::registry::{ConnectionToken, Lookup, OperationToken};
 use super::super::session::IoEffectsCommitAuthority;
 use super::{Direction, EstablishedIoConnection, IoCore, OperationKind};
 use crate::v2::error::{Error, Result};
@@ -24,6 +30,11 @@ use crate::v2::op::Completion;
 use crate::v2::qp::BatchPostOutcome;
 use crate::wc::{WcOpcode, WorkCompletion};
 use crate::wr::{PreparedRecvBatch, PreparedSendBatch, RecvWr, SendFlags, SendWr, Sge, WrOpcode};
+
+pub(super) use accounting::{CqCreditPool, OperationRegistry};
+#[cfg(test)]
+use state::OperationLifecycle;
+use state::{CompletionDisposition, OperationState};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::v2::engine) enum CqeReject {
@@ -532,26 +543,11 @@ fn release_proven_unaccepted_entries(
     entries: Vec<InternalBatchEntry>,
     error: Error,
 ) -> InternalRelease {
-    let releases = {
-        let mut inners = entries
-            .iter()
-            .map(|entry| lock_unpoison(&entry.state.inner))
-            .collect::<Vec<_>>();
-        if inners
-            .iter()
-            .any(|inner| !OperationState::can_release_unaccepted(inner))
-        {
-            None
-        } else {
-            Some(
-                entries
-                    .iter()
-                    .zip(inners.iter_mut())
-                    .map(|(entry, inner)| entry.state.take_unaccepted_locked(inner, error.clone()))
-                    .collect::<Vec<_>>(),
-            )
-        }
-    };
+    let states = entries
+        .iter()
+        .map(|entry| Arc::clone(&entry.state))
+        .collect::<Vec<_>>();
+    let releases = OperationState::take_proven_unaccepted_batch(&states, error);
     let Some(releases) = releases else {
         return InternalRelease::Retained(entries);
     };
@@ -669,7 +665,7 @@ impl Future for RdmaOperation {
                         };
                 }
                 FutureState::InFlight { operation, .. } => {
-                    operation.waker.register(cx.waker());
+                    operation.register_waker(cx.waker());
                     if let Some(output) = operation.take_output() {
                         self.state = FutureState::Done;
                         return Poll::Ready(output);
@@ -695,573 +691,9 @@ impl Drop for RdmaOperation {
         if let FutureState::InFlight { shared, operation } = state
             && operation.cancel(&shared)
         {
-            shared.schedule_reclamation(operation.token);
+            shared.schedule_reclamation(operation.token());
         }
     }
-}
-
-pub(in crate::v2::engine) struct OperationRegistry {
-    slots: PagedRegistry<OperationToken, Arc<OperationState>>,
-}
-
-impl OperationRegistry {
-    pub(in crate::v2::engine) fn new(capacity: usize) -> Result<Self> {
-        Ok(Self {
-            slots: PagedRegistry::new(capacity)?,
-        })
-    }
-
-    fn allocate(
-        &self,
-        make: impl FnOnce(OperationToken) -> Arc<OperationState>,
-    ) -> Result<(OperationToken, Arc<OperationState>)> {
-        self.slots.allocate_with(make)
-    }
-
-    pub(in crate::v2::engine) fn lookup(
-        &self,
-        token: OperationToken,
-    ) -> Lookup<Arc<OperationState>> {
-        self.slots.lookup_cloned(token)
-    }
-
-    fn release(&self, token: OperationToken, completed: bool) -> Option<Arc<OperationState>> {
-        self.slots.release(token, completed)
-    }
-
-    pub(in crate::v2::engine) fn live(&self) -> usize {
-        self.slots.live()
-    }
-
-    pub(in crate::v2::engine) fn occupied(&self) -> Vec<Arc<OperationState>> {
-        self.slots.occupied_cloned()
-    }
-
-    fn scan_occupied(
-        &self,
-        start: usize,
-        budget: usize,
-    ) -> (Vec<Arc<OperationState>>, usize, bool, usize) {
-        self.slots.scan_occupied_cloned(start, budget)
-    }
-}
-
-pub(in crate::v2::engine) struct CqCreditPool {
-    capacity: usize,
-    used: AtomicUsize,
-    retained: AtomicUsize,
-}
-
-impl CqCreditPool {
-    pub(in crate::v2::engine) fn new(capacity: usize) -> Self {
-        Self {
-            capacity,
-            used: AtomicUsize::new(0),
-            retained: AtomicUsize::new(0),
-        }
-    }
-
-    fn reserve(&self) -> bool {
-        let mut used = self.used.load(Ordering::Acquire);
-        loop {
-            if used >= self.capacity {
-                return false;
-            }
-            match self.used.compare_exchange_weak(
-                used,
-                used + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return true,
-                Err(observed) => used = observed,
-            }
-        }
-    }
-
-    fn release(&self) {
-        let previous = self.used.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "CQ admission release must have a reservation");
-    }
-
-    pub(in crate::v2::engine) fn retain(&self) {
-        self.retained.fetch_add(1, Ordering::AcqRel);
-    }
-
-    fn release_retained(&self) {
-        let previous = self.retained.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "retained CQ credit must exist");
-    }
-
-    pub(in crate::v2::engine) fn free(&self) -> usize {
-        self.capacity
-            .saturating_sub(self.used.load(Ordering::Acquire))
-    }
-
-    pub(in crate::v2::engine) fn retained(&self) -> usize {
-        self.retained.load(Ordering::Acquire)
-    }
-}
-
-pub(in crate::v2::engine) struct OperationState {
-    token: OperationToken,
-    connection: Arc<EstablishedIoConnection>,
-    direction: Direction,
-    expected_opcode: WcOpcode,
-    pub(in crate::v2::engine) mr_len: usize,
-    inner: Mutex<OperationInner>,
-    waker: AtomicWaker,
-    cancelled: AtomicBool,
-    quarantined: AtomicBool,
-}
-
-struct OperationInner {
-    lifecycle: OperationLifecycle,
-    mr: Option<Mr>,
-    completion: CompletionOwnership,
-    output: Option<(Result<Completion>, Option<Mr>)>,
-    detached: bool,
-    reclamation_pending: bool,
-    event_destination: Option<IoEventDestination>,
-}
-
-enum CompletionOwnership {
-    None,
-    // A validated CQE is owned by the connection dispatch queue.
-    Queued,
-    // Dispatch consumed that CQE before post reconciliation committed the WR.
-    Early(WorkCompletion),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OperationLifecycle {
-    Posting,
-    InFlight,
-    Completing,
-    Cancelled,
-    Reclaiming,
-    Quarantined,
-    Released,
-}
-
-trait IntoEstablishedIoConnection {
-    fn into_established_io(self) -> Arc<EstablishedIoConnection>;
-}
-
-impl IntoEstablishedIoConnection for Arc<EstablishedIoConnection> {
-    fn into_established_io(self) -> Arc<EstablishedIoConnection> {
-        self
-    }
-}
-
-#[cfg(test)]
-impl IntoEstablishedIoConnection for Arc<super::super::session::connection::ConnectionState> {
-    fn into_established_io(self) -> Arc<EstablishedIoConnection> {
-        Arc::clone(&self.io)
-    }
-}
-
-impl OperationState {
-    pub(in crate::v2::engine) fn token(&self) -> OperationToken {
-        self.token
-    }
-
-    pub(in crate::v2::engine) fn connection_token(&self) -> ConnectionToken {
-        self.connection.identity().connection
-    }
-
-    fn new(
-        token: OperationToken,
-        connection: impl IntoEstablishedIoConnection,
-        direction: Direction,
-        expected_opcode: WcOpcode,
-        mr: Option<Mr>,
-        mr_len: usize,
-    ) -> Self {
-        Self::new_with_event(
-            token,
-            connection,
-            direction,
-            expected_opcode,
-            mr,
-            mr_len,
-            None,
-        )
-    }
-
-    fn new_with_event(
-        token: OperationToken,
-        connection: impl IntoEstablishedIoConnection,
-        direction: Direction,
-        expected_opcode: WcOpcode,
-        mr: Option<Mr>,
-        mr_len: usize,
-        event_destination: Option<IoEventDestination>,
-    ) -> Self {
-        let detached = event_destination.is_some();
-        let connection = connection.into_established_io();
-        Self {
-            token,
-            connection,
-            direction,
-            expected_opcode,
-            mr_len,
-            inner: Mutex::new(OperationInner {
-                lifecycle: OperationLifecycle::Posting,
-                mr,
-                completion: CompletionOwnership::None,
-                output: None,
-                detached,
-                reclamation_pending: false,
-                event_destination,
-            }),
-            waker: AtomicWaker::new(),
-            cancelled: AtomicBool::new(false),
-            quarantined: AtomicBool::new(false),
-        }
-    }
-
-    fn commit_accepted(&self) -> Option<WorkCompletion> {
-        let mut inner = lock_unpoison(&self.inner);
-        self.connection.add_accepted(self.token);
-        let accepted_lifecycle = if inner.detached {
-            OperationLifecycle::Cancelled
-        } else {
-            OperationLifecycle::InFlight
-        };
-        match std::mem::replace(&mut inner.completion, CompletionOwnership::None) {
-            CompletionOwnership::None => {
-                inner.lifecycle = accepted_lifecycle;
-                None
-            }
-            CompletionOwnership::Queued => {
-                inner.completion = CompletionOwnership::Queued;
-                inner.lifecycle = accepted_lifecycle;
-                None
-            }
-            CompletionOwnership::Early(completion) => {
-                inner.lifecycle = OperationLifecycle::Completing;
-                Some(completion)
-            }
-        }
-    }
-
-    fn mark_completion_queued(&self) -> bool {
-        let mut inner = lock_unpoison(&self.inner);
-        if matches!(
-            inner.lifecycle,
-            OperationLifecycle::Completing | OperationLifecycle::Released
-        ) || !matches!(inner.completion, CompletionOwnership::None)
-        {
-            return false;
-        }
-        inner.completion = CompletionOwnership::Queued;
-        true
-    }
-
-    fn record_completion(&self, completion: WorkCompletion) -> CompletionDisposition {
-        let mut inner = lock_unpoison(&self.inner);
-        if !matches!(inner.completion, CompletionOwnership::Queued) {
-            return CompletionDisposition::Duplicate;
-        }
-        inner.completion = CompletionOwnership::None;
-        match inner.lifecycle {
-            OperationLifecycle::Posting => {
-                inner.completion = CompletionOwnership::Early(completion);
-                CompletionDisposition::Deferred
-            }
-            OperationLifecycle::InFlight
-            | OperationLifecycle::Cancelled
-            | OperationLifecycle::Reclaiming
-            | OperationLifecycle::Quarantined => {
-                inner.lifecycle = OperationLifecycle::Completing;
-                CompletionDisposition::Complete
-            }
-            OperationLifecycle::Completing | OperationLifecycle::Released => {
-                CompletionDisposition::Duplicate
-            }
-        }
-    }
-
-    fn cancel(&self, shared: &IoCore) -> bool {
-        if self.cancelled.swap(true, Ordering::AcqRel) {
-            return false;
-        }
-        let mut inner = lock_unpoison(&self.inner);
-        let mut completed_output = None;
-        let cancelled = match inner.lifecycle {
-            OperationLifecycle::InFlight => {
-                inner.lifecycle = OperationLifecycle::Cancelled;
-                inner.detached = true;
-                shared.pending_reclamations.fetch_add(1, Ordering::AcqRel);
-                inner.reclamation_pending = true;
-                true
-            }
-            OperationLifecycle::Released => {
-                inner.detached = true;
-                completed_output = inner.output.take();
-                false
-            }
-            OperationLifecycle::Posting => {
-                inner.detached = true;
-                shared.pending_reclamations.fetch_add(1, Ordering::AcqRel);
-                inner.reclamation_pending = true;
-                true
-            }
-            OperationLifecycle::Cancelled
-            | OperationLifecycle::Reclaiming
-            | OperationLifecycle::Quarantined
-            | OperationLifecycle::Completing => false,
-        };
-        drop(inner);
-        drop(completed_output);
-        cancelled
-    }
-
-    fn mark_reclaiming(&self) {
-        let mut inner = lock_unpoison(&self.inner);
-        if inner.lifecycle == OperationLifecycle::Cancelled {
-            inner.lifecycle = OperationLifecycle::Reclaiming;
-        }
-    }
-
-    pub(in crate::v2::engine) fn mark_quarantined(&self) -> QuarantineTransition {
-        let mut inner = lock_unpoison(&self.inner);
-        let was_reclaiming = inner.reclamation_pending;
-        match inner.lifecycle {
-            OperationLifecycle::InFlight
-            | OperationLifecycle::Cancelled
-            | OperationLifecycle::Reclaiming => {
-                inner.lifecycle = OperationLifecycle::Quarantined;
-                inner.reclamation_pending = false;
-                QuarantineTransition {
-                    newly_quarantined: !self.quarantined.swap(true, Ordering::AcqRel),
-                    was_reclaiming,
-                }
-            }
-            _ => QuarantineTransition {
-                newly_quarantined: false,
-                was_reclaiming: false,
-            },
-        }
-    }
-
-    pub(in crate::v2::engine) fn fail_observer_for_close(&self, error: Error) -> bool {
-        let mut inner = lock_unpoison(&self.inner);
-        if !inner.detached
-            && inner.output.is_none()
-            && matches!(
-                inner.lifecycle,
-                OperationLifecycle::InFlight
-                    | OperationLifecycle::Cancelled
-                    | OperationLifecycle::Reclaiming
-                    | OperationLifecycle::Quarantined
-            )
-        {
-            inner.detached = true;
-            inner.output = Some((Err(error), None));
-            return true;
-        }
-        false
-    }
-
-    fn finish_completion(&self, completion: WorkCompletion) -> FinishState {
-        let mut inner = lock_unpoison(&self.inner);
-        let was_reclaiming = inner.reclamation_pending;
-        inner.reclamation_pending = false;
-        let was_quarantined = self.quarantined.swap(false, Ordering::AcqRel);
-        let mut mr = inner.mr.take();
-        let typed = Completion::from_raw(completion);
-        let result = typed.result().map(|()| typed);
-        let event = inner.event_destination.take().map(|destination| {
-            let event_mr = mr.take();
-            destination.complete(
-                IoOperationIdentity::from_token(self.token),
-                result.clone(),
-                event_mr,
-            )
-        });
-        let detached_mr = if event.is_some() {
-            None
-        } else if inner.detached || inner.output.is_some() {
-            mr
-        } else {
-            inner.output = Some((result, mr));
-            None
-        };
-        inner.lifecycle = OperationLifecycle::Released;
-        drop(inner);
-        drop(detached_mr);
-        FinishState {
-            was_reclaiming,
-            was_quarantined,
-            event,
-        }
-    }
-
-    fn finish_after_qp_destroy(&self, error: Error) -> FinishState {
-        let mut inner = lock_unpoison(&self.inner);
-        let was_reclaiming = inner.reclamation_pending;
-        inner.reclamation_pending = false;
-        let was_quarantined = self.quarantined.swap(false, Ordering::AcqRel);
-        let mut mr = inner.mr.take();
-        let event = inner.event_destination.take().map(|destination| {
-            let event_mr = mr.take();
-            destination.complete(
-                IoOperationIdentity::from_token(self.token),
-                Err(error.clone()),
-                event_mr,
-            )
-        });
-        if event.is_none() && !inner.detached && inner.output.is_none() {
-            inner.output = Some((Err(error), None));
-        }
-        inner.lifecycle = OperationLifecycle::Released;
-        drop(inner);
-        drop(mr);
-        FinishState {
-            was_reclaiming,
-            was_quarantined,
-            event,
-        }
-    }
-
-    fn take_mr(&self) -> Option<Mr> {
-        lock_unpoison(&self.inner).mr.take()
-    }
-
-    fn take_unaccepted(&self, error: Error) -> Option<UnacceptedRelease> {
-        let mut inner = lock_unpoison(&self.inner);
-        if !Self::can_release_unaccepted(&inner) {
-            return None;
-        }
-        Some(self.take_unaccepted_locked(&mut inner, error))
-    }
-
-    fn can_release_unaccepted(inner: &OperationInner) -> bool {
-        inner.lifecycle == OperationLifecycle::Posting
-            && matches!(inner.completion, CompletionOwnership::None)
-    }
-
-    fn take_unaccepted_locked(
-        &self,
-        inner: &mut OperationInner,
-        error: Error,
-    ) -> UnacceptedRelease {
-        debug_assert!(Self::can_release_unaccepted(inner));
-        inner.lifecycle = OperationLifecycle::Released;
-        let mut mr = inner.mr.take();
-        let event = inner.event_destination.take().map(|destination| {
-            destination.unaccepted(
-                Some(IoOperationIdentity::from_token(self.token)),
-                error,
-                mr.take().expect("unaccepted I/O operation retains its MR"),
-            )
-        });
-        UnacceptedRelease { event, mr }
-    }
-
-    #[cfg(test)]
-    fn can_release_unaccepted_for_test(&self) -> bool {
-        let inner = lock_unpoison(&self.inner);
-        Self::can_release_unaccepted(&inner)
-    }
-
-    #[cfg(test)]
-    fn completion_ownership_for_test(&self) -> &'static str {
-        match lock_unpoison(&self.inner).completion {
-            CompletionOwnership::None => "none",
-            CompletionOwnership::Queued => "queued",
-            CompletionOwnership::Early(_) => "early",
-        }
-    }
-
-    fn take_output(&self) -> Option<(Result<Completion>, Option<Mr>)> {
-        lock_unpoison(&self.inner).output.take()
-    }
-
-    fn detach_with_post_error(&self, shared: &IoCore) {
-        let mut inner = lock_unpoison(&self.inner);
-        inner.detached = true;
-        inner.lifecycle = OperationLifecycle::Cancelled;
-        shared.pending_reclamations.fetch_add(1, Ordering::AcqRel);
-        inner.reclamation_pending = true;
-        self.cancelled.store(true, Ordering::Release);
-    }
-
-    pub(in crate::v2::engine) fn finalize_terminal(
-        &self,
-        outcome: &MemoizedTerminalResult,
-    ) -> TerminalizeState {
-        let mut inner = lock_unpoison(&self.inner);
-        let was_reclaiming = inner.reclamation_pending;
-        let newly_quarantined = match inner.lifecycle {
-            OperationLifecycle::InFlight
-            | OperationLifecycle::Cancelled
-            | OperationLifecycle::Reclaiming => {
-                inner.lifecycle = OperationLifecycle::Quarantined;
-                !self.quarantined.swap(true, Ordering::AcqRel)
-            }
-            OperationLifecycle::Quarantined => false,
-            OperationLifecycle::Posting
-            | OperationLifecycle::Completing
-            | OperationLifecycle::Released => {
-                return TerminalizeState {
-                    was_reclaiming: false,
-                    newly_quarantined: false,
-                    should_wake: false,
-                };
-            }
-        };
-        inner.reclamation_pending = false;
-        if !inner.detached && inner.output.is_none() {
-            let error = outcome.error().unwrap_or(Error::DriverShutdown);
-            inner.output = Some((Err(error), None));
-        }
-        drop(inner);
-        TerminalizeState {
-            was_reclaiming,
-            newly_quarantined,
-            should_wake: true,
-        }
-    }
-
-    pub(in crate::v2::engine) fn wake(&self) {
-        self.waker.wake();
-    }
-
-    #[cfg(test)]
-    fn lifecycle(&self) -> OperationLifecycle {
-        lock_unpoison(&self.inner).lifecycle
-    }
-}
-
-enum CompletionDisposition {
-    Deferred,
-    Complete,
-    Duplicate,
-}
-
-struct UnacceptedRelease {
-    event: Option<PendingIoEvent>,
-    mr: Option<Mr>,
-}
-
-struct FinishState {
-    was_reclaiming: bool,
-    was_quarantined: bool,
-    event: Option<PendingIoEvent>,
-}
-
-pub(in crate::v2::engine) struct QuarantineTransition {
-    pub(in crate::v2::engine) newly_quarantined: bool,
-    pub(in crate::v2::engine) was_reclaiming: bool,
-}
-
-pub(in crate::v2::engine) struct TerminalizeState {
-    pub(in crate::v2::engine) was_reclaiming: bool,
-    pub(in crate::v2::engine) newly_quarantined: bool,
-    pub(in crate::v2::engine) should_wake: bool,
 }
 
 enum StartResult {
@@ -1608,7 +1040,7 @@ impl QpReclaimCapability {
 
 impl PendingCompletion {
     pub(in crate::v2::engine) fn identity(&self) -> super::EstablishedIoIdentity {
-        self.operation.connection.identity()
+        self.operation.connection().identity()
     }
 }
 
@@ -1742,7 +1174,7 @@ impl IoCore {
                 self.quarantined_operations.fetch_add(1, Ordering::AcqRel);
                 self.quarantined_mrs.fetch_add(1, Ordering::AcqRel);
                 self.quarantined_bytes
-                    .fetch_add(operation.mr_len, Ordering::AcqRel);
+                    .fetch_add(operation.mr_len(), Ordering::AcqRel);
                 self.cq_credits.retain();
                 effects.quarantine.push(OperationQuarantineEffect::Added {
                     operation: operation.token(),
@@ -1780,7 +1212,7 @@ impl IoCore {
                 self.quarantined_operations.fetch_add(1, Ordering::AcqRel);
                 self.quarantined_mrs.fetch_add(1, Ordering::AcqRel);
                 self.quarantined_bytes
-                    .fetch_add(operation.mr_len, Ordering::AcqRel);
+                    .fetch_add(operation.mr_len(), Ordering::AcqRel);
                 self.cq_credits.retain();
                 effects.quarantine.push(OperationQuarantineEffect::Added {
                     operation: operation.token(),
@@ -1840,7 +1272,7 @@ impl IoCore {
         live: Option<super::super::registry::LiveIoConnectionProof>,
         connection: &Arc<EstablishedIoConnection>,
     ) -> Option<ConnectionToken> {
-        let identity = pending.operation.connection.identity();
+        let identity = pending.operation.connection().identity();
         if pending.completion.qp_num() != identity.qp_num {
             self.reject_cqe(CqeReject::WrongQpNum);
             return None;
@@ -1852,7 +1284,7 @@ impl IoCore {
             return None;
         }
         if pending.completion.is_success()
-            && pending.completion.opcode() != pending.operation.expected_opcode
+            && pending.completion.opcode() != pending.operation.expected_opcode()
         {
             self.reject_cqe(CqeReject::UnexpectedOpcode);
             return None;
@@ -1918,12 +1350,12 @@ impl IoCore {
         operation: Arc<OperationState>,
         completion: WorkCompletion,
     ) -> IoCoreEffects {
-        if self.operations.release(operation.token, true).is_none() {
+        if self.operations.release(operation.token(), true).is_none() {
             self.reject_cqe(CqeReject::Duplicate);
             return IoCoreEffects::default();
         }
-        let removed = operation.connection.remove_accepted(operation.token);
-        operation.connection.release_local(operation.direction);
+        let removed = operation.connection().remove_accepted(operation.token());
+        operation.connection().release_local(operation.direction());
         self.cq_credits.release();
         let previous = self.accepted_operations.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0, "accepted operation count must be positive");
@@ -1944,15 +1376,15 @@ impl IoCore {
             self.quarantined_operations.fetch_sub(1, Ordering::AcqRel);
             self.quarantined_mrs.fetch_sub(1, Ordering::AcqRel);
             self.quarantined_bytes
-                .fetch_sub(operation.mr_len, Ordering::AcqRel);
+                .fetch_sub(operation.mr_len(), Ordering::AcqRel);
             effects.quarantine.push(OperationQuarantineEffect::Cleared {
-                operation: operation.token,
+                operation: operation.token(),
                 connection: operation.connection_token(),
             });
         }
         if removed
-            && !operation.connection.is_posting_open()
-            && operation.connection.accepted_count() == 0
+            && !operation.connection().is_posting_open()
+            && operation.connection().accepted_count() == 0
         {
             effects.drained.push(operation.connection_token());
         }
@@ -2019,7 +1451,7 @@ impl IoCore {
             );
             return (false, IoCoreEffects::default());
         }
-        connection.release_local(operation.direction);
+        connection.release_local(operation.direction());
         self.cq_credits.release();
         let previous = self.accepted_operations.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0, "accepted operation count must be positive");
@@ -2040,9 +1472,9 @@ impl IoCore {
             self.quarantined_operations.fetch_sub(1, Ordering::AcqRel);
             self.quarantined_mrs.fetch_sub(1, Ordering::AcqRel);
             self.quarantined_bytes
-                .fetch_sub(operation.mr_len, Ordering::AcqRel);
+                .fetch_sub(operation.mr_len(), Ordering::AcqRel);
             effects.quarantine.push(OperationQuarantineEffect::Cleared {
-                operation: operation.token,
+                operation: operation.token(),
                 connection: operation.connection_token(),
             });
         }
@@ -2109,7 +1541,7 @@ impl IoCore {
         self.quarantined_operations.fetch_add(1, Ordering::AcqRel);
         self.quarantined_mrs.fetch_add(1, Ordering::AcqRel);
         self.quarantined_bytes
-            .fetch_add(operation.mr_len, Ordering::AcqRel);
+            .fetch_add(operation.mr_len(), Ordering::AcqRel);
         self.cq_credits.retain();
         IoCoreEffects {
             quarantine: vec![OperationQuarantineEffect::Added {
@@ -2161,7 +1593,7 @@ pub(in crate::v2::engine) fn register_operation_waker_for_test(
     let Lookup::Occupied(operation) = io_core.operations.lookup(token) else {
         panic!("test operation must remain registered")
     };
-    operation.waker.register(waker);
+    operation.register_waker(waker);
 }
 
 #[cfg(test)]
