@@ -299,8 +299,8 @@ unit tests in its direct child `engine/io_core/operation/tests.rs`.
 The CM and connection owners place production in
 `session/cm/mod.rs` and `session/connection/mod.rs`, with their unit tests in
 the respective direct-child `tests.rs` files; `session/listener.rs`,
-`session/drain.rs`, and `session/registry.rs` retain the remaining
-session-owned state and policy. These extracted test files remain direct
+`session/drain.rs`, `session/progress.rs`, and `session/registry.rs` retain
+the remaining session-owned state and policy. These extracted test files remain direct
 children of their private owner modules, preserving private-invariant access,
 existing test-hook paths, and narrow visibility. The remaining
 `engine/registry.rs` is not a connection owner: it provides opaque connection
