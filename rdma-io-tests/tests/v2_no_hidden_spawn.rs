@@ -921,6 +921,10 @@ fn is_test_only(attrs: &[Attribute]) -> bool {
     })
 }
 
+fn source_is_test_only(source: &str) -> Result<bool, syn::Error> {
+    Ok(is_test_only(&syn::parse_file(source)?.attrs))
+}
+
 fn item_attrs(item: &Item) -> &[Attribute] {
     match item {
         Item::Const(item) => &item.attrs,
@@ -1274,6 +1278,9 @@ fn find_spawn_violations(source: &str) -> Vec<String> {
         Ok(syntax) => syntax,
         Err(error) => return vec![format!("source parse failed: {error}")],
     };
+    if is_test_only(&syntax.attrs) {
+        return Vec::new();
+    }
     let mut aliases = AliasCollector::default();
     aliases.visit_file(&syntax);
     let mut detector = SpawnDetector::new(&aliases, source);
@@ -1379,6 +1386,31 @@ fn expression_block() {
         violations
             .iter()
             .any(|violation| violation.contains("spawn_local"))
+    );
+
+    let test_file = r#"
+#![cfg(test)]
+
+fn allowed_in_a_test_only_file() {
+    tokio::spawn(async {});
+}
+"#;
+    assert!(
+        find_spawn_violations(test_file).is_empty(),
+        "a recursively discovered test-only source must retain its file-level cfg context"
+    );
+
+    let feature_file = r#"
+#![cfg(any(test, feature = "test-hooks"))]
+
+fn reachable_with_test_hooks() {
+    tokio::spawn(async {});
+}
+"#;
+    assert_eq!(
+        find_spawn_violations(feature_file).len(),
+        1,
+        "a test-hooks source remains production-reachable and must be scanned"
     );
 }
 
@@ -1662,7 +1694,9 @@ fn test_no_hidden_spawn_in_v2() {
         v2_dir.join("mod.rs"),
         v2_dir.join("message_transport.rs"),
         v2_dir.join("engine").join("mod.rs"),
-        v2_dir.join("engine").join("driver.rs"),
+        v2_dir.join("engine").join("driver").join("mod.rs"),
+        v2_dir.join("engine").join("driver").join("test_api.rs"),
+        v2_dir.join("engine").join("driver").join("tests.rs"),
         v2_dir.join("engine").join("session").join("mod.rs"),
         v2_dir.join("engine").join("session").join("cm.rs"),
         v2_dir.join("engine").join("session").join("connection.rs"),
@@ -1675,7 +1709,7 @@ fn test_no_hidden_spawn_in_v2() {
     ] {
         assert!(
             files.binary_search(&required).is_ok(),
-            "expected production source missing from scan scope: {}",
+            "expected v2 source missing from scan scope: {}",
             required.display()
         );
     }
@@ -1683,6 +1717,11 @@ fn test_no_hidden_spawn_in_v2() {
     let mut violations = Vec::new();
     for path in &files {
         let content = fs::read_to_string(path).expect("read file");
+        if source_is_test_only(&content)
+            .unwrap_or_else(|error| panic!("parse file-level cfg for {}: {error}", path.display()))
+        {
+            continue;
+        }
         violations.extend(
             find_spawn_violations(&content)
                 .into_iter()
@@ -1761,6 +1800,11 @@ fn test_live_io_proof_issuance_is_confined_to_session_registry() {
 
     for path in collect_rs_files(&engine_dir).expect("enumerate live-I/O proof issuance sites") {
         let source = fs::read_to_string(&path).expect("read engine source");
+        if source_is_test_only(&source)
+            .unwrap_or_else(|error| panic!("parse file-level cfg for {}: {error}", path.display()))
+        {
+            continue;
+        }
         let locations =
             find_live_io_proof_issuance(&source).expect("parse live-I/O proof issuance source");
         if path == issuer_path {
@@ -1816,7 +1860,7 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     let connection_path = v2_dir.join("engine").join("session").join("connection.rs");
     let cm_path = v2_dir.join("engine").join("session").join("cm.rs");
     let listener_path = v2_dir.join("engine").join("session").join("listener.rs");
-    let driver_path = v2_dir.join("engine").join("driver.rs");
+    let driver_path = v2_dir.join("engine").join("driver").join("mod.rs");
     let drain_path = v2_dir.join("engine").join("session").join("drain.rs");
     let session_path = v2_dir.join("engine").join("session").join("mod.rs");
     let session_progress_path = v2_dir.join("engine").join("session").join("progress.rs");
@@ -1933,6 +1977,11 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     ];
     for path in collect_rs_files(&io_core_dir).expect("enumerate I/O core source") {
         let source = fs::read_to_string(&path).expect("read I/O core source");
+        if source_is_test_only(&source)
+            .unwrap_or_else(|error| panic!("parse file-level cfg for {}: {error}", path.display()))
+        {
+            continue;
+        }
         let violations =
             find_forbidden_production_dependencies(&source, &forbidden_core_dependencies)
                 .expect("parse I/O core source");
@@ -2249,6 +2298,11 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     let mut broad_adapter_violations = Vec::new();
     for path in collect_rs_files(&engine_dir).expect("enumerate root/session Deref adapters") {
         let source = fs::read_to_string(&path).expect("read engine source");
+        if source_is_test_only(&source)
+            .unwrap_or_else(|error| panic!("parse file-level cfg for {}: {error}", path.display()))
+        {
+            continue;
+        }
         for owner in ["EngineShared", "SessionManager"] {
             if has_trait_impl(&source, owner, "Deref").unwrap_or_else(|error| {
                 panic!("parse {} {owner} Deref impls: {error}", path.display())
@@ -2282,6 +2336,11 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     root_fixture_paths.push(io_path.clone());
     for path in root_fixture_paths {
         let source = fs::read_to_string(&path).expect("read I/O test fixture source");
+        if source_is_test_only(&source)
+            .unwrap_or_else(|error| panic!("parse file-level cfg for {}: {error}", path.display()))
+        {
+            continue;
+        }
         let relative = path
             .strip_prefix(&engine_dir)
             .expect("I/O fixture source beneath engine directory")
@@ -2349,6 +2408,11 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     let mut unexpected_root_owner_methods = Vec::new();
     for path in collect_rs_files(&engine_dir).expect("enumerate EngineShared implementations") {
         let source = fs::read_to_string(&path).expect("read EngineShared implementation");
+        if source_is_test_only(&source)
+            .unwrap_or_else(|error| panic!("parse file-level cfg for {}: {error}", path.display()))
+        {
+            continue;
+        }
         unexpected_root_owner_methods.extend(
             find_inherent_methods_accessing_fields(
                 &source,
@@ -2383,6 +2447,11 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     let mut root_forwarder_violations = Vec::new();
     for path in collect_rs_files(&engine_dir).expect("enumerate root forwarders") {
         let source = fs::read_to_string(&path).expect("read engine source");
+        if source_is_test_only(&source)
+            .unwrap_or_else(|error| panic!("parse file-level cfg for {}: {error}", path.display()))
+        {
+            continue;
+        }
         root_forwarder_violations.extend(
             find_inherent_methods(&source, "EngineShared", &obsolete_method_names)
                 .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()))
@@ -2403,12 +2472,7 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         );
     }
     let driver_source = fs::read_to_string(&driver_path).expect("read engine driver source");
-    let production_driver = driver_source
-        .split(
-            "#[cfg(any(test, feature = \"test-hooks\"))]\n#[doc(hidden)]\npub(super) mod test_api",
-        )
-        .next()
-        .expect("locate production driver prefix");
+    let production_driver = driver_source.as_str();
     let session_progress_source =
         fs::read_to_string(&session_progress_path).expect("read session progress source");
     assert_final_driver_boundary(
@@ -2595,6 +2659,11 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     );
     for path in collect_rs_files(&engine_dir).expect("enumerate engine sources") {
         let source = fs::read_to_string(&path).expect("read engine source");
+        if source_is_test_only(&source)
+            .unwrap_or_else(|error| panic!("parse file-level cfg for {}: {error}", path.display()))
+        {
+            continue;
+        }
         let mut calls = find_production_lifecycle_calls(
             &source,
             &["to_error", "destroy_qp", "destroy_connection"],
@@ -2700,6 +2769,11 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
             continue;
         }
         let source = fs::read_to_string(&path).expect("read engine source");
+        if source_is_test_only(&source)
+            .unwrap_or_else(|error| panic!("parse file-level cfg for {}: {error}", path.display()))
+        {
+            continue;
+        }
         assert!(
             !source.contains(".io_core.reclaim_after_qp_destroy("),
             "{} bypasses the proof-gated QP reclaim capability",
