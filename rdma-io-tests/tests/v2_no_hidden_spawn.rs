@@ -1787,6 +1787,13 @@ fn effect_owner_path(
     self_types: &[String],
 ) -> bool {
     if let Some(qself) = &path.qself {
+        // Associated-type projections can hide an effect behind unconstrained
+        // generic parameters and defaults. Reject every projected use of a
+        // restricted method name rather than attempting incomplete local type
+        // inference.
+        if qself.position < path.path.segments.len() {
+            return true;
+        }
         if type_mentions_any(&qself.ty, effect_types) {
             return true;
         }
@@ -3352,6 +3359,25 @@ fn io_effect_publication_detector_rejects_unchecked_routes() {
             .unwrap(),
         ["Marker::type Output"],
         "associated-type projections must not hide effect boundary types"
+    );
+    let generic_projection = r#"
+        struct AfterEngineUnlock;
+        struct CommittedIoCoreEffects { after_unlock: AfterEngineUnlock }
+        impl CommittedIoCoreEffects { fn publish(self) {} }
+        trait Map<T = CommittedIoCoreEffects> { type Out; }
+        struct Marker;
+        impl<T> Map<T> for Marker { type Out = T; }
+        fn bypass(value: <Marker as Map>::Out) {
+            let publish = <Marker as Map>::Out::publish;
+            publish(value);
+        }
+    "#;
+    assert_eq!(
+        find_restricted_effect_function_references(generic_projection)
+            .unwrap()
+            .len(),
+        1,
+        "associated-type projections of generic defaults must not hide effect publication"
     );
     assert_eq!(
         find_production_zero_argument_method_calls(
