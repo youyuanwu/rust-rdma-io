@@ -585,17 +585,11 @@ fn assert_statement_guards_field(statement: &syn::Stmt, field: &str) -> bool {
     assert_statement_guards_named_field(statement, "self", field)
 }
 
-fn statement_publishes_self_after_unlock(statement: &syn::Stmt) -> bool {
-    let syn::Stmt::Expr(Expr::MethodCall(call), _) = statement else {
+fn statement_returns_self_after_unlock(statement: &syn::Stmt) -> bool {
+    let syn::Stmt::Expr(expression, None) = statement else {
         return false;
     };
-    call.method == "publish"
-        && matches!(
-            call.receiver.as_ref(),
-            Expr::Field(field)
-                if matches!(&field.member, syn::Member::Named(member) if member == "after_unlock")
-                    && expression_is_rooted_at_self(&field.base)
-        )
+    expression_is_named_field(expression, "self", "after_unlock")
 }
 
 fn has_guarded_internal_effect_extraction(source: &str) -> Result<bool, syn::Error> {
@@ -644,6 +638,10 @@ fn has_guarded_internal_effect_extraction(source: &str) -> Result<bool, syn::Err
 fn analyze_io_effects_publication(
     source: &str,
 ) -> Result<IoEffectsPublicationAnalysis, syn::Error> {
+    // This guard intentionally reasons about ordinary parsed Rust syntax.
+    // Unlike the hidden-spawn detector, it does not inspect macro token
+    // streams and therefore does not claim to detect publication introduced
+    // only by macro expansion.
     fn inspect_items(
         items: &[Item],
         module_path: &mut Vec<String>,
@@ -722,7 +720,7 @@ fn analyze_io_effects_publication(
                                 .into_iter()
                                 .map(|line| format!("{function_name}:{line}")),
                         );
-                        if implementation.trait_.is_none() && name == "publish" {
+                        if implementation.trait_.is_none() && name == "into_after_unlock" {
                             let statements = &function.block.stmts;
                             analysis.publish_methods.push((
                                 function.sig.ident.span().start().line,
@@ -731,9 +729,16 @@ fn analyze_io_effects_publication(
                                 statements.len() == 3
                                     && assert_statement_guards_field(&statements[1], "drained"),
                                 statements.len() == 3
-                                    && statement_publishes_self_after_unlock(&statements[2]),
+                                    && statement_returns_self_after_unlock(&statements[2]),
                             ));
                             continue;
+                        }
+                        if implementation.trait_.is_none() && name == "publish" {
+                            analysis.violations.push(format!(
+                                "{}:broad-publish:{}",
+                                function_name,
+                                function.sig.ident.span().start().line
+                            ));
                         }
                         if implementation.trait_.is_none() && name != "extend" {
                             let mut field_visitor = NamedFieldAccessVisitor {
@@ -767,6 +772,13 @@ fn analyze_io_effects_publication(
                         let ImplItem::Fn(function) = implementation_item else {
                             continue;
                         };
+                        if matches!(
+                            owner.as_str(),
+                            "CommittedIoCoreEffects" | "DetachedIoCoreEffects"
+                        ) && function.sig.ident == "publish"
+                        {
+                            continue;
+                        }
                         if is_test_only(&function.attrs) {
                             continue;
                         }
@@ -2134,10 +2146,10 @@ fn io_effect_publication_detector_rejects_unchecked_routes() {
             drained: Vec<Token>,
         }
         impl IoCoreEffects {
-            fn publish(self) {
+            fn into_after_unlock(self) -> AfterEngineUnlock {
                 assert!(self.quarantine.is_empty());
                 assert!(self.drained.is_empty());
-                self.after_unlock.publish();
+                self.after_unlock
             }
         }
     "#;
@@ -2147,13 +2159,53 @@ fn io_effect_publication_detector_rejects_unchecked_routes() {
     assert!(quarantine_guarded && drained_guarded && detached_publish);
     assert!(guarded.violations.is_empty(), "{:#?}", guarded.violations);
 
-    let additional_inherent_method = r#"
-        struct IoCoreEffects { after_unlock: AfterEngineUnlock }
+    let broad_publish = r#"
+        struct IoCoreEffects {
+            after_unlock: AfterEngineUnlock,
+            quarantine: Vec<Effect>,
+            drained: Vec<Token>,
+        }
         impl IoCoreEffects {
             fn publish(self) {
                 assert!(self.quarantine.is_empty());
                 assert!(self.drained.is_empty());
                 self.after_unlock.publish();
+            }
+        }
+    "#;
+    assert!(
+        analyze_io_effects_publication(broad_publish)
+            .unwrap()
+            .violations
+            .iter()
+            .any(|violation| violation.contains("broad-publish")),
+        "a broad IoCoreEffects publication surface must be rejected"
+    );
+
+    let nested_bypass = r#"
+        struct IoCoreEffects { after_unlock: AfterEngineUnlock }
+        mod nested {
+            impl IoCoreEffects {
+                fn bypass(self) { self.after_unlock.publish(); }
+            }
+        }
+    "#;
+    assert!(
+        analyze_io_effects_publication(nested_bypass)
+            .unwrap()
+            .violations
+            .iter()
+            .any(|violation| violation.contains("nested::IoCoreEffects::bypass")),
+        "a publication bypass in a nested child module must be rejected"
+    );
+
+    let additional_inherent_method = r#"
+        struct IoCoreEffects { after_unlock: AfterEngineUnlock }
+        impl IoCoreEffects {
+            fn into_after_unlock(self) -> AfterEngineUnlock {
+                assert!(self.quarantine.is_empty());
+                assert!(self.drained.is_empty());
+                self.after_unlock
             }
             fn bypass(self) { self.after_unlock.publish(); }
         }
@@ -2232,12 +2284,12 @@ fn io_effect_publication_detector_rejects_unchecked_routes() {
     let conditional_guards = r#"
         struct IoCoreEffects { after_unlock: AfterEngineUnlock }
         impl IoCoreEffects {
-            fn publish(self) {
+            fn into_after_unlock(self) -> AfterEngineUnlock {
                 if should_check() {
                     assert!(self.quarantine.is_empty());
                     assert!(self.drained.is_empty());
                 }
-                self.after_unlock.publish();
+                self.after_unlock
             }
         }
     "#;
@@ -2253,10 +2305,10 @@ fn io_effect_publication_detector_rejects_unchecked_routes() {
     let non_guard_assertions = r#"
         struct IoCoreEffects { after_unlock: AfterEngineUnlock }
         impl IoCoreEffects {
-            fn publish(self) {
+            fn into_after_unlock(self) -> AfterEngineUnlock {
                 assert!(true || self.quarantine.is_empty());
                 assert!(self.drained.is_empty() || true);
-                self.after_unlock.publish();
+                self.after_unlock
             }
         }
     "#;
@@ -2272,11 +2324,11 @@ fn io_effect_publication_detector_rejects_unchecked_routes() {
     let multiple_publications = r#"
         struct IoCoreEffects { after_unlock: AfterEngineUnlock }
         impl IoCoreEffects {
-            fn publish(self) {
-                self.after_unlock.publish();
+            fn into_after_unlock(self) -> AfterEngineUnlock {
+                let first = self.after_unlock;
                 assert!(self.quarantine.is_empty());
                 assert!(self.drained.is_empty());
-                self.after_unlock.publish();
+                first
             }
         }
     "#;
@@ -2402,31 +2454,21 @@ fn io_effect_publication_detector_rejects_unchecked_routes() {
     let payload_extractor = r#"
         struct IoCoreEffects { after_unlock: AfterEngineUnlock }
         impl IoCoreEffects {
-            fn publish(self) {
-                assert!(self.quarantine.is_empty());
-                assert!(self.drained.is_empty());
-                self.after_unlock.publish();
-            }
             fn into_after_unlock(self) -> AfterEngineUnlock { self.after_unlock }
         }
     "#;
     assert!(
         analyze_io_effects_publication(payload_extractor)
             .unwrap()
-            .violations
+            .publish_methods
             .iter()
-            .any(|violation| violation.contains("into_after_unlock:payload-extractor")),
-        "an additional payload-extractor method must be rejected"
+            .all(|(_, quarantine, drained, extraction)| !(*quarantine && *drained && *extraction)),
+        "an unguarded payload-extractor method must be rejected"
     );
 
     let transformed_payload_extractor = r#"
         struct IoCoreEffects { after_unlock: AfterEngineUnlock }
         impl IoCoreEffects {
-            fn publish(self) {
-                assert!(self.quarantine.is_empty());
-                assert!(self.drained.is_empty());
-                self.after_unlock.publish();
-            }
             fn into_after_unlock(mut self) -> AfterEngineUnlock {
                 std::mem::take(&mut self).after_unlock
             }
@@ -2435,9 +2477,9 @@ fn io_effect_publication_detector_rejects_unchecked_routes() {
     assert!(
         analyze_io_effects_publication(transformed_payload_extractor)
             .unwrap()
-            .violations
+            .publish_methods
             .iter()
-            .any(|violation| violation.contains("into_after_unlock:payload-extractor")),
+            .all(|(_, quarantine, drained, extraction)| !(*quarantine && *drained && *extraction)),
         "a transformed payload-extractor method must be rejected"
     );
 
@@ -3667,16 +3709,16 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     assert_eq!(
         io_effects_publish_methods.len(),
         1,
-        "IoCoreEffects must have one checked production publish method: {io_effects_publish_methods:#?}"
+        "IoCoreEffects must have one checked detached-payload extraction method: {io_effects_publish_methods:#?}"
     );
-    let (publish_path, (_, quarantine_guarded, drained_guarded, detached_publish)) =
+    let (publish_path, (_, quarantine_guarded, drained_guarded, detached_extraction)) =
         &io_effects_publish_methods[0];
     assert!(
         publish_path == &io_core_operation_path
             && *quarantine_guarded
             && *drained_guarded
-            && *detached_publish,
-        "IoCoreEffects::publish must reject both session-facing effect classes before detached publication: {io_effects_publish_methods:#?}"
+            && *detached_extraction,
+        "IoCoreEffects::into_after_unlock must reject both session-facing effect classes before releasing detached publication: {io_effects_publish_methods:#?}"
     );
     assert!(
         unchecked_io_effect_publications.is_empty(),
@@ -3686,13 +3728,6 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     assert_eq!(
         after_unlock_accesses,
         BTreeMap::from([
-            (
-                (
-                    io_core_operation_path.clone(),
-                    "IoCore::fail_observers_for_close".to_owned(),
-                ),
-                1,
-            ),
             (
                 (
                     io_core_operation_path.clone(),
@@ -3724,7 +3759,7 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
             (
                 (
                     io_core_operation_path.clone(),
-                    "IoCoreEffects::publish".to_owned(),
+                    "IoCoreEffects::into_after_unlock".to_owned(),
                 ),
                 1,
             ),
@@ -3787,17 +3822,190 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         "IoCoreEffects fields must remain private"
     );
     let apply_io_effects = session_source
-        .split("pub(super) fn apply_io_effects(&self, effects: &mut IoCoreEffects) {")
+        .split("fn apply_io_effects(&self, mut effects: IoCoreEffects) -> CommittedIoCoreEffects {")
         .nth(1)
         .and_then(|tail| {
-            tail.split("\n    }\n\n    pub(super) fn enqueue_completion")
+            tail.split("\n    }\n\n    /// Consume session-facing")
                 .next()
         })
         .expect("locate SessionManager::apply_io_effects");
     assert!(
         apply_io_effects.contains("effects.take_quarantine()")
-            && apply_io_effects.contains("effects.take_drained()"),
-        "SessionManager must consume quarantine and accepted-zero effects before publication"
+            && apply_io_effects.contains("effects.take_drained()")
+            && apply_io_effects.contains("effects.into_committed()"),
+        "SessionManager must consume quarantine and accepted-zero effects before producing committed detached effects"
+    );
+    let committed_io_effects = io_core_operation_syntax
+        .items
+        .iter()
+        .find_map(|item| match item {
+            Item::Struct(item) if item.ident == "CommittedIoCoreEffects" => Some(item),
+            _ => None,
+        })
+        .expect("locate CommittedIoCoreEffects");
+    assert_eq!(
+        committed_io_effects
+            .fields
+            .iter()
+            .filter_map(|field| field.ident.as_ref().map(ToString::to_string))
+            .collect::<Vec<_>>(),
+        ["after_unlock"],
+        "CommittedIoCoreEffects must contain only detached publication"
+    );
+    assert!(
+        committed_io_effects
+            .fields
+            .iter()
+            .all(|field| matches!(field.vis, syn::Visibility::Inherited)),
+        "CommittedIoCoreEffects fields must remain private"
+    );
+    let detached_io_effects = io_core_operation_syntax
+        .items
+        .iter()
+        .find_map(|item| match item {
+            Item::Struct(item) if item.ident == "DetachedIoCoreEffects" => Some(item),
+            _ => None,
+        })
+        .expect("locate DetachedIoCoreEffects");
+    assert_eq!(
+        detached_io_effects
+            .fields
+            .iter()
+            .filter_map(|field| field.ident.as_ref().map(ToString::to_string))
+            .collect::<Vec<_>>(),
+        ["after_unlock"],
+        "DetachedIoCoreEffects must contain only detached publication"
+    );
+    assert!(
+        detached_io_effects
+            .fields
+            .iter()
+            .all(|field| matches!(field.vis, syn::Visibility::Inherited)),
+        "DetachedIoCoreEffects fields must remain private"
+    );
+    assert!(
+        io_core_operation_source.contains("\nstruct AfterEngineUnlock {")
+            && io_core_operation_source
+                .contains("pub(in crate::v2::engine) struct DetachedIoCoreEffects {")
+            && io_core_operation_source
+                .contains("pub(in crate::v2::engine) struct CommittedIoCoreEffects {")
+            && io_core_operation_source.contains(
+                "pub(in crate::v2::engine) fn into_committed(self) -> CommittedIoCoreEffects"
+            )
+            && io_core_operation_source.contains("pub(in crate::v2::engine) fn publish(self) {"),
+        "detached and committed publication types must retain engine-only visibility"
+    );
+    assert_eq!(
+        find_production_lifecycle_calls(&io_core_operation_source, &["into_after_unlock"])
+            .expect("find guarded full-effect extraction calls")
+            .into_iter()
+            .map(|call| call.split(':').nth(1).unwrap_or("<unknown>").to_owned())
+            .collect::<Vec<_>>(),
+        ["into_committed", "finish_early_completion"],
+        "guarded full-effect extraction is confined to scalar early completion and session commit conversion"
+    );
+    let mut into_committed_calls = Vec::new();
+    let mut terminal_apply_calls = Vec::new();
+    for path in collect_rs_files(&engine_dir).expect("enumerate consuming I/O effect calls") {
+        let source = fs::read_to_string(&path).expect("read engine source");
+        if source_is_test_only(&source)
+            .unwrap_or_else(|error| panic!("parse file-level cfg for {}: {error}", path.display()))
+        {
+            continue;
+        }
+        into_committed_calls.extend(
+            find_production_lifecycle_calls(&source, &["into_committed"])
+                .unwrap_or_else(|error| {
+                    panic!("parse {} committed conversion: {error}", path.display())
+                })
+                .into_iter()
+                .map(|call| (path.clone(), call)),
+        );
+        terminal_apply_calls.extend(
+            find_production_lifecycle_calls(&source, &["apply_terminal_io_effects"])
+                .unwrap_or_else(|error| {
+                    panic!("parse {} terminal application: {error}", path.display())
+                })
+                .into_iter()
+                .map(|call| (path.clone(), call)),
+        );
+    }
+    assert_eq!(
+        into_committed_calls.len(),
+        1,
+        "full I/O effects must have one production conversion to committed effects: {into_committed_calls:#?}"
+    );
+    assert!(
+        into_committed_calls[0].0 == session_path
+            && into_committed_calls[0]
+                .1
+                .starts_with("into_committed:apply_io_effects:"),
+        "only the private SessionManager application helper may construct committed effects"
+    );
+    assert_eq!(
+        terminal_apply_calls.len(),
+        1,
+        "terminal-only session effect application must have one production caller: {terminal_apply_calls:#?}"
+    );
+    assert!(
+        terminal_apply_calls[0].0 == engine_mod_path
+            && terminal_apply_calls[0]
+                .1
+                .starts_with("apply_terminal_io_effects:finish:"),
+        "only EngineShared::finish may request terminal-applied I/O effects"
+    );
+    assert!(
+        session_source.contains(
+            "pub(super) fn commit_io_effects(&self, effects: IoCoreEffects)"
+        ) && session_source.contains(
+            "pub(super) fn apply_terminal_io_effects(\n        &self,\n        effects: IoCoreEffects,\n    ) -> CommittedIoCoreEffects"
+        ) && session_source.contains("fn commit_terminal_effects(&self, effects: IoCoreEffects)")
+            && session_source.contains("self.commit_io_effects(effects);")
+            && !session_source.contains("effects: &mut IoCoreEffects"),
+        "SessionManager must expose only by-value ordinary, terminal, and bridge effect boundaries"
+    );
+    assert!(
+        io_progress_source.contains("self.bridge.commit_terminal_effects(effects);")
+            && !io_progress_source.contains("apply_terminal_effects"),
+        "bounded I/O terminalization must delegate by value to the ordinary commit boundary"
+    );
+    assert!(
+        engine_mod.contains(
+            "let committed_io_effects = self.session.apply_terminal_io_effects(io_effects);"
+        ) && engine_mod.contains("committed_io_effects.publish();")
+            && !engine_mod.contains("\n        io_effects.publish();"),
+        "root terminal composition must consume only the session-applied effect state"
+    );
+    let terminal_apply = engine_mod
+        .find("let committed_io_effects = self.session.apply_terminal_io_effects(io_effects);")
+        .expect("root terminal session application");
+    let terminalize_cm = engine_mod[terminal_apply..]
+        .find("self.session.terminalize_cm(&outcome);")
+        .map(|offset| terminal_apply + offset)
+        .expect("root CM terminalization");
+    let finalize_connection = engine_mod[terminalize_cm..]
+        .find(".finalize_connection_engine(connection, &outcome)")
+        .map(|offset| terminalize_cm + offset)
+        .expect("root connection terminalization");
+    let publish_operations = engine_mod[finalize_connection..]
+        .find("committed_io_effects.publish();")
+        .map(|offset| finalize_connection + offset)
+        .expect("root operation publication");
+    let wake_close = engine_mod[publish_operations..]
+        .find("connection.wake_close();")
+        .map(|offset| publish_operations + offset)
+        .expect("root close wake");
+    let wake_terminal = engine_mod[wake_close..]
+        .find("self.terminal_notify.notify_waiters();")
+        .map(|offset| wake_close + offset)
+        .expect("root terminal wake");
+    assert!(
+        terminal_apply < terminalize_cm
+            && terminalize_cm < finalize_connection
+            && finalize_connection < publish_operations
+            && publish_operations < wake_close
+            && wake_close < wake_terminal,
+        "root terminal composition order must remain session apply, CM, connections, operations, close, terminal"
     );
     let operation_state = io_core_operation_source
         .split("pub(in crate::v2::engine) struct OperationState {")

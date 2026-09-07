@@ -90,7 +90,7 @@ impl IoProgress {
                     .terminalize_operations_bounded(&outcome, self.terminal_cursor, budget);
             self.terminal_cursor = next;
             self.terminal_complete = complete;
-            self.bridge.apply_terminal_effects(effects);
+            self.bridge.commit_terminal_effects(effects);
             return Ok(ProgressReport::running(
                 scanned,
                 !complete,
@@ -416,7 +416,7 @@ mod tests {
             lock_unpoison(&self.reclaimed).push(token);
         }
 
-        fn apply_terminal_effects(&self, _effects: super::super::IoCoreEffects) {}
+        fn commit_terminal_effects(&self, _effects: super::super::IoCoreEffects) {}
     }
 
     fn progress(reclamation_budget: usize) -> (IoProgress, Arc<IoCore>, Arc<RecordingBridge>) {

@@ -387,11 +387,6 @@ impl ConnectionState {
     }
 
     #[cfg(test)]
-    pub(in crate::v2::engine) fn begin_posting(&self) -> Result<RwLockReadGuard<'_, ()>> {
-        self.io.begin_posting()
-    }
-
-    #[cfg(test)]
     pub(in crate::v2::engine) fn release_local(&self, direction: Direction) {
         self.io.release_local(direction);
     }
@@ -725,6 +720,12 @@ impl ConnectionState {
 
     pub(in crate::v2::engine) fn mark_drained_once(&self) -> bool {
         !self.drained_recorded.swap(true, Ordering::AcqRel)
+    }
+
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn drained_and_retirement_requested_for_test(&self) -> bool {
+        self.drained_recorded.load(Ordering::Acquire)
+            && self.retirement_requested.load(Ordering::Acquire)
     }
 
     pub(in crate::v2::engine) fn rollback_draining_count(&self) {

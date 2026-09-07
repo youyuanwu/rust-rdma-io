@@ -132,11 +132,10 @@ fn operation_lifecycle_transitions_follow_real_post_cancel_and_completion_paths(
         .accepted_operations
         .fetch_add(1, Ordering::AcqRel);
     assert_eq!(operation.lifecycle(), OperationLifecycle::Completing);
-    let mut effects = shared
+    let effects = shared
         .io_core
         .finish_operation(Arc::clone(&operation), early);
-    shared.session.apply_io_effects(&mut effects);
-    effects.publish();
+    shared.session.commit_io_effects(effects);
     assert_eq!(operation.lifecycle(), OperationLifecycle::Released);
 
     let token = install_accepted(&shared, &connection.state, WcOpcode::Send);
@@ -157,11 +156,10 @@ fn operation_lifecycle_transitions_follow_real_post_cancel_and_completion_paths(
         CompletionDisposition::Complete
     ));
     assert_eq!(operation.lifecycle(), OperationLifecycle::Completing);
-    let mut effects = shared
+    let effects = shared
         .io_core
         .finish_operation(Arc::clone(&operation), completion);
-    shared.session.apply_io_effects(&mut effects);
-    effects.publish();
+    shared.session.commit_io_effects(effects);
     assert_eq!(operation.lifecycle(), OperationLifecycle::Released);
 }
 
@@ -241,6 +239,31 @@ fn io_completion_wakes_after_admission_guard_is_released() {
 
 #[test]
 fn qp_destroy_event_uses_the_contextual_connection_close_error() {
+    use std::task::{Wake, Waker};
+
+    struct ReclaimCheckingWake {
+        io_core: Arc<IoCore>,
+        session: Arc<SessionManager>,
+        connection: Arc<ConnectionState>,
+        token: OperationToken,
+        observed: AtomicBool,
+    }
+
+    impl Wake for ReclaimCheckingWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            assert!(self.session.admission.try_write().is_ok());
+            assert!(self.connection.lifecycle_unlocked_for_test());
+            assert_eq!(self.io_core.operations.live(), 0);
+            assert_eq!(self.connection.accepted_count(), 0);
+            assert!(!self.session.operation_quarantined_for_test(self.token));
+            self.observed.store(true, Ordering::Release);
+        }
+    }
+
     let shared = synthetic_engine(8);
     let connection = synthetic_connection_on(&shared, 18);
     connection.state.reserve_local(Direction::Send).unwrap();
@@ -273,12 +296,21 @@ fn qp_destroy_event_uses_the_contextual_connection_close_error() {
     let proof = shared
         .session
         .mint_qp_destruction_proof_for_test(&connection.state);
+    let wake = Arc::new(ReclaimCheckingWake {
+        io_core: Arc::clone(&shared.io_core),
+        session: Arc::clone(&shared.session),
+        connection: Arc::clone(&connection.state),
+        token,
+        observed: AtomicBool::new(false),
+    });
+    receiver.register(&Waker::from(Arc::clone(&wake)));
 
     assert!(
         shared
             .session
             .reclaim_after_qp_destroy_for_test(&proof, &connection.state, token)
     );
+    assert!(wake.observed.load(Ordering::Acquire));
     let Some(super::super::io::IoEvent::Completion(completion)) = receiver.pop() else {
         panic!("QP destruction must publish an owned completion event")
     };
@@ -1289,7 +1321,10 @@ fn io_early_completion_event_is_published_after_post_guards_are_released() {
 
         fn wake_by_ref(self: &Arc<Self>) {
             assert!(self.admission.try_write().is_ok());
-            assert!(self.connection.begin_posting().is_ok());
+            assert!(
+                self.connection.io.posting_write_unlocked_for_test(),
+                "early-completion publication must release the posting read guard"
+            );
             self.observed.store(true, Ordering::Release);
         }
     }
@@ -1354,7 +1389,10 @@ fn io_unaccepted_event_is_published_after_post_guards_are_released() {
 
         fn wake_by_ref(self: &Arc<Self>) {
             assert!(self.admission.try_write().is_ok());
-            assert!(self.connection.begin_posting().is_ok());
+            assert!(
+                self.connection.io.posting_write_unlocked_for_test(),
+                "unaccepted publication must release the posting read guard"
+            );
             self.observed.store(true, Ordering::Release);
         }
     }
@@ -1403,6 +1441,160 @@ fn io_unaccepted_event_is_published_after_post_guards_are_released() {
         0
     );
     assert_eq!(shared.io_core.cq_credits.free(), 4);
+    drop(connection);
+    drop(driver);
+    drop(engine);
+}
+
+#[test]
+fn accepted_zero_is_committed_before_completion_event_publication() {
+    use std::task::{Wake, Waker};
+
+    struct DrainCheckingWake {
+        admission: Arc<RwLock<()>>,
+        connection: Arc<ConnectionState>,
+        observed: AtomicBool,
+    }
+
+    impl Wake for DrainCheckingWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            assert!(self.admission.try_write().is_ok());
+            assert!(
+                self.connection.drained_and_retirement_requested_for_test(),
+                "accepted-zero session effects must commit before event publication"
+            );
+            self.observed.store(true, Ordering::Release);
+        }
+    }
+
+    let Some((engine, driver, shared)) = production_engine(2, 4, 4) else {
+        return;
+    };
+    let poster = Arc::new(ScriptedPoster::new(
+        &shared.session,
+        53,
+        ScriptedPost::Accepted,
+    ));
+    let connection = scripted_connection(&shared.session, Arc::clone(&poster), 1, 1);
+    let (io, events) =
+        super::super::io::IoConnection::new(&shared.session, Arc::clone(&connection.state))
+            .unwrap();
+    let posted = io.post_send(IoSendRequest::new(
+        io.register_memory(64, AccessIntent::LocalOnly).unwrap(),
+        1,
+        IoOperationContext::new(()),
+    ));
+    assert!(posted.all_accepted());
+    let token = lock_unpoison(&poster.tokens)[0];
+    shared.session.begin_connection_close(&connection.state);
+
+    let wake = Arc::new(DrainCheckingWake {
+        admission: Arc::clone(&shared.session.admission),
+        connection: Arc::clone(&connection.state),
+        observed: AtomicBool::new(false),
+    });
+    events.register(&Waker::from(Arc::clone(&wake)));
+    assert_eq!(
+        shared
+            .session
+            .enqueue_completion(wc(token, 53, IBV_WC_SEND)),
+        Some(connection.state.token)
+    );
+    assert_eq!(
+        shared
+            .session
+            .dispatch_connection_completions(connection.state.token, 1),
+        (1, false)
+    );
+
+    assert!(wake.observed.load(Ordering::Acquire));
+    assert!(connection.state.drained_and_retirement_requested_for_test());
+    let Some(super::super::io::IoEvent::Completion(completion)) = events.pop() else {
+        panic!("completion event")
+    };
+    assert!(completion.into_parts().2.is_ok());
+    drop(connection);
+    drop(driver);
+    drop(engine);
+}
+
+#[test]
+fn quarantine_clear_is_committed_before_completion_event_publication() {
+    use std::task::{Wake, Waker};
+
+    struct QuarantineCheckingWake {
+        session: Arc<SessionManager>,
+        token: OperationToken,
+        observed: AtomicBool,
+    }
+
+    impl Wake for QuarantineCheckingWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            assert!(
+                !self.session.operation_quarantined_for_test(self.token),
+                "quarantine clear must commit before event publication"
+            );
+            self.observed.store(true, Ordering::Release);
+        }
+    }
+
+    let Some((engine, driver, shared)) = production_engine(2, 4, 4) else {
+        return;
+    };
+    let poster = Arc::new(ScriptedPoster::new(
+        &shared.session,
+        54,
+        ScriptedPost::Accepted,
+    ));
+    let connection = scripted_connection(&shared.session, Arc::clone(&poster), 1, 1);
+    let (io, events) =
+        super::super::io::IoConnection::new(&shared.session, Arc::clone(&connection.state))
+            .unwrap();
+    assert!(
+        io.post_send(IoSendRequest::new(
+            io.register_memory(64, AccessIntent::LocalOnly).unwrap(),
+            1,
+            IoOperationContext::new(()),
+        ))
+        .all_accepted()
+    );
+    let token = lock_unpoison(&poster.tokens)[0];
+    shared.session.quarantine_operation(token);
+    assert!(shared.session.operation_quarantined_for_test(token));
+
+    let wake = Arc::new(QuarantineCheckingWake {
+        session: Arc::clone(&shared.session),
+        token,
+        observed: AtomicBool::new(false),
+    });
+    events.register(&Waker::from(Arc::clone(&wake)));
+    assert_eq!(
+        shared
+            .session
+            .enqueue_completion(wc(token, 54, IBV_WC_SEND)),
+        Some(connection.state.token)
+    );
+    assert_eq!(
+        shared
+            .session
+            .dispatch_connection_completions(connection.state.token, 1),
+        (1, false)
+    );
+
+    assert!(wake.observed.load(Ordering::Acquire));
+    assert!(!shared.session.operation_quarantined_for_test(token));
+    let Some(super::super::io::IoEvent::Completion(completion)) = events.pop() else {
+        panic!("completion event")
+    };
+    assert!(completion.into_parts().2.is_ok());
     drop(connection);
     drop(driver);
     drop(engine);
@@ -1592,6 +1784,9 @@ async fn terminal_wakers_can_reenter_after_terminal_guards_drop() {
 
     struct ReentrantWaker {
         shared: Arc<EngineShared>,
+        token: OperationToken,
+        label: &'static str,
+        order: Arc<Mutex<Vec<&'static str>>>,
         wakes: AtomicUsize,
         lock_failures: AtomicUsize,
     }
@@ -1601,8 +1796,13 @@ async fn terminal_wakers_can_reenter_after_terminal_guards_drop() {
             arc_self.wakes.fetch_add(1, Ordering::AcqRel);
             let admission_unlocked = arc_self.shared.session.admission.try_write().is_ok();
             let terminal_unlocked = arc_self.shared.terminal.try_lock().is_ok();
-            if admission_unlocked && terminal_unlocked {
+            let quarantine_committed = arc_self
+                .shared
+                .session
+                .operation_quarantined_for_test(arc_self.token);
+            if admission_unlocked && terminal_unlocked && quarantine_committed {
                 let _ = arc_self.shared.diagnostics();
+                lock_unpoison(&arc_self.order).push(arc_self.label);
             } else {
                 arc_self.lock_failures.fetch_add(1, Ordering::AcqRel);
             }
@@ -1620,21 +1820,44 @@ async fn terminal_wakers_can_reenter_after_terminal_guards_drop() {
     let Lookup::Occupied(operation) = shared.io_core.operations.lookup(token) else {
         panic!("accepted operation")
     };
-    let reentrant = Arc::new(ReentrantWaker {
-        shared: Arc::clone(&shared),
-        wakes: AtomicUsize::new(0),
-        lock_failures: AtomicUsize::new(0),
-    });
-    let task_waker = waker(Arc::clone(&reentrant));
-    operation.waker.register(&task_waker);
-    let mut cx = Context::from_waker(&task_waker);
-    let mut close = Box::pin(connection.close());
-    assert!(close.as_mut().poll(&mut cx).is_pending());
-    let engine = super::super::RdmaEngine {
-        shared: Arc::clone(&shared),
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let observer = |label| {
+        Arc::new(ReentrantWaker {
+            shared: Arc::clone(&shared),
+            token,
+            label,
+            order: Arc::clone(&order),
+            wakes: AtomicUsize::new(0),
+            lock_failures: AtomicUsize::new(0),
+        })
     };
-    let mut shutdown = Box::pin(engine.shutdown());
-    assert!(shutdown.as_mut().poll(&mut cx).is_pending());
+    let connection_event = observer("connection-event");
+    let operation_wake = observer("operation");
+    let close_wake = observer("close");
+    let terminal_wake = observer("terminal");
+
+    let (_io, events) =
+        super::super::io::IoConnection::new(&shared.session, Arc::clone(&connection.state))
+            .unwrap();
+    events.register(&waker(Arc::clone(&connection_event)));
+    operation
+        .waker
+        .register(&waker(Arc::clone(&operation_wake)));
+    let close_notify = connection.state.close_state().notify();
+    let mut close_notified = Box::pin(close_notify.notified());
+    assert!(
+        close_notified
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker(Arc::clone(&close_wake))))
+            .is_pending()
+    );
+    let mut terminal_notified = Box::pin(shared.terminal_notify.notified());
+    assert!(
+        terminal_notified
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker(Arc::clone(&terminal_wake))))
+            .is_pending()
+    );
 
     shared.finish(MemoizedTerminalResult::from_error(Error::EngineWedged {
         retained_bundles: 1,
@@ -1642,23 +1865,24 @@ async fn terminal_wakers_can_reenter_after_terminal_guards_drop() {
         cq_debt: 1,
     }));
 
-    assert!(
-        reentrant.wakes.load(Ordering::Acquire) >= 3,
-        "operation, connection, and terminal waiters must all wake"
-    );
     assert_eq!(
-        reentrant.lock_failures.load(Ordering::Acquire),
-        0,
-        "terminal wakes must run after admission and terminal guards drop"
+        lock_unpoison(&order).as_slice(),
+        ["connection-event", "operation", "close", "terminal"],
+        "root terminal publication order must remain deterministic"
     );
-    assert!(matches!(
-        shutdown.as_mut().poll(&mut cx),
-        Poll::Ready(Err(Error::EngineWedged { .. }))
-    ));
-    assert!(matches!(
-        close.as_mut().poll(&mut cx),
-        Poll::Ready(Err(Error::EngineWedged { .. }))
-    ));
+    for reentrant in [
+        &connection_event,
+        &operation_wake,
+        &close_wake,
+        &terminal_wake,
+    ] {
+        assert_eq!(reentrant.wakes.load(Ordering::Acquire), 1);
+        assert_eq!(
+            reentrant.lock_failures.load(Ordering::Acquire),
+            0,
+            "terminal observers must run after session mutation and guard release"
+        );
+    }
     assert_eq!(
         shared
             .io_core

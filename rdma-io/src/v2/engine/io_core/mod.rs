@@ -26,13 +26,13 @@ use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
 pub(super) use operation::CqeReject;
 pub use operation::RdmaOperation;
 pub(super) use operation::{
-    CqCreditPool, IoCoreEffects, OperationQuarantineEffect, OperationRegistry, QpReclaimCapability,
-    post_io_recv_batch, post_io_send,
+    CommittedIoCoreEffects, CqCreditPool, IoCoreEffects, OperationQuarantineEffect,
+    OperationRegistry, QpReclaimCapability, post_io_recv_batch, post_io_send,
 };
 #[cfg(test)]
 pub(super) use operation::{
     completion_for_driver_test, install_accepted_operation_for_driver_test,
-    operation_future_for_io_lifetime_test,
+    operation_future_for_io_lifetime_test, register_operation_waker_for_test,
 };
 pub(super) use progress::IoProgress;
 
@@ -70,7 +70,7 @@ pub(super) trait IoSessionBridge: Send + Sync {
 
     fn handle_reclamation_deadline(&self, token: OperationToken);
 
-    fn apply_terminal_effects(&self, effects: IoCoreEffects);
+    fn commit_terminal_effects(&self, effects: IoCoreEffects);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -175,6 +175,11 @@ impl EstablishedIoConnection {
             return Err(Error::TransportClosed);
         }
         Ok(guard)
+    }
+
+    #[cfg(test)]
+    pub(super) fn posting_write_unlocked_for_test(&self) -> bool {
+        self.posting_gate.try_write().is_ok()
     }
 
     pub(super) fn release_local(&self, direction: Direction) {
