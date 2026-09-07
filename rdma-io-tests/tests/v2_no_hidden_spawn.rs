@@ -1510,7 +1510,14 @@ impl Visit<'_> for RestrictedEffectFunctionVisitor {
             .map(|segment| segment.ident.to_string());
         if matches!(
             method.as_deref(),
-            Some("publish" | "take_quarantine" | "take_drained" | "into_committed")
+            Some(
+                "publish"
+                    | "take_quarantine"
+                    | "take_drained"
+                    | "into_after_unlock"
+                    | "into_committed"
+                    | "apply_terminal_io_effects"
+            )
         ) {
             let owner = expression
                 .qself
@@ -1528,20 +1535,9 @@ impl Visit<'_> for RestrictedEffectFunctionVisitor {
                         Some(name)
                     }
                 });
-            let restricted_owner = match method.as_deref() {
-                Some("publish") => owner.as_ref().is_some_and(|name| {
-                    matches!(
-                        name.as_str(),
-                        "AfterEngineUnlock" | "DetachedIoCoreEffects" | "CommittedIoCoreEffects"
-                    ) || self.effect_types.contains(name) && name != "IoCoreEffects"
-                }),
-                Some("take_quarantine" | "take_drained" | "into_committed") => {
-                    owner.as_ref().is_some_and(|name| {
-                        name == "IoCoreEffects" || self.effect_types.contains(name)
-                    })
-                }
-                _ => false,
-            };
+            let restricted_owner = owner
+                .as_ref()
+                .is_some_and(|name| self.effect_types.contains(name));
             if restricted_owner {
                 self.references.push(expression.span().start().line);
             }
@@ -1585,6 +1581,7 @@ fn find_restricted_effect_function_references(source: &str) -> Result<Vec<usize>
         "AfterEngineUnlock",
         "DetachedIoCoreEffects",
         "CommittedIoCoreEffects",
+        "SessionManager",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -2589,26 +2586,57 @@ fn io_effect_publication_detector_rejects_unchecked_routes() {
     let function_item_aliases = r#"
         fn bypass(
             full: &mut IoCoreEffects,
+            owned: IoCoreEffects,
             detached: DetachedIoCoreEffects,
             committed: CommittedIoCoreEffects,
+            manager: &SessionManager,
         ) {
             let take_quarantine = IoCoreEffects::take_quarantine;
             let take_drained = IoCoreEffects::take_drained;
+            let extract = FullEffects::into_after_unlock;
             let publish_detached = DetachedAlias::publish;
             let publish_committed = CommittedIoCoreEffects::publish;
+            let terminal_apply = SessionAlias::apply_terminal_io_effects;
             type DetachedAlias = DetachedIoCoreEffects;
+            type FullEffects = IoCoreEffects;
+            type SessionAlias = SessionManager;
             take_quarantine(full);
             take_drained(full);
+            extract(owned);
             publish_detached(detached);
             publish_committed(committed);
+            terminal_apply(manager, IoCoreEffects::default());
         }
     "#;
     assert_eq!(
         find_restricted_effect_function_references(function_item_aliases)
             .unwrap()
             .len(),
-        4,
+        6,
         "restricted effect associated methods must not escape through function-item aliases"
+    );
+    let self_function_items = r#"
+        struct IoCoreEffects;
+        impl IoCoreEffects {
+            fn bypass(self) {
+                let extract = Self::into_after_unlock;
+                extract(self);
+            }
+        }
+        struct SessionManager;
+        impl SessionManager {
+            fn bypass(&self, effects: IoCoreEffects) {
+                let apply = Self::apply_terminal_io_effects;
+                apply(self, effects);
+            }
+        }
+    "#;
+    assert_eq!(
+        find_restricted_effect_function_references(self_function_items)
+            .unwrap()
+            .len(),
+        2,
+        "Self-qualified extraction and terminal-application function items must be detected"
     );
     assert_eq!(
         find_production_zero_argument_method_calls(
