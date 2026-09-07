@@ -3,7 +3,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, RwLockReadGuard, Weak};
 use std::task::{Context, Poll};
 
 use futures_util::task::AtomicWaker;
@@ -1342,7 +1342,7 @@ fn start_operation(
     }
     #[cfg(any(test, feature = "test-hooks"))]
     shared.pause_operation_before_register();
-    let _posting = match connection.begin_posting() {
+    let posting = match connection.begin_posting() {
         Ok(posting) => posting,
         Err(error) => return StartResult::Immediate((Err(error), Some(mr))),
     };
@@ -1390,11 +1390,9 @@ fn start_operation(
             shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
             let early = state.commit_accepted();
             shared.publish_cq_recheck();
-            drop(admission);
             if let Some(completion) = early {
-                shared
-                    .finish_operation(Arc::clone(&state), completion)
-                    .publish();
+                let after_unlock = shared.finish_early_completion(Arc::clone(&state), completion);
+                publish_after_post_guards(posting, admission, after_unlock);
             }
             StartResult::InFlight(state)
         }
@@ -1419,11 +1417,10 @@ fn start_operation(
                 shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
                 let early = state.commit_accepted();
                 shared.publish_cq_recheck();
-                drop(admission);
                 if let Some(completion) = early {
-                    shared
-                        .finish_operation(Arc::clone(&state), completion)
-                        .publish();
+                    let after_unlock =
+                        shared.finish_early_completion(Arc::clone(&state), completion);
+                    publish_after_post_guards(posting, admission, after_unlock);
                 }
                 StartResult::InFlight(state)
             }
@@ -1433,11 +1430,9 @@ fn start_operation(
             shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
             let early = state.commit_accepted();
             shared.publish_cq_recheck();
-            drop(admission);
             if let Some(completion) = early {
-                shared
-                    .finish_operation(Arc::clone(&state), completion)
-                    .publish();
+                let after_unlock = shared.finish_early_completion(Arc::clone(&state), completion);
+                publish_after_post_guards(posting, admission, after_unlock);
                 StartResult::InFlight(state)
             } else {
                 state.detach_with_post_error(shared);
@@ -1446,6 +1441,16 @@ fn start_operation(
             }
         }
     }
+}
+
+fn publish_after_post_guards(
+    posting: RwLockReadGuard<'_, ()>,
+    admission: RwLockReadGuard<'_, ()>,
+    after_unlock: AfterEngineUnlock,
+) {
+    drop(posting);
+    drop(admission);
+    after_unlock.publish();
 }
 
 struct ValidatedOperation {
@@ -1619,10 +1624,46 @@ pub(in crate::v2::engine) enum OperationQuarantineEffect {
 }
 
 #[derive(Default)]
+/// Effects produced after I/O-owned operation and registry mutation completes.
+///
+/// This full bundle is deliberately not publishable. The session owner must
+/// consume it so quarantine and accepted-zero/drain effects are applied before
+/// its detached events and operation wakes become available.
 pub(in crate::v2::engine) struct IoCoreEffects {
     after_unlock: AfterEngineUnlock,
     quarantine: Vec<OperationQuarantineEffect>,
     drained: Vec<ConnectionToken>,
+}
+
+/// Detached I/O publication after the session owner has committed all
+/// session-facing effects from the original [`IoCoreEffects`].
+///
+/// The root terminal path uses this state to preserve CM/connection
+/// terminalization before operation notifications. It cannot recover or reuse
+/// the original full bundle.
+pub(in crate::v2::engine) struct CommittedIoCoreEffects {
+    after_unlock: AfterEngineUnlock,
+}
+
+/// A detached-only result for a path that cannot produce session effects.
+///
+/// This is intentionally separate from [`IoCoreEffects`] and
+/// [`CommittedIoCoreEffects`]. Its only cross-module use is close-observer
+/// notification after admission and lifecycle guards have been released.
+pub(in crate::v2::engine) struct DetachedIoCoreEffects {
+    after_unlock: AfterEngineUnlock,
+}
+
+impl CommittedIoCoreEffects {
+    pub(in crate::v2::engine) fn publish(self) {
+        self.after_unlock.publish();
+    }
+}
+
+impl DetachedIoCoreEffects {
+    pub(in crate::v2::engine) fn publish(self) {
+        self.after_unlock.publish();
+    }
 }
 
 impl IoCoreEffects {
@@ -1640,7 +1681,7 @@ impl IoCoreEffects {
         std::mem::take(&mut self.drained)
     }
 
-    pub(in crate::v2::engine) fn publish(self) {
+    fn into_after_unlock(self) -> AfterEngineUnlock {
         assert!(
             self.quarantine.is_empty(),
             "engine must apply operation quarantine effects before publication"
@@ -1649,7 +1690,13 @@ impl IoCoreEffects {
             self.drained.is_empty(),
             "engine must apply accepted-zero effects before publication"
         );
-        self.after_unlock.publish();
+        self.after_unlock
+    }
+
+    pub(in crate::v2::engine) fn into_committed(self) -> CommittedIoCoreEffects {
+        CommittedIoCoreEffects {
+            after_unlock: self.into_after_unlock(),
+        }
     }
 }
 
@@ -1658,16 +1705,16 @@ impl IoCore {
         &self,
         tokens: &[OperationToken],
         error: Error,
-    ) -> IoCoreEffects {
-        let mut effects = IoCoreEffects::default();
+    ) -> DetachedIoCoreEffects {
+        let mut after_unlock = AfterEngineUnlock::default();
         for token in tokens.iter().copied() {
             if let Lookup::Occupied(operation) = self.operations.lookup(token)
                 && operation.fail_observer_for_close(error.clone())
             {
-                effects.after_unlock.operations_to_wake.push(operation);
+                after_unlock.operations_to_wake.push(operation);
             }
         }
-        effects
+        DetachedIoCoreEffects { after_unlock }
     }
 
     pub(in crate::v2::engine) fn terminalize_operations(
@@ -1908,6 +1955,15 @@ impl IoCore {
         effects
     }
 
+    fn finish_early_completion(
+        &self,
+        operation: Arc<OperationState>,
+        completion: WorkCompletion,
+    ) -> AfterEngineUnlock {
+        self.finish_operation(operation, completion)
+            .into_after_unlock()
+    }
+
     fn reclaim_after_qp_destroy(
         &self,
         destroyed_connection: ConnectionToken,
@@ -2090,6 +2146,18 @@ pub(in crate::v2::engine) fn install_accepted_operation_for_driver_test(
     operation.commit_accepted();
     io_core.accepted_operations.fetch_add(1, Ordering::AcqRel);
     token
+}
+
+#[cfg(test)]
+pub(in crate::v2::engine) fn register_operation_waker_for_test(
+    io_core: &IoCore,
+    token: OperationToken,
+    waker: &std::task::Waker,
+) {
+    let Lookup::Occupied(operation) = io_core.operations.lookup(token) else {
+        panic!("test operation must remain registered")
+    };
+    operation.waker.register(waker);
 }
 
 #[cfg(test)]

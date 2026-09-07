@@ -4,7 +4,10 @@
 //! entry, connection admission reservation, lifecycle deadline, and
 //! connection-level quarantine entry. The sibling [`super::io_core::IoCore`]
 //! owns operation/CQE state; effects crossing that boundary are interpreted
-//! here before their detached events and wakers are published.
+//! here through a consuming commit before their detached events and wakers are
+//! published. This ordering covers the runtime's admission, lifecycle,
+//! registry, posting, and operation guards; callers remain responsible for
+//! unrelated locks they hold outside the runtime.
 
 use std::collections::{HashMap, VecDeque};
 #[cfg(any(test, feature = "test-hooks"))]
@@ -32,7 +35,8 @@ use super::SessionTestInstrumentation;
 use super::config::{ProviderLimits, RdmaConnectionConfig, SessionConfig};
 use super::io::MemoryRegistrar;
 use super::io_core::{
-    IoCore, IoCoreEffects, IoSessionBridge, OperationQuarantineEffect, QpReclaimCapability,
+    CommittedIoCoreEffects, IoCore, IoCoreEffects, IoSessionBridge, OperationQuarantineEffect,
+    QpReclaimCapability,
 };
 use super::registry::{ConnectionToken, Lookup, OperationToken, lock_unpoison};
 use super::{Result, SessionEngineRuntime};
@@ -661,8 +665,14 @@ impl SessionManager {
         true
     }
 
-    /// Consume session-facing I/O effects before detached publication.
-    pub(super) fn apply_io_effects(&self, effects: &mut IoCoreEffects) {
+    #[cfg(test)]
+    pub(super) fn operation_quarantined_for_test(&self, token: OperationToken) -> bool {
+        lock_unpoison(&self.quarantines)
+            .entries
+            .contains_key(&QuarantineKey::Operation(token))
+    }
+
+    fn apply_io_effects(&self, mut effects: IoCoreEffects) -> CommittedIoCoreEffects {
         for effect in effects.take_quarantine() {
             match effect {
                 OperationQuarantineEffect::Added {
@@ -689,6 +699,31 @@ impl SessionManager {
                 self.schedule_connection_retirement(&connection);
             }
         }
+        effects.into_committed()
+    }
+
+    /// Consume an I/O effect bundle, apply all session-facing mutations, and
+    /// only then publish its detached events and operation wakes.
+    ///
+    /// Moving the bundle into this method prevents callers from publishing or
+    /// reusing the original value. I/O producers return only after their
+    /// operation and registry guards are released; direct posting and close
+    /// paths use a separate detached-only type after their guards are dropped.
+    /// This boundary cannot prove that a caller holds no unrelated lock.
+    pub(super) fn commit_io_effects(&self, effects: IoCoreEffects) {
+        self.apply_io_effects(effects).publish();
+    }
+
+    /// Apply session effects for root terminal composition.
+    ///
+    /// The returned value contains only detached publication and must be
+    /// consumed after CM and connection terminal state has been published.
+    /// Structural checks confine this split to root terminal composition.
+    pub(super) fn apply_terminal_io_effects(
+        &self,
+        effects: IoCoreEffects,
+    ) -> CommittedIoCoreEffects {
+        self.apply_io_effects(effects)
     }
 
     pub(super) fn enqueue_completion(
@@ -722,11 +757,10 @@ impl SessionManager {
             Lookup::Occupied(connection) => connection,
             _ => return (0, false),
         };
-        let (processed, remains_ready, mut effects) = self
+        let (processed, remains_ready, effects) = self
             .io_core
             .dispatch_connection_completions(&connection.io, quantum);
-        self.apply_io_effects(&mut effects);
-        effects.publish();
+        self.commit_io_effects(effects);
         (processed, remains_ready)
     }
 
@@ -768,15 +802,14 @@ impl SessionManager {
         connection: &ConnectionState,
         token: OperationToken,
     ) -> bool {
-        let (reclaimed, mut effects) = self.qp_reclaim.reclaim(
+        let (reclaimed, effects) = self.qp_reclaim.reclaim(
             proven_connection,
             proven_qp_num,
             &connection.io,
             connection.operation_close_error(),
             token,
         );
-        self.apply_io_effects(&mut effects);
-        effects.publish();
+        self.commit_io_effects(effects);
         reclaimed
     }
 
@@ -794,24 +827,21 @@ impl SessionManager {
         &self,
         connection: &ConnectionState,
     ) -> bool {
-        let (remains_ready, mut effects) = self
+        let (remains_ready, effects) = self
             .io_core
             .reject_queued_completions_after_qp_destroy(&connection.io);
-        self.apply_io_effects(&mut effects);
-        effects.publish();
+        self.commit_io_effects(effects);
         remains_ready
     }
 
     pub(super) fn handle_reclamation_deadline(&self, token: OperationToken) {
-        let mut effects = self.io_core.handle_reclamation_deadline(token);
-        self.apply_io_effects(&mut effects);
-        effects.publish();
+        let effects = self.io_core.handle_reclamation_deadline(token);
+        self.commit_io_effects(effects);
     }
 
     pub(super) fn quarantine_operation(&self, token: OperationToken) {
-        let mut effects = self.io_core.quarantine_operation(token);
-        self.apply_io_effects(&mut effects);
-        effects.publish();
+        let effects = self.io_core.quarantine_operation(token);
+        self.commit_io_effects(effects);
     }
 }
 
@@ -832,9 +862,8 @@ impl IoSessionBridge for SessionManager {
         self.handle_reclamation_deadline(token);
     }
 
-    fn apply_terminal_effects(&self, mut effects: IoCoreEffects) {
-        self.apply_io_effects(&mut effects);
-        effects.publish();
+    fn commit_terminal_effects(&self, effects: IoCoreEffects) {
+        self.commit_io_effects(effects);
     }
 }
 

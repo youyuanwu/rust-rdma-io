@@ -668,7 +668,7 @@ impl EngineShared {
             !outcome.is_connection_quarantined(),
             "ConnectionQuarantined is connection-local; no connection quarantine can terminate the engine driver"
         );
-        let (mut io_effects, connections_to_wake) = {
+        let (io_effects, connections_to_wake) = {
             let _admission = write_unpoison(&self.session.admission);
             let mut terminal = lock_unpoison(&self.terminal);
             if terminal.is_some() {
@@ -692,7 +692,7 @@ impl EngineShared {
             (io_effects, connections_to_wake)
         };
 
-        self.session.apply_io_effects(&mut io_effects);
+        let committed_io_effects = self.session.apply_terminal_io_effects(io_effects);
         self.session.terminalize_cm(&outcome);
         for connection in &connections_to_wake {
             if outcome.is_error() && connection.retain_bundle_for_engine_failure() {
@@ -705,7 +705,7 @@ impl EngineShared {
                 event.deliver();
             }
         }
-        io_effects.publish();
+        committed_io_effects.publish();
         for connection in connections_to_wake {
             connection.wake_close();
         }

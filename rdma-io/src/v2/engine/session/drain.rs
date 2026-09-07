@@ -197,7 +197,9 @@ mod tests {
     use std::task::{Context, Poll};
     use std::time::Duration;
 
-    use super::super::super::io_core::install_accepted_operation_for_driver_test;
+    use super::super::super::io_core::{
+        install_accepted_operation_for_driver_test, register_operation_waker_for_test,
+    };
     use super::super::super::registry::OperationToken;
     use super::super::super::{
         CompletionMode, RdmaConnectionConfig, RdmaEngineLifecycle, test_engine_pair,
@@ -462,6 +464,51 @@ mod tests {
             reentrant.lock_failures.load(Ordering::Acquire),
             0,
             "connection-close publication must run after admission and lifecycle guards drop"
+        );
+    }
+
+    #[test]
+    fn connection_close_wakes_operation_observer_after_guards_drop() {
+        let (engine, _driver) = test_engine_pair(CompletionMode::Polling);
+        let connection = install_connection(
+            &engine.shared.session,
+            TestPoster::new(22),
+            RdmaConnectionConfig::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let token = install_accepted_operation_for_driver_test(
+            &engine.shared.io_core,
+            &connection.state,
+            crate::wc::WcOpcode::Send,
+        );
+        let reentrant = Arc::new(GuardCheckingWaker {
+            session: Arc::clone(&engine.shared.session),
+            connection: Arc::clone(&connection.state),
+            wakes: AtomicUsize::new(0),
+            lock_failures: AtomicUsize::new(0),
+        });
+        register_operation_waker_for_test(
+            &engine.shared.io_core,
+            token,
+            &waker(Arc::clone(&reentrant)),
+        );
+
+        engine
+            .shared
+            .session
+            .begin_connection_close(&connection.state);
+
+        assert_eq!(
+            reentrant.wakes.load(Ordering::Acquire),
+            1,
+            "accepted operation observer must be detached and woken once"
+        );
+        assert_eq!(
+            reentrant.lock_failures.load(Ordering::Acquire),
+            0,
+            "operation-observer wake must run after admission and lifecycle guards drop"
         );
     }
 
