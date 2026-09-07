@@ -2066,6 +2066,70 @@ fn find_effect_trait_impls(
     Ok(found)
 }
 
+fn find_effect_associated_type_bindings(
+    source: &str,
+    known_types: &HashSet<String>,
+) -> Result<Vec<String>, syn::Error> {
+    fn inspect(
+        items: &[Item],
+        module_path: &mut Vec<String>,
+        known_types: &HashSet<String>,
+        found: &mut Vec<String>,
+    ) {
+        for item in items {
+            if is_test_only(item_attrs(item)) {
+                continue;
+            }
+            match item {
+                Item::Impl(implementation) => {
+                    let owner = type_path_last(&implementation.self_ty)
+                        .unwrap_or_else(|| "<impl>".to_owned());
+                    for implementation_item in &implementation.items {
+                        if let ImplItem::Type(associated) = implementation_item
+                            && !is_test_only(&associated.attrs)
+                            && type_mentions_any(&associated.ty, known_types)
+                        {
+                            found.push(qualified_name(
+                                module_path,
+                                &format!("{owner}::type {}", associated.ident),
+                            ));
+                        }
+                    }
+                }
+                Item::Trait(trait_item) => {
+                    for trait_member in &trait_item.items {
+                        if let TraitItem::Type(associated) = trait_member
+                            && !is_test_only(&associated.attrs)
+                            && associated
+                                .default
+                                .as_ref()
+                                .is_some_and(|(_, ty)| type_mentions_any(ty, known_types))
+                        {
+                            found.push(qualified_name(
+                                module_path,
+                                &format!("{}::type {}", trait_item.ident, associated.ident),
+                            ));
+                        }
+                    }
+                }
+                Item::Mod(module) => {
+                    if let Some((_, items)) = &module.content {
+                        module_path.push(module.ident.to_string());
+                        inspect(items, module_path, known_types, found);
+                        module_path.pop();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let syntax = syn::parse_file(source)?;
+    let mut found = Vec::new();
+    inspect(&syntax.items, &mut Vec::new(), known_types, &mut found);
+    Ok(found)
+}
+
 fn find_strong_owner_fields(
     source: &str,
     struct_name: &str,
@@ -3270,6 +3334,24 @@ fn io_effect_publication_detector_rejects_unchecked_routes() {
         .unwrap()
         .is_empty(),
         "generic and cross-file aliases must not hide constant effect extraction"
+    );
+    let associated_projection = r#"
+        struct AfterEngineUnlock;
+        impl AfterEngineUnlock { fn publish(self) {} }
+        struct CommittedIoCoreEffects { after_unlock: AfterEngineUnlock }
+        impl CommittedIoCoreEffects { fn publish(self) { self.after_unlock.publish(); } }
+        trait EffectMap { type Output; }
+        struct Marker;
+        impl EffectMap for Marker { type Output = CommittedIoCoreEffects; }
+        const BYPASS: fn(<Marker as EffectMap>::Output) = |value| {
+            <Marker as EffectMap>::Output::publish(value);
+        };
+    "#;
+    assert_eq!(
+        find_effect_associated_type_bindings(associated_projection, &base_effect_boundary_types(),)
+            .unwrap(),
+        ["Marker::type Output"],
+        "associated-type projections must not hide effect boundary types"
     );
     assert_eq!(
         find_production_zero_argument_method_calls(
@@ -4760,6 +4842,7 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     let mut post_guard_function_references = Vec::new();
     let mut post_guard_use_aliases = Vec::new();
     let mut effect_constant_bypasses = Vec::new();
+    let mut effect_associated_type_bindings = Vec::new();
     for path in effect_source_paths {
         let source = fs::read_to_string(&path).expect("read engine source");
         if source_is_test_only(&source)
@@ -4898,6 +4981,14 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
                 .into_iter()
                 .map(|violation| (path.clone(), violation)),
         );
+        effect_associated_type_bindings.extend(
+            find_effect_associated_type_bindings(&source, &global_effect_boundary_types)
+                .unwrap_or_else(|error| {
+                    panic!("parse {} effect associated types: {error}", path.display())
+                })
+                .into_iter()
+                .map(|binding| (path.clone(), binding)),
+        );
     }
     assert_eq!(
         io_effects_definition_paths.as_slice(),
@@ -5000,6 +5091,10 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     assert!(
         effect_constant_bypasses.is_empty(),
         "constant/static effect expressions must not extract or publish guarded payloads: {effect_constant_bypasses:#?}"
+    );
+    assert!(
+        effect_associated_type_bindings.is_empty(),
+        "effect boundary types must not escape through associated-type projections: {effect_associated_type_bindings:#?}"
     );
     assert!(
         post_guard_publish_calls.len() == 3
