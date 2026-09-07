@@ -12,19 +12,69 @@ hold narrow, resource-free capabilities rather than the shared engine state.
 Each engine-bound message connection additionally returns one non-cloneable
 `MessageTransport` frontend and one explicit `MessageTransportDriver`.
 
-```text
-application
-  ├─ one RdmaEngineDriver task
-  │    ├─ engine root: Context / PD / CQ / CM channel
-  │    ├─ IoCore: posting / CQE validation / operation ownership
-  │    └─ SessionManager: CM routes / connections / teardown / quarantine
-  │
-  └─ one MessageTransportDriver task per message connection
-       ├─ HELLO negotiation and timeout
-       ├─ DATA / CREDIT parsing and production
-       ├─ receive reposting and registered-buffer pools
-       ├─ connection-local fairness
-       └─ message lifecycle and terminal outcomes
+```mermaid
+flowchart TB
+    App["Application"]
+
+    subgraph Public["Returned public values (explicitly polled by the application)"]
+        Engine["RdmaEngine frontend"]
+        EngineDriver["RdmaEngineDriver"]
+        Transport["MessageTransport frontend"]
+        MessageDriver["MessageTransportDriver<br/>(one per message connection)"]
+    end
+
+    subgraph Composition["Engine composition"]
+        Root["EngineShared<br/>lifecycle, terminal state, work signal,<br/>device-resource lifetime"]
+        IoProgress["IoProgress<br/>CQ readiness, bounded CQ/dispatch/deadline turns"]
+        SessionProgress["SessionProgress<br/>CM readiness, bounded lifecycle/shutdown turns"]
+        IoCore["IoCore<br/>submission, exact CQE validation,<br/>operation and MR ownership"]
+        Session["SessionManager<br/>CM routes, listeners, connections,<br/>teardown and quarantine"]
+        Bridge["IoSessionBridge<br/>live connection/QP proof and effect handoff"]
+    end
+
+    subgraph Protocol["Per-connection protocol"]
+        IoBoundary["IoConnection + IoEventReceiver<br/>owned request/completion boundary"]
+        MessagePolicy["HELLO, DATA/CREDIT, pools,<br/>reposting, fairness, message outcomes"]
+    end
+
+    subgraph Hardware["RDMA resources and provider"]
+        Device["Context + PD"]
+        CQ["Shared CQ + optional readiness channel"]
+        CM["CM event channel + optional readiness adapter"]
+        Connections["QP + CmId connection bundles"]
+    end
+
+    App -->|calls| Engine
+    App -->|polls or spawns| EngineDriver
+    App -->|calls| Transport
+    App -->|polls or spawns| MessageDriver
+
+    Engine -->|connect, listen, shutdown| Root
+    EngineDriver -->|bounded I/O turn| IoProgress
+    EngineDriver -->|bounded session turn| SessionProgress
+    EngineDriver -->|post-owner terminal epilogue| Root
+
+    Root -->|constructs and retains| IoCore
+    Root -->|constructs and retains| Session
+    IoProgress -->|operates| IoCore
+    IoProgress -->|uses narrow capability| Bridge
+    Bridge -->|routes through| Session
+    SessionProgress -->|operates| Session
+
+    Transport <-->|commands and outcomes| MessagePolicy
+    MessageDriver -->|advances| MessagePolicy
+    MessagePolicy -->|submits and receives owned values| IoBoundary
+    IoBoundary -->|operations and completion events| IoCore
+    MessagePolicy -->|opaque close capability| Session
+
+    Root -->|anchors final lifetime| Device
+    Root -->|anchors final lifetime| CQ
+    Root -->|anchors final lifetime| CM
+    IoProgress -->|polls| CQ
+    SessionProgress -->|polls| CM
+    Session -->|owns lifecycle| Connections
+    Connections --> Device
+    Connections --> CQ
 ```
 
 The library creates no task or thread. Applications may spawn the returned
@@ -239,8 +289,13 @@ state preserves inbox/due fairness, odd-budget rotation, and unused-capacity
 transfer. Operation tokens and reclamation remain I/O-owned; connection drain
 and engine-shutdown deadline meanings remain session-owned.
 
-The source hierarchy mirrors that ownership. `engine/session/mod.rs` defines
-the manager and its lifecycle capabilities, while `session/cm.rs`,
+The source hierarchy mirrors that ownership. `engine/driver/mod.rs` contains
+the independently readable production scheduler, while
+`engine/driver/test_api.rs` contains the feature-gated test support and
+`engine/driver/tests.rs` contains its unit tests. Both extracted files remain
+direct children of the private driver module, preserving the existing
+test-hook path and narrow visibility. `engine/session/mod.rs` defines the
+manager and its lifecycle capabilities, while `session/cm.rs`,
 `session/listener.rs`, `session/connection.rs`, `session/drain.rs`, and
 `session/registry.rs` contain session-owned state and policy. The remaining
 `engine/registry.rs` is not a connection owner: it provides opaque connection
