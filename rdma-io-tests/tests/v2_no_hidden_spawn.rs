@@ -1398,21 +1398,10 @@ fn find_production_zero_argument_method_calls(
 struct EffectUfcsPublishVisitor {
     effect_types: HashSet<String>,
     calls: Vec<usize>,
+    self_types: Vec<String>,
 }
 
 impl Visit<'_> for EffectUfcsPublishVisitor {
-    fn visit_item_type(&mut self, alias: &syn::ItemType) {
-        if type_path_last(&alias.ty).is_some_and(|name| self.effect_types.contains(&name)) {
-            self.effect_types.insert(alias.ident.to_string());
-        }
-        visit::visit_item_type(self, alias);
-    }
-
-    fn visit_item_use(&mut self, item: &syn::ItemUse) {
-        collect_use_aliases(&item.tree, &mut self.effect_types);
-        visit::visit_item_use(self, item);
-    }
-
     fn visit_expr_call(&mut self, call: &ExprCall) {
         if let Expr::Path(path) = call.func.as_ref()
             && path
@@ -1430,6 +1419,13 @@ impl Visit<'_> for EffectUfcsPublishVisitor {
                     segments.next();
                     segments.next().map(|segment| segment.ident.to_string())
                 });
+            let receiver_type = receiver_type.and_then(|name| {
+                if name == "Self" {
+                    self.self_types.last().cloned()
+                } else {
+                    Some(name)
+                }
+            });
             if receiver_type
                 .as_ref()
                 .is_some_and(|name| self.effect_types.contains(name))
@@ -1439,21 +1435,60 @@ impl Visit<'_> for EffectUfcsPublishVisitor {
         }
         visit::visit_expr_call(self, call);
     }
+
+    fn visit_item_impl(&mut self, implementation: &syn::ItemImpl) {
+        self.self_types
+            .push(type_path_last(&implementation.self_ty).unwrap_or_else(|| "<impl>".to_owned()));
+        visit::visit_item_impl(self, implementation);
+        self.self_types.pop();
+    }
 }
 
 fn find_effect_ufcs_publications(source: &str) -> Result<Vec<usize>, syn::Error> {
     let syntax = syn::parse_file(source)?;
-    let effect_types = identifiers_and_aliases(
-        &syntax,
-        &[
-            "AfterEngineUnlock",
-            "DetachedIoCoreEffects",
-            "CommittedIoCoreEffects",
-        ],
-    );
+    struct AliasCollector<'a> {
+        names: &'a mut HashSet<String>,
+        changed: bool,
+    }
+
+    impl Visit<'_> for AliasCollector<'_> {
+        fn visit_item_type(&mut self, alias: &syn::ItemType) {
+            if type_path_last(&alias.ty).is_some_and(|name| self.names.contains(&name)) {
+                self.changed |= self.names.insert(alias.ident.to_string());
+            }
+            visit::visit_item_type(self, alias);
+        }
+
+        fn visit_item_use(&mut self, item: &syn::ItemUse) {
+            let before = self.names.len();
+            collect_use_aliases(&item.tree, self.names);
+            self.changed |= self.names.len() != before;
+            visit::visit_item_use(self, item);
+        }
+    }
+
+    let mut effect_types = [
+        "AfterEngineUnlock",
+        "DetachedIoCoreEffects",
+        "CommittedIoCoreEffects",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<HashSet<_>>();
+    loop {
+        let mut collector = AliasCollector {
+            names: &mut effect_types,
+            changed: false,
+        };
+        collector.visit_file(&syntax);
+        if !collector.changed {
+            break;
+        }
+    }
     let mut visitor = EffectUfcsPublishVisitor {
         effect_types,
         calls: Vec::new(),
+        self_types: Vec::new(),
     };
     visitor.visit_file(&syntax);
     Ok(visitor.calls)
@@ -2412,6 +2447,30 @@ fn io_effect_publication_detector_rejects_unchecked_routes() {
             .len(),
         2,
         "function-local type and use aliases must not hide effect UFCS publication"
+    );
+    assert_eq!(
+        find_effect_ufcs_publications(
+            "fn bypass(effect: AfterEngineUnlock) { Local::publish(effect); type Local = AfterEngineUnlock; }",
+        )
+        .unwrap()
+        .len(),
+        1,
+        "a block-local alias declared after its use must not hide effect UFCS publication"
+    );
+    let self_ufcs = r#"
+        struct CommittedIoCoreEffects;
+        impl CommittedIoCoreEffects {
+            fn bypass(self) { Self::publish(self); }
+        }
+        struct DetachedIoCoreEffects;
+        impl DetachedIoCoreEffects {
+            fn bypass(self) { <Self>::publish(self); }
+        }
+    "#;
+    assert_eq!(
+        find_effect_ufcs_publications(self_ufcs).unwrap().len(),
+        2,
+        "Self-qualified UFCS publication must be detected in effect-type implementations"
     );
     assert_eq!(
         find_production_zero_argument_method_calls(
