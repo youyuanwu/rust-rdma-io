@@ -1353,6 +1353,30 @@ fn find_production_zero_argument_method_calls(
                         calls.extend(visitor.calls);
                     }
                 }
+                Item::Trait(trait_item) => {
+                    for trait_member in &trait_item.items {
+                        let TraitItem::Fn(function) = trait_member else {
+                            continue;
+                        };
+                        if is_test_only(&function.attrs) {
+                            continue;
+                        }
+                        let Some(block) = &function.default else {
+                            continue;
+                        };
+                        let name = qualified_name(
+                            module_path,
+                            &format!("{}::{}", trait_item.ident, function.sig.ident),
+                        );
+                        let mut visitor = ZeroArgumentMethodCallVisitor {
+                            method,
+                            calls: Vec::new(),
+                            function: &name,
+                        };
+                        visitor.visit_block(block);
+                        calls.extend(visitor.calls);
+                    }
+                }
                 Item::Mod(module) => {
                     if let Some((_, items)) = &module.content {
                         module_path.push(module.ident.to_string());
@@ -1371,12 +1395,24 @@ fn find_production_zero_argument_method_calls(
     Ok(calls)
 }
 
-struct EffectUfcsPublishVisitor<'a> {
-    effect_types: &'a HashSet<String>,
+struct EffectUfcsPublishVisitor {
+    effect_types: HashSet<String>,
     calls: Vec<usize>,
 }
 
-impl Visit<'_> for EffectUfcsPublishVisitor<'_> {
+impl Visit<'_> for EffectUfcsPublishVisitor {
+    fn visit_item_type(&mut self, alias: &syn::ItemType) {
+        if type_path_last(&alias.ty).is_some_and(|name| self.effect_types.contains(&name)) {
+            self.effect_types.insert(alias.ident.to_string());
+        }
+        visit::visit_item_type(self, alias);
+    }
+
+    fn visit_item_use(&mut self, item: &syn::ItemUse) {
+        collect_use_aliases(&item.tree, &mut self.effect_types);
+        visit::visit_item_use(self, item);
+    }
+
     fn visit_expr_call(&mut self, call: &ExprCall) {
         if let Expr::Path(path) = call.func.as_ref()
             && path
@@ -1416,7 +1452,7 @@ fn find_effect_ufcs_publications(source: &str) -> Result<Vec<usize>, syn::Error>
         ],
     );
     let mut visitor = EffectUfcsPublishVisitor {
-        effect_types: &effect_types,
+        effect_types,
         calls: Vec::new(),
     };
     visitor.visit_file(&syntax);
@@ -2359,6 +2395,32 @@ fn io_effect_publication_detector_rejects_unchecked_routes() {
         find_effect_ufcs_publications(nested_ufcs).unwrap().len(),
         3,
         "nested UFCS publication must be detected for every effect publication type and alias"
+    );
+    let block_alias_ufcs = r#"
+        fn bypass(effect: AfterEngineUnlock) {
+            type LocalEffect = AfterEngineUnlock;
+            LocalEffect::publish(effect);
+        }
+        fn bypass_use(effect: DetachedIoCoreEffects) {
+            use crate::DetachedIoCoreEffects as LocalEffect;
+            LocalEffect::publish(effect);
+        }
+    "#;
+    assert_eq!(
+        find_effect_ufcs_publications(block_alias_ufcs)
+            .unwrap()
+            .len(),
+        2,
+        "function-local type and use aliases must not hide effect UFCS publication"
+    );
+    assert_eq!(
+        find_production_zero_argument_method_calls(
+            "trait Publisher { fn bypass(value: CommittedIoCoreEffects) { value.publish(); } }",
+            "publish",
+        )
+        .unwrap(),
+        ["Publisher::bypass:1"],
+        "default trait-method publication must be visible to the exact route allowlist"
     );
 
     let additional_inherent_method = r#"
