@@ -1,3 +1,12 @@
+//! Coupled per-operation state and its owned lifecycle transitions.
+//!
+//! `OperationInner` bundles lifecycle, completion ownership, output, MR,
+//! detachment, reclamation, and event destination under a single mutex because
+//! those fields must move together. Neither the inner bundle nor its guard
+//! leaves this module: every transition is a method here that returns an owned
+//! record (`FinishState`, `UnacceptedRelease`, `TerminalizeState`,
+//! `QuarantineTransition`) for the caller to act on after the lock is released.
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
@@ -97,6 +106,7 @@ impl OperationState {
         self.mr_len
     }
 
+    /// Registers the waker woken by post-unlock operation wakes.
     pub(super) fn register_waker(&self, waker: &Waker) {
         self.waker.register(waker);
     }
@@ -369,6 +379,12 @@ impl OperationState {
         Some(self.take_unaccepted_locked(&mut inner, error))
     }
 
+    /// Releases a proven-unaccepted batch as one all-or-none transaction.
+    ///
+    /// Locks every state in `states` before inspecting any of them, and takes
+    /// ownership only when the whole slice is still unaccepted (`Posting` with
+    /// no owned CQE). Returns `None` with nothing mutated when any member has
+    /// acquired a completion, so the caller can retain the batch instead.
     pub(super) fn take_proven_unaccepted_batch(
         states: &[Arc<Self>],
         error: Error,
@@ -493,6 +509,7 @@ pub(super) enum CompletionDisposition {
     Duplicate,
 }
 
+/// Post-unlock ownership taken from an operation that never reached the provider.
 pub(super) struct UnacceptedRelease {
     pub(super) event: Option<PendingIoEvent>,
     pub(super) mr: Option<Mr>,

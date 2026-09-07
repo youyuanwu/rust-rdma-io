@@ -1,3 +1,9 @@
+//! Generational operation registry and CQ admission/retained-debt accounting.
+//!
+//! Both types are engine-wide bookkeeping for the I/O owner and hold no
+//! per-operation state; the registry's slot storage stays private so callers
+//! reach entries only through the token-checked methods below.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
