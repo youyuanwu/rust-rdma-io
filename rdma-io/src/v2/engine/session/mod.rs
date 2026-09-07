@@ -30,6 +30,7 @@ use self::connection::{
 use self::listener::ListenerState;
 pub(super) use self::progress::SessionProgress;
 use self::registry::ConnectionRegistry;
+pub(in crate::v2::engine) use self::registry::LiveIoProofAuthority;
 #[cfg(any(test, feature = "test-hooks"))]
 use super::SessionTestInstrumentation;
 use super::config::{ProviderLimits, RdmaConnectionConfig, SessionConfig};
@@ -57,6 +58,11 @@ pub(super) struct DeadlineRequest {
 
 /// Non-forgeable authority for connection and QP lifecycle transitions.
 pub(super) struct SessionLifecycleAuthority {
+    _private: (),
+}
+
+/// Authority held by the session owner while committing I/O effects.
+pub(in crate::v2::engine) struct IoEffectsCommitAuthority {
     _private: (),
 }
 
@@ -335,6 +341,7 @@ pub(super) struct SessionManager {
     #[cfg(any(test, feature = "test-hooks"))]
     test_instrumentation: SessionTestInstrumentation,
     lifecycle_authority: SessionLifecycleAuthority,
+    io_effects_commit_authority: IoEffectsCommitAuthority,
     qp_reclaim: QpReclaimCapability,
     pub(super) io_core: Arc<IoCore>,
 }
@@ -368,6 +375,7 @@ impl SessionManager {
             #[cfg(any(test, feature = "test-hooks"))]
             test_instrumentation,
             lifecycle_authority: SessionLifecycleAuthority { _private: () },
+            io_effects_commit_authority: IoEffectsCommitAuthority { _private: () },
             qp_reclaim,
             io_core,
         })
@@ -699,7 +707,7 @@ impl SessionManager {
                 self.schedule_connection_retirement(&connection);
             }
         }
-        effects.into_committed()
+        effects.into_committed(&self.io_effects_commit_authority)
     }
 
     /// Consume an I/O effect bundle, apply all session-facing mutations, and
@@ -718,7 +726,7 @@ impl SessionManager {
     ///
     /// The returned value contains only detached publication and must be
     /// consumed after CM and connection terminal state has been published.
-    /// Structural checks confine this split to root terminal composition.
+    /// Session authority confines conversion before root composition.
     pub(super) fn apply_terminal_io_effects(
         &self,
         effects: IoCoreEffects,
@@ -902,11 +910,17 @@ mod tests {
             Ok(BatchPostOutcome::AllAccepted)
         }
 
-        fn to_error(&self) -> Result<()> {
+        fn to_error(
+            &self,
+            _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
+        ) -> Result<()> {
             Ok(())
         }
 
-        fn destroy_qp(&self) -> Result<bool> {
+        fn destroy_qp(
+            &self,
+            _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
+        ) -> Result<bool> {
             Ok(true)
         }
 

@@ -285,7 +285,10 @@ mod tests {
             unreachable!("drain test does not post")
         }
 
-        fn to_error(&self) -> Result<()> {
+        fn to_error(
+            &self,
+            _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
+        ) -> Result<()> {
             self.error_transitions.fetch_add(1, Ordering::AcqRel);
             if self.fail_error_transition {
                 Err(Error::Verbs(std::io::Error::other(
@@ -296,7 +299,10 @@ mod tests {
             }
         }
 
-        fn destroy_qp(&self) -> Result<bool> {
+        fn destroy_qp(
+            &self,
+            _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
+        ) -> Result<bool> {
             self.destroys.fetch_add(1, Ordering::AcqRel);
             if self.fail_destroy {
                 Err(Error::Verbs(std::io::Error::from_raw_os_error(libc::EBUSY)))

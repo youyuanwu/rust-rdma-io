@@ -9,9 +9,15 @@ use super::super::registry::{
 use super::connection::ConnectionState;
 use crate::v2::error::{Error, Result};
 
+/// Authority held by the connection registry while minting live-I/O proofs.
+pub(in crate::v2::engine) struct LiveIoProofAuthority {
+    _private: (),
+}
+
 pub(in crate::v2::engine) struct ConnectionRegistry {
     slots: PagedRegistry<ConnectionToken, Arc<ConnectionState>>,
     qp_index: Mutex<HashMap<u32, ConnectionToken>>,
+    live_io_proof_authority: LiveIoProofAuthority,
 }
 
 impl ConnectionRegistry {
@@ -19,6 +25,7 @@ impl ConnectionRegistry {
         Ok(Self {
             slots: PagedRegistry::new(capacity)?,
             qp_index: Mutex::new(HashMap::new()),
+            live_io_proof_authority: LiveIoProofAuthority { _private: () },
         })
     }
 
@@ -86,7 +93,9 @@ impl ConnectionRegistry {
             return None;
         }
         Some(LiveIoConnectionProof::issue_live_io_proof(
-            connection, qp_num,
+            &self.live_io_proof_authority,
+            connection,
+            qp_num,
         ))
     }
 

@@ -155,11 +155,17 @@ mod tests {
             unreachable!("lifecycle test does not post")
         }
 
-        fn to_error(&self) -> Result<()> {
+        fn to_error(
+            &self,
+            _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
+        ) -> Result<()> {
             Ok(())
         }
 
-        fn destroy_qp(&self) -> Result<bool> {
+        fn destroy_qp(
+            &self,
+            _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
+        ) -> Result<bool> {
             Ok(self
                 .destroys
                 .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)

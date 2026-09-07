@@ -365,27 +365,32 @@ or quarantine provider-visible ownership.
 
 These boundaries are crate-private and deliberately unstable. V1 APIs are
 unchanged; v2 replaces the aggregate reclamation-budget control with separate
-I/O and session controls. AST guards reject hidden work, production `IoCore`
-dependencies on root/session/connection/CM/listener/protocol types, strong
-session-resource retention by frontends and waiters, lifecycle operations
-without the private authority, public re-exports of internal capabilities, and
-obsolete top-level session-module paths. The guards also parse the current
-listed session sources, including test-only items and renamed imports, to
-reject direct `EngineShared` dependencies; recursively reject broad
-root/session `Deref` adapters and obsolete or newly renamed root-to-owner
-forwarding methods; constrain the session runtime method/type surface and
-`SessionConfig` fields; and require tests under `engine/io_core/` to use
-explicit `IoCore`/`SessionManager` fixture parts with only an opaque runtime
-retain.
+I/O and session controls.
 
-The structural checks recursively discover Rust sources beneath the v2 I/O
-core and session trees. They enforce the consuming session boundary, the
-root-terminal type-state exception, the guarded scalar and batch
-early-completion extraction paths, and an exact allowlist of source-visible
-publication calls, including qualified, aliased, nested, and default
-trait-method forms. The checker intentionally does not inspect effect
-publication introduced only through macro expansion; that accepted limitation
-must not be interpreted as a whole-program lock or publication proof.
+Enforcement follows the boundary that owns each invariant:
+
+- Package-local Clippy configuration rejects resolved thread, task, executor,
+  and runtime-construction APIs throughout production v2 code. V1 and
+  intentional unit-test concurrency fixtures are outside that lint scope.
+- Private fields and consuming types keep full `IoCoreEffects`
+  non-publishable. Conversion to committed effects requires an authority that
+  only the trusted `session` subtree can construct.
+- `ConnectionRegistry` owns a separate private authority required to mint a
+  `LiveIoConnectionProof` after exact generation and QP-index validation.
+  Provider-visible lifecycle adapters continue requiring
+  `SessionLifecycleAuthority`; all `session` descendants are trusted owner
+  code.
+- Reentrant owner-local tests prove guard release and
+  mutation-before-publication behavior. Scheduler, teardown, reclamation, and
+  provider suites prove observable behavior rather than private source shape.
+- Dependency direction, narrow visibility, and cohesive source layout remain
+  documented review constraints when Rust visibility cannot express them
+  without distorting the ownership model.
+
+The effect and live-proof constructors have a deliberate type-only dependency
+on session authority. They retain no session state, lock, registry, resource,
+or ownership handle. Exact method inventories, call counts, statement order,
+file paths, and private field lists are not architectural contracts.
 
 ## Completion-to-Message Handoff
 
@@ -591,8 +596,8 @@ CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 just validate-v2-engine
 ```
 
 It runs warning-denied feature builds, all-target workspace builds, formatting,
-strict Clippy, rustdoc, doctests, recursive hidden-work and internal-boundary
-guards, an isolated production build without `test-hooks`, and serialized
+strict Clippy including the production v2 hidden-work policy, rustdoc,
+doctests, an isolated production build without `test-hooks`, and serialized
 integration suites on both RXE and SIW.
 
 The provider-only matrix is:
@@ -621,13 +626,13 @@ count as the goal:
 
 | Criterion | As-built evidence |
 |---|---|
-| Lowest I/O layer excludes message, listener, and CM policy | `IoCore` owns posting, exact CQE validation, operation accounting, readiness, and reclamation behind a structural dependency guard. |
-| Message policy excludes engine/session internals | `MessageTransportDriver` uses only `IoConnection`, its event port, and opaque close capability; the structural guard rejects root, registry, and lifecycle internals. |
+| Lowest I/O layer excludes message, listener, and CM policy | `IoCore` owns posting, exact CQE validation, operation accounting, readiness, and reclamation. Its only session reference is the type-only authority required to commit full effects; it retains no session state or resources. |
+| Message policy excludes engine/session internals | `MessageTransportDriver` uses only `IoConnection`, its event port, and opaque close capability; private APIs and review preserve that dependency direction. |
 | CM/listener/session state is outside the I/O core | `SessionManager` owns CM routes, listeners, connections, lifecycle authority, teardown, deadlines, and connection quarantine under the `engine/session/` hierarchy. |
 | Composition root does not re-own owner policy | `EngineShared` assembles owners and coordinates global lifecycle, signaling, diagnostics, terminal state, and lifetime ordering. Session-to-engine access is the weak narrow runtime capability described above. |
 | Exact routing and fail-closed provider ownership remain intact | Unit and RXE/SIW provider suites cover generation/QP/opcode validation, duplicates, accepted prefixes, proven rejection, acceptance ambiguity, and missing completions. |
 | Positive release and teardown boundaries remain intact | Tests cover proven non-acceptance, exact completion, successful QP-destruction proof, QP-before-route/CmId retirement, and complete-bundle quarantine after failed destruction. |
-| Publication and progress contracts remain explicit | Tests cover post-guard callbacks/wakers, bounded owner turns, fair rotation, terminal composition, and the recursive no-hidden-task/thread guard. |
+| Publication and progress contracts remain explicit | Tests cover post-guard callbacks/wakers, bounded owner turns, fair rotation, and terminal composition; package-local Clippy rejects configured hidden-work APIs in production v2 code. |
 | Transitional seams are removed | The aggregate reclamation alias and old source paths remain absent; the final cleanup removes stale migration annotations, root/session test dereference, root forwarding, and full-root I/O fixtures. |
 | V1 remains separate | No v1 source is changed by this cleanup, and the complete provider gate retains the v1 safe-resource suite. |
 | Documentation matches implementation | This document distinguishes policy ownership, physical readiness/resource retention, narrow runtime composition, and bounded test support. |

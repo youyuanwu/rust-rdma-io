@@ -2225,12 +2225,18 @@ impl WorkRequestPoster for ScriptedPoster {
         ))
     }
 
-    fn to_error(&self) -> Result<()> {
+    fn to_error(
+        &self,
+        _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
+    ) -> Result<()> {
         self.error_transitions.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
-    fn destroy_qp(&self) -> Result<bool> {
+    fn destroy_qp(
+        &self,
+        _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
+    ) -> Result<bool> {
         Ok(false)
     }
 
@@ -2325,10 +2331,16 @@ impl WorkRequestPoster for NoopPoster {
     fn post_recv(&self, _: &mut PreparedRecvBatch) -> Result<BatchPostOutcome> {
         Ok(BatchPostOutcome::AllAccepted)
     }
-    fn to_error(&self) -> Result<()> {
+    fn to_error(
+        &self,
+        _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
+    ) -> Result<()> {
         Ok(())
     }
-    fn destroy_qp(&self) -> Result<bool> {
+    fn destroy_qp(
+        &self,
+        _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
+    ) -> Result<bool> {
         Ok(false)
     }
     #[cfg(any(test, feature = "test-hooks"))]

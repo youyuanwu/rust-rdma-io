@@ -208,11 +208,17 @@ impl WorkRequestPoster for TestIdlePoster {
         unreachable!("idle registry fixtures never post")
     }
 
-    fn to_error(&self) -> Result<()> {
+    fn to_error(
+        &self,
+        _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
+    ) -> Result<()> {
         Ok(())
     }
 
-    fn destroy_qp(&self) -> Result<bool> {
+    fn destroy_qp(
+        &self,
+        _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
+    ) -> Result<bool> {
         Ok(true)
     }
 
@@ -317,9 +323,7 @@ impl TestEngineResources {
             Ok(state) => state,
             Err(_) => return Ok(false),
         };
-        Ok(state
-            .poster
-            .uses_resources(&self.resources.pd, &self.resources.cq))
+        Ok(state.uses_resources_for_test(&self.resources.pd, &self.resources.cq))
     }
 
     /// Verify that the connection's exact generational CM route is live.
@@ -432,8 +436,7 @@ impl TestEngineResources {
     pub fn fail_next_connection_qp_destroy(&self, connection: &RdmaConnection) -> Result<()> {
         let shared = self.ensure_active()?;
         self.require_owned_connection(&shared, connection)?
-            .poster
-            .fail_next_qp_destroy()
+            .fail_next_qp_destroy_for_test()
     }
 
     /// Fail the next newly created connection installation and its QP rollback.

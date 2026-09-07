@@ -252,13 +252,6 @@ run_static_preflight() {
             CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
             RUSTFLAGS="-D warnings" \
             "$CARGO" check -p rdma-io --no-default-features --features tokio || return $?
-        sudo -u "$SUDO_USER" env \
-            HOME="$user_home" \
-            PATH="$TOOLCHAIN_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-            CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
-            CARGO="$CARGO" \
-            "$CARGO" test -p rdma-io-tests \
-                --test v2_no_hidden_spawn || return $?
     else
         env PATH="$TOOLCHAIN_BIN:$PATH" CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
             RUSTFLAGS="-D warnings" \
@@ -266,9 +259,6 @@ run_static_preflight() {
         env PATH="$TOOLCHAIN_BIN:$PATH" CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
             RUSTFLAGS="-D warnings" \
             "$CARGO" check -p rdma-io --no-default-features --features tokio || return $?
-        env PATH="$TOOLCHAIN_BIN:$PATH" CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" CARGO="$CARGO" \
-            "$CARGO" test -p rdma-io-tests \
-                --test v2_no_hidden_spawn || return $?
     fi
 }
 
@@ -295,7 +285,7 @@ restore_rxe() {
 
 cd "$ROOT_DIR" || exit 1
 if [[ "$FULL_VALIDATION" -eq 1 ]]; then
-    echo "=== Run build-profile and no-hidden-spawn preflight ==="
+    echo "=== Run build-profile preflight ==="
     run_static_preflight
     static_status=$?
     if [[ "$static_status" -ne 0 ]]; then

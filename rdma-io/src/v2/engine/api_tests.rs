@@ -161,12 +161,18 @@ fn shutdown_initiates_each_preexisting_connection_close_once() {
             Ok(BatchPostOutcome::AllAccepted)
         }
 
-        fn to_error(&self) -> Result<()> {
+        fn to_error(
+            &self,
+            _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
+        ) -> Result<()> {
             self.error_transitions.fetch_add(1, Ordering::AcqRel);
             Ok(())
         }
 
-        fn destroy_qp(&self) -> Result<bool> {
+        fn destroy_qp(
+            &self,
+            _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
+        ) -> Result<bool> {
             Ok(true)
         }
 
