@@ -432,14 +432,39 @@ fn pattern_destructures_io_effects(pattern: &Pat, effects_names: &HashSet<String
     }
 }
 
-struct UncheckedEffectPublicationVisitor<'a> {
-    effects_names: &'a HashSet<String>,
+struct UncheckedEffectPublicationVisitor {
+    effects_names: HashSet<String>,
     aliases: HashSet<String>,
     function: String,
     violations: Vec<String>,
 }
 
-impl Visit<'_> for UncheckedEffectPublicationVisitor<'_> {
+impl Visit<'_> for UncheckedEffectPublicationVisitor {
+    fn visit_item_type(&mut self, alias: &syn::ItemType) {
+        if type_path_last(&alias.ty).is_some_and(|name| self.effects_names.contains(&name)) {
+            self.effects_names.insert(alias.ident.to_string());
+            self.violations.push(format!(
+                "{}:block-type-alias:{}",
+                self.function,
+                alias.ident.span().start().line
+            ));
+        }
+        visit::visit_item_type(self, alias);
+    }
+
+    fn visit_item_use(&mut self, item: &syn::ItemUse) {
+        let before = self.effects_names.len();
+        collect_use_aliases(&item.tree, &mut self.effects_names);
+        if self.effects_names.len() != before {
+            self.violations.push(format!(
+                "{}:block-use-alias:{}",
+                self.function,
+                item.span().start().line
+            ));
+        }
+        visit::visit_item_use(self, item);
+    }
+
     fn visit_pat_struct(&mut self, pattern: &syn::PatStruct) {
         if pattern
             .path
@@ -460,7 +485,7 @@ impl Visit<'_> for UncheckedEffectPublicationVisitor<'_> {
     }
 
     fn visit_local(&mut self, local: &Local) {
-        if pattern_destructures_io_effects(&local.pat, self.effects_names) {
+        if pattern_destructures_io_effects(&local.pat, &self.effects_names) {
             self.violations.push(format!(
                 "{}:destructure:{}",
                 self.function,
@@ -645,7 +670,7 @@ fn analyze_io_effects_publication(
                 }
                 Item::Fn(function) => {
                     let mut visitor = UncheckedEffectPublicationVisitor {
-                        effects_names,
+                        effects_names: effects_names.clone(),
                         aliases: HashSet::new(),
                         function: qualified_name(module_path, &function.sig.ident.to_string()),
                         violations: Vec::new(),
@@ -725,7 +750,7 @@ fn analyze_io_effects_publication(
                             }
                         }
                         let mut visitor = UncheckedEffectPublicationVisitor {
-                            effects_names,
+                            effects_names: effects_names.clone(),
                             aliases: HashSet::new(),
                             function: function_name,
                             violations: Vec::new(),
@@ -746,7 +771,7 @@ fn analyze_io_effects_publication(
                             continue;
                         }
                         let mut visitor = UncheckedEffectPublicationVisitor {
-                            effects_names,
+                            effects_names: effects_names.clone(),
                             aliases: HashSet::new(),
                             function: qualified_name(
                                 module_path,
@@ -2324,6 +2349,54 @@ fn io_effect_publication_detector_rejects_unchecked_routes() {
             .iter()
             .any(|violation| violation.contains("bypass:destructure")),
         "destructuring through an IoCoreEffects alias must be rejected"
+    );
+
+    let block_local_alias = r#"
+        struct IoCoreEffects { after_unlock: AfterEngineUnlock }
+        fn bypass(effects: IoCoreEffects) {
+            type LocalEffects = IoCoreEffects;
+            let LocalEffects { after_unlock } = effects;
+            after_unlock.publish();
+        }
+    "#;
+    let block_alias_analysis = analyze_io_effects_publication(block_local_alias).unwrap();
+    assert!(
+        block_alias_analysis
+            .violations
+            .iter()
+            .any(|violation| violation.contains("bypass:block-type-alias")),
+        "a block-local IoCoreEffects type alias must be rejected"
+    );
+    assert!(
+        block_alias_analysis
+            .violations
+            .iter()
+            .any(|violation| violation.contains("bypass:destructure")),
+        "destructuring through a block-local type alias must be rejected"
+    );
+
+    let block_local_use_alias = r#"
+        struct IoCoreEffects { after_unlock: AfterEngineUnlock }
+        fn bypass(effects: IoCoreEffects) {
+            use crate::IoCoreEffects as LocalEffects;
+            let LocalEffects { after_unlock } = effects;
+            after_unlock.publish();
+        }
+    "#;
+    let block_use_analysis = analyze_io_effects_publication(block_local_use_alias).unwrap();
+    assert!(
+        block_use_analysis
+            .violations
+            .iter()
+            .any(|violation| violation.contains("bypass:block-use-alias")),
+        "a block-local IoCoreEffects use alias must be rejected"
+    );
+    assert!(
+        block_use_analysis
+            .violations
+            .iter()
+            .any(|violation| violation.contains("bypass:destructure")),
+        "destructuring through a block-local use alias must be rejected"
     );
 
     let payload_extractor = r#"
