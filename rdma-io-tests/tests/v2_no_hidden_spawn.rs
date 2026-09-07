@@ -1553,7 +1553,7 @@ impl Visit<'_> for RestrictedEffectFunctionVisitor {
     }
 }
 
-fn find_restricted_effect_function_references(source: &str) -> Result<Vec<usize>, syn::Error> {
+fn expand_type_aliases(source: &str, names: &mut HashSet<String>) -> Result<bool, syn::Error> {
     let syntax = syn::parse_file(source)?;
     struct AliasCollector<'a> {
         names: &'a mut HashSet<String>,
@@ -1576,7 +1576,23 @@ fn find_restricted_effect_function_references(source: &str) -> Result<Vec<usize>
         }
     }
 
-    let mut effect_types = [
+    let mut changed_any = false;
+    loop {
+        let mut collector = AliasCollector {
+            names,
+            changed: false,
+        };
+        collector.visit_file(&syntax);
+        if !collector.changed {
+            break;
+        }
+        changed_any = true;
+    }
+    Ok(changed_any)
+}
+
+fn base_effect_boundary_types() -> HashSet<String> {
+    [
         "IoCoreEffects",
         "AfterEngineUnlock",
         "DetachedIoCoreEffects",
@@ -1585,17 +1601,16 @@ fn find_restricted_effect_function_references(source: &str) -> Result<Vec<usize>
     ]
     .into_iter()
     .map(str::to_owned)
-    .collect::<HashSet<_>>();
-    loop {
-        let mut collector = AliasCollector {
-            names: &mut effect_types,
-            changed: false,
-        };
-        collector.visit_file(&syntax);
-        if !collector.changed {
-            break;
-        }
-    }
+    .collect()
+}
+
+fn find_restricted_effect_function_references_with_types(
+    source: &str,
+    known_types: &HashSet<String>,
+) -> Result<Vec<usize>, syn::Error> {
+    let syntax = syn::parse_file(source)?;
+    let mut effect_types = known_types.clone();
+    expand_type_aliases(source, &mut effect_types)?;
     let mut visitor = RestrictedEffectFunctionVisitor {
         effect_types,
         references: Vec::new(),
@@ -1603,6 +1618,10 @@ fn find_restricted_effect_function_references(source: &str) -> Result<Vec<usize>
     };
     visitor.visit_file(&syntax);
     Ok(visitor.references)
+}
+
+fn find_restricted_effect_function_references(source: &str) -> Result<Vec<usize>, syn::Error> {
+    find_restricted_effect_function_references_with_types(source, &base_effect_boundary_types())
 }
 
 fn find_strong_owner_fields(
@@ -2637,6 +2656,24 @@ fn io_effect_publication_detector_rejects_unchecked_routes() {
             .len(),
         2,
         "Self-qualified extraction and terminal-application function items must be detected"
+    );
+    let mut cross_file_types = base_effect_boundary_types();
+    assert!(
+        expand_type_aliases(
+            "pub(super) type CrossFileEffects = CommittedIoCoreEffects;",
+            &mut cross_file_types,
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        find_restricted_effect_function_references_with_types(
+            "fn bypass(effect: CrossFileEffects) { let publish = CrossFileEffects::publish; publish(effect); }",
+            &cross_file_types,
+        )
+        .unwrap()
+        .len(),
+        1,
+        "cross-file effect aliases must not hide function-item publication"
     );
     assert_eq!(
         find_production_zero_argument_method_calls(
@@ -4085,6 +4122,25 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     }
     let io_core_operation_source =
         fs::read_to_string(&io_core_operation_path).expect("read I/O operation source");
+    let effect_source_paths =
+        collect_rs_files(&engine_dir).expect("enumerate I/O effect publication paths");
+    let mut global_effect_boundary_types = base_effect_boundary_types();
+    loop {
+        let mut changed = false;
+        for path in &effect_source_paths {
+            let source = fs::read_to_string(path).expect("read engine source for effect aliases");
+            changed |= expand_type_aliases(&source, &mut global_effect_boundary_types)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "parse {} cross-file effect aliases: {error}",
+                        path.display()
+                    )
+                });
+        }
+        if !changed {
+            break;
+        }
+    }
     let mut io_effects_definition_paths = Vec::new();
     let mut io_effects_impl_paths = Vec::new();
     let mut io_effects_publish_methods = Vec::new();
@@ -4095,7 +4151,7 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     let mut zero_argument_publish_calls = BTreeMap::<(PathBuf, String), usize>::new();
     let mut effect_ufcs_publish_calls = Vec::new();
     let mut restricted_effect_function_references = Vec::new();
-    for path in collect_rs_files(&engine_dir).expect("enumerate I/O effect publication paths") {
+    for path in effect_source_paths {
         let source = fs::read_to_string(&path).expect("read engine source");
         if source_is_test_only(&source)
             .unwrap_or_else(|error| panic!("parse file-level cfg for {}: {error}", path.display()))
@@ -4167,15 +4223,18 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
                 .map(|line| (path.clone(), line)),
         );
         restricted_effect_function_references.extend(
-            find_restricted_effect_function_references(&source)
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "parse {} restricted effect function references: {error}",
-                        path.display()
-                    )
-                })
-                .into_iter()
-                .map(|line| (path.clone(), line)),
+            find_restricted_effect_function_references_with_types(
+                &source,
+                &global_effect_boundary_types,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "parse {} restricted effect function references: {error}",
+                    path.display()
+                )
+            })
+            .into_iter()
+            .map(|line| (path.clone(), line)),
         );
     }
     assert_eq!(
