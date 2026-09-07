@@ -1812,6 +1812,7 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     let engine_mod_path = v2_dir.join("engine").join("mod.rs");
     let config_path = v2_dir.join("engine").join("config.rs");
     let progress_path = v2_dir.join("engine").join("progress.rs");
+    let scheduler_path = v2_dir.join("engine").join("scheduler.rs");
     let connection_path = v2_dir.join("engine").join("session").join("connection.rs");
     let cm_path = v2_dir.join("engine").join("session").join("cm.rs");
     let listener_path = v2_dir.join("engine").join("session").join("listener.rs");
@@ -1970,17 +1971,22 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
             progress_path.display()
         );
     }
-    for required in [
-        "units_consumed",
-        "immediate_work",
-        "next_deadline",
-        "readiness",
-        "terminal",
-        "effects",
-    ] {
+    for required in ["units_consumed", "immediate_work", "readiness"] {
         assert!(
             progress_source.contains(required),
             "{} must report `{required}`",
+            progress_path.display()
+        );
+    }
+    for forbidden in [
+        "next_deadline",
+        "ProgressTerminal",
+        "EffectsPublication",
+        "effects:",
+    ] {
+        assert!(
+            !progress_source.contains(forbidden),
+            "{} must not retain redundant progress-report state `{forbidden}`",
             progress_path.display()
         );
     }
@@ -1988,9 +1994,24 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         fs::read_to_string(&io_core_mod_path).expect("read I/O core module source");
     assert!(
         io_core_source.contains("trait IoSessionBridge")
-            && io_core_source.contains("session_bridge: OnceLock<Weak<dyn IoSessionBridge>>"),
-        "{} must retain only one bind-once weak session capability",
+            && !io_core_source.contains("session_bridge:")
+            && !io_core_source.contains("bind_session_bridge")
+            && !io_core_source.contains("fn session_bridge("),
+        "{} must define the narrow bridge without storing or binding it",
         io_core_mod_path.display()
+    );
+    let io_progress_source =
+        fs::read_to_string(&io_core_progress_path).expect("read I/O progress source");
+    assert!(
+        io_progress_source.contains("bridge: Arc<dyn IoSessionBridge>")
+            && io_progress_source.contains("bridge: Arc<dyn IoSessionBridge>,"),
+        "{} must own the session bridge directly",
+        io_core_progress_path.display()
+    );
+    assert!(
+        !engine_mod.contains("bind_session_bridge"),
+        "{} must not post-bind the I/O/session bridge",
+        engine_mod_path.display()
     );
     let engine_shared = engine_mod
         .split("struct EngineShared {")
@@ -2388,6 +2409,8 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         )
         .next()
         .expect("locate production driver prefix");
+    let session_progress_source =
+        fs::read_to_string(&session_progress_path).expect("read session progress source");
     assert_final_driver_boundary(
         &driver_path,
         production_driver,
@@ -2406,13 +2429,115 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     assert!(
         production_driver.contains("io_progress")
             && production_driver.contains("session_progress")
+            && production_driver.contains("fn poll_once(")
+            && production_driver.contains("progress_driver_terminal(")
             && !production_driver.contains("session.cm")
+            && !production_driver.contains("TERMINAL_WORK")
+            && !production_driver.contains("OwnerClass::Terminal")
+            && !production_driver.contains("service_terminal")
             && !driver_source.contains("tokio::spawn("),
-        "{} must schedule owner-local progress without spawning",
+        "{} must implement the bounded two-owner turn and terminal epilogue without spawning",
         driver_path.display()
     );
-    let session_progress_source =
-        fs::read_to_string(&session_progress_path).expect("read session progress source");
+    let scheduler_source =
+        fs::read_to_string(&scheduler_path).expect("read owner scheduler source");
+    assert!(
+        scheduler_source.contains("const OWNER_CLASS_COUNT: usize = 2")
+            && scheduler_source.contains("first_starts_next_pass")
+            && scheduler_source.contains("fn begin_pass(")
+            && !scheduler_source.contains("OwnerClass::Terminal"),
+        "{} must rotate exactly the I/O and session owners",
+        scheduler_path.display()
+    );
+    assert!(
+        scheduler_source.contains("struct DeadlineQueue<P>")
+            && scheduler_source.contains("struct DeadlineEntry<P>")
+            && scheduler_source.contains(".checked_add(1)")
+            && scheduler_source.contains("fn pop_one_due(")
+            && scheduler_source.contains("struct AlternatingSources")
+            && scheduler_source.contains("enum Source"),
+        "{} must contain only stable generic deadline and alternating-source mechanics",
+        scheduler_path.display()
+    );
+    for forbidden in [
+        "DeadlineKind",
+        "OperationToken",
+        "ConnectionToken",
+        "WorkCompletion",
+        "ConnectionDrain",
+        "EngineShutdown",
+    ] {
+        assert!(
+            !scheduler_source.contains(forbidden),
+            "{} must not interpret owner payload `{forbidden}`",
+            scheduler_path.display()
+        );
+    }
+    assert!(
+        io_progress_source.contains("DeadlineQueue<OperationToken>")
+            && session_progress_source.contains("DeadlineQueue<SessionDeadline>"),
+        "each owner must bind the generic deadline queue to its local payload"
+    );
+    assert!(
+        !progress_source.contains("Terminal"),
+        "{} must not define a terminal scheduler owner",
+        progress_path.display()
+    );
+    assert!(
+        !io_core_source.contains("publish_terminal"),
+        "{} must publish final-drain reconsideration through I/O work",
+        io_core_mod_path.display()
+    );
+    let poll_once_source = production_driver
+        .split("fn poll_once(")
+        .nth(1)
+        .and_then(|tail| tail.split("\n}\n\nimpl Future").next())
+        .expect("locate bounded driver turn");
+    let owner_loop = poll_once_source
+        .find("for _ in 0..owner_budget")
+        .expect("locate ready-at-entry owner loop");
+    let io_turn = poll_once_source
+        .find("OwnerClass::Io")
+        .expect("locate I/O owner branch");
+    let session_turn = poll_once_source
+        .find("OwnerClass::Session")
+        .expect("locate session owner branch");
+    let terminal_epilogue = poll_once_source
+        .find("progress_driver_terminal(")
+        .expect("locate terminal epilogue");
+    assert!(
+        owner_loop < io_turn
+            && owner_loop < session_turn
+            && io_turn < terminal_epilogue
+            && session_turn < terminal_epilogue,
+        "terminal eligibility must follow the bounded two-owner pass"
+    );
+    let future_poll = production_driver
+        .split("fn poll(mut self:")
+        .nth(1)
+        .expect("locate Future::poll");
+    let first_timer = future_poll
+        .find("self.poll_deadline_timer(cx)")
+        .expect("locate initial timer processing");
+    let observed_epoch = future_poll
+        .find("let observed_epoch")
+        .expect("locate epoch observation");
+    let bounded_turn = future_poll
+        .find("self.poll_once(cx)")
+        .expect("locate bounded owner turn");
+    let refreshed_timer = future_poll
+        .rfind("self.poll_deadline_timer(cx)")
+        .expect("locate final timer refresh");
+    let register_recheck = future_poll
+        .find("register_and_recheck")
+        .expect("locate readiness register/recheck");
+    assert!(
+        first_timer < observed_epoch
+            && observed_epoch < bounded_turn
+            && bounded_turn < refreshed_timer
+            && refreshed_timer < register_recheck,
+        "driver poll ordering must be timer, epoch/work, bounded turn, timer refresh, register/recheck"
+    );
     for required in [
         "SessionProgressResources",
         "poll_readiness_events",
@@ -2437,8 +2562,9 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         fs::read_to_string(&io_core_progress_path).expect("read I/O progress source");
     assert!(
         io_progress_source.contains("terminalize_operations_bounded")
-            && io_progress_source.contains("ProgressTerminal::Ready"),
-        "{} must report bounded I/O terminal readiness",
+            && io_progress_source.contains("fn can_finish(&self) -> bool")
+            && io_progress_source.contains("terminal_complete"),
+        "{} must own bounded I/O terminal eligibility",
         io_core_progress_path.display()
     );
     assert!(
@@ -2520,6 +2646,41 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     }
     let io_core_operation_source =
         fs::read_to_string(&io_core_operation_path).expect("read I/O operation source");
+    let operation_state = io_core_operation_source
+        .split("pub(in crate::v2::engine) struct OperationState {")
+        .nth(1)
+        .and_then(|tail| tail.split("\n}\n\nstruct OperationInner").next())
+        .expect("locate OperationState fields");
+    assert!(
+        operation_state.contains("inner: Mutex<OperationInner>")
+            && operation_state.contains("waker: AtomicWaker")
+            && operation_state.contains("cancelled: AtomicBool")
+            && operation_state.contains("quarantined: AtomicBool"),
+        "OperationState must retain one coupled inner mutex and only independent wake/cancel/quarantine state"
+    );
+    let operation_inner = io_core_operation_source
+        .split("struct OperationInner {")
+        .nth(1)
+        .and_then(|tail| tail.split("\n}\n\nenum CompletionOwnership").next())
+        .expect("locate OperationInner fields");
+    for coupled in [
+        "lifecycle:",
+        "mr:",
+        "completion:",
+        "output:",
+        "detached:",
+        "reclamation_pending:",
+        "event_destination:",
+    ] {
+        assert!(
+            operation_inner.contains(coupled),
+            "OperationInner lost coupled state `{coupled}`"
+        );
+    }
+    assert!(
+        !operation_inner.contains("Atomic"),
+        "coupled operation lifecycle/completion/output/resource state must not be split into atomics"
+    );
     assert!(
         !io_core_operation_source.contains("QpDestructionProof"),
         "production I/O core must not depend on the session destruction proof type"

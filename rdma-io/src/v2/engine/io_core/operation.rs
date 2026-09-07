@@ -1876,7 +1876,7 @@ impl IoCore {
         self.cq_credits.release();
         let previous = self.accepted_operations.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0, "accepted operation count must be positive");
-        self.publish_terminal_if_drained(previous);
+        self.publish_io_if_drained(previous);
         let finished = operation.finish_completion(completion);
         if finished.was_reclaiming {
             self.pending_reclamations.fetch_sub(1, Ordering::AcqRel);
@@ -1963,7 +1963,7 @@ impl IoCore {
         self.cq_credits.release();
         let previous = self.accepted_operations.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0, "accepted operation count must be positive");
-        self.publish_terminal_if_drained(previous);
+        self.publish_io_if_drained(previous);
         let finished = operation.finish_after_qp_destroy(close_error);
         if finished.was_reclaiming {
             self.pending_reclamations.fetch_sub(1, Ordering::AcqRel);
@@ -2090,6 +2090,36 @@ pub(in crate::v2::engine) fn install_accepted_operation_for_driver_test(
     operation.commit_accepted();
     io_core.accepted_operations.fetch_add(1, Ordering::AcqRel);
     token
+}
+
+#[cfg(test)]
+pub(in crate::v2::engine) fn operation_future_for_io_lifetime_test(
+    io_core: &Arc<IoCore>,
+    connection: &Arc<EstablishedIoConnection>,
+) -> RdmaOperation {
+    connection.reserve_local(Direction::Send).unwrap();
+    assert!(io_core.cq_credits.reserve());
+    let (_, operation) = io_core
+        .operations
+        .allocate(|token| {
+            Arc::new(OperationState::new(
+                token,
+                Arc::clone(connection),
+                Direction::Send,
+                WcOpcode::Send,
+                None,
+                1,
+            ))
+        })
+        .unwrap();
+    operation.commit_accepted();
+    io_core.accepted_operations.fetch_add(1, Ordering::AcqRel);
+    RdmaOperation {
+        state: FutureState::InFlight {
+            shared: Arc::clone(io_core),
+            operation,
+        },
+    }
 }
 
 #[cfg(test)]

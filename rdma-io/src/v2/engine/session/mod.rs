@@ -35,9 +35,21 @@ use super::io_core::{
     IoCore, IoCoreEffects, IoSessionBridge, OperationQuarantineEffect, QpReclaimCapability,
 };
 use super::registry::{ConnectionToken, Lookup, OperationToken, lock_unpoison};
-use super::scheduler::{DeadlineKind, DeadlineRequest};
 use super::{Result, SessionEngineRuntime};
 use crate::v2::error::Error;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DeadlineKind {
+    ConnectionDrain,
+    EngineShutdown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct DeadlineRequest {
+    at: tokio::time::Instant,
+    kind: DeadlineKind,
+    token: u64,
+}
 
 /// Non-forgeable authority for connection and QP lifecycle transitions.
 pub(super) struct SessionLifecycleAuthority {
@@ -832,11 +844,10 @@ mod tests {
     use std::time::Duration;
 
     use super::super::registry::{ConnectionToken, lock_unpoison};
-    use super::super::scheduler::DeadlineKind;
     use super::super::{CompletionMode, RdmaConnectionConfig, test_engine_pair};
     use super::connection::{WorkRequestPoster, install_connection};
     use super::listener::{ListenerState, RdmaListener};
-    use super::{SessionCloseState, SessionConnection};
+    use super::{DeadlineKind, SessionCloseState, SessionConnection};
     use crate::v2::error::{Error, Result};
     use crate::v2::qp::{BatchPostOutcome, QpCapabilities};
     use crate::wr::{PreparedRecvBatch, PreparedSendBatch};

@@ -6,13 +6,13 @@
 //! pending bits and epoch. Therefore a publish before registration is found by
 //! the recheck, while a publish after registration performs the wake.
 //!
-//! Each poll fairly visits ready-at-entry I/O, session, and terminal owners at
-//! most once. The owners hide CQ/CM readiness, completion routing, deadline
-//! kinds, teardown, and terminalization details behind bounded progress
-//! reports. Because readiness wakes do not identify their source, every poll
-//! probes both owners once; idle owners register and recheck readiness without
-//! creating a self-wake loop. Polling mode yields cooperatively after the
-//! bounded pass.
+//! Each poll fairly visits ready-at-entry I/O and session owners at most once,
+//! then composes terminal eligibility as a bounded epilogue. The owners hide
+//! CQ/CM readiness, completion routing, deadline kinds, teardown, and
+//! terminalization details behind bounded progress reports. Because readiness
+//! wakes do not identify their source, every poll probes both owners once;
+//! idle owners register and recheck readiness without creating a self-wake
+//! loop. Polling mode yields cooperatively after the bounded pass.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -20,10 +20,10 @@ use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 
 use super::config::CompletionMode;
-use super::io_core::IoProgress;
+use super::io_core::{IoProgress, IoSessionBridge};
 #[cfg(test)]
 use super::lifecycle::MemoizedTerminalResult;
-use super::progress::{OwnerClass, ProgressTerminal};
+use super::progress::OwnerClass;
 use super::resources::EngineResources;
 use super::scheduler::OwnerScheduler;
 use super::session::SessionProgress;
@@ -31,9 +31,8 @@ use super::{EngineShared, RdmaEngineDriver};
 use crate::v2::error::{Error, Result};
 use crate::v2::runtime::preflight_driver_runtime;
 
-pub(super) const TERMINAL_WORK: usize = 1 << 0;
-pub(super) const IO_WORK: usize = 1 << 1;
-pub(super) const SESSION_WORK: usize = 1 << 2;
+pub(super) const IO_WORK: usize = 1 << 0;
+pub(super) const SESSION_WORK: usize = 1 << 1;
 
 fn earliest_deadline(
     io: Option<tokio::time::Instant>,
@@ -101,8 +100,10 @@ impl RdmaEngineDriver {
             }
             None => (None, None),
         };
+        let bridge: Arc<dyn IoSessionBridge> = shared.session.clone();
         let io_progress = IoProgress::new(
             Arc::clone(&shared.io_core),
+            bridge,
             io_resources,
             shared.config.cq_completion_budget,
             shared.config.completion_dispatch_budget,
@@ -128,10 +129,6 @@ impl RdmaEngineDriver {
     }
 
     fn mark_published_work(&mut self, published: usize) {
-        if published & TERMINAL_WORK != 0 {
-            self.scheduler.mark_ready(OwnerClass::Terminal);
-        }
-
         if published & IO_WORK != 0 {
             self.scheduler.mark_ready(OwnerClass::Io);
         }
@@ -149,7 +146,6 @@ impl RdmaEngineDriver {
         self.shared.begin_driver_failure(error);
         self.scheduler.mark_ready(OwnerClass::Io);
         self.scheduler.mark_ready(OwnerClass::Session);
-        self.scheduler.mark_ready(OwnerClass::Terminal);
         cx.waker().wake_by_ref();
         Poll::Pending
     }
@@ -159,23 +155,12 @@ impl RdmaEngineDriver {
         self.session_progress.release_resources();
     }
 
-    fn service_terminal(&mut self) -> Result<bool> {
-        Ok(self
-            .shared
-            .progress_driver_terminal(&self.io_progress, &self.session_progress))
-    }
-
     fn service_io(&mut self, cx: &mut TaskContext<'_>) -> Result<bool> {
         let report = self
             .io_progress
             .turn(self.shared.config.completion_mode, cx)?;
         if report.requires_repoll() {
             self.scheduler.mark_ready(OwnerClass::Io);
-        }
-        match report.terminal {
-            ProgressTerminal::Running => {}
-            ProgressTerminal::Ready => self.scheduler.mark_ready(OwnerClass::Terminal),
-            ProgressTerminal::Failed(error) => return Err(error),
         }
         Ok(report.units_consumed > 0)
     }
@@ -186,11 +171,6 @@ impl RdmaEngineDriver {
             .turn(self.shared.config.completion_mode, cx)?;
         if report.requires_repoll() {
             self.scheduler.mark_ready(OwnerClass::Session);
-        }
-        match report.terminal {
-            ProgressTerminal::Running => {}
-            ProgressTerminal::Ready => self.scheduler.mark_ready(OwnerClass::Terminal),
-            ProgressTerminal::Failed(error) => return Err(error),
         }
         Ok(report.units_consumed > 0)
     }
@@ -214,6 +194,26 @@ impl RdmaEngineDriver {
         self.deadline_at = None;
         self.probe_owners();
         true
+    }
+
+    fn poll_once(&mut self, cx: &mut TaskContext<'_>) -> Result<()> {
+        let owner_budget = self.scheduler.begin_pass();
+        for _ in 0..owner_budget {
+            let Some(owner) = self.scheduler.next() else {
+                break;
+            };
+            match owner {
+                OwnerClass::Io => {
+                    self.service_io(cx)?;
+                }
+                OwnerClass::Session => {
+                    self.service_session(cx)?;
+                }
+            }
+        }
+        self.shared
+            .progress_driver_terminal(&self.io_progress, &self.session_progress);
+        Ok(())
     }
 }
 
@@ -247,49 +247,8 @@ impl Future for RdmaEngineDriver {
         let observed_epoch = self.shared.work_signal.epoch();
         let published = self.shared.work_signal.take();
         self.mark_published_work(published);
-        if self
-            .shared
-            .shutdown_requested
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            self.scheduler.mark_ready(OwnerClass::Terminal);
-        }
-        self.probe_owners();
-
-        let class_budget = self.scheduler.ready_count();
-        for _ in 0..class_budget {
-            let Some(class) = self.scheduler.next() else {
-                break;
-            };
-            let result = match class {
-                OwnerClass::Terminal => match self.service_terminal() {
-                    Ok(true) => break,
-                    Ok(false) => Ok(false),
-                    Err(error) => Err(error),
-                },
-                OwnerClass::Io => self.service_io(cx),
-                OwnerClass::Session => self.service_session(cx),
-            };
-            if let Err(error) = result {
-                return self.fail(error, cx);
-            }
-            // Either owner can remove the final shutdown blocker after the
-            // terminal class already ran in this poll.
-            if matches!(class, OwnerClass::Io | OwnerClass::Session)
-                && self
-                    .shared
-                    .shutdown_requested
-                    .load(std::sync::atomic::Ordering::Acquire)
-            {
-                match self.service_terminal() {
-                    Ok(true) => break,
-                    Ok(false) => {}
-                    Err(error) => return self.fail(error, cx),
-                }
-            }
-            if self.shared.outcome().is_some() {
-                break;
-            }
+        if let Err(error) = self.poll_once(cx) {
+            return self.fail(error, cx);
         }
 
         if let Some(outcome) = self.shared.outcome() {
@@ -366,7 +325,7 @@ pub(super) mod test_api {
     #[cfg(test)]
     use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
 
-    use super::{EngineShared, Error, IO_WORK, Result, TERMINAL_WORK};
+    use super::{EngineShared, Error, IO_WORK, Result};
     use crate::v2::engine::io_core::CqeReject;
     use crate::v2::engine::registry::{Lookup, OperationToken};
 
@@ -797,7 +756,7 @@ pub(super) mod test_api {
         pub fn inject_driver_failure(&self, error: Error) -> Result<()> {
             let shared = self.ensure_active()?;
             shared.test_driver.inject_failure(error)?;
-            shared.work_signal.publish(TERMINAL_WORK);
+            shared.work_signal.publish(IO_WORK);
             Ok(())
         }
 
@@ -2175,15 +2134,36 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_and_failure_publish_both_cleanup_owners() {
+        let (engine, driver) = test_engine_pair(CompletionMode::Polling);
+        engine.shared.work_signal.take();
+
+        engine.shared.request_shutdown();
+        assert_eq!(
+            engine.shared.work_signal.take(),
+            IO_WORK | SESSION_WORK,
+            "idle shutdown must explicitly schedule both cleanup owners"
+        );
+
+        engine
+            .shared
+            .begin_driver_failure(Error::InvalidConfig("publication test".into()));
+        assert_eq!(
+            engine.shared.work_signal.take(),
+            IO_WORK | SESSION_WORK,
+            "driver failure must explicitly reschedule both bounded cleanup owners"
+        );
+        drop(driver);
+    }
+
+    #[test]
     fn every_poll_probe_covers_both_owners_during_a_software_wake() {
         let (_engine, mut driver) = test_engine_pair(CompletionMode::Polling);
-        driver.scheduler.mark_ready(OwnerClass::Terminal);
 
         driver.probe_owners();
         driver.probe_owners();
 
-        assert_eq!(driver.scheduler.ready_count(), 3);
-        assert_eq!(driver.scheduler.next(), Some(OwnerClass::Terminal));
+        assert_eq!(driver.scheduler.ready_count(), 2);
         assert_eq!(driver.scheduler.next(), Some(OwnerClass::Io));
         assert_eq!(driver.scheduler.next(), Some(OwnerClass::Session));
         drop(driver);
@@ -2200,15 +2180,12 @@ mod tests {
         let initial_io = driver.io_progress.turn_count();
         let initial_session = driver.session_progress.turn_count();
 
-        engine.shared.work_signal.publish(TERMINAL_WORK | IO_WORK);
+        engine.shared.work_signal.publish(IO_WORK);
         assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
         assert_eq!(driver.io_progress.turn_count(), initial_io + 1);
         assert_eq!(driver.session_progress.turn_count(), initial_session + 1);
 
-        engine
-            .shared
-            .work_signal
-            .publish(TERMINAL_WORK | SESSION_WORK);
+        engine.shared.work_signal.publish(SESSION_WORK);
         assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
         assert_eq!(driver.io_progress.turn_count(), initial_io + 2);
         assert_eq!(driver.session_progress.turn_count(), initial_session + 2);
@@ -2263,17 +2240,24 @@ mod tests {
         }
         assert!(matches!(result, Poll::Ready(Err(Error::InvalidConfig(_)))));
         assert_eq!(engine.diagnostics().quarantined_operations, 100);
+        assert!(
+            connections.iter().all(|connection| connection
+                .state
+                .close_state()
+                .raw_outcome()
+                .is_some())
+        );
         drop(connections);
     }
 
     #[test]
     fn wake_before_register_is_seen_by_recheck() {
         let signal = WorkSignal::new();
-        signal.publish(TERMINAL_WORK);
+        signal.publish(SESSION_WORK);
         let observed = signal.epoch();
         let counter = CountingWaker::new();
         let pending = signal.register_and_recheck(&counter.waker(), observed - 1);
-        assert_eq!(pending, TERMINAL_WORK);
+        assert_eq!(pending, SESSION_WORK);
         assert_eq!(counter.count(), 1);
     }
 
@@ -2310,7 +2294,7 @@ mod tests {
         let signal = Arc::new(WorkSignal::new());
         std::thread::scope(|scope| {
             let mut producers = Vec::new();
-            for bit in [TERMINAL_WORK, IO_WORK, SESSION_WORK] {
+            for bit in [IO_WORK, SESSION_WORK] {
                 let signal = Arc::clone(&signal);
                 producers.push(scope.spawn(move || {
                     for _ in 0..32 {
@@ -2322,7 +2306,7 @@ mod tests {
                 producer.join().unwrap();
             }
         });
-        assert_eq!(signal.take(), TERMINAL_WORK | IO_WORK | SESSION_WORK);
+        assert_eq!(signal.take(), IO_WORK | SESSION_WORK);
     }
 
     struct DrainInterleavingPoster {
@@ -2407,7 +2391,7 @@ mod tests {
                     completion_for_driver_test(operation, poster.qp_num, opcode, status),
                 );
                 engine.shared.session.schedule_deadline(
-                    super::super::scheduler::DeadlineKind::ConnectionDrain,
+                    super::super::session::DeadlineKind::ConnectionDrain,
                     connection.state.token.encode(),
                     Duration::ZERO,
                 );
@@ -2509,6 +2493,63 @@ mod tests {
         assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn deadline_timer_rearms_for_newly_earlier_owner_deadline() {
+        let (_engine, mut driver) = test_engine_pair(CompletionMode::Readiness);
+        let now = tokio::time::Instant::now();
+        let later = now + Duration::from_secs(10);
+        let earlier = now + Duration::from_secs(5);
+        driver
+            .io_progress
+            .schedule_deadline_for_test(later, super::super::registry::OperationToken::decode(1));
+        let waker = Waker::noop();
+        let mut cx = TaskContext::from_waker(waker);
+
+        assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
+        assert_eq!(driver.deadline_at, Some(later));
+
+        driver
+            .io_progress
+            .schedule_deadline_for_test(earlier, super::super::registry::OperationToken::decode(2));
+        assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
+        assert_eq!(driver.deadline_at, Some(earlier));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_timer_clears_removed_owner_deadline() {
+        let (_engine, mut driver) = test_engine_pair(CompletionMode::Readiness);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        driver.io_progress.schedule_deadline_for_test(
+            deadline,
+            super::super::registry::OperationToken::decode(1),
+        );
+        let waker = Waker::noop();
+        let mut cx = TaskContext::from_waker(waker);
+
+        assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
+        assert_eq!(driver.deadline_at, Some(deadline));
+
+        driver.io_progress.clear_deadlines_for_test();
+        assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
+        assert_eq!(driver.deadline_at, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_timer_processes_already_expired_owner_deadline() {
+        let (_engine, mut driver) = test_engine_pair(CompletionMode::Readiness);
+        driver.io_progress.schedule_deadline_for_test(
+            tokio::time::Instant::now(),
+            super::super::registry::OperationToken::decode(1),
+        );
+        let waker = Waker::noop();
+        let mut cx = TaskContext::from_waker(waker);
+
+        assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
+
+        assert_eq!(driver.io_progress.next_deadline(), None);
+        assert_eq!(driver.deadline_at, None);
+    }
+
     #[tokio::test]
     async fn readiness_idle_poll_does_not_self_wake_or_scan() {
         let (_engine, mut driver) = test_engine_pair(CompletionMode::Readiness);
@@ -2572,6 +2613,93 @@ mod tests {
         ));
         engine.shared.transition_running();
         assert_eq!(engine.shared.lifecycle(), RdmaEngineLifecycle::Terminated);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn final_accepted_operation_drain_wakes_and_reconsiders_terminal() {
+        let (engine, mut driver) = test_engine_pair(CompletionMode::Readiness);
+        let poster = Arc::new(DrainInterleavingPoster {
+            qp_num: 73,
+            destroys: AtomicUsize::new(0),
+        });
+        let connection = install_connection(
+            &engine.shared.session,
+            Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
+            RdmaConnectionConfig::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let operation = install_accepted_operation_for_driver_test(
+            &engine.shared.io_core,
+            &connection.state,
+            crate::wc::WcOpcode::Send,
+        );
+        let counter = CountingWaker::new();
+        let waker = counter.waker();
+        let mut cx = TaskContext::from_waker(&waker);
+
+        assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
+        engine.shared.request_shutdown();
+        assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
+        assert_eq!(engine.diagnostics().accepted_operations, 1);
+
+        let wakes_before_drain = counter.count();
+        engine
+            .shared
+            .test_driver
+            .queue_released_connection_cqe(completion_for_driver_test(
+                operation,
+                poster.qp_num,
+                rdma_io_sys::ibverbs::IBV_WC_SEND,
+                rdma_io_sys::ibverbs::IBV_WC_SUCCESS,
+            ));
+
+        let mut result = Pin::new(&mut driver).poll(&mut cx);
+        assert!(
+            counter.count() > wakes_before_drain,
+            "the final accepted-operation drain must wake the registered driver"
+        );
+        assert_eq!(engine.diagnostics().accepted_operations, 0);
+        for _ in 0..8 {
+            if result.is_ready() {
+                break;
+            }
+            result = Pin::new(&mut driver).poll(&mut cx);
+        }
+
+        assert!(matches!(result, Poll::Ready(Ok(()))));
+        assert_eq!(engine.diagnostics().live_connections, 0);
+        assert_eq!(
+            poster.destroys.load(Ordering::Acquire),
+            1,
+            "session retirement must retain QP destruction authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn final_session_cleanup_is_composed_after_the_owner_pass() {
+        let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
+        let connections = engine
+            .shared
+            .test_driver
+            .install_idle_connections(&engine.shared, 1)
+            .unwrap();
+        engine.shared.request_shutdown();
+        let waker = Waker::noop();
+        let mut cx = TaskContext::from_waker(waker);
+
+        let mut result = Poll::Pending;
+        for _ in 0..16 {
+            result = Pin::new(&mut driver).poll(&mut cx);
+            if result.is_ready() {
+                break;
+            }
+        }
+
+        assert!(matches!(result, Poll::Ready(Ok(()))));
+        assert_eq!(engine.diagnostics().live_connections, 0);
+        drop(connections);
     }
 
     fn pending_destruction_listener(

@@ -5,8 +5,9 @@
 //! notification resources. Readiness owns one completion channel/fd; polling
 //! owns none. Every connection shares those objects.
 //!
-//! The driver is a thin scheduler over bounded I/O, session, and terminal
-//! turns. The I/O owner polls the shared CQ and validates a CQE only when the
+//! The driver is a thin scheduler over bounded I/O and session owner turns,
+//! followed by one terminal-eligibility epilogue. The I/O owner polls the
+//! shared CQ and validates a CQE only when the
 //! current connection generation, operation generation, operation owner, and
 //! provider-reported `qp_num` all agree. The session owner consumes CM events
 //! and controls connection lifecycle. Cancellation, close, shutdown, and
@@ -64,12 +65,12 @@ pub use driver::{
     TestSharedResourceIdentity,
 };
 pub use io_core::RdmaOperation;
-use io_core::{IoCore, IoDriverSignal, IoProgress, IoSessionBridge};
+use io_core::{IoCore, IoDriverSignal, IoProgress};
 use lifecycle::MemoizedTerminalResult;
 use registry::{lock_unpoison, write_unpoison};
 use resources::{EngineResourceRefs, EngineResources};
-use scheduler::DeadlineKind;
 use scheduler::OwnerScheduler;
+use session::DeadlineKind;
 pub use session::connection::{RdmaConnection, RdmaConnectionIdentity};
 pub use session::listener::{RdmaListener, RdmaListenerConfig};
 use session::{SessionManager, SessionProgress};
@@ -392,13 +393,15 @@ impl Drop for RdmaEngine {
 
 /// Sole progress future for an [`RdmaEngine`].
 ///
-/// The driver fairly rotates across three opaque bounded owners: I/O, session,
-/// and terminal composition. CQ polling, completion dispatch, and operation
-/// deadlines remain behind the I/O owner; CM progress, lifecycle deadlines,
-/// and teardown remain behind the session owner. Message protocol work belongs
-/// to [`crate::v2::MessageTransportDriver`]. Readiness mode sleeps only on
-/// registered event sources and published software work; polling mode performs
-/// one bounded nonblocking iteration followed by a cooperative yield.
+/// The driver fairly rotates across two opaque bounded owners: I/O and session.
+/// Every external poll probes both, services each ready-at-entry owner at most
+/// once, and then composes terminal eligibility. CQ polling, completion
+/// dispatch, and operation deadlines remain behind the I/O owner; CM progress,
+/// lifecycle deadlines, and teardown remain behind the session owner. Message
+/// protocol work belongs to [`crate::v2::MessageTransportDriver`]. Readiness
+/// mode sleeps only after registering and rechecking event sources and
+/// published software work; polling mode performs one bounded nonblocking
+/// iteration followed by a cooperative yield.
 /// Dropping the driver publishes a terminal failure and wakes observed waiters.
 /// Drop performs one bounded pass over registered connections, with at most
 /// one QP ERR transition and one zero-outstanding QP destroy attempt per
@@ -559,10 +562,6 @@ impl IoDriverSignal for EngineIoDriverSignal {
         self.work_signal.publish(driver::IO_WORK);
     }
 
-    fn publish_terminal(&self) {
-        self.work_signal.publish(driver::TERMINAL_WORK);
-    }
-
     #[cfg(any(test, feature = "test-hooks"))]
     fn pause_operation_before_register(&self) {
         self.test_driver
@@ -576,8 +575,6 @@ impl EngineShared {
         shared.session.bind_self();
         let session_runtime: Arc<dyn SessionEngineRuntime> = shared.clone();
         shared.session.bind_engine(&session_runtime);
-        let session_bridge: Arc<dyn IoSessionBridge> = shared.session.clone();
-        shared.io_core.bind_session_bridge(&session_bridge);
         shared
     }
 
@@ -652,7 +649,8 @@ impl EngineShared {
             );
         }
 
-        self.work_signal.publish(driver::TERMINAL_WORK);
+        self.work_signal
+            .publish(driver::IO_WORK | driver::SESSION_WORK);
     }
 
     fn mark_shutdown_requested(&self) -> bool {
@@ -746,7 +744,7 @@ impl EngineShared {
         }
         drop(pending);
         self.work_signal
-            .publish(driver::IO_WORK | driver::SESSION_WORK | driver::TERMINAL_WORK);
+            .publish(driver::IO_WORK | driver::SESSION_WORK);
     }
 
     fn pending_terminal_outcome(&self) -> Option<MemoizedTerminalResult> {

@@ -3,12 +3,13 @@
 //! With the `tokio` feature, [`RdmaEngineBuilder::build`] returns
 //! ([`RdmaEngine`], [`RdmaEngineDriver`]). The handle submits connection,
 //! listener, operation, and lifecycle work; the driver schedules the sole
-//! CQ/CM consumers. Internally it is a thin scheduler over bounded I/O,
-//! session, and terminal turns; CQ/completion policy belongs to the I/O core
-//! and CM/connection lifecycle policy belongs to the session subsystem. Message
-//! protocol work has a separate per-connection driver. This resembles the
-//! ownership split of an io_uring instance or IOCP completion port, although
-//! the implementation uses libibverbs and librdmacm directly.
+//! CQ/CM consumers. Internally it is a thin scheduler over bounded I/O and
+//! session turns followed by terminal eligibility composition; CQ/completion
+//! policy belongs to the I/O core and CM/connection lifecycle policy belongs
+//! to the session subsystem. Message protocol work has a separate
+//! per-connection driver. This resembles the ownership split of an io_uring
+//! instance or IOCP completion port, although the implementation uses
+//! libibverbs and librdmacm directly.
 //!
 //! # Use case
 //!

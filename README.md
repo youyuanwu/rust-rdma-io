@@ -168,7 +168,9 @@ One engine owns one anchored context facade, PD, CQ, and CM event channel.
 Readiness adds one CQ completion channel/fd; polling adds none. There is exactly
 one explicit engine driver and zero library-owned tasks or threads, regardless
 of connection count. The engine driver is a thin fair scheduler over bounded
-I/O, session, and terminal turns; the owning layers retain CQ/completion and
+I/O and session turns. Each external poll probes both owners, services each
+ready-at-entry owner at most once, and then composes terminal eligibility as a
+bounded epilogue; the owning layers retain CQ/completion and
 CM/connection-lifecycle policy. Session code reaches engine-wide shutdown,
 terminal, failure, and work publication only through a weak narrow runtime
 capability; it cannot recover the concrete engine root or another owner's

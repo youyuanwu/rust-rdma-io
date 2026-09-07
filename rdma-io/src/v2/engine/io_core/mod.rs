@@ -7,7 +7,7 @@ use std::collections::{HashSet, VecDeque};
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, Weak};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use std::time::Duration;
 
 use super::io::{IoEventSender, IoTerminalEvent, PendingIoEvent};
@@ -32,6 +32,7 @@ pub(super) use operation::{
 #[cfg(test)]
 pub(super) use operation::{
     completion_for_driver_test, install_accepted_operation_for_driver_test,
+    operation_future_for_io_lifetime_test,
 };
 pub(super) use progress::IoProgress;
 
@@ -50,7 +51,6 @@ pub(super) trait IoDriverSignal: Send + Sync {
     fn publish_cq_recheck(&self);
     fn publish_completion_dispatch(&self);
     fn publish_reclamation(&self);
-    fn publish_terminal(&self);
     #[cfg(any(test, feature = "test-hooks"))]
     fn pause_operation_before_register(&self);
 }
@@ -351,7 +351,6 @@ pub(super) struct IoCore {
     missing_cqe_deadline: Duration,
     completion_dispatch_budget: usize,
     reclamation_requests: Mutex<VecDeque<IoDeadlineRequest>>,
-    session_bridge: OnceLock<Weak<dyn IoSessionBridge>>,
     terminal_failure: Mutex<Option<super::lifecycle::MemoizedTerminalResult>>,
 }
 
@@ -396,21 +395,10 @@ impl IoCore {
             missing_cqe_deadline,
             completion_dispatch_budget,
             reclamation_requests: Mutex::new(VecDeque::new()),
-            session_bridge: OnceLock::new(),
             terminal_failure: Mutex::new(None),
         });
         let reclaim = QpReclaimCapability::new(&core);
         Ok((core, reclaim))
-    }
-
-    pub(super) fn bind_session_bridge(&self, bridge: &Arc<dyn IoSessionBridge>) {
-        self.session_bridge
-            .set(Arc::downgrade(bridge))
-            .unwrap_or_else(|_| panic!("IoCore is bound to exactly one IoSessionBridge"));
-    }
-
-    pub(super) fn session_bridge(&self) -> Option<Arc<dyn IoSessionBridge>> {
-        self.session_bridge.get().and_then(Weak::upgrade)
     }
 
     pub(super) fn admission(&self) -> RwLockReadGuard<'_, ()> {
@@ -438,9 +426,9 @@ impl IoCore {
         self.driver_signal.publish_reclamation();
     }
 
-    fn publish_terminal_if_drained(&self, previous: usize) {
+    fn publish_io_if_drained(&self, previous: usize) {
         if previous == 1 && self.shutdown_requested.load(Ordering::Acquire) {
-            self.driver_signal.publish_terminal();
+            self.driver_signal.publish_completion_dispatch();
         }
     }
 
@@ -529,9 +517,31 @@ impl IoCore {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
     use super::*;
 
     struct TestPostAuthority;
+
+    struct RecordingSignal {
+        io_publications: AtomicUsize,
+    }
+
+    impl IoDriverSignal for RecordingSignal {
+        fn publish_cq_recheck(&self) {
+            self.io_publications.fetch_add(1, Ordering::AcqRel);
+        }
+
+        fn publish_completion_dispatch(&self) {
+            self.io_publications.fetch_add(1, Ordering::AcqRel);
+        }
+
+        fn publish_reclamation(&self) {
+            self.io_publications.fetch_add(1, Ordering::AcqRel);
+        }
+
+        fn pause_operation_before_register(&self) {}
+    }
 
     impl IoPostAuthority for TestPostAuthority {
         fn qp_num(&self) -> u32 {
@@ -595,5 +605,26 @@ mod tests {
             connection.reserve_local(Direction::Recv),
             Err(Error::TransportClosed)
         ));
+    }
+
+    #[test]
+    fn final_accepted_drain_publishes_io_owner_reconsideration() {
+        let signal = Arc::new(RecordingSignal {
+            io_publications: AtomicUsize::new(0),
+        });
+        let (core, _) = IoCore::new(
+            1,
+            1,
+            Duration::ZERO,
+            1,
+            Arc::new(RwLock::new(())),
+            Arc::clone(&signal) as Arc<dyn IoDriverSignal>,
+        )
+        .unwrap();
+        core.close_admission(Some(Error::DriverShutdown));
+
+        core.publish_io_if_drained(1);
+
+        assert_eq!(signal.io_publications.load(Ordering::Acquire), 1);
     }
 }

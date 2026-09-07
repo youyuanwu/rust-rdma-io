@@ -183,9 +183,9 @@ The runtime has five distinct roles:
    coordination, and connection-level quarantine.
 3. **Engine composition root:** global lifecycle and terminal-outcome
    composition across I/O and session readiness.
-4. **Engine scheduler:** fair rotation over opaque I/O, session, and terminal
-   turns, global software-work register/recheck, earliest-deadline arming, and
-   cooperative polling-mode yielding.
+4. **Engine scheduler:** fair rotation over opaque I/O and session turns,
+   post-owner terminal composition, global software-work register/recheck,
+   earliest-deadline arming, and cooperative polling-mode yielding.
 5. **Protocol:** HELLO, DATA, CREDIT, pools, receive reposting, message
    fairness, and frontend outcomes.
 
@@ -199,30 +199,45 @@ connection-validation capacities, and the connection-drain deadline.
 I/O scheduling, completion policy, and engine shutdown policy remain solely in
 `EngineConfig` and are not retained by the session owner. Session modules
 cannot access the concrete root or use it as an I/O-owner shortcut.
-`IoProgress` owns CQ readiness, the CQ buffer, completion-ready
-rotation, operation deadlines, and bounded I/O terminalization.
+`IoProgress` owns CQ readiness, the CQ buffer, completion-ready rotation,
+operation deadlines, bounded I/O terminalization, and the narrow strong
+`IoSessionBridge` used only while progress is composed. `IoCore` contains no
+session bridge or post-construction binding, so operation futures may outlive
+the driver without retaining session progress.
 `SessionProgress` owns CM readiness, fair CM source selection,
 connection/lifecycle deadlines, bounded shutdown scans, final CM draining, and
 bounded session terminalization. The one `RdmaEngineDriver` sees none of those
-state machines; it only polls and requeues the three owner classes. No
-component creates a task or thread.
+state machines; it only polls and requeues the two owner classes. No component
+creates a task or thread.
 
-Each owner turn returns a private progress report containing six pieces of
-scheduler information: units consumed, whether immediate work remains, the
-owner's earliest deadline, readiness registration/recheck status, terminal or
-failure status, and confirmation that detached effects have been published
-after protected guards were released. Reports contain no operation,
-connection, listener, route, registry, queue, teardown, or deadline-kind
-identity.
+Each owner turn returns a private progress report containing only bounded
+units consumed, whether immediate work remains, and readiness
+registration/recheck status. The driver queries owner deadlines and terminal
+eligibility directly; failures remain typed `Result` values. Post-guard
+publication is a behavioral invariant covered by reentrant tests rather than
+a constant report field. Reports contain no operation, connection, listener,
+route, registry, queue, teardown, or deadline-kind identity.
 
 Every driver poll probe-enqueues the I/O and session owners once because an
 `AsyncFd` wake does not identify its source. Software pending bits additionally
-identify the owning class. A ready-at-entry pass visits each deduplicated owner
-at most once; remaining work is appended for a later poll. In readiness mode
-an idle owner registers and rechecks its fd without requesting another poll.
-In polling mode the driver yields cooperatively. The one driver timer is armed
-to the minimum deadline reported by the two owners; equal deadlines are
-serviced by fair owner rotation rather than cross-layer insertion order.
+identify the owning class. A private bounded driver turn snapshots the two
+ready-at-entry owners, visits each at most once, appends remaining work for a
+later poll, and then evaluates terminal eligibility exactly once. Shutdown,
+failure, accepted-operation drain, and session cleanup publish owner work and
+wake the driver; terminal composition has no scheduler class or work bit. A
+final result is withheld until both bounded owners report cleanup complete. In
+readiness mode an idle owner registers and rechecks its fd without requesting
+another poll. In polling mode the driver yields cooperatively. The one driver
+timer is armed to the minimum deadline reported by the two owners; equal
+deadlines are serviced by fair owner rotation rather than cross-layer
+insertion order.
+
+Both owners use one payload-generic stable deadline queue. Equal timestamps
+retain insertion order through a checked non-wrapping sequence, and only one
+due payload is popped per accounted unit. Owner-neutral alternating-source
+state preserves inbox/due fairness, odd-budget rotation, and unused-capacity
+transfer. Operation tokens and reclamation remain I/O-owned; connection drain
+and engine-shutdown deadline meanings remain session-owned.
 
 The source hierarchy mirrors that ownership. `engine/session/mod.rs` defines
 the manager and its lifecycle capabilities, while `session/cm.rs`,

@@ -4,16 +4,11 @@
 //! another bounded turn. Layer-private identities and lifecycle state stay
 //! behind the I/O and session progress owners.
 
-use tokio::time::Instant;
-
-use super::Error;
-
 /// Opaque owner identity used for fair scheduler rotation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum OwnerClass {
     Io,
     Session,
-    Terminal,
 }
 
 impl OwnerClass {
@@ -21,7 +16,6 @@ impl OwnerClass {
         match self {
             Self::Io => 0,
             Self::Session => 1,
-            Self::Terminal => 2,
         }
     }
 }
@@ -30,18 +24,7 @@ impl OwnerClass {
 pub(super) struct ProgressReport {
     pub(super) units_consumed: usize,
     pub(super) immediate_work: bool,
-    #[allow(
-        dead_code,
-        reason = "owner report records the deadline even though the driver currently reads owner queues directly"
-    )]
-    pub(super) next_deadline: Option<Instant>,
     pub(super) readiness: ReadinessRegistration,
-    pub(super) terminal: ProgressTerminal,
-    #[allow(
-        dead_code,
-        reason = "owner report carries post-guard publication proof for tests and future consumers"
-    )]
-    pub(super) effects: EffectsPublication,
 }
 
 /// Whether an owner completed its external-readiness protocol before suspend.
@@ -52,43 +35,22 @@ pub(super) enum ReadinessRegistration {
     Incomplete,
 }
 
-/// Owner-local terminal information visible to the composition root.
-pub(super) enum ProgressTerminal {
-    Running,
-    Ready,
-    #[allow(
-        dead_code,
-        reason = "the shared owner contract supports typed failure while current turns return Result"
-    )]
-    Failed(Error),
-}
-
-/// Proof that user-visible effects from a turn were published after unlock.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum EffectsPublication {
-    Complete,
-}
-
 impl ProgressReport {
     pub(super) fn running(
         units_consumed: usize,
         immediate_work: bool,
-        next_deadline: Option<Instant>,
         readiness: ReadinessRegistration,
     ) -> Self {
         Self {
             units_consumed,
             immediate_work,
-            next_deadline,
             readiness,
-            terminal: ProgressTerminal::Running,
-            effects: EffectsPublication::Complete,
         }
     }
 
     #[cfg(test)]
-    pub(super) fn idle(next_deadline: Option<Instant>, readiness: ReadinessRegistration) -> Self {
-        Self::running(0, false, next_deadline, readiness)
+    pub(super) fn idle(readiness: ReadinessRegistration) -> Self {
+        Self::running(0, false, readiness)
     }
 
     pub(super) fn requires_repoll(&self) -> bool {
@@ -102,21 +64,19 @@ mod tests {
 
     #[test]
     fn idle_registered_report_does_not_request_repoll() {
-        let report = ProgressReport::idle(
-            Some(Instant::now()),
-            ReadinessRegistration::RegisteredAndRechecked,
-        );
+        let report = ProgressReport::idle(ReadinessRegistration::RegisteredAndRechecked);
 
         assert_eq!(report.units_consumed, 0);
         assert!(!report.requires_repoll());
-        assert!(report.next_deadline.is_some());
-        assert!(matches!(report.terminal, ProgressTerminal::Running));
-        assert_eq!(report.effects, EffectsPublication::Complete);
+        assert_eq!(
+            report.readiness,
+            ReadinessRegistration::RegisteredAndRechecked
+        );
     }
 
     #[test]
     fn incomplete_readiness_requests_repoll() {
-        let report = ProgressReport::idle(None, ReadinessRegistration::Incomplete);
+        let report = ProgressReport::idle(ReadinessRegistration::Incomplete);
 
         assert!(report.requires_repoll());
     }
