@@ -292,9 +292,20 @@ and engine-shutdown deadline meanings remain session-owned.
 The source hierarchy mirrors that ownership. `engine/driver/mod.rs` contains
 the independently readable production scheduler, while
 `engine/driver/test_api.rs` contains the feature-gated test support and
-`engine/driver/tests.rs` contains its unit tests. The I/O operation owner is
-similarly split between production in `engine/io_core/operation/mod.rs` and
-unit tests in its direct child `engine/io_core/operation/tests.rs`.
+`engine/driver/tests.rs` contains its unit tests. The I/O operation owner uses
+`engine/io_core/operation/mod.rs` as a narrow facade over responsibility-focused
+children: `accounting.rs` owns the operation registry and CQ credits;
+`state.rs` owns coupled per-operation lifecycle and resources; `effects.rs`
+owns consuming effect states and post-lock publication; `validation.rs` owns
+shared scalar/batch validation; `batch.rs` owns protocol SEND/RECV posting and
+provider-acceptance reconciliation; `future.rs` owns scalar first-poll posting
+and cancellation; `completion.rs` owns exact CQE validation, dispatch, and
+release; and `reclamation.rs` owns terminalization, quarantine, and positive-
+proof cleanup. `test_support.rs` and `tests.rs` are direct `cfg(test)` children.
+The hierarchy reflects current responsibilities rather than imposing a file-
+count rule. `batch` and `future` reach their shared submission vocabulary
+through `validation` instead of through each other, and neither depends on the
+other.
 `engine/session/mod.rs` defines the manager and its lifecycle capabilities.
 The CM and connection owners place production in
 `session/cm/mod.rs` and `session/connection/mod.rs`, with their unit tests in

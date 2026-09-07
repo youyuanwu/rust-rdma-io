@@ -502,7 +502,6 @@ fn exact_routing_rejects_invalid_classes_and_delivers_fatal_statuses() {
     let retired = shared
         .io_core
         .operations
-        .slots
         .force_generation_for_test(retired, u32::MAX);
     shared.io_core.operations.release(retired, false).unwrap();
     assert!(matches!(
@@ -1185,7 +1184,12 @@ fn dispatch_between_releasability_observation_and_release_retains_the_whole_suff
         Error::PostFailed(std::io::Error::from_raw_os_error(libc::ENOMEM)),
     ) {
         InternalRelease::Retained(entries) => entries,
-        InternalRelease::Released(_) => {
+        InternalRelease::Released(after_unlock) => {
+            // Bind and drop the payload rather than ignoring it: this arm is the
+            // only reader of the mirrored `Released` variant, so an `_` pattern
+            // would make the field look dead, and dropping before the panic
+            // keeps the assertion message intact.
+            drop(after_unlock);
             panic!("a recorded suffix CQE must prevent every suffix release")
         }
     };
@@ -1435,18 +1439,13 @@ fn scalar_early_publication_helper_releases_post_guards_without_a_provider() {
         connection: Arc::clone(&connection.state),
         observed: AtomicBool::new(false),
     });
-    operation.waker.register(&Waker::from(Arc::clone(&wake)));
+    operation.register_waker(&Waker::from(Arc::clone(&wake)));
 
     let admission = shared.io_core.admission();
     let posting = connection.state.io.begin_posting().unwrap();
-    publish_after_post_guards(
-        posting,
-        admission,
-        AfterEngineUnlock {
-            events: Vec::new(),
-            operations_to_wake: vec![operation],
-        },
-    );
+    let mut after_unlock = AfterEngineUnlock::default();
+    after_unlock.push_operation_wake(operation);
+    publish_after_post_guards(posting, admission, after_unlock);
 
     assert!(wake.observed.load(Ordering::Acquire));
 }
@@ -1938,9 +1937,7 @@ async fn terminal_wakers_can_reenter_after_terminal_guards_drop() {
         super::super::io::IoConnection::new(&shared.session, Arc::clone(&connection.state))
             .unwrap();
     events.register(&waker(Arc::clone(&connection_event)));
-    operation
-        .waker
-        .register(&waker(Arc::clone(&operation_wake)));
+    operation.register_waker(&waker(Arc::clone(&operation_wake)));
     let close_notify = connection.state.close_state().notify();
     let mut close_notified = Box::pin(close_notify.notified());
     assert!(

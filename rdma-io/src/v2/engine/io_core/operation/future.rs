@@ -1,0 +1,372 @@
+//! Scalar operation future, first-poll submission, and cancellation.
+//!
+//! `RdmaOperation` is the only caller-held handle for a single SEND, RECV,
+//! READ, or WRITE. Its first poll is the sole provider-post boundary for the
+//! scalar path: `start_operation` validates, takes the admission and posting
+//! guards, reserves the local direction, registry slot, and CQ credit, posts
+//! once, and reconciles the outcome before the future can observe anything.
+//! No later poll, and no `Drop`, ever calls the provider.
+//!
+//! `FutureState` stays private so the pre-post, in-flight, and resolved stages
+//! cannot be assembled or skipped from outside. That is why the sibling-test
+//! fixture uses the `cfg(test)` [`RdmaOperation::from_in_flight`] constructor
+//! instead of a struct literal.
+//!
+//! The module observes the same ownership rules as its `batch` sibling:
+//!
+//! - It never sees `OperationInner` or a state guard. Reservation, acceptance,
+//!   proven non-acceptance, detachment, and cancellation are `OperationState`
+//!   methods that return owned records.
+//! - It never reads or builds effect payload fields. Post-lock work is carried
+//!   in `AfterEngineUnlock` and published only by
+//!   [`publish_after_post_guards`], after both guards are dropped.
+//! - It releases provider-visible ownership only on positive proof. A rollback
+//!   before registration returns the MR directly; a proven-unaccepted post
+//!   returns it through `take_unaccepted`; anything ambiguous is committed as
+//!   accepted and left to reclamation.
+//!
+//! `Drop` follows the same split: a future dropped before its first poll owns
+//! an unregistered MR and simply frees it, while a dropped in-flight future
+//! only cancels and schedules reclamation, retaining the MR, registration, and
+//! CQ debt until an exact CQE or QP-destruction proof arrives.
+//!
+//! Submission validation lives in the sibling `validation` module, which is
+//! shared with `batch`; neither submission path depends on the other.
+
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, RwLockReadGuard};
+use std::task::{Context, Poll};
+
+use crate::v2::engine::registry::OperationToken;
+use crate::v2::error::{Error, Result};
+use crate::v2::mr::{Mr, RemoteMr};
+use crate::v2::op::Completion;
+use crate::v2::qp::BatchPostOutcome;
+use crate::wr::{PreparedRecvBatch, PreparedSendBatch, RecvWr, SendFlags, SendWr};
+
+use super::super::{EstablishedIoConnection, IoCore, OperationKind};
+use super::effects::AfterEngineUnlock;
+use super::state::OperationState;
+use super::validation::ValidatedOperation;
+
+/// Future for one engine-owned SEND, RECV, READ, or WRITE.
+///
+/// The future owns its MR and returns
+/// `(rdma_io::v2::Result<Completion>, Option<Mr>)`. Dropping it after posting
+/// transfers observation to the engine; the MR, operation registration, and CQ
+/// debt remain owned until the provider proves the WR unaccepted or the engine
+/// consumes its exact validated success/error/flush CQE, or until synchronous
+/// destruction of the owning per-connection QP proves that the HCA can no
+/// longer access the MR. Timeout, QP ERR, driver loss, and CQ emptiness alone
+/// are not release boundaries.
+///
+/// The first poll performs the synchronous `ibv_post_send` or `ibv_post_recv`
+/// call. Provider posting has no wall-clock latency guarantee even though
+/// completion is asynchronous.
+pub struct RdmaOperation {
+    state: FutureState,
+}
+
+enum FutureState {
+    PrePost {
+        shared: Arc<IoCore>,
+        connection: Arc<EstablishedIoConnection>,
+        kind: OperationKind,
+        mr: Option<Mr>,
+        remote: Option<RemoteMr>,
+        range: Option<(usize, usize)>,
+    },
+    InFlight {
+        shared: Arc<IoCore>,
+        operation: Arc<OperationState>,
+    },
+    Immediate(Option<(Result<Completion>, Option<Mr>)>),
+    Done,
+}
+
+impl Unpin for RdmaOperation {}
+
+impl RdmaOperation {
+    pub(in crate::v2::engine) fn new(
+        shared: Arc<IoCore>,
+        connection: Arc<EstablishedIoConnection>,
+        kind: OperationKind,
+        mr: Mr,
+        remote: Option<RemoteMr>,
+        range: Option<(usize, usize)>,
+    ) -> Self {
+        Self {
+            state: FutureState::PrePost {
+                shared,
+                connection,
+                kind,
+                mr: Some(mr),
+                remote,
+                range,
+            },
+        }
+    }
+
+    /// Builds an already-accepted in-flight future for sibling operation tests.
+    ///
+    /// Test fixtures need a future whose `Drop` exercises the in-flight
+    /// cancellation path without a provider. Exposing this constructor keeps
+    /// `state` and `FutureState` private instead of widening them for tests.
+    #[cfg(test)]
+    pub(super) fn from_in_flight(shared: Arc<IoCore>, operation: Arc<OperationState>) -> Self {
+        Self {
+            state: FutureState::InFlight { shared, operation },
+        }
+    }
+}
+
+impl Future for RdmaOperation {
+    type Output = (Result<Completion>, Option<Mr>);
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        loop {
+            match &mut self.state {
+                FutureState::PrePost { .. } => {
+                    let pending = std::mem::replace(&mut self.state, FutureState::Done);
+                    let FutureState::PrePost {
+                        shared,
+                        connection,
+                        kind,
+                        mut mr,
+                        remote,
+                        range,
+                    } = pending
+                    else {
+                        return Poll::Ready((Err(Error::DriverShutdown), None));
+                    };
+                    let Some(mr) = mr.take() else {
+                        return Poll::Ready((Err(Error::DriverShutdown), None));
+                    };
+                    self.state =
+                        match start_operation(&shared, &connection, kind, mr, remote, range) {
+                            StartResult::InFlight(operation) => {
+                                FutureState::InFlight { shared, operation }
+                            }
+                            StartResult::Immediate(output) => FutureState::Immediate(Some(output)),
+                        };
+                }
+                FutureState::InFlight { operation, .. } => {
+                    operation.register_waker(cx.waker());
+                    if let Some(output) = operation.take_output() {
+                        self.state = FutureState::Done;
+                        return Poll::Ready(output);
+                    }
+                    return Poll::Pending;
+                }
+                FutureState::Immediate(output) => {
+                    let output = output
+                        .take()
+                        .unwrap_or_else(|| (Err(Error::DriverShutdown), None));
+                    self.state = FutureState::Done;
+                    return Poll::Ready(output);
+                }
+                FutureState::Done => return Poll::Ready((Err(Error::DriverShutdown), None)),
+            }
+        }
+    }
+}
+
+impl Drop for RdmaOperation {
+    fn drop(&mut self) {
+        let state = std::mem::replace(&mut self.state, FutureState::Done);
+        if let FutureState::InFlight { shared, operation } = state
+            && operation.cancel(&shared)
+        {
+            shared.schedule_reclamation(operation.token());
+        }
+    }
+}
+
+/// Outcome of the single scalar posting attempt.
+///
+/// `InFlight` means the operation is registered and owned by the engine until
+/// an exact CQE or reclamation proof resolves it. `Immediate` means the caller
+/// keeps the result and whatever MR ownership survived the rollback.
+enum StartResult {
+    InFlight(Arc<OperationState>),
+    Immediate((Result<Completion>, Option<Mr>)),
+}
+
+/// Validates, reserves, posts once, and reconciles what the provider accepted.
+///
+/// Every early return before registration is a zero-call rollback that hands
+/// the MR straight back. After registration, each rollback releases the
+/// registry slot, CQ credit, and local direction it actually took, in the
+/// reverse order they were acquired. The accepted, exact-zero-prefix,
+/// proven-unaccepted, and ambiguous arms then assign one — and only one —
+/// owner to those reservations.
+fn start_operation(
+    shared: &IoCore,
+    connection: &Arc<EstablishedIoConnection>,
+    kind: OperationKind,
+    mr: Mr,
+    remote: Option<RemoteMr>,
+    range: Option<(usize, usize)>,
+) -> StartResult {
+    let validated = match ValidatedOperation::new(kind, &mr, remote, range) {
+        Ok(validated) => validated,
+        Err(error) => return StartResult::Immediate((Err(error), Some(mr))),
+    };
+    let admission = shared.admission();
+    if let Some(error) = shared.admission_error() {
+        return StartResult::Immediate((Err(error), Some(mr)));
+    }
+    #[cfg(any(test, feature = "test-hooks"))]
+    shared.pause_operation_before_register();
+    let posting = match connection.begin_posting() {
+        Ok(posting) => posting,
+        Err(error) => return StartResult::Immediate((Err(error), Some(mr))),
+    };
+    let direction = kind.direction();
+    if let Err(error) = connection.reserve_local(direction) {
+        return StartResult::Immediate((Err(error), Some(mr)));
+    }
+
+    let expected_opcode = validated.expected_opcode();
+    let mr_len = mr.len();
+    let mut mr = Some(mr);
+    let (token, state) = match shared.operations.allocate(|token| {
+        Arc::new(OperationState::new(
+            token,
+            Arc::clone(connection),
+            direction,
+            expected_opcode,
+            mr.take(),
+            mr_len,
+        ))
+    }) {
+        Ok(token) => token,
+        Err(error) => {
+            connection.release_local(direction);
+            return StartResult::Immediate((Err(error), mr));
+        }
+    };
+
+    if !shared.cq_credits.reserve() {
+        let state = shared.operations.release(token, false).unwrap_or(state);
+        connection.release_local(direction);
+        return StartResult::Immediate((Err(Error::CapacityExhausted), state.take_mr()));
+    }
+    let outcome = match post_validated_operation(validated, connection, token) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let state = shared.operations.release(token, false).unwrap_or(state);
+            shared.cq_credits.release();
+            connection.release_local(direction);
+            return StartResult::Immediate((Err(error), state.take_mr()));
+        }
+    };
+    match outcome {
+        BatchPostOutcome::AllAccepted => {
+            shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
+            let early = state.commit_accepted();
+            shared.publish_cq_recheck();
+            if let Some(completion) = early {
+                let after_unlock = shared.finish_early_completion(Arc::clone(&state), completion);
+                publish_after_post_guards(posting, admission, after_unlock);
+            }
+            StartResult::InFlight(state)
+        }
+        BatchPostOutcome::PrefixAccepted {
+            accepted,
+            first_unaccepted,
+            source,
+        } if accepted == 0 && first_unaccepted == 0 => {
+            let error = Error::PostFailed(source);
+            if let Some(release) = state.take_unaccepted(error.clone()) {
+                let registered = shared
+                    .operations
+                    .release(token, false)
+                    .expect("proven-unaccepted operation remains registered");
+                debug_assert!(Arc::ptr_eq(&registered, &state));
+                shared.cq_credits.release();
+                connection.release_local(direction);
+                debug_assert!(release.event.is_none());
+                drop(release.event);
+                StartResult::Immediate((Err(error), release.mr))
+            } else {
+                shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
+                let early = state.commit_accepted();
+                shared.publish_cq_recheck();
+                if let Some(completion) = early {
+                    let after_unlock =
+                        shared.finish_early_completion(Arc::clone(&state), completion);
+                    publish_after_post_guards(posting, admission, after_unlock);
+                }
+                StartResult::InFlight(state)
+            }
+        }
+        BatchPostOutcome::PrefixAccepted { source, .. }
+        | BatchPostOutcome::Ambiguous { source } => {
+            shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
+            let early = state.commit_accepted();
+            shared.publish_cq_recheck();
+            if let Some(completion) = early {
+                let after_unlock = shared.finish_early_completion(Arc::clone(&state), completion);
+                publish_after_post_guards(posting, admission, after_unlock);
+                StartResult::InFlight(state)
+            } else {
+                state.detach_with_post_error(shared);
+                shared.schedule_reclamation(token);
+                StartResult::Immediate((Err(Error::PostFailed(source)), None))
+            }
+        }
+    }
+}
+
+/// Encodes the validated operation as a one-entry RECV or SEND batch and posts.
+///
+/// The work request carries the operation token as its `wr_id`, which is what
+/// later CQE routing matches against, and consumes `validated` by value so no
+/// checked input can be reused after encoding.
+fn post_validated_operation(
+    validated: ValidatedOperation,
+    connection: &EstablishedIoConnection,
+    token: OperationToken,
+) -> Result<BatchPostOutcome> {
+    match validated.kind() {
+        OperationKind::Recv => {
+            let mut batch =
+                PreparedRecvBatch::new(vec![RecvWr::new(token.encode()).sg(validated.sge())])
+                    .map_err(Error::from_v1)?;
+            connection.post_recv(&mut batch)
+        }
+        OperationKind::Send | OperationKind::Write | OperationKind::Read => {
+            let opcode = validated.kind().send_wr_opcode().ok_or_else(|| {
+                Error::InvalidConfig("RECV cannot be encoded as a SEND work request".into())
+            })?;
+            let mut wr = SendWr::new(token.encode(), opcode)
+                .sg(validated.sge())
+                .flags(SendFlags::SIGNALED);
+            if let Some(remote) = validated.remote() {
+                wr = wr.rdma(remote.addr, remote.rkey);
+            }
+            let mut batch = PreparedSendBatch::new(vec![wr]).map_err(Error::from_v1)?;
+            connection.post_send(&mut batch)
+        }
+    }
+}
+
+/// Drops both posting guards by value, then publishes the accumulated effects.
+///
+/// Taking the guards by value makes the ordering unforgeable: a caller cannot
+/// publish an early-completion event or waker while still holding the posting
+/// or admission lock. The `pub(super)` scope exists only so the parent module's
+/// `cfg(test)` ordering test can call this boundary directly; no production
+/// code outside this module uses it.
+pub(super) fn publish_after_post_guards(
+    posting: RwLockReadGuard<'_, ()>,
+    admission: RwLockReadGuard<'_, ()>,
+    after_unlock: AfterEngineUnlock,
+) {
+    drop(posting);
+    drop(admission);
+    after_unlock.publish();
+}
