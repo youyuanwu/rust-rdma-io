@@ -543,6 +543,62 @@ fn clone_io_error(error: &std::io::Error) -> std::io::Error {
 /// the same fields with operation-subtree visibility and delegate straight to
 /// the production functions, so tests exercise the real reconciliation without
 /// widening production visibility.
+/// Take-once ownership ledger paired with stable raw batch storage.
+pub(super) struct PreparedBatchOwnership<T> {
+    entries: Vec<T>,
+}
+
+pub(super) enum BatchOwnershipTransfer<T> {
+    Accepted(Vec<T>),
+    Partial {
+        accepted: Vec<T>,
+        unaccepted: Vec<T>,
+        source: std::io::Error,
+    },
+    Ambiguous {
+        retained: Vec<T>,
+        source: std::io::Error,
+    },
+}
+
+impl<T> PreparedBatchOwnership<T> {
+    pub(super) fn new(entries: Vec<T>) -> Result<Self> {
+        if entries.is_empty() {
+            return Err(Error::InvalidConfig(
+                "batch ownership ledger must not be empty".into(),
+            ));
+        }
+        Ok(Self { entries })
+    }
+
+    pub(super) fn consume(mut self, outcome: BatchPostOutcome) -> BatchOwnershipTransfer<T> {
+        match outcome {
+            BatchPostOutcome::AllAccepted => BatchOwnershipTransfer::Accepted(self.entries),
+            BatchPostOutcome::PrefixAccepted {
+                accepted,
+                first_unaccepted,
+                source,
+            } if accepted == first_unaccepted && accepted <= self.entries.len() => {
+                let unaccepted = self.entries.split_off(accepted);
+                BatchOwnershipTransfer::Partial {
+                    accepted: self.entries,
+                    unaccepted,
+                    source,
+                }
+            }
+            BatchPostOutcome::PrefixAccepted { source, .. }
+            | BatchPostOutcome::Ambiguous { source } => BatchOwnershipTransfer::Ambiguous {
+                retained: self.entries,
+                source,
+            },
+        }
+    }
+
+    fn into_entries(self) -> Vec<T> {
+        self.entries
+    }
+}
+
 #[cfg(test)]
 pub(super) mod test_support {
     use super::*;
@@ -607,61 +663,5 @@ pub(super) mod test_support {
                 })
                 .collect(),
         )
-    }
-}
-
-/// Take-once ownership ledger paired with stable raw batch storage.
-pub(super) struct PreparedBatchOwnership<T> {
-    entries: Vec<T>,
-}
-
-pub(super) enum BatchOwnershipTransfer<T> {
-    Accepted(Vec<T>),
-    Partial {
-        accepted: Vec<T>,
-        unaccepted: Vec<T>,
-        source: std::io::Error,
-    },
-    Ambiguous {
-        retained: Vec<T>,
-        source: std::io::Error,
-    },
-}
-
-impl<T> PreparedBatchOwnership<T> {
-    pub(super) fn new(entries: Vec<T>) -> Result<Self> {
-        if entries.is_empty() {
-            return Err(Error::InvalidConfig(
-                "batch ownership ledger must not be empty".into(),
-            ));
-        }
-        Ok(Self { entries })
-    }
-
-    pub(super) fn consume(mut self, outcome: BatchPostOutcome) -> BatchOwnershipTransfer<T> {
-        match outcome {
-            BatchPostOutcome::AllAccepted => BatchOwnershipTransfer::Accepted(self.entries),
-            BatchPostOutcome::PrefixAccepted {
-                accepted,
-                first_unaccepted,
-                source,
-            } if accepted == first_unaccepted && accepted <= self.entries.len() => {
-                let unaccepted = self.entries.split_off(accepted);
-                BatchOwnershipTransfer::Partial {
-                    accepted: self.entries,
-                    unaccepted,
-                    source,
-                }
-            }
-            BatchPostOutcome::PrefixAccepted { source, .. }
-            | BatchPostOutcome::Ambiguous { source } => BatchOwnershipTransfer::Ambiguous {
-                retained: self.entries,
-                source,
-            },
-        }
-    }
-
-    fn into_entries(self) -> Vec<T> {
-        self.entries
     }
 }
