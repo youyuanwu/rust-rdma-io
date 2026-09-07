@@ -638,6 +638,100 @@ fn has_guarded_internal_effect_extraction(source: &str) -> Result<bool, syn::Err
 fn analyze_io_effects_publication(
     source: &str,
 ) -> Result<IoEffectsPublicationAnalysis, syn::Error> {
+    fn inspect_constant_expressions(
+        items: &[Item],
+        module_path: &mut Vec<String>,
+        effects_names: &HashSet<String>,
+        analysis: &mut IoEffectsPublicationAnalysis,
+    ) {
+        fn inspect_expression(
+            expression: &Expr,
+            function: String,
+            effects_names: &HashSet<String>,
+            analysis: &mut IoEffectsPublicationAnalysis,
+        ) {
+            let mut visitor = UncheckedEffectPublicationVisitor {
+                effects_names: effects_names.clone(),
+                aliases: HashSet::new(),
+                function,
+                violations: Vec::new(),
+            };
+            visitor.visit_expr(expression);
+            analysis.violations.extend(visitor.violations);
+        }
+
+        for item in items {
+            if is_test_only(item_attrs(item)) {
+                continue;
+            }
+            match item {
+                Item::Const(constant) => inspect_expression(
+                    &constant.expr,
+                    qualified_name(module_path, &format!("const {}", constant.ident)),
+                    effects_names,
+                    analysis,
+                ),
+                Item::Static(constant) => inspect_expression(
+                    &constant.expr,
+                    qualified_name(module_path, &format!("static {}", constant.ident)),
+                    effects_names,
+                    analysis,
+                ),
+                Item::Impl(implementation) => {
+                    let owner = type_path_last(&implementation.self_ty)
+                        .unwrap_or_else(|| "<impl>".to_owned());
+                    let mut names = effects_names.clone();
+                    if names.contains(&owner) {
+                        names.insert("Self".to_owned());
+                    }
+                    for implementation_item in &implementation.items {
+                        if let ImplItem::Const(constant) = implementation_item
+                            && !is_test_only(&constant.attrs)
+                        {
+                            inspect_expression(
+                                &constant.expr,
+                                qualified_name(
+                                    module_path,
+                                    &format!("{owner}::const {}", constant.ident),
+                                ),
+                                &names,
+                                analysis,
+                            );
+                        }
+                    }
+                }
+                Item::Trait(trait_item) => {
+                    let mut names = effects_names.clone();
+                    names.insert("Self".to_owned());
+                    for trait_member in &trait_item.items {
+                        if let TraitItem::Const(constant) = trait_member
+                            && !is_test_only(&constant.attrs)
+                            && let Some((_, expression)) = &constant.default
+                        {
+                            inspect_expression(
+                                expression,
+                                qualified_name(
+                                    module_path,
+                                    &format!("{}::const {}", trait_item.ident, constant.ident),
+                                ),
+                                &names,
+                                analysis,
+                            );
+                        }
+                    }
+                }
+                Item::Mod(module) => {
+                    if let Some((_, items)) = &module.content {
+                        module_path.push(module.ident.to_string());
+                        inspect_constant_expressions(items, module_path, effects_names, analysis);
+                        module_path.pop();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     // This guard intentionally reasons about ordinary parsed Rust syntax.
     // Unlike the hidden-spawn detector, it does not inspect macro token
     // streams and therefore does not claim to detect publication introduced
@@ -829,6 +923,12 @@ fn analyze_io_effects_publication(
     let effects_names = identifiers_and_aliases(&syntax, &["IoCoreEffects"]);
     let mut analysis = IoEffectsPublicationAnalysis::default();
     inspect_items(
+        &syntax.items,
+        &mut Vec::new(),
+        &effects_names,
+        &mut analysis,
+    );
+    inspect_constant_expressions(
         &syntax.items,
         &mut Vec::new(),
         &effects_names,
@@ -1332,51 +1432,97 @@ fn find_production_zero_argument_method_calls(
                     visitor.visit_block(&function.block);
                     calls.extend(visitor.calls);
                 }
+                Item::Const(constant) => {
+                    let name = qualified_name(module_path, &format!("const {}", constant.ident));
+                    let mut visitor = ZeroArgumentMethodCallVisitor {
+                        method,
+                        calls: Vec::new(),
+                        function: &name,
+                    };
+                    visitor.visit_expr(&constant.expr);
+                    calls.extend(visitor.calls);
+                }
+                Item::Static(constant) => {
+                    let name = qualified_name(module_path, &format!("static {}", constant.ident));
+                    let mut visitor = ZeroArgumentMethodCallVisitor {
+                        method,
+                        calls: Vec::new(),
+                        function: &name,
+                    };
+                    visitor.visit_expr(&constant.expr);
+                    calls.extend(visitor.calls);
+                }
                 Item::Impl(implementation) => {
                     let owner = type_path_last(&implementation.self_ty)
                         .unwrap_or_else(|| "<impl>".to_owned());
                     for implementation_item in &implementation.items {
-                        let ImplItem::Fn(function) = implementation_item else {
-                            continue;
-                        };
-                        if is_test_only(&function.attrs) {
-                            continue;
+                        match implementation_item {
+                            ImplItem::Fn(function) if !is_test_only(&function.attrs) => {
+                                let name = qualified_name(
+                                    module_path,
+                                    &format!("{owner}::{}", function.sig.ident),
+                                );
+                                let mut visitor = ZeroArgumentMethodCallVisitor {
+                                    method,
+                                    calls: Vec::new(),
+                                    function: &name,
+                                };
+                                visitor.visit_block(&function.block);
+                                calls.extend(visitor.calls);
+                            }
+                            ImplItem::Const(constant) if !is_test_only(&constant.attrs) => {
+                                let name = qualified_name(
+                                    module_path,
+                                    &format!("{owner}::const {}", constant.ident),
+                                );
+                                let mut visitor = ZeroArgumentMethodCallVisitor {
+                                    method,
+                                    calls: Vec::new(),
+                                    function: &name,
+                                };
+                                visitor.visit_expr(&constant.expr);
+                                calls.extend(visitor.calls);
+                            }
+                            _ => {}
                         }
-                        let name = qualified_name(
-                            module_path,
-                            &format!("{owner}::{}", function.sig.ident),
-                        );
-                        let mut visitor = ZeroArgumentMethodCallVisitor {
-                            method,
-                            calls: Vec::new(),
-                            function: &name,
-                        };
-                        visitor.visit_block(&function.block);
-                        calls.extend(visitor.calls);
                     }
                 }
                 Item::Trait(trait_item) => {
                     for trait_member in &trait_item.items {
                         let TraitItem::Fn(function) = trait_member else {
+                            if let TraitItem::Const(constant) = trait_member
+                                && !is_test_only(&constant.attrs)
+                                && let Some((_, expression)) = &constant.default
+                            {
+                                let name = qualified_name(
+                                    module_path,
+                                    &format!("{}::const {}", trait_item.ident, constant.ident),
+                                );
+                                let mut visitor = ZeroArgumentMethodCallVisitor {
+                                    method,
+                                    calls: Vec::new(),
+                                    function: &name,
+                                };
+                                visitor.visit_expr(expression);
+                                calls.extend(visitor.calls);
+                            }
                             continue;
                         };
-                        if is_test_only(&function.attrs) {
-                            continue;
+                        if !is_test_only(&function.attrs)
+                            && let Some(block) = &function.default
+                        {
+                            let name = qualified_name(
+                                module_path,
+                                &format!("{}::{}", trait_item.ident, function.sig.ident),
+                            );
+                            let mut visitor = ZeroArgumentMethodCallVisitor {
+                                method,
+                                calls: Vec::new(),
+                                function: &name,
+                            };
+                            visitor.visit_block(block);
+                            calls.extend(visitor.calls);
                         }
-                        let Some(block) = &function.default else {
-                            continue;
-                        };
-                        let name = qualified_name(
-                            module_path,
-                            &format!("{}::{}", trait_item.ident, function.sig.ident),
-                        );
-                        let mut visitor = ZeroArgumentMethodCallVisitor {
-                            method,
-                            calls: Vec::new(),
-                            function: &name,
-                        };
-                        visitor.visit_block(block);
-                        calls.extend(visitor.calls);
                     }
                 }
                 Item::Mod(module) => {
@@ -2938,6 +3084,38 @@ fn io_effect_publication_detector_rejects_unchecked_routes() {
             .iter()
             .any(|violation| violation.contains("destructure")),
         "Self destructuring inside IoCoreEffects must not bypass payload confinement"
+    );
+    let constant_bypass = r#"
+        struct IoCoreEffects {
+            after_unlock: AfterEngineUnlock,
+            quarantine: Vec<Effect>,
+            drained: Vec<Token>,
+        }
+        const BYPASS: fn(IoCoreEffects) = |effects| {
+            let IoCoreEffects { after_unlock, .. } = effects;
+            after_unlock.publish();
+        };
+        static STATIC_BYPASS: fn(IoCoreEffects) = |effects| {
+            let IoCoreEffects { after_unlock, .. } = effects;
+            after_unlock.publish();
+        };
+    "#;
+    let constant_analysis = analyze_io_effects_publication(constant_bypass).unwrap();
+    assert!(
+        constant_analysis
+            .violations
+            .iter()
+            .filter(|violation| violation.contains("destructure"))
+            .count()
+            == 2,
+        "const and static initializers must be inspected for effect destructuring"
+    );
+    assert_eq!(
+        find_production_zero_argument_method_calls(constant_bypass, "publish")
+            .unwrap()
+            .len(),
+        2,
+        "const and static initializers must be included in publication inventory"
     );
     assert_eq!(
         find_production_zero_argument_method_calls(
