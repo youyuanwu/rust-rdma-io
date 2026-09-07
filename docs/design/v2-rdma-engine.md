@@ -292,17 +292,22 @@ and engine-shutdown deadline meanings remain session-owned.
 The source hierarchy mirrors that ownership. `engine/driver/mod.rs` contains
 the independently readable production scheduler, while
 `engine/driver/test_api.rs` contains the feature-gated test support and
-`engine/driver/tests.rs` contains its unit tests. Both extracted files remain
-direct children of the private driver module, preserving the existing
-test-hook path and narrow visibility. `engine/session/mod.rs` defines the
-manager and its lifecycle capabilities, while `session/cm.rs`,
-`session/listener.rs`, `session/connection.rs`, `session/drain.rs`, and
-`session/registry.rs` contain session-owned state and policy. The remaining
+`engine/driver/tests.rs` contains its unit tests. The I/O operation owner is
+similarly split between production in `engine/io_core/operation/mod.rs` and
+unit tests in its direct child `engine/io_core/operation/tests.rs`.
+`engine/session/mod.rs` defines the manager and its lifecycle capabilities.
+The CM and connection owners place production in
+`session/cm/mod.rs` and `session/connection/mod.rs`, with their unit tests in
+the respective direct-child `tests.rs` files; `session/listener.rs`,
+`session/drain.rs`, `session/progress.rs`, and `session/registry.rs` retain
+the remaining session-owned state and policy. These extracted test files remain direct
+children of their private owner modules, preserving private-invariant access,
+existing test-hook paths, and narrow visibility. The remaining
 `engine/registry.rs` is not a connection owner: it provides opaque connection
 and operation identities, exact live-I/O proofs, generic non-wrapping
 generational registry storage, and lock helpers shared with `IoCore`. Public
 connection and listener types continue to be re-exported by the engine facade,
-so this physical relocation does not change public paths.
+so these physical relocations do not change public paths.
 
 An established I/O capability carries immutable connection/QP identity, local
 posting limits, operation ledgers, and a posting-only authority. That authority
