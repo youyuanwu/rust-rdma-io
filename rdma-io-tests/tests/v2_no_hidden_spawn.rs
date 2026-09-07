@@ -754,8 +754,10 @@ fn analyze_io_effects_publication(
                                 ));
                             }
                         }
+                        let mut effect_names = effects_names.clone();
+                        effect_names.insert("Self".to_owned());
                         let mut visitor = UncheckedEffectPublicationVisitor {
-                            effects_names: effects_names.clone(),
+                            effects_names: effect_names,
                             aliases: HashSet::new(),
                             function: function_name,
                             violations: Vec::new(),
@@ -1395,6 +1397,73 @@ fn find_production_zero_argument_method_calls(
     Ok(calls)
 }
 
+fn type_mentions_any(ty: &Type, names: &HashSet<String>) -> bool {
+    struct TypeNameVisitor<'a> {
+        names: &'a HashSet<String>,
+        found: bool,
+    }
+
+    impl Visit<'_> for TypeNameVisitor<'_> {
+        fn visit_type_path(&mut self, path: &syn::TypePath) {
+            if path
+                .path
+                .segments
+                .iter()
+                .any(|segment| self.names.contains(&segment.ident.to_string()))
+            {
+                self.found = true;
+            }
+            visit::visit_type_path(self, path);
+        }
+    }
+
+    let mut visitor = TypeNameVisitor {
+        names,
+        found: false,
+    };
+    visitor.visit_type(ty);
+    visitor.found
+}
+
+fn effect_owner_path(
+    path: &ExprPath,
+    effect_types: &HashSet<String>,
+    self_types: &[String],
+) -> bool {
+    if let Some(qself) = &path.qself {
+        if type_mentions_any(&qself.ty, effect_types) {
+            return true;
+        }
+        if type_path_last(&qself.ty).as_deref() == Some("Self") {
+            return self_types
+                .last()
+                .is_none_or(|owner| effect_types.contains(owner));
+        }
+    }
+    let mut segments = path.path.segments.iter().rev();
+    segments.next();
+    let Some(owner) = segments.next() else {
+        return false;
+    };
+    if owner.ident == "Self" {
+        return self_types
+            .last()
+            .is_none_or(|concrete| effect_types.contains(concrete));
+    }
+    if effect_types.contains(&owner.ident.to_string()) {
+        return true;
+    }
+    let syn::PathArguments::AngleBracketed(arguments) = &owner.arguments else {
+        return false;
+    };
+    arguments.args.iter().any(|argument| {
+        matches!(
+            argument,
+            syn::GenericArgument::Type(ty) if type_mentions_any(ty, effect_types)
+        )
+    })
+}
+
 struct EffectUfcsPublishVisitor {
     effect_types: HashSet<String>,
     calls: Vec<usize>,
@@ -1410,26 +1479,7 @@ impl Visit<'_> for EffectUfcsPublishVisitor {
                 .last()
                 .is_some_and(|segment| segment.ident == "publish")
         {
-            let receiver_type = path
-                .qself
-                .as_ref()
-                .and_then(|qself| type_path_last(&qself.ty))
-                .or_else(|| {
-                    let mut segments = path.path.segments.iter().rev();
-                    segments.next();
-                    segments.next().map(|segment| segment.ident.to_string())
-                });
-            let receiver_type = receiver_type.and_then(|name| {
-                if name == "Self" {
-                    self.self_types.last().cloned()
-                } else {
-                    Some(name)
-                }
-            });
-            if receiver_type
-                .as_ref()
-                .is_some_and(|name| self.effect_types.contains(name))
-            {
+            if effect_owner_path(path, &self.effect_types, &self.self_types) {
                 self.calls.push(call.span().start().line);
             }
         }
@@ -1497,6 +1547,7 @@ fn find_effect_ufcs_publications(source: &str) -> Result<Vec<usize>, syn::Error>
 
 struct RestrictedEffectFunctionVisitor {
     effect_types: HashSet<String>,
+    session_types: HashSet<String>,
     references: Vec<usize>,
     self_types: Vec<String>,
 }
@@ -1519,26 +1570,12 @@ impl Visit<'_> for RestrictedEffectFunctionVisitor {
                     | "apply_terminal_io_effects"
             )
         ) {
-            let owner = expression
-                .qself
-                .as_ref()
-                .and_then(|qself| type_path_last(&qself.ty))
-                .or_else(|| {
-                    let mut segments = expression.path.segments.iter().rev();
-                    segments.next();
-                    segments.next().map(|segment| segment.ident.to_string())
-                })
-                .and_then(|name| {
-                    if name == "Self" {
-                        self.self_types.last().cloned()
-                    } else {
-                        Some(name)
-                    }
-                });
-            let restricted_owner = owner
-                .as_ref()
-                .is_some_and(|name| self.effect_types.contains(name));
-            if restricted_owner {
+            let owner_types = if method.as_deref() == Some("apply_terminal_io_effects") {
+                &self.session_types
+            } else {
+                &self.effect_types
+            };
+            if effect_owner_path(expression, owner_types, &self.self_types) {
                 self.references.push(expression.span().start().line);
             }
         }
@@ -1597,7 +1634,6 @@ fn base_effect_boundary_types() -> HashSet<String> {
         "AfterEngineUnlock",
         "DetachedIoCoreEffects",
         "CommittedIoCoreEffects",
-        "SessionManager",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -1607,12 +1643,16 @@ fn base_effect_boundary_types() -> HashSet<String> {
 fn find_restricted_effect_function_references_with_types(
     source: &str,
     known_types: &HashSet<String>,
+    known_session_types: &HashSet<String>,
 ) -> Result<Vec<usize>, syn::Error> {
     let syntax = syn::parse_file(source)?;
     let mut effect_types = known_types.clone();
     expand_type_aliases(source, &mut effect_types)?;
+    let mut session_types = known_session_types.clone();
+    expand_type_aliases(source, &mut session_types)?;
     let mut visitor = RestrictedEffectFunctionVisitor {
         effect_types,
+        session_types,
         references: Vec::new(),
         self_types: Vec::new(),
     };
@@ -1621,7 +1661,54 @@ fn find_restricted_effect_function_references_with_types(
 }
 
 fn find_restricted_effect_function_references(source: &str) -> Result<Vec<usize>, syn::Error> {
-    find_restricted_effect_function_references_with_types(source, &base_effect_boundary_types())
+    find_restricted_effect_function_references_with_types(
+        source,
+        &base_effect_boundary_types(),
+        &HashSet::from(["SessionManager".to_owned()]),
+    )
+}
+
+fn find_effect_trait_impls(
+    source: &str,
+    known_types: &HashSet<String>,
+) -> Result<Vec<String>, syn::Error> {
+    fn inspect(
+        items: &[Item],
+        module_path: &mut Vec<String>,
+        known_types: &HashSet<String>,
+        found: &mut Vec<String>,
+    ) {
+        for item in items {
+            if is_test_only(item_attrs(item)) {
+                continue;
+            }
+            match item {
+                Item::Impl(implementation)
+                    if implementation.trait_.is_some()
+                        && type_mentions_any(&implementation.self_ty, known_types) =>
+                {
+                    found.push(qualified_name(
+                        module_path,
+                        &type_path_last(&implementation.self_ty)
+                            .unwrap_or_else(|| "<effect>".to_owned()),
+                    ));
+                }
+                Item::Mod(module) => {
+                    if let Some((_, items)) = &module.content {
+                        module_path.push(module.ident.to_string());
+                        inspect(items, module_path, known_types, found);
+                        module_path.pop();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let syntax = syn::parse_file(source)?;
+    let mut found = Vec::new();
+    inspect(&syntax.items, &mut Vec::new(), known_types, &mut found);
+    Ok(found)
 }
 
 fn find_strong_owner_fields(
@@ -2669,11 +2756,64 @@ fn io_effect_publication_detector_rejects_unchecked_routes() {
         find_restricted_effect_function_references_with_types(
             "fn bypass(effect: CrossFileEffects) { let publish = CrossFileEffects::publish; publish(effect); }",
             &cross_file_types,
+            &HashSet::from(["SessionManager".to_owned()]),
         )
         .unwrap()
         .len(),
         1,
         "cross-file effect aliases must not hide function-item publication"
+    );
+    let generic_alias = r#"
+        type Identity<T> = T;
+        fn bypass(effect: CommittedIoCoreEffects) {
+            let publish = Identity::<CommittedIoCoreEffects>::publish;
+            publish(effect);
+        }
+    "#;
+    assert_eq!(
+        find_restricted_effect_function_references(generic_alias)
+            .unwrap()
+            .len(),
+        1,
+        "generic identity aliases must not hide effect function items"
+    );
+    assert_eq!(
+        find_effect_ufcs_publications("trait Escape { fn bypass(self) { Self::publish(self); } }",)
+            .unwrap()
+            .len(),
+        1,
+        "Self-qualified publication in a default trait method must be rejected"
+    );
+    assert_eq!(
+        find_effect_trait_impls(
+            "trait Escape {} impl Escape for CommittedIoCoreEffects {}",
+            &base_effect_boundary_types(),
+        )
+        .unwrap()
+        .len(),
+        1,
+        "effect boundary types must not acquire alternate trait routes"
+    );
+    let self_destructure = r#"
+        struct IoCoreEffects {
+            after_unlock: AfterEngineUnlock,
+            quarantine: Vec<Effect>,
+            drained: Vec<Token>,
+        }
+        impl IoCoreEffects {
+            fn bypass(self) {
+                let Self { after_unlock, .. } = self;
+                after_unlock.publish();
+            }
+        }
+    "#;
+    assert!(
+        analyze_io_effects_publication(self_destructure)
+            .unwrap()
+            .violations
+            .iter()
+            .any(|violation| violation.contains("destructure")),
+        "Self destructuring inside IoCoreEffects must not bypass payload confinement"
     );
     assert_eq!(
         find_production_zero_argument_method_calls(
@@ -4125,6 +4265,7 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     let effect_source_paths =
         collect_rs_files(&engine_dir).expect("enumerate I/O effect publication paths");
     let mut global_effect_boundary_types = base_effect_boundary_types();
+    let mut global_session_manager_types = HashSet::from(["SessionManager".to_owned()]);
     loop {
         let mut changed = false;
         for path in &effect_source_paths {
@@ -4133,6 +4274,13 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
                 .unwrap_or_else(|error| {
                     panic!(
                         "parse {} cross-file effect aliases: {error}",
+                        path.display()
+                    )
+                });
+            changed |= expand_type_aliases(&source, &mut global_session_manager_types)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "parse {} cross-file session aliases: {error}",
                         path.display()
                     )
                 });
@@ -4151,6 +4299,7 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     let mut zero_argument_publish_calls = BTreeMap::<(PathBuf, String), usize>::new();
     let mut effect_ufcs_publish_calls = Vec::new();
     let mut restricted_effect_function_references = Vec::new();
+    let mut effect_trait_impls = Vec::new();
     for path in effect_source_paths {
         let source = fs::read_to_string(&path).expect("read engine source");
         if source_is_test_only(&source)
@@ -4226,6 +4375,7 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
             find_restricted_effect_function_references_with_types(
                 &source,
                 &global_effect_boundary_types,
+                &global_session_manager_types,
             )
             .unwrap_or_else(|error| {
                 panic!(
@@ -4235,6 +4385,17 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
             })
             .into_iter()
             .map(|line| (path.clone(), line)),
+        );
+        effect_trait_impls.extend(
+            find_effect_trait_impls(&source, &global_effect_boundary_types)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "parse {} effect trait implementations: {error}",
+                        path.display()
+                    )
+                })
+                .into_iter()
+                .map(|implementation| (path.clone(), implementation)),
         );
     }
     assert_eq!(
@@ -4323,14 +4484,19 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         restricted_effect_function_references.is_empty(),
         "effect methods must not escape through UFCS calls or function-item aliases: {restricted_effect_function_references:#?}"
     );
-    assert_eq!(
-        find_production_lifecycle_calls(&io_core_operation_source, &["publish_after_post_guards"],)
-            .expect("find scalar post-guard publication calls")
-            .into_iter()
-            .filter(|call| call.split(':').nth(1) == Some("start_operation"))
-            .count(),
-        3,
-        "all scalar early-completion branches must publish through the guard-consuming helper"
+    assert!(
+        effect_trait_impls.is_empty(),
+        "effect boundary types must not gain alternate trait-based conversion or publication routes: {effect_trait_impls:#?}"
+    );
+    let post_guard_publish_calls =
+        find_production_lifecycle_calls(&io_core_operation_source, &["publish_after_post_guards"])
+            .expect("find scalar post-guard publication calls");
+    assert!(
+        post_guard_publish_calls.len() == 3
+            && post_guard_publish_calls
+                .iter()
+                .all(|call| call.split(':').nth(1) == Some("start_operation")),
+        "all and only scalar early-completion branches may use the guard-consuming publication helper: {post_guard_publish_calls:#?}"
     );
     assert_eq!(
         after_unlock_accesses,
