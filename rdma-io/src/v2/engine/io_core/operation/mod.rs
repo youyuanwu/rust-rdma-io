@@ -16,6 +16,7 @@ use super::super::lifecycle::MemoizedTerminalResult;
 use super::super::registry::{
     ConnectionToken, Lookup, OperationToken, PagedRegistry, lock_unpoison,
 };
+use super::super::session::IoEffectsCommitAuthority;
 use super::{Direction, EstablishedIoConnection, IoCore, OperationKind};
 use crate::v2::error::{Error, Result};
 use crate::v2::mr::{Mr, RemoteMr};
@@ -1693,7 +1694,10 @@ impl IoCoreEffects {
         self.after_unlock
     }
 
-    pub(in crate::v2::engine) fn into_committed(self) -> CommittedIoCoreEffects {
+    pub(in crate::v2::engine) fn into_committed(
+        self,
+        _authority: &IoEffectsCommitAuthority,
+    ) -> CommittedIoCoreEffects {
         CommittedIoCoreEffects {
             after_unlock: self.into_after_unlock(),
         }

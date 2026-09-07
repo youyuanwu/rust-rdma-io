@@ -7,6 +7,8 @@ use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::v2::error::{Error, Result};
 
+use super::session::LiveIoProofAuthority;
+
 const PAGE_SIZE: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -28,6 +30,7 @@ pub(super) struct LiveIoConnectionProof {
 
 impl LiveIoConnectionProof {
     pub(in crate::v2::engine) const fn issue_live_io_proof(
+        _authority: &LiveIoProofAuthority,
         connection: ConnectionToken,
         qp_num: u32,
     ) -> Self {
