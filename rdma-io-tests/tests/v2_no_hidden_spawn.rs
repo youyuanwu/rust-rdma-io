@@ -4424,6 +4424,9 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     let mut effect_ufcs_publish_calls = Vec::new();
     let mut restricted_effect_function_references = Vec::new();
     let mut effect_trait_impls = Vec::new();
+    let mut post_guard_publish_calls = Vec::new();
+    let mut post_guard_function_references = Vec::new();
+    let mut post_guard_use_aliases = Vec::new();
     for path in effect_source_paths {
         let source = fs::read_to_string(&path).expect("read engine source");
         if source_is_test_only(&source)
@@ -4521,6 +4524,36 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
                 .into_iter()
                 .map(|implementation| (path.clone(), implementation)),
         );
+        post_guard_publish_calls.extend(
+            find_production_lifecycle_calls(&source, &["publish_after_post_guards"])
+                .unwrap_or_else(|error| {
+                    panic!("parse {} scalar publication calls: {error}", path.display())
+                })
+                .into_iter()
+                .map(|call| (path.clone(), call)),
+        );
+        post_guard_function_references.extend(
+            find_restricted_free_function_references(&source, "publish_after_post_guards")
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "parse {} scalar publication references: {error}",
+                        path.display()
+                    )
+                })
+                .into_iter()
+                .map(|line| (path.clone(), line)),
+        );
+        post_guard_use_aliases.extend(
+            find_restricted_free_function_use_aliases(&source, "publish_after_post_guards")
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "parse {} scalar publication aliases: {error}",
+                        path.display()
+                    )
+                })
+                .into_iter()
+                .map(|alias| (path.clone(), alias)),
+        );
     }
     assert_eq!(
         io_effects_definition_paths.as_slice(),
@@ -4612,32 +4645,20 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         effect_trait_impls.is_empty(),
         "effect boundary types must not gain alternate trait-based conversion or publication routes: {effect_trait_impls:#?}"
     );
-    let post_guard_publish_calls =
-        find_production_lifecycle_calls(&io_core_operation_source, &["publish_after_post_guards"])
-            .expect("find scalar post-guard publication calls");
     assert!(
-        find_restricted_free_function_references(
-            &io_core_operation_source,
-            "publish_after_post_guards",
-        )
-        .expect("find scalar publication helper references")
-        .is_empty(),
-        "the scalar post-guard publication helper must not escape as a function item"
+        post_guard_function_references.is_empty(),
+        "the scalar post-guard publication helper must not escape as a function item: {post_guard_function_references:#?}"
     );
     assert!(
-        find_restricted_free_function_use_aliases(
-            &io_core_operation_source,
-            "publish_after_post_guards",
-        )
-        .expect("find scalar publication helper use aliases")
-        .is_empty(),
-        "the scalar post-guard publication helper must not escape through a use alias"
+        post_guard_use_aliases.is_empty(),
+        "the scalar post-guard publication helper must not escape through a use alias: {post_guard_use_aliases:#?}"
     );
     assert!(
         post_guard_publish_calls.len() == 3
             && post_guard_publish_calls
                 .iter()
-                .all(|call| call.split(':').nth(1) == Some("start_operation")),
+                .all(|(path, call)| path == &io_core_operation_path
+                    && call.split(':').nth(1) == Some("start_operation")),
         "all and only scalar early-completion branches may use the guard-consuming publication helper: {post_guard_publish_calls:#?}"
     );
     assert_eq!(
