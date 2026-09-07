@@ -1184,7 +1184,8 @@ fn dispatch_between_releasability_observation_and_release_retains_the_whole_suff
         Error::PostFailed(std::io::Error::from_raw_os_error(libc::ENOMEM)),
     ) {
         InternalRelease::Retained(entries) => entries,
-        InternalRelease::Released(_) => {
+        InternalRelease::Released(after_unlock) => {
+            drop(after_unlock);
             panic!("a recorded suffix CQE must prevent every suffix release")
         }
     };
