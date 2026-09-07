@@ -270,6 +270,20 @@ impl Visit<'_> for SelfFieldAccessVisitor<'_> {
     }
 }
 
+struct NamedFieldAccessVisitor<'a> {
+    field: &'a str,
+    lines: Vec<usize>,
+}
+
+impl Visit<'_> for NamedFieldAccessVisitor<'_> {
+    fn visit_expr_field(&mut self, access: &ExprField) {
+        if matches!(&access.member, syn::Member::Named(member) if member == self.field) {
+            self.lines.push(access.span().start().line);
+        }
+        visit::visit_expr_field(self, access);
+    }
+}
+
 fn expression_is_rooted_at_self(expression: &Expr) -> bool {
     match expression {
         Expr::Path(path) => path.path.is_ident("self"),
@@ -344,7 +358,10 @@ fn find_inherent_methods_accessing_fields(
 
 #[derive(Default)]
 struct IoEffectsPublicationAnalysis {
+    definitions: usize,
+    implementation_blocks: usize,
     publish_methods: Vec<(usize, bool, bool, bool)>,
+    after_unlock_accesses: Vec<String>,
     violations: Vec<String>,
 }
 
@@ -506,15 +523,41 @@ impl Visit<'_> for UncheckedEffectPublicationVisitor<'_> {
     }
 }
 
-fn assert_statement_guards_field(statement: &syn::Stmt, field: &str) -> bool {
+fn expression_is_named_field(expression: &Expr, base: &str, field: &str) -> bool {
+    matches!(
+        expression,
+        Expr::Field(access)
+            if matches!(&access.member, syn::Member::Named(member) if member == field)
+                && matches!(
+                    access.base.as_ref(),
+                    Expr::Path(path) if path.path.is_ident(base)
+                )
+    )
+}
+
+fn assert_statement_guards_named_field(statement: &syn::Stmt, base: &str, field: &str) -> bool {
     let syn::Stmt::Macro(statement) = statement else {
         return false;
     };
     if !statement.mac.path.is_ident("assert") {
         return false;
     }
-    let tokens = statement.mac.tokens.to_string();
-    tokens.contains(&format!("self . {field} . is_empty ()"))
+    let Ok(arguments) = statement
+        .mac
+        .parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated)
+    else {
+        return false;
+    };
+    let Some(Expr::MethodCall(call)) = arguments.first() else {
+        return false;
+    };
+    call.method == "is_empty"
+        && call.args.is_empty()
+        && expression_is_named_field(&call.receiver, base, field)
+}
+
+fn assert_statement_guards_field(statement: &syn::Stmt, field: &str) -> bool {
+    assert_statement_guards_named_field(statement, "self", field)
 }
 
 fn statement_publishes_self_after_unlock(statement: &syn::Stmt) -> bool {
@@ -530,6 +573,49 @@ fn statement_publishes_self_after_unlock(statement: &syn::Stmt) -> bool {
         )
 }
 
+fn has_guarded_internal_effect_extraction(source: &str) -> Result<bool, syn::Error> {
+    let syntax = syn::parse_file(source)?;
+    let Some(function) = syntax.items.iter().find_map(|item| match item {
+        Item::Fn(function) if function.sig.ident == "commit_internal_entries" => Some(function),
+        _ => None,
+    }) else {
+        return Ok(false);
+    };
+    Ok(function
+        .block
+        .stmts
+        .iter()
+        .filter_map(|statement| match statement {
+            syn::Stmt::Expr(Expr::ForLoop(loop_expression), _) => Some(&loop_expression.body),
+            _ => None,
+        })
+        .any(|loop_body| {
+            if loop_body.stmts.len() != 4 {
+                return false;
+            }
+            let syn::Stmt::Local(effects_binding) = &loop_body.stmts[0] else {
+                return false;
+            };
+            if pat_ident(&effects_binding.pat).is_none_or(|identifier| identifier != "effects")
+                || effects_binding.init.is_none()
+            {
+                return false;
+            }
+            let syn::Stmt::Expr(Expr::MethodCall(extend), _) = &loop_body.stmts[3] else {
+                return false;
+            };
+            assert_statement_guards_named_field(&loop_body.stmts[1], "effects", "quarantine")
+                && assert_statement_guards_named_field(&loop_body.stmts[2], "effects", "drained")
+                && extend.method == "extend"
+                && matches!(
+                    extend.receiver.as_ref(),
+                    Expr::Path(path) if path.path.is_ident("after_unlock")
+                )
+                && extend.args.len() == 1
+                && expression_is_named_field(&extend.args[0], "effects", "after_unlock")
+        }))
+}
+
 fn analyze_io_effects_publication(
     source: &str,
 ) -> Result<IoEffectsPublicationAnalysis, syn::Error> {
@@ -540,8 +626,24 @@ fn analyze_io_effects_publication(
         analysis: &mut IoEffectsPublicationAnalysis,
     ) {
         for item in items {
+            if is_test_only(item_attrs(item)) {
+                continue;
+            }
             match item {
-                Item::Fn(function) if !is_test_only(&function.attrs) => {
+                Item::Struct(structure) if structure.ident == "IoCoreEffects" => {
+                    analysis.definitions += 1;
+                }
+                Item::Type(alias)
+                    if type_path_last(&alias.ty)
+                        .is_some_and(|name| effects_names.contains(&name)) =>
+                {
+                    analysis.violations.push(format!(
+                        "{}:type-alias:{}",
+                        qualified_name(module_path, &alias.ident.to_string()),
+                        alias.ident.span().start().line
+                    ));
+                }
+                Item::Fn(function) => {
                     let mut visitor = UncheckedEffectPublicationVisitor {
                         effects_names,
                         aliases: HashSet::new(),
@@ -551,11 +653,25 @@ fn analyze_io_effects_publication(
                     visitor.visit_signature(&function.sig);
                     visitor.visit_block(&function.block);
                     analysis.violations.extend(visitor.violations);
+                    let mut field_visitor = NamedFieldAccessVisitor {
+                        field: "after_unlock",
+                        lines: Vec::new(),
+                    };
+                    field_visitor.visit_block(&function.block);
+                    analysis
+                        .after_unlock_accesses
+                        .extend(field_visitor.lines.into_iter().map(|line| {
+                            format!(
+                                "{}:{line}",
+                                qualified_name(module_path, &function.sig.ident.to_string())
+                            )
+                        }));
                 }
                 Item::Impl(implementation)
                     if type_path_last(&implementation.self_ty)
                         .is_some_and(|name| effects_names.contains(&name)) =>
                 {
+                    analysis.implementation_blocks += 1;
                     if implementation.trait_.is_some() {
                         analysis.violations.push(format!(
                             "{}:trait-impl:{}",
@@ -568,6 +684,19 @@ fn analyze_io_effects_publication(
                             continue;
                         };
                         let name = function.sig.ident.to_string();
+                        let function_name =
+                            qualified_name(module_path, &format!("IoCoreEffects::{name}"));
+                        let mut field_visitor = NamedFieldAccessVisitor {
+                            field: "after_unlock",
+                            lines: Vec::new(),
+                        };
+                        field_visitor.visit_block(&function.block);
+                        analysis.after_unlock_accesses.extend(
+                            field_visitor
+                                .lines
+                                .into_iter()
+                                .map(|line| format!("{function_name}:{line}")),
+                        );
                         if implementation.trait_.is_none() && name == "publish" {
                             let statements = &function.block.stmts;
                             analysis.publish_methods.push((
@@ -582,16 +711,15 @@ fn analyze_io_effects_publication(
                             continue;
                         }
                         if implementation.trait_.is_none() && name != "extend" {
-                            let after_unlock_fields = ["after_unlock"].into_iter().collect();
-                            let mut field_visitor = SelfFieldAccessVisitor {
-                                fields: &after_unlock_fields,
-                                found: false,
+                            let mut field_visitor = NamedFieldAccessVisitor {
+                                field: "after_unlock",
+                                lines: Vec::new(),
                             };
                             field_visitor.visit_block(&function.block);
-                            if field_visitor.found {
+                            if !field_visitor.lines.is_empty() {
                                 analysis.violations.push(format!(
                                     "{}:payload-extractor:{}",
-                                    qualified_name(module_path, &name),
+                                    function_name,
                                     function.sig.ident.span().start().line
                                 ));
                             }
@@ -599,7 +727,7 @@ fn analyze_io_effects_publication(
                         let mut visitor = UncheckedEffectPublicationVisitor {
                             effects_names,
                             aliases: HashSet::new(),
-                            function: qualified_name(module_path, &name),
+                            function: function_name,
                             violations: Vec::new(),
                         };
                         visitor.visit_signature(&function.sig);
@@ -629,6 +757,21 @@ fn analyze_io_effects_publication(
                         visitor.visit_signature(&function.sig);
                         visitor.visit_block(&function.block);
                         analysis.violations.extend(visitor.violations);
+                        let function_name = qualified_name(
+                            module_path,
+                            &format!("{owner}::{}", function.sig.ident),
+                        );
+                        let mut field_visitor = NamedFieldAccessVisitor {
+                            field: "after_unlock",
+                            lines: Vec::new(),
+                        };
+                        field_visitor.visit_block(&function.block);
+                        analysis.after_unlock_accesses.extend(
+                            field_visitor
+                                .lines
+                                .into_iter()
+                                .map(|line| format!("{function_name}:{line}")),
+                        );
                     }
                 }
                 Item::Mod(module) => {
@@ -652,6 +795,7 @@ fn analyze_io_effects_publication(
         &effects_names,
         &mut analysis,
     );
+    analysis.after_unlock_accesses.sort();
     analysis.violations.sort();
     analysis.violations.dedup();
     Ok(analysis)
@@ -2081,6 +2225,25 @@ fn io_effect_publication_detector_rejects_unchecked_routes() {
         "conditional guards must not satisfy the publication contract"
     );
 
+    let non_guard_assertions = r#"
+        struct IoCoreEffects { after_unlock: AfterEngineUnlock }
+        impl IoCoreEffects {
+            fn publish(self) {
+                assert!(true || self.quarantine.is_empty());
+                assert!(self.drained.is_empty() || true);
+                self.after_unlock.publish();
+            }
+        }
+    "#;
+    let non_guard_analysis = analyze_io_effects_publication(non_guard_assertions).unwrap();
+    assert!(
+        !non_guard_analysis
+            .publish_methods
+            .iter()
+            .any(|(_, quarantine, drained, publish)| *quarantine && *drained && *publish),
+        "non-guarding assertions must not satisfy the publication contract"
+    );
+
     let multiple_publications = r#"
         struct IoCoreEffects { after_unlock: AfterEngineUnlock }
         impl IoCoreEffects {
@@ -2140,6 +2303,29 @@ fn io_effect_publication_detector_rejects_unchecked_routes() {
         "publication through a match-bound alias must be rejected"
     );
 
+    let aliased_effect_type = r#"
+        struct IoCoreEffects { after_unlock: AfterEngineUnlock }
+        type EffectsAlias = IoCoreEffects;
+        fn bypass(EffectsAlias { after_unlock }: EffectsAlias) {
+            after_unlock.publish();
+        }
+    "#;
+    let alias_analysis = analyze_io_effects_publication(aliased_effect_type).unwrap();
+    assert!(
+        alias_analysis
+            .violations
+            .iter()
+            .any(|violation| violation.contains("EffectsAlias:type-alias")),
+        "an IoCoreEffects type alias must be rejected"
+    );
+    assert!(
+        alias_analysis
+            .violations
+            .iter()
+            .any(|violation| violation.contains("bypass:destructure")),
+        "destructuring through an IoCoreEffects alias must be rejected"
+    );
+
     let payload_extractor = r#"
         struct IoCoreEffects { after_unlock: AfterEngineUnlock }
         impl IoCoreEffects {
@@ -2158,6 +2344,83 @@ fn io_effect_publication_detector_rejects_unchecked_routes() {
             .iter()
             .any(|violation| violation.contains("into_after_unlock:payload-extractor")),
         "an additional payload-extractor method must be rejected"
+    );
+
+    let transformed_payload_extractor = r#"
+        struct IoCoreEffects { after_unlock: AfterEngineUnlock }
+        impl IoCoreEffects {
+            fn publish(self) {
+                assert!(self.quarantine.is_empty());
+                assert!(self.drained.is_empty());
+                self.after_unlock.publish();
+            }
+            fn into_after_unlock(mut self) -> AfterEngineUnlock {
+                std::mem::take(&mut self).after_unlock
+            }
+        }
+    "#;
+    assert!(
+        analyze_io_effects_publication(transformed_payload_extractor)
+            .unwrap()
+            .violations
+            .iter()
+            .any(|violation| violation.contains("into_after_unlock:payload-extractor")),
+        "a transformed payload-extractor method must be rejected"
+    );
+
+    let guarded_internal_extraction = r#"
+        fn commit_internal_entries() {
+            for entry in early {
+                let effects = finish(entry);
+                assert!(effects.quarantine.is_empty());
+                assert!(effects.drained.is_empty());
+                after_unlock.extend(effects.after_unlock);
+            }
+        }
+    "#;
+    assert!(
+        has_guarded_internal_effect_extraction(guarded_internal_extraction).unwrap(),
+        "the narrow guarded internal extraction must remain accepted"
+    );
+    let conditional_internal_extraction = r#"
+        fn commit_internal_entries() {
+            for entry in early {
+                let effects = finish(entry);
+                if should_check() {
+                    assert!(effects.quarantine.is_empty());
+                    assert!(effects.drained.is_empty());
+                }
+                after_unlock.extend(effects.after_unlock);
+            }
+        }
+    "#;
+    assert!(
+        !has_guarded_internal_effect_extraction(conditional_internal_extraction).unwrap(),
+        "conditional guards must not authorize direct internal effect extraction"
+    );
+
+    let ufcs_consumer = r#"
+        fn bypass(effects: &mut IoCoreEffects) {
+            IoCoreEffects::take_quarantine(effects);
+        }
+    "#;
+    assert!(
+        !find_production_lifecycle_calls(ufcs_consumer, &["take_quarantine"])
+            .unwrap()
+            .is_empty(),
+        "UFCS effect consumers must be visible to consumer confinement"
+    );
+
+    let duplicate_definitions = r#"
+        struct IoCoreEffects;
+        mod nested { struct IoCoreEffects; }
+    "#;
+    assert_eq!(
+        analyze_io_effects_publication(duplicate_definitions)
+            .unwrap()
+            .definitions,
+        2,
+        "recursive duplicate IoCoreEffects definitions must be visible"
     );
 }
 
@@ -3258,7 +3521,10 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
     }
     let io_core_operation_source =
         fs::read_to_string(&io_core_operation_path).expect("read I/O operation source");
+    let mut io_effects_definition_paths = Vec::new();
+    let mut io_effects_impl_paths = Vec::new();
     let mut io_effects_publish_methods = Vec::new();
+    let mut after_unlock_accesses = BTreeMap::<(PathBuf, String), usize>::new();
     let mut unchecked_io_effect_publications = Vec::new();
     let mut quarantine_consumer_paths = Vec::new();
     let mut drained_consumer_paths = Vec::new();
@@ -3271,6 +3537,12 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         }
         let publication = analyze_io_effects_publication(&source)
             .unwrap_or_else(|error| panic!("parse {} publication paths: {error}", path.display()));
+        io_effects_definition_paths
+            .extend(std::iter::repeat_n(path.clone(), publication.definitions));
+        io_effects_impl_paths.extend(std::iter::repeat_n(
+            path.clone(),
+            publication.implementation_blocks,
+        ));
         io_effects_publish_methods.extend(
             publication
                 .publish_methods
@@ -3283,15 +3555,42 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
                 .into_iter()
                 .map(|violation| format!("{}:{violation}", path.display())),
         );
-        quarantine_consumer_paths.extend(std::iter::repeat_n(
-            path.clone(),
-            source.matches(".take_quarantine()").count(),
-        ));
-        drained_consumer_paths.extend(std::iter::repeat_n(
-            path.clone(),
-            source.matches(".take_drained()").count(),
-        ));
+        for access in publication.after_unlock_accesses {
+            let function = access
+                .rsplit_once(':')
+                .map_or(access.as_str(), |(function, _)| function)
+                .to_owned();
+            *after_unlock_accesses
+                .entry((path.clone(), function))
+                .or_default() += 1;
+        }
+        quarantine_consumer_paths.extend(
+            find_production_lifecycle_calls(&source, &["take_quarantine"])
+                .unwrap_or_else(|error| {
+                    panic!("parse {} quarantine consumers: {error}", path.display())
+                })
+                .into_iter()
+                .map(|call| (path.clone(), call)),
+        );
+        drained_consumer_paths.extend(
+            find_production_lifecycle_calls(&source, &["take_drained"])
+                .unwrap_or_else(|error| {
+                    panic!("parse {} accepted-zero consumers: {error}", path.display())
+                })
+                .into_iter()
+                .map(|call| (path.clone(), call)),
+        );
     }
+    assert_eq!(
+        io_effects_definition_paths,
+        [io_core_operation_path.clone()],
+        "IoCoreEffects must have one production definition"
+    );
+    assert_eq!(
+        io_effects_impl_paths,
+        [io_core_operation_path.clone()],
+        "IoCoreEffects must have one production implementation block"
+    );
     assert_eq!(
         io_effects_publish_methods.len(),
         1,
@@ -3312,13 +3611,80 @@ fn test_v2_io_boundary_dependency_direction_and_visibility() {
         unchecked_io_effect_publications.join(", ")
     );
     assert_eq!(
-        quarantine_consumer_paths,
-        [session_path.clone()],
+        after_unlock_accesses,
+        BTreeMap::from([
+            (
+                (
+                    io_core_operation_path.clone(),
+                    "IoCore::fail_observers_for_close".to_owned(),
+                ),
+                1,
+            ),
+            (
+                (
+                    io_core_operation_path.clone(),
+                    "IoCore::terminalize_operations".to_owned(),
+                ),
+                1,
+            ),
+            (
+                (
+                    io_core_operation_path.clone(),
+                    "IoCore::terminalize_operations_bounded".to_owned(),
+                ),
+                1,
+            ),
+            (
+                (
+                    io_core_operation_path.clone(),
+                    "IoCoreEffects::extend".to_owned(),
+                ),
+                2,
+            ),
+            (
+                (
+                    io_core_operation_path.clone(),
+                    "commit_internal_entries".to_owned(),
+                ),
+                1,
+            ),
+            (
+                (
+                    io_core_operation_path.clone(),
+                    "IoCoreEffects::publish".to_owned(),
+                ),
+                1,
+            ),
+        ]),
+        "IoCoreEffects detached payload access escaped the reviewed mutation and publication sites"
+    );
+    assert!(
+        has_guarded_internal_effect_extraction(&io_core_operation_source)
+            .expect("parse direct internal effect publication"),
+        "the narrow direct I/O publication path must prove that no session-facing effects exist"
+    );
+    assert_eq!(
+        quarantine_consumer_paths.len(),
+        1,
+        "operation quarantine effects must have one production consumer: {quarantine_consumer_paths:#?}"
+    );
+    assert!(
+        quarantine_consumer_paths[0].0 == session_path
+            && quarantine_consumer_paths[0]
+                .1
+                .starts_with("take_quarantine:apply_io_effects:"),
         "operation quarantine effects must be consumed only by SessionManager"
     );
     assert_eq!(
-        drained_consumer_paths,
-        [session_path.clone()],
+        drained_consumer_paths.len(),
+        1,
+        "accepted-zero effects must have one production consumer: {drained_consumer_paths:#?}"
+    );
+    assert!(
+        drained_consumer_paths[0].0 == session_path
+            && drained_consumer_paths[0]
+                .1
+                .starts_with("take_drained:apply_io_effects:"),
         "accepted-zero effects must be consumed only by SessionManager"
     );
     let io_core_operation_syntax =
