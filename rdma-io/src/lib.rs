@@ -3,6 +3,8 @@
 //! Provides RAII wrappers for RDMA resources with `Arc`-based ownership
 //! to enforce correct destruction order.
 
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 pub mod cm;
 pub mod comp_channel;
 pub mod cq;

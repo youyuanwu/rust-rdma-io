@@ -68,6 +68,11 @@
 //! - `tokio` feature adds [`Cq::completions_tokio()`] convenience
 
 #![deny(missing_docs)]
+#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
+#![cfg_attr(
+    test,
+    allow(clippy::disallowed_methods, clippy::disallowed_types)
+)]
 
 #[cfg(feature = "async")]
 mod completion;
