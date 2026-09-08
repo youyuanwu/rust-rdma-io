@@ -1,5 +1,13 @@
 # V2 RDMA Engine and Message Driver
 
+> **Active migration:** Issue #59 is incrementally simplifying the engine
+> toward one caller-polled, `RdmaEngineDriver`-owned reactor. The current-state
+> inventory, preserved invariants, phase gates, and mandatory old-path removal
+> criteria are recorded in
+> [V2 Single-Owner Reactor Migration Contract](v2-single-owner-reactor-migration.md).
+> This document continues to describe the implemented architecture until each
+> reviewed migration phase updates it.
+
 ## Overview
 
 V2 separates shared RDMA runtime mechanics from per-connection message
