@@ -10,9 +10,10 @@ mod event;
 mod inbound;
 mod outbound;
 mod retirement;
+mod shutdown;
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -48,6 +49,7 @@ use event::{CmEventReject, CmEventSnapshot, EventDisposition, is_failure_event};
 use outbound::ConnectWaiter;
 use outbound::OutboundRequest;
 pub(in crate::v2::engine) use outbound::{connect, connect_with_setup};
+pub(in crate::v2::engine) use shutdown::CmShutdownCursor;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct CmRouteToken {
@@ -106,32 +108,6 @@ pub(in crate::v2::engine) struct CmState {
     software_next_class: AtomicUsize,
     outbound_setup_active: AtomicBool,
     shutting_down: AtomicBool,
-}
-
-pub(in crate::v2::engine) struct CmShutdownCursor {
-    next_class: usize,
-    route_slot: usize,
-    listener_token: u64,
-    routes_complete: bool,
-    listeners_complete: bool,
-    destruction_listeners_remaining: Option<usize>,
-    destruction_listeners_complete: bool,
-    terminalized_listeners: HashSet<usize>,
-}
-
-impl Default for CmShutdownCursor {
-    fn default() -> Self {
-        Self {
-            next_class: 0,
-            route_slot: 0,
-            listener_token: 1,
-            routes_complete: false,
-            listeners_complete: false,
-            destruction_listeners_remaining: None,
-            destruction_listeners_complete: false,
-            terminalized_listeners: HashSet::new(),
-        }
-    }
 }
 
 impl CmState {
@@ -395,40 +371,11 @@ impl CmState {
         shared: &SessionManager,
         outcome: &MemoizedTerminalResult,
     ) {
-        if self.shutting_down.swap(true, Ordering::AcqRel) {
-            return;
-        }
-
-        if outcome.is_success() {
-            return;
-        }
-        let pending: Vec<_> = lock_unpoison(&self.pending).drain(..).collect();
-        for request in pending {
-            request.cancel(terminal_error(outcome));
-            drop(request.take_reservation());
-        }
-        let requests: Vec<_> = self
-            .routes
-            .occupied_cloned()
-            .into_iter()
-            .filter_map(|route| route.request())
-            .collect();
-        for request in requests {
-            request.cancel(terminal_error(outcome));
-            self.enqueue_cancellation(request);
-        }
-        let pending_listens: Vec<_> = lock_unpoison(&self.pending_listens).drain(..).collect();
-        for request in pending_listens {
-            request.complete(Err(terminal_error(outcome)));
-        }
-        let listeners: Vec<_> = lock_unpoison(&self.listeners).values().cloned().collect();
-        for listener in listeners {
-            listener.request_close(shared);
-        }
+        shutdown::begin(self, shared, outcome);
     }
 
     pub(in crate::v2::engine) fn start_bounded_shutdown(&self) {
-        self.shutting_down.store(true, Ordering::Release);
+        shutdown::start(self);
     }
 
     pub(in crate::v2::engine) fn service_bounded_shutdown(
@@ -439,118 +386,14 @@ impl CmState {
         cursor: &mut CmShutdownCursor,
         budget: usize,
     ) -> usize {
-        let mut processed = 0;
-        if !terminalize_listeners {
-            cursor.destruction_listeners_complete = true;
-        }
-        while processed < budget {
-            let mut selected = false;
-            for offset in 0..5 {
-                let class = (cursor.next_class + offset) % 5;
-                match class {
-                    0 => {
-                        let request = { lock_unpoison(&self.pending).pop_front() };
-                        let Some(request) = request else {
-                            continue;
-                        };
-                        request.cancel(terminal_error(outcome));
-                        drop(request.take_reservation());
-                    }
-                    1 if !cursor.routes_complete => {
-                        let (routes, next, complete, scanned) =
-                            self.routes.scan_occupied_cloned(cursor.route_slot, 1);
-                        cursor.route_slot = next;
-                        cursor.routes_complete = complete;
-                        if scanned == 0 {
-                            continue;
-                        }
-                        for route in routes {
-                            if let Some(request) = route.request() {
-                                request.cancel(terminal_error(outcome));
-                                self.enqueue_cancellation(request);
-                            }
-                        }
-                    }
-                    2 => {
-                        let request = { lock_unpoison(&self.pending_listens).pop_front() };
-                        let Some(request) = request else {
-                            continue;
-                        };
-                        request.complete(Err(terminal_error(outcome)));
-                    }
-                    3 if !cursor.listeners_complete => {
-                        let upper = self.next_listener_token.load(Ordering::Acquire);
-                        if cursor.listener_token >= upper {
-                            cursor.listeners_complete = true;
-                            continue;
-                        }
-                        let token = cursor.listener_token;
-                        cursor.listener_token = cursor.listener_token.saturating_add(1);
-                        let listener = { lock_unpoison(&self.listeners).get(&token).cloned() };
-                        if let Some(listener) = listener {
-                            if terminalize_listeners {
-                                let identity = Arc::as_ptr(&listener) as usize;
-                                if cursor.terminalized_listeners.insert(identity) {
-                                    listener.terminalize(outcome);
-                                }
-                            } else {
-                                listener.request_close(shared);
-                            }
-                        }
-                    }
-                    4 if terminalize_listeners && !cursor.destruction_listeners_complete => {
-                        let remaining = cursor
-                            .destruction_listeners_remaining
-                            .get_or_insert_with(|| lock_unpoison(&self.cm_destructions).len());
-                        if *remaining == 0 {
-                            cursor.destruction_listeners_complete = true;
-                            continue;
-                        }
-                        let listener = {
-                            let mut destructions = lock_unpoison(&self.cm_destructions);
-                            let Some(pending) = destructions.pop_front() else {
-                                cursor.destruction_listeners_complete = true;
-                                *remaining = 0;
-                                continue;
-                            };
-                            let listener = pending.listener().cloned();
-                            destructions.push_back(pending);
-                            listener
-                        };
-                        *remaining -= 1;
-                        if *remaining == 0 {
-                            cursor.destruction_listeners_complete = true;
-                        }
-                        if let Some(listener) = listener {
-                            let identity = Arc::as_ptr(&listener) as usize;
-                            if cursor.terminalized_listeners.insert(identity) {
-                                listener.terminalize(outcome);
-                            }
-                        }
-                    }
-                    _ => continue,
-                }
-                cursor.next_class = (class + 1) % 5;
-                processed += 1;
-                selected = true;
-                break;
-            }
-            if !selected {
-                break;
-            }
-        }
-        processed
+        shutdown::service(self, shared, outcome, terminalize_listeners, cursor, budget)
     }
 
     pub(in crate::v2::engine) fn bounded_shutdown_complete(
         &self,
         cursor: &CmShutdownCursor,
     ) -> bool {
-        cursor.routes_complete
-            && cursor.listeners_complete
-            && cursor.destruction_listeners_complete
-            && lock_unpoison(&self.pending).is_empty()
-            && lock_unpoison(&self.pending_listens).is_empty()
+        shutdown::complete(self, cursor)
     }
 
     pub(in crate::v2::engine) fn pending_route_count(&self) -> usize {
@@ -629,42 +472,7 @@ impl CmState {
     }
 
     pub(in crate::v2::engine) fn terminalize(&self, outcome: &MemoizedTerminalResult) {
-        if outcome.is_success() {
-            return;
-        }
-        let pending: Vec<_> = lock_unpoison(&self.pending).drain(..).collect();
-        let requests: Vec<_> = self
-            .routes
-            .occupied_cloned()
-            .into_iter()
-            .filter_map(|route| route.request())
-            .chain(pending)
-            .collect();
-        for request in requests {
-            drop(request.take_reservation());
-            request.cancel(terminal_error(outcome));
-        }
-        let pending_listens: Vec<_> = lock_unpoison(&self.pending_listens).drain(..).collect();
-        for request in pending_listens {
-            request.complete(Err(terminal_error(outcome)));
-        }
-        let mut listeners: Vec<_> = lock_unpoison(&self.listeners).values().cloned().collect();
-        let pending_listeners: Vec<_> = lock_unpoison(&self.cm_destructions)
-            .iter()
-            .filter_map(PendingCmDestruction::listener)
-            .cloned()
-            .collect();
-        for listener in pending_listeners {
-            if !listeners
-                .iter()
-                .any(|active| Arc::ptr_eq(active, &listener))
-            {
-                listeners.push(listener);
-            }
-        }
-        for listener in listeners {
-            listener.terminalize(outcome);
-        }
+        shutdown::terminalize(self, outcome);
     }
 
     fn start_listener(
@@ -1043,13 +851,6 @@ fn build_qp(
         )
         .sq_sig_all(true)
         .build_with_cm(cm_id)
-}
-
-fn terminal_error(outcome: &MemoizedTerminalResult) -> Error {
-    match outcome.clone().into_result() {
-        Err(error) => error,
-        Ok(()) => unreachable!("successful engine outcome was filtered"),
-    }
 }
 
 fn contextual_cm_error(context: impl Into<String>, error: Error) -> Error {

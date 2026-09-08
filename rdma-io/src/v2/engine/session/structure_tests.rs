@@ -445,12 +445,12 @@ impl<'ast> Visit<'ast> for ArchitectureVisitor {
     }
 
     fn visit_expr_call(&mut self, call: &'ast ExprCall) {
-        if self.skip_test_depth == 0 {
-            if let Expr::Path(path) = &*call.func {
-                self.record_path(&path.path);
-                if let Some(segment) = path.path.segments.last() {
-                    self.record_call_name(&segment.ident.to_string());
-                }
+        if self.skip_test_depth == 0
+            && let Expr::Path(path) = &*call.func
+        {
+            self.record_path(&path.path);
+            if let Some(segment) = path.path.segments.last() {
+                self.record_call_name(&segment.ident.to_string());
             }
         }
         visit::visit_expr_call(self, call);
