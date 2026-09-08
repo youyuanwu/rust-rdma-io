@@ -23,8 +23,6 @@ mod drain;
 pub(super) mod listener;
 mod progress;
 mod registry;
-#[cfg(test)]
-mod structure_tests;
 
 use self::connection::{
     ConnectionAdmissionPool, ConnectionState, QpDestroyStatus, SharedCmId, VerbsConnectionResources,

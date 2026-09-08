@@ -26,5 +26,4 @@ futures-util = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
-syn = { version = "2", features = ["full", "visit"] }
 tokio = { workspace = true, features = ["test-util"] }

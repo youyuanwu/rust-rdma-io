@@ -327,14 +327,12 @@ unit tests remain in their respective direct-child `tests.rs` files;
 `session/registry.rs` retain the remaining session-owned state and policy.
 These test files remain direct children of their private owner modules,
 preserving private-invariant access, existing test-hook paths, and narrow
-visibility. The recursive session structural suite discovers nested Rust
-sources and enforces the CM child dependency direction, driver isolation,
-hidden-work restrictions, and provider-mutation authority allowlists. The
-remaining `engine/registry.rs` is not a connection owner: it provides opaque
-connection and operation identities, exact live-I/O proofs, generic
-non-wrapping generational registry storage, and lock helpers shared with
-`IoCore`. Public connection and listener types continue to be re-exported by
-the engine facade, so these physical relocations do not change public paths.
+visibility. The remaining `engine/registry.rs` is not a connection owner: it
+provides opaque connection and operation identities, exact live-I/O proofs,
+generic non-wrapping generational registry storage, and lock helpers shared
+with `IoCore`. Public connection and listener types continue to be re-exported
+by the engine facade, so these physical relocations do not change public
+paths.
 
 An established I/O capability carries immutable connection/QP identity, local
 posting limits, operation ledgers, and a posting-only authority. That authority
