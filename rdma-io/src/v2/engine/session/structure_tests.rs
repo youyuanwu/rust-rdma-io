@@ -35,7 +35,6 @@ const TEST_ONLY_MODULES: &[(&str, &str, &str)] = &[
 const QP_AUTHORITY_PATHS: &[&str] = &[
     "src/v2/engine/session/mod.rs",
     "src/v2/engine/session/connection/mod.rs",
-    "src/v2/engine/session/cm/mod.rs",
     "src/v2/engine/session/cm/retirement.rs",
 ];
 

@@ -5,11 +5,10 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use super::{
-    CmRouteToken, CmState, ConnectionCmRoute, ConnectionState, ConnectionToken,
-    EstablishedConnectionRoute, FailedConnectionInstallResources, InboundRetirementCompletion,
-    InboundState, Lookup, OutboundState, PendingCmDestruction, RetainedSetupRollback,
-    RouteRetirement, SessionManager, connection_destruction_error, contextual_cm_error,
-    error_detail, lock_unpoison,
+    CmState, ConnectionCmRoute, ConnectionState, ConnectionToken, EstablishedConnectionRoute,
+    FailedConnectionInstallResources, InboundRetirementCompletion, Lookup, PendingCmDestruction,
+    RetainedSetupRollback, RouteRetirement, SessionManager, connection_destruction_error,
+    contextual_cm_error, error_detail, lock_unpoison,
 };
 #[cfg(test)]
 use super::{TestCmDestruction, injected_cm_result};
@@ -298,133 +297,6 @@ fn fail_inbound_retirement(
     }
 }
 
-fn retire_outbound_connection_route(
-    state: &CmState,
-    encoded: u64,
-    connection: &Arc<ConnectionState>,
-) -> Result<RouteRetirement> {
-    let token = CmRouteToken::decode(encoded);
-    let route = match state.routes.lookup_cloned(token) {
-        Lookup::Occupied(route) => route,
-        Lookup::Duplicate | Lookup::Stale | Lookup::Unknown | Lookup::Retired => {
-            return Ok(RouteRetirement::Complete {
-                completion: None,
-                reject: None,
-            });
-        }
-    };
-    let route_state =
-        route.take_state_if(|route_state| route_state.references_connection(connection.token));
-    match route_state {
-        Some(
-            OutboundState::EstablishedAwaitingDelivery { .. }
-            | OutboundState::Established { .. }
-            | OutboundState::DisconnectedAwaitingDelivery { .. }
-            | OutboundState::Disconnected { .. }
-            | OutboundState::FailedAwaitingDelivery { .. }
-            | OutboundState::Failed { .. }
-            | OutboundState::Closing { .. },
-        ) => {
-            state.retire_route(&route, true);
-            Ok(RouteRetirement::Complete {
-                completion: None,
-                reject: None,
-            })
-        }
-        Some(route_state) => {
-            route.set_state(route_state);
-            Err(Error::InvalidConfig(
-                "connection route was not established during retirement".into(),
-            ))
-        }
-        None if matches!(&*lock_unpoison(&route.state), OutboundState::Transitioning) => {
-            Ok(RouteRetirement::Retry)
-        }
-        None => Err(Error::InvalidConfig(
-            "connection route generation did not match retirement".into(),
-        )),
-    }
-}
-
-fn retire_inbound_connection_route(
-    state: &CmState,
-    encoded: u64,
-    connection: &Arc<ConnectionState>,
-) -> Result<RouteRetirement> {
-    let token = CmRouteToken::decode(encoded);
-    let route = match state.inbound_routes.lookup_cloned(token) {
-        Lookup::Occupied(route) => route,
-        Lookup::Duplicate | Lookup::Stale | Lookup::Unknown | Lookup::Retired => {
-            return Ok(RouteRetirement::Complete {
-                completion: None,
-                reject: None,
-            });
-        }
-    };
-    let route_state =
-        route.take_state_if(|route_state| route_state.references_connection(connection.token));
-    match route_state {
-        Some(InboundState::EstablishedAwaitingDelivery { request, .. }) => {
-            let delivered = request.fail_undelivered(Error::DriverShutdown);
-            if delivered
-                && let Some(listener) = route.listener.upgrade()
-                && listener.finish_selected_route(encoded)
-            {
-                state.enqueue_listener_work(&listener);
-            }
-            state.inbound_routes.release(token, true);
-            Ok(RouteRetirement::Complete {
-                completion: (!delivered).then(|| InboundRetirementCompletion {
-                    listener: route.listener.clone(),
-                    route: encoded,
-                    request: None,
-                    result: None,
-                    selected: true,
-                }),
-                reject: None,
-            })
-        }
-        Some(InboundState::Established { .. }) => {
-            state.inbound_routes.release(token, true);
-            Ok(RouteRetirement::Complete {
-                completion: None,
-                reject: None,
-            })
-        }
-        Some(InboundState::Closing {
-            request,
-            completion,
-            selected,
-            reject,
-            ..
-        }) => {
-            state.inbound_routes.release(token, true);
-            Ok(RouteRetirement::Complete {
-                completion: Some(InboundRetirementCompletion {
-                    listener: route.listener.clone(),
-                    route: encoded,
-                    request,
-                    result: completion,
-                    selected,
-                }),
-                reject,
-            })
-        }
-        Some(route_state) => {
-            route.set_state(route_state);
-            Err(Error::InvalidConfig(
-                "inbound connection route was not established during retirement".into(),
-            ))
-        }
-        None if matches!(&*lock_unpoison(&route.state), InboundState::Transitioning) => {
-            Ok(RouteRetirement::Retry)
-        }
-        None => Err(Error::InvalidConfig(
-            "inbound connection route generation did not match retirement".into(),
-        )),
-    }
-}
-
 pub(super) fn retire_registered_connection(
     shared: &SessionManager,
     token: ConnectionToken,
@@ -463,10 +335,10 @@ pub(super) fn retire_registered_connection(
     }
     let retirement = match connection.cm_route() {
         Some(ConnectionCmRoute::Outbound(encoded)) => {
-            retire_outbound_connection_route(state, encoded, &connection)?
+            state.retire_outbound_route_for_retirement(encoded, &connection)?
         }
         Some(ConnectionCmRoute::Inbound(encoded)) => {
-            retire_inbound_connection_route(state, encoded, &connection)?
+            state.retire_inbound_route_for_retirement(encoded, &connection)?
         }
         None => RouteRetirement::Complete {
             completion: None,
