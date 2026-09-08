@@ -307,18 +307,34 @@ count rule. `batch` and `future` reach their shared submission vocabulary
 through `validation` instead of through each other, and neither depends on the
 other.
 `engine/session/mod.rs` defines the manager and its lifecycle capabilities.
-The CM and connection owners place production in
-`session/cm/mod.rs` and `session/connection/mod.rs`, with their unit tests in
-the respective direct-child `tests.rs` files; `session/listener.rs`,
-`session/drain.rs`, `session/progress.rs`, and `session/registry.rs` retain
-the remaining session-owned state and policy. These extracted test files remain direct
-children of their private owner modules, preserving private-invariant access,
-existing test-hook paths, and narrow visibility. The remaining
-`engine/registry.rs` is not a connection owner: it provides opaque connection
-and operation identities, exact live-I/O proofs, generic non-wrapping
-generational registry storage, and lock helpers shared with `IoCore`. Public
-connection and listener types continue to be re-exported by the engine facade,
-so these physical relocations do not change public paths.
+The CM owner uses `session/cm/mod.rs` as its single `CmState` facade over
+responsibility-focused children: `event.rs` owns event snapshotting,
+acknowledgement, exact identity lookup, rejection classification, and
+parent-mediated dispatch; `outbound.rs` owns connect setup, waiter delivery,
+cancellation, and outbound transitions; `inbound.rs` owns listener CM setup,
+child admission/rejection, setup-before-accept, inbound transitions, and
+listener finalization; `retirement.rs` owns QP-proven retirement,
+event-drained `CmId` destruction, dependent completion, and full-bundle
+retention; and `shutdown.rs` owns bounded shutdown cursoring, issuance,
+terminalization, and completion. Shared route identities, route state used by
+multiple responsibilities, work queues, and coordination envelopes remain in
+the facade. Children expose narrow operations to the parent, do not name
+sibling modules, and do not implement the facade.
+
+The connection owner remains in `session/connection/mod.rs`. CM and connection
+unit tests remain in their respective direct-child `tests.rs` files;
+`session/listener.rs`, `session/drain.rs`, `session/progress.rs`, and
+`session/registry.rs` retain the remaining session-owned state and policy.
+These test files remain direct children of their private owner modules,
+preserving private-invariant access, existing test-hook paths, and narrow
+visibility. The recursive session structural suite discovers nested Rust
+sources and enforces the CM child dependency direction, driver isolation,
+hidden-work restrictions, and provider-mutation authority allowlists. The
+remaining `engine/registry.rs` is not a connection owner: it provides opaque
+connection and operation identities, exact live-I/O proofs, generic
+non-wrapping generational registry storage, and lock helpers shared with
+`IoCore`. Public connection and listener types continue to be re-exported by
+the engine facade, so these physical relocations do not change public paths.
 
 An established I/O capability carries immutable connection/QP identity, local
 posting limits, operation ledgers, and a posting-only authority. That authority
