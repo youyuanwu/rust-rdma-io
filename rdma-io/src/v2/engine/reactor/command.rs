@@ -9,6 +9,7 @@ use std::task::Poll;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::super::driver::{COMMAND_WORK, SESSION_WORK, WorkSignal};
+use super::super::io_core::OperationCommand;
 use super::super::registry::{ConnectionToken, Lookup, lock_unpoison, read_unpoison};
 use super::super::session::SessionManager;
 use super::super::session::cm::OutboundRequest;
@@ -30,7 +31,8 @@ enum SessionCommand {
 struct CommandQueues {
     connect: VecDeque<SessionCommand>,
     listen: VecDeque<SessionCommand>,
-    next_connect: bool,
+    operation: VecDeque<(Arc<OperationCommand>, OwnedSemaphorePermit)>,
+    next_class: usize,
 }
 
 #[derive(Default)]
@@ -52,6 +54,7 @@ pub(in crate::v2::engine) struct CommandTurn {
 pub(in crate::v2::engine) struct CommandIngress {
     connect_permits: Arc<Semaphore>,
     listen_permits: Arc<Semaphore>,
+    operation_permits: Arc<Semaphore>,
     queues: Mutex<CommandQueues>,
     controls: Mutex<ControlQueue>,
     shutdown: AtomicBool,
@@ -61,18 +64,20 @@ pub(in crate::v2::engine) struct CommandIngress {
 }
 
 impl CommandIngress {
-    pub(in crate::v2::engine) fn new(capacity: usize, signal: Arc<WorkSignal>) -> Arc<Self> {
+    pub(in crate::v2::engine) fn new(
+        connection_capacity: usize,
+        operation_capacity: usize,
+        signal: Arc<WorkSignal>,
+    ) -> Arc<Self> {
         Arc::new(Self {
-            connect_permits: Arc::new(Semaphore::new(capacity)),
-            listen_permits: Arc::new(Semaphore::new(capacity)),
-            queues: Mutex::new(CommandQueues {
-                next_connect: true,
-                ..CommandQueues::default()
-            }),
+            connect_permits: Arc::new(Semaphore::new(connection_capacity)),
+            listen_permits: Arc::new(Semaphore::new(connection_capacity)),
+            operation_permits: Arc::new(Semaphore::new(operation_capacity)),
+            queues: Mutex::new(CommandQueues::default()),
             controls: Mutex::new(ControlQueue::default()),
             shutdown: AtomicBool::new(false),
             closed: AtomicBool::new(false),
-            max_connection_controls: capacity,
+            max_connection_controls: connection_capacity,
             signal,
         })
     }
@@ -106,6 +111,13 @@ impl CommandIngress {
         self: &Arc<Self>,
     ) -> Option<OwnedSemaphorePermit> {
         Arc::clone(&self.listen_permits).acquire_owned().await.ok()
+    }
+
+    pub(in crate::v2::engine) fn operation_acquire(
+        self: &Arc<Self>,
+    ) -> impl std::future::Future<Output = Option<OwnedSemaphorePermit>> + Send + 'static {
+        let permits = Arc::clone(&self.operation_permits);
+        async move { permits.acquire_owned().await.ok() }
     }
 
     pub(in crate::v2::engine) fn enqueue_connect(
@@ -168,6 +180,34 @@ impl CommandIngress {
         command.is_some()
     }
 
+    pub(in crate::v2::engine) fn enqueue_operation(
+        &self,
+        manager: &SessionManager,
+        command: Arc<OperationCommand>,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<(), Error> {
+        let _admission = read_unpoison(&manager.admission);
+        if self.closed.load(Ordering::Acquire) {
+            return Err(manager.admission_error().unwrap_or(Error::DriverShutdown));
+        }
+        lock_unpoison(&self.queues)
+            .operation
+            .push_back((command, permit));
+        Ok(())
+    }
+
+    pub(in crate::v2::engine) fn cancel_operation(&self, target: &Arc<OperationCommand>) -> bool {
+        let command = {
+            let mut queues = lock_unpoison(&self.queues);
+            let position = queues
+                .operation
+                .iter()
+                .position(|(command, _)| Arc::ptr_eq(command, target));
+            position.and_then(|position| queues.operation.remove(position))
+        };
+        command.is_some()
+    }
+
     pub(in crate::v2::engine) fn request_connection_close(
         &self,
         manager: &SessionManager,
@@ -211,6 +251,7 @@ impl CommandIngress {
         if !self.closed.swap(true, Ordering::AcqRel) {
             self.connect_permits.close();
             self.listen_permits.close();
+            self.operation_permits.close();
         }
     }
 
@@ -218,6 +259,7 @@ impl CommandIngress {
         let mut queues = lock_unpoison(&self.queues);
         let commands: Vec<_> = queues.connect.drain(..).collect();
         let listens: Vec<_> = queues.listen.drain(..).collect();
+        let operations: Vec<_> = queues.operation.drain(..).collect();
         drop(queues);
         for command in commands.into_iter().chain(listens) {
             match command {
@@ -229,6 +271,9 @@ impl CommandIngress {
                     request.complete(Err(error.clone()));
                 }
             }
+        }
+        for (command, _permit) in operations {
+            command.cancel_before_execution(error.clone());
         }
     }
 
@@ -259,32 +304,45 @@ impl CommandIngress {
             session_work = true;
         }
 
+        enum ReadyCommand {
+            Session(SessionCommand),
+            Operation(Arc<OperationCommand>, OwnedSemaphorePermit),
+        }
         let command = {
             let mut queues = lock_unpoison(&self.queues);
-            let first_connect = queues.next_connect;
-            queues.next_connect = !queues.next_connect;
-            if first_connect {
-                queues
-                    .connect
-                    .pop_front()
-                    .or_else(|| queues.listen.pop_front())
-            } else {
-                queues
-                    .listen
-                    .pop_front()
-                    .or_else(|| queues.connect.pop_front())
+            let mut selected = None;
+            for offset in 0..3 {
+                let class = (queues.next_class + offset) % 3;
+                selected = match class {
+                    0 => queues.connect.pop_front().map(ReadyCommand::Session),
+                    1 => queues.listen.pop_front().map(ReadyCommand::Session),
+                    2 => queues
+                        .operation
+                        .pop_front()
+                        .map(|(command, permit)| ReadyCommand::Operation(command, permit)),
+                    _ => unreachable!(),
+                };
+                if selected.is_some() {
+                    queues.next_class = (class + 1) % 3;
+                    break;
+                }
             }
+            selected
         };
         if let Some(command) = command {
             match command {
-                SessionCommand::Connect { request, .. } => {
+                ReadyCommand::Session(SessionCommand::Connect { request, .. }) => {
                     shared.session.cm.enqueue(request);
+                    session_work = true;
                 }
-                SessionCommand::Listen { request, .. } => {
+                ReadyCommand::Session(SessionCommand::Listen { request, .. }) => {
                     shared.session.cm.enqueue_listen(request);
+                    session_work = true;
+                }
+                ReadyCommand::Operation(command, _permit) => {
+                    command.execute(&shared.session);
                 }
             }
-            session_work = true;
         }
 
         if session_work {
@@ -305,7 +363,7 @@ impl CommandIngress {
             return true;
         }
         let queues = lock_unpoison(&self.queues);
-        if !queues.connect.is_empty() || !queues.listen.is_empty() {
+        if !queues.connect.is_empty() || !queues.listen.is_empty() || !queues.operation.is_empty() {
             return true;
         }
         drop(queues);
@@ -331,6 +389,16 @@ impl CommandIngress {
     pub(in crate::v2::engine) fn available_listen_permits(&self) -> usize {
         self.listen_permits.available_permits()
     }
+
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn pending_operations(&self) -> usize {
+        lock_unpoison(&self.queues).operation.len()
+    }
+
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn available_operation_permits(&self) -> usize {
+        self.operation_permits.available_permits()
+    }
 }
 
 #[cfg(test)]
@@ -342,7 +410,7 @@ mod tests {
 
     #[tokio::test]
     async fn connect_admission_is_bounded_and_wakes_after_release() {
-        let ingress = CommandIngress::new(1, Arc::new(WorkSignal::new()));
+        let ingress = CommandIngress::new(1, 1, Arc::new(WorkSignal::new()));
         let permit = ingress.acquire_connect().await.unwrap();
         assert_eq!(ingress.available_connect_permits(), 0);
 
@@ -360,7 +428,7 @@ mod tests {
 
     #[tokio::test]
     async fn closing_admission_wakes_waiters_with_driver_shutdown() {
-        let ingress = CommandIngress::new(1, Arc::new(WorkSignal::new()));
+        let ingress = CommandIngress::new(1, 1, Arc::new(WorkSignal::new()));
         let _permit = ingress.acquire_listen().await.unwrap();
         let waiting = {
             let ingress = Arc::clone(&ingress);
@@ -373,7 +441,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_the_head_waiter_allows_the_next_waiter_to_acquire() {
-        let ingress = CommandIngress::new(1, Arc::new(WorkSignal::new()));
+        let ingress = CommandIngress::new(1, 1, Arc::new(WorkSignal::new()));
         let permit = ingress.acquire_connect().await.unwrap();
         let first = {
             let ingress = Arc::clone(&ingress);
@@ -392,7 +460,7 @@ mod tests {
 
     #[tokio::test]
     async fn permit_waiters_are_fifo_and_do_not_barge() {
-        let ingress = CommandIngress::new(1, Arc::new(WorkSignal::new()));
+        let ingress = CommandIngress::new(1, 1, Arc::new(WorkSignal::new()));
         let permit = ingress.acquire_connect().await.unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let first = {
@@ -422,7 +490,7 @@ mod tests {
 
     #[test]
     fn shutdown_requests_coalesce() {
-        let ingress = CommandIngress::new(1, Arc::new(WorkSignal::new()));
+        let ingress = CommandIngress::new(1, 1, Arc::new(WorkSignal::new()));
         ingress.request_shutdown();
         ingress.request_shutdown();
         assert!(ingress.shutdown.load(std::sync::atomic::Ordering::Acquire));

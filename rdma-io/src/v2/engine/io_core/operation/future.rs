@@ -1,11 +1,13 @@
-//! Scalar operation future, first-poll submission, and cancellation.
+//! Scalar operation future, bounded command admission, and cancellation.
 //!
 //! `RdmaOperation` is the only caller-held handle for a single SEND, RECV,
 //! READ, or WRITE. Its first poll is the sole provider-post boundary for the
-//! scalar path: `start_operation` validates, takes the admission and posting
+//! scalar path: the frontend first poll acquires bounded ingress and enqueues
+//! owned input without calling the provider. A later `RdmaEngineDriver` poll
+//! invokes `start_operation`, which validates, takes the admission and posting
 //! guards, reserves the local direction, registry slot, and CQ credit, posts
-//! once, and reconciles the outcome before the future can observe anything.
-//! No later poll, and no `Drop`, ever calls the provider.
+//! once, and reconciles the outcome. No frontend poll or `Drop` calls the
+//! provider.
 //!
 //! `FutureState` stays private so the pre-post, in-flight, and resolved stages
 //! cannot be assembled or skipped from outside. That is why the sibling-test
@@ -36,10 +38,16 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, RwLockReadGuard};
+use std::sync::{Arc, Mutex, RwLockReadGuard, Weak};
 use std::task::{Context, Poll};
 
-use crate::v2::engine::registry::OperationToken;
+use futures_util::task::AtomicWaker;
+use tokio::sync::OwnedSemaphorePermit;
+
+use crate::v2::engine::reactor::CommandIngress;
+use crate::v2::engine::registry::lock_unpoison;
+use crate::v2::engine::registry::{ConnectionToken, Lookup, OperationToken};
+use crate::v2::engine::session::SessionManager;
 use crate::v2::error::{Error, Result};
 use crate::v2::mr::{Mr, RemoteMr};
 use crate::v2::op::Completion;
@@ -62,25 +70,40 @@ use super::validation::ValidatedOperation;
 /// longer access the MR. Timeout, QP ERR, driver loss, and CQ emptiness alone
 /// are not release boundaries.
 ///
-/// The first poll performs the synchronous `ibv_post_send` or `ibv_post_recv`
-/// call. Provider posting has no wall-clock latency guarantee even though
-/// completion is asynchronous.
+/// The first poll only performs bounded command admission. The explicit engine
+/// driver later performs `ibv_post_send` or `ibv_post_recv`; those provider
+/// calls have no wall-clock latency guarantee even though completion is
+/// asynchronous.
 pub struct RdmaOperation {
     state: FutureState,
 }
 
 enum FutureState {
-    PrePost {
-        shared: Arc<IoCore>,
-        connection: Arc<EstablishedIoConnection>,
+    PreAdmission {
+        commands: Weak<CommandIngress>,
+        manager: Weak<SessionManager>,
+        connection: ConnectionToken,
+        shared: Weak<IoCore>,
         kind: OperationKind,
         mr: Option<Mr>,
         remote: Option<RemoteMr>,
         range: Option<(usize, usize)>,
     },
-    InFlight {
-        shared: Arc<IoCore>,
-        operation: Arc<OperationState>,
+    Waiting {
+        commands: Arc<CommandIngress>,
+        manager: Weak<SessionManager>,
+        connection: ConnectionToken,
+        permit: Pin<Box<dyn Future<Output = Option<OwnedSemaphorePermit>> + Send>>,
+        shared: Weak<IoCore>,
+        kind: OperationKind,
+        mr: Option<Mr>,
+        remote: Option<RemoteMr>,
+        range: Option<(usize, usize)>,
+    },
+    Queued {
+        commands: Weak<CommandIngress>,
+        command: Weak<OperationCommand>,
+        completion: Arc<OperationCommandCompletion>,
     },
     Immediate(Option<(Result<Completion>, Option<Mr>)>),
     Done,
@@ -90,17 +113,21 @@ impl Unpin for RdmaOperation {}
 
 impl RdmaOperation {
     pub(in crate::v2::engine) fn new(
-        shared: Arc<IoCore>,
-        connection: Arc<EstablishedIoConnection>,
+        commands: Weak<CommandIngress>,
+        manager: Weak<SessionManager>,
+        connection: ConnectionToken,
+        shared: Weak<IoCore>,
         kind: OperationKind,
         mr: Mr,
         remote: Option<RemoteMr>,
         range: Option<(usize, usize)>,
     ) -> Self {
         Self {
-            state: FutureState::PrePost {
-                shared,
+            state: FutureState::PreAdmission {
+                commands,
+                manager,
                 connection,
+                shared,
                 kind,
                 mr: Some(mr),
                 remote,
@@ -116,8 +143,14 @@ impl RdmaOperation {
     /// `state` and `FutureState` private instead of widening them for tests.
     #[cfg(test)]
     pub(super) fn from_in_flight(shared: Arc<IoCore>, operation: Arc<OperationState>) -> Self {
+        let completion = Arc::new(OperationCommandCompletion::new());
+        completion.install(StartResult::InFlight(operation), Arc::downgrade(&shared));
         Self {
-            state: FutureState::InFlight { shared, operation },
+            state: FutureState::Queued {
+                commands: Weak::new(),
+                command: Weak::new(),
+                completion,
+            },
         }
     }
 }
@@ -128,33 +161,105 @@ impl Future for RdmaOperation {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         loop {
             match &mut self.state {
-                FutureState::PrePost { .. } => {
+                FutureState::PreAdmission { .. } => {
                     let pending = std::mem::replace(&mut self.state, FutureState::Done);
-                    let FutureState::PrePost {
-                        shared,
+                    let FutureState::PreAdmission {
+                        commands,
+                        manager,
                         connection,
+                        shared,
                         kind,
-                        mut mr,
+                        mr,
                         remote,
                         range,
                     } = pending
                     else {
                         return Poll::Ready((Err(Error::DriverShutdown), None));
                     };
-                    let Some(mr) = mr.take() else {
-                        return Poll::Ready((Err(Error::DriverShutdown), None));
+                    let Some(commands) = commands.upgrade() else {
+                        self.state = FutureState::Immediate(Some((Err(Error::DriverShutdown), mr)));
+                        continue;
                     };
-                    self.state =
-                        match start_operation(&shared, &connection, kind, mr, remote, range) {
-                            StartResult::InFlight(operation) => {
-                                FutureState::InFlight { shared, operation }
-                            }
-                            StartResult::Immediate(output) => FutureState::Immediate(Some(output)),
-                        };
+                    let permit = Box::pin(commands.operation_acquire());
+                    self.state = FutureState::Waiting {
+                        commands,
+                        manager,
+                        connection,
+                        permit,
+                        shared,
+                        kind,
+                        mr,
+                        remote,
+                        range,
+                    };
                 }
-                FutureState::InFlight { operation, .. } => {
-                    operation.register_waker(cx.waker());
-                    if let Some(output) = operation.take_output() {
+                FutureState::Waiting { permit, .. } => {
+                    let Poll::Ready(permit) = permit.as_mut().poll(cx) else {
+                        return Poll::Pending;
+                    };
+                    let pending = std::mem::replace(&mut self.state, FutureState::Done);
+                    let FutureState::Waiting {
+                        commands,
+                        manager,
+                        connection,
+                        shared,
+                        kind,
+                        mut mr,
+                        remote,
+                        range,
+                        ..
+                    } = pending
+                    else {
+                        unreachable!("operation admission state changed while polling");
+                    };
+                    let Some(permit) = permit else {
+                        let error = shared
+                            .upgrade()
+                            .and_then(|shared| shared.admission_error())
+                            .unwrap_or(Error::DriverShutdown);
+                        self.state = FutureState::Immediate(Some((Err(error), mr)));
+                        continue;
+                    };
+                    let Some(shared) = shared.upgrade() else {
+                        self.state = FutureState::Immediate(Some((Err(Error::DriverShutdown), mr)));
+                        continue;
+                    };
+                    let Some(manager) = manager.upgrade() else {
+                        self.state = FutureState::Immediate(Some((Err(Error::DriverShutdown), mr)));
+                        continue;
+                    };
+                    let Some(mr) = mr.take() else {
+                        self.state =
+                            FutureState::Immediate(Some((Err(Error::DriverShutdown), None)));
+                        continue;
+                    };
+                    let completion = Arc::new(OperationCommandCompletion::new());
+                    completion.register(cx.waker());
+                    let command = Arc::new(OperationCommand::new(
+                        Arc::downgrade(&shared),
+                        connection,
+                        kind,
+                        mr,
+                        remote,
+                        range,
+                        Arc::clone(&completion),
+                    ));
+                    if let Err(error) =
+                        commands.enqueue_operation(&manager, Arc::clone(&command), permit)
+                    {
+                        command.cancel_before_execution(error);
+                    }
+                    commands.publish_command_work();
+                    cx.waker().wake_by_ref();
+                    self.state = FutureState::Queued {
+                        commands: Arc::downgrade(&commands),
+                        command: Arc::downgrade(&command),
+                        completion,
+                    };
+                    return Poll::Pending;
+                }
+                FutureState::Queued { completion, .. } => {
+                    if let Poll::Ready(output) = completion.poll(cx) {
                         self.state = FutureState::Done;
                         return Poll::Ready(output);
                     }
@@ -176,7 +281,215 @@ impl Future for RdmaOperation {
 impl Drop for RdmaOperation {
     fn drop(&mut self) {
         let state = std::mem::replace(&mut self.state, FutureState::Done);
-        if let FutureState::InFlight { shared, operation } = state
+        if let FutureState::Queued {
+            commands,
+            command,
+            completion,
+        } = state
+        {
+            completion.cancel();
+            if let (Some(commands), Some(command)) = (commands.upgrade(), command.upgrade()) {
+                commands.cancel_operation(&command);
+            }
+        }
+    }
+}
+
+struct OperationInput {
+    shared: Weak<IoCore>,
+    connection: ConnectionToken,
+    kind: OperationKind,
+    mr: Mr,
+    remote: Option<RemoteMr>,
+    range: Option<(usize, usize)>,
+}
+
+pub(in crate::v2::engine) struct OperationCommand {
+    input: Mutex<Option<OperationInput>>,
+    completion: Arc<OperationCommandCompletion>,
+}
+
+impl OperationCommand {
+    fn new(
+        shared: Weak<IoCore>,
+        connection: ConnectionToken,
+        kind: OperationKind,
+        mr: Mr,
+        remote: Option<RemoteMr>,
+        range: Option<(usize, usize)>,
+        completion: Arc<OperationCommandCompletion>,
+    ) -> Self {
+        Self {
+            input: Mutex::new(Some(OperationInput {
+                shared,
+                connection,
+                kind,
+                mr,
+                remote,
+                range,
+            })),
+            completion,
+        }
+    }
+
+    pub(in crate::v2::engine) fn execute(&self, manager: &SessionManager) {
+        let Some(input) = lock_unpoison(&self.input).take() else {
+            return;
+        };
+        let Some(shared) = input.shared.upgrade() else {
+            self.completion.install(
+                StartResult::Immediate((Err(Error::DriverShutdown), Some(input.mr))),
+                Weak::new(),
+            );
+            return;
+        };
+        let connection = match manager.connections.lookup(input.connection) {
+            Lookup::Occupied(connection) => Arc::clone(&connection.io),
+            Lookup::Duplicate | Lookup::Stale | Lookup::Unknown | Lookup::Retired => {
+                self.completion.install(
+                    StartResult::Immediate((Err(Error::TransportClosed), Some(input.mr))),
+                    Arc::downgrade(&shared),
+                );
+                return;
+            }
+        };
+        if self.completion.is_cancelled() {
+            self.completion.install(
+                StartResult::Immediate((Err(Error::DriverShutdown), Some(input.mr))),
+                Arc::downgrade(&shared),
+            );
+            return;
+        }
+        let result = start_operation(
+            &shared,
+            &connection,
+            input.kind,
+            input.mr,
+            input.remote,
+            input.range,
+        );
+        self.completion.install(result, Arc::downgrade(&shared));
+    }
+
+    pub(in crate::v2::engine) fn cancel_before_execution(&self, error: Error) {
+        let Some(input) = lock_unpoison(&self.input).take() else {
+            self.completion.cancel();
+            return;
+        };
+        self.completion.install(
+            StartResult::Immediate((Err(error), Some(input.mr))),
+            input.shared,
+        );
+    }
+}
+
+enum OperationCommandResult {
+    Pending,
+    InFlight {
+        shared: Weak<IoCore>,
+        operation: Arc<OperationState>,
+    },
+    Immediate(Option<(Result<Completion>, Option<Mr>)>),
+    Taken,
+}
+
+struct OperationCommandCompletion {
+    state: Mutex<OperationCommandResult>,
+    cancelled: std::sync::atomic::AtomicBool,
+    waker: AtomicWaker,
+}
+
+impl OperationCommandCompletion {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(OperationCommandResult::Pending),
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+            waker: AtomicWaker::new(),
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    fn register(&self, waker: &std::task::Waker) {
+        self.waker.register(waker);
+    }
+
+    fn install(&self, result: StartResult, shared: Weak<IoCore>) {
+        let mut state = lock_unpoison(&self.state);
+        *state = match result {
+            StartResult::InFlight(operation) => {
+                OperationCommandResult::InFlight { shared, operation }
+            }
+            StartResult::Immediate(output) => OperationCommandResult::Immediate(Some(output)),
+        };
+        let cancelled = self.is_cancelled();
+        let in_flight = match &*state {
+            OperationCommandResult::InFlight { shared, operation } if cancelled => {
+                Some((shared.clone(), Arc::clone(operation)))
+            }
+            _ => None,
+        };
+        drop(state);
+        if let Some((shared, operation)) = in_flight
+            && let Some(shared) = shared.upgrade()
+            && operation.cancel(&shared)
+        {
+            shared.schedule_reclamation(operation.token());
+        }
+        self.waker.wake();
+    }
+
+    fn poll(&self, cx: &mut Context<'_>) -> Poll<(Result<Completion>, Option<Mr>)> {
+        loop {
+            let in_flight = {
+                let mut state = lock_unpoison(&self.state);
+                match &mut *state {
+                    OperationCommandResult::Pending => {
+                        self.waker.register(cx.waker());
+                        return Poll::Pending;
+                    }
+                    OperationCommandResult::Immediate(output) => {
+                        let output = output
+                            .take()
+                            .unwrap_or_else(|| (Err(Error::DriverShutdown), None));
+                        *state = OperationCommandResult::Taken;
+                        return Poll::Ready(output);
+                    }
+                    OperationCommandResult::InFlight { operation, .. } => Arc::clone(operation),
+                    OperationCommandResult::Taken => {
+                        return Poll::Ready((Err(Error::DriverShutdown), None));
+                    }
+                }
+            };
+            in_flight.register_waker(cx.waker());
+            if let Some(output) = in_flight.take_output() {
+                *lock_unpoison(&self.state) = OperationCommandResult::Taken;
+                return Poll::Ready(output);
+            }
+            return Poll::Pending;
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        let in_flight = {
+            let mut state = lock_unpoison(&self.state);
+            match &mut *state {
+                OperationCommandResult::InFlight { shared, operation } => {
+                    Some((shared.clone(), Arc::clone(operation)))
+                }
+                OperationCommandResult::Immediate(output) => {
+                    drop(output.take());
+                    *state = OperationCommandResult::Taken;
+                    None
+                }
+                OperationCommandResult::Pending | OperationCommandResult::Taken => None,
+            }
+        };
+        if let Some((shared, operation)) = in_flight
+            && let Some(shared) = shared.upgrade()
             && operation.cancel(&shared)
         {
             shared.schedule_reclamation(operation.token());

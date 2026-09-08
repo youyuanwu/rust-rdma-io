@@ -680,8 +680,11 @@ fn validation_failure_is_a_zero_call_full_rollback() {
         .register_memory(64, AccessIntent::LocalOnly)
         .unwrap();
     let mut operation = connection.send(mr, Some((63, 2)));
+    assert!(poll_once(&mut operation).is_pending());
+    assert_eq!(poster.calls(), 0, "first poll must not call the provider");
+    engine.shared.commands.service_turn(&engine.shared);
     let Poll::Ready((result, returned)) = poll_once(&mut operation) else {
-        panic!("invalid range must fail synchronously")
+        panic!("invalid range must fail after driver command service")
     };
     assert!(matches!(result, Err(Error::InvalidConfig(_))));
     assert!(returned.is_some());
@@ -692,10 +695,89 @@ fn validation_failure_is_a_zero_call_full_rollback() {
 
     let mut operation = connection.send(returned.unwrap(), None);
     assert!(poll_once(&mut operation).is_pending());
+    engine.shared.commands.service_turn(&engine.shared);
     let token = poster.tokens()[0];
     complete(&shared.session, &connection.state, token, IBV_WC_SEND);
     drop(operation);
     drop(connection);
+    drop(driver);
+    drop(engine);
+}
+
+#[test]
+fn queued_operation_cancellation_releases_ingress_and_posts_nothing() {
+    let Some((engine, driver, shared)) = production_engine(2, 2, 2) else {
+        return;
+    };
+    let poster = Arc::new(ScriptedPoster::new(
+        &shared.session,
+        51,
+        ScriptedPost::Accepted,
+    ));
+    let second_poster = Arc::new(ScriptedPoster::new(
+        &shared.session,
+        52,
+        ScriptedPost::Accepted,
+    ));
+    let connection = scripted_connection(&shared.session, Arc::clone(&poster), 1, 1);
+    let second_connection = scripted_connection(&shared.session, Arc::clone(&second_poster), 1, 1);
+    let first_mr = connection
+        .register_memory(64, AccessIntent::LocalOnly)
+        .unwrap();
+    let second_mr = connection
+        .register_memory(64, AccessIntent::LocalOnly)
+        .unwrap();
+    let third_mr = second_connection
+        .register_memory(64, AccessIntent::LocalOnly)
+        .unwrap();
+    let mut first = connection.send(first_mr, None);
+    let mut second = connection.recv(second_mr, None);
+    let mut third = second_connection.send(third_mr, None);
+
+    assert!(poll_once(&mut first).is_pending());
+    assert!(poll_once(&mut second).is_pending());
+    assert!(poll_once(&mut third).is_pending());
+    assert_eq!(engine.shared.commands.pending_operations(), 2);
+    assert_eq!(engine.shared.commands.available_operation_permits(), 0);
+    assert_eq!(poster.calls(), 0);
+
+    drop(first);
+    assert_eq!(engine.shared.commands.pending_operations(), 1);
+    assert_eq!(
+        engine.shared.commands.available_operation_permits(),
+        0,
+        "the released permit is handed directly to the oldest waiter"
+    );
+    assert!(poll_once(&mut third).is_pending());
+    assert_eq!(engine.shared.commands.pending_operations(), 2);
+    assert_eq!(poster.calls(), 0);
+
+    engine.shared.commands.service_turn(&engine.shared);
+    engine.shared.commands.service_turn(&engine.shared);
+    assert_eq!(poster.calls(), 1);
+    assert_eq!(second_poster.calls(), 1);
+    complete(
+        &shared.session,
+        &connection.state,
+        poster.tokens()[0],
+        IBV_WC_RECV,
+    );
+    complete(
+        &shared.session,
+        &second_connection.state,
+        second_poster.tokens()[0],
+        IBV_WC_SEND,
+    );
+    for operation in [&mut second, &mut third] {
+        let Poll::Ready((result, returned)) = poll_once(operation) else {
+            panic!("driver-serviced operation did not complete")
+        };
+        result.unwrap();
+        assert!(returned.is_some());
+        drop(returned);
+    }
+    drop(connection);
+    drop(second_connection);
     drop(driver);
     drop(engine);
 }
@@ -755,9 +837,12 @@ fn local_direction_exhaustion_posts_nothing_and_preserves_global_capacity() {
         .unwrap();
     let mut first = connection.send(first_mr, None);
     assert!(poll_once(&mut first).is_pending());
+    engine.shared.commands.service_turn(&engine.shared);
     let mut second = connection.send(second_mr, None);
+    assert!(poll_once(&mut second).is_pending());
+    engine.shared.commands.service_turn(&engine.shared);
     let Poll::Ready((result, returned)) = poll_once(&mut second) else {
-        panic!("local exhaustion must be synchronous")
+        panic!("local exhaustion must resolve after driver command service")
     };
     assert!(matches!(result, Err(Error::CapacityExhausted)));
     assert!(returned.is_some());
@@ -807,12 +892,16 @@ fn operation_global_exhaustion_precedes_and_preserves_the_cq_invariant() {
     );
     assert!(poll_once(&mut send).is_pending());
     assert!(poll_once(&mut recv).is_pending());
+    engine.shared.commands.service_turn(&engine.shared);
+    engine.shared.commands.service_turn(&engine.shared);
     let mut rejected = second.send(
         second.register_memory(64, AccessIntent::LocalOnly).unwrap(),
         None,
     );
+    assert!(poll_once(&mut rejected).is_pending());
+    engine.shared.commands.service_turn(&engine.shared);
     let Poll::Ready((result, returned)) = poll_once(&mut rejected) else {
-        panic!("global operation exhaustion must be synchronous")
+        panic!("global operation exhaustion must resolve after driver command service")
     };
     assert!(matches!(result, Err(Error::CapacityExhausted)));
     assert!(returned.is_some());
@@ -854,8 +943,10 @@ fn wholly_unaccepted_post_restores_mr_slot_local_and_cq_reservations() {
             .unwrap(),
         None,
     );
+    assert!(poll_once(&mut operation).is_pending());
+    engine.shared.commands.service_turn(&engine.shared);
     let Poll::Ready((result, returned)) = poll_once(&mut operation) else {
-        panic!("provider-proven rejection must return immediately")
+        panic!("provider-proven rejection must return after driver command service")
     };
     assert!(matches!(result, Err(Error::PostFailed(_))));
     assert!(returned.is_some());
@@ -1260,8 +1351,10 @@ fn ambiguous_acceptance_retains_mr_identity_slot_and_cq_until_exact_dispatch() {
         .unwrap();
     let recorder = DestructionRecorder::arm(8);
     let mut operation = connection.send(mr, None);
+    assert!(poll_once(&mut operation).is_pending());
+    engine.shared.commands.service_turn(&engine.shared);
     let Poll::Ready((result, returned)) = poll_once(&mut operation) else {
-        panic!("ambiguous post reports its contextual error immediately")
+        panic!("ambiguous post reports its contextual error after driver command service")
     };
     assert!(matches!(result, Err(Error::PostFailed(_))));
     assert!(returned.is_none());
@@ -1321,8 +1414,10 @@ fn completion_dispatched_during_post_commits_and_releases_exactly_once() {
             .unwrap(),
         None,
     );
+    assert!(poll_once(&mut operation).is_pending());
+    engine.shared.commands.service_turn(&engine.shared);
     let Poll::Ready((result, returned)) = poll_once(&mut operation) else {
-        panic!("the early exact CQE must be delivered by the first poll")
+        panic!("the early exact CQE must be delivered after driver command service")
     };
     result.unwrap();
     assert!(returned.is_some());
@@ -1705,6 +1800,7 @@ fn cancellation_and_dispatch_race_releases_each_mr_and_reservation_once() {
             None,
         );
         assert!(poll_once(&mut operation).is_pending());
+        engine.shared.commands.service_turn(&engine.shared);
         let token = poster.tokens()[iteration];
         let barrier = Arc::new(Barrier::new(3));
         std::thread::scope(|scope| {
@@ -1785,6 +1881,8 @@ async fn driver_drop_wakes_all_waiters_and_retains_accepted_mrs_fail_closed() {
     let mut recv = Box::pin(connection.recv(recv_mr, None));
     assert!(send.as_mut().poll(&mut cx).is_pending());
     assert!(recv.as_mut().poll(&mut cx).is_pending());
+    engine.shared.commands.service_turn(&engine.shared);
+    engine.shared.commands.service_turn(&engine.shared);
     let mut shutdown = Box::pin(engine.shutdown());
     assert!(shutdown.as_mut().poll(&mut cx).is_pending());
     let mut rejected = connection.send(rejected_mr, None);

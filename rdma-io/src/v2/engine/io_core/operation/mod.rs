@@ -4,7 +4,7 @@ mod accounting;
 mod batch;
 mod completion;
 mod effects;
-mod future;
+pub(in crate::v2::engine) mod future;
 mod reclamation;
 mod state;
 #[cfg(test)]

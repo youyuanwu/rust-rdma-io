@@ -116,14 +116,17 @@ impl RdmaConnection {
         self.memory.register(len, access)
     }
 
-    /// Create a two-sided SEND operation submitted on first poll.
+    /// Create a two-sided SEND operation admitted on first poll and posted by
+    /// a later engine-driver poll.
     ///
     /// The optional `(offset, length)` selects a checked MR range. Awaiting the
     /// future returns `(Result<Completion>, Option<Mr>)`.
     pub fn send(&self, mr: Mr, range: Option<(usize, usize)>) -> RdmaOperation {
         RdmaOperation::new(
-            Arc::clone(&self.io_core),
-            Arc::clone(&self.io),
+            self.session.command_ingress(),
+            self.session.manager(),
+            self.session.token(),
+            Arc::downgrade(&self.io_core),
             OperationKind::Send,
             mr,
             None,
@@ -131,11 +134,14 @@ impl RdmaConnection {
         )
     }
 
-    /// Create a two-sided RECV operation submitted on first poll.
+    /// Create a two-sided RECV operation admitted on first poll and posted by
+    /// a later engine-driver poll.
     pub fn recv(&self, mr: Mr, range: Option<(usize, usize)>) -> RdmaOperation {
         RdmaOperation::new(
-            Arc::clone(&self.io_core),
-            Arc::clone(&self.io),
+            self.session.command_ingress(),
+            self.session.manager(),
+            self.session.token(),
+            Arc::downgrade(&self.io_core),
             OperationKind::Recv,
             mr,
             None,
@@ -143,11 +149,14 @@ impl RdmaConnection {
         )
     }
 
-    /// Create an RDMA WRITE operation submitted on first poll.
+    /// Create an RDMA WRITE operation admitted on first poll and posted by a
+    /// later engine-driver poll.
     pub fn write(&self, mr: Mr, remote: RemoteMr, range: Option<(usize, usize)>) -> RdmaOperation {
         RdmaOperation::new(
-            Arc::clone(&self.io_core),
-            Arc::clone(&self.io),
+            self.session.command_ingress(),
+            self.session.manager(),
+            self.session.token(),
+            Arc::downgrade(&self.io_core),
             OperationKind::Write,
             mr,
             Some(remote),
@@ -155,11 +164,14 @@ impl RdmaConnection {
         )
     }
 
-    /// Create an RDMA READ operation submitted on first poll.
+    /// Create an RDMA READ operation admitted on first poll and posted by a
+    /// later engine-driver poll.
     pub fn read(&self, mr: Mr, remote: RemoteMr, range: Option<(usize, usize)>) -> RdmaOperation {
         RdmaOperation::new(
-            Arc::clone(&self.io_core),
-            Arc::clone(&self.io),
+            self.session.command_ingress(),
+            self.session.manager(),
+            self.session.token(),
+            Arc::downgrade(&self.io_core),
             OperationKind::Read,
             mr,
             Some(remote),

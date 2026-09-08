@@ -25,6 +25,7 @@ use crate::wc::WorkCompletion;
 use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
 pub(super) use operation::CqeReject;
 pub use operation::RdmaOperation;
+pub(in crate::v2::engine) use operation::future::OperationCommand;
 pub(super) use operation::{
     CommittedIoCoreEffects, IoCoreEffects, OperationQuarantineEffect, QpReclaimCapability,
     post_io_recv_batch, post_io_send,

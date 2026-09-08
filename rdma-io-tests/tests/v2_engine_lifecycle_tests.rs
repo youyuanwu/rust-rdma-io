@@ -323,6 +323,10 @@ async fn run_missing_flush_cqe_qp_destroy_fallback(mode: CompletionMode) {
         Poll::Ready(())
     })
     .await;
+    wait_until("driver did not post the retained receive", || {
+        server_engine.diagnostics().accepted_operations == 1
+    })
+    .await;
     let accepted = server_resources.accepted_operation_wr_ids(&server).unwrap();
     assert_eq!(accepted.len(), 1);
     let old_wr_id = accepted[0];
@@ -366,6 +370,10 @@ async fn run_missing_flush_cqe_qp_destroy_fallback(mode: CompletionMode) {
     futures_util::future::poll_fn(|cx| {
         assert!(recv_b.as_mut().poll(cx).is_pending());
         Poll::Ready(())
+    })
+    .await;
+    wait_until("driver did not post the replacement receive", || {
+        server_engine.diagnostics().accepted_operations == 1
     })
     .await;
     let accepted_b = server_resources
@@ -478,6 +486,10 @@ async fn run_shutdown_qp_destroy_fallback(mode: CompletionMode) {
         Poll::Ready(())
     })
     .await;
+    wait_until("driver did not post the quarantined receive", || {
+        server_engine.diagnostics().accepted_operations == 1
+    })
+    .await;
     let suppression = server_resources
         .suppress_next_connection_cqe(&server)
         .unwrap();
@@ -547,6 +559,10 @@ async fn run_qp_destroy_failure_quarantine(mode: CompletionMode) {
     futures_util::future::poll_fn(|cx| {
         assert!(recv.as_mut().poll(cx).is_pending());
         Poll::Ready(())
+    })
+    .await;
+    wait_until("driver did not post the destroy-failure receive", || {
+        server_engine.diagnostics().accepted_operations == 1
     })
     .await;
     let suppression = server_resources

@@ -603,7 +603,11 @@ impl EngineShared {
     ) -> Result<Self> {
         let admission = Arc::new(RwLock::new(()));
         let work_signal = Arc::new(WorkSignal::new());
-        let commands = CommandIngress::new(config.max_live_connections, Arc::clone(&work_signal));
+        let commands = CommandIngress::new(
+            config.max_live_connections,
+            config.max_inflight_operations,
+            Arc::clone(&work_signal),
+        );
         let memory = io::MemoryRegistrar::from_resources(resource_refs.as_ref());
         #[cfg(any(test, feature = "test-hooks"))]
         let test_driver = Arc::new(driver::test_api::TestDriverState::new());

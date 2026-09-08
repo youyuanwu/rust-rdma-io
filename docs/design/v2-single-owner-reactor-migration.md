@@ -429,3 +429,30 @@ Serialized validation on 2026-09-08:
 - RXE/SIW connections: 11 tests per provider passed;
 - RXE/SIW listeners: 3 tests per provider passed; and
 - RXE/SIW lifecycle: 11 tests per provider passed.
+
+## Phase 3 Evidence
+
+Public scalar SEND/RECV/WRITE/READ futures now acquire one bounded operation
+ingress permit and enqueue owned operation input. Their admitting poll never
+calls the provider; a later `RdmaEngineDriver` poll invokes the extracted
+authoritative scalar backend. The backend still performs the original
+validation, local-credit, generational operation-slot, CQ-credit, provider
+post, exact-prefix/ambiguous reconciliation, accepted-set, completion, and
+reclamation transitions. Crate-private protocol batch posting is unchanged.
+
+Tests were updated only where they previously assumed provider posting during
+the first frontend poll. Replacement assertions first prove that the admitting
+poll leaves the provider call count at zero, then service the driver command
+boundary and apply the existing provider-safety assertions. Provider lifecycle
+tests wait for the accepted-operation diagnostic before deliberately
+suppressing a CQE or closing a connection; this preserves the original
+accepted-WR invariant under deferred posting.
+
+Serialized validation on 2026-09-08:
+
+- scalar operation unit tests: 34 passed;
+- all v2 engine unit tests: 192 passed;
+- RXE/SIW operations: 1 test per provider passed;
+- RXE/SIW driver flush gate: 3 tests per provider passed;
+- RXE/SIW connections: 11 tests per provider passed; and
+- RXE/SIW lifecycle: 11 tests per provider passed.

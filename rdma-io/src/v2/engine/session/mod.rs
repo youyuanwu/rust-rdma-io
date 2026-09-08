@@ -273,6 +273,18 @@ impl SessionConnection {
         }
     }
 
+    pub(in crate::v2::engine) fn command_ingress(&self) -> Weak<CommandIngress> {
+        self.commands.clone()
+    }
+
+    pub(in crate::v2::engine) fn manager(&self) -> Weak<SessionManager> {
+        self.manager.clone()
+    }
+
+    pub(in crate::v2::engine) fn token(&self) -> ConnectionToken {
+        self.token
+    }
+
     pub(crate) async fn close(&self) -> Result<()> {
         self.request_close();
         loop {

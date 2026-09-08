@@ -507,7 +507,16 @@ async fn run_operation_admission_shutdown_barrier(mode: CompletionMode) {
         .build()
         .unwrap();
     let resources = engine.test_resources().unwrap();
-    let driver_task = tokio::spawn(driver);
+    // Operation provider entry moved from the caller thread to the engine
+    // driver. Run that driver on a dedicated runtime so the synchronous test
+    // barrier below cannot block the task that must reach it.
+    let driver_task = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(driver)
+    });
     let (server, client) =
         establish_pair(&engine, &resources, RdmaConnectionConfig::default(), true).await;
     let recorder = DestructionRecorder::arm(64);
@@ -580,7 +589,7 @@ async fn run_operation_admission_shutdown_barrier(mode: CompletionMode) {
     server_result.unwrap();
     client_result.unwrap();
     shutdown_result.unwrap();
-    driver_task.await.unwrap().unwrap();
+    driver_task.join().unwrap().unwrap();
 
     let diagnostics = engine.diagnostics();
     assert_eq!(diagnostics.lifecycle, RdmaEngineLifecycle::Terminated);

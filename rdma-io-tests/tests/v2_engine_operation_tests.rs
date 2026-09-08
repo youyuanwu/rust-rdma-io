@@ -14,12 +14,22 @@ fn software_device_name() -> Option<String> {
         .find(|name| name.starts_with("rxe") || name.starts_with("siw"))
 }
 
-async fn post_once_then_cancel(operation: &mut std::pin::Pin<Box<rdma_io::v2::RdmaOperation>>) {
+async fn post_once_then_cancel(
+    operation: &mut std::pin::Pin<Box<rdma_io::v2::RdmaOperation>>,
+    engine: &rdma_io::v2::RdmaEngine,
+) {
     poll_fn(|cx| {
         assert!(operation.as_mut().poll(cx).is_pending());
         Poll::Ready(())
     })
     .await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while engine.diagnostics().accepted_operations == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("driver did not post the admitted operation");
 }
 
 async fn wait_for_no_accepted(engine: &rdma_io::v2::RdmaEngine) {
@@ -85,7 +95,7 @@ async fn run_owned_operations(mode: CompletionMode) {
 
     let cancelled_recv = server.register_memory(64, AccessIntent::LocalOnly).unwrap();
     let mut cancelled = Box::pin(server.recv(cancelled_recv, None));
-    post_once_then_cancel(&mut cancelled).await;
+    post_once_then_cancel(&mut cancelled, &engine).await;
     drop(cancelled);
     let cancelled_diagnostics = engine.diagnostics();
     assert_eq!(cancelled_diagnostics.accepted_operations, 1);
@@ -136,7 +146,7 @@ async fn run_owned_operations(mode: CompletionMode) {
 
     let flushed_recv = server.register_memory(64, AccessIntent::LocalOnly).unwrap();
     let mut flushed = Box::pin(server.recv(flushed_recv, None));
-    post_once_then_cancel(&mut flushed).await;
+    post_once_then_cancel(&mut flushed, &engine).await;
     drop(flushed);
     resources.transition_connection_to_error(&server).unwrap();
     wait_for_no_accepted(&engine).await;
