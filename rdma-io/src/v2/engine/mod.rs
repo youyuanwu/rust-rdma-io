@@ -38,6 +38,7 @@ pub(crate) mod io;
 mod io_core;
 mod lifecycle;
 mod progress;
+mod reactor;
 mod registry;
 mod resources;
 mod scheduler;
@@ -67,6 +68,7 @@ pub use driver::{
 pub use io_core::RdmaOperation;
 use io_core::{IoCore, IoDriverSignal, IoProgress};
 use lifecycle::MemoizedTerminalResult;
+use reactor::CommandIngress;
 use registry::{lock_unpoison, write_unpoison};
 use resources::{EngineResourceRefs, EngineResources};
 use scheduler::OwnerScheduler;
@@ -282,7 +284,7 @@ impl RdmaEngine {
     /// deadline is 30 seconds; unresolved accepted WR bundles return
     /// [`Error::EngineWedged`] and remain retained fail-closed.
     pub async fn shutdown(&self) -> Result<()> {
-        self.shared.request_shutdown();
+        self.shared.request_shutdown_command();
         loop {
             let notified = self.shared.terminal_notify.notified();
             tokio::pin!(notified);
@@ -312,6 +314,7 @@ impl RdmaEngine {
     pub async fn connect(&self, address: std::net::SocketAddr) -> Result<RdmaConnection> {
         session::cm::connect(
             Arc::clone(&self.shared.session),
+            Arc::clone(&self.shared.commands),
             address,
             RdmaConnectionConfig::default(),
         )
@@ -328,7 +331,13 @@ impl RdmaEngine {
         address: std::net::SocketAddr,
         config: RdmaConnectionConfig,
     ) -> Result<RdmaConnection> {
-        session::cm::connect(Arc::clone(&self.shared.session), address, config).await
+        session::cm::connect(
+            Arc::clone(&self.shared.session),
+            Arc::clone(&self.shared.commands),
+            address,
+            config,
+        )
+        .await
     }
 
     pub(crate) async fn connect_with_io_setup<F>(
@@ -342,6 +351,7 @@ impl RdmaEngine {
     {
         session::cm::connect_with_setup(
             Arc::clone(&self.shared.session),
+            Arc::clone(&self.shared.commands),
             address,
             config,
             Box::new(setup),
@@ -369,7 +379,13 @@ impl RdmaEngine {
         address: std::net::SocketAddr,
         config: RdmaListenerConfig,
     ) -> Result<RdmaListener> {
-        session::listener::listen(Arc::clone(&self.shared.session), address, config).await
+        session::listener::listen(
+            Arc::clone(&self.shared.session),
+            Arc::clone(&self.shared.commands),
+            address,
+            config,
+        )
+        .await
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -386,7 +402,7 @@ impl RdmaEngine {
 impl Drop for RdmaEngine {
     fn drop(&mut self) {
         if self.shared.frontend_count.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.shared.request_shutdown();
+            self.shared.request_shutdown_command();
         }
     }
 }
@@ -449,6 +465,7 @@ struct EngineShared {
     failure_retained: AtomicBool,
     frontend_count: AtomicUsize,
     work_signal: Arc<WorkSignal>,
+    commands: Arc<CommandIngress>,
     // Notify stores only live Notified futures and wakes every concurrent
     // shutdown waiter without retaining registrations from dropped futures.
     terminal_notify: Notify,
@@ -573,6 +590,7 @@ impl EngineShared {
     fn into_shared(self) -> Arc<Self> {
         let shared = Arc::new(self);
         shared.session.bind_self();
+        shared.session.bind_commands(&shared.commands);
         let session_runtime: Arc<dyn SessionEngineRuntime> = shared.clone();
         shared.session.bind_engine(&session_runtime);
         shared
@@ -585,6 +603,7 @@ impl EngineShared {
     ) -> Result<Self> {
         let admission = Arc::new(RwLock::new(()));
         let work_signal = Arc::new(WorkSignal::new());
+        let commands = CommandIngress::new(config.max_live_connections, Arc::clone(&work_signal));
         let memory = io::MemoryRegistrar::from_resources(resource_refs.as_ref());
         #[cfg(any(test, feature = "test-hooks"))]
         let test_driver = Arc::new(driver::test_api::TestDriverState::new());
@@ -623,6 +642,7 @@ impl EngineShared {
             failure_retained: AtomicBool::new(false),
             frontend_count: AtomicUsize::new(1),
             work_signal,
+            commands,
             terminal_notify: Notify::new(),
             terminal: Mutex::new(None),
             pending_terminal: Mutex::new(None),
@@ -634,10 +654,25 @@ impl EngineShared {
         })
     }
 
+    fn request_shutdown_command(&self) {
+        // Admission closes synchronously so no old-path operation can cross
+        // the shutdown boundary before the driver consumes the control
+        // command. Provider and teardown progress still require the driver.
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.test_driver.record_shutdown_attempt();
+        self.begin_shutdown_admission(Error::DriverShutdown, true);
+        self.commands.request_shutdown();
+    }
+
+    #[cfg(test)]
     fn request_shutdown(&self) {
         #[cfg(any(test, feature = "test-hooks"))]
         self.test_driver.record_shutdown_attempt();
-        self.mark_shutdown_requested();
+        self.begin_shutdown_admission(Error::DriverShutdown, true);
+        self.start_shutdown_progress();
+    }
+
+    fn start_shutdown_progress(&self) {
         if !self
             .shutdown_deadline_scheduled
             .swap(true, Ordering::AcqRel)
@@ -653,14 +688,26 @@ impl EngineShared {
             .publish(driver::IO_WORK | driver::SESSION_WORK);
     }
 
-    fn mark_shutdown_requested(&self) -> bool {
-        let _admission = write_unpoison(&self.session.admission);
-        if self.shutdown_requested.swap(true, Ordering::AcqRel) {
-            return false;
+    fn begin_shutdown_admission(&self, error: Error, drain_commands: bool) -> bool {
+        let first = {
+            let _admission = write_unpoison(&self.session.admission);
+            if self.shutdown_requested.swap(true, Ordering::AcqRel) {
+                false
+            } else {
+                self.io_core.close_admission(Some(error.clone()));
+                self.transition_shutdown_requested();
+                true
+            }
+        };
+        if first {
+            // Semaphore closure and command completion can wake arbitrary
+            // tasks, so publication happens after the admission guard drops.
+            self.commands.close_admission();
+            if drain_commands {
+                self.commands.drain_ordinary(error);
+            }
         }
-        self.io_core.close_admission(Some(Error::DriverShutdown));
-        self.transition_shutdown_requested();
-        true
+        first
     }
 
     fn finish(&self, outcome: MemoizedTerminalResult) {
@@ -734,11 +781,11 @@ impl EngineShared {
     }
 
     fn begin_driver_failure(&self, error: Error) {
-        let outcome = MemoizedTerminalResult::from_error(error);
+        let outcome = MemoizedTerminalResult::from_error(error.clone());
         let mut pending = lock_unpoison(&self.pending_terminal);
         if pending.is_none() {
             *pending = Some(outcome.clone());
-            self.mark_shutdown_requested();
+            self.begin_shutdown_admission(error.clone(), true);
             self.io_core.close_admission(outcome.error());
             self.io_core.begin_terminal_failure(outcome);
         }
@@ -771,7 +818,7 @@ impl EngineShared {
         if self.outcome().is_some() {
             return;
         }
-        self.mark_shutdown_requested();
+        let first_shutdown = self.begin_shutdown_admission(Error::DriverShutdown, false);
         self.session.synchronously_prepare_driver_drop();
         let outstanding = self.io_core.accepted_count();
         let cm_owners = self
@@ -787,6 +834,9 @@ impl EngineShared {
                 cq_debt: outstanding,
             }
         };
+        if first_shutdown {
+            self.commands.drain_ordinary(error.clone());
+        }
         self.finish(MemoizedTerminalResult::from_error(error));
         Self::retain_after_failure(self);
     }

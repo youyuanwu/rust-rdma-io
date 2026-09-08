@@ -398,3 +398,34 @@ Baseline results on 2026-09-08 at
 - public API/shutdown tests: 8 passed;
 - driver-drop filter: 6 passed; and
 - `git diff --check`: passed.
+
+## Phase 2 Evidence
+
+Phase 2 introduces bounded connect/listen command lanes, coalesced
+generational connection-close control, shutdown control admission, and typed
+take-once connect/listen completion storage. The driver transfers at most one
+ordinary command and one connection control into the existing authoritative
+session backend per external poll. Accept, listener identity, listener close,
+and waiter/child/selected ownership remain unchanged.
+
+One provider test expectation changed without weakening its invariant:
+`shutdown_waits_for_connect_admission_publication_in_both_modes` now expects
+the live-connection gauge to be zero immediately after shutdown wins the
+admission race. The old path retained the pre-provider reservation in
+`CmState.pending` until driver cleanup; the new bounded command path drains the
+unstarted command and releases that same reservation synchronously when
+admission closes. The preserved invariant is stronger: the connect still
+returns `DriverShutdown`, performs no provider work after shutdown wins, leaks
+no reservation, and shutdown reaches the same clean terminal result.
+
+Serialized validation on 2026-09-08:
+
+- reactor command/completion tests: 8 passed;
+- session/CM/listener tests: 71 passed;
+- public API/shutdown tests: 11 passed;
+- driver-drop filter: 8 passed;
+- connection integration compile: passed;
+- RXE/SIW provider probe: 4 tests per provider passed;
+- RXE/SIW connections: 11 tests per provider passed;
+- RXE/SIW listeners: 3 tests per provider passed; and
+- RXE/SIW lifecycle: 11 tests per provider passed.

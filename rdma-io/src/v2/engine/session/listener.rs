@@ -10,6 +10,8 @@ use std::task::{Context, Poll};
 
 use super::super::io::{IoConnection, IoEventReceiver};
 use super::super::lifecycle::{MemoizedTerminalResult, TakeOnceResult};
+use super::super::reactor::CommandIngress;
+use super::super::reactor::completion::CommandCompletion;
 use super::super::registry::{lock_unpoison, read_unpoison};
 use super::super::{ConnectionSetup, RdmaConnection, RdmaConnectionConfig, SetupSummary};
 use super::connection::{ConnectionReservation, SharedCmId};
@@ -176,26 +178,33 @@ impl Drop for RdmaListener {
 
 pub(in crate::v2::engine) async fn listen(
     manager: Arc<SessionManager>,
+    commands: Arc<CommandIngress>,
     address: SocketAddr,
     config: RdmaListenerConfig,
 ) -> Result<RdmaListener> {
     config.validate()?;
+    let permit = commands
+        .acquire_listen()
+        .await
+        .ok_or_else(|| manager.admission_error().unwrap_or(Error::DriverShutdown))?;
     let admission = read_unpoison(&manager.admission);
     if let Some(error) = manager.admission_error() {
         return Err(error);
     }
     let request = Arc::new(ListenRequest::new(address, config));
-    manager.cm.enqueue_listen(Arc::clone(&request));
+    commands.enqueue_listen(Arc::clone(&request), permit);
     drop(admission);
-    manager.publish_session_work();
+    commands.publish_command_work();
     let waiter = ListenWaiter {
         manager: Arc::downgrade(&manager),
+        commands: Arc::downgrade(&commands),
         request: Arc::downgrade(&request),
         observer: Arc::clone(&request.observer),
         finished: false,
     };
     drop(request);
     drop(manager);
+    CommandIngress::yield_after_admission().await;
     waiter.await
 }
 
@@ -327,71 +336,42 @@ pub(in crate::v2::engine) struct ListenRequest {
 }
 
 struct ListenRequestObserver {
-    result: Mutex<TakeOnceResult<RdmaListener>>,
-    cancelled: AtomicBool,
-    waker: AtomicWaker,
+    completion: CommandCompletion<RdmaListener>,
 }
 
 impl ListenRequest {
-    fn new(address: SocketAddr, config: RdmaListenerConfig) -> Self {
+    pub(in crate::v2::engine) fn new(address: SocketAddr, config: RdmaListenerConfig) -> Self {
         Self {
             address,
             config,
             observer: Arc::new(ListenRequestObserver {
-                result: Mutex::new(TakeOnceResult::Pending),
-                cancelled: AtomicBool::new(false),
-                waker: AtomicWaker::new(),
+                completion: CommandCompletion::new(),
             }),
         }
     }
 
     pub(in crate::v2::engine) fn is_cancelled(&self) -> bool {
-        self.observer.cancelled.load(Ordering::Acquire)
+        self.observer.completion.is_cancelled()
     }
 
     pub(in crate::v2::engine) fn complete(&self, result: Result<RdmaListener>) {
-        let mut current = lock_unpoison(&self.observer.result);
-        if matches!(&*current, TakeOnceResult::Pending) {
-            *current = TakeOnceResult::Ready(result);
-            drop(current);
-            self.observer.waker.wake();
-        }
+        self.observer.completion.complete(result);
     }
 }
 
 impl ListenRequestObserver {
     fn take_result(&self) -> Option<Result<RdmaListener>> {
-        let mut current = lock_unpoison(&self.result);
-        match std::mem::replace(&mut *current, TakeOnceResult::Taken) {
-            TakeOnceResult::Ready(result) => Some(result),
-            TakeOnceResult::Pending => {
-                *current = TakeOnceResult::Pending;
-                None
-            }
-            TakeOnceResult::Taken => None,
-        }
+        self.completion.take_result()
     }
 
     fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
-        let mut current = lock_unpoison(&self.result);
-        let replacement = match std::mem::replace(&mut *current, TakeOnceResult::Taken) {
-            TakeOnceResult::Pending => TakeOnceResult::Ready(Err(Error::DriverShutdown)),
-            TakeOnceResult::Ready(Ok(listener)) => {
-                drop(listener);
-                TakeOnceResult::Ready(Err(Error::DriverShutdown))
-            }
-            TakeOnceResult::Ready(Err(error)) => TakeOnceResult::Ready(Err(error)),
-            TakeOnceResult::Taken => TakeOnceResult::Taken,
-        };
-        *current = replacement;
-        drop(current);
-        self.waker.wake();
+        drop(self.completion.cancel(Error::DriverShutdown));
     }
 }
 
 struct ListenWaiter {
     manager: Weak<super::SessionManager>,
+    commands: Weak<CommandIngress>,
     request: Weak<ListenRequest>,
     observer: Arc<ListenRequestObserver>,
     finished: bool,
@@ -405,7 +385,7 @@ impl Future for ListenWaiter {
             self.finished = true;
             return Poll::Ready(result);
         }
-        self.observer.waker.register(cx.waker());
+        self.observer.completion.register(cx.waker());
         if let Some(result) = self.observer.take_result() {
             self.finished = true;
             return Poll::Ready(result);
@@ -420,8 +400,13 @@ impl Drop for ListenWaiter {
             return;
         }
         self.observer.cancel();
-        if self.request.upgrade().is_none() {
+        let Some(request) = self.request.upgrade() else {
             return;
+        };
+        if let Some(commands) = self.commands.upgrade() {
+            if commands.cancel_listen(&request) {
+                return;
+            }
         }
         if let Some(manager) = self.manager.upgrade() {
             manager.publish_session_work();
@@ -1130,6 +1115,7 @@ mod tests {
         let baseline_engine_owners = Arc::strong_count(&engine.shared);
         let mut listen_future = Box::pin(listen(
             Arc::clone(&engine.shared.session),
+            Arc::clone(&engine.shared.commands),
             "127.0.0.1:0".parse().unwrap(),
             RdmaListenerConfig::default(),
         ));
@@ -1140,6 +1126,13 @@ mod tests {
             Arc::strong_count(&engine.shared),
             baseline_engine_owners,
             "suspended listen future must retain only weak session routing"
+        );
+        assert_eq!(engine.shared.commands.pending_listens(), 1);
+        drop(listen_future);
+        assert_eq!(engine.shared.commands.pending_listens(), 0);
+        assert_eq!(
+            engine.shared.commands.available_listen_permits(),
+            engine.shared.config.max_live_connections
         );
 
         let listener = ListenerState::test_only(4);
@@ -1163,6 +1156,43 @@ mod tests {
             Arc::strong_count(&queues.waiters[0]),
             1,
             "only SessionManager listener queues may strongly retain the accept record"
+        );
+    }
+
+    #[test]
+    fn command_ingress_services_listens_in_fifo_order_one_per_turn() {
+        let (engine, _driver) =
+            super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
+        let first_address = "127.0.0.1:0".parse().unwrap();
+        let second_address = "127.0.0.2:0".parse().unwrap();
+        let mut first = Box::pin(listen(
+            Arc::clone(&engine.shared.session),
+            Arc::clone(&engine.shared.commands),
+            first_address,
+            RdmaListenerConfig::default(),
+        ));
+        let mut second = Box::pin(listen(
+            Arc::clone(&engine.shared.session),
+            Arc::clone(&engine.shared.commands),
+            second_address,
+            RdmaListenerConfig::default(),
+        ));
+        let waker = futures_util::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
+        assert!(first.as_mut().poll(&mut context).is_pending());
+        assert!(second.as_mut().poll(&mut context).is_pending());
+        assert_eq!(engine.shared.commands.pending_listens(), 2);
+
+        engine.shared.commands.service_turn(&engine.shared);
+        assert_eq!(engine.shared.commands.pending_listens(), 1);
+        assert_eq!(
+            engine.shared.session.cm.pending_listen_addresses(),
+            vec![first_address]
+        );
+        engine.shared.commands.service_turn(&engine.shared);
+        assert_eq!(
+            engine.shared.session.cm.pending_listen_addresses(),
+            vec![first_address, second_address]
         );
     }
 

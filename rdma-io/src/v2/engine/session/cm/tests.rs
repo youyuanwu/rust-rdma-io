@@ -32,6 +32,7 @@ fn pending_connect_future_releases_engine_and_manager_record_owners() {
     let baseline_manager_owners = Arc::strong_count(&engine.shared.session);
     let mut connect = Box::pin(connect_with_setup(
         Arc::clone(&engine.shared.session),
+        Arc::clone(&engine.shared.commands),
         "127.0.0.1:7471".parse().unwrap(),
         RdmaConnectionConfig::default(),
         empty_connection_setup(),
@@ -58,13 +59,54 @@ fn pending_connect_future_releases_engine_and_manager_record_owners() {
         Arc::strong_count(&engine.shared.session),
         baseline_manager_owners
     );
+    assert_eq!(lock_unpoison(&engine.shared.session.cm.pending).len(), 0);
+    assert_eq!(engine.shared.commands.pending_connects(), 1);
+    drop(connect);
+    assert_eq!(engine.shared.commands.pending_connects(), 0);
+    assert_eq!(
+        engine.shared.commands.available_connect_permits(),
+        engine.shared.config.max_live_connections
+    );
+    assert_eq!(engine.diagnostics().live_connections, 0);
+}
+
+#[test]
+fn command_ingress_services_connects_in_fifo_order_one_per_turn() {
+    let (engine, _driver) =
+        super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
+    let first_address = "127.0.0.1:7471".parse().unwrap();
+    let second_address = "127.0.0.1:7472".parse().unwrap();
+    let mut first = Box::pin(connect_with_setup(
+        Arc::clone(&engine.shared.session),
+        Arc::clone(&engine.shared.commands),
+        first_address,
+        RdmaConnectionConfig::default(),
+        empty_connection_setup(),
+    ));
+    let mut second = Box::pin(connect_with_setup(
+        Arc::clone(&engine.shared.session),
+        Arc::clone(&engine.shared.commands),
+        second_address,
+        RdmaConnectionConfig::default(),
+        empty_connection_setup(),
+    ));
+    let waker = futures_util::task::noop_waker();
+    let mut context = Context::from_waker(&waker);
+    assert!(first.as_mut().poll(&mut context).is_pending());
+    assert!(second.as_mut().poll(&mut context).is_pending());
+    assert_eq!(engine.shared.commands.pending_connects(), 2);
+
+    engine.shared.commands.service_turn(&engine.shared);
+    assert_eq!(engine.shared.commands.pending_connects(), 1);
     let pending = lock_unpoison(&engine.shared.session.cm.pending);
     assert_eq!(pending.len(), 1);
-    assert_eq!(
-        Arc::strong_count(&pending[0]),
-        1,
-        "only SessionManager CM state may strongly retain the outbound record"
-    );
+    assert_eq!(pending[0].address, first_address);
+    drop(pending);
+
+    engine.shared.commands.service_turn(&engine.shared);
+    let pending = lock_unpoison(&engine.shared.session.cm.pending);
+    assert_eq!(pending.len(), 2);
+    assert_eq!(pending[1].address, second_address);
 }
 
 #[test]
@@ -605,6 +647,7 @@ fn delivery_replaces_the_frontend_with_weak_generational_route_state() {
     request.complete(Ok(connection));
     let mut waiter = Box::pin(ConnectWaiter {
         manager: Arc::downgrade(&engine.shared.session),
+        commands: Arc::downgrade(&engine.shared.commands),
         request: Arc::downgrade(&request),
         observer: Arc::clone(&request.observer),
         finished: false,

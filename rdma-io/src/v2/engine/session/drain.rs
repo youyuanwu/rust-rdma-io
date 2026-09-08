@@ -339,6 +339,7 @@ mod tests {
                 .draining,
             0
         );
+        engine.shared.commands.service_turn(&engine.shared);
 
         let driver_error = loop {
             match poll_once(Pin::new(&mut driver)) {
@@ -350,7 +351,10 @@ mod tests {
         let Poll::Ready(Err(close_error)) = poll_once(close.as_mut()) else {
             panic!("bounded terminal cleanup did not wake the connection close");
         };
-        assert!(matches!(driver_error, Error::Verbs(_)));
+        assert!(
+            matches!(driver_error, Error::Verbs(_)),
+            "unexpected driver error: {driver_error:?}"
+        );
         assert_eq!(close_error.to_string(), driver_error.to_string());
         assert_eq!(
             engine

@@ -7,49 +7,57 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 
-use futures_util::task::AtomicWaker;
-
 use super::{
     CmEventReject, CmEventSnapshot, CmRouteToken, CmState, ConnectionCmRoute,
     ConnectionReservation, ConnectionSetup, ContextRoute, EngineResources,
     EstablishedConnectionRoute, EventDisposition, Lookup, OutboundRoute, OutboundState,
-    RdmaConnection, RdmaConnectionConfig, SessionManager, SharedCmId, TakeOnceResult,
-    VerbsConnectionResources, build_qp, empty_connection_setup, install_reserved_connection,
-    is_failure_event, lock_unpoison, reserve_connection, run_setup_before_establish,
+    RdmaConnection, RdmaConnectionConfig, SessionManager, SharedCmId, VerbsConnectionResources,
+    build_qp, empty_connection_setup, install_reserved_connection, is_failure_event, lock_unpoison,
+    reserve_connection, run_setup_before_establish,
 };
 use crate::cm::{CmEventType, CmId, PortSpace};
+use crate::v2::engine::reactor::CommandIngress;
+use crate::v2::engine::reactor::completion::CommandCompletion;
 use crate::v2::error::{Error, Result};
 
 pub(in crate::v2::engine) async fn connect(
     shared: Arc<SessionManager>,
+    commands: Arc<CommandIngress>,
     address: SocketAddr,
     config: RdmaConnectionConfig,
 ) -> Result<RdmaConnection> {
-    connect_with_setup(shared, address, config, empty_connection_setup()).await
+    connect_with_setup(shared, commands, address, config, empty_connection_setup()).await
 }
 
 pub(in crate::v2::engine) async fn connect_with_setup(
     shared: Arc<SessionManager>,
+    commands: Arc<CommandIngress>,
     address: SocketAddr,
     config: RdmaConnectionConfig,
     setup: ConnectionSetup,
 ) -> Result<RdmaConnection> {
     shared.validate_connection_config(&config)?;
+    let permit = commands
+        .acquire_connect()
+        .await
+        .ok_or_else(|| shared.admission_error().unwrap_or(Error::DriverShutdown))?;
     let (admission, reservation) = reserve_connection(&shared)?;
     let request = Arc::new(OutboundRequest::new(address, config, setup, reservation));
     #[cfg(any(test, feature = "test-hooks"))]
     shared.pause_connect_before_enqueue();
-    shared.cm.enqueue(Arc::clone(&request));
+    commands.enqueue_connect(Arc::clone(&request), permit);
     drop(admission);
-    shared.publish_session_work();
+    commands.publish_command_work();
     let waiter = ConnectWaiter {
         manager: Arc::downgrade(&shared),
+        commands: Arc::downgrade(&commands),
         request: Arc::downgrade(&request),
         observer: Arc::clone(&request.observer),
         finished: false,
     };
     drop(request);
     drop(shared);
+    CommandIngress::yield_after_admission().await;
     waiter.await
 }
 
@@ -58,9 +66,7 @@ pub(super) fn start(
     resources: &EngineResources,
     request: Arc<OutboundRequest>,
 ) -> Result<bool> {
-    if request.observer.cancelled.load(Ordering::Acquire)
-        || state.shutting_down.load(Ordering::Acquire)
-    {
+    if request.observer.completion.is_cancelled() || state.shutting_down.load(Ordering::Acquire) {
         request.take_reservation();
         request.complete(Err(Error::DriverShutdown));
         return Ok(false);
@@ -257,7 +263,7 @@ fn handle_addr_resolved(
     else {
         return Ok(EventDisposition::Rejected(CmEventReject::Duplicate));
     };
-    if request.observer.cancelled.load(Ordering::Acquire) || shared.shutdown_requested() {
+    if request.observer.completion.is_cancelled() || shared.shutdown_requested() {
         state.defer_cm_id(cm_id);
         drop(reservation);
         state.retire_route(route, true);
@@ -301,7 +307,7 @@ fn handle_route_resolved(
     else {
         return Ok(EventDisposition::Rejected(CmEventReject::Duplicate));
     };
-    if request.observer.cancelled.load(Ordering::Acquire) || shared.shutdown_requested() {
+    if request.observer.completion.is_cancelled() || shared.shutdown_requested() {
         state.defer_cm_id(cm_id);
         drop(reservation);
         state.retire_route(route, true);
@@ -386,7 +392,7 @@ fn handle_route_resolved(
         setup,
         &connection,
         || {
-            if request.observer.cancelled.load(Ordering::Acquire) || shared.shutdown_requested() {
+            if request.observer.completion.is_cancelled() || shared.shutdown_requested() {
                 Err(Error::DriverShutdown)
             } else {
                 Ok(())
@@ -399,7 +405,7 @@ fn handle_route_resolved(
         fail_registered_connection(state, shared, route, request, connection, error)?;
         return Ok(EventDisposition::Handled);
     }
-    if request.observer.cancelled.load(Ordering::Acquire) || shared.shutdown_requested() {
+    if request.observer.completion.is_cancelled() || shared.shutdown_requested() {
         drop(verbs);
         fail_registered_connection(
             state,
@@ -457,7 +463,7 @@ fn handle_established(
     else {
         return Ok(EventDisposition::Rejected(CmEventReject::Duplicate));
     };
-    if request.observer.cancelled.load(Ordering::Acquire) || shared.shutdown_requested() {
+    if request.observer.completion.is_cancelled() || shared.shutdown_requested() {
         fail_registered_connection(
             state,
             shared,
@@ -555,7 +561,7 @@ fn handle_failure_event(
             reservation,
         } => {
             let shutdown_won =
-                request.observer.cancelled.load(Ordering::Acquire) || shared.shutdown_requested();
+                request.observer.completion.is_cancelled() || shared.shutdown_requested();
             state.defer_cm_id(cm_id);
             drop(reservation);
             state.retire_route(route, true);
@@ -667,7 +673,7 @@ fn handle_failure_event(
     Ok(EventDisposition::Handled)
 }
 
-pub(super) struct OutboundRequest {
+pub(in crate::v2::engine) struct OutboundRequest {
     pub(super) address: SocketAddr,
     pub(super) config: RdmaConnectionConfig,
     setup: Mutex<Option<ConnectionSetup>>,
@@ -678,10 +684,8 @@ pub(super) struct OutboundRequest {
 }
 
 pub(super) struct OutboundRequestObserver {
-    result: Mutex<TakeOnceResult<RdmaConnection>>,
-    pub(super) cancelled: AtomicBool,
+    completion: CommandCompletion<RdmaConnection>,
     pub(super) delivered: AtomicBool,
-    waker: AtomicWaker,
 }
 
 impl OutboundRequest {
@@ -697,10 +701,8 @@ impl OutboundRequest {
             setup: Mutex::new(Some(setup)),
             reservation: Mutex::new(Some(reservation)),
             observer: Arc::new(OutboundRequestObserver {
-                result: Mutex::new(TakeOnceResult::Pending),
-                cancelled: AtomicBool::new(false),
+                completion: CommandCompletion::new(),
                 delivered: AtomicBool::new(false),
-                waker: AtomicWaker::new(),
             }),
             cancellation_enqueued: AtomicBool::new(false),
             route_token: AtomicU64::new(0),
@@ -711,26 +713,16 @@ impl OutboundRequest {
         lock_unpoison(&self.setup).take()
     }
 
-    pub(super) fn take_reservation(&self) -> Option<ConnectionReservation> {
+    pub(in crate::v2::engine) fn take_reservation(&self) -> Option<ConnectionReservation> {
         lock_unpoison(&self.reservation).take()
     }
 
     pub(super) fn complete(&self, result: Result<RdmaConnection>) {
-        let mut current = lock_unpoison(&self.observer.result);
-        if matches!(&*current, TakeOnceResult::Pending) {
-            *current = TakeOnceResult::Ready(result);
-            drop(current);
-            self.observer.waker.wake();
-        }
+        self.observer.completion.complete(result);
     }
 
-    pub(super) fn complete_failure(&self, error: Error) {
-        let mut current = lock_unpoison(&self.observer.result);
-        if matches!(&*current, TakeOnceResult::Pending) {
-            *current = TakeOnceResult::Ready(Err(error));
-            drop(current);
-            self.observer.waker.wake();
-        }
+    pub(in crate::v2::engine) fn complete_failure(&self, error: Error) {
+        self.observer.completion.complete(Err(error));
     }
 
     pub(super) fn try_enqueue_cancellation(&self) -> bool {
@@ -748,40 +740,17 @@ impl OutboundRequest {
 
 impl OutboundRequestObserver {
     pub(super) fn take_result(&self) -> Option<Result<RdmaConnection>> {
-        let mut current = lock_unpoison(&self.result);
-        match std::mem::replace(&mut *current, TakeOnceResult::Taken) {
-            TakeOnceResult::Ready(result) => Some(result),
-            TakeOnceResult::Pending => {
-                *current = TakeOnceResult::Pending;
-                None
-            }
-            TakeOnceResult::Taken => None,
-        }
+        self.completion.take_result()
     }
 
     fn cancel(&self, error: Error) {
-        self.cancelled.store(true, Ordering::Release);
-        let mut current = lock_unpoison(&self.result);
-        let (replacement, undelivered) =
-            match std::mem::replace(&mut *current, TakeOnceResult::Taken) {
-                TakeOnceResult::Pending => (TakeOnceResult::Ready(Err(error)), None),
-                TakeOnceResult::Ready(Ok(connection)) => {
-                    (TakeOnceResult::Ready(Err(error)), Some(connection))
-                }
-                TakeOnceResult::Ready(Err(existing)) => {
-                    (TakeOnceResult::Ready(Err(existing)), None)
-                }
-                TakeOnceResult::Taken => (TakeOnceResult::Taken, None),
-            };
-        *current = replacement;
-        drop(current);
-        drop(undelivered);
-        self.waker.wake();
+        drop(self.completion.cancel(error));
     }
 }
 
 pub(super) struct ConnectWaiter {
     pub(super) manager: Weak<SessionManager>,
+    pub(super) commands: Weak<CommandIngress>,
     pub(super) request: Weak<OutboundRequest>,
     pub(super) observer: Arc<OutboundRequestObserver>,
     pub(super) finished: bool,
@@ -798,7 +767,7 @@ impl Future for ConnectWaiter {
             self.finished = true;
             return Poll::Ready(result);
         }
-        self.observer.waker.register(cx.waker());
+        self.observer.completion.register(cx.waker());
         if let Some(result) = self.observer.take_result() {
             if result.is_ok() {
                 self.mark_delivered();
@@ -828,10 +797,15 @@ impl Drop for ConnectWaiter {
             return;
         }
         self.observer.cancel(Error::DriverShutdown);
+        let Some(request) = self.request.upgrade() else {
+            return;
+        };
+        if let Some(commands) = self.commands.upgrade()
+            && commands.cancel_connect(&request)
+        {
+            return;
+        }
         if let Some(manager) = self.manager.upgrade() {
-            let Some(request) = self.request.upgrade() else {
-                return;
-            };
             manager.cm.enqueue_cancellation(request);
             manager.publish_session_work();
         }

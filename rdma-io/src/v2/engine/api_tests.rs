@@ -120,6 +120,152 @@ fn pending_shutdown_waiter_is_woken_when_driver_drops() {
 }
 
 #[test]
+fn pending_connect_command_is_woken_and_releases_admission_on_driver_drop() {
+    let (engine, driver) = test_engine_pair(CompletionMode::Readiness);
+    let counter = CountingWaker::new();
+    let waker = counter.waker();
+    let mut cx = TaskContext::from_waker(&waker);
+    let mut connect = Box::pin(engine.connect("127.0.0.1:9".parse().unwrap()));
+
+    assert!(Pin::new(&mut connect).poll(&mut cx).is_pending());
+    assert_eq!(engine.shared.commands.pending_connects(), 1);
+    assert_eq!(engine.diagnostics().live_connections, 1);
+    drop(driver);
+    assert!(matches!(
+        Pin::new(&mut connect).poll(&mut cx),
+        Poll::Ready(Err(Error::DriverShutdown))
+    ));
+    assert_eq!(engine.shared.commands.pending_connects(), 0);
+    assert_eq!(engine.diagnostics().live_connections, 0);
+    assert!(counter.count() >= 1);
+}
+
+#[tokio::test]
+async fn shutdown_accounts_for_ingress_and_backend_connect_listen_commands() {
+    let (engine, driver) = test_engine_pair(CompletionMode::Polling);
+    let waker = futures_util::task::noop_waker();
+    let mut cx = TaskContext::from_waker(&waker);
+    let mut connect_backend = Box::pin(engine.connect("127.0.0.1:9".parse().unwrap()));
+    let mut connect_ingress = Box::pin(engine.connect("127.0.0.1:10".parse().unwrap()));
+    let mut listen_backend = Box::pin(engine.listen(
+        "127.0.0.1:0".parse().unwrap(),
+        RdmaListenerConfig::default(),
+    ));
+    let mut listen_ingress = Box::pin(engine.listen(
+        "127.0.0.2:0".parse().unwrap(),
+        RdmaListenerConfig::default(),
+    ));
+    for future in [&mut connect_backend, &mut connect_ingress] {
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+    }
+    for future in [&mut listen_backend, &mut listen_ingress] {
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+    }
+    engine.shared.commands.service_turn(&engine.shared);
+    engine.shared.commands.service_turn(&engine.shared);
+    assert_eq!(engine.shared.commands.pending_connects(), 1);
+    assert_eq!(engine.shared.commands.pending_listens(), 1);
+
+    let mut shutdown = Box::pin(engine.shutdown());
+    assert!(shutdown.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(engine.shared.commands.pending_connects(), 0);
+    assert_eq!(engine.shared.commands.pending_listens(), 0);
+    // The unit fixture intentionally has no provider resources. Terminalize
+    // the two commands already transferred to the authoritative CM backend
+    // before polling the full driver; provider-backed tests exercise the same
+    // path through normal bounded shutdown progress.
+    engine.shared.session.cm.begin_shutdown(
+        &engine.shared.session,
+        &MemoizedTerminalResult::from_error(Error::DriverShutdown),
+    );
+
+    let mut driver_task = tokio::spawn(driver);
+    let (
+        connect_backend_result,
+        connect_ingress_result,
+        listen_backend_result,
+        listen_ingress_result,
+        shutdown_result,
+        driver_result,
+    ) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(
+            connect_backend.as_mut(),
+            connect_ingress.as_mut(),
+            listen_backend.as_mut(),
+            listen_ingress.as_mut(),
+            shutdown.as_mut(),
+            &mut driver_task,
+        )
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "shutdown command accounting matrix did not terminate: diagnostics={:?}, pending_routes={}, pending_connects={}, pending_listens={}, driver_finished={}",
+            engine.diagnostics(),
+            engine.shared.session.cm.pending_route_count(),
+            engine.shared.commands.pending_connects(),
+            engine.shared.commands.pending_listens(),
+            driver_task.is_finished(),
+        )
+    });
+    for result in [connect_backend_result, connect_ingress_result] {
+        assert!(matches!(result, Err(Error::DriverShutdown)));
+    }
+    for result in [listen_backend_result, listen_ingress_result] {
+        assert!(matches!(result, Err(Error::DriverShutdown)));
+    }
+    shutdown_result.unwrap();
+    driver_result.unwrap().unwrap();
+    assert_eq!(engine.diagnostics().live_connections, 0);
+}
+
+#[test]
+fn driver_drop_accounts_for_ingress_and_backend_connect_listen_commands() {
+    let (engine, driver) = test_engine_pair(CompletionMode::Polling);
+    let counter = CountingWaker::new();
+    let waker = counter.waker();
+    let mut cx = TaskContext::from_waker(&waker);
+    let mut connect_backend = Box::pin(engine.connect("127.0.0.1:9".parse().unwrap()));
+    let mut connect_ingress = Box::pin(engine.connect("127.0.0.1:10".parse().unwrap()));
+    let mut listen_backend = Box::pin(engine.listen(
+        "127.0.0.1:0".parse().unwrap(),
+        RdmaListenerConfig::default(),
+    ));
+    let mut listen_ingress = Box::pin(engine.listen(
+        "127.0.0.2:0".parse().unwrap(),
+        RdmaListenerConfig::default(),
+    ));
+    for future in [&mut connect_backend, &mut connect_ingress] {
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+    }
+    for future in [&mut listen_backend, &mut listen_ingress] {
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+    }
+    engine.shared.commands.service_turn(&engine.shared);
+    engine.shared.commands.service_turn(&engine.shared);
+    assert_eq!(engine.shared.commands.pending_connects(), 1);
+    assert_eq!(engine.shared.commands.pending_listens(), 1);
+
+    drop(driver);
+    for future in [&mut connect_backend, &mut connect_ingress] {
+        assert!(matches!(
+            future.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::DriverShutdown))
+        ));
+    }
+    for future in [&mut listen_backend, &mut listen_ingress] {
+        assert!(matches!(
+            future.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::DriverShutdown))
+        ));
+    }
+    assert_eq!(engine.shared.commands.pending_connects(), 0);
+    assert_eq!(engine.shared.commands.pending_listens(), 0);
+    assert_eq!(engine.diagnostics().live_connections, 0);
+    assert!(counter.count() >= 4);
+}
+
+#[test]
 fn dropped_shutdown_future_unregisters_its_waiter() {
     let (engine, driver) = test_engine_pair(CompletionMode::Readiness);
     let counter = CountingWaker::new();

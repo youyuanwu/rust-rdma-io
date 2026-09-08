@@ -24,6 +24,7 @@ use super::io_core::{IoProgress, IoSessionBridge};
 #[cfg(test)]
 use super::lifecycle::MemoizedTerminalResult;
 use super::progress::OwnerClass;
+use super::reactor::DriverTermination;
 use super::resources::EngineResources;
 use super::scheduler::OwnerScheduler;
 use super::session::SessionProgress;
@@ -33,6 +34,7 @@ use crate::v2::runtime::preflight_driver_runtime;
 
 pub(super) const IO_WORK: usize = 1 << 0;
 pub(super) const SESSION_WORK: usize = 1 << 1;
+pub(super) const COMMAND_WORK: usize = 1 << 2;
 
 fn earliest_deadline(
     io: Option<tokio::time::Instant>,
@@ -134,6 +136,19 @@ impl RdmaEngineDriver {
         }
         if published & SESSION_WORK != 0 {
             self.scheduler.mark_ready(OwnerClass::Session);
+        }
+    }
+
+    fn service_commands(&mut self, published: usize) {
+        if published & COMMAND_WORK == 0 {
+            return;
+        }
+        let report = self.shared.commands.service_turn(&self.shared);
+        if report.session_work {
+            self.scheduler.mark_ready(OwnerClass::Session);
+        }
+        if report.has_more {
+            self.shared.work_signal.publish(COMMAND_WORK);
         }
     }
 
@@ -246,6 +261,7 @@ impl Future for RdmaEngineDriver {
 
         let observed_epoch = self.shared.work_signal.epoch();
         let published = self.shared.work_signal.take();
+        self.service_commands(published);
         self.mark_published_work(published);
         if let Err(error) = self.poll_once(cx) {
             return self.fail(error, cx);
@@ -271,6 +287,12 @@ impl Future for RdmaEngineDriver {
                     .shared
                     .work_signal
                     .register_and_recheck(cx.waker(), observed_epoch);
+                if published & COMMAND_WORK != 0 {
+                    // The command source is consumed only at the beginning of
+                    // an external poll. Preserve a command bit observed during
+                    // the final register/recheck for that next poll.
+                    self.shared.work_signal.publish(COMMAND_WORK);
+                }
                 self.mark_published_work(published);
                 if self.scheduler.ready_count() > 0 {
                     cx.waker().wake_by_ref();
@@ -292,7 +314,7 @@ impl Future for RdmaEngineDriver {
 
 impl Drop for RdmaEngineDriver {
     fn drop(&mut self) {
-        self.shared.handle_driver_drop();
+        DriverTermination::terminate(&self.shared);
         self.release_resources();
     }
 }

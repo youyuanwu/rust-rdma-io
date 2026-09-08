@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 #[cfg(test)]
 use super::super::SetupSummary;
-use super::super::lifecycle::{MemoizedTerminalResult, TakeOnceResult};
+use super::super::lifecycle::MemoizedTerminalResult;
 use super::super::registry::{
     ConnectionToken, Lookup, PagedRegistry, RegistryToken, lock_unpoison,
 };
@@ -47,8 +47,7 @@ use event::CmDispatchRoute;
 use event::{CmEventReject, CmEventSnapshot, EventDisposition, is_failure_event};
 #[cfg(test)]
 use outbound::ConnectWaiter;
-use outbound::OutboundRequest;
-pub(in crate::v2::engine) use outbound::{connect, connect_with_setup};
+pub(in crate::v2::engine) use outbound::{OutboundRequest, connect, connect_with_setup};
 pub(in crate::v2::engine) use shutdown::CmShutdownCursor;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -132,12 +131,20 @@ impl CmState {
         })
     }
 
-    fn enqueue(&self, request: Arc<OutboundRequest>) {
+    pub(in crate::v2::engine) fn enqueue(&self, request: Arc<OutboundRequest>) {
         lock_unpoison(&self.pending).push_back(request);
     }
 
     pub(in crate::v2::engine) fn enqueue_listen(&self, request: Arc<ListenRequest>) {
         lock_unpoison(&self.pending_listens).push_back(request);
+    }
+
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn pending_listen_addresses(&self) -> Vec<std::net::SocketAddr> {
+        lock_unpoison(&self.pending_listens)
+            .iter()
+            .map(|request| request.address)
+            .collect()
     }
 
     pub(in crate::v2::engine) fn enqueue_listener_work(&self, listener: &Arc<ListenerState>) {

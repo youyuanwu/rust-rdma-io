@@ -464,7 +464,10 @@ async fn run_connect_admission_shutdown_barrier(mode: CompletionMode) {
         .expect("shutdown poll thread panicked");
     let admitted = engine.diagnostics();
     assert_eq!(admitted.lifecycle, RdmaEngineLifecycle::ShutdownRequested);
-    assert_eq!(admitted.live_connections, 1);
+    assert_eq!(
+        admitted.live_connections, 0,
+        "shutdown drains the pre-provider command and releases its reservation"
+    );
 
     let driver_task = tokio::spawn(driver);
     let (connect_result, shutdown_result) = tokio::time::timeout(Duration::from_secs(10), async {

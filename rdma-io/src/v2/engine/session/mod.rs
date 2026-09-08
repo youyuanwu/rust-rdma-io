@@ -39,6 +39,7 @@ use super::io_core::{
     CommittedIoCoreEffects, IoCore, IoCoreEffects, IoSessionBridge, OperationQuarantineEffect,
     QpReclaimCapability,
 };
+use super::reactor::CommandIngress;
 use super::registry::{ConnectionToken, Lookup, OperationToken, lock_unpoison};
 use super::{Result, SessionEngineRuntime};
 use crate::v2::error::Error;
@@ -145,6 +146,7 @@ impl SessionCloseState {
 #[derive(Clone)]
 pub(crate) struct SessionConnection {
     manager: Weak<SessionManager>,
+    commands: Weak<CommandIngress>,
     token: ConnectionToken,
     close: Arc<SessionCloseState>,
 }
@@ -253,19 +255,21 @@ impl SessionListener {
 impl SessionConnection {
     pub(super) fn new(
         manager: Weak<SessionManager>,
+        commands: Weak<CommandIngress>,
         token: ConnectionToken,
         close: Arc<SessionCloseState>,
     ) -> Self {
         Self {
             manager,
+            commands,
             token,
             close,
         }
     }
 
     pub(crate) fn request_close(&self) {
-        if let Some(manager) = self.manager.upgrade() {
-            manager.request_connection_close(self.token);
+        if let (Some(manager), Some(commands)) = (self.manager.upgrade(), self.commands.upgrade()) {
+            commands.request_connection_close(&manager, self.token);
         }
     }
 
@@ -331,6 +335,7 @@ pub(super) struct SessionManager {
     quarantines: Mutex<QuarantineState>,
     // Frontend capabilities retain only this weak self-reference.
     self_ref: OnceLock<Weak<SessionManager>>,
+    commands: OnceLock<Weak<CommandIngress>>,
     // The session owner can reach only the engine-wide operations exposed by
     // SessionEngineRuntime; it cannot recover the concrete composition root.
     engine: OnceLock<Weak<dyn SessionEngineRuntime>>,
@@ -368,6 +373,7 @@ impl SessionManager {
             shutdown_connection_close_started: AtomicBool::new(false),
             quarantines: Mutex::new(QuarantineState::default()),
             self_ref: OnceLock::new(),
+            commands: OnceLock::new(),
             engine: OnceLock::new(),
             config,
             provider,
@@ -385,6 +391,12 @@ impl SessionManager {
         self.self_ref
             .set(Arc::downgrade(self))
             .unwrap_or_else(|_| panic!("SessionManager self reference is bound exactly once"));
+    }
+
+    pub(super) fn bind_commands(&self, commands: &Arc<CommandIngress>) {
+        self.commands
+            .set(Arc::downgrade(commands))
+            .unwrap_or_else(|_| panic!("SessionManager command ingress is bound exactly once"));
     }
 
     pub(super) fn bind_engine(&self, engine: &Arc<dyn SessionEngineRuntime>) {
@@ -472,7 +484,7 @@ impl SessionManager {
         self.test_instrumentation.pause_connect_before_enqueue();
     }
 
-    fn request_connection_close(&self, token: ConnectionToken) {
+    pub(in crate::v2::engine) fn request_connection_close(&self, token: ConnectionToken) {
         let Lookup::Occupied(connection) = self.connections.lookup(token) else {
             return;
         };
@@ -485,7 +497,17 @@ impl SessionManager {
             .get()
             .expect("SessionManager self reference is bound before use")
             .clone();
-        SessionConnection::new(manager, connection.token, connection.close_state())
+        let commands = self
+            .commands
+            .get()
+            .expect("SessionManager command ingress is bound before use")
+            .clone();
+        SessionConnection::new(
+            manager,
+            commands,
+            connection.token,
+            connection.close_state(),
+        )
     }
 
     pub(super) fn listener_capability(&self, listener: &Arc<ListenerState>) -> SessionListener {
@@ -971,6 +993,8 @@ mod tests {
             "request capability must not retain ConnectionState or its resource bundle"
         );
         capability.request_close();
+        assert!(!connection.state.close_started());
+        engine.shared.commands.service_turn(&engine.shared);
         assert!(connection.state.close_started());
         assert!(connection.state.error_transition_complete());
     }
@@ -1014,6 +1038,7 @@ mod tests {
         );
         let capability = SessionConnection {
             manager: Weak::new(),
+            commands: Weak::new(),
             token: ConnectionToken {
                 slot: 0,
                 generation: 1,
