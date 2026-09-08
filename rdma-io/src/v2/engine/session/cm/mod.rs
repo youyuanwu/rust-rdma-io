@@ -6,6 +6,8 @@
 //! acknowledged before state ownership advances or any potentially blocking
 //! librdmacm/verbs call runs.
 
+mod event;
+
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -41,23 +43,9 @@ use crate::cm::{CmEventType, CmId, PortSpace};
 use crate::v2::error::{Error, Result};
 use crate::v2::qp::QpBuilder;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CmEventReject {
-    Stale,
-    Duplicate,
-    Unknown,
-    WrongId,
-    Unexpected,
-}
-
-fn record_cm_reject(manager: &SessionManager, reject: CmEventReject) {
-    #[cfg(any(test, feature = "test-hooks"))]
-    if !matches!(reject, CmEventReject::Duplicate) {
-        manager.rejected_cm_events.fetch_add(1, Ordering::Relaxed);
-    }
-    #[cfg(not(any(test, feature = "test-hooks")))]
-    let _ = (manager, reject);
-}
+#[cfg(test)]
+use event::CmDispatchRoute;
+use event::{CmEventReject, CmEventSnapshot, EventDisposition, is_failure_event};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct CmRouteToken {
@@ -396,61 +384,7 @@ impl CmState {
         shared: &SessionManager,
         resources: &EngineResources,
     ) -> Result<bool> {
-        let event = match resources.cm_event_channel.try_get_event() {
-            Ok(event) => event,
-            Err(crate::Error::WouldBlock) => return Ok(false),
-            Err(crate::Error::Verbs(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                return Ok(false);
-            }
-            Err(error) => return Err(Error::from_v1(error)),
-        };
-        let snapshot = CmEventSnapshot {
-            event_type: event.event_type(),
-            status: event.status(),
-            id: event.cm_id_raw() as usize,
-            listen_id: event.listen_id_raw() as usize,
-            context_key: event.context_key(),
-        };
-        let route = self.lookup_dispatch_route(snapshot);
-        event.ack_checked().map_err(Error::from_v1)?;
-
-        let route = match route {
-            Ok(route) => route,
-            Err(reject) => {
-                record_cm_reject(shared, reject);
-                if snapshot.event_type == CmEventType::ConnectRequest {
-                    self.reject_raw_child(
-                        resources,
-                        snapshot.id,
-                        InboundRejectReason::ListenerClosed,
-                    )?;
-                }
-                return Ok(true);
-            }
-        };
-        let disposition = match route {
-            CmDispatchRoute::Outbound(route) => {
-                self.handle_event(shared, resources, &route, snapshot)?
-            }
-            CmDispatchRoute::Inbound(route) => {
-                self.handle_inbound_event(shared, &route, snapshot)?
-            }
-            CmDispatchRoute::Listener(listener) => {
-                if snapshot.event_type == CmEventType::ConnectRequest {
-                    self.handle_connect_request(shared, resources, &listener, snapshot)?
-                } else {
-                    self.handle_listener_event(shared, &listener, snapshot)?
-                }
-            }
-        };
-        match disposition {
-            EventDisposition::Handled => {}
-            EventDisposition::IgnoredAfterShutdown => {}
-            EventDisposition::Rejected(reject) => {
-                record_cm_reject(shared, reject);
-            }
-        }
-        Ok(true)
+        event::try_process_event(self, shared, resources)
     }
 
     #[cfg(test)]
@@ -1823,87 +1757,20 @@ impl CmState {
         }
     }
 
+    #[cfg(test)]
     fn lookup_dispatch_route(
         &self,
         snapshot: CmEventSnapshot,
     ) -> std::result::Result<CmDispatchRoute, CmEventReject> {
-        if snapshot.event_type == CmEventType::ConnectRequest {
-            let token = lock_unpoison(&self.listener_ids)
-                .get(&snapshot.listen_id)
-                .copied()
-                .ok_or(CmEventReject::Unknown)?;
-            let listener = lock_unpoison(&self.listeners)
-                .get(&token)
-                .cloned()
-                .ok_or(CmEventReject::Stale)?;
-            return Ok(CmDispatchRoute::Listener(listener));
-        }
-        if snapshot.context_key == 0 {
-            return Err(CmEventReject::Unknown);
-        }
-        let route = lock_unpoison(&self.context_routes)
-            .get(&snapshot.context_key)
-            .copied()
-            .ok_or(CmEventReject::Unknown)?;
-        match route {
-            ContextRoute::Outbound { .. } => self
-                .lookup_event_route(snapshot)
-                .map(CmDispatchRoute::Outbound),
-            ContextRoute::Inbound { token, raw_id } => {
-                if raw_id != snapshot.id {
-                    return Err(CmEventReject::WrongId);
-                }
-                let route = match self.inbound_routes.lookup_cloned(token) {
-                    Lookup::Occupied(route) => route,
-                    Lookup::Duplicate => return Err(CmEventReject::Duplicate),
-                    Lookup::Stale | Lookup::Retired => return Err(CmEventReject::Stale),
-                    Lookup::Unknown => return Err(CmEventReject::Unknown),
-                };
-                if route.raw_id.load(Ordering::Acquire) != raw_id {
-                    return Err(CmEventReject::WrongId);
-                }
-                Ok(CmDispatchRoute::Inbound(route))
-            }
-            ContextRoute::Listener { token, raw_id } => {
-                if raw_id != snapshot.id {
-                    return Err(CmEventReject::WrongId);
-                }
-                let listener = lock_unpoison(&self.listeners)
-                    .get(&token)
-                    .cloned()
-                    .ok_or(CmEventReject::Stale)?;
-                Ok(CmDispatchRoute::Listener(listener))
-            }
-        }
+        event::lookup_dispatch_route(self, snapshot)
     }
 
+    #[cfg(test)]
     fn lookup_event_route(
         &self,
         snapshot: CmEventSnapshot,
     ) -> std::result::Result<Arc<OutboundRoute>, CmEventReject> {
-        if snapshot.context_key == 0 {
-            return Err(CmEventReject::Unknown);
-        }
-        let route = lock_unpoison(&self.context_routes)
-            .get(&snapshot.context_key)
-            .copied()
-            .ok_or(CmEventReject::Unknown)?;
-        let ContextRoute::Outbound { token, raw_id } = route else {
-            return Err(CmEventReject::Unexpected);
-        };
-        if raw_id != snapshot.id {
-            return Err(CmEventReject::WrongId);
-        }
-        let route = match self.routes.lookup_cloned(token) {
-            Lookup::Occupied(route) => route,
-            Lookup::Duplicate => return Err(CmEventReject::Duplicate),
-            Lookup::Stale | Lookup::Retired => return Err(CmEventReject::Stale),
-            Lookup::Unknown => return Err(CmEventReject::Unknown),
-        };
-        if route.raw_id.load(Ordering::Acquire) != raw_id {
-            return Err(CmEventReject::WrongId);
-        }
-        Ok(route)
+        event::lookup_event_route(self, snapshot)
     }
 
     fn handle_event(
@@ -2882,19 +2749,6 @@ fn build_qp(
         .build_with_cm(cm_id)
 }
 
-fn is_failure_event(event: CmEventType) -> bool {
-    matches!(
-        event,
-        CmEventType::AddrError
-            | CmEventType::RouteError
-            | CmEventType::ConnectError
-            | CmEventType::Unreachable
-            | CmEventType::Rejected
-            | CmEventType::DeviceRemoval
-            | CmEventType::AddrChange
-    )
-}
-
 fn terminal_error(outcome: &MemoizedTerminalResult) -> Error {
     match outcome.clone().into_result() {
         Err(error) => error,
@@ -2945,21 +2799,6 @@ fn injected_cm_result(error: Option<String>) -> Result<()> {
         Some(error) => Err(Error::Verbs(std::io::Error::other(error))),
         None => Ok(()),
     }
-}
-
-#[derive(Clone, Copy)]
-struct CmEventSnapshot {
-    event_type: CmEventType,
-    status: i32,
-    id: usize,
-    listen_id: usize,
-    context_key: usize,
-}
-
-enum EventDisposition {
-    Handled,
-    IgnoredAfterShutdown,
-    Rejected(CmEventReject),
 }
 
 enum RouteRetirement {
@@ -3034,12 +2873,6 @@ impl PendingCmDestruction {
             Self::Route(_) | Self::Connection { .. } => None,
         }
     }
-}
-
-enum CmDispatchRoute {
-    Outbound(Arc<OutboundRoute>),
-    Inbound(Arc<InboundRoute>),
-    Listener(Arc<ListenerState>),
 }
 
 struct InboundRoute {
