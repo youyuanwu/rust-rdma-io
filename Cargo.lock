@@ -1481,6 +1481,7 @@ dependencies = [
  "futures-util",
  "libc",
  "rdma-io-sys",
+ "syn 2.0.119",
  "thiserror",
  "tokio",
  "tracing",
