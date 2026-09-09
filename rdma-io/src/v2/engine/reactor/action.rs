@@ -160,7 +160,9 @@ impl DeferredProtocolActions {
             actions: ReactorActions {
                 // Every early-completed operation can detach a connection
                 // drain wake, an I/O event, and an operation wake.
-                capacity: operations.saturating_mul(3),
+                // One additional resource-free submission receipt reports
+                // the reconciled provider disposition to the protocol owner.
+                capacity: operations.saturating_mul(3).saturating_add(1),
                 ..ReactorActions::default()
             },
         }

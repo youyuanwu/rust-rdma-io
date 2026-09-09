@@ -397,6 +397,10 @@ impl CommandIngress {
         Ok(count)
     }
 
+    pub(in crate::v2::engine) fn operation_capacity(&self) -> usize {
+        self.operation_capacity
+    }
+
     pub(in crate::v2::engine) fn operation_batch_acquire(
         self: &Arc<Self>,
         count: usize,
@@ -1237,6 +1241,29 @@ mod tests {
         assert_eq!(probe.executed.load(Ordering::Acquire), 1);
         assert_eq!(probe.dropped.load(Ordering::Acquire), 1);
         assert_eq!(commands.available_operation_permits(), capacity);
+    }
+
+    #[tokio::test]
+    async fn pending_protocol_payload_is_bounded_by_operation_capacity() {
+        let (engine, _driver) = test_engine_pair(CompletionMode::Polling);
+        let commands = Arc::clone(&engine.shared.commands);
+        let capacity = commands.available_operation_permits();
+        assert!(capacity > 1);
+        let blocker = commands.operation_batch_acquire(capacity).await.unwrap();
+        let adapter = protocol_admission(&engine);
+
+        let first = protocol_probe(false);
+        let (command, _events) = test_protocol_command(&adapter, capacity - 1, 0, first.clone());
+        assert!(adapter.submit(command).is_ok());
+
+        let overflow = protocol_probe(false);
+        let (command, _events) = test_protocol_command(&adapter, 2, 0, overflow.clone());
+        assert!(matches!(
+            adapter.submit(command),
+            Err((crate::v2::Error::CapacityExhausted, _))
+        ));
+        assert_eq!(first.dropped.load(Ordering::Acquire), 0);
+        drop(blocker);
     }
 
     #[tokio::test]

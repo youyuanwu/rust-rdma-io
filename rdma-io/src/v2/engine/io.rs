@@ -146,7 +146,7 @@ impl IoConnection {
     fn submit_protocol(&self, command: ProtocolCommand) -> IoSubmissionDisposition {
         let count = command.len();
         match self.submit(command) {
-            Ok(()) => IoSubmissionDisposition::Admitted { operations: count },
+            Ok(()) => IoSubmissionDisposition::Pending { operations: count },
             Err((error, command)) => command.reject(error),
         }
     }
@@ -184,15 +184,34 @@ impl IoConnection {
         if let Err(error) = commands.validate_operation_batch(command.len()) {
             return Err((error, command));
         }
+        let operation_capacity = commands.operation_capacity();
+        let operations = command.len();
+        if self
+            .admission
+            .pending_operations
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                pending
+                    .checked_add(operations)
+                    .filter(|next| *next <= operation_capacity)
+            })
+            .is_err()
+        {
+            return Err((Error::CapacityExhausted, command));
+        }
         let permit = Box::pin(commands.operation_batch_acquire(command.len()));
         let mut pending = lock_unpoison(&self.admission.pending);
         if !self.admission.open.load(Ordering::Acquire) {
+            self.admission
+                .pending_operations
+                .fetch_sub(operations, Ordering::AcqRel);
             return Err((Error::TransportClosed, command));
         }
         pending.push_back(ProtocolAdmission {
             command: Some(command),
             permit,
             polled: false,
+            pending_operations: Arc::clone(&self.admission.pending_operations),
+            operations,
         });
         drop(pending);
         self.admission.waker.wake();
@@ -273,10 +292,20 @@ struct ProtocolAdmission {
     command: Option<ProtocolCommand>,
     permit: Pin<Box<dyn Future<Output = Option<OwnedSemaphorePermit>> + Send>>,
     polled: bool,
+    pending_operations: Arc<std::sync::atomic::AtomicUsize>,
+    operations: usize,
+}
+
+impl Drop for ProtocolAdmission {
+    fn drop(&mut self) {
+        self.pending_operations
+            .fetch_sub(self.operations, Ordering::AcqRel);
+    }
 }
 
 struct ProtocolAdmissionState {
     pending: Mutex<VecDeque<ProtocolAdmission>>,
+    pending_operations: Arc<std::sync::atomic::AtomicUsize>,
     waker: AtomicWaker,
     open: Arc<AtomicBool>,
 }
@@ -285,6 +314,7 @@ impl Default for ProtocolAdmissionState {
     fn default() -> Self {
         Self {
             pending: Mutex::new(VecDeque::new()),
+            pending_operations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             waker: AtomicWaker::new(),
             open: Arc::new(AtomicBool::new(true)),
         }
@@ -367,11 +397,27 @@ impl IoConnectionTestAdmission<'_> {
         if let Err(error) = commands.validate_operation_batch(command.len()) {
             return Err((error, command));
         }
+        let operation_capacity = commands.operation_capacity();
+        let operations = command.len();
+        if self
+            .state
+            .pending_operations
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                pending
+                    .checked_add(operations)
+                    .filter(|next| *next <= operation_capacity)
+            })
+            .is_err()
+        {
+            return Err((Error::CapacityExhausted, command));
+        }
         let permit = Box::pin(commands.operation_batch_acquire(command.len()));
         lock_unpoison(&self.state.pending).push_back(ProtocolAdmission {
             command: Some(command),
             permit,
             polled: false,
+            pending_operations: Arc::clone(&self.state.pending_operations),
+            operations,
         });
         self.state.waker.wake();
         Ok(())
@@ -622,40 +668,38 @@ impl ProtocolCommand {
             self.reject_into(Error::TransportClosed, actions);
             return;
         }
-        match self.batch {
-            ProtocolBatch::Recv(requests) => {
-                connections
-                    .with_connection_io_mut(self.connection, |connection, connection_io, poster| {
-                        io_core::post_io_recv_batch_into(
-                            io_core,
-                            connection,
-                            connection_io,
-                            poster,
-                            &self.events,
-                            requests,
-                            actions,
-                        );
-                    })
-                    .expect("open protocol connection retains its I/O bundle");
-            }
-            ProtocolBatch::Send(request) => {
-                connections
-                    .with_connection_io_mut(self.connection, |connection, connection_io, poster| {
-                        io_core::post_io_send_into(
-                            io_core,
-                            connection,
-                            connection_io,
-                            poster,
-                            &self.events,
-                            request,
-                            actions,
-                        );
-                    })
-                    .expect("open protocol connection retains its I/O bundle");
-            }
+        let events = self.events.clone();
+        let disposition = match self.batch {
+            ProtocolBatch::Recv(requests) => connections
+                .with_connection_io_mut(self.connection, |connection, connection_io, poster| {
+                    io_core::post_io_recv_batch_into(
+                        io_core,
+                        connection,
+                        connection_io,
+                        poster,
+                        &self.events,
+                        requests,
+                        actions,
+                    )
+                })
+                .expect("open protocol connection retains its I/O bundle"),
+            ProtocolBatch::Send(request) => connections
+                .with_connection_io_mut(self.connection, |connection, connection_io, poster| {
+                    io_core::post_io_send_into(
+                        io_core,
+                        connection,
+                        connection_io,
+                        poster,
+                        &self.events,
+                        request,
+                        actions,
+                    )
+                })
+                .expect("open protocol connection retains its I/O bundle"),
             #[cfg(test)]
             ProtocolBatch::Test(_) => unreachable!("test protocol command returned above"),
-        }
+        };
+        actions.push_event(events.submission(disposition));
     }
 
     pub(in crate::v2::engine) fn reject(self, error: Error) -> IoSubmissionDisposition {
@@ -681,15 +725,27 @@ impl ProtocolCommand {
     }
 
     pub(in crate::v2::engine) fn reject_into(self, error: Error, actions: &mut ReactorActions) {
-        for event in self.rejected_events(error) {
+        let count = self.len();
+        let events = self.events.clone();
+        for event in self.rejected_events(error.clone()) {
             actions.push_event(event);
         }
+        actions.push_event(events.submission(IoSubmissionDisposition::FullyUnaccepted {
+            proven_unaccepted: count,
+            error,
+        }));
     }
 
     pub(in crate::v2::engine) fn cancel_into(self, actions: &mut ReactorActions) {
+        let count = self.len();
+        let events = self.events.clone();
         for event in self.cancelled_events() {
             actions.push_event(event);
         }
+        actions.push_event(events.submission(IoSubmissionDisposition::FullyUnaccepted {
+            proven_unaccepted: count,
+            error: Error::DriverShutdown,
+        }));
     }
 
     fn rejected_events(self, error: Error) -> Vec<PendingIoEvent> {
@@ -912,7 +968,9 @@ impl IoCancellation {
 /// Exact post-reconciliation ownership classification.
 #[derive(Debug)]
 pub(crate) enum IoSubmissionDisposition {
-    Admitted {
+    /// Frontend ownership is bounded, but no provider-acceptance claim exists
+    /// until the reactor publishes a matching submission event.
+    Pending {
         operations: usize,
     },
     AllAccepted {
@@ -939,12 +997,12 @@ pub(crate) enum IoSubmissionDisposition {
 
 impl IoSubmissionDisposition {
     pub(crate) fn all_accepted(&self) -> bool {
-        matches!(self, Self::Admitted { .. } | Self::AllAccepted { .. })
+        matches!(self, Self::AllAccepted { .. })
     }
 
     pub(crate) fn accepted(&self) -> usize {
         match self {
-            Self::Admitted { operations } => *operations,
+            Self::Pending { .. } => 0,
             Self::AllAccepted { accepted } | Self::ExactPrefix { accepted, .. } => *accepted,
             Self::FullyUnaccepted { .. } => 0,
             Self::RetainedAmbiguous { retained, .. }
@@ -954,7 +1012,7 @@ impl IoSubmissionDisposition {
 
     pub(crate) fn potentially_accepted(&self) -> bool {
         match self {
-            Self::Admitted { operations } => *operations != 0,
+            Self::Pending { .. } => false,
             Self::AllAccepted { accepted } => *accepted != 0,
             Self::ExactPrefix { accepted, .. } => *accepted != 0,
             Self::FullyUnaccepted { .. } => false,
@@ -965,7 +1023,7 @@ impl IoSubmissionDisposition {
 
     pub(crate) fn error(&self) -> Option<&Error> {
         match self {
-            Self::Admitted { .. } | Self::AllAccepted { .. } => None,
+            Self::Pending { .. } | Self::AllAccepted { .. } => None,
             Self::ExactPrefix { error, .. }
             | Self::FullyUnaccepted { error, .. }
             | Self::RetainedAmbiguous { error, .. }
@@ -981,7 +1039,7 @@ impl IoSubmissionDisposition {
             | Self::FullyUnaccepted {
                 proven_unaccepted, ..
             } => *proven_unaccepted,
-            Self::Admitted { .. }
+            Self::Pending { .. }
             | Self::AllAccepted { .. }
             | Self::RetainedAmbiguous { .. }
             | Self::RetainedAfterEarlyCompletion { .. } => 0,
@@ -1065,6 +1123,7 @@ pub(crate) enum IoTerminalEvent {
 /// One event from the connection-scoped I/O port.
 pub(crate) enum IoEvent {
     Completion(IoCompletionEvent),
+    Submission(IoSubmissionDisposition),
     Terminal(IoTerminalEvent),
 }
 
@@ -1133,6 +1192,13 @@ impl IoEventSender {
         PendingIoEvent {
             sender: self.clone(),
             event: IoEvent::Terminal(event),
+        }
+    }
+
+    fn submission(&self, disposition: IoSubmissionDisposition) -> PendingIoEvent {
+        PendingIoEvent {
+            sender: self.clone(),
+            event: IoEvent::Submission(disposition),
         }
     }
 }

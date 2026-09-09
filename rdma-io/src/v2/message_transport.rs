@@ -119,7 +119,7 @@ use super::engine::{
     RdmaConnection, RdmaConnectionConfig, RdmaEngine, RdmaListener,
     io::{
         BorrowedSetupIo, IoCancellation, IoConnection, IoEvent, IoEventReceiver,
-        IoOperationContext, IoRecvRequest, IoSendRequest, IoTerminalEvent,
+        IoOperationContext, IoRecvRequest, IoSendRequest, IoSubmissionDisposition, IoTerminalEvent,
     },
 };
 use super::error::{Error, Result};
@@ -693,6 +693,14 @@ enum MessageIoContext {
     ControlSend,
 }
 
+enum PendingProtocolTransition {
+    Receive { return_credit: bool },
+    Send,
+    ControlSend { credits: usize },
+    HelloSend,
+    HelloReceiveRepost { peer_capacity: usize },
+}
+
 struct EngineSendRequest {
     inner: StdMutex<EngineSendRequestInner>,
     cancelled: AtomicBool,
@@ -825,6 +833,7 @@ struct EngineMessageState {
     received: StdMutex<VecDeque<CompletedRecv>>,
     recv_notify: Notify,
     pending_credit_returns: AtomicUsize,
+    pending_protocol_transitions: StdMutex<VecDeque<PendingProtocolTransition>>,
     local_close_started: AtomicBool,
     io: OnceLock<EngineMessageIo>,
     self_weak: OnceLock<Weak<EngineMessageState>>,
@@ -857,6 +866,7 @@ impl EngineMessageState {
             received: StdMutex::new(VecDeque::new()),
             recv_notify: Notify::new(),
             pending_credit_returns: AtomicUsize::new(0),
+            pending_protocol_transitions: StdMutex::new(VecDeque::new()),
             local_close_started: AtomicBool::new(false),
             io: OnceLock::new(),
             self_weak: OnceLock::new(),
@@ -976,6 +986,10 @@ impl EngineMessageState {
     }
 
     fn dispose_io_event(&self, event: IoEvent) {
+        if matches!(event, IoEvent::Submission(_)) {
+            lock_std(&self.pending_protocol_transitions).pop_front();
+            return;
+        }
         let IoEvent::Completion(completion) = event else {
             return;
         };
@@ -1137,6 +1151,20 @@ impl EngineMessageState {
 
     fn process_io_event(&self, event: IoEvent) {
         let completion = match event {
+            IoEvent::Submission(disposition) => {
+                let Some(transition) = lock_std(&self.pending_protocol_transitions).pop_front()
+                else {
+                    self.fail(
+                        Error::InvalidConfig(
+                            "protocol submission receipt has no pending transition".into(),
+                        ),
+                        true,
+                    );
+                    return;
+                };
+                self.apply_protocol_disposition(transition, disposition);
+                return;
+            }
             IoEvent::Terminal(IoTerminalEvent::Disconnected) => {
                 self.fail(Error::TransportClosed, true);
                 return;
@@ -1166,6 +1194,74 @@ impl EngineMessageState {
             proven_unaccepted,
             cancelled_before_submit,
         );
+    }
+
+    fn track_protocol_disposition(
+        &self,
+        transition: PendingProtocolTransition,
+        disposition: IoSubmissionDisposition,
+    ) {
+        match disposition {
+            IoSubmissionDisposition::Pending { operations } => {
+                debug_assert!(operations != 0);
+                lock_std(&self.pending_protocol_transitions).push_back(transition);
+            }
+            disposition => self.apply_protocol_disposition(transition, disposition),
+        }
+    }
+
+    fn apply_protocol_disposition(
+        &self,
+        transition: PendingProtocolTransition,
+        disposition: IoSubmissionDisposition,
+    ) {
+        debug_assert!(
+            !matches!(disposition, IoSubmissionDisposition::Pending { .. }),
+            "a submission receipt must carry a reconciled provider disposition"
+        );
+        let all_accepted = disposition.all_accepted();
+        let potentially_accepted = disposition.potentially_accepted();
+        let error = disposition.error().cloned();
+        match transition {
+            PendingProtocolTransition::Receive { return_credit } => {
+                if all_accepted && return_credit {
+                    self.pending_credit_returns.fetch_add(1, Ordering::AcqRel);
+                } else if potentially_accepted && let Some(error) = error {
+                    self.fail(error, true);
+                }
+            }
+            PendingProtocolTransition::Send | PendingProtocolTransition::HelloSend => {
+                if potentially_accepted
+                    && !all_accepted
+                    && let Some(error) = error
+                {
+                    self.fail(error, true);
+                }
+            }
+            PendingProtocolTransition::ControlSend { credits } => {
+                if !all_accepted {
+                    if potentially_accepted {
+                        if let Some(error) = error {
+                            self.fail(error, true);
+                        }
+                    } else if self.state.load(Ordering::Acquire) == STATE_READY {
+                        self.pending_credit_returns
+                            .fetch_add(credits, Ordering::AcqRel);
+                    }
+                }
+            }
+            PendingProtocolTransition::HelloReceiveRepost { peer_capacity } => {
+                if all_accepted {
+                    self.peer_recv_capacity
+                        .store(peer_capacity, Ordering::Release);
+                    self.remote_credits.add_permits(peer_capacity);
+                    lock_std(&self.handshake).hello_receive_complete = true;
+                    self.try_mark_ready();
+                } else if potentially_accepted && let Some(error) = error {
+                    self.fail(error, true);
+                }
+            }
+        }
     }
 
     fn process_io_completion(
@@ -1358,15 +1454,10 @@ impl EngineMessageState {
             mr,
             IoOperationContext::new(MessageIoContext::Receive),
         ));
-        if disposition.all_accepted() {
-            if return_credit {
-                self.pending_credit_returns.fetch_add(1, Ordering::AcqRel);
-            }
-        } else if disposition.potentially_accepted()
-            && let Some(error) = disposition.error()
-        {
-            self.fail(error.clone(), true);
-        }
+        self.track_protocol_disposition(
+            PendingProtocolTransition::Receive { return_credit },
+            disposition,
+        );
     }
 
     fn process_send_request(&self, request: Arc<EngineSendRequest>) {
@@ -1415,13 +1506,7 @@ impl EngineMessageState {
                     )
                     .with_cancellation(request.io_cancellation.clone()),
                 );
-                if disposition.potentially_accepted()
-                    && !disposition.all_accepted()
-                    && let Some(error) = disposition.error()
-                {
-                    request.complete(Err(error.clone()));
-                    self.fail(error.clone(), true);
-                }
+                self.track_protocol_disposition(PendingProtocolTransition::Send, disposition);
             }
         }
     }
@@ -1528,16 +1613,10 @@ impl EngineMessageState {
             frame_len,
             IoOperationContext::new(MessageIoContext::ControlSend),
         ));
-        if !disposition.all_accepted() {
-            if disposition.potentially_accepted() {
-                if let Some(error) = disposition.error() {
-                    self.fail(error.clone(), true);
-                }
-            } else if self.state.load(Ordering::Acquire) == STATE_READY {
-                self.pending_credit_returns
-                    .fetch_add(credits, Ordering::AcqRel);
-            }
-        }
+        self.track_protocol_disposition(
+            PendingProtocolTransition::ControlSend { credits },
+            disposition,
+        );
         true
     }
 
@@ -1628,12 +1707,7 @@ impl EngineMessageState {
             len,
             IoOperationContext::new(MessageIoContext::HelloSend),
         ));
-        if disposition.potentially_accepted()
-            && !disposition.all_accepted()
-            && let Some(error) = disposition.error()
-        {
-            self.fail(error.clone(), true);
-        }
+        self.track_protocol_disposition(PendingProtocolTransition::HelloSend, disposition);
     }
 
     fn process_hello_receive(&self, result: Result<super::op::Completion>, mr: Option<Mr>) {
@@ -1675,19 +1749,10 @@ impl EngineMessageState {
             mr,
             IoOperationContext::new(MessageIoContext::Receive),
         ));
-        if !disposition.all_accepted() {
-            if disposition.potentially_accepted()
-                && let Some(error) = disposition.error()
-            {
-                self.fail(error.clone(), true);
-            }
-            return;
-        }
-        self.peer_recv_capacity
-            .store(peer_capacity, Ordering::Release);
-        self.remote_credits.add_permits(peer_capacity);
-        lock_std(&self.handshake).hello_receive_complete = true;
-        self.try_mark_ready();
+        self.track_protocol_disposition(
+            PendingProtocolTransition::HelloReceiveRepost { peer_capacity },
+            disposition,
+        );
     }
 
     fn parse_hello_receive(&self, completion: &super::op::Completion, mr: &Mr) -> Result<usize> {
@@ -2657,6 +2722,113 @@ mod tests {
         ));
         assert_eq!(state.remote_credits.available_permits(), 3);
         assert_eq!(state.credits_in_flight.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn protocol_transitions_wait_for_reconciled_acceptance() {
+        let state = engine_state();
+        state.state.store(STATE_READY, Ordering::Release);
+
+        state.track_protocol_disposition(
+            PendingProtocolTransition::Receive {
+                return_credit: true,
+            },
+            IoSubmissionDisposition::Pending { operations: 1 },
+        );
+        assert_eq!(state.pending_credit_returns.load(Ordering::Acquire), 0);
+        assert_eq!(lock_std(&state.pending_protocol_transitions).len(), 1);
+
+        state.process_io_event(IoEvent::Submission(IoSubmissionDisposition::AllAccepted {
+            accepted: 1,
+        }));
+        assert_eq!(state.pending_credit_returns.load(Ordering::Acquire), 1);
+        assert!(lock_std(&state.pending_protocol_transitions).is_empty());
+    }
+
+    #[test]
+    fn partial_ambiguous_error_and_cancellation_never_advance_protocol_state() {
+        for disposition in [
+            IoSubmissionDisposition::ExactPrefix {
+                accepted: 1,
+                proven_unaccepted: 1,
+                error: Error::CapacityExhausted,
+            },
+            IoSubmissionDisposition::RetainedAmbiguous {
+                retained: 1,
+                error: Error::CapacityExhausted,
+            },
+            IoSubmissionDisposition::RetainedAfterEarlyCompletion {
+                retained: 1,
+                error: Error::CapacityExhausted,
+            },
+        ] {
+            let state = engine_state();
+            state.state.store(STATE_READY, Ordering::Release);
+            state.apply_protocol_disposition(
+                PendingProtocolTransition::Receive {
+                    return_credit: true,
+                },
+                disposition,
+            );
+            assert_eq!(state.pending_credit_returns.load(Ordering::Acquire), 0);
+            assert_eq!(state.state.load(Ordering::Acquire), STATE_FAILED);
+        }
+
+        for disposition in [
+            IoSubmissionDisposition::FullyUnaccepted {
+                proven_unaccepted: 1,
+                error: Error::CapacityExhausted,
+            },
+            IoSubmissionDisposition::FullyUnaccepted {
+                proven_unaccepted: 1,
+                error: Error::DriverShutdown,
+            },
+        ] {
+            let state = engine_state();
+            state.state.store(STATE_READY, Ordering::Release);
+            state.apply_protocol_disposition(
+                PendingProtocolTransition::Receive {
+                    return_credit: true,
+                },
+                disposition,
+            );
+            assert_eq!(state.pending_credit_returns.load(Ordering::Acquire), 0);
+            assert_eq!(state.state.load(Ordering::Acquire), STATE_READY);
+        }
+    }
+
+    #[test]
+    fn hello_and_credit_feedback_are_deferred_until_acceptance_receipt() {
+        let state = engine_state();
+        state.state.store(STATE_CREATED, Ordering::Release);
+        lock_std(&state.handshake).hello_send_complete = true;
+        state.track_protocol_disposition(
+            PendingProtocolTransition::HelloReceiveRepost { peer_capacity: 7 },
+            IoSubmissionDisposition::Pending { operations: 1 },
+        );
+        assert_eq!(state.peer_recv_capacity.load(Ordering::Acquire), 0);
+        assert_eq!(state.remote_credits.available_permits(), 0);
+        assert_eq!(state.state.load(Ordering::Acquire), STATE_CREATED);
+        state.process_io_event(IoEvent::Submission(IoSubmissionDisposition::AllAccepted {
+            accepted: 1,
+        }));
+        assert_eq!(state.peer_recv_capacity.load(Ordering::Acquire), 7);
+        assert_eq!(state.remote_credits.available_permits(), 7);
+        assert_eq!(state.state.load(Ordering::Acquire), STATE_READY);
+
+        state.pending_credit_returns.store(0, Ordering::Release);
+        state.track_protocol_disposition(
+            PendingProtocolTransition::ControlSend { credits: 3 },
+            IoSubmissionDisposition::Pending { operations: 1 },
+        );
+        assert_eq!(state.pending_credit_returns.load(Ordering::Acquire), 0);
+        state.process_io_event(IoEvent::Submission(
+            IoSubmissionDisposition::FullyUnaccepted {
+                proven_unaccepted: 1,
+                error: Error::CapacityExhausted,
+            },
+        ));
+        assert_eq!(state.pending_credit_returns.load(Ordering::Acquire), 3);
     }
 
     #[tokio::test]
