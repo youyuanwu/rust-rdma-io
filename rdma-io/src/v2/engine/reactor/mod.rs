@@ -38,6 +38,10 @@ pub(super) struct EngineReactor {
     pub(super) lifecycle: EngineLifecycleState,
     scheduler: ReactorScheduler,
     resources: Option<EngineReactorResources>,
+    #[cfg(test)]
+    served_sources: Vec<ReactorSource>,
+    #[cfg(test)]
+    last_action_count: usize,
 }
 
 pub(super) struct ReactorTurn {
@@ -89,6 +93,10 @@ impl EngineReactor {
             lifecycle: EngineLifecycleState::new(),
             scheduler: ReactorScheduler::new(),
             resources,
+            #[cfg(test)]
+            served_sources: Vec::new(),
+            #[cfg(test)]
+            last_action_count: 0,
         }
     }
 
@@ -412,6 +420,8 @@ impl EngineReactor {
         });
         let mut observed_cm_would_block = self.resources.is_none();
         while let Some(source) = ready.pop_front() {
+            #[cfg(test)]
+            self.served_sources.push(source);
             match source {
                 ReactorSource::Commands => {
                     let report = shared.commands.service_turn_into(
@@ -697,14 +707,30 @@ impl EngineReactor {
         match self.turn(shared, mode, cx) {
             Ok(turn) => {
                 let requires_repoll = turn.requires_repoll;
+                self.last_action_count = turn.actions.len();
                 turn.actions.publish();
                 Ok(requires_repoll)
             }
+
             Err(failure) => {
+                self.last_action_count = failure.actions.len();
                 failure.actions.publish();
                 Err(failure.error)
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn take_served_sources_for_test(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.served_sources)
+            .into_iter()
+            .map(|source| format!("{source:?}"))
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(super) fn last_action_count_for_test(&self) -> usize {
+        self.last_action_count
     }
 
     /// Synchronous fail-closed termination when no later poll can occur.

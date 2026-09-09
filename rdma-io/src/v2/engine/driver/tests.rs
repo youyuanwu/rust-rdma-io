@@ -134,6 +134,144 @@ async fn software_wakes_coalesced_with_either_owner_still_poll_both_once() {
     drop(driver);
 }
 
+#[tokio::test(start_paused = true)]
+async fn integrated_all_source_contention_has_bounded_non_starvation() {
+    let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
+    let poster = Arc::new(DrainInterleavingPoster {
+        qp_num: 211,
+        destroys: AtomicUsize::new(0),
+    });
+    let connection = install_connection(
+        &driver.reactor.session.manager,
+        &mut driver.reactor.session.connections,
+        Arc::clone(&poster) as Arc<dyn TestConnectionProvider>,
+        RdmaConnectionConfig::default(),
+        None,
+        None,
+    )
+    .unwrap();
+    let operation = install_accepted_operation_for_driver_test(
+        driver.reactor.io.core_mut(),
+        &mut driver.reactor.session.connections,
+        connection.session_token(),
+        crate::wc::WcOpcode::Send,
+    );
+    driver.reactor.io.core_mut().cancel_operation(operation);
+    driver.reactor.io.schedule_deadline_for_test(
+        tokio::time::Instant::now(),
+        super::super::registry::OperationToken::decode(u64::MAX),
+    );
+    engine
+        .shared
+        .test_driver
+        .queue_released_connection_cqe(completion_for_driver_test(
+            operation,
+            poster.qp_num,
+            rdma_io_sys::ibverbs::IBV_WC_SEND,
+            rdma_io_sys::ibverbs::IBV_WC_SUCCESS,
+        ));
+
+    let (listener, listener_token) = driver
+        .reactor
+        .session
+        .cm
+        .test_listener(&driver.reactor.session.manager, 2);
+    driver
+        .reactor
+        .session
+        .cm
+        .enqueue_listener_work(listener_token);
+    let route_destroys = Arc::new(AtomicUsize::new(0));
+    driver
+        .reactor
+        .session
+        .cm
+        .defer_test_route_destruction(Arc::clone(&route_destroys));
+    for token in [connection.session_token().encode(), u64::MAX - 1] {
+        driver.reactor.session.connections.schedule_deadline(
+            super::super::session::DeadlineKind::ConnectionDrain,
+            token,
+            Duration::ZERO,
+        );
+    }
+    assert_eq!(
+        driver.reactor.session.service_deadline_requests(1).unwrap(),
+        1
+    );
+    engine.shared.request_shutdown();
+
+    let waker = Waker::noop();
+    let mut cx = TaskContext::from_waker(waker);
+    driver
+        .reactor
+        .turn_for_test(&engine.shared, CompletionMode::Polling, &mut cx)
+        .unwrap();
+    assert!(driver.reactor.last_action_count_for_test() <= 32);
+    let first = driver.reactor.take_served_sources_for_test();
+    for required in [
+        "Commands",
+        "Cq",
+        "IoReclamation",
+        "IoDeadline",
+        "CmListenerWork",
+        "CmEvent",
+        "CmDestruction",
+        "SessionDeadlineIngress",
+        "SessionDeadline",
+        "ShutdownListeners",
+        "ShutdownConnections",
+    ] {
+        assert!(
+            first.iter().any(|source| source == required),
+            "{required} received no bounded opportunity under contention: {first:?}"
+        );
+        assert_eq!(
+            first
+                .iter()
+                .filter(|source| source.as_str() == required)
+                .count(),
+            1,
+            "{required} received more than one ready-at-entry quantum"
+        );
+    }
+    assert!(
+        !first.iter().any(|source| source == "CompletionDispatch"),
+        "CQ-produced completion feedback must be deferred to the next turn"
+    );
+
+    driver
+        .reactor
+        .turn_for_test(&engine.shared, CompletionMode::Polling, &mut cx)
+        .unwrap();
+    assert!(driver.reactor.last_action_count_for_test() <= 32);
+    let second = driver.reactor.take_served_sources_for_test();
+    assert!(
+        second.iter().any(|source| source == "CompletionDispatch"),
+        "the next rotating turn must service deferred completion feedback"
+    );
+
+    engine
+        .shared
+        .begin_driver_failure(Error::InvalidConfig("terminal contention test".into()));
+    driver
+        .reactor
+        .turn_for_test(&engine.shared, CompletionMode::Polling, &mut cx)
+        .unwrap_or_else(|_| true);
+    assert!(driver.reactor.last_action_count_for_test() <= 32);
+    let terminal = driver.reactor.take_served_sources_for_test();
+    assert!(
+        terminal.iter().any(|source| source == "IoTerminal"),
+        "terminal service must retain an opportunity after ordinary-source contention"
+    );
+    assert!(
+        first.len() <= 21 && second.len() <= 21 && terminal.len() <= 21,
+        "one turn cannot exceed the finite ready-at-entry source set"
+    );
+
+    drop(listener);
+    drop(connection);
+}
+
 #[test]
 fn io_failure_cleanup_is_bounded_across_driver_polls() {
     let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
