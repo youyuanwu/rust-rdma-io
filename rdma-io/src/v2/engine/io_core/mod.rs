@@ -3,7 +3,7 @@
 mod operation;
 mod progress;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -90,11 +90,10 @@ pub(super) struct EstablishedIoIdentity {
 /// session-owned resource bundle.
 pub(super) struct EstablishedIoConnection {
     identity: EstablishedIoIdentity,
-    poster: Arc<dyn IoPostAuthority>,
     max_send_wr: usize,
     max_recv_wr: usize,
     #[cfg(any(test, feature = "test-hooks"))]
-    accepted_observation: Arc<Mutex<HashSet<OperationToken>>>,
+    accepted_observation: Arc<Mutex<Vec<OperationToken>>>,
     io_events: Mutex<Option<IoEventSender>>,
     drain_notify: Arc<tokio::sync::Notify>,
 }
@@ -108,19 +107,16 @@ pub(super) struct IoQuarantineReport {
 impl EstablishedIoConnection {
     pub(super) fn new(
         identity: EstablishedIoIdentity,
-        poster: Arc<dyn IoPostAuthority>,
         max_send_wr: usize,
         max_recv_wr: usize,
         drain_notify: Arc<tokio::sync::Notify>,
     ) -> Arc<Self> {
-        debug_assert_eq!(identity.qp_num, poster.qp_num());
         Arc::new(Self {
             identity,
-            poster,
             max_send_wr,
             max_recv_wr,
             #[cfg(any(test, feature = "test-hooks"))]
-            accepted_observation: Arc::new(Mutex::new(HashSet::new())),
+            accepted_observation: Arc::new(Mutex::new(Vec::new())),
             io_events: Mutex::new(None),
             drain_notify,
         })
@@ -130,24 +126,13 @@ impl EstablishedIoConnection {
         self.identity
     }
 
-    pub(super) fn post_send(&self, batch: &mut PreparedSendBatch) -> Result<BatchPostOutcome> {
-        self.poster.post_send(batch)
-    }
-
-    pub(super) fn post_recv(&self, batch: &mut PreparedRecvBatch) -> Result<BatchPostOutcome> {
-        self.poster.post_recv(batch)
-    }
-
     pub(super) fn drain_notify(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.drain_notify)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub(super) fn accepted_tokens_for_observation(&self) -> Vec<OperationToken> {
-        lock_unpoison(&self.accepted_observation)
-            .iter()
-            .copied()
-            .collect()
+        lock_unpoison(&self.accepted_observation).clone()
     }
 
     pub(super) fn install_io_event_sender(
@@ -207,18 +192,10 @@ impl OperationKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct AcceptedWrIdentity {
-    connection: ConnectionToken,
-    qp_num: u32,
-    operation: OperationToken,
-}
-
 /// State owned by the low-level operation/completion runtime.
 pub(super) struct IoState {
     operations: OperationRegistry,
     cq_credits: CqCreditPool,
-    connections: HashMap<ConnectionToken, ConnectionIoState>,
     #[cfg(any(test, feature = "test-hooks"))]
     pub(super) rejected_cqes: u64,
     #[cfg(any(test, feature = "test-hooks"))]
@@ -228,8 +205,6 @@ pub(super) struct IoState {
     pub(super) quarantined_operations: usize,
     pub(super) quarantined_mrs: usize,
     pub(super) quarantined_bytes: usize,
-    quarantined_operation_keys: HashMap<OperationToken, ConnectionToken>,
-    quarantined_connection_counts: HashMap<ConnectionToken, usize>,
     pub(super) published_completion_connections: VecDeque<ConnectionToken>,
     published_completion_set: HashSet<ConnectionToken>,
     admission: Arc<RwLock<()>>,
@@ -245,20 +220,20 @@ pub(super) struct IoState {
 #[cfg(test)]
 pub(super) type IoCore = IoState;
 
-struct ConnectionIoState {
+pub(in crate::v2::engine) struct ConnectionIoState {
     identity: EstablishedIoIdentity,
     max_send_wr: usize,
     max_recv_wr: usize,
     local_credits: LocalCredits,
-    accepted: HashSet<AcceptedWrIdentity>,
+    accepted: HashSet<OperationToken>,
     completions: VecDeque<WorkCompletion>,
-    quarantined: bool,
+    quarantined: HashSet<OperationToken>,
     #[cfg(any(test, feature = "test-hooks"))]
-    accepted_observation: Arc<Mutex<HashSet<OperationToken>>>,
+    accepted_observation: Arc<Mutex<Vec<OperationToken>>>,
 }
 
 impl ConnectionIoState {
-    fn from_connection(connection: &EstablishedIoConnection) -> Self {
+    pub(in crate::v2::engine) fn from_connection(connection: &EstablishedIoConnection) -> Self {
         Self {
             identity: connection.identity,
             max_send_wr: connection.max_send_wr,
@@ -266,10 +241,56 @@ impl ConnectionIoState {
             local_credits: LocalCredits::default(),
             accepted: HashSet::new(),
             completions: VecDeque::new(),
-            quarantined: false,
+            quarantined: HashSet::new(),
             #[cfg(any(test, feature = "test-hooks"))]
             accepted_observation: Arc::clone(&connection.accepted_observation),
         }
+    }
+
+    pub(in crate::v2::engine) fn identity(&self) -> EstablishedIoIdentity {
+        self.identity
+    }
+
+    pub(in crate::v2::engine) fn accepted_count(&self) -> usize {
+        self.accepted.len()
+    }
+
+    pub(in crate::v2::engine) fn accepted_tokens_bounded(
+        &self,
+        limit: usize,
+    ) -> Vec<OperationToken> {
+        self.accepted.iter().take(limit).copied().collect()
+    }
+
+    pub(in crate::v2::engine) fn has_completion_work(&self) -> bool {
+        !self.completions.is_empty()
+    }
+
+    pub(in crate::v2::engine) fn quarantined_operation_count(&self) -> usize {
+        self.quarantined.len()
+    }
+
+    pub(in crate::v2::engine) fn mark_operation_quarantined(
+        &mut self,
+        operation: OperationToken,
+    ) -> bool {
+        assert!(
+            self.accepted.contains(&operation),
+            "only accepted work can enter connection quarantine"
+        );
+        self.quarantined.insert(operation)
+    }
+
+    pub(in crate::v2::engine) fn clear_operation_quarantined(
+        &mut self,
+        operation: OperationToken,
+    ) -> bool {
+        self.quarantined.remove(&operation) && self.quarantined.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn insert_accepted_for_test(&mut self, operation: OperationToken) {
+        assert!(self.accepted.insert(operation));
     }
 }
 
@@ -297,7 +318,6 @@ impl IoState {
         Ok(Self {
             operations: OperationRegistry::new(max_inflight_operations)?,
             cq_credits: CqCreditPool::new(cq_capacity),
-            connections: HashMap::new(),
             #[cfg(any(test, feature = "test-hooks"))]
             rejected_cqes: 0,
             #[cfg(any(test, feature = "test-hooks"))]
@@ -307,8 +327,6 @@ impl IoState {
             quarantined_operations: 0,
             quarantined_mrs: 0,
             quarantined_bytes: 0,
-            quarantined_operation_keys: HashMap::new(),
-            quarantined_connection_counts: HashMap::new(),
             published_completion_connections: VecDeque::new(),
             published_completion_set: HashSet::new(),
             admission,
@@ -373,6 +391,16 @@ impl IoState {
         }
     }
 
+    pub(in crate::v2::engine) fn operation_connection(
+        &self,
+        token: OperationToken,
+    ) -> Option<ConnectionToken> {
+        match self.operations.lookup(token) {
+            Lookup::Occupied(operation) => Some(operation.connection_token()),
+            Lookup::Duplicate | Lookup::Stale | Lookup::Unknown | Lookup::Retired => None,
+        }
+    }
+
     pub(super) fn take_reclamation_requests(&mut self, budget: usize) -> Vec<IoDeadlineRequest> {
         let count = self.reclamation_requests.len().min(budget);
         self.reclamation_requests.drain(..count).collect()
@@ -421,8 +449,8 @@ impl IoState {
         self.terminal_failure.clone()
     }
 
-    pub(super) fn publish_connection(&mut self, connection: &Arc<EstablishedIoConnection>) {
-        let token = connection.identity().connection;
+    pub(super) fn publish_connection(&mut self, connection: ConnectionToken) {
+        let token = connection;
         if self.published_completion_set.insert(token) {
             self.published_completion_connections.push_back(token);
         }
@@ -448,34 +476,16 @@ impl IoState {
         self.rejected_cqe_reasons.clone()
     }
 
-    fn with_connection_mut<R>(
-        &mut self,
-        connection: &EstablishedIoConnection,
-        mutate: impl FnOnce(&mut ConnectionIoState) -> R,
-    ) -> R {
-        let state = self
-            .connections
-            .entry(connection.identity().connection)
-            .or_insert_with(|| ConnectionIoState::from_connection(connection));
-        mutate(state)
-    }
-
-    fn with_connection_token_mut<R>(
+    pub(in crate::v2::engine) fn retire_connection_io(
         &mut self,
         token: ConnectionToken,
-        mutate: impl FnOnce(&mut ConnectionIoState) -> R,
-    ) -> Option<R> {
-        self.connections.get_mut(&token).map(mutate)
-    }
-
-    pub(in crate::v2::engine) fn retire_connection_io(&mut self, token: ConnectionToken) {
-        let removed = self.connections.remove(&token);
-        if let Some(state) = removed {
-            debug_assert!(
-                state.accepted.is_empty() && state.completions.is_empty(),
-                "retired connection I/O state must have no provider-owned work"
-            );
-        }
+        state: &ConnectionIoState,
+    ) {
+        debug_assert_eq!(state.identity.connection, token);
+        debug_assert!(
+            state.accepted.is_empty() && state.completions.is_empty(),
+            "retired connection I/O state must have no provider-owned work"
+        );
         self.published_completion_set.remove(&token);
         self.published_completion_connections
             .retain(|queued| *queued != token);
@@ -484,202 +494,194 @@ impl IoState {
     pub(super) fn reserve_local(
         &mut self,
         connection: &EstablishedIoConnection,
+        state: &mut ConnectionIoState,
         direction: Direction,
     ) -> Result<()> {
-        self.with_connection_mut(connection, |state| {
-            let (used, maximum) = match direction {
-                Direction::Send => (&mut state.local_credits.send, state.max_send_wr),
-                Direction::Recv => (&mut state.local_credits.recv, state.max_recv_wr),
-            };
-            if *used >= maximum {
-                return Err(Error::CapacityExhausted);
-            }
-            *used += 1;
-            Ok(())
-        })
+        debug_assert_eq!(state.identity, connection.identity());
+        let (used, maximum) = match direction {
+            Direction::Send => (&mut state.local_credits.send, state.max_send_wr),
+            Direction::Recv => (&mut state.local_credits.recv, state.max_recv_wr),
+        };
+        if *used >= maximum {
+            return Err(Error::CapacityExhausted);
+        }
+        *used += 1;
+        Ok(())
     }
 
     pub(super) fn release_local(
         &mut self,
         connection: &EstablishedIoConnection,
+        state: &mut ConnectionIoState,
         direction: Direction,
     ) {
-        self.with_connection_mut(connection, |state| {
-            let used = match direction {
-                Direction::Send => &mut state.local_credits.send,
-                Direction::Recv => &mut state.local_credits.recv,
-            };
-            *used = used.saturating_sub(1);
-        });
+        debug_assert_eq!(state.identity, connection.identity());
+        Self::release_operation_local(state, connection.identity(), direction);
     }
 
     pub(super) fn add_accepted(
         &mut self,
         connection: &EstablishedIoConnection,
+        state: &mut ConnectionIoState,
         token: OperationToken,
     ) {
-        self.with_connection_mut(connection, |state| {
-            state.accepted.insert(AcceptedWrIdentity {
-                connection: state.identity.connection,
-                qp_num: state.identity.qp_num,
-                operation: token,
-            });
-            #[cfg(any(test, feature = "test-hooks"))]
-            lock_unpoison(&connection.accepted_observation).insert(token);
-        });
+        debug_assert_eq!(state.identity, connection.identity());
+        let inserted = state.accepted.insert(token);
+        debug_assert!(inserted, "accepted operation identity is single-shot");
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            let mut observed = lock_unpoison(&connection.accepted_observation);
+            debug_assert!(!observed.contains(&token));
+            observed.push(token);
+        }
     }
 
     pub(super) fn remove_accepted(
         &mut self,
         connection: &EstablishedIoConnection,
+        state: &mut ConnectionIoState,
         token: OperationToken,
     ) -> bool {
-        let removed = self.with_connection_mut(connection, |state| {
-            state.accepted.remove(&AcceptedWrIdentity {
-                connection: state.identity.connection,
-                qp_num: state.identity.qp_num,
-                operation: token,
-            })
-        });
+        debug_assert_eq!(state.identity, connection.identity());
+        let removed = state.accepted.remove(&token);
         #[cfg(any(test, feature = "test-hooks"))]
-        debug_assert_eq!(
-            removed,
-            lock_unpoison(&connection.accepted_observation).remove(&token)
-        );
+        {
+            let mut observed = lock_unpoison(&connection.accepted_observation);
+            let observed_removed = observed
+                .iter()
+                .position(|candidate| *candidate == token)
+                .map(|position| observed.swap_remove(position))
+                .is_some();
+            debug_assert_eq!(removed, observed_removed);
+        }
         removed
     }
 
     pub(super) fn remove_operation_accepted(
-        &mut self,
+        state: &mut ConnectionIoState,
         identity: EstablishedIoIdentity,
         token: OperationToken,
     ) -> bool {
-        self.with_connection_token_mut(identity.connection, |state| {
-            if state.identity != identity {
-                return false;
-            }
-            let removed = state.accepted.remove(&AcceptedWrIdentity {
-                connection: identity.connection,
-                qp_num: identity.qp_num,
-                operation: token,
-            });
-            #[cfg(any(test, feature = "test-hooks"))]
-            debug_assert_eq!(
-                removed,
-                lock_unpoison(&state.accepted_observation).remove(&token)
-            );
-            removed
-        })
-        .unwrap_or(false)
+        if state.identity != identity {
+            return false;
+        }
+        let removed = state.accepted.remove(&token);
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            let mut observed = lock_unpoison(&state.accepted_observation);
+            let observed_removed = observed
+                .iter()
+                .position(|candidate| *candidate == token)
+                .map(|position| observed.swap_remove(position))
+                .is_some();
+            debug_assert_eq!(removed, observed_removed);
+        }
+        removed
     }
 
     pub(super) fn add_operation_accepted(
-        &mut self,
+        state: &mut ConnectionIoState,
         identity: EstablishedIoIdentity,
         token: OperationToken,
     ) -> usize {
-        self.with_connection_token_mut(identity.connection, |state| {
-            if state.identity != identity {
-                return state.accepted.len();
-            }
-            state.accepted.insert(AcceptedWrIdentity {
-                connection: identity.connection,
-                qp_num: identity.qp_num,
-                operation: token,
-            });
+        if state.identity == identity {
+            state.accepted.insert(token);
             #[cfg(any(test, feature = "test-hooks"))]
-            lock_unpoison(&state.accepted_observation).insert(token);
-            state.accepted.len()
-        })
-        .unwrap_or(0)
+            {
+                let mut observed = lock_unpoison(&state.accepted_observation);
+                if !observed.contains(&token) {
+                    observed.push(token);
+                }
+            }
+        }
+        state.accepted.len()
     }
 
     pub(super) fn release_operation_local(
-        &mut self,
+        state: &mut ConnectionIoState,
         identity: EstablishedIoIdentity,
         direction: Direction,
     ) {
-        let _ = self.with_connection_token_mut(identity.connection, |state| {
-            if state.identity != identity {
-                return;
-            }
-            let used = match direction {
-                Direction::Send => &mut state.local_credits.send,
-                Direction::Recv => &mut state.local_credits.recv,
-            };
-            *used = used.saturating_sub(1);
-        });
+        if state.identity != identity {
+            return;
+        }
+        let used = match direction {
+            Direction::Send => &mut state.local_credits.send,
+            Direction::Recv => &mut state.local_credits.recv,
+        };
+        *used = used.saturating_sub(1);
     }
 
     pub(super) fn operation_connection_accepted_count(
-        &self,
+        state: &ConnectionIoState,
         identity: EstablishedIoIdentity,
     ) -> usize {
-        self.connections
-            .get(&identity.connection)
-            .filter(|state| state.identity == identity)
-            .map_or(0, |state| state.accepted.len())
+        if state.identity == identity {
+            state.accepted.len()
+        } else {
+            0
+        }
     }
 
+    #[cfg(test)]
     pub(super) fn accepted_tokens_bounded(
         &self,
         connection: &EstablishedIoConnection,
+        state: &ConnectionIoState,
         limit: usize,
     ) -> Vec<OperationToken> {
-        self.connections
-            .get(&connection.identity().connection)
-            .filter(|state| state.identity == connection.identity())
-            .into_iter()
-            .flat_map(|state| {
-                state
-                    .accepted
-                    .iter()
-                    .take(limit)
-                    .map(|identity| identity.operation)
-            })
-            .collect()
+        if state.identity != connection.identity() {
+            return Vec::new();
+        }
+        state.accepted_tokens_bounded(limit)
     }
 
-    pub(super) fn connection_accepted_count(&self, connection: &EstablishedIoConnection) -> usize {
-        self.operation_connection_accepted_count(connection.identity())
+    #[cfg(test)]
+    pub(super) fn connection_accepted_count(
+        &self,
+        connection: &EstablishedIoConnection,
+        state: &ConnectionIoState,
+    ) -> usize {
+        Self::operation_connection_accepted_count(state, connection.identity())
     }
 
     pub(super) fn enqueue_completion(
         &mut self,
         connection: &EstablishedIoConnection,
+        state: &mut ConnectionIoState,
         completion: WorkCompletion,
     ) {
-        self.with_connection_mut(connection, |state| {
-            state.completions.push_back(completion);
-        });
+        debug_assert_eq!(state.identity, connection.identity());
+        state.completions.push_back(completion);
     }
 
     pub(super) fn pop_completion(
         &mut self,
         connection: &EstablishedIoConnection,
+        state: &mut ConnectionIoState,
     ) -> Option<WorkCompletion> {
-        self.with_connection_mut(connection, |state| state.completions.pop_front())
+        debug_assert_eq!(state.identity, connection.identity());
+        state.completions.pop_front()
     }
 
     pub(super) fn has_connection_completion_work(
         &self,
         connection: &EstablishedIoConnection,
+        state: &ConnectionIoState,
     ) -> bool {
-        self.connections
-            .get(&connection.identity().connection)
-            .filter(|state| state.identity == connection.identity())
-            .is_some_and(|state| !state.completions.is_empty())
+        state.identity == connection.identity() && state.has_completion_work()
     }
 
     pub(super) fn begin_connection_quarantine(
         &mut self,
         connection: &EstablishedIoConnection,
+        state: &mut ConnectionIoState,
     ) -> Option<IoQuarantineReport> {
-        let state = self
-            .connections
-            .get_mut(&connection.identity().connection)?;
+        if state.identity != connection.identity() {
+            return None;
+        }
         let outstanding = state.accepted.len();
-        if outstanding == 0 || std::mem::replace(&mut state.quarantined, true) {
+        if outstanding == 0 {
             return None;
         }
         Some(IoQuarantineReport {
@@ -688,53 +690,27 @@ impl IoState {
         })
     }
 
-    fn record_operation_quarantine(
-        &mut self,
-        operation: OperationToken,
-        connection: ConnectionToken,
-    ) -> bool {
-        let previous = self
-            .quarantined_operation_keys
-            .insert(operation, connection);
-        debug_assert!(
-            previous.is_none(),
-            "operation quarantine key is single-shot"
-        );
-        let count = self
-            .quarantined_connection_counts
-            .entry(connection)
-            .or_insert(0);
-        let first = *count == 0;
-        *count += 1;
-        first
-    }
-
     fn clear_operation_quarantine(
         &mut self,
+        state: &mut ConnectionIoState,
         operation: OperationToken,
         connection: ConnectionToken,
     ) -> bool {
-        let removed = self.quarantined_operation_keys.remove(&operation);
-        debug_assert_eq!(
-            removed,
-            Some(connection),
-            "operation quarantine clears its exact production key"
+        debug_assert_eq!(state.identity.connection, connection);
+        debug_assert!(
+            state.quarantined.contains(&operation),
+            "cleared quarantine must name an exact retained operation"
         );
-        let Some(count) = self.quarantined_connection_counts.get_mut(&connection) else {
-            debug_assert!(false, "quarantined connection count must exist");
-            return false;
-        };
-        *count -= 1;
-        if *count != 0 {
-            return false;
-        }
-        self.quarantined_connection_counts.remove(&connection);
-        true
+        state.quarantined.contains(&operation)
     }
 
     #[cfg(test)]
-    pub(super) fn operation_quarantined_for_test(&self, operation: OperationToken) -> bool {
-        self.quarantined_operation_keys.contains_key(&operation)
+    pub(super) fn operation_quarantined_for_test(
+        &self,
+        state: &ConnectionIoState,
+        operation: OperationToken,
+    ) -> bool {
+        state.quarantined.contains(&operation)
     }
 }
 
@@ -743,8 +719,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-
-    struct TestPostAuthority;
 
     struct RecordingSignal {
         io_publications: AtomicUsize,
@@ -766,22 +740,8 @@ mod tests {
         fn pause_operation_before_register(&self) {}
     }
 
-    impl IoPostAuthority for TestPostAuthority {
-        fn qp_num(&self) -> u32 {
-            17
-        }
-
-        fn post_send(&self, _batch: &mut PreparedSendBatch) -> Result<BatchPostOutcome> {
-            Ok(BatchPostOutcome::AllAccepted)
-        }
-
-        fn post_recv(&self, _batch: &mut PreparedRecvBatch) -> Result<BatchPostOutcome> {
-            Ok(BatchPostOutcome::AllAccepted)
-        }
-    }
-
     #[test]
-    fn established_io_state_owns_local_accepted_and_completion_ledgers() {
+    fn value_owned_connection_ledger_tracks_local_accepted_and_completion_state() {
         let mut core = IoCore::new_owned(
             8,
             8,
@@ -801,38 +761,46 @@ mod tests {
                 },
                 qp_num: 17,
             },
-            Arc::new(TestPostAuthority),
             1,
             1,
             Arc::new(tokio::sync::Notify::new()),
         );
+        let mut connection_io = ConnectionIoState::from_connection(&connection);
 
-        core.reserve_local(&connection, Direction::Send).unwrap();
+        core.reserve_local(&connection, &mut connection_io, Direction::Send)
+            .unwrap();
         assert!(matches!(
-            core.reserve_local(&connection, Direction::Send),
+            core.reserve_local(&connection, &mut connection_io, Direction::Send),
             Err(Error::CapacityExhausted)
         ));
-        core.release_local(&connection, Direction::Send);
-        core.reserve_local(&connection, Direction::Recv).unwrap();
+        core.release_local(&connection, &mut connection_io, Direction::Send);
+        core.reserve_local(&connection, &mut connection_io, Direction::Recv)
+            .unwrap();
 
         let operation = OperationToken {
             slot: 7,
             generation: 11,
         };
-        core.add_accepted(&connection, operation);
+        core.add_accepted(&connection, &mut connection_io, operation);
         assert_eq!(
-            core.accepted_tokens_bounded(&connection, 8),
+            core.accepted_tokens_bounded(&connection, &connection_io, 8),
             vec![operation]
         );
-        assert_eq!(core.connection_accepted_count(&connection), 1);
+        assert_eq!(
+            core.connection_accepted_count(&connection, &connection_io),
+            1
+        );
 
-        core.enqueue_completion(&connection, WorkCompletion::default());
-        assert!(core.has_connection_completion_work(&connection));
-        assert!(core.pop_completion(&connection).is_some());
-        assert!(!core.has_connection_completion_work(&connection));
+        core.enqueue_completion(&connection, &mut connection_io, WorkCompletion::default());
+        assert!(core.has_connection_completion_work(&connection, &connection_io));
+        assert!(
+            core.pop_completion(&connection, &mut connection_io)
+                .is_some()
+        );
+        assert!(!core.has_connection_completion_work(&connection, &connection_io));
 
-        assert!(core.remove_accepted(&connection, operation));
-        core.release_local(&connection, Direction::Recv);
+        assert!(core.remove_accepted(&connection, &mut connection_io, operation));
+        core.release_local(&connection, &mut connection_io, Direction::Recv);
     }
 
     #[test]

@@ -153,24 +153,10 @@ impl IoReactorSources {
         self.core().diagnostics()
     }
 
-    #[cfg(not(test))]
-    pub(in crate::v2::engine) fn retain_unsafe_state(&mut self) {
-        let Some(state) = self.core.take() else {
-            return;
-        };
-        if state.accepted_count() == 0 && state.diagnostics().quarantined_operations == 0 {
-            return;
-        }
-        Self::failed_io_quarantine()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(state);
-    }
-
     pub(in crate::v2::engine) fn service_terminal(
         &mut self,
         budget: usize,
-        session: &crate::v2::engine::session::SessionManager,
+        session: &mut crate::v2::engine::session::SessionReactorSources,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> (usize, bool) {
         let Some(outcome) = self.core().terminal_failure() else {
@@ -184,13 +170,6 @@ impl IoReactorSources {
         self.terminal_complete = complete;
         session.commit_io_effects_into(effects, actions);
         (scanned, complete)
-    }
-
-    #[cfg(not(test))]
-    fn failed_io_quarantine() -> &'static std::sync::Mutex<Vec<IoState>> {
-        static STATES: std::sync::OnceLock<std::sync::Mutex<Vec<IoState>>> =
-            std::sync::OnceLock::new();
-        STATES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
     }
 
     pub(in crate::v2::engine) fn cq_budget(&self) -> usize {
@@ -288,7 +267,7 @@ impl IoReactorSources {
 
     pub(in crate::v2::engine) fn service_cq(
         &mut self,
-        session: &crate::v2::engine::session::SessionManager,
+        session: &mut crate::v2::engine::session::SessionReactorSources,
         mode: CompletionMode,
         cx: &mut TaskContext<'_>,
     ) -> Result<(usize, ReadinessRegistration, bool)> {
@@ -423,7 +402,7 @@ impl IoReactorSources {
         &mut self,
         _now: Instant,
         limit: usize,
-        session: &crate::v2::engine::session::SessionManager,
+        session: &mut crate::v2::engine::session::SessionReactorSources,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> usize {
         let mut consumed = 0;
@@ -431,8 +410,7 @@ impl IoReactorSources {
             let Some(token) = self.ready_deadlines.pop_front() else {
                 break;
             };
-            let effects = self.core_mut().handle_reclamation_deadline(token);
-            session.commit_io_effects_into(effects, actions);
+            session.handle_reclamation_deadline_with_core(self.core_mut(), token, actions);
             consumed += 1;
         }
         consumed
@@ -455,7 +433,7 @@ impl IoReactorSources {
     pub(in crate::v2::engine) fn service_completion_dispatch(
         &mut self,
         quantum: usize,
-        session: &crate::v2::engine::session::SessionManager,
+        session: &mut crate::v2::engine::session::SessionReactorSources,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Result<(usize, bool)> {
         let Some(connection) = self.completion_connections.pop() else {
@@ -544,12 +522,10 @@ mod tests {
     use super::*;
     use crate::v2::engine::driver::test_api::TestDriverState;
     use crate::v2::engine::io_core::{
-        EstablishedIoConnection, EstablishedIoIdentity, IoDriverSignal, IoPostAuthority,
+        EstablishedIoConnection, EstablishedIoIdentity, IoDriverSignal,
         operation_future_for_io_lifetime_test,
     };
     use crate::v2::engine::registry::lock_unpoison;
-    use crate::v2::qp::BatchPostOutcome;
-    use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
 
     struct NoopSignal;
 
@@ -558,22 +534,6 @@ mod tests {
         fn publish_completion_dispatch(&self) {}
         fn publish_reclamation(&self) {}
         fn pause_operation_before_register(&self) {}
-    }
-
-    struct NoopPoster;
-
-    impl IoPostAuthority for NoopPoster {
-        fn qp_num(&self) -> u32 {
-            7
-        }
-
-        fn post_send(&self, _batch: &mut PreparedSendBatch) -> Result<BatchPostOutcome> {
-            unreachable!("lifetime-only operation is already in flight")
-        }
-
-        fn post_recv(&self, _batch: &mut PreparedRecvBatch) -> Result<BatchPostOutcome> {
-            unreachable!("lifetime-only operation is already in flight")
-        }
     }
 
     #[derive(Default)]
@@ -673,12 +633,16 @@ mod tests {
                 connection: connection(7),
                 qp_num: 7,
             },
-            Arc::new(NoopPoster),
             1,
             1,
             Arc::new(tokio::sync::Notify::new()),
         );
-        let operation = operation_future_for_io_lifetime_test(progress.core_mut(), &connection);
+        let mut connection_io = super::super::ConnectionIoState::from_connection(&connection);
+        let operation = operation_future_for_io_lifetime_test(
+            progress.core_mut(),
+            &connection,
+            &mut connection_io,
+        );
 
         drop(connection);
         drop(bridge);

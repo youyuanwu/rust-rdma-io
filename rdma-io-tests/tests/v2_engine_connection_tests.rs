@@ -78,6 +78,7 @@ async fn establish_pair(
         let cm = rdma_io::async_cm::AsyncCmListener::migrate_accepted(cm_id).unwrap();
         server_resources
             .install_connection(qp, cm, server_config)
+            .await
             .unwrap()
     };
     let client = async {
@@ -466,7 +467,7 @@ async fn run_connect_admission_shutdown_barrier(mode: CompletionMode) {
     assert_eq!(admitted.lifecycle, RdmaEngineLifecycle::ShutdownRequested);
     assert_eq!(
         admitted.live_connections, 1,
-        "the unified reactor retains the admitted command reservation until its bounded shutdown turn"
+        "the admitted connect command retains its transferable connection reservation"
     );
 
     let driver_task = tokio::spawn(driver);

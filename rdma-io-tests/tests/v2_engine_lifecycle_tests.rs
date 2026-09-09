@@ -394,10 +394,10 @@ async fn run_missing_flush_cqe_qp_destroy_fallback(mode: CompletionMode) {
     server_resources
         .inject_completion(old_wr_id, old_qp_num, WcOpcode::Recv)
         .unwrap();
-    assert_eq!(
-        server_resources.instrumentation().unwrap().cqes_rejected,
-        rejected_before + 1
-    );
+    wait_until("stale completion was not rejected by the reactor", || {
+        server_resources.instrumentation().unwrap().cqes_rejected == rejected_before + 1
+    })
+    .await;
     futures_util::future::poll_fn(|cx| {
         assert!(recv_b.as_mut().poll(cx).is_pending());
         Poll::Ready(())

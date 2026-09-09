@@ -150,7 +150,7 @@ impl OperationState {
         self.token
     }
 
-    pub(super) fn connection_token(&self) -> ConnectionToken {
+    pub(in crate::v2::engine) fn connection_token(&self) -> ConnectionToken {
         self.identity.connection
     }
 

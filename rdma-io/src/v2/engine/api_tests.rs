@@ -120,7 +120,7 @@ fn pending_shutdown_waiter_is_woken_when_driver_drops() {
 }
 
 #[test]
-fn pending_connect_command_is_woken_and_releases_admission_on_driver_drop() {
+fn pending_connect_command_owns_and_releases_its_transferable_reservation() {
     let (engine, driver) = test_engine_pair(CompletionMode::Readiness);
     let counter = CountingWaker::new();
     let waker = counter.waker();
@@ -161,27 +161,31 @@ async fn shutdown_accounts_for_ingress_and_backend_connect_listen_commands() {
     for future in [&mut listen_backend, &mut listen_ingress] {
         assert!(future.as_mut().poll(&mut cx).is_pending());
     }
-    engine
-        .shared
-        .commands
-        .service_turn(&engine.shared, driver.reactor.io.core_mut());
-    engine
-        .shared
-        .commands
-        .service_turn(&engine.shared, driver.reactor.io.core_mut());
+    engine.shared.commands.service_turn(
+        &engine.shared,
+        driver.reactor.io.core_mut(),
+        &mut driver.reactor.session,
+    );
+    engine.shared.commands.service_turn(
+        &engine.shared,
+        driver.reactor.io.core_mut(),
+        &mut driver.reactor.session,
+    );
     assert_eq!(engine.shared.commands.pending_connects(), 1);
     assert_eq!(engine.shared.commands.pending_listens(), 1);
 
     let mut shutdown = Box::pin(engine.shutdown());
     assert!(shutdown.as_mut().poll(&mut cx).is_pending());
-    engine
-        .shared
-        .commands
-        .service_turn(&engine.shared, driver.reactor.io.core_mut());
-    engine
-        .shared
-        .commands
-        .service_turn(&engine.shared, driver.reactor.io.core_mut());
+    engine.shared.commands.service_turn(
+        &engine.shared,
+        driver.reactor.io.core_mut(),
+        &mut driver.reactor.session,
+    );
+    engine.shared.commands.service_turn(
+        &engine.shared,
+        driver.reactor.io.core_mut(),
+        &mut driver.reactor.session,
+    );
     assert_eq!(engine.shared.commands.pending_connects(), 0);
     assert_eq!(engine.shared.commands.pending_listens(), 0);
     // The unit fixture intentionally has no provider resources. Terminalize
@@ -189,6 +193,7 @@ async fn shutdown_accounts_for_ingress_and_backend_connect_listen_commands() {
     // before polling the full driver; provider-backed tests exercise the same
     // path through normal bounded shutdown progress.
     engine.shared.session.cm.begin_shutdown(
+        &mut driver.reactor.session.connections,
         &engine.shared.session,
         &MemoizedTerminalResult::from_error(Error::DriverShutdown),
     );
@@ -216,7 +221,8 @@ async fn shutdown_accounts_for_ingress_and_backend_connect_listen_commands() {
         panic!(
             "shutdown command accounting matrix did not terminate: diagnostics={:?}, pending_routes={}, pending_connects={}, pending_listens={}, driver_finished={}",
             engine.diagnostics(),
-            engine.shared.session.cm.pending_route_count(),
+            lock_unpoison(&engine.shared.connection_diagnostics).live
+                + engine.shared.session.cm.pending_adapter_route_count(),
             engine.shared.commands.pending_connects(),
             engine.shared.commands.pending_listens(),
             driver_task.is_finished(),
@@ -255,14 +261,16 @@ fn driver_drop_accounts_for_ingress_and_backend_connect_listen_commands() {
     for future in [&mut listen_backend, &mut listen_ingress] {
         assert!(future.as_mut().poll(&mut cx).is_pending());
     }
-    engine
-        .shared
-        .commands
-        .service_turn(&engine.shared, driver.reactor.io.core_mut());
-    engine
-        .shared
-        .commands
-        .service_turn(&engine.shared, driver.reactor.io.core_mut());
+    engine.shared.commands.service_turn(
+        &engine.shared,
+        driver.reactor.io.core_mut(),
+        &mut driver.reactor.session,
+    );
+    engine.shared.commands.service_turn(
+        &engine.shared,
+        driver.reactor.io.core_mut(),
+        &mut driver.reactor.session,
+    );
     assert_eq!(engine.shared.commands.pending_connects(), 1);
     assert_eq!(engine.shared.commands.pending_listens(), 1);
 
@@ -358,6 +366,7 @@ fn shutdown_initiates_each_preexisting_connection_close_once() {
         });
         let connection = install_connection(
             &engine.shared.session,
+            &mut driver.reactor.session.connections,
             Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
             RdmaConnectionConfig::default(),
             None,
@@ -369,14 +378,14 @@ fn shutdown_initiates_each_preexisting_connection_close_once() {
     }
 
     engine.shared.request_shutdown();
-    engine
-        .shared
-        .session
-        .begin_all_connection_close(driver.reactor.io.core_mut());
-    engine
-        .shared
-        .session
-        .begin_all_connection_close(driver.reactor.io.core_mut());
+    engine.shared.session.begin_all_connection_close(
+        &mut driver.reactor.session.connections,
+        driver.reactor.io.core_mut(),
+    );
+    engine.shared.session.begin_all_connection_close(
+        &mut driver.reactor.session.connections,
+        driver.reactor.io.core_mut(),
+    );
 
     assert!(
         engine
@@ -385,11 +394,13 @@ fn shutdown_initiates_each_preexisting_connection_close_once() {
             .shutdown_connection_close_started
             .load(Ordering::Acquire)
     );
-    assert!(
-        connections
-            .iter()
-            .all(|connection| connection.state.close_started())
-    );
+    assert!(connections.iter().all(|connection| {
+        driver
+            .reactor
+            .session
+            .connections
+            .close_started(connection.session_token())
+    }));
     assert!(
         posters
             .iter()

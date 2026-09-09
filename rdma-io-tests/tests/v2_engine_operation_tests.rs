@@ -60,12 +60,14 @@ async fn run_owned_operations(mode: CompletionMode) {
         .unwrap();
     let resources = engine.test_resources().unwrap();
     let mut pair = setup_engine_pair(&resources).await;
+    let driver_task = tokio::spawn(driver);
     let server = resources
         .install_connection(
             pair.server.qp.take().unwrap(),
             pair.server.cm.take().unwrap(),
             RdmaConnectionConfig::default(),
         )
+        .await
         .unwrap();
     let client = resources
         .install_connection(
@@ -73,8 +75,8 @@ async fn run_owned_operations(mode: CompletionMode) {
             pair.client.cm.take().unwrap(),
             RdmaConnectionConfig::default(),
         )
+        .await
         .unwrap();
-    let driver_task = tokio::spawn(driver);
     let recorder = DestructionRecorder::arm(64);
 
     let recv = server.register_memory(64, AccessIntent::LocalOnly).unwrap();

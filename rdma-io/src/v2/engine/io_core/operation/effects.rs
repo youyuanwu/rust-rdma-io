@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::v2::engine::io::PendingIoEvent;
 use crate::v2::engine::reactor::ReactorActions;
-use crate::v2::engine::registry::ConnectionToken;
+use crate::v2::engine::registry::{ConnectionToken, OperationToken};
 use crate::v2::engine::session::IoEffectsCommitAuthority;
 
 use super::state::OperationObserver;
@@ -85,8 +85,14 @@ impl AfterEngineUnlock {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::v2::engine) enum OperationQuarantineEffect {
-    Added(ConnectionToken),
-    Cleared(ConnectionToken),
+    Added {
+        connection: ConnectionToken,
+        operation: OperationToken,
+    },
+    Cleared {
+        connection: ConnectionToken,
+        operation: OperationToken,
+    },
 }
 
 #[derive(Default)]

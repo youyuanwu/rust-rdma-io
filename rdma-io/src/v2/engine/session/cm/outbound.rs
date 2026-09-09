@@ -7,17 +7,18 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 
+use super::super::connection::ConnectionState;
 use super::{
-    CmEventReject, CmEventSnapshot, CmRouteToken, CmState, ConnectionCmRoute,
-    ConnectionReservation, ConnectionSetup, ContextRoute, EngineResources,
-    EstablishedConnectionRoute, EventDisposition, Lookup, OutboundRoute, OutboundState,
-    RdmaConnection, RdmaConnectionConfig, SessionManager, SharedCmId, VerbsConnectionResources,
-    build_qp, empty_connection_setup, install_reserved_connection, is_failure_event, lock_unpoison,
-    reserve_connection, run_setup_before_establish,
+    CmEventReject, CmEventSnapshot, CmRouteToken, CmState, ConnectionSetup, ContextRoute,
+    EngineResources, EstablishedConnectionRoute, EventDisposition, Lookup, OutboundRoute,
+    OutboundState, RdmaConnection, RdmaConnectionConfig, SessionManager, SharedCmId,
+    VerbsConnectionResources, build_qp, empty_connection_setup, install_reserved_connection,
+    is_failure_event, lock_unpoison, run_setup_before_establish,
 };
 use crate::cm::{CmEventType, CmId, PortSpace};
 use crate::v2::engine::reactor::CommandIngress;
 use crate::v2::engine::reactor::completion::CommandCompletion;
+use crate::v2::engine::session::registry::ConnectionRegistry;
 use crate::v2::error::{Error, Result};
 
 pub(in crate::v2::engine) async fn connect(
@@ -37,19 +38,23 @@ pub(in crate::v2::engine) async fn connect_with_setup(
     setup: ConnectionSetup,
 ) -> Result<RdmaConnection> {
     shared.validate_connection_config(&config)?;
-    let permit = commands
+    let lane = commands
         .acquire_connect()
         .await
         .ok_or_else(|| shared.admission_error().unwrap_or(Error::DriverShutdown))?;
-    let (admission, reservation) = reserve_connection(&shared)?;
-    let request = Arc::new(OutboundRequest::new(address, config, setup, reservation));
+    let permit = commands.reserve_connect(lane).map_err(|error| {
+        if matches!(error, Error::DriverShutdown) {
+            shared.admission_error().unwrap_or(error)
+        } else {
+            error
+        }
+    })?;
+    let request = Arc::new(OutboundRequest::new(address, config, setup));
     #[cfg(any(test, feature = "test-hooks"))]
     shared.pause_connect_before_enqueue();
     commands.enqueue_connect(Arc::clone(&request), permit);
-    drop(admission);
     commands.publish_command_work();
     let waiter = ConnectWaiter {
-        manager: Arc::downgrade(&shared),
         commands: Arc::downgrade(&commands),
         request: Arc::downgrade(&request),
         observer: Arc::clone(&request.observer),
@@ -63,23 +68,21 @@ pub(in crate::v2::engine) async fn connect_with_setup(
 
 pub(super) fn start(
     state: &CmState,
+    connections: &mut ConnectionRegistry,
     resources: &EngineResources,
     request: Arc<OutboundRequest>,
+    reservation: super::ConnectionReservation,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<bool> {
     if request.observer.completion.is_cancelled() || state.shutting_down.load(Ordering::Acquire) {
-        request.take_reservation();
+        drop(reservation);
         request.complete_into(Err(Error::DriverShutdown), actions);
         return Ok(false);
     }
-    let reservation = request.take_reservation().ok_or_else(|| {
-        Error::InvalidConfig("outbound request lost its connection reservation".into())
-    })?;
-    let (token, route) = match state
-        .routes
-        .allocate_with(|token| Arc::new(OutboundRoute::new(token, Arc::clone(&request))))
+    let token = match connections
+        .register_outbound(|token| OutboundRoute::new(token, Arc::clone(&request)))
     {
-        Ok(route) => route,
+        Ok(token) => token,
         Err(error) => {
             drop(reservation);
             request.complete_failure_into(error, actions);
@@ -95,7 +98,7 @@ pub(super) fn start(
     ) {
         Ok(cm_id) => SharedCmId::new(cm_id, Arc::clone(&resources.cm_event_channel)),
         Err(error) => {
-            state.routes.release(token, false);
+            connections.release_route(token, false);
             drop(reservation);
             request.complete_failure_into(Error::from_v1(error), actions);
             return Ok(false);
@@ -103,7 +106,7 @@ pub(super) fn start(
     };
     let Some(context_token) = cm_id.context_token() else {
         state.defer_cm_id(cm_id);
-        state.routes.release(token, false);
+        connections.release_route(token, false);
         drop(reservation);
         request.complete_failure_into(
             Error::InvalidConfig("engine CM ID lost its route context token".into()),
@@ -114,7 +117,7 @@ pub(super) fn start(
     let context_route = CmRouteToken::decode(context_token);
     if context_route != token {
         state.defer_cm_id(cm_id);
-        state.routes.release(token, false);
+        connections.release_route(token, false);
         drop(reservation);
         request.complete_failure_into(
             Error::InvalidConfig("engine CM context token did not match its route".into()),
@@ -123,7 +126,7 @@ pub(super) fn start(
         return Ok(false);
     }
     let context_key = cm_id.context_key();
-    route.set_identity(cm_id.as_raw() as usize, context_key);
+    assert!(connections.set_route_identity(token, cm_id.as_raw() as usize, context_key));
     let raw_id = cm_id.as_raw() as usize;
     if !state.insert_context_route(
         context_key,
@@ -133,7 +136,7 @@ pub(super) fn start(
         },
     ) {
         state.defer_cm_id(cm_id);
-        state.routes.release(token, false);
+        connections.release_route(token, false);
         drop(reservation);
         request.complete_failure_into(
             Error::InvalidConfig("duplicate CM context identity".into()),
@@ -144,14 +147,19 @@ pub(super) fn start(
 
     let resolve = cm_id.resolve_addr(None, &request.address, 2_000);
     match resolve {
-        Ok(()) => route.set_state(OutboundState::AwaitAddr {
-            cm_id,
-            request,
-            reservation,
-        }),
+        Ok(()) => {
+            assert!(connections.set_outbound_state(
+                token,
+                OutboundState::AwaitAddr {
+                    cm_id,
+                    request,
+                    reservation,
+                },
+            ));
+        }
         Err(error) => {
             state.defer_cm_id(cm_id);
-            state.retire_route(&route, false);
+            state.retire_route(connections, token, false);
             drop(reservation);
             request.complete_failure_into(Error::from_v1(error), actions);
             return Ok(false);
@@ -162,6 +170,7 @@ pub(super) fn start(
 
 pub(super) fn process_cancellation(
     state: &CmState,
+    connections: &mut ConnectionRegistry,
     shared: &SessionManager,
     io_core: &mut crate::v2::engine::io_core::IoState,
     request: Arc<OutboundRequest>,
@@ -172,10 +181,10 @@ pub(super) fn process_cancellation(
         return Ok(());
     }
     let token = CmRouteToken::decode(encoded);
-    let Lookup::Occupied(route) = state.routes.lookup_cloned(token) else {
+    let Lookup::Occupied(_) = connections.lookup_outbound(token) else {
         return Ok(());
     };
-    let route_state = route.take_state_if(|route_state| {
+    let route_state = connections.take_outbound_state_if(token, |route_state| {
         matches!(
             route_state,
             OutboundState::EstablishedAwaitingDelivery { .. }
@@ -202,17 +211,34 @@ pub(super) fn process_cancellation(
         _ => unreachable!("cancellation state was pre-filtered"),
     };
     debug_assert!(Arc::ptr_eq(&route_request, &request));
-    let Some(connection_state) = connection.upgrade() else {
-        state.retire_route(&route, true);
+    let connection_token = connection.token;
+    if !matches!(connections.lookup(connection_token), Lookup::Occupied(_)) {
+        state.retire_route(connections, token, true);
         return Ok(());
-    };
-    route.set_state(OutboundState::Closing {
-        connection: connection.clone(),
-    });
-    shared.begin_connection_close_into(&connection_state, io_core, actions);
+    }
+    connections.set_outbound_state(
+        token,
+        OutboundState::Closing {
+            connection: connection.clone(),
+        },
+    );
+    shared.begin_connection_close_into(connections, connection_token, io_core, actions);
     drop(request.take_result());
-    if io_core.connection_accepted_count(&connection_state.io) == 0 {
-        shared.retire_registered_connection_into(io_core, connection_state.token, actions)?;
+    if connections
+        .with_connection(connection_token, |connection| {
+            connection.io_ledger.accepted_count()
+        })
+        .unwrap_or(0)
+        == 0
+    {
+        super::retirement::retire_registered_connection_into(
+            state,
+            connections,
+            shared,
+            io_core,
+            connection_token,
+            actions,
+        )?;
     }
     drop(route_request);
     Ok(())
@@ -220,29 +246,46 @@ pub(super) fn process_cancellation(
 
 pub(super) fn handle_event(
     state: &CmState,
+    connections: &mut ConnectionRegistry,
     shared: &SessionManager,
     io_core: &mut crate::v2::engine::io_core::IoState,
     resources: &EngineResources,
-    route: &Arc<OutboundRoute>,
+    token: CmRouteToken,
     snapshot: CmEventSnapshot,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<EventDisposition> {
     let disposition = if is_failure_event(snapshot.event_type) || snapshot.status != 0 {
-        handle_failure_event(state, shared, io_core, route, snapshot, actions)?
+        handle_failure_event(
+            state,
+            connections,
+            shared,
+            io_core,
+            token,
+            snapshot,
+            actions,
+        )?
     } else {
         match snapshot.event_type {
             CmEventType::AddrResolved => {
-                handle_addr_resolved(state, shared, resources, route, actions)
+                handle_addr_resolved(state, connections, shared, resources, token, actions)
             }
-            CmEventType::RouteResolved => {
-                handle_route_resolved(state, shared, io_core, resources, route, actions)
+            CmEventType::RouteResolved => handle_route_resolved(
+                state,
+                connections,
+                shared,
+                io_core,
+                resources,
+                token,
+                actions,
+            ),
+            CmEventType::Established => {
+                handle_established(state, connections, shared, io_core, token, actions)
             }
-            CmEventType::Established => handle_established(state, shared, io_core, route, actions),
             CmEventType::Disconnected => {
-                handle_disconnected(state, shared, io_core, route, actions)
+                handle_disconnected(state, connections, shared, io_core, token, actions)
             }
             CmEventType::TimewaitExit => {
-                if route.is_disconnected() {
+                if connections.outbound_is_disconnected(token) {
                     Ok(EventDisposition::Handled)
                 } else {
                     Ok(EventDisposition::Rejected(CmEventReject::Unexpected))
@@ -251,15 +294,15 @@ pub(super) fn handle_event(
             _ => Ok(EventDisposition::Rejected(CmEventReject::Unexpected)),
         }?
     };
-    let route_retired = !matches!(state.routes.lookup_cloned(route.token), Lookup::Occupied(_));
+    let route_retired = !matches!(connections.lookup_outbound(token), Lookup::Occupied(_));
     if is_failure_event(snapshot.event_type)
         || snapshot.status != 0
         || snapshot.event_type == CmEventType::RouteResolved
         || snapshot.event_type == CmEventType::Established
         || route_retired
-        || !route.is_establishing()
+        || !connections.outbound_is_establishing(token)
     {
-        state.outbound_setup_active.store(false, Ordering::Release);
+        connections.finish_outbound_setup();
         shared.publish_session_work();
     }
     Ok(disposition)
@@ -267,43 +310,51 @@ pub(super) fn handle_event(
 
 fn handle_addr_resolved(
     state: &CmState,
+    connections: &mut ConnectionRegistry,
     shared: &SessionManager,
     resources: &EngineResources,
-    route: &Arc<OutboundRoute>,
+    token: CmRouteToken,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<EventDisposition> {
     let Some(OutboundState::AwaitAddr {
         cm_id,
         request,
         reservation,
-    }) = route.take_state_if(|route_state| matches!(route_state, OutboundState::AwaitAddr { .. }))
+    }) = connections.take_outbound_state_if(token, |route_state| {
+        matches!(route_state, OutboundState::AwaitAddr { .. })
+    })
     else {
         return Ok(EventDisposition::Rejected(CmEventReject::Duplicate));
     };
     if request.observer.completion.is_cancelled() || shared.shutdown_requested() {
         state.defer_cm_id(cm_id);
         drop(reservation);
-        state.retire_route(route, true);
+        state.retire_route(connections, token, true);
         request.complete_into(Err(Error::DriverShutdown), actions);
         return Ok(EventDisposition::Handled);
     }
     if let Err(error) = cm_id.require_context(resources.context.raw_context()) {
         state.defer_cm_id(cm_id);
         drop(reservation);
-        state.retire_route(route, true);
+        state.retire_route(connections, token, true);
         request.complete_failure_into(Error::from_v1(error), actions);
         return Ok(EventDisposition::Handled);
     }
     match cm_id.resolve_route(2_000) {
-        Ok(()) => route.set_state(OutboundState::AwaitRoute {
-            cm_id,
-            request,
-            reservation,
-        }),
+        Ok(()) => {
+            connections.set_outbound_state(
+                token,
+                OutboundState::AwaitRoute {
+                    cm_id,
+                    request,
+                    reservation,
+                },
+            );
+        }
         Err(error) => {
             state.defer_cm_id(cm_id);
             drop(reservation);
-            state.retire_route(route, true);
+            state.retire_route(connections, token, true);
             request.complete_failure_into(Error::from_v1(error), actions);
         }
     }
@@ -312,31 +363,34 @@ fn handle_addr_resolved(
 
 fn handle_route_resolved(
     state: &CmState,
+    connections: &mut ConnectionRegistry,
     shared: &SessionManager,
     io_core: &mut crate::v2::engine::io_core::IoState,
     resources: &EngineResources,
-    route: &Arc<OutboundRoute>,
+    token: CmRouteToken,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<EventDisposition> {
     let Some(OutboundState::AwaitRoute {
         cm_id,
         request,
         reservation,
-    }) = route.take_state_if(|route_state| matches!(route_state, OutboundState::AwaitRoute { .. }))
+    }) = connections.take_outbound_state_if(token, |route_state| {
+        matches!(route_state, OutboundState::AwaitRoute { .. })
+    })
     else {
         return Ok(EventDisposition::Rejected(CmEventReject::Duplicate));
     };
     if request.observer.completion.is_cancelled() || shared.shutdown_requested() {
         state.defer_cm_id(cm_id);
         drop(reservation);
-        state.retire_route(route, true);
+        state.retire_route(connections, token, true);
         request.complete_into(Err(Error::DriverShutdown), actions);
         return Ok(EventDisposition::Handled);
     }
     if let Err(error) = cm_id.require_context(resources.context.raw_context()) {
         state.defer_cm_id(cm_id);
         drop(reservation);
-        state.retire_route(route, true);
+        state.retire_route(connections, token, true);
         request.complete_failure_into(Error::from_v1(error), actions);
         return Ok(EventDisposition::Handled);
     }
@@ -348,56 +402,64 @@ fn handle_route_resolved(
         Err(error) => {
             state.defer_cm_id(cm_id);
             drop(reservation);
-            state.retire_route(route, true);
+            state.retire_route(connections, token, true);
             request.complete_failure_into(error, actions);
             return Ok(EventDisposition::Handled);
         }
     };
-    let verbs = Arc::new(VerbsConnectionResources::new_shared(qp, cm_id));
+    let verbs = VerbsConnectionResources::new_shared(qp, cm_id);
     let connection = match install_reserved_connection(
         shared,
-        Arc::clone(&verbs) as Arc<_>,
+        connections,
+        Some(token),
+        verbs,
         request.config.clone(),
         local_addr,
         peer_addr,
         reservation,
-        Some(ConnectionCmRoute::Outbound(route.token.encode())),
     ) {
         Ok(connection) => connection,
         Err(failure) => {
-            let (error, failed_resources) = failure.into_parts();
-            match shared.destroy_unregistered_connection(&verbs) {
+            let (error, mut failed_resources) = failure.into_parts();
+            match shared.destroy_failed_connection_install(connections, &mut failed_resources) {
                 Ok((cm_id, _qp_destroyed)) => {
-                    state.release_failed_install(shared, failed_resources)?;
+                    state.release_failed_install(connections, failed_resources)?;
                     if let Some(cm_id) = cm_id {
                         state.defer_cm_id(cm_id);
                     }
-                    state.retire_route(route, true);
+                    state.retire_route(connections, token, true);
                 }
                 Err(destroy_error) => {
                     CmState::record_setup_rollback_quarantine(&destroy_error);
                     let connection = state.retain_failed_install(
+                        connections,
                         shared,
+                        token,
                         failed_resources,
                         &destroy_error,
                         actions,
                     );
-                    route.set_state(OutboundState::Quarantined { connection });
+                    connections
+                        .set_outbound_state(token, OutboundState::Quarantined { connection });
                 }
             }
-            drop(verbs);
             request.complete_failure_into(error, actions);
             return Ok(EventDisposition::Handled);
         }
     };
+    let Lookup::Occupied(_) = connections.lookup(connection.session_token()) else {
+        return Err(Error::InvalidConfig(
+            "outbound connection entry disappeared during setup".into(),
+        ));
+    };
 
     let Some(setup) = request.take_setup() else {
-        drop(verbs);
         fail_registered_connection(
             state,
+            connections,
             shared,
             io_core,
-            route,
+            token,
             request,
             connection,
             Error::InvalidConfig("outbound request setup was consumed more than once".into()),
@@ -408,9 +470,16 @@ fn handle_route_resolved(
     let conn_param = match request.config.conn_param() {
         Ok(param) => param,
         Err(error) => {
-            drop(verbs);
             fail_registered_connection(
-                state, shared, io_core, route, request, connection, error, actions,
+                state,
+                connections,
+                shared,
+                io_core,
+                token,
+                request,
+                connection,
+                error,
+                actions,
             )?;
             return Ok(EventDisposition::Handled);
         }
@@ -418,6 +487,8 @@ fn handle_route_resolved(
     let establish = run_setup_before_establish(
         setup,
         &connection,
+        connections,
+        connection.session_token(),
         io_core,
         || {
             if request.observer.completion.is_cancelled() || shared.shutdown_requested() {
@@ -426,22 +497,35 @@ fn handle_route_resolved(
                 Ok(())
             }
         },
-        || verbs.connect(&conn_param),
+        |connections| {
+            connections
+                .with_connection(connection.session_token(), |connection| {
+                    connection.connect(&conn_param)
+                })
+                .ok_or(Error::TransportClosed)?
+        },
     );
     if let Err(error) = establish {
-        drop(verbs);
         fail_registered_connection(
-            state, shared, io_core, route, request, connection, error, actions,
+            state,
+            connections,
+            shared,
+            io_core,
+            token,
+            request,
+            connection,
+            error,
+            actions,
         )?;
         return Ok(EventDisposition::Handled);
     }
     if request.observer.completion.is_cancelled() || shared.shutdown_requested() {
-        drop(verbs);
         fail_registered_connection(
             state,
+            connections,
             shared,
             io_core,
-            route,
+            token,
             request,
             connection,
             Error::DriverShutdown,
@@ -449,11 +533,13 @@ fn handle_route_resolved(
         )?;
         return Ok(EventDisposition::Handled);
     }
-    drop(verbs);
-    route.set_state(OutboundState::AwaitEstablished {
-        request,
-        connection,
-    });
+    connections.set_outbound_state(
+        token,
+        OutboundState::AwaitEstablished {
+            request,
+            connection,
+        },
+    );
     Ok(EventDisposition::Handled)
 }
 
@@ -462,23 +548,45 @@ fn handle_route_resolved(
     reason = "CM failure transition dependencies stay explicit"
 )]
 fn fail_registered_connection(
-    _state: &CmState,
+    state: &CmState,
+    connections: &mut ConnectionRegistry,
     shared: &SessionManager,
     io_core: &mut crate::v2::engine::io_core::IoState,
-    route: &Arc<OutboundRoute>,
+    token: CmRouteToken,
     request: Arc<OutboundRequest>,
     connection: RdmaConnection,
     error: Error,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<()> {
-    let connection_state = connection.require_session_state()?;
-    route.set_state(OutboundState::Closing {
-        connection: EstablishedConnectionRoute::new(&connection_state),
-    });
-    shared.begin_connection_close_into(&connection_state, io_core, actions);
+    let connection_token = connection.session_token();
+    let Lookup::Occupied(_) = connections.lookup(connection_token) else {
+        return Err(Error::InvalidConfig(
+            "registered outbound connection disappeared before close".into(),
+        ));
+    };
+    connections.set_outbound_state(
+        token,
+        OutboundState::Closing {
+            connection: EstablishedConnectionRoute::new(connection_token),
+        },
+    );
+    shared.begin_connection_close_into(connections, connection_token, io_core, actions);
     drop(connection);
-    if io_core.connection_accepted_count(&connection_state.io) == 0 {
-        shared.retire_registered_connection_into(io_core, connection_state.token, actions)?;
+    if connections
+        .with_connection(connection_token, |connection| {
+            connection.io_ledger.accepted_count()
+        })
+        .unwrap_or(0)
+        == 0
+    {
+        super::retirement::retire_registered_connection_into(
+            state,
+            connections,
+            shared,
+            io_core,
+            connection_token,
+            actions,
+        )?;
     }
     if matches!(&error, Error::DriverShutdown) {
         request.complete_into(Err(error), actions);
@@ -490,25 +598,28 @@ fn fail_registered_connection(
 
 fn handle_established(
     state: &CmState,
+    connections: &mut ConnectionRegistry,
     shared: &SessionManager,
     io_core: &mut crate::v2::engine::io_core::IoState,
-    route: &Arc<OutboundRoute>,
+    token: CmRouteToken,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<EventDisposition> {
     let Some(OutboundState::AwaitEstablished {
         request,
         connection,
-    }) = route
-        .take_state_if(|route_state| matches!(route_state, OutboundState::AwaitEstablished { .. }))
+    }) = connections.take_outbound_state_if(token, |route_state| {
+        matches!(route_state, OutboundState::AwaitEstablished { .. })
+    })
     else {
         return Ok(EventDisposition::Rejected(CmEventReject::Duplicate));
     };
     if request.observer.completion.is_cancelled() || shared.shutdown_requested() {
         fail_registered_connection(
             state,
+            connections,
             shared,
             io_core,
-            route,
+            token,
             request,
             connection,
             Error::DriverShutdown,
@@ -517,29 +628,39 @@ fn handle_established(
         return Ok(EventDisposition::Handled);
     }
     let waiter = Arc::clone(&request);
-    route.set_state(OutboundState::EstablishedAwaitingDelivery {
-        request,
-        connection: EstablishedConnectionRoute::new(&connection.require_session_state()?),
-    });
+    let connection_token = connection.session_token();
+    connections.set_outbound_state(
+        token,
+        OutboundState::EstablishedAwaitingDelivery {
+            request,
+            connection: EstablishedConnectionRoute::new(connection_token),
+        },
+    );
+    if !connections.mark_active(connection_token) {
+        return Err(Error::InvalidConfig(
+            "outbound connection disappeared before establishment".into(),
+        ));
+    }
     waiter.complete_into(Ok(connection), actions);
     Ok(EventDisposition::Handled)
 }
 
 fn handle_disconnected(
     state: &CmState,
+    connections: &mut ConnectionRegistry,
     shared: &SessionManager,
     io_core: &mut crate::v2::engine::io_core::IoState,
-    route: &Arc<OutboundRoute>,
+    token: CmRouteToken,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<EventDisposition> {
-    let route_state = route.take_state_if(|route_state| {
+    let route_state = connections.take_outbound_state_if(token, |route_state| {
         matches!(
             route_state,
-            OutboundState::EstablishedAwaitingDelivery { .. } | OutboundState::Established { .. }
+            OutboundState::EstablishedAwaitingDelivery { .. }
         )
     });
     let Some(route_state) = route_state else {
-        if route.is_disconnected() {
+        if connections.outbound_is_disconnected(token) {
             return Ok(EventDisposition::Rejected(CmEventReject::Duplicate));
         }
         return Ok(EventDisposition::Rejected(CmEventReject::Unexpected));
@@ -549,41 +670,64 @@ fn handle_disconnected(
             request,
             connection,
         } => (Some(request), connection),
-        OutboundState::Established { connection } => (None, connection),
         _ => unreachable!("disconnect state was pre-filtered"),
     };
-    let Some(connection_state) = connection.upgrade() else {
-        state.retire_route(route, true);
+    let connection_token = connection.token;
+    if !matches!(connections.lookup(connection_token), Lookup::Occupied(_)) {
+        state.retire_route(connections, token, true);
         return Ok(EventDisposition::Handled);
-    };
-    if let Some(event) = connection_state.mark_disconnected() {
+    }
+    if let Some(event) = connections
+        .with_connection_mut(connection_token, ConnectionState::mark_disconnected)
+        .flatten()
+    {
         actions.push_event(event);
     }
     let awaiting_delivery = request
         .as_ref()
         .is_some_and(|request| !request.observer.delivered.load(Ordering::Acquire));
     if awaiting_delivery {
-        route.set_state(OutboundState::DisconnectedAwaitingDelivery {
-            request: request.expect("awaiting delivery retains its request"),
-            connection: connection.clone(),
-        });
+        connections.set_outbound_state(
+            token,
+            OutboundState::DisconnectedAwaitingDelivery {
+                request: request.expect("awaiting delivery retains its request"),
+                connection: connection.clone(),
+            },
+        );
     } else {
-        route.set_state(OutboundState::Disconnected {
-            connection: connection.clone(),
-        });
+        connections.set_outbound_state(
+            token,
+            OutboundState::Disconnected {
+                connection: connection.clone(),
+            },
+        );
     }
-    shared.begin_connection_close_into(&connection_state, io_core, actions);
-    if io_core.connection_accepted_count(&connection_state.io) == 0 {
-        shared.retire_registered_connection_into(io_core, connection_state.token, actions)?;
+    shared.begin_connection_close_into(connections, connection_token, io_core, actions);
+    if connections
+        .with_connection(connection_token, |connection| {
+            connection.io_ledger.accepted_count()
+        })
+        .unwrap_or(0)
+        == 0
+    {
+        super::retirement::retire_registered_connection_into(
+            state,
+            connections,
+            shared,
+            io_core,
+            connection_token,
+            actions,
+        )?;
     }
     Ok(EventDisposition::Handled)
 }
 
 fn handle_failure_event(
     state: &CmState,
+    connections: &mut ConnectionRegistry,
     shared: &SessionManager,
     io_core: &mut crate::v2::engine::io_core::IoState,
-    route: &Arc<OutboundRoute>,
+    token: CmRouteToken,
     snapshot: CmEventSnapshot,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<EventDisposition> {
@@ -591,7 +735,7 @@ fn handle_failure_event(
         "RDMA CM {:?} failed with status {} for id={:#x} listen_id={:#x}",
         snapshot.event_type, snapshot.status, snapshot.id, snapshot.listen_id
     );
-    let route_state = route.take_state_if(|_| true);
+    let route_state = connections.take_outbound_state_if(token, |_| true);
     let Some(route_state) = route_state else {
         return Ok(EventDisposition::Rejected(CmEventReject::Duplicate));
     };
@@ -610,7 +754,7 @@ fn handle_failure_event(
                 request.observer.completion.is_cancelled() || shared.shutdown_requested();
             state.defer_cm_id(cm_id);
             drop(reservation);
-            state.retire_route(route, true);
+            state.retire_route(connections, token, true);
             if shutdown_won {
                 tracing::debug!(
                     cm_event = ?snapshot.event_type,
@@ -631,9 +775,10 @@ fn handle_failure_event(
         } => {
             fail_registered_connection(
                 state,
+                connections,
                 shared,
                 io_core,
-                route,
+                token,
                 request,
                 connection,
                 Error::Verbs(std::io::Error::other(message)),
@@ -648,54 +793,93 @@ fn handle_failure_event(
             request,
             connection,
         } => {
-            let Some(connection_state) = connection.upgrade() else {
-                state.retire_route(route, true);
+            let connection_token = connection.token;
+            if !matches!(connections.lookup(connection_token), Lookup::Occupied(_)) {
+                state.retire_route(connections, token, true);
                 return Ok(EventDisposition::Handled);
-            };
-            if let Some(event) = connection_state.mark_cm_failure_into(
-                Error::Verbs(std::io::Error::other(message.clone())),
-                actions,
-            ) {
+            }
+            if let Some(event) = connections
+                .with_connection_mut(connection_token, |connection| {
+                    connection.mark_cm_failure_into(
+                        Error::Verbs(std::io::Error::other(message.clone())),
+                        actions,
+                    )
+                })
+                .flatten()
+            {
                 actions.push_event(event);
             }
             if request.observer.delivered.load(Ordering::Acquire) {
-                route.set_state(OutboundState::Failed {
-                    connection: connection.clone(),
-                });
+                connections.set_outbound_state(
+                    token,
+                    OutboundState::Failed {
+                        connection: connection.clone(),
+                    },
+                );
             } else {
-                route.set_state(OutboundState::FailedAwaitingDelivery {
-                    request,
-                    connection: connection.clone(),
-                });
+                connections.set_outbound_state(
+                    token,
+                    OutboundState::FailedAwaitingDelivery {
+                        request,
+                        connection: connection.clone(),
+                    },
+                );
             }
-            shared.begin_connection_close_into(&connection_state, io_core, actions);
-            if io_core.connection_accepted_count(&connection_state.io) == 0 {
-                shared.retire_registered_connection_into(
+            shared.begin_connection_close_into(connections, connection_token, io_core, actions);
+            if connections
+                .with_connection(connection_token, |connection| {
+                    connection.io_ledger.accepted_count()
+                })
+                .unwrap_or(0)
+                == 0
+            {
+                super::retirement::retire_registered_connection_into(
+                    state,
+                    connections,
+                    shared,
                     io_core,
-                    connection_state.token,
+                    connection_token,
                     actions,
                 )?;
             }
         }
-        OutboundState::Established { connection } | OutboundState::Disconnected { connection } => {
-            let Some(connection_state) = connection.upgrade() else {
-                state.retire_route(route, true);
+        OutboundState::Disconnected { connection } => {
+            let connection_token = connection.token;
+            if !matches!(connections.lookup(connection_token), Lookup::Occupied(_)) {
+                state.retire_route(connections, token, true);
                 return Ok(EventDisposition::Handled);
-            };
-            if let Some(event) = connection_state.mark_cm_failure_into(
-                Error::Verbs(std::io::Error::other(message.clone())),
-                actions,
-            ) {
+            }
+            if let Some(event) = connections
+                .with_connection_mut(connection_token, |connection| {
+                    connection.mark_cm_failure_into(
+                        Error::Verbs(std::io::Error::other(message.clone())),
+                        actions,
+                    )
+                })
+                .flatten()
+            {
                 actions.push_event(event);
             }
-            route.set_state(OutboundState::Failed {
-                connection: connection.clone(),
-            });
-            shared.begin_connection_close_into(&connection_state, io_core, actions);
-            if io_core.connection_accepted_count(&connection_state.io) == 0 {
-                shared.retire_registered_connection_into(
+            connections.set_outbound_state(
+                token,
+                OutboundState::Failed {
+                    connection: connection.clone(),
+                },
+            );
+            shared.begin_connection_close_into(connections, connection_token, io_core, actions);
+            if connections
+                .with_connection(connection_token, |connection| {
+                    connection.io_ledger.accepted_count()
+                })
+                .unwrap_or(0)
+                == 0
+            {
+                super::retirement::retire_registered_connection_into(
+                    state,
+                    connections,
+                    shared,
                     io_core,
-                    connection_state.token,
+                    connection_token,
                     actions,
                 )?;
             }
@@ -704,22 +888,25 @@ fn handle_failure_event(
             request,
             connection,
         } => {
-            route.set_state(OutboundState::FailedAwaitingDelivery {
-                request,
-                connection,
-            });
+            connections.set_outbound_state(
+                token,
+                OutboundState::FailedAwaitingDelivery {
+                    request,
+                    connection,
+                },
+            );
             return Ok(EventDisposition::Rejected(CmEventReject::Duplicate));
         }
         OutboundState::Failed { connection } => {
-            route.set_state(OutboundState::Failed { connection });
+            connections.set_outbound_state(token, OutboundState::Failed { connection });
             return Ok(EventDisposition::Rejected(CmEventReject::Duplicate));
         }
         OutboundState::Closing { connection } => {
-            route.set_state(OutboundState::Closing { connection });
+            connections.set_outbound_state(token, OutboundState::Closing { connection });
             return Ok(EventDisposition::Rejected(CmEventReject::Duplicate));
         }
         route_state @ OutboundState::Quarantined { .. } => {
-            route.set_state(route_state);
+            connections.set_outbound_state(token, route_state);
             return Ok(EventDisposition::Rejected(CmEventReject::Duplicate));
         }
         OutboundState::Transitioning => {
@@ -735,7 +922,6 @@ pub(in crate::v2::engine) struct OutboundRequest {
     pub(super) address: SocketAddr,
     pub(super) config: RdmaConnectionConfig,
     setup: Mutex<Option<ConnectionSetup>>,
-    reservation: Mutex<Option<ConnectionReservation>>,
     pub(super) observer: Arc<OutboundRequestObserver>,
     cancellation_enqueued: AtomicBool,
     pub(super) route_token: AtomicU64,
@@ -747,17 +933,15 @@ pub(super) struct OutboundRequestObserver {
 }
 
 impl OutboundRequest {
-    pub(super) fn new(
+    pub(in crate::v2::engine) fn new(
         address: SocketAddr,
         config: RdmaConnectionConfig,
         setup: ConnectionSetup,
-        reservation: ConnectionReservation,
     ) -> Self {
         Self {
             address,
             config,
             setup: Mutex::new(Some(setup)),
-            reservation: Mutex::new(Some(reservation)),
             observer: Arc::new(OutboundRequestObserver {
                 completion: CommandCompletion::new(),
                 delivered: AtomicBool::new(false),
@@ -769,15 +953,6 @@ impl OutboundRequest {
 
     pub(super) fn take_setup(&self) -> Option<ConnectionSetup> {
         lock_unpoison(&self.setup).take()
-    }
-
-    pub(in crate::v2::engine) fn take_reservation(&self) -> Option<ConnectionReservation> {
-        lock_unpoison(&self.reservation).take()
-    }
-
-    #[cfg(test)]
-    pub(super) fn complete(&self, result: Result<RdmaConnection>) {
-        self.observer.completion.complete(result);
     }
 
     pub(super) fn complete_into(
@@ -804,7 +979,7 @@ impl OutboundRequest {
             .complete_into(Err(error), false, actions);
     }
 
-    pub(super) fn try_enqueue_cancellation(&self) -> bool {
+    pub(in crate::v2::engine) fn try_enqueue_cancellation(&self) -> bool {
         !self.cancellation_enqueued.swap(true, Ordering::AcqRel)
     }
 
@@ -841,7 +1016,6 @@ impl OutboundRequestObserver {
 }
 
 pub(super) struct ConnectWaiter {
-    pub(super) manager: Weak<SessionManager>,
     pub(super) commands: Weak<CommandIngress>,
     pub(super) request: Weak<OutboundRequest>,
     pub(super) observer: Arc<OutboundRequestObserver>,
@@ -874,12 +1048,6 @@ impl Future for ConnectWaiter {
 impl ConnectWaiter {
     fn mark_delivered(&self) {
         self.observer.delivered.store(true, Ordering::Release);
-        let Some(request) = self.request.upgrade() else {
-            return;
-        };
-        if let Some(manager) = self.manager.upgrade() {
-            manager.cm.mark_request_delivered(&request);
-        }
     }
 }
 
@@ -897,9 +1065,8 @@ impl Drop for ConnectWaiter {
         {
             return;
         }
-        if let Some(manager) = self.manager.upgrade() {
-            manager.cm.enqueue_cancellation(request);
-            manager.publish_session_work();
+        if let Some(commands) = self.commands.upgrade() {
+            commands.request_connect_cancel(request);
         }
     }
 }

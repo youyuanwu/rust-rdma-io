@@ -13,12 +13,10 @@ use tokio::sync::OwnedSemaphorePermit;
 
 #[cfg(test)]
 use super::EngineShared;
-use super::io_core::{self, EstablishedIoConnection, IoState};
+use super::io_core::{self, ConnectionIoState, EstablishedIoConnection, IoState};
 use super::reactor::ReactorActions;
 use super::registry::{OperationToken, lock_unpoison};
 use super::resources::EngineResourceRefs;
-use super::session::SessionConnection;
-#[cfg(test)]
 use super::session::connection::ConnectionState;
 use super::session::connection::RdmaConnection;
 use crate::v2::error::{Error, Result};
@@ -54,7 +52,8 @@ impl MemoryRegistrar {
 #[derive(Clone)]
 pub(crate) struct IoConnection {
     memory: MemoryRegistrar,
-    session: SessionConnection,
+    connection: super::registry::ConnectionToken,
+    close: Arc<super::session::SessionCloseState>,
     events: IoEventSender,
     commands: Weak<super::reactor::CommandIngress>,
     manager: Weak<super::session::SessionManager>,
@@ -68,7 +67,7 @@ impl IoConnection {
 
     pub(crate) fn post_recv_batch(&self, requests: Vec<IoRecvRequest>) -> IoSubmissionDisposition {
         self.submit_protocol(ProtocolCommand::recv(
-            self.session.token(),
+            self.connection,
             self.events.clone(),
             Arc::clone(&self.admission.open),
             requests,
@@ -81,7 +80,7 @@ impl IoConnection {
 
     pub(crate) fn post_send(&self, request: IoSendRequest) -> IoSubmissionDisposition {
         self.submit_protocol(ProtocolCommand::send(
-            self.session.token(),
+            self.connection,
             self.events.clone(),
             Arc::clone(&self.admission.open),
             request,
@@ -89,16 +88,38 @@ impl IoConnection {
     }
 
     pub(crate) fn request_close(&self) {
-        self.session.request_close();
+        if self.close.is_retired() {
+            return;
+        }
+        if let (Some(manager), Some(commands)) = (self.manager.upgrade(), self.commands.upgrade()) {
+            commands.request_connection_close(&manager, self.connection);
+        }
     }
 
     pub(crate) async fn close(&self) -> Result<()> {
-        self.session.close().await
+        self.request_close();
+        loop {
+            let notify = self.close.notify();
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(outcome) = self.close.outcome() {
+                return outcome.into_result();
+            }
+            if let Some(manager) = self.manager.upgrade()
+                && let Some(outcome) = manager.engine_outcome()
+            {
+                return outcome.into_result();
+            }
+            notified.await;
+        }
     }
 
-    pub(super) fn from_connection(connection: &RdmaConnection) -> Result<(Self, IoEventReceiver)> {
+    pub(super) fn from_connection(
+        connection: &RdmaConnection,
+        state: &mut ConnectionState,
+    ) -> Result<(Self, IoEventReceiver)> {
         let (events, receiver) = event_port();
-        let state = connection.session_state().ok_or(Error::TransportClosed)?;
         let pending = state.install_io_event_sender(events.clone())?;
         if let Some(pending) = pending {
             pending.deliver();
@@ -106,10 +127,11 @@ impl IoConnection {
         Ok((
             Self {
                 memory: connection.memory.clone(),
-                session: connection.session.clone(),
+                connection: connection.session_token(),
+                close: connection.close_state(),
                 events,
-                commands: connection.session.command_ingress(),
-                manager: connection.session.manager(),
+                commands: connection.command_ingress(),
+                manager: connection.manager(),
                 admission: Arc::new(ProtocolAdmissionState::default()),
             },
             receiver,
@@ -399,6 +421,8 @@ impl IoConnectionTestAdmission<'_> {
 pub(crate) struct BorrowedSetupIo<'a> {
     io_core: &'a mut IoState,
     io: Arc<EstablishedIoConnection>,
+    io_ledger: &'a mut ConnectionIoState,
+    poster: &'a dyn super::io_core::IoPostAuthority,
     connection: IoConnection,
 }
 
@@ -411,7 +435,14 @@ impl BorrowedSetupIo<'_> {
         &mut self,
         requests: Vec<IoRecvRequest>,
     ) -> IoSubmissionDisposition {
-        io_core::post_io_recv_batch(self.io_core, &self.io, &self.connection.events, requests)
+        io_core::post_io_recv_batch(
+            self.io_core,
+            &self.io,
+            self.io_ledger,
+            self.poster,
+            &self.connection.events,
+            requests,
+        )
     }
 
     pub(crate) fn into_connection(self) -> IoConnection {
@@ -422,14 +453,17 @@ impl BorrowedSetupIo<'_> {
 impl<'a> BorrowedSetupIo<'a> {
     pub(super) fn from_connection(
         connection: &'a RdmaConnection,
+        state: &'a mut ConnectionState,
         io_core: &'a mut IoState,
     ) -> Result<(Self, IoEventReceiver)> {
-        let (owned, receiver) = IoConnection::from_connection(connection)?;
-        let state = connection.require_session_state()?;
+        let (owned, receiver) = IoConnection::from_connection(connection, state)?;
+        let (io, io_ledger, poster) = state.io_parts_mut();
         Ok((
             Self {
                 io_core,
-                io: Arc::clone(&state.io),
+                io: Arc::clone(io),
+                io_ledger,
+                poster,
                 connection: owned,
             },
             receiver,
@@ -553,7 +587,7 @@ impl ProtocolCommand {
 
     pub(in crate::v2::engine) fn execute_into(
         self,
-        shared: &super::EngineShared,
+        connections: &mut super::session::registry::ConnectionRegistry,
         io_core: &mut IoState,
         actions: &mut ReactorActions,
     ) {
@@ -568,28 +602,40 @@ impl ProtocolCommand {
             }
             return;
         }
-        let super::registry::Lookup::Occupied(connection) =
-            shared.session.connections.lookup(self.connection)
-        else {
-            self.reject_into(Error::TransportClosed, actions);
-            return;
-        };
-        if !connection.io_is_open() {
+        if !connections.io_is_open(self.connection) {
             self.reject_into(Error::TransportClosed, actions);
             return;
         }
         match self.batch {
             ProtocolBatch::Recv(requests) => {
-                io_core::post_io_recv_batch_into(
-                    io_core,
-                    &connection.io,
-                    &self.events,
-                    requests,
-                    actions,
-                );
+                connections
+                    .with_connection_io_mut(self.connection, |connection, connection_io, poster| {
+                        io_core::post_io_recv_batch_into(
+                            io_core,
+                            connection,
+                            connection_io,
+                            poster,
+                            &self.events,
+                            requests,
+                            actions,
+                        );
+                    })
+                    .expect("open protocol connection retains its I/O bundle");
             }
             ProtocolBatch::Send(request) => {
-                io_core::post_io_send_into(io_core, &connection.io, &self.events, request, actions);
+                connections
+                    .with_connection_io_mut(self.connection, |connection, connection_io, poster| {
+                        io_core::post_io_send_into(
+                            io_core,
+                            connection,
+                            connection_io,
+                            poster,
+                            &self.events,
+                            request,
+                            actions,
+                        );
+                    })
+                    .expect("open protocol connection retains its I/O bundle");
             }
             #[cfg(test)]
             ProtocolBatch::Test(_) => unreachable!("test protocol command returned above"),
@@ -727,7 +773,7 @@ impl IoConnection {
         let shared = EngineShared::new(EngineConfig::new("test0".into()), None, None)
             .expect("test engine state")
             .into_shared();
-        let connection = Arc::new(ConnectionState::new(
+        let connection = ConnectionState::new_for_test(
             ConnectionToken {
                 slot: 0,
                 generation: 1,
@@ -737,8 +783,7 @@ impl IoConnection {
             None,
             None,
             None,
-            None,
-        ));
+        );
         let (sender, receiver) = event_port();
         assert!(
             connection
@@ -747,14 +792,14 @@ impl IoConnection {
                 .is_none()
         );
         let delayed = sender.terminal(IoTerminalEvent::Closed(Ok(())));
-        let session = shared.session.connection_capability(&connection);
         (
             Self {
                 memory: MemoryRegistrar { pd: None },
-                commands: session.command_ingress(),
-                manager: session.manager(),
+                commands: Arc::downgrade(&shared.commands),
+                manager: Arc::downgrade(&shared.session),
                 admission: Arc::new(ProtocolAdmissionState::default()),
-                session,
+                connection: connection.token,
+                close: connection.close_state(),
                 events: sender,
             },
             receiver,

@@ -44,36 +44,35 @@ impl WorkRequestPoster for TestPoster {
 }
 
 #[test]
-fn io_post_authority_is_posting_only_and_does_not_retain_the_owner() {
+fn posting_authority_is_borrowed_from_the_entry_owned_poster() {
     let owner: Arc<dyn WorkRequestPoster> = Arc::new(TestPoster);
-    assert_eq!(Arc::strong_count(&owner), 1);
-    let authority = SessionIoPostAuthority::new(&owner, owner.qp_num());
+    let weak = Arc::downgrade(&owner);
+    let authority = ConnectionPoster::from(owner);
     assert_eq!(authority.qp_num(), 1);
     assert_eq!(
-        Arc::strong_count(&owner),
+        weak.strong_count(),
         1,
-        "posting authority must retain only a weak owner reference"
+        "the connection entry is the sole owning poster"
     );
 
-    drop(owner);
-    assert!(matches!(authority.owner(), Err(Error::TransportClosed)));
+    drop(authority);
+    assert!(weak.upgrade().is_none());
 }
 
 #[test]
 fn live_io_proofs_require_exact_identity() {
-    let registry = ConnectionRegistry::new(1).unwrap();
+    let mut registry = ConnectionRegistry::new(1).unwrap();
     let registration = registry.register(1, |token| {
-        Arc::new(ConnectionState::new(
+        ConnectionState::new(
             token,
             Arc::new(TestPoster),
             RdmaConnectionConfig::default(),
             None,
             None,
             None,
-            None,
-        ))
+        )
     });
-    let (token, connection) = match registration {
+    let (token, _connection) = match registration {
         Ok(registered) => registered,
         Err(failure) => panic!("connection registration failed: {}", failure.error),
     };
@@ -82,7 +81,9 @@ fn live_io_proofs_require_exact_identity() {
     assert!(live.proves(token, 1));
     assert!(registry.prove_live_io(token, 2).is_none());
     assert_eq!(
-        connection.io.identity(),
+        registry
+            .with_connection(token, |connection| connection.io.identity())
+            .unwrap(),
         EstablishedIoIdentity {
             connection: token,
             qp_num: 1,
@@ -97,6 +98,16 @@ fn live_io_proofs_require_exact_identity() {
     assert!(registry.prove_live_io(token, 1).is_none());
 
     registry.set_qp_mapping_for_test(1, token);
+    assert!(registry.begin_close(token));
+    registry
+        .with_connection_mut(token, |connection| {
+            connection
+                .transition_to_error_once(&SessionLifecycleAuthority::for_test())
+                .unwrap();
+        })
+        .unwrap();
+    assert!(registry.request_retirement(token));
+    assert!(registry.begin_retirement(token));
     let retained = registry
         .release(token, 1)
         .expect("the exact live generation remains registered");
@@ -108,15 +119,14 @@ fn live_io_proofs_require_exact_identity() {
     assert!(registry.detach_qp_index(token, 1));
 
     let replacement = registry.register(1, |replacement| {
-        Arc::new(ConnectionState::new(
+        ConnectionState::new(
             replacement,
             Arc::new(TestPoster),
             RdmaConnectionConfig::default(),
             None,
             None,
             None,
-            None,
-        ))
+        )
     });
     let (replacement, _) = match replacement {
         Ok(registered) => registered,
@@ -134,8 +144,8 @@ fn live_io_proofs_require_exact_identity() {
 }
 
 #[test]
-fn terminal_events_are_pending_until_the_connection_lock_is_released() {
-    let connection = Arc::new(ConnectionState::new(
+fn terminal_events_are_pending_until_backend_state_is_committed() {
+    let mut connection = ConnectionState::new(
         ConnectionToken {
             slot: 0,
             generation: 1,
@@ -145,8 +155,7 @@ fn terminal_events_are_pending_until_the_connection_lock_is_released() {
         None,
         None,
         None,
-        None,
-    ));
+    );
     let (sender, receiver) = event_port();
     assert!(
         connection
@@ -216,14 +225,13 @@ fn memoized_close_failure_preserves_its_typed_error() {
 
 #[test]
 fn destroy_quarantine_publishes_event_and_outcome_once() {
-    let connection = ConnectionState::new(
+    let mut connection = ConnectionState::new(
         ConnectionToken {
             slot: 0,
             generation: 1,
         },
         Arc::new(TestPoster),
         RdmaConnectionConfig::default(),
-        None,
         None,
         None,
         None,
@@ -257,128 +265,6 @@ fn destroy_quarantine_publishes_event_and_outcome_once() {
         Err(Error::ConnectionDestroyQuarantined { cause })
             if cause.contains("first destroy failure")
     ));
-}
-
-#[test]
-fn connection_state_counts_follow_exact_reservation_transitions() {
-    let pool = ConnectionAdmissionPool::new(1);
-    let mut reservation = pool.try_acquire().expect("reservation");
-    assert_eq!(
-        pool.snapshot(),
-        ConnectionStateCountSnapshot {
-            live: 1,
-            establishing: 1,
-            ..ConnectionStateCountSnapshot::default()
-        }
-    );
-
-    reservation.mark_registered();
-    assert_eq!(
-        pool.snapshot(),
-        ConnectionStateCountSnapshot {
-            live: 1,
-            established: 1,
-            registered_live_qps: 1,
-            ..ConnectionStateCountSnapshot::default()
-        }
-    );
-
-    reservation.mark_draining();
-    reservation.mark_quarantined();
-    assert_eq!(
-        pool.snapshot(),
-        ConnectionStateCountSnapshot {
-            live: 1,
-            draining: 1,
-            quarantined_bundles: 1,
-            ..ConnectionStateCountSnapshot::default()
-        }
-    );
-
-    reservation.recover_quarantine(true);
-    reservation.mark_qp_destroyed();
-    assert_eq!(
-        pool.snapshot(),
-        ConnectionStateCountSnapshot {
-            live: 1,
-            draining: 1,
-            ..ConnectionStateCountSnapshot::default()
-        }
-    );
-
-    drop(reservation);
-    assert_eq!(pool.snapshot(), ConnectionStateCountSnapshot::default());
-}
-
-#[test]
-fn dropped_setup_quarantine_keeps_admission_and_bundle_pinned() {
-    let pool = ConnectionAdmissionPool::new(1);
-    let mut reservation = pool.try_acquire().expect("reservation");
-
-    assert!(reservation.retain_setup_quarantine());
-    assert!(!reservation.retain_setup_quarantine());
-    drop(reservation);
-
-    assert_eq!(
-        pool.snapshot(),
-        ConnectionStateCountSnapshot {
-            live: 1,
-            quarantined_bundles: 1,
-            ..ConnectionStateCountSnapshot::default()
-        }
-    );
-    assert!(pool.try_acquire().is_none());
-}
-
-#[test]
-fn clearing_dropped_setup_quarantine_releases_live_and_bundle_gauges_together() {
-    let pool = ConnectionAdmissionPool::new(2);
-    let retained = {
-        let mut reservation = pool.try_acquire().unwrap();
-        assert!(reservation.retain_setup_quarantine());
-        reservation
-    };
-    let live = pool.try_acquire().unwrap();
-    drop(retained);
-
-    pool.clear_retained_quarantine();
-
-    assert_eq!(
-        pool.snapshot(),
-        ConnectionStateCountSnapshot {
-            live: 1,
-            establishing: 1,
-            ..ConnectionStateCountSnapshot::default()
-        }
-    );
-    assert!(pool.try_acquire().is_some());
-    drop(live);
-}
-
-#[test]
-fn invalid_retained_quarantine_release_panics_without_corrupting_gauges() {
-    let pool = ConnectionAdmissionPool::new(1);
-
-    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
-        let pool = Arc::clone(&pool);
-        move || pool.clear_retained_quarantine()
-    }));
-
-    let panic = panic.expect_err("zero retained gauges must fail deterministically");
-    let message = panic
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| panic.downcast_ref::<&str>().copied())
-        .expect("retained gauge assertion uses a string panic");
-    assert_eq!(
-        message,
-        "retained connection quarantine release requires positive live and bundle gauges; live=0, quarantined_bundles=0"
-    );
-    assert_eq!(pool.snapshot(), ConnectionStateCountSnapshot::default());
-    let reservation = pool.try_acquire().expect("admission remains available");
-    assert!(pool.try_acquire().is_none());
-    drop(reservation);
-    assert_eq!(pool.snapshot(), ConnectionStateCountSnapshot::default());
 }
 
 #[test]
@@ -423,7 +309,7 @@ fn destroy_with_accepted_work_fails_closed_without_destroying() {
     }
 
     let poster = Arc::new(DestroyPoster(AtomicUsize::new(0)));
-    let connection = ConnectionState::new(
+    let mut connection = ConnectionState::new(
         ConnectionToken {
             slot: 1,
             generation: 1,
@@ -433,11 +319,9 @@ fn destroy_with_accepted_work_fails_closed_without_destroying() {
         None,
         None,
         None,
-        None,
     );
-    let lifecycle = connection.lock_lifecycle();
     let authority = SessionLifecycleAuthority::for_test();
-    let error = match connection.destroy_connection_resources(&authority, &lifecycle, 1) {
+    let error = match connection.destroy_connection_resources(&authority, 1) {
         Ok(_) => panic!("accepted work must prevent connection destruction"),
         Err(error) => error,
     };
@@ -455,7 +339,7 @@ fn destroy_with_accepted_work_fails_closed_without_destroying() {
 #[test]
 fn missing_qp_returns_typed_post_errors() {
     let resources = VerbsConnectionResources {
-        qp: Mutex::new(None),
+        qp: None,
         qp_num: 9,
         capabilities: QpCapabilities {
             max_send_wr: 1,
@@ -463,18 +347,18 @@ fn missing_qp_returns_typed_post_errors() {
             max_send_sge: 1,
             max_recv_sge: 1,
         },
-        cm_owner: Mutex::new(None),
+        cm_owner: None,
     };
     let mut send =
         PreparedSendBatch::new(vec![SendWr::new(1, WrOpcode::Send)]).expect("send batch");
     let mut recv = PreparedRecvBatch::new(vec![RecvWr::new(2)]).expect("recv batch");
 
     assert!(matches!(
-        resources.post_send(&mut send),
+        resources.post_send_owned(&mut send),
         Err(Error::TransportClosed)
     ));
     assert!(matches!(
-        resources.post_recv(&mut recv),
+        resources.post_recv_owned(&mut recv),
         Err(Error::TransportClosed)
     ));
 }

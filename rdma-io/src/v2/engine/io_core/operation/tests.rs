@@ -9,13 +9,13 @@ use super::batch::{
 };
 use super::state::{CompletionDisposition, OperationLifecycle, OperationState};
 use crate::v2::engine::io_core::{
-    CqeReject, Direction, EstablishedIoConnection, EstablishedIoIdentity, IoDriverSignal, IoState,
+    ConnectionIoState, CqeReject, Direction, EstablishedIoConnection, EstablishedIoIdentity,
+    IoDriverSignal, IoState,
 };
 use crate::v2::engine::registry::{ConnectionToken, LiveIoConnectionProof, Lookup, OperationToken};
-use crate::v2::error::{Error, Result};
+use crate::v2::error::Error;
 use crate::v2::qp::BatchPostOutcome;
 use crate::wc::{WcOpcode, WorkCompletion};
-use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
 use rdma_io_sys::ibverbs::{IBV_WC_RECV, IBV_WC_SEND, IBV_WC_SUCCESS};
 
 struct TestSignal;
@@ -25,24 +25,6 @@ impl IoDriverSignal for TestSignal {
     fn publish_completion_dispatch(&self) {}
     fn publish_reclamation(&self) {}
     fn pause_operation_before_register(&self) {}
-}
-
-struct TestPoster {
-    qp_num: u32,
-}
-
-impl super::super::IoPostAuthority for TestPoster {
-    fn qp_num(&self) -> u32 {
-        self.qp_num
-    }
-
-    fn post_send(&self, _batch: &mut PreparedSendBatch) -> Result<BatchPostOutcome> {
-        Ok(BatchPostOutcome::AllAccepted)
-    }
-
-    fn post_recv(&self, _batch: &mut PreparedRecvBatch) -> Result<BatchPostOutcome> {
-        Ok(BatchPostOutcome::AllAccepted)
-    }
 }
 
 fn core(capacity: usize) -> IoState {
@@ -57,26 +39,33 @@ fn core(capacity: usize) -> IoState {
     .unwrap()
 }
 
-fn connection(slot: u32, generation: u32, qp_num: u32) -> Arc<EstablishedIoConnection> {
-    EstablishedIoConnection::new(
+fn connection(
+    slot: u32,
+    generation: u32,
+    qp_num: u32,
+) -> (Arc<EstablishedIoConnection>, ConnectionIoState) {
+    let connection = EstablishedIoConnection::new(
         EstablishedIoIdentity {
             connection: ConnectionToken { slot, generation },
             qp_num,
         },
-        Arc::new(TestPoster { qp_num }),
         8,
         8,
         Arc::new(tokio::sync::Notify::new()),
-    )
+    );
+    let ledger = ConnectionIoState::from_connection(&connection);
+    (connection, ledger)
 }
 
 fn install_posting(
     core: &mut IoState,
     connection: &Arc<EstablishedIoConnection>,
+    connection_io: &mut ConnectionIoState,
     direction: Direction,
     opcode: WcOpcode,
 ) -> OperationToken {
-    core.reserve_local(connection, direction).unwrap();
+    core.reserve_local(connection, connection_io, direction)
+        .unwrap();
     assert!(core.cq_credits.reserve());
     core.operations
         .allocate(|token| {
@@ -88,9 +77,10 @@ fn install_posting(
 fn commit_accepted(
     core: &mut IoState,
     connection: &Arc<EstablishedIoConnection>,
+    connection_io: &mut ConnectionIoState,
     token: OperationToken,
 ) {
-    core.add_accepted(connection, token);
+    core.add_accepted(connection, connection_io, token);
     core.accepted_operations += 1;
     let Lookup::Occupied(operation) = core.operations.lookup_mut(token) else {
         panic!("test operation remains registered")
@@ -101,11 +91,12 @@ fn commit_accepted(
 fn install_accepted(
     core: &mut IoState,
     connection: &Arc<EstablishedIoConnection>,
+    connection_io: &mut ConnectionIoState,
     direction: Direction,
     opcode: WcOpcode,
 ) -> OperationToken {
-    let token = install_posting(core, connection, direction, opcode);
-    commit_accepted(core, connection, token);
+    let token = install_posting(core, connection, connection_io, direction, opcode);
+    commit_accepted(core, connection, connection_io, token);
     token
 }
 
@@ -138,7 +129,7 @@ fn credit_pool_never_oversubscribes_or_reuses_retained_debt() {
 #[test]
 fn operation_registry_is_value_owned_generational_and_duplicate_aware() {
     let mut registry = OperationRegistry::new(1).unwrap();
-    let connection = connection(1, 3, 7);
+    let (connection, _connection_io) = connection(1, 3, 7);
     let token = registry
         .allocate(|token| {
             OperationState::new(
@@ -176,8 +167,14 @@ fn operation_registry_is_value_owned_generational_and_duplicate_aware() {
 #[test]
 fn early_cqe_is_retained_until_post_acceptance_reconciliation() {
     let mut core = core(4);
-    let connection = connection(1, 1, 11);
-    let token = install_posting(&mut core, &connection, Direction::Send, WcOpcode::Send);
+    let (connection, mut connection_io) = connection(1, 1, 11);
+    let token = install_posting(
+        &mut core,
+        &connection,
+        &mut connection_io,
+        Direction::Send,
+        WcOpcode::Send,
+    );
     let completion = wc(token, 11, IBV_WC_SEND);
     let Lookup::Occupied(operation) = core.operations.lookup_mut(token) else {
         panic!("posting operation")
@@ -191,13 +188,16 @@ fn early_cqe_is_retained_until_post_acceptance_reconciliation() {
         .commit_accepted()
         .early
         .expect("early CQE retained");
-    core.add_accepted(&connection, token);
+    core.add_accepted(&connection, &mut connection_io, token);
     core.accepted_operations += 1;
 
-    let effects = core.finish_early_completion(token, early);
+    let effects = core.finish_early_completion(&mut connection_io, token, early);
     assert_eq!(core.operations.live(), 0);
     assert_eq!(core.accepted_operations, 0);
-    assert_eq!(core.connection_accepted_count(&connection), 0);
+    assert_eq!(
+        core.connection_accepted_count(&connection, &connection_io),
+        0
+    );
     assert_eq!(core.cq_credits.free(), 4);
     effects.publish();
 }
@@ -205,8 +205,14 @@ fn early_cqe_is_retained_until_post_acceptance_reconciliation() {
 #[test]
 fn batch_early_cqe_uses_post_guard_publication_without_drained_effect() {
     let mut core = core(1);
-    let connection = connection(1, 1, 15);
-    let token = install_posting(&mut core, &connection, Direction::Recv, WcOpcode::Recv);
+    let (connection, mut connection_io) = connection(1, 1, 15);
+    let token = install_posting(
+        &mut core,
+        &connection,
+        &mut connection_io,
+        Direction::Recv,
+        WcOpcode::Recv,
+    );
     let completion = wc(token, 15, IBV_WC_RECV);
     let Lookup::Occupied(operation) = core.operations.lookup_mut(token) else {
         panic!("posting batch operation")
@@ -219,6 +225,7 @@ fn batch_early_cqe_uses_post_guard_publication_without_drained_effect() {
 
     let after_unlock = commit_internal_entries(
         &mut core,
+        &mut connection_io,
         vec![InternalBatchEntry {
             token,
             sge: crate::wr::Sge::new(0, 0, 0),
@@ -228,15 +235,24 @@ fn batch_early_cqe_uses_post_guard_publication_without_drained_effect() {
 
     assert_eq!(core.operations.live(), 0);
     assert_eq!(core.accepted_operations, 0);
-    assert_eq!(core.connection_accepted_count(&connection), 0);
+    assert_eq!(
+        core.connection_accepted_count(&connection, &connection_io),
+        0
+    );
     assert_eq!(core.cq_credits.free(), 1);
 }
 
 #[test]
 fn operation_cancellation_is_deduplicated_and_schedules_one_deadline() {
     let mut core = core(2);
-    let connection = connection(1, 1, 12);
-    let token = install_accepted(&mut core, &connection, Direction::Send, WcOpcode::Send);
+    let (connection, mut connection_io) = connection(1, 1, 12);
+    let token = install_accepted(
+        &mut core,
+        &connection,
+        &mut connection_io,
+        Direction::Send,
+        WcOpcode::Send,
+    );
 
     core.cancel_operation(token);
     core.cancel_operation(token);
@@ -252,8 +268,9 @@ fn operation_cancellation_is_deduplicated_and_schedules_one_deadline() {
 #[test]
 fn cancellation_observed_during_provider_post_commits_then_reclaims_once() {
     let mut core = core(1);
-    let connection = connection(1, 1, 13);
-    core.reserve_local(&connection, Direction::Send).unwrap();
+    let (connection, mut connection_io) = connection(1, 1, 13);
+    core.reserve_local(&connection, &mut connection_io, Direction::Send)
+        .unwrap();
     assert!(core.cq_credits.reserve());
     let observer = super::state::OperationObserver::new();
     let token = core
@@ -274,7 +291,7 @@ fn cancellation_observed_during_provider_post_commits_then_reclaims_once() {
     // This is the state reached when the frontend is dropped while the sole
     // reactor thread is inside the provider post call.
     observer.cancel();
-    core.add_accepted(&connection, token);
+    core.add_accepted(&connection, &mut connection_io, token);
     core.accepted_operations += 1;
     let Lookup::Occupied(operation) = core.operations.lookup_mut(token) else {
         panic!("posting operation remains registered")
@@ -326,7 +343,7 @@ fn exact_prefix_and_ambiguous_batch_reconciliation_preserve_whole_ownership() {
     assert_eq!(retained, vec![1, 2, 3]);
 
     let mut registry = OperationRegistry::new(2).unwrap();
-    let connection = connection(2, 1, 14);
+    let (connection, _connection_io) = connection(2, 1, 14);
     let first = registry
         .allocate(|token| {
             OperationState::new(
@@ -375,22 +392,33 @@ fn exact_prefix_and_ambiguous_batch_reconciliation_preserve_whole_ownership() {
 #[test]
 fn exact_cqe_validation_rejects_wrong_qp_opcode_and_duplicate() {
     let mut core = core(4);
-    let connection = connection(2, 9, 17);
-    let token = install_accepted(&mut core, &connection, Direction::Send, WcOpcode::Send);
+    let (connection, mut connection_io) = connection(2, 9, 17);
+    let token = install_accepted(
+        &mut core,
+        &connection,
+        &mut connection_io,
+        Direction::Send,
+        WcOpcode::Send,
+    );
     let live = LiveIoConnectionProof::for_test(connection.identity());
 
     let wrong_qp = core
         .prepare_completion(wc(token, 18, IBV_WC_SEND))
         .expect("live token resolves");
     assert!(
-        core.enqueue_prepared_completion(wrong_qp, Some(live), &connection)
+        core.enqueue_prepared_completion(wrong_qp, Some(live), &connection, &mut connection_io,)
             .is_none()
     );
     let wrong_opcode = core
         .prepare_completion(wc(token, 17, IBV_WC_RECV))
         .expect("live token resolves");
     assert!(
-        core.enqueue_prepared_completion(wrong_opcode, Some(live), &connection)
+        core.enqueue_prepared_completion(
+            wrong_opcode,
+            Some(live),
+            &connection,
+            &mut connection_io,
+        )
             .is_none()
     );
 
@@ -398,18 +426,19 @@ fn exact_cqe_validation_rejects_wrong_qp_opcode_and_duplicate() {
         .prepare_completion(wc(token, 17, IBV_WC_SEND))
         .expect("exact token resolves");
     assert_eq!(
-        core.enqueue_prepared_completion(exact, Some(live), &connection),
+        core.enqueue_prepared_completion(exact, Some(live), &connection, &mut connection_io,),
         Some(connection.identity().connection)
     );
     let duplicate = core
         .prepare_completion(wc(token, 17, IBV_WC_SEND))
         .expect("registered token still resolves before dispatch");
     assert!(
-        core.enqueue_prepared_completion(duplicate, Some(live), &connection)
+        core.enqueue_prepared_completion(duplicate, Some(live), &connection, &mut connection_io,)
             .is_none()
     );
 
-    let (processed, ready, _) = core.dispatch_connection_completions(&connection, 1);
+    let (processed, ready, _) =
+        core.dispatch_connection_completions(&connection, &mut connection_io, 1);
     assert_eq!((processed, ready), (1, false));
     assert_eq!(core.operations.live(), 0);
     assert_eq!(
@@ -425,11 +454,18 @@ fn exact_cqe_validation_rejects_wrong_qp_opcode_and_duplicate() {
 #[test]
 fn reclamation_deadline_quarantines_and_late_cqe_clears_exact_debt() {
     let mut core = core(2);
-    let connection = connection(3, 1, 19);
-    let token = install_accepted(&mut core, &connection, Direction::Recv, WcOpcode::Recv);
+    let (connection, mut connection_io) = connection(3, 1, 19);
+    let token = install_accepted(
+        &mut core,
+        &connection,
+        &mut connection_io,
+        Direction::Recv,
+        WcOpcode::Recv,
+    );
     core.cancel_operation(token);
-    let added = core.handle_reclamation_deadline(token);
-    assert!(core.operation_quarantined_for_test(token));
+    let added = core.handle_reclamation_deadline(token, &mut connection_io);
+    connection_io.mark_operation_quarantined(token);
+    assert!(core.operation_quarantined_for_test(&connection_io, token));
     assert_eq!(core.pending_reclamations, 0);
     assert_eq!(core.quarantined_operations, 1);
     assert_eq!(core.quarantined_mrs, 1);
@@ -441,24 +477,31 @@ fn reclamation_deadline_quarantines_and_late_cqe_clears_exact_debt() {
     let pending = core
         .prepare_completion(wc(token, 19, IBV_WC_RECV))
         .expect("quarantined operation still resolves");
-    core.enqueue_prepared_completion(pending, Some(live), &connection)
+    core.enqueue_prepared_completion(pending, Some(live), &connection, &mut connection_io)
         .expect("exact late CQE");
-    let (_, _, cleared) = core.dispatch_connection_completions(&connection, 1);
+    let (_, _, cleared) = core.dispatch_connection_completions(&connection, &mut connection_io, 1);
     drop(cleared);
+    assert!(connection_io.clear_operation_quarantined(token));
 
     assert_eq!(core.quarantined_operations, 0);
     assert_eq!(core.quarantined_mrs, 0);
     assert_eq!(core.quarantined_bytes, 0);
     assert_eq!(core.cq_credits.retained(), 0);
     assert_eq!(core.cq_credits.free(), 2);
-    assert!(!core.operation_quarantined_for_test(token));
+    assert!(!core.operation_quarantined_for_test(&connection_io, token));
 }
 
 #[test]
 fn qp_destruction_release_requires_exact_connection_and_qp() {
     let mut core = core(2);
-    let connection = connection(4, 2, 23);
-    let token = install_accepted(&mut core, &connection, Direction::Send, WcOpcode::Send);
+    let (connection, mut connection_io) = connection(4, 2, 23);
+    let token = install_accepted(
+        &mut core,
+        &connection,
+        &mut connection_io,
+        Direction::Send,
+        WcOpcode::Send,
+    );
 
     assert!(
         !core
@@ -469,6 +512,7 @@ fn qp_destruction_release_requires_exact_connection_and_qp() {
                 },
                 24,
                 &connection,
+                &mut connection_io,
                 Error::TransportClosed,
                 token,
             )
@@ -480,6 +524,7 @@ fn qp_destruction_release_requires_exact_connection_and_qp() {
         connection.identity().connection,
         connection.identity().qp_num,
         &connection,
+        &mut connection_io,
         Error::TransportClosed,
         token,
     );
@@ -487,16 +532,25 @@ fn qp_destruction_release_requires_exact_connection_and_qp() {
     drop(effects);
     assert_eq!(core.operations.live(), 0);
     assert_eq!(core.accepted_operations, 0);
-    assert_eq!(core.connection_accepted_count(&connection), 0);
+    assert_eq!(
+        core.connection_accepted_count(&connection, &connection_io),
+        0
+    );
     assert_eq!(core.cq_credits.free(), 2);
 }
 
 #[test]
 fn terminalization_is_bounded_and_preserves_provider_ownership_in_quarantine() {
     let mut core = core(3);
-    let connection = connection(5, 1, 29);
+    let (connection, mut connection_io) = connection(5, 1, 29);
     for _ in 0..3 {
-        install_accepted(&mut core, &connection, Direction::Send, WcOpcode::Send);
+        install_accepted(
+            &mut core,
+            &connection,
+            &mut connection_io,
+            Direction::Send,
+            WcOpcode::Send,
+        );
     }
     let outcome =
         crate::v2::engine::lifecycle::MemoizedTerminalResult::from_error(Error::DriverShutdown);
@@ -514,21 +568,29 @@ fn terminalization_is_bounded_and_preserves_provider_ownership_in_quarantine() {
     assert_eq!(core.cq_credits.free(), 0);
     assert_eq!(core.cq_credits.retained(), 3);
     for token in core.operations.occupied_tokens() {
-        assert!(core.operation_quarantined_for_test(token));
+        assert!(matches!(
+            core.operations.lookup(token),
+            Lookup::Occupied(operation)
+                if operation.lifecycle() == OperationLifecycle::Quarantined
+        ));
     }
 }
 
 #[test]
 fn retiring_connection_io_requires_empty_ledgers_and_clears_publication_key() {
     let mut core = core(1);
-    let connection = connection(6, 4, 31);
-    core.reserve_local(&connection, Direction::Send).unwrap();
-    core.release_local(&connection, Direction::Send);
-    core.publish_connection(&connection);
+    let (connection, mut connection_io) = connection(6, 4, 31);
+    core.reserve_local(&connection, &mut connection_io, Direction::Send)
+        .unwrap();
+    core.release_local(&connection, &mut connection_io, Direction::Send);
+    core.publish_connection(connection.identity().connection);
     assert!(core.has_published_connections());
 
-    core.retire_connection_io(connection.identity().connection);
+    core.retire_connection_io(connection.identity().connection, &connection_io);
 
     assert!(!core.has_published_connections());
-    assert_eq!(core.connection_accepted_count(&connection), 0);
+    assert_eq!(
+        core.connection_accepted_count(&connection, &connection_io),
+        0
+    );
 }

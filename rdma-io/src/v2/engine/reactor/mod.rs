@@ -1,15 +1,16 @@
-//! Incremental command boundary for the driver-owned reactor migration.
+//! Driver-owned command, I/O, connection-lifecycle, and session progress.
 //!
-//! This module deliberately does not own session lifecycle state yet. It
-//! admits bounded frontend commands and lets the explicit engine driver
-//! transfer them into the existing authoritative session backend.
+//! Connection identity, routes, admission, deadlines, retirement, and
+//! quarantine live under this reactor. The shared session service retains the
+//! single listener/context-route and CM-destruction adapters until listener
+//! lifecycle moves as one unit.
 
 mod action;
 pub(super) mod command;
 pub(super) mod completion;
 mod scheduler;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::Context as TaskContext;
 use tokio::time::Instant;
 
@@ -28,8 +29,8 @@ use scheduler::{ReactorScheduler, ReactorSource};
 
 /// Driver-owned scheduling state for one bounded top-level reactor turn.
 ///
-/// Lifecycle and provider state deliberately remain in their authoritative
-/// pre-consolidation owners until their later migration phases.
+/// Listener identity and common CM adapter state remain in `SessionManager`;
+/// all connection-only mutable state is owned through `session`.
 pub(super) struct EngineReactor {
     pub(super) io: IoReactorSources,
     pub(super) session: SessionReactorSources,
@@ -44,6 +45,38 @@ pub(super) struct ReactorTurn {
 pub(super) struct ReactorTurnFailure {
     pub(super) error: super::Error,
     pub(super) actions: ReactorActions,
+}
+
+#[cfg(test)]
+struct ReactorTestBridge;
+
+#[cfg(test)]
+impl super::io_core::IoSessionBridge for ReactorTestBridge {
+    fn route_completion(
+        &self,
+        _io: &mut IoState,
+        _completion: crate::wc::WorkCompletion,
+    ) -> Option<super::registry::ConnectionToken> {
+        None
+    }
+
+    fn dispatch_connection_completions(
+        &self,
+        _io: &mut IoState,
+        _connection: super::registry::ConnectionToken,
+        _quantum: usize,
+    ) -> (usize, bool) {
+        (0, false)
+    }
+
+    fn handle_reclamation_deadline(
+        &self,
+        _io: &mut IoState,
+        _token: super::registry::OperationToken,
+    ) {
+    }
+
+    fn commit_terminal_effects(&self, _effects: super::io_core::IoCoreEffects) {}
 }
 
 impl EngineReactor {
@@ -70,7 +103,7 @@ impl EngineReactor {
         )
         .expect("validated engine I/O configuration");
         #[cfg(test)]
-        let bridge: Arc<dyn super::io_core::IoSessionBridge> = shared.session.clone();
+        let bridge: Arc<dyn super::io_core::IoSessionBridge> = Arc::new(ReactorTestBridge);
         Self {
             io: IoReactorSources::new(
                 io_core,
@@ -85,9 +118,11 @@ impl EngineReactor {
             ),
             session: SessionReactorSources::new(
                 Arc::clone(&shared.session),
+                shared.commands.connection_admission(),
                 session_resources,
                 shared.config.cm_event_budget,
                 shared.config.session_reclamation_budget,
+                shared.config.shutdown_deadline,
             ),
             scheduler: ReactorScheduler::new(),
         }
@@ -214,17 +249,19 @@ impl EngineReactor {
         while let Some(source) = ready.pop_front() {
             match source {
                 ReactorSource::Commands => {
-                    let report =
-                        shared
-                            .commands
-                            .service_turn_into(shared, self.io.core_mut(), &mut actions);
+                    let report = shared.commands.service_turn_into(
+                        shared,
+                        self.io.core_mut(),
+                        &mut self.session,
+                        &mut actions,
+                    );
                     if report.has_more {
                         shared.work_signal.publish(super::driver::REACTOR_WORK);
                     }
                     requires_repoll |= report.has_more || report.session_work;
                 }
                 ReactorSource::Cq => {
-                    let (_, _, repoll) = try_turn!(self.io.service_cq(&shared.session, mode, cx));
+                    let (_, _, repoll) = try_turn!(self.io.service_cq(&mut self.session, mode, cx));
                     requires_repoll |= repoll;
                 }
                 ReactorSource::CompletionDispatch => {
@@ -237,7 +274,7 @@ impl EngineReactor {
                     } else {
                         let (_, more) = try_turn!(self.io.service_completion_dispatch(
                             quantum,
-                            &shared.session,
+                            &mut self.session,
                             &mut actions,
                         ));
                         requires_repoll |= more;
@@ -253,7 +290,7 @@ impl EngineReactor {
                     let used = self.io.service_reclamation_deadlines(
                         now,
                         limit,
-                        &shared.session,
+                        &mut self.session,
                         &mut actions,
                     );
                     requires_repoll |= used == limit && self.io.due_deadline_count(now) != 0;
@@ -390,7 +427,7 @@ impl EngineReactor {
                     } else {
                         let (_, complete) =
                             self.io
-                                .service_terminal(budget, &shared.session, &mut actions);
+                                .service_terminal(budget, &mut self.session, &mut actions);
                         requires_repoll |= !complete;
                     }
                 }
@@ -399,6 +436,14 @@ impl EngineReactor {
         self.session
             .finish_turn(shutting_down, terminal_failure, observed_cm_would_block);
         shared.update_io_diagnostics(self.io.diagnostics());
+        let diagnostics = if terminal_failure {
+            self.session
+                .connections
+                .admission_snapshot_excluding_retained()
+        } else {
+            self.session.connections.admission_snapshot()
+        };
+        shared.update_connection_diagnostics(diagnostics);
         #[cfg(any(test, feature = "test-hooks"))]
         shared.update_io_rejections(self.io.core().rejected_cqe_reasons());
         // Sources made ready after the entry snapshot are deliberately not
@@ -453,9 +498,38 @@ impl EngineReactor {
         &mut self,
         shared: &Arc<EngineShared>,
     ) -> ReactorActions {
-        let actions = shared.handle_driver_drop(self.io.core_mut());
-        #[cfg(not(test))]
-        self.io.retain_unsafe_state();
+        let actions = shared.handle_driver_drop(&mut self.session, self.io.core_mut());
+        shared.update_connection_diagnostics(self.session.connections.admission_snapshot());
+        // A terminal outcome can intentionally publish diagnostics with
+        // retained connection bundles excluded. Do not use that copied
+        // snapshot as the ownership proof for dropping the reactor: setup
+        // rollback and destruction quarantines still live in the exclusive
+        // registry even when no operation debt remains.
+        let retain_reactor = shared
+            .failure_retained
+            .load(std::sync::atomic::Ordering::Acquire)
+            || self.session.connections.live() != 0
+            || self.io.core().accepted_count() != 0;
+        if retain_reactor {
+            let retained = std::mem::replace(self, EngineReactor::new(shared, None));
+            failed_reactor_quarantine()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(RetainedEngineReactor {
+                    _reactor: retained,
+                    _shared: Arc::clone(shared),
+                });
+        }
         actions
     }
+}
+
+struct RetainedEngineReactor {
+    _reactor: EngineReactor,
+    _shared: Arc<EngineShared>,
+}
+
+fn failed_reactor_quarantine() -> &'static Mutex<Vec<RetainedEngineReactor>> {
+    static REACTORS: OnceLock<Mutex<Vec<RetainedEngineReactor>>> = OnceLock::new();
+    REACTORS.get_or_init(|| Mutex::new(Vec::new()))
 }

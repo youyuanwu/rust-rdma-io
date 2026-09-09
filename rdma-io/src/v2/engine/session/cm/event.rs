@@ -1,13 +1,15 @@
 //! CM event acquisition, acknowledgement, and exact route dispatch.
 
-use std::sync::Arc;
+#[cfg(any(test, feature = "test-hooks"))]
 use std::sync::atomic::Ordering;
 
 use super::{
-    CmState, ContextRoute, EngineResources, InboundRejectReason, InboundRoute, ListenerState,
-    Lookup, OutboundRoute, SessionManager, lock_unpoison,
+    CmState, ContextRoute, EngineResources, InboundRejectReason, ListenerState, Lookup,
+    SessionManager, lock_unpoison,
 };
 use crate::cm::CmEventType;
+use crate::v2::engine::registry::ConnectionToken;
+use crate::v2::engine::session::registry::{ConnectionRegistry, ConnectionRouteIdentity};
 use crate::v2::error::{Error, Result};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,9 +37,9 @@ pub(super) enum EventDisposition {
 }
 
 pub(super) enum CmDispatchRoute {
-    Outbound(Arc<OutboundRoute>),
-    Inbound(Arc<InboundRoute>),
-    Listener(Arc<ListenerState>),
+    Outbound(ConnectionToken),
+    Inbound(ConnectionToken),
+    Listener(std::sync::Arc<ListenerState>),
 }
 
 pub(super) struct PendingCmEvent {
@@ -47,6 +49,7 @@ pub(super) struct PendingCmEvent {
 
 pub(super) fn acquire_event(
     state: &CmState,
+    connections: &ConnectionRegistry,
     resources: &EngineResources,
 ) -> Result<Option<PendingCmEvent>> {
     let event = match resources.cm_event_channel.try_get_event() {
@@ -64,13 +67,14 @@ pub(super) fn acquire_event(
         listen_id: event.listen_id_raw() as usize,
         context_key: event.context_key(),
     };
-    let route = lookup_dispatch_route(state, snapshot);
+    let route = lookup_dispatch_route(state, connections, snapshot);
     event.ack_checked().map_err(Error::from_v1)?;
     Ok(Some(PendingCmEvent { snapshot, route }))
 }
 
 pub(super) fn try_process_event(
     state: &CmState,
+    connections: &mut ConnectionRegistry,
     shared: &SessionManager,
     io_core: &mut crate::v2::engine::io_core::IoState,
     resources: &EngineResources,
@@ -79,17 +83,26 @@ pub(super) fn try_process_event(
     let pending = if let Some(pending) = state.take_pending_event() {
         pending
     } else {
-        let Some(pending) = acquire_event(state, resources)? else {
+        let Some(pending) = acquire_event(state, connections, resources)? else {
             return Ok(false);
         };
         pending
     };
-    process_event(state, shared, io_core, resources, pending, actions)?;
+    process_event(
+        state,
+        connections,
+        shared,
+        io_core,
+        resources,
+        pending,
+        actions,
+    )?;
     Ok(true)
 }
 
 fn process_event(
     state: &CmState,
+    connections: &mut ConnectionRegistry,
     shared: &SessionManager,
     io_core: &mut crate::v2::engine::io_core::IoState,
     resources: &EngineResources,
@@ -112,15 +125,21 @@ fn process_event(
         }
     };
     let disposition = match route {
-        CmDispatchRoute::Outbound(route) => {
-            state.handle_event(shared, io_core, resources, &route, snapshot, actions)?
-        }
-        CmDispatchRoute::Inbound(route) => {
-            state.handle_inbound_event(shared, io_core, &route, snapshot, actions)?
+        CmDispatchRoute::Outbound(token) => state.handle_event(
+            connections,
+            shared,
+            io_core,
+            resources,
+            token,
+            snapshot,
+            actions,
+        )?,
+        CmDispatchRoute::Inbound(token) => {
+            state.handle_inbound_event(connections, shared, io_core, token, snapshot, actions)?
         }
         CmDispatchRoute::Listener(listener) => {
             if snapshot.event_type == CmEventType::ConnectRequest {
-                state.handle_connect_request(shared, resources, &listener, snapshot)?
+                state.handle_connect_request(connections, shared, resources, &listener, snapshot)?
             } else {
                 state.handle_listener_event(shared, &listener, snapshot)?
             }
@@ -135,6 +154,7 @@ fn process_event(
 
 pub(super) fn lookup_dispatch_route(
     state: &CmState,
+    connections: &ConnectionRegistry,
     snapshot: CmEventSnapshot,
 ) -> std::result::Result<CmDispatchRoute, CmEventReject> {
     if snapshot.event_type == CmEventType::ConnectRequest {
@@ -156,23 +176,22 @@ pub(super) fn lookup_dispatch_route(
         .copied()
         .ok_or(CmEventReject::Unknown)?;
     match route {
-        ContextRoute::Outbound { .. } => {
-            lookup_event_route(state, snapshot).map(CmDispatchRoute::Outbound)
-        }
+        ContextRoute::Outbound { .. } => lookup_event_route(state, connections, snapshot)
+            .map(|route| CmDispatchRoute::Outbound(route.token)),
         ContextRoute::Inbound { token, raw_id } => {
             if raw_id != snapshot.id {
                 return Err(CmEventReject::WrongId);
             }
-            let route = match state.inbound_routes.lookup_cloned(token) {
+            let route = match connections.lookup_inbound(token) {
                 Lookup::Occupied(route) => route,
                 Lookup::Duplicate => return Err(CmEventReject::Duplicate),
                 Lookup::Stale | Lookup::Retired => return Err(CmEventReject::Stale),
                 Lookup::Unknown => return Err(CmEventReject::Unknown),
             };
-            if route.raw_id.load(Ordering::Acquire) != raw_id {
+            if route.raw_id != raw_id || route.context_key != snapshot.context_key {
                 return Err(CmEventReject::WrongId);
             }
-            Ok(CmDispatchRoute::Inbound(route))
+            Ok(CmDispatchRoute::Inbound(token))
         }
         ContextRoute::Listener { token, raw_id } => {
             if raw_id != snapshot.id {
@@ -189,8 +208,9 @@ pub(super) fn lookup_dispatch_route(
 
 pub(super) fn lookup_event_route(
     state: &CmState,
+    connections: &ConnectionRegistry,
     snapshot: CmEventSnapshot,
-) -> std::result::Result<Arc<OutboundRoute>, CmEventReject> {
+) -> std::result::Result<ConnectionRouteIdentity, CmEventReject> {
     if snapshot.context_key == 0 {
         return Err(CmEventReject::Unknown);
     }
@@ -204,13 +224,13 @@ pub(super) fn lookup_event_route(
     if raw_id != snapshot.id {
         return Err(CmEventReject::WrongId);
     }
-    let route = match state.routes.lookup_cloned(token) {
+    let route = match connections.lookup_outbound(token) {
         Lookup::Occupied(route) => route,
         Lookup::Duplicate => return Err(CmEventReject::Duplicate),
         Lookup::Stale | Lookup::Retired => return Err(CmEventReject::Stale),
         Lookup::Unknown => return Err(CmEventReject::Unknown),
     };
-    if route.raw_id.load(Ordering::Acquire) != raw_id {
+    if route.raw_id != raw_id || route.context_key != snapshot.context_key {
         return Err(CmEventReject::WrongId);
     }
     Ok(route)

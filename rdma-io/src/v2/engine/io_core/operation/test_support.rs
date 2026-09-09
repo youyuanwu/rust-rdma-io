@@ -11,7 +11,8 @@ use super::state::OperationState;
 
 pub(in crate::v2::engine) fn install_accepted_operation_for_driver_test(
     io_core: &mut IoCore,
-    connection: &Arc<crate::v2::engine::session::connection::ConnectionState>,
+    connections: &mut crate::v2::engine::session::registry::ConnectionRegistry,
+    connection: crate::v2::engine::registry::ConnectionToken,
     opcode: WcOpcode,
 ) -> OperationToken {
     let direction = if opcode == WcOpcode::Recv {
@@ -19,15 +20,22 @@ pub(in crate::v2::engine) fn install_accepted_operation_for_driver_test(
     } else {
         Direction::Send
     };
-    io_core.reserve_local(&connection.io, direction).unwrap();
-    assert!(io_core.cq_credits.reserve());
-    let token = io_core
-        .operations
-        .allocate(|token| {
-            OperationState::new(token, Arc::clone(connection), direction, opcode, None, 1)
+    let token = connections
+        .with_connection_io_mut(connection, |connection, connection_io, _poster| {
+            io_core
+                .reserve_local(connection, connection_io, direction)
+                .unwrap();
+            assert!(io_core.cq_credits.reserve());
+            let token = io_core
+                .operations
+                .allocate(|token| {
+                    OperationState::new(token, Arc::clone(connection), direction, opcode, None, 1)
+                })
+                .unwrap();
+            io_core.add_accepted(connection, connection_io, token);
+            token
         })
-        .unwrap();
-    io_core.add_accepted(&connection.io, token);
+        .expect("test connection remains registered");
     let Lookup::Occupied(operation) = io_core.operations.lookup_mut(token) else {
         unreachable!("test operation remains registered")
     };
@@ -50,8 +58,11 @@ pub(in crate::v2::engine) fn register_operation_waker_for_test(
 pub(in crate::v2::engine) fn operation_future_for_io_lifetime_test(
     io_core: &mut IoCore,
     connection: &Arc<EstablishedIoConnection>,
+    connection_io: &mut super::super::ConnectionIoState,
 ) -> RdmaOperation {
-    io_core.reserve_local(connection, Direction::Send).unwrap();
+    io_core
+        .reserve_local(connection, connection_io, Direction::Send)
+        .unwrap();
     assert!(io_core.cq_credits.reserve());
     let token = io_core
         .operations
@@ -66,7 +77,7 @@ pub(in crate::v2::engine) fn operation_future_for_io_lifetime_test(
             )
         })
         .unwrap();
-    io_core.add_accepted(connection, token);
+    io_core.add_accepted(connection, connection_io, token);
     let Lookup::Occupied(operation) = io_core.operations.lookup_mut(token) else {
         unreachable!("test operation remains registered")
     };

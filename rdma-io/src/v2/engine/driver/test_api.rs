@@ -8,12 +8,18 @@ use tokio::sync::Notify;
 
 use crate::async_cm::AsyncCmId;
 use crate::cm::CmId;
+use crate::v2::engine::reactor::completion::CommandCompletion;
 use crate::v2::engine::resources::TestResourceRefs;
+use crate::v2::engine::session::SessionManager;
 #[cfg(test)]
 use crate::v2::engine::session::connection::WorkRequestPoster;
+#[cfg(test)]
+use crate::v2::engine::session::connection::install_connection;
 use crate::v2::engine::session::connection::{
-    ConnectionState, VerbsConnectionResources, install_connection,
+    ConnectionPoster, ConnectionTestAccess, VerbsConnectionResources,
+    install_admitted_test_connection,
 };
+use crate::v2::engine::session::registry::ConnectionRegistry;
 #[cfg(test)]
 use crate::v2::qp::{BatchPostOutcome, QpCapabilities};
 use crate::v2::{
@@ -23,9 +29,84 @@ use crate::wc::{WcOpcode, WcStatus, WorkCompletion};
 #[cfg(test)]
 use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
 
+pub(in crate::v2::engine) struct TestConnectionInstallRequest {
+    input: Mutex<
+        Option<(
+            ConnectionPoster,
+            RdmaConnectionConfig,
+            Option<std::net::SocketAddr>,
+            Option<std::net::SocketAddr>,
+        )>,
+    >,
+    completion: CommandCompletion<RdmaConnection>,
+}
+
+impl TestConnectionInstallRequest {
+    fn new(
+        poster: impl Into<ConnectionPoster>,
+        config: RdmaConnectionConfig,
+        local_addr: Option<std::net::SocketAddr>,
+        peer_addr: Option<std::net::SocketAddr>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            input: Mutex::new(Some((poster.into(), config, local_addr, peer_addr))),
+            completion: CommandCompletion::new(),
+        })
+    }
+
+    pub(in crate::v2::engine) fn execute_into(
+        &self,
+        manager: &SessionManager,
+        connections: &mut ConnectionRegistry,
+        reservation: crate::v2::engine::session::connection::ConnectionReservation,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) {
+        let Some((poster, config, local_addr, peer_addr)) = lock_unpoison(&self.input).take()
+        else {
+            return;
+        };
+        let result = install_admitted_test_connection(
+            manager,
+            connections,
+            poster,
+            config,
+            local_addr,
+            peer_addr,
+            reservation,
+        );
+        self.completion.complete_into(result, false, actions);
+    }
+
+    pub(in crate::v2::engine) fn complete_failure(&self, error: Error) {
+        self.completion.complete(Err(error));
+    }
+
+    pub(in crate::v2::engine) fn complete_failure_into(
+        &self,
+        error: Error,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) {
+        self.completion.complete_into(Err(error), false, actions);
+    }
+
+    async fn wait(&self) -> Result<RdmaConnection> {
+        std::future::poll_fn(|cx| {
+            if let Some(result) = self.completion.take_result() {
+                return std::task::Poll::Ready(result);
+            }
+            self.completion.register(cx.waker());
+            match self.completion.take_result() {
+                Some(result) => std::task::Poll::Ready(result),
+                None => std::task::Poll::Pending,
+            }
+        })
+        .await
+    }
+}
+
 use super::{EngineShared, Error, IO_WORK, Result};
 use crate::v2::engine::io_core::CqeReject;
-use crate::v2::engine::registry::{Lookup, OperationToken, lock_unpoison};
+use crate::v2::engine::registry::{OperationToken, lock_unpoison};
 
 /// Test-only connection identity used by the Phase 2 routing gate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -244,17 +325,17 @@ impl TestEngineResources {
         &self,
         shared: &Arc<EngineShared>,
         connection: &RdmaConnection,
-    ) -> Result<Arc<ConnectionState>> {
+    ) -> Result<Arc<ConnectionTestAccess>> {
         let state = connection.require_session_state()?;
-        match shared
-            .session
-            .connections
-            .lookup(connection.session_token())
-        {
-            Lookup::Occupied(owner) if Arc::ptr_eq(&owner, &state) => Ok(state),
-            _ => Err(Error::InvalidConfig(
+        let Some(manager) = connection.manager().upgrade() else {
+            return Err(Error::TransportClosed);
+        };
+        if Arc::ptr_eq(&manager, &shared.session) {
+            Ok(state)
+        } else {
+            Err(Error::InvalidConfig(
                 "connection belongs to another engine".into(),
-            )),
+            ))
         }
     }
 
@@ -333,13 +414,15 @@ impl TestEngineResources {
             Ok(state) => state,
             Err(_) => return Ok(false),
         };
-        let route = state
+        let route = connection
             .cm_route()
             .ok_or_else(|| Error::InvalidConfig("connection has no CM route".into()))?;
-        Ok(shared
-            .session
-            .cm
-            .connection_route_is_live(route, state.token))
+        Ok(matches!(
+            route,
+            super::super::session::connection::ConnectionCmRoute::Outbound(_)
+                | super::super::session::connection::ConnectionCmRoute::Inbound(_)
+        ) && state.token == connection.session_token()
+            && !connection.close_state().is_retired())
     }
 
     /// Snapshot the exact rejection classes observed by CQE routing.
@@ -393,7 +476,7 @@ impl TestEngineResources {
     }
 
     /// Convert a connected test QP into the real Phase 3 connection path.
-    pub fn install_connection(
+    pub async fn install_connection(
         &self,
         qp: TestEngineQp,
         cm: AsyncCmId,
@@ -407,34 +490,60 @@ impl TestEngineResources {
         }
         let local_addr = cm.cm_id().local_addr();
         let peer_addr = cm.cm_id().peer_addr();
-        install_connection(
-            &shared.session,
-            Arc::new(VerbsConnectionResources::new(qp.qp, cm)),
+        let request = TestConnectionInstallRequest::new(
+            VerbsConnectionResources::new(qp.qp, cm),
             config,
             local_addr,
             peer_addr,
-        )
+        );
+        let lane = shared
+            .commands
+            .acquire_connect()
+            .await
+            .ok_or_else(|| shared.admission_error().unwrap_or(Error::DriverShutdown))?;
+        let permit = shared.commands.reserve_connect(lane).map_err(|error| {
+            if matches!(error, Error::DriverShutdown) {
+                shared.admission_error().unwrap_or(error)
+            } else {
+                error
+            }
+        })?;
+        shared
+            .commands
+            .enqueue_test_connection_install(Arc::clone(&request), permit);
+        shared.commands.publish_command_work();
+        super::super::reactor::CommandIngress::yield_after_admission().await;
+        request.wait().await
     }
 
     /// Explicitly transition an installed Phase 3 connection to QP ERR.
     pub fn transition_connection_to_error(&self, connection: &RdmaConnection) -> Result<()> {
         let shared = self.ensure_not_terminal()?;
         self.require_owned_connection(&shared, connection)?;
-        connection.transition_to_error_for_test()
+        shared
+            .commands
+            .request_connection_error(connection.session_token());
+        Ok(())
     }
 
     /// Request an RDMA-CM disconnect for an outbound engine connection.
     pub fn disconnect_connection(&self, connection: &RdmaConnection) -> Result<()> {
         let shared = self.ensure_active()?;
-        self.require_owned_connection(&shared, connection)?
-            .disconnect_for_test()
+        self.require_owned_connection(&shared, connection)?;
+        shared
+            .commands
+            .request_connection_disconnect(connection.session_token());
+        Ok(())
     }
 
     /// Make the next result-aware destruction of this connection's QP fail.
     pub fn fail_next_connection_qp_destroy(&self, connection: &RdmaConnection) -> Result<()> {
         let shared = self.ensure_active()?;
-        self.require_owned_connection(&shared, connection)?
-            .fail_next_qp_destroy_for_test()
+        self.require_owned_connection(&shared, connection)?;
+        shared
+            .commands
+            .request_fail_next_qp_destroy(connection.session_token());
+        Ok(())
     }
 
     /// Fail the next newly created connection installation and its QP rollback.
@@ -1041,6 +1150,7 @@ impl TestDriverState {
     pub(in crate::v2::engine) fn install_idle_connections(
         &self,
         shared: &Arc<EngineShared>,
+        registry: &mut super::super::session::registry::ConnectionRegistry,
         count: usize,
     ) -> Result<Vec<RdmaConnection>> {
         let mut connections = Vec::new();
@@ -1051,6 +1161,7 @@ impl TestDriverState {
             let qp_num = self.next_idle_qp()?;
             connections.push(install_connection(
                 &shared.session,
+                registry,
                 Arc::new(TestIdlePoster { qp_num }),
                 RdmaConnectionConfig::default(),
                 None,
@@ -1061,10 +1172,14 @@ impl TestDriverState {
     }
 
     fn instrumentation(&self, shared: &EngineShared) -> TestEngineInstrumentation {
+        let connections = *lock_unpoison(&shared.connection_diagnostics);
+        let cqes_rejected = lock_unpoison(&shared.io_rejections).len() as u64;
         TestEngineInstrumentation {
-            cm_pending_routes: shared.session.pending_cm_route_count(),
-            cm_retained_owners: shared.session.retained_cm_owner_count(),
-            cqes_rejected: lock_unpoison(&shared.io_rejections).len() as u64,
+            cm_pending_routes: connections.live + shared.session.cm.pending_adapter_route_count(),
+            cm_retained_owners: connections
+                .live
+                .max(shared.session.cm.retained_adapter_owner_count()),
+            cqes_rejected,
             cm_events_rejected: shared.session.rejected_cm_events.load(Ordering::Acquire),
         }
     }

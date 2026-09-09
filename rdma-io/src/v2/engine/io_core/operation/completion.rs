@@ -52,7 +52,7 @@ use crate::v2::engine::registry::{ConnectionToken, LiveIoConnectionProof, Lookup
 use crate::wc::WorkCompletion;
 use std::sync::Arc;
 
-use super::super::{EstablishedIoConnection, EstablishedIoIdentity, IoState};
+use super::super::{ConnectionIoState, EstablishedIoConnection, EstablishedIoIdentity, IoState};
 use super::effects::{AfterEngineUnlock, IoCoreEffects, OperationQuarantineEffect};
 use super::state::CompletionDisposition;
 
@@ -162,6 +162,7 @@ impl IoState {
         pending: PendingCompletion,
         live: Option<LiveIoConnectionProof>,
         connection: &Arc<EstablishedIoConnection>,
+        connection_io: &mut ConnectionIoState,
     ) -> Option<ConnectionToken> {
         let identity = pending.identity;
         if pending.completion.qp_num() != identity.qp_num {
@@ -170,6 +171,7 @@ impl IoState {
         }
         if !live.is_some_and(|proof| proof.proves(identity.connection, identity.qp_num))
             || connection.identity() != identity
+            || connection_io.identity() != identity
         {
             self.reject_cqe(CqeReject::WrongConnection);
             return None;
@@ -207,7 +209,7 @@ impl IoState {
             self.reject_cqe(CqeReject::Duplicate);
             return None;
         }
-        self.enqueue_completion(connection, pending.completion);
+        self.enqueue_completion(connection, connection_io, pending.completion);
         Some(identity.connection)
     }
 
@@ -219,20 +221,21 @@ impl IoState {
     pub(in crate::v2::engine) fn dispatch_connection_completions(
         &mut self,
         connection: &EstablishedIoConnection,
+        connection_io: &mut ConnectionIoState,
         quantum: usize,
     ) -> (usize, bool, IoCoreEffects) {
         let mut processed = 0;
         let mut effects = IoCoreEffects::default();
         while processed < quantum {
-            let Some(completion) = self.pop_completion(connection) else {
+            let Some(completion) = self.pop_completion(connection, connection_io) else {
                 break;
             };
-            effects.extend(self.dispatch_connection_completion(completion));
+            effects.extend(self.dispatch_connection_completion(connection_io, completion));
             processed += 1;
         }
         (
             processed,
-            self.has_connection_completion_work(connection),
+            self.has_connection_completion_work(connection, connection_io),
             effects,
         )
     }
@@ -243,7 +246,11 @@ impl IoState {
     /// released between queueing and dispatch. `Deferred` means the operation
     /// is not finished yet (a batch still owes completions), `Complete` hands
     /// off to the single release path, and `Duplicate` is refused.
-    fn dispatch_queued_completion(&mut self, completion: WorkCompletion) -> IoCoreEffects {
+    fn dispatch_queued_completion(
+        &mut self,
+        connection_io: &mut ConnectionIoState,
+        completion: WorkCompletion,
+    ) -> IoCoreEffects {
         let token = OperationToken::decode(completion.wr_id());
         let operation = match self.operations.lookup_mut(token) {
             Lookup::Occupied(operation) => operation,
@@ -266,7 +273,9 @@ impl IoState {
         };
         match operation.record_completion(completion) {
             CompletionDisposition::Deferred => IoCoreEffects::default(),
-            CompletionDisposition::Complete => self.finish_operation(token, completion),
+            CompletionDisposition::Complete => {
+                self.finish_operation(connection_io, token, completion)
+            }
             CompletionDisposition::Duplicate => {
                 self.reject_cqe(CqeReject::Duplicate);
                 IoCoreEffects::default()
@@ -288,14 +297,16 @@ impl IoState {
     /// narrowest visibility Rust can express for sibling access.
     pub(super) fn finish_operation(
         &mut self,
+        connection_io: &mut ConnectionIoState,
         token: OperationToken,
         completion: WorkCompletion,
     ) -> IoCoreEffects {
-        self.finish_operation_with_drained(token, completion, true)
+        self.finish_operation_with_drained(connection_io, token, completion, true)
     }
 
     fn finish_operation_with_drained(
         &mut self,
+        connection_io: &mut ConnectionIoState,
         token: OperationToken,
         completion: WorkCompletion,
         emit_drained: bool,
@@ -305,8 +316,8 @@ impl IoState {
             return IoCoreEffects::default();
         };
         let identity = operation.connection_identity();
-        let removed = self.remove_operation_accepted(identity, operation.token());
-        self.release_operation_local(identity, operation.direction());
+        let removed = Self::remove_operation_accepted(connection_io, identity, operation.token());
+        Self::release_operation_local(connection_io, identity, operation.direction());
         self.cq_credits.release();
         let previous = self.accepted_operations;
         debug_assert!(previous > 0, "accepted operation count must be positive");
@@ -331,13 +342,21 @@ impl IoState {
             self.quarantined_operations = self.quarantined_operations.saturating_sub(1);
             self.quarantined_mrs = self.quarantined_mrs.saturating_sub(1);
             self.quarantined_bytes = self.quarantined_bytes.saturating_sub(operation.mr_len());
-            if self.clear_operation_quarantine(operation.token(), operation.connection_token()) {
-                effects.push_quarantine(OperationQuarantineEffect::Cleared(
-                    operation.connection_token(),
-                ));
+            if self.clear_operation_quarantine(
+                connection_io,
+                operation.token(),
+                operation.connection_token(),
+            ) {
+                effects.push_quarantine(OperationQuarantineEffect::Cleared {
+                    connection: operation.connection_token(),
+                    operation: operation.token(),
+                });
             }
         }
-        if emit_drained && removed && self.operation_connection_accepted_count(identity) == 0 {
+        if emit_drained
+            && removed
+            && Self::operation_connection_accepted_count(connection_io, identity) == 0
+        {
             effects.push_drained(operation.connection_token());
         }
         effects
@@ -350,23 +369,28 @@ impl IoState {
     /// admission and posting guards are dropped.
     pub(super) fn finish_early_completion(
         &mut self,
+        connection_io: &mut ConnectionIoState,
         token: OperationToken,
         completion: WorkCompletion,
     ) -> AfterEngineUnlock {
         // Posting and all backend mutation run on the sole reactor thread.
         // A connection cannot enter close concurrently with this early-CQE
         // reconciliation, so accepted-zero is not a close-drain transition.
-        self.finish_operation_with_drained(token, completion, false)
+        self.finish_operation_with_drained(connection_io, token, completion, false)
             .into_after_unlock()
     }
 
-    fn dispatch_connection_completion(&mut self, completion: WorkCompletion) -> IoCoreEffects {
+    fn dispatch_connection_completion(
+        &mut self,
+        connection_io: &mut ConnectionIoState,
+        completion: WorkCompletion,
+    ) -> IoCoreEffects {
         // CQ routing and terminal publication share the admission barrier.
         // The guard covers one completion and drops before the caller applies
         // session effects or publishes events and operation wakes.
         let admission = Arc::clone(&self.admission);
         let _admission = crate::v2::engine::registry::read_unpoison(&admission);
-        self.dispatch_queued_completion(completion)
+        self.dispatch_queued_completion(connection_io, completion)
     }
 
     /// Drains up to `budget` queued completions after QP destruction.
@@ -377,16 +401,20 @@ impl IoState {
     fn dispatch_queued_completions(
         &mut self,
         connection: &EstablishedIoConnection,
+        connection_io: &mut ConnectionIoState,
         budget: usize,
     ) -> (bool, IoCoreEffects) {
         let mut effects = IoCoreEffects::default();
         for _ in 0..budget {
-            let Some(completion) = self.pop_completion(connection) else {
+            let Some(completion) = self.pop_completion(connection, connection_io) else {
                 return (false, effects);
             };
-            effects.extend(self.dispatch_connection_completion(completion));
+            effects.extend(self.dispatch_connection_completion(connection_io, completion));
         }
-        (self.has_connection_completion_work(connection), effects)
+        (
+            self.has_connection_completion_work(connection, connection_io),
+            effects,
+        )
     }
 
     /// Routes the completions already queued when the QP was destroyed.
@@ -397,10 +425,12 @@ impl IoState {
     pub(in crate::v2::engine) fn reject_queued_completions_after_qp_destroy(
         &mut self,
         connection: &EstablishedIoConnection,
+        connection_io: &mut ConnectionIoState,
         action_limited_budget: usize,
     ) -> (bool, IoCoreEffects) {
         self.dispatch_queued_completions(
             connection,
+            connection_io,
             self.completion_dispatch_budget.min(action_limited_budget),
         )
     }

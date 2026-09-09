@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use super::{CmState, MemoizedTerminalResult, PendingCmDestruction, SessionManager, lock_unpoison};
+use crate::v2::engine::session::registry::ConnectionRegistry;
 use crate::v2::error::Error;
 
 pub(in crate::v2::engine) struct CmShutdownCursor {
@@ -73,7 +74,12 @@ impl CmShutdownSnapshot {
 }
 
 #[cfg(test)]
-pub(super) fn begin(state: &CmState, shared: &SessionManager, outcome: &MemoizedTerminalResult) {
+pub(super) fn begin(
+    state: &CmState,
+    connections: &mut ConnectionRegistry,
+    shared: &SessionManager,
+    outcome: &MemoizedTerminalResult,
+) {
     if state.shutting_down.swap(true, Ordering::AcqRel) {
         return;
     }
@@ -81,20 +87,18 @@ pub(super) fn begin(state: &CmState, shared: &SessionManager, outcome: &Memoized
     if outcome.is_success() {
         return;
     }
-    let pending: Vec<_> = lock_unpoison(&state.pending).drain(..).collect();
-    for request in pending {
+    let pending: Vec<_> = connections.drain_pending_outbound().collect();
+    for (request, _reservation) in pending {
         request.cancel(terminal_error(outcome));
-        drop(request.take_reservation());
     }
-    let requests: Vec<_> = state
-        .routes
-        .occupied_cloned()
+    let requests: Vec<_> = connections
+        .outbound_routes()
         .into_iter()
-        .filter_map(|route| route.request())
+        .filter_map(|token| connections.outbound_request(token))
         .collect();
     for request in requests {
         request.cancel(terminal_error(outcome));
-        state.enqueue_cancellation(request);
+        connections.enqueue_cancellation(request);
     }
     let pending_listens: Vec<_> = lock_unpoison(&state.pending_listens).drain(..).collect();
     for request in pending_listens {
@@ -112,6 +116,7 @@ pub(super) fn start(state: &CmState) {
 
 pub(super) fn snapshot(
     state: &CmState,
+    connections: &ConnectionRegistry,
     terminalize_listeners: bool,
     cursor: &CmShutdownCursor,
     budget: usize,
@@ -127,7 +132,7 @@ pub(super) fn snapshot(
     };
     CmShutdownSnapshot {
         limits: [
-            lock_unpoison(&state.pending).len().min(budget),
+            connections.pending_outbound_count().min(budget),
             usize::from(!cursor.routes_complete).saturating_mul(budget),
             lock_unpoison(&state.pending_listens).len().min(budget),
             usize::from(!cursor.listeners_complete).saturating_mul(budget),
@@ -142,6 +147,7 @@ pub(super) fn snapshot(
 )]
 pub(super) fn service_class(
     state: &CmState,
+    connections: &mut ConnectionRegistry,
     shared: &SessionManager,
     outcome: &MemoizedTerminalResult,
     terminalize_listeners: bool,
@@ -157,25 +163,24 @@ pub(super) fn service_class(
     while processed < budget && actions.remaining() >= 8 {
         match class {
             CmShutdownClass::PendingOutbound => {
-                let request = { lock_unpoison(&state.pending).pop_front() };
-                let Some(request) = request else {
+                let pending = connections.pop_outbound();
+                let Some((request, _reservation)) = pending else {
                     break;
                 };
                 request.cancel_into(terminal_error(outcome), actions);
-                drop(request.take_reservation());
             }
             CmShutdownClass::Routes if !cursor.routes_complete => {
                 let (routes, next, complete, scanned) =
-                    state.routes.scan_occupied_cloned(cursor.route_slot, 1);
+                    connections.scan_outbound_routes(cursor.route_slot, 1);
                 cursor.route_slot = next;
                 cursor.routes_complete = complete;
                 if scanned == 0 {
                     break;
                 }
-                for route in routes {
-                    if let Some(request) = route.request() {
+                for token in routes {
+                    if let Some(request) = connections.outbound_request(token) {
                         request.cancel_into(terminal_error(outcome), actions);
-                        state.enqueue_cancellation(request);
+                        connections.enqueue_cancellation(request);
                     }
                 }
             }
@@ -257,74 +262,35 @@ pub(super) fn service_class(
     processed
 }
 
-pub(super) fn complete(state: &CmState, cursor: &CmShutdownCursor) -> bool {
+pub(super) fn complete(
+    state: &CmState,
+    connections: &ConnectionRegistry,
+    cursor: &CmShutdownCursor,
+) -> bool {
     cursor.routes_complete
         && cursor.listeners_complete
         && cursor.destruction_listeners_complete
-        && lock_unpoison(&state.pending).is_empty()
+        && connections.pending_outbound_count() == 0
         && lock_unpoison(&state.pending_listens).is_empty()
-}
-
-#[cfg(test)]
-pub(super) fn terminalize(state: &CmState, outcome: &MemoizedTerminalResult) {
-    if outcome.is_success() {
-        return;
-    }
-
-    let pending: Vec<_> = lock_unpoison(&state.pending).drain(..).collect();
-    let requests: Vec<_> = state
-        .routes
-        .occupied_cloned()
-        .into_iter()
-        .filter_map(|route| route.request())
-        .chain(pending)
-        .collect();
-    for request in requests {
-        drop(request.take_reservation());
-        request.cancel(terminal_error(outcome));
-    }
-    let pending_listens: Vec<_> = lock_unpoison(&state.pending_listens).drain(..).collect();
-    for request in pending_listens {
-        request.complete(Err(terminal_error(outcome)));
-    }
-    let mut listeners: Vec<_> = lock_unpoison(&state.listeners).values().cloned().collect();
-    let pending_listeners: Vec<_> = lock_unpoison(&state.cm_destructions)
-        .iter()
-        .filter_map(PendingCmDestruction::listener)
-        .cloned()
-        .collect();
-    for listener in pending_listeners {
-        if !listeners
-            .iter()
-            .any(|active| Arc::ptr_eq(active, &listener))
-        {
-            listeners.push(listener);
-        }
-    }
-
-    for listener in listeners {
-        listener.terminalize(outcome);
-    }
 }
 
 pub(super) fn terminalize_into(
     state: &CmState,
+    connections: &mut ConnectionRegistry,
     outcome: &MemoizedTerminalResult,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) {
     if outcome.is_success() {
         return;
     }
-    let pending: Vec<_> = lock_unpoison(&state.pending).drain(..).collect();
-    let requests: Vec<_> = state
-        .routes
-        .occupied_cloned()
+    let pending: Vec<_> = connections.drain_pending_outbound().collect();
+    let requests: Vec<_> = connections
+        .outbound_routes()
         .into_iter()
-        .filter_map(|route| route.request())
-        .chain(pending)
+        .filter_map(|token| connections.outbound_request(token))
+        .chain(pending.into_iter().map(|(request, _reservation)| request))
         .collect();
     for request in requests {
-        drop(request.take_reservation());
         request.cancel_into(terminal_error(outcome), actions);
     }
     let pending_listens: Vec<_> = lock_unpoison(&state.pending_listens).drain(..).collect();

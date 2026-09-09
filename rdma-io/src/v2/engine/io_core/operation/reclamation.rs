@@ -4,7 +4,7 @@ use crate::v2::engine::lifecycle::MemoizedTerminalResult;
 use crate::v2::engine::registry::{ConnectionToken, Lookup, OperationToken};
 use crate::v2::error::Error;
 
-use super::super::{EstablishedIoConnection, IoState};
+use super::super::{ConnectionIoState, EstablishedIoConnection, IoState};
 use super::effects::{
     AfterEngineUnlock, DetachedIoCoreEffects, IoCoreEffects, OperationQuarantineEffect,
 };
@@ -72,6 +72,7 @@ impl IoState {
     pub(in crate::v2::engine) fn scan_connection_quarantine(
         &mut self,
         connection: ConnectionToken,
+        connection_io: &mut ConnectionIoState,
         start: usize,
         scan_budget: usize,
     ) -> (IoCoreEffects, usize, bool) {
@@ -83,7 +84,7 @@ impl IoState {
                 self.operations.lookup(token),
                 Lookup::Occupied(operation) if operation.connection_token() == connection
             ) {
-                effects.extend(self.quarantine_operation(token));
+                effects.extend(self.quarantine_operation(token, connection_io));
             }
         }
         (effects, next, complete)
@@ -116,9 +117,10 @@ impl IoState {
                 self.quarantined_mrs += 1;
                 self.quarantined_bytes += mr_len;
                 self.cq_credits.retain();
-                if self.record_operation_quarantine(token, connection) {
-                    effects.push_quarantine(OperationQuarantineEffect::Added(connection));
-                }
+                effects.push_quarantine(OperationQuarantineEffect::Added {
+                    connection,
+                    operation: token,
+                });
             }
             if let Some(observer) = terminalized.observer {
                 effects.push_operation_wake(observer);
@@ -158,9 +160,10 @@ impl IoState {
                 self.quarantined_mrs += 1;
                 self.quarantined_bytes += mr_len;
                 self.cq_credits.retain();
-                if self.record_operation_quarantine(token, connection) {
-                    effects.push_quarantine(OperationQuarantineEffect::Added(connection));
-                }
+                effects.push_quarantine(OperationQuarantineEffect::Added {
+                    connection,
+                    operation: token,
+                });
             }
             if let Some(observer) = terminalized.observer {
                 effects.push_operation_wake(observer);
@@ -174,6 +177,7 @@ impl IoState {
         destroyed_connection: ConnectionToken,
         destroyed_qp_num: u32,
         connection: &EstablishedIoConnection,
+        connection_io: &mut ConnectionIoState,
         close_error: Error,
         token: OperationToken,
     ) -> (bool, IoCoreEffects) {
@@ -203,7 +207,7 @@ impl IoState {
             );
             return (false, IoCoreEffects::default());
         }
-        if !self.remove_accepted(connection, token) {
+        if !self.remove_accepted(connection, connection_io, token) {
             tracing::warn!(
                 connection = identity.connection.encode(),
                 operation = token.encode(),
@@ -212,7 +216,7 @@ impl IoState {
             return (false, IoCoreEffects::default());
         }
         let Some(mut operation) = self.operations.release(token, false) else {
-            self.add_accepted(connection, token);
+            self.add_accepted(connection, connection_io, token);
             tracing::warn!(
                 connection = identity.connection.encode(),
                 operation = token.encode(),
@@ -220,7 +224,7 @@ impl IoState {
             );
             return (false, IoCoreEffects::default());
         };
-        self.release_local(connection, operation.direction());
+        self.release_local(connection, connection_io, operation.direction());
         self.cq_credits.release();
         let previous = self.accepted_operations;
         debug_assert!(previous > 0, "accepted operation count must be positive");
@@ -243,10 +247,15 @@ impl IoState {
             self.quarantined_operations = self.quarantined_operations.saturating_sub(1);
             self.quarantined_mrs = self.quarantined_mrs.saturating_sub(1);
             self.quarantined_bytes = self.quarantined_bytes.saturating_sub(operation.mr_len());
-            if self.clear_operation_quarantine(operation.token(), operation.connection_token()) {
-                effects.push_quarantine(OperationQuarantineEffect::Cleared(
-                    operation.connection_token(),
-                ));
+            if self.clear_operation_quarantine(
+                connection_io,
+                operation.token(),
+                operation.connection_token(),
+            ) {
+                effects.push_quarantine(OperationQuarantineEffect::Cleared {
+                    connection: operation.connection_token(),
+                    operation: operation.token(),
+                });
             }
         }
         (true, effects)
@@ -261,13 +270,15 @@ impl IoState {
     pub(in crate::v2::engine) fn handle_reclamation_deadline(
         &mut self,
         token: OperationToken,
+        connection_io: &mut ConnectionIoState,
     ) -> IoCoreEffects {
-        self.quarantine_operation(token)
+        self.quarantine_operation(token, connection_io)
     }
 
     pub(in crate::v2::engine) fn quarantine_operation(
         &mut self,
         token: OperationToken,
+        connection_io: &mut ConnectionIoState,
     ) -> IoCoreEffects {
         let Lookup::Occupied(operation) = self.operations.lookup_mut(token) else {
             return IoCoreEffects::default();
@@ -286,9 +297,11 @@ impl IoState {
         self.quarantined_bytes += mr_len;
         self.cq_credits.retain();
         let mut effects = IoCoreEffects::default();
-        if self.record_operation_quarantine(token, connection) {
-            effects.push_quarantine(OperationQuarantineEffect::Added(connection));
-        }
+        debug_assert_eq!(connection_io.identity().connection, connection);
+        effects.push_quarantine(OperationQuarantineEffect::Added {
+            connection,
+            operation: token,
+        });
         effects
     }
 }

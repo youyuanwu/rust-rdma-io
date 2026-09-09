@@ -14,7 +14,7 @@ use super::super::reactor::CommandIngress;
 use super::super::reactor::completion::CommandCompletion;
 use super::super::registry::{lock_unpoison, read_unpoison};
 use super::super::{ConnectionSetup, RdmaConnection, RdmaConnectionConfig, SetupSummary};
-use super::connection::{ConnectionReservation, SharedCmId};
+use super::connection::SharedCmId;
 use super::{SessionListener, SessionListenerCloseState, SessionManager};
 use crate::v2::error::{Error, Result};
 use futures_util::task::AtomicWaker;
@@ -244,17 +244,26 @@ pub(in crate::v2::engine) fn empty_connection_setup() -> ConnectionSetup {
 pub(in crate::v2::engine) fn run_setup_before_establish(
     setup: ConnectionSetup,
     connection: &RdmaConnection,
+    connections: &mut super::registry::ConnectionRegistry,
+    connection_token: super::super::registry::ConnectionToken,
     io_core: &mut super::super::io_core::IoState,
     before_establish: impl FnOnce() -> Result<()>,
-    establish: impl FnOnce() -> Result<()>,
+    establish: impl FnOnce(&mut super::registry::ConnectionRegistry) -> Result<()>,
 ) -> Result<SetupSummary> {
-    let connection_state = connection.require_session_state()?;
-    let accepted_before = io_core.connection_accepted_count(&connection_state.io);
-    let (io, events) = super::super::io::BorrowedSetupIo::from_connection(connection, io_core)?;
-    let summary = SetupSummary {
-        posted_wrs: setup(io, events)?,
-    };
-    let accepted_after = io_core.connection_accepted_count(&connection_state.io);
+    let accepted_before = connections.accepted_count(connection_token);
+    let summary = connections
+        .with_connection_mut(connection_token, |connection_state| {
+            let (io, events) = super::super::io::BorrowedSetupIo::from_connection(
+                connection,
+                connection_state,
+                io_core,
+            )?;
+            Ok::<_, Error>(SetupSummary {
+                posted_wrs: setup(io, events)?,
+            })
+        })
+        .ok_or(Error::TransportClosed)??;
+    let accepted_after = connections.accepted_count(connection_token);
     let posted_wrs = accepted_after.checked_sub(accepted_before).ok_or_else(|| {
         Error::InvalidConfig("pre-establishment setup reduced the accepted WR set".into())
     })?;
@@ -265,7 +274,7 @@ pub(in crate::v2::engine) fn run_setup_before_establish(
         )));
     }
     before_establish()?;
-    establish()?;
+    establish(connections)?;
     Ok(summary)
 }
 
@@ -293,39 +302,25 @@ impl AcceptIntent {
 }
 
 pub(in crate::v2::engine) struct IncomingChild {
-    pub(in crate::v2::engine) cm_id: Option<SharedCmId>,
-    pub(in crate::v2::engine) reservation: Option<ConnectionReservation>,
+    pub(in crate::v2::engine) token: super::super::registry::ConnectionToken,
 }
 
 impl IncomingChild {
-    pub(in crate::v2::engine) fn new(
-        cm_id: SharedCmId,
-        reservation: ConnectionReservation,
-    ) -> Self {
-        Self {
-            cm_id: Some(cm_id),
-            reservation: Some(reservation),
-        }
+    pub(in crate::v2::engine) fn new(token: super::super::registry::ConnectionToken) -> Self {
+        Self { token }
     }
 
-    pub(in crate::v2::engine) fn into_resources(
-        mut self,
-    ) -> Result<(SharedCmId, ConnectionReservation)> {
-        let cm_id = self
-            .cm_id
-            .take()
-            .ok_or_else(|| Error::InvalidConfig("inbound child lost its CM ID".into()))?;
-        let reservation = self.reservation.take().ok_or_else(|| {
-            Error::InvalidConfig("inbound child lost its connection reservation".into())
-        })?;
-        Ok((cm_id, reservation))
+    pub(in crate::v2::engine) fn into_token(self) -> super::super::registry::ConnectionToken {
+        self.token
     }
 
     #[cfg(test)]
     pub(in crate::v2::engine) fn test_only() -> Self {
         Self {
-            cm_id: None,
-            reservation: None,
+            token: super::super::registry::ConnectionToken {
+                slot: u32::MAX,
+                generation: 1,
+            },
         }
     }
 }
@@ -521,22 +516,6 @@ impl AcceptRequest {
         drop(current);
         let waker = Arc::clone(&self.observer.waker);
         actions.push_close_or_listener(move || waker.wake());
-    }
-
-    #[cfg(test)]
-    pub(in crate::v2::engine) fn fail_undelivered(&self, error: Error) -> bool {
-        let mut current = lock_unpoison(&self.observer.result);
-        let replacement = match std::mem::replace(&mut *current, TakeOnceResult::Taken) {
-            TakeOnceResult::Pending | TakeOnceResult::Ready(Ok(_)) => {
-                TakeOnceResult::Ready(Err(error))
-            }
-            TakeOnceResult::Ready(Err(existing)) => TakeOnceResult::Ready(Err(existing)),
-            TakeOnceResult::Taken => TakeOnceResult::Taken,
-        };
-        *current = replacement;
-        drop(current);
-        self.observer.waker.wake();
-        self.is_delivered()
     }
 
     pub(in crate::v2::engine) fn fail_undelivered_into(
@@ -983,16 +962,6 @@ impl ListenerState {
         lock_unpoison(&self.cm_id).take()
     }
 
-    #[cfg(test)]
-    pub(in crate::v2::engine) fn finish_close(&self, error: Option<Error>) {
-        let failure = error.or_else(|| lock_unpoison(&self.failure).clone());
-        self.close.store_if_empty(match failure {
-            Some(error) => MemoizedTerminalResult::from_error(error),
-            None => MemoizedTerminalResult::success(),
-        });
-        self.close.notify_waiters();
-    }
-
     pub(in crate::v2::engine) fn finish_close_into(
         &self,
         error: Option<Error>,
@@ -1004,43 +973,6 @@ impl ListenerState {
             None => MemoizedTerminalResult::success(),
         });
         self.close.notify_waiters_into(actions);
-    }
-
-    #[cfg(test)]
-    pub(in crate::v2::engine) fn terminalize(&self, outcome: &MemoizedTerminalResult) {
-        self.closing.store(true, Ordering::Release);
-        {
-            self.close.store_if_empty(outcome.clone());
-        }
-        let mut queues = self.lock_queues();
-        let mut requests: Vec<_> = queues
-            .waiters
-            .drain(..)
-            .map(|request| (request, false))
-            .collect();
-        if let Some(selected) = queues.selected.take() {
-            let (request, routed) = match selected {
-                SelectedAccept::Ready { request, .. } | SelectedAccept::Processing { request } => {
-                    (request, false)
-                }
-                SelectedAccept::Routed { request, .. } => (request, true),
-            };
-            requests.push((request, routed));
-        }
-        queues.children.clear();
-        drop(queues);
-        for (request, routed) in requests {
-            let error = outcome
-                .clone()
-                .into_result()
-                .expect_err("terminal listener outcome must be an error");
-            if routed {
-                let _ = request.fail_undelivered(error);
-            } else {
-                request.complete(Err(error));
-            }
-        }
-        self.close.notify_waiters();
     }
 
     /// Publish terminal listener results within the caller's remaining action
@@ -1286,12 +1218,12 @@ mod tests {
 
     #[test]
     fn accept_success_and_listener_close_publish_only_after_state_commit() {
-        let (engine, driver) =
+        let (engine, mut driver) =
             super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
         let connection = engine
             .shared
             .test_driver
-            .install_idle_connections(&engine.shared, 1)
+            .install_idle_connections(&engine.shared, &mut driver.reactor.session.connections, 1)
             .unwrap()
             .pop()
             .unwrap();
@@ -1425,19 +1357,21 @@ mod tests {
         assert!(second.as_mut().poll(&mut context).is_pending());
         assert_eq!(engine.shared.commands.pending_listens(), 2);
 
-        engine
-            .shared
-            .commands
-            .service_turn(&engine.shared, driver.reactor.io.core_mut());
+        engine.shared.commands.service_turn(
+            &engine.shared,
+            driver.reactor.io.core_mut(),
+            &mut driver.reactor.session,
+        );
         assert_eq!(engine.shared.commands.pending_listens(), 1);
         assert_eq!(
             engine.shared.session.cm.pending_listen_addresses(),
             vec![first_address]
         );
-        engine
-            .shared
-            .commands
-            .service_turn(&engine.shared, driver.reactor.io.core_mut());
+        engine.shared.commands.service_turn(
+            &engine.shared,
+            driver.reactor.io.core_mut(),
+            &mut driver.reactor.session,
+        );
         assert_eq!(
             engine.shared.session.cm.pending_listen_addresses(),
             vec![first_address, second_address]

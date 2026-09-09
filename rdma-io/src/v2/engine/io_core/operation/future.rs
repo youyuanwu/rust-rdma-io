@@ -52,7 +52,7 @@ use crate::v2::op::Completion;
 use crate::v2::qp::BatchPostOutcome;
 use crate::wr::{PreparedRecvBatch, PreparedSendBatch, RecvWr, SendFlags, SendWr};
 
-use super::super::{EstablishedIoConnection, IoState, OperationKind};
+use super::super::{ConnectionIoState, EstablishedIoConnection, IoState, OperationKind};
 use super::effects::AfterEngineUnlock;
 use super::state::{OperationObserver, OperationState};
 use super::validation::ValidatedOperation;
@@ -326,27 +326,12 @@ impl OperationCommand {
 
     pub(in crate::v2::engine) fn execute_into(
         &self,
-        manager: &SessionManager,
+        connections: &mut crate::v2::engine::session::registry::ConnectionRegistry,
         shared: &mut IoState,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) {
         let Some(input) = lock_unpoison(&self.input).take() else {
             return;
-        };
-        let connection = match manager.connections.lookup(input.connection) {
-            Lookup::Occupied(connection) if connection.io_is_open() => Arc::clone(&connection.io),
-            Lookup::Occupied(_)
-            | Lookup::Duplicate
-            | Lookup::Stale
-            | Lookup::Unknown
-            | Lookup::Retired => {
-                self.completion.install_into(
-                    StartResult::Immediate((Err(Error::TransportClosed), Some(input.mr))),
-                    shared,
-                    actions,
-                );
-                return;
-            }
         };
         if self.completion.is_cancelled() {
             self.completion.install_into(
@@ -356,16 +341,30 @@ impl OperationCommand {
             );
             return;
         }
-        let result = start_operation(
-            shared,
-            &connection,
-            input.kind,
-            input.mr,
-            input.remote,
-            input.range,
-            Arc::clone(&self.completion.observer),
-            actions,
-        );
+        if !connections.io_is_open(input.connection) {
+            self.completion.install_into(
+                StartResult::Immediate((Err(Error::TransportClosed), Some(input.mr))),
+                shared,
+                actions,
+            );
+            return;
+        }
+        let result = connections
+            .with_connection_io_mut(input.connection, |connection, connection_io, poster| {
+                start_operation(
+                    shared,
+                    connection,
+                    connection_io,
+                    poster,
+                    input.kind,
+                    input.mr,
+                    input.remote,
+                    input.range,
+                    Arc::clone(&self.completion.observer),
+                    actions,
+                )
+            })
+            .expect("open connection retains its I/O bundle for the command turn");
         self.completion.install_into(result, shared, actions);
     }
 
@@ -498,6 +497,8 @@ enum StartResult {
 fn start_operation(
     shared: &mut IoState,
     connection: &Arc<EstablishedIoConnection>,
+    connection_io: &mut ConnectionIoState,
+    poster: &dyn super::super::IoPostAuthority,
     kind: OperationKind,
     mr: Mr,
     remote: Option<RemoteMr>,
@@ -518,7 +519,7 @@ fn start_operation(
     shared.pause_operation_before_register();
     let posting = PostingTurnGuard;
     let direction = kind.direction();
-    if let Err(error) = shared.reserve_local(connection, direction) {
+    if let Err(error) = shared.reserve_local(connection, connection_io, direction) {
         return StartResult::Immediate((Err(error), Some(mr)));
     }
 
@@ -538,7 +539,7 @@ fn start_operation(
     }) {
         Ok(token) => token,
         Err(error) => {
-            shared.release_local(connection, direction);
+            shared.release_local(connection, connection_io, direction);
             return StartResult::Immediate((Err(error), mr));
         }
     };
@@ -548,10 +549,10 @@ fn start_operation(
             .operations
             .release(token, false)
             .expect("unposted operation remains registered");
-        shared.release_local(connection, direction);
+        shared.release_local(connection, connection_io, direction);
         return StartResult::Immediate((Err(Error::CapacityExhausted), state.take_mr()));
     }
-    let outcome = match post_validated_operation(validated, connection, token) {
+    let outcome = match post_validated_operation(validated, poster, token) {
         Ok(outcome) => outcome,
         Err(error) => {
             let mut state = shared
@@ -559,14 +560,14 @@ fn start_operation(
                 .release(token, false)
                 .expect("unposted operation remains registered");
             shared.cq_credits.release();
-            shared.release_local(connection, direction);
+            shared.release_local(connection, connection_io, direction);
             return StartResult::Immediate((Err(error), state.take_mr()));
         }
     };
     match outcome {
         BatchPostOutcome::AllAccepted => {
             shared.accepted_operations += 1;
-            shared.add_accepted(connection, token);
+            shared.add_accepted(connection, connection_io, token);
             let committed = match shared.operations.lookup_mut(token) {
                 Lookup::Occupied(state) => state.commit_accepted(),
                 _ => unreachable!("accepted operation remains registered"),
@@ -577,7 +578,7 @@ fn start_operation(
             }
             shared.publish_cq_recheck();
             if let Some(completion) = committed.early {
-                let after_unlock = shared.finish_early_completion(token, completion);
+                let after_unlock = shared.finish_early_completion(connection_io, token, completion);
                 append_after_post_guards(posting, admission, after_unlock, actions);
             }
             StartResult::InFlight(token)
@@ -601,13 +602,13 @@ fn start_operation(
                     .take_unaccepted(error.clone())
                     .expect("proven-unaccepted operation has no completion");
                 shared.cq_credits.release();
-                shared.release_local(connection, direction);
+                shared.release_local(connection, connection_io, direction);
                 debug_assert!(release.event.is_none());
                 drop(release.event);
                 StartResult::Immediate((Err(error), release.mr))
             } else {
                 shared.accepted_operations += 1;
-                shared.add_accepted(connection, token);
+                shared.add_accepted(connection, connection_io, token);
                 let committed = match shared.operations.lookup_mut(token) {
                     Lookup::Occupied(state) => state.commit_accepted(),
                     _ => unreachable!("retained operation remains registered"),
@@ -618,7 +619,8 @@ fn start_operation(
                 }
                 shared.publish_cq_recheck();
                 if let Some(completion) = committed.early {
-                    let after_unlock = shared.finish_early_completion(token, completion);
+                    let after_unlock =
+                        shared.finish_early_completion(connection_io, token, completion);
                     append_after_post_guards(posting, admission, after_unlock, actions);
                 }
                 StartResult::InFlight(token)
@@ -627,7 +629,7 @@ fn start_operation(
         BatchPostOutcome::PrefixAccepted { source, .. }
         | BatchPostOutcome::Ambiguous { source } => {
             shared.accepted_operations += 1;
-            shared.add_accepted(connection, token);
+            shared.add_accepted(connection, connection_io, token);
             let committed = match shared.operations.lookup_mut(token) {
                 Lookup::Occupied(state) => state.commit_accepted(),
                 _ => unreachable!("ambiguous operation remains registered"),
@@ -638,7 +640,7 @@ fn start_operation(
             }
             shared.publish_cq_recheck();
             if let Some(completion) = committed.early {
-                let after_unlock = shared.finish_early_completion(token, completion);
+                let after_unlock = shared.finish_early_completion(connection_io, token, completion);
                 append_after_post_guards(posting, admission, after_unlock, actions);
                 StartResult::InFlight(token)
             } else {
@@ -663,7 +665,7 @@ fn start_operation(
 /// checked input can be reused after encoding.
 fn post_validated_operation(
     validated: ValidatedOperation,
-    connection: &EstablishedIoConnection,
+    poster: &dyn super::super::IoPostAuthority,
     token: OperationToken,
 ) -> Result<BatchPostOutcome> {
     match validated.kind() {
@@ -671,7 +673,7 @@ fn post_validated_operation(
             let mut batch =
                 PreparedRecvBatch::new(vec![RecvWr::new(token.encode()).sg(validated.sge())])
                     .map_err(Error::from_v1)?;
-            connection.post_recv(&mut batch)
+            poster.post_recv(&mut batch)
         }
         OperationKind::Send | OperationKind::Write | OperationKind::Read => {
             let opcode = validated.kind().send_wr_opcode().ok_or_else(|| {
@@ -684,7 +686,7 @@ fn post_validated_operation(
                 wr = wr.rdma(remote.addr, remote.rkey);
             }
             let mut batch = PreparedSendBatch::new(vec![wr]).map_err(Error::from_v1)?;
-            connection.post_send(&mut batch)
+            poster.post_send(&mut batch)
         }
     }
 }

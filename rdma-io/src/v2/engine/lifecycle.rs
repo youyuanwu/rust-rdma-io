@@ -1,6 +1,6 @@
 //! Central engine lifecycle deadlines and terminal wedge calculation.
 
-use super::session::SessionManager;
+use super::session::SessionReactorSources;
 use super::{EngineShared, RdmaEngineTerminalError};
 use crate::v2::error::{Error, Result};
 
@@ -74,7 +74,9 @@ impl EngineShared {
         }
         let retained_bundles = self.retained_bundle_count();
         let outstanding_operations = self.unsafe_outstanding_operations();
-        let pending_routes = self.session.cm.pending_route_count();
+        let pending_routes = super::registry::lock_unpoison(&self.connection_diagnostics)
+            .live
+            .saturating_add(self.session.cm.pending_adapter_route_count());
         if retained_bundles == 0 && outstanding_operations == 0 && pending_routes == 0 {
             return None;
         }
@@ -87,21 +89,32 @@ impl EngineShared {
     }
 }
 
-impl SessionManager {
-    pub(super) fn synchronously_prepare_driver_drop(&self, io_core: &mut super::io_core::IoState) {
-        for connection in self.connections.occupied() {
-            let _lifecycle = connection.lock_lifecycle();
-            connection.stop_posting();
-            let _ = self.transition_connection_to_error(&connection);
-            if io_core.connection_accepted_count(&connection.io) == 0
-                && !connection.is_retired()
-                && !connection.retirement_is_quarantined()
+impl SessionReactorSources {
+    pub(super) fn synchronously_prepare_driver_drop(
+        &mut self,
+        _io_core: &mut super::io_core::IoState,
+    ) {
+        for token in self.connections.occupied() {
+            self.connections
+                .with_connection_mut(token, |connection| connection.stop_posting());
+            let _ = self
+                .manager
+                .transition_connection_to_error(&mut self.connections, token);
+            if self.connections.accepted_count(token) == 0
+                && !self.connections.retirement_is_quarantined(token)
             {
-                match self.ensure_qp_destroyed(&connection, &_lifecycle) {
+                match self
+                    .manager
+                    .ensure_qp_destroyed(&mut self.connections, token)
+                {
                     Ok(()) => {}
                     Err(error) => {
+                        let qp_num = self
+                            .connections
+                            .with_connection(token, |connection| connection.qp_num())
+                            .unwrap_or(0);
                         tracing::warn!(
-                            qp_num = connection.qp_num(),
+                            qp_num,
                             %error,
                             "failed to establish QP destruction boundary during driver drop"
                         );
@@ -213,6 +226,7 @@ mod tests {
         });
         install_connection(
             &engine.shared.session,
+            &mut driver.reactor.session.connections,
             Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
             RdmaConnectionConfig::default(),
             None,
@@ -220,17 +234,18 @@ mod tests {
         )
         .unwrap();
 
-        engine
-            .shared
+        driver
+            .reactor
             .session
             .synchronously_prepare_driver_drop(driver.reactor.io.core_mut());
-        engine
-            .shared
+        driver
+            .reactor
             .session
             .synchronously_prepare_driver_drop(driver.reactor.io.core_mut());
 
         assert_eq!(poster.destroys.load(Ordering::Acquire), 1);
         engine.shared.finish(
+            &mut driver.reactor.session,
             driver.reactor.io.core_mut(),
             MemoizedTerminalResult::success(),
         );
@@ -246,33 +261,54 @@ mod tests {
         });
         let connection = install_connection(
             &engine.shared.session,
+            &mut driver.reactor.session.connections,
             Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
             RdmaConnectionConfig::default(),
             None,
             None,
         )
         .unwrap();
-        connection.state.begin_close();
-        assert!(connection.state.try_begin_retirement());
-        let (_, event) = connection.state.publish_destroy_quarantine(
-            &Error::InvalidConfig("injected destroy failure".into()),
-            || {},
-        );
+        let token = connection.session_token();
+        assert!(driver.reactor.session.connections.begin_close(token));
+        engine
+            .shared
+            .session
+            .transition_connection_to_error(&mut driver.reactor.session.connections, token)
+            .unwrap();
+        assert!(driver.reactor.session.connections.request_retirement(token));
+        assert!(driver.reactor.session.connections.begin_retirement(token));
+        driver
+            .reactor
+            .session
+            .connections
+            .track_bundle_quarantine(token);
+        let (_, event) = driver
+            .reactor
+            .session
+            .connections
+            .with_connection_mut(token, |connection| {
+                connection.publish_destroy_quarantine(
+                    &Error::InvalidConfig("injected destroy failure".into()),
+                    || {},
+                )
+            })
+            .unwrap();
         if let Some(event) = event {
             event.deliver();
         }
 
-        engine
-            .shared
+        driver
+            .reactor
             .session
             .synchronously_prepare_driver_drop(driver.reactor.io.core_mut());
-        engine
-            .shared
+        driver
+            .reactor
             .session
             .synchronously_prepare_driver_drop(driver.reactor.io.core_mut());
 
         assert_eq!(poster.destroys.load(Ordering::Acquire), 0);
         engine.shared.finish(
+            &mut driver.reactor.session,
             driver.reactor.io.core_mut(),
             MemoizedTerminalResult::success(),
         );
@@ -284,6 +320,7 @@ mod tests {
     fn engine_terminal_rejects_connection_quarantined() {
         let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
         engine.shared.finish(
+            &mut driver.reactor.session,
             driver.reactor.io.core_mut(),
             MemoizedTerminalResult::from_error(Error::ConnectionQuarantined {
                 outstanding_operations: 1,
@@ -302,6 +339,7 @@ mod tests {
         let poster_dyn: Arc<dyn WorkRequestPoster> = poster.clone();
         let connection = install_connection(
             &engine.shared.session,
+            &mut driver.reactor.session.connections,
             poster_dyn,
             RdmaConnectionConfig::default(),
             None,
@@ -312,11 +350,15 @@ mod tests {
             slot: 29,
             generation: 1,
         };
-        driver
-            .reactor
-            .io
-            .core_mut()
-            .add_accepted(&connection.state.io, unresolved);
+        let connection_token = connection.session_token();
+        let (io, session) = (&mut driver.reactor.io, &mut driver.reactor.session);
+        session
+            .connections
+            .with_connection_io_mut(connection_token, |connection, connection_io, _poster| {
+                io.core_mut()
+                    .add_accepted(connection, connection_io, unresolved);
+            })
+            .unwrap();
         driver.reactor.io.core_mut().accepted_operations += 1;
 
         let mut shutdown = Box::pin(engine.shutdown());

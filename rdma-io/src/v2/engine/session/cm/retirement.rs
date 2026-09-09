@@ -5,22 +5,22 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use super::{
-    CmState, ConnectionCmRoute, ConnectionState, ConnectionToken, EstablishedConnectionRoute,
+    CmState, ConnectionCmRoute, ConnectionToken, EstablishedConnectionRoute,
     FailedConnectionInstallResources, InboundRetirementCompletion, Lookup, PendingCmDestruction,
-    RetainedSetupRollback, RouteRetirement, SessionManager, connection_destruction_error,
-    contextual_cm_error, error_detail, lock_unpoison,
+    RouteRetirement, SessionManager, contextual_cm_error, error_detail, lock_unpoison,
 };
 #[cfg(test)]
 use super::{TestCmDestruction, injected_cm_result};
+use crate::v2::engine::session::registry::ConnectionRegistry;
 use crate::v2::error::{Error, Result};
 
 pub(super) fn service_cm_destructions(
     state: &CmState,
-    shared: &SessionManager,
+    connections: &mut ConnectionRegistry,
     io_core: &mut crate::v2::engine::io_core::IoState,
     budget: usize,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
-    mut defer_one_event: impl FnMut() -> Result<bool>,
+    mut defer_one_event: impl FnMut(&ConnectionRegistry) -> Result<bool>,
 ) -> Result<usize> {
     let mut processed = 0;
     while processed < budget {
@@ -28,7 +28,7 @@ pub(super) fn service_cm_destructions(
         let Some(pending) = pending else {
             break;
         };
-        match defer_one_event() {
+        match defer_one_event(connections) {
             Ok(true) => {
                 lock_unpoison(&state.cm_destructions).push_back(pending);
             }
@@ -45,29 +45,16 @@ pub(super) fn service_cm_destructions(
                     PendingCmDestruction::Route(cm_id) => cm_id.destroy()?,
                     PendingCmDestruction::Connection {
                         cm_id,
-                        connection,
+                        token,
                         completion,
                     } => {
-                        let destroy_result = cm_id.destroy().map_err(|error| {
-                            contextual_cm_error(
-                                format!(
-                                    "destroy connection CM ID for slot {} generation {}",
-                                    connection.token.slot, connection.token.generation
-                                ),
-                                error,
-                            )
-                        });
-                        let finalize_result = release_connection_retirement(shared, &connection);
-                        if finalize_result.is_ok() {
-                            io_core.retire_connection_io(connection.token);
-                        }
                         complete_connection_cm_destruction(
                             state,
-                            shared,
-                            connection,
+                            connections,
+                            io_core,
+                            token,
                             completion,
-                            destroy_result,
-                            finalize_result,
+                            cm_id,
                             actions,
                         )?;
                     }
@@ -95,26 +82,6 @@ pub(super) fn service_cm_destructions(
                                 injected_cm_result(destroy_error),
                                 actions,
                             )?,
-                            TestCmDestruction::Connection {
-                                connection,
-                                completion,
-                                destroy_error,
-                                finalize_error,
-                            } => {
-                                let finalize_result = match finalize_error {
-                                    Some(error) => injected_cm_result(Some(error)),
-                                    None => release_connection_retirement(shared, &connection),
-                                };
-                                complete_connection_cm_destruction(
-                                    state,
-                                    shared,
-                                    connection,
-                                    completion,
-                                    injected_cm_result(destroy_error),
-                                    finalize_result,
-                                    actions,
-                                )?
-                            }
                         }
                     }
                 }
@@ -148,90 +115,139 @@ fn complete_listener_cm_destruction(
 
 fn complete_connection_cm_destruction(
     state: &CmState,
-    shared: &SessionManager,
-    connection: Arc<ConnectionState>,
+    connections: &mut ConnectionRegistry,
+    io_core: &mut crate::v2::engine::io_core::IoState,
+    token: ConnectionToken,
     completion: Option<InboundRetirementCompletion>,
-    destroy_result: Result<()>,
-    finalize_result: Result<()>,
+    cm_id: super::SharedCmId,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<()> {
-    match (destroy_result, finalize_result) {
-        (Ok(()), Ok(())) => {
-            shared.record_connection_retired(&connection);
-            if let Some(event) = connection.finish_retirement_into(actions) {
-                actions.push_event(event);
+    match cm_id.destroy() {
+        Ok(()) => match release_connection_retirement(connections, token) {
+            Ok(mut connection) => {
+                io_core.retire_connection_io(token, &connection.io_ledger);
+                if let Some(event) = connection.finish_retirement_into(actions) {
+                    actions.push_event(event);
+                }
+                finish_inbound_retirement(state, completion, actions);
+                Ok(())
             }
-            finish_inbound_retirement(state, completion, actions);
-            Ok(())
-        }
-        (destroy_result, finalize_result) => {
-            let error = connection_destruction_error(destroy_result, finalize_result);
-            let message = error_detail(&error);
-            if let Some(event) = connection.fail_retirement_into(error.clone(), actions) {
-                actions.push_event(event);
-            }
-            fail_inbound_retirement(state, completion, message, actions);
-            Err(error)
+            Err(error) => quarantine_connection_retirement(
+                state,
+                connections,
+                token,
+                completion,
+                error,
+                actions,
+            ),
+        },
+        Err(error) => {
+            let error = contextual_cm_error(
+                format!(
+                    "destroy connection CM ID for slot {} generation {}",
+                    token.slot, token.generation
+                ),
+                error,
+            );
+            quarantine_connection_retirement(state, connections, token, completion, error, actions)
         }
     }
 }
 
+fn quarantine_connection_retirement(
+    state: &CmState,
+    connections: &mut ConnectionRegistry,
+    token: ConnectionToken,
+    completion: Option<InboundRetirementCompletion>,
+    error: Error,
+    actions: &mut crate::v2::engine::reactor::ReactorActions,
+) -> Result<()> {
+    let retained = connections.track_bundle_quarantine(token);
+    if !retained {
+        return Err(Error::InvalidConfig(
+            "connection destruction failure lost its retiring ownership bundle".into(),
+        ));
+    }
+    let (_, event) = connections
+        .with_connection_mut(token, |connection| {
+            connection.publish_destroy_quarantine_into(&error, || {}, actions)
+        })
+        .unwrap_or((false, None));
+    if let Some(event) = event {
+        actions.push_event(event);
+    }
+    tracing::warn!(
+        slot = token.slot,
+        generation = token.generation,
+        %error,
+        "connection destruction failed; retained the complete owning bundle"
+    );
+    fail_inbound_retirement(state, completion, error_detail(&error), actions);
+    Ok(())
+}
+
 pub(super) fn release_failed_install(
-    shared: &SessionManager,
+    connections: &mut ConnectionRegistry,
     resources: FailedConnectionInstallResources,
 ) -> Result<()> {
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    let _ = connections;
     match resources {
         FailedConnectionInstallResources::Unregistered { .. } => Ok(()),
-        FailedConnectionInstallResources::Registered(connection) => {
-            let released = shared
-                .connections
-                .release_unindexed(connection.token)
-                .ok_or_else(|| {
-                    Error::InvalidConfig(
-                        "failed connection installation lost its reserved generation".into(),
-                    )
-                })?;
-            if !Arc::ptr_eq(&released, &connection) {
-                return Err(Error::InvalidConfig(
-                    "failed connection installation released a mismatched generation".into(),
-                ));
-            }
-            connection.release_admission();
+        #[cfg(any(test, feature = "test-hooks"))]
+        FailedConnectionInstallResources::Registered(token) => {
+            let _released = connections.release_unindexed(token).ok_or_else(|| {
+                Error::InvalidConfig(
+                    "failed connection installation lost its reserved generation".into(),
+                )
+            })?;
             Ok(())
         }
+        FailedConnectionInstallResources::Detached(_)
+        | FailedConnectionInstallResources::Unrecoverable => Ok(()),
     }
 }
 
 pub(super) fn retain_failed_install(
-    state: &CmState,
+    _state: &CmState,
+    connections: &mut ConnectionRegistry,
     shared: &SessionManager,
+    token: ConnectionToken,
     resources: FailedConnectionInstallResources,
     destroy_error: &Error,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Option<EstablishedConnectionRoute> {
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    let _ = (shared, destroy_error, actions);
     match resources {
         FailedConnectionInstallResources::Unregistered {
             poster,
-            mut reservation,
+            reservation,
         } => {
-            reservation.retain_setup_quarantine();
-            lock_unpoison(&state.setup_rollback_quarantines).push(RetainedSetupRollback {
-                _poster: poster,
-                _reservation: reservation,
-            });
+            connections.retain_setup_quarantine(token, poster, reservation);
             None
         }
-        FailedConnectionInstallResources::Registered(connection) => {
-            connection.begin_close();
-            let _ = connection.try_begin_retirement();
-            shared.track_connection_quarantine(connection.token);
-            let (_, event) =
-                connection.publish_destroy_quarantine_into(destroy_error, || {}, actions);
+        #[cfg(any(test, feature = "test-hooks"))]
+        FailedConnectionInstallResources::Registered(token) => {
+            connections.begin_close(token);
+            let _ = connections.request_retirement(token);
+            let _ = connections.begin_retirement(token);
+            shared.track_connection_quarantine(connections, token);
+            let (_, event) = connections
+                .with_connection_mut(token, |connection| {
+                    connection.publish_destroy_quarantine_into(destroy_error, || {}, actions)
+                })
+                .unwrap_or((false, None));
             if let Some(event) = event {
                 actions.push_event(event);
             }
-            Some(EstablishedConnectionRoute::new(&connection))
+            Some(EstablishedConnectionRoute::new(token))
         }
+        FailedConnectionInstallResources::Detached(connection) => {
+            connections.retain_detached_quarantine(token, connection);
+            None
+        }
+        FailedConnectionInstallResources::Unrecoverable => None,
     }
 }
 
@@ -243,12 +259,13 @@ pub(super) fn record_setup_rollback_quarantine(destroy_error: &Error) {
 }
 
 fn finalize_connection_retirement_into(
-    shared: &SessionManager,
-    connection: Arc<ConnectionState>,
+    connections: &mut ConnectionRegistry,
+    io_core: &mut crate::v2::engine::io_core::IoState,
+    token: ConnectionToken,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<()> {
-    release_connection_retirement(shared, &connection)?;
-    shared.record_connection_retired(&connection);
+    let mut connection = release_connection_retirement(connections, token)?;
+    io_core.retire_connection_io(token, &connection.io_ledger);
     if let Some(event) = connection.finish_retirement_into(actions) {
         actions.push_event(event);
     }
@@ -256,22 +273,18 @@ fn finalize_connection_retirement_into(
 }
 
 fn release_connection_retirement(
-    shared: &SessionManager,
-    connection: &Arc<ConnectionState>,
-) -> Result<()> {
-    let released = shared
-        .connections
-        .release(connection.token, connection.qp_num())
+    connections: &mut ConnectionRegistry,
+    token: ConnectionToken,
+) -> Result<super::super::connection::ConnectionState> {
+    let qp_num = connections
+        .with_connection(token, |connection| connection.qp_num())
         .ok_or_else(|| {
             Error::InvalidConfig("connection registry retirement lost its entry".into())
         })?;
-    if !Arc::ptr_eq(&released, connection) {
-        return Err(Error::InvalidConfig(
-            "connection registry retired a mismatched generation".into(),
-        ));
-    }
-    connection.release_admission();
-    Ok(())
+    let released = connections.release(token, qp_num).ok_or_else(|| {
+        Error::InvalidConfig("connection registry retirement lost its entry".into())
+    })?;
+    Ok(released)
 }
 
 fn finish_inbound_retirement(
@@ -317,49 +330,55 @@ fn fail_inbound_retirement(
 }
 
 pub(super) fn retire_registered_connection_into(
+    state: &CmState,
+    connections: &mut ConnectionRegistry,
     shared: &SessionManager,
     io_core: &mut crate::v2::engine::io_core::IoState,
     token: ConnectionToken,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<()> {
-    let state = &shared.cm;
-    let Lookup::Occupied(connection) = shared.connections.lookup(token) else {
+    let Lookup::Occupied(connection) = connections.lookup(token) else {
         return Ok(());
     };
-    if io_core.connection_accepted_count(&connection.io) != 0 {
+    if connections.accepted_count(token) != 0 {
         return Ok(());
     }
-    if !connection.error_transition_complete() {
-        state.enqueue_retirement(token);
+    if !connections
+        .with_connection(token, |connection| connection.error_transition_complete())
+        .unwrap_or(false)
+    {
+        connections.enqueue_retirement(token);
         return Ok(());
     }
-    if !connection.try_begin_retirement() {
+    if !connections.begin_retirement(token) {
         return Ok(());
     }
-    let lifecycle = connection.lock_lifecycle();
-    let qp_boundary = shared.ensure_qp_destroyed(&connection, &lifecycle);
-    drop(lifecycle);
+    let qp_boundary = shared.ensure_qp_destroyed(connections, token);
     if let Err(error) = qp_boundary {
         tracing::warn!(
-            slot = connection.token.slot,
-            generation = connection.token.generation,
-            qp_num = connection.qp_num(),
+            slot = token.slot,
+            generation = token.generation,
+            qp_num = connection.qp_num,
             %error,
             "connection QP destroy failed; retaining CM route and ownership bundle"
         );
-        shared.track_connection_quarantine(connection.token);
-        let (_, event) = connection.publish_destroy_quarantine_into(&error, || {}, actions);
+        shared.track_connection_quarantine(connections, token);
+        let (_, event) = connections
+            .with_connection_mut(token, |connection| {
+                connection.publish_destroy_quarantine_into(&error, || {}, actions)
+            })
+            .unwrap_or((false, None));
         if let Some(event) = event {
             actions.push_event(event);
         }
         return Ok(());
     }
-    let retirement = match connection.cm_route() {
+    let retirement = match connections.connection_route(token) {
         Some(ConnectionCmRoute::Outbound(encoded)) => {
-            state.retire_outbound_route_for_retirement(encoded, &connection)?
+            state.retire_outbound_route_for_retirement(connections, encoded, token)?
         }
         Some(ConnectionCmRoute::Inbound(encoded)) => {
-            state.retire_inbound_route_for_retirement(encoded, &connection, actions)?
+            state.retire_inbound_route_for_retirement(connections, encoded, token, actions)?
         }
         None => RouteRetirement::Complete {
             completion: None,
@@ -367,27 +386,27 @@ pub(super) fn retire_registered_connection_into(
         },
     };
     let RouteRetirement::Complete { completion, reject } = retirement else {
-        connection.retry_retirement();
-        state.enqueue_retirement(token);
+        connections.retry_retirement(token);
         return Ok(());
     };
-    let lifecycle = connection.lock_lifecycle();
-    let outstanding_operations = io_core.connection_accepted_count(&connection.io);
-    let resources =
-        shared.destroy_connection_resources(&connection, &lifecycle, outstanding_operations);
-    drop(lifecycle);
+    let outstanding_operations = connections.accepted_count(token);
+    let resources = shared.destroy_connection_resources(connections, token, outstanding_operations);
     let cm_id = match resources {
         Ok(resources) => resources,
         Err(error) => {
             tracing::warn!(
-                slot = connection.token.slot,
-                generation = connection.token.generation,
-                qp_num = connection.qp_num(),
+                slot = token.slot,
+                generation = token.generation,
+                qp_num = connection.qp_num,
                 %error,
                 "connection resource finalization failed; retaining terminal quarantine"
             );
-            shared.track_connection_quarantine(connection.token);
-            let (_, event) = connection.publish_destroy_quarantine_into(&error, || {}, actions);
+            shared.track_connection_quarantine(connections, token);
+            let (_, event) = connections
+                .with_connection_mut(token, |connection| {
+                    connection.publish_destroy_quarantine_into(&error, || {}, actions)
+                })
+                .unwrap_or((false, None));
             if let Some(event) = event {
                 actions.push_event(event);
             }
@@ -406,12 +425,12 @@ pub(super) fn retire_registered_connection_into(
         }
         lock_unpoison(&state.cm_destructions).push_back(PendingCmDestruction::Connection {
             cm_id,
-            connection,
+            token,
             completion,
         });
         return Ok(());
     }
-    finalize_connection_retirement_into(shared, connection, actions)?;
+    finalize_connection_retirement_into(connections, io_core, token, actions)?;
     finish_inbound_retirement(state, completion, actions);
     Ok(())
 }

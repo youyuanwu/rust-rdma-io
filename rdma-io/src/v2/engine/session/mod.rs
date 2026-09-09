@@ -1,20 +1,16 @@
 //! Connection/session ownership for the explicitly driven v2 engine.
 //!
-//! The session manager owns every CM route, listener, connection registry
-//! entry, connection admission reservation, lifecycle deadline, and
-//! connection-level quarantine entry. The sibling [`super::io_core::IoCore`]
-//! owns operation/CQE state; effects crossing that boundary are interpreted
-//! here through a consuming commit before their detached events and wakers are
-//! published. This ordering covers the runtime's admission, lifecycle,
-//! registry, posting, and operation guards; callers remain responsible for
-//! unrelated locks they hold outside the runtime.
+//! `SessionManager` retains listener identity/lifecycle, the shared CM context
+//! index, and the common CM-destruction service as Phase-8 adapters. The
+//! driver-owned [`super::reactor::EngineReactor`] owns connection identity,
+//! routes, admission, deadlines, retirement, and quarantine. I/O effects cross
+//! into that owner through a consuming commit before detached events and
+//! wakers are published.
 
-use std::collections::{HashSet, VecDeque};
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
-use std::time::Duration;
 
 use self::cm::CmState;
 pub(in crate::v2::engine) use self::cm::{
@@ -25,15 +21,12 @@ pub(super) mod connection;
 mod drain;
 pub(super) mod listener;
 mod progress;
-mod registry;
+pub(in crate::v2::engine) mod registry;
 
-use self::connection::{
-    ConnectionAdmissionPool, ConnectionState, QpDestroyStatus, SharedCmId, VerbsConnectionResources,
-};
+use self::connection::{QpDestroyStatus, SharedCmId};
 use self::listener::ListenerState;
 pub(super) use self::progress::SessionReactorSources;
 use self::registry::ConnectionRegistry;
-pub(in crate::v2::engine) use self::registry::LiveIoProofAuthority;
 #[cfg(any(test, feature = "test-hooks"))]
 use super::SessionTestInstrumentation;
 use super::config::{ProviderLimits, RdmaConnectionConfig, SessionConfig};
@@ -149,17 +142,6 @@ impl SessionCloseState {
     }
 }
 
-/// Opaque request-only capability held by protocol I/O.
-///
-/// It cannot access a QP, CmId, registry entry, or lifecycle authority.
-#[derive(Clone)]
-pub(crate) struct SessionConnection {
-    manager: Weak<SessionManager>,
-    commands: Weak<CommandIngress>,
-    token: ConnectionToken,
-    close: Arc<SessionCloseState>,
-}
-
 /// Resource-free close observation for an engine-owned listener.
 pub(super) struct SessionListenerCloseState {
     outcome: Mutex<Option<super::lifecycle::MemoizedTerminalResult>>,
@@ -195,11 +177,6 @@ impl SessionListenerCloseState {
         let previous = self.frontend_count.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0, "listener frontend count must be positive");
         previous == 1
-    }
-
-    #[cfg(test)]
-    pub(super) fn notify_waiters(self: &Arc<Self>) {
-        self.notify.notify_waiters();
     }
 
     pub(super) fn notify_waiters_into(
@@ -270,88 +247,17 @@ impl SessionListener {
     }
 }
 
-impl SessionConnection {
-    pub(super) fn new(
-        manager: Weak<SessionManager>,
-        commands: Weak<CommandIngress>,
-        token: ConnectionToken,
-        close: Arc<SessionCloseState>,
-    ) -> Self {
-        Self {
-            manager,
-            commands,
-            token,
-            close,
-        }
-    }
-
-    pub(crate) fn request_close(&self) {
-        if let (Some(manager), Some(commands)) = (self.manager.upgrade(), self.commands.upgrade()) {
-            commands.request_connection_close(&manager, self.token);
-        }
-    }
-
-    pub(in crate::v2::engine) fn command_ingress(&self) -> Weak<CommandIngress> {
-        self.commands.clone()
-    }
-
-    pub(in crate::v2::engine) fn manager(&self) -> Weak<SessionManager> {
-        self.manager.clone()
-    }
-
-    pub(in crate::v2::engine) fn token(&self) -> ConnectionToken {
-        self.token
-    }
-
-    pub(crate) async fn close(&self) -> Result<()> {
-        self.request_close();
-        loop {
-            let notify = self.close.notify();
-            let notified = notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if let Some(outcome) = self.close.outcome() {
-                return outcome.into_result();
-            }
-
-            if let Some(manager) = self.manager.upgrade()
-                && let Some(outcome) = manager.engine_outcome()
-            {
-                return outcome.into_result();
-            }
-            notified.await;
-        }
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn transition_to_error_for_test(&self) -> Result<()> {
-        let manager = self.manager.upgrade().ok_or(Error::DriverShutdown)?;
-        manager.transition_connection_to_error_token(self.token)
-    }
-}
-
-#[derive(Default)]
-struct QuarantineState {
-    connection_bundles: HashSet<ConnectionToken>,
-    operation_connections: HashSet<ConnectionToken>,
-}
-
-/// Sole owner of v2 connection/session state and lifecycle policy.
+/// Shared listener/CM adapter and immutable session policy.
 ///
-/// `IoCore` is retained only as the narrow operation side of the composition;
-/// it has no dependency back on this owner. Resource-owning registry and CM
-/// fields precede that retain so they are dropped before the I/O core can lose
-/// its final session-held reference.
+/// Connection-only ownership is deliberately absent; reactor turns pass the
+/// exclusive connection registry into the adapter where listener or CM event
+/// dispatch still needs it.
 pub(super) struct SessionManager {
-    pub(super) connection_admission: Arc<ConnectionAdmissionPool>,
-    pub(super) connections: ConnectionRegistry,
     pub(super) cm: CmState,
     #[cfg(any(test, feature = "test-hooks"))]
     pub(super) rejected_cm_events: AtomicU64,
-    deadline_requests: Mutex<VecDeque<DeadlineRequest>>,
     pub(super) admission: Arc<RwLock<()>>,
     pub(super) shutdown_connection_close_started: AtomicBool,
-    quarantines: Mutex<QuarantineState>,
     // Frontend capabilities retain only this weak self-reference.
     self_ref: OnceLock<Weak<SessionManager>>,
     commands: OnceLock<Weak<CommandIngress>>,
@@ -378,15 +284,11 @@ impl SessionManager {
     ) -> Result<Self> {
         let max_live_connections = config.max_live_connections;
         Ok(Self {
-            connection_admission: ConnectionAdmissionPool::new(max_live_connections),
-            connections: ConnectionRegistry::new(max_live_connections)?,
             cm: CmState::new(max_live_connections)?,
             #[cfg(any(test, feature = "test-hooks"))]
             rejected_cm_events: AtomicU64::new(0),
-            deadline_requests: Mutex::new(VecDeque::new()),
             admission,
             shutdown_connection_close_started: AtomicBool::new(false),
-            quarantines: Mutex::new(QuarantineState::default()),
             self_ref: OnceLock::new(),
             commands: OnceLock::new(),
             engine: OnceLock::new(),
@@ -418,15 +320,17 @@ impl SessionManager {
         }
     }
 
-    pub(super) fn live_connection_count(&self) -> usize {
-        self.connections.live()
+    pub(super) fn max_live_connections(&self) -> usize {
+        self.config.max_live_connections
     }
 
     pub(super) fn engine_runtime(&self) -> Option<Arc<dyn SessionEngineRuntime>> {
         self.engine.get().and_then(Weak::upgrade)
     }
 
-    fn engine_outcome(&self) -> Option<super::lifecycle::MemoizedTerminalResult> {
+    pub(in crate::v2::engine) fn engine_outcome(
+        &self,
+    ) -> Option<super::lifecycle::MemoizedTerminalResult> {
         self.engine_runtime().and_then(|engine| engine.outcome())
     }
 
@@ -499,33 +403,15 @@ impl SessionManager {
 
     pub(in crate::v2::engine) fn request_connection_close_into(
         &self,
+        connections: &mut ConnectionRegistry,
         io_core: &mut IoState,
         token: ConnectionToken,
         actions: &mut super::reactor::ReactorActions,
     ) {
-        let Lookup::Occupied(connection) = self.connections.lookup(token) else {
+        let Lookup::Occupied(_) = connections.lookup(token) else {
             return;
         };
-        self.begin_connection_close_into(&connection, io_core, actions);
-    }
-
-    pub(super) fn connection_capability(&self, connection: &ConnectionState) -> SessionConnection {
-        let manager = self
-            .self_ref
-            .get()
-            .expect("SessionManager self reference is bound before use")
-            .clone();
-        let commands = self
-            .commands
-            .get()
-            .expect("SessionManager command ingress is bound before use")
-            .clone();
-        SessionConnection::new(
-            manager,
-            commands,
-            connection.token,
-            connection.close_state(),
-        )
+        self.begin_connection_close_into(connections, token, io_core, actions);
     }
 
     pub(super) fn listener_capability(&self, listener: &Arc<ListenerState>) -> SessionListener {
@@ -543,13 +429,20 @@ impl SessionManager {
 
     pub(super) fn establish_qp_destruction_proof(
         &self,
-        connection: &ConnectionState,
-        lifecycle: &std::sync::MutexGuard<'_, ()>,
+        connections: &mut ConnectionRegistry,
+        token: ConnectionToken,
     ) -> Result<QpDestructionProof> {
-        match connection.destroy_qp_for_session(&self.lifecycle_authority, lifecycle)? {
+        let status = connections
+            .with_connection_mut(token, |connection| {
+                connection.destroy_qp_for_session(&self.lifecycle_authority)
+            })
+            .ok_or(Error::TransportClosed)??;
+        match status {
             QpDestroyStatus::DestroyedNow => Ok(QpDestructionProof {
-                connection: connection.token,
-                qp_num: connection.qp_num(),
+                connection: token,
+                qp_num: connections
+                    .with_connection(token, |connection| connection.qp_num())
+                    .ok_or(Error::TransportClosed)?,
                 _authority: (),
             }),
             QpDestroyStatus::AlreadyDestroyed => Err(Error::InvalidConfig(
@@ -560,181 +453,160 @@ impl SessionManager {
 
     pub(super) fn ensure_qp_destroyed(
         &self,
-        connection: &ConnectionState,
-        lifecycle: &std::sync::MutexGuard<'_, ()>,
+        connections: &mut ConnectionRegistry,
+        token: ConnectionToken,
     ) -> Result<()> {
-        match connection.destroy_qp_for_session(&self.lifecycle_authority, lifecycle)? {
+        match connections
+            .with_connection_mut(token, |connection| {
+                connection.destroy_qp_for_session(&self.lifecycle_authority)
+            })
+            .ok_or(Error::TransportClosed)??
+        {
             QpDestroyStatus::DestroyedNow | QpDestroyStatus::AlreadyDestroyed => Ok(()),
         }
     }
 
     pub(super) fn transition_connection_to_error(
         &self,
-        connection: &ConnectionState,
+        connections: &mut ConnectionRegistry,
+        token: ConnectionToken,
     ) -> Result<bool> {
-        connection.transition_to_error_once(&self.lifecycle_authority)
+        connections
+            .with_connection_mut(token, |connection| {
+                connection.transition_to_error_once(&self.lifecycle_authority)
+            })
+            .ok_or(Error::TransportClosed)?
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    fn transition_connection_to_error_token(&self, token: ConnectionToken) -> Result<()> {
-        let Lookup::Occupied(connection) = self.connections.lookup(token) else {
-            return Err(Error::TransportClosed);
-        };
-        self.transition_connection_to_error(&connection).map(|_| ())
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(in crate::v2::engine) fn transition_connection_to_error_token(
+        &self,
+        connections: &mut ConnectionRegistry,
+        token: ConnectionToken,
+    ) -> Result<()> {
+        self.transition_connection_to_error(connections, token)
+            .map(|_| ())
     }
 
     pub(super) fn finalize_connection_engine(
         &self,
-        connection: &ConnectionState,
+        connections: &mut ConnectionRegistry,
+        token: ConnectionToken,
         outcome: &super::lifecycle::MemoizedTerminalResult,
     ) -> Option<super::io::PendingIoEvent> {
-        connection.close_state().record_engine_terminal(outcome);
-        connection.finalize_engine(&self.lifecycle_authority, outcome)
+        connections
+            .with_connection_mut(token, |connection| {
+                connection.close_state().record_engine_terminal(outcome);
+                connection.finalize_engine(&self.lifecycle_authority, outcome)
+            })
+            .flatten()
     }
 
     pub(super) fn destroy_connection_resources(
         &self,
-        connection: &ConnectionState,
-        lifecycle: &std::sync::MutexGuard<'_, ()>,
+        connections: &mut ConnectionRegistry,
+        token: ConnectionToken,
         outstanding_operations: usize,
     ) -> Result<Option<SharedCmId>> {
-        connection.destroy_connection_resources(
-            &self.lifecycle_authority,
-            lifecycle,
-            outstanding_operations,
-        )
+        connections
+            .with_connection_mut(token, |connection| {
+                connection
+                    .destroy_connection_resources(&self.lifecycle_authority, outstanding_operations)
+            })
+            .ok_or(Error::TransportClosed)?
     }
 
-    pub(super) fn destroy_unregistered_connection(
+    pub(super) fn destroy_failed_connection_install(
         &self,
-        connection: &VerbsConnectionResources,
+        connections: &mut ConnectionRegistry,
+        resources: &mut self::connection::FailedConnectionInstallResources,
     ) -> Result<(Option<SharedCmId>, bool)> {
-        connection.destroy_unregistered_for_session(&self.lifecycle_authority)
+        resources.destroy_for_session(connections, &self.lifecycle_authority)
     }
 
-    #[cfg(test)]
-    pub(super) fn mint_qp_destruction_proof_for_test(
+    pub(super) fn reject_failed_connection_install(
         &self,
-        connection: &ConnectionState,
-    ) -> QpDestructionProof {
-        connection.record_qp_destroyed_for_test();
-        QpDestructionProof {
-            connection: connection.token,
-            qp_num: connection.qp_num(),
-            _authority: (),
-        }
+        connections: &ConnectionRegistry,
+        resources: &self::connection::FailedConnectionInstallResources,
+    ) -> Result<()> {
+        resources.reject_for_session(connections)
     }
 
-    pub(super) fn schedule_deadline(&self, kind: DeadlineKind, token: u64, after: Duration) {
-        let now = tokio::time::Instant::now();
-        let at = now.checked_add(after).unwrap_or(now);
-        lock_unpoison(&self.deadline_requests).push_back(DeadlineRequest { at, kind, token });
-        self.publish_session_work();
-    }
-
-    pub(super) fn take_deadline_requests(&self, budget: usize) -> Vec<DeadlineRequest> {
-        let mut requests = lock_unpoison(&self.deadline_requests);
-        let count = requests.len().min(budget);
-        requests.drain(..count).collect()
-    }
-
-    #[cfg(test)]
-    pub(super) fn has_deadline_requests(&self) -> bool {
-        !lock_unpoison(&self.deadline_requests).is_empty()
-    }
-
-    pub(super) fn deadline_request_count(&self) -> usize {
-        lock_unpoison(&self.deadline_requests).len()
-    }
-
-    pub(super) fn track_connection_quarantine(&self, token: ConnectionToken) -> bool {
-        let mut quarantines = lock_unpoison(&self.quarantines);
-        if !quarantines.connection_bundles.insert(token) {
-            return false;
-        }
-        Self::retain_connection_quarantine(self, &quarantines, token)
-    }
-
-    pub(super) fn track_operation_quarantine(&self, connection: ConnectionToken) -> bool {
-        let mut quarantines = lock_unpoison(&self.quarantines);
-        if !quarantines.operation_connections.insert(connection) {
-            return false;
-        }
-        Self::retain_connection_quarantine(self, &quarantines, connection)
-    }
-
-    fn retain_connection_quarantine(
+    pub(super) fn track_connection_quarantine(
         &self,
-        quarantines: &QuarantineState,
-        connection: ConnectionToken,
+        connections: &mut ConnectionRegistry,
+        token: ConnectionToken,
     ) -> bool {
-        let first_for_connection = !(quarantines.connection_bundles.contains(&connection)
-            && quarantines.operation_connections.contains(&connection));
-        if first_for_connection
-            && let Lookup::Occupied(connection) = self.connections.lookup(connection)
-        {
-            connection.mark_reservation_quarantined();
-        }
-        first_for_connection
+        connections.track_bundle_quarantine(token)
     }
 
-    pub(super) fn clear_connection_quarantine(&self, token: ConnectionToken) -> bool {
-        let mut quarantines = lock_unpoison(&self.quarantines);
-        if !quarantines.connection_bundles.remove(&token) {
-            return false;
-        }
-        self.release_connection_quarantine(&quarantines, token)
-    }
-
-    pub(super) fn recover_connection_quarantine_entry(&self, token: ConnectionToken) -> bool {
-        self.clear_connection_quarantine(token)
-    }
-
-    pub(super) fn clear_operation_quarantine(&self, connection: ConnectionToken) -> bool {
-        let mut quarantines = lock_unpoison(&self.quarantines);
-        if !quarantines.operation_connections.remove(&connection) {
-            return false;
-        }
-        self.release_connection_quarantine(&quarantines, connection)
-    }
-
-    fn release_connection_quarantine(
+    pub(super) fn track_operation_quarantine(
         &self,
-        quarantines: &QuarantineState,
+        connections: &mut ConnectionRegistry,
         connection: ConnectionToken,
+        operation: OperationToken,
     ) -> bool {
-        if quarantines.connection_bundles.contains(&connection)
-            || quarantines.operation_connections.contains(&connection)
-        {
+        connections.track_operation_quarantine(connection, operation)
+    }
+
+    pub(super) fn clear_connection_quarantine(
+        &self,
+        connections: &mut ConnectionRegistry,
+        token: ConnectionToken,
+    ) -> bool {
+        if !connections.clear_bundle_quarantine(token) {
             return false;
-        }
-        if let Lookup::Occupied(connection) = self.connections.lookup(connection) {
-            connection.recover_reservation_quarantine();
-        } else {
-            self.connection_admission.clear_retained_quarantine();
         }
         true
     }
 
-    fn apply_io_effects(&self, mut effects: IoCoreEffects) -> CommittedIoCoreEffects {
+    pub(super) fn recover_connection_quarantine_entry(
+        &self,
+        connections: &mut ConnectionRegistry,
+        token: ConnectionToken,
+    ) -> bool {
+        self.clear_connection_quarantine(connections, token)
+    }
+
+    pub(super) fn clear_operation_quarantine(
+        &self,
+        connections: &mut ConnectionRegistry,
+        connection: ConnectionToken,
+        operation: OperationToken,
+    ) -> bool {
+        if !connections.clear_operation_quarantine(connection, operation) {
+            return false;
+        }
+        true
+    }
+
+    fn apply_io_effects(
+        &self,
+        connections: &mut ConnectionRegistry,
+        mut effects: IoCoreEffects,
+    ) -> CommittedIoCoreEffects {
         for effect in effects.take_quarantine() {
             match effect {
-                OperationQuarantineEffect::Added(connection) => {
-                    self.track_operation_quarantine(connection);
+                OperationQuarantineEffect::Added {
+                    connection,
+                    operation,
+                } => {
+                    self.track_operation_quarantine(connections, connection, operation);
                 }
-                OperationQuarantineEffect::Cleared(connection) => {
-                    self.clear_operation_quarantine(connection);
+                OperationQuarantineEffect::Cleared {
+                    connection,
+                    operation,
+                } => {
+                    self.clear_operation_quarantine(connections, connection, operation);
                 }
             }
         }
         for token in effects.take_drained() {
-            let Lookup::Occupied(connection) = self.connections.lookup(token) else {
-                continue;
-            };
-            if connection.close_started() {
-                self.recover_connection_quarantine(&connection);
-                self.record_connection_drained(&connection);
-                self.schedule_connection_retirement(&connection);
+            if connections.close_started(token) {
+                self.recover_connection_quarantine(connections, token);
+                self.record_connection_drained(connections, token);
+                self.schedule_connection_retirement(connections, token);
             }
         }
         effects.into_committed(&self.io_effects_commit_authority)
@@ -749,16 +621,22 @@ impl SessionManager {
     /// paths use a separate detached-only type after their guards are dropped.
     /// This boundary cannot prove that a caller holds no unrelated lock.
     #[cfg(test)]
-    pub(super) fn commit_io_effects(&self, effects: IoCoreEffects) {
-        self.apply_io_effects(effects).publish();
+    pub(super) fn commit_io_effects(
+        &self,
+        connections: &mut ConnectionRegistry,
+        effects: IoCoreEffects,
+    ) {
+        self.apply_io_effects(connections, effects).publish();
     }
 
     pub(super) fn commit_io_effects_into(
         &self,
+        connections: &mut ConnectionRegistry,
         effects: IoCoreEffects,
         actions: &mut super::reactor::ReactorActions,
     ) {
-        self.apply_io_effects(effects).append_to(actions);
+        self.apply_io_effects(connections, effects)
+            .append_to(actions);
     }
 
     /// Apply session effects for root terminal composition.
@@ -768,55 +646,59 @@ impl SessionManager {
     /// Session authority confines conversion before root composition.
     pub(super) fn apply_terminal_io_effects(
         &self,
+        connections: &mut ConnectionRegistry,
         effects: IoCoreEffects,
     ) -> CommittedIoCoreEffects {
-        self.apply_io_effects(effects)
+        self.apply_io_effects(connections, effects)
     }
 
     pub(super) fn enqueue_completion_with_core(
         &self,
+        connections: &mut ConnectionRegistry,
         io_core: &mut IoState,
         completion: crate::wc::WorkCompletion,
     ) -> Option<ConnectionToken> {
         let _admission = super::registry::read_unpoison(&self.admission);
         let pending = io_core.prepare_completion(completion)?;
         let identity = pending.identity();
-        let connection = match self.connections.lookup(identity.connection) {
-            Lookup::Occupied(connection) => connection,
-            _ => {
-                io_core.reject_cqe(super::io_core::CqeReject::StaleConnection);
-                return None;
-            }
-        };
-        let live = self
-            .connections
-            .prove_live_io(identity.connection, identity.qp_num);
-        io_core.enqueue_prepared_completion(pending, live, &connection.io)
+        if !matches!(connections.lookup(identity.connection), Lookup::Occupied(_)) {
+            io_core.reject_cqe(super::io_core::CqeReject::StaleConnection);
+            return None;
+        }
+        let live = connections.prove_live_io(identity.connection, identity.qp_num);
+        connections
+            .with_connection_io_mut(identity.connection, |connection, connection_io, _poster| {
+                io_core.enqueue_prepared_completion(pending, live, connection, connection_io)
+            })
+            .flatten()
     }
 
     pub(super) fn dispatch_connection_completions_with_core(
         &self,
+        connections: &mut ConnectionRegistry,
         io_core: &mut IoState,
         token: ConnectionToken,
         quantum: usize,
         actions: &mut super::reactor::ReactorActions,
     ) -> (usize, bool) {
-        let connection = match self.connections.lookup(token) {
-            Lookup::Occupied(connection) => connection,
-            _ => return (0, false),
+        let Some((processed, remains_ready, effects)) =
+            connections.with_connection_io_mut(token, |connection, connection_io, _poster| {
+                io_core.dispatch_connection_completions(connection, connection_io, quantum)
+            })
+        else {
+            return (0, false);
         };
-        let (processed, remains_ready, effects) =
-            io_core.dispatch_connection_completions(&connection.io, quantum);
-        self.commit_io_effects_into(effects, actions);
+        self.commit_io_effects_into(connections, effects, actions);
         (processed, remains_ready)
     }
 
     #[cfg(test)]
     pub(super) fn reclaim_after_qp_destroy(
         &self,
+        connections: &mut ConnectionRegistry,
         io_core: &mut IoState,
         proof: QpDestructionProof,
-        connection: &ConnectionState,
+        connection: ConnectionToken,
         tokens: Vec<OperationToken>,
     ) -> usize {
         let QpDestructionProof {
@@ -824,9 +706,14 @@ impl SessionManager {
             qp_num: proven_qp_num,
             _authority: (),
         } = proof;
-        if proven_connection != connection.token || proven_qp_num != connection.qp_num() {
+        let Some((qp_num, close_error)) = connections.with_connection(connection, |connection| {
+            (connection.qp_num(), connection.operation_close_error())
+        }) else {
+            return 0;
+        };
+        if proven_connection != connection || proven_qp_num != qp_num {
             tracing::warn!(
-                connection = connection.token.encode(),
+                connection = connection.encode(),
                 "operation reclaim rejected a mismatched QP destruction proof"
             );
             return 0;
@@ -835,10 +722,12 @@ impl SessionManager {
             .into_iter()
             .filter(|token| {
                 self.reclaim_after_proven_qp_destroy(
+                    connections,
                     io_core,
                     proven_connection,
                     proven_qp_num,
                     connection,
+                    close_error.clone(),
                     *token,
                 )
             })
@@ -847,17 +736,23 @@ impl SessionManager {
 
     pub(super) fn reclaim_after_qp_destroy_into(
         &self,
+        connections: &mut ConnectionRegistry,
         io_core: &mut IoState,
         proof: &QpDestructionProof,
-        connection: &ConnectionState,
+        connection: ConnectionToken,
         tokens: Vec<OperationToken>,
         actions: &mut super::reactor::ReactorActions,
     ) -> usize {
         let proven_connection = proof.connection;
         let proven_qp_num = proof.qp_num;
-        if proven_connection != connection.token || proven_qp_num != connection.qp_num() {
+        let Some((qp_num, close_error)) = connections.with_connection(connection, |connection| {
+            (connection.qp_num(), connection.operation_close_error())
+        }) else {
+            return 0;
+        };
+        if proven_connection != connection || proven_qp_num != qp_num {
             tracing::warn!(
-                connection = connection.token.encode(),
+                connection = connection.encode(),
                 "operation reclaim rejected a mismatched QP destruction proof"
             );
             return 0;
@@ -865,14 +760,21 @@ impl SessionManager {
         tokens
             .into_iter()
             .filter(|token| {
-                let (reclaimed, effects) = io_core.reclaim_after_qp_destroy(
-                    proven_connection,
-                    proven_qp_num,
-                    &connection.io,
-                    connection.operation_close_error(),
-                    *token,
-                );
-                self.commit_io_effects_into(effects, actions);
+                let Some((reclaimed, effects)) =
+                    connections.with_connection_io_mut(connection, |io, connection_io, _poster| {
+                        io_core.reclaim_after_qp_destroy(
+                            proven_connection,
+                            proven_qp_num,
+                            io,
+                            connection_io,
+                            close_error.clone(),
+                            *token,
+                        )
+                    })
+                else {
+                    return false;
+                };
+                self.commit_io_effects_into(connections, effects, actions);
                 reclaimed
             })
             .count()
@@ -881,83 +783,63 @@ impl SessionManager {
     #[cfg(test)]
     fn reclaim_after_proven_qp_destroy(
         &self,
+        connections: &mut ConnectionRegistry,
         io_core: &mut IoState,
         proven_connection: ConnectionToken,
         proven_qp_num: u32,
-        connection: &ConnectionState,
+        connection: ConnectionToken,
+        close_error: Error,
         token: OperationToken,
     ) -> bool {
-        let (reclaimed, effects) = io_core.reclaim_after_qp_destroy(
-            proven_connection,
-            proven_qp_num,
-            &connection.io,
-            connection.operation_close_error(),
-            token,
-        );
-        self.commit_io_effects(effects);
+        let Some((reclaimed, effects)) =
+            connections.with_connection_io_mut(connection, |io, connection_io, _poster| {
+                io_core.reclaim_after_qp_destroy(
+                    proven_connection,
+                    proven_qp_num,
+                    io,
+                    connection_io,
+                    close_error,
+                    token,
+                )
+            })
+        else {
+            return false;
+        };
+        self.commit_io_effects(connections, effects);
         reclaimed
     }
 
     pub(super) fn reject_queued_completions_after_qp_destroy_into(
         &self,
+        connections: &mut ConnectionRegistry,
         io_core: &mut IoState,
-        connection: &ConnectionState,
+        connection: ConnectionToken,
         actions: &mut super::reactor::ReactorActions,
     ) -> bool {
         // Every completion can publish an event, an operation wake, and a
         // connection-close wake. Keep two leaves for the owning connection's
         // quarantine/close tail before removing any copied CQE.
         let quantum = actions.remaining().saturating_sub(2) / 3;
-        let (remains_ready, effects) =
-            io_core.reject_queued_completions_after_qp_destroy(&connection.io, quantum);
-        self.commit_io_effects_into(effects, actions);
+        let Some((remains_ready, effects)) =
+            connections.with_connection_io_mut(connection, |io, connection_io, _poster| {
+                io_core.reject_queued_completions_after_qp_destroy(io, connection_io, quantum)
+            })
+        else {
+            return false;
+        };
+        self.commit_io_effects_into(connections, effects, actions);
         remains_ready
     }
 }
 
 #[cfg(test)]
-impl super::io_core::IoSessionBridge for SessionManager {
-    fn route_completion(
-        &self,
-        io: &mut IoState,
-        completion: crate::wc::WorkCompletion,
-    ) -> Option<ConnectionToken> {
-        self.enqueue_completion_with_core(io, completion)
-    }
-
-    fn dispatch_connection_completions(
-        &self,
-        io: &mut IoState,
-        connection: ConnectionToken,
-        quantum: usize,
-    ) -> (usize, bool) {
-        let mut actions = super::reactor::ReactorActions::default();
-        let result =
-            self.dispatch_connection_completions_with_core(io, connection, quantum, &mut actions);
-        actions.publish();
-        result
-    }
-
-    fn handle_reclamation_deadline(&self, io: &mut IoState, token: OperationToken) {
-        let effects = io.handle_reclamation_deadline(token);
-        self.commit_io_effects(effects);
-    }
-
-    fn commit_terminal_effects(&self, effects: IoCoreEffects) {
-        self.commit_io_effects(effects);
-    }
-}
-
-#[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Weak};
-    use std::time::Duration;
+    use std::sync::Arc;
 
-    use super::super::registry::{ConnectionToken, lock_unpoison};
     use super::super::{CompletionMode, RdmaConnectionConfig, test_engine_pair};
+    use super::DeadlineKind;
     use super::connection::{WorkRequestPoster, install_connection};
     use super::listener::{ListenerState, RdmaListener};
-    use super::{DeadlineKind, SessionCloseState, SessionConnection};
     use crate::v2::error::{Error, Result};
     use crate::v2::qp::{BatchPostOutcome, QpCapabilities};
     use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
@@ -1003,106 +885,87 @@ mod tests {
     }
 
     #[test]
-    fn session_manager_owns_registry_admission_cm_and_deadlines() {
-        let (engine, _driver) = test_engine_pair(CompletionMode::Polling);
-        let manager = &engine.shared.session;
+    fn reactor_owns_registry_admission_and_deadline_inbox() {
+        let (_engine, mut driver) = test_engine_pair(CompletionMode::Polling);
+        let connections = &mut driver.reactor.session.connections;
 
-        assert_eq!(manager.connections.live(), 0);
-        assert_eq!(manager.connection_admission.snapshot().live, 0);
-        assert_eq!(manager.cm.pending_route_count(), 0);
-        assert!(!manager.has_deadline_requests());
+        assert_eq!(connections.live(), 0);
+        assert_eq!(connections.admission_snapshot().live, 0);
+        assert_eq!(connections.deadline_request_count(), 0);
 
-        manager.schedule_deadline(DeadlineKind::ConnectionDrain, 7, Duration::ZERO);
-        assert!(manager.has_deadline_requests());
-        let requests = manager.take_deadline_requests(1);
+        connections.schedule_deadline(DeadlineKind::ConnectionDrain, 7, std::time::Duration::ZERO);
+        let requests = connections.take_deadline_requests(1);
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].kind, DeadlineKind::ConnectionDrain);
         assert_eq!(requests[0].token, 7);
-        assert!(!manager.has_deadline_requests());
+        assert_eq!(connections.deadline_request_count(), 0);
     }
 
     #[test]
-    fn session_connection_capability_is_resource_free_and_routes_close() {
+    fn connection_handle_routes_close_by_identity() {
         let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
         let connection = install_connection(
             &engine.shared.session,
+            &mut driver.reactor.session.connections,
             Arc::new(TestPoster { qp_num: 17 }),
             RdmaConnectionConfig::default(),
             None,
             None,
         )
         .expect("install synthetic connection");
-        let state_retain_count = Arc::strong_count(&connection.state);
-        let capability = engine
-            .shared
-            .session
-            .connection_capability(&connection.state);
-
-        assert_eq!(
-            Arc::strong_count(&connection.state),
-            state_retain_count,
-            "request capability must not retain ConnectionState or its resource bundle"
+        let token = connection.session_token();
+        connection.request_close();
+        assert!(!driver.reactor.session.connections.close_started(token));
+        engine.shared.commands.service_turn(
+            &engine.shared,
+            driver.reactor.io.core_mut(),
+            &mut driver.reactor.session,
         );
-        capability.request_close();
-        assert!(!connection.state.close_started());
-        engine
-            .shared
-            .commands
-            .service_turn(&engine.shared, driver.reactor.io.core_mut());
-        assert!(connection.state.close_started());
-        assert!(connection.state.error_transition_complete());
+        assert!(driver.reactor.session.connections.close_started(token));
+        assert!(
+            driver
+                .reactor
+                .session
+                .connections
+                .with_connection(token, |connection| connection.error_transition_complete())
+                .unwrap()
+        );
     }
 
     #[test]
-    fn session_connection_close_observer_waits_for_retirement_after_cm_failure() {
-        let (engine, _driver) = test_engine_pair(CompletionMode::Polling);
+    fn connection_close_observer_waits_for_retirement_after_cm_failure() {
+        let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
         let connection = install_connection(
             &engine.shared.session,
+            &mut driver.reactor.session.connections,
             Arc::new(TestPoster { qp_num: 18 }),
             RdmaConnectionConfig::default(),
             None,
             None,
         )
         .expect("install synthetic connection");
-        let capability = engine
-            .shared
+        let token = connection.session_token();
+        let _pending = driver
+            .reactor
             .session
-            .connection_capability(&connection.state);
-
-        let _pending = connection.state.mark_cm_failure(Error::TransportClosed);
+            .connections
+            .with_connection_mut(token, |connection| {
+                connection.mark_cm_failure(Error::TransportClosed)
+            })
+            .flatten();
         assert!(
-            capability.close.outcome().is_none(),
+            connection.close_state().outcome().is_none(),
             "ordinary close errors remain hidden until QP/CmId retirement"
         );
-        let _pending = connection.state.finish_retirement();
+        let _pending = driver
+            .reactor
+            .session
+            .connections
+            .with_connection_mut(token, |connection| connection.finish_retirement())
+            .flatten();
         assert!(matches!(
-            capability.close.outcome().unwrap().into_result(),
+            connection.close_state().outcome().unwrap().into_result(),
             Err(Error::TransportClosed)
-        ));
-    }
-
-    #[tokio::test]
-    async fn session_connection_close_observes_engine_terminal_without_manager_owner() {
-        let close = SessionCloseState::new();
-        *lock_unpoison(&close.outcome) = Some(
-            super::super::lifecycle::MemoizedTerminalResult::from_error(Error::TransportClosed),
-        );
-        close.record_engine_terminal(
-            &super::super::lifecycle::MemoizedTerminalResult::from_error(Error::DriverShutdown),
-        );
-        let capability = SessionConnection {
-            manager: Weak::new(),
-            commands: Weak::new(),
-            token: ConnectionToken {
-                slot: 0,
-                generation: 1,
-            },
-            close,
-        };
-
-        assert!(matches!(
-            capability.close().await,
-            Err(Error::DriverShutdown)
         ));
     }
 
@@ -1135,34 +998,38 @@ mod tests {
         let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
         let connection = install_connection(
             &engine.shared.session,
+            &mut driver.reactor.session.connections,
             Arc::new(TestPoster { qp_num: 19 }),
             RdmaConnectionConfig::default(),
             None,
             None,
         )
         .expect("install synthetic connection");
-        let lifecycle = connection.state.lock_lifecycle();
+        let token = connection.session_token();
         let proof = engine
             .shared
             .session
-            .establish_qp_destruction_proof(&connection.state, &lifecycle)
+            .establish_qp_destruction_proof(&mut driver.reactor.session.connections, token)
             .expect("first successful destroy mints proof");
-        assert_eq!(proof.connection, connection.state.token);
-        assert_eq!(proof.qp_num, connection.state.qp_num());
+        assert_eq!(proof.connection, token);
+        assert_eq!(proof.qp_num, connection.identity().qp_num());
         assert!(matches!(
             engine
                 .shared
                 .session
-                .establish_qp_destruction_proof(&connection.state, &lifecycle),
+                .establish_qp_destruction_proof(
+                    &mut driver.reactor.session.connections,
+                    token,
+                ),
             Err(Error::InvalidConfig(message)) if message.contains("cannot be replayed")
         ));
-        drop(lifecycle);
 
         assert_eq!(
             engine.shared.session.reclaim_after_qp_destroy(
+                &mut driver.reactor.session.connections,
                 driver.reactor.io.core_mut(),
                 proof,
-                &connection.state,
+                token,
                 Vec::new(),
             ),
             0

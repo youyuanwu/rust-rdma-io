@@ -64,7 +64,7 @@ async fn actions_produced_before_a_later_source_error_are_published() {
 
     engine.shared.commands.close_admission();
     driver.reactor.session.exhaust_deadline_sequence_for_test();
-    engine.shared.session.schedule_deadline(
+    driver.reactor.session.connections.schedule_deadline(
         super::super::session::DeadlineKind::ConnectionDrain,
         7,
         Duration::ZERO,
@@ -146,6 +146,7 @@ fn io_failure_cleanup_is_bounded_across_driver_polls() {
         });
         let connection = install_connection(
             &engine.shared.session,
+            &mut driver.reactor.session.connections,
             poster as Arc<dyn WorkRequestPoster>,
             RdmaConnectionConfig::default(),
             None,
@@ -154,7 +155,8 @@ fn io_failure_cleanup_is_bounded_across_driver_polls() {
         .unwrap();
         install_accepted_operation_for_driver_test(
             driver.reactor.io.core_mut(),
-            &connection.state,
+            &mut driver.reactor.session.connections,
+            connection.session_token(),
             crate::wc::WcOpcode::Send,
         );
         connections.push(connection);
@@ -312,6 +314,7 @@ async fn cq_reclamation_ready_interleaving_dispatches_queued_success_and_flush_e
             });
             let connection = install_connection(
                 &engine.shared.session,
+                &mut driver.reactor.session.connections,
                 Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
                 RdmaConnectionConfig::default(),
                 None,
@@ -325,14 +328,23 @@ async fn cq_reclamation_ready_interleaving_dispatches_queued_success_and_flush_e
             };
             let operation = install_accepted_operation_for_driver_test(
                 driver.reactor.io.core_mut(),
-                &connection.state,
+                &mut driver.reactor.session.connections,
+                connection.session_token(),
                 expected,
             );
-            connection.state.begin_close();
+            let connection_token = connection.session_token();
+            driver
+                .reactor
+                .session
+                .connections
+                .begin_close(connection_token);
             engine
                 .shared
                 .session
-                .transition_connection_to_error(&connection.state)
+                .transition_connection_to_error(
+                    &mut driver.reactor.session.connections,
+                    connection_token,
+                )
                 .unwrap();
             engine
                 .shared
@@ -343,9 +355,9 @@ async fn cq_reclamation_ready_interleaving_dispatches_queued_success_and_flush_e
                     opcode,
                     status,
                 ));
-            engine.shared.session.schedule_deadline(
+            driver.reactor.session.connections.schedule_deadline(
                 super::super::session::DeadlineKind::ConnectionDrain,
-                connection.state.token.encode(),
+                connection_token.encode(),
                 Duration::ZERO,
             );
             let waker = Waker::noop();
@@ -370,6 +382,7 @@ async fn cq_reclamation_ready_interleaving_dispatches_queued_success_and_flush_e
             );
 
             engine.shared.finish(
+                &mut driver.reactor.session,
                 driver.reactor.io.core_mut(),
                 MemoizedTerminalResult::success(),
             );
@@ -528,11 +541,11 @@ async fn idle_connections_publish_no_completion_dispatch_work() {
         config.completion_mode = CompletionMode::Readiness;
         config.max_live_connections = count;
         let shared = EngineShared::new(config, None, None).unwrap().into_shared();
+        let mut driver = super::super::RdmaEngineDriver::new(Arc::clone(&shared), None);
         let connections = shared
             .test_driver
-            .install_idle_connections(&shared, count)
+            .install_idle_connections(&shared, &mut driver.reactor.session.connections, count)
             .unwrap();
-        let mut driver = super::super::RdmaEngineDriver::new(Arc::clone(&shared), None);
         let waker = futures_util::task::noop_waker();
         let mut cx = TaskContext::from_waker(&waker);
 
@@ -584,6 +597,7 @@ async fn final_accepted_operation_drain_wakes_and_reconsiders_terminal() {
     });
     let connection = install_connection(
         &engine.shared.session,
+        &mut driver.reactor.session.connections,
         Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
         RdmaConnectionConfig::default(),
         None,
@@ -592,7 +606,8 @@ async fn final_accepted_operation_drain_wakes_and_reconsiders_terminal() {
     .unwrap();
     let operation = install_accepted_operation_for_driver_test(
         driver.reactor.io.core_mut(),
-        &connection.state,
+        &mut driver.reactor.session.connections,
+        connection.session_token(),
         crate::wc::WcOpcode::Send,
     );
     let counter = CountingWaker::new();
@@ -649,7 +664,7 @@ async fn final_session_cleanup_is_composed_after_the_owner_pass() {
     let connections = engine
         .shared
         .test_driver
-        .install_idle_connections(&engine.shared, 1)
+        .install_idle_connections(&engine.shared, &mut driver.reactor.session.connections, 1)
         .unwrap();
     engine.shared.request_shutdown();
     let waker = Waker::noop();
@@ -715,7 +730,7 @@ fn driver_drop_wakes_listener_close_pending_cm_destruction() {
     assert_terminal_close(&mut close, &mut cx, &terminal);
     assert_eq!(counter.count(), 1);
     assert_eq!(destroy_count.load(Ordering::Acquire), 0);
-    assert_eq!(engine.shared.session.cm.retained_owner_count(), 1);
+    assert_eq!(engine.shared.session.cm.retained_adapter_owner_count(), 1);
 }
 
 #[test]
@@ -753,7 +768,14 @@ fn driver_error_wakes_listener_close_once_and_preserves_pending_destruction() {
     assert_terminal_close(&mut close, &mut cx, &terminal);
     assert_eq!(counter.count(), 1);
     assert_eq!(destroy_count.load(Ordering::Acquire), 0);
-    assert_eq!(engine.shared.session.cm.retained_owner_count(), 1);
+    assert_eq!(
+        engine
+            .shared
+            .session
+            .cm
+            .retained_owner_count(&driver.reactor.session.connections),
+        1
+    );
 
     drop(driver);
     assert_eq!(counter.count(), 1, "driver drop must not finish twice");

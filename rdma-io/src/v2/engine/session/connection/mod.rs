@@ -3,25 +3,24 @@
 use std::net::SocketAddr;
 use std::ops::Deref;
 use std::sync::RwLockReadGuard;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use tokio::sync::OwnedSemaphorePermit;
 
 use self::qp::QpCapabilitiesExt;
 use super::super::RdmaConnectionConfig;
 use super::super::io::{IoEventSender, IoTerminalEvent, MemoryRegistrar, PendingIoEvent};
 use super::super::io_core::RdmaOperation;
 use super::super::io_core::{
-    EstablishedIoConnection, EstablishedIoIdentity, IoPostAuthority, IoQuarantineReport,
-    OperationKind,
+    ConnectionIoState, EstablishedIoConnection, EstablishedIoIdentity, IoPostAuthority,
+    IoQuarantineReport, OperationKind,
 };
 use super::super::lifecycle::MemoizedTerminalResult;
 #[cfg(any(test, feature = "test-hooks"))]
 use super::super::registry::OperationToken;
 use super::super::registry::{ConnectionToken, lock_unpoison, read_unpoison};
-use super::{
-    QpDestructionProof, SessionCloseState, SessionConnection, SessionLifecycleAuthority,
-    SessionManager,
-};
+use super::registry::ConnectionRegistry;
+use super::{QpDestructionProof, SessionCloseState, SessionLifecycleAuthority, SessionManager};
 use crate::cm::{CmId, ConnParam, EventChannel};
 use crate::v2::error::{Error, Result};
 use crate::v2::mr::{AccessIntent, Mr, RemoteMr};
@@ -76,32 +75,34 @@ impl RdmaConnectionIdentity {
 /// or independently pollable completion-driver handle. Establishment posts
 /// zero initial receives.
 pub struct RdmaConnection {
-    #[cfg(test)]
-    pub(in crate::v2::engine) state: Arc<ConnectionState>,
-    #[cfg(not(test))]
-    state: Weak<ConnectionState>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(in crate::v2::engine) state: Arc<ConnectionTestAccess>,
     pub(in crate::v2::engine) memory: MemoryRegistrar,
-    pub(in crate::v2::engine) session: SessionConnection,
+    commands: Weak<super::super::reactor::CommandIngress>,
+    manager: Weak<SessionManager>,
+    close: Arc<SessionCloseState>,
+    frontend: Arc<ConnectionFrontendState>,
     local_addr: Option<SocketAddr>,
     peer_addr: Option<SocketAddr>,
     identity: RdmaConnectionIdentity,
+    route: Option<ConnectionCmRoute>,
 }
 
 impl Clone for RdmaConnection {
     fn clone(&self) -> Self {
-        if let Some(state) = self.session_state() {
-            state.frontend_count.fetch_add(1, Ordering::Relaxed);
-        }
+        self.frontend.count.fetch_add(1, Ordering::Relaxed);
         Self {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             state: Arc::clone(&self.state),
-            #[cfg(not(test))]
-            state: self.state.clone(),
             memory: self.memory.clone(),
-            session: self.session.clone(),
+            commands: self.commands.clone(),
+            manager: self.manager.clone(),
+            close: Arc::clone(&self.close),
+            frontend: Arc::clone(&self.frontend),
             local_addr: self.local_addr,
             peer_addr: self.peer_addr,
             identity: self.identity,
+            route: self.route,
         }
     }
 }
@@ -122,9 +123,9 @@ impl RdmaConnection {
     /// future returns `(Result<Completion>, Option<Mr>)`.
     pub fn send(&self, mr: Mr, range: Option<(usize, usize)>) -> RdmaOperation {
         RdmaOperation::new(
-            self.session.command_ingress(),
-            self.session.manager(),
-            self.session.token(),
+            self.commands.clone(),
+            self.manager.clone(),
+            self.session_token(),
             OperationKind::Send,
             mr,
             None,
@@ -136,9 +137,9 @@ impl RdmaConnection {
     /// a later engine-driver poll.
     pub fn recv(&self, mr: Mr, range: Option<(usize, usize)>) -> RdmaOperation {
         RdmaOperation::new(
-            self.session.command_ingress(),
-            self.session.manager(),
-            self.session.token(),
+            self.commands.clone(),
+            self.manager.clone(),
+            self.session_token(),
             OperationKind::Recv,
             mr,
             None,
@@ -150,9 +151,9 @@ impl RdmaConnection {
     /// later engine-driver poll.
     pub fn write(&self, mr: Mr, remote: RemoteMr, range: Option<(usize, usize)>) -> RdmaOperation {
         RdmaOperation::new(
-            self.session.command_ingress(),
-            self.session.manager(),
-            self.session.token(),
+            self.commands.clone(),
+            self.manager.clone(),
+            self.session_token(),
             OperationKind::Write,
             mr,
             Some(remote),
@@ -164,9 +165,9 @@ impl RdmaConnection {
     /// later engine-driver poll.
     pub fn read(&self, mr: Mr, remote: RemoteMr, range: Option<(usize, usize)>) -> RdmaOperation {
         RdmaOperation::new(
-            self.session.command_ingress(),
-            self.session.manager(),
-            self.session.token(),
+            self.commands.clone(),
+            self.manager.clone(),
+            self.session_token(),
             OperationKind::Read,
             mr,
             Some(remote),
@@ -203,48 +204,36 @@ impl RdmaConnection {
     /// destruction boundary or another retirement wedge. Peer disconnect uses
     /// the same local QP-to-ERR and safe-destruction path.
     pub async fn close(&self) -> Result<()> {
-        self.session.close().await
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn transition_to_error_for_test(&self) -> Result<()> {
-        self.session.transition_to_error_for_test()
+        self.request_close();
+        loop {
+            let notify = self.close.notify();
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(outcome) = self.close.outcome() {
+                return outcome.into_result();
+            }
+            if let Some(manager) = self.manager.upgrade()
+                && let Some(outcome) = manager.engine_outcome()
+            {
+                return outcome.into_result();
+            }
+            notified.await;
+        }
     }
 }
 
 impl Drop for RdmaConnection {
     fn drop(&mut self) {
-        let Some(state) = self.session_state() else {
-            return;
-        };
-        let previous = state.frontend_count.fetch_sub(1, Ordering::AcqRel);
+        let previous = self.frontend.count.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0, "connection frontend count must be positive");
-        if previous == 1 && !state.is_retired() {
-            self.session.request_close();
+        if previous == 1 && !self.close.is_retired() {
+            self.request_close();
         }
     }
 }
 
 impl RdmaConnection {
-    pub(in crate::v2::engine) fn session_state(&self) -> Option<Arc<ConnectionState>> {
-        #[cfg(test)]
-        {
-            Some(Arc::clone(&self.state))
-        }
-        #[cfg(not(test))]
-        {
-            self.state.upgrade()
-        }
-    }
-
-    pub(in crate::v2::engine) fn require_session_state(&self) -> Result<Arc<ConnectionState>> {
-        self.session_state().ok_or_else(|| {
-            Error::InvalidConfig(
-                "session-owned connection record disappeared before route retirement".into(),
-            )
-        })
-    }
-
     pub(in crate::v2::engine) fn session_token(&self) -> ConnectionToken {
         ConnectionToken {
             slot: self.identity.slot,
@@ -252,59 +241,134 @@ impl RdmaConnection {
         }
     }
 
+    pub(in crate::v2::engine) fn command_ingress(
+        &self,
+    ) -> Weak<super::super::reactor::CommandIngress> {
+        self.commands.clone()
+    }
+
+    pub(in crate::v2::engine) fn manager(&self) -> Weak<SessionManager> {
+        self.manager.clone()
+    }
+
+    pub(in crate::v2::engine) fn close_state(&self) -> Arc<SessionCloseState> {
+        Arc::clone(&self.close)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(in crate::v2::engine) fn require_session_state(&self) -> Result<Arc<ConnectionTestAccess>> {
+        Ok(Arc::clone(&self.state))
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(in crate::v2::engine) fn cm_route(&self) -> Option<ConnectionCmRoute> {
+        self.route
+    }
+
+    pub(in crate::v2::engine) fn request_close(&self) {
+        if self.close.is_retired() {
+            return;
+        }
+        if let (Some(manager), Some(commands)) = (self.manager.upgrade(), self.commands.upgrade()) {
+            commands.request_connection_close(&manager, self.session_token());
+        }
+    }
+
     fn from_registered(
         manager: &SessionManager,
-        state: Arc<ConnectionState>,
-        session: SessionConnection,
+        state: &ConnectionState,
+        route: Option<ConnectionCmRoute>,
     ) -> Self {
         let identity = state.identity();
         let local_addr = state.local_addr;
         let peer_addr = state.peer_addr;
         Self {
-            #[cfg(test)]
-            state: Arc::clone(&state),
-            #[cfg(not(test))]
-            state: Arc::downgrade(&state),
+            #[cfg(any(test, feature = "test-hooks"))]
+            state: Arc::new(ConnectionTestAccess {
+                token: state.token,
+                io: Arc::clone(&state.io),
+                #[cfg(test)]
+                close: Arc::clone(&state.close),
+                uses_engine_resources: state.poster.uses_engine_resources(),
+            }),
             memory: manager.memory_registrar(),
-            session,
+            commands: manager
+                .commands
+                .get()
+                .expect("SessionManager command ingress is bound before use")
+                .clone(),
+            manager: manager
+                .self_ref
+                .get()
+                .expect("SessionManager self reference is bound before use")
+                .clone(),
+            close: state.close_state(),
+            frontend: Arc::clone(&state.frontend),
             local_addr,
             peer_addr,
             identity,
+            route,
         }
     }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub(in crate::v2::engine) struct ConnectionTestAccess {
+    pub(in crate::v2::engine) token: ConnectionToken,
+    pub(in crate::v2::engine) io: Arc<EstablishedIoConnection>,
+    #[cfg(test)]
+    close: Arc<SessionCloseState>,
+    uses_engine_resources: bool,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl ConnectionTestAccess {
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn close_state(&self) -> Arc<SessionCloseState> {
+        Arc::clone(&self.close)
+    }
+
+    pub(in crate::v2::engine) fn accepted_tokens(&self) -> Vec<OperationToken> {
+        self.io.accepted_tokens_for_observation()
+    }
+
+    pub(in crate::v2::engine) fn uses_resources_for_test(
+        &self,
+        _pd: &crate::v2::Pd,
+        _cq: &crate::v2::Cq,
+    ) -> bool {
+        self.uses_engine_resources
+    }
+}
+
+pub(in crate::v2::engine) struct ConnectionFrontendState {
+    count: AtomicUsize,
 }
 
 pub(in crate::v2::engine) struct ConnectionState {
     pub(in crate::v2::engine) token: ConnectionToken,
     qp_num: u32,
-    poster: Arc<dyn WorkRequestPoster>,
+    poster: ConnectionPoster,
     pub(in crate::v2::engine) io: Arc<EstablishedIoConnection>,
+    pub(in crate::v2::engine) io_ledger: ConnectionIoState,
     local_addr: Option<SocketAddr>,
     peer_addr: Option<SocketAddr>,
-    // Nested lifecycle synchronization always follows:
-    // SessionManager::admission -> lifecycle_gate -> posting_gate.
-    lifecycle_gate: Mutex<()>,
-    io_closed: AtomicBool,
-    close_started: AtomicBool,
-    close_operation_scan_slot: AtomicUsize,
-    close_operation_scan_complete: AtomicBool,
-    quarantine_operation_scan_slot: AtomicUsize,
-    quarantine_operation_scan_complete: AtomicBool,
+    io_closed: bool,
+    close_operation_scan_slot: usize,
+    close_operation_scan_complete: bool,
+    quarantine_operation_scan_slot: usize,
+    quarantine_operation_scan_complete: bool,
     close: Arc<SessionCloseState>,
-    quarantined: AtomicBool,
-    error_transition_started: AtomicBool,
-    error_transition_complete: AtomicBool,
-    qp_destroyed: AtomicBool,
-    qp_reclamation_proof: Mutex<Option<QpDestructionProof>>,
-    frontend_count: AtomicUsize,
-    retirement_requested: AtomicBool,
-    retirement_started: AtomicBool,
-    retirement_quarantined: AtomicBool,
-    drained_recorded: AtomicBool,
-    admission: Mutex<Option<ConnectionReservation>>,
-    cm_route: Option<ConnectionCmRoute>,
+    close_result: Option<MemoizedTerminalResult>,
+    error_transition_started: bool,
+    error_transition_complete: bool,
+    qp_destroyed: bool,
+    qp_reclamation_proof: Option<QpDestructionProof>,
+    frontend: Arc<ConnectionFrontendState>,
+    drained_recorded: bool,
+    pub(super) admission: Option<ConnectionReservation>,
     #[cfg(any(test, feature = "test-hooks"))]
-    retained_setup_rollback_mr: Mutex<Option<Mr>>,
+    retained_setup_rollback_mr: Option<Mr>,
 }
 
 pub(in crate::v2::engine) enum QpDestroyStatus {
@@ -313,63 +377,70 @@ pub(in crate::v2::engine) enum QpDestroyStatus {
 }
 
 impl ConnectionState {
-    pub(in crate::v2::engine) fn new(
+    pub(super) fn new(
         token: ConnectionToken,
-        poster: Arc<dyn WorkRequestPoster>,
+        poster: impl Into<ConnectionPoster>,
         config: RdmaConnectionConfig,
         local_addr: Option<SocketAddr>,
         peer_addr: Option<SocketAddr>,
         mut admission: Option<ConnectionReservation>,
-        cm_route: Option<ConnectionCmRoute>,
     ) -> Self {
         if let Some(reservation) = admission.as_mut() {
             reservation.mark_registered();
         }
+        let poster = poster.into();
         let qp_num = poster.qp_num();
         let close = SessionCloseState::new();
         let close_notify = close.notify();
-        let io_poster: Arc<dyn IoPostAuthority> =
-            Arc::new(SessionIoPostAuthority::new(&poster, qp_num));
         let io = EstablishedIoConnection::new(
             EstablishedIoIdentity {
                 connection: token,
                 qp_num,
             },
-            io_poster,
             config.max_send_wr,
             config.max_recv_wr,
             Arc::clone(&close_notify),
         );
+        let io_ledger = ConnectionIoState::from_connection(&io);
         Self {
             token,
             qp_num,
             poster,
             io,
+            io_ledger,
             local_addr,
             peer_addr,
-            lifecycle_gate: Mutex::new(()),
-            io_closed: AtomicBool::new(false),
-            close_started: AtomicBool::new(false),
-            close_operation_scan_slot: AtomicUsize::new(0),
-            close_operation_scan_complete: AtomicBool::new(false),
-            quarantine_operation_scan_slot: AtomicUsize::new(0),
-            quarantine_operation_scan_complete: AtomicBool::new(false),
+            io_closed: false,
+            close_operation_scan_slot: 0,
+            close_operation_scan_complete: false,
+            quarantine_operation_scan_slot: 0,
+            quarantine_operation_scan_complete: false,
             close,
-            quarantined: AtomicBool::new(false),
-            error_transition_started: AtomicBool::new(false),
-            error_transition_complete: AtomicBool::new(false),
-            qp_destroyed: AtomicBool::new(false),
-            qp_reclamation_proof: Mutex::new(None),
-            frontend_count: AtomicUsize::new(1),
-            retirement_requested: AtomicBool::new(false),
-            retirement_started: AtomicBool::new(false),
-            retirement_quarantined: AtomicBool::new(false),
-            drained_recorded: AtomicBool::new(false),
-            admission: Mutex::new(admission),
-            cm_route,
+            close_result: None,
+            error_transition_started: false,
+            error_transition_complete: false,
+            qp_destroyed: false,
+            qp_reclamation_proof: None,
+            frontend: Arc::new(ConnectionFrontendState {
+                count: AtomicUsize::new(1),
+            }),
+            drained_recorded: false,
+            admission,
             #[cfg(any(test, feature = "test-hooks"))]
-            retained_setup_rollback_mr: Mutex::new(None),
+            retained_setup_rollback_mr: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn new_for_test(
+        token: ConnectionToken,
+        poster: impl Into<ConnectionPoster>,
+        config: RdmaConnectionConfig,
+        local_addr: Option<SocketAddr>,
+        peer_addr: Option<SocketAddr>,
+        admission: Option<ConnectionReservation>,
+    ) -> Self {
+        Self::new(token, poster, config, local_addr, peer_addr, admission)
     }
 
     pub(in crate::v2::engine) fn identity(&self) -> RdmaConnectionIdentity {
@@ -387,19 +458,43 @@ impl ConnectionState {
         self.qp_num
     }
 
+    pub(in crate::v2::engine) fn connect(&self, param: &ConnParam) -> Result<()> {
+        self.poster.connect(param)
+    }
+
+    pub(in crate::v2::engine) fn accept(&self, param: &ConnParam) -> Result<()> {
+        self.poster.accept(param)
+    }
+
+    pub(in crate::v2::engine) fn reject(&self) -> Result<()> {
+        self.poster.reject()
+    }
+
+    pub(in crate::v2::engine) fn io_parts_mut(
+        &mut self,
+    ) -> (
+        &Arc<EstablishedIoConnection>,
+        &mut ConnectionIoState,
+        &dyn IoPostAuthority,
+    ) {
+        (&self.io, &mut self.io_ledger, &self.poster)
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(in crate::v2::engine) fn accepted_tokens(&self) -> Vec<OperationToken> {
-        self.io.accepted_tokens_for_observation()
+    pub(in crate::v2::engine) fn disconnect_for_test(&self) -> Result<()> {
+        self.poster.disconnect_for_test()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(in crate::v2::engine) fn fail_next_qp_destroy_for_test(&self) -> Result<()> {
+        self.poster.fail_next_qp_destroy()
     }
 
     pub(in crate::v2::engine) fn install_io_event_sender(
         &self,
         sender: IoEventSender,
     ) -> Result<Option<PendingIoEvent>> {
-        if !self
-            .io
-            .install_io_event_sender(sender, self.io_closed.load(Ordering::Acquire))?
-        {
+        if !self.io.install_io_event_sender(sender, self.io_closed)? {
             return Ok(None);
         }
 
@@ -421,79 +516,60 @@ impl ConnectionState {
         self.io.pending_io_event(event)
     }
 
-    pub(in crate::v2::engine) fn stop_posting(&self) {
-        self.io_closed.store(true, Ordering::Release);
+    pub(in crate::v2::engine) fn stop_posting(&mut self) {
+        self.io_closed = true;
     }
 
     pub(in crate::v2::engine) fn io_is_open(&self) -> bool {
-        !self.io_closed.load(Ordering::Acquire)
-    }
-
-    pub(in crate::v2::engine) fn lock_lifecycle(&self) -> MutexGuard<'_, ()> {
-        lock_unpoison(&self.lifecycle_gate)
-    }
-
-    #[cfg(test)]
-    pub(in crate::v2::engine) fn lifecycle_unlocked_for_test(&self) -> bool {
-        self.lifecycle_gate.try_lock().is_ok()
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(in crate::v2::engine) fn fail_next_qp_destroy_for_test(&self) -> Result<()> {
-        self.poster.fail_next_qp_destroy()
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(in crate::v2::engine) fn uses_resources_for_test(
-        &self,
-        pd: &crate::v2::Pd,
-        cq: &crate::v2::Cq,
-    ) -> bool {
-        self.poster.uses_resources(pd, cq)
+        !self.io_closed
     }
 
     pub(in crate::v2::engine) fn finalize_engine(
-        &self,
+        &mut self,
         authority: &SessionLifecycleAuthority,
         outcome: &MemoizedTerminalResult,
     ) -> Option<PendingIoEvent> {
         self.stop_posting();
         let _ = self.transition_to_error_once(authority);
         if let Some(error) = outcome.error() {
-            let mut close_outcome = lock_unpoison(&self.close.outcome);
-            if close_outcome.is_none() {
-                *close_outcome = Some(MemoizedTerminalResult::from_error(error.clone()));
+            if self.close_result.is_none() {
+                self.close_result = Some(MemoizedTerminalResult::from_error(error.clone()));
             }
-            drop(close_outcome);
+            self.publish_close_result();
             return self.pending_io_event(IoTerminalEvent::Terminal(error));
         }
         None
     }
 
-    pub(in crate::v2::engine) fn mark_disconnected(&self) -> Option<PendingIoEvent> {
+    pub(in crate::v2::engine) fn mark_disconnected(&mut self) -> Option<PendingIoEvent> {
         self.stop_posting();
         self.pending_io_event(IoTerminalEvent::Disconnected)
     }
 
-    pub(in crate::v2::engine) fn record_cm_failure(&self, error: Error) -> Option<PendingIoEvent> {
+    pub(in crate::v2::engine) fn record_cm_failure(
+        &mut self,
+        error: Error,
+    ) -> Option<PendingIoEvent> {
         self.stop_posting();
-        let mut outcome = lock_unpoison(&self.close.outcome);
-        if outcome.is_none() {
-            *outcome = Some(MemoizedTerminalResult::from_error(error.clone()));
+        if self.close_result.is_none() {
+            self.close_result = Some(MemoizedTerminalResult::from_error(error.clone()));
         }
-        drop(outcome);
+        self.publish_close_result();
         self.pending_io_event(IoTerminalEvent::Terminal(error))
     }
 
     #[cfg(test)]
-    pub(in crate::v2::engine) fn mark_cm_failure(&self, error: Error) -> Option<PendingIoEvent> {
+    pub(in crate::v2::engine) fn mark_cm_failure(
+        &mut self,
+        error: Error,
+    ) -> Option<PendingIoEvent> {
         let event = self.record_cm_failure(error);
         self.wake_close();
         event
     }
 
     pub(in crate::v2::engine) fn mark_cm_failure_into(
-        &self,
+        &mut self,
         error: Error,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Option<PendingIoEvent> {
@@ -503,26 +579,25 @@ impl ConnectionState {
     }
 
     pub(in crate::v2::engine) fn transition_to_error_once(
-        &self,
+        &mut self,
         authority: &SessionLifecycleAuthority,
     ) -> Result<bool> {
-        if self.error_transition_started.swap(true, Ordering::AcqRel) {
+        if self.error_transition_started {
             return Ok(false);
         }
+        self.error_transition_started = true;
         self.poster.to_error(authority)?;
-        self.error_transition_complete
-            .store(true, Ordering::Release);
+        self.error_transition_complete = true;
         Ok(true)
     }
 
     pub(in crate::v2::engine) fn error_transition_complete(&self) -> bool {
-        self.error_transition_complete.load(Ordering::Acquire)
+        self.error_transition_complete
     }
 
     pub(in crate::v2::engine) fn destroy_connection_resources(
-        &self,
+        &mut self,
         authority: &SessionLifecycleAuthority,
-        _lifecycle: &MutexGuard<'_, ()>,
         outstanding_operations: usize,
     ) -> Result<Option<SharedCmId>> {
         if outstanding_operations != 0 {
@@ -533,12 +608,12 @@ impl ConnectionState {
             });
         }
         self.stop_posting();
-        let destroy_qp = !self.qp_destroyed.load(Ordering::Acquire);
+        let destroy_qp = !self.qp_destroyed;
         let (cm_id, qp_destroyed) = self.poster.destroy_connection(authority, destroy_qp)?;
         if qp_destroyed {
             self.record_qp_destroyed();
         }
-        if !self.qp_destroyed.load(Ordering::Acquire) {
+        if !self.qp_destroyed {
             return Err(Error::InvalidConfig(
                 "connection resources lost QP ownership without a destruction boundary".into(),
             ));
@@ -547,12 +622,11 @@ impl ConnectionState {
     }
 
     pub(in crate::v2::engine) fn destroy_qp_for_session(
-        &self,
+        &mut self,
         authority: &SessionLifecycleAuthority,
-        _lifecycle: &MutexGuard<'_, ()>,
     ) -> Result<QpDestroyStatus> {
         self.stop_posting();
-        if self.qp_destroyed.load(Ordering::Acquire) {
+        if self.qp_destroyed {
             return Ok(QpDestroyStatus::AlreadyDestroyed);
         }
         match self.poster.destroy_qp(authority) {
@@ -564,7 +638,7 @@ impl ConnectionState {
                 }
             }
             Ok(false) => {
-                if self.qp_destroyed.load(Ordering::Acquire) {
+                if self.qp_destroyed {
                     Ok(QpDestroyStatus::AlreadyDestroyed)
                 } else {
                     Err(Error::InvalidConfig(
@@ -573,16 +647,9 @@ impl ConnectionState {
                     ))
                 }
             }
-            Err(_) if self.qp_destroyed.load(Ordering::Acquire) => {
-                Ok(QpDestroyStatus::AlreadyDestroyed)
-            }
+            Err(_) if self.qp_destroyed => Ok(QpDestroyStatus::AlreadyDestroyed),
             Err(error) => Err(error),
         }
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(in crate::v2::engine) fn disconnect_for_test(&self) -> Result<()> {
-        self.poster.disconnect()
     }
 
     #[cfg(test)]
@@ -591,54 +658,51 @@ impl ConnectionState {
     }
 
     pub(in crate::v2::engine) fn close_operation_scan_slot(&self) -> usize {
-        self.close_operation_scan_slot.load(Ordering::Acquire)
-    }
-
-    pub(in crate::v2::engine) fn update_close_operation_scan(&self, next: usize, complete: bool) {
         self.close_operation_scan_slot
-            .store(next, Ordering::Release);
-        self.close_operation_scan_complete
-            .store(complete, Ordering::Release);
     }
 
-    pub(in crate::v2::engine) fn close_operation_scan_complete(&self) -> bool {
-        self.close_operation_scan_complete.load(Ordering::Acquire)
-    }
-
-    pub(in crate::v2::engine) fn quarantine_operation_scan_slot(&self) -> usize {
-        self.quarantine_operation_scan_slot.load(Ordering::Acquire)
-    }
-
-    pub(in crate::v2::engine) fn update_quarantine_operation_scan(
-        &self,
+    pub(in crate::v2::engine) fn update_close_operation_scan(
+        &mut self,
         next: usize,
         complete: bool,
     ) {
+        self.close_operation_scan_slot = next;
+        self.close_operation_scan_complete = complete;
+    }
+
+    pub(in crate::v2::engine) fn close_operation_scan_complete(&self) -> bool {
+        self.close_operation_scan_complete
+    }
+
+    pub(in crate::v2::engine) fn quarantine_operation_scan_slot(&self) -> usize {
         self.quarantine_operation_scan_slot
-            .store(next, Ordering::Release);
-        self.quarantine_operation_scan_complete
-            .store(complete, Ordering::Release);
+    }
+
+    pub(in crate::v2::engine) fn update_quarantine_operation_scan(
+        &mut self,
+        next: usize,
+        complete: bool,
+    ) {
+        self.quarantine_operation_scan_slot = next;
+        self.quarantine_operation_scan_complete = complete;
     }
 
     pub(in crate::v2::engine) fn quarantine_operation_scan_complete(&self) -> bool {
         self.quarantine_operation_scan_complete
-            .load(Ordering::Acquire)
     }
 
-    pub(in crate::v2::engine) fn is_quarantined(&self) -> bool {
-        self.quarantined.load(Ordering::Acquire)
-    }
-
-    pub(in crate::v2::engine) fn store_qp_reclamation_proof(&self, proof: QpDestructionProof) {
-        let previous = lock_unpoison(&self.qp_reclamation_proof).replace(proof);
+    pub(in crate::v2::engine) fn store_qp_reclamation_proof(&mut self, proof: QpDestructionProof) {
+        let previous = self.qp_reclamation_proof.replace(proof);
         assert!(
             previous.is_none(),
             "connection can retain only its one minted QP destruction proof"
         );
     }
 
-    pub(in crate::v2::engine) fn take_qp_reclamation_proof(&self) -> Option<QpDestructionProof> {
-        lock_unpoison(&self.qp_reclamation_proof).take()
+    pub(in crate::v2::engine) fn take_qp_reclamation_proof(
+        &mut self,
+    ) -> Option<QpDestructionProof> {
+        self.qp_reclamation_proof.take()
     }
 
     pub(in crate::v2::engine) fn wake_close_into(
@@ -649,18 +713,14 @@ impl ConnectionState {
     }
 
     pub(in crate::v2::engine) fn begin_quarantine(
-        &self,
+        &mut self,
         io_core: &mut super::super::io_core::IoState,
     ) -> Option<IoQuarantineReport> {
-        let report = io_core.begin_connection_quarantine(&self.io)?;
-        if self.quarantined.swap(true, Ordering::AcqRel) {
-            return None;
-        }
-        Some(report)
+        io_core.begin_connection_quarantine(&self.io, &mut self.io_ledger)
     }
 
     pub(in crate::v2::engine) fn publish_quarantine_into(
-        &self,
+        &mut self,
         outstanding_operations: usize,
         cq_debt: usize,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
@@ -669,24 +729,22 @@ impl ConnectionState {
             outstanding_operations,
             cq_debt,
         };
-        let mut outcome = lock_unpoison(&self.close.outcome);
-        if outcome.is_none() {
-            *outcome = Some(MemoizedTerminalResult::from_error(error.clone()));
+        if self.close_result.is_none() {
+            self.close_result = Some(MemoizedTerminalResult::from_error(error.clone()));
         }
-        drop(outcome);
+        self.publish_close_result();
         self.close.notify_waiters_into(actions);
         self.pending_io_event(IoTerminalEvent::Terminal(error))
     }
 
     #[cfg(test)]
     pub(in crate::v2::engine) fn publish_destroy_quarantine(
-        &self,
+        &mut self,
         error: &Error,
         before_publish: impl FnOnce(),
     ) -> (bool, Option<PendingIoEvent>) {
-        self.retirement_quarantined.store(true, Ordering::Release);
-        let mut outcome = lock_unpoison(&self.close.outcome);
-        let newly_published = !outcome
+        let newly_published = !self
+            .close_result
             .as_ref()
             .is_some_and(MemoizedTerminalResult::is_connection_quarantined);
         if newly_published {
@@ -694,27 +752,24 @@ impl ConnectionState {
             let published = Error::ConnectionDestroyQuarantined {
                 cause: error.to_string(),
             };
-            *outcome = Some(MemoizedTerminalResult::from_error(published.clone()));
-            drop(outcome);
+            self.close_result = Some(MemoizedTerminalResult::from_error(published.clone()));
+            self.publish_close_result();
             let event = self.pending_io_event(IoTerminalEvent::Terminal(published));
             self.close.notify_waiters();
             return (true, event);
-        } else {
-            drop(outcome);
         }
         self.close.notify_waiters();
         (newly_published, None)
     }
 
     pub(in crate::v2::engine) fn publish_destroy_quarantine_into(
-        &self,
+        &mut self,
         error: &Error,
         before_publish: impl FnOnce(),
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> (bool, Option<PendingIoEvent>) {
-        self.retirement_quarantined.store(true, Ordering::Release);
-        let mut outcome = lock_unpoison(&self.close.outcome);
-        let newly_published = !outcome
+        let newly_published = !self
+            .close_result
             .as_ref()
             .is_some_and(MemoizedTerminalResult::is_connection_quarantined);
         if newly_published {
@@ -722,220 +777,178 @@ impl ConnectionState {
             let published = Error::ConnectionDestroyQuarantined {
                 cause: error.to_string(),
             };
-            *outcome = Some(MemoizedTerminalResult::from_error(published.clone()));
-            drop(outcome);
+            self.close_result = Some(MemoizedTerminalResult::from_error(published.clone()));
+            self.publish_close_result();
             let event = self.pending_io_event(IoTerminalEvent::Terminal(published));
             self.close.notify_waiters_into(actions);
             return (true, event);
         }
-        drop(outcome);
         self.close.notify_waiters_into(actions);
         (false, None)
-    }
-
-    pub(in crate::v2::engine) fn recover_quarantine(&self) -> bool {
-        self.quarantined.swap(false, Ordering::AcqRel)
     }
 
     pub(in crate::v2::engine) fn retain_bundle_for_engine_failure(
         &self,
         accepted_count: usize,
     ) -> bool {
-        accepted_count != 0 && !self.quarantined.swap(true, Ordering::AcqRel)
+        accepted_count != 0
     }
 
     #[cfg(test)]
-    pub(in crate::v2::engine) fn finish_retirement(&self) -> Option<PendingIoEvent> {
-        let mut outcome = lock_unpoison(&self.close.outcome);
-        if outcome.is_none() {
-            *outcome = Some(MemoizedTerminalResult::success());
+    pub(in crate::v2::engine) fn finish_retirement(&mut self) -> Option<PendingIoEvent> {
+        if self.close_result.is_none() {
+            self.close_result = Some(MemoizedTerminalResult::success());
         }
-        drop(outcome);
+        self.publish_close_result();
         self.close.mark_retired();
         self.close.notify_waiters();
         self.pending_io_event(IoTerminalEvent::Closed(Ok(())))
     }
 
     pub(in crate::v2::engine) fn finish_retirement_into(
-        &self,
+        &mut self,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Option<PendingIoEvent> {
-        let mut outcome = lock_unpoison(&self.close.outcome);
-        if outcome.is_none() {
-            *outcome = Some(MemoizedTerminalResult::success());
+        if self.close_result.is_none() {
+            self.close_result = Some(MemoizedTerminalResult::success());
         }
-        drop(outcome);
+        self.publish_close_result();
         self.close.mark_retired();
         self.close.notify_waiters_into(actions);
         self.pending_io_event(IoTerminalEvent::Closed(Ok(())))
     }
 
-    pub(in crate::v2::engine) fn fail_retirement_into(
-        &self,
-        error: Error,
-        actions: &mut crate::v2::engine::reactor::ReactorActions,
-    ) -> Option<PendingIoEvent> {
-        self.stop_posting();
-        self.release_admission();
-        let mut outcome = lock_unpoison(&self.close.outcome);
-        if !outcome
-            .as_ref()
-            .is_some_and(MemoizedTerminalResult::is_connection_quarantined)
-        {
-            *outcome = Some(MemoizedTerminalResult::from_error(error.clone()));
-        }
-        drop(outcome);
-        self.close.mark_retired();
-        self.close.notify_waiters_into(actions);
-        self.pending_io_event(IoTerminalEvent::Closed(Err(error)))
-    }
-
     #[cfg(test)]
     pub(in crate::v2::engine) fn close_outcome(&self) -> Option<MemoizedTerminalResult> {
-        self.close.outcome()
+        self.close_result.clone()
     }
 
     pub(in crate::v2::engine) fn operation_close_error(&self) -> Error {
-        self.close
-            .raw_outcome()
+        self.close_result
             .as_ref()
             .and_then(MemoizedTerminalResult::error)
             .unwrap_or(Error::TransportClosed)
     }
 
-    pub(in crate::v2::engine) fn close_started(&self) -> bool {
-        self.close_started.load(Ordering::Acquire)
-    }
-
-    pub(in crate::v2::engine) fn begin_close(&self) -> bool {
+    pub(in crate::v2::engine) fn begin_close(&mut self) {
         self.stop_posting();
-        let first = !self.close_started.swap(true, Ordering::AcqRel);
-        if first && let Some(reservation) = lock_unpoison(&self.admission).as_mut() {
+        if let Some(reservation) = self.admission.as_mut() {
             reservation.mark_draining();
         }
-        first
     }
 
-    pub(in crate::v2::engine) fn try_request_retirement(&self) -> bool {
-        !self.retirement_requested.swap(true, Ordering::AcqRel)
-    }
-
-    pub(in crate::v2::engine) fn try_begin_retirement(&self) -> bool {
-        if self.retirement_quarantined.load(Ordering::Acquire) {
-            return false;
+    pub(in crate::v2::engine) fn mark_drained_once(&mut self) -> bool {
+        if self.drained_recorded {
+            false
+        } else {
+            self.drained_recorded = true;
+            true
         }
-        !self.retirement_started.swap(true, Ordering::AcqRel)
     }
 
-    pub(in crate::v2::engine) fn retry_retirement(&self) {
-        if self.retirement_quarantined.load(Ordering::Acquire) {
-            return;
-        }
-        self.retirement_started.store(false, Ordering::Release);
-    }
-
-    pub(in crate::v2::engine) fn retirement_is_quarantined(&self) -> bool {
-        self.retirement_quarantined.load(Ordering::Acquire)
-    }
-
-    pub(in crate::v2::engine) fn is_retired(&self) -> bool {
-        self.close.is_retired()
-    }
-
-    pub(in crate::v2::engine) fn mark_drained_once(&self) -> bool {
-        !self.drained_recorded.swap(true, Ordering::AcqRel)
-    }
-
-    pub(in crate::v2::engine) fn rollback_draining_count(&self) {
-        if let Some(reservation) = lock_unpoison(&self.admission).as_mut() {
+    pub(in crate::v2::engine) fn rollback_draining_count(&mut self) {
+        if let Some(reservation) = self.admission.as_mut() {
             reservation.rollback_draining();
         }
     }
 
-    pub(in crate::v2::engine) fn mark_reservation_quarantined(&self) {
-        if let Some(reservation) = lock_unpoison(&self.admission).as_mut() {
+    pub(in crate::v2::engine) fn mark_reservation_quarantined(&mut self) {
+        if let Some(reservation) = self.admission.as_mut() {
             reservation.mark_quarantined();
         }
     }
 
-    pub(in crate::v2::engine) fn recover_reservation_quarantine(&self) {
-        if let Some(reservation) = lock_unpoison(&self.admission).as_mut() {
-            reservation.recover_quarantine(!self.qp_destroyed.load(Ordering::Acquire));
+    pub(in crate::v2::engine) fn recover_reservation_quarantine(&mut self) {
+        if let Some(reservation) = self.admission.as_mut() {
+            reservation.recover_quarantine(!self.qp_destroyed);
         }
     }
 
-    fn record_qp_destroyed(&self) -> bool {
-        let first = !self.qp_destroyed.swap(true, Ordering::AcqRel);
-        if first && let Some(reservation) = lock_unpoison(&self.admission).as_mut() {
+    fn record_qp_destroyed(&mut self) -> bool {
+        let first = !self.qp_destroyed;
+        self.qp_destroyed = true;
+        if first && let Some(reservation) = self.admission.as_mut() {
             reservation.mark_qp_destroyed();
         }
         first
     }
 
-    #[cfg(test)]
-    pub(in crate::v2::engine) fn record_qp_destroyed_for_test(&self) {
-        self.record_qp_destroyed();
-    }
-
-    pub(in crate::v2::engine) fn cm_route(&self) -> Option<ConnectionCmRoute> {
-        self.cm_route
-    }
-
-    pub(in crate::v2::engine) fn release_admission(&self) {
-        drop(lock_unpoison(&self.admission).take());
-    }
-
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(in crate::v2::engine) fn retain_setup_rollback_mr(&self, mr: Mr) {
-        let previous = lock_unpoison(&self.retained_setup_rollback_mr).replace(mr);
+    pub(in crate::v2::engine) fn retain_setup_rollback_mr(&mut self, mr: Mr) {
+        let previous = self.retained_setup_rollback_mr.replace(mr);
         assert!(
             previous.is_none(),
             "setup rollback retains at most one test MR"
         );
     }
-}
 
-pub(in crate::v2::engine) struct ConnectionAdmissionPool {
-    capacity: usize,
-    counts: Arc<ConnectionStateCounts>,
-}
-
-impl ConnectionAdmissionPool {
-    pub(in crate::v2::engine) fn new(capacity: usize) -> Arc<Self> {
-        Arc::new(Self {
-            capacity,
-            counts: Arc::new(ConnectionStateCounts::default()),
-        })
-    }
-
-    pub(in crate::v2::engine) fn try_acquire(self: &Arc<Self>) -> Option<ConnectionReservation> {
-        if !self.counts.try_acquire(self.capacity) {
-            return None;
+    fn publish_close_result(&self) {
+        let Some(result) = self.close_result.as_ref() else {
+            return;
+        };
+        let mut observer = lock_unpoison(&self.close.outcome);
+        if observer.is_none() || result.is_connection_quarantined() {
+            *observer = Some(result.clone());
         }
-        Some(ConnectionReservation {
-            counts: Arc::clone(&self.counts),
-            state: ReservationState::Establishing,
-            qp_counted: false,
-        })
     }
 
-    pub(in crate::v2::engine) fn snapshot(&self) -> ConnectionStateCountSnapshot {
-        self.counts.snapshot()
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn close_result_for_test(&self) -> Option<MemoizedTerminalResult> {
+        self.close_result.clone()
     }
 
-    pub(in crate::v2::engine) fn clear_retained_quarantine(&self) {
-        self.counts.release_retained_quarantine();
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn drained_for_test(&self) -> bool {
+        self.drained_recorded
+    }
+
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn resource_owner_identity_for_test(&self) -> usize {
+        self.poster.owner_identity()
     }
 }
 
+#[derive(Debug)]
 pub(in crate::v2::engine) struct ConnectionReservation {
-    counts: Arc<ConnectionStateCounts>,
+    _permit: OwnedSemaphorePermit,
     state: ReservationState,
     qp_counted: bool,
 }
 
+impl ConnectionReservation {
+    pub(in crate::v2::engine) fn new(permit: OwnedSemaphorePermit) -> Self {
+        Self {
+            _permit: permit,
+            state: ReservationState::Establishing,
+            qp_counted: false,
+        }
+    }
+
+    pub(in crate::v2::engine) fn contribute(&self, counts: &mut ConnectionStateCountSnapshot) {
+        match self.state {
+            ReservationState::Establishing => counts.establishing += 1,
+            ReservationState::Established => counts.established += 1,
+            ReservationState::Draining => counts.draining += 1,
+            ReservationState::QuarantinedEstablishing
+            | ReservationState::QuarantinedEstablished
+            | ReservationState::QuarantinedDraining => counts.quarantined_bundles += 1,
+        }
+        if matches!(self.state, ReservationState::QuarantinedDraining) {
+            counts.draining += 1;
+        }
+        if self.qp_counted {
+            counts.registered_live_qps += 1;
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn state(&self) -> ReservationState {
+        self.state
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ReservationState {
+pub(in crate::v2::engine) enum ReservationState {
     Establishing,
     Established,
     Draining,
@@ -954,112 +967,11 @@ pub(in crate::v2::engine) struct ConnectionStateCountSnapshot {
     pub(in crate::v2::engine) quarantined_bundles: usize,
 }
 
-#[derive(Default)]
-struct ConnectionStateCounts {
-    writer: Mutex<()>,
-    version: AtomicU64,
-    live: AtomicUsize,
-    establishing: AtomicUsize,
-    established: AtomicUsize,
-    draining: AtomicUsize,
-    registered_live_qps: AtomicUsize,
-    quarantined_bundles: AtomicUsize,
-}
-
-impl ConnectionStateCounts {
-    fn try_acquire(&self, capacity: usize) -> bool {
-        self.update(|counts| {
-            if counts.live >= capacity {
-                return false;
-            }
-            counts.live += 1;
-            counts.establishing += 1;
-            true
-        })
-    }
-
-    fn update<T>(&self, update: impl FnOnce(&mut ConnectionStateCountSnapshot) -> T) -> T {
-        let _writer = lock_unpoison(&self.writer);
-        let previous = self.version.fetch_add(1, Ordering::AcqRel);
-        debug_assert_eq!(previous & 1, 0, "connection gauge writer must be exclusive");
-        let mut counts = ConnectionStateCountSnapshot {
-            live: self.live.load(Ordering::Relaxed),
-            establishing: self.establishing.load(Ordering::Relaxed),
-            established: self.established.load(Ordering::Relaxed),
-            draining: self.draining.load(Ordering::Relaxed),
-            registered_live_qps: self.registered_live_qps.load(Ordering::Relaxed),
-            quarantined_bundles: self.quarantined_bundles.load(Ordering::Relaxed),
-        };
-        let result = update(&mut counts);
-        self.live.store(counts.live, Ordering::Relaxed);
-        self.establishing
-            .store(counts.establishing, Ordering::Relaxed);
-        self.established
-            .store(counts.established, Ordering::Relaxed);
-        self.draining.store(counts.draining, Ordering::Relaxed);
-        self.registered_live_qps
-            .store(counts.registered_live_qps, Ordering::Relaxed);
-        self.quarantined_bundles
-            .store(counts.quarantined_bundles, Ordering::Relaxed);
-        self.version.fetch_add(1, Ordering::Release);
-        result
-    }
-
-    fn release_retained_quarantine(&self) {
-        let _writer = lock_unpoison(&self.writer);
-        let live = self.live.load(Ordering::Relaxed);
-        let quarantined_bundles = self.quarantined_bundles.load(Ordering::Relaxed);
-        assert!(
-            live > 0 && quarantined_bundles > 0,
-            "retained connection quarantine release requires positive live and bundle gauges; live={live}, quarantined_bundles={quarantined_bundles}"
-        );
-        let next_live = live
-            .checked_sub(1)
-            .expect("positive retained live gauge must decrement");
-        let next_quarantined_bundles = quarantined_bundles
-            .checked_sub(1)
-            .expect("positive retained bundle gauge must decrement");
-
-        let previous = self.version.fetch_add(1, Ordering::AcqRel);
-        debug_assert_eq!(previous & 1, 0, "connection gauge writer must be exclusive");
-        self.live.store(next_live, Ordering::Relaxed);
-        self.quarantined_bundles
-            .store(next_quarantined_bundles, Ordering::Relaxed);
-        self.version.fetch_add(1, Ordering::Release);
-    }
-
-    fn snapshot(&self) -> ConnectionStateCountSnapshot {
-        loop {
-            let before = self.version.load(Ordering::Acquire);
-            if before & 1 != 0 {
-                std::hint::spin_loop();
-                continue;
-            }
-            let counts = ConnectionStateCountSnapshot {
-                live: self.live.load(Ordering::Relaxed),
-                establishing: self.establishing.load(Ordering::Relaxed),
-                established: self.established.load(Ordering::Relaxed),
-                draining: self.draining.load(Ordering::Relaxed),
-                registered_live_qps: self.registered_live_qps.load(Ordering::Relaxed),
-                quarantined_bundles: self.quarantined_bundles.load(Ordering::Relaxed),
-            };
-            if self.version.load(Ordering::Acquire) == before {
-                return counts;
-            }
-        }
-    }
-}
-
 impl ConnectionReservation {
     fn mark_registered(&mut self) {
         if self.state != ReservationState::Establishing {
             return;
         }
-        self.counts.update(|counts| {
-            counts.establishing = counts.establishing.saturating_sub(1);
-            counts.established += 1;
-            counts.registered_live_qps += 1;
-        });
         self.state = ReservationState::Established;
         self.qp_counted = true;
     }
@@ -1067,14 +979,9 @@ impl ConnectionReservation {
     fn mark_draining(&mut self) {
         match self.state {
             ReservationState::Established => {
-                self.counts.update(|counts| {
-                    counts.established = counts.established.saturating_sub(1);
-                    counts.draining += 1;
-                });
                 self.state = ReservationState::Draining;
             }
             ReservationState::QuarantinedEstablished => {
-                self.counts.update(|counts| counts.draining += 1);
                 self.state = ReservationState::QuarantinedDraining;
             }
             ReservationState::Establishing
@@ -1087,15 +994,9 @@ impl ConnectionReservation {
     fn rollback_draining(&mut self) {
         match self.state {
             ReservationState::Draining => {
-                self.counts.update(|counts| {
-                    counts.draining = counts.draining.saturating_sub(1);
-                    counts.established += 1;
-                });
                 self.state = ReservationState::Established;
             }
             ReservationState::QuarantinedDraining => {
-                self.counts
-                    .update(|counts| counts.draining = counts.draining.saturating_sub(1));
                 self.state = ReservationState::QuarantinedEstablished;
             }
             ReservationState::Establishing
@@ -1108,31 +1009,12 @@ impl ConnectionReservation {
     fn mark_quarantined(&mut self) {
         match self.state {
             ReservationState::Establishing => {
-                self.counts.update(|counts| {
-                    counts.establishing = counts.establishing.saturating_sub(1);
-                    counts.quarantined_bundles += 1;
-                });
                 self.state = ReservationState::QuarantinedEstablishing;
             }
             ReservationState::Established => {
-                self.counts.update(|counts| {
-                    counts.established = counts.established.saturating_sub(1);
-                    if self.qp_counted {
-                        counts.registered_live_qps = counts.registered_live_qps.saturating_sub(1);
-                    }
-                    counts.quarantined_bundles += 1;
-                });
                 self.state = ReservationState::QuarantinedEstablished;
             }
             ReservationState::Draining => {
-                if self.qp_counted {
-                    self.counts.update(|counts| {
-                        counts.registered_live_qps = counts.registered_live_qps.saturating_sub(1);
-                        counts.quarantined_bundles += 1;
-                    });
-                } else {
-                    self.counts.update(|counts| counts.quarantined_bundles += 1);
-                }
                 self.state = ReservationState::QuarantinedDraining;
             }
             ReservationState::QuarantinedEstablishing
@@ -1145,23 +1027,10 @@ impl ConnectionReservation {
     fn recover_quarantine(&mut self, qp_is_live: bool) {
         match self.state {
             ReservationState::QuarantinedEstablished => {
-                self.counts.update(|counts| {
-                    counts.established += 1;
-                    if qp_is_live {
-                        counts.registered_live_qps += 1;
-                    }
-                    counts.quarantined_bundles = counts.quarantined_bundles.saturating_sub(1);
-                });
                 self.state = ReservationState::Established;
                 self.qp_counted = qp_is_live;
             }
             ReservationState::QuarantinedDraining => {
-                self.counts.update(|counts| {
-                    if qp_is_live {
-                        counts.registered_live_qps += 1;
-                    }
-                    counts.quarantined_bundles = counts.quarantined_bundles.saturating_sub(1);
-                });
                 self.state = ReservationState::Draining;
                 self.qp_counted = qp_is_live;
             }
@@ -1176,40 +1045,7 @@ impl ConnectionReservation {
         if !self.qp_counted {
             return;
         }
-        self.counts.update(|counts| {
-            counts.registered_live_qps = counts.registered_live_qps.saturating_sub(1);
-        });
         self.qp_counted = false;
-    }
-}
-
-impl Drop for ConnectionReservation {
-    fn drop(&mut self) {
-        self.counts.update(|counts| {
-            match self.state {
-                ReservationState::Establishing => {
-                    counts.live = counts.live.saturating_sub(1);
-                    counts.establishing = counts.establishing.saturating_sub(1);
-                }
-                ReservationState::Established => {
-                    counts.live = counts.live.saturating_sub(1);
-                    counts.established = counts.established.saturating_sub(1);
-                }
-                ReservationState::Draining => {
-                    counts.live = counts.live.saturating_sub(1);
-                    counts.draining = counts.draining.saturating_sub(1);
-                }
-                ReservationState::QuarantinedEstablishing
-                | ReservationState::QuarantinedEstablished
-                | ReservationState::QuarantinedDraining => {
-                    // A quarantined reservation pins admission and bundle
-                    // diagnostics even if a future owner is dropped.
-                }
-            }
-            if self.qp_counted {
-                counts.registered_live_qps = counts.registered_live_qps.saturating_sub(1);
-            }
-        });
     }
 }
 
@@ -1232,6 +1068,7 @@ pub(in crate::v2::engine) enum ConnectionCmRoute {
     Inbound(u64),
 }
 
+#[cfg(any(test, feature = "test-hooks"))]
 pub(crate) trait WorkRequestPoster: Send + Sync {
     fn qp_num(&self) -> u32;
     fn capabilities(&self) -> Option<QpCapabilities>;
@@ -1264,49 +1101,178 @@ pub(crate) trait WorkRequestPoster: Send + Sync {
             "QP destroy-failure injection is unavailable for this poster".into(),
         ))
     }
+}
+
+pub(in crate::v2::engine) enum ConnectionPoster {
     #[cfg(any(test, feature = "test-hooks"))]
-    fn uses_resources(&self, _pd: &crate::v2::Pd, _cq: &crate::v2::Cq) -> bool {
-        false
+    Shared(Arc<dyn WorkRequestPoster>),
+    Verbs(VerbsConnectionResources),
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl<T> From<Arc<T>> for ConnectionPoster
+where
+    T: WorkRequestPoster + 'static,
+{
+    fn from(poster: Arc<T>) -> Self {
+        Self::Shared(poster)
     }
 }
 
-struct SessionIoPostAuthority {
-    owner: Weak<dyn WorkRequestPoster>,
-    qp_num: u32,
+#[cfg(any(test, feature = "test-hooks"))]
+impl From<Arc<dyn WorkRequestPoster>> for ConnectionPoster {
+    fn from(poster: Arc<dyn WorkRequestPoster>) -> Self {
+        Self::Shared(poster)
+    }
 }
 
-impl SessionIoPostAuthority {
-    fn new(owner: &Arc<dyn WorkRequestPoster>, qp_num: u32) -> Self {
-        Self {
-            owner: Arc::downgrade(owner),
-            qp_num,
+impl From<VerbsConnectionResources> for ConnectionPoster {
+    fn from(resources: VerbsConnectionResources) -> Self {
+        Self::Verbs(resources)
+    }
+}
+
+impl ConnectionPoster {
+    fn capabilities(&self) -> Option<QpCapabilities> {
+        match self {
+            #[cfg(any(test, feature = "test-hooks"))]
+            Self::Shared(poster) => poster.capabilities(),
+            Self::Verbs(resources) => Some(resources.capabilities),
         }
     }
 
-    fn owner(&self) -> Result<Arc<dyn WorkRequestPoster>> {
-        self.owner.upgrade().ok_or(Error::TransportClosed)
+    fn to_error(&mut self, authority: &SessionLifecycleAuthority) -> Result<()> {
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        let _ = authority;
+        match self {
+            #[cfg(any(test, feature = "test-hooks"))]
+            Self::Shared(poster) => poster.to_error(authority),
+            Self::Verbs(resources) => resources.to_error_owned(),
+        }
+    }
+
+    fn destroy_qp(&mut self, authority: &SessionLifecycleAuthority) -> Result<bool> {
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        let _ = authority;
+        match self {
+            #[cfg(any(test, feature = "test-hooks"))]
+            Self::Shared(poster) => poster.destroy_qp(authority),
+            Self::Verbs(resources) => resources.destroy_qp_owned(),
+        }
+    }
+
+    fn destroy_connection(
+        &mut self,
+        authority: &SessionLifecycleAuthority,
+        destroy_qp: bool,
+    ) -> Result<(Option<SharedCmId>, bool)> {
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        let _ = authority;
+        match self {
+            #[cfg(any(test, feature = "test-hooks"))]
+            Self::Shared(poster) => poster.destroy_connection(authority, destroy_qp),
+            Self::Verbs(resources) => resources.destroy_connection_owned(destroy_qp),
+        }
+    }
+
+    fn connect(&self, param: &ConnParam) -> Result<()> {
+        match self {
+            Self::Verbs(resources) => resources.connect(param),
+            #[cfg(any(test, feature = "test-hooks"))]
+            Self::Shared(_) => Err(Error::InvalidConfig(
+                "synthetic connection cannot initiate RDMA-CM connect".into(),
+            )),
+        }
+    }
+
+    fn accept(&self, param: &ConnParam) -> Result<()> {
+        match self {
+            Self::Verbs(resources) => resources.accept(param),
+            #[cfg(any(test, feature = "test-hooks"))]
+            Self::Shared(_) => Err(Error::InvalidConfig(
+                "synthetic connection cannot initiate RDMA-CM accept".into(),
+            )),
+        }
+    }
+
+    fn reject(&self) -> Result<()> {
+        match self {
+            Self::Verbs(resources) => resources.reject(),
+            #[cfg(any(test, feature = "test-hooks"))]
+            Self::Shared(_) => Err(Error::InvalidConfig(
+                "synthetic connection cannot reject an RDMA-CM child".into(),
+            )),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn fail_next_qp_destroy(&self) -> Result<()> {
+        match self {
+            #[cfg(any(test, feature = "test-hooks"))]
+            Self::Shared(poster) => poster.fail_next_qp_destroy(),
+            Self::Verbs(resources) => resources.fail_next_qp_destroy_owned(),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn uses_engine_resources(&self) -> bool {
+        match self {
+            #[cfg(any(test, feature = "test-hooks"))]
+            Self::Shared(_) => false,
+            Self::Verbs(_) => true,
+        }
+    }
+
+    #[cfg(test)]
+    fn owner_identity(&self) -> usize {
+        match self {
+            #[cfg(any(test, feature = "test-hooks"))]
+            Self::Shared(poster) => Arc::as_ptr(poster) as *const () as usize,
+            Self::Verbs(resources) => resources.qp_num as usize,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn disconnect_for_test(&self) -> Result<()> {
+        match self {
+            #[cfg(any(test, feature = "test-hooks"))]
+            Self::Shared(poster) => poster.disconnect(),
+            Self::Verbs(resources) => resources.disconnect_owned(),
+        }
     }
 }
 
-impl IoPostAuthority for SessionIoPostAuthority {
+impl IoPostAuthority for ConnectionPoster {
     fn qp_num(&self) -> u32 {
-        self.qp_num
+        match self {
+            #[cfg(any(test, feature = "test-hooks"))]
+            Self::Shared(poster) => poster.qp_num(),
+            Self::Verbs(resources) => resources.qp_num,
+        }
     }
 
     fn post_send(&self, batch: &mut PreparedSendBatch) -> Result<BatchPostOutcome> {
-        self.owner()?.post_send(batch)
+        match self {
+            #[cfg(any(test, feature = "test-hooks"))]
+            Self::Shared(poster) => poster.post_send(batch),
+            Self::Verbs(resources) => resources.post_send_owned(batch),
+        }
     }
 
     fn post_recv(&self, batch: &mut PreparedRecvBatch) -> Result<BatchPostOutcome> {
-        self.owner()?.post_recv(batch)
+        match self {
+            #[cfg(any(test, feature = "test-hooks"))]
+            Self::Shared(poster) => poster.post_recv(batch),
+            Self::Verbs(resources) => resources.post_recv_owned(batch),
+        }
     }
 }
 
 pub(in crate::v2::engine) struct VerbsConnectionResources {
-    qp: Mutex<Option<Qp>>,
+    qp: Option<Qp>,
     qp_num: u32,
     capabilities: QpCapabilities,
-    cm_owner: Mutex<Option<ConnectionCmOwner>>,
+    cm_owner: Option<ConnectionCmOwner>,
 }
 
 pub(in crate::v2::engine) struct SharedCmId {
@@ -1388,10 +1354,10 @@ impl VerbsConnectionResources {
         let qp_num = qp.qp_num();
         let capabilities = qp.capabilities();
         Self {
-            qp: Mutex::new(Some(qp)),
+            qp: Some(qp),
             qp_num,
             capabilities,
-            cm_owner: Mutex::new(Some(ConnectionCmOwner::External { _cm_id: cm_owner })),
+            cm_owner: Some(ConnectionCmOwner::External { _cm_id: cm_owner }),
         }
     }
 
@@ -1399,23 +1365,15 @@ impl VerbsConnectionResources {
         let qp_num = qp.qp_num();
         let capabilities = qp.capabilities();
         Self {
-            qp: Mutex::new(Some(qp)),
+            qp: Some(qp),
             qp_num,
             capabilities,
-            cm_owner: Mutex::new(Some(ConnectionCmOwner::Shared { cm_id })),
+            cm_owner: Some(ConnectionCmOwner::Shared { cm_id }),
         }
     }
 
-    pub(in crate::v2::engine) fn destroy_unregistered_for_session(
-        &self,
-        authority: &SessionLifecycleAuthority,
-    ) -> Result<(Option<SharedCmId>, bool)> {
-        <Self as WorkRequestPoster>::destroy_connection(self, authority, true)
-    }
-
     pub(in crate::v2::engine) fn connect(&self, param: &ConnParam) -> Result<()> {
-        let cm_owner = lock_unpoison(&self.cm_owner);
-        match cm_owner.as_ref() {
+        match self.cm_owner.as_ref() {
             Some(ConnectionCmOwner::Shared { cm_id, .. }) => {
                 cm_id.connect(param).map_err(Error::from_v1)
             }
@@ -1428,8 +1386,7 @@ impl VerbsConnectionResources {
     }
 
     pub(in crate::v2::engine) fn reject(&self) -> Result<()> {
-        let cm_owner = lock_unpoison(&self.cm_owner);
-        match cm_owner.as_ref() {
+        match self.cm_owner.as_ref() {
             Some(ConnectionCmOwner::Shared { cm_id, .. }) => {
                 cm_id.reject(&[]).map_err(Error::from_v1)
             }
@@ -1442,8 +1399,7 @@ impl VerbsConnectionResources {
     }
 
     pub(in crate::v2::engine) fn accept(&self, param: &ConnParam) -> Result<()> {
-        let cm_owner = lock_unpoison(&self.cm_owner);
-        match cm_owner.as_ref() {
+        match self.cm_owner.as_ref() {
             Some(ConnectionCmOwner::Shared { cm_id, .. }) => {
                 cm_id.accept(param).map_err(Error::from_v1)
             }
@@ -1468,21 +1424,13 @@ enum ConnectionCmOwner {
 
 impl Drop for VerbsConnectionResources {
     fn drop(&mut self) {
-        let cm_owner = self
-            .cm_owner
-            .get_mut()
-            .unwrap_or_else(|error| error.into_inner())
-            .take();
+        let cm_owner = self.cm_owner.take();
         let Some(cm_owner) = cm_owner else {
             return;
         };
         // The driver removes the owner only after the accepted set reaches
         // zero. Any other drop path must retain the complete live bundle.
-        let qp = self
-            .qp
-            .get_mut()
-            .unwrap_or_else(|error| error.into_inner())
-            .take();
+        let qp = self.qp.take();
         fallback_verbs_quarantine()
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -1503,62 +1451,48 @@ fn fallback_verbs_quarantine() -> &'static Mutex<Vec<RetainedVerbsConnectionReso
     RESOURCES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-impl WorkRequestPoster for VerbsConnectionResources {
-    fn qp_num(&self) -> u32 {
-        self.qp_num
-    }
-
-    fn capabilities(&self) -> Option<QpCapabilities> {
-        Some(self.capabilities)
-    }
-
-    fn post_send(&self, batch: &mut PreparedSendBatch) -> Result<BatchPostOutcome> {
-        let qp = lock_unpoison(&self.qp);
-        qp.as_ref()
+impl VerbsConnectionResources {
+    fn post_send_owned(&self, batch: &mut PreparedSendBatch) -> Result<BatchPostOutcome> {
+        self.qp
+            .as_ref()
             .ok_or(Error::TransportClosed)
             .map(|qp| qp.post_send_batch(batch))
     }
 
-    fn post_recv(&self, batch: &mut PreparedRecvBatch) -> Result<BatchPostOutcome> {
-        let qp = lock_unpoison(&self.qp);
-        qp.as_ref()
+    fn post_recv_owned(&self, batch: &mut PreparedRecvBatch) -> Result<BatchPostOutcome> {
+        self.qp
+            .as_ref()
             .ok_or(Error::TransportClosed)
             .map(|qp| qp.post_recv_batch(batch))
     }
 
-    fn to_error(&self, _authority: &SessionLifecycleAuthority) -> Result<()> {
-        let qp = lock_unpoison(&self.qp);
-        match qp.as_ref() {
+    fn to_error_owned(&mut self) -> Result<()> {
+        match self.qp.as_ref() {
             Some(qp) => qp.to_error(),
             None => Ok(()),
         }
     }
 
-    fn destroy_qp(&self, _authority: &SessionLifecycleAuthority) -> Result<bool> {
-        let mut qp = lock_unpoison(&self.qp);
-        let Some(owned) = qp.take() else {
+    fn destroy_qp_owned(&mut self) -> Result<bool> {
+        let Some(owned) = self.qp.take() else {
             return Ok(false);
         };
         match owned.try_destroy() {
             Ok(()) => Ok(true),
             Err((owned, error)) => {
-                *qp = Some(owned);
+                self.qp = Some(owned);
                 Err(error)
             }
         }
     }
 
-    fn destroy_connection(
-        &self,
-        authority: &SessionLifecycleAuthority,
-        destroy_qp: bool,
-    ) -> Result<(Option<SharedCmId>, bool)> {
+    fn destroy_connection_owned(&mut self, destroy_qp: bool) -> Result<(Option<SharedCmId>, bool)> {
         let qp_destroyed = if destroy_qp {
-            self.destroy_qp(authority)?
+            self.destroy_qp_owned()?
         } else {
             false
         };
-        let cm_id = match lock_unpoison(&self.cm_owner).take() {
+        let cm_id = match self.cm_owner.take() {
             Some(ConnectionCmOwner::Shared { cm_id }) => Some(cm_id),
             #[cfg(any(test, feature = "test-hooks"))]
             Some(ConnectionCmOwner::External { _cm_id }) => {
@@ -1571,9 +1505,8 @@ impl WorkRequestPoster for VerbsConnectionResources {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    fn disconnect(&self) -> Result<()> {
-        let cm_owner = lock_unpoison(&self.cm_owner);
-        match cm_owner.as_ref() {
+    fn disconnect_owned(&self) -> Result<()> {
+        match self.cm_owner.as_ref() {
             Some(ConnectionCmOwner::Shared { cm_id, .. }) => {
                 cm_id.disconnect().map_err(Error::from_v1)
             }
@@ -1585,80 +1518,102 @@ impl WorkRequestPoster for VerbsConnectionResources {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    fn fail_next_qp_destroy(&self) -> Result<()> {
-        let qp = lock_unpoison(&self.qp);
-        let qp = qp.as_ref().ok_or(Error::TransportClosed)?;
+    fn fail_next_qp_destroy_owned(&self) -> Result<()> {
+        let qp = self.qp.as_ref().ok_or(Error::TransportClosed)?;
         qp.fail_next_destroy();
         Ok(())
     }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn uses_resources(&self, pd: &crate::v2::Pd, cq: &crate::v2::Cq) -> bool {
-        lock_unpoison(&self.qp)
-            .as_ref()
-            .is_some_and(|qp| qp.uses_resources(pd, cq))
-    }
 }
 
-#[allow(
-    dead_code,
-    reason = "used by the test-only external-CM connection installer"
-)]
+#[cfg(test)]
 pub(crate) fn install_connection(
     manager: &SessionManager,
-    poster: Arc<dyn WorkRequestPoster>,
+    connections: &mut ConnectionRegistry,
+    poster: impl Into<ConnectionPoster>,
     config: RdmaConnectionConfig,
     local_addr: Option<SocketAddr>,
     peer_addr: Option<SocketAddr>,
 ) -> Result<RdmaConnection> {
     manager.validate_connection_config(&config)?;
-    let (admission, reservation) = reserve_connection(manager)?;
+    let (admission, reservation) = reserve_connection(manager, connections)?;
     let connection = install_reserved_connection(
         manager,
+        connections,
+        None,
         poster,
         config,
         local_addr,
         peer_addr,
         reservation,
-        None,
     );
     drop(admission);
     match connection {
         Ok(connection) => Ok(connection),
         Err(failure) => {
             let (error, resources) = failure.into_parts();
-            if let FailedConnectionInstallResources::Registered(connection) = resources {
-                let _ = manager.connections.release_unindexed(connection.token);
-                connection.release_admission();
+            #[cfg(any(test, feature = "test-hooks"))]
+            if let FailedConnectionInstallResources::Registered(token) = resources {
+                let _ = connections.release_unindexed(token);
             }
             Err(error)
         }
     }
 }
 
-pub(in crate::v2::engine) fn reserve_connection(
+#[cfg(any(test, feature = "test-hooks"))]
+pub(in crate::v2::engine) fn install_admitted_test_connection(
     manager: &SessionManager,
-) -> Result<(RwLockReadGuard<'_, ()>, ConnectionReservation)> {
+    connections: &mut ConnectionRegistry,
+    poster: impl Into<ConnectionPoster>,
+    config: RdmaConnectionConfig,
+    local_addr: Option<SocketAddr>,
+    peer_addr: Option<SocketAddr>,
+    reservation: ConnectionReservation,
+) -> Result<RdmaConnection> {
+    match install_reserved_connection(
+        manager,
+        connections,
+        None,
+        poster,
+        config,
+        local_addr,
+        peer_addr,
+        reservation,
+    ) {
+        Ok(connection) => Ok(connection),
+        Err(failure) => {
+            let (error, resources) = failure.into_parts();
+            if let FailedConnectionInstallResources::Registered(token) = resources {
+                let _ = connections.release_unindexed(token);
+            }
+            Err(error)
+        }
+    }
+}
+
+pub(in crate::v2::engine) fn reserve_connection<'a>(
+    manager: &'a SessionManager,
+    connections: &ConnectionRegistry,
+) -> Result<(RwLockReadGuard<'a, ()>, ConnectionReservation)> {
     let admission = read_unpoison(&manager.admission);
     if let Some(error) = manager.admission_error() {
         return Err(error);
     }
-    let reservation = manager
-        .connection_admission
-        .try_acquire()
-        .ok_or(Error::CapacityExhausted)?;
+    let reservation = connections.try_reserve().ok_or(Error::CapacityExhausted)?;
     Ok((admission, reservation))
 }
 
 pub(in crate::v2::engine) fn install_reserved_connection(
     manager: &SessionManager,
-    poster: Arc<dyn WorkRequestPoster>,
+    connections: &mut ConnectionRegistry,
+    route_token: Option<ConnectionToken>,
+    poster: impl Into<ConnectionPoster>,
     config: RdmaConnectionConfig,
     local_addr: Option<SocketAddr>,
     peer_addr: Option<SocketAddr>,
     reservation: ConnectionReservation,
-    cm_route: Option<ConnectionCmRoute>,
 ) -> std::result::Result<RdmaConnection, ConnectionInstallFailure> {
+    let poster = poster.into();
     if let Err(error) = manager.validate_connection_config(&config) {
         return Err(ConnectionInstallFailure::unregistered(
             error,
@@ -1676,67 +1631,116 @@ pub(in crate::v2::engine) fn install_reserved_connection(
         ));
     }
     let qp_num = poster.qp_num();
-    let pending = Arc::new(Mutex::new(Some((poster, reservation))));
-    let make_pending = Arc::clone(&pending);
-    let registration = manager.connections.register(qp_num, move |token| {
-        let (poster, reservation) = lock_unpoison(&make_pending)
-            .take()
-            .expect("connection registration factory runs exactly once");
-        Arc::new(ConnectionState::new(
+    if let Err(error) = connections.validate_qp_registration(qp_num) {
+        return Err(ConnectionInstallFailure::unregistered(
+            error,
+            poster,
+            reservation,
+        ));
+    }
+    let (token, _snapshot) = if let Some(token) = route_token {
+        let state = ConnectionState::new(
             token,
             poster,
             config,
             local_addr,
             peer_addr,
             Some(reservation),
-            cm_route,
-        ))
-    });
-    let (token, state) = match registration {
-        Ok(registration) => registration,
-        Err(failure) => {
-            if let Some((_token, state)) = failure.retained {
+        );
+        let snapshot = match connections.attach_registered(token, qp_num, state) {
+            Ok(snapshot) => snapshot,
+            Err(failure) => {
                 return Err(ConnectionInstallFailure {
                     error: failure.error,
-                    resources: FailedConnectionInstallResources::Registered(state),
+                    resources: FailedConnectionInstallResources::Detached(
+                        failure
+                            .retained
+                            .expect("failed attachment retains the connection state")
+                            .1,
+                    ),
                 });
             }
-            let (poster, reservation) = lock_unpoison(&pending)
+        };
+        (token, snapshot)
+    } else {
+        let mut pending = Some((poster, reservation));
+        let registration = connections.register(qp_num, |token| {
+            let (poster, reservation) = pending
                 .take()
-                .expect("failed registration retains unconsumed resources");
-            return Err(ConnectionInstallFailure::unregistered(
-                failure.error,
+                .expect("connection registration factory runs exactly once");
+            ConnectionState::new(
+                token,
                 poster,
-                reservation,
-            ));
+                config,
+                local_addr,
+                peer_addr,
+                Some(reservation),
+            )
+        });
+        match registration {
+            Ok(registration) => registration,
+            Err(failure) => {
+                if let Some((_token, state)) = failure.retained {
+                    return Err(ConnectionInstallFailure {
+                        error: failure.error,
+                        resources: FailedConnectionInstallResources::Detached(state),
+                    });
+                }
+                let (poster, reservation) = pending
+                    .take()
+                    .expect("failed allocation retains unconsumed connection resources");
+                return Err(ConnectionInstallFailure::unregistered(
+                    failure.error,
+                    poster,
+                    reservation,
+                ));
+            }
         }
     };
-    #[cfg(not(any(test, feature = "test-hooks")))]
-    let _ = token;
     #[cfg(any(test, feature = "test-hooks"))]
     if let Some(failure) = manager.take_setup_rollback_failure() {
-        state.retain_setup_rollback_mr(failure.retained_mr);
-        if !manager.connections.detach_qp_index(token, qp_num) {
+        let injected = connections.with_connection_mut(token, |state| {
+            state.retain_setup_rollback_mr(failure.retained_mr);
+            state.poster.fail_next_qp_destroy()
+        });
+        let Some(injected) = injected else {
+            return Err(ConnectionInstallFailure {
+                error: Error::InvalidConfig(
+                    "setup rollback injection lost its connection entry".into(),
+                ),
+                resources: FailedConnectionInstallResources::Unrecoverable,
+            });
+        };
+        if !connections.detach_qp_index(token, qp_num) {
             return Err(ConnectionInstallFailure {
                 error: Error::InvalidConfig(
                     "setup rollback injection lost its QP registration".into(),
                 ),
-                resources: FailedConnectionInstallResources::Registered(state),
+                resources: FailedConnectionInstallResources::Registered(token),
             });
         }
-        if let Err(injection_error) = state.poster.fail_next_qp_destroy() {
+        if let Err(injection_error) = injected {
             return Err(ConnectionInstallFailure {
                 error: injection_error,
-                resources: FailedConnectionInstallResources::Registered(state),
+                resources: FailedConnectionInstallResources::Registered(token),
             });
         }
         return Err(ConnectionInstallFailure {
             error: failure.error,
-            resources: FailedConnectionInstallResources::Registered(state),
+            resources: FailedConnectionInstallResources::Registered(token),
         });
     }
-    let session = manager.connection_capability(&state);
-    Ok(RdmaConnection::from_registered(manager, state, session))
+    let route = connections.connection_route(token);
+    connections
+        .with_connection(token, |state| {
+            RdmaConnection::from_registered(manager, state, route)
+        })
+        .ok_or_else(|| ConnectionInstallFailure {
+            error: Error::InvalidConfig(
+                "registered connection disappeared before frontend construction".into(),
+            ),
+            resources: FailedConnectionInstallResources::Unrecoverable,
+        })
 }
 
 pub(in crate::v2::engine) struct ConnectionInstallFailure {
@@ -1755,16 +1759,19 @@ impl std::fmt::Debug for ConnectionInstallFailure {
 
 pub(in crate::v2::engine) enum FailedConnectionInstallResources {
     Unregistered {
-        poster: Arc<dyn WorkRequestPoster>,
+        poster: ConnectionPoster,
         reservation: ConnectionReservation,
     },
-    Registered(Arc<ConnectionState>),
+    #[cfg(any(test, feature = "test-hooks"))]
+    Registered(ConnectionToken),
+    Detached(ConnectionState),
+    Unrecoverable,
 }
 
 impl ConnectionInstallFailure {
     fn unregistered(
         error: Error,
-        poster: Arc<dyn WorkRequestPoster>,
+        poster: ConnectionPoster,
         reservation: ConnectionReservation,
     ) -> Self {
         Self {
@@ -1778,6 +1785,48 @@ impl ConnectionInstallFailure {
 
     pub(in crate::v2::engine) fn into_parts(self) -> (Error, FailedConnectionInstallResources) {
         (self.error, self.resources)
+    }
+}
+
+impl FailedConnectionInstallResources {
+    pub(in crate::v2::engine) fn reject_for_session(
+        &self,
+        connections: &ConnectionRegistry,
+    ) -> Result<()> {
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        let _ = connections;
+        match self {
+            Self::Unregistered { poster, .. } => poster.reject(),
+            #[cfg(any(test, feature = "test-hooks"))]
+            Self::Registered(token) => connections
+                .with_connection(*token, ConnectionState::reject)
+                .ok_or(Error::TransportClosed)?,
+            Self::Detached(connection) => connection.reject(),
+            Self::Unrecoverable => Ok(()),
+        }
+    }
+
+    pub(in crate::v2::engine) fn destroy_for_session(
+        &mut self,
+        connections: &mut ConnectionRegistry,
+        authority: &SessionLifecycleAuthority,
+    ) -> Result<(Option<SharedCmId>, bool)> {
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        let _ = connections;
+        match self {
+            Self::Unregistered { poster, .. } => poster.destroy_connection(authority, true),
+            #[cfg(any(test, feature = "test-hooks"))]
+            Self::Registered(token) => connections
+                .with_connection_mut(*token, |connection| {
+                    connection.destroy_connection_resources(authority, 0)
+                })
+                .ok_or(Error::TransportClosed)?
+                .map(|cm_id| (cm_id, true)),
+            Self::Detached(connection) => connection
+                .destroy_connection_resources(authority, 0)
+                .map(|cm_id| (cm_id, true)),
+            Self::Unrecoverable => Ok((None, false)),
+        }
     }
 }
 
