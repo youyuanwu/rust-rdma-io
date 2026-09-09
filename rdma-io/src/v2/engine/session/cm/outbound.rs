@@ -163,6 +163,7 @@ pub(super) fn start(
 pub(super) fn process_cancellation(
     state: &CmState,
     shared: &SessionManager,
+    io_core: &mut crate::v2::engine::io_core::IoState,
     request: Arc<OutboundRequest>,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<()> {
@@ -208,10 +209,10 @@ pub(super) fn process_cancellation(
     route.set_state(OutboundState::Closing {
         connection: connection.clone(),
     });
-    shared.begin_connection_close_into(&connection_state, actions);
+    shared.begin_connection_close_into(&connection_state, io_core, actions);
     drop(request.take_result());
-    if connection_state.accepted_count() == 0 {
-        shared.retire_registered_connection_into(connection_state.token, actions)?;
+    if io_core.connection_accepted_count(&connection_state.io) == 0 {
+        shared.retire_registered_connection_into(io_core, connection_state.token, actions)?;
     }
     drop(route_request);
     Ok(())
@@ -220,23 +221,26 @@ pub(super) fn process_cancellation(
 pub(super) fn handle_event(
     state: &CmState,
     shared: &SessionManager,
+    io_core: &mut crate::v2::engine::io_core::IoState,
     resources: &EngineResources,
     route: &Arc<OutboundRoute>,
     snapshot: CmEventSnapshot,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<EventDisposition> {
     let disposition = if is_failure_event(snapshot.event_type) || snapshot.status != 0 {
-        handle_failure_event(state, shared, route, snapshot, actions)?
+        handle_failure_event(state, shared, io_core, route, snapshot, actions)?
     } else {
         match snapshot.event_type {
             CmEventType::AddrResolved => {
                 handle_addr_resolved(state, shared, resources, route, actions)
             }
             CmEventType::RouteResolved => {
-                handle_route_resolved(state, shared, resources, route, actions)
+                handle_route_resolved(state, shared, io_core, resources, route, actions)
             }
-            CmEventType::Established => handle_established(state, shared, route, actions),
-            CmEventType::Disconnected => handle_disconnected(state, shared, route, actions),
+            CmEventType::Established => handle_established(state, shared, io_core, route, actions),
+            CmEventType::Disconnected => {
+                handle_disconnected(state, shared, io_core, route, actions)
+            }
             CmEventType::TimewaitExit => {
                 if route.is_disconnected() {
                     Ok(EventDisposition::Handled)
@@ -309,6 +313,7 @@ fn handle_addr_resolved(
 fn handle_route_resolved(
     state: &CmState,
     shared: &SessionManager,
+    io_core: &mut crate::v2::engine::io_core::IoState,
     resources: &EngineResources,
     route: &Arc<OutboundRoute>,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
@@ -391,6 +396,7 @@ fn handle_route_resolved(
         fail_registered_connection(
             state,
             shared,
+            io_core,
             route,
             request,
             connection,
@@ -403,13 +409,16 @@ fn handle_route_resolved(
         Ok(param) => param,
         Err(error) => {
             drop(verbs);
-            fail_registered_connection(state, shared, route, request, connection, error, actions)?;
+            fail_registered_connection(
+                state, shared, io_core, route, request, connection, error, actions,
+            )?;
             return Ok(EventDisposition::Handled);
         }
     };
     let establish = run_setup_before_establish(
         setup,
         &connection,
+        io_core,
         || {
             if request.observer.completion.is_cancelled() || shared.shutdown_requested() {
                 Err(Error::DriverShutdown)
@@ -421,7 +430,9 @@ fn handle_route_resolved(
     );
     if let Err(error) = establish {
         drop(verbs);
-        fail_registered_connection(state, shared, route, request, connection, error, actions)?;
+        fail_registered_connection(
+            state, shared, io_core, route, request, connection, error, actions,
+        )?;
         return Ok(EventDisposition::Handled);
     }
     if request.observer.completion.is_cancelled() || shared.shutdown_requested() {
@@ -429,6 +440,7 @@ fn handle_route_resolved(
         fail_registered_connection(
             state,
             shared,
+            io_core,
             route,
             request,
             connection,
@@ -445,9 +457,14 @@ fn handle_route_resolved(
     Ok(EventDisposition::Handled)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "CM failure transition dependencies stay explicit"
+)]
 fn fail_registered_connection(
     _state: &CmState,
     shared: &SessionManager,
+    io_core: &mut crate::v2::engine::io_core::IoState,
     route: &Arc<OutboundRoute>,
     request: Arc<OutboundRequest>,
     connection: RdmaConnection,
@@ -458,10 +475,10 @@ fn fail_registered_connection(
     route.set_state(OutboundState::Closing {
         connection: EstablishedConnectionRoute::new(&connection_state),
     });
-    shared.begin_connection_close_into(&connection_state, actions);
+    shared.begin_connection_close_into(&connection_state, io_core, actions);
     drop(connection);
-    if connection_state.accepted_count() == 0 {
-        shared.retire_registered_connection_into(connection_state.token, actions)?;
+    if io_core.connection_accepted_count(&connection_state.io) == 0 {
+        shared.retire_registered_connection_into(io_core, connection_state.token, actions)?;
     }
     if matches!(&error, Error::DriverShutdown) {
         request.complete_into(Err(error), actions);
@@ -474,6 +491,7 @@ fn fail_registered_connection(
 fn handle_established(
     state: &CmState,
     shared: &SessionManager,
+    io_core: &mut crate::v2::engine::io_core::IoState,
     route: &Arc<OutboundRoute>,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<EventDisposition> {
@@ -489,6 +507,7 @@ fn handle_established(
         fail_registered_connection(
             state,
             shared,
+            io_core,
             route,
             request,
             connection,
@@ -509,6 +528,7 @@ fn handle_established(
 fn handle_disconnected(
     state: &CmState,
     shared: &SessionManager,
+    io_core: &mut crate::v2::engine::io_core::IoState,
     route: &Arc<OutboundRoute>,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<EventDisposition> {
@@ -552,9 +572,9 @@ fn handle_disconnected(
             connection: connection.clone(),
         });
     }
-    shared.begin_connection_close_into(&connection_state, actions);
-    if connection_state.accepted_count() == 0 {
-        shared.retire_registered_connection_into(connection_state.token, actions)?;
+    shared.begin_connection_close_into(&connection_state, io_core, actions);
+    if io_core.connection_accepted_count(&connection_state.io) == 0 {
+        shared.retire_registered_connection_into(io_core, connection_state.token, actions)?;
     }
     Ok(EventDisposition::Handled)
 }
@@ -562,6 +582,7 @@ fn handle_disconnected(
 fn handle_failure_event(
     state: &CmState,
     shared: &SessionManager,
+    io_core: &mut crate::v2::engine::io_core::IoState,
     route: &Arc<OutboundRoute>,
     snapshot: CmEventSnapshot,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
@@ -611,6 +632,7 @@ fn handle_failure_event(
             fail_registered_connection(
                 state,
                 shared,
+                io_core,
                 route,
                 request,
                 connection,
@@ -646,9 +668,13 @@ fn handle_failure_event(
                     connection: connection.clone(),
                 });
             }
-            shared.begin_connection_close_into(&connection_state, actions);
-            if connection_state.accepted_count() == 0 {
-                shared.retire_registered_connection_into(connection_state.token, actions)?;
+            shared.begin_connection_close_into(&connection_state, io_core, actions);
+            if io_core.connection_accepted_count(&connection_state.io) == 0 {
+                shared.retire_registered_connection_into(
+                    io_core,
+                    connection_state.token,
+                    actions,
+                )?;
             }
         }
         OutboundState::Established { connection } | OutboundState::Disconnected { connection } => {
@@ -665,9 +691,13 @@ fn handle_failure_event(
             route.set_state(OutboundState::Failed {
                 connection: connection.clone(),
             });
-            shared.begin_connection_close_into(&connection_state, actions);
-            if connection_state.accepted_count() == 0 {
-                shared.retire_registered_connection_into(connection_state.token, actions)?;
+            shared.begin_connection_close_into(&connection_state, io_core, actions);
+            if io_core.connection_accepted_count(&connection_state.io) == 0 {
+                shared.retire_registered_connection_into(
+                    io_core,
+                    connection_state.token,
+                    actions,
+                )?;
             }
         }
         OutboundState::FailedAwaitingDelivery {

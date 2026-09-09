@@ -13,7 +13,7 @@ use tokio::sync::OwnedSemaphorePermit;
 
 #[cfg(test)]
 use super::EngineShared;
-use super::io_core::{self, EstablishedIoConnection, IoCore};
+use super::io_core::{self, EstablishedIoConnection, IoState};
 use super::reactor::ReactorActions;
 use super::registry::{OperationToken, lock_unpoison};
 use super::resources::EngineResourceRefs;
@@ -53,58 +53,24 @@ impl MemoryRegistrar {
 /// Opaque authority for protocol I/O on one engine-owned connection.
 #[derive(Clone)]
 pub(crate) struct IoConnection {
-    #[cfg(test)]
-    io_core: Arc<IoCore>,
-    #[cfg(test)]
-    io: Arc<EstablishedIoConnection>,
     memory: MemoryRegistrar,
     session: SessionConnection,
     events: IoEventSender,
-    protocol: Arc<ProtocolIoCommandAdapter>,
+    commands: Weak<super::reactor::CommandIngress>,
+    manager: Weak<super::session::SessionManager>,
+    admission: Arc<ProtocolAdmissionState>,
 }
 
 impl IoConnection {
-    #[cfg(test)]
-    pub(super) fn new(
-        manager: &super::session::SessionManager,
-        connection: Arc<ConnectionState>,
-    ) -> Result<(Self, IoEventReceiver)> {
-        let (events, receiver) = event_port();
-        let pending = connection.install_io_event_sender(events.clone())?;
-        if let Some(pending) = pending {
-            pending.deliver();
-        }
-        let session = manager.connection_capability(&connection);
-        Ok((
-            Self {
-                io_core: Arc::clone(&manager.io_core),
-                io: Arc::clone(&connection.io),
-                memory: manager.memory_registrar(),
-                protocol: ProtocolIoCommandAdapter::new(
-                    session.command_ingress(),
-                    session.manager(),
-                ),
-                session,
-                events,
-            },
-            receiver,
-        ))
-    }
-
     pub(crate) fn register_memory(&self, len: usize, access: AccessIntent) -> Result<Mr> {
         self.memory.register(len, access)
     }
 
     pub(crate) fn post_recv_batch(&self, requests: Vec<IoRecvRequest>) -> IoSubmissionDisposition {
-        #[cfg(test)]
-        {
-            return io_core::post_io_recv_batch(&self.io_core, &self.io, &self.events, requests);
-        }
-        #[cfg(not(test))]
         self.submit_protocol(ProtocolCommand::recv(
             self.session.token(),
             self.events.clone(),
-            self.protocol.open_token(),
+            Arc::clone(&self.admission.open),
             requests,
         ))
     }
@@ -114,15 +80,10 @@ impl IoConnection {
     }
 
     pub(crate) fn post_send(&self, request: IoSendRequest) -> IoSubmissionDisposition {
-        #[cfg(test)]
-        {
-            return io_core::post_io_send(&self.io_core, &self.io, &self.events, request);
-        }
-        #[cfg(not(test))]
         self.submit_protocol(ProtocolCommand::send(
             self.session.token(),
             self.events.clone(),
-            self.protocol.open_token(),
+            Arc::clone(&self.admission.open),
             request,
         ))
     }
@@ -144,17 +105,12 @@ impl IoConnection {
         }
         Ok((
             Self {
-                #[cfg(test)]
-                io_core: Arc::clone(&connection.io_core),
-                #[cfg(test)]
-                io: Arc::clone(&connection.io),
                 memory: connection.memory.clone(),
                 session: connection.session.clone(),
                 events,
-                protocol: ProtocolIoCommandAdapter::new(
-                    connection.session.command_ingress(),
-                    connection.session.manager(),
-                ),
+                commands: connection.session.command_ingress(),
+                manager: connection.session.manager(),
+                admission: Arc::new(ProtocolAdmissionState::default()),
             },
             receiver,
         ))
@@ -163,58 +119,33 @@ impl IoConnection {
     #[cfg_attr(test, allow(dead_code))]
     fn submit_protocol(&self, command: ProtocolCommand) -> IoSubmissionDisposition {
         let count = command.len();
-        match self.protocol.submit(command) {
+        match self.submit(command) {
             Ok(()) => IoSubmissionDisposition::Admitted { operations: count },
             Err((error, command)) => command.reject(error),
         }
     }
 
     pub(crate) fn poll_protocol_admission(&self, cx: &mut Context<'_>, budget: usize) -> usize {
-        self.protocol.poll(cx, budget)
+        self.poll_admission(cx, budget)
     }
 
     pub(crate) fn has_unpolled_protocol_admission(&self) -> bool {
-        self.protocol.has_unpolled()
+        lock_unpoison(&self.admission.pending)
+            .front()
+            .is_some_and(|pending| !pending.polled)
     }
 
     pub(crate) fn discard_pending_protocol(&self) {
-        self.protocol.close();
-    }
-}
-
-struct ProtocolAdmission {
-    command: Option<ProtocolCommand>,
-    permit: Pin<Box<dyn Future<Output = Option<OwnedSemaphorePermit>> + Send>>,
-    polled: bool,
-}
-
-pub(in crate::v2::engine) struct ProtocolIoCommandAdapter {
-    commands: Weak<super::reactor::CommandIngress>,
-    manager: Weak<super::session::SessionManager>,
-    pending: Mutex<VecDeque<ProtocolAdmission>>,
-    waker: AtomicWaker,
-    open: Arc<AtomicBool>,
-}
-
-impl ProtocolIoCommandAdapter {
-    pub(in crate::v2::engine) fn new(
-        commands: Weak<super::reactor::CommandIngress>,
-        manager: Weak<super::session::SessionManager>,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            commands,
-            manager,
-            pending: Mutex::new(VecDeque::new()),
-            waker: AtomicWaker::new(),
-            open: Arc::new(AtomicBool::new(true)),
-        })
+        self.admission.open.store(false, Ordering::Release);
+        let pending = std::mem::take(&mut *lock_unpoison(&self.admission.pending));
+        drop(pending);
     }
 
-    pub(in crate::v2::engine) fn submit(
+    fn submit(
         &self,
         command: ProtocolCommand,
     ) -> std::result::Result<(), (Error, ProtocolCommand)> {
-        if !self.open.load(Ordering::Acquire) {
+        if !self.admission.open.load(Ordering::Acquire) {
             return Err((Error::TransportClosed, command));
         }
         let Some(commands) = self.commands.upgrade() else {
@@ -224,8 +155,8 @@ impl ProtocolIoCommandAdapter {
             return Err((error, command));
         }
         let permit = Box::pin(commands.operation_batch_acquire(command.len()));
-        let mut pending = lock_unpoison(&self.pending);
-        if !self.open.load(Ordering::Acquire) {
+        let mut pending = lock_unpoison(&self.admission.pending);
+        if !self.admission.open.load(Ordering::Acquire) {
             return Err((Error::TransportClosed, command));
         }
         pending.push_back(ProtocolAdmission {
@@ -234,15 +165,15 @@ impl ProtocolIoCommandAdapter {
             polled: false,
         });
         drop(pending);
-        self.waker.wake();
+        self.admission.waker.wake();
         Ok(())
     }
 
-    pub(in crate::v2::engine) fn poll(&self, cx: &mut Context<'_>, budget: usize) -> usize {
-        self.waker.register(cx.waker());
+    fn poll_admission(&self, cx: &mut Context<'_>, budget: usize) -> usize {
+        self.admission.waker.register(cx.waker());
         let mut progressed = 0;
         while progressed < budget {
-            let Some(mut admission) = lock_unpoison(&self.pending).pop_front() else {
+            let Some(mut admission) = lock_unpoison(&self.admission.pending).pop_front() else {
                 break;
             };
             let command = admission
@@ -263,7 +194,7 @@ impl ProtocolIoCommandAdapter {
             admission.polled = true;
             match admission.permit.as_mut().poll(cx) {
                 Poll::Pending => {
-                    lock_unpoison(&self.pending).push_front(admission);
+                    lock_unpoison(&self.admission.pending).push_front(admission);
                     break;
                 }
                 Poll::Ready(None) => {
@@ -306,29 +237,168 @@ impl ProtocolIoCommandAdapter {
         }
         progressed
     }
+}
 
-    fn has_unpolled(&self) -> bool {
-        lock_unpoison(&self.pending)
-            .front()
-            .is_some_and(|pending| !pending.polled)
+struct ProtocolAdmission {
+    command: Option<ProtocolCommand>,
+    permit: Pin<Box<dyn Future<Output = Option<OwnedSemaphorePermit>> + Send>>,
+    polled: bool,
+}
+
+struct ProtocolAdmissionState {
+    pending: Mutex<VecDeque<ProtocolAdmission>>,
+    waker: AtomicWaker,
+    open: Arc<AtomicBool>,
+}
+
+impl Default for ProtocolAdmissionState {
+    fn default() -> Self {
+        Self {
+            pending: Mutex::new(VecDeque::new()),
+            waker: AtomicWaker::new(),
+            open: Arc::new(AtomicBool::new(true)),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(in crate::v2::engine) struct ProtocolTestAdmission {
+    commands: Weak<super::reactor::CommandIngress>,
+    manager: Weak<super::session::SessionManager>,
+    state: ProtocolAdmissionState,
+}
+
+#[cfg(test)]
+impl ProtocolTestAdmission {
+    pub(in crate::v2::engine) fn new(
+        commands: Weak<super::reactor::CommandIngress>,
+        manager: Weak<super::session::SessionManager>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            commands,
+            manager,
+            state: ProtocolAdmissionState::default(),
+        })
+    }
+
+    pub(in crate::v2::engine) fn submit(
+        &self,
+        command: ProtocolCommand,
+    ) -> std::result::Result<(), (Error, ProtocolCommand)> {
+        let connection = IoConnectionTestAdmission {
+            commands: &self.commands,
+            manager: &self.manager,
+            state: &self.state,
+        };
+        connection.submit(command)
+    }
+
+    pub(in crate::v2::engine) fn poll(&self, cx: &mut Context<'_>, budget: usize) -> usize {
+        IoConnectionTestAdmission {
+            commands: &self.commands,
+            manager: &self.manager,
+            state: &self.state,
+        }
+        .poll(cx, budget)
     }
 
     pub(in crate::v2::engine) fn open_token(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.open)
+        Arc::clone(&self.state.open)
+    }
+}
+
+#[cfg(test)]
+struct IoConnectionTestAdmission<'a> {
+    commands: &'a Weak<super::reactor::CommandIngress>,
+    manager: &'a Weak<super::session::SessionManager>,
+    state: &'a ProtocolAdmissionState,
+}
+
+#[cfg(test)]
+impl IoConnectionTestAdmission<'_> {
+    fn submit(
+        &self,
+        command: ProtocolCommand,
+    ) -> std::result::Result<(), (Error, ProtocolCommand)> {
+        if !self.state.open.load(Ordering::Acquire) {
+            return Err((Error::TransportClosed, command));
+        }
+        let Some(commands) = self.commands.upgrade() else {
+            return Err((Error::DriverShutdown, command));
+        };
+        if let Err(error) = commands.validate_operation_batch(command.len()) {
+            return Err((error, command));
+        }
+        let permit = Box::pin(commands.operation_batch_acquire(command.len()));
+        lock_unpoison(&self.state.pending).push_back(ProtocolAdmission {
+            command: Some(command),
+            permit,
+            polled: false,
+        });
+        self.state.waker.wake();
+        Ok(())
     }
 
-    pub(in crate::v2::engine) fn close(&self) {
-        self.open.store(false, Ordering::Release);
-        let pending = std::mem::take(&mut *lock_unpoison(&self.pending));
-        drop(pending);
+    fn poll(&self, cx: &mut Context<'_>, budget: usize) -> usize {
+        self.state.waker.register(cx.waker());
+        let mut progressed = 0;
+        while progressed < budget {
+            let Some(mut admission) = lock_unpoison(&self.state.pending).pop_front() else {
+                break;
+            };
+            let command = admission.command.take().expect("pending command");
+            if command.receiver_lost() || command.is_cancelled() {
+                command.cancel();
+                progressed += 1;
+                continue;
+            }
+            admission.command = Some(command);
+            admission.polled = true;
+            match admission.permit.as_mut().poll(cx) {
+                Poll::Pending => {
+                    lock_unpoison(&self.state.pending).push_front(admission);
+                    break;
+                }
+                Poll::Ready(None) => {
+                    admission.command.take().expect("pending command").reject(
+                        self.manager
+                            .upgrade()
+                            .and_then(|manager| manager.admission_error())
+                            .unwrap_or(Error::DriverShutdown),
+                    );
+                    progressed += 1;
+                }
+                Poll::Ready(Some(permit)) => {
+                    let command = admission.command.take().expect("pending command");
+                    let Some(commands) = self.commands.upgrade() else {
+                        command.reject(Error::DriverShutdown);
+                        progressed += 1;
+                        continue;
+                    };
+                    let Some(manager) = self.manager.upgrade() else {
+                        command.reject(Error::DriverShutdown);
+                        progressed += 1;
+                        continue;
+                    };
+                    match commands.enqueue_protocol(&manager, command, permit) {
+                        Ok(()) => commands.publish_command_work(),
+                        Err((error, command)) => {
+                            command.reject(error);
+                        }
+                    }
+                    progressed += 1;
+                }
+            }
+        }
+        progressed
     }
 }
 
 /// Borrow-scoped protocol I/O used only while connection setup already holds
 /// exclusive reactor access before `rdma_connect`/`rdma_accept`.
 pub(crate) struct BorrowedSetupIo<'a> {
-    io_core: &'a IoCore,
-    io: &'a Arc<EstablishedIoConnection>,
+    io_core: &'a mut IoState,
+    io: Arc<EstablishedIoConnection>,
     connection: IoConnection,
 }
 
@@ -337,8 +407,11 @@ impl BorrowedSetupIo<'_> {
         self.connection.register_memory(len, access)
     }
 
-    pub(crate) fn post_recv_batch(&self, requests: Vec<IoRecvRequest>) -> IoSubmissionDisposition {
-        io_core::post_io_recv_batch(self.io_core, self.io, &self.connection.events, requests)
+    pub(crate) fn post_recv_batch(
+        &mut self,
+        requests: Vec<IoRecvRequest>,
+    ) -> IoSubmissionDisposition {
+        io_core::post_io_recv_batch(self.io_core, &self.io, &self.connection.events, requests)
     }
 
     pub(crate) fn into_connection(self) -> IoConnection {
@@ -349,12 +422,14 @@ impl BorrowedSetupIo<'_> {
 impl<'a> BorrowedSetupIo<'a> {
     pub(super) fn from_connection(
         connection: &'a RdmaConnection,
+        io_core: &'a mut IoState,
     ) -> Result<(Self, IoEventReceiver)> {
         let (owned, receiver) = IoConnection::from_connection(connection)?;
+        let state = connection.require_session_state()?;
         Ok((
             Self {
-                io_core: &connection.io_core,
-                io: &connection.io,
+                io_core,
+                io: Arc::clone(&state.io),
                 connection: owned,
             },
             receiver,
@@ -479,6 +554,7 @@ impl ProtocolCommand {
     pub(in crate::v2::engine) fn execute_into(
         self,
         shared: &super::EngineShared,
+        io_core: &mut IoState,
         actions: &mut ReactorActions,
     ) {
         #[cfg(test)]
@@ -498,10 +574,14 @@ impl ProtocolCommand {
             self.reject_into(Error::TransportClosed, actions);
             return;
         };
+        if !connection.io_is_open() {
+            self.reject_into(Error::TransportClosed, actions);
+            return;
+        }
         match self.batch {
             ProtocolBatch::Recv(requests) => {
                 io_core::post_io_recv_batch_into(
-                    &shared.io_core,
+                    io_core,
                     &connection.io,
                     &self.events,
                     requests,
@@ -509,13 +589,7 @@ impl ProtocolCommand {
                 );
             }
             ProtocolBatch::Send(request) => {
-                io_core::post_io_send_into(
-                    &shared.io_core,
-                    &connection.io,
-                    &self.events,
-                    request,
-                    actions,
-                );
+                io_core::post_io_send_into(io_core, &connection.io, &self.events, request, actions);
             }
             #[cfg(test)]
             ProtocolBatch::Test(_) => unreachable!("test protocol command returned above"),
@@ -676,13 +750,10 @@ impl IoConnection {
         let session = shared.session.connection_capability(&connection);
         (
             Self {
-                io_core: Arc::clone(&shared.io_core),
-                io: Arc::clone(&connection.io),
                 memory: MemoryRegistrar { pd: None },
-                protocol: ProtocolIoCommandAdapter::new(
-                    session.command_ingress(),
-                    session.manager(),
-                ),
+                commands: session.command_ingress(),
+                manager: session.manager(),
+                admission: Arc::new(ProtocolAdmissionState::default()),
                 session,
                 events: sender,
             },

@@ -66,7 +66,7 @@ pub use driver::{
     TestSharedResourceIdentity,
 };
 pub use io_core::RdmaOperation;
-use io_core::{IoCore, IoDriverSignal, IoReactorSources};
+use io_core::{IoCoreDiagnostics, IoDriverSignal, IoReactorSources};
 use lifecycle::MemoizedTerminalResult;
 use reactor::{CommandIngress, EngineReactor};
 use registry::{lock_unpoison, write_unpoison};
@@ -456,8 +456,10 @@ struct EngineShared {
     // This engine-owned core retain drops before the root resources below.
     // Operation futures may extend the Arc, but each MR anchors its PD and an
     // engine with accepted work is retained fail-closed.
-    io_core: Arc<IoCore>,
     session: Arc<SessionManager>,
+    io_diagnostics: Mutex<IoCoreDiagnostics>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    io_rejections: Mutex<Vec<io_core::CqeReject>>,
     lifecycle: AtomicU8,
     shutdown_requested: AtomicBool,
     shutdown_deadline_scheduled: AtomicBool,
@@ -610,35 +612,32 @@ impl EngineShared {
         let memory = io::MemoryRegistrar::from_resources(resource_refs.as_ref());
         #[cfg(any(test, feature = "test-hooks"))]
         let test_driver = Arc::new(driver::test_api::TestDriverState::new());
-        let io_driver_signal: Arc<dyn IoDriverSignal> = Arc::new(EngineIoDriverSignal {
-            work_signal: Arc::clone(&work_signal),
-            #[cfg(any(test, feature = "test-hooks"))]
-            test_driver: Arc::clone(&test_driver),
-        });
-        let (io_core, qp_reclaim) = IoCore::new(
-            config.max_inflight_operations,
-            config.cq_capacity,
-            config.missing_cqe_deadline,
-            config.completion_dispatch_budget,
-            Arc::clone(&admission),
-            io_driver_signal,
-        )?;
         let session = Arc::new(SessionManager::new(
             config::SessionConfig::from(&config),
             provider,
             Arc::clone(&admission),
-            Arc::clone(&io_core),
             memory,
-            qp_reclaim,
             #[cfg(any(test, feature = "test-hooks"))]
             SessionTestInstrumentation {
                 driver: Arc::clone(&test_driver),
             },
         )?);
+        let initial_cq_credits = config.cq_capacity;
         Ok(Self {
             config,
-            io_core,
             session,
+            io_diagnostics: Mutex::new(IoCoreDiagnostics {
+                registered_operations: 0,
+                accepted_operations: 0,
+                pending_reclamations: 0,
+                available_cq_credits: initial_cq_credits,
+                retained_cq_credits: 0,
+                quarantined_operations: 0,
+                quarantined_mrs: 0,
+                quarantined_bytes: 0,
+            }),
+            #[cfg(any(test, feature = "test-hooks"))]
+            io_rejections: Mutex::new(Vec::new()),
             lifecycle: AtomicU8::new(lifecycle_to_u8(RdmaEngineLifecycle::Created)),
             shutdown_requested: AtomicBool::new(false),
             shutdown_deadline_scheduled: AtomicBool::new(false),
@@ -697,7 +696,6 @@ impl EngineShared {
             if self.shutdown_requested.swap(true, Ordering::AcqRel) {
                 false
             } else {
-                self.io_core.close_admission(Some(error.clone()));
                 self.transition_shutdown_requested();
                 true
             }
@@ -714,13 +712,14 @@ impl EngineShared {
     }
 
     #[cfg(test)]
-    fn finish(&self, outcome: MemoizedTerminalResult) {
-        self.finish_with_operation_publication(outcome, || {});
+    fn finish(&self, io_core: &mut io_core::IoState, outcome: MemoizedTerminalResult) {
+        self.finish_with_operation_publication(io_core, outcome, || {});
     }
 
     #[cfg(test)]
     fn finish_with_operation_publication(
         &self,
+        io_core: &mut io_core::IoState,
         outcome: MemoizedTerminalResult,
         publish_commands: impl FnOnce(),
     ) {
@@ -735,7 +734,7 @@ impl EngineShared {
                 return;
             }
             self.shutdown_requested.store(true, Ordering::Release);
-            self.io_core.close_admission(outcome.error());
+            io_core.close_admission(outcome.error());
             self.transition_shutdown_requested();
             let lifecycle = if outcome.is_success() {
                 RdmaEngineLifecycle::Terminated
@@ -745,7 +744,7 @@ impl EngineShared {
             *terminal = Some(outcome.clone());
             self.transition_terminal(lifecycle);
 
-            let io_effects = self.io_core.terminalize_operations(&outcome);
+            let io_effects = io_core.terminalize_operations(&outcome);
 
             let connections_to_wake = self.session.connections.occupied();
             drop(terminal);
@@ -754,7 +753,8 @@ impl EngineShared {
 
         let committed_io_effects = self.session.apply_terminal_io_effects(io_effects);
         for connection in &connections_to_wake {
-            if outcome.is_error() && connection.retain_bundle_for_engine_failure() {
+            let accepted = io_core.connection_accepted_count(&connection.io);
+            if outcome.is_error() && connection.retain_bundle_for_engine_failure(accepted) {
                 self.session.track_connection_quarantine(connection.token);
             }
             if let Some(event) = self
@@ -775,6 +775,7 @@ impl EngineShared {
 
     fn finish_driver_drop_into(
         &self,
+        io_core: &mut io_core::IoState,
         outcome: MemoizedTerminalResult,
         drain_commands: bool,
         actions: &mut reactor::ReactorActions,
@@ -787,7 +788,7 @@ impl EngineShared {
                 return;
             }
             self.shutdown_requested.store(true, Ordering::Release);
-            self.io_core.close_admission(outcome.error());
+            io_core.close_admission(outcome.error());
             self.transition_shutdown_requested();
             let lifecycle = if outcome.is_success() {
                 RdmaEngineLifecycle::Terminated
@@ -796,7 +797,7 @@ impl EngineShared {
             };
             *terminal = Some(outcome.clone());
             self.transition_terminal(lifecycle);
-            let io_effects = self.io_core.terminalize_operations(&outcome);
+            let io_effects = io_core.terminalize_operations(&outcome);
             let connections_to_wake = self.session.connections.occupied();
             drop(terminal);
             (io_effects, connections_to_wake)
@@ -810,7 +811,8 @@ impl EngineShared {
                 .drain_ordinary_into(outcome.error().unwrap_or(Error::DriverShutdown), actions);
         }
         for connection in &connections_to_wake {
-            if outcome.is_error() && connection.retain_bundle_for_engine_failure() {
+            let accepted = io_core.connection_accepted_count(&connection.io);
+            if outcome.is_error() && connection.retain_bundle_for_engine_failure(accepted) {
                 self.session.track_connection_quarantine(connection.token);
             }
             if let Some(event) = self
@@ -855,8 +857,6 @@ impl EngineShared {
         if pending.is_none() {
             *pending = Some(outcome.clone());
             self.begin_shutdown_admission(error.clone(), false);
-            self.io_core.close_admission(outcome.error());
-            self.io_core.begin_terminal_failure(outcome);
         }
         drop(pending);
         self.work_signal
@@ -909,14 +909,17 @@ impl EngineShared {
         actions.push_terminal(move || terminal_notify.notify_waiters());
     }
 
-    fn handle_driver_drop(self: &Arc<Self>) -> reactor::ReactorActions {
+    fn handle_driver_drop(
+        self: &Arc<Self>,
+        io_core: &mut io_core::IoState,
+    ) -> reactor::ReactorActions {
         let mut actions = reactor::ReactorActions::for_synchronous_driver_drop();
         if self.outcome().is_some() {
             return actions;
         }
         self.begin_shutdown_admission(Error::DriverShutdown, false);
-        self.session.synchronously_prepare_driver_drop();
-        let outstanding = self.io_core.accepted_count();
+        self.session.synchronously_prepare_driver_drop(io_core);
+        let outstanding = io_core.accepted_count();
         let cm_owners = self
             .session
             .retained_cm_owner_count()
@@ -931,10 +934,12 @@ impl EngineShared {
             }
         };
         self.finish_driver_drop_into(
+            io_core,
             MemoizedTerminalResult::from_error(error.clone()),
             true,
             &mut actions,
         );
+        self.update_io_diagnostics(io_core.diagnostics());
         Self::retain_after_failure(self);
         actions
     }
@@ -1021,7 +1026,7 @@ impl EngineShared {
     }
 
     fn unsafe_outstanding_operations(&self) -> usize {
-        self.io_core.accepted_count()
+        lock_unpoison(&self.io_diagnostics).accepted_operations
     }
 
     fn retain_after_failure(shared: &Arc<Self>) {
@@ -1040,7 +1045,7 @@ impl EngineShared {
 
     fn diagnostics(&self) -> RdmaEngineDiagnostics {
         let connection_counts = self.session.connection_admission.snapshot();
-        let io = self.io_core.diagnostics();
+        let io = *lock_unpoison(&self.io_diagnostics);
         RdmaEngineDiagnostics {
             lifecycle: self.lifecycle(),
             terminal_error: self.outcome().and_then(|outcome| outcome.summary()),
@@ -1055,6 +1060,15 @@ impl EngineShared {
             quarantined_bytes: io.quarantined_bytes,
             quarantined_connections: connection_counts.quarantined_bundles,
         }
+    }
+
+    fn update_io_diagnostics(&self, diagnostics: IoCoreDiagnostics) {
+        *lock_unpoison(&self.io_diagnostics) = diagnostics;
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn update_io_rejections(&self, rejections: Vec<io_core::CqeReject>) {
+        *lock_unpoison(&self.io_rejections) = rejections;
     }
 }
 

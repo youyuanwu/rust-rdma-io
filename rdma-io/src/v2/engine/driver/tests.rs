@@ -153,7 +153,7 @@ fn io_failure_cleanup_is_bounded_across_driver_polls() {
         )
         .unwrap();
         install_accepted_operation_for_driver_test(
-            &engine.shared.io_core,
+            driver.reactor.io.core_mut(),
             &connection.state,
             crate::wc::WcOpcode::Send,
         );
@@ -324,7 +324,7 @@ async fn cq_reclamation_ready_interleaving_dispatches_queued_success_and_flush_e
                 crate::wc::WcOpcode::Send
             };
             let operation = install_accepted_operation_for_driver_test(
-                &engine.shared.io_core,
+                driver.reactor.io.core_mut(),
                 &connection.state,
                 expected,
             );
@@ -369,7 +369,10 @@ async fn cq_reclamation_ready_interleaving_dispatches_queued_success_and_flush_e
                 "exact completion permits normal session-owned retirement without fallback"
             );
 
-            engine.shared.finish(MemoizedTerminalResult::success());
+            engine.shared.finish(
+                driver.reactor.io.core_mut(),
+                MemoizedTerminalResult::success(),
+            );
             drop(driver);
         }
     }
@@ -535,7 +538,7 @@ async fn idle_connections_publish_no_completion_dispatch_work() {
 
         assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
         assert_eq!(driver.reactor.io.completion_connection_count(), 0);
-        assert!(!shared.io_core.has_published_connections());
+        assert!(!driver.reactor.io.core().has_published_connections());
 
         drop(connections);
         drop(driver);
@@ -588,7 +591,7 @@ async fn final_accepted_operation_drain_wakes_and_reconsiders_terminal() {
     )
     .unwrap();
     let operation = install_accepted_operation_for_driver_test(
-        &engine.shared.io_core,
+        driver.reactor.io.core_mut(),
         &connection.state,
         crate::wc::WcOpcode::Send,
     );

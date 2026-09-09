@@ -44,6 +44,15 @@ impl LiveIoConnectionProof {
     pub(super) fn proves(self, connection: ConnectionToken, qp_num: u32) -> bool {
         self.connection == connection && self.qp_num == qp_num
     }
+
+    #[cfg(test)]
+    pub(super) fn for_test(identity: super::io_core::EstablishedIoIdentity) -> Self {
+        Self {
+            connection: identity.connection,
+            qp_num: identity.qp_num,
+            _private: (),
+        }
+    }
 }
 
 impl ConnectionToken {

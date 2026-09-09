@@ -17,6 +17,7 @@ use crate::v2::error::{Error, Result};
 pub(super) fn service_cm_destructions(
     state: &CmState,
     shared: &SessionManager,
+    io_core: &mut crate::v2::engine::io_core::IoState,
     budget: usize,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
     mut defer_one_event: impl FnMut() -> Result<bool>,
@@ -57,6 +58,9 @@ pub(super) fn service_cm_destructions(
                             )
                         });
                         let finalize_result = release_connection_retirement(shared, &connection);
+                        if finalize_result.is_ok() {
+                            io_core.retire_connection_io(connection.token);
+                        }
                         complete_connection_cm_destruction(
                             state,
                             shared,
@@ -314,6 +318,7 @@ fn fail_inbound_retirement(
 
 pub(super) fn retire_registered_connection_into(
     shared: &SessionManager,
+    io_core: &mut crate::v2::engine::io_core::IoState,
     token: ConnectionToken,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<()> {
@@ -321,7 +326,7 @@ pub(super) fn retire_registered_connection_into(
     let Lookup::Occupied(connection) = shared.connections.lookup(token) else {
         return Ok(());
     };
-    if connection.accepted_count() != 0 {
+    if io_core.connection_accepted_count(&connection.io) != 0 {
         return Ok(());
     }
     if !connection.error_transition_complete() {
@@ -367,7 +372,9 @@ pub(super) fn retire_registered_connection_into(
         return Ok(());
     };
     let lifecycle = connection.lock_lifecycle();
-    let resources = shared.destroy_connection_resources(&connection, &lifecycle);
+    let outstanding_operations = io_core.connection_accepted_count(&connection.io);
+    let resources =
+        shared.destroy_connection_resources(&connection, &lifecycle, outstanding_operations);
     drop(lifecycle);
     let cm_id = match resources {
         Ok(resources) => resources,

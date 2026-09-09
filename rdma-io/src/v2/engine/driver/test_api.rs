@@ -25,7 +25,7 @@ use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
 
 use super::{EngineShared, Error, IO_WORK, Result};
 use crate::v2::engine::io_core::CqeReject;
-use crate::v2::engine::registry::{Lookup, OperationToken};
+use crate::v2::engine::registry::{Lookup, OperationToken, lock_unpoison};
 
 /// Test-only connection identity used by the Phase 2 routing gate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -345,9 +345,7 @@ impl TestEngineResources {
     /// Snapshot the exact rejection classes observed by CQE routing.
     pub fn cqe_rejections(&self) -> Result<Vec<TestCqeRejection>> {
         let shared = self.ensure_active()?;
-        Ok(shared
-            .io_core
-            .rejected_cqe_reasons()
+        Ok(lock_unpoison(&shared.io_rejections)
             .iter()
             .copied()
             .map(TestCqeRejection::from)
@@ -593,11 +591,8 @@ impl TestEngineResources {
         completion.inner.qp_num = qp_num;
         completion.inner.status = rdma_io_sys::ibverbs::IBV_WC_SUCCESS;
         completion.inner.opcode = raw_wc_opcode(opcode)?;
-        if let Some(token) = shared.session.enqueue_completion(completion)
-            && let Lookup::Occupied(connection) = shared.session.connections.lookup(token)
-        {
-            shared.io_core.publish_connection(&connection.io);
-        }
+        shared.test_driver.queue_released_connection_cqe(completion);
+        shared.work_signal.publish(super::IO_WORK);
         Ok(())
     }
 
@@ -1069,7 +1064,7 @@ impl TestDriverState {
         TestEngineInstrumentation {
             cm_pending_routes: shared.session.pending_cm_route_count(),
             cm_retained_owners: shared.session.retained_cm_owner_count(),
-            cqes_rejected: shared.io_core.rejected_cqe_count(),
+            cqes_rejected: lock_unpoison(&shared.io_rejections).len() as u64,
             cm_events_rejected: shared.session.rejected_cm_events.load(Ordering::Acquire),
         }
     }
@@ -1271,8 +1266,7 @@ impl TestDriverState {
             .pop_front()
     }
 
-    #[cfg(test)]
-    pub(super) fn queue_released_connection_cqe(&self, completion: WorkCompletion) {
+    pub(in crate::v2::engine) fn queue_released_connection_cqe(&self, completion: WorkCompletion) {
         self.released_connection_cqes
             .lock()
             .unwrap_or_else(|error| error.into_inner())

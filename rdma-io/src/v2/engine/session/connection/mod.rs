@@ -9,10 +9,6 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use self::qp::QpCapabilitiesExt;
 use super::super::RdmaConnectionConfig;
 use super::super::io::{IoEventSender, IoTerminalEvent, MemoryRegistrar, PendingIoEvent};
-#[cfg(test)]
-use super::super::io_core::Direction;
-#[cfg(test)]
-use super::super::io_core::IoDrainReport;
 use super::super::io_core::RdmaOperation;
 use super::super::io_core::{
     EstablishedIoConnection, EstablishedIoIdentity, IoPostAuthority, IoQuarantineReport,
@@ -84,8 +80,6 @@ pub struct RdmaConnection {
     pub(in crate::v2::engine) state: Arc<ConnectionState>,
     #[cfg(not(test))]
     state: Weak<ConnectionState>,
-    pub(in crate::v2::engine) io_core: Arc<super::super::io_core::IoCore>,
-    pub(in crate::v2::engine) io: Arc<EstablishedIoConnection>,
     pub(in crate::v2::engine) memory: MemoryRegistrar,
     pub(in crate::v2::engine) session: SessionConnection,
     local_addr: Option<SocketAddr>,
@@ -103,8 +97,6 @@ impl Clone for RdmaConnection {
             state: Arc::clone(&self.state),
             #[cfg(not(test))]
             state: self.state.clone(),
-            io_core: Arc::clone(&self.io_core),
-            io: Arc::clone(&self.io),
             memory: self.memory.clone(),
             session: self.session.clone(),
             local_addr: self.local_addr,
@@ -133,7 +125,6 @@ impl RdmaConnection {
             self.session.command_ingress(),
             self.session.manager(),
             self.session.token(),
-            Arc::downgrade(&self.io_core),
             OperationKind::Send,
             mr,
             None,
@@ -148,7 +139,6 @@ impl RdmaConnection {
             self.session.command_ingress(),
             self.session.manager(),
             self.session.token(),
-            Arc::downgrade(&self.io_core),
             OperationKind::Recv,
             mr,
             None,
@@ -163,7 +153,6 @@ impl RdmaConnection {
             self.session.command_ingress(),
             self.session.manager(),
             self.session.token(),
-            Arc::downgrade(&self.io_core),
             OperationKind::Write,
             mr,
             Some(remote),
@@ -178,7 +167,6 @@ impl RdmaConnection {
             self.session.command_ingress(),
             self.session.manager(),
             self.session.token(),
-            Arc::downgrade(&self.io_core),
             OperationKind::Read,
             mr,
             Some(remote),
@@ -221,16 +209,6 @@ impl RdmaConnection {
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn transition_to_error_for_test(&self) -> Result<()> {
         self.session.transition_to_error_for_test()
-    }
-
-    #[cfg(test)]
-    pub(in crate::v2::engine) fn into_state_without_close_for_test(self) -> Arc<ConnectionState> {
-        let state = Arc::clone(&self.state);
-        state.frontend_count.fetch_add(1, Ordering::Relaxed);
-        drop(self);
-        let previous = state.frontend_count.fetch_sub(1, Ordering::AcqRel);
-        debug_assert_eq!(previous, 1);
-        state
     }
 }
 
@@ -282,14 +260,11 @@ impl RdmaConnection {
         let identity = state.identity();
         let local_addr = state.local_addr;
         let peer_addr = state.peer_addr;
-        let io = Arc::clone(&state.io);
         Self {
             #[cfg(test)]
             state: Arc::clone(&state),
             #[cfg(not(test))]
             state: Arc::downgrade(&state),
-            io_core: Arc::clone(&manager.io_core),
-            io,
             memory: manager.memory_registrar(),
             session,
             local_addr,
@@ -309,6 +284,7 @@ pub(in crate::v2::engine) struct ConnectionState {
     // Nested lifecycle synchronization always follows:
     // SessionManager::admission -> lifecycle_gate -> posting_gate.
     lifecycle_gate: Mutex<()>,
+    io_closed: AtomicBool,
     close_started: AtomicBool,
     close_operation_scan_slot: AtomicUsize,
     close_operation_scan_complete: AtomicBool,
@@ -372,6 +348,7 @@ impl ConnectionState {
             local_addr,
             peer_addr,
             lifecycle_gate: Mutex::new(()),
+            io_closed: AtomicBool::new(false),
             close_started: AtomicBool::new(false),
             close_operation_scan_slot: AtomicUsize::new(0),
             close_operation_scan_complete: AtomicBool::new(false),
@@ -410,44 +387,19 @@ impl ConnectionState {
         self.qp_num
     }
 
-    #[cfg(test)]
-    pub(in crate::v2::engine) fn reserve_local(&self, direction: Direction) -> Result<()> {
-        self.io.reserve_local(direction)
-    }
-
-    #[cfg(test)]
-    pub(in crate::v2::engine) fn release_local(&self, direction: Direction) {
-        self.io.release_local(direction);
-    }
-
-    #[cfg(test)]
-    pub(in crate::v2::engine) fn add_accepted(&self, token: OperationToken) {
-        self.io.add_accepted(token);
-    }
-
-    #[cfg(test)]
-    pub(in crate::v2::engine) fn remove_accepted(&self, token: OperationToken) -> bool {
-        self.io.remove_accepted(token)
-    }
-
     #[cfg(any(test, feature = "test-hooks"))]
     pub(in crate::v2::engine) fn accepted_tokens(&self) -> Vec<OperationToken> {
-        self.io.accepted_tokens()
-    }
-
-    pub(in crate::v2::engine) fn accepted_count(&self) -> usize {
-        self.io.accepted_count()
-    }
-
-    pub(in crate::v2::engine) fn has_copied_completions(&self) -> bool {
-        self.io.has_completion_work()
+        self.io.accepted_tokens_for_observation()
     }
 
     pub(in crate::v2::engine) fn install_io_event_sender(
         &self,
         sender: IoEventSender,
     ) -> Result<Option<PendingIoEvent>> {
-        if !self.io.install_io_event_sender(sender)? {
+        if !self
+            .io
+            .install_io_event_sender(sender, self.io_closed.load(Ordering::Acquire))?
+        {
             return Ok(None);
         }
 
@@ -470,12 +422,11 @@ impl ConnectionState {
     }
 
     pub(in crate::v2::engine) fn stop_posting(&self) {
-        self.io.close_posting();
+        self.io_closed.store(true, Ordering::Release);
     }
 
-    #[cfg(test)]
-    pub(in crate::v2::engine) fn io_drain_report(&self) -> IoDrainReport {
-        self.io.drain_report()
+    pub(in crate::v2::engine) fn io_is_open(&self) -> bool {
+        !self.io_closed.load(Ordering::Acquire)
     }
 
     pub(in crate::v2::engine) fn lock_lifecycle(&self) -> MutexGuard<'_, ()> {
@@ -572,8 +523,8 @@ impl ConnectionState {
         &self,
         authority: &SessionLifecycleAuthority,
         _lifecycle: &MutexGuard<'_, ()>,
+        outstanding_operations: usize,
     ) -> Result<Option<SharedCmId>> {
-        let outstanding_operations = self.accepted_count();
         if outstanding_operations != 0 {
             return Err(Error::EngineWedged {
                 retained_bundles: 1,
@@ -697,8 +648,15 @@ impl ConnectionState {
         self.close.notify_waiters_into(actions);
     }
 
-    pub(in crate::v2::engine) fn begin_quarantine(&self) -> Option<IoQuarantineReport> {
-        self.io.begin_connection_quarantine(&self.quarantined)
+    pub(in crate::v2::engine) fn begin_quarantine(
+        &self,
+        io_core: &mut super::super::io_core::IoState,
+    ) -> Option<IoQuarantineReport> {
+        let report = io_core.begin_connection_quarantine(&self.io)?;
+        if self.quarantined.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        Some(report)
     }
 
     pub(in crate::v2::engine) fn publish_quarantine_into(
@@ -779,8 +737,11 @@ impl ConnectionState {
         self.quarantined.swap(false, Ordering::AcqRel)
     }
 
-    pub(in crate::v2::engine) fn retain_bundle_for_engine_failure(&self) -> bool {
-        self.accepted_count() != 0 && !self.quarantined.swap(true, Ordering::AcqRel)
+    pub(in crate::v2::engine) fn retain_bundle_for_engine_failure(
+        &self,
+        accepted_count: usize,
+    ) -> bool {
+        accepted_count != 0 && !self.quarantined.swap(true, Ordering::AcqRel)
     }
 
     #[cfg(test)]
@@ -883,12 +844,6 @@ impl ConnectionState {
 
     pub(in crate::v2::engine) fn mark_drained_once(&self) -> bool {
         !self.drained_recorded.swap(true, Ordering::AcqRel)
-    }
-
-    #[cfg(test)]
-    pub(in crate::v2::engine) fn drained_and_retirement_requested_for_test(&self) -> bool {
-        self.drained_recorded.load(Ordering::Acquire)
-            && self.retirement_requested.load(Ordering::Acquire)
     }
 
     pub(in crate::v2::engine) fn rollback_draining_count(&self) {

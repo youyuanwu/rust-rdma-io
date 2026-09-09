@@ -375,7 +375,7 @@ struct MessagePreparation {
 }
 
 impl MessagePreparation {
-    fn run(self, connection: BorrowedSetupIo<'_>, events: IoEventReceiver) -> Result<usize> {
+    fn run(self, mut connection: BorrowedSetupIo<'_>, events: IoEventReceiver) -> Result<usize> {
         let total = self
             .recv_count
             .checked_add(protocol::CTRL_RECV_COUNT)

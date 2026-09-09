@@ -130,11 +130,6 @@ impl ConnectionRegistry {
         self.slots.live()
     }
 
-    #[cfg(test)]
-    pub(in crate::v2::engine) fn free(&self) -> usize {
-        self.slots.free()
-    }
-
     pub(in crate::v2::engine) fn occupied(&self) -> Vec<Arc<ConnectionState>> {
         self.slots.occupied_cloned()
     }

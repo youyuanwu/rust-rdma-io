@@ -16,12 +16,12 @@
 //!
 //! The module observes the same ownership rules as its `batch` sibling:
 //!
-//! - It never sees `OperationInner` or a state guard. Reservation, acceptance,
-//!   proven non-acceptance, detachment, and cancellation are `OperationState`
-//!   methods that return owned records.
+//! - It reaches value-owned `OperationState` records only through the
+//!   reactor-owned registry. Reservation, acceptance, proven non-acceptance,
+//!   detachment, and cancellation never share a backend record.
 //! - It never reads or builds effect payload fields. Post-lock work is carried
 //!   in `AfterEngineUnlock` and published only by
-//!   [`publish_after_post_guards`], after both guards are dropped.
+//!   by the reactor action path after both guards are dropped.
 //! - It releases provider-visible ownership only on positive proof. A rollback
 //!   before registration returns the MR directly; a proven-unaccepted post
 //!   returns it through `take_unaccepted`; anything ambiguous is committed as
@@ -37,11 +37,9 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, RwLockReadGuard, Weak};
 use std::task::{Context, Poll};
 
-use futures_util::task::AtomicWaker;
 use tokio::sync::OwnedSemaphorePermit;
 
 use crate::v2::engine::reactor::CommandIngress;
@@ -54,10 +52,16 @@ use crate::v2::op::Completion;
 use crate::v2::qp::BatchPostOutcome;
 use crate::wr::{PreparedRecvBatch, PreparedSendBatch, RecvWr, SendFlags, SendWr};
 
-use super::super::{EstablishedIoConnection, IoCore, OperationKind};
+use super::super::{EstablishedIoConnection, IoState, OperationKind};
 use super::effects::AfterEngineUnlock;
-use super::state::OperationState;
+use super::state::{OperationObserver, OperationState};
 use super::validation::ValidatedOperation;
+
+struct PostingTurnGuard;
+
+impl Drop for PostingTurnGuard {
+    fn drop(&mut self) {}
+}
 
 /// Future for one engine-owned SEND, RECV, READ, or WRITE.
 ///
@@ -83,7 +87,6 @@ enum FutureState {
         commands: Weak<CommandIngress>,
         manager: Weak<SessionManager>,
         connection: ConnectionToken,
-        shared: Weak<IoCore>,
         kind: OperationKind,
         mr: Option<Mr>,
         remote: Option<RemoteMr>,
@@ -94,7 +97,6 @@ enum FutureState {
         manager: Weak<SessionManager>,
         connection: ConnectionToken,
         permit: Pin<Box<dyn Future<Output = Option<OwnedSemaphorePermit>> + Send>>,
-        shared: Weak<IoCore>,
         kind: OperationKind,
         mr: Option<Mr>,
         remote: Option<RemoteMr>,
@@ -116,7 +118,6 @@ impl RdmaOperation {
         commands: Weak<CommandIngress>,
         manager: Weak<SessionManager>,
         connection: ConnectionToken,
-        shared: Weak<IoCore>,
         kind: OperationKind,
         mr: Mr,
         remote: Option<RemoteMr>,
@@ -127,7 +128,6 @@ impl RdmaOperation {
                 commands,
                 manager,
                 connection,
-                shared,
                 kind,
                 mr: Some(mr),
                 remote,
@@ -142,9 +142,9 @@ impl RdmaOperation {
     /// cancellation path without a provider. Exposing this constructor keeps
     /// `state` and `FutureState` private instead of widening them for tests.
     #[cfg(test)]
-    pub(super) fn from_in_flight(shared: Arc<IoCore>, operation: Arc<OperationState>) -> Self {
-        let completion = Arc::new(OperationCommandCompletion::new());
-        completion.install(StartResult::InFlight(operation), Arc::downgrade(&shared));
+    pub(super) fn from_in_flight(token: OperationToken, observer: Arc<OperationObserver>) -> Self {
+        let completion = Arc::new(OperationCommandCompletion::from_observer(observer));
+        completion.install(StartResult::InFlight(token));
         Self {
             state: FutureState::Queued {
                 commands: Weak::new(),
@@ -167,7 +167,6 @@ impl Future for RdmaOperation {
                         commands,
                         manager,
                         connection,
-                        shared,
                         kind,
                         mr,
                         remote,
@@ -186,7 +185,6 @@ impl Future for RdmaOperation {
                         manager,
                         connection,
                         permit,
-                        shared,
                         kind,
                         mr,
                         remote,
@@ -202,7 +200,6 @@ impl Future for RdmaOperation {
                         commands,
                         manager,
                         connection,
-                        shared,
                         kind,
                         mut mr,
                         remote,
@@ -213,15 +210,11 @@ impl Future for RdmaOperation {
                         unreachable!("operation admission state changed while polling");
                     };
                     let Some(permit) = permit else {
-                        let error = shared
+                        let error = manager
                             .upgrade()
-                            .and_then(|shared| shared.admission_error())
+                            .and_then(|manager| manager.admission_error())
                             .unwrap_or(Error::DriverShutdown);
                         self.state = FutureState::Immediate(Some((Err(error), mr)));
-                        continue;
-                    };
-                    let Some(shared) = shared.upgrade() else {
-                        self.state = FutureState::Immediate(Some((Err(Error::DriverShutdown), mr)));
                         continue;
                     };
                     let Some(manager) = manager.upgrade() else {
@@ -236,7 +229,6 @@ impl Future for RdmaOperation {
                     let completion = Arc::new(OperationCommandCompletion::new());
                     completion.register(cx.waker());
                     let command = Arc::new(OperationCommand::new(
-                        Arc::downgrade(&shared),
                         connection,
                         kind,
                         mr,
@@ -288,15 +280,17 @@ impl Drop for RdmaOperation {
         } = state
         {
             completion.cancel();
-            if let (Some(commands), Some(command)) = (commands.upgrade(), command.upgrade()) {
-                commands.cancel_operation(&command);
+            if let (Some(commands), Some(command)) = (commands.upgrade(), command.upgrade())
+                && !commands.cancel_operation(&command)
+                && let Some(token) = completion.in_flight_token()
+            {
+                commands.request_operation_cancel(token);
             }
         }
     }
 }
 
 struct OperationInput {
-    shared: Weak<IoCore>,
     connection: ConnectionToken,
     kind: OperationKind,
     mr: Mr,
@@ -311,7 +305,6 @@ pub(in crate::v2::engine) struct OperationCommand {
 
 impl OperationCommand {
     fn new(
-        shared: Weak<IoCore>,
         connection: ConnectionToken,
         kind: OperationKind,
         mr: Mr,
@@ -321,7 +314,6 @@ impl OperationCommand {
     ) -> Self {
         Self {
             input: Mutex::new(Some(OperationInput {
-                shared,
                 connection,
                 kind,
                 mr,
@@ -335,25 +327,22 @@ impl OperationCommand {
     pub(in crate::v2::engine) fn execute_into(
         &self,
         manager: &SessionManager,
+        shared: &mut IoState,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) {
         let Some(input) = lock_unpoison(&self.input).take() else {
             return;
         };
-        let Some(shared) = input.shared.upgrade() else {
-            self.completion.install_into(
-                StartResult::Immediate((Err(Error::DriverShutdown), Some(input.mr))),
-                Weak::new(),
-                actions,
-            );
-            return;
-        };
         let connection = match manager.connections.lookup(input.connection) {
-            Lookup::Occupied(connection) => Arc::clone(&connection.io),
-            Lookup::Duplicate | Lookup::Stale | Lookup::Unknown | Lookup::Retired => {
+            Lookup::Occupied(connection) if connection.io_is_open() => Arc::clone(&connection.io),
+            Lookup::Occupied(_)
+            | Lookup::Duplicate
+            | Lookup::Stale
+            | Lookup::Unknown
+            | Lookup::Retired => {
                 self.completion.install_into(
                     StartResult::Immediate((Err(Error::TransportClosed), Some(input.mr))),
-                    Arc::downgrade(&shared),
+                    shared,
                     actions,
                 );
                 return;
@@ -362,22 +351,22 @@ impl OperationCommand {
         if self.completion.is_cancelled() {
             self.completion.install_into(
                 StartResult::Immediate((Err(Error::DriverShutdown), Some(input.mr))),
-                Arc::downgrade(&shared),
+                shared,
                 actions,
             );
             return;
         }
         let result = start_operation(
-            &shared,
+            shared,
             &connection,
             input.kind,
             input.mr,
             input.remote,
             input.range,
+            Arc::clone(&self.completion.observer),
             actions,
         );
-        self.completion
-            .install_into(result, Arc::downgrade(&shared), actions);
+        self.completion.install_into(result, shared, actions);
     }
 
     pub(in crate::v2::engine) fn cancel_before_execution(&self, error: Error) {
@@ -385,10 +374,8 @@ impl OperationCommand {
             self.completion.cancel();
             return;
         };
-        self.completion.install(
-            StartResult::Immediate((Err(error), Some(input.mr))),
-            input.shared,
-        );
+        self.completion
+            .install(StartResult::Immediate((Err(error), Some(input.mr))));
     }
 
     pub(in crate::v2::engine) fn cancel_before_execution_into(
@@ -400,137 +387,89 @@ impl OperationCommand {
             self.completion.cancel();
             return;
         };
-        self.completion.install_into(
-            StartResult::Immediate((Err(error), Some(input.mr))),
-            input.shared,
-            actions,
-        );
+        self.completion
+            .observer
+            .complete((Err(error), Some(input.mr)));
+        actions.push_operation_wake(Arc::clone(&self.completion.observer));
     }
 }
 
-enum OperationCommandResult {
-    Pending,
-    InFlight {
-        shared: Weak<IoCore>,
-        operation: Arc<OperationState>,
-    },
-    Immediate(Option<(Result<Completion>, Option<Mr>)>),
-    Taken,
-}
-
 struct OperationCommandCompletion {
-    state: Mutex<OperationCommandResult>,
-    cancelled: std::sync::atomic::AtomicBool,
-    waker: Arc<AtomicWaker>,
+    observer: Arc<OperationObserver>,
+    in_flight: Mutex<Option<OperationToken>>,
 }
 
 impl OperationCommandCompletion {
     fn new() -> Self {
         Self {
-            state: Mutex::new(OperationCommandResult::Pending),
-            cancelled: std::sync::atomic::AtomicBool::new(false),
-            waker: Arc::new(AtomicWaker::new()),
+            observer: OperationObserver::new(),
+            in_flight: Mutex::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    fn from_observer(observer: Arc<OperationObserver>) -> Self {
+        Self {
+            observer,
+            in_flight: Mutex::new(None),
         }
     }
 
     fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
+        self.observer.is_cancelled()
     }
 
     fn register(&self, waker: &std::task::Waker) {
-        self.waker.register(waker);
+        self.observer.register(waker);
     }
 
-    fn install(&self, result: StartResult, shared: Weak<IoCore>) {
+    fn install(&self, result: StartResult) {
         let mut actions = crate::v2::engine::reactor::ReactorActions::default();
-        self.install_into(result, shared, &mut actions);
+        match result {
+            StartResult::InFlight(token) => {
+                *lock_unpoison(&self.in_flight) = Some(token);
+            }
+            StartResult::Immediate(output) => self.observer.complete(output),
+        }
+        let observer = Arc::clone(&self.observer);
+        actions.push_operation(move || observer.wake());
         actions.publish();
     }
 
     fn install_into(
         &self,
         result: StartResult,
-        shared: Weak<IoCore>,
+        shared: &mut IoState,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) {
-        let mut state = lock_unpoison(&self.state);
-        *state = match result {
-            StartResult::InFlight(operation) => {
-                OperationCommandResult::InFlight { shared, operation }
+        let in_flight = match result {
+            StartResult::InFlight(token) => {
+                *lock_unpoison(&self.in_flight) = Some(token);
+                Some(token)
             }
-            StartResult::Immediate(output) => OperationCommandResult::Immediate(Some(output)),
-        };
-        let cancelled = self.is_cancelled();
-        let in_flight = match &*state {
-            OperationCommandResult::InFlight { shared, operation } if cancelled => {
-                Some((shared.clone(), Arc::clone(operation)))
+            StartResult::Immediate(output) => {
+                self.observer.complete(output);
+                None
             }
-            _ => None,
         };
-        drop(state);
-        if let Some((shared, operation)) = in_flight
-            && let Some(shared) = shared.upgrade()
-            && operation.cancel(&shared)
+        if self.is_cancelled()
+            && let Some(token) = in_flight
         {
-            shared.schedule_reclamation(operation.token());
+            shared.cancel_operation(token);
         }
-        let waker = Arc::clone(&self.waker);
-        actions.push_operation(move || waker.wake());
+        actions.push_operation_wake(Arc::clone(&self.observer));
     }
 
     fn poll(&self, cx: &mut Context<'_>) -> Poll<(Result<Completion>, Option<Mr>)> {
-        loop {
-            let in_flight = {
-                let mut state = lock_unpoison(&self.state);
-                match &mut *state {
-                    OperationCommandResult::Pending => {
-                        self.waker.register(cx.waker());
-                        return Poll::Pending;
-                    }
-                    OperationCommandResult::Immediate(output) => {
-                        let output = output
-                            .take()
-                            .unwrap_or_else(|| (Err(Error::DriverShutdown), None));
-                        *state = OperationCommandResult::Taken;
-                        return Poll::Ready(output);
-                    }
-                    OperationCommandResult::InFlight { operation, .. } => Arc::clone(operation),
-                    OperationCommandResult::Taken => {
-                        return Poll::Ready((Err(Error::DriverShutdown), None));
-                    }
-                }
-            };
-            in_flight.register_waker(cx.waker());
-            if let Some(output) = in_flight.take_output() {
-                *lock_unpoison(&self.state) = OperationCommandResult::Taken;
-                return Poll::Ready(output);
-            }
-            return Poll::Pending;
-        }
+        self.observer.poll(cx)
     }
 
     fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
-        let in_flight = {
-            let mut state = lock_unpoison(&self.state);
-            match &mut *state {
-                OperationCommandResult::InFlight { shared, operation } => {
-                    Some((shared.clone(), Arc::clone(operation)))
-                }
-                OperationCommandResult::Immediate(output) => {
-                    drop(output.take());
-                    *state = OperationCommandResult::Taken;
-                    None
-                }
-                OperationCommandResult::Pending | OperationCommandResult::Taken => None,
-            }
-        };
-        if let Some((shared, operation)) = in_flight
-            && let Some(shared) = shared.upgrade()
-            && operation.cancel(&shared)
-        {
-            shared.schedule_reclamation(operation.token());
-        }
+        self.observer.cancel();
+    }
+
+    fn in_flight_token(&self) -> Option<OperationToken> {
+        *lock_unpoison(&self.in_flight)
     }
 }
 
@@ -540,7 +479,7 @@ impl OperationCommandCompletion {
 /// an exact CQE or reclamation proof resolves it. `Immediate` means the caller
 /// keeps the result and whatever MR ownership survived the rollback.
 enum StartResult {
-    InFlight(Arc<OperationState>),
+    InFlight(OperationToken),
     Immediate((Result<Completion>, Option<Mr>)),
 }
 
@@ -552,78 +491,96 @@ enum StartResult {
 /// reverse order they were acquired. The accepted, exact-zero-prefix,
 /// proven-unaccepted, and ambiguous arms then assign one — and only one —
 /// owner to those reservations.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "provider transaction inputs stay explicit"
+)]
 fn start_operation(
-    shared: &IoCore,
+    shared: &mut IoState,
     connection: &Arc<EstablishedIoConnection>,
     kind: OperationKind,
     mr: Mr,
     remote: Option<RemoteMr>,
     range: Option<(usize, usize)>,
+    observer: Arc<OperationObserver>,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> StartResult {
     let validated = match ValidatedOperation::new(kind, &mr, remote, range) {
         Ok(validated) => validated,
         Err(error) => return StartResult::Immediate((Err(error), Some(mr))),
     };
-    let admission = shared.admission();
+    let admission_owner = Arc::clone(&shared.admission);
+    let admission = crate::v2::engine::registry::read_unpoison(&admission_owner);
     if let Some(error) = shared.admission_error() {
         return StartResult::Immediate((Err(error), Some(mr)));
     }
     #[cfg(any(test, feature = "test-hooks"))]
     shared.pause_operation_before_register();
-    let posting = match connection.begin_posting() {
-        Ok(posting) => posting,
-        Err(error) => return StartResult::Immediate((Err(error), Some(mr))),
-    };
+    let posting = PostingTurnGuard;
     let direction = kind.direction();
-    if let Err(error) = connection.reserve_local(direction) {
+    if let Err(error) = shared.reserve_local(connection, direction) {
         return StartResult::Immediate((Err(error), Some(mr)));
     }
 
     let expected_opcode = validated.expected_opcode();
     let mr_len = mr.len();
     let mut mr = Some(mr);
-    let (token, state) = match shared.operations.allocate(|token| {
-        Arc::new(OperationState::new(
+    let token = match shared.operations.allocate(|token| {
+        OperationState::new_scalar(
             token,
             Arc::clone(connection),
             direction,
             expected_opcode,
             mr.take(),
             mr_len,
-        ))
+            Arc::clone(&observer),
+        )
     }) {
         Ok(token) => token,
         Err(error) => {
-            connection.release_local(direction);
+            shared.release_local(connection, direction);
             return StartResult::Immediate((Err(error), mr));
         }
     };
 
     if !shared.cq_credits.reserve() {
-        let state = shared.operations.release(token, false).unwrap_or(state);
-        connection.release_local(direction);
+        let mut state = shared
+            .operations
+            .release(token, false)
+            .expect("unposted operation remains registered");
+        shared.release_local(connection, direction);
         return StartResult::Immediate((Err(Error::CapacityExhausted), state.take_mr()));
     }
     let outcome = match post_validated_operation(validated, connection, token) {
         Ok(outcome) => outcome,
         Err(error) => {
-            let state = shared.operations.release(token, false).unwrap_or(state);
+            let mut state = shared
+                .operations
+                .release(token, false)
+                .expect("unposted operation remains registered");
             shared.cq_credits.release();
-            connection.release_local(direction);
+            shared.release_local(connection, direction);
             return StartResult::Immediate((Err(error), state.take_mr()));
         }
     };
     match outcome {
         BatchPostOutcome::AllAccepted => {
-            shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
-            let early = state.commit_accepted();
+            shared.accepted_operations += 1;
+            shared.add_accepted(connection, token);
+            let committed = match shared.operations.lookup_mut(token) {
+                Lookup::Occupied(state) => state.commit_accepted(),
+                _ => unreachable!("accepted operation remains registered"),
+            };
+            if committed.cancellation_needs_reclamation {
+                shared.pending_reclamations += 1;
+                shared.schedule_reclamation(token);
+            }
             shared.publish_cq_recheck();
-            if let Some(completion) = early {
-                let after_unlock = shared.finish_early_completion(Arc::clone(&state), completion);
+            if let Some(completion) = committed.early {
+                let after_unlock = shared.finish_early_completion(token, completion);
                 append_after_post_guards(posting, admission, after_unlock, actions);
             }
-            StartResult::InFlight(state)
+            StartResult::InFlight(token)
         }
         BatchPostOutcome::PrefixAccepted {
             accepted,
@@ -631,41 +588,68 @@ fn start_operation(
             source,
         } if accepted == 0 && first_unaccepted == 0 => {
             let error = Error::PostFailed(source);
-            if let Some(release) = state.take_unaccepted(error.clone()) {
-                let registered = shared
+            let can_release = matches!(
+                shared.operations.lookup(token),
+                Lookup::Occupied(state) if state.can_release_unaccepted()
+            );
+            if can_release {
+                let mut state = shared
                     .operations
                     .release(token, false)
                     .expect("proven-unaccepted operation remains registered");
-                debug_assert!(Arc::ptr_eq(&registered, &state));
+                let release = state
+                    .take_unaccepted(error.clone())
+                    .expect("proven-unaccepted operation has no completion");
                 shared.cq_credits.release();
-                connection.release_local(direction);
+                shared.release_local(connection, direction);
                 debug_assert!(release.event.is_none());
                 drop(release.event);
                 StartResult::Immediate((Err(error), release.mr))
             } else {
-                shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
-                let early = state.commit_accepted();
+                shared.accepted_operations += 1;
+                shared.add_accepted(connection, token);
+                let committed = match shared.operations.lookup_mut(token) {
+                    Lookup::Occupied(state) => state.commit_accepted(),
+                    _ => unreachable!("retained operation remains registered"),
+                };
+                if committed.cancellation_needs_reclamation {
+                    shared.pending_reclamations += 1;
+                    shared.schedule_reclamation(token);
+                }
                 shared.publish_cq_recheck();
-                if let Some(completion) = early {
-                    let after_unlock =
-                        shared.finish_early_completion(Arc::clone(&state), completion);
+                if let Some(completion) = committed.early {
+                    let after_unlock = shared.finish_early_completion(token, completion);
                     append_after_post_guards(posting, admission, after_unlock, actions);
                 }
-                StartResult::InFlight(state)
+                StartResult::InFlight(token)
             }
         }
         BatchPostOutcome::PrefixAccepted { source, .. }
         | BatchPostOutcome::Ambiguous { source } => {
-            shared.accepted_operations.fetch_add(1, Ordering::AcqRel);
-            let early = state.commit_accepted();
-            shared.publish_cq_recheck();
-            if let Some(completion) = early {
-                let after_unlock = shared.finish_early_completion(Arc::clone(&state), completion);
-                append_after_post_guards(posting, admission, after_unlock, actions);
-                StartResult::InFlight(state)
-            } else {
-                state.detach_with_post_error(shared);
+            shared.accepted_operations += 1;
+            shared.add_accepted(connection, token);
+            let committed = match shared.operations.lookup_mut(token) {
+                Lookup::Occupied(state) => state.commit_accepted(),
+                _ => unreachable!("ambiguous operation remains registered"),
+            };
+            if committed.cancellation_needs_reclamation {
+                shared.pending_reclamations += 1;
                 shared.schedule_reclamation(token);
+            }
+            shared.publish_cq_recheck();
+            if let Some(completion) = committed.early {
+                let after_unlock = shared.finish_early_completion(token, completion);
+                append_after_post_guards(posting, admission, after_unlock, actions);
+                StartResult::InFlight(token)
+            } else {
+                let newly_pending = match shared.operations.lookup_mut(token) {
+                    Lookup::Occupied(state) => state.detach_with_post_error(),
+                    _ => false,
+                };
+                if newly_pending {
+                    shared.pending_reclamations += 1;
+                    shared.schedule_reclamation(token);
+                }
                 StartResult::Immediate((Err(Error::PostFailed(source)), None))
             }
         }
@@ -705,26 +689,8 @@ fn post_validated_operation(
     }
 }
 
-/// Drops both posting guards by value, then publishes the accumulated effects.
-///
-/// Taking the guards by value makes the ordering unforgeable: a caller cannot
-/// publish an early-completion event or waker while still holding the posting
-/// or admission lock. The `pub(super)` scope exists only so the parent module's
-/// `cfg(test)` ordering test can call this boundary directly; no production
-/// code outside this module uses it.
-#[cfg(test)]
-pub(super) fn publish_after_post_guards(
-    posting: RwLockReadGuard<'_, ()>,
-    admission: RwLockReadGuard<'_, ()>,
-    after_unlock: AfterEngineUnlock,
-) {
-    drop(posting);
-    drop(admission);
-    after_unlock.publish();
-}
-
 fn append_after_post_guards(
-    posting: RwLockReadGuard<'_, ()>,
+    posting: PostingTurnGuard,
     admission: RwLockReadGuard<'_, ()>,
     after_unlock: AfterEngineUnlock,
     actions: &mut crate::v2::engine::reactor::ReactorActions,

@@ -15,7 +15,7 @@ use tokio::time::Instant;
 
 use super::EngineShared;
 use super::config::CompletionMode;
-use super::io_core::{IoReactorSources, IoSessionBridge};
+use super::io_core::{IoDriverSignal, IoReactorSources, IoState};
 use super::progress::ReadinessRegistration;
 use super::resources::EngineResources;
 use super::session::{CmShutdownClass, CmSoftwareClass, SessionReactorSources};
@@ -55,10 +55,26 @@ impl EngineReactor {
             }
             None => (None, None),
         };
-        let bridge: Arc<dyn IoSessionBridge> = shared.session.clone();
+        let io_driver_signal: Arc<dyn IoDriverSignal> = Arc::new(super::EngineIoDriverSignal {
+            work_signal: Arc::clone(&shared.work_signal),
+            #[cfg(any(test, feature = "test-hooks"))]
+            test_driver: Arc::clone(&shared.test_driver),
+        });
+        let io_core = IoState::new_owned(
+            shared.config.max_inflight_operations,
+            shared.config.cq_capacity,
+            shared.config.missing_cqe_deadline,
+            shared.config.completion_dispatch_budget,
+            Arc::clone(&shared.session.admission),
+            io_driver_signal,
+        )
+        .expect("validated engine I/O configuration");
+        #[cfg(test)]
+        let bridge: Arc<dyn super::io_core::IoSessionBridge> = shared.session.clone();
         Self {
             io: IoReactorSources::new(
-                Arc::clone(&shared.io_core),
+                io_core,
+                #[cfg(test)]
                 bridge,
                 io_resources,
                 shared.config.cq_completion_budget,
@@ -77,6 +93,10 @@ impl EngineReactor {
         }
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "failure preserves the already-bounded action batch for publication"
+    )]
     pub(super) fn turn(
         &mut self,
         shared: &Arc<EngineShared>,
@@ -93,6 +113,8 @@ impl EngineReactor {
             };
         }
         let now = Instant::now();
+        self.io
+            .sync_lifecycle(shared.admission_error(), shared.pending_terminal_outcome());
         let io_terminal = try_turn!(self.io.begin_turn());
         let (shutting_down, terminal_failure) = try_turn!(self.session.begin_turn());
         let completion_count = self.io.prepare_completion_dispatch_snapshot();
@@ -192,14 +214,17 @@ impl EngineReactor {
         while let Some(source) = ready.pop_front() {
             match source {
                 ReactorSource::Commands => {
-                    let report = shared.commands.service_turn_into(shared, &mut actions);
+                    let report =
+                        shared
+                            .commands
+                            .service_turn_into(shared, self.io.core_mut(), &mut actions);
                     if report.has_more {
                         shared.work_signal.publish(super::driver::REACTOR_WORK);
                     }
                     requires_repoll |= report.has_more || report.session_work;
                 }
                 ReactorSource::Cq => {
-                    let (_, _, repoll) = try_turn!(self.io.service_cq(mode, cx));
+                    let (_, _, repoll) = try_turn!(self.io.service_cq(&shared.session, mode, cx));
                     requires_repoll |= repoll;
                 }
                 ReactorSource::CompletionDispatch => {
@@ -210,8 +235,11 @@ impl EngineReactor {
                     if quantum == 0 {
                         requires_repoll = true;
                     } else {
-                        let (_, more) =
-                            try_turn!(self.io.service_completion_dispatch(quantum, &mut actions));
+                        let (_, more) = try_turn!(self.io.service_completion_dispatch(
+                            quantum,
+                            &shared.session,
+                            &mut actions,
+                        ));
                         requires_repoll |= more;
                     }
                 }
@@ -222,9 +250,12 @@ impl EngineReactor {
                 }
                 ReactorSource::IoDeadline => {
                     let limit = io_deadline_count.min(self.io.reclamation_budget());
-                    let used = self
-                        .io
-                        .service_reclamation_deadlines(now, limit, &mut actions);
+                    let used = self.io.service_reclamation_deadlines(
+                        now,
+                        limit,
+                        &shared.session,
+                        &mut actions,
+                    );
                     requires_repoll |= used == limit && self.io.due_deadline_count(now) != 0;
                 }
                 ReactorSource::CmCancellation
@@ -248,6 +279,7 @@ impl EngineReactor {
                         requires_repoll = true;
                     } else {
                         let used = try_turn!(self.session.service_cm_software_class(
+                            self.io.core_mut(),
                             class,
                             limit,
                             &mut actions,
@@ -260,10 +292,14 @@ impl EngineReactor {
                     if limit == 0 {
                         requires_repoll = true;
                     } else {
-                        let (_, readiness, would_block) = try_turn!(
-                            self.session
-                                .service_cm_events(mode, cx, limit, &mut actions)
-                        );
+                        let (_, readiness, would_block) =
+                            try_turn!(self.session.service_cm_events(
+                                self.io.core_mut(),
+                                mode,
+                                cx,
+                                limit,
+                                &mut actions,
+                            ));
                         requires_repoll |= readiness == ReadinessRegistration::Incomplete;
                         observed_cm_would_block = would_block;
                     }
@@ -277,6 +313,7 @@ impl EngineReactor {
                         requires_repoll = true;
                     } else {
                         let used = try_turn!(self.session.service_cm_destructions(
+                            self.io.core_mut(),
                             limit,
                             observed_cm_would_block,
                             &mut actions,
@@ -295,6 +332,7 @@ impl EngineReactor {
                     let used = try_turn!(self.session.service_due_deadlines_into(
                         now,
                         limit,
+                        self.io.core_mut(),
                         &mut actions
                     ));
                     requires_repoll |= used == limit && self.session.due_deadline_count(now) != 0;
@@ -332,9 +370,11 @@ impl EngineReactor {
                     if limit == 0 {
                         requires_repoll = true;
                     } else {
-                        let used = self
-                            .session
-                            .service_shutdown_connections(limit, &mut actions);
+                        let used = self.session.service_shutdown_connections(
+                            self.io.core_mut(),
+                            limit,
+                            &mut actions,
+                        );
                         requires_repoll |= used != 0 && self.session.shutdown_work_pending();
                     }
                 }
@@ -348,7 +388,9 @@ impl EngineReactor {
                     if budget == 0 {
                         requires_repoll = true;
                     } else {
-                        let (_, complete) = self.io.service_terminal(budget, &mut actions);
+                        let (_, complete) =
+                            self.io
+                                .service_terminal(budget, &shared.session, &mut actions);
                         requires_repoll |= !complete;
                     }
                 }
@@ -356,6 +398,9 @@ impl EngineReactor {
         }
         self.session
             .finish_turn(shutting_down, terminal_failure, observed_cm_would_block);
+        shared.update_io_diagnostics(self.io.diagnostics());
+        #[cfg(any(test, feature = "test-hooks"))]
+        shared.update_io_rejections(self.io.core().rejected_cqe_reasons());
         // Sources made ready after the entry snapshot are deliberately not
         // appended to this turn, but they must schedule the next external
         // poll. This includes the common CM-event -> listener-work chain.
@@ -394,11 +439,23 @@ impl EngineReactor {
         self.session.release_resources();
     }
 
+    #[cfg(test)]
+    pub(super) fn session_turn_for_test(
+        &mut self,
+        mode: CompletionMode,
+        cx: &mut TaskContext<'_>,
+    ) -> super::Result<super::progress::ProgressReport> {
+        self.session.turn(self.io.core_mut(), mode, cx)
+    }
+
     /// Synchronous fail-closed termination when no later poll can occur.
     pub(super) fn terminate_on_driver_drop(
         &mut self,
         shared: &Arc<EngineShared>,
     ) -> ReactorActions {
-        shared.handle_driver_drop()
+        let actions = shared.handle_driver_drop(self.io.core_mut());
+        #[cfg(not(test))]
+        self.io.retain_unsafe_state();
+        actions
     }
 }

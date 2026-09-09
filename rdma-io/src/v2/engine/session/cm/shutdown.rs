@@ -136,6 +136,10 @@ pub(super) fn snapshot(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "bounded shutdown keeps ownership inputs explicit"
+)]
 pub(super) fn service_class(
     state: &CmState,
     shared: &SessionManager,

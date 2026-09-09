@@ -244,16 +244,17 @@ pub(in crate::v2::engine) fn empty_connection_setup() -> ConnectionSetup {
 pub(in crate::v2::engine) fn run_setup_before_establish(
     setup: ConnectionSetup,
     connection: &RdmaConnection,
+    io_core: &mut super::super::io_core::IoState,
     before_establish: impl FnOnce() -> Result<()>,
     establish: impl FnOnce() -> Result<()>,
 ) -> Result<SetupSummary> {
     let connection_state = connection.require_session_state()?;
-    let accepted_before = connection_state.accepted_count();
-    let (io, events) = super::super::io::BorrowedSetupIo::from_connection(connection)?;
+    let accepted_before = io_core.connection_accepted_count(&connection_state.io);
+    let (io, events) = super::super::io::BorrowedSetupIo::from_connection(connection, io_core)?;
     let summary = SetupSummary {
         posted_wrs: setup(io, events)?,
     };
-    let accepted_after = connection_state.accepted_count();
+    let accepted_after = io_core.connection_accepted_count(&connection_state.io);
     let posted_wrs = accepted_after.checked_sub(accepted_before).ok_or_else(|| {
         Error::InvalidConfig("pre-establishment setup reduced the accepted WR set".into())
     })?;
@@ -413,10 +414,10 @@ impl Drop for ListenWaiter {
         let Some(request) = self.request.upgrade() else {
             return;
         };
-        if let Some(commands) = self.commands.upgrade() {
-            if commands.cancel_listen(&request) {
-                return;
-            }
+        if let Some(commands) = self.commands.upgrade()
+            && commands.cancel_listen(&request)
+        {
+            return;
         }
         if let Some(manager) = self.manager.upgrade() {
             manager.publish_session_work();
@@ -765,17 +766,11 @@ impl ListenerState {
 
     pub(in crate::v2::engine) fn next_action(&self) -> ListenerAction {
         let mut queues = self.lock_queues();
-        if queues
+        if let Some(request) = queues
             .waiters
-            .front()
-            .is_some_and(|request| request.is_cancelled())
+            .pop_front_if(|request| request.is_cancelled())
         {
-            return ListenerAction::CancelledBeforeSelection(
-                queues
-                    .waiters
-                    .pop_front()
-                    .expect("cancelled front waiter exists"),
-            );
+            return ListenerAction::CancelledBeforeSelection(request);
         }
 
         if self.closing.load(Ordering::Acquire) {
@@ -1408,7 +1403,7 @@ mod tests {
 
     #[test]
     fn command_ingress_services_listens_in_fifo_order_one_per_turn() {
-        let (engine, _driver) =
+        let (engine, mut driver) =
             super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
         let first_address = "127.0.0.1:0".parse().unwrap();
         let second_address = "127.0.0.2:0".parse().unwrap();
@@ -1430,13 +1425,19 @@ mod tests {
         assert!(second.as_mut().poll(&mut context).is_pending());
         assert_eq!(engine.shared.commands.pending_listens(), 2);
 
-        engine.shared.commands.service_turn(&engine.shared);
+        engine
+            .shared
+            .commands
+            .service_turn(&engine.shared, driver.reactor.io.core_mut());
         assert_eq!(engine.shared.commands.pending_listens(), 1);
         assert_eq!(
             engine.shared.session.cm.pending_listen_addresses(),
             vec![first_address]
         );
-        engine.shared.commands.service_turn(&engine.shared);
+        engine
+            .shared
+            .commands
+            .service_turn(&engine.shared, driver.reactor.io.core_mut());
         assert_eq!(
             engine.shared.session.cm.pending_listen_addresses(),
             vec![first_address, second_address]

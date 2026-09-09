@@ -122,6 +122,7 @@ pub(super) fn start_listener(
 pub(super) fn service_listener(
     state: &CmState,
     shared: &SessionManager,
+    io_core: &mut crate::v2::engine::io_core::IoState,
     resources: &EngineResources,
     listener: &Arc<ListenerState>,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
@@ -137,7 +138,9 @@ pub(super) fn service_listener(
             reject_child(state, child, reason)?;
         }
         ListenerAction::ProcessSelected { request, child } => {
-            process_selected_pair(state, shared, resources, listener, request, child, actions)?;
+            process_selected_pair(
+                state, shared, io_core, resources, listener, request, child, actions,
+            )?;
         }
         ListenerAction::RejectSelected {
             request,
@@ -150,7 +153,7 @@ pub(super) fn service_listener(
         }
         ListenerAction::CancelAfterAccept { request, route } => {
             let _ = request;
-            cancel_inbound_route(state, shared, route, actions)?;
+            cancel_inbound_route(state, shared, io_core, route, actions)?;
         }
         ListenerAction::FinalizeClose => {
             finalize_listener(state, listener)?;
@@ -237,9 +240,14 @@ pub(super) fn handle_listener_event(
     Ok(EventDisposition::Handled)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "CM transition dependencies stay explicit"
+)]
 fn process_selected_pair(
     state: &CmState,
     shared: &SessionManager,
+    io_core: &mut crate::v2::engine::io_core::IoState,
     resources: &EngineResources,
     listener: &Arc<ListenerState>,
     request: Arc<AcceptRequest>,
@@ -360,13 +368,16 @@ fn process_selected_pair(
         Ok(param) => param,
         Err(error) => {
             drop(verbs);
-            fail_selected_connection(state, shared, &route, request, connection, error, actions)?;
+            fail_selected_connection(
+                state, shared, io_core, &route, request, connection, error, actions,
+            )?;
             return Ok(());
         }
     };
     let establish = run_setup_before_establish(
         setup,
         &connection,
+        io_core,
         || {
             if request.is_cancelled() || listener.is_closing() || shared.shutdown_requested() {
                 Err(if listener.is_closing() {
@@ -382,7 +393,9 @@ fn process_selected_pair(
     );
     if let Err(error) = establish {
         drop(verbs);
-        fail_selected_connection(state, shared, &route, request, connection, error, actions)?;
+        fail_selected_connection(
+            state, shared, io_core, &route, request, connection, error, actions,
+        )?;
         return Ok(());
     }
     drop(verbs);
@@ -393,9 +406,14 @@ fn process_selected_pair(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "CM failure transition dependencies stay explicit"
+)]
 fn fail_selected_connection(
     _state: &CmState,
     shared: &SessionManager,
+    io_core: &mut crate::v2::engine::io_core::IoState,
     route: &Arc<InboundRoute>,
     request: Arc<AcceptRequest>,
     connection: RdmaConnection,
@@ -415,10 +433,10 @@ fn fail_selected_connection(
         selected: true,
         reject: Some(reject),
     });
-    shared.begin_connection_close_into(&connection_state, actions);
+    shared.begin_connection_close_into(&connection_state, io_core, actions);
     drop(connection);
-    if connection_state.accepted_count() == 0 {
-        shared.retire_registered_connection_into(connection_state.token, actions)?;
+    if io_core.connection_accepted_count(&connection_state.io) == 0 {
+        shared.retire_registered_connection_into(io_core, connection_state.token, actions)?;
     }
     Ok(())
 }
@@ -474,6 +492,7 @@ fn reject_child(state: &CmState, child: IncomingChild, reason: InboundRejectReas
 fn cancel_inbound_route(
     state: &CmState,
     shared: &SessionManager,
+    io_core: &mut crate::v2::engine::io_core::IoState,
     encoded: u64,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<()> {
@@ -512,10 +531,14 @@ fn cancel_inbound_route(
                 selected: true,
                 reject: None,
             });
-            shared.begin_connection_close_into(&connection_state, actions);
+            shared.begin_connection_close_into(&connection_state, io_core, actions);
             drop(connection);
-            if connection_state.accepted_count() == 0 {
-                shared.retire_registered_connection_into(connection_state.token, actions)?;
+            if io_core.connection_accepted_count(&connection_state.io) == 0 {
+                shared.retire_registered_connection_into(
+                    io_core,
+                    connection_state.token,
+                    actions,
+                )?;
             }
         }
         InboundState::EstablishedAwaitingDelivery {
@@ -545,9 +568,13 @@ fn cancel_inbound_route(
                 selected: true,
                 reject: None,
             });
-            shared.begin_connection_close_into(&connection_state, actions);
-            if connection_state.accepted_count() == 0 {
-                shared.retire_registered_connection_into(connection_state.token, actions)?;
+            shared.begin_connection_close_into(&connection_state, io_core, actions);
+            if io_core.connection_accepted_count(&connection_state.io) == 0 {
+                shared.retire_registered_connection_into(
+                    io_core,
+                    connection_state.token,
+                    actions,
+                )?;
             }
         }
         _ => unreachable!("inbound cancellation state was pre-filtered"),
@@ -583,12 +610,13 @@ fn finalize_listener(state: &CmState, listener: &Arc<ListenerState>) -> Result<(
 pub(super) fn handle_event(
     state: &CmState,
     shared: &SessionManager,
+    io_core: &mut crate::v2::engine::io_core::IoState,
     route: &Arc<InboundRoute>,
     snapshot: CmEventSnapshot,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<EventDisposition> {
     if is_failure_event(snapshot.event_type) || snapshot.status != 0 {
-        return handle_failure(state, shared, route, snapshot, actions);
+        return handle_failure(state, shared, io_core, route, snapshot, actions);
     }
     match snapshot.event_type {
         CmEventType::Established => {
@@ -623,10 +651,14 @@ pub(super) fn handle_event(
                     selected: true,
                     reject: None,
                 });
-                shared.begin_connection_close_into(&connection_state, actions);
+                shared.begin_connection_close_into(&connection_state, io_core, actions);
                 drop(connection);
-                if connection_state.accepted_count() == 0 {
-                    shared.retire_registered_connection_into(connection_state.token, actions)?;
+                if io_core.connection_accepted_count(&connection_state.io) == 0 {
+                    shared.retire_registered_connection_into(
+                        io_core,
+                        connection_state.token,
+                        actions,
+                    )?;
                 }
                 return Ok(EventDisposition::Handled);
             }
@@ -640,7 +672,7 @@ pub(super) fn handle_event(
             request.complete_success_into(connection, actions);
             Ok(EventDisposition::Handled)
         }
-        CmEventType::Disconnected => handle_disconnected(state, shared, route, actions),
+        CmEventType::Disconnected => handle_disconnected(state, shared, io_core, route, actions),
         CmEventType::TimewaitExit => Ok(EventDisposition::Handled),
         _ => Ok(EventDisposition::Rejected(CmEventReject::Unexpected)),
     }
@@ -649,6 +681,7 @@ pub(super) fn handle_event(
 pub(super) fn handle_disconnected(
     state: &CmState,
     shared: &SessionManager,
+    io_core: &mut crate::v2::engine::io_core::IoState,
     route: &Arc<InboundRoute>,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<EventDisposition> {
@@ -735,9 +768,9 @@ pub(super) fn handle_disconnected(
             state.enqueue_listener_work(&listener);
         }
     }
-    shared.begin_connection_close_into(&connection_state, actions);
-    if connection_state.accepted_count() == 0 {
-        shared.retire_registered_connection_into(connection_state.token, actions)?;
+    shared.begin_connection_close_into(&connection_state, io_core, actions);
+    if io_core.connection_accepted_count(&connection_state.io) == 0 {
+        shared.retire_registered_connection_into(io_core, connection_state.token, actions)?;
     }
     Ok(EventDisposition::Handled)
 }
@@ -745,6 +778,7 @@ pub(super) fn handle_disconnected(
 fn handle_failure(
     state: &CmState,
     shared: &SessionManager,
+    io_core: &mut crate::v2::engine::io_core::IoState,
     route: &Arc<InboundRoute>,
     snapshot: CmEventSnapshot,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
@@ -776,10 +810,14 @@ fn handle_failure(
                 selected: true,
                 reject: None,
             });
-            shared.begin_connection_close_into(&connection_state, actions);
+            shared.begin_connection_close_into(&connection_state, io_core, actions);
             drop(connection);
-            if connection_state.accepted_count() == 0 {
-                shared.retire_registered_connection_into(connection_state.token, actions)?;
+            if io_core.connection_accepted_count(&connection_state.io) == 0 {
+                shared.retire_registered_connection_into(
+                    io_core,
+                    connection_state.token,
+                    actions,
+                )?;
             }
         }
         InboundState::EstablishedAwaitingDelivery {
@@ -818,9 +856,13 @@ fn handle_failure(
                     state.enqueue_listener_work(&listener);
                 }
             }
-            shared.begin_connection_close_into(&connection_state, actions);
-            if connection_state.accepted_count() == 0 {
-                shared.retire_registered_connection_into(connection_state.token, actions)?;
+            shared.begin_connection_close_into(&connection_state, io_core, actions);
+            if io_core.connection_accepted_count(&connection_state.io) == 0 {
+                shared.retire_registered_connection_into(
+                    io_core,
+                    connection_state.token,
+                    actions,
+                )?;
             }
         }
         InboundState::Established { connection } => {
@@ -841,9 +883,13 @@ fn handle_failure(
                 selected: false,
                 reject: None,
             });
-            shared.begin_connection_close_into(&connection_state, actions);
-            if connection_state.accepted_count() == 0 {
-                shared.retire_registered_connection_into(connection_state.token, actions)?;
+            shared.begin_connection_close_into(&connection_state, io_core, actions);
+            if io_core.connection_accepted_count(&connection_state.io) == 0 {
+                shared.retire_registered_connection_into(
+                    io_core,
+                    connection_state.token,
+                    actions,
+                )?;
             }
         }
         route_state @ InboundState::Closing { .. } => {

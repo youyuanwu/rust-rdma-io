@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::v2::engine::io::PendingIoEvent;
-use crate::v2::engine::io_core::OperationState;
+use crate::v2::engine::io_core::OperationObserver;
 
 /// The exact maximum number of user-visible publication leaves produced by
 /// one external engine-driver poll.
@@ -72,13 +72,12 @@ impl ReactorActions {
         self.events.push_back(Box::new(move || event.deliver()));
     }
 
-    pub(in crate::v2::engine) fn push_operation_wake(&mut self, operation: Arc<OperationState>) {
+    pub(in crate::v2::engine) fn push_operation_wake(&mut self, observer: Arc<OperationObserver>) {
         assert!(
             self.can_accept(1),
             "reactor operation wake exceeded turn budget"
         );
-        self.operations
-            .push_back(Box::new(move || operation.wake()));
+        self.operations.push_back(Box::new(move || observer.wake()));
     }
 
     pub(in crate::v2::engine) fn push_operation(&mut self, action: impl FnOnce() + Send + 'static) {

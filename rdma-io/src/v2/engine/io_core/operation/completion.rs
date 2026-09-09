@@ -48,17 +48,13 @@
 //! `pub(super)` finishing methods, which are the narrowest visibility that can
 //! span the operation subtree.
 
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
-
-#[cfg(any(test, feature = "test-hooks"))]
-use crate::v2::engine::registry::lock_unpoison;
 use crate::v2::engine::registry::{ConnectionToken, LiveIoConnectionProof, Lookup, OperationToken};
 use crate::wc::WorkCompletion;
+use std::sync::Arc;
 
-use super::super::{EstablishedIoConnection, EstablishedIoIdentity, IoCore};
+use super::super::{EstablishedIoConnection, EstablishedIoIdentity, IoState};
 use super::effects::{AfterEngineUnlock, IoCoreEffects, OperationQuarantineEffect};
-use super::state::{CompletionDisposition, OperationState};
+use super::state::CompletionDisposition;
 
 /// Counted reason an exact CQE was refused before it could move ownership.
 ///
@@ -87,7 +83,8 @@ pub(in crate::v2::engine) enum CqeReject {
 /// session owner holds it as an inferred temporary between the two steps.
 pub(in crate::v2::engine) struct PendingCompletion {
     completion: WorkCompletion,
-    operation: Arc<OperationState>,
+    token: OperationToken,
+    identity: EstablishedIoIdentity,
 }
 
 impl PendingCompletion {
@@ -96,20 +93,20 @@ impl PendingCompletion {
     /// This is the connection and QP the caller must look up and prove live
     /// before the completion may be queued.
     pub(in crate::v2::engine) fn identity(&self) -> EstablishedIoIdentity {
-        self.operation.connection().identity()
+        self.identity
     }
 }
 
-impl IoCore {
+impl IoState {
     /// Counts one refused CQE under test or `test-hooks` builds.
     ///
     /// Production builds keep no rejection history; the reason is consumed so
     /// the diagnostic path adds no production accounting.
-    pub(in crate::v2::engine) fn reject_cqe(&self, reason: CqeReject) {
+    pub(in crate::v2::engine) fn reject_cqe(&mut self, reason: CqeReject) {
         #[cfg(any(test, feature = "test-hooks"))]
         {
-            self.rejected_cqes.fetch_add(1, Ordering::Relaxed);
-            lock_unpoison(&self.rejected_cqe_reasons).push(reason);
+            self.rejected_cqes += 1;
+            self.rejected_cqe_reasons.push(reason);
         }
         #[cfg(not(any(test, feature = "test-hooks")))]
         let _ = reason;
@@ -121,7 +118,7 @@ impl IoCore {
     /// retired, or unknown token is rejected here; the QP, connection, and
     /// opcode proofs still belong to [`Self::enqueue_prepared_completion`].
     pub(in crate::v2::engine) fn prepare_completion(
-        &self,
+        &mut self,
         completion: WorkCompletion,
     ) -> Option<PendingCompletion> {
         let token = OperationToken::decode(completion.wr_id());
@@ -146,7 +143,8 @@ impl IoCore {
         };
         Some(PendingCompletion {
             completion,
-            operation,
+            token,
+            identity: operation.connection_identity(),
         })
     }
 
@@ -160,12 +158,12 @@ impl IoCore {
     /// CQE for the operation is refused instead of being dispatched twice.
     /// Returns the connection to make ready, or `None` if the CQE was rejected.
     pub(in crate::v2::engine) fn enqueue_prepared_completion(
-        &self,
+        &mut self,
         pending: PendingCompletion,
         live: Option<LiveIoConnectionProof>,
         connection: &Arc<EstablishedIoConnection>,
     ) -> Option<ConnectionToken> {
-        let identity = pending.operation.connection().identity();
+        let identity = pending.identity;
         if pending.completion.qp_num() != identity.qp_num {
             self.reject_cqe(CqeReject::WrongQpNum);
             return None;
@@ -177,16 +175,39 @@ impl IoCore {
             return None;
         }
         if pending.completion.is_success()
-            && pending.completion.opcode() != pending.operation.expected_opcode()
+            && pending.completion.opcode()
+                != match self.operations.lookup(pending.token) {
+                    Lookup::Occupied(operation) => operation.expected_opcode(),
+                    Lookup::Duplicate => {
+                        self.reject_cqe(CqeReject::Duplicate);
+                        return None;
+                    }
+                    Lookup::Stale => {
+                        self.reject_cqe(CqeReject::StaleOperation);
+                        return None;
+                    }
+                    Lookup::Retired => {
+                        self.reject_cqe(CqeReject::RetiredOperation);
+                        return None;
+                    }
+                    Lookup::Unknown => {
+                        self.reject_cqe(CqeReject::Unknown);
+                        return None;
+                    }
+                }
         {
             self.reject_cqe(CqeReject::UnexpectedOpcode);
             return None;
         }
-        if !pending.operation.mark_completion_queued() {
+        let queued = match self.operations.lookup_mut(pending.token) {
+            Lookup::Occupied(operation) => operation.mark_completion_queued(),
+            _ => false,
+        };
+        if !queued {
             self.reject_cqe(CqeReject::Duplicate);
             return None;
         }
-        connection.enqueue_completion(pending.completion);
+        self.enqueue_completion(connection, pending.completion);
         Some(identity.connection)
     }
 
@@ -196,20 +217,24 @@ impl IoCore {
     /// processed plus whether work remains so the scheduler can requeue the
     /// connection instead of rescanning it.
     pub(in crate::v2::engine) fn dispatch_connection_completions(
-        &self,
+        &mut self,
         connection: &EstablishedIoConnection,
         quantum: usize,
     ) -> (usize, bool, IoCoreEffects) {
         let mut processed = 0;
         let mut effects = IoCoreEffects::default();
         while processed < quantum {
-            let Some(completion) = connection.pop_completion() else {
+            let Some(completion) = self.pop_completion(connection) else {
                 break;
             };
             effects.extend(self.dispatch_connection_completion(completion));
             processed += 1;
         }
-        (processed, connection.has_completion_work(), effects)
+        (
+            processed,
+            self.has_connection_completion_work(connection),
+            effects,
+        )
     }
 
     /// Re-resolves one dequeued completion and routes it to its operation.
@@ -218,9 +243,9 @@ impl IoCore {
     /// released between queueing and dispatch. `Deferred` means the operation
     /// is not finished yet (a batch still owes completions), `Complete` hands
     /// off to the single release path, and `Duplicate` is refused.
-    fn dispatch_queued_completion(&self, completion: WorkCompletion) -> IoCoreEffects {
+    fn dispatch_queued_completion(&mut self, completion: WorkCompletion) -> IoCoreEffects {
         let token = OperationToken::decode(completion.wr_id());
-        let operation = match self.operations.lookup(token) {
+        let operation = match self.operations.lookup_mut(token) {
             Lookup::Occupied(operation) => operation,
             Lookup::Duplicate => {
                 self.reject_cqe(CqeReject::Duplicate);
@@ -241,7 +266,7 @@ impl IoCore {
         };
         match operation.record_completion(completion) {
             CompletionDisposition::Deferred => IoCoreEffects::default(),
-            CompletionDisposition::Complete => self.finish_operation(operation, completion),
+            CompletionDisposition::Complete => self.finish_operation(token, completion),
             CompletionDisposition::Duplicate => {
                 self.reject_cqe(CqeReject::Duplicate);
                 IoCoreEffects::default()
@@ -262,47 +287,57 @@ impl IoCore {
     /// reclamation paths all resolve exact CQEs through it; that is the
     /// narrowest visibility Rust can express for sibling access.
     pub(super) fn finish_operation(
-        &self,
-        operation: Arc<OperationState>,
+        &mut self,
+        token: OperationToken,
         completion: WorkCompletion,
     ) -> IoCoreEffects {
-        if self.operations.release(operation.token(), true).is_none() {
+        self.finish_operation_with_drained(token, completion, true)
+    }
+
+    fn finish_operation_with_drained(
+        &mut self,
+        token: OperationToken,
+        completion: WorkCompletion,
+        emit_drained: bool,
+    ) -> IoCoreEffects {
+        let Some(mut operation) = self.operations.release(token, true) else {
             self.reject_cqe(CqeReject::Duplicate);
             return IoCoreEffects::default();
-        }
-        let removed = operation.connection().remove_accepted(operation.token());
-        operation.connection().release_local(operation.direction());
+        };
+        let identity = operation.connection_identity();
+        let removed = self.remove_operation_accepted(identity, operation.token());
+        self.release_operation_local(identity, operation.direction());
         self.cq_credits.release();
-        let previous = self.accepted_operations.fetch_sub(1, Ordering::AcqRel);
+        let previous = self.accepted_operations;
         debug_assert!(previous > 0, "accepted operation count must be positive");
+        self.accepted_operations = self.accepted_operations.saturating_sub(1);
         self.publish_io_if_drained(previous);
         let finished = operation.finish_completion(completion);
         if finished.was_reclaiming {
-            self.pending_reclamations.fetch_sub(1, Ordering::AcqRel);
+            self.pending_reclamations = self.pending_reclamations.saturating_sub(1);
         }
         let mut effects = IoCoreEffects::default();
         if removed {
-            effects.push_close_wake(operation.connection().drain_notify());
+            effects.push_close_wake(operation.drain_notify());
         }
         if let Some(event) = finished.event {
             effects.push_event(event);
         }
-        effects.push_operation_wake(Arc::clone(&operation));
+        if let Some(observer) = finished.observer {
+            effects.push_operation_wake(observer);
+        }
         if finished.was_quarantined {
             self.cq_credits.release_retained();
-            self.quarantined_operations.fetch_sub(1, Ordering::AcqRel);
-            self.quarantined_mrs.fetch_sub(1, Ordering::AcqRel);
-            self.quarantined_bytes
-                .fetch_sub(operation.mr_len(), Ordering::AcqRel);
-            effects.push_quarantine(OperationQuarantineEffect::Cleared {
-                operation: operation.token(),
-                connection: operation.connection_token(),
-            });
+            self.quarantined_operations = self.quarantined_operations.saturating_sub(1);
+            self.quarantined_mrs = self.quarantined_mrs.saturating_sub(1);
+            self.quarantined_bytes = self.quarantined_bytes.saturating_sub(operation.mr_len());
+            if self.clear_operation_quarantine(operation.token(), operation.connection_token()) {
+                effects.push_quarantine(OperationQuarantineEffect::Cleared(
+                    operation.connection_token(),
+                ));
+            }
         }
-        if removed
-            && !operation.connection().is_posting_open()
-            && operation.connection().accepted_count() == 0
-        {
+        if emit_drained && removed && self.operation_connection_accepted_count(identity) == 0 {
             effects.push_drained(operation.connection_token());
         }
         effects
@@ -314,19 +349,23 @@ impl IoCore {
     /// post-unlock work so the submission paths publish only after their
     /// admission and posting guards are dropped.
     pub(super) fn finish_early_completion(
-        &self,
-        operation: Arc<OperationState>,
+        &mut self,
+        token: OperationToken,
         completion: WorkCompletion,
     ) -> AfterEngineUnlock {
-        self.finish_operation(operation, completion)
+        // Posting and all backend mutation run on the sole reactor thread.
+        // A connection cannot enter close concurrently with this early-CQE
+        // reconciliation, so accepted-zero is not a close-drain transition.
+        self.finish_operation_with_drained(token, completion, false)
             .into_after_unlock()
     }
 
-    fn dispatch_connection_completion(&self, completion: WorkCompletion) -> IoCoreEffects {
+    fn dispatch_connection_completion(&mut self, completion: WorkCompletion) -> IoCoreEffects {
         // CQ routing and terminal publication share the admission barrier.
         // The guard covers one completion and drops before the caller applies
         // session effects or publishes events and operation wakes.
-        let _admission = self.admission();
+        let admission = Arc::clone(&self.admission);
+        let _admission = crate::v2::engine::registry::read_unpoison(&admission);
         self.dispatch_queued_completion(completion)
     }
 
@@ -336,18 +375,18 @@ impl IoCore {
     /// queue reports no remaining work directly instead of re-reading the
     /// connection's readiness.
     fn dispatch_queued_completions(
-        &self,
+        &mut self,
         connection: &EstablishedIoConnection,
         budget: usize,
     ) -> (bool, IoCoreEffects) {
         let mut effects = IoCoreEffects::default();
         for _ in 0..budget {
-            let Some(completion) = connection.pop_completion() else {
+            let Some(completion) = self.pop_completion(connection) else {
                 return (false, effects);
             };
             effects.extend(self.dispatch_connection_completion(completion));
         }
-        (connection.has_completion_work(), effects)
+        (self.has_connection_completion_work(connection), effects)
     }
 
     /// Routes the completions already queued when the QP was destroyed.
@@ -356,7 +395,7 @@ impl IoCore {
     /// connection before queueing, so it is dispatched normally under the
     /// configured dispatch budget rather than discarded.
     pub(in crate::v2::engine) fn reject_queued_completions_after_qp_destroy(
-        &self,
+        &mut self,
         connection: &EstablishedIoConnection,
         action_limited_budget: usize,
     ) -> (bool, IoCoreEffects) {

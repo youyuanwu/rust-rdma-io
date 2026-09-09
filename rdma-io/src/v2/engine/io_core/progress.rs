@@ -1,14 +1,19 @@
 //! Bounded CQ, completion-dispatch, and operation-reclamation progress.
 
 use std::collections::{HashSet, VecDeque};
+#[cfg(any(test, feature = "test-hooks"))]
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 
 use tokio::time::Instant;
 
 #[cfg(test)]
+use super::IoCore;
+#[cfg(test)]
 use super::IoDeadlineRequest;
-use super::{IoCore, IoSessionBridge};
+#[cfg(test)]
+use super::IoSessionBridge;
+use super::IoState;
 use crate::v2::Completion;
 use crate::v2::completion::CqReadiness;
 use crate::v2::engine::config::CompletionMode;
@@ -22,7 +27,8 @@ use crate::v2::error::{Error, Result};
 
 /// I/O-owned progress state. It has no concrete dependency on session state.
 pub(in crate::v2::engine) struct IoReactorSources {
-    core: Arc<IoCore>,
+    core: Option<IoState>,
+    #[cfg(test)]
     bridge: Arc<dyn IoSessionBridge>,
     resources: Option<IoProgressResources>,
     cq_readiness: CqReadiness,
@@ -42,8 +48,8 @@ pub(in crate::v2::engine) struct IoReactorSources {
 
 impl IoReactorSources {
     pub(in crate::v2::engine) fn new(
-        core: Arc<IoCore>,
-        bridge: Arc<dyn IoSessionBridge>,
+        core: IoState,
+        #[cfg(test)] bridge: Arc<dyn IoSessionBridge>,
         resources: Option<IoProgressResources>,
         cq_budget: usize,
         completion_dispatch_budget: usize,
@@ -53,7 +59,8 @@ impl IoReactorSources {
         >,
     ) -> Self {
         Self {
-            core,
+            core: Some(core),
+            #[cfg(test)]
             bridge,
             resources,
             cq_readiness: CqReadiness::default(),
@@ -82,15 +89,16 @@ impl IoReactorSources {
         {
             self.turns = self.turns.saturating_add(1);
         }
-        if let Some(outcome) = self.core.terminal_failure() {
+        if let Some(outcome) = self.core().terminal_failure() {
             let budget = self
                 .cq_buffer
                 .len()
                 .saturating_add(self.completion_dispatch_budget)
                 .saturating_add(self.reclamation_budget);
-            let (effects, next, complete, scanned) =
-                self.core
-                    .terminalize_operations_bounded(&outcome, self.terminal_cursor, budget);
+            let cursor = self.terminal_cursor;
+            let (effects, next, complete, scanned) = self
+                .core_mut()
+                .terminalize_operations_bounded(&outcome, cursor, budget);
             self.terminal_cursor = next;
             self.terminal_complete = complete;
             self.bridge.commit_terminal_effects(effects);
@@ -100,11 +108,11 @@ impl IoReactorSources {
                 ReadinessRegistration::NotRequired,
             ));
         }
-        let (cq_units, readiness, cq_repoll) = self.service_cq(mode, cx)?;
+        let (cq_units, readiness, cq_repoll) = self.service_cq_for_test(mode, cx)?;
         let (reclamation_units, reclamation_ready) = self.service_reclamation_for_test()?;
-        let mut actions = crate::v2::engine::reactor::ReactorActions::default();
+        let actions = crate::v2::engine::reactor::ReactorActions::default();
         let (dispatch_units, dispatch_ready) =
-            self.service_completion_dispatch(self.completion_dispatch_budget, &mut actions)?;
+            self.service_completion_dispatch_for_test(self.completion_dispatch_budget)?;
         actions.publish();
         let units_consumed = cq_units
             .saturating_add(reclamation_units)
@@ -121,27 +129,68 @@ impl IoReactorSources {
         {
             self.turns = self.turns.saturating_add(1);
         }
-        if self.core.terminal_failure().is_some() {
+
+        if self.core().terminal_failure().is_some() {
             return Ok(true);
         }
         Ok(false)
     }
 
+    pub(in crate::v2::engine) fn sync_lifecycle(
+        &mut self,
+        admission_error: Option<Error>,
+        terminal: Option<crate::v2::engine::lifecycle::MemoizedTerminalResult>,
+    ) {
+        if admission_error.is_some() {
+            self.core_mut().close_admission(admission_error);
+        }
+        if let Some(outcome) = terminal {
+            self.core_mut().begin_terminal_failure(outcome);
+        }
+    }
+
+    pub(in crate::v2::engine) fn diagnostics(&self) -> super::IoCoreDiagnostics {
+        self.core().diagnostics()
+    }
+
+    #[cfg(not(test))]
+    pub(in crate::v2::engine) fn retain_unsafe_state(&mut self) {
+        let Some(state) = self.core.take() else {
+            return;
+        };
+        if state.accepted_count() == 0 && state.diagnostics().quarantined_operations == 0 {
+            return;
+        }
+        Self::failed_io_quarantine()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(state);
+    }
+
     pub(in crate::v2::engine) fn service_terminal(
         &mut self,
         budget: usize,
+        session: &crate::v2::engine::session::SessionManager,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> (usize, bool) {
-        let Some(outcome) = self.core.terminal_failure() else {
+        let Some(outcome) = self.core().terminal_failure() else {
             return (0, true);
         };
-        let (effects, next, complete, scanned) =
-            self.core
-                .terminalize_operations_bounded(&outcome, self.terminal_cursor, budget);
+        let cursor = self.terminal_cursor;
+        let (effects, next, complete, scanned) = self
+            .core_mut()
+            .terminalize_operations_bounded(&outcome, cursor, budget);
         self.terminal_cursor = next;
         self.terminal_complete = complete;
-        self.bridge.commit_terminal_effects_into(effects, actions);
+        session.commit_io_effects_into(effects, actions);
         (scanned, complete)
+    }
+
+    #[cfg(not(test))]
+    fn failed_io_quarantine() -> &'static std::sync::Mutex<Vec<IoState>> {
+        static STATES: std::sync::OnceLock<std::sync::Mutex<Vec<IoState>>> =
+            std::sync::OnceLock::new();
+        STATES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
     }
 
     pub(in crate::v2::engine) fn cq_budget(&self) -> usize {
@@ -157,7 +206,7 @@ impl IoReactorSources {
     }
 
     pub(in crate::v2::engine) fn reclamation_request_count(&self) -> usize {
-        self.core.reclamation_request_count()
+        self.core().reclamation_request_count()
     }
 
     pub(in crate::v2::engine) fn due_deadline_count(&self, now: Instant) -> usize {
@@ -178,7 +227,7 @@ impl IoReactorSources {
     pub(in crate::v2::engine) fn completion_source_count(&self) -> usize {
         self.completion_connections
             .len()
-            .saturating_add(self.core.published_connection_count())
+            .saturating_add(self.core().published_connection_count())
     }
 
     pub(in crate::v2::engine) fn release_resources(&mut self) {
@@ -193,10 +242,10 @@ impl IoReactorSources {
     }
 
     pub(in crate::v2::engine) fn can_finish(&self) -> bool {
-        if self.core.terminal_failure().is_some() {
+        if self.core().terminal_failure().is_some() {
             return self.terminal_complete;
         }
-        self.core.shutdown_requested() && self.core.accepted_count() == 0
+        self.core().shutdown_requested() && self.core().accepted_count() == 0
     }
 
     #[cfg(test)]
@@ -205,7 +254,7 @@ impl IoReactorSources {
     }
 
     pub(in crate::v2::engine) fn prepare_completion_dispatch_snapshot(&mut self) -> usize {
-        if let Some(connection) = self.core.take_published_connection() {
+        if let Some(connection) = self.core_mut().take_published_connection() {
             self.enqueue_connection(connection);
         }
         self.completion_connections.len()
@@ -221,8 +270,16 @@ impl IoReactorSources {
         self.turns
     }
 
-    fn bridge(&self) -> Arc<dyn IoSessionBridge> {
-        Arc::clone(&self.bridge)
+    pub(in crate::v2::engine) fn core(&self) -> &IoState {
+        self.core
+            .as_ref()
+            .expect("driver-owned I/O state is available while polling")
+    }
+
+    pub(in crate::v2::engine) fn core_mut(&mut self) -> &mut IoState {
+        self.core
+            .as_mut()
+            .expect("driver-owned I/O state is available while polling")
     }
 
     fn enqueue_connection(&mut self, connection: ConnectionToken) {
@@ -231,12 +288,15 @@ impl IoReactorSources {
 
     pub(in crate::v2::engine) fn service_cq(
         &mut self,
+        session: &crate::v2::engine::session::SessionManager,
         mode: CompletionMode,
         cx: &mut TaskContext<'_>,
     ) -> Result<(usize, ReadinessRegistration, bool)> {
         #[cfg(any(test, feature = "test-hooks"))]
         if let Some(completion) = self.test_driver.take_released_connection_cqe() {
-            if let Some(connection) = self.bridge.route_completion(completion) {
+            if let Some(connection) =
+                session.enqueue_completion_with_core(self.core_mut(), completion)
+            {
                 self.enqueue_connection(connection);
             }
             return Ok((1, ReadinessRegistration::Incomplete, true));
@@ -289,7 +349,6 @@ impl IoReactorSources {
         if count == 0 {
             return Ok((0, readiness, false));
         }
-        let bridge = self.bridge();
         let completions = self.cq_buffer[..count].to_vec();
         for completion in completions {
             let completion = completion.into_raw();
@@ -297,7 +356,9 @@ impl IoReactorSources {
             if self.test_driver.suppress_connection_cqe(completion) {
                 continue;
             }
-            if let Some(connection) = bridge.route_completion(completion) {
+            if let Some(connection) =
+                session.enqueue_completion_with_core(self.core_mut(), completion)
+            {
                 self.enqueue_connection(connection);
             }
             #[cfg(any(test, feature = "test-hooks"))]
@@ -309,22 +370,35 @@ impl IoReactorSources {
     }
 
     #[cfg(test)]
+    fn service_cq_for_test(
+        &mut self,
+        _mode: CompletionMode,
+        _cx: &mut TaskContext<'_>,
+    ) -> Result<(usize, ReadinessRegistration, bool)> {
+        if let Some(completion) = self.test_driver.take_released_connection_cqe() {
+            let bridge = Arc::clone(&self.bridge);
+            if let Some(connection) = bridge.route_completion(self.core_mut(), completion) {
+                self.enqueue_connection(connection);
+            }
+            return Ok((1, ReadinessRegistration::Incomplete, true));
+        }
+        Ok((0, ReadinessRegistration::NotRequired, false))
+    }
+
+    #[cfg(test)]
     fn service_reclamation_for_test(&mut self) -> Result<(usize, bool)> {
         let now = Instant::now();
         let request_limit = self
             .reclamation_request_count()
             .min(self.reclamation_budget);
         let requests = self.service_reclamation_requests(request_limit)?;
-        let mut actions = crate::v2::engine::reactor::ReactorActions::default();
-        let deadlines = self.service_reclamation_deadlines(
-            now,
-            self.reclamation_budget - requests,
-            &mut actions,
-        );
+        let actions = crate::v2::engine::reactor::ReactorActions::default();
+        let deadlines =
+            self.service_reclamation_deadlines_for_test(now, self.reclamation_budget - requests);
         actions.publish();
         Ok((
             requests + deadlines,
-            self.core.has_reclamation_requests()
+            self.core().has_reclamation_requests()
                 || self.deadlines.next().is_some_and(|at| at <= now),
         ))
     }
@@ -334,7 +408,7 @@ impl IoReactorSources {
         limit: usize,
     ) -> Result<usize> {
         let mut consumed = 0;
-        for request in self.core.take_reclamation_requests(limit) {
+        for request in self.core_mut().take_reclamation_requests(limit) {
             self.deadlines
                 .push(request.at, request.token)
                 .map_err(|_| {
@@ -349,15 +423,30 @@ impl IoReactorSources {
         &mut self,
         _now: Instant,
         limit: usize,
+        session: &crate::v2::engine::session::SessionManager,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> usize {
-        let bridge = self.bridge();
         let mut consumed = 0;
         while consumed < limit {
             let Some(token) = self.ready_deadlines.pop_front() else {
                 break;
             };
-            bridge.handle_reclamation_deadline_into(token, actions);
+            let effects = self.core_mut().handle_reclamation_deadline(token);
+            session.commit_io_effects_into(effects, actions);
+            consumed += 1;
+        }
+        consumed
+    }
+
+    #[cfg(test)]
+    fn service_reclamation_deadlines_for_test(&mut self, _now: Instant, limit: usize) -> usize {
+        let mut consumed = 0;
+        while consumed < limit {
+            let Some(token) = self.ready_deadlines.pop_front() else {
+                break;
+            };
+            let bridge = Arc::clone(&self.bridge);
+            bridge.handle_reclamation_deadline(self.core_mut(), token);
             consumed += 1;
         }
         consumed
@@ -366,20 +455,41 @@ impl IoReactorSources {
     pub(in crate::v2::engine) fn service_completion_dispatch(
         &mut self,
         quantum: usize,
+        session: &crate::v2::engine::session::SessionManager,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Result<(usize, bool)> {
         let Some(connection) = self.completion_connections.pop() else {
-            return Ok((0, self.core.has_published_connections()));
+            return Ok((0, self.core().has_published_connections()));
         };
-        let (processed, remains_ready) = self
-            .bridge
-            .dispatch_connection_completions_into(connection, quantum, actions);
+        let (processed, remains_ready) = session.dispatch_connection_completions_with_core(
+            self.core_mut(),
+            connection,
+            quantum,
+            actions,
+        );
         if remains_ready {
             self.enqueue_connection(connection);
         }
         Ok((
             processed,
-            self.completion_connections.len() > 0 || self.core.has_published_connections(),
+            self.completion_connections.len() > 0 || self.core().has_published_connections(),
+        ))
+    }
+
+    #[cfg(test)]
+    fn service_completion_dispatch_for_test(&mut self, quantum: usize) -> Result<(usize, bool)> {
+        let Some(connection) = self.completion_connections.pop() else {
+            return Ok((0, self.core().has_published_connections()));
+        };
+        let bridge = Arc::clone(&self.bridge);
+        let (processed, remains_ready) =
+            bridge.dispatch_connection_completions(self.core_mut(), connection, quantum);
+        if remains_ready {
+            self.enqueue_connection(connection);
+        }
+        Ok((
+            processed,
+            self.completion_connections.len() > 0 || self.core().has_published_connections(),
         ))
     }
 
@@ -476,6 +586,7 @@ mod tests {
     impl IoSessionBridge for RecordingBridge {
         fn route_completion(
             &self,
+            _io: &mut IoState,
             _completion: crate::wc::WorkCompletion,
         ) -> Option<ConnectionToken> {
             None
@@ -483,6 +594,7 @@ mod tests {
 
         fn dispatch_connection_completions(
             &self,
+            _io: &mut IoState,
             connection: ConnectionToken,
             quantum: usize,
         ) -> (usize, bool) {
@@ -494,18 +606,16 @@ mod tests {
             )
         }
 
-        fn handle_reclamation_deadline(&self, token: OperationToken) {
+        fn handle_reclamation_deadline(&self, _io: &mut IoState, token: OperationToken) {
             lock_unpoison(&self.reclaimed).push(token);
         }
 
         fn commit_terminal_effects(&self, _effects: super::super::IoCoreEffects) {}
     }
 
-    fn progress(
-        reclamation_budget: usize,
-    ) -> (IoReactorSources, Arc<IoCore>, Arc<RecordingBridge>) {
+    fn progress(reclamation_budget: usize) -> (IoReactorSources, Arc<RecordingBridge>) {
         let signal: Arc<dyn IoDriverSignal> = Arc::new(NoopSignal);
-        let (core, _) = IoCore::new(
+        let core = IoCore::new_owned(
             16,
             16,
             Duration::from_secs(1),
@@ -517,7 +627,7 @@ mod tests {
         let bridge = Arc::new(RecordingBridge::default());
         let bridge_dyn: Arc<dyn IoSessionBridge> = bridge.clone();
         let progress = IoReactorSources::new(
-            Arc::clone(&core),
+            core,
             bridge_dyn,
             None,
             4,
@@ -525,15 +635,12 @@ mod tests {
             reclamation_budget,
             Arc::new(TestDriverState::new()),
         );
-        (progress, core, bridge)
+        (progress, bridge)
     }
 
     fn service_due(progress: &mut IoReactorSources, now: Instant, limit: usize) -> usize {
-        let mut actions = crate::v2::engine::reactor::ReactorActions::default();
         progress.prepare_due_deadline_snapshot(now);
-        let consumed = progress.service_reclamation_deadlines(now, limit, &mut actions);
-        actions.publish();
-        consumed
+        progress.service_reclamation_deadlines_for_test(now, limit)
     }
 
     fn connection(slot: u32) -> ConnectionToken {
@@ -559,7 +666,7 @@ mod tests {
 
     #[test]
     fn operation_future_outlives_progress_without_retaining_session_bridge() {
-        let (progress, core, bridge) = progress(1);
+        let (mut progress, bridge) = progress(1);
         let bridge_weak = Arc::downgrade(&bridge);
         let connection = EstablishedIoConnection::new(
             EstablishedIoIdentity {
@@ -571,7 +678,7 @@ mod tests {
             1,
             Arc::new(tokio::sync::Notify::new()),
         );
-        let operation = operation_future_for_io_lifetime_test(&core, &connection);
+        let operation = operation_future_for_io_lifetime_test(progress.core_mut(), &connection);
 
         drop(connection);
         drop(bridge);
@@ -601,12 +708,15 @@ mod tests {
 
     #[test]
     fn deadline_sequence_exhaustion_maps_to_io_configuration_error() {
-        let (mut progress, core, _bridge) = progress(1);
+        let (mut progress, _bridge) = progress(1);
         progress.deadlines.exhaust_sequence_for_test();
-        lock_unpoison(&core.reclamation_requests).push_back(IoDeadlineRequest {
-            at: Instant::now(),
-            token: OperationToken::decode(1),
-        });
+        progress
+            .core_mut()
+            .reclamation_requests
+            .push_back(IoDeadlineRequest {
+                at: Instant::now(),
+                token: OperationToken::decode(1),
+            });
         let waker = futures_util::task::noop_waker();
         let mut cx = TaskContext::from_waker(&waker);
 
@@ -620,7 +730,7 @@ mod tests {
 
     #[test]
     fn owner_turn_bounds_one_connection_and_reports_remaining_work() {
-        let (mut progress, _core, bridge) = progress(1);
+        let (mut progress, bridge) = progress(1);
         progress.enqueue_connection(connection(1));
         progress.enqueue_connection(connection(2));
         let waker = futures_util::task::noop_waker();
@@ -640,9 +750,9 @@ mod tests {
 
     #[test]
     fn reclamation_sources_are_independently_bounded() {
-        let (mut progress, core, bridge) = progress(1);
+        let (mut progress, bridge) = progress(1);
         let now = Instant::now();
-        lock_unpoison(&core.reclamation_requests).extend([
+        progress.core_mut().reclamation_requests.extend([
             IoDeadlineRequest {
                 at: now,
                 token: OperationToken::decode(1),
@@ -664,12 +774,15 @@ mod tests {
 
     #[test]
     fn split_reclamation_sources_preserve_the_aggregate_budget() {
-        let (mut progress, core, _bridge) = progress(2);
+        let (mut progress, _bridge) = progress(2);
         let now = Instant::now();
-        lock_unpoison(&core.reclamation_requests).push_back(IoDeadlineRequest {
-            at: now,
-            token: OperationToken::decode(1),
-        });
+        progress
+            .core_mut()
+            .reclamation_requests
+            .push_back(IoDeadlineRequest {
+                at: now,
+                token: OperationToken::decode(1),
+            });
         let requests = progress.service_reclamation_requests(1).unwrap();
         let deadlines = service_due(&mut progress, now, 1);
         assert_eq!(requests + deadlines, 2);
@@ -677,11 +790,11 @@ mod tests {
 
     #[test]
     fn sustained_io_sources_alternate_and_leave_bounded_work_for_next_turn() {
-        let (mut progress, core, bridge) = progress(4);
+        let (mut progress, bridge) = progress(4);
         let now = Instant::now();
         progress.schedule_deadline_for_test(now, OperationToken::decode(10));
         progress.schedule_deadline_for_test(now, OperationToken::decode(11));
-        lock_unpoison(&core.reclamation_requests).extend([
+        progress.core_mut().reclamation_requests.extend([
             IoDeadlineRequest {
                 at: now,
                 token: OperationToken::decode(1),
@@ -702,7 +815,7 @@ mod tests {
 
     #[test]
     fn empty_io_inbox_transfers_entire_budget_to_due_deadlines() {
-        let (mut progress, _core, bridge) = progress(3);
+        let (mut progress, bridge) = progress(3);
         let now = Instant::now();
         for token in 1..=3 {
             progress.schedule_deadline_for_test(now, OperationToken::decode(token));

@@ -72,6 +72,7 @@ pub(super) fn acquire_event(
 pub(super) fn try_process_event(
     state: &CmState,
     shared: &SessionManager,
+    io_core: &mut crate::v2::engine::io_core::IoState,
     resources: &EngineResources,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<bool> {
@@ -83,13 +84,14 @@ pub(super) fn try_process_event(
         };
         pending
     };
-    process_event(state, shared, resources, pending, actions)?;
+    process_event(state, shared, io_core, resources, pending, actions)?;
     Ok(true)
 }
 
 fn process_event(
     state: &CmState,
     shared: &SessionManager,
+    io_core: &mut crate::v2::engine::io_core::IoState,
     resources: &EngineResources,
     pending: PendingCmEvent,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
@@ -111,10 +113,10 @@ fn process_event(
     };
     let disposition = match route {
         CmDispatchRoute::Outbound(route) => {
-            state.handle_event(shared, resources, &route, snapshot, actions)?
+            state.handle_event(shared, io_core, resources, &route, snapshot, actions)?
         }
         CmDispatchRoute::Inbound(route) => {
-            state.handle_inbound_event(shared, &route, snapshot, actions)?
+            state.handle_inbound_event(shared, io_core, &route, snapshot, actions)?
         }
         CmDispatchRoute::Listener(listener) => {
             if snapshot.event_type == CmEventType::ConnectRequest {

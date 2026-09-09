@@ -435,14 +435,9 @@ fn destroy_with_accepted_work_fails_closed_without_destroying() {
         None,
         None,
     );
-    connection.add_accepted(OperationToken {
-        slot: 2,
-        generation: 1,
-    });
-
     let lifecycle = connection.lock_lifecycle();
     let authority = SessionLifecycleAuthority::for_test();
-    let error = match connection.destroy_connection_resources(&authority, &lifecycle) {
+    let error = match connection.destroy_connection_resources(&authority, &lifecycle, 1) {
         Ok(_) => panic!("accepted work must prevent connection destruction"),
         Err(error) => error,
     };

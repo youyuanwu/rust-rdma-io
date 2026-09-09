@@ -1,15 +1,11 @@
 //! Coupled per-operation state and its owned lifecycle transitions.
 //!
-//! `OperationInner` bundles lifecycle, completion ownership, output, MR,
-//! detachment, reclamation, and event destination under a single mutex because
-//! those fields must move together. Neither the inner bundle nor its guard
-//! leaves this module: every transition is a method here that returns an owned
-//! record (`FinishState`, `UnacceptedRelease`, `TerminalizeState`,
-//! `QuarantineTransition`) for the caller to act on after the lock is released.
+//! The backend record is stored by value in the reactor-owned registry. Every
+//! transition therefore requires exclusive access to the record; only the
+//! resource-free frontend observer remains shared.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::Waker;
+use std::task::{Context, Poll, Waker};
 
 use futures_util::task::AtomicWaker;
 
@@ -21,28 +17,96 @@ use crate::v2::mr::Mr;
 use crate::v2::op::Completion;
 use crate::wc::{WcOpcode, WorkCompletion};
 
-use super::super::{Direction, EstablishedIoConnection, IoCore};
+use super::super::{Direction, EstablishedIoConnection};
+
+/// Resource-free scalar-operation observer shared with the frontend.
+///
+/// Provider-facing state and MR ownership stay in the reactor-owned operation
+/// record. The observer carries only cancellation, a take-once result, and a
+/// waker, so dropping or polling a frontend cannot mutate the backend.
+pub(in crate::v2::engine) struct OperationObserver {
+    result: Mutex<ObserverResult>,
+    waker: AtomicWaker,
+    cancelled: std::sync::atomic::AtomicBool,
+}
+
+enum ObserverResult {
+    Pending,
+    Ready(Option<(Result<Completion>, Option<Mr>)>),
+    Taken,
+}
+
+impl OperationObserver {
+    pub(super) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            result: Mutex::new(ObserverResult::Pending),
+            waker: AtomicWaker::new(),
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    pub(super) fn register(&self, waker: &Waker) {
+        self.waker.register(waker);
+    }
+
+    pub(super) fn poll(&self, cx: &mut Context<'_>) -> Poll<(Result<Completion>, Option<Mr>)> {
+        let mut result = lock_unpoison(&self.result);
+        match &mut *result {
+            ObserverResult::Pending => {
+                self.waker.register(cx.waker());
+                Poll::Pending
+            }
+            ObserverResult::Ready(output) => {
+                let output = output
+                    .take()
+                    .unwrap_or_else(|| (Err(Error::DriverShutdown), None));
+                *result = ObserverResult::Taken;
+                Poll::Ready(output)
+            }
+            ObserverResult::Taken => Poll::Ready((Err(Error::DriverShutdown), None)),
+        }
+    }
+
+    pub(super) fn complete(&self, output: (Result<Completion>, Option<Mr>)) {
+        let mut result = lock_unpoison(&self.result);
+        if matches!(*result, ObserverResult::Pending) {
+            *result = ObserverResult::Ready(Some(output));
+        }
+    }
+
+    pub(super) fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        let mut result = lock_unpoison(&self.result);
+        if let ObserverResult::Ready(output) = &mut *result {
+            drop(output.take());
+            *result = ObserverResult::Taken;
+        }
+    }
+
+    pub(super) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(in crate::v2::engine) fn wake(&self) {
+        self.waker.wake();
+    }
+}
 
 pub(in crate::v2::engine) struct OperationState {
     token: OperationToken,
-    connection: Arc<EstablishedIoConnection>,
+    identity: super::super::EstablishedIoIdentity,
+    drain_notify: Arc<tokio::sync::Notify>,
     direction: Direction,
     expected_opcode: WcOpcode,
     mr_len: usize,
-    inner: Mutex<OperationInner>,
-    waker: AtomicWaker,
-    cancelled: AtomicBool,
-    quarantined: AtomicBool,
-}
-
-struct OperationInner {
     lifecycle: OperationLifecycle,
     mr: Option<Mr>,
     completion: CompletionOwnership,
-    output: Option<(Result<Completion>, Option<Mr>)>,
-    detached: bool,
+    observer: Option<Arc<OperationObserver>>,
     reclamation_pending: bool,
     event_destination: Option<IoEventDestination>,
+    quarantined: bool,
 }
 
 enum CompletionOwnership {
@@ -87,11 +151,15 @@ impl OperationState {
     }
 
     pub(super) fn connection_token(&self) -> ConnectionToken {
-        self.connection.identity().connection
+        self.identity.connection
     }
 
-    pub(super) fn connection(&self) -> &EstablishedIoConnection {
-        &self.connection
+    pub(super) fn connection_identity(&self) -> super::super::EstablishedIoIdentity {
+        self.identity
+    }
+
+    pub(super) fn drain_notify(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.drain_notify)
     }
 
     pub(super) fn direction(&self) -> Direction {
@@ -107,10 +175,14 @@ impl OperationState {
     }
 
     /// Registers the waker woken by post-unlock operation wakes.
+    #[cfg(test)]
     pub(super) fn register_waker(&self, waker: &Waker) {
-        self.waker.register(waker);
+        if let Some(observer) = self.observer.as_ref() {
+            observer.register(waker);
+        }
     }
 
+    #[cfg(test)]
     pub(super) fn new(
         token: OperationToken,
         connection: impl IntoEstablishedIoConnection,
@@ -119,7 +191,7 @@ impl OperationState {
         mr: Option<Mr>,
         mr_len: usize,
     ) -> Self {
-        Self::new_with_event(
+        Self::new_with_observer(
             token,
             connection,
             direction,
@@ -127,6 +199,7 @@ impl OperationState {
             mr,
             mr_len,
             None,
+            Some(OperationObserver::new()),
         )
     }
 
@@ -139,83 +212,134 @@ impl OperationState {
         mr_len: usize,
         event_destination: Option<IoEventDestination>,
     ) -> Self {
-        let detached = event_destination.is_some();
-        let connection = connection.into_established_io();
-        Self {
+        Self::new_with_observer(
             token,
             connection,
             direction,
             expected_opcode,
+            mr,
             mr_len,
-            inner: Mutex::new(OperationInner {
-                lifecycle: OperationLifecycle::Posting,
-                mr,
-                completion: CompletionOwnership::None,
-                output: None,
-                detached,
-                reclamation_pending: false,
-                event_destination,
-            }),
-            waker: AtomicWaker::new(),
-            cancelled: AtomicBool::new(false),
-            quarantined: AtomicBool::new(false),
+            event_destination,
+            None,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "backend ownership is constructed atomically"
+    )]
+    fn new_with_observer(
+        token: OperationToken,
+        connection: impl IntoEstablishedIoConnection,
+        direction: Direction,
+        expected_opcode: WcOpcode,
+        mr: Option<Mr>,
+        mr_len: usize,
+        event_destination: Option<IoEventDestination>,
+        observer: Option<Arc<OperationObserver>>,
+    ) -> Self {
+        let connection = connection.into_established_io();
+        Self {
+            token,
+            identity: connection.identity(),
+            drain_notify: connection.drain_notify(),
+            direction,
+            expected_opcode,
+            mr_len,
+            lifecycle: OperationLifecycle::Posting,
+            mr,
+            completion: CompletionOwnership::None,
+            observer,
+            reclamation_pending: false,
+            event_destination,
+            quarantined: false,
         }
     }
 
-    pub(super) fn commit_accepted(&self) -> Option<WorkCompletion> {
-        let mut inner = lock_unpoison(&self.inner);
-        self.connection.add_accepted(self.token);
-        let accepted_lifecycle = if inner.detached {
+    pub(super) fn new_scalar(
+        token: OperationToken,
+        connection: impl IntoEstablishedIoConnection,
+        direction: Direction,
+        expected_opcode: WcOpcode,
+        mr: Option<Mr>,
+        mr_len: usize,
+        observer: Arc<OperationObserver>,
+    ) -> Self {
+        Self::new_with_observer(
+            token,
+            connection,
+            direction,
+            expected_opcode,
+            mr,
+            mr_len,
+            None,
+            Some(observer),
+        )
+    }
+
+    pub(super) fn commit_accepted(&mut self) -> CommitAccepted {
+        let accepted_lifecycle = if self
+            .observer
+            .as_ref()
+            .is_some_and(|observer| observer.is_cancelled())
+        {
+            self.reclamation_pending = true;
             OperationLifecycle::Cancelled
         } else {
             OperationLifecycle::InFlight
         };
-        match std::mem::replace(&mut inner.completion, CompletionOwnership::None) {
+        let early = match std::mem::replace(&mut self.completion, CompletionOwnership::None) {
             CompletionOwnership::None => {
-                inner.lifecycle = accepted_lifecycle;
+                self.lifecycle = accepted_lifecycle;
                 None
             }
             CompletionOwnership::Queued => {
-                inner.completion = CompletionOwnership::Queued;
-                inner.lifecycle = accepted_lifecycle;
+                self.completion = CompletionOwnership::Queued;
+                self.lifecycle = accepted_lifecycle;
                 None
             }
             CompletionOwnership::Early(completion) => {
-                inner.lifecycle = OperationLifecycle::Completing;
+                self.lifecycle = OperationLifecycle::Completing;
                 Some(completion)
             }
+        };
+        CommitAccepted {
+            early,
+            cancellation_needs_reclamation: accepted_lifecycle == OperationLifecycle::Cancelled
+                && self.reclamation_pending,
         }
     }
 
-    pub(super) fn mark_completion_queued(&self) -> bool {
-        let mut inner = lock_unpoison(&self.inner);
+    pub(super) fn mark_completion_queued(&mut self) -> bool {
         if matches!(
-            inner.lifecycle,
+            self.lifecycle,
             OperationLifecycle::Completing | OperationLifecycle::Released
-        ) || !matches!(inner.completion, CompletionOwnership::None)
+        ) || !matches!(self.completion, CompletionOwnership::None)
         {
             return false;
         }
-        inner.completion = CompletionOwnership::Queued;
+        self.completion = CompletionOwnership::Queued;
         true
     }
 
-    pub(super) fn record_completion(&self, completion: WorkCompletion) -> CompletionDisposition {
-        let mut inner = lock_unpoison(&self.inner);
-        if !matches!(inner.completion, CompletionOwnership::Queued) {
+    pub(super) fn record_completion(
+        &mut self,
+        completion: WorkCompletion,
+    ) -> CompletionDisposition {
+        if !matches!(self.completion, CompletionOwnership::Queued) {
             return CompletionDisposition::Duplicate;
         }
-        inner.completion = CompletionOwnership::None;
-        match inner.lifecycle {
+        self.completion = CompletionOwnership::None;
+        match self.lifecycle {
             OperationLifecycle::Posting => {
-                inner.completion = CompletionOwnership::Early(completion);
+                self.completion = CompletionOwnership::Early(completion);
                 CompletionDisposition::Deferred
             }
             OperationLifecycle::InFlight
             | OperationLifecycle::Cancelled
             | OperationLifecycle::Reclaiming
             | OperationLifecycle::Quarantined => {
-                inner.lifecycle = OperationLifecycle::Completing;
+                self.lifecycle = OperationLifecycle::Completing;
                 CompletionDisposition::Complete
             }
             OperationLifecycle::Completing | OperationLifecycle::Released => {
@@ -224,59 +348,46 @@ impl OperationState {
         }
     }
 
-    pub(super) fn cancel(&self, shared: &IoCore) -> bool {
-        if self.cancelled.swap(true, Ordering::AcqRel) {
-            return false;
-        }
-        let mut inner = lock_unpoison(&self.inner);
-        let mut completed_output = None;
-        let cancelled = match inner.lifecycle {
+    pub(in crate::v2::engine::io_core) fn cancel_backend(&mut self) -> bool {
+        match self.lifecycle {
             OperationLifecycle::InFlight => {
-                inner.lifecycle = OperationLifecycle::Cancelled;
-                inner.detached = true;
-                shared.pending_reclamations.fetch_add(1, Ordering::AcqRel);
-                inner.reclamation_pending = true;
+                self.lifecycle = OperationLifecycle::Cancelled;
+                self.observer.take();
+                self.reclamation_pending = true;
                 true
             }
             OperationLifecycle::Released => {
-                inner.detached = true;
-                completed_output = inner.output.take();
+                self.observer.take();
                 false
             }
             OperationLifecycle::Posting => {
-                inner.detached = true;
-                shared.pending_reclamations.fetch_add(1, Ordering::AcqRel);
-                inner.reclamation_pending = true;
+                self.observer.take();
+                self.reclamation_pending = true;
                 true
             }
             OperationLifecycle::Cancelled
             | OperationLifecycle::Reclaiming
             | OperationLifecycle::Quarantined
             | OperationLifecycle::Completing => false,
-        };
-        drop(inner);
-        drop(completed_output);
-        cancelled
-    }
-
-    pub(super) fn mark_reclaiming(&self) {
-        let mut inner = lock_unpoison(&self.inner);
-        if inner.lifecycle == OperationLifecycle::Cancelled {
-            inner.lifecycle = OperationLifecycle::Reclaiming;
         }
     }
 
-    pub(super) fn mark_quarantined(&self) -> QuarantineTransition {
-        let mut inner = lock_unpoison(&self.inner);
-        let was_reclaiming = inner.reclamation_pending;
-        match inner.lifecycle {
+    pub(super) fn mark_reclaiming(&mut self) {
+        if self.lifecycle == OperationLifecycle::Cancelled {
+            self.lifecycle = OperationLifecycle::Reclaiming;
+        }
+    }
+
+    pub(super) fn mark_quarantined(&mut self) -> QuarantineTransition {
+        let was_reclaiming = self.reclamation_pending;
+        match self.lifecycle {
             OperationLifecycle::InFlight
             | OperationLifecycle::Cancelled
             | OperationLifecycle::Reclaiming => {
-                inner.lifecycle = OperationLifecycle::Quarantined;
-                inner.reclamation_pending = false;
+                self.lifecycle = OperationLifecycle::Quarantined;
+                self.reclamation_pending = false;
                 QuarantineTransition {
-                    newly_quarantined: !self.quarantined.swap(true, Ordering::AcqRel),
+                    newly_quarantined: !std::mem::replace(&mut self.quarantined, true),
                     was_reclaiming,
                 }
             }
@@ -287,34 +398,34 @@ impl OperationState {
         }
     }
 
-    pub(super) fn fail_observer_for_close(&self, error: Error) -> bool {
-        let mut inner = lock_unpoison(&self.inner);
-        if !inner.detached
-            && inner.output.is_none()
+    pub(super) fn fail_observer_for_close(
+        &mut self,
+        error: Error,
+    ) -> Option<Arc<OperationObserver>> {
+        if self.observer.is_some()
             && matches!(
-                inner.lifecycle,
+                self.lifecycle,
                 OperationLifecycle::InFlight
                     | OperationLifecycle::Cancelled
                     | OperationLifecycle::Reclaiming
                     | OperationLifecycle::Quarantined
             )
         {
-            inner.detached = true;
-            inner.output = Some((Err(error), None));
-            return true;
+            let observer = self.observer.take().expect("checked scalar observer");
+            observer.complete((Err(error), None));
+            return Some(observer);
         }
-        false
+        None
     }
 
-    pub(super) fn finish_completion(&self, completion: WorkCompletion) -> FinishState {
-        let mut inner = lock_unpoison(&self.inner);
-        let was_reclaiming = inner.reclamation_pending;
-        inner.reclamation_pending = false;
-        let was_quarantined = self.quarantined.swap(false, Ordering::AcqRel);
-        let mut mr = inner.mr.take();
+    pub(super) fn finish_completion(&mut self, completion: WorkCompletion) -> FinishState {
+        let was_reclaiming = self.reclamation_pending;
+        self.reclamation_pending = false;
+        let was_quarantined = std::mem::replace(&mut self.quarantined, false);
+        let mut mr = self.mr.take();
         let typed = Completion::from_raw(completion);
         let result = typed.result().map(|()| typed);
-        let event = inner.event_destination.take().map(|destination| {
+        let event = self.event_destination.take().map(|destination| {
             let event_mr = mr.take();
             destination.complete(
                 IoOperationIdentity::from_token(self.token),
@@ -322,33 +433,36 @@ impl OperationState {
                 event_mr,
             )
         });
+        let observer = self.observer.take();
         let detached_mr = if event.is_some() {
             None
-        } else if inner.detached || inner.output.is_some() {
-            mr
+        } else if let Some(observer) = observer.as_ref() {
+            if observer.is_cancelled() {
+                mr
+            } else {
+                observer.complete((result, mr));
+                None
+            }
         } else {
-            inner.output = Some((result, mr));
-            None
+            mr
         };
-        inner.lifecycle = OperationLifecycle::Released;
-        drop(inner);
+        self.lifecycle = OperationLifecycle::Released;
         drop(detached_mr);
         FinishState {
             was_reclaiming,
             was_quarantined,
             event,
-            should_wake: true,
+            observer,
         }
     }
 
-    pub(super) fn finish_after_qp_destroy(&self, error: Error) -> FinishState {
-        let mut inner = lock_unpoison(&self.inner);
-        let was_reclaiming = inner.reclamation_pending;
-        inner.reclamation_pending = false;
-        let was_quarantined = self.quarantined.swap(false, Ordering::AcqRel);
-        let mut mr = inner.mr.take();
-        let should_wake = inner.event_destination.is_none() && !inner.detached;
-        let event = inner.event_destination.take().map(|destination| {
+    pub(super) fn finish_after_qp_destroy(&mut self, error: Error) -> FinishState {
+        let was_reclaiming = self.reclamation_pending;
+        self.reclamation_pending = false;
+        let was_quarantined = std::mem::replace(&mut self.quarantined, false);
+        let mut mr = self.mr.take();
+        let observer = self.observer.take();
+        let event = self.event_destination.take().map(|destination| {
             let event_mr = mr.take();
             destination.complete(
                 IoOperationIdentity::from_token(self.token),
@@ -356,80 +470,47 @@ impl OperationState {
                 event_mr,
             )
         });
-        if event.is_none() && !inner.detached && inner.output.is_none() {
-            inner.output = Some((Err(error), None));
+        if event.is_none()
+            && let Some(observer) = observer.as_ref()
+            && !observer.is_cancelled()
+        {
+            observer.complete((Err(error), None));
         }
-        inner.lifecycle = OperationLifecycle::Released;
-        drop(inner);
+        self.lifecycle = OperationLifecycle::Released;
         drop(mr);
         FinishState {
             was_reclaiming,
             was_quarantined,
             event,
-            should_wake,
+            observer,
         }
     }
 
     pub(super) fn qp_destroy_publication_leaves(&self) -> usize {
-        let inner = lock_unpoison(&self.inner);
-        1 + usize::from(inner.event_destination.is_some() || !inner.detached)
+        1 + usize::from(self.event_destination.is_some() || self.observer.is_some())
     }
 
-    pub(super) fn take_mr(&self) -> Option<Mr> {
-        lock_unpoison(&self.inner).mr.take()
+    pub(super) fn take_mr(&mut self) -> Option<Mr> {
+        self.mr.take()
     }
 
-    pub(super) fn take_unaccepted(&self, error: Error) -> Option<UnacceptedRelease> {
-        let mut inner = lock_unpoison(&self.inner);
-        if !Self::can_release_unaccepted(&inner) {
+    pub(super) fn take_unaccepted(&mut self, error: Error) -> Option<UnacceptedRelease> {
+        if !self.can_release_unaccepted() {
             return None;
         }
-        Some(self.take_unaccepted_locked(&mut inner, error))
+        Some(self.take_unaccepted_owned(error))
     }
 
-    /// Releases a proven-unaccepted batch as one all-or-none transaction.
-    ///
-    /// Locks every state in `states` before inspecting any of them, and takes
-    /// ownership only when the whole slice is still unaccepted (`Posting` with
-    /// no owned CQE). Returns `None` with nothing mutated when any member has
-    /// acquired a completion, so the caller can retain the batch instead.
-    pub(super) fn take_proven_unaccepted_batch(
-        states: &[Arc<Self>],
-        error: Error,
-    ) -> Option<Vec<UnacceptedRelease>> {
-        let mut inners = states
-            .iter()
-            .map(|state| lock_unpoison(&state.inner))
-            .collect::<Vec<_>>();
-        if inners
-            .iter()
-            .any(|inner| !Self::can_release_unaccepted(inner))
-        {
-            return None;
-        }
-        Some(
-            states
-                .iter()
-                .zip(inners.iter_mut())
-                .map(|(state, inner)| state.take_unaccepted_locked(inner, error.clone()))
-                .collect(),
-        )
+    pub(super) fn can_release_unaccepted(&self) -> bool {
+        self.lifecycle == OperationLifecycle::Posting
+            && matches!(self.completion, CompletionOwnership::None)
     }
 
-    fn can_release_unaccepted(inner: &OperationInner) -> bool {
-        inner.lifecycle == OperationLifecycle::Posting
-            && matches!(inner.completion, CompletionOwnership::None)
-    }
-
-    fn take_unaccepted_locked(
-        &self,
-        inner: &mut OperationInner,
-        error: Error,
-    ) -> UnacceptedRelease {
-        debug_assert!(Self::can_release_unaccepted(inner));
-        inner.lifecycle = OperationLifecycle::Released;
-        let mut mr = inner.mr.take();
-        let event = inner.event_destination.take().map(|destination| {
+    fn take_unaccepted_owned(&mut self, error: Error) -> UnacceptedRelease {
+        debug_assert!(self.can_release_unaccepted());
+        self.lifecycle = OperationLifecycle::Released;
+        let mut mr = self.mr.take();
+        let event = self.event_destination.take().map(|destination| {
             destination.unaccepted(
                 Some(IoOperationIdentity::from_token(self.token)),
                 error,
@@ -439,43 +520,28 @@ impl OperationState {
         UnacceptedRelease { event, mr }
     }
 
-    #[cfg(test)]
-    pub(super) fn can_release_unaccepted_for_test(&self) -> bool {
-        let inner = lock_unpoison(&self.inner);
-        Self::can_release_unaccepted(&inner)
-    }
-
-    #[cfg(test)]
-    pub(super) fn completion_ownership_for_test(&self) -> &'static str {
-        match lock_unpoison(&self.inner).completion {
-            CompletionOwnership::None => "none",
-            CompletionOwnership::Queued => "queued",
-            CompletionOwnership::Early(_) => "early",
+    pub(super) fn detach_with_post_error(&mut self) -> bool {
+        self.observer.take();
+        self.lifecycle = OperationLifecycle::Cancelled;
+        if self.reclamation_pending {
+            false
+        } else {
+            self.reclamation_pending = true;
+            true
         }
     }
 
-    pub(super) fn take_output(&self) -> Option<(Result<Completion>, Option<Mr>)> {
-        lock_unpoison(&self.inner).output.take()
-    }
-
-    pub(super) fn detach_with_post_error(&self, shared: &IoCore) {
-        let mut inner = lock_unpoison(&self.inner);
-        inner.detached = true;
-        inner.lifecycle = OperationLifecycle::Cancelled;
-        shared.pending_reclamations.fetch_add(1, Ordering::AcqRel);
-        inner.reclamation_pending = true;
-        self.cancelled.store(true, Ordering::Release);
-    }
-
-    pub(super) fn finalize_terminal(&self, outcome: &MemoizedTerminalResult) -> TerminalizeState {
-        let mut inner = lock_unpoison(&self.inner);
-        let was_reclaiming = inner.reclamation_pending;
-        let newly_quarantined = match inner.lifecycle {
+    pub(super) fn finalize_terminal(
+        &mut self,
+        outcome: &MemoizedTerminalResult,
+    ) -> TerminalizeState {
+        let was_reclaiming = self.reclamation_pending;
+        let newly_quarantined = match self.lifecycle {
             OperationLifecycle::InFlight
             | OperationLifecycle::Cancelled
             | OperationLifecycle::Reclaiming => {
-                inner.lifecycle = OperationLifecycle::Quarantined;
-                !self.quarantined.swap(true, Ordering::AcqRel)
+                self.lifecycle = OperationLifecycle::Quarantined;
+                !std::mem::replace(&mut self.quarantined, true)
             }
             OperationLifecycle::Quarantined => false,
             OperationLifecycle::Posting
@@ -484,30 +550,38 @@ impl OperationState {
                 return TerminalizeState {
                     was_reclaiming: false,
                     newly_quarantined: false,
-                    should_wake: false,
+                    observer: None,
                 };
             }
         };
-        inner.reclamation_pending = false;
-        if !inner.detached && inner.output.is_none() {
-            let error = outcome.error().unwrap_or(Error::DriverShutdown);
-            inner.output = Some((Err(error), None));
-        }
-        drop(inner);
+        self.reclamation_pending = false;
+        let observer = self.observer.take().filter(|observer| {
+            if observer.is_cancelled() {
+                false
+            } else {
+                let error = outcome.error().unwrap_or(Error::DriverShutdown);
+                observer.complete((Err(error), None));
+                true
+            }
+        });
         TerminalizeState {
             was_reclaiming,
             newly_quarantined,
-            should_wake: true,
+            observer,
         }
-    }
-
-    pub(in crate::v2::engine) fn wake(&self) {
-        self.waker.wake();
     }
 
     #[cfg(test)]
     pub(super) fn lifecycle(&self) -> OperationLifecycle {
-        lock_unpoison(&self.inner).lifecycle
+        self.lifecycle
+    }
+
+    #[cfg(test)]
+    pub(super) fn observer_for_test(&self) -> Arc<OperationObserver> {
+        self.observer
+            .as_ref()
+            .cloned()
+            .expect("test scalar operation retains its observer")
     }
 }
 
@@ -515,6 +589,11 @@ pub(super) enum CompletionDisposition {
     Deferred,
     Complete,
     Duplicate,
+}
+
+pub(super) struct CommitAccepted {
+    pub(super) early: Option<WorkCompletion>,
+    pub(super) cancellation_needs_reclamation: bool,
 }
 
 /// Post-unlock ownership taken from an operation that never reached the provider.
@@ -527,7 +606,7 @@ pub(super) struct FinishState {
     pub(super) was_reclaiming: bool,
     pub(super) was_quarantined: bool,
     pub(super) event: Option<PendingIoEvent>,
-    pub(super) should_wake: bool,
+    pub(super) observer: Option<Arc<OperationObserver>>,
 }
 
 pub(super) struct QuarantineTransition {
@@ -538,5 +617,5 @@ pub(super) struct QuarantineTransition {
 pub(super) struct TerminalizeState {
     pub(super) was_reclaiming: bool,
     pub(super) newly_quarantined: bool,
-    pub(super) should_wake: bool,
+    pub(super) observer: Option<Arc<OperationObserver>>,
 }

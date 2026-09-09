@@ -343,6 +343,7 @@ impl CmState {
     pub(in crate::v2::engine) fn service_software_class_into(
         &self,
         shared: &SessionManager,
+        io_core: &mut crate::v2::engine::io_core::IoState,
         resources: Option<&EngineResources>,
         class: CmSoftwareClass,
         budget: usize,
@@ -354,7 +355,7 @@ impl CmState {
                 CmSoftwareClass::Cancellation => {
                     let request = { lock_unpoison(&self.cancellations).pop_front() };
                     if let Some(request) = request {
-                        self.process_cancellation(shared, request, actions)?;
+                        self.process_cancellation(shared, io_core, request, actions)?;
                         processed += 1;
                     } else {
                         break;
@@ -363,7 +364,7 @@ impl CmState {
                 CmSoftwareClass::Retirement => {
                     let token = { lock_unpoison(&self.retirements).pop_front() };
                     if let Some(token) = token {
-                        shared.retire_registered_connection_into(token, actions)?;
+                        shared.retire_registered_connection_into(io_core, token, actions)?;
                         processed += 1;
                     } else {
                         break;
@@ -412,7 +413,7 @@ impl CmState {
                     let listener = { lock_unpoison(&self.listener_work).pop_front() };
                     if let Some(listener) = listener {
                         listener.begin_work();
-                        self.service_listener(shared, resources, &listener, actions)?;
+                        self.service_listener(shared, io_core, resources, &listener, actions)?;
                         if listener.has_work() {
                             self.enqueue_listener_work(&listener);
                         }
@@ -442,6 +443,7 @@ impl CmState {
     pub(in crate::v2::engine) fn service_software(
         &self,
         shared: &SessionManager,
+        io_core: &mut crate::v2::engine::io_core::IoState,
         resources: Option<&EngineResources>,
         budget: usize,
     ) -> Result<usize> {
@@ -454,6 +456,7 @@ impl CmState {
             }
             processed += self.service_software_class_into(
                 shared,
+                io_core,
                 resources,
                 class,
                 snapshot.count(class).min(budget - processed),
@@ -467,10 +470,11 @@ impl CmState {
     pub(in crate::v2::engine) fn try_process_event(
         &self,
         shared: &SessionManager,
+        io_core: &mut crate::v2::engine::io_core::IoState,
         resources: &EngineResources,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Result<bool> {
-        event::try_process_event(self, shared, resources, actions)
+        event::try_process_event(self, shared, io_core, resources, actions)
     }
 
     #[cfg(test)]
@@ -495,6 +499,10 @@ impl CmState {
         shutdown::snapshot(self, terminalize_listeners, cursor, budget)
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "bounded shutdown keeps ownership inputs explicit"
+    )]
     pub(in crate::v2::engine) fn service_bounded_shutdown_class(
         &self,
         shared: &SessionManager,
@@ -593,23 +601,27 @@ impl CmState {
     pub(in crate::v2::engine) fn service_cm_destructions_into(
         &self,
         shared: &SessionManager,
+        io_core: &mut crate::v2::engine::io_core::IoState,
         budget: usize,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
         defer_one_event: impl FnMut() -> Result<bool>,
     ) -> Result<usize> {
-        retirement::service_cm_destructions(self, shared, budget, actions, defer_one_event)
+        retirement::service_cm_destructions(self, shared, io_core, budget, actions, defer_one_event)
     }
 
     #[cfg(test)]
     pub(in crate::v2::engine) fn service_cm_destructions(
         &self,
         shared: &SessionManager,
+        io_core: &mut crate::v2::engine::io_core::IoState,
         budget: usize,
         mut try_process_event: impl FnMut() -> Result<bool>,
     ) -> Result<usize> {
         let mut actions = crate::v2::engine::reactor::ReactorActions::default();
         let result =
-            self.service_cm_destructions_into(shared, budget, &mut actions, || try_process_event());
+            self.service_cm_destructions_into(shared, io_core, budget, &mut actions, || {
+                try_process_event()
+            });
         actions.publish();
         result
     }
@@ -640,11 +652,12 @@ impl CmState {
     fn service_listener(
         &self,
         shared: &SessionManager,
+        io_core: &mut crate::v2::engine::io_core::IoState,
         resources: &EngineResources,
         listener: &Arc<ListenerState>,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Result<()> {
-        inbound::service_listener(self, shared, resources, listener, actions)
+        inbound::service_listener(self, shared, io_core, resources, listener, actions)
     }
 
     fn handle_connect_request(
@@ -687,10 +700,11 @@ impl CmState {
     fn process_cancellation(
         &self,
         shared: &SessionManager,
+        io_core: &mut crate::v2::engine::io_core::IoState,
         request: Arc<OutboundRequest>,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Result<()> {
-        outbound::process_cancellation(self, shared, request, actions)
+        outbound::process_cancellation(self, shared, io_core, request, actions)
     }
 
     fn release_failed_install(
@@ -734,32 +748,35 @@ impl CmState {
     fn handle_event(
         &self,
         shared: &SessionManager,
+        io_core: &mut crate::v2::engine::io_core::IoState,
         resources: &EngineResources,
         route: &Arc<OutboundRoute>,
         snapshot: CmEventSnapshot,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Result<EventDisposition> {
-        outbound::handle_event(self, shared, resources, route, snapshot, actions)
+        outbound::handle_event(self, shared, io_core, resources, route, snapshot, actions)
     }
 
     fn handle_inbound_event(
         &self,
         shared: &SessionManager,
+        io_core: &mut crate::v2::engine::io_core::IoState,
         route: &Arc<InboundRoute>,
         snapshot: CmEventSnapshot,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Result<EventDisposition> {
-        inbound::handle_event(self, shared, route, snapshot, actions)
+        inbound::handle_event(self, shared, io_core, route, snapshot, actions)
     }
 
     #[cfg(test)]
     fn handle_inbound_disconnected(
         &self,
         shared: &SessionManager,
+        io_core: &mut crate::v2::engine::io_core::IoState,
         route: &Arc<InboundRoute>,
     ) -> Result<EventDisposition> {
         let mut actions = crate::v2::engine::reactor::ReactorActions::default();
-        let result = inbound::handle_disconnected(self, shared, route, &mut actions);
+        let result = inbound::handle_disconnected(self, shared, io_core, route, &mut actions);
         actions.publish();
         result
     }
@@ -969,13 +986,14 @@ impl SessionManager {
 
     pub(in crate::v2::engine) fn service_cm_software_class(
         &self,
+        io_core: &mut crate::v2::engine::io_core::IoState,
         resources: Option<&EngineResources>,
         class: CmSoftwareClass,
         budget: usize,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Result<usize> {
         self.cm
-            .service_software_class_into(self, resources, class, budget, actions)
+            .service_software_class_into(self, io_core, resources, class, budget, actions)
     }
 
     pub(in crate::v2::engine) fn cm_software_snapshot(&self) -> CmSoftwareSnapshot {
@@ -984,10 +1002,11 @@ impl SessionManager {
 
     pub(in crate::v2::engine) fn try_process_cm_event(
         &self,
+        io_core: &mut crate::v2::engine::io_core::IoState,
         resources: &EngineResources,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Result<bool> {
-        self.cm.try_process_event(self, resources, actions)
+        self.cm.try_process_event(self, io_core, resources, actions)
     }
 
     pub(in crate::v2::engine) fn has_pending_cm_event(&self) -> bool {
@@ -996,20 +1015,26 @@ impl SessionManager {
 
     pub(in crate::v2::engine) fn service_deferred_cm_destructions(
         &self,
+        io_core: &mut crate::v2::engine::io_core::IoState,
         budget: usize,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
         defer_one_event: impl FnMut() -> Result<bool>,
     ) -> Result<usize> {
         self.cm
-            .service_cm_destructions_into(self, budget, actions, defer_one_event)
+            .service_cm_destructions_into(self, io_core, budget, actions, defer_one_event)
     }
 
     pub(in crate::v2::engine) fn retire_registered_connection_into(
         &self,
+        io_core: &mut crate::v2::engine::io_core::IoState,
         token: ConnectionToken,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Result<()> {
-        retirement::retire_registered_connection_into(self, token, actions)
+        retirement::retire_registered_connection_into(self, io_core, token, actions)?;
+        if !matches!(self.connections.lookup(token), Lookup::Occupied(_)) {
+            io_core.retire_connection_io(token);
+        }
+        Ok(())
     }
 }
 

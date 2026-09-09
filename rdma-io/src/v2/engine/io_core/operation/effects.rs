@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use crate::v2::engine::io::PendingIoEvent;
 use crate::v2::engine::reactor::ReactorActions;
-use crate::v2::engine::registry::{ConnectionToken, OperationToken};
+use crate::v2::engine::registry::ConnectionToken;
 use crate::v2::engine::session::IoEffectsCommitAuthority;
 
-use super::state::OperationState;
+use super::state::OperationObserver;
 
 /// Detached publication produced after provider submission and ownership
 /// reconciliation.
@@ -19,7 +19,7 @@ use super::state::OperationState;
 #[derive(Default)]
 pub(super) struct AfterEngineUnlock {
     events: Vec<PendingIoEvent>,
-    operations: Vec<Arc<OperationState>>,
+    operations: Vec<Arc<OperationObserver>>,
     closes: Vec<Arc<tokio::sync::Notify>>,
 }
 
@@ -36,8 +36,8 @@ impl AfterEngineUnlock {
         self.events.push(event);
     }
 
-    pub(super) fn push_operation_wake(&mut self, operation: Arc<OperationState>) {
-        self.operations.push(operation);
+    pub(super) fn push_operation_wake(&mut self, observer: Arc<OperationObserver>) {
+        self.operations.push(observer);
     }
 
     pub(super) fn push_close_wake(&mut self, notify: Arc<tokio::sync::Notify>) {
@@ -58,8 +58,8 @@ impl AfterEngineUnlock {
         for event in self.events {
             event.deliver();
         }
-        for operation in self.operations {
-            operation.wake();
+        for observer in self.operations {
+            observer.wake();
         }
         for notify in self.closes {
             notify.notify_waiters();
@@ -74,8 +74,8 @@ impl AfterEngineUnlock {
         for event in self.events {
             actions.push_event(event);
         }
-        for operation in self.operations {
-            actions.push_operation_wake(operation);
+        for observer in self.operations {
+            actions.push_operation_wake(observer);
         }
         for notify in self.closes {
             actions.push_close_or_listener(move || notify.notify_waiters());
@@ -85,14 +85,8 @@ impl AfterEngineUnlock {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::v2::engine) enum OperationQuarantineEffect {
-    Added {
-        operation: OperationToken,
-        connection: ConnectionToken,
-    },
-    Cleared {
-        operation: OperationToken,
-        connection: ConnectionToken,
-    },
+    Added(ConnectionToken),
+    Cleared(ConnectionToken),
 }
 
 #[derive(Default)]
@@ -127,6 +121,7 @@ pub(in crate::v2::engine) struct DetachedIoCoreEffects {
 }
 
 impl CommittedIoCoreEffects {
+    #[cfg(test)]
     pub(in crate::v2::engine) fn publish(self) {
         self.after_unlock.publish();
     }
@@ -166,8 +161,8 @@ impl IoCoreEffects {
         self.after_unlock.push_event(event);
     }
 
-    pub(super) fn push_operation_wake(&mut self, operation: Arc<OperationState>) {
-        self.after_unlock.push_operation_wake(operation);
+    pub(super) fn push_operation_wake(&mut self, observer: Arc<OperationObserver>) {
+        self.after_unlock.push_operation_wake(observer);
     }
 
     pub(super) fn push_close_wake(&mut self, notify: Arc<tokio::sync::Notify>) {

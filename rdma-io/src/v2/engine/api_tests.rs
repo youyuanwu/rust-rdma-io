@@ -142,7 +142,7 @@ fn pending_connect_command_is_woken_and_releases_admission_on_driver_drop() {
 
 #[tokio::test]
 async fn shutdown_accounts_for_ingress_and_backend_connect_listen_commands() {
-    let (engine, driver) = test_engine_pair(CompletionMode::Polling);
+    let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
     let waker = futures_util::task::noop_waker();
     let mut cx = TaskContext::from_waker(&waker);
     let mut connect_backend = Box::pin(engine.connect("127.0.0.1:9".parse().unwrap()));
@@ -161,15 +161,27 @@ async fn shutdown_accounts_for_ingress_and_backend_connect_listen_commands() {
     for future in [&mut listen_backend, &mut listen_ingress] {
         assert!(future.as_mut().poll(&mut cx).is_pending());
     }
-    engine.shared.commands.service_turn(&engine.shared);
-    engine.shared.commands.service_turn(&engine.shared);
+    engine
+        .shared
+        .commands
+        .service_turn(&engine.shared, driver.reactor.io.core_mut());
+    engine
+        .shared
+        .commands
+        .service_turn(&engine.shared, driver.reactor.io.core_mut());
     assert_eq!(engine.shared.commands.pending_connects(), 1);
     assert_eq!(engine.shared.commands.pending_listens(), 1);
 
     let mut shutdown = Box::pin(engine.shutdown());
     assert!(shutdown.as_mut().poll(&mut cx).is_pending());
-    engine.shared.commands.service_turn(&engine.shared);
-    engine.shared.commands.service_turn(&engine.shared);
+    engine
+        .shared
+        .commands
+        .service_turn(&engine.shared, driver.reactor.io.core_mut());
+    engine
+        .shared
+        .commands
+        .service_turn(&engine.shared, driver.reactor.io.core_mut());
     assert_eq!(engine.shared.commands.pending_connects(), 0);
     assert_eq!(engine.shared.commands.pending_listens(), 0);
     // The unit fixture intentionally has no provider resources. Terminalize
@@ -223,7 +235,7 @@ async fn shutdown_accounts_for_ingress_and_backend_connect_listen_commands() {
 
 #[test]
 fn driver_drop_accounts_for_ingress_and_backend_connect_listen_commands() {
-    let (engine, driver) = test_engine_pair(CompletionMode::Polling);
+    let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
     let counter = CountingWaker::new();
     let waker = counter.waker();
     let mut cx = TaskContext::from_waker(&waker);
@@ -243,8 +255,14 @@ fn driver_drop_accounts_for_ingress_and_backend_connect_listen_commands() {
     for future in [&mut listen_backend, &mut listen_ingress] {
         assert!(future.as_mut().poll(&mut cx).is_pending());
     }
-    engine.shared.commands.service_turn(&engine.shared);
-    engine.shared.commands.service_turn(&engine.shared);
+    engine
+        .shared
+        .commands
+        .service_turn(&engine.shared, driver.reactor.io.core_mut());
+    engine
+        .shared
+        .commands
+        .service_turn(&engine.shared, driver.reactor.io.core_mut());
     assert_eq!(engine.shared.commands.pending_connects(), 1);
     assert_eq!(engine.shared.commands.pending_listens(), 1);
 
@@ -330,7 +348,7 @@ fn shutdown_initiates_each_preexisting_connection_close_once() {
         }
     }
 
-    let (engine, driver) = test_engine_pair(CompletionMode::Polling);
+    let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
     let mut connections = Vec::new();
     let mut posters = Vec::new();
     for qp_num in 1..=3 {
@@ -351,8 +369,14 @@ fn shutdown_initiates_each_preexisting_connection_close_once() {
     }
 
     engine.shared.request_shutdown();
-    engine.shared.session.begin_all_connection_close();
-    engine.shared.session.begin_all_connection_close();
+    engine
+        .shared
+        .session
+        .begin_all_connection_close(driver.reactor.io.core_mut());
+    engine
+        .shared
+        .session
+        .begin_all_connection_close(driver.reactor.io.core_mut());
 
     assert!(
         engine

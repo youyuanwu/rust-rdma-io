@@ -11,7 +11,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use super::super::driver::{COMMAND_WORK, SESSION_WORK, WorkSignal};
 use super::super::io::ProtocolCommand;
 use super::super::io_core::OperationCommand;
-use super::super::registry::{ConnectionToken, Lookup, lock_unpoison, read_unpoison};
+use super::super::registry::{
+    ConnectionToken, Lookup, OperationToken, lock_unpoison, read_unpoison,
+};
 use super::super::session::SessionManager;
 use super::super::session::cm::OutboundRequest;
 use super::super::session::listener::ListenRequest;
@@ -46,6 +48,8 @@ enum ProtocolQueueEntry {
 struct ControlQueue {
     connection_close: VecDeque<ConnectionToken>,
     connection_close_set: HashSet<ConnectionToken>,
+    operation_cancel: VecDeque<OperationToken>,
+    operation_cancel_set: HashSet<OperationToken>,
 }
 
 pub(in crate::v2::engine) struct CommandTurn {
@@ -264,6 +268,21 @@ impl CommandIngress {
         command.is_some()
     }
 
+    pub(in crate::v2::engine) fn request_operation_cancel(&self, token: OperationToken) {
+        let inserted = {
+            let mut controls = lock_unpoison(&self.controls);
+            if controls.operation_cancel_set.insert(token) {
+                controls.operation_cancel.push_back(token);
+                true
+            } else {
+                false
+            }
+        };
+        if inserted {
+            self.publish_command_work();
+        }
+    }
+
     pub(in crate::v2::engine) fn request_connection_close(
         &self,
         manager: &SessionManager,
@@ -392,6 +411,7 @@ impl CommandIngress {
     pub(in crate::v2::engine) fn service_turn_into(
         &self,
         shared: &Arc<EngineShared>,
+        io: &mut super::super::io_core::IoState,
         actions: &mut super::ReactorActions,
     ) -> CommandTurn {
         let mut session_work = false;
@@ -412,8 +432,22 @@ impl CommandIngress {
             None
         };
         if let Some(token) = close {
-            shared.session.request_connection_close_into(token, actions);
+            shared
+                .session
+                .request_connection_close_into(io, token, actions);
             session_work = true;
+        }
+
+        let cancellation = {
+            let mut controls = lock_unpoison(&self.controls);
+            let token = controls.operation_cancel.pop_front();
+            if let Some(token) = token {
+                controls.operation_cancel_set.remove(&token);
+            }
+            token
+        };
+        if let Some(token) = cancellation {
+            io.cancel_operation(token);
         }
 
         enum ReadyCommand {
@@ -485,7 +519,7 @@ impl CommandIngress {
                     if let Some(error) = terminal_error {
                         command.cancel_before_execution_into(error, actions);
                     } else {
-                        command.execute_into(&shared.session, actions);
+                        command.execute_into(&shared.session, io, actions);
                     }
                     drop(permit);
                 }
@@ -501,7 +535,7 @@ impl CommandIngress {
                             } else if let Some(error) = terminal_error {
                                 command.reject_into(error, publication.actions_mut());
                             } else {
-                                command.execute_into(shared, publication.actions_mut());
+                                command.execute_into(shared, io, publication.actions_mut());
                             }
                             drop(permit);
                             publication
@@ -532,9 +566,13 @@ impl CommandIngress {
     }
 
     #[cfg(test)]
-    pub(in crate::v2::engine) fn service_turn(&self, shared: &Arc<EngineShared>) -> CommandTurn {
+    pub(in crate::v2::engine) fn service_turn(
+        &self,
+        shared: &Arc<EngineShared>,
+        io: &mut super::super::io_core::IoState,
+    ) -> CommandTurn {
         let mut actions = super::ReactorActions::default();
-        let report = self.service_turn_into(shared, &mut actions);
+        let report = self.service_turn_into(shared, io, &mut actions);
         actions.publish();
         report
     }
@@ -552,7 +590,8 @@ impl CommandIngress {
             return true;
         }
         drop(queues);
-        !lock_unpoison(&self.controls).connection_close.is_empty()
+        let controls = lock_unpoison(&self.controls);
+        !controls.connection_close.is_empty() || !controls.operation_cancel.is_empty()
     }
 
     #[cfg(test)]
@@ -576,11 +615,6 @@ impl CommandIngress {
     }
 
     #[cfg(test)]
-    pub(in crate::v2::engine) fn pending_operations(&self) -> usize {
-        lock_unpoison(&self.queues).operation.len()
-    }
-
-    #[cfg(test)]
     pub(in crate::v2::engine) fn pending_protocol(&self) -> usize {
         lock_unpoison(&self.queues).protocol.len()
     }
@@ -599,7 +633,7 @@ mod tests {
 
     use super::super::super::driver::WorkSignal;
     use super::super::super::io::{
-        ProtocolCommand, ProtocolIoCommandAdapter, ProtocolTestProbe, event_port,
+        ProtocolCommand, ProtocolTestAdmission, ProtocolTestProbe, event_port,
     };
     use super::super::super::{CompletionMode, test_engine_pair};
     use super::CommandIngress;
@@ -614,15 +648,15 @@ mod tests {
         }
     }
 
-    fn protocol_adapter(engine: &super::super::super::RdmaEngine) -> Arc<ProtocolIoCommandAdapter> {
-        ProtocolIoCommandAdapter::new(
+    fn protocol_adapter(engine: &super::super::super::RdmaEngine) -> Arc<ProtocolTestAdmission> {
+        ProtocolTestAdmission::new(
             Arc::downgrade(&engine.shared.commands),
             Arc::downgrade(&engine.shared.session),
         )
     }
 
     fn test_protocol_command(
-        adapter: &ProtocolIoCommandAdapter,
+        adapter: &ProtocolTestAdmission,
         operations: usize,
         actions: usize,
         probe: ProtocolTestProbe,
@@ -735,7 +769,7 @@ mod tests {
 
     #[tokio::test]
     async fn saturated_protocol_admission_stays_frontend_owned_until_capacity_recovers() {
-        let (engine, _driver) = test_engine_pair(CompletionMode::Polling);
+        let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
         let commands = Arc::clone(&engine.shared.commands);
         let capacity = commands.available_operation_permits();
         let blocker = commands.operation_batch_acquire(capacity).await.unwrap();
@@ -754,7 +788,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(adapter.poll(&mut cx, 1), 1);
         assert_eq!(commands.pending_protocol(), 1);
-        commands.service_turn(&engine.shared);
+        commands.service_turn(&engine.shared, driver.reactor.io.core_mut());
         assert_eq!(probe.executed.load(Ordering::Acquire), 1);
         assert_eq!(probe.dropped.load(Ordering::Acquire), 1);
         assert_eq!(commands.available_operation_permits(), capacity);
@@ -762,7 +796,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_before_and_after_protocol_queueing_resolves_once() {
-        let (engine, _driver) = test_engine_pair(CompletionMode::Polling);
+        let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
         let commands = Arc::clone(&engine.shared.commands);
         let capacity = commands.available_operation_permits();
         let blocker = commands.operation_batch_acquire(capacity).await.unwrap();
@@ -784,7 +818,7 @@ mod tests {
         assert_eq!(adapter.poll(&mut cx, 1), 1);
         assert_eq!(commands.pending_protocol(), 1);
         after.cancelled.store(true, Ordering::Release);
-        commands.service_turn(&engine.shared);
+        commands.service_turn(&engine.shared, driver.reactor.io.core_mut());
         assert_eq!(after.resolved.load(Ordering::Acquire), 1);
         assert_eq!(after.executed.load(Ordering::Acquire), 0);
         assert_eq!(after.dropped.load(Ordering::Acquire), 1);
@@ -793,7 +827,7 @@ mod tests {
 
     #[tokio::test]
     async fn queued_protocol_receiver_loss_prevents_provider_execution_and_restores_permit() {
-        let (engine, _driver) = test_engine_pair(CompletionMode::Polling);
+        let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
         let commands = Arc::clone(&engine.shared.commands);
         let capacity = commands.available_operation_permits();
         let adapter = protocol_adapter(&engine);
@@ -805,7 +839,7 @@ mod tests {
         assert_eq!(commands.available_operation_permits(), capacity - 2);
         drop(events);
 
-        commands.service_turn(&engine.shared);
+        commands.service_turn(&engine.shared, driver.reactor.io.core_mut());
         assert_eq!(probe.executed.load(Ordering::Acquire), 0);
         assert_eq!(probe.resolved.load(Ordering::Acquire), 0);
         assert_eq!(probe.dropped.load(Ordering::Acquire), 1);
@@ -814,7 +848,7 @@ mod tests {
 
     #[tokio::test]
     async fn large_protocol_batch_drains_publication_across_bounded_turns() {
-        let (engine, _driver) = test_engine_pair(CompletionMode::Polling);
+        let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
         let commands = Arc::clone(&engine.shared.commands);
         let capacity = commands.available_operation_permits();
         let adapter = protocol_adapter(&engine);
@@ -828,14 +862,15 @@ mod tests {
         for _ in 0..28 {
             actions.push_operation(|| {});
         }
-        let first = commands.service_turn_into(&engine.shared, &mut actions);
+        let first =
+            commands.service_turn_into(&engine.shared, driver.reactor.io.core_mut(), &mut actions);
         assert!(first.has_more);
         actions.publish();
         assert_eq!(probe.executed.load(Ordering::Acquire), 1);
         assert_eq!(probe.published.load(Ordering::Acquire), 4);
         assert_eq!(commands.available_operation_permits(), capacity);
 
-        let second = commands.service_turn(&engine.shared);
+        let second = commands.service_turn(&engine.shared, driver.reactor.io.core_mut());
         assert!(!second.has_more);
         assert_eq!(probe.published.load(Ordering::Acquire), 12);
         assert_eq!(probe.dropped.load(Ordering::Acquire), 1);

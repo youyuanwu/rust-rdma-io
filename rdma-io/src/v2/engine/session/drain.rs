@@ -12,6 +12,7 @@ use super::connection::ConnectionState;
 impl SessionManager {
     fn scan_close_observers_into(
         &self,
+        io_core: &mut super::super::io_core::IoState,
         connection: &ConnectionState,
         reserve: usize,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
@@ -23,7 +24,7 @@ impl SessionManager {
         if scan_budget == 0 {
             return false;
         }
-        let (effects, next, complete) = self.io_core.scan_connection_observers_for_close(
+        let (effects, next, complete) = io_core.scan_connection_observers_for_close(
             connection.token,
             connection.close_operation_scan_slot(),
             connection.operation_close_error(),
@@ -36,13 +37,14 @@ impl SessionManager {
 
     fn scan_quarantine_operations_into(
         &self,
+        io_core: &mut super::super::io_core::IoState,
         connection: &ConnectionState,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> bool {
         if connection.quarantine_operation_scan_complete() {
             return true;
         }
-        let (effects, next, complete) = self.io_core.scan_connection_quarantine(
+        let (effects, next, complete) = io_core.scan_connection_quarantine(
             connection.token,
             connection.quarantine_operation_scan_slot(),
             32,
@@ -53,7 +55,11 @@ impl SessionManager {
     }
 
     #[cfg(test)]
-    pub(crate) fn begin_connection_close(&self, connection: &Arc<ConnectionState>) {
+    pub(crate) fn begin_connection_close(
+        &self,
+        io_core: &mut super::super::io_core::IoState,
+        connection: &Arc<ConnectionState>,
+    ) {
         if connection.is_retired() {
             return;
         }
@@ -85,11 +91,8 @@ impl SessionManager {
             let engine_is_terminating = self.shutdown_requested();
             if !engine_is_terminating {
                 let error = connection.operation_close_error();
-                let report = connection.io_drain_report();
-                close_effects = Some(
-                    self.io_core
-                        .fail_observers_for_close(&report.accepted_tokens, error),
-                );
+                let tokens = io_core.accepted_tokens_bounded(&connection.io, usize::MAX);
+                close_effects = Some(io_core.fail_observers_for_close(&tokens, error));
             }
         }
         drop(lifecycle);
@@ -103,7 +106,7 @@ impl SessionManager {
         if first {
             self.schedule_connection_drain(connection.token);
         }
-        if connection.accepted_count() == 0 {
+        if io_core.connection_accepted_count(&connection.io) == 0 {
             self.record_connection_drained(connection);
             self.schedule_connection_retirement(connection);
         }
@@ -112,6 +115,7 @@ impl SessionManager {
     pub(crate) fn begin_connection_close_into(
         &self,
         connection: &Arc<ConnectionState>,
+        io_core: &mut super::super::io_core::IoState,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) {
         if connection.is_retired() {
@@ -141,7 +145,7 @@ impl SessionManager {
             publish_io_work = true;
             if !self.shutdown_requested() {
                 close_publication_remaining =
-                    !self.scan_close_observers_into(connection, 4, actions);
+                    !self.scan_close_observers_into(io_core, connection, 2, actions);
             }
         }
         drop(lifecycle);
@@ -156,14 +160,17 @@ impl SessionManager {
                 self.schedule_connection_drain(connection.token);
             }
         }
-        if connection.accepted_count() == 0 {
+        if io_core.connection_accepted_count(&connection.io) == 0 {
             self.record_connection_drained(connection);
             self.schedule_connection_retirement(connection);
         }
     }
 
     #[cfg(test)]
-    pub(in crate::v2::engine) fn begin_all_connection_close(&self) {
+    pub(in crate::v2::engine) fn begin_all_connection_close(
+        &self,
+        io_core: &mut super::super::io_core::IoState,
+    ) {
         if self
             .shutdown_connection_close_started
             .swap(true, Ordering::AcqRel)
@@ -171,7 +178,7 @@ impl SessionManager {
             return;
         }
         for connection in self.connections.occupied() {
-            self.begin_connection_close(&connection);
+            self.begin_connection_close(io_core, &connection);
         }
     }
 
@@ -208,6 +215,7 @@ impl SessionManager {
 
     pub(in crate::v2::engine) fn handle_connection_drain_deadline_into(
         &self,
+        io_core: &mut super::super::io_core::IoState,
         token: ConnectionToken,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) {
@@ -220,19 +228,22 @@ impl SessionManager {
         );
         if connection.close_started() && !self.shutdown_requested() {
             let scan_was_complete = connection.close_operation_scan_complete();
-            if !self.scan_close_observers_into(&connection, 2, actions) {
+            if !self.scan_close_observers_into(io_core, &connection, 2, actions) {
                 self.schedule_connection_drain_now(token);
                 return;
             }
             if !scan_was_complete {
+                // The zero-delay continuation finished only observer
+                // publication. Preserve the configured grace period before
+                // any destructive QP fallback.
                 self.schedule_connection_drain(token);
                 return;
             }
         }
         // CQEs already copied out of the hardware CQ must take the ordinary
         // quantum-bounded ready path before a destructive fallback can run.
-        if connection.has_copied_completions() {
-            self.io_core.publish_connection(&connection.io);
+        if io_core.has_connection_completion_work(&connection.io) {
+            io_core.publish_connection(&connection.io);
             self.schedule_deadline(
                 DeadlineKind::ConnectionDrain,
                 token.encode(),
@@ -241,15 +252,16 @@ impl SessionManager {
             return;
         }
         if connection.is_quarantined() {
-            if !self.scan_quarantine_operations_into(&connection, actions) {
+            if !self.scan_quarantine_operations_into(io_core, &connection, actions) {
                 self.schedule_connection_drain_now(token);
             }
             return;
         }
-        let accepted_count = connection.accepted_count();
-        let accepted_tokens = connection
-            .io
-            .accepted_tokens_bounded(actions.remaining().saturating_sub(2).min(32));
+        let accepted_count = io_core.connection_accepted_count(&connection.io);
+        let accepted_tokens = io_core.accepted_tokens_bounded(
+            &connection.io,
+            actions.remaining().saturating_sub(2).min(32),
+        );
         if accepted_count != 0 && accepted_tokens.is_empty() {
             self.schedule_connection_drain_now(token);
             return;
@@ -271,7 +283,7 @@ impl SessionManager {
             };
         }
         if let Some(proof) = reclamation_proof {
-            let prefix = self.io_core.qp_destroy_publication_prefix(
+            let prefix = io_core.qp_destroy_publication_prefix(
                 &accepted_tokens,
                 actions.remaining().saturating_sub(2),
             );
@@ -281,23 +293,24 @@ impl SessionManager {
                 return;
             }
             self.reclaim_after_qp_destroy_into(
+                io_core,
                 &proof,
                 &connection,
                 accepted_tokens[..prefix].to_vec(),
                 actions,
             );
-            if connection.accepted_count() != 0 {
-                if prefix < accepted_tokens.len() || accepted_tokens.len() < accepted_count {
-                    connection.store_qp_reclamation_proof(proof);
-                    self.schedule_connection_drain_now(token);
-                    return;
-                }
-                // Every snapshotted token was attempted. Any survivor is an
-                // anomalous accepted-set entry and follows the established
-                // complete-bundle quarantine path below.
+            // Every snapshotted token was attempted. Any survivor is an
+            // anomalous accepted-set entry and follows the established
+            // complete-bundle quarantine path below.
+            if io_core.connection_accepted_count(&connection.io) != 0
+                && (prefix < accepted_tokens.len() || accepted_tokens.len() < accepted_count)
+            {
+                connection.store_qp_reclamation_proof(proof);
+                self.schedule_connection_drain_now(token);
+                return;
             }
-            if self.reject_queued_completions_after_qp_destroy_into(&connection, actions) {
-                self.io_core.publish_connection(&connection.io);
+            if self.reject_queued_completions_after_qp_destroy_into(io_core, &connection, actions) {
+                io_core.publish_connection(&connection.io);
                 self.schedule_deadline(
                     DeadlineKind::ConnectionDrain,
                     token.encode(),
@@ -306,7 +319,7 @@ impl SessionManager {
                 return;
             }
         }
-        if let Some(report) = connection.begin_quarantine() {
+        if let Some(report) = connection.begin_quarantine(io_core) {
             self.track_connection_quarantine(connection.token);
             if let Some(event) = connection.publish_quarantine_into(
                 report.outstanding_operations,
@@ -315,13 +328,13 @@ impl SessionManager {
             ) {
                 actions.push_event(event);
             }
-            if !self.scan_quarantine_operations_into(&connection, actions) {
+            if !self.scan_quarantine_operations_into(io_core, &connection, actions) {
                 self.schedule_connection_drain_now(token);
                 return;
             }
         }
 
-        if connection.close_started() && connection.accepted_count() == 0 {
+        if connection.close_started() && io_core.connection_accepted_count(&connection.io) == 0 {
             self.recover_connection_quarantine(&connection);
             self.record_connection_drained(&connection);
             self.schedule_connection_retirement(&connection);
@@ -329,9 +342,13 @@ impl SessionManager {
     }
 
     #[cfg(test)]
-    pub(in crate::v2::engine) fn handle_connection_drain_deadline(&self, token: ConnectionToken) {
+    pub(in crate::v2::engine) fn handle_connection_drain_deadline(
+        &self,
+        io_core: &mut super::super::io_core::IoState,
+        token: ConnectionToken,
+    ) {
         let mut actions = crate::v2::engine::reactor::ReactorActions::default();
-        self.handle_connection_drain_deadline_into(token, &mut actions);
+        self.handle_connection_drain_deadline_into(io_core, token, &mut actions);
         actions.publish();
     }
 
@@ -509,7 +526,10 @@ mod tests {
                 .draining,
             0
         );
-        engine.shared.commands.service_turn(&engine.shared);
+        engine
+            .shared
+            .commands
+            .service_turn(&engine.shared, driver.reactor.io.core_mut());
 
         let driver_error = loop {
             match poll_once(Pin::new(&mut driver)) {
@@ -542,7 +562,7 @@ mod tests {
 
     #[test]
     fn failed_error_transition_wakes_close_waiter_after_guards_drop() {
-        let (engine, _driver) = test_engine_pair(CompletionMode::Polling);
+        let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
         let connection = install_connection(
             &engine.shared.session,
             TestPoster::failing(21),
@@ -570,7 +590,7 @@ mod tests {
         engine
             .shared
             .session
-            .begin_connection_close(&connection.state);
+            .begin_connection_close(driver.reactor.io.core_mut(), &connection.state);
 
         assert!(
             reentrant.wakes.load(Ordering::Acquire) >= 1,
@@ -610,7 +630,7 @@ mod tests {
 
     #[test]
     fn connection_close_wakes_driver_after_admission_and_lifecycle_guards_drop() {
-        let (engine, _driver) = test_engine_pair(CompletionMode::Readiness);
+        let (engine, mut driver) = test_engine_pair(CompletionMode::Readiness);
         let connection = install_connection(
             &engine.shared.session,
             TestPoster::new(20),
@@ -634,7 +654,7 @@ mod tests {
         engine
             .shared
             .session
-            .begin_connection_close(&connection.state);
+            .begin_connection_close(driver.reactor.io.core_mut(), &connection.state);
 
         assert!(
             reentrant.wakes.load(Ordering::Acquire) >= 1,
@@ -649,7 +669,7 @@ mod tests {
 
     #[test]
     fn connection_close_wakes_operation_observer_after_guards_drop() {
-        let (engine, _driver) = test_engine_pair(CompletionMode::Polling);
+        let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
         let connection = install_connection(
             &engine.shared.session,
             TestPoster::new(22),
@@ -659,7 +679,7 @@ mod tests {
         )
         .unwrap();
         let token = install_accepted_operation_for_driver_test(
-            &engine.shared.io_core,
+            driver.reactor.io.core_mut(),
             &connection.state,
             crate::wc::WcOpcode::Send,
         );
@@ -670,7 +690,7 @@ mod tests {
             lock_failures: AtomicUsize::new(0),
         });
         register_operation_waker_for_test(
-            &engine.shared.io_core,
+            driver.reactor.io.core(),
             token,
             &waker(Arc::clone(&reentrant)),
         );
@@ -678,7 +698,7 @@ mod tests {
         engine
             .shared
             .session
-            .begin_connection_close(&connection.state);
+            .begin_connection_close(driver.reactor.io.core_mut(), &connection.state);
 
         assert_eq!(
             reentrant.wakes.load(Ordering::Acquire),
@@ -692,8 +712,60 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn bounded_close_scan_continuation_preserves_drain_grace() {
+        let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
+        let poster = TestPoster::new(28);
+        let connection = install_connection(
+            &engine.shared.session,
+            Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
+            RdmaConnectionConfig::default().max_send_wr(64),
+            None,
+            None,
+        )
+        .unwrap();
+        for _ in 0..33 {
+            install_accepted_operation_for_driver_test(
+                driver.reactor.io.core_mut(),
+                &connection.state,
+                crate::wc::WcOpcode::Send,
+            );
+        }
+
+        let mut actions = crate::v2::engine::reactor::ReactorActions::default();
+        engine.shared.session.begin_connection_close_into(
+            &connection.state,
+            driver.reactor.io.core_mut(),
+            &mut actions,
+        );
+        actions.publish();
+        let immediate = engine.shared.session.take_deadline_requests(1);
+        assert_eq!(immediate.len(), 1);
+        assert_eq!(immediate[0].at, tokio::time::Instant::now());
+
+        let mut actions = crate::v2::engine::reactor::ReactorActions::default();
+        engine.shared.session.handle_connection_drain_deadline_into(
+            driver.reactor.io.core_mut(),
+            connection.state.token,
+            &mut actions,
+        );
+        actions.publish();
+        let grace = engine.shared.session.take_deadline_requests(1);
+        assert_eq!(grace.len(), 1);
+        assert!(
+            grace[0].at > tokio::time::Instant::now(),
+            "finishing the observer scan must arm the configured drain grace"
+        );
+        assert_eq!(
+            poster.destroys.load(Ordering::Acquire),
+            0,
+            "observer-scan continuation cannot destroy the QP"
+        );
+    }
+
     fn install_accepted_connection(
         engine: &super::super::super::RdmaEngine,
+        driver: &mut super::super::super::RdmaEngineDriver,
         qp_num: u32,
     ) -> (
         super::super::super::RdmaConnection,
@@ -714,19 +786,19 @@ mod tests {
             slot: qp_num,
             generation: 1,
         };
-        connection.state.add_accepted(token);
-        engine
-            .shared
-            .io_core
-            .accepted_operations
-            .fetch_add(1, Ordering::AcqRel);
+        driver
+            .reactor
+            .io
+            .core_mut()
+            .add_accepted(&connection.state.io, token);
+        driver.reactor.io.core_mut().accepted_operations += 1;
         (connection, poster, token)
     }
 
     #[tokio::test(start_paused = true)]
     async fn ambiguous_operation_ownership_quarantines_until_exact_removal() {
         let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
-        let (connection, poster, token) = install_accepted_connection(&engine, 17);
+        let (connection, poster, token) = install_accepted_connection(&engine, &mut driver, 17);
         let mut close = Box::pin(connection.close());
 
         assert!(poll_once(close.as_mut()).is_pending());
@@ -763,12 +835,14 @@ mod tests {
             "the defensive unknown-token branch retains accounting after a safe QP boundary"
         );
 
-        assert!(connection.state.remove_accepted(token));
-        engine
-            .shared
-            .io_core
-            .accepted_operations
-            .fetch_sub(1, Ordering::AcqRel);
+        assert!(
+            driver
+                .reactor
+                .io
+                .core_mut()
+                .remove_accepted(&connection.state.io, token)
+        );
+        driver.reactor.io.core_mut().accepted_operations -= 1;
         engine
             .shared
             .session
@@ -794,7 +868,12 @@ mod tests {
             .shared
             .session
             .cm
-            .service_software(&engine.shared.session, None, 32)
+            .service_software(
+                &engine.shared.session,
+                driver.reactor.io.core_mut(),
+                None,
+                32,
+            )
             .unwrap();
         assert_eq!(poster.destroys.load(Ordering::Acquire), 1);
 
@@ -831,7 +910,7 @@ mod tests {
         )
         .unwrap();
         install_accepted_operation_for_driver_test(
-            &engine.shared.io_core,
+            driver.reactor.io.core_mut(),
             &connection.state,
             crate::wc::WcOpcode::Recv,
         );
@@ -868,7 +947,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn anomalous_token_does_not_strand_reclaimable_operations_after_qp_destroy() {
-        let (engine, _driver) = test_engine_pair(CompletionMode::Polling);
+        let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
         let poster = TestPoster::new(24);
         let connection = install_connection(
             &engine.shared.session,
@@ -880,7 +959,7 @@ mod tests {
         .unwrap();
         for opcode in [crate::wc::WcOpcode::Send, crate::wc::WcOpcode::Recv] {
             install_accepted_operation_for_driver_test(
-                &engine.shared.io_core,
+                driver.reactor.io.core_mut(),
                 &connection.state,
                 opcode,
             );
@@ -889,12 +968,12 @@ mod tests {
             slot: u32::MAX,
             generation: 1,
         };
-        connection.state.add_accepted(anomalous);
-        engine
-            .shared
-            .io_core
-            .accepted_operations
-            .fetch_add(1, Ordering::AcqRel);
+        driver
+            .reactor
+            .io
+            .core_mut()
+            .add_accepted(&connection.state.io, anomalous);
+        driver.reactor.io.core_mut().accepted_operations += 1;
         connection.state.begin_close();
         engine
             .shared
@@ -905,17 +984,27 @@ mod tests {
         engine
             .shared
             .session
-            .handle_connection_drain_deadline(connection.state.token);
+            .handle_connection_drain_deadline(driver.reactor.io.core_mut(), connection.state.token);
         engine
             .shared
             .session
-            .handle_connection_drain_deadline(connection.state.token);
+            .handle_connection_drain_deadline(driver.reactor.io.core_mut(), connection.state.token);
 
-        let diagnostics = engine.diagnostics();
         assert_eq!(poster.destroys.load(Ordering::Acquire), 1);
-        assert_eq!(diagnostics.registered_operations, 0);
-        assert_eq!(diagnostics.accepted_operations, 1);
+        assert_eq!(
+            driver.reactor.io.core().diagnostics().registered_operations,
+            0
+        );
+        assert_eq!(driver.reactor.io.core().accepted_count(), 1);
         assert_eq!(connection.state.accepted_tokens(), vec![anomalous]);
-        assert_eq!(diagnostics.quarantined_connections, 1);
+        assert_eq!(
+            engine
+                .shared
+                .session
+                .connection_admission
+                .snapshot()
+                .quarantined_bundles,
+            1
+        );
     }
 }

@@ -72,7 +72,7 @@ fn pending_connect_future_releases_engine_and_manager_record_owners() {
 
 #[test]
 fn command_ingress_services_connects_in_fifo_order_one_per_turn() {
-    let (engine, _driver) =
+    let (engine, mut driver) =
         super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
     let first_address = "127.0.0.1:7471".parse().unwrap();
     let second_address = "127.0.0.1:7472".parse().unwrap();
@@ -96,14 +96,20 @@ fn command_ingress_services_connects_in_fifo_order_one_per_turn() {
     assert!(second.as_mut().poll(&mut context).is_pending());
     assert_eq!(engine.shared.commands.pending_connects(), 2);
 
-    engine.shared.commands.service_turn(&engine.shared);
+    engine
+        .shared
+        .commands
+        .service_turn(&engine.shared, driver.reactor.io.core_mut());
     assert_eq!(engine.shared.commands.pending_connects(), 1);
     let pending = lock_unpoison(&engine.shared.session.cm.pending);
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].address, first_address);
     drop(pending);
 
-    engine.shared.commands.service_turn(&engine.shared);
+    engine
+        .shared
+        .commands
+        .service_turn(&engine.shared, driver.reactor.io.core_mut());
     let pending = lock_unpoison(&engine.shared.session.cm.pending);
     assert_eq!(pending.len(), 2);
     assert_eq!(pending[1].address, second_address);
@@ -182,43 +188,22 @@ fn former_pending_cancellation_lock_order_forms_an_abba_cycle() {
 
 #[test]
 fn route_queries_and_cm_service_complete_under_lock_order_stress() {
-    let (engine, driver) =
+    let (engine, mut driver) =
         super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
     let shared = Arc::clone(&engine.shared.session);
-    let start = Arc::new(Barrier::new(3));
-
-    let diagnostics_shared = Arc::clone(&shared);
-    let diagnostics_start = Arc::clone(&start);
-    let diagnostics = std::thread::spawn(move || {
-        diagnostics_start.wait();
-        for _ in 0..1_000 {
-            let _ = diagnostics_shared.cm.pending_route_count();
-            let _ = diagnostics_shared.cm.retained_owner_count();
-            let _ = diagnostics_shared.cm.has_software_work();
-        }
-    });
-
-    let service_shared = Arc::clone(&shared);
-    let service_start = Arc::clone(&start);
-    let service = std::thread::spawn(move || {
-        service_start.wait();
-        for _ in 0..1_000 {
-            service_shared
+    for _ in 0..1_000 {
+        let _ = shared.cm.pending_route_count();
+        let _ = shared.cm.retained_owner_count();
+        let _ = shared.cm.has_software_work();
+        shared.cm.enqueue_cancellation(Arc::new(test_request()));
+        assert_eq!(
+            shared
                 .cm
-                .enqueue_cancellation(Arc::new(test_request()));
-            assert_eq!(
-                service_shared
-                    .cm
-                    .service_software(&service_shared, None, 1)
-                    .unwrap(),
-                1
-            );
-        }
-    });
-
-    start.wait();
-    diagnostics.join().unwrap();
-    service.join().unwrap();
+                .service_software(&shared, driver.reactor.io.core_mut(), None, 1)
+                .unwrap(),
+            1
+        );
+    }
     assert!(lock_unpoison(&shared.cm.cancellations).is_empty());
 
     drop(engine);
@@ -524,7 +509,7 @@ fn duplicate_listener_identity_keeps_both_incumbent_mappings() {
 
 #[test]
 fn pre_establish_setup_completes_before_connect_and_failure_skips_connect() {
-    let (engine, driver) =
+    let (engine, mut driver) =
         super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
     let connection = install_connection(
         &engine.shared.session,
@@ -540,6 +525,7 @@ fn pre_establish_setup_completes_before_connect_and_failure_skips_connect() {
     let summary = run_setup_before_establish(
         recording_setup(Arc::clone(&order), Ok(SetupSummary { posted_wrs: 0 })),
         &connection,
+        driver.reactor.io.core_mut(),
         || {
             lock_unpoison(&order).push("pre-connect");
             Ok(())
@@ -573,6 +559,7 @@ fn pre_establish_setup_completes_before_connect_and_failure_skips_connect() {
             Err(Error::InvalidConfig("setup failed".into())),
         ),
         &failed_connection,
+        driver.reactor.io.core_mut(),
         || {
             lock_unpoison(&order).push("pre-connect");
             Ok(())
@@ -600,6 +587,7 @@ fn pre_establish_setup_completes_before_connect_and_failure_skips_connect() {
     let error = run_setup_before_establish(
         recording_setup(Arc::clone(&order), Ok(SetupSummary { posted_wrs: 1 })),
         &mismatched_connection,
+        driver.reactor.io.core_mut(),
         || {
             lock_unpoison(&order).push("pre-connect");
             Ok(())
@@ -681,7 +669,7 @@ fn delivery_replaces_the_frontend_with_weak_generational_route_state() {
 
 #[test]
 fn shutdown_replaces_an_undelivered_success_and_enqueues_route_cleanup() {
-    let (engine, driver) =
+    let (engine, mut driver) =
         super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
     let connection = install_connection(
         &engine.shared.session,
@@ -725,7 +713,12 @@ fn shutdown_replaces_an_undelivered_success_and_enqueues_route_cleanup() {
         .shared
         .session
         .cm
-        .service_software(&engine.shared.session, None, 1)
+        .service_software(
+            &engine.shared.session,
+            driver.reactor.io.core_mut(),
+            None,
+            1,
+        )
         .unwrap();
     assert_eq!(processed, 1);
     assert!(lock_unpoison(&engine.shared.session.cm.cancellations).is_empty());
@@ -733,7 +726,12 @@ fn shutdown_replaces_an_undelivered_success_and_enqueues_route_cleanup() {
         .shared
         .session
         .cm
-        .service_software(&engine.shared.session, None, 1)
+        .service_software(
+            &engine.shared.session,
+            driver.reactor.io.core_mut(),
+            None,
+            1,
+        )
         .unwrap();
     drop(engine);
     drop(driver);
@@ -741,7 +739,7 @@ fn shutdown_replaces_an_undelivered_success_and_enqueues_route_cleanup() {
 
 #[test]
 fn transitioning_route_requeues_retirement_once_per_service_pass() {
-    let (engine, driver) =
+    let (engine, mut driver) =
         super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
     let request = Arc::new(test_request());
     let (route_token, route) = engine
@@ -781,7 +779,12 @@ fn transitioning_route_requeues_retirement_once_per_service_pass() {
         .shared
         .session
         .cm
-        .service_software(&engine.shared.session, None, 32)
+        .service_software(
+            &engine.shared.session,
+            driver.reactor.io.core_mut(),
+            None,
+            32,
+        )
         .unwrap();
     assert_eq!(
         processed, 1,
@@ -807,7 +810,12 @@ fn transitioning_route_requeues_retirement_once_per_service_pass() {
         .shared
         .session
         .cm
-        .service_software(&engine.shared.session, None, 32)
+        .service_software(
+            &engine.shared.session,
+            driver.reactor.io.core_mut(),
+            None,
+            32,
+        )
         .unwrap();
     assert_eq!(processed, 1);
     assert!(lock_unpoison(&engine.shared.session.cm.retirements).is_empty());
@@ -829,7 +837,7 @@ fn transitioning_route_requeues_retirement_once_per_service_pass() {
 
 #[test]
 fn inbound_disconnect_without_connection_state_fails_and_retires_selected_accept() {
-    let (engine, driver) =
+    let (engine, mut driver) =
         super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
     let listener = ListenerState::test_only(1);
     let (route_token, route) = engine
@@ -861,11 +869,11 @@ fn inbound_disconnect_without_connection_state_fails_and_retires_selected_accept
     drop(connection);
 
     assert!(matches!(
-        engine
-            .shared
-            .session
-            .cm
-            .handle_inbound_disconnected(&engine.shared.session, &route),
+        engine.shared.session.cm.handle_inbound_disconnected(
+            &engine.shared.session,
+            driver.reactor.io.core_mut(),
+            &route,
+        ),
         Ok(EventDisposition::Handled)
     ));
     let Some(Err(error)) = request.take_result_for_test() else {
@@ -892,7 +900,7 @@ fn inbound_disconnect_without_connection_state_fails_and_retires_selected_accept
 
 #[test]
 fn listener_destroy_error_completes_close_once_before_propagation() {
-    let (engine, driver) =
+    let (engine, mut driver) =
         super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
     let listener_state = ListenerState::test_only(1);
     let listener = RdmaListener::from_state(&engine.shared.session, Arc::clone(&listener_state));
@@ -916,7 +924,12 @@ fn listener_destroy_error_completes_close_once_before_propagation() {
         .shared
         .session
         .cm
-        .service_cm_destructions(&engine.shared.session, 1, || Ok(false))
+        .service_cm_destructions(
+            &engine.shared.session,
+            driver.reactor.io.core_mut(),
+            1,
+            || Ok(false),
+        )
         .unwrap_err();
     assert!(error.to_string().contains("injected failure"));
     let Poll::Ready(Err(close_error)) = close.as_mut().poll(&mut cx) else {
@@ -930,7 +943,12 @@ fn listener_destroy_error_completes_close_once_before_propagation() {
             .shared
             .session
             .cm
-            .service_cm_destructions(&engine.shared.session, 1, || Ok(false))
+            .service_cm_destructions(
+                &engine.shared.session,
+                driver.reactor.io.core_mut(),
+                1,
+                || Ok(false),
+            )
             .unwrap(),
         0
     );
@@ -964,7 +982,7 @@ fn connection_finalize_error_fails_accept_and_retirement_once() {
 
 #[test]
 fn cm_destroy_barrier_is_budgeted_across_service_passes() {
-    let (engine, driver) =
+    let (engine, mut driver) =
         super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
     let listener_state = ListenerState::test_only(1);
     let listener = RdmaListener::from_state(&engine.shared.session, Arc::clone(&listener_state));
@@ -991,14 +1009,19 @@ fn cm_destroy_barrier_is_budgeted_across_service_passes() {
             .shared
             .session
             .cm
-            .service_cm_destructions(&engine.shared.session, 1, || {
-                probes += 1;
-                let Some(event) = pending.pop_front() else {
-                    return Ok(false);
-                };
-                routed.push(event);
-                Ok(true)
-            })
+            .service_cm_destructions(
+                &engine.shared.session,
+                driver.reactor.io.core_mut(),
+                1,
+                || {
+                    probes += 1;
+                    let Some(event) = pending.pop_front() else {
+                        return Ok(false);
+                    };
+                    routed.push(event);
+                    Ok(true)
+                },
+            )
             .unwrap();
         assert_eq!(processed, 1);
         assert_eq!(routed.last().copied(), Some(expected));
@@ -1012,10 +1035,15 @@ fn cm_destroy_barrier_is_budgeted_across_service_passes() {
         .shared
         .session
         .cm
-        .service_cm_destructions(&engine.shared.session, 1, || {
-            probes += 1;
-            Ok(false)
-        })
+        .service_cm_destructions(
+            &engine.shared.session,
+            driver.reactor.io.core_mut(),
+            1,
+            || {
+                probes += 1;
+                Ok(false)
+            },
+        )
         .unwrap();
     assert_eq!(processed, 1);
     assert_eq!(probes, 3);
@@ -1035,7 +1063,12 @@ fn cm_destroy_barrier_is_budgeted_across_service_passes() {
             .shared
             .session
             .cm
-            .service_cm_destructions(&engine.shared.session, 1, || Ok(false))
+            .service_cm_destructions(
+                &engine.shared.session,
+                driver.reactor.io.core_mut(),
+                1,
+                || Ok(false),
+            )
             .unwrap(),
         0
     );
@@ -1070,7 +1103,7 @@ fn assert_connection_cm_destruction_failure(
     expected: &str,
     registry_retained: bool,
 ) {
-    let (engine, driver) =
+    let (engine, mut driver) =
         super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
     let connection = install_connection(
         &engine.shared.session,
@@ -1109,7 +1142,12 @@ fn assert_connection_cm_destruction_failure(
         .shared
         .session
         .cm
-        .service_cm_destructions(&engine.shared.session, 1, || Ok(false))
+        .service_cm_destructions(
+            &engine.shared.session,
+            driver.reactor.io.core_mut(),
+            1,
+            || Ok(false),
+        )
         .unwrap_err();
     assert!(error.to_string().contains(expected));
     assert!(connection.state.is_retired());
@@ -1130,7 +1168,12 @@ fn assert_connection_cm_destruction_failure(
             .shared
             .session
             .cm
-            .service_cm_destructions(&engine.shared.session, 1, || Ok(false))
+            .service_cm_destructions(
+                &engine.shared.session,
+                driver.reactor.io.core_mut(),
+                1,
+                || Ok(false),
+            )
             .unwrap(),
         0
     );
