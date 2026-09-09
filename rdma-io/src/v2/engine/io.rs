@@ -485,6 +485,7 @@ pub(crate) struct BorrowedSetupIo<'a> {
     io: Arc<EstablishedIoConnection>,
     io_ledger: &'a mut ConnectionIoState,
     poster: &'a super::session::connection::ConnectionPoster,
+    actions: &'a mut ReactorActions,
     connection: IoConnection,
 }
 
@@ -497,13 +498,14 @@ impl BorrowedSetupIo<'_> {
         &mut self,
         requests: Vec<IoRecvRequest>,
     ) -> IoSubmissionDisposition {
-        io_core::post_io_recv_batch(
+        io_core::post_io_recv_batch_into(
             self.io_core,
             &self.io,
             self.io_ledger,
             self.poster,
             &self.connection.events,
             requests,
+            self.actions,
         )
     }
 
@@ -517,6 +519,7 @@ impl<'a> BorrowedSetupIo<'a> {
         connection: &'a RdmaConnection,
         state: &'a mut ConnectionState,
         io_core: &'a mut IoState,
+        actions: &'a mut ReactorActions,
     ) -> Result<(Self, IoEventReceiver)> {
         let (owned, receiver) = IoConnection::from_connection(connection, state)?;
         let (io, io_ledger, poster) = state.io_parts_mut();
@@ -526,6 +529,7 @@ impl<'a> BorrowedSetupIo<'a> {
                 io: Arc::clone(io),
                 io_ledger,
                 poster,
+                actions,
                 connection: owned,
             },
             receiver,

@@ -279,22 +279,26 @@ pub(in crate::v2::engine) fn run_setup_before_establish(
     connections: &mut super::registry::ConnectionRegistry,
     connection_token: super::super::registry::ConnectionToken,
     io_core: &mut super::super::io_core::IoState,
+    actions: &mut crate::v2::engine::reactor::ReactorActions,
     before_establish: impl FnOnce() -> Result<()>,
     establish: impl FnOnce(&mut super::registry::ConnectionRegistry) -> Result<()>,
 ) -> Result<SetupSummary> {
     let accepted_before = connections.accepted_count(connection_token);
-    let summary = connections
-        .with_connection_mut(connection_token, |connection_state| {
-            let (io, events) = super::super::io::BorrowedSetupIo::from_connection(
-                connection,
-                connection_state,
-                io_core,
-            )?;
-            Ok::<_, Error>(SetupSummary {
-                posted_wrs: setup(io, events)?,
-            })
+    let mut setup_actions =
+        crate::v2::engine::reactor::ReactorActions::for_synchronous_driver_drop();
+    let setup_result = connections.with_connection_mut(connection_token, |connection_state| {
+        let (io, events) = super::super::io::BorrowedSetupIo::from_connection(
+            connection,
+            connection_state,
+            io_core,
+            &mut setup_actions,
+        )?;
+        Ok::<_, Error>(SetupSummary {
+            posted_wrs: setup(io, events)?,
         })
-        .ok_or(Error::TransportClosed)??;
+    });
+    setup_actions.append_setup_result_to(actions);
+    let summary = setup_result.ok_or(Error::TransportClosed)??;
     let accepted_after = connections.accepted_count(connection_token);
     let posted_wrs = accepted_after.checked_sub(accepted_before).ok_or_else(|| {
         Error::InvalidConfig("pre-establishment setup reduced the accepted WR set".into())

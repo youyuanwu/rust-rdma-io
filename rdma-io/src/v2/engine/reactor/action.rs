@@ -149,6 +149,21 @@ impl ReactorActions {
             action();
         }
     }
+
+    /// Collapse setup-only detached effects into one bounded publication
+    /// leaf. Setup has already committed all reactor-owned state before this
+    /// leaf can run, and a provider rejection of a batch may otherwise
+    /// produce more than one ordinary turn's worth of returned-MR events.
+    pub(in crate::v2::engine) fn append_setup_result_to(self, target: &mut Self) {
+        if self.len() == 0 {
+            return;
+        }
+        assert!(
+            target.can_accept(1),
+            "pre-establishment setup result exceeded turn budget"
+        );
+        target.push_operation(move || self.publish());
+    }
 }
 
 impl DeferredProtocolActions {
@@ -240,5 +255,31 @@ mod tests {
         }
         assert_eq!(actions.remaining(), 0);
         assert!(!actions.can_accept(1));
+    }
+
+    #[test]
+    fn setup_result_collapses_more_than_thirty_two_reentrant_effects() {
+        let borrow_gate = Arc::new(Mutex::new(()));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let reactor_borrow = borrow_gate.lock().unwrap();
+        let mut setup = ReactorActions::for_synchronous_driver_drop();
+        for index in 0..40 {
+            let borrow_gate = Arc::clone(&borrow_gate);
+            let observed = Arc::clone(&observed);
+            setup.push_operation(move || {
+                let _reentrant = borrow_gate
+                    .try_lock()
+                    .expect("setup publication runs after the reactor borrow ends");
+                observed.lock().unwrap().push(index);
+            });
+        }
+        let mut turn = ReactorActions::default();
+        setup.append_setup_result_to(&mut turn);
+        assert_eq!(turn.len(), 1);
+        assert!(observed.lock().unwrap().is_empty());
+
+        drop(reactor_borrow);
+        turn.publish();
+        assert_eq!(*observed.lock().unwrap(), (0..40).collect::<Vec<_>>());
     }
 }

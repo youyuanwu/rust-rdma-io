@@ -500,6 +500,7 @@ fn handle_route_resolved(
         connections,
         connection.session_token(),
         io_core,
+        actions,
         || {
             if request.observer.completion.is_cancelled() || shared.shutdown_requested() {
                 Err(Error::DriverShutdown)

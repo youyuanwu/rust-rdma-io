@@ -622,6 +622,7 @@ fn process_selected_pair(
         connections,
         connection.session_token(),
         io_core,
+        actions,
         || {
             let listener_error = state
                 .listeners

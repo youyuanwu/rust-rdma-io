@@ -53,32 +53,6 @@ pub(super) struct InternalBatchEntry {
 
 type InternalPostInput = (Mr, Option<(usize, usize)>, IoOperationContext);
 
-pub(in crate::v2::engine) fn post_io_recv_batch(
-    shared: &mut IoState,
-    connection: &Arc<EstablishedIoConnection>,
-    connection_io: &mut ConnectionIoState,
-    poster: &crate::v2::engine::session::connection::ConnectionPoster,
-    events: &IoEventSender,
-    requests: Vec<IoRecvRequest>,
-) -> IoSubmissionDisposition {
-    post_io_batch(
-        shared,
-        connection,
-        connection_io,
-        poster,
-        events,
-        OperationKind::Recv,
-        requests
-            .into_iter()
-            .map(|request| {
-                let (mr, context) = request.into_parts();
-                (mr, None, context)
-            })
-            .collect(),
-        None,
-    )
-}
-
 pub(in crate::v2::engine) fn post_io_recv_batch_into(
     shared: &mut IoState,
     connection: &Arc<EstablishedIoConnection>,
