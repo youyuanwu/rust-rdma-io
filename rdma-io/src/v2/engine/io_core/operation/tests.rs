@@ -16,7 +16,7 @@ use crate::v2::engine::registry::{ConnectionToken, LiveIoConnectionProof, Lookup
 use crate::v2::error::Error;
 use crate::v2::qp::BatchPostOutcome;
 use crate::wc::{WcOpcode, WorkCompletion};
-use rdma_io_sys::ibverbs::{IBV_WC_RECV, IBV_WC_SEND, IBV_WC_SUCCESS};
+use rdma_io_sys::ibverbs::{IBV_WC_LOC_QP_OP_ERR, IBV_WC_RECV, IBV_WC_SEND, IBV_WC_SUCCESS};
 
 struct TestSignal;
 
@@ -448,6 +448,58 @@ fn exact_cqe_validation_rejects_wrong_qp_opcode_and_duplicate() {
             CqeReject::UnexpectedOpcode,
             CqeReject::Duplicate,
         ]
+    );
+}
+
+#[test]
+fn wrong_opcode_success_is_rejected_but_exact_failed_cqe_terminalizes() {
+    let mut core = core(2);
+    let (connection, mut connection_io) = connection(8, 3, 29);
+    let token = install_accepted(
+        &mut core,
+        &connection,
+        &mut connection_io,
+        Direction::Send,
+        WcOpcode::Send,
+    );
+    let live = LiveIoConnectionProof::for_test(connection.identity());
+
+    let wrong_opcode_success = core
+        .prepare_completion(wc(token, 29, IBV_WC_RECV))
+        .expect("live token resolves");
+    assert!(
+        core.enqueue_prepared_completion(
+            wrong_opcode_success,
+            Some(live),
+            &connection,
+            &mut connection_io,
+        )
+        .is_none()
+    );
+    assert_eq!(core.accepted_count(), 1);
+
+    let mut failed = wc(token, 29, IBV_WC_RECV);
+    failed.inner.status = IBV_WC_LOC_QP_OP_ERR;
+    let exact_failed = core
+        .prepare_completion(failed)
+        .expect("the exact generational token still resolves");
+    assert_eq!(
+        core.enqueue_prepared_completion(
+            exact_failed,
+            Some(live),
+            &connection,
+            &mut connection_io,
+        ),
+        Some(connection.identity().connection)
+    );
+    let (processed, ready, _) =
+        core.dispatch_connection_completions(&connection, &mut connection_io, 1);
+    assert_eq!((processed, ready), (1, false));
+    assert_eq!(core.operations.live(), 0);
+    assert_eq!(core.accepted_count(), 0);
+    assert_eq!(
+        core.rejected_cqe_reasons(),
+        vec![CqeReject::UnexpectedOpcode]
     );
 }
 

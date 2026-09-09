@@ -100,9 +100,13 @@ The following mechanisms are intentionally not migration scaffolding:
 - Exact-prefix and ambiguous batch outcomes preserve whole ownership until
   positive evidence permits release
   ([operation/tests.rs:315-392](../../rdma-io/src/v2/engine/io_core/operation/tests.rs#L315-L392)).
-- Wrong QP, wrong opcode, unknown/stale generation, and duplicate CQEs cannot
-  release ownership
-  ([operation/tests.rs:393-494](../../rdma-io/src/v2/engine/io_core/operation/tests.rs#L393-L494)).
+- Successful CQEs require the expected opcode; wrong-QP, wrong-opcode-success,
+  unknown/stale-generation, and duplicate CQEs cannot release ownership.
+  Failed CQEs retain the exact token, connection generation, and QP checks but
+  deliberately ignore opcode because providers may leave that field
+  unreliable on error; the exact failed operation still terminalizes instead
+  of leaking ownership
+  ([operation/tests.rs:393-504](../../rdma-io/src/v2/engine/io_core/operation/tests.rs#L393-L504)).
 - QP-destruction reclamation requires the exact connection and QP
   ([operation/tests.rs:495-535](../../rdma-io/src/v2/engine/io_core/operation/tests.rs#L495-L535)).
 - The eight-connection provider test injects invalid and duplicate CQEs through

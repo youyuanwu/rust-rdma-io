@@ -205,10 +205,15 @@ reconciliation commits
 ### CQE validation and release
 
 CQ polling first resolves the exact operation generation. Enqueue then requires
-the current connection generation, exact `qp_num`, expected opcode, success
-status, and non-duplicate completion state. Rejected CQEs cannot release MRs,
-local credits, registry entries, or CQ debt
+the current connection generation, exact `qp_num`, and non-duplicate completion
+state. A successful CQE additionally requires the expected opcode. A failed
+CQE may carry an unreliable provider opcode, so exact-identity failure bypasses
+only the opcode check and terminalizes that operation rather than leaking its
+ownership. CQEs rejected for token, generation, connection, QP, successful
+opcode, or duplicate mismatch cannot release MRs, local credits, registry
+entries, or CQ debt
 ([operation/completion.rs:120-217](../../rdma-io/src/v2/engine/io_core/operation/completion.rs#L120-L217),
+[operation/tests.rs:393-504](../../rdma-io/src/v2/engine/io_core/operation/tests.rs#L393-L504),
 [io_core/progress.rs:204-281](../../rdma-io/src/v2/engine/io_core/progress.rs#L204-L281)).
 
 Completion dispatch is bounded per connection. It releases the operation slot,
