@@ -256,7 +256,7 @@ async fn integrated_all_source_contention_has_bounded_non_starvation() {
     driver
         .reactor
         .turn_for_test(&engine.shared, CompletionMode::Polling, &mut cx)
-        .unwrap_or_else(|_| true);
+        .unwrap_or(true);
     assert!(driver.reactor.last_action_count_for_test() <= 32);
     let terminal = driver.reactor.take_served_sources_for_test();
     assert!(

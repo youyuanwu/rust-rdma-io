@@ -273,6 +273,10 @@ pub(in crate::v2::engine) fn empty_connection_setup() -> ConnectionSetup {
     Box::new(|_connection, _events| Ok(0))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "setup keeps connection ownership, detached publication, and provider establishment explicit"
+)]
 pub(in crate::v2::engine) fn run_setup_before_establish(
     setup: ConnectionSetup,
     connection: &RdmaConnection,
