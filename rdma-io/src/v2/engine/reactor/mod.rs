@@ -22,7 +22,7 @@ use super::session::{CmShutdownClass, CmSoftwareClass, SessionReactorSources};
 
 #[cfg(test)]
 pub(super) use action::REACTOR_ACTION_BUDGET;
-pub(super) use action::ReactorActions;
+pub(super) use action::{DeferredProtocolActions, ReactorActions};
 pub(super) use command::CommandIngress;
 use scheduler::{ReactorScheduler, ReactorSource};
 

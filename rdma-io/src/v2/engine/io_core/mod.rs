@@ -26,9 +26,11 @@ use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
 pub(super) use operation::CqeReject;
 pub use operation::RdmaOperation;
 pub(in crate::v2::engine) use operation::future::OperationCommand;
+#[cfg(test)]
+pub(super) use operation::post_io_send;
 pub(super) use operation::{
     CommittedIoCoreEffects, IoCoreEffects, OperationQuarantineEffect, OperationState,
-    QpReclaimCapability, post_io_recv_batch, post_io_send,
+    QpReclaimCapability, post_io_recv_batch, post_io_recv_batch_into, post_io_send_into,
 };
 use operation::{CqCreditPool, OperationRegistry};
 #[cfg(test)]

@@ -9,6 +9,7 @@ use std::task::Poll;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::super::driver::{COMMAND_WORK, SESSION_WORK, WorkSignal};
+use super::super::io::ProtocolCommand;
 use super::super::io_core::OperationCommand;
 use super::super::registry::{ConnectionToken, Lookup, lock_unpoison, read_unpoison};
 use super::super::session::SessionManager;
@@ -32,7 +33,13 @@ struct CommandQueues {
     connect: VecDeque<SessionCommand>,
     listen: VecDeque<SessionCommand>,
     operation: VecDeque<(Arc<OperationCommand>, OwnedSemaphorePermit)>,
+    protocol: VecDeque<ProtocolQueueEntry>,
     next_class: usize,
+}
+
+enum ProtocolQueueEntry {
+    Command(ProtocolCommand, OwnedSemaphorePermit),
+    Publication(super::DeferredProtocolActions),
 }
 
 #[derive(Default)]
@@ -55,6 +62,7 @@ pub(in crate::v2::engine) struct CommandIngress {
     connect_permits: Arc<Semaphore>,
     listen_permits: Arc<Semaphore>,
     operation_permits: Arc<Semaphore>,
+    operation_capacity: usize,
     queues: Mutex<CommandQueues>,
     controls: Mutex<ControlQueue>,
     shutdown: AtomicBool,
@@ -73,6 +81,7 @@ impl CommandIngress {
             connect_permits: Arc::new(Semaphore::new(connection_capacity)),
             listen_permits: Arc::new(Semaphore::new(connection_capacity)),
             operation_permits: Arc::new(Semaphore::new(operation_capacity)),
+            operation_capacity,
             queues: Mutex::new(CommandQueues::default()),
             controls: Mutex::new(ControlQueue::default()),
             shutdown: AtomicBool::new(false),
@@ -196,6 +205,53 @@ impl CommandIngress {
         Ok(())
     }
 
+    #[cfg_attr(test, allow(dead_code))]
+    pub(in crate::v2::engine) fn enqueue_protocol(
+        &self,
+        manager: &SessionManager,
+        command: ProtocolCommand,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<(), (Error, ProtocolCommand)> {
+        let _admission = read_unpoison(&manager.admission);
+        if self.closed.load(Ordering::Acquire) {
+            return Err((
+                manager.admission_error().unwrap_or(Error::DriverShutdown),
+                command,
+            ));
+        }
+        lock_unpoison(&self.queues)
+            .protocol
+            .push_back(ProtocolQueueEntry::Command(command, permit));
+        Ok(())
+    }
+
+    pub(in crate::v2::engine) fn validate_operation_batch(
+        &self,
+        count: usize,
+    ) -> Result<u32, Error> {
+        let count = u32::try_from(count).map_err(|_| {
+            Error::InvalidConfig("protocol I/O batch length must be in 1..=u32::MAX".into())
+        })?;
+        if count == 0 || count as usize > self.operation_capacity {
+            return Err(Error::InvalidConfig(format!(
+                "protocol I/O batch length must be in 1..={}",
+                self.operation_capacity
+            )));
+        }
+        Ok(count)
+    }
+
+    pub(in crate::v2::engine) fn operation_batch_acquire(
+        self: &Arc<Self>,
+        count: usize,
+    ) -> impl std::future::Future<Output = Option<OwnedSemaphorePermit>> + Send + 'static {
+        let permits = Arc::clone(&self.operation_permits);
+        let count = self
+            .validate_operation_batch(count)
+            .expect("protocol batch is validated before admission");
+        async move { permits.acquire_many_owned(count).await.ok() }
+    }
+
     pub(in crate::v2::engine) fn cancel_operation(&self, target: &Arc<OperationCommand>) -> bool {
         let command = {
             let mut queues = lock_unpoison(&self.queues);
@@ -260,6 +316,7 @@ impl CommandIngress {
         let commands: Vec<_> = queues.connect.drain(..).collect();
         let listens: Vec<_> = queues.listen.drain(..).collect();
         let operations: Vec<_> = queues.operation.drain(..).collect();
+        let protocols: Vec<_> = queues.protocol.drain(..).collect();
         drop(queues);
         for command in commands.into_iter().chain(listens) {
             match command {
@@ -275,6 +332,14 @@ impl CommandIngress {
         for (command, _permit) in operations {
             command.cancel_before_execution(error.clone());
         }
+        for entry in protocols {
+            match entry {
+                ProtocolQueueEntry::Command(command, _permit) => {
+                    command.reject(error.clone());
+                }
+                ProtocolQueueEntry::Publication(actions) => actions.publish_synchronously(),
+            }
+        }
     }
 
     pub(in crate::v2::engine) fn drain_ordinary_into(
@@ -286,6 +351,7 @@ impl CommandIngress {
         let commands: Vec<_> = queues.connect.drain(..).collect();
         let listens: Vec<_> = queues.listen.drain(..).collect();
         let operations: Vec<_> = queues.operation.drain(..).collect();
+        let protocols: Vec<_> = queues.protocol.drain(..).collect();
         drop(queues);
         for command in commands.into_iter().chain(listens) {
             match command {
@@ -300,6 +366,20 @@ impl CommandIngress {
         }
         for (command, _permit) in operations {
             command.cancel_before_execution_into(error.clone(), actions);
+        }
+        for entry in protocols {
+            match entry {
+                ProtocolQueueEntry::Command(command, _permit) => {
+                    command.reject_into(error.clone(), actions);
+                }
+                ProtocolQueueEntry::Publication(mut pending) => {
+                    pending.append_bounded_to(actions);
+                    assert!(
+                        pending.is_empty(),
+                        "synchronous driver-drop actions have unbounded capacity"
+                    );
+                }
+            }
         }
     }
 
@@ -339,6 +419,7 @@ impl CommandIngress {
         enum ReadyCommand {
             Session(SessionCommand),
             Operation(Arc<OperationCommand>, OwnedSemaphorePermit),
+            Protocol(ProtocolQueueEntry),
         }
         let terminal_error = self.closed.load(Ordering::Acquire).then(|| {
             shared
@@ -349,8 +430,8 @@ impl CommandIngress {
         let command = if actions.remaining() != 0 {
             let mut queues = lock_unpoison(&self.queues);
             let mut selected = None;
-            for offset in 0..3 {
-                let class = (queues.next_class + offset) % 3;
+            for offset in 0..4 {
+                let class = (queues.next_class + offset) % 4;
                 let required_actions = if class == 2 && terminal_error.is_none() {
                     // Starting an operation can synchronously consume an early
                     // CQE (event + operation wake + close wake) before the
@@ -369,10 +450,11 @@ impl CommandIngress {
                         .operation
                         .pop_front()
                         .map(|(command, permit)| ReadyCommand::Operation(command, permit)),
+                    3 => queues.protocol.pop_front().map(ReadyCommand::Protocol),
                     _ => unreachable!(),
                 };
                 if selected.is_some() {
-                    queues.next_class = (class + 1) % 3;
+                    queues.next_class = (class + 1) % 4;
                     break;
                 }
             }
@@ -407,6 +489,32 @@ impl CommandIngress {
                     }
                     drop(permit);
                 }
+                ReadyCommand::Protocol(entry) => {
+                    let mut publication = match entry {
+                        ProtocolQueueEntry::Command(command, permit) => {
+                            let count = command.len();
+                            let mut publication = super::DeferredProtocolActions::new(count);
+                            if command.receiver_lost() {
+                                drop(command);
+                            } else if command.is_cancelled() {
+                                command.cancel_into(publication.actions_mut());
+                            } else if let Some(error) = terminal_error {
+                                command.reject_into(error, publication.actions_mut());
+                            } else {
+                                command.execute_into(shared, publication.actions_mut());
+                            }
+                            drop(permit);
+                            publication
+                        }
+                        ProtocolQueueEntry::Publication(publication) => publication,
+                    };
+                    publication.append_bounded_to(actions);
+                    if !publication.is_empty() {
+                        lock_unpoison(&self.queues)
+                            .protocol
+                            .push_front(ProtocolQueueEntry::Publication(publication));
+                    }
+                }
             }
         }
 
@@ -436,7 +544,11 @@ impl CommandIngress {
             return true;
         }
         let queues = lock_unpoison(&self.queues);
-        if !queues.connect.is_empty() || !queues.listen.is_empty() || !queues.operation.is_empty() {
+        if !queues.connect.is_empty()
+            || !queues.listen.is_empty()
+            || !queues.operation.is_empty()
+            || !queues.protocol.is_empty()
+        {
             return true;
         }
         drop(queues);
@@ -469,6 +581,11 @@ impl CommandIngress {
     }
 
     #[cfg(test)]
+    pub(in crate::v2::engine) fn pending_protocol(&self) -> usize {
+        lock_unpoison(&self.queues).protocol.len()
+    }
+
+    #[cfg(test)]
     pub(in crate::v2::engine) fn available_operation_permits(&self) -> usize {
         self.operation_permits.available_permits()
     }
@@ -477,9 +594,45 @@ impl CommandIngress {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::Context;
 
     use super::super::super::driver::WorkSignal;
+    use super::super::super::io::{
+        ProtocolCommand, ProtocolIoCommandAdapter, ProtocolTestProbe, event_port,
+    };
+    use super::super::super::{CompletionMode, test_engine_pair};
     use super::CommandIngress;
+
+    fn protocol_probe(cancelled: bool) -> ProtocolTestProbe {
+        ProtocolTestProbe {
+            cancelled: Arc::new(AtomicBool::new(cancelled)),
+            executed: Arc::new(AtomicUsize::new(0)),
+            resolved: Arc::new(AtomicUsize::new(0)),
+            dropped: Arc::new(AtomicUsize::new(0)),
+            published: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn protocol_adapter(engine: &super::super::super::RdmaEngine) -> Arc<ProtocolIoCommandAdapter> {
+        ProtocolIoCommandAdapter::new(
+            Arc::downgrade(&engine.shared.commands),
+            Arc::downgrade(&engine.shared.session),
+        )
+    }
+
+    fn test_protocol_command(
+        adapter: &ProtocolIoCommandAdapter,
+        operations: usize,
+        actions: usize,
+        probe: ProtocolTestProbe,
+    ) -> (ProtocolCommand, super::super::super::io::IoEventReceiver) {
+        let (events, receiver) = event_port();
+        (
+            ProtocolCommand::for_test(operations, actions, events, adapter.open_token(), probe),
+            receiver,
+        )
+    }
 
     #[tokio::test]
     async fn connect_admission_is_bounded_and_wakes_after_release() {
@@ -559,6 +712,151 @@ mod tests {
         drop(first.await.unwrap());
         assert_eq!(rx.recv().await, Some(2));
         drop(second.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn protocol_batch_permits_wait_atomically_and_restore_exact_capacity() {
+        let ingress = CommandIngress::new(1, 4, Arc::new(WorkSignal::new()));
+        let first = ingress.operation_batch_acquire(3).await.unwrap();
+        assert_eq!(ingress.operation_permits.available_permits(), 1);
+        let waiting = {
+            let ingress = Arc::clone(&ingress);
+            tokio::spawn(async move { ingress.operation_batch_acquire(2).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        assert_eq!(ingress.operation_permits.available_permits(), 0);
+        drop(first);
+        let second = waiting.await.unwrap().unwrap();
+        assert_eq!(ingress.operation_permits.available_permits(), 2);
+        drop(second);
+        assert_eq!(ingress.operation_permits.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn saturated_protocol_admission_stays_frontend_owned_until_capacity_recovers() {
+        let (engine, _driver) = test_engine_pair(CompletionMode::Polling);
+        let commands = Arc::clone(&engine.shared.commands);
+        let capacity = commands.available_operation_permits();
+        let blocker = commands.operation_batch_acquire(capacity).await.unwrap();
+        let adapter = protocol_adapter(&engine);
+        let probe = protocol_probe(false);
+        let (command, _events) = test_protocol_command(&adapter, 3, 0, probe.clone());
+        assert!(adapter.submit(command).is_ok());
+
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        assert_eq!(adapter.poll(&mut cx, 1), 0);
+        assert_eq!(commands.pending_protocol(), 0);
+        assert_eq!(probe.executed.load(Ordering::Acquire), 0);
+        assert_eq!(probe.dropped.load(Ordering::Acquire), 0);
+
+        drop(blocker);
+        tokio::task::yield_now().await;
+        assert_eq!(adapter.poll(&mut cx, 1), 1);
+        assert_eq!(commands.pending_protocol(), 1);
+        commands.service_turn(&engine.shared);
+        assert_eq!(probe.executed.load(Ordering::Acquire), 1);
+        assert_eq!(probe.dropped.load(Ordering::Acquire), 1);
+        assert_eq!(commands.available_operation_permits(), capacity);
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_and_after_protocol_queueing_resolves_once() {
+        let (engine, _driver) = test_engine_pair(CompletionMode::Polling);
+        let commands = Arc::clone(&engine.shared.commands);
+        let capacity = commands.available_operation_permits();
+        let blocker = commands.operation_batch_acquire(capacity).await.unwrap();
+        let adapter = protocol_adapter(&engine);
+        let before = protocol_probe(false);
+        let (command, _events) = test_protocol_command(&adapter, 1, 0, before.clone());
+        assert!(adapter.submit(command).is_ok());
+        before.cancelled.store(true, Ordering::Release);
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        assert_eq!(adapter.poll(&mut cx, 1), 1);
+        assert_eq!(before.resolved.load(Ordering::Acquire), 1);
+        assert_eq!(before.executed.load(Ordering::Acquire), 0);
+        assert_eq!(before.dropped.load(Ordering::Acquire), 1);
+
+        drop(blocker);
+        let after = protocol_probe(false);
+        let (command, _events) = test_protocol_command(&adapter, 1, 0, after.clone());
+        assert!(adapter.submit(command).is_ok());
+        assert_eq!(adapter.poll(&mut cx, 1), 1);
+        assert_eq!(commands.pending_protocol(), 1);
+        after.cancelled.store(true, Ordering::Release);
+        commands.service_turn(&engine.shared);
+        assert_eq!(after.resolved.load(Ordering::Acquire), 1);
+        assert_eq!(after.executed.load(Ordering::Acquire), 0);
+        assert_eq!(after.dropped.load(Ordering::Acquire), 1);
+        assert_eq!(commands.available_operation_permits(), capacity);
+    }
+
+    #[tokio::test]
+    async fn queued_protocol_receiver_loss_prevents_provider_execution_and_restores_permit() {
+        let (engine, _driver) = test_engine_pair(CompletionMode::Polling);
+        let commands = Arc::clone(&engine.shared.commands);
+        let capacity = commands.available_operation_permits();
+        let adapter = protocol_adapter(&engine);
+        let probe = protocol_probe(false);
+        let (command, events) = test_protocol_command(&adapter, 2, 0, probe.clone());
+        assert!(adapter.submit(command).is_ok());
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        assert_eq!(adapter.poll(&mut cx, 1), 1);
+        assert_eq!(commands.available_operation_permits(), capacity - 2);
+        drop(events);
+
+        commands.service_turn(&engine.shared);
+        assert_eq!(probe.executed.load(Ordering::Acquire), 0);
+        assert_eq!(probe.resolved.load(Ordering::Acquire), 0);
+        assert_eq!(probe.dropped.load(Ordering::Acquire), 1);
+        assert_eq!(commands.available_operation_permits(), capacity);
+    }
+
+    #[tokio::test]
+    async fn large_protocol_batch_drains_publication_across_bounded_turns() {
+        let (engine, _driver) = test_engine_pair(CompletionMode::Polling);
+        let commands = Arc::clone(&engine.shared.commands);
+        let capacity = commands.available_operation_permits();
+        let adapter = protocol_adapter(&engine);
+        let probe = protocol_probe(false);
+        let (command, _events) = test_protocol_command(&adapter, 12, 12, probe.clone());
+        assert!(adapter.submit(command).is_ok());
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        assert_eq!(adapter.poll(&mut cx, 1), 1);
+
+        let mut actions = super::super::ReactorActions::default();
+        for _ in 0..28 {
+            actions.push_operation(|| {});
+        }
+        let first = commands.service_turn_into(&engine.shared, &mut actions);
+        assert!(first.has_more);
+        actions.publish();
+        assert_eq!(probe.executed.load(Ordering::Acquire), 1);
+        assert_eq!(probe.published.load(Ordering::Acquire), 4);
+        assert_eq!(commands.available_operation_permits(), capacity);
+
+        let second = commands.service_turn(&engine.shared);
+        assert!(!second.has_more);
+        assert_eq!(probe.published.load(Ordering::Acquire), 12);
+        assert_eq!(probe.dropped.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn closed_protocol_admission_rejects_without_consuming_capacity() {
+        let ingress = CommandIngress::new(1, 4, Arc::new(WorkSignal::new()));
+        ingress.close_admission();
+        assert!(ingress.operation_batch_acquire(2).await.is_none());
+        assert_eq!(ingress.operation_permits.available_permits(), 4);
+    }
+
+    #[test]
+    fn oversized_protocol_batch_is_rejected_before_waiting() {
+        let ingress = CommandIngress::new(1, 4, Arc::new(WorkSignal::new()));
+        assert!(matches!(
+            ingress.validate_operation_batch(5),
+            Err(crate::v2::Error::InvalidConfig(_))
+        ));
+        assert_eq!(ingress.operation_permits.available_permits(), 4);
     }
 
     #[test]

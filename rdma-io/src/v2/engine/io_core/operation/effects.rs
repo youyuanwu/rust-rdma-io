@@ -9,13 +9,13 @@ use crate::v2::engine::session::IoEffectsCommitAuthority;
 
 use super::state::OperationState;
 
-/// Legacy protocol-compatible publication bundle.
+/// Detached publication produced after provider submission and ownership
+/// reconciliation.
 ///
-/// The crate-private message batch path remains direct until Phase 5A and can
-/// legitimately contain more than one reactor poll's 32-leaf budget. Reactor
-/// sources convert only a capacity-reserved prefix-free whole transition into
-/// [`ReactorActions`]; direct protocol batches keep their pre-Phase-5A
-/// behavior without weakening the reactor bound.
+/// Direct setup/test callers publish this bundle immediately. Protocol
+/// commands append it to a command-owned [`ReactorActions`] buffer, which the
+/// command ingress drains into bounded turn-local actions without repeating
+/// provider submission.
 #[derive(Default)]
 pub(super) struct AfterEngineUnlock {
     events: Vec<PendingIoEvent>,

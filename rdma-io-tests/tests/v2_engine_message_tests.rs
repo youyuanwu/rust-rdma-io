@@ -465,6 +465,19 @@ async fn run_queued_owned_completion_is_drained_on_driver_drop(mode: CompletionM
         size: 64,
     };
     let (listener, server, mut client) = establish_on(&server_engine, &client_engine, config).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let diagnostics = client_engine.diagnostics();
+            if diagnostics.accepted_operations == config.recvs + 2
+                && diagnostics.registered_operations == config.recvs + 2
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("steady-state receive repost did not cross the command boundary");
     let baseline = client_engine.diagnostics();
 
     client.test_hold_io_events(true).unwrap();

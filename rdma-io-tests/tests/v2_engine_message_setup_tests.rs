@@ -131,8 +131,14 @@ async fn run_success(mode: CompletionMode) {
     for engine in [&server_engine, &client_engine] {
         let diagnostics = engine.diagnostics();
         assert_eq!(diagnostics.live_connections, 1);
-        assert_eq!(diagnostics.registered_operations, 34);
-        assert_eq!(diagnostics.accepted_operations, 34);
+        assert!(
+            (33..=34).contains(&diagnostics.registered_operations),
+            "the 33 setup receives remain accepted while the completed HELLO send may already be retired"
+        );
+        assert!(
+            (33..=34).contains(&diagnostics.accepted_operations),
+            "the 33 setup receives remain provider-owned while HELLO completion retirement may be in progress"
+        );
     }
 
     close_pair(

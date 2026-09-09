@@ -118,8 +118,8 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use super::engine::{
     RdmaConnection, RdmaConnectionConfig, RdmaEngine, RdmaListener,
     io::{
-        IoConnection, IoEvent, IoEventReceiver, IoOperationContext, IoRecvRequest, IoSendRequest,
-        IoTerminalEvent,
+        BorrowedSetupIo, IoCancellation, IoConnection, IoEvent, IoEventReceiver,
+        IoOperationContext, IoRecvRequest, IoSendRequest, IoTerminalEvent,
     },
 };
 use super::error::{Error, Result};
@@ -375,7 +375,7 @@ struct MessagePreparation {
 }
 
 impl MessagePreparation {
-    fn run(self, connection: IoConnection, events: IoEventReceiver) -> Result<usize> {
+    fn run(self, connection: BorrowedSetupIo<'_>, events: IoEventReceiver) -> Result<usize> {
         let total = self
             .recv_count
             .checked_add(protocol::CTRL_RECV_COUNT)
@@ -413,7 +413,8 @@ impl MessagePreparation {
             }));
         }
         let posted = disposition.accepted();
-        self.state.install_io(connection, events)?;
+        self.state
+            .install_io(connection.into_connection(), events)?;
         Ok(posted)
     }
 }
@@ -695,6 +696,7 @@ enum MessageIoContext {
 struct EngineSendRequest {
     inner: StdMutex<EngineSendRequestInner>,
     cancelled: AtomicBool,
+    io_cancellation: IoCancellation,
     credit_committed: AtomicBool,
     waker: AtomicWaker,
 }
@@ -729,6 +731,7 @@ impl EngineSendRequest {
                 output: None,
             }),
             cancelled: AtomicBool::new(false),
+            io_cancellation: IoCancellation::new(),
             credit_committed: AtomicBool::new(false),
             waker: AtomicWaker::new(),
         })
@@ -765,6 +768,7 @@ impl EngineSendRequest {
 
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
+        self.io_cancellation.cancel();
     }
 }
 
@@ -1004,6 +1008,7 @@ impl EngineMessageState {
             self.dispose_terminal_event(event);
         }
         if let Some(io) = self.io.get() {
+            io.connection.discard_pending_protocol();
             let events = if close_io {
                 io.events.close()
             } else {
@@ -1152,8 +1157,15 @@ impl EngineMessageState {
                 completion
             }
         };
-        let (_identity, context, result, mr, proven_unaccepted) = completion.into_parts();
-        self.process_io_completion(context, result, mr, proven_unaccepted);
+        let (_identity, context, result, mr, proven_unaccepted, cancelled_before_submit) =
+            completion.into_parts_with_cancellation();
+        self.process_io_completion(
+            context,
+            result,
+            mr,
+            proven_unaccepted,
+            cancelled_before_submit,
+        );
     }
 
     fn process_io_completion(
@@ -1162,6 +1174,7 @@ impl EngineMessageState {
         result: Result<super::op::Completion>,
         mr: Option<Mr>,
         proven_unaccepted: bool,
+        cancelled_before_submit: bool,
     ) {
         let context = match context.downcast::<MessageIoContext>() {
             Ok(context) => context,
@@ -1197,6 +1210,18 @@ impl EngineMessageState {
             }
             MessageIoContext::Receive => self.process_receive(result, mr),
             MessageIoContext::Send(request) => {
+                if cancelled_before_submit {
+                    if proven_unaccepted {
+                        self.rollback_unaccepted_send(&request);
+                    }
+                    if let Some(mr) = mr
+                        && let Ok(pools) = self.pools()
+                    {
+                        pools.data_sends.put(mr);
+                    }
+                    request.complete(Err(Error::DriverShutdown));
+                    return;
+                }
                 self.process_send_completion(request, result, mr, proven_unaccepted);
             }
             MessageIoContext::ControlSend => {
@@ -1382,11 +1407,14 @@ impl EngineMessageState {
                         return;
                     }
                 };
-                let disposition = io.connection.post_send(IoSendRequest::new(
-                    mr,
-                    frame_len,
-                    IoOperationContext::new(MessageIoContext::Send(Arc::clone(&request))),
-                ));
+                let disposition = io.connection.post_send(
+                    IoSendRequest::new(
+                        mr,
+                        frame_len,
+                        IoOperationContext::new(MessageIoContext::Send(Arc::clone(&request))),
+                    )
+                    .with_cancellation(request.io_cancellation.clone()),
+                );
                 if disposition.potentially_accepted()
                     && !disposition.all_accepted()
                     && let Some(error) = disposition.error()
@@ -1706,11 +1734,24 @@ impl EngineMessageState {
 }
 
 impl EngineMessageState {
-    fn process(&self, budget: usize, prefer_credit: &mut bool, prefer_io: &mut bool) -> usize {
+    fn process(
+        &self,
+        cx: &mut Context<'_>,
+        budget: usize,
+        prefer_credit: &mut bool,
+        prefer_io: &mut bool,
+        prefer_admission: &mut bool,
+    ) -> usize {
         let mut processed = 0;
         while processed < budget {
+            if *prefer_admission && self.poll_protocol_admission(cx) {
+                *prefer_admission = false;
+                processed += 1;
+                continue;
+            }
             if *prefer_credit && self.flush_one_credit() {
                 *prefer_credit = false;
+                *prefer_admission = true;
                 processed += 1;
                 continue;
             }
@@ -1721,12 +1762,21 @@ impl EngineMessageState {
                     EngineMessageWork::Io(event) => self.process_io_event(event),
                 }
                 *prefer_credit = true;
+                *prefer_admission = true;
+            } else if self.poll_protocol_admission(cx) {
+                *prefer_admission = false;
             } else if !self.flush_one_credit() {
                 break;
             }
             processed += 1;
         }
         processed
+    }
+
+    fn poll_protocol_admission(&self, cx: &mut Context<'_>) -> bool {
+        self.io
+            .get()
+            .is_some_and(|io| io.connection.poll_protocol_admission(cx, 1) != 0)
     }
 
     fn pop_work(&self, prefer_io: &mut bool) -> Option<EngineMessageWork> {
@@ -1769,6 +1819,10 @@ impl EngineMessageState {
 
     fn has_work(&self) -> bool {
         !lock_std(&self.events).is_empty()
+            || self
+                .io
+                .get()
+                .is_some_and(|io| io.connection.has_unpolled_protocol_admission())
             || (!self.io_events_held() && self.io.get().is_some_and(|io| io.events.has_events()))
             || (self.pending_credit_returns.load(Ordering::Acquire) != 0
                 && self
@@ -1815,6 +1869,7 @@ pub struct MessageTransportDriver {
     runtime_checked: bool,
     prefer_credit: bool,
     prefer_io: bool,
+    prefer_admission: bool,
     completed: bool,
 }
 
@@ -1827,6 +1882,7 @@ impl MessageTransportDriver {
             runtime_checked: false,
             prefer_credit: false,
             prefer_io: false,
+            prefer_admission: false,
             completed: false,
         }
     }
@@ -1866,9 +1922,11 @@ impl Future for MessageTransportDriver {
         }
 
         this.state.process(
+            cx,
             MESSAGE_DRIVER_BUDGET,
             &mut this.prefer_credit,
             &mut this.prefer_io,
+            &mut this.prefer_admission,
         );
         if let Some(result) = this.state.driver_result() {
             this.completed = true;
@@ -2617,7 +2675,18 @@ mod tests {
         )));
         let mut prefer_credit = false;
         let mut prefer_io = false;
-        assert_eq!(state.process(1, &mut prefer_credit, &mut prefer_io), 1);
+        let mut prefer_admission = false;
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        assert_eq!(
+            state.process(
+                &mut cx,
+                1,
+                &mut prefer_credit,
+                &mut prefer_io,
+                &mut prefer_admission,
+            ),
+            1
+        );
         assert!(matches!(
             ready.await.unwrap(),
             Err(Error::ProtocolViolation(message)) if message == "steady-state failure"
@@ -2638,7 +2707,18 @@ mod tests {
         state.enqueue_event(EngineMessageEvent::TestDisconnected);
         let mut prefer_credit = false;
         let mut prefer_io = false;
-        assert_eq!(state.process(1, &mut prefer_credit, &mut prefer_io), 1);
+        let mut prefer_admission = false;
+        let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+        assert_eq!(
+            state.process(
+                &mut cx,
+                1,
+                &mut prefer_credit,
+                &mut prefer_io,
+                &mut prefer_admission,
+            ),
+            1
+        );
         assert_eq!(state.state.load(Ordering::Acquire), STATE_FAILED);
         assert!(matches!(state.terminal_error(), Error::TransportClosed));
     }
@@ -2655,6 +2735,7 @@ mod tests {
                 vendor_err: 0,
             }),
             None,
+            false,
             false,
         );
 
@@ -2673,6 +2754,7 @@ mod tests {
                 vendor_err: 7,
             }),
             None,
+            false,
             false,
         );
 
@@ -2903,6 +2985,7 @@ mod tests {
             IoOperationContext::new(MessageIoContext::ControlSend),
             Err(Error::TransportClosed),
             None,
+            false,
             false,
         );
         assert_eq!(state.state.load(Ordering::Acquire), STATE_FAILED);

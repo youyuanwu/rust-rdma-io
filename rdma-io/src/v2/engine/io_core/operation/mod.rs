@@ -55,12 +55,16 @@ use crate::wr::{PreparedRecvBatch, PreparedSendBatch, Sge, WrOpcode};
 
 pub(super) use accounting::{CqCreditPool, OperationRegistry};
 #[cfg(test)]
+pub(in crate::v2::engine) use batch::post_io_send;
+#[cfg(test)]
 use batch::test_support::{
     InternalBatchEntry, InternalRelease, commit_internal_entries, release_proven_unaccepted_entries,
 };
 #[cfg(test)]
 use batch::{BatchOwnershipTransfer, PreparedBatchOwnership};
-pub(in crate::v2::engine) use batch::{post_io_recv_batch, post_io_send};
+pub(in crate::v2::engine) use batch::{
+    post_io_recv_batch, post_io_recv_batch_into, post_io_send_into,
+};
 pub(in crate::v2::engine) use completion::CqeReject;
 #[cfg(test)]
 use effects::AfterEngineUnlock;

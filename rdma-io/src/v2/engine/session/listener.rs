@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 
-use super::super::io::{IoConnection, IoEventReceiver};
+use super::super::io::{BorrowedSetupIo, IoEventReceiver};
 use super::super::lifecycle::{MemoizedTerminalResult, TakeOnceResult};
 use super::super::reactor::CommandIngress;
 use super::super::reactor::completion::CommandCompletion;
@@ -134,7 +134,7 @@ impl RdmaListener {
         setup: F,
     ) -> Result<RdmaConnection>
     where
-        F: FnOnce(IoConnection, IoEventReceiver) -> Result<usize> + Send + 'static,
+        F: for<'a> FnOnce(BorrowedSetupIo<'a>, IoEventReceiver) -> Result<usize> + Send + 'static,
     {
         let (manager, state) = self.session.owners()?;
         accept_with_setup(manager, state, config, Box::new(setup)).await
@@ -249,7 +249,7 @@ pub(in crate::v2::engine) fn run_setup_before_establish(
 ) -> Result<SetupSummary> {
     let connection_state = connection.require_session_state()?;
     let accepted_before = connection_state.accepted_count();
-    let (io, events) = IoConnection::from_connection(connection)?;
+    let (io, events) = super::super::io::BorrowedSetupIo::from_connection(connection)?;
     let summary = SetupSummary {
         posted_wrs: setup(io, events)?,
     };

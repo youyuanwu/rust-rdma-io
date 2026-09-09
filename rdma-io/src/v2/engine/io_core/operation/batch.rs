@@ -28,6 +28,7 @@ use crate::v2::engine::io::{
     IoEventDestination, IoEventSender, IoOperationContext, IoRecvRequest, IoSendRequest,
     IoSubmissionDisposition,
 };
+use crate::v2::engine::reactor::ReactorActions;
 use crate::v2::engine::registry::OperationToken;
 use crate::v2::error::{Error, Result};
 use crate::v2::mr::Mr;
@@ -66,22 +67,66 @@ pub(in crate::v2::engine) fn post_io_recv_batch(
                 (mr, None, context)
             })
             .collect(),
+        None,
     )
 }
 
+pub(in crate::v2::engine) fn post_io_recv_batch_into(
+    shared: &IoCore,
+    connection: &Arc<EstablishedIoConnection>,
+    events: &IoEventSender,
+    requests: Vec<IoRecvRequest>,
+    actions: &mut ReactorActions,
+) -> IoSubmissionDisposition {
+    post_io_batch(
+        shared,
+        connection,
+        events,
+        OperationKind::Recv,
+        requests
+            .into_iter()
+            .map(|request| {
+                let (mr, context) = request.into_parts();
+                (mr, None, context)
+            })
+            .collect(),
+        Some(actions),
+    )
+}
+
+#[cfg(test)]
 pub(in crate::v2::engine) fn post_io_send(
     shared: &IoCore,
     connection: &Arc<EstablishedIoConnection>,
     events: &IoEventSender,
     request: IoSendRequest,
 ) -> IoSubmissionDisposition {
-    let (mr, len, context) = request.into_parts();
+    let (mr, len, context, _) = request.into_parts();
     post_io_batch(
         shared,
         connection,
         events,
         OperationKind::Send,
         vec![(mr, Some((0, len)), context)],
+        None,
+    )
+}
+
+pub(in crate::v2::engine) fn post_io_send_into(
+    shared: &IoCore,
+    connection: &Arc<EstablishedIoConnection>,
+    events: &IoEventSender,
+    request: IoSendRequest,
+    actions: &mut ReactorActions,
+) -> IoSubmissionDisposition {
+    let (mr, len, context, _) = request.into_parts();
+    post_io_batch(
+        shared,
+        connection,
+        events,
+        OperationKind::Send,
+        vec![(mr, Some((0, len)), context)],
+        Some(actions),
     )
 }
 
@@ -91,6 +136,7 @@ fn post_io_batch(
     events: &IoEventSender,
     kind: OperationKind,
     entries: Vec<InternalPostInput>,
+    mut actions: Option<&mut ReactorActions>,
 ) -> IoSubmissionDisposition {
     if entries.is_empty() {
         return IoSubmissionDisposition::FullyUnaccepted {
@@ -103,7 +149,7 @@ fn post_io_batch(
     if let Some(error) = shared.admission_error() {
         let after_unlock = detach_unreserved_entries(events, entries, error.clone());
         drop(admission);
-        after_unlock.publish();
+        publish_after_unlock(after_unlock, &mut actions);
         return IoSubmissionDisposition::FullyUnaccepted {
             proven_unaccepted: count,
             error,
@@ -114,7 +160,7 @@ fn post_io_batch(
         Err(error) => {
             let after_unlock = detach_unreserved_entries(events, entries, error.clone());
             drop(admission);
-            after_unlock.publish();
+            publish_after_unlock(after_unlock, &mut actions);
             return IoSubmissionDisposition::FullyUnaccepted {
                 proven_unaccepted: count,
                 error,
@@ -130,7 +176,7 @@ fn post_io_batch(
             let after_unlock = detach_unreserved_entries(events, entries, error.clone());
             drop(posting);
             drop(admission);
-            after_unlock.publish();
+            publish_after_unlock(after_unlock, &mut actions);
             return IoSubmissionDisposition::FullyUnaccepted {
                 proven_unaccepted: count,
                 error,
@@ -160,7 +206,7 @@ fn post_io_batch(
                 after_unlock.extend(detach_unreserved_entries(events, entries, error.clone()));
                 drop(posting);
                 drop(admission);
-                after_unlock.publish();
+                publish_after_unlock(after_unlock, &mut actions);
                 return IoSubmissionDisposition::FullyUnaccepted {
                     proven_unaccepted: count,
                     error,
@@ -178,7 +224,7 @@ fn post_io_batch(
             after_unlock.extend(detach_unreserved_entries(events, entries, error.clone()));
             drop(posting);
             drop(admission);
-            after_unlock.publish();
+            publish_after_unlock(after_unlock, &mut actions);
             return IoSubmissionDisposition::FullyUnaccepted {
                 proven_unaccepted: count,
                 error,
@@ -218,7 +264,7 @@ fn post_io_batch(
                 after_unlock.extend(detach_unreserved_entries(events, entries, error.clone()));
                 drop(posting);
                 drop(admission);
-                after_unlock.publish();
+                publish_after_unlock(after_unlock, &mut actions);
                 return IoSubmissionDisposition::FullyUnaccepted {
                     proven_unaccepted: count,
                     error,
@@ -245,7 +291,7 @@ fn post_io_batch(
             after_unlock.extend(detach_unreserved_entries(events, entries, error.clone()));
             drop(posting);
             drop(admission);
-            after_unlock.publish();
+            publish_after_unlock(after_unlock, &mut actions);
             return IoSubmissionDisposition::FullyUnaccepted {
                 proven_unaccepted: count,
                 error,
@@ -277,7 +323,7 @@ fn post_io_batch(
                     );
                     drop(posting);
                     drop(admission);
-                    after_unlock.publish();
+                    publish_after_unlock(after_unlock, &mut actions);
                     return IoSubmissionDisposition::FullyUnaccepted {
                         proven_unaccepted: count,
                         error,
@@ -307,7 +353,7 @@ fn post_io_batch(
                     );
                     drop(posting);
                     drop(admission);
-                    after_unlock.publish();
+                    publish_after_unlock(after_unlock, &mut actions);
                     return IoSubmissionDisposition::FullyUnaccepted {
                         proven_unaccepted: count,
                         error,
@@ -331,7 +377,7 @@ fn post_io_batch(
                 rollback_internal_entries(shared, connection, direction, entries, error.clone());
             drop(posting);
             drop(admission);
-            after_unlock.publish();
+            publish_after_unlock(after_unlock, &mut actions);
             return IoSubmissionDisposition::FullyUnaccepted {
                 proven_unaccepted: count,
                 error,
@@ -344,7 +390,7 @@ fn post_io_batch(
             let after_unlock = commit_internal_entries(shared, accepted);
             drop(posting);
             drop(admission);
-            after_unlock.publish();
+            publish_after_unlock(after_unlock, &mut actions);
             IoSubmissionDisposition::AllAccepted { accepted: count }
         }
         BatchOwnershipTransfer::Partial {
@@ -362,7 +408,7 @@ fn post_io_batch(
                     after_unlock.extend(commit_internal_entries(shared, accepted));
                     drop(posting);
                     drop(admission);
-                    after_unlock.publish();
+                    publish_after_unlock(after_unlock, &mut actions);
                     let error = Error::PostFailed(source);
                     if accepted_count == 0 {
                         IoSubmissionDisposition::FullyUnaccepted {
@@ -382,7 +428,7 @@ fn post_io_batch(
                     let after_unlock = commit_internal_entries(shared, accepted);
                     drop(posting);
                     drop(admission);
-                    after_unlock.publish();
+                    publish_after_unlock(after_unlock, &mut actions);
                     IoSubmissionDisposition::RetainedAfterEarlyCompletion {
                         retained: count,
                         error: Error::PostFailed(source),
@@ -395,12 +441,20 @@ fn post_io_batch(
             let after_unlock = commit_internal_entries(shared, retained);
             drop(posting);
             drop(admission);
-            after_unlock.publish();
+            publish_after_unlock(after_unlock, &mut actions);
             IoSubmissionDisposition::RetainedAmbiguous {
                 retained: retained_count,
                 error: Error::PostFailed(source),
             }
         }
+    }
+}
+
+fn publish_after_unlock(effects: AfterEngineUnlock, actions: &mut Option<&mut ReactorActions>) {
+    if let Some(actions) = actions.as_deref_mut() {
+        effects.append_to(actions);
+    } else {
+        effects.publish();
     }
 }
 

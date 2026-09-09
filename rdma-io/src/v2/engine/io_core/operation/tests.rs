@@ -1296,6 +1296,63 @@ fn exact_prefix_with_queued_suffix_cqe_retains_the_entire_batch_until_dispatch()
 }
 
 #[test]
+fn large_batch_with_all_early_cqes_defers_every_publication_leaf_without_overflow() {
+    const OPERATIONS: usize = 12;
+    let Some((engine, driver, shared)) = production_engine(2, 64, 64) else {
+        return;
+    };
+    let poster = Arc::new(ScriptedPoster::new(
+        &shared.session,
+        57,
+        ScriptedPost::CompleteAllDuringPost,
+    ));
+    let connection = scripted_connection(&shared.session, Arc::clone(&poster), 1, OPERATIONS);
+    let (io, _installed_events) =
+        super::super::io::IoConnection::new(&shared.session, Arc::clone(&connection.state))
+            .unwrap();
+    let (events, receiver) = super::super::io::event_port();
+    let requests = (0..OPERATIONS)
+        .map(|context| {
+            IoRecvRequest::new(
+                io.register_memory(64, AccessIntent::LocalOnly).unwrap(),
+                IoOperationContext::new(context),
+            )
+        })
+        .collect();
+    let mut deferred = crate::v2::engine::reactor::DeferredProtocolActions::new(OPERATIONS);
+
+    assert!(matches!(
+        super::post_io_recv_batch_into(
+            &shared.io_core,
+            &connection.state.io,
+            &events,
+            requests,
+            deferred.actions_mut(),
+        ),
+        IoSubmissionDisposition::AllAccepted {
+            accepted: OPERATIONS
+        }
+    ));
+    assert_eq!(shared.io_core.operations.live(), 0);
+    assert_eq!(connection.state.accepted_count(), 0);
+    assert_eq!(shared.io_core.cq_credits.free(), 64);
+
+    let mut first = crate::v2::engine::reactor::ReactorActions::default();
+    assert_eq!(deferred.append_bounded_to(&mut first), 32);
+    assert!(!deferred.is_empty());
+    first.publish();
+    let mut second = crate::v2::engine::reactor::ReactorActions::default();
+    assert_eq!(deferred.append_bounded_to(&mut second), 4);
+    assert!(deferred.is_empty());
+    second.publish();
+    assert_eq!(receiver.drain().len(), OPERATIONS);
+
+    drop(connection);
+    drop(driver);
+    drop(engine);
+}
+
+#[test]
 fn dispatch_between_releasability_observation_and_release_retains_the_whole_suffix() {
     let shared = synthetic_engine(8);
     let connection = synthetic_connection_on(&shared, 56);
@@ -2243,6 +2300,7 @@ async fn cancelled_operation_deadline_retains_slot_mr_debt_and_late_routing() {
 #[derive(Clone, Copy)]
 enum ScriptedPost {
     Accepted,
+    CompleteAllDuringPost,
     Unaccepted,
     Ambiguous,
     DispatchDuringPost,
@@ -2283,6 +2341,24 @@ impl ScriptedPoster {
         lock_unpoison(&self.tokens).extend(tokens.iter().copied());
         match self.outcome {
             ScriptedPost::Accepted => BatchPostOutcome::AllAccepted,
+            ScriptedPost::CompleteAllDuringPost => {
+                let session = self.session.upgrade().expect("session owner");
+                let connection = session
+                    .connections
+                    .lookup_qp(self.qp_num)
+                    .expect("connection token");
+                for token in tokens.iter().copied() {
+                    assert_eq!(
+                        session.enqueue_completion(wc(token, self.qp_num, opcode)),
+                        Some(connection)
+                    );
+                    assert_eq!(
+                        session.dispatch_connection_completions(connection, 1),
+                        (1, false)
+                    );
+                }
+                BatchPostOutcome::AllAccepted
+            }
             ScriptedPost::Unaccepted => BatchPostOutcome::PrefixAccepted {
                 accepted: 0,
                 first_unaccepted: 0,

@@ -1,5 +1,6 @@
 //! Bounded, consumed post-turn publication.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::v2::engine::io::PendingIoEvent;
@@ -20,20 +21,29 @@ type Publication = Box<dyn FnOnce() + Send + 'static>;
 /// close, terminal, or other existing owner record for a later reactor turn.
 pub(in crate::v2::engine) struct ReactorActions {
     capacity: usize,
-    events: Vec<Publication>,
-    operations: Vec<Publication>,
-    closes_and_listeners: Vec<Publication>,
-    terminal: Vec<Publication>,
+    events: VecDeque<Publication>,
+    operations: VecDeque<Publication>,
+    closes_and_listeners: VecDeque<Publication>,
+    terminal: VecDeque<Publication>,
+}
+
+/// Bounded publication remainder owned by a dequeued protocol command.
+///
+/// This is not a second action queue: it is the single consumed result of one
+/// provider submission. It remains on the command ingress until each action
+/// has moved into a turn-local [`ReactorActions`] batch.
+pub(in crate::v2::engine) struct DeferredProtocolActions {
+    actions: ReactorActions,
 }
 
 impl Default for ReactorActions {
     fn default() -> Self {
         Self {
             capacity: REACTOR_ACTION_BUDGET,
-            events: Vec::new(),
-            operations: Vec::new(),
-            closes_and_listeners: Vec::new(),
-            terminal: Vec::new(),
+            events: VecDeque::new(),
+            operations: VecDeque::new(),
+            closes_and_listeners: VecDeque::new(),
+            terminal: VecDeque::new(),
         }
     }
 }
@@ -59,7 +69,7 @@ impl ReactorActions {
             self.can_accept(1),
             "reactor event action exceeded turn budget"
         );
-        self.events.push(Box::new(move || event.deliver()));
+        self.events.push_back(Box::new(move || event.deliver()));
     }
 
     pub(in crate::v2::engine) fn push_operation_wake(&mut self, operation: Arc<OperationState>) {
@@ -67,7 +77,8 @@ impl ReactorActions {
             self.can_accept(1),
             "reactor operation wake exceeded turn budget"
         );
-        self.operations.push(Box::new(move || operation.wake()));
+        self.operations
+            .push_back(Box::new(move || operation.wake()));
     }
 
     pub(in crate::v2::engine) fn push_operation(&mut self, action: impl FnOnce() + Send + 'static) {
@@ -75,7 +86,7 @@ impl ReactorActions {
             self.can_accept(1),
             "reactor operation action exceeded turn budget"
         );
-        self.operations.push(Box::new(action));
+        self.operations.push_back(Box::new(action));
     }
 
     pub(in crate::v2::engine) fn push_close_or_listener(
@@ -86,7 +97,7 @@ impl ReactorActions {
             self.can_accept(1),
             "reactor close/listener action exceeded turn budget"
         );
-        self.closes_and_listeners.push(Box::new(action));
+        self.closes_and_listeners.push_back(Box::new(action));
     }
 
     pub(in crate::v2::engine) fn push_terminal(&mut self, action: impl FnOnce() + Send + 'static) {
@@ -94,7 +105,7 @@ impl ReactorActions {
             self.can_accept(1),
             "reactor terminal action exceeded turn budget"
         );
-        self.terminal.push(Box::new(action));
+        self.terminal.push_back(Box::new(action));
     }
 
     pub(in crate::v2::engine) fn len(&self) -> usize {
@@ -102,6 +113,25 @@ impl ReactorActions {
             + self.operations.len()
             + self.closes_and_listeners.len()
             + self.terminal.len()
+    }
+
+    fn append_bounded_to(&mut self, target: &mut Self) -> usize {
+        let mut appended = 0;
+        while target.can_accept(1) {
+            if let Some(action) = self.events.pop_front() {
+                target.events.push_back(action);
+            } else if let Some(action) = self.operations.pop_front() {
+                target.operations.push_back(action);
+            } else if let Some(action) = self.closes_and_listeners.pop_front() {
+                target.closes_and_listeners.push_back(action);
+            } else if let Some(action) = self.terminal.pop_front() {
+                target.terminal.push_back(action);
+            } else {
+                break;
+            }
+            appended += 1;
+        }
+        appended
     }
 
     /// Consume the batch in deterministic observer order.
@@ -119,6 +149,44 @@ impl ReactorActions {
         {
             action();
         }
+    }
+}
+
+impl DeferredProtocolActions {
+    /// A batch can produce one completion event and one operation wake per WR,
+    /// plus at most one connection-drain wake when its final accepted WR
+    /// completes during submission.
+    pub(in crate::v2::engine) fn new(operations: usize) -> Self {
+        Self {
+            actions: ReactorActions {
+                // Every early-completed operation can detach a connection
+                // drain wake, an I/O event, and an operation wake.
+                capacity: operations.saturating_mul(3),
+                ..ReactorActions::default()
+            },
+        }
+    }
+
+    pub(in crate::v2::engine) fn actions_mut(&mut self) -> &mut ReactorActions {
+        &mut self.actions
+    }
+
+    pub(in crate::v2::engine) fn append_bounded_to(
+        &mut self,
+        target: &mut ReactorActions,
+    ) -> usize {
+        self.actions.append_bounded_to(target)
+    }
+
+    pub(in crate::v2::engine) fn is_empty(&self) -> bool {
+        self.actions.len() == 0
+    }
+
+    pub(in crate::v2::engine) fn publish_synchronously(mut self) {
+        let mut actions = ReactorActions::for_synchronous_driver_drop();
+        self.append_bounded_to(&mut actions);
+        debug_assert!(self.is_empty());
+        actions.publish();
     }
 }
 
@@ -150,7 +218,7 @@ mod tests {
         let target = Arc::clone(&observed);
         actions.push_operation(move || target.lock().unwrap().push("operation"));
 
-        actions.events.push(Box::new({
+        actions.events.push_back(Box::new({
             let target = Arc::clone(&observed);
             move || target.lock().unwrap().push("event")
         }));

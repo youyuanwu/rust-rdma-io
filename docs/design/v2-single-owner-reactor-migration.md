@@ -426,6 +426,69 @@ Serialized validation on 2026-09-09 used `CARGO_BUILD_JOBS=1`,
   workspace gates; and
 - the validator restored RXE and removed SIW.
 
+## Phase 5A Message Engine Adapter
+
+Normal message SEND/RECV submission now crosses the same bounded operation
+admission lane as scalar I/O. `IoConnection` retains only the MR registrar,
+resource-free session capability, and event sender; it no longer retains
+`Arc<IoCore>` or `Arc<EstablishedIoConnection>` in production
+([io.rs:55-182](../../rdma-io/src/v2/engine/io.rs#L55-L182)). Each
+`ProtocolCommand` carries stable connection identity, owned request payload,
+its event destination, and frontend-liveness/cancellation evidence
+([io.rs:366-524](../../rdma-io/src/v2/engine/io.rs#L366-L524)).
+
+The frontend-owned `ProtocolIoCommandAdapter` retains a command while its
+atomic `N`-permit future is pending; only a fully acquired batch moves into the
+reactor queue. Saturation therefore applies backpressure instead of reporting
+`CapacityExhausted`, while admitted queued MR/WR payload remains bounded by
+`max_inflight_operations`
+([io.rs:184-326](../../rdma-io/src/v2/engine/io.rs#L184-L326),
+[reactor/command.rs:202-254](../../rdma-io/src/v2/engine/reactor/command.rs#L202-L254)).
+Cancellation is checked both before and after reactor queueing. Receiver or
+message-driver loss closes the frontend adapter and is rechecked before
+provider submission, so a queued command has exactly one owner and is either
+submitted once or dropped/rejected once
+([io.rs:241-326](../../rdma-io/src/v2/engine/io.rs#L241-L326),
+[reactor/command.rs:492-519](../../rdma-io/src/v2/engine/reactor/command.rs#L492-L519),
+[message_transport.rs:1009-1022](../../rdma-io/src/v2/message_transport.rs#L1009-L1022)).
+
+The command invokes the existing batch ledger rather than duplicating provider
+safety. The ledger's validation, stable WR storage, exact-prefix handling,
+early-completion handling, and ambiguous-acceptance retention are unchanged;
+only its detached effects append to a command-owned bounded publication result
+instead of publishing directly
+([operation/batch.rs:74-130](../../rdma-io/src/v2/engine/io_core/operation/batch.rs#L74-L130),
+[operation/batch.rs:453-461](../../rdma-io/src/v2/engine/io_core/operation/batch.rs#L453-L461)).
+That result is drained into the fixed 32-leaf turn batch across as many turns
+as required. Consequently a valid batch larger than eight can execute without
+an `N * 4` reservation, yet no external driver poll publishes more than the
+existing action budget
+([reactor/action.rs:28-187](../../rdma-io/src/v2/engine/reactor/action.rs#L28-L187),
+[reactor/command.rs:422-519](../../rdma-io/src/v2/engine/reactor/command.rs#L422-L519)).
+
+Connection setup remains synchronous before `rdma_connect`/`rdma_accept`, but
+receives a borrow-scoped `BorrowedSetupIo<'_>` which cannot escape the
+exclusive setup call. It returns the resource-free `IoConnection` to the
+unchanged message runtime only after setup posting succeeds
+([io.rs:329-361](../../rdma-io/src/v2/engine/io.rs#L329-L361),
+[message_transport.rs:378-417](../../rdma-io/src/v2/message_transport.rs#L378-L417)).
+`MessageTransportDriver`, framing, DATA/CREDIT rules, retry policy, MR pools,
+and its independent budget remain unchanged. The driver only polls the
+adapter's admission futures within that existing budget
+([message_transport.rs:1736-1780](../../rdma-io/src/v2/message_transport.rs#L1736-L1780)).
+
+Serialized validation on 2026-09-09 used `CARGO_BUILD_JOBS=1` and
+`CARGO_INCREMENTAL=0`: 207 engine unit tests and 28 message unit tests passed.
+The 12-test message-setup target passed on RXE and SIW. The message behavior
+target and the all-features workspace passed on both providers; that workspace
+run also re-executed the unchanged operation and 11-test lifecycle suites, so
+their Phase 5 provider evidence did not require redundant standalone matrix
+runs. Every validator invocation restored RXE. Deterministic unit coverage
+proves saturated frontend retention, cancellation before and after reactor
+queueing, receiver loss, batches larger than eight, bounded multi-turn
+publication, and exact permit recovery
+([reactor/command.rs:717-843](../../rdma-io/src/v2/engine/reactor/command.rs#L717-L843)).
+
 ## Old-Path Deletion Gates
 
 1. No runtime feature switch is introduced.

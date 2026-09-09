@@ -79,7 +79,7 @@ use session::{SessionManager, SessionReactorSources};
 use super::error::{Error, Result};
 
 type ConnectionSetup =
-    Box<dyn FnOnce(io::IoConnection, io::IoEventReceiver) -> Result<usize> + Send>;
+    Box<dyn for<'a> FnOnce(io::BorrowedSetupIo<'a>, io::IoEventReceiver) -> Result<usize> + Send>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SetupSummary {
@@ -346,7 +346,9 @@ impl RdmaEngine {
         setup: F,
     ) -> Result<RdmaConnection>
     where
-        F: FnOnce(io::IoConnection, io::IoEventReceiver) -> Result<usize> + Send + 'static,
+        F: for<'a> FnOnce(io::BorrowedSetupIo<'a>, io::IoEventReceiver) -> Result<usize>
+            + Send
+            + 'static,
     {
         session::cm::connect_with_setup(
             Arc::clone(&self.shared.session),
