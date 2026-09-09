@@ -363,6 +363,69 @@ rearm, and polling-mode cooperative yield remain mandatory
 ([completion.rs:348-451](../../rdma-io/src/v2/completion.rs#L348-L451),
 [session/progress.rs:464-527](../../rdma-io/src/v2/engine/session/progress.rs#L464-L527)).
 
+## Phase 5 Scheduling Equivalence Gate
+
+The deterministic equivalence map is:
+
+| Required scheduling/publication behavior | Phase-5 evidence | Disposition |
+|---|---|---|
+| Every ready-at-entry source receives one bounded opportunity and the global start rotates | `all_sources_ready_receive_one_quantum_and_global_start_rotates` ([reactor/scheduler.rs:97-111](../../rdma-io/src/v2/engine/reactor/scheduler.rs#L97-L111)) | Replaces the deleted owner/local alternation tests with a direct test over all 21 unified sources |
+| Work produced during a turn cannot extend that turn, including adversarial all-source feedback | `work_not_ready_at_entry_is_not_added_later` and `adversarial_all_source_feedback_is_deferred_to_the_next_turn` ([reactor/scheduler.rs:114-151](../../rdma-io/src/v2/engine/reactor/scheduler.rs#L114-L151)) | Replaces owner-bit choreography assertions with the ready-at-entry contract |
+| One turn emits no more than 32 leaves and has no overflow queue | `exact_budget_rejects_the_thirty_third_leaf` and `batch_has_no_overflow_storage` ([reactor/action.rs:132-140](../../rdma-io/src/v2/engine/reactor/action.rs#L132-L140), [reactor/action.rs:166-173](../../rdma-io/src/v2/engine/reactor/action.rs#L166-L173)) | Direct proof of the unified action bound |
+| Detached publication is ordered and may run only after runtime mutation ends | `consumed_batch_publishes_in_required_order` ([reactor/action.rs:143-163](../../rdma-io/src/v2/engine/reactor/action.rs#L143-L163)) plus operation reentry coverage ([operation/tests.rs:2042-2084](../../rdma-io/src/v2/engine/io_core/operation/tests.rs#L2042-L2084)) | Preserves event → operation → close/listener → terminal ordering and the prior no-reentry-under-lock invariant |
+| Registration cannot lose work arriving before or after waker installation | `wake_before_register_is_seen_by_recheck` and `enqueue_after_drain_is_seen_by_register_recheck` ([driver/tests.rs:195-241](../../rdma-io/src/v2/engine/driver/tests.rs#L195-L241)) | Unchanged register-and-recheck proof over the unified source epoch |
+| Terminal work remains bounded and is reconsidered after accepted-work drain | `terminal_request_wakes_driver_and_state_is_monotonic` and `final_accepted_operation_drain_wakes_and_reconsiders_terminal` ([driver/tests.rs:559-607](../../rdma-io/src/v2/engine/driver/tests.rs#L559-L607)); bounded connection terminal scans ([session/progress.rs:902-996](../../rdma-io/src/v2/engine/session/progress.rs#L902-L996)) | Retargeted to the unified reactor turn; no removed owner scheduler is observed |
+| Polling and readiness modes preserve provider-visible behavior | The unchanged provider targets for probe, flush, readiness race, resource ownership, scalar operations, connections, listeners, lifecycle, message setup/behavior/retry, diagnostics, eight-connection conformance, and V1 safe resources | Executed serially with `RDMA_REQUIRE_PROVIDER=1` on RXE and SIW |
+
+Three test-only assumptions were tightened without weakening production
+semantics. The connection-admission shutdown test now observes the admitted
+reservation until the first bounded reactor shutdown turn rejects it, rather
+than expecting frontend shutdown to bypass `ReactorActions`
+([v2_engine_connection_tests.rs:465-483](../../rdma-io-tests/tests/v2_engine_connection_tests.rs#L465-L483)).
+The operation-shutdown test accepts a close result that the already-running
+driver can legitimately publish before the test's observation point
+([v2_engine_connection_tests.rs:570-600](../../rdma-io-tests/tests/v2_engine_connection_tests.rs#L570-L600)).
+Lifecycle and listener payload exchanges now prove that the receive reached
+the provider before sending, so the tests measure teardown and listener
+behavior rather than provider-specific receiver-not-ready timing
+([v2_engine_lifecycle_tests.rs:224-242](../../rdma-io-tests/tests/v2_engine_lifecycle_tests.rs#L224-L242),
+[v2_engine_lifecycle_tests.rs:794-816](../../rdma-io-tests/tests/v2_engine_lifecycle_tests.rs#L794-L816),
+[v2_engine_listener_tests.rs:45-72](../../rdma-io-tests/tests/v2_engine_listener_tests.rs#L45-L72)).
+
+The reported SIW `TransportClosed` was not introduced by Phase 4. Before the
+test fix, `git diff 2e716c0..aacff28` showed no change to
+`v2_engine_lifecycle_tests.rs`; an isolated build of commit `2e716c0` then
+reproduced the same exact test failure at the receive-result unwrap. The test
+submitted receive and send futures concurrently without proving provider
+acceptance of the receive. After sequencing on the accepted-operation
+diagnostic, the exact SIW test passed ten consecutive isolated repetitions and
+the full lifecycle target passed. The same stabilization was applied to the
+two other lifecycle/listener exchanges that the serialized matrix exposed.
+
+Provider setup had an independent shell failure: with `set -o pipefail`,
+`ldconfig -p | grep -q` could report a false missing-library result when
+`grep -q` closed the pipe early. RXE and SIW setup now search one captured
+cache ([setup-rxe.sh:145-153](../../scripts/setup-rxe.sh#L145-L153),
+[setup-siw.sh:124-132](../../scripts/setup-siw.sh#L124-L132)), and the
+validator explicitly propagates `CARGO_INCREMENTAL=0` into every child build
+and test ([validate-v2-engine-providers.sh:13-14](../../scripts/validate-v2-engine-providers.sh#L13-L14),
+[validate-v2-engine-providers.sh:128-145](../../scripts/validate-v2-engine-providers.sh#L128-L145)).
+
+Serialized validation on 2026-09-09 used `CARGO_BUILD_JOBS=1`,
+`CARGO_INCREMENTAL=0`, and one process at a time:
+
+- all 199 v2 engine unit tests passed;
+- the repaired exact lifecycle case passed once on RXE and ten consecutive
+  times on SIW;
+- strict no-default-feature checks passed both without and with `tokio`;
+- the complete provider matrix passed on RXE and SIW, including the
+  four-test provider probe, three-test flush gate, five readiness-race
+  repetitions, resource, operation, 11-test connection, three-test listener,
+  11-test lifecycle, message setup/behavior/retry, diagnostics,
+  eight-connection, V1 safe-resource, production-build, and all-features
+  workspace gates; and
+- the validator restored RXE and removed SIW.
+
 ## Old-Path Deletion Gates
 
 1. No runtime feature switch is introduced.
@@ -474,14 +537,14 @@ session backend per external poll. Accept, listener identity, listener close,
 and waiter/child/selected ownership remain unchanged.
 
 One provider test expectation changed without weakening its invariant:
-`shutdown_waits_for_connect_admission_publication_in_both_modes` now expects
-the live-connection gauge to be zero immediately after shutdown wins the
-admission race. The old path retained the pre-provider reservation in
-`CmState.pending` until driver cleanup; the new bounded command path drains the
-unstarted command and releases that same reservation synchronously when
-admission closes. The preserved invariant is stronger: the connect still
-returns `DriverShutdown`, performs no provider work after shutdown wins, leaks
-no reservation, and shutdown reaches the same clean terminal result.
+`shutdown_waits_for_connect_admission_publication_in_both_modes` records that
+shutdown closes admission synchronously while the accepted pre-provider
+command and its reservation remain owned by the bounded command queue. The
+first unified reactor shutdown turn rejects that command, releases the
+reservation, and publishes its result through `ReactorActions`. The preserved
+invariant is that the connect returns `DriverShutdown`, performs no provider
+work after shutdown wins, leaks no reservation, and shutdown reaches the same
+clean terminal result.
 
 Serialized validation on 2026-09-08:
 

@@ -479,6 +479,7 @@ impl AcceptRequest {
         self.observer.delivered.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     pub(in crate::v2::engine) fn complete(&self, result: Result<RdmaConnection>) {
         let mut current = lock_unpoison(&self.observer.result);
         if matches!(&*current, TakeOnceResult::Pending) {
@@ -521,6 +522,7 @@ impl AcceptRequest {
         actions.push_close_or_listener(move || waker.wake());
     }
 
+    #[cfg(test)]
     pub(in crate::v2::engine) fn fail_undelivered(&self, error: Error) -> bool {
         let mut current = lock_unpoison(&self.observer.result);
         let replacement = match std::mem::replace(&mut *current, TakeOnceResult::Taken) {
@@ -1009,6 +1011,7 @@ impl ListenerState {
         self.close.notify_waiters_into(actions);
     }
 
+    #[cfg(test)]
     pub(in crate::v2::engine) fn terminalize(&self, outcome: &MemoizedTerminalResult) {
         self.closing.store(true, Ordering::Release);
         {

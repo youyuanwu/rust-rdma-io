@@ -138,6 +138,7 @@ impl SessionCloseState {
         self.retired.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    #[cfg(test)]
     pub(super) fn notify_waiters(self: &Arc<Self>) {
         self.notify.notify_waiters();
     }
@@ -199,6 +200,7 @@ impl SessionListenerCloseState {
         previous == 1
     }
 
+    #[cfg(test)]
     pub(super) fn notify_waiters(self: &Arc<Self>) {
         self.notify.notify_waiters();
     }

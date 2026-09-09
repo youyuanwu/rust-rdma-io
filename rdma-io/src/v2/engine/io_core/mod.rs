@@ -136,6 +136,7 @@ pub(super) struct EstablishedIoConnection {
 }
 
 /// Atomic operation/drain view consumed by session close policy.
+#[cfg(test)]
 pub(super) struct IoDrainReport {
     pub(super) accepted_tokens: Vec<OperationToken>,
 }
@@ -250,6 +251,7 @@ impl EstablishedIoConnection {
         Arc::clone(&self.drain_notify)
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(super) fn accepted_tokens(&self) -> Vec<OperationToken> {
         lock_unpoison(&self.accepted)
             .iter()
@@ -273,6 +275,7 @@ impl EstablishedIoConnection {
         self.posting_open.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     pub(super) fn drain_report(&self) -> IoDrainReport {
         let accepted = lock_unpoison(&self.accepted);
         let accepted_tokens = accepted

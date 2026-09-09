@@ -261,6 +261,7 @@ pub(super) fn complete(state: &CmState, cursor: &CmShutdownCursor) -> bool {
         && lock_unpoison(&state.pending_listens).is_empty()
 }
 
+#[cfg(test)]
 pub(super) fn terminalize(state: &CmState, outcome: &MemoizedTerminalResult) {
     if outcome.is_success() {
         return;

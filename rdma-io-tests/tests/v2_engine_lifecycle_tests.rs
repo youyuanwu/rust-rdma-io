@@ -221,20 +221,24 @@ async fn run_clean_close(mode: CompletionMode) {
         .unwrap();
     let server_task = tokio::spawn(server_driver);
     let client_task = tokio::spawn(client_driver);
-    let listener = server_engine
-        .listen(
-            "0.0.0.0:0".parse().unwrap(),
-            RdmaListenerConfig::default().backlog(2),
-        )
-        .await
-        .unwrap();
+    let listener = listen_with_retry(&server_engine).await;
     let (server, client) = accept_pair(&listener, &client_engine).await;
 
     let recv = server.register_memory(32, AccessIntent::LocalOnly).unwrap();
     let mut send = client.register_memory(32, AccessIntent::LocalOnly).unwrap();
     send.as_mut_slice()[0] = 91;
-    let ((recv_result, recv), (send_result, send)) =
-        tokio::join!(server.recv(recv, None), client.send(send, None));
+    let mut recv = Box::pin(server.recv(recv, None));
+    futures_util::future::poll_fn(|cx| {
+        assert!(recv.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    wait_until("driver did not post the clean-close receive", || {
+        server_engine.diagnostics().accepted_operations == 1
+    })
+    .await;
+    let (send_result, send) = client.send(send, None).await;
+    let (recv_result, recv) = recv.await;
     recv_result.unwrap();
     send_result.unwrap();
     assert_eq!(recv.unwrap().as_slice()[0], 91);
@@ -734,6 +738,10 @@ async fn run_driver_abort_with_accepted_wr(mode: CompletionMode) {
         Poll::Ready(())
     })
     .await;
+    wait_until("driver did not post the retained receive", || {
+        server_engine.diagnostics().accepted_operations == 1
+    })
+    .await;
     let suppression = server_resources
         .suppress_next_connection_cqe(&server)
         .unwrap();
@@ -783,14 +791,29 @@ async fn run_driver_abort_with_accepted_wr(mode: CompletionMode) {
     drop(client_engine);
 }
 
-async fn exchange_byte(sender: &RdmaConnection, receiver: &RdmaConnection, value: u8) {
+async fn exchange_byte(
+    receiver_engine: &RdmaEngine,
+    sender: &RdmaConnection,
+    receiver: &RdmaConnection,
+    value: u8,
+) {
     let recv = receiver
         .register_memory(8, AccessIntent::LocalOnly)
         .unwrap();
     let mut send = sender.register_memory(8, AccessIntent::LocalOnly).unwrap();
     send.as_mut_slice()[0] = value;
-    let ((recv_result, recv), (send_result, send)) =
-        tokio::join!(receiver.recv(recv, None), sender.send(send, None));
+    let mut recv = Box::pin(receiver.recv(recv, None));
+    futures_util::future::poll_fn(|cx| {
+        assert!(recv.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    wait_until("driver did not post the exchange receive", || {
+        receiver_engine.diagnostics().accepted_operations == 1
+    })
+    .await;
+    let (send_result, send) = sender.send(send, None).await;
+    let (recv_result, recv) = recv.await;
     recv_result.unwrap();
     send_result.unwrap();
     assert_eq!(recv.unwrap().as_slice()[0], value);
@@ -860,7 +883,7 @@ async fn run_clean_retirement_destroy_quarantine(mode: CompletionMode) {
     assert_eq!(diagnostics.registered_operations, 0);
     assert!(!server_task.is_finished());
 
-    exchange_byte(&healthy_client, &healthy_server, 0x5a).await;
+    exchange_byte(&server_engine, &healthy_client, &healthy_server, 0x5a).await;
     assert!(!server_task.is_finished());
     assert!(server_engine.diagnostics().terminal_error.is_none());
 
@@ -1036,7 +1059,7 @@ async fn run_setup_rollback_destroy_quarantines(mode: CompletionMode) {
     );
 
     let (healthy_server, healthy_client) = accept_pair(&listener, &client_engine).await;
-    exchange_byte(&healthy_client, &healthy_server, 0xa5).await;
+    exchange_byte(&server_engine, &healthy_client, &healthy_server, 0xa5).await;
     wait_until(
         "rejected peer reservation was not retired before diagnostics",
         || client_engine.diagnostics().live_connections == 2,

@@ -465,8 +465,8 @@ async fn run_connect_admission_shutdown_barrier(mode: CompletionMode) {
     let admitted = engine.diagnostics();
     assert_eq!(admitted.lifecycle, RdmaEngineLifecycle::ShutdownRequested);
     assert_eq!(
-        admitted.live_connections, 0,
-        "shutdown drains the pre-provider command and releases its reservation"
+        admitted.live_connections, 1,
+        "the unified reactor retains the admitted command reservation until its bounded shutdown turn"
     );
 
     let driver_task = tokio::spawn(driver);
@@ -569,16 +569,32 @@ async fn run_operation_admission_shutdown_barrier(mode: CompletionMode) {
 
     let mut server_close = Box::pin(server.close());
     let mut client_close = Box::pin(client.close());
-    assert!(poll_once(server_close.as_mut()).is_pending());
-    assert!(poll_once(client_close.as_mut()).is_pending());
+    let server_close_ready = match poll_once(server_close.as_mut()) {
+        Poll::Ready(result) => Some(result),
+        Poll::Pending => None,
+    };
+    let client_close_ready = match poll_once(client_close.as_mut()) {
+        Poll::Ready(result) => Some(result),
+        Poll::Pending => None,
+    };
     resources.transition_connection_to_error(&server).unwrap();
 
     let ((operation_result, returned), server_result, client_result, shutdown_result) =
         tokio::time::timeout(Duration::from_secs(15), async {
             tokio::join!(
                 operation.as_mut(),
-                server_close.as_mut(),
-                client_close.as_mut(),
+                async {
+                    match server_close_ready {
+                        Some(result) => result,
+                        None => server_close.as_mut().await,
+                    }
+                },
+                async {
+                    match client_close_ready {
+                        Some(result) => result,
+                        None => client_close.as_mut().await,
+                    }
+                },
                 shutdown.as_mut(),
             )
         })

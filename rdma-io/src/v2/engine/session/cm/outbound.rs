@@ -778,6 +778,7 @@ impl OutboundRequest {
         !self.cancellation_enqueued.swap(true, Ordering::AcqRel)
     }
 
+    #[cfg(test)]
     pub(super) fn cancel(&self, error: Error) {
         self.observer.cancel(error);
     }

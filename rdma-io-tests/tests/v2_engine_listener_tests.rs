@@ -42,12 +42,30 @@ fn poll_with_wake_counter<F: Future>(
     future.poll(&mut context)
 }
 
-async fn exchange(server: &RdmaConnection, client: &RdmaConnection, value: u8) {
+async fn exchange(
+    server_engine: &RdmaEngine,
+    server: &RdmaConnection,
+    client: &RdmaConnection,
+    value: u8,
+) {
     let recv = server.register_memory(16, AccessIntent::LocalOnly).unwrap();
     let mut send = client.register_memory(16, AccessIntent::LocalOnly).unwrap();
     send.as_mut_slice()[0] = value;
-    let ((recv_result, recv), (send_result, send)) =
-        tokio::join!(server.recv(recv, None), client.send(send, None));
+    let mut recv = Box::pin(server.recv(recv, None));
+    futures_util::future::poll_fn(|cx| {
+        assert!(recv.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while server_engine.diagnostics().accepted_operations == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("listener exchange receive was not accepted before send");
+    let (send_result, send) = client.send(send, None).await;
+    let (recv_result, recv) = recv.await;
     recv_result.unwrap();
     send_result.unwrap();
     assert_eq!(recv.unwrap().as_slice()[0], value);
@@ -145,8 +163,8 @@ async fn run_basic_listener(mode: CompletionMode) {
     assert_eq!(post_accept.registered_operations, 0);
     assert_eq!(post_accept.accepted_operations, 0);
 
-    exchange(&server_default, &client_default, 7).await;
-    exchange(&server_configured, &client_configured, 9).await;
+    exchange(&server_engine, &server_default, &client_default, 7).await;
+    exchange(&server_engine, &server_configured, &client_configured, 9).await;
     let address = connect_addr_for(Some(listener.local_addr().unwrap()));
     let mut queued_connects = tokio::task::JoinSet::new();
     for _ in 0..2 {
@@ -185,7 +203,13 @@ async fn run_basic_listener(mode: CompletionMode) {
 
     let (server_after_reject, client_after_reject) =
         accept_pair(&listener, &client_engine, false).await;
-    exchange(&server_after_reject, &client_after_reject, 11).await;
+    exchange(
+        &server_engine,
+        &server_after_reject,
+        &client_after_reject,
+        11,
+    )
+    .await;
 
     for connection in [&server_default, &server_configured] {
         connection.close().await.unwrap();

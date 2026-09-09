@@ -614,6 +614,7 @@ impl CmState {
         result
     }
 
+    #[cfg(test)]
     pub(in crate::v2::engine) fn terminalize(&self, outcome: &MemoizedTerminalResult) {
         shutdown::terminalize(self, outcome);
     }
@@ -940,6 +941,7 @@ impl CmState {
 }
 
 impl SessionManager {
+    #[cfg(test)]
     pub(in crate::v2::engine) fn terminalize_cm(&self, outcome: &MemoizedTerminalResult) {
         self.cm.terminalize(outcome);
     }

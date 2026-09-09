@@ -11,13 +11,17 @@ use super::super::RdmaConnectionConfig;
 use super::super::io::{IoEventSender, IoTerminalEvent, MemoryRegistrar, PendingIoEvent};
 #[cfg(test)]
 use super::super::io_core::Direction;
+#[cfg(test)]
+use super::super::io_core::IoDrainReport;
 use super::super::io_core::RdmaOperation;
 use super::super::io_core::{
-    EstablishedIoConnection, EstablishedIoIdentity, IoDrainReport, IoPostAuthority,
-    IoQuarantineReport, OperationKind,
+    EstablishedIoConnection, EstablishedIoIdentity, IoPostAuthority, IoQuarantineReport,
+    OperationKind,
 };
 use super::super::lifecycle::MemoizedTerminalResult;
-use super::super::registry::{ConnectionToken, OperationToken, lock_unpoison, read_unpoison};
+#[cfg(any(test, feature = "test-hooks"))]
+use super::super::registry::OperationToken;
+use super::super::registry::{ConnectionToken, lock_unpoison, read_unpoison};
 use super::{
     QpDestructionProof, SessionCloseState, SessionConnection, SessionLifecycleAuthority,
     SessionManager,
@@ -426,6 +430,7 @@ impl ConnectionState {
         self.io.remove_accepted(token)
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(in crate::v2::engine) fn accepted_tokens(&self) -> Vec<OperationToken> {
         self.io.accepted_tokens()
     }
@@ -468,6 +473,7 @@ impl ConnectionState {
         self.io.close_posting();
     }
 
+    #[cfg(test)]
     pub(in crate::v2::engine) fn io_drain_report(&self) -> IoDrainReport {
         self.io.drain_report()
     }
@@ -528,6 +534,7 @@ impl ConnectionState {
         self.pending_io_event(IoTerminalEvent::Terminal(error))
     }
 
+    #[cfg(test)]
     pub(in crate::v2::engine) fn mark_cm_failure(&self, error: Error) -> Option<PendingIoEvent> {
         let event = self.record_cm_failure(error);
         self.wake_close();
@@ -627,6 +634,7 @@ impl ConnectionState {
         self.poster.disconnect()
     }
 
+    #[cfg(test)]
     pub(in crate::v2::engine) fn wake_close(&self) {
         self.close.notify_waiters();
     }
