@@ -1299,7 +1299,11 @@ impl IoEventReceiver {
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn queued_len(&self) -> usize {
-        lock_unpoison(&self.port.queue).events.len()
+        lock_unpoison(&self.port.queue)
+            .events
+            .iter()
+            .filter(|event| !matches!(event, IoEvent::Submission(_)))
+            .count()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
