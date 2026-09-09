@@ -5,7 +5,6 @@ use std::sync::Arc;
 use crate::v2::engine::io::PendingIoEvent;
 use crate::v2::engine::reactor::ReactorActions;
 use crate::v2::engine::registry::{ConnectionToken, OperationToken};
-use crate::v2::engine::session::IoEffectsCommitAuthority;
 
 use super::state::OperationObserver;
 
@@ -212,13 +211,10 @@ impl IoCoreEffects {
     /// Convert to the publishable state once the session owner has applied all
     /// session-facing effects.
     ///
-    /// The authority reference is a type-only proof that the caller is the
-    /// session owner, and taking `self` by value prevents the original bundle
-    /// from being republished or re-committed.
-    pub(in crate::v2::engine) fn into_committed(
-        self,
-        _authority: &IoEffectsCommitAuthority,
-    ) -> CommittedIoCoreEffects {
+    /// Taking `self` by value prevents the original bundle from being
+    /// republished or re-committed after the reactor has applied its
+    /// connection-facing effects.
+    pub(in crate::v2::engine) fn into_committed(self) -> CommittedIoCoreEffects {
         CommittedIoCoreEffects {
             after_unlock: self.into_after_unlock(),
         }

@@ -12,18 +12,15 @@ use super::super::RdmaConnectionConfig;
 use super::super::io::{IoEventSender, IoTerminalEvent, MemoryRegistrar, PendingIoEvent};
 use super::super::io_core::RdmaOperation;
 use super::super::io_core::{
-    ConnectionIoState, EstablishedIoConnection, EstablishedIoIdentity, IoPostAuthority,
-    IoQuarantineReport, OperationKind,
+    ConnectionIoState, EstablishedIoConnection, EstablishedIoIdentity, IoQuarantineReport,
+    OperationKind,
 };
 use super::super::lifecycle::MemoizedTerminalResult;
 #[cfg(any(test, feature = "test-hooks"))]
 use super::super::registry::OperationToken;
 use super::super::registry::{ConnectionToken, lock_unpoison, read_unpoison};
 use super::registry::ConnectionRegistry;
-use super::{
-    QpDestructionProof, SessionCloseState, SessionFrontend, SessionLifecycleAuthority,
-    SessionManager,
-};
+use super::{QpDestructionProof, SessionCloseState, SessionFrontend, SessionManager};
 use crate::cm::{CmId, ConnParam, EventChannel};
 use crate::v2::error::{Error, Result};
 use crate::v2::mr::{AccessIntent, Mr, RemoteMr};
@@ -503,7 +500,7 @@ impl ConnectionState {
     ) -> (
         &Arc<EstablishedIoConnection>,
         &mut ConnectionIoState,
-        &dyn IoPostAuthority,
+        &ConnectionPoster,
     ) {
         (&self.io, &mut self.io_ledger, &self.poster)
     }
@@ -554,11 +551,10 @@ impl ConnectionState {
 
     pub(in crate::v2::engine) fn finalize_engine(
         &mut self,
-        authority: &SessionLifecycleAuthority,
         outcome: &MemoizedTerminalResult,
     ) -> Option<PendingIoEvent> {
         self.stop_posting();
-        let _ = self.transition_to_error_once(authority);
+        let _ = self.transition_to_error_once();
         if let Some(error) = outcome.error() {
             if self.close_result.is_none() {
                 self.close_result = Some(MemoizedTerminalResult::from_error(error.clone()));
@@ -621,15 +617,12 @@ impl ConnectionState {
         event
     }
 
-    pub(in crate::v2::engine) fn transition_to_error_once(
-        &mut self,
-        authority: &SessionLifecycleAuthority,
-    ) -> Result<bool> {
+    pub(in crate::v2::engine) fn transition_to_error_once(&mut self) -> Result<bool> {
         if self.error_transition_started {
             return Ok(false);
         }
         self.error_transition_started = true;
-        self.poster.to_error(authority)?;
+        self.poster.transition_qp_to_error()?;
         self.error_transition_complete = true;
         Ok(true)
     }
@@ -640,7 +633,6 @@ impl ConnectionState {
 
     pub(in crate::v2::engine) fn destroy_connection_resources(
         &mut self,
-        authority: &SessionLifecycleAuthority,
         outstanding_operations: usize,
     ) -> Result<Option<SharedCmId>> {
         if outstanding_operations != 0 {
@@ -652,7 +644,7 @@ impl ConnectionState {
         }
         self.stop_posting();
         let destroy_qp = !self.qp_destroyed;
-        let (cm_id, qp_destroyed) = self.poster.destroy_connection(authority, destroy_qp)?;
+        let (cm_id, qp_destroyed) = self.poster.destroy_connection(destroy_qp)?;
         if qp_destroyed {
             self.record_qp_destroyed();
         }
@@ -664,15 +656,12 @@ impl ConnectionState {
         Ok(cm_id)
     }
 
-    pub(in crate::v2::engine) fn destroy_qp_for_session(
-        &mut self,
-        authority: &SessionLifecycleAuthority,
-    ) -> Result<QpDestroyStatus> {
+    pub(in crate::v2::engine) fn destroy_qp_for_session(&mut self) -> Result<QpDestroyStatus> {
         self.stop_posting();
         if self.qp_destroyed {
             return Ok(QpDestroyStatus::AlreadyDestroyed);
         }
-        match self.poster.destroy_qp(authority) {
+        match self.poster.destroy_qp() {
             Ok(true) => {
                 if self.record_qp_destroyed() {
                     Ok(QpDestroyStatus::DestroyedNow)
@@ -1112,24 +1101,20 @@ pub(in crate::v2::engine) enum ConnectionCmRoute {
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub(crate) trait WorkRequestPoster: Send + Sync {
+pub(crate) trait TestConnectionProvider: Send + Sync {
     fn qp_num(&self) -> u32;
     fn capabilities(&self) -> Option<QpCapabilities>;
     fn post_send(&self, batch: &mut PreparedSendBatch) -> Result<BatchPostOutcome>;
     fn post_recv(&self, batch: &mut PreparedRecvBatch) -> Result<BatchPostOutcome>;
-    fn to_error(&self, authority: &SessionLifecycleAuthority) -> Result<()>;
+    fn to_error(&self) -> Result<()>;
     /// Returns true only when this call successfully takes and destroys the
     /// owned QP. A failure must retain the QP and return its error.
-    fn destroy_qp(&self, authority: &SessionLifecycleAuthority) -> Result<bool>;
-    fn destroy_connection(
-        &self,
-        authority: &SessionLifecycleAuthority,
-        destroy_qp: bool,
-    ) -> Result<(Option<SharedCmId>, bool)> {
+    fn destroy_qp(&self) -> Result<bool>;
+    fn destroy_connection(&self, destroy_qp: bool) -> Result<(Option<SharedCmId>, bool)> {
         Ok((
             None,
             if destroy_qp {
-                self.destroy_qp(authority)?
+                self.destroy_qp()?
             } else {
                 false
             },
@@ -1148,14 +1133,14 @@ pub(crate) trait WorkRequestPoster: Send + Sync {
 
 pub(in crate::v2::engine) enum ConnectionPoster {
     #[cfg(any(test, feature = "test-hooks"))]
-    Shared(Arc<dyn WorkRequestPoster>),
+    Shared(Arc<dyn TestConnectionProvider>),
     Verbs(VerbsConnectionResources),
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
 impl<T> From<Arc<T>> for ConnectionPoster
 where
-    T: WorkRequestPoster + 'static,
+    T: TestConnectionProvider + 'static,
 {
     fn from(poster: Arc<T>) -> Self {
         Self::Shared(poster)
@@ -1163,8 +1148,8 @@ where
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-impl From<Arc<dyn WorkRequestPoster>> for ConnectionPoster {
-    fn from(poster: Arc<dyn WorkRequestPoster>) -> Self {
+impl From<Arc<dyn TestConnectionProvider>> for ConnectionPoster {
+    fn from(poster: Arc<dyn TestConnectionProvider>) -> Self {
         Self::Shared(poster)
     }
 }
@@ -1184,36 +1169,26 @@ impl ConnectionPoster {
         }
     }
 
-    fn to_error(&mut self, authority: &SessionLifecycleAuthority) -> Result<()> {
-        #[cfg(not(any(test, feature = "test-hooks")))]
-        let _ = authority;
+    fn transition_qp_to_error(&mut self) -> Result<()> {
         match self {
             #[cfg(any(test, feature = "test-hooks"))]
-            Self::Shared(poster) => poster.to_error(authority),
-            Self::Verbs(resources) => resources.to_error_owned(),
+            Self::Shared(poster) => poster.to_error(),
+            Self::Verbs(resources) => resources.transition_qp_to_error_owned(),
         }
     }
 
-    fn destroy_qp(&mut self, authority: &SessionLifecycleAuthority) -> Result<bool> {
-        #[cfg(not(any(test, feature = "test-hooks")))]
-        let _ = authority;
+    fn destroy_qp(&mut self) -> Result<bool> {
         match self {
             #[cfg(any(test, feature = "test-hooks"))]
-            Self::Shared(poster) => poster.destroy_qp(authority),
+            Self::Shared(poster) => poster.destroy_qp(),
             Self::Verbs(resources) => resources.destroy_qp_owned(),
         }
     }
 
-    fn destroy_connection(
-        &mut self,
-        authority: &SessionLifecycleAuthority,
-        destroy_qp: bool,
-    ) -> Result<(Option<SharedCmId>, bool)> {
-        #[cfg(not(any(test, feature = "test-hooks")))]
-        let _ = authority;
+    fn destroy_connection(&mut self, destroy_qp: bool) -> Result<(Option<SharedCmId>, bool)> {
         match self {
             #[cfg(any(test, feature = "test-hooks"))]
-            Self::Shared(poster) => poster.destroy_connection(authority, destroy_qp),
+            Self::Shared(poster) => poster.destroy_connection(destroy_qp),
             Self::Verbs(resources) => resources.destroy_connection_owned(destroy_qp),
         }
     }
@@ -1285,8 +1260,8 @@ impl ConnectionPoster {
     }
 }
 
-impl IoPostAuthority for ConnectionPoster {
-    fn qp_num(&self) -> u32 {
+impl ConnectionPoster {
+    pub(in crate::v2::engine) fn qp_num(&self) -> u32 {
         match self {
             #[cfg(any(test, feature = "test-hooks"))]
             Self::Shared(poster) => poster.qp_num(),
@@ -1294,7 +1269,10 @@ impl IoPostAuthority for ConnectionPoster {
         }
     }
 
-    fn post_send(&self, batch: &mut PreparedSendBatch) -> Result<BatchPostOutcome> {
+    pub(in crate::v2::engine) fn post_send(
+        &self,
+        batch: &mut PreparedSendBatch,
+    ) -> Result<BatchPostOutcome> {
         match self {
             #[cfg(any(test, feature = "test-hooks"))]
             Self::Shared(poster) => poster.post_send(batch),
@@ -1302,7 +1280,10 @@ impl IoPostAuthority for ConnectionPoster {
         }
     }
 
-    fn post_recv(&self, batch: &mut PreparedRecvBatch) -> Result<BatchPostOutcome> {
+    pub(in crate::v2::engine) fn post_recv(
+        &self,
+        batch: &mut PreparedRecvBatch,
+    ) -> Result<BatchPostOutcome> {
         match self {
             #[cfg(any(test, feature = "test-hooks"))]
             Self::Shared(poster) => poster.post_recv(batch),
@@ -1532,7 +1513,7 @@ impl VerbsConnectionResources {
             .map(|qp| qp.post_recv_batch(batch))
     }
 
-    fn to_error_owned(&mut self) -> Result<()> {
+    fn transition_qp_to_error_owned(&mut self) -> Result<()> {
         match self.qp.as_ref() {
             Some(qp) => qp.to_error(),
             None => Ok(()),
@@ -1670,6 +1651,11 @@ pub(in crate::v2::engine) fn reserve_connection<'a>(
     Ok((admission, reservation))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    clippy::result_large_err,
+    reason = "failed installation returns the complete provider/resource bundle for exact cleanup"
+)]
 pub(in crate::v2::engine) fn install_reserved_connection(
     manager: &SessionManager,
     connections: &mut ConnectionRegistry,
@@ -1824,6 +1810,10 @@ impl std::fmt::Debug for ConnectionInstallFailure {
     }
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "variants retain complete value-owned provider bundles for exact rollback"
+)]
 pub(in crate::v2::engine) enum FailedConnectionInstallResources {
     Unregistered {
         poster: ConnectionPoster,
@@ -1876,21 +1866,20 @@ impl FailedConnectionInstallResources {
     pub(in crate::v2::engine) fn destroy_for_session(
         &mut self,
         connections: &mut ConnectionRegistry,
-        authority: &SessionLifecycleAuthority,
     ) -> Result<(Option<SharedCmId>, bool)> {
         #[cfg(not(any(test, feature = "test-hooks")))]
         let _ = connections;
         match self {
-            Self::Unregistered { poster, .. } => poster.destroy_connection(authority, true),
+            Self::Unregistered { poster, .. } => poster.destroy_connection(true),
             #[cfg(any(test, feature = "test-hooks"))]
             Self::Registered(token) => connections
                 .with_connection_mut(*token, |connection| {
-                    connection.destroy_connection_resources(authority, 0)
+                    connection.destroy_connection_resources(0)
                 })
                 .ok_or(Error::TransportClosed)?
                 .map(|cm_id| (cm_id, true)),
             Self::Detached(connection) => connection
-                .destroy_connection_resources(authority, 0)
+                .destroy_connection_resources(0)
                 .map(|cm_id| (cm_id, true)),
             Self::Unrecoverable => Ok((None, false)),
         }

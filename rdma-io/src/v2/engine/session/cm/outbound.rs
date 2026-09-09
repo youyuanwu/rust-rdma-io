@@ -250,6 +250,10 @@ pub(super) fn process_cancellation(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one CM event transaction keeps all reactor-owned state and evidence explicit"
+)]
 pub(super) fn handle_event(
     state: &mut CmState,
     connections: &mut ConnectionRegistry,
@@ -1117,7 +1121,7 @@ mod tests {
 
     use super::*;
     use crate::v2::engine::CompletionMode;
-    use crate::v2::engine::session::connection::WorkRequestPoster;
+    use crate::v2::engine::session::connection::TestConnectionProvider;
     use crate::v2::qp::{BatchPostOutcome, QpCapabilities};
     use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
 
@@ -1125,7 +1129,7 @@ mod tests {
         steps: Mutex<Vec<&'static str>>,
     }
 
-    impl WorkRequestPoster for ClosePoster {
+    impl TestConnectionProvider for ClosePoster {
         fn qp_num(&self) -> u32 {
             81
         }
@@ -1142,18 +1146,12 @@ mod tests {
             Ok(BatchPostOutcome::AllAccepted)
         }
 
-        fn to_error(
-            &self,
-            _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
-        ) -> Result<()> {
+        fn to_error(&self) -> Result<()> {
             lock_unpoison(&self.steps).push("to_error");
             Ok(())
         }
 
-        fn destroy_qp(
-            &self,
-            _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
-        ) -> Result<bool> {
+        fn destroy_qp(&self) -> Result<bool> {
             lock_unpoison(&self.steps).push("destroy_qp");
             Ok(true)
         }

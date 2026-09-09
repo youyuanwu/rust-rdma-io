@@ -396,6 +396,10 @@ impl CmState {
         Ok(true)
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "bounded source service keeps each reactor-owned input explicit"
+    )]
     pub(in crate::v2::engine) fn service_software_class_into(
         &mut self,
         connections: &mut ConnectionRegistry,
@@ -628,10 +632,10 @@ impl CmState {
         &self,
         connections: &ConnectionRegistry,
     ) -> usize {
-        connections.live() + self.retained_adapter_owner_count()
+        connections.live() + self.retained_session_owner_count()
     }
 
-    pub(in crate::v2::engine) fn retained_adapter_owner_count(&self) -> usize {
+    pub(in crate::v2::engine) fn retained_session_owner_count(&self) -> usize {
         let listeners = self.listeners.live();
         let cm_destructions = self
             .cm_destructions
@@ -647,7 +651,7 @@ impl CmState {
             + self.quarantined_cm_owners.len()
     }
 
-    pub(in crate::v2::engine) fn pending_adapter_route_count(&self) -> usize {
+    pub(in crate::v2::engine) fn pending_lifecycle_work_count(&self) -> usize {
         self.pending_listens.len()
             + self.listener_work.len()
             + self.cm_destructions.len()
@@ -826,6 +830,10 @@ impl CmState {
         event::lookup_event_route(self, connections, snapshot)
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one CM event transaction keeps all reactor-owned state and evidence explicit"
+    )]
     fn handle_event(
         &mut self,
         connections: &mut ConnectionRegistry,

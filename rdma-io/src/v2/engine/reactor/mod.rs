@@ -50,38 +50,6 @@ pub(super) struct ReactorTurnFailure {
     pub(super) actions: ReactorActions,
 }
 
-#[cfg(test)]
-struct ReactorTestBridge;
-
-#[cfg(test)]
-impl super::io_core::IoSessionBridge for ReactorTestBridge {
-    fn route_completion(
-        &self,
-        _io: &mut IoState,
-        _completion: crate::wc::WorkCompletion,
-    ) -> Option<super::registry::ConnectionToken> {
-        None
-    }
-
-    fn dispatch_connection_completions(
-        &self,
-        _io: &mut IoState,
-        _connection: super::registry::ConnectionToken,
-        _quantum: usize,
-    ) -> (usize, bool) {
-        (0, false)
-    }
-
-    fn handle_reclamation_deadline(
-        &self,
-        _io: &mut IoState,
-        _token: super::registry::OperationToken,
-    ) {
-    }
-
-    fn commit_terminal_effects(&self, _effects: super::io_core::IoCoreEffects) {}
-}
-
 impl EngineReactor {
     pub(super) fn new(
         shared: &Arc<EngineFrontendRoot>,
@@ -102,13 +70,9 @@ impl EngineReactor {
             io_driver_signal,
         )
         .expect("validated engine I/O configuration");
-        #[cfg(test)]
-        let bridge: Arc<dyn super::io_core::IoSessionBridge> = Arc::new(ReactorTestBridge);
         Self {
             io: IoReactorSources::new(
                 io_core,
-                #[cfg(test)]
-                bridge,
                 shared.config.cq_completion_budget,
                 shared.config.completion_dispatch_budget,
                 shared.config.io_reclamation_budget,
@@ -661,7 +625,7 @@ impl EngineReactor {
         };
         shared.update_connection_diagnostics(diagnostics);
         shared.update_cm_diagnostics(
-            self.session.cm.pending_adapter_route_count(),
+            self.session.cm.pending_lifecycle_work_count(),
             self.session
                 .cm
                 .retained_owner_count(&self.session.connections),
@@ -719,17 +683,28 @@ impl EngineReactor {
 
     pub(super) fn requires_complete_quarantine(&self) -> bool {
         self.session.connections.live() != 0
-            || self.session.cm.retained_adapter_owner_count() != 0
+            || self.session.cm.retained_session_owner_count() != 0
             || self.io.core().accepted_count() != 0
     }
 
     #[cfg(test)]
-    pub(super) fn session_turn_for_test(
+    pub(super) fn turn_for_test(
         &mut self,
+        shared: &Arc<EngineFrontendRoot>,
         mode: CompletionMode,
         cx: &mut TaskContext<'_>,
-    ) -> super::Result<super::progress::ProgressReport> {
-        self.session.turn(self.io.core_mut(), mode, cx)
+    ) -> super::Result<bool> {
+        match self.turn(shared, mode, cx) {
+            Ok(turn) => {
+                let requires_repoll = turn.requires_repoll;
+                turn.actions.publish();
+                Ok(requires_repoll)
+            }
+            Err(failure) => {
+                failure.actions.publish();
+                Err(failure.error)
+            }
+        }
     }
 
     /// Synchronous fail-closed termination when no later poll can occur.
@@ -740,7 +715,7 @@ impl EngineReactor {
         let actions = self.handle_driver_drop(shared);
         shared.update_connection_diagnostics(self.session.connections.admission_snapshot());
         shared.update_cm_diagnostics(
-            self.session.cm.pending_adapter_route_count(),
+            self.session.cm.pending_lifecycle_work_count(),
             self.session
                 .cm
                 .retained_owner_count(&self.session.connections),

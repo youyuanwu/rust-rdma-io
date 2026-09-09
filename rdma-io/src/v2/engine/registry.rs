@@ -458,13 +458,12 @@ impl<K: RegistryToken, T> PagedRegistry<K, T> {
                 page.iter().flat_map(move |page| {
                     page.iter()
                         .enumerate()
-                        .filter_map(move |(slot_index, slot)| {
-                            matches!(slot.state, SlotState::Occupied(_)).then(|| {
-                                K::from_parts(
-                                    (page_index * PAGE_SIZE + slot_index) as u32,
-                                    slot.generation,
-                                )
-                            })
+                        .filter(|(_, slot)| matches!(slot.state, SlotState::Occupied(_)))
+                        .map(move |(slot_index, slot)| {
+                            K::from_parts(
+                                (page_index * PAGE_SIZE + slot_index) as u32,
+                                slot.generation,
+                            )
                         })
                 })
             })

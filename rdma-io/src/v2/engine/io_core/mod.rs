@@ -10,9 +10,7 @@ use std::time::Duration;
 use super::io::{IoEventSender, IoTerminalEvent, PendingIoEvent};
 use super::registry::{ConnectionToken, Lookup, OperationToken, lock_unpoison};
 use crate::v2::error::{Error, Result};
-use crate::v2::qp::BatchPostOutcome;
 use crate::wc::WorkCompletion;
-use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
 pub(super) use operation::CqeReject;
 pub use operation::RdmaOperation;
 pub(in crate::v2::engine) use operation::future::OperationCommand;
@@ -28,16 +26,6 @@ pub(super) use operation::{
 };
 pub(super) use progress::IoReactorSources;
 
-/// Posting-only QP authority supplied by the session layer.
-///
-/// This boundary deliberately excludes QP error transitions, destruction,
-/// disconnect, CM ownership, and retirement.
-pub(super) trait IoPostAuthority: Send + Sync {
-    fn qp_num(&self) -> u32;
-    fn post_send(&self, batch: &mut PreparedSendBatch) -> Result<BatchPostOutcome>;
-    fn post_recv(&self, batch: &mut PreparedRecvBatch) -> Result<BatchPostOutcome>;
-}
-
 /// Restricted publication surface from the I/O core to the explicit driver.
 pub(super) trait IoDriverSignal: Send + Sync {
     fn publish_cq_recheck(&self);
@@ -45,30 +33,6 @@ pub(super) trait IoDriverSignal: Send + Sync {
     fn publish_reclamation(&self);
     #[cfg(any(test, feature = "test-hooks"))]
     fn pause_operation_before_register(&self);
-}
-
-/// Narrow session capability needed by owner-local I/O progress.
-///
-/// The I/O side never receives a concrete session manager, registry, lifecycle
-/// authority, or resource bundle through this boundary.
-#[cfg(test)]
-pub(super) trait IoSessionBridge: Send + Sync {
-    fn route_completion(
-        &self,
-        io: &mut IoState,
-        completion: WorkCompletion,
-    ) -> Option<ConnectionToken>;
-
-    fn dispatch_connection_completions(
-        &self,
-        io: &mut IoState,
-        connection: ConnectionToken,
-        quantum: usize,
-    ) -> (usize, bool);
-
-    fn handle_reclamation_deadline(&self, io: &mut IoState, token: OperationToken);
-
-    fn commit_terminal_effects(&self, effects: IoCoreEffects);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,10 +48,8 @@ pub(super) struct EstablishedIoIdentity {
     pub(super) qp_num: u32,
 }
 
-/// Opaque posting and operation-ledger capability for one established session.
-///
-/// The concrete posting authority contains only a weak reference to the
-/// session-owned resource bundle.
+/// Resource-free I/O identity, limits, and observers for one established
+/// connection. Provider resources remain exclusively in `ConnectionState`.
 pub(super) struct EstablishedIoConnection {
     identity: EstablishedIoIdentity,
     max_send_wr: usize,
@@ -216,9 +178,6 @@ pub(super) struct IoState {
     reclamation_requests: VecDeque<IoDeadlineRequest>,
     terminal_failure: Option<super::lifecycle::MemoizedTerminalResult>,
 }
-
-#[cfg(test)]
-pub(super) type IoCore = IoState;
 
 pub(in crate::v2::engine) struct ConnectionIoState {
     identity: EstablishedIoIdentity,
@@ -404,11 +363,6 @@ impl IoState {
     pub(super) fn take_reclamation_requests(&mut self, budget: usize) -> Vec<IoDeadlineRequest> {
         let count = self.reclamation_requests.len().min(budget);
         self.reclamation_requests.drain(..count).collect()
-    }
-
-    #[cfg(test)]
-    pub(super) fn has_reclamation_requests(&self) -> bool {
-        !self.reclamation_requests.is_empty()
     }
 
     pub(super) fn reclamation_request_count(&self) -> usize {
@@ -742,7 +696,7 @@ mod tests {
 
     #[test]
     fn value_owned_connection_ledger_tracks_local_accepted_and_completion_state() {
-        let mut core = IoCore::new_owned(
+        let mut core = IoState::new_owned(
             8,
             8,
             Duration::ZERO,
@@ -808,7 +762,7 @@ mod tests {
         let signal = Arc::new(RecordingSignal {
             io_publications: AtomicUsize::new(0),
         });
-        let mut core = IoCore::new_owned(
+        let mut core = IoState::new_owned(
             1,
             1,
             Duration::ZERO,

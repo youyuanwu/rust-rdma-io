@@ -44,6 +44,10 @@ struct LiveConnectionEntry {
     connection: ConnectionState,
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the generational slot owns each route and connection bundle in place"
+)]
 enum OutboundConnectionEntry {
     Establishing(OutboundRoute),
     Registered {
@@ -52,6 +56,10 @@ enum OutboundConnectionEntry {
     },
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the generational slot owns each route and connection bundle in place"
+)]
 enum InboundConnectionEntry {
     Establishing(InboundRoute),
     Registered {
@@ -626,6 +634,10 @@ impl ConnectionRegistry {
         Ok(token)
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "registration failure returns complete retained ownership for rollback"
+    )]
     pub(in crate::v2::engine) fn register(
         &mut self,
         qp_num: u32,
@@ -655,6 +667,10 @@ impl ConnectionRegistry {
         ))
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "attachment failure returns complete retained ownership for rollback"
+    )]
     pub(in crate::v2::engine) fn attach_registered(
         &mut self,
         token: ConnectionToken,
@@ -699,6 +715,10 @@ impl ConnectionRegistry {
             .expect("attached connection is immediately visible"))
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "the shared failure type preserves rollback ownership at every validation exit"
+    )]
     fn validate_qp(&self, qp_num: u32) -> std::result::Result<(), ConnectionRegistrationFailure> {
         if qp_num == 0 {
             return Err(ConnectionRegistrationFailure {
@@ -769,7 +789,7 @@ impl ConnectionRegistry {
         mutate: impl FnOnce(
             &Arc<EstablishedIoConnection>,
             &mut ConnectionIoState,
-            &dyn super::super::io_core::IoPostAuthority,
+            &super::connection::ConnectionPoster,
         ) -> T,
     ) -> Option<T> {
         self.with_connection_mut(token, |connection| {
@@ -1794,13 +1814,13 @@ impl<T> LookupOccupied<T> for Lookup<T> {
 mod tests {
     use super::*;
     use crate::v2::engine::RdmaConnectionConfig;
-    use crate::v2::engine::session::connection::{ReservationState, WorkRequestPoster};
+    use crate::v2::engine::session::connection::{ReservationState, TestConnectionProvider};
     use crate::v2::qp::{BatchPostOutcome, QpCapabilities};
     use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
 
     struct TestPoster;
 
-    impl WorkRequestPoster for TestPoster {
+    impl TestConnectionProvider for TestPoster {
         fn qp_num(&self) -> u32 {
             41
         }
@@ -1817,17 +1837,11 @@ mod tests {
             Ok(BatchPostOutcome::AllAccepted)
         }
 
-        fn to_error(
-            &self,
-            _: &crate::v2::engine::session::SessionLifecycleAuthority,
-        ) -> crate::v2::Result<()> {
+        fn to_error(&self) -> crate::v2::Result<()> {
             Ok(())
         }
 
-        fn destroy_qp(
-            &self,
-            _: &crate::v2::engine::session::SessionLifecycleAuthority,
-        ) -> crate::v2::Result<bool> {
+        fn destroy_qp(&self) -> crate::v2::Result<bool> {
             Ok(true)
         }
 
@@ -1902,9 +1916,7 @@ mod tests {
         registry
             .with_connection_mut(token, |connection| {
                 connection.record_cm_failure(Error::TransportClosed);
-                connection
-                    .transition_to_error_once(&super::super::SessionLifecycleAuthority::for_test())
-                    .unwrap();
+                connection.transition_to_error_once().unwrap();
             })
             .unwrap();
         assert!(registry.request_retirement(token));
@@ -1976,9 +1988,7 @@ mod tests {
         assert!(registry.begin_close(token));
         registry
             .with_connection_mut(token, |connection| {
-                connection
-                    .transition_to_error_once(&super::super::SessionLifecycleAuthority::for_test())
-                    .unwrap();
+                connection.transition_to_error_once().unwrap();
             })
             .unwrap();
         assert!(registry.request_retirement(token));

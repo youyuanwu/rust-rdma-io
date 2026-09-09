@@ -204,7 +204,7 @@ mod tests {
         DEFAULT_CONNECTION_DRAIN_DEADLINE, DEFAULT_ENGINE_SHUTDOWN_DEADLINE,
         DEFAULT_MISSING_CQE_DEADLINE, EngineConfig,
     };
-    use super::super::session::connection::{WorkRequestPoster, install_connection};
+    use super::super::session::connection::{TestConnectionProvider, install_connection};
     use super::super::{CompletionMode, RdmaConnectionConfig, test_engine_pair};
     use super::MemoizedTerminalResult;
     use crate::v2::error::{Error, Result};
@@ -217,7 +217,7 @@ mod tests {
         destroys: AtomicUsize,
     }
 
-    impl WorkRequestPoster for HeldPoster {
+    impl TestConnectionProvider for HeldPoster {
         fn qp_num(&self) -> u32 {
             self.qp_num
         }
@@ -234,18 +234,12 @@ mod tests {
             unreachable!("lifecycle test does not post")
         }
 
-        fn to_error(
-            &self,
-            _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
-        ) -> Result<()> {
+        fn to_error(&self) -> Result<()> {
             self.to_errors.fetch_add(1, Ordering::AcqRel);
             Ok(())
         }
 
-        fn destroy_qp(
-            &self,
-            _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
-        ) -> Result<bool> {
+        fn destroy_qp(&self) -> Result<bool> {
             Ok(self
                 .destroys
                 .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
@@ -296,7 +290,7 @@ mod tests {
         install_connection(
             &driver.reactor.session.manager,
             &mut driver.reactor.session.connections,
-            Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
+            Arc::clone(&poster) as Arc<dyn TestConnectionProvider>,
             RdmaConnectionConfig::default(),
             None,
             None,
@@ -330,7 +324,7 @@ mod tests {
         let connection = install_connection(
             &driver.reactor.session.manager,
             &mut driver.reactor.session.connections,
-            Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
+            Arc::clone(&poster) as Arc<dyn TestConnectionProvider>,
             RdmaConnectionConfig::default(),
             None,
             None,
@@ -393,7 +387,7 @@ mod tests {
         let connection = install_connection(
             &driver.reactor.session.manager,
             &mut driver.reactor.session.connections,
-            Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
+            Arc::clone(&poster) as Arc<dyn TestConnectionProvider>,
             RdmaConnectionConfig::default(),
             None,
             None,
@@ -438,7 +432,7 @@ mod tests {
             to_errors: AtomicUsize::new(0),
             destroys: AtomicUsize::new(0),
         });
-        let poster_dyn: Arc<dyn WorkRequestPoster> = poster.clone();
+        let poster_dyn: Arc<dyn TestConnectionProvider> = poster.clone();
         let connection = install_connection(
             &driver.reactor.session.manager,
             &mut driver.reactor.session.connections,

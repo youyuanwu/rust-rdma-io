@@ -170,23 +170,20 @@ impl RdmaEngineBuilder {
         self
     }
 
-    /// Set I/O reclamation/deadline actions per I/O service turn in `1..=4096`.
+    /// Set operation reclamation/deadline actions per reactor turn in
+    /// `1..=4096`.
     ///
-    /// This and [`Self::session_reclamation_budget`] replace the former
-    /// aggregate v2 `reclamation_budget`. To preserve an old aggregate value
-    /// `N`, divide it between the two owner-local controls. Odd values may use
-    /// either floor/ceiling assignment. The old value `1` has no exact
-    /// equivalent because both owners require a nonzero bounded turn; the
-    /// minimum replacement is `(1, 1)`.
+    /// This independent bound prevents cancellation and missing-CQE work from
+    /// consuming the connection-lifecycle source's turn budget.
     pub fn io_reclamation_budget(mut self, value: usize) -> Self {
         self.config.io_reclamation_budget = value;
         self
     }
 
-    /// Set session reclamation/deadline actions per session turn in `1..=4096`.
+    /// Set connection drain/deadline actions per reactor turn in `1..=4096`.
     ///
-    /// See [`Self::io_reclamation_budget`] for migration from the removed
-    /// aggregate `reclamation_budget` control.
+    /// This independent bound prevents connection lifecycle work from
+    /// consuming the operation-reclamation source's turn budget.
     pub fn session_reclamation_budget(mut self, value: usize) -> Self {
         self.config.session_reclamation_budget = value;
         self
@@ -541,13 +538,6 @@ impl EngineControl {
         lock_unpoison(&self.driver_failure).take()
     }
 
-    #[cfg(test)]
-    fn pending_terminal_outcome(&self) -> Option<MemoizedTerminalResult> {
-        lock_unpoison(&self.driver_failure)
-            .clone()
-            .map(MemoizedTerminalResult::from_error)
-    }
-
     fn publish(&self, work: usize) {
         if let Some(work_signal) = self.work_signal.upgrade() {
             work_signal.publish(work);
@@ -706,9 +696,9 @@ impl EngineFrontendRoot {
     }
 
     fn request_shutdown_command(&self) {
-        // Admission closes synchronously so no old-path operation can cross
-        // the shutdown boundary before the driver consumes the control
-        // command. Provider and teardown progress still require the driver.
+        // Admission closes synchronously so no operation can cross the
+        // shutdown boundary before the driver consumes the control command.
+        // Provider and teardown progress still require the driver.
         #[cfg(any(test, feature = "test-hooks"))]
         self.test_driver.record_shutdown_attempt();
         let admission = write_unpoison(&self.session.admission);

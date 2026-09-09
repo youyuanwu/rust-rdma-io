@@ -1,5 +1,7 @@
 use std::os::unix::io::RawFd;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
+#[cfg(any(test, feature = "test-hooks"))]
+use std::sync::Weak;
 
 use tokio::io::{Interest, unix::AsyncFd};
 

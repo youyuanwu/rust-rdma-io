@@ -52,7 +52,7 @@ impl MemoryRegistrar {
     }
 }
 
-/// Opaque authority for protocol I/O on one engine-owned connection.
+/// Resource-free protocol frontend for one engine-owned connection.
 #[derive(Clone)]
 pub(crate) struct IoConnection {
     memory: MemoryRegistrar,
@@ -167,6 +167,10 @@ impl IoConnection {
         drop(pending);
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "failed bounded admission returns the command with all owned MRs intact"
+    )]
     fn submit(
         &self,
         command: ProtocolCommand,
@@ -307,6 +311,10 @@ impl ProtocolTestAdmission {
         })
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "the test seam preserves production command ownership on rejection"
+    )]
     pub(in crate::v2::engine) fn submit(
         &self,
         command: ProtocolCommand,
@@ -342,6 +350,10 @@ struct IoConnectionTestAdmission<'a> {
 
 #[cfg(test)]
 impl IoConnectionTestAdmission<'_> {
+    #[allow(
+        clippy::result_large_err,
+        reason = "the test seam preserves production command ownership on rejection"
+    )]
     fn submit(
         &self,
         command: ProtocolCommand,
@@ -426,7 +438,7 @@ pub(crate) struct BorrowedSetupIo<'a> {
     io_core: &'a mut IoState,
     io: Arc<EstablishedIoConnection>,
     io_ledger: &'a mut ConnectionIoState,
-    poster: &'a dyn super::io_core::IoPostAuthority,
+    poster: &'a super::session::connection::ConnectionPoster,
     connection: IoConnection,
 }
 
@@ -732,13 +744,13 @@ impl IoConnection {
     pub(crate) fn with_delayed_close_event_for_test() -> (Self, IoEventReceiver, impl FnOnce()) {
         use super::config::{EngineConfig, RdmaConnectionConfig};
         use super::registry::ConnectionToken;
-        use super::session::connection::WorkRequestPoster;
+        use super::session::connection::TestConnectionProvider;
         use crate::v2::qp::{BatchPostOutcome, QpCapabilities};
         use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
 
         struct TestPoster;
 
-        impl WorkRequestPoster for TestPoster {
+        impl TestConnectionProvider for TestPoster {
             fn qp_num(&self) -> u32 {
                 1
             }
@@ -755,17 +767,11 @@ impl IoConnection {
                 Ok(BatchPostOutcome::AllAccepted)
             }
 
-            fn to_error(
-                &self,
-                _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
-            ) -> Result<()> {
+            fn to_error(&self) -> Result<()> {
                 Ok(())
             }
 
-            fn destroy_qp(
-                &self,
-                _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
-            ) -> Result<bool> {
+            fn destroy_qp(&self) -> Result<bool> {
                 Ok(false)
             }
 

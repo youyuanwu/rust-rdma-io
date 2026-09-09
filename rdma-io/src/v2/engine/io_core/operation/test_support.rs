@@ -5,12 +5,12 @@ use std::sync::Arc;
 use crate::v2::engine::registry::{Lookup, OperationToken};
 use crate::wc::{WcOpcode, WorkCompletion};
 
-use super::super::{Direction, EstablishedIoConnection, IoCore};
+use super::super::{Direction, EstablishedIoConnection, IoState};
 use super::future::RdmaOperation;
 use super::state::OperationState;
 
 pub(in crate::v2::engine) fn install_accepted_operation_for_driver_test(
-    io_core: &mut IoCore,
+    io_core: &mut IoState,
     connections: &mut crate::v2::engine::session::registry::ConnectionRegistry,
     connection: crate::v2::engine::registry::ConnectionToken,
     opcode: WcOpcode,
@@ -45,7 +45,7 @@ pub(in crate::v2::engine) fn install_accepted_operation_for_driver_test(
 }
 
 pub(in crate::v2::engine) fn register_operation_waker_for_test(
-    io_core: &IoCore,
+    io_core: &IoState,
     token: OperationToken,
     waker: &std::task::Waker,
 ) {
@@ -56,7 +56,7 @@ pub(in crate::v2::engine) fn register_operation_waker_for_test(
 }
 
 pub(in crate::v2::engine) fn operation_future_for_io_lifetime_test(
-    io_core: &mut IoCore,
+    io_core: &mut IoState,
     connection: &Arc<EstablishedIoConnection>,
     connection_io: &mut super::super::ConnectionIoState,
 ) -> RdmaOperation {

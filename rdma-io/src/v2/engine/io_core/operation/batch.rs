@@ -57,7 +57,7 @@ pub(in crate::v2::engine) fn post_io_recv_batch(
     shared: &mut IoState,
     connection: &Arc<EstablishedIoConnection>,
     connection_io: &mut ConnectionIoState,
-    poster: &dyn super::super::IoPostAuthority,
+    poster: &crate::v2::engine::session::connection::ConnectionPoster,
     events: &IoEventSender,
     requests: Vec<IoRecvRequest>,
 ) -> IoSubmissionDisposition {
@@ -83,7 +83,7 @@ pub(in crate::v2::engine) fn post_io_recv_batch_into(
     shared: &mut IoState,
     connection: &Arc<EstablishedIoConnection>,
     connection_io: &mut ConnectionIoState,
-    poster: &dyn super::super::IoPostAuthority,
+    poster: &crate::v2::engine::session::connection::ConnectionPoster,
     events: &IoEventSender,
     requests: Vec<IoRecvRequest>,
     actions: &mut ReactorActions,
@@ -110,7 +110,7 @@ pub(in crate::v2::engine) fn post_io_send_into(
     shared: &mut IoState,
     connection: &Arc<EstablishedIoConnection>,
     connection_io: &mut ConnectionIoState,
-    poster: &dyn super::super::IoPostAuthority,
+    poster: &crate::v2::engine::session::connection::ConnectionPoster,
     events: &IoEventSender,
     request: IoSendRequest,
     actions: &mut ReactorActions,
@@ -128,11 +128,15 @@ pub(in crate::v2::engine) fn post_io_send_into(
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "provider transaction ownership inputs remain explicit and borrow-scoped"
+)]
 fn post_io_batch(
     shared: &mut IoState,
     connection: &Arc<EstablishedIoConnection>,
     connection_io: &mut ConnectionIoState,
-    poster: &dyn super::super::IoPostAuthority,
+    poster: &crate::v2::engine::session::connection::ConnectionPoster,
     events: &IoEventSender,
     kind: OperationKind,
     entries: Vec<InternalPostInput>,
@@ -508,7 +512,7 @@ pub(super) fn commit_internal_entries(
 
 fn rollback_internal_entries(
     shared: &mut IoState,
-    connection: &impl EstablishedIoRef,
+    connection: &Arc<EstablishedIoConnection>,
     connection_io: &mut ConnectionIoState,
     direction: Direction,
     entries: Vec<InternalBatchEntry>,
@@ -538,38 +542,9 @@ enum InternalRelease {
     Retained(Vec<InternalBatchEntry>),
 }
 
-/// Ownership abstraction over the established I/O connection being posted to.
-///
-/// Production callers always pass the real `EstablishedIoConnection`; the
-/// `cfg(test)` impl lets owner-local fixtures drive rollback and release with a
-/// concrete `ConnectionState` without adding a session dependency to production
-/// operation code.
-trait EstablishedIoRef {
-    fn established_io(&self) -> &EstablishedIoConnection;
-}
-
-impl EstablishedIoRef for EstablishedIoConnection {
-    fn established_io(&self) -> &EstablishedIoConnection {
-        self
-    }
-}
-
-impl EstablishedIoRef for Arc<EstablishedIoConnection> {
-    fn established_io(&self) -> &EstablishedIoConnection {
-        self
-    }
-}
-
-#[cfg(test)]
-impl EstablishedIoRef for Arc<crate::v2::engine::session::connection::ConnectionState> {
-    fn established_io(&self) -> &EstablishedIoConnection {
-        &self.io
-    }
-}
-
 fn release_proven_unaccepted_entries(
     shared: &mut IoState,
-    connection: &impl EstablishedIoRef,
+    connection: &Arc<EstablishedIoConnection>,
     connection_io: &mut ConnectionIoState,
     direction: Direction,
     entries: Vec<InternalBatchEntry>,
@@ -590,7 +565,7 @@ fn release_proven_unaccepted_entries(
             .release(entry.token, false)
             .expect("proven-unaccepted operation remains registered");
         shared.cq_credits.release();
-        shared.release_local(connection.established_io(), connection_io, direction);
+        shared.release_local(connection, connection_io, direction);
         if let Some(event) = release.event {
             after_unlock.push_event(event);
         }

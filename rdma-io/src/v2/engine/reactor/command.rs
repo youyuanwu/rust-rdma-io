@@ -358,6 +358,10 @@ impl CommandIngress {
     }
 
     #[cfg_attr(test, allow(dead_code))]
+    #[allow(
+        clippy::result_large_err,
+        reason = "failed bounded admission returns the command with all owned MRs intact"
+    )]
     pub(in crate::v2::engine) fn enqueue_protocol(
         &self,
         manager: &SessionFrontend,
@@ -1079,7 +1083,7 @@ mod tests {
         }
     }
 
-    fn protocol_adapter(engine: &super::super::super::RdmaEngine) -> Arc<ProtocolTestAdmission> {
+    fn protocol_admission(engine: &super::super::super::RdmaEngine) -> Arc<ProtocolTestAdmission> {
         ProtocolTestAdmission::new(
             Arc::downgrade(&engine.shared.commands),
             Arc::downgrade(&engine.shared.session),
@@ -1087,14 +1091,14 @@ mod tests {
     }
 
     fn test_protocol_command(
-        adapter: &ProtocolTestAdmission,
+        admission: &ProtocolTestAdmission,
         operations: usize,
         actions: usize,
         probe: ProtocolTestProbe,
     ) -> (ProtocolCommand, super::super::super::io::IoEventReceiver) {
         let (events, receiver) = event_port();
         (
-            ProtocolCommand::for_test(operations, actions, events, adapter.open_token(), probe),
+            ProtocolCommand::for_test(operations, actions, events, admission.open_token(), probe),
             receiver,
         )
     }
@@ -1210,7 +1214,7 @@ mod tests {
         let commands = Arc::clone(&engine.shared.commands);
         let capacity = commands.available_operation_permits();
         let blocker = commands.operation_batch_acquire(capacity).await.unwrap();
-        let adapter = protocol_adapter(&engine);
+        let adapter = protocol_admission(&engine);
         let probe = protocol_probe(false);
         let (command, _events) = test_protocol_command(&adapter, 3, 0, probe.clone());
         assert!(adapter.submit(command).is_ok());
@@ -1241,7 +1245,7 @@ mod tests {
         let commands = Arc::clone(&engine.shared.commands);
         let capacity = commands.available_operation_permits();
         let blocker = commands.operation_batch_acquire(capacity).await.unwrap();
-        let adapter = protocol_adapter(&engine);
+        let adapter = protocol_admission(&engine);
         let before = protocol_probe(false);
         let (command, _events) = test_protocol_command(&adapter, 1, 0, before.clone());
         assert!(adapter.submit(command).is_ok());
@@ -1275,7 +1279,7 @@ mod tests {
         let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
         let commands = Arc::clone(&engine.shared.commands);
         let capacity = commands.available_operation_permits();
-        let adapter = protocol_adapter(&engine);
+        let adapter = protocol_admission(&engine);
         let probe = protocol_probe(false);
         let (command, events) = test_protocol_command(&adapter, 2, 0, probe.clone());
         assert!(adapter.submit(command).is_ok());
@@ -1300,7 +1304,7 @@ mod tests {
         let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
         let commands = Arc::clone(&engine.shared.commands);
         let capacity = commands.available_operation_permits();
-        let adapter = protocol_adapter(&engine);
+        let adapter = protocol_admission(&engine);
         let probe = protocol_probe(false);
         let (command, _events) = test_protocol_command(&adapter, 12, 12, probe.clone());
         assert!(adapter.submit(command).is_ok());

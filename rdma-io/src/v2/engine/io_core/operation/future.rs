@@ -498,7 +498,7 @@ fn start_operation(
     shared: &mut IoState,
     connection: &Arc<EstablishedIoConnection>,
     connection_io: &mut ConnectionIoState,
-    poster: &dyn super::super::IoPostAuthority,
+    poster: &crate::v2::engine::session::connection::ConnectionPoster,
     kind: OperationKind,
     mr: Mr,
     remote: Option<RemoteMr>,
@@ -665,7 +665,7 @@ fn start_operation(
 /// checked input can be reused after encoding.
 fn post_validated_operation(
     validated: ValidatedOperation,
-    poster: &dyn super::super::IoPostAuthority,
+    poster: &crate::v2::engine::session::connection::ConnectionPoster,
     token: OperationToken,
 ) -> Result<BatchPostOutcome> {
     match validated.kind() {

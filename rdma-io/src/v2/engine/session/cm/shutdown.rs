@@ -7,6 +7,7 @@ use crate::v2::engine::registry::ListenerToken;
 use crate::v2::engine::session::registry::ConnectionRegistry;
 use crate::v2::error::Error;
 
+#[derive(Default)]
 pub(in crate::v2::engine) struct CmShutdownCursor {
     route_slot: usize,
     listener_slot: usize,
@@ -15,20 +16,6 @@ pub(in crate::v2::engine) struct CmShutdownCursor {
     destruction_listeners_remaining: Option<usize>,
     destruction_listeners_complete: bool,
     terminalized_listeners: HashSet<ListenerToken>,
-}
-
-impl Default for CmShutdownCursor {
-    fn default() -> Self {
-        Self {
-            route_slot: 0,
-            listener_slot: 0,
-            routes_complete: false,
-            listeners_complete: false,
-            destruction_listeners_remaining: None,
-            destruction_listeners_complete: false,
-            terminalized_listeners: HashSet::new(),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,15 +28,6 @@ pub(in crate::v2::engine) enum CmShutdownClass {
 }
 
 impl CmShutdownClass {
-    #[cfg(test)]
-    pub(in crate::v2::engine) const ALL: [Self; 5] = [
-        Self::PendingOutbound,
-        Self::Routes,
-        Self::PendingListen,
-        Self::Listeners,
-        Self::RetainedListeners,
-    ];
-
     const fn index(self) -> usize {
         match self {
             Self::PendingOutbound => 0,
@@ -254,19 +232,19 @@ pub(super) fn service_class(
                 if *remaining == 0 {
                     cursor.destruction_listeners_complete = true;
                 }
-                if let Some(listener) = listener {
-                    if !cursor.terminalized_listeners.contains(&listener) {
-                        let complete = state.listeners.get_mut(listener).is_none_or(|listener| {
-                            listener.terminalize_waiters_into(outcome, actions, 1);
-                            !listener.has_waiters()
-                        });
-                        if complete {
-                            cursor.terminalized_listeners.insert(listener);
-                        } else {
-                            *remaining += 1;
-                            processed += 1;
-                            break;
-                        }
+                if let Some(listener) = listener
+                    && !cursor.terminalized_listeners.contains(&listener)
+                {
+                    let complete = state.listeners.get_mut(listener).is_none_or(|listener| {
+                        listener.terminalize_waiters_into(outcome, actions, 1);
+                        !listener.has_waiters()
+                    });
+                    if complete {
+                        cursor.terminalized_listeners.insert(listener);
+                    } else {
+                        *remaining += 1;
+                        processed += 1;
+                        break;
                     }
                 }
             }

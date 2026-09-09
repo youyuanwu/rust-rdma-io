@@ -48,28 +48,11 @@ pub(super) struct DeadlineRequest {
     token: u64,
 }
 
-/// Non-forgeable authority for connection and QP lifecycle transitions.
-pub(super) struct SessionLifecycleAuthority {
-    _private: (),
-}
-
-/// Authority held by the session owner while committing I/O effects.
-pub(in crate::v2::engine) struct IoEffectsCommitAuthority {
-    _private: (),
-}
-
-#[cfg(test)]
-impl SessionLifecycleAuthority {
-    pub(super) fn for_test() -> Self {
-        Self { _private: () }
-    }
-}
-
 /// Exact, non-cloneable proof minted after one successful synchronous QP destroy.
 pub(super) struct QpDestructionProof {
     connection: ConnectionToken,
     qp_num: u32,
-    _authority: (),
+    _evidence: (),
 }
 
 /// Resource-free close observation shared with connection frontends.
@@ -319,6 +302,13 @@ pub(super) struct SessionListener {
     local_addr: std::net::SocketAddr,
 }
 
+type SessionListenerOwners = (
+    Arc<SessionFrontend>,
+    Arc<CommandIngress>,
+    ListenerToken,
+    Arc<ListenerAdmission>,
+);
+
 impl SessionListener {
     pub(super) fn local_addr(&self) -> std::net::SocketAddr {
         self.local_addr
@@ -332,14 +322,7 @@ impl SessionListener {
         self.close.release_frontend()
     }
 
-    pub(super) fn owners(
-        &self,
-    ) -> Result<(
-        Arc<SessionFrontend>,
-        Arc<CommandIngress>,
-        ListenerToken,
-        Arc<ListenerAdmission>,
-    )> {
+    pub(super) fn owners(&self) -> Result<SessionListenerOwners> {
         let frontend = self.frontend.upgrade().ok_or(Error::DriverShutdown)?;
         let commands = self.commands.upgrade().ok_or_else(|| {
             self.close
@@ -379,7 +362,7 @@ impl SessionListener {
     }
 }
 
-/// Runtime-state-free backend policy and transition authority.
+/// Runtime-state-free backend policy used by the reactor.
 ///
 /// All mutable connection, listener, CM, shutdown, and terminal storage is
 /// owned by the reactor. Public handles cannot reach this value; they retain
@@ -393,8 +376,6 @@ pub(super) struct SessionManager {
     control: Weak<EngineControl>,
     #[cfg(any(test, feature = "test-hooks"))]
     test_instrumentation: SessionTestInstrumentation,
-    lifecycle_authority: SessionLifecycleAuthority,
-    io_effects_commit_authority: IoEffectsCommitAuthority,
 }
 
 impl SessionManager {
@@ -436,8 +417,6 @@ impl SessionManager {
             control,
             #[cfg(any(test, feature = "test-hooks"))]
             test_instrumentation,
-            lifecycle_authority: SessionLifecycleAuthority { _private: () },
-            io_effects_commit_authority: IoEffectsCommitAuthority { _private: () },
         }
     }
 
@@ -479,15 +458,6 @@ impl SessionManager {
             .get()
             .and_then(Weak::upgrade)
             .is_none_or(|commands| commands.is_closed())
-    }
-
-    #[cfg(test)]
-    pub(super) fn pending_terminal_outcome(
-        &self,
-    ) -> Option<super::lifecycle::MemoizedTerminalResult> {
-        self.control
-            .upgrade()
-            .and_then(|control| control.pending_terminal_outcome())
     }
 
     pub(super) fn begin_driver_failure(&self, error: Error) {
@@ -564,9 +534,7 @@ impl SessionManager {
         token: ConnectionToken,
     ) -> Result<QpDestructionProof> {
         let status = connections
-            .with_connection_mut(token, |connection| {
-                connection.destroy_qp_for_session(&self.lifecycle_authority)
-            })
+            .with_connection_mut(token, |connection| connection.destroy_qp_for_session())
             .ok_or(Error::TransportClosed)??;
         match status {
             QpDestroyStatus::DestroyedNow => Ok(QpDestructionProof {
@@ -574,7 +542,7 @@ impl SessionManager {
                 qp_num: connections
                     .with_connection(token, |connection| connection.qp_num())
                     .ok_or(Error::TransportClosed)?,
-                _authority: (),
+                _evidence: (),
             }),
             QpDestroyStatus::AlreadyDestroyed => Err(Error::InvalidConfig(
                 "QP destruction proof was already minted and cannot be replayed".into(),
@@ -588,9 +556,7 @@ impl SessionManager {
         token: ConnectionToken,
     ) -> Result<()> {
         match connections
-            .with_connection_mut(token, |connection| {
-                connection.destroy_qp_for_session(&self.lifecycle_authority)
-            })
+            .with_connection_mut(token, |connection| connection.destroy_qp_for_session())
             .ok_or(Error::TransportClosed)??
         {
             QpDestroyStatus::DestroyedNow | QpDestroyStatus::AlreadyDestroyed => Ok(()),
@@ -603,9 +569,7 @@ impl SessionManager {
         token: ConnectionToken,
     ) -> Result<bool> {
         connections
-            .with_connection_mut(token, |connection| {
-                connection.transition_to_error_once(&self.lifecycle_authority)
-            })
+            .with_connection_mut(token, |connection| connection.transition_to_error_once())
             .ok_or(Error::TransportClosed)?
     }
 
@@ -629,7 +593,7 @@ impl SessionManager {
         connections
             .with_connection_mut(token, |connection| {
                 connection.close_state().record_engine_terminal(outcome);
-                connection.finalize_engine(&self.lifecycle_authority, outcome)
+                connection.finalize_engine(outcome)
             })
             .flatten()
     }
@@ -656,8 +620,7 @@ impl SessionManager {
     ) -> Result<Option<SharedCmId>> {
         connections
             .with_connection_mut(token, |connection| {
-                connection
-                    .destroy_connection_resources(&self.lifecycle_authority, outstanding_operations)
+                connection.destroy_connection_resources(outstanding_operations)
             })
             .ok_or(Error::TransportClosed)?
     }
@@ -667,7 +630,7 @@ impl SessionManager {
         connections: &mut ConnectionRegistry,
         resources: &mut self::connection::FailedConnectionInstallResources,
     ) -> Result<(Option<SharedCmId>, bool)> {
-        resources.destroy_for_session(connections, &self.lifecycle_authority)
+        resources.destroy_for_session(connections)
     }
 
     pub(super) fn reject_failed_connection_install(
@@ -754,7 +717,7 @@ impl SessionManager {
                 self.schedule_connection_retirement(connections, token);
             }
         }
-        effects.into_committed(&self.io_effects_commit_authority)
+        effects.into_committed()
     }
 
     /// Consume an I/O effect bundle, apply all session-facing mutations, and
@@ -788,7 +751,7 @@ impl SessionManager {
     ///
     /// The returned value contains only detached publication and must be
     /// consumed after CM and connection terminal state has been published.
-    /// Session authority confines conversion before root composition.
+    /// Reactor ownership confines conversion before root composition.
     pub(super) fn apply_terminal_io_effects(
         &self,
         connections: &mut ConnectionRegistry,
@@ -849,7 +812,7 @@ impl SessionManager {
         let QpDestructionProof {
             connection: proven_connection,
             qp_num: proven_qp_num,
-            _authority: (),
+            _evidence: (),
         } = proof;
         let Some((qp_num, close_error)) = connections.with_connection(connection, |connection| {
             (connection.qp_num(), connection.operation_close_error())
@@ -926,6 +889,10 @@ impl SessionManager {
     }
 
     #[cfg(test)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "proof validation fixture keeps every expected identity and owner explicit"
+    )]
     fn reclaim_after_proven_qp_destroy(
         &self,
         connections: &mut ConnectionRegistry,
@@ -983,7 +950,7 @@ mod tests {
 
     use super::super::{CompletionMode, RdmaConnectionConfig, test_engine_pair};
     use super::DeadlineKind;
-    use super::connection::{WorkRequestPoster, install_connection};
+    use super::connection::{TestConnectionProvider, install_connection};
     use super::listener::{ListenerEntry, RdmaListener};
     use crate::v2::error::{Error, Result};
     use crate::v2::qp::{BatchPostOutcome, QpCapabilities};
@@ -993,7 +960,7 @@ mod tests {
         qp_num: u32,
     }
 
-    impl WorkRequestPoster for TestPoster {
+    impl TestConnectionProvider for TestPoster {
         fn qp_num(&self) -> u32 {
             self.qp_num
         }
@@ -1010,17 +977,11 @@ mod tests {
             Ok(BatchPostOutcome::AllAccepted)
         }
 
-        fn to_error(
-            &self,
-            _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
-        ) -> Result<()> {
+        fn to_error(&self) -> Result<()> {
             Ok(())
         }
 
-        fn destroy_qp(
-            &self,
-            _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
-        ) -> Result<bool> {
+        fn destroy_qp(&self) -> Result<bool> {
             Ok(true)
         }
 
@@ -1144,7 +1105,7 @@ mod tests {
     }
 
     #[test]
-    fn session_lifecycle_authority_mints_one_exact_qp_proof() {
+    fn qp_destroy_mints_one_exact_non_replayable_proof() {
         let (_engine, mut driver) = test_engine_pair(CompletionMode::Polling);
         let connection = install_connection(
             &driver.reactor.session.manager,

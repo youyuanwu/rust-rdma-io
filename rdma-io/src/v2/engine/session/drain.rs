@@ -431,7 +431,7 @@ mod tests {
     use super::super::super::{
         CompletionMode, RdmaConnectionConfig, RdmaEngineLifecycle, test_engine_pair,
     };
-    use super::super::connection::{WorkRequestPoster, install_connection};
+    use super::super::connection::{TestConnectionProvider, install_connection};
     use crate::v2::error::{Error, Result};
     use crate::v2::qp::{BatchPostOutcome, QpCapabilities};
     use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
@@ -493,7 +493,7 @@ mod tests {
         }
     }
 
-    impl WorkRequestPoster for TestPoster {
+    impl TestConnectionProvider for TestPoster {
         fn qp_num(&self) -> u32 {
             self.qp_num
         }
@@ -510,10 +510,7 @@ mod tests {
             unreachable!("drain test does not post")
         }
 
-        fn to_error(
-            &self,
-            _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
-        ) -> Result<()> {
+        fn to_error(&self) -> Result<()> {
             self.error_transitions.fetch_add(1, Ordering::AcqRel);
             if self.fail_error_transition {
                 Err(Error::Verbs(std::io::Error::other(
@@ -524,10 +521,7 @@ mod tests {
             }
         }
 
-        fn destroy_qp(
-            &self,
-            _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
-        ) -> Result<bool> {
+        fn destroy_qp(&self) -> Result<bool> {
             self.destroys.fetch_add(1, Ordering::AcqRel);
             if self.fail_destroy {
                 Err(Error::Verbs(std::io::Error::from_raw_os_error(libc::EBUSY)))
@@ -762,7 +756,7 @@ mod tests {
         let connection = install_connection(
             &driver.reactor.session.manager,
             &mut driver.reactor.session.connections,
-            Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
+            Arc::clone(&poster) as Arc<dyn TestConnectionProvider>,
             RdmaConnectionConfig::default().max_send_wr(64),
             None,
             None,
@@ -825,7 +819,7 @@ mod tests {
         OperationToken,
     ) {
         let poster = TestPoster::new(qp_num);
-        let poster_dyn: Arc<dyn WorkRequestPoster> = poster.clone();
+        let poster_dyn: Arc<dyn TestConnectionProvider> = poster.clone();
         let connection = install_connection(
             &driver.reactor.session.manager,
             &mut driver.reactor.session.connections,
@@ -974,7 +968,7 @@ mod tests {
         let connection = install_connection(
             &driver.reactor.session.manager,
             &mut driver.reactor.session.connections,
-            Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
+            Arc::clone(&poster) as Arc<dyn TestConnectionProvider>,
             RdmaConnectionConfig::default(),
             None,
             None,
@@ -1024,7 +1018,7 @@ mod tests {
         let connection = install_connection(
             &driver.reactor.session.manager,
             &mut driver.reactor.session.connections,
-            Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
+            Arc::clone(&poster) as Arc<dyn TestConnectionProvider>,
             RdmaConnectionConfig::default(),
             None,
             None,

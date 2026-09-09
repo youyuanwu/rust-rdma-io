@@ -128,23 +128,6 @@ pub(super) enum OperationLifecycle {
     Released,
 }
 
-pub(super) trait IntoEstablishedIoConnection {
-    fn into_established_io(self) -> Arc<EstablishedIoConnection>;
-}
-
-impl IntoEstablishedIoConnection for Arc<EstablishedIoConnection> {
-    fn into_established_io(self) -> Arc<EstablishedIoConnection> {
-        self
-    }
-}
-
-#[cfg(test)]
-impl IntoEstablishedIoConnection for Arc<crate::v2::engine::session::connection::ConnectionState> {
-    fn into_established_io(self) -> Arc<EstablishedIoConnection> {
-        Arc::clone(&self.io)
-    }
-}
-
 impl OperationState {
     pub(super) fn token(&self) -> OperationToken {
         self.token
@@ -185,7 +168,7 @@ impl OperationState {
     #[cfg(test)]
     pub(super) fn new(
         token: OperationToken,
-        connection: impl IntoEstablishedIoConnection,
+        connection: Arc<EstablishedIoConnection>,
         direction: Direction,
         expected_opcode: WcOpcode,
         mr: Option<Mr>,
@@ -205,7 +188,7 @@ impl OperationState {
 
     pub(super) fn new_with_event(
         token: OperationToken,
-        connection: impl IntoEstablishedIoConnection,
+        connection: Arc<EstablishedIoConnection>,
         direction: Direction,
         expected_opcode: WcOpcode,
         mr: Option<Mr>,
@@ -230,7 +213,7 @@ impl OperationState {
     )]
     fn new_with_observer(
         token: OperationToken,
-        connection: impl IntoEstablishedIoConnection,
+        connection: Arc<EstablishedIoConnection>,
         direction: Direction,
         expected_opcode: WcOpcode,
         mr: Option<Mr>,
@@ -238,7 +221,6 @@ impl OperationState {
         event_destination: Option<IoEventDestination>,
         observer: Option<Arc<OperationObserver>>,
     ) -> Self {
-        let connection = connection.into_established_io();
         Self {
             token,
             identity: connection.identity(),
@@ -258,7 +240,7 @@ impl OperationState {
 
     pub(super) fn new_scalar(
         token: OperationToken,
-        connection: impl IntoEstablishedIoConnection,
+        connection: Arc<EstablishedIoConnection>,
         direction: Direction,
         expected_opcode: WcOpcode,
         mr: Option<Mr>,

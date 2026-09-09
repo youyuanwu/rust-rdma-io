@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context as TaskContext, Poll, RawWaker, RawWakerVTable, Waker};
 
 use super::*;
-use crate::v2::engine::session::connection::{WorkRequestPoster, install_connection};
+use crate::v2::engine::session::connection::{TestConnectionProvider, install_connection};
 use crate::v2::qp::{BatchPostOutcome, QpCapabilities};
 use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
 
@@ -328,7 +328,7 @@ fn shutdown_initiates_each_preexisting_connection_close_once() {
         error_transitions: AtomicUsize,
     }
 
-    impl WorkRequestPoster for ShutdownPoster {
+    impl TestConnectionProvider for ShutdownPoster {
         fn qp_num(&self) -> u32 {
             self.qp_num
         }
@@ -345,18 +345,12 @@ fn shutdown_initiates_each_preexisting_connection_close_once() {
             Ok(BatchPostOutcome::AllAccepted)
         }
 
-        fn to_error(
-            &self,
-            _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
-        ) -> Result<()> {
+        fn to_error(&self) -> Result<()> {
             self.error_transitions.fetch_add(1, Ordering::AcqRel);
             Ok(())
         }
 
-        fn destroy_qp(
-            &self,
-            _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
-        ) -> Result<bool> {
+        fn destroy_qp(&self) -> Result<bool> {
             Ok(true)
         }
 
@@ -377,7 +371,7 @@ fn shutdown_initiates_each_preexisting_connection_close_once() {
         let connection = install_connection(
             &driver.reactor.session.manager,
             &mut driver.reactor.session.connections,
-            Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
+            Arc::clone(&poster) as Arc<dyn TestConnectionProvider>,
             RdmaConnectionConfig::default(),
             None,
             None,

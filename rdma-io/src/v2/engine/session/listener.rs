@@ -656,12 +656,7 @@ impl AcceptRequestObserver {
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
         let mut current = lock_unpoison(&self.result);
-        let replacement = match std::mem::replace(&mut *current, TakeOnceResult::Taken) {
-            TakeOnceResult::Pending => TakeOnceResult::Pending,
-            TakeOnceResult::Ready(Ok(connection)) => TakeOnceResult::Ready(Ok(connection)),
-            TakeOnceResult::Ready(Err(error)) => TakeOnceResult::Ready(Err(error)),
-            TakeOnceResult::Taken => TakeOnceResult::Taken,
-        };
+        let replacement = std::mem::replace(&mut *current, TakeOnceResult::Taken);
         *current = replacement;
         drop(current);
         self.waker.wake();

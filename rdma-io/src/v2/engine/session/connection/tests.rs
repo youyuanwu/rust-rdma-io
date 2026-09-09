@@ -7,7 +7,7 @@ use crate::wr::{RecvWr, SendWr, WrOpcode};
 
 struct TestPoster;
 
-impl WorkRequestPoster for TestPoster {
+impl TestConnectionProvider for TestPoster {
     fn qp_num(&self) -> u32 {
         1
     }
@@ -24,17 +24,11 @@ impl WorkRequestPoster for TestPoster {
         Ok(BatchPostOutcome::AllAccepted)
     }
 
-    fn to_error(
-        &self,
-        _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
-    ) -> Result<()> {
+    fn to_error(&self) -> Result<()> {
         Ok(())
     }
 
-    fn destroy_qp(
-        &self,
-        _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
-    ) -> Result<bool> {
+    fn destroy_qp(&self) -> Result<bool> {
         Ok(false)
     }
 
@@ -44,18 +38,18 @@ impl WorkRequestPoster for TestPoster {
 }
 
 #[test]
-fn posting_authority_is_borrowed_from_the_entry_owned_poster() {
-    let owner: Arc<dyn WorkRequestPoster> = Arc::new(TestPoster);
+fn provider_access_is_borrowed_from_the_entry_owned_resources() {
+    let owner: Arc<dyn TestConnectionProvider> = Arc::new(TestPoster);
     let weak = Arc::downgrade(&owner);
-    let authority = ConnectionPoster::from(owner);
-    assert_eq!(authority.qp_num(), 1);
+    let resources = ConnectionPoster::from(owner);
+    assert_eq!(resources.qp_num(), 1);
     assert_eq!(
         weak.strong_count(),
         1,
         "the connection entry is the sole owning poster"
     );
 
-    drop(authority);
+    drop(resources);
     assert!(weak.upgrade().is_none());
 }
 
@@ -101,9 +95,7 @@ fn live_io_proofs_require_exact_identity() {
     assert!(registry.begin_close(token));
     registry
         .with_connection_mut(token, |connection| {
-            connection
-                .transition_to_error_once(&SessionLifecycleAuthority::for_test())
-                .unwrap();
+            connection.transition_to_error_once().unwrap();
         })
         .unwrap();
     assert!(registry.request_retirement(token));
@@ -271,7 +263,7 @@ fn destroy_quarantine_publishes_event_and_outcome_once() {
 fn destroy_with_accepted_work_fails_closed_without_destroying() {
     struct DestroyPoster(AtomicUsize);
 
-    impl WorkRequestPoster for DestroyPoster {
+    impl TestConnectionProvider for DestroyPoster {
         fn qp_num(&self) -> u32 {
             7
         }
@@ -288,17 +280,11 @@ fn destroy_with_accepted_work_fails_closed_without_destroying() {
             Ok(BatchPostOutcome::AllAccepted)
         }
 
-        fn to_error(
-            &self,
-            _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
-        ) -> Result<()> {
+        fn to_error(&self) -> Result<()> {
             Ok(())
         }
 
-        fn destroy_qp(
-            &self,
-            _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
-        ) -> Result<bool> {
+        fn destroy_qp(&self) -> Result<bool> {
             self.0.fetch_add(1, Ordering::AcqRel);
             Ok(true)
         }
@@ -314,14 +300,13 @@ fn destroy_with_accepted_work_fails_closed_without_destroying() {
             slot: 1,
             generation: 1,
         },
-        Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
+        Arc::clone(&poster) as Arc<dyn TestConnectionProvider>,
         RdmaConnectionConfig::default(),
         None,
         None,
         None,
     );
-    let authority = SessionLifecycleAuthority::for_test();
-    let error = match connection.destroy_connection_resources(&authority, 1) {
+    let error = match connection.destroy_connection_resources(1) {
         Ok(_) => panic!("accepted work must prevent connection destruction"),
         Err(error) => error,
     };

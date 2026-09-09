@@ -1,9 +1,9 @@
 //! Exact CQE validation, queueing, bounded dispatch, and final release.
 //!
 //! A copied CQE only ever reaches an operation through this module, and it
-//! does so in two separately validated steps. [`IoCore::prepare_completion`]
+//! does so in two separately validated steps. [`IoState::prepare_completion`]
 //! resolves the encoded `wr_id` against the generational registry, and
-//! [`IoCore::enqueue_prepared_completion`] then requires the exact QP number,
+//! [`IoState::enqueue_prepared_completion`] then requires the exact QP number,
 //! a live-connection proof for that same connection *and* QP generation, the
 //! caller-supplied connection to be the identical established identity, and —
 //! for a successful status — the opcode the operation was validated to expect.
@@ -26,7 +26,7 @@
 //! destroyed. Both stop early on an empty queue and report whether completion
 //! work remains, so neither can spin on an idle connection.
 //!
-//! [`IoCore::finish_operation`] is the one place that releases a completed
+//! [`IoState::finish_operation`] is the one place that releases a completed
 //! operation, and it releases in a fixed order: the registry slot first (a
 //! failed release means another path already finished this operation, so the
 //! CQE is rejected as `Duplicate` and nothing else is touched), then the
@@ -43,7 +43,7 @@
 //! early CQE while still holding their posting guards.
 //!
 //! Dependency direction is one-way: this module uses `state`, `effects`, and
-//! the parent `IoCore` accounting fields only. It does not depend on `batch`,
+//! the parent `IoState` accounting fields only. It does not depend on `batch`,
 //! `future`, or reclamation; those callers reach completion through the
 //! `pub(super)` finishing methods, which are the narrowest visibility that can
 //! span the operation subtree.
@@ -78,7 +78,7 @@ pub(in crate::v2::engine) enum CqeReject {
 ///
 /// The value only carries the copied completion and the resolved operation, and
 /// both fields stay private, so the identity checks in
-/// [`IoCore::enqueue_prepared_completion`] cannot be bypassed by constructing or
+/// [`IoState::enqueue_prepared_completion`] cannot be bypassed by constructing or
 /// editing one. The type is intentionally absent from the parent facade: the
 /// session owner holds it as an inferred temporary between the two steps.
 pub(in crate::v2::engine) struct PendingCompletion {

@@ -526,23 +526,23 @@ pub(super) fn retire_registered_connection_into(
         }
     };
     if let Some(cm_id) = cm_id {
-        if let RouteRetirementDisposition::Reject(reason) = disposition {
-            if let Err(error) = cm_id.reject(&[]) {
-                let error = contextual_cm_error(
-                    format!("reject selected inbound child after setup rollback ({reason:?})"),
-                    Error::from_v1(error),
-                );
-                return retain_failed_connection_cm(
-                    state,
-                    connections,
-                    token,
-                    completion,
-                    cm_id,
-                    error,
-                    actions,
-                    false,
-                );
-            }
+        if let RouteRetirementDisposition::Reject(reason) = disposition
+            && let Err(error) = cm_id.reject(&[])
+        {
+            let error = contextual_cm_error(
+                format!("reject selected inbound child after setup rollback ({reason:?})"),
+                Error::from_v1(error),
+            );
+            return retain_failed_connection_cm(
+                state,
+                connections,
+                token,
+                completion,
+                cm_id,
+                error,
+                actions,
+                false,
+            );
         }
         state
             .cm_destructions

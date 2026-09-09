@@ -373,6 +373,13 @@ async fn run_mode(mode: CompletionMode) {
     resources
         .inject_completion(identity.wr_id(), identity.qp_num(), WcOpcode::Recv)
         .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while resources.instrumentation().unwrap().cqes_rejected < rejected_before + 4 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the driver did not process all injected invalid CQEs");
     assert_eq!(
         resources.instrumentation().unwrap().cqes_rejected,
         rejected_before + 4
@@ -394,6 +401,13 @@ async fn run_mode(mode: CompletionMode) {
     resources
         .inject_completion(identity.wr_id(), identity.qp_num(), identity.opcode())
         .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while resources.instrumentation().unwrap().cqes_rejected < rejected_before + 5 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the driver did not process the injected duplicate CQE");
     assert_eq!(
         resources.instrumentation().unwrap().cqes_rejected,
         rejected_before + 5

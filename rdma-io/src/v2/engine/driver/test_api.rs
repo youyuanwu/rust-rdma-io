@@ -12,7 +12,7 @@ use crate::v2::engine::reactor::completion::CommandCompletion;
 use crate::v2::engine::resources::TestResourceObservers;
 use crate::v2::engine::session::SessionManager;
 #[cfg(test)]
-use crate::v2::engine::session::connection::WorkRequestPoster;
+use crate::v2::engine::session::connection::TestConnectionProvider;
 #[cfg(test)]
 use crate::v2::engine::session::connection::install_connection;
 use crate::v2::engine::session::connection::{
@@ -29,15 +29,15 @@ use crate::wc::{WcOpcode, WcStatus, WorkCompletion};
 #[cfg(test)]
 use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
 
+type TestConnectionInstallInput = (
+    ConnectionPoster,
+    RdmaConnectionConfig,
+    Option<std::net::SocketAddr>,
+    Option<std::net::SocketAddr>,
+);
+
 pub(in crate::v2::engine) struct TestConnectionInstallRequest {
-    input: Mutex<
-        Option<(
-            ConnectionPoster,
-            RdmaConnectionConfig,
-            Option<std::net::SocketAddr>,
-            Option<std::net::SocketAddr>,
-        )>,
-    >,
+    input: Mutex<Option<TestConnectionInstallInput>>,
     completion: CommandCompletion<RdmaConnection>,
 }
 
@@ -274,7 +274,7 @@ struct TestIdlePoster {
 }
 
 #[cfg(test)]
-impl WorkRequestPoster for TestIdlePoster {
+impl TestConnectionProvider for TestIdlePoster {
     fn qp_num(&self) -> u32 {
         self.qp_num
     }
@@ -291,17 +291,11 @@ impl WorkRequestPoster for TestIdlePoster {
         unreachable!("idle registry fixtures never post")
     }
 
-    fn to_error(
-        &self,
-        _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
-    ) -> Result<()> {
+    fn to_error(&self) -> Result<()> {
         Ok(())
     }
 
-    fn destroy_qp(
-        &self,
-        _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
-    ) -> Result<bool> {
+    fn destroy_qp(&self) -> Result<bool> {
         Ok(true)
     }
 

@@ -9,7 +9,7 @@ use super::*;
 use crate::v2::engine::io_core::{
     completion_for_driver_test, install_accepted_operation_for_driver_test,
 };
-use crate::v2::engine::session::connection::{WorkRequestPoster, install_connection};
+use crate::v2::engine::session::connection::{TestConnectionProvider, install_connection};
 use crate::v2::engine::{
     RdmaConnectionConfig, RdmaEngineLifecycle, RdmaEngineTerminalError, RdmaListener,
     lock_unpoison, test_engine_pair,
@@ -146,7 +146,7 @@ fn io_failure_cleanup_is_bounded_across_driver_polls() {
         let connection = install_connection(
             &driver.reactor.session.manager,
             &mut driver.reactor.session.connections,
-            poster as Arc<dyn WorkRequestPoster>,
+            poster as Arc<dyn TestConnectionProvider>,
             RdmaConnectionConfig::default(),
             None,
             None,
@@ -256,7 +256,7 @@ struct DrainInterleavingPoster {
     destroys: AtomicUsize,
 }
 
-impl WorkRequestPoster for DrainInterleavingPoster {
+impl TestConnectionProvider for DrainInterleavingPoster {
     fn qp_num(&self) -> u32 {
         self.qp_num
     }
@@ -273,17 +273,11 @@ impl WorkRequestPoster for DrainInterleavingPoster {
         unreachable!("interleaving test installs an accepted operation directly")
     }
 
-    fn to_error(
-        &self,
-        _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
-    ) -> Result<()> {
+    fn to_error(&self) -> Result<()> {
         Ok(())
     }
 
-    fn destroy_qp(
-        &self,
-        _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
-    ) -> Result<bool> {
+    fn destroy_qp(&self) -> Result<bool> {
         self.destroys.fetch_add(1, Ordering::AcqRel);
         Ok(true)
     }
@@ -314,7 +308,7 @@ async fn cq_reclamation_ready_interleaving_dispatches_queued_success_and_flush_e
             let connection = install_connection(
                 &driver.reactor.session.manager,
                 &mut driver.reactor.session.connections,
-                Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
+                Arc::clone(&poster) as Arc<dyn TestConnectionProvider>,
                 RdmaConnectionConfig::default(),
                 None,
                 None,
@@ -602,7 +596,7 @@ async fn final_accepted_operation_drain_wakes_and_reconsiders_terminal() {
     let connection = install_connection(
         &driver.reactor.session.manager,
         &mut driver.reactor.session.connections,
-        Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
+        Arc::clone(&poster) as Arc<dyn TestConnectionProvider>,
         RdmaConnectionConfig::default(),
         None,
         None,
@@ -658,7 +652,7 @@ async fn final_accepted_operation_drain_wakes_and_reconsiders_terminal() {
     assert_eq!(
         poster.destroys.load(Ordering::Acquire),
         1,
-        "session retirement must retain QP destruction authority"
+        "session retirement must retain QP destruction evidence"
     );
 }
 
