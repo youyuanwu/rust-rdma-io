@@ -117,14 +117,13 @@ let channel = tonic_h3::H3Channel::new(connector, uri);
 let client = GreeterClient::new(channel);
 ```
 
-### V2 API — Shared RDMA Engine (tokio)
+### V2 API — Caller-Polled Single-Owner Reactor (tokio)
 
 The `v2` module provides one explicitly driven engine for many low-level and
-message connections. Its ownership model resembles one io_uring instance or
-IOCP completion port: frontend handles submit work, while one application-owned
-driver schedules the sole I/O and session consumers. The I/O owner routes
-completions by connection generation, operation generation, and exact
-`qp_num`.
+message connections. Frontend handles submit bounded typed commands using
+stable identities; one application-owned `RdmaEngineDriver` exclusively
+mutates the sole `EngineReactor`. The reactor routes completions by connection
+generation, operation generation, and exact `qp_num`.
 
 ```rust
 use rdma_io::v2::*;
@@ -167,30 +166,29 @@ let (engine, driver) = RdmaEngineBuilder::new("rxe0")
 One engine owns one anchored context facade, PD, CQ, and CM event channel.
 Readiness adds one CQ completion channel/fd; polling adds none. There is exactly
 one explicit engine driver and zero library-owned tasks or threads, regardless
-of connection count. The engine driver is a thin fair scheduler over bounded
-I/O and session turns. Each external poll probes both owners, services each
-ready-at-entry owner at most once, and then composes terminal eligibility as a
-bounded epilogue; the owning layers retain CQ/completion and
-CM/connection-lifecycle policy. Session code reaches engine-wide shutdown,
-terminal, failure, and work publication only through a weak narrow runtime
-capability; it cannot recover the concrete engine root or another owner's
-registries. Each message connection additionally returns one application-owned
-message driver; low-level connections add no driver.
+of connection count. Each poll snapshots ready command, CQ, completion,
+reclamation, deadline, CM, listener, shutdown, and terminal sources, gives each
+ready-at-entry source at most one bounded quantum, and publishes a bounded
+post-turn action batch. Operation, connection, listener, CM, teardown, and
+quarantine state is value-owned beneath that reactor rather than independently
+shared between subsystem owners. Each message connection additionally returns
+one application-owned message driver for protocol progress; low-level
+connections add no driver.
 Low-level `connect`/`connect_with_config` and listener
 `accept`/`accept_with_config` post zero initial receives.
 
-The former aggregate `reclamation_budget` builder option is replaced by
-`io_reclamation_budget` and `session_reclamation_budget` (both default to 16).
-Split an existing aggregate budget between them; an old value of 1 has no
-exact equivalent because both owner turns require a nonzero budget.
+`io_reclamation_budget` and `session_reclamation_budget` independently bound
+operation missing-CQE/cancellation work and connection lifecycle/deadline work
+(both default to 16), so neither source can consume the other's turn allowance.
 
 Dropping the last `RdmaEngine` clone requests shutdown; connections, listeners,
 and message transports retain safety state but do not keep an engine frontend
 alive. Keep an engine clone until submissions are complete and use
 `shutdown().await` to observe the terminal result. The first low-level
-operation poll, engine-driver polling, and driver/resource `Drop` can execute
-synchronous libibverbs/librdmacm calls, so they should not share a
-latency-sensitive executor lane that cannot tolerate provider stalls.
+operation poll performs validation and bounded admission only. Engine-driver
+polling and driver/resource `Drop` can execute synchronous
+libibverbs/librdmacm calls, so they should not share a latency-sensitive
+executor lane that cannot tolerate provider stalls.
 
 The independent low-level `Context`, `Pd`, `Cq`, `Mr`, `Qp`, typed
 `Completion`, `CqPoller`, and `Completions` resources remain available for
@@ -208,6 +206,11 @@ buffers, while SEND/RECV/READ/WRITE use the four named `Qp` methods.
 The non-default `test-hooks` feature has one doc-hidden namespace:
 `rdma_io::v2::test_support`. It exists only for deterministic V2 validation,
 exposes no raw pointer/fd/resource consumer, and is not a V1 API.
+
+See [V2 RDMA Engine and Message Driver](docs/design/v2-rdma-engine.md) for the
+architecture and
+[V2 Single-Owner Reactor Migration](docs/design/v2-single-owner-reactor-migration.md)
+for the completed invariant and old-path removal record.
 
 ### V2 Message Transport
 
