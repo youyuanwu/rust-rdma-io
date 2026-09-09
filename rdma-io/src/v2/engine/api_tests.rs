@@ -120,6 +120,16 @@ fn pending_shutdown_waiter_is_woken_when_driver_drops() {
 }
 
 #[test]
+fn only_the_last_engine_frontend_requests_shutdown() {
+    let (engine, driver) = test_engine_pair(CompletionMode::Polling);
+    let clone = engine.clone();
+    drop(engine);
+    assert!(!clone.shared.commands.shutdown_requested());
+    drop(clone);
+    assert!(driver.shared.commands.shutdown_requested());
+}
+
+#[test]
 fn pending_connect_command_owns_and_releases_its_transferable_reservation() {
     let (engine, driver) = test_engine_pair(CompletionMode::Readiness);
     let counter = CountingWaker::new();
@@ -192,9 +202,9 @@ async fn shutdown_accounts_for_ingress_and_backend_connect_listen_commands() {
     // the two commands already transferred to the authoritative CM backend
     // before polling the full driver; provider-backed tests exercise the same
     // path through normal bounded shutdown progress.
-    engine.shared.session.cm.begin_shutdown(
+    driver.reactor.session.cm.begin_shutdown(
         &mut driver.reactor.session.connections,
-        &engine.shared.session,
+        &driver.reactor.session.manager,
         &MemoizedTerminalResult::from_error(Error::DriverShutdown),
     );
 
@@ -222,7 +232,7 @@ async fn shutdown_accounts_for_ingress_and_backend_connect_listen_commands() {
             "shutdown command accounting matrix did not terminate: diagnostics={:?}, pending_routes={}, pending_connects={}, pending_listens={}, driver_finished={}",
             engine.diagnostics(),
             lock_unpoison(&engine.shared.connection_diagnostics).live
-                + engine.shared.session.cm.pending_adapter_route_count(),
+                + lock_unpoison(&engine.shared.cm_diagnostics).0,
             engine.shared.commands.pending_connects(),
             engine.shared.commands.pending_listens(),
             driver_task.is_finished(),
@@ -365,7 +375,7 @@ fn shutdown_initiates_each_preexisting_connection_close_once() {
             error_transitions: AtomicUsize::new(0),
         });
         let connection = install_connection(
-            &engine.shared.session,
+            &driver.reactor.session.manager,
             &mut driver.reactor.session.connections,
             Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
             RdmaConnectionConfig::default(),
@@ -378,19 +388,20 @@ fn shutdown_initiates_each_preexisting_connection_close_once() {
     }
 
     engine.shared.request_shutdown();
-    engine.shared.session.begin_all_connection_close(
+    driver.reactor.session.manager.begin_all_connection_close(
         &mut driver.reactor.session.connections,
         driver.reactor.io.core_mut(),
     );
-    engine.shared.session.begin_all_connection_close(
+    driver.reactor.session.manager.begin_all_connection_close(
         &mut driver.reactor.session.connections,
         driver.reactor.io.core_mut(),
     );
 
     assert!(
-        engine
-            .shared
+        driver
+            .reactor
             .session
+            .manager
             .shutdown_connection_close_started
             .load(Ordering::Acquire)
     );

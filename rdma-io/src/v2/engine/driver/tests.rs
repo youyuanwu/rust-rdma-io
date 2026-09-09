@@ -10,10 +10,9 @@ use crate::v2::engine::io_core::{
     completion_for_driver_test, install_accepted_operation_for_driver_test,
 };
 use crate::v2::engine::session::connection::{WorkRequestPoster, install_connection};
-use crate::v2::engine::session::listener::ListenerState;
 use crate::v2::engine::{
     RdmaConnectionConfig, RdmaEngineLifecycle, RdmaEngineTerminalError, RdmaListener,
-    test_engine_pair,
+    lock_unpoison, test_engine_pair,
 };
 use crate::v2::qp::{BatchPostOutcome, QpCapabilities};
 use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
@@ -145,7 +144,7 @@ fn io_failure_cleanup_is_bounded_across_driver_polls() {
             destroys: AtomicUsize::new(0),
         });
         let connection = install_connection(
-            &engine.shared.session,
+            &driver.reactor.session.manager,
             &mut driver.reactor.session.connections,
             poster as Arc<dyn WorkRequestPoster>,
             RdmaConnectionConfig::default(),
@@ -313,7 +312,7 @@ async fn cq_reclamation_ready_interleaving_dispatches_queued_success_and_flush_e
                 destroys: AtomicUsize::new(0),
             });
             let connection = install_connection(
-                &engine.shared.session,
+                &driver.reactor.session.manager,
                 &mut driver.reactor.session.connections,
                 Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
                 RdmaConnectionConfig::default(),
@@ -338,9 +337,10 @@ async fn cq_reclamation_ready_interleaving_dispatches_queued_success_and_flush_e
                 .session
                 .connections
                 .begin_close(connection_token);
-            engine
-                .shared
+            driver
+                .reactor
                 .session
+                .manager
                 .transition_connection_to_error(
                     &mut driver.reactor.session.connections,
                     connection_token,
@@ -381,11 +381,9 @@ async fn cq_reclamation_ready_interleaving_dispatches_queued_success_and_flush_e
                 "exact completion permits normal session-owned retirement without fallback"
             );
 
-            engine.shared.finish(
-                &mut driver.reactor.session,
-                driver.reactor.io.core_mut(),
-                MemoizedTerminalResult::success(),
-            );
+            driver
+                .reactor
+                .finish_for_test(&engine.shared, MemoizedTerminalResult::success());
             drop(driver);
         }
     }
@@ -540,11 +538,17 @@ async fn idle_connections_publish_no_completion_dispatch_work() {
         let mut config = super::super::config::EngineConfig::new("test0".into());
         config.completion_mode = CompletionMode::Readiness;
         config.max_live_connections = count;
-        let shared = EngineShared::new(config, None, None).unwrap().into_shared();
-        let mut driver = super::super::RdmaEngineDriver::new(Arc::clone(&shared), None);
+        let (shared, session) = super::super::EngineFrontendRoot::new(
+            config,
+            None,
+            super::super::io::MemoryRegistrar::from_pd(None),
+        )
+        .unwrap();
+        let shared = shared.into_shared();
+        let mut driver = super::super::RdmaEngineDriver::new(Arc::clone(&shared), session, None);
         let connections = shared
             .test_driver
-            .install_idle_connections(&shared, &mut driver.reactor.session.connections, count)
+            .install_idle_connections(&mut driver.reactor.session, count)
             .unwrap();
         let waker = futures_util::task::noop_waker();
         let mut cx = TaskContext::from_waker(&waker);
@@ -584,7 +588,7 @@ async fn terminal_request_wakes_driver_and_state_is_monotonic() {
         Pin::new(&mut driver).poll(&mut cx),
         Poll::Ready(Ok(()))
     ));
-    engine.shared.transition_running();
+    driver.reactor.transition_running(&engine.shared);
     assert_eq!(engine.shared.lifecycle(), RdmaEngineLifecycle::Terminated);
 }
 
@@ -596,7 +600,7 @@ async fn final_accepted_operation_drain_wakes_and_reconsiders_terminal() {
         destroys: AtomicUsize::new(0),
     });
     let connection = install_connection(
-        &engine.shared.session,
+        &driver.reactor.session.manager,
         &mut driver.reactor.session.connections,
         Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
         RdmaConnectionConfig::default(),
@@ -664,7 +668,7 @@ async fn final_session_cleanup_is_composed_after_the_owner_pass() {
     let connections = engine
         .shared
         .test_driver
-        .install_idle_connections(&engine.shared, &mut driver.reactor.session.connections, 1)
+        .install_idle_connections(&mut driver.reactor.session, 1)
         .unwrap();
     engine.shared.request_shutdown();
     let waker = Waker::noop();
@@ -684,19 +688,21 @@ async fn final_session_cleanup_is_composed_after_the_owner_pass() {
 }
 
 fn pending_destruction_listener(
-    engine: &super::super::RdmaEngine,
+    _engine: &super::super::RdmaEngine,
+    driver: &mut super::super::RdmaEngineDriver,
 ) -> (RdmaListener, Arc<AtomicUsize>) {
-    let state = ListenerState::test_only(1);
-    let destroy_count = Arc::new(AtomicUsize::new(0));
-    engine
-        .shared
+    let (listener, token) = driver
+        .reactor
         .session
         .cm
-        .defer_test_listener_destruction(Arc::clone(&state), Arc::clone(&destroy_count));
-    (
-        RdmaListener::from_state(&engine.shared.session, state),
-        destroy_count,
-    )
+        .test_listener(&driver.reactor.session.manager, 1);
+    let destroy_count = Arc::new(AtomicUsize::new(0));
+    driver
+        .reactor
+        .session
+        .cm
+        .defer_test_listener_destruction(token, Arc::clone(&destroy_count));
+    (listener, destroy_count)
 }
 
 fn assert_terminal_close(
@@ -712,8 +718,8 @@ fn assert_terminal_close(
 
 #[test]
 fn driver_drop_wakes_listener_close_pending_cm_destruction() {
-    let (engine, driver) = test_engine_pair(CompletionMode::Polling);
-    let (listener, destroy_count) = pending_destruction_listener(&engine);
+    let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
+    let (listener, destroy_count) = pending_destruction_listener(&engine, &mut driver);
     let counter = CountingWaker::new();
     let waker = counter.waker();
     let mut cx = TaskContext::from_waker(&waker);
@@ -730,13 +736,16 @@ fn driver_drop_wakes_listener_close_pending_cm_destruction() {
     assert_terminal_close(&mut close, &mut cx, &terminal);
     assert_eq!(counter.count(), 1);
     assert_eq!(destroy_count.load(Ordering::Acquire), 0);
-    assert_eq!(engine.shared.session.cm.retained_adapter_owner_count(), 1);
+    assert_eq!(lock_unpoison(&engine.shared.cm_diagnostics).1, 1);
+    assert!(super::super::reactor::failed_reactor_contains(
+        &engine.shared
+    ));
 }
 
 #[test]
 fn driver_error_wakes_listener_close_once_and_preserves_pending_destruction() {
     let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
-    let (listener, destroy_count) = pending_destruction_listener(&engine);
+    let (listener, destroy_count) = pending_destruction_listener(&engine, &mut driver);
     let counter = CountingWaker::new();
     let waker = counter.waker();
     let mut cx = TaskContext::from_waker(&waker);
@@ -753,13 +762,38 @@ fn driver_error_wakes_listener_close_once_and_preserves_pending_destruction() {
             )
             .is_pending()
     );
-    let driver_error = loop {
+    let mut driver_error = None;
+    for _ in 0..64 {
         match Pin::new(&mut driver).poll(&mut driver_cx) {
-            Poll::Ready(Err(error)) => break error,
+            Poll::Ready(Err(error)) => {
+                driver_error = Some(error);
+                break;
+            }
             Poll::Ready(Ok(())) => panic!("injected failure completed successfully"),
             Poll::Pending => {}
         }
-    };
+    }
+    let driver_error = driver_error.unwrap_or_else(|| {
+        panic!(
+            "driver failure did not make bounded terminal progress: lifecycle={:?}, commands={}, session_finish={}, listener_work={}, cm_owners={}",
+            driver.reactor.lifecycle.lifecycle(),
+            engine.shared.commands.has_pending(),
+            driver.reactor.session.can_finish(),
+            driver.reactor.session.cm.listener_work_count(),
+            driver
+                .reactor
+                .session
+                .cm
+                .retained_owner_count(&driver.reactor.session.connections),
+        )
+    });
+    match Pin::new(&mut driver).poll(&mut driver_cx) {
+        Poll::Ready(Err(repolled)) => {
+            assert_eq!(repolled.to_string(), driver_error.to_string());
+        }
+        Poll::Ready(Ok(())) => panic!("re-polled failed driver completed successfully"),
+        Poll::Pending => panic!("re-polled terminal driver lost its memoized result"),
+    }
     let terminal = engine
         .diagnostics()
         .terminal_error
@@ -769,15 +803,22 @@ fn driver_error_wakes_listener_close_once_and_preserves_pending_destruction() {
     assert_eq!(counter.count(), 1);
     assert_eq!(destroy_count.load(Ordering::Acquire), 0);
     assert_eq!(
-        engine
-            .shared
+        driver
+            .reactor
             .session
             .cm
             .retained_owner_count(&driver.reactor.session.connections),
         1
     );
+    assert!(
+        driver.reactor.requires_complete_quarantine(),
+        "a Ready failure must retain the complete reactor resource root until Drop"
+    );
 
     drop(driver);
+    assert!(super::super::reactor::failed_reactor_contains(
+        &engine.shared
+    ));
     assert_eq!(counter.count(), 1, "driver drop must not finish twice");
     assert_eq!(
         engine

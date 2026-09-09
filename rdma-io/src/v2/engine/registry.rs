@@ -68,11 +68,31 @@ pub(super) struct OperationToken {
     pub(super) generation: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) struct ListenerToken {
+    pub(super) slot: u32,
+    pub(super) generation: u32,
+}
+
 impl OperationToken {
     pub(super) const fn encode(self) -> u64 {
         ((self.generation as u64) << 32) | self.slot as u64
     }
 
+    pub(super) const fn decode(value: u64) -> Self {
+        Self {
+            slot: value as u32,
+            generation: (value >> 32) as u32,
+        }
+    }
+}
+
+impl ListenerToken {
+    pub(super) const fn encode(self) -> u64 {
+        ((self.generation as u64) << 32) | self.slot as u64
+    }
+
+    #[cfg(test)]
     pub(super) const fn decode(value: u64) -> Self {
         Self {
             slot: value as u32,
@@ -102,6 +122,20 @@ impl RegistryToken for ConnectionToken {
 }
 
 impl RegistryToken for OperationToken {
+    fn from_parts(slot: u32, generation: u32) -> Self {
+        Self { slot, generation }
+    }
+
+    fn slot(self) -> u32 {
+        self.slot
+    }
+
+    fn generation(self) -> u32 {
+        self.generation
+    }
+}
+
+impl RegistryToken for ListenerToken {
     fn from_parts(slot: u32, generation: u32) -> Self {
         Self { slot, generation }
     }
@@ -377,6 +411,10 @@ impl<K: RegistryToken, T> PagedRegistry<K, T> {
 
     pub(super) fn live(&self) -> usize {
         self.live
+    }
+
+    pub(super) fn has_capacity(&self) -> bool {
+        !self.inner.recycled.is_empty() || (self.inner.next_unused as usize) < self.capacity
     }
 
     #[cfg(test)]

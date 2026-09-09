@@ -14,26 +14,28 @@ mod shutdown;
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::atomic::Ordering;
 
 use super::super::lifecycle::MemoizedTerminalResult;
-use super::super::registry::{ConnectionToken, Lookup, lock_unpoison};
-use super::super::resources::EngineResources;
+use super::super::registry::{ConnectionToken, ListenerToken, Lookup};
+use super::super::resources::EngineReactorResources;
 use super::super::{ConnectionSetup, RdmaConnection, RdmaConnectionConfig};
-use super::SessionManager;
 use super::connection::{
     ConnectionCmRoute, ConnectionReservation, FailedConnectionInstallResources, SharedCmId,
     VerbsConnectionResources, install_reserved_connection, reserve_connection,
 };
+#[cfg(test)]
+use super::listener::RdmaListenerConfig;
 use super::listener::{
-    AcceptRequest, InboundRejectReason, IncomingChild, KERNEL_LISTEN_BACKLOG_REQUEST,
-    ListenRequest, ListenerAction, ListenerState, RdmaListener, empty_connection_setup,
-    run_setup_before_establish,
+    AcceptRequest, ChildAdmission, InboundRejectReason, IncomingChild, ListenRequest,
+    ListenerAction, ListenerRegistry, RdmaListener, empty_connection_setup,
+    run_setup_before_establish, with_validated_listener_backlog,
 };
 use super::registry::ConnectionRegistry;
+use super::{SessionFrontend, SessionManager};
 use crate::cm::CmId;
 use crate::v2::error::{Error, Result};
 use crate::v2::qp::QpBuilder;
@@ -50,7 +52,7 @@ type CmRouteToken = ConnectionToken;
 enum ContextRoute {
     Outbound { token: CmRouteToken, raw_id: usize },
     Inbound { token: CmRouteToken, raw_id: usize },
-    Listener { token: u64, raw_id: usize },
+    Listener { token: ListenerToken, raw_id: usize },
 }
 
 #[derive(Clone, Copy)]
@@ -95,62 +97,122 @@ impl CmSoftwareSnapshot {
 }
 
 pub(in crate::v2::engine) struct CmState {
-    context_routes: Mutex<HashMap<usize, ContextRoute>>,
-    pending_listens: Mutex<VecDeque<Arc<ListenRequest>>>,
-    listener_work: Mutex<VecDeque<Arc<ListenerState>>>,
-    listeners: Mutex<HashMap<u64, Arc<ListenerState>>>,
-    listener_ids: Mutex<HashMap<usize, u64>>,
-    next_listener_token: AtomicU64,
-    cm_destructions: Mutex<VecDeque<PendingCmDestruction>>,
-    pending_event: Mutex<Option<PendingCmEvent>>,
-    shutting_down: AtomicBool,
+    context_routes: HashMap<usize, ContextRoute>,
+    pending_listens: VecDeque<(ListenerToken, Arc<ListenRequest>)>,
+    listener_work: VecDeque<ListenerToken>,
+    listeners: ListenerRegistry,
+    cm_destructions: VecDeque<PendingCmDestruction>,
+    quarantined_cm_owners: Vec<SharedCmId>,
+    pending_event: Option<PendingCmEvent>,
+    shutting_down: bool,
 }
 
 impl CmState {
     pub(in crate::v2::engine) fn new(capacity: usize) -> Result<Self> {
-        let _ = capacity;
         Ok(Self {
-            context_routes: Mutex::new(HashMap::new()),
-            pending_listens: Mutex::new(VecDeque::new()),
-            listener_work: Mutex::new(VecDeque::new()),
-            listeners: Mutex::new(HashMap::new()),
-            listener_ids: Mutex::new(HashMap::new()),
-            next_listener_token: AtomicU64::new(1),
-            cm_destructions: Mutex::new(VecDeque::new()),
-            pending_event: Mutex::new(None),
-            shutting_down: AtomicBool::new(false),
+            context_routes: HashMap::new(),
+            pending_listens: VecDeque::new(),
+            listener_work: VecDeque::new(),
+            listeners: ListenerRegistry::new(capacity)?,
+            cm_destructions: VecDeque::new(),
+            quarantined_cm_owners: Vec::new(),
+            pending_event: None,
+            shutting_down: false,
         })
     }
 
-    pub(in crate::v2::engine) fn enqueue_listen(&self, request: Arc<ListenRequest>) {
-        lock_unpoison(&self.pending_listens).push_back(request);
+    pub(in crate::v2::engine) fn reserve_listener(
+        &mut self,
+        request: &ListenRequest,
+    ) -> Result<ListenerToken> {
+        self.listeners
+            .reserve(request.address, request.config.clone())
+    }
+
+    pub(in crate::v2::engine) fn listener_slot_available(&self) -> bool {
+        self.listeners.has_capacity()
+    }
+
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn listener_count(&self) -> usize {
+        self.listeners.live()
+    }
+
+    pub(in crate::v2::engine) fn enqueue_listen(
+        &mut self,
+        token: ListenerToken,
+        request: Arc<ListenRequest>,
+    ) {
+        self.pending_listens.push_back((token, request));
     }
 
     #[cfg(test)]
     pub(in crate::v2::engine) fn pending_listen_addresses(&self) -> Vec<std::net::SocketAddr> {
-        lock_unpoison(&self.pending_listens)
+        self.pending_listens
             .iter()
-            .map(|request| request.address)
+            .map(|(_, request)| request.address)
             .collect()
     }
 
-    pub(in crate::v2::engine) fn enqueue_listener_work(&self, listener: &Arc<ListenerState>) {
-        if listener.try_enqueue_work() {
-            lock_unpoison(&self.listener_work).push_back(Arc::clone(listener));
+    pub(in crate::v2::engine) fn enqueue_listener_work(&mut self, token: ListenerToken) {
+        let enqueue = self
+            .listeners
+            .get_mut(token)
+            .is_some_and(|listener| listener.try_enqueue_work());
+        if enqueue {
+            self.listener_work.push_back(token);
         }
     }
 
-    fn defer_cm_id(&self, cm_id: SharedCmId) {
-        lock_unpoison(&self.cm_destructions).push_back(PendingCmDestruction::Route(cm_id));
+    pub(in crate::v2::engine) fn request_listener_close(&mut self, token: ListenerToken) -> bool {
+        let changed = self
+            .listeners
+            .get_mut(token)
+            .is_some_and(|listener| listener.request_close());
+        if changed {
+            self.enqueue_listener_work(token);
+        }
+        changed
+    }
+
+    pub(in crate::v2::engine) fn admit_accept(
+        &mut self,
+        token: ListenerToken,
+        request: Arc<AcceptRequest>,
+    ) -> Result<()> {
+        self.listeners
+            .get_mut(token)
+            .ok_or(Error::TransportClosed)?
+            .register_waiter(request)
+    }
+
+    fn defer_cm_id(&mut self, cm_id: SharedCmId) {
+        self.cm_destructions
+            .push_back(PendingCmDestruction::Route(cm_id));
+    }
+
+    fn quarantine_cm_id(&mut self, cm_id: SharedCmId) {
+        self.quarantined_cm_owners.push(cm_id);
+    }
+
+    fn defer_listener_cm_id(&mut self, listener: ListenerToken, cm_id: SharedCmId) {
+        if let Some(entry) = self.listeners.get_mut(listener) {
+            entry.mark_cm_destruction_pending();
+        }
+        self.cm_destructions
+            .push_back(PendingCmDestruction::Listener { cm_id, listener });
     }
 
     #[cfg(test)]
     pub(in crate::v2::engine) fn defer_test_listener_destruction(
-        &self,
-        listener: Arc<ListenerState>,
+        &mut self,
+        listener: ListenerToken,
         destroy_count: Arc<AtomicUsize>,
     ) {
-        lock_unpoison(&self.cm_destructions).push_back(PendingCmDestruction::Test {
+        if let Some(entry) = self.listeners.get_mut(listener) {
+            entry.mark_cm_destruction_pending();
+        }
+        self.cm_destructions.push_back(PendingCmDestruction::Test {
             destroy_count,
             target: TestCmDestruction::Listener {
                 listener,
@@ -159,22 +221,56 @@ impl CmState {
         });
     }
 
-    pub(in crate::v2::engine) fn mark_accept_delivered(
-        &self,
-        listener: &Arc<ListenerState>,
-        request: &Arc<AcceptRequest>,
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn defer_test_route_destruction(
+        &mut self,
+        destroy_count: Arc<AtomicUsize>,
     ) {
-        let encoded = request.route_token();
-        if encoded == 0 {
-            return;
-        }
-        if listener.finish_selected_route(encoded) {
-            self.enqueue_listener_work(listener);
+        self.cm_destructions.push_back(PendingCmDestruction::Test {
+            destroy_count,
+            target: TestCmDestruction::Route,
+        });
+    }
+
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn reserve_test_listener_slot(
+        &mut self,
+        backlog: usize,
+    ) -> ListenerToken {
+        let address = "127.0.0.1:1".parse().unwrap();
+        let token = self
+            .listeners
+            .reserve(address, RdmaListenerConfig::default().backlog(backlog))
+            .unwrap();
+        assert!(self.listeners.activate_identity_for_test(
+            token,
+            address,
+            token.encode() as usize,
+            token.encode() as usize
+        ));
+        token
+    }
+
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn test_listener(
+        &mut self,
+        manager: &SessionManager,
+        backlog: usize,
+    ) -> (RdmaListener, ListenerToken) {
+        let token = self.reserve_test_listener_slot(backlog);
+        let listener = RdmaListener::from_state(manager, self.listeners.get(token).unwrap());
+        (listener, token)
+    }
+
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn release_test_listener(&mut self, token: ListenerToken) {
+        if let Some(listener) = self.listeners.release(token, true) {
+            listener.admission().close();
         }
     }
 
-    fn insert_context_route(&self, context_key: usize, route: ContextRoute) -> bool {
-        match lock_unpoison(&self.context_routes).entry(context_key) {
+    fn insert_context_route(&mut self, context_key: usize, route: ContextRoute) -> bool {
+        match self.context_routes.entry(context_key) {
             Entry::Vacant(entry) => {
                 entry.insert(route);
                 true
@@ -183,22 +279,49 @@ impl CmState {
         }
     }
 
-    fn insert_listener_identity(
-        &self,
-        token: u64,
+    fn activate_listener_identity(
+        &mut self,
+        token: ListenerToken,
+        local_addr: std::net::SocketAddr,
+        cm_id: SharedCmId,
         raw_id: usize,
-        listener: Arc<ListenerState>,
+        context_key: usize,
+    ) -> std::result::Result<(), SharedCmId> {
+        if self.context_routes.contains_key(&context_key)
+            || self.listeners.token_for_raw(raw_id).is_some()
+            || self.listeners.get(token).is_none()
+        {
+            return Err(cm_id);
+        }
+        self.listeners
+            .activate(token, local_addr, cm_id, raw_id, context_key)?;
+        self.context_routes
+            .insert(context_key, ContextRoute::Listener { token, raw_id });
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn activate_listener_identity_for_test(
+        &mut self,
+        token: ListenerToken,
+        local_addr: std::net::SocketAddr,
+        raw_id: usize,
+        context_key: usize,
     ) -> bool {
-        let mut listeners = lock_unpoison(&self.listeners);
-        let mut listener_ids = lock_unpoison(&self.listener_ids);
-        let Entry::Vacant(listener_entry) = listeners.entry(token) else {
+        if self.context_routes.contains_key(&context_key)
+            || self.listeners.token_for_raw(raw_id).is_some()
+            || self.listeners.get(token).is_none()
+        {
             return false;
-        };
-        let Entry::Vacant(identity_entry) = listener_ids.entry(raw_id) else {
+        }
+        if !self
+            .listeners
+            .activate_identity_for_test(token, local_addr, raw_id, context_key)
+        {
             return false;
-        };
-        listener_entry.insert(listener);
-        identity_entry.insert(token);
+        }
+        self.context_routes
+            .insert(context_key, ContextRoute::Listener { token, raw_id });
         true
     }
 
@@ -207,11 +330,11 @@ impl CmState {
         connections: &ConnectionRegistry,
     ) -> bool {
         let pending = connections.pending_outbound_count() != 0;
-        let pending_listens = !lock_unpoison(&self.pending_listens).is_empty();
+        let pending_listens = !self.pending_listens.is_empty();
         let cancellations = connections.cancellation_count() != 0;
-        let listener_work = !lock_unpoison(&self.listener_work).is_empty();
+        let listener_work = !self.listener_work.is_empty();
         let retirements = connections.retirement_count() != 0;
-        let cm_destructions = !lock_unpoison(&self.cm_destructions).is_empty();
+        let cm_destructions = !self.cm_destructions.is_empty();
         pending
             || pending_listens
             || cancellations
@@ -232,9 +355,9 @@ impl CmState {
         connections: &ConnectionRegistry,
     ) -> usize {
         connections.pending_outbound_count()
-            + lock_unpoison(&self.pending_listens).len()
+            + self.pending_listens.len()
             + connections.cancellation_count()
-            + lock_unpoison(&self.listener_work).len()
+            + self.listener_work.len()
             + connections.retirement_count()
     }
 
@@ -243,39 +366,42 @@ impl CmState {
     }
 
     pub(in crate::v2::engine) fn destruction_work_count(&self) -> usize {
-        lock_unpoison(&self.cm_destructions).len()
+        self.cm_destructions.len()
     }
 
-    fn take_pending_event(&self) -> Option<PendingCmEvent> {
-        lock_unpoison(&self.pending_event).take()
+    pub(in crate::v2::engine) fn listener_work_count(&self) -> usize {
+        self.listener_work.len()
+    }
+
+    fn take_pending_event(&mut self) -> Option<PendingCmEvent> {
+        self.pending_event.take()
     }
 
     pub(in crate::v2::engine) fn has_pending_event(&self) -> bool {
-        lock_unpoison(&self.pending_event).is_some()
+        self.pending_event.is_some()
     }
 
     pub(in crate::v2::engine) fn defer_one_event(
-        &self,
+        &mut self,
         connections: &ConnectionRegistry,
-        resources: &EngineResources,
+        resources: &EngineReactorResources,
     ) -> Result<bool> {
-        let mut pending = lock_unpoison(&self.pending_event);
-        if pending.is_some() {
+        if self.pending_event.is_some() {
             return Ok(true);
         }
         let Some(event) = event::acquire_event(self, connections, resources)? else {
             return Ok(false);
         };
-        *pending = Some(event);
+        self.pending_event = Some(event);
         Ok(true)
     }
 
     pub(in crate::v2::engine) fn service_software_class_into(
-        &self,
+        &mut self,
         connections: &mut ConnectionRegistry,
         shared: &SessionManager,
         io_core: &mut crate::v2::engine::io_core::IoState,
-        resources: Option<&EngineResources>,
+        resources: Option<&EngineReactorResources>,
         class: CmSoftwareClass,
         budget: usize,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
@@ -340,33 +466,37 @@ impl CmState {
                             "listener creation requires live engine resources".into(),
                         )
                     })?;
-                    let request = { lock_unpoison(&self.pending_listens).pop_front() };
-                    if let Some(request) = request {
-                        self.start_listener(shared, resources, request, actions)?;
+                    let pending = self.pending_listens.pop_front();
+                    if let Some((token, request)) = pending {
+                        self.start_listener(shared, resources, token, request, actions)?;
                         processed += 1;
                     } else {
                         break;
                     }
                 }
                 CmSoftwareClass::ListenerWork => {
-                    let resources = resources.ok_or_else(|| {
-                        Error::InvalidConfig(
-                            "listener progress requires live engine resources".into(),
-                        )
-                    })?;
-                    let listener = { lock_unpoison(&self.listener_work).pop_front() };
-                    if let Some(listener) = listener {
-                        listener.begin_work();
+                    let token = self.listener_work.pop_front();
+                    if let Some(token) = token {
+                        if let Some(listener) = self.listeners.get_mut(token) {
+                            listener.begin_work();
+                        } else {
+                            processed += 1;
+                            continue;
+                        }
                         self.service_listener(
                             connections,
                             shared,
                             io_core,
                             resources,
-                            &listener,
+                            token,
                             actions,
                         )?;
-                        if listener.has_work() {
-                            self.enqueue_listener_work(&listener);
+                        let has_work = self
+                            .listeners
+                            .get(token)
+                            .is_some_and(|listener| listener.has_work());
+                        if has_work {
+                            self.enqueue_listener_work(token);
                         }
                         processed += 1;
                     } else {
@@ -387,19 +517,19 @@ impl CmState {
                 connections.cancellation_count(),
                 connections.retirement_count(),
                 connections.pending_outbound_count(),
-                lock_unpoison(&self.pending_listens).len(),
-                lock_unpoison(&self.listener_work).len(),
+                self.pending_listens.len(),
+                self.listener_work.len(),
             ],
         }
     }
 
     #[cfg(test)]
     pub(in crate::v2::engine) fn service_software(
-        &self,
+        &mut self,
         connections: &mut ConnectionRegistry,
         shared: &SessionManager,
         io_core: &mut crate::v2::engine::io_core::IoState,
-        resources: Option<&EngineResources>,
+        resources: Option<&EngineReactorResources>,
         budget: usize,
     ) -> Result<usize> {
         let mut actions = crate::v2::engine::reactor::ReactorActions::default();
@@ -424,11 +554,11 @@ impl CmState {
     }
 
     pub(in crate::v2::engine) fn try_process_event(
-        &self,
+        &mut self,
         connections: &mut ConnectionRegistry,
         shared: &SessionManager,
         io_core: &mut crate::v2::engine::io_core::IoState,
-        resources: &EngineResources,
+        resources: &EngineReactorResources,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Result<bool> {
         event::try_process_event(self, connections, shared, io_core, resources, actions)
@@ -436,7 +566,7 @@ impl CmState {
 
     #[cfg(test)]
     pub(in crate::v2::engine) fn begin_shutdown(
-        &self,
+        &mut self,
         connections: &mut ConnectionRegistry,
         shared: &SessionManager,
         outcome: &MemoizedTerminalResult,
@@ -444,7 +574,7 @@ impl CmState {
         shutdown::begin(self, connections, shared, outcome);
     }
 
-    pub(in crate::v2::engine) fn start_bounded_shutdown(&self) {
+    pub(in crate::v2::engine) fn start_bounded_shutdown(&mut self) {
         shutdown::start(self);
     }
 
@@ -463,7 +593,7 @@ impl CmState {
         reason = "bounded shutdown keeps ownership inputs explicit"
     )]
     pub(in crate::v2::engine) fn service_bounded_shutdown_class(
-        &self,
+        &mut self,
         connections: &mut ConnectionRegistry,
         shared: &SessionManager,
         outcome: &MemoizedTerminalResult,
@@ -498,44 +628,65 @@ impl CmState {
         &self,
         connections: &ConnectionRegistry,
     ) -> usize {
-        let listeners = lock_unpoison(&self.listeners).len();
-        let cm_destructions = lock_unpoison(&self.cm_destructions).len();
-        connections.live() + listeners + cm_destructions
+        connections.live() + self.retained_adapter_owner_count()
     }
 
     pub(in crate::v2::engine) fn retained_adapter_owner_count(&self) -> usize {
-        let listeners = lock_unpoison(&self.listeners).len();
-        let cm_destructions = lock_unpoison(&self.cm_destructions).len();
-        listeners + cm_destructions
+        let listeners = self.listeners.live();
+        let cm_destructions = self
+            .cm_destructions
+            .iter()
+            .filter(|pending| pending.listener().is_none())
+            .count();
+        listeners + cm_destructions + self.quarantined_cm_owners.len()
+    }
+
+    pub(in crate::v2::engine) fn retained_provider_owner_count(&self) -> usize {
+        self.listeners.provider_owner_count()
+            + self.cm_destructions.len()
+            + self.quarantined_cm_owners.len()
     }
 
     pub(in crate::v2::engine) fn pending_adapter_route_count(&self) -> usize {
-        0 + lock_unpoison(&self.pending_listens).len()
-            + lock_unpoison(&self.listener_work).len()
-            + lock_unpoison(&self.cm_destructions).len()
-            + lock_unpoison(&self.listeners).len()
+        self.pending_listens.len()
+            + self.listener_work.len()
+            + self.cm_destructions.len()
+            + self.quarantined_cm_owners.len()
+            + self.listeners.live()
     }
 
     pub(in crate::v2::engine) fn service_cm_destructions_into(
-        &self,
+        &mut self,
+        connections: &mut ConnectionRegistry,
+        io_core: &mut crate::v2::engine::io_core::IoState,
+        resources: &EngineReactorResources,
+        budget: usize,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) -> Result<usize> {
+        retirement::service_cm_destructions(self, connections, io_core, resources, budget, actions)
+    }
+
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn service_cm_destructions_with_probe(
+        &mut self,
         connections: &mut ConnectionRegistry,
         io_core: &mut crate::v2::engine::io_core::IoState,
         budget: usize,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
-        defer_one_event: impl FnMut(&ConnectionRegistry) -> Result<bool>,
+        mut probe: impl FnMut() -> Result<bool>,
     ) -> Result<usize> {
-        retirement::service_cm_destructions(
+        retirement::service_cm_destructions_with_probe(
             self,
             connections,
             io_core,
             budget,
             actions,
-            defer_one_event,
+            |_state, _connections| probe(),
         )
     }
 
     pub(in crate::v2::engine) fn terminalize_into(
-        &self,
+        &mut self,
         connections: &mut ConnectionRegistry,
         outcome: &MemoizedTerminalResult,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
@@ -544,22 +695,23 @@ impl CmState {
     }
 
     fn start_listener(
-        &self,
+        &mut self,
         shared: &SessionManager,
-        resources: &EngineResources,
+        resources: &EngineReactorResources,
+        token: ListenerToken,
         request: Arc<ListenRequest>,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Result<()> {
-        inbound::start_listener(self, shared, resources, request, actions)
+        inbound::start_listener(self, shared, resources, token, request, actions)
     }
 
     fn service_listener(
-        &self,
+        &mut self,
         connections: &mut ConnectionRegistry,
         shared: &SessionManager,
         io_core: &mut crate::v2::engine::io_core::IoState,
-        resources: &EngineResources,
-        listener: &Arc<ListenerState>,
+        resources: Option<&EngineReactorResources>,
+        listener: ListenerToken,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Result<()> {
         inbound::service_listener(
@@ -574,28 +726,28 @@ impl CmState {
     }
 
     fn handle_connect_request(
-        &self,
+        &mut self,
         connections: &mut ConnectionRegistry,
         shared: &SessionManager,
-        resources: &EngineResources,
-        listener: &Arc<ListenerState>,
+        resources: &EngineReactorResources,
+        listener: ListenerToken,
         snapshot: CmEventSnapshot,
     ) -> Result<EventDisposition> {
         inbound::handle_connect_request(self, connections, shared, resources, listener, snapshot)
     }
 
     fn handle_listener_event(
-        &self,
+        &mut self,
         shared: &SessionManager,
-        listener: &Arc<ListenerState>,
+        listener: ListenerToken,
         snapshot: CmEventSnapshot,
     ) -> Result<EventDisposition> {
         inbound::handle_listener_event(self, shared, listener, snapshot)
     }
 
     fn reject_raw_child(
-        &self,
-        resources: &EngineResources,
+        &mut self,
+        resources: &EngineReactorResources,
         raw_id: usize,
         reason: InboundRejectReason,
     ) -> Result<()> {
@@ -603,9 +755,9 @@ impl CmState {
     }
 
     fn start_outbound(
-        &self,
+        &mut self,
         connections: &mut ConnectionRegistry,
-        resources: &EngineResources,
+        resources: &EngineReactorResources,
         request: Arc<OutboundRequest>,
         reservation: ConnectionReservation,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
@@ -614,7 +766,7 @@ impl CmState {
     }
 
     fn process_cancellation(
-        &self,
+        &mut self,
         connections: &mut ConnectionRegistry,
         shared: &SessionManager,
         io_core: &mut crate::v2::engine::io_core::IoState,
@@ -633,7 +785,7 @@ impl CmState {
     }
 
     fn retain_failed_install(
-        &self,
+        &mut self,
         connections: &mut ConnectionRegistry,
         shared: &SessionManager,
         token: ConnectionToken,
@@ -675,11 +827,11 @@ impl CmState {
     }
 
     fn handle_event(
-        &self,
+        &mut self,
         connections: &mut ConnectionRegistry,
         shared: &SessionManager,
         io_core: &mut crate::v2::engine::io_core::IoState,
-        resources: &EngineResources,
+        resources: &EngineReactorResources,
         token: ConnectionToken,
         snapshot: CmEventSnapshot,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
@@ -697,7 +849,7 @@ impl CmState {
     }
 
     fn handle_inbound_event(
-        &self,
+        &mut self,
         connections: &mut ConnectionRegistry,
         shared: &SessionManager,
         io_core: &mut crate::v2::engine::io_core::IoState,
@@ -706,6 +858,18 @@ impl CmState {
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Result<EventDisposition> {
         inbound::handle_event(self, connections, shared, io_core, token, snapshot, actions)
+    }
+
+    pub(super) fn prepare_connection_close(
+        &mut self,
+        connections: &mut ConnectionRegistry,
+        token: ConnectionToken,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) -> Result<bool> {
+        let Some(ConnectionCmRoute::Inbound(encoded)) = connections.connection_route(token) else {
+            return Ok(true);
+        };
+        inbound::prepare_selected_connection_close(self, connections, encoded, token, actions)
     }
 
     fn retire_route(
@@ -718,7 +882,7 @@ impl CmState {
     }
 
     fn retire_outbound_route_for_retirement(
-        &self,
+        &mut self,
         connections: &mut ConnectionRegistry,
         encoded: u64,
         connection: ConnectionToken,
@@ -729,7 +893,7 @@ impl CmState {
             Lookup::Duplicate | Lookup::Stale | Lookup::Unknown | Lookup::Retired => {
                 return Ok(RouteRetirement::Complete {
                     completion: None,
-                    reject: None,
+                    disposition: RouteRetirementDisposition::None,
                 });
             }
         }
@@ -748,7 +912,7 @@ impl CmState {
                 self.retire_route(connections, token, true);
                 Ok(RouteRetirement::Complete {
                     completion: None,
-                    reject: None,
+                    disposition: RouteRetirementDisposition::None,
                 })
             }
             Some(route_state) => {
@@ -772,11 +936,11 @@ impl CmState {
     }
 
     fn retire_inbound_route_for_retirement(
-        &self,
+        &mut self,
         connections: &mut ConnectionRegistry,
         encoded: u64,
         connection: ConnectionToken,
-        actions: &mut crate::v2::engine::reactor::ReactorActions,
+        _actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Result<RouteRetirement> {
         let token = CmRouteToken::decode(encoded);
         match connections.lookup_inbound(token) {
@@ -784,7 +948,7 @@ impl CmState {
             Lookup::Duplicate | Lookup::Stale | Lookup::Unknown | Lookup::Retired => {
                 return Ok(RouteRetirement::Complete {
                     completion: None,
-                    reject: None,
+                    disposition: RouteRetirementDisposition::None,
                 });
             }
         }
@@ -793,50 +957,44 @@ impl CmState {
             route_state.references_connection(connection)
         });
         match route_state {
-            Some(InboundState::EstablishedAwaitingDelivery { request, .. }) => {
-                let delivered = request.fail_undelivered_into(Error::DriverShutdown, actions);
-                if delivered
-                    && let Some(listener) = listener.as_ref().and_then(Weak::upgrade)
-                    && listener.finish_selected_route(encoded)
-                {
-                    self.enqueue_listener_work(&listener);
-                }
-                connections.release_route(token, true);
-                Ok(RouteRetirement::Complete {
-                    completion: (!delivered).then(|| InboundRetirementCompletion {
-                        listener: listener.clone().unwrap_or_default(),
-                        route: encoded,
-                        request: None,
-                        result: None,
-                        selected: true,
-                    }),
-                    reject: None,
-                })
+            Some(route_state @ InboundState::EstablishedAwaitingDelivery { .. }) => {
+                connections.set_inbound_state(token, route_state);
+                Err(Error::InvalidConfig(
+                    "selected accepted route reached retirement before close preparation".into(),
+                ))
             }
             Some(InboundState::Established { .. }) => {
                 connections.release_route(token, true);
                 Ok(RouteRetirement::Complete {
                     completion: None,
-                    reject: None,
+                    disposition: RouteRetirementDisposition::None,
                 })
             }
             Some(InboundState::Closing {
                 request,
                 completion,
                 selected,
-                reject,
+                peer,
                 ..
             }) => {
+                let disposition = match peer {
+                    InboundPeerState::PreAccept {
+                        reject: Some(reason),
+                    } => RouteRetirementDisposition::Reject(reason),
+                    InboundPeerState::PreAccept { reject: None } | InboundPeerState::Accepted => {
+                        RouteRetirementDisposition::None
+                    }
+                };
                 connections.release_route(token, true);
                 Ok(RouteRetirement::Complete {
                     completion: Some(InboundRetirementCompletion {
-                        listener: listener.clone().unwrap_or_default(),
+                        listener,
                         route: encoded,
                         request,
                         result: completion,
                         selected,
                     }),
-                    reject,
+                    disposition,
                 })
             }
             Some(route_state) => {
@@ -859,7 +1017,7 @@ impl CmState {
         }
     }
 
-    fn remove_owned_context_route(&self, cm_id: Option<&SharedCmId>) {
+    fn remove_owned_context_route(&mut self, cm_id: Option<&SharedCmId>) {
         let Some(cm_id) = cm_id else {
             return;
         };
@@ -872,7 +1030,7 @@ impl CmState {
     }
 
     fn remove_context_route_if_owned(
-        &self,
+        &mut self,
         context_key: usize,
         raw_id: usize,
         route_token: Option<u64>,
@@ -880,8 +1038,7 @@ impl CmState {
         let Some(route_token) = route_token else {
             return false;
         };
-        let mut routes = lock_unpoison(&self.context_routes);
-        let owned = match routes.get(&context_key).copied() {
+        let owned = match self.context_routes.get(&context_key).copied() {
             Some(ContextRoute::Outbound {
                 token,
                 raw_id: owner,
@@ -893,105 +1050,18 @@ impl CmState {
             Some(ContextRoute::Listener {
                 token,
                 raw_id: owner,
-            }) => token == route_token && owner == raw_id,
+            }) => token.encode() == route_token && owner == raw_id,
             None => false,
         };
         if owned {
-            routes.remove(&context_key);
+            self.context_routes.remove(&context_key);
         }
         owned
     }
 }
 
-impl SessionManager {
-    #[cfg(test)]
-    pub(in crate::v2::engine) fn terminalize_cm(
-        &self,
-        connections: &mut ConnectionRegistry,
-        outcome: &MemoizedTerminalResult,
-    ) {
-        let mut actions = crate::v2::engine::reactor::ReactorActions::default();
-        shutdown::terminalize_into(&self.cm, connections, outcome, &mut actions);
-        actions.publish();
-    }
-
-    pub(in crate::v2::engine) fn terminalize_cm_into(
-        &self,
-        connections: &mut ConnectionRegistry,
-        outcome: &MemoizedTerminalResult,
-        actions: &mut crate::v2::engine::reactor::ReactorActions,
-    ) {
-        self.cm.terminalize_into(connections, outcome, actions);
-    }
-
-    pub(in crate::v2::engine) fn retained_cm_owner_count(
-        &self,
-        connections: &ConnectionRegistry,
-    ) -> usize {
-        self.cm.retained_owner_count(connections)
-    }
-
-    pub(in crate::v2::engine) fn has_cm_work(&self, connections: &ConnectionRegistry) -> bool {
-        self.cm.has_software_work(connections)
-    }
-
-    pub(in crate::v2::engine) fn service_cm_software_class(
-        &self,
-        connections: &mut ConnectionRegistry,
-        io_core: &mut crate::v2::engine::io_core::IoState,
-        resources: Option<&EngineResources>,
-        class: CmSoftwareClass,
-        budget: usize,
-        actions: &mut crate::v2::engine::reactor::ReactorActions,
-    ) -> Result<usize> {
-        self.cm.service_software_class_into(
-            connections,
-            self,
-            io_core,
-            resources,
-            class,
-            budget,
-            actions,
-        )
-    }
-
-    pub(in crate::v2::engine) fn cm_software_snapshot(
-        &self,
-        connections: &ConnectionRegistry,
-    ) -> CmSoftwareSnapshot {
-        self.cm.software_snapshot(connections)
-    }
-
-    pub(in crate::v2::engine) fn try_process_cm_event(
-        &self,
-        connections: &mut ConnectionRegistry,
-        io_core: &mut crate::v2::engine::io_core::IoState,
-        resources: &EngineResources,
-        actions: &mut crate::v2::engine::reactor::ReactorActions,
-    ) -> Result<bool> {
-        self.cm
-            .try_process_event(connections, self, io_core, resources, actions)
-    }
-
-    pub(in crate::v2::engine) fn has_pending_cm_event(&self) -> bool {
-        self.cm.has_pending_event()
-    }
-
-    pub(in crate::v2::engine) fn service_deferred_cm_destructions(
-        &self,
-        connections: &mut ConnectionRegistry,
-        io_core: &mut crate::v2::engine::io_core::IoState,
-        budget: usize,
-        actions: &mut crate::v2::engine::reactor::ReactorActions,
-        defer_one_event: impl FnMut(&ConnectionRegistry) -> Result<bool>,
-    ) -> Result<usize> {
-        self.cm
-            .service_cm_destructions_into(connections, io_core, budget, actions, defer_one_event)
-    }
-}
-
 fn build_qp(
-    resources: &EngineResources,
+    resources: &EngineReactorResources,
     cm_id: &CmId,
     config: &RdmaConnectionConfig,
 ) -> Result<crate::v2::Qp> {
@@ -1046,9 +1116,15 @@ fn injected_cm_result(error: Option<String>) -> Result<()> {
 enum RouteRetirement {
     Complete {
         completion: Option<InboundRetirementCompletion>,
-        reject: Option<InboundRejectReason>,
+        disposition: RouteRetirementDisposition,
     },
     Retry,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RouteRetirementDisposition {
+    None,
+    Reject(InboundRejectReason),
 }
 
 enum PendingCmDestruction {
@@ -1060,7 +1136,7 @@ enum PendingCmDestruction {
     },
     Listener {
         cm_id: SharedCmId,
-        listener: Arc<ListenerState>,
+        listener: ListenerToken,
     },
     #[cfg(test)]
     Test {
@@ -1071,8 +1147,9 @@ enum PendingCmDestruction {
 
 #[cfg(test)]
 enum TestCmDestruction {
+    Route,
     Listener {
-        listener: Arc<ListenerState>,
+        listener: ListenerToken,
         destroy_error: Option<String>,
     },
 }
@@ -1088,14 +1165,19 @@ impl PendingCmDestruction {
         }
     }
 
-    fn listener(&self) -> Option<&Arc<ListenerState>> {
+    fn listener(&self) -> Option<ListenerToken> {
         match self {
-            Self::Listener { listener, .. } => Some(listener),
+            Self::Listener { listener, .. } => Some(*listener),
             #[cfg(test)]
             Self::Test {
                 target: TestCmDestruction::Listener { listener, .. },
                 ..
-            } => Some(listener),
+            } => Some(*listener),
+            #[cfg(test)]
+            Self::Test {
+                target: TestCmDestruction::Route,
+                ..
+            } => None,
             Self::Route(_) | Self::Connection { .. } => None,
         }
     }
@@ -1104,12 +1186,12 @@ impl PendingCmDestruction {
 pub(super) struct InboundRoute {
     pub(super) raw_id: usize,
     pub(super) context_key: usize,
-    pub(super) listener: Weak<ListenerState>,
+    pub(super) listener: ListenerToken,
     pub(super) state: InboundState,
 }
 
 impl InboundRoute {
-    pub(super) fn new(_token: CmRouteToken, listener: Weak<ListenerState>) -> Self {
+    pub(super) fn new(_token: CmRouteToken, listener: ListenerToken) -> Self {
         Self {
             raw_id: 0,
             context_key: 0,
@@ -1162,12 +1244,18 @@ pub(super) enum InboundState {
         request: Option<Arc<AcceptRequest>>,
         completion: Option<Error>,
         selected: bool,
-        reject: Option<InboundRejectReason>,
+        peer: InboundPeerState,
     },
     Quarantined {
         connection: Option<EstablishedConnectionRoute>,
     },
     Transitioning,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum InboundPeerState {
+    PreAccept { reject: Option<InboundRejectReason> },
+    Accepted,
 }
 
 impl InboundState {
@@ -1187,7 +1275,7 @@ impl InboundState {
 }
 
 struct InboundRetirementCompletion {
-    listener: Weak<ListenerState>,
+    listener: Option<ListenerToken>,
     route: u64,
     request: Option<Arc<AcceptRequest>>,
     result: Option<Error>,

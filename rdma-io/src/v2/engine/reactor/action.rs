@@ -181,6 +181,7 @@ impl DeferredProtocolActions {
         self.actions.len() == 0
     }
 
+    #[cfg(test)]
     pub(in crate::v2::engine) fn publish_synchronously(mut self) {
         let mut actions = ReactorActions::for_synchronous_driver_drop();
         self.append_bounded_to(&mut actions);

@@ -12,11 +12,10 @@ use futures_util::task::AtomicWaker;
 use tokio::sync::OwnedSemaphorePermit;
 
 #[cfg(test)]
-use super::EngineShared;
+use super::EngineFrontendRoot;
 use super::io_core::{self, ConnectionIoState, EstablishedIoConnection, IoState};
 use super::reactor::ReactorActions;
 use super::registry::{OperationToken, lock_unpoison};
-use super::resources::EngineResourceRefs;
 use super::session::connection::ConnectionState;
 use super::session::connection::RdmaConnection;
 use crate::v2::error::{Error, Result};
@@ -25,13 +24,13 @@ use crate::v2::op::Completion;
 
 #[derive(Clone)]
 pub(super) struct MemoryRegistrar {
-    pd: Option<crate::v2::Pd>,
+    pd: Option<Weak<crate::pd::ProtectionDomain>>,
 }
 
 impl MemoryRegistrar {
-    pub(super) fn from_resources(resources: Option<&EngineResourceRefs>) -> Self {
+    pub(super) fn from_pd(pd: Option<crate::v2::Pd>) -> Self {
         Self {
-            pd: resources.map(|resources| resources.pd.clone()),
+            pd: pd.map(|pd| Arc::downgrade(pd.raw_pd())),
         }
     }
 
@@ -41,9 +40,14 @@ impl MemoryRegistrar {
                 "engine MR length must be in 1..=u32::MAX".into(),
             ));
         }
-        let pd = self.pd.as_ref().ok_or_else(|| {
-            Error::InvalidConfig("engine shared protection domain is unavailable".into())
-        })?;
+        let pd = self
+            .pd
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .map(crate::v2::Pd::new)
+            .ok_or_else(|| {
+                Error::InvalidConfig("engine shared protection domain is unavailable".into())
+            })?;
         pd.reg_mr(len, access)
     }
 }
@@ -56,7 +60,7 @@ pub(crate) struct IoConnection {
     close: Arc<super::session::SessionCloseState>,
     events: IoEventSender,
     commands: Weak<super::reactor::CommandIngress>,
-    manager: Weak<super::session::SessionManager>,
+    manager: Weak<super::session::SessionFrontend>,
     admission: Arc<ProtocolAdmissionState>,
 }
 
@@ -131,7 +135,7 @@ impl IoConnection {
                 close: connection.close_state(),
                 events,
                 commands: connection.command_ingress(),
-                manager: connection.manager(),
+                manager: connection.frontend(),
                 admission: Arc::new(ProtocolAdmissionState::default()),
             },
             receiver,
@@ -286,7 +290,7 @@ impl Default for ProtocolAdmissionState {
 #[cfg(test)]
 pub(in crate::v2::engine) struct ProtocolTestAdmission {
     commands: Weak<super::reactor::CommandIngress>,
-    manager: Weak<super::session::SessionManager>,
+    manager: Weak<super::session::SessionFrontend>,
     state: ProtocolAdmissionState,
 }
 
@@ -294,7 +298,7 @@ pub(in crate::v2::engine) struct ProtocolTestAdmission {
 impl ProtocolTestAdmission {
     pub(in crate::v2::engine) fn new(
         commands: Weak<super::reactor::CommandIngress>,
-        manager: Weak<super::session::SessionManager>,
+        manager: Weak<super::session::SessionFrontend>,
     ) -> Arc<Self> {
         Arc::new(Self {
             commands,
@@ -332,7 +336,7 @@ impl ProtocolTestAdmission {
 #[cfg(test)]
 struct IoConnectionTestAdmission<'a> {
     commands: &'a Weak<super::reactor::CommandIngress>,
-    manager: &'a Weak<super::session::SessionManager>,
+    manager: &'a Weak<super::session::SessionFrontend>,
     state: &'a ProtocolAdmissionState,
 }
 
@@ -770,9 +774,13 @@ impl IoConnection {
             }
         }
 
-        let shared = EngineShared::new(EngineConfig::new("test0".into()), None, None)
-            .expect("test engine state")
-            .into_shared();
+        let (shared, _session) = EngineFrontendRoot::new(
+            EngineConfig::new("test0".into()),
+            None,
+            MemoryRegistrar::from_pd(None),
+        )
+        .expect("test engine state");
+        let shared = shared.into_shared();
         let connection = ConnectionState::new_for_test(
             ConnectionToken {
                 slot: 0,
@@ -794,7 +802,7 @@ impl IoConnection {
         let delayed = sender.terminal(IoTerminalEvent::Closed(Ok(())));
         (
             Self {
-                memory: MemoryRegistrar { pd: None },
+                memory: MemoryRegistrar::from_pd(None),
                 commands: Arc::downgrade(&shared.commands),
                 manager: Arc::downgrade(&shared.session),
                 admission: Arc::new(ProtocolAdmissionState::default()),

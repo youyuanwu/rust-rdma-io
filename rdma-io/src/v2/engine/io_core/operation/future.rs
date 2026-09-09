@@ -45,7 +45,7 @@ use tokio::sync::OwnedSemaphorePermit;
 use crate::v2::engine::reactor::CommandIngress;
 use crate::v2::engine::registry::lock_unpoison;
 use crate::v2::engine::registry::{ConnectionToken, Lookup, OperationToken};
-use crate::v2::engine::session::SessionManager;
+use crate::v2::engine::session::SessionFrontend;
 use crate::v2::error::{Error, Result};
 use crate::v2::mr::{Mr, RemoteMr};
 use crate::v2::op::Completion;
@@ -85,7 +85,7 @@ pub struct RdmaOperation {
 enum FutureState {
     PreAdmission {
         commands: Weak<CommandIngress>,
-        manager: Weak<SessionManager>,
+        manager: Weak<SessionFrontend>,
         connection: ConnectionToken,
         kind: OperationKind,
         mr: Option<Mr>,
@@ -94,7 +94,7 @@ enum FutureState {
     },
     Waiting {
         commands: Arc<CommandIngress>,
-        manager: Weak<SessionManager>,
+        manager: Weak<SessionFrontend>,
         connection: ConnectionToken,
         permit: Pin<Box<dyn Future<Output = Option<OwnedSemaphorePermit>> + Send>>,
         kind: OperationKind,
@@ -116,7 +116,7 @@ impl Unpin for RdmaOperation {}
 impl RdmaOperation {
     pub(in crate::v2::engine) fn new(
         commands: Weak<CommandIngress>,
-        manager: Weak<SessionManager>,
+        manager: Weak<SessionFrontend>,
         connection: ConnectionToken,
         kind: OperationKind,
         mr: Mr,

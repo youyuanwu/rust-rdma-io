@@ -21,7 +21,7 @@ use crate::v2::engine::config::CompletionMode;
 use crate::v2::engine::progress::ProgressReport;
 use crate::v2::engine::progress::ReadinessRegistration;
 use crate::v2::engine::registry::{ConnectionToken, OperationToken};
-use crate::v2::engine::resources::IoProgressResources;
+use crate::v2::engine::resources::EngineReactorResources;
 use crate::v2::engine::scheduler::DeadlineQueue;
 use crate::v2::error::{Error, Result};
 
@@ -30,7 +30,6 @@ pub(in crate::v2::engine) struct IoReactorSources {
     core: Option<IoState>,
     #[cfg(test)]
     bridge: Arc<dyn IoSessionBridge>,
-    resources: Option<IoProgressResources>,
     cq_readiness: CqReadiness,
     cq_buffer: Box<[Completion]>,
     completion_connections: CompletionConnections,
@@ -50,7 +49,6 @@ impl IoReactorSources {
     pub(in crate::v2::engine) fn new(
         core: IoState,
         #[cfg(test)] bridge: Arc<dyn IoSessionBridge>,
-        resources: Option<IoProgressResources>,
         cq_budget: usize,
         completion_dispatch_budget: usize,
         reclamation_budget: usize,
@@ -62,7 +60,6 @@ impl IoReactorSources {
             core: Some(core),
             #[cfg(test)]
             bridge,
-            resources,
             cq_readiness: CqReadiness::default(),
             cq_buffer: vec![Completion::default(); cq_budget].into_boxed_slice(),
             completion_connections: CompletionConnections::default(),
@@ -209,13 +206,6 @@ impl IoReactorSources {
             .saturating_add(self.core().published_connection_count())
     }
 
-    pub(in crate::v2::engine) fn release_resources(&mut self) {
-        if let Some(resources) = self.resources.as_mut() {
-            resources.drop_readiness_adapter();
-        }
-        self.resources.take();
-    }
-
     pub(in crate::v2::engine) fn next_deadline(&self) -> Option<Instant> {
         self.deadlines.next()
     }
@@ -268,6 +258,7 @@ impl IoReactorSources {
     pub(in crate::v2::engine) fn service_cq(
         &mut self,
         session: &mut crate::v2::engine::session::SessionReactorSources,
+        resources: Option<&EngineReactorResources>,
         mode: CompletionMode,
         cx: &mut TaskContext<'_>,
     ) -> Result<(usize, ReadinessRegistration, bool)> {
@@ -281,7 +272,7 @@ impl IoReactorSources {
             return Ok((1, ReadinessRegistration::Incomplete, true));
         }
 
-        let Some(resources) = self.resources.as_ref() else {
+        let Some(resources) = resources else {
             return Ok((0, ReadinessRegistration::NotRequired, false));
         };
         let (count, readiness) = match mode {
@@ -589,7 +580,6 @@ mod tests {
         let progress = IoReactorSources::new(
             core,
             bridge_dyn,
-            None,
             4,
             3,
             reclamation_budget,

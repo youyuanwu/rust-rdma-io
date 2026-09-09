@@ -457,6 +457,11 @@ async fn run_connect_admission_shutdown_barrier(mode: CompletionMode) {
         shutdown
     });
     barrier.wait_until_shutdown_attempted().unwrap();
+    assert_eq!(
+        engine.diagnostics().lifecycle,
+        paused.lifecycle,
+        "shutdown cannot publish lifecycle while connect admission holds the barrier"
+    );
     barrier.release().unwrap();
 
     let mut connect = connect_thread.join().expect("connect poll thread panicked");
@@ -464,7 +469,10 @@ async fn run_connect_admission_shutdown_barrier(mode: CompletionMode) {
         .join()
         .expect("shutdown poll thread panicked");
     let admitted = engine.diagnostics();
-    assert_eq!(admitted.lifecycle, RdmaEngineLifecycle::ShutdownRequested);
+    assert_eq!(
+        admitted.lifecycle, paused.lifecycle,
+        "the exclusively owned lifecycle changes only when the driver consumes shutdown"
+    );
     assert_eq!(
         admitted.live_connections, 1,
         "the admitted connect command retains its transferable connection reservation"
@@ -553,6 +561,11 @@ async fn run_operation_admission_shutdown_barrier(mode: CompletionMode) {
         shutdown
     });
     barrier.wait_until_shutdown_attempted().unwrap();
+    assert_eq!(
+        engine.diagnostics().lifecycle,
+        paused.lifecycle,
+        "shutdown cannot publish lifecycle while operation admission holds the barrier"
+    );
     barrier.release().unwrap();
 
     let mut operation = operation_thread
@@ -562,10 +575,18 @@ async fn run_operation_admission_shutdown_barrier(mode: CompletionMode) {
         .join()
         .expect("shutdown poll thread panicked");
     let admitted = engine.diagnostics();
-    assert_eq!(admitted.lifecycle, RdmaEngineLifecycle::ShutdownRequested);
-    assert_eq!(admitted.registered_operations, 1);
-    assert_eq!(admitted.accepted_operations, 1);
-    assert_eq!(admitted.available_cq_credits, OPERATIONS - 1);
+    assert!(
+        admitted.registered_operations <= 1,
+        "the one admitted operation may already have consumed its RXE flush completion"
+    );
+    assert_eq!(
+        admitted.accepted_operations, admitted.registered_operations,
+        "the admission race cannot leave a registered operation without exact provider ownership"
+    );
+    assert_eq!(
+        admitted.available_cq_credits + admitted.accepted_operations,
+        OPERATIONS
+    );
     assert_eq!(admitted.retained_cq_credits, 0);
 
     let mut server_close = Box::pin(server.close());

@@ -1,6 +1,6 @@
 //! Engine-owned listeners and ordered inbound accept arbitration.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -12,25 +12,22 @@ use super::super::io::{BorrowedSetupIo, IoEventReceiver};
 use super::super::lifecycle::{MemoizedTerminalResult, TakeOnceResult};
 use super::super::reactor::CommandIngress;
 use super::super::reactor::completion::CommandCompletion;
-use super::super::registry::{lock_unpoison, read_unpoison};
+use super::super::registry::{ListenerToken, Lookup, PagedRegistry, lock_unpoison, read_unpoison};
 use super::super::{ConnectionSetup, RdmaConnection, RdmaConnectionConfig, SetupSummary};
 use super::connection::SharedCmId;
-use super::{SessionListener, SessionListenerCloseState, SessionManager};
+use super::{SessionFrontend, SessionListener, SessionListenerCloseState, SessionManager};
 use crate::v2::error::{Error, Result};
 use futures_util::task::AtomicWaker;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 pub(crate) const DEFAULT_LISTENER_BACKLOG: usize = 128;
 const MAX_LISTENER_BACKLOG: usize = 4_096;
-pub(in crate::v2::engine) const KERNEL_LISTEN_BACKLOG_REQUEST: i32 = i32::MAX;
 
 /// Configuration for one engine-owned listener.
 ///
-/// The configurable backlog is a userspace queue limit, not the kernel
-/// `rdma_listen` backlog. It must be in `1..=4096` when
-/// [`RdmaEngine::listen`](super::super::RdmaEngine::listen) is called. The engine
-/// independently requests `i32::MAX` from `rdma_listen`; a provider or kernel
-/// may clamp that request, or may refuse it before any child reaches the
-/// userspace queue.
+/// The configured value is the single listener backlog contract. It must be in
+/// `1..=4096`, is passed unchanged to `rdma_listen`, and bounds both admitted
+/// accept requests and pending inbound children.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RdmaListenerConfig {
     backlog: usize,
@@ -45,19 +42,16 @@ impl Default for RdmaListenerConfig {
 }
 
 impl RdmaListenerConfig {
-    /// Store the userspace pending-child queue limit for validation by `listen`.
+    /// Store the listener backlog for validation by `listen`.
     ///
     /// Valid values are `1..=4096`. This setter deliberately does not validate,
-    /// panic, or clamp. The independent kernel `rdma_listen` request is always
-    /// `i32::MAX`; provider/kernel clamping does not change this configured
-    /// userspace limit, while refusal is reported by `listen` as a contextual
-    /// listener-creation error rather than as a userspace backlog rejection.
+    /// panic, or clamp.
     pub fn backlog(mut self, value: usize) -> Self {
         self.backlog = value;
         self
     }
 
-    /// Return the configured userspace pending-child queue limit.
+    /// Return the validated provider and userspace backlog bound.
     pub fn backlog_capacity(&self) -> usize {
         self.backlog
     }
@@ -71,6 +65,16 @@ impl RdmaListenerConfig {
         }
         Ok(())
     }
+}
+
+pub(in crate::v2::engine) fn with_validated_listener_backlog<T>(
+    config: &RdmaListenerConfig,
+    provider_call: impl FnOnce(i32) -> T,
+) -> Result<T> {
+    config.validate()?;
+    let backlog = i32::try_from(config.backlog_capacity())
+        .map_err(|_| Error::InvalidConfig("listener backlog does not fit provider ABI".into()))?;
+    Ok(provider_call(backlog))
 }
 
 /// Engine-owned inbound listener whose progress and resources belong to its engine driver.
@@ -108,10 +112,12 @@ impl RdmaListener {
     /// error, or with the engine-wide terminal error if the driver has failed.
     /// Low-level setup posts zero initial receives.
     pub async fn accept(&self) -> Result<RdmaConnection> {
-        let (manager, state) = self.session.owners()?;
+        let (frontend, commands, token, admission) = self.session.owners()?;
         accept_with_setup(
-            manager,
-            state,
+            frontend,
+            commands,
+            token,
+            admission,
             RdmaConnectionConfig::default(),
             empty_connection_setup(),
         )
@@ -124,8 +130,16 @@ impl RdmaListener {
     /// Cancellation and listener-close behavior are the same as [`Self::accept`].
     /// No value is silently clamped, and low-level setup posts zero receives.
     pub async fn accept_with_config(&self, config: RdmaConnectionConfig) -> Result<RdmaConnection> {
-        let (manager, state) = self.session.owners()?;
-        accept_with_setup(manager, state, config, empty_connection_setup()).await
+        let (frontend, commands, token, admission) = self.session.owners()?;
+        accept_with_setup(
+            frontend,
+            commands,
+            token,
+            admission,
+            config,
+            empty_connection_setup(),
+        )
+        .await
     }
 
     pub(crate) async fn accept_with_io_setup<F>(
@@ -136,16 +150,24 @@ impl RdmaListener {
     where
         F: for<'a> FnOnce(BorrowedSetupIo<'a>, IoEventReceiver) -> Result<usize> + Send + 'static,
     {
-        let (manager, state) = self.session.owners()?;
-        accept_with_setup(manager, state, config, Box::new(setup)).await
+        let (frontend, commands, token, admission) = self.session.owners()?;
+        accept_with_setup(
+            frontend,
+            commands,
+            token,
+            admission,
+            config,
+            Box::new(setup),
+        )
+        .await
     }
 
     pub(crate) fn validate_message_connection_config(
         &self,
         config: &RdmaConnectionConfig,
     ) -> Result<()> {
-        let (manager, _) = self.session.owners()?;
-        manager.validate_connection_config(config)
+        let (frontend, _, _, _) = self.session.owners()?;
+        frontend.validate_connection_config(config)
     }
 
     /// Close the listener and wait for CM destruction or engine termination.
@@ -160,10 +182,10 @@ impl RdmaListener {
 
     pub(in crate::v2::engine) fn from_state(
         manager: &SessionManager,
-        state: Arc<ListenerState>,
+        state: &ListenerEntry,
     ) -> Self {
         Self {
-            session: manager.listener_capability(&state),
+            session: manager.listener_capability(state),
         }
     }
 }
@@ -177,7 +199,7 @@ impl Drop for RdmaListener {
 }
 
 pub(in crate::v2::engine) async fn listen(
-    manager: Arc<SessionManager>,
+    frontend: Arc<SessionFrontend>,
     commands: Arc<CommandIngress>,
     address: SocketAddr,
     config: RdmaListenerConfig,
@@ -186,9 +208,9 @@ pub(in crate::v2::engine) async fn listen(
     let permit = commands
         .acquire_listen()
         .await
-        .ok_or_else(|| manager.admission_error().unwrap_or(Error::DriverShutdown))?;
-    let admission = read_unpoison(&manager.admission);
-    if let Some(error) = manager.admission_error() {
+        .ok_or_else(|| frontend.admission_error().unwrap_or(Error::DriverShutdown))?;
+    let admission = read_unpoison(&frontend.admission);
+    if let Some(error) = frontend.admission_error() {
         return Err(error);
     }
     let request = Arc::new(ListenRequest::new(address, config));
@@ -196,44 +218,54 @@ pub(in crate::v2::engine) async fn listen(
     drop(admission);
     commands.publish_command_work();
     let waiter = ListenWaiter {
-        manager: Arc::downgrade(&manager),
+        frontend: Arc::downgrade(&frontend),
         commands: Arc::downgrade(&commands),
         request: Arc::downgrade(&request),
         observer: Arc::clone(&request.observer),
         finished: false,
     };
     drop(request);
-    drop(manager);
+    drop(frontend);
     CommandIngress::yield_after_admission().await;
     waiter.await
 }
 
 pub(in crate::v2::engine) async fn accept_with_setup(
-    manager: Arc<SessionManager>,
-    listener: Arc<ListenerState>,
+    frontend: Arc<SessionFrontend>,
+    commands: Arc<CommandIngress>,
+    listener: ListenerToken,
+    listener_admission: Arc<ListenerAdmission>,
     config: RdmaConnectionConfig,
     setup: ConnectionSetup,
 ) -> Result<RdmaConnection> {
-    manager.validate_connection_config(&config)?;
-    let admission = read_unpoison(&manager.admission);
-    if let Some(error) = manager.admission_error() {
+    frontend.validate_connection_config(&config)?;
+    let permit = listener_admission
+        .acquire()
+        .await
+        .ok_or_else(|| listener_admission.close_error())?;
+    let admission = read_unpoison(&frontend.admission);
+    if let Some(error) = frontend.admission_error() {
         return Err(error);
     }
-    let request = Arc::new(AcceptRequest::new(AcceptIntent::new(config, setup)));
-    listener.register_waiter(Arc::clone(&request))?;
+    if !listener_admission.is_open() {
+        return Err(listener_admission.close_error());
+    }
+    let request = Arc::new(AcceptRequest::new(AcceptIntent::new(config, setup), permit));
+    commands.enqueue_accept(listener, Arc::clone(&request));
     drop(admission);
-    manager.cm.enqueue_listener_work(&listener);
-    manager.publish_session_work();
+    commands.publish_command_work();
     let waiter = AcceptWaiter {
-        manager: Arc::downgrade(&manager),
-        listener: Arc::downgrade(&listener),
+        commands: Arc::downgrade(&commands),
+        listener,
         request: Arc::downgrade(&request),
         observer: Arc::clone(&request.observer),
         finished: false,
     };
     drop(request);
-    drop(listener);
-    drop(manager);
+    drop(listener_admission);
+    drop(commands);
+    drop(frontend);
+    CommandIngress::yield_after_admission().await;
     waiter.await
 }
 
@@ -350,6 +382,7 @@ impl ListenRequest {
         self.observer.completion.is_cancelled()
     }
 
+    #[cfg(test)]
     pub(in crate::v2::engine) fn complete(&self, result: Result<RdmaListener>) {
         self.observer.completion.complete_listener(result);
     }
@@ -376,7 +409,7 @@ impl ListenRequestObserver {
 }
 
 struct ListenWaiter {
-    manager: Weak<super::SessionManager>,
+    frontend: Weak<SessionFrontend>,
     commands: Weak<CommandIngress>,
     request: Weak<ListenRequest>,
     observer: Arc<ListenRequestObserver>,
@@ -414,8 +447,8 @@ impl Drop for ListenWaiter {
         {
             return;
         }
-        if let Some(manager) = self.manager.upgrade() {
-            manager.publish_session_work();
+        if let Some(frontend) = self.frontend.upgrade() {
+            frontend.publish_session_work();
         }
     }
 }
@@ -424,6 +457,7 @@ pub(in crate::v2::engine) struct AcceptRequest {
     intent: Mutex<Option<AcceptIntent>>,
     observer: Arc<AcceptRequestObserver>,
     route_token: AtomicU64,
+    permit: Mutex<Option<OwnedSemaphorePermit>>,
 }
 
 struct AcceptRequestObserver {
@@ -433,8 +467,23 @@ struct AcceptRequestObserver {
     waker: Arc<AtomicWaker>,
 }
 
+pub(in crate::v2::engine) struct UndeliveredAcceptFailure {
+    delivered: bool,
+    connection: Option<RdmaConnection>,
+}
+
+impl UndeliveredAcceptFailure {
+    pub(in crate::v2::engine) fn delivered(&self) -> bool {
+        self.delivered
+    }
+
+    pub(in crate::v2::engine) fn into_connection(self) -> Option<RdmaConnection> {
+        self.connection
+    }
+}
+
 impl AcceptRequest {
-    fn new(intent: AcceptIntent) -> Self {
+    fn new(intent: AcceptIntent, permit: OwnedSemaphorePermit) -> Self {
         Self {
             intent: Mutex::new(Some(intent)),
             observer: Arc::new(AcceptRequestObserver {
@@ -444,15 +493,20 @@ impl AcceptRequest {
                 waker: Arc::new(AtomicWaker::new()),
             }),
             route_token: AtomicU64::new(0),
+            permit: Mutex::new(Some(permit)),
         }
     }
 
     #[cfg(test)]
     pub(in crate::v2::engine) fn test_only() -> Arc<Self> {
-        Arc::new(Self::new(AcceptIntent::new(
-            RdmaConnectionConfig::default(),
-            empty_connection_setup(),
-        )))
+        let permits = Arc::new(Semaphore::new(1));
+        let permit = permits
+            .try_acquire_owned()
+            .expect("test accept permit is available");
+        Arc::new(Self::new(
+            AcceptIntent::new(RdmaConnectionConfig::default(), empty_connection_setup()),
+            permit,
+        ))
     }
 
     pub(in crate::v2::engine) fn take_intent(&self) -> Option<AcceptIntent> {
@@ -467,12 +521,17 @@ impl AcceptRequest {
         self.route_token.store(token, Ordering::Release);
     }
 
-    pub(in crate::v2::engine) fn route_token(&self) -> u64 {
-        self.route_token.load(Ordering::Acquire)
-    }
-
     pub(in crate::v2::engine) fn is_delivered(&self) -> bool {
         self.observer.delivered.load(Ordering::Acquire)
+    }
+
+    pub(in crate::v2::engine) fn release_permit(&self) -> bool {
+        lock_unpoison(&self.permit).take().is_some()
+    }
+
+    #[cfg(test)]
+    fn owns_permit(&self) -> bool {
+        lock_unpoison(&self.permit).is_some()
     }
 
     #[cfg(test)]
@@ -505,17 +564,45 @@ impl AcceptRequest {
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) {
         let mut current = lock_unpoison(&self.observer.result);
-        if self.observer.cancelled.load(Ordering::Acquire)
-            || !matches!(&*current, TakeOnceResult::Pending)
-        {
+        if !matches!(&*current, TakeOnceResult::Pending) {
             drop(current);
             drop(connection);
             return;
         }
         *current = TakeOnceResult::Ready(Ok(connection));
+        if self.observer.cancelled.load(Ordering::Acquire) {
+            return;
+        }
         drop(current);
         let waker = Arc::clone(&self.observer.waker);
         actions.push_close_or_listener(move || waker.wake());
+    }
+
+    pub(in crate::v2::engine) fn claim_undelivered_failure_into(
+        &self,
+        error: Error,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) -> UndeliveredAcceptFailure {
+        let mut current = lock_unpoison(&self.observer.result);
+        let mut connection = None;
+        let replacement = match std::mem::replace(&mut *current, TakeOnceResult::Taken) {
+            TakeOnceResult::Pending => TakeOnceResult::Ready(Err(error)),
+            TakeOnceResult::Ready(Ok(value)) => {
+                connection = Some(value);
+                TakeOnceResult::Ready(Err(error))
+            }
+            TakeOnceResult::Ready(Err(existing)) => TakeOnceResult::Ready(Err(existing)),
+            TakeOnceResult::Taken => TakeOnceResult::Taken,
+        };
+        *current = replacement;
+        let delivered = self.is_delivered();
+        drop(current);
+        let waker = Arc::clone(&self.observer.waker);
+        actions.push_close_or_listener(move || waker.wake());
+        UndeliveredAcceptFailure {
+            delivered,
+            connection,
+        }
     }
 
     pub(in crate::v2::engine) fn fail_undelivered_into(
@@ -523,29 +610,28 @@ impl AcceptRequest {
         error: Error,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> bool {
-        let mut current = lock_unpoison(&self.observer.result);
-        let replacement = match std::mem::replace(&mut *current, TakeOnceResult::Taken) {
-            TakeOnceResult::Pending | TakeOnceResult::Ready(Ok(_)) => {
-                TakeOnceResult::Ready(Err(error))
-            }
-            TakeOnceResult::Ready(Err(existing)) => TakeOnceResult::Ready(Err(existing)),
-            TakeOnceResult::Taken => TakeOnceResult::Taken,
-        };
-        *current = replacement;
-        drop(current);
-        let waker = Arc::clone(&self.observer.waker);
-        actions.push_close_or_listener(move || waker.wake());
-        self.is_delivered()
+        let failure = self.claim_undelivered_failure_into(error, actions);
+        let delivered = failure.delivered();
+        drop(failure);
+        delivered
     }
 
     #[cfg(test)]
-    fn cancel(&self) {
+    pub(in crate::v2::engine) fn cancel(&self) {
         self.observer.cancel();
     }
 
     #[cfg(test)]
     pub(in crate::v2::engine) fn take_result_for_test(&self) -> Option<Result<RdmaConnection>> {
         self.observer.take_result()
+    }
+
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn has_undelivered_success_for_test(&self) -> bool {
+        matches!(
+            &*lock_unpoison(&self.observer.result),
+            TakeOnceResult::Ready(Ok(_))
+        ) && !self.is_delivered()
     }
 }
 
@@ -572,10 +658,7 @@ impl AcceptRequestObserver {
         let mut current = lock_unpoison(&self.result);
         let replacement = match std::mem::replace(&mut *current, TakeOnceResult::Taken) {
             TakeOnceResult::Pending => TakeOnceResult::Pending,
-            TakeOnceResult::Ready(Ok(connection)) => {
-                drop(connection);
-                TakeOnceResult::Taken
-            }
+            TakeOnceResult::Ready(Ok(connection)) => TakeOnceResult::Ready(Ok(connection)),
             TakeOnceResult::Ready(Err(error)) => TakeOnceResult::Ready(Err(error)),
             TakeOnceResult::Taken => TakeOnceResult::Taken,
         };
@@ -586,8 +669,8 @@ impl AcceptRequestObserver {
 }
 
 struct AcceptWaiter {
-    manager: Weak<super::SessionManager>,
-    listener: Weak<ListenerState>,
+    commands: Weak<CommandIngress>,
+    listener: ListenerToken,
     request: Weak<AcceptRequest>,
     observer: Arc<AcceptRequestObserver>,
     finished: bool,
@@ -619,17 +702,12 @@ impl Future for AcceptWaiter {
 
 impl AcceptWaiter {
     fn mark_delivered(&self) {
-        let Some(manager) = self.manager.upgrade() else {
+        if self.request.upgrade().is_none() {
             return;
-        };
-        let Some(listener) = self.listener.upgrade() else {
-            return;
-        };
-        let Some(request) = self.request.upgrade() else {
-            return;
-        };
-        manager.cm.mark_accept_delivered(&listener, &request);
-        manager.publish_session_work();
+        }
+        if let Some(commands) = self.commands.upgrade() {
+            commands.request_listener_work(self.listener);
+        }
     }
 }
 
@@ -639,129 +717,268 @@ impl Drop for AcceptWaiter {
             return;
         }
         self.observer.cancel();
-        let Some(manager) = self.manager.upgrade() else {
+        let Some(request) = self.request.upgrade() else {
             return;
         };
-        let Some(listener) = self.listener.upgrade() else {
-            return;
-        };
-        if self.request.upgrade().is_none() {
-            return;
+        if let Some(commands) = self.commands.upgrade() {
+            if commands.cancel_accept(&request) {
+                return;
+            }
+            commands.request_listener_work(self.listener);
         }
-        manager.cm.enqueue_listener_work(&listener);
-        manager.publish_session_work();
     }
 }
 
-pub(in crate::v2::engine) struct ListenerState {
-    pub(in crate::v2::engine) token: u64,
-    pub(in crate::v2::engine) local_addr: SocketAddr,
-    pub(in crate::v2::engine) backlog: usize,
-    pub(in crate::v2::engine) cm_id: Mutex<Option<SharedCmId>>,
-    queues: Mutex<ListenerQueues>,
-    closing: AtomicBool,
-    finalization_started: AtomicBool,
-    failure: Mutex<Option<Error>>,
+pub(in crate::v2::engine) struct ListenerAdmission {
+    token: ListenerToken,
+    permits: Arc<Semaphore>,
+    open: AtomicBool,
+    close_reason: Mutex<Option<Error>>,
     close: Arc<SessionListenerCloseState>,
-    work_enqueued: AtomicBool,
 }
 
-impl ListenerState {
-    pub(in crate::v2::engine) fn new(
-        token: u64,
-        local_addr: SocketAddr,
-        config: RdmaListenerConfig,
-        cm_id: SharedCmId,
-    ) -> Self {
+impl ListenerAdmission {
+    fn new(
+        token: ListenerToken,
+        backlog: usize,
+        close: Arc<SessionListenerCloseState>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            token,
+            permits: Arc::new(Semaphore::new(backlog)),
+            open: AtomicBool::new(true),
+            close_reason: Mutex::new(None),
+            close,
+        })
+    }
+
+    pub(in crate::v2::engine) fn token(&self) -> ListenerToken {
+        self.token
+    }
+
+    pub(in crate::v2::engine) async fn acquire(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.permits).acquire_owned().await.ok()
+    }
+
+    pub(in crate::v2::engine) fn is_open(&self) -> bool {
+        self.open.load(Ordering::Acquire)
+    }
+
+    pub(in crate::v2::engine) fn is_terminal(&self) -> bool {
+        self.close.outcome().is_some()
+    }
+
+    pub(in crate::v2::engine) fn close(&self) {
+        if self.open.swap(false, Ordering::AcqRel) {
+            self.permits.close();
+        }
+    }
+
+    pub(in crate::v2::engine) fn close_with_error(&self, error: Error) {
+        let mut reason = lock_unpoison(&self.close_reason);
+        if reason.is_none() {
+            *reason = Some(error);
+        }
+        self.close();
+    }
+
+    pub(in crate::v2::engine) fn close_error(&self) -> Error {
+        lock_unpoison(&self.close_reason)
+            .clone()
+            .or_else(|| {
+                self.close
+                    .outcome()
+                    .and_then(|outcome| outcome.into_result().err())
+            })
+            .unwrap_or(Error::TransportClosed)
+    }
+
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn available_permits(&self) -> usize {
+        self.permits.available_permits()
+    }
+}
+
+pub(in crate::v2::engine) struct ListenerEntry {
+    pub(in crate::v2::engine) token: ListenerToken,
+    requested_addr: SocketAddr,
+    pub(in crate::v2::engine) local_addr: Option<SocketAddr>,
+    pub(in crate::v2::engine) backlog: usize,
+    pub(in crate::v2::engine) cm_id: Option<SharedCmId>,
+    cm_destruction_pending: bool,
+    raw_id: usize,
+    context_key: usize,
+    queues: ListenerQueues,
+    child_slots_used: usize,
+    closing: bool,
+    finalization_started: bool,
+    failure: Option<Error>,
+    close: Arc<SessionListenerCloseState>,
+    admission: Arc<ListenerAdmission>,
+    work_enqueued: bool,
+}
+
+impl ListenerEntry {
+    fn creating(token: ListenerToken, address: SocketAddr, config: RdmaListenerConfig) -> Self {
+        let backlog = config.backlog;
+        let close = SessionListenerCloseState::new();
         Self {
             token,
-            local_addr,
-            backlog: config.backlog,
-            cm_id: Mutex::new(Some(cm_id)),
-            queues: Mutex::new(ListenerQueues::default()),
-            closing: AtomicBool::new(false),
-            finalization_started: AtomicBool::new(false),
-            failure: Mutex::new(None),
-            close: SessionListenerCloseState::new(),
-            work_enqueued: AtomicBool::new(false),
+            requested_addr: address,
+            local_addr: None,
+            backlog,
+            cm_id: None,
+            cm_destruction_pending: false,
+            raw_id: 0,
+            context_key: 0,
+            queues: ListenerQueues::default(),
+            child_slots_used: 0,
+            closing: false,
+            finalization_started: false,
+            failure: None,
+            close: Arc::clone(&close),
+            admission: ListenerAdmission::new(token, backlog, close),
+            work_enqueued: false,
         }
     }
 
     #[cfg(test)]
-    pub(in crate::v2::engine) fn test_only(backlog: usize) -> Arc<Self> {
-        Arc::new(Self {
-            token: 1,
-            local_addr: "127.0.0.1:1".parse().unwrap(),
-            backlog,
-            cm_id: Mutex::new(None),
-            queues: Mutex::new(ListenerQueues::default()),
-            closing: AtomicBool::new(false),
-            finalization_started: AtomicBool::new(false),
-            failure: Mutex::new(None),
-            close: SessionListenerCloseState::new(),
-            work_enqueued: AtomicBool::new(false),
-        })
+    pub(in crate::v2::engine) fn test_only(backlog: usize) -> Self {
+        let token = ListenerToken {
+            slot: 0,
+            generation: 1,
+        };
+        let mut entry = Self::creating(
+            token,
+            "127.0.0.1:1".parse().unwrap(),
+            RdmaListenerConfig::default().backlog(backlog),
+        );
+        entry.local_addr = Some("127.0.0.1:1".parse().unwrap());
+        entry
     }
 
-    fn lock_queues(&self) -> std::sync::MutexGuard<'_, ListenerQueues> {
-        lock_unpoison(&self.queues)
+    fn activate(
+        &mut self,
+        local_addr: SocketAddr,
+        cm_id: SharedCmId,
+        raw_id: usize,
+        context_key: usize,
+    ) {
+        self.local_addr = Some(local_addr);
+        self.cm_id = Some(cm_id);
+        self.raw_id = raw_id;
+        self.context_key = context_key;
     }
 
-    pub(in crate::v2::engine) fn register_waiter(&self, request: Arc<AcceptRequest>) -> Result<()> {
-        if self.closing.load(Ordering::Acquire) {
+    pub(in crate::v2::engine) fn display_addr(&self) -> SocketAddr {
+        self.local_addr.unwrap_or(self.requested_addr)
+    }
+
+    pub(in crate::v2::engine) fn raw_id(&self) -> usize {
+        self.raw_id
+    }
+
+    pub(in crate::v2::engine) fn context_key(&self) -> usize {
+        self.context_key
+    }
+
+    pub(in crate::v2::engine) fn admission(&self) -> Arc<ListenerAdmission> {
+        Arc::clone(&self.admission)
+    }
+
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn test_accept_request(&self) -> Arc<AcceptRequest> {
+        let permit = Arc::clone(&self.admission.permits)
+            .try_acquire_owned()
+            .expect("listener test has an accept permit");
+        Arc::new(AcceptRequest::new(
+            AcceptIntent::new(RdmaConnectionConfig::default(), empty_connection_setup()),
+            permit,
+        ))
+    }
+
+    pub(in crate::v2::engine) fn register_waiter(
+        &mut self,
+        request: Arc<AcceptRequest>,
+    ) -> Result<()> {
+        if self.is_closing() {
             return Err(self.close_error());
         }
-        let mut queues = self.lock_queues();
-        if self.closing.load(Ordering::Acquire) {
-            return Err(self.close_error());
-        }
-        queues.waiters.push_back(request);
-        select_pair(&mut queues);
+        debug_assert!(
+            self.queues.waiters.len() + usize::from(self.queues.selected.is_some()) < self.backlog,
+            "an accept permit bounds every queued or selected request"
+        );
+        self.queues.waiters.push_back(request);
+        select_pair(&mut self.queues);
         Ok(())
     }
 
-    pub(in crate::v2::engine) fn admit_child(&self, child: IncomingChild) -> ChildAdmission {
-        let mut queues = self.lock_queues();
-        if self.closing.load(Ordering::Acquire) {
+    pub(in crate::v2::engine) fn admit_child(&mut self, child: IncomingChild) -> ChildAdmission {
+        if self.is_closing() {
             return ChildAdmission {
                 rejected: Some((child, InboundRejectReason::ListenerClosed)),
             };
         }
-        select_pair(&mut queues);
-        if queues.selected.is_none()
-            && let Some(request) = queues.waiters.pop_front()
-        {
-            queues.selected = Some(SelectedAccept::Ready { request, child });
-            return ChildAdmission { rejected: None };
-        }
-        if queues.children.len() >= self.backlog {
+        if self.child_slots_used >= self.backlog {
             return ChildAdmission {
                 rejected: Some((child, InboundRejectReason::BacklogFull)),
             };
         }
-        queues.children.push_back(child);
+        self.child_slots_used += 1;
+        self.queues.children.push_back(child);
+        select_pair(&mut self.queues);
         ChildAdmission { rejected: None }
     }
 
-    pub(in crate::v2::engine) fn next_action(&self) -> ListenerAction {
-        let mut queues = self.lock_queues();
-        if let Some(request) = queues
+    pub(in crate::v2::engine) fn next_action(&mut self) -> ListenerAction {
+        if let Some(SelectedAccept::Routed {
+            request,
+            route,
+            cancel_started,
+        }) = self.queues.selected.as_ref()
+        {
+            let request = Arc::clone(request);
+            let route = *route;
+            let cancel_started = *cancel_started;
+            // Taking the successful result transfers the connection to the
+            // frontend. That transfer is linearized under the observer result
+            // lock and must win over a concurrently observed listener close.
+            if request.is_delivered() {
+                return ListenerAction::AcknowledgeDelivery { request, route };
+            }
+            if self.is_closing() || request.is_cancelled() {
+                if cancel_started {
+                    return ListenerAction::None;
+                }
+                self.queues.selected = Some(SelectedAccept::Routed {
+                    request: Arc::clone(&request),
+                    route,
+                    cancel_started: true,
+                });
+                return ListenerAction::CancelAfterAccept { request, route };
+            }
+        }
+
+        if let Some(request) = self
+            .queues
             .waiters
             .pop_front_if(|request| request.is_cancelled())
         {
+            request.release_permit();
             return ListenerAction::CancelledBeforeSelection(request);
         }
 
-        if self.closing.load(Ordering::Acquire) {
-            if let Some(request) = queues.waiters.pop_front() {
+        if self.is_closing() {
+            if let Some(request) = self.queues.waiters.pop_front() {
+                request.release_permit();
                 return ListenerAction::FailUnselected(request);
             }
-            if let Some(child) = queues.children.pop_front() {
+            if let Some(child) = self.queues.children.pop_front() {
                 return ListenerAction::RejectChild(child, InboundRejectReason::ListenerClosed);
             }
-            match queues.selected.take() {
+            match self.queues.selected.take() {
                 Some(SelectedAccept::Ready { request, child }) => {
-                    queues.selected = Some(SelectedAccept::Processing {
+                    self.queues.selected = Some(SelectedAccept::Processing {
                         request: Arc::clone(&request),
                     });
                     return ListenerAction::RejectSelected {
@@ -775,7 +992,7 @@ impl ListenerState {
                     route,
                     cancel_started,
                 }) => {
-                    queues.selected = Some(SelectedAccept::Routed {
+                    self.queues.selected = Some(SelectedAccept::Routed {
                         request: Arc::clone(&request),
                         route,
                         cancel_started: true,
@@ -785,10 +1002,11 @@ impl ListenerState {
                     }
                 }
                 Some(selected @ SelectedAccept::Processing { .. }) => {
-                    queues.selected = Some(selected);
+                    self.queues.selected = Some(selected);
                 }
                 None => {
-                    if !self.finalization_started.swap(true, Ordering::AcqRel) {
+                    if !self.finalization_started {
+                        self.finalization_started = true;
                         return ListenerAction::FinalizeClose;
                     }
                 }
@@ -796,10 +1014,10 @@ impl ListenerState {
             return ListenerAction::None;
         }
 
-        select_pair(&mut queues);
-        match queues.selected.take() {
+        select_pair(&mut self.queues);
+        match self.queues.selected.take() {
             Some(SelectedAccept::Ready { request, child }) => {
-                queues.selected = Some(SelectedAccept::Processing {
+                self.queues.selected = Some(SelectedAccept::Processing {
                     request: Arc::clone(&request),
                 });
                 ListenerAction::ProcessSelected { request, child }
@@ -809,7 +1027,7 @@ impl ListenerState {
                 route,
                 cancel_started,
             }) if request.is_cancelled() && !cancel_started => {
-                queues.selected = Some(SelectedAccept::Routed {
+                self.queues.selected = Some(SelectedAccept::Routed {
                     request: Arc::clone(&request),
                     route,
                     cancel_started: true,
@@ -817,7 +1035,7 @@ impl ListenerState {
                 ListenerAction::CancelAfterAccept { request, route }
             }
             Some(selected) => {
-                queues.selected = Some(selected);
+                self.queues.selected = Some(selected);
                 ListenerAction::None
             }
             None => ListenerAction::None,
@@ -825,16 +1043,15 @@ impl ListenerState {
     }
 
     pub(in crate::v2::engine) fn route_selected(
-        &self,
+        &mut self,
         request: &Arc<AcceptRequest>,
         route: u64,
     ) -> Result<()> {
-        let mut queues = self.lock_queues();
-        match queues.selected.take() {
+        match self.queues.selected.take() {
             Some(SelectedAccept::Processing { request: current })
                 if Arc::ptr_eq(&current, request) =>
             {
-                queues.selected = Some(SelectedAccept::Routed {
+                self.queues.selected = Some(SelectedAccept::Routed {
                     request: Arc::clone(request),
                     route,
                     cancel_started: false,
@@ -842,7 +1059,7 @@ impl ListenerState {
                 Ok(())
             }
             Some(selected) => {
-                queues.selected = Some(selected);
+                self.queues.selected = Some(selected);
                 Err(Error::InvalidConfig(
                     "listener selected pair changed during setup".into(),
                 ))
@@ -854,11 +1071,10 @@ impl ListenerState {
     }
 
     pub(in crate::v2::engine) fn finish_selected_request(
-        &self,
+        &mut self,
         request: &Arc<AcceptRequest>,
     ) -> bool {
-        let mut queues = self.lock_queues();
-        let matches = match queues.selected.as_ref() {
+        let matches = match self.queues.selected.as_ref() {
             Some(SelectedAccept::Processing { request: current })
             | Some(SelectedAccept::Ready {
                 request: current, ..
@@ -869,97 +1085,148 @@ impl ListenerState {
             None => false,
         };
         if matches {
-            queues.selected = None;
-            select_pair(&mut queues);
+            let selected = self
+                .queues
+                .selected
+                .take()
+                .expect("matching selected request exists");
+            selected.request().release_permit();
+            self.release_child_slot();
+            select_pair(&mut self.queues);
         }
         matches
     }
 
-    pub(in crate::v2::engine) fn finish_selected_route(&self, route: u64) -> bool {
-        let mut queues = self.lock_queues();
+    pub(in crate::v2::engine) fn finish_selected_route(&mut self, route: u64) -> bool {
         let matches = matches!(
-            queues.selected.as_ref(),
+            self.queues.selected.as_ref(),
             Some(SelectedAccept::Routed {
                 route: current, ..
             }) if *current == route
         );
         if matches {
-            queues.selected = None;
-            select_pair(&mut queues);
+            let selected = self
+                .queues
+                .selected
+                .take()
+                .expect("matching selected route exists");
+            selected.request().release_permit();
+            self.release_child_slot();
+            select_pair(&mut self.queues);
         }
         matches
     }
 
-    pub(in crate::v2::engine) fn request_close(self: &Arc<Self>, manager: &SessionManager) {
-        if !self.closing.swap(true, Ordering::AcqRel) {
-            manager.cm.enqueue_listener_work(self);
-            manager.publish_session_work();
+    pub(in crate::v2::engine) fn mark_selected_route_closing(&mut self, route: u64) -> bool {
+        let Some(SelectedAccept::Routed {
+            route: current,
+            cancel_started,
+            ..
+        }) = self.queues.selected.as_mut()
+        else {
+            return false;
+        };
+        if *current != route {
+            return false;
         }
+        let first = !*cancel_started;
+        *cancel_started = true;
+        first
     }
 
-    pub(in crate::v2::engine) fn fail(self: &Arc<Self>, manager: &SessionManager, error: Error) {
-        let mut failure = lock_unpoison(&self.failure);
-        if failure.is_none() {
-            *failure = Some(error);
+    pub(in crate::v2::engine) fn release_unpaired_child_slot(&mut self) {
+        self.release_child_slot();
+    }
+
+    fn release_child_slot(&mut self) {
+        debug_assert!(self.child_slots_used > 0);
+        self.child_slots_used = self.child_slots_used.saturating_sub(1);
+    }
+
+    pub(in crate::v2::engine) fn request_close(&mut self) -> bool {
+        if self.closing {
+            return false;
         }
-        drop(failure);
-        self.request_close(manager);
+        self.closing = true;
+        self.admission.close();
+        true
+    }
+
+    pub(in crate::v2::engine) fn close_accept_admission(&self, error: Error) {
+        self.admission.close_with_error(error);
+    }
+
+    pub(in crate::v2::engine) fn fail(&mut self, error: Error) -> bool {
+        if self.failure.is_none() {
+            self.failure = Some(error.clone());
+        }
+        self.admission.close_with_error(error);
+        self.request_close()
     }
 
     pub(in crate::v2::engine) fn close_error(&self) -> Error {
-        lock_unpoison(&self.failure)
-            .clone()
-            .unwrap_or(Error::TransportClosed)
+        self.failure.clone().unwrap_or(Error::TransportClosed)
     }
 
     pub(in crate::v2::engine) fn is_closing(&self) -> bool {
-        self.closing.load(Ordering::Acquire)
+        self.closing || !self.admission.is_open()
     }
 
-    pub(in crate::v2::engine) fn begin_work(&self) {
-        self.work_enqueued.store(false, Ordering::Release);
+    pub(in crate::v2::engine) fn begin_work(&mut self) {
+        self.work_enqueued = false;
     }
 
-    pub(in crate::v2::engine) fn try_enqueue_work(&self) -> bool {
-        !self.work_enqueued.swap(true, Ordering::AcqRel)
+    pub(in crate::v2::engine) fn try_enqueue_work(&mut self) -> bool {
+        if self.work_enqueued {
+            false
+        } else {
+            self.work_enqueued = true;
+            true
+        }
     }
 
     pub(in crate::v2::engine) fn has_work(&self) -> bool {
-        let queues = self.lock_queues();
-        if self.closing.load(Ordering::Acquire) {
-            return !queues.waiters.is_empty()
-                || !queues.children.is_empty()
-                || matches!(queues.selected, Some(SelectedAccept::Ready { .. }))
+        if self.is_closing() {
+            return !self.queues.waiters.is_empty()
+                || !self.queues.children.is_empty()
+                || matches!(self.queues.selected, Some(SelectedAccept::Ready { .. }))
                 || matches!(
-                    queues.selected,
+                    self.queues.selected,
                     Some(SelectedAccept::Routed {
                         cancel_started: false,
                         ..
                     })
                 )
-                || (queues.selected.is_none()
-                    && !self.finalization_started.load(Ordering::Acquire));
+                || (self.queues.selected.is_none() && !self.finalization_started);
         }
-        queues
+        self.queues
             .waiters
             .front()
             .is_some_and(|request| request.is_cancelled())
-            || matches!(queues.selected, Some(SelectedAccept::Ready { .. }))
+            || matches!(self.queues.selected, Some(SelectedAccept::Ready { .. }))
             || matches!(
-                queues.selected,
+                self.queues.selected,
                 Some(SelectedAccept::Routed {
                     ref request,
                     cancel_started: false,
                     ..
-                }) if request.is_cancelled()
+                }) if request.is_cancelled() || request.is_delivered()
             )
-            || (queues.selected.is_none()
-                && !queues.waiters.is_empty()
-                && !queues.children.is_empty())
+            || (self.queues.selected.is_none()
+                && !self.queues.waiters.is_empty()
+                && !self.queues.children.is_empty())
     }
 
-    pub(in crate::v2::engine) fn take_cm_id(&self) -> Option<SharedCmId> {
-        lock_unpoison(&self.cm_id).take()
+    pub(in crate::v2::engine) fn take_cm_id(&mut self) -> Option<SharedCmId> {
+        self.cm_id.take()
+    }
+
+    pub(in crate::v2::engine) fn mark_cm_destruction_pending(&mut self) {
+        self.cm_destruction_pending = true;
+    }
+
+    pub(in crate::v2::engine) fn cm_destruction_pending(&self) -> bool {
+        self.cm_destruction_pending
     }
 
     pub(in crate::v2::engine) fn finish_close_into(
@@ -967,81 +1234,234 @@ impl ListenerState {
         error: Option<Error>,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) {
-        let failure = error.or_else(|| lock_unpoison(&self.failure).clone());
-        self.close.store_if_empty(match failure {
+        let failure = error.or_else(|| self.failure.clone());
+        let _ = self.close.store_if_empty(match failure {
             Some(error) => MemoizedTerminalResult::from_error(error),
             None => MemoizedTerminalResult::success(),
         });
         self.close.notify_waiters_into(actions);
     }
 
-    /// Publish terminal listener results within the caller's remaining action
-    /// budget. Unprocessed waiters stay on this authoritative listener record.
-    pub(in crate::v2::engine) fn terminalize_into(
-        &self,
+    pub(in crate::v2::engine) fn terminalize_waiters_into(
+        &mut self,
         outcome: &MemoizedTerminalResult,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
-    ) -> bool {
-        self.closing.store(true, Ordering::Release);
-        self.close.store_if_empty(outcome.clone());
-        let mut units = 0;
-        loop {
-            if units == 32 {
-                return false;
-            }
-            let unit = {
-                let mut queues = self.lock_queues();
-                if actions.can_accept(1) {
-                    if let Some(request) = queues.waiters.pop_front() {
-                        Some(TerminalListenerUnit::Request(request, false))
-                    } else if let Some(selected) = queues.selected.take() {
-                        Some(match selected {
-                            SelectedAccept::Ready { request, .. }
-                            | SelectedAccept::Processing { request } => {
-                                TerminalListenerUnit::Request(request, false)
-                            }
-                            SelectedAccept::Routed { request, .. } => {
-                                TerminalListenerUnit::Request(request, true)
-                            }
-                        })
-                    } else if queues.children.pop_front().is_some() {
-                        Some(TerminalListenerUnit::Child)
-                    } else {
-                        None
-                    }
-                } else if queues.children.pop_front().is_some() {
-                    Some(TerminalListenerUnit::Child)
+        budget: usize,
+    ) -> usize {
+        let error = outcome
+            .clone()
+            .into_result()
+            .expect_err("terminal listener outcome must be an error");
+        self.admission.close_with_error(error.clone());
+        self.request_close();
+        if self.close.store_if_empty(outcome.clone()) {
+            self.close.notify_waiters_into(actions);
+        }
+        let mut processed = 0;
+        while processed < budget && actions.can_accept(1) {
+            let Some(request) = self.queues.waiters.pop_front() else {
+                break;
+            };
+            request.release_permit();
+            request.complete_into(Err(error.clone()), actions);
+            processed += 1;
+        }
+        if processed < budget
+            && actions.can_accept(1)
+            && let Some(selected) = self.queues.selected.as_ref()
+        {
+            let request = Arc::clone(selected.request());
+            if request.release_permit() {
+                if matches!(selected, SelectedAccept::Routed { .. }) {
+                    let _ = request.fail_undelivered_into(error, actions);
                 } else {
-                    None
+                    request.complete_into(Err(error), actions);
                 }
-            };
-            let Some(unit) = unit else {
-                if !actions.can_accept(1) {
-                    return false;
-                }
-                self.close.notify_waiters_into(actions);
-                return true;
-            };
-            units += 1;
-            match unit {
-                TerminalListenerUnit::Child => continue,
-                TerminalListenerUnit::Request(request, routed) => {
-                    let error = outcome
-                        .clone()
-                        .into_result()
-                        .expect_err("terminal listener outcome must be an error");
-                    if routed {
-                        let _ = request.fail_undelivered_into(error, actions);
-                    } else {
-                        request.complete_into(Err(error), actions);
-                    }
-                }
+                processed += 1;
             }
         }
+        processed
     }
 
     pub(in crate::v2::engine) fn close_state(&self) -> Arc<SessionListenerCloseState> {
         Arc::clone(&self.close)
+    }
+
+    pub(in crate::v2::engine) fn has_waiters(&self) -> bool {
+        !self.queues.waiters.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn child_slots_used(&self) -> usize {
+        self.child_slots_used
+    }
+
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn selected_is_some(&self) -> bool {
+        self.queues.selected.is_some()
+    }
+}
+
+pub(in crate::v2::engine) struct ListenerRegistry {
+    entries: PagedRegistry<ListenerToken, ListenerEntry>,
+    raw_ids: HashMap<usize, ListenerToken>,
+}
+
+impl ListenerRegistry {
+    pub(in crate::v2::engine) fn new(capacity: usize) -> Result<Self> {
+        Ok(Self {
+            entries: PagedRegistry::new(capacity)?,
+            raw_ids: HashMap::new(),
+        })
+    }
+
+    pub(in crate::v2::engine) fn reserve(
+        &mut self,
+        address: SocketAddr,
+        config: RdmaListenerConfig,
+    ) -> Result<ListenerToken> {
+        self.entries
+            .allocate_owned(|token| ListenerEntry::creating(token, address, config))
+    }
+
+    pub(in crate::v2::engine) fn activate(
+        &mut self,
+        token: ListenerToken,
+        local_addr: SocketAddr,
+        cm_id: SharedCmId,
+        raw_id: usize,
+        context_key: usize,
+    ) -> std::result::Result<(), SharedCmId> {
+        if self.raw_ids.contains_key(&raw_id) {
+            return Err(cm_id);
+        }
+        let Some(entry) = self.entries.get_mut(token) else {
+            return Err(cm_id);
+        };
+        if entry.cm_id.is_some() || entry.raw_id != 0 || entry.context_key != 0 {
+            return Err(cm_id);
+        }
+        entry.activate(local_addr, cm_id, raw_id, context_key);
+        self.raw_ids.insert(raw_id, token);
+        Ok(())
+    }
+
+    pub(in crate::v2::engine) fn lookup(&self, token: ListenerToken) -> Lookup<&ListenerEntry> {
+        self.entries.lookup_ref(token)
+    }
+
+    pub(in crate::v2::engine) fn get(&self, token: ListenerToken) -> Option<&ListenerEntry> {
+        match self.lookup(token) {
+            Lookup::Occupied(entry) => Some(entry),
+            Lookup::Duplicate | Lookup::Stale | Lookup::Unknown | Lookup::Retired => None,
+        }
+    }
+
+    pub(in crate::v2::engine) fn get_mut(
+        &mut self,
+        token: ListenerToken,
+    ) -> Option<&mut ListenerEntry> {
+        self.entries.get_mut(token)
+    }
+
+    pub(in crate::v2::engine) fn token_for_raw(&self, raw_id: usize) -> Option<ListenerToken> {
+        self.raw_ids.get(&raw_id).copied()
+    }
+
+    pub(in crate::v2::engine) fn remove_identity(
+        &mut self,
+        token: ListenerToken,
+        raw_id: usize,
+    ) -> bool {
+        if self.raw_ids.get(&raw_id) != Some(&token) {
+            return false;
+        }
+        self.raw_ids.remove(&raw_id);
+        true
+    }
+
+    pub(in crate::v2::engine) fn release(
+        &mut self,
+        token: ListenerToken,
+        completed: bool,
+    ) -> Option<ListenerEntry> {
+        let raw_id = self.entries.get_mut(token).map_or(0, |entry| entry.raw_id);
+        if raw_id != 0 {
+            self.remove_identity(token, raw_id);
+        }
+        let entry = self.entries.release(token, completed)?;
+        entry.admission.close();
+        Some(entry)
+    }
+
+    pub(in crate::v2::engine) fn live(&self) -> usize {
+        self.entries.live()
+    }
+
+    pub(in crate::v2::engine) fn has_capacity(&self) -> bool {
+        self.entries.has_capacity()
+    }
+
+    pub(in crate::v2::engine) fn occupied(&self) -> Vec<ListenerToken> {
+        self.entries.occupied_tokens()
+    }
+
+    pub(in crate::v2::engine) fn provider_owner_count(&self) -> usize {
+        self.occupied()
+            .into_iter()
+            .filter(|token| self.get(*token).is_some_and(|entry| entry.cm_id.is_some()))
+            .count()
+    }
+
+    pub(in crate::v2::engine) fn scan_occupied(
+        &self,
+        start: usize,
+        budget: usize,
+    ) -> (Vec<ListenerToken>, usize, bool, usize) {
+        self.entries.scan_occupied_tokens(start, budget)
+    }
+
+    #[cfg(test)]
+    fn force_generation_for_test(
+        &mut self,
+        token: ListenerToken,
+        generation: u32,
+    ) -> ListenerToken {
+        self.entries.force_generation_for_test(token, generation)
+    }
+
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn activate_identity_for_test(
+        &mut self,
+        token: ListenerToken,
+        local_addr: SocketAddr,
+        raw_id: usize,
+        context_key: usize,
+    ) -> bool {
+        if self.raw_ids.contains_key(&raw_id) {
+            return false;
+        }
+        let Some(entry) = self.entries.get_mut(token) else {
+            return false;
+        };
+        if entry.cm_id.is_some() || entry.raw_id != 0 || entry.context_key != 0 {
+            return false;
+        }
+        entry.local_addr = Some(local_addr);
+        entry.raw_id = raw_id;
+        entry.context_key = context_key;
+        self.raw_ids.insert(raw_id, token);
+        true
+    }
+
+    #[cfg(test)]
+    fn retired(&self) -> usize {
+        self.entries.retired()
+    }
+
+    #[cfg(test)]
+    fn free(&self) -> usize {
+        self.entries.free()
     }
 }
 
@@ -1070,11 +1490,6 @@ struct ListenerQueues {
     selected: Option<SelectedAccept>,
 }
 
-enum TerminalListenerUnit {
-    Request(Arc<AcceptRequest>, bool),
-    Child,
-}
-
 enum SelectedAccept {
     Ready {
         request: Arc<AcceptRequest>,
@@ -1088,6 +1503,16 @@ enum SelectedAccept {
         route: u64,
         cancel_started: bool,
     },
+}
+
+impl SelectedAccept {
+    fn request(&self) -> &Arc<AcceptRequest> {
+        match self {
+            Self::Ready { request, .. }
+            | Self::Processing { request }
+            | Self::Routed { request, .. } => request,
+        }
+    }
 }
 
 pub(in crate::v2::engine) struct ChildAdmission {
@@ -1108,6 +1533,10 @@ pub(in crate::v2::engine) enum ListenerAction {
         reason: Error,
     },
     CancelAfterAccept {
+        request: Arc<AcceptRequest>,
+        route: u64,
+    },
+    AcknowledgeDelivery {
         request: Arc<AcceptRequest>,
         route: u64,
     },
@@ -1142,12 +1571,12 @@ mod tests {
 
     #[test]
     fn terminal_listener_overflow_stays_on_authoritative_waiter_queue() {
-        let listener = ListenerState::test_only(64);
+        let mut listener = ListenerEntry::test_only(64);
         let wakes = Arc::new(CountWake(AtomicUsize::new(0)));
         let waker = Waker::from(Arc::clone(&wakes));
         let requests = (0..40)
             .map(|_| {
-                let request = AcceptRequest::test_only();
+                let request = request(&listener);
                 request.observer.waker.register(&waker);
                 listener.register_waiter(Arc::clone(&request)).unwrap();
                 request
@@ -1156,7 +1585,10 @@ mod tests {
         let outcome = MemoizedTerminalResult::from_error(Error::DriverShutdown);
 
         let mut first = crate::v2::engine::reactor::ReactorActions::default();
-        assert!(!listener.terminalize_into(&outcome, &mut first));
+        assert_eq!(
+            listener.terminalize_waiters_into(&outcome, &mut first, 32),
+            crate::v2::engine::reactor::REACTOR_ACTION_BUDGET - 1
+        );
         assert_eq!(
             first.len(),
             crate::v2::engine::reactor::REACTOR_ACTION_BUDGET
@@ -1170,13 +1602,19 @@ mod tests {
                     TakeOnceResult::Ready(Err(Error::DriverShutdown))
                 ))
                 .count(),
-            32
+            crate::v2::engine::reactor::REACTOR_ACTION_BUDGET - 1
         );
         first.publish();
-        assert_eq!(wakes.0.load(Ordering::Acquire), 32);
+        assert_eq!(
+            wakes.0.load(Ordering::Acquire),
+            crate::v2::engine::reactor::REACTOR_ACTION_BUDGET - 1
+        );
 
         let mut second = crate::v2::engine::reactor::ReactorActions::default();
-        assert!(listener.terminalize_into(&outcome, &mut second));
+        assert_eq!(
+            listener.terminalize_waiters_into(&outcome, &mut second, 32),
+            9
+        );
         assert_eq!(second.len(), 9);
         second.publish();
         assert_eq!(wakes.0.load(Ordering::Acquire), 40);
@@ -1184,8 +1622,8 @@ mod tests {
 
     #[test]
     fn accept_failure_mutates_authoritative_queue_before_detached_wake() {
-        let listener = ListenerState::test_only(4);
-        let request = AcceptRequest::test_only();
+        let mut listener = ListenerEntry::test_only(4);
+        let request = request(&listener);
         let wakes = Arc::new(CountWake(AtomicUsize::new(0)));
         request
             .observer
@@ -1203,7 +1641,7 @@ mod tests {
             panic!("authoritative listener queue did not select the cancelled request")
         };
         assert!(Arc::ptr_eq(&selected, &request));
-        assert!(listener.lock_queues().waiters.is_empty());
+        assert!(listener.queues.waiters.is_empty());
 
         let mut actions = crate::v2::engine::reactor::ReactorActions::default();
         selected.complete_into(Err(Error::DriverShutdown), &mut actions);
@@ -1223,7 +1661,7 @@ mod tests {
         let connection = engine
             .shared
             .test_driver
-            .install_idle_connections(&engine.shared, &mut driver.reactor.session.connections, 1)
+            .install_idle_connections(&mut driver.reactor.session, 1)
             .unwrap()
             .pop()
             .unwrap();
@@ -1241,7 +1679,7 @@ mod tests {
         ));
         assert_eq!(accept_wakes.0.load(Ordering::Acquire), 0);
 
-        let listener = ListenerState::test_only(1);
+        let listener = ListenerEntry::test_only(1);
         let close = listener.close_state();
         let before_close = actions.len();
         listener.finish_close_into(None, &mut actions);
@@ -1251,6 +1689,73 @@ mod tests {
         actions.publish();
         assert_eq!(accept_wakes.0.load(Ordering::Acquire), 1);
         drop(request.take_result_for_test());
+        drop(driver);
+    }
+
+    #[test]
+    fn cancellation_winning_success_publication_retains_the_selected_connection() {
+        let (engine, mut driver) =
+            super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
+        let connection = engine
+            .shared
+            .test_driver
+            .install_idle_connections(&mut driver.reactor.session, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let request = AcceptRequest::test_only();
+        request.cancel();
+
+        let mut actions = crate::v2::engine::reactor::ReactorActions::default();
+        request.complete_success_into(connection, &mut actions);
+        assert!(request.has_undelivered_success_for_test());
+        assert_eq!(actions.len(), 0);
+
+        let failure = request.claim_undelivered_failure_into(Error::DriverShutdown, &mut actions);
+        assert!(!failure.delivered());
+        assert!(failure.into_connection().is_some());
+        assert!(matches!(
+            request.take_result_for_test(),
+            Some(Err(Error::DriverShutdown))
+        ));
+        actions.publish();
+        drop(driver);
+    }
+
+    #[test]
+    fn cancellation_after_success_wake_retains_the_selected_connection() {
+        let (engine, mut driver) =
+            super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
+        let connection = engine
+            .shared
+            .test_driver
+            .install_idle_connections(&mut driver.reactor.session, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let request = AcceptRequest::test_only();
+        let wakes = Arc::new(CountWake(AtomicUsize::new(0)));
+        request
+            .observer
+            .waker
+            .register(&Waker::from(Arc::clone(&wakes)));
+
+        let mut published = crate::v2::engine::reactor::ReactorActions::default();
+        request.complete_success_into(connection, &mut published);
+        published.publish();
+        assert_eq!(wakes.0.load(Ordering::Acquire), 1);
+
+        request.cancel();
+        assert!(request.has_undelivered_success_for_test());
+        let mut cancelled = crate::v2::engine::reactor::ReactorActions::default();
+        let failure = request.claim_undelivered_failure_into(Error::DriverShutdown, &mut cancelled);
+        assert!(!failure.delivered());
+        assert!(failure.into_connection().is_some());
+        assert!(matches!(
+            request.take_result_for_test(),
+            Some(Err(Error::DriverShutdown))
+        ));
+        cancelled.publish();
         drop(driver);
     }
 
@@ -1309,28 +1814,23 @@ mod tests {
             engine.shared.config.max_live_connections
         );
 
-        let listener = ListenerState::test_only(4);
-        let baseline_listener_owners = Arc::strong_count(&listener);
+        let listener = ListenerEntry::test_only(4);
+        let listener_admission = listener.admission();
         let mut accept_future = Box::pin(accept_with_setup(
             Arc::clone(&engine.shared.session),
-            Arc::clone(&listener),
+            Arc::clone(&engine.shared.commands),
+            listener.token,
+            Arc::clone(&listener_admission),
             RdmaConnectionConfig::default(),
             empty_connection_setup(),
         ));
         assert!(accept_future.as_mut().poll(&mut context).is_pending());
         assert_eq!(Arc::strong_count(&engine.shared), baseline_engine_owners);
-        assert_eq!(
-            Arc::strong_count(&listener),
-            baseline_listener_owners + 1,
-            "only SessionManager's published listener-work queue may add a ListenerState retain"
-        );
-        let queues = lock_unpoison(&listener.queues);
-        assert_eq!(queues.waiters.len(), 1);
-        assert_eq!(
-            Arc::strong_count(&queues.waiters[0]),
-            1,
-            "only SessionManager listener queues may strongly retain the accept record"
-        );
+        assert_eq!(engine.shared.commands.pending_accepts(), 1);
+        assert_eq!(listener_admission.available_permits(), 3);
+        drop(accept_future);
+        assert_eq!(engine.shared.commands.pending_accepts(), 0);
+        assert_eq!(listener_admission.available_permits(), 4);
     }
 
     #[test]
@@ -1364,7 +1864,7 @@ mod tests {
         );
         assert_eq!(engine.shared.commands.pending_listens(), 1);
         assert_eq!(
-            engine.shared.session.cm.pending_listen_addresses(),
+            driver.reactor.session.cm.pending_listen_addresses(),
             vec![first_address]
         );
         engine.shared.commands.service_turn(
@@ -1373,16 +1873,13 @@ mod tests {
             &mut driver.reactor.session,
         );
         assert_eq!(
-            engine.shared.session.cm.pending_listen_addresses(),
+            driver.reactor.session.cm.pending_listen_addresses(),
             vec![first_address, second_address]
         );
     }
 
-    fn request() -> Arc<AcceptRequest> {
-        Arc::new(AcceptRequest::new(AcceptIntent::new(
-            RdmaConnectionConfig::default(),
-            empty_connection_setup(),
-        )))
+    fn request(listener: &ListenerEntry) -> Arc<AcceptRequest> {
+        listener.test_accept_request()
     }
 
     #[test]
@@ -1410,21 +1907,43 @@ mod tests {
 
     #[test]
     fn waiter_registration_reports_the_listener_failure_context() {
-        let listener = ListenerState::test_only(1);
-        *lock_unpoison(&listener.failure) =
-            Some(Error::InvalidConfig("listener CM close failed".into()));
-        listener.closing.store(true, Ordering::Release);
+        let mut listener = ListenerEntry::test_only(1);
+        let request = request(&listener);
+        listener.fail(Error::InvalidConfig("listener CM close failed".into()));
 
-        let error = listener.register_waiter(request()).unwrap_err();
+        let error = listener.register_waiter(request).unwrap_err();
         assert!(matches!(error, Error::InvalidConfig(_)));
         assert!(error.to_string().contains("listener CM close failed"));
+        assert!(
+            listener
+                .admission()
+                .close_error()
+                .to_string()
+                .contains("listener CM close failed")
+        );
+    }
+
+    #[test]
+    fn terminalization_publishes_accept_admission_error_before_close() {
+        let mut listener = ListenerEntry::test_only(1);
+        let outcome = MemoizedTerminalResult::from_error(Error::DriverShutdown);
+        let mut actions = crate::v2::engine::reactor::ReactorActions::default();
+
+        assert_eq!(
+            listener.terminalize_waiters_into(&outcome, &mut actions, 0),
+            0
+        );
+        assert!(matches!(
+            listener.admission().close_error(),
+            Error::DriverShutdown
+        ));
     }
 
     #[test]
     fn waiter_registration_and_child_arrival_order_are_exact() {
-        let listener = ListenerState::test_only(2);
-        let first = request();
-        let second = request();
+        let mut listener = ListenerEntry::test_only(2);
+        let first = request(&listener);
+        let second = request(&listener);
         listener.register_waiter(Arc::clone(&first)).unwrap();
         listener.register_waiter(Arc::clone(&second)).unwrap();
 
@@ -1459,10 +1978,8 @@ mod tests {
 
     #[test]
     fn delivered_accept_defensively_releases_selection_after_route_retirement() {
-        let (engine, driver) =
-            super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
-        let listener = ListenerState::test_only(1);
-        let request = request();
+        let mut listener = ListenerEntry::test_only(1);
+        let request = request(&listener);
         listener.register_waiter(Arc::clone(&request)).unwrap();
         assert!(
             listener
@@ -1476,24 +1993,122 @@ mod tests {
         ));
         request.set_route_token(42);
         listener.route_selected(&request, 42).unwrap();
-        assert!(lock_unpoison(&listener.queues).selected.is_some());
+        assert!(listener.queues.selected.is_some());
+        request.observer.delivered.store(true, Ordering::Release);
+        assert!(matches!(
+            listener.next_action(),
+            ListenerAction::AcknowledgeDelivery { route: 42, .. }
+        ));
+        assert!(listener.finish_selected_route(42));
+        assert!(listener.queues.selected.is_none());
+        assert!(!request.owns_permit());
+    }
 
-        engine
-            .shared
-            .session
-            .cm
-            .mark_accept_delivered(&listener, &request);
-        assert!(lock_unpoison(&listener.queues).selected.is_none());
+    #[test]
+    fn delivered_accept_wins_over_late_waiter_cancellation() {
+        let mut listener = ListenerEntry::test_only(1);
+        let request = request(&listener);
+        listener.register_waiter(Arc::clone(&request)).unwrap();
+        assert!(
+            listener
+                .admit_child(IncomingChild::test_only())
+                .rejected
+                .is_none()
+        );
+        assert!(matches!(
+            listener.next_action(),
+            ListenerAction::ProcessSelected { .. }
+        ));
+        request.set_route_token(43);
+        listener.route_selected(&request, 43).unwrap();
+        request.observer.delivered.store(true, Ordering::Release);
+        request.cancel();
 
-        drop(engine);
-        drop(driver);
+        assert!(matches!(
+            listener.next_action(),
+            ListenerAction::AcknowledgeDelivery { route: 43, .. }
+        ));
+        assert!(listener.selected_is_some());
+        assert_eq!(listener.child_slots_used(), 1);
+        assert_eq!(listener.admission.available_permits(), 0);
+        assert!(request.owns_permit());
+
+        assert!(listener.finish_selected_route(43));
+        assert!(!listener.selected_is_some());
+        assert_eq!(listener.child_slots_used(), 0);
+        assert_eq!(listener.admission.available_permits(), 1);
+        assert!(!request.owns_permit());
+    }
+
+    #[test]
+    fn delivered_accept_wins_over_late_listener_close() {
+        let mut listener = ListenerEntry::test_only(1);
+        let request = request(&listener);
+        listener.register_waiter(Arc::clone(&request)).unwrap();
+        assert!(
+            listener
+                .admit_child(IncomingChild::test_only())
+                .rejected
+                .is_none()
+        );
+        assert!(matches!(
+            listener.next_action(),
+            ListenerAction::ProcessSelected { .. }
+        ));
+        request.set_route_token(44);
+        listener.route_selected(&request, 44).unwrap();
+        request.observer.delivered.store(true, Ordering::Release);
+        listener.admission.close();
+
+        assert!(matches!(
+            listener.next_action(),
+            ListenerAction::AcknowledgeDelivery { route: 44, .. }
+        ));
+        assert!(listener.selected_is_some());
+        assert_eq!(listener.child_slots_used(), 1);
+        assert!(request.owns_permit());
+        assert!(listener.finish_selected_route(44));
+        assert!(!listener.selected_is_some());
+        assert_eq!(listener.child_slots_used(), 0);
+        assert!(!request.owns_permit());
+    }
+
+    #[test]
+    fn armed_route_close_suppresses_delivered_listener_requeue() {
+        let mut listener = ListenerEntry::test_only(1);
+        let request = request(&listener);
+        listener.register_waiter(Arc::clone(&request)).unwrap();
+        assert!(
+            listener
+                .admit_child(IncomingChild::test_only())
+                .rejected
+                .is_none()
+        );
+        assert!(matches!(
+            listener.next_action(),
+            ListenerAction::ProcessSelected { .. }
+        ));
+        request.set_route_token(45);
+        listener.route_selected(&request, 45).unwrap();
+        request.observer.delivered.store(true, Ordering::Release);
+        assert!(listener.has_work());
+
+        assert!(listener.mark_selected_route_closing(45));
+        assert!(!listener.has_work());
+        assert!(listener.selected_is_some());
+        assert_eq!(listener.child_slots_used(), 1);
+        assert!(request.owns_permit());
+        assert!(listener.finish_selected_route(45));
+        assert!(!listener.selected_is_some());
+        assert_eq!(listener.child_slots_used(), 0);
+        assert!(!request.owns_permit());
     }
 
     #[test]
     fn cancellation_before_selection_removes_only_that_waiter() {
-        let listener = ListenerState::test_only(2);
-        let cancelled = request();
-        let survivor = request();
+        let mut listener = ListenerEntry::test_only(2);
+        let cancelled = request(&listener);
+        let survivor = request(&listener);
         listener.register_waiter(Arc::clone(&cancelled)).unwrap();
         listener.register_waiter(Arc::clone(&survivor)).unwrap();
         cancelled.cancel();
@@ -1520,9 +2135,9 @@ mod tests {
 
     #[test]
     fn userspace_backlog_and_listener_state_are_independent() {
-        let first = ListenerState::test_only(2);
-        let second = ListenerState::test_only(2);
-        for listener in [&first, &second] {
+        let mut first = ListenerEntry::test_only(2);
+        let mut second = ListenerEntry::test_only(2);
+        for listener in [&mut first, &mut second] {
             assert!(
                 listener
                     .admit_child(IncomingChild::test_only())
@@ -1541,7 +2156,7 @@ mod tests {
                 Some((_, InboundRejectReason::BacklogFull))
             ));
         }
-        let first_waiter = request();
+        let first_waiter = request(&first);
         first.register_waiter(Arc::clone(&first_waiter)).unwrap();
         assert!(matches!(
             first.next_action(),
@@ -1555,9 +2170,9 @@ mod tests {
 
     #[test]
     fn cancellation_after_accept_blocks_later_selection_until_close_disposition() {
-        let listener = ListenerState::test_only(2);
-        let first = request();
-        let second = request();
+        let mut listener = ListenerEntry::test_only(2);
+        let first = request(&listener);
+        let second = request(&listener);
         listener.register_waiter(Arc::clone(&first)).unwrap();
         listener.register_waiter(Arc::clone(&second)).unwrap();
         assert!(
@@ -1596,9 +2211,9 @@ mod tests {
 
     #[test]
     fn close_actions_dispose_each_queue_owner_once_before_finalization() {
-        let listener = ListenerState::test_only(2);
-        let selected = request();
-        let pending = request();
+        let mut listener = ListenerEntry::test_only(2);
+        let selected = request(&listener);
+        let pending = request(&listener);
         listener.register_waiter(Arc::clone(&selected)).unwrap();
         listener.register_waiter(Arc::clone(&pending)).unwrap();
         assert!(
@@ -1613,7 +2228,7 @@ mod tests {
                 .rejected
                 .is_none()
         );
-        listener.closing.store(true, Ordering::Release);
+        listener.request_close();
 
         match listener.next_action() {
             ListenerAction::FailUnselected(request) => {
@@ -1625,6 +2240,7 @@ mod tests {
             listener.next_action(),
             ListenerAction::RejectChild(_, InboundRejectReason::ListenerClosed)
         ));
+        listener.release_unpaired_child_slot();
         match listener.next_action() {
             ListenerAction::RejectSelected { request, .. } => {
                 assert!(Arc::ptr_eq(&request, &selected));
@@ -1637,5 +2253,282 @@ mod tests {
             ListenerAction::FinalizeClose
         ));
         assert!(matches!(listener.next_action(), ListenerAction::None));
+        assert_eq!(listener.child_slots_used(), 0);
+        assert_eq!(listener.admission.available_permits(), 2);
+    }
+
+    #[test]
+    fn listener_registry_capacity_generation_and_retirement_are_exact() {
+        let address = "127.0.0.1:1".parse().unwrap();
+        let config = RdmaListenerConfig::default().backlog(1);
+        let mut registry = ListenerRegistry::new(2).unwrap();
+        let first = registry.reserve(address, config.clone()).unwrap();
+        assert_eq!(ListenerToken::decode(first.encode()), first);
+        let second = registry.reserve(address, config.clone()).unwrap();
+        assert_eq!(registry.live(), 2);
+        assert!(!registry.has_capacity());
+        assert!(matches!(
+            registry.reserve(address, config.clone()),
+            Err(Error::CapacityExhausted)
+        ));
+
+        registry.release(first, false).unwrap();
+        let reused = registry.reserve(address, config.clone()).unwrap();
+        assert_eq!(reused.slot, first.slot);
+        assert_eq!(reused.generation, first.generation + 1);
+        assert!(matches!(registry.lookup(first), Lookup::Stale));
+
+        let exhausted = registry.force_generation_for_test(reused, u32::MAX);
+        registry.release(exhausted, true).unwrap();
+        assert_eq!(registry.retired(), 1);
+        assert!(matches!(registry.lookup(exhausted), Lookup::Duplicate));
+        registry.release(second, true).unwrap();
+        assert_eq!(registry.free(), 1);
+        let remaining = registry.reserve(address, config).unwrap();
+        assert_ne!(remaining.slot, exhausted.slot);
+    }
+
+    #[test]
+    fn listener_registry_rejects_stale_token_and_raw_identity() {
+        let address = "127.0.0.1:1".parse().unwrap();
+        let config = RdmaListenerConfig::default().backlog(1);
+        let mut registry = ListenerRegistry::new(1).unwrap();
+        let first = registry.reserve(address, config.clone()).unwrap();
+        assert!(registry.activate_identity_for_test(first, address, 41, 51));
+        assert_eq!(registry.token_for_raw(41), Some(first));
+        registry.release(first, false).unwrap();
+        assert_eq!(registry.token_for_raw(41), None);
+
+        let second = registry.reserve(address, config).unwrap();
+        assert_ne!(first, second);
+        assert!(matches!(registry.lookup(first), Lookup::Stale));
+        assert!(matches!(registry.lookup(second), Lookup::Occupied(_)));
+    }
+
+    #[test]
+    fn terminal_stale_listener_drop_cannot_consume_reused_slot_control_capacity() {
+        let (engine, mut driver) = super::super::super::test_engine_pair_with_capacity(
+            super::super::super::CompletionMode::Polling,
+            1,
+        );
+        let (stale, stale_token) = driver
+            .reactor
+            .session
+            .cm
+            .test_listener(&driver.reactor.session.manager, 1);
+        let stale_close = stale.session.close.clone();
+        stale_close.store_if_empty(MemoizedTerminalResult::success());
+        driver.reactor.session.cm.release_test_listener(stale_token);
+
+        let (live, live_token) = driver
+            .reactor
+            .session
+            .cm
+            .test_listener(&driver.reactor.session.manager, 1);
+        assert_ne!(stale_token, live_token);
+        drop(stale);
+        assert_eq!(engine.shared.commands.pending_listener_closes(), 0);
+
+        drop(live);
+        assert_eq!(engine.shared.commands.pending_listener_closes(), 1);
+    }
+
+    #[tokio::test]
+    async fn accept_permits_are_fifo_and_do_not_barge() {
+        let listener = ListenerEntry::test_only(1);
+        let admission = listener.admission();
+        let held = admission.acquire().await.unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let first = {
+            let admission = Arc::clone(&admission);
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let permit = admission.acquire().await.unwrap();
+                tx.send(1).unwrap();
+                permit
+            })
+        };
+        tokio::task::yield_now().await;
+        let second = {
+            let admission = Arc::clone(&admission);
+            tokio::spawn(async move {
+                let permit = admission.acquire().await.unwrap();
+                tx.send(2).unwrap();
+                permit
+            })
+        };
+        drop(held);
+        assert_eq!(rx.recv().await, Some(1));
+        drop(first.await.unwrap());
+        assert_eq!(rx.recv().await, Some(2));
+        drop(second.await.unwrap());
+        assert_eq!(admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_accept_head_is_removed_and_release_wakes_next() {
+        let listener = ListenerEntry::test_only(1);
+        let admission = listener.admission();
+        let held = admission.acquire().await.unwrap();
+        let first = {
+            let admission = Arc::clone(&admission);
+            tokio::spawn(async move { admission.acquire().await })
+        };
+        tokio::task::yield_now().await;
+        let second = {
+            let admission = Arc::clone(&admission);
+            tokio::spawn(async move { admission.acquire().await })
+        };
+        tokio::task::yield_now().await;
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        drop(held);
+        let permit = second.await.unwrap().expect("next waiter is woken");
+        assert_eq!(admission.available_permits(), 0);
+        drop(permit);
+        assert_eq!(admission.available_permits(), 1);
+    }
+
+    #[test]
+    fn accept_wake_rechecks_listener_close_before_command_registration() {
+        let (engine, _driver) =
+            super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
+        let listener = ListenerEntry::test_only(1);
+        let admission = listener.admission();
+        let held = Arc::clone(&admission.permits).try_acquire_owned().unwrap();
+        let mut accept = Box::pin(accept_with_setup(
+            Arc::clone(&engine.shared.session),
+            Arc::clone(&engine.shared.commands),
+            listener.token,
+            Arc::clone(&admission),
+            RdmaConnectionConfig::default(),
+            empty_connection_setup(),
+        ));
+        let waker = futures_util::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(accept.as_mut().poll(&mut cx).is_pending());
+
+        let barrier =
+            super::super::super::registry::write_unpoison(&engine.shared.session.admission);
+        admission.close_with_error(Error::InvalidConfig(
+            "listener closed during accept wake".into(),
+        ));
+        drop(barrier);
+        drop(held);
+
+        assert!(matches!(
+            accept.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::InvalidConfig(message)))
+                if message.contains("listener closed during accept wake")
+        ));
+        assert_eq!(engine.shared.commands.pending_accepts(), 0);
+    }
+
+    #[test]
+    fn admitted_accept_forces_the_first_poll_to_yield() {
+        let (engine, _driver) =
+            super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
+        let listener = ListenerEntry::test_only(1);
+        let admission = listener.admission();
+        let mut accept = Box::pin(accept_with_setup(
+            Arc::clone(&engine.shared.session),
+            Arc::clone(&engine.shared.commands),
+            listener.token,
+            admission,
+            RdmaConnectionConfig::default(),
+            empty_connection_setup(),
+        ));
+        let wakes = Arc::new(CountWake(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(accept.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(engine.shared.commands.pending_accepts(), 1);
+        assert_eq!(
+            wakes.0.load(Ordering::Acquire),
+            1,
+            "admission must self-wake only after forcing the admitting poll to return"
+        );
+        drop(accept);
+        assert_eq!(engine.shared.commands.pending_accepts(), 0);
+    }
+
+    #[test]
+    fn accept_request_and_child_slot_transfer_together_through_selection() {
+        let mut listener = ListenerEntry::test_only(1);
+        let request = request(&listener);
+        listener.register_waiter(Arc::clone(&request)).unwrap();
+        assert!(
+            listener
+                .admit_child(IncomingChild::test_only())
+                .rejected
+                .is_none()
+        );
+        assert_eq!(listener.admission.available_permits(), 0);
+        assert_eq!(listener.child_slots_used(), 1);
+        assert!(listener.selected_is_some());
+        assert!(matches!(
+            listener.next_action(),
+            ListenerAction::ProcessSelected { .. }
+        ));
+        listener.route_selected(&request, 9).unwrap();
+        request.cancel();
+        assert!(matches!(
+            listener.next_action(),
+            ListenerAction::CancelAfterAccept { route: 9, .. }
+        ));
+        assert!(listener.finish_selected_route(9));
+        assert_eq!(listener.admission.available_permits(), 1);
+        assert_eq!(listener.child_slots_used(), 0);
+        assert!(!listener.selected_is_some());
+        assert!(!request.owns_permit());
+    }
+
+    #[test]
+    fn terminal_failure_releases_accept_permits_and_retains_child_owners_once() {
+        let mut listener = ListenerEntry::test_only(2);
+        let selected = request(&listener);
+        let pending = request(&listener);
+        listener.register_waiter(Arc::clone(&selected)).unwrap();
+        listener.register_waiter(Arc::clone(&pending)).unwrap();
+        listener.admit_child(IncomingChild::test_only());
+        listener.admit_child(IncomingChild::test_only());
+        assert!(matches!(
+            listener.next_action(),
+            ListenerAction::ProcessSelected { .. }
+        ));
+        listener.route_selected(&selected, 11).unwrap();
+
+        let mut actions = crate::v2::engine::reactor::ReactorActions::default();
+        let outcome = MemoizedTerminalResult::from_error(Error::DriverShutdown);
+        assert_eq!(
+            listener.terminalize_waiters_into(&outcome, &mut actions, 8),
+            2
+        );
+        assert!(!selected.owns_permit());
+        assert!(!pending.owns_permit());
+        assert_eq!(listener.admission.available_permits(), 2);
+        assert_eq!(listener.child_slots_used(), 2);
+        assert!(listener.selected_is_some());
+        assert_eq!(listener.queues.children.len(), 1);
+        actions.publish();
+    }
+
+    #[test]
+    fn provider_backlog_seam_receives_the_exact_public_value() {
+        let config = RdmaListenerConfig::default().backlog(37);
+        let mut observed = None;
+        with_validated_listener_backlog(&config, |backlog| observed = Some(backlog)).unwrap();
+        assert_eq!(observed, Some(37));
+        assert_eq!(config.backlog_capacity(), 37);
+
+        let mut called = false;
+        assert!(
+            with_validated_listener_backlog(&RdmaListenerConfig::default().backlog(0), |_| {
+                called = true;
+            })
+            .is_err()
+        );
+        assert!(!called);
     }
 }

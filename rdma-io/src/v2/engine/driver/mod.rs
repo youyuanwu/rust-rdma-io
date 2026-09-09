@@ -23,8 +23,9 @@ use super::config::CompletionMode;
 #[cfg(test)]
 use super::lifecycle::MemoizedTerminalResult;
 use super::reactor::EngineReactor;
-use super::resources::EngineResources;
-use super::{EngineShared, RdmaEngineDriver};
+use super::resources::EngineReactorResources;
+use super::session::SessionManager;
+use super::{EngineFrontendRoot, RdmaEngineDriver};
 use crate::v2::error::{Error, Result};
 use crate::v2::runtime::preflight_driver_runtime;
 
@@ -96,8 +97,12 @@ impl WorkSignal {
 }
 
 impl RdmaEngineDriver {
-    pub(super) fn new(shared: Arc<EngineShared>, resources: Option<EngineResources>) -> Self {
-        let reactor = EngineReactor::new(&shared, resources);
+    pub(super) fn new(
+        shared: Arc<EngineFrontendRoot>,
+        session: SessionManager,
+        resources: Option<EngineReactorResources>,
+    ) -> Self {
+        let reactor = EngineReactor::new(&shared, session, resources);
         Self {
             shared,
             reactor,
@@ -108,7 +113,7 @@ impl RdmaEngineDriver {
     }
 
     fn fail(&mut self, error: Error, cx: &mut TaskContext<'_>) -> Poll<Result<()>> {
-        self.shared.begin_driver_failure(error);
+        self.reactor.begin_driver_failure(&self.shared, error);
         cx.waker().wake_by_ref();
         Poll::Pending
     }
@@ -139,12 +144,18 @@ impl Future for RdmaEngineDriver {
     type Output = Result<()>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
-        if let Some(outcome) = self.shared.outcome() {
-            self.release_resources();
+        if let Some(outcome) = self.reactor.lifecycle.outcome() {
+            if !self.reactor.requires_complete_quarantine() {
+                self.release_resources();
+            }
             return Poll::Ready(outcome.into_result());
         }
 
-        let terminalizing_failure = self.shared.pending_terminal_outcome().is_some();
+        if let Some(error) = self.shared.take_driver_failure() {
+            let shared = Arc::clone(&self.shared);
+            self.reactor.begin_driver_failure(&shared, error);
+        }
+        let terminalizing_failure = self.reactor.lifecycle.is_terminalizing_failure();
         if !terminalizing_failure && !self.runtime_checked {
             if let Err(error) = preflight_driver_runtime("RdmaEngineDriver") {
                 return self.fail(error, cx);
@@ -157,7 +168,8 @@ impl Future for RdmaEngineDriver {
         {
             return self.fail(error, cx);
         }
-        self.shared.transition_running();
+        let shared = Arc::clone(&self.shared);
+        self.reactor.transition_running(&shared);
         if !terminalizing_failure {
             self.poll_deadline_timer(cx);
         }
@@ -169,7 +181,9 @@ impl Future for RdmaEngineDriver {
         let turn = match self.reactor.turn(&shared, mode, cx) {
             Ok(turn) => turn,
             Err(failure) => {
-                self.shared.begin_driver_failure(failure.error.clone());
+                let shared = Arc::clone(&self.shared);
+                self.reactor
+                    .begin_driver_failure(&shared, failure.error.clone());
                 failure.actions.publish();
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
@@ -178,12 +192,17 @@ impl Future for RdmaEngineDriver {
         let requires_repoll = turn.requires_repoll;
         turn.actions.publish();
 
-        if let Some(outcome) = self.shared.outcome() {
-            self.release_resources();
+        if let Some(outcome) = self.reactor.lifecycle.outcome() {
+            // A failed terminal result may still own an uncertain provider
+            // bundle. Keep the canonical resource root in this driver until
+            // Drop atomically moves the complete reactor into quarantine.
+            if !self.reactor.requires_complete_quarantine() {
+                self.release_resources();
+            }
             return Poll::Ready(outcome.into_result());
         }
 
-        if self.shared.pending_terminal_outcome().is_some() {
+        if self.reactor.lifecycle.is_terminalizing_failure() {
             cx.waker().wake_by_ref();
             return Poll::Pending;
         }

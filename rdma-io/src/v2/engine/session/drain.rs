@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 use super::super::registry::{ConnectionToken, Lookup, read_unpoison};
 use super::DeadlineKind;
 use super::SessionManager;
+use super::cm::CmState;
 use super::registry::ConnectionRegistry;
 use crate::v2::error::Error;
 
@@ -74,7 +75,7 @@ impl SessionManager {
             return;
         }
 
-        let admission = read_unpoison(&self.admission);
+        let admission = read_unpoison(&self.frontend.admission);
         let first = connections.begin_close(token);
         let mut close_effects = None;
         let mut publish_io_work = false;
@@ -127,6 +128,7 @@ impl SessionManager {
 
     pub(crate) fn begin_connection_close_into(
         &self,
+        cm: &mut CmState,
         connections: &mut ConnectionRegistry,
         token: ConnectionToken,
         io_core: &mut super::super::io_core::IoState,
@@ -135,7 +137,15 @@ impl SessionManager {
         if !matches!(connections.lookup(token), Lookup::Occupied(_)) {
             return;
         }
-        let admission = read_unpoison(&self.admission);
+        match cm.prepare_connection_close(connections, token, actions) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                self.begin_driver_failure(error);
+                return;
+            }
+        }
+        let admission = read_unpoison(&self.frontend.admission);
         let first = connections.begin_close(token);
         let mut close_publication_remaining = false;
         let mut publish_io_work = false;
@@ -217,7 +227,7 @@ impl SessionManager {
         connections.schedule_deadline(
             DeadlineKind::ConnectionDrain,
             token.encode(),
-            self.config.connection_drain_deadline,
+            self.connection_drain_deadline(),
         );
     }
 
@@ -287,7 +297,7 @@ impl SessionManager {
         }
         let mut reclamation_proof = connections.take_qp_reclamation_proof(token);
         if !accepted_tokens.is_empty() && reclamation_proof.is_none() {
-            let _admission = read_unpoison(&self.admission);
+            let _admission = read_unpoison(&self.frontend.admission);
             reclamation_proof = match self.establish_qp_destruction_proof(connections, token) {
                 Ok(proof) => Some(proof),
                 Err(error) => {
@@ -428,7 +438,7 @@ mod tests {
     use futures_util::task::{ArcWake, waker};
 
     struct GuardCheckingWaker {
-        session: Arc<super::super::SessionManager>,
+        session: Arc<super::super::SessionFrontend>,
         wakes: AtomicUsize,
         lock_failures: AtomicUsize,
     }
@@ -536,7 +546,7 @@ mod tests {
         let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
         let poster = TestPoster::failing(19);
         let connection = install_connection(
-            &engine.shared.session,
+            &driver.reactor.session.manager,
             &mut driver.reactor.session.connections,
             poster,
             RdmaConnectionConfig::default(),
@@ -594,7 +604,7 @@ mod tests {
     fn failed_error_transition_wakes_after_admission_guard_drops() {
         let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
         let connection = install_connection(
-            &engine.shared.session,
+            &driver.reactor.session.manager,
             &mut driver.reactor.session.connections,
             TestPoster::failing(21),
             RdmaConnectionConfig::default(),
@@ -617,7 +627,7 @@ mod tests {
                 .is_pending()
         );
 
-        engine.shared.session.begin_connection_close(
+        driver.reactor.session.manager.begin_connection_close(
             &mut driver.reactor.session.connections,
             driver.reactor.io.core_mut(),
             connection.session_token(),
@@ -662,7 +672,7 @@ mod tests {
     fn connection_close_wakes_driver_after_backend_commit() {
         let (engine, mut driver) = test_engine_pair(CompletionMode::Readiness);
         let connection = install_connection(
-            &engine.shared.session,
+            &driver.reactor.session.manager,
             &mut driver.reactor.session.connections,
             TestPoster::new(20),
             RdmaConnectionConfig::default(),
@@ -681,7 +691,7 @@ mod tests {
             .work_signal
             .register_waker_for_test(&task_waker);
 
-        engine.shared.session.begin_connection_close(
+        driver.reactor.session.manager.begin_connection_close(
             &mut driver.reactor.session.connections,
             driver.reactor.io.core_mut(),
             connection.session_token(),
@@ -702,7 +712,7 @@ mod tests {
     fn connection_close_wakes_operation_observer_after_backend_commit() {
         let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
         let connection = install_connection(
-            &engine.shared.session,
+            &driver.reactor.session.manager,
             &mut driver.reactor.session.connections,
             TestPoster::new(22),
             RdmaConnectionConfig::default(),
@@ -727,7 +737,7 @@ mod tests {
             &waker(Arc::clone(&reentrant)),
         );
 
-        engine.shared.session.begin_connection_close(
+        driver.reactor.session.manager.begin_connection_close(
             &mut driver.reactor.session.connections,
             driver.reactor.io.core_mut(),
             connection.session_token(),
@@ -747,10 +757,10 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn bounded_close_scan_continuation_preserves_drain_grace() {
-        let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
+        let (_engine, mut driver) = test_engine_pair(CompletionMode::Polling);
         let poster = TestPoster::new(28);
         let connection = install_connection(
-            &engine.shared.session,
+            &driver.reactor.session.manager,
             &mut driver.reactor.session.connections,
             Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
             RdmaConnectionConfig::default().max_send_wr(64),
@@ -768,7 +778,8 @@ mod tests {
         }
 
         let mut actions = crate::v2::engine::reactor::ReactorActions::default();
-        engine.shared.session.begin_connection_close_into(
+        driver.reactor.session.manager.begin_connection_close_into(
+            &mut driver.reactor.session.cm,
             &mut driver.reactor.session.connections,
             connection.session_token(),
             driver.reactor.io.core_mut(),
@@ -780,12 +791,16 @@ mod tests {
         assert_eq!(immediate[0].at, tokio::time::Instant::now());
 
         let mut actions = crate::v2::engine::reactor::ReactorActions::default();
-        engine.shared.session.handle_connection_drain_deadline_into(
-            &mut driver.reactor.session.connections,
-            driver.reactor.io.core_mut(),
-            connection.session_token(),
-            &mut actions,
-        );
+        driver
+            .reactor
+            .session
+            .manager
+            .handle_connection_drain_deadline_into(
+                &mut driver.reactor.session.connections,
+                driver.reactor.io.core_mut(),
+                connection.session_token(),
+                &mut actions,
+            );
         actions.publish();
         let grace = driver.reactor.session.connections.take_deadline_requests(1);
         assert_eq!(grace.len(), 1);
@@ -801,7 +816,7 @@ mod tests {
     }
 
     fn install_accepted_connection(
-        engine: &super::super::super::RdmaEngine,
+        _engine: &super::super::super::RdmaEngine,
         driver: &mut super::super::super::RdmaEngineDriver,
         qp_num: u32,
     ) -> (
@@ -812,7 +827,7 @@ mod tests {
         let poster = TestPoster::new(qp_num);
         let poster_dyn: Arc<dyn WorkRequestPoster> = poster.clone();
         let connection = install_connection(
-            &engine.shared.session,
+            &driver.reactor.session.manager,
             &mut driver.reactor.session.connections,
             poster_dyn,
             RdmaConnectionConfig::default(),
@@ -888,10 +903,14 @@ mod tests {
                 .unwrap()
         );
         driver.reactor.io.core_mut().accepted_operations -= 1;
-        engine.shared.session.recover_connection_quarantine(
-            &mut driver.reactor.session.connections,
-            connection_token,
-        );
+        driver
+            .reactor
+            .session
+            .manager
+            .recover_connection_quarantine(
+                &mut driver.reactor.session.connections,
+                connection_token,
+            );
         assert_eq!(
             driver
                 .reactor
@@ -901,21 +920,26 @@ mod tests {
                 .registered_live_qps,
             0
         );
-        engine
-            .shared
+        driver
+            .reactor
             .session
+            .manager
             .record_connection_drained(&mut driver.reactor.session.connections, connection_token);
-        engine.shared.session.schedule_connection_retirement(
-            &mut driver.reactor.session.connections,
-            connection_token,
-        );
-        engine
-            .shared
+        driver
+            .reactor
+            .session
+            .manager
+            .schedule_connection_retirement(
+                &mut driver.reactor.session.connections,
+                connection_token,
+            );
+        driver
+            .reactor
             .session
             .cm
             .service_software(
                 &mut driver.reactor.session.connections,
-                &engine.shared.session,
+                &driver.reactor.session.manager,
                 driver.reactor.io.core_mut(),
                 None,
                 32,
@@ -948,7 +972,7 @@ mod tests {
         let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
         let poster = TestPoster::destroy_failing(23);
         let connection = install_connection(
-            &engine.shared.session,
+            &driver.reactor.session.manager,
             &mut driver.reactor.session.connections,
             Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
             RdmaConnectionConfig::default(),
@@ -995,10 +1019,10 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn anomalous_token_does_not_strand_reclaimable_operations_after_qp_destroy() {
-        let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
+        let (_engine, mut driver) = test_engine_pair(CompletionMode::Polling);
         let poster = TestPoster::new(24);
         let connection = install_connection(
-            &engine.shared.session,
+            &driver.reactor.session.manager,
             &mut driver.reactor.session.connections,
             Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
             RdmaConnectionConfig::default(),
@@ -1033,25 +1057,34 @@ mod tests {
             .session
             .connections
             .begin_close(connection_token);
-        engine
-            .shared
+        driver
+            .reactor
             .session
+            .manager
             .transition_connection_to_error(
                 &mut driver.reactor.session.connections,
                 connection_token,
             )
             .unwrap();
 
-        engine.shared.session.handle_connection_drain_deadline(
-            &mut driver.reactor.session.connections,
-            driver.reactor.io.core_mut(),
-            connection_token,
-        );
-        engine.shared.session.handle_connection_drain_deadline(
-            &mut driver.reactor.session.connections,
-            driver.reactor.io.core_mut(),
-            connection_token,
-        );
+        driver
+            .reactor
+            .session
+            .manager
+            .handle_connection_drain_deadline(
+                &mut driver.reactor.session.connections,
+                driver.reactor.io.core_mut(),
+                connection_token,
+            );
+        driver
+            .reactor
+            .session
+            .manager
+            .handle_connection_drain_deadline(
+                &mut driver.reactor.session.connections,
+                driver.reactor.io.core_mut(),
+                connection_token,
+            );
 
         assert_eq!(poster.destroys.load(Ordering::Acquire), 1);
         assert_eq!(

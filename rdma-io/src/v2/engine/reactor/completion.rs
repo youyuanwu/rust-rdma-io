@@ -33,10 +33,12 @@ impl<T> CommandCompletion<T> {
         self.cancelled.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     pub(in crate::v2::engine) fn complete(&self, result: Result<T>) {
         self.complete_with(result, false);
     }
 
+    #[cfg(test)]
     pub(in crate::v2::engine) fn complete_listener(&self, result: Result<T>) {
         self.complete_with(result, true);
     }
@@ -57,6 +59,7 @@ impl<T> CommandCompletion<T> {
         }
     }
 
+    #[cfg(test)]
     fn complete_with(&self, result: Result<T>, _listener: bool) {
         if self.store_result(result) {
             self.waker.wake();

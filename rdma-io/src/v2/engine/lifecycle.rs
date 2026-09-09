@@ -1,7 +1,7 @@
 //! Central engine lifecycle deadlines and terminal wedge calculation.
 
 use super::session::SessionReactorSources;
-use super::{EngineShared, RdmaEngineTerminalError};
+use super::{RdmaEngineLifecycle, RdmaEngineTerminalError};
 use crate::v2::error::{Error, Result};
 
 pub(super) enum TakeOnceResult<T> {
@@ -19,6 +19,91 @@ pub(super) enum TakeOnceResult<T> {
 #[derive(Clone)]
 pub(super) struct MemoizedTerminalResult {
     result: Result<()>,
+}
+
+pub(super) struct EngineLifecycleState {
+    lifecycle: RdmaEngineLifecycle,
+    shutdown_requested: bool,
+    pending_terminal: Option<MemoizedTerminalResult>,
+    terminal: Option<MemoizedTerminalResult>,
+}
+
+impl EngineLifecycleState {
+    pub(super) fn new() -> Self {
+        Self {
+            lifecycle: RdmaEngineLifecycle::Created,
+            shutdown_requested: false,
+            pending_terminal: None,
+            terminal: None,
+        }
+    }
+
+    pub(super) fn lifecycle(&self) -> RdmaEngineLifecycle {
+        self.lifecycle
+    }
+
+    pub(super) fn transition_running(&mut self) {
+        if self.lifecycle == RdmaEngineLifecycle::Created {
+            self.lifecycle = RdmaEngineLifecycle::Running;
+        }
+    }
+
+    pub(super) fn request_shutdown(&mut self) -> bool {
+        if self.shutdown_requested {
+            return false;
+        }
+        self.shutdown_requested = true;
+        if !matches!(
+            self.lifecycle,
+            RdmaEngineLifecycle::Terminated | RdmaEngineLifecycle::Failed
+        ) {
+            self.lifecycle = RdmaEngineLifecycle::ShutdownRequested;
+        }
+        true
+    }
+
+    pub(super) fn begin_failure(&mut self, error: Error) -> bool {
+        if self.pending_terminal.is_some() || self.terminal.is_some() {
+            return false;
+        }
+        self.pending_terminal = Some(MemoizedTerminalResult::from_error(error));
+        self.request_shutdown();
+        true
+    }
+
+    pub(super) fn shutdown_requested(&self) -> bool {
+        self.shutdown_requested
+    }
+
+    pub(super) fn pending_terminal(&self) -> Option<MemoizedTerminalResult> {
+        self.pending_terminal.clone()
+    }
+
+    pub(super) fn is_terminalizing_failure(&self) -> bool {
+        self.pending_terminal.is_some()
+    }
+
+    pub(super) fn shutdown_is_pending(&self) -> bool {
+        self.shutdown_requested && self.terminal.is_none()
+    }
+
+    pub(super) fn outcome(&self) -> Option<MemoizedTerminalResult> {
+        self.terminal.clone()
+    }
+
+    pub(super) fn finish(&mut self, outcome: MemoizedTerminalResult) -> bool {
+        if self.terminal.is_some() {
+            return false;
+        }
+        self.shutdown_requested = true;
+        self.lifecycle = if outcome.is_success() {
+            RdmaEngineLifecycle::Terminated
+        } else {
+            RdmaEngineLifecycle::Failed
+        };
+        self.terminal = Some(outcome);
+        true
+    }
 }
 
 impl MemoizedTerminalResult {
@@ -67,28 +152,6 @@ impl MemoizedTerminalResult {
     }
 }
 
-impl EngineShared {
-    pub(super) fn shutdown_deadline_failure(&self) -> Option<Error> {
-        if self.outcome().is_some() {
-            return None;
-        }
-        let retained_bundles = self.retained_bundle_count();
-        let outstanding_operations = self.unsafe_outstanding_operations();
-        let pending_routes = super::registry::lock_unpoison(&self.connection_diagnostics)
-            .live
-            .saturating_add(self.session.cm.pending_adapter_route_count());
-        if retained_bundles == 0 && outstanding_operations == 0 && pending_routes == 0 {
-            return None;
-        }
-        // Pending CM work can wedge shutdown without owning a retained bundle.
-        Some(Error::EngineWedged {
-            retained_bundles,
-            outstanding_operations,
-            cq_debt: outstanding_operations,
-        })
-    }
-}
-
 impl SessionReactorSources {
     pub(super) fn synchronously_prepare_driver_drop(
         &mut self,
@@ -97,6 +160,9 @@ impl SessionReactorSources {
         for token in self.connections.occupied() {
             self.connections
                 .with_connection_mut(token, |connection| connection.stop_posting());
+            if self.connections.is_quarantined(token) {
+                continue;
+            }
             let _ = self
                 .manager
                 .transition_connection_to_error(&mut self.connections, token);
@@ -147,6 +213,7 @@ mod tests {
 
     struct HeldPoster {
         qp_num: u32,
+        to_errors: AtomicUsize,
         destroys: AtomicUsize,
     }
 
@@ -171,6 +238,7 @@ mod tests {
             &self,
             _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
         ) -> Result<()> {
+            self.to_errors.fetch_add(1, Ordering::AcqRel);
             Ok(())
         }
 
@@ -222,10 +290,11 @@ mod tests {
         let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
         let poster = Arc::new(HeldPoster {
             qp_num: 31,
+            to_errors: AtomicUsize::new(0),
             destroys: AtomicUsize::new(0),
         });
         install_connection(
-            &engine.shared.session,
+            &driver.reactor.session.manager,
             &mut driver.reactor.session.connections,
             Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
             RdmaConnectionConfig::default(),
@@ -244,11 +313,9 @@ mod tests {
             .synchronously_prepare_driver_drop(driver.reactor.io.core_mut());
 
         assert_eq!(poster.destroys.load(Ordering::Acquire), 1);
-        engine.shared.finish(
-            &mut driver.reactor.session,
-            driver.reactor.io.core_mut(),
-            MemoizedTerminalResult::success(),
-        );
+        driver
+            .reactor
+            .finish_for_test(&engine.shared, MemoizedTerminalResult::success());
         drop(driver);
     }
 
@@ -257,10 +324,11 @@ mod tests {
         let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
         let poster = Arc::new(HeldPoster {
             qp_num: 32,
+            to_errors: AtomicUsize::new(0),
             destroys: AtomicUsize::new(0),
         });
         let connection = install_connection(
-            &engine.shared.session,
+            &driver.reactor.session.manager,
             &mut driver.reactor.session.connections,
             Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
             RdmaConnectionConfig::default(),
@@ -270,9 +338,10 @@ mod tests {
         .unwrap();
         let token = connection.session_token();
         assert!(driver.reactor.session.connections.begin_close(token));
-        engine
-            .shared
+        driver
+            .reactor
             .session
+            .manager
             .transition_connection_to_error(&mut driver.reactor.session.connections, token)
             .unwrap();
         assert!(driver.reactor.session.connections.request_retirement(token));
@@ -307,11 +376,44 @@ mod tests {
             .synchronously_prepare_driver_drop(driver.reactor.io.core_mut());
 
         assert_eq!(poster.destroys.load(Ordering::Acquire), 0);
-        engine.shared.finish(
-            &mut driver.reactor.session,
-            driver.reactor.io.core_mut(),
-            MemoizedTerminalResult::success(),
+        driver
+            .reactor
+            .finish_for_test(&engine.shared, MemoizedTerminalResult::success());
+        drop(driver);
+    }
+
+    #[test]
+    fn driver_drop_preserves_nonretiring_quarantined_qp() {
+        let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
+        let poster = Arc::new(HeldPoster {
+            qp_num: 33,
+            to_errors: AtomicUsize::new(0),
+            destroys: AtomicUsize::new(0),
+        });
+        let connection = install_connection(
+            &driver.reactor.session.manager,
+            &mut driver.reactor.session.connections,
+            Arc::clone(&poster) as Arc<dyn WorkRequestPoster>,
+            RdmaConnectionConfig::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let token = connection.session_token();
+        assert!(
+            driver
+                .reactor
+                .session
+                .connections
+                .track_bundle_quarantine(token)
         );
+
+        driver
+            .reactor
+            .terminate_on_driver_drop(&engine.shared)
+            .publish();
+        assert_eq!(poster.to_errors.load(Ordering::Acquire), 0);
+        assert_eq!(poster.destroys.load(Ordering::Acquire), 0);
         drop(driver);
     }
 
@@ -319,9 +421,8 @@ mod tests {
     #[should_panic(expected = "ConnectionQuarantined is connection-local")]
     fn engine_terminal_rejects_connection_quarantined() {
         let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
-        engine.shared.finish(
-            &mut driver.reactor.session,
-            driver.reactor.io.core_mut(),
+        driver.reactor.finish_for_test(
+            &engine.shared,
             MemoizedTerminalResult::from_error(Error::ConnectionQuarantined {
                 outstanding_operations: 1,
                 cq_debt: 1,
@@ -334,11 +435,12 @@ mod tests {
         let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
         let poster = Arc::new(HeldPoster {
             qp_num: 29,
+            to_errors: AtomicUsize::new(0),
             destroys: AtomicUsize::new(0),
         });
         let poster_dyn: Arc<dyn WorkRequestPoster> = poster.clone();
         let connection = install_connection(
-            &engine.shared.session,
+            &driver.reactor.session.manager,
             &mut driver.reactor.session.connections,
             poster_dyn,
             RdmaConnectionConfig::default(),

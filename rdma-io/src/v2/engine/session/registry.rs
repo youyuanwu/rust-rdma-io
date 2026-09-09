@@ -6,14 +6,13 @@ use tokio::sync::Semaphore;
 
 use super::super::io_core::{ConnectionIoState, EstablishedIoConnection};
 use super::super::registry::{
-    ConnectionToken, LiveIoConnectionProof, Lookup, OperationToken, PagedRegistry,
+    ConnectionToken, ListenerToken, LiveIoConnectionProof, Lookup, OperationToken, PagedRegistry,
 };
 use super::cm::{InboundRoute, InboundState, OutboundRequest, OutboundRoute, OutboundState};
 use super::connection::{
     ConnectionCmRoute, ConnectionPoster, ConnectionReservation, ConnectionState,
     ConnectionStateCountSnapshot,
 };
-use super::listener::ListenerState;
 use super::{DeadlineKind, DeadlineRequest};
 use crate::v2::error::{Error, Result};
 
@@ -1069,11 +1068,8 @@ impl ConnectionRegistry {
             .is_some()
     }
 
-    pub(super) fn inbound_listener(
-        &self,
-        token: ConnectionToken,
-    ) -> Option<std::sync::Weak<ListenerState>> {
-        self.with_inbound_route(token, |route| route.listener.clone())
+    pub(super) fn inbound_listener(&self, token: ConnectionToken) -> Option<ListenerToken> {
+        self.with_inbound_route(token, |route| route.listener)
     }
 
     pub(super) fn outbound_request(&self, token: ConnectionToken) -> Option<Arc<OutboundRequest>> {

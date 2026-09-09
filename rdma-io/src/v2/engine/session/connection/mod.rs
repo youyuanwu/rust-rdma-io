@@ -20,7 +20,10 @@ use super::super::lifecycle::MemoizedTerminalResult;
 use super::super::registry::OperationToken;
 use super::super::registry::{ConnectionToken, lock_unpoison, read_unpoison};
 use super::registry::ConnectionRegistry;
-use super::{QpDestructionProof, SessionCloseState, SessionLifecycleAuthority, SessionManager};
+use super::{
+    QpDestructionProof, SessionCloseState, SessionFrontend, SessionLifecycleAuthority,
+    SessionManager,
+};
 use crate::cm::{CmId, ConnParam, EventChannel};
 use crate::v2::error::{Error, Result};
 use crate::v2::mr::{AccessIntent, Mr, RemoteMr};
@@ -79,7 +82,7 @@ pub struct RdmaConnection {
     pub(in crate::v2::engine) state: Arc<ConnectionTestAccess>,
     pub(in crate::v2::engine) memory: MemoryRegistrar,
     commands: Weak<super::super::reactor::CommandIngress>,
-    manager: Weak<SessionManager>,
+    session_frontend: Weak<SessionFrontend>,
     close: Arc<SessionCloseState>,
     frontend: Arc<ConnectionFrontendState>,
     local_addr: Option<SocketAddr>,
@@ -96,7 +99,7 @@ impl Clone for RdmaConnection {
             state: Arc::clone(&self.state),
             memory: self.memory.clone(),
             commands: self.commands.clone(),
-            manager: self.manager.clone(),
+            session_frontend: self.session_frontend.clone(),
             close: Arc::clone(&self.close),
             frontend: Arc::clone(&self.frontend),
             local_addr: self.local_addr,
@@ -124,7 +127,7 @@ impl RdmaConnection {
     pub fn send(&self, mr: Mr, range: Option<(usize, usize)>) -> RdmaOperation {
         RdmaOperation::new(
             self.commands.clone(),
-            self.manager.clone(),
+            self.session_frontend.clone(),
             self.session_token(),
             OperationKind::Send,
             mr,
@@ -138,7 +141,7 @@ impl RdmaConnection {
     pub fn recv(&self, mr: Mr, range: Option<(usize, usize)>) -> RdmaOperation {
         RdmaOperation::new(
             self.commands.clone(),
-            self.manager.clone(),
+            self.session_frontend.clone(),
             self.session_token(),
             OperationKind::Recv,
             mr,
@@ -152,7 +155,7 @@ impl RdmaConnection {
     pub fn write(&self, mr: Mr, remote: RemoteMr, range: Option<(usize, usize)>) -> RdmaOperation {
         RdmaOperation::new(
             self.commands.clone(),
-            self.manager.clone(),
+            self.session_frontend.clone(),
             self.session_token(),
             OperationKind::Write,
             mr,
@@ -166,7 +169,7 @@ impl RdmaConnection {
     pub fn read(&self, mr: Mr, remote: RemoteMr, range: Option<(usize, usize)>) -> RdmaOperation {
         RdmaOperation::new(
             self.commands.clone(),
-            self.manager.clone(),
+            self.session_frontend.clone(),
             self.session_token(),
             OperationKind::Read,
             mr,
@@ -213,8 +216,8 @@ impl RdmaConnection {
             if let Some(outcome) = self.close.outcome() {
                 return outcome.into_result();
             }
-            if let Some(manager) = self.manager.upgrade()
-                && let Some(outcome) = manager.engine_outcome()
+            if let Some(frontend) = self.session_frontend.upgrade()
+                && let Some(outcome) = frontend.engine_outcome()
             {
                 return outcome.into_result();
             }
@@ -247,8 +250,8 @@ impl RdmaConnection {
         self.commands.clone()
     }
 
-    pub(in crate::v2::engine) fn manager(&self) -> Weak<SessionManager> {
-        self.manager.clone()
+    pub(in crate::v2::engine) fn frontend(&self) -> Weak<SessionFrontend> {
+        self.session_frontend.clone()
     }
 
     pub(in crate::v2::engine) fn close_state(&self) -> Arc<SessionCloseState> {
@@ -269,8 +272,10 @@ impl RdmaConnection {
         if self.close.is_retired() {
             return;
         }
-        if let (Some(manager), Some(commands)) = (self.manager.upgrade(), self.commands.upgrade()) {
-            commands.request_connection_close(&manager, self.session_token());
+        if let (Some(frontend), Some(commands)) =
+            (self.session_frontend.upgrade(), self.commands.upgrade())
+        {
+            commands.request_connection_close(&frontend, self.session_token());
         }
     }
 
@@ -279,6 +284,7 @@ impl RdmaConnection {
         state: &ConnectionState,
         route: Option<ConnectionCmRoute>,
     ) -> Self {
+        let frontend = manager.frontend();
         let identity = state.identity();
         let local_addr = state.local_addr;
         let peer_addr = state.peer_addr;
@@ -291,16 +297,16 @@ impl RdmaConnection {
                 close: Arc::clone(&state.close),
                 uses_engine_resources: state.poster.uses_engine_resources(),
             }),
-            memory: manager.memory_registrar(),
-            commands: manager
+            memory: frontend.memory_registrar(),
+            commands: frontend
                 .commands
                 .get()
-                .expect("SessionManager command ingress is bound before use")
+                .expect("SessionFrontend command ingress is bound before use")
                 .clone(),
-            manager: manager
+            session_frontend: frontend
                 .self_ref
                 .get()
-                .expect("SessionManager self reference is bound before use")
+                .expect("SessionFrontend self reference is bound before use")
                 .clone(),
             close: state.close_state(),
             frontend: Arc::clone(&state.frontend),
@@ -360,6 +366,7 @@ pub(in crate::v2::engine) struct ConnectionState {
     quarantine_operation_scan_complete: bool,
     close: Arc<SessionCloseState>,
     close_result: Option<MemoizedTerminalResult>,
+    inbound_accept_succeeded: bool,
     error_transition_started: bool,
     error_transition_complete: bool,
     qp_destroyed: bool,
@@ -417,6 +424,7 @@ impl ConnectionState {
             quarantine_operation_scan_complete: false,
             close,
             close_result: None,
+            inbound_accept_succeeded: false,
             error_transition_started: false,
             error_transition_complete: false,
             qp_destroyed: false,
@@ -462,8 +470,28 @@ impl ConnectionState {
         self.poster.connect(param)
     }
 
-    pub(in crate::v2::engine) fn accept(&self, param: &ConnParam) -> Result<()> {
-        self.poster.accept(param)
+    pub(in crate::v2::engine) fn accept_inbound(&mut self, param: &ConnParam) -> Result<()> {
+        if self.inbound_accept_succeeded {
+            return Err(Error::InvalidConfig(
+                "inbound provider accept was requested more than once".into(),
+            ));
+        }
+        self.poster.accept(param)?;
+        self.inbound_accept_succeeded = true;
+        Ok(())
+    }
+
+    pub(in crate::v2::engine) fn inbound_accept_succeeded(&self) -> bool {
+        self.inbound_accept_succeeded
+    }
+
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn record_inbound_accept_for_test(&mut self) {
+        assert!(
+            !self.inbound_accept_succeeded,
+            "test inbound accept evidence is recorded once"
+        );
+        self.inbound_accept_succeeded = true;
     }
 
     pub(in crate::v2::engine) fn reject(&self) -> Result<()> {
@@ -531,6 +559,21 @@ impl ConnectionState {
     ) -> Option<PendingIoEvent> {
         self.stop_posting();
         let _ = self.transition_to_error_once(authority);
+        if let Some(error) = outcome.error() {
+            if self.close_result.is_none() {
+                self.close_result = Some(MemoizedTerminalResult::from_error(error.clone()));
+            }
+            self.publish_close_result();
+            return self.pending_io_event(IoTerminalEvent::Terminal(error));
+        }
+        None
+    }
+
+    pub(in crate::v2::engine) fn finalize_engine_without_provider(
+        &mut self,
+        outcome: &MemoizedTerminalResult,
+    ) -> Option<PendingIoEvent> {
+        self.stop_posting();
         if let Some(error) = outcome.error() {
             if self.close_result.is_none() {
                 self.close_result = Some(MemoizedTerminalResult::from_error(error.clone()));
@@ -1206,6 +1249,15 @@ impl ConnectionPoster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
+    fn disconnect_for_test(&self) -> Result<()> {
+        match self {
+            #[cfg(any(test, feature = "test-hooks"))]
+            Self::Shared(poster) => poster.disconnect(),
+            Self::Verbs(resources) => resources.disconnect_owned(),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
     fn fail_next_qp_destroy(&self) -> Result<()> {
         match self {
             #[cfg(any(test, feature = "test-hooks"))]
@@ -1229,15 +1281,6 @@ impl ConnectionPoster {
             #[cfg(any(test, feature = "test-hooks"))]
             Self::Shared(poster) => Arc::as_ptr(poster) as *const () as usize,
             Self::Verbs(resources) => resources.qp_num as usize,
-        }
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn disconnect_for_test(&self) -> Result<()> {
-        match self {
-            #[cfg(any(test, feature = "test-hooks"))]
-            Self::Shared(poster) => poster.disconnect(),
-            Self::Verbs(resources) => resources.disconnect_owned(),
         }
     }
 }
@@ -1288,14 +1331,37 @@ impl SharedCmId {
         }
     }
 
-    pub(in crate::v2::engine) fn destroy(mut self) -> Result<()> {
+    pub(in crate::v2::engine) fn try_destroy(mut self) -> std::result::Result<(), (Self, Error)> {
         let cm_id = self
             .cm_id
             .take()
             .expect("shared CM ID is destroyed exactly once");
-        let result = cm_id.destroy().map_err(Error::from_v1);
-        self.channel.take();
-        result
+        match cm_id.try_destroy() {
+            Ok(()) => {
+                self.channel.take();
+                Ok(())
+            }
+            Err((cm_id, error)) => {
+                self.cm_id = Some(cm_id);
+                Err((self, Error::from_v1(error)))
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn from_raw_for_ownership_test(
+        raw: *mut rdma_io_sys::rdmacm::rdma_cm_id,
+    ) -> Self {
+        Self {
+            cm_id: Some(unsafe { CmId::from_raw(raw, true) }),
+            channel: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn disarm_destroy_for_test(&mut self) {
+        let mut cm_id = self.cm_id.take().expect("test CM owner remains present");
+        cm_id.disarm_destroy_for_test();
     }
 
     pub(in crate::v2::engine) fn install_context_token(&mut self, route: u64) -> Result<()> {
@@ -1510,6 +1576,7 @@ impl VerbsConnectionResources {
             Some(ConnectionCmOwner::Shared { cm_id, .. }) => {
                 cm_id.disconnect().map_err(Error::from_v1)
             }
+            #[cfg(any(test, feature = "test-hooks"))]
             Some(ConnectionCmOwner::External { _cm_id }) => {
                 _cm_id.disconnect().map_err(Error::from_v1)
             }
@@ -1595,7 +1662,7 @@ pub(in crate::v2::engine) fn reserve_connection<'a>(
     manager: &'a SessionManager,
     connections: &ConnectionRegistry,
 ) -> Result<(RwLockReadGuard<'a, ()>, ConnectionReservation)> {
-    let admission = read_unpoison(&manager.admission);
+    let admission = read_unpoison(&manager.frontend.admission);
     if let Some(error) = manager.admission_error() {
         return Err(error);
     }

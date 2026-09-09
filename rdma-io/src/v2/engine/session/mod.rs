@@ -1,18 +1,16 @@
 //! Connection/session ownership for the explicitly driven v2 engine.
 //!
-//! `SessionManager` retains listener identity/lifecycle, the shared CM context
-//! index, and the common CM-destruction service as Phase-8 adapters. The
-//! driver-owned [`super::reactor::EngineReactor`] owns connection identity,
-//! routes, admission, deadlines, retirement, and quarantine. I/O effects cross
-//! into that owner through a consuming commit before detached events and
-//! wakers are published.
+//! The driver-owned [`super::reactor::EngineReactor`] owns connection and
+//! listener identity, the shared CM dispatcher/destruction service, admission,
+//! deadlines, retirement, shutdown, and quarantine. `SessionManager` is now a
+//! runtime-state-free policy/observer capability only; it owns no listener, route,
+//! connection, or terminal lifecycle storage.
 
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
-use self::cm::CmState;
 pub(in crate::v2::engine) use self::cm::{
     CmShutdownClass, CmShutdownSnapshot, CmSoftwareClass, CmSoftwareSnapshot,
 };
@@ -24,7 +22,7 @@ mod progress;
 pub(in crate::v2::engine) mod registry;
 
 use self::connection::{QpDestroyStatus, SharedCmId};
-use self::listener::ListenerState;
+use self::listener::{ListenerAdmission, ListenerEntry};
 pub(super) use self::progress::SessionReactorSources;
 use self::registry::ConnectionRegistry;
 #[cfg(any(test, feature = "test-hooks"))]
@@ -33,8 +31,8 @@ use super::config::{ProviderLimits, RdmaConnectionConfig, SessionConfig};
 use super::io::MemoryRegistrar;
 use super::io_core::{CommittedIoCoreEffects, IoCoreEffects, IoState, OperationQuarantineEffect};
 use super::reactor::CommandIngress;
-use super::registry::{ConnectionToken, Lookup, OperationToken, lock_unpoison};
-use super::{Result, SessionEngineRuntime};
+use super::registry::{ConnectionToken, ListenerToken, Lookup, OperationToken, lock_unpoison};
+use super::{EngineControl, EngineObserver, Result};
 use crate::v2::error::Error;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,10 +160,13 @@ impl SessionListenerCloseState {
         lock_unpoison(&self.outcome).clone()
     }
 
-    pub(super) fn store_if_empty(&self, outcome: super::lifecycle::MemoizedTerminalResult) {
+    pub(super) fn store_if_empty(&self, outcome: super::lifecycle::MemoizedTerminalResult) -> bool {
         let mut current = lock_unpoison(&self.outcome);
         if current.is_none() {
             *current = Some(outcome);
+            true
+        } else {
+            false
         }
     }
 
@@ -188,11 +189,132 @@ impl SessionListenerCloseState {
     }
 }
 
-/// Opaque request/observation capability for a SessionManager-owned listener.
+/// Narrow frontend policy and observation endpoint.
+///
+/// This value contains no connection, listener, CM, shutdown, terminal, or
+/// provider-progress owner. Public handles use it only for immutable
+/// validation/registration capability, typed command routing, and terminal
+/// observation.
+pub(super) struct SessionFrontend {
+    pub(super) admission: Arc<RwLock<()>>,
+    self_ref: OnceLock<Weak<SessionFrontend>>,
+    commands: OnceLock<Weak<CommandIngress>>,
+    observer: OnceLock<Weak<EngineObserver>>,
+    work_signal: OnceLock<Weak<super::driver::WorkSignal>>,
+    config: SessionConfig,
+    provider: Option<ProviderLimits>,
+    memory: MemoryRegistrar,
+    #[cfg(any(test, feature = "test-hooks"))]
+    test_instrumentation: SessionTestInstrumentation,
+}
+
+impl SessionFrontend {
+    fn new(
+        config: SessionConfig,
+        provider: Option<ProviderLimits>,
+        admission: Arc<RwLock<()>>,
+        memory: MemoryRegistrar,
+        #[cfg(any(test, feature = "test-hooks"))] test_instrumentation: SessionTestInstrumentation,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            admission,
+            self_ref: OnceLock::new(),
+            commands: OnceLock::new(),
+            observer: OnceLock::new(),
+            work_signal: OnceLock::new(),
+            config,
+            provider,
+            memory,
+            #[cfg(any(test, feature = "test-hooks"))]
+            test_instrumentation,
+        })
+    }
+
+    fn bind_self(self: &Arc<Self>) {
+        self.self_ref
+            .set(Arc::downgrade(self))
+            .unwrap_or_else(|_| panic!("SessionFrontend self reference is bound exactly once"));
+    }
+
+    fn bind_commands(&self, commands: &Arc<CommandIngress>) {
+        self.commands
+            .set(Arc::downgrade(commands))
+            .unwrap_or_else(|_| panic!("SessionFrontend command ingress is bound exactly once"));
+    }
+
+    fn bind_engine(
+        &self,
+        observer: &Arc<EngineObserver>,
+        work_signal: &Arc<super::driver::WorkSignal>,
+    ) {
+        if self.observer.set(Arc::downgrade(observer)).is_err()
+            || self.work_signal.set(Arc::downgrade(work_signal)).is_err()
+        {
+            panic!("SessionFrontend is bound to exactly one engine observer and work signal");
+        }
+    }
+
+    pub(super) fn admission_error(&self) -> Option<Error> {
+        if let Some(outcome) = self
+            .observer
+            .get()
+            .and_then(Weak::upgrade)
+            .and_then(|observer| observer.outcome())
+        {
+            return outcome.into_result().err();
+        }
+        self.commands
+            .get()
+            .and_then(Weak::upgrade)
+            .and_then(|commands| commands.admission_error())
+            .or_else(|| {
+                self.commands
+                    .get()
+                    .and_then(Weak::upgrade)
+                    .is_none()
+                    .then_some(Error::DriverShutdown)
+            })
+    }
+
+    pub(super) fn engine_outcome(&self) -> Option<super::lifecycle::MemoizedTerminalResult> {
+        self.observer
+            .get()
+            .and_then(Weak::upgrade)
+            .and_then(|observer| observer.outcome())
+    }
+
+    pub(super) fn validate_connection_config(&self, config: &RdmaConnectionConfig) -> Result<()> {
+        config.validate(&self.config, self.provider.as_ref())
+    }
+
+    pub(super) fn memory_registrar(&self) -> MemoryRegistrar {
+        self.memory.clone()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(super) fn provider_limits(&self) -> Option<ProviderLimits> {
+        self.provider
+    }
+
+    pub(super) fn publish_session_work(&self) {
+        if let Some(work_signal) = self.work_signal.get().and_then(Weak::upgrade) {
+            work_signal.publish(super::driver::SESSION_WORK);
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(super) fn pause_connect_before_enqueue(&self) {
+        self.test_instrumentation.pause_connect_before_enqueue();
+    }
+}
+
+/// Opaque request/observation capability for a reactor-owned listener.
 #[derive(Clone)]
 pub(super) struct SessionListener {
-    manager: Weak<SessionManager>,
-    listener: Weak<ListenerState>,
+    frontend: Weak<SessionFrontend>,
+    commands: Weak<CommandIngress>,
+    token: ListenerToken,
+    admission: Arc<ListenerAdmission>,
     close: Arc<SessionListenerCloseState>,
     local_addr: std::net::SocketAddr,
 }
@@ -210,22 +332,32 @@ impl SessionListener {
         self.close.release_frontend()
     }
 
-    pub(super) fn owners(&self) -> Result<(Arc<SessionManager>, Arc<ListenerState>)> {
-        let manager = self.manager.upgrade().ok_or(Error::DriverShutdown)?;
-        let listener = self.listener.upgrade().ok_or_else(|| {
+    pub(super) fn owners(
+        &self,
+    ) -> Result<(
+        Arc<SessionFrontend>,
+        Arc<CommandIngress>,
+        ListenerToken,
+        Arc<ListenerAdmission>,
+    )> {
+        let frontend = self.frontend.upgrade().ok_or(Error::DriverShutdown)?;
+        let commands = self.commands.upgrade().ok_or_else(|| {
             self.close
                 .outcome()
                 .and_then(|outcome| outcome.into_result().err())
-                .unwrap_or(Error::TransportClosed)
+                .unwrap_or(Error::DriverShutdown)
         })?;
-        Ok((manager, listener))
+        Ok((frontend, commands, self.token, Arc::clone(&self.admission)))
     }
 
     pub(super) fn request_close(&self) {
-        let Ok((manager, listener)) = self.owners() else {
+        if self.close.outcome().is_some() {
+            return;
+        }
+        let Ok((frontend, commands, token, admission)) = self.owners() else {
             return;
         };
-        listener.request_close(&manager);
+        commands.request_listener_close(&frontend, token, &admission);
     }
 
     pub(super) async fn close(&self) -> Result<()> {
@@ -237,8 +369,8 @@ impl SessionListener {
             if let Some(outcome) = self.close.outcome() {
                 return outcome.into_result();
             }
-            if let Some(manager) = self.manager.upgrade()
-                && let Some(outcome) = manager.engine_outcome()
+            if let Some(frontend) = self.frontend.upgrade()
+                && let Some(outcome) = frontend.engine_outcome()
             {
                 return outcome.into_result();
             }
@@ -247,27 +379,18 @@ impl SessionListener {
     }
 }
 
-/// Shared listener/CM adapter and immutable session policy.
+/// Runtime-state-free backend policy and transition authority.
 ///
-/// Connection-only ownership is deliberately absent; reactor turns pass the
-/// exclusive connection registry into the adapter where listener or CM event
-/// dispatch still needs it.
+/// All mutable connection, listener, CM, shutdown, and terminal storage is
+/// owned by the reactor. Public handles cannot reach this value; they retain
+/// only [`SessionFrontend`], typed command ingress, and take-once observers.
 pub(super) struct SessionManager {
-    pub(super) cm: CmState,
     #[cfg(any(test, feature = "test-hooks"))]
     pub(super) rejected_cm_events: AtomicU64,
-    pub(super) admission: Arc<RwLock<()>>,
+    #[cfg(test)]
     pub(super) shutdown_connection_close_started: AtomicBool,
-    // Frontend capabilities retain only this weak self-reference.
-    self_ref: OnceLock<Weak<SessionManager>>,
-    commands: OnceLock<Weak<CommandIngress>>,
-    // The session owner can reach only the engine-wide operations exposed by
-    // SessionEngineRuntime; it cannot recover the concrete composition root.
-    engine: OnceLock<Weak<dyn SessionEngineRuntime>>,
-    // Only session-owned immutable policy is copied into this owner.
-    config: SessionConfig,
-    provider: Option<ProviderLimits>,
-    memory: MemoryRegistrar,
+    frontend: Arc<SessionFrontend>,
+    control: Weak<EngineControl>,
     #[cfg(any(test, feature = "test-hooks"))]
     test_instrumentation: SessionTestInstrumentation,
     lifecycle_authority: SessionLifecycleAuthority,
@@ -280,113 +403,113 @@ impl SessionManager {
         provider: Option<ProviderLimits>,
         admission: Arc<RwLock<()>>,
         memory: MemoryRegistrar,
+        control: Weak<EngineControl>,
         #[cfg(any(test, feature = "test-hooks"))] test_instrumentation: SessionTestInstrumentation,
     ) -> Result<Self> {
-        let max_live_connections = config.max_live_connections;
-        Ok(Self {
-            cm: CmState::new(max_live_connections)?,
-            #[cfg(any(test, feature = "test-hooks"))]
-            rejected_cm_events: AtomicU64::new(0),
-            admission,
-            shutdown_connection_close_started: AtomicBool::new(false),
-            self_ref: OnceLock::new(),
-            commands: OnceLock::new(),
-            engine: OnceLock::new(),
+        let frontend = SessionFrontend::new(
             config,
             provider,
+            Arc::clone(&admission),
             memory,
+            #[cfg(any(test, feature = "test-hooks"))]
+            test_instrumentation.clone(),
+        );
+        Ok(Self::from_frontend(
+            frontend,
+            control,
+            #[cfg(any(test, feature = "test-hooks"))]
+            test_instrumentation,
+        ))
+    }
+
+    pub(super) fn from_frontend(
+        frontend: Arc<SessionFrontend>,
+        control: Weak<EngineControl>,
+        #[cfg(any(test, feature = "test-hooks"))] test_instrumentation: SessionTestInstrumentation,
+    ) -> Self {
+        Self {
+            #[cfg(any(test, feature = "test-hooks"))]
+            rejected_cm_events: AtomicU64::new(0),
+            #[cfg(test)]
+            shutdown_connection_close_started: AtomicBool::new(false),
+            frontend,
+            control,
             #[cfg(any(test, feature = "test-hooks"))]
             test_instrumentation,
             lifecycle_authority: SessionLifecycleAuthority { _private: () },
             io_effects_commit_authority: IoEffectsCommitAuthority { _private: () },
-        })
+        }
     }
 
-    pub(super) fn bind_self(self: &Arc<Self>) {
-        self.self_ref
-            .set(Arc::downgrade(self))
-            .unwrap_or_else(|_| panic!("SessionManager self reference is bound exactly once"));
+    pub(super) fn bind_self(&self) {
+        self.frontend.bind_self();
     }
 
     pub(super) fn bind_commands(&self, commands: &Arc<CommandIngress>) {
-        self.commands
-            .set(Arc::downgrade(commands))
-            .unwrap_or_else(|_| panic!("SessionManager command ingress is bound exactly once"));
+        self.frontend.bind_commands(commands);
     }
 
-    pub(super) fn bind_engine(&self, engine: &Arc<dyn SessionEngineRuntime>) {
-        if self.engine.set(Arc::downgrade(engine)).is_err() {
-            panic!("SessionManager is bound to exactly one engine runtime");
-        }
+    pub(super) fn bind_engine(
+        &self,
+        observer: &Arc<EngineObserver>,
+        work_signal: &Arc<super::driver::WorkSignal>,
+    ) {
+        self.frontend.bind_engine(observer, work_signal);
+    }
+
+    pub(super) fn frontend(&self) -> Arc<SessionFrontend> {
+        Arc::clone(&self.frontend)
     }
 
     pub(super) fn max_live_connections(&self) -> usize {
-        self.config.max_live_connections
+        self.frontend.config.max_live_connections
     }
 
-    pub(super) fn engine_runtime(&self) -> Option<Arc<dyn SessionEngineRuntime>> {
-        self.engine.get().and_then(Weak::upgrade)
-    }
-
-    pub(in crate::v2::engine) fn engine_outcome(
-        &self,
-    ) -> Option<super::lifecycle::MemoizedTerminalResult> {
-        self.engine_runtime().and_then(|engine| engine.outcome())
+    pub(super) fn connection_drain_deadline(&self) -> std::time::Duration {
+        self.frontend.config.connection_drain_deadline
     }
 
     pub(super) fn admission_error(&self) -> Option<Error> {
-        match self.engine_runtime() {
-            Some(engine) => engine.admission_error(),
-            None => Some(Error::DriverShutdown),
-        }
+        self.frontend.admission_error()
     }
 
     pub(super) fn shutdown_requested(&self) -> bool {
-        self.engine_runtime()
-            .is_none_or(|engine| engine.shutdown_requested())
+        self.frontend
+            .commands
+            .get()
+            .and_then(Weak::upgrade)
+            .is_none_or(|commands| commands.is_closed())
     }
 
+    #[cfg(test)]
     pub(super) fn pending_terminal_outcome(
         &self,
     ) -> Option<super::lifecycle::MemoizedTerminalResult> {
-        self.engine_runtime()
-            .and_then(|engine| engine.pending_terminal_outcome())
+        self.control
+            .upgrade()
+            .and_then(|control| control.pending_terminal_outcome())
     }
 
     pub(super) fn begin_driver_failure(&self, error: Error) {
-        if let Some(engine) = self.engine_runtime() {
-            engine.begin_driver_failure(error);
+        if let Some(control) = self.control.upgrade() {
+            control.request_driver_failure(error);
         }
     }
 
-    pub(super) fn shutdown_deadline_failure(&self) -> Option<Error> {
-        self.engine_runtime()
-            .and_then(|engine| engine.shutdown_deadline_failure())
-    }
-
     pub(super) fn publish_io_work(&self) {
-        if let Some(engine) = self.engine_runtime() {
-            engine.publish_io_work();
+        if let Some(control) = self.control.upgrade() {
+            control.publish(super::driver::IO_WORK);
         }
     }
 
     pub(super) fn publish_session_work(&self) {
-        if let Some(engine) = self.engine_runtime() {
-            engine.publish_session_work();
+        if let Some(control) = self.control.upgrade() {
+            control.publish(super::driver::SESSION_WORK);
         }
     }
 
     pub(super) fn validate_connection_config(&self, config: &RdmaConnectionConfig) -> Result<()> {
-        config.validate(&self.config, self.provider.as_ref())
-    }
-
-    pub(super) fn memory_registrar(&self) -> MemoryRegistrar {
-        self.memory.clone()
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn provider_limits(&self) -> Option<ProviderLimits> {
-        self.provider
+        self.frontend.validate_connection_config(config)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -396,13 +519,9 @@ impl SessionManager {
         self.test_instrumentation.take_setup_rollback_failure()
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn pause_connect_before_enqueue(&self) {
-        self.test_instrumentation.pause_connect_before_enqueue();
-    }
-
     pub(in crate::v2::engine) fn request_connection_close_into(
         &self,
+        cm: &mut cm::CmState,
         connections: &mut ConnectionRegistry,
         io_core: &mut IoState,
         token: ConnectionToken,
@@ -411,19 +530,31 @@ impl SessionManager {
         let Lookup::Occupied(_) = connections.lookup(token) else {
             return;
         };
-        self.begin_connection_close_into(connections, token, io_core, actions);
+        self.begin_connection_close_into(cm, connections, token, io_core, actions);
     }
 
-    pub(super) fn listener_capability(&self, listener: &Arc<ListenerState>) -> SessionListener {
+    pub(super) fn listener_capability(&self, listener: &ListenerEntry) -> SessionListener {
+        let admission = listener.admission();
+        debug_assert_eq!(admission.token(), listener.token);
         SessionListener {
-            manager: self
+            frontend: self
+                .frontend
                 .self_ref
                 .get()
-                .expect("SessionManager self reference is bound before use")
+                .expect("SessionFrontend self reference is bound before use")
                 .clone(),
-            listener: Arc::downgrade(listener),
+            commands: self
+                .frontend
+                .commands
+                .get()
+                .expect("SessionFrontend command ingress is bound before use")
+                .clone(),
+            token: listener.token,
+            admission,
             close: listener.close_state(),
-            local_addr: listener.local_addr,
+            local_addr: listener
+                .local_addr
+                .expect("published listener has a local address"),
         }
     }
 
@@ -499,6 +630,20 @@ impl SessionManager {
             .with_connection_mut(token, |connection| {
                 connection.close_state().record_engine_terminal(outcome);
                 connection.finalize_engine(&self.lifecycle_authority, outcome)
+            })
+            .flatten()
+    }
+
+    pub(super) fn finalize_quarantined_connection_engine(
+        &self,
+        connections: &mut ConnectionRegistry,
+        token: ConnectionToken,
+        outcome: &super::lifecycle::MemoizedTerminalResult,
+    ) -> Option<super::io::PendingIoEvent> {
+        connections
+            .with_connection_mut(token, |connection| {
+                connection.close_state().record_engine_terminal(outcome);
+                connection.finalize_engine_without_provider(outcome)
             })
             .flatten()
     }
@@ -658,7 +803,7 @@ impl SessionManager {
         io_core: &mut IoState,
         completion: crate::wc::WorkCompletion,
     ) -> Option<ConnectionToken> {
-        let _admission = super::registry::read_unpoison(&self.admission);
+        let _admission = super::registry::read_unpoison(&self.frontend.admission);
         let pending = io_core.prepare_completion(completion)?;
         let identity = pending.identity();
         if !matches!(connections.lookup(identity.connection), Lookup::Occupied(_)) {
@@ -839,7 +984,7 @@ mod tests {
     use super::super::{CompletionMode, RdmaConnectionConfig, test_engine_pair};
     use super::DeadlineKind;
     use super::connection::{WorkRequestPoster, install_connection};
-    use super::listener::{ListenerState, RdmaListener};
+    use super::listener::{ListenerEntry, RdmaListener};
     use crate::v2::error::{Error, Result};
     use crate::v2::qp::{BatchPostOutcome, QpCapabilities};
     use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
@@ -904,8 +1049,9 @@ mod tests {
     #[test]
     fn connection_handle_routes_close_by_identity() {
         let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
+        let frontend_owners = Arc::strong_count(&engine.shared.session);
         let connection = install_connection(
-            &engine.shared.session,
+            &driver.reactor.session.manager,
             &mut driver.reactor.session.connections,
             Arc::new(TestPoster { qp_num: 17 }),
             RdmaConnectionConfig::default(),
@@ -913,6 +1059,11 @@ mod tests {
             None,
         )
         .expect("install synthetic connection");
+        assert_eq!(
+            Arc::strong_count(&engine.shared.session),
+            frontend_owners,
+            "public connection capability retains only SessionFrontend"
+        );
         let token = connection.session_token();
         connection.request_close();
         assert!(!driver.reactor.session.connections.close_started(token));
@@ -934,9 +1085,9 @@ mod tests {
 
     #[test]
     fn connection_close_observer_waits_for_retirement_after_cm_failure() {
-        let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
+        let (_engine, mut driver) = test_engine_pair(CompletionMode::Polling);
         let connection = install_connection(
-            &engine.shared.session,
+            &driver.reactor.session.manager,
             &mut driver.reactor.session.connections,
             Arc::new(TestPoster { qp_num: 18 }),
             RdmaConnectionConfig::default(),
@@ -971,33 +1122,32 @@ mod tests {
 
     #[test]
     fn session_listener_capability_is_resource_free() {
-        let (engine, _driver) = test_engine_pair(CompletionMode::Polling);
-        let state = ListenerState::test_only(4);
-        let before = Arc::strong_count(&state);
-        let listener = RdmaListener::from_state(&engine.shared.session, Arc::clone(&state));
+        let (engine, driver) = test_engine_pair(CompletionMode::Polling);
+        let state = ListenerEntry::test_only(4);
+        let frontend_owners = Arc::strong_count(&engine.shared.session);
+        let listener = RdmaListener::from_state(&driver.reactor.session.manager, &state);
 
-        assert_eq!(listener.local_addr().unwrap(), state.local_addr);
+        assert_eq!(listener.local_addr().unwrap(), state.local_addr.unwrap());
         assert_eq!(
-            Arc::strong_count(&state),
-            before,
-            "listener capability must not retain ListenerState or its CmId"
+            Arc::strong_count(&engine.shared.session),
+            frontend_owners,
+            "public listener capability retains only SessionFrontend"
         );
         let clone = listener.clone();
-        assert_eq!(Arc::strong_count(&state), before);
+        assert_eq!(Arc::strong_count(&engine.shared.session), frontend_owners);
         drop(clone);
         drop(listener);
-        assert_eq!(
-            Arc::strong_count(&state),
-            before + 1,
-            "last-frontend close transfers the only added retain to SessionManager CM work"
+        assert!(
+            engine.shared.commands.has_pending(),
+            "last frontend routes close only by stable listener identity"
         );
     }
 
     #[test]
     fn session_lifecycle_authority_mints_one_exact_qp_proof() {
-        let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
+        let (_engine, mut driver) = test_engine_pair(CompletionMode::Polling);
         let connection = install_connection(
-            &engine.shared.session,
+            &driver.reactor.session.manager,
             &mut driver.reactor.session.connections,
             Arc::new(TestPoster { qp_num: 19 }),
             RdmaConnectionConfig::default(),
@@ -1006,17 +1156,19 @@ mod tests {
         )
         .expect("install synthetic connection");
         let token = connection.session_token();
-        let proof = engine
-            .shared
+        let proof = driver
+            .reactor
             .session
+            .manager
             .establish_qp_destruction_proof(&mut driver.reactor.session.connections, token)
             .expect("first successful destroy mints proof");
         assert_eq!(proof.connection, token);
         assert_eq!(proof.qp_num, connection.identity().qp_num());
         assert!(matches!(
-            engine
-                .shared
+            driver
+                .reactor
                 .session
+                .manager
                 .establish_qp_destruction_proof(
                     &mut driver.reactor.session.connections,
                     token,
@@ -1025,7 +1177,7 @@ mod tests {
         ));
 
         assert_eq!(
-            engine.shared.session.reclaim_after_qp_destroy(
+            driver.reactor.session.manager.reclaim_after_qp_destroy(
                 &mut driver.reactor.session.connections,
                 driver.reactor.io.core_mut(),
                 proof,

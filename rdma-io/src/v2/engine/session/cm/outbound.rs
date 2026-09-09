@@ -10,19 +10,20 @@ use std::task::{Context, Poll};
 use super::super::connection::ConnectionState;
 use super::{
     CmEventReject, CmEventSnapshot, CmRouteToken, CmState, ConnectionSetup, ContextRoute,
-    EngineResources, EstablishedConnectionRoute, EventDisposition, Lookup, OutboundRoute,
-    OutboundState, RdmaConnection, RdmaConnectionConfig, SessionManager, SharedCmId,
-    VerbsConnectionResources, build_qp, empty_connection_setup, install_reserved_connection,
-    is_failure_event, lock_unpoison, run_setup_before_establish,
+    EngineReactorResources, EstablishedConnectionRoute, EventDisposition, Lookup, OutboundRoute,
+    OutboundState, RdmaConnection, RdmaConnectionConfig, SessionFrontend, SessionManager,
+    SharedCmId, VerbsConnectionResources, build_qp, empty_connection_setup,
+    install_reserved_connection, is_failure_event, run_setup_before_establish,
 };
 use crate::cm::{CmEventType, CmId, PortSpace};
 use crate::v2::engine::reactor::CommandIngress;
 use crate::v2::engine::reactor::completion::CommandCompletion;
+use crate::v2::engine::registry::lock_unpoison;
 use crate::v2::engine::session::registry::ConnectionRegistry;
 use crate::v2::error::{Error, Result};
 
 pub(in crate::v2::engine) async fn connect(
-    shared: Arc<SessionManager>,
+    shared: Arc<SessionFrontend>,
     commands: Arc<CommandIngress>,
     address: SocketAddr,
     config: RdmaConnectionConfig,
@@ -31,7 +32,7 @@ pub(in crate::v2::engine) async fn connect(
 }
 
 pub(in crate::v2::engine) async fn connect_with_setup(
-    shared: Arc<SessionManager>,
+    shared: Arc<SessionFrontend>,
     commands: Arc<CommandIngress>,
     address: SocketAddr,
     config: RdmaConnectionConfig,
@@ -49,10 +50,15 @@ pub(in crate::v2::engine) async fn connect_with_setup(
             error
         }
     })?;
+    let admission = super::super::super::registry::read_unpoison(&shared.admission);
+    if let Some(error) = shared.admission_error() {
+        return Err(error);
+    }
     let request = Arc::new(OutboundRequest::new(address, config, setup));
     #[cfg(any(test, feature = "test-hooks"))]
     shared.pause_connect_before_enqueue();
     commands.enqueue_connect(Arc::clone(&request), permit);
+    drop(admission);
     commands.publish_command_work();
     let waiter = ConnectWaiter {
         commands: Arc::downgrade(&commands),
@@ -67,14 +73,14 @@ pub(in crate::v2::engine) async fn connect_with_setup(
 }
 
 pub(super) fn start(
-    state: &CmState,
+    state: &mut CmState,
     connections: &mut ConnectionRegistry,
-    resources: &EngineResources,
+    resources: &EngineReactorResources,
     request: Arc<OutboundRequest>,
     reservation: super::ConnectionReservation,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<bool> {
-    if request.observer.completion.is_cancelled() || state.shutting_down.load(Ordering::Acquire) {
+    if request.observer.completion.is_cancelled() || state.shutting_down {
         drop(reservation);
         request.complete_into(Err(Error::DriverShutdown), actions);
         return Ok(false);
@@ -169,7 +175,7 @@ pub(super) fn start(
 }
 
 pub(super) fn process_cancellation(
-    state: &CmState,
+    state: &mut CmState,
     connections: &mut ConnectionRegistry,
     shared: &SessionManager,
     io_core: &mut crate::v2::engine::io_core::IoState,
@@ -222,7 +228,7 @@ pub(super) fn process_cancellation(
             connection: connection.clone(),
         },
     );
-    shared.begin_connection_close_into(connections, connection_token, io_core, actions);
+    shared.begin_connection_close_into(state, connections, connection_token, io_core, actions);
     drop(request.take_result());
     if connections
         .with_connection(connection_token, |connection| {
@@ -245,11 +251,11 @@ pub(super) fn process_cancellation(
 }
 
 pub(super) fn handle_event(
-    state: &CmState,
+    state: &mut CmState,
     connections: &mut ConnectionRegistry,
     shared: &SessionManager,
     io_core: &mut crate::v2::engine::io_core::IoState,
-    resources: &EngineResources,
+    resources: &EngineReactorResources,
     token: CmRouteToken,
     snapshot: CmEventSnapshot,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
@@ -309,10 +315,10 @@ pub(super) fn handle_event(
 }
 
 fn handle_addr_resolved(
-    state: &CmState,
+    state: &mut CmState,
     connections: &mut ConnectionRegistry,
     shared: &SessionManager,
-    resources: &EngineResources,
+    resources: &EngineReactorResources,
     token: CmRouteToken,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<EventDisposition> {
@@ -362,11 +368,11 @@ fn handle_addr_resolved(
 }
 
 fn handle_route_resolved(
-    state: &CmState,
+    state: &mut CmState,
     connections: &mut ConnectionRegistry,
     shared: &SessionManager,
     io_core: &mut crate::v2::engine::io_core::IoState,
-    resources: &EngineResources,
+    resources: &EngineReactorResources,
     token: CmRouteToken,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<EventDisposition> {
@@ -548,7 +554,7 @@ fn handle_route_resolved(
     reason = "CM failure transition dependencies stay explicit"
 )]
 fn fail_registered_connection(
-    state: &CmState,
+    state: &mut CmState,
     connections: &mut ConnectionRegistry,
     shared: &SessionManager,
     io_core: &mut crate::v2::engine::io_core::IoState,
@@ -570,7 +576,7 @@ fn fail_registered_connection(
             connection: EstablishedConnectionRoute::new(connection_token),
         },
     );
-    shared.begin_connection_close_into(connections, connection_token, io_core, actions);
+    shared.begin_connection_close_into(state, connections, connection_token, io_core, actions);
     drop(connection);
     if connections
         .with_connection(connection_token, |connection| {
@@ -597,7 +603,7 @@ fn fail_registered_connection(
 }
 
 fn handle_established(
-    state: &CmState,
+    state: &mut CmState,
     connections: &mut ConnectionRegistry,
     shared: &SessionManager,
     io_core: &mut crate::v2::engine::io_core::IoState,
@@ -646,7 +652,7 @@ fn handle_established(
 }
 
 fn handle_disconnected(
-    state: &CmState,
+    state: &mut CmState,
     connections: &mut ConnectionRegistry,
     shared: &SessionManager,
     io_core: &mut crate::v2::engine::io_core::IoState,
@@ -656,7 +662,8 @@ fn handle_disconnected(
     let route_state = connections.take_outbound_state_if(token, |route_state| {
         matches!(
             route_state,
-            OutboundState::EstablishedAwaitingDelivery { .. }
+            OutboundState::AwaitEstablished { .. }
+                | OutboundState::EstablishedAwaitingDelivery { .. }
         )
     });
     let Some(route_state) = route_state else {
@@ -666,6 +673,26 @@ fn handle_disconnected(
         return Ok(EventDisposition::Rejected(CmEventReject::Unexpected));
     };
     let (request, connection) = match route_state {
+        OutboundState::AwaitEstablished {
+            request,
+            connection,
+        } => {
+            fail_registered_connection(
+                state,
+                connections,
+                shared,
+                io_core,
+                token,
+                request,
+                connection,
+                Error::Verbs(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "peer disconnected before outbound establishment",
+                )),
+                actions,
+            )?;
+            return Ok(EventDisposition::Handled);
+        }
         OutboundState::EstablishedAwaitingDelivery {
             request,
             connection,
@@ -702,7 +729,7 @@ fn handle_disconnected(
             },
         );
     }
-    shared.begin_connection_close_into(connections, connection_token, io_core, actions);
+    shared.begin_connection_close_into(state, connections, connection_token, io_core, actions);
     if connections
         .with_connection(connection_token, |connection| {
             connection.io_ledger.accepted_count()
@@ -723,7 +750,7 @@ fn handle_disconnected(
 }
 
 fn handle_failure_event(
-    state: &CmState,
+    state: &mut CmState,
     connections: &mut ConnectionRegistry,
     shared: &SessionManager,
     io_core: &mut crate::v2::engine::io_core::IoState,
@@ -825,7 +852,13 @@ fn handle_failure_event(
                     },
                 );
             }
-            shared.begin_connection_close_into(connections, connection_token, io_core, actions);
+            shared.begin_connection_close_into(
+                state,
+                connections,
+                connection_token,
+                io_core,
+                actions,
+            );
             if connections
                 .with_connection(connection_token, |connection| {
                     connection.io_ledger.accepted_count()
@@ -866,7 +899,13 @@ fn handle_failure_event(
                     connection: connection.clone(),
                 },
             );
-            shared.begin_connection_close_into(connections, connection_token, io_core, actions);
+            shared.begin_connection_close_into(
+                state,
+                connections,
+                connection_token,
+                io_core,
+                actions,
+            );
             if connections
                 .with_connection(connection_token, |connection| {
                     connection.io_ledger.accepted_count()
@@ -965,6 +1004,7 @@ impl OutboundRequest {
             .complete_into(result, false, actions);
     }
 
+    #[cfg(test)]
     pub(in crate::v2::engine) fn complete_failure(&self, error: Error) {
         self.observer.completion.complete(Err(error));
     }
@@ -1068,5 +1108,132 @@ impl Drop for ConnectWaiter {
         if let Some(commands) = self.commands.upgrade() {
             commands.request_connect_cancel(request);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::v2::engine::CompletionMode;
+    use crate::v2::engine::session::connection::WorkRequestPoster;
+    use crate::v2::qp::{BatchPostOutcome, QpCapabilities};
+    use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
+
+    struct ClosePoster {
+        steps: Mutex<Vec<&'static str>>,
+    }
+
+    impl WorkRequestPoster for ClosePoster {
+        fn qp_num(&self) -> u32 {
+            81
+        }
+
+        fn capabilities(&self) -> Option<QpCapabilities> {
+            None
+        }
+
+        fn post_send(&self, _batch: &mut PreparedSendBatch) -> Result<BatchPostOutcome> {
+            Ok(BatchPostOutcome::AllAccepted)
+        }
+
+        fn post_recv(&self, _batch: &mut PreparedRecvBatch) -> Result<BatchPostOutcome> {
+            Ok(BatchPostOutcome::AllAccepted)
+        }
+
+        fn to_error(
+            &self,
+            _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
+        ) -> Result<()> {
+            lock_unpoison(&self.steps).push("to_error");
+            Ok(())
+        }
+
+        fn destroy_qp(
+            &self,
+            _authority: &crate::v2::engine::session::SessionLifecycleAuthority,
+        ) -> Result<bool> {
+            lock_unpoison(&self.steps).push("destroy_qp");
+            Ok(true)
+        }
+
+        fn disconnect(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn disconnect_before_outbound_establishment_resolves_the_connect_request() {
+        let (_engine, mut driver) = crate::v2::engine::test_engine_pair(CompletionMode::Polling);
+        let poster = Arc::new(ClosePoster {
+            steps: Mutex::new(Vec::new()),
+        });
+        let request = Arc::new(OutboundRequest::new(
+            "127.0.0.1:7471".parse().unwrap(),
+            RdmaConnectionConfig::default(),
+            empty_connection_setup(),
+        ));
+        let reservation = driver
+            .reactor
+            .session
+            .connections
+            .try_reserve()
+            .expect("test connection admission is available");
+        let route = driver
+            .reactor
+            .session
+            .connections
+            .register_outbound(|route| OutboundRoute::new(route, Arc::clone(&request)))
+            .unwrap();
+        let connection = install_reserved_connection(
+            &driver.reactor.session.manager,
+            &mut driver.reactor.session.connections,
+            Some(route),
+            Arc::clone(&poster),
+            RdmaConnectionConfig::default(),
+            None,
+            None,
+            reservation,
+        )
+        .unwrap();
+        assert!(driver.reactor.session.connections.set_outbound_state(
+            route,
+            OutboundState::AwaitEstablished {
+                request: Arc::clone(&request),
+                connection,
+            },
+        ));
+
+        let mut actions = crate::v2::engine::reactor::ReactorActions::default();
+        assert!(matches!(
+            handle_disconnected(
+                &mut driver.reactor.session.cm,
+                &mut driver.reactor.session.connections,
+                &driver.reactor.session.manager,
+                driver.reactor.io.core_mut(),
+                route,
+                &mut actions,
+            )
+            .unwrap(),
+            EventDisposition::Handled
+        ));
+        assert!(matches!(
+            request.take_result(),
+            Some(Err(Error::Verbs(error)))
+                if error.kind() == std::io::ErrorKind::ConnectionAborted
+        ));
+        assert!(!matches!(
+            driver.reactor.session.connections.lookup_outbound(route),
+            Lookup::Occupied(_)
+        ));
+        assert_eq!(
+            *poster
+                .steps
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+            vec!["to_error", "destroy_qp"]
+        );
+        actions.publish();
     }
 }

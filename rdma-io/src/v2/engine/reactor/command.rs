@@ -1,4 +1,4 @@
-//! Bounded typed command admission ahead of the current session backend.
+//! Bounded typed command admission into the driver-owned reactor.
 
 use std::collections::{HashSet, VecDeque};
 use std::future::poll_fn;
@@ -11,13 +11,15 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use super::super::driver::{COMMAND_WORK, SESSION_WORK, WorkSignal};
 use super::super::io::ProtocolCommand;
 use super::super::io_core::OperationCommand;
-use super::super::registry::{ConnectionToken, OperationToken, lock_unpoison, read_unpoison};
-use super::super::session::SessionManager;
+use super::super::registry::{
+    ConnectionToken, ListenerToken, OperationToken, lock_unpoison, read_unpoison, write_unpoison,
+};
+use super::super::session::SessionFrontend;
 use super::super::session::SessionReactorSources;
 use super::super::session::cm::OutboundRequest;
 use super::super::session::connection::ConnectionReservation;
-use super::super::session::listener::ListenRequest;
-use super::super::{EngineShared, Error};
+use super::super::session::listener::{AcceptRequest, ListenRequest, ListenerAdmission};
+use super::super::{EngineFrontendRoot, Error};
 
 enum SessionCommand {
     Connect {
@@ -41,6 +43,7 @@ enum SessionCommand {
 struct CommandQueues {
     connect: VecDeque<SessionCommand>,
     listen: VecDeque<SessionCommand>,
+    accept: VecDeque<(ListenerToken, Arc<AcceptRequest>)>,
     operation: VecDeque<(Arc<OperationCommand>, OwnedSemaphorePermit)>,
     protocol: VecDeque<ProtocolQueueEntry>,
     next_class: usize,
@@ -64,11 +67,16 @@ struct ControlQueue {
     connection_fail_qp_destroy: VecDeque<ConnectionToken>,
     operation_cancel: VecDeque<OperationToken>,
     operation_cancel_set: HashSet<OperationToken>,
+    listener_close: VecDeque<ListenerToken>,
+    listener_close_set: HashSet<ListenerToken>,
+    listener_work: VecDeque<ListenerToken>,
+    listener_work_set: HashSet<ListenerToken>,
 }
 
 pub(in crate::v2::engine) struct CommandTurn {
     pub(in crate::v2::engine) session_work: bool,
     pub(in crate::v2::engine) has_more: bool,
+    pub(in crate::v2::engine) shutdown_requested: bool,
 }
 
 #[derive(Debug)]
@@ -80,8 +88,8 @@ pub(in crate::v2::engine) struct ConnectAdmission {
 /// Cloneable, resource-free frontend admission endpoint.
 ///
 /// Connect and listen permits bound only commands waiting for the driver.
-/// Dequeued connection commands transfer into the reactor-owned generational
-/// lifecycle; listener commands retain the common session adapter.
+/// Dequeued commands transfer into reactor-owned generational connection and
+/// listener lifecycles.
 pub(in crate::v2::engine) struct CommandIngress {
     connect_permits: Arc<Semaphore>,
     connection_permits: Arc<Semaphore>,
@@ -91,8 +99,11 @@ pub(in crate::v2::engine) struct CommandIngress {
     queues: Mutex<CommandQueues>,
     controls: Mutex<ControlQueue>,
     shutdown: AtomicBool,
+    shutdown_command_pending: AtomicBool,
     closed: AtomicBool,
+    closed_error: Mutex<Option<Error>>,
     max_connection_controls: usize,
+    max_listener_controls: usize,
     signal: Arc<WorkSignal>,
 }
 
@@ -111,8 +122,11 @@ impl CommandIngress {
             queues: Mutex::new(CommandQueues::default()),
             controls: Mutex::new(ControlQueue::default()),
             shutdown: AtomicBool::new(false),
+            shutdown_command_pending: AtomicBool::new(false),
             closed: AtomicBool::new(false),
+            closed_error: Mutex::new(None),
             max_connection_controls: connection_capacity,
+            max_listener_controls: connection_capacity,
             signal,
         })
     }
@@ -197,6 +211,16 @@ impl CommandIngress {
             });
     }
 
+    pub(in crate::v2::engine) fn enqueue_accept(
+        &self,
+        listener: ListenerToken,
+        request: Arc<AcceptRequest>,
+    ) {
+        lock_unpoison(&self.queues)
+            .accept
+            .push_back((listener, request));
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     pub(in crate::v2::engine) fn enqueue_test_connection_install(
         &self,
@@ -247,9 +271,79 @@ impl CommandIngress {
         command.is_some()
     }
 
+    pub(in crate::v2::engine) fn cancel_accept(&self, target: &Arc<AcceptRequest>) -> bool {
+        let request = {
+            let mut queues = lock_unpoison(&self.queues);
+            let position = queues
+                .accept
+                .iter()
+                .position(|(_, request)| Arc::ptr_eq(request, target));
+            position.and_then(|position| queues.accept.remove(position))
+        };
+        if let Some((_, request)) = request {
+            request.release_permit();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(in crate::v2::engine) fn request_listener_work(&self, token: ListenerToken) {
+        let inserted = {
+            let mut controls = lock_unpoison(&self.controls);
+            if controls.listener_work_set.insert(token) {
+                controls.listener_work.push_back(token);
+                true
+            } else {
+                false
+            }
+        };
+        if inserted {
+            self.publish_command_work();
+        }
+    }
+
+    pub(in crate::v2::engine) fn request_listener_close(
+        &self,
+        frontend: &SessionFrontend,
+        token: ListenerToken,
+        admission: &ListenerAdmission,
+    ) {
+        if admission.is_terminal() {
+            return;
+        }
+        let inserted = {
+            let _admission = write_unpoison(&frontend.admission);
+            if admission.is_terminal() {
+                return;
+            }
+            admission.close();
+            if self.closed.load(Ordering::Acquire) {
+                return;
+            }
+            let mut controls = lock_unpoison(&self.controls);
+            if !controls.listener_close_set.insert(token) {
+                false
+            } else if controls.listener_close.len() >= self.max_listener_controls {
+                controls.listener_close_set.remove(&token);
+                debug_assert!(
+                    false,
+                    "validated live listener controls cannot exceed configured capacity"
+                );
+                false
+            } else {
+                controls.listener_close.push_back(token);
+                true
+            }
+        };
+        if inserted {
+            self.publish_command_work();
+        }
+    }
+
     pub(in crate::v2::engine) fn enqueue_operation(
         &self,
-        manager: &SessionManager,
+        manager: &SessionFrontend,
         command: Arc<OperationCommand>,
         permit: OwnedSemaphorePermit,
     ) -> Result<(), Error> {
@@ -266,7 +360,7 @@ impl CommandIngress {
     #[cfg_attr(test, allow(dead_code))]
     pub(in crate::v2::engine) fn enqueue_protocol(
         &self,
-        manager: &SessionManager,
+        manager: &SessionFrontend,
         command: ProtocolCommand,
         permit: OwnedSemaphorePermit,
     ) -> Result<(), (Error, ProtocolCommand)> {
@@ -339,7 +433,7 @@ impl CommandIngress {
 
     pub(in crate::v2::engine) fn request_connection_close(
         &self,
-        manager: &SessionManager,
+        manager: &SessionFrontend,
         token: ConnectionToken,
     ) {
         let inserted = {
@@ -401,12 +495,19 @@ impl CommandIngress {
 
     pub(in crate::v2::engine) fn request_shutdown(&self) {
         if !self.shutdown.swap(true, Ordering::AcqRel) {
+            self.shutdown_command_pending.store(true, Ordering::Release);
             self.signal.publish(COMMAND_WORK);
         }
     }
 
+    #[cfg(test)]
     pub(in crate::v2::engine) fn close_admission(&self) {
+        self.close_admission_with(Error::DriverShutdown);
+    }
+
+    pub(in crate::v2::engine) fn close_admission_with(&self, error: Error) {
         if !self.closed.swap(true, Ordering::AcqRel) {
+            *lock_unpoison(&self.closed_error) = Some(error);
             self.connect_permits.close();
             self.connection_permits.close();
             self.listen_permits.close();
@@ -414,10 +515,20 @@ impl CommandIngress {
         }
     }
 
+    pub(in crate::v2::engine) fn admission_error(&self) -> Option<Error> {
+        lock_unpoison(&self.closed_error).clone()
+    }
+
+    pub(in crate::v2::engine) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
     pub(in crate::v2::engine) fn drain_ordinary(&self, error: Error) {
         let mut queues = lock_unpoison(&self.queues);
         let commands: Vec<_> = queues.connect.drain(..).collect();
         let listens: Vec<_> = queues.listen.drain(..).collect();
+        let accepts: Vec<_> = queues.accept.drain(..).collect();
         let operations: Vec<_> = queues.operation.drain(..).collect();
         let protocols: Vec<_> = queues.protocol.drain(..).collect();
         drop(queues);
@@ -434,6 +545,10 @@ impl CommandIngress {
                     request.complete_failure(error.clone());
                 }
             }
+        }
+        for (_, request) in accepts {
+            request.release_permit();
+            request.complete(Err(error.clone()));
         }
         for (command, _permit) in operations {
             command.cancel_before_execution(error.clone());
@@ -456,6 +571,7 @@ impl CommandIngress {
         let mut queues = lock_unpoison(&self.queues);
         let commands: Vec<_> = queues.connect.drain(..).collect();
         let listens: Vec<_> = queues.listen.drain(..).collect();
+        let accepts: Vec<_> = queues.accept.drain(..).collect();
         let operations: Vec<_> = queues.operation.drain(..).collect();
         let protocols: Vec<_> = queues.protocol.drain(..).collect();
         drop(queues);
@@ -472,6 +588,10 @@ impl CommandIngress {
                     request.complete_failure_into(error.clone(), actions);
                 }
             }
+        }
+        for (_, request) in accepts {
+            request.release_permit();
+            request.complete_into(Err(error.clone()), actions);
         }
         for (command, _permit) in operations {
             command.cancel_before_execution_into(error.clone(), actions);
@@ -498,17 +618,22 @@ impl CommandIngress {
         self.drain_ordinary(error);
     }
 
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn pending_listener_closes(&self) -> usize {
+        lock_unpoison(&self.controls).listener_close.len()
+    }
+
     pub(in crate::v2::engine) fn service_turn_into(
         &self,
-        shared: &Arc<EngineShared>,
+        shared: &Arc<EngineFrontendRoot>,
         io: &mut super::super::io_core::IoState,
         session: &mut SessionReactorSources,
         actions: &mut super::ReactorActions,
     ) -> CommandTurn {
         let mut session_work = false;
 
-        if self.shutdown.swap(false, Ordering::AcqRel) {
-            shared.start_shutdown_progress();
+        let shutdown_requested = self.shutdown_command_pending.swap(false, Ordering::AcqRel);
+        if shutdown_requested {
             session_work = true;
         }
 
@@ -520,7 +645,7 @@ impl CommandIngress {
             if let Some(Err(error)) = session.connections.with_connection(token, |connection| {
                 connection.fail_next_qp_destroy_for_test()
             }) {
-                shared.session.begin_driver_failure(error);
+                session.manager.begin_driver_failure(error);
             }
             session_work = true;
         }
@@ -534,7 +659,7 @@ impl CommandIngress {
                 .connections
                 .with_connection(token, |connection| connection.disconnect_for_test())
             {
-                shared.session.begin_driver_failure(error);
+                session.manager.begin_driver_failure(error);
             }
             session_work = true;
         }
@@ -550,12 +675,39 @@ impl CommandIngress {
             None
         };
         if let Some(token) = close {
-            shared.session.request_connection_close_into(
+            session.manager.request_connection_close_into(
+                &mut session.cm,
                 &mut session.connections,
                 io,
                 token,
                 actions,
             );
+            session_work = true;
+        }
+
+        let listener_close = {
+            let mut controls = lock_unpoison(&self.controls);
+            let token = controls.listener_close.pop_front();
+            if let Some(token) = token {
+                controls.listener_close_set.remove(&token);
+            }
+            token
+        };
+        if let Some(token) = listener_close {
+            session.cm.request_listener_close(token);
+            session_work = true;
+        }
+
+        let listener_work = {
+            let mut controls = lock_unpoison(&self.controls);
+            let token = controls.listener_work.pop_front();
+            if let Some(token) = token {
+                controls.listener_work_set.remove(&token);
+            }
+            token
+        };
+        if let Some(token) = listener_work {
+            session.cm.enqueue_listener_work(token);
             session_work = true;
         }
 
@@ -567,11 +719,11 @@ impl CommandIngress {
 
         #[cfg(any(test, feature = "test-hooks"))]
         if let Some(token) = lock_unpoison(&self.controls).connection_error.pop_front() {
-            if let Err(error) = shared
-                .session
+            if let Err(error) = session
+                .manager
                 .transition_connection_to_error_token(&mut session.connections, token)
             {
-                shared.session.begin_driver_failure(error);
+                session.manager.begin_driver_failure(error);
             }
             session_work = true;
         }
@@ -590,6 +742,7 @@ impl CommandIngress {
 
         enum ReadyCommand {
             Session(SessionCommand),
+            Accept(ListenerToken, Arc<AcceptRequest>),
             Operation(Arc<OperationCommand>, OwnedSemaphorePermit),
             Protocol(ProtocolQueueEntry),
         }
@@ -599,12 +752,13 @@ impl CommandIngress {
                 .admission_error()
                 .unwrap_or(Error::DriverShutdown)
         });
+        let listener_slot_available = session.cm.listener_slot_available();
         let command = if actions.remaining() != 0 {
             let mut queues = lock_unpoison(&self.queues);
             let mut selected = None;
-            for offset in 0..4 {
-                let class = (queues.next_class + offset) % 4;
-                let required_actions = if class == 2 && terminal_error.is_none() {
+            for offset in 0..5 {
+                let class = (queues.next_class + offset) % 5;
+                let required_actions = if class == 3 && terminal_error.is_none() {
                     // Starting an operation can synchronously consume an early
                     // CQE (event + operation wake + close wake) before the
                     // command-completion wake is detached.
@@ -617,16 +771,23 @@ impl CommandIngress {
                 }
                 selected = match class {
                     0 => queues.connect.pop_front().map(ReadyCommand::Session),
-                    1 => queues.listen.pop_front().map(ReadyCommand::Session),
+                    1 if listener_slot_available || terminal_error.is_some() => {
+                        queues.listen.pop_front().map(ReadyCommand::Session)
+                    }
+                    1 => None,
                     2 => queues
+                        .accept
+                        .pop_front()
+                        .map(|(listener, request)| ReadyCommand::Accept(listener, request)),
+                    3 => queues
                         .operation
                         .pop_front()
                         .map(|(command, permit)| ReadyCommand::Operation(command, permit)),
-                    3 => queues.protocol.pop_front().map(ReadyCommand::Protocol),
+                    4 => queues.protocol.pop_front().map(ReadyCommand::Protocol),
                     _ => unreachable!(),
                 };
                 if selected.is_some() {
-                    queues.next_class = (class + 1) % 4;
+                    queues.next_class = (class + 1) % 5;
                     break;
                 }
             }
@@ -648,12 +809,46 @@ impl CommandIngress {
                         session_work = true;
                     }
                 }
-                ReadyCommand::Session(SessionCommand::Listen { request, .. }) => {
+                ReadyCommand::Session(SessionCommand::Listen {
+                    request,
+                    _permit: permit,
+                }) => {
                     if let Some(error) = terminal_error {
                         request.complete_into(Err(error), actions);
                     } else {
-                        shared.session.cm.enqueue_listen(request);
-                        session_work = true;
+                        match session.cm.reserve_listener(&request) {
+                            Ok(token) => {
+                                session.cm.enqueue_listen(token, request);
+                                session_work = true;
+                            }
+                            Err(Error::CapacityExhausted) => {
+                                lock_unpoison(&self.queues).listen.push_front(
+                                    SessionCommand::Listen {
+                                        request,
+                                        _permit: permit,
+                                    },
+                                );
+                            }
+                            Err(error) => request.complete_into(Err(error), actions),
+                        }
+                    }
+                }
+                ReadyCommand::Accept(listener, request) => {
+                    if let Some(error) = terminal_error {
+                        request.release_permit();
+                        request.complete_into(Err(error), actions);
+                    } else {
+                        let result = session.cm.admit_accept(listener, Arc::clone(&request));
+                        match result {
+                            Ok(()) => {
+                                session.cm.enqueue_listener_work(listener);
+                                session_work = true;
+                            }
+                            Err(error) => {
+                                request.release_permit();
+                                request.complete_into(Err(error), actions);
+                            }
+                        }
                     }
                 }
                 #[cfg(any(test, feature = "test-hooks"))]
@@ -666,7 +861,7 @@ impl CommandIngress {
                         request.complete_failure_into(error, actions);
                     } else {
                         request.execute_into(
-                            &shared.session,
+                            &session.manager,
                             &mut session.connections,
                             reservation,
                             actions,
@@ -717,20 +912,21 @@ impl CommandIngress {
         if session_work {
             self.signal.publish(SESSION_WORK);
         }
-        let has_more = self.has_pending();
+        let has_more = self.has_runnable(session.cm.listener_slot_available());
         if has_more {
             self.signal.publish(COMMAND_WORK);
         }
         CommandTurn {
             session_work,
             has_more,
+            shutdown_requested,
         }
     }
 
     #[cfg(test)]
     pub(in crate::v2::engine) fn service_turn(
         &self,
-        shared: &Arc<EngineShared>,
+        shared: &Arc<EngineFrontendRoot>,
         io: &mut super::super::io_core::IoState,
         session: &mut SessionReactorSources,
     ) -> CommandTurn {
@@ -741,12 +937,13 @@ impl CommandIngress {
     }
 
     pub(in crate::v2::engine) fn has_pending(&self) -> bool {
-        if self.shutdown.load(Ordering::Acquire) {
+        if self.shutdown_command_pending.load(Ordering::Acquire) {
             return true;
         }
         let queues = lock_unpoison(&self.queues);
         if !queues.connect.is_empty()
             || !queues.listen.is_empty()
+            || !queues.accept.is_empty()
             || !queues.operation.is_empty()
             || !queues.protocol.is_empty()
         {
@@ -756,6 +953,8 @@ impl CommandIngress {
         let controls = lock_unpoison(&self.controls);
         !controls.connection_close.is_empty()
             || !controls.connect_cancel.is_empty()
+            || !controls.listener_close.is_empty()
+            || !controls.listener_work.is_empty()
             || {
                 #[cfg(any(test, feature = "test-hooks"))]
                 {
@@ -769,6 +968,45 @@ impl CommandIngress {
                 }
             }
             || !controls.operation_cancel.is_empty()
+    }
+
+    pub(in crate::v2::engine) fn has_runnable(&self, listener_slot_available: bool) -> bool {
+        if self.shutdown_command_pending.load(Ordering::Acquire) {
+            return true;
+        }
+        let queues = lock_unpoison(&self.queues);
+        let listener_runnable = listener_slot_available || self.closed.load(Ordering::Acquire);
+        if !queues.connect.is_empty()
+            || (!queues.listen.is_empty() && listener_runnable)
+            || !queues.accept.is_empty()
+            || !queues.operation.is_empty()
+            || !queues.protocol.is_empty()
+        {
+            return true;
+        }
+        drop(queues);
+        let controls = lock_unpoison(&self.controls);
+        !controls.connection_close.is_empty()
+            || !controls.connect_cancel.is_empty()
+            || !controls.listener_close.is_empty()
+            || !controls.listener_work.is_empty()
+            || {
+                #[cfg(any(test, feature = "test-hooks"))]
+                {
+                    !controls.connection_error.is_empty()
+                        || !controls.connection_disconnect.is_empty()
+                        || !controls.connection_fail_qp_destroy.is_empty()
+                }
+                #[cfg(not(any(test, feature = "test-hooks")))]
+                {
+                    false
+                }
+            }
+            || !controls.operation_cancel.is_empty()
+    }
+
+    pub(in crate::v2::engine) fn shutdown_requested(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -796,6 +1034,11 @@ impl CommandIngress {
     }
 
     #[cfg(test)]
+    pub(in crate::v2::engine) fn pending_accepts(&self) -> usize {
+        lock_unpoison(&self.queues).accept.len()
+    }
+
+    #[cfg(test)]
     pub(in crate::v2::engine) fn available_listen_permits(&self) -> usize {
         self.listen_permits.available_permits()
     }
@@ -813,6 +1056,7 @@ impl CommandIngress {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::Context;
@@ -821,7 +1065,8 @@ mod tests {
     use super::super::super::io::{
         ProtocolCommand, ProtocolTestAdmission, ProtocolTestProbe, event_port,
     };
-    use super::super::super::{CompletionMode, test_engine_pair};
+    use super::super::super::session::listener::{RdmaListenerConfig, listen};
+    use super::super::super::{CompletionMode, test_engine_pair, test_engine_pair_with_capacity};
     use super::CommandIngress;
 
     fn protocol_probe(cancelled: bool) -> ProtocolTestProbe {
@@ -1112,5 +1357,107 @@ mod tests {
         ingress.request_shutdown();
         ingress.request_shutdown();
         assert!(ingress.shutdown.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn blocked_listen_head_runs_after_exact_listener_slot_release() {
+        let (engine, mut driver) = test_engine_pair_with_capacity(CompletionMode::Polling, 1);
+        let occupied = driver.reactor.session.cm.reserve_test_listener_slot(1);
+        let mut pending = Box::pin(listen(
+            Arc::clone(&engine.shared.session),
+            Arc::clone(&engine.shared.commands),
+            "127.0.0.2:0".parse().unwrap(),
+            RdmaListenerConfig::default().backlog(1),
+        ));
+        let waker = futures_util::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(pending.as_mut().poll(&mut cx).is_pending());
+        let report = engine.shared.commands.service_turn(
+            &engine.shared,
+            driver.reactor.io.core_mut(),
+            &mut driver.reactor.session,
+        );
+        assert!(!report.has_more);
+        assert_eq!(engine.shared.commands.pending_listens(), 1);
+        assert!(
+            driver
+                .reactor
+                .session
+                .cm
+                .pending_listen_addresses()
+                .is_empty()
+        );
+
+        driver.reactor.session.cm.release_test_listener(occupied);
+        let report = engine.shared.commands.service_turn(
+            &engine.shared,
+            driver.reactor.io.core_mut(),
+            &mut driver.reactor.session,
+        );
+        assert!(report.session_work);
+        assert_eq!(engine.shared.commands.pending_listens(), 0);
+        assert_eq!(
+            driver.reactor.session.cm.pending_listen_addresses(),
+            vec!["127.0.0.2:0".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn blocked_listen_cancellation_releases_lane_without_slot_transfer() {
+        let (engine, mut driver) = test_engine_pair_with_capacity(CompletionMode::Polling, 1);
+        let _occupied = driver.reactor.session.cm.reserve_test_listener_slot(1);
+        let mut pending = Box::pin(listen(
+            Arc::clone(&engine.shared.session),
+            Arc::clone(&engine.shared.commands),
+            "127.0.0.2:0".parse().unwrap(),
+            RdmaListenerConfig::default().backlog(1),
+        ));
+        let waker = futures_util::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(pending.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(engine.shared.commands.available_listen_permits(), 0);
+        drop(pending);
+        assert_eq!(engine.shared.commands.pending_listens(), 0);
+        assert_eq!(engine.shared.commands.available_listen_permits(), 1);
+    }
+
+    #[test]
+    fn shutdown_and_driver_drop_dispose_a_slot_blocked_listen_once() {
+        for drop_driver in [false, true] {
+            let (engine, mut driver) = test_engine_pair_with_capacity(CompletionMode::Polling, 1);
+            let _occupied = driver.reactor.session.cm.reserve_test_listener_slot(1);
+            let mut pending = Box::pin(listen(
+                Arc::clone(&engine.shared.session),
+                Arc::clone(&engine.shared.commands),
+                "127.0.0.2:0".parse().unwrap(),
+                RdmaListenerConfig::default().backlog(1),
+            ));
+            let waker = futures_util::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            assert!(pending.as_mut().poll(&mut cx).is_pending());
+            if drop_driver {
+                drop(driver);
+            } else {
+                engine.shared.request_shutdown();
+                engine.shared.commands.service_turn(
+                    &engine.shared,
+                    driver.reactor.io.core_mut(),
+                    &mut driver.reactor.session,
+                );
+            }
+            assert!(matches!(
+                pending.as_mut().poll(&mut cx),
+                std::task::Poll::Ready(Err(crate::v2::Error::DriverShutdown))
+            ));
+            assert_eq!(engine.shared.commands.pending_listens(), 0);
+            assert_eq!(engine.shared.commands.available_listen_permits(), 1);
+            if drop_driver {
+                assert_eq!(
+                    super::super::super::registry::lock_unpoison(&engine.shared.cm_diagnostics).1,
+                    0,
+                    "driver drop releases a resource-free occupied listener slot"
+                );
+            }
+        }
     }
 }

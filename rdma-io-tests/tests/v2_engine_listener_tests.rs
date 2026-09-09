@@ -369,7 +369,11 @@ async fn run_accept_cancellation_and_live_shutdown(mode: CompletionMode) {
     let listener = server_engine
         .listen(
             "0.0.0.0:0".parse().unwrap(),
-            RdmaListenerConfig::default().backlog(1),
+            // Keep one established connection alive while exercising a
+            // second selected child. The Phase-8 contract passes this value
+            // to rdma_listen, and software providers count that live child
+            // against a backlog of one.
+            RdmaListenerConfig::default().backlog(2),
         )
         .await
         .unwrap();
@@ -389,6 +393,15 @@ async fn run_accept_cancellation_and_live_shutdown(mode: CompletionMode) {
     let mut cancelled_after_accept = Box::pin(listener.accept());
     let selected_wake = Arc::new(WakeCounter(AtomicUsize::new(0)));
     assert!(poll_with_wake_counter(cancelled_after_accept.as_mut(), &selected_wake).is_pending());
+    // Accept admission deliberately self-wakes once so the admitting poll
+    // cannot also observe provider completion. Consume that cooperative wake
+    // before using this counter as establishment evidence.
+    selected_wake.0.store(0, Ordering::Release);
+    assert!(
+        poll_with_wake_counter(cancelled_after_accept.as_mut(), &selected_wake).is_pending(),
+        "second poll must consume admission yield and register the result observer"
+    );
+    selected_wake.0.store(0, Ordering::Release);
     let second_address = connect_addr_for(Some(listener.local_addr().unwrap()));
     let second_engine = client_engine.clone();
     let second_connect = tokio::spawn(async move { second_engine.connect(second_address).await });
@@ -399,6 +412,11 @@ async fn run_accept_cancellation_and_live_shutdown(mode: CompletionMode) {
     })
     .await
     .expect("selected accept result was not published");
+    let second_client = tokio::time::timeout(Duration::from_secs(15), second_connect)
+        .await
+        .expect("peer did not finish establishment before server accept cancellation")
+        .unwrap()
+        .expect("peer establishment failed before server accept cancellation");
     drop(cancelled_after_accept);
     tokio::time::timeout(Duration::from_secs(15), async {
         while server_engine.diagnostics().live_connections != 1 {
@@ -412,11 +430,6 @@ async fn run_accept_cancellation_and_live_shutdown(mode: CompletionMode) {
             server_engine.diagnostics()
         )
     });
-    let second_client = tokio::time::timeout(Duration::from_secs(15), second_connect)
-        .await
-        .expect("cancelled server accept left client connect pending")
-        .unwrap()
-        .ok();
     drop(second_client);
     tokio::time::timeout(Duration::from_secs(10), async {
         while client_engine.diagnostics().live_connections != 1 {
@@ -431,6 +444,12 @@ async fn run_accept_cancellation_and_live_shutdown(mode: CompletionMode) {
     assert!(
         poll_with_wake_counter(selected_during_close.as_mut(), &close_selection_wake).is_pending()
     );
+    close_selection_wake.0.store(0, Ordering::Release);
+    assert!(
+        poll_with_wake_counter(selected_during_close.as_mut(), &close_selection_wake).is_pending(),
+        "second poll must consume admission yield and register the result observer"
+    );
+    close_selection_wake.0.store(0, Ordering::Release);
     let mut pending_accept = Box::pin(listener.accept());
     assert!(poll_once(pending_accept.as_mut()).is_pending());
     let close_address = connect_addr_for(Some(listener.local_addr().unwrap()));
@@ -448,6 +467,11 @@ async fn run_accept_cancellation_and_live_shutdown(mode: CompletionMode) {
             server_engine.diagnostics()
         )
     });
+    let close_client = tokio::time::timeout(Duration::from_secs(15), close_connect)
+        .await
+        .expect("peer did not finish establishment before listener close")
+        .unwrap()
+        .expect("peer establishment failed before listener close");
     let mut close_listener = Box::pin(listener.close());
     match poll_once(close_listener.as_mut()) {
         Poll::Ready(result) => result.unwrap(),
@@ -460,11 +484,6 @@ async fn run_accept_cancellation_and_live_shutdown(mode: CompletionMode) {
         Err(error) => panic!("unexpected listener-close accept error: {error}"),
         Ok(_) => panic!("listener close completed a pending accept successfully"),
     }
-    let close_client = tokio::time::timeout(Duration::from_secs(15), close_connect)
-        .await
-        .expect("listener close left selected client connect pending")
-        .unwrap()
-        .ok();
 
     let recv_connection = server_connection.clone();
     let pending_recv = tokio::spawn(async move {

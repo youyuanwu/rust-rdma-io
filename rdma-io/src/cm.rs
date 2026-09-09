@@ -11,12 +11,12 @@ use std::sync::Arc;
 use rdma_io_sys::ibverbs::*;
 use rdma_io_sys::rdmacm::*;
 
-use crate::Result;
 use crate::cq::CompletionQueue;
 use crate::device::{Context, ContextAnchor};
 use crate::error::{from_ptr, from_ret_errno};
 use crate::pd::ProtectionDomain;
 use crate::qp::QpInitAttr;
+use crate::{Error, Result};
 
 /// Port space for CM connections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -307,6 +307,8 @@ pub struct CmId {
     pub(crate) inner: *mut rdma_cm_id,
     /// Whether this CmId owns the underlying rdma_cm_id (should call rdma_destroy_id).
     owned: bool,
+    #[cfg(test)]
+    destroy_error: Option<Error>,
     #[cfg(feature = "tokio")]
     context_token: Option<Box<CmContextToken>>,
 }
@@ -333,7 +335,10 @@ impl CmId {
         if !self.owned {
             return Ok(());
         }
-        self.owned = false;
+        #[cfg(test)]
+        if let Some(error) = self.destroy_error.take() {
+            return Err(error);
+        }
         #[cfg(any(test, feature = "test-hooks"))]
         let address = self.inner as usize;
         #[cfg(any(test, feature = "test-hooks"))]
@@ -348,16 +353,22 @@ impl CmId {
             address,
             ret,
         );
-        from_ret_errno(ret)
+        from_ret_errno(ret)?;
+        self.owned = false;
+        Ok(())
     }
 
-    /// Consume and synchronously destroy this CM ID exactly once.
+    /// Attempt synchronous destruction without discarding ownership on failure.
     ///
-    /// Shared-channel callers must drain and acknowledge pending events through
-    /// their normal router immediately before invoking this method.
+    /// Shared CM users must retain the returned owner together with the event
+    /// channel and the rest of the provider bundle. A failed
+    /// `rdma_destroy_id` is not positive evidence that the ID was released.
     #[cfg(feature = "tokio")]
-    pub(crate) fn destroy(mut self) -> Result<()> {
-        self.destroy_once()
+    pub(crate) fn try_destroy(mut self) -> std::result::Result<(), (Self, Error)> {
+        match self.destroy_once() {
+            Ok(()) => Ok(()),
+            Err(error) => Err((self, error)),
+        }
     }
 
     /// Create a new CM ID on the given event channel.
@@ -374,6 +385,8 @@ impl CmId {
         Ok(Self {
             inner: id,
             owned: true,
+            #[cfg(test)]
+            destroy_error: None,
             #[cfg(feature = "tokio")]
             context_token: None,
         })
@@ -395,6 +408,8 @@ impl CmId {
         Ok(Self {
             inner: id,
             owned: true,
+            #[cfg(test)]
+            destroy_error: None,
             context_token: Some(context_token),
         })
     }
@@ -408,9 +423,22 @@ impl CmId {
         Self {
             inner: id,
             owned,
+            #[cfg(test)]
+            destroy_error: None,
             #[cfg(feature = "tokio")]
             context_token: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_destroy_for_test(&mut self, error: Error) {
+        self.destroy_error = Some(error);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn disarm_destroy_for_test(&mut self) {
+        self.owned = false;
+        self.destroy_error = None;
     }
 
     /// Install a new engine-owned generational route on an accepted CM ID.
@@ -1090,7 +1118,7 @@ unsafe fn sockaddr_to_std(
 
 #[cfg(test)]
 mod device_list_tests {
-    use super::select_name_index;
+    use super::{CmId, Error, NonNull, rdma_cm_id, select_name_index};
 
     #[test]
     fn exact_name_selection_uses_injected_entries() {
@@ -1098,5 +1126,27 @@ mod device_list_tests {
         assert_eq!(select_name_index(names, "siw0"), Some(1));
         assert_eq!(select_name_index(names, "rxe"), None);
         assert_eq!(select_name_index(names, "missing"), None);
+    }
+
+    #[test]
+    fn failed_cm_destruction_returns_the_exact_owner() {
+        let raw = NonNull::<rdma_cm_id>::dangling().as_ptr();
+        let mut cm_id = unsafe { CmId::from_raw(raw, true) };
+        cm_id.fail_next_destroy_for_test(Error::InvalidArg(
+            "injected rdma_destroy_id failure".into(),
+        ));
+
+        let (mut cm_id, error) = cm_id
+            .try_destroy()
+            .expect_err("injected destruction must preserve ownership");
+        assert_eq!(cm_id.as_raw(), raw);
+        assert!(
+            error
+                .to_string()
+                .contains("injected rdma_destroy_id failure")
+        );
+
+        // The fake pointer must not reach FFI when this unit test releases it.
+        cm_id.disarm_destroy_for_test();
     }
 }
