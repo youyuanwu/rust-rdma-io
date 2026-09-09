@@ -163,6 +163,8 @@ pub(super) struct PagedRegistry<K, T> {
     inner: RegistryInner<T>,
     live: usize,
     fail_next_page_allocation: bool,
+    #[cfg(test)]
+    occupied_full_scans: std::cell::Cell<usize>,
     _token: std::marker::PhantomData<fn() -> K>,
 }
 
@@ -214,6 +216,8 @@ impl<K: RegistryToken, T> PagedRegistry<K, T> {
             },
             live: 0,
             fail_next_page_allocation: false,
+            #[cfg(test)]
+            occupied_full_scans: std::cell::Cell::new(0),
             _token: std::marker::PhantomData,
         })
     }
@@ -450,6 +454,9 @@ impl<K: RegistryToken, T> PagedRegistry<K, T> {
     }
 
     pub(super) fn occupied_tokens(&self) -> Vec<K> {
+        #[cfg(test)]
+        self.occupied_full_scans
+            .set(self.occupied_full_scans.get() + 1);
         self.inner
             .pages
             .iter()
@@ -468,6 +475,11 @@ impl<K: RegistryToken, T> PagedRegistry<K, T> {
                 })
             })
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(super) fn occupied_full_scans(&self) -> usize {
+        self.occupied_full_scans.get()
     }
 
     pub(super) fn scan_occupied_tokens(

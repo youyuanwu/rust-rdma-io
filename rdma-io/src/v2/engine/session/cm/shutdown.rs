@@ -219,13 +219,13 @@ pub(super) fn service_class(
                     break;
                 }
                 let listener = {
-                    let Some(pending) = state.cm_destructions.pop_front() else {
+                    let Some(pending) = state.pop_cm_destruction_front() else {
                         cursor.destruction_listeners_complete = true;
                         *remaining = 0;
                         break;
                     };
                     let listener = pending.listener();
-                    state.cm_destructions.push_back(pending);
+                    state.push_cm_destruction_back(pending);
                     listener
                 };
                 *remaining -= 1;

@@ -10,8 +10,8 @@ use super::super::registry::{
 };
 use super::cm::{InboundRoute, InboundState, OutboundRequest, OutboundRoute, OutboundState};
 use super::connection::{
-    ConnectionCmRoute, ConnectionPoster, ConnectionReservation, ConnectionState,
-    ConnectionStateCountSnapshot,
+    ConnectionCmRoute, ConnectionDiagnosticsGauge, ConnectionPoster, ConnectionReservation,
+    ConnectionState, ConnectionStateCountSnapshot,
 };
 use super::{DeadlineKind, DeadlineRequest};
 use crate::v2::error::{Error, Result};
@@ -186,6 +186,7 @@ impl ConnectionEntry {
         }
     }
 
+    #[cfg(test)]
     fn reservation(&self) -> Option<&ConnectionReservation> {
         match self {
             Self::Outbound(OutboundConnectionEntry::Registered { connection, .. })
@@ -203,6 +204,32 @@ impl ConnectionEntry {
                 _ => None,
             },
             Self::Inbound(InboundConnectionEntry::Establishing(route)) => match &route.state {
+                InboundState::PendingSelection { reservation, .. } => Some(reservation),
+                _ => None,
+            },
+            Self::Transitioning => None,
+        }
+    }
+
+    fn reservation_mut(&mut self) -> Option<&mut ConnectionReservation> {
+        match self {
+            Self::Outbound(OutboundConnectionEntry::Registered { connection, .. })
+            | Self::Inbound(InboundConnectionEntry::Registered { connection, .. }) => {
+                connection.admission.as_mut()
+            }
+            Self::Active(connection) | Self::Draining(connection) | Self::Retired(connection) => {
+                connection.connection.admission.as_mut()
+            }
+            Self::Retiring { connection, .. } => connection.connection.admission.as_mut(),
+            Self::Quarantined(entry) => entry.lifecycle.reservation_mut(),
+            Self::Outbound(OutboundConnectionEntry::Establishing(route)) => {
+                match &mut route.state {
+                    OutboundState::AwaitAddr { reservation, .. }
+                    | OutboundState::AwaitRoute { reservation, .. } => Some(reservation),
+                    _ => None,
+                }
+            }
+            Self::Inbound(InboundConnectionEntry::Establishing(route)) => match &mut route.state {
                 InboundState::PendingSelection { reservation, .. } => Some(reservation),
                 _ => None,
             },
@@ -376,6 +403,32 @@ impl QuarantinedLifecycle {
         matches!(self, Self::Draining(_) | Self::Retiring { .. })
     }
 
+    #[cfg(test)]
+    fn reservation(&self) -> Option<&ConnectionReservation> {
+        match self {
+            Self::Outbound(OutboundConnectionEntry::Registered { connection, .. })
+            | Self::Inbound(InboundConnectionEntry::Registered { connection, .. }) => {
+                connection.admission.as_ref()
+            }
+            Self::Active(connection) | Self::Draining(connection) => {
+                connection.connection.admission.as_ref()
+            }
+            Self::Retiring { connection, .. } => connection.connection.admission.as_ref(),
+            Self::OutboundSetup { reservation, .. } | Self::InboundSetup { reservation, .. } => {
+                Some(reservation)
+            }
+            Self::Outbound(OutboundConnectionEntry::Establishing(route)) => match &route.state {
+                OutboundState::AwaitAddr { reservation, .. }
+                | OutboundState::AwaitRoute { reservation, .. } => Some(reservation),
+                _ => None,
+            },
+            Self::Inbound(InboundConnectionEntry::Establishing(route)) => match &route.state {
+                InboundState::PendingSelection { reservation, .. } => Some(reservation),
+                _ => None,
+            },
+        }
+    }
+
     fn reservation_mut(&mut self) -> Option<&mut ConnectionReservation> {
         match self {
             Self::Outbound(OutboundConnectionEntry::Registered { connection, .. })
@@ -402,31 +455,6 @@ impl QuarantinedLifecycle {
             },
         }
     }
-
-    fn reservation(&self) -> Option<&ConnectionReservation> {
-        match self {
-            Self::Outbound(OutboundConnectionEntry::Registered { connection, .. })
-            | Self::Inbound(InboundConnectionEntry::Registered { connection, .. }) => {
-                connection.admission.as_ref()
-            }
-            Self::Active(connection) | Self::Draining(connection) => {
-                connection.connection.admission.as_ref()
-            }
-            Self::Retiring { connection, .. } => connection.connection.admission.as_ref(),
-            Self::OutboundSetup { reservation, .. } | Self::InboundSetup { reservation, .. } => {
-                Some(reservation)
-            }
-            Self::Outbound(OutboundConnectionEntry::Establishing(route)) => match &route.state {
-                OutboundState::AwaitAddr { reservation, .. }
-                | OutboundState::AwaitRoute { reservation, .. } => Some(reservation),
-                _ => None,
-            },
-            Self::Inbound(InboundConnectionEntry::Establishing(route)) => match &route.state {
-                InboundState::PendingSelection { reservation, .. } => Some(reservation),
-                _ => None,
-            },
-        }
-    }
 }
 
 pub(in crate::v2::engine) struct ConnectionRegistry {
@@ -440,6 +468,7 @@ pub(in crate::v2::engine) struct ConnectionRegistry {
     retirements: VecDeque<ConnectionToken>,
     outbound_setup_active: bool,
     route_count: usize,
+    diagnostics: Arc<ConnectionDiagnosticsGauge>,
 }
 
 impl ConnectionRegistry {
@@ -463,6 +492,7 @@ impl ConnectionRegistry {
             retirements: VecDeque::new(),
             outbound_setup_active: false,
             route_count: 0,
+            diagnostics: Arc::new(ConnectionDiagnosticsGauge::default()),
         })
     }
 
@@ -565,51 +595,26 @@ impl ConnectionRegistry {
         Arc::clone(&self.admission)
             .try_acquire_owned()
             .ok()
-            .map(ConnectionReservation::new)
+            .map(|permit| {
+                ConnectionReservation::new_with_diagnostics(
+                    permit,
+                    Some(Arc::clone(&self.diagnostics)),
+                )
+            })
     }
 
     pub(in crate::v2::engine) fn admission_snapshot(&self) -> ConnectionStateCountSnapshot {
-        let mut counts = ConnectionStateCountSnapshot {
-            live: self
-                .capacity
-                .saturating_sub(self.admission.available_permits()),
-            ..ConnectionStateCountSnapshot::default()
-        };
-        for token in self.slots.occupied_tokens() {
-            if let Some(reservation) = self
-                .slots
-                .lookup_ref(token)
-                .occupied()
-                .and_then(ConnectionEntry::reservation)
-            {
-                reservation.contribute(&mut counts);
-            }
-        }
-        counts
+        let mut snapshot = self.diagnostics.snapshot();
+        snapshot.live = self
+            .capacity
+            .saturating_sub(self.admission.available_permits());
+        snapshot
     }
 
     pub(in crate::v2::engine) fn admission_snapshot_excluding_retained(
         &self,
     ) -> ConnectionStateCountSnapshot {
-        let mut counts = ConnectionStateCountSnapshot::default();
-        for token in self.slots.occupied_tokens() {
-            let Some(entry) = self.slots.lookup_ref(token).occupied() else {
-                continue;
-            };
-            if matches!(
-                entry,
-                ConnectionEntry::Quarantined(_)
-                    | ConnectionEntry::Draining(_)
-                    | ConnectionEntry::Retiring { .. }
-            ) {
-                continue;
-            }
-            if let Some(reservation) = entry.reservation() {
-                counts.live += 1;
-                reservation.contribute(&mut counts);
-            }
-        }
-        counts
+        self.diagnostics.snapshot_excluding_retained()
     }
 
     pub(super) fn register_outbound(
@@ -619,6 +624,11 @@ impl ConnectionRegistry {
         let token = self.slots.allocate_owned(|token| {
             ConnectionEntry::Outbound(OutboundConnectionEntry::Establishing(make(token)))
         })?;
+        self.slots
+            .get_mut(token)
+            .and_then(ConnectionEntry::reservation_mut)
+            .into_iter()
+            .for_each(|reservation| reservation.mark_indexed(Arc::clone(&self.diagnostics)));
         self.route_count += 1;
         Ok(token)
     }
@@ -630,6 +640,11 @@ impl ConnectionRegistry {
         let token = self.slots.allocate_owned(|token| {
             ConnectionEntry::Inbound(InboundConnectionEntry::Establishing(make(token)))
         })?;
+        self.slots
+            .get_mut(token)
+            .and_then(ConnectionEntry::reservation_mut)
+            .into_iter()
+            .for_each(|reservation| reservation.mark_indexed(Arc::clone(&self.diagnostics)));
         self.route_count += 1;
         Ok(token)
     }
@@ -661,6 +676,11 @@ impl ConnectionRegistry {
                 retained: None,
             })?;
         self.qp_index.insert(qp_num, token);
+        self.slots
+            .get_mut(token)
+            .and_then(ConnectionEntry::reservation_mut)
+            .into_iter()
+            .for_each(|reservation| reservation.mark_indexed(Arc::clone(&self.diagnostics)));
         Ok((
             token,
             snapshot.expect("connection registration factory runs exactly once"),
@@ -709,6 +729,11 @@ impl ConnectionRegistry {
         };
         *entry = next;
         self.qp_index.insert(qp_num, token);
+        self.slots
+            .get_mut(token)
+            .and_then(ConnectionEntry::reservation_mut)
+            .into_iter()
+            .for_each(|reservation| reservation.mark_indexed(Arc::clone(&self.diagnostics)));
         Ok(self
             .lookup(token)
             .occupied()
@@ -1664,6 +1689,11 @@ impl ConnectionRegistry {
             .collect()
     }
 
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn occupied_full_scans_for_test(&self) -> usize {
+        self.slots.occupied_full_scans()
+    }
+
     pub(in crate::v2::engine) fn scan_occupied(
         &self,
         start: usize,
@@ -1874,6 +1904,43 @@ mod tests {
             .attach_registered(token, 41, connection)
             .expect("attach exact QP owner");
         (registry, token)
+    }
+
+    #[test]
+    fn diagnostics_remain_constant_time_after_registry_high_water() {
+        let mut registry = ConnectionRegistry::new(2_048).unwrap();
+        for slot in 0..1_025_u32 {
+            registry
+                .slots
+                .allocate_owned(|token| {
+                    debug_assert_eq!(token.slot, slot);
+                    ConnectionEntry::Outbound(OutboundConnectionEntry::Establishing(
+                        OutboundRoute::new(
+                            token,
+                            Arc::new(OutboundRequest::new(
+                                "127.0.0.1:7471".parse().unwrap(),
+                                RdmaConnectionConfig::default(),
+                                crate::v2::engine::session::listener::empty_connection_setup(),
+                            )),
+                        ),
+                    ))
+                })
+                .unwrap();
+        }
+        let scans_before = registry.occupied_full_scans_for_test();
+        assert_eq!(
+            registry.admission_snapshot(),
+            ConnectionStateCountSnapshot::default()
+        );
+        assert_eq!(
+            registry.admission_snapshot_excluding_retained(),
+            ConnectionStateCountSnapshot::default()
+        );
+        assert_eq!(
+            registry.occupied_full_scans_for_test(),
+            scans_before,
+            "ordinary diagnostics must not enumerate the registry high-water range"
+        );
     }
 
     #[test]

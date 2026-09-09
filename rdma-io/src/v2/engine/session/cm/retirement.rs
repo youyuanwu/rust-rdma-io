@@ -41,13 +41,13 @@ pub(super) fn service_cm_destructions_with_probe(
 ) -> Result<usize> {
     let mut processed = 0;
     while processed < budget {
-        let pending = state.cm_destructions.pop_front();
+        let pending = state.pop_cm_destruction_front();
         let Some(pending) = pending else {
             break;
         };
         match defer_one_event(state, connections) {
             Ok(true) => {
-                state.cm_destructions.push_back(pending);
+                state.push_cm_destruction_back(pending);
             }
             Ok(false) => {
                 #[cfg(any(test, feature = "test-hooks"))]
@@ -61,9 +61,7 @@ pub(super) fn service_cm_destructions_with_probe(
                 match pending {
                     PendingCmDestruction::Route(cm_id) => {
                         if let Err((cm_id, error)) = cm_id.try_destroy() {
-                            state
-                                .cm_destructions
-                                .push_front(PendingCmDestruction::Route(cm_id));
+                            state.push_cm_destruction_front(PendingCmDestruction::Route(cm_id));
                             return Err(contextual_cm_error("destroy retired route CM ID", error));
                         }
                     }
@@ -99,9 +97,10 @@ pub(super) fn service_cm_destructions_with_probe(
                                 if let Some(listener_entry) = state.listeners.get(listener) {
                                     listener_entry.finish_close_into(Some(error.clone()), actions);
                                 }
-                                state
-                                    .cm_destructions
-                                    .push_front(PendingCmDestruction::Listener { cm_id, listener });
+                                state.push_cm_destruction_front(PendingCmDestruction::Listener {
+                                    cm_id,
+                                    listener,
+                                });
                                 return Err(error);
                             }
                         }
@@ -128,7 +127,7 @@ pub(super) fn service_cm_destructions_with_probe(
                 }
             }
             Err(error) => {
-                state.cm_destructions.push_front(pending);
+                state.push_cm_destruction_front(pending);
                 return Err(error);
             }
         }
@@ -246,9 +245,9 @@ fn retain_failed_connection_cm(
         completion,
     };
     if retry_at_front {
-        state.cm_destructions.push_front(pending);
+        state.push_cm_destruction_front(pending);
     } else {
-        state.cm_destructions.push_back(pending);
+        state.push_cm_destruction_back(pending);
     }
     Err(error)
 }

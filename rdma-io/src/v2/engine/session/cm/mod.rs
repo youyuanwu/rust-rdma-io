@@ -102,6 +102,7 @@ pub(in crate::v2::engine) struct CmState {
     listener_work: VecDeque<ListenerToken>,
     listeners: ListenerRegistry,
     cm_destructions: VecDeque<PendingCmDestruction>,
+    non_listener_destructions: usize,
     quarantined_cm_owners: Vec<SharedCmId>,
     pending_event: Option<PendingCmEvent>,
     shutting_down: bool,
@@ -115,6 +116,7 @@ impl CmState {
             listener_work: VecDeque::new(),
             listeners: ListenerRegistry::new(capacity)?,
             cm_destructions: VecDeque::new(),
+            non_listener_destructions: 0,
             quarantined_cm_owners: Vec::new(),
             pending_event: None,
             shutting_down: false,
@@ -187,8 +189,7 @@ impl CmState {
     }
 
     fn defer_cm_id(&mut self, cm_id: SharedCmId) {
-        self.cm_destructions
-            .push_back(PendingCmDestruction::Route(cm_id));
+        self.push_cm_destruction_back(PendingCmDestruction::Route(cm_id));
     }
 
     fn quarantine_cm_id(&mut self, cm_id: SharedCmId) {
@@ -199,8 +200,7 @@ impl CmState {
         if let Some(entry) = self.listeners.get_mut(listener) {
             entry.mark_cm_destruction_pending();
         }
-        self.cm_destructions
-            .push_back(PendingCmDestruction::Listener { cm_id, listener });
+        self.push_cm_destruction_back(PendingCmDestruction::Listener { cm_id, listener });
     }
 
     #[cfg(test)]
@@ -212,7 +212,7 @@ impl CmState {
         if let Some(entry) = self.listeners.get_mut(listener) {
             entry.mark_cm_destruction_pending();
         }
-        self.cm_destructions.push_back(PendingCmDestruction::Test {
+        self.push_cm_destruction_back(PendingCmDestruction::Test {
             destroy_count,
             target: TestCmDestruction::Listener {
                 listener,
@@ -226,7 +226,7 @@ impl CmState {
         &mut self,
         destroy_count: Arc<AtomicUsize>,
     ) {
-        self.cm_destructions.push_back(PendingCmDestruction::Test {
+        self.push_cm_destruction_back(PendingCmDestruction::Test {
             destroy_count,
             target: TestCmDestruction::Route,
         });
@@ -637,12 +637,25 @@ impl CmState {
 
     pub(in crate::v2::engine) fn retained_session_owner_count(&self) -> usize {
         let listeners = self.listeners.live();
-        let cm_destructions = self
-            .cm_destructions
-            .iter()
-            .filter(|pending| pending.listener().is_none())
-            .count();
-        listeners + cm_destructions + self.quarantined_cm_owners.len()
+        listeners + self.non_listener_destructions + self.quarantined_cm_owners.len()
+    }
+
+    fn push_cm_destruction_back(&mut self, pending: PendingCmDestruction) {
+        self.non_listener_destructions += usize::from(pending.listener().is_none());
+        self.cm_destructions.push_back(pending);
+    }
+
+    fn push_cm_destruction_front(&mut self, pending: PendingCmDestruction) {
+        self.non_listener_destructions += usize::from(pending.listener().is_none());
+        self.cm_destructions.push_front(pending);
+    }
+
+    fn pop_cm_destruction_front(&mut self) -> Option<PendingCmDestruction> {
+        let pending = self.cm_destructions.pop_front()?;
+        self.non_listener_destructions = self
+            .non_listener_destructions
+            .saturating_sub(usize::from(pending.listener().is_none()));
+        Some(pending)
     }
 
     pub(in crate::v2::engine) fn retained_provider_owner_count(&self) -> usize {

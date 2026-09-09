@@ -945,37 +945,51 @@ pub(in crate::v2::engine) struct ConnectionReservation {
     _permit: OwnedSemaphorePermit,
     state: ReservationState,
     qp_counted: bool,
+    diagnostics: Option<Arc<ConnectionDiagnosticsGauge>>,
+    indexed: bool,
 }
 
 impl ConnectionReservation {
     pub(in crate::v2::engine) fn new(permit: OwnedSemaphorePermit) -> Self {
+        Self::new_with_diagnostics(permit, None)
+    }
+
+    pub(in crate::v2::engine) fn new_with_diagnostics(
+        permit: OwnedSemaphorePermit,
+        diagnostics: Option<Arc<ConnectionDiagnosticsGauge>>,
+    ) -> Self {
+        if let Some(diagnostics) = &diagnostics {
+            diagnostics.add_live();
+        }
         Self {
             _permit: permit,
             state: ReservationState::Establishing,
             qp_counted: false,
-        }
-    }
-
-    pub(in crate::v2::engine) fn contribute(&self, counts: &mut ConnectionStateCountSnapshot) {
-        match self.state {
-            ReservationState::Establishing => counts.establishing += 1,
-            ReservationState::Established => counts.established += 1,
-            ReservationState::Draining => counts.draining += 1,
-            ReservationState::QuarantinedEstablishing
-            | ReservationState::QuarantinedEstablished
-            | ReservationState::QuarantinedDraining => counts.quarantined_bundles += 1,
-        }
-        if matches!(self.state, ReservationState::QuarantinedDraining) {
-            counts.draining += 1;
-        }
-        if self.qp_counted {
-            counts.registered_live_qps += 1;
+            diagnostics,
+            indexed: false,
         }
     }
 
     #[cfg(test)]
     pub(in crate::v2::engine) fn state(&self) -> ReservationState {
         self.state
+    }
+
+    pub(in crate::v2::engine) fn mark_indexed(
+        &mut self,
+        diagnostics: Arc<ConnectionDiagnosticsGauge>,
+    ) {
+        if self.indexed {
+            return;
+        }
+        if self.diagnostics.is_none() {
+            diagnostics.add_live();
+            self.diagnostics = Some(diagnostics);
+        }
+        self.indexed = true;
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.add_indexed(self.state, self.qp_counted);
+        }
     }
 }
 
@@ -999,85 +1013,243 @@ pub(in crate::v2::engine) struct ConnectionStateCountSnapshot {
     pub(in crate::v2::engine) quarantined_bundles: usize,
 }
 
-impl ConnectionReservation {
-    fn mark_registered(&mut self) {
-        if self.state != ReservationState::Establishing {
+#[derive(Debug, Default)]
+struct ConnectionDiagnosticsCounts {
+    all: ConnectionStateCountSnapshot,
+    excluding_retained: ConnectionStateCountSnapshot,
+}
+
+#[derive(Debug, Default)]
+pub(in crate::v2::engine) struct ConnectionDiagnosticsGauge {
+    counts: Mutex<ConnectionDiagnosticsCounts>,
+}
+
+impl ConnectionDiagnosticsGauge {
+    fn contribution(state: ReservationState, qp_counted: bool) -> ConnectionStateCountSnapshot {
+        let mut counts = ConnectionStateCountSnapshot::default();
+        match state {
+            ReservationState::Establishing => counts.establishing = 1,
+            ReservationState::Established => counts.established = 1,
+            ReservationState::Draining => counts.draining = 1,
+            ReservationState::QuarantinedEstablishing
+            | ReservationState::QuarantinedEstablished
+            | ReservationState::QuarantinedDraining => counts.quarantined_bundles = 1,
+        }
+        if matches!(state, ReservationState::QuarantinedDraining) {
+            counts.draining = 1;
+        }
+        if qp_counted {
+            counts.registered_live_qps = 1;
+        }
+        counts
+    }
+
+    fn included(state: ReservationState) -> bool {
+        matches!(
+            state,
+            ReservationState::Establishing | ReservationState::Established
+        )
+    }
+
+    fn add_snapshot(
+        target: &mut ConnectionStateCountSnapshot,
+        value: ConnectionStateCountSnapshot,
+    ) {
+        target.live += value.live;
+        target.establishing += value.establishing;
+        target.established += value.established;
+        target.draining += value.draining;
+        target.registered_live_qps += value.registered_live_qps;
+        target.quarantined_bundles += value.quarantined_bundles;
+    }
+
+    fn sub_snapshot(
+        target: &mut ConnectionStateCountSnapshot,
+        value: ConnectionStateCountSnapshot,
+    ) {
+        target.live = target.live.saturating_sub(value.live);
+        target.establishing = target.establishing.saturating_sub(value.establishing);
+        target.established = target.established.saturating_sub(value.established);
+        target.draining = target.draining.saturating_sub(value.draining);
+        target.registered_live_qps = target
+            .registered_live_qps
+            .saturating_sub(value.registered_live_qps);
+        target.quarantined_bundles = target
+            .quarantined_bundles
+            .saturating_sub(value.quarantined_bundles);
+    }
+
+    fn add_live(&self) {
+        lock_unpoison(&self.counts).all.live += 1;
+    }
+
+    fn add_indexed(&self, state: ReservationState, qp_counted: bool) {
+        let contribution = Self::contribution(state, qp_counted);
+        let mut counts = lock_unpoison(&self.counts);
+        Self::add_snapshot(&mut counts.all, contribution);
+        if Self::included(state) {
+            let mut contribution = contribution;
+            contribution.live = 1;
+            Self::add_snapshot(&mut counts.excluding_retained, contribution);
+        }
+    }
+
+    fn transition(
+        &self,
+        old_state: ReservationState,
+        old_qp_counted: bool,
+        new_state: ReservationState,
+        new_qp_counted: bool,
+        indexed: bool,
+    ) {
+        if !indexed {
             return;
         }
-        self.state = ReservationState::Established;
-        self.qp_counted = true;
+        let old = Self::contribution(old_state, old_qp_counted);
+        let new = Self::contribution(new_state, new_qp_counted);
+        let mut counts = lock_unpoison(&self.counts);
+        Self::sub_snapshot(&mut counts.all, old);
+        Self::add_snapshot(&mut counts.all, new);
+        if Self::included(old_state) {
+            let mut old = old;
+            old.live = 1;
+            Self::sub_snapshot(&mut counts.excluding_retained, old);
+        }
+        if Self::included(new_state) {
+            let mut new = new;
+            new.live = 1;
+            Self::add_snapshot(&mut counts.excluding_retained, new);
+        }
+    }
+
+    fn remove(&self, state: ReservationState, qp_counted: bool, indexed: bool) {
+        let mut counts = lock_unpoison(&self.counts);
+        counts.all.live = counts.all.live.saturating_sub(1);
+        if !indexed {
+            return;
+        }
+        let contribution = Self::contribution(state, qp_counted);
+        Self::sub_snapshot(&mut counts.all, contribution);
+        if Self::included(state) {
+            let mut contribution = contribution;
+            contribution.live = 1;
+            Self::sub_snapshot(&mut counts.excluding_retained, contribution);
+        }
+    }
+
+    pub(in crate::v2::engine) fn snapshot(&self) -> ConnectionStateCountSnapshot {
+        lock_unpoison(&self.counts).all
+    }
+
+    pub(in crate::v2::engine) fn snapshot_excluding_retained(
+        &self,
+    ) -> ConnectionStateCountSnapshot {
+        lock_unpoison(&self.counts).excluding_retained
+    }
+}
+
+impl ConnectionReservation {
+    fn update(&mut self, update: impl FnOnce(&mut ReservationState, &mut bool)) {
+        let old_state = self.state;
+        let old_qp_counted = self.qp_counted;
+        update(&mut self.state, &mut self.qp_counted);
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.transition(
+                old_state,
+                old_qp_counted,
+                self.state,
+                self.qp_counted,
+                self.indexed,
+            );
+        }
+    }
+
+    fn mark_registered(&mut self) {
+        self.update(|state, qp_counted| {
+            if *state == ReservationState::Establishing {
+                *state = ReservationState::Established;
+                *qp_counted = true;
+            }
+        });
     }
 
     fn mark_draining(&mut self) {
-        match self.state {
+        self.update(|state, _| match *state {
             ReservationState::Established => {
-                self.state = ReservationState::Draining;
+                *state = ReservationState::Draining;
             }
             ReservationState::QuarantinedEstablished => {
-                self.state = ReservationState::QuarantinedDraining;
+                *state = ReservationState::QuarantinedDraining;
             }
             ReservationState::Establishing
             | ReservationState::QuarantinedEstablishing
             | ReservationState::Draining
             | ReservationState::QuarantinedDraining => {}
-        }
+        });
     }
 
     fn rollback_draining(&mut self) {
-        match self.state {
+        self.update(|state, _| match *state {
             ReservationState::Draining => {
-                self.state = ReservationState::Established;
+                *state = ReservationState::Established;
             }
             ReservationState::QuarantinedDraining => {
-                self.state = ReservationState::QuarantinedEstablished;
+                *state = ReservationState::QuarantinedEstablished;
             }
             ReservationState::Establishing
             | ReservationState::QuarantinedEstablishing
             | ReservationState::Established
             | ReservationState::QuarantinedEstablished => {}
-        }
+        });
     }
 
     fn mark_quarantined(&mut self) {
-        match self.state {
-            ReservationState::Establishing => {
-                self.state = ReservationState::QuarantinedEstablishing;
+        self.update(|state, qp_counted| {
+            match *state {
+                ReservationState::Establishing => {
+                    *state = ReservationState::QuarantinedEstablishing;
+                }
+                ReservationState::Established => {
+                    *state = ReservationState::QuarantinedEstablished;
+                }
+                ReservationState::Draining => {
+                    *state = ReservationState::QuarantinedDraining;
+                }
+                ReservationState::QuarantinedEstablishing
+                | ReservationState::QuarantinedEstablished
+                | ReservationState::QuarantinedDraining => {}
             }
-            ReservationState::Established => {
-                self.state = ReservationState::QuarantinedEstablished;
-            }
-            ReservationState::Draining => {
-                self.state = ReservationState::QuarantinedDraining;
-            }
-            ReservationState::QuarantinedEstablishing
-            | ReservationState::QuarantinedEstablished
-            | ReservationState::QuarantinedDraining => {}
-        }
-        self.qp_counted = false;
+            *qp_counted = false;
+        });
     }
 
     fn recover_quarantine(&mut self, qp_is_live: bool) {
-        match self.state {
+        self.update(|state, qp_counted| match *state {
             ReservationState::QuarantinedEstablished => {
-                self.state = ReservationState::Established;
-                self.qp_counted = qp_is_live;
+                *state = ReservationState::Established;
+                *qp_counted = qp_is_live;
             }
             ReservationState::QuarantinedDraining => {
-                self.state = ReservationState::Draining;
-                self.qp_counted = qp_is_live;
+                *state = ReservationState::Draining;
+                *qp_counted = qp_is_live;
             }
             ReservationState::Establishing
             | ReservationState::QuarantinedEstablishing
             | ReservationState::Established
             | ReservationState::Draining => {}
-        }
+        });
     }
 
     fn mark_qp_destroyed(&mut self) {
-        if !self.qp_counted {
-            return;
+        self.update(|_, qp_counted| *qp_counted = false);
+    }
+}
+
+impl Drop for ConnectionReservation {
+    fn drop(&mut self) {
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.remove(self.state, self.qp_counted, self.indexed);
         }
-        self.qp_counted = false;
     }
 }
 
