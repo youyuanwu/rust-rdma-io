@@ -66,16 +66,15 @@ pub use driver::{
     TestSharedResourceIdentity,
 };
 pub use io_core::RdmaOperation;
-use io_core::{IoCore, IoDriverSignal, IoProgress};
+use io_core::{IoCore, IoDriverSignal, IoReactorSources};
 use lifecycle::MemoizedTerminalResult;
-use reactor::CommandIngress;
+use reactor::{CommandIngress, EngineReactor};
 use registry::{lock_unpoison, write_unpoison};
 use resources::{EngineResourceRefs, EngineResources};
-use scheduler::OwnerScheduler;
 use session::DeadlineKind;
 pub use session::connection::{RdmaConnection, RdmaConnectionIdentity};
 pub use session::listener::{RdmaListener, RdmaListenerConfig};
-use session::{SessionManager, SessionProgress};
+use session::{SessionManager, SessionReactorSources};
 
 use super::error::{Error, Result};
 
@@ -444,9 +443,7 @@ impl Drop for RdmaEngine {
 /// per successful build, and the engine creates zero internal tasks.
 pub struct RdmaEngineDriver {
     shared: Arc<EngineShared>,
-    io_progress: IoProgress,
-    session_progress: SessionProgress,
-    scheduler: OwnerScheduler,
+    reactor: EngineReactor,
     deadline_sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
     deadline_at: Option<tokio::time::Instant>,
     runtime_checked: bool,
@@ -468,7 +465,7 @@ struct EngineShared {
     commands: Arc<CommandIngress>,
     // Notify stores only live Notified futures and wakes every concurrent
     // shutdown waiter without retaining registrations from dropped futures.
-    terminal_notify: Notify,
+    terminal_notify: Arc<Notify>,
     terminal: Mutex<Option<MemoizedTerminalResult>>,
     pending_terminal: Mutex<Option<MemoizedTerminalResult>>,
     #[cfg(any(test, feature = "test-hooks"))]
@@ -647,7 +644,7 @@ impl EngineShared {
             frontend_count: AtomicUsize::new(1),
             work_signal,
             commands,
-            terminal_notify: Notify::new(),
+            terminal_notify: Arc::new(Notify::new()),
             terminal: Mutex::new(None),
             pending_terminal: Mutex::new(None),
             #[cfg(any(test, feature = "test-hooks"))]
@@ -664,7 +661,7 @@ impl EngineShared {
         // command. Provider and teardown progress still require the driver.
         #[cfg(any(test, feature = "test-hooks"))]
         self.test_driver.record_shutdown_attempt();
-        self.begin_shutdown_admission(Error::DriverShutdown, true);
+        self.begin_shutdown_admission(Error::DriverShutdown, false);
         self.commands.request_shutdown();
     }
 
@@ -672,7 +669,7 @@ impl EngineShared {
     fn request_shutdown(&self) {
         #[cfg(any(test, feature = "test-hooks"))]
         self.test_driver.record_shutdown_attempt();
-        self.begin_shutdown_admission(Error::DriverShutdown, true);
+        self.begin_shutdown_admission(Error::DriverShutdown, false);
         self.start_shutdown_progress();
     }
 
@@ -714,7 +711,17 @@ impl EngineShared {
         first
     }
 
+    #[cfg(test)]
     fn finish(&self, outcome: MemoizedTerminalResult) {
+        self.finish_with_operation_publication(outcome, || {});
+    }
+
+    #[cfg(test)]
+    fn finish_with_operation_publication(
+        &self,
+        outcome: MemoizedTerminalResult,
+        publish_commands: impl FnOnce(),
+    ) {
         assert!(
             !outcome.is_connection_quarantined(),
             "ConnectionQuarantined is connection-local; no connection quarantine can terminate the engine driver"
@@ -744,7 +751,6 @@ impl EngineShared {
         };
 
         let committed_io_effects = self.session.apply_terminal_io_effects(io_effects);
-        self.session.terminalize_cm(&outcome);
         for connection in &connections_to_wake {
             if outcome.is_error() && connection.retain_bundle_for_engine_failure() {
                 self.session.track_connection_quarantine(connection.token);
@@ -757,18 +763,75 @@ impl EngineShared {
             }
         }
         committed_io_effects.publish();
+        publish_commands();
         for connection in connections_to_wake {
             connection.wake_close();
         }
+        self.session.terminalize_cm(&outcome);
         self.terminal_notify.notify_waiters();
+    }
+
+    fn finish_driver_drop_into(
+        &self,
+        outcome: MemoizedTerminalResult,
+        drain_commands: bool,
+        actions: &mut reactor::ReactorActions,
+    ) {
+        assert!(!outcome.is_connection_quarantined());
+        let (io_effects, connections_to_wake) = {
+            let _admission = write_unpoison(&self.session.admission);
+            let mut terminal = lock_unpoison(&self.terminal);
+            if terminal.is_some() {
+                return;
+            }
+            self.shutdown_requested.store(true, Ordering::Release);
+            self.io_core.close_admission(outcome.error());
+            self.transition_shutdown_requested();
+            let lifecycle = if outcome.is_success() {
+                RdmaEngineLifecycle::Terminated
+            } else {
+                RdmaEngineLifecycle::Failed
+            };
+            *terminal = Some(outcome.clone());
+            self.transition_terminal(lifecycle);
+            let io_effects = self.io_core.terminalize_operations(&outcome);
+            let connections_to_wake = self.session.connections.occupied();
+            drop(terminal);
+            (io_effects, connections_to_wake)
+        };
+
+        self.session
+            .apply_terminal_io_effects(io_effects)
+            .append_to(actions);
+        if drain_commands {
+            self.commands
+                .drain_ordinary_into(outcome.error().unwrap_or(Error::DriverShutdown), actions);
+        }
+        for connection in &connections_to_wake {
+            if outcome.is_error() && connection.retain_bundle_for_engine_failure() {
+                self.session.track_connection_quarantine(connection.token);
+            }
+            if let Some(event) = self
+                .session
+                .finalize_connection_engine(connection, &outcome)
+            {
+                actions.push_event(event);
+            }
+            connection.wake_close_into(actions);
+        }
+        self.session.terminalize_cm_into(&outcome, actions);
+        let terminal_notify = Arc::clone(&self.terminal_notify);
+        actions.push_terminal(move || terminal_notify.notify_waiters());
     }
 
     fn progress_driver_terminal(
         self: &Arc<Self>,
-        io_progress: &IoProgress,
-        session_progress: &SessionProgress,
+        io_progress: &IoReactorSources,
+        session_progress: &SessionReactorSources,
+        actions: &mut reactor::ReactorActions,
     ) -> bool {
         if !self.shutdown_requested.load(Ordering::Acquire)
+            || self.commands.has_pending()
             || !io_progress.can_finish()
             || !session_progress.can_finish()
         {
@@ -776,10 +839,10 @@ impl EngineShared {
         }
         let pending = lock_unpoison(&self.pending_terminal).clone();
         if let Some(outcome) = pending {
-            self.finish_after_owner_cleanup(outcome);
+            self.finish_after_owner_cleanup_into(outcome, actions);
             Self::retain_after_failure(self);
         } else {
-            self.finish_after_owner_cleanup(MemoizedTerminalResult::success());
+            self.finish_after_owner_cleanup_into(MemoizedTerminalResult::success(), actions);
         }
         true
     }
@@ -789,7 +852,7 @@ impl EngineShared {
         let mut pending = lock_unpoison(&self.pending_terminal);
         if pending.is_none() {
             *pending = Some(outcome.clone());
-            self.begin_shutdown_admission(error.clone(), true);
+            self.begin_shutdown_admission(error.clone(), false);
             self.io_core.close_admission(outcome.error());
             self.io_core.begin_terminal_failure(outcome);
         }
@@ -802,6 +865,11 @@ impl EngineShared {
         lock_unpoison(&self.pending_terminal).clone()
     }
 
+    fn shutdown_is_pending(&self) -> bool {
+        self.shutdown_requested.load(Ordering::Acquire) && self.outcome().is_none()
+    }
+
+    #[cfg(test)]
     fn finish_after_owner_cleanup(&self, outcome: MemoizedTerminalResult) {
         let mut terminal = lock_unpoison(&self.terminal);
         if terminal.is_some() {
@@ -818,11 +886,33 @@ impl EngineShared {
         self.terminal_notify.notify_waiters();
     }
 
-    fn handle_driver_drop(self: &Arc<Self>) {
-        if self.outcome().is_some() {
+    fn finish_after_owner_cleanup_into(
+        &self,
+        outcome: MemoizedTerminalResult,
+        actions: &mut reactor::ReactorActions,
+    ) {
+        let mut terminal = lock_unpoison(&self.terminal);
+        if terminal.is_some() {
             return;
         }
-        let first_shutdown = self.begin_shutdown_admission(Error::DriverShutdown, false);
+        let lifecycle = if outcome.is_success() {
+            RdmaEngineLifecycle::Terminated
+        } else {
+            RdmaEngineLifecycle::Failed
+        };
+        *terminal = Some(outcome);
+        self.transition_terminal(lifecycle);
+        drop(terminal);
+        let terminal_notify = Arc::clone(&self.terminal_notify);
+        actions.push_terminal(move || terminal_notify.notify_waiters());
+    }
+
+    fn handle_driver_drop(self: &Arc<Self>) -> reactor::ReactorActions {
+        let mut actions = reactor::ReactorActions::for_synchronous_driver_drop();
+        if self.outcome().is_some() {
+            return actions;
+        }
+        self.begin_shutdown_admission(Error::DriverShutdown, false);
         self.session.synchronously_prepare_driver_drop();
         let outstanding = self.io_core.accepted_count();
         let cm_owners = self
@@ -838,11 +928,13 @@ impl EngineShared {
                 cq_debt: outstanding,
             }
         };
-        if first_shutdown {
-            self.commands.drain_ordinary(error.clone());
-        }
-        self.finish(MemoizedTerminalResult::from_error(error));
+        self.finish_driver_drop_into(
+            MemoizedTerminalResult::from_error(error.clone()),
+            true,
+            &mut actions,
+        );
         Self::retain_after_failure(self);
+        actions
     }
 
     fn outcome(&self) -> Option<MemoizedTerminalResult> {

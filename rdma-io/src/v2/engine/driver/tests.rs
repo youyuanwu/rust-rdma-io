@@ -54,6 +54,29 @@ impl CountingWaker {
     }
 }
 
+#[tokio::test]
+async fn actions_produced_before_a_later_source_error_are_published() {
+    let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
+    let mut connect = Box::pin(engine.connect("127.0.0.1:9".parse().unwrap()));
+    let waker = futures_util::task::noop_waker();
+    let mut cx = TaskContext::from_waker(&waker);
+    assert!(connect.as_mut().poll(&mut cx).is_pending());
+
+    engine.shared.commands.close_admission();
+    driver.reactor.session.exhaust_deadline_sequence_for_test();
+    engine.shared.session.schedule_deadline(
+        super::super::session::DeadlineKind::ConnectionDrain,
+        7,
+        Duration::ZERO,
+    );
+
+    assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
+    assert!(matches!(
+        connect.as_mut().poll(&mut cx),
+        Poll::Ready(Err(Error::DriverShutdown))
+    ));
+}
+
 #[test]
 fn earliest_owner_deadline_handles_equal_and_missing_values() {
     let now = tokio::time::Instant::now();
@@ -89,19 +112,6 @@ fn shutdown_and_failure_publish_both_cleanup_owners() {
     drop(driver);
 }
 
-#[test]
-fn every_poll_probe_covers_both_owners_during_a_software_wake() {
-    let (_engine, mut driver) = test_engine_pair(CompletionMode::Polling);
-
-    driver.probe_owners();
-    driver.probe_owners();
-
-    assert_eq!(driver.scheduler.ready_count(), 2);
-    assert_eq!(driver.scheduler.next(), Some(OwnerClass::Io));
-    assert_eq!(driver.scheduler.next(), Some(OwnerClass::Session));
-    drop(driver);
-}
-
 #[tokio::test]
 async fn software_wakes_coalesced_with_either_owner_still_poll_both_once() {
     let (engine, mut driver) = test_engine_pair(CompletionMode::Readiness);
@@ -110,18 +120,18 @@ async fn software_wakes_coalesced_with_either_owner_still_poll_both_once() {
     let mut cx = TaskContext::from_waker(&waker);
 
     assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
-    let initial_io = driver.io_progress.turn_count();
-    let initial_session = driver.session_progress.turn_count();
+    let initial_io = driver.reactor.io.turn_count();
+    let initial_session = driver.reactor.session.turn_count();
 
     engine.shared.work_signal.publish(IO_WORK);
     assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
-    assert_eq!(driver.io_progress.turn_count(), initial_io + 1);
-    assert_eq!(driver.session_progress.turn_count(), initial_session + 1);
+    assert_eq!(driver.reactor.io.turn_count(), initial_io + 1);
+    assert_eq!(driver.reactor.session.turn_count(), initial_session + 1);
 
     engine.shared.work_signal.publish(SESSION_WORK);
     assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
-    assert_eq!(driver.io_progress.turn_count(), initial_io + 2);
-    assert_eq!(driver.session_progress.turn_count(), initial_session + 2);
+    assert_eq!(driver.reactor.io.turn_count(), initial_io + 2);
+    assert_eq!(driver.reactor.session.turn_count(), initial_session + 2);
     drop(driver);
 }
 
@@ -165,7 +175,7 @@ fn io_failure_cleanup_is_bounded_across_driver_polls() {
     assert!(first > 0 && first < 100);
 
     let mut result = Poll::Pending;
-    for _ in 0..8 {
+    for _ in 0..32 {
         result = Pin::new(&mut driver).poll(&mut cx);
         if result.is_ready() {
             break;
@@ -338,15 +348,17 @@ async fn cq_reclamation_ready_interleaving_dispatches_queued_success_and_flush_e
                 connection.state.token.encode(),
                 Duration::ZERO,
             );
-            driver.scheduler.mark_ready(OwnerClass::Io);
-            driver.scheduler.mark_ready(OwnerClass::Session);
             let waker = Waker::noop();
             let mut cx = TaskContext::from_waker(waker);
 
-            assert_eq!(driver.scheduler.next(), Some(OwnerClass::Io));
-            assert!(driver.service_io(&mut cx).unwrap());
-            assert_eq!(driver.scheduler.next(), Some(OwnerClass::Session));
-            assert!(driver.service_session(&mut cx).unwrap());
+            for _ in 0..4 {
+                assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
+                if engine.diagnostics().accepted_operations == 0
+                    && poster.destroys.load(Ordering::Acquire) == 1
+                {
+                    break;
+                }
+            }
 
             let diagnostics = engine.diagnostics();
             assert_eq!(diagnostics.accepted_operations, 0);
@@ -419,7 +431,7 @@ fn abort_build_polling_driver_progresses_without_a_time_probe() {
 #[tokio::test(start_paused = true)]
 async fn deadline_timer_wakes_driver_and_processes_due_work() {
     let (_engine, mut driver) = test_engine_pair(CompletionMode::Readiness);
-    driver.io_progress.schedule_deadline_for_test(
+    driver.reactor.io.schedule_deadline_for_test(
         tokio::time::Instant::now() + Duration::from_secs(5),
         super::super::registry::OperationToken::decode(7),
     );
@@ -443,7 +455,8 @@ async fn deadline_timer_rearms_for_newly_earlier_owner_deadline() {
     let later = now + Duration::from_secs(10);
     let earlier = now + Duration::from_secs(5);
     driver
-        .io_progress
+        .reactor
+        .io
         .schedule_deadline_for_test(later, super::super::registry::OperationToken::decode(1));
     let waker = Waker::noop();
     let mut cx = TaskContext::from_waker(waker);
@@ -452,7 +465,8 @@ async fn deadline_timer_rearms_for_newly_earlier_owner_deadline() {
     assert_eq!(driver.deadline_at, Some(later));
 
     driver
-        .io_progress
+        .reactor
+        .io
         .schedule_deadline_for_test(earlier, super::super::registry::OperationToken::decode(2));
     assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
     assert_eq!(driver.deadline_at, Some(earlier));
@@ -463,7 +477,8 @@ async fn deadline_timer_clears_removed_owner_deadline() {
     let (_engine, mut driver) = test_engine_pair(CompletionMode::Readiness);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     driver
-        .io_progress
+        .reactor
+        .io
         .schedule_deadline_for_test(deadline, super::super::registry::OperationToken::decode(1));
     let waker = Waker::noop();
     let mut cx = TaskContext::from_waker(waker);
@@ -471,7 +486,7 @@ async fn deadline_timer_clears_removed_owner_deadline() {
     assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
     assert_eq!(driver.deadline_at, Some(deadline));
 
-    driver.io_progress.clear_deadlines_for_test();
+    driver.reactor.io.clear_deadlines_for_test();
     assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
     assert_eq!(driver.deadline_at, None);
 }
@@ -479,7 +494,7 @@ async fn deadline_timer_clears_removed_owner_deadline() {
 #[tokio::test(start_paused = true)]
 async fn deadline_timer_processes_already_expired_owner_deadline() {
     let (_engine, mut driver) = test_engine_pair(CompletionMode::Readiness);
-    driver.io_progress.schedule_deadline_for_test(
+    driver.reactor.io.schedule_deadline_for_test(
         tokio::time::Instant::now(),
         super::super::registry::OperationToken::decode(1),
     );
@@ -488,7 +503,7 @@ async fn deadline_timer_processes_already_expired_owner_deadline() {
 
     assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
 
-    assert_eq!(driver.io_progress.next_deadline(), None);
+    assert_eq!(driver.reactor.io.next_deadline(), None);
     assert_eq!(driver.deadline_at, None);
 }
 
@@ -500,7 +515,7 @@ async fn readiness_idle_poll_does_not_self_wake_or_scan() {
     let mut cx = TaskContext::from_waker(&waker);
     assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
     assert_eq!(counter.count(), 0);
-    assert_eq!(driver.io_progress.completion_connection_count(), 0);
+    assert_eq!(driver.reactor.io.completion_connection_count(), 0);
 }
 
 #[tokio::test]
@@ -519,7 +534,7 @@ async fn idle_connections_publish_no_completion_dispatch_work() {
         let mut cx = TaskContext::from_waker(&waker);
 
         assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
-        assert_eq!(driver.io_progress.completion_connection_count(), 0);
+        assert_eq!(driver.reactor.io.completion_connection_count(), 0);
         assert!(!shared.io_core.has_published_connections());
 
         drop(connections);
@@ -602,6 +617,12 @@ async fn final_accepted_operation_drain_wakes_and_reconsiders_terminal() {
         counter.count() > wakes_before_drain,
         "the final accepted-operation drain must wake the registered driver"
     );
+    for _ in 0..8 {
+        if result.is_ready() || engine.diagnostics().accepted_operations == 0 {
+            break;
+        }
+        result = Pin::new(&mut driver).poll(&mut cx);
+    }
     assert_eq!(engine.diagnostics().accepted_operations, 0);
     for _ in 0..8 {
         if result.is_ready() {

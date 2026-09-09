@@ -27,6 +27,13 @@ The implementation status remains the architecture described in
   through the scheduling-equivalence gate. Phase 8 moves listener identity and
   bounded accept/child admission together; no parallel listener identity or
   accept path is permitted.
+- Phase 4 adapts listener publication only into the common consumed
+  `ReactorActions` batch. The existing listener owner still decides and mutates
+  accept admission, waiter/child/selected queues, close/drop state, CM
+  ownership, and lifecycle transitions; the action batch carries only detached
+  result/wake publication leaves. No reactor listener registry, token adapter,
+  shadow state, second accept queue, or alternate lifecycle path exists before
+  Phase 8.
 - `LiveIoConnectionProof` and `QpDestructionProof` remain explicit runtime
   evidence in the final architecture.
 - Message transport is not modified during core command/scheduler Phases 1-5.
@@ -159,7 +166,7 @@ Core Phases 1-5 leave this path unchanged.
 | `SessionManager`, session deadline and quarantine maps | Owns CM, connection, listener, deadline, and quarantine policy ([session/mod.rs:299-448](../../rdma-io/src/v2/engine/session/mod.rs#L299-L448)) | Phase 7 moves connection/deadline state, Phase 8 listener/shutdown state and deletes the owner/maps/locks |
 | Connection admission, reservation, and gauges | Exact establishing/established/draining/quarantine accounting ([connection/mod.rs:794-1122](../../rdma-io/src/v2/engine/session/connection/mod.rs#L794-L1122)) | Phase 7 moves facts into generational connection entries and retains exact gauges |
 | `ConnectionState`, outbound/inbound routes, QP indexes, shared CM context-route index | Exact generation/raw/context/QP route and lifecycle ownership ([connection/mod.rs:283-365](../../rdma-io/src/v2/engine/session/connection/mod.rs#L283-L365), [cm/mod.rs:975-1273](../../rdma-io/src/v2/engine/session/cm/mod.rs#L975-L1273)) | Phase 7 replaces independently mutable connection owners with one connection enum and moves connection-only indexes. The single context-route index remains authoritative because it also contains listener routes; Phase 8 moves it with listener identity, without a parallel map or dispatcher |
-| `ListenerState`, listener identity/indexes, waiter/child/selected queues, backlog layers | FIFO selection, cancellation ownership, bounded child backlog ([listener.rs:640-831](../../rdma-io/src/v2/engine/session/listener.rs#L640-L831), [listener.rs:1176-1428](../../rdma-io/src/v2/engine/session/listener.rs#L1176-L1428)) | Retain together on the authoritative current path through Phase 7. Phase 8 moves identity, state, accept admission, and close together into the reactor; public backlog bounds accept requests and children and is passed to the provider; remove `i32::MAX` policy |
+| `ListenerState`, listener identity/indexes, waiter/child/selected queues, backlog layers | FIFO selection, cancellation ownership, bounded child backlog ([listener.rs:640-831](../../rdma-io/src/v2/engine/session/listener.rs#L640-L831), [listener.rs:1176-1428](../../rdma-io/src/v2/engine/session/listener.rs#L1176-L1428)) | Retain together on the authoritative current path through Phase 7. Phase 4 changes only how already-decided listener result/wake leaves are published through `ReactorActions`; it does not move or duplicate any listed state. Phase 8 moves identity, state, accept admission, and close together into the reactor; public backlog bounds accept requests and children and is passed to the provider; remove `i32::MAX` policy |
 | Retirement/CM-destruction queues and QP/CM bundles | QP destruction precedes route/CM destruction and `WouldBlock` gates ID destruction ([cm/retirement.rs:17-167](../../rdma-io/src/v2/engine/session/cm/retirement.rs#L17-L167), [cm/retirement.rs:300-393](../../rdma-io/src/v2/engine/session/cm/retirement.rs#L300-L393)) | Phase 7 moves connection retirement and bundles into reactor-owned connection state but retains the one common CM-destruction service because it also owns listener destruction. Phase 8 moves that service with listener lifecycle; retain one FIFO destruction barrier and complete bundles |
 | `SessionProgress`, `IoProgress`, `CmShutdownCursor`, bounded scan cursors | Bounded CQ/CM/deadline/reclamation/terminal service ([io_core/progress.rs:21-129](../../rdma-io/src/v2/engine/io_core/progress.rs#L21-L129), [session/progress.rs:17-122](../../rdma-io/src/v2/engine/session/progress.rs#L17-L122)) | Delete progress owner structs in Phase 4; retain readiness, deadline heaps, CQ buffer, and cursors as reactor source fields |
 | Message state, MR pools, queues, send requests, received messages, and driver | Separate explicit protocol runtime with bounded resources and budget 32 ([message_transport.rs:571-863](../../rdma-io/src/v2/message_transport.rs#L571-L863), [message_transport.rs:1708-1899](../../rdma-io/src/v2/message_transport.rs#L1708-L1899)) | Retain unchanged; Phase 5A changes only the engine I/O adapter |
@@ -297,6 +304,60 @@ are published after the mutable reactor borrow ends, ordered as connection/
 protocol events, operation results/wakes, close/listener results, then engine
 terminal.
 
+The Phase-4 implementation has no reactor publication backlog and no ambient
+capture. `RdmaEngineDriver` owns one turn-local 32-leaf batch; command, CQ,
+completion-dispatch, reclamation, deadline, CM software/event/destruction,
+shutdown, and terminal sources receive the remaining capacity explicitly
+([reactor/mod.rs](../../rdma-io/src/v2/engine/reactor/mod.rs),
+[reactor/action.rs](../../rdma-io/src/v2/engine/reactor/action.rs)). Source
+payloads that do not fit stay on their existing command queue, operation
+record, connection scan/proof continuation, listener queues, destruction
+queue, or terminal cell. The crate-private message batch retains its direct
+compatibility publication bundle until Phase 5A rather than sharing the
+reactor cap
+([operation/effects.rs](../../rdma-io/src/v2/engine/io_core/operation/effects.rs)).
+
+The old owner/local alternators are removed. The reactor snapshots the actual
+source set, CM class depths, completion-dispatch queue, and bounded due-deadline
+prefixes before service; source feedback schedules the next external poll
+instead of extending the current turn
+([reactor/scheduler.rs](../../rdma-io/src/v2/engine/reactor/scheduler.rs),
+[io_core/progress.rs](../../rdma-io/src/v2/engine/io_core/progress.rs),
+[session/progress.rs](../../rdma-io/src/v2/engine/session/progress.rs)).
+Listener overflow remains on `ListenerState`, including one authoritative
+pending-admission child while cancelled waiters are incrementally removed; no
+reactor listener registry or alternate admission/lifecycle path is introduced
+([listener.rs](../../rdma-io/src/v2/engine/session/listener.rs),
+[cm/inbound.rs](../../rdma-io/src/v2/engine/session/cm/inbound.rs)).
+
+The recovered Phase-4 validation passed 199 v2 engine unit tests, all focused
+unit gates, five RXE and five SIW readiness-race repetitions, and the four-test
+provider probe on each provider. The focused conformance invocation completed
+the RXE matrix. Its SIW lifecycle/drop composite passed ten tests but
+`clean_close_records_real_qp_mr_cm_and_canonical_ack_order_in_both_modes`
+returned the previously observed intermittent `TransportClosed`; the
+validator continued through the remaining SIW composites successfully and
+restored RXE. A targeted current-worktree retry of that exact SIW test also
+returned `TransportClosed`. RXE was restored; its setup script then
+transiently misreported missing `librdmacm` despite `ldconfig`, `ibv_devices`,
+and the active `rxe0` link immediately confirming a usable installation. These
+results are recorded as intermittent SIW/provider and setup failures, not as
+clean dual-provider conformance and not as evidence of a new regression
+without a reproducible code-level cause.
+
+For listeners in Phase 4, an action is only detached publication output from
+the existing authoritative listener transition. The action layer does not
+allocate listener identity, admit accepts, own `AcceptRequest`, retain
+waiter/child/selected queues, decide close/drop, own CM resources, or perform
+lifecycle mutation. Existing accept/listener-close observer storage retains
+take-once results, cancellation decisions, and any bounded pending-publication
+state; only emission crosses the action batch. `listener.rs`, `cm/inbound.rs`,
+`cm/retirement.rs`, and `cm/shutdown.rs` must all use that boundary for accept
+success/failure, close retirement, shutdown, and driver-drop publication. No
+parallel reactor listener record or second listener-ready ownership structure
+is introduced. Those ownership responsibilities move together only in Phase
+8.
+
 CQ arm/re-poll, CM re-registration, source epoch register/recheck, deadline
 rearm, and polling-mode cooperative yield remain mandatory
 ([completion.rs:348-451](../../rdma-io/src/v2/completion.rs#L348-L451),
@@ -314,7 +375,11 @@ rearm, and polling-mode cooperative yield remain mandatory
 4. The unchanged crate-private `IoConnection` compatibility path is deleted in
    the separate Phase 5A milestone, before exclusive ownership.
 5. Phase 4 deletes `OwnerScheduler`, `AlternatingSources`, the progress-owner
-   structs, owner work bits, and the old effect typestate pipeline.
+   structs, owner work bits, and the old effect typestate pipeline. For
+   listeners it replaces only direct publication with detached
+   `ReactorActions` leaves; listener identity, accept admission, queues,
+   close/drop state, CM ownership, and lifecycle mutation remain on the
+   authoritative current path.
 6. Phase 5 must prove bounded fairness, readiness, reentrancy, terminal,
    polling/readiness-mode, and RXE/SIW equivalence before Phase 5A or lifecycle
    ownership work, including the Phase-8 listener identity/admission move.

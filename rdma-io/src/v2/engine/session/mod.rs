@@ -17,6 +17,9 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::Duration;
 
 use self::cm::CmState;
+pub(in crate::v2::engine) use self::cm::{
+    CmShutdownClass, CmShutdownSnapshot, CmSoftwareClass, CmSoftwareSnapshot,
+};
 pub(super) mod cm;
 pub(super) mod connection;
 mod drain;
@@ -28,7 +31,7 @@ use self::connection::{
     ConnectionAdmissionPool, ConnectionState, QpDestroyStatus, SharedCmId, VerbsConnectionResources,
 };
 use self::listener::ListenerState;
-pub(super) use self::progress::SessionProgress;
+pub(super) use self::progress::SessionReactorSources;
 use self::registry::ConnectionRegistry;
 pub(in crate::v2::engine) use self::registry::LiveIoProofAuthority;
 #[cfg(any(test, feature = "test-hooks"))]
@@ -135,8 +138,16 @@ impl SessionCloseState {
         self.retired.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    pub(super) fn notify_waiters(&self) {
+    pub(super) fn notify_waiters(self: &Arc<Self>) {
         self.notify.notify_waiters();
+    }
+
+    pub(super) fn notify_waiters_into(
+        self: &Arc<Self>,
+        actions: &mut super::reactor::ReactorActions,
+    ) {
+        let close = Arc::clone(self);
+        actions.push_close_or_listener(move || close.notify.notify_waiters());
     }
 }
 
@@ -188,8 +199,16 @@ impl SessionListenerCloseState {
         previous == 1
     }
 
-    pub(super) fn notify_waiters(&self) {
+    pub(super) fn notify_waiters(self: &Arc<Self>) {
         self.notify.notify_waiters();
+    }
+
+    pub(super) fn notify_waiters_into(
+        self: &Arc<Self>,
+        actions: &mut super::reactor::ReactorActions,
+    ) {
+        let close = Arc::clone(self);
+        actions.push_close_or_listener(move || close.notify.notify_waiters());
     }
 }
 
@@ -496,11 +515,15 @@ impl SessionManager {
         self.test_instrumentation.pause_connect_before_enqueue();
     }
 
-    pub(in crate::v2::engine) fn request_connection_close(&self, token: ConnectionToken) {
+    pub(in crate::v2::engine) fn request_connection_close_into(
+        &self,
+        token: ConnectionToken,
+        actions: &mut super::reactor::ReactorActions,
+    ) {
         let Lookup::Occupied(connection) = self.connections.lookup(token) else {
             return;
         };
-        self.begin_connection_close(&connection);
+        self.begin_connection_close_into(&connection, actions);
     }
 
     pub(super) fn connection_capability(&self, connection: &ConnectionState) -> SessionConnection {
@@ -627,8 +650,13 @@ impl SessionManager {
         requests.drain(..count).collect()
     }
 
+    #[cfg(test)]
     pub(super) fn has_deadline_requests(&self) -> bool {
         !lock_unpoison(&self.deadline_requests).is_empty()
+    }
+
+    pub(super) fn deadline_request_count(&self) -> usize {
+        lock_unpoison(&self.deadline_requests).len()
     }
 
     pub(super) fn track_connection_quarantine(&self, token: ConnectionToken) -> bool {
@@ -756,6 +784,14 @@ impl SessionManager {
         self.apply_io_effects(effects).publish();
     }
 
+    pub(super) fn commit_io_effects_into(
+        &self,
+        effects: IoCoreEffects,
+        actions: &mut super::reactor::ReactorActions,
+    ) {
+        self.apply_io_effects(effects).append_to(actions);
+    }
+
     /// Apply session effects for root terminal composition.
     ///
     /// The returned value contains only detached publication and must be
@@ -806,6 +842,7 @@ impl SessionManager {
         (processed, remains_ready)
     }
 
+    #[cfg(test)]
     pub(super) fn reclaim_after_qp_destroy(
         &self,
         proof: QpDestructionProof,
@@ -837,6 +874,39 @@ impl SessionManager {
             .count()
     }
 
+    pub(super) fn reclaim_after_qp_destroy_into(
+        &self,
+        proof: &QpDestructionProof,
+        connection: &ConnectionState,
+        tokens: Vec<OperationToken>,
+        actions: &mut super::reactor::ReactorActions,
+    ) -> usize {
+        let proven_connection = proof.connection;
+        let proven_qp_num = proof.qp_num;
+        if proven_connection != connection.token || proven_qp_num != connection.qp_num() {
+            tracing::warn!(
+                connection = connection.token.encode(),
+                "operation reclaim rejected a mismatched QP destruction proof"
+            );
+            return 0;
+        }
+        tokens
+            .into_iter()
+            .filter(|token| {
+                let (reclaimed, effects) = self.qp_reclaim.reclaim(
+                    proven_connection,
+                    proven_qp_num,
+                    &connection.io,
+                    connection.operation_close_error(),
+                    *token,
+                );
+                self.commit_io_effects_into(effects, actions);
+                reclaimed
+            })
+            .count()
+    }
+
+    #[cfg(test)]
     fn reclaim_after_proven_qp_destroy(
         &self,
         proven_connection: ConnectionToken,
@@ -865,14 +935,19 @@ impl SessionManager {
         self.reclaim_after_proven_qp_destroy(proof.connection, proof.qp_num, connection, token)
     }
 
-    pub(super) fn reject_queued_completions_after_qp_destroy(
+    pub(super) fn reject_queued_completions_after_qp_destroy_into(
         &self,
         connection: &ConnectionState,
+        actions: &mut super::reactor::ReactorActions,
     ) -> bool {
+        // Every completion can publish an event, an operation wake, and a
+        // connection-close wake. Keep two leaves for the owning connection's
+        // quarantine/close tail before removing any copied CQE.
+        let quantum = actions.remaining().saturating_sub(2) / 3;
         let (remains_ready, effects) = self
             .io_core
-            .reject_queued_completions_after_qp_destroy(&connection.io);
-        self.commit_io_effects(effects);
+            .reject_queued_completions_after_qp_destroy(&connection.io, quantum);
+        self.commit_io_effects_into(effects, actions);
         remains_ready
     }
 
@@ -881,6 +956,7 @@ impl SessionManager {
         self.commit_io_effects(effects);
     }
 
+    #[cfg(test)]
     pub(super) fn quarantine_operation(&self, token: OperationToken) {
         let effects = self.io_core.quarantine_operation(token);
         self.commit_io_effects(effects);
@@ -900,12 +976,46 @@ impl IoSessionBridge for SessionManager {
         self.dispatch_connection_completions(connection, quantum)
     }
 
+    fn dispatch_connection_completions_into(
+        &self,
+        connection: ConnectionToken,
+        quantum: usize,
+        actions: &mut super::reactor::ReactorActions,
+    ) -> (usize, bool) {
+        let connection = match self.connections.lookup(connection) {
+            Lookup::Occupied(connection) => connection,
+            _ => return (0, false),
+        };
+        let (processed, remains_ready, effects) = self
+            .io_core
+            .dispatch_connection_completions(&connection.io, quantum);
+        self.commit_io_effects_into(effects, actions);
+        (processed, remains_ready)
+    }
+
     fn handle_reclamation_deadline(&self, token: OperationToken) {
         self.handle_reclamation_deadline(token);
     }
 
+    fn handle_reclamation_deadline_into(
+        &self,
+        token: OperationToken,
+        actions: &mut super::reactor::ReactorActions,
+    ) {
+        let effects = self.io_core.handle_reclamation_deadline(token);
+        self.commit_io_effects_into(effects, actions);
+    }
+
     fn commit_terminal_effects(&self, effects: IoCoreEffects) {
         self.commit_io_effects(effects);
+    }
+
+    fn commit_terminal_effects_into(
+        &self,
+        effects: IoCoreEffects,
+        actions: &mut super::reactor::ReactorActions,
+    ) {
+        self.commit_io_effects_into(effects, actions);
     }
 }
 

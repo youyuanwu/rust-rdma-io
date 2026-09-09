@@ -6,25 +6,28 @@ use std::task::{Context as TaskContext, Poll};
 use tokio::time::Instant;
 
 use super::cm::CmShutdownCursor;
-use super::{DeadlineKind, SessionManager};
+use super::{
+    CmShutdownClass, CmShutdownSnapshot, CmSoftwareClass, CmSoftwareSnapshot, DeadlineKind,
+    SessionManager,
+};
 use crate::v2::engine::config::CompletionMode;
 use crate::v2::engine::lifecycle::MemoizedTerminalResult;
-use crate::v2::engine::progress::{ProgressReport, ReadinessRegistration};
+#[cfg(test)]
+use crate::v2::engine::progress::ProgressReport;
+use crate::v2::engine::progress::ReadinessRegistration;
 use crate::v2::engine::resources::SessionProgressResources;
-use crate::v2::engine::scheduler::{AlternatingSources, DeadlineQueue, Source};
+use crate::v2::engine::scheduler::DeadlineQueue;
 use crate::v2::error::{Error, Result};
 
-pub(in crate::v2::engine) struct SessionProgress {
+pub(in crate::v2::engine) struct SessionReactorSources {
     manager: Arc<SessionManager>,
     resources: Option<SessionProgressResources>,
     deadlines: DeadlineQueue<SessionDeadline>,
-    reclamation_sources: AlternatingSources,
-    cm_next_source: usize,
+    ready_deadlines: std::collections::VecDeque<SessionDeadline>,
     shutdown_started: bool,
     shutdown_cm: CmShutdownCursor,
     shutdown_connection_slot: usize,
     shutdown_connections_complete: bool,
-    shutdown_next_source: bool,
     failure_scan_started: bool,
     terminal_completion_ready: bool,
     #[cfg(test)]
@@ -33,7 +36,7 @@ pub(in crate::v2::engine) struct SessionProgress {
     reclamation_budget: usize,
 }
 
-impl SessionProgress {
+impl SessionReactorSources {
     pub(in crate::v2::engine) fn new(
         manager: Arc<SessionManager>,
         resources: Option<SessionProgressResources>,
@@ -44,13 +47,11 @@ impl SessionProgress {
             manager,
             resources,
             deadlines: DeadlineQueue::default(),
-            reclamation_sources: AlternatingSources::default(),
-            cm_next_source: 0,
+            ready_deadlines: std::collections::VecDeque::new(),
             shutdown_started: false,
             shutdown_cm: CmShutdownCursor::default(),
             shutdown_connection_slot: 0,
             shutdown_connections_complete: false,
-            shutdown_next_source: true,
             failure_scan_started: false,
             terminal_completion_ready: false,
             #[cfg(test)]
@@ -60,11 +61,81 @@ impl SessionProgress {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::v2::engine) fn turn(
         &mut self,
         mode: CompletionMode,
         cx: &mut TaskContext<'_>,
     ) -> Result<ProgressReport> {
+        let (shutting_down, terminal_failure) = self.begin_turn()?;
+        let mut actions = crate::v2::engine::reactor::ReactorActions::default();
+        let mut cm_units = 0;
+        if !terminal_failure {
+            let snapshot = self.cm_software_snapshot();
+            for class in CmSoftwareClass::ALL {
+                cm_units += self.service_cm_software_class(
+                    class,
+                    snapshot
+                        .count(class)
+                        .min(self.cm_budget.saturating_sub(cm_units)),
+                    &mut actions,
+                )?;
+                if cm_units == self.cm_budget {
+                    break;
+                }
+            }
+        }
+        let (events, readiness, observed_would_block) = self.service_cm_events(
+            mode,
+            cx,
+            self.cm_budget.saturating_sub(cm_units),
+            &mut actions,
+        )?;
+        cm_units += events;
+        if !terminal_failure {
+            cm_units += self.service_cm_destructions(
+                self.cm_budget.saturating_sub(cm_units),
+                observed_would_block,
+                &mut actions,
+            )?;
+        }
+        if shutting_down {
+            let snapshot = self.shutdown_snapshot();
+            for class in CmShutdownClass::ALL {
+                cm_units += self.service_cm_shutdown_class(
+                    class,
+                    snapshot
+                        .count(class)
+                        .min(self.cm_budget.saturating_sub(cm_units)),
+                    &mut actions,
+                );
+                if cm_units == self.cm_budget {
+                    break;
+                }
+            }
+            if cm_units < self.cm_budget && self.shutdown_connections_ready() {
+                cm_units +=
+                    self.service_shutdown_connections(self.cm_budget - cm_units, &mut actions);
+            }
+        }
+        let (deadline_units, deadline_ready) = if terminal_failure {
+            (0, false)
+        } else {
+            self.service_deadlines_for_test()?
+        };
+        self.finish_turn(shutting_down, terminal_failure, observed_would_block);
+        actions.publish();
+        let cm_ready = cm_units >= self.cm_budget
+            || self.manager.has_cm_work()
+            || (shutting_down && !self.shutdown_issuance_complete());
+        Ok(ProgressReport::running(
+            cm_units.saturating_add(deadline_units),
+            cm_ready || deadline_ready,
+            readiness,
+        ))
+    }
+
+    pub(in crate::v2::engine) fn begin_turn(&mut self) -> Result<(bool, bool)> {
         #[cfg(test)]
         {
             self.turns = self.turns.saturating_add(1);
@@ -81,13 +152,15 @@ impl SessionProgress {
         if terminal_failure {
             self.prepare_failure_scan();
         }
-        let (cm_units, readiness, cm_ready, observed_would_block) =
-            self.service_cm(mode, cx, shutting_down, terminal_failure)?;
-        let (deadline_units, deadline_ready) = if terminal_failure {
-            (0, false)
-        } else {
-            self.service_deadlines()?
-        };
+        Ok((shutting_down, terminal_failure))
+    }
+
+    pub(in crate::v2::engine) fn finish_turn(
+        &mut self,
+        shutting_down: bool,
+        terminal_failure: bool,
+        observed_would_block: bool,
+    ) {
         if terminal_failure && self.shutdown_issuance_complete() {
             self.terminal_completion_ready = true;
         } else if shutting_down
@@ -104,11 +177,61 @@ impl SessionProgress {
             }
             self.terminal_completion_ready = true;
         }
-        Ok(ProgressReport::running(
-            cm_units.saturating_add(deadline_units),
-            cm_ready || deadline_ready,
-            readiness,
-        ))
+    }
+
+    pub(in crate::v2::engine) fn cm_budget(&self) -> usize {
+        self.cm_budget
+    }
+
+    pub(in crate::v2::engine) fn resources_absent(&self) -> bool {
+        self.resources.is_none()
+    }
+
+    pub(in crate::v2::engine) fn reclamation_budget(&self) -> usize {
+        self.reclamation_budget
+    }
+
+    pub(in crate::v2::engine) fn has_cm_software_work(&self) -> bool {
+        self.manager.cm.has_non_destruction_software_work()
+    }
+
+    pub(in crate::v2::engine) fn cm_software_snapshot(&self) -> CmSoftwareSnapshot {
+        self.manager.cm_software_snapshot()
+    }
+
+    pub(in crate::v2::engine) fn has_cm_destruction_work(&self) -> bool {
+        self.manager.cm.has_destruction_work()
+    }
+
+    pub(in crate::v2::engine) fn has_pending_cm_event(&self) -> bool {
+        self.manager.has_pending_cm_event()
+    }
+
+    pub(in crate::v2::engine) fn cm_destruction_work_count(&self) -> usize {
+        self.manager.cm.destruction_work_count()
+    }
+
+    pub(in crate::v2::engine) fn deadline_request_count(&self) -> usize {
+        self.manager.deadline_request_count()
+    }
+
+    pub(in crate::v2::engine) fn due_deadline_count(&self, now: Instant) -> usize {
+        self.ready_deadlines
+            .len()
+            .saturating_add(usize::from(self.deadlines.has_due(now)))
+    }
+
+    pub(in crate::v2::engine) fn prepare_due_deadline_snapshot(&mut self, now: Instant) -> usize {
+        let available = self
+            .reclamation_budget
+            .saturating_sub(self.ready_deadlines.len());
+        self.ready_deadlines
+            .extend(self.deadlines.drain_due(now, available));
+        self.ready_deadlines.len()
+    }
+
+    pub(in crate::v2::engine) fn shutdown_work_pending(&self) -> bool {
+        self.manager.shutdown_requested() && !self.shutdown_issuance_complete()
     }
 
     pub(in crate::v2::engine) fn can_finish(&self) -> bool {
@@ -133,13 +256,13 @@ impl SessionProgress {
     }
 
     #[cfg(test)]
-    fn reclamation_turn_starts_with_request(&self) -> bool {
-        self.reclamation_sources.first_starts_next_turn()
+    pub(in crate::v2::engine) fn turn_count(&self) -> usize {
+        self.turns
     }
 
     #[cfg(test)]
-    pub(in crate::v2::engine) fn turn_count(&self) -> usize {
-        self.turns
+    pub(in crate::v2::engine) fn exhaust_deadline_sequence_for_test(&mut self) {
+        self.deadlines.exhaust_sequence_for_test();
     }
 
     fn ensure_shutdown_started(&mut self) {
@@ -162,7 +285,6 @@ impl SessionProgress {
         self.shutdown_cm = CmShutdownCursor::default();
         self.shutdown_connection_slot = 0;
         self.shutdown_connections_complete = false;
-        self.shutdown_next_source = true;
     }
 
     fn shutdown_issuance_complete(&self) -> bool {
@@ -177,240 +299,270 @@ impl SessionProgress {
             && self.manager.live_connection_count() == 0
     }
 
-    fn service_shutdown_unit(&mut self) -> usize {
+    pub(in crate::v2::engine) fn shutdown_snapshot(&self) -> CmShutdownSnapshot {
+        self.manager.cm.bounded_shutdown_snapshot(
+            self.manager.pending_terminal_outcome().is_some(),
+            &self.shutdown_cm,
+            self.cm_budget,
+        )
+    }
+
+    pub(in crate::v2::engine) fn shutdown_connections_ready(&self) -> bool {
+        !self.shutdown_connections_complete
+    }
+
+    pub(in crate::v2::engine) fn service_cm_shutdown_class(
+        &mut self,
+        class: CmShutdownClass,
+        budget: usize,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) -> usize {
         let terminal = self.manager.pending_terminal_outcome();
         let outcome = terminal
             .clone()
             .unwrap_or_else(|| MemoizedTerminalResult::from_error(Error::DriverShutdown));
-        for _ in 0..2 {
-            let cm_first = self.shutdown_next_source;
-            self.shutdown_next_source = !self.shutdown_next_source;
-            if cm_first {
-                let processed = self.manager.cm.service_bounded_shutdown(
-                    &self.manager,
-                    &outcome,
-                    terminal.is_some(),
-                    &mut self.shutdown_cm,
-                    1,
-                );
-                if processed != 0 {
-                    return processed;
-                }
-            } else if !self.shutdown_connections_complete {
-                let (connections, next, complete, scanned) = self
-                    .manager
-                    .connections
-                    .scan_occupied(self.shutdown_connection_slot, 1);
-                self.shutdown_connection_slot = next;
-                self.shutdown_connections_complete = complete;
-                for connection in connections {
-                    self.manager.begin_connection_close(&connection);
-                    if let Some(outcome) = terminal.as_ref() {
-                        if connection.retain_bundle_for_engine_failure() {
-                            self.manager.track_connection_quarantine(connection.token);
-                        }
-                        if let Some(event) = self
-                            .manager
-                            .finalize_connection_engine(&connection, outcome)
-                        {
-                            event.deliver();
-                        }
-                        connection.wake_close();
-                    }
-                }
-                if scanned != 0 {
-                    return scanned;
-                }
-            }
-        }
-        0
+        self.manager.cm.service_bounded_shutdown_class(
+            &self.manager,
+            &outcome,
+            terminal.is_some(),
+            &mut self.shutdown_cm,
+            class,
+            budget,
+            actions,
+        )
     }
 
-    fn service_cm(
+    pub(in crate::v2::engine) fn service_shutdown_connections(
+        &mut self,
+        budget: usize,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) -> usize {
+        let terminal = self.manager.pending_terminal_outcome();
+        let mut processed = 0;
+        while processed < budget && actions.remaining() >= 8 && !self.shutdown_connections_complete
+        {
+            let (connections, next, complete, scanned) = self
+                .manager
+                .connections
+                .scan_occupied(self.shutdown_connection_slot, 1);
+            self.shutdown_connection_slot = next;
+            self.shutdown_connections_complete = complete;
+            for connection in connections {
+                self.manager
+                    .begin_connection_close_into(&connection, actions);
+                if let Some(outcome) = terminal.as_ref() {
+                    if connection.retain_bundle_for_engine_failure() {
+                        self.manager.track_connection_quarantine(connection.token);
+                    }
+                    if let Some(event) = self
+                        .manager
+                        .finalize_connection_engine(&connection, outcome)
+                    {
+                        actions.push_event(event);
+                    }
+                    connection.wake_close_into(actions);
+                }
+            }
+            if scanned == 0 {
+                break;
+            }
+            processed += scanned;
+        }
+        processed
+    }
+
+    #[cfg(test)]
+    fn service_deadlines_for_test(&mut self) -> Result<(usize, bool)> {
+        let now = Instant::now();
+        let requests = self.service_deadline_requests(self.reclamation_budget)?;
+        let mut actions = crate::v2::engine::reactor::ReactorActions::default();
+        let due =
+            self.service_due_deadlines_into(now, self.reclamation_budget - requests, &mut actions)?;
+        actions.publish();
+        Ok((
+            requests + due,
+            self.manager.has_deadline_requests()
+                || self.deadlines.next().is_some_and(|at| at <= now),
+        ))
+    }
+
+    pub(in crate::v2::engine) fn service_cm_software_class(
+        &mut self,
+        class: CmSoftwareClass,
+        budget: usize,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) -> Result<usize> {
+        self.manager.service_cm_software_class(
+            self.resources
+                .as_ref()
+                .map(SessionProgressResources::engine),
+            class,
+            budget,
+            actions,
+        )
+    }
+
+    pub(in crate::v2::engine) fn service_cm_events(
         &mut self,
         mode: CompletionMode,
         cx: &mut TaskContext<'_>,
-        shutting_down: bool,
-        terminal_failure: bool,
-    ) -> Result<(usize, ReadinessRegistration, bool, bool)> {
+        budget: usize,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) -> Result<(usize, ReadinessRegistration, bool)> {
+        let Some(resources) = self.resources.as_ref() else {
+            return Ok((0, ReadinessRegistration::NotRequired, true));
+        };
+        let resources = resources.engine();
         let mut processed = 0;
-        let mut readiness = if mode == CompletionMode::Readiness && self.resources.is_some() {
-            ReadinessRegistration::Incomplete
-        } else {
-            ReadinessRegistration::NotRequired
-        };
-        let mut readiness_checked = false;
-        let mut observed_would_block = self.resources.is_none();
-        while processed < self.cm_budget {
-            let mut selected = false;
-            for offset in 0..4 {
-                let source = (self.cm_next_source + offset) % 4;
-                if terminal_failure && source != 3 {
-                    continue;
-                }
-                let units = match source {
-                    0 => self.manager.service_cm_software(
-                        self.resources
-                            .as_ref()
-                            .map(SessionProgressResources::engine),
-                        1,
-                    )?,
-                    1 => {
-                        let Some(resources) = self.resources.as_ref() else {
-                            continue;
-                        };
-                        let resources = resources.engine();
-                        if self.manager.try_process_cm_event(resources)? {
-                            observed_would_block = false;
-                            readiness = if mode == CompletionMode::Readiness {
-                                ReadinessRegistration::Incomplete
-                            } else {
-                                ReadinessRegistration::NotRequired
-                            };
-                            1
-                        } else {
-                            observed_would_block = true;
-                            if mode == CompletionMode::Readiness && !readiness_checked {
-                                readiness_checked = true;
-                                let async_fd = resources.cm_async_fd.as_ref().ok_or_else(|| {
-                                    Error::InvalidConfig(
-                                        "readiness engine has no CM AsyncFd".into(),
-                                    )
-                                })?;
-                                match poll_readiness_events(
-                                    cx,
-                                    1,
-                                    |cx| match async_fd.poll_read_ready(cx) {
-                                        Poll::Ready(Ok(guard)) => Poll::Ready(Ok(guard)),
-                                        Poll::Ready(Err(error)) => {
-                                            Poll::Ready(Err(Error::Verbs(error)))
-                                        }
-                                        Poll::Pending => Poll::Pending,
-                                    },
-                                    |guard| guard.clear_ready(),
-                                    || self.manager.try_process_cm_event(resources),
-                                ) {
-                                    Poll::Ready(result) => {
-                                        let units = result?;
-                                        if units != 0 {
-                                            observed_would_block = false;
-                                            readiness = ReadinessRegistration::Incomplete;
-                                        }
-                                        units
-                                    }
-                                    Poll::Pending => {
-                                        readiness = ReadinessRegistration::RegisteredAndRechecked;
-                                        0
-                                    }
-                                }
-                            } else {
-                                0
-                            }
-                        }
-                    }
-                    2 => {
-                        let Some(resources) = self.resources.as_ref() else {
-                            continue;
-                        };
-                        let resources = resources.engine();
-                        self.manager.service_deferred_cm_destructions(1, || {
-                            self.manager.try_process_cm_event(resources)
-                        })?
-                    }
-                    3 if shutting_down && !self.shutdown_issuance_complete() => {
-                        self.service_shutdown_unit()
-                    }
-                    _ => 0,
-                };
-                if units == 0 {
-                    continue;
-                }
-                processed += units;
-                self.cm_next_source = (source + 1) % 4;
-                selected = true;
-                break;
-            }
-            if !selected {
-                break;
-            }
+        while processed < budget
+            && actions.remaining() >= 8
+            && self.manager.try_process_cm_event(resources, actions)?
+        {
+            processed += 1;
         }
-
-        let immediate = if terminal_failure {
-            !self.shutdown_issuance_complete()
-        } else {
-            processed >= self.cm_budget
-                || self.manager.has_cm_work()
-                || (shutting_down && !self.shutdown_issuance_complete())
-        };
-        Ok((processed, readiness, immediate, observed_would_block))
+        if processed == budget {
+            return Ok((processed, ReadinessRegistration::Incomplete, false));
+        }
+        if actions.remaining() < 8 {
+            return Ok((processed, ReadinessRegistration::Incomplete, false));
+        }
+        if mode != CompletionMode::Readiness {
+            return Ok((processed, ReadinessRegistration::NotRequired, true));
+        }
+        let async_fd = resources
+            .cm_async_fd
+            .as_ref()
+            .ok_or_else(|| Error::InvalidConfig("readiness engine has no CM AsyncFd".into()))?;
+        match poll_readiness_events(
+            cx,
+            1,
+            |cx| match async_fd.poll_read_ready(cx) {
+                Poll::Ready(Ok(guard)) => Poll::Ready(Ok(guard)),
+                Poll::Ready(Err(error)) => Poll::Ready(Err(Error::Verbs(error))),
+                Poll::Pending => Poll::Pending,
+            },
+            |guard| guard.clear_ready(),
+            || {
+                if actions.remaining() < 8 {
+                    Ok(false)
+                } else {
+                    self.manager.try_process_cm_event(resources, actions)
+                }
+            },
+        ) {
+            Poll::Ready(result) => {
+                let extra = result?;
+                Ok((
+                    processed + extra,
+                    ReadinessRegistration::Incomplete,
+                    extra == 0,
+                ))
+            }
+            Poll::Pending => Ok((
+                processed,
+                ReadinessRegistration::RegisteredAndRechecked,
+                true,
+            )),
+        }
     }
 
-    fn service_deadlines(&mut self) -> Result<(usize, bool)> {
-        let now = Instant::now();
-        let mut sources = self.reclamation_sources.begin_turn();
+    pub(in crate::v2::engine) fn service_cm_destructions(
+        &mut self,
+        budget: usize,
+        cm_drained: bool,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) -> Result<usize> {
+        if !cm_drained {
+            return Ok(0);
+        }
+        let Some(resources) = self.resources.as_ref() else {
+            return Ok(0);
+        };
+        let resources = resources.engine();
+        self.manager
+            .service_deferred_cm_destructions(budget, actions, || {
+                self.manager.cm.defer_one_event(resources)
+            })
+    }
+
+    pub(in crate::v2::engine) fn service_deadline_requests(
+        &mut self,
+        budget: usize,
+    ) -> Result<usize> {
         let mut consumed = 0;
-        while consumed < self.reclamation_budget {
-            let mut handled = false;
-            for source in sources.order() {
-                handled = match source {
-                    Source::First => self.ingest_one_deadline()?,
-                    Source::Second => self.process_one_deadline(now)?,
-                };
-                if handled {
-                    break;
-                }
-            }
-            if !handled {
+        for request in self.manager.take_deadline_requests(budget) {
+            self.deadlines
+                .push(
+                    request.at,
+                    SessionDeadline {
+                        kind: request.kind,
+                        token: request.token,
+                    },
+                )
+                .map_err(|_| {
+                    Error::InvalidConfig("session deadline insertion sequence exhausted".into())
+                })?;
+            consumed += 1;
+        }
+        Ok(consumed)
+    }
+
+    pub(in crate::v2::engine) fn service_due_deadlines_into(
+        &mut self,
+        _now: Instant,
+        budget: usize,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) -> Result<usize> {
+        let mut consumed = 0;
+        while consumed < budget {
+            let Some(deadline) = self.ready_deadlines.front().copied() else {
                 break;
+            };
+            let required_actions = match deadline.kind {
+                DeadlineKind::EngineShutdown => 0,
+                DeadlineKind::ConnectionDrain => 2,
+            };
+            if !actions.can_accept(required_actions) {
+                break;
+            }
+            let deadline = self
+                .ready_deadlines
+                .pop_front()
+                .expect("peeked session deadline remains at queue head");
+            match deadline {
+                SessionDeadline {
+                    kind: DeadlineKind::EngineShutdown,
+                    ..
+                } => {
+                    if let Some(failure) = self.manager.shutdown_deadline_failure() {
+                        return Err(failure);
+                    }
+                }
+                SessionDeadline {
+                    kind: DeadlineKind::ConnectionDrain,
+                    token,
+                    ..
+                } => self.manager.handle_connection_drain_deadline_into(
+                    crate::v2::engine::registry::ConnectionToken::decode(token),
+                    actions,
+                ),
             }
             consumed += 1;
-            sources.consumed();
         }
-        let immediate = self.manager.has_deadline_requests()
-            || self.deadlines.next().is_some_and(|at| at <= now);
-        Ok((consumed, immediate))
+        Ok(consumed)
     }
 
-    fn ingest_one_deadline(&mut self) -> Result<bool> {
-        let Some(request) = self.manager.take_deadline_requests(1).into_iter().next() else {
-            return Ok(false);
-        };
-        self.deadlines
-            .push(
-                request.at,
-                SessionDeadline {
-                    kind: request.kind,
-                    token: request.token,
-                },
-            )
-            .map_err(|_| {
-                Error::InvalidConfig("session deadline insertion sequence exhausted".into())
-            })?;
-        Ok(true)
-    }
-
-    fn process_one_deadline(&mut self, now: Instant) -> Result<bool> {
-        let Some(deadline) = self.deadlines.pop_one_due(now) else {
-            return Ok(false);
-        };
-        match deadline {
-            SessionDeadline {
-                kind: DeadlineKind::EngineShutdown,
-                ..
-            } => {
-                if let Some(failure) = self.manager.shutdown_deadline_failure() {
-                    return Err(failure);
-                }
-            }
-            SessionDeadline {
-                kind: DeadlineKind::ConnectionDrain,
-                token,
-                ..
-            } => self.manager.handle_connection_drain_deadline(
-                crate::v2::engine::registry::ConnectionToken::decode(token),
-            ),
-        }
-        Ok(true)
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn service_due_deadlines(
+        &mut self,
+        now: Instant,
+        budget: usize,
+    ) -> Result<usize> {
+        let mut actions = crate::v2::engine::reactor::ReactorActions::default();
+        self.prepare_due_deadline_snapshot(now);
+        let result = self.service_due_deadlines_into(now, budget, &mut actions);
+        actions.publish();
+        result
     }
 }
 
@@ -527,26 +679,20 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn deadline_turn_start_alternates_with_an_odd_budget() {
+    async fn deadline_ingress_is_deferred_from_due_service_snapshot() {
         let (engine, driver) = test_engine_pair(CompletionMode::Polling);
-        let mut progress = SessionProgress::new(Arc::clone(&engine.shared.session), None, 1, 1);
+        let mut progress =
+            SessionReactorSources::new(Arc::clone(&engine.shared.session), None, 1, 1);
         engine.shared.session.schedule_deadline(
             DeadlineKind::ConnectionDrain,
             1,
             std::time::Duration::ZERO,
         );
-        let waker = Waker::noop();
-        let mut cx = TaskContext::from_waker(waker);
-
-        assert!(progress.reclamation_turn_starts_with_request());
-        let first = progress.turn(CompletionMode::Polling, &mut cx).unwrap();
-        assert_eq!(first.units_consumed, 1);
-        assert!(first.immediate_work);
-        assert!(!progress.reclamation_turn_starts_with_request());
-
-        let second = progress.turn(CompletionMode::Polling, &mut cx).unwrap();
-        assert_eq!(second.units_consumed, 1);
-        assert!(progress.reclamation_turn_starts_with_request());
+        let now = Instant::now();
+        assert_eq!(progress.due_deadline_count(now), 0);
+        assert_eq!(progress.service_deadline_requests(1).unwrap(), 1);
+        assert_eq!(progress.service_due_deadlines(now, 0).unwrap(), 0);
+        assert_eq!(progress.service_due_deadlines(now, 1).unwrap(), 1);
 
         drop(driver);
     }
@@ -578,29 +724,53 @@ mod tests {
         assert_eq!(deadlines.pop_one_due(now).unwrap().token, 2);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn even_session_deadline_budget_still_flips_next_turn_preference() {
+    #[test]
+    fn connection_deadline_stays_on_owner_queue_without_two_action_leaves() {
         let (engine, driver) = test_engine_pair(CompletionMode::Polling);
-        let mut progress = SessionProgress::new(Arc::clone(&engine.shared.session), None, 1, 2);
+        let mut progress =
+            SessionReactorSources::new(Arc::clone(&engine.shared.session), None, 1, 1);
+        progress.ready_deadlines.push_back(SessionDeadline {
+            kind: DeadlineKind::ConnectionDrain,
+            token: 1,
+        });
+        let mut actions = crate::v2::engine::reactor::ReactorActions::default();
+        for _ in 0..crate::v2::engine::reactor::REACTOR_ACTION_BUDGET - 1 {
+            actions.push_operation(|| {});
+        }
+
+        assert_eq!(
+            progress
+                .service_due_deadlines_into(Instant::now(), 1, &mut actions)
+                .unwrap(),
+            0
+        );
+        assert_eq!(progress.ready_deadlines.len(), 1);
+        assert_eq!(progress.ready_deadlines.front().unwrap().token, 1);
+        drop(driver);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn split_session_deadline_sources_preserve_the_aggregate_budget() {
+        let (engine, driver) = test_engine_pair(CompletionMode::Polling);
+        let mut progress =
+            SessionReactorSources::new(Arc::clone(&engine.shared.session), None, 1, 2);
         engine.shared.session.schedule_deadline(
             DeadlineKind::ConnectionDrain,
             1,
             std::time::Duration::ZERO,
         );
-        let waker = Waker::noop();
-        let mut cx = TaskContext::from_waker(waker);
-
-        let report = progress.turn(CompletionMode::Polling, &mut cx).unwrap();
-
-        assert_eq!(report.units_consumed, 2);
-        assert!(!progress.reclamation_turn_starts_with_request());
+        let now = Instant::now();
+        let requests = progress.service_deadline_requests(1).unwrap();
+        let deadlines = progress.service_due_deadlines(now, 1).unwrap();
+        assert_eq!(requests + deadlines, 2);
         drop(driver);
     }
 
     #[test]
     fn sustained_session_sources_alternate_and_transfer_unused_budget() {
         let (engine, driver) = test_engine_pair(CompletionMode::Polling);
-        let mut progress = SessionProgress::new(Arc::clone(&engine.shared.session), None, 1, 4);
+        let mut progress =
+            SessionReactorSources::new(Arc::clone(&engine.shared.session), None, 1, 4);
         let now = Instant::now();
         for token in 10..=11 {
             progress
@@ -622,12 +792,12 @@ mod tests {
             );
         }
 
-        let (consumed, immediate) = progress.service_deadlines().unwrap();
+        let requests = progress.service_deadline_requests(2).unwrap();
+        let deadlines = progress.service_due_deadlines(now, 2).unwrap();
+        assert_eq!(requests + deadlines, 4);
 
-        assert_eq!(consumed, 4);
-        assert!(immediate);
-
-        let mut due_only = SessionProgress::new(Arc::clone(&engine.shared.session), None, 1, 3);
+        let mut due_only =
+            SessionReactorSources::new(Arc::clone(&engine.shared.session), None, 1, 3);
         for token in 20..=22 {
             due_only
                 .deadlines
@@ -640,19 +810,14 @@ mod tests {
                 )
                 .unwrap();
         }
-        let (consumed, immediate) = due_only.service_deadlines().unwrap();
-        assert_eq!(consumed, 3);
-        assert!(!immediate);
+        assert_eq!(due_only.service_due_deadlines(now, 3).unwrap(), 3);
         drop(driver);
     }
 
     #[test]
     fn deadline_sequence_exhaustion_maps_to_session_configuration_error() {
         let (engine, mut driver) = test_engine_pair(CompletionMode::Polling);
-        driver
-            .session_progress
-            .deadlines
-            .exhaust_sequence_for_test();
+        driver.reactor.session.deadlines.exhaust_sequence_for_test();
         engine.shared.session.schedule_deadline(
             DeadlineKind::ConnectionDrain,
             7,
@@ -662,7 +827,8 @@ mod tests {
         let mut cx = TaskContext::from_waker(waker);
 
         let error = match driver
-            .session_progress
+            .reactor
+            .session
             .turn(CompletionMode::Polling, &mut cx)
         {
             Ok(_) => panic!("exhausted session deadline sequence must fail"),
@@ -688,7 +854,8 @@ mod tests {
         let mut cx = TaskContext::from_waker(waker);
 
         let first = driver
-            .session_progress
+            .reactor
+            .session
             .turn(CompletionMode::Polling, &mut cx)
             .unwrap();
         let closed = connections
@@ -698,7 +865,7 @@ mod tests {
         assert!(closed > 0 && closed < connections.len());
         assert!(first.units_consumed <= 48);
         assert!(first.immediate_work);
-        assert!(!driver.session_progress.can_finish());
+        assert!(!driver.reactor.session.can_finish());
 
         drop(connections);
         drop(driver);
@@ -714,17 +881,18 @@ mod tests {
         let mut ready = false;
         for _ in 0..4 {
             let report = driver
-                .session_progress
+                .reactor
+                .session
                 .turn(CompletionMode::Polling, &mut cx)
                 .unwrap();
             assert!(report.units_consumed <= 48);
-            if driver.session_progress.can_finish() {
+            if driver.reactor.session.can_finish() {
                 ready = true;
                 break;
             }
         }
         assert!(ready);
-        assert!(driver.session_progress.can_finish());
+        assert!(driver.reactor.session.can_finish());
 
         engine.shared.finish(MemoizedTerminalResult::success());
         drop(driver);
@@ -745,7 +913,8 @@ mod tests {
         let mut cx = TaskContext::from_waker(waker);
 
         let first = driver
-            .session_progress
+            .reactor
+            .session
             .turn(CompletionMode::Polling, &mut cx)
             .unwrap();
         let terminalized = connections
@@ -756,17 +925,18 @@ mod tests {
         assert!(first.units_consumed <= 32);
         assert!(first.immediate_work);
 
-        let mut ready = driver.session_progress.can_finish();
+        let mut ready = driver.reactor.session.can_finish();
         for _ in 0..8 {
             if ready {
                 break;
             }
             let report = driver
-                .session_progress
+                .reactor
+                .session
                 .turn(CompletionMode::Polling, &mut cx)
                 .unwrap();
             assert!(report.units_consumed <= 32);
-            ready = driver.session_progress.can_finish();
+            ready = driver.reactor.session.can_finish();
         }
         assert!(ready);
         assert!(
@@ -799,11 +969,12 @@ mod tests {
         let mut cx = TaskContext::from_waker(waker);
 
         let graceful = driver
-            .session_progress
+            .reactor
+            .session
             .turn(CompletionMode::Polling, &mut cx)
             .unwrap();
         assert!(graceful.immediate_work);
-        assert!(driver.session_progress.shutdown_connection_slot > 0);
+        assert!(driver.reactor.session.shutdown_connection_slot > 0);
 
         engine
             .shared
@@ -811,16 +982,17 @@ mod tests {
         let mut ready = false;
         for _ in 0..12 {
             driver
-                .session_progress
+                .reactor
+                .session
                 .turn(CompletionMode::Polling, &mut cx)
                 .unwrap();
-            if driver.session_progress.can_finish() {
+            if driver.reactor.session.can_finish() {
                 ready = true;
                 break;
             }
         }
         assert!(ready);
-        assert!(driver.session_progress.failure_scan_started);
+        assert!(driver.reactor.session.failure_scan_started);
         assert!(
             connections.iter().all(|connection| connection
                 .state

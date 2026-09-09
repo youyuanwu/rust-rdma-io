@@ -49,6 +49,28 @@ impl QpReclaimCapability {
 }
 
 impl IoCore {
+    pub(in crate::v2::engine) fn qp_destroy_publication_prefix(
+        &self,
+        tokens: &[OperationToken],
+        budget: usize,
+    ) -> usize {
+        let mut leaves = 0usize;
+        let mut count = 0usize;
+        for token in tokens {
+            let next = match self.operations.lookup(*token) {
+                Lookup::Occupied(operation) => operation.qp_destroy_publication_leaves(),
+                _ => 0,
+            };
+            if leaves.saturating_add(next) > budget {
+                break;
+            }
+            leaves += next;
+            count += 1;
+        }
+        count
+    }
+
+    #[cfg(test)]
     pub(in crate::v2::engine) fn fail_observers_for_close(
         &self,
         tokens: &[OperationToken],
@@ -63,6 +85,41 @@ impl IoCore {
             }
         }
         DetachedIoCoreEffects::new(after_unlock)
+    }
+
+    pub(in crate::v2::engine) fn scan_connection_observers_for_close(
+        &self,
+        connection: ConnectionToken,
+        start: usize,
+        error: Error,
+        scan_budget: usize,
+    ) -> (DetachedIoCoreEffects, usize, bool) {
+        let (operations, next, complete, _) = self.operations.scan_occupied(start, scan_budget);
+        let mut after_unlock = AfterEngineUnlock::default();
+        for operation in operations {
+            if operation.connection_token() == connection
+                && operation.fail_observer_for_close(error.clone())
+            {
+                after_unlock.push_operation_wake(operation);
+            }
+        }
+        (DetachedIoCoreEffects::new(after_unlock), next, complete)
+    }
+
+    pub(in crate::v2::engine) fn scan_connection_quarantine(
+        &self,
+        connection: ConnectionToken,
+        start: usize,
+        scan_budget: usize,
+    ) -> (IoCoreEffects, usize, bool) {
+        let (operations, next, complete, _) = self.operations.scan_occupied(start, scan_budget);
+        let mut effects = IoCoreEffects::default();
+        for operation in operations {
+            if operation.connection_token() == connection {
+                effects.extend(self.quarantine_operation(operation.token()));
+            }
+        }
+        (effects, next, complete)
     }
 
     pub(in crate::v2::engine) fn terminalize_operations(
@@ -199,10 +256,13 @@ impl IoCore {
             self.pending_reclamations.fetch_sub(1, Ordering::AcqRel);
         }
         let mut effects = IoCoreEffects::default();
+        effects.push_close_wake(connection.drain_notify());
         if let Some(event) = finished.event {
             effects.push_event(event);
         }
-        effects.push_operation_wake(Arc::clone(&operation));
+        if finished.should_wake {
+            effects.push_operation_wake(Arc::clone(&operation));
+        }
         if finished.was_quarantined {
             self.cq_credits.release_retained();
             self.quarantined_operations.fetch_sub(1, Ordering::AcqRel);

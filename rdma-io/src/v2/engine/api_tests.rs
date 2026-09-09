@@ -168,6 +168,8 @@ async fn shutdown_accounts_for_ingress_and_backend_connect_listen_commands() {
 
     let mut shutdown = Box::pin(engine.shutdown());
     assert!(shutdown.as_mut().poll(&mut cx).is_pending());
+    engine.shared.commands.service_turn(&engine.shared);
+    engine.shared.commands.service_turn(&engine.shared);
     assert_eq!(engine.shared.commands.pending_connects(), 0);
     assert_eq!(engine.shared.commands.pending_listens(), 0);
     // The unit fixture intentionally has no provider resources. Terminalize

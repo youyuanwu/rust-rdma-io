@@ -44,11 +44,11 @@ use crate::v2::qp::QpBuilder;
 
 #[cfg(test)]
 use event::CmDispatchRoute;
-use event::{CmEventReject, CmEventSnapshot, EventDisposition, is_failure_event};
+use event::{CmEventReject, CmEventSnapshot, EventDisposition, PendingCmEvent, is_failure_event};
 #[cfg(test)]
 use outbound::ConnectWaiter;
 pub(in crate::v2::engine) use outbound::{OutboundRequest, connect, connect_with_setup};
-pub(in crate::v2::engine) use shutdown::CmShutdownCursor;
+pub(in crate::v2::engine) use shutdown::{CmShutdownClass, CmShutdownCursor, CmShutdownSnapshot};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct CmRouteToken {
@@ -90,6 +90,47 @@ enum ContextRoute {
     Listener { token: u64, raw_id: usize },
 }
 
+#[derive(Clone, Copy)]
+pub(in crate::v2::engine) struct CmSoftwareSnapshot {
+    remaining: [usize; 5],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::v2::engine) enum CmSoftwareClass {
+    Cancellation,
+    Retirement,
+    OutboundStart,
+    ListenStart,
+    ListenerWork,
+}
+
+impl CmSoftwareClass {
+    #[cfg(test)]
+    pub(in crate::v2::engine) const ALL: [Self; 5] = [
+        Self::Cancellation,
+        Self::Retirement,
+        Self::OutboundStart,
+        Self::ListenStart,
+        Self::ListenerWork,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Cancellation => 0,
+            Self::Retirement => 1,
+            Self::OutboundStart => 2,
+            Self::ListenStart => 3,
+            Self::ListenerWork => 4,
+        }
+    }
+}
+
+impl CmSoftwareSnapshot {
+    pub(in crate::v2::engine) fn count(self, class: CmSoftwareClass) -> usize {
+        self.remaining[class.index()]
+    }
+}
+
 pub(in crate::v2::engine) struct CmState {
     routes: PagedRegistry<CmRouteToken, Arc<OutboundRoute>>,
     inbound_routes: PagedRegistry<CmRouteToken, Arc<InboundRoute>>,
@@ -103,8 +144,8 @@ pub(in crate::v2::engine) struct CmState {
     next_listener_token: AtomicU64,
     retirements: Mutex<VecDeque<ConnectionToken>>,
     cm_destructions: Mutex<VecDeque<PendingCmDestruction>>,
+    pending_event: Mutex<Option<PendingCmEvent>>,
     setup_rollback_quarantines: Mutex<Vec<RetainedSetupRollback>>,
-    software_next_class: AtomicUsize,
     outbound_setup_active: AtomicBool,
     shutting_down: AtomicBool,
 }
@@ -124,8 +165,8 @@ impl CmState {
             next_listener_token: AtomicU64::new(1),
             retirements: Mutex::new(VecDeque::new()),
             cm_destructions: Mutex::new(VecDeque::new()),
+            pending_event: Mutex::new(None),
             setup_rollback_quarantines: Mutex::new(Vec::new()),
-            software_next_class: AtomicUsize::new(0),
             outbound_setup_active: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
         })
@@ -256,111 +297,170 @@ impl CmState {
             || cm_destructions
     }
 
+    pub(in crate::v2::engine) fn has_non_destruction_software_work(&self) -> bool {
+        self.non_destruction_software_work_count() != 0
+    }
+
+    pub(in crate::v2::engine) fn non_destruction_software_work_count(&self) -> usize {
+        lock_unpoison(&self.pending).len()
+            + lock_unpoison(&self.pending_listens).len()
+            + lock_unpoison(&self.cancellations).len()
+            + lock_unpoison(&self.listener_work).len()
+            + lock_unpoison(&self.retirements).len()
+    }
+
+    pub(in crate::v2::engine) fn has_destruction_work(&self) -> bool {
+        self.destruction_work_count() != 0
+    }
+
+    pub(in crate::v2::engine) fn destruction_work_count(&self) -> usize {
+        lock_unpoison(&self.cm_destructions).len()
+    }
+
+    fn take_pending_event(&self) -> Option<PendingCmEvent> {
+        lock_unpoison(&self.pending_event).take()
+    }
+
+    pub(in crate::v2::engine) fn has_pending_event(&self) -> bool {
+        lock_unpoison(&self.pending_event).is_some()
+    }
+
+    pub(in crate::v2::engine) fn defer_one_event(
+        &self,
+        resources: &EngineResources,
+    ) -> Result<bool> {
+        let mut pending = lock_unpoison(&self.pending_event);
+        if pending.is_some() {
+            return Ok(true);
+        }
+        let Some(event) = event::acquire_event(self, resources)? else {
+            return Ok(false);
+        };
+        *pending = Some(event);
+        Ok(true)
+    }
+
+    pub(in crate::v2::engine) fn service_software_class_into(
+        &self,
+        shared: &SessionManager,
+        resources: Option<&EngineResources>,
+        class: CmSoftwareClass,
+        budget: usize,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) -> Result<usize> {
+        let mut processed = 0;
+        while processed < budget && actions.remaining() >= 8 {
+            match class {
+                CmSoftwareClass::Cancellation => {
+                    let request = { lock_unpoison(&self.cancellations).pop_front() };
+                    if let Some(request) = request {
+                        self.process_cancellation(shared, request, actions)?;
+                        processed += 1;
+                    } else {
+                        break;
+                    }
+                }
+                CmSoftwareClass::Retirement => {
+                    let token = { lock_unpoison(&self.retirements).pop_front() };
+                    if let Some(token) = token {
+                        shared.retire_registered_connection_into(token, actions)?;
+                        processed += 1;
+                    } else {
+                        break;
+                    }
+                }
+                CmSoftwareClass::OutboundStart => {
+                    let Some(resources) = resources else {
+                        return Err(Error::InvalidConfig(
+                            "CM pending work requires live engine resources".into(),
+                        ));
+                    };
+                    let request = { lock_unpoison(&self.pending).pop_front() };
+                    if let Some(request) = request {
+                        if self.outbound_setup_active.swap(true, Ordering::AcqRel) {
+                            lock_unpoison(&self.pending).push_front(request);
+                            break;
+                        }
+                        if !self.start_outbound(resources, request, actions)? {
+                            self.outbound_setup_active.store(false, Ordering::Release);
+                        }
+                        processed += 1;
+                    } else {
+                        break;
+                    }
+                }
+                CmSoftwareClass::ListenStart => {
+                    let resources = resources.ok_or_else(|| {
+                        Error::InvalidConfig(
+                            "listener creation requires live engine resources".into(),
+                        )
+                    })?;
+                    let request = { lock_unpoison(&self.pending_listens).pop_front() };
+                    if let Some(request) = request {
+                        self.start_listener(shared, resources, request, actions)?;
+                        processed += 1;
+                    } else {
+                        break;
+                    }
+                }
+                CmSoftwareClass::ListenerWork => {
+                    let resources = resources.ok_or_else(|| {
+                        Error::InvalidConfig(
+                            "listener progress requires live engine resources".into(),
+                        )
+                    })?;
+                    let listener = { lock_unpoison(&self.listener_work).pop_front() };
+                    if let Some(listener) = listener {
+                        listener.begin_work();
+                        self.service_listener(shared, resources, &listener, actions)?;
+                        if listener.has_work() {
+                            self.enqueue_listener_work(&listener);
+                        }
+                        processed += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(processed)
+    }
+
+    pub(in crate::v2::engine) fn software_snapshot(&self) -> CmSoftwareSnapshot {
+        CmSoftwareSnapshot {
+            remaining: [
+                lock_unpoison(&self.cancellations).len(),
+                lock_unpoison(&self.retirements).len(),
+                lock_unpoison(&self.pending).len(),
+                lock_unpoison(&self.pending_listens).len(),
+                lock_unpoison(&self.listener_work).len(),
+            ],
+        }
+    }
+
+    #[cfg(test)]
     pub(in crate::v2::engine) fn service_software(
         &self,
         shared: &SessionManager,
         resources: Option<&EngineResources>,
         budget: usize,
     ) -> Result<usize> {
-        // Snapshot each class depth at pass entry. Work requeued while it is
-        // transitioning is therefore deferred to a later driver poll instead
-        // of consuming this pass's bounded budget repeatedly.
-        let cancellations = lock_unpoison(&self.cancellations).len();
-        let retirements = lock_unpoison(&self.retirements).len();
-        let pending = lock_unpoison(&self.pending).len();
-        let pending_listens = lock_unpoison(&self.pending_listens).len();
-        let listener_work = lock_unpoison(&self.listener_work).len();
-        let mut remaining = [
-            cancellations,
-            retirements,
-            pending,
-            pending_listens,
-            listener_work,
-        ];
-        let mut next_class = self.software_next_class.load(Ordering::Acquire) % remaining.len();
+        let mut actions = crate::v2::engine::reactor::ReactorActions::default();
+        let snapshot = self.software_snapshot();
         let mut processed = 0;
-        while processed < budget && remaining.iter().any(|count| *count != 0) {
-            let mut selected = None;
-            for offset in 0..remaining.len() {
-                let class = (next_class + offset) % remaining.len();
-                if remaining[class] != 0 {
-                    remaining[class] -= 1;
-                    next_class = (class + 1) % remaining.len();
-                    selected = Some(class);
-                    break;
-                }
-            }
-            let Some(class) = selected else {
+        for class in CmSoftwareClass::ALL {
+            if processed == budget {
                 break;
-            };
-            match class {
-                0 => {
-                    let request = { lock_unpoison(&self.cancellations).pop_front() };
-                    if let Some(request) = request {
-                        self.process_cancellation(shared, request)?;
-                        processed += 1;
-                    }
-                }
-                1 => {
-                    let token = { lock_unpoison(&self.retirements).pop_front() };
-                    if let Some(token) = token {
-                        shared.retire_registered_connection(token)?;
-                        processed += 1;
-                    }
-                }
-                2 => {
-                    let request = { lock_unpoison(&self.pending).pop_front() };
-                    if let Some(request) = request {
-                        if self.outbound_setup_active.swap(true, Ordering::AcqRel) {
-                            lock_unpoison(&self.pending).push_front(request);
-                            remaining[2] = 0;
-                            continue;
-                        }
-                        let Some(resources) = resources else {
-                            self.outbound_setup_active.store(false, Ordering::Release);
-                            return Err(Error::InvalidConfig(
-                                "CM pending work requires live engine resources".into(),
-                            ));
-                        };
-                        if !self.start_outbound(resources, request)? {
-                            self.outbound_setup_active.store(false, Ordering::Release);
-                        }
-                        processed += 1;
-                    }
-                }
-                3 => {
-                    let request = { lock_unpoison(&self.pending_listens).pop_front() };
-                    if let Some(request) = request {
-                        let resources = resources.ok_or_else(|| {
-                            Error::InvalidConfig(
-                                "listener creation requires live engine resources".into(),
-                            )
-                        })?;
-                        self.start_listener(shared, resources, request)?;
-                        processed += 1;
-                    }
-                }
-                4 => {
-                    let listener = { lock_unpoison(&self.listener_work).pop_front() };
-                    if let Some(listener) = listener {
-                        listener.begin_work();
-                        let resources = resources.ok_or_else(|| {
-                            Error::InvalidConfig(
-                                "listener progress requires live engine resources".into(),
-                            )
-                        })?;
-                        self.service_listener(shared, resources, &listener)?;
-                        if listener.has_work() {
-                            self.enqueue_listener_work(&listener);
-                        }
-                        processed += 1;
-                    }
-                }
-                _ => unreachable!("software work has five classes"),
             }
+            processed += self.service_software_class_into(
+                shared,
+                resources,
+                class,
+                snapshot.count(class).min(budget - processed),
+                &mut actions,
+            )?;
         }
-        self.software_next_class
-            .store(next_class, Ordering::Release);
+        actions.publish();
         Ok(processed)
     }
 
@@ -368,8 +468,9 @@ impl CmState {
         &self,
         shared: &SessionManager,
         resources: &EngineResources,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Result<bool> {
-        event::try_process_event(self, shared, resources)
+        event::try_process_event(self, shared, resources, actions)
     }
 
     #[cfg(test)]
@@ -385,15 +486,35 @@ impl CmState {
         shutdown::start(self);
     }
 
-    pub(in crate::v2::engine) fn service_bounded_shutdown(
+    pub(in crate::v2::engine) fn bounded_shutdown_snapshot(
+        &self,
+        terminalize_listeners: bool,
+        cursor: &CmShutdownCursor,
+        budget: usize,
+    ) -> CmShutdownSnapshot {
+        shutdown::snapshot(self, terminalize_listeners, cursor, budget)
+    }
+
+    pub(in crate::v2::engine) fn service_bounded_shutdown_class(
         &self,
         shared: &SessionManager,
         outcome: &MemoizedTerminalResult,
         terminalize_listeners: bool,
         cursor: &mut CmShutdownCursor,
+        class: CmShutdownClass,
         budget: usize,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> usize {
-        shutdown::service(self, shared, outcome, terminalize_listeners, cursor, budget)
+        shutdown::service_class(
+            self,
+            shared,
+            outcome,
+            terminalize_listeners,
+            cursor,
+            class,
+            budget,
+            actions,
+        )
     }
 
     pub(in crate::v2::engine) fn bounded_shutdown_complete(
@@ -469,17 +590,40 @@ impl CmState {
         }
     }
 
+    pub(in crate::v2::engine) fn service_cm_destructions_into(
+        &self,
+        shared: &SessionManager,
+        budget: usize,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+        defer_one_event: impl FnMut() -> Result<bool>,
+    ) -> Result<usize> {
+        retirement::service_cm_destructions(self, shared, budget, actions, defer_one_event)
+    }
+
+    #[cfg(test)]
     pub(in crate::v2::engine) fn service_cm_destructions(
         &self,
         shared: &SessionManager,
         budget: usize,
-        try_process_event: impl FnMut() -> Result<bool>,
+        mut try_process_event: impl FnMut() -> Result<bool>,
     ) -> Result<usize> {
-        retirement::service_cm_destructions(self, shared, budget, try_process_event)
+        let mut actions = crate::v2::engine::reactor::ReactorActions::default();
+        let result =
+            self.service_cm_destructions_into(shared, budget, &mut actions, || try_process_event());
+        actions.publish();
+        result
     }
 
     pub(in crate::v2::engine) fn terminalize(&self, outcome: &MemoizedTerminalResult) {
         shutdown::terminalize(self, outcome);
+    }
+
+    pub(in crate::v2::engine) fn terminalize_into(
+        &self,
+        outcome: &MemoizedTerminalResult,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) {
+        shutdown::terminalize_into(self, outcome, actions);
     }
 
     fn start_listener(
@@ -487,8 +631,9 @@ impl CmState {
         shared: &SessionManager,
         resources: &EngineResources,
         request: Arc<ListenRequest>,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Result<()> {
-        inbound::start_listener(self, shared, resources, request)
+        inbound::start_listener(self, shared, resources, request, actions)
     }
 
     fn service_listener(
@@ -496,8 +641,9 @@ impl CmState {
         shared: &SessionManager,
         resources: &EngineResources,
         listener: &Arc<ListenerState>,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Result<()> {
-        inbound::service_listener(self, shared, resources, listener)
+        inbound::service_listener(self, shared, resources, listener, actions)
     }
 
     fn handle_connect_request(
@@ -532,16 +678,18 @@ impl CmState {
         &self,
         resources: &EngineResources,
         request: Arc<OutboundRequest>,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Result<bool> {
-        outbound::start(self, resources, request)
+        outbound::start(self, resources, request, actions)
     }
 
     fn process_cancellation(
         &self,
         shared: &SessionManager,
         request: Arc<OutboundRequest>,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Result<()> {
-        outbound::process_cancellation(self, shared, request)
+        outbound::process_cancellation(self, shared, request, actions)
     }
 
     fn release_failed_install(
@@ -557,8 +705,9 @@ impl CmState {
         shared: &SessionManager,
         resources: FailedConnectionInstallResources,
         destroy_error: &Error,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Option<EstablishedConnectionRoute> {
-        retirement::retain_failed_install(self, shared, resources, destroy_error)
+        retirement::retain_failed_install(self, shared, resources, destroy_error, actions)
     }
 
     fn record_setup_rollback_quarantine(destroy_error: &Error) {
@@ -587,8 +736,9 @@ impl CmState {
         resources: &EngineResources,
         route: &Arc<OutboundRoute>,
         snapshot: CmEventSnapshot,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Result<EventDisposition> {
-        outbound::handle_event(self, shared, resources, route, snapshot)
+        outbound::handle_event(self, shared, resources, route, snapshot, actions)
     }
 
     fn handle_inbound_event(
@@ -596,8 +746,9 @@ impl CmState {
         shared: &SessionManager,
         route: &Arc<InboundRoute>,
         snapshot: CmEventSnapshot,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Result<EventDisposition> {
-        inbound::handle_event(self, shared, route, snapshot)
+        inbound::handle_event(self, shared, route, snapshot, actions)
     }
 
     #[cfg(test)]
@@ -606,7 +757,10 @@ impl CmState {
         shared: &SessionManager,
         route: &Arc<InboundRoute>,
     ) -> Result<EventDisposition> {
-        inbound::handle_disconnected(self, shared, route)
+        let mut actions = crate::v2::engine::reactor::ReactorActions::default();
+        let result = inbound::handle_disconnected(self, shared, route, &mut actions);
+        actions.publish();
+        result
     }
 
     fn retire_route(&self, route: &Arc<OutboundRoute>, completed: bool) {
@@ -665,6 +819,7 @@ impl CmState {
         &self,
         encoded: u64,
         connection: &Arc<ConnectionState>,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Result<RouteRetirement> {
         let token = CmRouteToken::decode(encoded);
         let route = match self.inbound_routes.lookup_cloned(token) {
@@ -680,7 +835,7 @@ impl CmState {
             route.take_state_if(|route_state| route_state.references_connection(connection.token));
         match route_state {
             Some(InboundState::EstablishedAwaitingDelivery { request, .. }) => {
-                let delivered = request.fail_undelivered(Error::DriverShutdown);
+                let delivered = request.fail_undelivered_into(Error::DriverShutdown, actions);
                 if delivered
                     && let Some(listener) = route.listener.upgrade()
                     && listener.finish_selected_route(encoded)
@@ -789,6 +944,14 @@ impl SessionManager {
         self.cm.terminalize(outcome);
     }
 
+    pub(in crate::v2::engine) fn terminalize_cm_into(
+        &self,
+        outcome: &MemoizedTerminalResult,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) {
+        self.cm.terminalize_into(outcome, actions);
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     pub(in crate::v2::engine) fn pending_cm_route_count(&self) -> usize {
         self.cm.pending_route_count()
@@ -802,35 +965,49 @@ impl SessionManager {
         self.cm.has_software_work()
     }
 
-    pub(in crate::v2::engine) fn service_cm_software(
+    pub(in crate::v2::engine) fn service_cm_software_class(
         &self,
         resources: Option<&EngineResources>,
+        class: CmSoftwareClass,
         budget: usize,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Result<usize> {
-        self.cm.service_software(self, resources, budget)
+        self.cm
+            .service_software_class_into(self, resources, class, budget, actions)
+    }
+
+    pub(in crate::v2::engine) fn cm_software_snapshot(&self) -> CmSoftwareSnapshot {
+        self.cm.software_snapshot()
     }
 
     pub(in crate::v2::engine) fn try_process_cm_event(
         &self,
         resources: &EngineResources,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Result<bool> {
-        self.cm.try_process_event(self, resources)
+        self.cm.try_process_event(self, resources, actions)
+    }
+
+    pub(in crate::v2::engine) fn has_pending_cm_event(&self) -> bool {
+        self.cm.has_pending_event()
     }
 
     pub(in crate::v2::engine) fn service_deferred_cm_destructions(
         &self,
         budget: usize,
-        try_process_event: impl FnMut() -> Result<bool>,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+        defer_one_event: impl FnMut() -> Result<bool>,
     ) -> Result<usize> {
         self.cm
-            .service_cm_destructions(self, budget, try_process_event)
+            .service_cm_destructions_into(self, budget, actions, defer_one_event)
     }
 
-    pub(in crate::v2::engine) fn retire_registered_connection(
+    pub(in crate::v2::engine) fn retire_registered_connection_into(
         &self,
         token: ConnectionToken,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Result<()> {
-        retirement::retire_registered_connection(self, token)
+        retirement::retire_registered_connection_into(self, token, actions)
     }
 }
 

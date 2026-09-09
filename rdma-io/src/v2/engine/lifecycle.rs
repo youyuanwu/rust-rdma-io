@@ -306,7 +306,12 @@ mod tests {
         assert!(poll_once(Pin::new(&mut driver)).is_pending());
 
         tokio::time::advance(Duration::from_millis(29_999)).await;
-        assert!(poll_once(Pin::new(&mut driver)).is_pending());
+        for _ in 0..4 {
+            assert!(poll_once(Pin::new(&mut driver)).is_pending());
+            if poster.destroys.load(Ordering::Acquire) == 1 {
+                break;
+            }
+        }
         assert!(poll_once(shutdown.as_mut()).is_pending());
         assert_eq!(
             poster.destroys.load(Ordering::Acquire),

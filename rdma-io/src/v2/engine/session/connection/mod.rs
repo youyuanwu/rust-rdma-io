@@ -18,7 +18,10 @@ use super::super::io_core::{
 };
 use super::super::lifecycle::MemoizedTerminalResult;
 use super::super::registry::{ConnectionToken, OperationToken, lock_unpoison, read_unpoison};
-use super::{SessionCloseState, SessionConnection, SessionLifecycleAuthority, SessionManager};
+use super::{
+    QpDestructionProof, SessionCloseState, SessionConnection, SessionLifecycleAuthority,
+    SessionManager,
+};
 use crate::cm::{CmId, ConnParam, EventChannel};
 use crate::v2::error::{Error, Result};
 use crate::v2::mr::{AccessIntent, Mr, RemoteMr};
@@ -303,11 +306,16 @@ pub(in crate::v2::engine) struct ConnectionState {
     // SessionManager::admission -> lifecycle_gate -> posting_gate.
     lifecycle_gate: Mutex<()>,
     close_started: AtomicBool,
+    close_operation_scan_slot: AtomicUsize,
+    close_operation_scan_complete: AtomicBool,
+    quarantine_operation_scan_slot: AtomicUsize,
+    quarantine_operation_scan_complete: AtomicBool,
     close: Arc<SessionCloseState>,
     quarantined: AtomicBool,
     error_transition_started: AtomicBool,
     error_transition_complete: AtomicBool,
     qp_destroyed: AtomicBool,
+    qp_reclamation_proof: Mutex<Option<QpDestructionProof>>,
     frontend_count: AtomicUsize,
     retirement_requested: AtomicBool,
     retirement_started: AtomicBool,
@@ -361,11 +369,16 @@ impl ConnectionState {
             peer_addr,
             lifecycle_gate: Mutex::new(()),
             close_started: AtomicBool::new(false),
+            close_operation_scan_slot: AtomicUsize::new(0),
+            close_operation_scan_complete: AtomicBool::new(false),
+            quarantine_operation_scan_slot: AtomicUsize::new(0),
+            quarantine_operation_scan_complete: AtomicBool::new(false),
             close,
             quarantined: AtomicBool::new(false),
             error_transition_started: AtomicBool::new(false),
             error_transition_complete: AtomicBool::new(false),
             qp_destroyed: AtomicBool::new(false),
+            qp_reclamation_proof: Mutex::new(None),
             frontend_count: AtomicUsize::new(1),
             retirement_requested: AtomicBool::new(false),
             retirement_started: AtomicBool::new(false),
@@ -521,6 +534,16 @@ impl ConnectionState {
         event
     }
 
+    pub(in crate::v2::engine) fn mark_cm_failure_into(
+        &self,
+        error: Error,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) -> Option<PendingIoEvent> {
+        let event = self.record_cm_failure(error);
+        self.wake_close_into(actions);
+        event
+    }
+
     pub(in crate::v2::engine) fn transition_to_error_once(
         &self,
         authority: &SessionLifecycleAuthority,
@@ -608,14 +631,73 @@ impl ConnectionState {
         self.close.notify_waiters();
     }
 
+    pub(in crate::v2::engine) fn close_operation_scan_slot(&self) -> usize {
+        self.close_operation_scan_slot.load(Ordering::Acquire)
+    }
+
+    pub(in crate::v2::engine) fn update_close_operation_scan(&self, next: usize, complete: bool) {
+        self.close_operation_scan_slot
+            .store(next, Ordering::Release);
+        self.close_operation_scan_complete
+            .store(complete, Ordering::Release);
+    }
+
+    pub(in crate::v2::engine) fn close_operation_scan_complete(&self) -> bool {
+        self.close_operation_scan_complete.load(Ordering::Acquire)
+    }
+
+    pub(in crate::v2::engine) fn quarantine_operation_scan_slot(&self) -> usize {
+        self.quarantine_operation_scan_slot.load(Ordering::Acquire)
+    }
+
+    pub(in crate::v2::engine) fn update_quarantine_operation_scan(
+        &self,
+        next: usize,
+        complete: bool,
+    ) {
+        self.quarantine_operation_scan_slot
+            .store(next, Ordering::Release);
+        self.quarantine_operation_scan_complete
+            .store(complete, Ordering::Release);
+    }
+
+    pub(in crate::v2::engine) fn quarantine_operation_scan_complete(&self) -> bool {
+        self.quarantine_operation_scan_complete
+            .load(Ordering::Acquire)
+    }
+
+    pub(in crate::v2::engine) fn is_quarantined(&self) -> bool {
+        self.quarantined.load(Ordering::Acquire)
+    }
+
+    pub(in crate::v2::engine) fn store_qp_reclamation_proof(&self, proof: QpDestructionProof) {
+        let previous = lock_unpoison(&self.qp_reclamation_proof).replace(proof);
+        assert!(
+            previous.is_none(),
+            "connection can retain only its one minted QP destruction proof"
+        );
+    }
+
+    pub(in crate::v2::engine) fn take_qp_reclamation_proof(&self) -> Option<QpDestructionProof> {
+        lock_unpoison(&self.qp_reclamation_proof).take()
+    }
+
+    pub(in crate::v2::engine) fn wake_close_into(
+        &self,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) {
+        self.close.notify_waiters_into(actions);
+    }
+
     pub(in crate::v2::engine) fn begin_quarantine(&self) -> Option<IoQuarantineReport> {
         self.io.begin_connection_quarantine(&self.quarantined)
     }
 
-    pub(in crate::v2::engine) fn publish_quarantine(
+    pub(in crate::v2::engine) fn publish_quarantine_into(
         &self,
         outstanding_operations: usize,
         cq_debt: usize,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Option<PendingIoEvent> {
         let error = Error::ConnectionQuarantined {
             outstanding_operations,
@@ -626,10 +708,11 @@ impl ConnectionState {
             *outcome = Some(MemoizedTerminalResult::from_error(error.clone()));
         }
         drop(outcome);
-        self.close.notify_waiters();
+        self.close.notify_waiters_into(actions);
         self.pending_io_event(IoTerminalEvent::Terminal(error))
     }
 
+    #[cfg(test)]
     pub(in crate::v2::engine) fn publish_destroy_quarantine(
         &self,
         error: &Error,
@@ -657,6 +740,33 @@ impl ConnectionState {
         (newly_published, None)
     }
 
+    pub(in crate::v2::engine) fn publish_destroy_quarantine_into(
+        &self,
+        error: &Error,
+        before_publish: impl FnOnce(),
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) -> (bool, Option<PendingIoEvent>) {
+        self.retirement_quarantined.store(true, Ordering::Release);
+        let mut outcome = lock_unpoison(&self.close.outcome);
+        let newly_published = !outcome
+            .as_ref()
+            .is_some_and(MemoizedTerminalResult::is_connection_quarantined);
+        if newly_published {
+            before_publish();
+            let published = Error::ConnectionDestroyQuarantined {
+                cause: error.to_string(),
+            };
+            *outcome = Some(MemoizedTerminalResult::from_error(published.clone()));
+            drop(outcome);
+            let event = self.pending_io_event(IoTerminalEvent::Terminal(published));
+            self.close.notify_waiters_into(actions);
+            return (true, event);
+        }
+        drop(outcome);
+        self.close.notify_waiters_into(actions);
+        (false, None)
+    }
+
     pub(in crate::v2::engine) fn recover_quarantine(&self) -> bool {
         self.quarantined.swap(false, Ordering::AcqRel)
     }
@@ -665,6 +775,7 @@ impl ConnectionState {
         self.accepted_count() != 0 && !self.quarantined.swap(true, Ordering::AcqRel)
     }
 
+    #[cfg(test)]
     pub(in crate::v2::engine) fn finish_retirement(&self) -> Option<PendingIoEvent> {
         let mut outcome = lock_unpoison(&self.close.outcome);
         if outcome.is_none() {
@@ -676,7 +787,25 @@ impl ConnectionState {
         self.pending_io_event(IoTerminalEvent::Closed(Ok(())))
     }
 
-    pub(in crate::v2::engine) fn fail_retirement(&self, error: Error) -> Option<PendingIoEvent> {
+    pub(in crate::v2::engine) fn finish_retirement_into(
+        &self,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) -> Option<PendingIoEvent> {
+        let mut outcome = lock_unpoison(&self.close.outcome);
+        if outcome.is_none() {
+            *outcome = Some(MemoizedTerminalResult::success());
+        }
+        drop(outcome);
+        self.close.mark_retired();
+        self.close.notify_waiters_into(actions);
+        self.pending_io_event(IoTerminalEvent::Closed(Ok(())))
+    }
+
+    pub(in crate::v2::engine) fn fail_retirement_into(
+        &self,
+        error: Error,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) -> Option<PendingIoEvent> {
         self.stop_posting();
         self.release_admission();
         let mut outcome = lock_unpoison(&self.close.outcome);
@@ -688,7 +817,7 @@ impl ConnectionState {
         }
         drop(outcome);
         self.close.mark_retired();
-        self.close.notify_waiters();
+        self.close.notify_waiters_into(actions);
         self.pending_io_event(IoTerminalEvent::Closed(Err(error)))
     }
 

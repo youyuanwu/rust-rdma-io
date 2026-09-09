@@ -40,16 +40,20 @@ pub(super) enum CmDispatchRoute {
     Listener(Arc<ListenerState>),
 }
 
-pub(super) fn try_process_event(
+pub(super) struct PendingCmEvent {
+    snapshot: CmEventSnapshot,
+    route: std::result::Result<CmDispatchRoute, CmEventReject>,
+}
+
+pub(super) fn acquire_event(
     state: &CmState,
-    shared: &SessionManager,
     resources: &EngineResources,
-) -> Result<bool> {
+) -> Result<Option<PendingCmEvent>> {
     let event = match resources.cm_event_channel.try_get_event() {
         Ok(event) => event,
-        Err(crate::Error::WouldBlock) => return Ok(false),
+        Err(crate::Error::WouldBlock) => return Ok(None),
         Err(crate::Error::Verbs(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
-            return Ok(false);
+            return Ok(None);
         }
         Err(error) => return Err(Error::from_v1(error)),
     };
@@ -62,7 +66,35 @@ pub(super) fn try_process_event(
     };
     let route = lookup_dispatch_route(state, snapshot);
     event.ack_checked().map_err(Error::from_v1)?;
+    Ok(Some(PendingCmEvent { snapshot, route }))
+}
 
+pub(super) fn try_process_event(
+    state: &CmState,
+    shared: &SessionManager,
+    resources: &EngineResources,
+    actions: &mut crate::v2::engine::reactor::ReactorActions,
+) -> Result<bool> {
+    let pending = if let Some(pending) = state.take_pending_event() {
+        pending
+    } else {
+        let Some(pending) = acquire_event(state, resources)? else {
+            return Ok(false);
+        };
+        pending
+    };
+    process_event(state, shared, resources, pending, actions)?;
+    Ok(true)
+}
+
+fn process_event(
+    state: &CmState,
+    shared: &SessionManager,
+    resources: &EngineResources,
+    pending: PendingCmEvent,
+    actions: &mut crate::v2::engine::reactor::ReactorActions,
+) -> Result<()> {
+    let PendingCmEvent { snapshot, route } = pending;
     let route = match route {
         Ok(route) => route,
         Err(reject) => {
@@ -74,14 +106,16 @@ pub(super) fn try_process_event(
                     InboundRejectReason::ListenerClosed,
                 )?;
             }
-            return Ok(true);
+            return Ok(());
         }
     };
     let disposition = match route {
         CmDispatchRoute::Outbound(route) => {
-            state.handle_event(shared, resources, &route, snapshot)?
+            state.handle_event(shared, resources, &route, snapshot, actions)?
         }
-        CmDispatchRoute::Inbound(route) => state.handle_inbound_event(shared, &route, snapshot)?,
+        CmDispatchRoute::Inbound(route) => {
+            state.handle_inbound_event(shared, &route, snapshot, actions)?
+        }
         CmDispatchRoute::Listener(listener) => {
             if snapshot.event_type == CmEventType::ConnectRequest {
                 state.handle_connect_request(shared, resources, &listener, snapshot)?
@@ -94,7 +128,7 @@ pub(super) fn try_process_event(
         EventDisposition::Handled | EventDisposition::IgnoredAfterShutdown => {}
         EventDisposition::Rejected(reject) => record_cm_reject(shared, reject),
     }
-    Ok(true)
+    Ok(())
 }
 
 pub(super) fn lookup_dispatch_route(

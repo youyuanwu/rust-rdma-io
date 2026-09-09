@@ -332,31 +332,38 @@ impl OperationCommand {
         }
     }
 
-    pub(in crate::v2::engine) fn execute(&self, manager: &SessionManager) {
+    pub(in crate::v2::engine) fn execute_into(
+        &self,
+        manager: &SessionManager,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) {
         let Some(input) = lock_unpoison(&self.input).take() else {
             return;
         };
         let Some(shared) = input.shared.upgrade() else {
-            self.completion.install(
+            self.completion.install_into(
                 StartResult::Immediate((Err(Error::DriverShutdown), Some(input.mr))),
                 Weak::new(),
+                actions,
             );
             return;
         };
         let connection = match manager.connections.lookup(input.connection) {
             Lookup::Occupied(connection) => Arc::clone(&connection.io),
             Lookup::Duplicate | Lookup::Stale | Lookup::Unknown | Lookup::Retired => {
-                self.completion.install(
+                self.completion.install_into(
                     StartResult::Immediate((Err(Error::TransportClosed), Some(input.mr))),
                     Arc::downgrade(&shared),
+                    actions,
                 );
                 return;
             }
         };
         if self.completion.is_cancelled() {
-            self.completion.install(
+            self.completion.install_into(
                 StartResult::Immediate((Err(Error::DriverShutdown), Some(input.mr))),
                 Arc::downgrade(&shared),
+                actions,
             );
             return;
         }
@@ -367,8 +374,10 @@ impl OperationCommand {
             input.mr,
             input.remote,
             input.range,
+            actions,
         );
-        self.completion.install(result, Arc::downgrade(&shared));
+        self.completion
+            .install_into(result, Arc::downgrade(&shared), actions);
     }
 
     pub(in crate::v2::engine) fn cancel_before_execution(&self, error: Error) {
@@ -379,6 +388,22 @@ impl OperationCommand {
         self.completion.install(
             StartResult::Immediate((Err(error), Some(input.mr))),
             input.shared,
+        );
+    }
+
+    pub(in crate::v2::engine) fn cancel_before_execution_into(
+        &self,
+        error: Error,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) {
+        let Some(input) = lock_unpoison(&self.input).take() else {
+            self.completion.cancel();
+            return;
+        };
+        self.completion.install_into(
+            StartResult::Immediate((Err(error), Some(input.mr))),
+            input.shared,
+            actions,
         );
     }
 }
@@ -396,7 +421,7 @@ enum OperationCommandResult {
 struct OperationCommandCompletion {
     state: Mutex<OperationCommandResult>,
     cancelled: std::sync::atomic::AtomicBool,
-    waker: AtomicWaker,
+    waker: Arc<AtomicWaker>,
 }
 
 impl OperationCommandCompletion {
@@ -404,7 +429,7 @@ impl OperationCommandCompletion {
         Self {
             state: Mutex::new(OperationCommandResult::Pending),
             cancelled: std::sync::atomic::AtomicBool::new(false),
-            waker: AtomicWaker::new(),
+            waker: Arc::new(AtomicWaker::new()),
         }
     }
 
@@ -417,6 +442,17 @@ impl OperationCommandCompletion {
     }
 
     fn install(&self, result: StartResult, shared: Weak<IoCore>) {
+        let mut actions = crate::v2::engine::reactor::ReactorActions::default();
+        self.install_into(result, shared, &mut actions);
+        actions.publish();
+    }
+
+    fn install_into(
+        &self,
+        result: StartResult,
+        shared: Weak<IoCore>,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) {
         let mut state = lock_unpoison(&self.state);
         *state = match result {
             StartResult::InFlight(operation) => {
@@ -438,7 +474,8 @@ impl OperationCommandCompletion {
         {
             shared.schedule_reclamation(operation.token());
         }
-        self.waker.wake();
+        let waker = Arc::clone(&self.waker);
+        actions.push_operation(move || waker.wake());
     }
 
     fn poll(&self, cx: &mut Context<'_>) -> Poll<(Result<Completion>, Option<Mr>)> {
@@ -522,6 +559,7 @@ fn start_operation(
     mr: Mr,
     remote: Option<RemoteMr>,
     range: Option<(usize, usize)>,
+    actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> StartResult {
     let validated = match ValidatedOperation::new(kind, &mr, remote, range) {
         Ok(validated) => validated,
@@ -583,7 +621,7 @@ fn start_operation(
             shared.publish_cq_recheck();
             if let Some(completion) = early {
                 let after_unlock = shared.finish_early_completion(Arc::clone(&state), completion);
-                publish_after_post_guards(posting, admission, after_unlock);
+                append_after_post_guards(posting, admission, after_unlock, actions);
             }
             StartResult::InFlight(state)
         }
@@ -611,7 +649,7 @@ fn start_operation(
                 if let Some(completion) = early {
                     let after_unlock =
                         shared.finish_early_completion(Arc::clone(&state), completion);
-                    publish_after_post_guards(posting, admission, after_unlock);
+                    append_after_post_guards(posting, admission, after_unlock, actions);
                 }
                 StartResult::InFlight(state)
             }
@@ -623,7 +661,7 @@ fn start_operation(
             shared.publish_cq_recheck();
             if let Some(completion) = early {
                 let after_unlock = shared.finish_early_completion(Arc::clone(&state), completion);
-                publish_after_post_guards(posting, admission, after_unlock);
+                append_after_post_guards(posting, admission, after_unlock, actions);
                 StartResult::InFlight(state)
             } else {
                 state.detach_with_post_error(shared);
@@ -674,6 +712,7 @@ fn post_validated_operation(
 /// or admission lock. The `pub(super)` scope exists only so the parent module's
 /// `cfg(test)` ordering test can call this boundary directly; no production
 /// code outside this module uses it.
+#[cfg(test)]
 pub(super) fn publish_after_post_guards(
     posting: RwLockReadGuard<'_, ()>,
     admission: RwLockReadGuard<'_, ()>,
@@ -682,4 +721,15 @@ pub(super) fn publish_after_post_guards(
     drop(posting);
     drop(admission);
     after_unlock.publish();
+}
+
+fn append_after_post_guards(
+    posting: RwLockReadGuard<'_, ()>,
+    admission: RwLockReadGuard<'_, ()>,
+    after_unlock: AfterEngineUnlock,
+    actions: &mut crate::v2::engine::reactor::ReactorActions,
+) {
+    drop(posting);
+    drop(admission);
+    after_unlock.append_to(actions);
 }

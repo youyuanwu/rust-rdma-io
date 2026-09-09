@@ -10,10 +10,54 @@ use super::SessionManager;
 use super::connection::ConnectionState;
 
 impl SessionManager {
+    fn scan_close_observers_into(
+        &self,
+        connection: &ConnectionState,
+        reserve: usize,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) -> bool {
+        if connection.close_operation_scan_complete() {
+            return true;
+        }
+        let scan_budget = actions.remaining().saturating_sub(reserve).min(32);
+        if scan_budget == 0 {
+            return false;
+        }
+        let (effects, next, complete) = self.io_core.scan_connection_observers_for_close(
+            connection.token,
+            connection.close_operation_scan_slot(),
+            connection.operation_close_error(),
+            scan_budget,
+        );
+        connection.update_close_operation_scan(next, complete);
+        effects.append_to(actions);
+        complete
+    }
+
+    fn scan_quarantine_operations_into(
+        &self,
+        connection: &ConnectionState,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) -> bool {
+        if connection.quarantine_operation_scan_complete() {
+            return true;
+        }
+        let (effects, next, complete) = self.io_core.scan_connection_quarantine(
+            connection.token,
+            connection.quarantine_operation_scan_slot(),
+            32,
+        );
+        connection.update_quarantine_operation_scan(next, complete);
+        self.commit_io_effects_into(effects, actions);
+        complete
+    }
+
+    #[cfg(test)]
     pub(crate) fn begin_connection_close(&self, connection: &Arc<ConnectionState>) {
         if connection.is_retired() {
             return;
         }
+
         let admission = read_unpoison(&self.admission);
         let lifecycle = connection.lock_lifecycle();
         let first = connection.begin_close();
@@ -35,6 +79,7 @@ impl SessionManager {
                     return;
                 }
             }
+
             publish_io_work = true;
 
             let engine_is_terminating = self.shutdown_requested();
@@ -57,6 +102,59 @@ impl SessionManager {
         }
         if first {
             self.schedule_connection_drain(connection.token);
+        }
+        if connection.accepted_count() == 0 {
+            self.record_connection_drained(connection);
+            self.schedule_connection_retirement(connection);
+        }
+    }
+
+    pub(crate) fn begin_connection_close_into(
+        &self,
+        connection: &Arc<ConnectionState>,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) {
+        if connection.is_retired() {
+            return;
+        }
+        let admission = read_unpoison(&self.admission);
+        let lifecycle = connection.lock_lifecycle();
+        let first = connection.begin_close();
+        let mut close_publication_remaining = false;
+        let mut publish_io_work = false;
+        if first {
+            match self.transition_connection_to_error(connection) {
+                Ok(_) => {}
+                Err(error) => {
+                    let event = connection.record_cm_failure(error.clone());
+                    connection.rollback_draining_count();
+                    drop(lifecycle);
+                    drop(admission);
+                    if let Some(event) = event {
+                        actions.push_event(event);
+                    }
+                    connection.wake_close_into(actions);
+                    self.begin_driver_failure(error);
+                    return;
+                }
+            }
+            publish_io_work = true;
+            if !self.shutdown_requested() {
+                close_publication_remaining =
+                    !self.scan_close_observers_into(connection, 4, actions);
+            }
+        }
+        drop(lifecycle);
+        drop(admission);
+        if publish_io_work {
+            self.publish_io_work();
+        }
+        if first {
+            if close_publication_remaining {
+                self.schedule_connection_drain_now(connection.token);
+            } else {
+                self.schedule_connection_drain(connection.token);
+            }
         }
         if connection.accepted_count() == 0 {
             self.record_connection_drained(connection);
@@ -100,10 +198,37 @@ impl SessionManager {
         );
     }
 
-    pub(in crate::v2::engine) fn handle_connection_drain_deadline(&self, token: ConnectionToken) {
+    fn schedule_connection_drain_now(&self, token: ConnectionToken) {
+        self.schedule_deadline(
+            DeadlineKind::ConnectionDrain,
+            token.encode(),
+            std::time::Duration::ZERO,
+        );
+    }
+
+    pub(in crate::v2::engine) fn handle_connection_drain_deadline_into(
+        &self,
+        token: ConnectionToken,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) {
         let Lookup::Occupied(connection) = self.connections.lookup(token) else {
             return;
         };
+        debug_assert!(
+            actions.can_accept(2),
+            "connection drain deadline must reserve its tail publications before dequeue"
+        );
+        if connection.close_started() && !self.shutdown_requested() {
+            let scan_was_complete = connection.close_operation_scan_complete();
+            if !self.scan_close_observers_into(&connection, 2, actions) {
+                self.schedule_connection_drain_now(token);
+                return;
+            }
+            if !scan_was_complete {
+                self.schedule_connection_drain(token);
+                return;
+            }
+        }
         // CQEs already copied out of the hardware CQ must take the ordinary
         // quantum-bounded ready path before a destructive fallback can run.
         if connection.has_copied_completions() {
@@ -115,29 +240,63 @@ impl SessionManager {
             );
             return;
         }
-        let forced_tokens = {
+        if connection.is_quarantined() {
+            if !self.scan_quarantine_operations_into(&connection, actions) {
+                self.schedule_connection_drain_now(token);
+            }
+            return;
+        }
+        let accepted_count = connection.accepted_count();
+        let accepted_tokens = connection
+            .io
+            .accepted_tokens_bounded(actions.remaining().saturating_sub(2).min(32));
+        if accepted_count != 0 && accepted_tokens.is_empty() {
+            self.schedule_connection_drain_now(token);
+            return;
+        }
+        let mut reclamation_proof = connection.take_qp_reclamation_proof();
+        if !accepted_tokens.is_empty() && reclamation_proof.is_none() {
             let _admission = read_unpoison(&self.admission);
             let lifecycle = connection.lock_lifecycle();
-            let tokens = connection.io_drain_report().accepted_tokens;
-            if tokens.is_empty() {
-                None
-            } else {
-                match self.establish_qp_destruction_proof(&connection, &lifecycle) {
-                    Ok(proof) => Some((tokens, proof)),
-                    Err(error) => {
-                        tracing::warn!(
-                            qp_num = connection.qp_num(),
-                            %error,
-                            "failed to establish result-aware QP destruction boundary"
-                        );
-                        None
-                    }
+            reclamation_proof = match self.establish_qp_destruction_proof(&connection, &lifecycle) {
+                Ok(proof) => Some(proof),
+                Err(error) => {
+                    tracing::warn!(
+                        qp_num = connection.qp_num(),
+                        %error,
+                        "failed to establish result-aware QP destruction boundary"
+                    );
+                    None
                 }
+            };
+        }
+        if let Some(proof) = reclamation_proof {
+            let prefix = self.io_core.qp_destroy_publication_prefix(
+                &accepted_tokens,
+                actions.remaining().saturating_sub(2),
+            );
+            if prefix == 0 && !accepted_tokens.is_empty() {
+                connection.store_qp_reclamation_proof(proof);
+                self.schedule_connection_drain_now(token);
+                return;
             }
-        };
-        if let Some((tokens, proof)) = forced_tokens {
-            self.reclaim_after_qp_destroy(proof, &connection, tokens);
-            if self.reject_queued_completions_after_qp_destroy(&connection) {
+            self.reclaim_after_qp_destroy_into(
+                &proof,
+                &connection,
+                accepted_tokens[..prefix].to_vec(),
+                actions,
+            );
+            if connection.accepted_count() != 0 {
+                if prefix < accepted_tokens.len() || accepted_tokens.len() < accepted_count {
+                    connection.store_qp_reclamation_proof(proof);
+                    self.schedule_connection_drain_now(token);
+                    return;
+                }
+                // Every snapshotted token was attempted. Any survivor is an
+                // anomalous accepted-set entry and follows the established
+                // complete-bundle quarantine path below.
+            }
+            if self.reject_queued_completions_after_qp_destroy_into(&connection, actions) {
                 self.io_core.publish_connection(&connection.io);
                 self.schedule_deadline(
                     DeadlineKind::ConnectionDrain,
@@ -149,20 +308,31 @@ impl SessionManager {
         }
         if let Some(report) = connection.begin_quarantine() {
             self.track_connection_quarantine(connection.token);
-            for operation in connection.accepted_tokens() {
-                self.quarantine_operation(operation);
+            if let Some(event) = connection.publish_quarantine_into(
+                report.outstanding_operations,
+                report.cq_debt,
+                actions,
+            ) {
+                actions.push_event(event);
             }
-            if let Some(event) =
-                connection.publish_quarantine(report.outstanding_operations, report.cq_debt)
-            {
-                event.deliver();
+            if !self.scan_quarantine_operations_into(&connection, actions) {
+                self.schedule_connection_drain_now(token);
+                return;
             }
         }
+
         if connection.close_started() && connection.accepted_count() == 0 {
             self.recover_connection_quarantine(&connection);
             self.record_connection_drained(&connection);
             self.schedule_connection_retirement(&connection);
         }
+    }
+
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn handle_connection_drain_deadline(&self, token: ConnectionToken) {
+        let mut actions = crate::v2::engine::reactor::ReactorActions::default();
+        self.handle_connection_drain_deadline_into(token, &mut actions);
+        actions.publish();
     }
 
     pub(in crate::v2::engine) fn recover_connection_quarantine(
@@ -670,7 +840,12 @@ mod tests {
         assert!(poll_once(close.as_mut()).is_pending());
         assert!(poll_once(Pin::new(&mut driver)).is_pending());
         tokio::time::advance(Duration::from_secs(5)).await;
-        assert!(poll_once(Pin::new(&mut driver)).is_pending());
+        for _ in 0..4 {
+            assert!(poll_once(Pin::new(&mut driver)).is_pending());
+            if poster.destroys.load(Ordering::Acquire) == 1 {
+                break;
+            }
+        }
         assert!(matches!(
             poll_once(close.as_mut()),
             Poll::Ready(Err(Error::ConnectionQuarantined {
@@ -727,6 +902,10 @@ mod tests {
             .transition_connection_to_error(&connection.state)
             .unwrap();
 
+        engine
+            .shared
+            .session
+            .handle_connection_drain_deadline(connection.state.token);
         engine
             .shared
             .session

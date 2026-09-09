@@ -23,7 +23,7 @@ use crate::wc::{WcOpcode, WorkCompletion};
 
 use super::super::{Direction, EstablishedIoConnection, IoCore};
 
-pub(super) struct OperationState {
+pub(in crate::v2::engine) struct OperationState {
     token: OperationToken,
     connection: Arc<EstablishedIoConnection>,
     direction: Direction,
@@ -337,6 +337,7 @@ impl OperationState {
             was_reclaiming,
             was_quarantined,
             event,
+            should_wake: true,
         }
     }
 
@@ -346,6 +347,7 @@ impl OperationState {
         inner.reclamation_pending = false;
         let was_quarantined = self.quarantined.swap(false, Ordering::AcqRel);
         let mut mr = inner.mr.take();
+        let should_wake = inner.event_destination.is_none() && !inner.detached;
         let event = inner.event_destination.take().map(|destination| {
             let event_mr = mr.take();
             destination.complete(
@@ -364,7 +366,13 @@ impl OperationState {
             was_reclaiming,
             was_quarantined,
             event,
+            should_wake,
         }
+    }
+
+    pub(super) fn qp_destroy_publication_leaves(&self) -> usize {
+        let inner = lock_unpoison(&self.inner);
+        1 + usize::from(inner.event_destination.is_some() || !inner.detached)
     }
 
     pub(super) fn take_mr(&self) -> Option<Mr> {
@@ -493,7 +501,7 @@ impl OperationState {
         }
     }
 
-    pub(super) fn wake(&self) {
+    pub(in crate::v2::engine) fn wake(&self) {
         self.waker.wake();
     }
 
@@ -519,6 +527,7 @@ pub(super) struct FinishState {
     pub(super) was_reclaiming: bool,
     pub(super) was_quarantined: bool,
     pub(super) event: Option<PendingIoEvent>,
+    pub(super) should_wake: bool,
 }
 
 pub(super) struct QuarantineTransition {

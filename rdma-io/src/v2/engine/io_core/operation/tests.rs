@@ -582,6 +582,33 @@ fn queued_completion_marker_rejects_duplicates_before_dispatch() {
 }
 
 #[test]
+fn qp_destroy_completion_stays_on_connection_when_action_quantum_is_zero() {
+    let shared = synthetic_engine(8);
+    let connection = synthetic_connection_on(&shared, 16);
+    let token = install_accepted(&shared, &connection.state, WcOpcode::Send);
+    let completion = wc(token, 16, IBV_WC_SEND);
+    assert_eq!(
+        shared.session.enqueue_completion(completion),
+        Some(connection.state.token)
+    );
+
+    let (remains_ready, effects) = shared
+        .io_core
+        .reject_queued_completions_after_qp_destroy(&connection.state.io, 0);
+    assert!(remains_ready);
+    assert_eq!(effects.into_after_unlock().len(), 0);
+    assert!(connection.state.io.has_completion_work());
+    assert_eq!(shared.io_core.operations.live(), 1);
+
+    assert_eq!(
+        shared
+            .session
+            .dispatch_connection_completions(connection.state.token, 1),
+        (1, false)
+    );
+}
+
+#[test]
 fn duplicate_connection_installation_releases_new_slot_without_replacing_qp_index() {
     let shared = synthetic_engine(8);
     let first = synthetic_connection_on(&shared, 9);
@@ -778,6 +805,57 @@ fn queued_operation_cancellation_releases_ingress_and_posts_nothing() {
     }
     drop(connection);
     drop(second_connection);
+    drop(driver);
+    drop(engine);
+}
+
+#[test]
+fn queued_operation_stays_authoritative_until_four_action_leaves_are_available() {
+    let Some((engine, driver, shared)) = production_engine(1, 2, 2) else {
+        return;
+    };
+    let poster = Arc::new(ScriptedPoster::new(
+        &shared.session,
+        53,
+        ScriptedPost::Accepted,
+    ));
+    let connection = scripted_connection(&shared.session, Arc::clone(&poster), 1, 1);
+    let mr = connection
+        .register_memory(64, AccessIntent::LocalOnly)
+        .unwrap();
+    let mut operation = connection.send(mr, None);
+    assert!(poll_once(&mut operation).is_pending());
+    assert_eq!(engine.shared.commands.pending_operations(), 1);
+
+    let mut actions = crate::v2::engine::reactor::ReactorActions::default();
+    for _ in 0..crate::v2::engine::reactor::REACTOR_ACTION_BUDGET - 3 {
+        actions.push_operation(|| {});
+    }
+    let report = engine
+        .shared
+        .commands
+        .service_turn_into(&engine.shared, &mut actions);
+    assert!(report.has_more);
+    assert_eq!(engine.shared.commands.pending_operations(), 1);
+    assert_eq!(engine.shared.commands.available_operation_permits(), 1);
+    assert_eq!(poster.calls(), 0);
+
+    engine.shared.commands.service_turn(&engine.shared);
+    assert_eq!(engine.shared.commands.pending_operations(), 0);
+    assert_eq!(poster.calls(), 1);
+    complete(
+        &shared.session,
+        &connection.state,
+        poster.tokens()[0],
+        IBV_WC_SEND,
+    );
+    let Poll::Ready((result, returned)) = poll_once(&mut operation) else {
+        panic!("driver-serviced operation did not complete")
+    };
+    result.unwrap();
+    assert!(returned.is_some());
+    drop(returned);
+    drop(connection);
     drop(driver);
     drop(engine);
 }

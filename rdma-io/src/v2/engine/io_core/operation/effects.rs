@@ -3,28 +3,32 @@
 use std::sync::Arc;
 
 use crate::v2::engine::io::PendingIoEvent;
+use crate::v2::engine::reactor::ReactorActions;
 use crate::v2::engine::registry::{ConnectionToken, OperationToken};
 use crate::v2::engine::session::IoEffectsCommitAuthority;
 
 use super::state::OperationState;
 
-/// Detached work that must run after the producing engine guards are dropped.
+/// Legacy protocol-compatible publication bundle.
 ///
-/// This is the single publication primitive for the operation subtree: every
-/// effect state below delegates to [`AfterEngineUnlock::publish`], so events
-/// are always delivered before operation wakers are woken. Both payload
-/// vectors stay private so no caller can reorder or replay them.
+/// The crate-private message batch path remains direct until Phase 5A and can
+/// legitimately contain more than one reactor poll's 32-leaf budget. Reactor
+/// sources convert only a capacity-reserved prefix-free whole transition into
+/// [`ReactorActions`]; direct protocol batches keep their pre-Phase-5A
+/// behavior without weakening the reactor bound.
 #[derive(Default)]
 pub(super) struct AfterEngineUnlock {
     events: Vec<PendingIoEvent>,
-    operations_to_wake: Vec<Arc<OperationState>>,
+    operations: Vec<Arc<OperationState>>,
+    closes: Vec<Arc<tokio::sync::Notify>>,
 }
 
 impl AfterEngineUnlock {
     pub(super) fn from_events(events: Vec<PendingIoEvent>) -> Self {
         Self {
             events,
-            operations_to_wake: Vec::new(),
+            operations: Vec::new(),
+            closes: Vec::new(),
         }
     }
 
@@ -33,25 +37,48 @@ impl AfterEngineUnlock {
     }
 
     pub(super) fn push_operation_wake(&mut self, operation: Arc<OperationState>) {
-        self.operations_to_wake.push(operation);
+        self.operations.push(operation);
+    }
+
+    pub(super) fn push_close_wake(&mut self, notify: Arc<tokio::sync::Notify>) {
+        self.closes.push(notify);
     }
 
     pub(super) fn extend(&mut self, mut other: Self) {
         self.events.append(&mut other.events);
-        self.operations_to_wake
-            .append(&mut other.operations_to_wake);
+        self.operations.append(&mut other.operations);
+        self.closes.append(&mut other.closes);
     }
 
-    /// Deliver every event, then wake every operation.
-    ///
-    /// Consuming `self` keeps publication single-shot, and the fixed order
-    /// guarantees a woken future observes its completion event.
+    pub(super) fn len(&self) -> usize {
+        self.events.len() + self.operations.len() + self.closes.len()
+    }
+
     pub(super) fn publish(self) {
         for event in self.events {
             event.deliver();
         }
-        for operation in self.operations_to_wake {
+        for operation in self.operations {
             operation.wake();
+        }
+        for notify in self.closes {
+            notify.notify_waiters();
+        }
+    }
+
+    pub(super) fn append_to(self, actions: &mut ReactorActions) {
+        assert!(
+            actions.can_accept(self.len()),
+            "operation publication exceeded reserved reactor capacity"
+        );
+        for event in self.events {
+            actions.push_event(event);
+        }
+        for operation in self.operations {
+            actions.push_operation_wake(operation);
+        }
+        for notify in self.closes {
+            actions.push_close_or_listener(move || notify.notify_waiters());
         }
     }
 }
@@ -103,6 +130,10 @@ impl CommittedIoCoreEffects {
     pub(in crate::v2::engine) fn publish(self) {
         self.after_unlock.publish();
     }
+
+    pub(in crate::v2::engine) fn append_to(self, actions: &mut ReactorActions) {
+        self.after_unlock.append_to(actions);
+    }
 }
 
 impl DetachedIoCoreEffects {
@@ -114,8 +145,13 @@ impl DetachedIoCoreEffects {
         Self { after_unlock }
     }
 
+    #[cfg(test)]
     pub(in crate::v2::engine) fn publish(self) {
         self.after_unlock.publish();
+    }
+
+    pub(in crate::v2::engine) fn append_to(self, actions: &mut ReactorActions) {
+        self.after_unlock.append_to(actions);
     }
 }
 
@@ -132,6 +168,10 @@ impl IoCoreEffects {
 
     pub(super) fn push_operation_wake(&mut self, operation: Arc<OperationState>) {
         self.after_unlock.push_operation_wake(operation);
+    }
+
+    pub(super) fn push_close_wake(&mut self, notify: Arc<tokio::sync::Notify>) {
+        self.after_unlock.push_close_wake(notify);
     }
 
     pub(super) fn push_quarantine(&mut self, effect: OperationQuarantineEffect) {

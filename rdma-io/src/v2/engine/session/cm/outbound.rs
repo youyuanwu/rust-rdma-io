@@ -65,10 +65,11 @@ pub(super) fn start(
     state: &CmState,
     resources: &EngineResources,
     request: Arc<OutboundRequest>,
+    actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<bool> {
     if request.observer.completion.is_cancelled() || state.shutting_down.load(Ordering::Acquire) {
         request.take_reservation();
-        request.complete(Err(Error::DriverShutdown));
+        request.complete_into(Err(Error::DriverShutdown), actions);
         return Ok(false);
     }
     let reservation = request.take_reservation().ok_or_else(|| {
@@ -81,7 +82,7 @@ pub(super) fn start(
         Ok(route) => route,
         Err(error) => {
             drop(reservation);
-            request.complete_failure(error);
+            request.complete_failure_into(error, actions);
             return Ok(false);
         }
     };
@@ -96,7 +97,7 @@ pub(super) fn start(
         Err(error) => {
             state.routes.release(token, false);
             drop(reservation);
-            request.complete_failure(Error::from_v1(error));
+            request.complete_failure_into(Error::from_v1(error), actions);
             return Ok(false);
         }
     };
@@ -104,9 +105,10 @@ pub(super) fn start(
         state.defer_cm_id(cm_id);
         state.routes.release(token, false);
         drop(reservation);
-        request.complete_failure(Error::InvalidConfig(
-            "engine CM ID lost its route context token".into(),
-        ));
+        request.complete_failure_into(
+            Error::InvalidConfig("engine CM ID lost its route context token".into()),
+            actions,
+        );
         return Ok(false);
     };
     let context_route = CmRouteToken::decode(context_token);
@@ -114,9 +116,10 @@ pub(super) fn start(
         state.defer_cm_id(cm_id);
         state.routes.release(token, false);
         drop(reservation);
-        request.complete_failure(Error::InvalidConfig(
-            "engine CM context token did not match its route".into(),
-        ));
+        request.complete_failure_into(
+            Error::InvalidConfig("engine CM context token did not match its route".into()),
+            actions,
+        );
         return Ok(false);
     }
     let context_key = cm_id.context_key();
@@ -132,7 +135,10 @@ pub(super) fn start(
         state.defer_cm_id(cm_id);
         state.routes.release(token, false);
         drop(reservation);
-        request.complete_failure(Error::InvalidConfig("duplicate CM context identity".into()));
+        request.complete_failure_into(
+            Error::InvalidConfig("duplicate CM context identity".into()),
+            actions,
+        );
         return Ok(false);
     }
 
@@ -147,7 +153,7 @@ pub(super) fn start(
             state.defer_cm_id(cm_id);
             state.retire_route(&route, false);
             drop(reservation);
-            request.complete_failure(Error::from_v1(error));
+            request.complete_failure_into(Error::from_v1(error), actions);
             return Ok(false);
         }
     }
@@ -158,6 +164,7 @@ pub(super) fn process_cancellation(
     state: &CmState,
     shared: &SessionManager,
     request: Arc<OutboundRequest>,
+    actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<()> {
     let encoded = request.route_token.load(Ordering::Acquire);
     if encoded == 0 {
@@ -201,10 +208,10 @@ pub(super) fn process_cancellation(
     route.set_state(OutboundState::Closing {
         connection: connection.clone(),
     });
-    shared.begin_connection_close(&connection_state);
+    shared.begin_connection_close_into(&connection_state, actions);
     drop(request.take_result());
     if connection_state.accepted_count() == 0 {
-        shared.retire_registered_connection(connection_state.token)?;
+        shared.retire_registered_connection_into(connection_state.token, actions)?;
     }
     drop(route_request);
     Ok(())
@@ -216,15 +223,20 @@ pub(super) fn handle_event(
     resources: &EngineResources,
     route: &Arc<OutboundRoute>,
     snapshot: CmEventSnapshot,
+    actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<EventDisposition> {
     let disposition = if is_failure_event(snapshot.event_type) || snapshot.status != 0 {
-        handle_failure_event(state, shared, route, snapshot)?
+        handle_failure_event(state, shared, route, snapshot, actions)?
     } else {
         match snapshot.event_type {
-            CmEventType::AddrResolved => handle_addr_resolved(state, shared, resources, route),
-            CmEventType::RouteResolved => handle_route_resolved(state, shared, resources, route),
-            CmEventType::Established => handle_established(state, shared, route),
-            CmEventType::Disconnected => handle_disconnected(state, shared, route),
+            CmEventType::AddrResolved => {
+                handle_addr_resolved(state, shared, resources, route, actions)
+            }
+            CmEventType::RouteResolved => {
+                handle_route_resolved(state, shared, resources, route, actions)
+            }
+            CmEventType::Established => handle_established(state, shared, route, actions),
+            CmEventType::Disconnected => handle_disconnected(state, shared, route, actions),
             CmEventType::TimewaitExit => {
                 if route.is_disconnected() {
                     Ok(EventDisposition::Handled)
@@ -254,6 +266,7 @@ fn handle_addr_resolved(
     shared: &SessionManager,
     resources: &EngineResources,
     route: &Arc<OutboundRoute>,
+    actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<EventDisposition> {
     let Some(OutboundState::AwaitAddr {
         cm_id,
@@ -267,14 +280,14 @@ fn handle_addr_resolved(
         state.defer_cm_id(cm_id);
         drop(reservation);
         state.retire_route(route, true);
-        request.complete(Err(Error::DriverShutdown));
+        request.complete_into(Err(Error::DriverShutdown), actions);
         return Ok(EventDisposition::Handled);
     }
     if let Err(error) = cm_id.require_context(resources.context.raw_context()) {
         state.defer_cm_id(cm_id);
         drop(reservation);
         state.retire_route(route, true);
-        request.complete_failure(Error::from_v1(error));
+        request.complete_failure_into(Error::from_v1(error), actions);
         return Ok(EventDisposition::Handled);
     }
     match cm_id.resolve_route(2_000) {
@@ -287,7 +300,7 @@ fn handle_addr_resolved(
             state.defer_cm_id(cm_id);
             drop(reservation);
             state.retire_route(route, true);
-            request.complete_failure(Error::from_v1(error));
+            request.complete_failure_into(Error::from_v1(error), actions);
         }
     }
     Ok(EventDisposition::Handled)
@@ -298,6 +311,7 @@ fn handle_route_resolved(
     shared: &SessionManager,
     resources: &EngineResources,
     route: &Arc<OutboundRoute>,
+    actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<EventDisposition> {
     let Some(OutboundState::AwaitRoute {
         cm_id,
@@ -311,14 +325,14 @@ fn handle_route_resolved(
         state.defer_cm_id(cm_id);
         drop(reservation);
         state.retire_route(route, true);
-        request.complete(Err(Error::DriverShutdown));
+        request.complete_into(Err(Error::DriverShutdown), actions);
         return Ok(EventDisposition::Handled);
     }
     if let Err(error) = cm_id.require_context(resources.context.raw_context()) {
         state.defer_cm_id(cm_id);
         drop(reservation);
         state.retire_route(route, true);
-        request.complete_failure(Error::from_v1(error));
+        request.complete_failure_into(Error::from_v1(error), actions);
         return Ok(EventDisposition::Handled);
     }
 
@@ -330,7 +344,7 @@ fn handle_route_resolved(
             state.defer_cm_id(cm_id);
             drop(reservation);
             state.retire_route(route, true);
-            request.complete_failure(error);
+            request.complete_failure_into(error, actions);
             return Ok(EventDisposition::Handled);
         }
     };
@@ -357,13 +371,17 @@ fn handle_route_resolved(
                 }
                 Err(destroy_error) => {
                     CmState::record_setup_rollback_quarantine(&destroy_error);
-                    let connection =
-                        state.retain_failed_install(shared, failed_resources, &destroy_error);
+                    let connection = state.retain_failed_install(
+                        shared,
+                        failed_resources,
+                        &destroy_error,
+                        actions,
+                    );
                     route.set_state(OutboundState::Quarantined { connection });
                 }
             }
             drop(verbs);
-            request.complete_failure(error);
+            request.complete_failure_into(error, actions);
             return Ok(EventDisposition::Handled);
         }
     };
@@ -377,6 +395,7 @@ fn handle_route_resolved(
             request,
             connection,
             Error::InvalidConfig("outbound request setup was consumed more than once".into()),
+            actions,
         )?;
         return Ok(EventDisposition::Handled);
     };
@@ -384,7 +403,7 @@ fn handle_route_resolved(
         Ok(param) => param,
         Err(error) => {
             drop(verbs);
-            fail_registered_connection(state, shared, route, request, connection, error)?;
+            fail_registered_connection(state, shared, route, request, connection, error, actions)?;
             return Ok(EventDisposition::Handled);
         }
     };
@@ -402,7 +421,7 @@ fn handle_route_resolved(
     );
     if let Err(error) = establish {
         drop(verbs);
-        fail_registered_connection(state, shared, route, request, connection, error)?;
+        fail_registered_connection(state, shared, route, request, connection, error, actions)?;
         return Ok(EventDisposition::Handled);
     }
     if request.observer.completion.is_cancelled() || shared.shutdown_requested() {
@@ -414,6 +433,7 @@ fn handle_route_resolved(
             request,
             connection,
             Error::DriverShutdown,
+            actions,
         )?;
         return Ok(EventDisposition::Handled);
     }
@@ -432,20 +452,21 @@ fn fail_registered_connection(
     request: Arc<OutboundRequest>,
     connection: RdmaConnection,
     error: Error,
+    actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<()> {
     let connection_state = connection.require_session_state()?;
     route.set_state(OutboundState::Closing {
         connection: EstablishedConnectionRoute::new(&connection_state),
     });
-    shared.begin_connection_close(&connection_state);
+    shared.begin_connection_close_into(&connection_state, actions);
     drop(connection);
     if connection_state.accepted_count() == 0 {
-        shared.retire_registered_connection(connection_state.token)?;
+        shared.retire_registered_connection_into(connection_state.token, actions)?;
     }
     if matches!(&error, Error::DriverShutdown) {
-        request.complete(Err(error));
+        request.complete_into(Err(error), actions);
     } else {
-        request.complete_failure(error);
+        request.complete_failure_into(error, actions);
     }
     Ok(())
 }
@@ -454,6 +475,7 @@ fn handle_established(
     state: &CmState,
     shared: &SessionManager,
     route: &Arc<OutboundRoute>,
+    actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<EventDisposition> {
     let Some(OutboundState::AwaitEstablished {
         request,
@@ -471,6 +493,7 @@ fn handle_established(
             request,
             connection,
             Error::DriverShutdown,
+            actions,
         )?;
         return Ok(EventDisposition::Handled);
     }
@@ -479,7 +502,7 @@ fn handle_established(
         request,
         connection: EstablishedConnectionRoute::new(&connection.require_session_state()?),
     });
-    waiter.complete(Ok(connection));
+    waiter.complete_into(Ok(connection), actions);
     Ok(EventDisposition::Handled)
 }
 
@@ -487,6 +510,7 @@ fn handle_disconnected(
     state: &CmState,
     shared: &SessionManager,
     route: &Arc<OutboundRoute>,
+    actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<EventDisposition> {
     let route_state = route.take_state_if(|route_state| {
         matches!(
@@ -513,7 +537,7 @@ fn handle_disconnected(
         return Ok(EventDisposition::Handled);
     };
     if let Some(event) = connection_state.mark_disconnected() {
-        event.deliver();
+        actions.push_event(event);
     }
     let awaiting_delivery = request
         .as_ref()
@@ -528,9 +552,9 @@ fn handle_disconnected(
             connection: connection.clone(),
         });
     }
-    shared.begin_connection_close(&connection_state);
+    shared.begin_connection_close_into(&connection_state, actions);
     if connection_state.accepted_count() == 0 {
-        shared.retire_registered_connection(connection_state.token)?;
+        shared.retire_registered_connection_into(connection_state.token, actions)?;
     }
     Ok(EventDisposition::Handled)
 }
@@ -540,6 +564,7 @@ fn handle_failure_event(
     shared: &SessionManager,
     route: &Arc<OutboundRoute>,
     snapshot: CmEventSnapshot,
+    actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<EventDisposition> {
     let message = format!(
         "RDMA CM {:?} failed with status {} for id={:#x} listen_id={:#x}",
@@ -574,10 +599,10 @@ fn handle_failure_event(
                     failure = %message,
                     "ignoring outbound CM setup failure after shutdown won the request"
                 );
-                request.complete(Err(Error::DriverShutdown));
+                request.complete_into(Err(Error::DriverShutdown), actions);
                 return Ok(EventDisposition::IgnoredAfterShutdown);
             }
-            request.complete_failure(Error::Verbs(std::io::Error::other(message)));
+            request.complete_failure_into(Error::Verbs(std::io::Error::other(message)), actions);
         }
         OutboundState::AwaitEstablished {
             request,
@@ -590,6 +615,7 @@ fn handle_failure_event(
                 request,
                 connection,
                 Error::Verbs(std::io::Error::other(message)),
+                actions,
             )?;
         }
         OutboundState::EstablishedAwaitingDelivery {
@@ -604,10 +630,11 @@ fn handle_failure_event(
                 state.retire_route(route, true);
                 return Ok(EventDisposition::Handled);
             };
-            if let Some(event) = connection_state
-                .mark_cm_failure(Error::Verbs(std::io::Error::other(message.clone())))
-            {
-                event.deliver();
+            if let Some(event) = connection_state.mark_cm_failure_into(
+                Error::Verbs(std::io::Error::other(message.clone())),
+                actions,
+            ) {
+                actions.push_event(event);
             }
             if request.observer.delivered.load(Ordering::Acquire) {
                 route.set_state(OutboundState::Failed {
@@ -619,9 +646,9 @@ fn handle_failure_event(
                     connection: connection.clone(),
                 });
             }
-            shared.begin_connection_close(&connection_state);
+            shared.begin_connection_close_into(&connection_state, actions);
             if connection_state.accepted_count() == 0 {
-                shared.retire_registered_connection(connection_state.token)?;
+                shared.retire_registered_connection_into(connection_state.token, actions)?;
             }
         }
         OutboundState::Established { connection } | OutboundState::Disconnected { connection } => {
@@ -629,17 +656,18 @@ fn handle_failure_event(
                 state.retire_route(route, true);
                 return Ok(EventDisposition::Handled);
             };
-            if let Some(event) = connection_state
-                .mark_cm_failure(Error::Verbs(std::io::Error::other(message.clone())))
-            {
-                event.deliver();
+            if let Some(event) = connection_state.mark_cm_failure_into(
+                Error::Verbs(std::io::Error::other(message.clone())),
+                actions,
+            ) {
+                actions.push_event(event);
             }
             route.set_state(OutboundState::Failed {
                 connection: connection.clone(),
             });
-            shared.begin_connection_close(&connection_state);
+            shared.begin_connection_close_into(&connection_state, actions);
             if connection_state.accepted_count() == 0 {
-                shared.retire_registered_connection(connection_state.token)?;
+                shared.retire_registered_connection_into(connection_state.token, actions)?;
             }
         }
         OutboundState::FailedAwaitingDelivery {
@@ -717,12 +745,33 @@ impl OutboundRequest {
         lock_unpoison(&self.reservation).take()
     }
 
+    #[cfg(test)]
     pub(super) fn complete(&self, result: Result<RdmaConnection>) {
         self.observer.completion.complete(result);
     }
 
+    pub(super) fn complete_into(
+        &self,
+        result: Result<RdmaConnection>,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) {
+        self.observer
+            .completion
+            .complete_into(result, false, actions);
+    }
+
     pub(in crate::v2::engine) fn complete_failure(&self, error: Error) {
         self.observer.completion.complete(Err(error));
+    }
+
+    pub(in crate::v2::engine) fn complete_failure_into(
+        &self,
+        error: Error,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) {
+        self.observer
+            .completion
+            .complete_into(Err(error), false, actions);
     }
 
     pub(super) fn try_enqueue_cancellation(&self) -> bool {
@@ -731,6 +780,14 @@ impl OutboundRequest {
 
     pub(super) fn cancel(&self, error: Error) {
         self.observer.cancel(error);
+    }
+
+    pub(super) fn cancel_into(
+        &self,
+        error: Error,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) {
+        self.observer.cancel_into(error, actions);
     }
 
     pub(super) fn take_result(&self) -> Option<Result<RdmaConnection>> {
@@ -745,6 +802,10 @@ impl OutboundRequestObserver {
 
     fn cancel(&self, error: Error) {
         drop(self.completion.cancel(error));
+    }
+
+    fn cancel_into(&self, error: Error, actions: &mut crate::v2::engine::reactor::ReactorActions) {
+        drop(self.completion.cancel_into(error, false, actions));
     }
 }
 

@@ -17,7 +17,7 @@ use crate::v2::error::{Error, Result};
 pub(in crate::v2::engine) struct CommandCompletion<T> {
     result: Mutex<TakeOnceResult<T>>,
     cancelled: AtomicBool,
-    waker: AtomicWaker,
+    waker: std::sync::Arc<AtomicWaker>,
 }
 
 impl<T> CommandCompletion<T> {
@@ -25,7 +25,7 @@ impl<T> CommandCompletion<T> {
         Self {
             result: Mutex::new(TakeOnceResult::Pending),
             cancelled: AtomicBool::new(false),
-            waker: AtomicWaker::new(),
+            waker: std::sync::Arc::new(AtomicWaker::new()),
         }
     }
 
@@ -34,11 +34,42 @@ impl<T> CommandCompletion<T> {
     }
 
     pub(in crate::v2::engine) fn complete(&self, result: Result<T>) {
+        self.complete_with(result, false);
+    }
+
+    pub(in crate::v2::engine) fn complete_listener(&self, result: Result<T>) {
+        self.complete_with(result, true);
+    }
+
+    pub(in crate::v2::engine) fn complete_into(
+        &self,
+        result: Result<T>,
+        listener: bool,
+        actions: &mut super::ReactorActions,
+    ) {
+        if self.store_result(result) {
+            let waker = std::sync::Arc::clone(&self.waker);
+            if listener {
+                actions.push_close_or_listener(move || waker.wake());
+            } else {
+                actions.push_operation(move || waker.wake());
+            }
+        }
+    }
+
+    fn complete_with(&self, result: Result<T>, _listener: bool) {
+        if self.store_result(result) {
+            self.waker.wake();
+        }
+    }
+
+    fn store_result(&self, result: Result<T>) -> bool {
         let mut current = lock_unpoison(&self.result);
         if matches!(&*current, TakeOnceResult::Pending) {
             *current = TakeOnceResult::Ready(result);
-            drop(current);
-            self.waker.wake();
+            true
+        } else {
+            false
         }
     }
 
@@ -63,6 +94,32 @@ impl<T> CommandCompletion<T> {
     /// A successfully completed value that was never observed is returned to
     /// the caller for normal drop/close handling.
     pub(in crate::v2::engine) fn cancel(&self, error: Error) -> Option<T> {
+        let (undelivered, should_wake) = self.cancel_state(error);
+        if should_wake {
+            self.waker.wake();
+        }
+        undelivered
+    }
+
+    pub(in crate::v2::engine) fn cancel_into(
+        &self,
+        error: Error,
+        listener: bool,
+        actions: &mut super::ReactorActions,
+    ) -> Option<T> {
+        let (undelivered, should_wake) = self.cancel_state(error);
+        if should_wake {
+            let waker = std::sync::Arc::clone(&self.waker);
+            if listener {
+                actions.push_close_or_listener(move || waker.wake());
+            } else {
+                actions.push_operation(move || waker.wake());
+            }
+        }
+        undelivered
+    }
+
+    fn cancel_state(&self, error: Error) -> (Option<T>, bool) {
         self.cancelled.store(true, Ordering::Release);
         let mut current = lock_unpoison(&self.result);
         let (replacement, undelivered) =
@@ -77,9 +134,7 @@ impl<T> CommandCompletion<T> {
                 TakeOnceResult::Taken => (TakeOnceResult::Taken, None),
             };
         *current = replacement;
-        drop(current);
-        self.waker.wake();
-        undelivered
+        (undelivered, true)
     }
 }
 

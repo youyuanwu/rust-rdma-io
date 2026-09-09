@@ -277,13 +277,43 @@ impl CommandIngress {
         }
     }
 
+    pub(in crate::v2::engine) fn drain_ordinary_into(
+        &self,
+        error: Error,
+        actions: &mut super::ReactorActions,
+    ) {
+        let mut queues = lock_unpoison(&self.queues);
+        let commands: Vec<_> = queues.connect.drain(..).collect();
+        let listens: Vec<_> = queues.listen.drain(..).collect();
+        let operations: Vec<_> = queues.operation.drain(..).collect();
+        drop(queues);
+        for command in commands.into_iter().chain(listens) {
+            match command {
+                SessionCommand::Connect { request, .. } => {
+                    drop(request.take_reservation());
+                    request.complete_failure_into(error.clone(), actions);
+                }
+                SessionCommand::Listen { request, .. } => {
+                    request.complete_into(Err(error.clone()), actions);
+                }
+            }
+        }
+        for (command, _permit) in operations {
+            command.cancel_before_execution_into(error.clone(), actions);
+        }
+    }
+
     #[cfg(test)]
     pub(in crate::v2::engine) fn close_ordinary(&self, error: Error) {
         self.close_admission();
         self.drain_ordinary(error);
     }
 
-    pub(in crate::v2::engine) fn service_turn(&self, shared: &Arc<EngineShared>) -> CommandTurn {
+    pub(in crate::v2::engine) fn service_turn_into(
+        &self,
+        shared: &Arc<EngineShared>,
+        actions: &mut super::ReactorActions,
+    ) -> CommandTurn {
         let mut session_work = false;
 
         if self.shutdown.swap(false, Ordering::AcqRel) {
@@ -291,16 +321,18 @@ impl CommandIngress {
             session_work = true;
         }
 
-        let close = {
+        let close = if actions.remaining() >= 4 {
             let mut controls = lock_unpoison(&self.controls);
             let close = controls.connection_close.pop_front();
             if let Some(token) = close {
                 controls.connection_close_set.remove(&token);
             }
             close
+        } else {
+            None
         };
         if let Some(token) = close {
-            shared.session.request_connection_close(token);
+            shared.session.request_connection_close_into(token, actions);
             session_work = true;
         }
 
@@ -308,11 +340,28 @@ impl CommandIngress {
             Session(SessionCommand),
             Operation(Arc<OperationCommand>, OwnedSemaphorePermit),
         }
-        let command = {
+        let terminal_error = self.closed.load(Ordering::Acquire).then(|| {
+            shared
+                .session
+                .admission_error()
+                .unwrap_or(Error::DriverShutdown)
+        });
+        let command = if actions.remaining() != 0 {
             let mut queues = lock_unpoison(&self.queues);
             let mut selected = None;
             for offset in 0..3 {
                 let class = (queues.next_class + offset) % 3;
+                let required_actions = if class == 2 && terminal_error.is_none() {
+                    // Starting an operation can synchronously consume an early
+                    // CQE (event + operation wake + close wake) before the
+                    // command-completion wake is detached.
+                    4
+                } else {
+                    1
+                };
+                if !actions.can_accept(required_actions) {
+                    continue;
+                }
                 selected = match class {
                     0 => queues.connect.pop_front().map(ReadyCommand::Session),
                     1 => queues.listen.pop_front().map(ReadyCommand::Session),
@@ -328,19 +377,35 @@ impl CommandIngress {
                 }
             }
             selected
+        } else {
+            None
         };
         if let Some(command) = command {
             match command {
                 ReadyCommand::Session(SessionCommand::Connect { request, .. }) => {
-                    shared.session.cm.enqueue(request);
-                    session_work = true;
+                    if let Some(error) = terminal_error {
+                        drop(request.take_reservation());
+                        request.complete_failure_into(error, actions);
+                    } else {
+                        shared.session.cm.enqueue(request);
+                        session_work = true;
+                    }
                 }
                 ReadyCommand::Session(SessionCommand::Listen { request, .. }) => {
-                    shared.session.cm.enqueue_listen(request);
-                    session_work = true;
+                    if let Some(error) = terminal_error {
+                        request.complete_into(Err(error), actions);
+                    } else {
+                        shared.session.cm.enqueue_listen(request);
+                        session_work = true;
+                    }
                 }
-                ReadyCommand::Operation(command, _permit) => {
-                    command.execute(&shared.session);
+                ReadyCommand::Operation(command, permit) => {
+                    if let Some(error) = terminal_error {
+                        command.cancel_before_execution_into(error, actions);
+                    } else {
+                        command.execute_into(&shared.session, actions);
+                    }
+                    drop(permit);
                 }
             }
         }
@@ -358,7 +423,15 @@ impl CommandIngress {
         }
     }
 
-    fn has_pending(&self) -> bool {
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn service_turn(&self, shared: &Arc<EngineShared>) -> CommandTurn {
+        let mut actions = super::ReactorActions::default();
+        let report = self.service_turn_into(shared, &mut actions);
+        actions.publish();
+        report
+    }
+
+    pub(in crate::v2::engine) fn has_pending(&self) -> bool {
         if self.shutdown.load(Ordering::Acquire) {
             return true;
         }

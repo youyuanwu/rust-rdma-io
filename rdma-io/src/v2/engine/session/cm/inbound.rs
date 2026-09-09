@@ -22,12 +22,13 @@ pub(super) fn start_listener(
     shared: &SessionManager,
     resources: &EngineResources,
     request: Arc<ListenRequest>,
+    actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<()> {
     if request.is_cancelled()
         || state.shutting_down.load(Ordering::Acquire)
         || shared.shutdown_requested()
     {
-        request.complete(Err(Error::DriverShutdown));
+        request.complete_into(Err(Error::DriverShutdown), actions);
         return Ok(());
     }
     let token = state
@@ -40,10 +41,13 @@ pub(super) fn start_listener(
         match CmId::new_with_context_token(&resources.cm_event_channel, PortSpace::Tcp, token) {
             Ok(cm_id) => SharedCmId::new(cm_id, Arc::clone(&resources.cm_event_channel)),
             Err(error) => {
-                request.complete(Err(contextual_cm_error(
-                    format!("create listener {}", request.address),
-                    Error::from_v1(error),
-                )));
+                request.complete_into(
+                    Err(contextual_cm_error(
+                        format!("create listener {}", request.address),
+                        Error::from_v1(error),
+                    )),
+                    actions,
+                );
                 return Ok(());
             }
         };
@@ -51,20 +55,26 @@ pub(super) fn start_listener(
     let raw_id = cm_id.as_raw() as usize;
     if !state.insert_context_route(context_key, ContextRoute::Listener { token, raw_id }) {
         state.defer_cm_id(cm_id);
-        request.complete(Err(Error::InvalidConfig(
-            "duplicate listener CM context identity".into(),
-        )));
+        request.complete_into(
+            Err(Error::InvalidConfig(
+                "duplicate listener CM context identity".into(),
+            )),
+            actions,
+        );
         return Ok(());
     }
     if let Err(error) = cm_id.listen(&request.address, KERNEL_LISTEN_BACKLOG_REQUEST) {
         state.defer_cm_id(cm_id);
-        request.complete(Err(contextual_cm_error(
-            format!(
-                "listen on {} with requested kernel backlog {}",
-                request.address, KERNEL_LISTEN_BACKLOG_REQUEST
-            ),
-            Error::from_v1(error),
-        )));
+        request.complete_into(
+            Err(contextual_cm_error(
+                format!(
+                    "listen on {} with requested kernel backlog {}",
+                    request.address, KERNEL_LISTEN_BACKLOG_REQUEST
+                ),
+                Error::from_v1(error),
+            )),
+            actions,
+        );
         return Ok(());
     }
     let local_addr = cm_id.local_addr().ok_or_else(|| {
@@ -77,7 +87,7 @@ pub(super) fn start_listener(
         Ok(local_addr) => local_addr,
         Err(error) => {
             state.defer_cm_id(cm_id);
-            request.complete(Err(error));
+            request.complete_into(Err(error), actions);
             return Ok(());
         }
     };
@@ -92,16 +102,19 @@ pub(super) fn start_listener(
             .take_cm_id()
             .expect("new duplicate listener still owns its CM ID");
         state.defer_cm_id(cm_id);
-        request.complete(Err(Error::InvalidConfig(
-            "duplicate listener route identity".into(),
-        )));
+        request.complete_into(
+            Err(Error::InvalidConfig(
+                "duplicate listener route identity".into(),
+            )),
+            actions,
+        );
         return Ok(());
     }
     if request.is_cancelled() {
         listener.request_close(shared);
-        request.complete(Err(Error::DriverShutdown));
+        request.complete_into(Err(Error::DriverShutdown), actions);
     } else {
-        request.complete(Ok(RdmaListener::from_state(shared, listener)));
+        request.complete_into(Ok(RdmaListener::from_state(shared, listener)), actions);
     }
     Ok(())
 }
@@ -111,19 +124,20 @@ pub(super) fn service_listener(
     shared: &SessionManager,
     resources: &EngineResources,
     listener: &Arc<ListenerState>,
+    actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<()> {
     match listener.next_action() {
         ListenerAction::CancelledBeforeSelection(request) => {
-            request.complete(Err(Error::DriverShutdown));
+            request.complete_into(Err(Error::DriverShutdown), actions);
         }
         ListenerAction::FailUnselected(request) => {
-            request.complete(Err(listener.close_error()));
+            request.complete_into(Err(listener.close_error()), actions);
         }
         ListenerAction::RejectChild(child, reason) => {
             reject_child(state, child, reason)?;
         }
         ListenerAction::ProcessSelected { request, child } => {
-            process_selected_pair(state, shared, resources, listener, request, child)?;
+            process_selected_pair(state, shared, resources, listener, request, child, actions)?;
         }
         ListenerAction::RejectSelected {
             request,
@@ -131,12 +145,12 @@ pub(super) fn service_listener(
             reason,
         } => {
             reject_child(state, child, InboundRejectReason::ListenerClosed)?;
-            request.complete(Err(reason));
+            request.complete_into(Err(reason), actions);
             listener.finish_selected_request(&request);
         }
         ListenerAction::CancelAfterAccept { request, route } => {
             let _ = request;
-            cancel_inbound_route(state, shared, route)?;
+            cancel_inbound_route(state, shared, route, actions)?;
         }
         ListenerAction::FinalizeClose => {
             finalize_listener(state, listener)?;
@@ -191,12 +205,10 @@ pub(super) fn handle_connect_request(
     };
     let admitted = listener.admit_child(IncomingChild::new(child_id, reservation));
     drop(admission);
-    for request in admitted.cancelled {
-        request.complete(Err(Error::DriverShutdown));
-    }
     if let Some((child, reason)) = admitted.rejected {
         reject_child(state, child, reason)?;
-    } else {
+    }
+    if listener.has_work() {
         state.enqueue_listener_work(listener);
     }
     Ok(EventDisposition::Handled)
@@ -232,6 +244,7 @@ fn process_selected_pair(
     listener: &Arc<ListenerState>,
     request: Arc<AcceptRequest>,
     child: IncomingChild,
+    actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<()> {
     if request.is_cancelled() || listener.is_closing() || shared.shutdown_requested() {
         let error = if listener.is_closing() {
@@ -245,7 +258,7 @@ fn process_selected_pair(
             InboundRejectReason::AdmissionClosed
         };
         reject_child(state, child, reject)?;
-        request.complete(Err(error));
+        request.complete_into(Err(error), actions);
         listener.finish_selected_request(&request);
         return Ok(());
     }
@@ -262,7 +275,7 @@ fn process_selected_pair(
         state.inbound_routes.release(token, false);
         reject_unreserved_child(state, child_cm_id, InboundRejectReason::SetupFailure)?;
         drop(child_reservation);
-        request.complete(Err(error));
+        request.complete_into(Err(error), actions);
         listener.finish_selected_request(&request);
         return Ok(());
     }
@@ -273,9 +286,12 @@ fn process_selected_pair(
         state.inbound_routes.release(token, false);
         reject_unreserved_child(state, child_cm_id, InboundRejectReason::SetupFailure)?;
         drop(child_reservation);
-        request.complete(Err(Error::InvalidConfig(
-            "duplicate inbound CM context identity".into(),
-        )));
+        request.complete_into(
+            Err(Error::InvalidConfig(
+                "duplicate inbound CM context identity".into(),
+            )),
+            actions,
+        );
         listener.finish_selected_request(&request);
         return Ok(());
     }
@@ -290,10 +306,13 @@ fn process_selected_pair(
             state.inbound_routes.release(token, false);
             reject_unreserved_child(state, child_cm_id, InboundRejectReason::SetupFailure)?;
             drop(child_reservation);
-            request.complete(Err(contextual_cm_error(
-                format!("build inbound QP for {}", listener.local_addr),
-                error,
-            )));
+            request.complete_into(
+                Err(contextual_cm_error(
+                    format!("build inbound QP for {}", listener.local_addr),
+                    error,
+                )),
+                actions,
+            );
             listener.finish_selected_route(token.encode());
             return Ok(());
         }
@@ -322,12 +341,16 @@ fn process_selected_pair(
                 Err(destroy_error) => {
                     CmState::record_setup_rollback_quarantine(&destroy_error);
                     reject_retained_inbound_child(&verbs);
-                    let connection =
-                        state.retain_failed_install(shared, failed_resources, &destroy_error);
+                    let connection = state.retain_failed_install(
+                        shared,
+                        failed_resources,
+                        &destroy_error,
+                        actions,
+                    );
                     route.set_state(InboundState::Quarantined { connection });
                 }
             }
-            request.complete(Err(error));
+            request.complete_into(Err(error), actions);
             listener.finish_selected_route(token.encode());
             return Ok(());
         }
@@ -337,7 +360,7 @@ fn process_selected_pair(
         Ok(param) => param,
         Err(error) => {
             drop(verbs);
-            fail_selected_connection(state, shared, &route, request, connection, error)?;
+            fail_selected_connection(state, shared, &route, request, connection, error, actions)?;
             return Ok(());
         }
     };
@@ -359,7 +382,7 @@ fn process_selected_pair(
     );
     if let Err(error) = establish {
         drop(verbs);
-        fail_selected_connection(state, shared, &route, request, connection, error)?;
+        fail_selected_connection(state, shared, &route, request, connection, error, actions)?;
         return Ok(());
     }
     drop(verbs);
@@ -377,6 +400,7 @@ fn fail_selected_connection(
     request: Arc<AcceptRequest>,
     connection: RdmaConnection,
     error: Error,
+    actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<()> {
     let connection_state = connection.require_session_state()?;
     let reject = match &error {
@@ -391,10 +415,10 @@ fn fail_selected_connection(
         selected: true,
         reject: Some(reject),
     });
-    shared.begin_connection_close(&connection_state);
+    shared.begin_connection_close_into(&connection_state, actions);
     drop(connection);
     if connection_state.accepted_count() == 0 {
-        shared.retire_registered_connection(connection_state.token)?;
+        shared.retire_registered_connection_into(connection_state.token, actions)?;
     }
     Ok(())
 }
@@ -447,7 +471,12 @@ fn reject_child(state: &CmState, child: IncomingChild, reason: InboundRejectReas
     result
 }
 
-fn cancel_inbound_route(state: &CmState, shared: &SessionManager, encoded: u64) -> Result<()> {
+fn cancel_inbound_route(
+    state: &CmState,
+    shared: &SessionManager,
+    encoded: u64,
+    actions: &mut crate::v2::engine::reactor::ReactorActions,
+) -> Result<()> {
     let token = CmRouteToken::decode(encoded);
     let Lookup::Occupied(route) = state.inbound_routes.lookup_cloned(token) else {
         return Ok(());
@@ -483,10 +512,10 @@ fn cancel_inbound_route(state: &CmState, shared: &SessionManager, encoded: u64) 
                 selected: true,
                 reject: None,
             });
-            shared.begin_connection_close(&connection_state);
+            shared.begin_connection_close_into(&connection_state, actions);
             drop(connection);
             if connection_state.accepted_count() == 0 {
-                shared.retire_registered_connection(connection_state.token)?;
+                shared.retire_registered_connection_into(connection_state.token, actions)?;
             }
         }
         InboundState::EstablishedAwaitingDelivery {
@@ -498,7 +527,7 @@ fn cancel_inbound_route(state: &CmState, shared: &SessionManager, encoded: u64) 
                 return Ok(());
             };
             let error = cancellation_error();
-            if request.fail_undelivered(error) {
+            if request.fail_undelivered_into(error, actions) {
                 route.set_state(InboundState::Established {
                     connection: connection.clone(),
                 });
@@ -516,9 +545,9 @@ fn cancel_inbound_route(state: &CmState, shared: &SessionManager, encoded: u64) 
                 selected: true,
                 reject: None,
             });
-            shared.begin_connection_close(&connection_state);
+            shared.begin_connection_close_into(&connection_state, actions);
             if connection_state.accepted_count() == 0 {
-                shared.retire_registered_connection(connection_state.token)?;
+                shared.retire_registered_connection_into(connection_state.token, actions)?;
             }
         }
         _ => unreachable!("inbound cancellation state was pre-filtered"),
@@ -556,9 +585,10 @@ pub(super) fn handle_event(
     shared: &SessionManager,
     route: &Arc<InboundRoute>,
     snapshot: CmEventSnapshot,
+    actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<EventDisposition> {
     if is_failure_event(snapshot.event_type) || snapshot.status != 0 {
-        return handle_failure(state, shared, route, snapshot);
+        return handle_failure(state, shared, route, snapshot, actions);
     }
     match snapshot.event_type {
         CmEventType::Established => {
@@ -593,10 +623,10 @@ pub(super) fn handle_event(
                     selected: true,
                     reject: None,
                 });
-                shared.begin_connection_close(&connection_state);
+                shared.begin_connection_close_into(&connection_state, actions);
                 drop(connection);
                 if connection_state.accepted_count() == 0 {
-                    shared.retire_registered_connection(connection_state.token)?;
+                    shared.retire_registered_connection_into(connection_state.token, actions)?;
                 }
                 return Ok(EventDisposition::Handled);
             }
@@ -607,10 +637,10 @@ pub(super) fn handle_event(
                 request: Arc::clone(&request),
                 connection: connection_route,
             });
-            request.complete_success(connection);
+            request.complete_success_into(connection, actions);
             Ok(EventDisposition::Handled)
         }
-        CmEventType::Disconnected => handle_disconnected(state, shared, route),
+        CmEventType::Disconnected => handle_disconnected(state, shared, route, actions),
         CmEventType::TimewaitExit => Ok(EventDisposition::Handled),
         _ => Ok(EventDisposition::Rejected(CmEventReject::Unexpected)),
     }
@@ -620,6 +650,7 @@ pub(super) fn handle_disconnected(
     state: &CmState,
     shared: &SessionManager,
     route: &Arc<InboundRoute>,
+    actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<EventDisposition> {
     let route_state = route.take_state_if(|route_state| {
         matches!(
@@ -650,10 +681,13 @@ pub(super) fn handle_disconnected(
     };
     let Some(connection_state) = connection.upgrade() else {
         if let Some(request) = request {
-            let _ = request.fail_undelivered(Error::Verbs(std::io::Error::new(
-                std::io::ErrorKind::ConnectionAborted,
-                "inbound disconnect lost connection state before accept retirement",
-            )));
+            let _ = request.fail_undelivered_into(
+                Error::Verbs(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "inbound disconnect lost connection state before accept retirement",
+                )),
+                actions,
+            );
         }
         if selected
             && let Some(listener) = route.listener.upgrade()
@@ -665,7 +699,7 @@ pub(super) fn handle_disconnected(
         return Ok(EventDisposition::Handled);
     };
     if let Some(event) = connection_state.mark_disconnected() {
-        event.deliver();
+        actions.push_event(event);
     }
     route.set_state(InboundState::Closing {
         connection: connection.clone(),
@@ -680,10 +714,13 @@ pub(super) fn handle_disconnected(
         reject: None,
     });
     if let Some(request) = request
-        && request.fail_undelivered(Error::Verbs(std::io::Error::new(
-            std::io::ErrorKind::ConnectionAborted,
-            "inbound connection disconnected before accept delivery",
-        )))
+        && request.fail_undelivered_into(
+            Error::Verbs(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "inbound connection disconnected before accept delivery",
+            )),
+            actions,
+        )
     {
         route.set_state(InboundState::Closing {
             connection: connection.clone(),
@@ -698,9 +735,9 @@ pub(super) fn handle_disconnected(
             state.enqueue_listener_work(&listener);
         }
     }
-    shared.begin_connection_close(&connection_state);
+    shared.begin_connection_close_into(&connection_state, actions);
     if connection_state.accepted_count() == 0 {
-        shared.retire_registered_connection(connection_state.token)?;
+        shared.retire_registered_connection_into(connection_state.token, actions)?;
     }
     Ok(EventDisposition::Handled)
 }
@@ -710,6 +747,7 @@ fn handle_failure(
     shared: &SessionManager,
     route: &Arc<InboundRoute>,
     snapshot: CmEventSnapshot,
+    actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<EventDisposition> {
     let message = format!(
         "inbound RDMA CM {:?} failed with status {} for id={:#x} listen_id={:#x}",
@@ -725,10 +763,11 @@ fn handle_failure(
             connection,
         } => {
             let connection_state = connection.require_session_state()?;
-            if let Some(event) = connection_state
-                .mark_cm_failure(Error::Verbs(std::io::Error::other(message.clone())))
-            {
-                event.deliver();
+            if let Some(event) = connection_state.mark_cm_failure_into(
+                Error::Verbs(std::io::Error::other(message.clone())),
+                actions,
+            ) {
+                actions.push_event(event);
             }
             route.set_state(InboundState::Closing {
                 connection: EstablishedConnectionRoute::new(&connection_state),
@@ -737,10 +776,10 @@ fn handle_failure(
                 selected: true,
                 reject: None,
             });
-            shared.begin_connection_close(&connection_state);
+            shared.begin_connection_close_into(&connection_state, actions);
             drop(connection);
             if connection_state.accepted_count() == 0 {
-                shared.retire_registered_connection(connection_state.token)?;
+                shared.retire_registered_connection_into(connection_state.token, actions)?;
             }
         }
         InboundState::EstablishedAwaitingDelivery {
@@ -751,10 +790,11 @@ fn handle_failure(
                 state.inbound_routes.release(route.token, true);
                 return Ok(EventDisposition::Handled);
             };
-            if let Some(event) = connection_state
-                .mark_cm_failure(Error::Verbs(std::io::Error::other(message.clone())))
-            {
-                event.deliver();
+            if let Some(event) = connection_state.mark_cm_failure_into(
+                Error::Verbs(std::io::Error::other(message.clone())),
+                actions,
+            ) {
+                actions.push_event(event);
             }
             route.set_state(InboundState::Closing {
                 connection: connection.clone(),
@@ -763,7 +803,8 @@ fn handle_failure(
                 selected: true,
                 reject: None,
             });
-            if request.fail_undelivered(Error::Verbs(std::io::Error::other(message))) {
+            if request.fail_undelivered_into(Error::Verbs(std::io::Error::other(message)), actions)
+            {
                 route.set_state(InboundState::Closing {
                     connection: connection.clone(),
                     request: None,
@@ -777,9 +818,9 @@ fn handle_failure(
                     state.enqueue_listener_work(&listener);
                 }
             }
-            shared.begin_connection_close(&connection_state);
+            shared.begin_connection_close_into(&connection_state, actions);
             if connection_state.accepted_count() == 0 {
-                shared.retire_registered_connection(connection_state.token)?;
+                shared.retire_registered_connection_into(connection_state.token, actions)?;
             }
         }
         InboundState::Established { connection } => {
@@ -787,10 +828,11 @@ fn handle_failure(
                 state.inbound_routes.release(route.token, true);
                 return Ok(EventDisposition::Handled);
             };
-            if let Some(event) = connection_state
-                .mark_cm_failure(Error::Verbs(std::io::Error::other(message.clone())))
-            {
-                event.deliver();
+            if let Some(event) = connection_state.mark_cm_failure_into(
+                Error::Verbs(std::io::Error::other(message.clone())),
+                actions,
+            ) {
+                actions.push_event(event);
             }
             route.set_state(InboundState::Closing {
                 connection: connection.clone(),
@@ -799,9 +841,9 @@ fn handle_failure(
                 selected: false,
                 reject: None,
             });
-            shared.begin_connection_close(&connection_state);
+            shared.begin_connection_close_into(&connection_state, actions);
             if connection_state.accepted_count() == 0 {
-                shared.retire_registered_connection(connection_state.token)?;
+                shared.retire_registered_connection_into(connection_state.token, actions)?;
             }
         }
         route_state @ InboundState::Closing { .. } => {

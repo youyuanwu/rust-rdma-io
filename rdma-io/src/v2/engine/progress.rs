@@ -1,27 +1,9 @@
-//! Owner-neutral contracts used by the explicit engine scheduler.
-//!
-//! The contracts deliberately report only information needed to schedule
-//! another bounded turn. Layer-private identities and lifecycle state stay
-//! behind the I/O and session progress owners.
+//! External-readiness state shared by reactor sources.
 
-/// Opaque owner identity used for fair scheduler rotation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum OwnerClass {
-    Io,
-    Session,
-}
-
-impl OwnerClass {
-    pub(super) const fn index(self) -> usize {
-        match self {
-            Self::Io => 0,
-            Self::Session => 1,
-        }
-    }
-}
-
-/// Result of one finite owner-defined progress turn.
+#[cfg(test)]
+/// Compatibility report used only by focused source tests.
 pub(super) struct ProgressReport {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) units_consumed: usize,
     pub(super) immediate_work: bool,
     pub(super) readiness: ReadinessRegistration,
@@ -35,6 +17,7 @@ pub(super) enum ReadinessRegistration {
     Incomplete,
 }
 
+#[cfg(test)]
 impl ProgressReport {
     pub(super) fn running(
         units_consumed: usize,
@@ -48,7 +31,6 @@ impl ProgressReport {
         }
     }
 
-    #[cfg(test)]
     pub(super) fn idle(readiness: ReadinessRegistration) -> Self {
         Self::running(0, false, readiness)
     }

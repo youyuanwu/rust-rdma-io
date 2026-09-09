@@ -281,6 +281,9 @@ impl IoCore {
             self.pending_reclamations.fetch_sub(1, Ordering::AcqRel);
         }
         let mut effects = IoCoreEffects::default();
+        if removed {
+            effects.push_close_wake(operation.connection().drain_notify());
+        }
         if let Some(event) = finished.event {
             effects.push_event(event);
         }
@@ -355,7 +358,11 @@ impl IoCore {
     pub(in crate::v2::engine) fn reject_queued_completions_after_qp_destroy(
         &self,
         connection: &EstablishedIoConnection,
+        action_limited_budget: usize,
     ) -> (bool, IoCoreEffects) {
-        self.dispatch_queued_completions(connection, self.completion_dispatch_budget)
+        self.dispatch_queued_completions(
+            connection,
+            self.completion_dispatch_budget.min(action_limited_budget),
+        )
     }
 }

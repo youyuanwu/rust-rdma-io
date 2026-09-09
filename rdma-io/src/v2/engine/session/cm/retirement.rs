@@ -18,7 +18,8 @@ pub(super) fn service_cm_destructions(
     state: &CmState,
     shared: &SessionManager,
     budget: usize,
-    mut try_process_event: impl FnMut() -> Result<bool>,
+    actions: &mut crate::v2::engine::reactor::ReactorActions,
+    mut defer_one_event: impl FnMut() -> Result<bool>,
 ) -> Result<usize> {
     let mut processed = 0;
     while processed < budget {
@@ -26,7 +27,7 @@ pub(super) fn service_cm_destructions(
         let Some(pending) = pending else {
             break;
         };
-        match try_process_event() {
+        match defer_one_event() {
             Ok(true) => {
                 lock_unpoison(&state.cm_destructions).push_back(pending);
             }
@@ -63,6 +64,7 @@ pub(super) fn service_cm_destructions(
                             completion,
                             destroy_result,
                             finalize_result,
+                            actions,
                         )?;
                     }
                     PendingCmDestruction::Listener { cm_id, listener } => {
@@ -72,7 +74,7 @@ pub(super) fn service_cm_destructions(
                                 error,
                             )
                         });
-                        complete_listener_cm_destruction(listener, destroy_result)?;
+                        complete_listener_cm_destruction(listener, destroy_result, actions)?;
                     }
                     #[cfg(test)]
                     PendingCmDestruction::Test {
@@ -87,6 +89,7 @@ pub(super) fn service_cm_destructions(
                             } => complete_listener_cm_destruction(
                                 listener,
                                 injected_cm_result(destroy_error),
+                                actions,
                             )?,
                             TestCmDestruction::Connection {
                                 connection,
@@ -105,6 +108,7 @@ pub(super) fn service_cm_destructions(
                                     completion,
                                     injected_cm_result(destroy_error),
                                     finalize_result,
+                                    actions,
                                 )?
                             }
                         }
@@ -124,14 +128,15 @@ pub(super) fn service_cm_destructions(
 fn complete_listener_cm_destruction(
     listener: Arc<super::ListenerState>,
     result: Result<()>,
+    actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<()> {
     match result {
         Ok(()) => {
-            listener.finish_close(None);
+            listener.finish_close_into(None, actions);
             Ok(())
         }
         Err(error) => {
-            listener.finish_close(Some(error.clone()));
+            listener.finish_close_into(Some(error.clone()), actions);
             Err(error)
         }
     }
@@ -144,23 +149,24 @@ fn complete_connection_cm_destruction(
     completion: Option<InboundRetirementCompletion>,
     destroy_result: Result<()>,
     finalize_result: Result<()>,
+    actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<()> {
     match (destroy_result, finalize_result) {
         (Ok(()), Ok(())) => {
             shared.record_connection_retired(&connection);
-            if let Some(event) = connection.finish_retirement() {
-                event.deliver();
+            if let Some(event) = connection.finish_retirement_into(actions) {
+                actions.push_event(event);
             }
-            finish_inbound_retirement(state, completion);
+            finish_inbound_retirement(state, completion, actions);
             Ok(())
         }
         (destroy_result, finalize_result) => {
             let error = connection_destruction_error(destroy_result, finalize_result);
             let message = error_detail(&error);
-            if let Some(event) = connection.fail_retirement(error.clone()) {
-                event.deliver();
+            if let Some(event) = connection.fail_retirement_into(error.clone(), actions) {
+                actions.push_event(event);
             }
-            fail_inbound_retirement(state, completion, message);
+            fail_inbound_retirement(state, completion, message, actions);
             Err(error)
         }
     }
@@ -197,6 +203,7 @@ pub(super) fn retain_failed_install(
     shared: &SessionManager,
     resources: FailedConnectionInstallResources,
     destroy_error: &Error,
+    actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Option<EstablishedConnectionRoute> {
     match resources {
         FailedConnectionInstallResources::Unregistered {
@@ -214,9 +221,10 @@ pub(super) fn retain_failed_install(
             connection.begin_close();
             let _ = connection.try_begin_retirement();
             shared.track_connection_quarantine(connection.token);
-            let (_, event) = connection.publish_destroy_quarantine(destroy_error, || {});
+            let (_, event) =
+                connection.publish_destroy_quarantine_into(destroy_error, || {}, actions);
             if let Some(event) = event {
-                event.deliver();
+                actions.push_event(event);
             }
             Some(EstablishedConnectionRoute::new(&connection))
         }
@@ -230,14 +238,15 @@ pub(super) fn record_setup_rollback_quarantine(destroy_error: &Error) {
     );
 }
 
-fn finalize_connection_retirement(
+fn finalize_connection_retirement_into(
     shared: &SessionManager,
     connection: Arc<ConnectionState>,
+    actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<()> {
     release_connection_retirement(shared, &connection)?;
     shared.record_connection_retired(&connection);
-    if let Some(event) = connection.finish_retirement() {
-        event.deliver();
+    if let Some(event) = connection.finish_retirement_into(actions) {
+        actions.push_event(event);
     }
     Ok(())
 }
@@ -261,14 +270,18 @@ fn release_connection_retirement(
     Ok(())
 }
 
-fn finish_inbound_retirement(state: &CmState, completion: Option<InboundRetirementCompletion>) {
+fn finish_inbound_retirement(
+    state: &CmState,
+    completion: Option<InboundRetirementCompletion>,
+    actions: &mut crate::v2::engine::reactor::ReactorActions,
+) {
     let Some(completion) = completion else {
         return;
     };
     if let Some(request) = completion.request
         && let Some(result) = completion.result
     {
-        request.complete(Err(result));
+        request.complete_into(Err(result), actions);
     }
     if completion.selected
         && let Some(listener) = completion.listener.upgrade()
@@ -282,12 +295,14 @@ fn fail_inbound_retirement(
     state: &CmState,
     completion: Option<InboundRetirementCompletion>,
     message: String,
+    actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) {
     let Some(completion) = completion else {
         return;
     };
     if let Some(request) = completion.request {
-        let _ = request.fail_undelivered(Error::Verbs(std::io::Error::other(message)));
+        let _ =
+            request.fail_undelivered_into(Error::Verbs(std::io::Error::other(message)), actions);
     }
     if completion.selected
         && let Some(listener) = completion.listener.upgrade()
@@ -297,9 +312,10 @@ fn fail_inbound_retirement(
     }
 }
 
-pub(super) fn retire_registered_connection(
+pub(super) fn retire_registered_connection_into(
     shared: &SessionManager,
     token: ConnectionToken,
+    actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Result<()> {
     let state = &shared.cm;
     let Lookup::Occupied(connection) = shared.connections.lookup(token) else {
@@ -327,9 +343,9 @@ pub(super) fn retire_registered_connection(
             "connection QP destroy failed; retaining CM route and ownership bundle"
         );
         shared.track_connection_quarantine(connection.token);
-        let (_, event) = connection.publish_destroy_quarantine(&error, || {});
+        let (_, event) = connection.publish_destroy_quarantine_into(&error, || {}, actions);
         if let Some(event) = event {
-            event.deliver();
+            actions.push_event(event);
         }
         return Ok(());
     }
@@ -338,7 +354,7 @@ pub(super) fn retire_registered_connection(
             state.retire_outbound_route_for_retirement(encoded, &connection)?
         }
         Some(ConnectionCmRoute::Inbound(encoded)) => {
-            state.retire_inbound_route_for_retirement(encoded, &connection)?
+            state.retire_inbound_route_for_retirement(encoded, &connection, actions)?
         }
         None => RouteRetirement::Complete {
             completion: None,
@@ -364,11 +380,11 @@ pub(super) fn retire_registered_connection(
                 "connection resource finalization failed; retaining terminal quarantine"
             );
             shared.track_connection_quarantine(connection.token);
-            let (_, event) = connection.publish_destroy_quarantine(&error, || {});
+            let (_, event) = connection.publish_destroy_quarantine_into(&error, || {}, actions);
             if let Some(event) = event {
-                event.deliver();
+                actions.push_event(event);
             }
-            finish_inbound_retirement(state, completion);
+            finish_inbound_retirement(state, completion, actions);
             return Ok(());
         }
     };
@@ -388,7 +404,7 @@ pub(super) fn retire_registered_connection(
         });
         return Ok(());
     }
-    finalize_connection_retirement(shared, connection)?;
-    finish_inbound_retirement(state, completion);
+    finalize_connection_retirement_into(shared, connection, actions)?;
+    finish_inbound_retirement(state, completion, actions);
     Ok(())
 }

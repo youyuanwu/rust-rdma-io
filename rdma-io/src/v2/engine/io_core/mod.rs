@@ -27,8 +27,8 @@ pub(super) use operation::CqeReject;
 pub use operation::RdmaOperation;
 pub(in crate::v2::engine) use operation::future::OperationCommand;
 pub(super) use operation::{
-    CommittedIoCoreEffects, IoCoreEffects, OperationQuarantineEffect, QpReclaimCapability,
-    post_io_recv_batch, post_io_send,
+    CommittedIoCoreEffects, IoCoreEffects, OperationQuarantineEffect, OperationState,
+    QpReclaimCapability, post_io_recv_batch, post_io_send,
 };
 use operation::{CqCreditPool, OperationRegistry};
 #[cfg(test)]
@@ -36,7 +36,7 @@ pub(super) use operation::{
     completion_for_driver_test, install_accepted_operation_for_driver_test,
     operation_future_for_io_lifetime_test, register_operation_waker_for_test,
 };
-pub(super) use progress::IoProgress;
+pub(super) use progress::IoReactorSources;
 
 /// Posting-only QP authority supplied by the session layer.
 ///
@@ -70,9 +70,37 @@ pub(super) trait IoSessionBridge: Send + Sync {
         quantum: usize,
     ) -> (usize, bool);
 
+    fn dispatch_connection_completions_into(
+        &self,
+        connection: ConnectionToken,
+        quantum: usize,
+        actions: &mut super::reactor::ReactorActions,
+    ) -> (usize, bool) {
+        let _ = actions;
+        self.dispatch_connection_completions(connection, quantum)
+    }
+
     fn handle_reclamation_deadline(&self, token: OperationToken);
 
+    fn handle_reclamation_deadline_into(
+        &self,
+        token: OperationToken,
+        actions: &mut super::reactor::ReactorActions,
+    ) {
+        let _ = actions;
+        self.handle_reclamation_deadline(token);
+    }
+
     fn commit_terminal_effects(&self, effects: IoCoreEffects);
+
+    fn commit_terminal_effects_into(
+        &self,
+        effects: IoCoreEffects,
+        actions: &mut super::reactor::ReactorActions,
+    ) {
+        let _ = actions;
+        self.commit_terminal_effects(effects);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -211,20 +239,28 @@ impl EstablishedIoConnection {
     }
 
     pub(super) fn remove_accepted(&self, token: OperationToken) -> bool {
-        let removed = lock_unpoison(&self.accepted).remove(&AcceptedWrIdentity {
+        lock_unpoison(&self.accepted).remove(&AcceptedWrIdentity {
             connection: self.identity.connection,
             qp_num: self.identity.qp_num,
             operation: token,
-        });
-        if removed {
-            self.drain_notify.notify_waiters();
-        }
-        removed
+        })
+    }
+
+    pub(super) fn drain_notify(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.drain_notify)
     }
 
     pub(super) fn accepted_tokens(&self) -> Vec<OperationToken> {
         lock_unpoison(&self.accepted)
             .iter()
+            .map(|identity| identity.operation)
+            .collect()
+    }
+
+    pub(super) fn accepted_tokens_bounded(&self, limit: usize) -> Vec<OperationToken> {
+        lock_unpoison(&self.accepted)
+            .iter()
+            .take(limit)
             .map(|identity| identity.operation)
             .collect()
     }
@@ -467,8 +503,13 @@ impl IoCore {
         requests.drain(..count).collect()
     }
 
+    #[cfg(test)]
     pub(super) fn has_reclamation_requests(&self) -> bool {
         !lock_unpoison(&self.reclamation_requests).is_empty()
+    }
+
+    pub(super) fn reclamation_request_count(&self) -> usize {
+        lock_unpoison(&self.reclamation_requests).len()
     }
 
     pub(super) fn diagnostics(&self) -> IoCoreDiagnostics {
@@ -518,6 +559,10 @@ impl IoCore {
 
     pub(super) fn has_published_connections(&self) -> bool {
         !lock_unpoison(&self.published_completion_connections).is_empty()
+    }
+
+    pub(super) fn published_connection_count(&self) -> usize {
+        lock_unpoison(&self.published_completion_connections).len()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

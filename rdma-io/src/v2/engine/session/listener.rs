@@ -355,7 +355,17 @@ impl ListenRequest {
     }
 
     pub(in crate::v2::engine) fn complete(&self, result: Result<RdmaListener>) {
-        self.observer.completion.complete(result);
+        self.observer.completion.complete_listener(result);
+    }
+
+    pub(in crate::v2::engine) fn complete_into(
+        &self,
+        result: Result<RdmaListener>,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) {
+        self.observer
+            .completion
+            .complete_into(result, true, actions);
     }
 }
 
@@ -424,7 +434,7 @@ struct AcceptRequestObserver {
     result: Mutex<TakeOnceResult<RdmaConnection>>,
     cancelled: AtomicBool,
     delivered: AtomicBool,
-    waker: AtomicWaker,
+    waker: Arc<AtomicWaker>,
 }
 
 impl AcceptRequest {
@@ -435,7 +445,7 @@ impl AcceptRequest {
                 result: Mutex::new(TakeOnceResult::Pending),
                 cancelled: AtomicBool::new(false),
                 delivered: AtomicBool::new(false),
-                waker: AtomicWaker::new(),
+                waker: Arc::new(AtomicWaker::new()),
             }),
             route_token: AtomicU64::new(0),
         }
@@ -478,7 +488,25 @@ impl AcceptRequest {
         }
     }
 
-    pub(in crate::v2::engine) fn complete_success(&self, connection: RdmaConnection) {
+    pub(in crate::v2::engine) fn complete_into(
+        &self,
+        result: Result<RdmaConnection>,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) {
+        let mut current = lock_unpoison(&self.observer.result);
+        if matches!(&*current, TakeOnceResult::Pending) {
+            *current = TakeOnceResult::Ready(result);
+            drop(current);
+            let waker = Arc::clone(&self.observer.waker);
+            actions.push_close_or_listener(move || waker.wake());
+        }
+    }
+
+    pub(in crate::v2::engine) fn complete_success_into(
+        &self,
+        connection: RdmaConnection,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) {
         let mut current = lock_unpoison(&self.observer.result);
         if self.observer.cancelled.load(Ordering::Acquire)
             || !matches!(&*current, TakeOnceResult::Pending)
@@ -489,7 +517,8 @@ impl AcceptRequest {
         }
         *current = TakeOnceResult::Ready(Ok(connection));
         drop(current);
-        self.observer.waker.wake();
+        let waker = Arc::clone(&self.observer.waker);
+        actions.push_close_or_listener(move || waker.wake());
     }
 
     pub(in crate::v2::engine) fn fail_undelivered(&self, error: Error) -> bool {
@@ -504,6 +533,26 @@ impl AcceptRequest {
         *current = replacement;
         drop(current);
         self.observer.waker.wake();
+        self.is_delivered()
+    }
+
+    pub(in crate::v2::engine) fn fail_undelivered_into(
+        &self,
+        error: Error,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) -> bool {
+        let mut current = lock_unpoison(&self.observer.result);
+        let replacement = match std::mem::replace(&mut *current, TakeOnceResult::Taken) {
+            TakeOnceResult::Pending | TakeOnceResult::Ready(Ok(_)) => {
+                TakeOnceResult::Ready(Err(error))
+            }
+            TakeOnceResult::Ready(Err(existing)) => TakeOnceResult::Ready(Err(existing)),
+            TakeOnceResult::Taken => TakeOnceResult::Taken,
+        };
+        *current = replacement;
+        drop(current);
+        let waker = Arc::clone(&self.observer.waker);
+        actions.push_close_or_listener(move || waker.wake());
         self.is_delivered()
     }
 
@@ -691,17 +740,8 @@ impl ListenerState {
 
     pub(in crate::v2::engine) fn admit_child(&self, child: IncomingChild) -> ChildAdmission {
         let mut queues = self.lock_queues();
-        let mut cancelled = Vec::new();
-        while queues
-            .waiters
-            .front()
-            .is_some_and(|request| request.is_cancelled())
-        {
-            cancelled.push(queues.waiters.pop_front().expect("front waiter exists"));
-        }
         if self.closing.load(Ordering::Acquire) {
             return ChildAdmission {
-                cancelled,
                 rejected: Some((child, InboundRejectReason::ListenerClosed)),
             };
         }
@@ -710,36 +750,29 @@ impl ListenerState {
             && let Some(request) = queues.waiters.pop_front()
         {
             queues.selected = Some(SelectedAccept::Ready { request, child });
-            return ChildAdmission {
-                cancelled,
-                rejected: None,
-            };
+            return ChildAdmission { rejected: None };
         }
         if queues.children.len() >= self.backlog {
             return ChildAdmission {
-                cancelled,
                 rejected: Some((child, InboundRejectReason::BacklogFull)),
             };
         }
         queues.children.push_back(child);
-        ChildAdmission {
-            cancelled,
-            rejected: None,
-        }
+        ChildAdmission { rejected: None }
     }
 
     pub(in crate::v2::engine) fn next_action(&self) -> ListenerAction {
         let mut queues = self.lock_queues();
-        if let Some(position) = queues
+        if queues
             .waiters
-            .iter()
-            .position(|request| request.is_cancelled())
+            .front()
+            .is_some_and(|request| request.is_cancelled())
         {
             return ListenerAction::CancelledBeforeSelection(
                 queues
                     .waiters
-                    .remove(position)
-                    .expect("cancelled waiter position is valid"),
+                    .pop_front()
+                    .expect("cancelled front waiter exists"),
             );
         }
 
@@ -931,7 +964,10 @@ impl ListenerState {
                 || (queues.selected.is_none()
                     && !self.finalization_started.load(Ordering::Acquire));
         }
-        queues.waiters.iter().any(|request| request.is_cancelled())
+        queues
+            .waiters
+            .front()
+            .is_some_and(|request| request.is_cancelled())
             || matches!(queues.selected, Some(SelectedAccept::Ready { .. }))
             || matches!(
                 queues.selected,
@@ -950,6 +986,7 @@ impl ListenerState {
         lock_unpoison(&self.cm_id).take()
     }
 
+    #[cfg(test)]
     pub(in crate::v2::engine) fn finish_close(&self, error: Option<Error>) {
         let failure = error.or_else(|| lock_unpoison(&self.failure).clone());
         self.close.store_if_empty(match failure {
@@ -957,6 +994,19 @@ impl ListenerState {
             None => MemoizedTerminalResult::success(),
         });
         self.close.notify_waiters();
+    }
+
+    pub(in crate::v2::engine) fn finish_close_into(
+        &self,
+        error: Option<Error>,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) {
+        let failure = error.or_else(|| lock_unpoison(&self.failure).clone());
+        self.close.store_if_empty(match failure {
+            Some(error) => MemoizedTerminalResult::from_error(error),
+            None => MemoizedTerminalResult::success(),
+        });
+        self.close.notify_waiters_into(actions);
     }
 
     pub(in crate::v2::engine) fn terminalize(&self, outcome: &MemoizedTerminalResult) {
@@ -995,6 +1045,71 @@ impl ListenerState {
         self.close.notify_waiters();
     }
 
+    /// Publish terminal listener results within the caller's remaining action
+    /// budget. Unprocessed waiters stay on this authoritative listener record.
+    pub(in crate::v2::engine) fn terminalize_into(
+        &self,
+        outcome: &MemoizedTerminalResult,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) -> bool {
+        self.closing.store(true, Ordering::Release);
+        self.close.store_if_empty(outcome.clone());
+        let mut units = 0;
+        loop {
+            if units == 32 {
+                return false;
+            }
+            let unit = {
+                let mut queues = self.lock_queues();
+                if actions.can_accept(1) {
+                    if let Some(request) = queues.waiters.pop_front() {
+                        Some(TerminalListenerUnit::Request(request, false))
+                    } else if let Some(selected) = queues.selected.take() {
+                        Some(match selected {
+                            SelectedAccept::Ready { request, .. }
+                            | SelectedAccept::Processing { request } => {
+                                TerminalListenerUnit::Request(request, false)
+                            }
+                            SelectedAccept::Routed { request, .. } => {
+                                TerminalListenerUnit::Request(request, true)
+                            }
+                        })
+                    } else if queues.children.pop_front().is_some() {
+                        Some(TerminalListenerUnit::Child)
+                    } else {
+                        None
+                    }
+                } else if queues.children.pop_front().is_some() {
+                    Some(TerminalListenerUnit::Child)
+                } else {
+                    None
+                }
+            };
+            let Some(unit) = unit else {
+                if !actions.can_accept(1) {
+                    return false;
+                }
+                self.close.notify_waiters_into(actions);
+                return true;
+            };
+            units += 1;
+            match unit {
+                TerminalListenerUnit::Child => continue,
+                TerminalListenerUnit::Request(request, routed) => {
+                    let error = outcome
+                        .clone()
+                        .into_result()
+                        .expect_err("terminal listener outcome must be an error");
+                    if routed {
+                        let _ = request.fail_undelivered_into(error, actions);
+                    } else {
+                        request.complete_into(Err(error), actions);
+                    }
+                }
+            }
+        }
+    }
+
     pub(in crate::v2::engine) fn close_state(&self) -> Arc<SessionListenerCloseState> {
         Arc::clone(&self.close)
     }
@@ -1025,6 +1140,11 @@ struct ListenerQueues {
     selected: Option<SelectedAccept>,
 }
 
+enum TerminalListenerUnit {
+    Request(Arc<AcceptRequest>, bool),
+    Child,
+}
+
 enum SelectedAccept {
     Ready {
         request: Arc<AcceptRequest>,
@@ -1041,7 +1161,6 @@ enum SelectedAccept {
 }
 
 pub(in crate::v2::engine) struct ChildAdmission {
-    pub(in crate::v2::engine) cancelled: Vec<Arc<AcceptRequest>>,
     pub(in crate::v2::engine) rejected: Option<(IncomingChild, InboundRejectReason)>,
 }
 
@@ -1078,7 +1197,132 @@ pub(in crate::v2::engine) enum InboundRejectReason {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+    use std::task::{Wake, Waker};
+
     use super::*;
+
+    struct CountWake(AtomicUsize);
+
+    impl Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    #[test]
+    fn terminal_listener_overflow_stays_on_authoritative_waiter_queue() {
+        let listener = ListenerState::test_only(64);
+        let wakes = Arc::new(CountWake(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wakes));
+        let requests = (0..40)
+            .map(|_| {
+                let request = AcceptRequest::test_only();
+                request.observer.waker.register(&waker);
+                listener.register_waiter(Arc::clone(&request)).unwrap();
+                request
+            })
+            .collect::<Vec<_>>();
+        let outcome = MemoizedTerminalResult::from_error(Error::DriverShutdown);
+
+        let mut first = crate::v2::engine::reactor::ReactorActions::default();
+        assert!(!listener.terminalize_into(&outcome, &mut first));
+        assert_eq!(
+            first.len(),
+            crate::v2::engine::reactor::REACTOR_ACTION_BUDGET
+        );
+        assert_eq!(wakes.0.load(Ordering::Acquire), 0);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| matches!(
+                    &*lock_unpoison(&request.observer.result),
+                    TakeOnceResult::Ready(Err(Error::DriverShutdown))
+                ))
+                .count(),
+            32
+        );
+        first.publish();
+        assert_eq!(wakes.0.load(Ordering::Acquire), 32);
+
+        let mut second = crate::v2::engine::reactor::ReactorActions::default();
+        assert!(listener.terminalize_into(&outcome, &mut second));
+        assert_eq!(second.len(), 9);
+        second.publish();
+        assert_eq!(wakes.0.load(Ordering::Acquire), 40);
+    }
+
+    #[test]
+    fn accept_failure_mutates_authoritative_queue_before_detached_wake() {
+        let listener = ListenerState::test_only(4);
+        let request = AcceptRequest::test_only();
+        let wakes = Arc::new(CountWake(AtomicUsize::new(0)));
+        request
+            .observer
+            .waker
+            .register(&Waker::from(Arc::clone(&wakes)));
+        listener.register_waiter(Arc::clone(&request)).unwrap();
+        request.cancel();
+        let cancellation_wakes = wakes.0.load(Ordering::Acquire);
+        request
+            .observer
+            .waker
+            .register(&Waker::from(Arc::clone(&wakes)));
+
+        let ListenerAction::CancelledBeforeSelection(selected) = listener.next_action() else {
+            panic!("authoritative listener queue did not select the cancelled request")
+        };
+        assert!(Arc::ptr_eq(&selected, &request));
+        assert!(listener.lock_queues().waiters.is_empty());
+
+        let mut actions = crate::v2::engine::reactor::ReactorActions::default();
+        selected.complete_into(Err(Error::DriverShutdown), &mut actions);
+        assert_eq!(wakes.0.load(Ordering::Acquire), cancellation_wakes);
+        assert!(matches!(
+            &*lock_unpoison(&request.observer.result),
+            TakeOnceResult::Ready(Err(Error::DriverShutdown))
+        ));
+        actions.publish();
+        assert_eq!(wakes.0.load(Ordering::Acquire), cancellation_wakes + 1);
+    }
+
+    #[test]
+    fn accept_success_and_listener_close_publish_only_after_state_commit() {
+        let (engine, driver) =
+            super::super::super::test_engine_pair(super::super::super::CompletionMode::Polling);
+        let connection = engine
+            .shared
+            .test_driver
+            .install_idle_connections(&engine.shared, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let request = AcceptRequest::test_only();
+        let accept_wakes = Arc::new(CountWake(AtomicUsize::new(0)));
+        request
+            .observer
+            .waker
+            .register(&Waker::from(Arc::clone(&accept_wakes)));
+        let mut actions = crate::v2::engine::reactor::ReactorActions::default();
+        request.complete_success_into(connection, &mut actions);
+        assert!(matches!(
+            &*lock_unpoison(&request.observer.result),
+            TakeOnceResult::Ready(Ok(_))
+        ));
+        assert_eq!(accept_wakes.0.load(Ordering::Acquire), 0);
+
+        let listener = ListenerState::test_only(1);
+        let close = listener.close_state();
+        let before_close = actions.len();
+        listener.finish_close_into(None, &mut actions);
+        assert!(close.outcome().unwrap().is_success());
+        assert_eq!(actions.len(), before_close + 1);
+
+        actions.publish();
+        assert_eq!(accept_wakes.0.load(Ordering::Acquire), 1);
+        drop(request.take_result_for_test());
+        drop(driver);
+    }
 
     #[test]
     fn waiter_observers_do_not_retain_listen_or_accept_records() {

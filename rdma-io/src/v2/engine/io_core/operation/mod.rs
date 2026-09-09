@@ -71,8 +71,7 @@ pub use future::RdmaOperation;
 #[cfg(test)]
 use future::publish_after_post_guards;
 pub(in crate::v2::engine) use reclamation::QpReclaimCapability;
-#[cfg(test)]
-use state::OperationState;
+pub(in crate::v2::engine) use state::OperationState;
 #[cfg(test)]
 use state::{CompletionDisposition, OperationLifecycle};
 #[cfg(test)]
