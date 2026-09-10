@@ -128,26 +128,22 @@ impl CommandIngress {
         let listener_slot_available = session.cm.listener_slot_available();
         let command = if actions.remaining() != 0 {
             let mut queues = lock_unpoison(&self.queues);
-            let mut selected = None;
-            for offset in 0..5 {
-                let class = (queues.next_class + offset) % 5;
-                let required_actions = if class == 3 && terminal_error.is_none() {
-                    // Starting an operation can synchronously consume an early
-                    // CQE (event + operation wake + close wake) before the
-                    // command-completion wake is detached.
-                    4
-                } else {
-                    1
-                };
-                if !actions.can_accept(required_actions) {
-                    continue;
-                }
-                selected = match class {
+            let ordinary_action = actions.can_accept(1);
+            let operation_action = actions.can_accept(if terminal_error.is_none() { 4 } else { 1 });
+            let ready = [
+                ordinary_action && !queues.connect.is_empty(),
+                ordinary_action
+                    && (listener_slot_available || terminal_error.is_some())
+                    && !queues.listen.is_empty(),
+                ordinary_action && !queues.accept.is_empty(),
+                operation_action && !queues.operation.is_empty(),
+                ordinary_action && !queues.protocol.is_empty(),
+            ];
+            queues
+                .select_ready_class(ready)
+                .and_then(|class| match class {
                     0 => queues.connect.pop_front().map(ReadyCommand::Session),
-                    1 if listener_slot_available || terminal_error.is_some() => {
-                        queues.listen.pop_front().map(ReadyCommand::Session)
-                    }
-                    1 => None,
+                    1 => queues.listen.pop_front().map(ReadyCommand::Session),
                     2 => queues
                         .accept
                         .pop_front()
@@ -158,13 +154,7 @@ impl CommandIngress {
                         .map(|(command, permit)| ReadyCommand::Operation(command, permit)),
                     4 => queues.protocol.pop_front().map(ReadyCommand::Protocol),
                     _ => unreachable!(),
-                };
-                if selected.is_some() {
-                    queues.next_class = (class + 1) % 5;
-                    break;
-                }
-            }
-            selected
+                })
         } else {
             None
         };

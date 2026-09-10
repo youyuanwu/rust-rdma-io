@@ -296,6 +296,53 @@ mod tests {
     }
 
     #[test]
+    fn close_control_requests_notify_only_on_first_insertion() {
+        let (engine, mut driver) = test_engine_pair_with_capacity(CompletionMode::Polling, 1);
+        engine.shared.work_signal.take();
+        let connection = engine
+            .shared
+            .test_driver
+            .install_idle_connections(&mut driver.reactor.session, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let connection_token = connection.session_token();
+        engine
+            .shared
+            .commands
+            .request_connection_close(&engine.shared.session, connection_token);
+        assert_eq!(engine.shared.work_signal.take(), REACTOR_WORK);
+        engine
+            .shared
+            .commands
+            .request_connection_close(&engine.shared.session, connection_token);
+        assert_eq!(engine.shared.work_signal.take(), 0);
+
+        let (_listener, listener) = driver
+            .reactor
+            .session
+            .cm
+            .test_listener(&driver.reactor.session.manager, 1);
+        let admission = driver
+            .reactor
+            .session
+            .cm
+            .listener_admission_for_test(listener);
+        engine
+            .shared
+            .commands
+            .request_listener_close(&engine.shared.session, listener, &admission);
+        assert_eq!(engine.shared.work_signal.take(), REACTOR_WORK);
+        engine
+            .shared
+            .commands
+            .request_listener_close(&engine.shared.session, listener, &admission);
+        assert_eq!(engine.shared.work_signal.take(), 0);
+        drop(connection);
+        drop(driver);
+    }
+
+    #[test]
     fn connection_drop_propagates_the_distinct_overflow_panic() {
         let (engine, mut driver) = test_engine_pair_with_capacity(CompletionMode::Polling, 1);
         let connection = engine

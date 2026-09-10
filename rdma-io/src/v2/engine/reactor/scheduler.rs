@@ -5,8 +5,7 @@ use std::collections::VecDeque;
 /// Independently budgeted reactor sources.
 ///
 /// The variants describe scheduling responsibility only. Provider and
-/// lifecycle state remains in the existing authoritative owners until its
-/// planned consolidation phase.
+/// lifecycle state remains in the existing authoritative owners.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(super) enum ReactorSource {
     // Command ingress.

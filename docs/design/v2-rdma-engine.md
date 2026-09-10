@@ -165,8 +165,10 @@ authorities
 Frontend futures perform validation and bounded admission on first poll. A
 successfully admitted command is executed only by a later driver poll.
 Ordinary work uses distinct bounded connect, listen, and operation lanes.
-Close, cancellation, listener close, and shutdown use generational coalesced
-control state so cleanup cannot be blocked behind ordinary capacity
+Connection close, operation cancellation, listener close, and listener work
+use four bounded generational coalesced queues so cleanup cannot be blocked
+behind ordinary capacity. Shutdown remains a separate atomically coalesced
+request
 ([reactor/command/controls.rs](../../rdma-io/src/v2/engine/reactor/command/controls.rs),
 [reactor/command/service.rs](../../rdma-io/src/v2/engine/reactor/command/service.rs)).
 

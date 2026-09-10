@@ -27,13 +27,13 @@ use super::connection::{
     ConnectionCmRoute, ConnectionReservation, FailedConnectionInstallResources, SharedCmId,
     VerbsConnectionResources, install_reserved_connection, reserve_connection,
 };
-#[cfg(test)]
-use super::listener::RdmaListenerConfig;
 use super::listener::{
     AcceptRequest, ChildAdmission, InboundRejectReason, IncomingChild, ListenRequest,
     ListenerAction, ListenerRegistry, RdmaListener, empty_connection_setup,
     run_setup_before_establish, with_validated_listener_backlog,
 };
+#[cfg(test)]
+use super::listener::{ListenerAdmission, RdmaListenerConfig};
 use super::registry::ConnectionRegistry;
 use super::{SessionContext, SessionFrontend};
 use crate::cm::CmId;
@@ -260,6 +260,17 @@ impl CmState {
         let token = self.reserve_test_listener_slot(backlog);
         let listener = RdmaListener::from_state(manager, self.listeners.get(token).unwrap());
         (listener, token)
+    }
+
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn listener_admission_for_test(
+        &self,
+        token: ListenerToken,
+    ) -> Arc<ListenerAdmission> {
+        self.listeners
+            .get(token)
+            .expect("test listener exists")
+            .admission()
     }
 
     #[cfg(test)]

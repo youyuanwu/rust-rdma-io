@@ -38,7 +38,48 @@ pub(super) struct CommandQueues {
     pub(super) next_class: usize,
 }
 
+impl CommandQueues {
+    pub(super) fn select_ready_class(&mut self, ready: [bool; 5]) -> Option<usize> {
+        for offset in 0..ready.len() {
+            let class = (self.next_class + offset) % ready.len();
+            if ready[class] {
+                self.next_class = (class + 1) % ready.len();
+                return Some(class);
+            }
+        }
+        None
+    }
+}
+
 pub(super) enum ProtocolQueueEntry {
     Command(ProtocolCommand, OwnedSemaphorePermit),
     Publication(crate::v2::engine::reactor::DeferredProtocolActions),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CommandQueues;
+
+    #[test]
+    fn five_class_cursor_rotates_and_skips_blocked_classes() {
+        let mut queues = CommandQueues::default();
+        assert_eq!(queues.select_ready_class([true; 5]), Some(0));
+        assert_eq!(queues.select_ready_class([true; 5]), Some(1));
+        assert_eq!(queues.select_ready_class([true; 5]), Some(2));
+        assert_eq!(queues.select_ready_class([true; 5]), Some(3));
+        assert_eq!(queues.select_ready_class([true; 5]), Some(4));
+        assert_eq!(queues.select_ready_class([true; 5]), Some(0));
+
+        let mut queues = CommandQueues::default();
+        assert_eq!(queues.select_ready_class([true; 5]), Some(0));
+        assert_eq!(
+            queues.select_ready_class([true, false, true, true, true]),
+            Some(2)
+        );
+        assert_eq!(
+            queues.select_ready_class([true, false, false, false, false]),
+            Some(0)
+        );
+        assert_eq!(queues.next_class, 1);
+    }
 }
