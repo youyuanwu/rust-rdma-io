@@ -187,19 +187,28 @@ pub mod test_helpers {
 
     fn is_transient_v2_listener_message(message: &str) -> bool {
         const PREFIX: &str = "listen on ";
-        const BACKLOG: &str = " with requested kernel backlog 2147483647: ";
+        const BACKLOG: &str = " with backlog ";
 
-        let Some((address, source)) = message
+        let expected_source = std::io::Error::from_raw_os_error(98).to_string();
+        let Some((listener, source)) = message
             .strip_prefix(PREFIX)
-            .and_then(|message| message.split_once(BACKLOG))
+            .and_then(|message| message.rsplit_once(": "))
         else {
+            return false;
+        };
+        let Some((address, backlog_token)) = listener.split_once(BACKLOG) else {
             return false;
         };
         let Ok(address) = address.parse::<std::net::SocketAddr>() else {
             return false;
         };
-        let expected_source = std::io::Error::from_raw_os_error(98).to_string();
-        message == format!("{PREFIX}{address}{BACKLOG}{expected_source}")
+        let Ok(backlog) = backlog_token.parse::<i32>() else {
+            return false;
+        };
+        if backlog <= 0 || backlog.to_string() != backlog_token {
+            return false;
+        }
+        message == format!("{PREFIX}{address}{BACKLOG}{backlog}: {expected_source}")
             && source == expected_source
     }
 
@@ -1444,7 +1453,7 @@ mod tests {
             );
         }
         let listener_busy = format!(
-            "listen on 0.0.0.0:0 with requested kernel backlog 2147483647: {}",
+            "listen on 0.0.0.0:0 with backlog 8: {}",
             std::io::Error::from_raw_os_error(98)
         );
         let error = rdma_io::v2::Error::Verbs(std::io::Error::new(
@@ -1502,6 +1511,10 @@ mod tests {
 
     #[test]
     fn v2_transient_cm_error_requires_exact_setup_status_and_error_type() {
+        let addr_in_use = std::io::Error::from_raw_os_error(98);
+        let listener_addr_in_use = rdma_io::v2::Error::Verbs(std::io::Error::other(format!(
+            "listen on 0.0.0.0:0 with backlog 8: {addr_in_use}"
+        )));
         let addr_error = rdma_io::v2::Error::Verbs(std::io::Error::other(
             "RDMA CM AddrError failed with status -110 for id=0x1 listen_id=0x0",
         ));
@@ -1532,6 +1545,16 @@ mod tests {
         assert!(is_transient_v2_engine_cm_setup_error(
             V2EngineCmSetupStage::Listen,
             &rdma_io::v2::Error::Verbs(std::io::Error::from_raw_os_error(98))
+        ));
+        assert!(is_transient_v2_engine_cm_setup_error(
+            V2EngineCmSetupStage::Listen,
+            &listener_addr_in_use,
+        ));
+        assert!(!is_transient_v2_engine_cm_setup_error(
+            V2EngineCmSetupStage::Listen,
+            &rdma_io::v2::Error::Verbs(std::io::Error::other(format!(
+                "listen on 0.0.0.0:0 with backlog 0: {addr_in_use}"
+            ))),
         ));
     }
 

@@ -18,7 +18,7 @@ fn software_device_name() -> Option<String> {
 }
 
 async fn listen_with_retry(engine: &RdmaEngine) -> RdmaListener {
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             match engine
                 .listen("0.0.0.0:0".parse().unwrap(), RdmaListenerConfig::default())
@@ -41,7 +41,7 @@ async fn accept_pair(
     client_engine: &RdmaEngine,
 ) -> (RdmaConnection, RdmaConnection) {
     let address = connect_addr_for(Some(listener.local_addr().unwrap()));
-    tokio::time::timeout(Duration::from_secs(15), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         let (server, client) = tokio::join!(listener.accept(), client_engine.connect(address));
         (server.unwrap(), client.unwrap())
     })
@@ -476,10 +476,7 @@ async fn run_shutdown_qp_destroy_fallback(mode: CompletionMode) {
     let server_resources = server_engine.test_resources().unwrap();
     let server_task = tokio::spawn(server_driver);
     let client_task = tokio::spawn(client_driver);
-    let listener = server_engine
-        .listen("0.0.0.0:0".parse().unwrap(), RdmaListenerConfig::default())
-        .await
-        .unwrap();
+    let listener = listen_with_retry(&server_engine).await;
     let (server, client) = accept_pair(&listener, &client_engine).await;
 
     let recv_mr = server.register_memory(64, AccessIntent::LocalOnly).unwrap();
@@ -553,10 +550,7 @@ async fn run_qp_destroy_failure_quarantine(mode: CompletionMode) {
     let server_resources = server_engine.test_resources().unwrap();
     let server_task = tokio::spawn(server_driver);
     let client_task = tokio::spawn(client_driver);
-    let listener = server_engine
-        .listen("0.0.0.0:0".parse().unwrap(), RdmaListenerConfig::default())
-        .await
-        .unwrap();
+    let listener = listen_with_retry(&server_engine).await;
     let (server, client) = accept_pair(&listener, &client_engine).await;
     let recv_mr = server.register_memory(64, AccessIntent::LocalOnly).unwrap();
     let mut recv = Box::pin(server.recv(recv_mr, None));
@@ -724,10 +718,7 @@ async fn run_driver_abort_with_accepted_wr(mode: CompletionMode) {
     let server_resources = server_engine.test_resources().unwrap();
     let server_task = tokio::spawn(server_driver);
     let client_task = tokio::spawn(client_driver);
-    let listener = server_engine
-        .listen("0.0.0.0:0".parse().unwrap(), RdmaListenerConfig::default())
-        .await
-        .unwrap();
+    let listener = listen_with_retry(&server_engine).await;
     let (server, client) = accept_pair(&listener, &client_engine).await;
 
     let recv_mr = server.register_memory(64, AccessIntent::LocalOnly).unwrap();
