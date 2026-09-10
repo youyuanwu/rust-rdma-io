@@ -1,5 +1,7 @@
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
+#[cfg(any(test, feature = "test-hooks"))]
+use std::sync::Weak;
 
 use tokio::io::{Interest, unix::AsyncFd};
 
@@ -13,11 +15,11 @@ use super::config::{CompletionMode, EngineConfig, ProviderLimits};
 #[cfg(panic = "unwind")]
 use crate::v2::runtime::{RuntimeProbe, probe_runtime};
 
-pub(super) struct EngineResources {
-    // I/O progress is extracted into the driver before polling begins.
-    io_progress: Option<IoProgressResources>,
-    // Rust drops fields in declaration order. Keep the Tokio adapter before
-    // the CM channel owner whose raw descriptor it registers.
+pub(super) struct EngineReactorResources {
+    // Rust drops fields in declaration order. Keep the Tokio adapters before
+    // the provider owners whose raw descriptors they register, then keep the
+    // canonical CQ -> PD -> CM channel -> anchored context root order.
+    pub(super) cq_async_fd: Option<AsyncFd<RawFd>>,
     pub(super) cm_async_fd: Option<AsyncFd<RawFd>>,
     pub(super) cq: Arc<Cq>,
     pub(super) pd: Pd,
@@ -25,49 +27,17 @@ pub(super) struct EngineResources {
     pub(super) context: Context,
 }
 
-/// CQ resources owned by the bounded I/O progress component.
-pub(super) struct IoProgressResources {
-    // Keep the Tokio adapter before the CQ owner whose descriptor it registers.
-    pub(super) cq_async_fd: Option<AsyncFd<RawFd>>,
-    pub(super) cq: Arc<Cq>,
-}
-
-/// CM and root resources owned by the bounded session progress component.
-pub(super) struct SessionProgressResources {
-    engine: EngineResources,
-}
-
-#[derive(Clone)]
-pub(super) struct EngineResourceRefs {
-    #[allow(dead_code, reason = "retains the shared CQ for connection descendants")]
-    pub(super) cq: Arc<Cq>,
-    pub(super) pd: Pd,
-    #[allow(
-        dead_code,
-        reason = "keeps the shared CM fd alive until after CQ and PD teardown"
-    )]
-    pub(super) cm_event_channel: Arc<EventChannel>,
-    #[allow(
-        dead_code,
-        reason = "retains the anchored context for connection descendants"
-    )]
-    pub(super) context: Context,
-}
-
 #[cfg(any(test, feature = "test-hooks"))]
 #[derive(Clone)]
-pub(super) struct TestResourceRefs {
-    pub(super) cq: Arc<Cq>,
-    pub(super) pd: Pd,
-    #[allow(
-        dead_code,
-        reason = "keeps canonical root order while safe test leases are live"
-    )]
-    pub(super) cm_event_channel: Arc<EventChannel>,
-    pub(super) context: Context,
+/// Resource-free test observation: weak identities never extend provider lifetime.
+pub(super) struct TestResourceObservers {
+    pub(super) cq: Weak<Cq>,
+    pub(super) pd: Weak<crate::pd::ProtectionDomain>,
+    pub(super) cm_event_channel: Weak<EventChannel>,
+    pub(super) context: Weak<crate::device::Context>,
 }
 
-impl EngineResources {
+impl EngineReactorResources {
     pub(super) fn build(config: &EngineConfig) -> Result<(Self, ProviderLimits)> {
         let device_list = RdmaCmDeviceList::new().map_err(Error::from_v1)?;
         let inner_context = device_list
@@ -119,10 +89,7 @@ impl EngineResources {
 
         Ok((
             Self {
-                io_progress: Some(IoProgressResources {
-                    cq_async_fd,
-                    cq: Arc::clone(&cq),
-                }),
+                cq_async_fd,
                 cm_async_fd,
                 cq,
                 pd,
@@ -133,30 +100,19 @@ impl EngineResources {
         ))
     }
 
-    pub(super) fn connection_resource_refs(&self) -> EngineResourceRefs {
-        EngineResourceRefs {
-            cq: Arc::clone(&self.cq),
-            pd: self.pd.clone(),
-            cm_event_channel: Arc::clone(&self.cm_event_channel),
-            context: self.context.clone(),
-        }
-    }
-
-    pub(super) fn take_io_progress_resources(&mut self) -> IoProgressResources {
-        self.io_progress
-            .take()
-            .expect("I/O progress resources are taken exactly once")
-    }
-
-    pub(super) fn into_session_progress(self) -> SessionProgressResources {
-        assert!(
-            self.io_progress.is_none(),
-            "I/O progress resources must be extracted before session ownership transfer"
-        );
-        SessionProgressResources { engine: self }
+    pub(super) fn memory_registrar(&self) -> super::io::MemoryRegistrar {
+        super::io::MemoryRegistrar::from_pd(Some(self.pd.clone()))
     }
 
     pub(super) fn drop_readiness_adapters(&mut self) {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(adapter) = self.cq_async_fd.as_ref() {
+            crate::test_support::destruction::record(
+                crate::test_support::destruction::DestructionKind::CqReadinessAdapter,
+                *adapter.get_ref() as usize,
+            );
+        }
+        self.cq_async_fd.take();
         #[cfg(any(test, feature = "test-hooks"))]
         if let Some(adapter) = self.cm_async_fd.as_ref() {
             crate::test_support::destruction::record(
@@ -168,36 +124,13 @@ impl EngineResources {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn test_resource_refs(&self) -> TestResourceRefs {
-        TestResourceRefs {
-            cq: Arc::clone(&self.cq),
-            pd: self.pd.clone(),
-            cm_event_channel: Arc::clone(&self.cm_event_channel),
-            context: self.context.clone(),
+    pub(super) fn test_resource_observers(&self) -> TestResourceObservers {
+        TestResourceObservers {
+            cq: Arc::downgrade(&self.cq),
+            pd: Arc::downgrade(self.pd.raw_pd()),
+            cm_event_channel: Arc::downgrade(&self.cm_event_channel),
+            context: Arc::downgrade(self.context.raw_context()),
         }
-    }
-}
-
-impl IoProgressResources {
-    pub(super) fn drop_readiness_adapter(&mut self) {
-        #[cfg(any(test, feature = "test-hooks"))]
-        if let Some(adapter) = self.cq_async_fd.as_ref() {
-            crate::test_support::destruction::record(
-                crate::test_support::destruction::DestructionKind::CqReadinessAdapter,
-                *adapter.get_ref() as usize,
-            );
-        }
-        self.cq_async_fd.take();
-    }
-}
-
-impl SessionProgressResources {
-    pub(super) fn engine(&self) -> &EngineResources {
-        &self.engine
-    }
-
-    pub(super) fn drop_readiness_adapter(&mut self) {
-        self.engine.drop_readiness_adapters();
     }
 }
 

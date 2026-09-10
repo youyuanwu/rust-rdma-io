@@ -14,149 +14,205 @@ mod shutdown;
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
-#[cfg(test)]
-use super::super::SetupSummary;
-use super::super::lifecycle::{MemoizedTerminalResult, TakeOnceResult};
-use super::super::registry::{
-    ConnectionToken, Lookup, PagedRegistry, RegistryToken, lock_unpoison,
-};
-use super::super::resources::EngineResources;
+use super::super::lifecycle::MemoizedTerminalResult;
+use super::super::registry::{ConnectionToken, ListenerToken, Lookup};
+use super::super::resources::EngineReactorResources;
 use super::super::{ConnectionSetup, RdmaConnection, RdmaConnectionConfig};
-use super::SessionManager;
 use super::connection::{
-    ConnectionCmRoute, ConnectionReservation, ConnectionState, FailedConnectionInstallResources,
-    SharedCmId, VerbsConnectionResources, WorkRequestPoster, install_reserved_connection,
-    reserve_connection,
-};
-use super::listener::{
-    AcceptRequest, InboundRejectReason, IncomingChild, KERNEL_LISTEN_BACKLOG_REQUEST,
-    ListenRequest, ListenerAction, ListenerState, RdmaListener, empty_connection_setup,
-    run_setup_before_establish,
+    ConnectionCmRoute, ConnectionReservation, FailedConnectionInstallResources, SharedCmId,
+    VerbsConnectionResources, install_reserved_connection, reserve_connection,
 };
 #[cfg(test)]
-use crate::cm::CmEventType;
+use super::listener::RdmaListenerConfig;
+use super::listener::{
+    AcceptRequest, ChildAdmission, InboundRejectReason, IncomingChild, ListenRequest,
+    ListenerAction, ListenerRegistry, RdmaListener, empty_connection_setup,
+    run_setup_before_establish, with_validated_listener_backlog,
+};
+use super::registry::ConnectionRegistry;
+use super::{SessionFrontend, SessionManager};
 use crate::cm::CmId;
 use crate::v2::error::{Error, Result};
 use crate::v2::qp::QpBuilder;
 
 #[cfg(test)]
 use event::CmDispatchRoute;
-use event::{CmEventReject, CmEventSnapshot, EventDisposition, is_failure_event};
-#[cfg(test)]
-use outbound::ConnectWaiter;
-use outbound::OutboundRequest;
-pub(in crate::v2::engine) use outbound::{connect, connect_with_setup};
-pub(in crate::v2::engine) use shutdown::CmShutdownCursor;
+use event::{CmEventReject, CmEventSnapshot, EventDisposition, PendingCmEvent, is_failure_event};
+pub(in crate::v2::engine) use outbound::{OutboundRequest, connect, connect_with_setup};
+pub(in crate::v2::engine) use shutdown::{CmShutdownClass, CmShutdownCursor, CmShutdownSnapshot};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct CmRouteToken {
-    slot: u32,
-    generation: u32,
-}
-
-impl CmRouteToken {
-    const fn encode(self) -> u64 {
-        ((self.generation as u64) << 32) | self.slot as u64
-    }
-
-    const fn decode(value: u64) -> Self {
-        Self {
-            slot: value as u32,
-            generation: (value >> 32) as u32,
-        }
-    }
-}
-
-impl RegistryToken for CmRouteToken {
-    fn from_parts(slot: u32, generation: u32) -> Self {
-        Self { slot, generation }
-    }
-
-    fn slot(self) -> u32 {
-        self.slot
-    }
-
-    fn generation(self) -> u32 {
-        self.generation
-    }
-}
+type CmRouteToken = ConnectionToken;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ContextRoute {
     Outbound { token: CmRouteToken, raw_id: usize },
     Inbound { token: CmRouteToken, raw_id: usize },
-    Listener { token: u64, raw_id: usize },
+    Listener { token: ListenerToken, raw_id: usize },
+}
+
+#[derive(Clone, Copy)]
+pub(in crate::v2::engine) struct CmSoftwareSnapshot {
+    remaining: [usize; 5],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::v2::engine) enum CmSoftwareClass {
+    Cancellation,
+    Retirement,
+    OutboundStart,
+    ListenStart,
+    ListenerWork,
+}
+
+impl CmSoftwareClass {
+    #[cfg(test)]
+    pub(in crate::v2::engine) const ALL: [Self; 5] = [
+        Self::Cancellation,
+        Self::Retirement,
+        Self::OutboundStart,
+        Self::ListenStart,
+        Self::ListenerWork,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Cancellation => 0,
+            Self::Retirement => 1,
+            Self::OutboundStart => 2,
+            Self::ListenStart => 3,
+            Self::ListenerWork => 4,
+        }
+    }
+}
+
+impl CmSoftwareSnapshot {
+    pub(in crate::v2::engine) fn count(self, class: CmSoftwareClass) -> usize {
+        self.remaining[class.index()]
+    }
 }
 
 pub(in crate::v2::engine) struct CmState {
-    routes: PagedRegistry<CmRouteToken, Arc<OutboundRoute>>,
-    inbound_routes: PagedRegistry<CmRouteToken, Arc<InboundRoute>>,
-    context_routes: Mutex<HashMap<usize, ContextRoute>>,
-    pending: Mutex<VecDeque<Arc<OutboundRequest>>>,
-    pending_listens: Mutex<VecDeque<Arc<ListenRequest>>>,
-    cancellations: Mutex<VecDeque<Arc<OutboundRequest>>>,
-    listener_work: Mutex<VecDeque<Arc<ListenerState>>>,
-    listeners: Mutex<HashMap<u64, Arc<ListenerState>>>,
-    listener_ids: Mutex<HashMap<usize, u64>>,
-    next_listener_token: AtomicU64,
-    retirements: Mutex<VecDeque<ConnectionToken>>,
-    cm_destructions: Mutex<VecDeque<PendingCmDestruction>>,
-    setup_rollback_quarantines: Mutex<Vec<RetainedSetupRollback>>,
-    software_next_class: AtomicUsize,
-    outbound_setup_active: AtomicBool,
-    shutting_down: AtomicBool,
+    context_routes: HashMap<usize, ContextRoute>,
+    pending_listens: VecDeque<(ListenerToken, Arc<ListenRequest>)>,
+    listener_work: VecDeque<ListenerToken>,
+    listeners: ListenerRegistry,
+    cm_destructions: VecDeque<PendingCmDestruction>,
+    non_listener_destructions: usize,
+    quarantined_cm_owners: Vec<SharedCmId>,
+    pending_event: Option<PendingCmEvent>,
+    shutting_down: bool,
 }
 
 impl CmState {
     pub(in crate::v2::engine) fn new(capacity: usize) -> Result<Self> {
         Ok(Self {
-            routes: PagedRegistry::new(capacity)?,
-            inbound_routes: PagedRegistry::new(capacity)?,
-            context_routes: Mutex::new(HashMap::new()),
-            pending: Mutex::new(VecDeque::new()),
-            pending_listens: Mutex::new(VecDeque::new()),
-            cancellations: Mutex::new(VecDeque::new()),
-            listener_work: Mutex::new(VecDeque::new()),
-            listeners: Mutex::new(HashMap::new()),
-            listener_ids: Mutex::new(HashMap::new()),
-            next_listener_token: AtomicU64::new(1),
-            retirements: Mutex::new(VecDeque::new()),
-            cm_destructions: Mutex::new(VecDeque::new()),
-            setup_rollback_quarantines: Mutex::new(Vec::new()),
-            software_next_class: AtomicUsize::new(0),
-            outbound_setup_active: AtomicBool::new(false),
-            shutting_down: AtomicBool::new(false),
+            context_routes: HashMap::new(),
+            pending_listens: VecDeque::new(),
+            listener_work: VecDeque::new(),
+            listeners: ListenerRegistry::new(capacity)?,
+            cm_destructions: VecDeque::new(),
+            non_listener_destructions: 0,
+            quarantined_cm_owners: Vec::new(),
+            pending_event: None,
+            shutting_down: false,
         })
     }
 
-    fn enqueue(&self, request: Arc<OutboundRequest>) {
-        lock_unpoison(&self.pending).push_back(request);
+    pub(in crate::v2::engine) fn reserve_listener(
+        &mut self,
+        request: &ListenRequest,
+    ) -> Result<ListenerToken> {
+        self.listeners
+            .reserve(request.address, request.config.clone())
     }
 
-    pub(in crate::v2::engine) fn enqueue_listen(&self, request: Arc<ListenRequest>) {
-        lock_unpoison(&self.pending_listens).push_back(request);
+    pub(in crate::v2::engine) fn listener_slot_available(&self) -> bool {
+        self.listeners.has_capacity()
     }
 
-    pub(in crate::v2::engine) fn enqueue_listener_work(&self, listener: &Arc<ListenerState>) {
-        if listener.try_enqueue_work() {
-            lock_unpoison(&self.listener_work).push_back(Arc::clone(listener));
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn listener_count(&self) -> usize {
+        self.listeners.live()
+    }
+
+    pub(in crate::v2::engine) fn enqueue_listen(
+        &mut self,
+        token: ListenerToken,
+        request: Arc<ListenRequest>,
+    ) {
+        self.pending_listens.push_back((token, request));
+    }
+
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn pending_listen_addresses(&self) -> Vec<std::net::SocketAddr> {
+        self.pending_listens
+            .iter()
+            .map(|(_, request)| request.address)
+            .collect()
+    }
+
+    pub(in crate::v2::engine) fn enqueue_listener_work(&mut self, token: ListenerToken) {
+        let enqueue = self
+            .listeners
+            .get_mut(token)
+            .is_some_and(|listener| listener.try_enqueue_work());
+        if enqueue {
+            self.listener_work.push_back(token);
         }
     }
 
-    fn defer_cm_id(&self, cm_id: SharedCmId) {
-        lock_unpoison(&self.cm_destructions).push_back(PendingCmDestruction::Route(cm_id));
+    pub(in crate::v2::engine) fn request_listener_close(&mut self, token: ListenerToken) -> bool {
+        let changed = self
+            .listeners
+            .get_mut(token)
+            .is_some_and(|listener| listener.request_close());
+        if changed {
+            self.enqueue_listener_work(token);
+        }
+        changed
+    }
+
+    pub(in crate::v2::engine) fn admit_accept(
+        &mut self,
+        token: ListenerToken,
+        request: Arc<AcceptRequest>,
+    ) -> Result<()> {
+        self.listeners
+            .get_mut(token)
+            .ok_or(Error::TransportClosed)?
+            .register_waiter(request)
+    }
+
+    fn defer_cm_id(&mut self, cm_id: SharedCmId) {
+        self.push_cm_destruction_back(PendingCmDestruction::Route(cm_id));
+    }
+
+    fn quarantine_cm_id(&mut self, cm_id: SharedCmId) {
+        self.quarantined_cm_owners.push(cm_id);
+    }
+
+    fn defer_listener_cm_id(&mut self, listener: ListenerToken, cm_id: SharedCmId) {
+        if let Some(entry) = self.listeners.get_mut(listener) {
+            entry.mark_cm_destruction_pending();
+        }
+        self.push_cm_destruction_back(PendingCmDestruction::Listener { cm_id, listener });
     }
 
     #[cfg(test)]
     pub(in crate::v2::engine) fn defer_test_listener_destruction(
-        &self,
-        listener: Arc<ListenerState>,
+        &mut self,
+        listener: ListenerToken,
         destroy_count: Arc<AtomicUsize>,
     ) {
-        lock_unpoison(&self.cm_destructions).push_back(PendingCmDestruction::Test {
+        if let Some(entry) = self.listeners.get_mut(listener) {
+            entry.mark_cm_destruction_pending();
+        }
+        self.push_cm_destruction_back(PendingCmDestruction::Test {
             destroy_count,
             target: TestCmDestruction::Listener {
                 listener,
@@ -165,48 +221,56 @@ impl CmState {
         });
     }
 
-    fn enqueue_cancellation(&self, request: Arc<OutboundRequest>) {
-        if request.try_enqueue_cancellation() {
-            lock_unpoison(&self.cancellations).push_back(request);
-        }
-    }
-
-    pub(in crate::v2::engine) fn enqueue_retirement(&self, token: ConnectionToken) {
-        lock_unpoison(&self.retirements).push_back(token);
-    }
-
-    fn mark_request_delivered(&self, request: &Arc<OutboundRequest>) {
-        let encoded = request.route_token.load(Ordering::Acquire);
-        if encoded == 0 {
-            return;
-        }
-        if let Lookup::Occupied(route) = self.routes.lookup_cloned(CmRouteToken::decode(encoded)) {
-            route.mark_delivered(request);
-        }
-    }
-
-    pub(in crate::v2::engine) fn mark_accept_delivered(
-        &self,
-        listener: &Arc<ListenerState>,
-        request: &Arc<AcceptRequest>,
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn defer_test_route_destruction(
+        &mut self,
+        destroy_count: Arc<AtomicUsize>,
     ) {
-        let encoded = request.route_token();
-        if encoded == 0 {
-            return;
-        }
-        if let Lookup::Occupied(route) = self
-            .inbound_routes
-            .lookup_cloned(CmRouteToken::decode(encoded))
-        {
-            route.mark_delivered(request);
-        }
-        if listener.finish_selected_route(encoded) {
-            self.enqueue_listener_work(listener);
+        self.push_cm_destruction_back(PendingCmDestruction::Test {
+            destroy_count,
+            target: TestCmDestruction::Route,
+        });
+    }
+
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn reserve_test_listener_slot(
+        &mut self,
+        backlog: usize,
+    ) -> ListenerToken {
+        let address = "127.0.0.1:1".parse().unwrap();
+        let token = self
+            .listeners
+            .reserve(address, RdmaListenerConfig::default().backlog(backlog))
+            .unwrap();
+        assert!(self.listeners.activate_identity_for_test(
+            token,
+            address,
+            token.encode() as usize,
+            token.encode() as usize
+        ));
+        token
+    }
+
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn test_listener(
+        &mut self,
+        manager: &SessionManager,
+        backlog: usize,
+    ) -> (RdmaListener, ListenerToken) {
+        let token = self.reserve_test_listener_slot(backlog);
+        let listener = RdmaListener::from_state(manager, self.listeners.get(token).unwrap());
+        (listener, token)
+    }
+
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn release_test_listener(&mut self, token: ListenerToken) {
+        if let Some(listener) = self.listeners.release(token, true) {
+            listener.admission().close();
         }
     }
 
-    fn insert_context_route(&self, context_key: usize, route: ContextRoute) -> bool {
-        match lock_unpoison(&self.context_routes).entry(context_key) {
+    fn insert_context_route(&mut self, context_key: usize, route: ContextRoute) -> bool {
+        match self.context_routes.entry(context_key) {
             Entry::Vacant(entry) => {
                 entry.insert(route);
                 true
@@ -215,32 +279,62 @@ impl CmState {
         }
     }
 
-    fn insert_listener_identity(
-        &self,
-        token: u64,
+    fn activate_listener_identity(
+        &mut self,
+        token: ListenerToken,
+        local_addr: std::net::SocketAddr,
+        cm_id: SharedCmId,
         raw_id: usize,
-        listener: Arc<ListenerState>,
+        context_key: usize,
+    ) -> std::result::Result<(), SharedCmId> {
+        if self.context_routes.contains_key(&context_key)
+            || self.listeners.token_for_raw(raw_id).is_some()
+            || self.listeners.get(token).is_none()
+        {
+            return Err(cm_id);
+        }
+        self.listeners
+            .activate(token, local_addr, cm_id, raw_id, context_key)?;
+        self.context_routes
+            .insert(context_key, ContextRoute::Listener { token, raw_id });
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn activate_listener_identity_for_test(
+        &mut self,
+        token: ListenerToken,
+        local_addr: std::net::SocketAddr,
+        raw_id: usize,
+        context_key: usize,
     ) -> bool {
-        let mut listeners = lock_unpoison(&self.listeners);
-        let mut listener_ids = lock_unpoison(&self.listener_ids);
-        let Entry::Vacant(listener_entry) = listeners.entry(token) else {
+        if self.context_routes.contains_key(&context_key)
+            || self.listeners.token_for_raw(raw_id).is_some()
+            || self.listeners.get(token).is_none()
+        {
             return false;
-        };
-        let Entry::Vacant(identity_entry) = listener_ids.entry(raw_id) else {
+        }
+        if !self
+            .listeners
+            .activate_identity_for_test(token, local_addr, raw_id, context_key)
+        {
             return false;
-        };
-        listener_entry.insert(listener);
-        identity_entry.insert(token);
+        }
+        self.context_routes
+            .insert(context_key, ContextRoute::Listener { token, raw_id });
         true
     }
 
-    pub(in crate::v2::engine) fn has_software_work(&self) -> bool {
-        let pending = !lock_unpoison(&self.pending).is_empty();
-        let pending_listens = !lock_unpoison(&self.pending_listens).is_empty();
-        let cancellations = !lock_unpoison(&self.cancellations).is_empty();
-        let listener_work = !lock_unpoison(&self.listener_work).is_empty();
-        let retirements = !lock_unpoison(&self.retirements).is_empty();
-        let cm_destructions = !lock_unpoison(&self.cm_destructions).is_empty();
+    pub(in crate::v2::engine) fn has_software_work(
+        &self,
+        connections: &ConnectionRegistry,
+    ) -> bool {
+        let pending = connections.pending_outbound_count() != 0;
+        let pending_listens = !self.pending_listens.is_empty();
+        let cancellations = connections.cancellation_count() != 0;
+        let listener_work = !self.listener_work.is_empty();
+        let retirements = connections.retirement_count() != 0;
+        let cm_destructions = !self.cm_destructions.is_empty();
         pending
             || pending_listens
             || cancellations
@@ -249,272 +343,428 @@ impl CmState {
             || cm_destructions
     }
 
-    pub(in crate::v2::engine) fn service_software(
+    pub(in crate::v2::engine) fn has_non_destruction_software_work(
         &self,
+        connections: &ConnectionRegistry,
+    ) -> bool {
+        self.non_destruction_software_work_count(connections) != 0
+    }
+
+    pub(in crate::v2::engine) fn non_destruction_software_work_count(
+        &self,
+        connections: &ConnectionRegistry,
+    ) -> usize {
+        connections.pending_outbound_count()
+            + self.pending_listens.len()
+            + connections.cancellation_count()
+            + self.listener_work.len()
+            + connections.retirement_count()
+    }
+
+    pub(in crate::v2::engine) fn has_destruction_work(&self) -> bool {
+        self.destruction_work_count() != 0
+    }
+
+    pub(in crate::v2::engine) fn destruction_work_count(&self) -> usize {
+        self.cm_destructions.len()
+    }
+
+    pub(in crate::v2::engine) fn listener_work_count(&self) -> usize {
+        self.listener_work.len()
+    }
+
+    fn take_pending_event(&mut self) -> Option<PendingCmEvent> {
+        self.pending_event.take()
+    }
+
+    pub(in crate::v2::engine) fn has_pending_event(&self) -> bool {
+        self.pending_event.is_some()
+    }
+
+    pub(in crate::v2::engine) fn defer_one_event(
+        &mut self,
+        connections: &ConnectionRegistry,
+        resources: &EngineReactorResources,
+    ) -> Result<bool> {
+        if self.pending_event.is_some() {
+            return Ok(true);
+        }
+        let Some(event) = event::acquire_event(self, connections, resources)? else {
+            return Ok(false);
+        };
+        self.pending_event = Some(event);
+        Ok(true)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "bounded source service keeps each reactor-owned input explicit"
+    )]
+    pub(in crate::v2::engine) fn service_software_class_into(
+        &mut self,
+        connections: &mut ConnectionRegistry,
         shared: &SessionManager,
-        resources: Option<&EngineResources>,
+        io_core: &mut crate::v2::engine::io_core::IoState,
+        resources: Option<&EngineReactorResources>,
+        class: CmSoftwareClass,
         budget: usize,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Result<usize> {
-        // Snapshot each class depth at pass entry. Work requeued while it is
-        // transitioning is therefore deferred to a later driver poll instead
-        // of consuming this pass's bounded budget repeatedly.
-        let cancellations = lock_unpoison(&self.cancellations).len();
-        let retirements = lock_unpoison(&self.retirements).len();
-        let pending = lock_unpoison(&self.pending).len();
-        let pending_listens = lock_unpoison(&self.pending_listens).len();
-        let listener_work = lock_unpoison(&self.listener_work).len();
-        let mut remaining = [
-            cancellations,
-            retirements,
-            pending,
-            pending_listens,
-            listener_work,
-        ];
-        let mut next_class = self.software_next_class.load(Ordering::Acquire) % remaining.len();
         let mut processed = 0;
-        while processed < budget && remaining.iter().any(|count| *count != 0) {
-            let mut selected = None;
-            for offset in 0..remaining.len() {
-                let class = (next_class + offset) % remaining.len();
-                if remaining[class] != 0 {
-                    remaining[class] -= 1;
-                    next_class = (class + 1) % remaining.len();
-                    selected = Some(class);
-                    break;
-                }
-            }
-            let Some(class) = selected else {
-                break;
-            };
+        while processed < budget && actions.remaining() >= 8 {
             match class {
-                0 => {
-                    let request = { lock_unpoison(&self.cancellations).pop_front() };
+                CmSoftwareClass::Cancellation => {
+                    let request = connections.pop_cancellation();
                     if let Some(request) = request {
-                        self.process_cancellation(shared, request)?;
+                        self.process_cancellation(connections, shared, io_core, request, actions)?;
                         processed += 1;
+                    } else {
+                        break;
                     }
                 }
-                1 => {
-                    let token = { lock_unpoison(&self.retirements).pop_front() };
+                CmSoftwareClass::Retirement => {
+                    let token = connections.pop_retirement();
                     if let Some(token) = token {
-                        shared.retire_registered_connection(token)?;
+                        retirement::retire_registered_connection_into(
+                            self,
+                            connections,
+                            shared,
+                            io_core,
+                            token,
+                            actions,
+                        )?;
                         processed += 1;
+                    } else {
+                        break;
                     }
                 }
-                2 => {
-                    let request = { lock_unpoison(&self.pending).pop_front() };
-                    if let Some(request) = request {
-                        if self.outbound_setup_active.swap(true, Ordering::AcqRel) {
-                            lock_unpoison(&self.pending).push_front(request);
-                            remaining[2] = 0;
+                CmSoftwareClass::OutboundStart => {
+                    let Some(resources) = resources else {
+                        return Err(Error::InvalidConfig(
+                            "CM pending work requires live engine resources".into(),
+                        ));
+                    };
+                    let pending = connections.pop_outbound();
+                    if let Some((request, reservation)) = pending {
+                        if !connections.try_begin_outbound_setup() {
+                            connections.push_front_outbound(request, reservation);
+                            break;
+                        }
+                        if !self.start_outbound(
+                            connections,
+                            resources,
+                            request,
+                            reservation,
+                            actions,
+                        )? {
+                            connections.finish_outbound_setup();
+                        }
+                        processed += 1;
+                    } else {
+                        break;
+                    }
+                }
+                CmSoftwareClass::ListenStart => {
+                    let resources = resources.ok_or_else(|| {
+                        Error::InvalidConfig(
+                            "listener creation requires live engine resources".into(),
+                        )
+                    })?;
+                    let pending = self.pending_listens.pop_front();
+                    if let Some((token, request)) = pending {
+                        self.start_listener(shared, resources, token, request, actions)?;
+                        processed += 1;
+                    } else {
+                        break;
+                    }
+                }
+                CmSoftwareClass::ListenerWork => {
+                    let token = self.listener_work.pop_front();
+                    if let Some(token) = token {
+                        if let Some(listener) = self.listeners.get_mut(token) {
+                            listener.begin_work();
+                        } else {
+                            processed += 1;
                             continue;
                         }
-                        let Some(resources) = resources else {
-                            self.outbound_setup_active.store(false, Ordering::Release);
-                            return Err(Error::InvalidConfig(
-                                "CM pending work requires live engine resources".into(),
-                            ));
-                        };
-                        if !self.start_outbound(resources, request)? {
-                            self.outbound_setup_active.store(false, Ordering::Release);
+                        self.service_listener(
+                            connections,
+                            shared,
+                            io_core,
+                            resources,
+                            token,
+                            actions,
+                        )?;
+                        let has_work = self
+                            .listeners
+                            .get(token)
+                            .is_some_and(|listener| listener.has_work());
+                        if has_work {
+                            self.enqueue_listener_work(token);
                         }
                         processed += 1;
+                    } else {
+                        break;
                     }
                 }
-                3 => {
-                    let request = { lock_unpoison(&self.pending_listens).pop_front() };
-                    if let Some(request) = request {
-                        let resources = resources.ok_or_else(|| {
-                            Error::InvalidConfig(
-                                "listener creation requires live engine resources".into(),
-                            )
-                        })?;
-                        self.start_listener(shared, resources, request)?;
-                        processed += 1;
-                    }
-                }
-                4 => {
-                    let listener = { lock_unpoison(&self.listener_work).pop_front() };
-                    if let Some(listener) = listener {
-                        listener.begin_work();
-                        let resources = resources.ok_or_else(|| {
-                            Error::InvalidConfig(
-                                "listener progress requires live engine resources".into(),
-                            )
-                        })?;
-                        self.service_listener(shared, resources, &listener)?;
-                        if listener.has_work() {
-                            self.enqueue_listener_work(&listener);
-                        }
-                        processed += 1;
-                    }
-                }
-                _ => unreachable!("software work has five classes"),
             }
         }
-        self.software_next_class
-            .store(next_class, Ordering::Release);
+        Ok(processed)
+    }
+
+    pub(in crate::v2::engine) fn software_snapshot(
+        &self,
+        connections: &ConnectionRegistry,
+    ) -> CmSoftwareSnapshot {
+        CmSoftwareSnapshot {
+            remaining: [
+                connections.cancellation_count(),
+                connections.retirement_count(),
+                connections.pending_outbound_count(),
+                self.pending_listens.len(),
+                self.listener_work.len(),
+            ],
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn service_software(
+        &mut self,
+        connections: &mut ConnectionRegistry,
+        shared: &SessionManager,
+        io_core: &mut crate::v2::engine::io_core::IoState,
+        resources: Option<&EngineReactorResources>,
+        budget: usize,
+    ) -> Result<usize> {
+        let mut actions = crate::v2::engine::reactor::ReactorActions::default();
+        let snapshot = self.software_snapshot(connections);
+        let mut processed = 0;
+        for class in CmSoftwareClass::ALL {
+            if processed == budget {
+                break;
+            }
+            processed += self.service_software_class_into(
+                connections,
+                shared,
+                io_core,
+                resources,
+                class,
+                snapshot.count(class).min(budget - processed),
+                &mut actions,
+            )?;
+        }
+        actions.publish();
         Ok(processed)
     }
 
     pub(in crate::v2::engine) fn try_process_event(
-        &self,
+        &mut self,
+        connections: &mut ConnectionRegistry,
         shared: &SessionManager,
-        resources: &EngineResources,
+        io_core: &mut crate::v2::engine::io_core::IoState,
+        resources: &EngineReactorResources,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Result<bool> {
-        event::try_process_event(self, shared, resources)
+        event::try_process_event(self, connections, shared, io_core, resources, actions)
     }
 
     #[cfg(test)]
     pub(in crate::v2::engine) fn begin_shutdown(
-        &self,
+        &mut self,
+        connections: &mut ConnectionRegistry,
         shared: &SessionManager,
         outcome: &MemoizedTerminalResult,
     ) {
-        shutdown::begin(self, shared, outcome);
+        shutdown::begin(self, connections, shared, outcome);
     }
 
-    pub(in crate::v2::engine) fn start_bounded_shutdown(&self) {
+    pub(in crate::v2::engine) fn start_bounded_shutdown(&mut self) {
         shutdown::start(self);
     }
 
-    pub(in crate::v2::engine) fn service_bounded_shutdown(
+    pub(in crate::v2::engine) fn bounded_shutdown_snapshot(
         &self,
+        connections: &ConnectionRegistry,
+        terminalize_listeners: bool,
+        cursor: &CmShutdownCursor,
+        budget: usize,
+    ) -> CmShutdownSnapshot {
+        shutdown::snapshot(self, connections, terminalize_listeners, cursor, budget)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "bounded shutdown keeps ownership inputs explicit"
+    )]
+    pub(in crate::v2::engine) fn service_bounded_shutdown_class(
+        &mut self,
+        connections: &mut ConnectionRegistry,
         shared: &SessionManager,
         outcome: &MemoizedTerminalResult,
         terminalize_listeners: bool,
         cursor: &mut CmShutdownCursor,
+        class: CmShutdownClass,
         budget: usize,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> usize {
-        shutdown::service(self, shared, outcome, terminalize_listeners, cursor, budget)
+        shutdown::service_class(
+            self,
+            connections,
+            shared,
+            outcome,
+            terminalize_listeners,
+            cursor,
+            class,
+            budget,
+            actions,
+        )
     }
 
     pub(in crate::v2::engine) fn bounded_shutdown_complete(
         &self,
+        connections: &ConnectionRegistry,
         cursor: &CmShutdownCursor,
     ) -> bool {
-        shutdown::complete(self, cursor)
+        shutdown::complete(self, connections, cursor)
     }
 
-    pub(in crate::v2::engine) fn pending_route_count(&self) -> usize {
-        let establishing = self
-            .routes
-            .occupied_cloned()
-            .into_iter()
-            .filter(|route| route.is_establishing())
-            .count();
-        let pending = lock_unpoison(&self.pending).len();
-        let pending_listens = lock_unpoison(&self.pending_listens).len();
-        let cancellations = lock_unpoison(&self.cancellations).len();
-        let listener_work = lock_unpoison(&self.listener_work).len();
-        let retirements = lock_unpoison(&self.retirements).len();
-        let cm_destructions = lock_unpoison(&self.cm_destructions).len();
-        let inbound_routes = self.inbound_routes.live();
-        let listeners = lock_unpoison(&self.listeners).len();
-        establishing
-            + pending
-            + pending_listens
-            + cancellations
-            + listener_work
-            + retirements
-            + cm_destructions
-            + inbound_routes
-            + listeners
-    }
-
-    pub(in crate::v2::engine) fn retained_owner_count(&self) -> usize {
-        let routes = self.routes.live();
-        let inbound_routes = self.inbound_routes.live();
-        let listeners = lock_unpoison(&self.listeners).len();
-        let cm_destructions = lock_unpoison(&self.cm_destructions).len();
-        let routed_owners = routes + inbound_routes + listeners + cm_destructions;
-        // Every retained setup rollback still owns its live CM route. The
-        // maximum counts those overlapping owners once while flooring the
-        // result if a future unregistered rollback ever loses route coverage.
-        let setup_rollback_quarantines = lock_unpoison(&self.setup_rollback_quarantines).len();
-        routed_owners.max(setup_rollback_quarantines)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(in crate::v2::engine) fn connection_route_is_live(
+    pub(in crate::v2::engine) fn retained_owner_count(
         &self,
-        route: ConnectionCmRoute,
-        connection: ConnectionToken,
-    ) -> bool {
-        let token = match route {
-            ConnectionCmRoute::Outbound(encoded) | ConnectionCmRoute::Inbound(encoded) => {
-                CmRouteToken::decode(encoded)
-            }
-        };
-        match route {
-            ConnectionCmRoute::Outbound(_) => {
-                let Lookup::Occupied(route) = self.routes.lookup_cloned(token) else {
-                    return false;
-                };
-                lock_unpoison(&route.state).references_connection(connection)
-            }
-            ConnectionCmRoute::Inbound(_) => {
-                let Lookup::Occupied(route) = self.inbound_routes.lookup_cloned(token) else {
-                    return false;
-                };
-                lock_unpoison(&route.state).references_connection(connection)
-            }
-        }
+        connections: &ConnectionRegistry,
+    ) -> usize {
+        connections.live() + self.retained_session_owner_count()
     }
 
-    pub(in crate::v2::engine) fn service_cm_destructions(
-        &self,
-        shared: &SessionManager,
+    pub(in crate::v2::engine) fn retained_session_owner_count(&self) -> usize {
+        let listeners = self.listeners.live();
+        listeners + self.non_listener_destructions + self.quarantined_cm_owners.len()
+    }
+
+    fn push_cm_destruction_back(&mut self, pending: PendingCmDestruction) {
+        self.non_listener_destructions += usize::from(pending.listener().is_none());
+        self.cm_destructions.push_back(pending);
+    }
+
+    fn push_cm_destruction_front(&mut self, pending: PendingCmDestruction) {
+        self.non_listener_destructions += usize::from(pending.listener().is_none());
+        self.cm_destructions.push_front(pending);
+    }
+
+    fn pop_cm_destruction_front(&mut self) -> Option<PendingCmDestruction> {
+        let pending = self.cm_destructions.pop_front()?;
+        self.non_listener_destructions = self
+            .non_listener_destructions
+            .saturating_sub(usize::from(pending.listener().is_none()));
+        Some(pending)
+    }
+
+    pub(in crate::v2::engine) fn retained_provider_owner_count(&self) -> usize {
+        self.listeners.provider_owner_count()
+            + self.cm_destructions.len()
+            + self.quarantined_cm_owners.len()
+    }
+
+    pub(in crate::v2::engine) fn pending_lifecycle_work_count(&self) -> usize {
+        self.pending_listens.len()
+            + self.listener_work.len()
+            + self.cm_destructions.len()
+            + self.quarantined_cm_owners.len()
+            + self.listeners.live()
+    }
+
+    pub(in crate::v2::engine) fn service_cm_destructions_into(
+        &mut self,
+        connections: &mut ConnectionRegistry,
+        io_core: &mut crate::v2::engine::io_core::IoState,
+        resources: &EngineReactorResources,
         budget: usize,
-        try_process_event: impl FnMut() -> Result<bool>,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Result<usize> {
-        retirement::service_cm_destructions(self, shared, budget, try_process_event)
+        retirement::service_cm_destructions(self, connections, io_core, resources, budget, actions)
     }
 
-    pub(in crate::v2::engine) fn terminalize(&self, outcome: &MemoizedTerminalResult) {
-        shutdown::terminalize(self, outcome);
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn service_cm_destructions_with_probe(
+        &mut self,
+        connections: &mut ConnectionRegistry,
+        io_core: &mut crate::v2::engine::io_core::IoState,
+        budget: usize,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+        mut probe: impl FnMut() -> Result<bool>,
+    ) -> Result<usize> {
+        retirement::service_cm_destructions_with_probe(
+            self,
+            connections,
+            io_core,
+            budget,
+            actions,
+            |_state, _connections| probe(),
+        )
+    }
+
+    pub(in crate::v2::engine) fn terminalize_into(
+        &mut self,
+        connections: &mut ConnectionRegistry,
+        outcome: &MemoizedTerminalResult,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) {
+        shutdown::terminalize_into(self, connections, outcome, actions);
     }
 
     fn start_listener(
-        &self,
+        &mut self,
         shared: &SessionManager,
-        resources: &EngineResources,
+        resources: &EngineReactorResources,
+        token: ListenerToken,
         request: Arc<ListenRequest>,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Result<()> {
-        inbound::start_listener(self, shared, resources, request)
+        inbound::start_listener(self, shared, resources, token, request, actions)
     }
 
     fn service_listener(
-        &self,
+        &mut self,
+        connections: &mut ConnectionRegistry,
         shared: &SessionManager,
-        resources: &EngineResources,
-        listener: &Arc<ListenerState>,
+        io_core: &mut crate::v2::engine::io_core::IoState,
+        resources: Option<&EngineReactorResources>,
+        listener: ListenerToken,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Result<()> {
-        inbound::service_listener(self, shared, resources, listener)
+        inbound::service_listener(
+            self,
+            connections,
+            shared,
+            io_core,
+            resources,
+            listener,
+            actions,
+        )
     }
 
     fn handle_connect_request(
-        &self,
+        &mut self,
+        connections: &mut ConnectionRegistry,
         shared: &SessionManager,
-        resources: &EngineResources,
-        listener: &Arc<ListenerState>,
+        resources: &EngineReactorResources,
+        listener: ListenerToken,
         snapshot: CmEventSnapshot,
     ) -> Result<EventDisposition> {
-        inbound::handle_connect_request(self, shared, resources, listener, snapshot)
+        inbound::handle_connect_request(self, connections, shared, resources, listener, snapshot)
     }
 
     fn handle_listener_event(
-        &self,
+        &mut self,
         shared: &SessionManager,
-        listener: &Arc<ListenerState>,
+        listener: ListenerToken,
         snapshot: CmEventSnapshot,
     ) -> Result<EventDisposition> {
         inbound::handle_listener_event(self, shared, listener, snapshot)
     }
 
     fn reject_raw_child(
-        &self,
-        resources: &EngineResources,
+        &mut self,
+        resources: &EngineReactorResources,
         raw_id: usize,
         reason: InboundRejectReason,
     ) -> Result<()> {
@@ -522,36 +772,53 @@ impl CmState {
     }
 
     fn start_outbound(
-        &self,
-        resources: &EngineResources,
+        &mut self,
+        connections: &mut ConnectionRegistry,
+        resources: &EngineReactorResources,
         request: Arc<OutboundRequest>,
+        reservation: ConnectionReservation,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Result<bool> {
-        outbound::start(self, resources, request)
+        outbound::start(self, connections, resources, request, reservation, actions)
     }
 
     fn process_cancellation(
-        &self,
+        &mut self,
+        connections: &mut ConnectionRegistry,
         shared: &SessionManager,
+        io_core: &mut crate::v2::engine::io_core::IoState,
         request: Arc<OutboundRequest>,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Result<()> {
-        outbound::process_cancellation(self, shared, request)
+        outbound::process_cancellation(self, connections, shared, io_core, request, actions)
     }
 
     fn release_failed_install(
         &self,
-        shared: &SessionManager,
+        connections: &mut ConnectionRegistry,
         resources: FailedConnectionInstallResources,
     ) -> Result<()> {
-        retirement::release_failed_install(shared, resources)
+        retirement::release_failed_install(connections, resources)
     }
 
     fn retain_failed_install(
-        &self,
+        &mut self,
+        connections: &mut ConnectionRegistry,
         shared: &SessionManager,
+        token: ConnectionToken,
         resources: FailedConnectionInstallResources,
         destroy_error: &Error,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Option<EstablishedConnectionRoute> {
-        retirement::retain_failed_install(self, shared, resources, destroy_error)
+        retirement::retain_failed_install(
+            self,
+            connections,
+            shared,
+            token,
+            resources,
+            destroy_error,
+            actions,
+        )
     }
 
     fn record_setup_rollback_quarantine(destroy_error: &Error) {
@@ -561,91 +828,126 @@ impl CmState {
     #[cfg(test)]
     fn lookup_dispatch_route(
         &self,
+        connections: &ConnectionRegistry,
         snapshot: CmEventSnapshot,
     ) -> std::result::Result<CmDispatchRoute, CmEventReject> {
-        event::lookup_dispatch_route(self, snapshot)
+        event::lookup_dispatch_route(self, connections, snapshot)
     }
 
     #[cfg(test)]
     fn lookup_event_route(
         &self,
+        connections: &ConnectionRegistry,
         snapshot: CmEventSnapshot,
-    ) -> std::result::Result<Arc<OutboundRoute>, CmEventReject> {
-        event::lookup_event_route(self, snapshot)
+    ) -> std::result::Result<super::registry::ConnectionRouteIdentity, CmEventReject> {
+        event::lookup_event_route(self, connections, snapshot)
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one CM event transaction keeps all reactor-owned state and evidence explicit"
+    )]
     fn handle_event(
-        &self,
+        &mut self,
+        connections: &mut ConnectionRegistry,
         shared: &SessionManager,
-        resources: &EngineResources,
-        route: &Arc<OutboundRoute>,
+        io_core: &mut crate::v2::engine::io_core::IoState,
+        resources: &EngineReactorResources,
+        token: ConnectionToken,
         snapshot: CmEventSnapshot,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Result<EventDisposition> {
-        outbound::handle_event(self, shared, resources, route, snapshot)
+        outbound::handle_event(
+            self,
+            connections,
+            shared,
+            io_core,
+            resources,
+            token,
+            snapshot,
+            actions,
+        )
     }
 
     fn handle_inbound_event(
-        &self,
+        &mut self,
+        connections: &mut ConnectionRegistry,
         shared: &SessionManager,
-        route: &Arc<InboundRoute>,
+        io_core: &mut crate::v2::engine::io_core::IoState,
+        token: ConnectionToken,
         snapshot: CmEventSnapshot,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Result<EventDisposition> {
-        inbound::handle_event(self, shared, route, snapshot)
+        inbound::handle_event(self, connections, shared, io_core, token, snapshot, actions)
     }
 
-    #[cfg(test)]
-    fn handle_inbound_disconnected(
+    pub(super) fn prepare_connection_close(
+        &mut self,
+        connections: &mut ConnectionRegistry,
+        token: ConnectionToken,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) -> Result<bool> {
+        let Some(ConnectionCmRoute::Inbound(encoded)) = connections.connection_route(token) else {
+            return Ok(true);
+        };
+        inbound::prepare_selected_connection_close(self, connections, encoded, token, actions)
+    }
+
+    fn retire_route(
         &self,
-        shared: &SessionManager,
-        route: &Arc<InboundRoute>,
-    ) -> Result<EventDisposition> {
-        inbound::handle_disconnected(self, shared, route)
-    }
-
-    fn retire_route(&self, route: &Arc<OutboundRoute>, completed: bool) {
-        self.routes.release(route.token, completed);
+        connections: &mut ConnectionRegistry,
+        token: ConnectionToken,
+        completed: bool,
+    ) {
+        connections.release_route(token, completed);
     }
 
     fn retire_outbound_route_for_retirement(
-        &self,
+        &mut self,
+        connections: &mut ConnectionRegistry,
         encoded: u64,
-        connection: &Arc<ConnectionState>,
+        connection: ConnectionToken,
     ) -> Result<RouteRetirement> {
         let token = CmRouteToken::decode(encoded);
-        let route = match self.routes.lookup_cloned(token) {
-            Lookup::Occupied(route) => route,
+        match connections.lookup_outbound(token) {
+            Lookup::Occupied(_) => {}
             Lookup::Duplicate | Lookup::Stale | Lookup::Unknown | Lookup::Retired => {
                 return Ok(RouteRetirement::Complete {
                     completion: None,
-                    reject: None,
+                    disposition: RouteRetirementDisposition::None,
                 });
             }
-        };
-        let route_state =
-            route.take_state_if(|route_state| route_state.references_connection(connection.token));
+        }
+        let route_state = connections.take_outbound_state_if(token, |route_state| {
+            route_state.references_connection(connection)
+        });
         match route_state {
             Some(
                 OutboundState::EstablishedAwaitingDelivery { .. }
-                | OutboundState::Established { .. }
                 | OutboundState::DisconnectedAwaitingDelivery { .. }
                 | OutboundState::Disconnected { .. }
                 | OutboundState::FailedAwaitingDelivery { .. }
                 | OutboundState::Failed { .. }
                 | OutboundState::Closing { .. },
             ) => {
-                self.retire_route(&route, true);
+                self.retire_route(connections, token, true);
                 Ok(RouteRetirement::Complete {
                     completion: None,
-                    reject: None,
+                    disposition: RouteRetirementDisposition::None,
                 })
             }
             Some(route_state) => {
-                route.set_state(route_state);
+                connections.set_outbound_state(token, route_state);
                 Err(Error::InvalidConfig(
                     "connection route was not established during retirement".into(),
                 ))
             }
-            None if matches!(&*lock_unpoison(&route.state), OutboundState::Transitioning) => {
+            None if connections
+                .with_outbound_route(token, |route| {
+                    matches!(&route.state, OutboundState::Transitioning)
+                })
+                .unwrap_or(false) =>
+            {
                 Ok(RouteRetirement::Retry)
             }
             None => Err(Error::InvalidConfig(
@@ -655,76 +957,79 @@ impl CmState {
     }
 
     fn retire_inbound_route_for_retirement(
-        &self,
+        &mut self,
+        connections: &mut ConnectionRegistry,
         encoded: u64,
-        connection: &Arc<ConnectionState>,
+        connection: ConnectionToken,
+        _actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Result<RouteRetirement> {
         let token = CmRouteToken::decode(encoded);
-        let route = match self.inbound_routes.lookup_cloned(token) {
-            Lookup::Occupied(route) => route,
+        match connections.lookup_inbound(token) {
+            Lookup::Occupied(_) => {}
             Lookup::Duplicate | Lookup::Stale | Lookup::Unknown | Lookup::Retired => {
                 return Ok(RouteRetirement::Complete {
                     completion: None,
-                    reject: None,
+                    disposition: RouteRetirementDisposition::None,
                 });
             }
-        };
-        let route_state =
-            route.take_state_if(|route_state| route_state.references_connection(connection.token));
+        }
+        let listener = connections.inbound_listener(token);
+        let route_state = connections.take_inbound_state_if(token, |route_state| {
+            route_state.references_connection(connection)
+        });
         match route_state {
-            Some(InboundState::EstablishedAwaitingDelivery { request, .. }) => {
-                let delivered = request.fail_undelivered(Error::DriverShutdown);
-                if delivered
-                    && let Some(listener) = route.listener.upgrade()
-                    && listener.finish_selected_route(encoded)
-                {
-                    self.enqueue_listener_work(&listener);
-                }
-                self.inbound_routes.release(token, true);
-                Ok(RouteRetirement::Complete {
-                    completion: (!delivered).then(|| InboundRetirementCompletion {
-                        listener: route.listener.clone(),
-                        route: encoded,
-                        request: None,
-                        result: None,
-                        selected: true,
-                    }),
-                    reject: None,
-                })
+            Some(route_state @ InboundState::EstablishedAwaitingDelivery { .. }) => {
+                connections.set_inbound_state(token, route_state);
+                Err(Error::InvalidConfig(
+                    "selected accepted route reached retirement before close preparation".into(),
+                ))
             }
             Some(InboundState::Established { .. }) => {
-                self.inbound_routes.release(token, true);
+                connections.release_route(token, true);
                 Ok(RouteRetirement::Complete {
                     completion: None,
-                    reject: None,
+                    disposition: RouteRetirementDisposition::None,
                 })
             }
             Some(InboundState::Closing {
                 request,
                 completion,
                 selected,
-                reject,
+                peer,
                 ..
             }) => {
-                self.inbound_routes.release(token, true);
+                let disposition = match peer {
+                    InboundPeerState::PreAccept {
+                        reject: Some(reason),
+                    } => RouteRetirementDisposition::Reject(reason),
+                    InboundPeerState::PreAccept { reject: None } | InboundPeerState::Accepted => {
+                        RouteRetirementDisposition::None
+                    }
+                };
+                connections.release_route(token, true);
                 Ok(RouteRetirement::Complete {
                     completion: Some(InboundRetirementCompletion {
-                        listener: route.listener.clone(),
+                        listener,
                         route: encoded,
                         request,
                         result: completion,
                         selected,
                     }),
-                    reject,
+                    disposition,
                 })
             }
             Some(route_state) => {
-                route.set_state(route_state);
+                connections.set_inbound_state(token, route_state);
                 Err(Error::InvalidConfig(
                     "inbound connection route was not established during retirement".into(),
                 ))
             }
-            None if matches!(&*lock_unpoison(&route.state), InboundState::Transitioning) => {
+            None if connections
+                .with_inbound_route(token, |route| {
+                    matches!(&route.state, InboundState::Transitioning)
+                })
+                .unwrap_or(false) =>
+            {
                 Ok(RouteRetirement::Retry)
             }
             None => Err(Error::InvalidConfig(
@@ -733,7 +1038,7 @@ impl CmState {
         }
     }
 
-    fn remove_owned_context_route(&self, cm_id: Option<&SharedCmId>) {
+    fn remove_owned_context_route(&mut self, cm_id: Option<&SharedCmId>) {
         let Some(cm_id) = cm_id else {
             return;
         };
@@ -746,7 +1051,7 @@ impl CmState {
     }
 
     fn remove_context_route_if_owned(
-        &self,
+        &mut self,
         context_key: usize,
         raw_id: usize,
         route_token: Option<u64>,
@@ -754,8 +1059,7 @@ impl CmState {
         let Some(route_token) = route_token else {
             return false;
         };
-        let mut routes = lock_unpoison(&self.context_routes);
-        let owned = match routes.get(&context_key).copied() {
+        let owned = match self.context_routes.get(&context_key).copied() {
             Some(ContextRoute::Outbound {
                 token,
                 raw_id: owner,
@@ -767,68 +1071,18 @@ impl CmState {
             Some(ContextRoute::Listener {
                 token,
                 raw_id: owner,
-            }) => token == route_token && owner == raw_id,
+            }) => token.encode() == route_token && owner == raw_id,
             None => false,
         };
         if owned {
-            routes.remove(&context_key);
+            self.context_routes.remove(&context_key);
         }
         owned
     }
 }
 
-impl SessionManager {
-    pub(in crate::v2::engine) fn terminalize_cm(&self, outcome: &MemoizedTerminalResult) {
-        self.cm.terminalize(outcome);
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(in crate::v2::engine) fn pending_cm_route_count(&self) -> usize {
-        self.cm.pending_route_count()
-    }
-
-    pub(in crate::v2::engine) fn retained_cm_owner_count(&self) -> usize {
-        self.cm.retained_owner_count()
-    }
-
-    pub(in crate::v2::engine) fn has_cm_work(&self) -> bool {
-        self.cm.has_software_work()
-    }
-
-    pub(in crate::v2::engine) fn service_cm_software(
-        &self,
-        resources: Option<&EngineResources>,
-        budget: usize,
-    ) -> Result<usize> {
-        self.cm.service_software(self, resources, budget)
-    }
-
-    pub(in crate::v2::engine) fn try_process_cm_event(
-        &self,
-        resources: &EngineResources,
-    ) -> Result<bool> {
-        self.cm.try_process_event(self, resources)
-    }
-
-    pub(in crate::v2::engine) fn service_deferred_cm_destructions(
-        &self,
-        budget: usize,
-        try_process_event: impl FnMut() -> Result<bool>,
-    ) -> Result<usize> {
-        self.cm
-            .service_cm_destructions(self, budget, try_process_event)
-    }
-
-    pub(in crate::v2::engine) fn retire_registered_connection(
-        &self,
-        token: ConnectionToken,
-    ) -> Result<()> {
-        retirement::retire_registered_connection(self, token)
-    }
-}
-
 fn build_qp(
-    resources: &EngineResources,
+    resources: &EngineReactorResources,
     cm_id: &CmId,
     config: &RdmaConnectionConfig,
 ) -> Result<crate::v2::Qp> {
@@ -872,24 +1126,6 @@ fn error_detail(error: &Error) -> String {
     }
 }
 
-fn connection_destruction_error(destroy_result: Result<()>, finalize_result: Result<()>) -> Error {
-    match (destroy_result, finalize_result) {
-        (Err(destroy), Ok(())) => destroy,
-        (Ok(()), Err(finalize)) => contextual_cm_error(
-            "finalize connection retirement after CM destruction",
-            finalize,
-        ),
-        (Err(destroy), Err(finalize)) => Error::Verbs(std::io::Error::other(format!(
-            "{}; additionally failed to finalize connection retirement: {}",
-            error_detail(&destroy),
-            error_detail(&finalize)
-        ))),
-        (Ok(()), Ok(())) => {
-            unreachable!("connection destruction error requires at least one failure")
-        }
-    }
-}
-
 #[cfg(test)]
 fn injected_cm_result(error: Option<String>) -> Result<()> {
     match error {
@@ -901,21 +1137,27 @@ fn injected_cm_result(error: Option<String>) -> Result<()> {
 enum RouteRetirement {
     Complete {
         completion: Option<InboundRetirementCompletion>,
-        reject: Option<InboundRejectReason>,
+        disposition: RouteRetirementDisposition,
     },
     Retry,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RouteRetirementDisposition {
+    None,
+    Reject(InboundRejectReason),
 }
 
 enum PendingCmDestruction {
     Route(SharedCmId),
     Connection {
         cm_id: SharedCmId,
-        connection: Arc<ConnectionState>,
+        token: ConnectionToken,
         completion: Option<InboundRetirementCompletion>,
     },
     Listener {
         cm_id: SharedCmId,
-        listener: Arc<ListenerState>,
+        listener: ListenerToken,
     },
     #[cfg(test)]
     Test {
@@ -924,22 +1166,12 @@ enum PendingCmDestruction {
     },
 }
 
-struct RetainedSetupRollback {
-    _poster: Arc<dyn WorkRequestPoster>,
-    _reservation: ConnectionReservation,
-}
-
 #[cfg(test)]
 enum TestCmDestruction {
+    Route,
     Listener {
-        listener: Arc<ListenerState>,
+        listener: ListenerToken,
         destroy_error: Option<String>,
-    },
-    Connection {
-        connection: Arc<ConnectionState>,
-        completion: Option<InboundRetirementCompletion>,
-        destroy_error: Option<String>,
-        finalize_error: Option<String>,
     },
 }
 
@@ -954,17 +1186,17 @@ impl PendingCmDestruction {
         }
     }
 
-    fn listener(&self) -> Option<&Arc<ListenerState>> {
+    fn listener(&self) -> Option<ListenerToken> {
         match self {
-            Self::Listener { listener, .. } => Some(listener),
+            Self::Listener { listener, .. } => Some(*listener),
             #[cfg(test)]
             Self::Test {
                 target: TestCmDestruction::Listener { listener, .. },
                 ..
-            } => Some(listener),
+            } => Some(*listener),
             #[cfg(test)]
             Self::Test {
-                target: TestCmDestruction::Connection { .. },
+                target: TestCmDestruction::Route,
                 ..
             } => None,
             Self::Route(_) | Self::Connection { .. } => None,
@@ -972,63 +1204,51 @@ impl PendingCmDestruction {
     }
 }
 
-struct InboundRoute {
-    token: CmRouteToken,
-    raw_id: AtomicUsize,
-    context_key: AtomicUsize,
-    listener: Weak<ListenerState>,
-    state: Mutex<InboundState>,
+pub(super) struct InboundRoute {
+    pub(super) raw_id: usize,
+    pub(super) context_key: usize,
+    pub(super) listener: ListenerToken,
+    pub(super) state: InboundState,
 }
 
 impl InboundRoute {
-    fn new(token: CmRouteToken, listener: Weak<ListenerState>) -> Self {
+    pub(super) fn new(_token: CmRouteToken, listener: ListenerToken) -> Self {
         Self {
-            token,
-            raw_id: AtomicUsize::new(0),
-            context_key: AtomicUsize::new(0),
+            raw_id: 0,
+            context_key: 0,
             listener,
-            state: Mutex::new(InboundState::Transitioning),
+            state: InboundState::Transitioning,
         }
     }
 
-    fn set_identity(&self, raw_id: usize, context_key: usize) {
-        self.raw_id.store(raw_id, Ordering::Release);
-        self.context_key.store(context_key, Ordering::Release);
+    pub(super) fn set_identity(&mut self, raw_id: usize, context_key: usize) {
+        self.raw_id = raw_id;
+        self.context_key = context_key;
     }
 
-    fn set_state(&self, state: InboundState) {
-        *lock_unpoison(&self.state) = state;
+    pub(super) fn set_state(&mut self, state: InboundState) {
+        self.state = state;
     }
 
-    fn take_state_if(&self, predicate: impl FnOnce(&InboundState) -> bool) -> Option<InboundState> {
-        let mut state = lock_unpoison(&self.state);
-        if !predicate(&state) {
+    pub(super) fn take_state_if(
+        &mut self,
+        predicate: impl FnOnce(&InboundState) -> bool,
+    ) -> Option<InboundState> {
+        if !predicate(&self.state) {
             return None;
         }
-        Some(std::mem::replace(&mut *state, InboundState::Transitioning))
-    }
-
-    fn mark_delivered(&self, request: &Arc<AcceptRequest>) -> bool {
-        let mut state = lock_unpoison(&self.state);
-        let replacement = match &*state {
-            InboundState::EstablishedAwaitingDelivery {
-                request: current,
-                connection,
-            } if Arc::ptr_eq(current, request) => Some(InboundState::Established {
-                connection: connection.clone(),
-            }),
-            _ => None,
-        };
-        if let Some(replacement) = replacement {
-            *state = replacement;
-            true
-        } else {
-            false
-        }
+        Some(std::mem::replace(
+            &mut self.state,
+            InboundState::Transitioning,
+        ))
     }
 }
 
-enum InboundState {
+pub(super) enum InboundState {
+    PendingSelection {
+        cm_id: SharedCmId,
+        reservation: ConnectionReservation,
+    },
     AwaitEstablished {
         request: Arc<AcceptRequest>,
         connection: RdmaConnection,
@@ -1045,7 +1265,7 @@ enum InboundState {
         request: Option<Arc<AcceptRequest>>,
         completion: Option<Error>,
         selected: bool,
-        reject: Option<InboundRejectReason>,
+        peer: InboundPeerState,
     },
     Quarantined {
         connection: Option<EstablishedConnectionRoute>,
@@ -1053,9 +1273,16 @@ enum InboundState {
     Transitioning,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum InboundPeerState {
+    PreAccept { reject: Option<InboundRejectReason> },
+    Accepted,
+}
+
 impl InboundState {
     fn references_connection(&self, token: ConnectionToken) -> bool {
         match self {
+            Self::PendingSelection { .. } => false,
             Self::AwaitEstablished { connection, .. } => connection.session_token() == token,
             Self::EstablishedAwaitingDelivery { connection, .. }
             | Self::Established { connection }
@@ -1069,27 +1296,27 @@ impl InboundState {
 }
 
 struct InboundRetirementCompletion {
-    listener: Weak<ListenerState>,
+    listener: Option<ListenerToken>,
     route: u64,
     request: Option<Arc<AcceptRequest>>,
     result: Option<Error>,
     selected: bool,
 }
 
-struct OutboundRoute {
-    token: CmRouteToken,
-    raw_id: AtomicUsize,
-    context_key: AtomicUsize,
-    state: Mutex<OutboundState>,
+pub(super) struct OutboundRoute {
+    pub(super) token: CmRouteToken,
+    pub(super) raw_id: usize,
+    pub(super) context_key: usize,
+    pub(super) state: OutboundState,
 }
 
 impl OutboundRoute {
-    fn new(token: CmRouteToken, request: Arc<OutboundRequest>) -> Self {
+    pub(super) fn new(token: CmRouteToken, request: Arc<OutboundRequest>) -> Self {
         Self {
             token,
-            raw_id: AtomicUsize::new(0),
-            context_key: AtomicUsize::new(0),
-            state: Mutex::new(OutboundState::Transitioning),
+            raw_id: 0,
+            context_key: 0,
+            state: OutboundState::Transitioning,
         }
         .with_initial_request(request)
     }
@@ -1101,36 +1328,37 @@ impl OutboundRoute {
         self
     }
 
-    fn set_identity(&self, raw_id: usize, context_key: usize) {
-        self.raw_id.store(raw_id, Ordering::Release);
-        self.context_key.store(context_key, Ordering::Release);
+    pub(super) fn set_identity(&mut self, raw_id: usize, context_key: usize) {
+        self.raw_id = raw_id;
+        self.context_key = context_key;
     }
 
-    fn set_state(&self, state: OutboundState) {
-        *lock_unpoison(&self.state) = state;
+    pub(super) fn set_state(&mut self, state: OutboundState) {
+        self.state = state;
     }
 
-    fn take_state_if(
-        &self,
+    pub(super) fn take_state_if(
+        &mut self,
         predicate: impl FnOnce(&OutboundState) -> bool,
     ) -> Option<OutboundState> {
-        let mut state = lock_unpoison(&self.state);
-        if !predicate(&state) {
+        if !predicate(&self.state) {
             return None;
         }
-        Some(std::mem::replace(&mut *state, OutboundState::Transitioning))
+        Some(std::mem::replace(
+            &mut self.state,
+            OutboundState::Transitioning,
+        ))
     }
 
-    fn request(&self) -> Option<Arc<OutboundRequest>> {
-        match &*lock_unpoison(&self.state) {
+    pub(super) fn request(&self) -> Option<Arc<OutboundRequest>> {
+        match &self.state {
             OutboundState::AwaitAddr { request, .. }
             | OutboundState::AwaitRoute { request, .. }
             | OutboundState::AwaitEstablished { request, .. }
             | OutboundState::EstablishedAwaitingDelivery { request, .. }
             | OutboundState::DisconnectedAwaitingDelivery { request, .. }
             | OutboundState::FailedAwaitingDelivery { request, .. } => Some(Arc::clone(request)),
-            OutboundState::Established { .. }
-            | OutboundState::Disconnected { .. }
+            OutboundState::Disconnected { .. }
             | OutboundState::Failed { .. }
             | OutboundState::Closing { .. }
             | OutboundState::Quarantined { .. }
@@ -1138,9 +1366,9 @@ impl OutboundRoute {
         }
     }
 
-    fn is_establishing(&self) -> bool {
+    pub(super) fn is_establishing(&self) -> bool {
         matches!(
-            &*lock_unpoison(&self.state),
+            &self.state,
             OutboundState::AwaitAddr { .. }
                 | OutboundState::AwaitRoute { .. }
                 | OutboundState::AwaitEstablished { .. }
@@ -1148,9 +1376,9 @@ impl OutboundRoute {
         )
     }
 
-    fn is_disconnected(&self) -> bool {
+    pub(super) fn is_disconnected(&self) -> bool {
         matches!(
-            &*lock_unpoison(&self.state),
+            &self.state,
             OutboundState::DisconnectedAwaitingDelivery { .. }
                 | OutboundState::Disconnected { .. }
                 | OutboundState::FailedAwaitingDelivery { .. }
@@ -1159,56 +1387,20 @@ impl OutboundRoute {
                 | OutboundState::Quarantined { .. }
         )
     }
-
-    fn mark_delivered(&self, request: &Arc<OutboundRequest>) {
-        let mut state = lock_unpoison(&self.state);
-        let replacement = match &*state {
-            OutboundState::EstablishedAwaitingDelivery {
-                request: route_request,
-                connection,
-            } if Arc::ptr_eq(route_request, request) => Some(OutboundState::Established {
-                connection: connection.clone(),
-            }),
-            OutboundState::DisconnectedAwaitingDelivery {
-                request: route_request,
-                connection,
-            } if Arc::ptr_eq(route_request, request) => Some(OutboundState::Disconnected {
-                connection: connection.clone(),
-            }),
-            OutboundState::FailedAwaitingDelivery {
-                request: route_request,
-                connection,
-            } if Arc::ptr_eq(route_request, request) => Some(OutboundState::Failed {
-                connection: connection.clone(),
-            }),
-            _ => None,
-        };
-        if let Some(replacement) = replacement {
-            *state = replacement;
-        }
-    }
 }
 
 #[derive(Clone)]
-struct EstablishedConnectionRoute {
+pub(super) struct EstablishedConnectionRoute {
     token: ConnectionToken,
-    state: Weak<ConnectionState>,
 }
 
 impl EstablishedConnectionRoute {
-    fn new(connection: &Arc<ConnectionState>) -> Self {
-        Self {
-            token: connection.token,
-            state: Arc::downgrade(connection),
-        }
-    }
-
-    fn upgrade(&self) -> Option<Arc<ConnectionState>> {
-        self.state.upgrade()
+    fn new(token: ConnectionToken) -> Self {
+        Self { token }
     }
 }
 
-enum OutboundState {
+pub(super) enum OutboundState {
     AwaitAddr {
         cm_id: SharedCmId,
         request: Arc<OutboundRequest>,
@@ -1225,9 +1417,6 @@ enum OutboundState {
     },
     EstablishedAwaitingDelivery {
         request: Arc<OutboundRequest>,
-        connection: EstablishedConnectionRoute,
-    },
-    Established {
         connection: EstablishedConnectionRoute,
     },
     DisconnectedAwaitingDelivery {
@@ -1258,7 +1447,6 @@ impl OutboundState {
         match self {
             Self::AwaitEstablished { connection, .. } => connection.session_token() == token,
             Self::EstablishedAwaitingDelivery { connection, .. }
-            | Self::Established { connection }
             | Self::DisconnectedAwaitingDelivery { connection, .. }
             | Self::Disconnected { connection }
             | Self::FailedAwaitingDelivery { connection, .. }

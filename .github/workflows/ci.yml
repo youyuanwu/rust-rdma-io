@@ -68,9 +68,12 @@ jobs:
       - name: Test
         run: |
           for i in $(seq 1 5); do
+            if [ "$i" -gt 1 ]; then
+              sudo ./scripts/teardown-siw.sh
+              sudo ./scripts/setup-siw.sh
+            fi
             echo "=== Test run $i/5 ==="
             cargo test --workspace
-            sleep 3
           done
         timeout-minutes: 30
 
@@ -125,9 +128,12 @@ jobs:
       - name: Test
         run: |
           for i in $(seq 1 5); do
+            if [ "$i" -gt 1 ]; then
+              sudo ./scripts/teardown-rxe.sh
+              sudo ./scripts/setup-rxe.sh
+            fi
             echo "=== Test run $i/5 ==="
             cargo test --workspace
-            sleep 3
           done
         timeout-minutes: 30
 

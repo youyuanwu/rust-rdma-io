@@ -78,6 +78,7 @@ async fn establish_pair(
         let cm = rdma_io::async_cm::AsyncCmListener::migrate_accepted(cm_id).unwrap();
         server_resources
             .install_connection(qp, cm, server_config)
+            .await
             .unwrap()
     };
     let client = async {
@@ -456,6 +457,11 @@ async fn run_connect_admission_shutdown_barrier(mode: CompletionMode) {
         shutdown
     });
     barrier.wait_until_shutdown_attempted().unwrap();
+    assert_eq!(
+        engine.diagnostics().lifecycle,
+        paused.lifecycle,
+        "shutdown cannot publish lifecycle while connect admission holds the barrier"
+    );
     barrier.release().unwrap();
 
     let mut connect = connect_thread.join().expect("connect poll thread panicked");
@@ -463,8 +469,14 @@ async fn run_connect_admission_shutdown_barrier(mode: CompletionMode) {
         .join()
         .expect("shutdown poll thread panicked");
     let admitted = engine.diagnostics();
-    assert_eq!(admitted.lifecycle, RdmaEngineLifecycle::ShutdownRequested);
-    assert_eq!(admitted.live_connections, 1);
+    assert_eq!(
+        admitted.lifecycle, paused.lifecycle,
+        "the exclusively owned lifecycle changes only when the driver consumes shutdown"
+    );
+    assert_eq!(
+        admitted.live_connections, 1,
+        "the admitted connect command retains its transferable connection reservation"
+    );
 
     let driver_task = tokio::spawn(driver);
     let (connect_result, shutdown_result) = tokio::time::timeout(Duration::from_secs(10), async {
@@ -504,7 +516,16 @@ async fn run_operation_admission_shutdown_barrier(mode: CompletionMode) {
         .build()
         .unwrap();
     let resources = engine.test_resources().unwrap();
-    let driver_task = tokio::spawn(driver);
+    // Operation provider entry moved from the caller thread to the engine
+    // driver. Run that driver on a dedicated runtime so the synchronous test
+    // barrier below cannot block the task that must reach it.
+    let driver_task = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(driver)
+    });
     let (server, client) =
         establish_pair(&engine, &resources, RdmaConnectionConfig::default(), true).await;
     let recorder = DestructionRecorder::arm(64);
@@ -540,6 +561,11 @@ async fn run_operation_admission_shutdown_barrier(mode: CompletionMode) {
         shutdown
     });
     barrier.wait_until_shutdown_attempted().unwrap();
+    assert_eq!(
+        engine.diagnostics().lifecycle,
+        paused.lifecycle,
+        "shutdown cannot publish lifecycle while operation admission holds the barrier"
+    );
     barrier.release().unwrap();
 
     let mut operation = operation_thread
@@ -549,24 +575,48 @@ async fn run_operation_admission_shutdown_barrier(mode: CompletionMode) {
         .join()
         .expect("shutdown poll thread panicked");
     let admitted = engine.diagnostics();
-    assert_eq!(admitted.lifecycle, RdmaEngineLifecycle::ShutdownRequested);
-    assert_eq!(admitted.registered_operations, 1);
-    assert_eq!(admitted.accepted_operations, 1);
-    assert_eq!(admitted.available_cq_credits, OPERATIONS - 1);
+    assert!(
+        admitted.registered_operations <= 1,
+        "the one admitted operation may already have consumed its RXE flush completion"
+    );
+    assert_eq!(
+        admitted.accepted_operations, admitted.registered_operations,
+        "the admission race cannot leave a registered operation without exact provider ownership"
+    );
+    assert_eq!(
+        admitted.available_cq_credits + admitted.accepted_operations,
+        OPERATIONS
+    );
     assert_eq!(admitted.retained_cq_credits, 0);
 
     let mut server_close = Box::pin(server.close());
     let mut client_close = Box::pin(client.close());
-    assert!(poll_once(server_close.as_mut()).is_pending());
-    assert!(poll_once(client_close.as_mut()).is_pending());
+    let server_close_ready = match poll_once(server_close.as_mut()) {
+        Poll::Ready(result) => Some(result),
+        Poll::Pending => None,
+    };
+    let client_close_ready = match poll_once(client_close.as_mut()) {
+        Poll::Ready(result) => Some(result),
+        Poll::Pending => None,
+    };
     resources.transition_connection_to_error(&server).unwrap();
 
     let ((operation_result, returned), server_result, client_result, shutdown_result) =
         tokio::time::timeout(Duration::from_secs(15), async {
             tokio::join!(
                 operation.as_mut(),
-                server_close.as_mut(),
-                client_close.as_mut(),
+                async {
+                    match server_close_ready {
+                        Some(result) => result,
+                        None => server_close.as_mut().await,
+                    }
+                },
+                async {
+                    match client_close_ready {
+                        Some(result) => result,
+                        None => client_close.as_mut().await,
+                    }
+                },
                 shutdown.as_mut(),
             )
         })
@@ -577,7 +627,7 @@ async fn run_operation_admission_shutdown_barrier(mode: CompletionMode) {
     server_result.unwrap();
     client_result.unwrap();
     shutdown_result.unwrap();
-    driver_task.await.unwrap().unwrap();
+    driver_task.join().unwrap().unwrap();
 
     let diagnostics = engine.diagnostics();
     assert_eq!(diagnostics.lifecycle, RdmaEngineLifecycle::Terminated);

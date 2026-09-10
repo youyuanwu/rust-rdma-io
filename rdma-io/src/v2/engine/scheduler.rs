@@ -1,71 +1,9 @@
-//! Bounded owner rotation and owner-neutral deadline scheduling.
-//!
-//! Each work class can occupy its queue at most once. A class that remains
-//! ready is appended at the tail.
+//! Owner-neutral deadline scheduling.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
 
 use tokio::time::Instant;
-
-use super::progress::OwnerClass;
-
-const OWNER_CLASS_COUNT: usize = 2;
-
-/// Deduplicated fair rotation over progress owners.
-pub(super) struct OwnerScheduler {
-    classes: VecDeque<OwnerClass>,
-    queued: [bool; OWNER_CLASS_COUNT],
-    first_starts_next_pass: OwnerClass,
-}
-
-impl OwnerScheduler {
-    pub(super) fn new() -> Self {
-        Self {
-            classes: VecDeque::with_capacity(OWNER_CLASS_COUNT),
-            queued: [false; OWNER_CLASS_COUNT],
-            first_starts_next_pass: OwnerClass::Io,
-        }
-    }
-
-    pub(super) fn mark_ready(&mut self, class: OwnerClass) {
-        let queued = &mut self.queued[class.index()];
-        if !*queued {
-            *queued = true;
-            self.classes.push_back(class);
-        }
-    }
-
-    pub(super) fn next(&mut self) -> Option<OwnerClass> {
-        let class = self.classes.pop_front()?;
-        self.queued[class.index()] = false;
-        Some(class)
-    }
-
-    pub(super) fn begin_pass(&mut self) -> usize {
-        self.mark_ready(OwnerClass::Io);
-        self.mark_ready(OwnerClass::Session);
-
-        let first = self.first_starts_next_pass;
-        self.first_starts_next_pass = match first {
-            OwnerClass::Io => OwnerClass::Session,
-            OwnerClass::Session => OwnerClass::Io,
-        };
-        if self.classes.front() != Some(&first) {
-            let first_index = self
-                .classes
-                .iter()
-                .position(|class| *class == first)
-                .expect("both owners are queued at pass start");
-            self.classes.rotate_left(first_index);
-        }
-        self.ready_count()
-    }
-
-    pub(super) fn ready_count(&self) -> usize {
-        self.classes.len()
-    }
-}
 
 struct DeadlineEntry<P> {
     at: Instant,
@@ -139,6 +77,20 @@ impl<P> DeadlineQueue<P> {
         self.entries.peek().map(|entry| entry.0.at)
     }
 
+    pub(super) fn has_due(&self, now: Instant) -> bool {
+        self.entries.peek().is_some_and(|entry| entry.0.at <= now)
+    }
+
+    pub(super) fn drain_due(&mut self, now: Instant, limit: usize) -> VecDeque<P> {
+        let mut due = VecDeque::new();
+        while due.len() < limit
+            && let Some(payload) = self.pop_one_due(now)
+        {
+            due.push_back(payload);
+        }
+        due
+    }
+
     #[cfg(test)]
     pub(super) fn clear(&mut self) {
         self.entries.clear();
@@ -150,101 +102,10 @@ impl<P> DeadlineQueue<P> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Source {
-    First,
-    Second,
-}
-
-pub(super) struct AlternatingSources {
-    first_starts_next_turn: bool,
-}
-
-impl Default for AlternatingSources {
-    fn default() -> Self {
-        Self {
-            first_starts_next_turn: true,
-        }
-    }
-}
-
-impl AlternatingSources {
-    pub(super) fn begin_turn(&mut self) -> AlternatingTurn {
-        let first_preferred = self.first_starts_next_turn;
-        self.first_starts_next_turn = !first_preferred;
-        AlternatingTurn { first_preferred }
-    }
-
-    #[cfg(test)]
-    pub(super) fn first_starts_next_turn(&self) -> bool {
-        self.first_starts_next_turn
-    }
-}
-
-pub(super) struct AlternatingTurn {
-    first_preferred: bool,
-}
-
-impl AlternatingTurn {
-    pub(super) fn order(&self) -> [Source; 2] {
-        if self.first_preferred {
-            [Source::First, Source::Second]
-        } else {
-            [Source::Second, Source::First]
-        }
-    }
-
-    pub(super) fn consumed(&mut self) {
-        self.first_preferred = !self.first_preferred;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
-
-    #[test]
-    fn owner_classes_deduplicate_and_rotate() {
-        let mut scheduler = OwnerScheduler::new();
-        scheduler.mark_ready(OwnerClass::Io);
-        scheduler.mark_ready(OwnerClass::Session);
-        scheduler.mark_ready(OwnerClass::Io);
-
-        assert_eq!(scheduler.ready_count(), OWNER_CLASS_COUNT);
-        assert_eq!(scheduler.next(), Some(OwnerClass::Io));
-        scheduler.mark_ready(OwnerClass::Io);
-        assert_eq!(scheduler.next(), Some(OwnerClass::Session));
-        assert_eq!(scheduler.next(), Some(OwnerClass::Io));
-        assert_eq!(scheduler.next(), None);
-    }
-
-    #[test]
-    fn ready_at_entry_bounds_one_turn_per_owner_and_rotates_pass_start() {
-        let mut scheduler = OwnerScheduler::new();
-        let mut passes = Vec::new();
-
-        for _ in 0..3 {
-            let pass_budget = scheduler.begin_pass();
-            let mut serviced = Vec::new();
-            for _ in 0..pass_budget {
-                let class = scheduler.next().unwrap();
-                serviced.push(class);
-                scheduler.mark_ready(class);
-            }
-            passes.push(serviced);
-        }
-
-        assert_eq!(scheduler.ready_count(), OWNER_CLASS_COUNT);
-        assert_eq!(
-            passes,
-            [
-                vec![OwnerClass::Io, OwnerClass::Session],
-                vec![OwnerClass::Session, OwnerClass::Io],
-                vec![OwnerClass::Io, OwnerClass::Session],
-            ]
-        );
-    }
 
     #[test]
     fn deadlines_are_stable_and_popped_one_at_a_time() {
@@ -275,76 +136,5 @@ mod tests {
             Err(DeadlineSequenceExhausted)
         );
         assert_eq!(deadlines.next(), None);
-    }
-
-    #[test]
-    fn alternating_sources_flip_by_turn_and_consumed_unit() {
-        let mut sources = AlternatingSources::default();
-        let mut first = sources.begin_turn();
-        assert_eq!(first.order(), [Source::First, Source::Second]);
-        first.consumed();
-        assert_eq!(first.order(), [Source::Second, Source::First]);
-
-        let second = sources.begin_turn();
-        assert_eq!(second.order(), [Source::Second, Source::First]);
-        assert!(sources.first_starts_next_turn());
-    }
-
-    fn consume_sources(
-        sources: &mut AlternatingSources,
-        budget: usize,
-        first_available: &mut usize,
-        second_available: &mut usize,
-    ) -> Vec<Source> {
-        let mut turn = sources.begin_turn();
-        let mut consumed = Vec::new();
-        while consumed.len() < budget {
-            let mut selected = None;
-            for source in turn.order() {
-                let available = match source {
-                    Source::First => &mut *first_available,
-                    Source::Second => &mut *second_available,
-                };
-                if *available > 0 {
-                    *available -= 1;
-                    selected = Some(source);
-                    break;
-                }
-            }
-            let Some(source) = selected else {
-                break;
-            };
-            consumed.push(source);
-            turn.consumed();
-        }
-        consumed
-    }
-
-    #[test]
-    fn alternating_sources_cover_odd_even_budgets_and_sustained_pressure() {
-        let mut sources = AlternatingSources::default();
-        let mut first_available = 8;
-        let mut second_available = 8;
-
-        assert_eq!(
-            consume_sources(&mut sources, 3, &mut first_available, &mut second_available),
-            [Source::First, Source::Second, Source::First]
-        );
-        assert_eq!(
-            consume_sources(&mut sources, 4, &mut first_available, &mut second_available),
-            [Source::Second, Source::First, Source::Second, Source::First]
-        );
-    }
-
-    #[test]
-    fn alternating_sources_transfer_unused_opportunities_to_nonempty_source() {
-        let mut sources = AlternatingSources::default();
-        let mut first_available = 0;
-        let mut second_available = 3;
-
-        assert_eq!(
-            consume_sources(&mut sources, 3, &mut first_available, &mut second_available),
-            [Source::Second, Source::Second, Source::Second]
-        );
     }
 }

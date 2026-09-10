@@ -3,28 +3,31 @@
 use std::sync::Arc;
 
 use crate::v2::engine::io::PendingIoEvent;
+use crate::v2::engine::reactor::ReactorActions;
 use crate::v2::engine::registry::{ConnectionToken, OperationToken};
-use crate::v2::engine::session::IoEffectsCommitAuthority;
 
-use super::state::OperationState;
+use super::state::OperationObserver;
 
-/// Detached work that must run after the producing engine guards are dropped.
+/// Detached publication produced after provider submission and ownership
+/// reconciliation.
 ///
-/// This is the single publication primitive for the operation subtree: every
-/// effect state below delegates to [`AfterEngineUnlock::publish`], so events
-/// are always delivered before operation wakers are woken. Both payload
-/// vectors stay private so no caller can reorder or replay them.
+/// Direct setup/test callers publish this bundle immediately. Protocol
+/// commands append it to a command-owned [`ReactorActions`] buffer, which the
+/// command ingress drains into bounded turn-local actions without repeating
+/// provider submission.
 #[derive(Default)]
 pub(super) struct AfterEngineUnlock {
     events: Vec<PendingIoEvent>,
-    operations_to_wake: Vec<Arc<OperationState>>,
+    operations: Vec<Arc<OperationObserver>>,
+    closes: Vec<Arc<tokio::sync::Notify>>,
 }
 
 impl AfterEngineUnlock {
     pub(super) fn from_events(events: Vec<PendingIoEvent>) -> Self {
         Self {
             events,
-            operations_to_wake: Vec::new(),
+            operations: Vec::new(),
+            closes: Vec::new(),
         }
     }
 
@@ -32,26 +35,49 @@ impl AfterEngineUnlock {
         self.events.push(event);
     }
 
-    pub(super) fn push_operation_wake(&mut self, operation: Arc<OperationState>) {
-        self.operations_to_wake.push(operation);
+    pub(super) fn push_operation_wake(&mut self, observer: Arc<OperationObserver>) {
+        self.operations.push(observer);
+    }
+
+    pub(super) fn push_close_wake(&mut self, notify: Arc<tokio::sync::Notify>) {
+        self.closes.push(notify);
     }
 
     pub(super) fn extend(&mut self, mut other: Self) {
         self.events.append(&mut other.events);
-        self.operations_to_wake
-            .append(&mut other.operations_to_wake);
+        self.operations.append(&mut other.operations);
+        self.closes.append(&mut other.closes);
     }
 
-    /// Deliver every event, then wake every operation.
-    ///
-    /// Consuming `self` keeps publication single-shot, and the fixed order
-    /// guarantees a woken future observes its completion event.
+    pub(super) fn len(&self) -> usize {
+        self.events.len() + self.operations.len() + self.closes.len()
+    }
+
     pub(super) fn publish(self) {
         for event in self.events {
             event.deliver();
         }
-        for operation in self.operations_to_wake {
-            operation.wake();
+        for observer in self.operations {
+            observer.wake();
+        }
+        for notify in self.closes {
+            notify.notify_waiters();
+        }
+    }
+
+    pub(super) fn append_to(self, actions: &mut ReactorActions) {
+        assert!(
+            actions.can_accept(self.len()),
+            "operation publication exceeded reserved reactor capacity"
+        );
+        for event in self.events {
+            actions.push_event(event);
+        }
+        for observer in self.operations {
+            actions.push_operation_wake(observer);
+        }
+        for notify in self.closes {
+            actions.push_close_or_listener(move || notify.notify_waiters());
         }
     }
 }
@@ -59,12 +85,12 @@ impl AfterEngineUnlock {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::v2::engine) enum OperationQuarantineEffect {
     Added {
-        operation: OperationToken,
         connection: ConnectionToken,
+        operation: OperationToken,
     },
     Cleared {
-        operation: OperationToken,
         connection: ConnectionToken,
+        operation: OperationToken,
     },
 }
 
@@ -100,8 +126,13 @@ pub(in crate::v2::engine) struct DetachedIoCoreEffects {
 }
 
 impl CommittedIoCoreEffects {
+    #[cfg(test)]
     pub(in crate::v2::engine) fn publish(self) {
         self.after_unlock.publish();
+    }
+
+    pub(in crate::v2::engine) fn append_to(self, actions: &mut ReactorActions) {
+        self.after_unlock.append_to(actions);
     }
 }
 
@@ -114,8 +145,13 @@ impl DetachedIoCoreEffects {
         Self { after_unlock }
     }
 
+    #[cfg(test)]
     pub(in crate::v2::engine) fn publish(self) {
         self.after_unlock.publish();
+    }
+
+    pub(in crate::v2::engine) fn append_to(self, actions: &mut ReactorActions) {
+        self.after_unlock.append_to(actions);
     }
 }
 
@@ -130,8 +166,12 @@ impl IoCoreEffects {
         self.after_unlock.push_event(event);
     }
 
-    pub(super) fn push_operation_wake(&mut self, operation: Arc<OperationState>) {
-        self.after_unlock.push_operation_wake(operation);
+    pub(super) fn push_operation_wake(&mut self, observer: Arc<OperationObserver>) {
+        self.after_unlock.push_operation_wake(observer);
+    }
+
+    pub(super) fn push_close_wake(&mut self, notify: Arc<tokio::sync::Notify>) {
+        self.after_unlock.push_close_wake(notify);
     }
 
     pub(super) fn push_quarantine(&mut self, effect: OperationQuarantineEffect) {
@@ -171,13 +211,10 @@ impl IoCoreEffects {
     /// Convert to the publishable state once the session owner has applied all
     /// session-facing effects.
     ///
-    /// The authority reference is a type-only proof that the caller is the
-    /// session owner, and taking `self` by value prevents the original bundle
-    /// from being republished or re-committed.
-    pub(in crate::v2::engine) fn into_committed(
-        self,
-        _authority: &IoEffectsCommitAuthority,
-    ) -> CommittedIoCoreEffects {
+    /// Taking `self` by value prevents the original bundle from being
+    /// republished or re-committed after the reactor has applied its
+    /// connection-facing effects.
+    pub(in crate::v2::engine) fn into_committed(self) -> CommittedIoCoreEffects {
         CommittedIoCoreEffects {
             after_unlock: self.into_after_unlock(),
         }

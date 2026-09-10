@@ -123,8 +123,9 @@ fi
 # --- 4. rdma-core libs ---
 echo ""
 echo "=== Libraries ==="
+LDCONFIG_CACHE=$(ldconfig -p 2>/dev/null || true)
 for lib in libibverbs librdmacm; do
-    if ldconfig -p 2>/dev/null | grep -q "$lib"; then
+    if grep -Fq -- "$lib" <<<"$LDCONFIG_CACHE"; then
         ok "$lib present"
     else
         fail "$lib not found"

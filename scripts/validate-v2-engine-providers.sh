@@ -11,6 +11,7 @@ RUN_FULL_WORKSPACE=0
 ENGINE_CONFORMANCE=0
 FULL_VALIDATION=0
 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
+CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
 
 if [[ -z "${CARGO:-}" ]]; then
     if command -v cargo >/dev/null 2>&1; then
@@ -131,6 +132,7 @@ run_selected_test() {
             HOME="$user_home" \
             PATH="$TOOLCHAIN_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
             CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
+            CARGO_INCREMENTAL="$CARGO_INCREMENTAL" \
             RDMA_REQUIRE_PROVIDER=1 \
             RUST_TEST_THREADS=1 \
             "$CARGO" test -p rdma-io-tests --test "$target" -- --nocapture
@@ -138,6 +140,7 @@ run_selected_test() {
         env \
             PATH="$TOOLCHAIN_BIN:$PATH" \
             CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
+            CARGO_INCREMENTAL="$CARGO_INCREMENTAL" \
             RDMA_REQUIRE_PROVIDER=1 \
             RUST_TEST_THREADS=1 \
             "$CARGO" test -p rdma-io-tests --test "$target" -- --nocapture
@@ -206,11 +209,13 @@ run_production_build() {
             HOME="$user_home" \
             PATH="$TOOLCHAIN_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
             CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
+            CARGO_INCREMENTAL="$CARGO_INCREMENTAL" \
             "$CARGO" build -p rdma-io --release --no-default-features --features tokio
     else
         env \
             PATH="$TOOLCHAIN_BIN:$PATH" \
             CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
+            CARGO_INCREMENTAL="$CARGO_INCREMENTAL" \
             "$CARGO" build -p rdma-io --release --no-default-features --features tokio
     fi
 }
@@ -223,6 +228,7 @@ run_full_workspace() {
             HOME="$user_home" \
             PATH="$TOOLCHAIN_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
             CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
+            CARGO_INCREMENTAL="$CARGO_INCREMENTAL" \
             RDMA_REQUIRE_PROVIDER=1 \
             RUST_TEST_THREADS=1 \
             "$CARGO" test --workspace --all-features
@@ -230,6 +236,7 @@ run_full_workspace() {
         env \
             PATH="$TOOLCHAIN_BIN:$PATH" \
             CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
+            CARGO_INCREMENTAL="$CARGO_INCREMENTAL" \
             RDMA_REQUIRE_PROVIDER=1 \
             RUST_TEST_THREADS=1 \
             "$CARGO" test --workspace --all-features
@@ -244,19 +251,23 @@ run_static_preflight() {
             HOME="$user_home" \
             PATH="$TOOLCHAIN_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
             CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
+            CARGO_INCREMENTAL="$CARGO_INCREMENTAL" \
             RUSTFLAGS="-D warnings" \
             "$CARGO" check -p rdma-io --no-default-features || return $?
         sudo -u "$SUDO_USER" env \
             HOME="$user_home" \
             PATH="$TOOLCHAIN_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
             CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
+            CARGO_INCREMENTAL="$CARGO_INCREMENTAL" \
             RUSTFLAGS="-D warnings" \
             "$CARGO" check -p rdma-io --no-default-features --features tokio || return $?
     else
         env PATH="$TOOLCHAIN_BIN:$PATH" CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
+            CARGO_INCREMENTAL="$CARGO_INCREMENTAL" \
             RUSTFLAGS="-D warnings" \
             "$CARGO" check -p rdma-io --no-default-features || return $?
         env PATH="$TOOLCHAIN_BIN:$PATH" CARGO_BUILD_JOBS="$CARGO_BUILD_JOBS" \
+            CARGO_INCREMENTAL="$CARGO_INCREMENTAL" \
             RUSTFLAGS="-D warnings" \
             "$CARGO" check -p rdma-io --no-default-features --features tokio || return $?
     fi

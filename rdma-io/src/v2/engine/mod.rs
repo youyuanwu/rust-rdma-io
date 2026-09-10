@@ -5,8 +5,8 @@
 //! notification resources. Readiness owns one completion channel/fd; polling
 //! owns none. Every connection shares those objects.
 //!
-//! The driver is a thin scheduler over bounded I/O and session owner turns,
-//! followed by one terminal-eligibility epilogue. The I/O owner polls the
+//! The driver exclusively owns one bounded reactor and follows each turn with
+//! one terminal-eligibility epilogue. The I/O state polls the
 //! shared CQ and validates a CQE only when the
 //! current connection generation, operation generation, operation owner, and
 //! provider-reported `qp_num` all agree. The session owner consumes CM events
@@ -38,6 +38,7 @@ pub(crate) mod io;
 mod io_core;
 mod lifecycle;
 mod progress;
+mod reactor;
 mod registry;
 mod resources;
 mod scheduler;
@@ -46,8 +47,8 @@ mod session;
 #[cfg(test)]
 mod api_tests;
 
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use tokio::sync::Notify;
@@ -65,20 +66,19 @@ pub use driver::{
     TestSharedResourceIdentity,
 };
 pub use io_core::RdmaOperation;
-use io_core::{IoCore, IoDriverSignal, IoProgress};
+use io_core::{IoCoreDiagnostics, IoDriverSignal};
 use lifecycle::MemoizedTerminalResult;
+use reactor::{CommandIngress, EngineReactor};
 use registry::{lock_unpoison, write_unpoison};
-use resources::{EngineResourceRefs, EngineResources};
-use scheduler::OwnerScheduler;
-use session::DeadlineKind;
+use resources::EngineReactorResources;
 pub use session::connection::{RdmaConnection, RdmaConnectionIdentity};
 pub use session::listener::{RdmaListener, RdmaListenerConfig};
-use session::{SessionManager, SessionProgress};
+use session::{SessionFrontend, SessionManager};
 
 use super::error::{Error, Result};
 
 type ConnectionSetup =
-    Box<dyn FnOnce(io::IoConnection, io::IoEventReceiver) -> Result<usize> + Send>;
+    Box<dyn for<'a> FnOnce(io::BorrowedSetupIo<'a>, io::IoEventReceiver) -> Result<usize> + Send>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SetupSummary {
@@ -170,23 +170,20 @@ impl RdmaEngineBuilder {
         self
     }
 
-    /// Set I/O reclamation/deadline actions per I/O service turn in `1..=4096`.
+    /// Set operation reclamation/deadline actions per reactor turn in
+    /// `1..=4096`.
     ///
-    /// This and [`Self::session_reclamation_budget`] replace the former
-    /// aggregate v2 `reclamation_budget`. To preserve an old aggregate value
-    /// `N`, divide it between the two owner-local controls. Odd values may use
-    /// either floor/ceiling assignment. The old value `1` has no exact
-    /// equivalent because both owners require a nonzero bounded turn; the
-    /// minimum replacement is `(1, 1)`.
+    /// This independent bound prevents cancellation and missing-CQE work from
+    /// consuming the connection-lifecycle source's turn budget.
     pub fn io_reclamation_budget(mut self, value: usize) -> Self {
         self.config.io_reclamation_budget = value;
         self
     }
 
-    /// Set session reclamation/deadline actions per session turn in `1..=4096`.
+    /// Set connection drain/deadline actions per reactor turn in `1..=4096`.
     ///
-    /// See [`Self::io_reclamation_budget`] for migration from the removed
-    /// aggregate `reclamation_budget` control.
+    /// This independent bound prevents connection lifecycle work from
+    /// consuming the operation-reclamation source's turn budget.
     pub fn session_reclamation_budget(mut self, value: usize) -> Self {
         self.config.session_reclamation_budget = value;
         self
@@ -228,20 +225,20 @@ impl RdmaEngineBuilder {
             preflight_tokio_io()?;
         }
 
-        let (resources, provider) = EngineResources::build(&self.config)?;
-        let resource_refs = resources.connection_resource_refs();
-        let shared = EngineShared::new(self.config, Some(provider), Some(resource_refs))?;
+        let (resources, provider) = EngineReactorResources::build(&self.config)?;
+        let memory = resources.memory_registrar();
+        let (shared, session) = EngineFrontendRoot::new(self.config, Some(provider), memory)?;
         #[cfg(any(test, feature = "test-hooks"))]
         let shared = {
             let mut shared = shared;
-            shared.test_resources = Some(resources.test_resource_refs());
+            shared.test_observers = Some(resources.test_resource_observers());
             shared
         };
         let shared = shared.into_shared();
         let engine = RdmaEngine {
             shared: Arc::clone(&shared),
         };
-        let driver = RdmaEngineDriver::new(shared, Some(resources));
+        let driver = RdmaEngineDriver::new(shared, session, Some(resources));
         Ok((engine, driver))
     }
 }
@@ -262,7 +259,7 @@ impl RdmaEngineBuilder {
 /// new submissions are finished, and prefer [`RdmaEngine::shutdown`] when the
 /// terminal result must be observed.
 pub struct RdmaEngine {
-    shared: Arc<EngineShared>,
+    shared: Arc<EngineFrontendRoot>,
 }
 
 impl Clone for RdmaEngine {
@@ -282,9 +279,9 @@ impl RdmaEngine {
     /// deadline is 30 seconds; unresolved accepted WR bundles return
     /// [`Error::EngineWedged`] and remain retained fail-closed.
     pub async fn shutdown(&self) -> Result<()> {
-        self.shared.request_shutdown();
+        self.shared.request_shutdown_command();
         loop {
-            let notified = self.shared.terminal_notify.notified();
+            let notified = self.shared.observer.terminal_notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             if let Some(outcome) = self.shared.outcome() {
@@ -312,6 +309,7 @@ impl RdmaEngine {
     pub async fn connect(&self, address: std::net::SocketAddr) -> Result<RdmaConnection> {
         session::cm::connect(
             Arc::clone(&self.shared.session),
+            Arc::clone(&self.shared.commands),
             address,
             RdmaConnectionConfig::default(),
         )
@@ -328,7 +326,13 @@ impl RdmaEngine {
         address: std::net::SocketAddr,
         config: RdmaConnectionConfig,
     ) -> Result<RdmaConnection> {
-        session::cm::connect(Arc::clone(&self.shared.session), address, config).await
+        session::cm::connect(
+            Arc::clone(&self.shared.session),
+            Arc::clone(&self.shared.commands),
+            address,
+            config,
+        )
+        .await
     }
 
     pub(crate) async fn connect_with_io_setup<F>(
@@ -338,10 +342,13 @@ impl RdmaEngine {
         setup: F,
     ) -> Result<RdmaConnection>
     where
-        F: FnOnce(io::IoConnection, io::IoEventReceiver) -> Result<usize> + Send + 'static,
+        F: for<'a> FnOnce(io::BorrowedSetupIo<'a>, io::IoEventReceiver) -> Result<usize>
+            + Send
+            + 'static,
     {
         session::cm::connect_with_setup(
             Arc::clone(&self.shared.session),
+            Arc::clone(&self.shared.commands),
             address,
             config,
             Box::new(setup),
@@ -358,25 +365,29 @@ impl RdmaEngine {
 
     /// Bind an engine-owned listener on the shared CM event channel.
     ///
-    /// `config.backlog_capacity()` is the userspace pending-child queue limit
-    /// and must be in `1..=4096`. Independently, the engine requests
-    /// `i32::MAX` from the kernel through `rdma_listen`. Providers may clamp
-    /// that kernel request, reducing how many requests reach userspace, or
-    /// refuse it. Refusal is returned here as a contextual listener-creation
-    /// error and is not counted as a userspace `BacklogFull` rejection.
+    /// `config.backlog_capacity()` must be in `1..=4096`. The validated value
+    /// is passed unchanged to `rdma_listen` and also bounds admitted accept
+    /// requests and pending inbound children. Provider refusal is returned as
+    /// a contextual listener-creation error.
     pub async fn listen(
         &self,
         address: std::net::SocketAddr,
         config: RdmaListenerConfig,
     ) -> Result<RdmaListener> {
-        session::listener::listen(Arc::clone(&self.shared.session), address, config).await
+        session::listener::listen(
+            Arc::clone(&self.shared.session),
+            Arc::clone(&self.shared.commands),
+            address,
+            config,
+        )
+        .await
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     pub fn test_resources(&self) -> Result<driver::TestEngineResources> {
         let resources =
-            self.shared.test_resources.clone().ok_or_else(|| {
+            self.shared.test_observers.clone().ok_or_else(|| {
                 Error::InvalidConfig("test engine resources are unavailable".into())
             })?;
         Ok(driver::TestEngineResources::new(&self.shared, resources))
@@ -386,16 +397,16 @@ impl RdmaEngine {
 impl Drop for RdmaEngine {
     fn drop(&mut self) {
         if self.shared.frontend_count.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.shared.request_shutdown();
+            self.shared.request_shutdown_command();
         }
     }
 }
 
 /// Sole progress future for an [`RdmaEngine`].
 ///
-/// The driver fairly rotates across two opaque bounded owners: I/O and session.
-/// Every external poll probes both, services each ready-at-entry owner at most
-/// once, and then composes terminal eligibility. CQ polling, completion
+/// The driver fairly rotates across the bounded sources of one owned reactor.
+/// Every external poll probes all sources, services each ready-at-entry source
+/// at most once, and then composes terminal eligibility. CQ polling, completion
 /// dispatch, and operation deadlines remain behind the I/O owner; CM progress,
 /// lifecycle deadlines, and teardown remain behind the session owner. Message
 /// protocol work belongs to [`crate::v2::MessageTransportDriver`]. Readiness
@@ -427,102 +438,143 @@ impl Drop for RdmaEngine {
 /// to `tokio::spawn` without a wrapper method. Exactly one driver is returned
 /// per successful build, and the engine creates zero internal tasks.
 pub struct RdmaEngineDriver {
-    shared: Arc<EngineShared>,
-    io_progress: IoProgress,
-    session_progress: SessionProgress,
-    scheduler: OwnerScheduler,
+    shared: Arc<EngineFrontendRoot>,
+    reactor: EngineReactor,
     deadline_sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
     deadline_at: Option<tokio::time::Instant>,
     runtime_checked: bool,
 }
 
-struct EngineShared {
-    config: EngineConfig,
-    // This engine-owned core retain drops before the root resources below.
-    // Operation futures may extend the Arc, but each MR anchors its PD and an
-    // engine with accepted work is retained fail-closed.
-    io_core: Arc<IoCore>,
-    session: Arc<SessionManager>,
+/// Resource-free lifecycle/result observation published by `EngineReactor`.
+struct EngineObserver {
     lifecycle: AtomicU8,
-    shutdown_requested: AtomicBool,
-    shutdown_deadline_scheduled: AtomicBool,
-    failure_retained: AtomicBool,
-    frontend_count: AtomicUsize,
-    work_signal: Arc<WorkSignal>,
-    // Notify stores only live Notified futures and wakes every concurrent
-    // shutdown waiter without retaining registrations from dropped futures.
-    terminal_notify: Notify,
+    terminal_notify: Arc<Notify>,
     terminal: Mutex<Option<MemoizedTerminalResult>>,
-    pending_terminal: Mutex<Option<MemoizedTerminalResult>>,
-    #[cfg(any(test, feature = "test-hooks"))]
-    test_resources: Option<resources::TestResourceRefs>,
-    #[cfg(any(test, feature = "test-hooks"))]
-    test_driver: Arc<driver::test_api::TestDriverState>,
-    // Rust drops fields in declaration order. Keep this root retain after every
-    // registry/test owner so quarantined QP/CM/MR descendants are released
-    // before the shared CQ, PD, CM event channel, and context can disappear.
-    #[allow(
-        dead_code,
-        reason = "retains canonical device resources through root teardown ordering"
-    )]
-    resource_refs: Option<EngineResourceRefs>,
 }
 
-/// Weak, owner-neutral access from session progress to engine-wide runtime state.
-///
-/// The capability deliberately excludes I/O registries, session registries,
-/// provider resources, and lifecycle authority. `SessionManager` can observe
-/// or publish global composition state without recovering `EngineShared`.
-trait SessionEngineRuntime: Send + Sync {
-    fn admission_error(&self) -> Option<Error>;
+impl EngineObserver {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            lifecycle: AtomicU8::new(lifecycle_to_u8(RdmaEngineLifecycle::Created)),
+            terminal_notify: Arc::new(Notify::new()),
+            terminal: Mutex::new(None),
+        })
+    }
 
-    fn outcome(&self) -> Option<MemoizedTerminalResult>;
+    fn publish_lifecycle(&self, lifecycle: RdmaEngineLifecycle) {
+        self.lifecycle
+            .store(lifecycle_to_u8(lifecycle), Ordering::Release);
+    }
 
-    fn shutdown_requested(&self) -> bool;
-
-    fn pending_terminal_outcome(&self) -> Option<MemoizedTerminalResult>;
-
-    fn begin_driver_failure(&self, error: Error);
-
-    fn shutdown_deadline_failure(&self) -> Option<Error>;
-
-    fn publish_io_work(&self);
-
-    fn publish_session_work(&self);
-}
-
-impl SessionEngineRuntime for EngineShared {
-    fn admission_error(&self) -> Option<Error> {
-        EngineShared::admission_error(self)
+    fn publish_terminal_into(
+        &self,
+        outcome: MemoizedTerminalResult,
+        actions: &mut reactor::ReactorActions,
+    ) {
+        let mut terminal = lock_unpoison(&self.terminal);
+        if terminal.is_some() {
+            return;
+        }
+        *terminal = Some(outcome);
+        drop(terminal);
+        let terminal_notify = Arc::clone(&self.terminal_notify);
+        actions.push_terminal(move || terminal_notify.notify_waiters());
     }
 
     fn outcome(&self) -> Option<MemoizedTerminalResult> {
-        EngineShared::outcome(self)
+        lock_unpoison(&self.terminal).clone()
     }
 
-    fn shutdown_requested(&self) -> bool {
-        self.shutdown_requested.load(Ordering::Acquire)
+    fn lifecycle(&self) -> RdmaEngineLifecycle {
+        lifecycle_from_u8(self.lifecycle.load(Ordering::Acquire))
+    }
+}
+
+/// Resource-free failure/admission ingress; it owns no lifecycle or terminal result.
+struct EngineControl {
+    driver_failure: Mutex<Option<Error>>,
+    admission: Arc<RwLock<()>>,
+    commands: std::sync::Weak<CommandIngress>,
+    observer: std::sync::Weak<EngineObserver>,
+    work_signal: std::sync::Weak<WorkSignal>,
+}
+
+impl EngineControl {
+    fn new(
+        admission: Arc<RwLock<()>>,
+        commands: &Arc<CommandIngress>,
+        observer: &Arc<EngineObserver>,
+        work_signal: &Arc<WorkSignal>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            driver_failure: Mutex::new(None),
+            admission,
+            commands: Arc::downgrade(commands),
+            observer: Arc::downgrade(observer),
+            work_signal: Arc::downgrade(work_signal),
+        })
     }
 
-    fn pending_terminal_outcome(&self) -> Option<MemoizedTerminalResult> {
-        EngineShared::pending_terminal_outcome(self)
+    fn request_driver_failure(&self, error: Error) {
+        let mut pending = lock_unpoison(&self.driver_failure);
+        let terminal = self
+            .observer
+            .upgrade()
+            .and_then(|observer| observer.outcome());
+        if pending.is_none() && terminal.is_none() {
+            *pending = Some(error.clone());
+            let admission = write_unpoison(&self.admission);
+            if let Some(commands) = self.commands.upgrade() {
+                commands.close_admission_with(error);
+            }
+            drop(admission);
+            if let Some(work_signal) = self.work_signal.upgrade() {
+                work_signal.publish(driver::IO_WORK | driver::SESSION_WORK);
+            }
+        }
     }
 
-    fn begin_driver_failure(&self, error: Error) {
-        EngineShared::begin_driver_failure(self, error);
+    fn take_driver_failure(&self) -> Option<Error> {
+        lock_unpoison(&self.driver_failure).take()
     }
 
-    fn shutdown_deadline_failure(&self) -> Option<Error> {
-        EngineShared::shutdown_deadline_failure(self)
+    fn publish(&self, work: usize) {
+        if let Some(work_signal) = self.work_signal.upgrade() {
+            work_signal.publish(work);
+        }
     }
+}
 
-    fn publish_io_work(&self) {
-        self.work_signal.publish(driver::IO_WORK);
-    }
-
-    fn publish_session_work(&self) {
-        self.work_signal.publish(driver::SESSION_WORK);
-    }
+/// Resource-free composition root shared by public frontends and the driver.
+///
+/// Provider resources and mutable runtime policy are owned only by
+/// `EngineReactor`. This root contains ingress, terminal observation,
+/// immutable diagnostics snapshots, and explicitly shareable frontend
+/// capabilities.
+struct EngineFrontendRoot {
+    config: EngineConfig,
+    // Runtime-state-free policy retained by the frontend composition root.
+    // Provider ownership remains exclusively in EngineReactor.
+    session: Arc<SessionFrontend>,
+    io_diagnostics: Mutex<IoCoreDiagnostics>,
+    connection_diagnostics: Mutex<session::connection::ConnectionStateCountSnapshot>,
+    cm_diagnostics: Mutex<(usize, usize)>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    cm_rejections: std::sync::atomic::AtomicU64,
+    #[cfg(any(test, feature = "test-hooks"))]
+    io_rejections: Mutex<Vec<io_core::CqeReject>>,
+    // Resource-free frontend observation published by the driver-owned
+    // lifecycle state.
+    observer: Arc<EngineObserver>,
+    control: Arc<EngineControl>,
+    frontend_count: AtomicUsize,
+    work_signal: Arc<WorkSignal>,
+    commands: Arc<CommandIngress>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    // Weak provider identities used only for deterministic test observation.
+    test_observers: Option<resources::TestResourceObservers>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    test_driver: Arc<driver::test_api::TestDriverState>,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -569,334 +621,157 @@ impl IoDriverSignal for EngineIoDriverSignal {
     }
 }
 
-impl EngineShared {
+impl EngineFrontendRoot {
     fn into_shared(self) -> Arc<Self> {
-        let shared = Arc::new(self);
-        shared.session.bind_self();
-        let session_runtime: Arc<dyn SessionEngineRuntime> = shared.clone();
-        shared.session.bind_engine(&session_runtime);
-        shared
+        Arc::new(self)
     }
 
     fn new(
         config: EngineConfig,
         provider: Option<config::ProviderLimits>,
-        resource_refs: Option<EngineResourceRefs>,
-    ) -> Result<Self> {
+        memory: io::MemoryRegistrar,
+    ) -> Result<(Self, SessionManager)> {
         let admission = Arc::new(RwLock::new(()));
         let work_signal = Arc::new(WorkSignal::new());
-        let memory = io::MemoryRegistrar::from_resources(resource_refs.as_ref());
+        let commands = CommandIngress::new(
+            config.max_live_connections,
+            config.max_inflight_operations,
+            Arc::clone(&work_signal),
+        );
+        let observer = EngineObserver::new();
+        let control =
+            EngineControl::new(Arc::clone(&admission), &commands, &observer, &work_signal);
         #[cfg(any(test, feature = "test-hooks"))]
         let test_driver = Arc::new(driver::test_api::TestDriverState::new());
-        let io_driver_signal: Arc<dyn IoDriverSignal> = Arc::new(EngineIoDriverSignal {
-            work_signal: Arc::clone(&work_signal),
-            #[cfg(any(test, feature = "test-hooks"))]
-            test_driver: Arc::clone(&test_driver),
-        });
-        let (io_core, qp_reclaim) = IoCore::new(
-            config.max_inflight_operations,
-            config.cq_capacity,
-            config.missing_cqe_deadline,
-            config.completion_dispatch_budget,
-            Arc::clone(&admission),
-            io_driver_signal,
-        )?;
-        let session = Arc::new(SessionManager::new(
+        let session = SessionManager::new(
             config::SessionConfig::from(&config),
             provider,
             Arc::clone(&admission),
-            Arc::clone(&io_core),
             memory,
-            qp_reclaim,
+            Arc::downgrade(&control),
             #[cfg(any(test, feature = "test-hooks"))]
             SessionTestInstrumentation {
                 driver: Arc::clone(&test_driver),
             },
-        )?);
-        Ok(Self {
-            config,
-            io_core,
+        )?;
+        session.bind_self();
+        session.bind_commands(&commands);
+        session.bind_engine(&observer, &work_signal);
+        let session_frontend = session.frontend();
+        let initial_cq_credits = config.cq_capacity;
+        Ok((
+            Self {
+                config,
+                session: session_frontend,
+                io_diagnostics: Mutex::new(IoCoreDiagnostics {
+                    registered_operations: 0,
+                    accepted_operations: 0,
+                    pending_reclamations: 0,
+                    available_cq_credits: initial_cq_credits,
+                    retained_cq_credits: 0,
+                    quarantined_operations: 0,
+                    quarantined_mrs: 0,
+                    quarantined_bytes: 0,
+                }),
+                connection_diagnostics: Mutex::new(
+                    session::connection::ConnectionStateCountSnapshot::default(),
+                ),
+                cm_diagnostics: Mutex::new((0, 0)),
+                #[cfg(any(test, feature = "test-hooks"))]
+                cm_rejections: std::sync::atomic::AtomicU64::new(0),
+                #[cfg(any(test, feature = "test-hooks"))]
+                io_rejections: Mutex::new(Vec::new()),
+                observer,
+                control,
+                frontend_count: AtomicUsize::new(1),
+                work_signal,
+                commands,
+                #[cfg(any(test, feature = "test-hooks"))]
+                test_observers: None,
+                #[cfg(any(test, feature = "test-hooks"))]
+                test_driver,
+            },
             session,
-            lifecycle: AtomicU8::new(lifecycle_to_u8(RdmaEngineLifecycle::Created)),
-            shutdown_requested: AtomicBool::new(false),
-            shutdown_deadline_scheduled: AtomicBool::new(false),
-            failure_retained: AtomicBool::new(false),
-            frontend_count: AtomicUsize::new(1),
-            work_signal,
-            terminal_notify: Notify::new(),
-            terminal: Mutex::new(None),
-            pending_terminal: Mutex::new(None),
-            #[cfg(any(test, feature = "test-hooks"))]
-            test_resources: None,
-            #[cfg(any(test, feature = "test-hooks"))]
-            test_driver,
-            resource_refs,
-        })
+        ))
     }
 
+    fn request_shutdown_command(&self) {
+        // Admission closes synchronously so no operation can cross the
+        // shutdown boundary before the driver consumes the control command.
+        // Provider and teardown progress still require the driver.
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.test_driver.record_shutdown_attempt();
+        let admission = write_unpoison(&self.session.admission);
+        self.commands.close_admission_with(Error::DriverShutdown);
+        drop(admission);
+        self.commands.request_shutdown();
+    }
+
+    #[cfg(test)]
     fn request_shutdown(&self) {
         #[cfg(any(test, feature = "test-hooks"))]
         self.test_driver.record_shutdown_attempt();
-        self.mark_shutdown_requested();
-        if !self
-            .shutdown_deadline_scheduled
-            .swap(true, Ordering::AcqRel)
-        {
-            self.session.schedule_deadline(
-                DeadlineKind::EngineShutdown,
-                0,
-                self.config.shutdown_deadline,
-            );
-        }
+        let admission = write_unpoison(&self.session.admission);
+        self.commands.close_admission_with(Error::DriverShutdown);
+        drop(admission);
+        self.commands.request_shutdown();
+    }
 
+    fn start_shutdown_progress(&self) {
         self.work_signal
             .publish(driver::IO_WORK | driver::SESSION_WORK);
     }
 
-    fn mark_shutdown_requested(&self) -> bool {
-        let _admission = write_unpoison(&self.session.admission);
-        if self.shutdown_requested.swap(true, Ordering::AcqRel) {
-            return false;
-        }
-        self.io_core.close_admission(Some(Error::DriverShutdown));
-        self.transition_shutdown_requested();
-        true
+    fn publish_lifecycle(&self, lifecycle: RdmaEngineLifecycle) {
+        self.observer.publish_lifecycle(lifecycle);
     }
 
-    fn finish(&self, outcome: MemoizedTerminalResult) {
-        assert!(
-            !outcome.is_connection_quarantined(),
-            "ConnectionQuarantined is connection-local; no connection quarantine can terminate the engine driver"
-        );
-        let (io_effects, connections_to_wake) = {
-            let _admission = write_unpoison(&self.session.admission);
-            let mut terminal = lock_unpoison(&self.terminal);
-            if terminal.is_some() {
-                return;
-            }
-            self.shutdown_requested.store(true, Ordering::Release);
-            self.io_core.close_admission(outcome.error());
-            self.transition_shutdown_requested();
-            let lifecycle = if outcome.is_success() {
-                RdmaEngineLifecycle::Terminated
-            } else {
-                RdmaEngineLifecycle::Failed
-            };
-            *terminal = Some(outcome.clone());
-            self.transition_terminal(lifecycle);
-
-            let io_effects = self.io_core.terminalize_operations(&outcome);
-
-            let connections_to_wake = self.session.connections.occupied();
-            drop(terminal);
-            (io_effects, connections_to_wake)
-        };
-
-        let committed_io_effects = self.session.apply_terminal_io_effects(io_effects);
-        self.session.terminalize_cm(&outcome);
-        for connection in &connections_to_wake {
-            if outcome.is_error() && connection.retain_bundle_for_engine_failure() {
-                self.session.track_connection_quarantine(connection.token);
-            }
-            if let Some(event) = self
-                .session
-                .finalize_connection_engine(connection, &outcome)
-            {
-                event.deliver();
-            }
-        }
-        committed_io_effects.publish();
-        for connection in connections_to_wake {
-            connection.wake_close();
-        }
-        self.terminal_notify.notify_waiters();
+    fn publish_terminal_into(
+        &self,
+        outcome: MemoizedTerminalResult,
+        actions: &mut reactor::ReactorActions,
+    ) {
+        self.observer.publish_terminal_into(outcome, actions);
     }
 
-    fn progress_driver_terminal(
-        self: &Arc<Self>,
-        io_progress: &IoProgress,
-        session_progress: &SessionProgress,
-    ) -> bool {
-        if !self.shutdown_requested.load(Ordering::Acquire)
-            || !io_progress.can_finish()
-            || !session_progress.can_finish()
-        {
-            return false;
-        }
-        let pending = lock_unpoison(&self.pending_terminal).clone();
-        if let Some(outcome) = pending {
-            self.finish_after_owner_cleanup(outcome);
-            Self::retain_after_failure(self);
-        } else {
-            self.finish_after_owner_cleanup(MemoizedTerminalResult::success());
-        }
-        true
+    #[cfg(test)]
+    fn request_driver_failure(&self, error: Error) {
+        self.control.request_driver_failure(error);
     }
 
+    fn take_driver_failure(&self) -> Option<Error> {
+        self.control.take_driver_failure()
+    }
+
+    #[cfg(test)]
     fn begin_driver_failure(&self, error: Error) {
-        let outcome = MemoizedTerminalResult::from_error(error);
-        let mut pending = lock_unpoison(&self.pending_terminal);
-        if pending.is_none() {
-            *pending = Some(outcome.clone());
-            self.mark_shutdown_requested();
-            self.io_core.close_admission(outcome.error());
-            self.io_core.begin_terminal_failure(outcome);
-        }
-        drop(pending);
-        self.work_signal
-            .publish(driver::IO_WORK | driver::SESSION_WORK);
-    }
-
-    fn pending_terminal_outcome(&self) -> Option<MemoizedTerminalResult> {
-        lock_unpoison(&self.pending_terminal).clone()
-    }
-
-    fn finish_after_owner_cleanup(&self, outcome: MemoizedTerminalResult) {
-        let mut terminal = lock_unpoison(&self.terminal);
-        if terminal.is_some() {
-            return;
-        }
-        let lifecycle = if outcome.is_success() {
-            RdmaEngineLifecycle::Terminated
-        } else {
-            RdmaEngineLifecycle::Failed
-        };
-        *terminal = Some(outcome);
-        self.transition_terminal(lifecycle);
-        drop(terminal);
-        self.terminal_notify.notify_waiters();
-    }
-
-    fn handle_driver_drop(self: &Arc<Self>) {
-        if self.outcome().is_some() {
-            return;
-        }
-        self.mark_shutdown_requested();
-        self.session.synchronously_prepare_driver_drop();
-        let outstanding = self.io_core.accepted_count();
-        let cm_owners = self
-            .session
-            .retained_cm_owner_count()
-            .max(self.session.live_connection_count());
-        let error = if outstanding == 0 && cm_owners == 0 {
-            Error::DriverShutdown
-        } else {
-            Error::EngineWedged {
-                retained_bundles: self.retained_bundle_count().max(1),
-                outstanding_operations: outstanding,
-                cq_debt: outstanding,
-            }
-        };
-        self.finish(MemoizedTerminalResult::from_error(error));
-        Self::retain_after_failure(self);
+        self.request_driver_failure(error);
     }
 
     fn outcome(&self) -> Option<MemoizedTerminalResult> {
-        lock_unpoison(&self.terminal).clone()
-    }
-
-    fn transition_running(&self) {
-        let _ = self.lifecycle.compare_exchange(
-            lifecycle_to_u8(RdmaEngineLifecycle::Created),
-            lifecycle_to_u8(RdmaEngineLifecycle::Running),
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-    }
-
-    fn transition_shutdown_requested(&self) {
-        let mut current = self.lifecycle.load(Ordering::Acquire);
-        loop {
-            let state = lifecycle_from_u8(current);
-            if matches!(
-                state,
-                RdmaEngineLifecycle::ShutdownRequested
-                    | RdmaEngineLifecycle::Terminated
-                    | RdmaEngineLifecycle::Failed
-            ) {
-                return;
-            }
-            match self.lifecycle.compare_exchange_weak(
-                current,
-                lifecycle_to_u8(RdmaEngineLifecycle::ShutdownRequested),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return,
-                Err(observed) => current = observed,
-            }
-        }
-    }
-
-    fn transition_terminal(&self, terminal: RdmaEngineLifecycle) {
-        debug_assert!(matches!(
-            terminal,
-            RdmaEngineLifecycle::Terminated | RdmaEngineLifecycle::Failed
-        ));
-        let mut current = self.lifecycle.load(Ordering::Acquire);
-        loop {
-            if matches!(
-                lifecycle_from_u8(current),
-                RdmaEngineLifecycle::Terminated | RdmaEngineLifecycle::Failed
-            ) {
-                return;
-            }
-            match self.lifecycle.compare_exchange_weak(
-                current,
-                lifecycle_to_u8(terminal),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return,
-                Err(observed) => current = observed,
-            }
-        }
+        self.observer.outcome()
     }
 
     fn lifecycle(&self) -> RdmaEngineLifecycle {
-        lifecycle_from_u8(self.lifecycle.load(Ordering::Acquire))
+        self.observer.lifecycle()
     }
 
     fn admission_error(&self) -> Option<Error> {
         if let Some(outcome) = self.outcome() {
             return outcome.into_result().err();
         }
-        self.shutdown_requested
-            .load(Ordering::Acquire)
-            .then_some(Error::DriverShutdown)
-    }
-
-    fn retained_bundle_count(&self) -> usize {
-        self.session
-            .live_connection_count()
-            .max(self.session.cm.retained_owner_count())
-    }
-
-    fn unsafe_outstanding_operations(&self) -> usize {
-        self.io_core.accepted_count()
-    }
-
-    fn retain_after_failure(shared: &Arc<Self>) {
-        if (shared.unsafe_outstanding_operations() == 0
-            && shared.session.live_connection_count() == 0
-            && shared.session.cm.retained_owner_count() == 0)
-            || shared.failure_retained.swap(true, Ordering::AcqRel)
-        {
-            return;
-        }
-        failed_engine_quarantine()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .push(Arc::clone(shared));
+        self.commands.admission_error()
     }
 
     fn diagnostics(&self) -> RdmaEngineDiagnostics {
-        let connection_counts = self.session.connection_admission.snapshot();
-        let io = self.io_core.diagnostics();
+        let connection_counts = *lock_unpoison(&self.connection_diagnostics);
+        let io = *lock_unpoison(&self.io_diagnostics);
         RdmaEngineDiagnostics {
             lifecycle: self.lifecycle(),
             terminal_error: self.outcome().and_then(|outcome| outcome.summary()),
-            live_connections: connection_counts.live,
+            live_connections: connection_counts
+                .live
+                .max(self.commands.connection_reservations()),
             registered_operations: io.registered_operations,
             accepted_operations: io.accepted_operations,
             pending_reclamations: io.pending_reclamations,
@@ -908,6 +783,31 @@ impl EngineShared {
             quarantined_connections: connection_counts.quarantined_bundles,
         }
     }
+
+    fn update_io_diagnostics(&self, diagnostics: IoCoreDiagnostics) {
+        *lock_unpoison(&self.io_diagnostics) = diagnostics;
+    }
+
+    fn update_connection_diagnostics(
+        &self,
+        diagnostics: session::connection::ConnectionStateCountSnapshot,
+    ) {
+        *lock_unpoison(&self.connection_diagnostics) = diagnostics;
+    }
+
+    fn update_cm_diagnostics(&self, pending_routes: usize, retained_owners: usize) {
+        *lock_unpoison(&self.cm_diagnostics) = (pending_routes, retained_owners);
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn update_cm_rejections(&self, rejected: u64) {
+        self.cm_rejections.store(rejected, Ordering::Release);
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn update_io_rejections(&self, rejections: Vec<io_core::CqeReject>) {
+        *lock_unpoison(&self.io_rejections) = rejections;
+    }
 }
 
 fn preflight_tokio_io() -> Result<()> {
@@ -917,13 +817,6 @@ fn preflight_tokio_io() -> Result<()> {
         ));
     }
     Ok(())
-}
-
-fn failed_engine_quarantine() -> &'static Mutex<Vec<Arc<EngineShared>>> {
-    // No progress source remains after terminal driver failure, so accepted
-    // QP/CM/MR bundles cannot reach a positive release boundary.
-    static ENGINES: OnceLock<Mutex<Vec<Arc<EngineShared>>>> = OnceLock::new();
-    ENGINES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 const fn lifecycle_to_u8(lifecycle: RdmaEngineLifecycle) -> u8 {
@@ -948,13 +841,24 @@ const fn lifecycle_from_u8(value: u8) -> RdmaEngineLifecycle {
 
 #[cfg(test)]
 pub(crate) fn test_engine_pair(mode: CompletionMode) -> (RdmaEngine, RdmaEngineDriver) {
+    test_engine_pair_with_capacity(mode, EngineConfig::new("test0".into()).max_live_connections)
+}
+
+#[cfg(test)]
+pub(crate) fn test_engine_pair_with_capacity(
+    mode: CompletionMode,
+    max_live_connections: usize,
+) -> (RdmaEngine, RdmaEngineDriver) {
     let mut config = EngineConfig::new("test0".into());
     config.completion_mode = mode;
-    let shared = EngineShared::new(config, None, None).unwrap().into_shared();
+    config.max_live_connections = max_live_connections;
+    let (shared, session) =
+        EngineFrontendRoot::new(config, None, io::MemoryRegistrar::from_pd(None)).unwrap();
+    let shared = shared.into_shared();
     (
         RdmaEngine {
             shared: Arc::clone(&shared),
         },
-        RdmaEngineDriver::new(shared, None),
+        RdmaEngineDriver::new(shared, session, None),
     )
 }

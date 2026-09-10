@@ -187,19 +187,28 @@ pub mod test_helpers {
 
     fn is_transient_v2_listener_message(message: &str) -> bool {
         const PREFIX: &str = "listen on ";
-        const BACKLOG: &str = " with requested kernel backlog 2147483647: ";
+        const BACKLOG: &str = " with backlog ";
 
-        let Some((address, source)) = message
+        let expected_source = std::io::Error::from_raw_os_error(98).to_string();
+        let Some((listener, source)) = message
             .strip_prefix(PREFIX)
-            .and_then(|message| message.split_once(BACKLOG))
+            .and_then(|message| message.rsplit_once(": "))
         else {
+            return false;
+        };
+        let Some((address, backlog_token)) = listener.split_once(BACKLOG) else {
             return false;
         };
         let Ok(address) = address.parse::<std::net::SocketAddr>() else {
             return false;
         };
-        let expected_source = std::io::Error::from_raw_os_error(98).to_string();
-        message == format!("{PREFIX}{address}{BACKLOG}{expected_source}")
+        let Ok(backlog) = backlog_token.parse::<i32>() else {
+            return false;
+        };
+        if backlog <= 0 || backlog.to_string() != backlog_token {
+            return false;
+        }
+        message == format!("{PREFIX}{address}{BACKLOG}{backlog}: {expected_source}")
             && source == expected_source
     }
 
@@ -774,7 +783,7 @@ pub mod engine_test_helpers {
             }
         }
 
-        fn matches(&self, expected: &Self) -> bool {
+        fn ownership_matches(&self, expected: &Self) -> bool {
             self.live_connections == expected.live_connections
                 && self.registered_operations == expected.registered_operations
                 && self.accepted_operations == expected.accepted_operations
@@ -787,8 +796,6 @@ pub mod engine_test_helpers {
                 && self.quarantined_connections == expected.quarantined_connections
                 && self.cm_pending_routes == expected.cm_pending_routes
                 && self.cm_retained_owners == expected.cm_retained_owners
-                && self.cqes_rejected == expected.cqes_rejected
-                && self.cm_events_rejected == expected.cm_events_rejected
         }
     }
 
@@ -808,7 +815,9 @@ pub mod engine_test_helpers {
                 SafetyBaseline::capture(server_engine, server_resources.instrumentation().unwrap());
             let client =
                 SafetyBaseline::capture(client_engine, client_resources.instrumentation().unwrap());
-            if server.matches(server_baseline) && client.matches(client_baseline) {
+            if server.ownership_matches(server_baseline)
+                && client.ownership_matches(client_baseline)
+            {
                 return (server, client);
             }
             let now = std::time::Instant::now();
@@ -882,6 +891,8 @@ pub mod engine_test_helpers {
     ///
     /// Readiness retries require the exact production CM-event grammar; raw
     /// errno, HELLO, protocol, and data-operation errors are never retried.
+    /// A stage timeout is retried only after exact ownership cleanup and only
+    /// when no engine rejection diagnostic changed during the attempt.
     /// All attempts share a 60-second wall-clock budget; cancellation of that
     /// outer budget is followed by at most 15 seconds of exact cleanup
     /// verification.
@@ -1006,7 +1017,7 @@ pub mod engine_test_helpers {
                         let error = setup_timeout("listener setup", elapsed);
                         let context = error.to_string();
                         attempt_history.push(format!("attempt {attempt}: {context}"));
-                        wait_for_engine_cleanup(
+                        let (server, client) = wait_for_engine_cleanup(
                             server_engine,
                             &server_resources,
                             &server_baseline,
@@ -1016,7 +1027,20 @@ pub mod engine_test_helpers {
                             &context,
                         )
                         .await;
-                        return Err(error);
+                        if !attempt_has_no_engine_rejects(
+                            &server,
+                            &server_baseline,
+                            &client,
+                            &client_baseline,
+                        ) || attempt + 1 == TRANSIENT_CM_HANDSHAKE_ATTEMPTS
+                        {
+                            return Err(error);
+                        }
+                        tracing::warn!(
+                            "V2 message listener attempt {attempt} timed out after exact cleanup"
+                        );
+                        tokio::time::sleep(transient_cm_retry_delay(attempt)).await;
+                        continue;
                     }
                 };
                 if let Err(error) = before_connect_accept(attempt) {
@@ -1109,7 +1133,7 @@ pub mod engine_test_helpers {
                         let error = setup_timeout("connect/accept setup", elapsed);
                         let context = error.to_string();
                         attempt_history.push(format!("attempt {attempt}: {context}"));
-                        wait_for_engine_cleanup(
+                        let (server, client) = wait_for_engine_cleanup(
                             server_engine,
                             &server_resources,
                             &server_baseline,
@@ -1119,7 +1143,20 @@ pub mod engine_test_helpers {
                             &context,
                         )
                         .await;
-                        return Err(error);
+                        if !attempt_has_no_engine_rejects(
+                            &server,
+                            &server_baseline,
+                            &client,
+                            &client_baseline,
+                        ) || attempt + 1 == TRANSIENT_CM_HANDSHAKE_ATTEMPTS
+                        {
+                            return Err(error);
+                        }
+                        tracing::warn!(
+                            "V2 message connect/accept attempt {attempt} timed out after exact cleanup"
+                        );
+                        tokio::time::sleep(transient_cm_retry_delay(attempt)).await;
+                        continue;
                     }
                 };
 
@@ -1269,7 +1306,7 @@ pub mod engine_test_helpers {
                         let context = error.to_string();
                         attempt_history.push(format!("attempt {attempt}: {context}"));
                         close_message_attempt(Some(listener), Some(server), Some(client)).await;
-                        wait_for_engine_cleanup(
+                        let (server, client) = wait_for_engine_cleanup(
                             server_engine,
                             &server_resources,
                             &server_baseline,
@@ -1279,7 +1316,20 @@ pub mod engine_test_helpers {
                             &context,
                         )
                         .await;
-                        return Err(error);
+                        if !attempt_has_no_engine_rejects(
+                            &server,
+                            &server_baseline,
+                            &client,
+                            &client_baseline,
+                        ) || attempt + 1 == TRANSIENT_CM_HANDSHAKE_ATTEMPTS
+                        {
+                            return Err(error);
+                        }
+                        tracing::warn!(
+                            "V2 message HELLO attempt {attempt} timed out after exact cleanup"
+                        );
+                        tokio::time::sleep(transient_cm_retry_delay(attempt)).await;
+                        continue;
                     }
                 }
             }
@@ -1444,7 +1494,7 @@ mod tests {
             );
         }
         let listener_busy = format!(
-            "listen on 0.0.0.0:0 with requested kernel backlog 2147483647: {}",
+            "listen on 0.0.0.0:0 with backlog 8: {}",
             std::io::Error::from_raw_os_error(98)
         );
         let error = rdma_io::v2::Error::Verbs(std::io::Error::new(
@@ -1502,6 +1552,10 @@ mod tests {
 
     #[test]
     fn v2_transient_cm_error_requires_exact_setup_status_and_error_type() {
+        let addr_in_use = std::io::Error::from_raw_os_error(98);
+        let listener_addr_in_use = rdma_io::v2::Error::Verbs(std::io::Error::other(format!(
+            "listen on 0.0.0.0:0 with backlog 8: {addr_in_use}"
+        )));
         let addr_error = rdma_io::v2::Error::Verbs(std::io::Error::other(
             "RDMA CM AddrError failed with status -110 for id=0x1 listen_id=0x0",
         ));
@@ -1532,6 +1586,16 @@ mod tests {
         assert!(is_transient_v2_engine_cm_setup_error(
             V2EngineCmSetupStage::Listen,
             &rdma_io::v2::Error::Verbs(std::io::Error::from_raw_os_error(98))
+        ));
+        assert!(is_transient_v2_engine_cm_setup_error(
+            V2EngineCmSetupStage::Listen,
+            &listener_addr_in_use,
+        ));
+        assert!(!is_transient_v2_engine_cm_setup_error(
+            V2EngineCmSetupStage::Listen,
+            &rdma_io::v2::Error::Verbs(std::io::Error::other(format!(
+                "listen on 0.0.0.0:0 with backlog 0: {addr_in_use}"
+            ))),
         ));
     }
 

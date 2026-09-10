@@ -9,8 +9,8 @@
 //!
 //! The module observes three ownership rules:
 //!
-//! - It never sees `OperationInner` or a state guard. Every transition is a
-//!   method on `OperationState` that returns an owned record.
+//! - It reaches value-owned `OperationState` records only through the
+//!   reactor-owned registry and never shares a backend record.
 //! - It never reads or builds effect payload fields. Post-lock work accumulates
 //!   in `AfterEngineUnlock` and publishes only after the posting and admission
 //!   guards are dropped.
@@ -22,41 +22,51 @@
 //! future shares it without either submission path depending on the other.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use crate::v2::engine::io::{
     IoEventDestination, IoEventSender, IoOperationContext, IoRecvRequest, IoSendRequest,
     IoSubmissionDisposition,
 };
-use crate::v2::engine::registry::OperationToken;
+use crate::v2::engine::reactor::ReactorActions;
+use crate::v2::engine::registry::{Lookup, OperationToken, read_unpoison};
 use crate::v2::error::{Error, Result};
 use crate::v2::mr::Mr;
 use crate::v2::qp::BatchPostOutcome;
 use crate::wc::WcOpcode;
 use crate::wr::{PreparedRecvBatch, PreparedSendBatch, RecvWr, SendFlags, SendWr, Sge, WrOpcode};
 
-use super::super::{Direction, EstablishedIoConnection, IoCore, OperationKind};
+use super::super::{ConnectionIoState, Direction, EstablishedIoConnection, IoState, OperationKind};
 use super::effects::AfterEngineUnlock;
 use super::state::OperationState;
 use super::validation::ValidatedOperation;
 
-struct InternalBatchEntry {
-    token: OperationToken,
-    state: Arc<OperationState>,
-    sge: Sge,
+struct PostingTurnGuard;
+
+impl Drop for PostingTurnGuard {
+    fn drop(&mut self) {}
+}
+
+pub(super) struct InternalBatchEntry {
+    pub(super) token: OperationToken,
+    pub(super) sge: Sge,
 }
 
 type InternalPostInput = (Mr, Option<(usize, usize)>, IoOperationContext);
 
-pub(in crate::v2::engine) fn post_io_recv_batch(
-    shared: &IoCore,
+pub(in crate::v2::engine) fn post_io_recv_batch_into(
+    shared: &mut IoState,
     connection: &Arc<EstablishedIoConnection>,
+    connection_io: &mut ConnectionIoState,
+    poster: &crate::v2::engine::session::connection::ConnectionPoster,
     events: &IoEventSender,
     requests: Vec<IoRecvRequest>,
+    actions: &mut ReactorActions,
 ) -> IoSubmissionDisposition {
     post_io_batch(
         shared,
         connection,
+        connection_io,
+        poster,
         events,
         OperationKind::Recv,
         requests
@@ -66,31 +76,45 @@ pub(in crate::v2::engine) fn post_io_recv_batch(
                 (mr, None, context)
             })
             .collect(),
+        Some(actions),
     )
 }
 
-pub(in crate::v2::engine) fn post_io_send(
-    shared: &IoCore,
+pub(in crate::v2::engine) fn post_io_send_into(
+    shared: &mut IoState,
     connection: &Arc<EstablishedIoConnection>,
+    connection_io: &mut ConnectionIoState,
+    poster: &crate::v2::engine::session::connection::ConnectionPoster,
     events: &IoEventSender,
     request: IoSendRequest,
+    actions: &mut ReactorActions,
 ) -> IoSubmissionDisposition {
-    let (mr, len, context) = request.into_parts();
+    let (mr, len, context, _) = request.into_parts();
     post_io_batch(
         shared,
         connection,
+        connection_io,
+        poster,
         events,
         OperationKind::Send,
         vec![(mr, Some((0, len)), context)],
+        Some(actions),
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "provider transaction ownership inputs remain explicit and borrow-scoped"
+)]
 fn post_io_batch(
-    shared: &IoCore,
+    shared: &mut IoState,
     connection: &Arc<EstablishedIoConnection>,
+    connection_io: &mut ConnectionIoState,
+    poster: &crate::v2::engine::session::connection::ConnectionPoster,
     events: &IoEventSender,
     kind: OperationKind,
     entries: Vec<InternalPostInput>,
+    mut actions: Option<&mut ReactorActions>,
 ) -> IoSubmissionDisposition {
     if entries.is_empty() {
         return IoSubmissionDisposition::FullyUnaccepted {
@@ -99,28 +123,18 @@ fn post_io_batch(
         };
     }
     let count = entries.len();
-    let admission = shared.admission();
+    let admission_owner = Arc::clone(&shared.admission);
+    let admission = read_unpoison(&admission_owner);
     if let Some(error) = shared.admission_error() {
         let after_unlock = detach_unreserved_entries(events, entries, error.clone());
         drop(admission);
-        after_unlock.publish();
+        publish_after_unlock(after_unlock, &mut actions);
         return IoSubmissionDisposition::FullyUnaccepted {
             proven_unaccepted: count,
             error,
         };
     }
-    let posting = match connection.begin_posting() {
-        Ok(posting) => posting,
-        Err(error) => {
-            let after_unlock = detach_unreserved_entries(events, entries, error.clone());
-            drop(admission);
-            after_unlock.publish();
-            return IoSubmissionDisposition::FullyUnaccepted {
-                proven_unaccepted: count,
-                error,
-            };
-        }
-    };
+    let posting = PostingTurnGuard;
     let direction = kind.direction();
     let expected_opcode = match kind {
         OperationKind::Recv => WcOpcode::Recv,
@@ -130,7 +144,7 @@ fn post_io_batch(
             let after_unlock = detach_unreserved_entries(events, entries, error.clone());
             drop(posting);
             drop(admission);
-            after_unlock.publish();
+            publish_after_unlock(after_unlock, &mut actions);
             return IoSubmissionDisposition::FullyUnaccepted {
                 proven_unaccepted: count,
                 error,
@@ -146,6 +160,7 @@ fn post_io_batch(
                 let mut after_unlock = rollback_internal_entries(
                     shared,
                     connection,
+                    connection_io,
                     direction,
                     reserved,
                     error.clone(),
@@ -160,16 +175,22 @@ fn post_io_batch(
                 after_unlock.extend(detach_unreserved_entries(events, entries, error.clone()));
                 drop(posting);
                 drop(admission);
-                after_unlock.publish();
+                publish_after_unlock(after_unlock, &mut actions);
                 return IoSubmissionDisposition::FullyUnaccepted {
                     proven_unaccepted: count,
                     error,
                 };
             }
         };
-        if let Err(error) = connection.reserve_local(direction) {
-            let mut after_unlock =
-                rollback_internal_entries(shared, connection, direction, reserved, error.clone());
+        if let Err(error) = shared.reserve_local(connection, connection_io, direction) {
+            let mut after_unlock = rollback_internal_entries(
+                shared,
+                connection,
+                connection_io,
+                direction,
+                reserved,
+                error.clone(),
+            );
             after_unlock.push_event(IoEventDestination::new(events.clone(), context).unaccepted(
                 None,
                 error.clone(),
@@ -178,7 +199,7 @@ fn post_io_batch(
             after_unlock.extend(detach_unreserved_entries(events, entries, error.clone()));
             drop(posting);
             drop(admission);
-            after_unlock.publish();
+            publish_after_unlock(after_unlock, &mut actions);
             return IoSubmissionDisposition::FullyUnaccepted {
                 proven_unaccepted: count,
                 error,
@@ -187,8 +208,8 @@ fn post_io_batch(
         let mr_len = mr.len();
         let mut mr = Some(mr);
         let mut destination = Some(IoEventDestination::new(events.clone(), context));
-        let (token, state) = match shared.operations.allocate(|token| {
-            Arc::new(OperationState::new_with_event(
+        let token = match shared.operations.allocate(|token| {
+            OperationState::new_with_event(
                 token,
                 Arc::clone(connection),
                 direction,
@@ -196,11 +217,11 @@ fn post_io_batch(
                 mr.take(),
                 mr_len,
                 destination.take(),
-            ))
+            )
         }) {
             Ok(allocated) => allocated,
             Err(error) => {
-                connection.release_local(direction);
+                shared.release_local(connection, connection_io, direction);
                 let mr = mr
                     .take()
                     .expect("operation allocation failure retains I/O MR");
@@ -210,6 +231,7 @@ fn post_io_batch(
                 let mut after_unlock = rollback_internal_entries(
                     shared,
                     connection,
+                    connection_io,
                     direction,
                     reserved,
                     error.clone(),
@@ -218,7 +240,7 @@ fn post_io_batch(
                 after_unlock.extend(detach_unreserved_entries(events, entries, error.clone()));
                 drop(posting);
                 drop(admission);
-                after_unlock.publish();
+                publish_after_unlock(after_unlock, &mut actions);
                 return IoSubmissionDisposition::FullyUnaccepted {
                     proven_unaccepted: count,
                     error,
@@ -227,17 +249,22 @@ fn post_io_batch(
         };
         if !shared.cq_credits.reserve() {
             let error = Error::CapacityExhausted;
-            let release = state
-                .take_unaccepted(error.clone())
-                .expect("an operation rejected before posting has no completion");
-            let registered = shared
+            let mut state = shared
                 .operations
                 .release(token, false)
                 .expect("unposted operation remains registered");
-            debug_assert!(Arc::ptr_eq(&registered, &state));
-            connection.release_local(direction);
-            let mut after_unlock =
-                rollback_internal_entries(shared, connection, direction, reserved, error.clone());
+            let release = state
+                .take_unaccepted(error.clone())
+                .expect("an operation rejected before posting has no completion");
+            shared.release_local(connection, connection_io, direction);
+            let mut after_unlock = rollback_internal_entries(
+                shared,
+                connection,
+                connection_io,
+                direction,
+                reserved,
+                error.clone(),
+            );
             if let Some(event) = release.event {
                 after_unlock.push_event(event);
             }
@@ -245,7 +272,7 @@ fn post_io_batch(
             after_unlock.extend(detach_unreserved_entries(events, entries, error.clone()));
             drop(posting);
             drop(admission);
-            after_unlock.publish();
+            publish_after_unlock(after_unlock, &mut actions);
             return IoSubmissionDisposition::FullyUnaccepted {
                 proven_unaccepted: count,
                 error,
@@ -253,7 +280,6 @@ fn post_io_batch(
         }
         reserved.push(InternalBatchEntry {
             token,
-            state,
             sge: validated.sge(),
         });
     }
@@ -271,13 +297,14 @@ fn post_io_batch(
                     let after_unlock = rollback_internal_entries(
                         shared,
                         connection,
+                        connection_io,
                         direction,
                         reserved,
                         error.clone(),
                     );
                     drop(posting);
                     drop(admission);
-                    after_unlock.publish();
+                    publish_after_unlock(after_unlock, &mut actions);
                     return IoSubmissionDisposition::FullyUnaccepted {
                         proven_unaccepted: count,
                         error,
@@ -301,13 +328,14 @@ fn post_io_batch(
                     let after_unlock = rollback_internal_entries(
                         shared,
                         connection,
+                        connection_io,
                         direction,
                         reserved,
                         error.clone(),
                     );
                     drop(posting);
                     drop(admission);
-                    after_unlock.publish();
+                    publish_after_unlock(after_unlock, &mut actions);
                     return IoSubmissionDisposition::FullyUnaccepted {
                         proven_unaccepted: count,
                         error,
@@ -321,17 +349,23 @@ fn post_io_batch(
         PreparedBatchOwnership::new(reserved).expect("non-empty detached batch ownership");
     let mut requests = requests;
     let outcome = match match &mut requests {
-        InternalPreparedBatch::Recv(batch) => connection.post_recv(batch),
-        InternalPreparedBatch::Send(batch) => connection.post_send(batch),
+        InternalPreparedBatch::Recv(batch) => poster.post_recv(batch),
+        InternalPreparedBatch::Send(batch) => poster.post_send(batch),
     } {
         Ok(outcome) => outcome,
         Err(error) => {
             let entries = ownership.into_entries();
-            let after_unlock =
-                rollback_internal_entries(shared, connection, direction, entries, error.clone());
+            let after_unlock = rollback_internal_entries(
+                shared,
+                connection,
+                connection_io,
+                direction,
+                entries,
+                error.clone(),
+            );
             drop(posting);
             drop(admission);
-            after_unlock.publish();
+            publish_after_unlock(after_unlock, &mut actions);
             return IoSubmissionDisposition::FullyUnaccepted {
                 proven_unaccepted: count,
                 error,
@@ -341,10 +375,10 @@ fn post_io_batch(
     let transfer = ownership.consume(outcome);
     match transfer {
         BatchOwnershipTransfer::Accepted(accepted) => {
-            let after_unlock = commit_internal_entries(shared, accepted);
+            let after_unlock = commit_internal_entries(shared, connection_io, accepted);
             drop(posting);
             drop(admission);
-            after_unlock.publish();
+            publish_after_unlock(after_unlock, &mut actions);
             IoSubmissionDisposition::AllAccepted { accepted: count }
         }
         BatchOwnershipTransfer::Partial {
@@ -356,13 +390,18 @@ fn post_io_batch(
             let accepted_count = accepted.len();
             let unaccepted_count = unaccepted.len();
             match release_proven_unaccepted_entries(
-                shared, connection, direction, unaccepted, error,
+                shared,
+                connection,
+                connection_io,
+                direction,
+                unaccepted,
+                error,
             ) {
                 InternalRelease::Released(mut after_unlock) => {
-                    after_unlock.extend(commit_internal_entries(shared, accepted));
+                    after_unlock.extend(commit_internal_entries(shared, connection_io, accepted));
                     drop(posting);
                     drop(admission);
-                    after_unlock.publish();
+                    publish_after_unlock(after_unlock, &mut actions);
                     let error = Error::PostFailed(source);
                     if accepted_count == 0 {
                         IoSubmissionDisposition::FullyUnaccepted {
@@ -379,10 +418,10 @@ fn post_io_batch(
                 }
                 InternalRelease::Retained(mut unaccepted) => {
                     accepted.append(&mut unaccepted);
-                    let after_unlock = commit_internal_entries(shared, accepted);
+                    let after_unlock = commit_internal_entries(shared, connection_io, accepted);
                     drop(posting);
                     drop(admission);
-                    after_unlock.publish();
+                    publish_after_unlock(after_unlock, &mut actions);
                     IoSubmissionDisposition::RetainedAfterEarlyCompletion {
                         retained: count,
                         error: Error::PostFailed(source),
@@ -392,10 +431,10 @@ fn post_io_batch(
         }
         BatchOwnershipTransfer::Ambiguous { retained, source } => {
             let retained_count = retained.len();
-            let after_unlock = commit_internal_entries(shared, retained);
+            let after_unlock = commit_internal_entries(shared, connection_io, retained);
             drop(posting);
             drop(admission);
-            after_unlock.publish();
+            publish_after_unlock(after_unlock, &mut actions);
             IoSubmissionDisposition::RetainedAmbiguous {
                 retained: retained_count,
                 error: Error::PostFailed(source),
@@ -404,45 +443,70 @@ fn post_io_batch(
     }
 }
 
+fn publish_after_unlock(effects: AfterEngineUnlock, actions: &mut Option<&mut ReactorActions>) {
+    if let Some(actions) = actions.as_deref_mut() {
+        effects.append_to(actions);
+    } else {
+        effects.publish();
+    }
+}
+
 enum InternalPreparedBatch {
     Recv(PreparedRecvBatch),
     Send(PreparedSendBatch),
 }
 
-fn commit_internal_entries(shared: &IoCore, entries: Vec<InternalBatchEntry>) -> AfterEngineUnlock {
-    shared
-        .accepted_operations
-        .fetch_add(entries.len(), Ordering::AcqRel);
+pub(super) fn commit_internal_entries(
+    shared: &mut IoState,
+    connection_io: &mut ConnectionIoState,
+    entries: Vec<InternalBatchEntry>,
+) -> AfterEngineUnlock {
+    shared.accepted_operations += entries.len();
     let mut early = Vec::new();
     for entry in entries {
-        if let Some(completion) = entry.state.commit_accepted() {
-            early.push((entry.state, completion));
+        let identity = match shared.operations.lookup(entry.token) {
+            Lookup::Occupied(operation) => operation.connection_identity(),
+            _ => continue,
+        };
+        IoState::add_operation_accepted(connection_io, identity, entry.token);
+        let Lookup::Occupied(operation) = shared.operations.lookup_mut(entry.token) else {
+            continue;
+        };
+        if let Some(completion) = operation.commit_accepted().early {
+            early.push((entry.token, completion));
         }
     }
     shared.publish_cq_recheck();
     let mut after_unlock = AfterEngineUnlock::default();
-    for (state, completion) in early {
-        let effects = shared.finish_operation(state, completion);
-        after_unlock.extend(effects.into_after_unlock());
+    for (token, completion) in early {
+        after_unlock.extend(shared.finish_early_completion(connection_io, token, completion));
     }
     after_unlock
 }
 
 fn rollback_internal_entries(
-    shared: &IoCore,
-    connection: &impl EstablishedIoRef,
+    shared: &mut IoState,
+    connection: &Arc<EstablishedIoConnection>,
+    connection_io: &mut ConnectionIoState,
     direction: Direction,
     entries: Vec<InternalBatchEntry>,
     error: Error,
 ) -> AfterEngineUnlock {
-    match release_proven_unaccepted_entries(shared, connection, direction, entries, error) {
+    match release_proven_unaccepted_entries(
+        shared,
+        connection,
+        connection_io,
+        direction,
+        entries,
+        error,
+    ) {
         InternalRelease::Released(after_unlock) => after_unlock,
         InternalRelease::Retained(entries) => {
             debug_assert!(
                 entries.is_empty(),
                 "an operation known not to have reached the provider acquired a completion"
             );
-            commit_internal_entries(shared, entries)
+            commit_internal_entries(shared, connection_io, entries)
         }
     }
 }
@@ -452,60 +516,30 @@ enum InternalRelease {
     Retained(Vec<InternalBatchEntry>),
 }
 
-/// Ownership abstraction over the established I/O connection being posted to.
-///
-/// Production callers always pass the real `EstablishedIoConnection`; the
-/// `cfg(test)` impl lets owner-local fixtures drive rollback and release with a
-/// concrete `ConnectionState` without adding a session dependency to production
-/// operation code.
-trait EstablishedIoRef {
-    fn established_io(&self) -> &EstablishedIoConnection;
-}
-
-impl EstablishedIoRef for EstablishedIoConnection {
-    fn established_io(&self) -> &EstablishedIoConnection {
-        self
-    }
-}
-
-impl EstablishedIoRef for Arc<EstablishedIoConnection> {
-    fn established_io(&self) -> &EstablishedIoConnection {
-        self
-    }
-}
-
-#[cfg(test)]
-impl EstablishedIoRef for Arc<crate::v2::engine::session::connection::ConnectionState> {
-    fn established_io(&self) -> &EstablishedIoConnection {
-        &self.io
-    }
-}
-
 fn release_proven_unaccepted_entries(
-    shared: &IoCore,
-    connection: &impl EstablishedIoRef,
+    shared: &mut IoState,
+    connection: &Arc<EstablishedIoConnection>,
+    connection_io: &mut ConnectionIoState,
     direction: Direction,
     entries: Vec<InternalBatchEntry>,
     error: Error,
 ) -> InternalRelease {
-    let states = entries
-        .iter()
-        .map(|entry| Arc::clone(&entry.state))
-        .collect::<Vec<_>>();
-    let releases = OperationState::take_proven_unaccepted_batch(&states, error);
+    let tokens = entries.iter().map(|entry| entry.token).collect::<Vec<_>>();
+    let releases = shared
+        .operations
+        .take_proven_unaccepted_batch(&tokens, error);
     let Some(releases) = releases else {
         return InternalRelease::Retained(entries);
     };
 
     let mut after_unlock = AfterEngineUnlock::default();
     for (entry, release) in entries.into_iter().zip(releases) {
-        let registered = shared
+        let _registered = shared
             .operations
             .release(entry.token, false)
             .expect("proven-unaccepted operation remains registered");
-        debug_assert!(Arc::ptr_eq(&registered, &entry.state));
         shared.cq_credits.release();
-        connection.established_io().release_local(direction);
+        shared.release_local(connection, connection_io, direction);
         if let Some(event) = release.event {
             after_unlock.push_event(event);
         }
@@ -593,80 +627,5 @@ impl<T> PreparedBatchOwnership<T> {
 
     fn into_entries(self) -> Vec<T> {
         self.entries
-    }
-}
-
-/// `cfg(test)` mirrors of this module's private reservation vocabulary.
-///
-/// `operation::tests` reaches submission internals through `use super::*`, but
-/// the production entry and release types keep private fields so that no
-/// sibling can assemble or inspect reservations directly. These mirrors carry
-/// the same fields with operation-subtree visibility and delegate straight to
-/// the production functions, so tests exercise the real reconciliation without
-/// widening production visibility.
-#[cfg(test)]
-pub(super) mod test_support {
-    use super::*;
-
-    pub(in crate::v2::engine::io_core::operation) struct InternalBatchEntry {
-        pub(in crate::v2::engine::io_core::operation) token: OperationToken,
-        pub(in crate::v2::engine::io_core::operation) state: Arc<OperationState>,
-        pub(in crate::v2::engine::io_core::operation) sge: Sge,
-    }
-
-    pub(in crate::v2::engine::io_core::operation) enum InternalRelease {
-        Released(AfterEngineUnlock),
-        Retained(Vec<InternalBatchEntry>),
-    }
-
-    pub(in crate::v2::engine::io_core::operation) fn release_proven_unaccepted_entries(
-        shared: &IoCore,
-        connection: &Arc<crate::v2::engine::session::connection::ConnectionState>,
-        direction: Direction,
-        entries: Vec<InternalBatchEntry>,
-        error: Error,
-    ) -> InternalRelease {
-        let entries = entries
-            .into_iter()
-            .map(|entry| super::InternalBatchEntry {
-                token: entry.token,
-                state: entry.state,
-                sge: entry.sge,
-            })
-            .collect();
-        match super::release_proven_unaccepted_entries(
-            shared, connection, direction, entries, error,
-        ) {
-            super::InternalRelease::Released(after_unlock) => {
-                InternalRelease::Released(after_unlock)
-            }
-            super::InternalRelease::Retained(entries) => InternalRelease::Retained(
-                entries
-                    .into_iter()
-                    .map(|entry| InternalBatchEntry {
-                        token: entry.token,
-                        state: entry.state,
-                        sge: entry.sge,
-                    })
-                    .collect(),
-            ),
-        }
-    }
-
-    pub(in crate::v2::engine::io_core::operation) fn commit_internal_entries(
-        shared: &IoCore,
-        entries: Vec<InternalBatchEntry>,
-    ) -> AfterEngineUnlock {
-        super::commit_internal_entries(
-            shared,
-            entries
-                .into_iter()
-                .map(|entry| super::InternalBatchEntry {
-                    token: entry.token,
-                    state: entry.state,
-                    sge: entry.sge,
-                })
-                .collect(),
-        )
     }
 }

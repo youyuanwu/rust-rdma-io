@@ -2,681 +2,358 @@
 
 ## Overview
 
-V2 separates shared RDMA runtime mechanics from per-connection message
-protocol policy.
+The v2 runtime uses one application-owned `RdmaEngineDriver` to advance a
+single `EngineReactor`. Public engine, listener, connection, and operation
+handles contain stable identities, bounded command admission, and
+resource-free result observers; they do not own a second mutable provider
+runtime. The library creates no hidden task or thread
+([engine/mod.rs:261-340](../../rdma-io/src/v2/engine/mod.rs#L261-L340),
+[driver/mod.rs:143-246](../../rdma-io/src/v2/engine/driver/mod.rs#L143-L246),
+[reactor/mod.rs:35-82](../../rdma-io/src/v2/engine/reactor/mod.rs#L35-L82)).
 
-An `RdmaEngine` owns one device-scoped resource set and one explicit
-`RdmaEngineDriver`. Its internal composition root combines a low-level
-`IoCore` with a `SessionManager`; low-level connection and listener frontends
-hold narrow, resource-free capabilities rather than the shared engine state.
-Each engine-bound message connection additionally returns one non-cloneable
-`MessageTransport` frontend and one explicit `MessageTransportDriver`.
+V1 remains a separate API. Message transport keeps its own explicit
+`MessageTransportDriver` for HELLO, DATA/CREDIT, receive reposting, and
+message-level fairness. That protocol driver submits provider work through the
+engine command boundary; it is not an alternate engine provider owner.
 
 ```mermaid
 flowchart TB
     App["Application"]
 
-    subgraph Public["Returned public values (explicitly polled by the application)"]
-        Engine["RdmaEngine frontend"]
-        EngineDriver["RdmaEngineDriver"]
-        Transport["MessageTransport frontend"]
-        MessageDriver["MessageTransportDriver<br/>(one per message connection)"]
+    subgraph Handles["Public and crate-private frontends"]
+        Engine["RdmaEngine"]
+        Listener["RdmaListener + listener token"]
+        Connection["RdmaConnection + connection token"]
+        Operation["RdmaOperation + operation token"]
+        Message["MessageTransport"]
     end
 
-    subgraph Composition["Engine composition"]
-        Root["EngineShared<br/>lifecycle, terminal state, work signal,<br/>device-resource lifetime"]
-        IoProgress["IoProgress<br/>CQ readiness, bounded CQ/dispatch/deadline turns"]
-        SessionProgress["SessionProgress<br/>CM readiness, bounded lifecycle/shutdown turns"]
-        IoCore["IoCore<br/>submission, exact CQE validation,<br/>operation and MR ownership"]
-        Session["SessionManager<br/>CM routes, listeners, connections,<br/>teardown and quarantine"]
-        Bridge["IoSessionBridge<br/>live connection/QP proof and effect handoff"]
+    Ingress["CommandIngress<br/>bounded ordinary lanes + coalesced control"]
+    Driver["RdmaEngineDriver<br/>explicit Future"]
+
+    subgraph Reactor["EngineReactor — exclusive mutable ownership"]
+        Scheduler["ReactorScheduler<br/>ready-at-entry fair rotation"]
+        Io["IoReactorSources + IoState<br/>CQ, operations, credits, deadlines"]
+        Session["SessionReactorSources<br/>connections, listeners, CM, teardown"]
+        Lifecycle["EngineLifecycleState"]
+        Actions["ReactorActions<br/>bounded post-turn publication"]
+        Resources["EngineReactorResources<br/>CQ, PD, CM channel, context"]
     end
 
-    subgraph Protocol["Per-connection protocol"]
-        IoBoundary["IoConnection + IoEventReceiver<br/>owned request/completion boundary"]
-        MessagePolicy["HELLO, DATA/CREDIT, pools,<br/>reposting, fairness, message outcomes"]
-    end
+    MessageDriver["MessageTransportDriver<br/>explicit protocol progress"]
+    Provider["RDMA provider"]
 
-    subgraph Hardware["RDMA resources and provider"]
-        Device["Context + PD"]
-        CQ["Shared CQ + optional readiness channel"]
-        CM["CM event channel + optional readiness adapter"]
-        Connections["QP + CmId connection bundles"]
-    end
-
-    App -->|calls| Engine
-    App -->|polls or spawns| EngineDriver
-    App -->|calls| Transport
-    App -->|polls or spawns| MessageDriver
-
-    Engine -->|connect, listen, shutdown| Root
-    EngineDriver -->|bounded I/O turn| IoProgress
-    EngineDriver -->|bounded session turn| SessionProgress
-    EngineDriver -->|post-owner terminal epilogue| Root
-
-    Root -->|constructs and retains| IoCore
-    Root -->|constructs and retains| Session
-    IoProgress -->|operates| IoCore
-    IoProgress -->|uses narrow capability| Bridge
-    Bridge -->|routes through| Session
-    SessionProgress -->|operates| Session
-
-    Transport <-->|commands and outcomes| MessagePolicy
-    MessageDriver -->|advances| MessagePolicy
-    MessagePolicy -->|submits and receives owned values| IoBoundary
-    IoBoundary -->|operations and completion events| IoCore
-    MessagePolicy -->|opaque close capability| Session
-
-    Root -->|anchors final lifetime| Device
-    Root -->|anchors final lifetime| CQ
-    Root -->|anchors final lifetime| CM
-    IoProgress -->|polls| CQ
-    SessionProgress -->|polls| CM
-    Session -->|owns lifecycle| Connections
-    Connections --> Device
-    Connections --> CQ
+    App --> Engine
+    App --> Listener
+    App --> Connection
+    App --> Operation
+    App --> Message
+    Engine --> Ingress
+    Listener --> Ingress
+    Connection --> Ingress
+    Operation --> Ingress
+    Message --> MessageDriver
+    MessageDriver --> Ingress
+    App -->|polls or spawns| Driver
+    Driver --> Scheduler
+    Scheduler --> Io
+    Scheduler --> Session
+    Scheduler --> Lifecycle
+    Io --> Actions
+    Session --> Actions
+    Reactor --> Provider
+    Resources --> Provider
 ```
 
-The library creates no task or thread. Applications may spawn the returned
-drivers or poll them directly. V1 remains a separate API and is unchanged.
+## Explicit Progress Contract
 
-## Progress and Task Contract
-
-`RdmaEngineBuilder::build()` returns:
+`RdmaEngineBuilder::build()` returns an engine frontend and one unspawned
+driver:
 
 ```text
 Result<(RdmaEngine, RdmaEngineDriver)>
 ```
 
-`MessageTransportBuilder::connect_on()` and `accept_on()` return:
+Applications must poll or spawn that driver. Withholding it prevents command,
+CM, CQ, reclamation, and shutdown progress. The driver future performs runtime
+preflight, calls the sole production `EngineReactor::turn`, publishes the
+returned action batch, and applies the register-and-recheck suspension protocol
+([driver/mod.rs:143-236](../../rdma-io/src/v2/engine/driver/mod.rs#L143-L236),
+[reactor/mod.rs:288-674](../../rdma-io/src/v2/engine/reactor/mod.rs#L288-L674)).
 
-```text
-Result<(MessageTransport, MessageTransportDriver)>
-```
-
-A typical client explicitly starts both progress owners:
+A typical low-level client is:
 
 ```rust,no_run
 use rdma_io::v2::*;
 
 async fn run() -> Result<()> {
-    let (engine, engine_driver) = RdmaEngineBuilder::new("rxe0").build()?;
-    let engine_task = tokio::spawn(engine_driver);
+    let (engine, driver) = RdmaEngineBuilder::new("rxe0").build()?;
+    let driver_task = tokio::spawn(driver);
 
-    let (transport, message_driver) = MessageTransportBuilder::new()
-        .connect_on(&engine, "192.0.2.1:7471".parse().unwrap())
-        .await?;
-    let message_task = tokio::spawn(message_driver);
+    let connection = engine.connect("192.0.2.1:7471".parse().unwrap()).await?;
+    let mut mr = connection.register_memory(1024, AccessIntent::LocalOnly)?;
+    mr.as_mut_slice()[..5].copy_from_slice(b"hello");
+    let (completion, mr) = connection.send(mr, Some((0, 5))).await;
+    completion?;
+    drop(mr);
 
-    transport.ready().await?;
-    transport.send(b"hello").await?;
-    transport.close().await?;
-    message_task.await.expect("message driver panicked")?;
-
+    connection.close().await?;
     engine.shutdown().await?;
-    engine_task.await.expect("engine driver panicked")?;
+    driver_task.await.expect("engine driver panicked")?;
     Ok(())
 }
 ```
 
-An unpolled engine driver provides no CM, CQ, reclamation, or shutdown
-progress. An unpolled message driver provides no HELLO, DATA, CREDIT, repost,
-or message-lifecycle progress. Its HELLO timer is armed on first poll, so a
-never-polled driver also provides no timeout guarantee. Dropping an unfinished
-message driver publishes `Error::DriverShutdown` and asks the engine to close
-the connection safely.
-
-Readiness is the default engine completion mode. Building it requires an
-active Tokio I/O runtime. Polling mode allocates no CQ completion channel and
-may be built outside a runtime, but polling either driver still requires an
-active Tokio runtime; Tokio time must be enabled before a deadline is armed.
-
-## Layer Responsibilities
-
-### Engine composition root
-
-One engine owns:
-
-- an anchored `Context`;
-- one `Pd`;
-- one shared send/receive `Cq`;
-- one CM event channel;
-- one CQ completion channel in readiness mode, or none in polling mode;
-- one `IoCore`; and
-- one `SessionManager`.
-
-The root owns engine-wide lifecycle, terminal state, work signaling, and the
-canonical lifetime of device-scoped resources. It does not directly own
-connection registries, CM state, session deadlines, or connection quarantine.
-Driver-owned I/O and session progress values physically retain the live CQ and
-CM readiness resources while they are polled; the root's canonical references
-preserve final device-resource drop ordering.
-
-### I/O core
-
-`IoCore` owns operation generations and registrations, CQ admission, provider
-posting reconciliation, exact CQE validation, copied and early completions,
-cancellation and missing-CQE state, operation-level quarantine, and detached
-completion effects. It has no production dependency on the engine composition
-root, connection state, CM/listener state, session resource owners, or message
-protocol policy.
-
-### Session manager
-
-`SessionManager` owns connection admission and the generational connection
-registry, `CmState` and all routes, connect/listen/accept manager records,
-listener and established-connection state, QP/CmId-owning bundles, lifecycle
-deadlines, close/drain/disconnect/retirement policy, and connection-level
-quarantine. It interprets the I/O effects that change session lifecycle before
-detached events or wakers are published.
-
-Session code does not receive or recover the concrete composition root.
-Immutable engine and provider validation inputs, the I/O owner retain, and
-memory-registration authority are copied into the manager at construction.
-A bind-once `Weak<dyn SessionEngineRuntime>` capability exposes only admission
-and terminal observation, shutdown state, failure escalation, shutdown-deadline
-composition, and I/O/session work publication. It exposes no I/O or session
-registry, provider resource, QP lifecycle authority, or protocol policy.
-
-The engine has a per-connection completion-dispatch queue so one connection
-cannot monopolize event delivery. That queue contains validated low-level
-completions only. It is not a message scheduler and does not parse frames,
-manage message credits or pools, repost message receives, or own HELLO
-deadlines.
-
-Low-level `connect`, `connect_with_config`, `accept`, and
-`accept_with_config` post no initial receives. Their callers own all operation
-submission and buffers.
-
-### Message layer
-
-`MessageTransport` is the sole, non-cloneable application frontend for one
-message connection. Its `send`, `recv`, `ready`, and `close` futures run in
-the caller's task and communicate with the connection's driver.
-
-`MessageTransportDriver` is the single logical writer for protocol state. It
-owns:
-
-- the HELLO deadline and capability negotiation;
-- DATA and CREDIT frame processing;
-- registered send/control pools and remote-credit accounting;
-- completed receive delivery and receive reposting;
-- connection-local scheduling and fairness; and
-- translation of protocol, engine, peer-disconnect, and close events into one
-  terminal message outcome.
-
-Message setup allocates and posts every configured receive before
-`rdma_connect` or `rdma_accept`. With defaults, the QP requirements are:
-
-- 19 send WRs: 16 DATA, 2 control, and 1 HELLO;
-- 34 receive WRs: 32 DATA and 2 control.
-
-HELLO reuses a control receive; there is no additional receive.
-
-## ADR: Crate-Private I/O and Session Ownership Boundaries
-
-**Status:** implemented and closure-audited on the v2 feature branch. The
-protocol/I/O seam, low-level `IoCore`, narrow `SessionManager` boundary,
-owner-local progress components, and thin engine scheduler satisfy the issue
-#43 architecture. The issue remains open until its owner explicitly authorizes
-closure.
-
-The runtime has five distinct roles:
-
-1. **I/O core:** submission admission, provider posting, operation identity,
-   CQ resource/readiness polling, exact CQE validation, accepted-set
-   accounting, completion scheduling, I/O deadlines, completion ownership,
-   and operation-level quarantine.
-2. **Session manager:** connect/listen/accept state, CM routes, connection and
-   QP/CmId ownership, CM resource/readiness polling, drain/disconnect/
-   retirement, lifecycle deadlines, lifecycle authority, shutdown
-   coordination, and connection-level quarantine.
-3. **Engine composition root:** global lifecycle and terminal-outcome
-   composition across I/O and session readiness.
-4. **Engine scheduler:** fair rotation over opaque I/O and session turns,
-   post-owner terminal composition, global software-work register/recheck,
-   earliest-deadline arming, and cooperative polling-mode yielding.
-5. **Protocol:** HELLO, DATA, CREDIT, pools, receive reposting, message
-   fairness, and frontend outcomes.
-
-`EngineShared` is the composition root. It directly retains the device-scoped
-resources, engine lifecycle, work signal, `Arc<IoCore>`, and
-`Arc<SessionManager>`. Session collections and quarantine maps are fields of
-`SessionManager`, not parallel fields on the root. The session manager holds
-only a weak trait-object runtime capability back toward engine-wide state and
-a copied `SessionConfig` containing live-connection capacity, the two
-connection-validation capacities, and the connection-drain deadline.
-I/O scheduling, completion policy, and engine shutdown policy remain solely in
-`EngineConfig` and are not retained by the session owner. Session modules
-cannot access the concrete root or use it as an I/O-owner shortcut.
-`IoProgress` owns CQ readiness, the CQ buffer, completion-ready rotation,
-operation deadlines, bounded I/O terminalization, and the narrow strong
-`IoSessionBridge` used only while progress is composed. `IoCore` contains no
-session bridge or post-construction binding, so operation futures may outlive
-the driver without retaining session progress.
-`SessionProgress` owns CM readiness, fair CM source selection,
-connection/lifecycle deadlines, bounded shutdown scans, final CM draining, and
-bounded session terminalization. The one `RdmaEngineDriver` sees none of those
-state machines; it only polls and requeues the two owner classes. No component
-creates a task or thread.
-
-Each owner turn returns a private progress report containing only bounded
-units consumed, whether immediate work remains, and readiness
-registration/recheck status. The driver queries owner deadlines and terminal
-eligibility directly; failures remain typed `Result` values. Post-guard
-publication is a behavioral invariant covered by reentrant tests rather than
-a constant report field. Reports contain no operation, connection, listener,
-route, registry, queue, teardown, or deadline-kind identity.
-
-Every driver poll probe-enqueues the I/O and session owners once because an
-`AsyncFd` wake does not identify its source. Software pending bits additionally
-identify the owning class. A private bounded driver turn snapshots the two
-ready-at-entry owners, visits each at most once, appends remaining work for a
-later poll, and then evaluates terminal eligibility exactly once. Shutdown,
-failure, accepted-operation drain, and session cleanup publish owner work and
-wake the driver; terminal composition has no scheduler class or work bit. A
-final result is withheld until both bounded owners report cleanup complete. In
-readiness mode an idle owner registers and rechecks its fd without requesting
-another poll. In polling mode the driver yields cooperatively. The one driver
-timer is armed to the minimum deadline reported by the two owners; equal
-deadlines are serviced by fair owner rotation rather than cross-layer
-insertion order.
-
-Both owners use one payload-generic stable deadline queue. Equal timestamps
-retain insertion order through a checked non-wrapping sequence, and only one
-due payload is popped per accounted unit. Owner-neutral alternating-source
-state preserves inbox/due fairness, odd-budget rotation, and unused-capacity
-transfer. Operation tokens and reclamation remain I/O-owned; connection drain
-and engine-shutdown deadline meanings remain session-owned.
-
-The source hierarchy mirrors that ownership. `engine/driver/mod.rs` contains
-the independently readable production scheduler, while
-`engine/driver/test_api.rs` contains the feature-gated test support and
-`engine/driver/tests.rs` contains its unit tests. The I/O operation owner uses
-`engine/io_core/operation/mod.rs` as a narrow facade over responsibility-focused
-children: `accounting.rs` owns the operation registry and CQ credits;
-`state.rs` owns coupled per-operation lifecycle and resources; `effects.rs`
-owns consuming effect states and post-lock publication; `validation.rs` owns
-shared scalar/batch validation; `batch.rs` owns protocol SEND/RECV posting and
-provider-acceptance reconciliation; `future.rs` owns scalar first-poll posting
-and cancellation; `completion.rs` owns exact CQE validation, dispatch, and
-release; and `reclamation.rs` owns terminalization, quarantine, and positive-
-proof cleanup. `test_support.rs` and `tests.rs` are direct `cfg(test)` children.
-The hierarchy reflects current responsibilities rather than imposing a file-
-count rule. `batch` and `future` reach their shared submission vocabulary
-through `validation` instead of through each other, and neither depends on the
-other.
-`engine/session/mod.rs` defines the manager and its lifecycle capabilities.
-The CM owner uses `session/cm/mod.rs` as its single `CmState` facade over
-responsibility-focused children: `event.rs` owns event snapshotting,
-acknowledgement, exact identity lookup, rejection classification, and
-parent-mediated dispatch; `outbound.rs` owns connect setup, waiter delivery,
-cancellation, and outbound transitions; `inbound.rs` owns listener CM setup,
-child admission/rejection, setup-before-accept, inbound transitions, and
-listener finalization; `retirement.rs` owns QP-proven retirement,
-event-drained `CmId` destruction, dependent completion, and full-bundle
-retention; and `shutdown.rs` owns bounded shutdown cursoring, issuance,
-terminalization, and completion. Shared route identities, route state used by
-multiple responsibilities, work queues, and coordination envelopes remain in
-the facade. Children expose narrow operations to the parent, do not name
-sibling modules, and do not implement the facade.
-
-The connection owner remains in `session/connection/mod.rs`. CM and connection
-unit tests remain in their respective direct-child `tests.rs` files;
-`session/listener.rs`, `session/drain.rs`, `session/progress.rs`, and
-`session/registry.rs` retain the remaining session-owned state and policy.
-These test files remain direct children of their private owner modules,
-preserving private-invariant access, existing test-hook paths, and narrow
-visibility. The remaining `engine/registry.rs` is not a connection owner: it
-provides opaque connection and operation identities, exact live-I/O proofs,
-generic non-wrapping generational registry storage, and lock helpers shared
-with `IoCore`. Public connection and listener types continue to be re-exported
-by the engine facade, so these physical relocations do not change public
-paths.
-
-An established I/O capability carries immutable connection/QP identity, local
-posting limits, operation ledgers, and a posting-only authority. That authority
-uses a weak reference to the SessionManager-owned QP resource. Production
-`RdmaConnection`, `RdmaListener`, and protocol `IoConnection` values retain
-direct I/O/immutable state plus weak opaque session capabilities and
-resource-free observers; they do not strongly retain or keep alive the shared
-engine, `ConnectionState`, `ListenerState`, QP, or CmId. Suspended
-connect/listen/accept futures likewise drop strong manager records before
-awaiting.
-
-Only `SessionManager` owns `SessionLifecycleAuthority`. QP ERR transition,
-result-aware destruction, and final resource extraction require a reference to
-that private authority. A successful synchronous QP destruction while the
-CmId remains owned can mint one exact connection/`qp_num` proof. The proof is
-private, non-copyable, non-cloneable, consumed by value for one reclaim
-transaction, and cannot be replayed. Zero-debt retirement records destroyed
-state without manufacturing a reclaim proof.
-
-`IoCore` does not import the proof or any session owner. During the consuming
-transaction, `SessionManager` passes the already-proven exact connection and
-QP identities to the narrow reclaim operation. `IoCore` still verifies the
-established I/O identity, exact operation generation and owner, accepted-set
-membership, registration, local/CQ credit, and MR before releasing anything.
-An anomalous token remains retained rather than making the proof reusable.
-
-For a copied CQE, `IoCore` first resolves the exact operation generation.
-`SessionManager` then proves that its registry still contains the operation's
-connection generation and exact `qp_num`; the core checks opcode and duplicate
-state before consuming ownership. Provider posting retains its existing
-outcomes: accepted, exact accepted prefix plus proven-unaccepted suffix,
-proven-unaccepted, or complete-batch retention for ambiguity or an observed
-early suffix CQE.
-
-One connection-scoped event port carries owned completion and terminal events.
-Core mutations return owned effects for event delivery, operation wakes,
-accepted-zero transitions, and operation-quarantine transitions.
-Ordinary paths move the full bundle into `SessionManager::commit_io_effects`;
-the session applies quarantine changes and accepted-zero/drain transitions
-before consuming the detached publication. Root terminal composition uses one
-opaque post-application state so CM and connection terminal state/events remain
-ordered before operation effects, close wakes, and the terminal wake. The
-original full bundle cannot be reused or published after either consuming
-handoff. The port releases its queue mutex before wakeup, and the message
-driver preserves check-register-recheck suspension.
-
-Operation quarantine retains one operation's MR, registration, accepted-set
-membership, and CQ debt inside `IoCore`. `SessionManager` owns the combined
-per-connection index that retains connection admission on the first operation
-or connection quarantine key and recovers it only after the last clear.
-Connection quarantine retains the QP/CmId-owning state, route, generation,
-admission, and unresolved operations when no positive release boundary can be
-proven. Protocol code can request close but cannot transition, release, prove,
-or quarantine provider-visible ownership.
-
-These boundaries are crate-private and deliberately unstable. V1 APIs are
-unchanged; v2 replaces the aggregate reclamation-budget control with separate
-I/O and session controls.
-
-Enforcement follows the boundary that owns each invariant:
-
-- Package-local Clippy configuration rejects resolved thread, task, executor,
-  and runtime-construction APIs throughout production v2 code. V1 and
-  intentional unit-test concurrency fixtures are outside that lint scope.
-- Private fields and consuming types keep full `IoCoreEffects`
-  non-publishable. Conversion to committed effects requires an authority that
-  only the trusted `session` subtree can construct.
-- `ConnectionRegistry` owns a separate private authority required to mint a
-  `LiveIoConnectionProof` after exact generation and QP-index validation.
-  Provider-visible lifecycle adapters continue requiring
-  `SessionLifecycleAuthority`; all `session` descendants are trusted owner
-  code.
-- Reentrant owner-local tests prove guard release and
-  mutation-before-publication behavior. Scheduler, teardown, reclamation, and
-  provider suites prove observable behavior rather than private source shape.
-- Dependency direction, narrow visibility, and cohesive source layout remain
-  documented review constraints when Rust visibility cannot express them
-  without distorting the ownership model.
-
-The effect and live-proof constructors have a deliberate type-only dependency
-on session authority. They retain no session state, lock, registry, resource,
-or ownership handle. Exact method inventories, call counts, statement order,
-file paths, and private field lists are not architectural contracts.
-
-## Completion-to-Message Handoff
-
-The I/O progress owner is the only hardware-CQ poller; `IoCore` is the only
-component allowed to validate and consume operation CQEs. A completion must
-match the current operation generation, session-proven connection generation,
-owning connection, provider-reported `qp_num`, and expected opcode where the
-status is successful.
-
-After validation, the core removes operation ownership and creates an owned
-completion event containing the opaque request context, completion result, and
-releasable MR. Registry, admission, posting, and operation-ledger guards are
-released before the event is enqueued on the connection's I/O port and before
-the message driver is woken. Quarantine and accepted-zero/drain effects are
-committed by the session before the event or operation wake is published.
-Detached-only scalar posting first consumes its posting and admission guards;
-connection-close observer publication similarly follows admission and
-lifecycle release. These guarantees cover the runtime guards named here, not
-arbitrary unrelated guards retained by a caller.
-
-The driver then parses the frame or advances the corresponding send/repost
-state. Neither the frontend nor the engine directly mutates driver-owned
-protocol state.
-
-Suspension uses check-register-recheck behavior: the driver checks for work,
-registers both its local-work and I/O-port wakers, and checks again before
-returning `Pending`. This prevents an event, terminal notification, frontend
-close, or timeout from being lost between an empty-queue observation and
-suspension. Events are removed from their queue before protocol processing.
-
-## Wire Protocol, Credits, and Fairness
-
-The internal message protocol has a 12-byte magic/version/type/length header
-and three frame types:
-
-- `HELLO` exchanges receive capacity and maximum message size;
-- `DATA` carries one application message;
-- `CREDIT` reports reposted receive capacity to the peer.
-
-The codec is not public API.
-
-Each DATA send consumes one negotiated remote receive credit. Dropping a
-`ReceivedMessage` returns its MR to driver-owned repost work; after the repost
-is accepted, the driver returns CREDIT to the peer. Holding all received
-messages intentionally withholds all DATA receive capacity.
-
-Within one driver turn, ready application events, control credit work, and
-reposts are bounded and rotated. Pending CREDIT/repost work is explicitly
-given opportunities between message events, so sustained DATA demand cannot
-indefinitely starve control progress. The engine separately rotates validated
-completion dispatch across connections. Neither layer promises real-time
-latency.
-
-## Hardware Ownership and CQE Routing
-
-An MR offered to a provider remains owned by the engine until one of these
-positive boundaries:
-
-1. the provider proves the WR was not accepted;
-2. the engine consumes the WR's exact validated CQE; or
-3. synchronous destruction of the owning QP succeeds while its owning CmId is
-   still alive.
-
-QP ERR, cancellation, a deadline, CQ emptiness, driver loss, or an attempted
-QP destruction is not a release boundary.
-
-Connection and operation slots use non-wrapping generations. Exhausting a
-generation retires the slot permanently. Stale, retired, duplicate, unknown,
-wrong-connection, wrong-`qp_num`, and unexpected-success-opcode CQEs cannot
-change live ownership. An exact error CQE, including a provider fatal or
-unknown status, is consumed for that operation and delivered as
-`Error::CompletionError`.
-
-For linked posting batches, only a valid `bad_wr` pointer into the exact batch
-proves a suffix unaccepted. A null, foreign, misaligned, or otherwise invalid
-pointer leaves the complete batch acceptance-ambiguous, so all entries are
-retained.
-
-An exact prefix is also promoted to complete retained ownership if any CQE was
-already observed for its nominally unaccepted suffix before the post call
-returned. The provider classification remains the starting point; the
-operation ledger's observed completion is the stronger ownership fact.
-
-Providers differ in whether and when they emit flush CQEs. Teardown consumes
-the exact flush CQEs that arrive, but never assumes that every accepted WR
-will produce one.
-
-## Close, Shutdown, and Quarantine
-
-All shutdown orderings converge on engine-owned hardware teardown:
-
-- **Frontend first:** dropping or closing `MessageTransport` wakes its driver;
-  the driver stops message work and requests connection close.
-- **Message driver first:** dropping the driver terminalizes pending frontend
-  operations with `DriverShutdown` and requests close.
-- **Engine first:** engine shutdown stops admission, publishes engine
-  unavailability to each message driver, and safely drains or quarantines
-  every connection.
-
-The SessionManager stops posting, uses its private lifecycle authority to
-transition the local QP to ERR, and lets `IoCore` drain exact CQEs. If accepted
-WRs remain at the drain deadline, it attempts synchronous destruction of that
-exact QP before releasing any associated operation or MR. Successful
-destruction creates one internal proof consumed by the exact unresolved
-operation-reclamation transaction.
-
-For a clean zero-debt retirement, successful QP destruction is also
-established before the connection's CM route is retired. The owning CmId is
-destroyed only after the QP and any required CM acknowledgement. Connection
-and operation generations are retired only after their ownership is no longer
-live.
-
-If QP destruction fails or its result is uncertain, the engine fails closed.
-It retains the exact QP, owning CmId, CM route and generation, admission
-reservation, accepted operation records, CQ debt, and MRs as one bundle.
-Neither another connection nor a later generation can reuse those resources.
-
-`ConnectionQuarantined` describes outstanding hardware-visible work whose
-release boundary could not be established.
-`ConnectionDestroyQuarantined` describes failed zero-debt connection
-finalization. If engine-wide shutdown cannot resolve unsafe ownership before
-its deadline, it returns `EngineWedged`. After the sole engine driver is gone,
-unresolved bundles are intentionally retained until process exit.
-
-## Configuration
-
-### Engine defaults
-
-| Setting | Default | Range |
-|---|---:|---:|
-| Completion mode | Readiness | Readiness or Polling |
-| Maximum live connections | 256 | 1–1,048,576 |
-| Maximum in-flight operations | 16,384 | 2–16,777,216 |
-| Shared CQ capacity | 16,384 | 2–16,777,216 |
-| CQ completion budget | 32 | 1–4,096 |
-| CM event budget | 32 | 1–4,096 |
-| I/O reclamation budget | 16 | 1–4,096 |
-| Session reclamation budget | 16 | 1–4,096 |
-| Completion-dispatch budget | 32 | 1–4,096 |
-| Missing-CQE deadline | 30 s | 1 s–24 h |
-| Connection drain deadline | 5 s | 1 ms–5 min |
-| Engine shutdown deadline | 30 s | 1 ms–10 min |
-
-Maximum in-flight operations cannot exceed CQ capacity. Device limits such as
-`max_qp`, `max_qp_wr`, `max_sge`, `max_cqe`, and RDMA atomic depths are checked
-without clamping.
-
-The owner-local reclamation controls replace the former aggregate
-`reclamation_budget`. To preserve an old aggregate value, divide it between
-`io_reclamation_budget` and `session_reclamation_budget`; either owner may
-receive the extra unit for odd values. The old aggregate value `1` has no exact
-equivalent because both owners require a nonzero turn, so the minimum
-replacement is `(1, 1)`. No compatibility alias is provided.
-
-### Message defaults
-
-| Setting | Default | Validation |
-|---|---:|---|
-| DATA receive buffers | 32 | greater than zero |
-| DATA send buffers | 16 | greater than zero |
-| Maximum payload | 64 KiB | greater than zero and wire-representable |
-| HELLO deadline | 10 s | 1 ms–5 min |
-
-An explicit `RdmaConnectionConfig` may exceed, but cannot undershoot, the WR
-requirements derived from the message configuration.
-
-## Compact Diagnostics and Test Support
-
-`RdmaEngine::diagnostics()` is an O(1) lifecycle and hardware-debt snapshot.
-It reports only:
-
-- lifecycle and an optional engine-wide terminal error;
-- live connections;
-- registered and accepted operations;
-- pending reclamations;
-- available and retained CQ credits;
-- quarantined operations, MRs, bytes, and connections.
-
-It intentionally has no per-object listings, configuration echoes, scheduler
-visits, task-count declarations, event ledger, or message-protocol counters.
-Operation and message futures carry their contextual errors.
-
-The non-default, doc-hidden `rdma_io::v2::test_support` namespace is limited to
-otherwise unobservable safety boundaries: exact-CQE suppression and routing,
-posting acceptance, readiness-arm races, forced QP-destroy failure,
-destruction order, exact route retention, and opaque shared-resource identity.
-Malformed protocol tests use an independently encoded test peer rather than a
-production frame-mutation hook.
-
-Colocated unit tests name the owning `io_core` or `session` fixture explicitly.
-They do not use root-to-session-to-I/O `Deref`, root forwarding methods, or a
-strong root field on test connection frontends. A test connection may retain
-its `ConnectionState` directly when a lifecycle or accounting assertion needs
-that session-owned fixture; this retain exposes neither the root nor another
-owner.
-
-## Validation
-
-The complete local gate is:
-
-```sh
-CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 just validate-v2-engine
-```
-
-It runs warning-denied feature builds, all-target workspace builds, formatting,
-strict Clippy including the production v2 hidden-work policy, rustdoc,
-doctests, an isolated production build without `test-hooks`, and serialized
-integration suites on both RXE and SIW.
-
-The provider-only matrix is:
-
-```sh
-sudo -E env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 \
-  CARGO="$(command -v cargo)" \
-  ./scripts/validate-v2-engine-providers.sh
-```
-
-The script positively identifies each provider, propagates
-`CARGO_BUILD_JOBS` through nested user switching, sets
-`RDMA_REQUIRE_PROVIDER=1`, runs routing, readiness-race, lifecycle, listener,
-message setup/behavior/retry, diagnostics, multi-connection, full-workspace,
-and v1 safe-resource suites, then restores RXE. A self-skipped provider suite
-is not a pass.
-
-Useful focused modes include `--provider-probe`, `--readiness-race`,
-`--driver-flush-gate`, `--operations`, `--connections`, `--listeners`,
-`--lifecycle`, `--message-setup`, `--message`, and `--engine-conformance`.
-
-## Issue #43 Closure Evidence
-
-The final audit classifies composition-root uses rather than treating symbol
-count as the goal:
-
-| Criterion | As-built evidence |
-|---|---|
-| Lowest I/O layer excludes message, listener, and CM policy | `IoCore` owns posting, exact CQE validation, operation accounting, readiness, and reclamation. Its only session reference is the type-only authority required to commit full effects; it retains no session state or resources. |
-| Message policy excludes engine/session internals | `MessageTransportDriver` uses only `IoConnection`, its event port, and opaque close capability; private APIs and review preserve that dependency direction. |
-| CM/listener/session state is outside the I/O core | `SessionManager` owns CM routes, listeners, connections, lifecycle authority, teardown, deadlines, and connection quarantine under the `engine/session/` hierarchy. |
-| Composition root does not re-own owner policy | `EngineShared` assembles owners and coordinates global lifecycle, signaling, diagnostics, terminal state, and lifetime ordering. Session-to-engine access is the weak narrow runtime capability described above. |
-| Exact routing and fail-closed provider ownership remain intact | Unit and RXE/SIW provider suites cover generation/QP/opcode validation, duplicates, accepted prefixes, proven rejection, acceptance ambiguity, and missing completions. |
-| Positive release and teardown boundaries remain intact | Tests cover proven non-acceptance, exact completion, successful QP-destruction proof, QP-before-route/CmId retirement, and complete-bundle quarantine after failed destruction. |
-| Publication and progress contracts remain explicit | Tests cover post-guard callbacks/wakers, bounded owner turns, fair rotation, and terminal composition; package-local Clippy rejects configured hidden-work APIs in production v2 code. |
-| Transitional seams are removed | The aggregate reclamation alias and old source paths remain absent; the final cleanup removes stale migration annotations, root/session test dereference, root forwarding, and full-root I/O fixtures. |
-| V1 remains separate | No v1 source is changed by this cleanup, and the complete provider gate retains the v1 safe-resource suite. |
-| Documentation matches implementation | This document distinguishes policy ownership, physical readiness/resource retention, narrow runtime composition, and bounded test support. |
-
-This matrix records implementation coverage; actual closure remains a human
-issue-management action. The final pull-request report must include the exact
-serialized gate result and any environmental limitation before recommending
-closure.
-
-## Limitations
-
-- One RDMA device, anchored context, PD, and shared CQ per engine.
-- RC QPs only; no UD, inline-data configuration, multi-SGE message API,
-  atomics, or message ring transport in this layer.
-- Tokio is the current engine/message-driver runtime integration.
-- No byte-stream, tonic, Quinn, or V1 adapter is built into the v2 engine.
-- Message send completion is local completion, not remote consumption.
-- Message buffer pools are fixed for the connection lifetime.
-- Low-level early SENDs can wait under RNR retry until a receive is posted.
-- Quarantine intentionally retains memory, kernel objects, and admission when
-  safe release cannot be proven.
-- Bounded fairness is not a real-time guarantee.
+Readiness mode is the default and requires an active Tokio I/O runtime during
+construction. Polling mode creates no CQ readiness adapter, but polling still
+requires Tokio time support before lifecycle deadlines can be armed
+([engine/config.rs:26-42](../../rdma-io/src/v2/engine/config.rs#L26-L42),
+[engine/mod.rs:118-258](../../rdma-io/src/v2/engine/mod.rs#L118-L258)).
+
+## Single-Owner Architecture
+
+### Reactor-owned state
+
+`RdmaEngineDriver` owns one `EngineReactor`. The reactor owns:
+
+- `IoReactorSources`, including the value-owned `IoState`, CQ readiness,
+  completion buffer, completion-ready set, operation deadlines, and bounded
+  reclamation cursors;
+- `SessionReactorSources`, including the generational connection registry,
+  generational listener registry, common CM context route, CM event and
+  destruction services, lifecycle deadlines, shutdown cursors, and
+  quarantines;
+- global lifecycle and terminal composition;
+- the one fair source scheduler; and
+- the canonical provider resource bundle
+  ([reactor/mod.rs:35-82](../../rdma-io/src/v2/engine/reactor/mod.rs#L35-L82),
+  [io_core/progress.rs:21-64](../../rdma-io/src/v2/engine/io_core/progress.rs#L21-L64),
+  [session/progress.rs:22-41](../../rdma-io/src/v2/engine/session/progress.rs#L22-L41),
+  [resources.rs:18-37](../../rdma-io/src/v2/engine/resources.rs#L18-L37)).
+
+`SessionManager` remains only a reactor-owned policy and frontend-binding
+value. It contains no connection, listener, route, operation, CM, deadline, or
+terminal registry. Shared frontend state is limited to immutable
+configuration, memory registration, command ingress, admission synchronization,
+work signaling, diagnostics, and take-once observers
+([session/mod.rs:355-449](../../rdma-io/src/v2/engine/session/mod.rs#L355-L449)).
+
+### Stable identity
+
+Connections, listeners, and operations use private slot-plus-generation
+tokens. Registry generation never wraps: an exhausted slot retires rather than
+becoming a valid old identity. Provider `qp_num`, raw CM ID, and context route
+are secondary facts checked against the current token; they are not alternate
+owners
+([registry.rs:41-145](../../rdma-io/src/v2/engine/registry.rs#L41-L145),
+[session/registry.rs:432-715](../../rdma-io/src/v2/engine/session/registry.rs#L432-L715),
+[session/listener.rs:1300-1445](../../rdma-io/src/v2/engine/session/listener.rs#L1300-L1445)).
+
+`LiveIoConnectionProof` records that the exact connection generation and QP
+are live when a copied CQE is routed. `QpDestructionProof` records a successful
+synchronous destruction of the exact owning QP. These values are retained
+because they encode runtime provider facts, unlike the removed forwarding
+authorities
+([registry.rs:20-39](../../rdma-io/src/v2/engine/registry.rs#L20-L39),
+[session/mod.rs:50-58](../../rdma-io/src/v2/engine/session/mod.rs#L50-L58)).
+
+## Typed Commands, Admission, and Cancellation
+
+Frontend futures perform validation and bounded admission on first poll. A
+successfully admitted command is executed only by a later driver poll.
+Ordinary work uses distinct bounded connect, listen, and operation lanes.
+Close, cancellation, listener close, and shutdown use generational coalesced
+control state so cleanup cannot be blocked behind ordinary capacity
+([reactor/command.rs:261-410](../../rdma-io/src/v2/engine/reactor/command.rs#L261-L410),
+[reactor/command.rs:746-1024](../../rdma-io/src/v2/engine/reactor/command.rs#L746-L1024)).
+
+Admission waiters remain frontend-owned. Cancellation before admission removes
+the waiter and creates no provider work. Cancellation after admission transfers
+cleanup responsibility to the reactor. Losing a completion receiver suppresses
+delivery, not MR, CQ-credit, QP, CM, or reservation cleanup. Command permits
+release only after the command is disposed or ownership has transferred to the
+authoritative backend.
+
+Protocol batches consume one operation-lane permit per WR entry, atomically.
+This bounds queued WR and MR ownership by `max_inflight_operations`. Setup I/O
+uses `BorrowedSetupIo<'_>` only while connect/accept setup already holds
+exclusive reactor access
+([io.rs:425-477](../../rdma-io/src/v2/engine/io.rs#L425-L477),
+[reactor/command.rs:430-524](../../rdma-io/src/v2/engine/reactor/command.rs#L430-L524)).
+
+## Provider-Safety Transactions
+
+### Posting and acceptance
+
+Scalar and protocol operations share validation and the same connection-owned
+provider resource methods. Before a provider call, the reactor installs
+operation identity, MR ownership, local QP credits, and CQ credit. The result
+is then reconciled as:
+
+- all accepted;
+- exact accepted prefix with proven-unaccepted suffix;
+- exact zero accepted; or
+- ambiguous.
+
+Only positive non-acceptance proof releases a WR's ownership. Accepted or
+ambiguous ownership remains registered until an exact CQE or QP-destruction
+proof resolves it. An early CQE is retained until provider acceptance
+reconciliation commits
+([operation/future.rs:497-655](../../rdma-io/src/v2/engine/io_core/operation/future.rs#L497-L655),
+[operation/batch.rs:135-478](../../rdma-io/src/v2/engine/io_core/operation/batch.rs#L135-L478)).
+
+### CQE validation and release
+
+CQ polling first resolves the exact operation generation. Enqueue then requires
+the current connection generation, exact `qp_num`, and non-duplicate completion
+state. A successful CQE additionally requires the expected opcode. A failed
+CQE may carry an unreliable provider opcode, so exact-identity failure bypasses
+only the opcode check and terminalizes that operation rather than leaking its
+ownership. CQEs rejected for token, generation, connection, QP, successful
+opcode, or duplicate mismatch cannot release MRs, local credits, registry
+entries, or CQ debt
+([operation/completion.rs:120-217](../../rdma-io/src/v2/engine/io_core/operation/completion.rs#L120-L217),
+[operation/tests.rs:393-504](../../rdma-io/src/v2/engine/io_core/operation/tests.rs#L393-L504),
+[io_core/progress.rs:204-281](../../rdma-io/src/v2/engine/io_core/progress.rs#L204-L281)).
+
+Completion dispatch is bounded per connection. It releases the operation slot,
+accepted membership, local direction credit, CQ credit, and retained MR only
+through the one completion transaction. Session-facing quarantine and
+accepted-zero effects commit before detached events and wakes enter
+`ReactorActions`
+([operation/completion.rs:219-377](../../rdma-io/src/v2/engine/io_core/operation/completion.rs#L219-L377),
+[operation/effects.rs:100-220](../../rdma-io/src/v2/engine/io_core/operation/effects.rs#L100-L220),
+[session/mod.rs:695-780](../../rdma-io/src/v2/engine/session/mod.rs#L695-L780)).
+
+## Scheduling, Readiness, and Publication
+
+Every reactor poll snapshots ready sources. `ReactorScheduler` visits each
+ready-at-entry source at most once, rotates the global starting source, and
+defers work made ready during a turn to a later poll. Separate bounded sources
+cover commands, CQ polling, completion dispatch, I/O reclamation/deadlines, CM
+software classes, CM events/destruction, session deadlines, shutdown classes,
+and I/O terminalization
+([reactor/scheduler.rs:1-92](../../rdma-io/src/v2/engine/reactor/scheduler.rs#L1-L92),
+[reactor/mod.rs:321-609](../../rdma-io/src/v2/engine/reactor/mod.rs#L321-L609)).
+
+`ReactorActions` has an ordinary per-turn capacity of 32 leaves and no overflow
+queue. State mutation completes before the driver publishes events, operation
+wakes, close/listener notifications, protocol actions, and the terminal wake
+in their required order. If a later source fails, already-produced actions are
+still published
+([reactor/action.rs:11-151](../../rdma-io/src/v2/engine/reactor/action.rs#L11-L151),
+[driver/mod.rs:178-199](../../rdma-io/src/v2/engine/driver/mod.rs#L178-L199)).
+
+Readiness mode follows arm, poll, register, and recheck protocols for CQ and CM
+fds. Software producers use the `WorkSignal` epoch so enqueue-before-register
+and enqueue-during-register races cannot suspend the driver. One driver timer
+tracks the earliest I/O or session deadline. Polling mode cooperatively yields
+instead of self-spinning.
+
+The two public reclamation budgets are intentionally distinct. One bounds
+operation cancellation and missing-CQE deadlines; the other bounds connection
+drain and lifecycle deadlines. Neither source can consume the other's turn
+allowance
+([engine/mod.rs:173-192](../../rdma-io/src/v2/engine/mod.rs#L173-L192)).
+
+## Listener Contract
+
+The listener registry is bounded by `max_live_connections` and uses
+non-wrapping generations. A public backlog value is validated once and is used
+both for `rdma_listen` and for userspace admission:
+
+- exactly `backlog` fair accept-request permits;
+- exactly `backlog` pending-child slots; and
+- one selected request/child pair.
+
+Accept waiters are FIFO and anti-barging. A selected accept retains its permit
+and child resources through delivery acknowledgement or exact rejection and
+retirement. Listener close, shutdown, and driver drop dispose or quarantine
+each waiter, child, selected pair, CM owner, and observer exactly once
+([session/listener.rs:35-57](../../rdma-io/src/v2/engine/session/listener.rs#L35-L57),
+[session/listener.rs:1050-1285](../../rdma-io/src/v2/engine/session/listener.rs#L1050-L1285),
+[session/listener.rs:1300-1445](../../rdma-io/src/v2/engine/session/listener.rs#L1300-L1445)).
+
+## Close, Teardown, and Quarantine
+
+Connection close stops posting, transitions the QP to error once, scans
+accepted operations in bounded units, and schedules a drain deadline. Exact
+CQEs release normal ownership. If work remains, successful destruction of the
+owning QP mints a `QpDestructionProof`; reclamation rechecks the connection,
+QP, operation generation, accepted membership, local credit, CQ credit, and MR
+before release
+([session/drain.rs:12-188](../../rdma-io/src/v2/engine/session/drain.rs#L12-L188),
+[session/drain.rs:270-367](../../rdma-io/src/v2/engine/session/drain.rs#L270-L367),
+[operation/reclamation.rs:175-267](../../rdma-io/src/v2/engine/io_core/operation/reclamation.rs#L175-L267)).
+
+QP ownership is destroyed before its `CmId` enters the common destruction
+service. CM destruction waits until event draining reaches `WouldBlock`.
+Failures and uncertain ownership retain the complete connection/listener
+bundle in reactor or process-lifetime quarantine; capacity and diagnostics
+remain pinned until explicit recovery
+([session/cm/retirement.rs:16-93](../../rdma-io/src/v2/engine/session/cm/retirement.rs#L16-L93),
+[session/cm/retirement.rs:440-559](../../rdma-io/src/v2/engine/session/cm/retirement.rs#L440-L559)).
+
+Dropping the engine driver is synchronous because no later poll is possible.
+It closes all admission, drains unstarted commands, terminalizes observers,
+attempts only provably safe destruction, and retains the complete reactor if
+provider ownership remains unresolved
+([reactor/mod.rs:210-286](../../rdma-io/src/v2/engine/reactor/mod.rs#L210-L286),
+[reactor/mod.rs:711-756](../../rdma-io/src/v2/engine/reactor/mod.rs#L711-L756)).
+
+Canonical provider resources drop in CQ-readiness, CM-readiness, CQ, PD, CM
+channel, context-root order after final CM draining
+([resources.rs:18-37](../../rdma-io/src/v2/engine/resources.rs#L18-L37),
+[resources/drop_tests.rs:79-82](../../rdma-io/src/v2/engine/resources/drop_tests.rs#L79-L82)).
+
+## Message Transport Boundary
+
+`MessageTransportDriver` remains a separate explicitly polled protocol
+runtime. It owns HELLO negotiation, DATA/CREDIT processing, registered pools,
+remote credits, receive reposting, message delivery, and connection-local
+fairness. It does not own `IoState`, the provider CQ, connection registry, QP,
+or `CmId`. Provider operations enter the engine through the same bounded
+operation command lane as scalar operations.
+
+Message setup posts receive batches through `BorrowedSetupIo<'_>` before
+`rdma_connect` or `rdma_accept`. Integrating the message protocol scheduler
+into `EngineReactor` is intentionally outside issue #59.
+
+## Configuration and Diagnostics
+
+The engine exposes bounds for live connections, in-flight operations, CQ
+capacity, CQ service, CM service, I/O reclamation, session reclamation,
+completion dispatch, missing-CQE deadline, connection drain deadline, and
+shutdown deadline. Configuration is validated against arithmetic limits and
+provider capabilities; values are rejected rather than silently clamped
+([engine/mod.rs:118-217](../../rdma-io/src/v2/engine/mod.rs#L118-L217),
+[engine/config.rs:87-185](../../rdma-io/src/v2/engine/config.rs#L87-L185)).
+
+`RdmaEngine::diagnostics()` exposes copied lifecycle, connection/operation,
+CQ-credit, quarantine, and terminal observations. Diagnostics are not mutation
+capabilities and do not retain provider resources
+([diagnostics.rs:33-58](../../rdma-io/src/v2/engine/diagnostics.rs#L33-L58)).
+
+## Verification
+
+The implementation is covered by:
+
+- generational registry and exact-proof unit tests
+  ([registry.rs:506-655](../../rdma-io/src/v2/engine/registry.rs#L506-L655),
+  [session/registry.rs:1860-2010](../../rdma-io/src/v2/engine/session/registry.rs#L1860-L2010));
+- provider acceptance, early-CQE, exact-CQE, credit, cancellation, and
+  reclamation tests
+  ([operation/tests.rs:315-535](../../rdma-io/src/v2/engine/io_core/operation/tests.rs#L315-L535));
+- scheduler and bounded-action tests
+  ([reactor/scheduler.rs:97-157](../../rdma-io/src/v2/engine/reactor/scheduler.rs#L97-L157),
+  [reactor/action.rs:184-242](../../rdma-io/src/v2/engine/reactor/action.rs#L184-L242));
+- listener capacity, generation, FIFO, cancellation, ownership-transfer, and
+  exact provider backlog tests
+  ([session/listener.rs:2256-2529](../../rdma-io/src/v2/engine/session/listener.rs#L2256-L2529));
+- resource drop-order tests in both completion modes
+  ([resources/drop_tests.rs:79-82](../../rdma-io/src/v2/engine/resources/drop_tests.rs#L79-L82));
+  and
+- serialized RXE and SIW conformance, including v1 safe-resource regression.
+
+The completed migration evidence and old-path deletion record are in
+[V2 Single-Owner Reactor Migration](v2-single-owner-reactor-migration.md).

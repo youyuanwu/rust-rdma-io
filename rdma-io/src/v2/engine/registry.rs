@@ -1,13 +1,8 @@
 //! Lazily paged generational registries used by the shared engine.
 
-#[cfg(test)]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::v2::error::{Error, Result};
-
-use super::session::LiveIoProofAuthority;
 
 const PAGE_SIZE: usize = 256;
 
@@ -19,7 +14,7 @@ pub(super) struct ConnectionToken {
 
 /// Proof that the session registry currently owns an exact connection/QP pair.
 ///
-/// Only `ConnectionRegistry` can construct this value. The I/O core consumes
+/// Only the reactor-owned connection registry can construct this value. The I/O core consumes
 /// it while validating a copied CQE; it carries no connection resources.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct LiveIoConnectionProof {
@@ -30,7 +25,6 @@ pub(super) struct LiveIoConnectionProof {
 
 impl LiveIoConnectionProof {
     pub(in crate::v2::engine) const fn issue_live_io_proof(
-        _authority: &LiveIoProofAuthority,
         connection: ConnectionToken,
         qp_num: u32,
     ) -> Self {
@@ -43,6 +37,15 @@ impl LiveIoConnectionProof {
 
     pub(super) fn proves(self, connection: ConnectionToken, qp_num: u32) -> bool {
         self.connection == connection && self.qp_num == qp_num
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(identity: super::io_core::EstablishedIoIdentity) -> Self {
+        Self {
+            connection: identity.connection,
+            qp_num: identity.qp_num,
+            _private: (),
+        }
     }
 }
 
@@ -65,11 +68,31 @@ pub(super) struct OperationToken {
     pub(super) generation: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) struct ListenerToken {
+    pub(super) slot: u32,
+    pub(super) generation: u32,
+}
+
 impl OperationToken {
     pub(super) const fn encode(self) -> u64 {
         ((self.generation as u64) << 32) | self.slot as u64
     }
 
+    pub(super) const fn decode(value: u64) -> Self {
+        Self {
+            slot: value as u32,
+            generation: (value >> 32) as u32,
+        }
+    }
+}
+
+impl ListenerToken {
+    pub(super) const fn encode(self) -> u64 {
+        ((self.generation as u64) << 32) | self.slot as u64
+    }
+
+    #[cfg(test)]
     pub(super) const fn decode(value: u64) -> Self {
         Self {
             slot: value as u32,
@@ -112,6 +135,20 @@ impl RegistryToken for OperationToken {
     }
 }
 
+impl RegistryToken for ListenerToken {
+    fn from_parts(slot: u32, generation: u32) -> Self {
+        Self { slot, generation }
+    }
+
+    fn slot(self) -> u32 {
+        self.slot
+    }
+
+    fn generation(self) -> u32 {
+        self.generation
+    }
+}
+
 #[derive(Clone)]
 pub(super) enum Lookup<T> {
     Occupied(T),
@@ -123,10 +160,11 @@ pub(super) enum Lookup<T> {
 
 pub(super) struct PagedRegistry<K, T> {
     capacity: usize,
-    inner: Mutex<RegistryInner<T>>,
-    live: AtomicUsize,
+    inner: RegistryInner<T>,
+    live: usize,
+    fail_next_page_allocation: bool,
     #[cfg(test)]
-    fail_next_page_allocation: AtomicBool,
+    occupied_full_scans: std::cell::Cell<usize>,
     _token: std::marker::PhantomData<fn() -> K>,
 }
 
@@ -171,23 +209,25 @@ impl<K: RegistryToken, T> PagedRegistry<K, T> {
         pages.resize_with(page_count, || None);
         Ok(Self {
             capacity,
-            inner: Mutex::new(RegistryInner {
+            inner: RegistryInner {
                 pages,
                 recycled: Vec::new(),
                 next_unused: 0,
-            }),
-            live: AtomicUsize::new(0),
+            },
+            live: 0,
+            fail_next_page_allocation: false,
             #[cfg(test)]
-            fail_next_page_allocation: AtomicBool::new(false),
+            occupied_full_scans: std::cell::Cell::new(0),
             _token: std::marker::PhantomData,
         })
     }
 
-    pub(super) fn allocate_with(&self, make: impl FnOnce(K) -> T) -> Result<(K, T)>
+    #[cfg(test)]
+    pub(super) fn allocate_with(&mut self, make: impl FnOnce(K) -> T) -> Result<(K, T)>
     where
         T: Clone,
     {
-        let mut inner = lock_unpoison(&self.inner);
+        let inner = &mut self.inner;
         let (slot, recycled) = if let Some(slot) = inner.recycled.pop() {
             (slot, true)
         } else {
@@ -201,7 +241,13 @@ impl<K: RegistryToken, T> PagedRegistry<K, T> {
                 .ok_or(Error::CapacityExhausted)?;
             (next as u32, false)
         };
-        let entry = match self.slot_mut(&mut inner, slot, true) {
+        let entry = match Self::slot_mut(
+            self.capacity,
+            inner,
+            slot,
+            true,
+            &mut self.fail_next_page_allocation,
+        ) {
             Ok(entry) => entry,
             Err(error) => {
                 if recycled {
@@ -225,21 +271,87 @@ impl<K: RegistryToken, T> PagedRegistry<K, T> {
         let token = K::from_parts(slot, entry.generation);
         let value = make(token);
         entry.state = SlotState::Occupied(value.clone());
-        self.live.fetch_add(1, Ordering::AcqRel);
+        self.live += 1;
         Ok((token, value))
     }
 
-    pub(super) fn lookup_cloned(&self, token: K) -> Lookup<T>
-    where
-        T: Clone,
-    {
-        let inner = lock_unpoison(&self.inner);
-        let Some(entry) = self.slot_ref(&inner, token.slot()) else {
+    pub(super) fn allocate_owned(&mut self, make: impl FnOnce(K) -> T) -> Result<K> {
+        let inner = &mut self.inner;
+        let (slot, recycled) = if let Some(slot) = inner.recycled.pop() {
+            (slot, true)
+        } else {
+            let next = inner.next_unused as usize;
+            if next >= self.capacity {
+                return Err(Error::CapacityExhausted);
+            }
+            inner.next_unused = inner
+                .next_unused
+                .checked_add(1)
+                .ok_or(Error::CapacityExhausted)?;
+            (next as u32, false)
+        };
+        let entry = match Self::slot_mut(
+            self.capacity,
+            inner,
+            slot,
+            true,
+            &mut self.fail_next_page_allocation,
+        ) {
+            Ok(entry) => entry,
+            Err(error) => {
+                if recycled {
+                    inner.recycled.push(slot);
+                } else {
+                    inner.next_unused = slot;
+                }
+                return Err(error);
+            }
+        };
+        if !matches!(entry.state, SlotState::Vacant) {
+            if recycled {
+                inner.recycled.push(slot);
+            } else {
+                inner.next_unused = slot;
+            }
+            return Err(Error::InvalidConfig(
+                "registry allocator selected a non-vacant slot".into(),
+            ));
+        }
+        let token = K::from_parts(slot, entry.generation);
+        entry.state = SlotState::Occupied(make(token));
+        self.live += 1;
+        Ok(token)
+    }
+
+    pub(super) fn lookup_ref(&self, token: K) -> Lookup<&T> {
+        let Some(entry) = self.slot_ref(token.slot()) else {
             return Lookup::Unknown;
         };
         if entry.last_completed_generation == Some(token.generation()) {
             return Lookup::Duplicate;
         }
+        if entry.generation != token.generation() {
+            return Lookup::Stale;
+        }
+        match &entry.state {
+            SlotState::Occupied(value) => Lookup::Occupied(value),
+            SlotState::Vacant => Lookup::Unknown,
+            SlotState::Retired => Lookup::Retired,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn lookup_cloned(&self, token: K) -> Lookup<T>
+    where
+        T: Clone,
+    {
+        let Some(entry) = self.slot_ref(token.slot()) else {
+            return Lookup::Unknown;
+        };
+        if entry.last_completed_generation == Some(token.generation()) {
+            return Lookup::Duplicate;
+        }
+
         if entry.generation != token.generation() {
             return Lookup::Stale;
         }
@@ -250,9 +362,34 @@ impl<K: RegistryToken, T> PagedRegistry<K, T> {
         }
     }
 
-    pub(super) fn release(&self, token: K, completed: bool) -> Option<T> {
-        let mut inner = lock_unpoison(&self.inner);
-        let entry = self.slot_mut(&mut inner, token.slot(), false).ok()?;
+    pub(super) fn get_mut(&mut self, token: K) -> Option<&mut T> {
+        let entry = Self::slot_mut(
+            self.capacity,
+            &mut self.inner,
+            token.slot(),
+            false,
+            &mut self.fail_next_page_allocation,
+        )
+        .ok()?;
+        if entry.generation != token.generation() {
+            return None;
+        }
+        match &mut entry.state {
+            SlotState::Occupied(value) => Some(value),
+            SlotState::Vacant | SlotState::Retired => None,
+        }
+    }
+
+    pub(super) fn release(&mut self, token: K, completed: bool) -> Option<T> {
+        let inner = &mut self.inner;
+        let entry = Self::slot_mut(
+            self.capacity,
+            inner,
+            token.slot(),
+            false,
+            &mut self.fail_next_page_allocation,
+        )
+        .ok()?;
         if entry.generation != token.generation() {
             return None;
         }
@@ -272,18 +409,21 @@ impl<K: RegistryToken, T> PagedRegistry<K, T> {
             entry.generation += 1;
             inner.recycled.push(token.slot());
         }
-        self.live.fetch_sub(1, Ordering::AcqRel);
+        self.live -= 1;
         Some(value)
     }
 
     pub(super) fn live(&self) -> usize {
-        self.live.load(Ordering::Acquire)
+        self.live
+    }
+
+    pub(super) fn has_capacity(&self) -> bool {
+        !self.inner.recycled.is_empty() || (self.inner.next_unused as usize) < self.capacity
     }
 
     #[cfg(test)]
     pub(super) fn retired(&self) -> usize {
-        let inner = lock_unpoison(&self.inner);
-        inner
+        self.inner
             .pages
             .iter()
             .filter_map(Option::as_ref)
@@ -301,7 +441,7 @@ impl<K: RegistryToken, T> PagedRegistry<K, T> {
 
     #[cfg(test)]
     fn allocated_pages(&self) -> usize {
-        lock_unpoison(&self.inner)
+        self.inner
             .pages
             .iter()
             .filter(|page| page.is_some())
@@ -309,86 +449,111 @@ impl<K: RegistryToken, T> PagedRegistry<K, T> {
     }
 
     #[cfg(test)]
-    fn fail_next_page_allocation(&self) {
-        self.fail_next_page_allocation
-            .store(true, Ordering::Release);
+    fn fail_next_page_allocation(&mut self) {
+        self.fail_next_page_allocation = true;
     }
 
-    pub(super) fn occupied_cloned(&self) -> Vec<T>
-    where
-        T: Clone,
-    {
-        let inner = lock_unpoison(&self.inner);
-        inner
+    pub(super) fn occupied_tokens(&self) -> Vec<K> {
+        #[cfg(test)]
+        self.occupied_full_scans
+            .set(self.occupied_full_scans.get() + 1);
+        self.inner
             .pages
             .iter()
-            .filter_map(Option::as_ref)
-            .flat_map(|page| page.iter())
-            .filter_map(|slot| match &slot.state {
-                SlotState::Occupied(value) => Some(value.clone()),
-                SlotState::Vacant | SlotState::Retired => None,
+            .enumerate()
+            .flat_map(|(page_index, page)| {
+                page.iter().flat_map(move |page| {
+                    page.iter()
+                        .enumerate()
+                        .filter(|(_, slot)| matches!(slot.state, SlotState::Occupied(_)))
+                        .map(move |(slot_index, slot)| {
+                            K::from_parts(
+                                (page_index * PAGE_SIZE + slot_index) as u32,
+                                slot.generation,
+                            )
+                        })
+                })
             })
             .collect()
     }
 
-    pub(super) fn scan_occupied_cloned(
+    #[cfg(test)]
+    pub(super) fn occupied_full_scans(&self) -> usize {
+        self.occupied_full_scans.get()
+    }
+
+    pub(super) fn scan_occupied_tokens(
         &self,
         start: usize,
         budget: usize,
-    ) -> (Vec<T>, usize, bool, usize)
-    where
-        T: Clone,
-    {
-        let inner = lock_unpoison(&self.inner);
-        let end = (start.saturating_add(budget)).min(inner.next_unused as usize);
-        let values = (start..end)
-            .filter_map(|slot| self.slot_ref(&inner, slot as u32))
-            .filter_map(|entry| match &entry.state {
-                SlotState::Occupied(value) => Some(value.clone()),
-                SlotState::Vacant | SlotState::Retired => None,
+    ) -> (Vec<K>, usize, bool, usize) {
+        let end = (start.saturating_add(budget)).min(self.inner.next_unused as usize);
+        let tokens = (start..end)
+            .filter_map(|slot| {
+                let entry = self.slot_ref(slot as u32)?;
+                matches!(entry.state, SlotState::Occupied(_))
+                    .then(|| K::from_parts(slot as u32, entry.generation))
             })
             .collect();
-        (values, end, end >= inner.next_unused as usize, end - start)
+        (
+            tokens,
+            end,
+            end >= self.inner.next_unused as usize,
+            end - start,
+        )
     }
 
     #[cfg(test)]
-    fn insert_at_for_test(&self, slot: u32, value: T) -> K {
+    fn insert_at_for_test(&mut self, slot: u32, value: T) -> K {
         assert!((slot as usize) < self.capacity);
-        let mut inner = lock_unpoison(&self.inner);
-        let entry = self.slot_mut(&mut inner, slot, true).unwrap();
+        let entry = Self::slot_mut(
+            self.capacity,
+            &mut self.inner,
+            slot,
+            true,
+            &mut self.fail_next_page_allocation,
+        )
+        .unwrap();
         assert!(matches!(entry.state, SlotState::Vacant));
         let token = K::from_parts(slot, entry.generation);
         entry.state = SlotState::Occupied(value);
-        self.live.fetch_add(1, Ordering::AcqRel);
+        self.live += 1;
         token
     }
 
     #[cfg(test)]
-    pub(super) fn force_generation_for_test(&self, token: K, generation: u32) -> K {
-        let mut inner = lock_unpoison(&self.inner);
-        let entry = self.slot_mut(&mut inner, token.slot(), false).unwrap();
+    pub(super) fn force_generation_for_test(&mut self, token: K, generation: u32) -> K {
+        let entry = Self::slot_mut(
+            self.capacity,
+            &mut self.inner,
+            token.slot(),
+            false,
+            &mut self.fail_next_page_allocation,
+        )
+        .unwrap();
         assert_eq!(entry.generation, token.generation());
         entry.generation = generation;
         K::from_parts(token.slot(), generation)
     }
 
-    fn slot_ref<'a>(&self, inner: &'a RegistryInner<T>, slot: u32) -> Option<&'a RegistrySlot<T>> {
+    fn slot_ref(&self, slot: u32) -> Option<&RegistrySlot<T>> {
         let index = slot as usize;
         if index >= self.capacity {
             return None;
         }
-        let page = inner.pages.get(index / PAGE_SIZE)?.as_ref()?;
+        let page = self.inner.pages.get(index / PAGE_SIZE)?.as_ref()?;
         page.get(index % PAGE_SIZE)
     }
 
     fn slot_mut<'a>(
-        &self,
+        capacity: usize,
         inner: &'a mut RegistryInner<T>,
         slot: u32,
         allocate_page: bool,
+        _fail_next_page_allocation: &mut bool,
     ) -> Result<&'a mut RegistrySlot<T>> {
         let index = slot as usize;
-        if index >= self.capacity {
+        if index >= capacity {
             return Err(Error::CapacityExhausted);
         }
         let page_index = index / PAGE_SIZE;
@@ -397,7 +562,7 @@ impl<K: RegistryToken, T> PagedRegistry<K, T> {
                 return Err(Error::CapacityExhausted);
             }
             #[cfg(test)]
-            if self.fail_next_page_allocation.swap(false, Ordering::AcqRel) {
+            if std::mem::replace(_fail_next_page_allocation, false) {
                 return Err(Error::InvalidConfig(
                     "registry page allocation failed".into(),
                 ));
@@ -429,8 +594,6 @@ pub(super) fn write_unpoison<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Barrier};
-
     use super::*;
 
     type TestRegistry = PagedRegistry<ConnectionToken, usize>;
@@ -438,7 +601,7 @@ mod tests {
     #[test]
     fn registry_allocates_pages_lazily_at_representative_scale() {
         for capacity in [1, 1_024, 1_048_576] {
-            let registry = TestRegistry::new(capacity).unwrap();
+            let mut registry = TestRegistry::new(capacity).unwrap();
             assert_eq!(registry.allocated_pages(), 0);
             let mut slots = vec![0, capacity / 2, capacity - 1];
             slots.sort_unstable();
@@ -458,7 +621,7 @@ mod tests {
                 registry.allocated_pages() <= 3,
                 "only touched pages may be allocated"
             );
-            let inner = lock_unpoison(&registry.inner);
+            let inner = &registry.inner;
             let resident_slot_capacity = inner
                 .pages
                 .iter()
@@ -469,7 +632,6 @@ mod tests {
                 * std::mem::size_of::<Option<Box<[RegistrySlot<usize>]>>>()
                 + resident_slot_capacity * std::mem::size_of::<RegistrySlot<usize>>()
                 + inner.recycled.capacity() * std::mem::size_of::<u32>();
-            drop(inner);
             assert!(
                 resident_slot_capacity <= 3 * PAGE_SIZE,
                 "representative slots must allocate at most three pages"
@@ -483,7 +645,7 @@ mod tests {
 
     #[test]
     fn page_allocation_failure_restores_the_exact_fresh_slot() {
-        let registry = TestRegistry::new(1).unwrap();
+        let mut registry = TestRegistry::new(1).unwrap();
         registry.fail_next_page_allocation();
 
         assert!(matches!(
@@ -504,7 +666,7 @@ mod tests {
 
     #[test]
     fn release_invalidates_before_reuse_and_duplicate_is_distinct() {
-        let registry = TestRegistry::new(1).unwrap();
+        let mut registry = TestRegistry::new(1).unwrap();
         let (first, _) = registry.allocate_with(|_| 7).unwrap();
         assert_eq!(registry.release(first, true), Some(7));
         assert!(matches!(registry.lookup_cloned(first), Lookup::Duplicate));
@@ -520,7 +682,7 @@ mod tests {
 
     #[test]
     fn maximum_generation_retires_without_wrapping() {
-        let registry = TestRegistry::new(1).unwrap();
+        let mut registry = TestRegistry::new(1).unwrap();
         let (token, _) = registry.allocate_with(|_| 1).unwrap();
         let exhausted = registry.force_generation_for_test(token, u32::MAX);
         assert_eq!(registry.release(exhausted, true), Some(1));
@@ -535,7 +697,7 @@ mod tests {
             Err(Error::CapacityExhausted)
         ));
 
-        let retired_lookup = TestRegistry::new(1).unwrap();
+        let mut retired_lookup = TestRegistry::new(1).unwrap();
         let (token, _) = retired_lookup.allocate_with(|_| 2).unwrap();
         let exhausted = retired_lookup.force_generation_for_test(token, u32::MAX);
         assert_eq!(retired_lookup.release(exhausted, false), Some(2));
@@ -546,23 +708,10 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_registrations_fill_and_release_exact_capacity() {
-        let registry = Arc::new(TestRegistry::new(8).unwrap());
-        let start = Arc::new(Barrier::new(9));
-        let workers = (0..8)
-            .map(|value| {
-                let registry = Arc::clone(&registry);
-                let start = Arc::clone(&start);
-                std::thread::spawn(move || {
-                    start.wait();
-                    registry.allocate_with(|_| value).unwrap()
-                })
-            })
-            .collect::<Vec<_>>();
-        start.wait();
-        let entries = workers
-            .into_iter()
-            .map(|worker| worker.join().unwrap())
+    fn exclusive_registrations_fill_and_release_exact_capacity() {
+        let mut registry = TestRegistry::new(8).unwrap();
+        let entries = (0..8)
+            .map(|value| registry.allocate_with(|_| value).unwrap())
             .collect::<Vec<_>>();
 
         assert_eq!(registry.live(), 8);

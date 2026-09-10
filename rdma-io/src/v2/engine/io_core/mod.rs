@@ -4,30 +4,19 @@ mod operation;
 mod progress;
 
 use std::collections::{HashSet, VecDeque};
-#[cfg(any(test, feature = "test-hooks"))]
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use super::io::{IoEventSender, IoTerminalEvent, PendingIoEvent};
-use super::registry::{
-    ConnectionToken, OperationToken, lock_unpoison, read_unpoison, write_unpoison,
-};
-#[cfg(test)]
-use super::{
-    CompletionMode, RdmaConnectionConfig, RdmaEngine, RdmaEngineBuilder, RdmaEngineDriver,
-    RdmaEngineLifecycle, io,
-};
+use super::registry::{ConnectionToken, Lookup, OperationToken, lock_unpoison};
 use crate::v2::error::{Error, Result};
-use crate::v2::qp::BatchPostOutcome;
 use crate::wc::WorkCompletion;
-use crate::wr::{PreparedRecvBatch, PreparedSendBatch};
 pub(super) use operation::CqeReject;
 pub use operation::RdmaOperation;
+pub(in crate::v2::engine) use operation::future::OperationCommand;
 pub(super) use operation::{
-    CommittedIoCoreEffects, IoCoreEffects, OperationQuarantineEffect, QpReclaimCapability,
-    post_io_recv_batch, post_io_send,
+    CommittedIoCoreEffects, IoCoreEffects, OperationObserver, OperationQuarantineEffect,
+    post_io_recv_batch_into, post_io_send_into,
 };
 use operation::{CqCreditPool, OperationRegistry};
 #[cfg(test)]
@@ -35,17 +24,7 @@ pub(super) use operation::{
     completion_for_driver_test, install_accepted_operation_for_driver_test,
     operation_future_for_io_lifetime_test, register_operation_waker_for_test,
 };
-pub(super) use progress::IoProgress;
-
-/// Posting-only QP authority supplied by the session layer.
-///
-/// This boundary deliberately excludes QP error transitions, destruction,
-/// disconnect, CM ownership, and retirement.
-pub(super) trait IoPostAuthority: Send + Sync {
-    fn qp_num(&self) -> u32;
-    fn post_send(&self, batch: &mut PreparedSendBatch) -> Result<BatchPostOutcome>;
-    fn post_recv(&self, batch: &mut PreparedRecvBatch) -> Result<BatchPostOutcome>;
-}
+pub(super) use progress::IoReactorSources;
 
 /// Restricted publication surface from the I/O core to the explicit driver.
 pub(super) trait IoDriverSignal: Send + Sync {
@@ -54,24 +33,6 @@ pub(super) trait IoDriverSignal: Send + Sync {
     fn publish_reclamation(&self);
     #[cfg(any(test, feature = "test-hooks"))]
     fn pause_operation_before_register(&self);
-}
-
-/// Narrow session capability needed by owner-local I/O progress.
-///
-/// The I/O side never receives a concrete session manager, registry, lifecycle
-/// authority, or resource bundle through this boundary.
-pub(super) trait IoSessionBridge: Send + Sync {
-    fn route_completion(&self, completion: WorkCompletion) -> Option<ConnectionToken>;
-
-    fn dispatch_connection_completions(
-        &self,
-        connection: ConnectionToken,
-        quantum: usize,
-    ) -> (usize, bool);
-
-    fn handle_reclamation_deadline(&self, token: OperationToken);
-
-    fn commit_terminal_effects(&self, effects: IoCoreEffects);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,28 +48,16 @@ pub(super) struct EstablishedIoIdentity {
     pub(super) qp_num: u32,
 }
 
-/// Opaque posting and operation-ledger capability for one established session.
-///
-/// The concrete posting authority contains only a weak reference to the
-/// session-owned resource bundle.
+/// Resource-free I/O identity, limits, and observers for one established
+/// connection. Provider resources remain exclusively in `ConnectionState`.
 pub(super) struct EstablishedIoConnection {
     identity: EstablishedIoIdentity,
-    poster: Arc<dyn IoPostAuthority>,
     max_send_wr: usize,
     max_recv_wr: usize,
-    posting_open: AtomicBool,
-    posting_gate: RwLock<()>,
-    local_credits: Mutex<LocalCredits>,
-    accepted: Mutex<HashSet<AcceptedWrIdentity>>,
-    completions: Mutex<VecDeque<WorkCompletion>>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    accepted_observation: Arc<Mutex<Vec<OperationToken>>>,
     io_events: Mutex<Option<IoEventSender>>,
-    completion_published: AtomicBool,
     drain_notify: Arc<tokio::sync::Notify>,
-}
-
-/// Atomic operation/drain view consumed by session close policy.
-pub(super) struct IoDrainReport {
-    pub(super) accepted_tokens: Vec<OperationToken>,
 }
 
 /// Atomic connection-quarantine accounting reported to session policy.
@@ -120,24 +69,17 @@ pub(super) struct IoQuarantineReport {
 impl EstablishedIoConnection {
     pub(super) fn new(
         identity: EstablishedIoIdentity,
-        poster: Arc<dyn IoPostAuthority>,
         max_send_wr: usize,
         max_recv_wr: usize,
         drain_notify: Arc<tokio::sync::Notify>,
     ) -> Arc<Self> {
-        debug_assert_eq!(identity.qp_num, poster.qp_num());
         Arc::new(Self {
             identity,
-            poster,
             max_send_wr,
             max_recv_wr,
-            posting_open: AtomicBool::new(true),
-            posting_gate: RwLock::new(()),
-            local_credits: Mutex::new(LocalCredits::default()),
-            accepted: Mutex::new(HashSet::new()),
-            completions: Mutex::new(VecDeque::new()),
+            #[cfg(any(test, feature = "test-hooks"))]
+            accepted_observation: Arc::new(Mutex::new(Vec::new())),
             io_events: Mutex::new(None),
-            completion_published: AtomicBool::new(false),
             drain_notify,
         })
     }
@@ -146,141 +88,28 @@ impl EstablishedIoConnection {
         self.identity
     }
 
-    pub(super) fn post_send(&self, batch: &mut PreparedSendBatch) -> Result<BatchPostOutcome> {
-        self.poster.post_send(batch)
+    pub(super) fn drain_notify(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.drain_notify)
     }
 
-    pub(super) fn post_recv(&self, batch: &mut PreparedRecvBatch) -> Result<BatchPostOutcome> {
-        self.poster.post_recv(batch)
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(super) fn accepted_tokens_for_observation(&self) -> Vec<OperationToken> {
+        lock_unpoison(&self.accepted_observation).clone()
     }
 
-    pub(super) fn reserve_local(&self, direction: Direction) -> Result<()> {
-        if !self.posting_open.load(Ordering::Acquire) {
-            return Err(Error::TransportClosed);
-        }
-        let mut credits = lock_unpoison(&self.local_credits);
-        let (used, maximum) = match direction {
-            Direction::Send => (&mut credits.send, self.max_send_wr),
-            Direction::Recv => (&mut credits.recv, self.max_recv_wr),
-        };
-        if *used >= maximum {
-            return Err(Error::CapacityExhausted);
-        }
-        *used += 1;
-        Ok(())
-    }
-
-    pub(super) fn begin_posting(&self) -> Result<RwLockReadGuard<'_, ()>> {
-        let guard = read_unpoison(&self.posting_gate);
-        if !self.posting_open.load(Ordering::Acquire) {
-            return Err(Error::TransportClosed);
-        }
-        Ok(guard)
-    }
-
-    #[cfg(test)]
-    pub(super) fn posting_write_unlocked_for_test(&self) -> bool {
-        self.posting_gate.try_write().is_ok()
-    }
-
-    #[cfg(test)]
-    pub(super) fn local_credit_used_for_test(&self, direction: Direction) -> usize {
-        let credits = lock_unpoison(&self.local_credits);
-        match direction {
-            Direction::Send => credits.send,
-            Direction::Recv => credits.recv,
-        }
-    }
-
-    pub(super) fn release_local(&self, direction: Direction) {
-        let mut credits = lock_unpoison(&self.local_credits);
-        let used = match direction {
-            Direction::Send => &mut credits.send,
-            Direction::Recv => &mut credits.recv,
-        };
-        *used = used.saturating_sub(1);
-    }
-
-    pub(super) fn add_accepted(&self, token: OperationToken) {
-        lock_unpoison(&self.accepted).insert(AcceptedWrIdentity {
-            connection: self.identity.connection,
-            qp_num: self.identity.qp_num,
-            operation: token,
-        });
-    }
-
-    pub(super) fn remove_accepted(&self, token: OperationToken) -> bool {
-        let removed = lock_unpoison(&self.accepted).remove(&AcceptedWrIdentity {
-            connection: self.identity.connection,
-            qp_num: self.identity.qp_num,
-            operation: token,
-        });
-        if removed {
-            self.drain_notify.notify_waiters();
-        }
-        removed
-    }
-
-    pub(super) fn accepted_tokens(&self) -> Vec<OperationToken> {
-        lock_unpoison(&self.accepted)
-            .iter()
-            .map(|identity| identity.operation)
-            .collect()
-    }
-
-    pub(super) fn accepted_count(&self) -> usize {
-        lock_unpoison(&self.accepted).len()
-    }
-
-    pub(super) fn is_posting_open(&self) -> bool {
-        self.posting_open.load(Ordering::Acquire)
-    }
-
-    pub(super) fn drain_report(&self) -> IoDrainReport {
-        let accepted = lock_unpoison(&self.accepted);
-        let accepted_tokens = accepted
-            .iter()
-            .map(|identity| identity.operation)
-            .collect::<Vec<_>>();
-        IoDrainReport { accepted_tokens }
-    }
-
-    pub(super) fn begin_connection_quarantine(
+    pub(super) fn install_io_event_sender(
         &self,
-        quarantined: &AtomicBool,
-    ) -> Option<IoQuarantineReport> {
-        let accepted = lock_unpoison(&self.accepted);
-        let outstanding = accepted.len();
-        if outstanding == 0 || quarantined.swap(true, Ordering::AcqRel) {
-            return None;
-        }
-        Some(IoQuarantineReport {
-            outstanding_operations: outstanding,
-            cq_debt: outstanding,
-        })
-    }
-
-    pub(super) fn enqueue_completion(&self, completion: WorkCompletion) {
-        lock_unpoison(&self.completions).push_back(completion);
-    }
-
-    pub(super) fn pop_completion(&self) -> Option<WorkCompletion> {
-        lock_unpoison(&self.completions).pop_front()
-    }
-
-    pub(super) fn has_completion_work(&self) -> bool {
-        !lock_unpoison(&self.completions).is_empty()
-    }
-
-    pub(super) fn install_io_event_sender(&self, sender: IoEventSender) -> Result<bool> {
+        sender: IoEventSender,
+        already_terminal: bool,
+    ) -> Result<bool> {
         let mut current = lock_unpoison(&self.io_events);
         if current.is_some() {
             return Err(Error::InvalidConfig(
                 "connection already has an attached I/O event port".into(),
             ));
         }
+
         *current = Some(sender);
-        let already_terminal = !self.posting_open.load(Ordering::Acquire);
         drop(current);
         Ok(already_terminal)
     }
@@ -288,19 +117,6 @@ impl EstablishedIoConnection {
     pub(super) fn pending_io_event(&self, event: IoTerminalEvent) -> Option<PendingIoEvent> {
         let sender = lock_unpoison(&self.io_events).clone();
         sender.map(|sender| sender.terminal(event))
-    }
-
-    pub(super) fn mark_completion_published(&self) -> bool {
-        !self.completion_published.swap(true, Ordering::AcqRel)
-    }
-
-    pub(super) fn clear_completion_published(&self) {
-        self.completion_published.store(false, Ordering::Release);
-    }
-
-    pub(super) fn close_posting(&self) {
-        let _posting = write_unpoison(&self.posting_gate);
-        self.posting_open.store(false, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -338,38 +154,106 @@ impl OperationKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct AcceptedWrIdentity {
-    connection: ConnectionToken,
-    qp_num: u32,
-    operation: OperationToken,
-}
-
 /// State owned by the low-level operation/completion runtime.
-pub(super) struct IoCore {
+pub(super) struct IoState {
     operations: OperationRegistry,
     cq_credits: CqCreditPool,
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) rejected_cqes: AtomicU64,
+    pub(super) rejected_cqes: u64,
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) rejected_cqe_reasons: Mutex<Vec<CqeReject>>,
-    pub(super) accepted_operations: AtomicUsize,
-    pub(super) pending_reclamations: AtomicUsize,
-    pub(super) quarantined_operations: AtomicUsize,
-    pub(super) quarantined_mrs: AtomicUsize,
-    pub(super) quarantined_bytes: AtomicUsize,
-    pub(super) published_completion_connections: Mutex<VecDeque<Arc<EstablishedIoConnection>>>,
+    pub(super) rejected_cqe_reasons: Vec<CqeReject>,
+    pub(super) accepted_operations: usize,
+    pub(super) pending_reclamations: usize,
+    pub(super) quarantined_operations: usize,
+    pub(super) quarantined_mrs: usize,
+    pub(super) quarantined_bytes: usize,
+    pub(super) published_completion_connections: VecDeque<ConnectionToken>,
+    published_completion_set: HashSet<ConnectionToken>,
     admission: Arc<RwLock<()>>,
-    admission_error: Mutex<Option<Error>>,
-    shutdown_requested: AtomicBool,
+    admission_error: Option<Error>,
+    shutdown_requested: bool,
     driver_signal: Arc<dyn IoDriverSignal>,
     missing_cqe_deadline: Duration,
     completion_dispatch_budget: usize,
-    reclamation_requests: Mutex<VecDeque<IoDeadlineRequest>>,
-    terminal_failure: Mutex<Option<super::lifecycle::MemoizedTerminalResult>>,
+    reclamation_requests: VecDeque<IoDeadlineRequest>,
+    terminal_failure: Option<super::lifecycle::MemoizedTerminalResult>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::v2::engine) struct ConnectionIoState {
+    identity: EstablishedIoIdentity,
+    max_send_wr: usize,
+    max_recv_wr: usize,
+    local_credits: LocalCredits,
+    accepted: HashSet<OperationToken>,
+    completions: VecDeque<WorkCompletion>,
+    quarantined: HashSet<OperationToken>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    accepted_observation: Arc<Mutex<Vec<OperationToken>>>,
+}
+
+impl ConnectionIoState {
+    pub(in crate::v2::engine) fn from_connection(connection: &EstablishedIoConnection) -> Self {
+        Self {
+            identity: connection.identity,
+            max_send_wr: connection.max_send_wr,
+            max_recv_wr: connection.max_recv_wr,
+            local_credits: LocalCredits::default(),
+            accepted: HashSet::new(),
+            completions: VecDeque::new(),
+            quarantined: HashSet::new(),
+            #[cfg(any(test, feature = "test-hooks"))]
+            accepted_observation: Arc::clone(&connection.accepted_observation),
+        }
+    }
+
+    pub(in crate::v2::engine) fn identity(&self) -> EstablishedIoIdentity {
+        self.identity
+    }
+
+    pub(in crate::v2::engine) fn accepted_count(&self) -> usize {
+        self.accepted.len()
+    }
+
+    pub(in crate::v2::engine) fn accepted_tokens_bounded(
+        &self,
+        limit: usize,
+    ) -> Vec<OperationToken> {
+        self.accepted.iter().take(limit).copied().collect()
+    }
+
+    pub(in crate::v2::engine) fn has_completion_work(&self) -> bool {
+        !self.completions.is_empty()
+    }
+
+    pub(in crate::v2::engine) fn quarantined_operation_count(&self) -> usize {
+        self.quarantined.len()
+    }
+
+    pub(in crate::v2::engine) fn mark_operation_quarantined(
+        &mut self,
+        operation: OperationToken,
+    ) -> bool {
+        assert!(
+            self.accepted.contains(&operation),
+            "only accepted work can enter connection quarantine"
+        );
+        self.quarantined.insert(operation)
+    }
+
+    pub(in crate::v2::engine) fn clear_operation_quarantined(
+        &mut self,
+        operation: OperationToken,
+    ) -> bool {
+        self.quarantined.remove(&operation) && self.quarantined.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(in crate::v2::engine) fn insert_accepted_for_test(&mut self, operation: OperationToken) {
+        assert!(self.accepted.insert(operation));
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct IoCoreDiagnostics {
     pub(super) registered_operations: usize,
     pub(super) accepted_operations: usize,
@@ -381,52 +265,47 @@ pub(super) struct IoCoreDiagnostics {
     pub(super) quarantined_bytes: usize,
 }
 
-impl IoCore {
-    pub(super) fn new(
+impl IoState {
+    pub(super) fn new_owned(
         max_inflight_operations: usize,
         cq_capacity: usize,
         missing_cqe_deadline: Duration,
         completion_dispatch_budget: usize,
         admission: Arc<RwLock<()>>,
         driver_signal: Arc<dyn IoDriverSignal>,
-    ) -> Result<(Arc<Self>, QpReclaimCapability)> {
-        let core = Arc::new(Self {
+    ) -> Result<Self> {
+        Ok(Self {
             operations: OperationRegistry::new(max_inflight_operations)?,
             cq_credits: CqCreditPool::new(cq_capacity),
             #[cfg(any(test, feature = "test-hooks"))]
-            rejected_cqes: AtomicU64::new(0),
+            rejected_cqes: 0,
             #[cfg(any(test, feature = "test-hooks"))]
-            rejected_cqe_reasons: Mutex::new(Vec::new()),
-            accepted_operations: AtomicUsize::new(0),
-            pending_reclamations: AtomicUsize::new(0),
-            quarantined_operations: AtomicUsize::new(0),
-            quarantined_mrs: AtomicUsize::new(0),
-            quarantined_bytes: AtomicUsize::new(0),
-            published_completion_connections: Mutex::new(VecDeque::new()),
+            rejected_cqe_reasons: Vec::new(),
+            accepted_operations: 0,
+            pending_reclamations: 0,
+            quarantined_operations: 0,
+            quarantined_mrs: 0,
+            quarantined_bytes: 0,
+            published_completion_connections: VecDeque::new(),
+            published_completion_set: HashSet::new(),
             admission,
-            admission_error: Mutex::new(None),
-            shutdown_requested: AtomicBool::new(false),
+            admission_error: None,
+            shutdown_requested: false,
             driver_signal,
             missing_cqe_deadline,
             completion_dispatch_budget,
-            reclamation_requests: Mutex::new(VecDeque::new()),
-            terminal_failure: Mutex::new(None),
-        });
-        let reclaim = QpReclaimCapability::new(&core);
-        Ok((core, reclaim))
-    }
-
-    pub(super) fn admission(&self) -> RwLockReadGuard<'_, ()> {
-        read_unpoison(&self.admission)
+            reclamation_requests: VecDeque::new(),
+            terminal_failure: None,
+        })
     }
 
     pub(super) fn admission_error(&self) -> Option<Error> {
-        lock_unpoison(&self.admission_error).clone()
+        self.admission_error.clone()
     }
 
-    pub(super) fn close_admission(&self, error: Option<Error>) {
-        self.shutdown_requested.store(true, Ordering::Release);
-        *lock_unpoison(&self.admission_error) = error;
+    pub(super) fn close_admission(&mut self, error: Option<Error>) {
+        self.shutdown_requested = true;
+        self.admission_error = error;
     }
 
     fn publish_cq_recheck(&self) {
@@ -442,7 +321,7 @@ impl IoCore {
     }
 
     fn publish_io_if_drained(&self, previous: usize) {
-        if previous == 1 && self.shutdown_requested.load(Ordering::Acquire) {
+        if previous == 1 && self.shutdown_requested {
             self.driver_signal.publish_completion_dispatch();
         }
     }
@@ -452,91 +331,348 @@ impl IoCore {
         self.driver_signal.pause_operation_before_register();
     }
 
-    fn schedule_reclamation(&self, token: OperationToken) {
+    fn schedule_reclamation(&mut self, token: OperationToken) {
         self.begin_reclamation(token);
         let now = tokio::time::Instant::now();
         let at = now.checked_add(self.missing_cqe_deadline).unwrap_or(now);
-        lock_unpoison(&self.reclamation_requests).push_back(IoDeadlineRequest { at, token });
+        self.reclamation_requests
+            .push_back(IoDeadlineRequest { at, token });
         self.publish_reclamation();
     }
 
-    pub(super) fn take_reclamation_requests(&self, budget: usize) -> Vec<IoDeadlineRequest> {
-        let mut requests = lock_unpoison(&self.reclamation_requests);
-        let count = requests.len().min(budget);
-        requests.drain(..count).collect()
+    pub(in crate::v2::engine) fn cancel_operation(&mut self, token: OperationToken) {
+        let Lookup::Occupied(operation) = self.operations.lookup_mut(token) else {
+            return;
+        };
+        if operation.cancel_backend() {
+            self.pending_reclamations += 1;
+            self.schedule_reclamation(token);
+        }
     }
 
-    pub(super) fn has_reclamation_requests(&self) -> bool {
-        !lock_unpoison(&self.reclamation_requests).is_empty()
+    pub(in crate::v2::engine) fn operation_connection(
+        &self,
+        token: OperationToken,
+    ) -> Option<ConnectionToken> {
+        match self.operations.lookup(token) {
+            Lookup::Occupied(operation) => Some(operation.connection_token()),
+            Lookup::Duplicate | Lookup::Stale | Lookup::Unknown | Lookup::Retired => None,
+        }
+    }
+
+    pub(super) fn take_reclamation_requests(&mut self, budget: usize) -> Vec<IoDeadlineRequest> {
+        let count = self.reclamation_requests.len().min(budget);
+        self.reclamation_requests.drain(..count).collect()
+    }
+
+    pub(super) fn reclamation_request_count(&self) -> usize {
+        self.reclamation_requests.len()
     }
 
     pub(super) fn diagnostics(&self) -> IoCoreDiagnostics {
         IoCoreDiagnostics {
             registered_operations: self.operations.live(),
-            accepted_operations: self.accepted_operations.load(Ordering::Acquire),
-            pending_reclamations: self.pending_reclamations.load(Ordering::Acquire),
+            accepted_operations: self.accepted_operations,
+            pending_reclamations: self.pending_reclamations,
             available_cq_credits: self.cq_credits.free(),
             retained_cq_credits: self.cq_credits.retained(),
-            quarantined_operations: self.quarantined_operations.load(Ordering::Acquire),
-            quarantined_mrs: self.quarantined_mrs.load(Ordering::Acquire),
-            quarantined_bytes: self.quarantined_bytes.load(Ordering::Acquire),
+            quarantined_operations: self.quarantined_operations,
+            quarantined_mrs: self.quarantined_mrs,
+            quarantined_bytes: self.quarantined_bytes,
         }
     }
 
     pub(super) fn accepted_count(&self) -> usize {
-        self.accepted_operations.load(Ordering::Acquire)
+        self.accepted_operations
     }
 
     pub(super) fn shutdown_requested(&self) -> bool {
-        self.shutdown_requested.load(Ordering::Acquire)
+        self.shutdown_requested
     }
 
-    pub(super) fn begin_terminal_failure(&self, outcome: super::lifecycle::MemoizedTerminalResult) {
-        let mut terminal = lock_unpoison(&self.terminal_failure);
-        if terminal.is_none() {
-            *terminal = Some(outcome);
+    pub(super) fn begin_terminal_failure(
+        &mut self,
+        outcome: super::lifecycle::MemoizedTerminalResult,
+    ) {
+        if self.terminal_failure.is_none() {
+            self.terminal_failure = Some(outcome);
         }
     }
 
     pub(super) fn terminal_failure(&self) -> Option<super::lifecycle::MemoizedTerminalResult> {
-        lock_unpoison(&self.terminal_failure).clone()
+        self.terminal_failure.clone()
     }
 
-    pub(super) fn publish_connection(&self, connection: &Arc<EstablishedIoConnection>) {
-        if connection.mark_completion_published() {
-            lock_unpoison(&self.published_completion_connections).push_back(Arc::clone(connection));
+    pub(super) fn publish_connection(&mut self, connection: ConnectionToken) {
+        let token = connection;
+        if self.published_completion_set.insert(token) {
+            self.published_completion_connections.push_back(token);
         }
         self.publish_completion_dispatch();
     }
 
-    pub(super) fn take_published_connection(&self) -> Option<ConnectionToken> {
-        let connection = lock_unpoison(&self.published_completion_connections).pop_front()?;
-        connection.clear_completion_published();
-        Some(connection.identity().connection)
+    pub(super) fn take_published_connection(&mut self) -> Option<ConnectionToken> {
+        let connection = self.published_completion_connections.pop_front()?;
+        self.published_completion_set.remove(&connection);
+        Some(connection)
     }
 
     pub(super) fn has_published_connections(&self) -> bool {
-        !lock_unpoison(&self.published_completion_connections).is_empty()
+        !self.published_completion_connections.is_empty()
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(super) fn rejected_cqe_count(&self) -> u64 {
-        self.rejected_cqes.load(Ordering::Acquire)
+    pub(super) fn published_connection_count(&self) -> usize {
+        self.published_completion_connections.len()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub(super) fn rejected_cqe_reasons(&self) -> Vec<CqeReject> {
-        lock_unpoison(&self.rejected_cqe_reasons).clone()
+        self.rejected_cqe_reasons.clone()
+    }
+
+    pub(in crate::v2::engine) fn retire_connection_io(
+        &mut self,
+        token: ConnectionToken,
+        state: &ConnectionIoState,
+    ) {
+        debug_assert_eq!(state.identity.connection, token);
+        debug_assert!(
+            state.accepted.is_empty() && state.completions.is_empty(),
+            "retired connection I/O state must have no provider-owned work"
+        );
+        self.published_completion_set.remove(&token);
+        self.published_completion_connections
+            .retain(|queued| *queued != token);
+    }
+
+    pub(super) fn reserve_local(
+        &mut self,
+        connection: &EstablishedIoConnection,
+        state: &mut ConnectionIoState,
+        direction: Direction,
+    ) -> Result<()> {
+        debug_assert_eq!(state.identity, connection.identity());
+        let (used, maximum) = match direction {
+            Direction::Send => (&mut state.local_credits.send, state.max_send_wr),
+            Direction::Recv => (&mut state.local_credits.recv, state.max_recv_wr),
+        };
+        if *used >= maximum {
+            return Err(Error::CapacityExhausted);
+        }
+        *used += 1;
+        Ok(())
+    }
+
+    pub(super) fn release_local(
+        &mut self,
+        connection: &EstablishedIoConnection,
+        state: &mut ConnectionIoState,
+        direction: Direction,
+    ) {
+        debug_assert_eq!(state.identity, connection.identity());
+        Self::release_operation_local(state, connection.identity(), direction);
+    }
+
+    pub(super) fn add_accepted(
+        &mut self,
+        connection: &EstablishedIoConnection,
+        state: &mut ConnectionIoState,
+        token: OperationToken,
+    ) {
+        debug_assert_eq!(state.identity, connection.identity());
+        let inserted = state.accepted.insert(token);
+        debug_assert!(inserted, "accepted operation identity is single-shot");
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            let mut observed = lock_unpoison(&connection.accepted_observation);
+            debug_assert!(!observed.contains(&token));
+            observed.push(token);
+        }
+    }
+
+    pub(super) fn remove_accepted(
+        &mut self,
+        connection: &EstablishedIoConnection,
+        state: &mut ConnectionIoState,
+        token: OperationToken,
+    ) -> bool {
+        debug_assert_eq!(state.identity, connection.identity());
+        let removed = state.accepted.remove(&token);
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            let mut observed = lock_unpoison(&connection.accepted_observation);
+            let observed_removed = observed
+                .iter()
+                .position(|candidate| *candidate == token)
+                .map(|position| observed.swap_remove(position))
+                .is_some();
+            debug_assert_eq!(removed, observed_removed);
+        }
+        removed
+    }
+
+    pub(super) fn remove_operation_accepted(
+        state: &mut ConnectionIoState,
+        identity: EstablishedIoIdentity,
+        token: OperationToken,
+    ) -> bool {
+        if state.identity != identity {
+            return false;
+        }
+        let removed = state.accepted.remove(&token);
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            let mut observed = lock_unpoison(&state.accepted_observation);
+            let observed_removed = observed
+                .iter()
+                .position(|candidate| *candidate == token)
+                .map(|position| observed.swap_remove(position))
+                .is_some();
+            debug_assert_eq!(removed, observed_removed);
+        }
+        removed
+    }
+
+    pub(super) fn add_operation_accepted(
+        state: &mut ConnectionIoState,
+        identity: EstablishedIoIdentity,
+        token: OperationToken,
+    ) -> usize {
+        if state.identity == identity {
+            state.accepted.insert(token);
+            #[cfg(any(test, feature = "test-hooks"))]
+            {
+                let mut observed = lock_unpoison(&state.accepted_observation);
+                if !observed.contains(&token) {
+                    observed.push(token);
+                }
+            }
+        }
+        state.accepted.len()
+    }
+
+    pub(super) fn release_operation_local(
+        state: &mut ConnectionIoState,
+        identity: EstablishedIoIdentity,
+        direction: Direction,
+    ) {
+        if state.identity != identity {
+            return;
+        }
+        let used = match direction {
+            Direction::Send => &mut state.local_credits.send,
+            Direction::Recv => &mut state.local_credits.recv,
+        };
+        *used = used.saturating_sub(1);
+    }
+
+    pub(super) fn operation_connection_accepted_count(
+        state: &ConnectionIoState,
+        identity: EstablishedIoIdentity,
+    ) -> usize {
+        if state.identity == identity {
+            state.accepted.len()
+        } else {
+            0
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn accepted_tokens_bounded(
+        &self,
+        connection: &EstablishedIoConnection,
+        state: &ConnectionIoState,
+        limit: usize,
+    ) -> Vec<OperationToken> {
+        if state.identity != connection.identity() {
+            return Vec::new();
+        }
+        state.accepted_tokens_bounded(limit)
+    }
+
+    #[cfg(test)]
+    pub(super) fn connection_accepted_count(
+        &self,
+        connection: &EstablishedIoConnection,
+        state: &ConnectionIoState,
+    ) -> usize {
+        Self::operation_connection_accepted_count(state, connection.identity())
+    }
+
+    pub(super) fn enqueue_completion(
+        &mut self,
+        connection: &EstablishedIoConnection,
+        state: &mut ConnectionIoState,
+        completion: WorkCompletion,
+    ) {
+        debug_assert_eq!(state.identity, connection.identity());
+        state.completions.push_back(completion);
+    }
+
+    pub(super) fn pop_completion(
+        &mut self,
+        connection: &EstablishedIoConnection,
+        state: &mut ConnectionIoState,
+    ) -> Option<WorkCompletion> {
+        debug_assert_eq!(state.identity, connection.identity());
+        state.completions.pop_front()
+    }
+
+    pub(super) fn has_connection_completion_work(
+        &self,
+        connection: &EstablishedIoConnection,
+        state: &ConnectionIoState,
+    ) -> bool {
+        state.identity == connection.identity() && state.has_completion_work()
+    }
+
+    pub(super) fn begin_connection_quarantine(
+        &mut self,
+        connection: &EstablishedIoConnection,
+        state: &mut ConnectionIoState,
+    ) -> Option<IoQuarantineReport> {
+        if state.identity != connection.identity() {
+            return None;
+        }
+        let outstanding = state.accepted.len();
+        if outstanding == 0 {
+            return None;
+        }
+        Some(IoQuarantineReport {
+            outstanding_operations: outstanding,
+            cq_debt: outstanding,
+        })
+    }
+
+    fn clear_operation_quarantine(
+        &mut self,
+        state: &mut ConnectionIoState,
+        operation: OperationToken,
+        connection: ConnectionToken,
+    ) -> bool {
+        debug_assert_eq!(state.identity.connection, connection);
+        debug_assert!(
+            state.quarantined.contains(&operation),
+            "cleared quarantine must name an exact retained operation"
+        );
+        state.quarantined.contains(&operation)
+    }
+
+    #[cfg(test)]
+    pub(super) fn operation_quarantined_for_test(
+        &self,
+        state: &ConnectionIoState,
+        operation: OperationToken,
+    ) -> bool {
+        state.quarantined.contains(&operation)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-
-    struct TestPostAuthority;
 
     struct RecordingSignal {
         io_publications: AtomicUsize,
@@ -558,22 +694,19 @@ mod tests {
         fn pause_operation_before_register(&self) {}
     }
 
-    impl IoPostAuthority for TestPostAuthority {
-        fn qp_num(&self) -> u32 {
-            17
-        }
-
-        fn post_send(&self, _batch: &mut PreparedSendBatch) -> Result<BatchPostOutcome> {
-            Ok(BatchPostOutcome::AllAccepted)
-        }
-
-        fn post_recv(&self, _batch: &mut PreparedRecvBatch) -> Result<BatchPostOutcome> {
-            Ok(BatchPostOutcome::AllAccepted)
-        }
-    }
-
     #[test]
-    fn established_io_state_owns_local_accepted_and_completion_ledgers() {
+    fn value_owned_connection_ledger_tracks_local_accepted_and_completion_state() {
+        let mut core = IoState::new_owned(
+            8,
+            8,
+            Duration::ZERO,
+            8,
+            Arc::new(RwLock::new(())),
+            Arc::new(RecordingSignal {
+                io_publications: AtomicUsize::new(0),
+            }),
+        )
+        .unwrap();
         let connection = EstablishedIoConnection::new(
             EstablishedIoIdentity {
                 connection: ConnectionToken {
@@ -582,44 +715,46 @@ mod tests {
                 },
                 qp_num: 17,
             },
-            Arc::new(TestPostAuthority),
             1,
             1,
             Arc::new(tokio::sync::Notify::new()),
         );
+        let mut connection_io = ConnectionIoState::from_connection(&connection);
 
-        connection.reserve_local(Direction::Send).unwrap();
+        core.reserve_local(&connection, &mut connection_io, Direction::Send)
+            .unwrap();
         assert!(matches!(
-            connection.reserve_local(Direction::Send),
+            core.reserve_local(&connection, &mut connection_io, Direction::Send),
             Err(Error::CapacityExhausted)
         ));
-        connection.release_local(Direction::Send);
-        connection.reserve_local(Direction::Recv).unwrap();
+        core.release_local(&connection, &mut connection_io, Direction::Send);
+        core.reserve_local(&connection, &mut connection_io, Direction::Recv)
+            .unwrap();
 
         let operation = OperationToken {
             slot: 7,
             generation: 11,
         };
-        connection.add_accepted(operation);
-        assert_eq!(connection.accepted_tokens(), vec![operation]);
-        assert_eq!(connection.accepted_count(), 1);
+        core.add_accepted(&connection, &mut connection_io, operation);
+        assert_eq!(
+            core.accepted_tokens_bounded(&connection, &connection_io, 8),
+            vec![operation]
+        );
+        assert_eq!(
+            core.connection_accepted_count(&connection, &connection_io),
+            1
+        );
 
-        connection.enqueue_completion(WorkCompletion::default());
-        assert!(connection.has_completion_work());
-        assert!(connection.pop_completion().is_some());
-        assert!(!connection.has_completion_work());
+        core.enqueue_completion(&connection, &mut connection_io, WorkCompletion::default());
+        assert!(core.has_connection_completion_work(&connection, &connection_io));
+        assert!(
+            core.pop_completion(&connection, &mut connection_io)
+                .is_some()
+        );
+        assert!(!core.has_connection_completion_work(&connection, &connection_io));
 
-        assert!(connection.remove_accepted(operation));
-        connection.release_local(Direction::Recv);
-        connection.close_posting();
-        assert!(matches!(
-            connection.begin_posting(),
-            Err(Error::TransportClosed)
-        ));
-        assert!(matches!(
-            connection.reserve_local(Direction::Recv),
-            Err(Error::TransportClosed)
-        ));
+        assert!(core.remove_accepted(&connection, &mut connection_io, operation));
+        core.release_local(&connection, &mut connection_io, Direction::Recv);
     }
 
     #[test]
@@ -627,7 +762,7 @@ mod tests {
         let signal = Arc::new(RecordingSignal {
             io_publications: AtomicUsize::new(0),
         });
-        let (core, _) = IoCore::new(
+        let mut core = IoState::new_owned(
             1,
             1,
             Duration::ZERO,

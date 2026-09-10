@@ -20,20 +20,25 @@ use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 
 use super::config::CompletionMode;
-use super::io_core::{IoProgress, IoSessionBridge};
 #[cfg(test)]
 use super::lifecycle::MemoizedTerminalResult;
-use super::progress::OwnerClass;
-use super::resources::EngineResources;
-use super::scheduler::OwnerScheduler;
-use super::session::SessionProgress;
-use super::{EngineShared, RdmaEngineDriver};
+use super::reactor::EngineReactor;
+use super::resources::EngineReactorResources;
+use super::session::SessionManager;
+use super::{EngineFrontendRoot, RdmaEngineDriver};
 use crate::v2::error::{Error, Result};
 use crate::v2::runtime::preflight_driver_runtime;
 
-pub(super) const IO_WORK: usize = 1 << 0;
-pub(super) const SESSION_WORK: usize = 1 << 1;
+/// A producer has made at least one reactor source potentially ready.
+///
+/// Source-specific owner bits are intentionally gone: each external poll
+/// takes one finite ready-at-entry pass over the reactor source set.
+pub(super) const REACTOR_WORK: usize = 1;
+pub(super) const IO_WORK: usize = REACTOR_WORK;
+pub(super) const SESSION_WORK: usize = REACTOR_WORK;
+pub(super) const COMMAND_WORK: usize = REACTOR_WORK;
 
+#[cfg(test)]
 fn earliest_deadline(
     io: Option<tokio::time::Instant>,
     session: Option<tokio::time::Instant>,
@@ -92,94 +97,33 @@ impl WorkSignal {
 }
 
 impl RdmaEngineDriver {
-    pub(super) fn new(shared: Arc<EngineShared>, resources: Option<EngineResources>) -> Self {
-        let (io_resources, session_resources) = match resources {
-            Some(mut resources) => {
-                let io = resources.take_io_progress_resources();
-                (Some(io), Some(resources.into_session_progress()))
-            }
-            None => (None, None),
-        };
-        let bridge: Arc<dyn IoSessionBridge> = shared.session.clone();
-        let io_progress = IoProgress::new(
-            Arc::clone(&shared.io_core),
-            bridge,
-            io_resources,
-            shared.config.cq_completion_budget,
-            shared.config.completion_dispatch_budget,
-            shared.config.io_reclamation_budget,
-            #[cfg(any(test, feature = "test-hooks"))]
-            Arc::clone(&shared.test_driver),
-        );
-        let session_progress = SessionProgress::new(
-            Arc::clone(&shared.session),
-            session_resources,
-            shared.config.cm_event_budget,
-            shared.config.session_reclamation_budget,
-        );
+    pub(super) fn new(
+        shared: Arc<EngineFrontendRoot>,
+        session: SessionManager,
+        resources: Option<EngineReactorResources>,
+    ) -> Self {
+        let reactor = EngineReactor::new(&shared, session, resources);
         Self {
             shared,
-            io_progress,
-            session_progress,
-            scheduler: OwnerScheduler::new(),
+            reactor,
             deadline_sleep: None,
             deadline_at: None,
             runtime_checked: false,
         }
     }
 
-    fn mark_published_work(&mut self, published: usize) {
-        if published & IO_WORK != 0 {
-            self.scheduler.mark_ready(OwnerClass::Io);
-        }
-        if published & SESSION_WORK != 0 {
-            self.scheduler.mark_ready(OwnerClass::Session);
-        }
-    }
-
-    fn probe_owners(&mut self) {
-        self.scheduler.mark_ready(OwnerClass::Io);
-        self.scheduler.mark_ready(OwnerClass::Session);
-    }
-
     fn fail(&mut self, error: Error, cx: &mut TaskContext<'_>) -> Poll<Result<()>> {
-        self.shared.begin_driver_failure(error);
-        self.scheduler.mark_ready(OwnerClass::Io);
-        self.scheduler.mark_ready(OwnerClass::Session);
+        self.reactor.begin_driver_failure(&self.shared, error);
         cx.waker().wake_by_ref();
         Poll::Pending
     }
 
     fn release_resources(&mut self) {
-        self.io_progress.release_resources();
-        self.session_progress.release_resources();
-    }
-
-    fn service_io(&mut self, cx: &mut TaskContext<'_>) -> Result<bool> {
-        let report = self
-            .io_progress
-            .turn(self.shared.config.completion_mode, cx)?;
-        if report.requires_repoll() {
-            self.scheduler.mark_ready(OwnerClass::Io);
-        }
-        Ok(report.units_consumed > 0)
-    }
-
-    fn service_session(&mut self, cx: &mut TaskContext<'_>) -> Result<bool> {
-        let report = self
-            .session_progress
-            .turn(self.shared.config.completion_mode, cx)?;
-        if report.requires_repoll() {
-            self.scheduler.mark_ready(OwnerClass::Session);
-        }
-        Ok(report.units_consumed > 0)
+        self.reactor.release_resources();
     }
 
     fn poll_deadline_timer(&mut self, cx: &mut TaskContext<'_>) -> bool {
-        let next = earliest_deadline(
-            self.io_progress.next_deadline(),
-            self.session_progress.next_deadline(),
-        );
+        let next = self.reactor.next_deadline();
         if self.deadline_at != next {
             self.deadline_sleep = next.map(|at| Box::pin(tokio::time::sleep_until(at)));
             self.deadline_at = next;
@@ -192,28 +136,7 @@ impl RdmaEngineDriver {
         }
         self.deadline_sleep = None;
         self.deadline_at = None;
-        self.probe_owners();
         true
-    }
-
-    fn poll_once(&mut self, cx: &mut TaskContext<'_>) -> Result<()> {
-        let owner_budget = self.scheduler.begin_pass();
-        for _ in 0..owner_budget {
-            let Some(owner) = self.scheduler.next() else {
-                break;
-            };
-            match owner {
-                OwnerClass::Io => {
-                    self.service_io(cx)?;
-                }
-                OwnerClass::Session => {
-                    self.service_session(cx)?;
-                }
-            }
-        }
-        self.shared
-            .progress_driver_terminal(&self.io_progress, &self.session_progress);
-        Ok(())
     }
 }
 
@@ -221,12 +144,18 @@ impl Future for RdmaEngineDriver {
     type Output = Result<()>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
-        if let Some(outcome) = self.shared.outcome() {
-            self.release_resources();
+        if let Some(outcome) = self.reactor.lifecycle.outcome() {
+            if !self.reactor.requires_complete_quarantine() {
+                self.release_resources();
+            }
             return Poll::Ready(outcome.into_result());
         }
 
-        let terminalizing_failure = self.shared.pending_terminal_outcome().is_some();
+        if let Some(error) = self.shared.take_driver_failure() {
+            let shared = Arc::clone(&self.shared);
+            self.reactor.begin_driver_failure(&shared, error);
+        }
+        let terminalizing_failure = self.reactor.lifecycle.is_terminalizing_failure();
         if !terminalizing_failure && !self.runtime_checked {
             if let Err(error) = preflight_driver_runtime("RdmaEngineDriver") {
                 return self.fail(error, cx);
@@ -239,24 +168,41 @@ impl Future for RdmaEngineDriver {
         {
             return self.fail(error, cx);
         }
-        self.shared.transition_running();
+        let shared = Arc::clone(&self.shared);
+        self.reactor.transition_running(&shared);
         if !terminalizing_failure {
             self.poll_deadline_timer(cx);
         }
 
         let observed_epoch = self.shared.work_signal.epoch();
-        let published = self.shared.work_signal.take();
-        self.mark_published_work(published);
-        if let Err(error) = self.poll_once(cx) {
-            return self.fail(error, cx);
-        }
+        self.shared.work_signal.take();
+        let mode = self.shared.config.completion_mode;
+        let shared = Arc::clone(&self.shared);
+        let turn = match self.reactor.turn(&shared, mode, cx) {
+            Ok(turn) => turn,
+            Err(failure) => {
+                let shared = Arc::clone(&self.shared);
+                self.reactor
+                    .begin_driver_failure(&shared, failure.error.clone());
+                failure.actions.publish();
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+        };
+        let requires_repoll = turn.requires_repoll;
+        turn.actions.publish();
 
-        if let Some(outcome) = self.shared.outcome() {
-            self.release_resources();
+        if let Some(outcome) = self.reactor.lifecycle.outcome() {
+            // A failed terminal result may still own an uncertain provider
+            // bundle. Keep the canonical resource root in this driver until
+            // Drop atomically moves the complete reactor into quarantine.
+            if !self.reactor.requires_complete_quarantine() {
+                self.release_resources();
+            }
             return Poll::Ready(outcome.into_result());
         }
 
-        if self.shared.pending_terminal_outcome().is_some() {
+        if self.reactor.lifecycle.is_terminalizing_failure() {
             cx.waker().wake_by_ref();
             return Poll::Pending;
         }
@@ -271,8 +217,7 @@ impl Future for RdmaEngineDriver {
                     .shared
                     .work_signal
                     .register_and_recheck(cx.waker(), observed_epoch);
-                self.mark_published_work(published);
-                if self.scheduler.ready_count() > 0 {
+                if published != 0 || requires_repoll {
                     cx.waker().wake_by_ref();
                 }
             }
@@ -292,7 +237,8 @@ impl Future for RdmaEngineDriver {
 
 impl Drop for RdmaEngineDriver {
     fn drop(&mut self) {
-        self.shared.handle_driver_drop();
+        let actions = self.reactor.terminate_on_driver_drop(&self.shared);
+        actions.publish();
         self.release_resources();
     }
 }
