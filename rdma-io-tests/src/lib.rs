@@ -891,6 +891,8 @@ pub mod engine_test_helpers {
     ///
     /// Readiness retries require the exact production CM-event grammar; raw
     /// errno, HELLO, protocol, and data-operation errors are never retried.
+    /// A stage timeout is retried only after exact ownership cleanup and only
+    /// when no engine rejection diagnostic changed during the attempt.
     /// All attempts share a 60-second wall-clock budget; cancellation of that
     /// outer budget is followed by at most 15 seconds of exact cleanup
     /// verification.
@@ -1015,7 +1017,7 @@ pub mod engine_test_helpers {
                         let error = setup_timeout("listener setup", elapsed);
                         let context = error.to_string();
                         attempt_history.push(format!("attempt {attempt}: {context}"));
-                        wait_for_engine_cleanup(
+                        let (server, client) = wait_for_engine_cleanup(
                             server_engine,
                             &server_resources,
                             &server_baseline,
@@ -1025,7 +1027,20 @@ pub mod engine_test_helpers {
                             &context,
                         )
                         .await;
-                        return Err(error);
+                        if !attempt_has_no_engine_rejects(
+                            &server,
+                            &server_baseline,
+                            &client,
+                            &client_baseline,
+                        ) || attempt + 1 == TRANSIENT_CM_HANDSHAKE_ATTEMPTS
+                        {
+                            return Err(error);
+                        }
+                        tracing::warn!(
+                            "V2 message listener attempt {attempt} timed out after exact cleanup"
+                        );
+                        tokio::time::sleep(transient_cm_retry_delay(attempt)).await;
+                        continue;
                     }
                 };
                 if let Err(error) = before_connect_accept(attempt) {
@@ -1118,7 +1133,7 @@ pub mod engine_test_helpers {
                         let error = setup_timeout("connect/accept setup", elapsed);
                         let context = error.to_string();
                         attempt_history.push(format!("attempt {attempt}: {context}"));
-                        wait_for_engine_cleanup(
+                        let (server, client) = wait_for_engine_cleanup(
                             server_engine,
                             &server_resources,
                             &server_baseline,
@@ -1128,7 +1143,20 @@ pub mod engine_test_helpers {
                             &context,
                         )
                         .await;
-                        return Err(error);
+                        if !attempt_has_no_engine_rejects(
+                            &server,
+                            &server_baseline,
+                            &client,
+                            &client_baseline,
+                        ) || attempt + 1 == TRANSIENT_CM_HANDSHAKE_ATTEMPTS
+                        {
+                            return Err(error);
+                        }
+                        tracing::warn!(
+                            "V2 message connect/accept attempt {attempt} timed out after exact cleanup"
+                        );
+                        tokio::time::sleep(transient_cm_retry_delay(attempt)).await;
+                        continue;
                     }
                 };
 
@@ -1278,7 +1306,7 @@ pub mod engine_test_helpers {
                         let context = error.to_string();
                         attempt_history.push(format!("attempt {attempt}: {context}"));
                         close_message_attempt(Some(listener), Some(server), Some(client)).await;
-                        wait_for_engine_cleanup(
+                        let (server, client) = wait_for_engine_cleanup(
                             server_engine,
                             &server_resources,
                             &server_baseline,
@@ -1288,7 +1316,20 @@ pub mod engine_test_helpers {
                             &context,
                         )
                         .await;
-                        return Err(error);
+                        if !attempt_has_no_engine_rejects(
+                            &server,
+                            &server_baseline,
+                            &client,
+                            &client_baseline,
+                        ) || attempt + 1 == TRANSIENT_CM_HANDSHAKE_ATTEMPTS
+                        {
+                            return Err(error);
+                        }
+                        tracing::warn!(
+                            "V2 message HELLO attempt {attempt} timed out after exact cleanup"
+                        );
+                        tokio::time::sleep(transient_cm_retry_delay(attempt)).await;
+                        continue;
                     }
                 }
             }
