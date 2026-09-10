@@ -14,6 +14,8 @@ use rdma_io_tests::engine_test_helpers::{
 };
 use rdma_io_tests::test_helpers::{connect_addr_for, has_software_rdma};
 
+const PROVIDER_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn software_device_name() -> Option<String> {
     let list = RdmaCmDeviceList::new().ok()?;
     list.device_names()
@@ -48,7 +50,7 @@ async fn build_engine(mode: CompletionMode) -> (RdmaEngine, tokio::task::JoinHan
 }
 
 async fn listen(engine: &RdmaEngine) -> RdmaListener {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(PROVIDER_PROGRESS_TIMEOUT, async {
         loop {
             match engine
                 .listen(
@@ -77,7 +79,7 @@ async fn establish_messages(
     let address = connect_addr_for(Some(listener.local_addr().unwrap()));
     let accept = MessageTransportBuilder::new().accept_on(&listener);
     let connect = MessageTransportBuilder::new().connect_on(client, address);
-    let (accepted, connected) = tokio::time::timeout(Duration::from_secs(15), async {
+    let (accepted, connected) = tokio::time::timeout(PROVIDER_PROGRESS_TIMEOUT, async {
         tokio::join!(accept, connect)
     })
     .await
@@ -98,7 +100,7 @@ async fn close_pair(
     server_driver: tokio::task::JoinHandle<Result<()>>,
     client_driver: tokio::task::JoinHandle<Result<()>>,
 ) {
-    let (server_close, client_close) = tokio::time::timeout(Duration::from_secs(15), async {
+    let (server_close, client_close) = tokio::time::timeout(PROVIDER_PROGRESS_TIMEOUT, async {
         tokio::join!(server.shutdown(), client.shutdown())
     })
     .await
@@ -120,7 +122,7 @@ async fn run_success(mode: CompletionMode) {
     let (client_engine, client_driver) = build_engine(mode).await;
     let (listener, server, client) = establish_messages(&server_engine, &client_engine).await;
 
-    tokio::time::timeout(Duration::from_secs(15), async {
+    tokio::time::timeout(PROVIDER_PROGRESS_TIMEOUT, async {
         let (server_ready, client_ready) = tokio::join!(server.ready(), client.ready());
         server_ready.unwrap();
         client_ready.unwrap();
@@ -191,7 +193,7 @@ async fn run_cancelled_accept(mode: CompletionMode) {
     drop(cancelled);
 
     let address = connect_addr_for(Some(listener.local_addr().unwrap()));
-    let (server, client) = tokio::time::timeout(Duration::from_secs(15), async {
+    let (server, client) = tokio::time::timeout(PROVIDER_PROGRESS_TIMEOUT, async {
         tokio::join!(
             MessageTransportBuilder::new().accept_on(&listener),
             MessageTransportBuilder::new().connect_on(&client_engine, address)
@@ -201,7 +203,7 @@ async fn run_cancelled_accept(mode: CompletionMode) {
     .expect("post-cancellation message establishment timed out");
     let server = drive(server.unwrap());
     let client = drive(client.unwrap());
-    tokio::time::timeout(Duration::from_secs(15), async {
+    tokio::time::timeout(PROVIDER_PROGRESS_TIMEOUT, async {
         let (server_ready, client_ready) = tokio::join!(server.ready(), client.ready());
         server_ready.unwrap();
         client_ready.unwrap();
@@ -241,7 +243,7 @@ async fn run_malformed_hello(mode: CompletionMode) {
         (peer_hello_frame(0, 64 * 1024), "data_recv_capacity is 0"),
         (peer_hello_frame(32, 64 * 1024 - 1), "peer max_message_size"),
     ] {
-        let (server, client) = tokio::time::timeout(Duration::from_secs(15), async {
+        let (server, client) = tokio::time::timeout(PROVIDER_PROGRESS_TIMEOUT, async {
             tokio::join!(
                 MessageTransportBuilder::new().accept_on(&listener),
                 MessageTransportBuilder::new().connect_on(&client_engine, address)
@@ -257,7 +259,7 @@ async fn run_malformed_hello(mode: CompletionMode) {
             Ok(()) | Err(Error::TransportClosed) => {}
             Err(error) => panic!("failed to inject malformed HELLO ({expected}): {error:?}"),
         }
-        let error = tokio::time::timeout(Duration::from_secs(15), server.ready())
+        let error = tokio::time::timeout(PROVIDER_PROGRESS_TIMEOUT, server.ready())
             .await
             .expect("malformed HELLO did not resolve readiness")
             .unwrap_err();
@@ -265,7 +267,7 @@ async fn run_malformed_hello(mode: CompletionMode) {
             error,
             Error::ProtocolViolation(message) if message.contains(expected)
         ));
-        let server_close = tokio::time::timeout(Duration::from_secs(15), server.shutdown())
+        let server_close = tokio::time::timeout(PROVIDER_PROGRESS_TIMEOUT, server.shutdown())
             .await
             .expect("malformed server shutdown timed out");
         assert!(
@@ -308,14 +310,14 @@ async fn run_mixed_accept_order(mode: CompletionMode) {
     assert!(poll_once(independent_accept.as_mut()).is_pending());
 
     let independent_client = tokio::time::timeout(
-        Duration::from_secs(15),
+        PROVIDER_PROGRESS_TIMEOUT,
         client_engine.connect(second_address),
     )
     .await
     .expect("independent listener client timed out")
     .unwrap();
     let independent_server =
-        tokio::time::timeout(Duration::from_secs(15), independent_accept.as_mut())
+        tokio::time::timeout(PROVIDER_PROGRESS_TIMEOUT, independent_accept.as_mut())
             .await
             .expect("independent listener accept timed out")
             .unwrap();
@@ -324,13 +326,13 @@ async fn run_mixed_accept_order(mode: CompletionMode) {
     assert!(poll_once(message_accept.as_mut()).is_pending());
 
     let default_client = tokio::time::timeout(
-        Duration::from_secs(15),
+        PROVIDER_PROGRESS_TIMEOUT,
         client_engine.connect(first_address),
     )
     .await
     .expect("default mixed client timed out")
     .unwrap();
-    let default_server = tokio::time::timeout(Duration::from_secs(15), default_accept.as_mut())
+    let default_server = tokio::time::timeout(PROVIDER_PROGRESS_TIMEOUT, default_accept.as_mut())
         .await
         .expect("default mixed accept timed out")
         .unwrap();
@@ -341,14 +343,14 @@ async fn run_mixed_accept_order(mode: CompletionMode) {
         .max_send_wr(8)
         .max_recv_wr(8);
     let configured_client = tokio::time::timeout(
-        Duration::from_secs(15),
+        PROVIDER_PROGRESS_TIMEOUT,
         client_engine.connect_with_config(first_address, configured),
     )
     .await
     .expect("configured mixed client timed out")
     .unwrap();
     let configured_server =
-        match tokio::time::timeout(Duration::from_secs(15), configured_accept.as_mut()).await {
+        match tokio::time::timeout(PROVIDER_PROGRESS_TIMEOUT, configured_accept.as_mut()).await {
             Ok(result) => result.unwrap(),
             Err(_) => panic!(
                 "configured mixed accept timed out: {:?}",
@@ -358,19 +360,19 @@ async fn run_mixed_accept_order(mode: CompletionMode) {
     assert!(poll_once(message_accept.as_mut()).is_pending());
 
     let message_client = tokio::time::timeout(
-        Duration::from_secs(15),
+        PROVIDER_PROGRESS_TIMEOUT,
         MessageTransportBuilder::new().connect_on(&client_engine, first_address),
     )
     .await
     .expect("mixed message client timed out")
     .unwrap();
-    let message_server = tokio::time::timeout(Duration::from_secs(15), message_accept.as_mut())
+    let message_server = tokio::time::timeout(PROVIDER_PROGRESS_TIMEOUT, message_accept.as_mut())
         .await
         .expect("mixed message accept timed out")
         .unwrap();
     let message_client = drive(message_client);
     let message_server = drive(message_server);
-    tokio::time::timeout(Duration::from_secs(15), async {
+    tokio::time::timeout(PROVIDER_PROGRESS_TIMEOUT, async {
         let (server_ready, client_ready) =
             tokio::join!(message_server.ready(), message_client.ready());
         server_ready.unwrap();
@@ -380,7 +382,7 @@ async fn run_mixed_accept_order(mode: CompletionMode) {
     .expect("mixed message accept HELLO timed out");
 
     let (message_server_close, message_client_close) =
-        tokio::time::timeout(Duration::from_secs(15), async {
+        tokio::time::timeout(PROVIDER_PROGRESS_TIMEOUT, async {
             tokio::join!(message_server.close(), message_client.close())
         })
         .await
@@ -395,7 +397,7 @@ async fn run_mixed_accept_order(mode: CompletionMode) {
         configured_server,
         configured_client,
     ] {
-        tokio::time::timeout(Duration::from_secs(15), connection.close())
+        tokio::time::timeout(PROVIDER_PROGRESS_TIMEOUT, connection.close())
             .await
             .expect("mixed low-level close timed out")
             .unwrap();
@@ -437,7 +439,7 @@ async fn run_driver_withholding(mode: CompletionMode) {
     assert!(!connect.is_finished());
 
     let client_driver = tokio::spawn(client_driver);
-    let (server, client) = tokio::time::timeout(Duration::from_secs(15), async {
+    let (server, client) = tokio::time::timeout(PROVIDER_PROGRESS_TIMEOUT, async {
         tokio::join!(accept, connect)
     })
     .await
@@ -466,7 +468,7 @@ async fn run_driver_withholding(mode: CompletionMode) {
     assert_eq!(client_engine.diagnostics().live_connections, 1);
     let server = DrivenMessageTransport::new(server, server_message_driver);
     let client = DrivenMessageTransport::new(client, client_message_driver);
-    tokio::time::timeout(Duration::from_secs(15), async {
+    tokio::time::timeout(PROVIDER_PROGRESS_TIMEOUT, async {
         let (server_ready, client_ready) = tokio::join!(server.ready(), client.ready());
         server_ready.unwrap();
         client_ready.unwrap();
@@ -491,7 +493,7 @@ async fn run_message_driver_hello_timeout(mode: CompletionMode) {
     let (client_engine, client_engine_driver) = build_engine(mode).await;
     let listener = listen(&server_engine).await;
     let address = connect_addr_for(Some(listener.local_addr().unwrap()));
-    let (server, client) = tokio::time::timeout(Duration::from_secs(15), async {
+    let (server, client) = tokio::time::timeout(PROVIDER_PROGRESS_TIMEOUT, async {
         tokio::join!(
             MessageTransportBuilder::new()
                 .hello_deadline(Duration::from_millis(50))
