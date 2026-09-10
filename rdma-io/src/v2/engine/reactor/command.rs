@@ -122,13 +122,31 @@ pub(in crate::v2::engine) struct CommandIngress {
     max_connection_controls: usize,
     max_listener_controls: usize,
     signal: Arc<WorkSignal>,
+    diagnostics: Arc<Mutex<super::super::diagnostics::PublishedDiagnostics>>,
 }
 
 impl CommandIngress {
+    #[cfg(test)]
     pub(in crate::v2::engine) fn new(
         connection_capacity: usize,
         operation_capacity: usize,
         signal: Arc<WorkSignal>,
+    ) -> Arc<Self> {
+        Self::new_with_diagnostics(
+            connection_capacity,
+            operation_capacity,
+            signal,
+            Arc::new(Mutex::new(
+                super::super::diagnostics::PublishedDiagnostics::initial(operation_capacity),
+            )),
+        )
+    }
+
+    pub(in crate::v2::engine) fn new_with_diagnostics(
+        connection_capacity: usize,
+        operation_capacity: usize,
+        signal: Arc<WorkSignal>,
+        diagnostics: Arc<Mutex<super::super::diagnostics::PublishedDiagnostics>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             connect_permits: Arc::new(Semaphore::new(connection_capacity)),
@@ -146,6 +164,7 @@ impl CommandIngress {
             max_connection_controls: connection_capacity,
             max_listener_controls: connection_capacity,
             signal,
+            diagnostics,
         })
     }
 
@@ -178,9 +197,17 @@ impl CommandIngress {
         self: &Arc<Self>,
         lane: OwnedSemaphorePermit,
     ) -> Result<ConnectAdmission, Error> {
-        let reservation = Arc::clone(&self.connection_permits)
+        let permit_pool = Arc::clone(&self.connection_permits);
+        let reservation = Arc::clone(&permit_pool)
             .try_acquire_owned()
-            .map(ConnectionReservation::new)
+            .map(|permit| {
+                ConnectionReservation::new_with_frontend_diagnostics(
+                    permit,
+                    Arc::clone(&permit_pool),
+                    self.max_connection_controls,
+                    Arc::clone(&self.diagnostics),
+                )
+            })
             .map_err(|error| match error {
                 tokio::sync::TryAcquireError::NoPermits => Error::CapacityExhausted,
                 tokio::sync::TryAcquireError::Closed => Error::DriverShutdown,
@@ -730,11 +757,12 @@ impl CommandIngress {
             None
         };
         if let Some(token) = close {
-            session.manager.request_connection_close_into(
+            SessionReactorSources::begin_connection_close_into(
+                &session.manager,
                 &mut session.cm,
                 &mut session.connections,
-                io,
                 token,
+                io,
                 actions,
             );
             session_work = true;

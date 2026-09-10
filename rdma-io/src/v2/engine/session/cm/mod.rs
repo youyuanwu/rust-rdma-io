@@ -35,7 +35,7 @@ use super::listener::{
     run_setup_before_establish, with_validated_listener_backlog,
 };
 use super::registry::ConnectionRegistry;
-use super::{SessionFrontend, SessionManager};
+use super::{SessionContext, SessionFrontend};
 use crate::cm::CmId;
 use crate::v2::error::{Error, Result};
 use crate::v2::qp::QpBuilder;
@@ -254,7 +254,7 @@ impl CmState {
     #[cfg(test)]
     pub(in crate::v2::engine) fn test_listener(
         &mut self,
-        manager: &SessionManager,
+        manager: &SessionContext,
         backlog: usize,
     ) -> (RdmaListener, ListenerToken) {
         let token = self.reserve_test_listener_slot(backlog);
@@ -403,7 +403,7 @@ impl CmState {
     pub(in crate::v2::engine) fn service_software_class_into(
         &mut self,
         connections: &mut ConnectionRegistry,
-        shared: &SessionManager,
+        shared: &SessionContext,
         io_core: &mut crate::v2::engine::io_core::IoState,
         resources: Option<&EngineReactorResources>,
         class: CmSoftwareClass,
@@ -531,7 +531,7 @@ impl CmState {
     pub(in crate::v2::engine) fn service_software(
         &mut self,
         connections: &mut ConnectionRegistry,
-        shared: &SessionManager,
+        shared: &SessionContext,
         io_core: &mut crate::v2::engine::io_core::IoState,
         resources: Option<&EngineReactorResources>,
         budget: usize,
@@ -560,7 +560,7 @@ impl CmState {
     pub(in crate::v2::engine) fn try_process_event(
         &mut self,
         connections: &mut ConnectionRegistry,
-        shared: &SessionManager,
+        shared: &SessionContext,
         io_core: &mut crate::v2::engine::io_core::IoState,
         resources: &EngineReactorResources,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
@@ -572,7 +572,7 @@ impl CmState {
     pub(in crate::v2::engine) fn begin_shutdown(
         &mut self,
         connections: &mut ConnectionRegistry,
-        shared: &SessionManager,
+        shared: &SessionContext,
         outcome: &MemoizedTerminalResult,
     ) {
         shutdown::begin(self, connections, shared, outcome);
@@ -599,7 +599,7 @@ impl CmState {
     pub(in crate::v2::engine) fn service_bounded_shutdown_class(
         &mut self,
         connections: &mut ConnectionRegistry,
-        shared: &SessionManager,
+        shared: &SessionContext,
         outcome: &MemoizedTerminalResult,
         terminalize_listeners: bool,
         cursor: &mut CmShutdownCursor,
@@ -713,7 +713,7 @@ impl CmState {
 
     fn start_listener(
         &mut self,
-        shared: &SessionManager,
+        shared: &SessionContext,
         resources: &EngineReactorResources,
         token: ListenerToken,
         request: Arc<ListenRequest>,
@@ -725,7 +725,7 @@ impl CmState {
     fn service_listener(
         &mut self,
         connections: &mut ConnectionRegistry,
-        shared: &SessionManager,
+        shared: &SessionContext,
         io_core: &mut crate::v2::engine::io_core::IoState,
         resources: Option<&EngineReactorResources>,
         listener: ListenerToken,
@@ -745,7 +745,7 @@ impl CmState {
     fn handle_connect_request(
         &mut self,
         connections: &mut ConnectionRegistry,
-        shared: &SessionManager,
+        shared: &SessionContext,
         resources: &EngineReactorResources,
         listener: ListenerToken,
         snapshot: CmEventSnapshot,
@@ -755,7 +755,7 @@ impl CmState {
 
     fn handle_listener_event(
         &mut self,
-        shared: &SessionManager,
+        shared: &SessionContext,
         listener: ListenerToken,
         snapshot: CmEventSnapshot,
     ) -> Result<EventDisposition> {
@@ -785,7 +785,7 @@ impl CmState {
     fn process_cancellation(
         &mut self,
         connections: &mut ConnectionRegistry,
-        shared: &SessionManager,
+        shared: &SessionContext,
         io_core: &mut crate::v2::engine::io_core::IoState,
         request: Arc<OutboundRequest>,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
@@ -804,7 +804,7 @@ impl CmState {
     fn retain_failed_install(
         &mut self,
         connections: &mut ConnectionRegistry,
-        shared: &SessionManager,
+        shared: &SessionContext,
         token: ConnectionToken,
         resources: FailedConnectionInstallResources,
         destroy_error: &Error,
@@ -850,7 +850,7 @@ impl CmState {
     fn handle_event(
         &mut self,
         connections: &mut ConnectionRegistry,
-        shared: &SessionManager,
+        shared: &SessionContext,
         io_core: &mut crate::v2::engine::io_core::IoState,
         resources: &EngineReactorResources,
         token: ConnectionToken,
@@ -872,7 +872,7 @@ impl CmState {
     fn handle_inbound_event(
         &mut self,
         connections: &mut ConnectionRegistry,
-        shared: &SessionManager,
+        shared: &SessionContext,
         io_core: &mut crate::v2::engine::io_core::IoState,
         token: ConnectionToken,
         snapshot: CmEventSnapshot,

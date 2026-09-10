@@ -20,7 +20,7 @@ use super::io_core::{IoDriverSignal, IoReactorSources, IoState};
 use super::lifecycle::EngineLifecycleState;
 use super::progress::ReadinessRegistration;
 use super::resources::EngineReactorResources;
-use super::session::{CmShutdownClass, CmSoftwareClass, SessionManager, SessionReactorSources};
+use super::session::{CmShutdownClass, CmSoftwareClass, SessionContext, SessionReactorSources};
 
 #[cfg(test)]
 pub(super) use action::REACTOR_ACTION_BUDGET;
@@ -58,7 +58,7 @@ pub(super) struct ReactorTurnFailure {
 impl EngineReactor {
     pub(super) fn new(
         shared: &Arc<EngineFrontendRoot>,
-        manager: SessionManager,
+        manager: SessionContext,
         resources: Option<EngineReactorResources>,
     ) -> Self {
         let io_driver_signal: Arc<dyn IoDriverSignal> = Arc::new(super::EngineIoDriverSignal {
@@ -164,10 +164,7 @@ impl EngineReactor {
         self.io.core_mut().close_admission(outcome.error());
         let io_effects = self.io.core_mut().terminalize_operations(&outcome);
         let connections_to_wake = self.session.connections.occupied();
-        self.session
-            .manager
-            .apply_terminal_io_effects(&mut self.session.connections, io_effects)
-            .append_to(actions);
+        self.session.commit_io_effects_into(io_effects, actions);
         shared.commands.drain_ordinary_into(
             outcome.error().unwrap_or(super::Error::DriverShutdown),
             actions,
@@ -182,22 +179,16 @@ impl EngineReactor {
                 })
                 .unwrap_or(false);
             if outcome.is_error() && retain {
-                self.session
-                    .manager
-                    .track_connection_quarantine(&mut self.session.connections, *token);
+                self.session.connections.track_bundle_quarantine(*token);
             }
             let event = if self.session.connections.is_quarantined(*token) {
-                self.session.manager.finalize_quarantined_connection_engine(
-                    &mut self.session.connections,
-                    *token,
-                    &outcome,
-                )
+                self.session
+                    .connections
+                    .finalize_quarantined_connection_engine(*token, &outcome)
             } else {
-                self.session.manager.finalize_connection_engine(
-                    &mut self.session.connections,
-                    *token,
-                    &outcome,
-                )
+                self.session
+                    .connections
+                    .finalize_connection_engine(*token, &outcome)
             };
             if let Some(event) = event {
                 actions.push_event(event);
@@ -680,7 +671,8 @@ impl EngineReactor {
         connection: super::session::connection::ConnectionStateCountSnapshot,
     ) {
         let io = self.io.diagnostics();
-        shared.publish_diagnostics(PublishedDiagnostics {
+        let mut published = super::registry::lock_unpoison(&shared.diagnostics);
+        *published = PublishedDiagnostics {
             engine: RdmaEngineDiagnostics {
                 lifecycle: self.lifecycle.lifecycle(),
                 terminal_error: self
@@ -705,7 +697,7 @@ impl EngineReactor {
                 .session
                 .cm
                 .retained_owner_count(&self.session.connections),
-        });
+        };
     }
 
     #[cfg(test)]
@@ -765,7 +757,7 @@ impl EngineReactor {
         // registry even when no operation debt remains.
         let retain_reactor = self.requires_complete_quarantine();
         if retain_reactor {
-            let replacement_manager = SessionManager::from_frontend(
+            let replacement_manager = SessionContext::from_frontend(
                 Arc::clone(&shared.session),
                 Arc::downgrade(&shared.control),
                 #[cfg(any(test, feature = "test-hooks"))]

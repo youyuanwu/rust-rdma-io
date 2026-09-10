@@ -2,9 +2,9 @@
 //!
 //! The driver-owned [`super::reactor::EngineReactor`] owns connection and
 //! listener identity, the shared CM dispatcher/destruction service, admission,
-//! deadlines, retirement, shutdown, and quarantine. `SessionManager` is now a
-//! runtime-state-free policy/observer capability only; it owns no listener, route,
-//! connection, or terminal lifecycle storage.
+//! deadlines, retirement, shutdown, and quarantine. `SessionContext` is a
+//! runtime-state-free policy and frontend capability; mutable session state
+//! remains in [`SessionReactorSources`] and connection-owned records.
 
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::atomic::AtomicU64;
@@ -21,7 +21,6 @@ pub(super) mod listener;
 mod progress;
 pub(in crate::v2::engine) mod registry;
 
-use self::connection::{QpDestroyStatus, SharedCmId};
 use self::listener::{ListenerAdmission, ListenerEntry};
 pub(super) use self::progress::SessionReactorSources;
 use self::registry::ConnectionRegistry;
@@ -29,9 +28,13 @@ use self::registry::ConnectionRegistry;
 use super::SessionTestInstrumentation;
 use super::config::{ProviderLimits, RdmaConnectionConfig, SessionConfig};
 use super::io::MemoryRegistrar;
-use super::io_core::{CommittedIoCoreEffects, IoCoreEffects, IoState, OperationQuarantineEffect};
+#[cfg(test)]
+use super::io_core::IoState;
+use super::io_core::{CommittedIoCoreEffects, IoCoreEffects, OperationQuarantineEffect};
 use super::reactor::CommandIngress;
-use super::registry::{ConnectionToken, ListenerToken, Lookup, OperationToken, lock_unpoison};
+#[cfg(test)]
+use super::registry::OperationToken;
+use super::registry::{ConnectionToken, ListenerToken, Lookup, lock_unpoison};
 use super::{EngineControl, EngineObserver, Result};
 use crate::v2::error::Error;
 
@@ -342,7 +345,7 @@ impl SessionListener {
 /// All mutable connection, listener, CM, shutdown, and terminal storage is
 /// owned by the reactor. Public handles cannot reach this value; they retain
 /// only [`SessionFrontend`], typed command ingress, and take-once observers.
-pub(super) struct SessionManager {
+pub(super) struct SessionContext {
     #[cfg(any(test, feature = "test-hooks"))]
     pub(super) rejected_cm_events: AtomicU64,
     #[cfg(test)]
@@ -353,7 +356,38 @@ pub(super) struct SessionManager {
     test_instrumentation: SessionTestInstrumentation,
 }
 
-impl SessionManager {
+fn apply_io_effects(
+    context: &SessionContext,
+    connections: &mut ConnectionRegistry,
+    mut effects: IoCoreEffects,
+) -> CommittedIoCoreEffects {
+    for effect in effects.take_quarantine() {
+        match effect {
+            OperationQuarantineEffect::Added {
+                connection,
+                operation,
+            } => {
+                connections.track_operation_quarantine(connection, operation);
+            }
+            OperationQuarantineEffect::Cleared {
+                connection,
+                operation,
+            } => {
+                connections.clear_operation_quarantine(connection, operation);
+            }
+        }
+    }
+    for token in effects.take_drained() {
+        if connections.close_started(token) {
+            connections.clear_bundle_quarantine(token);
+            SessionReactorSources::record_connection_drained(connections, token);
+            SessionReactorSources::schedule_connection_retirement(context, connections, token);
+        }
+    }
+    effects.into_committed()
+}
+
+impl SessionContext {
     pub(super) fn new(
         config: SessionConfig,
         provider: Option<ProviderLimits>,
@@ -447,20 +481,6 @@ impl SessionManager {
         self.test_instrumentation.take_setup_rollback_failure()
     }
 
-    pub(in crate::v2::engine) fn request_connection_close_into(
-        &self,
-        cm: &mut cm::CmState,
-        connections: &mut ConnectionRegistry,
-        io_core: &mut IoState,
-        token: ConnectionToken,
-        actions: &mut super::reactor::ReactorActions,
-    ) {
-        let Lookup::Occupied(_) = connections.lookup(token) else {
-            return;
-        };
-        self.begin_connection_close_into(cm, connections, token, io_core, actions);
-    }
-
     pub(super) fn listener_capability(&self, listener: &ListenerEntry) -> SessionListener {
         let admission = listener.admission();
         debug_assert_eq!(admission.token(), listener.token);
@@ -476,276 +496,15 @@ impl SessionManager {
         }
     }
 
-    pub(super) fn establish_qp_destruction_proof(
-        &self,
-        connections: &mut ConnectionRegistry,
-        token: ConnectionToken,
-    ) -> Result<QpDestructionProof> {
-        let status = connections
-            .with_connection_mut(token, |connection| connection.destroy_qp_for_session())
-            .ok_or(Error::TransportClosed)??;
-        match status {
-            QpDestroyStatus::DestroyedNow => Ok(QpDestructionProof {
-                connection: token,
-                qp_num: connections
-                    .with_connection(token, |connection| connection.qp_num())
-                    .ok_or(Error::TransportClosed)?,
-                _evidence: (),
-            }),
-            QpDestroyStatus::AlreadyDestroyed => Err(Error::InvalidConfig(
-                "QP destruction proof was already minted and cannot be replayed".into(),
-            )),
-        }
-    }
-
-    pub(super) fn ensure_qp_destroyed(
-        &self,
-        connections: &mut ConnectionRegistry,
-        token: ConnectionToken,
-    ) -> Result<()> {
-        match connections
-            .with_connection_mut(token, |connection| connection.destroy_qp_for_session())
-            .ok_or(Error::TransportClosed)??
-        {
-            QpDestroyStatus::DestroyedNow | QpDestroyStatus::AlreadyDestroyed => Ok(()),
-        }
-    }
-
-    pub(super) fn transition_connection_to_error(
-        &self,
-        connections: &mut ConnectionRegistry,
-        token: ConnectionToken,
-    ) -> Result<bool> {
-        connections
-            .with_connection_mut(token, |connection| connection.transition_to_error_once())
-            .ok_or(Error::TransportClosed)?
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
     #[cfg(any(test, feature = "test-hooks"))]
     pub(in crate::v2::engine) fn transition_connection_to_error_token(
         &self,
         connections: &mut ConnectionRegistry,
         token: ConnectionToken,
     ) -> Result<()> {
-        self.transition_connection_to_error(connections, token)
+        connections
+            .transition_connection_to_error(token)
             .map(|_| ())
-    }
-
-    pub(super) fn finalize_connection_engine(
-        &self,
-        connections: &mut ConnectionRegistry,
-        token: ConnectionToken,
-        outcome: &super::lifecycle::MemoizedTerminalResult,
-    ) -> Option<super::io::PendingIoEvent> {
-        connections
-            .with_connection_mut(token, |connection| {
-                connection.close_state().record_engine_terminal(outcome);
-                connection.finalize_engine(outcome)
-            })
-            .flatten()
-    }
-
-    pub(super) fn finalize_quarantined_connection_engine(
-        &self,
-        connections: &mut ConnectionRegistry,
-        token: ConnectionToken,
-        outcome: &super::lifecycle::MemoizedTerminalResult,
-    ) -> Option<super::io::PendingIoEvent> {
-        connections
-            .with_connection_mut(token, |connection| {
-                connection.close_state().record_engine_terminal(outcome);
-                connection.finalize_engine_without_provider(outcome)
-            })
-            .flatten()
-    }
-
-    pub(super) fn destroy_connection_resources(
-        &self,
-        connections: &mut ConnectionRegistry,
-        token: ConnectionToken,
-        outstanding_operations: usize,
-    ) -> Result<Option<SharedCmId>> {
-        connections
-            .with_connection_mut(token, |connection| {
-                connection.destroy_connection_resources(outstanding_operations)
-            })
-            .ok_or(Error::TransportClosed)?
-    }
-
-    pub(super) fn destroy_failed_connection_install(
-        &self,
-        connections: &mut ConnectionRegistry,
-        resources: &mut self::connection::FailedConnectionInstallResources,
-    ) -> Result<(Option<SharedCmId>, bool)> {
-        resources.destroy_for_session(connections)
-    }
-
-    pub(super) fn reject_failed_connection_install(
-        &self,
-        connections: &ConnectionRegistry,
-        resources: &self::connection::FailedConnectionInstallResources,
-    ) -> Result<()> {
-        resources.reject_for_session(connections)
-    }
-
-    pub(super) fn track_connection_quarantine(
-        &self,
-        connections: &mut ConnectionRegistry,
-        token: ConnectionToken,
-    ) -> bool {
-        connections.track_bundle_quarantine(token)
-    }
-
-    pub(super) fn track_operation_quarantine(
-        &self,
-        connections: &mut ConnectionRegistry,
-        connection: ConnectionToken,
-        operation: OperationToken,
-    ) -> bool {
-        connections.track_operation_quarantine(connection, operation)
-    }
-
-    pub(super) fn clear_connection_quarantine(
-        &self,
-        connections: &mut ConnectionRegistry,
-        token: ConnectionToken,
-    ) -> bool {
-        if !connections.clear_bundle_quarantine(token) {
-            return false;
-        }
-        true
-    }
-
-    pub(super) fn recover_connection_quarantine_entry(
-        &self,
-        connections: &mut ConnectionRegistry,
-        token: ConnectionToken,
-    ) -> bool {
-        self.clear_connection_quarantine(connections, token)
-    }
-
-    pub(super) fn clear_operation_quarantine(
-        &self,
-        connections: &mut ConnectionRegistry,
-        connection: ConnectionToken,
-        operation: OperationToken,
-    ) -> bool {
-        if !connections.clear_operation_quarantine(connection, operation) {
-            return false;
-        }
-        true
-    }
-
-    fn apply_io_effects(
-        &self,
-        connections: &mut ConnectionRegistry,
-        mut effects: IoCoreEffects,
-    ) -> CommittedIoCoreEffects {
-        for effect in effects.take_quarantine() {
-            match effect {
-                OperationQuarantineEffect::Added {
-                    connection,
-                    operation,
-                } => {
-                    self.track_operation_quarantine(connections, connection, operation);
-                }
-                OperationQuarantineEffect::Cleared {
-                    connection,
-                    operation,
-                } => {
-                    self.clear_operation_quarantine(connections, connection, operation);
-                }
-            }
-        }
-        for token in effects.take_drained() {
-            if connections.close_started(token) {
-                self.recover_connection_quarantine(connections, token);
-                self.record_connection_drained(connections, token);
-                self.schedule_connection_retirement(connections, token);
-            }
-        }
-        effects.into_committed()
-    }
-
-    /// Consume an I/O effect bundle, apply all session-facing mutations, and
-    /// only then publish its detached events and operation wakes.
-    ///
-    /// Moving the bundle into this method prevents callers from publishing or
-    /// reusing the original value. I/O producers return only after their
-    /// operation and registry guards are released; direct posting and close
-    /// paths use a separate detached-only type after their guards are dropped.
-    /// This boundary cannot prove that a caller holds no unrelated lock.
-    #[cfg(test)]
-    pub(super) fn commit_io_effects(
-        &self,
-        connections: &mut ConnectionRegistry,
-        effects: IoCoreEffects,
-    ) {
-        self.apply_io_effects(connections, effects).publish();
-    }
-
-    pub(super) fn commit_io_effects_into(
-        &self,
-        connections: &mut ConnectionRegistry,
-        effects: IoCoreEffects,
-        actions: &mut super::reactor::ReactorActions,
-    ) {
-        self.apply_io_effects(connections, effects)
-            .append_to(actions);
-    }
-
-    /// Apply session effects for root terminal composition.
-    ///
-    /// The returned value contains only detached publication and must be
-    /// consumed after CM and connection terminal state has been published.
-    /// Reactor ownership confines conversion before root composition.
-    pub(super) fn apply_terminal_io_effects(
-        &self,
-        connections: &mut ConnectionRegistry,
-        effects: IoCoreEffects,
-    ) -> CommittedIoCoreEffects {
-        self.apply_io_effects(connections, effects)
-    }
-
-    pub(super) fn enqueue_completion_with_core(
-        &self,
-        connections: &mut ConnectionRegistry,
-        io_core: &mut IoState,
-        completion: crate::wc::WorkCompletion,
-    ) -> Option<ConnectionToken> {
-        let _admission = super::registry::read_unpoison(&self.frontend.admission);
-        let pending = io_core.prepare_completion(completion)?;
-        let identity = pending.identity();
-        if !matches!(connections.lookup(identity.connection), Lookup::Occupied(_)) {
-            io_core.reject_cqe(super::io_core::CqeReject::StaleConnection);
-            return None;
-        }
-        let live = connections.prove_live_io(identity.connection, identity.qp_num);
-        connections
-            .with_connection_io_mut(identity.connection, |connection, connection_io, _poster| {
-                io_core.enqueue_prepared_completion(pending, live, connection, connection_io)
-            })
-            .flatten()
-    }
-
-    pub(super) fn dispatch_connection_completions_with_core(
-        &self,
-        connections: &mut ConnectionRegistry,
-        io_core: &mut IoState,
-        token: ConnectionToken,
-        quantum: usize,
-        actions: &mut super::reactor::ReactorActions,
-    ) -> (usize, bool) {
-        let Some((processed, remains_ready, effects)) =
-            connections.with_connection_io_mut(token, |connection, connection_io, _poster| {
-                io_core.dispatch_connection_completions(connection, connection_io, quantum)
-            })
-        else {
-            return (0, false);
-        };
-        self.commit_io_effects_into(connections, effects, actions);
-        (processed, remains_ready)
     }
 
     #[cfg(test)]
@@ -790,52 +549,6 @@ impl SessionManager {
             .count()
     }
 
-    pub(super) fn reclaim_after_qp_destroy_into(
-        &self,
-        connections: &mut ConnectionRegistry,
-        io_core: &mut IoState,
-        proof: &QpDestructionProof,
-        connection: ConnectionToken,
-        tokens: Vec<OperationToken>,
-        actions: &mut super::reactor::ReactorActions,
-    ) -> usize {
-        let proven_connection = proof.connection;
-        let proven_qp_num = proof.qp_num;
-        let Some((qp_num, close_error)) = connections.with_connection(connection, |connection| {
-            (connection.qp_num(), connection.operation_close_error())
-        }) else {
-            return 0;
-        };
-        if proven_connection != connection || proven_qp_num != qp_num {
-            tracing::warn!(
-                connection = connection.encode(),
-                "operation reclaim rejected a mismatched QP destruction proof"
-            );
-            return 0;
-        }
-        tokens
-            .into_iter()
-            .filter(|token| {
-                let Some((reclaimed, effects)) =
-                    connections.with_connection_io_mut(connection, |io, connection_io, _poster| {
-                        io_core.reclaim_after_qp_destroy(
-                            proven_connection,
-                            proven_qp_num,
-                            io,
-                            connection_io,
-                            close_error.clone(),
-                            *token,
-                        )
-                    })
-                else {
-                    return false;
-                };
-                self.commit_io_effects_into(connections, effects, actions);
-                reclaimed
-            })
-            .count()
-    }
-
     #[cfg(test)]
     #[allow(
         clippy::too_many_arguments,
@@ -865,30 +578,8 @@ impl SessionManager {
         else {
             return false;
         };
-        self.commit_io_effects(connections, effects);
+        apply_io_effects(self, connections, effects).publish();
         reclaimed
-    }
-
-    pub(super) fn reject_queued_completions_after_qp_destroy_into(
-        &self,
-        connections: &mut ConnectionRegistry,
-        io_core: &mut IoState,
-        connection: ConnectionToken,
-        actions: &mut super::reactor::ReactorActions,
-    ) -> bool {
-        // Every completion can publish an event, an operation wake, and a
-        // connection-close wake. Keep two leaves for the owning connection's
-        // quarantine/close tail before removing any copied CQE.
-        let quantum = actions.remaining().saturating_sub(2) / 3;
-        let Some((remains_ready, effects)) =
-            connections.with_connection_io_mut(connection, |io, connection_io, _poster| {
-                io_core.reject_queued_completions_after_qp_destroy(io, connection_io, quantum)
-            })
-        else {
-            return false;
-        };
-        self.commit_io_effects_into(connections, effects, actions);
-        remains_ready
     }
 }
 
@@ -1068,8 +759,8 @@ mod tests {
         let proof = driver
             .reactor
             .session
-            .manager
-            .establish_qp_destruction_proof(&mut driver.reactor.session.connections, token)
+            .connections
+            .establish_qp_destruction_proof(token)
             .expect("first successful destroy mints proof");
         assert_eq!(proof.connection, token);
         assert_eq!(proof.qp_num, connection.identity().qp_num());
@@ -1077,11 +768,8 @@ mod tests {
             driver
                 .reactor
                 .session
-                .manager
-                .establish_qp_destruction_proof(
-                    &mut driver.reactor.session.connections,
-                    token,
-                ),
+                .connections
+                .establish_qp_destruction_proof(token),
             Err(Error::InvalidConfig(message)) if message.contains("cannot be replayed")
         ));
 

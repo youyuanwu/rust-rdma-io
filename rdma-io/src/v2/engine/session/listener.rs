@@ -15,7 +15,7 @@ use super::super::reactor::completion::CommandCompletion;
 use super::super::registry::{ListenerToken, Lookup, PagedRegistry, lock_unpoison, read_unpoison};
 use super::super::{ConnectionSetup, RdmaConnection, RdmaConnectionConfig, SetupSummary};
 use super::connection::SharedCmId;
-use super::{SessionFrontend, SessionListener, SessionListenerCloseState, SessionManager};
+use super::{SessionContext, SessionFrontend, SessionListener, SessionListenerCloseState};
 use crate::v2::error::{Error, Result};
 use futures_util::task::AtomicWaker;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -181,7 +181,7 @@ impl RdmaListener {
     }
 
     pub(in crate::v2::engine) fn from_state(
-        manager: &SessionManager,
+        manager: &SessionContext,
         state: &ListenerEntry,
     ) -> Self {
         Self {

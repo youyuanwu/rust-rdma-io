@@ -10,9 +10,10 @@ use super::cm::CmState;
 use super::registry::ConnectionRegistry;
 use super::{
     CmShutdownClass, CmShutdownSnapshot, CmSoftwareClass, CmSoftwareSnapshot, DeadlineKind,
-    SessionManager,
+    SessionContext,
 };
 use crate::v2::engine::config::CompletionMode;
+use crate::v2::engine::io_core::IoCoreEffects;
 use crate::v2::engine::lifecycle::MemoizedTerminalResult;
 use crate::v2::engine::progress::ReadinessRegistration;
 use crate::v2::engine::resources::EngineReactorResources;
@@ -20,7 +21,7 @@ use crate::v2::engine::scheduler::DeadlineQueue;
 use crate::v2::error::{Error, Result};
 
 pub(in crate::v2::engine) struct SessionReactorSources {
-    pub(in crate::v2::engine) manager: SessionManager,
+    pub(in crate::v2::engine) manager: SessionContext,
     pub(in crate::v2::engine) cm: CmState,
     pub(in crate::v2::engine) connections: ConnectionRegistry,
     deadlines: DeadlineQueue<SessionDeadline>,
@@ -100,11 +101,10 @@ impl SessionReactorSources {
 
     pub(in crate::v2::engine) fn commit_io_effects_into(
         &mut self,
-        effects: crate::v2::engine::io_core::IoCoreEffects,
+        effects: IoCoreEffects,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) {
-        self.manager
-            .commit_io_effects_into(&mut self.connections, effects, actions);
+        super::apply_io_effects(&self.manager, &mut self.connections, effects).append_to(actions);
     }
 
     pub(in crate::v2::engine) fn enqueue_completion_with_core(
@@ -112,8 +112,25 @@ impl SessionReactorSources {
         io_core: &mut crate::v2::engine::io_core::IoState,
         completion: crate::wc::WorkCompletion,
     ) -> Option<crate::v2::engine::registry::ConnectionToken> {
-        self.manager
-            .enqueue_completion_with_core(&mut self.connections, io_core, completion)
+        let _admission =
+            crate::v2::engine::registry::read_unpoison(&self.manager.frontend.admission);
+        let pending = io_core.prepare_completion(completion)?;
+        let identity = pending.identity();
+        if !matches!(
+            self.connections.lookup(identity.connection),
+            super::Lookup::Occupied(_)
+        ) {
+            io_core.reject_cqe(crate::v2::engine::io_core::CqeReject::StaleConnection);
+            return None;
+        }
+        let live = self
+            .connections
+            .prove_live_io(identity.connection, identity.qp_num);
+        self.connections
+            .with_connection_io_mut(identity.connection, |connection, connection_io, _poster| {
+                io_core.enqueue_prepared_completion(pending, live, connection, connection_io)
+            })
+            .flatten()
     }
 
     pub(in crate::v2::engine) fn dispatch_connection_completions_with_core(
@@ -123,13 +140,16 @@ impl SessionReactorSources {
         quantum: usize,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> (usize, bool) {
-        self.manager.dispatch_connection_completions_with_core(
-            &mut self.connections,
-            io_core,
-            token,
-            quantum,
-            actions,
-        )
+        let Some((processed, remains_ready, effects)) =
+            self.connections
+                .with_connection_io_mut(token, |connection, connection_io, _poster| {
+                    io_core.dispatch_connection_completions(connection, connection_io, quantum)
+                })
+        else {
+            return (0, false);
+        };
+        self.commit_io_effects_into(effects, actions);
+        (processed, remains_ready)
     }
 
     pub(in crate::v2::engine) fn handle_reclamation_deadline_with_core(
@@ -153,7 +173,7 @@ impl SessionReactorSources {
     }
 
     pub(in crate::v2::engine) fn new(
-        manager: SessionManager,
+        manager: SessionContext,
         connection_admission: Arc<tokio::sync::Semaphore>,
         cm_budget: usize,
         reclamation_budget: usize,
@@ -401,7 +421,8 @@ impl SessionReactorSources {
             self.shutdown_connection_slot = next;
             self.shutdown_connections_complete = complete;
             for token in connections {
-                self.manager.begin_connection_close_into(
+                Self::begin_connection_close_into(
+                    &self.manager,
                     &mut self.cm,
                     &mut self.connections,
                     token,
@@ -417,14 +438,9 @@ impl SessionReactorSources {
                         })
                         .unwrap_or(false);
                     if retain {
-                        self.manager
-                            .track_connection_quarantine(&mut self.connections, token);
+                        self.connections.track_bundle_quarantine(token);
                     }
-                    let event = self.manager.finalize_connection_engine(
-                        &mut self.connections,
-                        token,
-                        outcome,
-                    );
+                    let event = self.connections.finalize_connection_engine(token, outcome);
                     if let Some(event) = event {
                         actions.push_event(event);
                     }
@@ -631,7 +647,8 @@ impl SessionReactorSources {
                     kind: DeadlineKind::ConnectionDrain,
                     token,
                     ..
-                } => self.manager.handle_connection_drain_deadline_into(
+                } => Self::handle_connection_drain_deadline_into(
+                    &self.manager,
                     &mut self.connections,
                     io_core,
                     crate::v2::engine::registry::ConnectionToken::decode(token),

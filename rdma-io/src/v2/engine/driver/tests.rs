@@ -472,11 +472,8 @@ async fn cq_reclamation_ready_interleaving_dispatches_queued_success_and_flush_e
             driver
                 .reactor
                 .session
-                .manager
-                .transition_connection_to_error(
-                    &mut driver.reactor.session.connections,
-                    connection_token,
-                )
+                .connections
+                .transition_connection_to_error(connection_token)
                 .unwrap();
             engine
                 .shared

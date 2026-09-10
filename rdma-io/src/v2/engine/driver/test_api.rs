@@ -10,7 +10,7 @@ use crate::async_cm::AsyncCmId;
 use crate::cm::CmId;
 use crate::v2::engine::reactor::completion::CommandCompletion;
 use crate::v2::engine::resources::TestResourceObservers;
-use crate::v2::engine::session::SessionManager;
+use crate::v2::engine::session::SessionContext;
 #[cfg(test)]
 use crate::v2::engine::session::connection::TestConnectionProvider;
 #[cfg(test)]
@@ -56,7 +56,7 @@ impl TestConnectionInstallRequest {
 
     pub(in crate::v2::engine) fn execute_into(
         &self,
-        manager: &SessionManager,
+        manager: &SessionContext,
         connections: &mut ConnectionRegistry,
         reservation: crate::v2::engine::session::connection::ConnectionReservation,
         actions: &mut crate::v2::engine::reactor::ReactorActions,

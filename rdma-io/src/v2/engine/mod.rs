@@ -74,7 +74,7 @@ use registry::{lock_unpoison, write_unpoison};
 use resources::EngineReactorResources;
 pub use session::connection::{RdmaConnection, RdmaConnectionIdentity};
 pub use session::listener::{RdmaListener, RdmaListenerConfig};
-use session::{SessionFrontend, SessionManager};
+use session::{SessionContext, SessionFrontend};
 
 use super::error::{Error, Result};
 
@@ -546,7 +546,7 @@ struct EngineFrontendRoot {
     // Runtime-state-free policy retained by the frontend composition root.
     // Provider ownership remains exclusively in EngineReactor.
     session: Arc<SessionFrontend>,
-    diagnostics: Mutex<PublishedDiagnostics>,
+    diagnostics: Arc<Mutex<PublishedDiagnostics>>,
     #[cfg(any(test, feature = "test-hooks"))]
     cm_rejections: std::sync::atomic::AtomicU64,
     #[cfg(any(test, feature = "test-hooks"))]
@@ -610,20 +610,25 @@ impl EngineFrontendRoot {
         config: EngineConfig,
         provider: Option<config::ProviderLimits>,
         memory: io::MemoryRegistrar,
-    ) -> Result<(Self, SessionManager)> {
+    ) -> Result<(Self, SessionContext)> {
         let admission = Arc::new(RwLock::new(()));
         let work_signal = Arc::new(WorkSignal::new());
-        let commands = CommandIngress::new(
+        let initial_cq_credits = config.cq_capacity;
+        let diagnostics = Arc::new(Mutex::new(PublishedDiagnostics::initial(
+            initial_cq_credits,
+        )));
+        let commands = CommandIngress::new_with_diagnostics(
             config.max_live_connections,
             config.max_inflight_operations,
             Arc::clone(&work_signal),
+            Arc::clone(&diagnostics),
         );
         let observer = EngineObserver::new();
         let control =
             EngineControl::new(Arc::clone(&admission), &commands, &observer, &work_signal);
         #[cfg(any(test, feature = "test-hooks"))]
         let test_driver = Arc::new(driver::test_api::TestDriverState::new());
-        let session = SessionManager::new(
+        let session = SessionContext::new(
             config::SessionConfig::from(&config),
             provider,
             Arc::clone(&admission),
@@ -638,12 +643,11 @@ impl EngineFrontendRoot {
             },
         )?;
         let session_frontend = session.frontend();
-        let initial_cq_credits = config.cq_capacity;
         Ok((
             Self {
                 config,
                 session: session_frontend,
-                diagnostics: Mutex::new(PublishedDiagnostics::initial(initial_cq_credits)),
+                diagnostics,
                 #[cfg(any(test, feature = "test-hooks"))]
                 cm_rejections: std::sync::atomic::AtomicU64::new(0),
                 #[cfg(any(test, feature = "test-hooks"))]
@@ -725,6 +729,7 @@ impl EngineFrontendRoot {
         lock_unpoison(&self.diagnostics).engine.clone()
     }
 
+    #[cfg(test)]
     fn publish_diagnostics(&self, diagnostics: PublishedDiagnostics) {
         *lock_unpoison(&self.diagnostics) = diagnostics;
     }

@@ -7,11 +7,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 
+use super::super::SessionReactorSources;
 use super::super::connection::ConnectionState;
 use super::{
     CmEventReject, CmEventSnapshot, CmRouteToken, CmState, ConnectionSetup, ContextRoute,
     EngineReactorResources, EstablishedConnectionRoute, EventDisposition, Lookup, OutboundRoute,
-    OutboundState, RdmaConnection, RdmaConnectionConfig, SessionFrontend, SessionManager,
+    OutboundState, RdmaConnection, RdmaConnectionConfig, SessionContext, SessionFrontend,
     SharedCmId, VerbsConnectionResources, build_qp, empty_connection_setup,
     install_reserved_connection, is_failure_event, run_setup_before_establish,
 };
@@ -177,7 +178,7 @@ pub(super) fn start(
 pub(super) fn process_cancellation(
     state: &mut CmState,
     connections: &mut ConnectionRegistry,
-    shared: &SessionManager,
+    shared: &SessionContext,
     io_core: &mut crate::v2::engine::io_core::IoState,
     request: Arc<OutboundRequest>,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
@@ -228,7 +229,14 @@ pub(super) fn process_cancellation(
             connection: connection.clone(),
         },
     );
-    shared.begin_connection_close_into(state, connections, connection_token, io_core, actions);
+    SessionReactorSources::begin_connection_close_into(
+        shared,
+        state,
+        connections,
+        connection_token,
+        io_core,
+        actions,
+    );
     drop(request.take_result());
     if connections
         .with_connection(connection_token, |connection| {
@@ -257,7 +265,7 @@ pub(super) fn process_cancellation(
 pub(super) fn handle_event(
     state: &mut CmState,
     connections: &mut ConnectionRegistry,
-    shared: &SessionManager,
+    shared: &SessionContext,
     io_core: &mut crate::v2::engine::io_core::IoState,
     resources: &EngineReactorResources,
     token: CmRouteToken,
@@ -321,7 +329,7 @@ pub(super) fn handle_event(
 fn handle_addr_resolved(
     state: &mut CmState,
     connections: &mut ConnectionRegistry,
-    shared: &SessionManager,
+    shared: &SessionContext,
     resources: &EngineReactorResources,
     token: CmRouteToken,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
@@ -374,7 +382,7 @@ fn handle_addr_resolved(
 fn handle_route_resolved(
     state: &mut CmState,
     connections: &mut ConnectionRegistry,
-    shared: &SessionManager,
+    shared: &SessionContext,
     io_core: &mut crate::v2::engine::io_core::IoState,
     resources: &EngineReactorResources,
     token: CmRouteToken,
@@ -431,7 +439,7 @@ fn handle_route_resolved(
         Ok(connection) => connection,
         Err(failure) => {
             let (error, mut failed_resources) = failure.into_parts();
-            match shared.destroy_failed_connection_install(connections, &mut failed_resources) {
+            match failed_resources.destroy_for_session(connections) {
                 Ok((cm_id, _qp_destroyed)) => {
                     state.release_failed_install(connections, failed_resources)?;
                     if let Some(cm_id) = cm_id {
@@ -561,7 +569,7 @@ fn handle_route_resolved(
 fn fail_registered_connection(
     state: &mut CmState,
     connections: &mut ConnectionRegistry,
-    shared: &SessionManager,
+    shared: &SessionContext,
     io_core: &mut crate::v2::engine::io_core::IoState,
     token: CmRouteToken,
     request: Arc<OutboundRequest>,
@@ -581,7 +589,14 @@ fn fail_registered_connection(
             connection: EstablishedConnectionRoute::new(connection_token),
         },
     );
-    shared.begin_connection_close_into(state, connections, connection_token, io_core, actions);
+    SessionReactorSources::begin_connection_close_into(
+        shared,
+        state,
+        connections,
+        connection_token,
+        io_core,
+        actions,
+    );
     drop(connection);
     if connections
         .with_connection(connection_token, |connection| {
@@ -610,7 +625,7 @@ fn fail_registered_connection(
 fn handle_established(
     state: &mut CmState,
     connections: &mut ConnectionRegistry,
-    shared: &SessionManager,
+    shared: &SessionContext,
     io_core: &mut crate::v2::engine::io_core::IoState,
     token: CmRouteToken,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
@@ -659,7 +674,7 @@ fn handle_established(
 fn handle_disconnected(
     state: &mut CmState,
     connections: &mut ConnectionRegistry,
-    shared: &SessionManager,
+    shared: &SessionContext,
     io_core: &mut crate::v2::engine::io_core::IoState,
     token: CmRouteToken,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
@@ -734,7 +749,14 @@ fn handle_disconnected(
             },
         );
     }
-    shared.begin_connection_close_into(state, connections, connection_token, io_core, actions);
+    SessionReactorSources::begin_connection_close_into(
+        shared,
+        state,
+        connections,
+        connection_token,
+        io_core,
+        actions,
+    );
     if connections
         .with_connection(connection_token, |connection| {
             connection.io_ledger.accepted_count()
@@ -757,7 +779,7 @@ fn handle_disconnected(
 fn handle_failure_event(
     state: &mut CmState,
     connections: &mut ConnectionRegistry,
-    shared: &SessionManager,
+    shared: &SessionContext,
     io_core: &mut crate::v2::engine::io_core::IoState,
     token: CmRouteToken,
     snapshot: CmEventSnapshot,
@@ -857,7 +879,8 @@ fn handle_failure_event(
                     },
                 );
             }
-            shared.begin_connection_close_into(
+            SessionReactorSources::begin_connection_close_into(
+                shared,
                 state,
                 connections,
                 connection_token,
@@ -904,7 +927,8 @@ fn handle_failure_event(
                     connection: connection.clone(),
                 },
             );
-            shared.begin_connection_close_into(
+            SessionReactorSources::begin_connection_close_into(
+                shared,
                 state,
                 connections,
                 connection_token,

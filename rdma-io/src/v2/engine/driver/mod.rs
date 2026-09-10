@@ -24,7 +24,7 @@ use super::config::CompletionMode;
 use super::lifecycle::MemoizedTerminalResult;
 use super::reactor::EngineReactor;
 use super::resources::EngineReactorResources;
-use super::session::SessionManager;
+use super::session::SessionContext;
 use super::{EngineFrontendRoot, RdmaEngineDriver};
 use crate::v2::error::{Error, Result};
 use crate::v2::runtime::preflight_driver_runtime;
@@ -96,7 +96,7 @@ impl WorkSignal {
 impl RdmaEngineDriver {
     pub(super) fn new(
         shared: Arc<EngineFrontendRoot>,
-        session: SessionManager,
+        session: SessionContext,
         resources: Option<EngineReactorResources>,
     ) -> Self {
         let reactor = EngineReactor::new(&shared, session, resources);

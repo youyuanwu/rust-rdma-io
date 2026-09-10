@@ -4,12 +4,13 @@ use std::sync::Arc;
 
 use rdma_io_sys::rdmacm::rdma_cm_id;
 
+use super::super::SessionReactorSources;
 use super::super::connection::ConnectionState;
 use super::{
     AcceptRequest, ChildAdmission, CmEventReject, CmEventSnapshot, CmRouteToken, CmState,
     ContextRoute, EngineReactorResources, EstablishedConnectionRoute, EventDisposition,
     InboundPeerState, InboundRejectReason, InboundRoute, InboundState, IncomingChild,
-    ListenRequest, ListenerAction, Lookup, RdmaConnection, RdmaListener, SessionManager,
+    ListenRequest, ListenerAction, Lookup, RdmaConnection, RdmaListener, SessionContext,
     SharedCmId, VerbsConnectionResources, build_qp, contextual_cm_error,
     install_reserved_connection, is_failure_event, reserve_connection, run_setup_before_establish,
     with_validated_listener_backlog,
@@ -23,7 +24,7 @@ use crate::v2::error::{Error, Result};
 
 pub(super) fn start_listener(
     state: &mut CmState,
-    shared: &SessionManager,
+    shared: &SessionContext,
     resources: &EngineReactorResources,
     token: ListenerToken,
     request: Arc<ListenRequest>,
@@ -131,7 +132,7 @@ pub(super) fn start_listener(
 pub(super) fn service_listener(
     state: &mut CmState,
     connections: &mut ConnectionRegistry,
-    shared: &SessionManager,
+    shared: &SessionContext,
     io_core: &mut crate::v2::engine::io_core::IoState,
     resources: Option<&EngineReactorResources>,
     listener: ListenerToken,
@@ -218,7 +219,7 @@ pub(super) fn service_listener(
 fn acknowledge_accept_delivery(
     state: &mut CmState,
     connections: &mut ConnectionRegistry,
-    _shared: &SessionManager,
+    _shared: &SessionContext,
     listener: ListenerToken,
     request: &Arc<AcceptRequest>,
     encoded: u64,
@@ -261,7 +262,7 @@ fn acknowledge_accept_delivery(
 pub(super) fn handle_connect_request(
     state: &mut CmState,
     connections: &mut ConnectionRegistry,
-    shared: &SessionManager,
+    shared: &SessionContext,
     resources: &EngineReactorResources,
     listener: ListenerToken,
     snapshot: CmEventSnapshot,
@@ -352,7 +353,7 @@ pub(super) fn handle_connect_request(
 
 pub(super) fn handle_listener_event(
     state: &mut CmState,
-    shared: &SessionManager,
+    shared: &SessionContext,
     listener: ListenerToken,
     snapshot: CmEventSnapshot,
 ) -> Result<EventDisposition> {
@@ -392,7 +393,7 @@ pub(super) fn handle_listener_event(
 fn process_selected_pair(
     state: &mut CmState,
     connections: &mut ConnectionRegistry,
-    shared: &SessionManager,
+    shared: &SessionContext,
     io_core: &mut crate::v2::engine::io_core::IoState,
     resources: &EngineReactorResources,
     listener: ListenerToken,
@@ -546,9 +547,7 @@ fn process_selected_pair(
         Ok(connection) => connection,
         Err(failure) => {
             let (error, mut failed_resources) = failure.into_parts();
-            if let Err(reject_error) =
-                shared.reject_failed_connection_install(connections, &failed_resources)
-            {
+            if let Err(reject_error) = failed_resources.reject_for_session(connections) {
                 let reject_error = contextual_cm_error(
                     "reject inbound child after failed connection installation",
                     reject_error,
@@ -569,7 +568,7 @@ fn process_selected_pair(
                 }
                 return Err(reject_error);
             }
-            match shared.destroy_failed_connection_install(connections, &mut failed_resources) {
+            match failed_resources.destroy_for_session(connections) {
                 Ok((cm_id, _qp_destroyed)) => {
                     state.release_failed_install(connections, failed_resources)?;
                     if let Some(cm_id) = cm_id {
@@ -678,7 +677,7 @@ fn process_selected_pair(
 fn fail_selected_connection(
     state: &mut CmState,
     connections: &mut ConnectionRegistry,
-    shared: &SessionManager,
+    shared: &SessionContext,
     io_core: &mut crate::v2::engine::io_core::IoState,
     token: CmRouteToken,
     request: Arc<AcceptRequest>,
@@ -726,7 +725,7 @@ fn fail_selected_connection(
                 connection: Some(EstablishedConnectionRoute::new(connection_token)),
             },
         );
-        shared.track_connection_quarantine(connections, connection_token);
+        connections.track_bundle_quarantine(connection_token);
         if let Some(event) = connections
             .with_connection_mut(connection_token, |connection| {
                 connection
@@ -759,7 +758,14 @@ fn fail_selected_connection(
             peer: InboundPeerState::PreAccept { reject: None },
         },
     );
-    shared.begin_connection_close_into(state, connections, connection_token, io_core, actions);
+    SessionReactorSources::begin_connection_close_into(
+        shared,
+        state,
+        connections,
+        connection_token,
+        io_core,
+        actions,
+    );
     drop(connection);
     if connections
         .with_connection(connection_token, |connection| {
@@ -856,7 +862,7 @@ fn reject_child(
 fn cancel_inbound_route(
     state: &mut CmState,
     connections: &mut ConnectionRegistry,
-    shared: &SessionManager,
+    shared: &SessionContext,
     io_core: &mut crate::v2::engine::io_core::IoState,
     encoded: u64,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
@@ -1028,7 +1034,7 @@ pub(super) fn prepare_selected_connection_close(
 fn close_accepted_connection(
     state: &mut CmState,
     connections: &mut ConnectionRegistry,
-    shared: &SessionManager,
+    shared: &SessionContext,
     io_core: &mut crate::v2::engine::io_core::IoState,
     token: CmRouteToken,
     request: Arc<AcceptRequest>,
@@ -1079,7 +1085,14 @@ fn close_accepted_connection(
         },
     );
     let cancelled_connection = failure.into_connection();
-    shared.begin_connection_close_into(state, connections, connection_token, io_core, actions);
+    SessionReactorSources::begin_connection_close_into(
+        shared,
+        state,
+        connections,
+        connection_token,
+        io_core,
+        actions,
+    );
     if connections
         .with_connection(connection_token, |connection| {
             connection.io_ledger.accepted_count()
@@ -1132,7 +1145,7 @@ fn finalize_listener(state: &mut CmState, listener: ListenerToken) -> Result<()>
 pub(super) fn handle_event(
     state: &mut CmState,
     connections: &mut ConnectionRegistry,
-    shared: &SessionManager,
+    shared: &SessionContext,
     io_core: &mut crate::v2::engine::io_core::IoState,
     token: CmRouteToken,
     snapshot: CmEventSnapshot,
@@ -1237,7 +1250,7 @@ pub(super) fn handle_event(
 pub(super) fn handle_disconnected(
     state: &mut CmState,
     connections: &mut ConnectionRegistry,
-    shared: &SessionManager,
+    shared: &SessionContext,
     io_core: &mut crate::v2::engine::io_core::IoState,
     token: CmRouteToken,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
@@ -1331,7 +1344,7 @@ pub(super) fn handle_disconnected(
 fn close_after_inbound_terminal(
     state: &mut CmState,
     connections: &mut ConnectionRegistry,
-    shared: &SessionManager,
+    shared: &SessionContext,
     io_core: &mut crate::v2::engine::io_core::IoState,
     token: CmRouteToken,
     connection: EstablishedConnectionRoute,
@@ -1384,7 +1397,14 @@ fn close_after_inbound_terminal(
             peer: InboundPeerState::Accepted,
         },
     );
-    shared.begin_connection_close_into(state, connections, connection_token, io_core, actions);
+    SessionReactorSources::begin_connection_close_into(
+        shared,
+        state,
+        connections,
+        connection_token,
+        io_core,
+        actions,
+    );
     if connections
         .with_connection(connection_token, |connection| {
             connection.io_ledger.accepted_count()
@@ -1409,7 +1429,7 @@ fn close_after_inbound_terminal(
 fn finish_closing_terminal(
     state: &mut CmState,
     connections: &mut ConnectionRegistry,
-    shared: &SessionManager,
+    shared: &SessionContext,
     io_core: &mut crate::v2::engine::io_core::IoState,
     token: CmRouteToken,
     route_state: InboundState,
@@ -1465,7 +1485,14 @@ fn finish_closing_terminal(
             peer,
         },
     );
-    shared.begin_connection_close_into(state, connections, connection_token, io_core, actions);
+    SessionReactorSources::begin_connection_close_into(
+        shared,
+        state,
+        connections,
+        connection_token,
+        io_core,
+        actions,
+    );
     if connections
         .with_connection(connection_token, |connection| {
             connection.io_ledger.accepted_count()
@@ -1502,7 +1529,7 @@ fn registered_connection(
 fn handle_failure(
     state: &mut CmState,
     connections: &mut ConnectionRegistry,
-    shared: &SessionManager,
+    shared: &SessionContext,
     io_core: &mut crate::v2::engine::io_core::IoState,
     token: CmRouteToken,
     snapshot: CmEventSnapshot,
@@ -1659,7 +1686,7 @@ mod tests {
     }
 
     fn install_selected_route(
-        manager: &SessionManager,
+        manager: &SessionContext,
         state: &mut CmState,
         connections: &mut ConnectionRegistry,
         poster: Arc<OrderedClosePoster>,

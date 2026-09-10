@@ -20,7 +20,7 @@ use super::super::lifecycle::MemoizedTerminalResult;
 use super::super::registry::OperationToken;
 use super::super::registry::{ConnectionToken, lock_unpoison, read_unpoison};
 use super::registry::ConnectionRegistry;
-use super::{QpDestructionProof, SessionCloseState, SessionFrontend, SessionManager};
+use super::{QpDestructionProof, SessionCloseState, SessionContext, SessionFrontend};
 use crate::cm::{CmId, ConnParam, EventChannel};
 use crate::v2::error::{Error, Result};
 use crate::v2::mr::{AccessIntent, Mr, RemoteMr};
@@ -277,7 +277,7 @@ impl RdmaConnection {
     }
 
     fn from_registered(
-        manager: &SessionManager,
+        manager: &SessionContext,
         state: &ConnectionState,
         route: Option<ConnectionCmRoute>,
     ) -> Self {
@@ -934,16 +934,30 @@ impl ConnectionState {
 
 #[derive(Debug)]
 pub(in crate::v2::engine) struct ConnectionReservation {
-    _permit: OwnedSemaphorePermit,
+    permit: Option<OwnedSemaphorePermit>,
+    permit_pool: Option<Arc<tokio::sync::Semaphore>>,
+    permit_capacity: usize,
     state: ReservationState,
     qp_counted: bool,
     diagnostics: Option<Arc<ConnectionDiagnosticsGauge>>,
+    frontend_diagnostics: Option<Arc<Mutex<crate::v2::engine::diagnostics::PublishedDiagnostics>>>,
     indexed: bool,
 }
 
 impl ConnectionReservation {
-    pub(in crate::v2::engine) fn new(permit: OwnedSemaphorePermit) -> Self {
-        Self::new_with_diagnostics(permit, None)
+    pub(in crate::v2::engine) fn new_with_frontend_diagnostics(
+        permit: OwnedSemaphorePermit,
+        permit_pool: Arc<tokio::sync::Semaphore>,
+        permit_capacity: usize,
+        frontend_diagnostics: Arc<Mutex<crate::v2::engine::diagnostics::PublishedDiagnostics>>,
+    ) -> Self {
+        lock_unpoison(&frontend_diagnostics).engine.live_connections =
+            permit_capacity.saturating_sub(permit_pool.available_permits());
+        let mut reservation = Self::new_with_diagnostics(permit, None);
+        reservation.permit_pool = Some(permit_pool);
+        reservation.permit_capacity = permit_capacity;
+        reservation.frontend_diagnostics = Some(frontend_diagnostics);
+        reservation
     }
 
     pub(in crate::v2::engine) fn new_with_diagnostics(
@@ -954,10 +968,13 @@ impl ConnectionReservation {
             diagnostics.add_live();
         }
         Self {
-            _permit: permit,
+            permit: Some(permit),
+            permit_pool: None,
+            permit_capacity: 0,
             state: ReservationState::Establishing,
             qp_counted: false,
             diagnostics,
+            frontend_diagnostics: None,
             indexed: false,
         }
     }
@@ -1242,6 +1259,14 @@ impl Drop for ConnectionReservation {
     fn drop(&mut self) {
         if let Some(diagnostics) = &self.diagnostics {
             diagnostics.remove(self.state, self.qp_counted, self.indexed);
+        }
+        if let Some(diagnostics) = &self.frontend_diagnostics {
+            drop(self.permit.take());
+            let mut diagnostics = lock_unpoison(diagnostics);
+            diagnostics.engine.live_connections = self.permit_pool.as_ref().map_or(0, |pool| {
+                self.permit_capacity
+                    .saturating_sub(pool.available_permits())
+            });
         }
     }
 }
@@ -1740,7 +1765,7 @@ impl VerbsConnectionResources {
 
 #[cfg(test)]
 pub(crate) fn install_connection(
-    manager: &SessionManager,
+    manager: &SessionContext,
     connections: &mut ConnectionRegistry,
     poster: impl Into<ConnectionPoster>,
     config: RdmaConnectionConfig,
@@ -1775,7 +1800,7 @@ pub(crate) fn install_connection(
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub(in crate::v2::engine) fn install_admitted_test_connection(
-    manager: &SessionManager,
+    manager: &SessionContext,
     connections: &mut ConnectionRegistry,
     poster: impl Into<ConnectionPoster>,
     config: RdmaConnectionConfig,
@@ -1805,7 +1830,7 @@ pub(in crate::v2::engine) fn install_admitted_test_connection(
 }
 
 pub(in crate::v2::engine) fn reserve_connection<'a>(
-    manager: &'a SessionManager,
+    manager: &'a SessionContext,
     connections: &ConnectionRegistry,
 ) -> Result<(RwLockReadGuard<'a, ()>, ConnectionReservation)> {
     let admission = read_unpoison(&manager.frontend.admission);
@@ -1822,7 +1847,7 @@ pub(in crate::v2::engine) fn reserve_connection<'a>(
     reason = "failed installation returns the complete provider/resource bundle for exact cleanup"
 )]
 pub(in crate::v2::engine) fn install_reserved_connection(
-    manager: &SessionManager,
+    manager: &SessionContext,
     connections: &mut ConnectionRegistry,
     route_token: Option<ConnectionToken>,
     poster: impl Into<ConnectionPoster>,
