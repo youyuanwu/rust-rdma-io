@@ -70,7 +70,7 @@ impl WorkSignal {
         self.waker.wake();
     }
 
-    fn take(&self) -> usize {
+    pub(in crate::v2::engine) fn take(&self) -> usize {
         self.pending.swap(0, std::sync::atomic::Ordering::AcqRel)
     }
 
