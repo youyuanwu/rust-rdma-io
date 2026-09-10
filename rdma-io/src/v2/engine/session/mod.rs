@@ -30,7 +30,7 @@ use super::config::{ProviderLimits, RdmaConnectionConfig, SessionConfig};
 use super::io::MemoryRegistrar;
 #[cfg(test)]
 use super::io_core::IoState;
-use super::io_core::{CommittedIoCoreEffects, IoCoreEffects, OperationQuarantineEffect};
+use super::io_core::{AfterEngineUnlock, IoCoreEffects};
 use super::reactor::CommandIngress;
 #[cfg(test)]
 use super::registry::OperationToken;
@@ -359,32 +359,9 @@ pub(super) struct SessionContext {
 fn apply_io_effects(
     context: &SessionContext,
     connections: &mut ConnectionRegistry,
-    mut effects: IoCoreEffects,
-) -> CommittedIoCoreEffects {
-    for effect in effects.take_quarantine() {
-        match effect {
-            OperationQuarantineEffect::Added {
-                connection,
-                operation,
-            } => {
-                connections.track_operation_quarantine(connection, operation);
-            }
-            OperationQuarantineEffect::Cleared {
-                connection,
-                operation,
-            } => {
-                connections.clear_operation_quarantine(connection, operation);
-            }
-        }
-    }
-    for token in effects.take_drained() {
-        if connections.close_started(token) {
-            connections.clear_bundle_quarantine(token);
-            SessionReactorSources::record_connection_drained(connections, token);
-            SessionReactorSources::schedule_connection_retirement(context, connections, token);
-        }
-    }
-    effects.into_committed()
+    effects: IoCoreEffects,
+) -> AfterEngineUnlock {
+    effects.apply_session(context, connections)
 }
 
 impl SessionContext {

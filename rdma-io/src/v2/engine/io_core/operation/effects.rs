@@ -1,10 +1,21 @@
 //! Consuming operation effects and detached post-lock publication states.
+//!
+//! `IoCoreEffects` is the non-publishable mutation result. Its sole
+//! engine-wide conversion applies session quarantine, drain, and retirement
+//! mutations before yielding `AfterEngineUnlock`. The former committed-stage
+//! wrapper was nominal and is intentionally removed. `DetachedIoCoreEffects`
+//! remains distinct because it is constructed only for paths that cannot
+//! carry session effects. Provider transfer results, operation transitions,
+//! deferred protocol actions, and bounded reactor actions remain separate
+//! because each still owns a different acceptance, lifecycle, or capacity
+//! invariant.
 
 use std::sync::Arc;
 
 use crate::v2::engine::io::PendingIoEvent;
 use crate::v2::engine::reactor::ReactorActions;
 use crate::v2::engine::registry::{ConnectionToken, OperationToken};
+use crate::v2::engine::session::{SessionContext, registry::ConnectionRegistry};
 
 use super::state::OperationObserver;
 
@@ -16,7 +27,7 @@ use super::state::OperationObserver;
 /// command ingress drains into bounded turn-local actions without repeating
 /// provider submission.
 #[derive(Default)]
-pub(super) struct AfterEngineUnlock {
+pub(in crate::v2::engine) struct AfterEngineUnlock {
     events: Vec<PendingIoEvent>,
     operations: Vec<Arc<OperationObserver>>,
     closes: Vec<Arc<tokio::sync::Notify>>,
@@ -53,7 +64,7 @@ impl AfterEngineUnlock {
         self.events.len() + self.operations.len() + self.closes.len()
     }
 
-    pub(super) fn publish(self) {
+    pub(in crate::v2::engine) fn publish(self) {
         for event in self.events {
             event.deliver();
         }
@@ -65,7 +76,7 @@ impl AfterEngineUnlock {
         }
     }
 
-    pub(super) fn append_to(self, actions: &mut ReactorActions) {
+    pub(in crate::v2::engine) fn append_to(self, actions: &mut ReactorActions) {
         assert!(
             actions.can_accept(self.len()),
             "operation publication exceeded reserved reactor capacity"
@@ -106,34 +117,13 @@ pub(in crate::v2::engine) struct IoCoreEffects {
     drained: Vec<ConnectionToken>,
 }
 
-/// Detached I/O publication after the session owner has committed all
-/// session-facing effects from the original [`IoCoreEffects`].
-///
-/// The root terminal path uses this state to preserve CM/connection
-/// terminalization before operation notifications. It cannot recover or reuse
-/// the original full bundle.
-pub(in crate::v2::engine) struct CommittedIoCoreEffects {
-    after_unlock: AfterEngineUnlock,
-}
-
 /// A detached-only result for a path that cannot produce session effects.
 ///
-/// This is intentionally separate from [`IoCoreEffects`] and
-/// [`CommittedIoCoreEffects`]. Its only cross-module use is close-observer
-/// notification after admission and lifecycle guards have been released.
+/// This is intentionally separate from [`IoCoreEffects`]. Its only
+/// cross-module use is close-observer notification after admission and
+/// lifecycle guards have been released.
 pub(in crate::v2::engine) struct DetachedIoCoreEffects {
     after_unlock: AfterEngineUnlock,
-}
-
-impl CommittedIoCoreEffects {
-    #[cfg(test)]
-    pub(in crate::v2::engine) fn publish(self) {
-        self.after_unlock.publish();
-    }
-
-    pub(in crate::v2::engine) fn append_to(self, actions: &mut ReactorActions) {
-        self.after_unlock.append_to(actions);
-    }
 }
 
 impl DetachedIoCoreEffects {
@@ -182,20 +172,12 @@ impl IoCoreEffects {
         self.drained.push(connection);
     }
 
-    pub(in crate::v2::engine) fn take_quarantine(&mut self) -> Vec<OperationQuarantineEffect> {
-        std::mem::take(&mut self.quarantine)
-    }
-
-    pub(in crate::v2::engine) fn take_drained(&mut self) -> Vec<ConnectionToken> {
-        std::mem::take(&mut self.drained)
-    }
-
     /// Consume the bundle for direct operation-owned publication.
     ///
     /// Only I/O paths that provably produce no session-facing effect may use
     /// this; the assertions fail closed if quarantine or accepted-zero work
     /// would otherwise be dropped. Session-facing bundles must instead go
-    /// through [`IoCoreEffects::into_committed`].
+    /// through [`IoCoreEffects::apply_session`].
     pub(super) fn into_after_unlock(self) -> AfterEngineUnlock {
         assert!(
             self.quarantine.is_empty(),
@@ -208,15 +190,38 @@ impl IoCoreEffects {
         self.after_unlock
     }
 
-    /// Convert to the publishable state once the session owner has applied all
-    /// session-facing effects.
-    ///
-    /// Taking `self` by value prevents the original bundle from being
-    /// republished or re-committed after the reactor has applied its
-    /// connection-facing effects.
-    pub(in crate::v2::engine) fn into_committed(self) -> CommittedIoCoreEffects {
-        CommittedIoCoreEffects {
-            after_unlock: self.into_after_unlock(),
+    /// Consume the full bundle by applying every session-facing mutation
+    /// before returning detached publication.
+    pub(in crate::v2::engine) fn apply_session(
+        mut self,
+        context: &SessionContext,
+        connections: &mut ConnectionRegistry,
+    ) -> AfterEngineUnlock {
+        for effect in self.quarantine.drain(..) {
+            match effect {
+                OperationQuarantineEffect::Added {
+                    connection,
+                    operation,
+                } => {
+                    connections.track_operation_quarantine(connection, operation);
+                }
+                OperationQuarantineEffect::Cleared {
+                    connection,
+                    operation,
+                } => {
+                    connections.clear_operation_quarantine(connection, operation);
+                }
+            }
         }
+        for token in self.drained.drain(..) {
+            if connections.close_started(token) {
+                connections.clear_bundle_quarantine(token);
+                connections.mark_drained_once(token);
+                if connections.request_retirement(token) {
+                    context.notify_reactor();
+                }
+            }
+        }
+        self.into_after_unlock()
     }
 }

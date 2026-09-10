@@ -15,8 +15,7 @@ pub(super) use operation::CqeReject;
 pub use operation::RdmaOperation;
 pub(in crate::v2::engine) use operation::future::OperationCommand;
 pub(super) use operation::{
-    CommittedIoCoreEffects, IoCoreEffects, OperationObserver, OperationQuarantineEffect,
-    post_io_recv_batch_into, post_io_send_into,
+    AfterEngineUnlock, IoCoreEffects, OperationObserver, post_io_recv_batch_into, post_io_send_into,
 };
 use operation::{CqCreditPool, OperationRegistry};
 #[cfg(test)]

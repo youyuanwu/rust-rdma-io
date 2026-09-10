@@ -1442,7 +1442,7 @@ impl ConnectionRegistry {
         .unwrap_or(false)
     }
 
-    pub(super) fn track_operation_quarantine(
+    pub(in crate::v2::engine) fn track_operation_quarantine(
         &mut self,
         token: ConnectionToken,
         operation: OperationToken,
@@ -1521,7 +1521,10 @@ impl ConnectionRegistry {
         .unwrap_or(false)
     }
 
-    pub(super) fn clear_bundle_quarantine(&mut self, token: ConnectionToken) -> bool {
+    pub(in crate::v2::engine) fn clear_bundle_quarantine(
+        &mut self,
+        token: ConnectionToken,
+    ) -> bool {
         self.transition(token, |entry| match entry {
             ConnectionEntry::Quarantined(mut quarantined) if quarantined.bundle => {
                 quarantined.bundle = false;
@@ -1545,7 +1548,7 @@ impl ConnectionRegistry {
         .unwrap_or(false)
     }
 
-    pub(super) fn clear_operation_quarantine(
+    pub(in crate::v2::engine) fn clear_operation_quarantine(
         &mut self,
         token: ConnectionToken,
         operation: OperationToken,

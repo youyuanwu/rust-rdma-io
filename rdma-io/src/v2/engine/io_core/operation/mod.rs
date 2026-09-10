@@ -15,7 +15,7 @@ pub(super) use accounting::{CqCreditPool, OperationRegistry};
 pub(in crate::v2::engine) use batch::{post_io_recv_batch_into, post_io_send_into};
 pub(in crate::v2::engine) use completion::CqeReject;
 pub(in crate::v2::engine) use effects::{
-    CommittedIoCoreEffects, IoCoreEffects, OperationQuarantineEffect,
+    AfterEngineUnlock, IoCoreEffects, OperationQuarantineEffect,
 };
 pub use future::RdmaOperation;
 pub(in crate::v2::engine) use state::OperationObserver;
