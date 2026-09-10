@@ -319,7 +319,9 @@ impl EngineReactor {
             .has_runnable(self.session.cm.listener_slot_available());
 
         let ready_sources = [
+            // Command ingress.
             (ReactorSource::Commands, commands_ready),
+            // I/O progress.
             (ReactorSource::Cq, !io_terminal),
             (
                 ReactorSource::CompletionDispatch,
@@ -333,6 +335,7 @@ impl EngineReactor {
                 ReactorSource::IoDeadline,
                 !io_terminal && io_deadline_count != 0,
             ),
+            // Connection-management progress.
             (
                 ReactorSource::CmCancellation,
                 !terminal_failure && cm_software_snapshot.count(CmSoftwareClass::Cancellation) != 0,
@@ -359,6 +362,7 @@ impl EngineReactor {
                 ReactorSource::CmDestruction,
                 !terminal_failure && cm_destruction_count != 0,
             ),
+            // Session deadlines.
             (
                 ReactorSource::SessionDeadlineIngress,
                 !terminal_failure && session_deadline_count != 0,
@@ -367,6 +371,7 @@ impl EngineReactor {
                 ReactorSource::SessionDeadline,
                 !terminal_failure && session_due_count != 0,
             ),
+            // Graceful and failed shutdown.
             (
                 ReactorSource::ShutdownPendingOutbound,
                 shutdown_ready && shutdown_snapshot.count(CmShutdownClass::PendingOutbound) != 0,
@@ -391,6 +396,7 @@ impl EngineReactor {
                 ReactorSource::ShutdownConnections,
                 shutdown_ready && shutdown_connections_ready,
             ),
+            // I/O terminal scan.
             (ReactorSource::IoTerminal, io_terminal),
         ];
         let mut requires_repoll = false;
