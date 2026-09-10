@@ -261,7 +261,7 @@ impl IoConnection {
                         continue;
                     };
                     match commands.enqueue_protocol(&manager, command, permit) {
-                        Ok(()) => commands.publish_command_work(),
+                        Ok(()) => commands.notify_reactor(),
                         Err((error, command)) => {
                             command.reject_after_pending(error);
                         }
@@ -434,7 +434,7 @@ impl IoConnectionTestAdmission<'_> {
                         continue;
                     };
                     match commands.enqueue_protocol(&manager, command, permit) {
-                        Ok(()) => commands.publish_command_work(),
+                        Ok(()) => commands.notify_reactor(),
                         Err((error, command)) => {
                             command.reject_after_pending(error);
                         }

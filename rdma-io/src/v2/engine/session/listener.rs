@@ -216,7 +216,7 @@ pub(in crate::v2::engine) async fn listen(
     let request = Arc::new(ListenRequest::new(address, config));
     commands.enqueue_listen(Arc::clone(&request), permit);
     drop(admission);
-    commands.publish_command_work();
+    commands.notify_reactor();
     let waiter = ListenWaiter {
         frontend: Arc::downgrade(&frontend),
         commands: Arc::downgrade(&commands),
@@ -253,7 +253,7 @@ pub(in crate::v2::engine) async fn accept_with_setup(
     let request = Arc::new(AcceptRequest::new(AcceptIntent::new(config, setup), permit));
     commands.enqueue_accept(listener, Arc::clone(&request));
     drop(admission);
-    commands.publish_command_work();
+    commands.notify_reactor();
     let waiter = AcceptWaiter {
         commands: Arc::downgrade(&commands),
         listener,
@@ -465,7 +465,7 @@ impl Drop for ListenWaiter {
             return;
         }
         if let Some(frontend) = self.frontend.upgrade() {
-            frontend.publish_session_work();
+            frontend.notify_reactor();
         }
     }
 }

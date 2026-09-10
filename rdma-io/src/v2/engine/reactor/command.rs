@@ -8,7 +8,7 @@ use std::task::Poll;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use super::super::driver::{COMMAND_WORK, SESSION_WORK, WorkSignal};
+use super::super::driver::WorkSignal;
 use super::super::io::ProtocolCommand;
 use super::super::io_core::OperationCommand;
 use super::super::registry::{
@@ -255,8 +255,8 @@ impl CommandIngress {
             });
     }
 
-    pub(in crate::v2::engine) fn publish_command_work(&self) {
-        self.signal.publish(COMMAND_WORK);
+    pub(in crate::v2::engine) fn notify_reactor(&self) {
+        self.signal.notify_reactor();
     }
 
     pub(in crate::v2::engine) fn defer_setup_publication(
@@ -271,7 +271,7 @@ impl CommandIngress {
         lock_unpoison(&self.queues)
             .protocol
             .push_back(ProtocolQueueEntry::Publication(publication));
-        self.publish_command_work();
+        self.notify_reactor();
     }
 
     pub(in crate::v2::engine) fn cancel_connect(&self, target: &Arc<OutboundRequest>) -> bool {
@@ -332,7 +332,7 @@ impl CommandIngress {
             }
         };
         if inserted {
-            self.publish_command_work();
+            self.notify_reactor();
         }
     }
 
@@ -370,7 +370,7 @@ impl CommandIngress {
             }
         };
         if inserted {
-            self.publish_command_work();
+            self.notify_reactor();
         }
     }
 
@@ -482,7 +482,7 @@ impl CommandIngress {
             }
         };
         if inserted {
-            self.publish_command_work();
+            self.notify_reactor();
         }
     }
 
@@ -513,7 +513,7 @@ impl CommandIngress {
             }
         };
         if inserted {
-            self.publish_command_work();
+            self.notify_reactor();
         }
     }
 
@@ -521,7 +521,7 @@ impl CommandIngress {
         lock_unpoison(&self.controls)
             .connect_cancel
             .push_back(request);
-        self.publish_command_work();
+        self.notify_reactor();
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -529,7 +529,7 @@ impl CommandIngress {
         lock_unpoison(&self.controls)
             .connection_error
             .push_back(token);
-        self.publish_command_work();
+        self.notify_reactor();
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -537,7 +537,7 @@ impl CommandIngress {
         lock_unpoison(&self.controls)
             .connection_disconnect
             .push_back(token);
-        self.publish_command_work();
+        self.notify_reactor();
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -545,13 +545,13 @@ impl CommandIngress {
         lock_unpoison(&self.controls)
             .connection_fail_qp_destroy
             .push_back(token);
-        self.publish_command_work();
+        self.notify_reactor();
     }
 
     pub(in crate::v2::engine) fn request_shutdown(&self) {
         if !self.shutdown.swap(true, Ordering::AcqRel) {
             self.shutdown_command_pending.store(true, Ordering::Release);
-            self.signal.publish(COMMAND_WORK);
+            self.signal.notify_reactor();
         }
     }
 
@@ -965,11 +965,11 @@ impl CommandIngress {
         }
 
         if session_work {
-            self.signal.publish(SESSION_WORK);
+            self.signal.notify_reactor();
         }
         let has_more = self.has_runnable(session.cm.listener_slot_available());
         if has_more {
-            self.signal.publish(COMMAND_WORK);
+            self.signal.notify_reactor();
         }
         CommandTurn {
             session_work,
@@ -1570,7 +1570,8 @@ mod tests {
             assert_eq!(engine.shared.commands.available_listen_permits(), 1);
             if drop_driver {
                 assert_eq!(
-                    super::super::super::registry::lock_unpoison(&engine.shared.cm_diagnostics).1,
+                    super::super::super::registry::lock_unpoison(&engine.shared.diagnostics)
+                        .cm_retained_owners,
                     0,
                     "driver drop releases a resource-free occupied listener slot"
                 );

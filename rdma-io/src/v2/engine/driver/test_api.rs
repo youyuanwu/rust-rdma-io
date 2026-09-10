@@ -105,7 +105,7 @@ impl TestConnectionInstallRequest {
     }
 }
 
-use super::{EngineFrontendRoot, Error, IO_WORK, Result};
+use super::{EngineFrontendRoot, Error, Result};
 use crate::v2::engine::io_core::CqeReject;
 use crate::v2::engine::registry::{OperationToken, lock_unpoison};
 
@@ -542,7 +542,7 @@ impl TestEngineResources {
         shared
             .commands
             .enqueue_test_connection_install(Arc::clone(&request), permit);
-        shared.commands.publish_command_work();
+        shared.commands.notify_reactor();
         super::super::reactor::CommandIngress::yield_after_admission().await;
         request.wait().await
     }
@@ -593,7 +593,7 @@ impl TestEngineResources {
     pub fn inject_driver_failure(&self, error: Error) -> Result<()> {
         let shared = self.ensure_active()?;
         shared.test_driver.inject_failure(error)?;
-        shared.work_signal.publish(IO_WORK);
+        shared.work_signal.notify_reactor();
         Ok(())
     }
 
@@ -732,7 +732,7 @@ impl TestEngineResources {
         completion.inner.status = rdma_io_sys::ibverbs::IBV_WC_SUCCESS;
         completion.inner.opcode = raw_wc_opcode(opcode)?;
         shared.test_driver.queue_released_connection_cqe(completion);
-        shared.work_signal.publish(super::IO_WORK);
+        shared.work_signal.notify_reactor();
         Ok(())
     }
 
@@ -857,7 +857,7 @@ impl TestCqArmWindowControl {
     pub fn release(mut self, generation: u64) -> Result<()> {
         let shared = self.shared.upgrade().ok_or(Error::DriverShutdown)?;
         shared.test_driver.release_cq_arm(self.point, generation)?;
-        shared.work_signal.publish(0);
+        shared.work_signal.notify_reactor();
         self.active = false;
         Ok(())
     }
@@ -870,7 +870,7 @@ impl Drop for TestCqArmWindowControl {
         }
         if let Some(shared) = self.shared.upgrade() {
             shared.test_driver.stop_cq_arm_control(self.point);
-            shared.work_signal.publish(0);
+            shared.work_signal.notify_reactor();
         }
         self.active = false;
     }
@@ -911,7 +911,7 @@ impl TestConnectionCqeSuppression {
         shared
             .test_driver
             .release_connection_cqe(self.connection, self.qp_num)?;
-        shared.work_signal.publish(0);
+        shared.work_signal.notify_reactor();
         self.active = false;
         Ok(())
     }
@@ -1202,12 +1202,14 @@ impl TestDriverState {
     }
 
     fn instrumentation(&self, shared: &EngineFrontendRoot) -> TestEngineInstrumentation {
-        let connections = *lock_unpoison(&shared.connection_diagnostics);
-        let (cm_pending, cm_retained) = *lock_unpoison(&shared.cm_diagnostics);
+        let diagnostics = lock_unpoison(&shared.diagnostics).clone();
         let cqes_rejected = lock_unpoison(&shared.io_rejections).len() as u64;
         TestEngineInstrumentation {
-            cm_pending_routes: connections.live + cm_pending,
-            cm_retained_owners: connections.live.max(cm_retained),
+            cm_pending_routes: diagnostics.engine.live_connections + diagnostics.cm_pending_routes,
+            cm_retained_owners: diagnostics
+                .engine
+                .live_connections
+                .max(diagnostics.cm_retained_owners),
             cqes_rejected,
             cm_events_rejected: shared.cm_rejections.load(Ordering::Acquire),
         }
@@ -1623,7 +1625,7 @@ impl TestDriverState {
         }
         routes.insert(qp_num, Arc::clone(&route));
         drop(routes);
-        shared.work_signal.publish(IO_WORK);
+        shared.work_signal.notify_reactor();
         Ok(TestRouteHandle {
             shared: Arc::downgrade(shared),
             route,

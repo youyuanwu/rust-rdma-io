@@ -56,3 +56,33 @@ pub struct RdmaEngineDiagnostics {
     /// Complete connection ownership bundles retained fail-closed.
     pub quarantined_connections: usize,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct PublishedDiagnostics {
+    pub(super) engine: RdmaEngineDiagnostics,
+    pub(super) cm_pending_routes: usize,
+    pub(super) cm_retained_owners: usize,
+}
+
+impl PublishedDiagnostics {
+    pub(super) fn initial(cq_capacity: usize) -> Self {
+        Self {
+            engine: RdmaEngineDiagnostics {
+                lifecycle: RdmaEngineLifecycle::Created,
+                terminal_error: None,
+                live_connections: 0,
+                registered_operations: 0,
+                accepted_operations: 0,
+                pending_reclamations: 0,
+                available_cq_credits: cq_capacity,
+                retained_cq_credits: 0,
+                quarantined_operations: 0,
+                quarantined_mrs: 0,
+                quarantined_bytes: 0,
+                quarantined_connections: 0,
+            },
+            cm_pending_routes: 0,
+            cm_retained_owners: 0,
+        }
+    }
+}

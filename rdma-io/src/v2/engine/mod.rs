@@ -47,7 +47,7 @@ mod session;
 #[cfg(test)]
 mod api_tests;
 
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -55,6 +55,7 @@ use tokio::sync::Notify;
 
 use config::EngineConfig;
 pub use config::{CompletionMode, RdmaConnectionConfig};
+use diagnostics::PublishedDiagnostics;
 pub use diagnostics::{RdmaEngineDiagnostics, RdmaEngineLifecycle, RdmaEngineTerminalError};
 use driver::WorkSignal;
 #[cfg(any(test, feature = "test-hooks"))]
@@ -65,8 +66,8 @@ pub use driver::{
     TestEngineQp, TestEngineResources, TestProviderLimits, TestRouteHandle,
     TestSharedResourceIdentity,
 };
+use io_core::IoDriverSignal;
 pub use io_core::RdmaOperation;
-use io_core::{IoCoreDiagnostics, IoDriverSignal};
 use lifecycle::MemoizedTerminalResult;
 use reactor::{CommandIngress, EngineReactor};
 use registry::{lock_unpoison, write_unpoison};
@@ -447,7 +448,6 @@ pub struct RdmaEngineDriver {
 
 /// Resource-free lifecycle/result observation published by `EngineReactor`.
 struct EngineObserver {
-    lifecycle: AtomicU8,
     terminal_notify: Arc<Notify>,
     terminal: Mutex<Option<MemoizedTerminalResult>>,
 }
@@ -455,15 +455,9 @@ struct EngineObserver {
 impl EngineObserver {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            lifecycle: AtomicU8::new(lifecycle_to_u8(RdmaEngineLifecycle::Created)),
             terminal_notify: Arc::new(Notify::new()),
             terminal: Mutex::new(None),
         })
-    }
-
-    fn publish_lifecycle(&self, lifecycle: RdmaEngineLifecycle) {
-        self.lifecycle
-            .store(lifecycle_to_u8(lifecycle), Ordering::Release);
     }
 
     fn publish_terminal_into(
@@ -483,10 +477,6 @@ impl EngineObserver {
 
     fn outcome(&self) -> Option<MemoizedTerminalResult> {
         lock_unpoison(&self.terminal).clone()
-    }
-
-    fn lifecycle(&self) -> RdmaEngineLifecycle {
-        lifecycle_from_u8(self.lifecycle.load(Ordering::Acquire))
     }
 }
 
@@ -529,7 +519,7 @@ impl EngineControl {
             }
             drop(admission);
             if let Some(work_signal) = self.work_signal.upgrade() {
-                work_signal.publish(driver::IO_WORK | driver::SESSION_WORK);
+                work_signal.notify_reactor();
             }
         }
     }
@@ -538,9 +528,9 @@ impl EngineControl {
         lock_unpoison(&self.driver_failure).take()
     }
 
-    fn publish(&self, work: usize) {
+    fn notify_reactor(&self) {
         if let Some(work_signal) = self.work_signal.upgrade() {
-            work_signal.publish(work);
+            work_signal.notify_reactor();
         }
     }
 }
@@ -556,9 +546,7 @@ struct EngineFrontendRoot {
     // Runtime-state-free policy retained by the frontend composition root.
     // Provider ownership remains exclusively in EngineReactor.
     session: Arc<SessionFrontend>,
-    io_diagnostics: Mutex<IoCoreDiagnostics>,
-    connection_diagnostics: Mutex<session::connection::ConnectionStateCountSnapshot>,
-    cm_diagnostics: Mutex<(usize, usize)>,
+    diagnostics: Mutex<PublishedDiagnostics>,
     #[cfg(any(test, feature = "test-hooks"))]
     cm_rejections: std::sync::atomic::AtomicU64,
     #[cfg(any(test, feature = "test-hooks"))]
@@ -602,16 +590,8 @@ struct EngineIoDriverSignal {
 }
 
 impl IoDriverSignal for EngineIoDriverSignal {
-    fn publish_cq_recheck(&self) {
-        self.work_signal.publish(driver::IO_WORK);
-    }
-
-    fn publish_completion_dispatch(&self) {
-        self.work_signal.publish(driver::IO_WORK);
-    }
-
-    fn publish_reclamation(&self) {
-        self.work_signal.publish(driver::IO_WORK);
+    fn notify_reactor(&self) {
+        self.work_signal.notify_reactor();
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -663,20 +643,7 @@ impl EngineFrontendRoot {
             Self {
                 config,
                 session: session_frontend,
-                io_diagnostics: Mutex::new(IoCoreDiagnostics {
-                    registered_operations: 0,
-                    accepted_operations: 0,
-                    pending_reclamations: 0,
-                    available_cq_credits: initial_cq_credits,
-                    retained_cq_credits: 0,
-                    quarantined_operations: 0,
-                    quarantined_mrs: 0,
-                    quarantined_bytes: 0,
-                }),
-                connection_diagnostics: Mutex::new(
-                    session::connection::ConnectionStateCountSnapshot::default(),
-                ),
-                cm_diagnostics: Mutex::new((0, 0)),
+                diagnostics: Mutex::new(PublishedDiagnostics::initial(initial_cq_credits)),
                 #[cfg(any(test, feature = "test-hooks"))]
                 cm_rejections: std::sync::atomic::AtomicU64::new(0),
                 #[cfg(any(test, feature = "test-hooks"))]
@@ -718,12 +685,7 @@ impl EngineFrontendRoot {
     }
 
     fn start_shutdown_progress(&self) {
-        self.work_signal
-            .publish(driver::IO_WORK | driver::SESSION_WORK);
-    }
-
-    fn publish_lifecycle(&self, lifecycle: RdmaEngineLifecycle) {
-        self.observer.publish_lifecycle(lifecycle);
+        self.work_signal.notify_reactor();
     }
 
     fn publish_terminal_into(
@@ -752,10 +714,6 @@ impl EngineFrontendRoot {
         self.observer.outcome()
     }
 
-    fn lifecycle(&self) -> RdmaEngineLifecycle {
-        self.observer.lifecycle()
-    }
-
     fn admission_error(&self) -> Option<Error> {
         if let Some(outcome) = self.outcome() {
             return outcome.into_result().err();
@@ -764,39 +722,11 @@ impl EngineFrontendRoot {
     }
 
     fn diagnostics(&self) -> RdmaEngineDiagnostics {
-        let connection_counts = *lock_unpoison(&self.connection_diagnostics);
-        let io = *lock_unpoison(&self.io_diagnostics);
-        RdmaEngineDiagnostics {
-            lifecycle: self.lifecycle(),
-            terminal_error: self.outcome().and_then(|outcome| outcome.summary()),
-            live_connections: connection_counts
-                .live
-                .max(self.commands.connection_reservations()),
-            registered_operations: io.registered_operations,
-            accepted_operations: io.accepted_operations,
-            pending_reclamations: io.pending_reclamations,
-            available_cq_credits: io.available_cq_credits,
-            retained_cq_credits: io.retained_cq_credits,
-            quarantined_operations: io.quarantined_operations,
-            quarantined_mrs: io.quarantined_mrs,
-            quarantined_bytes: io.quarantined_bytes,
-            quarantined_connections: connection_counts.quarantined_bundles,
-        }
+        lock_unpoison(&self.diagnostics).engine.clone()
     }
 
-    fn update_io_diagnostics(&self, diagnostics: IoCoreDiagnostics) {
-        *lock_unpoison(&self.io_diagnostics) = diagnostics;
-    }
-
-    fn update_connection_diagnostics(
-        &self,
-        diagnostics: session::connection::ConnectionStateCountSnapshot,
-    ) {
-        *lock_unpoison(&self.connection_diagnostics) = diagnostics;
-    }
-
-    fn update_cm_diagnostics(&self, pending_routes: usize, retained_owners: usize) {
-        *lock_unpoison(&self.cm_diagnostics) = (pending_routes, retained_owners);
+    fn publish_diagnostics(&self, diagnostics: PublishedDiagnostics) {
+        *lock_unpoison(&self.diagnostics) = diagnostics;
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -817,26 +747,6 @@ fn preflight_tokio_io() -> Result<()> {
         ));
     }
     Ok(())
-}
-
-const fn lifecycle_to_u8(lifecycle: RdmaEngineLifecycle) -> u8 {
-    match lifecycle {
-        RdmaEngineLifecycle::Created => 0,
-        RdmaEngineLifecycle::Running => 1,
-        RdmaEngineLifecycle::ShutdownRequested => 2,
-        RdmaEngineLifecycle::Terminated => 3,
-        RdmaEngineLifecycle::Failed => 4,
-    }
-}
-
-const fn lifecycle_from_u8(value: u8) -> RdmaEngineLifecycle {
-    match value {
-        0 => RdmaEngineLifecycle::Created,
-        1 => RdmaEngineLifecycle::Running,
-        2 => RdmaEngineLifecycle::ShutdownRequested,
-        3 => RdmaEngineLifecycle::Terminated,
-        _ => RdmaEngineLifecycle::Failed,
-    }
 }
 
 #[cfg(test)]

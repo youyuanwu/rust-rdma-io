@@ -45,6 +45,87 @@ impl CountingWaker {
 }
 
 #[test]
+fn diagnostics_reads_one_coherent_published_snapshot() {
+    let (engine, driver) = test_engine_pair(CompletionMode::Polling);
+    let shared = Arc::clone(&engine.shared);
+    let running = diagnostics::PublishedDiagnostics {
+        engine: RdmaEngineDiagnostics {
+            lifecycle: RdmaEngineLifecycle::Running,
+            terminal_error: None,
+            live_connections: 1,
+            registered_operations: 1,
+            accepted_operations: 1,
+            pending_reclamations: 1,
+            available_cq_credits: 1,
+            retained_cq_credits: 1,
+            quarantined_operations: 1,
+            quarantined_mrs: 1,
+            quarantined_bytes: 1,
+            quarantined_connections: 1,
+        },
+        cm_pending_routes: 1,
+        cm_retained_owners: 1,
+    };
+    let failed = diagnostics::PublishedDiagnostics {
+        engine: RdmaEngineDiagnostics {
+            lifecycle: RdmaEngineLifecycle::Failed,
+            terminal_error: Some(RdmaEngineTerminalError {
+                class: "snapshot".into(),
+                message: "snapshot".into(),
+            }),
+            live_connections: 2,
+            registered_operations: 2,
+            accepted_operations: 2,
+            pending_reclamations: 2,
+            available_cq_credits: 2,
+            retained_cq_credits: 2,
+            quarantined_operations: 2,
+            quarantined_mrs: 2,
+            quarantined_bytes: 2,
+            quarantined_connections: 2,
+        },
+        cm_pending_routes: 2,
+        cm_retained_owners: 2,
+    };
+    shared.publish_diagnostics(running.clone());
+
+    let writer = std::thread::spawn(move || {
+        for index in 0..10_000 {
+            shared.publish_diagnostics(if index % 2 == 0 {
+                running.clone()
+            } else {
+                failed.clone()
+            });
+        }
+    });
+    for _ in 0..10_000 {
+        let snapshot = engine.diagnostics();
+        let marker = snapshot.live_connections;
+        assert!(marker == 1 || marker == 2);
+        assert_eq!(snapshot.registered_operations, marker);
+        assert_eq!(snapshot.accepted_operations, marker);
+        assert_eq!(snapshot.pending_reclamations, marker);
+        assert_eq!(snapshot.available_cq_credits, marker);
+        assert_eq!(snapshot.retained_cq_credits, marker);
+        assert_eq!(snapshot.quarantined_operations, marker);
+        assert_eq!(snapshot.quarantined_mrs, marker);
+        assert_eq!(snapshot.quarantined_bytes, marker);
+        assert_eq!(snapshot.quarantined_connections, marker);
+        assert_eq!(
+            snapshot.lifecycle,
+            if marker == 1 {
+                RdmaEngineLifecycle::Running
+            } else {
+                RdmaEngineLifecycle::Failed
+            }
+        );
+        assert_eq!(snapshot.terminal_error.is_some(), marker == 2);
+    }
+    writer.join().unwrap();
+    drop(driver);
+}
+
+#[test]
 fn engine_failure_preserves_explicit_cq_debt() {
     let failure = lifecycle::MemoizedTerminalResult::from_error(Error::EngineWedged {
         retained_bundles: 2,
@@ -231,8 +312,10 @@ async fn shutdown_accounts_for_ingress_and_backend_connect_listen_commands() {
         panic!(
             "shutdown command accounting matrix did not terminate: diagnostics={:?}, pending_routes={}, pending_connects={}, pending_listens={}, driver_finished={}",
             engine.diagnostics(),
-            lock_unpoison(&engine.shared.connection_diagnostics).live
-                + lock_unpoison(&engine.shared.cm_diagnostics).0,
+            {
+                let diagnostics = lock_unpoison(&engine.shared.diagnostics);
+                diagnostics.engine.live_connections + diagnostics.cm_pending_routes
+            },
             engine.shared.commands.pending_connects(),
             engine.shared.commands.pending_listens(),
             driver_task.is_finished(),

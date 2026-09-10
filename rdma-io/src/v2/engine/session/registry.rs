@@ -611,6 +611,7 @@ impl ConnectionRegistry {
         snapshot
     }
 
+    #[cfg(test)]
     pub(in crate::v2::engine) fn admission_snapshot_excluding_retained(
         &self,
     ) -> ConnectionStateCountSnapshot {

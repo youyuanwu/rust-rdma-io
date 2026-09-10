@@ -390,9 +390,7 @@ mod tests {
     struct NoopSignal;
 
     impl IoDriverSignal for NoopSignal {
-        fn publish_cq_recheck(&self) {}
-        fn publish_completion_dispatch(&self) {}
-        fn publish_reclamation(&self) {}
+        fn notify_reactor(&self) {}
         fn pause_operation_before_register(&self) {}
     }
 

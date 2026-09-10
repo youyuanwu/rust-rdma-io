@@ -78,7 +78,7 @@ impl SessionManager {
         let admission = read_unpoison(&self.frontend.admission);
         let first = connections.begin_close(token);
         let mut close_effects = None;
-        let mut publish_io_work = false;
+        let mut notify_reactor = false;
         if first {
             match self.transition_connection_to_error(connections, token) {
                 Ok(_) => {}
@@ -99,7 +99,7 @@ impl SessionManager {
                 }
             }
 
-            publish_io_work = true;
+            notify_reactor = true;
 
             let engine_is_terminating = self.shutdown_requested();
             if !engine_is_terminating {
@@ -111,8 +111,8 @@ impl SessionManager {
             }
         }
         drop(admission);
-        if publish_io_work {
-            self.publish_io_work();
+        if notify_reactor {
+            self.notify_reactor();
         }
         if let Some(effects) = close_effects {
             effects.publish();
@@ -148,7 +148,7 @@ impl SessionManager {
         let admission = read_unpoison(&self.frontend.admission);
         let first = connections.begin_close(token);
         let mut close_publication_remaining = false;
-        let mut publish_io_work = false;
+        let mut notify_reactor = false;
         if first {
             match self.transition_connection_to_error(connections, token) {
                 Ok(_) => {}
@@ -168,15 +168,15 @@ impl SessionManager {
                     return;
                 }
             }
-            publish_io_work = true;
+            notify_reactor = true;
             if !self.shutdown_requested() {
                 close_publication_remaining =
                     !self.scan_close_observers_into(io_core, connections, token, 2, actions);
             }
         }
         drop(admission);
-        if publish_io_work {
-            self.publish_io_work();
+        if notify_reactor {
+            self.notify_reactor();
         }
         if first {
             if close_publication_remaining {
@@ -216,7 +216,7 @@ impl SessionManager {
         if !connections.request_retirement(token) {
             return;
         }
-        self.publish_session_work();
+        self.notify_reactor();
     }
 
     fn schedule_connection_drain(

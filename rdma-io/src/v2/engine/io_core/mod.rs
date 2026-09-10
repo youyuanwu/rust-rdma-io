@@ -28,9 +28,7 @@ pub(super) use progress::IoReactorSources;
 
 /// Restricted publication surface from the I/O core to the explicit driver.
 pub(super) trait IoDriverSignal: Send + Sync {
-    fn publish_cq_recheck(&self);
-    fn publish_completion_dispatch(&self);
-    fn publish_reclamation(&self);
+    fn notify_reactor(&self);
     #[cfg(any(test, feature = "test-hooks"))]
     fn pause_operation_before_register(&self);
 }
@@ -308,21 +306,13 @@ impl IoState {
         self.admission_error = error;
     }
 
-    fn publish_cq_recheck(&self) {
-        self.driver_signal.publish_cq_recheck();
-    }
-
-    pub(super) fn publish_completion_dispatch(&self) {
-        self.driver_signal.publish_completion_dispatch();
-    }
-
-    fn publish_reclamation(&self) {
-        self.driver_signal.publish_reclamation();
+    fn notify_reactor(&self) {
+        self.driver_signal.notify_reactor();
     }
 
     fn publish_io_if_drained(&self, previous: usize) {
         if previous == 1 && self.shutdown_requested {
-            self.driver_signal.publish_completion_dispatch();
+            self.driver_signal.notify_reactor();
         }
     }
 
@@ -337,7 +327,7 @@ impl IoState {
         let at = now.checked_add(self.missing_cqe_deadline).unwrap_or(now);
         self.reclamation_requests
             .push_back(IoDeadlineRequest { at, token });
-        self.publish_reclamation();
+        self.notify_reactor();
     }
 
     pub(in crate::v2::engine) fn cancel_operation(&mut self, token: OperationToken) {
@@ -408,7 +398,7 @@ impl IoState {
         if self.published_completion_set.insert(token) {
             self.published_completion_connections.push_back(token);
         }
-        self.publish_completion_dispatch();
+        self.notify_reactor();
     }
 
     pub(super) fn take_published_connection(&mut self) -> Option<ConnectionToken> {
@@ -679,15 +669,7 @@ mod tests {
     }
 
     impl IoDriverSignal for RecordingSignal {
-        fn publish_cq_recheck(&self) {
-            self.io_publications.fetch_add(1, Ordering::AcqRel);
-        }
-
-        fn publish_completion_dispatch(&self) {
-            self.io_publications.fetch_add(1, Ordering::AcqRel);
-        }
-
-        fn publish_reclamation(&self) {
+        fn notify_reactor(&self) {
             self.io_publications.fetch_add(1, Ordering::AcqRel);
         }
 

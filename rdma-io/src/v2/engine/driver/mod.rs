@@ -34,9 +34,6 @@ use crate::v2::runtime::preflight_driver_runtime;
 /// Source-specific owner bits are intentionally gone: each external poll
 /// takes one finite ready-at-entry pass over the reactor source set.
 pub(super) const REACTOR_WORK: usize = 1;
-pub(super) const IO_WORK: usize = REACTOR_WORK;
-pub(super) const SESSION_WORK: usize = REACTOR_WORK;
-pub(super) const COMMAND_WORK: usize = REACTOR_WORK;
 
 #[cfg(test)]
 fn earliest_deadline(
@@ -66,9 +63,9 @@ impl WorkSignal {
         }
     }
 
-    pub(super) fn publish(&self, work: usize) {
+    pub(super) fn notify_reactor(&self) {
         self.pending
-            .fetch_or(work, std::sync::atomic::Ordering::Release);
+            .fetch_or(REACTOR_WORK, std::sync::atomic::Ordering::Release);
         self.epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         self.waker.wake();
     }

@@ -59,7 +59,7 @@ pub(in crate::v2::engine) async fn connect_with_setup(
     shared.pause_connect_before_enqueue();
     commands.enqueue_connect(Arc::clone(&request), permit);
     drop(admission);
-    commands.publish_command_work();
+    commands.notify_reactor();
     let waiter = ConnectWaiter {
         commands: Arc::downgrade(&commands),
         request: Arc::downgrade(&request),
@@ -313,7 +313,7 @@ pub(super) fn handle_event(
         || !connections.outbound_is_establishing(token)
     {
         connections.finish_outbound_setup();
-        shared.publish_session_work();
+        shared.notify_reactor();
     }
     Ok(disposition)
 }

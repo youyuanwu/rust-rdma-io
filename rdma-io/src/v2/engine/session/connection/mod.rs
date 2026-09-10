@@ -1141,6 +1141,7 @@ impl ConnectionDiagnosticsGauge {
         lock_unpoison(&self.counts).all
     }
 
+    #[cfg(test)]
     pub(in crate::v2::engine) fn snapshot_excluding_retained(
         &self,
     ) -> ConnectionStateCountSnapshot {

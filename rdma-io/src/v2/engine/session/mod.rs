@@ -279,9 +279,9 @@ impl SessionFrontend {
         self.provider
     }
 
-    pub(super) fn publish_session_work(&self) {
+    pub(super) fn notify_reactor(&self) {
         if let Some(work_signal) = self.work_signal.get().and_then(Weak::upgrade) {
-            work_signal.publish(super::driver::SESSION_WORK);
+            work_signal.notify_reactor();
         }
     }
 
@@ -466,15 +466,9 @@ impl SessionManager {
         }
     }
 
-    pub(super) fn publish_io_work(&self) {
+    pub(super) fn notify_reactor(&self) {
         if let Some(control) = self.control.upgrade() {
-            control.publish(super::driver::IO_WORK);
-        }
-    }
-
-    pub(super) fn publish_session_work(&self) {
-        if let Some(control) = self.control.upgrade() {
-            control.publish(super::driver::SESSION_WORK);
+            control.notify_reactor();
         }
     }
 
