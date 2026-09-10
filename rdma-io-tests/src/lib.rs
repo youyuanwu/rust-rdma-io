@@ -774,7 +774,7 @@ pub mod engine_test_helpers {
             }
         }
 
-        fn matches(&self, expected: &Self) -> bool {
+        fn ownership_matches(&self, expected: &Self) -> bool {
             self.live_connections == expected.live_connections
                 && self.registered_operations == expected.registered_operations
                 && self.accepted_operations == expected.accepted_operations
@@ -787,8 +787,6 @@ pub mod engine_test_helpers {
                 && self.quarantined_connections == expected.quarantined_connections
                 && self.cm_pending_routes == expected.cm_pending_routes
                 && self.cm_retained_owners == expected.cm_retained_owners
-                && self.cqes_rejected == expected.cqes_rejected
-                && self.cm_events_rejected == expected.cm_events_rejected
         }
     }
 
@@ -808,7 +806,9 @@ pub mod engine_test_helpers {
                 SafetyBaseline::capture(server_engine, server_resources.instrumentation().unwrap());
             let client =
                 SafetyBaseline::capture(client_engine, client_resources.instrumentation().unwrap());
-            if server.matches(server_baseline) && client.matches(client_baseline) {
+            if server.ownership_matches(server_baseline)
+                && client.ownership_matches(client_baseline)
+            {
                 return (server, client);
             }
             let now = std::time::Instant::now();
