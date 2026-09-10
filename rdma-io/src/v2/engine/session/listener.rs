@@ -377,11 +377,7 @@ impl IncomingChild {
 pub(in crate::v2::engine) struct ListenRequest {
     pub(in crate::v2::engine) address: SocketAddr,
     pub(in crate::v2::engine) config: RdmaListenerConfig,
-    observer: Arc<ListenRequestObserver>,
-}
-
-struct ListenRequestObserver {
-    completion: CommandCompletion<RdmaListener>,
+    observer: Arc<CommandCompletion<RdmaListener>>,
 }
 
 impl ListenRequest {
@@ -389,19 +385,17 @@ impl ListenRequest {
         Self {
             address,
             config,
-            observer: Arc::new(ListenRequestObserver {
-                completion: CommandCompletion::new(),
-            }),
+            observer: Arc::new(CommandCompletion::new()),
         }
     }
 
     pub(in crate::v2::engine) fn is_cancelled(&self) -> bool {
-        self.observer.completion.is_cancelled()
+        self.observer.is_cancelled()
     }
 
     #[cfg(test)]
     pub(in crate::v2::engine) fn complete(&self, result: Result<RdmaListener>) {
-        self.observer.completion.complete_listener(result);
+        self.observer.complete(result);
     }
 
     pub(in crate::v2::engine) fn complete_into(
@@ -409,19 +403,7 @@ impl ListenRequest {
         result: Result<RdmaListener>,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) {
-        self.observer
-            .completion
-            .complete_into(result, true, actions);
-    }
-}
-
-impl ListenRequestObserver {
-    fn take_result(&self) -> Option<Result<RdmaListener>> {
-        self.completion.take_result()
-    }
-
-    fn cancel(&self) {
-        drop(self.completion.cancel(Error::DriverShutdown));
+        self.observer.complete_into(result, true, actions);
     }
 }
 
@@ -429,7 +411,7 @@ struct ListenWaiter {
     frontend: Weak<SessionFrontend>,
     commands: Weak<CommandIngress>,
     request: Weak<ListenRequest>,
-    observer: Arc<ListenRequestObserver>,
+    observer: Arc<CommandCompletion<RdmaListener>>,
     finished: bool,
 }
 
@@ -441,7 +423,7 @@ impl Future for ListenWaiter {
             self.finished = true;
             return Poll::Ready(result);
         }
-        self.observer.completion.register(cx.waker());
+        self.observer.register(cx.waker());
         if let Some(result) = self.observer.take_result() {
             self.finished = true;
             return Poll::Ready(result);
@@ -455,7 +437,7 @@ impl Drop for ListenWaiter {
         if self.finished {
             return;
         }
-        self.observer.cancel();
+        drop(self.observer.cancel(Error::DriverShutdown));
         let Some(request) = self.request.upgrade() else {
             return;
         };
@@ -477,6 +459,10 @@ pub(in crate::v2::engine) struct AcceptRequest {
     permit: Mutex<Option<OwnedSemaphorePermit>>,
 }
 
+/// Accept completion retains cancellation and delivery ownership separately.
+///
+/// A selected connection and backlog permit remain owned until delivery,
+/// rejection, or explicit close disposition resolves the accept.
 struct AcceptRequestObserver {
     result: Mutex<TakeOnceResult<RdmaConnection>>,
     cancelled: AtomicBool,

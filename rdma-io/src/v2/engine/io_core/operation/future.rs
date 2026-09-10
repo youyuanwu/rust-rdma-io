@@ -393,6 +393,10 @@ impl OperationCommand {
     }
 }
 
+/// Frontend completion paired with the token installed after provider commit.
+///
+/// A dropped future uses the token only when ingress removal loses, preserving
+/// backend cancellation without releasing MR or CQ-credit ownership early.
 struct OperationCommandCompletion {
     observer: Arc<OperationObserver>,
     in_flight: Mutex<Option<OperationToken>>,

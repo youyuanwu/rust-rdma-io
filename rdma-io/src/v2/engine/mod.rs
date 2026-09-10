@@ -446,7 +446,10 @@ pub struct RdmaEngineDriver {
     runtime_checked: bool,
 }
 
-/// Resource-free lifecycle/result observation published by `EngineReactor`.
+/// Resource-free first-terminal-wins observation published by `EngineReactor`.
+///
+/// This remains distinct from command completion because shutdown waiters
+/// repeatedly observe one memoized engine-wide outcome through `Notify`.
 struct EngineObserver {
     terminal_notify: Arc<Notify>,
     terminal: Mutex<Option<MemoizedTerminalResult>>,

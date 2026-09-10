@@ -59,6 +59,10 @@ pub(super) struct QpDestructionProof {
 }
 
 /// Resource-free close observation shared with connection frontends.
+///
+/// Quarantine is immediately observable, ordinary close waits for retirement,
+/// and an engine-terminal outcome is the fallback until either local state
+/// becomes authoritative. Repeated close calls share this one state.
 pub(super) struct SessionCloseState {
     pub(super) outcome: Mutex<Option<super::lifecycle::MemoizedTerminalResult>>,
     engine_terminal: Mutex<Option<super::lifecycle::MemoizedTerminalResult>>,
@@ -127,6 +131,9 @@ impl SessionCloseState {
 }
 
 /// Resource-free close observation for an engine-owned listener.
+///
+/// The first close result wins, while the independent frontend clone count
+/// makes only the last listener handle request backend close.
 pub(super) struct SessionListenerCloseState {
     outcome: Mutex<Option<super::lifecycle::MemoizedTerminalResult>>,
     notify: tokio::sync::Notify,

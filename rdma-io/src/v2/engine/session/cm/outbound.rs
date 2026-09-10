@@ -995,6 +995,10 @@ pub(in crate::v2::engine) struct OutboundRequest {
     pub(super) route_token: AtomicU64,
 }
 
+/// Connect completion plus delivery acknowledgement.
+///
+/// The delivered bit determines whether cancellation/route retirement must
+/// close an established but still frontend-unowned connection.
 pub(super) struct OutboundRequestObserver {
     completion: CommandCompletion<RdmaConnection>,
     pub(super) delivered: AtomicBool,
