@@ -74,7 +74,7 @@ use registry::{lock_unpoison, write_unpoison};
 use resources::EngineReactorResources;
 pub use session::connection::{RdmaConnection, RdmaConnectionIdentity};
 pub use session::listener::{RdmaListener, RdmaListenerConfig};
-use session::{SessionContext, SessionFrontend};
+use session::{SessionContext, SessionFrontend, SessionFrontendLinks};
 
 use super::error::{Error, Result};
 
@@ -629,6 +629,7 @@ impl EngineFrontendRoot {
         let observer = EngineObserver::new();
         let control =
             EngineControl::new(Arc::clone(&admission), &commands, &observer, &work_signal);
+        let session_links = SessionFrontendLinks::new(&control, &commands, &observer, &work_signal);
         #[cfg(any(test, feature = "test-hooks"))]
         let test_driver = Arc::new(driver::test_api::TestDriverState::new());
         let session = SessionContext::new(
@@ -636,10 +637,7 @@ impl EngineFrontendRoot {
             provider,
             Arc::clone(&admission),
             memory,
-            Arc::downgrade(&control),
-            &commands,
-            &observer,
-            &work_signal,
+            session_links,
             #[cfg(any(test, feature = "test-hooks"))]
             SessionTestInstrumentation {
                 driver: Arc::clone(&test_driver),

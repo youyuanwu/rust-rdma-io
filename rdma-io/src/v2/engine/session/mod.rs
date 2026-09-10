@@ -201,23 +201,44 @@ pub(super) struct SessionFrontend {
     test_instrumentation: SessionTestInstrumentation,
 }
 
+pub(super) struct SessionFrontendLinks {
+    control: Weak<EngineControl>,
+    commands: Weak<CommandIngress>,
+    observer: Weak<EngineObserver>,
+    work_signal: Weak<super::driver::WorkSignal>,
+}
+
+impl SessionFrontendLinks {
+    pub(super) fn new(
+        control: &Arc<EngineControl>,
+        commands: &Arc<CommandIngress>,
+        observer: &Arc<EngineObserver>,
+        work_signal: &Arc<super::driver::WorkSignal>,
+    ) -> Self {
+        Self {
+            control: Arc::downgrade(control),
+            commands: Arc::downgrade(commands),
+            observer: Arc::downgrade(observer),
+            work_signal: Arc::downgrade(work_signal),
+        }
+    }
+}
+
 impl SessionFrontend {
     fn new(
         config: SessionConfig,
         provider: Option<ProviderLimits>,
         admission: Arc<RwLock<()>>,
         memory: MemoryRegistrar,
-        commands: &Arc<CommandIngress>,
-        observer: &Arc<EngineObserver>,
-        work_signal: &Arc<super::driver::WorkSignal>,
+        links: &SessionFrontendLinks,
         #[cfg(any(test, feature = "test-hooks"))] test_instrumentation: SessionTestInstrumentation,
     ) -> Arc<Self> {
         Arc::new_cyclic(|self_ref| Self {
             admission,
             self_ref: self_ref.clone(),
-            commands: Arc::downgrade(commands),
-            observer: Arc::downgrade(observer),
-            work_signal: Arc::downgrade(work_signal),
+            commands: links.commands.clone(),
+            observer: links.observer.clone(),
+            work_signal: links.work_signal.clone(),
             config,
             provider,
             memory,
@@ -377,10 +398,7 @@ impl SessionContext {
         provider: Option<ProviderLimits>,
         admission: Arc<RwLock<()>>,
         memory: MemoryRegistrar,
-        control: Weak<EngineControl>,
-        commands: &Arc<CommandIngress>,
-        observer: &Arc<EngineObserver>,
-        work_signal: &Arc<super::driver::WorkSignal>,
+        links: SessionFrontendLinks,
         #[cfg(any(test, feature = "test-hooks"))] test_instrumentation: SessionTestInstrumentation,
     ) -> Result<Self> {
         let frontend = SessionFrontend::new(
@@ -388,15 +406,13 @@ impl SessionContext {
             provider,
             Arc::clone(&admission),
             memory,
-            commands,
-            observer,
-            work_signal,
+            &links,
             #[cfg(any(test, feature = "test-hooks"))]
             test_instrumentation.clone(),
         );
         Ok(Self::from_frontend(
             frontend,
-            control,
+            links.control,
             #[cfg(any(test, feature = "test-hooks"))]
             test_instrumentation,
         ))
