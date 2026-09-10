@@ -14,9 +14,7 @@ mod validation;
 pub(super) use accounting::{CqCreditPool, OperationRegistry};
 pub(in crate::v2::engine) use batch::{post_io_recv_batch_into, post_io_send_into};
 pub(in crate::v2::engine) use completion::CqeReject;
-pub(in crate::v2::engine) use effects::{
-    AfterEngineUnlock, IoCoreEffects, OperationQuarantineEffect,
-};
+pub(in crate::v2::engine) use effects::{AfterEngineUnlock, IoCoreEffects};
 pub use future::RdmaOperation;
 pub(in crate::v2::engine) use state::OperationObserver;
 #[cfg(test)]
