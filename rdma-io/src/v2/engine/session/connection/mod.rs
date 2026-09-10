@@ -295,16 +295,8 @@ impl RdmaConnection {
                 uses_engine_resources: state.poster.uses_engine_resources(),
             }),
             memory: frontend.memory_registrar(),
-            commands: frontend
-                .commands
-                .get()
-                .expect("SessionFrontend command ingress is bound before use")
-                .clone(),
-            session_frontend: frontend
-                .self_ref
-                .get()
-                .expect("SessionFrontend self reference is bound before use")
-                .clone(),
+            commands: frontend.commands.clone(),
+            session_frontend: frontend.self_ref.clone(),
             close: state.close_state(),
             frontend: Arc::clone(&state.frontend),
             local_addr,

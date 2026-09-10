@@ -629,14 +629,14 @@ impl EngineFrontendRoot {
             Arc::clone(&admission),
             memory,
             Arc::downgrade(&control),
+            &commands,
+            &observer,
+            &work_signal,
             #[cfg(any(test, feature = "test-hooks"))]
             SessionTestInstrumentation {
                 driver: Arc::clone(&test_driver),
             },
         )?;
-        session.bind_self();
-        session.bind_commands(&commands);
-        session.bind_engine(&observer, &work_signal);
         let session_frontend = session.frontend();
         let initial_cq_credits = config.cq_capacity;
         Ok((

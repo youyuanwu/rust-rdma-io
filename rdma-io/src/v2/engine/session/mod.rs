@@ -9,7 +9,7 @@
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 pub(in crate::v2::engine) use self::cm::{
     CmShutdownClass, CmShutdownSnapshot, CmSoftwareClass, CmSoftwareSnapshot,
@@ -180,10 +180,10 @@ impl SessionListenerCloseState {
 /// observation.
 pub(super) struct SessionFrontend {
     pub(super) admission: Arc<RwLock<()>>,
-    self_ref: OnceLock<Weak<SessionFrontend>>,
-    commands: OnceLock<Weak<CommandIngress>>,
-    observer: OnceLock<Weak<EngineObserver>>,
-    work_signal: OnceLock<Weak<super::driver::WorkSignal>>,
+    pub(super) self_ref: Weak<SessionFrontend>,
+    pub(super) commands: Weak<CommandIngress>,
+    observer: Weak<EngineObserver>,
+    work_signal: Weak<super::driver::WorkSignal>,
     config: SessionConfig,
     provider: Option<ProviderLimits>,
     memory: MemoryRegistrar,
@@ -197,14 +197,17 @@ impl SessionFrontend {
         provider: Option<ProviderLimits>,
         admission: Arc<RwLock<()>>,
         memory: MemoryRegistrar,
+        commands: &Arc<CommandIngress>,
+        observer: &Arc<EngineObserver>,
+        work_signal: &Arc<super::driver::WorkSignal>,
         #[cfg(any(test, feature = "test-hooks"))] test_instrumentation: SessionTestInstrumentation,
     ) -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new_cyclic(|self_ref| Self {
             admission,
-            self_ref: OnceLock::new(),
-            commands: OnceLock::new(),
-            observer: OnceLock::new(),
-            work_signal: OnceLock::new(),
+            self_ref: self_ref.clone(),
+            commands: Arc::downgrade(commands),
+            observer: Arc::downgrade(observer),
+            work_signal: Arc::downgrade(work_signal),
             config,
             provider,
             memory,
@@ -213,47 +216,20 @@ impl SessionFrontend {
         })
     }
 
-    fn bind_self(self: &Arc<Self>) {
-        self.self_ref
-            .set(Arc::downgrade(self))
-            .unwrap_or_else(|_| panic!("SessionFrontend self reference is bound exactly once"));
-    }
-
-    fn bind_commands(&self, commands: &Arc<CommandIngress>) {
-        self.commands
-            .set(Arc::downgrade(commands))
-            .unwrap_or_else(|_| panic!("SessionFrontend command ingress is bound exactly once"));
-    }
-
-    fn bind_engine(
-        &self,
-        observer: &Arc<EngineObserver>,
-        work_signal: &Arc<super::driver::WorkSignal>,
-    ) {
-        if self.observer.set(Arc::downgrade(observer)).is_err()
-            || self.work_signal.set(Arc::downgrade(work_signal)).is_err()
-        {
-            panic!("SessionFrontend is bound to exactly one engine observer and work signal");
-        }
-    }
-
     pub(super) fn admission_error(&self) -> Option<Error> {
         if let Some(outcome) = self
             .observer
-            .get()
-            .and_then(Weak::upgrade)
+            .upgrade()
             .and_then(|observer| observer.outcome())
         {
             return outcome.into_result().err();
         }
         self.commands
-            .get()
-            .and_then(Weak::upgrade)
+            .upgrade()
             .and_then(|commands| commands.admission_error())
             .or_else(|| {
                 self.commands
-                    .get()
-                    .and_then(Weak::upgrade)
+                    .upgrade()
                     .is_none()
                     .then_some(Error::DriverShutdown)
             })
@@ -261,8 +237,7 @@ impl SessionFrontend {
 
     pub(super) fn engine_outcome(&self) -> Option<super::lifecycle::MemoizedTerminalResult> {
         self.observer
-            .get()
-            .and_then(Weak::upgrade)
+            .upgrade()
             .and_then(|observer| observer.outcome())
     }
 
@@ -280,7 +255,7 @@ impl SessionFrontend {
     }
 
     pub(super) fn notify_reactor(&self) {
-        if let Some(work_signal) = self.work_signal.get().and_then(Weak::upgrade) {
+        if let Some(work_signal) = self.work_signal.upgrade() {
             work_signal.notify_reactor();
         }
     }
@@ -385,6 +360,9 @@ impl SessionManager {
         admission: Arc<RwLock<()>>,
         memory: MemoryRegistrar,
         control: Weak<EngineControl>,
+        commands: &Arc<CommandIngress>,
+        observer: &Arc<EngineObserver>,
+        work_signal: &Arc<super::driver::WorkSignal>,
         #[cfg(any(test, feature = "test-hooks"))] test_instrumentation: SessionTestInstrumentation,
     ) -> Result<Self> {
         let frontend = SessionFrontend::new(
@@ -392,6 +370,9 @@ impl SessionManager {
             provider,
             Arc::clone(&admission),
             memory,
+            commands,
+            observer,
+            work_signal,
             #[cfg(any(test, feature = "test-hooks"))]
             test_instrumentation.clone(),
         );
@@ -420,22 +401,6 @@ impl SessionManager {
         }
     }
 
-    pub(super) fn bind_self(&self) {
-        self.frontend.bind_self();
-    }
-
-    pub(super) fn bind_commands(&self, commands: &Arc<CommandIngress>) {
-        self.frontend.bind_commands(commands);
-    }
-
-    pub(super) fn bind_engine(
-        &self,
-        observer: &Arc<EngineObserver>,
-        work_signal: &Arc<super::driver::WorkSignal>,
-    ) {
-        self.frontend.bind_engine(observer, work_signal);
-    }
-
     pub(super) fn frontend(&self) -> Arc<SessionFrontend> {
         Arc::clone(&self.frontend)
     }
@@ -455,8 +420,7 @@ impl SessionManager {
     pub(super) fn shutdown_requested(&self) -> bool {
         self.frontend
             .commands
-            .get()
-            .and_then(Weak::upgrade)
+            .upgrade()
             .is_none_or(|commands| commands.is_closed())
     }
 
@@ -501,18 +465,8 @@ impl SessionManager {
         let admission = listener.admission();
         debug_assert_eq!(admission.token(), listener.token);
         SessionListener {
-            frontend: self
-                .frontend
-                .self_ref
-                .get()
-                .expect("SessionFrontend self reference is bound before use")
-                .clone(),
-            commands: self
-                .frontend
-                .commands
-                .get()
-                .expect("SessionFrontend command ingress is bound before use")
-                .clone(),
+            frontend: self.frontend.self_ref.clone(),
+            commands: self.frontend.commands.clone(),
             token: listener.token,
             admission,
             close: listener.close_state(),
