@@ -2,7 +2,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::future::poll_fn;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
@@ -85,6 +85,22 @@ pub(in crate::v2::engine) struct ConnectAdmission {
     reservation: ConnectionReservation,
 }
 
+/// Frontend-owned protocol payload waiting to acquire operation-lane permits.
+///
+/// All message connections share this counter, so commands that have not yet
+/// acquired semaphore permits cannot retain more than one operation lane's
+/// configured capacity in aggregate.
+pub(in crate::v2::engine) struct ProtocolPayloadReservation {
+    pending: Arc<AtomicUsize>,
+    operations: usize,
+}
+
+impl Drop for ProtocolPayloadReservation {
+    fn drop(&mut self) {
+        self.pending.fetch_sub(self.operations, Ordering::AcqRel);
+    }
+}
+
 /// Cloneable, resource-free frontend admission endpoint.
 ///
 /// Connect and listen permits bound only commands waiting for the driver.
@@ -96,6 +112,7 @@ pub(in crate::v2::engine) struct CommandIngress {
     listen_permits: Arc<Semaphore>,
     operation_permits: Arc<Semaphore>,
     operation_capacity: usize,
+    pending_protocol_operations: Arc<AtomicUsize>,
     queues: Mutex<CommandQueues>,
     controls: Mutex<ControlQueue>,
     shutdown: AtomicBool,
@@ -119,6 +136,7 @@ impl CommandIngress {
             listen_permits: Arc::new(Semaphore::new(connection_capacity)),
             operation_permits: Arc::new(Semaphore::new(operation_capacity)),
             operation_capacity,
+            pending_protocol_operations: Arc::new(AtomicUsize::new(0)),
             queues: Mutex::new(CommandQueues::default()),
             controls: Mutex::new(ControlQueue::default()),
             shutdown: AtomicBool::new(false),
@@ -239,6 +257,21 @@ impl CommandIngress {
 
     pub(in crate::v2::engine) fn publish_command_work(&self) {
         self.signal.publish(COMMAND_WORK);
+    }
+
+    pub(in crate::v2::engine) fn defer_setup_publication(
+        &self,
+        mut publication: super::DeferredProtocolActions,
+        actions: &mut super::ReactorActions,
+    ) {
+        publication.append_bounded_to(actions);
+        if publication.is_empty() {
+            return;
+        }
+        lock_unpoison(&self.queues)
+            .protocol
+            .push_back(ProtocolQueueEntry::Publication(publication));
+        self.publish_command_work();
     }
 
     pub(in crate::v2::engine) fn cancel_connect(&self, target: &Arc<OutboundRequest>) -> bool {
@@ -397,8 +430,22 @@ impl CommandIngress {
         Ok(count)
     }
 
-    pub(in crate::v2::engine) fn operation_capacity(&self) -> usize {
-        self.operation_capacity
+    pub(in crate::v2::engine) fn reserve_protocol_payload(
+        &self,
+        operations: usize,
+    ) -> Result<ProtocolPayloadReservation, Error> {
+        self.validate_operation_batch(operations)?;
+        self.pending_protocol_operations
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                pending
+                    .checked_add(operations)
+                    .filter(|next| *next <= self.operation_capacity)
+            })
+            .map_err(|_| Error::CapacityExhausted)?;
+        Ok(ProtocolPayloadReservation {
+            pending: Arc::clone(&self.pending_protocol_operations),
+            operations,
+        })
     }
 
     pub(in crate::v2::engine) fn operation_batch_acquire(
@@ -564,7 +611,7 @@ impl CommandIngress {
         for entry in protocols {
             match entry {
                 ProtocolQueueEntry::Command(command, _permit) => {
-                    command.reject(error.clone());
+                    command.reject_after_pending(error.clone());
                 }
                 ProtocolQueueEntry::Publication(actions) => actions.publish_synchronously(),
             }
@@ -1274,7 +1321,7 @@ mod tests {
         let blocker = commands.operation_batch_acquire(capacity).await.unwrap();
         let adapter = protocol_admission(&engine);
         let before = protocol_probe(false);
-        let (command, _events) = test_protocol_command(&adapter, 1, 0, before.clone());
+        let (command, events) = test_protocol_command(&adapter, 1, 0, before.clone());
         assert!(adapter.submit(command).is_ok());
         before.cancelled.store(true, Ordering::Release);
         let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
@@ -1282,6 +1329,16 @@ mod tests {
         assert_eq!(before.resolved.load(Ordering::Acquire), 1);
         assert_eq!(before.executed.load(Ordering::Acquire), 0);
         assert_eq!(before.dropped.load(Ordering::Acquire), 1);
+        assert!(matches!(
+            events.pop(),
+            Some(super::super::super::io::IoEvent::Submission(
+                super::super::super::io::IoSubmissionDisposition::FullyUnaccepted {
+                    proven_unaccepted: 1,
+                    ..
+                }
+            ))
+        ));
+        assert!(events.pop().is_none());
 
         drop(blocker);
         let after = protocol_probe(false);
@@ -1299,6 +1356,35 @@ mod tests {
         assert_eq!(after.executed.load(Ordering::Acquire), 0);
         assert_eq!(after.dropped.load(Ordering::Acquire), 1);
         assert_eq!(commands.available_operation_permits(), capacity);
+    }
+
+    #[tokio::test]
+    async fn pending_protocol_payload_is_bounded_across_connections() {
+        let (engine, _driver) = test_engine_pair(CompletionMode::Polling);
+        let commands = Arc::clone(&engine.shared.commands);
+        let capacity = commands.available_operation_permits();
+        let blocker = commands.operation_batch_acquire(capacity).await.unwrap();
+        let first = protocol_admission(&engine);
+        let second = protocol_admission(&engine);
+
+        let first_probe = protocol_probe(false);
+        let (command, _events) = test_protocol_command(&first, capacity, 0, first_probe);
+        assert!(first.submit(command).is_ok());
+
+        let second_probe = protocol_probe(false);
+        let (command, _events) = test_protocol_command(&second, 1, 0, second_probe.clone());
+        assert!(matches!(
+            second.submit(command),
+            Err((crate::v2::Error::CapacityExhausted, _))
+        ));
+
+        drop(first);
+        let (command, _events) = test_protocol_command(&second, 1, 0, second_probe);
+        assert!(
+            second.submit(command).is_ok(),
+            "dropping one connection's pending payload must release shared capacity"
+        );
+        drop(blocker);
     }
 
     #[tokio::test]

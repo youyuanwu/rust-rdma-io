@@ -149,21 +149,6 @@ impl ReactorActions {
             action();
         }
     }
-
-    /// Collapse setup-only detached effects into one bounded publication
-    /// leaf. Setup has already committed all reactor-owned state before this
-    /// leaf can run, and a provider rejection of a batch may otherwise
-    /// produce more than one ordinary turn's worth of returned-MR events.
-    pub(in crate::v2::engine) fn append_setup_result_to(self, target: &mut Self) {
-        if self.len() == 0 {
-            return;
-        }
-        assert!(
-            target.can_accept(1),
-            "pre-establishment setup result exceeded turn budget"
-        );
-        target.push_operation(move || self.publish());
-    }
 }
 
 impl DeferredProtocolActions {
@@ -181,6 +166,10 @@ impl DeferredProtocolActions {
                 ..ReactorActions::default()
             },
         }
+    }
+
+    pub(in crate::v2::engine) fn from_actions(actions: ReactorActions) -> Self {
+        Self { actions }
     }
 
     pub(in crate::v2::engine) fn actions_mut(&mut self) -> &mut ReactorActions {
@@ -258,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    fn setup_result_collapses_more_than_thirty_two_reentrant_effects() {
+    fn setup_result_drains_actual_effects_across_bounded_turns() {
         let borrow_gate = Arc::new(Mutex::new(()));
         let observed = Arc::new(Mutex::new(Vec::new()));
         let reactor_borrow = borrow_gate.lock().unwrap();
@@ -273,13 +262,22 @@ mod tests {
                 observed.lock().unwrap().push(index);
             });
         }
-        let mut turn = ReactorActions::default();
-        setup.append_setup_result_to(&mut turn);
-        assert_eq!(turn.len(), 1);
+        let mut pending = DeferredProtocolActions::from_actions(setup);
+        let mut first_turn = ReactorActions::default();
+        pending.append_bounded_to(&mut first_turn);
+        assert_eq!(first_turn.len(), REACTOR_ACTION_BUDGET);
+        assert!(!pending.is_empty());
         assert!(observed.lock().unwrap().is_empty());
 
         drop(reactor_borrow);
-        turn.publish();
+        first_turn.publish();
+        assert_eq!(*observed.lock().unwrap(), (0..32).collect::<Vec<_>>());
+
+        let mut second_turn = ReactorActions::default();
+        pending.append_bounded_to(&mut second_turn);
+        assert!(pending.is_empty());
+        assert_eq!(second_turn.len(), 8);
+        second_turn.publish();
         assert_eq!(*observed.lock().unwrap(), (0..40).collect::<Vec<_>>());
     }
 }

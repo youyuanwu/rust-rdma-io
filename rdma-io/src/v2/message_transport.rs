@@ -2831,6 +2831,35 @@ mod tests {
         assert_eq!(state.pending_credit_returns.load(Ordering::Acquire), 3);
     }
 
+    #[test]
+    fn cancelled_pending_receipt_preserves_transition_fifo() {
+        let state = engine_state();
+        state.state.store(STATE_READY, Ordering::Release);
+        state.track_protocol_disposition(
+            PendingProtocolTransition::Send,
+            IoSubmissionDisposition::Pending { operations: 1 },
+        );
+        state.process_io_event(IoEvent::Submission(
+            IoSubmissionDisposition::FullyUnaccepted {
+                proven_unaccepted: 1,
+                error: Error::DriverShutdown,
+            },
+        ));
+        assert!(lock_std(&state.pending_protocol_transitions).is_empty());
+
+        state.track_protocol_disposition(
+            PendingProtocolTransition::Receive {
+                return_credit: true,
+            },
+            IoSubmissionDisposition::Pending { operations: 1 },
+        );
+        state.process_io_event(IoEvent::Submission(IoSubmissionDisposition::AllAccepted {
+            accepted: 1,
+        }));
+        assert_eq!(state.pending_credit_returns.load(Ordering::Acquire), 1);
+        assert!(lock_std(&state.pending_protocol_transitions).is_empty());
+    }
+
     #[tokio::test]
     async fn engine_terminal_failure_wakes_ready_recv_and_send_terminal_waiters() {
         let state = engine_state();

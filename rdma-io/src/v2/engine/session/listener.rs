@@ -301,7 +301,16 @@ pub(in crate::v2::engine) fn run_setup_before_establish(
             posted_wrs: setup(io, events)?,
         })
     });
-    setup_actions.append_setup_result_to(actions);
+    if setup_actions.len() != 0 {
+        let commands = connection
+            .command_ingress()
+            .upgrade()
+            .ok_or(Error::DriverShutdown)?;
+        commands.defer_setup_publication(
+            crate::v2::engine::reactor::DeferredProtocolActions::from_actions(setup_actions),
+            actions,
+        );
+    }
     let summary = setup_result.ok_or(Error::TransportClosed)??;
     let accepted_after = connections.accepted_count(connection_token);
     let posted_wrs = accepted_after.checked_sub(accepted_before).ok_or_else(|| {

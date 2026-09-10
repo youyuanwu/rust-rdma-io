@@ -184,34 +184,20 @@ impl IoConnection {
         if let Err(error) = commands.validate_operation_batch(command.len()) {
             return Err((error, command));
         }
-        let operation_capacity = commands.operation_capacity();
-        let operations = command.len();
-        if self
-            .admission
-            .pending_operations
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
-                pending
-                    .checked_add(operations)
-                    .filter(|next| *next <= operation_capacity)
-            })
-            .is_err()
-        {
-            return Err((Error::CapacityExhausted, command));
-        }
+        let payload = match commands.reserve_protocol_payload(command.len()) {
+            Ok(payload) => payload,
+            Err(error) => return Err((error, command)),
+        };
         let permit = Box::pin(commands.operation_batch_acquire(command.len()));
         let mut pending = lock_unpoison(&self.admission.pending);
         if !self.admission.open.load(Ordering::Acquire) {
-            self.admission
-                .pending_operations
-                .fetch_sub(operations, Ordering::AcqRel);
             return Err((Error::TransportClosed, command));
         }
         pending.push_back(ProtocolAdmission {
             command: Some(command),
             permit,
             polled: false,
-            pending_operations: Arc::clone(&self.admission.pending_operations),
-            operations,
+            _payload: payload,
         });
         drop(pending);
         self.admission.waker.wake();
@@ -235,7 +221,7 @@ impl IoConnection {
                 continue;
             }
             if command.is_cancelled() {
-                command.cancel();
+                command.cancel_after_pending();
                 progressed += 1;
                 continue;
             }
@@ -256,7 +242,7 @@ impl IoConnection {
                         .upgrade()
                         .and_then(|manager| manager.admission_error())
                         .unwrap_or(Error::DriverShutdown);
-                    command.reject(error);
+                    command.reject_after_pending(error);
                     progressed += 1;
                 }
                 Poll::Ready(Some(permit)) => {
@@ -265,19 +251,19 @@ impl IoConnection {
                         .take()
                         .expect("ready protocol admission owns its command");
                     let Some(commands) = self.commands.upgrade() else {
-                        command.reject(Error::DriverShutdown);
+                        command.reject_after_pending(Error::DriverShutdown);
                         progressed += 1;
                         continue;
                     };
                     let Some(manager) = self.manager.upgrade() else {
-                        command.reject(Error::DriverShutdown);
+                        command.reject_after_pending(Error::DriverShutdown);
                         progressed += 1;
                         continue;
                     };
                     match commands.enqueue_protocol(&manager, command, permit) {
                         Ok(()) => commands.publish_command_work(),
                         Err((error, command)) => {
-                            command.reject(error);
+                            command.reject_after_pending(error);
                         }
                     }
                     progressed += 1;
@@ -292,20 +278,11 @@ struct ProtocolAdmission {
     command: Option<ProtocolCommand>,
     permit: Pin<Box<dyn Future<Output = Option<OwnedSemaphorePermit>> + Send>>,
     polled: bool,
-    pending_operations: Arc<std::sync::atomic::AtomicUsize>,
-    operations: usize,
-}
-
-impl Drop for ProtocolAdmission {
-    fn drop(&mut self) {
-        self.pending_operations
-            .fetch_sub(self.operations, Ordering::AcqRel);
-    }
+    _payload: super::reactor::command::ProtocolPayloadReservation,
 }
 
 struct ProtocolAdmissionState {
     pending: Mutex<VecDeque<ProtocolAdmission>>,
-    pending_operations: Arc<std::sync::atomic::AtomicUsize>,
     waker: AtomicWaker,
     open: Arc<AtomicBool>,
 }
@@ -314,7 +291,6 @@ impl Default for ProtocolAdmissionState {
     fn default() -> Self {
         Self {
             pending: Mutex::new(VecDeque::new()),
-            pending_operations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             waker: AtomicWaker::new(),
             open: Arc::new(AtomicBool::new(true)),
         }
@@ -397,27 +373,16 @@ impl IoConnectionTestAdmission<'_> {
         if let Err(error) = commands.validate_operation_batch(command.len()) {
             return Err((error, command));
         }
-        let operation_capacity = commands.operation_capacity();
-        let operations = command.len();
-        if self
-            .state
-            .pending_operations
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
-                pending
-                    .checked_add(operations)
-                    .filter(|next| *next <= operation_capacity)
-            })
-            .is_err()
-        {
-            return Err((Error::CapacityExhausted, command));
-        }
+        let payload = match commands.reserve_protocol_payload(command.len()) {
+            Ok(payload) => payload,
+            Err(error) => return Err((error, command)),
+        };
         let permit = Box::pin(commands.operation_batch_acquire(command.len()));
         lock_unpoison(&self.state.pending).push_back(ProtocolAdmission {
             command: Some(command),
             permit,
             polled: false,
-            pending_operations: Arc::clone(&self.state.pending_operations),
-            operations,
+            _payload: payload,
         });
         self.state.waker.wake();
         Ok(())
@@ -432,7 +397,7 @@ impl IoConnectionTestAdmission<'_> {
             };
             let command = admission.command.take().expect("pending command");
             if command.receiver_lost() || command.is_cancelled() {
-                command.cancel();
+                command.cancel_after_pending();
                 progressed += 1;
                 continue;
             }
@@ -444,30 +409,34 @@ impl IoConnectionTestAdmission<'_> {
                     break;
                 }
                 Poll::Ready(None) => {
-                    admission.command.take().expect("pending command").reject(
-                        self.manager
-                            .upgrade()
-                            .and_then(|manager| manager.admission_error())
-                            .unwrap_or(Error::DriverShutdown),
-                    );
+                    admission
+                        .command
+                        .take()
+                        .expect("pending command")
+                        .reject_after_pending(
+                            self.manager
+                                .upgrade()
+                                .and_then(|manager| manager.admission_error())
+                                .unwrap_or(Error::DriverShutdown),
+                        );
                     progressed += 1;
                 }
                 Poll::Ready(Some(permit)) => {
                     let command = admission.command.take().expect("pending command");
                     let Some(commands) = self.commands.upgrade() else {
-                        command.reject(Error::DriverShutdown);
+                        command.reject_after_pending(Error::DriverShutdown);
                         progressed += 1;
                         continue;
                     };
                     let Some(manager) = self.manager.upgrade() else {
-                        command.reject(Error::DriverShutdown);
+                        command.reject_after_pending(Error::DriverShutdown);
                         progressed += 1;
                         continue;
                     };
                     match commands.enqueue_protocol(&manager, command, permit) {
                         Ok(()) => commands.publish_command_work(),
                         Err((error, command)) => {
-                            command.reject(error);
+                            command.reject_after_pending(error);
                         }
                     }
                     progressed += 1;
@@ -717,15 +686,32 @@ impl ProtocolCommand {
         }
     }
 
-    pub(in crate::v2::engine) fn cancel(self) -> IoSubmissionDisposition {
+    pub(in crate::v2::engine) fn reject_after_pending(self, error: Error) {
         let count = self.len();
+        let events = self.events.clone();
+        self.rejected_events(error.clone())
+            .into_iter()
+            .for_each(PendingIoEvent::deliver);
+        events
+            .submission(IoSubmissionDisposition::FullyUnaccepted {
+                proven_unaccepted: count,
+                error,
+            })
+            .deliver();
+    }
+
+    fn cancel_after_pending(self) {
+        let count = self.len();
+        let events = self.events.clone();
         self.cancelled_events()
             .into_iter()
             .for_each(PendingIoEvent::deliver);
-        IoSubmissionDisposition::FullyUnaccepted {
-            proven_unaccepted: count,
-            error: Error::DriverShutdown,
-        }
+        events
+            .submission(IoSubmissionDisposition::FullyUnaccepted {
+                proven_unaccepted: count,
+                error: Error::DriverShutdown,
+            })
+            .deliver();
     }
 
     pub(in crate::v2::engine) fn reject_into(self, error: Error, actions: &mut ReactorActions) {
