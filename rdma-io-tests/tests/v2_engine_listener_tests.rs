@@ -10,7 +10,9 @@ use rdma_io::v2::{
     AccessIntent, CompletionMode, Error, RdmaConnection, RdmaConnectionConfig, RdmaEngine,
     RdmaEngineBuilder, RdmaListener, RdmaListenerConfig,
 };
-use rdma_io_tests::test_helpers::{connect_addr_for, has_software_rdma};
+use rdma_io_tests::test_helpers::{
+    V2_PROVIDER_PROGRESS_TIMEOUT, connect_addr_for, has_software_rdma,
+};
 
 fn software_device_name() -> Option<String> {
     let list = RdmaCmDeviceList::new().ok()?;
@@ -105,7 +107,7 @@ async fn accept_pair(
             clients.connect(address).await
         }
     };
-    tokio::time::timeout(Duration::from_secs(15), async {
+    tokio::time::timeout(V2_PROVIDER_PROGRESS_TIMEOUT, async {
         let (server, client) = tokio::join!(accept, connect);
         (
             server.unwrap_or_else(|error| {
@@ -171,7 +173,7 @@ async fn run_basic_listener(mode: CompletionMode) {
         let engine = client_engine.clone();
         queued_connects.spawn(async move { engine.connect(address).await });
     }
-    tokio::time::timeout(Duration::from_secs(15), async {
+    tokio::time::timeout(V2_PROVIDER_PROGRESS_TIMEOUT, async {
         while server_engine.diagnostics().live_connections != 4 {
             tokio::task::yield_now().await;
         }
@@ -185,7 +187,7 @@ async fn run_basic_listener(mode: CompletionMode) {
     });
     let overflow_engine = client_engine.clone();
     let overflow = tokio::spawn(async move { overflow_engine.connect(address).await });
-    let overflow = tokio::time::timeout(Duration::from_secs(15), overflow)
+    let overflow = tokio::time::timeout(V2_PROVIDER_PROGRESS_TIMEOUT, overflow)
         .await
         .expect("listener backlog did not reject overflow")
         .unwrap();
@@ -275,7 +277,7 @@ async fn run_two_listener_backlog_and_capacity(mode: CompletionMode) {
         let engine = client_engine.clone();
         connects.spawn(async move { engine.connect(address).await });
     }
-    tokio::time::timeout(Duration::from_secs(15), async {
+    tokio::time::timeout(V2_PROVIDER_PROGRESS_TIMEOUT, async {
         loop {
             let diagnostics = server_engine.diagnostics();
             if diagnostics.live_connections == 4 {
@@ -293,7 +295,7 @@ async fn run_two_listener_backlog_and_capacity(mode: CompletionMode) {
     });
     let engine = client_engine.clone();
     let overflow = tokio::spawn(async move { engine.connect(first_addr).await });
-    let overflow = tokio::time::timeout(Duration::from_secs(15), overflow)
+    let overflow = tokio::time::timeout(V2_PROVIDER_PROGRESS_TIMEOUT, overflow)
         .await
         .expect("aggregate connection capacity did not reject the fifth child")
         .unwrap();
@@ -305,7 +307,7 @@ async fn run_two_listener_backlog_and_capacity(mode: CompletionMode) {
     }
     assert_eq!(server_engine.diagnostics().live_connections, 4);
 
-    let accepted = tokio::time::timeout(Duration::from_secs(15), async {
+    let accepted = tokio::time::timeout(V2_PROVIDER_PROGRESS_TIMEOUT, async {
         tokio::join!(
             first.accept(),
             second.accept(),
@@ -382,7 +384,7 @@ async fn run_accept_cancellation_and_live_shutdown(mode: CompletionMode) {
     drop(cancelled);
     let address = connect_addr_for(Some(listener.local_addr().unwrap()));
     let (server_connection, client_connection) =
-        tokio::time::timeout(Duration::from_secs(15), async {
+        tokio::time::timeout(V2_PROVIDER_PROGRESS_TIMEOUT, async {
             tokio::join!(listener.accept(), client_engine.connect(address))
         })
         .await
@@ -406,20 +408,20 @@ async fn run_accept_cancellation_and_live_shutdown(mode: CompletionMode) {
     let second_address = connect_addr_for(Some(listener.local_addr().unwrap()));
     let second_engine = client_engine.clone();
     let second_connect = tokio::spawn(async move { second_engine.connect(second_address).await });
-    tokio::time::timeout(Duration::from_secs(15), async {
+    tokio::time::timeout(V2_PROVIDER_PROGRESS_TIMEOUT, async {
         while selected_wake.0.load(Ordering::Acquire) == 0 {
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("selected accept result was not published");
-    let second_client = tokio::time::timeout(Duration::from_secs(15), second_connect)
+    let second_client = tokio::time::timeout(V2_PROVIDER_PROGRESS_TIMEOUT, second_connect)
         .await
         .expect("peer did not finish establishment before server accept cancellation")
         .unwrap()
         .expect("peer establishment failed before server accept cancellation");
     drop(cancelled_after_accept);
-    tokio::time::timeout(Duration::from_secs(15), async {
+    tokio::time::timeout(V2_PROVIDER_PROGRESS_TIMEOUT, async {
         while server_engine.diagnostics().live_connections != 1 {
             tokio::task::yield_now().await;
         }
@@ -457,7 +459,7 @@ async fn run_accept_cancellation_and_live_shutdown(mode: CompletionMode) {
     let close_address = connect_addr_for(Some(listener.local_addr().unwrap()));
     let close_engine = client_engine.clone();
     let close_connect = tokio::spawn(async move { close_engine.connect(close_address).await });
-    tokio::time::timeout(Duration::from_secs(15), async {
+    tokio::time::timeout(V2_PROVIDER_PROGRESS_TIMEOUT, async {
         while close_selection_wake.0.load(Ordering::Acquire) == 0 {
             tokio::task::yield_now().await;
         }
@@ -469,7 +471,7 @@ async fn run_accept_cancellation_and_live_shutdown(mode: CompletionMode) {
             server_engine.diagnostics()
         )
     });
-    let close_client = tokio::time::timeout(Duration::from_secs(15), close_connect)
+    let close_client = tokio::time::timeout(V2_PROVIDER_PROGRESS_TIMEOUT, close_connect)
         .await
         .expect("peer did not finish establishment before listener close")
         .unwrap()

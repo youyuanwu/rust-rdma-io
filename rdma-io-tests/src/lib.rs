@@ -5,6 +5,14 @@
 pub mod test_helpers {
     use std::net::SocketAddr;
 
+    /// Test-only ceiling for one software-provider progress operation.
+    ///
+    /// Repeated RXE/SIW stress runs can take longer than 15 seconds to settle
+    /// even when the operation completes correctly. Production deadlines are
+    /// configured independently by each engine under test.
+    pub const V2_PROVIDER_PROGRESS_TIMEOUT: std::time::Duration =
+        std::time::Duration::from_secs(30);
+
     /// Returns `true` if **any** device is iWARP (e.g. siw present alongside rxe).
     pub fn any_iwarp() -> bool {
         rdma_io::device::any_device_is_iwarp()

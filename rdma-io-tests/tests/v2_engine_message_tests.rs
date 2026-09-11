@@ -15,7 +15,7 @@ use rdma_io_tests::engine_test_helpers::{
     DrivenMessageTransport, establish_message_pair_with_retry, peer_credit_frame, peer_data_frame,
     peer_hello_frame, send_peer_frame,
 };
-use rdma_io_tests::test_helpers::has_software_rdma;
+use rdma_io_tests::test_helpers::{V2_PROVIDER_PROGRESS_TIMEOUT, has_software_rdma};
 
 #[derive(Clone, Copy)]
 struct MessageConfig {
@@ -89,7 +89,7 @@ async fn close_connection_pair(
     server: DrivenMessageTransport,
     client: DrivenMessageTransport,
 ) {
-    let (server_close, client_close) = tokio::time::timeout(Duration::from_secs(15), async {
+    let (server_close, client_close) = tokio::time::timeout(V2_PROVIDER_PROGRESS_TIMEOUT, async {
         tokio::join!(server.shutdown(), client.shutdown())
     })
     .await
@@ -176,7 +176,7 @@ async fn run_boundaries_and_reuse(mode: CompletionMode) {
     })
     .take(16)
     .collect::<Vec<_>>();
-    let received = tokio::time::timeout(Duration::from_secs(15), async {
+    let received = tokio::time::timeout(V2_PROVIDER_PROGRESS_TIMEOUT, async {
         for sender in senders {
             sender.await.unwrap();
         }
@@ -408,7 +408,7 @@ async fn run_intra_connection_fairness(mode: CompletionMode) {
         });
     }
 
-    tokio::time::timeout(Duration::from_secs(15), async {
+    tokio::time::timeout(V2_PROVIDER_PROGRESS_TIMEOUT, async {
         while let Some(result) = senders.join_next().await {
             result.unwrap().unwrap();
         }

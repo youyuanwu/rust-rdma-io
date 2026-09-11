@@ -11,7 +11,9 @@ use rdma_io::v2::{
     AccessIntent, CompletionMode, Error, RdmaConnection, RdmaConnectionConfig, RdmaEngine,
     RdmaEngineBuilder, RdmaEngineLifecycle,
 };
-use rdma_io_tests::test_helpers::{bind_listener_with_retry, connect_addr_for, has_software_rdma};
+use rdma_io_tests::test_helpers::{
+    V2_PROVIDER_PROGRESS_TIMEOUT, bind_listener_with_retry, connect_addr_for, has_software_rdma,
+};
 
 fn software_device_name() -> Option<String> {
     let list = RdmaCmDeviceList::new().ok()?;
@@ -88,7 +90,7 @@ async fn establish_pair(
             engine.connect_with_config(address, config).await
         }
     };
-    tokio::time::timeout(Duration::from_secs(15), async {
+    tokio::time::timeout(V2_PROVIDER_PROGRESS_TIMEOUT, async {
         let (server, client) = tokio::join!(server, client);
         (server, client.unwrap())
     })
@@ -394,12 +396,12 @@ async fn run_shutdown_with_undelivered_connect(mode: CompletionMode) {
     .expect("established connect result was not published");
 
     drop(connect);
-    tokio::time::timeout(Duration::from_secs(15), engine.shutdown())
+    tokio::time::timeout(V2_PROVIDER_PROGRESS_TIMEOUT, engine.shutdown())
         .await
         .expect("shutdown did not retire the undelivered connection")
         .unwrap();
     driver_task.await.unwrap().unwrap();
-    tokio::time::timeout(Duration::from_secs(15), server_task)
+    tokio::time::timeout(V2_PROVIDER_PROGRESS_TIMEOUT, server_task)
         .await
         .expect("peer did not observe undelivered connection teardown")
         .unwrap();
@@ -602,7 +604,7 @@ async fn run_operation_admission_shutdown_barrier(mode: CompletionMode) {
     resources.transition_connection_to_error(&server).unwrap();
 
     let ((operation_result, returned), server_result, client_result, shutdown_result) =
-        tokio::time::timeout(Duration::from_secs(15), async {
+        tokio::time::timeout(V2_PROVIDER_PROGRESS_TIMEOUT, async {
             tokio::join!(
                 operation.as_mut(),
                 async {
