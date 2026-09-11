@@ -2,7 +2,6 @@ name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
     branches: [main]
   schedule:
@@ -68,16 +67,12 @@ jobs:
 
       - name: Test
         run: |
-          runs=1
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            runs=5
-          fi
-          for i in $(seq 1 "$runs"); do
+          for i in $(seq 1 5); do
             if [ "$i" -gt 1 ]; then
               sudo ./scripts/teardown-siw.sh
               sudo ./scripts/setup-siw.sh
             fi
-            echo "=== Test run $i/$runs ==="
+            echo "=== Test run $i/5 ==="
             cargo test --workspace
           done
         timeout-minutes: 30
@@ -132,16 +127,12 @@ jobs:
 
       - name: Test
         run: |
-          runs=1
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            runs=5
-          fi
-          for i in $(seq 1 "$runs"); do
+          for i in $(seq 1 5); do
             if [ "$i" -gt 1 ]; then
               sudo ./scripts/teardown-rxe.sh
               sudo ./scripts/setup-rxe.sh
             fi
-            echo "=== Test run $i/$runs ==="
+            echo "=== Test run $i/5 ==="
             cargo test --workspace
           done
         timeout-minutes: 30
