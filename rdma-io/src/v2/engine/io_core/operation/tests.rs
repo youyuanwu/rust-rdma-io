@@ -21,9 +21,7 @@ use rdma_io_sys::ibverbs::{IBV_WC_LOC_QP_OP_ERR, IBV_WC_RECV, IBV_WC_SEND, IBV_W
 struct TestSignal;
 
 impl IoDriverSignal for TestSignal {
-    fn publish_cq_recheck(&self) {}
-    fn publish_completion_dispatch(&self) {}
-    fn publish_reclamation(&self) {}
+    fn notify_reactor(&self) {}
     fn pause_operation_before_register(&self) {}
 }
 

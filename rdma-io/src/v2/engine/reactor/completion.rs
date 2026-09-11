@@ -38,11 +38,6 @@ impl<T> CommandCompletion<T> {
         self.complete_with(result, false);
     }
 
-    #[cfg(test)]
-    pub(in crate::v2::engine) fn complete_listener(&self, result: Result<T>) {
-        self.complete_with(result, true);
-    }
-
     pub(in crate::v2::engine) fn complete_into(
         &self,
         result: Result<T>,

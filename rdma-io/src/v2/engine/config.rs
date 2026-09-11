@@ -202,7 +202,7 @@ pub(crate) struct EngineConfig {
 ///
 /// This deliberately contains only session capacity, connection-validation,
 /// and connection-drain policy. I/O scheduling and engine shutdown policy
-/// remain inaccessible from [`SessionManager`](super::session::SessionManager).
+/// remain inaccessible from [`SessionContext`](super::session::SessionContext).
 #[derive(Debug, Clone, Copy)]
 pub(super) struct SessionConfig {
     pub(super) max_live_connections: usize,

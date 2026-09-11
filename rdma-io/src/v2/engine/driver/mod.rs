@@ -24,7 +24,7 @@ use super::config::CompletionMode;
 use super::lifecycle::MemoizedTerminalResult;
 use super::reactor::EngineReactor;
 use super::resources::EngineReactorResources;
-use super::session::SessionManager;
+use super::session::SessionContext;
 use super::{EngineFrontendRoot, RdmaEngineDriver};
 use crate::v2::error::{Error, Result};
 use crate::v2::runtime::preflight_driver_runtime;
@@ -34,9 +34,6 @@ use crate::v2::runtime::preflight_driver_runtime;
 /// Source-specific owner bits are intentionally gone: each external poll
 /// takes one finite ready-at-entry pass over the reactor source set.
 pub(super) const REACTOR_WORK: usize = 1;
-pub(super) const IO_WORK: usize = REACTOR_WORK;
-pub(super) const SESSION_WORK: usize = REACTOR_WORK;
-pub(super) const COMMAND_WORK: usize = REACTOR_WORK;
 
 #[cfg(test)]
 fn earliest_deadline(
@@ -66,14 +63,14 @@ impl WorkSignal {
         }
     }
 
-    pub(super) fn publish(&self, work: usize) {
+    pub(super) fn notify_reactor(&self) {
         self.pending
-            .fetch_or(work, std::sync::atomic::Ordering::Release);
+            .fetch_or(REACTOR_WORK, std::sync::atomic::Ordering::Release);
         self.epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         self.waker.wake();
     }
 
-    fn take(&self) -> usize {
+    pub(in crate::v2::engine) fn take(&self) -> usize {
         self.pending.swap(0, std::sync::atomic::Ordering::AcqRel)
     }
 
@@ -99,7 +96,7 @@ impl WorkSignal {
 impl RdmaEngineDriver {
     pub(super) fn new(
         shared: Arc<EngineFrontendRoot>,
-        session: SessionManager,
+        session: SessionContext,
         resources: Option<EngineReactorResources>,
     ) -> Self {
         let reactor = EngineReactor::new(&shared, session, resources);
@@ -184,6 +181,7 @@ impl Future for RdmaEngineDriver {
                 let shared = Arc::clone(&self.shared);
                 self.reactor
                     .begin_driver_failure(&shared, failure.error.clone());
+                self.reactor.publish_current_diagnostics(&shared);
                 failure.actions.publish();
                 cx.waker().wake_by_ref();
                 return Poll::Pending;

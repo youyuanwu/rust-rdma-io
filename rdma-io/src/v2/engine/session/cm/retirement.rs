@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 use super::{
     CmState, ConnectionCmRoute, ConnectionToken, EstablishedConnectionRoute,
     FailedConnectionInstallResources, InboundRetirementCompletion, Lookup, PendingCmDestruction,
-    RouteRetirement, RouteRetirementDisposition, SessionManager, contextual_cm_error, error_detail,
+    RouteRetirement, RouteRetirementDisposition, SessionContext, contextual_cm_error, error_detail,
 };
 #[cfg(test)]
 use super::{TestCmDestruction, injected_cm_result};
@@ -309,14 +309,14 @@ pub(super) fn release_failed_install(
 pub(super) fn retain_failed_install(
     _state: &mut CmState,
     connections: &mut ConnectionRegistry,
-    shared: &SessionManager,
+    _shared: &SessionContext,
     token: ConnectionToken,
     resources: FailedConnectionInstallResources,
     destroy_error: &Error,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
 ) -> Option<EstablishedConnectionRoute> {
     #[cfg(not(any(test, feature = "test-hooks")))]
-    let _ = (shared, destroy_error, actions);
+    let _ = (_shared, destroy_error, actions);
     match resources {
         FailedConnectionInstallResources::Unregistered {
             poster,
@@ -330,7 +330,7 @@ pub(super) fn retain_failed_install(
             connections.begin_close(token);
             let _ = connections.request_retirement(token);
             let _ = connections.begin_retirement(token);
-            shared.track_connection_quarantine(connections, token);
+            connections.track_bundle_quarantine(token);
             let (_, event) = connections
                 .with_connection_mut(token, |connection| {
                     connection.publish_destroy_quarantine_into(destroy_error, || {}, actions)
@@ -436,7 +436,7 @@ fn fail_inbound_retirement(
 pub(super) fn retire_registered_connection_into(
     state: &mut CmState,
     connections: &mut ConnectionRegistry,
-    shared: &SessionManager,
+    _shared: &SessionContext,
     io_core: &mut crate::v2::engine::io_core::IoState,
     token: ConnectionToken,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
@@ -457,7 +457,7 @@ pub(super) fn retire_registered_connection_into(
     if !connections.begin_retirement(token) {
         return Ok(());
     }
-    let qp_boundary = shared.ensure_qp_destroyed(connections, token);
+    let qp_boundary = connections.ensure_qp_destroyed(token);
     if let Err(error) = qp_boundary {
         tracing::warn!(
             slot = token.slot,
@@ -466,7 +466,7 @@ pub(super) fn retire_registered_connection_into(
             %error,
             "connection QP destroy failed; retaining CM route and ownership bundle"
         );
-        shared.track_connection_quarantine(connections, token);
+        connections.track_bundle_quarantine(token);
         let (_, event) = connections
             .with_connection_mut(token, |connection| {
                 connection.publish_destroy_quarantine_into(&error, || {}, actions)
@@ -500,7 +500,7 @@ pub(super) fn retire_registered_connection_into(
         }
     };
     let outstanding_operations = connections.accepted_count(token);
-    let resources = shared.destroy_connection_resources(connections, token, outstanding_operations);
+    let resources = connections.destroy_connection_resources(token, outstanding_operations);
     let cm_id = match resources {
         Ok(resources) => resources,
         Err(error) => {
@@ -511,7 +511,7 @@ pub(super) fn retire_registered_connection_into(
                 %error,
                 "connection resource finalization failed; retaining terminal quarantine"
             );
-            shared.track_connection_quarantine(connections, token);
+            connections.track_bundle_quarantine(token);
             let (_, event) = connections
                 .with_connection_mut(token, |connection| {
                     connection.publish_destroy_quarantine_into(&error, || {}, actions)

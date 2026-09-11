@@ -15,11 +15,12 @@ use tokio::time::Instant;
 
 use super::EngineFrontendRoot;
 use super::config::CompletionMode;
+use super::diagnostics::{PublishedDiagnostics, RdmaEngineDiagnostics};
 use super::io_core::{IoDriverSignal, IoReactorSources, IoState};
 use super::lifecycle::EngineLifecycleState;
 use super::progress::ReadinessRegistration;
 use super::resources::EngineReactorResources;
-use super::session::{CmShutdownClass, CmSoftwareClass, SessionManager, SessionReactorSources};
+use super::session::{CmShutdownClass, CmSoftwareClass, SessionContext, SessionReactorSources};
 
 #[cfg(test)]
 pub(super) use action::REACTOR_ACTION_BUDGET;
@@ -57,7 +58,7 @@ pub(super) struct ReactorTurnFailure {
 impl EngineReactor {
     pub(super) fn new(
         shared: &Arc<EngineFrontendRoot>,
-        manager: SessionManager,
+        manager: SessionContext,
         resources: Option<EngineReactorResources>,
     ) -> Self {
         let io_driver_signal: Arc<dyn IoDriverSignal> = Arc::new(super::EngineIoDriverSignal {
@@ -109,17 +110,12 @@ impl EngineReactor {
             let admission = super::registry::write_unpoison(&shared.session.admission);
             shared.commands.close_admission_with(error);
             drop(admission);
-            shared.publish_lifecycle(self.lifecycle.lifecycle());
             shared.start_shutdown_progress();
         }
     }
 
-    pub(super) fn transition_running(&mut self, shared: &EngineFrontendRoot) {
-        let before = self.lifecycle.lifecycle();
+    pub(super) fn transition_running(&mut self, _shared: &EngineFrontendRoot) {
         self.lifecycle.transition_running();
-        if self.lifecycle.lifecycle() != before {
-            shared.publish_lifecycle(self.lifecycle.lifecycle());
-        }
     }
 
     fn finish_after_owner_cleanup_into(
@@ -129,7 +125,6 @@ impl EngineReactor {
         actions: &mut ReactorActions,
     ) {
         if self.lifecycle.finish(outcome.clone()) {
-            shared.publish_lifecycle(self.lifecycle.lifecycle());
             shared.publish_terminal_into(outcome, actions);
         }
     }
@@ -169,10 +164,7 @@ impl EngineReactor {
         self.io.core_mut().close_admission(outcome.error());
         let io_effects = self.io.core_mut().terminalize_operations(&outcome);
         let connections_to_wake = self.session.connections.occupied();
-        self.session
-            .manager
-            .apply_terminal_io_effects(&mut self.session.connections, io_effects)
-            .append_to(actions);
+        self.session.commit_io_effects_into(io_effects, actions);
         shared.commands.drain_ordinary_into(
             outcome.error().unwrap_or(super::Error::DriverShutdown),
             actions,
@@ -187,22 +179,16 @@ impl EngineReactor {
                 })
                 .unwrap_or(false);
             if outcome.is_error() && retain {
-                self.session
-                    .manager
-                    .track_connection_quarantine(&mut self.session.connections, *token);
+                self.session.connections.track_bundle_quarantine(*token);
             }
             let event = if self.session.connections.is_quarantined(*token) {
-                self.session.manager.finalize_quarantined_connection_engine(
-                    &mut self.session.connections,
-                    *token,
-                    &outcome,
-                )
+                self.session
+                    .connections
+                    .finalize_quarantined_connection_engine(*token, &outcome)
             } else {
-                self.session.manager.finalize_connection_engine(
-                    &mut self.session.connections,
-                    *token,
-                    &outcome,
-                )
+                self.session
+                    .connections
+                    .finalize_connection_engine(*token, &outcome)
             };
             if let Some(event) = event {
                 actions.push_event(event);
@@ -223,11 +209,6 @@ impl EngineReactor {
         self.begin_driver_failure(shared, super::Error::DriverShutdown);
         self.session
             .synchronously_prepare_driver_drop(self.io.core_mut());
-        shared.update_connection_diagnostics(
-            self.session
-                .connections
-                .admission_snapshot_excluding_retained(),
-        );
         let outstanding = self.io.core().accepted_count();
         let cm_owners = self
             .session
@@ -259,7 +240,6 @@ impl EngineReactor {
             &mut actions,
         );
         self.finish_driver_drop_into(shared, outcome, &mut actions);
-        shared.update_io_diagnostics(self.io.core().diagnostics());
         actions
     }
 
@@ -275,6 +255,7 @@ impl EngineReactor {
         );
         let mut actions = ReactorActions::for_synchronous_driver_drop();
         self.finish_driver_drop_into(shared, outcome, &mut actions);
+        self.publish_diagnostics(shared, self.session.connections.diagnostics_snapshot());
         actions.publish();
     }
 
@@ -286,6 +267,7 @@ impl EngineReactor {
     ) {
         let mut actions = ReactorActions::default();
         self.finish_after_owner_cleanup_into(shared, outcome, &mut actions);
+        self.publish_diagnostics(shared, self.session.connections.diagnostics_snapshot());
         actions.publish();
     }
 
@@ -313,7 +295,6 @@ impl EngineReactor {
             self.begin_driver_failure(shared, error);
         }
         if shared.commands.shutdown_requested() && self.lifecycle.request_shutdown() {
-            shared.publish_lifecycle(self.lifecycle.lifecycle());
             shared.start_shutdown_progress();
         }
         self.io
@@ -338,7 +319,9 @@ impl EngineReactor {
             .has_runnable(self.session.cm.listener_slot_available());
 
         let ready_sources = [
+            // Command ingress.
             (ReactorSource::Commands, commands_ready),
+            // I/O progress.
             (ReactorSource::Cq, !io_terminal),
             (
                 ReactorSource::CompletionDispatch,
@@ -352,6 +335,7 @@ impl EngineReactor {
                 ReactorSource::IoDeadline,
                 !io_terminal && io_deadline_count != 0,
             ),
+            // Connection-management progress.
             (
                 ReactorSource::CmCancellation,
                 !terminal_failure && cm_software_snapshot.count(CmSoftwareClass::Cancellation) != 0,
@@ -378,6 +362,7 @@ impl EngineReactor {
                 ReactorSource::CmDestruction,
                 !terminal_failure && cm_destruction_count != 0,
             ),
+            // Session deadlines.
             (
                 ReactorSource::SessionDeadlineIngress,
                 !terminal_failure && session_deadline_count != 0,
@@ -386,6 +371,7 @@ impl EngineReactor {
                 ReactorSource::SessionDeadline,
                 !terminal_failure && session_due_count != 0,
             ),
+            // Graceful and failed shutdown.
             (
                 ReactorSource::ShutdownPendingOutbound,
                 shutdown_ready && shutdown_snapshot.count(CmShutdownClass::PendingOutbound) != 0,
@@ -410,6 +396,7 @@ impl EngineReactor {
                 ReactorSource::ShutdownConnections,
                 shutdown_ready && shutdown_connections_ready,
             ),
+            // I/O terminal scan.
             (ReactorSource::IoTerminal, io_terminal),
         ];
         let mut requires_repoll = false;
@@ -431,10 +418,10 @@ impl EngineReactor {
                         &mut actions,
                     );
                     if report.has_more {
-                        shared.work_signal.publish(super::driver::REACTOR_WORK);
+                        shared.work_signal.notify_reactor();
                     }
-                    if report.shutdown_requested && self.lifecycle.request_shutdown() {
-                        shared.publish_lifecycle(self.lifecycle.lifecycle());
+                    if report.shutdown_requested {
+                        self.lifecycle.request_shutdown();
                     }
                     requires_repoll |= report.has_more || report.session_work;
                 }
@@ -625,21 +612,7 @@ impl EngineReactor {
             observed_cm_would_block,
             self.resources.as_ref(),
         );
-        shared.update_io_diagnostics(self.io.diagnostics());
-        let diagnostics = if terminal_failure {
-            self.session
-                .connections
-                .admission_snapshot_excluding_retained()
-        } else {
-            self.session.connections.admission_snapshot()
-        };
-        shared.update_connection_diagnostics(diagnostics);
-        shared.update_cm_diagnostics(
-            self.session.cm.pending_lifecycle_work_count(),
-            self.session
-                .cm
-                .retained_owner_count(&self.session.connections),
-        );
+        let connection_diagnostics = self.session.connections.diagnostics_snapshot();
         #[cfg(any(test, feature = "test-hooks"))]
         shared.update_cm_rejections(
             self.session
@@ -669,6 +642,7 @@ impl EngineReactor {
         } else if self.lifecycle.shutdown_is_pending() {
             requires_repoll = true;
         }
+        self.publish_diagnostics(shared, connection_diagnostics);
         Ok(ReactorTurn {
             actions,
             requires_repoll,
@@ -697,6 +671,43 @@ impl EngineReactor {
             || self.io.core().accepted_count() != 0
     }
 
+    fn publish_diagnostics(
+        &self,
+        shared: &EngineFrontendRoot,
+        connection: super::session::connection::ConnectionStateCountSnapshot,
+    ) {
+        let io = self.io.diagnostics();
+        let mut published = super::registry::lock_unpoison(&shared.diagnostics);
+        *published = PublishedDiagnostics {
+            engine: RdmaEngineDiagnostics {
+                lifecycle: self.lifecycle.lifecycle(),
+                terminal_error: self
+                    .lifecycle
+                    .outcome()
+                    .and_then(|outcome| outcome.summary()),
+                live_connections: connection.live,
+                registered_operations: io.registered_operations,
+                accepted_operations: io.accepted_operations,
+                pending_reclamations: io.pending_reclamations,
+                available_cq_credits: io.available_cq_credits,
+                retained_cq_credits: io.retained_cq_credits,
+                quarantined_operations: io.quarantined_operations,
+                quarantined_mrs: io.quarantined_mrs,
+                quarantined_bytes: io.quarantined_bytes,
+                quarantined_connections: connection.quarantined_bundles,
+            },
+            cm_pending_routes: self.session.cm.pending_lifecycle_work_count(),
+            cm_retained_owners: self
+                .session
+                .cm
+                .retained_owner_count(&self.session.connections),
+        };
+    }
+
+    pub(super) fn publish_current_diagnostics(&self, shared: &EngineFrontendRoot) {
+        self.publish_diagnostics(shared, self.session.connections.diagnostics_snapshot());
+    }
+
     #[cfg(test)]
     pub(super) fn turn_for_test(
         &mut self,
@@ -714,6 +725,7 @@ impl EngineReactor {
 
             Err(failure) => {
                 self.last_action_count = failure.actions.len();
+                self.publish_current_diagnostics(shared);
                 failure.actions.publish();
                 Err(failure.error)
             }
@@ -739,13 +751,7 @@ impl EngineReactor {
         shared: &Arc<EngineFrontendRoot>,
     ) -> ReactorActions {
         let actions = self.handle_driver_drop(shared);
-        shared.update_connection_diagnostics(self.session.connections.admission_snapshot());
-        shared.update_cm_diagnostics(
-            self.session.cm.pending_lifecycle_work_count(),
-            self.session
-                .cm
-                .retained_owner_count(&self.session.connections),
-        );
+        self.publish_diagnostics(shared, self.session.connections.diagnostics_snapshot());
         #[cfg(any(test, feature = "test-hooks"))]
         shared.update_cm_rejections(
             self.session
@@ -760,7 +766,7 @@ impl EngineReactor {
         // registry even when no operation debt remains.
         let retain_reactor = self.requires_complete_quarantine();
         if retain_reactor {
-            let replacement_manager = SessionManager::from_frontend(
+            let replacement_manager = SessionContext::from_frontend(
                 Arc::clone(&shared.session),
                 Arc::downgrade(&shared.control),
                 #[cfg(any(test, feature = "test-hooks"))]

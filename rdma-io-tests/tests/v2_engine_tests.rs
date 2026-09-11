@@ -12,7 +12,9 @@ use rdma_io::v2::{
 };
 use rdma_io::wc::WcOpcode;
 use rdma_io_tests::engine_test_helpers::{peer_credit_frame, send_peer_frame};
-use rdma_io_tests::test_helpers::{connect_addr_for, has_software_rdma};
+use rdma_io_tests::test_helpers::{
+    V2_PROVIDER_PROGRESS_TIMEOUT, connect_addr_for, has_software_rdma,
+};
 
 fn software_device_name() -> Option<String> {
     let list = rdma_io::cm::RdmaCmDeviceList::new().ok()?;
@@ -66,7 +68,7 @@ async fn establish_message_pair(
         tokio::task::JoinHandle<rdma_io::v2::Result<()>>,
     ),
 ) {
-    let (server, client) = tokio::time::timeout(Duration::from_secs(15), async {
+    let (server, client) = tokio::time::timeout(V2_PROVIDER_PROGRESS_TIMEOUT, async {
         tokio::join!(
             message_builder().accept_on(listener),
             message_builder().connect_on(engine, address)
@@ -272,7 +274,7 @@ async fn run_mode(mode: CompletionMode) {
         pairs.push(pair);
         message_drivers.push(drivers);
     }
-    let (low_server, low_client) = tokio::time::timeout(Duration::from_secs(15), async {
+    let (low_server, low_client) = tokio::time::timeout(V2_PROVIDER_PROGRESS_TIMEOUT, async {
         tokio::join!(listener.accept(), engine.connect(address))
     })
     .await

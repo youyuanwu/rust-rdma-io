@@ -89,15 +89,15 @@ fn earliest_owner_deadline_handles_equal_and_missing_values() {
 }
 
 #[test]
-fn shutdown_and_failure_publish_both_cleanup_owners() {
+fn shutdown_and_failure_notify_the_reactor() {
     let (engine, driver) = test_engine_pair(CompletionMode::Polling);
     engine.shared.work_signal.take();
 
     engine.shared.request_shutdown();
     assert_eq!(
         engine.shared.work_signal.take(),
-        IO_WORK | SESSION_WORK,
-        "idle shutdown must explicitly schedule both cleanup owners"
+        REACTOR_WORK,
+        "idle shutdown must notify the reactor"
     );
 
     engine
@@ -105,14 +105,14 @@ fn shutdown_and_failure_publish_both_cleanup_owners() {
         .begin_driver_failure(Error::InvalidConfig("publication test".into()));
     assert_eq!(
         engine.shared.work_signal.take(),
-        IO_WORK | SESSION_WORK,
-        "driver failure must explicitly reschedule both bounded cleanup owners"
+        REACTOR_WORK,
+        "driver failure must notify the reactor"
     );
     drop(driver);
 }
 
 #[tokio::test]
-async fn software_wakes_coalesced_with_either_owner_still_poll_both_once() {
+async fn reactor_notifications_still_poll_both_owners_once() {
     let (engine, mut driver) = test_engine_pair(CompletionMode::Readiness);
     let counter = CountingWaker::new();
     let waker = counter.waker();
@@ -122,12 +122,12 @@ async fn software_wakes_coalesced_with_either_owner_still_poll_both_once() {
     let initial_io = driver.reactor.io.turn_count();
     let initial_session = driver.reactor.session.turn_count();
 
-    engine.shared.work_signal.publish(IO_WORK);
+    engine.shared.work_signal.notify_reactor();
     assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
     assert_eq!(driver.reactor.io.turn_count(), initial_io + 1);
     assert_eq!(driver.reactor.session.turn_count(), initial_session + 1);
 
-    engine.shared.work_signal.publish(SESSION_WORK);
+    engine.shared.work_signal.notify_reactor();
     assert!(Pin::new(&mut driver).poll(&mut cx).is_pending());
     assert_eq!(driver.reactor.io.turn_count(), initial_io + 2);
     assert_eq!(driver.reactor.session.turn_count(), initial_session + 2);
@@ -333,11 +333,11 @@ fn io_failure_cleanup_is_bounded_across_driver_polls() {
 #[test]
 fn wake_before_register_is_seen_by_recheck() {
     let signal = WorkSignal::new();
-    signal.publish(SESSION_WORK);
+    signal.notify_reactor();
     let observed = signal.epoch();
     let counter = CountingWaker::new();
     let pending = signal.register_and_recheck(&counter.waker(), observed - 1);
-    assert_eq!(pending, SESSION_WORK);
+    assert_eq!(pending, REACTOR_WORK);
     assert_eq!(counter.count(), 1);
 }
 
@@ -347,11 +347,11 @@ fn wake_during_register_is_not_lost() {
     let observed = signal.epoch();
     std::thread::scope(|scope| {
         let signal = Arc::clone(&signal);
-        scope.spawn(move || signal.publish(IO_WORK)).join().unwrap();
+        scope.spawn(move || signal.notify_reactor()).join().unwrap();
     });
     let counter = CountingWaker::new();
     let pending = signal.register_and_recheck(&counter.waker(), observed);
-    assert_eq!(pending, IO_WORK);
+    assert_eq!(pending, REACTOR_WORK);
     assert_eq!(counter.count(), 1);
 }
 
@@ -360,25 +360,25 @@ fn enqueue_after_drain_is_seen_by_register_recheck() {
     let signal = WorkSignal::new();
     assert_eq!(signal.take(), 0);
     let observed = signal.epoch();
-    signal.publish(IO_WORK);
+    signal.notify_reactor();
     let counter = CountingWaker::new();
     assert_eq!(
         signal.register_and_recheck(&counter.waker(), observed),
-        IO_WORK
+        REACTOR_WORK
     );
     assert_eq!(counter.count(), 1);
 }
 
 #[test]
-fn concurrent_producers_coalesce_without_losing_work_classes() {
+fn concurrent_producers_coalesce_into_one_reactor_notification() {
     let signal = Arc::new(WorkSignal::new());
     std::thread::scope(|scope| {
         let mut producers = Vec::new();
-        for bit in [IO_WORK, SESSION_WORK] {
+        for _ in 0..2 {
             let signal = Arc::clone(&signal);
             producers.push(scope.spawn(move || {
                 for _ in 0..32 {
-                    signal.publish(bit);
+                    signal.notify_reactor();
                 }
             }));
         }
@@ -386,7 +386,7 @@ fn concurrent_producers_coalesce_without_losing_work_classes() {
             producer.join().unwrap();
         }
     });
-    assert_eq!(signal.take(), IO_WORK | SESSION_WORK);
+    assert_eq!(signal.take(), REACTOR_WORK);
 }
 
 struct DrainInterleavingPoster {
@@ -472,11 +472,8 @@ async fn cq_reclamation_ready_interleaving_dispatches_queued_success_and_flush_e
             driver
                 .reactor
                 .session
-                .manager
-                .transition_connection_to_error(
-                    &mut driver.reactor.session.connections,
-                    connection_token,
-                )
+                .connections
+                .transition_connection_to_error(connection_token)
                 .unwrap();
             engine
                 .shared
@@ -721,7 +718,10 @@ async fn terminal_request_wakes_driver_and_state_is_monotonic() {
         Poll::Ready(Ok(()))
     ));
     driver.reactor.transition_running(&engine.shared);
-    assert_eq!(engine.shared.lifecycle(), RdmaEngineLifecycle::Terminated);
+    assert_eq!(
+        engine.diagnostics().lifecycle,
+        RdmaEngineLifecycle::Terminated
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -868,7 +868,10 @@ fn driver_drop_wakes_listener_close_pending_cm_destruction() {
     assert_terminal_close(&mut close, &mut cx, &terminal);
     assert_eq!(counter.count(), 1);
     assert_eq!(destroy_count.load(Ordering::Acquire), 0);
-    assert_eq!(lock_unpoison(&engine.shared.cm_diagnostics).1, 1);
+    assert_eq!(
+        lock_unpoison(&engine.shared.diagnostics).cm_retained_owners,
+        1
+    );
     assert!(super::super::reactor::failed_reactor_contains(
         &engine.shared
     ));

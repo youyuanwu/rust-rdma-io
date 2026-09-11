@@ -5,15 +5,17 @@ use std::collections::VecDeque;
 /// Independently budgeted reactor sources.
 ///
 /// The variants describe scheduling responsibility only. Provider and
-/// lifecycle state remains in the existing authoritative owners until its
-/// planned consolidation phase.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// lifecycle state remains in the existing authoritative owners.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(super) enum ReactorSource {
+    // Command ingress.
     Commands,
+    // I/O progress.
     Cq,
     CompletionDispatch,
     IoReclamation,
     IoDeadline,
+    // Connection-management progress.
     CmCancellation,
     CmRetirement,
     CmOutboundStart,
@@ -21,24 +23,30 @@ pub(super) enum ReactorSource {
     CmListenerWork,
     CmEvent,
     CmDestruction,
+    // Session deadlines.
     SessionDeadlineIngress,
     SessionDeadline,
+    // Graceful and failed shutdown.
     ShutdownPendingOutbound,
     ShutdownRoutes,
     ShutdownPendingListen,
     ShutdownListeners,
     ShutdownRetainedListeners,
     ShutdownConnections,
+    // I/O terminal scan.
     IoTerminal,
 }
 
 impl ReactorSource {
     pub(super) const ALL: [Self; 21] = [
+        // Command ingress.
         Self::Commands,
+        // I/O progress.
         Self::Cq,
         Self::CompletionDispatch,
         Self::IoReclamation,
         Self::IoDeadline,
+        // Connection-management progress.
         Self::CmCancellation,
         Self::CmRetirement,
         Self::CmOutboundStart,
@@ -46,14 +54,17 @@ impl ReactorSource {
         Self::CmListenerWork,
         Self::CmEvent,
         Self::CmDestruction,
+        // Session deadlines.
         Self::SessionDeadlineIngress,
         Self::SessionDeadline,
+        // Graceful and failed shutdown.
         Self::ShutdownPendingOutbound,
         Self::ShutdownRoutes,
         Self::ShutdownPendingListen,
         Self::ShutdownListeners,
         Self::ShutdownRetainedListeners,
         Self::ShutdownConnections,
+        // I/O terminal scan.
         Self::IoTerminal,
     ];
 }
@@ -92,6 +103,42 @@ impl ReactorScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn source_vocabulary_preserves_exact_flat_sequence() {
+        assert_eq!(
+            ReactorSource::ALL,
+            [
+                ReactorSource::Commands,
+                ReactorSource::Cq,
+                ReactorSource::CompletionDispatch,
+                ReactorSource::IoReclamation,
+                ReactorSource::IoDeadline,
+                ReactorSource::CmCancellation,
+                ReactorSource::CmRetirement,
+                ReactorSource::CmOutboundStart,
+                ReactorSource::CmListenStart,
+                ReactorSource::CmListenerWork,
+                ReactorSource::CmEvent,
+                ReactorSource::CmDestruction,
+                ReactorSource::SessionDeadlineIngress,
+                ReactorSource::SessionDeadline,
+                ReactorSource::ShutdownPendingOutbound,
+                ReactorSource::ShutdownRoutes,
+                ReactorSource::ShutdownPendingListen,
+                ReactorSource::ShutdownListeners,
+                ReactorSource::ShutdownRetainedListeners,
+                ReactorSource::ShutdownConnections,
+                ReactorSource::IoTerminal,
+            ]
+        );
+        assert_eq!(ReactorSource::ALL.len(), 21);
+        assert_eq!(
+            ReactorSource::ALL.into_iter().collect::<HashSet<_>>().len(),
+            21
+        );
+    }
 
     #[test]
     fn all_sources_ready_receive_one_quantum_and_global_start_rotates() {

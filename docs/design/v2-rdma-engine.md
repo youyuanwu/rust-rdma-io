@@ -131,12 +131,15 @@ requires Tokio time support before lifecycle deadlines can be armed
   [session/progress.rs:22-41](../../rdma-io/src/v2/engine/session/progress.rs#L22-L41),
   [resources.rs:18-37](../../rdma-io/src/v2/engine/resources.rs#L18-L37)).
 
-`SessionManager` remains only a reactor-owned policy and frontend-binding
-value. It contains no connection, listener, route, operation, CM, deadline, or
-terminal registry. Shared frontend state is limited to immutable
-configuration, memory registration, command ingress, admission synchronization,
-work signaling, diagnostics, and take-once observers
-([session/mod.rs:355-449](../../rdma-io/src/v2/engine/session/mod.rs#L355-L449)).
+`SessionReactorSources` performs reactor-wide session orchestration, while the
+connection registry and connection records own local transitions and proof
+facts. `SessionContext` retains only immutable frontend policy, failure
+reporting, notification, and test capability. `SessionFrontend` is fully
+constructed with immutable weak routes before public escape; shared frontend
+state remains resource-free
+([session/mod.rs](../../rdma-io/src/v2/engine/session/mod.rs),
+[session/progress.rs](../../rdma-io/src/v2/engine/session/progress.rs),
+[session/registry.rs](../../rdma-io/src/v2/engine/session/registry.rs)).
 
 ### Stable identity
 
@@ -162,10 +165,21 @@ authorities
 Frontend futures perform validation and bounded admission on first poll. A
 successfully admitted command is executed only by a later driver poll.
 Ordinary work uses distinct bounded connect, listen, and operation lanes.
-Close, cancellation, listener close, and shutdown use generational coalesced
-control state so cleanup cannot be blocked behind ordinary capacity
-([reactor/command.rs:261-410](../../rdma-io/src/v2/engine/reactor/command.rs#L261-L410),
-[reactor/command.rs:746-1024](../../rdma-io/src/v2/engine/reactor/command.rs#L746-L1024)).
+Connection close, operation cancellation, listener close, and listener work
+use four bounded generational coalesced queues so cleanup cannot be blocked
+behind ordinary capacity. Shutdown remains a separate atomically coalesced
+request
+([reactor/command/controls.rs](../../rdma-io/src/v2/engine/reactor/command/controls.rs),
+[reactor/command/service.rs](../../rdma-io/src/v2/engine/reactor/command/service.rs)).
+
+The four direct coalesced controls are intrinsically bounded by their
+configured live-identity domains. A duplicate identity at capacity is a
+successful coalesced no-op. A new distinct identity beyond that bound is an
+internal invariant violation and asserts or panics, including from
+`Drop`-originated request paths. This intentional fail-fast policy does not
+silently suppress work, allocate overflow, terminalize the engine, or expose a
+new public result channel
+([reactor/command/coalesced.rs](../../rdma-io/src/v2/engine/reactor/command/coalesced.rs)).
 
 Admission waiters remain frontend-owned. Cancellation before admission removes
 the waiter and creates no provider work. Cancellation after admission transfers
@@ -219,20 +233,21 @@ entries, or CQ debt
 Completion dispatch is bounded per connection. It releases the operation slot,
 accepted membership, local direction credit, CQ credit, and retained MR only
 through the one completion transaction. Session-facing quarantine and
-accepted-zero effects commit before detached events and wakes enter
-`ReactorActions`
+accepted-zero effects are applied by the consuming
+`IoCoreEffects::apply_session` transition before detached events and wakes
+enter `ReactorActions`; no nominal committed-stage wrapper remains
 ([operation/completion.rs:219-377](../../rdma-io/src/v2/engine/io_core/operation/completion.rs#L219-L377),
 [operation/effects.rs:100-220](../../rdma-io/src/v2/engine/io_core/operation/effects.rs#L100-L220),
-[session/mod.rs:695-780](../../rdma-io/src/v2/engine/session/mod.rs#L695-L780)).
+[session/mod.rs:387-392](../../rdma-io/src/v2/engine/session/mod.rs#L387-L392)).
 
 ## Scheduling, Readiness, and Publication
 
-Every reactor poll snapshots ready sources. `ReactorScheduler` visits each
-ready-at-entry source at most once, rotates the global starting source, and
-defers work made ready during a turn to a later poll. Separate bounded sources
-cover commands, CQ polling, completion dispatch, I/O reclamation/deadlines, CM
-software classes, CM events/destruction, session deadlines, shutdown classes,
-and I/O terminalization
+Every reactor poll snapshots exactly 21 flat leaf sources.
+`ReactorScheduler` visits each ready-at-entry leaf at most once, rotates the
+one global starting source, and defers work made ready during a turn to a later
+poll. Separate bounded leaves cover commands, CQ polling, completion dispatch,
+I/O reclamation/deadlines, CM software classes, CM events/destruction, session
+deadlines, shutdown classes, and I/O terminalization
 ([reactor/scheduler.rs:1-92](../../rdma-io/src/v2/engine/reactor/scheduler.rs#L1-L92),
 [reactor/mod.rs:321-609](../../rdma-io/src/v2/engine/reactor/mod.rs#L321-L609)).
 
@@ -245,7 +260,8 @@ still published
 [driver/mod.rs:178-199](../../rdma-io/src/v2/engine/driver/mod.rs#L178-L199)).
 
 Readiness mode follows arm, poll, register, and recheck protocols for CQ and CM
-fds. Software producers use the `WorkSignal` epoch so enqueue-before-register
+fds. Every software producer uses one reactor notification backed by the
+`WorkSignal` epoch so enqueue-before-register
 and enqueue-during-register races cannot suspend the driver. One driver timer
 tracks the earliest I/O or session deadline. Polling mode cooperatively yields
 instead of self-spinning.
@@ -329,9 +345,12 @@ provider capabilities; values are rejected rather than silently clamped
 ([engine/mod.rs:118-217](../../rdma-io/src/v2/engine/mod.rs#L118-L217),
 [engine/config.rs:87-185](../../rdma-io/src/v2/engine/config.rs#L87-L185)).
 
-`RdmaEngine::diagnostics()` exposes copied lifecycle, connection/operation,
-CQ-credit, quarantine, and terminal observations. Diagnostics are not mutation
-capabilities and do not retain provider resources
+`RdmaEngine::diagnostics()` copies one aggregate lifecycle,
+connection/operation, CQ-credit, quarantine, and terminal snapshot. Completed
+normal turns, terminal turns, and synchronous driver drop replace the
+aggregate once after authoritative mutation; the public read performs no
+secondary live-state reads. Diagnostics are not mutation capabilities and do
+not retain provider resources
 ([diagnostics.rs:33-58](../../rdma-io/src/v2/engine/diagnostics.rs#L33-L58)).
 
 ## Verification
@@ -353,7 +372,10 @@ The implementation is covered by:
 - resource drop-order tests in both completion modes
   ([resources/drop_tests.rs:79-82](../../rdma-io/src/v2/engine/resources/drop_tests.rs#L79-L82));
   and
-- serialized RXE and SIW conformance, including v1 safe-resource regression.
+- historical serialized RXE and SIW conformance, including v1 safe-resource
+  regression. The facade-cleanup final matrix was blocked by the unchanged
+  non-default-profile warning preflight before provider switching; its
+  final-state unit, integration, workspace, Clippy, and doctest gates passed.
 
 The completed migration evidence and old-path deletion record are in
 [V2 Single-Owner Reactor Migration](v2-single-owner-reactor-migration.md).

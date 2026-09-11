@@ -2,14 +2,14 @@
 //!
 //! The driver-owned [`super::reactor::EngineReactor`] owns connection and
 //! listener identity, the shared CM dispatcher/destruction service, admission,
-//! deadlines, retirement, shutdown, and quarantine. `SessionManager` is now a
-//! runtime-state-free policy/observer capability only; it owns no listener, route,
-//! connection, or terminal lifecycle storage.
+//! deadlines, retirement, shutdown, and quarantine. `SessionContext` is a
+//! runtime-state-free policy and frontend capability; mutable session state
+//! remains in [`SessionReactorSources`] and connection-owned records.
 
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 pub(in crate::v2::engine) use self::cm::{
     CmShutdownClass, CmShutdownSnapshot, CmSoftwareClass, CmSoftwareSnapshot,
@@ -21,7 +21,6 @@ pub(super) mod listener;
 mod progress;
 pub(in crate::v2::engine) mod registry;
 
-use self::connection::{QpDestroyStatus, SharedCmId};
 use self::listener::{ListenerAdmission, ListenerEntry};
 pub(super) use self::progress::SessionReactorSources;
 use self::registry::ConnectionRegistry;
@@ -29,9 +28,13 @@ use self::registry::ConnectionRegistry;
 use super::SessionTestInstrumentation;
 use super::config::{ProviderLimits, RdmaConnectionConfig, SessionConfig};
 use super::io::MemoryRegistrar;
-use super::io_core::{CommittedIoCoreEffects, IoCoreEffects, IoState, OperationQuarantineEffect};
+#[cfg(test)]
+use super::io_core::IoState;
+use super::io_core::{AfterEngineUnlock, IoCoreEffects};
 use super::reactor::CommandIngress;
-use super::registry::{ConnectionToken, ListenerToken, Lookup, OperationToken, lock_unpoison};
+#[cfg(test)]
+use super::registry::OperationToken;
+use super::registry::{ConnectionToken, ListenerToken, Lookup, lock_unpoison};
 use super::{EngineControl, EngineObserver, Result};
 use crate::v2::error::Error;
 
@@ -56,8 +59,13 @@ pub(super) struct QpDestructionProof {
 }
 
 /// Resource-free close observation shared with connection frontends.
+///
+/// Quarantine is immediately observable, ordinary close waits for retirement,
+/// and an engine-terminal outcome is the fallback until either local state
+/// becomes authoritative. Repeated close calls share this one state.
 pub(super) struct SessionCloseState {
     pub(super) outcome: Mutex<Option<super::lifecycle::MemoizedTerminalResult>>,
+    pending_engine_terminal: Mutex<Option<super::lifecycle::MemoizedTerminalResult>>,
     engine_terminal: Mutex<Option<super::lifecycle::MemoizedTerminalResult>>,
     pub(super) notify: Arc<tokio::sync::Notify>,
     retired: AtomicBool,
@@ -67,6 +75,7 @@ impl SessionCloseState {
     pub(super) fn new() -> Arc<Self> {
         Arc::new(Self {
             outcome: Mutex::new(None),
+            pending_engine_terminal: Mutex::new(None),
             engine_terminal: Mutex::new(None),
             notify: Arc::new(tokio::sync::Notify::new()),
             retired: AtomicBool::new(false),
@@ -99,7 +108,7 @@ impl SessionCloseState {
         &self,
         outcome: &super::lifecycle::MemoizedTerminalResult,
     ) {
-        let mut terminal = lock_unpoison(&self.engine_terminal);
+        let mut terminal = lock_unpoison(&self.pending_engine_terminal);
         if terminal.is_none() {
             *terminal = Some(outcome.clone());
         }
@@ -109,21 +118,44 @@ impl SessionCloseState {
         self.retired.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    #[cfg(test)]
-    pub(super) fn notify_waiters(self: &Arc<Self>) {
+    pub(super) fn publish(
+        &self,
+        outcome: Option<super::lifecycle::MemoizedTerminalResult>,
+        retired: bool,
+    ) {
+        if let Some(outcome) = lock_unpoison(&self.pending_engine_terminal).take() {
+            let mut terminal = lock_unpoison(&self.engine_terminal);
+            if terminal.is_none() {
+                *terminal = Some(outcome);
+            }
+        }
+        if let Some(outcome) = outcome {
+            let mut current = lock_unpoison(&self.outcome);
+            if current.is_none() || outcome.is_connection_quarantined() {
+                *current = Some(outcome);
+            }
+        }
+        if retired {
+            self.mark_retired();
+        }
         self.notify.notify_waiters();
     }
 
-    pub(super) fn notify_waiters_into(
+    pub(super) fn publish_into(
         self: &Arc<Self>,
+        outcome: Option<super::lifecycle::MemoizedTerminalResult>,
+        retired: bool,
         actions: &mut super::reactor::ReactorActions,
     ) {
         let close = Arc::clone(self);
-        actions.push_close_or_listener(move || close.notify.notify_waiters());
+        actions.push_close_or_listener(move || close.publish(outcome, retired));
     }
 }
 
 /// Resource-free close observation for an engine-owned listener.
+///
+/// The first close result wins, while the independent frontend clone count
+/// makes only the last listener handle request backend close.
 pub(super) struct SessionListenerCloseState {
     outcome: Mutex<Option<super::lifecycle::MemoizedTerminalResult>>,
     notify: tokio::sync::Notify,
@@ -180,15 +212,38 @@ impl SessionListenerCloseState {
 /// observation.
 pub(super) struct SessionFrontend {
     pub(super) admission: Arc<RwLock<()>>,
-    self_ref: OnceLock<Weak<SessionFrontend>>,
-    commands: OnceLock<Weak<CommandIngress>>,
-    observer: OnceLock<Weak<EngineObserver>>,
-    work_signal: OnceLock<Weak<super::driver::WorkSignal>>,
+    pub(super) self_ref: Weak<SessionFrontend>,
+    pub(super) commands: Weak<CommandIngress>,
+    observer: Weak<EngineObserver>,
+    work_signal: Weak<super::driver::WorkSignal>,
     config: SessionConfig,
     provider: Option<ProviderLimits>,
     memory: MemoryRegistrar,
     #[cfg(any(test, feature = "test-hooks"))]
     test_instrumentation: SessionTestInstrumentation,
+}
+
+pub(super) struct SessionFrontendLinks {
+    control: Weak<EngineControl>,
+    commands: Weak<CommandIngress>,
+    observer: Weak<EngineObserver>,
+    work_signal: Weak<super::driver::WorkSignal>,
+}
+
+impl SessionFrontendLinks {
+    pub(super) fn new(
+        control: &Arc<EngineControl>,
+        commands: &Arc<CommandIngress>,
+        observer: &Arc<EngineObserver>,
+        work_signal: &Arc<super::driver::WorkSignal>,
+    ) -> Self {
+        Self {
+            control: Arc::downgrade(control),
+            commands: Arc::downgrade(commands),
+            observer: Arc::downgrade(observer),
+            work_signal: Arc::downgrade(work_signal),
+        }
+    }
 }
 
 impl SessionFrontend {
@@ -197,14 +252,15 @@ impl SessionFrontend {
         provider: Option<ProviderLimits>,
         admission: Arc<RwLock<()>>,
         memory: MemoryRegistrar,
+        links: &SessionFrontendLinks,
         #[cfg(any(test, feature = "test-hooks"))] test_instrumentation: SessionTestInstrumentation,
     ) -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new_cyclic(|self_ref| Self {
             admission,
-            self_ref: OnceLock::new(),
-            commands: OnceLock::new(),
-            observer: OnceLock::new(),
-            work_signal: OnceLock::new(),
+            self_ref: self_ref.clone(),
+            commands: links.commands.clone(),
+            observer: links.observer.clone(),
+            work_signal: links.work_signal.clone(),
             config,
             provider,
             memory,
@@ -213,47 +269,20 @@ impl SessionFrontend {
         })
     }
 
-    fn bind_self(self: &Arc<Self>) {
-        self.self_ref
-            .set(Arc::downgrade(self))
-            .unwrap_or_else(|_| panic!("SessionFrontend self reference is bound exactly once"));
-    }
-
-    fn bind_commands(&self, commands: &Arc<CommandIngress>) {
-        self.commands
-            .set(Arc::downgrade(commands))
-            .unwrap_or_else(|_| panic!("SessionFrontend command ingress is bound exactly once"));
-    }
-
-    fn bind_engine(
-        &self,
-        observer: &Arc<EngineObserver>,
-        work_signal: &Arc<super::driver::WorkSignal>,
-    ) {
-        if self.observer.set(Arc::downgrade(observer)).is_err()
-            || self.work_signal.set(Arc::downgrade(work_signal)).is_err()
-        {
-            panic!("SessionFrontend is bound to exactly one engine observer and work signal");
-        }
-    }
-
     pub(super) fn admission_error(&self) -> Option<Error> {
         if let Some(outcome) = self
             .observer
-            .get()
-            .and_then(Weak::upgrade)
+            .upgrade()
             .and_then(|observer| observer.outcome())
         {
             return outcome.into_result().err();
         }
         self.commands
-            .get()
-            .and_then(Weak::upgrade)
+            .upgrade()
             .and_then(|commands| commands.admission_error())
             .or_else(|| {
                 self.commands
-                    .get()
-                    .and_then(Weak::upgrade)
+                    .upgrade()
                     .is_none()
                     .then_some(Error::DriverShutdown)
             })
@@ -261,8 +290,7 @@ impl SessionFrontend {
 
     pub(super) fn engine_outcome(&self) -> Option<super::lifecycle::MemoizedTerminalResult> {
         self.observer
-            .get()
-            .and_then(Weak::upgrade)
+            .upgrade()
             .and_then(|observer| observer.outcome())
     }
 
@@ -279,9 +307,9 @@ impl SessionFrontend {
         self.provider
     }
 
-    pub(super) fn publish_session_work(&self) {
-        if let Some(work_signal) = self.work_signal.get().and_then(Weak::upgrade) {
-            work_signal.publish(super::driver::SESSION_WORK);
+    pub(super) fn notify_reactor(&self) {
+        if let Some(work_signal) = self.work_signal.upgrade() {
+            work_signal.notify_reactor();
         }
     }
 
@@ -367,7 +395,7 @@ impl SessionListener {
 /// All mutable connection, listener, CM, shutdown, and terminal storage is
 /// owned by the reactor. Public handles cannot reach this value; they retain
 /// only [`SessionFrontend`], typed command ingress, and take-once observers.
-pub(super) struct SessionManager {
+pub(super) struct SessionContext {
     #[cfg(any(test, feature = "test-hooks"))]
     pub(super) rejected_cm_events: AtomicU64,
     #[cfg(test)]
@@ -378,13 +406,21 @@ pub(super) struct SessionManager {
     test_instrumentation: SessionTestInstrumentation,
 }
 
-impl SessionManager {
+fn apply_io_effects(
+    context: &SessionContext,
+    connections: &mut ConnectionRegistry,
+    effects: IoCoreEffects,
+) -> AfterEngineUnlock {
+    effects.apply_session(context, connections)
+}
+
+impl SessionContext {
     pub(super) fn new(
         config: SessionConfig,
         provider: Option<ProviderLimits>,
         admission: Arc<RwLock<()>>,
         memory: MemoryRegistrar,
-        control: Weak<EngineControl>,
+        links: SessionFrontendLinks,
         #[cfg(any(test, feature = "test-hooks"))] test_instrumentation: SessionTestInstrumentation,
     ) -> Result<Self> {
         let frontend = SessionFrontend::new(
@@ -392,12 +428,13 @@ impl SessionManager {
             provider,
             Arc::clone(&admission),
             memory,
+            &links,
             #[cfg(any(test, feature = "test-hooks"))]
             test_instrumentation.clone(),
         );
         Ok(Self::from_frontend(
             frontend,
-            control,
+            links.control,
             #[cfg(any(test, feature = "test-hooks"))]
             test_instrumentation,
         ))
@@ -420,22 +457,6 @@ impl SessionManager {
         }
     }
 
-    pub(super) fn bind_self(&self) {
-        self.frontend.bind_self();
-    }
-
-    pub(super) fn bind_commands(&self, commands: &Arc<CommandIngress>) {
-        self.frontend.bind_commands(commands);
-    }
-
-    pub(super) fn bind_engine(
-        &self,
-        observer: &Arc<EngineObserver>,
-        work_signal: &Arc<super::driver::WorkSignal>,
-    ) {
-        self.frontend.bind_engine(observer, work_signal);
-    }
-
     pub(super) fn frontend(&self) -> Arc<SessionFrontend> {
         Arc::clone(&self.frontend)
     }
@@ -455,8 +476,7 @@ impl SessionManager {
     pub(super) fn shutdown_requested(&self) -> bool {
         self.frontend
             .commands
-            .get()
-            .and_then(Weak::upgrade)
+            .upgrade()
             .is_none_or(|commands| commands.is_closed())
     }
 
@@ -466,15 +486,9 @@ impl SessionManager {
         }
     }
 
-    pub(super) fn publish_io_work(&self) {
+    pub(super) fn notify_reactor(&self) {
         if let Some(control) = self.control.upgrade() {
-            control.publish(super::driver::IO_WORK);
-        }
-    }
-
-    pub(super) fn publish_session_work(&self) {
-        if let Some(control) = self.control.upgrade() {
-            control.publish(super::driver::SESSION_WORK);
+            control.notify_reactor();
         }
     }
 
@@ -489,36 +503,12 @@ impl SessionManager {
         self.test_instrumentation.take_setup_rollback_failure()
     }
 
-    pub(in crate::v2::engine) fn request_connection_close_into(
-        &self,
-        cm: &mut cm::CmState,
-        connections: &mut ConnectionRegistry,
-        io_core: &mut IoState,
-        token: ConnectionToken,
-        actions: &mut super::reactor::ReactorActions,
-    ) {
-        let Lookup::Occupied(_) = connections.lookup(token) else {
-            return;
-        };
-        self.begin_connection_close_into(cm, connections, token, io_core, actions);
-    }
-
     pub(super) fn listener_capability(&self, listener: &ListenerEntry) -> SessionListener {
         let admission = listener.admission();
         debug_assert_eq!(admission.token(), listener.token);
         SessionListener {
-            frontend: self
-                .frontend
-                .self_ref
-                .get()
-                .expect("SessionFrontend self reference is bound before use")
-                .clone(),
-            commands: self
-                .frontend
-                .commands
-                .get()
-                .expect("SessionFrontend command ingress is bound before use")
-                .clone(),
+            frontend: self.frontend.self_ref.clone(),
+            commands: self.frontend.commands.clone(),
             token: listener.token,
             admission,
             close: listener.close_state(),
@@ -528,276 +518,15 @@ impl SessionManager {
         }
     }
 
-    pub(super) fn establish_qp_destruction_proof(
-        &self,
-        connections: &mut ConnectionRegistry,
-        token: ConnectionToken,
-    ) -> Result<QpDestructionProof> {
-        let status = connections
-            .with_connection_mut(token, |connection| connection.destroy_qp_for_session())
-            .ok_or(Error::TransportClosed)??;
-        match status {
-            QpDestroyStatus::DestroyedNow => Ok(QpDestructionProof {
-                connection: token,
-                qp_num: connections
-                    .with_connection(token, |connection| connection.qp_num())
-                    .ok_or(Error::TransportClosed)?,
-                _evidence: (),
-            }),
-            QpDestroyStatus::AlreadyDestroyed => Err(Error::InvalidConfig(
-                "QP destruction proof was already minted and cannot be replayed".into(),
-            )),
-        }
-    }
-
-    pub(super) fn ensure_qp_destroyed(
-        &self,
-        connections: &mut ConnectionRegistry,
-        token: ConnectionToken,
-    ) -> Result<()> {
-        match connections
-            .with_connection_mut(token, |connection| connection.destroy_qp_for_session())
-            .ok_or(Error::TransportClosed)??
-        {
-            QpDestroyStatus::DestroyedNow | QpDestroyStatus::AlreadyDestroyed => Ok(()),
-        }
-    }
-
-    pub(super) fn transition_connection_to_error(
-        &self,
-        connections: &mut ConnectionRegistry,
-        token: ConnectionToken,
-    ) -> Result<bool> {
-        connections
-            .with_connection_mut(token, |connection| connection.transition_to_error_once())
-            .ok_or(Error::TransportClosed)?
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
     #[cfg(any(test, feature = "test-hooks"))]
     pub(in crate::v2::engine) fn transition_connection_to_error_token(
         &self,
         connections: &mut ConnectionRegistry,
         token: ConnectionToken,
     ) -> Result<()> {
-        self.transition_connection_to_error(connections, token)
+        connections
+            .transition_connection_to_error(token)
             .map(|_| ())
-    }
-
-    pub(super) fn finalize_connection_engine(
-        &self,
-        connections: &mut ConnectionRegistry,
-        token: ConnectionToken,
-        outcome: &super::lifecycle::MemoizedTerminalResult,
-    ) -> Option<super::io::PendingIoEvent> {
-        connections
-            .with_connection_mut(token, |connection| {
-                connection.close_state().record_engine_terminal(outcome);
-                connection.finalize_engine(outcome)
-            })
-            .flatten()
-    }
-
-    pub(super) fn finalize_quarantined_connection_engine(
-        &self,
-        connections: &mut ConnectionRegistry,
-        token: ConnectionToken,
-        outcome: &super::lifecycle::MemoizedTerminalResult,
-    ) -> Option<super::io::PendingIoEvent> {
-        connections
-            .with_connection_mut(token, |connection| {
-                connection.close_state().record_engine_terminal(outcome);
-                connection.finalize_engine_without_provider(outcome)
-            })
-            .flatten()
-    }
-
-    pub(super) fn destroy_connection_resources(
-        &self,
-        connections: &mut ConnectionRegistry,
-        token: ConnectionToken,
-        outstanding_operations: usize,
-    ) -> Result<Option<SharedCmId>> {
-        connections
-            .with_connection_mut(token, |connection| {
-                connection.destroy_connection_resources(outstanding_operations)
-            })
-            .ok_or(Error::TransportClosed)?
-    }
-
-    pub(super) fn destroy_failed_connection_install(
-        &self,
-        connections: &mut ConnectionRegistry,
-        resources: &mut self::connection::FailedConnectionInstallResources,
-    ) -> Result<(Option<SharedCmId>, bool)> {
-        resources.destroy_for_session(connections)
-    }
-
-    pub(super) fn reject_failed_connection_install(
-        &self,
-        connections: &ConnectionRegistry,
-        resources: &self::connection::FailedConnectionInstallResources,
-    ) -> Result<()> {
-        resources.reject_for_session(connections)
-    }
-
-    pub(super) fn track_connection_quarantine(
-        &self,
-        connections: &mut ConnectionRegistry,
-        token: ConnectionToken,
-    ) -> bool {
-        connections.track_bundle_quarantine(token)
-    }
-
-    pub(super) fn track_operation_quarantine(
-        &self,
-        connections: &mut ConnectionRegistry,
-        connection: ConnectionToken,
-        operation: OperationToken,
-    ) -> bool {
-        connections.track_operation_quarantine(connection, operation)
-    }
-
-    pub(super) fn clear_connection_quarantine(
-        &self,
-        connections: &mut ConnectionRegistry,
-        token: ConnectionToken,
-    ) -> bool {
-        if !connections.clear_bundle_quarantine(token) {
-            return false;
-        }
-        true
-    }
-
-    pub(super) fn recover_connection_quarantine_entry(
-        &self,
-        connections: &mut ConnectionRegistry,
-        token: ConnectionToken,
-    ) -> bool {
-        self.clear_connection_quarantine(connections, token)
-    }
-
-    pub(super) fn clear_operation_quarantine(
-        &self,
-        connections: &mut ConnectionRegistry,
-        connection: ConnectionToken,
-        operation: OperationToken,
-    ) -> bool {
-        if !connections.clear_operation_quarantine(connection, operation) {
-            return false;
-        }
-        true
-    }
-
-    fn apply_io_effects(
-        &self,
-        connections: &mut ConnectionRegistry,
-        mut effects: IoCoreEffects,
-    ) -> CommittedIoCoreEffects {
-        for effect in effects.take_quarantine() {
-            match effect {
-                OperationQuarantineEffect::Added {
-                    connection,
-                    operation,
-                } => {
-                    self.track_operation_quarantine(connections, connection, operation);
-                }
-                OperationQuarantineEffect::Cleared {
-                    connection,
-                    operation,
-                } => {
-                    self.clear_operation_quarantine(connections, connection, operation);
-                }
-            }
-        }
-        for token in effects.take_drained() {
-            if connections.close_started(token) {
-                self.recover_connection_quarantine(connections, token);
-                self.record_connection_drained(connections, token);
-                self.schedule_connection_retirement(connections, token);
-            }
-        }
-        effects.into_committed()
-    }
-
-    /// Consume an I/O effect bundle, apply all session-facing mutations, and
-    /// only then publish its detached events and operation wakes.
-    ///
-    /// Moving the bundle into this method prevents callers from publishing or
-    /// reusing the original value. I/O producers return only after their
-    /// operation and registry guards are released; direct posting and close
-    /// paths use a separate detached-only type after their guards are dropped.
-    /// This boundary cannot prove that a caller holds no unrelated lock.
-    #[cfg(test)]
-    pub(super) fn commit_io_effects(
-        &self,
-        connections: &mut ConnectionRegistry,
-        effects: IoCoreEffects,
-    ) {
-        self.apply_io_effects(connections, effects).publish();
-    }
-
-    pub(super) fn commit_io_effects_into(
-        &self,
-        connections: &mut ConnectionRegistry,
-        effects: IoCoreEffects,
-        actions: &mut super::reactor::ReactorActions,
-    ) {
-        self.apply_io_effects(connections, effects)
-            .append_to(actions);
-    }
-
-    /// Apply session effects for root terminal composition.
-    ///
-    /// The returned value contains only detached publication and must be
-    /// consumed after CM and connection terminal state has been published.
-    /// Reactor ownership confines conversion before root composition.
-    pub(super) fn apply_terminal_io_effects(
-        &self,
-        connections: &mut ConnectionRegistry,
-        effects: IoCoreEffects,
-    ) -> CommittedIoCoreEffects {
-        self.apply_io_effects(connections, effects)
-    }
-
-    pub(super) fn enqueue_completion_with_core(
-        &self,
-        connections: &mut ConnectionRegistry,
-        io_core: &mut IoState,
-        completion: crate::wc::WorkCompletion,
-    ) -> Option<ConnectionToken> {
-        let _admission = super::registry::read_unpoison(&self.frontend.admission);
-        let pending = io_core.prepare_completion(completion)?;
-        let identity = pending.identity();
-        if !matches!(connections.lookup(identity.connection), Lookup::Occupied(_)) {
-            io_core.reject_cqe(super::io_core::CqeReject::StaleConnection);
-            return None;
-        }
-        let live = connections.prove_live_io(identity.connection, identity.qp_num);
-        connections
-            .with_connection_io_mut(identity.connection, |connection, connection_io, _poster| {
-                io_core.enqueue_prepared_completion(pending, live, connection, connection_io)
-            })
-            .flatten()
-    }
-
-    pub(super) fn dispatch_connection_completions_with_core(
-        &self,
-        connections: &mut ConnectionRegistry,
-        io_core: &mut IoState,
-        token: ConnectionToken,
-        quantum: usize,
-        actions: &mut super::reactor::ReactorActions,
-    ) -> (usize, bool) {
-        let Some((processed, remains_ready, effects)) =
-            connections.with_connection_io_mut(token, |connection, connection_io, _poster| {
-                io_core.dispatch_connection_completions(connection, connection_io, quantum)
-            })
-        else {
-            return (0, false);
-        };
-        self.commit_io_effects_into(connections, effects, actions);
-        (processed, remains_ready)
     }
 
     #[cfg(test)]
@@ -842,52 +571,6 @@ impl SessionManager {
             .count()
     }
 
-    pub(super) fn reclaim_after_qp_destroy_into(
-        &self,
-        connections: &mut ConnectionRegistry,
-        io_core: &mut IoState,
-        proof: &QpDestructionProof,
-        connection: ConnectionToken,
-        tokens: Vec<OperationToken>,
-        actions: &mut super::reactor::ReactorActions,
-    ) -> usize {
-        let proven_connection = proof.connection;
-        let proven_qp_num = proof.qp_num;
-        let Some((qp_num, close_error)) = connections.with_connection(connection, |connection| {
-            (connection.qp_num(), connection.operation_close_error())
-        }) else {
-            return 0;
-        };
-        if proven_connection != connection || proven_qp_num != qp_num {
-            tracing::warn!(
-                connection = connection.encode(),
-                "operation reclaim rejected a mismatched QP destruction proof"
-            );
-            return 0;
-        }
-        tokens
-            .into_iter()
-            .filter(|token| {
-                let Some((reclaimed, effects)) =
-                    connections.with_connection_io_mut(connection, |io, connection_io, _poster| {
-                        io_core.reclaim_after_qp_destroy(
-                            proven_connection,
-                            proven_qp_num,
-                            io,
-                            connection_io,
-                            close_error.clone(),
-                            *token,
-                        )
-                    })
-                else {
-                    return false;
-                };
-                self.commit_io_effects_into(connections, effects, actions);
-                reclaimed
-            })
-            .count()
-    }
-
     #[cfg(test)]
     #[allow(
         clippy::too_many_arguments,
@@ -917,30 +600,8 @@ impl SessionManager {
         else {
             return false;
         };
-        self.commit_io_effects(connections, effects);
+        apply_io_effects(self, connections, effects).publish();
         reclaimed
-    }
-
-    pub(super) fn reject_queued_completions_after_qp_destroy_into(
-        &self,
-        connections: &mut ConnectionRegistry,
-        io_core: &mut IoState,
-        connection: ConnectionToken,
-        actions: &mut super::reactor::ReactorActions,
-    ) -> bool {
-        // Every completion can publish an event, an operation wake, and a
-        // connection-close wake. Keep two leaves for the owning connection's
-        // quarantine/close tail before removing any copied CQE.
-        let quantum = actions.remaining().saturating_sub(2) / 3;
-        let Some((remains_ready, effects)) =
-            connections.with_connection_io_mut(connection, |io, connection_io, _poster| {
-                io_core.reject_queued_completions_after_qp_destroy(io, connection_io, quantum)
-            })
-        else {
-            return false;
-        };
-        self.commit_io_effects_into(connections, effects, actions);
-        remains_ready
     }
 }
 
@@ -1120,8 +781,8 @@ mod tests {
         let proof = driver
             .reactor
             .session
-            .manager
-            .establish_qp_destruction_proof(&mut driver.reactor.session.connections, token)
+            .connections
+            .establish_qp_destruction_proof(token)
             .expect("first successful destroy mints proof");
         assert_eq!(proof.connection, token);
         assert_eq!(proof.qp_num, connection.identity().qp_num());
@@ -1129,11 +790,8 @@ mod tests {
             driver
                 .reactor
                 .session
-                .manager
-                .establish_qp_destruction_proof(
-                    &mut driver.reactor.session.connections,
-                    token,
-                ),
+                .connections
+                .establish_qp_destruction_proof(token),
             Err(Error::InvalidConfig(message)) if message.contains("cannot be replayed")
         ));
 

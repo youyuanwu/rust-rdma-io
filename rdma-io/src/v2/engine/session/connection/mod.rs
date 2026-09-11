@@ -20,7 +20,7 @@ use super::super::lifecycle::MemoizedTerminalResult;
 use super::super::registry::OperationToken;
 use super::super::registry::{ConnectionToken, lock_unpoison, read_unpoison};
 use super::registry::ConnectionRegistry;
-use super::{QpDestructionProof, SessionCloseState, SessionFrontend, SessionManager};
+use super::{QpDestructionProof, SessionCloseState, SessionContext, SessionFrontend};
 use crate::cm::{CmId, ConnParam, EventChannel};
 use crate::v2::error::{Error, Result};
 use crate::v2::mr::{AccessIntent, Mr, RemoteMr};
@@ -277,7 +277,7 @@ impl RdmaConnection {
     }
 
     fn from_registered(
-        manager: &SessionManager,
+        manager: &SessionContext,
         state: &ConnectionState,
         route: Option<ConnectionCmRoute>,
     ) -> Self {
@@ -295,16 +295,8 @@ impl RdmaConnection {
                 uses_engine_resources: state.poster.uses_engine_resources(),
             }),
             memory: frontend.memory_registrar(),
-            commands: frontend
-                .commands
-                .get()
-                .expect("SessionFrontend command ingress is bound before use")
-                .clone(),
-            session_frontend: frontend
-                .self_ref
-                .get()
-                .expect("SessionFrontend self reference is bound before use")
-                .clone(),
+            commands: frontend.commands.clone(),
+            session_frontend: frontend.self_ref.clone(),
             close: state.close_state(),
             frontend: Arc::clone(&state.frontend),
             local_addr,
@@ -559,7 +551,6 @@ impl ConnectionState {
             if self.close_result.is_none() {
                 self.close_result = Some(MemoizedTerminalResult::from_error(error.clone()));
             }
-            self.publish_close_result();
             return self.pending_io_event(IoTerminalEvent::Terminal(error));
         }
         None
@@ -574,7 +565,6 @@ impl ConnectionState {
             if self.close_result.is_none() {
                 self.close_result = Some(MemoizedTerminalResult::from_error(error.clone()));
             }
-            self.publish_close_result();
             return self.pending_io_event(IoTerminalEvent::Terminal(error));
         }
         None
@@ -593,7 +583,6 @@ impl ConnectionState {
         if self.close_result.is_none() {
             self.close_result = Some(MemoizedTerminalResult::from_error(error.clone()));
         }
-        self.publish_close_result();
         self.pending_io_event(IoTerminalEvent::Terminal(error))
     }
 
@@ -613,7 +602,7 @@ impl ConnectionState {
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Option<PendingIoEvent> {
         let event = self.record_cm_failure(error);
-        self.wake_close_into(actions);
+        self.publish_close_result_into(false, actions);
         event
     }
 
@@ -686,7 +675,7 @@ impl ConnectionState {
 
     #[cfg(test)]
     pub(in crate::v2::engine) fn wake_close(&self) {
-        self.close.notify_waiters();
+        self.close.publish(self.close_result.clone(), false);
     }
 
     pub(in crate::v2::engine) fn close_operation_scan_slot(&self) -> usize {
@@ -741,7 +730,7 @@ impl ConnectionState {
         &self,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) {
-        self.close.notify_waiters_into(actions);
+        self.publish_close_result_into(false, actions);
     }
 
     pub(in crate::v2::engine) fn begin_quarantine(
@@ -764,8 +753,7 @@ impl ConnectionState {
         if self.close_result.is_none() {
             self.close_result = Some(MemoizedTerminalResult::from_error(error.clone()));
         }
-        self.publish_close_result();
-        self.close.notify_waiters_into(actions);
+        self.publish_close_result_into(false, actions);
         self.pending_io_event(IoTerminalEvent::Terminal(error))
     }
 
@@ -785,12 +773,11 @@ impl ConnectionState {
                 cause: error.to_string(),
             };
             self.close_result = Some(MemoizedTerminalResult::from_error(published.clone()));
-            self.publish_close_result();
             let event = self.pending_io_event(IoTerminalEvent::Terminal(published));
-            self.close.notify_waiters();
+            self.close.publish(self.close_result.clone(), false);
             return (true, event);
         }
-        self.close.notify_waiters();
+        self.close.publish(self.close_result.clone(), false);
         (newly_published, None)
     }
 
@@ -810,12 +797,11 @@ impl ConnectionState {
                 cause: error.to_string(),
             };
             self.close_result = Some(MemoizedTerminalResult::from_error(published.clone()));
-            self.publish_close_result();
             let event = self.pending_io_event(IoTerminalEvent::Terminal(published));
-            self.close.notify_waiters_into(actions);
+            self.publish_close_result_into(false, actions);
             return (true, event);
         }
-        self.close.notify_waiters_into(actions);
+        self.publish_close_result_into(false, actions);
         (false, None)
     }
 
@@ -831,9 +817,7 @@ impl ConnectionState {
         if self.close_result.is_none() {
             self.close_result = Some(MemoizedTerminalResult::success());
         }
-        self.publish_close_result();
-        self.close.mark_retired();
-        self.close.notify_waiters();
+        self.close.publish(self.close_result.clone(), true);
         self.pending_io_event(IoTerminalEvent::Closed(Ok(())))
     }
 
@@ -844,9 +828,7 @@ impl ConnectionState {
         if self.close_result.is_none() {
             self.close_result = Some(MemoizedTerminalResult::success());
         }
-        self.publish_close_result();
-        self.close.mark_retired();
-        self.close.notify_waiters_into(actions);
+        self.publish_close_result_into(true, actions);
         self.pending_io_event(IoTerminalEvent::Closed(Ok(())))
     }
 
@@ -914,14 +896,13 @@ impl ConnectionState {
         );
     }
 
-    fn publish_close_result(&self) {
-        let Some(result) = self.close_result.as_ref() else {
-            return;
-        };
-        let mut observer = lock_unpoison(&self.close.outcome);
-        if observer.is_none() || result.is_connection_quarantined() {
-            *observer = Some(result.clone());
-        }
+    fn publish_close_result_into(
+        &self,
+        retired: bool,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) {
+        self.close
+            .publish_into(self.close_result.clone(), retired, actions);
     }
 
     #[cfg(test)]
@@ -950,10 +931,6 @@ pub(in crate::v2::engine) struct ConnectionReservation {
 }
 
 impl ConnectionReservation {
-    pub(in crate::v2::engine) fn new(permit: OwnedSemaphorePermit) -> Self {
-        Self::new_with_diagnostics(permit, None)
-    }
-
     pub(in crate::v2::engine) fn new_with_diagnostics(
         permit: OwnedSemaphorePermit,
         diagnostics: Option<Arc<ConnectionDiagnosticsGauge>>,
@@ -1141,6 +1118,7 @@ impl ConnectionDiagnosticsGauge {
         lock_unpoison(&self.counts).all
     }
 
+    #[cfg(test)]
     pub(in crate::v2::engine) fn snapshot_excluding_retained(
         &self,
     ) -> ConnectionStateCountSnapshot {
@@ -1747,7 +1725,7 @@ impl VerbsConnectionResources {
 
 #[cfg(test)]
 pub(crate) fn install_connection(
-    manager: &SessionManager,
+    manager: &SessionContext,
     connections: &mut ConnectionRegistry,
     poster: impl Into<ConnectionPoster>,
     config: RdmaConnectionConfig,
@@ -1782,7 +1760,7 @@ pub(crate) fn install_connection(
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub(in crate::v2::engine) fn install_admitted_test_connection(
-    manager: &SessionManager,
+    manager: &SessionContext,
     connections: &mut ConnectionRegistry,
     poster: impl Into<ConnectionPoster>,
     config: RdmaConnectionConfig,
@@ -1812,7 +1790,7 @@ pub(in crate::v2::engine) fn install_admitted_test_connection(
 }
 
 pub(in crate::v2::engine) fn reserve_connection<'a>(
-    manager: &'a SessionManager,
+    manager: &'a SessionContext,
     connections: &ConnectionRegistry,
 ) -> Result<(RwLockReadGuard<'a, ()>, ConnectionReservation)> {
     let admission = read_unpoison(&manager.frontend.admission);
@@ -1829,7 +1807,7 @@ pub(in crate::v2::engine) fn reserve_connection<'a>(
     reason = "failed installation returns the complete provider/resource bundle for exact cleanup"
 )]
 pub(in crate::v2::engine) fn install_reserved_connection(
-    manager: &SessionManager,
+    manager: &SessionContext,
     connections: &mut ConnectionRegistry,
     route_token: Option<ConnectionToken>,
     poster: impl Into<ConnectionPoster>,

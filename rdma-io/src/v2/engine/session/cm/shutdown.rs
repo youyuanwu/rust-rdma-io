@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use super::{CmState, MemoizedTerminalResult, SessionManager};
+use super::{CmState, MemoizedTerminalResult, SessionContext};
 use crate::v2::engine::registry::ListenerToken;
 use crate::v2::engine::session::registry::ConnectionRegistry;
 use crate::v2::error::Error;
@@ -54,7 +54,7 @@ impl CmShutdownSnapshot {
 pub(super) fn begin(
     state: &mut CmState,
     connections: &mut ConnectionRegistry,
-    _shared: &SessionManager,
+    _shared: &SessionContext,
     outcome: &MemoizedTerminalResult,
 ) {
     if std::mem::replace(&mut state.shutting_down, true) {
@@ -132,7 +132,7 @@ pub(super) fn snapshot(
 pub(super) fn service_class(
     state: &mut CmState,
     connections: &mut ConnectionRegistry,
-    _shared: &SessionManager,
+    _shared: &SessionContext,
     outcome: &MemoizedTerminalResult,
     terminalize_listeners: bool,
     cursor: &mut CmShutdownCursor,

@@ -241,7 +241,7 @@ impl Future for RdmaOperation {
                     {
                         command.cancel_before_execution(error);
                     }
-                    commands.publish_command_work();
+                    commands.notify_reactor();
                     cx.waker().wake_by_ref();
                     self.state = FutureState::Queued {
                         commands: Arc::downgrade(&commands),
@@ -393,6 +393,10 @@ impl OperationCommand {
     }
 }
 
+/// Frontend completion paired with the token installed after provider commit.
+///
+/// A dropped future uses the token only when ingress removal loses, preserving
+/// backend cancellation without releasing MR or CQ-credit ownership early.
 struct OperationCommandCompletion {
     observer: Arc<OperationObserver>,
     in_flight: Mutex<Option<OperationToken>>,
@@ -576,7 +580,7 @@ fn start_operation(
                 shared.pending_reclamations += 1;
                 shared.schedule_reclamation(token);
             }
-            shared.publish_cq_recheck();
+            shared.notify_reactor();
             if let Some(completion) = committed.early {
                 let after_unlock = shared.finish_early_completion(connection_io, token, completion);
                 append_after_post_guards(posting, admission, after_unlock, actions);
@@ -617,7 +621,7 @@ fn start_operation(
                     shared.pending_reclamations += 1;
                     shared.schedule_reclamation(token);
                 }
-                shared.publish_cq_recheck();
+                shared.notify_reactor();
                 if let Some(completion) = committed.early {
                     let after_unlock =
                         shared.finish_early_completion(connection_io, token, completion);
@@ -638,7 +642,7 @@ fn start_operation(
                 shared.pending_reclamations += 1;
                 shared.schedule_reclamation(token);
             }
-            shared.publish_cq_recheck();
+            shared.notify_reactor();
             if let Some(completion) = committed.early {
                 let after_unlock = shared.finish_early_completion(connection_io, token, completion);
                 append_after_post_guards(posting, admission, after_unlock, actions);

@@ -476,7 +476,7 @@ pub(super) fn commit_internal_entries(
             early.push((entry.token, completion));
         }
     }
-    shared.publish_cq_recheck();
+    shared.notify_reactor();
     let mut after_unlock = AfterEngineUnlock::default();
     for (token, completion) in early {
         after_unlock.extend(shared.finish_early_completion(connection_io, token, completion));

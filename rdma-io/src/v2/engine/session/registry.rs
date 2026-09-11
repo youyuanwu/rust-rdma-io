@@ -472,6 +472,83 @@ pub(in crate::v2::engine) struct ConnectionRegistry {
 }
 
 impl ConnectionRegistry {
+    pub(in crate::v2::engine) fn establish_qp_destruction_proof(
+        &mut self,
+        token: ConnectionToken,
+    ) -> Result<super::QpDestructionProof> {
+        let status = self
+            .with_connection_mut(token, |connection| connection.destroy_qp_for_session())
+            .ok_or(Error::TransportClosed)??;
+        match status {
+            super::connection::QpDestroyStatus::DestroyedNow => Ok(super::QpDestructionProof {
+                connection: token,
+                qp_num: self
+                    .with_connection(token, |connection| connection.qp_num())
+                    .ok_or(Error::TransportClosed)?,
+                _evidence: (),
+            }),
+            super::connection::QpDestroyStatus::AlreadyDestroyed => Err(Error::InvalidConfig(
+                "QP destruction proof was already minted and cannot be replayed".into(),
+            )),
+        }
+    }
+
+    pub(in crate::v2::engine) fn ensure_qp_destroyed(
+        &mut self,
+        token: ConnectionToken,
+    ) -> Result<()> {
+        match self
+            .with_connection_mut(token, |connection| connection.destroy_qp_for_session())
+            .ok_or(Error::TransportClosed)??
+        {
+            super::connection::QpDestroyStatus::DestroyedNow
+            | super::connection::QpDestroyStatus::AlreadyDestroyed => Ok(()),
+        }
+    }
+
+    pub(in crate::v2::engine) fn transition_connection_to_error(
+        &mut self,
+        token: ConnectionToken,
+    ) -> Result<bool> {
+        self.with_connection_mut(token, |connection| connection.transition_to_error_once())
+            .ok_or(Error::TransportClosed)?
+    }
+
+    pub(in crate::v2::engine) fn finalize_connection_engine(
+        &mut self,
+        token: ConnectionToken,
+        outcome: &super::super::lifecycle::MemoizedTerminalResult,
+    ) -> Option<super::super::io::PendingIoEvent> {
+        self.with_connection_mut(token, |connection| {
+            connection.close_state().record_engine_terminal(outcome);
+            connection.finalize_engine(outcome)
+        })
+        .flatten()
+    }
+
+    pub(in crate::v2::engine) fn finalize_quarantined_connection_engine(
+        &mut self,
+        token: ConnectionToken,
+        outcome: &super::super::lifecycle::MemoizedTerminalResult,
+    ) -> Option<super::super::io::PendingIoEvent> {
+        self.with_connection_mut(token, |connection| {
+            connection.close_state().record_engine_terminal(outcome);
+            connection.finalize_engine_without_provider(outcome)
+        })
+        .flatten()
+    }
+
+    pub(in crate::v2::engine) fn destroy_connection_resources(
+        &mut self,
+        token: ConnectionToken,
+        outstanding_operations: usize,
+    ) -> Result<Option<super::connection::SharedCmId>> {
+        self.with_connection_mut(token, |connection| {
+            connection.destroy_connection_resources(outstanding_operations)
+        })
+        .ok_or(Error::TransportClosed)?
+    }
+
     #[cfg(test)]
     pub(in crate::v2::engine) fn new(capacity: usize) -> Result<Self> {
         Self::new_with_admission(capacity, Arc::new(Semaphore::new(capacity)))
@@ -604,13 +681,18 @@ impl ConnectionRegistry {
     }
 
     pub(in crate::v2::engine) fn admission_snapshot(&self) -> ConnectionStateCountSnapshot {
-        let mut snapshot = self.diagnostics.snapshot();
+        let mut snapshot = self.diagnostics_snapshot();
         snapshot.live = self
             .capacity
             .saturating_sub(self.admission.available_permits());
         snapshot
     }
 
+    pub(in crate::v2::engine) fn diagnostics_snapshot(&self) -> ConnectionStateCountSnapshot {
+        self.diagnostics.snapshot()
+    }
+
+    #[cfg(test)]
     pub(in crate::v2::engine) fn admission_snapshot_excluding_retained(
         &self,
     ) -> ConnectionStateCountSnapshot {
@@ -1364,7 +1446,7 @@ impl ConnectionRegistry {
         .unwrap_or(false)
     }
 
-    pub(super) fn track_operation_quarantine(
+    pub(in crate::v2::engine) fn track_operation_quarantine(
         &mut self,
         token: ConnectionToken,
         operation: OperationToken,
@@ -1443,7 +1525,10 @@ impl ConnectionRegistry {
         .unwrap_or(false)
     }
 
-    pub(super) fn clear_bundle_quarantine(&mut self, token: ConnectionToken) -> bool {
+    pub(in crate::v2::engine) fn clear_bundle_quarantine(
+        &mut self,
+        token: ConnectionToken,
+    ) -> bool {
         self.transition(token, |entry| match entry {
             ConnectionEntry::Quarantined(mut quarantined) if quarantined.bundle => {
                 quarantined.bundle = false;
@@ -1467,7 +1552,7 @@ impl ConnectionRegistry {
         .unwrap_or(false)
     }
 
-    pub(super) fn clear_operation_quarantine(
+    pub(in crate::v2::engine) fn clear_operation_quarantine(
         &mut self,
         token: ConnectionToken,
         operation: OperationToken,

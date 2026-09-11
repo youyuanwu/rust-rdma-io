@@ -163,16 +163,11 @@ impl SessionReactorSources {
             if self.connections.is_quarantined(token) {
                 continue;
             }
-            let _ = self
-                .manager
-                .transition_connection_to_error(&mut self.connections, token);
+            let _ = self.connections.transition_connection_to_error(token);
             if self.connections.accepted_count(token) == 0
                 && !self.connections.retirement_is_quarantined(token)
             {
-                match self
-                    .manager
-                    .ensure_qp_destroyed(&mut self.connections, token)
-                {
+                match self.connections.ensure_qp_destroyed(token) {
                     Ok(()) => {}
                     Err(error) => {
                         let qp_num = self
@@ -335,8 +330,8 @@ mod tests {
         driver
             .reactor
             .session
-            .manager
-            .transition_connection_to_error(&mut driver.reactor.session.connections, token)
+            .connections
+            .transition_connection_to_error(token)
             .unwrap();
         assert!(driver.reactor.session.connections.request_retirement(token));
         assert!(driver.reactor.session.connections.begin_retirement(token));

@@ -4,7 +4,7 @@
 use std::sync::atomic::Ordering;
 
 use super::{
-    CmState, ContextRoute, EngineReactorResources, InboundRejectReason, Lookup, SessionManager,
+    CmState, ContextRoute, EngineReactorResources, InboundRejectReason, Lookup, SessionContext,
 };
 use crate::cm::CmEventType;
 use crate::v2::engine::registry::{ConnectionToken, ListenerToken};
@@ -74,7 +74,7 @@ pub(super) fn acquire_event(
 pub(super) fn try_process_event(
     state: &mut CmState,
     connections: &mut ConnectionRegistry,
-    shared: &SessionManager,
+    shared: &SessionContext,
     io_core: &mut crate::v2::engine::io_core::IoState,
     resources: &EngineReactorResources,
     actions: &mut crate::v2::engine::reactor::ReactorActions,
@@ -102,7 +102,7 @@ pub(super) fn try_process_event(
 fn process_event(
     state: &mut CmState,
     connections: &mut ConnectionRegistry,
-    shared: &SessionManager,
+    shared: &SessionContext,
     io_core: &mut crate::v2::engine::io_core::IoState,
     resources: &EngineReactorResources,
     pending: PendingCmEvent,
@@ -247,7 +247,7 @@ pub(super) fn lookup_event_route(
     Ok(route)
 }
 
-fn record_cm_reject(manager: &SessionManager, reject: CmEventReject) {
+fn record_cm_reject(manager: &SessionContext, reject: CmEventReject) {
     #[cfg(any(test, feature = "test-hooks"))]
     if !matches!(reject, CmEventReject::Duplicate) {
         manager.rejected_cm_events.fetch_add(1, Ordering::Relaxed);

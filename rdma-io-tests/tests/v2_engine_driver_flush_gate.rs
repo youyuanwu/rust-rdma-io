@@ -45,7 +45,6 @@ async fn run_flush_gate(mode: CompletionMode) {
         return;
     }
     let device = software_device_name().expect("software RDMA device");
-    let recorder = DestructionRecorder::arm(128);
     let (engine, driver) = RdmaEngineBuilder::new(device)
         .completion_mode(mode)
         .maximum_live_connections(8)
@@ -58,6 +57,7 @@ async fn run_flush_gate(mode: CompletionMode) {
 
     let mut flush_pair = setup_engine_pair(&resources).await;
     let mut traffic_pair = setup_engine_pair(&resources).await;
+    let recorder = DestructionRecorder::arm(128);
 
     let flush_route = install_endpoint_route(
         &resources,
