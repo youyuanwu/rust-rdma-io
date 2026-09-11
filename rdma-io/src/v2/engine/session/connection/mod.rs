@@ -675,7 +675,7 @@ impl ConnectionState {
 
     #[cfg(test)]
     pub(in crate::v2::engine) fn wake_close(&self) {
-        self.close.notify_waiters();
+        self.close.publish(self.close_result.clone(), false);
     }
 
     pub(in crate::v2::engine) fn close_operation_scan_slot(&self) -> usize {
@@ -773,12 +773,11 @@ impl ConnectionState {
                 cause: error.to_string(),
             };
             self.close_result = Some(MemoizedTerminalResult::from_error(published.clone()));
-            self.publish_close_result();
             let event = self.pending_io_event(IoTerminalEvent::Terminal(published));
-            self.close.notify_waiters();
+            self.close.publish(self.close_result.clone(), false);
             return (true, event);
         }
-        self.close.notify_waiters();
+        self.close.publish(self.close_result.clone(), false);
         (newly_published, None)
     }
 
@@ -818,9 +817,7 @@ impl ConnectionState {
         if self.close_result.is_none() {
             self.close_result = Some(MemoizedTerminalResult::success());
         }
-        self.publish_close_result();
-        self.close.mark_retired();
-        self.close.notify_waiters();
+        self.close.publish(self.close_result.clone(), true);
         self.pending_io_event(IoTerminalEvent::Closed(Ok(())))
     }
 
@@ -897,17 +894,6 @@ impl ConnectionState {
             previous.is_none(),
             "setup rollback retains at most one test MR"
         );
-    }
-
-    #[cfg(test)]
-    fn publish_close_result(&self) {
-        let Some(result) = self.close_result.as_ref() else {
-            return;
-        };
-        let mut observer = lock_unpoison(&self.close.outcome);
-        if observer.is_none() || result.is_connection_quarantined() {
-            *observer = Some(result.clone());
-        }
     }
 
     fn publish_close_result_into(
