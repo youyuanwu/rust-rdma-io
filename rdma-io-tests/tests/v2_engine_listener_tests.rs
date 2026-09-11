@@ -401,7 +401,8 @@ async fn run_accept_cancellation_and_live_shutdown(mode: CompletionMode) {
         poll_with_wake_counter(cancelled_after_accept.as_mut(), &selected_wake).is_pending(),
         "second poll must consume admission yield and register the result observer"
     );
-    selected_wake.0.store(0, Ordering::Release);
+    // Do not clear after registration: establishment may wake concurrently
+    // with the second poll returning.
     let second_address = connect_addr_for(Some(listener.local_addr().unwrap()));
     let second_engine = client_engine.clone();
     let second_connect = tokio::spawn(async move { second_engine.connect(second_address).await });
@@ -449,7 +450,8 @@ async fn run_accept_cancellation_and_live_shutdown(mode: CompletionMode) {
         poll_with_wake_counter(selected_during_close.as_mut(), &close_selection_wake).is_pending(),
         "second poll must consume admission yield and register the result observer"
     );
-    close_selection_wake.0.store(0, Ordering::Release);
+    // Do not clear after registration: establishment may wake concurrently
+    // with the second poll returning.
     let mut pending_accept = Box::pin(listener.accept());
     assert!(poll_once(pending_accept.as_mut()).is_pending());
     let close_address = connect_addr_for(Some(listener.local_addr().unwrap()));
