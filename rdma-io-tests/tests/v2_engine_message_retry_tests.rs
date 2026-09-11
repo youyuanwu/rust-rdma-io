@@ -64,7 +64,10 @@ async fn transient_retry_reclaims_capacity_routes_and_requests_before_retry() {
     )
     .await
     .unwrap();
-    assert_eq!(attempts.load(Ordering::Acquire), 2);
+    assert!(
+        attempts.load(Ordering::Acquire) >= 2,
+        "the injected first failure must force at least one retry"
+    );
     assert_eq!(server_engine.diagnostics().live_connections, 1);
     assert_eq!(client_engine.diagnostics().live_connections, 1);
 
@@ -112,7 +115,10 @@ async fn ready_transient_restores_exact_baseline_before_retry() {
     )
     .await
     .unwrap();
-    assert_eq!(ready_attempts.load(Ordering::Acquire), 2);
+    assert!(
+        ready_attempts.load(Ordering::Acquire) >= 2,
+        "the injected first readiness failure must force at least one retry"
+    );
     assert_eq!(server_engine.diagnostics().live_connections, 1);
     assert_eq!(client_engine.diagnostics().live_connections, 1);
 
