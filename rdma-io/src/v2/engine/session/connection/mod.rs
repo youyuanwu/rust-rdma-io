@@ -923,32 +923,14 @@ impl ConnectionState {
 
 #[derive(Debug)]
 pub(in crate::v2::engine) struct ConnectionReservation {
-    permit: Option<OwnedSemaphorePermit>,
-    permit_pool: Option<Arc<tokio::sync::Semaphore>>,
-    permit_capacity: usize,
+    _permit: OwnedSemaphorePermit,
     state: ReservationState,
     qp_counted: bool,
     diagnostics: Option<Arc<ConnectionDiagnosticsGauge>>,
-    frontend_diagnostics: Option<Arc<Mutex<crate::v2::engine::diagnostics::PublishedDiagnostics>>>,
     indexed: bool,
 }
 
 impl ConnectionReservation {
-    pub(in crate::v2::engine) fn new_with_frontend_diagnostics(
-        permit: OwnedSemaphorePermit,
-        permit_pool: Arc<tokio::sync::Semaphore>,
-        permit_capacity: usize,
-        frontend_diagnostics: Arc<Mutex<crate::v2::engine::diagnostics::PublishedDiagnostics>>,
-    ) -> Self {
-        lock_unpoison(&frontend_diagnostics).engine.live_connections =
-            permit_capacity.saturating_sub(permit_pool.available_permits());
-        let mut reservation = Self::new_with_diagnostics(permit, None);
-        reservation.permit_pool = Some(permit_pool);
-        reservation.permit_capacity = permit_capacity;
-        reservation.frontend_diagnostics = Some(frontend_diagnostics);
-        reservation
-    }
-
     pub(in crate::v2::engine) fn new_with_diagnostics(
         permit: OwnedSemaphorePermit,
         diagnostics: Option<Arc<ConnectionDiagnosticsGauge>>,
@@ -957,13 +939,10 @@ impl ConnectionReservation {
             diagnostics.add_live();
         }
         Self {
-            permit: Some(permit),
-            permit_pool: None,
-            permit_capacity: 0,
+            _permit: permit,
             state: ReservationState::Establishing,
             qp_counted: false,
             diagnostics,
-            frontend_diagnostics: None,
             indexed: false,
         }
     }
@@ -1248,14 +1227,6 @@ impl Drop for ConnectionReservation {
     fn drop(&mut self) {
         if let Some(diagnostics) = &self.diagnostics {
             diagnostics.remove(self.state, self.qp_counted, self.indexed);
-        }
-        if let Some(diagnostics) = &self.frontend_diagnostics {
-            drop(self.permit.take());
-            let mut diagnostics = lock_unpoison(diagnostics);
-            diagnostics.engine.live_connections = self.permit_pool.as_ref().map_or(0, |pool| {
-                self.permit_capacity
-                    .saturating_sub(pool.available_permits())
-            });
         }
     }
 }

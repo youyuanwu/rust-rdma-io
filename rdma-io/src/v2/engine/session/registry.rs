@@ -681,11 +681,15 @@ impl ConnectionRegistry {
     }
 
     pub(in crate::v2::engine) fn admission_snapshot(&self) -> ConnectionStateCountSnapshot {
-        let mut snapshot = self.diagnostics.snapshot();
+        let mut snapshot = self.diagnostics_snapshot();
         snapshot.live = self
             .capacity
             .saturating_sub(self.admission.available_permits());
         snapshot
+    }
+
+    pub(in crate::v2::engine) fn diagnostics_snapshot(&self) -> ConnectionStateCountSnapshot {
+        self.diagnostics.snapshot()
     }
 
     #[cfg(test)]

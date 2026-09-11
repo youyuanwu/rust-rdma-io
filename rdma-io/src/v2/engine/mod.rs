@@ -620,11 +620,10 @@ impl EngineFrontendRoot {
         let diagnostics = Arc::new(Mutex::new(PublishedDiagnostics::initial(
             initial_cq_credits,
         )));
-        let commands = CommandIngress::new_with_diagnostics(
+        let commands = CommandIngress::new(
             config.max_live_connections,
             config.max_inflight_operations,
             Arc::clone(&work_signal),
-            Arc::clone(&diagnostics),
         );
         let observer = EngineObserver::new();
         let control =
@@ -727,7 +726,11 @@ impl EngineFrontendRoot {
     }
 
     fn diagnostics(&self) -> RdmaEngineDiagnostics {
-        lock_unpoison(&self.diagnostics).engine.clone()
+        let mut diagnostics = lock_unpoison(&self.diagnostics).engine.clone();
+        diagnostics.live_connections = diagnostics
+            .live_connections
+            .max(self.commands.connection_reservations());
+        diagnostics
     }
 
     #[cfg(test)]

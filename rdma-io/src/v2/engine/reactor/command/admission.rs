@@ -37,14 +37,7 @@ impl CommandIngress {
         let permit_pool = Arc::clone(&self.connection_permits);
         let reservation = Arc::clone(&permit_pool)
             .try_acquire_owned()
-            .map(|permit| {
-                ConnectionReservation::new_with_frontend_diagnostics(
-                    permit,
-                    Arc::clone(&permit_pool),
-                    self.connection_capacity,
-                    Arc::clone(&self.diagnostics),
-                )
-            })
+            .map(|permit| ConnectionReservation::new_with_diagnostics(permit, None))
             .map_err(|error| match error {
                 tokio::sync::TryAcquireError::NoPermits => Error::CapacityExhausted,
                 tokio::sync::TryAcquireError::Closed => Error::DriverShutdown,

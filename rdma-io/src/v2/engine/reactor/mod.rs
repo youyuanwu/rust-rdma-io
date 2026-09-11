@@ -255,7 +255,7 @@ impl EngineReactor {
         );
         let mut actions = ReactorActions::for_synchronous_driver_drop();
         self.finish_driver_drop_into(shared, outcome, &mut actions);
-        self.publish_diagnostics(shared, self.session.connections.admission_snapshot());
+        self.publish_diagnostics(shared, self.session.connections.diagnostics_snapshot());
         actions.publish();
     }
 
@@ -267,7 +267,7 @@ impl EngineReactor {
     ) {
         let mut actions = ReactorActions::default();
         self.finish_after_owner_cleanup_into(shared, outcome, &mut actions);
-        self.publish_diagnostics(shared, self.session.connections.admission_snapshot());
+        self.publish_diagnostics(shared, self.session.connections.diagnostics_snapshot());
         actions.publish();
     }
 
@@ -612,7 +612,7 @@ impl EngineReactor {
             observed_cm_would_block,
             self.resources.as_ref(),
         );
-        let connection_diagnostics = self.session.connections.admission_snapshot();
+        let connection_diagnostics = self.session.connections.diagnostics_snapshot();
         #[cfg(any(test, feature = "test-hooks"))]
         shared.update_cm_rejections(
             self.session
@@ -685,9 +685,7 @@ impl EngineReactor {
                     .lifecycle
                     .outcome()
                     .and_then(|outcome| outcome.summary()),
-                live_connections: connection
-                    .live
-                    .max(shared.commands.connection_reservations()),
+                live_connections: connection.live,
                 registered_operations: io.registered_operations,
                 accepted_operations: io.accepted_operations,
                 pending_reclamations: io.pending_reclamations,
@@ -707,7 +705,7 @@ impl EngineReactor {
     }
 
     pub(super) fn publish_current_diagnostics(&self, shared: &EngineFrontendRoot) {
-        self.publish_diagnostics(shared, self.session.connections.admission_snapshot());
+        self.publish_diagnostics(shared, self.session.connections.diagnostics_snapshot());
     }
 
     #[cfg(test)]
@@ -753,7 +751,7 @@ impl EngineReactor {
         shared: &Arc<EngineFrontendRoot>,
     ) -> ReactorActions {
         let actions = self.handle_driver_drop(shared);
-        self.publish_diagnostics(shared, self.session.connections.admission_snapshot());
+        self.publish_diagnostics(shared, self.session.connections.diagnostics_snapshot());
         #[cfg(any(test, feature = "test-hooks"))]
         shared.update_cm_rejections(
             self.session

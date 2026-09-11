@@ -78,31 +78,13 @@ pub(in crate::v2::engine) struct CommandIngress {
     closed: AtomicBool,
     closed_error: Mutex<Option<Error>>,
     signal: Arc<WorkSignal>,
-    diagnostics: Arc<Mutex<super::super::diagnostics::PublishedDiagnostics>>,
 }
 
 impl CommandIngress {
-    #[cfg(test)]
     pub(in crate::v2::engine) fn new(
         connection_capacity: usize,
         operation_capacity: usize,
         signal: Arc<WorkSignal>,
-    ) -> Arc<Self> {
-        Self::new_with_diagnostics(
-            connection_capacity,
-            operation_capacity,
-            signal,
-            Arc::new(Mutex::new(
-                super::super::diagnostics::PublishedDiagnostics::initial(operation_capacity),
-            )),
-        )
-    }
-
-    pub(in crate::v2::engine) fn new_with_diagnostics(
-        connection_capacity: usize,
-        operation_capacity: usize,
-        signal: Arc<WorkSignal>,
-        diagnostics: Arc<Mutex<super::super::diagnostics::PublishedDiagnostics>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             connect_permits: Arc::new(Semaphore::new(connection_capacity)),
@@ -119,7 +101,6 @@ impl CommandIngress {
             closed: AtomicBool::new(false),
             closed_error: Mutex::new(None),
             signal,
-            diagnostics,
         })
     }
 }
