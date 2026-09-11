@@ -551,7 +551,6 @@ impl ConnectionState {
             if self.close_result.is_none() {
                 self.close_result = Some(MemoizedTerminalResult::from_error(error.clone()));
             }
-            self.publish_close_result();
             return self.pending_io_event(IoTerminalEvent::Terminal(error));
         }
         None
@@ -566,7 +565,6 @@ impl ConnectionState {
             if self.close_result.is_none() {
                 self.close_result = Some(MemoizedTerminalResult::from_error(error.clone()));
             }
-            self.publish_close_result();
             return self.pending_io_event(IoTerminalEvent::Terminal(error));
         }
         None
@@ -585,7 +583,6 @@ impl ConnectionState {
         if self.close_result.is_none() {
             self.close_result = Some(MemoizedTerminalResult::from_error(error.clone()));
         }
-        self.publish_close_result();
         self.pending_io_event(IoTerminalEvent::Terminal(error))
     }
 
@@ -605,7 +602,7 @@ impl ConnectionState {
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) -> Option<PendingIoEvent> {
         let event = self.record_cm_failure(error);
-        self.wake_close_into(actions);
+        self.publish_close_result_into(false, actions);
         event
     }
 
@@ -733,7 +730,7 @@ impl ConnectionState {
         &self,
         actions: &mut crate::v2::engine::reactor::ReactorActions,
     ) {
-        self.close.notify_waiters_into(actions);
+        self.publish_close_result_into(false, actions);
     }
 
     pub(in crate::v2::engine) fn begin_quarantine(
@@ -756,8 +753,7 @@ impl ConnectionState {
         if self.close_result.is_none() {
             self.close_result = Some(MemoizedTerminalResult::from_error(error.clone()));
         }
-        self.publish_close_result();
-        self.close.notify_waiters_into(actions);
+        self.publish_close_result_into(false, actions);
         self.pending_io_event(IoTerminalEvent::Terminal(error))
     }
 
@@ -802,12 +798,11 @@ impl ConnectionState {
                 cause: error.to_string(),
             };
             self.close_result = Some(MemoizedTerminalResult::from_error(published.clone()));
-            self.publish_close_result();
             let event = self.pending_io_event(IoTerminalEvent::Terminal(published));
-            self.close.notify_waiters_into(actions);
+            self.publish_close_result_into(false, actions);
             return (true, event);
         }
-        self.close.notify_waiters_into(actions);
+        self.publish_close_result_into(false, actions);
         (false, None)
     }
 
@@ -836,9 +831,7 @@ impl ConnectionState {
         if self.close_result.is_none() {
             self.close_result = Some(MemoizedTerminalResult::success());
         }
-        self.publish_close_result();
-        self.close.mark_retired();
-        self.close.notify_waiters_into(actions);
+        self.publish_close_result_into(true, actions);
         self.pending_io_event(IoTerminalEvent::Closed(Ok(())))
     }
 
@@ -906,6 +899,7 @@ impl ConnectionState {
         );
     }
 
+    #[cfg(test)]
     fn publish_close_result(&self) {
         let Some(result) = self.close_result.as_ref() else {
             return;
@@ -914,6 +908,15 @@ impl ConnectionState {
         if observer.is_none() || result.is_connection_quarantined() {
             *observer = Some(result.clone());
         }
+    }
+
+    fn publish_close_result_into(
+        &self,
+        retired: bool,
+        actions: &mut crate::v2::engine::reactor::ReactorActions,
+    ) {
+        self.close
+            .publish_into(self.close_result.clone(), retired, actions);
     }
 
     #[cfg(test)]

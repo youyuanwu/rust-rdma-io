@@ -706,6 +706,10 @@ impl EngineReactor {
         };
     }
 
+    pub(super) fn publish_current_diagnostics(&self, shared: &EngineFrontendRoot) {
+        self.publish_diagnostics(shared, self.session.connections.admission_snapshot());
+    }
+
     #[cfg(test)]
     pub(super) fn turn_for_test(
         &mut self,
@@ -723,6 +727,7 @@ impl EngineReactor {
 
             Err(failure) => {
                 self.last_action_count = failure.actions.len();
+                self.publish_current_diagnostics(shared);
                 failure.actions.publish();
                 Err(failure.error)
             }

@@ -181,6 +181,7 @@ impl Future for RdmaEngineDriver {
                 let shared = Arc::clone(&self.shared);
                 self.reactor
                     .begin_driver_failure(&shared, failure.error.clone());
+                self.reactor.publish_current_diagnostics(&shared);
                 failure.actions.publish();
                 cx.waker().wake_by_ref();
                 return Poll::Pending;

@@ -65,6 +65,7 @@ pub(super) struct QpDestructionProof {
 /// becomes authoritative. Repeated close calls share this one state.
 pub(super) struct SessionCloseState {
     pub(super) outcome: Mutex<Option<super::lifecycle::MemoizedTerminalResult>>,
+    pending_engine_terminal: Mutex<Option<super::lifecycle::MemoizedTerminalResult>>,
     engine_terminal: Mutex<Option<super::lifecycle::MemoizedTerminalResult>>,
     pub(super) notify: Arc<tokio::sync::Notify>,
     retired: AtomicBool,
@@ -74,6 +75,7 @@ impl SessionCloseState {
     pub(super) fn new() -> Arc<Self> {
         Arc::new(Self {
             outcome: Mutex::new(None),
+            pending_engine_terminal: Mutex::new(None),
             engine_terminal: Mutex::new(None),
             notify: Arc::new(tokio::sync::Notify::new()),
             retired: AtomicBool::new(false),
@@ -106,7 +108,7 @@ impl SessionCloseState {
         &self,
         outcome: &super::lifecycle::MemoizedTerminalResult,
     ) {
-        let mut terminal = lock_unpoison(&self.engine_terminal);
+        let mut terminal = lock_unpoison(&self.pending_engine_terminal);
         if terminal.is_none() {
             *terminal = Some(outcome.clone());
         }
@@ -121,12 +123,31 @@ impl SessionCloseState {
         self.notify.notify_waiters();
     }
 
-    pub(super) fn notify_waiters_into(
+    pub(super) fn publish_into(
         self: &Arc<Self>,
+        outcome: Option<super::lifecycle::MemoizedTerminalResult>,
+        retired: bool,
         actions: &mut super::reactor::ReactorActions,
     ) {
         let close = Arc::clone(self);
-        actions.push_close_or_listener(move || close.notify.notify_waiters());
+        actions.push_close_or_listener(move || {
+            if let Some(outcome) = lock_unpoison(&close.pending_engine_terminal).take() {
+                let mut terminal = lock_unpoison(&close.engine_terminal);
+                if terminal.is_none() {
+                    *terminal = Some(outcome);
+                }
+            }
+            if let Some(outcome) = outcome {
+                let mut current = lock_unpoison(&close.outcome);
+                if current.is_none() || outcome.is_connection_quarantined() {
+                    *current = Some(outcome);
+                }
+            }
+            if retired {
+                close.mark_retired();
+            }
+            close.notify.notify_waiters();
+        });
     }
 }
 

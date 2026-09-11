@@ -173,6 +173,31 @@ fn terminal_events_are_pending_until_backend_state_is_committed() {
 }
 
 #[test]
+fn retirement_result_is_hidden_until_post_turn_publication() {
+    let mut connection = ConnectionState::new(
+        ConnectionToken {
+            slot: 0,
+            generation: 1,
+        },
+        Arc::new(TestPoster),
+        RdmaConnectionConfig::default(),
+        None,
+        None,
+        None,
+    );
+    let close = connection.close_state();
+    let mut actions = crate::v2::engine::reactor::ReactorActions::default();
+
+    assert!(connection.finish_retirement_into(&mut actions).is_none());
+    assert!(close.outcome().is_none());
+    assert!(!close.is_retired());
+
+    actions.publish();
+    assert!(close.outcome().is_some_and(|outcome| outcome.is_success()));
+    assert!(close.is_retired());
+}
+
+#[test]
 fn returned_qp_capabilities_must_not_be_reduced() {
     let config = RdmaConnectionConfig::default();
     QpCapabilities {
