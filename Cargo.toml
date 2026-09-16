@@ -53,7 +53,7 @@ rcgen = "0.14"
 # Build / codegen
 cc = "1"
 tonic-prost-build = "0.14"
-windows-bindgen = "0.66"
+windows-bindgen = "0.100"
 
 # Dev / test
 tempfile = "3"
