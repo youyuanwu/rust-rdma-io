@@ -9,9 +9,9 @@ description = "Generator that produces the bnd-rdma crate from rdma-core system 
 publish = false
 
 [dependencies]
-bnd-winmd.workspace = true
-tracing-subscriber.workspace = true
-windows-bindgen.workspace = true
-
-[dev-dependencies]
+bnd-bindgen.workspace = true
+bnd-clang.workspace = true
 tempfile.workspace = true
+tracing-subscriber.workspace = true
+windows-metadata.workspace = true
+windows-rdl.workspace = true

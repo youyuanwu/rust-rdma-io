@@ -16,8 +16,9 @@ rdma-io-tonic = { path = "rdma-io-tonic", version = "0.0.2" }
 rdma-io-quinn = { path = "rdma-io-quinn", version = "0.0.1" }
 
 # bnd ecosystem
-bnd-winmd = "0.0.7"
-bnd-linux = "0.0.6"
+bnd-clang = "0.0.7"
+bnd-bindgen = "0.0.7"
+bnd-linux = "0.0.7"
 bnd-macros = "0.0.6"
 
 # Core
@@ -53,7 +54,8 @@ rcgen = "0.14"
 # Build / codegen
 cc = "1"
 tonic-prost-build = "0.14"
-windows-bindgen = "0.66"
+windows-metadata = "0.100"
+windows-rdl = { version = "0.100", default-features = false }
 
 # Dev / test
 tempfile = "3"

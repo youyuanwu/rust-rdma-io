@@ -128,17 +128,20 @@ teardown-rxe:
 gen-bindings:
     #!/usr/bin/env bash
     set -euo pipefail
-    winmd_url="https://github.com/youyuanwu/bnd/raw/refs/heads/main/bnd-linux/winmd/bnd-linux.winmd"
+    winmd_url="https://raw.githubusercontent.com/youyuanwu/bnd/f03e14ddc3123efa27029872b4dd7d555ab983bb/bnd-linux/winmd/bnd-linux.winmd"
+    winmd_sha256="cba0abba36755696666ecfa0e39c02f14b260ac7b19e9cde5812137ab451838c"
     winmd="build/winmd/bnd-linux.winmd"
-    if [[ -f "$winmd" ]]; then
-        echo "bnd-linux.winmd already present ($(stat -c%s "$winmd") bytes)"
+    if [[ -f "$winmd" ]] && [[ "$(sha256sum "$winmd" | cut -d' ' -f1)" == "$winmd_sha256" ]]; then
+        echo "bnd-linux 0.0.7 WinMD already present ($(stat -c%s "$winmd") bytes)"
     else
-        echo "Downloading bnd-linux.winmd to ${winmd}"
+        echo "Downloading bnd-linux 0.0.7 WinMD to ${winmd}"
         mkdir -p "$(dirname "$winmd")"
-        curl --proto '=https' --tlsv1.2 -fSL "$winmd_url" -o "$winmd"
+        curl --proto '=https' --tlsv1.2 -fSL "$winmd_url" -o "${winmd}.tmp"
+        echo "${winmd_sha256}  ${winmd}.tmp" | sha256sum --check
+        mv "${winmd}.tmp" "$winmd"
         echo "Downloaded bnd-linux.winmd ($(stat -c%s "$winmd") bytes)"
     fi
-    cargo run -p bnd-rdma-gen
+    cargo run -p bnd-rdma-gen -j 1
 
 # Remove build artifacts.
 clean:

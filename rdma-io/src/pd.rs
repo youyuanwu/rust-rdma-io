@@ -74,7 +74,7 @@ impl ProtectionDomain {
             ibv_reg_mr(
                 self.inner,
                 buf.as_mut_ptr().cast(),
-                buf.len() as u64,
+                buf.len(),
                 access.bits() as i32,
             )
         })?;
@@ -98,7 +98,7 @@ impl ProtectionDomain {
             ibv_reg_mr(
                 self.inner,
                 buf.as_mut_ptr().cast(),
-                buf.len() as u64,
+                buf.len(),
                 access.bits() as i32,
             )
         })?;

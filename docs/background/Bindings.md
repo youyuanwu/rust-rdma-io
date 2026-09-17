@@ -362,9 +362,9 @@ Same as Option D but vendors a copy of `verbs.h` instead of using system headers
 
 Two crates in the `rust-rdma-io` workspace:
 
-1. **`bnd-rdma-gen`** — Developer-time generator. Extracts RDMA types from system headers via `bnd-winmd` into a `.winmd`, then runs `windows-bindgen` to emit Rust FFI modules. Three partitions: ibverbs (275 structs, 92 enums, 164 functions), rdmacm (19 structs, 4 enums, 40 functions), wrapper (96 inline function wrappers).
+1. **`bnd-rdma-gen`** — Developer-time generator. Uses the bnd 0.0.7 direct-Clang pipeline (`bnd-clang` → RDL → `windows-rdl` → canonical WinMD → `bnd-bindgen`) to emit the `ibverbs`, `rdmacm`, and `wrapper` Rust FFI modules.
 
-2. **`rdma-io-sys`** — User-facing sys crate. Contains the generated FFI modules (`src/rdma/`) directly — no separate generated crate. Compiles `wrapper.c` (96 C wrappers for static inline functions) via `cc` crate. Cross-references `bnd-posix` (pthread, socket, inet types) and `bnd-linux` (`__be16/32/64`) via `--reference` flags.
+2. **`rdma-io-sys`** — User-facing sys crate. Contains the generated FFI modules (`src/rdma/`) directly — no separate generated crate. Compiles `wrapper.c` (96 C wrappers for static inline functions) via `cc` and routes shared POSIX/Linux types to the defining-header modules in `bnd-linux` 0.0.7.
 
 ### Build flow:
 ```
@@ -421,5 +421,5 @@ Regardless of binding approach, we need to decide what to bind:
 4. **Code generation tool**: bnd (not bindgen) — pre-generated, namespaced modules, type sharing with `bnd-posix`/`bnd-linux`. (Resolved & implemented: Feb 2026)
 5. **Wrapper naming**: `rdma_wrap_` prefix (e.g., `rdma_wrap_ibv_post_send`). (Resolved & implemented: Feb 2026)
 6. **Wrapper as bnd partition**: `wrapper.h` is a third bnd partition, so Rust FFI declarations are auto-generated with cross-module references. (Resolved & implemented: Feb 2026)
-7. **`__be*` types**: Added `linux.types` partition to bnd-linux upstream. (Resolved & committed: Feb 2026)
+7. **`__be*` types**: Reused from the `bnd_linux::libc::types` defining-header module. (Updated: Sep 2026)
 8. **Single sys crate**: Merged `bnd-rdma` into `rdma-io-sys` — generated FFI modules live alongside `build.rs` and `wrapper.c`. No separate generated crate. (Resolved: Feb 2026)
