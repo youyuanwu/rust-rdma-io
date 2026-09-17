@@ -1024,10 +1024,10 @@ fn to_sockaddr_storage(addr: &SocketAddr) -> SockAddrBuf {
     let mut buf = [0u8; std::mem::size_of::<bnd_linux::libc::socket::sockaddr_storage>()];
     match addr {
         SocketAddr::V4(v4) => {
-            let sa = bnd_linux::libc::r#in::sockaddr_in {
+            let sa = bnd_linux::libc::in_::sockaddr_in {
                 sin_family: AF_INET,
                 sin_port: v4.port().to_be(),
-                sin_addr: bnd_linux::libc::r#in::in_addr {
+                sin_addr: bnd_linux::libc::in_::in_addr {
                     s_addr: u32::from_ne_bytes(v4.ip().octets()),
                 },
                 ..Default::default()
@@ -1041,12 +1041,12 @@ fn to_sockaddr_storage(addr: &SocketAddr) -> SockAddrBuf {
             }
         }
         SocketAddr::V6(v6) => {
-            let sa = bnd_linux::libc::r#in::sockaddr_in6 {
+            let sa = bnd_linux::libc::in_::sockaddr_in6 {
                 sin6_family: AF_INET6,
                 sin6_port: v6.port().to_be(),
                 sin6_flowinfo: v6.flowinfo(),
-                sin6_addr: bnd_linux::libc::r#in::in6_addr {
-                    __in6_u: bnd_linux::libc::r#in::in6_addr_0 {
+                sin6_addr: bnd_linux::libc::in_::in6_addr {
+                    __in6_u: bnd_linux::libc::in_::in6_addr_0 {
                         __u6_addr8: v6.ip().octets(),
                     },
                 },
@@ -1094,12 +1094,12 @@ unsafe fn sockaddr_to_std(sa: *const bnd_linux::libc::socket::sockaddr) -> Optio
     unsafe {
         let family = (*sa).sa_family;
         if family == AF_INET {
-            let sin = &*(sa as *const bnd_linux::libc::r#in::sockaddr_in);
+            let sin = &*(sa as *const bnd_linux::libc::in_::sockaddr_in);
             let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
             let port = u16::from_be(sin.sin_port);
             Some(SocketAddr::V4(std::net::SocketAddrV4::new(ip, port)))
         } else if family == AF_INET6 {
-            let sin6 = &*(sa as *const bnd_linux::libc::r#in::sockaddr_in6);
+            let sin6 = &*(sa as *const bnd_linux::libc::in_::sockaddr_in6);
             let ip = std::net::Ipv6Addr::from(sin6.sin6_addr.__in6_u.__u6_addr8);
             let port = u16::from_be(sin6.sin6_port);
             Some(SocketAddr::V6(std::net::SocketAddrV6::new(

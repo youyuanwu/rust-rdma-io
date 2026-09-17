@@ -362,9 +362,9 @@ Same as Option D but vendors a copy of `verbs.h` instead of using system headers
 
 Two crates in the `rust-rdma-io` workspace:
 
-1. **`bnd-rdma-gen`** — Developer-time generator. Uses the bnd 0.0.7 direct-Clang pipeline (`bnd-clang` → RDL → `windows-rdl` → canonical WinMD → `bnd-bindgen`) to emit the `ibverbs`, `rdmacm`, and `wrapper` Rust FFI modules.
+1. **`bnd-rdma-gen`** — Developer-time generator. Uses the bnd 0.0.8 direct-Clang pipeline (`bnd-clang` → RDL → `windows-rdl` → canonical header-owned WinMD → `bnd-bindgen`) to emit the RDMA Rust FFI modules.
 
-2. **`rdma-io-sys`** — User-facing sys crate. Contains the generated FFI modules (`src/rdma/`) directly — no separate generated crate. Compiles `wrapper.c` (96 C wrappers for static inline functions) via `cc` and routes shared POSIX/Linux types to the defining-header modules in `bnd-linux` 0.0.7.
+2. **`rdma-io-sys`** — User-facing sys crate. Contains the generated FFI modules (`src/rdma/`) directly — no separate generated crate. Compiles `wrapper.c` (96 C wrappers for static inline functions) via `cc` and routes the canonical `libc` metadata namespace to `bnd-linux` 0.0.8.
 
 ### Build flow:
 ```

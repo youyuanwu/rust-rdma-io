@@ -9,7 +9,7 @@ description = "Low-level RDMA sys crate — FFI bindings for libibverbs + librdm
 readme = "README.md"
 
 [dependencies]
-bnd-linux = { workspace = true, features = ["in", "pthreadtypes", "socket", "struct_timespec", "types", "unistd"] }
+bnd-linux = { workspace = true, features = ["in_", "pthreadtypes", "socket", "struct_timespec", "types", "unistd"] }
 bnd-macros = { workspace = true }
 
 [build-dependencies]
@@ -18,7 +18,14 @@ cc.workspace = true
 [features]
 default = ["ibverbs", "rdmacm", "wrapper"]
 Foundation = []
+ibverbs = ["verbs", "verbs_api"]
+rdmacm = ["ibverbs", "rdma_cma"]
 # generated features
-ibverbs = []
-rdmacm = ["ibverbs"]
-wrapper = ["ibverbs"]
+ib_user_ioctl_verbs = ["ib_user_verbs", "int_ll64"]
+ib_user_verbs = ["int_ll64"]
+int_ll64 = []
+rdma_cma = ["sa", "verbs"]
+sa = ["verbs"]
+verbs = ["ib_user_ioctl_verbs"]
+verbs_api = []
+wrapper = ["ib_user_ioctl_verbs", "verbs"]

@@ -128,13 +128,13 @@ teardown-rxe:
 gen-bindings:
     #!/usr/bin/env bash
     set -euo pipefail
-    winmd_url="https://raw.githubusercontent.com/youyuanwu/bnd/f03e14ddc3123efa27029872b4dd7d555ab983bb/bnd-linux/winmd/bnd-linux.winmd"
-    winmd_sha256="cba0abba36755696666ecfa0e39c02f14b260ac7b19e9cde5812137ab451838c"
+    winmd_url="https://raw.githubusercontent.com/youyuanwu/bnd/9b3d718f33d362234ccd421a5e539f676db622e6/bnd-linux/winmd/bnd-linux.winmd"
+    winmd_sha256="c0a350a943d555b1e7179be69a0d0829ba17e05809c37a7ff7162e97e7ab6371"
     winmd="build/winmd/bnd-linux.winmd"
     if [[ -f "$winmd" ]] && [[ "$(sha256sum "$winmd" | cut -d' ' -f1)" == "$winmd_sha256" ]]; then
-        echo "bnd-linux 0.0.7 WinMD already present ($(stat -c%s "$winmd") bytes)"
+        echo "bnd-linux 0.0.8 WinMD already present ($(stat -c%s "$winmd") bytes)"
     else
-        echo "Downloading bnd-linux 0.0.7 WinMD to ${winmd}"
+        echo "Downloading bnd-linux 0.0.8 WinMD to ${winmd}"
         mkdir -p "$(dirname "$winmd")"
         curl --proto '=https' --tlsv1.2 -fSL "$winmd_url" -o "${winmd}.tmp"
         echo "${winmd_sha256}  ${winmd}.tmp" | sha256sum --check

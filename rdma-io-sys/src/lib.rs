@@ -13,4 +13,19 @@
 pub mod rdma;
 pub use rdma::*;
 
+#[cfg(feature = "ibverbs")]
+pub mod ibverbs {
+    pub use crate::rdma::ib_user_ioctl_verbs::*;
+    pub use crate::rdma::ib_user_verbs::*;
+    pub use crate::rdma::int_ll64::*;
+    pub use crate::rdma::verbs::*;
+    pub use crate::rdma::verbs_api::*;
+}
+
+#[cfg(feature = "rdmacm")]
+pub mod rdmacm {
+    pub use crate::rdma::rdma_cma::*;
+    pub use crate::rdma::sa::*;
+}
+
 extern crate bnd_macros as windows_link;

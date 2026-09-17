@@ -246,9 +246,9 @@ checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
 name = "bnd-bindgen"
-version = "0.0.7"
+version = "0.0.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fdb6f5c1f8c0073057c6cab4c6e440d811f1f8476e60823c8255b95b46eaeb3d"
+checksum = "e191cd35078e7e9a29d196857c3da2cb6d3b580e3fa10fd9b957fd96b12be984"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -258,9 +258,9 @@ dependencies = [
 
 [[package]]
 name = "bnd-clang"
-version = "0.0.7"
+version = "0.0.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7ff2720ee0047fa9fd17690534cbf68dcce4cafc38ac41ce693b8a6cc786f97"
+checksum = "e7c0da70cf7d22b71d63c7c8ca9d7e5f6d8b72f0d2fbd04f035def3d81b4c395"
 dependencies = [
  "clang-sys",
  "proc-macro2",
@@ -274,9 +274,9 @@ dependencies = [
 
 [[package]]
 name = "bnd-linux"
-version = "0.0.7"
+version = "0.0.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a75dc8af01d6e085cbe6f739086ebd988940697b6ab80b8cc296618ece14adb"
+checksum = "c9631514865a4b5806a6ca16902d12aa64a9e17918fd0ab6031a1acddc212502"
 dependencies = [
  "bnd-macros",
 ]
