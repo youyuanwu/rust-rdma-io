@@ -317,10 +317,10 @@ impl SendWr {
         // Set immediate data if applicable.
         match self.opcode {
             WrOpcode::SendWithImm(imm) | WrOpcode::RdmaWriteWithImm(imm) => {
-                wr.ibv_send_wr__anon_0.imm_data = imm;
+                wr.Anonymous.imm_data = imm;
             }
             WrOpcode::LocalInv => {
-                wr.ibv_send_wr__anon_0.invalidate_rkey = self.invalidate_rkey;
+                wr.Anonymous.invalidate_rkey = self.invalidate_rkey;
             }
             _ => {}
         }
@@ -328,13 +328,13 @@ impl SendWr {
         // Set RDMA fields.
         match self.opcode {
             WrOpcode::RdmaWrite | WrOpcode::RdmaWriteWithImm(_) | WrOpcode::RdmaRead => {
-                wr.wr.rdma = ibv_send_wr_wr_rdma {
+                wr.wr.rdma = ibv_send_wr_1_0 {
                     remote_addr: self.rdma_remote_addr,
                     rkey: self.rdma_rkey,
                 };
             }
             WrOpcode::AtomicCmpAndSwp | WrOpcode::AtomicFetchAndAdd => {
-                wr.wr.atomic = ibv_send_wr_wr_atomic {
+                wr.wr.atomic = ibv_send_wr_1_1 {
                     remote_addr: self.rdma_remote_addr,
                     compare_add: self.atomic_compare_add,
                     swap: self.atomic_swap,
@@ -342,7 +342,7 @@ impl SendWr {
                 };
             }
             WrOpcode::BindMw => {
-                wr.ibv_send_wr__anon_1.bind_mw = ibv_send_wr__anon_1_bind_mw {
+                wr.Anonymous2.bind_mw = ibv_send_wr_3_0 {
                     mw: self.bind_mw_mw,
                     rkey: self.bind_mw_rkey,
                     bind_info: self.bind_mw_bind_info,

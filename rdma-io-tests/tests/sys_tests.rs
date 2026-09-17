@@ -166,7 +166,7 @@ fn test_register_deregister_mr() {
         let mr = rdma_io_sys::wrapper::rdma_wrap___ibv_reg_mr(
             pd,
             buf.as_mut_ptr() as *mut core::ffi::c_void,
-            buf.len() as u64,
+            buf.len(),
             IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE,
             1,
         );
@@ -241,14 +241,14 @@ fn test_multiple_resources() {
         let mr1 = rdma_io_sys::wrapper::rdma_wrap___ibv_reg_mr(
             pd1,
             buf1.as_mut_ptr() as *mut core::ffi::c_void,
-            buf1.len() as u64,
+            buf1.len(),
             IBV_ACCESS_LOCAL_WRITE,
             1,
         );
         let mr2 = rdma_io_sys::wrapper::rdma_wrap___ibv_reg_mr(
             pd2,
             buf2.as_mut_ptr() as *mut core::ffi::c_void,
-            buf2.len() as u64,
+            buf2.len(),
             IBV_ACCESS_LOCAL_WRITE,
             1,
         );

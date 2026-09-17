@@ -64,7 +64,7 @@ impl WorkCompletion {
 
     /// Immediate data (valid if `wc_flags` has `IBV_WC_WITH_IMM`).
     pub fn imm_data(&self) -> u32 {
-        unsafe { self.inner.ibv_wc__anon_0.imm_data }
+        unsafe { self.inner.Anonymous.imm_data }
     }
 
     /// Raw `ibv_wc` reference.

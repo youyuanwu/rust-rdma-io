@@ -16,7 +16,7 @@ test-hooks = ["tokio"]
 
 [dependencies]
 rdma-io-sys.workspace = true
-bnd-linux = { workspace = true, features = ["posix_socket", "posix_inet"] }
+bnd-linux = { workspace = true, features = ["in_", "socket"] }
 bitflags.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

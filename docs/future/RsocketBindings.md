@@ -79,7 +79,7 @@ enum { RDMA_SQSIZE, RDMA_RQSIZE, RDMA_INLINE, RDMA_IOMAPSIZE, RDMA_ROUTE };
 
 ### Layer 1: FFI Bindings (rdma-io-sys)
 
-Add rsocket as a new partition in `bnd-rdma-gen/rdma.toml`:
+Add rsocket headers to the direct-Clang scope in `bnd-rdma-gen/src/clang.rs`:
 
 ```toml
 [[partition]]
@@ -242,7 +242,7 @@ tests/
 ## Implementation Phases
 
 ### Phase 1: FFI Bindings
-- Add `rsocket` partition to `bnd-rdma-gen/rdma.toml`
+- Add an `rsocket` header route to `bnd-rdma-gen/src/clang.rs`
 - Regenerate bindings with `cargo run -p bnd-rdma-gen`
 - Verify rsocket symbols appear in `rdma-io-sys`
 
@@ -458,7 +458,7 @@ impl tokio::io::AsyncRead for AsyncRSocket {
 
 ## Other Open Questions
 
-1. **bnd-rdma-gen compatibility:** Does `bnd-winmd` handle rsocket.h correctly? The header uses `off_t`, `struct msghdr`, variadic `rfcntl()` — may need wrapper functions in `rdma-io-sys/wrapper/` for unsupported patterns.
+1. **bnd-rdma-gen compatibility:** Does `bnd-clang` handle rsocket.h correctly? The header uses `off_t`, `struct msghdr`, variadic `rfcntl()` — it may need external `bnd-linux` routes or wrapper functions in `rdma-io-sys/wrapper/`.
 
 2. **rfcntl variadic:** C variadic functions can't be called directly from Rust. Add wrappers to the existing `rdma-io-sys/wrapper/wrapper.{h,c}` (same pattern used for inline ibverbs functions):
    ```c
@@ -471,7 +471,7 @@ impl tokio::io::AsyncRead for AsyncRSocket {
    int rdma_wrap_rfcntl_getfl(int socket) { return rfcntl(socket, F_GETFL); }
    int rdma_wrap_rfcntl_setfl(int socket, int flags) { return rfcntl(socket, F_SETFL, flags); }
    ```
-   These get compiled into `librdma_wrapper` and picked up by the existing `wrapper` partition in `bnd-rdma-gen/rdma.toml`.
+   These get compiled into `librdma_wrapper` and picked up by the wrapper header route in `bnd-rdma-gen/src/clang.rs`.
 
 3. **Performance vs AsyncRdmaStream:** On hardware, rsocket manages its own QP/CQ internally. Our AsyncRdmaStream has fine-grained control over buffer sizes and CQ polling. The rpoll thread adds latency that raw verbs don't have. Is rsocket's convenience worth the overhead for gRPC workloads?
 

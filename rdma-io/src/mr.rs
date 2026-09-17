@@ -77,7 +77,7 @@ impl MemoryRegion<'_> {
 
     /// The registered length.
     pub fn length(&self) -> usize {
-        unsafe { (*self.inner).length as usize }
+        unsafe { (*self.inner).length }
     }
 
     /// Raw pointer (for advanced/FFI use).
