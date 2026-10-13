@@ -1171,7 +1171,7 @@ impl TestDriverState {
     #[cfg(test)]
     fn next_idle_qp(&self) -> Result<u32> {
         self.next_idle_qp
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current.checked_add(1)
             })
             .map_err(|_| Error::CapacityExhausted)
@@ -1596,7 +1596,7 @@ impl TestDriverState {
         }
         let slot = self
             .next_slot
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |slot| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |slot| {
                 slot.checked_add(1)
             })
             .map_err(|_| Error::CapacityExhausted)?;

@@ -273,7 +273,7 @@ impl CommandIngress {
     ) -> Result<ProtocolPayloadReservation, Error> {
         self.validate_operation_batch(operations)?;
         self.pending_protocol_operations
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
                 pending
                     .checked_add(operations)
                     .filter(|next| *next <= self.operation_capacity)

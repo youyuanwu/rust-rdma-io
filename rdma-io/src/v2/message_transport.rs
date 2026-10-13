@@ -1544,7 +1544,7 @@ impl EngineMessageState {
         }
         if self
             .credits_in_flight
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                 value.checked_sub(1)
             })
             .is_ok()
@@ -1562,7 +1562,7 @@ impl EngineMessageState {
             self.peer_recv_capacity.load(Ordering::Acquire),
         )?;
         self.credits_in_flight
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                 value.checked_sub(credits)
             })
             .map_err(|value| {

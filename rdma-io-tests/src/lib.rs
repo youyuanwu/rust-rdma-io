@@ -1698,6 +1698,10 @@ mod tests {
 /// a simple test service with unary, server-streaming, client-streaming,
 /// and bidirectional-streaming RPCs.
 pub mod greeter_service {
+    #[allow(
+        clippy::double_must_use,
+        reason = "tonic's generated async_trait methods add redundant must_use attributes"
+    )]
     pub mod greeter {
         tonic::include_proto!("greeter");
     }
