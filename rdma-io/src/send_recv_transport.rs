@@ -162,8 +162,11 @@ impl SendRecvTransport {
 
         async_cm.connect(&ConnParam::default()).await?;
 
+        // SAFETY: event_channel owns the fd and is dropped after cm_async_fd.
+        // Register before splitting ownership so errors drop qp before the CM.
+        let cm_async_fd = unsafe { AsyncFd::register(async_cm.event_channel().fd()) }
+            .map_err(|error| crate::Error::Verbs(error.into()))?;
         let (event_channel, cm_id) = async_cm.into_parts();
-        let cm_async_fd = AsyncFd::new(event_channel.fd()).map_err(crate::Error::Verbs)?;
 
         Ok(Self::from_parts(
             qp,
@@ -232,8 +235,11 @@ impl SendRecvTransport {
         listener.await_established().await?;
         let conn_ch = EventChannel::new()?;
         conn_ch.set_nonblocking()?;
+        // SAFETY: conn_ch moves into event_channel, which drops after cm_async_fd.
+        // Register before migration so registration errors leave conn_id on the listener.
+        let cm_async_fd = unsafe { AsyncFd::register(conn_ch.fd()) }
+            .map_err(|error| crate::Error::Verbs(error.into()))?;
         conn_id.migrate(&conn_ch)?;
-        let cm_async_fd = AsyncFd::new(conn_ch.fd()).map_err(crate::Error::Verbs)?;
 
         Ok(Self::from_parts(
             qp,
