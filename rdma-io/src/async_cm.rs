@@ -9,7 +9,7 @@
 
 use std::mem::ManuallyDrop;
 use std::net::SocketAddr;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{BorrowedFd, OwnedFd};
 use std::sync::Arc;
 
 use tokio::io::unix::AsyncFd;
@@ -26,7 +26,7 @@ use crate::qp::QpInitAttr;
 /// Uses tokio's `AsyncFd` to await readiness on the event channel fd,
 /// then calls `try_get_event()` for non-blocking event retrieval.
 pub(crate) struct AsyncEventChannel {
-    async_fd: AsyncFd<RawFd>,
+    async_fd: AsyncFd<OwnedFd>,
 }
 
 impl AsyncEventChannel {
@@ -34,7 +34,13 @@ impl AsyncEventChannel {
     ///
     /// The underlying `EventChannel` must already be set to non-blocking mode.
     pub(crate) fn new(ch: &EventChannel) -> Result<Self> {
-        let async_fd = AsyncFd::new(ch.fd()).map_err(crate::Error::Verbs)?;
+        // SAFETY: ch owns this descriptor and is borrowed until duplication completes.
+        let fd = unsafe { BorrowedFd::borrow_raw(ch.fd()) }
+            .try_clone_to_owned()
+            .map_err(crate::Error::Verbs)?;
+        // SAFETY: AsyncFd owns the duplicate and never replaces or closes it early.
+        let async_fd =
+            unsafe { AsyncFd::register(fd) }.map_err(|error| crate::Error::Verbs(error.into()))?;
         Ok(Self { async_fd })
     }
 
@@ -338,7 +344,7 @@ unsafe impl Send for AsyncCmListener {}
 // Safety: All fields are Sync:
 // - CmId: `unsafe impl Sync` (kernel operations are atomic)
 // - EventChannel: `unsafe impl Sync` (kernel fd queue is serialized)
-// - AsyncEventChannel: contains `AsyncFd<RawFd>` which is Sync
+// - AsyncEventChannel: contains `AsyncFd<OwnedFd>` which is Sync
 // - pending_requests: `Mutex<VecDeque<CmId>>` is Sync
 // Concurrent &self callers are safe; the kernel serializes event delivery.
 unsafe impl Sync for AsyncCmListener {}
@@ -346,7 +352,7 @@ unsafe impl Sync for AsyncCmListener {}
 impl Drop for AsyncCmListener {
     fn drop(&mut self) {
         // RDMA teardown order: CM ID first, then event channel.
-        // async_ch has no Drop (just wraps an AsyncFd).
+        // async_ch owns a duplicate fd, so it can deregister after the channel closes.
         unsafe {
             ManuallyDrop::drop(&mut self._cm_id);
             ManuallyDrop::drop(&mut self.event_channel);

@@ -282,7 +282,7 @@ impl PendingCreditRing {
     }
 
     /// Take ownership of the established CM connection's decomposed parts (fd +
-    /// CM id + event channel). Infallible: the fallible `AsyncFd::new` is done by
+    /// CM id + event channel). Infallible: the fallible `AsyncFd::register` is done by
     /// the caller on a borrow *before* this call (so the CM handle stays intact —
     /// and thus the QP's CM id stays alive — if it fails).
     fn attach_cm(&mut self, cm_async_fd: AsyncFd<RawFd>, cm_id: CmId, event_channel: EventChannel) {
@@ -543,11 +543,13 @@ impl CreditRingTransport {
         // cancellation here drops `pending` first (QP destroyed) then `async_cm`.
         async_cm.connect(&ConnParam::default()).await?;
 
-        // Attach the established CM. The fallible `AsyncFd::new` runs on a borrow
+        // Attach the established CM. The fallible `AsyncFd::register` runs on a borrow
         // *before* `into_parts`, so `async_cm` stays intact (CM id alive) if it
         // fails.
-        let cm_async_fd =
-            AsyncFd::new(async_cm.event_channel().fd()).map_err(crate::Error::Verbs)?;
+        // SAFETY: the channel moves into PendingCm, then the transport; both
+        // declare cm_async_fd before the owning event_channel.
+        let cm_async_fd = unsafe { AsyncFd::register(async_cm.event_channel().fd()) }
+            .map_err(|error| crate::Error::Verbs(error.into()))?;
         let (event_channel, cm_id) = async_cm.into_parts();
         pending.attach_cm(cm_async_fd, cm_id, event_channel);
 
@@ -590,9 +592,11 @@ impl CreditRingTransport {
         let conn_ch = EventChannel::new()?;
         conn_ch.set_nonblocking()?;
         conn_id.migrate(&conn_ch)?;
-        // Fallible `AsyncFd::new` on a borrow before consuming `conn_id`/`conn_ch`
+        // Fallible `AsyncFd::register` on a borrow before consuming `conn_id`/`conn_ch`
         // into the bundle, so both stay live (QP's CM id alive) if it fails.
-        let cm_async_fd = AsyncFd::new(conn_ch.fd()).map_err(crate::Error::Verbs)?;
+        // SAFETY: PendingCm and the transport drop cm_async_fd before conn_ch.
+        let cm_async_fd = unsafe { AsyncFd::register(conn_ch.fd()) }
+            .map_err(|error| crate::Error::Verbs(error.into()))?;
         pending.attach_cm(cm_async_fd, conn_id, conn_ch);
 
         // Bind MW, exchange tokens, drain setup sends, post doorbells.

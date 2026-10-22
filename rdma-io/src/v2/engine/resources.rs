@@ -70,10 +70,14 @@ impl EngineReactorResources {
                         "readiness mode did not create a CQ completion channel".into(),
                     )
                 })?;
-                (
-                    Some(try_async_fd(cq_fd, "CQ completion channel")?),
-                    Some(try_async_fd(cm_event_channel.fd(), "CM event channel")?),
-                )
+                // SAFETY: the CQ and CM channel own these fds. Locals and Self's
+                // field order keep both owners alive until their adapters drop.
+                unsafe {
+                    (
+                        Some(try_async_fd(cq_fd, "CQ completion channel")?),
+                        Some(try_async_fd(cm_event_channel.fd(), "CM event channel")?),
+                    )
+                }
             }
             CompletionMode::Polling => (None, None),
         };
@@ -134,10 +138,14 @@ impl EngineReactorResources {
     }
 }
 
-fn try_async_fd(fd: RawFd, resource: &str) -> Result<AsyncFd<RawFd>> {
+/// # Safety
+///
+/// fd must remain open and unchanged until the returned adapter is dropped.
+unsafe fn try_async_fd(fd: RawFd, resource: &str) -> Result<AsyncFd<RawFd>> {
     #[cfg(panic = "unwind")]
     {
-        match probe_runtime(|| AsyncFd::with_interest(fd, Interest::READABLE)) {
+        // SAFETY: the caller guarantees the descriptor's lifetime.
+        match probe_runtime(|| unsafe { AsyncFd::register_with_interest(fd, Interest::READABLE) }) {
             RuntimeProbe::Completed(Ok(async_fd)) => Ok(async_fd),
             RuntimeProbe::Completed(Err(error)) => Err(Error::InvalidConfig(format!(
                 "failed to register {resource} with Tokio I/O: {error}"
@@ -152,7 +160,8 @@ fn try_async_fd(fd: RawFd, resource: &str) -> Result<AsyncFd<RawFd>> {
         // The runtime-presence check has already used Handle::try_current.
         // Tokio has no safe optional-I/O capability query, so do only the
         // required registration and preserve errors from its fallible path.
-        AsyncFd::with_interest(fd, Interest::READABLE).map_err(|error| {
+        // SAFETY: the caller guarantees the descriptor's lifetime.
+        unsafe { AsyncFd::register_with_interest(fd, Interest::READABLE) }.map_err(|error| {
             Error::InvalidConfig(format!(
                 "failed to register {resource} with Tokio I/O: {error}"
             ))
@@ -192,15 +201,20 @@ mod tests {
         assert!(ProviderLimits::from_device_attr(&attr).is_err());
     }
 
-    #[cfg(not(panic = "unwind"))]
     #[test]
-    fn abort_build_preserves_fallible_async_fd_registration_errors() {
+    fn preserves_fallible_async_fd_registration_errors() {
+        use std::os::unix::io::AsRawFd;
+
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()
             .build()
             .unwrap();
         let _entered = runtime.enter();
-        let error = try_async_fd(-1, "invalid test descriptor").unwrap_err();
+        // /dev/null is a valid descriptor but cannot be registered with epoll.
+        let file = std::fs::File::open("/dev/null").unwrap();
+        // SAFETY: file owns the descriptor and outlives the registration attempt.
+        let error =
+            unsafe { try_async_fd(file.as_raw_fd(), "unpollable test descriptor") }.unwrap_err();
         assert!(error.to_string().contains("failed to register"));
     }
 }
