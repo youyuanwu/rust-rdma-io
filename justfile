@@ -26,12 +26,18 @@ build-rxe:
     set -euo pipefail
     repo="torvalds/linux"
     kver="$(uname -r)"
-    base="$(echo "$kver" | sed -E 's/^([0-9]+\.[0-9]+).*/\1/')"
+    headers="/lib/modules/${kver}/build"
+    header_package="linux-headers-${kver}"
+    source_package="$(dpkg-query -W -f='${source:Package}' "$header_package")"
+    source_version="$(dpkg-query -W -f='${source:Version}' "$header_package")"
+    base="$(echo "$source_version" | sed -E 's/^([0-9]+\.[0-9]+).*/\1/')"
     ref="v${base}"
     src_dir="build/rxe-src"
     git_dir="build/rxe-git"
     build_dir="build/rxe-build"
     stamp="${src_dir}/.fetched-${repo//\//_}-${ref}"
+    echo "Kernel headers: ${header_package} ${source_version} (${source_package})"
+    echo "Matching upstream kernel source: ${repo}@${ref}"
     if [[ -f "$stamp" ]]; then
         echo "RXE source already fetched (${repo}@${ref}); skipping git checkout"
     else
@@ -47,13 +53,18 @@ build-rxe:
     fi
     # Stage an out-of-tree module build: copy sources, rename Makefile -> Kbuild and
     # force CONFIG_RDMA_RXE to build as a module, then write a thin driver Makefile.
-    headers="/lib/modules/${kver}/build"
     rm -rf "$build_dir"
     mkdir -p "$build_dir"
     cp "$src_dir"/*.c "$src_dir"/*.h "$build_dir"/
     cp "$src_dir"/Kconfig "$src_dir"/Makefile "$build_dir"/
     mv "$build_dir/Makefile" "$build_dir/Kbuild"
     sed -i 's/\$(CONFIG_RDMA_RXE)/m/' "$build_dir/Kbuild"
+    # Ubuntu backports can change this API before the matching upstream release.
+    if grep -Eq 'setup_udp_tunnel_sock[[:space:]]*\([^,]*,[[:space:]]*struct sock[[:space:]]*\*' \
+        "$headers/include/net/udp_tunnel.h"; then
+        sed -i 's/setup_udp_tunnel_sock(net, sock, /setup_udp_tunnel_sock(net, sock->sk, /' \
+            "$build_dir/rxe_net.c"
+    fi
     printf 'modules:\n\t$(MAKE) -C %s M=$(CURDIR) modules\nclean:\n\t$(MAKE) -C %s M=$(CURDIR) clean\n.PHONY: modules clean\n' \
         "$headers" "$headers" > "$build_dir/Makefile"
     if [[ ! -d "$headers" ]]; then
