@@ -99,8 +99,8 @@ jobs:
             ibverbs-utils \
             iproute2 \
             libclang-dev \
-            linux-headers-$(uname -r) \
-            linux-modules-extra-$(uname -r)
+            linux-headers-$(uname -r)
+          sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
 
       - uses: taiki-e/install-action@protoc
       - uses: taiki-e/install-action@just
