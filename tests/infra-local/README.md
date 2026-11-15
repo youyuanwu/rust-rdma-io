@@ -55,6 +55,11 @@ just build-rxe
 ./tests/infra-local/scripts/destroy-vm.sh -y
 ```
 
+Software emulation (`--no-kvm`) uses a Haswell CPU model with AVX support.
+Native crypto dependencies in the CI benchmark binaries can require AVX;
+older models such as Nehalem cause an illegal-instruction crash during H3
+server startup. KVM continues to use host-passthrough.
+
 ## Connecting to VMs
 
 ```bash
