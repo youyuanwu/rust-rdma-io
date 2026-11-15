@@ -188,7 +188,7 @@ resource "libvirt_domain" "vm1" {
 
   cpu = {
     mode  = var.use_kvm ? "host-passthrough" : "custom"
-    model = var.use_kvm ? null : "Nehalem"
+    model = var.use_kvm ? null : "Haswell"
   }
 
   devices = {
@@ -371,7 +371,7 @@ resource "libvirt_domain" "vm2" {
 
   cpu = {
     mode  = var.use_kvm ? "host-passthrough" : "custom"
-    model = var.use_kvm ? null : "Nehalem"
+    model = var.use_kvm ? null : "Haswell"
   }
 
   devices = {

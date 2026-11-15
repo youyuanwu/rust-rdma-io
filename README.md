@@ -152,6 +152,14 @@ To build the rxe kernel module from source (optional):
 just build-rxe
 ```
 
+Install `linux-headers-$(uname -r)` first. On Ubuntu kernels (including Azure,
+AWS, and generic), the recipe uses the installed headers' source package and
+version to fetch the exact Ubuntu release tag, including Ubuntu's kernel API
+patches. Other distributions use the upstream `vX.Y` tag. Only the RXE source
+directory is checked out. Ubuntu HWE packages use their base kernel repository
+(for example, `linux-azure-7.0` uses `linux-azure`) while retaining the full HWE
+package name in the release tag.
+
 ## Test
 
 Tests require a software RDMA provider (siw or rxe) and must run single-threaded due to kernel resource contention:

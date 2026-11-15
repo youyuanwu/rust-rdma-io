@@ -99,8 +99,13 @@ jobs:
             ibverbs-utils \
             iproute2 \
             libclang-dev \
-            linux-headers-$(uname -r) \
-            linux-modules-extra-$(uname -r)
+            linux-headers-$(uname -r)
+          EXTRA_MODULES="linux-modules-extra-$(uname -r)"
+          if apt-cache show "$EXTRA_MODULES" >/dev/null 2>&1; then
+            sudo apt-get install -y "$EXTRA_MODULES"
+          else
+            echo "::notice::$EXTRA_MODULES is unavailable; RXE setup will verify the required kernel modules."
+          fi
 
       - uses: taiki-e/install-action@protoc
       - uses: taiki-e/install-action@just
@@ -180,7 +185,7 @@ jobs:
       - name: Install QEMU, libvirt, and Ansible
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-kvm libvirt-daemon-system \
+          sudo apt-get install -y qemu-system-x86 libvirt-daemon-system \
               libvirt-clients libvirt-dev virtinst qemu-utils ansible
           sudo systemctl start libvirtd
           sudo usermod -aG libvirt $USER

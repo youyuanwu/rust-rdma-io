@@ -17,9 +17,8 @@ check-deps:
 build:
     cargo build
 
-# Fetch the rxe driver source (sparse, partial git checkout — avoids the per-file
-# raw.githubusercontent.com rate limiting) and build rdma_rxe.ko out-of-tree
-# against the running kernel's headers.
+# Fetch matching rxe source (Ubuntu release tag or upstream Linux tag)
+# with a sparse checkout and build against the running kernel's headers.
 # Build the rdma_rxe kernel module from source (no CMake required).
 build-rxe:
     #!/usr/bin/env bash
@@ -28,6 +27,33 @@ build-rxe:
     kver="$(uname -r)"
     base="$(echo "$kver" | sed -E 's/^([0-9]+\.[0-9]+).*/\1/')"
     ref="v${base}"
+    repo_url="https://github.com/${repo}.git"
+    headers="/lib/modules/${kver}/build"
+    if [[ ! -d "$headers" ]]; then
+        echo "error: kernel headers not found at ${headers}" >&2
+        echo "install them with: sudo apt-get install -y linux-headers-${kver}" >&2
+        exit 1
+    fi
+    if [[ -f /etc/os-release ]]; then
+        source /etc/os-release
+        if [[ "${ID:-}" == "ubuntu" ]]; then
+            source_info="$(dpkg-query -W -f='${source:Package} ${source:Version}' "linux-headers-${kver}")"
+            read -r source_package source_version <<< "$source_info"
+            source_repository="$(echo "$source_package" | sed -E 's/-[0-9]+\.[0-9]+$//; s/^linux-hwe$/linux/')"
+            repo="ubuntu/${source_repository}/${VERSION_CODENAME}"
+            if [[ "$source_repository" == "linux" ]]; then
+                owner="ubuntu-kernel"
+            else
+                owner="canonical-kernel"
+            fi
+            if [[ "$source_package" == "linux" ]]; then
+                ref="Ubuntu-${source_version//\~/_}"
+            else
+                ref="Ubuntu-${source_package#linux-}-${source_version//\~/_}"
+            fi
+            repo_url="https://git.launchpad.net/~${owner}/ubuntu/+source/${source_repository}/+git/${VERSION_CODENAME}"
+        fi
+    fi
     src_dir="build/rxe-src"
     git_dir="build/rxe-git"
     build_dir="build/rxe-build"
@@ -38,7 +64,7 @@ build-rxe:
         echo "Fetching rxe driver source ${repo}@${ref} via sparse partial clone"
         rm -rf "$git_dir" "$src_dir"
         git clone --filter=blob:none --sparse --depth 1 --branch "$ref" \
-            "https://github.com/${repo}.git" "$git_dir"
+            "$repo_url" "$git_dir"
         git -C "$git_dir" sparse-checkout set drivers/infiniband/sw/rxe
         mkdir -p "$src_dir"
         cp "$git_dir"/drivers/infiniband/sw/rxe/* "$src_dir"/
@@ -47,7 +73,6 @@ build-rxe:
     fi
     # Stage an out-of-tree module build: copy sources, rename Makefile -> Kbuild and
     # force CONFIG_RDMA_RXE to build as a module, then write a thin driver Makefile.
-    headers="/lib/modules/${kver}/build"
     rm -rf "$build_dir"
     mkdir -p "$build_dir"
     cp "$src_dir"/*.c "$src_dir"/*.h "$build_dir"/
@@ -56,11 +81,6 @@ build-rxe:
     sed -i 's/\$(CONFIG_RDMA_RXE)/m/' "$build_dir/Kbuild"
     printf 'modules:\n\t$(MAKE) -C %s M=$(CURDIR) modules\nclean:\n\t$(MAKE) -C %s M=$(CURDIR) clean\n.PHONY: modules clean\n' \
         "$headers" "$headers" > "$build_dir/Makefile"
-    if [[ ! -d "$headers" ]]; then
-        echo "error: kernel headers not found at ${headers}" >&2
-        echo "install them with: sudo apt-get install -y linux-headers-${kver}" >&2
-        exit 1
-    fi
     make -C "$build_dir" modules -j"$(nproc)"
     echo "Built ${build_dir}/rdma_rxe.ko"
 
