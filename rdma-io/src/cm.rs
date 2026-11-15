@@ -8,8 +8,7 @@ use std::os::unix::io::RawFd;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use rdma_io_sys::ibverbs::*;
-use rdma_io_sys::rdmacm::*;
+use rdma_io_sys::*;
 
 use crate::Result;
 use crate::cq::CompletionQueue;
@@ -512,7 +511,7 @@ impl CmId {
     /// Returns `None` if the address is not available (e.g., not yet connected).
     pub fn peer_addr(&self) -> Option<SocketAddr> {
         // rdma_get_peer_addr is an inline function: &id->route.addr.dst_addr
-        let sa = unsafe { &(*self.inner).route.addr.Anonymous2.dst_addr };
+        let sa = unsafe { &(*self.inner).route.addr.__bindgen_anon_2.dst_addr };
         unsafe { sockaddr_to_std(sa as *const _ as *const _) }
     }
 
@@ -521,7 +520,7 @@ impl CmId {
     /// Returns `None` if the address is not available.
     pub fn local_addr(&self) -> Option<SocketAddr> {
         // rdma_get_local_addr is an inline function: &id->route.addr.src_addr
-        let sa = unsafe { &(*self.inner).route.addr.Anonymous.src_addr };
+        let sa = unsafe { &(*self.inner).route.addr.__bindgen_anon_1.src_addr };
         unsafe { sockaddr_to_std(sa as *const _ as *const _) }
     }
 }
@@ -724,62 +723,57 @@ const AF_INET6: u16 = 10;
 
 /// Convert a `SocketAddr` to a `sockaddr_storage`-sized buffer.
 fn to_sockaddr_storage(addr: &SocketAddr) -> SockAddrBuf {
-    let mut buf = [0u8; std::mem::size_of::<bnd_linux::libc::socket::sockaddr_storage>()];
+    let mut buf = SockAddrBuf(unsafe { std::mem::zeroed() });
     match addr {
         SocketAddr::V4(v4) => {
-            let sa = bnd_linux::libc::in_::sockaddr_in {
+            let sa = libc::sockaddr_in {
                 sin_family: AF_INET,
                 sin_port: v4.port().to_be(),
-                sin_addr: bnd_linux::libc::in_::in_addr {
+                sin_addr: libc::in_addr {
                     s_addr: u32::from_ne_bytes(v4.ip().octets()),
                 },
-                ..Default::default()
+                sin_zero: [0; 8],
             };
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     &sa as *const _ as *const u8,
-                    buf.as_mut_ptr(),
+                    (&mut buf.0 as *mut libc::sockaddr_storage).cast(),
                     std::mem::size_of_val(&sa),
                 );
             }
         }
         SocketAddr::V6(v6) => {
-            let sa = bnd_linux::libc::in_::sockaddr_in6 {
+            let sa = libc::sockaddr_in6 {
                 sin6_family: AF_INET6,
                 sin6_port: v6.port().to_be(),
                 sin6_flowinfo: v6.flowinfo(),
-                sin6_addr: bnd_linux::libc::in_::in6_addr {
-                    __in6_u: bnd_linux::libc::in_::in6_addr_0 {
-                        __u6_addr8: v6.ip().octets(),
-                    },
+                sin6_addr: libc::in6_addr {
+                    s6_addr: v6.ip().octets(),
                 },
                 sin6_scope_id: v6.scope_id(),
             };
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     &sa as *const _ as *const u8,
-                    buf.as_mut_ptr(),
+                    (&mut buf.0 as *mut libc::sockaddr_storage).cast(),
                     std::mem::size_of_val(&sa),
                 );
             }
         }
     }
-    SockAddrBuf(buf)
+    buf
 }
 
 /// Stack-allocated sockaddr buffer.
-struct SockAddrBuf([u8; std::mem::size_of::<bnd_linux::libc::socket::sockaddr_storage>()]);
+struct SockAddrBuf(libc::sockaddr_storage);
 
 impl SockAddrBuf {
-    fn as_ptr(&self) -> *const bnd_linux::libc::socket::sockaddr {
-        self.0.as_ptr().cast()
+    fn as_ptr(&self) -> *const libc::sockaddr {
+        (&self.0 as *const libc::sockaddr_storage).cast()
     }
 }
 
-fn sockaddr_args(
-    src: Option<&SocketAddr>,
-    dst: &SocketAddr,
-) -> (*mut bnd_linux::libc::socket::sockaddr, SockAddrBuf) {
+fn sockaddr_args(src: Option<&SocketAddr>, dst: &SocketAddr) -> (*mut libc::sockaddr, SockAddrBuf) {
     let dst_sa = to_sockaddr_storage(dst);
     let src_ptr = match src {
         // For simplicity, pass null for src (let the kernel choose).
@@ -793,17 +787,17 @@ fn sockaddr_args(
 ///
 /// # Safety
 /// The pointer must be valid and point to a `sockaddr_in` or `sockaddr_in6`.
-unsafe fn sockaddr_to_std(sa: *const bnd_linux::libc::socket::sockaddr) -> Option<SocketAddr> {
+unsafe fn sockaddr_to_std(sa: *const libc::sockaddr) -> Option<SocketAddr> {
     unsafe {
         let family = (*sa).sa_family;
         if family == AF_INET {
-            let sin = &*(sa as *const bnd_linux::libc::in_::sockaddr_in);
+            let sin = &*(sa as *const libc::sockaddr_in);
             let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
             let port = u16::from_be(sin.sin_port);
             Some(SocketAddr::V4(std::net::SocketAddrV4::new(ip, port)))
         } else if family == AF_INET6 {
-            let sin6 = &*(sa as *const bnd_linux::libc::in_::sockaddr_in6);
-            let ip = std::net::Ipv6Addr::from(sin6.sin6_addr.__in6_u.__u6_addr8);
+            let sin6 = &*(sa as *const libc::sockaddr_in6);
+            let ip = std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr);
             let port = u16::from_be(sin6.sin6_port);
             Some(SocketAddr::V6(std::net::SocketAddrV6::new(
                 ip,
@@ -813,6 +807,30 @@ unsafe fn sockaddr_to_std(sa: *const bnd_linux::libc::socket::sockaddr) -> Optio
             )))
         } else {
             None
+        }
+    }
+}
+
+#[cfg(test)]
+mod sockaddr_tests {
+    use super::{sockaddr_to_std, to_sockaddr_storage};
+    use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+
+    #[test]
+    fn libc_socket_addresses_round_trip() {
+        let addresses = [
+            "192.0.2.17:43210".parse().unwrap(),
+            SocketAddr::V6(SocketAddrV6::new(
+                "fe80::1234".parse::<Ipv6Addr>().unwrap(),
+                54321,
+                0x12345,
+                7,
+            )),
+        ];
+        for address in addresses {
+            let storage = to_sockaddr_storage(&address);
+            assert!(storage.as_ptr().is_aligned());
+            assert_eq!(unsafe { sockaddr_to_std(storage.as_ptr()) }, Some(address));
         }
     }
 }

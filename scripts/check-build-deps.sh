@@ -3,7 +3,8 @@
 #
 # Verifies the headers, libraries, and tools required to compile the
 # workspace (libibverbs + librdmacm dev packages, a C compiler for the
-# `cc`-built wrapper, protoc for the tonic tests, and the Rust toolchain).
+# `cc`-built wrapper, libclang for bindgen, protoc for the tonic tests, and
+# the Rust toolchain).
 #
 # Usage: ./scripts/check-build-deps.sh
 #
@@ -84,14 +85,9 @@ check_tool "protoc" "protobuf-compiler"
 check_tool "pkg-config" "pkg-config"
 
 echo
-echo "=== Optional (binding regeneration / full workspace build) ==="
-# libclang is used by bnd-winmd (via clang-sys) in the dev-only bnd-rdma-gen
-# crate. It is NOT needed to build the rdma-io library crates, but a
-# workspace-wide `cargo build`/`cargo check` compiles bnd-rdma-gen too and
-# will fail without it. The generated bindings are checked in, so this only
-# warns. Note: clang-sys loads the libclang.so / libclang-*.so file directly —
-# it does NOT consult llvm-config — so a versioned runtime library alone
-# (e.g. libclang-18.so.1) is not enough; the -dev package's symlink is required.
+echo "=== libclang (required by bindgen) ==="
+# clang-sys loads libclang.so / libclang-*.so directly. A versioned runtime
+# library alone (e.g. libclang-18.so.1) does not provide the required symlink.
 libclang_so=""
 libclang_dirs=()
 [[ -n "${LIBCLANG_PATH:-}" ]] && libclang_dirs+=("$LIBCLANG_PATH")
@@ -112,10 +108,12 @@ done
 if [[ -n "$libclang_so" ]]; then
     ok "libclang ($libclang_so)"
 else
-    warn "libclang.so not found — needed for 'just gen-bindings' and"
-    warn "  workspace-wide builds of bnd-rdma-gen (install libclang-dev)"
+    fail "libclang.so not found (install libclang-dev or set LIBCLANG_PATH)"
+    errors=$((errors + 1))
 fi
 
+echo
+echo "=== Optional (RXE kernel module build) ==="
 # Kernel headers are needed only to build the rdma_rxe module from source
 # ('just build-rxe'). They must match the running kernel exactly, so report the
 # specific linux-headers-<uname -r> package when the build symlink is missing.
@@ -135,6 +133,6 @@ else
     fail "$errors dependency check(s) failed"
     echo
     echo "On Ubuntu/Debian, install everything with:"
-    echo "  sudo apt install build-essential pkg-config libibverbs-dev librdmacm-dev rdma-core protobuf-compiler libssl-dev"
+    echo "  sudo apt install build-essential pkg-config libclang-dev libibverbs-dev librdmacm-dev rdma-core protobuf-compiler libssl-dev"
     exit 1
 fi

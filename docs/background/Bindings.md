@@ -356,25 +356,24 @@ Same as Option D but vendors a copy of `verbs.h` instead of using system headers
 
 ## 5. Recommendation
 
-**Option D (C wrapper + system headers)** — implemented with bnd for Rust FFI generation.
+**Option D (C wrapper + system headers)** - implemented with build-time bindgen for Rust FFI generation.
 
 ### What was built
 
-Two crates in the `rust-rdma-io` workspace:
-
-1. **`bnd-rdma-gen`** — Developer-time generator. Uses the bnd 0.0.8 direct-Clang pipeline (`bnd-clang` → RDL → `windows-rdl` → canonical header-owned WinMD → `bnd-bindgen`) to emit the RDMA Rust FFI modules.
-
-2. **`rdma-io-sys`** — User-facing sys crate. Contains the generated FFI modules (`src/rdma/`) directly — no separate generated crate. Compiles `wrapper.c` (96 C wrappers for static inline functions) via `cc` and routes the canonical `libc` metadata namespace to `bnd-linux` 0.0.8.
+**`rdma-io-sys`** generates FFI bindings from the installed RDMA headers during
+its Cargo build. It compiles `wrapper.c` for static inline functions via `cc`
+and shares socket, pthread, and timespec types with `libc`. No separate
+generator crate or checked-in metadata is needed.
 
 ### Build flow:
 ```
 cargo build (rdma-io-sys):
-  1. cc compiles wrapper/wrapper.c → librdma_wrapper.a (static)
-  2. Links libibverbs.so + librdmacm.so (dynamic)
-  3. Pre-generated Rust bindings in rdma-io-sys/src/rdma/ — no codegen at build time
+  1. bindgen parses verbs.h + rdma_cma.h + wrapper.h into OUT_DIR/bindings.rs
+  2. cc compiles wrapper/wrapper.c -> librdma_wrapper.a (static)
+  3. Links libibverbs.so + librdmacm.so (dynamic)
 ```
 
-See [BndBindings.md](BndBindings.md) for full implementation details.
+See [Bindings.md](../design/Bindings.md) for full implementation details.
 
 ---
 
@@ -415,11 +414,11 @@ Regardless of binding approach, we need to decide what to bind:
 
 ## 8. Resolved Decisions
 
-1. **Binding strategy**: Option D — C wrapper + system headers + bnd (not bindgen). (Resolved & implemented: Feb 2026)
+1. **Binding strategy**: Option D - C wrapper + system headers + bindgen.
 2. **No vendored headers**: System `libibverbs-dev` / `librdmacm-dev` required at build time. (Resolved: Feb 2026)
 3. **No mummy/dlopen approach**: Direct linking against system `libibverbs.so` is simpler and sufficient. (Resolved: Feb 2026)
-4. **Code generation tool**: bnd (not bindgen) — pre-generated, namespaced modules, type sharing with `bnd-posix`/`bnd-linux`. (Resolved & implemented: Feb 2026)
+4. **Code generation tool**: Build-time bindgen, with flat crate-root exports and shared Linux types from `libc`.
 5. **Wrapper naming**: `rdma_wrap_` prefix (e.g., `rdma_wrap_ibv_post_send`). (Resolved & implemented: Feb 2026)
-6. **Wrapper as bnd partition**: `wrapper.h` is a third bnd partition, so Rust FFI declarations are auto-generated with cross-module references. (Resolved & implemented: Feb 2026)
-7. **`__be*` types**: Reused from the `bnd_linux::libc::types` defining-header module. (Updated: Sep 2026)
-8. **Single sys crate**: Merged `bnd-rdma` into `rdma-io-sys` — generated FFI modules live alongside `build.rs` and `wrapper.c`. No separate generated crate. (Resolved: Feb 2026)
+6. **Wrapper declarations**: `wrapper.h` is parsed with the system headers so wrappers share their RDMA types.
+7. **`__be*` types**: Generated from the target headers as integer aliases; callers preserve network byte order.
+8. **Single sys crate**: `rdma-io-sys` owns binding generation, C wrappers, and native-library linking.

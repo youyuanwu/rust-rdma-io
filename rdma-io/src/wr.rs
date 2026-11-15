@@ -1,6 +1,6 @@
 //! Work Request builders and related types.
 
-use rdma_io_sys::ibverbs::*;
+use rdma_io_sys::*;
 
 /// QP type enum (typed wrapper over `ibv_qp_type`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -317,10 +317,10 @@ impl SendWr {
         // Set immediate data if applicable.
         match self.opcode {
             WrOpcode::SendWithImm(imm) | WrOpcode::RdmaWriteWithImm(imm) => {
-                wr.Anonymous.imm_data = imm;
+                wr.__bindgen_anon_1.imm_data = imm;
             }
             WrOpcode::LocalInv => {
-                wr.Anonymous.invalidate_rkey = self.invalidate_rkey;
+                wr.__bindgen_anon_1.invalidate_rkey = self.invalidate_rkey;
             }
             _ => {}
         }
@@ -328,29 +328,76 @@ impl SendWr {
         // Set RDMA fields.
         match self.opcode {
             WrOpcode::RdmaWrite | WrOpcode::RdmaWriteWithImm(_) | WrOpcode::RdmaRead => {
-                wr.wr.rdma = ibv_send_wr_1_0 {
-                    remote_addr: self.rdma_remote_addr,
-                    rkey: self.rdma_rkey,
-                };
+                wr.wr.rdma.remote_addr = self.rdma_remote_addr;
+                wr.wr.rdma.rkey = self.rdma_rkey;
             }
             WrOpcode::AtomicCmpAndSwp | WrOpcode::AtomicFetchAndAdd => {
-                wr.wr.atomic = ibv_send_wr_1_1 {
-                    remote_addr: self.rdma_remote_addr,
-                    compare_add: self.atomic_compare_add,
-                    swap: self.atomic_swap,
-                    rkey: self.rdma_rkey,
-                };
+                wr.wr.atomic.remote_addr = self.rdma_remote_addr;
+                wr.wr.atomic.compare_add = self.atomic_compare_add;
+                wr.wr.atomic.swap = self.atomic_swap;
+                wr.wr.atomic.rkey = self.rdma_rkey;
             }
             WrOpcode::BindMw => {
-                wr.Anonymous2.bind_mw = ibv_send_wr_3_0 {
-                    mw: self.bind_mw_mw,
-                    rkey: self.bind_mw_rkey,
-                    bind_info: self.bind_mw_bind_info,
-                };
+                wr.__bindgen_anon_2.bind_mw.mw = self.bind_mw_mw;
+                wr.__bindgen_anon_2.bind_mw.rkey = self.bind_mw_rkey;
+                wr.__bindgen_anon_2.bind_mw.bind_info = self.bind_mw_bind_info;
             }
             _ => {}
         }
 
         wr
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn send_union_fields_preserve_immediate_rdma_and_atomic_parameters() {
+        let mut send = SendWr::new(1, WrOpcode::RdmaWriteWithImm(0x1234))
+            .rdma(0x5678, 0x9abc)
+            .flags(SendFlags::SIGNALED);
+        let raw = send.build_raw();
+        assert_eq!(raw.opcode, IBV_WR_RDMA_WRITE_WITH_IMM);
+        unsafe {
+            assert_eq!(raw.__bindgen_anon_1.imm_data, 0x1234);
+            assert_eq!(raw.wr.rdma.remote_addr, 0x5678);
+            assert_eq!(raw.wr.rdma.rkey, 0x9abc);
+        }
+        let mut atomic = SendWr::new(2, WrOpcode::AtomicCmpAndSwp).atomic(0x1000, 3, 4, 5);
+        let raw = atomic.build_raw();
+        unsafe {
+            assert_eq!(raw.wr.atomic.remote_addr, 0x1000);
+            assert_eq!(raw.wr.atomic.rkey, 3);
+            assert_eq!(raw.wr.atomic.compare_add, 4);
+            assert_eq!(raw.wr.atomic.swap, 5);
+        }
+    }
+
+    #[test]
+    fn send_union_fields_preserve_memory_window_parameters() {
+        let mut mw = ibv_mw::default();
+        let mut mr = ibv_mr::default();
+        let mut bind = SendWr::new(3, WrOpcode::BindMw).bind_mw(
+            &mut mw,
+            11,
+            &mut mr,
+            0x2000,
+            1024,
+            IBV_ACCESS_REMOTE_WRITE,
+        );
+        let raw = bind.build_raw();
+        let info = unsafe { raw.__bindgen_anon_2.bind_mw };
+        assert_eq!(info.mw, &mut mw as *mut _);
+        assert_eq!(info.rkey, 11);
+        assert_eq!(info.bind_info.mr, &mut mr as *mut _);
+        assert_eq!(info.bind_info.addr, 0x2000);
+        assert_eq!(info.bind_info.length, 1024);
+        assert_eq!(info.bind_info.mw_access_flags, IBV_ACCESS_REMOTE_WRITE);
+
+        let mut invalidate = SendWr::new(4, WrOpcode::LocalInv).inv_rkey(11);
+        let raw = invalidate.build_raw();
+        assert_eq!(unsafe { raw.__bindgen_anon_1.invalidate_rkey }, 11);
     }
 }

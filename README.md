@@ -123,11 +123,15 @@ let client = GreeterClient::new(channel);
 
 ```sh
 # Ubuntu/Debian
-sudo apt install libibverbs-dev librdmacm-dev rdma-core
+sudo apt install build-essential libclang-dev libibverbs-dev librdmacm-dev rdma-core
 
 # For protobuf compilation (tonic tests)
 sudo apt install protobuf-compiler
 ```
+
+`rdma-io-sys` runs bindgen during each build to match the installed RDMA
+headers and target architecture. Set `LIBCLANG_PATH` if libclang is installed
+outside the default search paths.
 
 ## Software RDMA Providers
 
@@ -191,7 +195,7 @@ Design documents and background research are in [`docs/`](docs/):
 | [EchoBenchmark.md](docs/design/EchoBenchmark.md) | Direct transport-level echo benchmark (`--mode echo`) design and diagrams |
 | [Testing.md](docs/design/Testing.md) | Test strategy and provider compatibility matrix |
 | [RingBufferStream.md](docs/design/RingBufferStream.md) | Ring buffer stream design (RDMA Write alternative) |
-| [BndBindings.md](docs/design/BndBindings.md) | FFI binding generation with bnd |
+| [Bindings.md](docs/design/Bindings.md) | Build-time FFI binding generation with bindgen |
 | [siw-vs-rxe.md](docs/background/siw-vs-rxe.md) | Software provider comparison |
 | [msquic-rdma.md](docs/background/msquic-rdma.md) | msquic RDMA transport architecture analysis |
 | [bench/scenarios/grpc.md](docs/bench/scenarios/grpc.md) | gRPC-over-RDMA (`rh2`) vs TCP benchmark scenario + results |

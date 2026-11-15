@@ -18,8 +18,7 @@
 //! so Rust drops the QP before the CQs — matching the kernel-enforced
 //! teardown order.
 
-use rdma_io_sys::ibverbs::*;
-use rdma_io_sys::wrapper::*;
+use rdma_io_sys::*;
 
 use std::sync::Arc;
 use std::task::{Context, Poll};

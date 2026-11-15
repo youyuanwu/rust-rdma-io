@@ -1,6 +1,6 @@
 //! Work Completion types.
 
-use rdma_io_sys::ibverbs::*;
+use rdma_io_sys::*;
 
 /// A work completion entry.
 ///
@@ -64,7 +64,7 @@ impl WorkCompletion {
 
     /// Immediate data (valid if `wc_flags` has `IBV_WC_WITH_IMM`).
     pub fn imm_data(&self) -> u32 {
-        unsafe { self.inner.Anonymous.imm_data }
+        unsafe { self.inner.__bindgen_anon_1.imm_data }
     }
 
     /// Raw `ibv_wc` reference.

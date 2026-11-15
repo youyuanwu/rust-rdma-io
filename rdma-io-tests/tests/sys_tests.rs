@@ -4,7 +4,7 @@
 //! Data-path tests (QP, send/recv) require rdma_cm for siw and
 //! are not included here.
 
-use rdma_io_sys::ibverbs::*;
+use rdma_io_sys::*;
 use rdma_io_tests::require_software_rdma;
 use std::ffi::CStr;
 
@@ -163,7 +163,7 @@ fn test_register_deregister_mr() {
         assert!(!pd.is_null(), "ibv_alloc_pd failed");
 
         let mut buf = vec![0u8; 4096];
-        let mr = rdma_io_sys::wrapper::rdma_wrap___ibv_reg_mr(
+        let mr = rdma_io_sys::rdma_wrap___ibv_reg_mr(
             pd,
             buf.as_mut_ptr() as *mut core::ffi::c_void,
             buf.len(),
@@ -238,14 +238,14 @@ fn test_multiple_resources() {
 
         let mut buf1 = vec![0u8; 1024];
         let mut buf2 = vec![0u8; 2048];
-        let mr1 = rdma_io_sys::wrapper::rdma_wrap___ibv_reg_mr(
+        let mr1 = rdma_io_sys::rdma_wrap___ibv_reg_mr(
             pd1,
             buf1.as_mut_ptr() as *mut core::ffi::c_void,
             buf1.len(),
             IBV_ACCESS_LOCAL_WRITE,
             1,
         );
-        let mr2 = rdma_io_sys::wrapper::rdma_wrap___ibv_reg_mr(
+        let mr2 = rdma_io_sys::rdma_wrap___ibv_reg_mr(
             pd2,
             buf2.as_mut_ptr() as *mut core::ffi::c_void,
             buf2.len(),

@@ -258,7 +258,7 @@ impl AsyncCmId {
     }
 
     /// Raw QP pointer (from the cm_id, for low-level use before QP is transferred).
-    pub fn qp_raw(&self) -> *mut rdma_io_sys::ibverbs::ibv_qp {
+    pub fn qp_raw(&self) -> *mut rdma_io_sys::ibv_qp {
         self.cm_id.qp_raw()
     }
 

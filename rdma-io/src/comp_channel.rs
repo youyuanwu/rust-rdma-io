@@ -9,7 +9,7 @@ use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 
-use rdma_io_sys::ibverbs::*;
+use rdma_io_sys::*;
 
 use crate::Result;
 use crate::device::Context;

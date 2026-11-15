@@ -67,7 +67,7 @@ pub mod test_helpers {
         devices.iter().any(|d| {
             d.open()
                 .and_then(|ctx| ctx.query_device())
-                .map(|attr| attr.atomic_cap != rdma_io_sys::ibverbs::IBV_ATOMIC_NONE)
+                .map(|attr| attr.atomic_cap != rdma_io_sys::IBV_ATOMIC_NONE)
                 .unwrap_or(false)
         })
     }

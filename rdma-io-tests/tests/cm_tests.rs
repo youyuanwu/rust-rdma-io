@@ -136,21 +136,20 @@ fn cm_loopback_send_recv() {
         let server_qp = cmqp.as_raw();
         let server_recv_cq = unsafe { (*server_qp).recv_cq };
         {
-            let mut sge = rdma_io_sys::ibverbs::ibv_sge {
+            let mut sge = rdma_io_sys::ibv_sge {
                 addr: unsafe { (*recv_mr.as_raw()).addr as u64 },
                 length: 64,
                 lkey: recv_mr.lkey(),
             };
-            let mut wr = rdma_io_sys::ibverbs::ibv_recv_wr {
+            let mut wr = rdma_io_sys::ibv_recv_wr {
                 wr_id: 1,
                 sg_list: &mut sge,
                 num_sge: 1,
                 ..Default::default()
             };
-            let mut bad_wr: *mut rdma_io_sys::ibverbs::ibv_recv_wr = std::ptr::null_mut();
-            let ret = unsafe {
-                rdma_io_sys::wrapper::rdma_wrap_ibv_post_recv(server_qp, &mut wr, &mut bad_wr)
-            };
+            let mut bad_wr: *mut rdma_io_sys::ibv_recv_wr = std::ptr::null_mut();
+            let ret =
+                unsafe { rdma_io_sys::rdma_wrap_ibv_post_recv(server_qp, &mut wr, &mut bad_wr) };
             assert_eq!(ret, 0, "server post_recv failed");
         }
 
@@ -164,11 +163,7 @@ fn cm_loopback_send_recv() {
         let mut wc = [WorkCompletion::default(); 1];
         loop {
             let n = unsafe {
-                rdma_io_sys::wrapper::rdma_wrap_ibv_poll_cq(
-                    server_recv_cq,
-                    1,
-                    wc.as_mut_ptr().cast(),
-                )
+                rdma_io_sys::rdma_wrap_ibv_poll_cq(server_recv_cq, 1, wc.as_mut_ptr().cast())
             };
             if n > 0 {
                 assert!(wc[0].is_success(), "recv WC error: {:?}", wc[0].status());
@@ -224,23 +219,21 @@ fn cm_loopback_send_recv() {
     let client_qp = cmqp.as_raw();
     let client_send_cq = unsafe { (*client_qp).send_cq };
     {
-        let mut sge = rdma_io_sys::ibverbs::ibv_sge {
+        let mut sge = rdma_io_sys::ibv_sge {
             addr: unsafe { (*send_mr.as_raw()).addr as u64 },
             length: 11,
             lkey: send_mr.lkey(),
         };
-        let mut wr = rdma_io_sys::ibverbs::ibv_send_wr {
+        let mut wr = rdma_io_sys::ibv_send_wr {
             wr_id: 2,
-            opcode: rdma_io_sys::ibverbs::IBV_WR_SEND,
-            send_flags: rdma_io_sys::ibverbs::IBV_SEND_SIGNALED,
+            opcode: rdma_io_sys::IBV_WR_SEND,
+            send_flags: rdma_io_sys::IBV_SEND_SIGNALED,
             sg_list: &mut sge,
             num_sge: 1,
             ..Default::default()
         };
-        let mut bad_wr: *mut rdma_io_sys::ibverbs::ibv_send_wr = std::ptr::null_mut();
-        let ret = unsafe {
-            rdma_io_sys::wrapper::rdma_wrap_ibv_post_send(client_qp, &mut wr, &mut bad_wr)
-        };
+        let mut bad_wr: *mut rdma_io_sys::ibv_send_wr = std::ptr::null_mut();
+        let ret = unsafe { rdma_io_sys::rdma_wrap_ibv_post_send(client_qp, &mut wr, &mut bad_wr) };
         assert_eq!(ret, 0, "client post_send failed");
     }
 
@@ -248,7 +241,7 @@ fn cm_loopback_send_recv() {
     let mut wc = [WorkCompletion::default(); 1];
     loop {
         let n = unsafe {
-            rdma_io_sys::wrapper::rdma_wrap_ibv_poll_cq(client_send_cq, 1, wc.as_mut_ptr().cast())
+            rdma_io_sys::rdma_wrap_ibv_poll_cq(client_send_cq, 1, wc.as_mut_ptr().cast())
         };
         if n > 0 {
             assert!(wc[0].is_success(), "send WC error: {:?}", wc[0].status());

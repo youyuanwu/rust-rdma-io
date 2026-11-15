@@ -2,8 +2,7 @@
 
 use std::sync::Arc;
 
-use rdma_io_sys::ibverbs::*;
-use rdma_io_sys::wrapper::*;
+use rdma_io_sys::*;
 
 use crate::Result;
 use crate::comp_channel::CompletionChannel;
