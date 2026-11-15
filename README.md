@@ -15,6 +15,9 @@ Safe Rust bindings for RDMA programming over [libibverbs](https://github.com/lin
 - **gRPC and QUIC integration** — Run tonic gRPC, Quinn QUIC, and tonic gRPC over HTTP/3 on RDMA transports.
 - **Low-level control when needed** — Access safe resource wrappers and asynchronous RDMA verbs for custom protocols.
 
+The experimental `rdma_io::v2` API has been retired. Use the core resource
+wrappers and async transport APIs shown below.
+
 ## Workspace Crates
 
 | Crate | Description |
