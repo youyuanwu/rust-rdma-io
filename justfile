@@ -17,7 +17,7 @@ check-deps:
 build:
     cargo build
 
-# Fetch matching rxe source (Ubuntu Azure release tag or upstream Linux tag)
+# Fetch matching rxe source (Ubuntu release tag or upstream Linux tag)
 # with a sparse checkout and build against the running kernel's headers.
 # Build the rdma_rxe kernel module from source (no CMake required).
 build-rxe:
@@ -36,12 +36,18 @@ build-rxe:
     fi
     if [[ -f /etc/os-release ]]; then
         source /etc/os-release
-        if [[ "${ID:-}" == "ubuntu" && "$kver" == *-azure ]]; then
+        if [[ "${ID:-}" == "ubuntu" ]]; then
             source_info="$(dpkg-query -W -f='${source:Package} ${source:Version}' "linux-headers-${kver}")"
             read -r source_package source_version <<< "$source_info"
-            repo="ubuntu/linux-azure/${VERSION_CODENAME}"
-            repo_url="https://git.launchpad.net/~canonical-kernel/ubuntu/+source/linux-azure/+git/${VERSION_CODENAME}"
-            ref="Ubuntu-${source_package#linux-}-${source_version//\~/_}"
+            repo="ubuntu/${source_package}/${VERSION_CODENAME}"
+            if [[ "$source_package" == "linux" ]]; then
+                owner="ubuntu-kernel"
+                ref="Ubuntu-${source_version//\~/_}"
+            else
+                owner="canonical-kernel"
+                ref="Ubuntu-${source_package#linux-}-${source_version//\~/_}"
+            fi
+            repo_url="https://git.launchpad.net/~${owner}/ubuntu/+source/${source_package}/+git/${VERSION_CODENAME}"
         fi
     fi
     src_dir="build/rxe-src"
