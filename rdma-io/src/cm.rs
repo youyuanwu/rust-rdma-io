@@ -11,12 +11,12 @@ use std::sync::Arc;
 use rdma_io_sys::ibverbs::*;
 use rdma_io_sys::rdmacm::*;
 
+use crate::Result;
 use crate::cq::CompletionQueue;
 use crate::device::{Context, ContextAnchor};
 use crate::error::{from_ptr, from_ret_errno};
 use crate::pd::ProtectionDomain;
 use crate::qp::QpInitAttr;
-use crate::{Error, Result};
 
 /// Port space for CM connections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,11 +133,6 @@ unsafe impl Sync for EventChannel {}
 
 impl Drop for EventChannel {
     fn drop(&mut self) {
-        #[cfg(any(test, feature = "test-hooks"))]
-        crate::test_support::destruction::record(
-            crate::test_support::destruction::DestructionKind::CmEventChannel,
-            self.inner as usize,
-        );
         unsafe { rdma_destroy_event_channel(self.inner) };
     }
 }
@@ -229,37 +224,10 @@ impl CmEvent {
         unsafe { (*self.inner).listen_id }
     }
 
-    /// Opaque user-context pointer associated with the event's CM ID.
-    ///
-    /// The pointer is never dereferenced from an event. Engine routing uses the
-    /// allocation address only as an identity key, then resolves the separately
-    /// registered generational token that was read safely from the owning
-    /// [`CmId`] when the route was created.
-    #[cfg(feature = "tokio")]
-    pub(crate) fn context_key(&self) -> usize {
-        let id = self.cm_id_raw();
-        if id.is_null() {
-            0
-        } else {
-            unsafe { (*id).context as usize }
-        }
-    }
-
     /// Acknowledge and consume this event, preserving acknowledgement errors.
     pub(crate) fn ack_checked(mut self) -> Result<()> {
         let event = std::mem::replace(&mut self.inner, std::ptr::null_mut());
-        #[cfg(any(test, feature = "test-hooks"))]
-        crate::test_support::destruction::record(
-            crate::test_support::destruction::DestructionKind::CmEventAck,
-            event as usize,
-        );
         let ret = unsafe { rdma_ack_cm_event(event) };
-        #[cfg(any(test, feature = "test-hooks"))]
-        crate::test_support::destruction::record_result(
-            crate::test_support::destruction::DestructionKind::CmEventAck,
-            event as usize,
-            ret,
-        );
         from_ret_errno(ret)
     }
 
@@ -278,18 +246,7 @@ impl Drop for CmEvent {
         }
         // If not ack'd, ack now to avoid leaking the event.
         let event = self.inner;
-        #[cfg(any(test, feature = "test-hooks"))]
-        crate::test_support::destruction::record(
-            crate::test_support::destruction::DestructionKind::CmEventAck,
-            event as usize,
-        );
         let ret = unsafe { rdma_ack_cm_event(event) };
-        #[cfg(any(test, feature = "test-hooks"))]
-        crate::test_support::destruction::record_result(
-            crate::test_support::destruction::DestructionKind::CmEventAck,
-            event as usize,
-            ret,
-        );
         self.inner = std::ptr::null_mut();
         if ret != 0 {
             tracing::error!(
@@ -307,15 +264,6 @@ pub struct CmId {
     pub(crate) inner: *mut rdma_cm_id,
     /// Whether this CmId owns the underlying rdma_cm_id (should call rdma_destroy_id).
     owned: bool,
-    #[cfg(test)]
-    destroy_error: Option<Error>,
-    #[cfg(feature = "tokio")]
-    context_token: Option<Box<CmContextToken>>,
-}
-
-#[cfg(feature = "tokio")]
-struct CmContextToken {
-    route: u64,
 }
 
 // Safety: rdma_cm_id operations are serialized by the caller.
@@ -335,40 +283,10 @@ impl CmId {
         if !self.owned {
             return Ok(());
         }
-        #[cfg(test)]
-        if let Some(error) = self.destroy_error.take() {
-            return Err(error);
-        }
-        #[cfg(any(test, feature = "test-hooks"))]
-        let address = self.inner as usize;
-        #[cfg(any(test, feature = "test-hooks"))]
-        crate::test_support::destruction::record(
-            crate::test_support::destruction::DestructionKind::CmId,
-            address,
-        );
         let ret = unsafe { rdma_destroy_id(self.inner) };
-        #[cfg(any(test, feature = "test-hooks"))]
-        crate::test_support::destruction::record_result(
-            crate::test_support::destruction::DestructionKind::CmId,
-            address,
-            ret,
-        );
         from_ret_errno(ret)?;
         self.owned = false;
         Ok(())
-    }
-
-    /// Attempt synchronous destruction without discarding ownership on failure.
-    ///
-    /// Shared CM users must retain the returned owner together with the event
-    /// channel and the rest of the provider bundle. A failed
-    /// `rdma_destroy_id` is not positive evidence that the ID was released.
-    #[cfg(feature = "tokio")]
-    pub(crate) fn try_destroy(mut self) -> std::result::Result<(), (Self, Error)> {
-        match self.destroy_once() {
-            Ok(()) => Ok(()),
-            Err(error) => Err((self, error)),
-        }
     }
 
     /// Create a new CM ID on the given event channel.
@@ -385,32 +303,6 @@ impl CmId {
         Ok(Self {
             inner: id,
             owned: true,
-            #[cfg(test)]
-            destroy_error: None,
-            #[cfg(feature = "tokio")]
-            context_token: None,
-        })
-    }
-
-    /// Create a CM ID associated with one engine-owned generational route.
-    #[cfg(feature = "tokio")]
-    pub(crate) fn new_with_context_token(
-        channel: &EventChannel,
-        port_space: PortSpace,
-        route: u64,
-    ) -> Result<Self> {
-        let mut context_token = Box::new(CmContextToken { route });
-        let context = std::ptr::from_mut(context_token.as_mut()).cast();
-        let mut id: *mut rdma_cm_id = std::ptr::null_mut();
-        from_ret_errno(unsafe {
-            rdma_create_id(channel.inner, &mut id, context, port_space.as_raw())
-        })?;
-        Ok(Self {
-            inner: id,
-            owned: true,
-            #[cfg(test)]
-            destroy_error: None,
-            context_token: Some(context_token),
         })
     }
 
@@ -420,42 +312,7 @@ impl CmId {
     /// The caller must ensure the pointer is valid and that ownership semantics
     /// are correctly handled.
     pub unsafe fn from_raw(id: *mut rdma_cm_id, owned: bool) -> Self {
-        Self {
-            inner: id,
-            owned,
-            #[cfg(test)]
-            destroy_error: None,
-            #[cfg(feature = "tokio")]
-            context_token: None,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fail_next_destroy_for_test(&mut self, error: Error) {
-        self.destroy_error = Some(error);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn disarm_destroy_for_test(&mut self) {
-        self.owned = false;
-        self.destroy_error = None;
-    }
-
-    /// Install a new engine-owned generational route on an accepted CM ID.
-    #[cfg(feature = "tokio")]
-    pub(crate) fn install_context_token(&mut self, route: u64) -> Result<()> {
-        if self.context_token.is_some() {
-            return Err(crate::Error::InvalidArg(
-                "CM ID already owns an engine context token".into(),
-            ));
-        }
-        let mut context_token = Box::new(CmContextToken { route });
-        let context = std::ptr::from_mut(context_token.as_mut()).cast();
-        unsafe {
-            (*self.inner).context = context;
-        }
-        self.context_token = Some(context_token);
-        Ok(())
+        Self { inner: id, owned }
     }
 
     /// Resolve the destination address.
@@ -525,12 +382,9 @@ impl CmId {
             cm_id_raw: Some(
                 NonNull::new(self.inner).expect("rdma_create_qp requires a non-null CM ID"),
             ),
-            capabilities: raw_attr.cap,
             _pd: Arc::clone(pd),
             _send_cq: send_cq.map(Arc::clone),
             _recv_cq: recv_cq.map(Arc::clone),
-            #[cfg(any(test, feature = "test-hooks"))]
-            fail_next_verbs_destroy: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -644,21 +498,6 @@ impl CmId {
         self.inner
     }
 
-    /// Opaque context identity installed when this CM ID was created.
-    #[cfg(feature = "tokio")]
-    pub(crate) fn context_key(&self) -> usize {
-        unsafe { (*self.inner).context as usize }
-    }
-
-    /// Generational route token owned by this CM ID's context allocation.
-    ///
-    /// This reads the Rust-owned allocation directly. CM events use only its
-    /// stable address and resolve that address through the engine route table.
-    #[cfg(feature = "tokio")]
-    pub(crate) fn context_token(&self) -> Option<u64> {
-        self.context_token.as_ref().map(|token| token.route)
-    }
-
     /// Migrate this CM ID to a different event channel.
     ///
     /// After migration, events for this CM ID will be reported on the new channel.
@@ -693,9 +532,7 @@ impl CmId {
 
 /// A Queue Pair created via `rdma_create_qp` on a [`CmId`].
 ///
-/// Owns the QP lifecycle. [`Drop`] calls `rdma_destroy_qp`; the Tokio engine
-/// uses a result-aware consuming `ibv_destroy_qp` path for QPs with externally
-/// supplied CQs.
+/// Owns the QP lifecycle. [`Drop`] calls `rdma_destroy_qp`.
 /// Captures `Arc` references to PD and CQs to prevent premature destruction
 /// of resources the QP depends on.
 ///
@@ -708,16 +545,9 @@ impl CmId {
 pub struct CmQueuePair {
     qp: *mut ibv_qp,
     cm_id_raw: Option<NonNull<rdma_cm_id>>,
-    #[allow(
-        dead_code,
-        reason = "read by the Tokio engine when shared-CM QPs are enabled"
-    )]
-    capabilities: ibv_qp_cap,
     _pd: Arc<ProtectionDomain>,
     _send_cq: Option<Arc<CompletionQueue>>,
     _recv_cq: Option<Arc<CompletionQueue>>,
-    #[cfg(any(test, feature = "test-hooks"))]
-    fail_next_verbs_destroy: std::sync::atomic::AtomicBool,
 }
 
 // Safety: ibv_qp is thread-safe (protected by internal locking in libibverbs).
@@ -735,90 +565,11 @@ impl CmQueuePair {
         let Some(cm_id_raw) = self.cm_id_raw.take() else {
             return;
         };
-        #[cfg(any(test, feature = "test-hooks"))]
-        crate::test_support::destruction::record(
-            crate::test_support::destruction::DestructionKind::QueuePair,
-            self.qp as usize,
-        );
         // Safety: QP was created by rdma_create_qp on this CM ID. The retained
         // PD/CQ Arcs and the caller's owning CmId remain alive for this call.
         // rdma_destroy_qp synchronously consumes that QP. Once it returns, no
         // HCA work owned by this QP can access its formerly posted MRs.
         unsafe { rdma_destroy_qp(cm_id_raw.as_ptr()) };
-    }
-
-    /// Destroy a CM-created QP through the result-returning verbs primitive.
-    ///
-    /// This path is restricted to QPs created with caller-owned CQs. Unlike
-    /// `rdma_destroy_qp`, `ibv_destroy_qp` reports failure and does not destroy
-    /// librdmacm-created CQs. The CM ID's QP pointer is cleared only after the
-    /// verbs call succeeds.
-    #[cfg(feature = "tokio")]
-    pub(crate) fn try_destroy_verbs(mut self) -> std::result::Result<(), (Self, crate::Error)> {
-        let Some(cm_id_raw) = self.cm_id_raw else {
-            return Ok(());
-        };
-        if self._send_cq.is_none() || self._recv_cq.is_none() {
-            return Err((
-                self,
-                crate::Error::InvalidArg(
-                    "result-aware QP destruction requires externally supplied CQs".into(),
-                ),
-            ));
-        }
-        let cm_qp = unsafe { (*cm_id_raw.as_ptr()).qp };
-        if cm_qp != self.qp {
-            return Err((
-                self,
-                crate::Error::InvalidArg(
-                    "CM ID no longer owns the QP selected for destruction".into(),
-                ),
-            ));
-        }
-
-        #[cfg(any(test, feature = "test-hooks"))]
-        let ret = if self
-            .fail_next_verbs_destroy
-            .swap(false, std::sync::atomic::Ordering::AcqRel)
-        {
-            -libc::EBUSY
-        } else {
-            unsafe { ibv_destroy_qp(self.qp) }
-        };
-        #[cfg(not(any(test, feature = "test-hooks")))]
-        let ret = unsafe { ibv_destroy_qp(self.qp) };
-
-        #[cfg(any(test, feature = "test-hooks"))]
-        {
-            crate::test_support::destruction::record(
-                crate::test_support::destruction::DestructionKind::QueuePair,
-                self.qp as usize,
-            );
-            crate::test_support::destruction::record_result(
-                crate::test_support::destruction::DestructionKind::QueuePair,
-                self.qp as usize,
-                ret,
-            );
-        }
-        if ret != 0 {
-            let errno = ret.checked_abs().unwrap_or(i32::MAX);
-            return Err((
-                self,
-                crate::Error::Verbs(std::io::Error::from_raw_os_error(errno)),
-            ));
-        }
-
-        unsafe {
-            (*cm_id_raw.as_ptr()).qp = std::ptr::null_mut();
-        }
-        self.cm_id_raw = None;
-        Ok(())
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn fail_next_verbs_destroy(&self) {
-        self.fail_next_verbs_destroy
-            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Raw QP pointer for posting work requests.
@@ -829,36 +580,6 @@ impl CmQueuePair {
     /// QP number assigned by the HCA.
     pub fn qp_num(&self) -> u32 {
         unsafe { (*self.qp).qp_num }
-    }
-
-    /// Capabilities returned by the provider from `rdma_create_qp`.
-    #[allow(
-        dead_code,
-        reason = "read by the Tokio engine when shared-CM QPs are enabled"
-    )]
-    pub(crate) fn capabilities(&self) -> ibv_qp_cap {
-        self.capabilities
-    }
-
-    #[allow(
-        dead_code,
-        reason = "used by Tokio engine resource-identity test hooks"
-    )]
-    pub(crate) fn uses_resources(
-        &self,
-        pd: &Arc<ProtectionDomain>,
-        send_cq: &Arc<CompletionQueue>,
-        recv_cq: &Arc<CompletionQueue>,
-    ) -> bool {
-        Arc::ptr_eq(&self._pd, pd)
-            && self
-                ._send_cq
-                .as_ref()
-                .is_some_and(|cq| Arc::ptr_eq(cq, send_cq))
-            && self
-                ._recv_cq
-                .as_ref()
-                .is_some_and(|cq| Arc::ptr_eq(cq, recv_cq))
     }
 
     /// Transition the QP to the ERROR state (`IBV_QPS_ERR`).
@@ -908,11 +629,6 @@ impl RdmaCmDeviceList {
             return Err(crate::Error::Verbs(std::io::Error::last_os_error()));
         };
         if count <= 0 {
-            #[cfg(any(test, feature = "test-hooks"))]
-            crate::test_support::destruction::record(
-                crate::test_support::destruction::DestructionKind::RdmaFreeDevices,
-                list.as_ptr() as usize,
-            );
             unsafe { rdma_free_devices(list.as_ptr()) };
             return Err(crate::Error::NoDevices);
         }
@@ -944,14 +660,6 @@ impl RdmaCmDeviceList {
         let index = select_name_index((0..self.count).map(|index| self.context_name(index)), name)
             .ok_or_else(|| crate::Error::DeviceNotFound(name.to_owned()))?;
         self.context_at(index)
-    }
-
-    /// Select the first librdmacm-enumerated context.
-    pub(crate) fn first_context(self: &Arc<Self>) -> Result<Arc<Context>> {
-        if self.count == 0 {
-            return Err(crate::Error::NoDevices);
-        }
-        self.context_at(0)
     }
 
     fn context_at(self: &Arc<Self>, index: usize) -> Result<Arc<Context>> {
@@ -995,11 +703,6 @@ impl RdmaCmDeviceList {
 
 impl Drop for RdmaCmDeviceList {
     fn drop(&mut self) {
-        #[cfg(any(test, feature = "test-hooks"))]
-        crate::test_support::destruction::record(
-            crate::test_support::destruction::DestructionKind::RdmaFreeDevices,
-            self.list.as_ptr() as usize,
-        );
         unsafe { rdma_free_devices(self.list.as_ptr()) };
     }
 }
@@ -1116,7 +819,7 @@ unsafe fn sockaddr_to_std(sa: *const bnd_linux::libc::socket::sockaddr) -> Optio
 
 #[cfg(test)]
 mod device_list_tests {
-    use super::{CmId, Error, NonNull, rdma_cm_id, select_name_index};
+    use super::select_name_index;
 
     #[test]
     fn exact_name_selection_uses_injected_entries() {
@@ -1124,27 +827,5 @@ mod device_list_tests {
         assert_eq!(select_name_index(names, "siw0"), Some(1));
         assert_eq!(select_name_index(names, "rxe"), None);
         assert_eq!(select_name_index(names, "missing"), None);
-    }
-
-    #[test]
-    fn failed_cm_destruction_returns_the_exact_owner() {
-        let raw = NonNull::<rdma_cm_id>::dangling().as_ptr();
-        let mut cm_id = unsafe { CmId::from_raw(raw, true) };
-        cm_id.fail_next_destroy_for_test(Error::InvalidArg(
-            "injected rdma_destroy_id failure".into(),
-        ));
-
-        let (mut cm_id, error) = cm_id
-            .try_destroy()
-            .expect_err("injected destruction must preserve ownership");
-        assert_eq!(cm_id.as_raw(), raw);
-        assert!(
-            error
-                .to_string()
-                .contains("injected rdma_destroy_id failure")
-        );
-
-        // The fake pointer must not reach FFI when this unit test releases it.
-        cm_id.disarm_destroy_for_test();
     }
 }

@@ -130,18 +130,7 @@ impl Drop for Context {
     fn drop(&mut self) {
         match &self.ownership {
             ContextOwnership::Owned => {
-                #[cfg(any(test, feature = "test-hooks"))]
-                crate::test_support::destruction::record(
-                    crate::test_support::destruction::DestructionKind::IbvCloseDevice,
-                    self.inner as usize,
-                );
                 let ret = unsafe { ibv_close_device(self.inner) };
-                #[cfg(any(test, feature = "test-hooks"))]
-                crate::test_support::destruction::record_result(
-                    crate::test_support::destruction::DestructionKind::IbvCloseDevice,
-                    self.inner as usize,
-                    ret,
-                );
                 if ret != 0 {
                     tracing::error!(
                         "ibv_close_device failed: {}",
@@ -149,20 +138,8 @@ impl Drop for Context {
                     );
                 }
             }
-            ContextOwnership::Borrowed => {
-                #[cfg(any(test, feature = "test-hooks"))]
-                crate::test_support::destruction::record(
-                    crate::test_support::destruction::DestructionKind::ContextFacade,
-                    self.inner as usize,
-                );
-            }
-            ContextOwnership::Anchored(_anchor) => {
-                #[cfg(any(test, feature = "test-hooks"))]
-                crate::test_support::destruction::record(
-                    crate::test_support::destruction::DestructionKind::ContextFacade,
-                    self.inner as usize,
-                );
-            }
+            ContextOwnership::Borrowed => {}
+            ContextOwnership::Anchored(_anchor) => {}
         }
     }
 }
