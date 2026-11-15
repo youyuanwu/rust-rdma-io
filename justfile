@@ -39,15 +39,19 @@ build-rxe:
         if [[ "${ID:-}" == "ubuntu" ]]; then
             source_info="$(dpkg-query -W -f='${source:Package} ${source:Version}' "linux-headers-${kver}")"
             read -r source_package source_version <<< "$source_info"
-            repo="ubuntu/${source_package}/${VERSION_CODENAME}"
-            if [[ "$source_package" == "linux" ]]; then
+            source_repository="$(echo "$source_package" | sed -E 's/-[0-9]+\.[0-9]+$//; s/^linux-hwe$/linux/')"
+            repo="ubuntu/${source_repository}/${VERSION_CODENAME}"
+            if [[ "$source_repository" == "linux" ]]; then
                 owner="ubuntu-kernel"
-                ref="Ubuntu-${source_version//\~/_}"
             else
                 owner="canonical-kernel"
+            fi
+            if [[ "$source_package" == "linux" ]]; then
+                ref="Ubuntu-${source_version//\~/_}"
+            else
                 ref="Ubuntu-${source_package#linux-}-${source_version//\~/_}"
             fi
-            repo_url="https://git.launchpad.net/~${owner}/ubuntu/+source/${source_package}/+git/${VERSION_CODENAME}"
+            repo_url="https://git.launchpad.net/~${owner}/ubuntu/+source/${source_repository}/+git/${VERSION_CODENAME}"
         fi
     fi
     src_dir="build/rxe-src"
