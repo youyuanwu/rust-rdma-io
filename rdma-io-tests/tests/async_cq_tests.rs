@@ -94,20 +94,20 @@ async fn setup_and_send(send_data: &[u8], recv_wr_id: u64) -> (ServerSetup, Clie
             // Post raw recv before accept (tests raw verb path)
             let server_qp = cmqp.as_raw();
             {
-                let mut sge = rdma_io_sys::ibverbs::ibv_sge {
+                let mut sge = rdma_io_sys::ibv_sge {
                     addr: unsafe { (*recv_mr.as_raw()).addr as u64 },
                     length: 64,
                     lkey: recv_mr.lkey(),
                 };
-                let mut wr = rdma_io_sys::ibverbs::ibv_recv_wr {
+                let mut wr = rdma_io_sys::ibv_recv_wr {
                     wr_id: recv_wr_id,
                     sg_list: &mut sge,
                     num_sge: 1,
                     ..Default::default()
                 };
-                let mut bad_wr: *mut rdma_io_sys::ibverbs::ibv_recv_wr = std::ptr::null_mut();
+                let mut bad_wr: *mut rdma_io_sys::ibv_recv_wr = std::ptr::null_mut();
                 let ret = unsafe {
-                    rdma_io_sys::wrapper::rdma_wrap_ibv_post_recv(server_qp, &mut wr, &mut bad_wr)
+                    rdma_io_sys::rdma_wrap_ibv_post_recv(server_qp, &mut wr, &mut bad_wr)
                 };
                 assert_eq!(ret, 0, "server post_recv failed");
             }
@@ -179,23 +179,21 @@ async fn setup_and_send(send_data: &[u8], recv_wr_id: u64) -> (ServerSetup, Clie
     let client_qp = cmqp.as_raw();
     let client_send_cq = unsafe { (*client_qp).send_cq };
     {
-        let mut sge = rdma_io_sys::ibverbs::ibv_sge {
+        let mut sge = rdma_io_sys::ibv_sge {
             addr: unsafe { (*send_mr.as_raw()).addr as u64 },
             length: data_len as u32,
             lkey: send_mr.lkey(),
         };
-        let mut wr = rdma_io_sys::ibverbs::ibv_send_wr {
+        let mut wr = rdma_io_sys::ibv_send_wr {
             wr_id: 999,
-            opcode: rdma_io_sys::ibverbs::IBV_WR_SEND,
-            send_flags: rdma_io_sys::ibverbs::IBV_SEND_SIGNALED,
+            opcode: rdma_io_sys::IBV_WR_SEND,
+            send_flags: rdma_io_sys::IBV_SEND_SIGNALED,
             sg_list: &mut sge,
             num_sge: 1,
             ..Default::default()
         };
-        let mut bad_wr: *mut rdma_io_sys::ibverbs::ibv_send_wr = std::ptr::null_mut();
-        let ret = unsafe {
-            rdma_io_sys::wrapper::rdma_wrap_ibv_post_send(client_qp, &mut wr, &mut bad_wr)
-        };
+        let mut bad_wr: *mut rdma_io_sys::ibv_send_wr = std::ptr::null_mut();
+        let ret = unsafe { rdma_io_sys::rdma_wrap_ibv_post_send(client_qp, &mut wr, &mut bad_wr) };
         assert_eq!(ret, 0, "client post_send failed");
     }
 
@@ -203,7 +201,7 @@ async fn setup_and_send(send_data: &[u8], recv_wr_id: u64) -> (ServerSetup, Clie
     let mut wc = [WorkCompletion::default(); 1];
     loop {
         let n = unsafe {
-            rdma_io_sys::wrapper::rdma_wrap_ibv_poll_cq(client_send_cq, 1, wc.as_mut_ptr().cast())
+            rdma_io_sys::rdma_wrap_ibv_poll_cq(client_send_cq, 1, wc.as_mut_ptr().cast())
         };
         if n > 0 {
             assert!(wc[0].is_success(), "send WC error: {:?}", wc[0].status());

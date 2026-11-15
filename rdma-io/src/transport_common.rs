@@ -388,7 +388,7 @@ pub(crate) fn bind_recv_mw(
             recv_mr.as_raw(),
             recv_mr.addr(),
             ring_capacity as u64,
-            rdma_io_sys::ibverbs::IBV_ACCESS_REMOTE_WRITE,
+            rdma_io_sys::IBV_ACCESS_REMOTE_WRITE,
         );
     qp.post_send_wr(&mut bind_wr)?;
 

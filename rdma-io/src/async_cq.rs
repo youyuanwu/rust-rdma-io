@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::task::{Context, Poll};
 
-use rdma_io_sys::ibverbs::*;
+use rdma_io_sys::*;
 
 use crate::Result;
 use crate::comp_channel::CompletionChannel;

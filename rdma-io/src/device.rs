@@ -3,8 +3,7 @@
 use std::ffi::CStr;
 use std::sync::Arc;
 
-use rdma_io_sys::ibverbs::*;
-use rdma_io_sys::wrapper::rdma_wrap____ibv_query_port;
+use rdma_io_sys::*;
 
 use crate::error::{from_ptr, from_ret};
 use crate::{Error, Result};
@@ -266,8 +265,7 @@ pub fn supports_mw_type2(pd: &Arc<crate::pd::ProtectionDomain>) -> bool {
     };
     let flags = attr.device_cap_flags;
     flags
-        & (rdma_io_sys::ibverbs::IBV_DEVICE_MEM_WINDOW_TYPE_2A
-            | rdma_io_sys::ibverbs::IBV_DEVICE_MEM_WINDOW_TYPE_2B)
+        & (rdma_io_sys::IBV_DEVICE_MEM_WINDOW_TYPE_2A | rdma_io_sys::IBV_DEVICE_MEM_WINDOW_TYPE_2B)
         != 0
 }
 

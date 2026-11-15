@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use rdma_io_sys::ibverbs::*;
+use rdma_io_sys::*;
 
 use crate::pd::ProtectionDomain;
 

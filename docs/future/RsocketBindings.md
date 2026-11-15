@@ -79,17 +79,16 @@ enum { RDMA_SQSIZE, RDMA_RQSIZE, RDMA_INLINE, RDMA_IOMAPSIZE, RDMA_ROUTE };
 
 ### Layer 1: FFI Bindings (rdma-io-sys)
 
-Add rsocket headers to the direct-Clang scope in `bnd-rdma-gen/src/clang.rs`:
+Add the rsocket header to the bindgen translation unit in `rdma-io-sys/build.rs`:
 
-```toml
-[[partition]]
-namespace = "rdma.rsocket"
-library = "rdmacm"          # rsocket lives in librdmacm
-headers = ["rdma/rsocket.h"]
-traverse = ["rdma/rsocket.h"]
+```c
+#include <rdma/rsocket.h>
 ```
 
-This generates raw FFI in `rdma-io-sys/src/rdma/rsocket/mod.rs` — consistent with the existing `ibverbs` and `rdmacm` partitions.
+Extend the function/type allowlists to include rsocket's `r*` functions and
+their argument types. Bindings will be generated into Cargo's `OUT_DIR` and
+exported at the `rdma_io_sys` crate root. rsocket already lives in `librdmacm`,
+which the build script links.
 
 ### Layer 2: Safe Sync Wrapper (rdma-io)
 
@@ -242,8 +241,8 @@ tests/
 ## Implementation Phases
 
 ### Phase 1: FFI Bindings
-- Add an `rsocket` header route to `bnd-rdma-gen/src/clang.rs`
-- Regenerate bindings with `cargo run -p bnd-rdma-gen`
+- Include `rdma/rsocket.h` and extend the bindgen allowlists in `rdma-io-sys/build.rs`
+- Generate bindings with `cargo build -p rdma-io-sys`
 - Verify rsocket symbols appear in `rdma-io-sys`
 
 ### Phase 2: Safe Sync Wrapper
@@ -458,7 +457,7 @@ impl tokio::io::AsyncRead for AsyncRSocket {
 
 ## Other Open Questions
 
-1. **bnd-rdma-gen compatibility:** Does `bnd-clang` handle rsocket.h correctly? The header uses `off_t`, `struct msghdr`, variadic `rfcntl()` — it may need external `bnd-linux` routes or wrapper functions in `rdma-io-sys/wrapper/`.
+1. **bindgen coverage:** The header uses `off_t`, `struct msghdr`, and variadic `rfcntl()`. Extend the bindgen allowlists and use `libc` types or wrapper functions where necessary.
 
 2. **rfcntl variadic:** C variadic functions can't be called directly from Rust. Add wrappers to the existing `rdma-io-sys/wrapper/wrapper.{h,c}` (same pattern used for inline ibverbs functions):
    ```c
@@ -471,7 +470,7 @@ impl tokio::io::AsyncRead for AsyncRSocket {
    int rdma_wrap_rfcntl_getfl(int socket) { return rfcntl(socket, F_GETFL); }
    int rdma_wrap_rfcntl_setfl(int socket, int flags) { return rfcntl(socket, F_SETFL, flags); }
    ```
-   These get compiled into `librdma_wrapper` and picked up by the wrapper header route in `bnd-rdma-gen/src/clang.rs`.
+   These get compiled into `librdma_wrapper` and picked up by bindgen through `wrapper.h`.
 
 3. **Performance vs AsyncRdmaStream:** On hardware, rsocket manages its own QP/CQ internally. Our AsyncRdmaStream has fine-grained control over buffer sizes and CQ polling. The rpoll thread adds latency that raw verbs don't have. Is rsocket's convenience worth the overhead for gRPC workloads?
 

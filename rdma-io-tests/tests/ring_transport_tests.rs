@@ -164,7 +164,7 @@ async fn ring_mw_capability_probe() {
         Ok(rxe_ctx) => {
             let rxe_attr = rxe_ctx.query_device().unwrap();
             let rxe_flags = rxe_attr.device_cap_flags;
-            let rxe_mw2b = rxe_flags & rdma_io_sys::ibverbs::IBV_DEVICE_MEM_WINDOW_TYPE_2B != 0;
+            let rxe_mw2b = rxe_flags & rdma_io_sys::IBV_DEVICE_MEM_WINDOW_TYPE_2B != 0;
 
             let rxe_ctx = std::sync::Arc::new(rxe_ctx);
             let rxe_pd = rdma_io::pd::ProtectionDomain::new(rxe_ctx).unwrap();

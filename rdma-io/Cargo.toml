@@ -15,7 +15,6 @@ tokio = ["async", "dep:tokio", "tokio/rt", "tokio/sync", "tokio/time", "tokio/ma
 
 [dependencies]
 rdma-io-sys.workspace = true
-bnd-linux = { workspace = true, features = ["in_", "socket"] }
 bitflags.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

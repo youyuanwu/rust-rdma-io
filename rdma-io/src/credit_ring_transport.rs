@@ -749,7 +749,7 @@ impl CreditRingTransport {
                 }
                 WcOpcode::Recv => {
                     // Credit update — process it.
-                    if wc.wc_flags() & rdma_io_sys::ibverbs::IBV_WC_WITH_IMM != 0 {
+                    if wc.wc_flags() & rdma_io_sys::IBV_WC_WITH_IMM != 0 {
                         let freed_count = wc.imm_data();
                         let last = self.remote_freed_received;
                         let delta = freed_count.wrapping_sub(last) as usize;
@@ -891,7 +891,7 @@ impl Transport for CreditRingTransport {
     fn send_gather(&mut self, bufs: &[std::io::IoSlice<'_>]) -> crate::Result<usize> {
         if self.peer_disconnected {
             return Err(crate::Error::WorkCompletion {
-                status: rdma_io_sys::ibverbs::IBV_WC_WR_FLUSH_ERR,
+                status: rdma_io_sys::IBV_WC_WR_FLUSH_ERR,
                 vendor_err: 0,
             });
         }
@@ -1174,7 +1174,7 @@ impl Transport for CreditRingTransport {
                     }
                     WcOpcode::Recv => {
                         // Credit update from peer's Send+Imm.
-                        if wc.wc_flags() & rdma_io_sys::ibverbs::IBV_WC_WITH_IMM != 0 {
+                        if wc.wc_flags() & rdma_io_sys::IBV_WC_WITH_IMM != 0 {
                             let freed_count = wc.imm_data();
                             let last = self.remote_freed_received;
                             let delta = freed_count.wrapping_sub(last) as usize;

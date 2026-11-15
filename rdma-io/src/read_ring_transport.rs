@@ -516,7 +516,7 @@ fn bind_offset_mw(
             offset_mr.as_raw(),
             offset_mr.addr(),
             offset_size as u64,
-            rdma_io_sys::ibverbs::IBV_ACCESS_REMOTE_READ,
+            rdma_io_sys::IBV_ACCESS_REMOTE_READ,
         );
     qp.post_send_wr(&mut bind_wr)?;
 
@@ -1346,7 +1346,7 @@ impl Transport for ReadRingInner {
     fn send_gather(&mut self, bufs: &[std::io::IoSlice<'_>]) -> crate::Result<usize> {
         if self.peer_disconnected {
             return Err(crate::Error::WorkCompletion {
-                status: rdma_io_sys::ibverbs::IBV_WC_WR_FLUSH_ERR,
+                status: rdma_io_sys::IBV_WC_WR_FLUSH_ERR,
                 vendor_err: 0,
             });
         }
